@@ -9,6 +9,7 @@ edition = "2024"
 license = "MIT"
 rust-version = "1.98"
 repository = "https://github.com/hyper-light/mantle"
+publish = false
 
 [workspace.dependencies]
 bytes = "1.12"

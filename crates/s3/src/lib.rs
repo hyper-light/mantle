@@ -13,5 +13,6 @@
     )
 )]
 
+pub mod checksum;
 pub mod chunked;
 pub mod sigv4;

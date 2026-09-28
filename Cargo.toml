@@ -12,17 +12,21 @@ repository = "https://github.com/hyper-light/mantle"
 publish = false
 
 [workspace.dependencies]
+base64 = "0.23"
 bytes = "1.12"
 clap = { version = "4.6", features = ["derive"] }
 getrandom = "0.4"
 hmac = "0.13"
+md-5 = "0.11"
 crc-fast = { version = "1.10", default-features = false, features = ["std"] }
 proptest = "1.11"
 reed-solomon-simd = "3.1"
 sha2 = "0.11"
+sha1 = "0.11"
 rustix = { version = "1.1", features = ["fs", "system", "param"] }
 tempfile = "3.20"
 thiserror = "2.0"
+twox-hash = { version = "2.1", default-features = false, features = ["std", "xxhash64", "xxhash3_64", "xxhash3_128"] }
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Security",

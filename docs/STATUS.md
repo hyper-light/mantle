@@ -69,8 +69,10 @@ Remaining before it is done:
 **S3 protocol** (`mantle-s3`). Signature Version 4 in the `Authorization` header and in
 presigned URLs, and `aws-chunked` bodies with signed chunks and signed or unsigned trailing
 checksums, verified against every worked example in AWS's S3 developer guide: the canonical
-requests, the signatures, and the chunked bodies byte for byte. Remaining for the gateway is
-listed under item 2 below.
+requests, the signatures, and the chunked bodies byte for byte. The ten checksum algorithms
+S3 accepts, full-object CRCs combined from parts without the data, composite values and
+ETags, verified against AWS's multipart tutorial and ceph s3-tests' vectors. Remaining for
+the gateway is listed under item 2 below.
 
 ## Planned, in order
 

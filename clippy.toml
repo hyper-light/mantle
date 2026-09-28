@@ -26,6 +26,7 @@ disallowed-macros = [
 ]
 
 disallowed-methods = [
+  { path = "bool::then_some", reason = "builds its argument even when false, so a value with Drop is built and dropped (a CFRelease(NULL) crash in the macOS probe); use `then(|| ..)` or if/else" },
   { path = "std::env::temp_dir", reason = "tests use tempfile's directories and remove them; production never writes outside its configured data directories" },
   { path = "std::thread::sleep", reason = "a blocking sleep stalls a worker; wait on an event or a runtime timer" },
 ]

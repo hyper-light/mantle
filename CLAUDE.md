@@ -54,8 +54,10 @@ mismatch is a typed corruption error that feeds repair.
 ## 7. Portable by construction
 
 Linux, macOS and Windows on x86_64 and aarch64. Platform code sits behind `cfg` with a
-portable path beside it. `unsafe` lives only in the audited platform modules, every block
-with a `// SAFETY:` comment stating the invariant.
+portable path beside it. `unsafe` lives only in the OS-interface files that
+`scripts/check-contracts.py` lists, every block with a `// SAFETY:` comment stating the
+invariant. `scripts/check-targets.sh` lints all six targets from one machine and
+`scripts/linux-test.sh` runs the tests on Linux in a container.
 
 ## 8. Tests are real
 
@@ -75,6 +77,7 @@ Every commit passes these on its final tree; CI runs them on Linux, macOS and Wi
 x86_64 and aarch64.
 
 ```
+python3 scripts/check-contracts.py
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 bash scripts/check-production.sh

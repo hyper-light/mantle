@@ -43,6 +43,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      - name: Source contracts
+        run: python3 scripts/check-contracts.py
       - name: Formatting
         run: cargo fmt --all --check
       - name: Lints

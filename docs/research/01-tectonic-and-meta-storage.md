@@ -69,7 +69,7 @@ Note that BALEEN uses "block" for the unit mapped to an HDD location, which is w
    Cross-directory moves are **non-atomic**: a two-phase link-then-unlink with a parent backpointer. Garbage collectors between layers clean up the resulting "acceptable" inconsistencies [TEC §3.3, §3.5, pp. 221-222]. The authors report "These limitations have not been a problem in practice" [TEC §7, p. 228].
 3. **Two write paths, chosen per call:**
    - **(a) Full-block RS-encoded writes** for large write-once files. The client encodes. For RS(9,6), it sends reservation requests to 19 nodes, writes to the first 15, and acknowledges at 14 of 15 [TEC §5.1, p. 224].
-   - **(b) Partial-block quorum appends** for small objects. These are 3-way replicated and acknowledged after 2 on-disk writes. The post-append block size and checksum are committed to block metadata *before* the acknowledgement. Sealed blocks are later re-encoded to RS(10,4) [TEC §5.2, pp. 224-225].
+   - **(b) Partial-block quorum appends** for small objects. The paper's example is 3-way replication acknowledged after 2 on-disk writes. The post-append block size and checksum are committed to block metadata *before* the acknowledgement. Sealed blocks are later re-encoded to RS(10,4) [TEC §5.2, pp. 224-225].
 4. **Sizes.**
    - Tectonic blocks are "typically 72 MiB" and chunks "typically 8 MiB" [TSHIFT §2, p. 435]. The Tectonic paper itself uses 72 MB blocks only in its hedging experiment [TEC Fig. 3a, p. 224].
    - Ambry independently settled on 4-8 MB chunks for large blobs [AMB §4.2.1, p. 257].
@@ -99,7 +99,7 @@ Note that BALEEN uses "block" for the unit mapped to an HDD location, which is w
     - flag plus copy-compaction (Haystack) [HAY §3.4.3, §3.6.1, pp. 52-54];
     - delete-entry plus in-place compaction (Ambry) [AMB §2.2, p. 255];
     - crypto-shredding with per-BLOB keys and no compaction, which left 6.8% dead space (f4) [F4 §5.3, §6.5, pp. 389, 394].
-13. **ZippyDB sources.** Everything about ZippyDB beyond sharding, Paxos, RocksDB, primary-served strong reads and "no cross-shard transactions" is **NON-PEER-REVIEWED** (see §5).
+13. **ZippyDB sources.** Everything about ZippyDB beyond sharding, Paxos, RocksDB, primary-served strong reads and the absence of cross-shard transactions is **NON-PEER-REVIEWED** (see §5).
 
 ---
 
@@ -443,7 +443,7 @@ If C1 and C2 run between R1 and R3, then R3 would erase the new mapping. The fix
 - The read path decomposes a `pread` into block reads "by querying the Tectonic File Layer".
 
 **BALEEN §2.1 [p. 348]:** "(Tectonic has 8 MB blocks and 128 kB segments.)" In BALEEN's own definition, a block is the unit "mapped to a location on backing HDDs" and segments are cacheable sub-units.
-- **Terminology conflict (DERIVED interpretation).** BALEEN's "8 MB block" matches TSHIFT's "8 MiB chunk", the unit on one disk, not TSHIFT's 72 MiB block.
+- **Terminology conflict (DERIVED interpretation).** BALEEN's "8 MB blocks" match TSHIFT's chunks ("typically 8 MiB"), the unit on one disk, not TSHIFT's 72 MiB block.
 - **Resolution for this record:** logical block = 72 MiB, chunk = 8 MiB, cache segment = 128 kB.
 
 ### 1.15 Tectonic facts we could NOT verify from primary sources
@@ -477,7 +477,7 @@ If C1 and C2 run between R1 and R3, then R3 would erase the new mapping. The fix
 | Block forward | (blk_id) | blk_id | encoding (RS(k,m) or Rep(n)), committed size S, checksum, sealed flag, chunk locations in chunk order | TEC Table 1; §5.2 (size and checksum committed before ack) |
 | Block reverse | (disk_id, blk_id) | **blk_id** | chunk_info: chunk index, length, checksum | TEC Table 1; §3.5 (per-shard, per-disk repair) |
 
-- **Recommendation M3: physical key encoding.** *INFERENCE.* "Sharded by X" but "prefix-scanned by Y" needs the shard to be chosen independently of the key's sort prefix, as with the `(disk_id, blk_id)` row sharded by blk_id. Prefix every physical key with a virtual-shard number `vshard = H(shard_key) mod V`, then a layer tag, then the logical key. Physical shards own vshard ranges.
+- **Recommendation M3: physical key encoding.** *INFERENCE.* A row that is sharded by one ID but prefix-scanned by another needs the shard to be chosen independently of the key's sort prefix, as with the `(disk_id, blk_id)` row sharded by blk_id. Prefix every physical key with a virtual-shard number `vshard = H(shard_key) mod V`, then a layer tag, then the logical key. Physical shards own vshard ranges.
   - This reproduces hash partitioning, keeps co-sharded rows together, and supports in-shard prefix scans on any KV store.
   - It allows resharding without rehashing. The same idea appears as ZippyDB microshards [ZDB-BLOG, NON-PEER-REVIEWED], Akkio's µ-shards [AKKIO §3, p. 449] and the logical/physical splits in Haystack and Ambry [HAY §3.1, p. 50; AMB §2.2, p. 254].
 - **Recommendation M4: required KV contract.** This is what Tectonic assumes of ZippyDB [TEC §3.3]:
@@ -660,7 +660,7 @@ If C1 and C2 run between R1 and R3, then R3 would erase the new mapping. The fix
 
 - **Initial approach:** double-replicated cells in two datacenters, giving 3.6 -> **2.8**.
 - **XOR scheme:** "storing the XOR of blocks from two different volumes primarily stored in two different datacenters in a third datacenter". Each block's counterpart in the other volume is its "buddy block". The XOR volumes keep normal triple-replicated index files.
-- **Formula:** "The 2.1 replication factor comes from the 1.4X for the primary single cell replication for each of two volumes and another 1.4X for the geo-replicated XOR of the two volumes: (1.4*2+1.4)/2 = 2.1."
+- **Formula:** "The 2.1 replication factor comes from the 1.4X for the primary single cell replication for each of two volumes and another 1.4X for the geo-replicated XOR of the two volumes:" (1.4 x 2 + 1.4) / 2 = 2.1. The paper typesets this as a fraction; it is rewritten inline here.
 - **Reads during a datacenter failure:** a geo-backoff node fetches the region from the local XOR block and the remote XOR-companion block, then reconstructs.
 - **Tradeoff:** this is accepted "with the tradeoff of decreased throughput for BLOBs stored at the failed datacenter".
 - **Code properties:** the local RS code is MDS, "though the combination with XOR is not" [F4 §8, p. 395].
@@ -849,7 +849,7 @@ If C1 and C2 run between R1 and R3, then R3 would erase the new mapping. The fix
 
 ### 4.1 Context
 
-- Ambry had been in production "for the past 24 months, across four datacenters, serving more than 400 million users" [AMB §1, p. 254].
+- Ambry had been in production "for the last 24 months, across four datacenters, serving more than 400 million users" [AMB §1, p. 254].
 - **Load:** up to 10K req/s [AMB Abstract, p. 253]. Request rate grew from 5k to 9.5k req/s over 12 months. There were "more than 800 million put and get operations per day (over 120 TB in size)" [AMB §1, p. 253].
 - **Workload:** blob sizes range from tens of KB to a few GB, with ">95% read traffic" [AMB §1, pp. 253-254].
 - **Results:** up to 88% of network bandwidth, under 50 ms for a 1 MB object, and 8x-10x better request-rate balance across disks [AMB Abstract, p. 253].
@@ -964,7 +964,7 @@ If C1 and C2 run between R1 and R3, then R3 would erase the new mapping. The fix
 ### 4.9 Implications for mantle (Ambry)
 
 - **Recommendation A1: decouple logical from physical placement.** This is how Ambry rebalances without rehashing [AMB §2.2]. mantle achieves it more finely with Tectonic's explicit chunk -> disk map [TEC §7].
-- **Recommendation A2: an ~8 MiB transfer/storage unit is corroborated.** Ambry's 4-8 MB chunks [AMB §4.2.1] and Tectonic's typical 8 MiB chunks [TSHIFT §2] agree. mantle's large-object layout (a File layer with an ordered block list) is Ambry's "metadata blob with ordered chunk ids". mantle should also stream GET responses with a sliding window of parallel chunk reads [AMB §4.2.1].
+- **Recommendation A2: an ~8 MiB transfer/storage unit is corroborated.** Ambry's 4-8 MB chunks [AMB §4.2.1] and Tectonic's typical 8 MiB chunks [TSHIFT §2] agree. mantle's large-object layout (a File layer with an ordered block list) is the counterpart of Ambry's metadata blob, which "stores the number of chunks and chunk ids in order". mantle should also stream GET responses with a sliding window of parallel chunk reads [AMB §4.2.1].
 - **Recommendation A3: node-local index design, if ever needed.** If mantle adds node-local indexes (for example a packed small-object store outside the metadata KV), use Ambry's design:
   - sorted segments with the latest in memory;
   - Bloom filters for on-disk segments;
@@ -1049,7 +1049,7 @@ If C1 and C2 run between R1 and R3, then R3 would erase the new mapping. The fix
 - **Recommendation Z1: the minimal KV feature set is exactly Tectonic's assumptions** (M4):
   - per-shard consensus log with a total write order;
   - leader lease for primary-served linearizable reads;
-  - in-shard multi-key transactions or conditional writes. These implement R3-style guards and "create with overwrite". The `key_not_present` and `value_matches_or_key_not_present` preconditions [ZDB-BLOG] map directly onto name creation and mapping swaps;
+  - in-shard multi-key transactions or conditional writes. These implement R3-style guards and "create with overwriting". The `key_not_present` and `value_matches_or_key_not_present` preconditions [ZDB-BLOG] map directly onto name creation and mapping swaps;
   - prefix scans;
   - no cross-shard transactions needed.
 - **Recommendation Z2: metadata writes use the default durable mode.** Acknowledge after a majority log commit plus apply on the leader. Never use a fast-ack mode for filesystem metadata [ZDB-BLOG]. *INFERENCE:* the Tectonic ordering guarantees (§1.9) require the metadata commit to be durable before the client is acknowledged.

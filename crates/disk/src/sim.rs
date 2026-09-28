@@ -147,8 +147,13 @@ impl SimFile {
             .map_err(|_| sim_error("simulated file lock poisoned"))
     }
 
-    fn check(&self, offset: u64, len: usize) -> Result<u64, DiskError> {
-        if !self.align.is_aligned_u64(offset) || !self.align.is_aligned(len) {
+    /// Refuses what a direct-I/O file would refuse: misaligned offsets, lengths and buffer
+    /// addresses, so tests catch an engine that would fail on a real `O_DIRECT` file.
+    fn check(&self, addr: usize, offset: u64, len: usize) -> Result<u64, DiskError> {
+        if !self.align.is_aligned_u64(offset)
+            || !self.align.is_aligned(len)
+            || !self.align.is_aligned(addr)
+        {
             return Err(DiskError::Misaligned {
                 offset,
                 len,
@@ -221,7 +226,7 @@ impl BlockFile for SimFile {
     }
 
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), DiskError> {
-        let end = self.check(offset, buf.len())?;
+        let end = self.check(buf.as_ptr().addr(), offset, buf.len())?;
         let mut state = self.lock()?;
         state.stats.reads = state.stats.reads.saturating_add(1);
         let len = u64::try_from(buf.len()).map_err(|_| sim_error("length"))?;
@@ -259,7 +264,7 @@ impl BlockFile for SimFile {
     }
 
     fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError> {
-        let end = self.check(offset, buf.len())?;
+        let end = self.check(buf.as_ptr().addr(), offset, buf.len())?;
         let mut state = self.lock()?;
         state.stats.writes = state.stats.writes.saturating_add(1);
         if let Some(i) = state.faults.iter().position(|f| *f == Fault::WriteError) {
@@ -324,6 +329,7 @@ impl BlockFile for SimFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buf::AlignedBuf;
 
     fn file(seed: u64) -> SimFile {
         SimFile::new(
@@ -334,35 +340,46 @@ mod tests {
         .unwrap()
     }
 
-    fn block(byte: u8) -> Vec<u8> {
-        vec![byte; 4096]
+    fn aligned(len: usize, byte: u8) -> AlignedBuf {
+        let mut b = AlignedBuf::zeroed(len, Alignment::new(4096).unwrap()).unwrap();
+        b.as_mut_capacity().fill(byte);
+        b.set_len(len).unwrap();
+        b
+    }
+
+    fn block(byte: u8) -> AlignedBuf {
+        aligned(4096, byte)
+    }
+
+    fn bytes(b: &AlignedBuf) -> Vec<u8> {
+        b.as_slice().to_vec()
     }
 
     #[test]
     fn flushed_writes_survive_any_crash() {
         let f = file(1);
-        f.write_all_at(&block(7), 0).unwrap();
+        f.write_all_at(block(7).as_slice(), 0).unwrap();
         f.sync_data().unwrap();
         f.crash(Crash::LoseAll).unwrap();
         let mut buf = block(0);
-        f.read_exact_at(&mut buf, 0).unwrap();
-        assert_eq!(buf, block(7));
+        f.read_exact_at(buf.as_mut_slice(), 0).unwrap();
+        assert_eq!(bytes(&buf), bytes(&block(7)));
     }
 
     #[test]
     fn unflushed_writes_are_lost_or_kept_as_the_crash_says() {
         let f = file(2);
-        f.write_all_at(&block(1), 0).unwrap();
+        f.write_all_at(block(1).as_slice(), 0).unwrap();
         f.sync_data().unwrap();
-        f.write_all_at(&block(2), 0).unwrap();
+        f.write_all_at(block(2).as_slice(), 0).unwrap();
         f.crash(Crash::LoseAll).unwrap();
         let mut buf = block(0);
-        f.read_exact_at(&mut buf, 0).unwrap();
-        assert_eq!(buf, block(1));
-        f.write_all_at(&block(3), 0).unwrap();
+        f.read_exact_at(buf.as_mut_slice(), 0).unwrap();
+        assert_eq!(bytes(&buf), bytes(&block(1)));
+        f.write_all_at(block(3).as_slice(), 0).unwrap();
         f.crash(Crash::KeepAll).unwrap();
-        f.read_exact_at(&mut buf, 0).unwrap();
-        assert_eq!(buf, block(3));
+        f.read_exact_at(buf.as_mut_slice(), 0).unwrap();
+        assert_eq!(bytes(&buf), bytes(&block(3)));
     }
 
     #[test]
@@ -370,17 +387,18 @@ mod tests {
         let mut torn = false;
         for seed in 0..64 {
             let f = file(seed);
-            f.write_all_at(&block(1), 0).unwrap();
+            f.write_all_at(block(1).as_slice(), 0).unwrap();
             f.sync_data().unwrap();
-            f.write_all_at(&block(2), 0).unwrap();
+            f.write_all_at(block(2).as_slice(), 0).unwrap();
             f.crash(Crash::Random).unwrap();
             let mut buf = block(0);
-            f.read_exact_at(&mut buf, 0).unwrap();
-            for sector in buf.chunks(512) {
+            f.read_exact_at(buf.as_mut_slice(), 0).unwrap();
+            let got = bytes(&buf);
+            for sector in got.chunks(512) {
                 assert!(sector.iter().all(|&b| b == sector[0]), "a sector tore");
                 assert!(sector[0] == 1 || sector[0] == 2);
             }
-            torn |= buf.chunks(512).any(|s| s[0] == 1) && buf.chunks(512).any(|s| s[0] == 2);
+            torn |= got.chunks(512).any(|s| s[0] == 1) && got.chunks(512).any(|s| s[0] == 2);
         }
         assert!(torn, "no seed produced a torn write");
     }
@@ -390,13 +408,13 @@ mod tests {
         let mut lost = false;
         for seed in 0..32 {
             let f = file(seed);
-            f.write_all_at(&vec![9u8; 8192], 0).unwrap();
+            f.write_all_at(aligned(8192, 9).as_slice(), 0).unwrap();
             f.inject(Fault::SyncError).unwrap();
             assert!(f.sync_data().is_err());
             // Until the crash, the cache still returns the new bytes.
-            let mut buf = vec![0u8; 8192];
-            f.read_exact_at(&mut buf, 0).unwrap();
-            assert!(buf.iter().all(|&b| b == 9));
+            let mut buf = aligned(8192, 0);
+            f.read_exact_at(buf.as_mut_slice(), 0).unwrap();
+            assert!(buf.as_slice().iter().all(|&b| b == 9));
             // A second flush "succeeds" without writing anything.
             f.sync_data().unwrap();
             f.crash(Crash::LoseAll).unwrap();
@@ -409,7 +427,7 @@ mod tests {
     #[test]
     fn faults_fire_as_armed() {
         let f = file(3);
-        f.write_all_at(&block(5), 0).unwrap();
+        f.write_all_at(block(5).as_slice(), 0).unwrap();
         f.inject(Fault::BitFlip {
             offset: 10,
             bit: 3,
@@ -417,22 +435,22 @@ mod tests {
         })
         .unwrap();
         let mut buf = block(0);
-        f.read_exact_at(&mut buf, 0).unwrap();
-        assert_eq!(buf[10], 5 ^ 8);
+        f.read_exact_at(buf.as_mut_slice(), 0).unwrap();
+        assert_eq!(buf.as_slice()[10], 5 ^ 8);
         f.clear_faults().unwrap();
         f.inject(Fault::ReadError {
             offset: 4000,
             len: 1,
         })
         .unwrap();
-        assert!(f.read_exact_at(&mut buf, 0).is_err());
+        assert!(f.read_exact_at(buf.as_mut_slice(), 0).is_err());
         f.clear_faults().unwrap();
         f.inject(Fault::WriteError).unwrap();
-        assert!(f.write_all_at(&block(6), 0).is_err());
-        f.write_all_at(&block(6), 0).unwrap();
+        assert!(f.write_all_at(block(6).as_slice(), 0).is_err());
+        f.write_all_at(block(6).as_slice(), 0).unwrap();
         f.inject(Fault::Capacity { len: 8192 }).unwrap();
-        assert!(f.write_all_at(&block(6), 8192).is_err());
-        f.write_all_at(&block(6), 4096).unwrap();
+        assert!(f.write_all_at(block(6).as_slice(), 8192).is_err());
+        f.write_all_at(block(6).as_slice(), 4096).unwrap();
     }
 
     #[test]
@@ -440,6 +458,12 @@ mod tests {
         let f = file(4);
         assert!(matches!(
             f.write_all_at(&[0u8; 100], 0),
+            Err(DiskError::Misaligned { .. })
+        ));
+        // An aligned length at an unaligned address is refused too, as O_DIRECT would.
+        let buf = aligned(8192, 1);
+        assert!(matches!(
+            f.write_all_at(&buf.as_slice()[1..4097], 0),
             Err(DiskError::Misaligned { .. })
         ));
     }

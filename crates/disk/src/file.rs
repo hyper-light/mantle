@@ -95,6 +95,7 @@ impl DeviceFile {
     /// Writes all of `buf` at `offset`.
     pub fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError> {
         self.check_alignment(offset, buf.len())?;
+        self.check_address(buf.as_ptr().addr(), offset, buf.len())?;
         let mut done = 0usize;
         while let Some(rest) = buf.get(done..).filter(|r| !r.is_empty()) {
             let at = offset
@@ -128,6 +129,7 @@ impl DeviceFile {
     /// Reads into `buf` from `offset` until it is full or the file ends; returns the count.
     pub fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize, DiskError> {
         self.check_alignment(offset, buf.len())?;
+        self.check_address(buf.as_ptr().addr(), offset, buf.len())?;
         let mut done = 0usize;
         while let Some(rest) = buf.get_mut(done..).filter(|r| !r.is_empty()) {
             let at = offset
@@ -173,6 +175,19 @@ impl DeviceFile {
 
     fn check_alignment(&self, offset: u64, len: usize) -> Result<(), DiskError> {
         if self.align.is_aligned_u64(offset) && self.align.is_aligned(len) {
+            return Ok(());
+        }
+        Err(DiskError::Misaligned {
+            offset,
+            len,
+            align: self.align.get(),
+        })
+    }
+
+    /// Direct transfers move straight between the device and the buffer, so its address
+    /// must be aligned as well (open(2) NOTES; Windows "File Buffering").
+    fn check_address(&self, addr: usize, offset: u64, len: usize) -> Result<(), DiskError> {
+        if self.align.is_aligned(addr) {
             return Ok(());
         }
         Err(DiskError::Misaligned {

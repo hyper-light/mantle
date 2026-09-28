@@ -37,16 +37,16 @@ pub fn probe(out: &mut impl Write, path: &Path, measure: bool, verbose: bool) ->
     writeln!(out, "{}", path.display())?;
     field(out, "disk", &disk(&id))?;
     field(out, "file system", &file_system(&id))?;
-    field(out, "safety", safety(&id))?;
+    field(out, "write cache", write_cache(&id))?;
     if matches!(id.zoned, Zoned::HostAware | Zoned::HostManaged) {
         field(
             out,
             "zones",
-            "the drive is zoned: mantle writes each zone front to back",
+            "zoned drive; mantle writes each zone sequentially",
         )?;
     }
     if verbose && !id.notes.is_empty() {
-        writeln!(out, "  the OS could not say:")?;
+        writeln!(out, "  not reported by the OS:")?;
         for note in &id.notes {
             writeln!(out, "    {note}")?;
         }
@@ -121,16 +121,12 @@ fn file_system(id: &Identity) -> String {
     }
 }
 
-/// What mantle does to make a write safe on this device, and why.
-fn safety(id: &Identity) -> &'static str {
+/// Whether the device holds writes in a volatile cache, and what mantle does about it.
+fn write_cache(id: &Identity) -> &'static str {
     match id.write_cache {
-        WriteCache::WriteBack => {
-            "the drive caches writes, so every commit empties its cache before mantle answers"
-        }
-        WriteCache::WriteThrough => "the drive puts writes on stable media before it answers",
-        WriteCache::Unknown => {
-            "the drive does not say whether it caches writes, so every commit empties its cache"
-        }
+        WriteCache::WriteBack => "volatile; mantle flushes it on every commit",
+        WriteCache::WriteThrough => "write-through; writes are on stable media when they complete",
+        WriteCache::Unknown => "not reported; mantle flushes the drive cache on every commit",
     }
 }
 
@@ -147,7 +143,7 @@ fn measured(out: &mut impl Write, path: &Path, id: &Identity) -> Result<(), Erro
     let plan = Plan::standard(align);
     writeln!(
         out,
-        "measuring with a scratch file of up to {}, removed afterwards...",
+        "measuring with a scratch file of up to {} (removed afterwards)",
         display::capacity(plan.span)
     )?;
     out.flush()?;
@@ -164,8 +160,10 @@ fn report(out: &mut impl Write, c: &Calibration) -> std::io::Result<()> {
             out,
             "reads",
             &format!(
-                "fastest with {} small reads in flight, so mantle keeps up to {} in flight",
-                knee.depth, knee.depth
+                "{} concurrent {} reads give the highest throughput; mantle uses up to {}",
+                knee.depth,
+                display::size(c.small),
+                knee.depth
             ),
         )?;
     }
@@ -179,16 +177,17 @@ fn report(out: &mut impl Write, c: &Calibration) -> std::io::Result<()> {
         out,
         "throughput",
         &format!(
-            "{} reading and {} writing large transfers",
+            "{} read, {} write ({} transfers)",
             display::rate(best(&c.sequential_read)),
-            display::rate(best(&c.sequential_write))
+            display::rate(best(&c.sequential_write)),
+            display::size(c.large)
         ),
     )?;
     field(
         out,
         "commits",
         &format!(
-            "about {} until a write is safe; writes that arrive together share one commit",
+            "{} per durable write; concurrent writes share a flush",
             display::nanos(c.durable_write.p50_ns)
         ),
     )?;
@@ -196,7 +195,7 @@ fn report(out: &mut impl Write, c: &Calibration) -> std::io::Result<()> {
         field(
             out,
             "caching",
-            "the file system refused direct I/O, so reads and writes pass through its cache",
+            "the file system refused direct I/O; reads and writes use the page cache",
         )?;
     }
     Ok(())
@@ -212,7 +211,7 @@ mod tests {
         let mut out = Vec::new();
         probe(&mut out, dir.path(), false, true).unwrap();
         let text = String::from_utf8(out).unwrap();
-        for name in ["disk", "file system", "safety"] {
+        for name in ["disk", "file system", "write cache"] {
             assert!(text.contains(name), "{name} missing from:\n{text}");
         }
     }

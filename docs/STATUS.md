@@ -1,47 +1,52 @@
-# Where mantle stands
+# Status
 
-Updated 2026-09-28. Each piece closes when its tests pass on all six platform targets in
-CI and the evidence named below is recorded.
+Updated 2026-09-28. A component is complete when its tests pass on all six CI targets
+(Linux, macOS and Windows on x86_64 and arm64) and the evidence listed for it has been
+recorded.
 
-## What you can run today
+## Implemented
 
-`mantle disk probe` tells you what the operating system says about the storage under a
-directory and, with `--measure`, what that storage actually does. Under it sit the
-foundations every later layer uses:
+`mantle disk probe` reports what the operating system knows about the device that holds a
+directory and, with `--measure`, benchmarks the device. It is built on:
 
 - **Device identification** on Linux (sysfs, including device-mapper and md members),
   macOS (the I/O Registry, including APFS containers and disk images) and Windows (the
-  volume functions and storage IOCTLs). Tested on real devices, a mounted disk image and a
-  virtual disk.
-- **A file layer that makes writes safe the way each platform requires**: direct I/O where
-  the file system accepts it, aligned positional transfers, and the platform's full flush.
-  Tested on APFS, ext4 and tmpfs.
-- **Calibration** that measures reads, writes and commits through that layer, repeats each
-  point and reports the median, and never leaves its scratch file behind.
-- **Checksums**: CRC-32C for everything mantle stores and sends, CRC-64/NVME for the S3
-  checksum clients now send by default, checked against the published test vectors.
+  volume management functions and storage IOCTLs). Tested on physical disks, a mounted
+  disk image and a virtual disk.
+- **The file layer**: direct I/O where the file system supports it, aligned positional
+  reads and writes, and each platform's full flush. Tested on APFS, ext4, tmpfs and NTFS.
+- **Calibration**: reads, writes and flush latency measured through the file layer. Each
+  measurement runs three times and the median is reported. The scratch file is removed
+  whether the run succeeds or fails.
+- **Checksums**: CRC-32C for stored and transmitted data, and CRC-64/NVME for S3
+  checksums, both verified against published test vectors.
+- **A simulated device** for crash testing: writes not yet flushed are lost, kept or torn
+  at sector granularity when it crashes, a failed flush leaves their durability unknown,
+  and reads and writes can be made to fail or return corrupted bytes.
 
-## What is being built, in order
+## Planned, in order
 
-1. **Chunk store.** One log-structured volume per disk: group commit, self-describing
-   records, a second copy of every record's identity, crash recovery, cleaning and
-   scrubbing ([design](design/chunk-store.md)). Closes when a simulated device that loses,
-   tears and corrupts unflushed writes at every point of a randomized workload never makes
-   it lose an answered write or return a byte that fails its check, and when the same
-   workload survives `kill -9` on real disks.
-2. **Erasure coding.** Reed–Solomon profiles chosen from the failure domains you have.
-   Closes when encode and decode are benchmarked at each profile's shape and every
-   combination of lost pieces within a profile's tolerance rebuilds.
-3. **Metadata service.** Ranges of names, file layouts and block locations, each replicated
-   on focal's Raft core with its fast track, over QUIC for transfers and a UDP plane for
-   consensus. Closes when a linearizability checker passes histories recorded under
-   partitions, crashes and disk faults in deterministic simulation and on real processes.
-4. **S3 gateway.** The API your tools use: signatures (including presigned URLs and
-   chunked uploads with trailing checksums), buckets, put, get with ranges, head, delete,
-   batch delete, copy, listings, multipart uploads with resumption, versioning,
-   conditional requests and checksums. Closes when the AWS CLI, boto3 and the AWS SDK for
-   Rust pass end-to-end suites against a running mantle, and ceph's s3-tests pass for
-   every feature mantle claims.
-5. **A fleet.** Placement across racks and zones, repair ordered by remaining redundancy,
-   rebalancing, and a disk's retirement after it starts failing. Closes when multi-machine
-   runs lose disks, machines and racks mid-write and every answered write reads back.
+1. **Chunk store.** One log-structured volume per disk with group commit, self-describing
+   records, a second copy of each record's identity in an index log, crash recovery,
+   cleaning and scrubbing ([design](design/chunk-store.md)). Done when randomized
+   workloads crashed at random points on the simulated device never lose an acknowledged
+   write or return data that fails verification, and the same workloads survive
+   `kill -9` on real disks.
+2. **Erasure coding.** Reed–Solomon layouts chosen from the number of available failure
+   domains. Done when encoding and decoding are benchmarked for each layout, and every
+   combination of lost chunks within a layout's tolerance is rebuilt correctly.
+3. **Metadata service.** Ranges of object names, file layouts and chunk locations, each
+   replicated with focal's Raft implementation and its fast-track commit, over QUIC for
+   bulk transfers and a UDP transport for consensus messages. Done when a linearizability
+   checker accepts histories recorded under network partitions, process crashes and disk
+   faults, both in deterministic simulation and with real processes.
+4. **S3 gateway.** Request signing (including presigned URLs and chunked uploads with
+   trailing checksums), buckets, PUT, GET with byte ranges, HEAD, DELETE and batch
+   delete, copy, ListObjects and ListObjectsV2, multipart uploads including resuming an
+   interrupted upload, versioning, conditional requests and checksums. Done when
+   end-to-end suites using the AWS CLI, boto3 and the AWS SDK for Rust pass against a
+   running mantle, and ceph's s3-tests pass for every supported feature.
+5. **Multi-machine operation.** Placement across racks and zones, repair ordered by
+   remaining redundancy, rebalancing, and retiring disks that start to fail. Done when
+   tests that fail disks, machines and racks during writes show that every acknowledged
+   write can still be read back.

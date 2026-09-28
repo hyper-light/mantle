@@ -11,6 +11,19 @@ pub fn capacity(bytes: u64) -> String {
     )
 }
 
+/// Transfer sizes are powers of two in practice; an exact one prints without decimals.
+pub fn size(bytes: usize) -> String {
+    let units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes;
+    for unit in units {
+        if value < 1024 || !value.is_multiple_of(1024) {
+            return format!("{value} {unit}");
+        }
+        value >>= 10;
+    }
+    format!("{value} PiB")
+}
+
 pub fn rate(bytes_per_sec: f64) -> String {
     format!(
         "{}/s",
@@ -76,6 +89,9 @@ mod tests {
         assert_eq!(capacity(7_998_499_225_600), "8.00 TB");
         assert_eq!(capacity(512), "512 B");
         assert_eq!(rate(10_600_000_000.0), "10.6 GB/s");
+        assert_eq!(size(4096), "4 KiB");
+        assert_eq!(size(1 << 20), "1 MiB");
+        assert_eq!(size(1536), "1536 B");
         assert_eq!(nanos(73_727), "73.7 µs");
         assert_eq!(nanos(4_718_591), "4.72 ms");
         assert_eq!(nanos(900), "900 ns");

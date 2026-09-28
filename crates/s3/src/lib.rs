@@ -21,4 +21,5 @@ pub mod list;
 pub mod range;
 pub mod route;
 pub mod sigv4;
+pub mod time;
 pub mod xml;

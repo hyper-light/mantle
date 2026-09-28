@@ -253,7 +253,8 @@ fn verify_header(
     let timestamp = header(request.headers, "x-amz-date")
         .or_else(|| header(request.headers, "date"))
         .ok_or(malformed("no x-amz-date"))?;
-    let time = parse_timestamp(timestamp).ok_or(malformed("x-amz-date is not YYYYMMDDTHHMMSSZ"))?;
+    let time = crate::time::parse_amz_date(timestamp)
+        .ok_or(malformed("x-amz-date is not YYYYMMDDTHHMMSSZ"))?;
     check_scope(&claim, timestamp, region, malformed)?;
     if now.abs_diff(time) > MAX_SKEW_SECS.unsigned_abs() {
         return Err(AuthError::TooSkewed);
@@ -311,7 +312,8 @@ fn verify_presigned(
         malformed,
     )?;
     let timestamp = get("X-Amz-Date").ok_or(malformed("no X-Amz-Date"))?;
-    let time = parse_timestamp(timestamp).ok_or(malformed("X-Amz-Date is not YYYYMMDDTHHMMSSZ"))?;
+    let time = crate::time::parse_amz_date(timestamp)
+        .ok_or(malformed("X-Amz-Date is not YYYYMMDDTHHMMSSZ"))?;
     check_scope(&claim, timestamp, region, malformed)?;
     let expires: i64 = get("X-Amz-Expires")
         .ok_or(malformed("no X-Amz-Expires"))?
@@ -666,68 +668,6 @@ pub fn unhex(text: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// `YYYYMMDDTHHMMSSZ` as Unix seconds (05 §1.6: UTC, no fractional seconds).
-pub fn parse_timestamp(text: &str) -> Option<i64> {
-    let b = text.as_bytes();
-    if b.len() != 16 || b.get(8) != Some(&b'T') || b.get(15) != Some(&b'Z') {
-        return None;
-    }
-    let num = |from: usize, to: usize| -> Option<i64> { text.get(from..to)?.parse().ok() };
-    let (year, month, day) = (num(0, 4)?, num(4, 6)?, num(6, 8)?);
-    let (hour, minute, second) = (num(9, 11)?, num(11, 13)?, num(13, 15)?);
-    if !(1..=12).contains(&month)
-        || !(1..=days_in_month(year, month)).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
-        return None;
-    }
-    let seconds = hour
-        .checked_mul(3600)?
-        .checked_add(minute.checked_mul(60)?)?
-        .checked_add(second)?;
-    days_from_civil(year, month, day)?
-        .checked_mul(86_400)?
-        .checked_add(seconds)
-}
-
-fn days_in_month(year: i64, month: i64) -> i64 {
-    match month {
-        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    }
-}
-
-/// Days from 1970-01-01 to a proleptic Gregorian date (Hinnant, "chrono-Compatible Low-Level
-/// Date Algorithms", `days_from_civil`).
-fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
-    let y = if month <= 2 {
-        year.checked_sub(1)?
-    } else {
-        year
-    };
-    let era = y.checked_div_euclid(400)?;
-    let yoe = y.checked_sub(era.checked_mul(400)?)?;
-    let mp = month.checked_add(9)?.checked_rem(12)?;
-    let doy = mp
-        .checked_mul(153)?
-        .checked_add(2)?
-        .checked_div(5)?
-        .checked_add(day)?
-        .checked_sub(1)?;
-    let doe = yoe
-        .checked_mul(365)?
-        .checked_add(yoe.checked_div(4)?)?
-        .checked_sub(yoe.checked_div(100)?)?
-        .checked_add(doy)?;
-    era.checked_mul(146_097)?
-        .checked_add(doe)?
-        .checked_sub(719_468)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -741,7 +681,7 @@ mod tests {
     }
 
     fn now() -> i64 {
-        parse_timestamp(WHEN).unwrap()
+        crate::time::parse_amz_date(WHEN).unwrap()
     }
 
     fn auth(signed: &str, signature: &str) -> String {
@@ -1082,14 +1022,5 @@ mod tests {
         assert_eq!(uri_encode(b"a b/c", true), "a%20b%2Fc");
         assert_eq!(percent_decode(b"a%2Fb+c"), Some(b"a/b+c".to_vec()));
         assert_eq!(percent_decode(b"%zz"), None);
-    }
-
-    #[test]
-    fn timestamps_parse_as_utc() {
-        assert_eq!(parse_timestamp("19700101T000000Z"), Some(0));
-        assert_eq!(parse_timestamp(WHEN), Some(1_369_353_600));
-        assert_eq!(parse_timestamp("20240229T235959Z"), Some(1_709_251_199));
-        assert_eq!(parse_timestamp("20230229T000000Z"), None);
-        assert_eq!(parse_timestamp("2013-05-24T00:00:00Z"), None);
     }
 }

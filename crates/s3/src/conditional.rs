@@ -54,7 +54,7 @@ pub fn read(c: &Conditions<'_>, current: &Current<'_>) -> Outcome {
         Some(list) if !matches_any(list, etag) => return Outcome::Failed,
         Some(_) => {}
         None => {
-            if let Some(since) = c.if_unmodified_since.and_then(parse_http_date)
+            if let Some(since) = c.if_unmodified_since.and_then(crate::time::parse_http_date)
                 && *modified > since
             {
                 return Outcome::Failed;
@@ -65,7 +65,7 @@ pub fn read(c: &Conditions<'_>, current: &Current<'_>) -> Outcome {
         Some(list) if matches_any(list, etag) => return Outcome::NotModified,
         Some(_) => {}
         None => {
-            if let Some(since) = c.if_modified_since.and_then(parse_http_date)
+            if let Some(since) = c.if_modified_since.and_then(crate::time::parse_http_date)
                 && *modified <= since
             {
                 return Outcome::NotModified;
@@ -126,46 +126,6 @@ fn bare(etag: &str) -> &str {
         .unwrap_or(etag)
 }
 
-const MONTHS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
-
-/// An HTTP-date as Unix seconds, in any of the three forms recipients must accept (RFC 9110
-/// §5.6.7): `Sun, 06 Nov 1994 08:49:37 GMT`, `Sunday, 06-Nov-94 08:49:37 GMT` and
-/// `Sun Nov  6 08:49:37 1994`.
-pub fn parse_http_date(text: &str) -> Option<i64> {
-    let words: Vec<&str> = text.split_whitespace().collect();
-    let (day, month, year, time) = match words.as_slice() {
-        [_, day, month, year, time, "GMT"] => (*day, *month, year.parse().ok()?, *time),
-        [_, date, time, "GMT"] => {
-            let mut parts = date.split('-');
-            let day = parts.next()?;
-            let month = parts.next()?;
-            let yy: i64 = parts.next()?.parse().ok()?;
-            // RFC 9110 §5.6.7: a two-digit year more than 50 years in the future is the past
-            // century's; taken here as 1970–2069 around the epoch these dates describe.
-            let year = if yy < 70 {
-                yy.checked_add(2000)?
-            } else {
-                yy.checked_add(1900)?
-            };
-            (day, month, year, *time)
-        }
-        [_, month, day, time, year] => (*day, *month, year.parse().ok()?, *time),
-        _ => return None,
-    };
-    let month = MONTHS.iter().position(|m| *m == month)?;
-    let month = i64::try_from(month).ok()?.checked_add(1)?;
-    let day: i64 = day.parse().ok()?;
-    let mut hms = time.split(':').map(str::parse::<i64>);
-    let (h, m, s) = (hms.next()?.ok()?, hms.next()?.ok()?, hms.next()?.ok()?);
-    if hms.next().is_some() {
-        return None;
-    }
-    let stamp = format!("{year:04}{month:02}{day:02}T{h:02}{m:02}{s:02}Z");
-    crate::sigv4::parse_timestamp(&stamp)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,17 +135,8 @@ mod tests {
     fn present() -> Current<'static> {
         Current::Present {
             etag: ETAG,
-            modified: parse_http_date("Tue, 24 Sep 2024 12:00:00 GMT").unwrap(),
+            modified: crate::time::parse_http_date("Tue, 24 Sep 2024 12:00:00 GMT").unwrap(),
         }
-    }
-
-    #[test]
-    fn http_dates_parse_in_all_three_forms() {
-        let want = Some(784_111_777);
-        assert_eq!(parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"), want);
-        assert_eq!(parse_http_date("Sunday, 06-Nov-94 08:49:37 GMT"), want);
-        assert_eq!(parse_http_date("Sun Nov  6 08:49:37 1994"), want);
-        assert_eq!(parse_http_date("06 Nov 1994"), None);
     }
 
     /// The s3-tests read cases and AWS's two documented combinations (05 §2.4).

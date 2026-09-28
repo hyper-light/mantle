@@ -64,6 +64,11 @@ writer lays out, writes and flushes each batch in turn, so the device sits idle 
 writer computes and the writer sits idle during the flush: after finding 4, the flush took
 55% of its time, data and log writes 18%, copying payloads 20%, and checksums 5%.
 
+**7. Results depend on the drive's recent history.** The first put points after the fill
+pass ran at half their usual rate (4 KiB puts with one writer: 102/s) and at the usual rate
+when run later in the same process. One pass per point measures the drive's state as much
+as the store; how many repetitions a point needs is open (docs/research/11).
+
 **8. The index frame's separate write costs a quarter of durable bandwidth here.** Raw
 32 MiB batches through the file layer, each written and then flushed: 5.31 GB/s cycling
 within 256 MiB and 5.36 GB/s advancing across 4 GiB, so where the data goes does not
@@ -76,11 +81,6 @@ data write 23%, frame write 7.6%).
 **9. Writes proceed partly while another flush runs.** Two threads each writing and
 flushing 32 MiB batches on separate regions reach 5.99 GB/s against 5.12 GB/s for one;
 four reach 5.55 GB/s.
-
-**7. Results depend on the drive's recent history.** The first put points after the fill
-pass ran at half their usual rate (4 KiB puts with one writer: 102/s) and at the usual rate
-when run later in the same process. One pass per point measures the drive's state as much
-as the store; how many repetitions a point needs is open (docs/research/11).
 
 ## Consequences
 

@@ -11,62 +11,34 @@
 <h1 align="center">mantle</h1>
 <p align="center"><em>File-system and object store for exabyte scale.</em></p>
 
-Mantle is a distributed object store and file system with an S3-compatible API, built for
-the data AI agents produce: checkpoints, transcripts, datasets, embeddings and build
-artifacts. Existing S3 clients work with it unchanged, including the AWS CLI, boto3, the
-AWS SDKs and rclone.
+Mantle is a distributed object store and file system for the data that AI agents
+produce: checkpoints, transcripts, datasets, embeddings and build artifacts. It implements
+the S3 API, so the AWS CLI, boto3, the AWS SDKs, rclone and other S3 clients work with it
+unchanged. The same binary runs as a single process on a laptop or as a cluster of many
+machines.
 
-The design follows Meta's Tectonic file system. Storage nodes own their local disks and
-store chunks. A metadata service, replicated with Raft, records which chunks make up each
-object and where each chunk is stored. Clients split large objects into erasure-coded
-chunks and write them directly to the storage nodes. The same binary runs as a single
-process on a laptop or as a cluster of many machines.
+Mantle acknowledges a write only after the data is durable on every node that stores it,
+and a read that starts after that returns the new data. Agents can coordinate through
+conditional writes: `If-None-Match: *` creates an object only if its key is unused, and
+`If-Match` replaces an object only if it has not changed since it was read. Data is
+checksummed with CRC-32C when it is received and verified again whenever it is read; a
+chunk that fails verification is served from another copy and repaired.
 
-A write completes only after its data is durable on every node it was sent to, and a read
-that starts after the write completes returns the new data. Conditional writes
-(`If-None-Match: *` and `If-Match`) let an agent claim a key, or update an object only if
-it has not changed since the agent read it. Data is checksummed with CRC-32C when it
-arrives and verified on every read; a chunk that fails verification is read from another
-copy and repaired.
-
-Operating systems often misreport storage devices. In a Linux VM under Docker Desktop on
-macOS, for example, the virtual disk is reported as rotational although it is backed by
-flash, and the file system reports 1.88 TB free on a host with 24 GB free. Mantle checks
-what the OS reports against measurements of the device, and uses the measurements to set
-I/O sizes, queue depths and commit batching. `mantle disk probe` shows both:
-
-```console
-$ mantle disk probe ~/mantle-data --measure
-~/mantle-data
-  disk          APPLE SSD AP8192Z, internal flash
-  file system   APFS, 46.0 GB free
-  write cache   not reported; mantle flushes the drive cache on every commit
-measuring with a scratch file of up to 268 MB (removed afterwards)
-measured in 13 s:
-  reads         64 concurrent 4 KiB reads give the highest throughput; mantle uses up to 64
-  throughput    15.0 GB/s read, 22.2 GB/s write (1 MiB transfers)
-  commits       4.46 ms per durable write; concurrent writes share a flush
-```
-
-On this machine a durable write takes about 4.5 ms, because macOS flushes the drive's
-write cache (`F_FULLFSYNC`) before the write completes. Mantle writes concurrent requests
-in a batch that shares one flush, so the flush time adds latency to each write but does
-not limit the number of writes per second.
-
-> [!NOTE]
-> Captured from a release build on an Apple M5 Max running macOS 26, with the home
-> directory shortened to `~`.
+The design follows Meta's Tectonic file system. Storage nodes own their disks and store
+chunks, a metadata service replicated with Raft records where every chunk is, and clients
+write chunks directly to the storage nodes. [How it works](#how-it-works) follows a write
+and a read through these parts.
 
 > [!IMPORTANT]
 > Mantle has no release yet. The storage-device layer is implemented and tested on Linux,
 > macOS and Windows, on x86_64 and arm64: device identification, direct I/O with the
 > correct flush call for each platform, device measurement, and CRC-32C and CRC-64/NVME
-> checksums. `mantle disk probe` is built on it. The chunk store is in progress; erasure
-> coding, the metadata service and the S3 gateway follow. The gateway will implement the
-> S3 API that standard clients use: multipart uploads, including resuming an interrupted
-> upload, PUT, GET with byte ranges, HEAD, DELETE and batch delete, copy, ListObjects and
-> ListObjectsV2, versioning, conditional requests, checksums and presigned URLs.
-> [docs/STATUS.md](docs/STATUS.md) tracks each component.
+> checksums. The chunk store is in progress; erasure coding, the metadata service and the
+> S3 gateway follow. The gateway will implement the S3 API that standard clients use:
+> multipart uploads, including resuming an interrupted upload, PUT, GET with byte ranges,
+> HEAD, DELETE and batch delete, copy, ListObjects and ListObjectsV2, versioning,
+> conditional requests, checksums and presigned URLs. [docs/STATUS.md](docs/STATUS.md)
+> tracks each component.
 
 ## Install
 
@@ -82,52 +54,78 @@ mantle --help
 
 ## Quickstart
 
-```sh
-mantle disk probe ~/mantle-data
+So far the only command is the disk probe. Before mantle stores data on a device, it
+checks what the operating system reports about the device and then measures it, because
+the reported values are often wrong. In a Linux VM under Docker Desktop on macOS, for
+example, the virtual disk is reported as rotational although it is backed by flash, and
+the file system reports 1.88 TB free on a host with 24 GB free. `mantle disk probe` runs
+the same checks on the device that holds a directory:
+
+```console
+$ mantle disk probe ~/mantle-data --measure
+~/mantle-data
+  disk          APPLE SSD AP8192Z, internal flash
+  file system   APFS, 46.0 GB free
+  write cache   not reported; mantle flushes the drive cache on every commit
+measuring with a scratch file of up to 268 MB (removed afterwards)
+measured in 13 s:
+  reads         64 concurrent 4 KiB reads give the highest throughput; mantle uses up to 64
+  throughput    15.0 GB/s read, 22.2 GB/s write (1 MiB transfers)
+  commits       4.46 ms per durable write; concurrent writes share a flush
 ```
 
-This prints what the operating system reports about the device that holds the directory:
-the drive model and type, the file system and its free space, and whether the drive has a
-volatile write cache. It returns immediately.
+The first three lines come from the operating system and print immediately. The rest
+comes from `--measure`, which benchmarks the device through the same direct-I/O path that
+mantle uses for data. It writes a scratch file of at most 256 MB, or a tenth of the free
+space if that is smaller, and deletes it when it finishes, including after an error.
+Mantle uses these results to choose I/O sizes, queue depths and how many writes to group
+into each flush. On this Mac a durable write takes about 4.5 ms, because macOS flushes
+the drive's write cache (`F_FULLFSYNC`) before the write completes; grouping concurrent
+writes into one flush keeps that cost from limiting how many writes complete per second.
+`--verbose` lists every property the operating system did not report.
 
-With `--measure`, mantle also benchmarks the device through the same direct-I/O path it
-uses for data. It writes a scratch file of at most 256 MB, or a tenth of the free space if
-that is smaller, and deletes the file when it finishes, including after an error.
-`--verbose` lists every property the OS did not report.
+> [!NOTE]
+> Captured from a release build on an Apple M5 Max running macOS 26, with the home
+> directory shortened to `~`.
 
 ## How it works
 
 This section describes the design. [docs/STATUS.md](docs/STATUS.md) lists which parts
 are implemented.
 
-**Durability.** A write is acknowledged only after the device confirms it is durable:
-`fdatasync` on Linux, `fcntl(F_FULLFSYNC)` on macOS, where `fsync` does not flush the
-drive's cache, and `FlushFileBuffers` on Windows. If a flush fails, mantle stops writing
-to that disk and recovers from its on-disk state. It does not retry the flush, because
-after a failed flush the kernel may have discarded the data without writing it (Rebello
-et al., USENIX ATC 2020).
+**Writing an object.** The S3 gateway authenticates the request and passes the data to
+mantle's client library. An object smaller than a block is appended to a shared block
+that is replicated on three storage nodes and re-encoded with erasure coding once the
+block is full. A larger object is split into blocks, and each block is erasure-coded into
+chunks that go to disks in different racks. The metadata service chooses where each chunk
+goes. The object's name is committed only after every chunk is durable, so a failed
+upload never leaves a partial object visible.
 
-**Write path.** Each disk holds one volume: a large file or a raw block device, opened
-with direct I/O and written sequentially in fixed-size segments. One loop per disk writes
-and flushes each batch of requests; requests that arrive during a flush go into the next
-batch.
+**Storing a chunk.** Each disk holds one volume, a large file or a raw block device
+opened with direct I/O and written sequentially in fixed-size segments. One writer loop
+per disk takes the requests that arrived during the previous flush, writes them as a
+batch, and flushes the device once: `fdatasync` on Linux, `fcntl(F_FULLFSYNC)` on macOS,
+where `fsync` does not flush the drive's cache, and `FlushFileBuffers` on Windows. The
+requests are acknowledged after the flush returns. If a flush fails, mantle stops writing
+to that disk and recovers from what is on it. It does not retry the flush, because the
+kernel may already have discarded the data (Rebello et al., USENIX ATC 2020).
 
-**Integrity.** Each record on disk stores the identity of its chunk and a CRC-32C for
-every 64 KiB of data. A separate index log holds a second copy of each record's identity
-and location. Together they detect bit rot, torn writes, misdirected writes, and writes
-the drive acknowledged but did not persist. A read that fails verification is retried
-against another copy, and the damaged copy is rebuilt.
+**Reading and checking data.** Each record on disk stores the identity of its chunk and
+a CRC-32C for every 64 KiB of data, and a separate index log holds a second copy of each
+record's identity and location. A read verifies both, which detects bit rot, torn writes,
+misdirected writes, and writes the drive acknowledged but did not persist. A chunk that
+fails verification is read from another copy and rebuilt. Every disk is also scrubbed in
+the background at least every two weeks.
 
-**Metadata.** Object names are kept in sorted order and divided into ranges, each
-replicated with Raft. A range splits when it grows or when its request rate increases,
-which is also how S3 scales request rates per key prefix. Chunk locations are stored
-separately from object names, so repairing a disk updates locations without rewriting
-names.
+**Finding objects.** Object names are kept in sorted order and divided into ranges, each
+replicated with Raft. A range splits when it grows large or receives more requests, which
+is also how S3 scales request rates per key prefix. Chunk locations are stored separately
+from names, so repairing a disk changes locations without rewriting names.
 
-**Redundancy.** Large objects are erasure-coded, with their chunks placed in different
-racks. Small objects are written as three replicas and re-encoded once the block holding
-them is full. When a disk fails, the blocks with the fewest surviving chunks are repaired
-first.
+**Recovering from failures.** When a disk or machine fails, the blocks with the fewest
+surviving chunks are rebuilt first, from their remaining chunks, onto other disks. Space
+held by deleted data is reclaimed by copying the live records out of mostly empty
+segments and reusing the segments.
 
 The design documents are in [docs/design/](docs/design/), starting with the
 [chunk store](docs/design/chunk-store.md). The papers and platform documentation they
@@ -136,7 +134,7 @@ cite are summarized in [docs/research/](docs/research/).
 ## From a laptop to a fleet
 
 The S3 API is the same at every scale. You configure how many failures a write must
-tolerate; mantle places data to meet that requirement, and reports it when the available
+tolerate, and mantle places data to meet that requirement, or reports that the available
 hardware cannot.
 
 | Deployment | A write completes when | Tolerates |

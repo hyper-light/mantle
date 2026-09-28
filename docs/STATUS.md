@@ -66,6 +66,12 @@ Remaining before it is done:
   target, computed from failure and repair rates under correlated failures
   (docs/research/04 §A5) rather than from a table.
 
+**S3 protocol** (`mantle-s3`). Signature Version 4 in the `Authorization` header and in
+presigned URLs, and `aws-chunked` bodies with signed chunks and signed or unsigned trailing
+checksums, verified against every worked example in AWS's S3 developer guide: the canonical
+requests, the signatures, and the chunked bodies byte for byte. Remaining for the gateway is
+listed under item 2 below.
+
 ## Planned, in order
 
 1. **Metadata service.** Ranges of object names, file layouts and chunk locations, each

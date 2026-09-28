@@ -88,7 +88,7 @@ impl Algorithm {
     }
 
     /// Bytes in a value.
-    pub fn width(self) -> usize {
+    pub const fn width(self) -> usize {
         match self {
             Self::Crc32 | Self::Crc32c => 4,
             Self::Crc64Nvme | Self::XxHash64 | Self::XxHash3 => 8,
@@ -96,6 +96,22 @@ impl Algorithm {
             Self::Sha1 => 20,
             Self::Sha256 => 32,
             Self::Sha512 => 64,
+        }
+    }
+
+    /// The element that holds a value in XML bodies (docs/research/13 §6.2).
+    pub const fn element(self) -> &'static str {
+        match self {
+            Self::Crc32 => "ChecksumCRC32",
+            Self::Crc32c => "ChecksumCRC32C",
+            Self::Crc64Nvme => "ChecksumCRC64NVME",
+            Self::Sha1 => "ChecksumSHA1",
+            Self::Sha256 => "ChecksumSHA256",
+            Self::Md5 => "ChecksumMD5",
+            Self::XxHash64 => "ChecksumXXHASH64",
+            Self::XxHash3 => "ChecksumXXHASH3",
+            Self::XxHash128 => "ChecksumXXHASH128",
+            Self::Sha512 => "ChecksumSHA512",
         }
     }
 

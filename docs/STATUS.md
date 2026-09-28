@@ -66,13 +66,24 @@ Remaining before it is done:
   target, computed from failure and repair rates under correlated failures
   (docs/research/04 §A5) rather than from a table.
 
-**S3 protocol** (`mantle-s3`). Signature Version 4 in the `Authorization` header and in
-presigned URLs, and `aws-chunked` bodies with signed chunks and signed or unsigned trailing
-checksums, verified against every worked example in AWS's S3 developer guide: the canonical
-requests, the signatures, and the chunked bodies byte for byte. The ten checksum algorithms
-S3 accepts, full-object CRCs combined from parts without the data, composite values and
-ETags, verified against AWS's multipart tutorial and ceph s3-tests' vectors. Remaining for
-the gateway is listed under item 2 below.
+**S3 protocol** (`mantle-s3`, [design](design/s3-protocol.md)). Signature Version 4 in the
+`Authorization` header and in presigned URLs, and `aws-chunked` bodies with signed chunks and
+signed or unsigned trailing checksums, verified against every worked example in AWS's S3
+developer guide: the canonical requests, the signatures, and the chunked bodies byte for
+byte. The ten checksum algorithms S3 accepts, full-object CRCs combined from parts without
+the data, composite values and ETags, verified against AWS's multipart tutorial and ceph
+s3-tests' vectors. Routing by virtual-hosted and path-style addressing, conditional requests
+in RFC 9110's order, byte ranges, and ListObjects paging, each tested against the s3-tests
+cases for it. An XML reader for request bodies that refuses entity declarations and does
+work linear in the body, checked against roxmltree on generated and mutated documents, with
+the CompleteMultipartUpload, DeleteObjects, CreateBucket and PutBucketVersioning documents
+read against their schemas under size limits computed from S3's own.
+
+Remaining before it is done:
+
+- The response documents: listings, multipart results, errors with request IDs.
+- ListObjectVersions paging, once the metadata service fixes how versions are ordered.
+- Tagging and ACL documents.
 
 ## Planned, in order
 

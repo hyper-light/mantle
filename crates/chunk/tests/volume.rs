@@ -280,3 +280,91 @@ fn concurrent_writers_share_group_commits() {
         }
     }
 }
+
+#[test]
+fn cleaning_reclaims_partly_dead_segments_and_keeps_every_live_byte() {
+    let file = sim(9);
+    let v = Volume::format(Arc::clone(&file), SIZE, config()).unwrap();
+    // Small chunks, many per segment, until the volume is full.
+    let mut written = Vec::new();
+    for n in 0..100_000u64 {
+        match v.put(key(n), &data(n, 3000)) {
+            Ok(()) => written.push(n),
+            Err(ChunkError::Full) => break,
+            Err(e) => panic!("unexpected {e}"),
+        }
+    }
+    // Delete every other chunk: each sealed segment is about half dead.
+    for &n in written.iter().filter(|n| *n % 2 == 0) {
+        v.delete(key(n)).unwrap();
+    }
+    let before = v.usage().unwrap().free;
+    let report = v.clean(8).unwrap();
+    let after = v.usage().unwrap().free;
+
+    assert!(report.relocated > 0 && report.corrupt == 0, "{report:?}");
+    assert!(
+        after > before,
+        "free segments {before} -> {after} after {report:?}"
+    );
+    // Freed space takes new writes.
+    for n in 0..20u64 {
+        v.put(key(900_000 + n), &data(n, 3000)).unwrap();
+    }
+    let check = |v: &Volume<Arc<mantle_disk::sim::SimFile>>| {
+        for &n in &written {
+            let got = v
+                .stat(&key(n))
+                .unwrap()
+                .map(|s| v.read(&key(n), 0, s.len).unwrap());
+            let want = if n % 2 == 0 {
+                None
+            } else {
+                Some(data(n, 3000))
+            };
+            assert_eq!(got, want, "chunk {n}");
+        }
+    };
+    check(&v);
+    drop(v);
+    let (v, _) = Volume::open(Arc::clone(&file), config()).unwrap();
+    check(&v);
+}
+
+#[test]
+fn cleaning_leaves_a_corrupt_fragment_in_place() {
+    let file = sim(10);
+    let v = Volume::format(Arc::clone(&file), SIZE, config()).unwrap();
+    for n in 0..300u64 {
+        v.put(key(n), &data(n, 3000)).unwrap();
+    }
+    for n in (0..300u64).filter(|n| n % 3 != 0) {
+        v.delete(key(n)).unwrap();
+    }
+    // Damage one surviving chunk's payload on the device.
+    let image = file.durable_image().unwrap();
+    let needle = &data(3, 3000)[1000..1064];
+    let at = image
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .unwrap() as u64;
+    file.inject(mantle_disk::sim::Fault::BitFlip {
+        offset: at,
+        bit: 4,
+        stored: true,
+    })
+    .unwrap();
+    let report = v.clean(64).unwrap();
+    assert_eq!(report.corrupt, 1, "{report:?}");
+    assert!(matches!(
+        v.read(&key(3), 0, 3000),
+        Err(ChunkError::Corrupt { .. })
+    ));
+    for n in (0..300u64).filter(|n| n % 3 == 0 && *n != 3) {
+        assert_eq!(
+            v.read(&key(n), 0, 3000).unwrap(),
+            data(n, 3000),
+            "chunk {n}"
+        );
+    }
+}

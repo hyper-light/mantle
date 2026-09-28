@@ -97,6 +97,13 @@ fn writer(v: &Volume<Arc<SimFile>>, id: u64, seed: u64, ops: usize) -> Model {
         uncertain: None,
     };
     for step in 0..ops {
+        // Now and then, clean: relocations race the writes and the power cut.
+        if rng.below(12) == 0 {
+            match v.clean(2) {
+                Ok(_) | Err(ChunkError::Device(_) | ChunkError::Fenced | ChunkError::Closed) => {}
+                Err(e) => panic!("writer {id} step {step}: cleaning failed: {e}"),
+            }
+        }
         let k = keys[rng.below(keys.len() as u64) as usize];
         let state = model.acked[&k].clone();
         let size = match rng.below(10) {

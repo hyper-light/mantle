@@ -16,7 +16,7 @@ use mantle_disk::buf::AlignedBuf;
 
 use crate::error::ChunkError;
 use crate::frame::{KIND_BATCH, KIND_WRAP, LogRecord, PutRecord, SegmentState};
-use crate::index::{Index, SegmentInfo};
+use crate::index::{Fragment, Index, Inserted, SegmentInfo};
 use crate::layout::{Config, Geometry};
 use crate::log::{self, Cursor};
 use crate::record::{self, Prefix};
@@ -42,7 +42,9 @@ pub(crate) struct Recovered {
     pub sequence: u64,
     pub incarnation: u32,
     pub fragments: u64,
-    pub open: Option<u32>,
+    /// Open segments, newest first: the first two continue the writer's two streams, the
+    /// rest are sealed by its first batch.
+    pub open: Vec<u32>,
     pub report: RecoveryReport,
 }
 
@@ -63,7 +65,8 @@ pub(crate) fn recover<F: BlockFile>(
     // Replay.
     let mut pos = sb.start_pos;
     let mut lsn = sb.start_lsn;
-    let mut last_batch: Vec<PutRecord> = Vec::new();
+    // The last batch's Puts, each with the fragment it displaced when it was a relocation.
+    let mut last_batch: Vec<(PutRecord, Option<Fragment>)> = Vec::new();
     let max_frames = geometry
         .log_size
         .checked_div(geometry.block)
@@ -94,12 +97,16 @@ pub(crate) fn recover<F: BlockFile>(
         for record in &records {
             match record {
                 LogRecord::Put(p) => {
-                    index
+                    let outcome = index
                         .insert(p.key, p, per_chunk)
                         .map_err(|_| ChunkError::CorruptLog { lsn: header.lsn })?;
                     sequence = sequence.max(p.sequence);
                     if header.kind == KIND_BATCH {
-                        last_batch.push(*p);
+                        let displaced = match outcome {
+                            Inserted::Replaced(old) => Some(old),
+                            Inserted::Added | Inserted::Unchanged => None,
+                        };
+                        last_batch.push((*p, displaced));
                     }
                     // The segment's high-water mark counts every record the log placed there,
                     // including ones a later delete removes from the index: roll-forward must
@@ -144,26 +151,33 @@ pub(crate) fn recover<F: BlockFile>(
 
     // The last batch's flush may not have completed: keep only records whose data verifies.
     // They are the last fragments of their chunks, so they come off in reverse order.
-    for put in last_batch.iter().rev() {
+    for (put, displaced) in last_batch.iter().rev() {
         let verified = verify_at(file, geometry, sb, put.segment, u64::from(put.offset))?
             .is_some_and(|v| v.matches(put));
-        if !verified
-            && index
+        if verified {
+            continue;
+        }
+        // A relocation whose new copy did not reach the disk goes back to the copy it moved:
+        // that segment is freed only after a relocation is durable, so the old copy is intact.
+        let undone = match displaced {
+            Some(old) => index.restore_fragment(&put.key, old),
+            None => index
                 .pop_fragment(&put.key, put.chunk_offset, put.sequence)
-                .is_some()
-        {
+                .is_some(),
+        };
+        if undone {
             report.unflushed_dropped = report.unflushed_dropped.saturating_add(1);
         }
     }
 
     // Roll forward through open segments.
-    let mut open = None;
+    let mut open = Vec::new();
     for (i, info) in segments.iter_mut().enumerate() {
         if info.state != SegmentState::Open {
             continue;
         }
         let segment = u32::try_from(i).map_err(|_| ChunkError::Full)?;
-        open = Some(segment);
+        open.push((info.incarnation, segment));
         let mut at = u64::from(info.write_pos).max(geometry.block);
         while at < geometry.segment_size {
             let Some(found) = verify_at(file, geometry, sb, segment, at)? else {
@@ -196,6 +210,8 @@ pub(crate) fn recover<F: BlockFile>(
         }
     }
 
+    open.sort_unstable_by(|a, b| b.cmp(a));
+    let open: Vec<u32> = open.into_iter().map(|(_, s)| s).collect();
     let used = distance(sb.start_pos, pos, geometry.log_size);
     Ok(Recovered {
         index,

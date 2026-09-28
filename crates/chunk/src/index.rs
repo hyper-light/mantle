@@ -79,6 +79,15 @@ impl Entry {
     }
 }
 
+/// What an insert did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Inserted {
+    Added,
+    /// The fragment moved: this is where it was.
+    Replaced(Fragment),
+    Unchanged,
+}
+
 /// Why an index update was refused. The writer validates every request before it writes,
 /// so these arise only from a log whose frames contradict each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,14 +122,15 @@ impl Index {
         self.map.iter()
     }
 
-    /// Adds a fragment written for `key`. A fragment identical to one already present (the
-    /// same record replayed twice) changes nothing.
+    /// Adds a fragment written for `key`. The same bytes at the same chunk offset replace the
+    /// fragment already there when written no earlier (a relocated copy, or the same record
+    /// replayed twice); the outcome says which happened.
     pub fn insert(
         &mut self,
         key: ChunkKey,
         put: &PutRecord,
         max_fragments: usize,
-    ) -> Result<(), Inconsistent> {
+    ) -> Result<Inserted, Inconsistent> {
         let fragment = Fragment::from_put(put);
         let sealed = put.flags & FLAG_FINAL != 0;
         let entry = self.map.entry(key).or_insert_with(|| Entry {
@@ -132,17 +142,21 @@ impl Index {
             && existing.payload_len == fragment.payload_len
             && existing.payload_crc == fragment.payload_crc
         {
+            let existing = *existing;
+            entry.sealed |= sealed;
+            if existing == fragment || fragment.sequence < existing.sequence {
+                return Ok(Inserted::Unchanged);
+            }
             // The same bytes at a newer location: a relocated copy supersedes the old one.
-            if fragment.sequence >= existing.sequence
-                && let Ok(i) = entry
-                    .fragments
-                    .binary_search_by_key(&fragment.chunk_offset, |f| f.chunk_offset)
+            if let Ok(i) = entry
+                .fragments
+                .binary_search_by_key(&fragment.chunk_offset, |f| f.chunk_offset)
                 && let Some(slot) = entry.fragments.get_mut(i)
             {
                 *slot = fragment;
+                return Ok(Inserted::Replaced(existing));
             }
-            entry.sealed |= sealed;
-            return Ok(());
+            return Ok(Inserted::Unchanged);
         }
         if entry.sealed {
             return Err(Inconsistent::Sealed);
@@ -167,11 +181,35 @@ impl Index {
         entry.fragments.push(fragment);
         entry.sealed = sealed;
         entry.time_ns = put.time_ns;
-        Ok(())
+        Ok(Inserted::Added)
     }
 
     pub fn remove(&mut self, key: &ChunkKey) -> Option<Entry> {
         self.map.remove(key)
+    }
+
+    /// Puts `fragment` back in place of the copy of the same bytes that replaced it; true if
+    /// there was such a copy to put it back over.
+    pub fn restore_fragment(&mut self, key: &ChunkKey, fragment: &Fragment) -> bool {
+        let Some(entry) = self.map.get_mut(key) else {
+            return false;
+        };
+        let Ok(i) = entry
+            .fragments
+            .binary_search_by_key(&fragment.chunk_offset, |f| f.chunk_offset)
+        else {
+            return false;
+        };
+        match entry.fragments.get_mut(i) {
+            Some(slot)
+                if slot.payload_len == fragment.payload_len
+                    && slot.payload_crc == fragment.payload_crc =>
+            {
+                *slot = *fragment;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Removes `key`'s last fragment if it is the one at `chunk_offset` written with

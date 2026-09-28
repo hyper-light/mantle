@@ -31,16 +31,19 @@ two superblocks, self-describing data records with a CRC-32C per checksum block,
 index log with a second copy of every record's identity, the group-commit writer that
 flushes once per batch and fences the volume on a failed write or flush, reads that
 verify every byte they return, checkpoints and log wrap-around, reuse of segments that
-empty out, and crash recovery (replay, verification of the last batch, roll-forward, and a
-checkpoint that makes recovery's corrections durable). Tested with randomized workloads
-cut by power loss at every point on the simulated device (6,000 runs per soak, no
-acknowledged write lost, no unverified byte returned) and with bit flips, read errors,
-damaged superblocks, damaged log frames and failed writes and flushes.
+empty out, cleaning of partly dead segments chosen by cost-benefit (relocations batched
+into the cleaner's own stream, a reserve segment kept for it, and passes that stop when
+they cannot gain space), and crash recovery (replay, verification of the last batch,
+roll-forward, and a checkpoint that makes recovery's corrections durable). Tested with
+randomized workloads, cleaning included, cut by power loss at every point on the
+simulated device (20,000 runs per soak: no acknowledged write lost, no unverified byte
+returned) and with bit flips, read errors, damaged superblocks, damaged log frames and
+failed writes and flushes.
 
 Remaining before it is done:
 
-- Cleaning: copying the live records out of partly dead segments, chosen by cost-benefit.
 - Scrubbing on the schedule in the design.
+- A grace period before deleted data is reclaimed.
 - Writing new file regions once before use where calibration measures a first-write penalty.
 - An I/O path that keeps the measured number of reads in flight.
 - The same crash workloads against real disks, with the process killed by `kill -9`.

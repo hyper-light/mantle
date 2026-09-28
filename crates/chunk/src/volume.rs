@@ -9,12 +9,13 @@ use std::thread::JoinHandle;
 use mantle_disk::DiskError;
 use mantle_disk::block::BlockFile;
 
+use crate::clean::{CleanReport, Cleaner};
 use crate::error::ChunkError;
 use crate::frame::SegmentState;
 use crate::index::Fragment;
 use crate::key::ChunkKey;
 use crate::layout::{Config, Geometry};
-use crate::record;
+use crate::read;
 use crate::recover::{self, RecoveryReport, read_span};
 use crate::superblock::{OFFSET_A, OFFSET_B_COMPACT, OFFSET_B_STANDARD, Superblock};
 use crate::writer::{Op, Request, Shared, Writer, write_superblock};
@@ -42,7 +43,12 @@ pub struct Volume<F: BlockFile + 'static> {
     shared: Arc<Shared<F>>,
     sender: Option<SyncSender<Request>>,
     writer: Option<JoinHandle<()>>,
+    /// Dropping it stops the cleaner.
+    wake_cleaner: Option<SyncSender<()>>,
+    cleaner: Option<JoinHandle<()>>,
     superblock: Superblock,
+    watermarks: (usize, usize),
+    limits: crate::layout::Limits,
 }
 
 impl<F: BlockFile + 'static> Volume<F> {
@@ -120,21 +126,35 @@ impl<F: BlockFile + 'static> Volume<F> {
             checksum_shift: superblock.checksum_shift,
             index: RwLock::new(recovered.index),
             fenced: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
+            dead_bytes: std::sync::atomic::AtomicU64::new(0),
             usage: RwLock::new(recovered.segments.clone()),
         });
         let (sender, rx) = sync_channel(config.limits.queue.max(1));
+        let (wake, wakes) = sync_channel(1);
+        // Clean below one sixteenth of the segments free, up to one eighth; never below the
+        // two a relocation needs (one being cleaned, one to write into).
+        let segments = usize::try_from(geometry.segments).unwrap_or(usize::MAX);
+        let low = (segments / 16).max(2);
+        let high = (segments / 8).max(low.saturating_add(1));
         let report = recovered.report;
+        let mut opens = recovered.open.into_iter();
+        let client = opens.next();
+        let clean = opens.next();
         let mut writer = Writer {
             shared: Arc::clone(&shared),
             config,
             rx,
             segments: recovered.segments,
-            open: recovered.open,
+            opens: [client, clean],
+            stale: opens.collect(),
             incarnation: recovered.incarnation,
             sequence: recovered.sequence,
             cursor: recovered.cursor,
             superblock: superblock.clone(),
             fragments: recovered.fragments,
+            poke: Some(wake.clone()),
+            low_water: low,
         };
         // Recovery changed the index relative to the log: it dropped records whose flush
         // never completed, or indexed records the log never named. Both decisions live only
@@ -144,22 +164,40 @@ impl<F: BlockFile + 'static> Volume<F> {
             writer.checkpoint()?;
         }
         let superblock = writer.superblock.clone();
+        let spawn_error = |e| {
+            ChunkError::Device(DiskError::Io {
+                op: "spawn thread",
+                path: std::path::PathBuf::new(),
+                source: e,
+            })
+        };
         let handle = std::thread::Builder::new()
             .name("mantle-chunk-writer".into())
             .spawn(move || writer.run())
-            .map_err(|e| {
-                ChunkError::Device(DiskError::Io {
-                    op: "spawn writer",
-                    path: std::path::PathBuf::new(),
-                    source: e,
-                })
-            })?;
+            .map_err(spawn_error)?;
+        let cleaner = Cleaner {
+            shared: Arc::clone(&shared),
+            submit: sender.clone(),
+            wake: wakes,
+            low,
+            high,
+            batch_bytes: config.limits.batch_bytes,
+            batch_moves: config.limits.batch_requests,
+        };
+        let cleaner = std::thread::Builder::new()
+            .name("mantle-chunk-cleaner".into())
+            .spawn(move || cleaner.run())
+            .map_err(spawn_error)?;
         Ok((
             Self {
                 shared,
                 sender: Some(sender),
                 writer: Some(handle),
+                wake_cleaner: Some(wake),
+                cleaner: Some(cleaner),
                 superblock,
+                watermarks: (low, high),
+                limits: config.limits,
             },
             report,
         ))
@@ -283,85 +321,26 @@ impl<F: BlockFile + 'static> Volume<F> {
             let to = end
                 .min(fragment.end())
                 .saturating_sub(fragment.chunk_offset);
-            self.read_fragment(key, fragment, from, to, &mut out)?;
+            read::fragment(&self.shared, key, fragment, from, to, &mut out)?;
         }
         Ok(out)
     }
 
-    /// Appends payload bytes `[from, to)` of one fragment to `out`, verified.
-    fn read_fragment(
-        &self,
-        key: &ChunkKey,
-        fragment: &Fragment,
-        from: u64,
-        to: u64,
-        out: &mut Vec<u8>,
-    ) -> Result<(), ChunkError> {
-        let corrupt = |detail: &str| ChunkError::Corrupt {
-            key: *key,
-            detail: detail.to_owned(),
+    /// Cleans the `n` segments with the best cost-benefit ratio now, whatever the free
+    /// space, and waits for their space to be freed.
+    pub fn clean(&self, n: u32) -> Result<CleanReport, ChunkError> {
+        let submit = self.sender.clone().ok_or(ChunkError::Closed)?;
+        let (_, wakes) = sync_channel(1);
+        let cleaner = Cleaner {
+            shared: Arc::clone(&self.shared),
+            submit,
+            wake: wakes,
+            low: self.watermarks.0,
+            high: self.watermarks.1,
+            batch_bytes: self.limits.batch_bytes,
+            batch_moves: self.limits.batch_requests,
         };
-        let geometry = &self.shared.geometry;
-        let shift = self.shared.checksum_shift;
-        let block_size = 1u64.checked_shl(u32::from(shift)).unwrap_or(u64::MAX);
-        let prefix_len = record::prefix_len(fragment.payload_len, shift)
-            .and_then(|p| u64::try_from(p).ok())
-            .ok_or_else(|| corrupt("record size"))?;
-        let base = geometry
-            .segment_offset(fragment.segment)
-            .ok_or_else(|| corrupt("segment"))?;
-        let first_block = from.checked_div(block_size).unwrap_or(0);
-        let last_block_end = to
-            .div_ceil(block_size)
-            .saturating_mul(block_size)
-            .min(u64::from(fragment.payload_len));
-        let payload_from = first_block.saturating_mul(block_size);
-        // One read covering the header and the needed checksum blocks.
-        let span_len = prefix_len.saturating_add(last_block_end);
-        let bytes = match read_span(
-            &self.shared.file,
-            geometry,
-            base,
-            u64::from(fragment.offset),
-            span_len,
-        ) {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => return Err(corrupt("record extends past the end of the volume")),
-            Err(ChunkError::Device(e)) => return Err(corrupt(&format!("read failed: {e}"))),
-            Err(e) => return Err(e),
-        };
-        let prefix =
-            record::decode_prefix(&bytes).ok_or_else(|| corrupt("record header did not verify"))?;
-        let h = &prefix.header;
-        if h.key != *key
-            || h.volume != self.shared.volume
-            || h.segment != fragment.segment
-            || h.incarnation != fragment.incarnation
-            || h.sequence != fragment.sequence
-            || h.chunk_offset != fragment.chunk_offset
-            || h.payload_len != fragment.payload_len
-        {
-            return Err(corrupt("record identity does not match the index"));
-        }
-        let start = usize::try_from(prefix_len.saturating_add(payload_from))
-            .map_err(|_| corrupt("offset"))?;
-        let stop = usize::try_from(prefix_len.saturating_add(last_block_end))
-            .map_err(|_| corrupt("offset"))?;
-        let blocks = bytes
-            .get(start..stop)
-            .ok_or_else(|| corrupt("short record"))?;
-        let first = u32::try_from(first_block).map_err(|_| corrupt("offset"))?;
-        if !record::verify(&prefix, first, blocks) {
-            return Err(corrupt("payload checksum mismatch"));
-        }
-        let skip =
-            usize::try_from(from.saturating_sub(payload_from)).map_err(|_| corrupt("offset"))?;
-        let take = usize::try_from(to.saturating_sub(from)).map_err(|_| corrupt("offset"))?;
-        let wanted = blocks
-            .get(skip..skip.saturating_add(take))
-            .ok_or_else(|| corrupt("short record"))?;
-        out.extend_from_slice(wanted);
-        Ok(())
+        cleaner.clean_best(n)
     }
 
     /// Stops the writer after it answers what is queued. Everything acknowledged is already
@@ -371,9 +350,18 @@ impl<F: BlockFile + 'static> Volume<F> {
     }
 
     fn shutdown(&mut self) {
+        // The cleaner holds a sender to the writer, so it stops first. The writer holds a
+        // wake sender of its own, so the cleaner is told to stop and then woken.
+        self.shared.stopping.store(true, Ordering::Release);
+        if let Some(wake) = self.wake_cleaner.take() {
+            let _ = wake.try_send(());
+        }
+        if let Some(handle) = self.cleaner.take() {
+            // A thread that unwound has already stopped; there is nothing more to wait for.
+            let _ = handle.join();
+        }
         self.sender.take();
         if let Some(handle) = self.writer.take() {
-            // A writer that unwound has already stopped; there is nothing more to wait for.
             let _ = handle.join();
         }
     }
@@ -430,4 +418,15 @@ fn random_id() -> Result<u128, ChunkError> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(|e| ChunkError::Config(format!("random id: {e}")))?;
     Ok(u128::from_le_bytes(bytes))
+}
+
+impl<F: BlockFile + 'static> Volume<F> {
+    /// Each segment's state, incarnation, write position and live bytes.
+    pub fn segments(&self) -> Result<Vec<(SegmentState, u32, u32, u64)>, ChunkError> {
+        let usage = self.shared.usage.read().map_err(|_| ChunkError::Fenced)?;
+        Ok(usage
+            .iter()
+            .map(|s| (s.state, s.incarnation, s.write_pos, s.live))
+            .collect())
+    }
 }

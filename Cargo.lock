@@ -97,8 +97,10 @@ name = "mantle-disk"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "rustix",
  "tempfile",
  "thiserror",
+ "windows-sys",
 ]
 
 [[package]]

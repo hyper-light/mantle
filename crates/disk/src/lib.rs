@@ -12,4 +12,32 @@
     )
 )]
 
+use std::path::PathBuf;
+
 pub mod buf;
+pub mod file;
+
+#[derive(Debug, thiserror::Error)]
+pub enum DiskError {
+    #[error("{op} {}: {source}", path.display())]
+    Io {
+        op: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("direct transfer at offset {offset} of {len} bytes is not aligned to {align}")]
+    Misaligned {
+        offset: u64,
+        len: usize,
+        align: usize,
+    },
+    #[error("{} ended at offset {offset}: {missing} bytes short", path.display())]
+    ShortRead {
+        path: PathBuf,
+        offset: u64,
+        missing: usize,
+    },
+    #[error(transparent)]
+    Buf(#[from] buf::BufError),
+}

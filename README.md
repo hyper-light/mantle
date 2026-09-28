@@ -170,8 +170,9 @@ cell map switches to the new owner. Every cell has a maximum size at which it is
 so when a deployment needs more space or throughput, it adds cells.
 
 The design documents are in [docs/design/](docs/design/), starting with the
-[chunk store](docs/design/chunk-store.md). The papers and platform documentation they
-cite are summarized in [docs/research/](docs/research/).
+[architecture](docs/design/architecture.md) and the [chunk store](docs/design/chunk-store.md).
+The papers and platform documentation they cite are summarized in
+[docs/research/](docs/research/).
 
 ## From a laptop to a fleet
 
@@ -198,6 +199,7 @@ write is proposed by a replica that is not the leader.
 | Doc | Contents |
 |---|---|
 | [Status](docs/STATUS.md) | Implemented components, and the tests that will complete the rest |
+| [Architecture](docs/design/architecture.md) | Regions, cells and ranges: routing, moving data between cells, isolation |
 | [Chunk store](docs/design/chunk-store.md) | On-disk layout, the write path, crash recovery, space reclamation |
 | [Research](docs/research/) | Summaries of the papers and platform documentation the design cites |
 | [Measurements](docs/measurements/) | Measurements taken on real hardware and the design changes they led to |

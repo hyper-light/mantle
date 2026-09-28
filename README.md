@@ -98,6 +98,24 @@ writes into one flush keeps that cost from limiting how many writes complete per
 This section describes the design. [docs/STATUS.md](docs/STATUS.md) lists which parts
 are implemented.
 
+```
+S3 client          gateway                   cell that owns the key    storage nodes
+PUT bucket/key ──▶ check the signature;
+                   find the key's cell
+                   in the cell map ────────▶ choose disks across
+                                             racks for the chunks ───▶ add each chunk to
+                                                                       its disk's batch;
+                                                                       write, flush once
+                                             commit the name ◀──────── durable
+200 OK ◀────────── reply ◀────────────────── committed
+
+GET bucket/key ──▶ find the key's cell ────▶ find the chunks ────────▶ read each chunk;
+                                                                       check its identity
+                                                                       and CRC-32Cs
+object bytes ◀──── stream them ◀──────────── rebuild any chunk ◀────── verified bytes
+                                             that fails
+```
+
 **Finding the cell.** Each bucket's keys are divided into ranges of consecutive names, and
 every range belongs to one cell. A small cell map, replicated with Raft, records which cell
 owns each range. The S3 gateway authenticates a request, looks up the owner in its copy of

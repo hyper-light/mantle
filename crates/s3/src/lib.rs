@@ -15,4 +15,5 @@
 
 pub mod checksum;
 pub mod chunked;
+pub mod route;
 pub mod sigv4;

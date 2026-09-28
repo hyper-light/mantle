@@ -18,6 +18,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 mod bench;
+mod bench_ec;
 mod disk;
 mod display;
 
@@ -67,6 +68,17 @@ enum BenchCommand {
         /// Leave out the measurement of the device itself.
         #[arg(long)]
         skip_device: bool,
+    },
+    /// Measure erasure coding on one core: encoding, and rebuilding after losing one data
+    /// chunk and as many as each code tolerates.
+    Ec {
+        /// Seconds each measurement runs.
+        #[arg(long, default_value_t = 0.5)]
+        seconds: f64,
+        /// Chunk sizes to measure, comma-separated, in bytes or with a K or M suffix: 64K,1M,8M
+        /// by default.
+        #[arg(long, value_delimiter = ',', value_parser = parse_size)]
+        sizes: Vec<usize>,
     },
 }
 
@@ -140,6 +152,19 @@ fn main() -> ExitCode {
                 },
             )
             .map_err(|e| e.to_string()),
+            Err(_) => Err(format!("--seconds {seconds} is not a duration")),
+        },
+        Command::Bench {
+            command: BenchCommand::Ec { seconds, sizes },
+        } => match std::time::Duration::try_from_secs_f64(seconds) {
+            Ok(step) => {
+                let sizes = if sizes.is_empty() {
+                    vec![64 << 10, 1 << 20, 8 << 20]
+                } else {
+                    sizes
+                };
+                bench_ec::ec(&mut out, &bench_ec::CODES, &sizes, step).map_err(|e| e.to_string())
+            }
             Err(_) => Err(format!("--seconds {seconds} is not a duration")),
         },
     };

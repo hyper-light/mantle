@@ -17,6 +17,7 @@ path = "src/main.rs"
 clap.workspace = true
 mantle-chunk = { path = "../chunk" }
 mantle-disk = { path = "../disk" }
+mantle-ec = { path = "../ec" }
 
 [dev-dependencies]
 tempfile.workspace = true

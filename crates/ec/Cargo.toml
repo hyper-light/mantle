@@ -1,0 +1,20 @@
+[package]
+name = "mantle-ec"
+description = "Reed-Solomon erasure coding of blocks into chunks"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+reed-solomon-simd.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

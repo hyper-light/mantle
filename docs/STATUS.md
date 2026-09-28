@@ -49,30 +49,42 @@ Remaining before it is done:
 
 - Writing new file regions once before use where calibration measures a first-write penalty.
 - An I/O path that keeps the measured number of reads in flight.
-- Benchmarks of write and read throughput and latency against the raw-device numbers.
+- `mantle bench chunk` measures puts and reads next to the same reads through the file
+  layer ([measurements](measurements/2026-09-28-chunk-store-benchmark.md)). Remaining: each
+  point repeated until its result is statistically stable, and large puts brought closer
+  to the device's durable bandwidth.
+
+**Erasure coding** (`mantle-ec`). Systematic Reed–Solomon over GF(2^16) with contiguous
+data chunks, from `reed-solomon-simd` behind an unwind boundary. Every combination of lost
+chunks within the tolerance of RS(2,1) through RS(9,6) is rebuilt byte for byte in the
+tests, and `mantle bench ec` measures encoding and rebuilding per code
+([measurements](measurements/2026-09-28-erasure-coding.md)).
+
+Remaining before it is done:
+
+- Choosing the code for a block from the failure domains available and a durability
+  target, computed from failure and repair rates under correlated failures
+  (docs/research/04 §A5) rather than from a table.
 
 ## Planned, in order
 
-1. **Erasure coding.** Reed–Solomon layouts chosen from the number of available failure
-   domains. Done when encoding and decoding are benchmarked for each layout, and every
-   combination of lost chunks within a layout's tolerance is rebuilt correctly.
-2. **Metadata service.** Ranges of object names, file layouts and chunk locations, each
+1. **Metadata service.** Ranges of object names, file layouts and chunk locations, each
    replicated with focal's Raft implementation and its fast-track commit, over QUIC for
    bulk transfers and a UDP transport for consensus messages, and lazy deletion that keeps
    an unreferenced block's chunks for a grace period. Done when a linearizability
    checker accepts histories recorded under network partitions, process crashes and disk
    faults, both in deterministic simulation and with real processes.
-3. **S3 gateway.** Request signing (including presigned URLs and chunked uploads with
+2. **S3 gateway.** Request signing (including presigned URLs and chunked uploads with
    trailing checksums), buckets, PUT, GET with byte ranges, HEAD, DELETE and batch
    delete, copy, ListObjects and ListObjectsV2, multipart uploads including resuming an
    interrupted upload, versioning, conditional requests and checksums. Done when
    end-to-end suites using the AWS CLI, boto3 and the AWS SDK for Rust pass against a
    running mantle, and ceph's s3-tests pass for every supported feature.
-4. **Multi-machine operation.** Placement across racks and zones, repair ordered by
+3. **Multi-machine operation.** Placement across racks and zones, repair ordered by
    remaining redundancy, rebalancing, and retiring disks that start to fail. Done when
    tests that fail disks, machines and racks during writes show that every acknowledged
    write can still be read back.
-5. **Cells.** A replicated map of which cell owns each key range, routing from cached
+4. **Cells.** A replicated map of which cell owns each key range, routing from cached
    copies of it with redirects after a range moves, moving a range between cells while it
    is read and written, and adding and retiring cells. Done when ranges move between cells
    under a mixed workload with no lost write and no stale read, and failing or upgrading

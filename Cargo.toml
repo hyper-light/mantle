@@ -17,6 +17,7 @@ clap = { version = "4.6", features = ["derive"] }
 getrandom = "0.4"
 crc-fast = { version = "1.10", default-features = false, features = ["std"] }
 proptest = "1.11"
+reed-solomon-simd = "3.1"
 rustix = { version = "1.1", features = ["fs", "system", "param"] }
 tempfile = "3.20"
 thiserror = "2.0"
@@ -71,3 +72,9 @@ debug = "line-tables-only"
 
 [profile.bench]
 inherits = "release"
+
+# Debug builds optimize the erasure-coding library alone: unoptimized, its FFT made the test
+# that rebuilds every loss pattern of every code take 116 s instead of 6 s. mantle's own code
+# stays a debug build with every check.
+[profile.dev.package.reed-solomon-simd]
+opt-level = 3

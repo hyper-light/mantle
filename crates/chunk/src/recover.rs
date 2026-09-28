@@ -40,7 +40,7 @@ pub(crate) struct Recovered {
     pub segments: Vec<SegmentInfo>,
     pub cursor: Cursor,
     pub sequence: u64,
-    pub incarnation: u32,
+    pub incarnation: u64,
     pub fragments: u64,
     /// Open segments, newest first: the first two continue the writer's two streams, the
     /// rest are sealed by its first batch.
@@ -59,8 +59,9 @@ pub(crate) fn recover<F: BlockFile>(
     let segment_count = usize::try_from(geometry.segments).map_err(|_| ChunkError::Full)?;
     let mut segments = vec![SegmentInfo::FREE; segment_count];
     let mut report = RecoveryReport::default();
-    let mut sequence = 0u64;
-    let mut incarnation = 0u32;
+    // Every number the device might hold is within the superblock's reservations.
+    let mut sequence = sb.sequence_limit;
+    let mut incarnation = sb.incarnation_limit;
 
     // Replay.
     let mut pos = sb.start_pos;

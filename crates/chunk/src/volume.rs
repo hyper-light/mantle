@@ -76,6 +76,9 @@ impl<F: BlockFile + 'static> Volume<F> {
             data_offset: geometry.data_offset,
             start_lsn: 1,
             start_pos: 0,
+            // Nothing issued, nothing reserved: the first batch reserves.
+            sequence_limit: 0,
+            incarnation_limit: 0,
         };
         let a = base.clone();
         let b = Superblock {
@@ -266,6 +269,12 @@ impl<F: BlockFile + 'static> Volume<F> {
     /// Deletes a chunk; deleting one that does not exist succeeds.
     pub fn delete(&self, key: ChunkKey) -> Result<(), ChunkError> {
         self.submit(Op::Delete { key })
+    }
+
+    /// Writes the whole index into the log and points the superblock at it, so the next open
+    /// replays nothing written before now. Returns once it is durable.
+    pub fn checkpoint(&self) -> Result<(), ChunkError> {
+        self.submit(Op::Checkpoint)
     }
 
     fn submit(&self, op: Op) -> Result<(), ChunkError> {
@@ -485,7 +494,7 @@ fn random_id() -> Result<u128, ChunkError> {
 
 impl<F: BlockFile + 'static> Volume<F> {
     /// Each segment's state, incarnation, write position and live bytes.
-    pub fn segments(&self) -> Result<Vec<(SegmentState, u32, u32, u64)>, ChunkError> {
+    pub fn segments(&self) -> Result<Vec<(SegmentState, u64, u32, u64)>, ChunkError> {
         let usage = self.shared.usage.read().map_err(|_| ChunkError::Fenced)?;
         Ok(usage
             .iter()

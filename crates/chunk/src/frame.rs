@@ -11,7 +11,7 @@ use crate::codec::{Reader, Writer};
 use crate::key::ChunkKey;
 
 pub const FRAME_MAGIC: [u8; 4] = *b"MNIX";
-pub const FRAME_VERSION: u16 = 1;
+pub const FRAME_VERSION: u16 = 2;
 pub const FRAME_HEADER: usize = 48;
 const CRC_AT: usize = 44;
 
@@ -26,16 +26,16 @@ const TAG_PUT: u8 = 1;
 const TAG_DELETE: u8 = 2;
 const TAG_SEGMENT: u8 = 3;
 
-pub const PUT_LEN: usize = 1 + ChunkKey::ENCODED_LEN + 4 + 4 + 4 + 4 + 8 + 4 + 4 + 8 + 8 + 1;
+pub const PUT_LEN: usize = 1 + ChunkKey::ENCODED_LEN + 4 + 8 + 4 + 4 + 8 + 4 + 4 + 8 + 8 + 1;
 pub const DELETE_LEN: usize = 1 + ChunkKey::ENCODED_LEN + 8 + 8;
-pub const SEGMENT_LEN: usize = 1 + 4 + 4 + 1 + 4;
+pub const SEGMENT_LEN: usize = 1 + 4 + 8 + 1 + 4;
 
 /// A chunk fragment written at a location.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PutRecord {
     pub key: ChunkKey,
     pub segment: u32,
-    pub incarnation: u32,
+    pub incarnation: u64,
     /// Byte offset of the data record within its segment.
     pub offset: u32,
     /// Bytes of the whole data record, header to padding.
@@ -87,7 +87,7 @@ impl SegmentState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentRecord {
     pub segment: u32,
-    pub incarnation: u32,
+    pub incarnation: u64,
     pub state: SegmentState,
     /// Bytes of the segment written in this incarnation.
     pub write_pos: u32,
@@ -115,7 +115,7 @@ impl LogRecord {
                 w.u8(TAG_PUT);
                 p.key.encode(w);
                 w.u32(p.segment);
-                w.u32(p.incarnation);
+                w.u64(p.incarnation);
                 w.u32(p.offset);
                 w.u32(p.record_len);
                 w.u64(p.chunk_offset);
@@ -134,7 +134,7 @@ impl LogRecord {
             Self::Segment(s) => {
                 w.u8(TAG_SEGMENT);
                 w.u32(s.segment);
-                w.u32(s.incarnation);
+                w.u64(s.incarnation);
                 w.u8(s.state.code());
                 w.u32(s.write_pos);
             }
@@ -146,7 +146,7 @@ impl LogRecord {
             TAG_PUT => Some(Self::Put(PutRecord {
                 key: ChunkKey::decode(r)?,
                 segment: r.u32()?,
-                incarnation: r.u32()?,
+                incarnation: r.u64()?,
                 offset: r.u32()?,
                 record_len: r.u32()?,
                 chunk_offset: r.u64()?,
@@ -163,7 +163,7 @@ impl LogRecord {
             })),
             TAG_SEGMENT => Some(Self::Segment(SegmentRecord {
                 segment: r.u32()?,
-                incarnation: r.u32()?,
+                incarnation: r.u64()?,
                 state: SegmentState::from_code(r.u8()?)?,
                 write_pos: r.u32()?,
             })),

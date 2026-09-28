@@ -29,7 +29,7 @@ pub struct RecordHeader {
     pub checksum_shift: u8,
     pub volume: u128,
     pub segment: u32,
-    pub incarnation: u32,
+    pub incarnation: u64,
     pub sequence: u64,
     pub key: ChunkKey,
     pub chunk_offset: u64,
@@ -91,7 +91,7 @@ pub fn encode(header: &RecordHeader, payload: &[u8], out: &mut Vec<u8>) -> Optio
     w.u8(0);
     w.u128(header.volume);
     w.u32(header.segment);
-    w.u32(header.incarnation);
+    w.u64(header.incarnation);
     w.u64(header.sequence);
     header.key.encode(&mut w);
     w.u16(0);
@@ -99,7 +99,6 @@ pub fn encode(header: &RecordHeader, payload: &[u8], out: &mut Vec<u8>) -> Optio
     w.u32(header.payload_len);
     w.u32(u32::try_from(table.len()).ok()?);
     w.u64(header.time_ns);
-    w.u32(0);
     // The CRC covers the header before it and the table after it.
     let mut crc = mantle_crc::Crc32c::new();
     crc.update(w.as_slice());
@@ -154,7 +153,7 @@ pub fn peek_lengths(bytes: &[u8]) -> Option<Lengths> {
     if checksum_shift > 30 {
         return None;
     }
-    r.take(1 + 16 + 4 + 4 + 8 + ChunkKey::ENCODED_LEN + 2 + 8)?;
+    r.take(1 + 16 + 4 + 8 + 8 + ChunkKey::ENCODED_LEN + 2 + 8)?;
     Some(Lengths {
         payload_len: r.u32()?,
         checksum_shift,
@@ -173,7 +172,7 @@ pub fn decode_prefix(bytes: &[u8]) -> Option<Prefix> {
     r.u8()?;
     let volume = r.u128()?;
     let segment = r.u32()?;
-    let incarnation = r.u32()?;
+    let incarnation = r.u64()?;
     let sequence = r.u64()?;
     let key = ChunkKey::decode(&mut r)?;
     r.u16()?;
@@ -181,7 +180,6 @@ pub fn decode_prefix(bytes: &[u8]) -> Option<Prefix> {
     let payload_len = r.u32()?;
     let count = r.u32()?;
     let time_ns = r.u64()?;
-    r.u32()?;
     let crc = r.u32()?;
     if checksum_shift > 30 || blocks(payload_len, checksum_shift)? != count {
         return None;
@@ -242,7 +240,7 @@ pub fn verify(prefix: &Prefix, first: u32, data: &[u8]) -> bool {
 pub struct SegmentHeader {
     pub volume: u128,
     pub segment: u32,
-    pub incarnation: u32,
+    pub incarnation: u64,
     pub time_ns: u64,
 }
 
@@ -252,7 +250,7 @@ impl SegmentHeader {
         w.bytes(&SEGMENT_MAGIC);
         w.u128(self.volume);
         w.u32(self.segment);
-        w.u32(self.incarnation);
+        w.u64(self.incarnation);
         w.u64(self.time_ns);
         let crc = mantle_crc::crc32c(w.as_slice());
         w.u32(crc);
@@ -268,7 +266,7 @@ impl SegmentHeader {
         let header = Self {
             volume: r.u128()?,
             segment: r.u32()?,
-            incarnation: r.u32()?,
+            incarnation: r.u64()?,
             time_ns: r.u64()?,
         };
         let covered = r.position();

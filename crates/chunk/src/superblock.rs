@@ -9,7 +9,7 @@
 use crate::codec::{Reader, Writer};
 
 pub const MAGIC: [u8; 8] = *b"MNTLVOL1";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// Superblock A's offset.
 pub const OFFSET_A: u64 = 0;
@@ -37,6 +37,11 @@ pub struct Superblock {
     pub start_lsn: u64,
     /// That frame's byte position within the log region.
     pub start_pos: u64,
+    /// Every record sequence and segment incarnation issued so far is at most these. They
+    /// are raised here before any record uses a higher number, and recovery resumes above
+    /// them, so no number that might still be on the device is issued twice.
+    pub sequence_limit: u64,
+    pub incarnation_limit: u64,
 }
 
 impl Superblock {
@@ -60,6 +65,8 @@ impl Superblock {
         w.u64(self.data_offset);
         w.u64(self.start_lsn);
         w.u64(self.start_pos);
+        w.u64(self.sequence_limit);
+        w.u64(self.incarnation_limit);
         let body = size.saturating_sub(4);
         w.zeros(body.saturating_sub(w.len()));
         let crc = mantle_crc::crc32c(w.as_slice());
@@ -101,6 +108,8 @@ impl Superblock {
             data_offset: r.u64()?,
             start_lsn: r.u64()?,
             start_pos: r.u64()?,
+            sequence_limit: r.u64()?,
+            incarnation_limit: r.u64()?,
         };
         Some(sb)
     }
@@ -135,6 +144,8 @@ mod tests {
             data_offset: 2 << 20,
             start_lsn: 1,
             start_pos: 0,
+            sequence_limit: 1 << 24,
+            incarnation_limit: 1 << 16,
         }
     }
 

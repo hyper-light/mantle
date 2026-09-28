@@ -27,7 +27,7 @@ All offsets and lengths are multiples of the volume's block size `B`: the larger
 
 | Region | Offset | Size | Contents |
 |---|---|---|---|
-| Superblock A | 0 | `B` | volume identity, geometry, checkpoint pointer, sequence, CRC-32C |
+| Superblock A | 0 | `B` | volume identity, geometry, checkpoint pointer, identifier reservations, sequence, CRC-32C |
 | Superblock B | 16 MiB | `B` | same; written alternately with A |
 | Index log | 32 MiB | `L` | circular log of index frames |
 | Segments | after the log, segment-aligned | `n × S` | data records, written sequentially |
@@ -60,20 +60,20 @@ offset size field
 5      1    flags: bit 0 = final (the chunk is sealed at this record's end)
 6      1    checksum-block shift k (checksum blocks of 2^k bytes; 16 = 64 KiB)
 7      1    reserved (0)
-8      4    segment number
-12     4    segment incarnation
-16     8    sequence (volume-wide, monotonic)
-24     16   block id
-40     4    epoch (layout generation of the block)
-44     2    chunk index
-46     2    reserved (0)
-48     8    chunk offset of the payload
-56     4    payload length
-60     4    number of checksum blocks
-64     8    write time (Unix ns)
-72     4    reserved (0)
-76     4    CRC-32C of bytes [0,76) and the checksum table
-80     4n   checksum table: CRC-32C of each 2^k-byte block of the payload
+8      16   volume id
+24     4    segment number
+28     8    segment incarnation (volume-wide, never reused)
+36     8    sequence (volume-wide, never reused)
+44     16   block id
+60     4    epoch (layout generation of the block)
+64     2    chunk index
+66     2    reserved (0)
+68     8    chunk offset of the payload
+76     4    payload length
+80     4    number of checksum blocks
+84     8    write time (Unix ns)
+92     4    CRC-32C of bytes [0,92) and the checksum table
+96     4n   checksum table: CRC-32C of each 2^k-byte block of the payload
 ..     len  payload
 ```
 
@@ -128,6 +128,14 @@ and the volume must be reopened and recovered. A failed flush is never retried, 
 the kernel may already have marked the pages clean [RPA+20 §3]; recovery trusts only what
 the device returns, verified by checksum.
 
+Record sequences and segment incarnations are never reused over the volume's life. A
+freed segment keeps its old records until new ones overwrite them, and a batch whose flush
+failed may leave records the log never names, so numbers derived from the log could
+repeat theirs; a repeated incarnation would let roll-forward (§6) take a stale record for
+a new one. The superblock therefore records a reservation for each, raised with a
+superblock write and flush before any record carries a number past it (2^24 sequences and
+2^16 incarnations at a time), and recovery resumes above it (docs/bugs/2026-09-28).
+
 Streams: client writes and cleaner relocations append to different open segments, so
 data is grouped by age [RO92 §3.6; HKA17 rule 4]. Appends to one chunk must be contiguous
 (the offset equals the chunk's current length) or an exact repeat of a durable fragment
@@ -149,7 +157,8 @@ after it are still needed.
 
 ## 6. Recovery
 
-1. Read both superblocks; take the valid one with the higher sequence.
+1. Read both superblocks; take the valid one with the higher sequence. Sequences and
+   incarnations resume above its reservations (§4).
 2. Load the checkpoint it names and replay index frames in LSN order to the end of the
    log (§3.2 torn-versus-corrupt rule).
 3. Roll forward [RO92 §4.2]: from each open segment's last known write position, scan

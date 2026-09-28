@@ -35,6 +35,16 @@ use crate::superblock::Superblock;
 /// (Rosenblum and Ousterhout, TOCS 1992, §3.6: the cleaner needs clean segments to work).
 pub(crate) const CLEANER_RESERVE: usize = 1;
 
+/// Record sequences and segment incarnations reserved at a time. The superblock records how
+/// far they are reserved before any record carries a number beyond it, and recovery resumes
+/// above the reservation. A freed segment keeps its records until they are overwritten, and
+/// a batch whose flush failed may have left records on the device that the log never names;
+/// numbers taken from what the log remembers could repeat theirs, and a reused incarnation
+/// would let roll-forward take a stale record for a new one. A reservation costs one
+/// superblock write and flush; recovery skips what was reserved but not used.
+pub(crate) const SEQUENCE_RESERVE: u64 = 1 << 24;
+pub(crate) const INCARNATION_RESERVE: u64 = 1 << 16;
+
 pub(crate) enum Op {
     Write {
         key: ChunkKey,
@@ -51,6 +61,8 @@ pub(crate) enum Op {
     Relocate {
         moves: Vec<Move>,
     },
+    /// Writes the whole index into the log after the batch it arrives in.
+    Checkpoint,
 }
 
 /// One fragment the cleaner moves.
@@ -99,7 +111,7 @@ pub(crate) struct Writer<F: BlockFile> {
     pub opens: [Option<u32>; 2],
     /// Segments recovery found open beyond one per stream; sealed by the first batch.
     pub stale: Vec<u32>,
-    pub incarnation: u32,
+    pub incarnation: u64,
     pub sequence: u64,
     pub cursor: Cursor,
     pub superblock: Superblock,
@@ -155,18 +167,18 @@ struct Layout {
     /// Where each touched segment's next record goes.
     positions: HashMap<u32, u64>,
     /// Segments this batch opened, with their incarnations.
-    opened: Vec<(u32, u32)>,
+    opened: Vec<(u32, u64)>,
     sealed: Vec<(u32, u32)>,
     freed: Vec<u32>,
     opens: [Option<u32>; 2],
-    incarnation: u32,
+    incarnation: u64,
     free: Vec<u32>,
     /// Incarnation and write position of each segment before this batch.
-    before: HashMap<u32, (u32, u64)>,
+    before: HashMap<u32, (u64, u64)>,
 }
 
 impl Layout {
-    fn incarnation_of(&self, segment: u32) -> u32 {
+    fn incarnation_of(&self, segment: u32) -> u64 {
         self.opened
             .iter()
             .rev()
@@ -334,16 +346,46 @@ impl<F: BlockFile> Writer<F> {
     }
 
     fn process(&mut self, batch: Vec<Request>) {
+        let (checkpoints, batch): (Vec<Request>, Vec<Request>) = batch
+            .into_iter()
+            .partition(|r| matches!(r.op, Op::Checkpoint));
         if self.cursor.used > self.shared.geometry.log_size / 3
             && let Err(e) = self.checkpoint()
         {
             self.fence();
             let mut first = Some(e);
-            for request in batch {
+            for request in batch.into_iter().chain(checkpoints) {
                 reply(request, Err(first.take().unwrap_or(ChunkError::Fenced)));
             }
             return;
         }
+        self.handle(batch);
+        if checkpoints.is_empty() {
+            return;
+        }
+        let result = if self.shared.fenced.load(Ordering::Acquire) {
+            Err(ChunkError::Fenced)
+        } else {
+            self.checkpoint()
+        };
+        match result {
+            Ok(()) => {
+                for request in checkpoints {
+                    reply(request, Ok(()));
+                }
+            }
+            Err(e) => {
+                self.fence();
+                let mut first = Some(e);
+                for request in checkpoints {
+                    reply(request, Err(first.take().unwrap_or(ChunkError::Fenced)));
+                }
+            }
+        }
+    }
+
+    /// Validates and commits the batch's writes, deletes and relocations.
+    fn handle(&mut self, batch: Vec<Request>) {
         let accepted = match self.validate(batch) {
             Ok(accepted) => accepted,
             Err(()) => return,
@@ -506,6 +548,8 @@ impl<F: BlockFile> Writer<F> {
                         Ok(Decision::Relocate(current))
                     }
                 }
+                // Taken out of the batch before validation (`process`).
+                Op::Checkpoint => Ok(Decision::Done),
             };
             match decision {
                 Ok(Decision::Done) => reply(request, Ok(())),
@@ -685,7 +729,8 @@ impl<F: BlockFile> Writer<F> {
         }
 
         let result = self
-            .write_batch(&mut layout)
+            .reserve(sequence, layout.incarnation)
+            .and_then(|()| self.write_batch(&mut layout))
             .and_then(|()| self.publish(&layout));
         match result {
             Err(e) => {
@@ -704,6 +749,28 @@ impl<F: BlockFile> Writer<F> {
                 }
             }
         }
+    }
+
+    /// Raises the superblock's reservations, durably, if `sequence` or `incarnation` is past
+    /// them; runs before any record carrying either is written.
+    fn reserve(&mut self, sequence: u64, incarnation: u64) -> Result<(), ChunkError> {
+        if sequence <= self.superblock.sequence_limit
+            && incarnation <= self.superblock.incarnation_limit
+        {
+            return Ok(());
+        }
+        let mut superblock = self.superblock.clone();
+        superblock.sequence = superblock.sequence.saturating_add(1);
+        superblock.sequence_limit = superblock
+            .sequence_limit
+            .max(sequence.saturating_add(SEQUENCE_RESERVE));
+        superblock.incarnation_limit = superblock
+            .incarnation_limit
+            .max(incarnation.saturating_add(INCARNATION_RESERVE));
+        write_superblock(&self.shared.file, &superblock)?;
+        self.shared.file.sync_data().map_err(ChunkError::Device)?;
+        self.superblock = superblock;
+        Ok(())
     }
 
     fn write_batch(&mut self, layout: &mut Layout) -> Result<(), ChunkError> {
@@ -1021,6 +1088,6 @@ fn request_bytes(request: &Request) -> usize {
     match &request.op {
         Op::Write { data, .. } => data.len(),
         Op::Relocate { moves } => moves.iter().map(|m| m.data.len()).sum(),
-        Op::Delete { .. } => 0,
+        Op::Delete { .. } | Op::Checkpoint => 0,
     }
 }

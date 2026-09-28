@@ -368,3 +368,58 @@ fn cleaning_leaves_a_corrupt_fragment_in_place() {
         );
     }
 }
+
+/// A freed segment keeps the records it held until new ones overwrite them. Whatever the
+/// segment is reopened as after a restart, those stale records must never pass for new ones,
+/// or the roll-forward at the next open would bring deleted chunks back.
+#[test]
+fn deleted_chunks_stay_deleted_when_their_segment_is_reused_after_a_restart() {
+    let file = sim(11);
+    let v = Volume::format(Arc::clone(&file), SIZE, config()).unwrap();
+    // Two chunks fill the first segment; the third opens the second segment, and three
+    // small ones follow it there, each in a batch of its own.
+    v.put(key(1), &data(1, 1000)).unwrap();
+    v.put(key(2), &data(2, 200 << 10)).unwrap();
+    v.put(key(3), &data(3, 200 << 10)).unwrap();
+    for n in 4..7u64 {
+        v.put(key(n), &data(n, 1000)).unwrap();
+    }
+    let before: u64 = v.segments().unwrap().iter().map(|s| s.1).max().unwrap();
+    // Deleting everything in the second segment frees it; the checkpoint is written while it
+    // is free.
+    for n in 3..7u64 {
+        v.delete(key(n)).unwrap();
+    }
+    v.checkpoint().unwrap();
+    drop(v);
+
+    // After a restart, the next segment opened is written up to exactly where the deleted
+    // small chunks' records begin.
+    let (v, _) = Volume::open(Arc::clone(&file), config()).unwrap();
+    v.put(key(7), &data(7, 200 << 10)).unwrap();
+    let after: u64 = v
+        .segments()
+        .unwrap()
+        .iter()
+        .filter(|s| s.0 == mantle_chunk::frame::SegmentState::Open)
+        .map(|s| s.1)
+        .max()
+        .unwrap();
+    assert!(
+        after > before,
+        "a segment was opened with incarnation {after}, not above the {before} already used"
+    );
+    drop(v);
+
+    let (v, report) = Volume::open(Arc::clone(&file), config()).unwrap();
+    for n in 3..7u64 {
+        assert_eq!(
+            v.stat(&key(n)).unwrap(),
+            None,
+            "deleted chunk {n} came back"
+        );
+    }
+    assert_eq!(report.rolled_forward, 0, "{report:?}");
+    assert_eq!(v.read(&key(1), 0, 1000).unwrap(), data(1, 1000));
+    assert_eq!(v.read(&key(7), 0, 200 << 10).unwrap(), data(7, 200 << 10));
+}

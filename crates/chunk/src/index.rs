@@ -13,7 +13,7 @@ use crate::record::FLAG_FINAL;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fragment {
     pub segment: u32,
-    pub incarnation: u32,
+    pub incarnation: u64,
     /// Byte offset of the data record within its segment.
     pub offset: u32,
     /// Bytes of the whole data record.
@@ -239,7 +239,7 @@ impl Index {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentInfo {
     pub state: SegmentState,
-    pub incarnation: u32,
+    pub incarnation: u64,
     /// Bytes of the segment written in this incarnation, a multiple of the block size.
     pub write_pos: u32,
     /// Bytes of records in this segment that some chunk still references.

@@ -16,13 +16,13 @@
     </mask>
   </defs>
   <g clip-path="url(#sphere)">
-    <path d="M 39.19 39.19 A 86.00 36.00 45 0 0 160.81 160.81 A 86.00 86.00 0 0 1 39.19 39.19 Z" fill="#8e9399" mask="url(#contours)"/>
-    <g mask="url(#interior)" fill="none" stroke="#1f2328" stroke-width="6">
+    <path d="M 39.19 39.19 A 86.00 36.00 45 0 0 160.81 160.81 A 86.00 86.00 0 0 1 39.19 39.19 Z" fill="#8e9399" fill-opacity="0.35" mask="url(#contours)"/>
+    <g mask="url(#interior)" fill="none" stroke="#8e9399" stroke-width="6">
       <circle cx="100" cy="100" r="38"/><circle cx="100" cy="100" r="51"/><circle cx="100" cy="100" r="64"/>
     </g>
-    <circle cx="100" cy="100" r="24" fill="#1f2328"/>
+    <circle cx="100" cy="100" r="24" fill="#8e9399" fill-opacity="0.35" stroke="#8e9399" stroke-width="6"/>
   </g>
-  <g fill="none" stroke="#1f2328" stroke-linecap="round" stroke-width="7">
+  <g fill="none" stroke="#8e9399" stroke-linecap="round" stroke-width="7">
     <path d="M 39.19 39.19 A 86.00 36.00 45 0 0 160.81 160.81"/>
     <circle cx="100" cy="100" r="86"/>
   </g>

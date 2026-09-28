@@ -16,9 +16,12 @@ U = (1 / math.sqrt(2), 1 / math.sqrt(2))     # seam runs top-left to bottom-righ
 TL = (C - R * U[0], C - R * U[1])
 BR = (C + R * U[0], C + R * U[1])
 
+# (line colour, shading colour, shading opacity). Lines carry the mark; fills are shading.
+# The light file uses vorpal's mid-grey for lines so it stays legible if a viewer shows it
+# on a dark background; the dark file uses GitHub's dark-theme foreground.
 PALETTES = {
-    "light": ("#1f2328", "#8e9399"),
-    "dark": ("#f0f6fc", "#7c8794"),
+    "light": ("#8e9399", "#8e9399", "0.35"),
+    "dark": ("#f0f6fc", "#7c8794", "0.55"),
 }
 
 
@@ -31,7 +34,7 @@ def half_ellipse(b):
     return f"M {pt(TL)} A {R:.2f} {b:.2f} 45 0 0 {pt(BR)}"
 
 
-def svg(ink, stone):
+def svg(ink, stone, shade):
     surface = f"{half_ellipse(B)} A {R:.2f} {R:.2f} 0 0 1 {pt(TL)} Z"
     contours = " ".join(half_ellipse(b) for b in (52.0, 67.0))
     rings = "".join(
@@ -55,11 +58,11 @@ def svg(ink, stone):
     </mask>
   </defs>
   <g clip-path="url(#sphere)">
-    <path d="{surface}" fill="{stone}" mask="url(#contours)"/>
+    <path d="{surface}" fill="{stone}" fill-opacity="{shade}" mask="url(#contours)"/>
     <g mask="url(#interior)" fill="none" stroke="{ink}" stroke-width="6">
       {rings}
     </g>
-    <circle cx="{C:g}" cy="{C:g}" r="24" fill="{ink}"/>
+    <circle cx="{C:g}" cy="{C:g}" r="24" fill="{stone}" fill-opacity="{shade}" stroke="{ink}" stroke-width="6"/>
   </g>
   <g fill="none" stroke="{ink}" stroke-linecap="round" stroke-width="7">
     <path d="{half_ellipse(B)}"/>
@@ -69,8 +72,8 @@ def svg(ink, stone):
 '''
 
 
-for name, (ink, stone) in (("mantle-mark.svg", PALETTES["light"]),
-                           ("mantle-mark-light.svg", PALETTES["light"]),
-                           ("mantle-mark-dark.svg", PALETTES["dark"])):
+for name, (ink, stone, shade) in (("mantle-mark.svg", PALETTES["light"]),
+                                  ("mantle-mark-light.svg", PALETTES["light"]),
+                                  ("mantle-mark-dark.svg", PALETTES["dark"])):
     with open(name, "w") as f:
-        f.write(svg(ink, stone))
+        f.write(svg(ink, stone, shade))

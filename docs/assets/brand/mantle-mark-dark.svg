@@ -16,11 +16,11 @@
     </mask>
   </defs>
   <g clip-path="url(#sphere)">
-    <path d="M 39.19 39.19 A 86.00 36.00 45 0 0 160.81 160.81 A 86.00 86.00 0 0 1 39.19 39.19 Z" fill="#7c8794" mask="url(#contours)"/>
+    <path d="M 39.19 39.19 A 86.00 36.00 45 0 0 160.81 160.81 A 86.00 86.00 0 0 1 39.19 39.19 Z" fill="#7c8794" fill-opacity="0.55" mask="url(#contours)"/>
     <g mask="url(#interior)" fill="none" stroke="#f0f6fc" stroke-width="6">
       <circle cx="100" cy="100" r="38"/><circle cx="100" cy="100" r="51"/><circle cx="100" cy="100" r="64"/>
     </g>
-    <circle cx="100" cy="100" r="24" fill="#f0f6fc"/>
+    <circle cx="100" cy="100" r="24" fill="#7c8794" fill-opacity="0.55" stroke="#f0f6fc" stroke-width="6"/>
   </g>
   <g fill="none" stroke="#f0f6fc" stroke-linecap="round" stroke-width="7">
     <path d="M 39.19 39.19 A 86.00 36.00 45 0 0 160.81 160.81"/>

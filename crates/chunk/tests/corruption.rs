@@ -211,6 +211,33 @@ fn scrubbing_finds_damage_before_a_read_does() {
     assert_eq!(v.scrub().unwrap(), 0);
 }
 
+/// A record whose header is damaged cannot say whose it is; the scrubber names its chunk
+/// from the index's record places, and a read error at a live record is damage too.
+#[test]
+fn scrubbing_names_the_chunk_of_a_damaged_header_and_of_a_read_error() {
+    let file = sim(28);
+    let v = Volume::format(Arc::clone(&file), SIZE, config()).unwrap();
+    for n in 0..40u64 {
+        v.put(key(n), &data(n, 5000)).unwrap();
+    }
+    // The record header sits just before the payload: 96 bytes and a 2-entry checksum table.
+    let payload = find(&file, &data(9, 5000)[..64]);
+    file.inject(Fault::BitFlip {
+        offset: payload - 60,
+        bit: 0,
+        stored: true,
+    })
+    .unwrap();
+    let unreadable = find(&file, &data(21, 5000)[..64]);
+    file.inject(Fault::ReadError {
+        offset: unreadable,
+        len: 1,
+    })
+    .unwrap();
+    assert_eq!(v.scrub().unwrap(), 2);
+    assert_eq!(v.damaged().unwrap(), vec![key(9), key(21)]);
+}
+
 #[test]
 fn the_background_scrubber_finds_damage_on_its_own() {
     let file = sim(27);

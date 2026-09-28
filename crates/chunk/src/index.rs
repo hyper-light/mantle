@@ -2,8 +2,16 @@
 //! segment states. Haystack keeps its needle index in memory so a read costs one disk
 //! operation (Beaver et al., OSDI 2010, §3.4); this index does the same, and its size is
 //! bounded by the volume's chunk budget.
+//!
+//! Beside the map the index keeps where each live record starts, ordered by segment and
+//! offset: LFS's segment summary, kept in memory (Rosenblum and Ousterhout, SOSP 1991,
+//! §3.3). The scrubber and cleaner find a segment's records there, in the order they lie on
+//! the device, without walking the map. It costs about 20 bytes a fragment: 19.6 measured
+//! with a counting allocator for 4M records appended in order, 15.9 once a third are
+//! deleted at random (docs/design/chunk-store.md §8).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::ops::Range;
 
 use crate::frame::{PutRecord, SegmentState};
 use crate::key::ChunkKey;
@@ -103,6 +111,9 @@ pub enum Inconsistent {
 #[derive(Debug, Default)]
 pub struct Index {
     map: HashMap<ChunkKey, Entry>,
+    /// `(segment, offset)` of every fragment's record. A live record's place names it: only
+    /// the current incarnation of a segment holds live records.
+    placed: BTreeSet<(u32, u32)>,
 }
 
 impl Index {
@@ -120,6 +131,52 @@ impl Index {
 
     pub fn iter(&self) -> impl Iterator<Item = (&ChunkKey, &Entry)> {
         self.map.iter()
+    }
+
+    /// Offsets of the live records that start in `offsets` of `segment`, in order.
+    pub fn placed_in(&self, segment: u32, offsets: Range<u32>) -> Vec<u32> {
+        self.placed
+            .range((segment, offsets.start)..(segment, offsets.end))
+            .map(|&(_, offset)| offset)
+            .collect()
+    }
+
+    /// Whether a live record starts at `offset` of `segment`.
+    pub fn is_placed(&self, segment: u32, offset: u32) -> bool {
+        self.placed.contains(&(segment, offset))
+    }
+
+    /// The chunk and fragment whose record starts at `offset` of `segment`. It walks the
+    /// whole map, so it serves only to name the owner of a record too damaged to name itself.
+    pub fn owner(&self, segment: u32, offset: u32) -> Option<(ChunkKey, Fragment)> {
+        self.map.iter().find_map(|(key, entry)| {
+            entry
+                .fragments
+                .iter()
+                .find(|f| f.segment == segment && f.offset == offset)
+                .map(|f| (*key, *f))
+        })
+    }
+
+    /// The fragment of `key` at `chunk_offset` if it is the record written at `offset` of
+    /// `segment` with `incarnation` and `sequence`: that record is live.
+    pub fn live(
+        &self,
+        key: &ChunkKey,
+        chunk_offset: u64,
+        at: (u32, u32),
+        incarnation: u64,
+        sequence: u64,
+    ) -> Option<Fragment> {
+        self.map
+            .get(key)?
+            .fragment_at(chunk_offset)
+            .filter(|f| {
+                (f.segment, f.offset) == at
+                    && f.incarnation == incarnation
+                    && f.sequence == sequence
+            })
+            .copied()
     }
 
     /// Adds a fragment written for `key`. The same bytes at the same chunk offset replace the
@@ -154,6 +211,8 @@ impl Index {
                 && let Some(slot) = entry.fragments.get_mut(i)
             {
                 *slot = fragment;
+                self.placed.remove(&(existing.segment, existing.offset));
+                self.placed.insert((fragment.segment, fragment.offset));
                 return Ok(Inserted::Replaced(existing));
             }
             return Ok(Inserted::Unchanged);
@@ -181,11 +240,16 @@ impl Index {
         entry.fragments.push(fragment);
         entry.sealed = sealed;
         entry.time_ns = put.time_ns;
+        self.placed.insert((fragment.segment, fragment.offset));
         Ok(Inserted::Added)
     }
 
     pub fn remove(&mut self, key: &ChunkKey) -> Option<Entry> {
-        self.map.remove(key)
+        let entry = self.map.remove(key)?;
+        for f in &entry.fragments {
+            self.placed.remove(&(f.segment, f.offset));
+        }
+        Some(entry)
     }
 
     /// Puts `fragment` back in place of the copy of the same bytes that replaced it; true if
@@ -205,6 +269,8 @@ impl Index {
                 if slot.payload_len == fragment.payload_len
                     && slot.payload_crc == fragment.payload_crc =>
             {
+                self.placed.remove(&(slot.segment, slot.offset));
+                self.placed.insert((fragment.segment, fragment.offset));
                 *slot = *fragment;
                 true
             }
@@ -230,6 +296,9 @@ impl Index {
         entry.sealed = false;
         if entry.fragments.is_empty() {
             self.map.remove(key);
+        }
+        if let Some(f) = &popped {
+            self.placed.remove(&(f.segment, f.offset));
         }
         popped
     }
@@ -357,5 +426,84 @@ mod tests {
             index.insert(key, &put(2, 1, 3, 0), 2),
             Err(Inconsistent::TooManyFragments)
         );
+    }
+
+    /// Checks that `placed` names exactly the records the map holds.
+    fn check(index: &Index) {
+        let expected: BTreeSet<(u32, u32)> = index
+            .map
+            .values()
+            .flat_map(|e| e.fragments.iter().map(|f| (f.segment, f.offset)))
+            .collect();
+        assert_eq!(index.placed, expected);
+    }
+
+    /// Appends, relocations, restores, pops and removals in a random order keep the placed
+    /// records equal to the map's.
+    #[test]
+    fn placed_records_follow_the_map() {
+        let mut index = Index::default();
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut replaced: Vec<(ChunkKey, Fragment)> = Vec::new();
+        let (mut place, mut sequence) = (0u32, 0u64);
+        let put = |key: ChunkKey, at: u32, chunk_offset: u64, crc: u32, sequence: u64| PutRecord {
+            key,
+            segment: at % 7,
+            incarnation: 1,
+            offset: at,
+            record_len: 100,
+            chunk_offset,
+            payload_len: 10,
+            payload_crc: crc,
+            sequence,
+            time_ns: sequence,
+            flags: 0,
+        };
+        for _ in 0..20_000 {
+            let key = ChunkKey {
+                block: u128::from(next() % 50),
+                epoch: 0,
+                index: 0,
+            };
+            place += 1;
+            sequence += 1;
+            match next() % 6 {
+                0 | 1 => {
+                    let end = index.get(&key).map_or(0, Entry::len);
+                    let _ = index.insert(key, &put(key, place, end, end as u32, sequence), 8);
+                }
+                2 => {
+                    let first = index.get(&key).and_then(|e| e.fragments.first()).copied();
+                    if let Some(f) = first {
+                        let moved = put(key, place, f.chunk_offset, f.payload_crc, sequence);
+                        if let Ok(Inserted::Replaced(old)) = index.insert(key, &moved, 8) {
+                            replaced.push((key, old));
+                        }
+                    }
+                }
+                3 => {
+                    if let Some((key, old)) = replaced.pop() {
+                        index.restore_fragment(&key, &old);
+                    }
+                }
+                4 => {
+                    let last = index.get(&key).and_then(|e| e.fragments.last()).copied();
+                    if let Some(f) = last {
+                        index.pop_fragment(&key, f.chunk_offset, f.sequence);
+                    }
+                }
+                _ => {
+                    index.remove(&key);
+                }
+            }
+            check(&index);
+        }
+        assert!(!index.is_empty());
     }
 }

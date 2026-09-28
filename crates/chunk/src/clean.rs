@@ -14,14 +14,14 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::time::Duration;
 
+use mantle_disk::DiskError;
 use mantle_disk::block::BlockFile;
 
 use crate::error::ChunkError;
 use crate::frame::SegmentState;
-use crate::index::Fragment;
 use crate::key::ChunkKey;
-use crate::read;
 use crate::record::{FLAG_FINAL, Payload};
+use crate::recover::{Identity, verify_at};
 use crate::writer::{Move, Op, Request, Shared};
 
 /// How often the cleaner checks free space without being woken.
@@ -165,7 +165,8 @@ impl<F: BlockFile> Cleaner<F> {
             .and_then(|(_, i)| u32::try_from(i).ok())
     }
 
-    /// Relocates every live fragment of `segment`; returns (relocated, corrupt).
+    /// Relocates every live record of `segment`, found where they lie in the index's record
+    /// places and each checked against the index as it is read; returns (relocated, corrupt).
     fn clean(&self, segment: u32) -> Result<(u64, u64), ChunkError> {
         let incarnation = self
             .shared
@@ -175,54 +176,69 @@ impl<F: BlockFile> Cleaner<F> {
             .get(usize::try_from(segment).unwrap_or(usize::MAX))
             .map(|s| s.incarnation)
             .ok_or(ChunkError::Fenced)?;
-        let live: Vec<(ChunkKey, Fragment, u8, u64)> = {
-            let index = self.shared.index.read().map_err(|_| ChunkError::Fenced)?;
-            index
-                .iter()
-                .flat_map(|(key, entry)| {
-                    let last = entry.fragments.len().saturating_sub(1);
-                    entry
-                        .fragments
-                        .iter()
-                        .enumerate()
-                        .filter(move |(_, f)| f.segment == segment && f.incarnation == incarnation)
-                        .map(move |(i, f)| {
-                            let flags = if entry.sealed && i == last {
-                                FLAG_FINAL
-                            } else {
-                                0
-                            };
-                            (*key, *f, flags, entry.time_ns)
-                        })
-                })
-                .collect()
+        let offsets = self
+            .shared
+            .index
+            .read()
+            .map_err(|_| ChunkError::Fenced)?
+            .placed_in(segment, 0..u32::MAX);
+        let identity = Identity {
+            volume: self.shared.volume,
+            checksum_shift: self.shared.checksum_shift,
         };
         let (mut relocated, mut corrupt) = (0u64, 0u64);
         let mut moves: Vec<Move> = Vec::new();
         let mut bytes = 0usize;
-        for (key, from, flags, time_ns) in live {
-            let mut data = Vec::with_capacity(usize::try_from(from.payload_len).unwrap_or(0));
-            match read::fragment(
-                &self.shared,
-                &key,
-                &from,
-                0,
-                u64::from(from.payload_len),
-                &mut data,
-            ) {
-                Ok(()) => {}
-                Err(ChunkError::Corrupt { .. }) => {
-                    // Left in place: moving bytes that fail verification would launder them.
+        for offset in offsets {
+            let mut data = Vec::new();
+            let read = verify_at(
+                &self.shared.file,
+                &self.shared.pool,
+                &self.shared.geometry,
+                identity,
+                segment,
+                u64::from(offset),
+                Some(&mut data),
+            );
+            let header = match read {
+                Ok(Some(v)) if v.prefix.header.incarnation == incarnation => v.prefix.header,
+                // Left in place: moving bytes that fail verification would launder them.
+                Ok(_) | Err(ChunkError::Device(DiskError::Io { .. })) => {
                     corrupt = corrupt.saturating_add(1);
                     continue;
                 }
                 Err(e) => return Err(e),
-            }
+            };
+            // Only a record the index still holds at this place is live.
+            let found = {
+                let index = self.shared.index.read().map_err(|_| ChunkError::Fenced)?;
+                index
+                    .live(
+                        &header.key,
+                        header.chunk_offset,
+                        (segment, offset),
+                        header.incarnation,
+                        header.sequence,
+                    )
+                    .and_then(|from| {
+                        let entry = index.get(&header.key)?;
+                        let last = entry.fragments.last().map(|f| f.chunk_offset);
+                        let flags = if entry.sealed && last == Some(from.chunk_offset) {
+                            FLAG_FINAL
+                        } else {
+                            0
+                        };
+                        Some((from, flags, entry.time_ns))
+                    })
+            };
+            let Some((from, flags, time_ns)) = found else {
+                continue;
+            };
             bytes = bytes.saturating_add(data.len());
             let payload = Payload::new(data, self.shared.checksum_shift)
                 .ok_or_else(|| ChunkError::Config("checksum block size".into()))?;
             moves.push(Move {
-                key,
+                key: header.key,
                 from,
                 payload,
                 flags,

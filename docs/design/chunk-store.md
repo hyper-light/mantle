@@ -224,15 +224,27 @@ to the cleaner's stream (sorted by age), and frees the segment once the copies a
 durable and indexed. A relocated record keeps its sequence; the index accepts it only if
 the chunk still points at the old location, so a concurrent delete wins.
 
+The cleaner and the scrubber find a segment's records through the index's record places:
+the `(segment, offset)` of every live record, ordered, kept beside the key map. It is LFS's
+segment summary [RO92 §3.3] held in memory, and it replaces a walk of the whole map, under
+its lock, for every segment cleaned or scrubbed. It costs about 20 bytes a fragment,
+measured with a counting allocator: 19.6 for 4M records appended in order, 15.9 once a
+third are deleted at random, against roughly 150 for the map's entry. Each record
+is read where it lies and verified from its own header, then counted only if the index
+still names it; a record too damaged to name itself is attributed by a search of the map,
+which only damage pays for.
+
 ## 9. Scrubbing
 
 Every sealed segment is read and verified at least every 14 days, targeting 7, at the
 lowest I/O priority [BGPS07 §6; SDG10 §5; AWK+19 §5.1]; seven days is practice rather than
 a derived period [research/11 §12.2]. The order is staggered: SDG10 reads 128 MiB regions in
 1 MiB steps, one step of every region before the next, which shortens the mean time to
-detect an error by 10–20% at 7–14-day periods [research/11 §12.3: SDG10 §5.2.3]. Here the
-step is a segment, so a region is 128 segments and each round reads 1/128 of the volume
-spread over all of it; steps within a segment await a per-segment map of its fragments. A
+detect an error by 10–20% at 7–14-day periods [research/11 §12.3: SDG10 §5.2.3]. The
+scrubber does the same over the data area, the segments laid end to end: each step
+verifies the live records that start in its 1 MiB (§8's record places), and each round
+reads 1/128 of the volume spread over all of it. A read error at a live record is damage:
+it is how a latent sector error appears. A
 bad block triggers an immediate scan of its ±10 MiB neighbourhood and marks the device at
 risk for 30 days [BGPS07 §5; SLM16 §5]. Damaged chunks are listed for repair up to 4,096;
 more than 80% of disks with latent errors had fewer than 50 [BGPS07-F2], so a volume past

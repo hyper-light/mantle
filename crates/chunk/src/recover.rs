@@ -154,8 +154,17 @@ pub(crate) fn recover<F: BlockFile>(
     // The last batch's flush may not have completed: keep only records whose data verifies.
     // They are the last fragments of their chunks, so they come off in reverse order.
     for (put, displaced) in last_batch.iter().rev() {
-        let verified = verify_at(file, pool, geometry, sb, put.segment, u64::from(put.offset))?
-            .is_some_and(|v| v.matches(put));
+        let at = u64::from(put.offset);
+        let verified = verify_at(
+            file,
+            pool,
+            geometry,
+            Identity::of(sb),
+            put.segment,
+            at,
+            None,
+        )?
+        .is_some_and(|v| v.matches(put));
         if verified {
             continue;
         }
@@ -182,7 +191,8 @@ pub(crate) fn recover<F: BlockFile>(
         open.push((info.incarnation, segment));
         let mut at = u64::from(info.write_pos).max(geometry.block);
         while at < geometry.segment_size {
-            let Some(found) = verify_at(file, pool, geometry, sb, segment, at)? else {
+            let Some(found) = verify_at(file, pool, geometry, Identity::of(sb), segment, at, None)?
+            else {
                 break;
             };
             if found.prefix.header.incarnation != info.incarnation {
@@ -294,15 +304,33 @@ impl Verified {
     }
 }
 
+/// What every record of a volume carries: the volume's ID and its checksum block size.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Identity {
+    pub volume: u128,
+    pub checksum_shift: u8,
+}
+
+impl Identity {
+    pub fn of(sb: &Superblock) -> Self {
+        Self {
+            volume: sb.volume,
+            checksum_shift: sb.checksum_shift,
+        }
+    }
+}
+
 /// Reads the data record at `offset` in `segment` and verifies its header, identity and
-/// every checksum block. `None` if no intact record of this volume and segment is there.
+/// every checksum block, appending its payload to `payload` when given one. `None` if no
+/// intact record of this volume and segment is there.
 pub(crate) fn verify_at<F: BlockFile>(
     file: &F,
     pool: &Pool,
     geometry: &Geometry,
-    sb: &Superblock,
+    identity: Identity,
     segment: u32,
     offset: u64,
+    payload_out: Option<&mut Vec<u8>>,
 ) -> Result<Option<Verified>, ChunkError> {
     let Some(base) = geometry.segment_offset(segment) else {
         return Ok(None);
@@ -338,7 +366,10 @@ pub(crate) fn verify_at<F: BlockFile>(
         return Ok(None);
     };
     let h = &prefix.header;
-    if h.volume != sb.volume || h.segment != segment || h.checksum_shift != sb.checksum_shift {
+    if h.volume != identity.volume
+        || h.segment != segment
+        || h.checksum_shift != identity.checksum_shift
+    {
         return Ok(None);
     }
     let Some(start) = h.prefix_len() else {
@@ -353,6 +384,9 @@ pub(crate) fn verify_at<F: BlockFile>(
         return Ok(None);
     }
     let payload_crc = mantle_crc::crc32c(payload);
+    if let Some(out) = payload_out {
+        out.extend_from_slice(payload);
+    }
     Ok(Some(Verified {
         prefix,
         payload_crc,

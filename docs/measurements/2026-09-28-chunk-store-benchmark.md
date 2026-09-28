@@ -64,6 +64,19 @@ writer lays out, writes and flushes each batch in turn, so the device sits idle 
 writer computes and the writer sits idle during the flush: after finding 4, the flush took
 55% of its time, data and log writes 18%, copying payloads 20%, and checksums 5%.
 
+**8. The index frame's separate write costs a quarter of durable bandwidth here.** Raw
+32 MiB batches through the file layer, each written and then flushed: 5.31 GB/s cycling
+within 256 MiB and 5.36 GB/s advancing across 4 GiB, so where the data goes does not
+matter; adding one 4 KiB write to a separate region before each flush, as the chunk store
+does with its index frame, drops both to 4.0–4.1 GB/s (p50 6.82 → 8.39 ms per batch). After
+checksums moved to the senders and records were encoded in place, 8 MiB puts reach 3.0–3.25
+GB/s: 75–80% of what their own I/O pattern allows, with the writer 92% in I/O (flush 61%,
+data write 23%, frame write 7.6%).
+
+**9. Writes proceed partly while another flush runs.** Two threads each writing and
+flushing 32 MiB batches on separate regions reach 5.99 GB/s against 5.12 GB/s for one;
+four reach 5.55 GB/s.
+
 **7. Results depend on the drive's recent history.** The first put points after the fill
 pass ran at half their usual rate (4 KiB puts with one writer: 102/s) and at the usual rate
 when run later in the same process. One pass per point measures the drive's state as much
@@ -74,5 +87,8 @@ as the store; how many repetitions a point needs is open (docs/research/11).
 - Buffers for I/O come from pools; nothing on a read or write path allocates per I/O.
 - The whole-payload CRC is combined with a fixed shift.
 - The group-commit wait is derived from measured quantities (finding 5).
-- Next: overlap the writer's computation for one batch with the previous batch's flush, and
-  encode records straight into the aligned write buffer, to close the gap in finding 6.
+- Checksums are computed by the sender and records are encoded in place (finding 8's
+  numbers include both).
+- Open: whether the index frame must be a separate write in the flush path (finding 8 and
+  docs/design/chunk-store.md §3.2), and a writer that overlaps a batch's writes with the
+  previous flush to the depth calibration measures (finding 9).

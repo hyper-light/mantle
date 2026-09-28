@@ -103,6 +103,15 @@ records:      Put { key, segment, incarnation, offset, header+payload length, ch
 padding to B
 ```
 
+**Open question: the frame's cost.** A separate 4 KiB frame written before each flush
+costs a quarter of durable bandwidth on the development machine's SSD
+(docs/measurements/2026-09-28-chunk-store-benchmark.md, finding 8), and on a disk it costs a
+seek per batch. The separate copy is what turns a lost data write into a detected one; a
+frame written in the same I/O as its data, or lazily after it (Haystack writes its index
+asynchronously and rebuilds the tail from needles [HAY §3.5]), would give that up for
+acknowledged writes the metadata service alone would then have to catch. Deciding needs the
+field rate of lost writes [BGS+08] against the measured cost per device class.
+
 Frames carry consecutive LSNs. Recovery tells a torn tail from corruption by what follows
 an invalid frame [AGL+18 §3.3.3; GAA17 §4.2]: nothing with the next LSN means a crash
 (the frame was never acknowledged, discard it); a valid frame with a later LSN means

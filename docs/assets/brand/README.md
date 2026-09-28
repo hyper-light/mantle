@@ -6,15 +6,15 @@ focal, slates and vorpal marks. A sphere is cut open along a seam: on one side i
 surface, a solid crescent with contour lines cut through it; on the other, strata rings
 around a solid core.
 
-- `render-mark.py` draws all three SVGs: `python3 render-mark.py`.
-- Lines carry the mark and fills are shading. `mantle-mark.svg` is the master and
-  `mantle-mark-light.svg` the light-theme file: lines in vorpal's mid-grey `#8e9399`, which
+- `render-strata.py` draws all three SVGs: `python3 render-strata.py`.
+- Lines carry the mark and fills are shading. `mantle-strata.svg` is the master and
+  `mantle-strata-light.svg` the light-theme file: lines in vorpal's mid-grey `#8e9399`, which
   stays legible if a viewer shows this file on a dark background, and fills in the same grey
-  at 35% opacity. `mantle-mark-dark.svg` has lines in `#f0f6fc` and fills in `#7c8794` at 55%.
+  at 35% opacity. `mantle-strata-dark.svg` has lines in `#f0f6fc` and fills in `#7c8794` at 55%.
   The README shows them at 90 × 90 through a `<picture>` element.
-- `mantle-mark-transparent.png` is a 1080 × 1080 export:
-  `rsvg-convert -w 1080 -h 1080 mantle-mark.svg -o mantle-mark-transparent.png`.
-- `mantle-mark-preview.png` shows both themes at 256, 90 and 28 pixels.
+- `mantle-strata-transparent.png` is a 1080 × 1080 export:
+  `rsvg-convert -w 1080 -h 1080 mantle-strata.svg -o mantle-strata-transparent.png`.
+- `mantle-strata-preview.png` shows both themes at 256, 90 and 28 pixels.
 
 Geometry, on a 200-unit square: the sphere has radius 86; the seam is the lower-left half
 of a great circle whose axis runs along the diagonal, drawn as an ellipse of half-width 36;

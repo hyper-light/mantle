@@ -1,9 +1,9 @@
 <p align="center">
-  <a href="docs/assets/brand/mantle-mark-preview.png">
+  <a href="docs/assets/brand/mantle-strata-preview.png">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="docs/assets/brand/mantle-mark-dark.svg">
-      <source media="(prefers-color-scheme: light)" srcset="docs/assets/brand/mantle-mark-light.svg">
-      <img src="docs/assets/brand/mantle-mark-light.svg" alt="Mantle logo: a globe cut open along a seam, showing its surface on one side and strata rings around a solid core on the other" width="90" height="90">
+      <source media="(prefers-color-scheme: dark)" srcset="docs/assets/brand/mantle-strata-dark.svg">
+      <source media="(prefers-color-scheme: light)" srcset="docs/assets/brand/mantle-strata-light.svg">
+      <img src="docs/assets/brand/mantle-strata-light.svg" alt="Mantle logo: a globe cut open along a seam, showing its surface on one side and strata rings around a solid core on the other" width="90" height="90">
     </picture>
   </a>
 </p>

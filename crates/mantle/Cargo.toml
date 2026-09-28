@@ -1,0 +1,23 @@
+[package]
+name = "mantle"
+description = "The mantle binary: server and command line"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "mantle"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+mantle-disk = { path = "../disk" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

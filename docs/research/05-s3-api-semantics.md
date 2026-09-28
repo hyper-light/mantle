@@ -66,7 +66,7 @@ No blogs. Where AWS docs are silent, the behavior asserted by s3-tests is given 
 
 ## 1. Signature Version 4 (SigV4) for S3
 
-> **Where the docs live now.** In 2026 AWS moved the S3 authentication, common-header and error pages out of the *S3 API Reference*. Their old `/AmazonS3/latest/API/sig-v4-*.html`, `/API/sigv4-*.html`, `/API/RESTCommon*.html` and `/API/ErrorResponses.html` URLs now return `302` to the API Reference index. The pages are now in the new **Amazon S3 Developer Guide** at `https://docs.aws.amazon.com/AmazonS3/latest/developerguide/<page>.html`. The API Reference Welcome page says so: "For information about using the Amazon S3 API—including authentication, signing requests, code examples, and error handling—see the Amazon S3 Developer Guide." ([API Welcome](https://docs.aws.amazon.com/AmazonS3/latest/API/Welcome.html)). Many AWS pages, and search results, still link to the old `/API/` URLs. All citations below use the new locations.
+> **Where the docs live now.** AWS has moved the S3 authentication, common-header and error pages out of the *S3 API Reference*. The move date is **UNVERIFIED**; it was observed on 2026-09-28. Their old `/AmazonS3/latest/API/sig-v4-*.html`, `/API/sigv4-*.html`, `/API/RESTCommon*.html` and `/API/ErrorResponses.html` URLs now return `302` to the API Reference index. The pages are now in the new **Amazon S3 Developer Guide** at `https://docs.aws.amazon.com/AmazonS3/latest/developerguide/<page>.html`. The API Reference Welcome page says so: "For information about using the Amazon S3 API—including authentication, signing requests, code examples, and error handling—see the Amazon S3 Developer Guide." ([API Welcome](https://docs.aws.amazon.com/AmazonS3/latest/API/Welcome.html)). Many AWS pages, and search results, still link to the old `/API/` URLs. All citations below use the new locations.
 
 Primary sources for this section:
 
@@ -115,7 +115,9 @@ AWS also warns: "The standard UriEncode functions provided by your development p
 
 - "the URI-encoded version of the absolute path component of the URI—everything starting with the "/" that follows the domain name and up to the end of the string or to the question mark character" ([S3-SingleChunk](https://docs.aws.amazon.com/AmazonS3/latest/developerguide/sig-v4-header-based-auth.html#canonical-request)). IAM-Create adds: "If the absolute path is empty, use a forward slash character (`/`)."
 - **No normalization.** "You do not normalize URI paths for requests to Amazon S3. For example, you may have a bucket with an object named "my-object//example//photo.user". Normalizing the path changes the object name in the request to "my-object/example/photo.user". This is an incorrect path for that object." (S3-SingleChunk).
-- **No double encoding.** For non-S3 services, generic SigV4 encodes each path segment twice. For S3 the path is encoded **once**. AWS's worked example shows the key `test$file.text` canonicalized as `/test%24file.text` (single `%24`) (S3-SingleChunk, "Example: PUT Object"). The explicit sentence "S3 is URI-encoded only once" no longer appears in the current IAM page (IAM-Create), so the evidence is the S3 examples plus the `UriEncode` definition. That definition encodes every byte once and keeps `/` in the key.
+- **No double encoding.** For S3 the path is encoded **once**. AWS's worked example shows the key `test$file.text` canonicalized as `/test%24file.text` (single `%24`) (S3-SingleChunk, "Example: PUT Object").
+  - Generic SigV4 for other AWS services double-encodes path segments, and older IAM text named S3 as the exception. Neither statement appears in the current IAM page (IAM-Create), so treat them as background (**UNVERIFIED** in current docs).
+  - The authoritative evidence is the S3 examples plus the `UriEncode` definition, which encodes every byte once and keeps `/` in the key.
 - **Addressing.** With path-style the bucket name is part of CanonicalURI: `/examplebucket/chunkObject.txt` ([S3-Chunked example](https://docs.aws.amazon.com/AmazonS3/latest/developerguide/sigv4-streaming.html#example-signature-calculations-streaming)). With virtual-hosted style it is not: `/test.txt` with `host:examplebucket.s3.amazonaws.com` (S3-SingleChunk examples).
 - **Implication (our analysis, not AWS text).** A server should canonicalize from the *decoded* key bytes, re-encoding with the rules above and leaving `/` unencoded. It should not reuse the raw request-target. Clients differ in which optional characters they percent-escape (for example `$`, `~`, `!`), and the signed form is always the `UriEncode` form. Never collapse `//`, `/./` or `/../` in keys.
 
@@ -376,7 +378,8 @@ x-amz-trailer-signature:d81f82fc3505edab99d459891051a732e8730629a2e4a59689829ca1
 - The completion chunk is `0\r\n`.
 - Trailer: `x-amz-checksum-<alg>:<base64>\r\n\r\n`. AWS also shows `...<base64>\n\r\n\r\n` and notes "The usage of the linefeed `\n` at the end of the checksum value might vary across clients."
 - The response echoes `x-amz-checksum-crc32: YABb/g==`.
-- **Be lenient:** accept an optional bare `\n` before the CRLF, and accept LF-only line ends in trailers. Only the Authorization header covers integrity here, together with the checksum value itself.
+- **Be lenient:** accept an optional bare `\n` before the CRLF, and accept LF-only line ends in trailers.
+- In unsigned mode the signature covers only the headers, not the body. Body integrity comes solely from the trailing checksum, so it **must** be verified.
 
 **Documentation defects to be aware of.**
 
@@ -388,7 +391,7 @@ x-amz-trailer-signature:d81f82fc3505edab99d459891051a732e8730629a2e4a59689829ca1
 1. Parse `Authorization`, tolerating `, ` after commas, or the `X-Amz-*` query parameters. Reject an unknown algorithm with `AuthorizationHeaderMalformed` or `AuthorizationQueryParametersError` (400).
 2. Look up the access key. If unknown, return `InvalidAccessKeyId` (403) ([ErrorResponses](https://docs.aws.amazon.com/AmazonS3/latest/developerguide/ErrorResponses.html#ErrorCodeList)).
 3. Get the timestamp from `x-amz-date`, falling back to `Date` in ISO 8601 basic form. The credential-scope date must equal its `YYYYMMDD`.
-4. Enforce ±15 minutes for header auth, returning `RequestTimeTooSkewed` (403). For presigned URLs, enforce `X-Amz-Date` ≤ now < `X-Amz-Date` + `X-Amz-Expires`, with `1 ≤ X-Amz-Expires ≤ 604800` (403 per s3-tests).
+4. Enforce ±15 minutes for header auth, returning `RequestTimeTooSkewed` (403). For presigned URLs, enforce now < `X-Amz-Date` + `X-Amz-Expires`, with `1 ≤ X-Amz-Expires ≤ 604800` (403 per s3-tests). How much tolerance AWS allows for a future-dated `X-Amz-Date` is **UNVERIFIED**; applying the same 15-minute skew is a reasonable choice.
 5. Rebuild the canonical request from decoded components: single-encoded path, sorted encoded query without `X-Amz-Signature`, the listed headers (lowercased, trimmed, inner spaces collapsed), and the payload token taken from `x-amz-content-sha256`, or `UNSIGNED-PAYLOAD` for presigned URLs.
 6. Compare signatures in constant time. On mismatch return `SignatureDoesNotMatch` (403).
 7. If the body is a hex digest, hash it while streaming and fail at the end (code **UNVERIFIED**, see 1.2.5). If it is `STREAMING-*`, run the chunk decoder with signature chaining and trailer verification. Enforce `x-amz-decoded-content-length` against the decoded byte count (error code **UNVERIFIED**; `IncompleteBody` 400 is documented for "You did not provide the number of bytes specified by the Content-Length HTTP header").
@@ -647,7 +650,8 @@ UG-Integrity and UG-Upload now list **ten** algorithms. "The `CRC64NVME` checksu
 
   Boto3 supports CRC32C/CRC64NVME/xxHash/SHA512 only "Via CRT". The SDK for Rust supports CRC64NVME, CRC32, CRC32C, SHA1 and SHA256.
 - On the wire, s3-tests shows botocore switching `put_object` to `STREAMING-UNSIGNED-PAYLOAD-TRAILER` unless `request_checksum_calculation='when_required'` is set. See the comment in [test_object_create_bad_contentlength_negative](https://github.com/ceph/s3-tests/blob/5522d1c351f75bc00ae0f64f742f3f095f5939d9/s3tests/functional/test_headers.py#L212) (`auth_common`, `fails_on_mod_proxy_fcgi`).
-- The consequence for a server: **current default clients send aws-chunked bodies with unsigned payload and a trailing `x-amz-checksum-crc32` (boto3/Rust) or `-crc64nvme` (CLI v2), and validate response checksums when present.**
+- The consequence for a server: **current default clients compute CRC32 (boto3, Rust) or CRC64NVME (CLI v2) on every upload and validate response checksums when present.** For botocore, s3-tests shows the upload is sent as an unsigned aws-chunked body with a trailing checksum.
+  - For the Rust SDK and CLI v2, whether the checksum travels as a trailer or a header is **UNVERIFIED** here. Support both.
 
 ## 4. Multipart upload rules
 
@@ -743,7 +747,7 @@ The [qfacts](https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html) 
 **s3-tests:**
 
 - Parts of 10 KiB (non-last) return 400 `EntityTooSmall`: [test_multipart_upload_size_too_small](https://github.com/ceph/s3-tests/blob/5522d1c351f75bc00ae0f64f742f3f095f5939d9/s3tests/functional/test_s3.py#L6411).
-- Listing part number 9999 that was never uploaded returns 400 `InvalidPart`: [test_multipart_upload_missing_part](https://github.com/ceph/s3-tests/blob/5522d1c351f75bc00ae0f64f742f3f095f5939d9/s3tests/functional/test_s3.py#L6587).
+- Referencing part number 9999 (never uploaded) in the Complete list returns 400 `InvalidPart`: [test_multipart_upload_missing_part](https://github.com/ceph/s3-tests/blob/5522d1c351f75bc00ae0f64f742f3f095f5939d9/s3tests/functional/test_s3.py#L6587).
 - A wrong ETag returns 400 `InvalidPart`: [test_multipart_upload_incorrect_etag](https://github.com/ceph/s3-tests/blob/5522d1c351f75bc00ae0f64f742f3f095f5939d9/s3tests/functional/test_s3.py#L6606).
 - Complete with **no body** returns 400 `MalformedXML`: [test_multipart_upload_empty](https://github.com/ceph/s3-tests/blob/5522d1c351f75bc00ae0f64f742f3f095f5939d9/s3tests/functional/test_s3.py#L5988).
 - An unknown upload ID returns 404 `NoSuchUpload`: [test_multipart_upload_complete_without_create](https://github.com/ceph/s3-tests/blob/5522d1c351f75bc00ae0f64f742f3f095f5939d9/s3tests/functional/test_s3.py#L6001) (`fails_on_dbstore`).
@@ -804,7 +808,7 @@ The [qfacts](https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html) 
 - Directory buckets: "The ETag for the object in a directory bucket isn't the MD5 digest of the object" ([PutObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html#AmazonS3-PutObject-response-header-ETag)).
 - **Format:** lowercase hex MD5 wrapped in double quotes, both in the header and in XML (`<ETag>"3858f62230ac3c915f300c664312c11f-9"</ETag>` in the CompleteMultipartUpload sample; `ETag: "..."` in headers).
   - s3-tests: `put_object(Body='bar')` returns ETag `'"37b51d194a7513e45b56f6524f2d51f2"'` (MD5 of "bar", quoted) ([test_object_write_check_etag](https://github.com/ceph/s3-tests/blob/5522d1c351f75bc00ae0f64f742f3f095f5939d9/s3tests/functional/test_s3.py#L1803)).
-  - Note that listings (ListObjects) also return quoted ETags in XML (AWS examples; §6).
+  - Listings also return quoted ETags in XML, for example `<ETag>"fba9dede5f27731c9771645a39863328"</ETag>` in the [ListObjectsV2 examples](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html#API_ListObjectsV2_Examples) Literal `"` and the `&quot;` entity are equivalent XML; which one AWS emits on the wire is **UNVERIFIED**.
 - A copy of a multipart object via CopyObject becomes single-part: "If the source object is an object that was uploaded by using a multipart upload, the object copy will be a single part object" ([CopyObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_CopyObject.html#AmazonS3-CopyObject-request-header-CopySource)). Its ETag is therefore MD5 for SSE-S3/plaintext. This follows from the rules above; it is not stated verbatim.
 - "The ETag reflects changes only to the contents of an object, not its metadata". A metadata-only self-copy keeps the ETag, given MD5-of-content.
 
@@ -892,7 +896,7 @@ s3-tests behaviors (marker `list_objects_v2` unless noted):
 - **NextMarker** (verbatim): "When the response is truncated ... you can use the key name in this field as the `marker` parameter in the subsequent request ... **This element is returned only if you have the `delimiter` request parameter specified.** If the response does not include the `NextMarker` element and it is truncated, you can use the value of the last `Key` element in the response as the `marker` parameter in the subsequent request" ([ListObjects](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjects.html#AmazonS3-ListObjects-response-NextMarker)).
 - s3-tests: with a delimiter, `NextMarker` is the last item returned, which may be a **CommonPrefix** such as `'boo/'`. It is absent when not truncated ([test_bucket_list_delimiter_prefix](https://github.com/ceph/s3-tests/blob/5522d1c351f75bc00ae0f64f742f3f095f5939d9/s3tests/functional/test_s3.py#L312), `fails_on_dbstore`).
 - V1 returns `Owner` by default. s3-tests compares `Owner.ID`/`DisplayName`, `ETag`, `Size` and `LastModified` with HEAD/ACL data ([test_bucket_list_return_data](https://github.com/ceph/s3-tests/blob/5522d1c351f75bc00ae0f64f742f3f095f5939d9/s3tests/functional/test_s3.py#L1400)).
-- `LastModified` in listings has second precision relative to HEAD (`_compare_dates` zeroes microseconds).
+- Listing `LastModified` must equal HEAD's `Last-Modified` at whole-second precision. The s3-tests helper `_compare_dates` zeroes the listing value's sub-seconds before comparing.
 - `max-keys=blah` returns 400 `InvalidArgument` ([test_bucket_list_maxkeys_invalid](https://github.com/ceph/s3-tests/blob/5522d1c351f75bc00ae0f64f742f3f095f5939d9/s3tests/functional/test_s3.py#L1239)).
 - V1 `encoding-type=url`: AWS does not list which elements are encoded (**UNVERIFIED** beyond s3-tests, which shows Key and CommonPrefix encoding, [L250](https://github.com/ceph/s3-tests/blob/5522d1c351f75bc00ae0f64f742f3f095f5939d9/s3tests/functional/test_s3.py#L250)). Mirror V2 and also encode `Marker`/`NextMarker`. That V1 part is **UNVERIFIED**.
 - Anonymous listing: 403 `AccessDenied` unless the bucket allows public read ([L1485](https://github.com/ceph/s3-tests/blob/5522d1c351f75bc00ae0f64f742f3f095f5939d9/s3tests/functional/test_s3.py#L1485)).
@@ -1102,7 +1106,10 @@ These are `x-amz-copy-source-if-match`, `-if-none-match`, `-if-modified-since` a
 - The API minimum is 1 (`Length Constraints: Minimum length of 1` on GetObject Key).
 - **Relative path segments** (AWS enforces): "Object keys that contain relative path elements (for example, `../`) are valid if, when parsed left-to-right, the cumulative count of relative path segments never exceeds the number of non-relative path elements encountered ... `videos/2014/../../video1.wmv` is valid. `videos/../../video1.wmv` isn't valid." The error code for invalid ones is **UNVERIFIED**.
 - The key `"soap"` isn't supported for virtual-hosted-style requests. Path-style must be used for it.
-- Guidance lists: safe characters `0-9 a-z A-Z ! - _ . * ' ( )`; "might require special handling" (`& $ @ = ; / : + , ?`, space, 0x00–0x1F, 0x7F); "avoid" (`\ { ^ } % \` ] " > [ ~ < # |`, 128–255). These are advisory, not enforced.
+- Guidance lists (advisory, not enforced):
+  - Safe characters: `0-9 a-z A-Z ! - _ . * ' ( )`.
+  - "Might require special handling": `& $ @ = ; / : + , ?`, space, 0x00–0x1F and 0x7F.
+  - "Avoid": backslash, `{`, `^`, `}`, `%`, backtick, `]`, `"`, `>`, `[`, `~`, `<`, `#`, `|`, and bytes 128–255.
 - XML: "carriage returns and other special characters must be replaced with their equivalent XML entity code" in XML requests (for example DeleteObjects keys with `&#13;`). Use `encoding-type=url` for keys containing characters invalid in XML 1.0 (listing docs).
 - s3-tests uses keys with `?`, `&`, `%`, space and `#`. See §4.3/§9.2, and [test_bucket_list_delimiter_percentage](https://github.com/ceph/s3-tests/blob/5522d1c351f75bc00ae0f64f742f3f095f5939d9/s3tests/functional/test_s3.py#L443).
 
@@ -1138,7 +1145,7 @@ Verbatim rules:
 
 Other points:
 
-- **New (2026 docs): account regional namespace.** Names of the form `<prefix>-<12-digit-account>-<region>-an`, created with `CreateBucket` plus header `x-amz-bucket-namespace: account-regional`. Only the owning account can create them.
+- **New (launch date UNVERIFIED): account regional namespace.** Names of the form `<prefix>-<12-digit-account>-<region>-an`, created with `CreateBucket` plus header `x-amz-bucket-namespace: account-regional`. Only the owning account can create them.
 - Virtual-host TLS caveat: "the SSL wildcard certificate matches only buckets that do not contain dots" ([VirtualHosting](https://docs.aws.amazon.com/AmazonS3/latest/userguide/VirtualHosting.html)).
 - Error: `InvalidBucketName` 400.
 - s3-tests, all expecting 400 `InvalidBucketName`:
@@ -1302,7 +1309,7 @@ Primary sources:
   - An 8 MiB object with `bytes=3145728-5242880` gives `bytes 3145728-5242880/8388608` ([L7582](https://github.com/ceph/s3-tests/blob/5522d1c351f75bc00ae0f64f742f3f095f5939d9/s3tests/functional/test_s3.py#L7582)).
 - **Unsatisfiable:** `InvalidRange` 416, "The requested range cannot be satisfied." ([ErrorResponses](https://docs.aws.amazon.com/AmazonS3/latest/developerguide/ErrorResponses.html#ErrorCodeList)).
   - s3-tests: `bytes=40-50` on an 11-byte object gives 416 `InvalidRange` ([test_ranged_request_invalid_range](https://github.com/ceph/s3-tests/blob/5522d1c351f75bc00ae0f64f742f3f095f5939d9/s3tests/functional/test_s3.py#L7626), unmarked).
-  - **Any** range on a 0-byte object gives 416 `InvalidRange` ([test_ranged_request_empty_object](https://github.com/ceph/s3-tests/blob/5522d1c351f75bc00ae0f64f742f3f095f5939d9/s3tests/functional/test_s3.py#L7640), unmarked).
+  - `bytes=40-50` on a **0-byte** object gives 416 `InvalidRange` ([test_ranged_request_empty_object](https://github.com/ceph/s3-tests/blob/5522d1c351f75bc00ae0f64f742f3f095f5939d9/s3tests/functional/test_s3.py#L7640), unmarked).
   - `Content-Range: bytes */<size>` on 416 is RFC 9110 §15.5.17 behavior. It is **not** stated in AWS docs or asserted by s3-tests (**UNVERIFIED** for AWS). Sending it is harmless.
 - HEAD with Range: "If the Range is satisfiable, only the `ContentLength` is affected in the response. If the Range is not satisfiable, S3 returns a `416 - Requested Range Not Satisfiable` error." ([HeadObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html#AmazonS3-HeadObject-request-header-Range)).
 - Multi-range (`bytes=0-1,3-4`) and syntactically invalid Range headers: AWS docs say only "doesn't support". Whether S3 ignores the header (200 full body) or errors is **UNVERIFIED**. For UploadPartCopy's `x-amz-copy-source-range`, s3-tests expects 400 `InvalidArgument` for malformed or multi ranges (§4.3).
@@ -1411,7 +1418,7 @@ S3TEST_CONF=aws.conf  tox -- -m 'not fails_on_aws'                  # marker fil
 ```
 
 - Test files: `test_s3.py` (760 tests), `test_headers.py` (48), `test_iam.py`, `test_sts.py`, `test_sns.py`, `test_s3select.py`, `test_s3control.py`. The README text about Boto2 and `s3test_boto3` directories is stale; only `s3tests/functional/` exists.
-- **Per-test fixture cost:** an `autouse` fixture runs `setup()`/`teardown()` around *every* test. It calls `nuke_prefixed_buckets` for the **main, alt and tenant** clients ([L308](https://github.com/ceph/s3-tests/blob/5522d1c351f75bc00ae0f64f742f3f095f5939d9/s3tests/functional/__init__.py#L308), [L345](https://github.com/ceph/s3-tests/blob/5522d1c351f75bc00ae0f64f742f3f095f5939d9/s3tests/functional/__init__.py#L346)). That cleanup uses:
+- **Per-test fixture cost:** an `autouse` fixture runs `setup()`/`teardown()` around *every* test. It calls `nuke_prefixed_buckets` for the **main, alt and tenant** clients ([L308](https://github.com/ceph/s3-tests/blob/5522d1c351f75bc00ae0f64f742f3f095f5939d9/s3tests/functional/__init__.py#L308), [L346](https://github.com/ceph/s3-tests/blob/5522d1c351f75bc00ae0f64f742f3f095f5939d9/s3tests/functional/__init__.py#L346)). That cleanup uses:
   - `ListBuckets`, filtered client-side by the prefix.
   - `ListObjectVersions` with `MaxKeys=128`, paginating via `KeyMarker=NextKeyMarker` and `VersionIdMarker=NextVersionIdMarker`. **If `IsTruncated` is true, both Next markers must be present** or botocore rejects the `None` value ([list_versions](https://github.com/ceph/s3-tests/blob/5522d1c351f75bc00ae0f64f742f3f095f5939d9/s3tests/functional/__init__.py#L84)).
   - `DeleteObjects` with `Quiet: True` and `x-amz-bypass-governance-retention`.
@@ -1492,7 +1499,7 @@ user_id = iam-alt-root
 email = iamaltroot@example.com
 ```
 
-`api_name` sets the LocationConstraint used by `test_bucket_get_location`. An empty value skips that test ([L3855](https://github.com/ceph/s3-tests/blob/5522d1c351f75bc00ae0f64f742f3f095f5939d9/s3tests/functional/test_s3.py#L3852)).
+`api_name` sets the LocationConstraint used by `test_bucket_get_location`. An empty value skips that test ([L3852](https://github.com/ceph/s3-tests/blob/5522d1c351f75bc00ae0f64f742f3f095f5939d9/s3tests/functional/test_s3.py#L3852)).
 
 ### 15.3 Markers and deselection
 
@@ -1594,7 +1601,7 @@ This section is our analysis, built on the facts cited above. Client-specific in
    - `DeleteObjects`: accept Content-MD5 **or** `x-amz-checksum-*`; report missing keys as `Deleted`; Quiet mode; at most 1000 keys.
    - `CopyObject`: `x-amz-copy-source` decoded once, `?versionId`, directives, `x-amz-copy-source-if-*`, the self-copy rule.
 6. **Listing.** Implement `ListObjectsV2` and `ListObjects` V1. Both are needed; V1 keeps `Marker`/`NextMarker` semantics.
-   - Byte-order sorting, `delimiter` (any string), CommonPrefixes counted in `KeyCount`/`MaxKeys`, and `encoding-type=url`.
+   - Byte-order sorting, `delimiter` (s3-tests only uses single characters; matching it as a string is a safe superset), CommonPrefixes counted in `KeyCount`/`MaxKeys`, and `encoding-type=url`.
    - Strongly consistent with writes (§13).
    - **UNVERIFIED but high-impact:** botocore is widely reported to add `encoding-type=url` to list calls automatically and to URL-decode the returned keys. If mantle ignores `encoding-type`, keys containing `%` or `+` may be corrupted client-side. Honor it exactly.
 7. **Multipart.**
@@ -1628,7 +1635,7 @@ This section is our analysis, built on the facts cited above. Client-specific in
    - `x-amz-trailer: x-amz-checksum-crc32` (or `-crc64nvme`),
    - with `x-amz-decoded-content-length`, possibly wrapped in HTTP `Transfer-Encoding: chunked`.
 
-   Trailer lines may end in `\r\n` or `\n\r\n`. Strip `aws-chunked` from the stored `Content-Encoding`. Chunk sizes must be at least 8 KiB except the last; be lenient.
+   Trailer lines may end in `\r\n` or `\n\r\n`. Strip `aws-chunked` from the stored `Content-Encoding`. AWS requires chunks of at least 8 KiB except the last; mantle may accept smaller ones.
 2. **Content-MD5 is no longer what SDKs send** for DeleteObjects, PutBucketVersioning and other "MD5 required" operations. They send `x-amz-sdk-checksum-algorithm` plus `x-amz-checksum-crc32`. Accept any valid checksum in place of MD5 (§3.2).
 3. **Response checksums are validated by clients.** Return `x-amz-checksum-*` only if the value is exactly right for the bytes served:
    - the whole object,

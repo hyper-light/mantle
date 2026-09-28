@@ -89,5 +89,6 @@ Work lands on `dev`, committed and pushed after each gated step.
 
 ## Where things are
 
-- `docs/design/` — architecture and decision records; start at `ARCHITECTURE.md`.
+- `docs/design/` — architecture and decision records.
+- `docs/STATUS.md` — what works today and what closes each remaining piece.
 - `docs/research/` — the literature and ground-truth notes decisions cite.

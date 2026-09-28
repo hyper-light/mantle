@@ -48,7 +48,7 @@ jobs:
       - name: Formatting
         run: cargo fmt --all --check
       - name: Lints
-        run: cargo clippy --workspace --all-targets --locked --target ${{ matrix.target }} -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked --target ${{ matrix.target }} -- -D warnings
       - name: Production panic policy
         shell: bash
         run: bash scripts/check-production.sh --target ${{ matrix.target }}

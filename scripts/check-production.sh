@@ -3,7 +3,7 @@
 # without cfg(test), so the test-only allowances at each crate root do not apply.
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
-cargo clippy --workspace --lib --bins --locked "$@" -- \
+cargo clippy --workspace --lib --bins --all-features --locked "$@" -- \
   -D warnings \
   -D clippy::panic \
   -D clippy::unwrap_used \

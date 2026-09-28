@@ -13,6 +13,6 @@ targets=(
 )
 for target in "${targets[@]}"; do
   echo "== $target"
-  cargo clippy --workspace --all-targets --locked --target "$target" -- -D warnings
+  cargo clippy --workspace --all-targets --all-features --locked --target "$target" -- -D warnings
   bash scripts/check-production.sh --target "$target"
 done

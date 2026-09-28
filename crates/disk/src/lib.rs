@@ -22,6 +22,8 @@ pub mod histogram;
 pub mod identity;
 pub mod measure;
 pub mod probe;
+#[cfg(any(test, feature = "sim"))]
+pub mod sim;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DiskError {

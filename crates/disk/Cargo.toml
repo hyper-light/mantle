@@ -9,6 +9,10 @@ rust-version.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# The simulated power-loss file, for other crates' tests.
+sim = []
+
 [dependencies]
 thiserror.workspace = true
 

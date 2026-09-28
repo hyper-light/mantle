@@ -35,20 +35,18 @@ impl From<std::io::Error> for Error {
 pub fn probe(out: &mut impl Write, path: &Path, measure: bool, verbose: bool) -> Result<(), Error> {
     let id = mantle_disk::probe::identify(path);
     writeln!(out, "{}", path.display())?;
-    field(out, "device", &device(&id))?;
-    field(out, "medium", &medium(&id))?;
-    field(out, "blocks", &blocks(&id))?;
+    field(out, "disk", &disk(&id))?;
     field(out, "file system", &file_system(&id))?;
-    field(out, "write cache", write_cache(&id))?;
+    field(out, "safety", safety(&id))?;
     if matches!(id.zoned, Zoned::HostAware | Zoned::HostManaged) {
         field(
             out,
-            "zoned",
-            "yes: writes must stay sequential within each zone",
+            "zones",
+            "the drive is zoned: mantle writes each zone front to back",
         )?;
     }
     if verbose && !id.notes.is_empty() {
-        writeln!(out, "  not answered by the OS:")?;
+        writeln!(out, "  the OS could not say:")?;
         for note in &id.notes {
             writeln!(out, "    {note}")?;
         }
@@ -63,45 +61,35 @@ fn field(out: &mut impl Write, name: &str, value: &str) -> std::io::Result<()> {
     writeln!(out, "  {name:<13} {value}")
 }
 
-fn device(id: &Identity) -> String {
-    match (&id.device, &id.model) {
-        (Some(d), Some(m)) => format!("{d}: {m}"),
-        (Some(d), None) => d.clone(),
-        (None, Some(m)) => m.clone(),
-        (None, None) => "not reported".to_owned(),
-    }
-}
-
-fn medium(id: &Identity) -> String {
+fn disk(id: &Identity) -> String {
+    let name = id
+        .model
+        .clone()
+        .or_else(|| id.device.clone())
+        .unwrap_or_else(|| "a device the OS does not name".to_owned());
     let medium = match id.medium {
-        Medium::SolidState => "solid state",
-        Medium::Rotational => "rotational",
+        Medium::SolidState => "flash",
+        Medium::Rotational => "spinning disk",
         Medium::Memory => "memory",
-        Medium::Unknown => "not reported",
+        Medium::Unknown => "medium not reported",
     };
     let link = match &id.interconnect {
-        Interconnect::Nvme => "NVMe".to_owned(),
-        Interconnect::Scsi => "SATA/SAS/SCSI".to_owned(),
-        Interconnect::Usb => "USB".to_owned(),
-        Interconnect::Virtual => "virtual disk".to_owned(),
-        Interconnect::Mmc => "SD/MMC".to_owned(),
-        Interconnect::AppleFabric => "Apple Fabric".to_owned(),
-        Interconnect::Network => "network".to_owned(),
-        Interconnect::Composite => format!("composite of {} devices", id.members.len()),
-        Interconnect::Memory => "RAM".to_owned(),
-        Interconnect::Other(s) => s.clone(),
-        Interconnect::Unknown => return medium.to_owned(),
+        Interconnect::Nvme => Some("NVMe".to_owned()),
+        Interconnect::Scsi => Some("SATA/SAS".to_owned()),
+        Interconnect::Usb => Some("USB".to_owned()),
+        Interconnect::Virtual => Some("a virtual disk".to_owned()),
+        Interconnect::Mmc => Some("SD card".to_owned()),
+        Interconnect::AppleFabric => Some("internal".to_owned()),
+        Interconnect::Network => Some("over the network".to_owned()),
+        Interconnect::Composite => Some(format!("{} devices combined", id.members.len())),
+        Interconnect::Memory => Some("RAM".to_owned()),
+        Interconnect::Other(s) => Some(s.clone()),
+        Interconnect::Unknown => None,
     };
-    format!("{medium}, {link}")
-}
-
-fn blocks(id: &Identity) -> String {
-    let show = |b: Option<u32>| b.map_or("?".to_owned(), |b| format!("{b} B"));
-    format!(
-        "{} logical, {} physical",
-        show(id.logical_block),
-        show(id.physical_block)
-    )
+    match link {
+        Some(link) => format!("{name}, {link} {medium}"),
+        None => format!("{name}, {medium}"),
+    }
 }
 
 fn file_system(id: &Identity) -> String {
@@ -127,24 +115,22 @@ fn file_system(id: &Identity) -> String {
         FileSystemKind::Other(s) => s.clone(),
         FileSystemKind::Unknown => "not reported".to_owned(),
     };
-    match (id.file_system.available_bytes, id.file_system.total_bytes) {
-        (Some(free), Some(total)) => format!(
-            "{kind}, {} free of {}",
-            display::capacity(free),
-            display::capacity(total)
-        ),
-        _ => kind,
+    match id.file_system.available_bytes {
+        Some(free) => format!("{kind}, {} free", display::capacity(free)),
+        None => kind,
     }
 }
 
-fn write_cache(id: &Identity) -> &'static str {
+/// What mantle does to make a write safe on this device, and why.
+fn safety(id: &Identity) -> &'static str {
     match id.write_cache {
-        WriteCache::WriteBack => "volatile: a write is durable only once flushed",
-        WriteCache::WriteThrough => "write-through: completed writes are on stable media",
-        WriteCache::Unknown if cfg!(target_vendor = "apple") => {
-            "not reported; flushes use F_FULLFSYNC, which empties any drive cache"
+        WriteCache::WriteBack => {
+            "the drive caches writes, so every commit empties its cache before mantle answers"
         }
-        WriteCache::Unknown => "not reported; every flush asks the drive to empty it",
+        WriteCache::WriteThrough => "the drive puts writes on stable media before it answers",
+        WriteCache::Unknown => {
+            "the drive does not say whether it caches writes, so every commit empties its cache"
+        }
     }
 }
 
@@ -161,7 +147,7 @@ fn measured(out: &mut impl Write, path: &Path, id: &Identity) -> Result<(), Erro
     let plan = Plan::standard(align);
     writeln!(
         out,
-        "measuring with a scratch file of up to {} ...",
+        "measuring with a scratch file of up to {}, removed afterwards...",
         display::capacity(plan.span)
     )?;
     out.flush()?;
@@ -172,71 +158,48 @@ fn measured(out: &mut impl Write, path: &Path, id: &Identity) -> Result<(), Erro
 }
 
 fn report(out: &mut impl Write, c: &Calibration) -> std::io::Result<()> {
-    let caching = match c.caching {
-        Caching::Direct => "direct I/O",
-        Caching::Buffered => "buffered I/O (the file system refused direct I/O)",
-    };
-    writeln!(
-        out,
-        "measured in {:.1} s through {caching}, median of three rounds:",
-        c.elapsed.as_secs_f64()
-    )?;
-    let at = |p: &calibrate::Point, rate: String| format!("{rate} at depth {}", p.depth);
-    let reads: Vec<String> = c
-        .random_read
-        .iter()
-        .map(|p| {
-            format!(
-                "{} ({})",
-                at(p, display::per_sec(p.ops_per_sec)),
-                display::nanos(p.p50_ns)
-            )
-        })
-        .collect();
-    measure_field(
-        out,
-        &format!("{} random reads", display::size(c.small)),
-        &reads.join(", "),
-    )?;
+    writeln!(out, "measured in {:.0} s:", c.elapsed.as_secs_f64())?;
     if let Some(knee) = c.random_read_knee() {
-        measure_field(
+        field(
             out,
-            "useful queue depth",
-            &format!("{}: deeper queues add waiting, not throughput", knee.depth),
+            "reads",
+            &format!(
+                "fastest with {} small reads in flight, so mantle keeps up to {} in flight",
+                knee.depth, knee.depth
+            ),
         )?;
     }
-    let seq = |points: &[calibrate::Point]| {
+    let best = |points: &[calibrate::Point]| {
         points
             .iter()
-            .map(|p| at(p, display::rate(p.bytes_per_sec)))
-            .collect::<Vec<_>>()
-            .join(", ")
+            .map(|p| p.bytes_per_sec)
+            .fold(0.0f64, f64::max)
     };
-    measure_field(
+    field(
         out,
-        &format!("{} reads", display::size(c.large)),
-        &seq(&c.sequential_read),
-    )?;
-    measure_field(
-        out,
-        &format!("{} writes", display::size(c.large)),
-        &seq(&c.sequential_write),
-    )?;
-    measure_field(
-        out,
-        "durable write",
+        "throughput",
         &format!(
-            "{} (p99 {}): at most {} flushes a second, so writes must share them",
-            display::nanos(c.durable_write.p50_ns),
-            display::nanos(c.durable_write.p99_ns),
-            display::count(c.durable_write.ops_per_sec)
+            "{} reading and {} writing large transfers",
+            display::rate(best(&c.sequential_read)),
+            display::rate(best(&c.sequential_write))
         ),
     )?;
+    field(
+        out,
+        "commits",
+        &format!(
+            "about {} until a write is safe; writes that arrive together share one commit",
+            display::nanos(c.durable_write.p50_ns)
+        ),
+    )?;
+    if c.caching == Caching::Buffered {
+        field(
+            out,
+            "caching",
+            "the file system refused direct I/O, so reads and writes pass through its cache",
+        )?;
+    }
     Ok(())
-}
-
-fn measure_field(out: &mut impl Write, name: &str, value: &str) -> std::io::Result<()> {
-    writeln!(out, "  {name:<20} {value}")
 }
 
 #[cfg(test)]
@@ -249,7 +212,7 @@ mod tests {
         let mut out = Vec::new();
         probe(&mut out, dir.path(), false, true).unwrap();
         let text = String::from_utf8(out).unwrap();
-        for name in ["device", "medium", "blocks", "file system", "write cache"] {
+        for name in ["disk", "file system", "safety"] {
             assert!(text.contains(name), "{name} missing from:\n{text}");
         }
     }

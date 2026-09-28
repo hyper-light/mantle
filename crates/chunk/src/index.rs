@@ -26,7 +26,8 @@ pub struct Fragment {
 
 impl Fragment {
     pub fn end(&self) -> u64 {
-        self.chunk_offset.saturating_add(u64::from(self.payload_len))
+        self.chunk_offset
+            .saturating_add(u64::from(self.payload_len))
     }
 
     pub fn from_put(p: &PutRecord) -> Self {
@@ -155,6 +156,14 @@ impl Index {
         if entry.fragments.len() >= max_fragments {
             return Err(Inconsistent::TooManyFragments);
         }
+        // A fragment may start where an empty one did only if that one ended the chunk,
+        // which the sealed check above already refused.
+        if entry.fragments.last().is_some_and(|f| f.payload_len == 0) {
+            return Err(Inconsistent::NotContiguous {
+                expected: entry.len(),
+                got: fragment.chunk_offset,
+            });
+        }
         entry.fragments.push(fragment);
         entry.sealed = sealed;
         entry.time_ns = put.time_ns;
@@ -163,6 +172,28 @@ impl Index {
 
     pub fn remove(&mut self, key: &ChunkKey) -> Option<Entry> {
         self.map.remove(key)
+    }
+
+    /// Removes `key`'s last fragment if it is the one at `chunk_offset` written with
+    /// `sequence`, unsealing the chunk; removes the chunk if nothing is left. Returns the
+    /// fragment removed.
+    pub fn pop_fragment(
+        &mut self,
+        key: &ChunkKey,
+        chunk_offset: u64,
+        sequence: u64,
+    ) -> Option<Fragment> {
+        let entry = self.map.get_mut(key)?;
+        let last = entry.fragments.last()?;
+        if last.chunk_offset != chunk_offset || last.sequence != sequence {
+            return None;
+        }
+        let popped = entry.fragments.pop();
+        entry.sealed = false;
+        if entry.fragments.is_empty() {
+            self.map.remove(key);
+        }
+        popped
     }
 }
 
@@ -195,7 +226,11 @@ mod tests {
 
     fn put(offset: u64, len: u32, seq: u64, flags: u8) -> PutRecord {
         PutRecord {
-            key: ChunkKey { block: 1, epoch: 0, index: 0 },
+            key: ChunkKey {
+                block: 1,
+                epoch: 0,
+                index: 0,
+            },
             segment: 0,
             incarnation: 1,
             offset: 4096,
@@ -211,16 +246,26 @@ mod tests {
 
     #[test]
     fn appends_must_be_contiguous_and_stop_at_seal() {
-        let key = ChunkKey { block: 1, epoch: 0, index: 0 };
+        let key = ChunkKey {
+            block: 1,
+            epoch: 0,
+            index: 0,
+        };
         let mut index = Index::default();
         index.insert(key, &put(0, 10, 1, 0), 8).unwrap();
         index.insert(key, &put(10, 5, 2, 0), 8).unwrap();
         assert_eq!(
             index.insert(key, &put(20, 5, 3, 0), 8),
-            Err(Inconsistent::NotContiguous { expected: 15, got: 20 })
+            Err(Inconsistent::NotContiguous {
+                expected: 15,
+                got: 20
+            })
         );
         index.insert(key, &put(15, 5, 3, FLAG_FINAL), 8).unwrap();
-        assert_eq!(index.insert(key, &put(20, 1, 4, 0), 8), Err(Inconsistent::Sealed));
+        assert_eq!(
+            index.insert(key, &put(20, 1, 4, 0), 8),
+            Err(Inconsistent::Sealed)
+        );
         let e = index.get(&key).unwrap();
         assert_eq!(e.len(), 20);
         assert!(e.sealed);
@@ -229,7 +274,11 @@ mod tests {
 
     #[test]
     fn replaying_a_fragment_twice_changes_nothing() {
-        let key = ChunkKey { block: 1, epoch: 0, index: 0 };
+        let key = ChunkKey {
+            block: 1,
+            epoch: 0,
+            index: 0,
+        };
         let mut index = Index::default();
         index.insert(key, &put(0, 10, 1, FLAG_FINAL), 8).unwrap();
         index.insert(key, &put(0, 10, 1, FLAG_FINAL), 8).unwrap();
@@ -237,11 +286,38 @@ mod tests {
     }
 
     #[test]
+    fn popping_the_last_fragment_unseals_and_empties() {
+        let key = ChunkKey {
+            block: 1,
+            epoch: 0,
+            index: 0,
+        };
+        let mut index = Index::default();
+        index.insert(key, &put(0, 10, 1, 0), 8).unwrap();
+        index.insert(key, &put(10, 5, 2, FLAG_FINAL), 8).unwrap();
+        assert!(
+            index.pop_fragment(&key, 0, 1).is_none(),
+            "only the last fragment pops"
+        );
+        assert!(index.pop_fragment(&key, 10, 2).is_some());
+        assert!(!index.get(&key).unwrap().sealed);
+        assert!(index.pop_fragment(&key, 0, 1).is_some());
+        assert!(index.get(&key).is_none());
+    }
+
+    #[test]
     fn a_chunk_has_a_bounded_number_of_fragments() {
-        let key = ChunkKey { block: 1, epoch: 0, index: 0 };
+        let key = ChunkKey {
+            block: 1,
+            epoch: 0,
+            index: 0,
+        };
         let mut index = Index::default();
         index.insert(key, &put(0, 1, 1, 0), 2).unwrap();
         index.insert(key, &put(1, 1, 2, 0), 2).unwrap();
-        assert_eq!(index.insert(key, &put(2, 1, 3, 0), 2), Err(Inconsistent::TooManyFragments));
+        assert_eq!(
+            index.insert(key, &put(2, 1, 3, 0), 2),
+            Err(Inconsistent::TooManyFragments)
+        );
     }
 }

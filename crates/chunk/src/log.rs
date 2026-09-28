@@ -3,7 +3,7 @@
 
 use mantle_disk::DiskError;
 use mantle_disk::block::BlockFile;
-use mantle_disk::buf::{Alignment, AlignedBuf};
+use mantle_disk::buf::{AlignedBuf, Alignment};
 
 use crate::frame::{self, FrameHeader, LogRecord};
 use crate::layout::{Geometry, MAX_FRAME_BYTES};
@@ -133,7 +133,13 @@ mod tests {
     use super::*;
 
     fn cursor(pos: u64, start: u64, used: u64) -> Cursor {
-        Cursor { pos, lsn: 1, start_pos: start, start_lsn: 1, used }
+        Cursor {
+            pos,
+            lsn: 1,
+            start_pos: start,
+            start_lsn: 1,
+            used,
+        }
     }
 
     #[test]
@@ -142,13 +148,21 @@ mod tests {
         let c = cursor(0, 0, 0);
         assert_eq!(
             c.place(4096, block, size),
-            Some(Placement { wrap: false, at: 0, consumed: 4096 })
+            Some(Placement {
+                wrap: false,
+                at: 0,
+                consumed: 4096
+            })
         );
         // Near the end: the tail is skipped with a wrap frame and the frame goes to 0.
         let c = cursor(14 * 4096, 12 * 4096, 2 * 4096);
         assert_eq!(
             c.place(3 * 4096, block, size),
-            Some(Placement { wrap: true, at: 0, consumed: 5 * 4096 })
+            Some(Placement {
+                wrap: true,
+                at: 0,
+                consumed: 5 * 4096
+            })
         );
         // Not enough free space before the live span.
         let c = cursor(4096, 2 * 4096, 15 * 4096);

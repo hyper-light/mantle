@@ -106,9 +106,15 @@ fn now_ns() -> u64 {
         .unwrap_or(0)
 }
 
-fn reply(request: Request, result: Result<(), ChunkError>) {
+type Reply = SyncSender<Result<(), ChunkError>>;
+
+fn answer(tx: Reply, result: Result<(), ChunkError>) {
     // The submitter may have given up waiting; its answer has nowhere to go.
-    let _ = request.reply.send(result);
+    let _ = tx.send(result);
+}
+
+fn reply(request: Request, result: Result<(), ChunkError>) {
+    answer(request.reply, result);
 }
 
 impl<F: BlockFile> Writer<F> {
@@ -142,15 +148,15 @@ impl<F: BlockFile> Writer<F> {
     }
 
     fn process(&mut self, batch: Vec<Request>) {
-        if self.cursor.used > self.shared.geometry.log_size / 3 {
-            if let Err(e) = self.checkpoint() {
-                self.fence();
-                let mut first = Some(e);
-                for request in batch {
-                    reply(request, Err(first.take().unwrap_or(ChunkError::Fenced)));
-                }
-                return;
+        if self.cursor.used > self.shared.geometry.log_size / 3
+            && let Err(e) = self.checkpoint()
+        {
+            self.fence();
+            let mut first = Some(e);
+            for request in batch {
+                reply(request, Err(first.take().unwrap_or(ChunkError::Fenced)));
             }
+            return;
         }
         let accepted = match self.validate(batch) {
             Ok(accepted) => accepted,
@@ -189,13 +195,22 @@ impl<F: BlockFile> Writer<F> {
                 } => {
                     let view = views
                         .entry(*key)
-                        .or_insert_with(|| index.get(key).map(|e| View {
-                            len: e.len(),
-                            sealed: e.sealed,
-                            fragments: e.fragments.len(),
-                            pending: Vec::new(),
-                        }))
+                        .or_insert_with(|| {
+                            index.get(key).map(|e| View {
+                                len: e.len(),
+                                sealed: e.sealed,
+                                fragments: e.fragments.len(),
+                                pending: Vec::new(),
+                            })
+                        })
                         .clone();
+                    // Appending nothing without sealing writes nothing. A zero-length fragment
+                    // may only end a chunk: fragments are found by their starting offset, which
+                    // must be unique.
+                    if data.is_empty() && !*seal {
+                        reply(request, Ok(()));
+                        continue;
+                    }
                     let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
                     let crc = mantle_crc::crc32c(data);
                     let existing = index
@@ -214,6 +229,8 @@ impl<F: BlockFile> Writer<F> {
                         Some(v) if *offset < v.len || (v.sealed && *offset == v.len) => {
                             if existing == Some((len, crc)) && (!seal || v.sealed) {
                                 Ok(Decision::Done)
+                            } else if *offset == 0 && *seal {
+                                Err(ChunkError::Exists(*key))
                             } else if v.sealed {
                                 Err(ChunkError::Sealed(*key))
                             } else {
@@ -267,12 +284,14 @@ impl<F: BlockFile> Writer<F> {
                 Op::Delete { key } => {
                     let exists = views
                         .entry(*key)
-                        .or_insert_with(|| index.get(key).map(|e| View {
-                            len: e.len(),
-                            sealed: e.sealed,
-                            fragments: e.fragments.len(),
-                            pending: Vec::new(),
-                        }))
+                        .or_insert_with(|| {
+                            index.get(key).map(|e| View {
+                                len: e.len(),
+                                sealed: e.sealed,
+                                fragments: e.fragments.len(),
+                                pending: Vec::new(),
+                            })
+                        })
                         .is_some();
                     if exists {
                         views.insert(*key, None);
@@ -323,18 +342,24 @@ impl<F: BlockFile> Writer<F> {
         let mut open = self.open;
         let mut incarnation = self.incarnation;
         let mut sequence = self.sequence;
-        let mut ok: Vec<Request> = Vec::with_capacity(accepted.len());
+        let mut ok: Vec<Reply> = Vec::with_capacity(accepted.len());
 
         // Sealed segments with nothing live are freed in this frame, so this batch may reuse them.
+        // At most one per request, so the frame stays within the log's headroom
+        // (layout::batch_frame_bytes); the rest are freed by later batches.
         let freed: Vec<u32> = self
             .segments
             .iter()
             .enumerate()
             .filter(|(_, s)| s.state == SegmentState::Sealed && s.live == 0)
             .filter_map(|(i, _)| u32::try_from(i).ok())
+            .take(accepted.len().max(1))
             .collect();
         for &segment in &freed {
-            if let Some(info) = self.segments.get(usize::try_from(segment).unwrap_or(usize::MAX)) {
+            if let Some(info) = self
+                .segments
+                .get(usize::try_from(segment).unwrap_or(usize::MAX))
+            {
                 records.push(LogRecord::Segment(SegmentRecord {
                     segment,
                     incarnation: info.incarnation,
@@ -355,8 +380,9 @@ impl<F: BlockFile> Writer<F> {
         free.dedup();
         let mut free = free.into_iter();
 
-        for item in accepted {
-            match (&item.request.op, &item.decision) {
+        for Accepted { request, decision } in accepted {
+            let Request { op, reply: tx } = request;
+            match (&op, &decision) {
                 (
                     Op::Write {
                         key,
@@ -367,21 +393,24 @@ impl<F: BlockFile> Writer<F> {
                     Decision::Write(crc),
                 ) => {
                     let Ok(payload_len) = u32::try_from(data.len()) else {
-                        reply(item.request, Err(ChunkError::Full));
+                        answer(tx, Err(ChunkError::Full));
                         continue;
                     };
                     let Some(len) = record::record_len(payload_len, self.shared.checksum_shift)
                         .and_then(|l| u64::try_from(l).ok())
                     else {
-                        reply(item.request, Err(ChunkError::Full));
+                        answer(tx, Err(ChunkError::Full));
                         continue;
                     };
                     // Find room: the open segment, or a new one.
                     let segment = loop {
                         if let Some(s) = open {
-                            let at = positions.get(&s).copied().unwrap_or_else(|| {
-                                self.segment(s).map_or(block, |i| u64::from(i.write_pos).max(block))
-                            });
+                            // A segment left open by an earlier batch continues at its write
+                            // position; record it so the placement below uses the same one.
+                            let written = self
+                                .segment(s)
+                                .map_or(block, |i| u64::from(i.write_pos).max(block));
+                            let at = *positions.entry(s).or_insert(written);
                             if at.saturating_add(len) <= geometry.segment_size {
                                 break Some(s);
                             }
@@ -421,10 +450,13 @@ impl<F: BlockFile> Writer<F> {
                         open = Some(next);
                     };
                     let Some(segment) = segment else {
-                        reply(item.request, Err(ChunkError::Full));
+                        answer(tx, Err(ChunkError::Full));
                         continue;
                     };
-                    let at = positions.get(&segment).copied().unwrap_or(block);
+                    let Some(at) = positions.get(&segment).copied() else {
+                        answer(tx, Err(ChunkError::Full));
+                        continue;
+                    };
                     let region = match regions.iter_mut().rfind(|r| r.segment == segment) {
                         Some(r) => r,
                         None => {
@@ -453,13 +485,13 @@ impl<F: BlockFile> Writer<F> {
                         time_ns: now,
                     };
                     let Some(written_crc) = record::encode(&header, data, &mut region.bytes) else {
-                        reply(item.request, Err(ChunkError::Full));
+                        answer(tx, Err(ChunkError::Full));
                         continue;
                     };
                     if written_crc != *crc {
                         // The bytes changed between validation and encoding: memory corruption.
-                        reply(
-                            item.request,
+                        answer(
+                            tx,
                             Err(ChunkError::Corrupt {
                                 key: *key,
                                 detail: "payload changed in memory before it was written".into(),
@@ -481,7 +513,7 @@ impl<F: BlockFile> Writer<F> {
                         flags: header.flags,
                     }));
                     positions.insert(segment, at.saturating_add(len));
-                    ok.push(item.request);
+                    ok.push(tx);
                 }
                 (Op::Delete { key }, Decision::Delete) => {
                     sequence = sequence.saturating_add(1);
@@ -490,9 +522,9 @@ impl<F: BlockFile> Writer<F> {
                         sequence,
                         time_ns: now,
                     }));
-                    ok.push(item.request);
+                    ok.push(tx);
                 }
-                _ => reply(item.request, Ok(())),
+                _ => answer(tx, Ok(())),
             }
         }
         if ok.is_empty() && freed.is_empty() {
@@ -505,23 +537,23 @@ impl<F: BlockFile> Writer<F> {
             Err(e) => {
                 self.fence();
                 let mut first = Some(e);
-                for request in ok {
-                    reply(request, Err(first.take().unwrap_or(ChunkError::Fenced)));
+                for tx in ok {
+                    answer(tx, Err(first.take().unwrap_or(ChunkError::Fenced)));
                 }
             }
             Ok(()) => {
                 if let Err(e) = self.publish(&records, &regions, &freed, &sealed, &opened, open) {
                     self.fence();
                     let mut first = Some(e);
-                    for request in ok {
-                        reply(request, Err(first.take().unwrap_or(ChunkError::Fenced)));
+                    for tx in ok {
+                        answer(tx, Err(first.take().unwrap_or(ChunkError::Fenced)));
                     }
                     return;
                 }
                 self.incarnation = incarnation;
                 self.sequence = sequence;
-                for request in ok {
-                    reply(request, Ok(()));
+                for tx in ok {
+                    answer(tx, Ok(()));
                 }
             }
         }
@@ -541,7 +573,11 @@ impl<F: BlockFile> Writer<F> {
             .unwrap_or(0)
     }
 
-    fn write_batch(&mut self, regions: &mut [Region], records: &[LogRecord]) -> Result<(), ChunkError> {
+    fn write_batch(
+        &mut self,
+        regions: &mut [Region],
+        records: &[LogRecord],
+    ) -> Result<(), ChunkError> {
         let geometry = self.shared.geometry;
         let align = self.shared.file.alignment();
         for region in regions.iter_mut() {
@@ -551,7 +587,8 @@ impl<F: BlockFile> Writer<F> {
                 .checked_next_multiple_of(geometry.block_usize())
                 .ok_or(ChunkError::Full)?;
             region.bytes.resize(padded, 0);
-            let mut buf = AlignedBuf::zeroed(padded, align).map_err(|e| ChunkError::Device(e.into()))?;
+            let mut buf =
+                AlignedBuf::zeroed(padded, align).map_err(|e| ChunkError::Device(e.into()))?;
             buf.extend_from_slice(&region.bytes)
                 .map_err(|e| ChunkError::Device(e.into()))?;
             let at = geometry
@@ -563,16 +600,24 @@ impl<F: BlockFile> Writer<F> {
                 .write_all_at(buf.as_slice(), at)
                 .map_err(ChunkError::Device)?;
         }
-        self.append_frame(KIND_BATCH, records)?;
+        let group = self.cursor.lsn;
+        self.append_frame(KIND_BATCH, records, group)?;
         self.shared.file.sync_data().map_err(ChunkError::Device)
     }
 
-    /// Appends one frame to the log (preceded by a wrap frame when it must go around).
-    fn append_frame(&mut self, kind: u16, records: &[LogRecord]) -> Result<(u64, u64), ChunkError> {
+    /// Appends one frame to the log (preceded by a wrap frame when it must go around). `group`
+    /// is the LSN of the first frame written since the last completed flush.
+    fn append_frame(
+        &mut self,
+        kind: u16,
+        records: &[LogRecord],
+        group: u64,
+    ) -> Result<(u64, u64), ChunkError> {
         let geometry = self.shared.geometry;
         let block = geometry.block_usize();
         let align = self.shared.file.alignment();
-        let probe = frame::encode(kind, 0, self.shared.volume, records, block).ok_or(ChunkError::Full)?;
+        let probe = frame::encode(kind, 0, 0, self.shared.volume, records, block)
+            .ok_or(ChunkError::Full)?;
         let len = u64::try_from(probe.len()).map_err(|_| ChunkError::Full)?;
         let placement = self
             .cursor
@@ -580,13 +625,14 @@ impl<F: BlockFile> Writer<F> {
             .ok_or(ChunkError::Full)?;
         let mut lsn = self.cursor.lsn;
         if placement.wrap {
-            let wrap = frame::encode(KIND_WRAP, lsn, self.shared.volume, &[], block)
+            let wrap = frame::encode(KIND_WRAP, lsn, group, self.shared.volume, &[], block)
                 .ok_or(ChunkError::Full)?;
             log::write_frame(&self.shared.file, &geometry, self.cursor.pos, &wrap, align)
                 .map_err(ChunkError::Device)?;
             lsn = lsn.saturating_add(1);
         }
-        let bytes = frame::encode(kind, lsn, self.shared.volume, records, block).ok_or(ChunkError::Full)?;
+        let bytes = frame::encode(kind, lsn, group, self.shared.volume, records, block)
+            .ok_or(ChunkError::Full)?;
         log::write_frame(&self.shared.file, &geometry, placement.at, &bytes, align)
             .map_err(ChunkError::Device)?;
         self.cursor.advance(placement, len, geometry.log_size);
@@ -606,12 +652,18 @@ impl<F: BlockFile> Writer<F> {
         let per_chunk = self.config.limits.fragments_per_chunk;
         let mut index = self.shared.index.write().map_err(|_| ChunkError::Fenced)?;
         for &segment in freed {
-            if let Some(info) = self.segments.get_mut(usize::try_from(segment).unwrap_or(usize::MAX)) {
+            if let Some(info) = self
+                .segments
+                .get_mut(usize::try_from(segment).unwrap_or(usize::MAX))
+            {
                 *info = SegmentInfo::FREE;
             }
         }
         for &(segment, incarnation) in opened {
-            if let Some(info) = self.segments.get_mut(usize::try_from(segment).unwrap_or(usize::MAX)) {
+            if let Some(info) = self
+                .segments
+                .get_mut(usize::try_from(segment).unwrap_or(usize::MAX))
+            {
                 *info = SegmentInfo {
                     state: SegmentState::Open,
                     incarnation,
@@ -626,9 +678,14 @@ impl<F: BlockFile> Writer<F> {
                 LogRecord::Put(p) => {
                     index
                         .insert(p.key, p, per_chunk)
-                        .map_err(|_| ChunkError::CorruptLog { lsn: self.cursor.lsn })?;
+                        .map_err(|_| ChunkError::CorruptLog {
+                            lsn: self.cursor.lsn,
+                        })?;
                     self.fragments = self.fragments.saturating_add(1);
-                    if let Some(info) = self.segments.get_mut(usize::try_from(p.segment).unwrap_or(usize::MAX)) {
+                    if let Some(info) = self
+                        .segments
+                        .get_mut(usize::try_from(p.segment).unwrap_or(usize::MAX))
+                    {
                         info.live = info.live.saturating_add(u64::from(p.record_len));
                         info.youngest_ns = info.youngest_ns.max(p.time_ns);
                     }
@@ -637,7 +694,10 @@ impl<F: BlockFile> Writer<F> {
                     if let Some(entry) = index.remove(&d.key) {
                         for f in &entry.fragments {
                             self.fragments = self.fragments.saturating_sub(1);
-                            if let Some(info) = self.segments.get_mut(usize::try_from(f.segment).unwrap_or(usize::MAX)) {
+                            if let Some(info) = self
+                                .segments
+                                .get_mut(usize::try_from(f.segment).unwrap_or(usize::MAX))
+                            {
                                 info.live = info.live.saturating_sub(u64::from(f.record_len));
                             }
                         }
@@ -649,14 +709,22 @@ impl<F: BlockFile> Writer<F> {
         drop(index);
         let block = self.shared.geometry.block;
         for region in regions {
-            if let Some(info) = self.segments.get_mut(usize::try_from(region.segment).unwrap_or(usize::MAX)) {
-                let end = region.start.saturating_add(u64::try_from(region.bytes.len()).unwrap_or(0));
+            if let Some(info) = self
+                .segments
+                .get_mut(usize::try_from(region.segment).unwrap_or(usize::MAX))
+            {
+                let end = region
+                    .start
+                    .saturating_add(u64::try_from(region.bytes.len()).unwrap_or(0));
                 let end = end.checked_next_multiple_of(block).unwrap_or(end);
                 info.write_pos = u32::try_from(end).unwrap_or(u32::MAX).max(info.write_pos);
             }
         }
         for &segment in sealed {
-            if let Some(info) = self.segments.get_mut(usize::try_from(segment).unwrap_or(usize::MAX)) {
+            if let Some(info) = self
+                .segments
+                .get_mut(usize::try_from(segment).unwrap_or(usize::MAX))
+            {
                 info.state = SegmentState::Sealed;
             }
         }
@@ -669,7 +737,7 @@ impl<F: BlockFile> Writer<F> {
 
     /// Writes the whole index into the log and points the superblock at it, freeing the log
     /// before it (docs/design/chunk-store.md §5).
-    fn checkpoint(&mut self) -> Result<(), ChunkError> {
+    pub(crate) fn checkpoint(&mut self) -> Result<(), ChunkError> {
         let segment_records: Vec<LogRecord> = self
             .segments
             .iter()
@@ -691,18 +759,32 @@ impl<F: BlockFile> Writer<F> {
                 .flat_map(|(key, entry)| {
                     let last = entry.fragments.len().saturating_sub(1);
                     entry.fragments.iter().enumerate().map(move |(i, f)| {
-                        put_of(*key, f, if entry.sealed && i == last { FLAG_FINAL } else { 0 }, entry.time_ns)
+                        put_of(
+                            *key,
+                            f,
+                            if entry.sealed && i == last {
+                                FLAG_FINAL
+                            } else {
+                                0
+                            },
+                            entry.time_ns,
+                        )
                     })
                 })
                 .collect()
         };
-        let (begin_pos, begin_lsn) = self.append_frame(KIND_CHECKPOINT_BEGIN, &segment_records)?;
+        // Every frame of the checkpoint shares one flush.
+        let group = self.cursor.lsn;
+        let (begin_pos, begin_lsn) =
+            self.append_frame(KIND_CHECKPOINT_BEGIN, &segment_records, group)?;
         let used_before = self.cursor.used;
-        let per_frame = usize::try_from(CHECKPOINT_RECORDS_PER_FRAME).unwrap_or(1).max(1);
+        let per_frame = usize::try_from(CHECKPOINT_RECORDS_PER_FRAME)
+            .unwrap_or(1)
+            .max(1);
         for chunk in puts.chunks(per_frame) {
-            self.append_frame(KIND_CHECKPOINT_CHUNK, chunk)?;
+            self.append_frame(KIND_CHECKPOINT_CHUNK, chunk, group)?;
         }
-        self.append_frame(KIND_CHECKPOINT_END, &[])?;
+        self.append_frame(KIND_CHECKPOINT_END, &[], group)?;
         self.shared.file.sync_data().map_err(ChunkError::Device)?;
 
         let mut superblock = self.superblock.clone();
@@ -751,8 +833,10 @@ pub(crate) fn put_of(key: ChunkKey, f: &Fragment, flags: u8, time_ns: u64) -> Lo
 /// Writes a superblock to the copy its sequence selects.
 pub(crate) fn write_superblock<F: BlockFile>(file: &F, sb: &Superblock) -> Result<(), ChunkError> {
     let bytes = sb.encode();
-    let mut buf = AlignedBuf::zeroed(bytes.len(), file.alignment()).map_err(|e| ChunkError::Device(e.into()))?;
-    buf.extend_from_slice(&bytes).map_err(|e| ChunkError::Device(e.into()))?;
+    let mut buf = AlignedBuf::zeroed(bytes.len(), file.alignment())
+        .map_err(|e| ChunkError::Device(e.into()))?;
+    buf.extend_from_slice(&bytes)
+        .map_err(|e| ChunkError::Device(e.into()))?;
     file.write_all_at(buf.as_slice(), sb.offset_of(sb.slot()))
         .map_err(ChunkError::Device)
 }

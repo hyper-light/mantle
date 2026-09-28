@@ -35,6 +35,9 @@ pub enum Fault {
     SyncError,
     /// Writes that would grow the file past `len` fail with ENOSPC.
     Capacity { len: u64 },
+    /// Power is cut after `ops` more writes and flushes: that operation and every one after
+    /// it fails, until the test crashes the file and clears its faults.
+    PowerCut { ops: u64 },
 }
 
 /// What a crash does with sectors written since the last successful flush.
@@ -201,6 +204,19 @@ fn persist_sector(state: &mut State, sector: u64, size: u64) {
     }
 }
 
+/// Counts one write or flush against an armed power cut; true once the power is off.
+fn power_cut(state: &mut State) -> bool {
+    for fault in &mut state.faults {
+        if let Fault::PowerCut { ops } = fault {
+            if *ops == 0 {
+                return true;
+            }
+            *ops = ops.saturating_sub(1);
+        }
+    }
+    false
+}
+
 fn overlaps(offset: u64, len: u64, start: u64, span: u64) -> bool {
     let end = offset.saturating_add(len);
     let fault_end = start.saturating_add(span);
@@ -267,6 +283,9 @@ impl BlockFile for SimFile {
         let end = self.check(buf.as_ptr().addr(), offset, buf.len())?;
         let mut state = self.lock()?;
         state.stats.writes = state.stats.writes.saturating_add(1);
+        if power_cut(&mut state) {
+            return Err(self.io("write", std::io::ErrorKind::Other));
+        }
         if let Some(i) = state.faults.iter().position(|f| *f == Fault::WriteError) {
             state.faults.remove(i);
             return Err(self.io("write", std::io::ErrorKind::Other));
@@ -303,6 +322,9 @@ impl BlockFile for SimFile {
     fn sync_data(&self) -> Result<(), DiskError> {
         let mut state = self.lock()?;
         state.stats.syncs = state.stats.syncs.saturating_add(1);
+        if power_cut(&mut state) {
+            return Err(self.io("sync_data", std::io::ErrorKind::Other));
+        }
         let dirty: Vec<u64> = std::mem::take(&mut state.dirty).into_iter().collect();
         if let Some(i) = state.faults.iter().position(|f| *f == Fault::SyncError) {
             state.faults.remove(i);
@@ -451,6 +473,21 @@ mod tests {
         f.inject(Fault::Capacity { len: 8192 }).unwrap();
         assert!(f.write_all_at(block(6).as_slice(), 8192).is_err());
         f.write_all_at(block(6).as_slice(), 4096).unwrap();
+    }
+
+    #[test]
+    fn a_power_cut_fails_everything_after_its_count() {
+        let f = file(5);
+        f.inject(Fault::PowerCut { ops: 2 }).unwrap();
+        f.write_all_at(block(1).as_slice(), 0).unwrap();
+        f.sync_data().unwrap();
+        assert!(f.write_all_at(block(2).as_slice(), 0).is_err());
+        assert!(f.sync_data().is_err());
+        f.crash(Crash::LoseAll).unwrap();
+        f.clear_faults().unwrap();
+        let mut buf = block(0);
+        f.read_exact_at(buf.as_mut_slice(), 0).unwrap();
+        assert_eq!(bytes(&buf), bytes(&block(1)));
     }
 
     #[test]

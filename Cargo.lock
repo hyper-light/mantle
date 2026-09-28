@@ -252,6 +252,7 @@ dependencies = [
 name = "mantle-chunk"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.4.3",
  "mantle-crc",
  "mantle-disk",
  "proptest",

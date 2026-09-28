@@ -136,6 +136,31 @@ pub struct Prefix {
     pub table: Vec<u32>,
 }
 
+/// The length fields of a record header, read without verifying it: enough to know how many
+/// bytes to read before verifying the whole prefix with `decode_prefix`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lengths {
+    pub payload_len: u32,
+    pub checksum_shift: u8,
+}
+
+pub fn peek_lengths(bytes: &[u8]) -> Option<Lengths> {
+    let mut r = Reader::new(bytes);
+    if r.take(4)? != RECORD_MAGIC || r.u8()? != KIND_PAYLOAD {
+        return None;
+    }
+    r.u8()?;
+    let checksum_shift = r.u8()?;
+    if checksum_shift > 30 {
+        return None;
+    }
+    r.take(1 + 16 + 4 + 4 + 8 + ChunkKey::ENCODED_LEN + 2 + 8)?;
+    Some(Lengths {
+        payload_len: r.u32()?,
+        checksum_shift,
+    })
+}
+
 /// Decodes the header and checksum table at the start of `bytes`. `None` if the bytes are
 /// not an intact record prefix: a torn, stale, or corrupt record reads as absent.
 pub fn decode_prefix(bytes: &[u8]) -> Option<Prefix> {
@@ -309,6 +334,20 @@ mod tests {
             data[i] ^= 1 << bit;
             prop_assert!(!verify(&prefix, 0, &data));
         }
+    }
+
+    #[test]
+    fn lengths_can_be_read_from_the_header_alone() {
+        let h = header(3000, 10);
+        let mut out = Vec::new();
+        encode(&h, &[7u8; 3000], &mut out).unwrap();
+        assert_eq!(
+            peek_lengths(&out[..HEADER_LEN]),
+            Some(Lengths {
+                payload_len: 3000,
+                checksum_shift: 10
+            })
+        );
     }
 
     #[test]

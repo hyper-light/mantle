@@ -24,29 +24,45 @@ directory and, with `--measure`, benchmarks the device. It is built on:
   at sector granularity when it crashes, a failed flush leaves their durability unknown,
   and reads and writes can be made to fail or return corrupted bytes.
 
+## In progress
+
+**Chunk store** ([design](design/chunk-store.md)). Implemented: the volume layout with
+two superblocks, self-describing data records with a CRC-32C per checksum block, the
+index log with a second copy of every record's identity, the group-commit writer that
+flushes once per batch and fences the volume on a failed write or flush, reads that
+verify every byte they return, checkpoints and log wrap-around, reuse of segments that
+empty out, and crash recovery (replay, verification of the last batch, roll-forward, and a
+checkpoint that makes recovery's corrections durable). Tested with randomized workloads
+cut by power loss at every point on the simulated device (6,000 runs per soak, no
+acknowledged write lost, no unverified byte returned) and with bit flips, read errors,
+damaged superblocks, damaged log frames and failed writes and flushes.
+
+Remaining before it is done:
+
+- Cleaning: copying the live records out of partly dead segments, chosen by cost-benefit.
+- Scrubbing on the schedule in the design.
+- Writing new file regions once before use where calibration measures a first-write penalty.
+- An I/O path that keeps the measured number of reads in flight.
+- The same crash workloads against real disks, with the process killed by `kill -9`.
+- Benchmarks of write and read throughput and latency against the raw-device numbers.
+
 ## Planned, in order
 
-1. **Chunk store.** One log-structured volume per disk with group commit, self-describing
-   records, a second copy of each record's identity in an index log, crash recovery,
-   cleaning and scrubbing ([design](design/chunk-store.md)). Done when randomized
-   workloads crashed at random points on the simulated device never lose an acknowledged
-   write or return data that fails verification, and the same workloads survive
-   `kill -9` on real disks.
-2. **Erasure coding.** Reed–Solomon layouts chosen from the number of available failure
+1. **Erasure coding.** Reed–Solomon layouts chosen from the number of available failure
    domains. Done when encoding and decoding are benchmarked for each layout, and every
    combination of lost chunks within a layout's tolerance is rebuilt correctly.
-3. **Metadata service.** Ranges of object names, file layouts and chunk locations, each
+2. **Metadata service.** Ranges of object names, file layouts and chunk locations, each
    replicated with focal's Raft implementation and its fast-track commit, over QUIC for
    bulk transfers and a UDP transport for consensus messages. Done when a linearizability
    checker accepts histories recorded under network partitions, process crashes and disk
    faults, both in deterministic simulation and with real processes.
-4. **S3 gateway.** Request signing (including presigned URLs and chunked uploads with
+3. **S3 gateway.** Request signing (including presigned URLs and chunked uploads with
    trailing checksums), buckets, PUT, GET with byte ranges, HEAD, DELETE and batch
    delete, copy, ListObjects and ListObjectsV2, multipart uploads including resuming an
    interrupted upload, versioning, conditional requests and checksums. Done when
    end-to-end suites using the AWS CLI, boto3 and the AWS SDK for Rust pass against a
    running mantle, and ceph's s3-tests pass for every supported feature.
-5. **Multi-machine operation.** Placement across racks and zones, repair ordered by
+4. **Multi-machine operation.** Placement across racks and zones, repair ordered by
    remaining redundancy, rebalancing, and retiring disks that start to fail. Done when
    tests that fail disks, machines and racks during writes show that every acknowledged
    write can still be read back.

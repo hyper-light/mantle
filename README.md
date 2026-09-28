@@ -33,8 +33,9 @@ and a read through these parts.
 > Mantle has no release yet. The storage-device layer is implemented and tested on Linux,
 > macOS and Windows, on x86_64 and arm64: device identification, direct I/O with the
 > correct flush call for each platform, device measurement, and CRC-32C and CRC-64/NVME
-> checksums. The chunk store is in progress; erasure coding, the metadata service and the
-> S3 gateway follow. The gateway will implement the S3 API that standard clients use:
+> checksums. The chunk store's write path, reads and crash recovery are implemented and
+> tested; its cleaning and scrubbing are in progress. Erasure coding, the metadata service
+> and the S3 gateway follow. The gateway will implement the S3 API that standard clients use:
 > multipart uploads, including resuming an interrupted upload, PUT, GET with byte ranges,
 > HEAD, DELETE and batch delete, copy, ListObjects and ListObjectsV2, versioning,
 > conditional requests, checksums and presigned URLs. [docs/STATUS.md](docs/STATUS.md)

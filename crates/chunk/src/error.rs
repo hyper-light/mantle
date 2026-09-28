@@ -21,7 +21,11 @@ pub enum ChunkError {
     #[error("chunk {0} is sealed")]
     Sealed(ChunkKey),
     #[error("append to {key} at offset {offset}, but the chunk ends at {end}")]
-    Gap { key: ChunkKey, offset: u64, end: u64 },
+    Gap {
+        key: ChunkKey,
+        offset: u64,
+        end: u64,
+    },
     #[error("append to {key} at offset {offset} differs from the bytes already there")]
     Conflict { key: ChunkKey, offset: u64 },
     #[error("{len} bytes exceed the largest fragment, {max}")]

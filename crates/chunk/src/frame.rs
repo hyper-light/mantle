@@ -176,6 +176,9 @@ impl LogRecord {
 pub struct FrameHeader {
     pub kind: u16,
     pub lsn: u64,
+    /// The LSN of the first frame of this frame's flush group: frames written between two
+    /// device flushes. Stored as the distance back from `lsn`.
+    pub group: u64,
     pub volume: u128,
     pub payload_len: u32,
     pub count: u32,
@@ -190,14 +193,17 @@ impl FrameHeader {
     }
 }
 
-/// Encodes a frame padded to `block` bytes.
+/// Encodes a frame padded to `block` bytes. `group` is the LSN of the first frame written
+/// since the last completed flush.
 pub fn encode(
     kind: u16,
     lsn: u64,
+    group: u64,
     volume: u128,
     records: &[LogRecord],
     block: usize,
 ) -> Option<Vec<u8>> {
+    let group_delta = u32::try_from(lsn.checked_sub(group)?).ok()?;
     let payload: usize = records.iter().map(LogRecord::encoded_len).sum();
     let total = FRAME_HEADER
         .checked_add(payload)?
@@ -210,7 +216,7 @@ pub fn encode(
     w.u128(volume);
     w.u32(u32::try_from(payload).ok()?);
     w.u32(u32::try_from(records.len()).ok()?);
-    w.u32(0);
+    w.u32(group_delta);
     let mut body = Writer::with_capacity(payload);
     for record in records {
         record.encode(&mut body);
@@ -230,12 +236,19 @@ pub fn peek(bytes: &[u8]) -> Option<FrameHeader> {
     if r.take(4)? != FRAME_MAGIC || r.u16()? != FRAME_VERSION {
         return None;
     }
+    let kind = r.u16()?;
+    let lsn = r.u64()?;
+    let volume = r.u128()?;
+    let payload_len = r.u32()?;
+    let count = r.u32()?;
+    let group = lsn.checked_sub(u64::from(r.u32()?))?;
     Some(FrameHeader {
-        kind: r.u16()?,
-        lsn: r.u64()?,
-        volume: r.u128()?,
-        payload_len: r.u32()?,
-        count: r.u32()?,
+        kind,
+        lsn,
+        group,
+        volume,
+        payload_len,
+        count,
     })
 }
 
@@ -311,10 +324,11 @@ mod tests {
 
     #[test]
     fn frames_round_trip_padded_to_the_block() {
-        let bytes = encode(KIND_BATCH, 5, 99, &records(), 4096).unwrap();
+        let bytes = encode(KIND_BATCH, 5, 3, 99, &records(), 4096).unwrap();
         assert_eq!(bytes.len(), 4096);
         let (header, decoded) = decode(&bytes, 99).unwrap();
         assert_eq!(header.lsn, 5);
+        assert_eq!(header.group, 3);
         assert_eq!(header.kind, KIND_BATCH);
         assert_eq!(decoded, records());
         assert_eq!(header.frame_len(4096), Some(4096));
@@ -322,13 +336,13 @@ mod tests {
 
     #[test]
     fn another_volumes_frame_is_not_ours() {
-        let bytes = encode(KIND_BATCH, 5, 99, &records(), 4096).unwrap();
+        let bytes = encode(KIND_BATCH, 5, 5, 99, &records(), 4096).unwrap();
         assert!(decode(&bytes, 100).is_none());
     }
 
     #[test]
     fn any_damage_to_header_or_payload_is_detected() {
-        let bytes = encode(KIND_BATCH, 5, 99, &records(), 4096).unwrap();
+        let bytes = encode(KIND_BATCH, 5, 5, 99, &records(), 4096).unwrap();
         let used = FRAME_HEADER + records().iter().map(LogRecord::encoded_len).sum::<usize>();
         for i in 0..used {
             let mut copy = bytes.clone();
@@ -339,7 +353,7 @@ mod tests {
 
     #[test]
     fn an_absurd_record_count_is_refused_without_allocating() {
-        let mut bytes = encode(KIND_BATCH, 5, 99, &[], 4096).unwrap();
+        let mut bytes = encode(KIND_BATCH, 5, 5, 99, &[], 4096).unwrap();
         bytes[36..40].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(decode(&bytes, 99).is_none());
     }

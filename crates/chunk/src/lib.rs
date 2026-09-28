@@ -13,9 +13,20 @@
 )]
 
 pub mod codec;
+mod error;
 pub mod frame;
+pub mod index;
 pub mod key;
+pub mod layout;
+mod log;
 pub mod record;
+mod recover;
 pub mod superblock;
+mod volume;
+mod writer;
 
+pub use error::ChunkError;
 pub use key::ChunkKey;
+pub use layout::{Config, Limits};
+pub use recover::RecoveryReport;
+pub use volume::{ChunkStat, Usage, Volume};

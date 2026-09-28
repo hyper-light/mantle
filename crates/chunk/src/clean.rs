@@ -248,6 +248,7 @@ impl<F: BlockFile> Cleaner<F> {
             .send(Request {
                 op: Op::Relocate { moves },
                 reply,
+                queued: None,
             })
             .map_err(|_| ChunkError::Closed)?;
         answer.recv().map_err(|_| ChunkError::Closed)??;
@@ -269,6 +270,7 @@ impl<F: BlockFile> Cleaner<F> {
                     },
                 },
                 reply,
+                queued: None,
             })
             .map_err(|_| ChunkError::Closed)?;
         answer.recv().map_err(|_| ChunkError::Closed)?

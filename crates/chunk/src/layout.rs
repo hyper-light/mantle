@@ -15,8 +15,6 @@ pub const CHECKPOINT_RECORDS_PER_FRAME: u64 = (MAX_FRAME_BYTES - 8192) / PUT_LEN
 /// is everything that arrived while the previous flush ran, up to these limits.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
-    /// Requests waiting for the writer; a full queue blocks the submitter.
-    pub queue: usize,
     /// Requests in one group commit.
     pub batch_requests: usize,
     /// Payload bytes in one group commit.
@@ -28,11 +26,27 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            queue: 4096,
             batch_requests: 1024,
             batch_bytes: 32 << 20,
             fragments_per_chunk: 4096,
         }
+    }
+}
+
+impl Limits {
+    /// Client requests the writer's queue holds: the next batch while one is written, and one
+    /// more to absorb a burst. By Little's law a longer queue only adds waiting, since the
+    /// writer takes no more than a batch at a time: at this bound a request waits about two
+    /// batches at most (docs/research/11 §4).
+    pub fn queue_requests(&self) -> usize {
+        self.batch_requests.saturating_mul(2)
+    }
+
+    /// Payload bytes the writer's queue holds, by the same rule.
+    pub fn queue_bytes(&self) -> u64 {
+        u64::try_from(self.batch_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(2)
     }
 }
 

@@ -22,7 +22,6 @@ pub fn config() -> Config {
         compact: true,
         scrub_period: None,
         limits: Limits {
-            queue: 256,
             batch_requests: 64,
             batch_bytes: 1 << 20,
             fragments_per_chunk: 64,

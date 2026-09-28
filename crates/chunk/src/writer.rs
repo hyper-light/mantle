@@ -98,6 +98,37 @@ pub(crate) struct Move {
 pub(crate) struct Request {
     pub op: Op,
     pub reply: SyncSender<Result<(), ChunkError>>,
+    /// Payload bytes the request holds of the client queue's room (`Queue`); `None` for the
+    /// cleaner's requests, which it sends one at a time outside that room.
+    pub queued: Option<u64>,
+}
+
+/// The room client requests hold in the writer's queue (docs/design/chunk-store.md §4).
+#[derive(Debug, Default)]
+pub(crate) struct Queue {
+    requests: usize,
+    bytes: u64,
+}
+
+impl Queue {
+    /// Takes room for a request of `bytes` payload bytes, or refuses with `Busy`. A payload
+    /// larger than the whole byte bound is admitted into a queue holding no other payload.
+    pub fn admit(&mut self, bytes: u64, limits: &crate::layout::Limits) -> Result<(), ChunkError> {
+        let requests = self.requests.checked_add(1).ok_or(ChunkError::Busy)?;
+        let total = self.bytes.checked_add(bytes).ok_or(ChunkError::Busy)?;
+        if requests > limits.queue_requests() || (self.bytes > 0 && total > limits.queue_bytes()) {
+            return Err(ChunkError::Busy);
+        }
+        self.requests = requests;
+        self.bytes = total;
+        Ok(())
+    }
+
+    /// Gives back the room of a request that left the queue or was never sent.
+    pub fn release(&mut self, bytes: u64) {
+        self.requests = self.requests.saturating_sub(1);
+        self.bytes = self.bytes.saturating_sub(bytes);
+    }
 }
 
 /// What readers, the writer and the cleaner share.
@@ -119,6 +150,8 @@ pub(crate) struct Shared<F> {
     pub submitted: std::sync::atomic::AtomicU64,
     /// Checkpoints written since the volume opened.
     pub checkpoints: std::sync::atomic::AtomicU64,
+    /// The room client requests hold in the writer's queue.
+    pub queue: std::sync::Mutex<Queue>,
     pub usage: RwLock<Vec<SegmentInfo>>,
 }
 
@@ -363,13 +396,13 @@ impl<F: BlockFile> Writer<F> {
         let mut answered = 0u64;
         let mut backlog = 0u64;
         while let Ok(first) = self.rx.recv() {
-            self.received = self.received.saturating_add(1);
+            self.dequeued(&first);
             let mut bytes = request_bytes(&first);
             let mut batch = vec![first];
             while self.room(&batch, bytes) {
                 match self.rx.try_recv() {
                     Ok(next) => {
-                        self.received = self.received.saturating_add(1);
+                        self.dequeued(&next);
                         bytes = bytes.saturating_add(request_bytes(&next));
                         batch.push(next);
                     }
@@ -393,6 +426,16 @@ impl<F: BlockFile> Writer<F> {
                 .submitted
                 .load(Ordering::Acquire)
                 .saturating_sub(self.received);
+        }
+    }
+
+    /// Counts a request out of the queue and gives back the room it held there.
+    fn dequeued(&mut self, request: &Request) {
+        self.received = self.received.saturating_add(1);
+        if let Some(bytes) = request.queued
+            && let Ok(mut queue) = self.shared.queue.lock()
+        {
+            queue.release(bytes);
         }
     }
 
@@ -426,7 +469,7 @@ impl<F: BlockFile> Writer<F> {
             }
             match self.rx.recv_timeout(std::time::Duration::from_nanos(step)) {
                 Ok(next) => {
-                    self.received = self.received.saturating_add(1);
+                    self.dequeued(&next);
                     *bytes = bytes.saturating_add(request_bytes(&next));
                     batch.push(next);
                 }
@@ -551,7 +594,7 @@ impl<F: BlockFile> Writer<F> {
             }
         };
         let limits = self.config.limits;
-        let max_payload = self.max_payload();
+        let max_payload = max_payload(&self.shared.geometry, self.shared.checksum_shift);
         let mut views: HashMap<ChunkKey, Option<View>> = HashMap::new();
         let mut added: u64 = 0;
         let mut accepted = Vec::with_capacity(batch.len());
@@ -698,24 +741,6 @@ impl<F: BlockFile> Writer<F> {
         Ok(accepted)
     }
 
-    /// The largest payload one record can hold: a segment less its header block.
-    fn max_payload(&self) -> u64 {
-        let room = self
-            .shared
-            .geometry
-            .segment_size
-            .saturating_sub(self.shared.geometry.block);
-        let table = room
-            .checked_shr(u32::from(self.shared.checksum_shift))
-            .unwrap_or(0)
-            .saturating_add(1)
-            .saturating_mul(4);
-        room.saturating_sub(record::HEADER_LEN as u64)
-            .saturating_sub(table)
-            .saturating_sub(record::RECORD_ALIGN as u64)
-            .min(u64::from(u32::MAX))
-    }
-
     fn layout(&self, requests: usize) -> Layout {
         let mut before = HashMap::new();
         for (i, s) in self.segments.iter().enumerate() {
@@ -804,7 +829,7 @@ impl<F: BlockFile> Writer<F> {
         let mut payloads: Vec<Payload> = Vec::with_capacity(accepted.len());
         let shift = self.shared.checksum_shift;
         for Accepted { request, decision } in accepted {
-            let Request { op, reply: tx } = request;
+            let Request { op, reply: tx, .. } = request;
             match (op, decision) {
                 (
                     Op::Write {
@@ -1173,6 +1198,20 @@ impl<F: BlockFile> Writer<F> {
     }
 }
 
+/// The largest payload one record can hold: a segment less its header block.
+pub(crate) fn max_payload(geometry: &Geometry, checksum_shift: u8) -> u64 {
+    let room = geometry.segment_size.saturating_sub(geometry.block);
+    let table = room
+        .checked_shr(u32::from(checksum_shift))
+        .unwrap_or(0)
+        .saturating_add(1)
+        .saturating_mul(4);
+    room.saturating_sub(record::HEADER_LEN as u64)
+        .saturating_sub(table)
+        .saturating_sub(record::RECORD_ALIGN as u64)
+        .min(u64::from(u32::MAX))
+}
+
 /// What a record says about the fragment it holds, apart from its placement.
 struct Put {
     key: ChunkKey,
@@ -1280,5 +1319,47 @@ fn request_bytes(request: &Request) -> usize {
         Op::Write { payload, .. } => payload.data.len(),
         Op::Relocate { moves } => moves.iter().map(|m| m.payload.data.len()).sum(),
         Op::Delete { .. } | Op::Checkpoint => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::Limits;
+
+    fn limits() -> Limits {
+        Limits {
+            batch_requests: 2,
+            batch_bytes: 100,
+            fragments_per_chunk: 4,
+        }
+    }
+
+    #[test]
+    fn the_queue_holds_two_batches_and_refuses_beyond() {
+        let (limits, mut q) = (limits(), Queue::default());
+        for _ in 0..4 {
+            q.admit(10, &limits).unwrap();
+        }
+        assert!(matches!(q.admit(0, &limits), Err(ChunkError::Busy)));
+        q.release(10);
+        q.admit(0, &limits).unwrap();
+        let mut q = Queue::default();
+        q.admit(150, &limits).unwrap();
+        assert!(matches!(q.admit(51, &limits), Err(ChunkError::Busy)));
+        q.admit(50, &limits).unwrap();
+    }
+
+    /// A payload larger than the whole byte bound is admitted into a queue holding no other
+    /// payload, so the bound is its size or two batches, whichever is larger.
+    #[test]
+    fn a_payload_larger_than_the_bound_waits_for_an_empty_queue() {
+        let (limits, mut q) = (limits(), Queue::default());
+        q.admit(500, &limits).unwrap();
+        assert!(matches!(q.admit(1, &limits), Err(ChunkError::Busy)));
+        q.release(500);
+        q.admit(0, &limits).unwrap();
+        q.admit(500, &limits).unwrap();
+        assert!(matches!(q.admit(1, &limits), Err(ChunkError::Busy)));
     }
 }

@@ -263,8 +263,18 @@ fn run(out: &mut impl Write, dir: &Path, align: Alignment, plan: &Plan) -> Resul
     let mut point = 1u64;
     for &size in &plan.sizes {
         for &workers in &plan.workers {
-            let (put, keys) = puts(&v, size, workers, plan.step, budget, point)?;
-            row(out, &format!("put {}", display::size(size)), workers, &put)?;
+            // More writers than the store's queue admits would be refused with Busy: the
+            // queue holds what the writer takes in two batches (Limits::queue_bytes).
+            let admitted = config
+                .limits
+                .queue_bytes()
+                .checked_div(u64::try_from(size).unwrap_or(u64::MAX))
+                .and_then(|n| usize::try_from(n).ok())
+                .unwrap_or(usize::MAX)
+                .clamp(1, config.limits.queue_requests().max(1));
+            let writers = workers.min(admitted);
+            let (put, keys) = puts(&v, size, writers, plan.step, budget, point)?;
+            row(out, &format!("put {}", display::size(size)), writers, &put)?;
             if !keys.is_empty() {
                 let get = gets(&v, &keys, size, workers, plan.step, point)?;
                 row(out, &format!("get {}", display::size(size)), workers, &get)?;

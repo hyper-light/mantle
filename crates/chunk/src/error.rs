@@ -41,6 +41,10 @@ pub enum ChunkError {
     TooManyFragments(ChunkKey),
     #[error("volume is full")]
     Full,
+    /// The writer's queue holds all it takes (`Limits::queue_requests`, `queue_bytes`):
+    /// nothing was written, and the caller retries later or elsewhere.
+    #[error("volume is busy: its write queue is full")]
+    Busy,
     #[error("volume is closed")]
     Closed,
     /// The bytes at the start of the file are not a mantle volume this code can open.

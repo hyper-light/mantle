@@ -2,7 +2,7 @@
 //! delete chunks through its group-commit writer, and read them back verified.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{SyncSender, sync_channel};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 
@@ -42,6 +42,24 @@ pub struct Usage {
     pub live_bytes: u64,
     /// Checkpoints written since the volume opened.
     pub checkpoints: u64,
+}
+
+/// Room a request holds in the writer's queue; given back if the request is never sent,
+/// and by the writer once it takes the request off the queue.
+struct Ticket<'a> {
+    queue: &'a std::sync::Mutex<crate::writer::Queue>,
+    bytes: u64,
+    sent: bool,
+}
+
+impl Drop for Ticket<'_> {
+    fn drop(&mut self) {
+        if !self.sent
+            && let Ok(mut queue) = self.queue.lock()
+        {
+            queue.release(self.bytes);
+        }
+    }
 }
 
 pub struct Volume<F: BlockFile + 'static> {
@@ -145,9 +163,12 @@ impl<F: BlockFile + 'static> Volume<F> {
             dead_bytes: std::sync::atomic::AtomicU64::new(0),
             submitted: std::sync::atomic::AtomicU64::new(0),
             checkpoints: std::sync::atomic::AtomicU64::new(0),
+            queue: std::sync::Mutex::new(crate::writer::Queue::default()),
             usage: RwLock::new(recovered.segments.clone()),
         });
-        let (sender, rx) = sync_channel(config.limits.queue.max(1));
+        // Client requests are admitted up to `queue_requests` (`submit`); the cleaner sends
+        // one request at a time beside them.
+        let (sender, rx) = sync_channel(config.limits.queue_requests().saturating_add(1));
         let (wake, wakes) = sync_channel(1);
         // Clean below one sixteenth of the segments free, up to one eighth; never below the
         // two a relocation needs (one being cleaned, one to write into).
@@ -304,7 +325,8 @@ impl<F: BlockFile + 'static> Volume<F> {
     }
 
     /// Checksums the payload in the calling thread, verifies it against `expected` when the
-    /// sender supplied one, and submits it.
+    /// sender supplied one, and submits it. A payload no record can hold, or one the queue has
+    /// no room for, is refused before it is copied.
     fn write(
         &self,
         key: ChunkKey,
@@ -313,6 +335,12 @@ impl<F: BlockFile + 'static> Volume<F> {
         seal: bool,
         expected: Option<u32>,
     ) -> Result<(), ChunkError> {
+        let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        let max = crate::writer::max_payload(&self.shared.geometry, self.shared.checksum_shift);
+        if len > max {
+            return Err(ChunkError::TooLarge { len, max });
+        }
+        let ticket = self.admit(len)?;
         let payload = Payload::new(data.to_vec(), self.shared.checksum_shift)
             .ok_or_else(|| ChunkError::Config("checksum block size".into()))?;
         if let Some(expected) = expected
@@ -324,12 +352,15 @@ impl<F: BlockFile + 'static> Volume<F> {
                 actual: payload.crc,
             });
         }
-        self.submit(Op::Write {
-            key,
-            offset,
-            payload,
-            seal,
-        })
+        self.send(
+            Op::Write {
+                key,
+                offset,
+                payload,
+                seal,
+            },
+            ticket,
+        )
     }
 
     /// Deletes a chunk; deleting one that does not exist succeeds.
@@ -344,15 +375,44 @@ impl<F: BlockFile + 'static> Volume<F> {
     }
 
     fn submit(&self, op: Op) -> Result<(), ChunkError> {
+        let ticket = self.admit(0)?;
+        self.send(op, ticket)
+    }
+
+    /// Takes room in the writer's queue for a request of `bytes` payload bytes: `Busy` when
+    /// the queue holds all the writer takes (`Limits::queue_requests`, `queue_bytes`).
+    fn admit(&self, bytes: u64) -> Result<Ticket<'_>, ChunkError> {
         if self.is_fenced() {
             return Err(ChunkError::Fenced);
         }
+        self.shared
+            .queue
+            .lock()
+            .map_err(|_| ChunkError::Fenced)?
+            .admit(bytes, &self.limits)?;
+        Ok(Ticket {
+            queue: &self.shared.queue,
+            bytes,
+            sent: false,
+        })
+    }
+
+    /// Sends an admitted request and waits for its answer.
+    fn send(&self, op: Op, mut ticket: Ticket<'_>) -> Result<(), ChunkError> {
         let sender = self.sender.as_ref().ok_or(ChunkError::Closed)?;
         let (reply, answer) = sync_channel(1);
         self.shared.submitted.fetch_add(1, Ordering::AcqRel);
-        sender
-            .send(Request { op, reply })
-            .map_err(|_| ChunkError::Closed)?;
+        let request = Request {
+            op,
+            reply,
+            queued: Some(ticket.bytes),
+        };
+        match sender.try_send(request) {
+            Ok(()) => ticket.sent = true,
+            // Admission keeps the channel from filling; if it has, refuse rather than wait.
+            Err(TrySendError::Full(_)) => return Err(ChunkError::Busy),
+            Err(TrySendError::Disconnected(_)) => return Err(ChunkError::Closed),
+        }
         answer.recv().map_err(|_| ChunkError::Closed)?
     }
 

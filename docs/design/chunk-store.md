@@ -122,8 +122,14 @@ corruption of acknowledged state, which is reported and recovered from the data 
 ## 4. Writing
 
 One group-commit loop per volume [DKO+84 §5.2; research/03 G1]. Callers submit put,
-append and delete requests to a bounded queue (a full queue refuses with `Busy`). The
-loop takes every request that arrived while the previous batch was being made durable,
+append and delete requests to a bounded queue. It admits two batches of client requests,
+by count and by payload bytes, and beyond that refuses with `Busy` before the payload is
+copied: the loop takes at most a batch at a time, so by Little's law a longer queue adds
+only waiting, about two batches' worth at this bound [research/11 §4]. A payload larger
+than the byte bound is admitted into a queue holding no other payload, and one no record
+can hold is refused as `TooLarge` before it is queued. The cleaner's relocations, one batch
+at a time, pass beside the bound. The loop takes every request that arrived while the
+previous batch was being made durable,
 lays the data records into the open segment for their stream, appends one index frame,
 issues the writes, then **one** flush of the volume (`sync_data`: `fdatasync`,
 `F_FULLFSYNC`, `FlushFileBuffers`), and only then acknowledges every request in the batch

@@ -5,7 +5,45 @@ Research note for mantle's range-partitioned, multi-Raft metadata layer. Source:
 `cargo metadata --no-deps`). Every path below is relative to that repository unless it
 starts with `/`. Line numbers are those of the working tree on 2026-09-28.
 
-<!-- SUMMARY -->
+## Summary
+
+- **focal-raft** is a sans-io Raft core (tick/step in; one `Ready` out; `advance_append`
+  and `advance_apply_to` back) with pre-vote, check-quorum, priority, learners, joint
+  consensus, transfer, ReadIndex (quorum, no lease), snapshots and a **Fast Raft fast
+  track** (non-leaders propose to every voter; commit at ⌈3M/4⌉). Its only dependencies
+  are `raft-proto` (tikv, pinned to an unmerged-PR revision; needs a protoc build) and
+  `thiserror`. It is tested step for step against raft-rs (80.8 M steps equal), under seeded
+  schedules, and with a TLA+ model of the fast track checked by TLC in CI.
+- **focal-consensus (`DurableNode`)** is a generic durable shell: bytes in, committed bytes
+  out, checkpoint bytes back. There is **no state-machine trait**; the application owns
+  the node. It persists each `Ready` to a shared WAL and releases nothing, not even a
+  leader's appends, before the fsync. It adds a second fence for the commit index, a
+  `catch_unwind` boundary (`guarded_in`), per-group memory budgets, decoder fences and
+  restore images. It has **no dependency on focal's domain crates**. Its limits for mantle:
+  snapshots ≤ 8 MiB sent as one message, the whole retained log held in RAM, and fixed
+  policy constants.
+- **focal-log** is one disk-writer thread per node, which merges queued appends from all
+  groups into one covering flush. Segments are CRC-chained frames of postcard records,
+  published by a checksummed `CURRENT` fence file. Durability comes from `File::sync_all`
+  (`fsync` on Linux, `F_FULLFSYNC` on macOS, `FlushFileBuffers` on Windows) plus directory
+  fsync and rename. The tail after the fence is truncated, and corruption before it is
+  fatal. **Compaction rewrites the entire physical WAL for every group checkpoint**, which
+  is the main multi-Raft scaling gap.
+- **focal-wire** runs quinn with TLS 1.3 mTLS against a cluster CA and authorizes peers by
+  certificate fingerprint. It keeps one pooled connection per peer, shared by all groups
+  (2 in flight per peer), sends one stream per Raft message, and uses Copa congestion
+  control plus `TrafficClass` stream priorities. **Copa and the traffic classes are
+  uncommitted.** The crate is coupled to focal's domain, so mantle would have to port it.
+- **There is no separate UDP layer for Fast Raft in focal.** No QUIC datagrams are used
+  either; fast-track messages travel as ordinary Raft messages on QUIC streams. The
+  two-plane design (a bare-UDP, header-encrypted control plane that "Raft rides", plus a
+  QUIC session plane) is specified in the hecate reference spec. slates has a codec for it
+  that nothing uses.
+- **Reuse:** take `focal-raft`, `focal-timing`, `focal-memory` and `focal-platform`
+  unchanged. Take `focal-consensus` + `focal-log` for bring-up, and change WAL compaction,
+  snapshots and log residency before scaling. Port the transport core out of `focal-wire`.
+  Use `focal-ranges` as a pattern only. Pin `bd5e54b` on `r10-r11-windows-ci` (it is not
+  on `main`).
 
 ## 0. Provenance: which revision to pin
 
@@ -17,8 +55,8 @@ starts with `/`. Line numbers are those of the working tree on 2026-09-28.
 | raft-rs types come from an unmerged upstream PR head, pinned by `rev` | `Cargo.toml:19-23`, `docs/dependencies/raft-upstream.md:5-11` |
 
 Consequence: a mantle git dependency must pin `rev = "bd5e54b…"` on that branch (not
-`main`), and cannot get Copa until the owner commits it. focal's own `deny.toml` would
-also have to be taught the extra git source (section 8).
+`main`), and cannot get Copa until the owner commits it. mantle's `deny.toml` must allow
+the focal git source as well as `tikv/raft-rs` (sections 7.3, 8.2).
 
 ---
 
@@ -184,7 +222,9 @@ closes it (27 §4.3).
 - Generated enum accessors unwind on unknown values a peer can choose; they are banned by
   `clippy.toml` `disallowed-methods` and the core reads enums as `Option`
   (`clippy.toml:1-15`, `src/proto.rs:24-29`). Fast-track kinds 100/101 are raw
-  `msg_type` values outside the enum, so a raft-rs member treats them as unknown.
+  `msg_type` values outside the enum — exactly the values those accessors unwind on — which
+  is one reason a fast group is marked by a WAL record that older binaries refuse
+  (section 2.5).
 
 ### 1.6 TLA+ model
 
@@ -275,7 +315,7 @@ and a random election seed from `getrandom` (`src/lib.rs:559-578, 1460-1475`).
 | checkpoint | `checkpoint(index, data)`, `begin_checkpoint`, `begin_checkpoint_funded`, `try_finish_checkpoint`, `finish_checkpoint`, `cancel_unadmitted_checkpoint` | 862; `checkpoint.rs:22-207` |
 | status | `status()`, `peer_progress()`, `peer(node)`, `has_committed_current_term()`, `published_term(index)`, `snapshot_index()`, `failed()` | 1163-1255, 868, 1412 |
 | disk | `disk_available_bytes()`, `disk_budget()`, `shared_wal()` | 1154-1162; `persistence.rs:33` |
-| tests | `inject_fault_once(FaultPoint)`, `set_randomized_election_timeout` (feature `test-support`) | 1319, 814 |
+| tests | `inject_fault_once(FaultPoint)`; `set_randomized_election_timeout` (only under `cfg(test)` or feature `test-support`) | 1319, 814 |
 
 `NodeEvents` (`src/lib.rs:210-229`): `messages`, `committed: Vec<CommittedEntry{index,
 term, data}>`, `membership: Vec<AppliedMembership>` (before/after configurations +
@@ -319,6 +359,15 @@ runnable.
    (`317-381`; `README.md:11`).
 5. When `has_ready()` is false the complete durable prefix is returned as `NodeEvents`
    (`137-160`).
+
+So **the commit index is always made durable before the entries it commits are
+released** — in the next `Ready`'s `HardState` record when the commit moves on stepping
+append responses (multi-voter), or in the `LightReady` fence when `advance_append` moves
+it (single voter, fast commit). The core's `Ready::must_sync()` ("false when nothing but
+the commit is to persist: that write need not be waited for", `focal-raft/src/node.rs:174-178`)
+is not consulted anywhere in the shell or its owners (grep of `focal-consensus`,
+`focal-node`, `focal-ledger`, `focal-control`): every `Ready` with records waits for its
+fence.
 
 While any of this is pending, every mutation — `step`, `tick`, `propose`, `read_index`,
 membership, transfer, checkpoint — returns retryable `PersistencePending`; the **host**
@@ -436,7 +485,7 @@ shape mantle's design:
 | Snapshot = application checkpoint bytes, ≤ 8 MiB, sent as one `MsgSnapshot` | A range's state cannot be snapshotted through Raft unless ranges stay tiny. mantle needs out-of-band range state transfer (checkpoint = small manifest of an LSM/SST set) and a patch to DurableNode for "external" snapshots |
 | Whole retained log in RAM (`RamLog`) until checkpoint | Frequent small checkpoints per range, or a patch that reads cold entries from the WAL |
 | Every checkpoint rewrites the **entire physical WAL** (all groups) — section 3.5 | With thousands of ranges per node, checkpoint write amplification is O(groups × WAL); this is the main multi-Raft scaling gap |
-| Two WAL fences per commit (entries, then commit hard state), each = segment fsync + fence-file fsync + rename + directory fsync | Commit latency ≈ 2 × (3 flushes) on the leader plus follower flushes; group commit amortizes across ranges but not within one write |
+| Two WAL fences on the leader per write (entries; then the commit index, before anything is applied), each = segment fsync + fence-file fsync + rename + directory fsync; `must_sync` ignored | Leader commit latency ≈ fence + RTT + follower fence + fence; group commit amortizes across ranges but not within one write |
 | Leader appends released only after the leader's fsync | No leader-write/replicate overlap; a latency cost on every write |
 | `PersistencePending` gate; no inbound queue | mantle's per-range router must buffer (bounded) and retry inbound messages and client proposals |
 | Leader-only proposals; peer `MsgPropose` refused | mantle must route writes to range leaders (or use the fast track from followers) |
@@ -552,9 +601,10 @@ drive that lies about flushes" (`lib.rs:21-22`).
 
 ### 3.6 Numbers that matter for mantle
 
-- Per commit on a leader: Ready fence (entries + hard state) and LightReady fence
-  (commit) — up to 2 × (2 `sync_all` + 1 directory sync). On macOS each is an
-  `F_FULLFSYNC`.
+- Per write on a leader: the entries' fence, then a fence for the commit index (next
+  `Ready`'s hard state, or the `LightReady` fence) — 2 × (2 `sync_all` + 1 directory
+  sync + 1 rename). On macOS each flush is an `F_FULLFSYNC`; one whole fence (one
+  `Wal::append`) measured ~12.6 ms there (section 9).
 - One disk thread per `SharedWal`; ≤ 64 requests and ≤ 64 MiB per group commit.
 - `benches/append.rs` measures ns/append, records/s and MiB/s for batch × payload in
   {(1,64), (16,64), (256,64), (1,4096), (16,4096)} on the `Wal` directly
@@ -639,8 +689,8 @@ at `09:11057-11210` also uncommitted). At HEAD `bd5e54b` focal runs quinn's defa
 ### 4.3 Copa (uncommitted)
 
 `src/congestion.rs` ports slates' `crates/transport/src/congestion/copa.rs` (doc
-`:1-25`): target rate 1/(δ·d_q) with d_q = RTTstanding − RTTmin (RTTstanding = min over
-srtt/2, RTTmin = min over 10 s); window moves v/(δ·cwnd) per ACK, velocity doubles after
+`:1-25`): target rate 1/(δ·d_q) with d_q = RTTstanding − RTTmin (RTTstanding = least RTT
+over the last srtt/2, RTTmin = least over 10 s); window moves v/(δ·cwnd) per ACK, velocity doubles after
 3 RTTs in one direction; slow start until first decrease; competitive mode (1/δ +1 per RTT,
 halved on loss) when the queue has not nearly emptied over 4·srtt; loss otherwise not a
 signal; persistent congestion resets to 2 datagrams; initial window 10 datagrams;
@@ -906,7 +956,100 @@ logged move/split state machine with seed + catch-up + barrier + activation), an
 into a new Raft group (bootstrap the child group from the parent's state at a barrier
 index, fence the key span by epoch) is not implemented anywhere in focal.
 
-<!-- SECTION7 -->
+---
+
+## 7. Coupling and reuse
+
+### 7.1 Dependency matrix
+
+From `cargo metadata --no-deps` on HEAD (`focal-model`, `focal-stream`, `focal-core`,
+`focal-ledger`, `focal-directory`, `focal-evidence`, `focal-graph`, `focal-control`,
+`focal-runtime` are the domain crates):
+
+| Crate | Workspace deps | Dev workspace deps | Domain? | Notable external deps | Verdict |
+|---|---|---|---|---|---|
+| `focal-raft` | — | — | no | `raft-proto` (git rev, prost 0.11, protoc build), `thiserror`; dev `raft`, `slog` | **Git dep, unchanged** |
+| `focal-timing` | — | — | no | none | **Git dep, unchanged** |
+| `focal-memory` | — | — | no | `serde` (optional) | **Git dep, unchanged** (also gives `RangeMap`/`RangeStore`) |
+| `focal-platform` | — | — | no | `rustix`; `windows-sys`, `tokio` on Windows | **Git dep, unchanged** |
+| `focal-log` | memory, platform | — | no | `crc32fast`, `postcard`, `serde`, `thiserror`, `tokio` | Git dep for bring-up; **compaction must change before many-ranges scale** |
+| `focal-consensus` | log, memory, raft, timing | log (test-support), sim | no (cosmetic mentions only) | `getrandom`, `postcard`, `serde`, `thiserror` | Git dep for bring-up; **plan patches** (7.2 B) |
+| `focal-sim` | **model** | — | yes (`history.rs` only) | `thiserror` | Copy `lib.rs`/`network.rs`/`path.rs`/`disk.rs` (~1.3k lines) or accept `focal-model` as a dev-dep |
+| `focal-wire` | memory, **model**, **stream**, timing, platform | model, sim | **yes** | `quinn`, `quinn-proto`, `rustls`, `blake3`, `futures-util`, `postcard`, `tokio` | **Port** the generic core (section 4.8) |
+| `focal-ranges` | memory, **model** | — | **yes** | `blake3`, `postcard`, `serde` | Pattern only (section 6) |
+| `focal-enrollment` (not asked, relevant) | platform | log | no domain crate (own enrollment types, ~6k lines) | `rcgen`, `ring`, `rustls`, `quinn`, `x509-parser`, `zeroize` | Evaluate for node PKI / CSR enrollment |
+
+Transitive cost of any focal git dependency: a second git source (`tikv/raft-rs`) through
+`raft-proto`, and a protoc build (`protobuf-build` → `protobuf-src`, or `PROTOC`)
+(`docs/dependencies/raft-upstream.md:13`). The focal remote is
+`git@github.com:hyper-light/focal.git`; if the repository is private, mantle's CI needs
+git credentials for Cargo.
+
+### 7.2 Recommendation
+
+**A. Consume unchanged, pinned by `rev`:** `focal-raft`, `focal-timing`,
+`focal-memory`, `focal-platform`. No domain coupling, small surfaces, strong tests
+(differential against raft-rs, seeded schedules, TLA+ for the fast track).
+
+**B. Consume for bring-up, then fork or upstream generalizations:** `focal-consensus` +
+`focal-log`. Today they give mantle durable multi-group Raft on one WAL with cross-group
+group commit, fail-stop discipline, memory/disk accounting, decoder fences and the fast
+track, with a non-blocking `try_drain` suited to a scheduler. Before mantle's scale they
+need (best done upstream, since the owner controls both repositories):
+1. WAL compaction that does not copy every group per checkpoint (per-group segment chains
+   or low-water-mark segment GC) — `focal-log/src/lib.rs:356-394`, `writer.rs:1131-1180`.
+2. External snapshots: checkpoint data as a small manifest, state moved out of band in
+   chunks, no 8 MiB cap (`focal-consensus/src/checkpoint.rs:70`, `lib.rs:904-912`); focal
+   itself notes the missing "chunked snapshot transport" (`focal-node/src/fleet.rs:2830-2833`).
+3. Retained entries read from disk instead of held whole in `RamLog`, or a strict
+   checkpoint cadence.
+4. Configurable policy constants (entry/snapshot/message caps, per-group budget,
+   `max_committed_size_per_ready`) and a considered choice on the two-fence commit and on
+   sending leader appends before the leader's own fsync (the core permits it,
+   `focal-raft/src/node.rs:5-8`; the shell does not).
+
+**C. Port into a mantle crate:** focal-wire's transport core — `quic_transport`,
+`server_tls`/`client_tls`, `QuicServer`/`QuicConnector`/`QuicRemote` generic over an
+envelope, `frame.rs`, `congestion.rs` (Copa), `admission.rs`, `PeerRegistry` +
+`certificate_fingerprint`, the `peers.rs` pool and estimators, `round.rs` (`gather`), and
+the `tests/congestion.rs` harness with `focal_sim::path` — about 3–3.5k lines. While
+porting, change for multi-Raft: batch Raft messages per peer across groups (a long-lived
+stream or batched frames instead of one stream per message), lift the shared
+2-in-flight-per-peer cap for Raft, and add a chunked snapshot stream.
+
+**D. Pattern only:** `focal-ranges` (fenced intent → seed → catch-up → barrier →
+activate), focal-node's leader-return rules and leader balancer (27 §5), the multi-group
+worker with fair scheduling (`focal-node/src/fleet_group.rs`), and the tick pacer loop
+(`network_service.rs:1517-1554`).
+
+### 7.3 Minimal set for multi-Raft + QUIC + fast track
+
+- **Dependencies:** `focal-consensus` and `focal-raft` (bringing `focal-log`,
+  `focal-memory`, `focal-platform`, `focal-timing`) at one pinned rev.
+- **Ported:** the focal-wire core above (`mantle-wire`).
+- **New in mantle** (focal has no equivalent to depend on):
+  1. A range host: thousands of `DurableNode`s on one `SharedWal`, driven by `try_drain`
+     from a small owner pool, with per-group bounded inbound queues (for
+     `PersistencePending`) and a tick pacer from `TickPace`.
+  2. A Raft router: `(group, message)` envelopes, per-peer cross-group batching.
+  3. The KV state machine: apply committed entries, checkpoint manifests, request-id
+     dedup.
+  4. Range split/merge as new Raft groups: bootstrap a child group from the parent's state
+     at a barrier index and fence key spans by epoch (`focal_memory::RangeMap::replace`
+     gives the directory algebra).
+  5. Out-of-band snapshot/state transfer.
+  6. Placement and leader balancing.
+  7. Optionally, the UDP datagram plane for fast-track and other small consensus messages
+     (hecate §1.1; slates' unwired codec as a starting point). A `FAST_PROPOSE` carries the
+     entry payload, so datagram delivery needs entries under the path MTU or fragmentation.
+- **Fast-track obligations for mantle's state machine** (27 §4.6): an entry must be a
+  request every member evaluates (not a leader-sequenced outcome); nothing may be derived
+  from an entry's term; displaced proposals are re-proposed and deduplicated. The flag is
+  set when a group is created and never changes (`RecordKind::FastTrack`).
+- **Pin:** `rev = "bd5e54b18df87ceda2bc4b548f0ecf11ad10a5b9"` today. Better: ask the owner
+  to commit the Copa work and merge or tag `r10-r11-windows-ci`, then pin that. mantle's
+  `deny.toml` must allow both `https://github.com/hyper-light/focal` and
+  `https://github.com/tikv/raft-rs` with `required-git-spec = "rev"`.
 
 ---
 
@@ -1006,8 +1149,8 @@ exist.**
 | Replication CPU cost, in-memory storage, lossless net (ns per entry committed by all), raft-rs vs focal-raft | 3 members ×1 × 64 B: 3,333 vs 3,323; ×16 × 64 B: 1,738 vs 1,721; ×1 × 4 KiB: 16,841 vs 16,026; ×16 × 4 KiB: 15,186 vs 15,004; 5 members ×1 × 64 B: 6,608 vs 6,626; 5 × 16 × 1 KiB: 8,612 vs 8,510; 3 × 1 × 256 KiB: 906,984 vs 864,550 (ratio 0.95–1.00) | `09-implementation-status.md:10873-10888`; `crates/focal-raft/benches/replicate.rs` |
 | Differential run vs raft-rs | 5 campaigns × 3,000 schedules × 6,000 steps, release, 77 s: 80,847,287 steps, all equal | `09:10816-10833` |
 | Fast-track schedules | 2,000 × 6,000 steps, 7 s: 331,509 fast proposals, 284,247 held, 7,973 taken on arrival, 86,941 taken at election, 1,913 committed by the fast quorum, 73,142 displaced | `09:10929-10937` |
-| Fast-track latency (non-leader proposer, propose→applied at itself, virtual time; **real WAL on disk but fsync time not counted**) | regional 3 members 0% loss: classic 320.9 ms mean vs fast 243.4 ms (0.76); regional 5 members 10%: 499.6 vs 283.9 (0.57); LAN 3 members 0%: 0.8 vs 0.6 ms; LAN 3 members 5%: 14.6 vs 17.9 (1.22, the one case where fast is slower on the mean); p99 always lower or equal | `09:10953-10985`; `crates/focal-consensus/src/sim_fast_tests.rs:1-5, 157-200, 322-341` |
-| WAL durable append (`Wal::append`, one F_FULLFSYNC each) | ~12.6 ms/append (batch 1 × 64 B, 80 rec/s); ~13.4 ms (16 × 64 B, 1,198 rec/s); ~14.7 ms (256 × 64 B, 17,357 rec/s, 1.1 MiB/s); ~12.7 ms (1 × 4 KiB, 79 rec/s); ~13.6 ms (16 × 4 KiB, 1,175 rec/s, 4.6 MiB/s) | `docs/qualification/performance/2026-09-12-macos-arm64.md:62-83`; `capacity-envelope.md:28-40`; `09:9811-9820` |
+| Fast-track latency (non-leader proposer, propose→applied at itself, virtual time; **real WAL on disk but fsync time not counted**) | regional 3 members 0% loss: classic 320.9 ms mean vs fast 243.4 ms (0.76); regional 5 members 10%: 499.6 vs 283.9 (0.57); LAN 3 members 0%: 0.8 vs 0.6 ms; LAN 3 members 5%: 14.6 vs 17.9 (1.22, the only case where fast is slower on the mean). p99 is usually lower but not always (regional, 3 members, 1%: 411.2 vs 366.1 ms). The test asserts ≥ 90% fast-quorum commits and ratio < 0.85 at 0% loss, and fast median ≤ 1.05 × classic median at every loss | `09:10953-10985`; `crates/focal-consensus/src/sim_fast_tests.rs:1-5, 157-200, 322-341` |
+| WAL durable append (`Wal::append`; described there as "one `F_FULLFSYNC`" per call, but in code each call is three flushes — segment, `CURRENT.tmp`, directory — plus a rename, section 3.2) | ~12.6 ms/append (batch 1 × 64 B, 80 rec/s); ~13.4 ms (16 × 64 B, 1,198 rec/s); ~14.7 ms (256 × 64 B, 17,357 rec/s, 1.1 MiB/s); ~12.7 ms (1 × 4 KiB, 79 rec/s); ~13.6 ms (16 × 4 KiB, 1,175 rec/s, 4.6 MiB/s) | `docs/qualification/performance/2026-09-12-macos-arm64.md:62-83`; `capacity-envelope.md:28-40`; `09:9811-9820` |
 | End to end, single node | 200 claims at ~33 ops/s, p50 ~30 ms, bound by F_FULLFSYNC | `09:9891-9894` |
 | Memory budget admission | reserve/commit 7.7 ns uncontended, 26.8 ns via child budget; shared envelope 130.8 / 237.0 / 270.5 ns at 2 / 4 / 8 threads | `performance/2026-09-12-macos-arm64.md:11-18` |
 | Request codec | ~40 ns fixed each way, decode ~2 GiB/s | same file `:45-54` |
@@ -1018,4 +1161,40 @@ exist.**
 No multi-group WAL throughput number is recorded — only the test that 12 groups share one
 covering flush. No commit-latency number on a real network with real fsync exists.
 
-<!-- SECTION10 -->
+---
+
+## 10. Risks and open questions for mantle
+
+1. **Pin target.** focal-raft, focal-timing and focal-platform exist only on
+   `r10-r11-windows-ci`; Copa, traffic classes, the 1 MiB stream window and the
+   quinn-proto 0.11.18 fix are uncommitted (sections 0, 4.0).
+2. **No UDP plane exists.** The two-plane transport is a spec (hecate §1.1) plus an unwired
+   slates codec (section 4.7). Building it means designing keying, replay windows,
+   fencing ("fencing is still owed" in slates' `accept.rs`), MTU-bounded messages and
+   loss handling from scratch, and deciding which messages ride it.
+3. **Multi-Raft scaling of the durable layer**: whole-WAL rewrite per group checkpoint;
+   whole retained log in RAM; ≤ 8 MiB snapshots sent as one message; per-operation staging
+   reservations proportional to retained history (sections 2.4, 2.7, 3.5).
+4. **Write latency**: two WAL fences per commit, each two file flushes + a directory flush
+   + a rename; the leader sends only after its own fsync. The only recorded end-to-end
+   number is single-node macOS: ~30 ms p50 at ~33 ops/s, consistent with two ~12.6 ms
+   `F_FULLFSYNC` fences (section 9; that attribution is this note's inference). There are
+   no Linux or NVMe numbers.
+5. **Transport throughput for many groups**: one stream per Raft message, 2 in flight per
+   peer across all groups, queue-full drops left to Raft retransmission (section 4.6).
+6. **Fast track maturity**: built, modelled and measured, but no production owner uses it.
+   The TLA+ model has no reconfiguration and no liveness properties. The differential
+   test covers only the classic track, since raft-rs has no fast track. The measured
+   latency gain counts network time, not disk time (section 9).
+7. **Gate gaps to fix when adopting**: `windows.yml` does not run the full gate set that
+   `CLAUDE.md:48` requires, and `deny.toml` graph targets exclude Windows (section 8.2).
+8. **raft-proto provenance**: pinned to the head of an unmerged upstream PR, with a
+   protoc/C++ build dependency (section 1.5).
+9. **Stale documentation noticed** (small, but worth knowing when reading focal):
+   - `focal-timing/src/lib.rs:9-11` still calls `PathRtt` an RFC 9002 estimator; it is
+     median/MAD.
+   - `focal-ranges/README.md:3-6` says the crate is unconnected; focal-ledger and
+     focal-node use it.
+   - `docs/dependencies/README.md` gives 206 inventory rows; there are 202.
+   - Doc 27 §1's table still says "no leader balancing" and "Fast track commit: no",
+     although §5 and §6 record both as built.

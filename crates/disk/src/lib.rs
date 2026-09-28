@@ -17,7 +17,9 @@ use std::path::PathBuf;
 pub mod buf;
 pub mod file;
 pub mod histogram;
+pub mod identity;
 pub mod measure;
+pub mod probe;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DiskError {

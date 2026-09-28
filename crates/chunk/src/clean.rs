@@ -241,6 +241,7 @@ impl<F: BlockFile> Cleaner<F> {
     fn relocate(&self, moves: Vec<Move>) -> Result<u64, ChunkError> {
         let count = u64::try_from(moves.len()).unwrap_or(u64::MAX);
         let (reply, answer) = sync_channel(1);
+        self.shared.submitted.fetch_add(1, Ordering::AcqRel);
         self.submit
             .send(Request {
                 op: Op::Relocate { moves },
@@ -255,6 +256,7 @@ impl<F: BlockFile> Cleaner<F> {
     /// segments.
     fn flush(&self) -> Result<(), ChunkError> {
         let (reply, answer) = sync_channel(1);
+        self.shared.submitted.fetch_add(1, Ordering::AcqRel);
         self.submit
             .send(Request {
                 op: Op::Delete {

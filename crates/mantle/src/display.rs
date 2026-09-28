@@ -31,6 +31,11 @@ pub fn rate(bytes_per_sec: f64) -> String {
     )
 }
 
+/// Counts and rates of operations: 950, 13.5K, 1.02M.
+pub fn count(value: f64) -> String {
+    scaled(value, 1000.0, &["", "K", "M", "G"])
+}
+
 pub fn nanos(ns: u64) -> String {
     let ns = ns as f64;
     if ns < 1_000.0 {
@@ -95,5 +100,8 @@ mod tests {
         assert_eq!(nanos(73_727), "73.7 µs");
         assert_eq!(nanos(4_718_591), "4.72 ms");
         assert_eq!(nanos(900), "900 ns");
+        assert_eq!(count(950.0), "950");
+        assert_eq!(count(13_512.0), "13.5K");
+        assert_eq!(count(1_020_000.0), "1.02M");
     }
 }

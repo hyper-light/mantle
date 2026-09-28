@@ -8,6 +8,7 @@ use std::thread::JoinHandle;
 
 use mantle_disk::DiskError;
 use mantle_disk::block::BlockFile;
+use mantle_disk::buf::Pool;
 
 use crate::clean::{CleanReport, Cleaner};
 use crate::error::ChunkError;
@@ -125,8 +126,12 @@ impl<F: BlockFile + 'static> Volume<F> {
         geometry: Geometry,
         config: Config,
     ) -> Result<(Self, RecoveryReport), ChunkError> {
-        let recovered = recover::recover(&file, &superblock, &geometry, &config)?;
+        // Read buffers: at most one batch's worth kept free, none larger than a batch.
+        let batch = config.limits.batch_bytes;
+        let pool = Pool::new(file.alignment(), batch, batch);
+        let recovered = recover::recover(&file, &pool, &superblock, &geometry, &config)?;
         let shared = Arc::new(Shared {
+            pool,
             file,
             geometry,
             volume: superblock.volume,
@@ -135,6 +140,7 @@ impl<F: BlockFile + 'static> Volume<F> {
             fenced: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             dead_bytes: std::sync::atomic::AtomicU64::new(0),
+            submitted: std::sync::atomic::AtomicU64::new(0),
             usage: RwLock::new(recovered.segments.clone()),
         });
         let (sender, rx) = sync_channel(config.limits.queue.max(1));
@@ -162,6 +168,15 @@ impl<F: BlockFile + 'static> Volume<F> {
             fragments: recovered.fragments,
             poke: Some(wake.clone()),
             low_water: low,
+            // Two batches' buffers kept free, each up to twice a batch.
+            pool: Pool::new(
+                shared.file.alignment(),
+                batch.saturating_mul(2),
+                batch.saturating_mul(2),
+            ),
+            service_ns: 0,
+            return_rate: crate::writer::RATE_ONE / 2,
+            received: 0,
         };
         // Recovery changed the index relative to the log: it dropped records whose flush
         // never completed, or indexed records the log never named. Both decisions live only
@@ -235,6 +250,15 @@ impl<F: BlockFile + 'static> Volume<F> {
         self.superblock.volume
     }
 
+    /// The bytes of the file or device that hold segments.
+    pub fn data_span(&self) -> std::ops::Range<u64> {
+        let g = &self.shared.geometry;
+        let end = u64::from(g.segments)
+            .saturating_mul(g.segment_size)
+            .saturating_add(g.data_offset);
+        g.data_offset..end
+    }
+
     pub fn is_fenced(&self) -> bool {
         self.shared.fenced.load(Ordering::Acquire)
     }
@@ -283,6 +307,7 @@ impl<F: BlockFile + 'static> Volume<F> {
         }
         let sender = self.sender.as_ref().ok_or(ChunkError::Closed)?;
         let (reply, answer) = sync_channel(1);
+        self.shared.submitted.fetch_add(1, Ordering::AcqRel);
         sender
             .send(Request { op, reply })
             .map_err(|_| ChunkError::Closed)?;
@@ -326,6 +351,21 @@ impl<F: BlockFile + 'static> Volume<F> {
     /// Reads `len` bytes of a chunk from `offset`, verifying every byte returned against the
     /// record's checksums and every record against the identity the index expects.
     pub fn read(&self, key: &ChunkKey, offset: u64, len: u64) -> Result<Vec<u8>, ChunkError> {
+        let mut out = Vec::new();
+        self.read_into(key, offset, len, &mut out)?;
+        Ok(out)
+    }
+
+    /// Reads like [`Volume::read`] into `out`, replacing what it held. A caller that reads in a
+    /// loop with the same `out` allocates nothing once `out` is large enough.
+    pub fn read_into(
+        &self,
+        key: &ChunkKey,
+        offset: u64,
+        len: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<(), ChunkError> {
+        out.clear();
         let fragments = {
             let index = self.shared.index.read().map_err(|_| ChunkError::Fenced)?;
             let entry = index.get(key).ok_or(ChunkError::NotFound(*key))?;
@@ -346,7 +386,7 @@ impl<F: BlockFile + 'static> Volume<F> {
         };
         let capacity =
             usize::try_from(len).map_err(|_| ChunkError::TooLarge { len, max: u64::MAX })?;
-        let mut out = Vec::with_capacity(capacity);
+        out.reserve(capacity);
         let end = offset.saturating_add(len);
         for fragment in &fragments {
             let from = offset
@@ -355,9 +395,9 @@ impl<F: BlockFile + 'static> Volume<F> {
             let to = end
                 .min(fragment.end())
                 .saturating_sub(fragment.chunk_offset);
-            read::fragment(&self.shared, key, fragment, from, to, &mut out)?;
+            read::fragment(&self.shared, key, fragment, from, to, out)?;
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Verifies every stored fragment now; returns the number that failed. Failed chunks are
@@ -450,6 +490,7 @@ impl<F: BlockFile + 'static> Drop for Volume<F> {
 fn read_superblock<F: BlockFile>(file: &F) -> Result<Superblock, ChunkError> {
     let mut best: Option<Superblock> = None;
     let len = file.len().map_err(ChunkError::Device)?;
+    let pool = Pool::new(file.alignment(), 64 << 10, 64 << 10);
     for offset in [OFFSET_A, OFFSET_B_COMPACT, OFFSET_B_STANDARD] {
         for block in [4096u64, 8192, 16384, 32768, 65536] {
             if offset.saturating_add(block) > len || !file.alignment().is_aligned_u64(block) {
@@ -464,10 +505,10 @@ fn read_superblock<F: BlockFile>(file: &F) -> Result<Superblock, ChunkError> {
                 log_size: 0,
                 data_offset: 0,
             };
-            let Ok(Some(bytes)) = read_span(file, &base, 0, offset, block) else {
+            let Ok(Some(span)) = read_span(file, &pool, &base, 0, offset, block) else {
                 continue;
             };
-            if let Some(sb) = Superblock::decode(&bytes)
+            if let Some(sb) = Superblock::decode(span.bytes())
                 && sb.offset_of(sb.slot()) == offset
                 && best.as_ref().is_none_or(|b| sb.sequence > b.sequence)
             {

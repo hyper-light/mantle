@@ -6,7 +6,9 @@
 //! FILE_FLAG_NO_BUFFERING). The buffer is carved out of an ordinary allocation that is
 //! `align - 1` bytes longer than needed, so no `unsafe` allocation is involved.
 
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
+use std::sync::Mutex;
 
 /// The largest alignment accepted. Direct-I/O alignments are logical block sizes and page
 /// sizes (512 B to 64 KiB on every platform mantle targets); the bound caps the slack a
@@ -111,6 +113,17 @@ impl std::fmt::Debug for AlignedBuf {
 }
 
 impl AlignedBuf {
+    /// A buffer of no capacity, allocating nothing.
+    pub const fn empty() -> Self {
+        Self {
+            storage: Vec::new(),
+            start: 0,
+            capacity: 0,
+            len: 0,
+            align: Alignment::BYTE,
+        }
+    }
+
     /// A zero-filled buffer of at least `capacity` bytes, rounded up to the alignment.
     pub fn zeroed(capacity: usize, align: Alignment) -> Result<Self, BufError> {
         let capacity = align.up(capacity).ok_or(BufError::TooLarge(capacity))?;
@@ -231,6 +244,142 @@ impl AlignedBuf {
     }
 }
 
+/// Aligned buffers kept for reuse, so steady I/O does not allocate.
+///
+/// A new buffer is zero-filled, since safe Rust hands out only initialized memory, and
+/// allocators zero large blocks by returning their pages to the OS and faulting fresh ones
+/// back in: glibc serves them with `mmap` (mallopt(3), M_MMAP_THRESHOLD), and macOS's
+/// allocator calls `madvise` on each one, which took 12% of a chunk reader's time and stalled
+/// reads for milliseconds (docs/measurements/2026-09-28-chunk-store-benchmark.md). A pool hands back a
+/// buffer whose bytes are already initialized.
+///
+/// Free buffers are kept by capacity. A request takes the smallest free buffer that holds
+/// it and is at most twice its size, so a small read never ties up a large buffer; otherwise
+/// it allocates exactly what it needs. At most `limit` bytes are kept free, none in a
+/// buffer larger than `largest`; a buffer returned past either bound is freed.
+pub struct Pool {
+    align: Alignment,
+    limit: usize,
+    largest: usize,
+    free: Mutex<Free>,
+}
+
+#[derive(Default)]
+struct Free {
+    by_capacity: BTreeMap<usize, Vec<AlignedBuf>>,
+    held: usize,
+}
+
+impl std::fmt::Debug for Pool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pool")
+            .field("align", &self.align.get())
+            .field("limit", &self.limit)
+            .field("largest", &self.largest)
+            .finish()
+    }
+}
+
+impl Pool {
+    pub fn new(align: Alignment, limit: usize, largest: usize) -> Self {
+        Self {
+            align,
+            limit,
+            largest,
+            free: Mutex::new(Free::default()),
+        }
+    }
+
+    pub fn alignment(&self) -> Alignment {
+        self.align
+    }
+
+    /// An empty buffer of at least `capacity` bytes; it returns to the pool when dropped.
+    pub fn take(&self, capacity: usize) -> Result<PoolBuf<'_>, BufError> {
+        let needed = self
+            .align
+            .up(capacity)
+            .ok_or(BufError::TooLarge(capacity))?;
+        let reused = self.free.lock().ok().and_then(|mut free| {
+            let fit = free
+                .by_capacity
+                .range(needed..=needed.saturating_mul(2))
+                .next()
+                .map(|(c, _)| *c)?;
+            let list = free.by_capacity.get_mut(&fit)?;
+            let buf = list.pop()?;
+            if list.is_empty() {
+                free.by_capacity.remove(&fit);
+            }
+            free.held = free.held.saturating_sub(buf.capacity());
+            Some(buf)
+        });
+        let mut buf = match reused {
+            Some(buf) => buf,
+            None => AlignedBuf::zeroed(needed, self.align)?,
+        };
+        buf.clear();
+        Ok(PoolBuf {
+            pool: self,
+            buf: Some(buf),
+        })
+    }
+
+    /// Bytes held in free buffers.
+    pub fn held(&self) -> usize {
+        self.free.lock().map_or(0, |free| free.held)
+    }
+
+    fn give(&self, buf: AlignedBuf) {
+        let capacity = buf.capacity();
+        if capacity > self.largest || buf.alignment() != self.align {
+            return;
+        }
+        // A poisoned lock only means another thread unwound while holding it; the free list
+        // is still a valid list of buffers, but dropping this one is the conservative choice.
+        if let Ok(mut free) = self.free.lock()
+            && free.held.saturating_add(capacity) <= self.limit
+        {
+            free.held = free.held.saturating_add(capacity);
+            free.by_capacity.entry(capacity).or_default().push(buf);
+        }
+    }
+}
+
+/// A buffer taken from a [`Pool`], returned to it when dropped.
+pub struct PoolBuf<'a> {
+    pool: &'a Pool,
+    buf: Option<AlignedBuf>,
+}
+
+impl std::ops::Deref for PoolBuf<'_> {
+    type Target = AlignedBuf;
+
+    fn deref(&self) -> &AlignedBuf {
+        // Present from construction until drop takes it.
+        match &self.buf {
+            Some(buf) => buf,
+            None => &EMPTY,
+        }
+    }
+}
+
+impl std::ops::DerefMut for PoolBuf<'_> {
+    fn deref_mut(&mut self) -> &mut AlignedBuf {
+        self.buf.get_or_insert_with(AlignedBuf::empty)
+    }
+}
+
+impl Drop for PoolBuf<'_> {
+    fn drop(&mut self) {
+        if let Some(buf) = self.buf.take() {
+            self.pool.give(buf);
+        }
+    }
+}
+
+static EMPTY: AlignedBuf = AlignedBuf::empty();
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +430,43 @@ mod tests {
         );
         assert!(buf.set_len(513).is_err());
         assert!(AlignedBuf::zeroed(MAX_BUFFER + 1, Alignment::BYTE).is_err());
+    }
+
+    #[test]
+    fn a_pool_reuses_buffers_within_its_bounds() {
+        let align = Alignment::new(4096).unwrap();
+        let pool = Pool::new(align, 64 << 10, 32 << 10);
+        let first = {
+            let mut b = pool.take(5000).unwrap();
+            assert!(b.capacity() >= 5000 && b.is_empty());
+            b.extend_from_slice(&[7; 100]).unwrap();
+            b.as_mut_capacity().as_ptr().addr()
+        };
+        assert_eq!(pool.held(), 8192);
+        // The same buffer comes back, emptied, for a request it fits within twice over.
+        let b = pool.take(4097).unwrap();
+        assert_eq!(b.as_slice().len(), 0);
+        let again = b.as_slice().as_ptr().addr();
+        assert_eq!(again, first);
+        assert_eq!(pool.held(), 0);
+        drop(b);
+        assert_eq!(pool.held(), 8192);
+        // Buffers past `largest`, or past `limit` in total, are freed rather than kept.
+        drop(pool.take(40 << 10).unwrap());
+        assert_eq!(pool.held(), 8192);
+
+        // A request under half the size of every free buffer gets a buffer of its own.
+        let pool = Pool::new(align, 64 << 10, 32 << 10);
+        drop(pool.take(20_000).unwrap());
+        assert_eq!(pool.held(), 20480);
+        let small = pool.take(100).unwrap();
+        assert_eq!(small.capacity(), 4096);
+        assert_eq!(pool.held(), 20480);
+        drop(small);
+        assert_eq!(pool.held(), 20480 + 4096);
+        let held: Vec<_> = (0..10).map(|_| pool.take(16 << 10).unwrap()).collect();
+        drop(held);
+        assert!(pool.held() <= 64 << 10);
     }
 
     proptest! {

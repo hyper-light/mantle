@@ -17,6 +17,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+mod bench;
 mod disk;
 mod display;
 
@@ -38,6 +39,35 @@ enum Command {
         #[command(subcommand)]
         command: DiskCommand,
     },
+    /// Measure mantle's storage on a device.
+    Bench {
+        #[command(subcommand)]
+        command: BenchCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum BenchCommand {
+    /// Measure the device under PATH, then the chunk store's puts and reads on it across
+    /// chunk sizes and concurrency, in a scratch volume of at most 4 GiB and a tenth of the
+    /// free space (removed afterwards; about a minute on an SSD).
+    Chunk {
+        /// A directory on the device to measure.
+        path: PathBuf,
+        /// Seconds each put and each read measurement runs.
+        #[arg(long, default_value_t = 1.0)]
+        seconds: f64,
+        /// Chunk sizes to measure, comma-separated, in bytes or with a K or M suffix
+        /// (powers of 1024): 4K,64K,1M,8M by default.
+        #[arg(long, value_delimiter = ',', value_parser = parse_size)]
+        sizes: Vec<usize>,
+        /// Requests in flight to measure, comma-separated: 1,4,16,64 by default.
+        #[arg(long, value_delimiter = ',')]
+        workers: Vec<usize>,
+        /// Leave out the measurement of the device itself.
+        #[arg(long)]
+        skip_device: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -57,6 +87,25 @@ enum DiskCommand {
     },
 }
 
+/// A byte count, optionally with a K or M suffix (powers of 1024).
+fn parse_size(text: &str) -> Result<usize, String> {
+    let text = text.trim();
+    let (digits, shift) = match text.strip_suffix(['k', 'K']) {
+        Some(d) => (d, 10),
+        None => match text.strip_suffix(['m', 'M']) {
+            Some(d) => (d, 20),
+            None => (text, 0),
+        },
+    };
+    let value: usize = digits
+        .parse()
+        .map_err(|_| format!("{text} is not a size in bytes"))?;
+    value
+        .checked_shl(shift)
+        .filter(|v| v.checked_shr(shift) == Some(value) && *v > 0)
+        .ok_or_else(|| format!("{text} is not a usable size"))
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let stdout = std::io::stdout();
@@ -69,7 +118,30 @@ fn main() -> ExitCode {
                     measure,
                     verbose,
                 },
-        } => disk::probe(&mut out, &path, measure, verbose),
+        } => disk::probe(&mut out, &path, measure, verbose).map_err(|e| e.to_string()),
+        Command::Bench {
+            command:
+                BenchCommand::Chunk {
+                    path,
+                    seconds,
+                    sizes,
+                    workers,
+                    skip_device,
+                },
+        } => match std::time::Duration::try_from_secs_f64(seconds) {
+            Ok(step) => bench::chunk(
+                &mut out,
+                &path,
+                &bench::Options {
+                    step,
+                    sizes,
+                    workers,
+                    skip_device,
+                },
+            )
+            .map_err(|e| e.to_string()),
+            Err(_) => Err(format!("--seconds {seconds} is not a duration")),
+        },
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

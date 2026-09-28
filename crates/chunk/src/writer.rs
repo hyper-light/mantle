@@ -6,6 +6,24 @@
 //! Only then does it publish the batch to readers and answer the requests. A failed write or
 //! flush fences the volume; the flush is never retried (Rebello et al., ATC 2020).
 //!
+//! A batch that has just been answered frees its submitters to send their next requests,
+//! but the next batch is formed at once from whatever is queued. With a few closed-loop
+//! submitters, batches then alternate between those answered last time and the rest, and
+//! every request waits for two flushes (docs/measurements/2026-09-28-chunk-store-benchmark.md,
+//! finding 5). Research note 03 rule G6 adds an adaptive wait once
+//! measurements show the flush rate limits throughput; the wait is derived, not chosen.
+//! With `n` requests in the batch, waiting a further `dw` for one more that arrives with
+//! probability `p` costs the batch `n·dw` of latency and saves the newcomer about `S − dw`,
+//! where `S` is the batch's service time (writes and flush), because a request that misses
+//! a batch waits for that batch to finish before its own starts. The expected total latency
+//! falls while `dw < p·S / (n + p)`, so that is how long the writer waits for each next
+//! request, and only while submitters it just answered have yet to return. `S` is measured
+//! on every batch, and `p` is learned as the fraction of answered submitters that return
+//! while the writer waits; both are moving averages with the gain of 1/8 that TCP uses for
+//! its round-trip estimate (Jacobson, SIGCOMM 1988; RFC 6298 §2). The model assumes a batch's
+//! service time does not grow with one more request, which holds while the flush dominates;
+//! the batch limits bound the rest.
+//!
 //! Records go to one of two streams, each with its own open segment: new writes, and the
 //! cleaner's relocations. Keeping relocated data apart groups data by age, which is what
 //! lets later cleaning find segments that are mostly dead (Rosenblum and Ousterhout, TOCS
@@ -17,7 +35,7 @@ use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, RwLock};
 
 use mantle_disk::block::BlockFile;
-use mantle_disk::buf::AlignedBuf;
+use mantle_disk::buf::{AlignedBuf, Pool};
 
 use crate::error::ChunkError;
 use crate::frame::{
@@ -85,6 +103,8 @@ pub(crate) struct Shared<F> {
     pub geometry: Geometry,
     pub volume: u128,
     pub checksum_shift: u8,
+    /// Buffers for reading records: reads, verification, cleaning and scrubbing.
+    pub pool: Pool,
     pub index: RwLock<Index>,
     pub fenced: std::sync::atomic::AtomicBool,
     /// Set when the volume closes: background threads stop at their next wake.
@@ -92,6 +112,8 @@ pub(crate) struct Shared<F> {
     /// Bytes of records made dead since the volume opened: the cleaner waits for this to grow
     /// after a pass that could not gain space.
     pub dead_bytes: std::sync::atomic::AtomicU64,
+    /// Requests submitted to the writer so far, counted just before each is sent.
+    pub submitted: std::sync::atomic::AtomicU64,
     pub usage: RwLock<Vec<SegmentInfo>>,
 }
 
@@ -119,6 +141,27 @@ pub(crate) struct Writer<F: BlockFile> {
     /// Wakes the cleaner when free segments run low.
     pub poke: Option<SyncSender<()>>,
     pub low_water: usize,
+    /// Buffers for the batches the writer lays out, reused from batch to batch.
+    pub pool: Pool,
+    /// Moving average of a batch's service time (its writes and flush), in nanoseconds; zero
+    /// until one is measured.
+    pub service_ns: u64,
+    /// Moving average of the fraction of answered submitters that return while the writer
+    /// waits, in 1/2^16ths. It starts at one half, the estimate with no observations
+    /// (Laplace's rule of succession).
+    pub return_rate: u64,
+    /// Requests received from the queue so far.
+    pub received: u64,
+}
+
+/// `return_rate`'s unit: one.
+pub(crate) const RATE_ONE: u64 = 1 << 16;
+
+/// One step of a moving average with gain 1/8 (RFC 6298 §2).
+fn smooth(average: u64, sample: u64) -> u64 {
+    average
+        .saturating_sub(average / 8)
+        .saturating_add(sample / 8)
 }
 
 /// A chunk as the batch being validated sees it: the index plus earlier requests in the batch.
@@ -300,29 +343,86 @@ fn slot<T>(items: &mut [T], index: u32) -> Option<&mut T> {
 
 impl<F: BlockFile> Writer<F> {
     pub fn run(mut self) {
+        // Requests the previous batch answered, and requests already submitted when it did.
+        let mut answered = 0u64;
+        let mut backlog = 0u64;
         while let Ok(first) = self.rx.recv() {
+            self.received = self.received.saturating_add(1);
             let mut bytes = request_bytes(&first);
             let mut batch = vec![first];
-            while batch.len() < self.config.limits.batch_requests
-                && bytes < self.config.limits.batch_bytes
-            {
+            while self.room(&batch, bytes) {
                 match self.rx.try_recv() {
                     Ok(next) => {
+                        self.received = self.received.saturating_add(1);
                         bytes = bytes.saturating_add(request_bytes(&next));
                         batch.push(next);
                     }
                     Err(_) => break,
                 }
             }
+            self.gather(&mut batch, &mut bytes, answered, backlog);
+            answered = u64::try_from(batch.len()).unwrap_or(u64::MAX);
             if self.shared.fenced.load(Ordering::Acquire) {
                 for request in batch {
                     reply(request, Err(ChunkError::Fenced));
                 }
-                continue;
+            } else {
+                self.process(batch);
+                self.poke_cleaner();
             }
-            self.process(batch);
-            self.poke_cleaner();
+            // Requests submitted before these answers went out are queued ahead of any the
+            // answered submitters send next.
+            backlog = self
+                .shared
+                .submitted
+                .load(Ordering::Acquire)
+                .saturating_sub(self.received);
         }
+    }
+
+    fn room(&self, batch: &[Request], bytes: usize) -> bool {
+        batch.len() < self.config.limits.batch_requests && bytes < self.config.limits.batch_bytes
+    }
+
+    /// Waits for the submitters the last batch answered while waiting is expected to lower
+    /// total latency (module docs), and learns how many of them return.
+    fn gather(&mut self, batch: &mut Vec<Request>, bytes: &mut usize, answered: u64, backlog: u64) {
+        if answered == 0 {
+            return;
+        }
+        // The first `backlog` requests received were sent before the answers.
+        let returned = |batch: &Vec<Request>| {
+            u64::try_from(batch.len())
+                .unwrap_or(u64::MAX)
+                .saturating_sub(backlog)
+        };
+        while self.service_ns > 0 && returned(batch) < answered && self.room(batch, *bytes) {
+            // dw < p·S / (n + p), with p in 1/2^16ths.
+            let n = u128::try_from(batch.len()).unwrap_or(u128::MAX);
+            let p = u128::from(self.return_rate);
+            let step = p
+                .saturating_mul(u128::from(self.service_ns))
+                .checked_div(n.saturating_mul(u128::from(RATE_ONE)).saturating_add(p))
+                .and_then(|ns| u64::try_from(ns).ok())
+                .unwrap_or(0);
+            if step == 0 {
+                break;
+            }
+            match self.rx.recv_timeout(std::time::Duration::from_nanos(step)) {
+                Ok(next) => {
+                    self.received = self.received.saturating_add(1);
+                    *bytes = bytes.saturating_add(request_bytes(&next));
+                    batch.push(next);
+                }
+                Err(_) => break,
+            }
+        }
+        let sample = returned(batch)
+            .min(answered)
+            .saturating_mul(RATE_ONE)
+            .checked_div(answered)
+            .unwrap_or(0);
+        self.return_rate = smooth(self.return_rate, sample);
     }
 
     fn fence(&self) {
@@ -774,8 +874,8 @@ impl<F: BlockFile> Writer<F> {
     }
 
     fn write_batch(&mut self, layout: &mut Layout) -> Result<(), ChunkError> {
+        let started = std::time::Instant::now();
         let geometry = self.shared.geometry;
-        let align = self.shared.file.alignment();
         for region in &mut layout.regions {
             let padded = region
                 .bytes
@@ -783,8 +883,10 @@ impl<F: BlockFile> Writer<F> {
                 .checked_next_multiple_of(geometry.block_usize())
                 .ok_or(ChunkError::Full)?;
             region.bytes.resize(padded, 0);
-            let mut buf =
-                AlignedBuf::zeroed(padded, align).map_err(|e| ChunkError::Device(e.into()))?;
+            let mut buf = self
+                .pool
+                .take(padded)
+                .map_err(|e| ChunkError::Device(e.into()))?;
             buf.extend_from_slice(&region.bytes)
                 .map_err(|e| ChunkError::Device(e.into()))?;
             let at = geometry
@@ -798,7 +900,14 @@ impl<F: BlockFile> Writer<F> {
         }
         let group = self.cursor.lsn;
         self.append_frame(KIND_BATCH, &layout.records, group)?;
-        self.shared.file.sync_data().map_err(ChunkError::Device)
+        self.shared.file.sync_data().map_err(ChunkError::Device)?;
+        let took = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.service_ns = if self.service_ns == 0 {
+            took
+        } else {
+            smooth(self.service_ns, took)
+        };
+        Ok(())
     }
 
     /// Appends one frame to the log (preceded by a wrap frame when it must go around). `group`

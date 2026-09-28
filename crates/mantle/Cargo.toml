@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+mantle-chunk = { path = "../chunk" }
 mantle-disk = { path = "../disk" }
 
 [dev-dependencies]

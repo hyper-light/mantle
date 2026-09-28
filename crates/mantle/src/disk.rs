@@ -191,6 +191,15 @@ fn report(out: &mut impl Write, c: &Calibration) -> std::io::Result<()> {
             display::nanos(c.durable_write.p50_ns)
         ),
     )?;
+    field(
+        out,
+        "batches",
+        &format!(
+            "{} when {} is made durable at a time",
+            display::rate(c.durable_sequential.bytes_per_sec),
+            display::size(c.durable_large)
+        ),
+    )?;
     if c.caching == Caching::Buffered {
         field(
             out,

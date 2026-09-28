@@ -42,20 +42,22 @@ pub(crate) fn fragment<F: BlockFile>(
     let payload_from = first_block.saturating_mul(block_size);
     // One read covering the header and the checksum blocks that hold the range.
     let span_len = prefix_len.saturating_add(last_block_end);
-    let bytes = match read_span(
+    let span = match read_span(
         &shared.file,
+        &shared.pool,
         geometry,
         base,
         u64::from(fragment.offset),
         span_len,
     ) {
-        Ok(Some(bytes)) => bytes,
+        Ok(Some(span)) => span,
         Ok(None) => return Err(corrupt("record extends past the end of the volume")),
         Err(ChunkError::Device(e)) => return Err(corrupt(&format!("read failed: {e}"))),
         Err(e) => return Err(e),
     };
+    let bytes = span.bytes();
     let prefix =
-        record::decode_prefix(&bytes).ok_or_else(|| corrupt("record header did not verify"))?;
+        record::decode_prefix(bytes).ok_or_else(|| corrupt("record header did not verify"))?;
     let h = &prefix.header;
     if h.key != *key
         || h.volume != shared.volume

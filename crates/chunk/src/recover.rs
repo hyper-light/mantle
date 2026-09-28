@@ -12,7 +12,7 @@
 
 use mantle_disk::DiskError;
 use mantle_disk::block::BlockFile;
-use mantle_disk::buf::AlignedBuf;
+use mantle_disk::buf::{Pool, PoolBuf};
 
 use crate::error::ChunkError;
 use crate::frame::{KIND_BATCH, KIND_WRAP, LogRecord, PutRecord, SegmentState};
@@ -50,6 +50,7 @@ pub(crate) struct Recovered {
 
 pub(crate) fn recover<F: BlockFile>(
     file: &F,
+    pool: &Pool,
     sb: &Superblock,
     geometry: &Geometry,
     config: &Config,
@@ -153,7 +154,7 @@ pub(crate) fn recover<F: BlockFile>(
     // The last batch's flush may not have completed: keep only records whose data verifies.
     // They are the last fragments of their chunks, so they come off in reverse order.
     for (put, displaced) in last_batch.iter().rev() {
-        let verified = verify_at(file, geometry, sb, put.segment, u64::from(put.offset))?
+        let verified = verify_at(file, pool, geometry, sb, put.segment, u64::from(put.offset))?
             .is_some_and(|v| v.matches(put));
         if verified {
             continue;
@@ -181,7 +182,7 @@ pub(crate) fn recover<F: BlockFile>(
         open.push((info.incarnation, segment));
         let mut at = u64::from(info.write_pos).max(geometry.block);
         while at < geometry.segment_size {
-            let Some(found) = verify_at(file, geometry, sb, segment, at)? else {
+            let Some(found) = verify_at(file, pool, geometry, sb, segment, at)? else {
                 break;
             };
             if found.prefix.header.incarnation != info.incarnation {
@@ -297,6 +298,7 @@ impl Verified {
 /// every checksum block. `None` if no intact record of this volume and segment is there.
 pub(crate) fn verify_at<F: BlockFile>(
     file: &F,
+    pool: &Pool,
     geometry: &Geometry,
     sb: &Superblock,
     segment: u32,
@@ -306,11 +308,18 @@ pub(crate) fn verify_at<F: BlockFile>(
         return Ok(None);
     };
     // The header first: it says how long the record is.
-    let Some(header_span) = read_span(file, geometry, base, offset, record::HEADER_LEN as u64)?
+    let Some(header_span) = read_span(
+        file,
+        pool,
+        geometry,
+        base,
+        offset,
+        record::HEADER_LEN as u64,
+    )?
     else {
         return Ok(None);
     };
-    let Some(first) = record::peek_lengths(&header_span) else {
+    let Some(first) = record::peek_lengths(header_span.bytes()) else {
         return Ok(None);
     };
     let Some(record_len) = record::record_len(first.payload_len, first.checksum_shift) else {
@@ -320,10 +329,12 @@ pub(crate) fn verify_at<F: BlockFile>(
     if offset.saturating_add(record_len64) > geometry.segment_size {
         return Ok(None);
     }
-    let Some(bytes) = read_span(file, geometry, base, offset, record_len64)? else {
+    drop(header_span);
+    let Some(span) = read_span(file, pool, geometry, base, offset, record_len64)? else {
         return Ok(None);
     };
-    let Some(prefix) = record::decode_prefix(&bytes) else {
+    let bytes = span.bytes();
+    let Some(prefix) = record::decode_prefix(bytes) else {
         return Ok(None);
     };
     let h = &prefix.header;
@@ -349,16 +360,33 @@ pub(crate) fn verify_at<F: BlockFile>(
     }))
 }
 
-/// Reads `len` bytes at `offset` within the segment at `base`, through an aligned buffer.
-/// `None` if the span runs past the end of the file.
-pub(crate) fn read_span<F: BlockFile>(
+/// Bytes read from the device into a pooled buffer, which returns to its pool when the span
+/// is dropped.
+pub(crate) struct Span<'p> {
+    buf: PoolBuf<'p>,
+    skip: usize,
+    len: usize,
+}
+
+impl Span<'_> {
+    pub fn bytes(&self) -> &[u8] {
+        self.buf
+            .as_slice()
+            .get(self.skip..self.skip.saturating_add(self.len))
+            .unwrap_or_default()
+    }
+}
+
+/// Reads `len` bytes at `offset` within the segment at `base`, through an aligned buffer
+/// from `pool`. `None` if the span runs past the end of the file.
+pub(crate) fn read_span<'p, F: BlockFile>(
     file: &F,
+    pool: &'p Pool,
     geometry: &Geometry,
     base: u64,
     offset: u64,
     len: u64,
-) -> Result<Option<Vec<u8>>, ChunkError> {
-    let align = file.alignment();
+) -> Result<Option<Span<'p>>, ChunkError> {
     let block = geometry.block;
     let start = base.checked_add(offset).ok_or(ChunkError::Full)?;
     let end = start.checked_add(len).ok_or(ChunkError::Full)?;
@@ -371,7 +399,7 @@ pub(crate) fn read_span<F: BlockFile>(
         .ok_or(ChunkError::Full)?;
     let span =
         usize::try_from(aligned_end.saturating_sub(aligned_start)).map_err(|_| ChunkError::Full)?;
-    let mut buf = AlignedBuf::zeroed(span, align).map_err(|e| ChunkError::Device(e.into()))?;
+    let mut buf = pool.take(span).map_err(|e| ChunkError::Device(e.into()))?;
     buf.set_len(span)
         .map_err(|e| ChunkError::Device(e.into()))?;
     match file.read_exact_at(buf.as_mut_slice(), aligned_start) {
@@ -380,9 +408,9 @@ pub(crate) fn read_span<F: BlockFile>(
         Err(e) => return Err(ChunkError::Device(e)),
     }
     let skip = usize::try_from(start.saturating_sub(aligned_start)).unwrap_or(0);
-    let take = usize::try_from(len).unwrap_or(0);
-    Ok(buf
-        .as_slice()
-        .get(skip..skip.saturating_add(take))
-        .map(<[u8]>::to_vec))
+    let len = usize::try_from(len).unwrap_or(0);
+    if skip.saturating_add(len) > span {
+        return Ok(None);
+    }
+    Ok(Some(Span { buf, skip, len }))
 }

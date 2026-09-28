@@ -37,6 +37,9 @@ pub struct Plan {
     pub large: usize,
     /// Durable small writes measured (each one write plus a full flush).
     pub durable_writes: u64,
+    /// Bytes of each durable sequential write: written, then flushed, one at a time. The
+    /// chunk store's largest group commit, so the rate is the ceiling for batched writes.
+    pub durable_large: usize,
 }
 
 impl Plan {
@@ -54,6 +57,7 @@ impl Plan {
             small,
             large: 1 << 20,
             durable_writes: 64,
+            durable_large: 32 << 20,
         }
     }
 }
@@ -78,6 +82,9 @@ pub struct Calibration {
     pub sequential_write: Vec<Point>,
     /// A small write followed by the platform's full flush, one at a time.
     pub durable_write: Point,
+    /// `durable_large` bytes written sequentially, then a full flush, one at a time.
+    pub durable_sequential: Point,
+    pub durable_large: usize,
     pub elapsed: Duration,
 }
 
@@ -189,6 +196,23 @@ pub fn calibrate(
         sync_each: true,
         seed: round,
     })?;
+    // No larger than the scratch file, and whole alignment units.
+    let durable_large = usize::try_from(span)
+        .map_or(plan.durable_large, |s| plan.durable_large.min(s))
+        .checked_div(plan.small)
+        .unwrap_or(0)
+        .saturating_mul(plan.small)
+        .max(plan.small);
+    let durable_sequential = median(&file, plan.rounds, |round| Job {
+        pattern: Pattern::SequentialWrite,
+        block: durable_large,
+        depth: 1,
+        span,
+        budget: plan.step.saturating_mul(4),
+        max_ops: u64::MAX,
+        sync_each: true,
+        seed: round,
+    })?;
 
     Ok(Calibration {
         caching: file.caching(),
@@ -198,6 +222,8 @@ pub fn calibrate(
         sequential_read,
         sequential_write,
         durable_write,
+        durable_sequential,
+        durable_large,
         elapsed: started.elapsed(),
     })
 }
@@ -265,11 +291,14 @@ mod tests {
             small: 4096,
             large: 1 << 20,
             durable_writes: 4,
+            durable_large: 2 << 20,
         };
         let c = calibrate(dir.path(), align, None, &plan).unwrap();
         assert_eq!(c.random_read.len(), 2);
         assert!(c.random_read.iter().all(|p| p.ops_per_sec > 0.0));
         assert!(c.durable_write.ops_per_sec > 0.0);
+        assert!(c.durable_sequential.bytes_per_sec > 0.0);
+        assert_eq!(c.durable_large, 2 << 20);
         let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
         assert!(leftovers.is_empty(), "scratch file left behind");
     }

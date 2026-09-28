@@ -117,11 +117,14 @@ pub fn encode(header: &RecordHeader, payload: &[u8], out: &mut Vec<u8>) -> Optio
     let padded = written.checked_next_multiple_of(RECORD_ALIGN)?;
     out.resize(start.saturating_add(padded), 0);
 
-    // The whole payload's CRC from the block CRCs, without a second pass over the bytes.
+    // The whole payload's CRC from the block CRCs, without a second pass over the bytes. Every
+    // block but the last is the same size, so one shift combines them all.
+    let full = mantle_crc::Crc32cShift::new(u64::try_from(size).ok()?);
     let mut whole: Option<u32> = None;
     for (c, block) in table.iter().zip(payload.chunks(size)) {
         whole = Some(match whole {
             None => *c,
+            Some(acc) if block.len() == size => full.combine(acc, *c),
             Some(acc) => mantle_crc::crc32c_combine(acc, *c, u64::try_from(block.len()).ok()?),
         });
     }

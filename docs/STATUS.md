@@ -38,7 +38,8 @@ roll-forward, and a checkpoint that makes recovery's corrections durable). Teste
 randomized workloads, cleaning included, cut by power loss at every point on the
 simulated device (20,000 runs per soak: no acknowledged write lost, no unverified byte
 returned) and with bit flips, read errors, damaged superblocks, damaged log frames and
-failed writes and flushes.
+failed writes and flushes. On real file systems (APFS, ext4 and tmpfs), a writing process
+killed with `kill -9` at random points loses no write it acknowledged.
 
 The scrubber verifies every live fragment in the background, paced so a pass takes the
 configured period (7 days by default) and continuous once damage is found; damaged
@@ -49,7 +50,6 @@ Remaining before it is done:
 - A grace period before deleted data is reclaimed.
 - Writing new file regions once before use where calibration measures a first-write penalty.
 - An I/O path that keeps the measured number of reads in flight.
-- The same crash workloads against real disks, with the process killed by `kill -9`.
 - Benchmarks of write and read throughput and latency against the raw-device numbers.
 
 ## Planned, in order

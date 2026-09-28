@@ -15,5 +15,7 @@
 
 pub mod checksum;
 pub mod chunked;
+pub mod conditional;
+pub mod range;
 pub mod route;
 pub mod sigv4;

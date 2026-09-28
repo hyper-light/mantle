@@ -40,6 +40,8 @@ pub struct Usage {
     pub sealed: u32,
     /// Bytes of records some chunk still references.
     pub live_bytes: u64,
+    /// Checkpoints written since the volume opened.
+    pub checkpoints: u64,
 }
 
 pub struct Volume<F: BlockFile + 'static> {
@@ -142,6 +144,7 @@ impl<F: BlockFile + 'static> Volume<F> {
             stopping: AtomicBool::new(false),
             dead_bytes: std::sync::atomic::AtomicU64::new(0),
             submitted: std::sync::atomic::AtomicU64::new(0),
+            checkpoints: std::sync::atomic::AtomicU64::new(0),
             usage: RwLock::new(recovered.segments.clone()),
         });
         let (sender, rx) = sync_channel(config.limits.queue.max(1));
@@ -374,6 +377,7 @@ impl<F: BlockFile + 'static> Volume<F> {
         let segments = self.shared.usage.read().map_err(|_| ChunkError::Fenced)?;
         let mut usage = Usage {
             segments: u32::try_from(segments.len()).unwrap_or(u32::MAX),
+            checkpoints: self.shared.checkpoints.load(Ordering::Relaxed),
             ..Usage::default()
         };
         for s in segments.iter() {

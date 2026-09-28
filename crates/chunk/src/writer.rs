@@ -44,7 +44,10 @@ use crate::frame::{
 };
 use crate::index::{Fragment, Index, Inserted, SegmentInfo};
 use crate::key::ChunkKey;
-use crate::layout::{CHECKPOINT_RECORDS_PER_FRAME, Config, Geometry};
+use crate::layout::{
+    CHECKPOINT_RECORDS_PER_FRAME, Config, Geometry, batch_frame_bytes, checkpoint_bytes,
+    largest_frame,
+};
 use crate::log::{self, Cursor};
 use crate::record::{self, FLAG_FINAL, Payload, RecordHeader, SegmentHeader, Sink};
 use crate::superblock::Superblock;
@@ -114,6 +117,8 @@ pub(crate) struct Shared<F> {
     pub dead_bytes: std::sync::atomic::AtomicU64,
     /// Requests submitted to the writer so far, counted just before each is sent.
     pub submitted: std::sync::atomic::AtomicU64,
+    /// Checkpoints written since the volume opened.
+    pub checkpoints: std::sync::atomic::AtomicU64,
     pub usage: RwLock<Vec<SegmentInfo>>,
 }
 
@@ -460,7 +465,7 @@ impl<F: BlockFile> Writer<F> {
         let (checkpoints, batch): (Vec<Request>, Vec<Request>) = batch
             .into_iter()
             .partition(|r| matches!(r.op, Op::Checkpoint));
-        if self.cursor.used > self.shared.geometry.log_size / 3
+        if self.checkpoint_due(batch.len())
             && let Err(e) = self.checkpoint()
         {
             self.fence();
@@ -493,6 +498,30 @@ impl<F: BlockFile> Writer<F> {
                 }
             }
         }
+    }
+
+    /// Whether the log must be checkpointed before a batch of `requests` requests: after the
+    /// live log, the batch's frame, then a wrap and a checkpoint of the index as the batch may
+    /// leave it must fit, or the log would fill with nothing able to free it. Waiting until then
+    /// leaves at least `3·C_max − 2·C` of frames between checkpoints of size `C` (the log's
+    /// sizing, layout.rs), so a checkpoint takes at most half the log's writes, at the full
+    /// budget, and far less below it; and replay never exceeds one log (docs/research/11 §9.3).
+    fn checkpoint_due(&self, requests: usize) -> bool {
+        let geometry = &self.shared.geometry;
+        let reserve = || {
+            let checkpoint = checkpoint_bytes(
+                self.fragments.checked_add(u64::try_from(requests).ok()?)?,
+                u64::from(geometry.segments),
+                geometry.block,
+            )?;
+            let batch = batch_frame_bytes(self.config.limits.batch_requests, geometry.block)?;
+            let wrap = largest_frame(&self.config, geometry.block)?;
+            checkpoint
+                .checked_add(batch)?
+                .checked_add(wrap)?
+                .checked_add(self.cursor.used)
+        };
+        reserve().is_none_or(|need| need > geometry.log_size)
     }
 
     /// Validates and commits the batch's writes, deletes and relocations.
@@ -1139,6 +1168,7 @@ impl<F: BlockFile> Writer<F> {
         self.cursor.start_pos = begin_pos;
         self.cursor.start_lsn = begin_lsn;
         self.cursor.used = distance(begin_pos, self.cursor.pos, self.shared.geometry.log_size);
+        self.shared.checkpoints.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 }

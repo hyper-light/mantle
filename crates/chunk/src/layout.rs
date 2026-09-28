@@ -123,15 +123,18 @@ impl Geometry {
         let segments_upper = size.checked_div(config.segment_size).unwrap_or(0);
         let checkpoint = checkpoint_bytes(config.max_fragments, segments_upper, block)
             .ok_or_else(|| bad("fragment budget too large"))?;
-        // Headroom for the largest frames written between checkpoints: one batch frame, and a
-        // wrap that skips at most one frame's worth at the end of the region.
+        // Three checkpoints of the full budget, one batch frame, and the wraps before two
+        // checkpoints: the one being written and the one before it, whose skipped tail stays
+        // in the live log until the next. With it, a full index leaves a checkpoint's worth of
+        // frames between checkpoints (docs/design/chunk-store.md §5).
         let batch_frame = batch_frame_bytes(config.limits.batch_requests, block)
             .ok_or_else(|| bad("batch limit too large"))?;
-        let checkpoint_frame = checkpoint_frame_bytes(config.max_fragments, block)
-            .ok_or_else(|| bad("fragment budget too large"))?;
+        let largest = largest_frame(config, block)
+            .ok_or_else(|| bad("batch limit or fragment budget too large"))?;
         let log_size = checkpoint
             .checked_mul(3)
-            .and_then(|c| c.checked_add(batch_frame.max(checkpoint_frame).saturating_mul(2)))
+            .and_then(|c| c.checked_add(batch_frame))
+            .and_then(|c| c.checked_add(largest.checked_mul(2)?))
             .map(|c| c.max(min_log))
             .and_then(|c| c.checked_next_multiple_of(block))
             .ok_or_else(|| bad("log too large"))?;
@@ -180,6 +183,14 @@ pub fn batch_frame_bytes(requests: usize, block: u64) -> Option<u64> {
     (FRAME_HEADER as u64)
         .checked_add(payload)?
         .checked_next_multiple_of(block)
+}
+
+/// The largest frame the log holds, and so the most a wrap skips at the end of the log region:
+/// a wrap happens when the next frame does not fit in what remains.
+pub fn largest_frame(config: &Config, block: u64) -> Option<u64> {
+    let batch = batch_frame_bytes(config.limits.batch_requests, block)?;
+    let checkpoint = checkpoint_frame_bytes(config.max_fragments, block)?;
+    Some(batch.max(checkpoint))
 }
 
 /// Bytes of the largest checkpoint frame.

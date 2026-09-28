@@ -13,7 +13,8 @@ mod common;
 use std::sync::Arc;
 
 use common::{SIZE, config, data, key, sim};
-use mantle_chunk::{ChunkError, Volume};
+use mantle_chunk::layout::{Geometry, batch_frame_bytes, checkpoint_bytes, largest_frame};
+use mantle_chunk::{ChunkError, Config, Volume};
 use mantle_disk::buf::Alignment;
 use mantle_disk::file::{CachingRequest, DeviceFile};
 
@@ -169,6 +170,52 @@ fn appending_nothing_writes_nothing_and_survives_checkpoints() {
     let (v, _) = Volume::open(Arc::clone(&file), config()).unwrap();
     assert_eq!(v.read(&k, 0, 6).unwrap(), b"abcdef");
     assert!(v.stat(&k).unwrap().unwrap().sealed);
+}
+
+/// A checkpoint comes only when the log could not otherwise hold the next batch and another
+/// checkpoint, so consecutive checkpoints of size `C` are at least `L − 2C − b − 2w` of log
+/// apart, `b` a batch frame and `w` a wrap before each checkpoint. The trigger it replaces, a
+/// third of the log counting the checkpoint itself, came ever sooner as the index filled: 16
+/// checkpoints here where this allows 12 (docs/research/11 §9.1).
+#[test]
+fn checkpoints_come_only_when_the_log_needs_the_room() {
+    let config = Config {
+        max_fragments: 5000,
+        ..config()
+    };
+    let size = 64 << 20;
+    let geometry = Geometry::plan(size, Alignment::new(4096).unwrap(), &config).unwrap();
+    let v = Volume::format(sim(9), size, config).unwrap();
+    let chunks = 4500u64;
+    std::thread::scope(|s| {
+        for t in 0..8 {
+            let v = &v;
+            s.spawn(move || {
+                for n in (t..chunks).step_by(8) {
+                    v.put(key(n), &data(n, 16)).unwrap();
+                }
+            });
+        }
+    });
+    let before = v.usage().unwrap().checkpoints;
+    // Replacing chunks keeps the index its size; each delete and put is its own batch and a
+    // one-block frame.
+    let frames = 1200u64;
+    for n in 0..frames / 2 {
+        v.delete(key(n)).unwrap();
+        v.put(key(n), &data(n + 7, 16)).unwrap();
+    }
+    let checkpoints = v.usage().unwrap().checkpoints - before;
+    let block = geometry.block;
+    let checkpoint = checkpoint_bytes(chunks + 1, u64::from(geometry.segments), block).unwrap();
+    let batch = batch_frame_bytes(config.limits.batch_requests, block).unwrap();
+    let wrap = largest_frame(&config, block).unwrap();
+    let room = geometry.log_size - 2 * checkpoint - batch - 2 * wrap;
+    let bound = (frames * block).div_ceil(room) + 1;
+    assert!(
+        (1..=bound).contains(&checkpoints),
+        "{checkpoints} checkpoints in {frames} frames; the rule allows 1 to {bound}"
+    );
 }
 
 #[test]

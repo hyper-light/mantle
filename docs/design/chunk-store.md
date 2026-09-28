@@ -1,7 +1,8 @@
 # Chunk store: how mantle writes bytes to a device
 
 Status: design, 2026-09-28. Sources: docs/research/03 (cited by its keys, e.g. [RO92]),
-docs/research/01 (Tectonic, Haystack, Ambry), docs/measurements.
+docs/research/01 (Tectonic, Haystack, Ambry), docs/research/11 (models for the operating
+parameters, cited as "research/11 §x"), docs/measurements.
 
 A chunk is the unit one device stores: one replica or one erasure-coded shard of a
 block. The chunk store owns a device and keeps chunks durably, verifies them on every
@@ -157,12 +158,23 @@ whole chunk; a bounded list for an appended one) and is held in memory, as Hayst
 its needle index [HAY §3.4]. Its size is bounded by the volume's chunk budget; a put past
 the budget is refused with `Full`, never an allocation failure.
 
-Recovery must not scan the device [HAY §3.5: the index file]. Periodically, once the log
-since the last checkpoint exceeds the checkpoint's own size, the loop writes the whole
+Recovery must not scan the device [HAY §3.5: the index file]. The loop writes the whole
 index into the log as a checkpoint, then records it in the superblock (alternating A/B);
-log space before the checkpoint is then free. `L` holds three checkpoints of the full
-budget, so a checkpoint can always be written while the previous one and the frames
-after it are still needed.
+log space before the checkpoint is then free. It checkpoints when the log could not
+otherwise hold more: before a batch, if the live log, the batch's frame, a wrap and a
+checkpoint of the index as the batch may leave it would not fit in `L`.
+
+`L` holds three checkpoints of the full budget `C_max`, one batch frame, and the wraps
+before two checkpoints, the one being written and the one before it, whose skipped tail
+stays live until the next (a wrap skips less than the largest frame). So a checkpoint of
+size `C` follows at least `3·C_max − 2·C` bytes of other frames: checkpoints take at most
+half the log's writes, at the full budget, and far less below it, which is Raft's rule of
+snapshotting at a log size well above the snapshot's [research/11 §9.2: RAFTX §7]; and
+replay reads at most one log. The trigger as first built, a third of `L` counting the
+checkpoint itself, rewrote a full 320 MB index after every ~2.8 MB of frames
+[research/11 §9.1]. A bound on recovery time, checkpointing once replay would exceed a
+stated budget as Oracle's Fast-Start does [research/11 §9.2: LAH01 §3.1], waits for an
+availability target to set the budget from.
 
 ## 6. Recovery
 

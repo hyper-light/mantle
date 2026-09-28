@@ -1,19 +1,19 @@
 # mantle logo
 
-The mark is the one the Hyperlight site draws for mantle
-(`hyperlight-site/components/project-mark.tsx`), geometry unchanged: a planet of radius 12
-on a 32-unit grid, its strata curving across the face at 60% opacity, and two concentric
-arcs where the interior shows through. Strokes are 1.4 units with round caps and joins.
+The mark is the globe the Hyperlight site draws for mantle
+(`hyperlight-site/components/studies/mantle.tsx`): a sphere of engraved stone, tilted a
+quarter turn, with a wedge cut away to show thirty-four strata lit in a soft spectrum
+around a stone core. On the site it turns slowly; here it is the first frame, the pose
+the site renders before its animation starts.
 
-- `mantle-planet.svg` is the monochrome master; `mantle-planet-light.svg` and
-  `mantle-planet-dark.svg` are the same paths stroked in `#1f2328` and `#f0f6fc`. The
-  README displays these directly at 90 × 90.
-- `mantle-planet-transparent.png` is a 1080 × 1080 export of the master.
-- `mantle-planet-preview.png` shows both themes at 256, 90 and 28 pixels.
+- `render-globe.py` ports the component's geometry, gradients, masks and lighting to
+  Python and writes `mantle-globe.svg`. Regenerate it after the site's artwork changes:
+  `python3 render-globe.py > mantle-globe.svg`.
+- `mantle-globe.svg` is what the README shows. Its stone and strata carry their own
+  colors, so the one file reads on light and dark themes alike.
+- `mantle-globe-transparent.png` is a 1080-pixel-wide export:
+  `rsvg-convert -w 1080 mantle-globe.svg -o mantle-globe-transparent.png`.
+- `mantle-globe-preview.png` shows it on both themes at 256, 160 and 48 pixels.
 
-The files hold only vector paths: no bitmaps, filters, fonts, scripts or external
-resources. Reproduce the exports from this directory with:
-
-```sh
-rsvg-convert -w 1080 -h 1080 mantle-planet.svg -o mantle-planet-transparent.png
-```
+The SVG holds only vector paths, gradients, masks and clip paths: no bitmaps, filters,
+fonts, scripts or external resources.

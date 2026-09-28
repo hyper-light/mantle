@@ -1,10 +1,6 @@
 <p align="center">
-  <a href="docs/assets/brand/mantle-planet-preview.png">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="docs/assets/brand/mantle-planet-dark.svg">
-      <source media="(prefers-color-scheme: light)" srcset="docs/assets/brand/mantle-planet-light.svg">
-      <img src="docs/assets/brand/mantle-planet-light.svg" alt="Mantle logo: a planet with its strata curving across its face and two arcs of its inner layers exposed" width="90" height="90">
-    </picture>
+  <a href="docs/assets/brand/mantle-globe-preview.png">
+    <img src="docs/assets/brand/mantle-globe.svg" alt="Mantle logo: a globe of engraved stone with a wedge cut away, showing layered strata lit in a soft spectrum around a stone core" width="180">
   </a>
 </p>
 

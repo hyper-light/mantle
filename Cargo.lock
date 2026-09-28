@@ -249,6 +249,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mantle-chunk"
+version = "0.1.0"
+dependencies = [
+ "mantle-crc",
+ "mantle-disk",
+ "proptest",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "mantle-crc"
 version = "0.1.0"
 dependencies = [

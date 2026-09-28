@@ -1,0 +1,6 @@
+[toolchain]
+# An exact version, not "stable": the gates (`clippy -D warnings`) must mean the same thing on
+# every laptop and CI runner. Bump here and in .github/workflows/ in one commit.
+channel = "1.98.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

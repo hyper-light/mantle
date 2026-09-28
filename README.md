@@ -24,22 +24,26 @@ conditional writes: `If-None-Match: *` creates an object only if its key is unus
 checksummed with CRC-32C when it is received and verified again whenever it is read; a
 chunk that fails verification is served from another copy and repaired.
 
-The design follows Meta's Tectonic file system. Storage nodes own their disks and store
-chunks, a metadata service replicated with Raft records where every chunk is, and clients
-write chunks directly to the storage nodes. [How it works](#how-it-works) follows a write
-and a read through these parts.
+Mantle combines two published designs. From AWS it takes cells: a deployment is divided
+into cells, each a complete cluster with its own disks, its own metadata and its own repair
+work, and each owning a share of the keys. A failure, a bad upgrade or a surge of requests
+stays inside the cell where it happens, and a deployment grows by adding cells. From Meta's
+Tectonic file system it takes the design of each cell: storage nodes own their disks and
+store chunks, a metadata service replicated with Raft records where every chunk is, and
+clients write chunks directly to the storage nodes. [How it works](#how-it-works) follows
+a request from the S3 endpoint to a disk and back.
 
 > [!IMPORTANT]
 > Mantle has no release yet. The storage-device layer is implemented and tested on Linux,
 > macOS and Windows, on x86_64 and arm64: device identification, direct I/O with the
 > correct flush call for each platform, device measurement, and CRC-32C and CRC-64/NVME
 > checksums. The chunk store's write path, verified reads, cleaning, scrubbing and crash
-> recovery are implemented and tested. Erasure coding, the metadata service
-> and the S3 gateway follow. The gateway will implement the S3 API that standard clients use:
-> multipart uploads, including resuming an interrupted upload, PUT, GET with byte ranges,
-> HEAD, DELETE and batch delete, copy, ListObjects and ListObjectsV2, versioning,
-> conditional requests, checksums and presigned URLs. [docs/STATUS.md](docs/STATUS.md)
-> tracks each component.
+> recovery are implemented and tested. Erasure coding, the metadata service, the S3 gateway
+> and the division into cells follow. The gateway will implement the S3 API that standard
+> clients use: multipart uploads, including resuming an interrupted upload, PUT, GET with
+> byte ranges, HEAD, DELETE and batch delete, copy, ListObjects and ListObjectsV2,
+> versioning, conditional requests, checksums and presigned URLs.
+> [docs/STATUS.md](docs/STATUS.md) tracks each component.
 
 ## Install
 
@@ -94,13 +98,21 @@ writes into one flush keeps that cost from limiting how many writes complete per
 This section describes the design. [docs/STATUS.md](docs/STATUS.md) lists which parts
 are implemented.
 
-**Writing an object.** The S3 gateway authenticates the request and passes the data to
-mantle's client library. An object smaller than a block is appended to a shared block
-that is replicated on three storage nodes and re-encoded with erasure coding once the
-block is full. A larger object is split into blocks, and each block is erasure-coded into
-chunks that go to disks in different racks. The metadata service chooses where each chunk
-goes. The object's name is committed only after every chunk is durable, so a failed
-upload never leaves a partial object visible.
+**Finding the cell.** Each bucket's keys are divided into ranges of consecutive names, and
+every range belongs to one cell. A small cell map, replicated with Raft, records which cell
+owns each range. The S3 gateway authenticates a request, looks up the owner in its copy of
+the map and sends the request straight to that cell. If the range has moved since the
+gateway's copy was made, the old owner replies with the new one and the gateway retries
+there. Gateways keep routing from their copies while the cell map itself is unavailable,
+so reads and writes continue during its repair.
+
+**Writing an object.** Inside the cell, mantle's client library writes the data. An object
+smaller than a block is appended to a shared block that is replicated on three storage
+nodes and re-encoded with erasure coding once the block is full. A larger object is split
+into blocks, and each block is erasure-coded into chunks that go to disks in different
+racks. The cell's metadata service chooses where each chunk goes. The object's name is
+committed only after every chunk is durable, so a failed upload never leaves a partial
+object visible.
 
 **Storing a chunk.** Each disk holds one volume, a large file or a raw block device
 opened with direct I/O and written sequentially in fixed-size segments. One writer loop
@@ -118,15 +130,23 @@ misdirected writes, and writes the drive acknowledged but did not persist. A chu
 fails verification is read from another copy and rebuilt. Every disk is also scrubbed in
 the background at least every two weeks.
 
-**Finding objects.** Object names are kept in sorted order and divided into ranges, each
-replicated with Raft. A range splits when it grows large or receives more requests, which
-is also how S3 scales request rates per key prefix. Chunk locations are stored separately
-from names, so repairing a disk changes locations without rewriting names.
+**Listing objects.** A cell keeps the names in each of its ranges in sorted order,
+replicated with Raft, so a listing walks the ranges in key order and returns names the
+way S3 does. A range splits when it grows large or receives many requests, which is also
+how S3 scales request rates per key prefix. Chunk locations are stored separately from
+names, so repairing a disk changes locations without rewriting names.
 
-**Recovering from failures.** When a disk or machine fails, the blocks with the fewest
-surviving chunks are rebuilt first, from their remaining chunks, onto other disks. Space
-held by deleted data is reclaimed by copying the live records out of mostly empty
-segments and reusing the segments.
+**Recovering from failures.** When a disk or machine fails, its cell rebuilds the blocks
+with the fewest surviving chunks first, from their remaining chunks, onto the cell's other
+disks. Space held by deleted data is reclaimed by copying the live records out of mostly
+empty segments and reusing the segments.
+
+**Growing and shrinking.** A new cell starts empty, and new buckets go to the cells with
+the most room. To relieve a busy cell, or to empty one before retiring it, mantle moves
+ranges out of it. The new owner copies a range's objects while the old owner keeps serving
+them; writes to the range then pause briefly while the last changes are copied, and the
+cell map switches to the new owner. Every cell has a maximum size at which it is tested,
+so when a deployment needs more space or throughput, it adds cells.
 
 The design documents are in [docs/design/](docs/design/), starting with the
 [chunk store](docs/design/chunk-store.md). The papers and platform documentation they
@@ -134,9 +154,11 @@ cite are summarized in [docs/research/](docs/research/).
 
 ## From a laptop to a fleet
 
-The S3 API is the same at every scale. You configure how many failures a write must
-tolerate, and mantle places data to meet that requirement, or reports that the available
-hardware cannot.
+The S3 API is the same at every scale. A laptop runs one cell in one process. A fleet runs
+many cells behind the same endpoint, and each cell spreads its chunks across the disks,
+racks and zones it has. You configure how many failures a write must tolerate, and mantle
+places data in every cell to meet that requirement, or reports that the available hardware
+cannot.
 
 | Deployment | A write completes when | Tolerates |
 |---|---|---|
@@ -174,11 +196,13 @@ reference the measurement that supports them.
 
 ## Acknowledgements
 
-The architecture follows Tectonic (Pan et al., USENIX FAST 2021). The storage layer draws
-on Haystack and f4 for storing many objects in a few large files, on the log-structured
-file system of Rosenblum and Ousterhout for reclaiming space in them, and on Ceph's
-BlueStore for managing disks directly instead of through a local file system. The
-consensus core comes from [focal](https://github.com/hyper-light/focal), and the
+Each cell follows Tectonic (Pan et al., USENIX FAST 2021). The division into cells follows
+AWS's cell-based architecture and Physalia (Brooker, Chen and Ping, USENIX NSDI 2020),
+which runs a separate small database for each partition of its data. The storage layer
+draws on Haystack and f4 for storing many objects in a few large files, on the
+log-structured file system of Rosenblum and Ousterhout for reclaiming space in them, and
+on Ceph's BlueStore for managing disks directly instead of through a local file system.
+The consensus core comes from [focal](https://github.com/hyper-light/focal), and the
 engineering rules from focal and [slates](https://github.com/hyper-light/slates).
 
 ## License

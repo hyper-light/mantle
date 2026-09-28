@@ -72,3 +72,8 @@ Remaining before it is done:
    remaining redundancy, rebalancing, and retiring disks that start to fail. Done when
    tests that fail disks, machines and racks during writes show that every acknowledged
    write can still be read back.
+5. **Cells.** A replicated map of which cell owns each key range, routing from cached
+   copies of it with redirects after a range moves, moving a range between cells while it
+   is read and written, and adding and retiring cells. Done when ranges move between cells
+   under a mixed workload with no lost write and no stale read, and failing or upgrading
+   one cell leaves the requests of every other cell unaffected.

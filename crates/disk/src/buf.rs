@@ -237,6 +237,26 @@ impl AlignedBuf {
         Ok(())
     }
 
+    /// Appends `n` zero bytes.
+    pub fn extend_zeros(&mut self, n: usize) -> Result<(), BufError> {
+        let available = self.remaining();
+        if n > available {
+            return Err(BufError::Full {
+                requested: n,
+                available,
+            });
+        }
+        let from = self.start.saturating_add(self.len);
+        let to = from.saturating_add(n);
+        let dst = self.storage.get_mut(from..to).ok_or(BufError::Full {
+            requested: n,
+            available,
+        })?;
+        dst.fill(0);
+        self.len = self.len.saturating_add(n);
+        Ok(())
+    }
+
     fn window(&self, len: usize) -> &[u8] {
         self.storage
             .get(self.start..self.start.saturating_add(len))

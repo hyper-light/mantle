@@ -52,4 +52,15 @@ pub enum ChunkError {
     CorruptLog { lsn: u64 },
     #[error("invalid configuration: {0}")]
     Config(String),
+    /// The bytes submitted do not match the CRC-32C their sender computed: they changed on
+    /// the way, and nothing was written.
+    #[error("chunk {key}: data has CRC-32C {actual:#010x}, sender computed {expected:#010x}")]
+    Checksum {
+        key: ChunkKey,
+        expected: u32,
+        actual: u32,
+    },
+    /// The writer's own bookkeeping disagreed with itself; the volume is fenced.
+    #[error("internal inconsistency: {0}")]
+    Internal(&'static str),
 }

@@ -21,7 +21,7 @@ use crate::frame::SegmentState;
 use crate::index::Fragment;
 use crate::key::ChunkKey;
 use crate::read;
-use crate::record::FLAG_FINAL;
+use crate::record::{FLAG_FINAL, Payload};
 use crate::writer::{Move, Op, Request, Shared};
 
 /// How often the cleaner checks free space without being woken.
@@ -219,10 +219,12 @@ impl<F: BlockFile> Cleaner<F> {
                 Err(e) => return Err(e),
             }
             bytes = bytes.saturating_add(data.len());
+            let payload = Payload::new(data, self.shared.checksum_shift)
+                .ok_or_else(|| ChunkError::Config("checksum block size".into()))?;
             moves.push(Move {
                 key,
                 from,
-                data,
+                payload,
                 flags,
                 time_ns,
             });

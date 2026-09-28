@@ -46,7 +46,7 @@ use crate::index::{Fragment, Index, Inserted, SegmentInfo};
 use crate::key::ChunkKey;
 use crate::layout::{CHECKPOINT_RECORDS_PER_FRAME, Config, Geometry};
 use crate::log::{self, Cursor};
-use crate::record::{self, FLAG_FINAL, RecordHeader, SegmentHeader};
+use crate::record::{self, FLAG_FINAL, Payload, RecordHeader, SegmentHeader, Sink};
 use crate::superblock::Superblock;
 
 /// Free segments kept back from new writes so the cleaner can always relocate into one
@@ -67,7 +67,7 @@ pub(crate) enum Op {
     Write {
         key: ChunkKey,
         offset: u64,
-        data: Vec<u8>,
+        payload: Payload,
         seal: bool,
     },
     Delete {
@@ -87,7 +87,7 @@ pub(crate) enum Op {
 pub(crate) struct Move {
     pub key: ChunkKey,
     pub from: Fragment,
-    pub data: Vec<u8>,
+    pub payload: Payload,
     pub flags: u8,
     pub time_ns: u64,
 }
@@ -192,12 +192,26 @@ struct Accepted {
     decision: Decision,
 }
 
-/// Bytes being laid into one segment in this batch.
+/// One contiguous run of one segment written by this batch: where it starts and ends, and
+/// what goes in it, in order. It is encoded only once the whole batch is placed, straight
+/// into one aligned buffer of exactly its size.
 struct Region {
     segment: u32,
     /// Where the region starts in the segment, block-aligned.
     start: u64,
-    bytes: Vec<u8>,
+    /// Where its last record ends.
+    end: u64,
+    parts: Vec<Part>,
+}
+
+enum Part {
+    /// A newly opened segment's first block.
+    Segment(SegmentHeader),
+    /// A data record; `payload` indexes the batch's payloads.
+    Record {
+        header: RecordHeader,
+        payload: usize,
+    },
 }
 
 /// One batch's placement of records into segments.
@@ -281,7 +295,8 @@ impl Layout {
         self.regions.push(Region {
             segment: next,
             start: 0,
-            bytes: header.encode(self.geometry.block_usize()),
+            end: block,
+            parts: vec![Part::Segment(header)],
         });
         self.positions.insert(next, block);
         self.opened.push((next, self.incarnation));
@@ -291,31 +306,27 @@ impl Layout {
         Some((next, block))
     }
 
-    /// Encodes a record at `at` in `segment` and advances the segment's position.
-    fn append(
-        &mut self,
-        segment: u32,
-        at: u64,
-        header: &RecordHeader,
-        data: &[u8],
-    ) -> Option<(u32, u64)> {
-        let region = match self.regions.iter().rposition(|r| r.segment == segment) {
-            Some(i) => i,
+    /// Stages a record of `len` bytes at `at` in `segment` and advances the segment's
+    /// position.
+    fn stage(&mut self, segment: u32, at: u64, len: u64, header: RecordHeader, payload: usize) {
+        let region = match self.regions.iter_mut().rev().find(|r| r.segment == segment) {
+            Some(region) => region,
             None => {
                 self.regions.push(Region {
                     segment,
                     start: at,
-                    bytes: Vec::new(),
+                    end: at,
+                    parts: Vec::new(),
                 });
-                self.regions.len().checked_sub(1)?
+                match self.regions.last_mut() {
+                    Some(region) => region,
+                    None => return,
+                }
             }
         };
-        let region = self.regions.get_mut(region)?;
-        let before = region.bytes.len();
-        let crc = record::encode(header, data, &mut region.bytes)?;
-        let len = u64::try_from(region.bytes.len().saturating_sub(before)).ok()?;
-        self.positions.insert(segment, at.saturating_add(len));
-        Some((crc, len))
+        region.parts.push(Part::Record { header, payload });
+        region.end = at.saturating_add(len);
+        self.positions.insert(segment, region.end);
     }
 }
 
@@ -534,19 +545,19 @@ impl<F: BlockFile> Writer<F> {
                 Op::Write {
                     key,
                     offset,
-                    data,
+                    payload,
                     seal,
                 } => {
                     // Appending nothing without sealing writes nothing. A zero-length fragment
                     // may only end a chunk: fragments are found by their starting offset, which
                     // must be unique.
-                    if data.is_empty() && !*seal {
+                    if payload.data.is_empty() && !*seal {
                         reply(request, Ok(()));
                         continue;
                     }
                     let view = view_of(&mut views, key);
-                    let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
-                    let crc = mantle_crc::crc32c(data);
+                    let len = u64::try_from(payload.data.len()).unwrap_or(u64::MAX);
+                    let crc = payload.crc;
                     let existing = index
                         .get(key)
                         .and_then(|e| e.fragment_at(*offset))
@@ -636,9 +647,7 @@ impl<F: BlockFile> Writer<F> {
                             let untouched = views
                                 .get(&m.key)
                                 .is_none_or(|v| v.as_ref().is_some_and(|v| !v.touched));
-                            now == Some(&m.from)
-                                && untouched
-                                && mantle_crc::crc32c(&m.data) == m.from.payload_crc
+                            now == Some(&m.from) && untouched && m.payload.crc == m.from.payload_crc
                         })
                         .map(|(i, _)| i)
                         .collect();
@@ -763,6 +772,7 @@ impl<F: BlockFile> Writer<F> {
         let mut layout = self.layout(accepted.len());
         let mut sequence = self.sequence;
         let mut ok: Vec<Reply> = Vec::with_capacity(accepted.len());
+        let mut payloads: Vec<Payload> = Vec::with_capacity(accepted.len());
         let shift = self.shared.checksum_shift;
         for Accepted { request, decision } in accepted {
             let Request { op, reply: tx } = request;
@@ -771,15 +781,24 @@ impl<F: BlockFile> Writer<F> {
                     Op::Write {
                         key,
                         offset,
-                        data,
+                        payload,
                         seal,
                     },
                     Decision::Write(crc),
                 ) => {
                     sequence = sequence.saturating_add(1);
                     let flags = if seal { FLAG_FINAL } else { 0 };
-                    let put = (key, offset, &data, flags, sequence, layout.now, crc);
-                    match place_record(&mut layout, Stream::Client, shift, put) {
+                    let put = Put {
+                        key,
+                        chunk_offset: offset,
+                        flags,
+                        sequence,
+                        time_ns: layout.now,
+                        crc,
+                    };
+                    payloads.push(payload);
+                    let index = payloads.len().saturating_sub(1);
+                    match place_record(&mut layout, Stream::Client, shift, &put, &payloads, index) {
                         Ok(record) => {
                             layout.records.push(LogRecord::Put(record));
                             ok.push(tx);
@@ -789,17 +808,28 @@ impl<F: BlockFile> Writer<F> {
                 }
                 (Op::Relocate { moves }, Decision::Relocate(current)) => {
                     let mut result = Ok(());
-                    for m in current.iter().filter_map(|&i| moves.get(i)) {
-                        let put = (
-                            m.key,
-                            m.from.chunk_offset,
-                            &m.data,
-                            m.flags,
-                            m.from.sequence,
-                            m.time_ns,
-                            m.from.payload_crc,
-                        );
-                        match place_record(&mut layout, Stream::Clean, shift, put) {
+                    for (i, m) in moves.into_iter().enumerate() {
+                        if !current.contains(&i) {
+                            continue;
+                        }
+                        let put = Put {
+                            key: m.key,
+                            chunk_offset: m.from.chunk_offset,
+                            flags: m.flags,
+                            sequence: m.from.sequence,
+                            time_ns: m.time_ns,
+                            crc: m.from.payload_crc,
+                        };
+                        payloads.push(m.payload);
+                        let index = payloads.len().saturating_sub(1);
+                        match place_record(
+                            &mut layout,
+                            Stream::Clean,
+                            shift,
+                            &put,
+                            &payloads,
+                            index,
+                        ) {
                             Ok(record) => layout.records.push(LogRecord::Put(record)),
                             Err(e) => {
                                 result = Err(e);
@@ -830,7 +860,7 @@ impl<F: BlockFile> Writer<F> {
 
         let result = self
             .reserve(sequence, layout.incarnation)
-            .and_then(|()| self.write_batch(&mut layout))
+            .and_then(|()| self.write_batch(&layout, &payloads))
             .and_then(|()| self.publish(&layout));
         match result {
             Err(e) => {
@@ -873,21 +903,37 @@ impl<F: BlockFile> Writer<F> {
         Ok(())
     }
 
-    fn write_batch(&mut self, layout: &mut Layout) -> Result<(), ChunkError> {
+    /// Encodes each region straight into an aligned buffer of its size, writes it, appends
+    /// the batch's index frame and flushes once.
+    fn write_batch(&mut self, layout: &Layout, payloads: &[Payload]) -> Result<(), ChunkError> {
         let started = std::time::Instant::now();
         let geometry = self.shared.geometry;
-        for region in &mut layout.regions {
-            let padded = region
-                .bytes
-                .len()
-                .checked_next_multiple_of(geometry.block_usize())
+        let block = geometry.block_usize();
+        for region in &layout.regions {
+            let len = usize::try_from(region.end.saturating_sub(region.start))
+                .map_err(|_| ChunkError::Full)?;
+            let padded = len
+                .checked_next_multiple_of(block)
                 .ok_or(ChunkError::Full)?;
-            region.bytes.resize(padded, 0);
             let mut buf = self
                 .pool
                 .take(padded)
                 .map_err(|e| ChunkError::Device(e.into()))?;
-            buf.extend_from_slice(&region.bytes)
+            for part in &region.parts {
+                let encoded = match part {
+                    Part::Segment(header) => (*buf).put(&header.encode(block)),
+                    Part::Record { header, payload } => payloads
+                        .get(*payload)
+                        .and_then(|p| record::encode(header, &p.table, &p.data, &mut *buf)),
+                };
+                encoded.ok_or(ChunkError::Internal("a record did not encode as placed"))?;
+            }
+            if buf.len() != len {
+                return Err(ChunkError::Internal(
+                    "a region's records did not fill it as placed",
+                ));
+            }
+            buf.extend_zeros(padded.saturating_sub(len))
                 .map_err(|e| ChunkError::Device(e.into()))?;
             let at = geometry
                 .segment_offset(region.segment)
@@ -1015,9 +1061,9 @@ impl<F: BlockFile> Writer<F> {
         for region in &layout.regions {
             if let Some(info) = slot(&mut self.segments, region.segment) {
                 let end = region
-                    .start
-                    .saturating_add(u64::try_from(region.bytes.len()).unwrap_or(0));
-                let end = end.checked_next_multiple_of(block).unwrap_or(end);
+                    .end
+                    .checked_next_multiple_of(block)
+                    .unwrap_or(region.end);
                 info.write_pos = u32::try_from(end).unwrap_or(u32::MAX).max(info.write_pos);
             }
         }
@@ -1097,55 +1143,61 @@ impl<F: BlockFile> Writer<F> {
     }
 }
 
-/// Places a record for `put` = (key, chunk offset, payload, flags, sequence, time, CRC) in
-/// `stream` and returns its Put record.
+/// What a record says about the fragment it holds, apart from its placement.
+struct Put {
+    key: ChunkKey,
+    chunk_offset: u64,
+    flags: u8,
+    sequence: u64,
+    time_ns: u64,
+    crc: u32,
+}
+
+/// Places the record for `put`, whose payload is `payloads[payload]`, in `stream` and
+/// returns its Put record. The record is encoded when the batch is written.
 fn place_record(
     layout: &mut Layout,
     stream: Stream,
     shift: u8,
-    put: (ChunkKey, u64, &Vec<u8>, u8, u64, u64, u32),
+    put: &Put,
+    payloads: &[Payload],
+    payload: usize,
 ) -> Result<PutRecord, ChunkError> {
-    let (key, chunk_offset, data, flags, sequence, time_ns, crc) = put;
-    let payload_len = u32::try_from(data.len()).map_err(|_| ChunkError::Full)?;
+    let data_len = payloads
+        .get(payload)
+        .map(|p| p.data.len())
+        .ok_or(ChunkError::Internal("a payload went missing"))?;
+    let payload_len = u32::try_from(data_len).map_err(|_| ChunkError::Full)?;
     let len = record::record_len(payload_len, shift)
         .and_then(|l| u64::try_from(l).ok())
         .ok_or(ChunkError::Full)?;
     let (segment, at) = layout.place(stream, len).ok_or(ChunkError::Full)?;
     let header = RecordHeader {
-        flags,
+        flags: put.flags,
         checksum_shift: shift,
         volume: layout.volume,
         segment,
         incarnation: layout.incarnation_of(segment),
-        sequence,
-        key,
-        chunk_offset,
+        sequence: put.sequence,
+        key: put.key,
+        chunk_offset: put.chunk_offset,
         payload_len,
-        time_ns,
+        time_ns: put.time_ns,
     };
-    let (written_crc, written_len) = layout
-        .append(segment, at, &header, data)
-        .ok_or(ChunkError::Full)?;
-    if written_crc != crc {
-        // The bytes changed between validation and encoding: memory corruption. The record is
-        // laid out but no index record names it, so its bytes are dead space.
-        return Err(ChunkError::Corrupt {
-            key,
-            detail: "payload changed in memory before it was written".into(),
-        });
-    }
+    let incarnation = header.incarnation;
+    layout.stage(segment, at, len, header, payload);
     Ok(PutRecord {
-        key,
+        key: put.key,
         segment,
-        incarnation: header.incarnation,
+        incarnation,
         offset: u32::try_from(at).map_err(|_| ChunkError::Full)?,
-        record_len: u32::try_from(written_len).map_err(|_| ChunkError::Full)?,
-        chunk_offset,
+        record_len: u32::try_from(len).map_err(|_| ChunkError::Full)?,
+        chunk_offset: put.chunk_offset,
         payload_len,
-        payload_crc: crc,
-        sequence,
-        time_ns,
-        flags,
+        payload_crc: put.crc,
+        sequence: put.sequence,
+        time_ns: put.time_ns,
+        flags: put.flags,
     })
 }
 
@@ -1195,8 +1247,8 @@ pub(crate) fn write_superblock<F: BlockFile>(file: &F, sb: &Superblock) -> Resul
 
 fn request_bytes(request: &Request) -> usize {
     match &request.op {
-        Op::Write { data, .. } => data.len(),
-        Op::Relocate { moves } => moves.iter().map(|m| m.data.len()).sum(),
+        Op::Write { payload, .. } => payload.data.len(),
+        Op::Relocate { moves } => moves.iter().map(|m| m.payload.data.len()).sum(),
         Op::Delete { .. } | Op::Checkpoint => 0,
     }
 }

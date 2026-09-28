@@ -17,6 +17,7 @@ use crate::index::Fragment;
 use crate::key::ChunkKey;
 use crate::layout::{Config, Geometry};
 use crate::read;
+use crate::record::Payload;
 use crate::recover::{self, RecoveryReport, read_span};
 use crate::scrub::{Findings, Scrubber, SharedFindings, scrub_all};
 use crate::superblock::{OFFSET_A, OFFSET_B_COMPACT, OFFSET_B_STANDARD, Superblock};
@@ -265,12 +266,13 @@ impl<F: BlockFile + 'static> Volume<F> {
 
     /// Writes a whole chunk and seals it. Returns once it is durable.
     pub fn put(&self, key: ChunkKey, data: &[u8]) -> Result<(), ChunkError> {
-        self.submit(Op::Write {
-            key,
-            offset: 0,
-            data: data.to_vec(),
-            seal: true,
-        })
+        self.write(key, 0, data, true, None)
+    }
+
+    /// Writes a whole chunk like [`Volume::put`], after checking it against the CRC-32C its
+    /// sender computed: bytes changed on the way are refused before anything is written.
+    pub fn put_checked(&self, key: ChunkKey, data: &[u8], crc32c: u32) -> Result<(), ChunkError> {
+        self.write(key, 0, data, true, Some(crc32c))
     }
 
     /// Appends to a chunk at `offset`, which must be where the chunk ends (or an exact
@@ -282,10 +284,47 @@ impl<F: BlockFile + 'static> Volume<F> {
         data: &[u8],
         seal: bool,
     ) -> Result<(), ChunkError> {
+        self.write(key, offset, data, seal, None)
+    }
+
+    /// Appends like [`Volume::append`], after checking the bytes against the CRC-32C their
+    /// sender computed.
+    pub fn append_checked(
+        &self,
+        key: ChunkKey,
+        offset: u64,
+        data: &[u8],
+        seal: bool,
+        crc32c: u32,
+    ) -> Result<(), ChunkError> {
+        self.write(key, offset, data, seal, Some(crc32c))
+    }
+
+    /// Checksums the payload in the calling thread, verifies it against `expected` when the
+    /// sender supplied one, and submits it.
+    fn write(
+        &self,
+        key: ChunkKey,
+        offset: u64,
+        data: &[u8],
+        seal: bool,
+        expected: Option<u32>,
+    ) -> Result<(), ChunkError> {
+        let payload = Payload::new(data.to_vec(), self.shared.checksum_shift)
+            .ok_or_else(|| ChunkError::Config("checksum block size".into()))?;
+        if let Some(expected) = expected
+            && expected != payload.crc
+        {
+            return Err(ChunkError::Checksum {
+                key,
+                expected,
+                actual: payload.crc,
+            });
+        }
         self.submit(Op::Write {
             key,
             offset,
-            data: data.to_vec(),
+            payload,
             seal,
         })
     }

@@ -423,3 +423,29 @@ fn deleted_chunks_stay_deleted_when_their_segment_is_reused_after_a_restart() {
     assert_eq!(v.read(&key(1), 0, 1000).unwrap(), data(1, 1000));
     assert_eq!(v.read(&key(7), 0, 200 << 10).unwrap(), data(7, 200 << 10));
 }
+
+/// A sender's CRC-32C is checked when the bytes arrive: bytes that changed on the way are
+/// refused and nothing is written.
+#[test]
+fn bytes_that_do_not_match_their_senders_checksum_are_refused() {
+    let v = Volume::format(sim(12), SIZE, config()).unwrap();
+    let bytes = data(1, 10_000);
+    let crc = mantle_crc::crc32c(&bytes);
+    assert!(matches!(
+        v.put_checked(key(1), &bytes, crc ^ 1),
+        Err(ChunkError::Checksum { .. })
+    ));
+    assert_eq!(v.stat(&key(1)).unwrap(), None);
+    v.put_checked(key(1), &bytes, crc).unwrap();
+    assert_eq!(v.read(&key(1), 0, 10_000).unwrap(), bytes);
+
+    let more = data(2, 5000);
+    assert!(matches!(
+        v.append_checked(key(2), 0, &more, false, 0),
+        Err(ChunkError::Checksum { .. })
+    ));
+    assert_eq!(v.stat(&key(2)).unwrap(), None);
+    v.append_checked(key(2), 0, &more, false, mantle_crc::crc32c(&more))
+        .unwrap();
+    assert_eq!(v.read(&key(2), 0, 5000).unwrap(), more);
+}

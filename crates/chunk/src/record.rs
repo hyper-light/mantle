@@ -7,6 +7,8 @@
 //! (Bairavasundaram et al., FAST 2008, §2.2); per-block checksums let a read verify only
 //! the blocks it returns (Ghemawat et al., SOSP 2003, §5.2).
 
+use mantle_disk::buf::AlignedBuf;
+
 use crate::codec::{Reader, Writer};
 use crate::key::ChunkKey;
 
@@ -76,13 +78,77 @@ pub fn record_len(payload_len: u32, shift: u8) -> Option<usize> {
     unpadded.checked_next_multiple_of(RECORD_ALIGN)
 }
 
-/// Appends a record for `payload` to `out` and returns the CRC-32C of the whole payload.
-pub fn encode(header: &RecordHeader, payload: &[u8], out: &mut Vec<u8>) -> Option<u32> {
-    if usize::try_from(header.payload_len).ok()? != payload.len() {
+/// A payload and its checksums, computed by the thread that submits it: the source computes
+/// the checksum, the store verifies it on ingest and on every read (docs/research/03 rule
+/// 10), and the single writer thread is spared the work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Payload {
+    pub data: Vec<u8>,
+    /// CRC-32C of each checksum block of `data`.
+    pub table: Vec<u32>,
+    /// CRC-32C of all of `data`.
+    pub crc: u32,
+}
+
+impl Payload {
+    /// Checksums `data` in blocks of 2^`shift` bytes; `None` for a shift past 30.
+    pub fn new(data: Vec<u8>, shift: u8) -> Option<Self> {
+        let (table, crc) = checksums(&data, shift)?;
+        Some(Self { data, table, crc })
+    }
+}
+
+/// The CRC-32C of each 2^`shift`-byte block of `payload`, and of the whole payload combined
+/// from them without a second pass over the bytes.
+pub fn checksums(payload: &[u8], shift: u8) -> Option<(Vec<u32>, u32)> {
+    if shift > 30 {
         return None;
     }
-    let size = usize::try_from(1u64.checked_shl(u32::from(header.checksum_shift))?).ok()?;
+    let size = usize::try_from(1u64.checked_shl(u32::from(shift))?).ok()?;
     let table: Vec<u32> = payload.chunks(size).map(mantle_crc::crc32c).collect();
+    // Every block but the last is the same size, so one shift combines them all.
+    let full = mantle_crc::Crc32cShift::new(u64::try_from(size).ok()?);
+    let mut whole: Option<u32> = None;
+    for (c, block) in table.iter().zip(payload.chunks(size)) {
+        whole = Some(match whole {
+            None => *c,
+            Some(acc) if block.len() == size => full.combine(acc, *c),
+            Some(acc) => mantle_crc::crc32c_combine(acc, *c, u64::try_from(block.len()).ok()?),
+        });
+    }
+    Some((table, whole.unwrap_or_else(|| mantle_crc::crc32c(&[]))))
+}
+
+/// Where records are encoded: a vector, or the aligned buffer the writer sends to the device.
+pub trait Sink {
+    fn put(&mut self, bytes: &[u8]) -> Option<()>;
+}
+
+impl Sink for Vec<u8> {
+    fn put(&mut self, bytes: &[u8]) -> Option<()> {
+        self.extend_from_slice(bytes);
+        Some(())
+    }
+}
+
+impl Sink for AlignedBuf {
+    fn put(&mut self, bytes: &[u8]) -> Option<()> {
+        self.extend_from_slice(bytes).ok()
+    }
+}
+
+/// Appends a record for `payload`, whose checksum table is `table`, to `out`.
+pub fn encode(
+    header: &RecordHeader,
+    table: &[u32],
+    payload: &[u8],
+    out: &mut impl Sink,
+) -> Option<()> {
+    if usize::try_from(header.payload_len).ok()? != payload.len()
+        || usize::try_from(header.blocks()?).ok()? != table.len()
+    {
+        return None;
+    }
     let mut w = Writer::with_capacity(header.prefix_len()?);
     w.bytes(&RECORD_MAGIC);
     w.u8(KIND_PAYLOAD);
@@ -103,32 +169,20 @@ pub fn encode(header: &RecordHeader, payload: &[u8], out: &mut Vec<u8>) -> Optio
     let mut crc = mantle_crc::Crc32c::new();
     crc.update(w.as_slice());
     let mut table_bytes = Writer::with_capacity(table.len().saturating_mul(4));
-    for &c in &table {
+    for &c in table {
         table_bytes.u32(c);
     }
     crc.update(table_bytes.as_slice());
     w.u32(crc.finish());
     w.bytes(table_bytes.as_slice());
 
-    let start = out.len();
-    out.extend_from_slice(w.as_slice());
-    out.extend_from_slice(payload);
-    let written = out.len().saturating_sub(start);
-    let padded = written.checked_next_multiple_of(RECORD_ALIGN)?;
-    out.resize(start.saturating_add(padded), 0);
-
-    // The whole payload's CRC from the block CRCs, without a second pass over the bytes. Every
-    // block but the last is the same size, so one shift combines them all.
-    let full = mantle_crc::Crc32cShift::new(u64::try_from(size).ok()?);
-    let mut whole: Option<u32> = None;
-    for (c, block) in table.iter().zip(payload.chunks(size)) {
-        whole = Some(match whole {
-            None => *c,
-            Some(acc) if block.len() == size => full.combine(acc, *c),
-            Some(acc) => mantle_crc::crc32c_combine(acc, *c, u64::try_from(block.len()).ok()?),
-        });
-    }
-    Some(whole.unwrap_or_else(|| mantle_crc::crc32c(&[])))
+    out.put(w.as_slice())?;
+    out.put(payload)?;
+    let written = w.len().saturating_add(payload.len());
+    let pad = written
+        .checked_next_multiple_of(RECORD_ALIGN)?
+        .saturating_sub(written);
+    out.put([0u8; RECORD_ALIGN].get(..pad)?)
 }
 
 /// A decoded header and checksum table, with the header CRC verified.
@@ -312,8 +366,9 @@ mod tests {
                                          shift in 9u8..=16) {
             let h = header(payload.len() as u32, shift);
             let mut out = Vec::new();
-            let whole = encode(&h, &payload, &mut out).unwrap();
-            prop_assert_eq!(whole, mantle_crc::crc32c(&payload));
+            let p = Payload::new(payload.clone(), shift).unwrap();
+            prop_assert_eq!(p.crc, mantle_crc::crc32c(&payload));
+            encode(&h, &p.table, &payload, &mut out).unwrap();
             prop_assert_eq!(out.len(), h.record_len().unwrap());
             prop_assert_eq!(out.len() % RECORD_ALIGN, 0);
             let prefix = decode_prefix(&out).unwrap();
@@ -327,7 +382,7 @@ mod tests {
                                                      at in any::<usize>(), bit in 0u8..8) {
             let h = header(payload.len() as u32, 10);
             let mut out = Vec::new();
-            encode(&h, &payload, &mut out).unwrap();
+            encode(&h, &Payload::new(payload.clone(), 10).unwrap().table, &payload, &mut out).unwrap();
             let prefix = decode_prefix(&out).unwrap();
             let start = h.prefix_len().unwrap();
             let mut data = out[start..start + payload.len()].to_vec();
@@ -341,7 +396,8 @@ mod tests {
     fn lengths_can_be_read_from_the_header_alone() {
         let h = header(3000, 10);
         let mut out = Vec::new();
-        encode(&h, &[7u8; 3000], &mut out).unwrap();
+        let table = Payload::new(vec![7u8; 3000], 10).unwrap().table;
+        encode(&h, &table, &[7u8; 3000], &mut out).unwrap();
         assert_eq!(
             peek_lengths(&out[..HEADER_LEN]),
             Some(Lengths {
@@ -355,7 +411,8 @@ mod tests {
     fn a_flipped_header_bit_makes_the_record_absent() {
         let h = header(3000, 10);
         let mut out = Vec::new();
-        encode(&h, &[7u8; 3000], &mut out).unwrap();
+        let table = Payload::new(vec![7u8; 3000], 10).unwrap().table;
+        encode(&h, &table, &[7u8; 3000], &mut out).unwrap();
         for i in 0..h.prefix_len().unwrap() {
             let mut copy = out.clone();
             copy[i] ^= 0x10;
@@ -368,7 +425,8 @@ mod tests {
         let payload: Vec<u8> = (0..5000u32).map(|i| i as u8).collect();
         let h = header(5000, 10);
         let mut out = Vec::new();
-        encode(&h, &payload, &mut out).unwrap();
+        let table = Payload::new(payload.clone(), 10).unwrap().table;
+        encode(&h, &table, &payload, &mut out).unwrap();
         let prefix = decode_prefix(&out).unwrap();
         let start = h.prefix_len().unwrap();
         // Blocks 2..5 (bytes 2048..5000), the last one short.

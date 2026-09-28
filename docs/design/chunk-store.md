@@ -220,10 +220,17 @@ the chunk still points at the old location, so a concurrent delete wins.
 
 ## 9. Scrubbing
 
-Every sealed segment is read and verified at least every 14 days, targeting 7, in a
-staggered order of 128 MiB regions read in 1 MiB steps, at the lowest I/O priority
-[BGPS07 §6; SDG10 §5; AWK+19 §5.1]. A bad block triggers an immediate scan of its
-±10 MiB neighbourhood and marks the device at risk for 30 days [BGPS07 §5; SLM16 §5].
+Every sealed segment is read and verified at least every 14 days, targeting 7, at the
+lowest I/O priority [BGPS07 §6; SDG10 §5; AWK+19 §5.1]; seven days is practice rather than
+a derived period [research/11 §12.2]. The order is staggered: SDG10 reads 128 MiB regions in
+1 MiB steps, one step of every region before the next, which shortens the mean time to
+detect an error by 10–20% at 7–14-day periods [research/11 §12.3: SDG10 §5.2.3]. Here the
+step is a segment, so a region is 128 segments and each round reads 1/128 of the volume
+spread over all of it; steps within a segment await a per-segment map of its fragments. A
+bad block triggers an immediate scan of its ±10 MiB neighbourhood and marks the device at
+risk for 30 days [BGPS07 §5; SLM16 §5]. Damaged chunks are listed for repair up to 4,096;
+more than 80% of disks with latent errors had fewer than 50 [BGPS07-F2], so a volume past
+that is failing and is drained whole [research/11 §12.4].
 
 ## 10. Testing
 

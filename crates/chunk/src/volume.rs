@@ -465,6 +465,12 @@ impl<F: BlockFile + 'static> Volume<F> {
             .unwrap_or(true)
     }
 
+    /// Whether the volume has more damage than repair chunk by chunk should chase, and is to
+    /// be drained whole (`scrub::MAX_DAMAGED`).
+    pub fn failing(&self) -> bool {
+        self.findings.lock().map(|f| f.failing).unwrap_or(true)
+    }
+
     /// Forgets a chunk once it has been repaired or its copy here deleted.
     pub fn repaired(&self, key: &ChunkKey) -> Result<(), ChunkError> {
         self.findings

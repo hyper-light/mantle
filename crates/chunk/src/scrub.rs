@@ -4,8 +4,10 @@
 //! Latent sector errors are found by nothing but reads, and most are found by scrubbing
 //! rather than by the workload (Bairavasundaram et al., SIGMETRICS 2007, §6). The scrubber
 //! verifies every live fragment segment by segment, at a rate that finishes the volume
-//! within its period (target 7 days, never more than 14; Schroeder, Damouras and Gill, FAST
-//! 2010, §5), and records each chunk that fails in a bounded list for repair. A failure also
+//! within its period (seven days is practice, NetApp scrubbing every two weeks and Ceph
+//! every one: docs/research/11 §12.2), in a staggered order that reads a little of every
+//! region of the volume before any region twice (Schroeder, Damouras and Gill, FAST 2010,
+//! §5.2.3). It records each chunk that fails in a bounded list for repair. A failure also
 //! marks the volume at risk: errors cluster in space and time (Bairavasundaram et al. 2007,
 //! §5), so the whole volume is then scrubbed at once rather than on schedule.
 
@@ -23,16 +25,28 @@ use crate::key::ChunkKey;
 use crate::read;
 use crate::writer::Shared;
 
-/// The most damaged chunks remembered for repair; past it, the oldest are dropped and counted.
-pub const MAX_DAMAGED: usize = 65_536;
+/// Damaged chunks remembered for repair. More than 80% of disks with latent sector errors had
+/// fewer than 50, and errors cluster within 10 MB (docs/research/03 BGPS07-F2, F3), so a
+/// volume with thousands of damaged chunks has failed in many places: past this many it is
+/// failing, to be drained whole rather than repaired chunk by chunk, and further damage is
+/// counted rather than listed (docs/research/11 §12.4).
+pub const MAX_DAMAGED: usize = 4096;
+
+/// Segments per region in the staggered order. Schroeder, Damouras and Gill stagger 128 MiB
+/// regions read in 1 MiB steps (docs/design/chunk-store.md §9); here a step is a segment, so a
+/// region is 128 segments and each round reads one segment of every region: the same 1/128 of
+/// the volume, spread over all of it.
+const STEPS: usize = 128;
 
 /// What scrubbing has found.
 #[derive(Debug, Default)]
 pub struct Findings {
     /// Chunks with a fragment that failed verification, awaiting repair.
     pub damaged: BTreeSet<ChunkKey>,
-    /// Damaged chunks forgotten because the list was full.
+    /// Damaged chunks found once the list was full, counted but not listed.
     pub dropped: u64,
+    /// The list filled: the volume is to be drained whole. It stays so until reopened.
+    pub failing: bool,
     /// When the volume first showed damage; it stays at risk until reopened.
     pub at_risk_since: Option<Instant>,
     /// Fragments verified and bytes read, over the volume's life so far.
@@ -45,6 +59,7 @@ pub struct Findings {
 impl Findings {
     fn record(&mut self, key: ChunkKey) {
         if self.damaged.len() >= MAX_DAMAGED && !self.damaged.contains(&key) {
+            self.failing = true;
             self.dropped = self.dropped.saturating_add(1);
             return;
         }
@@ -111,15 +126,18 @@ pub(crate) fn scrub_all<F: BlockFile>(
     shared: &Shared<F>,
     findings: &SharedFindings,
 ) -> Result<u64, ChunkError> {
-    let segments: Vec<u32> = shared
-        .usage
-        .read()
-        .map_err(|_| ChunkError::Fenced)?
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.state != SegmentState::Free && s.live > 0)
-        .filter_map(|(i, _)| u32::try_from(i).ok())
-        .collect();
+    let segments: Vec<u32> = {
+        let usage = shared.usage.read().map_err(|_| ChunkError::Fenced)?;
+        (0..positions(usage.len()))
+            .filter_map(|p| staggered(p, usage.len()))
+            .filter(|&i| {
+                usage
+                    .get(i)
+                    .is_some_and(|s| s.state != SegmentState::Free && s.live > 0)
+            })
+            .filter_map(|i| u32::try_from(i).ok())
+            .collect()
+    };
     let mut damaged = 0u64;
     for segment in segments {
         if shared.stopping.load(Ordering::Acquire) {
@@ -150,7 +168,7 @@ impl<F: BlockFile> Scrubber<F> {
             if self.shared.stopping.load(Ordering::Acquire) {
                 return;
             }
-            let (segment, volume_bytes) = match self.pick(next) {
+            let (position, segment, volume_bytes) = match self.pick(next) {
                 Some(found) => found,
                 None => {
                     // Nothing stored: wait a period, or until woken.
@@ -160,7 +178,7 @@ impl<F: BlockFile> Scrubber<F> {
                     continue;
                 }
             };
-            next = usize::try_from(segment).unwrap_or(0).saturating_add(1);
+            next = position.saturating_add(1);
             let bytes = match scrub_segment(&self.shared, &self.findings, segment) {
                 Ok((_, bytes, _)) => bytes,
                 // The volume is fenced or closing: stop until woken.
@@ -187,21 +205,25 @@ impl<F: BlockFile> Scrubber<F> {
         }
     }
 
-    /// The next segment holding live data at or after `from`, wrapping around, and the live
-    /// bytes of the whole volume.
-    fn pick(&self, from: usize) -> Option<(u32, u64)> {
+    /// The next segment holding live data at or after position `from` of the staggered
+    /// order, wrapping around: its position, the segment, and the live bytes of the volume.
+    fn pick(&self, from: usize) -> Option<(usize, u32, u64)> {
         let usage = self.shared.usage.read().ok()?;
         let total: u64 = usage.iter().map(|s| s.live).sum();
-        let count = usage.len();
+        let count = positions(usage.len());
         (0..count)
-            .map(|i| from.saturating_add(i).checked_rem(count).unwrap_or(0))
-            .find(|&i| {
-                usage
-                    .get(i)
-                    .is_some_and(|s| s.state != SegmentState::Free && s.live > 0)
+            .filter_map(|i| from.saturating_add(i).checked_rem(count))
+            .find_map(|p| {
+                let segment = staggered(p, usage.len())?;
+                let live = usage
+                    .get(segment)
+                    .is_some_and(|s| s.state != SegmentState::Free && s.live > 0);
+                if live {
+                    Some((p, u32::try_from(segment).ok()?, total))
+                } else {
+                    None
+                }
             })
-            .and_then(|i| u32::try_from(i).ok())
-            .map(|segment| (segment, total))
     }
 
     /// Waits `pause`, or until woken; true if the volume is closing.
@@ -212,6 +234,22 @@ impl<F: BlockFile> Scrubber<F> {
         }
         self.shared.stopping.load(Ordering::Acquire)
     }
+}
+
+/// Positions in a staggered pass over `count` segments: every step of every region.
+fn positions(count: usize) -> usize {
+    count.div_ceil(STEPS).saturating_mul(STEPS)
+}
+
+/// The segment at position `p` of a staggered pass over `count` segments: step `p / regions`
+/// of region `p % regions`. `None` for a step past the end of the last, shorter region.
+fn staggered(p: usize, count: usize) -> Option<usize> {
+    let regions = count.div_ceil(STEPS);
+    let segment = p
+        .checked_rem(regions)?
+        .checked_mul(STEPS)?
+        .checked_add(p.checked_div(regions)?)?;
+    if segment < count { Some(segment) } else { None }
 }
 
 /// The pause after scrubbing `bytes`, so that `volume_bytes` take `period` to scrub.
@@ -251,6 +289,27 @@ mod tests {
         }
         assert_eq!(f.damaged.len(), MAX_DAMAGED);
         assert_eq!(f.dropped, 10);
+        assert!(f.failing);
         assert!(f.at_risk_since.is_some());
+    }
+
+    /// A pass visits every segment once, and its first round one segment of every region.
+    #[test]
+    fn the_staggered_order_covers_the_volume_and_spreads_each_round() {
+        for count in [1, 5, 127, 128, 129, 1000, 80_000] {
+            let order: Vec<usize> = (0..positions(count))
+                .filter_map(|p| staggered(p, count))
+                .collect();
+            let mut sorted = order.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, (0..count).collect::<Vec<_>>(), "{count} segments");
+            let regions = count.div_ceil(STEPS);
+            let first: Vec<usize> = order.iter().take(regions).map(|s| s / STEPS).collect();
+            assert_eq!(first, (0..regions).collect::<Vec<_>>(), "{count} segments");
+        }
+        assert_eq!(staggered(0, 300), Some(0));
+        assert_eq!(staggered(1, 300), Some(128));
+        assert_eq!(staggered(2, 300), Some(256));
+        assert_eq!(staggered(3, 300), Some(1));
     }
 }

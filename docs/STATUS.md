@@ -47,7 +47,6 @@ chunks are listed for repair.
 
 Remaining before it is done:
 
-- A grace period before deleted data is reclaimed.
 - Writing new file regions once before use where calibration measures a first-write penalty.
 - An I/O path that keeps the measured number of reads in flight.
 - Benchmarks of write and read throughput and latency against the raw-device numbers.
@@ -59,7 +58,8 @@ Remaining before it is done:
    combination of lost chunks within a layout's tolerance is rebuilt correctly.
 2. **Metadata service.** Ranges of object names, file layouts and chunk locations, each
    replicated with focal's Raft implementation and its fast-track commit, over QUIC for
-   bulk transfers and a UDP transport for consensus messages. Done when a linearizability
+   bulk transfers and a UDP transport for consensus messages, and lazy deletion that keeps
+   an unreferenced block's chunks for a grace period. Done when a linearizability
    checker accepts histories recorded under network partitions, process crashes and disk
    faults, both in deterministic simulation and with real processes.
 3. **S3 gateway.** Request signing (including presigned URLs and chunked uploads with

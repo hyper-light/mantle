@@ -181,9 +181,14 @@ never returns unverified bytes.
 ## 8. Deleting and cleaning
 
 A delete appends `Delete` to the index log in the next batch and removes the entry; the
-record's bytes become dead in its segment's usage. Deleted data stays recoverable for a
-grace period (default 3 days, as GFS's lazy reclamation [GGL03 §4.4]) before cleaning may
-reclaim it, a net under metadata-GC mistakes.
+record's bytes become dead in its segment's usage, and cleaning may reclaim them at once.
+The net under deleting data by mistake is lazy deletion one layer up: the metadata service
+deletes a block's chunks only after the block has gone unreferenced for a grace period, as
+GFS keeps a deleted file for three days before reclaiming its chunks [GGL03 §4.4] and
+Tectonic deletes lazily between its metadata layers [TEC §3.5]. Undoing a mistake there is
+a metadata change. Holding deleted chunks here instead would either keep them in the index
+for the cleaner to copy, or keep freed segments from being discarded, and dead data an SSD
+must still treat as live raises its internal garbage collection [HKA17 Obs. #8, #21].
 
 Cleaning starts when free segments fall below a low watermark and stops at a high one
 [RO92 §3.6]. It picks sealed segments by cost-benefit, `(1−u)·age / (1+u)` with `u` the

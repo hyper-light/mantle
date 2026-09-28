@@ -13,6 +13,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 # Each entry: the file and the interface it binds.
 UNSAFE_ALLOWED = {
     "crates/disk/src/probe/macos.rs": "IOKit and CoreFoundation (device identification)",
+    "crates/disk/src/probe/windows.rs": "volume management and IOCTL_STORAGE_QUERY_PROPERTY (device identification)",
 }
 
 ALLOW_UNSAFE = re.compile(r"allow\s*\(\s*unsafe_code\s*\)")

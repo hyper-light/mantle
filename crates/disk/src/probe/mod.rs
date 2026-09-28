@@ -14,7 +14,17 @@ mod macos;
 #[cfg(target_os = "macos")]
 use macos::identify as platform_identify;
 
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+use windows::identify as platform_identify;
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    windows
+)))]
 fn platform_identify(path: &Path) -> Identity {
     use crate::identity::{FileSystem, FileSystemKind};
     let mut identity = Identity::unknown(FileSystem {

@@ -20,6 +20,7 @@ pub fn config() -> Config {
         checksum_shift: 12,
         max_fragments: 2000,
         compact: true,
+        scrub_period: None,
         limits: Limits {
             queue: 256,
             batch_requests: 64,

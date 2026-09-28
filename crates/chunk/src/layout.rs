@@ -49,6 +49,10 @@ pub struct Config {
     pub max_fragments: u64,
     /// Place superblock B and the log near the start: for small volumes and tests.
     pub compact: bool,
+    /// How long one background scrub of the whole volume takes; `None` scrubs only when
+    /// asked. Seven days is the target the literature supports, fourteen the most it allows
+    /// (docs/research/03 §15.9).
+    pub scrub_period: Option<std::time::Duration>,
     pub limits: Limits,
 }
 
@@ -59,6 +63,7 @@ impl Default for Config {
             checksum_shift: 16,
             max_fragments: 1 << 22,
             compact: false,
+            scrub_period: Some(std::time::Duration::from_secs(7 * 24 * 3600)),
             limits: Limits::default(),
         }
     }

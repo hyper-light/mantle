@@ -183,3 +183,59 @@ fn a_failed_write_or_flush_fences_the_volume_and_loses_nothing_acknowledged() {
         let _ = file.len();
     }
 }
+
+#[test]
+fn scrubbing_finds_damage_before_a_read_does() {
+    let file = sim(26);
+    let v = Volume::format(Arc::clone(&file), SIZE, config()).unwrap();
+    for n in 0..40u64 {
+        v.put(key(n), &data(n, 6000)).unwrap();
+    }
+    assert_eq!(v.scrub().unwrap(), 0);
+    assert!(!v.at_risk());
+    let at = find(&file, &data(7, 6000)[2000..2064]);
+    file.inject(Fault::BitFlip {
+        offset: at,
+        bit: 6,
+        stored: true,
+    })
+    .unwrap();
+    assert_eq!(v.scrub().unwrap(), 1);
+    assert_eq!(v.damaged().unwrap(), vec![key(7)]);
+    assert!(v.at_risk());
+    // Once repaired (here: rewritten under a new key and the damaged one deleted), the chunk
+    // is forgotten.
+    v.delete(key(7)).unwrap();
+    v.repaired(&key(7)).unwrap();
+    assert!(v.damaged().unwrap().is_empty());
+    assert_eq!(v.scrub().unwrap(), 0);
+}
+
+#[test]
+fn the_background_scrubber_finds_damage_on_its_own() {
+    let file = sim(27);
+    let mut cfg = config();
+    cfg.scrub_period = Some(std::time::Duration::from_millis(200));
+    let v = Volume::format(Arc::clone(&file), SIZE, cfg).unwrap();
+    for n in 0..40u64 {
+        v.put(key(n), &data(n, 6000)).unwrap();
+    }
+    let at = find(&file, &data(11, 6000)[100..164]);
+    file.inject(Fault::BitFlip {
+        offset: at,
+        bit: 1,
+        stored: true,
+    })
+    .unwrap();
+    // The fact this test needs is the scrubber's finding; it has a whole period's worth of
+    // passes (many) to make it, and the bound only stops a hang.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while v.damaged().unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the scrubber never found the damage"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(v.damaged().unwrap(), vec![key(11)]);
+}

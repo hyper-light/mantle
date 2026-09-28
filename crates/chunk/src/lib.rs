@@ -23,6 +23,7 @@ mod log;
 mod read;
 pub mod record;
 mod recover;
+mod scrub;
 pub mod superblock;
 mod volume;
 mod writer;

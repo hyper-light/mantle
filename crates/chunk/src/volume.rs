@@ -17,6 +17,7 @@ use crate::key::ChunkKey;
 use crate::layout::{Config, Geometry};
 use crate::read;
 use crate::recover::{self, RecoveryReport, read_span};
+use crate::scrub::{Findings, Scrubber, SharedFindings, scrub_all};
 use crate::superblock::{OFFSET_A, OFFSET_B_COMPACT, OFFSET_B_STANDARD, Superblock};
 use crate::writer::{Op, Request, Shared, Writer, write_superblock};
 
@@ -43,9 +44,12 @@ pub struct Volume<F: BlockFile + 'static> {
     shared: Arc<Shared<F>>,
     sender: Option<SyncSender<Request>>,
     writer: Option<JoinHandle<()>>,
-    /// Dropping it stops the cleaner.
+    /// Wakes the cleaner, which stops once `stopping` is set.
     wake_cleaner: Option<SyncSender<()>>,
     cleaner: Option<JoinHandle<()>>,
+    wake_scrubber: Option<SyncSender<()>>,
+    scrubber: Option<JoinHandle<()>>,
+    findings: SharedFindings,
     superblock: Superblock,
     watermarks: (usize, usize),
     limits: crate::layout::Limits,
@@ -188,6 +192,24 @@ impl<F: BlockFile + 'static> Volume<F> {
             .name("mantle-chunk-cleaner".into())
             .spawn(move || cleaner.run())
             .map_err(spawn_error)?;
+        let findings: SharedFindings = Arc::new(std::sync::Mutex::new(Findings::default()));
+        let (wake_scrubber, scrubber) = match config.scrub_period {
+            Some(period) => {
+                let (wake, wakes) = sync_channel(1);
+                let scrubber = Scrubber {
+                    shared: Arc::clone(&shared),
+                    findings: Arc::clone(&findings),
+                    wake: wakes,
+                    period,
+                };
+                let handle = std::thread::Builder::new()
+                    .name("mantle-chunk-scrubber".into())
+                    .spawn(move || scrubber.run())
+                    .map_err(spawn_error)?;
+                (Some(wake), Some(handle))
+            }
+            None => (None, None),
+        };
         Ok((
             Self {
                 shared,
@@ -195,6 +217,9 @@ impl<F: BlockFile + 'static> Volume<F> {
                 writer: Some(handle),
                 wake_cleaner: Some(wake),
                 cleaner: Some(cleaner),
+                wake_scrubber,
+                scrubber,
+                findings,
                 superblock,
                 watermarks: (low, high),
                 limits: config.limits,
@@ -326,6 +351,38 @@ impl<F: BlockFile + 'static> Volume<F> {
         Ok(out)
     }
 
+    /// Verifies every stored fragment now; returns the number that failed. Failed chunks are
+    /// listed by `damaged`.
+    pub fn scrub(&self) -> Result<u64, ChunkError> {
+        scrub_all(&self.shared, &self.findings)
+    }
+
+    /// Chunks with a fragment that failed verification, found by reads of the scrubber, for
+    /// repair from another copy.
+    pub fn damaged(&self) -> Result<Vec<ChunkKey>, ChunkError> {
+        let findings = self.findings.lock().map_err(|_| ChunkError::Fenced)?;
+        Ok(findings.damaged.iter().copied().collect())
+    }
+
+    /// Whether damage has been found since the volume opened: errors cluster, so a volume
+    /// with one is scrubbed continuously and should be repaired or drained.
+    pub fn at_risk(&self) -> bool {
+        self.findings
+            .lock()
+            .map(|f| f.at_risk_since.is_some())
+            .unwrap_or(true)
+    }
+
+    /// Forgets a chunk once it has been repaired or its copy here deleted.
+    pub fn repaired(&self, key: &ChunkKey) -> Result<(), ChunkError> {
+        self.findings
+            .lock()
+            .map_err(|_| ChunkError::Fenced)?
+            .damaged
+            .remove(key);
+        Ok(())
+    }
+
     /// Cleans the `n` segments with the best cost-benefit ratio now, whatever the free
     /// space, and waits for their space to be freed.
     pub fn clean(&self, n: u32) -> Result<CleanReport, ChunkError> {
@@ -358,6 +415,12 @@ impl<F: BlockFile + 'static> Volume<F> {
         }
         if let Some(handle) = self.cleaner.take() {
             // A thread that unwound has already stopped; there is nothing more to wait for.
+            let _ = handle.join();
+        }
+        if let Some(wake) = self.wake_scrubber.take() {
+            let _ = wake.try_send(());
+        }
+        if let Some(handle) = self.scrubber.take() {
             let _ = handle.join();
         }
         self.sender.take();

@@ -2,7 +2,13 @@
 //! `cargo run --release --example extent_flush -- DIR [SPAN_MIB] [BLOCK_KIB]`.
 //! Answers whether steady-state appends should overwrite pre-written blocks (a metadata
 //! journal commit per flush when extents are unwritten or the file grows).
-#![allow(clippy::unwrap_used, clippy::disallowed_macros, clippy::expect_used)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::disallowed_macros,
+    clippy::expect_used,
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation
+)]
 
 use std::time::Duration;
 

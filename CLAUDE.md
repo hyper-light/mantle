@@ -73,8 +73,8 @@ code. Comments explain why.
 
 ## Gates
 
-Every commit passes these on its final tree; CI runs them on Linux, macOS and Windows,
-x86_64 and aarch64.
+Every commit passes these on its final tree (`bash scripts/gates.sh` runs them in order and
+stops at the first failure); CI runs them on Linux, macOS and Windows, x86_64 and aarch64.
 
 ```
 python3 scripts/check-contracts.py

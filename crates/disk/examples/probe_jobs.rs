@@ -1,5 +1,11 @@
 //! Prints raw job measurements for a directory: `cargo run --release --example probe_jobs -- DIR [SPAN_MIB]`.
-#![allow(clippy::unwrap_used, clippy::disallowed_macros, clippy::expect_used)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::disallowed_macros,
+    clippy::expect_used,
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation
+)]
 
 use std::time::Duration;
 

@@ -1,7 +1,7 @@
 # S3 protocol: how mantle reads requests and writes responses
 
 Status: design, 2026-09-28. Sources: docs/research/05 (S3 API semantics, cited as "05 §x"),
-docs/research/13 (XML, cited as "13 §x").
+docs/research/13 (XML, cited as "13 §x"), docs/research/16 (CORS, cited as "16 §x").
 
 `mantle-s3` is the protocol layer the gateway (STATUS item 2) is built from: pure functions
 over requests and bodies, with no I/O and no knowledge of where objects live. Each module
@@ -23,7 +23,8 @@ restating S3.
 | `tagging` | tag sets: S3's limits and characters, and the `x-amz-tagging` header | 13 §6.7, s3-tests, S3's observed answers |
 | `acl` | canned and header ACLs, Object Ownership, and whether a request's ACL goes ahead with ACLs disabled | 13 §6.8, s3-tests |
 | `lifecycle` | lifecycle rules checked, when each action falls due, and the expiration and abort headers | 13 §6.9, the user guide's worked examples, s3-tests |
-| `response` | the documents responses carry: listings, multipart and copy results, batch deletes, errors, bucket settings, tags, ACLs, lifecycle rules | 28 of AWS's sample responses, s3-tests |
+| `cors` | CORS rules checked, preflights answered or refused, and the headers of an actual cross-origin request | 16, S3's recorded answers, s3-tests |
+| `response` | the documents responses carry: listings, multipart and copy results, batch deletes, errors, bucket settings, tags, ACLs, lifecycle and CORS rules | 28 of AWS's sample responses, s3-tests |
 
 ## 2. XML bodies
 
@@ -374,3 +375,47 @@ alone, and of incomplete multipart uploads** (`crates/s3/src/lifecycle.rs`; 13 �
   `InvalidRequest`, which is current, where the recordings are from 2016 and 2017.
 - **Storage** of a configuration is the metadata layer's, and open (metadata.md §6): at its
   largest it is about 13 MB unescaped.
+
+## 8. CORS
+
+**Decision: a bucket's CORS rules are checked as S3 was recorded checking them, and a request
+carrying an `Origin` is answered as S3 answers it, where the Fetch standard, which browsers
+enforce, agrees** (`crates/s3/src/cors.rs`; 16).
+
+- **Checks.** 1 to 100 rules in at most 64 KB, as documented. A rule without an origin or a
+  method, and no rules at all, are `MalformedXML`; a method other than the five a rule may
+  allow is `InvalidRequest` naming it, and so is an origin with two `*`, with S3's recorded
+  messages. An allowed header with two `*` is refused the same way, as S3 documents one `*` at
+  most. An ID holds at most 255 characters and names one rule, as documented, and a negative
+  `MaxAgeSeconds` is refused, since `Access-Control-Max-Age` holds delta-seconds. Exposed
+  headers are not checked as names, as S3 accepted `GET` among them. An empty origin is
+  accepted, as S3 accepted it.
+- **Matching.** The first rule that matches decides. An origin matches a pattern byte for
+  byte, as a browser compares the answer with its origin; a `*` stands for any run of
+  characters, the empty one included, as s3-tests expects. No source says how S3 compares
+  case, so mantle does not fold it. A method matches exactly. Each requested header must match
+  an allowed header whatever its case, as S3 answered; a rule with no allowed headers allows
+  none.
+- **The answer.** A named origin is echoed with `Access-Control-Allow-Credentials: true`, and
+  an origin a rule allows only by `*` is answered `*` without it, as S3 answered both. A
+  wildcard rule so never grants a request with credentials, which a browser refuses `*`
+  (16 §4). `Access-Control-Allow-Methods` lists the rule's methods, as every recorded answer
+  does, and `Access-Control-Allow-Headers` the requested ones, lowercase, as S3 answered in
+  2025.
+- **Preflights.** `OPTIONS` on a bucket or an object is a preflight whatever its query, as a
+  preflight may carry the parameters of the request it precedes, and it is answered without
+  authentication: a browser sends none, and s3-tests preflights presigned URLs. Without an
+  `Origin` it is `400 BadRequest`; to a bucket without rules `403 AccessForbidden`, "CORS is
+  not enabled"; when no rule matches `403 AccessForbidden`, "This CORS request is not
+  allowed", with S3's messages and the `Method` and `ResourceType` elements its error carries.
+  An `Origin` without `Access-Control-Request-Method`, to a bucket with rules, is `400`, as
+  s3-tests expects; no recording of S3 covers it.
+- **Actual requests** are never refused for CORS, as S3 serves a PUT no rule allows. One that
+  carries an `Origin` is matched by the method and headers it asks about, when it carries
+  `Access-Control-Request-Method` or `Access-Control-Request-Headers`, and otherwise by its own
+  method, as S3 answered; its real headers are not checked. The CORS headers go on its
+  response whatever its status, as s3-tests expects of a 404 and a 403.
+- **`Vary`** goes on every response to a request for a bucket with CORS rules, with or without
+  an `Origin`, matched or not. S3 sends it only when a rule matches, so a cache in front of it
+  may keep an answer without CORS headers and give it to a browser a rule allows; the Fetch
+  standard names that failure and prescribes `Vary` against it (16 §4).

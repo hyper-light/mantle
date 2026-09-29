@@ -41,6 +41,11 @@ pub enum Operation {
     GetBucketLifecycleConfiguration,
     PutBucketLifecycleConfiguration,
     DeleteBucketLifecycle,
+    GetBucketCors,
+    PutBucketCors,
+    DeleteBucketCors,
+    /// A CORS preflight, `OPTIONS` on a bucket or an object.
+    Preflight,
     ListObjects,
     ListObjectsV2,
     ListObjectVersions,
@@ -103,10 +108,9 @@ pub const MAX_KEY: usize = 1024;
 
 /// Bucket subresources S3 defines that mantle does not serve: answered `501 NotImplemented`
 /// rather than taken for another operation.
-const UNSUPPORTED: [&str; 19] = [
+const UNSUPPORTED: [&str; 18] = [
     "accelerate",
     "analytics",
-    "cors",
     "encryption",
     "intelligent-tiering",
     "inventory",
@@ -136,6 +140,18 @@ pub fn route(
     headers: &[(&str, &str)],
 ) -> Result<Route, RouteError> {
     let (bucket, key) = target(endpoint, host, path)?;
+    // A preflight asks about the request it precedes, whose parameters it may carry: it is
+    // answered from the bucket's CORS rules whatever its query (16 §3).
+    if method == "OPTIONS" {
+        return match bucket {
+            Some(_) => Ok(Route {
+                operation: Operation::Preflight,
+                bucket,
+                key,
+            }),
+            None => Err(RouteError::MethodNotAllowed),
+        };
+    }
     let q = Query::parse(query);
     if let Some(name) = UNSUPPORTED.iter().find(|n| q.has(n)) {
         return Err(RouteError::NotImplemented(name));
@@ -179,7 +195,7 @@ fn subresource(
 }
 
 /// The subresources of a bucket.
-const BUCKET_SUBRESOURCES: [Subresource; 9] = {
+const BUCKET_SUBRESOURCES: [Subresource; 10] = {
     use Operation as O;
     [
         ("location", &[("GET", O::GetBucketLocation)]),
@@ -213,6 +229,14 @@ const BUCKET_SUBRESOURCES: [Subresource; 9] = {
                 ("GET", O::GetBucketLifecycleConfiguration),
                 ("PUT", O::PutBucketLifecycleConfiguration),
                 ("DELETE", O::DeleteBucketLifecycle),
+            ],
+        ),
+        (
+            "cors",
+            &[
+                ("GET", O::GetBucketCors),
+                ("PUT", O::PutBucketCors),
+                ("DELETE", O::DeleteBucketCors),
             ],
         ),
         ("versions", &[("GET", O::ListObjectVersions)]),
@@ -581,6 +605,34 @@ mod tests {
         }
     }
 
+    /// `?cors` is the bucket's CORS rules; `OPTIONS` on a bucket or an object is a preflight
+    /// whatever its query, and needs a bucket (16 §3).
+    #[test]
+    fn cors_and_preflights_route() {
+        use Operation as O;
+        assert_eq!(op("GET", "/b", "cors"), O::GetBucketCors);
+        assert_eq!(op("PUT", "/b", "cors"), O::PutBucketCors);
+        assert_eq!(op("DELETE", "/b", "cors"), O::DeleteBucketCors);
+        let preflight = r(
+            "OPTIONS",
+            "s3.example.com",
+            "/b/k",
+            "uploadId=u&partNumber=1",
+        )
+        .unwrap();
+        assert_eq!(preflight.operation, O::Preflight);
+        assert_eq!(preflight.key.as_deref(), Some("k"));
+        assert_eq!(op("OPTIONS", "/b", "policy"), O::Preflight);
+        assert_eq!(
+            r("OPTIONS", "s3.example.com", "/", ""),
+            Err(RouteError::MethodNotAllowed)
+        );
+        assert_eq!(
+            r("PUT", "s3.example.com", "/b/k", "cors"),
+            Err(RouteError::MethodNotAllowed)
+        );
+    }
+
     #[test]
     fn lifecycle_is_a_bucket_subresource() {
         use Operation as O;
@@ -602,8 +654,8 @@ mod tests {
             Err(RouteError::NotImplemented("policy"))
         );
         assert_eq!(
-            r("DELETE", "s3.example.com", "/b", "cors"),
-            Err(RouteError::NotImplemented("cors"))
+            r("DELETE", "s3.example.com", "/b", "website"),
+            Err(RouteError::NotImplemented("website"))
         );
         assert_eq!(
             r("POST", "s3.example.com", "/", ""),

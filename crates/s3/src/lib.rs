@@ -18,6 +18,7 @@ pub mod body;
 pub mod checksum;
 pub mod chunked;
 pub mod conditional;
+pub mod cors;
 pub mod crypto;
 pub mod lifecycle;
 pub mod list;

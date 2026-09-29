@@ -41,12 +41,12 @@ a request from the S3 endpoint to a disk and back.
 > recovery are implemented and tested, as are Reed–Solomon erasure coding, the metadata
 > layers, the Raft log and range replicas under deterministic simulation, and the S3
 > protocol: request signing, chunked uploads, checksums, routing, conditional requests,
-> listings, tags, ACLs, lifecycle rules and the XML documents requests and responses carry.
-> The S3 gateway that joins them, and the division into cells, follow. The gateway will
-> implement the S3 API that standard clients use: multipart uploads, including resuming an
-> interrupted upload, PUT, GET with byte ranges, HEAD, DELETE and batch delete, copy,
-> ListObjects and ListObjectsV2, versioning, conditional requests, checksums and presigned
-> URLs.
+> listings, tags, ACLs, lifecycle and CORS rules, and the XML documents requests and
+> responses carry. The S3 gateway that joins them, and the division into cells, follow. The
+> gateway will implement the S3 API that standard clients use: multipart uploads, including
+> resuming an interrupted upload, PUT, GET with byte ranges, HEAD, DELETE and batch delete,
+> copy, ListObjects and ListObjectsV2, versioning, conditional requests, checksums and
+> presigned URLs.
 > [docs/STATUS.md](docs/STATUS.md) tracks each component.
 
 ## Install

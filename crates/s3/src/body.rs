@@ -8,6 +8,7 @@
 
 use crate::acl::{Grant, Grantee, MAX_GRANTS, Ownership, Permission, Policy};
 use crate::checksum::Algorithm;
+use crate::cors::{self, CorsError};
 use crate::lifecycle::{
     self, And, Filter, Given, GivenExpiration, GivenNoncurrent, GivenTransition, LifecycleError,
     Rule,
@@ -42,7 +43,7 @@ pub const MAX_OBJECTS: usize = 1000;
 /// (13 §6.4); URL-ready text needs no XML escape.
 const MAX_VERSION_ID: usize = 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BodyError {
     #[error(transparent)]
     Xml(#[from] XmlError),
@@ -58,6 +59,8 @@ pub enum BodyError {
     MalformedAcl(XmlError),
     #[error(transparent)]
     Lifecycle(#[from] LifecycleError),
+    #[error(transparent)]
+    Cors(#[from] CorsError),
 }
 
 impl BodyError {
@@ -71,6 +74,7 @@ impl BodyError {
             Self::Tag(error) => error.code(),
             Self::MalformedAcl(_) => ("MalformedACLError", 400),
             Self::Lifecycle(error) => error.code(),
+            Self::Cors(error) => error.code(),
         }
     }
 }
@@ -600,6 +604,55 @@ pub fn ownership_controls(body: &[u8]) -> Result<Ownership, BodyError> {
     }
     reader.finish()?;
     rule.ok_or(schema("OwnershipControls without a rule"))
+}
+
+/// The largest CORSConfiguration body: "The document is limited to 64 KB in size"
+/// (16 §1.1).
+pub const CORS_LIMIT: usize = cors::LIMIT;
+
+/// PutBucketCors' rules (16 §1.3): read against S3's schema, then checked by
+/// [`cors::check`]. Rules are counted as they are read, so a document never holds more than
+/// 100.
+pub fn cors(body: &[u8]) -> Result<Vec<cors::Rule>, BodyError> {
+    let mut reader = Reader::open(body, CORS_LIMIT, "CORSConfiguration")?;
+    let mut rules = Vec::new();
+    while let Some(name) = reader.child()? {
+        if name != "CORSRule" {
+            return Err(schema("an element CORSConfiguration does not have"));
+        }
+        if rules.len() >= cors::MAX_RULES {
+            return Err(CorsError::TooManyRules.into());
+        }
+        rules.push(cors_rule(&mut reader)?);
+    }
+    reader.finish()?;
+    Ok(cors::check(rules)?)
+}
+
+/// A `CORSRule`: its lists, each repeated without a wrapper, and at most one `ID` and one
+/// `MaxAgeSeconds` (16 §1.3). Text is kept exactly, white space and all, as `xs:string` keeps
+/// it (13 §5).
+fn cors_rule(reader: &mut Reader<'_>) -> Result<cors::Given, BodyError> {
+    let mut rule = cors::Given::default();
+    while let Some(name) = reader.child()? {
+        let list = match name {
+            "AllowedHeader" => &mut rule.headers,
+            "AllowedMethod" => &mut rule.methods,
+            "AllowedOrigin" => &mut rule.origins,
+            "ExposeHeader" => &mut rule.expose,
+            "ID" => {
+                once(&mut rule.id, reader.text()?.into_owned())?;
+                continue;
+            }
+            "MaxAgeSeconds" => {
+                once(&mut rule.max_age, int(&reader.text()?)?)?;
+                continue;
+            }
+            _ => return Err(schema("an element CORSRule does not have")),
+        };
+        list.push(reader.text()?.into_owned());
+    }
+    Ok(rule)
 }
 
 /// The longest `xs:int` a serializer writes.
@@ -1955,5 +2008,111 @@ mod tests {
             lifecycle_code(&one.repeat(lifecycle::MAX_RULES)),
             Ok(lifecycle::MAX_RULES)
         );
+    }
+
+    /// AWS's PutBucketCors examples, which write the root without a namespace, `AllowedOrigin`
+    /// first and blank lines between elements (16 §1.1).
+    #[test]
+    fn cors_reads_aws_samples() {
+        let example_1 = b"<CORSConfiguration>
+ <CORSRule>
+   <AllowedOrigin>http://www.example.com</AllowedOrigin>
+
+   <AllowedMethod>PUT</AllowedMethod>
+   <AllowedMethod>POST</AllowedMethod>
+   <AllowedMethod>DELETE</AllowedMethod>
+
+   <AllowedHeader>*</AllowedHeader>
+ </CORSRule>
+ <CORSRule>
+   <AllowedOrigin>*</AllowedOrigin>
+   <AllowedMethod>GET</AllowedMethod>
+ </CORSRule>
+</CORSConfiguration>";
+        let rules = cors(example_1).unwrap();
+        assert_eq!(
+            rules[0],
+            cors::Rule {
+                id: None,
+                headers: vec!["*".into()],
+                methods: vec![cors::Method::Put, cors::Method::Post, cors::Method::Delete],
+                origins: vec!["http://www.example.com".into()],
+                expose: Vec::new(),
+                max_age: None,
+            }
+        );
+        assert_eq!(rules[1].methods, [cors::Method::Get]);
+        let example_2 = b"<CORSConfiguration>
+ <CORSRule>
+   <AllowedOrigin>http://www.example.com</AllowedOrigin>
+   <AllowedMethod>PUT</AllowedMethod>
+   <AllowedMethod>POST</AllowedMethod>
+   <AllowedMethod>DELETE</AllowedMethod>
+   <AllowedHeader>*</AllowedHeader>
+   <MaxAgeSeconds>3000</MaxAgeSeconds>
+   <ExposeHeader>x-amz-server-side-encryption</ExposeHeader>
+ </CORSRule>
+</CORSConfiguration>";
+        let rules = cors(example_2).unwrap();
+        assert_eq!(rules[0].max_age, Some(3000));
+        assert_eq!(rules[0].expose, ["x-amz-server-side-encryption"]);
+    }
+
+    /// The schema, and S3's recorded answers: no rules or a rule without an origin or a method
+    /// is `MalformedXML`, an empty method `InvalidRequest`; one `MaxAgeSeconds` and one `ID`
+    /// at most; a document over 64 KB refused before it is read (16 §1, §7).
+    #[test]
+    fn cors_refusals_are_s3s() {
+        let code = |rules: &str| {
+            cors(format!("<CORSConfiguration>{rules}</CORSConfiguration>").as_bytes())
+                .map(|rules| rules.len())
+                .map_err(|e| e.code().0)
+        };
+        let rule = |inner: &str| format!("<CORSRule>{inner}</CORSRule>");
+        let get_any = "<AllowedMethod>GET</AllowedMethod><AllowedOrigin>*</AllowedOrigin>";
+        assert_eq!(code(&rule(get_any)), Ok(1));
+        assert_eq!(code(""), Err("MalformedXML"));
+        assert_eq!(code("<CORSRule></CORSRule>"), Err("MalformedXML"));
+        assert_eq!(
+            code(&rule("<AllowedMethod>GET</AllowedMethod>")),
+            Err("MalformedXML")
+        );
+        assert_eq!(
+            code(&rule(
+                "<AllowedMethod></AllowedMethod><AllowedOrigin>*</AllowedOrigin>"
+            )),
+            Err("InvalidRequest")
+        );
+        assert_eq!(
+            code(&rule(&format!(
+                "{get_any}<MaxAgeSeconds>1</MaxAgeSeconds><MaxAgeSeconds>2</MaxAgeSeconds>"
+            ))),
+            Err("MalformedXML")
+        );
+        assert_eq!(
+            code(&rule(&format!("{get_any}<MaxAgeSeconds>a</MaxAgeSeconds>"))),
+            Err("MalformedXML")
+        );
+        assert_eq!(
+            code(&rule(&format!("{get_any}<Allowed>x</Allowed>"))),
+            Err("MalformedXML")
+        );
+        assert_eq!(
+            code(&rule(get_any).repeat(cors::MAX_RULES)),
+            Ok(cors::MAX_RULES)
+        );
+        assert_eq!(
+            code(&rule(get_any).repeat(cors::MAX_RULES + 1)),
+            Err("MalformedXML")
+        );
+        assert_eq!(
+            cors(&vec![b' '; CORS_LIMIT + 1]).map_err(|e| e.code().0),
+            Err("MaxMessageLengthExceeded")
+        );
+        let namespaced = format!(
+            "<CORSConfiguration xmlns=\"{NAMESPACE}\">{}</CORSConfiguration>",
+            rule(get_any)
+        );
+        assert!(cors(namespaced.as_bytes()).is_ok());
     }
 }

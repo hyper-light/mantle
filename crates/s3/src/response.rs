@@ -15,6 +15,7 @@ use std::borrow::Cow;
 use crate::acl::{Ownership, Permission};
 use crate::body::Versioning;
 use crate::checksum::{Algorithm, Checksum, ChecksumType};
+use crate::cors;
 use crate::lifecycle::{And, Expiration, Filter, Rule, Scope};
 use crate::list::{Page, Request, Start, url_encode};
 use crate::tagging::Tag;
@@ -536,6 +537,9 @@ pub struct Failure<'a> {
     pub message: &'a str,
     /// The bucket or object the error concerns.
     pub resource: Option<&'a str>,
+    /// Elements S3 adds for some errors, after the message: `BucketName` for a missing
+    /// bucket setting, `Method` and `ResourceType` for a refused preflight (16 §7).
+    pub details: &'a [(&'a str, &'a str)],
     pub request_id: &'a str,
     /// The response's `x-amz-id-2`.
     pub host_id: &'a str,
@@ -548,6 +552,9 @@ pub fn error(failure: &Failure<'_>) -> String {
         w.text("Message", failure.message);
         if let Some(resource) = failure.resource {
             w.text("Resource", resource);
+        }
+        for (name, value) in failure.details {
+            w.text(name, value);
         }
         w.text("RequestId", failure.request_id);
         w.text("HostId", failure.host_id);
@@ -672,6 +679,35 @@ pub fn lifecycle_configuration(rules: &[Rule]) -> Result<String, TimeOutOfRange>
             });
         }
     }))
+}
+
+/// GetBucketCors' `CORSConfiguration` (16 §1.2): each rule as set, its lists in the order
+/// given, in its Response Syntax's order.
+pub fn cors_configuration(rules: &[cors::Rule]) -> String {
+    Writer::document("CORSConfiguration", true, |w| {
+        for rule in rules {
+            w.element("CORSRule", |w| {
+                for header in &rule.headers {
+                    w.text("AllowedHeader", header);
+                }
+                for method in &rule.methods {
+                    w.text("AllowedMethod", method.name());
+                }
+                for origin in &rule.origins {
+                    w.text("AllowedOrigin", origin);
+                }
+                for header in &rule.expose {
+                    w.text("ExposeHeader", header);
+                }
+                if let Some(id) = &rule.id {
+                    w.text("ID", id);
+                }
+                if let Some(age) = rule.max_age {
+                    w.text("MaxAgeSeconds", &age.to_string());
+                }
+            });
+        }
+    })
 }
 
 /// A lifecycle rule's `Filter`, holding what it held when set.
@@ -1542,6 +1578,7 @@ mod tests {
             code: "InternalError",
             message: "We encountered an internal error. Please try again.",
             resource: None,
+            details: &[],
             request_id: "656c76696e6727732072657175657374",
             host_id: "Uuag1LuByRx9e6j5Onimru9pO4ZVKnJ2Qz7/C1NPcfTWAtRPfTaOFg==",
         };
@@ -2245,6 +2282,69 @@ mod tests {
         prop_oneof![v2, v1]
     }
 
+    /// A refused preflight's error, whose elements S3 was recorded writing as `Code`,
+    /// `Message`, `Method`, `ResourceType`, `RequestId`, `HostId` (16 §7).
+    #[test]
+    fn errors_carry_s3s_further_elements() {
+        let doc = error(&Failure {
+            code: "AccessForbidden",
+            message: "CORSResponse: CORS is not enabled for this bucket.",
+            resource: None,
+            details: &[("Method", "OPTIONS"), ("ResourceType", "BUCKET")],
+            request_id: "Z4ERRATSVNEC7WS7",
+            host_id: "h",
+        });
+        assert!(
+            doc.contains(
+                "<Message>CORSResponse: CORS is not enabled for this bucket.</Message>\
+                 <Method>OPTIONS</Method><ResourceType>BUCKET</ResourceType>\
+                 <RequestId>Z4ERRATSVNEC7WS7</RequestId>"
+            ),
+            "{doc}"
+        );
+    }
+
+    fn cors_rule_strategy() -> impl Strategy<Value = cors::Rule> {
+        let method = prop_oneof![
+            Just(cors::Method::Get),
+            Just(cors::Method::Put),
+            Just(cors::Method::Head),
+            Just(cors::Method::Post),
+            Just(cors::Method::Delete),
+        ];
+        let one_star = || {
+            document_text().prop_map(|text| {
+                let mut stars = 0;
+                text.chars()
+                    .filter(|c| {
+                        *c != '*' || {
+                            stars += 1;
+                            stars == 1
+                        }
+                    })
+                    .collect::<String>()
+            })
+        };
+        (
+            prop::option::of(document_text()),
+            prop::collection::vec(one_star(), 0..3),
+            prop::collection::vec(method, 1..4),
+            prop::collection::vec(one_star(), 1..3),
+            prop::collection::vec(document_text(), 0..3),
+            prop::option::of(0..=u32::try_from(i32::MAX).unwrap()),
+        )
+            .prop_map(
+                |(id, headers, methods, origins, expose, max_age)| cors::Rule {
+                    id: id.map(|id| id.chars().take(cors::MAX_ID / 2).collect()),
+                    headers,
+                    methods,
+                    origins,
+                    expose,
+                    max_age,
+                },
+            )
+    }
+
     proptest! {
         /// Every configuration mantle accepts reads back from the document it writes exactly,
         /// as the rules were set.
@@ -2256,6 +2356,20 @@ mod tests {
             }
             let doc = lifecycle_configuration(&rules).unwrap();
             prop_assert_eq!(crate::body::lifecycle(doc.as_bytes()), Ok(rules));
+        }
+
+        /// Every CORS configuration mantle accepts reads back from the document it writes
+        /// exactly, as the rules were set.
+        #[test]
+        fn cors_configurations_read_back(rules in prop::collection::vec(cors_rule_strategy(), 1..5)) {
+            let mut rules = rules;
+            for (i, rule) in rules.iter_mut().enumerate() {
+                if let Some(id) = &mut rule.id {
+                    *id = format!("{i}{id}");
+                }
+            }
+            let doc = cors_configuration(&rules);
+            prop_assert_eq!(crate::body::cors(doc.as_bytes()), Ok(rules));
         }
     }
 

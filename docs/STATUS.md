@@ -115,20 +115,23 @@ control accepted, as s3-tests expects. Lifecycle configuration: rules checked as
 recorded checking them, in both of its forms, transitions refused once the rest is valid,
 and when each expiration, noncurrent expiration, delete marker removal and upload abort falls
 due, with the `x-amz-expiration` and abort headers, checked against the user guide's worked
-examples and s3-tests, and every configuration read back as it was set, by property test. A
-subresource routes to its own operation or to 405, never to the bucket or object itself, nor
-across from one to the other. The documents every response carries, from listings and
-multipart results to batch deletes, errors, bucket settings, tags, ACLs and lifecycle rules,
-each holding what AWS's sample response holds for the same content when both are read by
-roxmltree. Its SHA-1, SHA-256, SHA-512, MD5 and HMAC-SHA256 come from AWS-LC, every
+examples and s3-tests, and every configuration read back as it was set, by property test.
+CORS: rules checked as S3 was recorded checking them, preflights answered and refused as S3
+answers them, and the headers an actual cross-origin request's response carries, checked
+against s3-tests' origin tables and LocalStack's recordings of S3. A subresource routes to
+its own operation or to 405, never to the bucket or object itself, nor across from one to the
+other, and `OPTIONS` is a preflight. The documents every response carries, from listings and
+multipart results to batch deletes, errors, bucket settings, tags, ACLs, lifecycle and CORS
+rules, each holding what AWS's sample response holds for the same content when both are read
+by roxmltree. Its SHA-1, SHA-256, SHA-512, MD5 and HMAC-SHA256 come from AWS-LC, every
 call fallible and behind an unwind boundary. `mantle bench hash` measures each checksum
 algorithm, signature verification and signed-chunk decoding on one core.
 
 Remaining before it is done:
 
 - The rest of 05 §16.1's later surface: bucket policies, the access S3 grants beyond the
-  owner once ACLs are disabled; CORS; server-side encryption headers; Object Lock; and
-  browser POST uploads.
+  owner once ACLs are disabled; server-side encryption headers; Object Lock; and browser POST
+  uploads.
 - The worker that takes lifecycle actions as they fall due, over the Name layer's versions
   and uploads, once the gateway and the metadata layer hold configurations (metadata.md §6).
 

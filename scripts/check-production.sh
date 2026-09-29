@@ -3,7 +3,9 @@
 # without cfg(test), so the test-only allowances at each crate root do not apply.
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
-cargo clippy --workspace --lib --bins --all-features --locked "$@" -- \
+# The clippy driver: `cargo clippy`, or the cross-building one check-targets.sh passes.
+read -r -a clippy <<<"${CLIPPY:-cargo clippy}"
+"${clippy[@]}" --workspace --lib --bins --all-features --locked "$@" -- \
   -D warnings \
   -D clippy::panic \
   -D clippy::unwrap_used \

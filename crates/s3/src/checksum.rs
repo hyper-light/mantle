@@ -10,10 +10,9 @@ use std::hash::Hasher as _;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use md5::Md5;
-use sha1::Sha1;
-use sha2::{Digest as _, Sha256, Sha512};
 use twox_hash::{XxHash3_64, XxHash3_128, XxHash64};
+
+use crate::crypto::{self, CryptoError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Algorithm {
@@ -179,73 +178,66 @@ impl Checksum {
 }
 
 /// Computes a value as data streams through.
-#[derive(Clone)]
 pub enum Hasher {
     Crc32(mantle_crc::Crc32),
     Crc32c(mantle_crc::Crc32c),
     Crc64Nvme(mantle_crc::Crc64Nvme),
-    Sha1(Sha1),
-    Sha256(Sha256),
-    Md5(Md5),
     XxHash64(XxHash64),
     XxHash3(XxHash3_64),
     XxHash128(XxHash3_128),
-    Sha512(Sha512),
+    /// SHA-1, SHA-256, SHA-512 or MD5.
+    Digest(Algorithm, crypto::Digest),
 }
 
 impl Hasher {
-    pub fn new(algorithm: Algorithm) -> Self {
-        match algorithm {
+    pub fn new(algorithm: Algorithm) -> Result<Self, CryptoError> {
+        let digest = |d| crypto::Digest::new(d).map(|d| Self::Digest(algorithm, d));
+        Ok(match algorithm {
             Algorithm::Crc32 => Self::Crc32(mantle_crc::Crc32::new()),
             Algorithm::Crc32c => Self::Crc32c(mantle_crc::Crc32c::new()),
             Algorithm::Crc64Nvme => Self::Crc64Nvme(mantle_crc::Crc64Nvme::new()),
-            Algorithm::Sha1 => Self::Sha1(Sha1::new()),
-            Algorithm::Sha256 => Self::Sha256(Sha256::new()),
-            Algorithm::Md5 => Self::Md5(Md5::new()),
+            Algorithm::Sha1 => digest(&crypto::SHA1)?,
+            Algorithm::Sha256 => digest(&crypto::SHA256)?,
+            Algorithm::Md5 => digest(&crypto::MD5)?,
             // S3's xxHash values use the default seed, zero.
             Algorithm::XxHash64 => Self::XxHash64(XxHash64::with_seed(0)),
             Algorithm::XxHash3 => Self::XxHash3(XxHash3_64::with_seed(0)),
             Algorithm::XxHash128 => Self::XxHash128(XxHash3_128::with_seed(0)),
-            Algorithm::Sha512 => Self::Sha512(Sha512::new()),
-        }
+            Algorithm::Sha512 => digest(&crypto::SHA512)?,
+        })
     }
 
-    pub fn update(&mut self, data: &[u8]) {
+    pub fn update(&mut self, data: &[u8]) -> Result<(), CryptoError> {
         match self {
             Self::Crc32(h) => h.update(data),
             Self::Crc32c(h) => h.update(data),
             Self::Crc64Nvme(h) => h.update(data),
-            Self::Sha1(h) => h.update(data),
-            Self::Sha256(h) => h.update(data),
-            Self::Md5(h) => h.update(data),
             Self::XxHash64(h) => h.write(data),
             Self::XxHash3(h) => h.write(data),
             Self::XxHash128(h) => h.write(data),
-            Self::Sha512(h) => h.update(data),
+            Self::Digest(_, h) => return h.update(data),
         }
+        Ok(())
     }
 
-    pub fn finish(self) -> Checksum {
+    pub fn finish(self) -> Result<Checksum, CryptoError> {
         let (algorithm, bytes) = match self {
             Self::Crc32(h) => (Algorithm::Crc32, h.finish().to_be_bytes().to_vec()),
             Self::Crc32c(h) => (Algorithm::Crc32c, h.finish().to_be_bytes().to_vec()),
             Self::Crc64Nvme(h) => (Algorithm::Crc64Nvme, h.finish().to_be_bytes().to_vec()),
-            Self::Sha1(h) => (Algorithm::Sha1, h.finalize().to_vec()),
-            Self::Sha256(h) => (Algorithm::Sha256, h.finalize().to_vec()),
-            Self::Md5(h) => (Algorithm::Md5, h.finalize().to_vec()),
             Self::XxHash64(h) => (Algorithm::XxHash64, h.finish().to_be_bytes().to_vec()),
             Self::XxHash3(h) => (Algorithm::XxHash3, h.finish().to_be_bytes().to_vec()),
             Self::XxHash128(h) => (Algorithm::XxHash128, h.finish_128().to_be_bytes().to_vec()),
-            Self::Sha512(h) => (Algorithm::Sha512, h.finalize().to_vec()),
+            Self::Digest(algorithm, h) => (algorithm, h.finish()?),
         };
-        Checksum { algorithm, bytes }
+        Ok(Checksum { algorithm, bytes })
     }
 }
 
 /// The value of `data`.
-pub fn checksum(algorithm: Algorithm, data: &[u8]) -> Checksum {
-    let mut h = Hasher::new(algorithm);
-    h.update(data);
+pub fn checksum(algorithm: Algorithm, data: &[u8]) -> Result<Checksum, CryptoError> {
+    let mut h = Hasher::new(algorithm)?;
+    h.update(data)?;
     h.finish()
 }
 
@@ -285,18 +277,21 @@ pub fn full_object(parts: &[(Checksum, u64)]) -> Option<Checksum> {
 }
 
 /// The composite value of an object made of parts, `base64(H(H1 ‖ … ‖ Hn))-n`, over the
-/// parts' binary values (05 §3.4). `None` if the parts differ in algorithm or it has no
-/// composite form.
-pub fn composite(parts: &[Checksum]) -> Option<String> {
-    let algorithm = parts.first()?.algorithm;
+/// parts' binary values (05 §3.4). `None` if there are no parts, they differ in algorithm, or
+/// it has no composite form.
+pub fn composite(parts: &[Checksum]) -> Result<Option<String>, CryptoError> {
+    let Some(first) = parts.first() else {
+        return Ok(None);
+    };
+    let algorithm = first.algorithm;
     if !algorithm.composite() || parts.iter().any(|c| c.algorithm != algorithm) {
-        return None;
+        return Ok(None);
     }
-    let mut h = Hasher::new(algorithm);
+    let mut h = Hasher::new(algorithm)?;
     for part in parts {
-        h.update(&part.bytes);
+        h.update(&part.bytes)?;
     }
-    Some(format!("{}-{}", h.finish().to_base64(), parts.len()))
+    Ok(Some(format!("{}-{}", h.finish()?.to_base64(), parts.len())))
 }
 
 /// A single-part object's ETag: the MD5 of its bytes in lowercase hex, quoted (05 §5.1).
@@ -305,13 +300,13 @@ pub fn etag(md5: &[u8; 16]) -> String {
 }
 
 /// A multipart object's ETag: the MD5 of its parts' binary MD5s, then `-n`, quoted (05 §4.5).
-pub fn multipart_etag(parts: &[[u8; 16]]) -> String {
-    let mut h = Md5::new();
+pub fn multipart_etag(parts: &[[u8; 16]]) -> Result<String, CryptoError> {
+    let mut h = crypto::Digest::new(&crypto::MD5)?;
     for part in parts {
-        h.update(part);
+        h.update(part)?;
     }
-    let digest: [u8; 16] = h.finalize().into();
-    format!("\"{}-{}\"", hex(&digest), parts.len())
+    let digest: [u8; 16] = h.finish_array()?;
+    Ok(format!("\"{}-{}\"", hex(&digest), parts.len()))
 }
 
 /// A `Content-MD5` header's value: base64 of 16 bytes.
@@ -342,6 +337,14 @@ mod tests {
         Checksum::from_base64(algorithm, text).unwrap()
     }
 
+    fn sum(algorithm: Algorithm, data: &[u8]) -> Checksum {
+        checksum(algorithm, data).unwrap()
+    }
+
+    fn md5(data: &[u8]) -> [u8; 16] {
+        sum(Algorithm::Md5, data).bytes.try_into().unwrap()
+    }
+
     /// AWS's composite SHA-256 example from its multipart-checksum tutorial (05 §3.4).
     #[test]
     fn aws_tutorial_composite() {
@@ -352,7 +355,7 @@ mod tests {
         ]
         .map(|p| b64(Algorithm::Sha256, p));
         assert_eq!(
-            composite(&parts).unwrap(),
+            composite(&parts).unwrap().unwrap(),
             "aI8EoktCdotjU8Bq46DrPCxQCGuGcPIhJ51noWs6hvk=-3"
         );
     }
@@ -365,7 +368,7 @@ mod tests {
         let len = 5u64 << 20;
         let crc32: Vec<(Checksum, u64)> = parts
             .iter()
-            .map(|p| (checksum(Algorithm::Crc32, p), len))
+            .map(|p| (sum(Algorithm::Crc32, p), len))
             .collect();
         assert_eq!(
             crc32.iter().map(|(c, _)| c.to_base64()).collect::<Vec<_>>(),
@@ -374,29 +377,26 @@ mod tests {
         assert_eq!(full_object(&crc32).unwrap().to_base64(), "WgDhBQ==");
         let nvme: Vec<(Checksum, u64)> = parts
             .iter()
-            .map(|p| (checksum(Algorithm::Crc64Nvme, p), len))
+            .map(|p| (sum(Algorithm::Crc64Nvme, p), len))
             .collect();
         assert_eq!(
             nvme.iter().map(|(c, _)| c.to_base64()).collect::<Vec<_>>(),
             ["L/E4WYn8v98=", "xW1l19VobYM=", "cK5MnNaWrW4="]
         );
         assert_eq!(full_object(&nvme).unwrap().to_base64(), "i+6LR0y3eFo=");
-        let sha: Vec<Checksum> = parts
-            .iter()
-            .map(|p| checksum(Algorithm::Sha256, p))
-            .collect();
+        let sha: Vec<Checksum> = parts.iter().map(|p| sum(Algorithm::Sha256, p)).collect();
         assert_eq!(
-            composite(&sha).unwrap(),
+            composite(&sha).unwrap().unwrap(),
             "uWBwpe1dxI4Vw8Gf0X9ynOdw/SS6VBzfWm9giiv1sf4=-3"
         );
-        let md5: Vec<[u8; 16]> = parts.iter().map(|p| Md5::digest(p).into()).collect();
+        let md5s: Vec<[u8; 16]> = parts.iter().map(|p| md5(p)).collect();
         assert_eq!(
-            multipart_etag(&md5),
+            multipart_etag(&md5s).unwrap(),
             "\"b2add96cc9702bbf4efb0ccdfc6b7747-3\""
         );
-        let one = [checksum(Algorithm::Sha256, &[b'A'; 1024])];
+        let one = [sum(Algorithm::Sha256, &[b'A'; 1024])];
         assert_eq!(
-            composite(&one).unwrap(),
+            composite(&one).unwrap().unwrap(),
             "Ok6Cs5b96ux6+MWQkJO7UBT5sKPBeXBLwvj/hK89smg=-1"
         );
     }
@@ -405,7 +405,7 @@ mod tests {
     #[test]
     fn aws_trailer_crc32c() {
         assert_eq!(
-            checksum(Algorithm::Crc32c, &[b'a'; 66560]).to_base64(),
+            sum(Algorithm::Crc32c, &[b'a'; 66560]).to_base64(),
             "sOO8/Q=="
         );
     }
@@ -416,15 +416,17 @@ mod tests {
             assert_eq!(Algorithm::from_name(a.name()), Some(a));
             assert_eq!(Algorithm::from_name(&a.name().to_lowercase()), Some(a));
             assert_eq!(Algorithm::from_header(a.header()), Some(a));
-            assert_eq!(checksum(a, b"x").bytes.len(), a.width());
+            assert_eq!(sum(a, b"x").bytes.len(), a.width());
         }
         assert!(Checksum::from_base64(Algorithm::Crc32, "AAAAAAAA").is_none());
-        assert!(composite(&[checksum(Algorithm::Crc64Nvme, b"x")]).is_none());
-        assert!(full_object(&[(checksum(Algorithm::Sha256, b"x"), 1)]).is_none());
-        assert_eq!(
-            etag(&Md5::digest(b"").into()),
-            "\"d41d8cd98f00b204e9800998ecf8427e\""
+        assert!(
+            composite(&[sum(Algorithm::Crc64Nvme, b"x")])
+                .unwrap()
+                .is_none()
         );
+        assert!(composite(&[]).unwrap().is_none());
+        assert!(full_object(&[(sum(Algorithm::Sha256, b"x"), 1)]).is_none());
+        assert_eq!(etag(&md5(b"")), "\"d41d8cd98f00b204e9800998ecf8427e\"");
     }
 
     proptest! {
@@ -443,9 +445,9 @@ mod tests {
             for a in [Algorithm::Crc32, Algorithm::Crc32c, Algorithm::Crc64Nvme] {
                 let parts: Vec<(Checksum, u64)> = pieces
                     .iter()
-                    .map(|p| (checksum(a, p), p.len() as u64))
+                    .map(|p| (sum(a, p), p.len() as u64))
                     .collect();
-                prop_assert_eq!(full_object(&parts).unwrap(), checksum(a, &data));
+                prop_assert_eq!(full_object(&parts).unwrap(), sum(a, &data));
             }
         }
     }

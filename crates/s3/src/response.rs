@@ -1673,7 +1673,7 @@ mod tests {
     /// and a part's value (05 §3.3–§3.5).
     #[test]
     fn checksums_are_written_where_aws_places_them() {
-        let value = checksum(Algorithm::Crc32, b"hello");
+        let value = checksum(Algorithm::Crc32, b"hello").unwrap();
         let summary = ObjectChecksum {
             algorithm: Algorithm::Sha256,
             kind: ChecksumType::Composite,

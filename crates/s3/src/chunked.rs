@@ -9,8 +9,7 @@
 //! The decoder is fed the body as it arrives and holds at most one line of framing, whose
 //! longest legal form bounds it (`MAX_LINE`).
 
-use sha2::{Digest, Sha256};
-
+use crate::crypto::{self, CryptoError};
 use crate::sigv4::{AuthError, Chain, unhex};
 
 /// "The chunk size must be at least 8 KB ... except the last one" (S3 developer guide,
@@ -46,6 +45,8 @@ pub enum ChunkError {
     Trailer,
     #[error(transparent)]
     Signature(#[from] AuthError),
+    #[error("a chunk could not be hashed: {0}")]
+    Internal(#[from] CryptoError),
 }
 
 impl ChunkError {
@@ -58,6 +59,7 @@ impl ChunkError {
             Self::Framing(_) | Self::ShortChunk | Self::TooLong | Self::Trailer => {
                 ("InvalidRequest", 400)
             }
+            Self::Internal(_) => ("InternalError", 500),
         }
     }
 }
@@ -84,7 +86,8 @@ pub struct Decoder {
     decoded: u64,
     state: State,
     line: Vec<u8>,
-    hasher: Sha256,
+    /// The SHA-256 of the current chunk's data, for signed chunks.
+    hasher: Option<crypto::Digest>,
     signature: [u8; 32],
     /// A data chunk under `MIN_CHUNK` was seen, so the next chunk must be the last.
     short: bool,
@@ -111,7 +114,7 @@ impl Decoder {
             decoded: 0,
             state: State::Header,
             line: Vec::with_capacity(MAX_LINE),
-            hasher: Sha256::new(),
+            hasher: None,
             signature: [0; 32],
             short: false,
             trailer: None,
@@ -126,7 +129,9 @@ impl Decoder {
                 State::Data(left) => {
                     let take = usize::try_from(left).unwrap_or(usize::MAX).min(input.len());
                     let (data, rest) = input.split_at(take);
-                    self.hasher.update(data);
+                    if let Some(hasher) = &mut self.hasher {
+                        hasher.update(data)?;
+                    }
                     out.extend_from_slice(data);
                     let taken = u64::try_from(take).unwrap_or(u64::MAX);
                     self.decoded = self.decoded.saturating_add(taken);
@@ -212,7 +217,10 @@ impl Decoder {
         let size = u64::from_str_radix(size, 16)
             .map_err(|_| ChunkError::Framing("a chunk size is not hex"))?;
         self.signature = signature;
-        self.hasher = Sha256::new();
+        self.hasher = match self.chain {
+            Some(_) => Some(crypto::Digest::new(&crypto::SHA256)?),
+            None => None,
+        };
         if size == 0 {
             self.chunk_done()?;
             self.state = State::Trailer;
@@ -229,8 +237,11 @@ impl Decoder {
     /// Checks the signature of the chunk just read, when chunks are signed.
     fn chunk_done(&mut self) -> Result<(), ChunkError> {
         if let Some(chain) = &mut self.chain {
-            let hasher = std::mem::replace(&mut self.hasher, Sha256::new());
-            chain.verify_chunk(&hasher.finalize().into(), &self.signature)?;
+            let hasher = self
+                .hasher
+                .take()
+                .ok_or(ChunkError::Framing("a chunk ended that did not begin"))?;
+            chain.verify_chunk(&hasher.finish_array()?, &self.signature)?;
         }
         Ok(())
     }
@@ -301,7 +312,7 @@ mod tests {
     const WHEN: &str = "20130524T000000Z";
 
     fn chain(seed: [u8; 32]) -> Chain {
-        client_chain(SECRET, WHEN, "20130524", "us-east-1", seed)
+        client_chain(SECRET, WHEN, "20130524", "us-east-1", seed).unwrap()
     }
 
     /// Frames `data` as signed chunks of `sizes` (then the rest), with an optional trailer.
@@ -326,17 +337,19 @@ mod tests {
             pieces.push(&data[at..]);
         }
         for piece in pieces {
-            let sig = chain.sign_chunk(&Sha256::digest(piece).into());
+            let sig = chain.sign_chunk(&crypto::sha256(piece).unwrap()).unwrap();
             out.extend_from_slice(
                 format!("{:x};chunk-signature={}\r\n", piece.len(), hex(&sig)).as_bytes(),
             );
             out.extend_from_slice(piece);
             out.extend_from_slice(b"\r\n");
         }
-        let zero = chain.sign_chunk(&Sha256::digest([]).into());
+        let zero = chain.sign_chunk(&crypto::sha256(&[]).unwrap()).unwrap();
         out.extend_from_slice(format!("0;chunk-signature={}\r\n", hex(&zero)).as_bytes());
         if let Some((name, value)) = trailer {
-            let sig = chain.sign_trailer(format!("{name}:{value}\n").as_bytes());
+            let sig = chain
+                .sign_trailer(format!("{name}:{value}\n").as_bytes())
+                .unwrap();
             out.extend_from_slice(
                 format!(
                     "{name}:{value}\r\nx-amz-trailer-signature:{}\r\n",

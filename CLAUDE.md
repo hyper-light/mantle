@@ -83,6 +83,7 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 bash scripts/check-production.sh
 cargo deny check advisories bans licenses sources
 cargo test --workspace --locked
+cargo test --manifest-path vendor/Cargo.toml --workspace --locked
 ```
 
 Work lands on `dev`, committed and pushed after each gated step.

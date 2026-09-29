@@ -8,3 +8,4 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 bash scripts/check-production.sh
 cargo deny check advisories bans licenses sources 2>/dev/null
 cargo test --workspace --locked
+cargo test --manifest-path vendor/Cargo.toml --workspace --locked

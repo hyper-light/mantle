@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-09-28. A component is complete when its tests pass on all six CI targets
+Updated 2026-09-29. A component is complete when its tests pass on all six CI targets
 (Linux, macOS and Windows on x86_64 and arm64) and the evidence listed for it has been
 recorded.
 
@@ -22,6 +22,12 @@ directory and, with `--measure`, benchmarks the device. It is built on:
   scratch file is removed whether the run succeeds or fails.
 - **Checksums**: CRC-32C for stored and transmitted data, and CRC-64/NVME for S3
   checksums, both verified against published test vectors.
+- **Cryptography** ([design](design/crypto.md)): AWS-LC through aws-lc-rs, vendored with the
+  changes vendor/UPSTREAM.md lists. Processes seed from the operating system rather than CPU
+  jitter entropy, 17.6 ms sooner, and a CPU random-number instruction that keeps failing gives
+  way to the operating system instead of aborting the process, tested with generators that
+  fail on demand. Both crates' own suites run on every target, and every target lints from
+  one machine with cross C toolchains.
 - **A simulated device** for crash testing: writes not yet flushed are lost, kept or torn
   at sector granularity when it crashes, a failed flush leaves their durability unknown,
   and reads and writes can be made to fail or return corrupted bytes.
@@ -94,7 +100,9 @@ the CompleteMultipartUpload, DeleteObjects, CreateBucket and PutBucketVersioning
 read against their schemas under size limits computed from S3's own. The documents every
 response carries, from listings and multipart results to batch deletes, errors and bucket
 settings, each holding what AWS's sample response holds for the same content when both are
-read by roxmltree.
+read by roxmltree. Its SHA-1, SHA-256, SHA-512, MD5 and HMAC-SHA256 come from AWS-LC, every
+call fallible and behind an unwind boundary. `mantle bench hash` measures each checksum
+algorithm, signature verification and signed-chunk decoding on one core.
 
 Remaining before it is done:
 

@@ -1,5 +1,7 @@
 [workspace]
 members = ["crates/*"]
+# vendor/ is its own workspace, which runs the vendored crates' own suites (vendor/UPSTREAM.md).
+exclude = ["vendor"]
 resolver = "3"
 
 [workspace.package]
@@ -12,18 +14,16 @@ repository = "https://github.com/hyper-light/mantle"
 publish = false
 
 [workspace.dependencies]
+# AWS-LC, through the vendored copies patched in below (docs/design/crypto.md).
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys"] }
 base64 = "0.23"
 bytes = "1.12"
 clap = { version = "4.6", features = ["derive"] }
 getrandom = "0.4"
-hmac = "0.13"
-md-5 = "0.11"
 crc-fast = { version = "1.10", default-features = false, features = ["std"] }
 proptest = "1.11"
 reed-solomon-simd = "3.1"
 roxmltree = "0.21"
-sha2 = "0.11"
-sha1 = "0.11"
 rustix = { version = "1.1", features = ["fs", "system", "param"] }
 tempfile = "3.20"
 thiserror = "2.0"
@@ -85,3 +85,11 @@ inherits = "release"
 # stays a debug build with every check.
 [profile.dev.package.reed-solomon-simd]
 opt-level = 3
+
+# AWS-LC and its Rust binding, vendored with local patches recorded in vendor/UPSTREAM.md: the
+# default build seeds from the operating system rather than CPU jitter entropy, a hardware rng
+# that keeps failing gives way to the operating system instead of aborting the process, and
+# `LessSafeKey` clones.
+[patch.crates-io]
+aws-lc-rs = { path = "vendor/aws-lc-rs" }
+aws-lc-sys = { path = "vendor/aws-lc-sys" }

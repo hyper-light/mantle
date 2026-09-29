@@ -6,10 +6,7 @@
 //! characters they escape, and the signed form is always the `UriEncode` form (05 §1.2.2).
 //! S3 paths are encoded once and never normalized, so `a//b` stays `a//b`.
 
-use hmac::{Hmac, KeyInit, Mac};
-use sha2::{Digest, Sha256};
-
-type HmacSha256 = Hmac<Sha256>;
+use crate::crypto::{self, CryptoError};
 
 pub const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 /// SHA-256 of the empty string, the hashed payload of a request with no body.
@@ -74,6 +71,8 @@ pub enum AuthError {
     Mismatch,
     #[error("{0}")]
     Unsupported(&'static str),
+    #[error("the signature could not be checked: {0}")]
+    Internal(#[from] CryptoError),
 }
 
 impl AuthError {
@@ -87,6 +86,7 @@ impl AuthError {
             Self::TooSkewed => ("RequestTimeTooSkewed", 403),
             Self::Mismatch => ("SignatureDoesNotMatch", 403),
             Self::Unsupported(_) => ("InvalidRequest", 400),
+            Self::Internal(_) => ("InternalError", 500),
         }
     }
 }
@@ -140,22 +140,22 @@ impl Chain {
             self.timestamp,
             self.scope,
             hex(&self.previous),
-            hex(&Sha256::digest(canonical).into())
+            hex(&crypto::sha256(canonical)?)
         );
         self.advance(&sts, signature)
     }
 
     fn advance(&mut self, string_to_sign: &str, signature: &[u8; 32]) -> Result<(), AuthError> {
-        let mac = HmacSha256::new_from_slice(&self.key).map_err(|_| AuthError::Mismatch)?;
-        mac.chain_update(string_to_sign.as_bytes())
-            .verify_slice(signature)
-            .map_err(|_| AuthError::Mismatch)?;
+        let expected = crypto::hmac_sha256(&self.key, string_to_sign.as_bytes())?;
+        if !crypto::equal(&expected, signature)? {
+            return Err(AuthError::Mismatch);
+        }
         self.previous = *signature;
         Ok(())
     }
 
     /// Signs the next chunk as a client would: for tests and for mantle's own clients.
-    pub fn sign_chunk(&mut self, sha256: &[u8; 32]) -> [u8; 32] {
+    pub fn sign_chunk(&mut self, sha256: &[u8; 32]) -> Result<[u8; 32], AuthError> {
         let sts = format!(
             "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{}\n{}",
             self.timestamp,
@@ -164,23 +164,23 @@ impl Chain {
             EMPTY_SHA256,
             hex(sha256)
         );
-        let signature = hmac(&self.key, sts.as_bytes());
+        let signature = crypto::hmac_sha256(&self.key, sts.as_bytes())?;
         self.previous = signature;
-        signature
+        Ok(signature)
     }
 
     /// Signs the trailer as a client would.
-    pub fn sign_trailer(&mut self, canonical: &[u8]) -> [u8; 32] {
+    pub fn sign_trailer(&mut self, canonical: &[u8]) -> Result<[u8; 32], AuthError> {
         let sts = format!(
             "AWS4-HMAC-SHA256-TRAILER\n{}\n{}\n{}\n{}",
             self.timestamp,
             self.scope,
             hex(&self.previous),
-            hex(&Sha256::digest(canonical).into())
+            hex(&crypto::sha256(canonical)?)
         );
-        let signature = hmac(&self.key, sts.as_bytes());
+        let signature = crypto::hmac_sha256(&self.key, sts.as_bytes())?;
         self.previous = signature;
-        signature
+        Ok(signature)
     }
 }
 
@@ -428,17 +428,16 @@ fn check_signature(
     secret: &impl Fn(&str) -> Option<String>,
 ) -> Result<[u8; 32], AuthError> {
     let secret = secret(claim.access_key).ok_or(AuthError::UnknownKey)?;
-    let key = signing_key(&secret, claim.date, claim.region, claim.service);
+    let key = signing_key(&secret, claim.date, claim.region, claim.service)?;
     let sts = string_to_sign(
         timestamp,
         &scope(claim.date, claim.region, claim.service),
         canonical,
-    );
-    HmacSha256::new_from_slice(&key)
-        .map_err(|_| AuthError::Mismatch)?
-        .chain_update(sts.as_bytes())
-        .verify_slice(&claim.signature)
-        .map_err(|_| AuthError::Mismatch)?;
+    )?;
+    let expected = crypto::hmac_sha256(&key, sts.as_bytes())?;
+    if !crypto::equal(&expected, &claim.signature)? {
+        return Err(AuthError::Mismatch);
+    }
     Ok(key)
 }
 
@@ -495,11 +494,15 @@ pub fn canonical_request(
     ))
 }
 
-pub fn string_to_sign(timestamp: &str, scope: &str, canonical_request: &str) -> String {
-    format!(
+pub fn string_to_sign(
+    timestamp: &str,
+    scope: &str,
+    canonical_request: &str,
+) -> Result<String, AuthError> {
+    Ok(format!(
         "{ALGORITHM}\n{timestamp}\n{scope}\n{}",
-        hex(&Sha256::digest(canonical_request.as_bytes()).into())
-    )
+        hex(&crypto::sha256(canonical_request.as_bytes())?)
+    ))
 }
 
 pub fn scope(date: &str, region: &str, service: &str) -> String {
@@ -507,30 +510,31 @@ pub fn scope(date: &str, region: &str, service: &str) -> String {
 }
 
 /// `SigningKey = HMAC(HMAC(HMAC(HMAC("AWS4" + secret, date), region), service), "aws4_request")`.
-pub fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> [u8; 32] {
+pub fn signing_key(
+    secret: &str,
+    date: &str,
+    region: &str,
+    service: &str,
+) -> Result<[u8; 32], AuthError> {
     let mut first = b"AWS4".to_vec();
     first.extend_from_slice(secret.as_bytes());
-    let date_key = hmac(&first, date.as_bytes());
-    let region_key = hmac(&date_key, region.as_bytes());
-    let service_key = hmac(&region_key, service.as_bytes());
-    hmac(&service_key, b"aws4_request")
-}
-
-fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
-    // HMAC accepts a key of any length; the error arm is unreachable for HMAC-SHA256, and a
-    // key of zeros would only produce a signature that matches nothing.
-    HmacSha256::new_from_slice(key)
-        .map(|m| m.chain_update(data).finalize().into_bytes().into())
-        .unwrap_or([0u8; 32])
+    let date_key = crypto::hmac_sha256(&first, date.as_bytes())?;
+    let region_key = crypto::hmac_sha256(&date_key, region.as_bytes())?;
+    let service_key = crypto::hmac_sha256(&region_key, service.as_bytes())?;
+    Ok(crypto::hmac_sha256(&service_key, b"aws4_request")?)
 }
 
 /// Signs `canonical` as a client would, for tests and mantle's own clients.
-pub fn sign(secret: &str, timestamp: &str, date: &str, region: &str, canonical: &str) -> [u8; 32] {
-    let key = signing_key(secret, date, region, "s3");
-    hmac(
-        &key,
-        string_to_sign(timestamp, &scope(date, region, "s3"), canonical).as_bytes(),
-    )
+pub fn sign(
+    secret: &str,
+    timestamp: &str,
+    date: &str,
+    region: &str,
+    canonical: &str,
+) -> Result<[u8; 32], AuthError> {
+    let key = signing_key(secret, date, region, "s3")?;
+    let sts = string_to_sign(timestamp, &scope(date, region, "s3"), canonical)?;
+    Ok(crypto::hmac_sha256(&key, sts.as_bytes())?)
 }
 
 /// The chain a client starts with its seed signature, for tests and mantle's own clients.
@@ -540,13 +544,13 @@ pub fn client_chain(
     date: &str,
     region: &str,
     seed: [u8; 32],
-) -> Chain {
-    Chain {
-        key: signing_key(secret, date, region, "s3"),
+) -> Result<Chain, AuthError> {
+    Ok(Chain {
+        key: signing_key(secret, date, region, "s3")?,
         timestamp: timestamp.to_owned(),
         scope: scope(date, region, "s3"),
         previous: seed,
-    }
+    })
 }
 
 fn body_of(payload: &str) -> Option<Body> {
@@ -779,7 +783,7 @@ mod tests {
                 .1;
             let canonical = canonical_request(&request, &signed_list, payload, None).unwrap();
             assert_eq!(
-                hex(&Sha256::digest(canonical.as_bytes()).into()),
+                hex(&crypto::sha256(canonical.as_bytes()).unwrap()),
                 hash,
                 "{method} {path}?{query}"
             );
@@ -877,7 +881,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            hex(&Sha256::digest(canonical.as_bytes()).into()),
+            hex(&crypto::sha256(canonical.as_bytes()).unwrap()),
             "3bfa292879f6447bbcda7001decf97f4a54dc650c8942174ae0a9121cf58ad04"
         );
         let verified = verify(&request, "us-east-1", now() + 3600, secret).unwrap();
@@ -921,7 +925,7 @@ mod tests {
         let canonical =
             canonical_request(&request, &list, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD", None).unwrap();
         assert_eq!(
-            hex(&Sha256::digest(canonical.as_bytes()).into()),
+            hex(&crypto::sha256(canonical.as_bytes()).unwrap()),
             "cee3fed04b70f867d036f722359b0b1f2f0e5dc0efadbc082b76c4c60e316455"
         );
         let authorization = auth(
@@ -952,7 +956,7 @@ mod tests {
             ),
         ] {
             let data = vec![b'a'; len];
-            let sha: [u8; 32] = Sha256::digest(&data).into();
+            let sha = crypto::sha256(&data).unwrap();
             chain
                 .verify_chunk(&sha, &unhex(signature).unwrap())
                 .unwrap();
@@ -991,24 +995,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            hex(&Sha256::digest(canonical.as_bytes()).into()),
+            hex(&crypto::sha256(canonical.as_bytes()).unwrap()),
             "44d48b8c2f70eae815a0198cc73d7a546a73a93359c070abbaa5e6c7de112559"
         );
-        let seed = sign(SECRET, WHEN, "20130524", "us-east-1", &canonical);
+        let seed = sign(SECRET, WHEN, "20130524", "us-east-1", &canonical).unwrap();
         assert_eq!(
             hex(&seed),
             "106e2a8a18243abcf37539882f36619c00e2dfc72633413f02d3b74544bfeb8e"
         );
-        let mut chain = client_chain(SECRET, WHEN, "20130524", "us-east-1", seed);
+        let mut chain = client_chain(SECRET, WHEN, "20130524", "us-east-1", seed).unwrap();
         for len in [65536, 1024] {
-            chain.sign_chunk(&Sha256::digest(vec![b'a'; len]).into());
+            chain
+                .sign_chunk(&crypto::sha256(&vec![b'a'; len]).unwrap())
+                .unwrap();
         }
-        let zero = chain.sign_chunk(&Sha256::digest([]).into());
+        let zero = chain.sign_chunk(&crypto::sha256(&[]).unwrap()).unwrap();
         assert_eq!(
             hex(&zero),
             "2ca2aba2005185cf7159c6277faf83795951dd77a3a99e6e65d5c9f85863f992"
         );
-        let trailer = chain.sign_trailer(b"x-amz-checksum-crc32c:sOO8/Q==\n");
+        let trailer = chain
+            .sign_trailer(b"x-amz-checksum-crc32c:sOO8/Q==\n")
+            .unwrap();
         assert_eq!(
             hex(&trailer),
             "d81f82fc3505edab99d459891051a732e8730629a2e4a59689829ca17fe2e435"

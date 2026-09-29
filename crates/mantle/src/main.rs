@@ -19,6 +19,7 @@ use clap::{Parser, Subcommand};
 
 mod bench;
 mod bench_ec;
+mod bench_hash;
 mod bench_log;
 mod disk;
 mod display;
@@ -97,6 +98,17 @@ enum BenchCommand {
         seconds: f64,
         /// Chunk sizes to measure, comma-separated, in bytes or with a K or M suffix: 64K,1M,8M
         /// by default.
+        #[arg(long, value_delimiter = ',', value_parser = parse_size)]
+        sizes: Vec<usize>,
+    },
+    /// Measure the S3 gateway's cryptography on one core: each checksum algorithm across
+    /// buffer sizes, verifying a request's signature, and decoding signed chunks.
+    Hash {
+        /// Seconds each measurement runs.
+        #[arg(long, default_value_t = 0.5)]
+        seconds: f64,
+        /// Buffer sizes to measure, comma-separated, in bytes or with a K or M suffix:
+        /// 8K,64K,1M,8M by default.
         #[arg(long, value_delimiter = ',', value_parser = parse_size)]
         sizes: Vec<usize>,
     },
@@ -207,6 +219,19 @@ fn main() -> ExitCode {
                     sizes
                 };
                 bench_ec::ec(&mut out, &bench_ec::CODES, &sizes, step).map_err(|e| e.to_string())
+            }
+            Err(_) => Err(format!("--seconds {seconds} is not a duration")),
+        },
+        Command::Bench {
+            command: BenchCommand::Hash { seconds, sizes },
+        } => match std::time::Duration::try_from_secs_f64(seconds) {
+            Ok(step) => {
+                let sizes = if sizes.is_empty() {
+                    vec![8 << 10, 64 << 10, 1 << 20, 8 << 20]
+                } else {
+                    sizes
+                };
+                bench_hash::hash(&mut out, &sizes, step).map_err(|e| e.to_string())
             }
             Err(_) => Err(format!("--seconds {seconds} is not a duration")),
         },

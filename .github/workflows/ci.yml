@@ -40,9 +40,17 @@ jobs:
         run: |
           rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
           rustup target add --toolchain 1.98.0 ${{ matrix.target }}
+      # AWS-LC's x86_64 Windows assembly is NASM source, built rather than taken prebuilt
+      # (vendor/UPSTREAM.md).
+      - name: Install NASM
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        uses: ilammy/setup-nasm@v1.5.2
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+          workspaces: |
+            .
+            vendor
       - name: Source contracts
         run: python3 scripts/check-contracts.py
       - name: Formatting
@@ -54,5 +62,7 @@ jobs:
         run: bash scripts/check-production.sh --target ${{ matrix.target }}
       - name: Tests
         run: cargo test --workspace --locked --target ${{ matrix.target }}
+      - name: Vendored crates' suites
+        run: cargo test --manifest-path vendor/Cargo.toml --workspace --locked --target ${{ matrix.target }}
       - name: Release build
         run: cargo build --release --workspace --locked --target ${{ matrix.target }}

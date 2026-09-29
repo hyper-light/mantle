@@ -23,6 +23,7 @@ restating S3.
 | `xml`, `body` | the XML reader and writer, and request documents read against their schemas | 13; roxmltree as an oracle |
 | `json` | the JSON reader and compact writer, for bucket policies | 17 §1; JSONTestSuite's 318 cases |
 | `policy` | bucket policies checked, and requests judged against them | 17; S3's recorded answers, s3-tests' policies, IAM's documented semantics |
+| `account` | account IDs, and the expected bucket owner a request names | 17 §2.1; S3's recorded answers |
 | `tagging` | tag sets: S3's limits and characters, and the `x-amz-tagging` header | 13 §6.7, s3-tests, S3's observed answers |
 | `acl` | canned and header ACLs, Object Ownership, and whether a request's ACL goes ahead with ACLs disabled | 13 §6.8, s3-tests |
 | `lifecycle` | lifecycle rules checked, when each action falls due, and the expiration and abort headers | 13 §6.9, the user guide's worked examples, s3-tests |
@@ -450,6 +451,10 @@ be enforced differently from the one its author reviewed.
 mantle's principals: accounts and the anonymous requester** (`crates/s3/src/policy`; 17).
 With ACLs disabled on every bucket (§5), a policy is how a bucket's owner lets anyone else in.
 
+- **Expected owners.** `x-amz-expected-bucket-owner`, and a copy source's
+  `x-amz-source-expected-bucket-owner`, refuse a request whose bucket another account owns,
+  `403 AccessDenied`, and a value that is no 12-digit account ID first, `400
+  InvalidBucketOwnerAWSAccountID` naming it, as S3 answered (`crates/s3/src/account.rs`).
 - **Principals.** An account is named as AWS names one, by its 12-digit ID or its root's ARN,
   or by its canonical user ID, so a policy written for S3 names mantle's accounts unchanged.
   mantle has no IAM users, roles or federation, so a policy naming one names no principal

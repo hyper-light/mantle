@@ -631,7 +631,7 @@ fn account(named: &str) -> Result<String, PolicyError> {
         .strip_prefix("arn:aws:iam::")
         .and_then(|rest| rest.strip_suffix(":root"))
         .unwrap_or(named);
-    if id.len() == 12 && id.bytes().all(|b| b.is_ascii_digit()) {
+    if crate::account::valid_id(id) {
         Ok(id.to_owned())
     } else {
         Err(PolicyError::Principal)

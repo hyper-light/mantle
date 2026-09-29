@@ -115,6 +115,15 @@ opening brackets, and 250,001 bytes of `[{"":` repeated.
   "Statement":[{"Effect":"Allow","Sid":"1","Principal":{"AWS":["111122223333",
   "444455556666"]},"Action":["s3:*"],"Resource":"arn:aws:s3:::bucket/*"}]}`.
 - botocore marks the operation `requestChecksumRequired`.
+- `x-amz-expected-bucket-owner`, on these operations as on most others: "If the account ID
+  that you provide does not match the actual owner of the bucket, the request fails with the
+  HTTP status code `403 Forbidden` (access denied)." S3 answered a mismatch 403 `AccessDenied`,
+  "Access Denied", and the values `0000`, `0000000000020`, `abcd` and `invalid` 400
+  `InvalidBucketOwnerAWSAccountID`, "The value of the expected bucket owner parameter must be an
+  AWS Account ID... [0000]", the value in brackets (secondary: LocalStack
+  `test_get_bucket_policy_invalid_account_id`, `test_put_bucket_policy_expected_bucket_owner`,
+  `test_delete_bucket_policy_expected_bucket_owner`, recorded 2026-02-21). The error table's
+  message is "The value of the expected bucket owner parameter must be an AWS account ID."
 
 ### 2.2 GetBucketPolicy, DeleteBucketPolicy, GetBucketPolicyStatus
 

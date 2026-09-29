@@ -3,7 +3,7 @@
 
 use std::fmt;
 
-use crate::codec::{Reader, Writer};
+use mantle_codec::{Reader, Writer};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ChunkKey {

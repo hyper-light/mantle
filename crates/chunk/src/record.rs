@@ -9,8 +9,8 @@
 
 use mantle_disk::buf::AlignedBuf;
 
-use crate::codec::{Reader, Writer};
 use crate::key::ChunkKey;
+use mantle_codec::{Reader, Writer};
 
 pub const RECORD_MAGIC: [u8; 4] = *b"MNRC";
 pub const SEGMENT_MAGIC: [u8; 4] = *b"MNSG";

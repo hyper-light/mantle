@@ -6,7 +6,7 @@
 //! LFS takes the newer of its two checkpoint regions (Rosenblum and Ousterhout, TOCS 1992,
 //! §4.1). Each copy is one block ending in its CRC-32C.
 
-use crate::codec::{Reader, Writer};
+use mantle_codec::{Reader, Writer};
 
 pub const MAGIC: [u8; 8] = *b"MNTLVOL1";
 pub const VERSION: u32 = 2;

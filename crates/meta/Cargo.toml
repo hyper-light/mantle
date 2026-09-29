@@ -11,6 +11,7 @@ publish.workspace = true
 
 [dependencies]
 mantle-chunk = { path = "../chunk" }
+mantle-codec = { path = "../codec" }
 mantle-crc = { path = "../crc" }
 thiserror.workspace = true
 

@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 47fb09043566384e409de7718f932508e45597cf2fdfdf18cb4685b2f3682d70 # shrinks to steps = [Append { group: 3, terms: [1, 1, 1], back: 0 }, Compact { group: 3, keep: 1 }, Crash { ops: 0 }, Append { group: 0, terms: [1], back: 0 }, Append { group: 0, terms: [1], back: 0 }], seed = 0, segment_blocks = 4
+cc 5108f4768419d8fd2e84fefa397c15dfdc836ff5ae1d34ca704f017d511133eb # shrinks to steps = [Append { group: 0, terms: [1], back: 0 }, Propose { group: 0, ahead: 2 }, Append { group: 0, terms: [1, 1, 1], back: 1 }, Append { group: 0, terms: [1], back: 2 }, Crash { ops: 0 }, Append { group: 0, terms: [1], back: 0 }], seed = 0, segment_blocks = 5
+cc 078468b738f9ab5b24546fd8af18b5eba3885b8e21b76e089f1e66e8ab8d8d91 # shrinks to steps = [Snapshot { group: 2, ahead: 0 }, Append { group: 0, terms: [1], back: 0 }, Append { group: 1, terms: [1], back: 0 }, Snapshot { group: 0, ahead: 0 }, Append { group: 0, terms: [1], back: 0 }, Append { group: 0, terms: [1], back: 0 }, Crash { ops: 1 }, Snapshot { group: 0, ahead: 0 }, Crash { ops: 1 }, Snapshot { group: 0, ahead: 1 }], seed = 9027821557123358245, segment_blocks = 4

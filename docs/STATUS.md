@@ -114,15 +114,27 @@ simulation of one bucket across a Bucket range and two Name ranges checks after 
 that no acknowledged write is lost to a delete, under 2,000 generated schedules of
 concurrent creates and deletes, coordinators taken over, and writers with stale views.
 
+The Raft log (`mantle-log`, [design](design/raft-log.md)), which every range replica on a
+metadata device shares: group commit across ranges with one flush a batch, frames whose
+sequences tell a torn tail from damage to acknowledged state, segments reclaimed oldest
+first by sweeping their live records forward in one frame, and reads of entries no longer
+in memory verified by each entry's own checksum. A property test runs generated histories
+of appends, conflicts, compactions, snapshots, proposals and removals, cutting power at
+random points on the simulated device, and checks after every reopen that each
+acknowledged update survived and the one in flight landed whole or not at all; a soak of
+200,000 histories over segment sizes and quotas passed.
+
 Remaining before it is done:
 
+- The replica: focal-raft's core driven over the log and an engine, and a benchmark of the
+  log's submissions per second and latency against the device's measured flush rate.
 - The coordinator that runs a bucket's create and delete across the ranges, and the
   collector that finishes what a failed one leaves and removes unreferenced files and
   blocks after a grace period.
 - The production engine, once its binding is chosen (design §4).
-- Ranges replicated with focal's Raft and its fast-track commit over a shared per-disk log,
-  with request deduplication, ReadIndex reads, snapshots and splits, over QUIC for bulk
-  transfers and a UDP transport for consensus messages.
+- Ranges replicated with focal's Raft and its fast-track commit, with request
+  deduplication, ReadIndex reads, snapshots and splits, over QUIC for bulk transfers and a
+  UDP transport for consensus messages.
 - Done when a linearizability checker accepts histories recorded under network partitions,
   process crashes and disk faults, both in deterministic simulation and with real
   processes.

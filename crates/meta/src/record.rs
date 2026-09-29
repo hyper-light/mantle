@@ -1,7 +1,7 @@
 //! Row values: a format byte, the fields, and a CRC-32C of everything before it, verified
 //! before a field is read (CLAUDE.md rule 6). A value whose checksum fails is `Corrupt`.
 
-use mantle_chunk::codec::{Reader, Writer};
+use mantle_codec::{Reader, Writer};
 
 /// Values written by this code.
 const FORMAT: u8 = 1;

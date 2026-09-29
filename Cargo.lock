@@ -354,11 +354,19 @@ name = "mantle-chunk"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.4.3",
+ "mantle-codec",
  "mantle-crc",
  "mantle-disk",
  "proptest",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "mantle-codec"
+version = "0.1.0"
+dependencies = [
+ "proptest",
 ]
 
 [[package]]
@@ -390,10 +398,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "mantle-log"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "mantle-codec",
+ "mantle-crc",
+ "mantle-disk",
+ "proptest",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "mantle-meta"
 version = "0.1.0"
 dependencies = [
  "mantle-chunk",
+ "mantle-codec",
  "mantle-crc",
  "proptest",
  "thiserror",

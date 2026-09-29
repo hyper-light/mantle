@@ -13,7 +13,6 @@
 )]
 
 mod clean;
-pub mod codec;
 mod error;
 pub mod frame;
 pub mod index;

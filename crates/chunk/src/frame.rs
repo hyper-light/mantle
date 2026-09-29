@@ -7,8 +7,8 @@
 //! same device, and a torn tail from corruption in the middle (Alagappan et al., FAST 2018,
 //! §3.3.3).
 
-use crate::codec::{Reader, Writer};
 use crate::key::ChunkKey;
+use mantle_codec::{Reader, Writer};
 
 pub const FRAME_MAGIC: [u8; 4] = *b"MNIX";
 pub const FRAME_VERSION: u16 = 2;

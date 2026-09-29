@@ -1,6 +1,6 @@
 [package]
-name = "mantle-chunk"
-description = "The chunk store: one log-structured volume per device"
+name = "mantle-log"
+description = "The Raft log: one log per metadata device, shared by every range replica on it"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

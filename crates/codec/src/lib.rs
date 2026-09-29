@@ -1,6 +1,17 @@
 //! Bounds-checked little-endian encoding for on-disk structures. A reader past the end of
 //! its input returns `None` instead of panicking, so a torn or corrupt structure decodes to
 //! "invalid", never to a crash.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::disallowed_macros
+    )
+)]
 
 /// Appends little-endian fields to a byte vector.
 #[derive(Debug, Default)]

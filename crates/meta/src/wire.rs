@@ -661,6 +661,35 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
             record::put_bytes(w, &s.at)?;
             w.u64(s.child);
         }
+        name::Command::Freeze(f) => {
+            w.u8(14);
+            w.u64(f.generation);
+            record::put_descriptor(w, &f.into)?;
+        }
+        name::Command::Merge(m) => {
+            w.u8(15);
+            w.u64(m.generation);
+            record::put_descriptor(w, &m.from)?;
+            w.u64(m.max_rows);
+        }
+        name::Command::Abandon(a) => {
+            w.u8(16);
+            w.u64(a.generation);
+        }
+        name::Command::End(e) => {
+            w.u8(17);
+            w.u64(e.generation);
+            record::put_descriptor(w, &e.into)?;
+        }
+        name::Command::Thaw(t) => {
+            w.u8(18);
+            w.u64(t.generation);
+        }
+        name::Command::Resolve(r) => {
+            w.u8(19);
+            w.u64(r.from);
+            w.u64(r.generation);
+        }
     }
     Ok(())
 }
@@ -792,6 +821,29 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
             generation: r.u64()?,
             at: record::take_bytes(r)?,
             child: r.u64()?,
+        }),
+        14 => name::Command::Freeze(name::Freeze {
+            generation: r.u64()?,
+            into: record::take_descriptor(r)?,
+        }),
+        15 => name::Command::Merge(name::Merge {
+            generation: r.u64()?,
+            from: record::take_descriptor(r)?,
+            max_rows: r.u64()?,
+        }),
+        16 => name::Command::Abandon(name::Abandon {
+            generation: r.u64()?,
+        }),
+        17 => name::Command::End(name::End {
+            generation: r.u64()?,
+            into: record::take_descriptor(r)?,
+        }),
+        18 => name::Command::Thaw(name::Thaw {
+            generation: r.u64()?,
+        }),
+        19 => name::Command::Resolve(name::Resolve {
+            from: r.u64()?,
+            generation: r.u64()?,
         }),
         10 => name::Command::Reclaim(name::Reclaim {
             released_ns: r.u64()?,
@@ -1122,6 +1174,24 @@ fn put_name_outcome(w: &mut Writer, o: &name::Outcome) -> Result<(), RecordError
             w.u8(28);
             record::put_lineage(w, lineage)?;
         }
+        O::Frozen(lineage) => {
+            w.u8(29);
+            record::put_lineage(w, lineage)?;
+        }
+        O::Merged(lineage) => {
+            w.u8(30);
+            record::put_lineage(w, lineage)?;
+        }
+        O::Refused(lineage) => {
+            w.u8(31);
+            record::put_lineage(w, lineage)?;
+        }
+        O::Ended => w.u8(32),
+        O::Thawed(lineage) => {
+            w.u8(33);
+            record::put_lineage(w, lineage)?;
+        }
+        O::Resolved => w.u8(34),
     }
     Ok(())
 }
@@ -1206,6 +1276,12 @@ fn take_name_outcome(r: &mut Reader<'_>) -> Option<name::Outcome> {
         26 => O::Unmarked,
         27 => O::Moved(Box::new(record::take_lineage(r)?)),
         28 => O::Split(Box::new(record::take_lineage(r)?)),
+        29 => O::Frozen(Box::new(record::take_lineage(r)?)),
+        30 => O::Merged(Box::new(record::take_lineage(r)?)),
+        31 => O::Refused(Box::new(record::take_lineage(r)?)),
+        32 => O::Ended,
+        33 => O::Thawed(Box::new(record::take_lineage(r)?)),
+        34 => O::Resolved,
         _ => return None,
     })
 }
@@ -1246,6 +1322,12 @@ mod tests {
 
     /// One command of every kind, each with the time the entry gives it.
     fn commands(at_ns: u64) -> Vec<Command> {
+        let descriptor = crate::record::Descriptor {
+            id: 3,
+            lo: crate::key::route("b", "a"),
+            hi: None,
+            generation: 4,
+        };
         let preconditions = name::Preconditions {
             if_match: Some(name::Match::Tags(vec!["a".into(), "b".into()])),
             if_none_match: Some(name::Match::Any),
@@ -1448,6 +1530,25 @@ mod tests {
                 at: crate::key::route("b", "k\0"),
                 child: u64::MAX,
             })),
+            named(name::Command::Freeze(name::Freeze {
+                generation: 5,
+                into: descriptor.clone(),
+            })),
+            named(name::Command::Merge(name::Merge {
+                generation: 6,
+                from: descriptor.clone(),
+                max_rows: 1 << 20,
+            })),
+            named(name::Command::Abandon(name::Abandon { generation: 7 })),
+            named(name::Command::End(name::End {
+                generation: 8,
+                into: descriptor.clone(),
+            })),
+            named(name::Command::Thaw(name::Thaw { generation: 9 })),
+            named(name::Command::Resolve(name::Resolve {
+                from: 2,
+                generation: u64::MAX,
+            })),
             named(name::Command::Reclaim(name::Reclaim {
                 released_ns: 5,
                 file: u128::MAX,
@@ -1568,6 +1669,17 @@ mod tests {
                 hi: None,
                 generation: 2,
             }),
+            standing: crate::record::Standing::Frozen,
+            into: Some(crate::record::Descriptor {
+                id: 0,
+                lo: Vec::new(),
+                hi: Some(Vec::new()),
+                generation: 9,
+            }),
+            taken: Some(crate::record::Taken {
+                from: 7,
+                generation: 8,
+            }),
         };
         use bucket::Outcome as B;
         use name::Outcome as N;
@@ -1650,7 +1762,13 @@ mod tests {
                 N::Checked(Vec::new()),
                 N::Unmarked,
                 N::Moved(Box::new(lineage.clone())),
-                N::Split(Box::new(lineage)),
+                N::Split(Box::new(lineage.clone())),
+                N::Frozen(Box::new(lineage.clone())),
+                N::Merged(Box::new(lineage.clone())),
+                N::Refused(Box::new(lineage.clone())),
+                N::Ended,
+                N::Thawed(Box::new(lineage)),
+                N::Resolved,
             ]
             .map(Answer::Name),
         );

@@ -342,20 +342,27 @@ replica; its log is the node's shared write-ahead log.
   TLA+ before they are built (architecture §6.1, §10).
 - **Splits and merges under a create and a delete.** `docs/models/RangeSplit.tla` models
   Name ranges splitting and merging while a bucket is created, written and deleted. A split
-  is one command in the parent's log, and the new child takes the parent's gate. Writers
-  route by cached descriptors, and a range answers a stale one with its own descriptor and
-  that of the child its last split made; one whose descriptors then no longer cover the keys
-  reads the directory.
+  is one command in the parent's log, and the new child takes the parent's gate. A merge
+  spans the two ranges' logs: the higher range freezes for a merge into the lower one at the
+  generation its driver read, and the lower range decides the merge once, at that
+  generation, moving its generation on whether it takes the frozen range or refuses; a taken
+  merge ends the frozen range and is then resolved, and one never to be taken thaws it.
+  Drivers stop and are replaced at any point, and their commands arrive late. Writers route
+  by cached descriptors, and a range answers a stale one with its own descriptor, unless it
+  has ended, and those of the child its last split made and of the range it is merging or
+  merged into; one whose descriptors then no longer cover the keys reads the directory.
   Each step of a create or delete attempt names the descriptor generation it read; a range
-  refuses another generation, and the attempt learns the answer and starts its phase again.
-  A merge is one command in the lower range's log: it takes the higher range's span and keys
-  at a generation past both and keeps its own gate, and the higher range ends, answering a
-  stale request with the lower's descriptor. The two gates need not agree: an attempt that
-  held either range's descriptor is refused at the new generation and starts its phase
-  again, so it moves the joined gate from wherever the lower one was. TLC checks
-  98,557,369 distinct states of three keys, two splits, a merge, a create and two delete
-  attempts (`scripts/check-model.sh`). In every one of them:
-  - the live ranges divide the keys between them;
+  refuses another generation, and the attempt learns the answer, keeping each range's
+  newest descriptor only, and starts its phase again. The merged range keeps its own gate:
+  an attempt that held either range's descriptor is refused at the new generation and starts
+  its phase again, so it moves the joined gate from wherever the lower one was. TLC checks
+  every state of four configurations of three keys (`scripts/check-model.sh`): two splits, a
+  create and two delete attempts (1,607,127 states); two splits, a merge, a create and a
+  delete (13,081,532); a split, a merge, a create and two deletes, one taking over from
+  the other (9,457,818); and two splits, two merges and a create (93,864,489). In
+  every one of them:
+  - the ranges that own their spans, every serving range and every frozen one whose merge
+    was not taken, divide the keys between them;
   - no acknowledged write is lost to a delete;
   - an active bucket's every range has its gate open.
 
@@ -364,7 +371,19 @@ replica; its log is the node's shared write-ahead log.
   half, and deletes the bucket while the child holds a version (eight steps). A create opens
   only the parent's gate and activates the bucket, and the child's gate never opens (five
   steps). So the coordinator (§2) routes each step by a descriptor and names its
-  generation, and relearns as the model's attempts do.
+  generation, and relearns as the model's attempts do. Two more controls justify the merge's
+  rules. A refusal that leaves the lower range's generation where it was, a driver thawing on
+  the answer, lets a late decision take a range that thawed and serves: two ranges own one
+  key (five steps). A range frozen while holding a merge it took can be taken and end, and a
+  driver reads the merge it held as never taken and thaws its frozen range: two ranges own
+  one key (eight steps).
+
+  Checking merges found two rules the attempts must keep. An attempt keeps each range's
+  newest descriptor only: an older one beside it can span keys the range no longer holds,
+  and once the newer one's step is done the attempt counts them as covered, activating a
+  bucket whose child range never opened its gate. And a range that ended answers with where
+  its span went, never with its own descriptor, which an attempt would take for a live
+  range and step forever.
 - **Splits, as built** (`crates/meta/src/name.rs`). A Name range's lineage records its
   descriptor, an ID, a span and a generation, and the child its last split made. A span runs
   between two routing keys (`key::route`): the bucket, then the key, each escaped and ended.
@@ -408,6 +427,56 @@ replica; its log is the node's shared write-ahead log.
     resumed cleanup unable to finish. A child without the clock passed 2,000 schedules,
     which never reached the one interleaving that needs it, so a test of its own spells
     that interleaving out.
+- **Merges, as built** (`crates/meta/src/name.rs`, `crates/meta/src/merge.rs`). A merge
+  joins a range to the range just below it across the two ranges' logs, in the steps the
+  model takes.
+  - *Freeze.* A driver reads both descriptors and freezes the higher range for a merge into
+    the lower one at the generation it read. The frozen range takes nothing but the merge's
+    own steps, and its generation rises, so a step routed by what it was is refused after it
+    thaws. A range holding a merge not yet resolved is not frozen: it could otherwise end
+    with the merge unresolved, and a driver would read the merge as never taken.
+  - *Decision.* Once every replica of the frozen range has applied the freeze, the lower
+    range decides, in its own log and only at the generation the merge names. It takes the
+    frozen range if it holds no merge not yet resolved, the frozen range begins where it
+    ends, and the frozen range holds no more rows than the merge may take, which bounds the
+    entry; otherwise it refuses. Either way its generation moves on, so the merge is decided
+    once, and a command for it that comes later, however late, is routed by a generation the
+    range no longer has. A driver abandons a merge not yet decided the same way, by moving
+    the lower range's generation on. The generation is the record of the decision: no merge
+    counter or watermark is kept.
+  - *What moves.* Each replica of the lower range reads its own copy of the frozen range,
+    which every replica holds frozen alike, and takes its rows and marks, its queue of
+    released files, and the gates of the buckets the lower range holds none of, keeping its
+    own gate of a bucket both hold keys of; the higher of the two floors and the later of the
+    two clocks, so a time a check recorded carries over as in a split; and none of its
+    sessions. A replica whose copy is not frozen for the merge stops rather than take other
+    rows than its peers.
+  - *Ending.* A taken merge ends the frozen range, which then answers every request with the
+    lower range as the merge left it and never with its own descriptor, and the lower range
+    lets go of the merge; a refused one thaws the frozen range a generation on. A driver
+    thaws only once the lower range shows the merge will never be taken: its generation past
+    the merge's and the merge not the one it holds, or the range ended. Once the lower range
+    has let go of a taken merge, a driver still judging it reads it as never taken, but the
+    frozen range has ended by then and its thaw is refused. A lower range read while frozen
+    for a merge of its own decides nothing until that merge ends it or thaws it a generation
+    on, and the merge waiting on it is then never taken. The driver asks whether the lower
+    range took the merge before whether it ended, so it judges an ended range right from its
+    lineage even without the rule against freezing a range that holds a merge; the rule
+    keeps the judgment from resting on that lineage staying readable.
+  - *Routing through a merge.* Until the merge is decided nothing serves the frozen span,
+    and writes to it wait, as architecture §6 accepts for a merge. Between the lower range
+    taking the merge and the frozen range ending, the frozen range names the lower range as
+    the driver read it; a sender asks that range next, which holds the span once the merge
+    is taken. A merge that takes back the lower range's child forgets the child, which no
+    longer holds any of its span.
+  - *Checked.* Both simulations merge ranges while buckets are created and deleted and files
+    are handed over and swept, with drivers that stop anywhere, resume from either range,
+    give up, and whose last command arrives late. Each rule removed on purpose fails one of
+    them or a test: marks or the queue left behind release files versions reference or lose
+    track of one; a refusal that leaves the generation where it was, with the replica's own
+    check of the frozen copy removed, lets two ranges own one key, and with the check the
+    replica stops first. A merge that keeps the lower range's clock passed the simulations,
+    so a test spells out the interleaving that needs the later clock.
 - **Transport:** QUIC for snapshots and other bulk transfers, and a separate UDP datagram
   plane for Raft's messages, including Fast Raft's, as the hecate specification lays out
   (07 §4.7). A fast-track proposal carries its entry, so an entry travels as datagrams only

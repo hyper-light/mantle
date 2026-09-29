@@ -24,6 +24,7 @@ pub mod engine;
 pub mod error;
 pub mod file;
 pub mod key;
+pub mod merge;
 pub mod name;
 pub mod overlay;
 pub mod reclaim;

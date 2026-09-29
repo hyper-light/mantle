@@ -14,8 +14,8 @@
 //! range; it may stop for good at any stage, or come late to the next. Deletes release files,
 //! both sweeps run a step at a time and stop for good between any two steps, leaders whose
 //! clocks run behind propose entries at times earlier than entries already applied, and Name
-//! ranges split, their marks going with their keys, while the gateways and the sweep route by
-//! descriptors they learn of late.
+//! ranges split and merge, their marks and queues going with their keys, while the gateways
+//! and the sweep route by descriptors they learn of late and wait out a merge in flight.
 //!
 //! After every step, no file a version references is released, every file written is
 //! referenced, released or unsettled, and every block a written file names still has its rows
@@ -32,12 +32,13 @@ use mantle_meta::block;
 use mantle_meta::engine::{Engine, Model, Rows};
 use mantle_meta::file::{self, Unsettled};
 use mantle_meta::key::{self, NameRow};
+use mantle_meta::merge::{self, Merger};
 use mantle_meta::name::{
     self, Check, Checked, GateChange, Marked, Preconditions, Put, Split, Unmark, Verdict,
 };
 use mantle_meta::record::{
-    BlockHeader, ChunkPlace, Descriptor, Extent, GateState, Lineage, Referrer, Target, Version,
-    Versioning,
+    BlockHeader, ChunkPlace, Descriptor, Extent, GateState, Lineage, Referrer, Standing, Target,
+    Version, Versioning,
 };
 use mantle_meta::sweep::{Answer, BlockAnswer, BlockRequest, BlockSweep, Request, Sweep};
 use proptest::prelude::*;
@@ -60,8 +61,11 @@ const CUTS: [(&str, &str); 7] = [
 const HANDOVER: u64 = 50;
 const PAGE: usize = 2;
 /// Times a command is sent before its sender's descriptors lead it to the range that holds
-/// its key: each refusal names a newer descriptor, and the directory, current here, ends it.
+/// its key: each refusal names a newer descriptor, and the directory, current here, ends it,
+/// unless a merge in flight holds the key, when the sender tries again later.
 const ROUTES: usize = 8;
+/// Rows a merge resumed after its driver stopped may take.
+const MAX_ROWS: u64 = 64;
 
 #[derive(Debug, Clone)]
 enum Action {
@@ -97,6 +101,22 @@ enum Action {
     },
     /// The gateways and the sweep take the directory's descriptors.
     Refresh,
+    /// A driver begins merging a range into the one just below it, taking at most `rows`
+    /// rows.
+    Merge {
+        range: usize,
+        rows: u64,
+    },
+    /// One step of one merge in flight.
+    MergeStep(usize),
+    /// A merge's driver gives it up before its decision.
+    MergeAbandon(usize),
+    /// A merge's driver stops for good; the request it was sending arrives later.
+    MergeStop(usize),
+    /// A stopped driver's request arrives, late.
+    Late(usize),
+    /// Every merge a range's lineage shows in flight is resumed.
+    MergeResume,
 }
 
 fn action() -> impl Strategy<Value = Action> {
@@ -113,6 +133,12 @@ fn action() -> impl Strategy<Value = Action> {
         2 => (0u64..=20).prop_map(|steps| Action::Leader { lag: steps * 10 }),
         1 => (0usize..8, 0..CUTS.len()).prop_map(|(range, cut)| Action::Split { range, cut }),
         1 => Just(Action::Refresh),
+        1 => (0usize..8, 0u64..16).prop_map(|(range, rows)| Action::Merge { range, rows }),
+        3 => (0usize..4).prop_map(Action::MergeStep),
+        1 => (0usize..4).prop_map(Action::MergeAbandon),
+        1 => (0usize..4).prop_map(Action::MergeStop),
+        1 => (0usize..4).prop_map(Action::Late),
+        1 => Just(Action::MergeResume),
     ]
 }
 
@@ -148,6 +174,12 @@ struct World {
     next_range: u64,
     /// The descriptors the gateways and the sweep route by.
     cache: Vec<Descriptor>,
+    /// Merges in flight.
+    mergers: Vec<Merger>,
+    /// Requests of stopped merge drivers, not yet arrived.
+    late: Vec<merge::Request>,
+    /// The merges a lower range took, by its ID and the generation the merge named.
+    taken: BTreeSet<(u64, u64)>,
     /// Chunks on volumes, as (volume, block, epoch, index).
     volumes: BTreeSet<(u128, u128, u32, u16)>,
     clock: u64,
@@ -180,6 +212,9 @@ impl World {
             )]),
             next_range: 2,
             cache: Vec::new(),
+            mergers: Vec::new(),
+            late: Vec::new(),
+            taken: BTreeSet::new(),
             volumes: BTreeSet::new(),
             clock: 1_000,
             lag: 0,
@@ -213,9 +248,84 @@ impl World {
         name::lineage(&self.names[&id].engine).unwrap()
     }
 
-    /// Every Name range's descriptor now: what the directory holds, current here.
+    /// The descriptor of every Name range that has not ended: what the directory holds,
+    /// current here.
     fn directory(&self) -> Vec<Descriptor> {
-        self.names.keys().map(|&id| self.lineage(id).now).collect()
+        self.names
+            .keys()
+            .map(|&id| self.lineage(id))
+            .filter(|l| l.standing != Standing::Ended)
+            .map(|l| l.now)
+            .collect()
+    }
+
+    /// The ranges that own their spans: every serving range, and every frozen one whose merge
+    /// was not taken. A range that ended, or whose merge was taken, keeps rows its lower range
+    /// took and now owns.
+    fn owners(&self) -> Vec<(u64, Lineage)> {
+        self.names
+            .keys()
+            .map(|&id| (id, self.lineage(id)))
+            .filter(|(_, l)| match (l.standing, &l.into) {
+                (Standing::Serving, _) => true,
+                (Standing::Frozen, Some(into)) => !self.taken.contains(&(into.id, into.generation)),
+                _ => false,
+            })
+            .collect()
+    }
+
+    /// The rows of every range that owns its span.
+    fn owned(&self) -> Vec<&Model> {
+        self.owners()
+            .into_iter()
+            .map(|(id, _)| &self.names[&id].engine)
+            .collect()
+    }
+
+    /// What the Name ranges answer a merge driver's request.
+    fn serve_merge(&mut self, request: merge::Request) -> merge::Answer {
+        match request {
+            merge::Request::Name { range, command } => {
+                merge::Answer::Name(self.name(range, *command))
+            }
+            merge::Request::Merge {
+                range,
+                from,
+                command,
+            } => {
+                let upper = self.names[&from].engine.clone();
+                let lower = self.names.get_mut(&range).unwrap();
+                lower.index += 1;
+                let outcome =
+                    name::merge(&mut lower.engine, lower.index, &command, &upper).unwrap();
+                if let name::Outcome::Merged(_) = outcome {
+                    self.taken.insert((range, command.generation));
+                }
+                merge::Answer::Name(outcome)
+            }
+            merge::Request::Lineage { range } => merge::Answer::Lineage(self.lineage(range)),
+        }
+    }
+
+    /// One step of the merge at `i`.
+    fn merge_step(&mut self, i: usize) {
+        if let Some(request) = self.mergers[i].next() {
+            let answer = self.serve_merge(request);
+            self.mergers[i].answer(answer).unwrap();
+        }
+        if self.mergers[i].is_done() {
+            self.mergers.swap_remove(i);
+        }
+    }
+
+    /// A driver for every merge a range's lineage shows in flight.
+    fn resume_merges(&mut self) {
+        let ids: Vec<u64> = self.names.keys().copied().collect();
+        for id in ids {
+            if let Ok(m) = Merger::resume(&self.lineage(id), MAX_ROWS) {
+                self.mergers.push(m);
+            }
+        }
     }
 
     /// Splits range `id` at `at` as its replicas would: the child starts from the rows the
@@ -266,7 +376,13 @@ impl World {
     /// The senders learn where a span went from a range's lineage.
     fn learn(&mut self, id: u64, lineage: &Lineage) {
         self.cache.retain(|d| d.id != id);
-        for d in [Some(&lineage.now), lineage.child.as_ref()]
+        // An ended range holds nothing: only where its span went is learnt.
+        let own = if lineage.standing == Standing::Ended {
+            None
+        } else {
+            Some(&lineage.now)
+        };
+        for d in [own, lineage.child.as_ref(), lineage.into.as_ref()]
             .into_iter()
             .flatten()
         {
@@ -282,27 +398,41 @@ impl World {
     }
 
     /// Sends `command` for `key` where the senders' descriptors route it until the range that
-    /// holds the key answers.
-    fn send(&mut self, key: &str, command: &name::Command) -> name::Outcome {
+    /// holds the key answers; `None` while a merge in flight holds the key.
+    fn send(&mut self, key: &str, command: &name::Command) -> Option<name::Outcome> {
+        let mut next = None;
         for _ in 0..ROUTES {
-            let id = self.route(key);
+            let id = next.take().unwrap_or_else(|| self.route(key));
             match self.name(id, command.clone()) {
-                name::Outcome::Moved(lineage) => self.learn(id, &lineage),
-                outcome => return outcome,
+                name::Outcome::Moved(lineage) => {
+                    // A frozen range's span is the range below's once the merge is taken, so
+                    // that range is asked next.
+                    if lineage.standing == Standing::Frozen {
+                        next = lineage.into.as_ref().map(|d| d.id);
+                    }
+                    self.learn(id, &lineage);
+                }
+                outcome => return Some(outcome),
             }
         }
-        panic!("{key} was never routed to its range");
+        let route = key::route(BUCKET, key);
+        let frozen = self.names.keys().any(|&id| {
+            let l = self.lineage(id);
+            l.standing == Standing::Frozen && l.now.holds(&route)
+        });
+        assert!(frozen, "{key} was never routed");
+        None
     }
 
-    /// The range that holds `key` now.
+    /// The range that owns `key` now.
     fn holder(&self, key: &str) -> &Model {
         let route = key::route(BUCKET, key);
-        let (_, range) = self
-            .names
-            .iter()
-            .find(|(id, _)| self.lineage(**id).now.holds(&route))
+        let (id, _) = self
+            .owners()
+            .into_iter()
+            .find(|(_, l)| l.now.holds(&route))
             .unwrap();
-        &range.engine
+        &self.names[&id].engine
     }
 
     fn file(&mut self, command: file::Command) -> file::Outcome {
@@ -410,6 +540,40 @@ impl World {
                 self.split(id, key::route(bucket, key));
             }
             Action::Refresh => self.cache = self.directory(),
+            Action::Merge { range, rows } => {
+                let directory = self.directory();
+                let upper = directory[range % directory.len()].clone();
+                if let Some(lower) = directory.iter().find(|d| d.hi.as_ref() == Some(&upper.lo)) {
+                    self.mergers.push(Merger::new(lower.clone(), upper, rows));
+                }
+            }
+            Action::MergeStep(i) => {
+                if !self.mergers.is_empty() {
+                    self.merge_step(i % self.mergers.len());
+                }
+            }
+            Action::MergeAbandon(i) => {
+                if !self.mergers.is_empty() {
+                    let i = i % self.mergers.len();
+                    if let Some(request) = self.mergers[i].abandon() {
+                        let answer = self.serve_merge(request);
+                        self.mergers[i].answer(answer).unwrap();
+                    }
+                }
+            }
+            Action::MergeStop(i) => {
+                if !self.mergers.is_empty() {
+                    let stopped = self.mergers.swap_remove(i % self.mergers.len());
+                    self.late.extend(stopped.next());
+                }
+            }
+            Action::Late(i) => {
+                if !self.late.is_empty() {
+                    let request = self.late.swap_remove(i % self.late.len());
+                    self.serve_merge(request);
+                }
+            }
+            Action::MergeResume => self.resume_merges(),
         }
     }
 
@@ -446,11 +610,17 @@ impl World {
                     other => panic!("{other:?}"),
                 }
             }
-            Stage::File { deadline_ns } => self.handover(&g, deadline_ns),
+            Stage::File { deadline_ns } => {
+                if !self.handover(&g, deadline_ns) {
+                    self.gateways.push(g);
+                }
+            }
         }
     }
 
-    fn handover(&mut self, g: &Gateway, deadline_ns: u64) {
+    /// Hands the file over; false while a merge in flight holds its key, so the gateway tries
+    /// again later.
+    fn handover(&mut self, g: &Gateway, deadline_ns: u64) -> bool {
         let put = name::Command::Put(Put {
             bucket: BUCKET.into(),
             incarnation: 1,
@@ -478,10 +648,12 @@ impl World {
         let late =
             mantle_meta::clock::now(self.holder(g.key), self.proposed()).unwrap() > deadline_ns;
         match self.send(g.key, &put) {
-            name::Outcome::Put { .. } => assert!(!late, "a late handover was taken"),
-            name::Outcome::Expired => assert!(late, "a handover in time was refused"),
-            other => panic!("{other:?}"),
+            None => return false,
+            Some(name::Outcome::Put { .. }) => assert!(!late, "a late handover was taken"),
+            Some(name::Outcome::Expired) => assert!(late, "a handover in time was refused"),
+            Some(other) => panic!("{other:?}"),
         }
+        true
     }
 
     fn sweep_step(&mut self) {
@@ -490,7 +662,10 @@ impl World {
             self.sweep = None;
             return;
         };
-        let answer = self.serve(request);
+        // A key a merge in flight holds leaves the step to be tried again.
+        let Some(answer) = self.serve(request) else {
+            return;
+        };
         let sweep = self.sweep.as_mut().unwrap();
         sweep.answer(answer).unwrap();
         if sweep.is_done() {
@@ -514,9 +689,10 @@ impl World {
         }
     }
 
-    /// What the File and Name ranges answer a file sweep's request.
-    fn serve(&mut self, request: Request) -> Answer {
-        match request {
+    /// What the File and Name ranges answer a file sweep's request; `None` while a merge in
+    /// flight holds one of its keys.
+    fn serve(&mut self, request: Request) -> Option<Answer> {
+        Some(match request {
             Request::Due { max } => {
                 let now = mantle_meta::clock::now(&self.files, self.proposed()).unwrap();
                 Answer::Due(file::unsettled(&self.files, now, max).unwrap())
@@ -552,6 +728,9 @@ impl World {
                         }
                     }
                 }
+                if verdicts.iter().any(Option::is_none) {
+                    return None;
+                }
                 Answer::Checked(verdicts.into_iter().map(Option::unwrap).collect())
             }
             Request::Settle(files) => {
@@ -570,11 +749,12 @@ impl World {
                             file,
                         }],
                     });
-                    assert_eq!(self.send(&referrer.key, &unmark), name::Outcome::Unmarked);
+                    let outcome = self.send(&referrer.key, &unmark)?;
+                    assert_eq!(outcome, name::Outcome::Unmarked);
                 }
                 Answer::Unmarked
             }
-        }
+        })
     }
 
     /// What the Block and File ranges and the volumes answer a block sweep's request.
@@ -620,9 +800,9 @@ impl World {
     /// Files a version references, in every Name range.
     fn referenced(&self) -> BTreeSet<u128> {
         let mut out = BTreeSet::new();
-        for range in self.names.values() {
+        for range in self.owned() {
             let (mut from, to) = key::bucket_span(BUCKET);
-            while let Some((k, v)) = range.engine.next(&from, &to).unwrap() {
+            while let Some((k, v)) = range.next(&from, &to).unwrap() {
                 if let Some((_, _, NameRow::Version(_))) = key::decode_name(&k) {
                     out.extend(Version::decode(&v).unwrap().file);
                 }
@@ -634,9 +814,9 @@ impl World {
     }
 
     fn released(&self) -> BTreeSet<u128> {
-        self.names
-            .values()
-            .flat_map(|r| name::released(&r.engine, u64::MAX, usize::MAX).unwrap())
+        self.owned()
+            .into_iter()
+            .flat_map(|r| name::released(r, u64::MAX, usize::MAX).unwrap())
             .map(|r| r.file)
             .collect()
     }
@@ -675,9 +855,9 @@ impl World {
     /// Files marked in any Name range, under whatever key.
     fn marked(&self) -> BTreeSet<u128> {
         let mut out = BTreeSet::new();
-        for range in self.names.values() {
+        for range in self.owned() {
             let (mut from, to) = key::marks_span(BUCKET);
-            while let Some((k, _)) = range.engine.next(&from, &to).unwrap() {
+            while let Some((k, _)) = range.next(&from, &to).unwrap() {
                 out.insert(key::decode_mark(&k).unwrap().2);
                 from = k;
                 from.push(0);
@@ -711,6 +891,21 @@ impl World {
     /// and both sweeps run until nothing is unsettled.
     fn finish(&mut self) {
         self.lag = 0;
+        // Late requests arrive, and every merge in flight is carried to its end, each in turn,
+        // since one may wait on another's end.
+        while let Some(request) = self.late.pop() {
+            self.serve_merge(request);
+            self.check();
+        }
+        self.resume_merges();
+        for turn in 0..10_000 {
+            if self.mergers.is_empty() {
+                break;
+            }
+            self.merge_step(turn % self.mergers.len());
+            self.check();
+        }
+        assert!(self.mergers.is_empty(), "a merge never finished");
         while let Some(g) = self.gateways.pop() {
             self.clock += 10;
             self.advance(g);

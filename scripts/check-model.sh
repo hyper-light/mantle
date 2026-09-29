@@ -4,9 +4,9 @@
 # there is none, in a Java container.
 #
 #   scripts/check-model.sh             every model as mantle builds it
-#   scripts/check-model.sh unfenced    splits without generation checks: the check passes
-#                                      when the checker finds the lost write and the gate
-#                                      a create never opened
+#   scripts/check-model.sh controls    the model with each rule it justifies removed: the
+#                                      check passes when the checker breaks the property
+#                                      the rule is for
 set -euo pipefail
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 tools="${TLA_TOOLS:-$root/target/tla}"
@@ -33,7 +33,10 @@ tlc() { # MODEL CONFIG
     (cd "$work" && java -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers auto -deadlock \
       -config "$2" "$1.tla" >out.log 2>&1) || status=$?
   else
+    # The queue of states to visit is held in the container's memory rather than on the
+    # host's disk.
     docker run --rm -v "$work":/work -v "$jar":/tla2tools.jar:ro -w /work \
+      --tmpfs /work/states:rw,size=24g \
       eclipse-temurin:21-jre java -XX:+UseParallelGC -cp /tla2tools.jar tlc2.TLC \
       -workers auto -deadlock -config "$2" "$1.tla" >"$work/out.log" 2>&1 || status=$?
   fi
@@ -42,15 +45,20 @@ tlc() { # MODEL CONFIG
   return "$status"
 }
 case "${1:-}" in
-  "") tlc RangeSplit RangeSplit.cfg ;;
-  unfenced)
+  "")
+    for config in RangeSplit RangeMerge RangeMergeTakeover RangeMergeTwice; do
+      tlc RangeSplit "$config.cfg"
+    done
+    ;;
+  controls)
     # 12: an invariant was violated. Each control must fail on the invariant it is for.
-    for control in "RangeSplitUnfenced NoLostWrite" "RangeSplitUnfencedCreate ActiveOpen"; do
+    for control in "RangeSplitUnfenced NoLostWrite" "RangeSplitUnfencedCreate ActiveOpen" \
+      "RangeMergeUnrecorded Partition" "RangeMergeTwoRoles Partition"; do
       set -- $control
       status=0
       tlc RangeSplit "$1.cfg" || status=$?
       if [ "$status" -eq 12 ] && grep -q "Invariant $2 is violated" "$tools/run-$1/out.log"; then
-        echo "$1: the checker finds $2 broken without generation checks"
+        echo "$1: the checker finds $2 broken"
       else
         echo "$1: the checker did not find $2 broken (exit $status)" >&2
         exit 1

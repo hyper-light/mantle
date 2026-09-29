@@ -8,9 +8,11 @@
 //! (docs/design/metadata.md §2).
 //!
 //! A range holds the object keys of one span, which its lineage records with a generation
-//! that every split raises. A command for a key outside the span, or a coordinator's step
-//! routed by another generation, is not the range's: it answers with its lineage, takes
-//! nothing, and the sender routes the command again (docs/design/metadata.md §3).
+//! that every split and merge raises. A command for a key outside the span, or a
+//! coordinator's step routed by another generation, is not the range's: it answers with its
+//! lineage, takes nothing, and the sender routes the command again. A range frozen for a
+//! merge, or ended by one, takes nothing but the merge's own steps (docs/design/metadata.md
+//! §3).
 
 use crate::clock;
 use crate::engine::{Row, Rows, Write};
@@ -18,7 +20,7 @@ use crate::error::MetaError;
 use crate::key::{self, NULL_VERSION, NameRow};
 use crate::record::{
     self, Checksum, DefaultRetention, Descriptor, Gate, GateState, Holder, Lineage, Part,
-    Retention, RetentionMode, Upload, Version,
+    Retention, RetentionMode, Standing, Taken, Upload, Version,
 };
 
 pub use crate::record::Verdict;
@@ -74,6 +76,13 @@ pub enum Command {
     Check(Check),
     Unmark(Unmark),
     Split(Split),
+    Freeze(Freeze),
+    /// Applied by [`merge`], which reads the frozen range's rows; [`apply`] refuses it.
+    Merge(Merge),
+    Abandon(Abandon),
+    End(End),
+    Thaw(Thaw),
+    Resolve(Resolve),
 }
 
 impl Command {
@@ -97,7 +106,10 @@ impl Command {
             Self::Gate(g) => g.generation != now.generation,
             Self::Collect(c) => c.generation != now.generation,
             Self::Split(s) => s.generation != now.generation,
-            Self::Reclaim(_) => false,
+            Self::Freeze(f) => f.generation != now.generation,
+            Self::Merge(m) => m.generation != now.generation,
+            Self::Abandon(a) => a.generation != now.generation,
+            Self::Reclaim(_) | Self::Resolve(_) | Self::End(_) | Self::Thaw(_) => false,
         }
     }
 
@@ -117,7 +129,13 @@ impl Command {
             | Self::Reclaim(_)
             | Self::Check(_)
             | Self::Unmark(_)
-            | Self::Split(_) => None,
+            | Self::Split(_)
+            | Self::Freeze(_)
+            | Self::Merge(_)
+            | Self::Abandon(_)
+            | Self::End(_)
+            | Self::Thaw(_)
+            | Self::Resolve(_) => None,
         }
     }
 
@@ -307,6 +325,62 @@ pub struct Child {
     pub spans: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
+/// Freezes the range for a merge into `into`, the range just below it, as the merge's driver
+/// read both (docs/design/metadata.md §3). The range takes no step but the merge's own until
+/// the merge ends it or it thaws, and its generation rises, so a step routed by what it was is
+/// refused after it thaws. A range holding a merge not yet resolved is not frozen: it could
+/// otherwise end with the merge unresolved, and a driver would read the merge as never taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Freeze {
+    /// The generation of the descriptor the driver read.
+    pub generation: u64,
+    /// The range just below, whose ID and generation name the merge.
+    pub into: Descriptor,
+}
+
+/// The lower range's decision on the merge its driver read it for at `generation`: it takes
+/// `from`, the frozen range as it froze, keeping its own gates, if it holds no merge not yet
+/// resolved, `from` begins where it ends, and `from` holds at most `max_rows` rows; otherwise
+/// it refuses. Either way its generation moves on, so the merge is decided once, and a command
+/// for it that comes later, however late, is routed by a generation the range no longer has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Merge {
+    pub generation: u64,
+    pub from: Descriptor,
+    /// Rows the merge may take, which bounds its entry.
+    pub max_rows: u64,
+}
+
+/// A driver abandons a merge not yet decided: the lower range, at the generation the merge
+/// names, moves its generation on, so the merge is never taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Abandon {
+    pub generation: u64,
+}
+
+/// The frozen range ends: the merge named by the range below and its `generation` was taken,
+/// and `into` is that range as the merge left it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct End {
+    pub generation: u64,
+    pub into: Descriptor,
+}
+
+/// The frozen range serves again: the merge named by the range below and its `generation`
+/// will never be taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Thaw {
+    pub generation: u64,
+}
+
+/// The lower range lets go of the merge it took of range `from` at `generation`, once `from`
+/// has ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolve {
+    pub from: u64,
+    pub generation: u64,
+}
+
 /// A coordinator's read, routed by the generation of the descriptor it holds: the answer, or
 /// the range's lineage once the range has moved past that generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -476,16 +550,39 @@ pub enum Outcome {
     Moved(Box<Lineage>),
     /// The range split: its lineage now, naming the child.
     Split(Box<Lineage>),
+    /// The range froze for a merge: its lineage now.
+    Frozen(Box<Lineage>),
+    /// The range took the merge: its lineage now.
+    Merged(Box<Lineage>),
+    /// The range refused the merge, or abandoned it, and moved on: its lineage now.
+    Refused(Box<Lineage>),
+    /// The frozen range ended.
+    Ended,
+    /// The frozen range serves again: its lineage now.
+    Thawed(Box<Lineage>),
+    /// The range holds no merge from that range at that generation any more.
+    Resolved,
 }
 
 /// Applies `command` as log entry `index`. A refused command still advances the index.
 pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<Outcome, MetaError> {
     let lineage = lineage(engine)?;
-    // Not the range's: it takes nothing, not even a file the command carries, which its sender
-    // hands on to the range that holds the key.
-    if command.moved(&lineage.now) {
-        engine.apply(index, &[])?;
-        return Ok(Outcome::Moved(Box::new(lineage)));
+    // A frozen or ended range takes only the merge's own steps. A command that is not the
+    // range's takes nothing, not even a file it carries, which its sender hands on to the
+    // range that holds the key.
+    let settled = match (lineage.standing, command) {
+        (Standing::Frozen, Command::Thaw(t)) => Some(thaw(&lineage, t)?),
+        (Standing::Frozen | Standing::Ended, Command::End(e)) => Some(end(&lineage, e)?),
+        (Standing::Serving, Command::Thaw(_) | Command::End(_)) => {
+            Some((Outcome::Conflict, Vec::new()))
+        }
+        (Standing::Serving, Command::Merge(_)) => Some((Outcome::Invalid, Vec::new())),
+        (Standing::Serving, _) if !command.moved(&lineage.now) => None,
+        _ => Some((Outcome::Moved(Box::new(lineage.clone())), Vec::new())),
+    };
+    if let Some((outcome, writes)) = settled {
+        engine.apply(index, &writes)?;
+        return Ok(outcome);
     }
     let admitted = match command.write_to() {
         Some((bucket, incarnation)) => admits(engine, bucket, incarnation)?,
@@ -521,6 +618,11 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
                 .collect(),
         ),
         Command::Split(s) => split(engine, s)?,
+        Command::Freeze(f) => freeze(&lineage, f)?,
+        Command::Abandon(_) => refuse(lineage.clone())?,
+        Command::Resolve(r) => resolve(&lineage, r)?,
+        // Settled above.
+        Command::Merge(_) | Command::End(_) | Command::Thaw(_) => (Outcome::Invalid, Vec::new()),
     };
     // A file a write carries is referenced if the write goes ahead, and released if it is
     // refused: the gateway wrote it for this write alone. Either way the range has taken it,
@@ -556,16 +658,218 @@ pub fn lineage<E: Rows>(engine: &E) -> Result<Lineage, MetaError> {
 
 /// The rows of a cell's first Name range, `id`: every object key, at generation 1.
 pub fn first(id: u64) -> Result<Vec<Row>, MetaError> {
-    let lineage = Lineage {
-        now: Descriptor {
-            id,
-            lo: Vec::new(),
-            hi: None,
-            generation: 1,
-        },
-        child: None,
-    };
+    let lineage = serving(Descriptor {
+        id,
+        lo: Vec::new(),
+        hi: None,
+        generation: 1,
+    });
     Ok(vec![(LINEAGE.to_vec(), lineage.encode()?)])
+}
+
+/// A serving range's lineage, new: no child, no merge.
+fn serving(now: Descriptor) -> Lineage {
+    Lineage {
+        now,
+        child: None,
+        standing: Standing::Serving,
+        into: None,
+        taken: None,
+    }
+}
+
+/// `lineage` a generation on.
+fn onward(mut lineage: Lineage) -> Result<Lineage, MetaError> {
+    lineage.now.generation = lineage
+        .now
+        .generation
+        .checked_add(1)
+        .ok_or(MetaError::Corrupt)?;
+    Ok(lineage)
+}
+
+fn freeze(lineage: &Lineage, f: &Freeze) -> Result<(Outcome, Vec<Write>), MetaError> {
+    if lineage.taken.is_some() {
+        return Ok((Outcome::Conflict, Vec::new()));
+    }
+    if f.into.hi.as_ref() != Some(&lineage.now.lo) || f.into.id == lineage.now.id {
+        return Ok((Outcome::Invalid, Vec::new()));
+    }
+    let mut frozen = onward(lineage.clone())?;
+    frozen.standing = Standing::Frozen;
+    frozen.into = Some(f.into.clone());
+    let row = Write::Put(LINEAGE.to_vec(), frozen.encode()?);
+    Ok((Outcome::Frozen(Box::new(frozen)), vec![row]))
+}
+
+/// The range refuses a merge, or abandons one, moving its generation on.
+fn refuse(lineage: Lineage) -> Result<(Outcome, Vec<Write>), MetaError> {
+    let refused = onward(lineage)?;
+    let row = Write::Put(LINEAGE.to_vec(), refused.encode()?);
+    Ok((Outcome::Refused(Box::new(refused)), vec![row]))
+}
+
+/// Whether a frozen range is frozen for the merge the range below names with `generation`.
+fn frozen_for(lineage: &Lineage, generation: u64) -> bool {
+    lineage.standing == Standing::Frozen
+        && lineage
+            .into
+            .as_ref()
+            .is_some_and(|d| d.generation == generation)
+}
+
+fn thaw(lineage: &Lineage, t: &Thaw) -> Result<(Outcome, Vec<Write>), MetaError> {
+    if !frozen_for(lineage, t.generation) {
+        return Ok((Outcome::Conflict, Vec::new()));
+    }
+    let mut thawed = onward(lineage.clone())?;
+    thawed.standing = Standing::Serving;
+    thawed.into = None;
+    let row = Write::Put(LINEAGE.to_vec(), thawed.encode()?);
+    Ok((Outcome::Thawed(Box::new(thawed)), vec![row]))
+}
+
+/// The frozen range ends; an end repeated once it has is answered the same. Its rows stay
+/// for the replicas of the range that took them, which each read their own copy, until the
+/// replica group ends.
+fn end(lineage: &Lineage, e: &End) -> Result<(Outcome, Vec<Write>), MetaError> {
+    let into = lineage.into.as_ref().map(|d| d.id);
+    match lineage.standing {
+        Standing::Ended if into == Some(e.into.id) => Ok((Outcome::Ended, Vec::new())),
+        Standing::Frozen if frozen_for(lineage, e.generation) && into == Some(e.into.id) => {
+            let ended = Lineage {
+                standing: Standing::Ended,
+                into: Some(e.into.clone()),
+                ..lineage.clone()
+            };
+            let row = Write::Put(LINEAGE.to_vec(), ended.encode()?);
+            Ok((Outcome::Ended, vec![row]))
+        }
+        _ => Ok((Outcome::Conflict, Vec::new())),
+    }
+}
+
+fn resolve(lineage: &Lineage, r: &Resolve) -> Result<(Outcome, Vec<Write>), MetaError> {
+    let held = Taken {
+        from: r.from,
+        generation: r.generation,
+    };
+    if lineage.taken != Some(held) {
+        return Ok((Outcome::Resolved, Vec::new()));
+    }
+    let resolved = Lineage {
+        taken: None,
+        ..lineage.clone()
+    };
+    let row = Write::Put(LINEAGE.to_vec(), resolved.encode()?);
+    Ok((Outcome::Resolved, vec![row]))
+}
+
+/// Applies merge `m`'s decision as log entry `index` of the lower range, reading `from`, this
+/// replica's copy of the frozen range (docs/design/metadata.md §3). Every replica of the
+/// frozen range applied its freeze before the merge was proposed, and a frozen range takes no
+/// step, so every replica of this range reads the same rows. The range takes the frozen
+/// range's rows and marks, its queue of released files, and the gates of the buckets it holds
+/// none of; the later of the two clocks and the higher of the two floors; and none of its
+/// sessions.
+pub fn merge<E: Rows, F: Rows>(
+    engine: &mut E,
+    index: u64,
+    m: &Merge,
+    from: &F,
+) -> Result<Outcome, MetaError> {
+    let lineage = lineage(engine)?;
+    if lineage.standing != Standing::Serving || lineage.now.generation != m.generation {
+        engine.apply(index, &[])?;
+        return Ok(Outcome::Moved(Box::new(lineage)));
+    }
+    let adjacent = lineage.now.hi.as_ref() == Some(&m.from.lo) && m.from.id != lineage.now.id;
+    let taken = if lineage.taken.is_none() && adjacent {
+        taking(engine, &lineage, m, from)?
+    } else {
+        None
+    };
+    let (outcome, writes) = match taken {
+        Some(taken) => taken,
+        None => refuse(lineage)?,
+    };
+    engine.apply(index, &writes)?;
+    Ok(outcome)
+}
+
+/// The rows by which the range takes the frozen range `from`; `None` if `from` holds more rows
+/// than the merge may take.
+fn taking<E: Rows, F: Rows>(
+    engine: &E,
+    lineage: &Lineage,
+    m: &Merge,
+    from: &F,
+) -> Result<Option<(Outcome, Vec<Write>)>, MetaError> {
+    let theirs = self::lineage(from)?;
+    let named = theirs
+        .into
+        .as_ref()
+        .is_some_and(|d| d.id == lineage.now.id && d.generation == m.generation);
+    if theirs.standing != Standing::Frozen || !named || theirs.now != m.from {
+        return Err(MetaError::Unfrozen);
+    }
+    let mut writes = Vec::new();
+    let mut spans = key::name_spans(&m.from.lo, m.from.hi.as_deref()).to_vec();
+    spans.push(key::released_all());
+    let (gates, gates_end) = (vec![key::LOCAL, key::marker::GATE], key::GATES_END.to_vec());
+    spans.push((gates, gates_end));
+    let mut rows: u64 = 0;
+    for (mut at, to) in spans {
+        while let Some((k, v)) = from.next(&at, &to)? {
+            rows = rows.checked_add(1).ok_or(MetaError::Corrupt)?;
+            if rows > m.max_rows {
+                return Ok(None);
+            }
+            at = after(&k);
+            // The range keeps its own gate of a bucket both hold keys of.
+            if key::decode_gate(&k).is_some() && engine.get(&k)?.is_some() {
+                continue;
+            }
+            writes.push(Write::Put(k, v));
+        }
+    }
+    for local in [FLOOR, clock::ROW] {
+        let ours = engine
+            .get(local)?
+            .map(|b| record::decode_number(&b, "local"))
+            .transpose()?;
+        let theirs = from
+            .get(local)?
+            .map(|b| record::decode_number(&b, "local"))
+            .transpose()?;
+        if let Some(later) = ours.max(theirs) {
+            writes.push(Write::Put(local.to_vec(), record::encode_number(later)));
+        }
+    }
+    let generation = lineage
+        .now
+        .generation
+        .max(m.from.generation)
+        .checked_add(1)
+        .ok_or(MetaError::Corrupt)?;
+    let merged = Lineage {
+        now: Descriptor {
+            id: lineage.now.id,
+            lo: lineage.now.lo.clone(),
+            hi: m.from.hi.clone(),
+            generation,
+        },
+        // A child the range takes back is no longer where any of its span went.
+        child: lineage.child.clone().filter(|c| c.id != m.from.id),
+        standing: Standing::Serving,
+        into: None,
+        taken: Some(Taken {
+            from: m.from.id,
+            generation: m.generation,
+        }),
+    };
+    writes.push(Write::Put(LINEAGE.to_vec(), merged.encode()?));
+    Ok(Some((Outcome::Merged(Box::new(merged)), writes)))
 }
 
 /// A split the range takes: its lineage after, the child's descriptor, and where the gates
@@ -581,7 +885,7 @@ struct Cut {
 fn cut<E: Rows>(engine: &E, s: &Split) -> Result<Result<Cut, Outcome>, MetaError> {
     let lineage = lineage(engine)?;
     let now = &lineage.now;
-    if s.generation != now.generation {
+    if lineage.standing != Standing::Serving || s.generation != now.generation {
         return Ok(Err(Outcome::Moved(Box::new(lineage))));
     }
     let Some((bucket, key)) = key::decode_route(&s.at) else {
@@ -605,6 +909,7 @@ fn cut<E: Rows>(engine: &E, s: &Split) -> Result<Result<Cut, Outcome>, MetaError
             generation,
         },
         child: Some(child.clone()),
+        ..lineage.clone()
     };
     // The child can hold keys of every bucket from the one `at` falls in; the range keeps the
     // gates of those whose keys begin before `at`, the one `at` falls in unless `at` is its
@@ -645,10 +950,7 @@ pub fn child<E: Rows>(engine: &E, s: &Split) -> Result<Option<Child>, MetaError>
     let Ok(cut) = cut(engine, s)? else {
         return Ok(None);
     };
-    let lineage = Lineage {
-        now: cut.child.clone(),
-        child: None,
-    };
+    let lineage = serving(cut.child.clone());
     let mut rows = vec![(LINEAGE.to_vec(), lineage.encode()?)];
     for local in [FLOOR, clock::ROW] {
         if let Some(value) = engine.get(local)? {
@@ -1722,7 +2024,7 @@ fn routed<E: Rows, T>(
     read: impl FnOnce() -> Result<T, MetaError>,
 ) -> Result<Routed<T>, MetaError> {
     let lineage = lineage(engine)?;
-    if lineage.now.generation != generation {
+    if lineage.standing != Standing::Serving || lineage.now.generation != generation {
         return Ok(Routed::Moved(Box::new(lineage)));
     }
     Ok(Routed::Here(read()?))
@@ -3489,16 +3791,16 @@ mod tests {
         let parent = Lineage {
             now: descriptor(1, None, Some("m"), 2),
             child: Some(descriptor(2, Some("m"), None, 2)),
+            standing: Standing::Serving,
+            into: None,
+            taken: None,
         };
         assert_eq!(outcome, Outcome::Split(Box::new(parent.clone())));
         let mut c = made.unwrap();
         assert_eq!(lineage(&r.engine).unwrap(), parent);
         assert_eq!(
             lineage(&c.engine).unwrap(),
-            Lineage {
-                now: descriptor(2, Some("m"), None, 2),
-                child: None
-            }
+            serving(descriptor(2, Some("m"), None, 2))
         );
         // Every row and mark of a key is on the side that holds the key; the bucket both hold
         // keys of has its gate on both sides; the floor and the clock went with the child.
@@ -3614,6 +3916,272 @@ mod tests {
         });
         assert_eq!(c.run(put), Outcome::Expired);
         assert_eq!(current(&c.engine, "b", "t").unwrap(), None);
+    }
+
+    /// A merge across the two ranges' logs: the higher range freezes and takes nothing but the
+    /// merge's own steps; the lower range takes its rows, marks, queue and the gates it holds
+    /// none of, the later clock and the higher floor; the frozen range ends, pointing at the
+    /// lower; and the lower lets go of the merge.
+    #[test]
+    fn a_merge_joins_the_higher_range_to_the_lower() {
+        use GateState::Open;
+        let mut r = Range::new();
+        r.put("a", "1", Versioning::Enabled);
+        r.put("t", "2", Versioning::Enabled);
+        let (_, made) = r.split(key::route("b", "m"), 2);
+        let mut c = made.unwrap();
+        // The child alone holds bucket "c", and releases a file there.
+        c.run(Command::Gate(GateChange {
+            bucket: "c".into(),
+            incarnation: 3,
+            attempt: 3,
+            from: None,
+            to: Some(Open),
+            generation: 2,
+        }));
+        c.clock = r.clock + 1_000;
+        let put_c = |c: &mut Range, key: &str| {
+            c.clock += 10;
+            c.run(Command::Put(Put {
+                bucket: "c".into(),
+                incarnation: 3,
+                key: key.into(),
+                versioning: Versioning::Unversioned,
+                preconditions: Preconditions::default(),
+                at_ns: c.clock,
+                ordered_ns: None,
+                version: Version {
+                    file: Some(7),
+                    ..object("e")
+                },
+                default: None,
+                deadline_ns: u64::MAX,
+            }))
+        };
+        put_c(&mut c, "k");
+        put_c(&mut c, "k");
+        assert_eq!(released(&c.engine, u64::MAX, 8).unwrap().len(), 1);
+        let lower = lineage(&r.engine).unwrap().now;
+        let upper = lineage(&c.engine).unwrap().now;
+        let freeze = Command::Freeze(Freeze {
+            generation: upper.generation,
+            into: lower.clone(),
+        });
+        let Outcome::Frozen(frozen) = c.run(freeze) else {
+            panic!("frozen");
+        };
+        // Frozen, it takes nothing: not a write, a coordinator's read, or a split.
+        let moved = |r: &Range| Outcome::Moved(Box::new(lineage(&r.engine).unwrap()));
+        assert_eq!(c.put("t", "3", Versioning::Enabled), moved(&c));
+        assert!(matches!(
+            read_gate(&c.engine, "b", frozen.now.generation).unwrap(),
+            Routed::Moved(_)
+        ));
+        assert_eq!(c.split(key::route("b", "x"), 9).0, moved(&c));
+        assert_eq!(
+            c.run(Command::Thaw(Thaw {
+                generation: lower.generation + 1
+            })),
+            Outcome::Conflict,
+            "a thaw for another merge"
+        );
+        let m = Merge {
+            generation: lower.generation,
+            from: frozen.now.clone(),
+            max_rows: 64,
+        };
+        // Only `merge`, with the frozen range's rows, takes it.
+        assert_eq!(r.run(Command::Merge(m.clone())), Outcome::Invalid);
+        r.index += 1;
+        let Outcome::Merged(merged) = merge(&mut r.engine, r.index, &m, &c.engine).unwrap() else {
+            panic!("merged");
+        };
+        assert_eq!(
+            (merged.now.lo.clone(), merged.now.hi.clone()),
+            (Vec::new(), None)
+        );
+        assert!(merged.now.generation > lower.generation.max(frozen.now.generation));
+        assert_eq!(
+            merged.taken,
+            Some(Taken {
+                from: 2,
+                generation: lower.generation
+            })
+        );
+        // Everything of the child is in the lower range now.
+        assert!(current(&r.engine, "b", "t").unwrap().is_some());
+        assert!(current(&r.engine, "c", "k").unwrap().is_some());
+        assert!(r.engine.get(&key::mark("b", "t", 1)).unwrap().is_some());
+        assert!(gate(&r.engine, "c").unwrap().is_some());
+        assert_eq!(released(&r.engine, u64::MAX, 8).unwrap().len(), 1);
+        assert!(clock::now(&r.engine, 0).unwrap() >= clock::now(&c.engine, 0).unwrap());
+        // A command for the merge that comes again is routed by a generation the range no
+        // longer has, and changes nothing.
+        r.index += 1;
+        assert_eq!(
+            merge(&mut r.engine, r.index, &m, &c.engine).unwrap(),
+            moved(&r)
+        );
+        // Holding the merge, the range may not be frozen for another.
+        let hold = Command::Freeze(Freeze {
+            generation: merged.now.generation,
+            into: descriptor(0, None, Some(""), 1),
+        });
+        assert_eq!(r.run(hold), Outcome::Conflict);
+        // The frozen range ends, and answers every request with where its span went; the end
+        // repeated is answered the same.
+        let end = Command::End(End {
+            generation: lower.generation,
+            into: merged.now.clone(),
+        });
+        assert_eq!(c.run(end.clone()), Outcome::Ended);
+        assert_eq!(c.run(end), Outcome::Ended);
+        let Outcome::Moved(gone) = c.put("t", "3", Versioning::Enabled) else {
+            panic!("moved");
+        };
+        assert_eq!(gone.standing, Standing::Ended);
+        assert_eq!(gone.into, Some(merged.now.clone()));
+        let resolve = Command::Resolve(Resolve {
+            from: 2,
+            generation: lower.generation,
+        });
+        assert_eq!(r.run(resolve.clone()), Outcome::Resolved);
+        assert_eq!(lineage(&r.engine).unwrap().taken, None);
+        assert_eq!(r.run(resolve), Outcome::Resolved);
+        assert!(matches!(
+            r.put("t", "3", Versioning::Enabled),
+            Outcome::Put { .. }
+        ));
+    }
+
+    /// A merge keeps the later clock. A check in the frozen range released a file never handed
+    /// over and recorded its time; the lower range's clock is behind it. A handover a lagging
+    /// leader proposes behind the check, reaching the range that took the key, is refused.
+    #[test]
+    fn a_merge_keeps_the_time_a_check_recorded() {
+        let mut r = Range::new();
+        let (_, made) = r.split(key::route("b", "m"), 2);
+        let mut c = made.unwrap();
+        let deadline_ns = r.clock + 50;
+        let check = Command::Check(Check {
+            files: vec![Checked {
+                bucket: "b".into(),
+                key: "t".into(),
+                file: 4,
+                deadline_ns,
+            }],
+            at_ns: deadline_ns + 1_000,
+        });
+        assert_eq!(c.run(check), Outcome::Checked(vec![Verdict::Released]));
+        let lower = lineage(&r.engine).unwrap().now;
+        let generation = lineage(&c.engine).unwrap().now.generation;
+        let Outcome::Frozen(frozen) = c.run(Command::Freeze(Freeze {
+            generation,
+            into: lower.clone(),
+        })) else {
+            panic!("frozen");
+        };
+        let m = Merge {
+            generation: lower.generation,
+            from: frozen.now,
+            max_rows: 64,
+        };
+        r.index += 1;
+        assert!(matches!(
+            merge(&mut r.engine, r.index, &m, &c.engine).unwrap(),
+            Outcome::Merged(_)
+        ));
+        let put = Command::Put(Put {
+            bucket: "b".into(),
+            incarnation: 1,
+            key: "t".into(),
+            versioning: Versioning::Unversioned,
+            preconditions: Preconditions::default(),
+            at_ns: deadline_ns - 10,
+            ordered_ns: None,
+            version: Version {
+                file: Some(4),
+                ..object("e")
+            },
+            default: None,
+            deadline_ns,
+        });
+        assert_eq!(r.run(put), Outcome::Expired);
+    }
+
+    /// The lower range decides a merge once. A refusal, or an abandon, moves its generation
+    /// on, so the frozen range may thaw: a command for the merge that comes after finds the
+    /// range at another generation and changes nothing.
+    #[test]
+    fn a_refused_merge_is_never_taken_after() {
+        let mut r = Range::new();
+        let (_, made) = r.split(key::route("b", "m"), 2);
+        let mut c = made.unwrap();
+        let lower = lineage(&r.engine).unwrap().now;
+        let freeze = |c: &mut Range, into: &Descriptor| {
+            let generation = lineage(&c.engine).unwrap().now.generation;
+            let Outcome::Frozen(frozen) = c.run(Command::Freeze(Freeze {
+                generation,
+                into: into.clone(),
+            })) else {
+                panic!("frozen");
+            };
+            frozen.now
+        };
+        let from = freeze(&mut c, &lower);
+        let abandon = Command::Abandon(Abandon {
+            generation: lower.generation,
+        });
+        let Outcome::Refused(refused) = r.run(abandon) else {
+            panic!("refused");
+        };
+        assert!(refused.now.generation > lower.generation && refused.taken.is_none());
+        let m = Merge {
+            generation: lower.generation,
+            from,
+            max_rows: 64,
+        };
+        let thaw = Command::Thaw(Thaw {
+            generation: lower.generation,
+        });
+        assert!(matches!(c.run(thaw), Outcome::Thawed(_)));
+        // The merge's decision, arriving late, finds the range moved on and takes nothing.
+        r.index += 1;
+        assert!(matches!(
+            merge(&mut r.engine, r.index, &m, &c.engine).unwrap(),
+            Outcome::Moved(_)
+        ));
+        assert_eq!(
+            lineage(&r.engine).unwrap().now.hi,
+            Some(key::route("b", "m"))
+        );
+        // A merge whose frozen range holds more rows than it may take is refused.
+        c.put("t", "1", Versioning::Enabled);
+        let lower = lineage(&r.engine).unwrap().now;
+        let from = freeze(&mut c, &lower);
+        let m = Merge {
+            generation: lower.generation,
+            from,
+            max_rows: 1,
+        };
+        r.index += 1;
+        assert!(matches!(
+            merge(&mut r.engine, r.index, &m, &c.engine).unwrap(),
+            Outcome::Refused(_)
+        ));
+        // A replica whose copy of the frozen range is not frozen for the merge stops rather
+        // than take other rows than its peers.
+        let lower = lineage(&r.engine).unwrap().now;
+        let m = Merge {
+            generation: lower.generation,
+            from: lineage(&c.engine).unwrap().now,
+            max_rows: 64,
+        };
+        r.index += 1;
+        assert_eq!(
+            merge(&mut r.engine, r.index, &m, &c.engine),
+            Err(MetaError::Unfrozen)
+        );
     }
 
     /// A split at a bucket's first routing key leaves the range none of its keys, and the

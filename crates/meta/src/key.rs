@@ -324,6 +324,13 @@ pub fn released_before(before_ns: u64) -> (Vec<u8>, Vec<u8>) {
     (RELEASED.to_vec(), past)
 }
 
+/// Every key of the released queue: its first, and a key past its last.
+pub fn released_all() -> (Vec<u8>, Vec<u8>) {
+    let mut past = released(u64::MAX, u128::MAX);
+    past.push(0);
+    (RELEASED.to_vec(), past)
+}
+
 /// The time and file a released file's key names; `None` if it is not one.
 pub fn decode_released(k: &[u8]) -> Option<(u64, u128)> {
     let rest = k.strip_prefix(&RELEASED)?;

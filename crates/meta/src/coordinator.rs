@@ -25,7 +25,7 @@ use std::cmp::Ordering;
 use crate::bucket;
 use crate::key;
 use crate::name::{self, Collect, GateChange, Probe, Routed};
-use crate::record::{Bucket, BucketState, Descriptor, Gate, GateState, Lineage};
+use crate::record::{Bucket, BucketState, Descriptor, Gate, GateState, Lineage, Standing};
 
 /// A coordinator's next request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -445,7 +445,13 @@ impl Coordinator {
         restart: Restart,
     ) -> Result<Phase, CoordinatorError> {
         self.known.retain(|d| d.id != at.range.id);
-        for d in [Some(lineage.now), lineage.child].into_iter().flatten() {
+        // An ended range holds nothing: only where its span went is learnt.
+        let own = if lineage.standing == Standing::Ended {
+            None
+        } else {
+            Some(lineage.now)
+        };
+        for d in [own, lineage.child, lineage.into].into_iter().flatten() {
             self.learn(d);
         }
         if self.covers() {
@@ -571,7 +577,13 @@ mod tests {
     }
 
     fn moved(now: Descriptor, child: Option<Descriptor>) -> Box<Lineage> {
-        Box::new(Lineage { now, child })
+        Box::new(Lineage {
+            now,
+            child,
+            standing: crate::record::Standing::Serving,
+            into: None,
+            taken: None,
+        })
     }
 
     /// The range and generation a request is routed by.

@@ -16,4 +16,8 @@ pub enum MetaError {
     /// of time can bring about.
     #[error("the range's clock has no later instant")]
     ClockExhausted,
+    /// A merge came to be taken while this replica's copy of the range it takes is not frozen
+    /// for it: the replicas would take different rows, so this one stops.
+    #[error("the range a merge takes is not frozen for it on this replica")]
+    Unfrozen,
 }

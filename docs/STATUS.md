@@ -193,15 +193,18 @@ simulation of 2,000 schedules, with gateways that stop at any stage or come late
 stop between any two steps, and leaders whose clocks run behind, finds no file both
 referenced and released, no named block taken apart, and nothing left unsettled or unnamed.
 
-Name ranges split ([design §3](design/metadata.md#3-ranges)), as the TLA+ model of splits
-under a create and a delete lays out: each range records its span and a generation, the
-child takes the keys past the cut with their rows and marks, the gates of the buckets it
-can hold, the gate floor and the clock, and a command for a key outside the span, or a
-coordinator's step routed by another generation, is answered with where the span went and
-takes nothing. The coordinator routes by descriptors and starts its phase again when a range
-has moved on. Both simulations split ranges while buckets are created and deleted and files
-are handed over and swept, with writers and sweeps that learn of splits late, and each rule
-removed on purpose fails one of them or a test of its own.
+Name ranges split and merge ([design §3](design/metadata.md#3-ranges)), as the TLA+ model
+of splits and merges under a create and a delete lays out: each range records its span and a
+generation, the child takes the keys past the cut with their rows and marks, the gates of the
+buckets it can hold, the gate floor and the clock, and a command for a key outside the span,
+or a coordinator's step routed by another generation, is answered with where the span went
+and takes nothing. A merge freezes the higher range and lets the lower range decide once, in
+its own log, moving its generation on either way, then ends or thaws the frozen range; its
+driver (`mantle_meta::merge`) resumes from either range. The coordinator routes by
+descriptors and starts its phase again when a range has moved on. Both simulations split and
+merge ranges while buckets are created and deleted and files are handed over and swept, with
+writers and sweeps that learn of both late and merge drivers that stop, resume, give up and
+send late, and each rule removed on purpose fails one of them or a test of its own.
 
 The Raft log (`mantle-log`, [design](design/raft-log.md)), which every range replica on a
 metadata device shares: group commit across ranges with one flush a batch, frames whose
@@ -236,14 +239,14 @@ Remaining before it is done:
   storage nodes run, and the collector's pacing against foreground latency (design §2, §6;
   docs/research/22 §10).
 - The production engine, once its binding is chosen (design §4).
-- Merges. The model joins two ranges in one step; built, a merge spans two logs, freezing
-  the higher range, deciding in the lower's, then ending or thawing the higher, and a
-  stale command must never join a range that has thawed. That protocol is modelled in
-  TLA+ first (design §3, `docs/models/RangeSplit.tla`).
-- The replica side of a split: the child's group made on the parent's replicas from the
-  parent's engine files as they stood at the split's entry, which carries the split alone;
-  the directory the ranges publish their descriptors to; and a read by key answered only by
-  the range whose span holds it, when the gateway's read path is built.
+- The replica side of splits and merges: the child's group made on the parent's replicas
+  from the parent's engine files as they stood at the split's entry, which carries the split
+  alone; a merge's replica sets aligned first, its decision proposed once every replica of
+  the frozen range has applied the freeze, and the ended range's group kept until every
+  replica of the lower range has taken its rows; the directory the ranges publish their
+  descriptors to; which ranges to split and merge, from measured size and load; and a read
+  by key answered only by the range whose span holds it, when the gateway's read path is
+  built.
 - The fast track under simulation, and the transport: QUIC for bulk transfers and
   snapshots, and a UDP transport for consensus messages.
 - Linearizability checked with real processes on the production engine.

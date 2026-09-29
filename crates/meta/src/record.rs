@@ -281,13 +281,36 @@ pub struct Descriptor {
     pub generation: u64,
 }
 
-/// What a Name range knows of where its span went: its descriptor now and the child its last
-/// split made, as it was made. A range answers a request routed by a descriptor it no longer
-/// matches with its lineage, and never with data (docs/design/metadata.md §3).
+/// What a Name range knows of where its span went: its descriptor now, the child its last
+/// split made, as it was made, and the range it is merging or merged into. A range answers a
+/// request routed by a descriptor it no longer matches with its lineage, and never with data
+/// (docs/design/metadata.md §3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lineage {
     pub now: Descriptor,
     pub child: Option<Descriptor>,
+    pub standing: Standing,
+    /// While frozen, the range just below as the merge's driver read it, whose ID and
+    /// generation name the merge; once ended, that range as the merge left it.
+    pub into: Option<Descriptor>,
+    /// The merge this range took and has not yet let go of.
+    pub taken: Option<Taken>,
+}
+
+/// Whether a Name range takes steps: serving, frozen for a merge into the range just below
+/// it, or ended by one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    Serving,
+    Frozen,
+    Ended,
+}
+
+/// A merge a range took: the ID of the range it took, and its own generation the merge named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Taken {
+    pub from: u64,
+    pub generation: u64,
 }
 
 /// The object key a released file was held under: the version, part or handover that took
@@ -490,11 +513,26 @@ pub(crate) fn take_descriptor(r: &mut Reader<'_>) -> Option<Descriptor> {
 
 pub(crate) fn put_lineage(w: &mut Writer, l: &Lineage) -> Result<(), RecordError> {
     put_descriptor(w, &l.now)?;
-    match &l.child {
+    for d in [&l.child, &l.into] {
+        match d {
+            None => w.u8(0),
+            Some(d) => {
+                w.u8(1);
+                put_descriptor(w, d)?;
+            }
+        }
+    }
+    w.u8(match l.standing {
+        Standing::Serving => 0,
+        Standing::Frozen => 1,
+        Standing::Ended => 2,
+    });
+    match l.taken {
         None => w.u8(0),
-        Some(child) => {
+        Some(t) => {
             w.u8(1);
-            put_descriptor(w, child)?;
+            w.u64(t.from);
+            w.u64(t.generation);
         }
     }
     Ok(())
@@ -502,12 +540,40 @@ pub(crate) fn put_lineage(w: &mut Writer, l: &Lineage) -> Result<(), RecordError
 
 pub(crate) fn take_lineage(r: &mut Reader<'_>) -> Option<Lineage> {
     let now = take_descriptor(r)?;
-    let child = match r.u8()? {
-        0 => None,
-        1 => Some(take_descriptor(r)?),
+    let mut descriptors = [None, None];
+    for d in &mut descriptors {
+        *d = match r.u8()? {
+            0 => None,
+            1 => Some(take_descriptor(r)?),
+            _ => return None,
+        };
+    }
+    let [child, into] = descriptors;
+    let standing = match r.u8()? {
+        0 => Standing::Serving,
+        1 => Standing::Frozen,
+        2 => Standing::Ended,
         _ => return None,
     };
-    Some(Lineage { now, child })
+    let taken = match r.u8()? {
+        0 => None,
+        1 => Some(Taken {
+            from: r.u64()?,
+            generation: r.u64()?,
+        }),
+        _ => return None,
+    };
+    // A range heads somewhere exactly when it is frozen or has ended.
+    if into.is_some() != (standing != Standing::Serving) {
+        return None;
+    }
+    Some(Lineage {
+        now,
+        child,
+        standing,
+        into,
+        taken,
+    })
 }
 
 impl Lineage {
@@ -1411,14 +1477,39 @@ mod tests {
             Lineage {
                 now: parent.clone(),
                 child: Some(child.clone()),
+                standing: Standing::Serving,
+                into: None,
+                taken: Some(Taken {
+                    from: 9,
+                    generation: 4,
+                }),
             },
             Lineage {
                 now: child.clone(),
                 child: None,
+                standing: Standing::Frozen,
+                into: Some(parent.clone()),
+                taken: None,
+            },
+            Lineage {
+                now: child.clone(),
+                child: None,
+                standing: Standing::Ended,
+                into: Some(parent.clone()),
+                taken: None,
             },
         ] {
             assert_eq!(Lineage::decode(&l.encode().unwrap()), Ok(l));
         }
+        // A serving range heads nowhere.
+        let wrong = Lineage {
+            now: child.clone(),
+            child: None,
+            standing: Standing::Serving,
+            into: Some(parent.clone()),
+            taken: None,
+        };
+        assert!(Lineage::decode(&wrong.encode().unwrap()).is_err());
         assert!(parent.holds(b"") && parent.holds(b"l") && !parent.holds(&[b'm', 0, 0]));
         assert!(child.holds(&[b'm', 0, 0]) && child.holds(&[0xFE]));
         // A bucket's routes meet the spans that hold any of them.

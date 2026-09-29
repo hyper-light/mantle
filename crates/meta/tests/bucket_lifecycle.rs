@@ -7,28 +7,33 @@
     clippy::disallowed_macros
 )]
 
-//! Creating and deleting one bucket across a Bucket range and Name ranges that split while it
-//! happens (docs/design/metadata.md §2–§3), driven by the coordinator the gateway runs
-//! (`mantle_meta::coordinator`), under schedules proptest chooses: coordinators that stall and
-//! are taken over between any two of their reads and commands, collectors that resume deletes
-//! left behind, whether or not the collector's schedule calls for it, writers whose view of the
-//! bucket is stale, and splits the directory and the writers learn of late, as in
-//! docs/models/RangeSplit.tla. After every step, the ranges divide the keys between them and
-//! hold rows only of their own, no write a Name range acknowledged is lost to a delete, an
-//! active bucket's every range has its gate open, and a forgotten bucket leaves no gate
-//! behind. Once the schedule's faults stop, the directory catches up, every coordinator runs
-//! and the collector acts on its schedule, and every create and delete comes to an end: the
-//! bucket active, or its name forgotten.
+//! Creating and deleting one bucket across a Bucket range and Name ranges that split and merge
+//! while it happens (docs/design/metadata.md §2–§3), driven by the coordinator the gateway
+//! runs (`mantle_meta::coordinator`), under schedules proptest chooses: coordinators that stall
+//! and are taken over between any two of their reads and commands, collectors that resume
+//! deletes left behind, whether or not the collector's schedule calls for it, writers whose
+//! view of the bucket is stale, splits the directory and the writers learn of late, and merges
+//! whose drivers (`mantle_meta::merge`) stop, are resumed from either range, give up, and
+//! whose last command arrives late, as in docs/models/RangeSplit.tla. After every step, the
+//! ranges that own their spans divide the keys between them and hold rows only of their own,
+//! no write a Name range acknowledged is lost to a delete, an active bucket's every range has
+//! its gate open, and a forgotten bucket leaves no gate behind. Once the schedule's faults
+//! stop, every merge in flight ends, the directory catches up, every coordinator runs and the
+//! collector acts on its schedule, and every create and delete comes to an end: the bucket
+//! active, or its name forgotten.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use mantle_meta::bucket::{self, Create};
 use mantle_meta::collector::{Schedule, Takeover};
 use mantle_meta::coordinator::{Answer, Coordinator, Request, Settled};
 use mantle_meta::engine::{Engine, Model};
-use mantle_meta::key;
-use mantle_meta::name::{self, Delete, Preconditions, Probe, Put, Routed, Split};
-use mantle_meta::record::{BucketState, Descriptor, GateState, Lineage, Version, Versioning};
+use mantle_meta::key::{self, NameRow};
+use mantle_meta::merge::{self, Merger};
+use mantle_meta::name::{self, Delete, Preconditions, Put, Split};
+use mantle_meta::record::{
+    BucketState, Descriptor, GateState, Lineage, Standing, Version, Versioning,
+};
 use proptest::prelude::*;
 
 const BUCKET: &str = "b";
@@ -84,6 +89,22 @@ enum Action {
     Publish,
     /// The writers take the directory's descriptors.
     Refresh,
+    /// A driver begins merging a range into the one just below it, as the directory
+    /// describes them, taking at most `rows` rows: few enough that some merges are refused.
+    Merge {
+        range: usize,
+        rows: u64,
+    },
+    /// One step of one merge in flight.
+    MergeStep(usize),
+    /// A merge's driver gives it up before its decision.
+    MergeAbandon(usize),
+    /// A merge's driver stops for good; the request it was sending arrives later.
+    MergeStop(usize),
+    /// A stopped driver's request arrives, late.
+    Late(usize),
+    /// Every merge a range's lineage shows in flight is resumed.
+    MergeResume,
 }
 
 fn action() -> impl Strategy<Value = Action> {
@@ -101,8 +122,17 @@ fn action() -> impl Strategy<Value = Action> {
         1 => (0usize..8, 0..CUTS.len()).prop_map(|(range, cut)| Action::Split { range, cut }),
         1 => Just(Action::Publish),
         1 => Just(Action::Refresh),
+        1 => (0usize..8, 0u64..8).prop_map(|(range, rows)| Action::Merge { range, rows }),
+        4 => (0usize..4).prop_map(Action::MergeStep),
+        1 => (0usize..4).prop_map(Action::MergeAbandon),
+        1 => (0usize..4).prop_map(Action::MergeStop),
+        1 => (0usize..4).prop_map(Action::Late),
+        1 => Just(Action::MergeResume),
     ]
 }
+
+/// Rows a merge resumed after its driver stopped may take.
+const MAX_ROWS: u64 = 64;
 
 /// Rows a coordinator's read or collection passes or removes at a time: one, so every paused
 /// read and partial collection is exercised.
@@ -132,6 +162,12 @@ struct World {
     directory: Vec<Descriptor>,
     /// The descriptors the writers route by.
     cache: Vec<Descriptor>,
+    /// Merges in flight.
+    mergers: Vec<Merger>,
+    /// Requests of stopped merge drivers, not yet arrived.
+    late: Vec<merge::Request>,
+    /// The merges a lower range took, by its ID and the generation the merge named.
+    taken: BTreeSet<(u64, u64)>,
     clock: u64,
     coordinators: Vec<Coordinator>,
     /// Incarnations writers have seen active, oldest first.
@@ -161,6 +197,9 @@ impl World {
             next_id: 2,
             directory: Vec::new(),
             cache: Vec::new(),
+            mergers: Vec::new(),
+            late: Vec::new(),
+            taken: BTreeSet::new(),
             clock: 0,
             coordinators: Vec::new(),
             views: Vec::new(),
@@ -253,6 +292,42 @@ impl World {
         }
     }
 
+    /// What the Name ranges answer a merge driver's request.
+    fn serve_merge(&mut self, request: merge::Request) -> merge::Answer {
+        match request {
+            merge::Request::Name { range, command } => {
+                merge::Answer::Name(self.name(range, *command))
+            }
+            merge::Request::Merge {
+                range,
+                from,
+                command,
+            } => {
+                let upper = self.names[&from].engine.clone();
+                let lower = self.names.get_mut(&range).unwrap();
+                lower.index += 1;
+                let outcome =
+                    name::merge(&mut lower.engine, lower.index, &command, &upper).unwrap();
+                if let name::Outcome::Merged(_) = outcome {
+                    self.taken.insert((range, command.generation));
+                }
+                merge::Answer::Name(outcome)
+            }
+            merge::Request::Lineage { range } => merge::Answer::Lineage(self.lineage(range)),
+        }
+    }
+
+    /// One step of the merge at `i`.
+    fn merge_step(&mut self, i: usize) {
+        if let Some(request) = self.mergers[i].next() {
+            let answer = self.serve_merge(request);
+            self.mergers[i].answer(answer).unwrap();
+        }
+        if self.mergers[i].is_done() {
+            self.mergers.swap_remove(i);
+        }
+    }
+
     /// The range the writers route `key` by, if their descriptors hold it.
     fn route(&self, key: &str) -> Option<u64> {
         let route = key::route(BUCKET, key);
@@ -274,10 +349,14 @@ impl World {
         let outcome = self.name(id, command);
         if let name::Outcome::Moved(lineage) = &outcome {
             self.cache.retain(|d| d.id != id);
-            for d in [Some(&lineage.now), lineage.child.as_ref()]
-                .into_iter()
-                .flatten()
-            {
+            // An ended range holds nothing: only where its span went is learnt.
+            let own = if lineage.standing == Standing::Ended {
+                None
+            } else {
+                Some(&lineage.now)
+            };
+            let learnt = [own, lineage.child.as_ref(), lineage.into.as_ref()];
+            for d in learnt.into_iter().flatten() {
                 if !self
                     .cache
                     .iter()
@@ -434,6 +513,55 @@ impl World {
                 self.directory = self.names.keys().map(|&id| self.lineage(id).now).collect();
             }
             Action::Refresh => self.cache.clone_from(&self.directory),
+            Action::Merge { range, rows } => {
+                if !self.directory.is_empty() {
+                    let upper = self.directory[range % self.directory.len()].clone();
+                    if let Some(lower) = self
+                        .directory
+                        .iter()
+                        .find(|d| d.hi.as_ref() == Some(&upper.lo))
+                    {
+                        self.mergers.push(Merger::new(lower.clone(), upper, *rows));
+                    }
+                }
+            }
+            Action::MergeStep(i) => {
+                if !self.mergers.is_empty() {
+                    self.merge_step(i % self.mergers.len());
+                }
+            }
+            Action::MergeAbandon(i) => {
+                if !self.mergers.is_empty() {
+                    let i = i % self.mergers.len();
+                    if let Some(request) = self.mergers[i].abandon() {
+                        let answer = self.serve_merge(request);
+                        self.mergers[i].answer(answer).unwrap();
+                    }
+                }
+            }
+            Action::MergeStop(i) => {
+                if !self.mergers.is_empty() {
+                    let stopped = self.mergers.swap_remove(i % self.mergers.len());
+                    self.late.extend(stopped.next());
+                }
+            }
+            Action::Late(i) => {
+                if !self.late.is_empty() {
+                    let request = self.late.swap_remove(i % self.late.len());
+                    self.serve_merge(request);
+                }
+            }
+            Action::MergeResume => self.resume_merges(),
+        }
+    }
+
+    /// A driver for every merge a range's lineage shows in flight.
+    fn resume_merges(&mut self) {
+        let ids: Vec<u64> = self.names.keys().copied().collect();
+        for id in ids {
+            if let Ok(m) = Merger::resume(&self.lineage(id), MAX_ROWS) {
+                self.mergers.push(m);
+            }
         }
     }
 
@@ -449,6 +577,28 @@ impl World {
     /// the collector acts on its schedule once the attempts left behind have gone their
     /// patience: every create and delete comes to an end within a few rounds.
     fn finish(&mut self) {
+        // Late requests arrive, and every merge in flight is carried to its end.
+        while let Some(request) = self.late.pop() {
+            self.serve_merge(request);
+            self.check();
+        }
+        self.resume_merges();
+        // Each in turn, since one may wait on another's end.
+        for turn in 0..10_000 {
+            if self.mergers.is_empty() {
+                break;
+            }
+            self.merge_step(turn % self.mergers.len());
+            self.check();
+        }
+        assert!(self.mergers.is_empty(), "a merge never finished");
+        for id in self.names.keys() {
+            let lineage = self.lineage(*id);
+            assert!(
+                lineage.standing != Standing::Frozen && lineage.taken.is_none(),
+                "a merge left in flight: {lineage:?}"
+            );
+        }
         self.act(&Action::Publish);
         for _ in 0..16 {
             let mut budget = 10_000;
@@ -473,30 +623,45 @@ impl World {
         panic!("attempts left after 16 rounds of the collector");
     }
 
-    /// The live range whose span holds `key`, and its rows.
+    /// The ranges that own their spans: every serving range, and every frozen one whose merge
+    /// was not taken. A range that ended, or whose merge was taken, keeps rows its lower range
+    /// took and now owns.
+    fn owners(&self) -> Vec<(u64, Lineage)> {
+        self.names
+            .keys()
+            .map(|&id| (id, self.lineage(id)))
+            .filter(|(_, l)| match (l.standing, &l.into) {
+                (Standing::Serving, _) => true,
+                (Standing::Frozen, Some(into)) => !self.taken.contains(&(into.id, into.generation)),
+                _ => false,
+            })
+            .collect()
+    }
+
+    /// The range that owns `key`, and its rows.
     fn holder(&self, key: &str) -> &Model {
         let route = key::route(BUCKET, key);
-        let (_, range) = self
-            .names
-            .iter()
-            .find(|(id, _)| self.lineage(**id).now.holds(&route))
+        let (id, _) = self
+            .owners()
+            .into_iter()
+            .find(|(_, l)| l.now.holds(&route))
             .unwrap();
-        &range.engine
+        &self.names[&id].engine
     }
 
     fn check(&self) {
         // The ranges divide the keys between them, and each holds rows, marks and gates only
         // of its own keys and buckets.
-        let mut spans: Vec<Descriptor> =
-            self.names.keys().map(|&id| self.lineage(id).now).collect();
+        let owners = self.owners();
+        let mut spans: Vec<Descriptor> = owners.iter().map(|(_, l)| l.now.clone()).collect();
         spans.sort_by(|a, b| a.lo.cmp(&b.lo));
         assert!(spans[0].lo.is_empty(), "no range holds the first keys");
         for pair in spans.windows(2) {
             assert_eq!(pair[0].hi.as_ref(), Some(&pair[1].lo), "{spans:?}");
         }
         assert_eq!(spans.last().unwrap().hi, None);
-        for (&id, range) in &self.names {
-            let now = self.lineage(id).now;
+        for (id, lineage) in &owners {
+            let (now, range) = (&lineage.now, &self.names[id]);
             for (k, _) in range.engine.image().unwrap() {
                 if let Some((bucket, key, _)) = key::decode_name(&k) {
                     assert!(
@@ -535,10 +700,10 @@ impl World {
             assert!(!version.marker);
         }
         let (first, past) = key::bucket_routes(BUCKET);
-        for (&id, range) in &self.names {
-            let now = self.lineage(id).now;
+        for (id, lineage) in &owners {
+            let (now, range) = (&lineage.now, &self.names[id]);
             let gate = name::gate(&range.engine, BUCKET).unwrap();
-            let probe = name::probe(&range.engine, BUCKET, now.generation, None, 64).unwrap();
+            let versions = holds_versions(&range.engine);
             match row.as_ref().map(|r| (r.state, r.created_ns)) {
                 // An active bucket takes writes to every key: every range that can hold its
                 // keys has its gate open.
@@ -551,16 +716,27 @@ impl World {
                 }
                 // A deleted bucket holds no versions, and a forgotten one no gates.
                 Some((BucketState::Deleted, _)) => {
-                    assert_eq!(probe, Routed::Here(Probe::Clear));
+                    assert!(!versions, "a deleted bucket's version in {now:?}");
                 }
                 None => {
                     assert_eq!(gate, None, "a forgotten bucket's gate in {now:?}");
-                    assert_eq!(probe, Routed::Here(Probe::Clear));
+                    assert!(!versions, "a forgotten bucket's version in {now:?}");
                 }
                 _ => {}
             }
         }
     }
+}
+
+/// Whether a range's rows hold a version or delete marker of the bucket, read as they are,
+/// frozen or not.
+fn holds_versions(engine: &Model) -> bool {
+    engine.image().unwrap().iter().any(|(k, _)| {
+        matches!(
+            key::decode_name(k),
+            Some((bucket, _, NameRow::Null | NameRow::Version(_))) if bucket == BUCKET
+        )
+    })
 }
 
 fn object() -> Version {

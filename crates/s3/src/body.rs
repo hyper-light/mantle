@@ -606,6 +606,47 @@ pub fn ownership_controls(body: &[u8]) -> Result<Ownership, BodyError> {
     rule.ok_or(schema("OwnershipControls without a rule"))
 }
 
+/// The largest PublicAccessBlockConfiguration body: its four settings, each at its longest.
+pub const PUBLIC_ACCESS_BLOCK_LIMIT: usize = SPACE
+    * (PROLOG
+        + "<PublicAccessBlockConfiguration></PublicAccessBlockConfiguration>".len()
+        + "<BlockPublicAcls>false</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls>\
+           <BlockPublicPolicy>false</BlockPublicPolicy>\
+           <RestrictPublicBuckets>false</RestrictPublicBuckets>"
+            .len());
+
+/// PutPublicAccessBlock's settings (17 §7): each an `xs:boolean`, and one the document leaves
+/// out off, as the settings are replaced whole.
+pub fn public_access_block(body: &[u8]) -> Result<crate::policy::PublicAccessBlock, BodyError> {
+    let mut reader = Reader::open(
+        body,
+        PUBLIC_ACCESS_BLOCK_LIMIT,
+        "PublicAccessBlockConfiguration",
+    )?;
+    let (mut acls, mut ignore, mut policy, mut restrict) = (None, None, None, None);
+    while let Some(name) = reader.child()? {
+        let field = match name {
+            "BlockPublicAcls" => &mut acls,
+            "IgnorePublicAcls" => &mut ignore,
+            "BlockPublicPolicy" => &mut policy,
+            "RestrictPublicBuckets" => &mut restrict,
+            _ => {
+                return Err(schema(
+                    "an element PublicAccessBlockConfiguration does not have",
+                ));
+            }
+        };
+        once(field, boolean(&reader.text()?)?)?;
+    }
+    reader.finish()?;
+    Ok(crate::policy::PublicAccessBlock {
+        block_public_acls: acls.unwrap_or(false),
+        ignore_public_acls: ignore.unwrap_or(false),
+        block_public_policy: policy.unwrap_or(false),
+        restrict_public_buckets: restrict.unwrap_or(false),
+    })
+}
+
 /// The largest CORSConfiguration body: "The document is limited to 64 KB in size"
 /// (16 §1.1).
 pub const CORS_LIMIT: usize = cors::LIMIT;
@@ -2114,5 +2155,33 @@ mod tests {
             rule(get_any)
         );
         assert!(cors(namespaced.as_bytes()).is_ok());
+    }
+
+    /// PutPublicAccessBlock's settings as botocore writes them; one left out is off (17 §7).
+    #[test]
+    fn public_access_block_reads_its_settings() {
+        let all = format!(
+            "<PublicAccessBlockConfiguration xmlns=\"{NAMESPACE}\"><BlockPublicAcls>true\
+             </BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls><BlockPublicPolicy>true\
+             </BlockPublicPolicy><RestrictPublicBuckets>true</RestrictPublicBuckets>\
+             </PublicAccessBlockConfiguration>"
+        );
+        assert_eq!(
+            public_access_block(all.as_bytes()),
+            Ok(crate::policy::PublicAccessBlock::NEW_BUCKET)
+        );
+        let one =
+            b"<PublicAccessBlockConfiguration><RestrictPublicBuckets>1</RestrictPublicBuckets>\
+                    </PublicAccessBlockConfiguration>";
+        let read = public_access_block(one).unwrap();
+        assert!(read.restrict_public_buckets);
+        assert!(!read.block_public_policy && !read.block_public_acls && !read.ignore_public_acls);
+        for bad in [
+            &b"<PublicAccessBlockConfiguration><BlockPublicPolicy>yes</BlockPublicPolicy></PublicAccessBlockConfiguration>"[..],
+            b"<PublicAccessBlockConfiguration><BlockPublicPolicy>true</BlockPublicPolicy><BlockPublicPolicy>true</BlockPublicPolicy></PublicAccessBlockConfiguration>",
+            b"<PublicAccessBlockConfiguration><BlockAll>true</BlockAll></PublicAccessBlockConfiguration>",
+        ] {
+            assert_eq!(public_access_block(bad).map_err(|e| e.code().0), Err("MalformedXML"));
+        }
     }
 }

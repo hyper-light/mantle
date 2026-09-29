@@ -681,6 +681,26 @@ pub fn lifecycle_configuration(rules: &[Rule]) -> Result<String, TimeOutOfRange>
     }))
 }
 
+/// GetPublicAccessBlock's `PublicAccessBlockConfiguration` (17 §7).
+pub fn public_access_block(block: &crate::policy::PublicAccessBlock) -> String {
+    let flag = |on: bool| if on { "true" } else { "false" };
+    Writer::document("PublicAccessBlockConfiguration", true, |w| {
+        w.text("BlockPublicAcls", flag(block.block_public_acls));
+        w.text("IgnorePublicAcls", flag(block.ignore_public_acls));
+        w.text("BlockPublicPolicy", flag(block.block_public_policy));
+        w.text("RestrictPublicBuckets", flag(block.restrict_public_buckets));
+    })
+}
+
+/// GetBucketPolicyStatus' `PolicyStatus`, `IsPublic` written `true` or `false`: AWS's sample
+/// writes `TRUE`, which botocore, reading a boolean as `text == 'true'`, takes for false
+/// (17 §2.2).
+pub fn policy_status(public: bool) -> String {
+    Writer::document("PolicyStatus", true, |w| {
+        w.text("IsPublic", if public { "true" } else { "false" });
+    })
+}
+
 /// GetBucketCors' `CORSConfiguration` (16 §1.2): each rule as set, its lists in the order
 /// given, in its Response Syntax's order.
 pub fn cors_configuration(rules: &[cors::Rule]) -> String {
@@ -2301,6 +2321,28 @@ mod tests {
                  <RequestId>Z4ERRATSVNEC7WS7</RequestId>"
             ),
             "{doc}"
+        );
+    }
+
+    /// GetPublicAccessBlock's settings read back as they were set, and the policy status in the
+    /// lowercase botocore reads (17 §2.2, §7).
+    #[test]
+    fn public_access_documents_read_back() {
+        let block = crate::policy::PublicAccessBlock {
+            block_public_acls: true,
+            ignore_public_acls: false,
+            block_public_policy: true,
+            restrict_public_buckets: false,
+        };
+        let doc = public_access_block(&block);
+        assert_eq!(crate::body::public_access_block(doc.as_bytes()), Ok(block));
+        let status = policy_status(true);
+        assert!(status.contains("<IsPublic>true</IsPublic>"), "{status}");
+        assert!(policy_status(false).contains("<IsPublic>false</IsPublic>"));
+        let (_, leaves) = elements(&status);
+        assert_eq!(
+            leaves,
+            [("/PolicyStatus/IsPublic".to_string(), "true".to_string())]
         );
     }
 

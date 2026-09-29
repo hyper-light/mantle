@@ -54,6 +54,58 @@ pub struct Action {
     pub keys: &'static [&'static str],
 }
 
+/// A bucket's Block Public Access settings (17 §7). S3 turns all four on for every new bucket
+/// since April 2023; with ACLs disabled on every bucket, the two for ACLs change nothing, and
+/// are kept so a configuration reads back as it was set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicAccessBlock {
+    pub block_public_acls: bool,
+    pub ignore_public_acls: bool,
+    /// Refuse a public policy: "Setting this element to `TRUE` causes Amazon S3 to reject calls
+    /// to PUT Bucket policy if the specified bucket policy allows public access."
+    pub block_public_policy: bool,
+    /// Limit what a public policy grants to the owner's own account: "public and cross-account
+    /// access within any public bucket policy, including non-public delegation to specific
+    /// accounts, is blocked."
+    pub restrict_public_buckets: bool,
+}
+
+impl PublicAccessBlock {
+    /// A new bucket's: every setting on.
+    pub const NEW_BUCKET: Self = Self {
+        block_public_acls: true,
+        ignore_public_acls: true,
+        block_public_policy: true,
+        restrict_public_buckets: true,
+    };
+}
+
+/// PutBucketPolicy refused for a public policy under BlockPublicPolicy: `403 AccessDenied`
+/// (17 §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "Access Denied because public policies are prevented by the BlockPublicPolicy setting in S3 Block Public Access."
+)]
+pub struct PublicPolicyBlocked;
+
+impl PublicPolicyBlocked {
+    pub fn code(&self) -> (&'static str, u16) {
+        ("AccessDenied", 403)
+    }
+}
+
+/// Whether `policy` may be set on a bucket with the settings `block`, if it has any.
+pub fn may_set(
+    policy: &Policy,
+    block: Option<&PublicAccessBlock>,
+) -> Result<(), PublicPolicyBlocked> {
+    if block.is_some_and(|block| block.block_public_policy) && policy.is_public() {
+        Err(PublicPolicyBlocked)
+    } else {
+        Ok(())
+    }
+}
+
 /// A bucket policy, checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Policy {
@@ -298,6 +350,69 @@ pub fn parse(body: &[u8], bucket: &str) -> Result<Policy, PolicyError> {
         variables,
         statements,
     })
+}
+
+impl Policy {
+    /// Whether the policy is public, as S3 judges it: "Amazon S3 begins by assuming that the
+    /// policy is public. ... To be considered non-public, a bucket policy must grant access
+    /// only to fixed values (values that don't contain a wildcard or an AWS Identity and Access
+    /// Management Policy Variable)" of a principal, a source address range no broader than `/8`
+    /// for IPv4 and `/32` for IPv6, or one of the keys that fix a source (17 §7). An allowing
+    /// statement to everyone is public unless one of its conditions fixes such a key; one that
+    /// names principals is not. A denying statement grants nothing.
+    pub fn is_public(&self) -> bool {
+        self.statements.iter().any(|statement| {
+            statement.allow
+                && statement.principals.everyone
+                && !statement.conditions.iter().any(fixes)
+        })
+    }
+}
+
+/// Whether a condition holds a request to fixed values of a key S3 counts as confining it
+/// (17 §7). A condition a request without the key satisfies, `...IfExists` or `ForAllValues`,
+/// confines nothing.
+fn fixes(condition: &Condition) -> bool {
+    use Operator as O;
+    if condition.if_exists || condition.set == Some(Set::All) {
+        return false;
+    }
+    let fixed = condition
+        .values
+        .iter()
+        .all(|value| !value.contains(['*', '?']) && !value.contains("${"));
+    match condition.key.as_str() {
+        "aws:sourceip" => {
+            condition.operator == O::IpAddress
+                && condition.values.iter().all(|value| {
+                    cidr(value).is_some_and(|(address, prefix)| {
+                        prefix >= if address.is_ipv4() { 8 } else { 32 }
+                    })
+                })
+        }
+        "aws:sourcearn"
+        | "aws:sourcevpc"
+        | "aws:sourcevpce"
+        | "aws:sourceowner"
+        | "aws:sourceaccount"
+        | "aws:principalorgid"
+        | "aws:principalarn"
+        | "aws:principalaccount"
+        | "aws:userid"
+        | "s3:dataaccesspointarn"
+        | "s3:dataaccesspointaccount" => {
+            fixed
+                && matches!(
+                    condition.operator,
+                    O::StringEquals
+                        | O::StringEqualsIgnoreCase
+                        | O::StringLike
+                        | O::ArnEquals
+                        | O::ArnLike
+                )
+        }
+        _ => false,
+    }
 }
 
 /// One statement: its elements, each pair of an element and its `Not` form exclusive, and
@@ -1073,5 +1188,104 @@ mod tests {
         assert!(wildcard("é?", "éé"));
         let long = "a".repeat(2000);
         assert!(!wildcard(&"*a".repeat(100), &format!("{long}b")));
+    }
+
+    fn allow(principal: &str, condition: &str) -> Policy {
+        let condition = if condition.is_empty() {
+            String::new()
+        } else {
+            format!(", \"Condition\": {condition}")
+        };
+        read(&format!(
+            "{{\"Version\": \"2012-10-17\", \"Statement\": [{{\"Effect\": \"Allow\", \
+             \"Principal\": {principal}, \"Action\": \"s3:PutObject\", \
+             \"Resource\": \"arn:aws:s3:::bucket/*\"{condition}}}]}}"
+        ))
+        .unwrap()
+    }
+
+    /// "The meaning of public" and its examples, and s3-tests' policy-status cases (17 §7, §9).
+    #[test]
+    fn public_is_as_s3_means_it() {
+        let everyone = "{\"AWS\": \"*\"}";
+        assert!(allow("\"*\"", "").is_public());
+        assert!(allow(everyone, "").is_public());
+        assert!(!allow("{\"AWS\": \"111122223333\"}", "").is_public());
+        assert!(
+            !allow(
+                everyone,
+                r#"{"IpAddress": {"aws:SourceIp": "10.0.0.0/32"}}"#
+            )
+            .is_public()
+        );
+        assert!(!allow(everyone, r#"{"IpAddress": {"aws:SourceIp": "10.0.0.0/8"}}"#).is_public());
+        assert!(allow(everyone, r#"{"IpAddress": {"aws:SourceIp": "0.0.0.0/1"}}"#).is_public());
+        assert!(
+            allow(
+                everyone,
+                r#"{"IpAddress": {"aws:SourceIp": "2001:db8::/31"}}"#
+            )
+            .is_public()
+        );
+        assert!(
+            allow(
+                everyone,
+                r#"{"NotIpAddress": {"aws:SourceIp": "10.0.0.0/8"}}"#
+            )
+            .is_public()
+        );
+        assert!(
+            !allow(
+                everyone,
+                r#"{"StringEquals": {"aws:SourceVpc": "vpc-91237329"}}"#
+            )
+            .is_public()
+        );
+        assert!(allow(everyone, r#"{"StringLike": {"aws:SourceVpc": "vpc-*"}}"#).is_public());
+        assert!(
+            allow(
+                everyone,
+                r#"{"StringEqualsIfExists": {"aws:SourceVpc": "vpc-91237329"}}"#
+            )
+            .is_public()
+        );
+        assert!(
+            allow(
+                everyone,
+                r#"{"StringEquals": {"aws:Referer": "http://example.com/"}}"#
+            )
+            .is_public()
+        );
+        assert!(
+            !allow(
+                everyone,
+                r#"{"StringEquals": {"aws:PrincipalOrgID": "o-a1b2c3"}}"#
+            )
+            .is_public()
+        );
+        // A denying statement grants nothing: s3-tests puts one under BlockPublicPolicy.
+        let deny = read(
+            r#"{"Statement": [{"Effect": "Deny", "Principal": {"AWS": "*"}, "Action":
+                "s3:GetBucketPublicAccessBlock", "Resource": "arn:aws:s3:::bucket"}]}"#,
+        )
+        .unwrap();
+        assert!(!deny.is_public());
+    }
+
+    /// s3-tests' `test_block_public_policy` and `..._with_principal`: BlockPublicPolicy refuses a
+    /// public policy, 403 `AccessDenied`, and admits one naming its principals (17 §7, §9).
+    #[test]
+    fn block_public_policy_refuses_public_policies() {
+        let block = PublicAccessBlock::NEW_BUCKET;
+        let public = allow("{\"AWS\": \"*\"}", "");
+        assert_eq!(may_set(&public, Some(&block)), Err(PublicPolicyBlocked));
+        assert_eq!(PublicPolicyBlocked.code(), ("AccessDenied", 403));
+        assert!(may_set(&allow("{\"AWS\": \"111122223333\"}", ""), Some(&block)).is_ok());
+        let off = PublicAccessBlock {
+            block_public_policy: false,
+            ..block
+        };
+        assert!(may_set(&public, Some(&off)).is_ok());
+        assert!(may_set(&public, None).is_ok());
     }
 }

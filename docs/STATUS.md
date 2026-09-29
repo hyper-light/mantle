@@ -122,7 +122,8 @@ against s3-tests' origin tables and LocalStack's recordings of S3. Bucket polici
 a strict JSON reader checked against JSONTestSuite, checked as S3 was recorded checking them
 against the Service Authorization Reference's actions and keys, and requests judged against
 them as IAM documents, with its conditions, wildcards and variables, for accounts and the
-anonymous requester. A subresource routes to
+anonymous requester; whether a policy is public, as S3 judges it, and Block Public Access, on
+for every new bucket as in S3. A subresource routes to
 its own operation or to 405, never to the bucket or object itself, nor across from one to the
 other, and `OPTIONS` is a preflight. The documents every response carries, from listings and
 multipart results to batch deletes, errors, bucket settings, tags, ACLs, lifecycle and CORS
@@ -133,8 +134,6 @@ algorithm, signature verification and signed-chunk decoding on one core.
 
 Remaining before it is done:
 
-- Whether a policy makes its bucket public, and Block Public Access, which S3 turns on for
-  every new bucket: GetBucketPolicyStatus and the `publicAccessBlock` operations.
 - The rest of 05 §16.1's later surface: server-side encryption headers, Object Lock and
   browser POST uploads.
 - The worker that takes lifecycle actions as they fall due, over the Name layer's versions

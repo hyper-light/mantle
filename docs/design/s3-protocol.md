@@ -487,3 +487,17 @@ With ACLs disabled on every bucket (§5), a policy is how a bucket's owner lets 
 - **Variables**, under Version `2012-10-17` only, stand for a key's single value or a default,
   and match themselves: a value holding `*` is not a wildcard. A resource naming a variable
   the request has no value for matches nothing.
+- **Public.** A policy is public as S3 judges it: an allowing statement to everyone, unless one
+  of its conditions holds requests to fixed values of a key that confines their source or
+  principal, or to address ranges no broader than `/8` for IPv4 and `/32` for IPv6. A condition
+  a request without the key satisfies, `...IfExists` or `ForAllValues`, confines nothing.
+  GetBucketPolicyStatus writes `IsPublic` in lowercase, which botocore reads, where AWS's sample
+  writes `TRUE`, which it takes for false; without a policy it answers `NoSuchBucketPolicy`, as
+  S3 did, where s3-tests expects `false`.
+- **Block Public Access** starts with all four settings on for a new bucket, as S3's have been
+  since April 2023. BlockPublicPolicy refuses a public policy, `403 AccessDenied`;
+  RestrictPublicBuckets keeps what a public policy grants within the owner's account, anonymous
+  requests and grants to named accounts included, as S3 documents. The two settings for ACLs
+  change nothing on buckets without ACLs, and are kept so they read back as set. s3-tests sets
+  public policies on new buckets without turning these off, and those tests fail against S3 as
+  against mantle.

@@ -47,6 +47,10 @@ pub enum Operation {
     GetBucketPolicy,
     PutBucketPolicy,
     DeleteBucketPolicy,
+    GetBucketPolicyStatus,
+    GetPublicAccessBlock,
+    PutPublicAccessBlock,
+    DeletePublicAccessBlock,
     /// A CORS preflight, `OPTIONS` on a bucket or an object.
     Preflight,
     ListObjects,
@@ -111,7 +115,7 @@ pub const MAX_KEY: usize = 1024;
 
 /// Bucket subresources S3 defines that mantle does not serve: answered `501 NotImplemented`
 /// rather than taken for another operation.
-const UNSUPPORTED: [&str; 17] = [
+const UNSUPPORTED: [&str; 15] = [
     "accelerate",
     "analytics",
     "encryption",
@@ -121,8 +125,6 @@ const UNSUPPORTED: [&str; 17] = [
     "metrics",
     "notification",
     "object-lock",
-    "policyStatus",
-    "publicAccessBlock",
     "replication",
     "requestPayment",
     "website",
@@ -197,7 +199,7 @@ fn subresource(
 }
 
 /// The subresources of a bucket.
-const BUCKET_SUBRESOURCES: [Subresource; 11] = {
+const BUCKET_SUBRESOURCES: [Subresource; 13] = {
     use Operation as O;
     [
         ("location", &[("GET", O::GetBucketLocation)]),
@@ -247,6 +249,15 @@ const BUCKET_SUBRESOURCES: [Subresource; 11] = {
                 ("GET", O::GetBucketPolicy),
                 ("PUT", O::PutBucketPolicy),
                 ("DELETE", O::DeleteBucketPolicy),
+            ],
+        ),
+        ("policyStatus", &[("GET", O::GetBucketPolicyStatus)]),
+        (
+            "publicAccessBlock",
+            &[
+                ("GET", O::GetPublicAccessBlock),
+                ("PUT", O::PutPublicAccessBlock),
+                ("DELETE", O::DeletePublicAccessBlock),
             ],
         ),
         ("versions", &[("GET", O::ListObjectVersions)]),
@@ -653,9 +664,22 @@ mod tests {
             r("PUT", "s3.example.com", "/b/k", "policy"),
             Err(RouteError::MethodNotAllowed)
         );
+        assert_eq!(op("GET", "/b", "policyStatus"), O::GetBucketPolicyStatus);
         assert_eq!(
-            r("GET", "s3.example.com", "/b", "policyStatus"),
-            Err(RouteError::NotImplemented("policyStatus"))
+            r("PUT", "s3.example.com", "/b", "policyStatus"),
+            Err(RouteError::MethodNotAllowed)
+        );
+        assert_eq!(
+            op("GET", "/b", "publicAccessBlock"),
+            O::GetPublicAccessBlock
+        );
+        assert_eq!(
+            op("PUT", "/b", "publicAccessBlock"),
+            O::PutPublicAccessBlock
+        );
+        assert_eq!(
+            op("DELETE", "/b", "publicAccessBlock"),
+            O::DeletePublicAccessBlock
         );
     }
 

@@ -1,7 +1,7 @@
 //! How a request is judged against a bucket policy (docs/research/17 §3.3, §3.4, §4): which
 //! statements apply to it, and whether it goes ahead.
 
-use super::{Operator, Policy, Principals, Set, Statement, cidr, date, number};
+use super::{Operator, Policy, Principals, PublicAccessBlock, Set, Statement, cidr, date, number};
 
 /// Who makes a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,7 +107,7 @@ impl Policy {
 }
 
 /// Whether a request goes ahead on a bucket whose owner's account is `owner`, under its
-/// policy, if it has one (17 §4):
+/// policy and Block Public Access settings, if it has them (17 §4, §7):
 ///
 /// - "the root principal in a bucket owner's AWS account can perform the `GetBucketPolicy`,
 ///   `PutBucketPolicy`, and `DeleteBucketPolicy` API actions, even if their bucket policy
@@ -118,8 +118,16 @@ impl Policy {
 ///   exception of the AWS account root user, which has full access";
 /// - anyone else needs an allowing statement. mantle's requesters are accounts, each its own
 ///   root, so no identity policy stands between another account and what the bucket policy
-///   grants it, as s3-tests expects of another account's root.
-pub fn authorize(owner: &str, policy: Option<&Policy>, request: &Request<'_>) -> bool {
+///   grants it, as s3-tests expects of another account's root;
+/// - under RestrictPublicBuckets, a public policy grants nothing outside the owner's account:
+///   "This setting also rejects all anonymous (or unsigned) calls", and "Any denial resulting
+///   from the `RestrictPublicBuckets` setting is explicit".
+pub fn authorize(
+    owner: &str,
+    policy: Option<&Policy>,
+    block: Option<&PublicAccessBlock>,
+    request: &Request<'_>,
+) -> bool {
     let owners = matches!(request.requester, Requester::Account { id, .. } if id == owner);
     let own_policy = matches!(
         request.action,
@@ -128,9 +136,12 @@ pub fn authorize(owner: &str, policy: Option<&Policy>, request: &Request<'_>) ->
     if owners && own_policy {
         return true;
     }
+    let restricted = block.is_some_and(|block| block.restrict_public_buckets)
+        && policy.is_some_and(Policy::is_public);
     match policy.map(|policy| policy.verdict(request)) {
         Some(Verdict::Deny) => false,
-        Some(Verdict::Allow) => true,
+        Some(Verdict::Allow) if owners => true,
+        Some(Verdict::Allow) => !restricted,
         Some(Verdict::None) | None => owners,
     }
 }
@@ -479,7 +490,7 @@ mod tests {
             resource,
             context,
         };
-        authorize(OWNER, policy, &request)
+        authorize(OWNER, policy, None, &request)
     }
 
     /// S3's defaults: its owner's account may, anyone else may not (17 §4).
@@ -912,5 +923,55 @@ mod tests {
             "aws:principalarn".into(),
             vec!["arn:aws:iam::222222222222:root".into()]
         )));
+    }
+
+    /// s3-tests' `test_block_public_restrict_public_buckets`: RestrictPublicBuckets turns the
+    /// anonymous GET a public policy allows from allowed to refused, and leaves the owner be;
+    /// it blocks "non-public delegation to specific accounts" in a public policy too (17 §7).
+    #[test]
+    fn restrict_public_buckets_confines_a_public_policy_to_the_owner() {
+        let public = policy(
+            r#"{"Effect": "Allow", "Principal": {"AWS": "*"}, "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::bucket/*"},
+               {"Effect": "Allow", "Principal": {"AWS": "222222222222"}, "Action": "s3:PutObject",
+                "Resource": "arn:aws:s3:::bucket/*"}"#,
+        );
+        let object = "arn:aws:s3:::bucket/k";
+        let judge = |block: Option<&PublicAccessBlock>, requester: Requester<'_>, action: &str| {
+            let request = Request {
+                requester,
+                action,
+                resource: object,
+                context: &[],
+            };
+            authorize(OWNER, Some(&public), block, &request)
+        };
+        let open = PublicAccessBlock {
+            restrict_public_buckets: false,
+            ..PublicAccessBlock::NEW_BUCKET
+        };
+        assert!(judge(Some(&open), Requester::Anonymous, "s3:GetObject"));
+        assert!(judge(None, Requester::Anonymous, "s3:GetObject"));
+        assert!(judge(Some(&open), OTHER, "s3:PutObject"));
+        let restricted = PublicAccessBlock::NEW_BUCKET;
+        assert!(!judge(
+            Some(&restricted),
+            Requester::Anonymous,
+            "s3:GetObject"
+        ));
+        assert!(!judge(Some(&restricted), OTHER, "s3:PutObject"));
+        assert!(judge(Some(&restricted), OWNING, "s3:GetObject"));
+        // A policy that is not public is not restricted.
+        let named = policy(
+            r#"{"Effect": "Allow", "Principal": {"AWS": "222222222222"}, "Action": "s3:PutObject",
+                "Resource": "arn:aws:s3:::bucket/*"}"#,
+        );
+        let request = Request {
+            requester: OTHER,
+            action: "s3:PutObject",
+            resource: object,
+            context: &[],
+        };
+        assert!(authorize(OWNER, Some(&named), Some(&restricted), &request));
     }
 }

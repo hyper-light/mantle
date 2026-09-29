@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 0125abddaba0f844fa87ad8252189942a561c0501ab138f7f47d69dda706ec8b # shrinks to actions = [Write { key: 0 }, Write { key: 0 }, Write { key: 0 }, Write { key: 0 }, Write { key: 0 }, Write { key: 0 }, Write { key: 0 }, Write { key: 0 }, BlockSweep, BlockSweep]
+cc d656427ea4cc7d520b477c73b7a199b3bc245322713dd523ffecca8caf55511f # shrinks to actions = [Write { key: 0 }, Wait, BlockSweep, BlockSweep, Leader { lag: 70 }, Delete { key: 0, versioned: false }, Delete { key: 0, versioned: false }, Advance(0)]

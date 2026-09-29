@@ -1,0 +1,22 @@
+[package]
+name = "mantle-meta"
+description = "The metadata service: buckets, object versions, uploads, files and blocks in replicated ranges"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+mantle-chunk = { path = "../chunk" }
+mantle-codec = { path = "../codec" }
+mantle-crc = { path = "../crc" }
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

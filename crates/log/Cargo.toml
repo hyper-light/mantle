@@ -1,0 +1,25 @@
+[package]
+name = "mantle-log"
+description = "The Raft log: one log per metadata device, shared by every range replica on it"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+getrandom.workspace = true
+mantle-codec = { path = "../codec" }
+mantle-crc = { path = "../crc" }
+mantle-disk = { path = "../disk" }
+thiserror.workspace = true
+
+[dev-dependencies]
+mantle-disk = { path = "../disk", features = ["sim"] }
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

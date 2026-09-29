@@ -1,0 +1,535 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Loom is a tool for testing concurrent programs."><title>loom - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="/-/rustdoc.static/${f}">`).join(""))</script><link rel="stylesheet" href="/-/rustdoc.static/normalize-9960930a.css"><link rel="stylesheet" href="/-/static/vendored.css?0-0-0-9439cafc1e2ea4a64558a489c81351cd959d6077-2026-09-22" media="all" /><link rel="stylesheet" href="/-/rustdoc.static/rustdoc-203241e4.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="/-/rustdoc.static/" data-current-crate="loom" data-themes="" data-resource-suffix="-20260830-1.100.0-nightly-908501772" data-rustdoc-version="1.100.0-nightly (908501772 2026-08-30)" data-channel="nightly" data-search-js="search-b167f383.js" data-stringdex-js="stringdex-b5109af9.js" data-settings-js="settings-170eb4bf.js" ><script src="/-/rustdoc.static/storage-41dd4d93.js"></script><script defer src="../crates-20260830-1.100.0-nightly-908501772.js"></script><script defer src="/-/rustdoc.static/main-1814ead3.js"></script><noscript><link rel="stylesheet" href="/-/rustdoc.static/noscript-9f56287d.css"></noscript><link rel="alternate icon" type="image/png" href="/-/rustdoc.static/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="/-/rustdoc.static/favicon-044be391.svg"><link rel="stylesheet" href="/-/static/rustdoc-2025-08-20.css?0-0-0-9439cafc1e2ea4a64558a489c81351cd959d6077-2026-09-22" media="all" /><link rel="stylesheet" href="/-/static/font-awesome.css?0-0-0-9439cafc1e2ea4a64558a489c81351cd959d6077-2026-09-22" media="all" />
+
+<link rel="search" href="/-/static/opensearch.xml" type="application/opensearchdescription+xml" title="Docs.rs" />
+
+<script type="text/javascript">(function() {
+    function applyTheme(theme) {
+        if (theme) {
+            document.documentElement.dataset.docsRsTheme = theme;
+        }
+    }
+
+    window.addEventListener("storage", ev => {
+        if (ev.key === "rustdoc-theme") {
+            applyTheme(ev.newValue);
+        }
+    });
+
+    // see ./storage-change-detection.html for details
+    window.addEventListener("message", ev => {
+        if (ev.data && ev.data.storage && ev.data.storage.key === "rustdoc-theme") {
+            applyTheme(ev.data.storage.value);
+        }
+    });
+
+    applyTheme(window.localStorage.getItem("rustdoc-theme"));
+})();</script></head><body class="rustdoc-page">
+<div class="nav-container">
+    <div class="container">
+        <div class="pure-menu pure-menu-horizontal" role="navigation" aria-label="Main navigation">
+            <form action="/releases/search"
+                  method="GET"
+                  id="nav-search-form"
+                  class="landing-search-form-nav  ">
+
+                
+                <a href="/" class="pure-menu-heading pure-menu-link docsrs-logo" aria-label="Docs.rs">
+                    <span title="Docs.rs"><span class="fa fa-solid fa-cubes " aria-hidden="true"></span></span>
+                    <span class="title">Docs.rs</span>
+                </a><ul class="pure-menu-list">
+    <script id="crate-metadata" type="application/json">
+        
+        {
+            "name": "loom",
+            "version": "0.7.2"
+        }
+    </script><li class="pure-menu-item pure-menu-has-children crate-dropdown">
+            <a href="#" class="pure-menu-link crate-name" title="Permutation testing for concurrent code">
+                <span class="fa fa-solid fa-cube " aria-hidden="true"></span>
+                <span class="title">loom-0.7.2</span>
+            </a><div class="pure-menu-children package-details-menu">
+                
+                <ul class="pure-menu-list menu-item-divided">
+                    <li class="pure-menu-heading" id="crate-title">
+                        loom 0.7.2
+                        <span id="clipboard" class="svg-clipboard" title="Copy crate name and version information"></span>
+                    </li><li class="pure-menu-item">
+                        <a href="/loom/0.7.2/loom/" class="pure-menu-link description" id="permalink" title="Get a link to this specific version"><span class="fa fa-solid fa-link " aria-hidden="true"></span> Permalink
+                        </a>
+                    </li><li class="pure-menu-item">
+                        <a href="/crate/loom/latest" class="pure-menu-link description" title="See loom in docs.rs">
+                            <span class="fa fa-solid fa-cube " aria-hidden="true"></span> Docs.rs crate page
+                        </a>
+                    </li><li class="pure-menu-item">
+                            <span class="pure-menu-link description license"><span class="fa fa-solid fa-scale-unbalanced-flip " aria-hidden="true"></span>
+                            <a href="https://spdx.org/licenses/MIT" class="pure-menu-sublink">MIT</a></span>
+                        </li><li class="pure-menu-item">
+                            <span class="pure-menu-link description" title="Built with rustc 1.100.0-nightly (908501772 2026-08-30)">
+                                <span class="fa fa-solid fa-gears " aria-hidden="true"></span> 31 August 2026
+                            </span>
+                        </li></ul>
+
+                <div class="pure-g menu-item-divided">
+                    <div class="pure-u-1-2 right-border">
+                        <ul class="pure-menu-list">
+                            <li class="pure-menu-heading">Links</li>
+
+                            <li class="pure-menu-item">
+                                    <a href="https://github.com/tokio-rs/loom" class="pure-menu-link">
+                                        <span class="fa fa-solid fa-house " aria-hidden="true"></span> Homepage
+                                    </a>
+                                </li><li class="pure-menu-item">
+                                    <a href="https://github.com/tokio-rs/loom" class="pure-menu-link">
+                                        <span class="fa fa-solid fa-code-branch " aria-hidden="true"></span> Repository
+                                    </a>
+                                </li><li class="pure-menu-item">
+                                <a href="https://crates.io/crates/loom" class="pure-menu-link" title="See loom in crates.io">
+                                    <span class="fa fa-solid fa-cube " aria-hidden="true"></span> crates.io
+                                </a>
+                            </li>
+
+                            
+                            <li class="pure-menu-item">
+                                <a href="/crate/loom/latest/source/" title="Browse source of loom-0.7.2" class="pure-menu-link">
+                                    <span class="fa fa-solid fa-folder-open " aria-hidden="true"></span> Source
+                                </a>
+                            </li>
+                        </ul>
+                    </div><div class="pure-u-1-2">
+                        <ul class="pure-menu-list" id="topbar-owners">
+                            <li class="pure-menu-heading">Owners</li><li class="pure-menu-item">
+                                    <a href="https://crates.io/users/carllerche" class="pure-menu-link">
+                                        <span class="fa fa-solid fa-user " aria-hidden="true"></span> carllerche
+                                    </a>
+                                </li><li class="pure-menu-item">
+                                    <a href="https://crates.io/teams/github:tokio-rs:core" class="pure-menu-link">
+                                        <span class="fa fa-solid fa-user " aria-hidden="true"></span> github:tokio-rs:core
+                                    </a>
+                                </li></ul>
+                    </div>
+                </div>
+
+                <div class="pure-g menu-item-divided">
+                    <div class="pure-u-1-2 right-border">
+                        <ul class="pure-menu-list">
+                            <li class="pure-menu-heading">Dependencies</li>
+
+                            
+                            <li class="pure-menu-item">
+                                <div class="pure-menu pure-menu-scrollable sub-menu" tabindex="-1">
+                                    <ul class="pure-menu-list">
+                                        <li class="pure-menu-item"><a href="/cfg-if/^1.0.0/" class="pure-menu-link">
+                cfg-if ^1.0.0
+                
+                    <i class="dependencies normal">normal</i>
+                    
+                
+            </a>
+        </li><li class="pure-menu-item"><a href="/generator/^0.8.1/" class="pure-menu-link">
+                generator ^0.8.1
+                
+                    <i class="dependencies normal">normal</i>
+                    
+                
+            </a>
+        </li><li class="pure-menu-item"><a href="/pin-utils/^0.1.0/" class="pure-menu-link">
+                pin-utils ^0.1.0
+                
+                    <i class="dependencies normal">normal</i>
+                    
+                        <i>optional</i>
+                    
+                
+            </a>
+        </li><li class="pure-menu-item"><a href="/scoped-tls/^1.0.0/" class="pure-menu-link">
+                scoped-tls ^1.0.0
+                
+                    <i class="dependencies normal">normal</i>
+                    
+                
+            </a>
+        </li><li class="pure-menu-item"><a href="/serde/^1.0.92/" class="pure-menu-link">
+                serde ^1.0.92
+                
+                    <i class="dependencies normal">normal</i>
+                    
+                        <i>optional</i>
+                    
+                
+            </a>
+        </li><li class="pure-menu-item"><a href="/serde_json/^1.0.33/" class="pure-menu-link">
+                serde_json ^1.0.33
+                
+                    <i class="dependencies normal">normal</i>
+                    
+                        <i>optional</i>
+                    
+                
+            </a>
+        </li><li class="pure-menu-item"><a href="/tracing/^0.1.27/" class="pure-menu-link">
+                tracing ^0.1.27
+                
+                    <i class="dependencies normal">normal</i>
+                    
+                
+            </a>
+        </li><li class="pure-menu-item"><a href="/tracing-subscriber/^0.3.8/" class="pure-menu-link">
+                tracing-subscriber ^0.3.8
+                
+                    <i class="dependencies normal">normal</i>
+                    
+                
+            </a>
+        </li><li class="pure-menu-item"><a href="/futures-util/^0.3.0/" class="pure-menu-link">
+                futures-util ^0.3.0
+                
+                    <i class="dependencies dev">dev</i>
+                    
+                
+            </a>
+        </li>
+                                    </ul>
+                                </div>
+                            </li>
+                        </ul>
+                    </div>
+
+                    <div class="pure-u-1-2">
+                        <ul class="pure-menu-list">
+                            <li class="pure-menu-heading">Versions</li>
+
+                            <li class="pure-menu-item">
+                                <div class="pure-menu pure-menu-scrollable sub-menu" id="releases-list" tabindex="-1" data-url="/crate/loom/latest/menus/releases/loom/">
+                                    <span class="rotate"><span class="fa fa-solid fa-spinner " aria-hidden="true"></span></span>
+                                </div>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+                    
+                    
+                    <div class="pure-g">
+                        <div class="pure-u-1">
+                            <ul class="pure-menu-list">
+                                <li>
+                                    <a href="/crate/loom/latest" class="pure-menu-link">
+                                        <b>100%</b>
+                                        of the crate is documented
+                                    </a>
+                                </li>
+                            </ul>
+                        </div>
+                    </div></div>
+        </li><li class="pure-menu-item pure-menu-has-children">
+                <a href="#" class="pure-menu-link" aria-label="Platform">
+                    <span class="fa fa-solid fa-gears " aria-hidden="true"></span>
+                    <span class="title">Platform</span>
+                </a>
+
+                
+                <ul class="pure-menu-children" id="platforms" data-url="/crate/loom/latest/menus/platforms/loom/"><li class="pure-menu-item">
+            <a href="/crate/loom/latest/target-redirect/loom/" class="pure-menu-link" data-fragment="retain" rel="nofollow">x86_64-unknown-linux-gnu</a>
+        </li></ul>
+            </li><li class="pure-menu-item">
+                <a href="/crate/loom/latest/features" title="Browse available feature flags of loom-0.7.2" class="pure-menu-link">
+                    <span class="fa fa-solid fa-flag " aria-hidden="true"></span>
+                    <span class="title">Feature flags</span>
+                </a>
+            </li>
+        
+    
+</ul><div class="spacer"></div>
+                
+                <div id="abnormalities" class="hidden"></div>
+
+                <ul class="pure-menu-list">
+                    <li class="pure-menu-item pure-menu-has-children">
+                        <a href="#" class="pure-menu-link" aria-label="docs.rs">docs.rs</a>
+                        <ul class="pure-menu-children aligned-icons"><li class="pure-menu-item"><a class="pure-menu-link" href="/about"><span class="fa fa-solid fa-circle-info " aria-hidden="true"></span> About docs.rs</a></li><li class="pure-menu-item"><a class="pure-menu-link" href="/about/badges"><span class="fa fa-brands fa-fonticons " aria-hidden="true"></span> Badges</a></li><li class="pure-menu-item"><a class="pure-menu-link" href="/about/builds"><span class="fa fa-solid fa-gears " aria-hidden="true"></span> Builds</a></li><li class="pure-menu-item"><a class="pure-menu-link" href="/about/metadata"><span class="fa fa-solid fa-table " aria-hidden="true"></span> Metadata</a></li><li class="pure-menu-item"><a class="pure-menu-link" href="/about/redirections"><span class="fa fa-solid fa-road " aria-hidden="true"></span> Shorthand URLs</a></li><li class="pure-menu-item"><a class="pure-menu-link" href="/about/download"><span class="fa fa-solid fa-download " aria-hidden="true"></span> Download</a></li><li class="pure-menu-item"><a class="pure-menu-link" href="/about/rustdoc-json"><span class="fa fa-solid fa-file-code " aria-hidden="true"></span> Rustdoc JSON</a></li><li class="pure-menu-item"><a class="pure-menu-link" href="/releases/queue"><span class="fa fa-solid fa-gears " aria-hidden="true"></span> Build queue</a></li><li class="pure-menu-item"><a class="pure-menu-link" href="https://foundation.rust-lang.org/policies/privacy-policy/#docs.rs" target="_blank"><span class="fa fa-solid fa-shield-halved " aria-hidden="true"></span> Privacy policy</a></li>
+                        </ul>
+                    </li>
+                </ul>
+                <ul class="pure-menu-list"><li class="pure-menu-item pure-menu-has-children">
+                        <a href="#" class="pure-menu-link" aria-label="Rust">Rust</a>
+                        <ul class="pure-menu-children">
+                            <li class="pure-menu-item"><a class="pure-menu-link" href="https://www.rust-lang.org/" target="_blank">Rust website</a></li>
+                            <li class="pure-menu-item"><a class="pure-menu-link" href="https://doc.rust-lang.org/book/" target="_blank">The Book</a></li>
+
+                            <li class="pure-menu-item"><a class="pure-menu-link" href="https://doc.rust-lang.org/std/" target="_blank">Standard Library API Reference</a></li>
+
+                            <li class="pure-menu-item"><a class="pure-menu-link" href="https://doc.rust-lang.org/rust-by-example/" target="_blank">Rust by Example</a></li>
+
+                            <li class="pure-menu-item"><a class="pure-menu-link" href="https://doc.rust-lang.org/cargo/guide/" target="_blank">The Cargo Guide</a></li>
+
+                            <li class="pure-menu-item"><a class="pure-menu-link" href="https://doc.rust-lang.org/nightly/clippy" target="_blank">Clippy Documentation</a></li>
+                        </ul>
+                    </li>
+                </ul>
+                
+                <div id="search-input-nav">
+                    <label for="nav-search">
+                        <span class="fa fa-solid fa-magnifying-glass " aria-hidden="true"></span>
+                    </label>
+
+                    
+                    
+                    <input id="nav-search" name="query" type="text" aria-label="Find crate by search query" tabindex="-1"
+                        placeholder="Find crate"
+                        >
+                </div>
+            </form>
+        </div>
+    </div>
+</div><div class="rustdoc mod crate container-rustdoc" id="rustdoc_body_wrapper" tabindex="-1"><script async src="/-/static/menu.js?0-0-0-9439cafc1e2ea4a64558a489c81351cd959d6077-2026-09-22"></script>
+<script async src="/-/static/index.js?0-0-0-9439cafc1e2ea4a64558a489c81351cd959d6077-2026-09-22"></script>
+
+<iframe src="/-/storage-change-detection.html" width="0" height="0" style="display: none"></iframe><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Crate loom</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../loom/index.html">loom</a><span class="version">0.7.2</span></h2></div><div class="sidebar-elems"><ul class="block"><li><a id="all-types" href="all.html">All Items</a></li></ul><section id="rustdoc-toc"><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#background" title="Background">Background</a></li><li><a href="#solution" title="Solution">Solution</a></li><li><a href="#writing-tests" title="Writing tests">Writing tests</a><ul><li><a href="#handling-loom-api-differences" title="Handling Loom API differences.">Handling Loom API differences.</a></li><li><a href="#yielding" title="Yielding">Yielding</a></li></ul></li><li><a href="#running-loom-tests" title="Running Loom Tests">Running Loom Tests</a></li><li><a href="#debugging-loom-failures" title="Debugging Loom Failures">Debugging Loom Failures</a></li><li><a href="#limitations-and-caveats" title="Limitations and Caveats">Limitations and Caveats</a><ul><li><a href="#intrusive-implementation" title="Intrusive Implementation">Intrusive Implementation</a></li><li><a href="#large-models" title="Large Models">Large Models</a></li><li><a href="#relaxed-memory-ordering" title="Relaxed Memory Ordering">Relaxed Memory Ordering</a></li><li><a href="#combinatorial-explosion-with-many-threads" title="Combinatorial Explosion with Many Threads">Combinatorial Explosion with Many Threads</a></li></ul></li><li><a href="#implementation" title="Implementation">Implementation</a></li></ul><h3><a href="#modules">Crate Items</a></h3><ul class="block"><li><a href="#modules" title="Modules">Modules</a></li><li><a href="#macros" title="Macros">Macros</a></li><li><a href="#constants" title="Constants">Constants</a></li><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1>Crate <span>loom</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/loom/lib.rs.html#1-474">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Loom is a tool for testing concurrent programs.</p>
+<p>At a high level, it runs tests many times, permuting the possible concurrent executions of each
+test according to what constitutes valid executions under the <a href="https://en.cppreference.com/w/cpp/atomic/memory_order">C11 memory model</a>. It then
+uses state reduction techniques to avoid combinatorial explosion of the number of possible
+executions.</p>
+<h2 id="background"><a class="doc-anchor" href="#background">§</a>Background</h2>
+<p>Testing concurrent programs is challenging; concurrent strands of execution can interleave in
+all sorts of ways, and each such interleaving might expose a concurrency bug in the program.
+Some bugs may be so rare that they only occur under a very small set of possible executions,
+and may not surface even if you run the code millions or billions of times.</p>
+<p>Loom provides a way to deterministically explore the various possible execution permutations
+without relying on random executions. This allows you to write tests that verify that your
+concurrent code is correct under <em>all</em> executions, not just “most of the time”.</p>
+<p>Consider a simple example:</p>
+
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>std::sync::Arc;
+<span class="kw">use </span>std::sync::atomic::AtomicUsize;
+<span class="kw">use </span>std::sync::atomic::Ordering::SeqCst;
+<span class="kw">use </span>std::thread;
+
+<span class="attr">#[test]
+</span><span class="kw">fn </span>test_concurrent_logic() {
+    <span class="kw">let </span>v1 = Arc::new(AtomicUsize::new(<span class="number">0</span>));
+    <span class="kw">let </span>v2 = v1.clone();
+
+    thread::spawn(<span class="kw">move </span>|| {
+        v1.store(<span class="number">1</span>, SeqCst);
+    });
+
+    <span class="macro">assert_eq!</span>(<span class="number">0</span>, v2.load(SeqCst));
+}</code></pre></div>
+<p>This program is incorrect: the main thread might yield between spawning the thread that stores
+to <code>v1</code> and loading from <code>v2</code>, during which time the spawned thread may get to run and store 1
+into <code>v1</code>. <strong>Most</strong> of the time, the main thread will get to the assertion before the spawned
+thread executes, so the assertion will succeed. But, every once in a while, the spawned thread
+manages to run just in time and the assertion will fail! This is obviously a contrived example,
+but in practice many concurrent programs exhibit similar behavior – they operate correctly
+under most executions, but <em>some</em> executions end up producing buggy behavior.</p>
+<p>Historically, the strategy for testing concurrent code has been to run tests in loops and hope
+that an execution fails. Or to place the testing host under load while running the test suite
+in an attempt to produce less frequently exercised executions. However, this kind of testing is
+not reliable, and, in the event an iteration should fail, debugging the cause is exceedingly
+difficult.</p>
+<p>The problem is compounded when other memory orderings than <code>SeqCst</code> are considered, where bugs
+may only occur on hardware with particular memory characteristics, and thus <strong>no</strong> amount of
+iteration will demonstrate the bug on different hardware!</p>
+<h2 id="solution"><a class="doc-anchor" href="#solution">§</a>Solution</h2>
+<p>Loom fixes the problem by simulating the operating system’s scheduler and Rust’s memory model
+such that all possible valid behaviors are explored and tested. To see how this works out in
+practice, the above example can be rewritten to use loom’s concurrency types as:</p>
+
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>loom::sync::atomic::AtomicUsize;
+<span class="kw">use </span>loom::thread;
+
+<span class="kw">use </span>std::sync::Arc;
+<span class="kw">use </span>std::sync::atomic::Ordering::SeqCst;
+
+<span class="attr">#[test]
+</span><span class="kw">fn </span>test_concurrent_logic() {
+    loom::model(|| {
+        <span class="kw">let </span>v1 = Arc::new(AtomicUsize::new(<span class="number">0</span>));
+        <span class="kw">let </span>v2 = v1.clone();
+
+        thread::spawn(<span class="kw">move </span>|| {
+            v1.store(<span class="number">1</span>, SeqCst);
+        });
+
+        <span class="macro">assert_eq!</span>(<span class="number">0</span>, v2.load(SeqCst));
+    });
+}</code></pre></div>
+<p>Loom will run the closure provided to <code>loom::model</code> many times over, and each time a different
+thread scheduling will be used. That is, one execution will have the spawned thread run after
+the load from <code>v2</code>, and another will have the spawned thread run before the store to <code>v2</code>.
+Thus, the test is guaranteed to fail.</p>
+<h2 id="writing-tests"><a class="doc-anchor" href="#writing-tests">§</a>Writing tests</h2>
+<p>Test cases using loom must be fully deterministic. All sources of non-determism must be via loom
+types so that loom can expose different possible values on each execution of the test closure.
+Other sources of non-determinism like random number generation or system calls cannot be
+modeled directly by loom, and must be mocked to be testable by loom.</p>
+<p>To model synchronization non-determinism, tests must use the loom synchronization types, such
+as <a href="sync/atomic/index.html" title="mod loom::sync::atomic"><code>Atomic*</code></a>, <a href="sync/struct.Mutex.html" title="struct loom::sync::Mutex"><code>Mutex</code></a>, <a href="sync/struct.RwLock.html" title="struct loom::sync::RwLock"><code>RwLock</code></a>,
+<a href="sync/struct.Condvar.html" title="struct loom::sync::Condvar"><code>Condvar</code></a>, as well as other concurrency primitives like <a href="thread/fn.spawn.html" title="fn loom::thread::spawn"><code>thread::spawn</code></a>,
+<a href="cell/struct.UnsafeCell.html" title="struct loom::cell::UnsafeCell"><code>UnsafeCell</code></a>, and <a href="macro.lazy_static.html" title="macro loom::lazy_static"><code>lazy_static!</code></a>. However, when <strong>not</strong> running loom
+tests, the <code>std</code> should be used, since the loom runtime won’t be active. This means that
+library code will need to use conditional compilation to decide which types to use.</p>
+<p>It is recommended to use a <code>loom</code> cfg flag to signal using the loom types. You can do this by
+passing <code>RUSTFLAGS="--cfg loom"</code> as part of the command when you want to run the loom tests.
+Then modify your <code>Cargo.toml</code> to include loom like this:</p>
+<div class="example-wrap"><pre class="language-toml"><code>[target.&#39;cfg(loom)&#39;.dependencies]
+loom = &quot;0.7&quot;</code></pre></div>
+<p>One common strategy to use the right types with and without loom is to create a module in your
+crate named <code>sync</code> or any other name of your choosing. In this module, list out the types that
+need to be toggled between loom and <code>std</code>:</p>
+
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="attr">#[cfg(loom)]
+</span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">use </span>loom::sync::atomic::AtomicUsize;
+
+<span class="attr">#[cfg(not(loom))]
+</span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">use </span>std::sync::atomic::AtomicUsize;</code></pre></div>
+<p>Then, elsewhere in the library:</p>
+
+<div class="example-wrap ignore"><a href="#" class="tooltip" title="This example is not tested">ⓘ</a><pre class="rust rust-example-rendered"><code><span class="kw">use </span><span class="kw">crate</span>::sync::AtomicUsize;</code></pre></div><h3 id="handling-loom-api-differences"><a class="doc-anchor" href="#handling-loom-api-differences">§</a>Handling Loom API differences.</h3>
+<p>Most of loom’s type are drop-in replacements for their counterpart in <code>std</code>, but sometimes
+there are minor API differences that you must work around. If your library must use Loom APIs
+that differ from <code>std</code> types, then the library will be required to implement those APIs for
+<code>std</code>. For example, for <code>UnsafeCell</code>, in the library’s source, add the following:</p>
+
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="attr">#![cfg(not(loom))]
+
+#[derive(Debug)]
+</span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">struct </span>UnsafeCell&lt;T&gt;(std::cell::UnsafeCell&lt;T&gt;);
+
+<span class="kw">impl</span>&lt;T&gt; UnsafeCell&lt;T&gt; {
+    <span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>new(data: T) -&gt; UnsafeCell&lt;T&gt; {
+        UnsafeCell(std::cell::UnsafeCell::new(data))
+    }
+
+    <span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>with&lt;R&gt;(<span class="kw-2">&amp;</span><span class="self">self</span>, f: <span class="kw">impl </span>FnOnce(<span class="kw-2">*const </span>T) -&gt; R) -&gt; R {
+        f(<span class="self">self</span>.<span class="number">0</span>.get())
+    }
+
+    <span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>with_mut&lt;R&gt;(<span class="kw-2">&amp;</span><span class="self">self</span>, f: <span class="kw">impl </span>FnOnce(<span class="kw-2">*mut </span>T) -&gt; R) -&gt; R {
+        f(<span class="self">self</span>.<span class="number">0</span>.get())
+    }
+}</code></pre></div><h3 id="yielding"><a class="doc-anchor" href="#yielding">§</a>Yielding</h3>
+<p>Some concurrent algorithms assume a fair scheduler. For example, a spin lock assumes that, at
+some point, another thread will make enough progress for the lock to become available. This
+presents a challenge for loom as its scheduler is, by design, not fair. It is specifically
+trying to emulate every <em>possible</em> execution, which may mean that another thread does not get
+to run for a very long time (see also <a href="https://matklad.github.io/2020/01/02/spinlocks-considered-harmful.html">Spinlocks Considered Harmful</a>). In such cases, loops
+must include calls to <a href="lazy_static/fn.yield_now.html" title="fn loom::lazy_static::yield_now"><code>loom::thread::yield_now</code></a>. This tells loom that
+another thread needs to be scheduled in order for the current one to make progress.</p>
+<h2 id="running-loom-tests"><a class="doc-anchor" href="#running-loom-tests">§</a>Running Loom Tests</h2>
+<p>Loom tests must be run separately, with <code>RUSTFLAGS="--cfg loom"</code> specified (assuming you went
+with the <code>cfg</code> approach suggested above). For example, if the library includes a test file:
+<code>tests/loom_my_struct.rs</code> that includes tests with <a href="model/index.html" title="mod loom::model"><code>loom::model</code></a>, then run the
+following command:</p>
+<div class="example-wrap"><pre class="language-console"><code>RUSTFLAGS=&quot;--cfg loom&quot; cargo test --test loom_my_struct --release</code></pre></div>
+<p>Note that you will generally want to run loom tests with <code>--release</code> since loom must execute
+each test closure a large number of times, at which point the speed win from optimized code
+makes a big difference.</p>
+<h2 id="debugging-loom-failures"><a class="doc-anchor" href="#debugging-loom-failures">§</a>Debugging Loom Failures</h2>
+<p>Loom’s deterministic execution allows the specific chain of events leading to a test failure
+can be isolated for debugging. When a loom test fails, the first step is to isolate the exact
+execution path that resulted in the failure. To do this, Loom is able to output the execution
+path to a file. Two environment variables are useful for this process:</p>
+<ul>
+<li><code>LOOM_CHECKPOINT_FILE</code></li>
+<li><code>LOOM_CHECKPOINT_INTERVAL</code></li>
+</ul>
+<p>The first specifies the file to write to and read from. The second specifies how often to write
+to the file. If the execution fails on the 10,000,000th permutation, it is faster to write to a
+file every 10,000 iterations instead of every single one.</p>
+<p>To isolate the exact failing path, first run the following command to generate the checkpoint
+for the failing scenario:</p>
+<div class="example-wrap"><pre class="language-console"><code>LOOM_CHECKPOINT_FILE=my_test.json [other env vars] \
+    cargo test --test loom_my_struct --release [failing test]</code></pre></div>
+<p>Then this to check that the next permutation indeed triggers the fault:</p>
+<div class="example-wrap"><pre class="language-console"><code>LOOM_CHECKPOINT_INTERVAL=1 LOOM_CHECKPOINT_FILE=my_test.json [other env vars] \
+    cargo test --test loom_my_struct --release [failing test]</code></pre></div>
+<p>The test should fail on the first permutation, effectively isolating the failure
+scenario.</p>
+<p>The next step is to enable additional log output for just the failing permutation. Again, there
+are some environment variables for this:</p>
+<ul>
+<li><code>LOOM_LOG</code></li>
+<li><code>LOOM_LOCATION</code></li>
+</ul>
+<p>The first environment variable, <code>LOOM_LOG</code>, outputs a marker on every thread switch. This helps
+with tracing the exact steps in a threaded environment that results in the test failure.</p>
+<p>The second, <code>LOOM_LOCATION</code>, enables location tracking. This includes additional information in
+panic messages that helps identify which specific field resulted in the error.</p>
+<p>Put together, the command becomes (yes, we know this is not great… but it works):</p>
+<div class="example-wrap"><pre class="language-console"><code>LOOM_LOG=trace \
+    LOOM_LOCATION=1 \
+    LOOM_CHECKPOINT_INTERVAL=1 \
+    LOOM_CHECKPOINT_FILE=my_test.json \
+    RUSTFLAGS=&quot;--cfg loom&quot; \
+    [other env vars] \
+    cargo test --test loom_my_struct --release [failing test]</code></pre></div>
+<p>This should provide you with a trace of all the concurrency events leading up to the failure,
+which should allow you to identify how the bug is triggered.</p>
+<h2 id="limitations-and-caveats"><a class="doc-anchor" href="#limitations-and-caveats">§</a>Limitations and Caveats</h2><h3 id="intrusive-implementation"><a class="doc-anchor" href="#intrusive-implementation">§</a>Intrusive Implementation</h3>
+<p>Loom works by intercepting all loads, stores, and other concurrency-sensitive operations (like
+spawning threads) that may trigger concurrency bugs in an applications. But this interception
+is not automatic – it requires that the code being tested specifically uses the loom
+replacement types. Any code that does not use loom’s replacement types is invisible to loom,
+and thus won’t be subject to the loom model’s permutation.</p>
+<p>While it is relatively simple to utilize loom’s types in a single crate through the root-level
+<code>#[cfg(loom)] mod sync</code> approach suggested earlier, more complex use-cases may require the use
+of a library that itself uses concurrent constructs like locks and channels. In such cases,
+that library must <em>also</em> be augmented to support loom to achieve complete execution coverage.</p>
+<p>Note that loom still works if some concurrent operations are hidden from it (for example, if
+you use <code>std::sync::Arc</code> instead of <code>loom::sync::Arc</code>). It just means that loom won’t be able
+to reason about the interaction between those operations and the other concurrent operations in
+your program, and thus certain executions that are possible in the real world won’t be modeled.</p>
+<h3 id="large-models"><a class="doc-anchor" href="#large-models">§</a>Large Models</h3>
+<p>By default, loom runs an <strong>exhaustive</strong> check of your program’s possible concurrent executions
+where <strong>all</strong> possible interleavings are checked. Loom’s state reduction algorithms (see
+“Implementation” below) significantly reduce the state space that must be explored, but complex
+models can still take <strong>significant</strong> time to complete.</p>
+<p>To handle such large models in a more reasonable amount of time, you may need to <strong>not</strong> run
+an exhaustive check, and instead tell loom to prune out interleavings that are unlikely to
+reveal additional bugs. You do this by providing loom with a <em>thread pre-emption bound</em>. If you
+set such a bound, loom will check all possible executions that include <strong>at most</strong> <code>n</code> thread
+pre-emptions (where one thread is forcibly stopped and another one runs in its place. <strong>In
+practice, setting the thread pre-emption bound to 2 or 3 is enough to catch most bugs</strong> while
+significantly reducing the number of possible executions.</p>
+<p>To set the thread pre-emption bound, set the <code>LOOM_MAX_PREEMPTIONS</code> environment
+variable when running tests (or set
+<a href="model/struct.Builder.html#structfield.preemption_bound" title="field loom::model::Builder::preemption_bound"><code>Builder::preemption_bound</code></a>). For example:</p>
+<div class="example-wrap"><pre class="language-console"><code>LOOM_MAX_PREEMPTIONS=3 RUSTFLAGS=&quot;--cfg loom&quot; cargo test --test loom_my_struct --release</code></pre></div><h3 id="relaxed-memory-ordering"><a class="doc-anchor" href="#relaxed-memory-ordering">§</a>Relaxed Memory Ordering</h3>
+<p>The <a href="https://doc.rust-lang.org/nightly/core/sync/atomic/enum.Ordering.html#variant.Relaxed" title="variant core::sync::atomic::Ordering::Relaxed"><code>Relaxed</code> memory ordering</a> allows particularly
+strange executions. For example, in the following code snippet, it is <a href="https://en.cppreference.com/w/cpp/atomic/memory_order#Relaxed_ordering">completely
+legal</a> for <code>r1 == r2 == 42</code>!</p>
+
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code>thread::spawn(<span class="kw">move </span>|| {
+  <span class="kw">let </span>r1 = y.load(Ordering::Relaxed); <span class="comment">// A
+  </span>x.store(r1, Ordering::Relaxed);     <span class="comment">// B
+</span>});
+thread::spawn(<span class="kw">move </span>|| {
+  <span class="kw">let </span>r2 = x.load(Ordering::Relaxed); <span class="comment">// C
+  </span>y.store(<span class="number">42</span>, Ordering::Relaxed);     <span class="comment">// D
+</span>});</code></pre></div>
+<p>Unfortunately, it is not possible for loom to completely model all the interleavings that
+relaxed memory ordering allows. This is because the relaxed memory ordering allows memory
+operations to be re-ordered within a single thread – B can run <em>before</em> A – which loom cannot
+emulate. The same restriction applies to certain reorderings that are possible across different
+atomic variables with other memory orderings, and means that there are certain concurrency bugs
+that loom cannot catch.</p>
+<h3 id="combinatorial-explosion-with-many-threads"><a class="doc-anchor" href="#combinatorial-explosion-with-many-threads">§</a>Combinatorial Explosion with Many Threads</h3>
+<p>The number of possible execution interleavings grows exponentially with the number of threads,
+as each possible execution of each additional thread must be taken into account for each
+possible execution of the current threads. Loom mitigates this to an extent by reducing the
+state space (see “Implementation” below) through <em>equivalent execution elimination</em>. For
+example, if two threads <strong>read</strong> from the same atomic variable, loom does not attempt another
+execution given that the order in which two threads read from the same atomic cannot impact the
+execution.</p>
+<p>However, even with equivalent execution elimination, the number of possible executions grows
+significantly with each new thread, to the point where checking becomes infeasible. Loom
+therefore specifically limits the number of threads it will model (see <a href="constant.MAX_THREADS.html" title="constant loom::MAX_THREADS"><code>MAX_THREADS</code></a>), and
+tailors its implementation to that limit.</p>
+<h2 id="implementation"><a class="doc-anchor" href="#implementation">§</a>Implementation</h2>
+<p>Loom is an implementation of techniques described in <a href="http://demsky.eecs.uci.edu/publications/c11modelcheck.pdf">CDSChecker: Checking Concurrent Data
+Structures Written with C/C++ Atomics</a>. Please see the paper for much more detail
+on equivalent execution elimination and the other techniques loom uses to accurately model the
+<a href="https://en.cppreference.com/w/cpp/atomic/memory_order">C11 memory model</a>.</p>
+</div></details><h2 id="modules" class="section-header">Modules<a href="#modules" class="anchor">§</a></h2><dl class="item-table"><dt><a class="mod" href="alloc/index.html" title="mod loom::alloc">alloc</a></dt><dd>Memory allocation APIs</dd><dt><a class="mod" href="cell/index.html" title="mod loom::cell">cell</a></dt><dd>Shareable mutable containers.</dd><dt><a class="mod" href="future/index.html" title="mod loom::future">future</a><wbr><span class="stab portability" title="Available on crate feature `futures` only"><code>futures</code></span></dt><dd>Future related synchronization primitives.</dd><dt><a class="mod" href="hint/index.html" title="mod loom::hint">hint</a></dt><dd>Mocked versions of <a href="https://doc.rust-lang.org/nightly/core/hint/index.html" title="mod core::hint"><code>std::hint</code></a> functions.</dd><dt><a class="mod" href="lazy_static/index.html" title="mod loom::lazy_static">lazy_<wbr>static</a></dt><dd>Mock implementation of the <code>lazy_static</code> crate.</dd><dt><a class="mod" href="model/index.html" title="mod loom::model">model</a></dt><dd>Model concurrent programs.</dd><dt><a class="mod" href="sync/index.html" title="mod loom::sync">sync</a></dt><dd>Mock implementation of <code>std::sync</code>.</dd><dt><a class="mod" href="thread/index.html" title="mod loom::thread">thread</a></dt><dd>Mock implementation of <code>std::thread</code>.</dd></dl><h2 id="macros" class="section-header">Macros<a href="#macros" class="anchor">§</a></h2><dl class="item-table"><dt><a class="macro" href="macro.lazy_static.html" title="macro loom::lazy_static">lazy_<wbr>static</a></dt><dd>Mock version of <code>lazy_static::lazy_static!</code>.</dd><dt><a class="macro" href="macro.thread_local.html" title="macro loom::thread_local">thread_<wbr>local</a></dt><dd>Mock version of <code>std::thread_local!</code>.</dd></dl><h2 id="constants" class="section-header">Constants<a href="#constants" class="anchor">§</a></h2><dl class="item-table"><dt><a class="constant" href="constant.MAX_THREADS.html" title="constant loom::MAX_THREADS">MAX_<wbr>THREADS</a></dt><dd>Maximum number of threads that can be included in a model.</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.explore.html" title="fn loom::explore">explore</a></dt><dd>Tells loom to explore possible concurrent executions starting at this point.</dd><dt><a class="fn" href="fn.model.html" title="fn loom::model">model</a></dt><dd>Run all concurrent permutations of the provided closure.</dd><dt><a class="fn" href="fn.skip_branch.html" title="fn loom::skip_branch">skip_<wbr>branch</a></dt><dd>Tells loom to stop exploring possible concurrent execution starting at this
+point.</dd><dt><a class="fn" href="fn.stop_exploring.html" title="fn loom::stop_exploring">stop_<wbr>exploring</a></dt><dd>Tells loom to stop exploring possible concurrent executions starting at this
+point.</dd></dl></section></div></main></div></body></html>

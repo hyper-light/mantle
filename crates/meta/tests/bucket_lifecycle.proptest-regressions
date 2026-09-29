@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 68112eadbaa6aaeb74f900600c9f834bd23f1b912fa45120e4b7a867144e5575 # shrinks to actions = [Create, Step(0), Step(0), Step(0), Delete, Step(1), Step(1), Step(1), Step(1), Step(1), Step(1), Collect, Collect, Step(3), Step(1), Step(3), Step(1), Step(1), Step(1), Step(3)]
+cc 38f08ab885420689707cd48b78f01b2130302a1e5350a4c7361dbc3c8789ba89 # shrinks to actions = [Create, Step(0), Step(0), Step(0), Step(0), Step(0), Look, Delete, Put { key: 0, view: 0 }, Step(0), Step(0), Step(0), Step(0), Step(0), Step(0), Step(0)]
+cc 29ea3e60937997df4b3093d8a91d5d6ecc9872cbb1a7e702088d64dfe1a6bb37 # shrinks to actions = [Create, Collect, Collect, Step(0), Step(0), Step(0), Create, Abandon, Collect, Step(1), Collect, Step(1), Step(0), Step(1), Step(0), Delete, Step(0), Step(1), Step(1), Step(0), Step(0), Step(0), Step(0), Step(0), Step(0), Step(0), Step(0), Step(0), Step(0), Step(0), Crash(0)]

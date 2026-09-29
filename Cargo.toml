@@ -1,0 +1,101 @@
+[workspace]
+members = ["crates/*"]
+# vendor/ is its own workspace, which runs the vendored crates' own suites (vendor/UPSTREAM.md).
+exclude = ["vendor"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Ada Lundhe <sales@lundhe.audio>"]
+edition = "2024"
+license = "MIT"
+rust-version = "1.98"
+repository = "https://github.com/hyper-light/mantle"
+publish = false
+
+[workspace.dependencies]
+# AWS-LC, through the vendored copies patched in below (docs/design/crypto.md).
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys"] }
+base64 = "0.23"
+bytes = "1.12"
+clap = { version = "4.6", features = ["derive"] }
+getrandom = "0.4"
+# SIMD substring search, for the delimiters of form bodies (docs/design/s3-protocol.md §12).
+memchr = "2.8"
+crc-fast = { version = "1.10", default-features = false, features = ["std"] }
+proptest = "1.11"
+reed-solomon-simd = "3.1"
+roxmltree = "0.21"
+rustix = { version = "1.1", features = ["fs", "system", "param"] }
+tempfile = "3.20"
+thiserror = "2.0"
+twox-hash = { version = "2.1", default-features = false, features = ["std", "xxhash64", "xxhash3_64", "xxhash3_128"] }
+# Unicode 16.0.0 general categories, for the characters S3 allows in a tag (docs/research/13 §6.7).
+unicode-general-category = "1.1"
+# Wiping a customer's SSE-C key from memory when it is dropped (docs/design/encryption.md).
+zeroize = "1.9"
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
+  "Win32_System_Ioctl",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+  "Win32_System_WindowsProgramming",
+] }
+
+# The no-panic law and the rest of CLAUDE.md §1 as lints. Production code is additionally
+# checked by scripts/check-production.sh, which denies these without the test allowances.
+[workspace.lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+panic = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+unreachable = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+string_slice = "deny"
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"
+disallowed_macros = "deny"
+disallowed_methods = "deny"
+disallowed_types = "deny"
+undocumented_unsafe_blocks = "deny"
+mem_forget = "deny"
+exit = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# A dependency's overflow unwinds to the boundary that contains it instead of wrapping into
+# a wrong offset or length; mantle's own arithmetic is checked and never reaches this.
+overflow-checks = true
+# Symbols for profilers; no effect on generated code.
+debug = "line-tables-only"
+
+[profile.bench]
+inherits = "release"
+
+# Debug builds optimize the erasure-coding library alone: unoptimized, its FFT made the test
+# that rebuilds every loss pattern of every code take 116 s instead of 6 s. mantle's own code
+# stays a debug build with every check.
+[profile.dev.package.reed-solomon-simd]
+opt-level = 3
+
+# AWS-LC and its Rust binding, vendored with local patches recorded in vendor/UPSTREAM.md: the
+# default build seeds from the operating system rather than CPU jitter entropy, a hardware rng
+# that keeps failing gives way to the operating system instead of aborting the process, and
+# `LessSafeKey` clones.
+[patch.crates-io]
+aws-lc-rs = { path = "vendor/aws-lc-rs" }
+aws-lc-sys = { path = "vendor/aws-lc-sys" }

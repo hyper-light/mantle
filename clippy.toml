@@ -1,0 +1,32 @@
+# Tests may unwrap, expect, panic, index and print; production may not (CLAUDE.md §1).
+# Test code opts out of the macro bans with the crate-root `cfg_attr(test, allow(..))` block.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-dbg-in-tests = true
+allow-indexing-slicing-in-tests = true
+
+disallowed-macros = [
+  { path = "std::assert", reason = "unwinds; return a typed error" },
+  { path = "std::assert_eq", reason = "unwinds; return a typed error" },
+  { path = "std::assert_ne", reason = "unwinds; return a typed error" },
+  { path = "std::debug_assert", reason = "a check that exists only in debug builds is a check production skips; return a typed error" },
+  { path = "std::debug_assert_eq", reason = "as debug_assert" },
+  { path = "std::debug_assert_ne", reason = "as debug_assert" },
+  { path = "core::assert", reason = "unwinds; return a typed error" },
+  { path = "core::assert_eq", reason = "unwinds; return a typed error" },
+  { path = "core::assert_ne", reason = "unwinds; return a typed error" },
+  { path = "core::debug_assert", reason = "as debug_assert" },
+  { path = "core::debug_assert_eq", reason = "as debug_assert" },
+  { path = "core::debug_assert_ne", reason = "as debug_assert" },
+  { path = "std::print", reason = "output goes through tracing or the CLI's writer" },
+  { path = "std::println", reason = "output goes through tracing or the CLI's writer" },
+  { path = "std::eprint", reason = "output goes through tracing or the CLI's writer" },
+  { path = "std::eprintln", reason = "output goes through tracing or the CLI's writer" },
+]
+
+disallowed-methods = [
+  { path = "bool::then_some", reason = "builds its argument even when false, so a value with Drop is built and dropped (a CFRelease(NULL) crash in the macOS probe); use `then(|| ..)` or if/else" },
+  { path = "std::env::temp_dir", reason = "tests use tempfile's directories and remove them; production never writes outside its configured data directories" },
+  { path = "std::thread::sleep", reason = "a blocking sleep stalls a worker; wait on an event or a runtime timer" },
+]

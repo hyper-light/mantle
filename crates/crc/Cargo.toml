@@ -1,0 +1,19 @@
+[package]
+name = "mantle-crc"
+description = "The checksums mantle stores and verifies: CRC-32C and CRC-64/NVME"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+crc-fast.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,606 @@
+//! Reclaiming a file the Name layer released (docs/design/metadata.md §2): each block's chunks
+//! from their volumes, then the block's rows, an adopted part's file the same way, then the
+//! file's rows, then any mark a sweep that stopped left on it, wherever its key now is, and
+//! last its row in the Name range's queue.
+//!
+//! A [`Reclaimer`] names its next [`Request`] and moves on with the [`Answer`], doing no I/O
+//! itself, as the coordinator does. Every step can be repeated: a chunk or a row already gone
+//! stays gone, and a file already removed reads as one with no extents. So a collector that
+//! stops part way starts again from the queue row, which goes last.
+
+use std::collections::VecDeque;
+
+use crate::record::{BlockHeader, ChunkPlace, Extent, Holder, Target};
+use crate::{block, file, name};
+
+/// A reclaimer's next request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Request {
+    /// A read of at most `max` of `file`'s extents, from the one holding byte `from`
+    /// ([`file::extents`]).
+    Extents { file: u128, from: u64, max: usize },
+    /// A read of a block's header and its chunks' places ([`block::read`]).
+    Block(u128),
+    /// Deleting a chunk from its volume, on the node that holds the volume.
+    Chunk(ChunkPlace),
+    /// A command to the Block range that holds the block.
+    BlockCommand(block::Command),
+    /// A command to the File range that holds the file.
+    FileCommand(file::Command),
+    /// Removing the file's mark, as `name::Command::Unmark`, at the Name range that holds its
+    /// key now.
+    Unmark(name::Unmark),
+    /// Dropping the file's row from the queue of the Name range that released it, as
+    /// `name::Command::Reclaim`.
+    Reclaim(name::Reclaim),
+}
+
+/// What a request answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    Extents(Vec<(u64, Extent)>),
+    Block(Option<(BlockHeader, Vec<ChunkPlace>)>),
+    /// The chunk is gone from its volume, deleted now or before.
+    Chunk,
+    BlockOutcome(block::Outcome),
+    FileOutcome(file::Outcome),
+    NameOutcome(name::Outcome),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ReclaimError {
+    #[error("an answer of another kind than the request")]
+    Mismatch,
+    #[error("an answer the reclaimer's step cannot have")]
+    Unexpected,
+    /// An adopted part's file names another file: a part is written as blocks.
+    #[error("a part's file holds another file")]
+    Nested,
+}
+
+/// A file being taken apart: where its next extents start, and those read but not yet
+/// reclaimed.
+#[derive(Debug, Clone)]
+struct Frame {
+    file: u128,
+    from: u64,
+    /// The last read found the file's end.
+    ended: bool,
+    pending: VecDeque<Extent>,
+}
+
+impl Frame {
+    fn new(file: u128) -> Self {
+        Self {
+            file,
+            from: 0,
+            ended: false,
+            pending: VecDeque::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Phase {
+    /// Reading the top file's next extents, or moving on to its next pending one.
+    Next,
+    ReadBlock(u128),
+    /// Deleting the block's chunks, the next one first.
+    Chunks(u128),
+    DeleteBlock(u128),
+    DeleteFile(u128),
+    Unmark,
+    Reclaim,
+    Done,
+}
+
+/// The reclamation of one released file.
+#[derive(Debug, Clone)]
+pub struct Reclaimer {
+    released_ns: u64,
+    root: u128,
+    holder: Holder,
+    /// The released file, then the adopted part being taken apart: at most two.
+    frames: Vec<Frame>,
+    chunks: Vec<ChunkPlace>,
+    /// Extents one read returns at most, which bounds what the reclaimer holds.
+    budget: usize,
+    phase: Phase,
+}
+
+impl Reclaimer {
+    /// The reclamation of a released file ([`name::released`]).
+    pub fn new(released: name::Released, budget: usize) -> Self {
+        Self {
+            released_ns: released.released_ns,
+            root: released.file,
+            holder: released.holder,
+            frames: vec![Frame::new(released.file)],
+            chunks: Vec::new(),
+            budget: budget.max(1),
+            phase: Phase::Next,
+        }
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.phase == Phase::Done
+    }
+
+    /// The request to send next; `None` once the file is reclaimed.
+    pub fn next(&self) -> Option<Request> {
+        Some(match &self.phase {
+            Phase::Next => {
+                let frame = self.frames.last()?;
+                Request::Extents {
+                    file: frame.file,
+                    from: frame.from,
+                    max: self.budget,
+                }
+            }
+            Phase::ReadBlock(block) => Request::Block(*block),
+            Phase::Chunks(_) => Request::Chunk(*self.chunks.last()?),
+            Phase::DeleteBlock(block) => {
+                Request::BlockCommand(block::Command::Delete { block: *block })
+            }
+            Phase::DeleteFile(file) => Request::FileCommand(file::Command::Delete { file: *file }),
+            Phase::Unmark => Request::Unmark(name::Unmark {
+                files: vec![name::Marked {
+                    bucket: self.holder.bucket.clone(),
+                    key: self.holder.key.clone(),
+                    file: self.root,
+                }],
+            }),
+            Phase::Reclaim => Request::Reclaim(name::Reclaim {
+                released_ns: self.released_ns,
+                file: self.root,
+            }),
+            Phase::Done => return None,
+        })
+    }
+
+    /// Moves on with what the request [`Reclaimer::next`] named answered.
+    pub fn step(&mut self, answer: Answer) -> Result<(), ReclaimError> {
+        match (&self.phase, answer) {
+            (Phase::Next, Answer::Extents(extents)) => {
+                let frame = self.frames.last_mut().ok_or(ReclaimError::Unexpected)?;
+                match extents.last() {
+                    None => frame.ended = true,
+                    Some(&(start, last)) => {
+                        frame.from = start
+                            .checked_add(last.length)
+                            .ok_or(ReclaimError::Unexpected)?;
+                        frame.ended = extents.len() < self.budget;
+                    }
+                }
+                frame
+                    .pending
+                    .extend(extents.into_iter().map(|(_, extent)| extent));
+                self.advance()
+            }
+            (Phase::ReadBlock(block), Answer::Block(read)) => {
+                let block = *block;
+                match read {
+                    // Removed before: a reclaimer that stopped after its block step.
+                    None => self.advance(),
+                    Some((_, places)) => {
+                        self.chunks = places;
+                        self.phase = if self.chunks.is_empty() {
+                            Phase::DeleteBlock(block)
+                        } else {
+                            Phase::Chunks(block)
+                        };
+                        Ok(())
+                    }
+                }
+            }
+            (Phase::Chunks(block), Answer::Chunk) => {
+                let block = *block;
+                self.chunks.pop();
+                if self.chunks.is_empty() {
+                    self.phase = Phase::DeleteBlock(block);
+                }
+                Ok(())
+            }
+            (Phase::DeleteBlock(_), Answer::BlockOutcome(outcome)) => match outcome {
+                block::Outcome::Deleted => self.advance(),
+                _ => Err(ReclaimError::Unexpected),
+            },
+            (Phase::DeleteFile(_), Answer::FileOutcome(outcome)) => match outcome {
+                file::Outcome::Deleted => {
+                    self.frames.pop();
+                    if self.frames.is_empty() {
+                        self.phase = Phase::Unmark;
+                        Ok(())
+                    } else {
+                        self.advance()
+                    }
+                }
+                _ => Err(ReclaimError::Unexpected),
+            },
+            (Phase::Unmark, Answer::NameOutcome(outcome)) => match outcome {
+                name::Outcome::Unmarked => {
+                    self.phase = Phase::Reclaim;
+                    Ok(())
+                }
+                _ => Err(ReclaimError::Unexpected),
+            },
+            (Phase::Reclaim, Answer::NameOutcome(outcome)) => match outcome {
+                name::Outcome::Reclaimed => {
+                    self.phase = Phase::Done;
+                    Ok(())
+                }
+                _ => Err(ReclaimError::Unexpected),
+            },
+            _ => Err(ReclaimError::Mismatch),
+        }
+    }
+
+    /// Takes the top file's next pending extent, reads its next ones, or, once it has none
+    /// left, removes it.
+    fn advance(&mut self) -> Result<(), ReclaimError> {
+        let depth = self.frames.len();
+        let frame = self.frames.last_mut().ok_or(ReclaimError::Unexpected)?;
+        self.phase = match frame.pending.pop_front() {
+            Some(Extent {
+                target: Target::Block(block),
+                ..
+            }) => Phase::ReadBlock(block),
+            Some(Extent {
+                target: Target::File(part),
+                ..
+            }) => {
+                if depth > 1 {
+                    return Err(ReclaimError::Nested);
+                }
+                self.frames.push(Frame::new(part));
+                Phase::Next
+            }
+            None if frame.ended => Phase::DeleteFile(frame.file),
+            None => Phase::Next,
+        };
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::Model;
+    use crate::name::{Command, Delete, Named, Outcome, Put};
+    use crate::record::{Version, Versioning};
+    use mantle_chunk::ChunkKey;
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
+
+    /// A cell's worth of ranges on model engines, and the chunks its volumes hold.
+    struct Cell {
+        name: Model,
+        files: Model,
+        blocks: Model,
+        chunks: BTreeSet<(u128, ChunkKey)>,
+        index: u64,
+    }
+
+    impl Cell {
+        fn new() -> Self {
+            let mut cell = Self {
+                name: Model::default(),
+                files: Model::default(),
+                blocks: Model::default(),
+                chunks: BTreeSet::new(),
+                index: 0,
+            };
+            cell.run_name(&Command::Gate(name::GateChange {
+                bucket: "b".into(),
+                incarnation: 1,
+                attempt: 1,
+                from: None,
+                to: Some(crate::record::GateState::Open),
+            }));
+            cell
+        }
+
+        fn tick(&mut self) -> u64 {
+            self.index += 1;
+            self.index
+        }
+
+        fn run_name(&mut self, command: &Command) -> Outcome {
+            let index = self.tick();
+            name::apply(&mut self.name, index, command).unwrap()
+        }
+
+        /// A block of `width` chunks on volumes of their own, recorded as a PUT's would be.
+        fn block(&mut self, block: u128, width: u8) {
+            let chunks: Vec<ChunkPlace> = (0..width)
+                .map(|index| ChunkPlace {
+                    volume: u128::from(index) + 1,
+                    key: ChunkKey {
+                        block,
+                        epoch: 1,
+                        index: u16::from(index),
+                    },
+                })
+                .collect();
+            for place in &chunks {
+                self.chunks.insert((place.volume, place.key));
+            }
+            let index = self.tick();
+            let outcome = block::apply(
+                &mut self.blocks,
+                index,
+                &block::Command::Write {
+                    block,
+                    header: BlockHeader {
+                        length: 1,
+                        data: width,
+                        parity: 0,
+                        chunk_len: 1,
+                        crc32c: 0,
+                    },
+                    chunks,
+                    at_ns: 0,
+                    file: 1,
+                    handover_ns: u64::MAX / 2,
+                },
+            )
+            .unwrap();
+            assert!(matches!(outcome, block::Outcome::Written { .. }));
+        }
+
+        fn file(&mut self, file: u128, targets: &[Target]) {
+            let extents = targets
+                .iter()
+                .map(|&target| Extent { length: 1, target })
+                .collect();
+            let index = self.tick();
+            let write = file::Command::Write {
+                file,
+                extents,
+                referrer: crate::record::Referrer {
+                    bucket: "b".into(),
+                    incarnation: 1,
+                    key: "k".into(),
+                },
+                handover_ns: 1_000,
+                at_ns: index,
+                blocks_deadline_ns: u64::MAX,
+            };
+            let outcome = file::apply(&mut self.files, index, &write).unwrap();
+            assert!(matches!(outcome, file::Outcome::Written { .. }));
+        }
+
+        /// Sends `request` where it goes and returns its answer.
+        fn answer(&mut self, request: Request) -> Answer {
+            match request {
+                Request::Extents { file, from, max } => {
+                    Answer::Extents(file::extents(&self.files, file, from, max).unwrap())
+                }
+                Request::Block(block) => Answer::Block(block::read(&self.blocks, block).unwrap()),
+                Request::Chunk(place) => {
+                    self.chunks.remove(&(place.volume, place.key));
+                    Answer::Chunk
+                }
+                Request::BlockCommand(command) => {
+                    let index = self.tick();
+                    Answer::BlockOutcome(block::apply(&mut self.blocks, index, &command).unwrap())
+                }
+                Request::FileCommand(command) => {
+                    let index = self.tick();
+                    Answer::FileOutcome(file::apply(&mut self.files, index, &command).unwrap())
+                }
+                Request::Unmark(unmark) => {
+                    Answer::NameOutcome(self.run_name(&Command::Unmark(unmark)))
+                }
+                Request::Reclaim(reclaim) => {
+                    Answer::NameOutcome(self.run_name(&Command::Reclaim(reclaim)))
+                }
+            }
+        }
+
+        /// Runs `reclaimer` for at most `steps` requests; whether it finished.
+        fn drive(&mut self, reclaimer: &mut Reclaimer, steps: usize) -> bool {
+            for _ in 0..steps {
+                let Some(request) = reclaimer.next() else {
+                    return true;
+                };
+                let answer = self.answer(request);
+                reclaimer.step(answer).unwrap();
+            }
+            reclaimer.is_done()
+        }
+
+        fn rows(engine: &Model) -> usize {
+            let mut count = 0;
+            let mut from = vec![crate::key::DATA];
+            let to = vec![crate::key::REVERSE, 0xFF];
+            while let Some((k, _)) = crate::engine::Rows::next(engine, &from, &to).unwrap() {
+                count += 1;
+                from = k;
+                from.push(0);
+            }
+            count
+        }
+    }
+
+    fn object(file: u128) -> Version {
+        Version {
+            marker: false,
+            null: false,
+            modified_ns: 0,
+            etag: "e".into(),
+            size: 1,
+            checksum: None,
+            file: Some(file),
+            owner: "o".into(),
+            headers: Vec::new(),
+            retention: None,
+            legal_hold: None,
+        }
+    }
+
+    /// A completed upload's file of two part files, each of blocks, and a plain object beside
+    /// it: removing the upload's version releases its file, and reclaiming it removes its
+    /// parts, their blocks and chunks, and the queue row, and nothing of the other object.
+    #[test]
+    fn a_released_upload_is_reclaimed_to_its_chunks() {
+        let mut cell = Cell::new();
+        cell.block(11, 3);
+        cell.block(12, 2);
+        cell.block(21, 3);
+        cell.file(100, &[Target::Block(11), Target::Block(12)]);
+        cell.file(200, &[Target::Block(21)]);
+        cell.file(300, &[Target::File(100), Target::File(200)]);
+        cell.block(41, 2);
+        cell.file(400, &[Target::Block(41)]);
+        for (key, file) in [("upload", 300), ("other", 400)] {
+            let outcome = cell.run_name(&Command::Put(Put {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: key.into(),
+                versioning: Versioning::Unversioned,
+                preconditions: name::Preconditions::default(),
+                at_ns: 1,
+                ordered_ns: None,
+                version: object(file),
+                default: None,
+                deadline_ns: u64::MAX,
+            }));
+            assert!(matches!(outcome, Outcome::Put { .. }));
+        }
+        cell.run_name(&Command::Delete(Delete {
+            bucket: "b".into(),
+            incarnation: 1,
+            key: "upload".into(),
+            versioning: Versioning::Unversioned,
+            named: Some(Named::Null),
+            if_match: None,
+            at_ns: 2,
+            bypass: false,
+        }));
+        let mut queue = name::released(&cell.name, u64::MAX, 10).unwrap();
+        assert_eq!(queue.len(), 1);
+        let released = queue.remove(0);
+        assert_eq!(released.file, 300);
+        let mut reclaimer = Reclaimer::new(released, 1);
+        assert!(cell.drive(&mut reclaimer, 1_000));
+        assert_eq!(name::released(&cell.name, u64::MAX, 10).unwrap(), []);
+        for gone in [100, 200, 300] {
+            assert_eq!(file::header(&cell.files, gone).unwrap(), None);
+        }
+        for gone in [11, 12, 21] {
+            assert_eq!(block::read(&cell.blocks, gone).unwrap(), None);
+        }
+        // Only the other object's chunks, block and file remain.
+        assert_eq!(cell.chunks.len(), 2);
+        assert!(cell.chunks.iter().all(|(_, key)| key.block == 41));
+        assert!(block::read(&cell.blocks, 41).unwrap().is_some());
+        assert!(file::header(&cell.files, 400).unwrap().is_some());
+        assert!(Cell::rows(&cell.blocks) > 0);
+    }
+
+    #[test]
+    fn answers_out_of_turn_are_refused() {
+        let mut reclaimer = Reclaimer::new(
+            name::Released {
+                released_ns: 1,
+                file: 5,
+                holder: crate::record::Holder {
+                    bucket: "b".into(),
+                    key: "k".into(),
+                },
+            },
+            4,
+        );
+        assert_eq!(reclaimer.step(Answer::Chunk), Err(ReclaimError::Mismatch));
+        reclaimer
+            .step(Answer::Extents(vec![(
+                0,
+                Extent {
+                    length: 1,
+                    target: Target::File(6),
+                },
+            )]))
+            .unwrap();
+        // The adopted part holds a file: parts are written as blocks.
+        assert_eq!(
+            reclaimer.step(Answer::Extents(vec![(
+                0,
+                Extent {
+                    length: 1,
+                    target: Target::File(7),
+                },
+            )])),
+            Err(ReclaimError::Nested)
+        );
+    }
+
+    proptest! {
+        /// Stopped after any number of steps and started again from the queue row, as many
+        /// times as it takes, the reclaimer ends where one uninterrupted run does: every
+        /// row, block and chunk of the released file gone, and nothing else.
+        #[test]
+        fn a_reclaimer_stopped_anywhere_resumes_from_the_queue(
+            parts in proptest::collection::vec(proptest::collection::vec(1u8..4, 1..4), 1..4),
+            budget in 1usize..4,
+            stops in proptest::collection::vec(0usize..12, 0..6),
+        ) {
+            let mut cell = Cell::new();
+            let mut next = 10u128;
+            let mut part_files = Vec::new();
+            for widths in &parts {
+                let mut targets = Vec::new();
+                for &width in widths {
+                    next += 1;
+                    cell.block(next, width);
+                    targets.push(Target::Block(next));
+                }
+                next += 1;
+                cell.file(next, &targets);
+                part_files.push(Target::File(next));
+            }
+            next += 1;
+            let root = next;
+            cell.file(root, &part_files);
+            cell.run_name(&Command::Put(Put {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: "k".into(),
+                versioning: Versioning::Unversioned,
+                preconditions: name::Preconditions::default(),
+                at_ns: 1,
+                ordered_ns: None,
+                version: object(root),
+                default: None,
+                deadline_ns: u64::MAX,
+            }));
+            cell.run_name(&Command::Delete(Delete {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: "k".into(),
+                versioning: Versioning::Unversioned,
+                named: None,
+                if_match: None,
+                at_ns: 2,
+                bypass: false,
+            }));
+            for &stop in &stops {
+                let mut queue = name::released(&cell.name, u64::MAX, 2).unwrap();
+                if queue.len() != 1 {
+                    break;
+                }
+                let mut reclaimer = Reclaimer::new(queue.remove(0), budget);
+                cell.drive(&mut reclaimer, stop);
+            }
+            let mut queue = name::released(&cell.name, u64::MAX, 2).unwrap();
+            if queue.len() == 1 {
+                let mut reclaimer = Reclaimer::new(queue.remove(0), budget);
+                prop_assert!(cell.drive(&mut reclaimer, 10_000));
+            }
+            prop_assert_eq!(name::released(&cell.name, u64::MAX, 2).unwrap(), vec![]);
+            prop_assert!(cell.chunks.is_empty());
+            prop_assert_eq!(Cell::rows(&cell.files), 0);
+            prop_assert_eq!(Cell::rows(&cell.blocks), 0);
+        }
+    }
+}

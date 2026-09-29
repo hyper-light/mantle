@@ -1,0 +1,68 @@
+name: gates
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+jobs:
+  dependencies:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.98.0 --profile minimal
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: Audit dependencies
+        run: cargo deny check advisories bans licenses sources
+
+  gates:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
+          - { name: linux-aarch64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { name: macos-aarch64, runner: macos-15, target: aarch64-apple-darwin }
+          # Built on Apple silicon and run under Rosetta 2.
+          - { name: macos-x86_64, runner: macos-15, target: x86_64-apple-darwin }
+          - { name: windows-x86_64, runner: windows-2025, target: x86_64-pc-windows-msvc }
+          - { name: windows-aarch64, runner: windows-11-arm, target: aarch64-pc-windows-msvc }
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned Rust
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
+          rustup target add --toolchain 1.98.0 ${{ matrix.target }}
+      # AWS-LC's x86_64 Windows assembly is NASM source, built rather than taken prebuilt
+      # (vendor/UPSTREAM.md).
+      - name: Install NASM
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        uses: ilammy/setup-nasm@v1.5.2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          workspaces: |
+            .
+            vendor
+      - name: Source contracts
+        run: python3 scripts/check-contracts.py
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Lints
+        run: cargo clippy --workspace --all-targets --all-features --locked --target ${{ matrix.target }} -- -D warnings
+      - name: Production panic policy
+        shell: bash
+        run: bash scripts/check-production.sh --target ${{ matrix.target }}
+      - name: Tests
+        run: cargo test --workspace --locked --target ${{ matrix.target }}
+      - name: Vendored crates' suites
+        run: cargo test --manifest-path vendor/Cargo.toml --workspace --locked --target ${{ matrix.target }}
+      - name: Release build
+        run: cargo build --release --workspace --locked --target ${{ matrix.target }}

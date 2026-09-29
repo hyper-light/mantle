@@ -514,16 +514,24 @@ impl<F: BlockFile + 'static> Volume<F> {
         // The fragments are read one at a time, so the read buffers the most any one needs.
         let mut cost = 0u64;
         for fragment in &fragments {
+            let from = offset
+                .max(fragment.chunk_offset)
+                .saturating_sub(fragment.chunk_offset);
             let to = end
                 .min(fragment.end())
                 .saturating_sub(fragment.chunk_offset);
-            let span = read::span_len(self.shared.checksum_shift, fragment, to).ok_or(
-                ChunkError::Corrupt {
-                    key: *key,
-                    detail: "record size".into(),
-                },
-            )?;
-            cost = cost.max(span);
+            let plan = read::Plan::new(
+                self.shared.checksum_shift,
+                fragment,
+                from,
+                to,
+                self.shared.reads.gap(),
+            )
+            .ok_or(ChunkError::Corrupt {
+                key: *key,
+                detail: "record size".into(),
+            })?;
+            cost = cost.max(plan.bytes());
         }
         // Let through before anything is taken: a read refused or waiting holds no memory.
         let _turn = self.shared.reads.enter(cost)?;

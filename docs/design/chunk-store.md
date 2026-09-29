@@ -258,12 +258,27 @@ data records alone: slow, but no acknowledged chunk depends on the log.
 
 ## 7. Reading
 
-A read looks up the fragments covering the requested range, reads the block-aligned span
-holding each fragment's header and the needed payload, and verifies it (§3.1). A
-checksum, identity or incarnation mismatch, or `EIO`, is one condition: a typed
-`Corrupt` error naming the chunk, returned to the caller (which reads another replica or
-fragment) and reported for repair [GAA17 §4; research/03 X1]. The node never crashes and
-never returns unverified bytes.
+A read looks up the fragments covering the requested range and, for each, reads the
+fragment's header with its checksum table and the checksum blocks the range touches, then
+verifies them (§3.1). A checksum, identity or incarnation mismatch, or `EIO`, is one
+condition: a typed `Corrupt` error naming the chunk, returned to the caller (which reads
+another replica or fragment) and reported for repair [GAA17 §4; research/03 X1]. The node
+never crashes and never returns unverified bytes.
+
+The header and the blocks are one read when the payload between them is no larger than the
+volume's read gap, and two reads otherwise. A read costs the device an access and then its
+bytes at the transfer rate (Gray and Graefe 1997, §2), so passing over the gap costs what a
+second access would. The volume reads at the depth where the device saturates, so both are
+taken there: the access is the device time a small random read takes at saturation less its
+transfer, and the gap is what the device transfers in that time
+(`Calibration::read_gap`; research/11 §8.4). On this machine that is 51.2 kB, so a range
+beyond its fragment's first checksum block is read apart; a device whose access is longer,
+as a disk's seek is, reads through proportionally more. A device not measured has a gap of
+zero and reads only what it verifies. Before this rule a read spanned from the header through its last
+block, so 4 KiB at the end of an 8 MiB fragment read all 8 MiB before it (audit P01). Ranges
+of 8 MiB chunks now read 16 to 27 times as fast with 16 in flight, and a gap taken at idle,
+about 1 MB here, lost to this one at every point under load
+([measurements](../measurements/2026-09-29-range-reads.md)).
 
 A volume holds at most `Reads::depth` client reads at the device: the shallowest depth at
 which calibration finds throughput stops growing, its interval overlapping the fastest

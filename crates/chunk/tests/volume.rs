@@ -18,6 +18,7 @@ use mantle_chunk::layout::{Geometry, batch_frame_bytes, checkpoint_bytes, larges
 use mantle_chunk::{ChunkError, Config, Reads, Volume};
 use mantle_disk::buf::Alignment;
 use mantle_disk::file::{CachingRequest, DeviceFile};
+use mantle_disk::sim::{Fault, SimFile};
 
 /// A volume formatted to pre-write has every byte of its extent written at format, before
 /// its superblocks; one formatted without has only its superblocks and log (docs/design/
@@ -174,6 +175,99 @@ fn a_volume_on_a_raw_device_reopens_with_its_chunks() {
 fn a_volume_on_a_linux_block_device_reopens_with_its_chunks() {
     let device = std::env::var_os("MANTLE_TEST_BLOCK_DEVICE").unwrap();
     a_volume_on_a_raw_device_reopens(std::path::Path::new(&device));
+}
+
+/// A simulated file that counts the bytes read from it.
+struct Counting {
+    file: Arc<SimFile>,
+    read: AtomicU64,
+}
+
+impl mantle_disk::block::BlockFile for Counting {
+    fn alignment(&self) -> Alignment {
+        self.file.alignment()
+    }
+    fn len(&self) -> Result<u64, mantle_disk::DiskError> {
+        mantle_disk::block::BlockFile::len(&*self.file)
+    }
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), mantle_disk::DiskError> {
+        self.read.fetch_add(buf.len() as u64, Ordering::SeqCst);
+        self.file.read_exact_at(buf, offset)
+    }
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), mantle_disk::DiskError> {
+        self.file.write_all_at(buf, offset)
+    }
+    fn sync_data(&self) -> Result<(), mantle_disk::DiskError> {
+        self.file.sync_data()
+    }
+}
+
+/// A 4 KiB range at the end of an 8 MiB chunk reads the record's header and checksum table
+/// and the one 64 KiB checksum block that holds it, not the 8 MiB before it (audit P01);
+/// where the device's measured gap covers the payload before a range, one read takes all of
+/// it instead. Either way the range is verified: damage to its checksum block is found, and
+/// damage to a block it does not read is not its concern.
+#[test]
+fn a_range_read_reads_its_checksum_blocks_and_not_the_payload_before_them() {
+    let config = |gap| Config {
+        segment_size: 16 << 20,
+        checksum_shift: 16,
+        max_fragments: 64,
+        compact: true,
+        scrub_period: None,
+        limits: mantle_chunk::Limits {
+            batch_requests: 16,
+            batch_bytes: 32 << 20,
+            fragments_per_chunk: 4,
+        },
+        prewrite: false,
+        reads: Reads::measured(1, 0, gap),
+    };
+    let sim = sim(21);
+    let counting = Arc::new(Counting {
+        file: Arc::clone(&sim),
+        read: AtomicU64::new(0),
+    });
+    let whole = 8u64 << 20;
+    let bytes = data(5, whole as usize);
+    let v = Volume::format(Arc::clone(&counting), 64 << 20, config(0)).unwrap();
+    v.put(key(1), &bytes).unwrap();
+    let tail = whole - 4096;
+    let read = |v: &Volume<Arc<Counting>>| {
+        counting.read.store(0, Ordering::SeqCst);
+        let got = v.read(&key(1), tail, 4096);
+        (got, counting.read.load(Ordering::SeqCst))
+    };
+    let (got, apart) = read(&v);
+    assert_eq!(got.unwrap(), &bytes[tail as usize..]);
+    assert!(apart <= 72 << 10, "{apart} bytes read for 4 KiB");
+    v.close();
+    // A gap as long as the payload: the one read of old.
+    let (v, _) = Volume::open(Arc::clone(&counting), config(whole)).unwrap();
+    let (got, together) = read(&v);
+    assert_eq!(got.unwrap(), &bytes[tail as usize..]);
+    assert!(together >= whole, "{together} bytes read in one");
+    v.close();
+    // The record is the first in the first segment, after the segment's header block.
+    let (v, _) = Volume::open(Arc::clone(&counting), config(0)).unwrap();
+    let payload = v.data_span().start
+        + 4096
+        + mantle_chunk::record::prefix_len(whole as u32, 16).unwrap() as u64;
+    sim.inject(Fault::BitFlip {
+        offset: payload,
+        bit: 0,
+        stored: false,
+    })
+    .unwrap();
+    assert_eq!(read(&v).0.unwrap(), &bytes[tail as usize..]);
+    sim.clear_faults().unwrap();
+    sim.inject(Fault::BitFlip {
+        offset: payload + whole - 1,
+        bit: 0,
+        stored: false,
+    })
+    .unwrap();
+    assert!(matches!(read(&v).0, Err(ChunkError::Corrupt { .. })));
 }
 
 #[test]
@@ -596,6 +690,7 @@ fn reads_past_the_depth_wait_or_are_refused() {
             depth: 2,
             waiting: 1,
             bytes: u64::MAX,
+            gap: 0,
         },
         ..config()
     };
@@ -737,6 +832,7 @@ fn settings_no_volume_can_run_with_are_refused_before_any_io() {
                 depth: 0,
                 waiting: 1,
                 bytes: u64::MAX,
+                gap: 0,
             },
             ..config()
         },
@@ -800,6 +896,7 @@ fn reads_hold_their_buffers_to_the_read_bytes() {
             depth: 4,
             waiting: 64,
             bytes: budget,
+            gap: 0,
         },
         ..config()
     };

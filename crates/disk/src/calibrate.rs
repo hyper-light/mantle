@@ -191,6 +191,23 @@ impl Calibration {
         saturation(&self.sequential_read)
     }
 
+    /// The bytes past which reading on costs more of the device than a second read would. A
+    /// read takes an access and then its bytes at the transfer rate (Gray and Graefe, SIGMOD
+    /// Record 26(4), 1997, §2, eq. 6), so the break-even is the access time times the rate.
+    /// Both are taken at saturation, where the device serves the most reads: an access is what
+    /// a small random read takes of the saturated device, `1/ops`, less its own bytes at the
+    /// sequential saturation rate (docs/research/11 §8.4). `None` without both measurements.
+    pub fn read_gap(&self) -> Option<u64> {
+        let random = self.random_read_saturation()?;
+        let rate = self.sequential_read_saturation()?.bytes_per_sec;
+        if random.ops_per_sec <= 0.0 || rate <= 0.0 {
+            return None;
+        }
+        let small = u32::try_from(self.small).map_or(f64::MAX, f64::from);
+        let access = (1.0 / random.ops_per_sec - small / rate).max(0.0);
+        whole(rate * access)
+    }
+
     /// Whether a durable write into preallocated, never-written space is slower than the same
     /// write over written space: the first write's throughput interval lies wholly below the
     /// overwrite's, the test by which Georges, Buytaert and Eeckhout tell two measurements
@@ -201,6 +218,12 @@ impl Calibration {
     pub fn first_write_penalty(&self) -> bool {
         slower(&self.first_write, &self.overwrite)
     }
+}
+
+/// `x` rounded down, when it is finite, not negative and at most `u64::MAX`: the conversion of
+/// seconds to a `Duration` checks exactly that, and keeps the whole seconds exact.
+fn whole(x: f64) -> Option<u64> {
+    Duration::try_from_secs_f64(x).ok().map(|d| d.as_secs())
 }
 
 /// `a`'s throughput interval lies wholly below `b`'s.
@@ -475,6 +498,40 @@ mod tests {
             p50_ns: None,
             p99_ns: None,
         }
+    }
+
+    /// At 2^17 small reads a second, a 4 KiB read takes 2^-17 s of the device, 2^-20 s of it
+    /// moving its bytes at 2^32 B/s: the access is 7·2^-20 s, in which the device reads
+    /// 28 KiB. Without a random-read rate there is none.
+    #[test]
+    fn the_read_gap_is_an_access_at_the_saturated_transfer_rate() {
+        // A 1 MiB sequential read's rate in operations tracks its bytes.
+        let sequential = |depth, bytes_per_sec: f64| Point {
+            bytes_per_sec,
+            ..at(depth, bytes_per_sec / f64::from(1u32 << 20))
+        };
+        let durable = at(1, 0.0);
+        let mut c = Calibration {
+            caching: Caching::Direct,
+            small: 4096,
+            large: 1 << 20,
+            random_read: vec![at(1, f64::from(1u32 << 15)), at(4, f64::from(1u32 << 17))],
+            random_read_capped: false,
+            sequential_read: vec![
+                sequential(1, 2.0f64.powi(31)),
+                sequential(4, 2.0f64.powi(32)),
+            ],
+            sequential_write: Vec::new(),
+            durable_write: durable,
+            durable_sequential: durable,
+            durable_large: 1 << 20,
+            first_write: durable,
+            overwrite: durable,
+            elapsed: Duration::ZERO,
+        };
+        assert_eq!(c.read_gap(), Some(28 << 10));
+        c.random_read = vec![at(1, 0.0)];
+        assert_eq!(c.read_gap(), None);
     }
 
     /// Power `X²/N` is greatest where more depth stops buying throughput in proportion.

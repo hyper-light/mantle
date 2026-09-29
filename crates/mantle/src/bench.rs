@@ -13,7 +13,10 @@
 //! the same state. Right after each read point, the same number of workers read the same
 //! number of bytes from random places in the volume's segments directly through the file
 //! layer. Background work of the file system and the drive stalls reads at times; running
-//! the two back to back shows what mantle adds, apart from the environment.
+//! the two back to back shows what mantle adds, apart from the environment. For chunks
+//! larger than the smallest size, the same readers then read ranges of the smallest size at
+//! random places within the same chunks, which a range GET does: the store reads a range's
+//! checksum blocks, not the chunk (docs/design/chunk-store.md §7).
 //!
 //! One pass measures the drive's recent history as much as the store
 //! (docs/measurements/2026-09-28-chunk-store-benchmark.md, finding 7), and this machine's
@@ -218,7 +221,7 @@ pub fn chunk(out: &mut impl Write, path: &Path, options: &Options) -> Result<(),
                 .zip(u64::try_from(device.large).ok())
                 .and_then(|(d, l)| d.checked_mul(l))
                 .unwrap_or(u64::MAX);
-            reads = Reads::measured(random.depth, bytes);
+            reads = Reads::measured(random.depth, bytes, device.read_gap().unwrap_or(0));
         }
     }
     run(out, path, align, &plan, prewrite, reads)
@@ -307,7 +310,7 @@ fn run(
     writeln!(
         out,
         "chunk store on a {} volume in a scratch file (removed afterwards){}, reading {} at \
-         a time with {} more let wait",
+         a time with {} more let wait, and through at most {} of a record to reach its range",
         display::capacity(volume),
         if prewrite {
             ", written once at format"
@@ -315,7 +318,8 @@ fn run(
             ""
         },
         reads.depth,
-        reads.waiting
+        reads.waiting,
+        display::capacity(reads.gap)
     )?;
     out.flush()?;
 
@@ -356,18 +360,28 @@ fn run(
             // More readers than the store holds at the device and lets wait would be refused
             // with Busy; the file layer reads as many at once, for comparison.
             let readers = workers.min(reads.depth.saturating_add(reads.waiting));
-            let (mut put, mut get, mut direct) =
-                (Series::default(), Series::default(), Series::default());
+            let (mut put, mut get, mut direct, mut range) = (
+                Series::default(),
+                Series::default(),
+                Series::default(),
+                Series::default(),
+            );
             for _ in 0..plan.rounds.limit() {
                 let (outcome, keys) = puts(&v, size, writers, plan.step, budget, point)?;
                 put.add(outcome);
                 if !keys.is_empty() {
-                    get.add(gets(&v, &keys, size, readers, plan.step, point)?);
+                    get.add(gets(&v, &keys, size, size, readers, plan.step, point)?);
                     direct.add(raw_reads(&raw, &span, size, readers, plan.step, point)?);
+                    if size > smallest {
+                        range.add(gets(&v, &keys, size, smallest, readers, plan.step, point)?);
+                    }
                 }
                 deletes(&v, &keys)?;
                 point = point.saturating_add(1);
-                if [&put, &get, &direct].iter().all(|s| s.enough(&plan.rounds)) {
+                if [&put, &get, &direct, &range]
+                    .iter()
+                    .all(|s| s.enough(&plan.rounds))
+                {
                     break;
                 }
             }
@@ -387,6 +401,10 @@ fn run(
                     &get,
                 )?;
                 rows(out, "  file layer", readers, size, &direct)?;
+            }
+            if !range.ops_per_sec.is_empty() {
+                let name = format!("  {} range", display::size(smallest));
+                rows(out, &name, readers, smallest, &range)?;
             }
         }
     }
@@ -569,12 +587,14 @@ fn puts(
     ))
 }
 
-/// `workers` closed-loop readers read whole chunks of `keys`, chosen at random, until
+/// `workers` closed-loop readers read `len` bytes of the `size`-byte chunks of `keys`, the
+/// chunk chosen at random and the range at a random multiple of `len` within it, until
 /// `step` passes.
 fn gets(
     v: &Volume<DeviceFile>,
     keys: &[ChunkKey],
     size: usize,
+    len: usize,
     workers: usize,
     step: Duration,
     point: u64,
@@ -582,7 +602,12 @@ fn gets(
     let started = Instant::now();
     let deadline = started.checked_add(step);
     let failed: Mutex<Option<ChunkError>> = Mutex::new(None);
-    let size64 = u64::try_from(size).unwrap_or(u64::MAX);
+    let len64 = u64::try_from(len).unwrap_or(u64::MAX);
+    let places = u64::try_from(size)
+        .unwrap_or(0)
+        .checked_div(len64)
+        .unwrap_or(0)
+        .max(1);
     let count = u64::try_from(keys.len()).unwrap_or(u64::MAX);
     let results: Result<Vec<Option<Histogram>>, std::io::Error> = std::thread::scope(|scope| {
         let handles = mantle_disk::workers::spawn_all(scope, workers, |worker| {
@@ -601,8 +626,9 @@ fn gets(
                     let Some(k) = keys.get(pick) else {
                         break;
                     };
+                    let from = rng.below(places).saturating_mul(len64);
                     let t = Instant::now();
-                    match v.read_into(k, 0, size64, &mut buf) {
+                    match v.read_into(k, from, len64, &mut buf) {
                         Ok(()) => latency.record(nanos(t.elapsed())),
                         Err(e) => {
                             if let Ok(mut f) = failed.lock() {
@@ -631,7 +657,7 @@ fn gets(
     let ops = latency.count();
     Ok(Outcome {
         ops,
-        bytes: ops.saturating_mul(size64),
+        bytes: ops.saturating_mul(len64),
         elapsed,
         latency,
         full: false,
@@ -781,7 +807,7 @@ mod tests {
             align,
             &plan,
             false,
-            Reads::measured(4, 4 << 20),
+            Reads::measured(4, 4 << 20, 0),
         )
         .unwrap();
         let text = String::from_utf8(out).unwrap();
@@ -793,6 +819,7 @@ mod tests {
             "put 1 MiB",
             "get 1 MiB",
             "file layer",
+            "4 KiB range",
         ] {
             assert!(text.contains(name), "{name} missing from:\n{text}");
         }

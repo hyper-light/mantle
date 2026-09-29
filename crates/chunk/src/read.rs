@@ -83,6 +83,11 @@ impl Gate {
         }
     }
 
+    /// Bytes of payload a read goes past rather than read twice (`Reads::gap`).
+    pub fn gap(&self) -> u64 {
+        self.reads.gap
+    }
+
     /// A turn for a read that buffers `cost` bytes: at once if it fits and none waits, after
     /// the reads that came first if one may wait, and otherwise `Busy`.
     pub fn enter(&self, cost: u64) -> Result<Turn<'_>, ChunkError> {
@@ -141,16 +146,49 @@ impl Drop for Turn<'_> {
     }
 }
 
-/// Bytes a read of `fragment`'s payload up to `to` buffers from the device: the record's
-/// header and checksum table, and the checksum blocks up to the one holding `to`.
-pub(crate) fn span_len(shift: u8, fragment: &Fragment, to: u64) -> Option<u64> {
-    let block_size = 1u64.checked_shl(u32::from(shift))?;
-    let prefix_len = u64::try_from(record::prefix_len(fragment.payload_len, shift)?).ok()?;
-    let last_block_end = to
-        .div_ceil(block_size)
-        .saturating_mul(block_size)
-        .min(u64::from(fragment.payload_len));
-    Some(prefix_len.saturating_add(last_block_end))
+/// How a read of `fragment`'s payload `[from, to)` goes to the device: the record's header
+/// and checksum table, which verify it, and the checksum blocks that hold the range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Plan {
+    /// Bytes of the header and checksum table.
+    pub prefix: u64,
+    /// The payload offsets of the first checksum block the range needs and the end of the
+    /// last.
+    pub blocks: (u64, u64),
+    /// Whether the header and table are read apart from the blocks: when the blocks start
+    /// more than the device's gap into the payload, which a single read would read past
+    /// (audit P01).
+    pub apart: bool,
+}
+
+impl Plan {
+    /// Plans a read of `[from, to)` of `fragment`'s payload whose checksum blocks are
+    /// `1 << shift` bytes, reading past no more than `gap` bytes of payload it was not asked
+    /// for.
+    pub fn new(shift: u8, fragment: &Fragment, from: u64, to: u64, gap: u64) -> Option<Self> {
+        let block_size = 1u64.checked_shl(u32::from(shift))?;
+        let prefix = u64::try_from(record::prefix_len(fragment.payload_len, shift)?).ok()?;
+        let first = from.checked_div(block_size)?.checked_mul(block_size)?;
+        let end = to
+            .div_ceil(block_size)
+            .checked_mul(block_size)?
+            .min(u64::from(fragment.payload_len));
+        Some(Self {
+            prefix,
+            blocks: (first, end),
+            apart: first > gap,
+        })
+    }
+
+    /// Bytes the read buffers from the device.
+    pub fn bytes(&self) -> u64 {
+        let (first, end) = self.blocks;
+        if self.apart {
+            self.prefix.saturating_add(end.saturating_sub(first))
+        } else {
+            self.prefix.saturating_add(end)
+        }
+    }
 }
 
 /// Appends payload bytes `[from, to)` of `fragment` to `out`. A device error or any failed
@@ -170,36 +208,47 @@ pub(crate) fn fragment<F: BlockFile>(
     let geometry = &shared.geometry;
     let shift = shared.checksum_shift;
     let block_size = 1u64.checked_shl(u32::from(shift)).unwrap_or(u64::MAX);
-    let prefix_len = record::prefix_len(fragment.payload_len, shift)
-        .and_then(|p| u64::try_from(p).ok())
+    let plan = Plan::new(shift, fragment, from, to, shared.reads.gap())
         .ok_or_else(|| corrupt("record size"))?;
+    let (payload_from, last_block_end) = plan.blocks;
+    let first_block = payload_from.checked_div(block_size).unwrap_or(0);
     let base = geometry
         .segment_offset(fragment.segment)
         .ok_or_else(|| corrupt("segment"))?;
-    let first_block = from.checked_div(block_size).unwrap_or(0);
-    let last_block_end = to
-        .div_ceil(block_size)
-        .saturating_mul(block_size)
-        .min(u64::from(fragment.payload_len));
-    let payload_from = first_block.saturating_mul(block_size);
-    // One read covering the header and the checksum blocks that hold the range.
-    let span_len = span_len(shift, fragment, to).ok_or_else(|| corrupt("record size"))?;
-    let span = match read_span(
+    let read = |offset: u64, len: u64| match read_span(
         &shared.file,
         &shared.pool,
         geometry,
         base,
-        u64::from(fragment.offset),
-        span_len,
+        offset,
+        len,
     ) {
-        Ok(Some(span)) => span,
-        Ok(None) => return Err(corrupt("record extends past the end of the volume")),
-        Err(ChunkError::Device(e)) => return Err(corrupt(&format!("read failed: {e}"))),
-        Err(e) => return Err(e),
+        Ok(Some(span)) => Ok(span),
+        Ok(None) => Err(corrupt("record extends past the end of the volume")),
+        Err(ChunkError::Device(e)) => Err(corrupt(&format!("read failed: {e}"))),
+        Err(e) => Err(e),
     };
-    let bytes = span.bytes();
-    let prefix =
-        record::decode_prefix(bytes).ok_or_else(|| corrupt("record header did not verify"))?;
+    let record_at = u64::from(fragment.offset);
+    // The header and table, with the blocks when they are near enough to read past the
+    // payload before them; the blocks apart otherwise.
+    let head = if plan.apart {
+        read(record_at, plan.prefix)?
+    } else {
+        read(record_at, plan.bytes())?
+    };
+    let apart = if plan.apart {
+        Some(read(
+            record_at
+                .checked_add(plan.prefix)
+                .and_then(|at| at.checked_add(payload_from))
+                .ok_or_else(|| corrupt("offset"))?,
+            last_block_end.saturating_sub(payload_from),
+        )?)
+    } else {
+        None
+    };
+    let prefix = record::decode_prefix(head.bytes())
+        .ok_or_else(|| corrupt("record header did not verify"))?;
     let h = &prefix.header;
     if h.key != *key
         || h.volume != shared.volume
@@ -211,13 +260,18 @@ pub(crate) fn fragment<F: BlockFile>(
     {
         return Err(corrupt("record identity does not match the index"));
     }
-    let start =
-        usize::try_from(prefix_len.saturating_add(payload_from)).map_err(|_| corrupt("offset"))?;
-    let stop = usize::try_from(prefix_len.saturating_add(last_block_end))
-        .map_err(|_| corrupt("offset"))?;
-    let blocks = bytes
-        .get(start..stop)
-        .ok_or_else(|| corrupt("short record"))?;
+    let blocks = match &apart {
+        Some(span) => span.bytes(),
+        None => {
+            let start = usize::try_from(plan.prefix.saturating_add(payload_from))
+                .map_err(|_| corrupt("offset"))?;
+            let stop = usize::try_from(plan.prefix.saturating_add(last_block_end))
+                .map_err(|_| corrupt("offset"))?;
+            head.bytes()
+                .get(start..stop)
+                .ok_or_else(|| corrupt("short record"))?
+        }
+    };
     let first = u32::try_from(first_block).map_err(|_| corrupt("offset"))?;
     if !record::verify(&prefix, first, blocks) {
         return Err(corrupt("payload checksum mismatch"));
@@ -249,6 +303,7 @@ mod tests {
             depth: 2,
             waiting: 2,
             bytes: u64::MAX,
+            gap: 0,
         }));
         let first = gate.enter(1).unwrap();
         let second = gate.enter(1).unwrap();
@@ -290,6 +345,7 @@ mod tests {
             depth: 4,
             waiting: 4,
             bytes: 100,
+            gap: 0,
         }));
         let first = gate.enter(60).unwrap();
         let (admitted, order) = mpsc::channel();
@@ -345,6 +401,7 @@ mod tests {
             depth: 3,
             waiting: 5,
             bytes: 1_000,
+            gap: 0,
         });
         std::thread::scope(|s| {
             for t in 0..16u64 {

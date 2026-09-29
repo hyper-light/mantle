@@ -74,27 +74,33 @@ pub struct Reads {
     /// when no other read is at the device, as the writer's queue takes a payload larger than
     /// its bound, so the reads' buffers never exceed this or one read's (audit S07).
     pub bytes: u64,
+    /// Bytes of payload a read goes past rather than ask the device a second time: what the
+    /// device reads sequentially in the time one small random read takes
+    /// (`mantle_disk::calibrate::Calibration::read_gap`). A range that starts further into a
+    /// record's payload is read apart from the record's header and checksum table (audit P01).
+    pub gap: u64,
 }
 
 impl Reads {
-    /// The measured depth and bytes, with as many reads let wait: by Little's law each then
-    /// waits about as long as a read takes at that depth, beyond which another copy serves it
-    /// sooner.
-    pub fn measured(depth: usize, bytes: u64) -> Self {
+    /// The measured depth, bytes and gap, with as many reads let wait: by Little's law each
+    /// then waits about as long as a read takes at that depth, beyond which another copy
+    /// serves it sooner.
+    pub fn measured(depth: usize, bytes: u64, gap: u64) -> Self {
         let depth = depth.max(1);
         Self {
             depth,
             waiting: depth,
             bytes,
+            gap,
         }
     }
 }
 
 impl Default for Reads {
     /// A device not measured reads one at a time, each read alone: no device's depth of
-    /// greatest power is below one.
+    /// greatest power is below one. It reads no payload it was not asked for.
     fn default() -> Self {
-        Self::measured(1, 0)
+        Self::measured(1, 0, 0)
     }
 }
 

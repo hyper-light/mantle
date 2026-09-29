@@ -15,6 +15,7 @@ use std::borrow::Cow;
 use crate::acl::{Ownership, Permission};
 use crate::body::Versioning;
 use crate::checksum::{Algorithm, Checksum, ChecksumType};
+use crate::lifecycle::{And, Expiration, Filter, Rule, Scope};
 use crate::list::{Page, Request, Start, url_encode};
 use crate::tagging::Tag;
 use crate::time::iso8601;
@@ -615,6 +616,99 @@ pub fn ownership_controls() -> String {
             w.text("ObjectOwnership", Ownership::BucketOwnerEnforced.name())
         });
     })
+}
+
+/// GetBucketLifecycleConfiguration's `LifecycleConfiguration` (13 §6.9): each rule in the
+/// order set, with its ID, and its objects named as it named them, by a `Filter` or by the
+/// rule's own `Prefix`, as AWS's sample gives a rule-level `Prefix` back. A rule's elements
+/// are in the order S3 was recorded writing them, `ID`, `Filter` or `Prefix`, `Status`, then
+/// the actions, rather than its Response Syntax's. A `Date` is written as every time in a
+/// response is (13 §9.2).
+pub fn lifecycle_configuration(rules: &[Rule]) -> Result<String, TimeOutOfRange> {
+    let mut dates = Vec::new();
+    for rule in rules {
+        if let Some(Expiration::Date(day)) = rule.expiration {
+            let millis = day.checked_mul(86_400_000).ok_or(TimeOutOfRange(day))?;
+            dates.push(iso8601(millis).ok_or(TimeOutOfRange(day))?);
+        }
+    }
+    let mut dates = dates.iter();
+    Ok(Writer::document("LifecycleConfiguration", true, |w| {
+        for rule in rules {
+            w.element("Rule", |w| {
+                w.text("ID", &rule.id);
+                match &rule.scope {
+                    Scope::Filter(filter) => w.element("Filter", |w| lifecycle_filter(w, filter)),
+                    Scope::Prefix(prefix) => w.text("Prefix", prefix),
+                }
+                w.text("Status", if rule.enabled { "Enabled" } else { "Disabled" });
+                if let Some(expiration) = rule.expiration {
+                    w.element("Expiration", |w| match expiration {
+                        Expiration::Date(_) => {
+                            w.text("Date", dates.next().map_or("", String::as_str));
+                        }
+                        Expiration::Days(days) => w.text("Days", &days.to_string()),
+                        Expiration::Marker(marker) => {
+                            w.text(
+                                "ExpiredObjectDeleteMarker",
+                                if marker { "true" } else { "false" },
+                            );
+                        }
+                    });
+                }
+                if let Some(noncurrent) = rule.noncurrent {
+                    w.element("NoncurrentVersionExpiration", |w| {
+                        if let Some(newer) = noncurrent.newer {
+                            w.text("NewerNoncurrentVersions", &newer.to_string());
+                        }
+                        w.text("NoncurrentDays", &noncurrent.days.to_string());
+                    });
+                }
+                if let Some(days) = rule.abort {
+                    w.element("AbortIncompleteMultipartUpload", |w| {
+                        w.text("DaysAfterInitiation", &days.to_string());
+                    });
+                }
+            });
+        }
+    }))
+}
+
+/// A lifecycle rule's `Filter`, holding what it held when set.
+fn lifecycle_filter(w: &mut Writer, filter: &Filter) {
+    match filter {
+        Filter::All => {}
+        Filter::And(And {
+            prefix,
+            tags,
+            larger,
+            smaller,
+        }) => w.element("And", |w| {
+            if let Some(size) = larger {
+                w.text("ObjectSizeGreaterThan", &size.to_string());
+            }
+            if let Some(size) = smaller {
+                w.text("ObjectSizeLessThan", &size.to_string());
+            }
+            if let Some(prefix) = prefix {
+                w.text("Prefix", prefix);
+            }
+            for tag in tags {
+                lifecycle_tag(w, tag);
+            }
+        }),
+        Filter::Larger(size) => w.text("ObjectSizeGreaterThan", &size.to_string()),
+        Filter::Smaller(size) => w.text("ObjectSizeLessThan", &size.to_string()),
+        Filter::Prefix(prefix) => w.text("Prefix", prefix),
+        Filter::Tag(tag) => lifecycle_tag(w, tag),
+    }
+}
+
+fn lifecycle_tag(w: &mut Writer, tag: &Tag) {
+    w.element("Tag", |w| {
+        w.text("Key", &tag.key);
+        w.text("Value", &tag.value);
+    });
 }
 
 /// A listing's `Contents`.
@@ -1946,6 +2040,223 @@ mod tests {
             1..24,
         )
         .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    /// AWS's GetBucketLifecycleConfiguration sample, without the two transitions mantle does
+    /// not hold: the rule-level `Prefix` comes back as a `Prefix`, not a `Filter` (13 §6.9).
+    #[test]
+    fn lifecycle_configuration_holds_what_aws_samples_hold() {
+        let rule = Rule {
+            id: "Archive and then delete rule".into(),
+            scope: Scope::Prefix("projectdocs/".into()),
+            enabled: true,
+            expiration: Some(Expiration::Days(3650)),
+            noncurrent: None,
+            abort: None,
+        };
+        same(
+            &lifecycle_configuration(&[rule]).unwrap(),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+            <LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+               <Rule>
+                  <ID>Archive and then delete rule</ID>
+                  <Prefix>projectdocs/</Prefix>
+                  <Status>Enabled</Status>
+                  <Expiration>
+                     <Days>3650</Days>
+                  </Expiration>
+               </Rule>
+            </LifecycleConfiguration>"#,
+            Some(NAMESPACE),
+        );
+        // An empty filter comes back empty, as botocore reads `Filter: {}`, and a date as
+        // every time is written.
+        let dated = Rule {
+            id: "r".into(),
+            scope: Scope::Filter(Filter::All),
+            enabled: false,
+            expiration: Some(Expiration::Date(17_436)),
+            noncurrent: None,
+            abort: Some(7),
+        };
+        let doc = lifecycle_configuration(&[dated]).unwrap();
+        assert!(doc.contains("<Filter></Filter>"), "{doc}");
+        assert!(
+            doc.contains("<Date>2017-09-27T00:00:00.000Z</Date>"),
+            "{doc}"
+        );
+        assert_eq!(
+            lifecycle_configuration(&[Rule {
+                expiration: Some(Expiration::Date(i64::MAX / 86_400_000 + 1)),
+                ..lifecycle_rule()
+            }]),
+            Err(TimeOutOfRange(i64::MAX / 86_400_000 + 1))
+        );
+    }
+
+    fn lifecycle_rule() -> Rule {
+        Rule {
+            id: "r".into(),
+            scope: Scope::Prefix(String::new()),
+            enabled: true,
+            expiration: Some(Expiration::Days(1)),
+            noncurrent: None,
+            abort: None,
+        }
+    }
+
+    /// Text a request document can carry: any character but NUL, U+FFFE and U+FFFF, which
+    /// XML cannot hold even as a reference. A configuration's text comes from one.
+    fn document_text() -> impl Strategy<Value = String> {
+        key_strategy().prop_map(|text| {
+            text.chars()
+                .filter(|c| !matches!(c, '\u{FFFE}' | '\u{FFFF}'))
+                .collect()
+        })
+    }
+
+    /// Tags whose keys differ.
+    fn filter_tags(most: usize) -> impl Strategy<Value = Vec<Tag>> {
+        prop::collection::btree_map("[a-zA-Z0-9 _.:/=+@-]{1,6}", document_text(), 0..=most)
+            .prop_map(|tags| {
+                tags.into_iter()
+                    .map(|(key, value)| Tag { key, value })
+                    .collect()
+            })
+    }
+
+    /// Sizes S3 admits in a filter: from `least` to 1000 × 2^40 bytes (13 §6.9).
+    fn size_strategy(least: u64) -> impl Strategy<Value = u64> {
+        least..=crate::lifecycle::MAX_FILTER_SIZE
+    }
+
+    fn filter_strategy() -> impl Strategy<Value = Filter> {
+        let and = (
+            prop::option::of(document_text()),
+            filter_tags(3),
+            prop::option::of(0..crate::lifecycle::MAX_FILTER_SIZE / 2),
+            prop::option::of(size_strategy(crate::lifecycle::MAX_FILTER_SIZE / 2)),
+        )
+            .prop_filter_map(
+                "an And holds two or more predicates",
+                |(prefix, tags, larger, smaller)| {
+                    let count = tags.len()
+                        + usize::from(prefix.is_some())
+                        + usize::from(larger.is_some())
+                        + usize::from(smaller.is_some());
+                    if count >= 2 {
+                        Some(Filter::And(And {
+                            prefix,
+                            tags,
+                            larger,
+                            smaller,
+                        }))
+                    } else {
+                        None
+                    }
+                },
+            );
+        prop_oneof![
+            Just(Filter::All),
+            document_text().prop_map(Filter::Prefix),
+            filter_tags(1)
+                .prop_filter_map("one tag", |mut tags| tags.pop())
+                .prop_map(Filter::Tag),
+            size_strategy(0).prop_map(Filter::Larger),
+            size_strategy(1).prop_map(Filter::Smaller),
+            and,
+        ]
+    }
+
+    /// The actions of a valid rule over `scope`: S3 admits no marker or abort beside a tag or
+    /// size predicate, and `NewerNoncurrentVersions` only in Lifecycle V2.
+    fn rule_strategy(scope: impl Strategy<Value = Scope>) -> impl Strategy<Value = Rule> {
+        let expiration = prop::option::of(prop_oneof![
+            (1..=u32::try_from(i32::MAX).unwrap()).prop_map(Expiration::Days),
+            (0..=2_932_896i64).prop_map(Expiration::Date),
+            any::<bool>().prop_map(Expiration::Marker),
+        ]);
+        let noncurrent = prop::option::of((1..=1000u32, prop::option::of(1..=1000u32)));
+        (
+            document_text(),
+            scope,
+            any::<bool>(),
+            expiration,
+            noncurrent,
+            prop::option::of(1..=1000u32),
+        )
+            .prop_filter_map(
+                "a rule S3 accepts",
+                |(id, scope, enabled, expiration, noncurrent, abort)| {
+                    let narrowed = match &scope {
+                        Scope::Filter(Filter::Tag(_) | Filter::Larger(_) | Filter::Smaller(_)) => {
+                            true
+                        }
+                        Scope::Filter(Filter::And(and)) => {
+                            !and.tags.is_empty() || and.larger.is_some() || and.smaller.is_some()
+                        }
+                        _ => false,
+                    };
+                    let noncurrent = noncurrent.map(|(days, newer)| crate::lifecycle::Noncurrent {
+                        days,
+                        newer: newer.filter(|_| matches!(scope, Scope::Filter(_))),
+                    });
+                    let abort = abort.filter(|_| !narrowed);
+                    let expiration =
+                        expiration.filter(|e| !(narrowed && matches!(e, Expiration::Marker(_))));
+                    let acts = expiration.is_some() || noncurrent.is_some() || abort.is_some();
+                    let id = id
+                        .chars()
+                        .take(crate::lifecycle::MAX_ID / 2)
+                        .collect::<String>();
+                    if acts && !id.is_empty() {
+                        Some(Rule {
+                            id,
+                            scope,
+                            enabled,
+                            expiration,
+                            noncurrent,
+                            abort,
+                        })
+                    } else {
+                        None
+                    }
+                },
+            )
+    }
+
+    /// A configuration in one form: every rule with a `Filter`, or every rule with its own
+    /// `Prefix`, the prefixes led by each rule's position so that none begins another.
+    fn configuration_strategy() -> impl Strategy<Value = Vec<Rule>> {
+        let v2 = prop::collection::vec(
+            rule_strategy(filter_strategy().prop_map(Scope::Filter)),
+            1..6,
+        );
+        let v1 =
+            prop::collection::vec(rule_strategy(document_text().prop_map(Scope::Prefix)), 1..6)
+                .prop_map(|mut rules| {
+                    for (i, rule) in rules.iter_mut().enumerate() {
+                        if let Scope::Prefix(prefix) = &mut rule.scope {
+                            *prefix = format!("{i}/{prefix}");
+                        }
+                    }
+                    rules
+                });
+        prop_oneof![v2, v1]
+    }
+
+    proptest! {
+        /// Every configuration mantle accepts reads back from the document it writes exactly,
+        /// as the rules were set.
+        #[test]
+        fn lifecycle_configurations_read_back(rules in configuration_strategy()) {
+            let mut rules = rules;
+            for (i, rule) in rules.iter_mut().enumerate() {
+                rule.id = format!("{i}{}", rule.id);
+            }
+            let doc = lifecycle_configuration(&rules).unwrap();
+            prop_assert_eq!(crate::body::lifecycle(doc.as_bytes()), Ok(rules));
+        }
     }
 
     proptest! {

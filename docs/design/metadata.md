@@ -255,3 +255,7 @@ cover the production engine, which the simulator cannot.
 - The grace period of lazy deletion, which is a recovery-point policy.
 - The bound on a cached bucket row's staleness, and how a versioning change reaches
   gateways within it.
+- Where a bucket's lifecycle and tag configurations live. A lifecycle configuration at its
+  largest, 1,000 rules with the longest IDs, prefixes and tags, is about 13 MB unescaped
+  (docs/design/s3-protocol.md §7). That is too large for the bucket's row, which every
+  request to the bucket reads, and larger than one entry should be.

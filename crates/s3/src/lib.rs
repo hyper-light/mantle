@@ -19,6 +19,7 @@ pub mod checksum;
 pub mod chunked;
 pub mod conditional;
 pub mod crypto;
+pub mod lifecycle;
 pub mod list;
 pub mod range;
 pub mod response;

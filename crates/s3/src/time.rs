@@ -90,6 +90,101 @@ pub fn iso8601(millis: i64) -> Option<String> {
     ))
 }
 
+/// An XML Schema `dateTime` with its time zone, as a lifecycle rule's `Date` carries one:
+/// `2017-09-27T00:00:00Z` as botocore writes it, `2017-09-27T00:00:00.000Z`, or
+/// `2017-09-27T02:00:00+02:00` (XML Schema Part 2 §3.2.7; 13 §6.9). The result is Unix
+/// seconds and nanoseconds.
+///
+/// It is `None` in three cases:
+/// - a time without a zone, which names no instant (§3.2.7.3);
+/// - a year outside 0000–9999, as written or in UTC, which S3's formats cannot write back;
+/// - a fraction finer than a nanosecond.
+pub fn parse_iso8601(text: &str) -> Option<(i64, u32)> {
+    let (date, time) = text.split_once('T')?;
+    let mut ymd = date.split('-');
+    let (year, month, day) = (ymd.next()?, ymd.next()?, ymd.next()?);
+    let (clock, offset) = match time.strip_suffix('Z') {
+        Some(clock) => (clock, 0),
+        None => {
+            let sign = time.rfind(['+', '-'])?;
+            (time.get(..sign)?, zone(time.get(sign..)?)?)
+        }
+    };
+    let (hms, fraction) = clock.split_once('.').unwrap_or((clock, ""));
+    let mut parts = hms.split(':');
+    let (hour, minute, second) = (parts.next()?, parts.next()?, parts.next()?);
+    let widths = [
+        (year, 4),
+        (month, 2),
+        (day, 2),
+        (hour, 2),
+        (minute, 2),
+        (second, 2),
+    ];
+    if ymd.next().is_some()
+        || parts.next().is_some()
+        || widths.iter().any(|(field, width)| field.len() != *width)
+        || (clock.contains('.') && fraction.is_empty())
+    {
+        return None;
+    }
+    let nanos = nanoseconds(fraction)?;
+    let local = unix(
+        number(year)?,
+        number(month)?,
+        number(day)?,
+        number(hour)?,
+        number(minute)?,
+        number(second)?,
+    )?;
+    let utc = local.checked_sub(offset)?;
+    civil(utc.checked_div_euclid(SECONDS_PER_DAY)?)?;
+    Some((utc, nanos))
+}
+
+/// A zone offset, `+hh:mm` or `-hh:mm` within ±14:00, as seconds east of UTC (XML Schema
+/// Part 2 §3.2.7.3).
+fn zone(text: &str) -> Option<i64> {
+    let (sign, rest) = match text.as_bytes().first()? {
+        b'+' => (1, text.get(1..)?),
+        b'-' => (-1, text.get(1..)?),
+        _ => return None,
+    };
+    let (hours, minutes) = rest.split_once(':')?;
+    if hours.len() != 2 || minutes.len() != 2 {
+        return None;
+    }
+    let (hours, minutes) = (number(hours)?, number(minutes)?);
+    if minutes > 59 || hours > 14 || (hours == 14 && minutes > 0) {
+        return None;
+    }
+    hours
+        .checked_mul(3600)?
+        .checked_add(minutes.checked_mul(60)?)?
+        .checked_mul(sign)
+}
+
+/// A second's decimal fraction as nanoseconds: digits past the ninth must be zero, since a
+/// finer time than a nanosecond is not held.
+fn nanoseconds(fraction: &str) -> Option<u32> {
+    if !fraction.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (head, tail) = fraction.split_at_checked(fraction.len().min(9))?;
+    if tail.bytes().any(|b| b != b'0') {
+        return None;
+    }
+    let mut nanos: u32 = 0;
+    for position in 0..9 {
+        let digit = head
+            .as_bytes()
+            .get(position)
+            .map_or(0, |b| b.wrapping_sub(b'0'));
+        nanos = nanos.checked_mul(10)?.checked_add(u32::from(digit))?;
+    }
+    Some(nanos)
+}
+
 /// Digits alone as a number: no sign, no space.
 fn number(text: &str) -> Option<i64> {
     if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
@@ -236,6 +331,43 @@ mod tests {
         assert_eq!(iso8601(-1).as_deref(), Some("1969-12-31T23:59:59.999Z"));
         assert_eq!(iso8601(i64::MAX), None);
         assert_eq!(http_date(i64::MIN), None);
+    }
+
+    /// botocore writes `2017-09-27` as `2017-09-27T00:00:00Z` (13 §6.9); other SDKs write
+    /// milliseconds or an offset.
+    #[test]
+    fn iso8601_times_parse_with_their_zone() {
+        let midnight = Some((1_506_470_400, 0));
+        assert_eq!(parse_iso8601("2017-09-27T00:00:00Z"), midnight);
+        assert_eq!(parse_iso8601("2017-09-27T00:00:00.000Z"), midnight);
+        assert_eq!(parse_iso8601("2017-09-27T00:00:00.0000000000Z"), midnight);
+        assert_eq!(parse_iso8601("2017-09-27T02:00:00+02:00"), midnight);
+        assert_eq!(parse_iso8601("2017-09-26T19:30:00-04:30"), midnight);
+        assert_eq!(
+            parse_iso8601("2017-09-27T00:00:00.5Z"),
+            Some((1_506_470_400, 500_000_000))
+        );
+        assert_eq!(parse_iso8601("1970-08-22T19:08:21Z"), Some((20_200_101, 0)));
+        for refused in [
+            "2017-09-27",
+            "2017-09-27T00:00:00",
+            "2017-09-27T00:00Z",
+            "2017-09-27T00:00:00.Z",
+            "2017-09-27T00:00:00.0000000001Z",
+            "2017-09-27T00:00:00+15:00",
+            "2017-09-27T00:00:00+14:30",
+            "2017-09-27T00:00:00+0200",
+            "2017-9-27T00:00:00Z",
+            "12017-09-27T00:00:00Z",
+            "2017-09-27T24:00:00Z",
+            "2017-02-30T00:00:00Z",
+            "2017-09-27t00:00:00z",
+            " 2017-09-27T00:00:00Z",
+            "9999-12-31T23:00:00-01:00",
+            "0000-01-01T00:00:00+00:01",
+        ] {
+            assert_eq!(parse_iso8601(refused), None, "{refused}");
+        }
     }
 
     /// Every day from 0000-01-01 to 9999-12-31 converts both ways.

@@ -38,6 +38,9 @@ pub enum Operation {
     GetBucketOwnershipControls,
     PutBucketOwnershipControls,
     DeleteBucketOwnershipControls,
+    GetBucketLifecycleConfiguration,
+    PutBucketLifecycleConfiguration,
+    DeleteBucketLifecycle,
     ListObjects,
     ListObjectsV2,
     ListObjectVersions,
@@ -100,14 +103,13 @@ pub const MAX_KEY: usize = 1024;
 
 /// Bucket subresources S3 defines that mantle does not serve: answered `501 NotImplemented`
 /// rather than taken for another operation.
-const UNSUPPORTED: [&str; 20] = [
+const UNSUPPORTED: [&str; 19] = [
     "accelerate",
     "analytics",
     "cors",
     "encryption",
     "intelligent-tiering",
     "inventory",
-    "lifecycle",
     "logging",
     "metrics",
     "notification",
@@ -176,9 +178,10 @@ fn subresource(
     )
 }
 
-fn bucket_operation(method: &str, q: &Query) -> Result<Operation, RouteError> {
+/// The subresources of a bucket.
+const BUCKET_SUBRESOURCES: [Subresource; 9] = {
     use Operation as O;
-    const SUBRESOURCES: [Subresource; 8] = [
+    [
         ("location", &[("GET", O::GetBucketLocation)]),
         (
             "versioning",
@@ -204,26 +207,24 @@ fn bucket_operation(method: &str, q: &Query) -> Result<Operation, RouteError> {
                 ("DELETE", O::DeleteBucketOwnershipControls),
             ],
         ),
+        (
+            "lifecycle",
+            &[
+                ("GET", O::GetBucketLifecycleConfiguration),
+                ("PUT", O::PutBucketLifecycleConfiguration),
+                ("DELETE", O::DeleteBucketLifecycle),
+            ],
+        ),
         ("versions", &[("GET", O::ListObjectVersions)]),
         ("uploads", &[("GET", O::ListMultipartUploads)]),
         ("delete", &[("POST", O::DeleteObjects)]),
-    ];
-    if let Some(operation) = subresource(&SUBRESOURCES, method, q) {
-        return operation;
-    }
-    match method {
-        "GET" if q.value("list-type") == Some("2") => Ok(O::ListObjectsV2),
-        "GET" => Ok(O::ListObjects),
-        "PUT" => Ok(O::CreateBucket),
-        "DELETE" => Ok(O::DeleteBucket),
-        "HEAD" => Ok(O::HeadBucket),
-        _ => Err(RouteError::MethodNotAllowed),
-    }
-}
+    ]
+};
 
-fn object_operation(method: &str, q: &Query, copy: bool) -> Result<Operation, RouteError> {
+/// The subresources of an object.
+const OBJECT_SUBRESOURCES: [Subresource; 5] = {
     use Operation as O;
-    const SUBRESOURCES: [Subresource; 5] = [
+    [
         (
             "tagging",
             &[
@@ -244,13 +245,47 @@ fn object_operation(method: &str, q: &Query, copy: bool) -> Result<Operation, Ro
                 ("DELETE", O::AbortMultipartUpload),
             ],
         ),
-    ];
-    match subresource(&SUBRESOURCES, method, q) {
+    ]
+};
+
+/// Whether the query carries a subresource of `others` but none of `own`: one S3 defines on
+/// the other kind of resource. Such a request is refused, never taken for the bucket's or the
+/// object's own operation: `PUT /bucket/key?lifecycle` writes no object, and
+/// `DELETE /bucket?uploadId=u` deletes no bucket.
+fn misdirected(own: &[Subresource], others: &[Subresource], q: &Query) -> bool {
+    let carries = |list: &[Subresource]| list.iter().any(|(name, _)| q.has(name));
+    carries(others) && !carries(own)
+}
+
+fn bucket_operation(method: &str, q: &Query) -> Result<Operation, RouteError> {
+    use Operation as O;
+    if let Some(operation) = subresource(&BUCKET_SUBRESOURCES, method, q) {
+        return operation;
+    }
+    if misdirected(&BUCKET_SUBRESOURCES, &OBJECT_SUBRESOURCES, q) {
+        return Err(RouteError::MethodNotAllowed);
+    }
+    match method {
+        "GET" if q.value("list-type") == Some("2") => Ok(O::ListObjectsV2),
+        "GET" => Ok(O::ListObjects),
+        "PUT" => Ok(O::CreateBucket),
+        "DELETE" => Ok(O::DeleteBucket),
+        "HEAD" => Ok(O::HeadBucket),
+        _ => Err(RouteError::MethodNotAllowed),
+    }
+}
+
+fn object_operation(method: &str, q: &Query, copy: bool) -> Result<Operation, RouteError> {
+    use Operation as O;
+    match subresource(&OBJECT_SUBRESOURCES, method, q) {
         // A part is named by its number; a PUT to an upload without one names nothing, and
         // is never taken for a PutObject that would replace the object with the part.
         Some(Ok(O::UploadPart)) if !q.has("partNumber") => Err(RouteError::MethodNotAllowed),
         Some(Ok(O::UploadPart)) if copy => Ok(O::UploadPartCopy),
         Some(operation) => operation,
+        None if misdirected(&OBJECT_SUBRESOURCES, &BUCKET_SUBRESOURCES, q) => {
+            Err(RouteError::MethodNotAllowed)
+        }
         None => match method {
             "PUT" if copy => Ok(O::CopyObject),
             "PUT" => Ok(O::PutObject),
@@ -525,6 +560,39 @@ mod tests {
         refused("PUT", "/b/k", "uploadId=u");
         refused("POST", "/b/k", "tagging");
         refused("HEAD", "/b", "acl");
+        refused("POST", "/b", "lifecycle");
+        // A subresource S3 defines only on the other kind of resource.
+        for query in [
+            "lifecycle",
+            "versioning",
+            "location",
+            "ownershipControls",
+            "versions",
+            "delete",
+        ] {
+            for method in ["GET", "PUT", "DELETE", "HEAD"] {
+                refused(method, "/b/k", query);
+            }
+        }
+        for query in ["uploadId=u", "attributes", "uploadId=u&partNumber=1"] {
+            for method in ["GET", "PUT", "DELETE", "HEAD"] {
+                refused(method, "/b", query);
+            }
+        }
+    }
+
+    #[test]
+    fn lifecycle_is_a_bucket_subresource() {
+        use Operation as O;
+        assert_eq!(
+            op("GET", "/b", "lifecycle"),
+            O::GetBucketLifecycleConfiguration
+        );
+        assert_eq!(
+            op("PUT", "/b", "lifecycle="),
+            O::PutBucketLifecycleConfiguration
+        );
+        assert_eq!(op("DELETE", "/b", "lifecycle"), O::DeleteBucketLifecycle);
     }
 
     #[test]

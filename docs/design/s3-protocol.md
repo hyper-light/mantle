@@ -22,7 +22,8 @@ restating S3.
 | `xml`, `body` | the XML reader and writer, and request documents read against their schemas | 13; roxmltree as an oracle |
 | `tagging` | tag sets: S3's limits and characters, and the `x-amz-tagging` header | 13 §6.7, s3-tests, S3's observed answers |
 | `acl` | canned and header ACLs, Object Ownership, and whether a request's ACL goes ahead with ACLs disabled | 13 §6.8, s3-tests |
-| `response` | the documents responses carry: listings, multipart and copy results, batch deletes, errors, bucket settings, tags, ACLs | 27 of AWS's sample responses, s3-tests |
+| `lifecycle` | lifecycle rules checked, when each action falls due, and the expiration and abort headers | 13 §6.9, the user guide's worked examples, s3-tests |
+| `response` | the documents responses carry: listings, multipart and copy results, batch deletes, errors, bucket settings, tags, ACLs, lifecycle rules | 28 of AWS's sample responses, s3-tests |
 
 ## 2. XML bodies
 
@@ -296,5 +297,80 @@ the bucket's or the object's own operation (`crates/s3/src/route.rs`). Routing o
 first would take `DELETE /bucket?versioning` for DeleteBucket and `PUT /bucket/key?attributes`
 for PutObject, so a client's mistake would delete a bucket or replace an object. A PUT to an
 upload without `partNumber` is refused the same way rather than written as the object.
-Subresources S3 defines and mantle does not serve are `501 NotImplemented` whatever the
-method.
+So is a subresource S3 defines only on buckets sent with a key, and one defined only on
+objects sent to a bucket: `PUT /bucket/key?lifecycle` writes no object, and
+`DELETE /bucket?uploadId=u` deletes no bucket. Subresources S3 defines and mantle does not
+serve are `501 NotImplemented` whatever the method.
+
+## 7. Lifecycle configuration
+
+**Decision: a bucket's lifecycle rules are checked as S3 checks them, and mantle takes S3's
+expiration actions: of current versions, of noncurrent versions, of delete markers left
+alone, and of incomplete multipart uploads** (`crates/s3/src/lifecycle.rs`; 13 §6.9).
+
+- **Transitions are refused.** mantle stores every object in one class, so a rule with a
+  `Transition` or `NoncurrentVersionTransition` is `501 NotImplemented`. The configuration is
+  checked first, so one S3 would refuse is answered as S3 answers it, as s3-tests expects of a
+  transition dated at no midnight. The checks S3 was recorded making of transitions are made:
+  a class it defines, 30 days before `STANDARD_IA` or `ONEZONE_IA`, no class twice, no dates
+  beside day counts. The order S3 requires between classes is not, since no transition is
+  taken. Accepting a transition and never making it would give back a configuration that does
+  not describe the bucket.
+- **Two forms, as S3 has them.** A configuration whose first rule has a `Filter` is what S3
+  calls Lifecycle V2; one whose first rule has its own `Prefix` is the form before it. S3
+  refuses the other form beside the first, and in the older form refuses
+  `NewerNoncurrentVersions` and two rules whose prefixes overlap taking the same kind of
+  action, each with the message it was recorded answering. Overlap is found by sorting each
+  kind's prefixes and comparing neighbours: a prefix that begins another begins the one after
+  it.
+- **A rule comes back as it was written.** A rule-level `Prefix` stays one and a `Filter`
+  stays a `Filter`, as AWS's sample and s3-tests expect. A rule's elements are written in the
+  order S3 was recorded writing them, `ID`, `Filter` or `Prefix`, `Status`, then its actions.
+  The PUT's `x-amz-transition-default-minimum-object-size` is kept and answered on the GET,
+  and when none was sent both answer `all_storage_classes_128K`, as S3 does.
+- **IDs.** A rule given no ID, or an empty one, is named `rule-N` with the lowest N no rule was
+  given, so the same document names its rules the same way each time it is put. S3 names such
+  a rule with a random UUID in base64; no client can rely on its form, and s3-tests asks only
+  that an ID be there. An ID holds at most 255 UTF-16 code units, counted as S3 counts a tag's
+  characters.
+- **Filters.** A `Filter` holds nothing, which applies to every object, or exactly one
+  predicate; `And` holds two or more, an empty `Prefix` counting as one. Sizes exclude their
+  bounds, and lie from 0, or 1 for `ObjectSizeLessThan`, to 1000 × 2^40 bytes, the range S3
+  answered; the documented 50 TB is not what S3 enforces. A tag in a filter may leave out its
+  `Value`, which then matches only a tag with no value, as the user guide says. No
+  `ExpiredObjectDeleteMarker` or abort sits beside a tag or size predicate, as S3 refuses.
+- **Limits.** 1,000 rules. A filter names at most 10 tags, and a prefix at most 1,024 bytes:
+  an object holds at most 10 tags and a key at most 1,024 bytes, so a filter past either
+  matches nothing, and S3 documents no limit of its own. `NewerNoncurrentVersions` is at least
+  1 with no maximum: S3 accepted 500 against the documented 100. The body limit follows from
+  these, as for the other documents (§2): about 165 MB, most of it 10,000 tags at their
+  longest.
+- **Due times.** An action falls due its days after the version was created, or after its
+  successor was, rounded up to midnight UTC; a time already at midnight is its own ceiling,
+  since no source says otherwise. Of the rules that apply, the one due first wins, and the
+  first given on a tie, as S3 answered for rules of equal days: "the shorter expiration policy
+  is honored". A `Date` rule is due on its date for every object it applies to.
+- **What each action does.** An expiration applies only to a current version that is not a
+  delete marker, and deletes it as DeleteObject without a version ID would in the bucket's
+  versioning state. `NewerNoncurrentVersions` N keeps the N newest noncurrent versions, delete
+  markers among them, whatever their age, as the API reference and s3-tests read it; the user
+  guide's examples page, which would keep N+1, disagrees with both. A delete marker with no
+  version beneath it is removed at once under `ExpiredObjectDeleteMarker`, and under an
+  expiration of `Days` once it is that old. A delete marker has no tags and size 0, as the
+  user guide's rule for noncurrent delete markers treats it. An upload is aborted by prefix.
+- **Headers.** `x-amz-expiration` is `expiry-date="<HTTP-date>", rule-id="<ID>"`, and
+  `x-amz-abort-date` an HTTP-date, as recorded. The ID goes as it is, as S3 was recorded
+  sending IDs with spaces, although the documentation calls it URL-encoded. An ID may hold
+  any character a document can carry, among them a line break or a quote, which a header
+  cannot; such an ID is percent-encoded whole, as documented. Neither header is written for a
+  date past 9999-12-31, which an HTTP-date cannot hold, and the gateway writes the expiration
+  only for the current version asked for without a version ID, as S3 does.
+- **Dates.** A `Date` is an XML Schema `dateTime` with its zone, which must name midnight UTC
+  in a year from 0000 to 9999. A time without a zone names no instant and is refused.
+- **Errors.** Each fault answers the code S3 was recorded answering, where one was recorded;
+  otherwise the code of the recorded fault nearest it, an argument out of range
+  `InvalidArgument`, and a combination S3 refuses `InvalidRequest`. For no rules and for more
+  than 1,000, S3's error table and its recorded answers differ; mantle answers the table's
+  `InvalidRequest`, which is current, where the recordings are from 2016 and 2017.
+- **Storage** of a configuration is the metadata layer's, and open (metadata.md §6): at its
+  largest it is about 13 MB unescaped.

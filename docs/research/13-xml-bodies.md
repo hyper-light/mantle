@@ -1,20 +1,22 @@
 # 13 — XML bodies: ground truth for reading S3's request documents and writing its responses
 
 Research note for mantle's S3 protocol layer (`crates/s3/src/xml.rs`, `body.rs`,
-`tagging.rs`, `acl.rs`). It covers:
+`tagging.rs`, `acl.rs`, `lifecycle.rs`). It covers:
 
 - what XML 1.0 and Namespaces in XML require of a reader and a writer;
 - the security record of XML's entity mechanism;
 - the documents S3's requests carry, their limits, and how S3 writes keys XML cannot carry;
 - tags, ACLs and Object Ownership, in documents and in headers;
+- bucket lifecycle configuration: its document, when its actions fall due, and its headers;
 - the Rust parser evaluated for the job;
 - the documents S3's responses carry, as the API reference and its samples show them.
 
 Compiled 2026-09-28 from the W3C recommendations, RFC 7303, the AWS S3 API reference and user
 guide as served that day, and the roxmltree 0.21.1 source. §6.7, §6.8 and §9.6 were compiled
 2026-09-29 from the API reference, user guide and other AWS pages as served that day, with
-observed S3 behaviour from public issue trackers, each labelled as such. This is research
-input; the decision records are docs/design/s3-protocol.md §2, §4 and §5.
+observed S3 behaviour from public issue trackers, each labelled as such; §6.9 the same day,
+with botocore's serializer run offline. This is research input; the decision records are
+docs/design/s3-protocol.md §2, §4, §5 and §7.
 
 ---
 
@@ -436,6 +438,336 @@ take all but `x-amz-grant-write`. s3-tests sends the values bare, `id=<uid>`
 - CreateBucket takes the setting as `x-amz-object-ownership`, with the same three values
   ([API_CreateBucket]).
 
+### 6.9 Lifecycle configuration
+
+Sources: the API reference and user guide pages below, as served 2026-09-29; botocore's
+model and serializer at 358f8ee (release 1.43.104), run offline; ceph s3-tests at 5522d1c;
+and S3's answers as others recorded them, under "Observed answers".
+
+**The operations** ([API_PutBucketLifecycleConfiguration],
+[API_GetBucketLifecycleConfiguration], [API_DeleteBucketLifecycle]).
+
+- PutBucketLifecycleConfiguration, `PUT /?lifecycle`: "Creates a new lifecycle configuration
+  for the bucket or replaces an existing lifecycle configuration." It answers 200 with an
+  empty body.
+- GetBucketLifecycleConfiguration, `GET /?lifecycle`, answers the same document. Its special
+  error is `NoSuchLifecycleConfiguration`, "The lifecycle configuration does not exist", 404.
+- DeleteBucketLifecycle, `DELETE /?lifecycle`: "Amazon S3 removes all the lifecycle
+  configuration rules in the lifecycle subresource associated with the bucket." It answers
+  204. The page does not say what happens when there is no configuration.
+- The deprecated PutBucketLifecycle and GetBucketLifecycle use the same method and URI
+  ([API_PutBucketLifecycle], [API_GetBucketLifecycle]). Their `Rule` type requires a
+  rule-level `Prefix` and has no `Filter`, so a server can tell them apart only by the body.
+  "Previous configurations where a prefix is defined will continue to operate as before"
+  ([API_LifecycleRule]).
+- botocore marks both PUTs `requestChecksumRequired`. It sends
+  `x-amz-sdk-checksum-algorithm: CRC32` and `x-amz-checksum-crc32` by default, never
+  Content-MD5. It writes no XML declaration, and the root
+  `<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`. A rule's
+  children follow the caller's dict order, not the model's. `Filter: {}` becomes `<Filter />`.
+  Its client-side validation checks `required` and `min`, but not enumerations or maxima.
+
+**The document** ([API_LifecycleRule], [API_LifecycleRuleFilter],
+[API_LifecycleRuleAndOperator], [API_LifecycleExpiration],
+[API_NoncurrentVersionExpiration], [API_AbortIncompleteMultipartUpload], [API_Transition],
+[API_NoncurrentVersionTransition]; botocore's shapes).
+
+- `LifecycleConfiguration` holds `Rule` elements, flattened. A rule holds:
+  - `ID`: "The value cannot be longer than 255 characters."
+  - `Status`, required: `Enabled | Disabled`.
+  - `Filter`, or the deprecated rule-level `Prefix`: "`Filter` is required if the
+    `LifecycleRule` does not contain a `Prefix` element."
+  - the actions: `Expiration`, `Transition` (repeated), `NoncurrentVersionTransition`
+    (repeated), `NoncurrentVersionExpiration`, `AbortIncompleteMultipartUpload`.
+- `Filter`: "A `Filter` must have exactly one of `Prefix`, `Tag`, `ObjectSizeGreaterThan`,
+  `ObjectSizeLessThan`, or `And` specified" (LifecycleRule). "If the `Filter` element is left
+  empty, the Lifecycle Rule applies to all objects in the bucket" (LifecycleRuleFilter).
+- `And`: "used in a Lifecycle Rule Filter to apply a logical AND to two or more predicates.
+  The Lifecycle Rule will apply to any object matching all of the predicates configured
+  inside the And operator." It holds `Prefix`, `ObjectSizeGreaterThan`, `ObjectSizeLessThan`
+  and `Tag` elements, flattened.
+- Types: `Days`, `NoncurrentDays`, `DaysAfterInitiation` and `NewerNoncurrentVersions` are
+  integers; the sizes are longs; `Date` is an ISO 8601 timestamp;
+  `ExpiredObjectDeleteMarker` is a boolean. botocore writes a date as `%Y-%m-%dT%H:%M:%SZ`,
+  so `'2017-09-27'` goes out as `2017-09-27T00:00:00Z`, and `'20200101'`, read as epoch
+  seconds, as `1970-08-22T19:08:21Z`.
+- `Expiration`:
+  - `Date`: "The date value must conform to the ISO 8601 format. The time is always midnight
+    UTC."
+  - `Days`: "The value must be a non-zero positive integer."
+  - `ExpiredObjectDeleteMarker`: "If set to true, the delete marker will be expired; if set
+    to false the policy takes no action. This cannot be specified with Days or Date in a
+    Lifecycle Expiration Policy."
+- `NoncurrentVersionExpiration`: `NoncurrentDays`, "a non-zero positive integer", and
+  `NewerNoncurrentVersions`: "You can specify up to 100 noncurrent versions to retain."
+- `Transition`'s `Days` "can be `0` or any positive integer". `NoncurrentVersionTransition`'s
+  `NoncurrentDays` has no non-zero clause. `StorageClass` is one of `GLACIER`,
+  `STANDARD_IA`, `ONEZONE_IA`, `INTELLIGENT_TIERING`, `DEEP_ARCHIVE` or `GLACIER_IR`.
+- `Tag`: `Key`, "Minimum length of 1", and `Value`, both "Required: Yes" ([API_Tag]).
+- `x-amz-transition-default-minimum-object-size`, a request header of the PUT and a response
+  header of the PUT and GET, is `varies_by_storage_class | all_storage_classes_128K`.
+  "Configurations created before September 2024 retain the previous transition behavior
+  unless you modify them" ([lifecycle-transition-general-considerations]). Under the newer
+  default, "objects smaller than 128 KB will not be transitioned to any storage class"
+  ([intro-lifecycle-filters]).
+
+**Limits** ([intro-lifecycle-rules]; [intro-lifecycle-filters]).
+
+- "An S3 Lifecycle configuration can have up to 1,000 rules per bucket. This limit is not
+  adjustable. ... ID length is limited to 255 characters."
+- `NewerNoncurrentVersions`: "(between 1 and 100)".
+- Sizes: "Maximum filter size is 50 TB." The console requires "larger than 0 bytes and up to
+  50 TB".
+- No page gives a longest prefix, a most tags in a filter, or a largest document.
+
+**Filters** ([intro-lifecycle-rules]; [intro-lifecycle-filters]).
+
+- "Each tag must match _both_ the key and value exactly. If you specify only a `<Key>`
+  element and no `<Value>` element, the rule will apply only to objects that match the tag
+  key and that do _not_ have a value specified."
+- "The rule applies to a subset of objects that has all the tags specified in the rule. If
+  an object has additional tags specified, the rule will still apply."
+- "When you specify multiple tags in a filter, each tag key must be unique."
+- "A filter can have only one prefix, and zero or more tags." "You can specify an **empty
+  filter**, in which case the rule applies to all objects in the bucket."
+- "The `ObjectSizeGreaterThan` and `ObjectSizeLessThan` filters exclude the specified
+  values. For example, if you set objects sized 128 KB to 1024 KB ... objects that are
+  exactly 1024 KB and 128 KB won't transition". "If you're specifying an object size range,
+  the `ObjectSizeGreaterThan` integer must be less than the `ObjectSizeLessThan` value."
+- "S3 Lifecycle doesn't support excluding prefixes in your rules", nor "including multiple
+  prefixes".
+
+**When an action falls due** ([intro-lifecycle-rules]; [troubleshoot-lifecycle]).
+
+- By age: "Amazon S3 calculates the time by adding the number of days specified in the rule
+  to the object creation time and rounding up the resulting time to the next day at midnight
+  UTC. For example, if an object was created on 1/15/2014 at 10:30 AM UTC and you specify 3
+  days in a transition rule, then the transition date of the object would be calculated as
+  1/19/2014 00:00 UTC." The creation date "is synonymous with the **Last modified** date".
+- Noncurrent versions: the days count from "the time when the new successor version of the
+  object is created", with the same rounding. The worked example deletes `photo.gif`,
+  deleted on 1/2/2014 at 11:30 AM UTC, "On 1/8/2014 at 00:00 UTC ... five days after it
+  became a noncurrent version."
+- The troubleshooting page: an object created at 00:05 UTC on January 2 "becomes one day old
+  at 00:05 UTC on January 3, which makes it eligible for expiration when S3 Lifecycle
+  evaluates objects at 00:00 UTC on January 4."
+- By date: "If you specify an S3 Lifecycle action with a date that is in the past, all
+  qualified objects become immediately eligible for that lifecycle action. ... The date-based
+  action is not a one-time action. Amazon S3 continues to apply the date-based action even
+  after the date has passed, as long as the rule status is `Enabled`."
+- No page says how a time already at midnight rounds.
+
+**What each action does** ([lifecycle-expire-general-considerations];
+[intro-lifecycle-rules]; [lifecycle-configuration-examples];
+[mpu-abort-incomplete-mpu-lifecycle-config]).
+
+- Expiration: "Object expiration applies only to an object's current version". In a bucket
+  never versioned it "permanently remov[es] the object"; with versioning enabled, "If the
+  current object version is not a delete marker, Amazon S3 adds a delete marker"; with
+  versioning suspended it "creates a delete marker with null as the version ID ... If the
+  version ID of the current version of the object is `null`, the `Expiration` action
+  permanently deletes this version." "Amazon S3 doesn't take any action if there are one or
+  more object versions and the delete marker is the current version."
+- NoncurrentVersionExpiration: "`NewerNoncurrentVersions` ... specifies how many newer
+  noncurrent versions must exist before Amazon S3 can expire a given version. Amazon S3 will
+  permanently delete any additional noncurrent versions beyond the specified number to
+  retain. For the deletion to occur, both the `<NoncurrentDays>` **and** the
+  `<NewerNoncurrentVersions>` values must be exceeded. ... If you don't specify a `<Filter>`
+  element, Amazon S3 generates an `InvalidRequest` error when you specify the number of
+  noncurrent versions to retain." It has no effect in a bucket never versioned.
+- ExpiredObjectDeleteMarker removes "a delete marker with zero noncurrent versions". "You
+  can't specify both a `Days` and an `ExpiredObjectDeleteMarker` tag on the same rule. When
+  you specify the `Days` tag, Amazon S3 automatically performs `ExpiredObjectDeleteMarker`
+  cleanup when the delete markers are old enough to satisfy the age criteria. To clean up
+  delete markers as soon as they become the only version, create a separate rule with only
+  the `ExpiredObjectDeleteMarker` tag." "You can't specify this lifecycle action in a rule
+  that has a filter that uses object tags."
+- AbortIncompleteMultipartUpload applies to uploads "determined by the key name `prefix`
+  specified in the Lifecycle rule", "to both existing multipart uploads and those that you
+  create later", and "doesn't apply to objects". "You can't specify this lifecycle action in
+  a rule that has a filter that uses object tags."
+- "An object is eligible for only one S3 Lifecycle action per day." "If two expiration
+  policies overlap, the shorter expiration policy is honored so that data is not stored for
+  longer than expected"; "Permanent deletion takes precedence over transition. Transition
+  takes precedence over creation of delete markers" ([lifecycle-conflicts]).
+- "When you add an S3 Lifecycle configuration to a bucket, Amazon S3 replaces the bucket's
+  current Lifecycle configuration", and "the configuration rules apply to both existing
+  objects and objects that you add later" ([how-to-set-lifecycle-configuration-intro]).
+
+**Headers** ([API_GetObject], [API_HeadObject], [API_PutObject], [API_CopyObject],
+[API_CompleteMultipartUpload], [API_CreateMultipartUpload], [API_ListParts]).
+
+- `x-amz-expiration` on GetObject, HeadObject, PutObject, CopyObject and
+  CompleteMultipartUpload: "It includes the `expiry-date` and `rule-id` key-value pairs
+  providing object expiration information. The value of the `rule-id` is URL-encoded."
+  Samples: `x-amz-expiration: expiry-date="Fri, 23 Dec 2012 00:00:00 GMT",
+  rule-id="picture-deletion-rule"` (GetObject, PutObject) and `expiry-date="Fri, 21 Dec 2012
+  00:00:00 GMT", rule-id="Rule for testfile.txt"` (HeadObject). 23 December 2012 was a
+  Sunday; 21 December 2012 was a Friday.
+- `x-amz-abort-date` and `x-amz-abort-rule-id` on CreateMultipartUpload and ListParts: "If
+  the bucket has a lifecycle rule configured with an action to abort incomplete multipart
+  uploads and the prefix in the lifecycle rule matches the object name in the request, the
+  response includes this header." botocore models the date as a header timestamp, whose
+  default form is an HTTP-date.
+- "To find when the current version of an object is scheduled to expire, use the HeadObject
+  or GetObject API operation" ([lifecycle-expire-general-considerations]).
+
+**Errors** ([ErrorResponses]). `InvalidRequest`, 400, lists "At least one action must be
+specified in a lifecycle rule.", "At least one lifecycle rule must be specified." and "The
+number of lifecycle rules must not exceed the allowed limit of 1000 rules."
+`NoSuchLifecycleConfiguration` is 404. `MalformedXML` is "not well formed or did not validate
+against our published schema". No other lifecycle fault has a code on any page.
+
+**Samples** (quoted in the tests of `crates/s3/src/body.rs` and `response.rs`).
+
+- PutBucketLifecycleConfiguration's Example 1 holds `<Filter><Prefix>documents/</Prefix>
+  </Filter>` with a `Transition` to `GLACIER` at 30 days, and `logs/` expiring at 365 days.
+- GetBucketLifecycleConfiguration's sample gives back a rule-level `<Prefix>projectdocs/
+  </Prefix>` as sent, with two `Transition`s and an `Expiration` of 3650 days, in S3's
+  namespace. Its Response Syntax root has no namespace.
+- Examples 3, 4 and 5 write the root `<LifeCycleConfiguration>`. Example 5 closes `<And>`,
+  `<Filter>` and `<Expiration>` with start tags, so it is not well-formed XML.
+
+**ceph s3-tests at 5522d1c** ([s3-tests]; secondary). 48 tests are marked `lifecycle`, and
+25 of them `fails_on_aws`: most wait on RGW's `rgw_lc_debug_interval`, which makes a "day"
+last seconds. The ones that set configurations and check responses:
+
+- `test_lifecycle_set`, `_get`, `_set_date`, `_set_noncurrent`, `_set_deletemarker`,
+  `_set_filter`, `_set_empty_filter` and `_set_multipart` expect 200. `_get` expects the
+  rules back exactly as sent: a rule-level `Prefix` stays one, and no `Filter` is added.
+- `test_lifecycle_get_no_id` expects every rule read back to hold an `ID`.
+- `test_lifecycle_delete`: GET with no configuration is 404 `NoSuchLifecycleConfiguration`,
+  and DELETE is 204 with or without one.
+- `test_lifecycle_id_too_long` (256 characters) and `test_lifecycle_same_id` expect 400
+  `InvalidArgument`. `test_lifecycle_invalid_status` expects 400 `MalformedXML` for `enabled`,
+  `disabled` and `invalid`. `test_lifecycle_expiration_days0` expects `InvalidArgument`: "days:
+  0 is legal in a transition rule, but not legal in an expiration rule".
+  `test_lifecycle_set_invalid_date` and `test_lifecycle_transition_set_invalid_date`, dates at
+  no midnight, expect status 400 with no code asserted.
+- `test_lifecycle_expiration_header_put` and `_head` expect `x-amz-expiration` matching
+  `expiry-date="(.+)", rule-id="(.+)"`, whose date is one whole day, by `timedelta.days`,
+  after the time taken before the PUT, for a rule of 1 day. `_tags_head` expects it for a
+  tag rule the object matches once tagged, and not after the rule is replaced by one it does
+  not match; `_and_tags_head` expects none when one of an `And`'s two tags differs.
+- `test_lifecycle_expiration_newer_noncurrent` (fails_on_aws, for its timing) expects 6 of 10
+  versions left by `NewerNoncurrentVersions` 5: "1 current and (9 - 5) noncurrent".
+- The `lifecycle_transition` tests need at least two storage classes configured, and are
+  skipped otherwise.
+
+**Observed answers** (secondary). The principal source is LocalStack's lifecycle tests at
+`8b9a79f05846835cf4dff63ab7eefdde9df83783`, its final commit before the repository was
+archived: `tests/aws/services/s3/test_s3.py`, class `TestS3BucketLifecycle` (L8971–L9683),
+each test `@markers.aws.validated`, with snapshots recorded against S3 on 21 February 2026
+(`test_s3.validation.json` L1646–L1753) ([localstack]). The rest are S3's answers quoted
+in issues and recordings, each dated. Some were seen only through CloudFormation, which
+passes on S3's message but not its code or status; these are marked (CFN).
+
+- A `Date` not at midnight: 400 `InvalidArgument`, "'Date' must be at midnight GMT"
+  (LocalStack; [aws-sdk-478], 2023; CFN, 2026).
+- `ExpiredObjectDeleteMarker` with `Days`: 400 `MalformedXML` (LocalStack; [aws-cli-8239],
+  2023; [aws-cdk-25824], 2023). `Date` with `Days`, or an empty `Expiration`: no record.
+- `AbortIncompleteMultipartUpload` with a tag filter: 400 `InvalidRequest`,
+  "AbortIncompleteMultipartUpload cannot be specified with Tags." ([tfm-s3-109], 2021; and
+  2025, 2026). With a size filter: "AbortIncompleteMultipartUpload cannot be specified with
+  Object Size." ([cfn-lint-3554], 2024; code not captured).
+- `ExpiredObjectDeleteMarker` with a size filter: 400 `InvalidRequest`,
+  "ExpiredObjectDeleteMarker cannot be specified with Object Size.", with the element set to
+  `false` ([cloudposse-137], 2022; [tfm-s3-376], 2026). With a tag filter: no record.
+- Two predicates directly in a `Filter`: 400 `MalformedXML` (LocalStack, Prefix with
+  ObjectSizeGreaterThan, and And beside Prefix; [s3-tests-638], 2025, Prefix with Tag). An
+  `And` holding one `Prefix`: 400 `MalformedXML`, from a wire capture; an `And` of an empty
+  `Prefix` and one other predicate was accepted ([tf-23882], 2022). An `And` of two tags is
+  accepted (LocalStack).
+- Sizes: `ObjectSizeLessThan` 0 was 400 `InvalidRequest`, "'ObjectSizeLessThan' should be
+  between 1 and 1099511627776000." ([tf-41521], 2025); `ObjectSizeGreaterThan` equal to
+  `ObjectSizeLessThan` was "'ObjectSizeLessThan' has to be a value greater than
+  'ObjectSizeGreaterThan'." (CFN, 2026). Negative sizes, and sizes past 50 TB: no record.
+- `NewerNoncurrentVersions` 500 was accepted (CFN, 2026), past the documented 100. In a
+  configuration of rule-level prefixes: 400 `InvalidRequest`, "NewerNoncurrentVersions element
+  can only be used in Lifecycle V2." ([tf-23228], 2022). Without `NoncurrentDays`:
+  `MalformedXML`, as a NooBaa maintainer found testing S3 ([noobaa-8861]). An empty
+  `NoncurrentVersionExpiration`: 400 `MalformedXML` (LocalStack).
+- A rule with neither `Filter` nor `Prefix`: 400 `MalformedXML` (LocalStack; wire captures in
+  [aws-sdk-go-v2-2874], 2023). Both in one rule: no record. Rules of both forms in one
+  configuration: 400 `InvalidRequest`, "Filter element can only be used in Lifecycle V2."
+  after a rule-level prefix ([ansible-53751], 2019), and "Base level prefix cannot be used in
+  Lifecycle V2, prefixes are only supported in the Filter." after a filter ([tf-23299],
+  2022).
+- Rule-level prefixes that overlap: 400 `InvalidRequest`, "Found overlapping prefixes '' and
+  'a' for same action type 'Expiration'" ([noobaa-8341], 2024). The user guide's conflicts
+  page gives two rules with overlapping filters and the same action as a configuration S3
+  resolves ([lifecycle-conflicts], Example 3).
+- Duplicate tag keys in an `And`: 400 `InvalidRequest`, "Duplicate Tag Keys are not allowed."
+  (LocalStack; CFN, 2026).
+- Day counts: `Days` 0 in an expiration, "'Days' for Expiration action must be a positive
+  integer" (CFN, 2026); `NoncurrentDays` 0, 400 `InvalidArgument`, "'NoncurrentDays' for
+  NoncurrentVersionExpiration action must be a positive integer" ([tf-35328], 2024).
+  `DaysAfterInitiation` 0: no record; NooBaa copies S3's form, "'DaysAfterInitiation' for
+  AbortIncompleteMultipartUpload action must be a positive integer", `InvalidArgument`
+  ([noobaa-8970]).
+- Transitions: 400 `InvalidArgument`, "'Days' in Transition action must be greater than or
+  equal to 30 for storageClass 'ONEZONE_IA'", for 0 days as for 29 ([zenn-thaim], 2024);
+  "'StorageClass' must be different for 'Transition' actions in same 'Rule' with filter
+  '(prefix=)'" and "Found mixed 'Date' and 'Days' based Expiration and Transition actions in
+  lifecycle rule for filter '(prefix=)'" (CFN, 2026). `Days` 0 to `GLACIER_IR` was stored
+  ([aws-ps-367], 2024).
+- An ID over 255 characters: `InvalidArgument`, "ID length should not exceed allowed limit of
+  255" ([noobaa-8628], 2025). Two rules with one ID: `InvalidArgument`, "Rule ID must be
+  unique. Found same ID for more than one rule" ([tiflash-9889], 2025). `Status` `enabled`:
+  `MalformedXML` ([noobaa-8664], 2025).
+- A rule with no action: 400 `InvalidRequest`, "At least one action needs to be specified in
+  a rule" ([mcaf-s3-46], 2025).
+- No rules: `MalformedXML` ([s3life-6], 2017). 1,127 rules: `MalformedXML` ([hub-529],
+  2016). Both are older than the error table's `InvalidRequest` for these faults.
+- IDs S3 makes for rules sent without one are 48 characters of base64 holding a lowercase,
+  hyphenated version 4 UUID, such as `OWI4YzMxM2UtYTAyOS00MTRjLTllMDAtYWJjMTI1NWI3ODMx`, in
+  CloudFormation reads and in `x-amz-abort-rule-id` and `x-amz-expiration` headers
+  ([aws-sdk-go-v2-3165], 2025).
+- `x-amz-expiration`: `expiry-date="<RFC 1123 date> GMT", rule-id="<id>"`, with the ID as it
+  is: spaces arrive as spaces in every capture, from 2016 to 2025, among them `rule-id="Delete
+  after 14 days"`. No capture holds a character a header could not carry. With several rules
+  for one key, all of 7 days, S3 named the first listed, which also had the longest prefix
+  (LocalStack). A rule of `ExpiredObjectDeleteMarker` alone gives no header, and HEAD with a
+  `versionId`, even the current version's, gives none (LocalStack).
+- `x-amz-abort-date` is an HTTP-date at 00:00:00 GMT, such as `Tue, 19 Aug 2025 00:00:00 GMT`,
+  and `x-amz-abort-rule-id` the ID as it is ([aws-sdk-go-v2-3165]; [aws-sdk-js-v3-8199], an AWS
+  maintainer against S3).
+- `x-amz-transition-default-minimum-object-size`: without it, both the PUT and the GET answer
+  `all_storage_classes_128K`; a value S3 does not define is 400 `InvalidRequest`, "Invalid
+  TransitionDefaultMinimumObjectSize found: value" (LocalStack).
+- GetBucketLifecycleConfiguration writes a rule's elements as `ID`, `Filter`, `Status`, then
+  its actions, and an empty filter as `<Filter/>`: `<Rule><ID>testglacierrule</ID><Filter/>
+  <Status>Enabled</Status><Transition><Days>0</Days><StorageClass>GLACIER_IR</StorageClass>
+  </Transition></Rule>` ([aws-ps-367], 2024). The PUT accepts its elements in any order.
+- A `Date` written `Fri, 01 Jan 2016 00:00:00 GMT` was 400 `MalformedXML` ([aws-sdk-js-2352],
+  2018). No record shows a `Date` S3 wrote.
+- No record gives a limit on a body's size, on tags in an `And`, or on a prefix's length. The
+  user guide's example "to expire noncurrent objects that have no data, including noncurrent
+  delete marker objects" filters by `ObjectSizeLessThan` 1 ([lifecycle-configuration-examples]).
+
+**Discrepancies.**
+
+- The Filter is "exactly one" predicate in LifecycleRule and may be empty in
+  LifecycleRuleFilter and the user guide. RGW's tests put several predicates directly in a
+  `Filter`; all of them are `fails_on_aws`, and S3 refuses such a filter as malformed.
+- NewerNoncurrentVersions. The API says S3 "will retain" N and "permanently delete any
+  additional noncurrent versions beyond the specified number to retain", so a version with N
+  newer noncurrent versions goes. The elements page agrees: N "newer noncurrent versions must
+  exist before Amazon S3 can expire a given version". The examples page says twice "more
+  than 5 [10] newer noncurrent versions must exist", which would keep N+1. Both pages end
+  "both the `NoncurrentDays` and the `NewerNoncurrentVersions` values must be exceeded".
+- `x-amz-expiration`'s `rule-id` "is URL-encoded", but the HeadObject sample and every
+  recorded answer show spaces as spaces.
+- The error table's `InvalidRequest` for no rules and for more than 1,000, against
+  `MalformedXML` recorded in 2016 and 2017. Its "At least one action must be specified in a
+  lifecycle rule." against the recorded "At least one action needs to be specified in a rule",
+  with the same code.
+- `NewerNoncurrentVersions` is documented up to 100, and 500 was accepted.
+- The user guide's conflicts Example 3 transitions to `STANDARD_IA` at 10 days, which S3
+  refuses: "'Days' in Transition action must be greater than or equal to 30".
+- The API reference makes the Tag's `Value` required, and every SDK sends it; the user guide
+  lets a filter's tag leave it out.
+
 ## 7. How S3 writes a key that XML 1.0 cannot carry
 
 - S3 writes such characters as character references. A ListObjectsV2 response quoted in
@@ -666,7 +998,60 @@ pages add:
 - [whatsnew-2023-04-28] https://aws.amazon.com/about-aws/whats-new/2023/04/amazon-s3-security-best-practices-buckets-default/
 - [WHATWG-URL] URL Living Standard, WHATWG, §5.1 "application/x-www-form-urlencoded parsing", https://url.spec.whatwg.org/#urlencoded-parsing
 - [python-urlencode] Python 3 documentation, `urllib.parse.urlencode`, https://docs.python.org/3/library/urllib.parse.html#urllib.parse.urlencode
+- [API_PutBucketLifecycleConfiguration] https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketLifecycleConfiguration.html
+- [API_GetBucketLifecycleConfiguration] https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketLifecycleConfiguration.html
+- [API_DeleteBucketLifecycle] https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteBucketLifecycle.html
+- [API_PutBucketLifecycle] https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketLifecycle.html
+- [API_GetBucketLifecycle] https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketLifecycle.html
+- [API_LifecycleRule] https://docs.aws.amazon.com/AmazonS3/latest/API/API_LifecycleRule.html
+- [API_LifecycleRuleFilter] https://docs.aws.amazon.com/AmazonS3/latest/API/API_LifecycleRuleFilter.html
+- [API_LifecycleRuleAndOperator] https://docs.aws.amazon.com/AmazonS3/latest/API/API_LifecycleRuleAndOperator.html
+- [API_LifecycleExpiration] https://docs.aws.amazon.com/AmazonS3/latest/API/API_LifecycleExpiration.html
+- [API_NoncurrentVersionExpiration] https://docs.aws.amazon.com/AmazonS3/latest/API/API_NoncurrentVersionExpiration.html
+- [API_NoncurrentVersionTransition] https://docs.aws.amazon.com/AmazonS3/latest/API/API_NoncurrentVersionTransition.html
+- [API_AbortIncompleteMultipartUpload] https://docs.aws.amazon.com/AmazonS3/latest/API/API_AbortIncompleteMultipartUpload.html
+- [API_Transition] https://docs.aws.amazon.com/AmazonS3/latest/API/API_Transition.html
+- [API_HeadObject] https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html
+- [intro-lifecycle-rules] https://docs.aws.amazon.com/AmazonS3/latest/userguide/intro-lifecycle-rules.html
+- [intro-lifecycle-filters] https://docs.aws.amazon.com/AmazonS3/latest/userguide/intro-lifecycle-filters.html
+- [lifecycle-expire-general-considerations] https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-expire-general-considerations.html
+- [lifecycle-transition-general-considerations] https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-transition-general-considerations.html
+- [lifecycle-conflicts] https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-conflicts.html
+- [lifecycle-configuration-examples] https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-configuration-examples.html
+- [how-to-set-lifecycle-configuration-intro] https://docs.aws.amazon.com/AmazonS3/latest/userguide/how-to-set-lifecycle-configuration-intro.html
+- [troubleshoot-lifecycle] https://docs.aws.amazon.com/AmazonS3/latest/userguide/troubleshoot-lifecycle.html
+- [mpu-abort-incomplete-mpu-lifecycle-config] https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpu-abort-incomplete-mpu-lifecycle-config.html
 - [s3-tests] https://github.com/ceph/s3-tests/blob/5522d1c351f75bc00ae0f64f742f3f095f5939d9/s3tests/functional/test_s3.py and `test_headers.py`
+- [localstack] https://github.com/localstack/localstack/tree/8b9a79f05846835cf4dff63ab7eefdde9df83783/tests/aws/services/s3 (`test_s3.py`, `test_s3.snapshot.json`, `test_s3.validation.json`)
+- [aws-sdk-478] https://github.com/aws/aws-sdk/issues/478
+- [aws-cli-8239] https://github.com/aws/aws-cli/issues/8239
+- [aws-cdk-25824] https://github.com/aws/aws-cdk/issues/25824
+- [tfm-s3-109] https://github.com/terraform-aws-modules/terraform-aws-s3-bucket/issues/109
+- [tfm-s3-376] https://github.com/terraform-aws-modules/terraform-aws-s3-bucket/issues/376
+- [cloudposse-137] https://github.com/cloudposse/terraform-aws-s3-bucket/issues/137
+- [cfn-lint-3554] https://github.com/aws-cloudformation/cfn-lint/issues/3554
+- [s3-tests-638] https://github.com/ceph/s3-tests/issues/638
+- [tf-23882] https://github.com/hashicorp/terraform-provider-aws/issues/23882
+- [tf-41521] https://github.com/hashicorp/terraform-provider-aws/issues/41521
+- [tf-23228] https://github.com/hashicorp/terraform-provider-aws/issues/23228
+- [tf-23299] https://github.com/hashicorp/terraform-provider-aws/issues/23299
+- [tf-35328] https://github.com/hashicorp/terraform-provider-aws/issues/35328
+- [ansible-53751] https://github.com/ansible/ansible/issues/53751
+- [noobaa-8341] https://github.com/noobaa/noobaa-core/issues/8341
+- [noobaa-8628] https://github.com/noobaa/noobaa-core/pull/8628
+- [noobaa-8664] https://github.com/noobaa/noobaa-core/pull/8664
+- [noobaa-8861] https://github.com/noobaa/noobaa-core/issues/8861
+- [noobaa-8970] https://github.com/noobaa/noobaa-core/pull/8970
+- [zenn-thaim] https://zenn.dev/thaim/articles/2024-04-s3-lifecycle-configuration-min-duration
+- [aws-ps-367] https://github.com/aws/aws-tools-for-powershell/issues/367
+- [tiflash-9889] https://github.com/pingcap/tiflash/issues/9889
+- [mcaf-s3-46] https://github.com/schubergphilis/terraform-aws-mcaf-s3/issues/46
+- [s3life-6] https://github.com/mapbox/s3life/issues/6
+- [hub-529] https://github.com/flightstats/hub/issues/529
+- [aws-sdk-go-v2-2874] https://github.com/aws/aws-sdk-go-v2/issues/2874
+- [aws-sdk-go-v2-3165] https://github.com/aws/aws-sdk-go-v2/issues/3165
+- [aws-sdk-js-v3-8199] https://github.com/aws/aws-sdk-js-v3/issues/8199
+- [aws-sdk-js-2352] https://github.com/aws/aws-sdk-js/issues/2352
 - [aws-cli-2841] https://github.com/aws/aws-cli/issues/2841
 - [tf-19895] https://github.com/hashicorp/terraform-provider-aws/issues/19895
 - [tf-41747] https://github.com/hashicorp/terraform-provider-aws/issues/41747

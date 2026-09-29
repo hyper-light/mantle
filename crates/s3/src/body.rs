@@ -8,6 +8,10 @@
 
 use crate::acl::{Grant, Grantee, MAX_GRANTS, Ownership, Permission, Policy};
 use crate::checksum::Algorithm;
+use crate::lifecycle::{
+    self, And, Filter, Given, GivenExpiration, GivenNoncurrent, GivenTransition, LifecycleError,
+    Rule,
+};
 use crate::route::MAX_KEY;
 use crate::tagging::{self, Tag, TagError, Tagged};
 use crate::xml::{NAMESPACE, Reader, XmlError};
@@ -52,6 +56,8 @@ pub enum BodyError {
     Tag(#[from] TagError),
     #[error("the ACL is not well-formed or does not validate against S3's schema: {0}")]
     MalformedAcl(XmlError),
+    #[error(transparent)]
+    Lifecycle(#[from] LifecycleError),
 }
 
 impl BodyError {
@@ -64,6 +70,7 @@ impl BodyError {
             Self::NotImplemented(_) => ("NotImplemented", 501),
             Self::Tag(error) => error.code(),
             Self::MalformedAcl(_) => ("MalformedACLError", 400),
+            Self::Lifecycle(error) => error.code(),
         }
     }
 }
@@ -593,6 +600,263 @@ pub fn ownership_controls(body: &[u8]) -> Result<Ownership, BodyError> {
     }
     reader.finish()?;
     rule.ok_or(schema("OwnershipControls without a rule"))
+}
+
+/// The longest `xs:int` a serializer writes.
+const INT: usize = "-2147483648".len();
+
+/// The longest `xs:long` a serializer writes.
+const LONG: usize = "-9223372036854775808".len();
+
+/// The longest time a serializer writes: nanoseconds and a zone offset.
+const DATE_TIME: usize = "2017-09-27T00:00:00.000000000+00:00".len();
+
+/// The longest storage class a transition names.
+const CLASS: usize = "INTELLIGENT_TIERING".len();
+
+/// A lifecycle filter at its longest: an `And` of the longest prefix, both sizes and the most
+/// tags an object holds, each at its longest.
+const LIFECYCLE_FILTER: usize = "<Filter><And><Prefix></Prefix><ObjectSizeGreaterThan>\
+    </ObjectSizeGreaterThan><ObjectSizeLessThan></ObjectSizeLessThan></And></Filter>"
+    .len()
+    + ESCAPED * MAX_KEY
+    + 2 * LONG
+    + lifecycle::MAX_FILTER_TAGS * TAG;
+
+/// A lifecycle rule at its longest: the longest ID and filter, each action once at its
+/// longest, and a transition and a noncurrent transition to each class.
+const LIFECYCLE_RULE: usize = "<Rule><ID></ID><Status>Disabled</Status><Expiration><Date>\
+    </Date></Expiration><NoncurrentVersionExpiration><NoncurrentDays></NoncurrentDays>\
+    <NewerNoncurrentVersions></NewerNoncurrentVersions></NoncurrentVersionExpiration>\
+    <AbortIncompleteMultipartUpload><DaysAfterInitiation></DaysAfterInitiation>\
+    </AbortIncompleteMultipartUpload></Rule>"
+    .len()
+    + ESCAPED * UTF8_PER_UTF16 * lifecycle::MAX_ID
+    + LIFECYCLE_FILTER
+    + DATE_TIME
+    + 3 * INT
+    + lifecycle::CLASSES.len()
+        * ("<Transition><Date></Date><StorageClass></StorageClass></Transition>".len()
+            + DATE_TIME
+            + CLASS
+            + "<NoncurrentVersionTransition><NoncurrentDays></NoncurrentDays>\
+               <NewerNoncurrentVersions></NewerNoncurrentVersions><StorageClass></StorageClass>\
+               </NoncurrentVersionTransition>"
+                .len()
+            + 2 * INT
+            + CLASS);
+
+/// The largest LifecycleConfiguration body: 1,000 rules, each at its longest.
+pub const LIFECYCLE_LIMIT: usize = SPACE
+    * (PROLOG
+        + "<LifecycleConfiguration></LifecycleConfiguration>".len()
+        + lifecycle::MAX_RULES * LIFECYCLE_RULE);
+
+/// PutBucketLifecycleConfiguration's rules (13 §6.9): read against S3's schema, then checked
+/// by [`lifecycle::check`]. The deprecated PutBucketLifecycle sends the same request with each
+/// rule's own `Prefix` in place of a `Filter`, and is read by the same schema. Rules are
+/// counted as they are read, so a document never holds more than 1,000.
+pub fn lifecycle(body: &[u8]) -> Result<Vec<Rule>, BodyError> {
+    let mut reader = Reader::open(body, LIFECYCLE_LIMIT, "LifecycleConfiguration")?;
+    let mut rules = Vec::new();
+    while let Some(name) = reader.child()? {
+        if name != "Rule" {
+            return Err(schema("an element LifecycleConfiguration does not have"));
+        }
+        if rules.len() >= lifecycle::MAX_RULES {
+            return Err(LifecycleError::TooManyRules.into());
+        }
+        rules.push(lifecycle_rule(&mut reader)?);
+    }
+    reader.finish()?;
+    Ok(lifecycle::check(rules)?)
+}
+
+/// A `Rule`. Its `Status` is exact, as an enumeration of `xs:string` keeps its white space
+/// (13 §5), and required.
+fn lifecycle_rule(reader: &mut Reader<'_>) -> Result<Given, BodyError> {
+    let mut rule = Given::default();
+    let mut status = None;
+    while let Some(name) = reader.child()? {
+        match name {
+            "ID" => once(&mut rule.id, reader.text()?.into_owned())?,
+            "Prefix" => once(&mut rule.prefix, reader.text()?.into_owned())?,
+            "Filter" => once(&mut rule.filter, lifecycle_filter(reader)?)?,
+            "Status" => once(&mut status, reader.text()?.into_owned())?,
+            "Expiration" => once(&mut rule.expiration, lifecycle_expiration(reader)?)?,
+            "NoncurrentVersionExpiration" => {
+                let mut given = GivenNoncurrent::default();
+                while let Some(name) = reader.child()? {
+                    match name {
+                        "NoncurrentDays" => once(&mut given.days, int(&reader.text()?)?)?,
+                        "NewerNoncurrentVersions" => {
+                            once(&mut given.newer, int(&reader.text()?)?)?;
+                        }
+                        _ => {
+                            return Err(schema(
+                                "an element NoncurrentVersionExpiration does not have",
+                            ));
+                        }
+                    }
+                }
+                once(&mut rule.noncurrent, given)?;
+            }
+            "AbortIncompleteMultipartUpload" => {
+                let mut days = None;
+                while let Some(name) = reader.child()? {
+                    if name != "DaysAfterInitiation" {
+                        return Err(schema(
+                            "an element AbortIncompleteMultipartUpload does not have",
+                        ));
+                    }
+                    once(&mut days, int(&reader.text()?)?)?;
+                }
+                once(&mut rule.abort, days)?;
+            }
+            "Transition" => rule.transitions.push(transition(reader, false)?),
+            "NoncurrentVersionTransition" => {
+                rule.noncurrent_transitions.push(transition(reader, true)?);
+            }
+            _ => return Err(schema("an element Rule does not have")),
+        }
+    }
+    rule.enabled = match status.as_deref() {
+        Some("Enabled") => true,
+        Some("Disabled") => false,
+        Some(_) => return Err(schema("a rule status other than Enabled or Disabled")),
+        None => return Err(schema("a rule without a Status")),
+    };
+    Ok(rule)
+}
+
+/// A `Filter`: empty, which applies to every object, or exactly one predicate, as its type
+/// says (13 §6.9).
+fn lifecycle_filter(reader: &mut Reader<'_>) -> Result<Filter, BodyError> {
+    let mut filter = None;
+    while let Some(name) = reader.child()? {
+        let predicate = match name {
+            "Prefix" => Filter::Prefix(reader.text()?.into_owned()),
+            "Tag" => Filter::Tag(filter_tag(reader)?),
+            "ObjectSizeGreaterThan" => Filter::Larger(larger(&reader.text()?)?),
+            "ObjectSizeLessThan" => Filter::Smaller(smaller(&reader.text()?)?),
+            "And" => Filter::And(and(reader)?),
+            _ => return Err(schema("an element Filter does not have")),
+        };
+        if filter.replace(predicate).is_some() {
+            return Err(schema("a filter holding two predicates outside And"));
+        }
+    }
+    Ok(filter.unwrap_or(Filter::All))
+}
+
+/// An `And`: "two or more predicates" (13 §6.9).
+fn and(reader: &mut Reader<'_>) -> Result<And, BodyError> {
+    let mut and = And::default();
+    while let Some(name) = reader.child()? {
+        match name {
+            "Prefix" => once(&mut and.prefix, reader.text()?.into_owned())?,
+            "Tag" => and.tags.push(filter_tag(reader)?),
+            "ObjectSizeGreaterThan" => once(&mut and.larger, larger(&reader.text()?)?)?,
+            "ObjectSizeLessThan" => once(&mut and.smaller, smaller(&reader.text()?)?)?,
+            _ => return Err(schema("an element And does not have")),
+        }
+    }
+    let predicates = and
+        .tags
+        .len()
+        .saturating_add(usize::from(and.prefix.is_some()))
+        .saturating_add(usize::from(and.larger.is_some()))
+        .saturating_add(usize::from(and.smaller.is_some()));
+    if predicates < 2 {
+        return Err(schema("an And holding fewer than two predicates"));
+    }
+    Ok(and)
+}
+
+/// A filter's `Tag`. Its `Value` may be left out, and is then empty: "If you specify only a
+/// `<Key>` element and no `<Value>` element, the rule will apply only to objects that match the
+/// tag key and that do not have a value specified" (13 §6.9).
+fn filter_tag(reader: &mut Reader<'_>) -> Result<Tag, BodyError> {
+    let (mut key, mut value) = (None, None);
+    while let Some(name) = reader.child()? {
+        let field = match name {
+            "Key" => &mut key,
+            "Value" => &mut value,
+            _ => return Err(schema("an element Tag does not have")),
+        };
+        once(field, reader.text()?.into_owned())?;
+    }
+    Ok(Tag {
+        key: key.ok_or(schema("a tag without a key"))?,
+        value: value.unwrap_or_default(),
+    })
+}
+
+/// An `Expiration`: each of its elements, read as its type; which of them may be given
+/// together is [`lifecycle::check`]'s.
+fn lifecycle_expiration(reader: &mut Reader<'_>) -> Result<GivenExpiration, BodyError> {
+    let mut given = GivenExpiration::default();
+    while let Some(name) = reader.child()? {
+        match name {
+            "Date" => once(&mut given.date, date(&reader.text()?)?)?,
+            "Days" => once(&mut given.days, int(&reader.text()?)?)?,
+            "ExpiredObjectDeleteMarker" => {
+                once(&mut given.marker, boolean(&reader.text()?)?)?;
+            }
+            _ => return Err(schema("an element Expiration does not have")),
+        }
+    }
+    Ok(given)
+}
+
+/// A `Transition`, or with `noncurrent` a `NoncurrentVersionTransition`.
+fn transition(reader: &mut Reader<'_>, noncurrent: bool) -> Result<GivenTransition, BodyError> {
+    let mut given = GivenTransition::default();
+    while let Some(name) = reader.child()? {
+        match (name, noncurrent) {
+            ("Date", false) => once(&mut given.date, date(&reader.text()?)?)?,
+            ("Days", false) | ("NoncurrentDays", true) => {
+                once(&mut given.days, int(&reader.text()?)?)?;
+            }
+            ("NewerNoncurrentVersions", true) => once(&mut given.newer, int(&reader.text()?)?)?,
+            ("StorageClass", _) => once(&mut given.class, reader.text()?.into_owned())?,
+            _ => return Err(schema("an element a transition does not have")),
+        }
+    }
+    Ok(given)
+}
+
+/// A `Date`: an `xs:dateTime` with its zone, collapsed as the type's white space facet says
+/// (XML Schema Part 2 §3.2.7).
+fn date(text: &str) -> Result<(i64, u32), BodyError> {
+    crate::time::parse_iso8601(collapsed(text)).ok_or(schema("a Date that is not an ISO 8601 time"))
+}
+
+/// An object size in a filter: an `xs:long`, in bytes, from `least` to
+/// [`lifecycle::MAX_FILTER_SIZE`], or else the fault `outside` (13 §6.9).
+fn size(text: &str, least: u64, outside: LifecycleError) -> Result<u64, BodyError> {
+    let text = collapsed(text);
+    let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(schema("not an integer"));
+    }
+    let size: i64 = text
+        .parse()
+        .map_err(|_| schema("an integer out of range"))?;
+    u64::try_from(size)
+        .ok()
+        .filter(|size| (least..=lifecycle::MAX_FILTER_SIZE).contains(size))
+        .ok_or(BodyError::Lifecycle(outside))
+}
+
+/// `ObjectSizeGreaterThan`, which may be 0.
+fn larger(text: &str) -> Result<u64, BodyError> {
+    size(text, 0, LifecycleError::LargerRange)
+}
+
+/// `ObjectSizeLessThan`, which is at least 1.
+fn smaller(text: &str) -> Result<u64, BodyError> {
+    size(text, 1, LifecycleError::SmallerRange)
 }
 
 const fn schema(reason: &'static str) -> BodyError {
@@ -1330,5 +1594,366 @@ mod tests {
         ] {
             assert_eq!(versioning(bad).map_err(|e| e.code().0), Err("MalformedXML"));
         }
+    }
+    /// A LifecycleConfiguration as botocore writes one: S3's namespace, no declaration, and
+    /// each rule's elements in the order the caller gave them (13 §6.9).
+    fn configuration(rules: &str) -> String {
+        format!("<LifecycleConfiguration xmlns=\"{NAMESPACE}\">{rules}</LifecycleConfiguration>")
+    }
+
+    fn lifecycle_code(rules: &str) -> Result<usize, &'static str> {
+        lifecycle(configuration(rules).as_bytes())
+            .map(|rules| rules.len())
+            .map_err(|e| e.code().0)
+    }
+
+    /// The configurations s3-tests sets and expects S3 to accept, as botocore sends them
+    /// (13 §6.9).
+    #[test]
+    fn lifecycle_reads_what_s3_tests_sets() {
+        let rules = lifecycle(
+            configuration(
+                "<Rule><ID>rule1</ID><Expiration><Days>1</Days></Expiration>\
+                 <Prefix>test1/</Prefix><Status>Enabled</Status></Rule>\
+                 <Rule><ID>rule2</ID><Expiration><Days>2</Days></Expiration>\
+                 <Prefix>test2/</Prefix><Status>Disabled</Status></Rule>",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            rules[0],
+            Rule {
+                id: "rule1".into(),
+                scope: lifecycle::Scope::Prefix("test1/".into()),
+                enabled: true,
+                expiration: Some(lifecycle::Expiration::Days(1)),
+                noncurrent: None,
+                abort: None,
+            }
+        );
+        assert!(!rules[1].enabled);
+        let accepted = [
+            // test_lifecycle_set_date: '2017-09-27' as botocore writes it.
+            "<Rule><ID>rule1</ID><Expiration><Date>2017-09-27T00:00:00Z</Date></Expiration>\
+             <Prefix>test1/</Prefix><Status>Enabled</Status></Rule>",
+            // test_lifecycle_set_noncurrent.
+            "<Rule><ID>rule1</ID><NoncurrentVersionExpiration><NoncurrentDays>2\
+             </NoncurrentDays></NoncurrentVersionExpiration><Prefix>past/</Prefix>\
+             <Status>Enabled</Status></Rule>",
+            // test_lifecycle_set_deletemarker.
+            "<Rule><ID>rule1</ID><Expiration><ExpiredObjectDeleteMarker>true\
+             </ExpiredObjectDeleteMarker></Expiration><Prefix>test1/</Prefix>\
+             <Status>Enabled</Status></Rule>",
+            // test_lifecycle_set_filter and test_lifecycle_set_empty_filter.
+            "<Rule><ID>rule1</ID><Expiration><ExpiredObjectDeleteMarker>true\
+             </ExpiredObjectDeleteMarker></Expiration><Filter><Prefix>foo</Prefix></Filter>\
+             <Status>Enabled</Status></Rule>",
+            "<Rule><ID>rule1</ID><Expiration><ExpiredObjectDeleteMarker>true\
+             </ExpiredObjectDeleteMarker></Expiration><Filter /><Status>Enabled</Status></Rule>",
+            // test_lifecycle_set_multipart.
+            "<Rule><ID>rule1</ID><Prefix>test1/</Prefix><Status>Enabled</Status>\
+             <AbortIncompleteMultipartUpload><DaysAfterInitiation>2</DaysAfterInitiation>\
+             </AbortIncompleteMultipartUpload></Rule>",
+            // test_delete_marker_expiration: an empty rule-level prefix.
+            "<Rule><Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker>\
+             </Expiration><ID>dm-1-days</ID><Prefix></Prefix><Status>Enabled</Status></Rule>",
+        ];
+        for rules in accepted {
+            assert_eq!(lifecycle_code(rules), Ok(1), "{rules}");
+        }
+        // test_lifecycle_get_no_id: every rule comes back with an ID.
+        let unnamed = lifecycle(
+            configuration(
+                "<Rule><Expiration><Days>31</Days></Expiration><Prefix>test1/</Prefix>\
+                 <Status>Enabled</Status></Rule>",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert!(!unnamed[0].id.is_empty());
+    }
+
+    /// What s3-tests expects S3 to refuse, and the codes it asserts (13 §6.9).
+    #[test]
+    fn lifecycle_refusals_are_s3_tests() {
+        let rule = |id: &str, expiration: &str, status: &str| {
+            format!(
+                "<Rule><ID>{id}</ID><Expiration>{expiration}</Expiration>\
+                 <Prefix>test1/</Prefix><Status>{status}</Status></Rule>"
+            )
+        };
+        let days1 = "<Days>1</Days>";
+        for status in ["enabled", "disabled", "invalid", " Enabled"] {
+            assert_eq!(
+                lifecycle_code(&rule("r", days1, status)),
+                Err("MalformedXML")
+            );
+        }
+        assert_eq!(
+            lifecycle_code(&rule(&"a".repeat(256), days1, "Enabled")),
+            Err("InvalidArgument")
+        );
+        let same = rule("rule1", days1, "Enabled") + &rule("rule1", "<Days>2</Days>", "Enabled");
+        assert_eq!(lifecycle_code(&same), Err("InvalidArgument"));
+        assert_eq!(
+            lifecycle_code(&rule("r", "<Days>0</Days>", "Enabled")),
+            Err("InvalidArgument")
+        );
+        // test_lifecycle_set_invalid_date: '20200101' as botocore writes it, not a midnight.
+        let invalid_date = rule("r", "<Date>1970-08-22T19:08:21Z</Date>", "Enabled");
+        assert_eq!(
+            lifecycle(configuration(&invalid_date).as_bytes())
+                .unwrap_err()
+                .code()
+                .1,
+            400
+        );
+        // test_lifecycle_transition_set_invalid_date: a transition dated at no midnight is a
+        // 400, although transitions are otherwise not implemented.
+        let transition = "<Rule><ID>rule1</ID><Expiration><Date>2023-09-27T00:00:00Z</Date>\
+            </Expiration><Transition><Date>1970-08-23T00:55:27Z</Date>\
+            <StorageClass>GLACIER</StorageClass></Transition><Prefix>test1/</Prefix>\
+            <Status>Enabled</Status></Rule>";
+        assert_eq!(
+            lifecycle(configuration(transition).as_bytes())
+                .unwrap_err()
+                .code()
+                .1,
+            400
+        );
+        assert_eq!(lifecycle_code(""), Err("InvalidRequest"));
+        assert_eq!(lifecycle(b"").map_err(|e| e.code().0), Err("MalformedXML"));
+    }
+
+    /// AWS's examples, which transition objects, are refused as not implemented once read;
+    /// its expiring rule alone is read. The examples that write the root
+    /// `<LifeCycleConfiguration>` are not the document botocore sends (13 §6.9).
+    #[test]
+    fn lifecycle_reads_aws_samples() {
+        let example_1 = b"<LifecycleConfiguration>
+              <Rule>
+                <ID>id1</ID>
+                <Filter>
+                   <Prefix>documents/</Prefix>
+                </Filter>
+                <Status>Enabled</Status>
+                <Transition>
+                  <Days>30</Days>
+                  <StorageClass>GLACIER</StorageClass>
+                </Transition>
+              </Rule>
+              <Rule>
+                <ID>id2</ID>
+                <Filter>
+                   <Prefix>logs/</Prefix>
+                </Filter>
+                <Status>Enabled</Status>
+                <Expiration>
+                  <Days>365</Days>
+                </Expiration>
+              </Rule>
+            </LifecycleConfiguration>";
+        assert_eq!(
+            lifecycle(example_1).map_err(|e| e.code()),
+            Err(("NotImplemented", 501))
+        );
+        let get_sample = br#"<?xml version="1.0" encoding="UTF-8"?>
+            <LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+               <Rule>
+                  <ID>Archive and then delete rule</ID>
+                  <Prefix>projectdocs/</Prefix>
+                  <Status>Enabled</Status>
+                  <Transition>
+                     <Days>30</Days>
+                     <StorageClass>STANDARD_IA</StorageClass>
+                  </Transition>
+                  <Transition>
+                     <Days>365</Days>
+                     <StorageClass>GLACIER</StorageClass>
+                  </Transition>
+                  <Expiration>
+                     <Days>3650</Days>
+                  </Expiration>
+               </Rule>
+            </LifecycleConfiguration>"#;
+        assert_eq!(
+            lifecycle(get_sample).map_err(|e| e.code().0),
+            Err("NotImplemented")
+        );
+        let expiring = b"<LifecycleConfiguration>
+              <Rule>
+                <ID>id2</ID>
+                <Filter>
+                   <Prefix>logs/</Prefix>
+                </Filter>
+                <Status>Enabled</Status>
+                <Expiration>
+                  <Days>365</Days>
+                </Expiration>
+              </Rule>
+            </LifecycleConfiguration>";
+        let rules = lifecycle(expiring).unwrap();
+        assert_eq!(
+            rules[0].scope,
+            lifecycle::Scope::Filter(Filter::Prefix("logs/".into()))
+        );
+        assert_eq!(rules[0].expiration, Some(lifecycle::Expiration::Days(365)));
+        let example_3 = b"<LifeCycleConfiguration><Rule><ID>DeleteAfterBecomingNonCurrent</ID>\
+            <Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status>\
+            <NoncurrentVersionExpiration><NoncurrentDays>100</NoncurrentDays>\
+            </NoncurrentVersionExpiration></Rule></LifeCycleConfiguration>";
+        assert_eq!(
+            lifecycle(example_3).map_err(|e| e.code().0),
+            Err("MalformedXML")
+        );
+    }
+
+    /// A filter holds one predicate, or an `And` of two or more; a tag's value may be left
+    /// out (13 §6.9).
+    #[test]
+    fn lifecycle_filters_follow_their_schema() {
+        let filtered = |filter: &str| {
+            format!(
+                "<Rule><ID>r</ID><Filter>{filter}</Filter><Status>Enabled</Status>\
+                 <Expiration><Days>1</Days></Expiration></Rule>"
+            )
+        };
+        let read = |filter: &str| {
+            lifecycle(configuration(&filtered(filter)).as_bytes())
+                .map(|mut rules| rules.remove(0).scope)
+                .map_err(|e| e.code().0)
+        };
+        let tag = |key: &str, value: &str| Tag {
+            key: key.into(),
+            value: value.into(),
+        };
+        assert_eq!(
+            read(
+                "<And><Prefix>docs/</Prefix><Tag><Key>a</Key><Value>1</Value></Tag>\
+                  <Tag><Key>b</Key></Tag><ObjectSizeGreaterThan> 500 </ObjectSizeGreaterThan>\
+                  <ObjectSizeLessThan>64000</ObjectSizeLessThan></And>"
+            ),
+            Ok(lifecycle::Scope::Filter(Filter::And(And {
+                prefix: Some("docs/".into()),
+                tags: vec![tag("a", "1"), tag("b", "")],
+                larger: Some(500),
+                smaller: Some(64000),
+            })))
+        );
+        assert_eq!(
+            read("<Tag><Key>k</Key><Value>v</Value></Tag>"),
+            Ok(lifecycle::Scope::Filter(Filter::Tag(tag("k", "v"))))
+        );
+        // S3's range for a size: 0 or 1 up to 1000 × 2^40 bytes (13 §6.9).
+        assert_eq!(
+            read("<ObjectSizeGreaterThan>0</ObjectSizeGreaterThan>"),
+            Ok(lifecycle::Scope::Filter(Filter::Larger(0)))
+        );
+        assert_eq!(
+            read("<ObjectSizeLessThan>1099511627776000</ObjectSizeLessThan>"),
+            Ok(lifecycle::Scope::Filter(Filter::Smaller(
+                lifecycle::MAX_FILTER_SIZE
+            )))
+        );
+        for outside in [
+            "<ObjectSizeLessThan>0</ObjectSizeLessThan>",
+            "<ObjectSizeLessThan>1099511627776001</ObjectSizeLessThan>",
+            "<ObjectSizeGreaterThan>-1</ObjectSizeGreaterThan>",
+            "<And><Prefix/><ObjectSizeLessThan>-5</ObjectSizeLessThan></And>",
+        ] {
+            assert_eq!(read(outside), Err("InvalidRequest"), "{outside}");
+        }
+        for malformed in [
+            "<Prefix>a</Prefix><Tag><Key>k</Key><Value>v</Value></Tag>",
+            "<Prefix>a</Prefix><Prefix>b</Prefix>",
+            "<And><Prefix>a</Prefix></And>",
+            "<And><Tag><Key>k</Key><Value>v</Value></Tag></And>",
+            "<And></And>",
+            "<Tag><Value>v</Value></Tag>",
+            "<ObjectSizeGreaterThan>1.5</ObjectSizeGreaterThan>",
+            "<ObjectSizeGreaterThan>9223372036854775808</ObjectSizeGreaterThan>",
+            "<Size>1</Size>",
+        ] {
+            assert_eq!(read(malformed), Err("MalformedXML"), "{malformed}");
+        }
+        // An And with an empty prefix and one other predicate holds two (13 §6.9).
+        assert!(
+            read("<And><Prefix></Prefix><ObjectSizeGreaterThan>1</ObjectSizeGreaterThan></And>")
+                .is_ok()
+        );
+        let two_tags = "<And><Tag><Key>k</Key><Value>1</Value></Tag>\
+                        <Tag><Key>k</Key><Value>2</Value></Tag></And>";
+        assert_eq!(read(two_tags), Err("InvalidRequest"));
+        let range = "<And><ObjectSizeGreaterThan>10</ObjectSizeGreaterThan>\
+                     <ObjectSizeLessThan>10</ObjectSizeLessThan></And>";
+        assert_eq!(read(range), Err("InvalidRequest"));
+        let both = "<Rule><ID>r</ID><Prefix>a</Prefix><Filter><Prefix>a</Prefix></Filter>\
+                    <Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule>";
+        assert_eq!(lifecycle_code(both), Err("InvalidRequest"));
+        let neither = "<Rule><ID>r</ID><Status>Enabled</Status>\
+                       <Expiration><Days>1</Days></Expiration></Rule>";
+        assert_eq!(lifecycle_code(neither), Err("MalformedXML"));
+    }
+
+    /// The limit admits the longest configuration S3's limits allow: 1,000 rules, each with
+    /// the longest ID, an `And` of the longest prefix, both sizes and ten of the longest tags,
+    /// an expiration, a noncurrent expiration and an abort. Its text is written as character
+    /// references, as the tagging limits' test writes it.
+    #[test]
+    fn lifecycle_limit_admits_the_longest_body() {
+        let tags: String = (0..lifecycle::MAX_FILTER_TAGS)
+            .map(|i| {
+                let key: String = (0..tagging::MAX_KEY)
+                    .map(|j| format!("&#{};", 0x4E00 + i * tagging::MAX_KEY + j))
+                    .collect();
+                let value = "&#x9FA5;".repeat(tagging::MAX_VALUE);
+                format!("<Tag><Key>{key}</Key><Value>{value}</Value></Tag>")
+            })
+            .collect();
+        let prefix = "&quot;".repeat(MAX_KEY);
+        let rules: String = (0..lifecycle::MAX_RULES)
+            .map(|i| {
+                let id = format!("{i:0>255}");
+                format!(
+                    "<Rule><ID>{id}</ID><Filter><And><Prefix>{prefix}</Prefix>{tags}\
+                     <ObjectSizeGreaterThan>1099511627775999</ObjectSizeGreaterThan>\
+                     <ObjectSizeLessThan>1099511627776000</ObjectSizeLessThan></And>\
+                     </Filter><Status>Disabled</Status><Expiration><Days>2147483647</Days>\
+                     </Expiration><NoncurrentVersionExpiration><NewerNoncurrentVersions>100\
+                     </NewerNoncurrentVersions><NoncurrentDays>2147483647</NoncurrentDays>\
+                     </NoncurrentVersionExpiration></Rule>"
+                )
+            })
+            .collect();
+        let body = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>{}",
+            configuration(&rules)
+        );
+        assert!(
+            body.len() * 2 <= LIFECYCLE_LIMIT,
+            "{} > {LIFECYCLE_LIMIT}",
+            body.len()
+        );
+        assert_eq!(
+            lifecycle(body.as_bytes()).unwrap().len(),
+            lifecycle::MAX_RULES
+        );
+        assert_eq!(
+            lifecycle(&vec![b' '; LIFECYCLE_LIMIT + 1]),
+            Err(BodyError::Xml(XmlError::TooLarge {
+                limit: LIFECYCLE_LIMIT
+            }))
+        );
+        let one = "<Rule><Filter/><Status>Enabled</Status><Expiration><Days>1</Days>\
+                   </Expiration></Rule>";
+        assert_eq!(
+            lifecycle_code(&one.repeat(lifecycle::MAX_RULES + 1)),
+            Err("InvalidRequest")
+        );
+        assert_eq!(
+            lifecycle_code(&one.repeat(lifecycle::MAX_RULES)),
+            Ok(lifecycle::MAX_RULES)
+        );
     }
 }

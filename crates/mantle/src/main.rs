@@ -81,7 +81,8 @@ enum Command {
 enum BenchCommand {
     /// Measure the device under PATH, then the chunk store's puts and reads on it across
     /// chunk sizes and concurrency, in a scratch volume of at most 4 GiB and a tenth of the
-    /// free space (removed afterwards; about a minute on an SSD).
+    /// free space (removed afterwards). Each point runs ten to thirty rounds of about three
+    /// steps each: from eight minutes to about half an hour for every point at the defaults.
     Chunk {
         /// A directory on the device to measure.
         path: PathBuf,
@@ -95,6 +96,10 @@ enum BenchCommand {
         /// Requests in flight to measure, comma-separated: 1,4,16,64 by default.
         #[arg(long, value_delimiter = ',')]
         workers: Vec<usize>,
+        /// Rounds each point runs at most, from ten to 120: thirty by default, enough for two
+        /// states to each carry an interval when the smaller holds a fifth of the rounds.
+        #[arg(long, default_value_t = mantle_disk::rounds::Policy::STANDARD.max)]
+        rounds: usize,
         /// Leave out the measurement of the device itself.
         #[arg(long)]
         skip_device: bool,
@@ -225,6 +230,7 @@ fn main() -> ExitCode {
                     seconds,
                     sizes,
                     workers,
+                    rounds,
                     skip_device,
                 },
         } => match std::time::Duration::try_from_secs_f64(seconds) {
@@ -235,6 +241,7 @@ fn main() -> ExitCode {
                     step,
                     sizes,
                     workers,
+                    rounds,
                     skip_device,
                 },
             )

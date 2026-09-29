@@ -23,6 +23,7 @@ pub mod histogram;
 pub mod identity;
 pub mod measure;
 pub mod probe;
+pub mod rounds;
 #[cfg(any(test, feature = "sim"))]
 pub mod sim;
 

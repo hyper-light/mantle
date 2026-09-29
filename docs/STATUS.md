@@ -80,17 +80,20 @@ Remaining before it is done:
 
 - An I/O path that keeps the measured number of reads in flight.
 - `mantle bench chunk` measures puts and reads next to the same reads through the file
-  layer, each point in rounds until its throughput is within ±5% at 95% confidence or six
-  rounds have run, stating the interval it reached
-  ([measurements](measurements/2026-09-29-chunk-store-rounds.md)). Remaining: large puts
-  brought closer to the device's durable bandwidth. 8 MiB puts reach about 69% of it now
-  that a batch's frame is written beside its records
+  layer, each point in ten to thirty rounds judged as the [measurement
+  design](design/measurement.md) sets out: rounds ordered in time found by the lag-1
+  autocorrelation and an exact runs test, two states found by Hartigan's dip test (its
+  statistic matching R's `diptest` and a linear program from its definition on 5,000
+  samples), and each state's median with its order-statistic interval. On this machine reads
+  fall in two states, because the drive stalls every read for about a second in every nine
+  under a stream of full flushes ([measurements](measurements/2026-09-29-chunk-store-states.md)).
+  Remaining: where states change in time, and repetition across volumes and processes
+  (design §7). Also remaining: large puts brought closer to the device's durable bandwidth.
+  8 MiB puts reach about 69% of it now that a batch's frame is written beside its records
   ([measurements](measurements/2026-09-29-frame-overlap.md)); the flush is most of the
   rest. Writing the next batch during the last one's flush gains 10% at 32 MiB batches and
   nothing at 8 MiB here, where `F_FULLFSYNC` holds writes issued during it: not worth a
-  pipelined writer's complexity until a device measures more. Also remaining: the step and round counts from a
-  dimensioning run, with results that alternate between two states reported per state
-  (docs/research/11 §16.3).
+  pipelined writer's complexity until a device measures more.
 - The group-commit wait for submitters slower than half a batch, from the measured
   distribution of their return times (docs/research/11 §2.6), once real clients supply it.
 - Device health in how writes are placed and when a device is drained (docs/research/10).

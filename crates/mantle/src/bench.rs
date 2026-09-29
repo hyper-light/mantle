@@ -13,12 +13,18 @@
 //! the same state. Right after each read point, the same number of workers read the same
 //! number of bytes from random places in the volume's segments directly through the file
 //! layer. Background work of the file system and the drive stalls reads at times; running
-//! the two back to back shows what mantle adds, apart from the environment. Each point runs
-//! in rounds, as calibration's do (`calibrate::Rounds`), until the throughput of its puts,
-//! reads and file-layer reads is each within ±5% at 95% confidence, or six rounds have run:
-//! one pass measures the drive's recent history as much as the store
-//! (docs/measurements/2026-09-28-chunk-store-benchmark.md, finding 7). The scratch file is
-//! removed however the benchmark ends.
+//! the two back to back shows what mantle adds, apart from the environment.
+//!
+//! One pass measures the drive's recent history as much as the store
+//! (docs/measurements/2026-09-28-chunk-store-benchmark.md, finding 7), and this machine's
+//! drive answers a stream of full flushes by stalling every read for about a second at a time,
+//! so a round's reads catch a stall or miss it (docs/measurements/2026-09-29-chunk-store-states.md).
+//! Each point therefore runs in rounds, ten to thirty by default, and each operation's rounds
+//! are judged as `mantle_disk::rounds` judges them: whether they are independent in time,
+//! whether they fall in one state or two, and each state's median with its 95% interval. A
+//! point stops before the limit once its puts, reads and file-layer reads are independent and
+//! every state's interval is within ±5% of its median. The scratch file is removed however the
+//! benchmark ends.
 
 use std::fmt;
 use std::io::Write;
@@ -29,10 +35,11 @@ use std::time::{Duration, Instant};
 
 use mantle_chunk::{ChunkError, ChunkKey, Config, Volume};
 use mantle_disk::buf::{AlignedBuf, Alignment};
-use mantle_disk::calibrate::{self, Calibration, Rounds};
+use mantle_disk::calibrate::{self, Calibration};
 use mantle_disk::file::{CachingRequest, DeviceFile};
 use mantle_disk::histogram::Histogram;
 use mantle_disk::measure::SplitMix64;
+use mantle_disk::rounds::{self, Order, Policy};
 
 use crate::display;
 
@@ -75,13 +82,13 @@ pub struct Plan {
     pub workers: Vec<usize>,
     /// How long each round of a put or read point runs.
     pub step: Duration,
-    pub rounds: Rounds,
+    pub rounds: Policy,
 }
 
 impl Plan {
     /// A 4 GiB volume, or a tenth of the free space if that is smaller; chunks from a small
     /// object's 4 KiB to an erasure-coded shard's 8 MiB.
-    pub fn standard(available: Option<u64>, step: Duration) -> Self {
+    pub fn standard(available: Option<u64>, step: Duration, rounds: usize) -> Self {
         let cap = 4u64 << 30;
         let volume = available.map_or(cap, |free| cap.min(free / 10));
         Self {
@@ -89,7 +96,10 @@ impl Plan {
             sizes: vec![4 << 10, 64 << 10, 1 << 20, 8 << 20],
             workers: vec![1, 4, 16, 64],
             step,
-            rounds: Rounds::STANDARD,
+            rounds: Policy {
+                max: rounds,
+                ..Policy::STANDARD
+            },
         }
     }
 }
@@ -125,26 +135,24 @@ impl Outcome {
     }
 }
 
-/// A point's rounds: each round's throughput, and every round's transfers together.
+/// A point's rounds: each round's throughput and transfers, in time order.
 #[derive(Debug, Default)]
 struct Series {
     ops_per_sec: Vec<f64>,
-    bytes_per_sec: Vec<f64>,
-    latency: Histogram,
+    latency: Vec<Histogram>,
     full: bool,
 }
 
 impl Series {
-    fn add(&mut self, o: &Outcome) {
+    fn add(&mut self, o: Outcome) {
         self.ops_per_sec.push(o.ops_per_sec());
-        self.bytes_per_sec.push(o.bytes_per_sec());
-        self.latency.merge(&o.latency);
+        self.latency.push(o.latency);
         self.full |= o.full;
     }
 
-    /// Enough rounds by `rounds`, or none to judge: reads of a point that wrote nothing.
-    fn enough(&self, rounds: &Rounds) -> bool {
-        self.ops_per_sec.is_empty() || rounds.enough(&self.ops_per_sec)
+    /// Enough rounds by `policy`, or none to judge: reads of a point that wrote nothing.
+    fn enough(&self, policy: &Policy) -> bool {
+        self.ops_per_sec.is_empty() || policy.enough(&rounds::judge(&self.ops_per_sec))
     }
 }
 
@@ -166,6 +174,8 @@ pub struct Options {
     pub sizes: Vec<usize>,
     /// Requests in flight; the standard set when empty.
     pub workers: Vec<usize>,
+    /// Rounds each point runs at most.
+    pub rounds: usize,
     /// Leave out the device measurement.
     pub skip_device: bool,
 }
@@ -181,7 +191,7 @@ pub fn chunk(out: &mut impl Write, path: &Path, options: &Options) -> Result<(),
             Alignment::new(4096).unwrap_or(Alignment::BYTE),
             Alignment::max,
         );
-    let mut plan = Plan::standard(id.file_system.available_bytes, options.step);
+    let mut plan = Plan::standard(id.file_system.available_bytes, options.step, options.rounds);
     if !options.sizes.is_empty() {
         plan.sizes.clone_from(&options.sizes);
     }
@@ -304,6 +314,11 @@ fn run(
 
     writeln!(
         out,
+        "  each row is the median of a point's rounds, ± the wider side of its 95% interval (–\n  \
+         when the rounds are too few or not independent); rounds in two states take a row each"
+    )?;
+    writeln!(
+        out,
         "  {:<14} {:>9} {:>10} {:>12} {:>5} {:>6} {:>10} {:>10} {:>10}",
         "", "in flight", "ops/s", "throughput", "±", "rounds", "p50", "p99", "p99.9"
     )?;
@@ -325,10 +340,10 @@ fn run(
                 (Series::default(), Series::default(), Series::default());
             for _ in 0..plan.rounds.limit() {
                 let (outcome, keys) = puts(&v, size, writers, plan.step, budget, point)?;
-                put.add(&outcome);
+                put.add(outcome);
                 if !keys.is_empty() {
-                    get.add(&gets(&v, &keys, size, workers, plan.step, point)?);
-                    direct.add(&raw_reads(&raw, &span, size, workers, plan.step, point)?);
+                    get.add(gets(&v, &keys, size, workers, plan.step, point)?);
+                    direct.add(raw_reads(&raw, &span, size, workers, plan.step, point)?);
                 }
                 deletes(&v, &keys)?;
                 point = point.saturating_add(1);
@@ -336,10 +351,22 @@ fn run(
                     break;
                 }
             }
-            row(out, &format!("put {}", display::size(size)), writers, &put)?;
+            rows(
+                out,
+                &format!("put {}", display::size(size)),
+                writers,
+                size,
+                &put,
+            )?;
             if !get.ops_per_sec.is_empty() {
-                row(out, &format!("get {}", display::size(size)), workers, &get)?;
-                row(out, "  file layer", workers, &direct)?;
+                rows(
+                    out,
+                    &format!("get {}", display::size(size)),
+                    workers,
+                    size,
+                    &get,
+                )?;
+                rows(out, "  file layer", workers, size, &direct)?;
             }
         }
     }
@@ -347,23 +374,69 @@ fn run(
     Ok(())
 }
 
-/// A point's row: its mean throughput over the rounds, the half-width of that mean's 95%
-/// confidence interval, and latency quantiles over every round's transfers.
-fn row(out: &mut impl Write, name: &str, workers: usize, s: &Series) -> std::io::Result<()> {
-    writeln!(
-        out,
-        "  {:<14} {:>9} {:>10} {:>12} {:>5} {:>6} {:>10} {:>10} {:>10}{}",
-        name,
-        workers,
-        display::count(calibrate::mean(&s.ops_per_sec)),
-        display::rate(calibrate::mean(&s.bytes_per_sec)),
-        display::percent(calibrate::relative_interval(&s.ops_per_sec)),
-        s.ops_per_sec.len(),
-        display::nanos(s.latency.p50()),
-        display::nanos(s.latency.p99()),
-        display::nanos(s.latency.p999()),
-        if s.full { "  (volume full)" } else { "" }
-    )?;
+/// A point's rows, one for each state its rounds fall in: the state's median throughput, the
+/// wider side of the median's 95% interval, the rounds in the state, and latency quantiles
+/// over the state's transfers. The first row says when the rounds are ordered in time.
+fn rows(
+    out: &mut impl Write,
+    name: &str,
+    workers: usize,
+    size: usize,
+    s: &Series,
+) -> std::io::Result<()> {
+    let judged = rounds::judge(&s.ops_per_sec);
+    let two = judged.states.len() > 1;
+    // Every transfer of these points moves `size` bytes, so bytes follow operations.
+    let bytes = f64::from(u32::try_from(size).unwrap_or(u32::MAX));
+    for (i, state) in judged.states.iter().enumerate() {
+        let mut latency = Histogram::new();
+        for h in state.rounds.iter().filter_map(|&r| s.latency.get(r)) {
+            latency.merge(h);
+        }
+        let first = i == 0;
+        // Of two states, how large a share of rounds each may hold, at 95%.
+        let share = if two {
+            let (lo, hi) = rounds::share(state.rounds.len(), judged.rounds);
+            format!(
+                "  {}–{} of rounds",
+                display::percent(lo),
+                display::percent(hi)
+            )
+        } else {
+            String::new()
+        };
+        let order = match judged.order {
+            Order::Persistent if first => "  rounds persist in a state",
+            Order::Alternating if first => "  rounds alternate",
+            _ => "",
+        };
+        writeln!(
+            out,
+            "  {:<14} {:>9} {:>10} {:>12} {:>5} {:>6} {:>10} {:>10} {:>10}{}{}{}",
+            if first { name } else { "" },
+            workers,
+            display::count(state.median),
+            display::rate(state.median * bytes),
+            state
+                .spread()
+                .map_or_else(|| "–".to_owned(), display::percent),
+            if two {
+                format!("{}/{}", state.rounds.len(), judged.rounds)
+            } else {
+                judged.rounds.to_string()
+            },
+            display::nanos(latency.p50()),
+            display::nanos(latency.p99()),
+            display::nanos(latency.p999()),
+            share,
+            order,
+            if first && s.full {
+                "  (volume full)"
+            } else {
+                ""
+            }
+        )?;
+    }
     out.flush()
 }
 
@@ -661,7 +734,7 @@ mod tests {
             sizes: vec![4 << 10, 1 << 20],
             workers: vec![1, 4],
             step: Duration::from_millis(50),
-            rounds: Rounds {
+            rounds: Policy {
                 min: 2,
                 max: 2,
                 precision: 0.05,

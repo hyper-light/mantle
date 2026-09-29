@@ -759,6 +759,8 @@ chunk sizes:            the design's chunk-size distribution (small objects; era
                         not a fixed ladder
 ```
 
+The repetition formula above holds for normally distributed rounds (HB15 §4.2.2, as note 21 §6.4 finds). Note 21 gives cited methods for the rest of this section: independence checks, the dip test for states, and intervals of each state's median (note 21 §9).
+
 ### 16.4 Inputs and uncertainty
 
 Inputs: per-point `CV` from a dimensioning run, levels and costs (step, process, fresh volume), the device's cache size. Uncertain: machine noise (finding 2) inflates `CV` and may make ±5% unaffordable. KJ13's method then says where to spend the budget, and the report should state the achieved interval rather than claim precision it lacks.

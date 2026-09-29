@@ -390,6 +390,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mantle-meta"
+version = "0.1.0"
+dependencies = [
+ "mantle-chunk",
+ "mantle-crc",
+ "proptest",
+ "thiserror",
+]
+
+[[package]]
 name = "mantle-s3"
 version = "0.1.0"
 dependencies = [

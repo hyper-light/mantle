@@ -565,7 +565,7 @@ Third-party: LocalStack's own implementation (`presigned_url.py`, `provider.py` 
 - The code is `InvalidArgument`, not the table's `UserKeyMustBeSpecified`.
 
 **Extra input fields:**
-- [moxie-165] 2016: 403 `<Code>AccessDenied</Code><Message>Invalid according to Policy: Extra input fields: filename</Message>`. The form's field was `Filename`, so the name is reported lowercased. An `Upload` field after `file` was not reported.
+- [moxie-165] 2016: 403 `<Code>AccessDenied</Code><Message>Invalid according to Policy: Extra input fields: filename</Message>`. The form's field was `Filename`, so the name is reported lowercased. An `Upload` field after `file` was not reported. (A later capture names a field as sent, `StorageClass`: §13.2.)
 - [s3-beam-42] 2017: "Invalid according to Policy: Extra input fields: content-disposition".
 - [vue-dropzone-471] 2019: "Extra input fields: dzuuid".
 
@@ -632,6 +632,10 @@ s3-tests agrees that a missing signature (400) comes before condition failures. 
 
 ## 11. Not stated by any fetched source (UNVERIFIED)
 
+§13 answers several of these from further captures: the 20 KB limit, the answer to no file, a
+wrong region, an empty access key, a malformed `x-amz-date`, an unreadable expiration, the
+redirect's encoding and the headers of a 204.
+
 **Size and time limits**
 - Whether 20 KB means 20,480 bytes, what exactly it counts, and the message for `MaxPostPreDataLengthExceededError`.
 - The largest object a POST may carry; 5 GB is stated only for PUT.
@@ -671,6 +675,134 @@ s3-tests agrees that a missing signature (400) comes before condition failures. 
 - **Signing.** `crates/s3/src/sigv4.rs` already has `signing_key` and `hex`. The POST signature is `hex(HMAC(signing_key(date, region, "s3"), policy_b64_as_received))`. Verify it before decoding the policy. §3.3 and §6.1 are two independent vectors.
 - **SigV2.** Every authenticated s3-tests POST test uses SigV2. mantle refuses SigV2 (sigv4.rs L230, "use AWS4-HMAC-SHA256"), so only the anonymous and ACL-based ones can pass as written. Those also need public-read-write bucket ACLs, which mantle does not have.
 - **JSON.** `crates/s3/src/json.rs` is strict. AWS's signed example parses. Its illustrative examples do not, and S3's leniency is unrecorded.
+
+## 13. Further captures (compiled 2026-09-29)
+
+A second search, of GitHub issues, Stack Overflow, AWS re:Post and blogs, for S3's answers in
+the cases §11 lists. LocalStack's POST tests and snapshot on main are unchanged since
+`8b9a79f`, and its snapshot redacts `StringToSignBytes`. versitygw is pinned at
+`b91e178a12fae7a6acf31597a70aef8b8b3e72f4`; its messages are third-party, modelled on S3's.
+
+### 13.1 The policy document
+
+- **An expiration S3 cannot read (secondary).** 400 `InvalidPolicyDocument`, "Invalid Policy:
+  Invalid 'expiration' value: '2011-09-13T07:52:58+02:00'" ([cwd-2], 2011); the fix sent UTC,
+  and the next error was about fields, so the UTC form passed. "Invalid Policy: Invalid
+  'expiration' value: '2015-10-17 03:15:59 UTC'" ([cwd-189], 2015). An offset is refused, and
+  so is a space for the `T`.
+- **A member the policy language lacks (secondary).** An IAM bucket policy sent as a POST
+  policy, with `Version`, `Id` and `Statement`, drew `InvalidPolicyDocument`, "Invalid Policy:
+  Unexpected: 'statement'" ([so-31169349], 2015): the name lowercased, in single quotes, and
+  reported before the missing expiration and conditions. Why `statement` rather than
+  `version`, the first member, is not shown. versitygw writes "Unexpected: %q" (double quotes).
+- **Missing expiration, missing or non-list conditions: not found.** versitygw: "Invalid
+  Policy: Policy missing expiration.", "Invalid Policy: Policy missing conditions.", "Invalid
+  Policy: Invalid 'conditions' value: must be a List."; RGW's internal texts are the same
+  phrases. s3-tests expects 400 for each (§7 items 21, 22, 26, 27).
+- **A float bound (secondary).** `["content-length-range",0,512.0]`, decoded from the capture's
+  policy: 400 `InvalidPolicyDocument`, "Invalid Policy: Invalid JSON." ([repost-float], 2023;
+  [so-77643928]).
+- **A null simple-condition value (secondary).** `{"success_action_redirect": null}`: "Invalid
+  Policy: Invalid JSON." ([cwd-230], 2019), where a number drew "value must be a string" (§8.2).
+- **"Invalid Policy: Invalid Condition: missing operation identifier." (secondary)**
+  ([so-43431505], 2017), its policy not shown; versitygw gives it for an empty condition `[]`.
+- **"Invalid Policy: Token - must be enclosed in quotes." (secondary)** ([so-73624713], 2022),
+  its policy not shown.
+- **Not found**, with versitygw's texts: an unknown operation, "Invalid Policy: Invalid
+  Condition: unknown operation '%s'."; the wrong number of items, "Invalid Policy: Invalid %s:
+  wrong number of arguments.", `%s` the operation; a condition of another JSON type, "Invalid
+  Policy: Invalid condition test: must be a List or Object."; base64 that does not decode,
+  "Invalid Policy: invalid Base64 encoding."; operands that are not strings, "Invalid JSON."
+  in its tests.
+
+### 13.2 The form
+
+- **The fields before the file (secondary).** Code `MaxPostPreDataLengthExceeded`, without the
+  table's `Error`; message "Your POST request fields preceeding the upload file was too
+  large." (sic); the element `<MaxPostPreDataLengthBytes>20480</MaxPostPreDataLengthBytes>`
+  ([s3du-45], 2013; [ember-45], 2015; [rnbu-55], 2018; [so-65267176], 2020). The limit is 20,480
+  bytes. Each was a form whose file part had another name, so its content counted as a field.
+  A file part sent as `Content-Disposition: file; name="file"` drew the same ([so-18541652],
+  2013): only a `form-data` part named `file` is the file.
+- **No file (secondary).** Never `IncorrectNumberOfFilesInPostRequest`: 400 `InvalidArgument`,
+  "POST requires exactly one file upload per request.", `ArgumentName` `file`, `ArgumentValue`
+  `0` ([vue-dropzone-303], 2018; [rnip-97], 2016; [boto3-934], 2016, a part named after its path;
+  [so-64554749], 2020). Two parts named `file`: the same message in prose only.
+- **A Content-Type without a boundary (secondary).** 400 `MalformedPOSTRequest`, "The body of
+  your POST request is not well-formed multipart/form-data." ([repost-boundary], 2017).
+- **A field no condition covers is named as sent (secondary).** "Invalid according to Policy:
+  Extra input fields: StorageClass" ([so-54014351], 2019), against §8.2's lowercase `filename`,
+  whose form may have carried a lowercase field Flash added.
+- **A failed condition keeps the policy's spelling and escapes quotes (secondary).** `["eq",
+  "$Content-Disposition", "filename=\"test.png\""]` ([so-79055241], 2024); `["eq",
+  "$X-Amz-Date", ...]` from an SDK and `["eq", "$x-amz-date", ...]` from a user ([sdkjs-1514],
+  2017).
+
+### 13.3 Signing
+
+- **Another region (secondary).** 400 `InvalidArgument`, "the region 'us-east-1' is wrong;
+  expecting 'us-west-1'", `ArgumentName` `X-Amz-Credential`, `ArgumentValue` the credential,
+  and `<Region>us-west-1</Region>` ([slingshot-150], 2015; [sdkjs-2529], 2019): the message a
+  presigned URL gets, without its "Error parsing the X-Amz-Credential parameter; " prefix.
+- **An empty access key (secondary).** 400 `InvalidArgument`, "a non-empty Access Key (AKID)
+  must be provided in the credential.", naming the credential ([outline-7060], 2024).
+- **A malformed `x-amz-date` (secondary).** `InvalidArgument`, "X-Amz-Date must be formated via
+  ISO8601 Long format" (sic), `ArgumentName` `X-Amz-Date`, `ArgumentValue` as sent
+  ([s3upload-1], 2017).
+- **Not found**, with versitygw's texts: a malformed credential, "the Credential is mal-formed;
+  expecting \"<YOUR-AKID>/YYYYMMDD/REGION/SERVICE/aws4_request\"."; its date, "incorrect date
+  format %q. This date in the credential must be in the format \"yyyyMMdd\"."; its service,
+  "incorrect service %q. This endpoint belongs to \"s3\"."; its terminal, "incorrect terminal
+  %q. This endpoint uses \"aws4_request\"."; another algorithm. Nor whether S3 checks the
+  credential's day against `x-amz-date`; versitygw does not.
+- **An unknown access key (secondary).** `InvalidAccessKeyId`, "The AWS Access Key Id you
+  provided does not exist in our records.", `<AWSAccessKeyId>` the credential's key
+  ([cognito-1], 2019; [sdkjs-3878], 2021; [sdknet-1989], 2022); 403 from prose and s3-tests.
+- **A signature that does not match (secondary).** Elements in order: `AWSAccessKeyId`,
+  `StringToSign`, `SignatureProvided`, `StringToSignBytes`, with no canonical request.
+  `StringToSignBytes` is two lowercase hex digits a byte, single spaces between, and decodes to
+  the policy as sent ([fausto-65], 2019, SigV4; SigV2 captures alike).
+
+### 13.4 Answers
+
+- **Redirects (secondary).** S3 keeps a query the URL has, raw space and all, appends with `&`,
+  and adds `bucket`, `key` and `etag` in that order, form-encoded: the key's `/` as `%2F`, a
+  space as `+`, the ETag quoted as `%22...%22`:
+  `...upload_complete?md5=...&remote_url=https://s3.amazonaws.com/omnivore-scratch/8329/1391639479.7579765/Untitled copy.sketch&bucket=omnivore-scratch&key=8329%2F1391639479.7579765%2FUntitled+copy.sketch&etag=%2247371919f8bdb6e35df40d8744db818a%22`
+  ([layervault-8], 2014); `...?bucket=%bucket%&key=images%2F1851413185242563.jpg&etag=%22...%22`
+  ([so-18390253], 2013). Other reserved and non-ASCII characters: not shown.
+- **A 204 (secondary).** `HTTP/1.1 204 No Content` with `ETag` quoted and `Location`, the
+  object's URL with the key's `/` as `%2F`, no `Content-Type` and no `Content-Length`
+  ([boto3-2851], 2021, an SDK maintainer's wire trace; [lepozepo-72], 2015).
+- **A request header that conflicts with a field: not found.**
+
+### 13.5 Sources
+
+- [cwd-2] https://github.com/dwilkie/carrierwave_direct/issues/2
+- [cwd-189] https://github.com/dwilkie/carrierwave_direct/pull/189
+- [cwd-230] https://github.com/dwilkie/carrierwave_direct/issues/230
+- [so-31169349] https://stackoverflow.com/q/31169349
+- [repost-float] https://repost.aws/questions/QUo27u4OYpTA-XvAWr72xeRg ; [so-77643928] https://stackoverflow.com/q/77643928
+- [so-43431505] https://stackoverflow.com/q/43431505
+- [so-73624713] https://stackoverflow.com/q/73624713
+- [s3du-45] https://github.com/waynehoover/s3_direct_upload/issues/45
+- [ember-45] https://github.com/benefitcloud/ember-uploader/issues/45
+- [rnbu-55] https://github.com/Vydia/react-native-background-upload/issues/55
+- [so-65267176] https://stackoverflow.com/q/65267176 ; [so-18541652] https://stackoverflow.com/q/18541652
+- [vue-dropzone-303] https://github.com/rowanwins/vue-dropzone/issues/303
+- [rnip-97] https://github.com/react-native-image-picker/react-native-image-picker/issues/97
+- [boto3-934] https://github.com/boto/boto3/issues/934 ; [so-64554749] https://stackoverflow.com/q/64554749
+- [repost-boundary] https://repost.aws/questions/QUeXkR-SeeSaCFrB_koqLpKA
+- [so-54014351] https://stackoverflow.com/q/54014351 ; [so-79055241] https://stackoverflow.com/q/79055241
+- [sdkjs-1514] https://github.com/aws/aws-sdk-js/issues/1514
+- [slingshot-150] https://github.com/CulturalMe/meteor-slingshot/issues/150 ; [sdkjs-2529] https://github.com/aws/aws-sdk-js/issues/2529
+- [outline-7060] https://github.com/outline/outline/issues/7060
+- [s3upload-1] https://github.com/michaeldyrynda/s3upload/issues/1
+- [cognito-1] https://github.com/furaiev/amazon-cognito-identity-dart-2/issues/1 ; [sdkjs-3878] https://github.com/aws/aws-sdk-js/issues/3878 ; [sdknet-1989] https://github.com/aws/aws-sdk-net/issues/1989
+- [fausto-65] https://github.com/Fausto95/aws-s3/issues/65
+- [layervault-8] https://github.com/layervault/layervault_ruby_client/issues/8 ; [so-18390253] https://stackoverflow.com/q/18390253
+- [boto3-2851] https://github.com/boto/boto3/issues/2851 ; [lepozepo-72] https://github.com/Lepozepo/S3/issues/72
+- [versitygw] https://github.com/versity/versitygw/blob/b91e178a12fae7a6acf31597a70aef8b8b3e72f4/s3err/post-object.go
 
 ## Sources
 

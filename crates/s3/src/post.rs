@@ -75,12 +75,19 @@ pub enum PostError {
         "Bucket POST must contain a field named '{0}'.  If it is specified, please check the order of the fields."
     )]
     Missing(&'static str),
-    /// A field holds a value S3 does not take.
+    /// A signing field holds a value S3 does not take (19 §13).
     #[error("{message}")]
     Field {
         name: &'static str,
         value: String,
-        message: &'static str,
+        message: String,
+    },
+    /// The credential's scope names another region than the endpoint's (19 §13).
+    #[error("the region '{given}' is wrong; expecting '{expected}'")]
+    Region {
+        credential: String,
+        given: String,
+        expected: String,
     },
     /// Signature Version 2's fields, which mantle does not serve (05 §1).
     #[error(
@@ -89,7 +96,7 @@ pub enum PostError {
     SignatureVersion,
     #[error("Your key is too long.")]
     KeyTooLong,
-    #[error("The AWS access key ID that you provided does not exist in our records.")]
+    #[error("The AWS Access Key Id you provided does not exist in our records.")]
     UnknownKey(String),
     /// The signature is not the policy's, as sent, under the access key's secret.
     #[error(
@@ -108,7 +115,7 @@ pub enum PostError {
     /// A condition fails, written as S3 writes it (19 §8.1).
     #[error("Invalid according to Policy: Policy Condition failed: {0}")]
     Condition(String),
-    /// A field no condition covers, its name lowercased as S3 reports it (19 §8.2).
+    /// A field no condition covers, named as the form sent it (19 §13).
     #[error("Invalid according to Policy: Extra input fields: {0}")]
     Extra(String),
     #[error("Your proposed upload exceeds the maximum allowed size")]
@@ -128,7 +135,7 @@ impl PostError {
     /// field `InvalidArgument`, where it says `UserKeyMustBeSpecified` (19 §10 items 1, 2).
     pub fn code(&self) -> (&'static str, u16) {
         match self {
-            Self::Missing(_) | Self::Field { .. } => ("InvalidArgument", 400),
+            Self::Missing(_) | Self::Field { .. } | Self::Region { .. } => ("InvalidArgument", 400),
             Self::SignatureVersion | Self::Conflict(_) => ("InvalidRequest", 400),
             Self::KeyTooLong => ("KeyTooLongError", 400),
             Self::UnknownKey(_) => ("InvalidAccessKeyId", 403),
@@ -141,7 +148,7 @@ impl PostError {
         }
     }
 
-    /// The elements S3's error carries after its message, as recorded (19 §8).
+    /// The elements S3's error carries after its message, as recorded (19 §8, §13).
     pub fn details(&self) -> Vec<(&'static str, String)> {
         match self {
             Self::Missing(name) => vec![
@@ -151,6 +158,15 @@ impl PostError {
             Self::Field { name, value, .. } => vec![
                 ("ArgumentName", (*name).to_owned()),
                 ("ArgumentValue", value.clone()),
+            ],
+            Self::Region {
+                credential,
+                expected,
+                ..
+            } => vec![
+                ("ArgumentName", "X-Amz-Credential".to_owned()),
+                ("ArgumentValue", credential.clone()),
+                ("Region", expected.clone()),
             ],
             Self::UnknownKey(key) => vec![("AWSAccessKeyId", key.clone())],
             Self::Mismatch {
@@ -279,10 +295,17 @@ pub fn authorize(
         return Err(PostError::Field {
             name: "X-Amz-Algorithm",
             value: algorithm.to_owned(),
-            message: "X-Amz-Algorithm only supports \"AWS4-HMAC-SHA256\"",
+            message: "X-Amz-Algorithm only supports \"AWS4-HMAC-SHA256\"".to_owned(),
         });
     }
-    let scope = Scope::parse(credential, date, region)?;
+    if time::parse_amz_date(date).is_none() {
+        return Err(PostError::Field {
+            name: "X-Amz-Date",
+            value: date.to_owned(),
+            message: "X-Amz-Date must be formated via ISO8601 Long format".to_owned(),
+        });
+    }
+    let scope = Scope::parse(credential, region)?;
     let secret = secret(scope.access_key)
         .ok_or_else(|| PostError::UnknownKey(scope.access_key.to_owned()))?;
     // "Create the signature as an HMAC-SHA256 hash of the string to sign", the policy as sent
@@ -322,7 +345,7 @@ pub fn authorize(
                 .get(..IGNORED.len())
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case(IGNORED));
         if !exempt && !policy.conditions.iter().any(|c| c.covers(name)) {
-            return Err(PostError::Extra(name.to_ascii_lowercase()));
+            return Err(PostError::Extra(name.clone()));
         }
     }
     Ok(Authorized {
@@ -338,45 +361,50 @@ struct Scope<'a> {
 }
 
 impl<'a> Scope<'a> {
-    /// The scope `credential` names, which must be this endpoint's, on the day `date`, the
-    /// form's `x-amz-date`, names: "The bucket must be in the region that you specified in the
-    /// credential scope" and "It is the same date you used in creating the signing key" (19
-    /// §3.1).
-    fn parse(credential: &'a str, date: &str, region: &str) -> Result<Self, PostError> {
-        let malformed = |message| PostError::Field {
+    /// The scope `credential` names, which must be this endpoint's: "The bucket must be in the
+    /// region that you specified in the credential scope" (19 §3.1). Each fault is
+    /// `InvalidArgument` naming the credential, with S3's message where one is recorded, and
+    /// otherwise the one S3 gives a presigned URL without its prefix, as versitygw words them
+    /// (19 §13). The day's agreement with `x-amz-date`, which AWS's text asks for, is left to
+    /// the signature: S3's enforcement of it is unrecorded, and the signing key is the day's.
+    fn parse(credential: &'a str, region: &str) -> Result<Self, PostError> {
+        let fault = |message: String| PostError::Field {
             name: "X-Amz-Credential",
             value: credential.to_owned(),
             message,
         };
-        let mut parts = credential.rsplitn(5, '/');
-        let (terminator, service, scoped_region, day, access_key) = (
-            parts.next().unwrap_or_default(),
-            parts.next().unwrap_or_default(),
-            parts.next().unwrap_or_default(),
-            parts.next().unwrap_or_default(),
-            parts.next().unwrap_or_default(),
-        );
-        if access_key.is_empty() || terminator != "aws4_request" || service != "s3" {
-            return Err(malformed(
-                "Error parsing the X-Amz-Credential parameter; the Credential is mal-formed; expecting \"<YOUR-AKID>/YYYYMMDD/REGION/SERVICE/aws4_request\".",
+        let parts: Vec<&str> = credential.rsplitn(5, '/').collect();
+        let [terminator, service, scoped, day, access_key] = parts.as_slice() else {
+            return Err(fault(
+                "the Credential is mal-formed; expecting \"<YOUR-AKID>/YYYYMMDD/REGION/SERVICE/aws4_request\".".to_owned(),
+            ));
+        };
+        if access_key.is_empty() {
+            return Err(fault(
+                "a non-empty Access Key (AKID) must be provided in the credential.".to_owned(),
             ));
         }
-        if scoped_region != region {
-            return Err(malformed(
-                "Error parsing the X-Amz-Credential parameter; the region is wrong.",
-            ));
+        if day.len() != 8 || time::parse_amz_date(&format!("{day}T000000Z")).is_none() {
+            return Err(fault(format!(
+                "incorrect date format \"{day}\". This date in the credential must be in the format \"yyyyMMdd\"."
+            )));
         }
-        if time::parse_amz_date(date).is_none() {
-            return Err(PostError::Field {
-                name: "X-Amz-Date",
-                value: date.to_owned(),
-                message: "X-Amz-Date must be in the ISO8601 Long Format \"yyyyMMdd'T'HHmmss'Z'\"",
+        if *scoped != region {
+            return Err(PostError::Region {
+                credential: credential.to_owned(),
+                given: (*scoped).to_owned(),
+                expected: region.to_owned(),
             });
         }
-        if date.get(..8) != Some(day) {
-            return Err(malformed(
-                "Error parsing the X-Amz-Credential parameter; incorrect date format. This date in the credential must be in the format \"yyyyMMdd\".",
-            ));
+        if *service != "s3" {
+            return Err(fault(format!(
+                "incorrect service \"{service}\". This endpoint belongs to \"s3\"."
+            )));
+        }
+        if *terminator != "aws4_request" {
+            return Err(fault(format!(
+                "incorrect terminal \"{terminator}\". This endpoint uses \"aws4_request\"."
+            )));
         }
         Ok(Self {
             access_key,
@@ -434,22 +462,33 @@ enum Bound {
 
 /// The document a policy's text encodes: base64 of JSON.
 fn document(text: &str) -> Result<Value, PostError> {
-    let invalid = || PostError::Policy("Invalid JSON.".to_owned());
-    let decoded = BASE64.decode(text).map_err(|_| invalid())?;
-    json::parse(&decoded).map_err(|_| invalid())
+    let decoded = BASE64
+        .decode(text)
+        .map_err(|_| PostError::Policy("invalid Base64 encoding.".to_owned()))?;
+    json::parse(&decoded).map_err(|_| PostError::Policy("Invalid JSON.".to_owned()))
 }
 
 impl<'a> Policy<'a> {
     /// The policy `document` holds: an object with `expiration` and `conditions`, named exactly
-    /// so, which s3-tests expects of `EXPIRATION` and `CONDITIONS` (19 §7 items 21, 22). Other
-    /// members name no condition, and are passed over.
+    /// so, which s3-tests expects of `EXPIRATION` and `CONDITIONS` (19 §7 items 21, 22). S3
+    /// answered a member of another name "Unexpected", naming it in lowercase, before asking
+    /// for either (19 §13).
     fn read(document: &'a Value) -> Result<Self, PostError> {
-        if !matches!(document, Value::Object(_)) {
+        let Value::Object(members) = document else {
             return Err(PostError::Policy("Invalid JSON.".to_owned()));
+        };
+        if let Some((name, _)) = members
+            .iter()
+            .find(|(name, _)| name != "expiration" && name != "conditions")
+        {
+            return Err(PostError::Policy(format!(
+                "Unexpected: '{}'",
+                name.to_lowercase()
+            )));
         }
         let expiration = match document.member("expiration") {
             None => return Err(PostError::Policy("Policy missing expiration.".to_owned())),
-            Some(Value::String(text)) => time::parse_iso8601(text).ok_or_else(|| {
+            Some(Value::String(text)) => expiration(text).ok_or_else(|| {
                 PostError::Policy(format!("Invalid 'expiration' value: '{text}'"))
             })?,
             Some(other) => {
@@ -467,7 +506,7 @@ impl<'a> Policy<'a> {
                 .collect::<Result<_, _>>()?,
             Some(_) => {
                 return Err(PostError::Policy(
-                    "Invalid 'conditions' value: must be a list.".to_owned(),
+                    "Invalid 'conditions' value: must be a List.".to_owned(),
                 ));
             }
         };
@@ -488,9 +527,25 @@ impl<'a> Policy<'a> {
     }
 }
 
+/// An expiration "in ISO8601 GMT date format" (19 §4.1): a time in UTC, `Z`, with or without
+/// fractional seconds, as AWS's example and botocore write it. S3 refused one with an offset,
+/// `+02:00`, and one with a space for the `T` (19 §13).
+fn expiration(text: &str) -> Option<(i64, u32)> {
+    if text.ends_with('Z') {
+        time::parse_iso8601(text)
+    } else {
+        None
+    }
+}
+
 impl<'a> Condition<'a> {
+    /// A condition as the policy writes it, with S3's answer to each shape it refuses where one
+    /// is recorded (19 §8.2, §13), and versitygw's wording of S3's where none is: JSON's `null`,
+    /// and a value of another type where a string or a whole size belongs, S3 answered as
+    /// "Invalid JSON.", as it did `{"success_action_redirect": null}` and a bound of `512.0`.
     fn read(value: &'a Value) -> Result<Self, PostError> {
         let policy = |message: &str| PostError::Policy(message.to_owned());
+        let invalid_json = || policy("Invalid JSON.");
         match value {
             Value::Object(members) => {
                 let [(name, value)] = members.as_slice() else {
@@ -498,8 +553,12 @@ impl<'a> Condition<'a> {
                         "Invalid Simple-Condition: Simple-Conditions must have exactly one property specified.",
                     ));
                 };
-                let Value::String(value) = value else {
-                    return Err(policy("Invalid Simple-Condition: value must be a string."));
+                let value = match value {
+                    Value::String(value) => value,
+                    Value::Null => return Err(invalid_json()),
+                    _ => {
+                        return Err(policy("Invalid Simple-Condition: value must be a string."));
+                    }
                 };
                 Ok(Self {
                     test: Test::Eq {
@@ -511,25 +570,26 @@ impl<'a> Condition<'a> {
             }
             Value::Array(items) => {
                 let Some(Value::String(operator)) = items.first() else {
-                    return Err(policy(
-                        "Invalid Condition: the first element must be the operation.",
-                    ));
+                    return Err(policy("Invalid Condition: missing operation identifier."));
                 };
+                let arity =
+                    || PostError::Policy(format!("Invalid {operator}: wrong number of arguments."));
                 let test = if operator.eq_ignore_ascii_case("content-length-range") {
                     let [_, min, max] = items.as_slice() else {
-                        return Err(policy(
-                            "Invalid content-length-range: must specify a minimum and a maximum.",
-                        ));
+                        return Err(arity());
                     };
                     Test::Range {
                         min: Bound::read(min)?,
                         max: Bound::read(max)?,
                     }
-                } else {
-                    let [_, Value::String(name), Value::String(operand)] = items.as_slice() else {
-                        return Err(policy(
-                            "Invalid Condition: must be an operation, a field and a value, as strings.",
-                        ));
+                } else if operator.eq_ignore_ascii_case("eq")
+                    || operator.eq_ignore_ascii_case("starts-with")
+                {
+                    let [_, name, operand] = items.as_slice() else {
+                        return Err(arity());
+                    };
+                    let (Value::String(name), Value::String(operand)) = (name, operand) else {
+                        return Err(invalid_json());
                     };
                     // A name without `$` names no field, and the condition fails (19 §8.1).
                     let field = name.strip_prefix('$');
@@ -538,23 +598,23 @@ impl<'a> Condition<'a> {
                             field,
                             value: operand,
                         }
-                    } else if operator.eq_ignore_ascii_case("starts-with") {
+                    } else {
                         Test::StartsWith {
                             field,
                             prefix: operand,
                         }
-                    } else {
-                        return Err(PostError::Policy(format!(
-                            "Invalid Condition: unknown operation '{operator}'."
-                        )));
                     }
+                } else {
+                    return Err(PostError::Policy(format!(
+                        "Invalid Condition: unknown operation '{operator}'."
+                    )));
                 };
                 Ok(Self {
                     test,
                     source: Source::List(items),
                 })
             }
-            _ => Err(policy("Invalid Condition: must be an object or a list.")),
+            _ => Err(policy("Invalid condition test: must be a List or Object.")),
         }
     }
 
@@ -620,15 +680,12 @@ impl Source<'_> {
 }
 
 impl Bound {
-    /// A number must be a whole one, and not below zero: s3-tests expects `-1` refused (19 §7
-    /// item 30). A string is read as S3 was recorded reading `"5"`, and one holding no number
-    /// fails the condition (19 §8.1).
+    /// A bound is a whole size: S3 answered `512.0` as "Invalid JSON." (19 §13), and so is
+    /// anything else that is not one, a size below zero among them, which s3-tests expects
+    /// refused (19 §7 item 30). A string is read as S3 was recorded reading `"5"`, and one
+    /// holding no size fails the condition, as `"test"` did (19 §8.1).
     fn read(value: &Value) -> Result<Self, PostError> {
-        let invalid = || {
-            PostError::Policy(
-                "Invalid content-length-range: bounds must be non-negative integers.".to_owned(),
-            )
-        };
+        let invalid = || PostError::Policy("Invalid JSON.".to_owned());
         match value {
             Value::Number(written) => {
                 let digits = written.strip_prefix('-').unwrap_or(written);
@@ -707,15 +764,19 @@ pub fn conflict(form: &Form, request: &[(&str, &str)]) -> Result<(), PostError> 
     Ok(())
 }
 
-/// How a successful upload is answered (19 §2.2, §2.5, §8).
+/// How a successful upload is answered (19 §2.2, §2.5, §8, §13).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Answer {
-    /// `303 See Other` to this URL, with an empty body.
-    Redirect(String),
-    /// `200` or `204`, with an empty body.
-    Empty(u16),
-    /// `201`, with this `PostResponse`.
-    Created(String),
+pub struct Answer {
+    /// `303` to a redirect; else `200`, `201` or `204`.
+    pub status: u16,
+    /// The `Location` header: where a redirect goes, or the object's URL, which S3 sends with a
+    /// 201 and a 204 alike.
+    pub location: String,
+    /// The `ETag` header, quoted, which S3 sends with the object's URL; no redirect of S3's is
+    /// recorded with one.
+    pub etag: Option<String>,
+    /// The `PostResponse` a 201 carries; every other answer's body is empty.
+    pub body: Option<String>,
 }
 
 /// The answer to a form whose file was stored as `key` in `bucket` with `etag`, unquoted, at
@@ -729,52 +790,93 @@ pub fn answer(form: &Form, bucket: &str, key: &str, etag: &str, location: &str) 
         .get("success_action_redirect")
         .or_else(|| form.get("redirect"));
     if let Some(url) = redirect.and_then(|url| redirect_to(url, bucket, key, etag)) {
-        return Answer::Redirect(url);
+        return Answer {
+            status: 303,
+            location: url,
+            etag: None,
+            body: None,
+        };
     }
-    match form.get("success_action_status") {
-        Some("200") => Answer::Empty(200),
-        Some("201") => Answer::Created(crate::response::post_response(location, bucket, key, etag)),
-        _ => Answer::Empty(204),
+    let (status, body) = match form.get("success_action_status") {
+        Some("200") => (200, None),
+        Some("201") => (
+            201,
+            Some(crate::response::post_response(location, bucket, key, etag)),
+        ),
+        _ => (204, None),
+    };
+    Answer {
+        status,
+        location: location.to_owned(),
+        etag: Some(format!("\"{etag}\"")),
+        body,
     }
 }
 
 /// The URL of the object `key` under `base`, the bucket's URL ending in `/`: the key
-/// percent-encoded, `/` included, as S3 writes `Location` (19 §8.2).
+/// percent-encoded, `/` included, as S3 writes `Location` in a 201's body and a 204's header
+/// (19 §8.2, §13).
 pub fn location(base: &str, key: &str) -> String {
     format!("{base}{}", sigv4::uri_encode(key.as_bytes(), true))
 }
 
-/// `url` with `bucket`, `key` and the quoted `etag` appended to its query (19 §2.2), or `None`
-/// for a URL S3 would not interpret: one that is not absolute `http` or `https`, as S3 ignored
-/// a relative one (19 §8.1), or one a `Location` header cannot carry. The values are
-/// percent-encoded, a key's `/` kept as AWS's sample shows it (19 §2.5).
+/// `url` with `bucket`, `key` and the quoted `etag` appended to its query, as S3 appends them:
+/// after a query the URL has, kept as sent, with `&`, and each value form-encoded, a key's `/`
+/// as `%2F` and a space as `+` (19 §13). `None` for a URL S3 would not interpret: one that is
+/// not absolute `http` or `https`, as S3 ignored a relative one (19 §8.1), or one a `Location`
+/// header cannot carry, holding a control character or a byte outside ASCII. A fragment stays
+/// last, where RFC 3986 §3 puts it.
 fn redirect_to(url: &str, bucket: &str, key: &str, etag: &str) -> Option<String> {
     let (scheme, rest) = url.split_once("://")?;
     if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
         return None;
     }
     let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    if host.is_empty() || !url.bytes().all(|b| b.is_ascii_graphic()) {
+    if host.is_empty()
+        || host.contains(' ')
+        || !url.bytes().all(|b| b == b' ' || b.is_ascii_graphic())
+    {
         return None;
     }
     let (base, fragment) = match url.split_once('#') {
         Some((base, fragment)) => (base, Some(fragment)),
         None => (url, None),
     };
-    let encode = |text: &str| sigv4::uri_encode(text.as_bytes(), false);
     let mut out = String::from(base);
     out.push(if base.contains('?') { '&' } else { '?' });
     out.push_str("bucket=");
-    out.push_str(&encode(bucket));
+    form_encode(&mut out, bucket);
     out.push_str("&key=");
-    out.push_str(&encode(key));
+    form_encode(&mut out, key);
     out.push_str("&etag=");
-    out.push_str(&encode(&format!("\"{etag}\"")));
+    form_encode(&mut out, &format!("\"{etag}\""));
     if let Some(fragment) = fragment {
         out.push('#');
         out.push_str(fragment);
     }
     Some(out)
+}
+
+/// `text` as `application/x-www-form-urlencoded` writes a value (WHATWG URL §5.2): letters,
+/// digits and `*-._` as they are, a space as `+`, and every other byte of its UTF-8 as `%XX`,
+/// which is how S3 wrote `8329%2F1391639479.7579765%2FUntitled+copy.sketch` (19 §13).
+fn form_encode(out: &mut String, text: &str) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for &b in text.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'*' | b'-' | b'.' | b'_') {
+            out.push(char::from(b));
+        } else if b == b' ' {
+            out.push('+');
+        } else {
+            out.push('%');
+            out.push(char::from(
+                HEX.get(usize::from(b >> 4)).copied().unwrap_or(b'0'),
+            ));
+            out.push(char::from(
+                HEX.get(usize::from(b & 15)).copied().unwrap_or(b'0'),
+            ));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -926,9 +1028,12 @@ mod tests {
         );
         assert_eq!(
             answer(&form, "sigv4examplebucket", "user/user1/photo.jpg", "39d459dfbc0faabbb5e179358dfb94c3", ""),
-            Answer::Redirect(
-                "http://sigv4examplebucket.s3.amazonaws.com/successful_upload.html?bucket=sigv4examplebucket&key=user/user1/photo.jpg&etag=%2239d459dfbc0faabbb5e179358dfb94c3%22".into()
-            )
+            Answer {
+                status: 303,
+                location: "http://sigv4examplebucket.s3.amazonaws.com/successful_upload.html?bucket=sigv4examplebucket&key=user%2Fuser1%2Fphoto.jpg&etag=%2239d459dfbc0faabbb5e179358dfb94c3%22".into(),
+                etag: None,
+                body: None,
+            }
         );
     }
 
@@ -1058,6 +1163,89 @@ mod tests {
         )
         .0;
         assert_eq!(check(&v2), Err(PostError::SignatureVersion));
+        // The signing fields' values, each answered as S3 answered it (19 §13).
+        let with = |field: &str, value: &str| {
+            let fields: Vec<_> = full
+                .iter()
+                .map(|&(n, v)| if n == field { (n, value) } else { (n, v) })
+                .collect();
+            check(&form(&fields, None, b"").0).unwrap_err()
+        };
+        let argument = |error: PostError| {
+            let details = error.details();
+            (
+                error.to_string(),
+                details[0].1.clone(),
+                details[1].1.clone(),
+            )
+        };
+        assert_eq!(
+            argument(with("x-amz-date", "2017-10-22T03:21:54+00:00")),
+            (
+                "X-Amz-Date must be formated via ISO8601 Long format".into(),
+                "X-Amz-Date".into(),
+                "2017-10-22T03:21:54+00:00".into()
+            )
+        );
+        let empty = "/20240616/us-east-1/s3/aws4_request";
+        assert_eq!(
+            argument(with("x-amz-credential", empty)),
+            (
+                "a non-empty Access Key (AKID) must be provided in the credential.".into(),
+                "X-Amz-Credential".into(),
+                empty.into()
+            )
+        );
+        let west = "AKIAIOSFODNN7EXAMPLE/20151229/us-west-1/s3/aws4_request";
+        let region = with("x-amz-credential", west);
+        assert_eq!(
+            region.to_string(),
+            "the region 'us-west-1' is wrong; expecting 'us-east-1'"
+        );
+        assert_eq!(
+            region.details(),
+            vec![
+                ("ArgumentName", "X-Amz-Credential".to_owned()),
+                ("ArgumentValue", west.to_owned()),
+                ("Region", "us-east-1".to_owned())
+            ]
+        );
+        for (credential, message) in [
+            (
+                "no-slashes",
+                "the Credential is mal-formed; expecting \"<YOUR-AKID>/YYYYMMDD/REGION/SERVICE/aws4_request\".",
+            ),
+            (
+                "AKID/2015122/us-east-1/s3/aws4_request",
+                "incorrect date format \"2015122\". This date in the credential must be in the format \"yyyyMMdd\".",
+            ),
+            (
+                "AKID/20151229/us-east-1/s4/aws4_request",
+                "incorrect service \"s4\". This endpoint belongs to \"s3\".",
+            ),
+            (
+                "AKID/20151229/us-east-1/s3/aws5_request",
+                "incorrect terminal \"aws5_request\". This endpoint uses \"aws4_request\".",
+            ),
+        ] {
+            assert_eq!(with("x-amz-credential", credential).to_string(), message);
+        }
+        assert_eq!(
+            with("x-amz-algorithm", "AWS4-ECDSA-P256-SHA256").code(),
+            ("InvalidArgument", 400)
+        );
+        let unknown = with(
+            "x-amz-credential",
+            "AKIDUNKNOWN/20151229/us-east-1/s3/aws4_request",
+        );
+        assert_eq!(
+            (unknown.to_string(), unknown.code(), unknown.details()),
+            (
+                "The AWS Access Key Id you provided does not exist in our records.".into(),
+                ("InvalidAccessKeyId", 403),
+                vec![("AWSAccessKeyId", "AKIDUNKNOWN".to_owned())]
+            )
+        );
         let long = "k".repeat(MAX_KEY + 1);
         assert_eq!(
             key(&form(&[("key", &long)], None, b"").0),
@@ -1164,10 +1352,19 @@ mod tests {
                 "[\"eq\", \"$acl\", \"private\"]".into()
             ))
         );
-        // A field no condition covers, named lowercase.
+        // A field no condition covers, named as sent, as S3 named `StorageClass` (19 §13).
         assert_eq!(
-            form_with("", &[("Filename", "x")]).map_err(|e| e.to_string()),
-            Err("Invalid according to Policy: Extra input fields: filename".into())
+            form_with("", &[("StorageClass", "x")]).map_err(|e| e.to_string()),
+            Err("Invalid according to Policy: Extra input fields: StorageClass".into())
+        );
+        // A condition's text keeps the policy's spelling and escapes its quotes (19 §13).
+        assert_eq!(
+            form_with(
+                ", [\"eq\", \"$Content-Disposition\", \"filename=\\\"test.png\\\"\"]",
+                &[("Content-Disposition", "inline")]
+            )
+            .map_err(|e| e.to_string()),
+            Err("Invalid according to Policy: Policy Condition failed: [\"eq\", \"$Content-Disposition\", \"filename=\\\"test.png\\\"\"]".into())
         );
         // Ignored and exempt fields need no condition.
         assert!(form_with("", &[("x-ignore-foo", "bar"), ("X-Ignore-Bar", "baz")]).is_ok());
@@ -1214,6 +1411,44 @@ mod tests {
         invalid(&policy(", [\"ne\", \"$key\", \"k\"]"));
         invalid(&policy(", [\"eq\", \"$key\"]"));
         invalid(&policy(", \"key\""));
+        // S3's recorded answers to other shapes (19 §13).
+        let message = |policy: &str| refused(policy).to_string();
+        assert_eq!(
+            message(&policy(", {\"success_action_redirect\": null}")),
+            "Invalid Policy: Invalid JSON."
+        );
+        assert_eq!(
+            message(&policy(", [\"content-length-range\", 0, 512.0]")),
+            "Invalid Policy: Invalid JSON."
+        );
+        assert_eq!(
+            message(&policy(", [\"eq\", \"$key\", 5]")),
+            "Invalid Policy: Invalid JSON."
+        );
+        assert_eq!(
+            message(&policy(", []")),
+            "Invalid Policy: Invalid Condition: missing operation identifier."
+        );
+        assert_eq!(
+            message(&policy(", [\"starts-with\", \"$key\"]")),
+            "Invalid Policy: Invalid starts-with: wrong number of arguments."
+        );
+        assert_eq!(
+            message(&policy(", [\"ne\", \"$key\", \"k\"]")),
+            "Invalid Policy: Invalid Condition: unknown operation 'ne'."
+        );
+        assert_eq!(
+            message("{\"Version\": \"2012-10-17\", \"Statement\": []}"),
+            "Invalid Policy: Unexpected: 'version'"
+        );
+        assert_eq!(
+            message("{\"expiration\": \"2011-09-13T07:52:58+02:00\", \"conditions\": []}"),
+            "Invalid Policy: Invalid 'expiration' value: '2011-09-13T07:52:58+02:00'"
+        );
+        assert_eq!(
+            message("{\"expiration\": \"2015-10-17 03:15:59 UTC\", \"conditions\": []}"),
+            "Invalid Policy: Invalid 'expiration' value: '2015-10-17 03:15:59 UTC'"
+        );
     }
 
     /// `content-length-range` bounds the file, inclusive, as S3 was recorded bounding it (19
@@ -1322,30 +1557,25 @@ mod tests {
 
     #[test]
     fn answers_follow_the_form() {
+        let url = location("https://b.s3.example.com/", "dir/my key+é");
         let answer_to = |fields: &[(&str, &str)]| {
             let (form, _) = form(fields, None, b"");
-            answer(
-                &form,
-                "b",
-                "dir/my key+é",
-                "e",
-                &location("https://b.s3.example.com/", "dir/my key+é"),
-            )
+            answer(&form, "b", "dir/my key+é", "e", &url)
         };
-        assert_eq!(answer_to(&[]), Answer::Empty(204));
-        assert_eq!(
-            answer_to(&[("success_action_status", "404")]),
-            Answer::Empty(204)
-        );
-        assert_eq!(
-            answer_to(&[("success_action_status", "200")]),
-            Answer::Empty(200)
-        );
-        let Answer::Created(body) = answer_to(&[("success_action_status", "201")]) else {
-            panic!("201 is a document");
+        let plain = |status| Answer {
+            status,
+            location: url.clone(),
+            etag: Some("\"e\"".into()),
+            body: None,
         };
+        // A 204 carries the object's ETag and Location, as S3's does (19 §13).
+        assert_eq!(answer_to(&[]), plain(204));
+        assert_eq!(answer_to(&[("success_action_status", "404")]), plain(204));
+        assert_eq!(answer_to(&[("success_action_status", "200")]), plain(200));
+        let created = answer_to(&[("success_action_status", "201")]);
+        assert_eq!((created.status, &created.location), (201, &url));
         assert_eq!(
-            body,
+            created.body.unwrap(),
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<PostResponse><Location>https://b.s3.example.com/dir%2Fmy%20key%2B%C3%A9</Location><Bucket>b</Bucket><Key>dir/my key+é</Key><ETag>\"e\"</ETag></PostResponse>"
         );
         // A relative redirect is ignored, as S3 ignored one; the deprecated field is followed.
@@ -1356,11 +1586,23 @@ mod tests {
             ]),
             answer_to(&[("success_action_status", "201")])
         );
+        let redirect = |url: &str| Answer {
+            status: 303,
+            location: url.into(),
+            etag: None,
+            body: None,
+        };
         assert_eq!(
             answer_to(&[("redirect", "https://example.com/done?x=1#top")]),
-            Answer::Redirect(
-                "https://example.com/done?x=1&bucket=b&key=dir/my%20key%2B%C3%A9&etag=%22e%22#top"
-                    .into()
+            redirect(
+                "https://example.com/done?x=1&bucket=b&key=dir%2Fmy+key%2B%C3%A9&etag=%22e%22#top"
+            )
+        );
+        // An existing query is kept as sent, raw space and all, as S3 kept one (19 §13).
+        assert_eq!(
+            answer_to(&[("success_action_redirect", "https://example.com/up?name=a b")]),
+            redirect(
+                "https://example.com/up?name=a b&bucket=b&key=dir%2Fmy+key%2B%C3%A9&etag=%22e%22"
             )
         );
         for ignored in [
@@ -1368,10 +1610,12 @@ mod tests {
             "http:///path",
             "https://exa mple.com/",
             "example.com",
+            "https://example.com/\r\nSet-Cookie: x",
+            "https://example.com/é",
         ] {
             assert_eq!(
                 answer_to(&[("success_action_redirect", ignored)]),
-                Answer::Empty(204),
+                plain(204),
                 "{ignored}"
             );
         }

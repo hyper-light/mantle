@@ -571,12 +571,16 @@ body, so nothing of the object may be kept until the fields that authorize it ar
   type is its `Content-Type` field's, which the policy covers, and never a header no condition
   can reach. A request that is not `multipart/form-data` is `412 PreconditionFailed` with S3's
   `Condition` (19 §8.1).
-- **The fields before the file** are bounded at 20 KiB: AWS's "20KB" read as 20,480 bytes,
-  the larger of its two meanings, so no form S3 accepts is refused (19 §2.1, §11). The fields
-  with `${filename}` expanded are held to the same bound, since S3 checks the policy against
-  the expanded form (19 §4.4) and a short form could otherwise expand to megabytes.
-- **The file** is the part named `file`, in any case, never a part merely carrying a
-  `filename`: Python's `requests`, which s3-tests posts with, names one on every part (19 §5.5).
+- **The fields before the file** are bounded at 20,480 bytes, the figure S3's own answer to a
+  form over it states: `MaxPostPreDataLengthExceeded`, with `MaxPostPreDataLengthBytes` (19
+  §13.2). The fields with `${filename}` expanded are held to the same bound, since S3 checks
+  the policy against the expanded form (19 §4.4) and a short form could otherwise expand to
+  megabytes.
+- **The file** is the `form-data` part named `file`, in any case, never a part merely
+  carrying a `filename`: Python's `requests`, which s3-tests posts with, names one on every
+  part (19 §5.5). A part of another disposition is a field, as S3 read one, and a form with no
+  file is `InvalidArgument` naming `file`, as S3 answers, never the table's
+  `IncorrectNumberOfFilesInPostRequest` (19 §13.2).
   It ends at the delimiter, whose line may hold only padding, then a CRLF or `--`. Any other
   byte means the boundary appeared inside the file, which RFC 2046 forbids a sender; taking it
   for the end would store a file cut short, and "Amazon S3 never stores partial objects"
@@ -599,15 +603,21 @@ body, so nothing of the object may be kept until the fields that authorize it ar
   2's fields are refused, as its header is. A signed form holds all four and `policy`; the
   first missing is named in S3's spelling and message, `X-Amz-Algorithm` before
   `X-Amz-Credential`, and `key` before any. The credential's scope must be this endpoint's
-  region and `s3`, and its day the `x-amz-date`'s.
+  region and `s3`, each fault `InvalidArgument` with S3's recorded message, a wrong region's
+  with its `Region` (19 §13.3). AWS's text asks the credential's day to be the `x-amz-date`'s;
+  S3's enforcement is unrecorded, and the signature under the day's key and the policy's
+  `x-amz-date` condition already bind both, so the difference is not refused.
 - **The signature** is the policy's as sent, under the day's signing key (19 §3.2), checked
   before the policy is decoded: a policy changed after signing is `SignatureDoesNotMatch` with
   the policy as `StringToSign`, as S3 answered one (19 §8.1). AWS's example and botocore's
   presigned POST verify byte for byte. `x-amz-date`'s age is not checked: a form is signed
   ahead of its use, and the policy's expiration is the bound AWS documents.
 - **The policy** is read by the strict JSON reader (§9): `expiration` and `conditions`, named
-  exactly so, as s3-tests expects; the expiration an ISO 8601 time with its zone, after which
-  the policy is "not valid". Conditions are simple (one member, a string), `eq`, `starts-with`
+  exactly so, as s3-tests expects, and any other member refused "Unexpected", as S3 refused
+  one; the expiration an ISO 8601 time in UTC, as S3 refused an offset, after which the
+  policy is "not valid" (19 §13.1). JSON's `null`, and a value of another type where a string
+  or a whole size belongs, are "Invalid JSON.", as S3 answered a `null` and a bound of
+  `512.0`. Conditions are simple (one member, a string), `eq`, `starts-with`
   and `content-length-range`; operators and field names in any case, values compared in
   theirs, and `starts-with` on `Content-Type` item by item of a comma list (19 §4.2). A
   `bucket` condition holds the bucket the URL names. A condition on a field the form lacks
@@ -615,15 +625,15 @@ body, so nothing of the object may be kept until the fields that authorize it ar
   inclusive; a number must be whole and not negative; a string holding digits is read as the
   number, and any other fails the condition, as S3 answered `"5"` and `"test"` (19 §8.1).
   Every field but `x-amz-signature`, `file`, `policy` and `x-ignore-*` must be named by a
-  condition; the first that is not is named lowercase, as S3 names it.
+  condition; the first that is not is named as sent, as S3 named `StorageClass` (19 §13.2).
 - **S3's answers win over its error table** where they differ (19 §10): a failed condition is
   `403 AccessDenied`, "Invalid according to Policy: Policy Condition failed: [...]", the
   condition written as S3 writes it; a missing field is `400 InvalidArgument`; an expired
   policy `403 AccessDenied`; a malformed one `400 InvalidPolicyDocument`, "Invalid Policy:
   ...". A file outside the range is `EntityTooLarge` or `EntityTooSmall` with its proposed
-  size and the bound. Where no answer of S3's is recorded, a credential of another region or
-  form, an unknown algorithm, and the policy's other faults, the code is its recorded
-  neighbour's and the message mantle's (19 §11).
+  size and the bound. Where no answer of S3's is recorded, an unknown algorithm, a
+  credential's other faults, and the policy's other shapes, the code is its recorded
+  neighbour's and the message versitygw's wording of S3's (19 §13).
 - **The upload's settings are its fields**: `acl` for `x-amz-acl`, the content fields, and every
   `x-amz-` field but those that sign the form, each as PutObject's header of the same name, and
   `tagging` as a `Tagging` document. The request's own headers set nothing, so the policy stays
@@ -632,10 +642,11 @@ body, so nothing of the object may be kept until the fields that authorize it ar
   fields." (19 §2.6). The upload is judged as `s3:PutObject` on the key its form names.
 - **The answer.** A `success_action_redirect`, or the deprecated `redirect`, that is an
   absolute `http` or `https` URL a `Location` header can carry is `303` to it with `bucket`,
-  `key` and the quoted `etag` appended; S3 ignored a relative one (19 §8.1). Otherwise
-  `success_action_status` `201` is a `PostResponse` in no namespace, its `Location` holding the
-  key percent-encoded with its `/`, as S3's captured bodies do, `200` an empty 200, and anything
-  else an empty 204 (19 §2.2, §8.2).
+  `key` and the quoted `etag` appended, form-encoded after any query it has, as S3 appends them;
+  S3 ignored a relative one (19 §8.1, §13.4). Otherwise `success_action_status` `201` is a
+  `PostResponse` in no namespace, its `Location` holding the key percent-encoded with its `/`,
+  as S3's captured bodies do, `200` an empty 200, and anything else an empty 204; each carries
+  the object's `ETag` and `Location` headers, as S3's 204 does (19 §2.2, §8.2, §13.4).
 - **s3-tests** signs every authenticated POST with Signature Version 2, which mantle refuses,
   and its anonymous ones need public-read-write ACLs, which mantle's buckets do not have; the
   unit tests take the same policies signed with Version 4 (19 §5).

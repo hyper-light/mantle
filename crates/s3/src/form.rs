@@ -43,7 +43,8 @@ pub enum FormError {
     /// The body breaks RFC 7578 or RFC 2046, for the reason given.
     #[error("The body of your POST request is not well-formed multipart/form-data.")]
     Malformed(&'static str),
-    #[error("Your POST request fields preceding the upload file were too large.")]
+    /// S3's message as it answers, "preceeding" and all (19 §13).
+    #[error("Your POST request fields preceeding the upload file was too large.")]
     PreDataTooLong,
     /// The body closed with no part named `file`.
     #[error("POST requires exactly one file upload per request.")]
@@ -54,25 +55,29 @@ pub enum FormError {
 }
 
 impl FormError {
-    /// The S3 error code and status (19 §2.6, §9): S3 answers a body that is not a form with
-    /// `PreconditionFailed`, not the table's `RequestIsNotMultiPartContent` (19 §10 item 3).
+    /// The S3 error code and status, as S3 answered each (19 §9, §13), where its error table
+    /// names others: `PreconditionFailed` for `RequestIsNotMultiPartContent`,
+    /// `MaxPostPreDataLengthExceeded` without the table's `Error`, and `InvalidArgument` for a
+    /// form with no file, never `IncorrectNumberOfFilesInPostRequest`.
     pub fn code(&self) -> (&'static str, u16) {
         match self {
             Self::NotForm => ("PreconditionFailed", 412),
             Self::Malformed(_) => ("MalformedPOSTRequest", 400),
-            Self::PreDataTooLong => ("MaxPostPreDataLengthExceededError", 400),
-            Self::NoFile => ("IncorrectNumberOfFilesInPostRequest", 400),
+            Self::PreDataTooLong => ("MaxPostPreDataLengthExceeded", 400),
+            Self::NoFile => ("InvalidArgument", 400),
             Self::Internal => ("InternalError", 500),
         }
     }
 
-    /// The elements S3's error carries after its message (19 §8.1).
+    /// The elements S3's error carries after its message (19 §8.1, §13).
     pub fn details(&self) -> &'static [(&'static str, &'static str)] {
         match self {
             Self::NotForm => &[(
                 "Condition",
                 "Bucket POST must be of the enclosure-type multipart/form-data",
             )],
+            Self::PreDataTooLong => &[("MaxPostPreDataLengthBytes", "20480")],
+            Self::NoFile => &[("ArgumentName", "file"), ("ArgumentValue", "0")],
             _ => &[],
         }
     }
@@ -477,12 +482,13 @@ fn read(
                 if headers.is_empty() {
                     return Err(FormError::Malformed("a part has no header fields"));
                 }
-                let (name, filename) = part(headers)?;
+                let (name, filename, form_data) = part(headers)?;
                 let start = after(end, CRLF.len())?;
                 // "The file or text content must be the last field in the form" (19 §2.2): the
-                // part named `file`, in any case, whether or not it names a file, since clients
-                // name one on every part (19 §5.5).
-                if name.eq_ignore_ascii_case("file") {
+                // `form-data` part named `file`, in any case, whether or not it names a file,
+                // since clients name one on every part (19 §5.5). S3 read a part of another
+                // disposition, or of another name, as a field (19 §13).
+                if form_data && name.eq_ignore_ascii_case("file") {
                     form.filename = filename;
                     return Ok(Some(start));
                 }
@@ -571,13 +577,14 @@ fn boundary(content_type: Option<&str>) -> Result<String, FormError> {
     Ok(boundary)
 }
 
-/// A part's name and its file's name, from its header fields (RFC 7578 §4.2): each part "MUST
-/// contain a Content-Disposition header field ... where the disposition type is "form-data""
-/// with a "name" parameter. Any other header field "MUST be ignored" (§4.8), a part's
-/// `Content-Type` among them: an object's type is its `Content-Type` field's, which a policy
-/// can cover, and never a part's. A field folded onto more lines is unfolded (RFC 5322 §2.2.3,
-/// which RFC 2046's part headers follow).
-fn part(headers: &[u8]) -> Result<(String, Option<String>), FormError> {
+/// A part's name, its file's name, and whether its disposition is `form-data`, from its header
+/// fields (RFC 7578 §4.2): each part "MUST contain a Content-Disposition header field ... where
+/// the disposition type is "form-data"" with a "name" parameter. S3 read a part of another
+/// disposition as a field (19 §13), and so does mantle. Any other header field "MUST be
+/// ignored" (§4.8), a part's `Content-Type` among them: an object's type is its `Content-Type`
+/// field's, which a policy can cover, and never a part's. A field folded onto more lines is
+/// unfolded (RFC 5322 §2.2.3, which RFC 2046's part headers follow).
+fn part(headers: &[u8]) -> Result<(String, Option<String>, bool), FormError> {
     let text = std::str::from_utf8(headers)
         .map_err(|_| FormError::Malformed("a part's header fields are not UTF-8"))?;
     let text = text.strip_suffix("\r\n").unwrap_or(text);
@@ -615,11 +622,6 @@ fn part(headers: &[u8]) -> Result<(String, Option<String>), FormError> {
     let disposition =
         disposition.ok_or(FormError::Malformed("a part has no Content-Disposition"))?;
     let (kind, parameters) = parameterized(disposition)?;
-    if !kind.eq_ignore_ascii_case("form-data") {
-        return Err(FormError::Malformed(
-            "a part's disposition is not form-data",
-        ));
-    }
     let (mut name, mut filename) = (None, None);
     for (parameter, value) in parameters {
         // `filename*` "MUST NOT be used" (RFC 7578 §4.2), and is ignored with every other.
@@ -637,7 +639,7 @@ fn part(headers: &[u8]) -> Result<(String, Option<String>), FormError> {
         }
     }
     let name = name.ok_or(FormError::Malformed("a part has no name"))?;
-    Ok((name, filename))
+    Ok((name, filename, kind.eq_ignore_ascii_case("form-data")))
 }
 
 /// A header field's parameters, names as sent and values unquoted.
@@ -943,15 +945,13 @@ body\r\n--b--  \r\nThis is the epilogue.";
         let t = "multipart/form-data; boundary=b";
         let refused = |body: &[u8]| decode(t, body, 2).err();
         let malformed = |body: &[u8]| matches!(refused(body), Some(FormError::Malformed(_)));
-        // No delimiter, a part with no headers, no disposition, not form-data, no name.
+        // No delimiter, a part with no headers, no disposition, no name.
         assert!(malformed(b"just text"));
         assert!(malformed(b"--b\r\n\r\nvalue\r\n--b--"));
         assert!(malformed(
             b"--b\r\nContent-Type: text/plain\r\n\r\nv\r\n--b--"
         ));
-        assert!(malformed(
-            b"--b\r\nContent-Disposition: attachment; name=\"a\"\r\n\r\nv\r\n--b--"
-        ));
+
         assert!(malformed(
             b"--b\r\nContent-Disposition: form-data\r\n\r\nv\r\n--b--"
         ));
@@ -983,10 +983,20 @@ body\r\n--b--  \r\nThis is the epilogue.";
         assert!(malformed(
             b"--b\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nda\r\n--bta\r\n--b--"
         ));
-        // The body closes with no file.
+        // The body closes with no file, or with a `file` part of another disposition, which S3
+        // read as a field (19 §13).
         assert_eq!(
             refused(b"--b\r\nContent-Disposition: form-data; name=\"key\"\r\n\r\nk\r\n--b--"),
             Some(FormError::NoFile)
+        );
+        assert_eq!(
+            refused(b"--b\r\nContent-Disposition: file; name=\"file\"; filename=\"f\"\r\n\r\nk\r\n--b--"),
+            Some(FormError::NoFile)
+        );
+        assert_eq!(FormError::NoFile.code(), ("InvalidArgument", 400));
+        assert_eq!(
+            FormError::NoFile.details(),
+            &[("ArgumentName", "file"), ("ArgumentValue", "0")]
         );
     }
 
@@ -1046,6 +1056,14 @@ body\r\n--b--  \r\nThis is the epilogue.";
                 Some(FormError::PreDataTooLong)
             );
         }
+        assert_eq!(
+            FormError::PreDataTooLong.code(),
+            ("MaxPostPreDataLengthExceeded", 400)
+        );
+        assert_eq!(
+            FormError::PreDataTooLong.details(),
+            &[("MaxPostPreDataLengthBytes", "20480")]
+        );
         // A preamble counts toward the bound too.
         let preamble = vec![b'p'; MAX_PRE_DATA + 1];
         assert_eq!(

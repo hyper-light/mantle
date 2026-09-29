@@ -40,7 +40,7 @@ use mantle_disk::buf::Alignment;
 use mantle_disk::sim::{Crash, Fault, SimFile};
 use mantle_log::{Config as LogConfig, Log};
 use mantle_meta::apply::Layer;
-use mantle_meta::engine::{Model, Rows};
+use mantle_meta::engine::{Engine, Model, Rows};
 use mantle_meta::name::{self, GateChange, Preconditions, Put};
 use mantle_meta::record::{GateState, Version, Versioning};
 use mantle_meta::session::Rules;
@@ -76,6 +76,14 @@ const SETTINGS: Settings = Settings {
     max_uncommitted_size: 1 << 20,
     max_committed_size_per_ready: 1 << 20,
 };
+
+/// The engine of a cell's first Name range, before any entry: its lineage, holding every key.
+fn first_range() -> Model {
+    let mut m = Model::default();
+    m.install(0, name::first(1).unwrap()).unwrap();
+    m.persist().unwrap();
+    m
+}
 
 fn range() -> Range {
     Range {
@@ -143,7 +151,7 @@ impl Node {
             .unwrap(),
         );
         let log = Arc::new(Log::create(Arc::clone(&file), log_config(), log_id(id)).unwrap());
-        let replica = Replica::open(id, GROUP, log, Model::default(), &range(), seed ^ id).unwrap();
+        let replica = Replica::open(id, GROUP, log, first_range(), &range(), seed ^ id).unwrap();
         Self {
             id,
             file,
@@ -851,6 +859,7 @@ fn open_gate() -> Command {
         attempt: 1,
         from: None,
         to: Some(GateState::Open),
+        generation: 1,
     })))
 }
 

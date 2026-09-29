@@ -6,14 +6,19 @@
 //! the range's clock's (clock.rs), so versions of a key never share an order. A write to a
 //! bucket's objects passes only through the bucket's open gate for the incarnation it names
 //! (docs/design/metadata.md §2).
+//!
+//! A range holds the object keys of one span, which its lineage records with a generation
+//! that every split raises. A command for a key outside the span, or a coordinator's step
+//! routed by another generation, is not the range's: it answers with its lineage, takes
+//! nothing, and the sender routes the command again (docs/design/metadata.md §3).
 
 use crate::clock;
-use crate::engine::{Rows, Write};
+use crate::engine::{Row, Rows, Write};
 use crate::error::MetaError;
 use crate::key::{self, NULL_VERSION, NameRow};
 use crate::record::{
-    self, Checksum, DefaultRetention, Gate, GateState, Holder, Part, Retention, RetentionMode,
-    Upload, Version,
+    self, Checksum, DefaultRetention, Descriptor, Gate, GateState, Holder, Lineage, Part,
+    Retention, RetentionMode, Upload, Version,
 };
 
 pub use crate::record::Verdict;
@@ -68,9 +73,34 @@ pub enum Command {
     Reclaim(Reclaim),
     Check(Check),
     Unmark(Unmark),
+    Split(Split),
 }
 
 impl Command {
+    /// Whether a range whose descriptor is `now` must refuse the command as routed by a
+    /// descriptor it no longer matches: a write to an object key its span does not hold, the
+    /// sweep's for a file of such a key, or a step routed by another generation. The range's
+    /// own queue of released files goes with no key.
+    fn moved(&self, now: &Descriptor) -> bool {
+        let away = |bucket: &str, key: &str| !now.holds(&key::route(bucket, key));
+        match self {
+            Self::Put(c) => away(&c.bucket, &c.key),
+            Self::Delete(c) => away(&c.bucket, &c.key),
+            Self::CreateUpload(c) => away(&c.bucket, &c.key),
+            Self::PutPart(c) => away(&c.bucket, &c.key),
+            Self::Complete(c) => away(&c.bucket, &c.key),
+            Self::Abort(c) => away(&c.bucket, &c.key),
+            Self::Retain(c) => away(&c.bucket, &c.key),
+            Self::Hold(c) => away(&c.bucket, &c.key),
+            Self::Check(c) => c.files.iter().any(|f| away(&f.bucket, &f.key)),
+            Self::Unmark(u) => u.files.iter().any(|m| away(&m.bucket, &m.key)),
+            Self::Gate(g) => g.generation != now.generation,
+            Self::Collect(c) => c.generation != now.generation,
+            Self::Split(s) => s.generation != now.generation,
+            Self::Reclaim(_) => false,
+        }
+    }
+
     /// The bucket and incarnation a write to objects names; `None` for the gates' commands.
     fn write_to(&self) -> Option<(&str, u64)> {
         match self {
@@ -86,7 +116,8 @@ impl Command {
             | Self::Collect(_)
             | Self::Reclaim(_)
             | Self::Check(_)
-            | Self::Unmark(_) => None,
+            | Self::Unmark(_)
+            | Self::Split(_) => None,
         }
     }
 
@@ -232,6 +263,8 @@ pub struct GateChange {
     pub from: Option<GateState>,
     /// Its next state; `None` removes the gate once the range holds no row of the bucket.
     pub to: Option<GateState>,
+    /// The generation of the descriptor the coordinator routed it by.
+    pub generation: u64,
 }
 
 /// Removes rows of a condemned bucket, its uploads and their parts, as the collector does
@@ -243,6 +276,43 @@ pub struct Collect {
     /// Rows this entry may remove, which bounds its size.
     pub budget: u32,
     pub at_ns: u64,
+    /// The generation of the descriptor the coordinator routed it by.
+    pub generation: u64,
+}
+
+/// Splits the range at `at` (docs/design/metadata.md §3): the range keeps the object keys
+/// before it, and a new range, `child`, takes the rest with their rows and marks, the gate of
+/// every bucket whose keys it can hold, the gate floor and the clock. Both take the next
+/// generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Split {
+    /// The generation of the descriptor the splitter read.
+    pub generation: u64,
+    /// The first routing key the child holds (`key::route`), inside the span and past its
+    /// first key.
+    pub at: Vec<u8>,
+    /// The child's ID, which no range has had.
+    pub child: u64,
+}
+
+/// A split's child as the parent makes it ([`child`]): its descriptor, the rows it starts
+/// with beside those it takes, and the key ranges whose rows it takes from the parent as they
+/// stand before the split.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Child {
+    pub descriptor: Descriptor,
+    /// Its lineage, and the parent's gate floor and clock.
+    pub rows: Vec<Row>,
+    /// Its keys' rows and marks, and its buckets' gates.
+    pub spans: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// A coordinator's read, routed by the generation of the descriptor it holds: the answer, or
+/// the range's lineage once the range has moved past that generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Routed<T> {
+    Here(T),
+    Moved(Box<Lineage>),
 }
 
 /// The collector reclaimed a released file, its blocks and chunks: its row in the queue goes.
@@ -401,10 +471,22 @@ pub enum Outcome {
     Checked(Vec<Verdict>),
     /// The marks of settled files went.
     Unmarked,
+    /// The command was routed by a descriptor the range no longer matches: it took nothing,
+    /// and this is where its span went.
+    Moved(Box<Lineage>),
+    /// The range split: its lineage now, naming the child.
+    Split(Box<Lineage>),
 }
 
 /// Applies `command` as log entry `index`. A refused command still advances the index.
 pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<Outcome, MetaError> {
+    let lineage = lineage(engine)?;
+    // Not the range's: it takes nothing, not even a file the command carries, which its sender
+    // hands on to the range that holds the key.
+    if command.moved(&lineage.now) {
+        engine.apply(index, &[])?;
+        return Ok(Outcome::Moved(Box::new(lineage)));
+    }
     let admitted = match command.write_to() {
         Some((bucket, incarnation)) => admits(engine, bucket, incarnation)?,
         None => true,
@@ -424,7 +506,7 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
         Command::Abort(a) => abort(engine, a)?,
         Command::Retain(r) => retain(engine, r)?,
         Command::Hold(h) => hold(engine, h)?,
-        Command::Gate(g) => move_gate(engine, g)?,
+        Command::Gate(g) => move_gate(engine, &lineage.now, g)?,
         Command::Collect(c) => collect(engine, c)?,
         Command::Reclaim(r) => (
             Outcome::Reclaimed,
@@ -438,6 +520,7 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
                 .map(|m| Write::Delete(key::mark(&m.bucket, &m.key, m.file)))
                 .collect(),
         ),
+        Command::Split(s) => split(engine, s)?,
     };
     // A file a write carries is referenced if the write goes ahead, and released if it is
     // refused: the gateway wrote it for this write alone. Either way the range has taken it,
@@ -459,6 +542,126 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
     }
     engine.apply(index, &writes)?;
     Ok(outcome)
+}
+
+/// The range's lineage: its descriptor, and the child of its last split.
+const LINEAGE: &[u8] = &[key::LOCAL, key::marker::LINEAGE];
+
+/// The range's lineage. Every Name range has one from its making: the first by [`first`],
+/// every other by the split that made it.
+pub fn lineage<E: Rows>(engine: &E) -> Result<Lineage, MetaError> {
+    let bytes = engine.get(LINEAGE)?.ok_or(MetaError::Corrupt)?;
+    Ok(Lineage::decode(&bytes)?)
+}
+
+/// The rows of a cell's first Name range, `id`: every object key, at generation 1.
+pub fn first(id: u64) -> Result<Vec<Row>, MetaError> {
+    let lineage = Lineage {
+        now: Descriptor {
+            id,
+            lo: Vec::new(),
+            hi: None,
+            generation: 1,
+        },
+        child: None,
+    };
+    Ok(vec![(LINEAGE.to_vec(), lineage.encode()?)])
+}
+
+/// A split the range takes: its lineage after, the child's descriptor, and where the gates
+/// the child takes begin and those the range keeps end.
+struct Cut {
+    parent: Lineage,
+    child: Descriptor,
+    child_gates: Vec<u8>,
+    kept_gates_past: Vec<u8>,
+}
+
+/// The split `s` does, or the outcome that refuses it.
+fn cut<E: Rows>(engine: &E, s: &Split) -> Result<Result<Cut, Outcome>, MetaError> {
+    let lineage = lineage(engine)?;
+    let now = &lineage.now;
+    if s.generation != now.generation {
+        return Ok(Err(Outcome::Moved(Box::new(lineage))));
+    }
+    let Some((bucket, key)) = key::decode_route(&s.at) else {
+        return Ok(Err(Outcome::Invalid));
+    };
+    if s.at <= now.lo || now.hi.as_ref().is_some_and(|hi| s.at >= *hi) || s.child == now.id {
+        return Ok(Err(Outcome::Invalid));
+    }
+    let generation = now.generation.checked_add(1).ok_or(MetaError::Corrupt)?;
+    let child = Descriptor {
+        id: s.child,
+        lo: s.at.clone(),
+        hi: now.hi.clone(),
+        generation,
+    };
+    let parent = Lineage {
+        now: Descriptor {
+            id: now.id,
+            lo: now.lo.clone(),
+            hi: Some(s.at.clone()),
+            generation,
+        },
+        child: Some(child.clone()),
+    };
+    // The child can hold keys of every bucket from the one `at` falls in; the range keeps the
+    // gates of those whose keys begin before `at`, the one `at` falls in unless `at` is its
+    // first routing key.
+    let child_gates = key::gate(&bucket);
+    let kept_gates_past = if key.is_empty() {
+        child_gates.clone()
+    } else {
+        after(&child_gates)
+    };
+    Ok(Ok(Cut {
+        parent,
+        child,
+        child_gates,
+        kept_gates_past,
+    }))
+}
+
+fn split<E: Rows>(engine: &E, s: &Split) -> Result<(Outcome, Vec<Write>), MetaError> {
+    let cut = match cut(engine, s)? {
+        Ok(cut) => cut,
+        Err(outcome) => return Ok((outcome, Vec::new())),
+    };
+    let mut writes = vec![Write::Put(LINEAGE.to_vec(), cut.parent.encode()?)];
+    for (from, to) in key::name_spans(&cut.child.lo, cut.child.hi.as_deref()) {
+        writes.push(Write::Clear(from, to));
+    }
+    writes.push(Write::Clear(cut.kept_gates_past, key::GATES_END.to_vec()));
+    Ok((Outcome::Split(Box::new(cut.parent)), writes))
+}
+
+/// The child split `s` makes, read from the range before it applies the split; `None` if the
+/// range would refuse it. The child starts with its lineage and the range's gate floor and
+/// clock, so no attempt the range refused may place a gate there and no time it gave repeats,
+/// and takes the rows of its keys, their marks and its buckets' gates as they stand. It holds
+/// no session and none of the range's queue of released files, which the range keeps.
+pub fn child<E: Rows>(engine: &E, s: &Split) -> Result<Option<Child>, MetaError> {
+    let Ok(cut) = cut(engine, s)? else {
+        return Ok(None);
+    };
+    let lineage = Lineage {
+        now: cut.child.clone(),
+        child: None,
+    };
+    let mut rows = vec![(LINEAGE.to_vec(), lineage.encode()?)];
+    for local in [FLOOR, clock::ROW] {
+        if let Some(value) = engine.get(local)? {
+            rows.push((local.to_vec(), value));
+        }
+    }
+    let mut spans = key::name_spans(&cut.child.lo, cut.child.hi.as_deref()).to_vec();
+    spans.push((cut.child_gates, key::GATES_END.to_vec()));
+    Ok(Some(Child {
+        descriptor: cut.child,
+        rows,
+        spans,
+    }))
 }
 
 /// The rows that release `file`, held under `key`, at the range's time `now_ns`: nothing
@@ -535,8 +738,18 @@ fn admits<E: Rows>(engine: &E, bucket: &str, incarnation: u64) -> Result<bool, M
         .is_some_and(|g| g.incarnation == incarnation && g.state == GateState::Open))
 }
 
-fn move_gate<E: Rows>(engine: &E, g: &GateChange) -> Result<(Outcome, Vec<Write>), MetaError> {
+fn move_gate<E: Rows>(
+    engine: &E,
+    now: &Descriptor,
+    g: &GateChange,
+) -> Result<(Outcome, Vec<Write>), MetaError> {
     use GateState::{Closed, Condemned, Open};
+    // A range keeps gates only for the buckets whose keys it can hold, which a split divides
+    // by its span.
+    let (first, past) = key::bucket_routes(&g.bucket);
+    if !now.meets(&first, &past) {
+        return Ok((Outcome::Invalid, Vec::new()));
+    }
     // The steps creating and deleting a bucket take. A delete that takes over from an
     // attempt left behind closes each gate again, and one that abandons an unfinished create
     // places closed gates where none was opened.
@@ -1477,10 +1690,45 @@ pub enum Probe {
     Paused(Vec<u8>),
 }
 
-/// Whether the range holds a version or delete marker of `bucket`, reading at most `budget`
-/// rows from `from`, a paused read's key, or from the bucket's first row. A key's versions
-/// sort before its uploads, so one row answers for each key.
+/// The range's gate for `bucket`, read by a coordinator routed by `generation`.
+pub fn read_gate<E: Rows>(
+    engine: &E,
+    bucket: &str,
+    generation: u64,
+) -> Result<Routed<Option<Gate>>, MetaError> {
+    routed(engine, generation, || gate(engine, bucket))
+}
+
+/// Whether the range holds a version or delete marker of `bucket`, read by a coordinator
+/// routed by `generation`: at most `budget` rows from `from`, a paused read's key, or from the
+/// bucket's first row. A key's versions sort before its uploads, so one row answers for each
+/// key.
 pub fn probe<E: Rows>(
+    engine: &E,
+    bucket: &str,
+    generation: u64,
+    from: Option<&[u8]>,
+    budget: usize,
+) -> Result<Routed<Probe>, MetaError> {
+    routed(engine, generation, || {
+        probe_rows(engine, bucket, from, budget)
+    })
+}
+
+/// `read`'s answer if the range is at `generation`, or its lineage.
+fn routed<E: Rows, T>(
+    engine: &E,
+    generation: u64,
+    read: impl FnOnce() -> Result<T, MetaError>,
+) -> Result<Routed<T>, MetaError> {
+    let lineage = lineage(engine)?;
+    if lineage.now.generation != generation {
+        return Ok(Routed::Moved(Box::new(lineage)));
+    }
+    Ok(Routed::Here(read()?))
+}
+
+fn probe_rows<E: Rows>(
     engine: &E,
     bucket: &str,
     from: Option<&[u8]>,
@@ -1525,6 +1773,14 @@ mod tests {
     use super::*;
     use crate::engine::{Engine, Model};
 
+    /// A cell's first Name range, holding every key.
+    fn seeded() -> Model {
+        let mut m = Model::default();
+        m.install(0, first(1).unwrap()).unwrap();
+        m.persist().unwrap();
+        m
+    }
+
     struct Range {
         engine: Model,
         index: u64,
@@ -1535,7 +1791,7 @@ mod tests {
         /// A range holding bucket "b", incarnation 1, open.
         fn new() -> Self {
             let mut r = Self {
-                engine: Model::default(),
+                engine: seeded(),
                 index: 0,
                 clock: 1_000,
             };
@@ -1559,6 +1815,7 @@ mod tests {
                 attempt,
                 from,
                 to,
+                generation: 1,
             }))
         }
 
@@ -2209,6 +2466,7 @@ mod tests {
             attempt: 1,
             from: None,
             to: Some(GateState::Open),
+            generation: 1,
         });
         let commands: Vec<Command> = std::iter::once(open)
             .chain((0..20u64).map(|i| {
@@ -2240,11 +2498,11 @@ mod tests {
                 }
             }))
             .collect();
-        let mut whole = Model::default();
+        let mut whole = seeded();
         for (i, c) in commands.iter().enumerate() {
             apply(&mut whole, i as u64 + 1, c).unwrap();
         }
-        let mut crashed = Model::default();
+        let mut crashed = seeded();
         for (i, c) in commands.iter().enumerate() {
             apply(&mut crashed, i as u64 + 1, c).unwrap();
             if i == 7 {
@@ -2334,6 +2592,7 @@ mod tests {
             attempt: 9,
             from: Some(Closed),
             to: Some(Open),
+            generation: 1,
         });
         assert_eq!(r.run(other), Outcome::Conflict);
     }
@@ -2352,13 +2611,17 @@ mod tests {
         }
         r.create("m");
         assert_eq!(r.gate_at(4, Some(Open), Some(Closed)), Outcome::GateMoved);
-        assert_eq!(probe(&r.engine, "b", None, 10).unwrap(), Probe::Clear);
+        assert_eq!(
+            probe(&r.engine, "b", 1, None, 10).unwrap(),
+            Routed::Here(Probe::Clear)
+        );
         let collect = |budget| {
             Command::Collect(Collect {
                 bucket: "b".into(),
                 incarnation: 1,
                 budget,
                 at_ns: 0,
+                generation: 1,
             })
         };
         assert_eq!(r.run(collect(10)), Outcome::Conflict, "not yet condemned");
@@ -2410,6 +2673,7 @@ mod tests {
             incarnation: 1,
             budget: 10,
             at_ns: 0,
+            generation: 1,
         });
         assert_eq!(r.run(collect), Outcome::NotEmpty);
         assert_eq!(r.versions("k").len(), 1);
@@ -2424,19 +2688,31 @@ mod tests {
             let upload = r.create(key);
             r.part(key, &upload, 1, 1, 1);
         }
-        assert_eq!(probe(&r.engine, "b", None, 10).unwrap(), Probe::Clear);
+        assert_eq!(
+            probe(&r.engine, "b", 1, None, 10).unwrap(),
+            Routed::Here(Probe::Clear)
+        );
         r.delete("d", Versioning::Enabled, None);
-        let Probe::Paused(at) = probe(&r.engine, "b", None, 2).unwrap() else {
+        let Routed::Here(Probe::Paused(at)) = probe(&r.engine, "b", 1, None, 2).unwrap() else {
             panic!("the budget ran out")
         };
         assert_eq!(
-            probe(&r.engine, "b", Some(&at), 1).unwrap(),
-            Probe::Paused(beyond_rows("b", "c"))
+            probe(&r.engine, "b", 1, Some(&at), 1).unwrap(),
+            Routed::Here(Probe::Paused(beyond_rows("b", "c")))
         );
-        assert_eq!(probe(&r.engine, "b", Some(&at), 2).unwrap(), Probe::Found);
+        assert_eq!(
+            probe(&r.engine, "b", 1, Some(&at), 2).unwrap(),
+            Routed::Here(Probe::Found)
+        );
         // A position before the bucket starts at its first row.
-        assert_eq!(probe(&r.engine, "b", Some(&[]), 4).unwrap(), Probe::Found);
-        assert_eq!(probe(&r.engine, "c", None, 4).unwrap(), Probe::Clear);
+        assert_eq!(
+            probe(&r.engine, "b", 1, Some(&[]), 4).unwrap(),
+            Routed::Here(Probe::Found)
+        );
+        assert_eq!(
+            probe(&r.engine, "c", 1, None, 4).unwrap(),
+            Routed::Here(Probe::Clear)
+        );
     }
 
     const MS: u64 = 1_000_000;
@@ -3130,6 +3406,258 @@ mod tests {
         });
         assert_eq!(r.run(put), Outcome::Expired);
         assert_eq!(current(&r.engine, "b", "a").unwrap(), None);
+    }
+
+    impl Range {
+        /// Splits the range at `at` into itself and a child with ID `id`, made as a replica
+        /// makes it: the rows `child` names, and the parent's rows in its spans as they stand.
+        fn split(&mut self, at: Vec<u8>, id: u64) -> (Outcome, Option<Range>) {
+            let generation = lineage(&self.engine).unwrap().now.generation;
+            let s = Split {
+                generation,
+                at,
+                child: id,
+            };
+            let made = child(&self.engine, &s).unwrap().map(|c| {
+                let mut rows = c.rows;
+                for (k, v) in self.engine.image().unwrap() {
+                    if c.spans.iter().any(|(from, to)| *from <= k && k < *to) {
+                        rows.push((k, v));
+                    }
+                }
+                let mut engine = Model::default();
+                engine.install(0, rows).unwrap();
+                Range {
+                    engine,
+                    index: 0,
+                    clock: self.clock,
+                }
+            });
+            (self.run(Command::Split(s)), made)
+        }
+
+        fn rows(&self) -> Vec<Vec<u8>> {
+            self.engine
+                .image()
+                .unwrap()
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect()
+        }
+    }
+
+    fn descriptor(id: u64, lo: Option<&str>, hi: Option<&str>, generation: u64) -> Descriptor {
+        Descriptor {
+            id,
+            lo: lo.map(|k| key::route("b", k)).unwrap_or_default(),
+            hi: hi.map(|k| key::route("b", k)),
+            generation,
+        }
+    }
+
+    /// A split leaves the range the keys before its point and gives the child the rest, with
+    /// their rows and marks, the gates of the buckets it can hold, the floor and the clock.
+    /// Each side refuses what is the other's with its lineage, taking nothing.
+    #[test]
+    fn a_split_divides_the_keys_and_each_side_refuses_the_others() {
+        use GateState::{Closed, Condemned, Open};
+        let mut r = Range::new();
+        r.put("a", "1", Versioning::Enabled);
+        r.put("m", "2", Versioning::Enabled);
+        let upload = r.create("t");
+        r.part("t", &upload, 1, 1, 9);
+        // Bucket "c", after "b", comes and goes, raising the floor to its attempt.
+        let other = |from, to| {
+            Command::Gate(GateChange {
+                bucket: "c".into(),
+                incarnation: 5,
+                attempt: 5,
+                from,
+                to,
+                generation: 1,
+            })
+        };
+        for (from, to) in [
+            (None, Some(Open)),
+            (Some(Open), Some(Closed)),
+            (Some(Closed), Some(Condemned)),
+            (Some(Condemned), None),
+        ] {
+            assert_eq!(r.run(other(from, to)), Outcome::GateMoved);
+        }
+        let (outcome, made) = r.split(key::route("b", "m"), 2);
+        let parent = Lineage {
+            now: descriptor(1, None, Some("m"), 2),
+            child: Some(descriptor(2, Some("m"), None, 2)),
+        };
+        assert_eq!(outcome, Outcome::Split(Box::new(parent.clone())));
+        let mut c = made.unwrap();
+        assert_eq!(lineage(&r.engine).unwrap(), parent);
+        assert_eq!(
+            lineage(&c.engine).unwrap(),
+            Lineage {
+                now: descriptor(2, Some("m"), None, 2),
+                child: None
+            }
+        );
+        // Every row and mark of a key is on the side that holds the key; the bucket both hold
+        // keys of has its gate on both sides; the floor and the clock went with the child.
+        let routes = |r: &Range| -> Vec<(String, String)> {
+            r.rows()
+                .iter()
+                .filter_map(|k| {
+                    let (bucket, key, _) = key::decode_name(k)
+                        .or_else(|| key::decode_mark(k).map(|(b, k, _)| (b, k, NameRow::Null)))?;
+                    Some((bucket, key))
+                })
+                .collect()
+        };
+        assert!(routes(&r).iter().all(|(_, k)| k == "a"));
+        assert!(routes(&c).iter().any(|(_, k)| k == "m"));
+        assert!(routes(&c).iter().any(|(_, k)| k == "t"));
+        assert!(routes(&c).iter().all(|(_, k)| k != "a"));
+        assert!(r.engine.get(&key::mark("b", "a", 1)).unwrap().is_some());
+        assert!(c.engine.get(&key::mark("b", "m", 1)).unwrap().is_some());
+        assert_eq!(gate(&r.engine, "b").unwrap(), gate(&c.engine, "b").unwrap());
+        assert_eq!(floor(&c.engine).unwrap(), 5);
+        assert_eq!(
+            clock::now(&c.engine, 0).unwrap(),
+            clock::now(&r.engine, 0).unwrap()
+        );
+        // The queue of released files stays with the parent.
+        assert!(released(&c.engine, u64::MAX, 8).unwrap().is_empty());
+        // Refused, a write carrying a file takes nothing: no version, release or mark.
+        let queued = released(&r.engine, u64::MAX, 8).unwrap().len();
+        let moved = |r: &Range| Outcome::Moved(Box::new(lineage(&r.engine).unwrap()));
+        assert_eq!(r.put("t", "3", Versioning::Enabled), moved(&r));
+        assert_eq!(released(&r.engine, u64::MAX, 8).unwrap().len(), queued);
+        assert!(r.engine.get(&key::mark("b", "t", 1)).unwrap().is_none());
+        assert_eq!(c.put("a", "3", Versioning::Enabled), moved(&c));
+        assert!(matches!(
+            c.put("z", "3", Versioning::Enabled),
+            Outcome::Put { .. }
+        ));
+        // The sweep's commands name keys, and go where the keys are.
+        let check = Command::Check(Check {
+            files: vec![Checked {
+                bucket: "b".into(),
+                key: "t".into(),
+                file: 9,
+                deadline_ns: 0,
+            }],
+            at_ns: 0,
+        });
+        assert_eq!(r.run(check.clone()), moved(&r));
+        assert_eq!(c.run(check), Outcome::Checked(vec![Verdict::Held]));
+        // A coordinator's reads and steps routed by the old generation are told where the span
+        // went, and those routed by the new one are answered.
+        assert_eq!(
+            read_gate(&r.engine, "b", 1).unwrap(),
+            Routed::Moved(Box::new(parent))
+        );
+        assert!(matches!(
+            read_gate(&c.engine, "b", 2).unwrap(),
+            Routed::Here(Some(Gate { state: Open, .. }))
+        ));
+        assert!(matches!(
+            probe(&c.engine, "b", 1, None, 8).unwrap(),
+            Routed::Moved(_)
+        ));
+        assert_eq!(r.gate(Some(Open), Some(Closed)), moved(&r));
+        let collect = |generation| {
+            Command::Collect(Collect {
+                bucket: "b".into(),
+                incarnation: 1,
+                budget: 8,
+                at_ns: 0,
+                generation,
+            })
+        };
+        assert_eq!(c.run(collect(1)), moved(&c));
+        assert_eq!(c.run(collect(2)), Outcome::Conflict, "not condemned");
+    }
+
+    /// The clock goes with the child. A check that released a file never handed over recorded
+    /// its time; a handover a lagging leader proposes behind that time, reaching the child that
+    /// holds the key now, is refused as the parent would have refused it. A child starting its
+    /// clock afresh would take a file the collector is to reclaim.
+    #[test]
+    fn a_split_carries_the_time_a_check_recorded() {
+        let mut r = Range::new();
+        let deadline_ns = r.clock + 50;
+        let check = Command::Check(Check {
+            files: vec![Checked {
+                bucket: "b".into(),
+                key: "t".into(),
+                file: 4,
+                deadline_ns,
+            }],
+            at_ns: deadline_ns + 1,
+        });
+        assert_eq!(r.run(check), Outcome::Checked(vec![Verdict::Released]));
+        let (_, made) = r.split(key::route("b", "m"), 2);
+        let mut c = made.unwrap();
+        let put = Command::Put(Put {
+            bucket: "b".into(),
+            incarnation: 1,
+            key: "t".into(),
+            versioning: Versioning::Unversioned,
+            preconditions: Preconditions::default(),
+            at_ns: deadline_ns - 10,
+            ordered_ns: None,
+            version: Version {
+                file: Some(4),
+                ..object("e")
+            },
+            default: None,
+            deadline_ns,
+        });
+        assert_eq!(c.run(put), Outcome::Expired);
+        assert_eq!(current(&c.engine, "b", "t").unwrap(), None);
+    }
+
+    /// A split at a bucket's first routing key leaves the range none of its keys, and the
+    /// range gives up the bucket's gate; a split the range cannot take is refused.
+    #[test]
+    fn a_split_at_a_buckets_start_moves_its_gate_whole() {
+        let mut r = Range::new();
+        let (outcome, made) = r.split(key::bucket_routes("b").0, 2);
+        assert!(matches!(outcome, Outcome::Split(_)));
+        let c = made.unwrap();
+        assert_eq!(gate(&r.engine, "b").unwrap(), None);
+        assert!(gate(&c.engine, "b").unwrap().is_some());
+        // A range may hold a gate only for a bucket whose keys its span can hold.
+        let open = Command::Gate(GateChange {
+            bucket: "b".into(),
+            incarnation: 1,
+            attempt: 1,
+            from: None,
+            to: Some(GateState::Open),
+            generation: 2,
+        });
+        assert_eq!(r.run(open), Outcome::Invalid);
+        let refused = |r: &mut Range, at: Vec<u8>, id: u64, generation: u64| {
+            let s = Split {
+                generation,
+                at,
+                child: id,
+            };
+            assert_eq!(child(&r.engine, &s).unwrap(), None);
+            r.run(Command::Split(s))
+        };
+        let lo = lineage(&r.engine).unwrap().now.hi.unwrap();
+        // At or past the span's end, at its start, not a key's route, or the range's own ID.
+        assert_eq!(refused(&mut r, lo.clone(), 3, 2), Outcome::Invalid);
+        assert_eq!(refused(&mut r, Vec::new(), 3, 2), Outcome::Invalid);
+        assert_eq!(refused(&mut r, vec![b'a'], 3, 2), Outcome::Invalid);
+        assert_eq!(
+            refused(&mut r, key::route("a", "k"), 1, 2),
+            Outcome::Invalid
+        );
+        assert!(matches!(
+            refused(&mut r, key::route("a", "k"), 3, 1),
+            Outcome::Moved(_)
+        ));
     }
 
     /// Every range's engine also holds the rows its replica keeps about itself: the group's

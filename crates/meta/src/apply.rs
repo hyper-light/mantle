@@ -138,12 +138,20 @@ mod tests {
             attempt: 1,
             from: None,
             to: Some(GateState::Open),
+            generation: 1,
         })))
+    }
+
+    /// A cell's first Name range, holding every key.
+    fn name_range() -> Model {
+        let mut m = Model::default();
+        m.install(0, crate::name::first(1).unwrap()).unwrap();
+        m
     }
 
     #[test]
     fn commands_apply_once_in_order_and_see_each_other() {
-        let mut m = Model::default();
+        let mut m = name_range();
         let run = |m: &mut Model, index, e: Entry| {
             apply_entry(m, index, &e, Layer::Name, &RULES).unwrap()
         };
@@ -214,7 +222,7 @@ mod tests {
 
     #[test]
     fn a_session_unused_past_its_lifetime_expires_at_the_entry_that_passes_it() {
-        let mut m = Model::default();
+        let mut m = name_range();
         let e = entry(10, vec![from(0, 0, Command::Register)]);
         let [Answer::Registered { session }] =
             apply_entry(&mut m, 1, &e, Layer::Name, &RULES).unwrap()[..]
@@ -245,8 +253,8 @@ mod tests {
                 entry(10 * i, commands)
             })
             .collect();
-        let mut a = Model::default();
-        let mut b = Model::default();
+        let mut a = name_range();
+        let mut b = name_range();
         for (i, e) in (1u64..).zip(&log) {
             assert_eq!(
                 apply_entry(&mut a, i, e, Layer::Name, &RULES).unwrap(),

@@ -16,8 +16,10 @@
 (* A writer routes by the descriptors it cached.  A range takes a write    *)
 (* only for a key in its span, through an open gate.  To a request routed  *)
 (* by a descriptor it no longer matches, a range answers with its own      *)
-(* descriptor, those of the children it made and of the range it merged   *)
-(* into, and never with data.                                              *)
+(* descriptor, that of the child its last split made and of the range it   *)
+(* merged into, and never with data: it keeps one child, so what it keeps  *)
+(* is bounded, and a sender whose descriptors no longer cover the keys     *)
+(* reads the directory.                                                    *)
 (*                                                                         *)
 (* A create attempt opens the gate of every range it knows, then           *)
 (* activates the bucket.  A delete attempt closes the gate of every range  *)
@@ -49,7 +51,7 @@ Bottom == CHOOSE k \in Keys : \A j \in Keys : k <= j
 End == (CHOOSE k \in Keys : \A j \in Keys : j <= k) + 1
 Ids == 1..(MaxSplits + 1)
 
-VARIABLES ranges,    \* id -> the range, or one not yet made
+VARIABLES ranges,    \* id -> the range, or one not yet made; kids holds at most the child of its last split
           directory, \* the descriptors the directory holds
           cache,     \* the writer's descriptors
           bucket,    \* "none", "creating", "active", "deleting" or "deleted"
@@ -67,7 +69,7 @@ Live == {i \in Ids : ranges[i].live}
 Covers(ds) == \A k \in Keys : \E d \in ds : k \in Span(d)
 
 \* What a range answers a request routed by a descriptor it no longer matches: its own
-\* descriptor, its children's, and that of the range it merged into.
+\* descriptor, its last child's, and that of the range it merged into.
 Answer(d) == {Desc(i) : i \in {d.id} \cup ranges[d.id].kids \cup
                               (IF ranges[d.id].into = 0 THEN {} ELSE {ranges[d.id].into})}
 
@@ -129,7 +131,7 @@ Split(i, m) ==
        IN ranges' = [ranges EXCEPT
             ![i] = [r EXCEPT !.hi = m, !.gen = r.gen + 1,
                              !.keys = {k \in r.keys : k < m},
-                             !.kids = r.kids \cup {c}],
+                             !.kids = {c}],
                         ![c] = [lo |-> m, hi |-> r.hi, gen |-> r.gen + 1,
                     keys |-> {k \in r.keys : m <= k}, gate |-> r.gate,
                     gatt |-> r.gatt, live |-> TRUE, made |-> TRUE, kids |-> {},

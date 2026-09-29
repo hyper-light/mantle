@@ -622,12 +622,14 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
             w.u64(g.attempt);
             w.u8(gate_code(g.from));
             w.u8(gate_code(g.to));
+            w.u64(g.generation);
         }
         name::Command::Collect(c) => {
             w.u8(7);
             record::put_str(w, &c.bucket)?;
             w.u64(c.incarnation);
             w.u32(c.budget);
+            w.u64(c.generation);
         }
         name::Command::Reclaim(c) => {
             w.u8(10);
@@ -652,6 +654,12 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
                 record::put_str(w, &m.key)?;
                 w.u128(m.file);
             }
+        }
+        name::Command::Split(s) => {
+            w.u8(13);
+            w.u64(s.generation);
+            record::put_bytes(w, &s.at)?;
+            w.u64(s.child);
         }
     }
     Ok(())
@@ -771,12 +779,19 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
             attempt: r.u64()?,
             from: gate_state(r.u8()?)?,
             to: gate_state(r.u8()?)?,
+            generation: r.u64()?,
         }),
         7 => name::Command::Collect(name::Collect {
             bucket: record::take_str(r)?,
             incarnation: r.u64()?,
             budget: r.u32()?,
             at_ns,
+            generation: r.u64()?,
+        }),
+        13 => name::Command::Split(name::Split {
+            generation: r.u64()?,
+            at: record::take_bytes(r)?,
+            child: r.u64()?,
         }),
         10 => name::Command::Reclaim(name::Reclaim {
             released_ns: r.u64()?,
@@ -1099,6 +1114,14 @@ fn put_name_outcome(w: &mut Writer, o: &name::Outcome) -> Result<(), RecordError
             put_verdicts(w, verdicts)?;
         }
         O::Unmarked => w.u8(26),
+        O::Moved(lineage) => {
+            w.u8(27);
+            record::put_lineage(w, lineage)?;
+        }
+        O::Split(lineage) => {
+            w.u8(28);
+            record::put_lineage(w, lineage)?;
+        }
     }
     Ok(())
 }
@@ -1181,6 +1204,8 @@ fn take_name_outcome(r: &mut Reader<'_>) -> Option<name::Outcome> {
         24 => O::Expired,
         25 => O::Checked(take_verdicts(r)?),
         26 => O::Unmarked,
+        27 => O::Moved(Box::new(record::take_lineage(r)?)),
+        28 => O::Split(Box::new(record::take_lineage(r)?)),
         _ => return None,
     })
 }
@@ -1409,12 +1434,19 @@ mod tests {
                 attempt: 2,
                 from: Some(GateState::Closed),
                 to: None,
+                generation: u64::MAX,
             })),
             named(name::Command::Collect(name::Collect {
                 bucket: "b".into(),
                 incarnation: 1,
                 budget: 64,
                 at_ns,
+                generation: 3,
+            })),
+            named(name::Command::Split(name::Split {
+                generation: 4,
+                at: crate::key::route("b", "k\0"),
+                child: u64::MAX,
             })),
             named(name::Command::Reclaim(name::Reclaim {
                 released_ns: 5,
@@ -1523,6 +1555,20 @@ mod tests {
 
     #[test]
     fn every_answer_round_trips() {
+        let lineage = crate::record::Lineage {
+            now: crate::record::Descriptor {
+                id: 1,
+                lo: Vec::new(),
+                hi: Some(crate::key::route("b", "m")),
+                generation: 2,
+            },
+            child: Some(crate::record::Descriptor {
+                id: 2,
+                lo: crate::key::route("b", "m"),
+                hi: None,
+                generation: 2,
+            }),
+        };
         use bucket::Outcome as B;
         use name::Outcome as N;
         let mut answers = vec![
@@ -1603,6 +1649,8 @@ mod tests {
                 ]),
                 N::Checked(Vec::new()),
                 N::Unmarked,
+                N::Moved(Box::new(lineage.clone())),
+                N::Split(Box::new(lineage)),
             ]
             .map(Answer::Name),
         );

@@ -22,6 +22,8 @@ pub mod marker {
     /// The Name range's gate floor.
     pub const FLOOR: u8 = b'f';
     pub const GATE: u8 = b'g';
+    /// The Name range's lineage: its descriptor and the child of its last split.
+    pub const LINEAGE: u8 = b'l';
     /// How many sessions the range holds.
     pub const SESSIONS: u8 = b'n';
     /// The last snapshot a member installed.
@@ -36,12 +38,13 @@ pub mod marker {
     pub const UNSETTLED: u8 = b'u';
 
     /// Every marker in use.
-    pub const ALL: [u8; 11] = [
+    pub const ALL: [u8; 12] = [
         ATTEMPT,
         CLOCK,
         EXPIRY,
         FLOOR,
         GATE,
+        LINEAGE,
         UNSETTLED,
         SESSIONS,
         INSTALLED,
@@ -59,6 +62,10 @@ pub const REVERSE: u8 = 0x02;
 /// object key as its rows are: a split cuts them at the same key, and listings never see them
 /// (docs/design/metadata.md §2).
 pub const MARKS: u8 = 0x03;
+
+/// After an object key's routing key in the marks' space: one of its marks. A file ID may
+/// begin with 0xFF, which would read as an escaped 0x00 of the key.
+const MARK: u8 = 1;
 
 /// Name-layer rows under `(bucket, key)`, in the order they sort.
 const NULL: u8 = 1;
@@ -137,6 +144,67 @@ pub fn gate(bucket: &str) -> Vec<u8> {
     out
 }
 
+/// A key past every gate.
+pub const GATES_END: [u8; 3] = [LOCAL, marker::GATE, 0xFF];
+
+/// The bucket a gate's key names; `None` if it is not one.
+pub fn decode_gate(k: &[u8]) -> Option<String> {
+    let rest = k.strip_prefix(&[LOCAL, marker::GATE])?;
+    let (name, rest) = take_string(rest)?;
+    if !rest.is_empty() {
+        return None;
+    }
+    String::from_utf8(name).ok()
+}
+
+/// The routing key of an object key: its bucket, then its key. Every row of the key, in each
+/// space that holds them, is the space's byte, this, and a suffix whose first byte is below
+/// 0xFF, so a span between two routing keys bounds the rows of its keys by bytes in every
+/// space, and a Name range's span is such a pair (docs/design/metadata.md §3).
+pub fn route(bucket: &str, key: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bucket.len().saturating_add(key.len()).saturating_add(2));
+    put_string(&mut out, bucket.as_bytes());
+    put_string(&mut out, key.as_bytes());
+    out
+}
+
+/// The bucket and key a routing key names; `None` if it is not one.
+pub fn decode_route(r: &[u8]) -> Option<(String, String)> {
+    let (bucket, rest) = take_string(r)?;
+    let (key, rest) = take_string(rest)?;
+    if !rest.is_empty() {
+        return None;
+    }
+    Some((
+        String::from_utf8(bucket).ok()?,
+        String::from_utf8(key).ok()?,
+    ))
+}
+
+/// The routing keys of a bucket's object keys lie in `[from, past)`: `from` is its empty
+/// key's, the least, and no routing key of another bucket falls between.
+pub fn bucket_routes(bucket: &str) -> (Vec<u8>, Vec<u8>) {
+    let mut from = Vec::with_capacity(bucket.len().saturating_add(2));
+    put_string(&mut from, bucket.as_bytes());
+    let mut past = from.clone();
+    from.push(0x00);
+    past.push(0xFF);
+    (from, past)
+}
+
+/// The rows of the Name layer's spaces, its objects' and its marks', whose routing keys lie in
+/// `[from, to)`, or from `from` on when `to` is `None`.
+pub fn name_spans(from: &[u8], to: Option<&[u8]>) -> [(Vec<u8>, Vec<u8>); 2] {
+    [DATA, MARKS].map(|space| {
+        let mut lo = vec![space];
+        lo.extend_from_slice(from);
+        // A routing key never begins with 0xFF, so this bounds the whole space.
+        let mut hi = vec![space];
+        hi.extend_from_slice(to.unwrap_or(&[0xFF]));
+        (lo, hi)
+    })
+}
+
 /// The key of a bucket's row in the Bucket range's index of creates and deletes in progress,
 /// which the collector reads for attempts to take over (docs/design/metadata.md §2).
 pub fn attempt(bucket: &str) -> Vec<u8> {
@@ -173,6 +241,7 @@ pub fn decode_attempt(k: &[u8]) -> Option<String> {
 pub fn mark(bucket: &str, key: &str, file: u128) -> Vec<u8> {
     let mut out = marks_of(bucket);
     put_string(&mut out, key.as_bytes());
+    out.push(MARK);
     out.extend_from_slice(&file.to_be_bytes());
     out
 }
@@ -190,6 +259,7 @@ pub fn decode_mark(k: &[u8]) -> Option<(String, String, u128)> {
     let rest = k.strip_prefix(&[MARKS])?;
     let (bucket, rest) = take_string(rest)?;
     let (key, rest) = take_string(rest)?;
+    let rest = rest.strip_prefix(&[MARK])?;
     Some((
         String::from_utf8(bucket).ok()?,
         String::from_utf8(key).ok()?,
@@ -610,6 +680,62 @@ mod tests {
         ] {
             assert!(outside < from || past <= outside, "{outside:?}");
         }
+    }
+
+    fn route_text() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop_oneof![Just('\0'), Just('a'), Just('b'), Just('\u{7F}'), Just('é')],
+            0..4,
+        )
+        .prop_map(|c| c.into_iter().collect())
+    }
+
+    proptest! {
+        /// A span between routing keys holds, in each space, the rows of exactly the object
+        /// keys whose routing keys it holds: a mark whose file ID begins with 0xFF included.
+        #[test]
+        fn a_routing_span_bounds_every_row_of_its_keys(
+            bucket in route_text(),
+            key in route_text(),
+            r in row(),
+            file in prop_oneof![Just(u128::MAX), Just(0), any::<u128>()],
+            lo in (route_text(), route_text()),
+            hi in prop::option::of((route_text(), route_text())),
+        ) {
+            let at = route(&bucket, &key);
+            let (lo, hi) = (route(&lo.0, &lo.1), hi.map(|(b, k)| route(&b, &k)));
+            let inside = lo <= at && hi.as_ref().is_none_or(|hi| at < *hi);
+            let [data, marks] = name_spans(&lo, hi.as_deref());
+            for (row, (from, to)) in [(name(&bucket, &key, &r), data), (mark(&bucket, &key, file), marks)] {
+                prop_assert_eq!(from <= row && row < to, inside);
+            }
+            prop_assert_eq!(decode_route(&at), Some((bucket.clone(), key.clone())));
+            let (first, past) = bucket_routes(&bucket);
+            prop_assert!(first <= at && at < past);
+            prop_assert_eq!(decode_mark(&mark(&bucket, &key, file)), Some((bucket, key, file)));
+        }
+
+        /// Routing keys order as their `(bucket, key)` pairs, and a bucket's routes hold only
+        /// its own keys.
+        #[test]
+        fn routing_keys_order_as_their_pairs(
+            a in (route_text(), route_text()),
+            b in (route_text(), route_text()),
+        ) {
+            let pair = |p: &(String, String)| (p.0.as_bytes().to_vec(), p.1.as_bytes().to_vec());
+            prop_assert_eq!(route(&a.0, &a.1).cmp(&route(&b.0, &b.1)), pair(&a).cmp(&pair(&b)));
+            let (first, past) = bucket_routes(&a.0);
+            let at = route(&b.0, &b.1);
+            prop_assert_eq!(first <= at && at < past, a.0 == b.0);
+        }
+    }
+
+    #[test]
+    fn gate_keys_decode_to_their_bucket() {
+        assert_eq!(decode_gate(&gate("b\0c")), Some("b\0c".into()));
+        assert!(gate("\u{10FFFF}") < GATES_END.to_vec());
+        assert_eq!(decode_gate(&GATES_END), None);
+        assert_eq!(decode_route(&route("b", "k")[..3]), None);
     }
 
     #[test]

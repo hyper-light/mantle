@@ -29,7 +29,9 @@ fits the Name layer to S3.
 | Name | (bucket, key, VERSION, order) | a version: object or delete marker | (bucket, key) |
 | Name | (bucket, key, UPLOAD, upload) | a multipart upload in progress | (bucket, key) |
 | Name | (bucket, key, UPLOAD, upload, part) | an uploaded part | (bucket, key) |
+| Name | (MARKS, bucket, key, file) | a file the range took, until the sweep settles it | (bucket, key) |
 | Name | (RELEASED, time, file), in each range | a file nothing references any more, for the collector | the range's |
+| Name | (LINEAGE), in each range | the range's descriptor, and the child of its last split | the range's |
 | File | (file, HEADER) | length, extent count | file |
 | File | (file, EXTENT, end) | a block, or another file, and its length | file |
 | Block | (block, HEADER) | length, code, chunk size, checksum | block |
@@ -339,9 +341,11 @@ replica; its log is the node's shared write-ahead log.
   one Raft message (12 §6.3–§6.5). Splits, merges and moves between cells are modeled in
   TLA+ before they are built (architecture §6.1, §10).
 - **Splits and merges under a create and a delete.** `docs/models/RangeSplit.tla` models
-  Name ranges splitting and merging while a bucket is created, written and deleted. A split is one command in the
-  parent's log, and the new child takes the parent's gate. Writers route by cached
-  descriptors, and a range answers a stale one with its own descriptor and its children's.
+  Name ranges splitting and merging while a bucket is created, written and deleted. A split
+  is one command in the parent's log, and the new child takes the parent's gate. Writers
+  route by cached descriptors, and a range answers a stale one with its own descriptor and
+  that of the child its last split made; one whose descriptors then no longer cover the keys
+  reads the directory.
   Each step of a create or delete attempt names the descriptor generation it read; a range
   refuses another generation, and the attempt learns the answer and starts its phase again.
   A merge is one command in the lower range's log: it takes the higher range's span and keys
@@ -349,7 +353,7 @@ replica; its log is the node's shared write-ahead log.
   stale request with the lower's descriptor. The two gates need not agree: an attempt that
   held either range's descriptor is refused at the new generation and starts its phase
   again, so it moves the joined gate from wherever the lower one was. TLC checks
-  72,007,924 distinct states of three keys, two splits, a merge, a create and two delete
+  98,557,369 distinct states of three keys, two splits, a merge, a create and two delete
   attempts (`scripts/check-model.sh`). In every one of them:
   - the live ranges divide the keys between them;
   - no acknowledged write is lost to a delete;
@@ -359,8 +363,51 @@ replica; its log is the node's shared write-ahead log.
   directory has not yet learned of a split. A delete then closes and reads only the parent's
   half, and deletes the bucket while the child holds a version (eight steps). A create opens
   only the parent's gate and activates the bucket, and the child's gate never opens (five
-  steps). So before ranges split, the coordinator (§2) will carry each range's descriptor
-  and generation, where today it counts ranges.
+  steps). So the coordinator (§2) routes each step by a descriptor and names its
+  generation, and relearns as the model's attempts do.
+- **Splits, as built** (`crates/meta/src/name.rs`). A Name range's lineage records its
+  descriptor, an ID, a span and a generation, and the child its last split made. A span runs
+  between two routing keys (`key::route`): the bucket, then the key, each escaped and ended.
+  Every row of an object key, its versions and uploads and its marks alike, is its space's
+  byte, the key's routing key and a suffix whose first byte is below 0xFF, so a span bounds
+  its keys' rows by bytes in every space; a mark carries a byte of its own before the file
+  ID, which may begin with 0xFF and would otherwise read, after a key ending in an escaped
+  zero byte, as part of a later key.
+  - *The split* is one command in the parent's log, naming the generation the splitter read
+    and a routing key inside the span. The parent keeps the keys before it, its queue of
+    released files and its sessions. The child takes the keys from it with their rows and
+    marks, and the gate of every bucket whose keys it can hold: a bucket the cut falls
+    inside keeps its gate on both sides, and one wholly past the cut moves its gate. It
+    takes the gate floor, so an attempt the parent refused stays refused and a resumed
+    cleanup finds the gates it dropped, and the clock, so a time a check recorded carries
+    over: a handover a lagging leader proposes behind the check that released its file is
+    refused by the child as the parent would have refused it. Both take the next
+    generation, and the parent clears what the child took with one range delete a space
+    (§4). `name::child` reads the child's rows from the parent before the parent applies the
+    split, so the replicas can make the child on the parent's replicas from the parent's
+    rows as they stood.
+  - *Fences.* A command for an object key outside the range's span, a write or the sweep's
+    check or unmark of a file made for such a key, is not the range's, and neither is a
+    coordinator's step or read routed by another generation. The range answers with its
+    lineage and takes nothing, not even a file the command carries, which the sender hands
+    on to the range that holds the key. A range keeps one child, so its lineage is bounded;
+    a sender whose descriptors no longer cover the keys it needs reads the directory.
+  - *Checked.* `crates/meta/tests/bucket_lifecycle.rs` splits ranges at seven cuts,
+    among them the bucket's first routing key and the next bucket's, while its 2,000
+    schedules create and delete the bucket; writers route by descriptors they learn of
+    late, and the directory learns of splits when the schedule says. After every step it
+    checks the model's properties, that each range holds rows, marks and gates only of its
+    own keys and buckets, and that a forgotten bucket leaves no gate.
+    `crates/meta/tests/orphan_sweep.rs` splits ranges while gateways hand files over and the
+    sweep checks them by late descriptors. Each rule removed on purpose fails a
+    simulation: without the generation check, the delete of the model's eight-step schedule
+    loses its version and a create activates a bucket whose child never opened its gate;
+    without the span check, writes land outside the span; a child without its gates
+    leaves an active bucket's range closed; marks left behind, or checks answered outside
+    the span, release files that versions reference; a child without the floor leaves a
+    resumed cleanup unable to finish. A child without the clock passed 2,000 schedules,
+    which never reached the one interleaving that needs it, so a test of its own spells
+    that interleaving out.
 - **Transport:** QUIC for snapshots and other bulk transfers, and a separate UDP datagram
   plane for Raft's messages, including Fast Raft's, as the hecate specification lays out
   (07 §4.7). A fast-track proposal carries its entry, so an entry travels as datagrams only

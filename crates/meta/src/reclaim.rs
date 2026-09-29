@@ -265,7 +265,7 @@ impl Reclaimer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::Model;
+    use crate::engine::{Engine, Model};
     use crate::name::{Command, Delete, Named, Outcome, Put};
     use crate::record::{Version, Versioning};
     use mantle_chunk::ChunkKey;
@@ -283,8 +283,10 @@ mod tests {
 
     impl Cell {
         fn new() -> Self {
+            let mut first = Model::default();
+            first.install(0, name::first(1).unwrap()).unwrap();
             let mut cell = Self {
-                name: Model::default(),
+                name: first,
                 files: Model::default(),
                 blocks: Model::default(),
                 chunks: BTreeSet::new(),
@@ -296,6 +298,7 @@ mod tests {
                 attempt: 1,
                 from: None,
                 to: Some(crate::record::GateState::Open),
+                generation: 1,
             }));
             cell
         }

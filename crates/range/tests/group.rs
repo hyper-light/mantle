@@ -15,7 +15,7 @@ use mantle_disk::buf::Alignment;
 use mantle_disk::sim::SimFile;
 use mantle_log::{Config as LogConfig, Log};
 use mantle_meta::apply::Layer;
-use mantle_meta::engine::{Model, Rows};
+use mantle_meta::engine::{Engine, Model, Rows};
 use mantle_meta::name::{self, GateChange, Preconditions, Put};
 use mantle_meta::record::{GateState, Version, Versioning};
 use mantle_meta::session::Rules;
@@ -45,6 +45,14 @@ const SETTINGS: Settings = Settings {
     max_uncommitted_size: 1 << 24,
     max_committed_size_per_ready: 1 << 22,
 };
+
+/// The engine of a cell's first Name range, before any entry: its lineage, holding every key.
+fn first_range() -> Model {
+    let mut m = Model::default();
+    m.install(0, name::first(1).unwrap()).unwrap();
+    m.persist().unwrap();
+    m
+}
 
 fn range() -> Range {
     Range {
@@ -79,7 +87,7 @@ fn node(id: u64, seed: u64) -> Node {
         .unwrap(),
     );
     let log = Arc::new(Log::create(file, log_config(), 0x6c6f67 + u128::from(id)).unwrap());
-    let replica = Replica::open(id, GROUP, log, Model::default(), &range(), seed).unwrap();
+    let replica = Replica::open(id, GROUP, log, first_range(), &range(), seed).unwrap();
     Node { replica }
 }
 
@@ -166,6 +174,7 @@ fn a_group_elects_a_leader_and_applies_the_same_entries_everywhere() {
         attempt: 1,
         from: None,
         to: Some(GateState::Open),
+        generation: 1,
     })));
     let commands = vec![
         Sessioned {
@@ -273,6 +282,7 @@ fn a_member_added_after_compaction_catches_up_and_replaces_a_lost_one() {
         attempt: 1,
         from: None,
         to: Some(GateState::Open),
+        generation: 1,
     })));
     let commands = vec![
         Sessioned {
@@ -375,7 +385,7 @@ fn a_member_whose_engine_is_ahead_of_its_logs_commit_reopens() {
         .iter()
         .zip(1u64..)
         .map(|(log, id)| Node {
-            replica: Replica::open(id, GROUP, Arc::clone(log), Model::default(), &range(), id)
+            replica: Replica::open(id, GROUP, Arc::clone(log), first_range(), &range(), id)
                 .unwrap(),
         })
         .collect();

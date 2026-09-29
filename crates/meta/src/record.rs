@@ -269,6 +269,27 @@ pub struct BlockHeader {
     pub crc32c: u32,
 }
 
+/// A Name range's span and generation, as requests route by it (docs/design/metadata.md §3).
+/// The span runs from routing key `lo` (`key::route`), empty for the first range, up to `hi`,
+/// or to the end of the key space when `hi` is `None`. The generation rises with every split,
+/// so a request routed by an older descriptor is told where the span went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Descriptor {
+    pub id: u64,
+    pub lo: Vec<u8>,
+    pub hi: Option<Vec<u8>>,
+    pub generation: u64,
+}
+
+/// What a Name range knows of where its span went: its descriptor now and the child its last
+/// split made, as it was made. A range answers a request routed by a descriptor it no longer
+/// matches with its lineage, and never with data (docs/design/metadata.md §3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lineage {
+    pub now: Descriptor,
+    pub child: Option<Descriptor>,
+}
+
 /// The object key a released file was held under: the version, part or handover that took
 /// it. It routes the removal of the file's mark to the range that holds the key, wherever
 /// splits and merges have moved it by then (docs/design/metadata.md §2).
@@ -421,6 +442,85 @@ impl BlockHeader {
             })
         })();
         decoded(header, &r, "block")
+    }
+}
+
+impl Descriptor {
+    /// Whether the span holds routing key `route`.
+    pub fn holds(&self, route: &[u8]) -> bool {
+        self.lo.as_slice() <= route && self.hi.as_deref().is_none_or(|hi| route < hi)
+    }
+
+    /// Whether the span holds any routing key in `[from, past)`: a bucket's, from
+    /// `key::bucket_routes`.
+    pub fn meets(&self, from: &[u8], past: &[u8]) -> bool {
+        self.lo.as_slice() < past && self.hi.as_deref().is_none_or(|hi| from < hi)
+    }
+}
+
+pub(crate) fn put_descriptor(w: &mut Writer, d: &Descriptor) -> Result<(), RecordError> {
+    w.u64(d.id);
+    put_bytes(w, &d.lo)?;
+    match &d.hi {
+        None => w.u8(0),
+        Some(hi) => {
+            w.u8(1);
+            put_bytes(w, hi)?;
+        }
+    }
+    w.u64(d.generation);
+    Ok(())
+}
+
+pub(crate) fn take_descriptor(r: &mut Reader<'_>) -> Option<Descriptor> {
+    let id = r.u64()?;
+    let lo = take_bytes(r)?;
+    let hi = match r.u8()? {
+        0 => None,
+        1 => Some(take_bytes(r)?),
+        _ => return None,
+    };
+    Some(Descriptor {
+        id,
+        lo,
+        hi,
+        generation: r.u64()?,
+    })
+}
+
+pub(crate) fn put_lineage(w: &mut Writer, l: &Lineage) -> Result<(), RecordError> {
+    put_descriptor(w, &l.now)?;
+    match &l.child {
+        None => w.u8(0),
+        Some(child) => {
+            w.u8(1);
+            put_descriptor(w, child)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn take_lineage(r: &mut Reader<'_>) -> Option<Lineage> {
+    let now = take_descriptor(r)?;
+    let child = match r.u8()? {
+        0 => None,
+        1 => Some(take_descriptor(r)?),
+        _ => return None,
+    };
+    Some(Lineage { now, child })
+}
+
+impl Lineage {
+    pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
+        let mut w = start();
+        put_lineage(&mut w, self)?;
+        Ok(finish(w))
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "lineage")?;
+        let lineage = take_lineage(&mut r);
+        decoded(lineage, &r, "lineage")
     }
 }
 
@@ -1291,6 +1391,39 @@ mod tests {
         let crc = mantle_crc::crc32c(&bad[..body]);
         bad[body..].copy_from_slice(&crc.to_le_bytes());
         assert_eq!(Gate::decode(&bad), Err(RecordError::Corrupt("gate")));
+    }
+
+    #[test]
+    fn lineages_round_trip_and_spans_hold_their_keys() {
+        let parent = Descriptor {
+            id: 1,
+            lo: Vec::new(),
+            hi: Some(vec![b'm', 0, 0]),
+            generation: 2,
+        };
+        let child = Descriptor {
+            id: u64::MAX,
+            lo: vec![b'm', 0, 0],
+            hi: None,
+            generation: 2,
+        };
+        for l in [
+            Lineage {
+                now: parent.clone(),
+                child: Some(child.clone()),
+            },
+            Lineage {
+                now: child.clone(),
+                child: None,
+            },
+        ] {
+            assert_eq!(Lineage::decode(&l.encode().unwrap()), Ok(l));
+        }
+        assert!(parent.holds(b"") && parent.holds(b"l") && !parent.holds(&[b'm', 0, 0]));
+        assert!(child.holds(&[b'm', 0, 0]) && child.holds(&[0xFE]));
+        // A bucket's routes meet the spans that hold any of them.
+        assert!(parent.meets(b"a", b"b") && !child.meets(b"a", b"b"));
+        assert!(parent.meets(&[b'm', 0], &[b'm', 0xFF]) && child.meets(&[b'm', 0], &[b'm', 0xFF]));
     }
 
     /// Every flipped bit and every truncation is refused, never misread.

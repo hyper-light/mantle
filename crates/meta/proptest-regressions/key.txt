@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc d36a562dbf9f1b776dcd37a28f9818552a32592b5703d57a215072c974ff0416 # shrinks to a = ("a", "", Part([], 65280)), b = ("a", "", Null)
+cc 2c91dfe731a9701e629af0a771b3db1590227375c841a570a0ba5125765c1222 # shrinks to bucket = "", key = "", r = Null, file = 340282366920938463463374607431768211455, lo = ("", ""), hi = None

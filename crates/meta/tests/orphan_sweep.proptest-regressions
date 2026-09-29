@@ -6,3 +6,5 @@
 # everyone who runs the test benefits from these saved cases.
 cc 0125abddaba0f844fa87ad8252189942a561c0501ab138f7f47d69dda706ec8b # shrinks to actions = [Write { key: 0 }, Write { key: 0 }, Write { key: 0 }, Write { key: 0 }, Write { key: 0 }, Write { key: 0 }, Write { key: 0 }, Write { key: 0 }, BlockSweep, BlockSweep]
 cc d656427ea4cc7d520b477c73b7a199b3bc245322713dd523ffecca8caf55511f # shrinks to actions = [Write { key: 0 }, Wait, BlockSweep, BlockSweep, Leader { lag: 70 }, Delete { key: 0, versioned: false }, Delete { key: 0, versioned: false }, Advance(0)]
+cc 04bde5e5b0586fb52dbb5f2458a514f6b1a4c6c98c88e4c04e967a6b607acc9a # shrinks to actions = [Write { key: 1 }, Leader { lag: 0 }, Advance(0), Advance(0), Split { range: 6, cut: 0 }]
+cc 29e0d70fe0718753ac70fab1c06204f3347f04969bc030adcf9cbc5831fcda4e # shrinks to actions = [Write { key: 0 }, Advance(0), Write { key: 0 }, Advance(0), Crash(0), Write { key: 0 }, Write { key: 0 }, Write { key: 3 }, Leader { lag: 0 }, Crash(3), Advance(0), Advance(1), Write { key: 0 }, Write { key: 0 }, Split { range: 1, cut: 4 }, Write { key: 0 }]

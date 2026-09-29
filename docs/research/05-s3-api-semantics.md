@@ -917,6 +917,24 @@ s3-tests behaviors (marker `list_objects_v2` unless noted):
 - `test_bucket_list_return_data_versioning` ([L1432](https://github.com/ceph/s3-tests/blob/5522d1c351f75bc00ae0f64f742f3f095f5939d9/s3tests/functional/test_s3.py#L1432)) cross-checks VersionId, ETag, Size and Owner against HEAD.
 
 
+### 6.5 How clients follow pages (botocore)
+
+botocore's paginator definitions for S3 (`botocore/data/s3/2006-03-01/paginators-1.json` at
+commit 358f8ee), which the AWS CLI and boto3 follow:
+
+| Operation | Next page from | Sent back as |
+|---|---|---|
+| ListObjects | `NextMarker \|\| Contents[-1].Key` | `Marker` |
+| ListObjectsV2 | `NextContinuationToken` | `ContinuationToken` |
+| ListObjectVersions | `NextKeyMarker`, `NextVersionIdMarker` | `KeyMarker`, `VersionIdMarker` |
+| ListMultipartUploads | `NextKeyMarker`, `NextUploadIdMarker` | `KeyMarker`, `UploadIdMarker` |
+| ListParts | `NextPartNumberMarker` | `PartNumberMarker` |
+| ListBuckets | `ContinuationToken` | `ContinuationToken` |
+
+Each continues while `IsTruncated` is true (ListBuckets while a token comes back). For
+ListObjects the next marker is `NextMarker` when the response has one, else the last key
+listed.
+
 ## 7. Versioning semantics
 
 Primary sources:

@@ -14,7 +14,7 @@ use std::borrow::Cow;
 
 use crate::body::Versioning;
 use crate::checksum::{Algorithm, Checksum, ChecksumType};
-use crate::list::{Page, Request, url_encode};
+use crate::list::{Page, Request, Start, url_encode};
 use crate::time::iso8601;
 use crate::xml::Writer;
 
@@ -99,20 +99,19 @@ pub struct ListV1<'a> {
 }
 
 /// ListObjects' `ListBucketResult`. `Marker` is written even when none was sent, as s3-tests
-/// expects, and `NextMarker`, the last key or common prefix listed, only on a truncated page
-/// listed with a delimiter: "This element is returned only if you have the delimiter request
-/// parameter specified" (05 §6.3). V1 lists owners unasked.
+/// expects, and `NextMarker` as [`Page::next_marker`] gives it. V1 lists owners unasked.
 pub fn list_objects(list: &ListV1<'_>, page: &Page<Entry>) -> Result<String, TimeOutOfRange> {
     let modified = times(page.contents.iter().map(|(_, entry)| entry.modified))?;
     let (request, url) = (&list.request, list.url);
     Ok(Writer::document("ListBucketResult", true, |w| {
         w.text("IsTruncated", flag(page.truncated));
-        w.text("Marker", &encoded(request.after.unwrap_or(""), url));
-        if page.truncated
-            && delimited(request.delimiter).is_some()
-            && let Some(last) = &page.last
-        {
-            w.text("NextMarker", &encoded(last, url));
+        let marker = match request.start {
+            Some(Start::After(marker) | Start::Past(marker)) => marker,
+            None => "",
+        };
+        w.text("Marker", &encoded(marker, url));
+        if let Some(next) = page.next_marker(delimited(request.delimiter).is_some()) {
+            w.text("NextMarker", &encoded(next, url));
         }
         contents(w, page, &modified, true, url);
         w.text("Name", list.bucket);
@@ -285,8 +284,8 @@ pub struct ListUploads<'a> {
     pub uploads: &'a [Upload],
     pub common_prefixes: &'a [String],
     pub truncated: bool,
-    /// Where a next page would start, which S3 writes on every page, truncated or not, and
-    /// empty when the page lists nothing to resume after (13 §9.3).
+    /// `NextKeyMarker` and `NextUploadIdMarker`, which S3 writes on every page, truncated or
+    /// not ([`crate::list::EntryPage::upload_markers`]).
     pub next: Next<'a>,
 }
 
@@ -665,7 +664,7 @@ fn timestamp(seconds: i64) -> Result<String, TimeOutOfRange> {
 mod tests {
     use super::*;
     use crate::checksum::checksum;
-    use crate::list::continuation_token;
+    use crate::list::{Paging, Resume, continuation_token};
     use crate::sigv4::percent_decode;
     use crate::xml::NAMESPACE;
     use proptest::prelude::*;
@@ -724,8 +723,9 @@ mod tests {
         Request {
             prefix,
             delimiter,
-            after,
+            start: after.map(Start::After),
             max_keys: 1000,
+            paging: Paging::Token,
         }
     }
 
@@ -737,7 +737,7 @@ mod tests {
                 .collect(),
             common_prefixes: common_prefixes.iter().map(|p| p.to_string()).collect(),
             truncated: false,
-            last: None,
+            next: None,
         }
     }
 
@@ -1477,7 +1477,7 @@ mod tests {
             &["a/c/"],
         );
         listed.truncated = true;
-        listed.last = Some("a/c/".into());
+        listed.next = Some(Resume::After("a/c/".into()));
         let list = ListV2 {
             continuation_token: Some("t"),
             start_after: Some("a/"),
@@ -1491,7 +1491,7 @@ mod tests {
                 },
             )
         };
-        let token = continuation_token("a/c/");
+        let token = continuation_token(&Resume::After("a/c/".into()));
         assert_eq!(
             list_objects_v2(&list, &listed).unwrap(),
             format!(
@@ -1535,7 +1535,7 @@ mod tests {
         // NextMarker, the last item listed, only on a truncated page with a delimiter.
         let mut truncated = listed.clone();
         truncated.truncated = true;
-        truncated.last = Some("d/".into());
+        truncated.next = Some(Resume::After("d/".into()));
         let l = leaves(list_objects(&v1(request("", Some("/"), None)), &truncated));
         assert_eq!(text(&l, "/ListBucketResult/NextMarker"), Some("d/".into()));
         let l = leaves(list_objects(&v1(request("", None, None)), &truncated));
@@ -1582,7 +1582,7 @@ mod tests {
         };
         let mut listed = page(vec![(odd, entry(0, "e", 1, "o"))], &[odd]);
         listed.truncated = true;
-        listed.last = Some(odd.into());
+        listed.next = Some(Resume::After(odd.into()));
         let list = ListV2 {
             start_after: Some(odd),
             url: true,
@@ -1799,7 +1799,7 @@ mod tests {
                 contents: keys.iter().map(|k| (k.clone(), entry(0, "e", 1, "o"))).collect(),
                 common_prefixes: keys.iter().map(|k| format!("{k}/")).collect(),
                 truncated: false,
-                last: None,
+                next: None,
             };
             let read = |doc: &str, path: &str| -> Vec<String> {
                 elements(doc).1.into_iter().filter(|(p, _)| p == path).map(|(_, t)| t).collect()

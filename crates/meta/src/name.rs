@@ -785,35 +785,40 @@ fn id(null: bool, order: u64) -> String {
     }
 }
 
-/// What a listing step found (docs/design/s3-protocol.md §3).
+/// What a listing's scan found (docs/design/s3-protocol.md §3). A scan passes at most a
+/// budget of keys that hold nothing it lists, counting each one off, and pauses between keys,
+/// so the key it names on pausing is the one to resume after.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Scan {
-    /// The first key at or after the position whose current version is an object.
-    Found {
-        key: String,
-        order: u64,
-        version: Version,
-    },
-    /// No such key is left in the bucket.
+pub enum Scan<T> {
+    Found(T),
+    /// Nothing the scan lists is left before its end.
     End,
-    /// The budget of rows ran out first: the next step starts at this object-key position.
-    Paused(Vec<u8>),
+    /// The budget ran out: this is the last key passed.
+    Paused(String),
 }
 
-/// The first key at or after `from`, in object-key byte order, whose current version is an
-/// object rather than a delete marker, reading at most `budget` rows: a bucket whose keys are
-/// mostly delete markers pauses the scan rather than running it unbounded.
+/// A key's current version, as ListObjects lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Current {
+    pub key: String,
+    pub order: u64,
+    pub version: Version,
+}
+
+/// The first key at or after `from` and before `to`, in object-key byte order, whose current
+/// version is an object rather than a delete marker (05 §6.4). A delete marker's key and a key
+/// holding only uploads are passed; each costs at most two rows, its null pointer and its
+/// newest version or first upload.
 pub fn next_current<E: Rows>(
     engine: &E,
     bucket: &str,
     from: &[u8],
-    budget: usize,
-) -> Result<Scan, MetaError> {
+    to: &[u8],
+    budget: &mut usize,
+) -> Result<Scan<Current>, MetaError> {
     let mut position = key::position(bucket, from);
-    // Where the next step starts, in object-key space.
-    let mut resume = from.to_vec();
-    let (_, end) = key::bucket_span(bucket);
-    for _ in 0..budget {
+    let end = key::position(bucket, to);
+    loop {
         let Some((k, v)) = engine.next(&position, &end)? else {
             return Ok(Scan::End);
         };
@@ -822,30 +827,190 @@ pub fn next_current<E: Rows>(
         };
         match row {
             // The null pointer sorts before the key's versions.
-            NameRow::Null => {
-                position = after(&k);
-                resume = object.into_bytes();
-            }
+            NameRow::Null => position = after(&k),
             NameRow::Version(order) => {
                 let version = Version::decode(&v)?;
                 if !version.marker {
-                    return Ok(Scan::Found {
+                    return Ok(Scan::Found(Current {
                         key: object,
                         order,
                         version,
-                    });
+                    }));
                 }
                 position = beyond_rows(bucket, &object);
-                resume = after(object.as_bytes());
+                if pass(budget) {
+                    return Ok(Scan::Paused(object));
+                }
             }
             // Uploads with no version before them: the key has no current version.
             NameRow::Upload(_) | NameRow::Part(..) => {
                 position = beyond_rows(bucket, &object);
-                resume = after(object.as_bytes());
+                if pass(budget) {
+                    return Ok(Scan::Paused(object));
+                }
             }
         }
     }
-    Ok(Scan::Paused(resume))
+}
+
+/// A version or delete marker, as ListObjectVersions lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Versioned {
+    pub key: String,
+    pub order: u64,
+    pub version: Version,
+    /// The key's newest version: the first a scan meets on entering the key.
+    pub latest: bool,
+}
+
+impl Versioned {
+    /// The ID S3 shows for it: `null` for the null version (05 §7.1).
+    pub fn version_id(&self) -> String {
+        id(self.version.null, self.order)
+    }
+}
+
+/// Where a scan of versions starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionFrom<'a> {
+    /// The first version of the first key at or after these object-key bytes.
+    Key(&'a [u8]),
+    /// The version after the one `version_id` names, `null` included (05 §7.1). An ID that
+    /// names no version of the key starts at the key's first, so no version is skipped.
+    After { key: &'a str, version_id: &'a str },
+}
+
+/// The first version at or after `from` whose key is before `to`: keys in byte order, each
+/// key's versions and delete markers newest first (05 §6.4). A key holding only uploads is
+/// passed.
+pub fn next_version<E: Rows>(
+    engine: &E,
+    bucket: &str,
+    from: VersionFrom<'_>,
+    to: &[u8],
+    budget: &mut usize,
+) -> Result<Scan<Versioned>, MetaError> {
+    let (mut position, resumed) = match from {
+        VersionFrom::Key(from) => (key::position(bucket, from), None),
+        VersionFrom::After { key, version_id } => {
+            let order = if version_id == NULL_VERSION {
+                null_order(engine, bucket, key)?
+            } else {
+                key::parse_version_id(version_id)
+            };
+            match order {
+                Some(order) => (
+                    after(&key::name(bucket, key, &NameRow::Version(order))),
+                    Some(key),
+                ),
+                None => (key::object(bucket, key), None),
+            }
+        }
+    };
+    let end = key::position(bucket, to);
+    loop {
+        let Some((k, v)) = engine.next(&position, &end)? else {
+            return Ok(Scan::End);
+        };
+        let Some((_, object, row)) = key::decode_name(&k) else {
+            return Err(MetaError::Corrupt);
+        };
+        match row {
+            NameRow::Null => position = after(&k),
+            NameRow::Version(order) => {
+                let latest = resumed != Some(object.as_str());
+                return Ok(Scan::Found(Versioned {
+                    key: object,
+                    order,
+                    version: Version::decode(&v)?,
+                    latest,
+                }));
+            }
+            // Past the key's versions: its uploads list nothing here.
+            NameRow::Upload(_) | NameRow::Part(..) => {
+                position = beyond_rows(bucket, &object);
+                if pass(budget) {
+                    return Ok(Scan::Paused(object));
+                }
+            }
+        }
+    }
+}
+
+/// A multipart upload in progress, as ListMultipartUploads lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Uploaded {
+    pub key: String,
+    pub id: String,
+    pub upload: Upload,
+}
+
+/// Where a scan of uploads starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadFrom<'a> {
+    /// The first upload of the first key at or after these object-key bytes.
+    Key(&'a [u8]),
+    /// The upload after `id` of `key`.
+    After { key: &'a str, id: &'a str },
+}
+
+/// The first upload at or after `from` whose key is before `to`: keys in byte order, each
+/// key's uploads by ID, which is the order they were created in (05 §4.7). Parts are passed
+/// with the seek past their upload, and a key's versions with one seek to its uploads; a key
+/// holding only versions is passed.
+pub fn next_upload<E: Rows>(
+    engine: &E,
+    bucket: &str,
+    from: UploadFrom<'_>,
+    to: &[u8],
+    budget: &mut usize,
+) -> Result<Scan<Uploaded>, MetaError> {
+    let mut position = match from {
+        UploadFrom::Key(from) => key::position(bucket, from),
+        UploadFrom::After { key, id } => {
+            let mut beyond = key::name(bucket, key, &NameRow::Upload(id.as_bytes().to_vec()));
+            beyond.push(u8::MAX);
+            beyond
+        }
+    };
+    let end = key::position(bucket, to);
+    // A key whose uploads were sought and not yet found.
+    let mut sought: Option<String> = None;
+    loop {
+        let Some((k, v)) = engine.next(&position, &end)? else {
+            return Ok(Scan::End);
+        };
+        let Some((_, object, row)) = key::decode_name(&k) else {
+            return Err(MetaError::Corrupt);
+        };
+        if let Some(passed) = sought.take()
+            && passed != object
+            && pass(budget)
+        {
+            return Ok(Scan::Paused(passed));
+        }
+        match row {
+            NameRow::Upload(id) => {
+                return Ok(Scan::Found(Uploaded {
+                    key: object,
+                    id: String::from_utf8(id).map_err(|_| MetaError::Corrupt)?,
+                    upload: Upload::decode(&v)?,
+                }));
+            }
+            NameRow::Null | NameRow::Version(_) => {
+                position = key::name(bucket, &object, &NameRow::Upload(Vec::new()));
+                sought = Some(object);
+            }
+            // A part sorts after its upload, which a scan either lists or passes whole.
+            NameRow::Part(..) => return Err(MetaError::Corrupt),
+        }
+    }
+}
+
+/// Counts a key passed off the budget; true once it is spent.
+fn pass(budget: &mut usize) -> bool {
+    *budget = budget.saturating_sub(1);
+    *budget == 0
 }
 
 /// The range's gate for `bucket`.
@@ -1221,24 +1386,168 @@ mod tests {
         }
         r.delete("b", Versioning::Enabled, None);
         r.delete("c", Versioning::Enabled, None);
-        let found = |s: Scan| match s {
-            Scan::Found { key, .. } => key,
+        let scan = |bucket: &str, from: &[u8], to: &[u8], budget: usize| {
+            let mut budget = budget;
+            next_current(&r.engine, bucket, from, to, &mut budget).unwrap()
+        };
+        let found = |s: Scan<Current>| match s {
+            Scan::Found(current) => current.key,
             other => panic!("{other:?}"),
         };
-        assert_eq!(found(next_current(&r.engine, "b", b"", 10).unwrap()), "a");
+        let end = [u8::MAX];
+        assert_eq!(found(scan("b", b"", &end, 10)), "a");
+        assert_eq!(found(scan("b", b"a\0", &end, 10)), "d");
+        // Two delete markers passed, the budget spent: the scan names the last key passed.
+        assert_eq!(scan("b", b"a\0", &end, 2), Scan::Paused("c".into()));
+        assert_eq!(found(scan("b", b"c\0", &end, 1)), "d");
+        assert_eq!(scan("b", b"e", &end, 10), Scan::End);
+        assert_eq!(scan("other", b"", &end, 10), Scan::End);
+        // The scan stops at its end: "d" is not before "d".
+        assert_eq!(scan("b", b"a\0", b"d", 10), Scan::End);
+        // A null version's pointer is read with its key, not counted as a key passed.
+        r.put("e", "e", Versioning::Unversioned);
+        r.delete("e", Versioning::Suspended, None);
+        let mut budget = 1;
         assert_eq!(
-            found(next_current(&r.engine, "b", b"a\0", 10).unwrap()),
-            "d"
+            next_current(&r.engine, "b", b"d\0", &end, &mut budget).unwrap(),
+            Scan::Paused("e".into())
         );
-        // Two markers read, the budget spent: the next step starts just after "c".
+    }
+
+    /// Versions list by key, newest first, the first a scan meets on entering a key marked
+    /// latest. A scan resumes after a version by its ID, `null` included, starts a key over
+    /// when the ID names none of its versions, and passes keys holding only uploads.
+    #[test]
+    fn versions_list_newest_first_and_resume_by_id() {
+        let mut r = Range::new();
+        r.put("a", "a1", Versioning::Unversioned);
+        r.put("a", "a2", Versioning::Enabled);
+        r.delete("a", Versioning::Enabled, None);
+        r.create("b");
+        r.put("c", "c1", Versioning::Enabled);
+        let end = [u8::MAX];
+        let scan = |from: VersionFrom<'_>, budget: usize| {
+            let mut budget = budget;
+            next_version(&r.engine, "b", from, &end, &mut budget).unwrap()
+        };
+        let found = |s: Scan<Versioned>| match s {
+            Scan::Found(v) => (
+                v.key.clone(),
+                id(v.version.null, v.order),
+                v.version.marker,
+                v.version.etag,
+                v.latest,
+            ),
+            other => panic!("{other:?}"),
+        };
+        let mut seen = Vec::new();
+        let mut step = scan(VersionFrom::Key(b""), 10);
+        while let Scan::Found(v) = &step {
+            let (key, version_id) = (v.key.clone(), id(v.version.null, v.order));
+            seen.push(found(step.clone()));
+            step = scan(
+                VersionFrom::After {
+                    key: &key,
+                    version_id: &version_id,
+                },
+                10,
+            );
+        }
+        assert_eq!(step, Scan::End);
+        let marker = seen[0].1.clone();
         assert_eq!(
-            next_current(&r.engine, "b", b"a\0", 2).unwrap(),
-            Scan::Paused(b"c\0".to_vec())
+            seen,
+            [
+                ("a".into(), marker.clone(), true, String::new(), true),
+                ("a".into(), seen[1].1.clone(), false, "a2".into(), false),
+                ("a".into(), "null".into(), false, "a1".into(), false),
+                ("c".into(), seen[3].1.clone(), false, "c1".into(), true),
+            ]
         );
-        assert_eq!(found(next_current(&r.engine, "b", b"c\0", 1).unwrap()), "d");
-        assert_eq!(next_current(&r.engine, "b", b"e", 10).unwrap(), Scan::End);
+        // "b" holds only an upload: a budget of one passes it and pauses there.
         assert_eq!(
-            next_current(&r.engine, "other", b"", 10).unwrap(),
+            scan(
+                VersionFrom::After {
+                    key: "a",
+                    version_id: "null"
+                },
+                1
+            ),
+            Scan::Paused("b".into())
+        );
+        // An ID that names no version starts the key over, so nothing is skipped.
+        assert_eq!(
+            found(scan(
+                VersionFrom::After {
+                    key: "a",
+                    version_id: "bogus"
+                },
+                10
+            ))
+            .1,
+            marker
+        );
+        r.delete("a", Versioning::Enabled, Some(Named::Null));
+        let mut budget = 10;
+        let after_null = VersionFrom::After {
+            key: "a",
+            version_id: "null",
+        };
+        let step = next_version(&r.engine, "b", after_null, &end, &mut budget).unwrap();
+        assert_eq!(found(step).1, marker);
+    }
+
+    /// Uploads list by key and ID, which is the order they were created in; their parts and
+    /// their keys' versions are passed with a seek each, and a key holding only versions is
+    /// passed within the budget.
+    #[test]
+    fn uploads_list_in_creation_order_and_pass_keys_without_them() {
+        let mut r = Range::new();
+        r.put("a", "a1", Versioning::Enabled);
+        let u1 = r.create("b");
+        r.part("b", &u1, 1, 1, 1);
+        r.part("b", &u1, 2, 1, 2);
+        let u2 = r.create("b");
+        r.put("c", "c1", Versioning::Enabled);
+        let u3 = r.create("c");
+        r.put("d", "d1", Versioning::Enabled);
+        assert!(u1 < u2);
+        let end = [u8::MAX];
+        let scan = |from: UploadFrom<'_>, budget: usize| {
+            let mut budget = budget;
+            next_upload(&r.engine, "b", from, &end, &mut budget).unwrap()
+        };
+        let mut seen = Vec::new();
+        let mut step = scan(UploadFrom::Key(b""), 10);
+        while let Scan::Found(u) = &step {
+            seen.push((u.key.clone(), u.id.clone()));
+            let (key, id) = (u.key.clone(), u.id.clone());
+            step = scan(UploadFrom::After { key: &key, id: &id }, 10);
+        }
+        assert_eq!(step, Scan::End);
+        assert_eq!(
+            seen,
+            [
+                ("b".to_string(), u1.clone()),
+                ("b".into(), u2.clone()),
+                ("c".into(), u3.clone())
+            ]
+        );
+        // "a" holds only versions: a budget of one passes it and pauses there.
+        assert_eq!(scan(UploadFrom::Key(b""), 1), Scan::Paused("a".into()));
+        // "d", the last key, holds only versions: the scan reaches the end rather than pausing.
+        assert_eq!(scan(UploadFrom::After { key: "c", id: &u3 }, 1), Scan::End);
+        // The end bounds the scan: nothing at or after "c".
+        let mut budget = 10;
+        assert_eq!(
+            next_upload(
+                &r.engine,
+                "b",
+                UploadFrom::After { key: "b", id: &u2 },
+                b"c",
+                &mut budget
+            )
+            .unwrap(),
             Scan::End
         );
     }
@@ -1424,7 +1733,11 @@ mod tests {
         let other = r.create("m");
         r.part("m", &other, 1, 1, 1);
         assert_eq!(current(&r.engine, "b", "m").unwrap(), None);
-        assert_eq!(next_current(&r.engine, "b", b"", 10).unwrap(), Scan::End);
+        let mut budget = 10;
+        assert_eq!(
+            next_current(&r.engine, "b", b"", &[u8::MAX], &mut budget).unwrap(),
+            Scan::End
+        );
     }
 
     /// Replaying the log from the durable point after a crash rebuilds the same rows.

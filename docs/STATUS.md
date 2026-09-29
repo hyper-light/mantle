@@ -86,8 +86,9 @@ developer guide: the canonical requests, the signatures, and the chunked bodies 
 byte. The ten checksum algorithms S3 accepts, full-object CRCs combined from parts without
 the data, composite values and ETags, verified against AWS's multipart tutorial and ceph
 s3-tests' vectors. Routing by virtual-hosted and path-style addressing, conditional requests
-in RFC 9110's order, byte ranges, and ListObjects paging, each tested against the s3-tests
-cases for it. An XML reader for request bodies that refuses entity declarations and does
+in RFC 9110's order, byte ranges, and paging of keys, versions and multipart uploads, each
+tested against the s3-tests cases for it. A page passes at most 1,000 keys that list nothing
+and resumes past them without dropping a common prefix, over the Name layer's scans. An XML reader for request bodies that refuses entity declarations and does
 work linear in the body, checked against roxmltree on generated and mutated documents, with
 the CompleteMultipartUpload, DeleteObjects, CreateBucket and PutBucketVersioning documents
 read against their schemas under size limits computed from S3's own. The documents every
@@ -97,8 +98,6 @@ read by roxmltree.
 
 Remaining before it is done:
 
-- ListObjectVersions and ListMultipartUploads paging: a scan of the Name layer's versions
-  and uploads, in the order its rows already keep them, and pages over that scan.
 - Tagging and ACL documents.
 
 **Metadata service** (`mantle-meta`, [design](design/metadata.md)). Row keys whose byte

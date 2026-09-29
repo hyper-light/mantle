@@ -155,10 +155,12 @@ layers removes them, as Tectonic's does [01 §1.6].
     checks these properties after every step of 2,000 generated schedules. The schedules
     have concurrent creates and deletes, coordinators that stall and are taken over,
     collectors that resume, and writers with stale views.
-- **Listing** scans the Name range in key order (list.rs), taking the first version of each
-  key and skipping keys whose first version is a delete marker (05 §6.4). How far one scan
-  may pass over delete markers before a page ends short is a range's to bound (s3-protocol
-  §3).
+- **Listing** scans the Name range in key order. ListObjects takes the first version of each
+  key and passes keys whose first version is a delete marker (05 §6.4); ListObjectVersions
+  takes every version, newest first; ListMultipartUploads takes uploads, reaching a key's
+  with one seek past its versions. Each scan passes at most a budget of keys that hold nothing
+  it lists, and pauses between keys, naming the last one passed so the next page starts just
+  after it (s3-protocol §3).
 
 ## 3. Ranges
 
@@ -226,7 +228,6 @@ cover the production engine, which the simulator cannot.
 - How an entry larger than a datagram reaches the replicas: over QUIC, or fragmented on the
   UDP plane. A completion of 10,000 parts is an entry of hundreds of kilobytes in the Name
   range and another in the File range.
-- How long a Name scan may pass over delete markers before a listing page ends short.
 - The grace period of lazy deletion, which is a recovery-point policy.
 - The bound on a cached bucket row's staleness, and how a versioning change reaches
   gateways within it.

@@ -90,26 +90,76 @@ was given.
 
 ## 3. Listing
 
-A page is computed over an ordered index that answers one question: the first key at or after
-a byte string (`crates/s3/src/list.rs`).
+A page is computed over an ordered index (`crates/s3/src/list.rs`). For keys the index
+answers one question, the first key at or after a byte string that lists; for versions and
+multipart uploads, the first entry at or after a key and an ID. The Name layer's scans
+answer them (`crates/meta/src/name.rs`: `next_current`, `next_version`, `next_upload`).
 
 - **One seek per common prefix.** Keys that roll up into a common prefix "count as a single
   return" (05 §6.2), so the page passes the rest of a common prefix with one seek to the
-  first key beyond it. A page costs at most `max-keys + 1` seeks however many keys a common
-  prefix holds.
+  first key beyond it, however many keys it holds.
 - **Resuming inside a common prefix.** A common prefix "is filtered out from results if it is
-  not lexicographically greater than the `StartAfter` value" (05 §6.2). The common prefix a
-  `start-after` value itself rolls up into is a prefix of it, so never greater, and every key
-  after it under that prefix rolls up into it: the page starts beyond that common prefix.
-  Every other common prefix the page meets is greater than `start-after`.
-- **Continuation tokens** are the base64url of the last item returned. S3 calls them
-  "obfuscated and ... not a real key" (05 §6.2); a token a client alters only moves where
-  the next page starts, as `start-after` could.
+  not lexicographically greater than the `StartAfter` value" (05 §6.2), and likewise than the
+  key marker of ListObjects, ListObjectVersions and ListMultipartUploads (05 §6.3–§6.4,
+  §4.7). The common prefix a marker itself rolls up into is a prefix of it, so never greater,
+  and every key after it under that prefix rolls up into it: the page starts beyond that
+  common prefix. Every other common prefix the page meets is greater than the marker.
+- **Markers of versions and uploads.** A key marker alone starts after all of its key's
+  entries, "only the keys lexicographically greater than the specified key-marker"; with a
+  version-ID or upload-ID marker, after that entry of the key (05 §4.7). Within a key,
+  versions come newest first and uploads in the order they were created, which is their IDs'
+  order (metadata.md §1). A version is its key's latest when it is the first the scan meets
+  on entering the key, so no read is spent on it; a page resumed inside a key calls its first
+  version not latest even if a newer one was deleted since the previous page.
 
-Open, for the metadata service: the index leaves out keys whose current version is a delete
-marker (05 §6.4), so one seek can pass many of them. How far one seek may scan before a page
-ends early belongs with the index; the page may end short, since "The response might contain
-fewer keys" (05 §6.2).
+**Decision: a page passes at most 1,000 keys that list nothing, then ends early, and the
+next page starts just after the last key passed.**
+
+An index passes keys that hold nothing a listing shows: for ListObjects, a key whose current
+version is a delete marker, which "ListObjects/V2 do not return" (05 §6.4), or one holding
+only uploads; for ListObjectVersions, a key holding only uploads; for ListMultipartUploads,
+one holding only versions. A run of them can be as long as the bucket, and every loop needs
+a bound (CLAUDE.md §2). The bound is S3's own page size, `MAX_KEYS`, "up to 1,000"
+(05 §6.2): a page never reads more than twice the keys the largest page lists, and a listing
+costs the keys it passes plus the items it shows. Reaching the bound ends the page early,
+which S3 allows, "The response might contain fewer keys" (05 §6.2), possibly with nothing
+listed.
+
+The next page must start after the keys already passed, or a run longer than the bound would
+be read again by every page and never passed. It must also still be able to list the common
+prefix the last key passed is in, which the page did not list, and which the marker rule above
+would drop. How each listing says so:
+
+- **ListObjectsV2.** The continuation token is mantle's own, "obfuscated and is not a real
+  key" (05 §6.2): the base64url of a tag and a key, `a` to start after an item listed, with
+  the marker rule, and `p` to start just past a key passed, without it. A token a client
+  alters only moves where the next page starts, as `start-after` could.
+- **ListObjectVersions and ListMultipartUploads.** Clients echo `NextKeyMarker` with
+  `NextVersionIdMarker` or `NextUploadIdMarker` (botocore's paginators; 05 §6.5). A page that
+  paused names the last key passed and the ID marker `passed`, which no version or upload ID
+  can be (IDs are 13 characters of Crockford's base 32, or `null`); that pair starts the next
+  page just after the key without the marker rule.
+- **ListObjects.** Clients echo `NextMarker`, or else the last key listed (05 §6.5). A page
+  that paused names the last key passed as `NextMarker`, including without a delimiter, where
+  S3 returns it "only if you have the delimiter request parameter specified" (05 §6.3):
+  without it, a client would resume at the last key listed, before the keys passed, and a
+  page that listed nothing would end the listing. A marker cannot say "without the marker
+  rule", so a page that pauses inside a common prefix it has not listed lists that prefix
+  and resumes beyond it. The keys under it lie ahead, and some may list; if none does, the
+  listing shows a common prefix under which nothing lists. The alternatives are worse: to
+  read on without a bound, to refuse the request, or to drop the prefix and every key under
+  it. ListObjectsV2 has no such case.
+
+ListMultipartUploads writes `NextKeyMarker` and `NextUploadIdMarker` on every page, as all
+three of AWS's samples do: where the next page starts, or on a page that is not truncated,
+the last upload listed (13 §9.3).
+
+**Cost of uploads kept under their keys.** An upload sorts with its key (metadata.md §1), so
+a listing of uploads passes every key between two keys with uploads, at two seeks each, and
+pages through a bucket of many keys and few uploads. ListMultipartUploads is a client's
+cleanup and resume path, not a read path, and completing an upload stays within one range. An
+index of uploads kept in each range beside its keys would make the listing cost the uploads
+alone; it waits for a measurement that the scan costs too much.
 
 ## 4. Response documents
 

@@ -16,4 +16,5 @@
 
 pub mod engine;
 pub mod key;
+pub mod name;
 pub mod record;

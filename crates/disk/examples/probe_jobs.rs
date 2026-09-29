@@ -30,7 +30,7 @@ fn main() {
             depth,
             base: 0,
             span,
-            budget: Duration::from_millis(ms),
+            budget: Some(Duration::from_millis(ms)),
             max_ops,
             sync_each,
             seed: 42,

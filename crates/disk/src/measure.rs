@@ -1,8 +1,8 @@
 //! Measuring a device through the same file layer mantle stores data with.
 //!
 //! A [`Job`] issues fixed-size transfers against a [`DeviceFile`] at a fixed depth (transfers
-//! in flight at once), bounded by a wall-clock budget and an operation count, and records
-//! each transfer's latency. Depth is realised as that many threads issuing blocking
+//! in flight at once), bounded by an operation count and, when it has one, a wall-clock
+//! budget, and records each transfer's latency. Depth is realised as that many threads issuing blocking
 //! positional I/O, which is how the portable I/O path issues it; a measurement describes
 //! the path mantle will use, not the device in the abstract.
 //!
@@ -49,7 +49,10 @@ pub struct Job {
     /// least one block.
     pub base: u64,
     pub span: u64,
-    pub budget: Duration,
+    /// How long the job may issue transfers. `None` bounds it by `max_ops` alone, for a job
+    /// whose every transfer must happen, as a fill's must; a deadline past the last instant the
+    /// clock holds is none.
+    pub budget: Option<Duration>,
     pub max_ops: u64,
     /// Flush after every write, so each recorded latency is that of a durable write.
     pub sync_each: bool,
@@ -144,6 +147,9 @@ pub fn run(file: &DeviceFile, job: &Job) -> Result<JobResult, DiskError> {
             "base must be aligned, and the span end within the file's range",
         ));
     }
+    if job.budget.is_none() && job.max_ops == u64::MAX {
+        return Err(invalid("a job needs a budget or an operation count"));
+    }
 
     let started = Instant::now();
     let shared = Shared {
@@ -151,7 +157,7 @@ pub fn run(file: &DeviceFile, job: &Job) -> Result<JobResult, DiskError> {
         job,
         block,
         slots,
-        deadline: started.checked_add(job.budget).unwrap_or(started),
+        deadline: job.budget.and_then(|budget| started.checked_add(budget)),
         next: AtomicU64::new(0),
         issued: AtomicU64::new(0),
     };
@@ -197,7 +203,7 @@ struct Shared<'a> {
     job: &'a Job,
     block: u64,
     slots: u64,
-    deadline: Instant,
+    deadline: Option<Instant>,
     /// The next sequential slot.
     next: AtomicU64,
     /// Operations claimed so far, across workers.
@@ -218,7 +224,9 @@ impl Shared<'_> {
         loop {
             // Claim an operation before issuing it, so the job never exceeds max_ops.
             if self.issued.fetch_add(1, Ordering::Relaxed) >= job.max_ops
-                || Instant::now() >= self.deadline
+                || self
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
             {
                 break;
             }
@@ -285,7 +293,8 @@ mod tests {
             depth,
             base: 0,
             span: 1 << 20,
-            budget: Duration::from_secs(10),
+            // Each test waits on the transfers it counts, never on a wall-clock guess.
+            budget: None,
             max_ops,
             sync_each: false,
             seed: 7,
@@ -331,6 +340,9 @@ mod tests {
         assert!(run(&file, &j).is_err());
         let mut j = job(Pattern::RandomRead, 1, 1);
         j.base = 100;
+        assert!(run(&file, &j).is_err());
+        // Neither a budget nor a count: nothing would end it.
+        let j = job(Pattern::RandomRead, 1, u64::MAX);
         assert!(run(&file, &j).is_err());
     }
 

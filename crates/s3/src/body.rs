@@ -63,6 +63,8 @@ pub enum BodyError {
     Cors(#[from] CorsError),
     #[error(transparent)]
     Lock(#[from] crate::lock::LockError),
+    #[error(transparent)]
+    Sse(#[from] crate::sse::SseError),
 }
 
 impl BodyError {
@@ -78,6 +80,7 @@ impl BodyError {
             Self::Lifecycle(error) => error.code(),
             Self::Cors(error) => error.code(),
             Self::Lock(error) => error.code(),
+            Self::Sse(error) => error.code(),
         }
     }
 }
@@ -769,6 +772,85 @@ pub fn public_access_block(body: &[u8]) -> Result<crate::policy::PublicAccessBlo
         block_public_policy: policy.unwrap_or(false),
         restrict_public_buckets: restrict.unwrap_or(false),
     })
+}
+
+/// The largest ServerSideEncryptionConfiguration body: one rule with its default, the longest KMS
+/// key ID botocore's model allows (2048), its Bucket Key flag, and both blocked types (20 §4.1).
+pub const SSE_LIMIT: usize = SPACE
+    * (PROLOG
+        + "<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault>\
+           <SSEAlgorithm>aws:kms:dsse</SSEAlgorithm><KMSMasterKeyID></KMSMasterKeyID>\
+           </ApplyServerSideEncryptionByDefault><BucketKeyEnabled>false</BucketKeyEnabled>\
+           <BlockedEncryptionTypes><EncryptionType>SSE-C</EncryptionType>\
+           <EncryptionType>NONE</EncryptionType></BlockedEncryptionTypes></Rule>\
+           </ServerSideEncryptionConfiguration>"
+            .len()
+        + 2048);
+
+/// PutBucketEncryption's rule (20 §4.1): exactly one `Rule`, S3 answering none or two
+/// `MalformedXML` (20 §4.3); a default of `AES256`, SSE-KMS and DSSE-KMS not being implemented,
+/// and a KMS key only with those; the Bucket Key flag; and the blocked types, `SSE-C` or `NONE`.
+pub fn server_side_encryption_configuration(body: &[u8]) -> Result<crate::sse::Rule, BodyError> {
+    let mut reader = Reader::open(body, SSE_LIMIT, "ServerSideEncryptionConfiguration")?;
+    let mut rule = None;
+    while let Some(name) = reader.child()? {
+        if name != "Rule" {
+            return Err(schema(
+                "an element ServerSideEncryptionConfiguration does not have",
+            ));
+        }
+        let (mut default, mut bucket_key, mut blocked) = (None, None, None);
+        while let Some(name) = reader.child()? {
+            match name {
+                "ApplyServerSideEncryptionByDefault" => {
+                    let (mut algorithm, mut kms_key) = (None, None);
+                    while let Some(name) = reader.child()? {
+                        match name {
+                            "SSEAlgorithm" => once(&mut algorithm, reader.text()?.into_owned())?,
+                            "KMSMasterKeyID" => once(&mut kms_key, reader.text()?.into_owned())?,
+                            _ => {
+                                return Err(schema(
+                                    "an element ApplyServerSideEncryptionByDefault does not have",
+                                ));
+                            }
+                        }
+                    }
+                    let algorithm = algorithm.ok_or(schema("a default without an SSEAlgorithm"))?;
+                    once(&mut default, (algorithm, kms_key.is_some()))?;
+                }
+                "BucketKeyEnabled" => once(&mut bucket_key, boolean(&reader.text()?)?)?,
+                "BlockedEncryptionTypes" => {
+                    let mut types = Vec::new();
+                    while let Some(name) = reader.child()? {
+                        if name != "EncryptionType" {
+                            return Err(schema("an element BlockedEncryptionTypes does not have"));
+                        }
+                        types.push(reader.text()?.into_owned());
+                    }
+                    let customer = match types.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+                        ["SSE-C"] => true,
+                        ["NONE"] => false,
+                        _ => return Err(schema("blocked types other than one of SSE-C or NONE")),
+                    };
+                    once(&mut blocked, customer)?;
+                }
+                _ => return Err(schema("an element Rule does not have")),
+            }
+        }
+        if let Some((algorithm, kms_key)) = &default {
+            crate::sse::default_algorithm(algorithm, *kms_key)
+                .ok_or(schema("an SSEAlgorithm S3 does not define"))??;
+        }
+        once(
+            &mut rule,
+            crate::sse::Rule {
+                bucket_key: bucket_key.unwrap_or(false),
+                customer_blocked: blocked,
+            },
+        )?;
+    }
+    reader.finish()?;
+    rule.ok_or(schema("a configuration without a rule"))
 }
 
 /// The largest CORSConfiguration body: "The document is limited to 64 KB in size"
@@ -2282,6 +2364,75 @@ mod tests {
     }
 
     /// PutPublicAccessBlock's settings as botocore writes them; one left out is off (17 §7).
+    /// AWS's PutBucketEncryption sample shape, and S3's recorded refusals (20 §4.1, §4.3).
+    #[test]
+    fn encryption_configuration_is_read_as_s3_reads_it() {
+        use crate::sse::{Rule, SseError};
+        let read = |rules: &str| {
+            server_side_encryption_configuration(
+                format!(
+                    "<ServerSideEncryptionConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{rules}</ServerSideEncryptionConfiguration>"
+                )
+                .as_bytes(),
+            )
+        };
+        assert_eq!(
+            read(
+                "<Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault><BucketKeyEnabled>true</BucketKeyEnabled></Rule>"
+            ),
+            Ok(Rule {
+                bucket_key: true,
+                customer_blocked: None
+            })
+        );
+        assert_eq!(
+            read(
+                "<Rule><BlockedEncryptionTypes><EncryptionType>NONE</EncryptionType></BlockedEncryptionTypes></Rule>"
+            ),
+            Ok(Rule {
+                bucket_key: false,
+                customer_blocked: Some(false)
+            })
+        );
+        assert_eq!(
+            read(
+                "<Rule><BlockedEncryptionTypes><EncryptionType>SSE-C</EncryptionType></BlockedEncryptionTypes></Rule>"
+            ),
+            Ok(Rule {
+                bucket_key: false,
+                customer_blocked: Some(true)
+            })
+        );
+        let malformed = |rules: &str| {
+            assert_eq!(
+                read(rules).map_err(|e| e.code()),
+                Err(("MalformedXML", 400)),
+                "{rules}"
+            );
+        };
+        malformed("");
+        malformed("<Rule/><Rule/>");
+        malformed("<Rule><ApplyServerSideEncryptionByDefault/></Rule>");
+        malformed(
+            "<Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:fsx</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule>",
+        );
+        malformed(
+            "<Rule><BlockedEncryptionTypes><EncryptionType>SSE-C</EncryptionType><EncryptionType>NONE</EncryptionType></BlockedEncryptionTypes></Rule>",
+        );
+        malformed("<Rule><BlockedEncryptionTypes/></Rule>");
+        assert_eq!(
+            read(
+                "<Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm><KMSMasterKeyID>k</KMSMasterKeyID></ApplyServerSideEncryptionByDefault></Rule>"
+            ),
+            Err(BodyError::Sse(SseError::KmsKeyNotApplicable))
+        );
+        assert_eq!(
+            read("<Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule>")
+                .map_err(|e| e.code()),
+            Err(("NotImplemented", 501))
+        );
+    }
+
     #[test]
     fn public_access_block_reads_its_settings() {
         let all = format!(

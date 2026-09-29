@@ -555,6 +555,7 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "base64",
+ "getrandom 0.4.3",
  "mantle-crc",
  "memchr",
  "proptest",
@@ -562,6 +563,7 @@ dependencies = [
  "thiserror",
  "twox-hash",
  "unicode-general-category",
+ "zeroize",
 ]
 
 [[package]]

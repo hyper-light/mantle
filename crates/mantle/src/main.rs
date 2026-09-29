@@ -131,7 +131,7 @@ enum BenchCommand {
     },
     /// Measure the S3 gateway's cryptography and framing on one core: each checksum algorithm
     /// across buffer sizes, verifying a request's signature, decoding signed chunks and form
-    /// bodies, and checking a form's policy.
+    /// bodies, checking a form's policy, and sealing data at rest.
     Hash {
         /// Seconds each measurement runs.
         #[arg(long, default_value_t = 0.5)]

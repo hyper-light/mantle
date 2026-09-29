@@ -18,6 +18,7 @@ use mantle_s3::chunked::{self, ChunkError, Decoder};
 use mantle_s3::crypto::CryptoError;
 use mantle_s3::form::{self, FormError};
 use mantle_s3::post::{self, PostError};
+use mantle_s3::seal::{self, DataKey, SealError, Segments, WrappingKey};
 use mantle_s3::sigv4::{self, AuthError, Request};
 
 use crate::display;
@@ -30,6 +31,7 @@ pub enum Error {
     Crypto(CryptoError),
     Form(FormError),
     Post(PostError),
+    Seal(SealError),
 }
 
 impl std::fmt::Display for Error {
@@ -41,6 +43,7 @@ impl std::fmt::Display for Error {
             Self::Crypto(e) => write!(f, "hashing: {e}"),
             Self::Form(e) => write!(f, "decoding a form: {e:?}"),
             Self::Post(e) => write!(f, "checking a form's policy: {e}"),
+            Self::Seal(e) => write!(f, "sealing: {e}"),
         }
     }
 }
@@ -78,6 +81,12 @@ impl From<FormError> for Error {
 impl From<PostError> for Error {
     fn from(e: PostError) -> Self {
         Self::Post(e)
+    }
+}
+
+impl From<SealError> for Error {
+    fn from(e: SealError) -> Self {
+        Self::Seal(e)
     }
 }
 
@@ -227,6 +236,54 @@ pub fn hash(out: &mut impl Write, sizes: &[usize], step: Duration) -> Result<(),
         display::count(run.per_second(1)),
         display::nanos(run.nanos_each()),
     )?;
+
+    // Every stored byte is sealed on its way in and opened on its way out
+    // (docs/design/encryption.md §3), a 64 KiB segment at a time.
+    let key = DataKey::generate()?;
+    let segments = Segments::new(&key, 1)?;
+    let count = u64::try_from(file.len().div_ceil(seal::SEGMENT)).unwrap_or(1);
+    let mut sealed: Vec<Vec<u8>> = Vec::new();
+    let run = repeat(step, || {
+        sealed.clear();
+        for (index, piece) in (0..count).zip(file.chunks(seal::SEGMENT)) {
+            let mut segment = Vec::with_capacity(seal::SEGMENT + seal::TAG);
+            segment.extend_from_slice(piece);
+            segments.seal(index, index.checked_add(1) == Some(count), &mut segment)?;
+            sealed.push(segment);
+        }
+        Ok(())
+    })?;
+    writeln!(
+        out,
+        "  sealing 64 KiB segments: {}",
+        display::rate(run.per_second(FORM_FILE))
+    )?;
+    let mut opened = Vec::with_capacity(seal::SEGMENT + seal::TAG);
+    let run = repeat(step, || {
+        for (index, segment) in (0..count).zip(&sealed) {
+            opened.clear();
+            opened.extend_from_slice(segment);
+            segments.open(index, index.checked_add(1) == Some(count), &mut opened)?;
+        }
+        Ok(())
+    })?;
+    writeln!(
+        out,
+        "  opening 64 KiB segments: {}",
+        display::rate(run.per_second(FORM_FILE))
+    )?;
+    let root = WrappingKey::generate()?;
+    let run = repeat(step, || {
+        let wrapped = DataKey::generate()?.wrap(&root)?;
+        std::hint::black_box(DataKey::unwrap(&wrapped, &root)?);
+        Ok(())
+    })?;
+    writeln!(
+        out,
+        "  a file's data key: {} made, wrapped and unwrapped/s, {} each",
+        display::count(run.per_second(1)),
+        display::nanos(run.nanos_each()),
+    )?;
     Ok(())
 }
 
@@ -359,5 +416,7 @@ mod tests {
         assert!(!text.contains("signed chunks of 4 KiB"), "{text}");
         assert!(text.contains("a form's file in pieces of 4 KiB"), "{text}");
         assert!(text.contains("a form's policy"), "{text}");
+        assert!(text.contains("sealing 64 KiB segments"), "{text}");
+        assert!(text.contains("a file's data key"), "{text}");
     }
 }

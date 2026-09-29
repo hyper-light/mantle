@@ -130,17 +130,25 @@ RFC 2046 define them, the fields before the file bounded as S3 bounds them, and 
 policy, its signature and its conditions checked as S3 was recorded checking them, against
 AWS's signed example and botocore's presigned POST byte for byte. A subresource routes to its
 own operation or to 405, never to the bucket or object itself, nor across from one to the
-other; `OPTIONS` is a preflight, and a `POST` to a bucket a browser upload. The documents every response carries, from listings and
+other; `OPTIONS` is a preflight, and a `POST` to a bucket a browser upload. Server-side
+encryption: its headers and a bucket's configuration checked as S3 was recorded checking them,
+SSE-C blocked on new buckets as S3's are since April 2026, and the sealing every stored byte
+takes ([design](design/encryption.md)): a random key per file wrapped with AES-256 key wrap,
+checked against RFC 3394's vector, and AES-256-GCM segments at counted nonces, at about 8 GB/s
+on one core. The documents every response carries, from listings and
 multipart results to batch deletes, errors, bucket settings, tags, ACLs, lifecycle and CORS
 rules, each holding what AWS's sample response holds for the same content when both are read
 by roxmltree. Its SHA-1, SHA-256, SHA-512, MD5 and HMAC-SHA256 come from AWS-LC, every
 call fallible and behind an unwind boundary. `mantle bench hash` measures each checksum
-algorithm, signature verification, signed-chunk and form decoding, and a form's policy check on
-one core.
+algorithm, signature verification, signed-chunk and form decoding, a form's policy check, and
+sealing and opening at rest on one core.
 
 Remaining before it is done:
 
-- The rest of 05 §16.1's later surface: server-side encryption headers.
+- Encryption at rest in the gateway's data path: each file's wrapped key in its header row,
+  the root key's file and its generations, and the pass that rewraps under a new one
+  (design/encryption.md).
+
 - The worker that takes lifecycle actions as they fall due, over the Name layer's versions
   and uploads, once the gateway and the metadata layer hold configurations (metadata.md §6).
 

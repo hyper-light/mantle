@@ -32,6 +32,8 @@ thiserror = "2.0"
 twox-hash = { version = "2.1", default-features = false, features = ["std", "xxhash64", "xxhash3_64", "xxhash3_128"] }
 # Unicode 16.0.0 general categories, for the characters S3 allows in a tag (docs/research/13 §6.7).
 unicode-general-category = "1.1"
+# Wiping a customer's SSE-C key from memory when it is dropped (docs/design/encryption.md).
+zeroize = "1.9"
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Security",

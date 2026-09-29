@@ -742,6 +742,28 @@ pub fn public_access_block(block: &crate::policy::PublicAccessBlock) -> String {
     })
 }
 
+/// GetBucketEncryption's `ServerSideEncryptionConfiguration` (20 §4.2): SSE-S3 as the default,
+/// the Bucket Key flag, and the blocked types, which S3 writes on every bucket since April 2026
+/// (20 §3.6).
+pub fn server_side_encryption_configuration(configuration: &crate::sse::Configuration) -> String {
+    Writer::document("ServerSideEncryptionConfiguration", true, |w| {
+        w.element("Rule", |w| {
+            w.element("ApplyServerSideEncryptionByDefault", |w| {
+                w.text("SSEAlgorithm", crate::sse::AES256);
+            });
+            w.text("BucketKeyEnabled", flag(configuration.bucket_key));
+            w.element("BlockedEncryptionTypes", |w| {
+                let blocked = if configuration.customer_blocked {
+                    "SSE-C"
+                } else {
+                    "NONE"
+                };
+                w.text("EncryptionType", blocked);
+            });
+        });
+    })
+}
+
 /// GetBucketPolicyStatus' `PolicyStatus`, `IsPublic` written `true` or `false`: AWS's sample
 /// writes `TRUE`, which botocore, reading a boolean as `text == 'true'`, takes for false
 /// (17 §2.2).
@@ -901,6 +923,29 @@ fn timestamp(seconds: i64) -> Result<String, TimeOutOfRange> {
         .checked_mul(1000)
         .and_then(iso8601)
         .ok_or(TimeOutOfRange(seconds))
+}
+
+#[cfg(test)]
+mod sse_tests {
+    use super::*;
+
+    /// What GetBucketEncryption answers a new bucket, as S3's read back since April 2026 (20
+    /// §3.6, §4.4), and a bucket that unblocked SSE-C with a Bucket Key.
+    #[test]
+    fn the_encryption_configuration_is_written_as_s3_writes_it() {
+        let body = server_side_encryption_configuration(&crate::sse::Configuration::NEW_BUCKET);
+        assert_eq!(
+            body,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ServerSideEncryptionConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault><BucketKeyEnabled>false</BucketKeyEnabled><BlockedEncryptionTypes><EncryptionType>SSE-C</EncryptionType></BlockedEncryptionTypes></Rule></ServerSideEncryptionConfiguration>"
+        );
+        let unblocked = crate::sse::Configuration {
+            bucket_key: true,
+            customer_blocked: false,
+        };
+        let written = server_side_encryption_configuration(&unblocked);
+        let read = crate::body::server_side_encryption_configuration(written.as_bytes()).unwrap();
+        assert_eq!(crate::sse::Configuration::NEW_BUCKET.put(read), unblocked);
+    }
 }
 
 #[cfg(test)]

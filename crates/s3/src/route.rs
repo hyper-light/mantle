@@ -53,6 +53,9 @@ pub enum Operation {
     DeletePublicAccessBlock,
     GetObjectLockConfiguration,
     PutObjectLockConfiguration,
+    GetBucketEncryption,
+    PutBucketEncryption,
+    DeleteBucketEncryption,
     /// A CORS preflight, `OPTIONS` on a bucket or an object.
     Preflight,
     ListObjects,
@@ -123,10 +126,9 @@ pub const MAX_KEY: usize = 1024;
 
 /// Bucket subresources S3 defines that mantle does not serve: answered `501 NotImplemented`
 /// rather than taken for another operation.
-const UNSUPPORTED: [&str; 12] = [
+const UNSUPPORTED: [&str; 11] = [
     "accelerate",
     "analytics",
-    "encryption",
     "intelligent-tiering",
     "inventory",
     "logging",
@@ -204,7 +206,7 @@ fn subresource(
 }
 
 /// The subresources of a bucket.
-const BUCKET_SUBRESOURCES: [Subresource; 14] = {
+const BUCKET_SUBRESOURCES: [Subresource; 15] = {
     use Operation as O;
     [
         ("location", &[("GET", O::GetBucketLocation)]),
@@ -270,6 +272,14 @@ const BUCKET_SUBRESOURCES: [Subresource; 14] = {
                 ("GET", O::GetPublicAccessBlock),
                 ("PUT", O::PutPublicAccessBlock),
                 ("DELETE", O::DeletePublicAccessBlock),
+            ],
+        ),
+        (
+            "encryption",
+            &[
+                ("GET", O::GetBucketEncryption),
+                ("PUT", O::PutBucketEncryption),
+                ("DELETE", O::DeleteBucketEncryption),
             ],
         ),
         ("versions", &[("GET", O::ListObjectVersions)]),
@@ -350,6 +360,11 @@ fn bucket_operation(method: &str, q: &Query) -> Result<Operation, RouteError> {
 
 fn object_operation(method: &str, q: &Query, copy: bool) -> Result<Operation, RouteError> {
     use Operation as O;
+    // UpdateObjectEncryption moves an object to SSE-KMS alone (20 §1.6), which mantle does not
+    // implement.
+    if q.has("encryption") {
+        return Err(RouteError::NotImplemented("UpdateObjectEncryption"));
+    }
     match subresource(&OBJECT_SUBRESOURCES, method, q) {
         // A part is named by its number; a PUT to an upload without one names nothing, and
         // is never taken for a PutObject that would replace the object with the part.
@@ -563,6 +578,13 @@ mod tests {
         assert_eq!(op("GET", "/b/", "uploads"), O::ListMultipartUploads);
         assert_eq!(op("POST", "/b", "delete"), O::DeleteObjects);
         assert_eq!(op("POST", "/b", ""), O::PostObject);
+        assert_eq!(op("GET", "/b", "encryption"), O::GetBucketEncryption);
+        assert_eq!(op("PUT", "/b", "encryption"), O::PutBucketEncryption);
+        assert_eq!(op("DELETE", "/b", "encryption"), O::DeleteBucketEncryption);
+        assert_eq!(
+            r("PUT", "s3.example.com", "/b/k", "encryption&versionId=v"),
+            Err(RouteError::NotImplemented("UpdateObjectEncryption"))
+        );
         assert_eq!(op("POST", "/b/", ""), O::PostObject);
         assert_eq!(op("PUT", "/b", "versioning"), O::PutBucketVersioning);
         assert_eq!(op("POST", "/b/k", "uploads"), O::CreateMultipartUpload);

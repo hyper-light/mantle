@@ -21,7 +21,7 @@ pub use aws_lc_rs::digest::{MD5_FOR_LEGACY_USE_ONLY as MD5, SHA256, SHA512};
 pub struct CryptoError;
 
 /// Runs `f`, turning the library's error, or a panic inside it, into `CryptoError`.
-fn guarded<T>(f: impl FnOnce() -> Result<T, Unspecified>) -> Result<T, CryptoError> {
+pub(crate) fn guarded<T>(f: impl FnOnce() -> Result<T, Unspecified>) -> Result<T, CryptoError> {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(Unspecified)) | Err(_) => Err(CryptoError),

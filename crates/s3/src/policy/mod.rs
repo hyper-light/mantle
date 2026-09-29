@@ -166,6 +166,8 @@ pub fn action(operation: crate::route::Operation, versioned: bool) -> Option<&'s
         O::GetObjectAcl => either("s3:GetObjectAcl", "s3:GetObjectVersionAcl"),
         O::PutObjectAcl => either("s3:PutObjectAcl", "s3:PutObjectVersionAcl"),
         O::GetObjectLockConfiguration => Some("s3:GetBucketObjectLockConfiguration"),
+        O::GetBucketEncryption => Some("s3:GetEncryptionConfiguration"),
+        O::PutBucketEncryption | O::DeleteBucketEncryption => Some("s3:PutEncryptionConfiguration"),
         O::PutObjectLockConfiguration => Some("s3:PutBucketObjectLockConfiguration"),
         O::GetObjectRetention => Some("s3:GetObjectRetention"),
         O::PutObjectRetention => Some("s3:PutObjectRetention"),
@@ -1407,10 +1409,14 @@ mod tests {
             O::ListMultipartUploads,
             O::GetObjectLockConfiguration,
             O::PutObjectLockConfiguration,
+            O::GetBucketEncryption,
+            O::PutBucketEncryption,
+            O::DeleteBucketEncryption,
         ];
         let object_level = [
             O::DeleteObjects,
             O::PutObject,
+            O::PostObject,
             O::CopyObject,
             O::GetObject,
             O::HeadObject,

@@ -3,7 +3,8 @@
 Status: design, 2026-09-28. Sources: docs/research/05 (S3 API semantics, cited as "05 §x"),
 docs/research/13 (XML, cited as "13 §x"), docs/research/16 (CORS, cited as "16 §x"),
 docs/research/17 (bucket policies and JSON, cited as "17 §x"), docs/research/18 (Object Lock,
-cited as "18 §x"), docs/research/19 (browser uploads, cited as "19 §x").
+cited as "18 §x"), docs/research/19 (browser uploads, cited as "19 §x"), docs/research/20
+(server-side encryption, cited as "20 §x").
 
 `mantle-s3` is the protocol layer the gateway (STATUS item 2) is built from: pure functions
 over requests and bodies, with no I/O and no knowledge of where objects live. Each module
@@ -28,6 +29,9 @@ restating S3.
 | `lock` | Object Lock's documents and headers, and the rules for writes that carry locks | 18; S3's recorded answers, s3-tests |
 | `form` | `multipart/form-data` bodies, decoded as they stream: the fields before the file, then the file | RFC 7578 and RFC 2046; property tests over every cut of a body |
 | `post` | browser uploads: a form's policy, its signature and conditions, and the answer to it | AWS's signed example and botocore's presigned POST, byte for byte; S3's recorded answers, s3-tests' policies |
+| `sse` | server-side encryption's headers and a bucket's encryption configuration | S3's recorded answers, ceph s3-tests' keys, botocore's SSE-C encoding |
+| `seal` | data at rest: a key per file, AES key wrap, AES-256-GCM segments | RFC 3394's wrap vector, GCM's test cases 13 and 14, property tests |
+
 | `tagging` | tag sets: S3's limits and characters, and the `x-amz-tagging` header | 13 §6.7, s3-tests, S3's observed answers |
 | `acl` | canned and header ACLs, Object Ownership, and whether a request's ACL goes ahead with ACLs disabled | 13 §6.8, s3-tests |
 | `lifecycle` | lifecycle rules checked, when each action falls due, and the expiration and abort headers | 13 §6.9, the user guide's worked examples, s3-tests |
@@ -650,3 +654,35 @@ body, so nothing of the object may be kept until the fields that authorize it ar
 - **s3-tests** signs every authenticated POST with Signature Version 2, which mantle refuses,
   and its anonymous ones need public-read-write ACLs, which mantle's buckets do not have; the
   unit tests take the same policies signed with Version 4 (19 §5).
+
+## 13. Server-side encryption
+
+**Decision: every object is sealed at rest; S3's encryption headers choose whose key wraps its
+data key, and are checked as S3 was recorded checking them** (`crates/s3/src/sse.rs`,
+`crates/s3/src/seal.rs`; docs/design/encryption.md; 20).
+
+- **SSE-S3 is every object's state.** A write without encryption headers, or with `AES256`, is
+  SSE-S3, as S3's writes are since January 2023 (20 §1.3), and its responses say so on the
+  operations S3 lists (20 §1.2). A KMS key named without `aws:kms` is S3's `InvalidArgument`;
+  any other value of `x-amz-server-side-encryption`, the empty one included, is
+  `InvalidArgument`, "The encryption method specified is not supported", the answer S3 gave the
+  empty value (20 §1.4).
+- **SSE-KMS and DSSE-KMS** are `501 NotImplemented`: they name keys in a key management service
+  mantle does not have. So is UpdateObjectEncryption, which moves an object to SSE-KMS alone (20
+  §1.6).
+- **SSE-C** is checked in the order S3 was recorded refusing it (20 §3.5): with
+  `x-amz-server-side-encryption`, incompatible; an algorithm other than `AES256`,
+  `InvalidEncryptionAlgorithmError`; a key or MD5 without an algorithm, or an algorithm without a
+  key; the key's MD5, before the key's length, as S3 answered a 24-byte key; a key not 256 bits.
+  A request that leaves the MD5 out is taken and the echo computed, since whether S3 needs it is
+  unrecorded. The key is wiped when the request drops it, and SSE-C needs TLS (20 §3.3). A read
+  of an SSE-C object without a key, a key for an object that is not SSE-C, a wrong key (`403`,
+  found by the key wrap's integrity check), and a part whose key its upload did not name, each
+  take S3's answer.
+- **The bucket's configuration** is S3's `ServerSideEncryptionConfiguration`: exactly one rule,
+  S3 answering none or two `MalformedXML`; `AES256` the only default; a KMS key only with KMS;
+  and `BlockedEncryptionTypes`, `SSE-C` or `NONE`. A new bucket blocks SSE-C, as S3's have since
+  April 2026, answering a write `403 AccessDenied` with S3's message naming the requester, the
+  action and the object (20 §3.6). A rule without `BlockedEncryptionTypes` leaves the block as it
+  was, as S3 was recorded doing, and DeleteBucketEncryption resets the default and keeps it.
+  GetBucketEncryption writes the blocked types on every bucket, as S3 does since April 2026.

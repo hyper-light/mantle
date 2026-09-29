@@ -80,6 +80,9 @@ pub enum PutError {
     TooLong,
     #[error("the body's MD5 is not the Content-MD5 the request sent")]
     BadDigest,
+    /// A `Content-MD5` the PUT was not told of when it was made, which it has not taken.
+    #[error("a Content-MD5 the PUT was not told of when it was made")]
+    UndeclaredDigest,
     #[error("the body's checksum is not the one the request sent")]
     BadChecksum,
     /// No volume the placement offered took one of the block's chunks: `503 SlowDown`.
@@ -138,6 +141,9 @@ pub struct Body {
     pub length: u64,
     /// The checksum the object or part keeps, if the request or its upload names one.
     pub checksum: Option<Algorithm>,
+    /// Whether the request sent `Content-MD5`, a header and so known before the body: the
+    /// plaintext's MD5 is then taken to check it even where the ETag is not that MD5.
+    pub content_md5: bool,
 }
 
 /// What the request said the body would be, checked at its end.
@@ -182,6 +188,16 @@ pub struct Stored {
     pub etag: String,
     pub size: u64,
     pub checksum: Option<checksum::Checksum>,
+}
+
+/// The 16 bytes of a finished MD5.
+fn md5_of(hasher: Hasher) -> Result<[u8; 16], PutError> {
+    hasher
+        .finish()?
+        .bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| PutError::Crypto(CryptoError))
 }
 
 /// A block on its way down: coded, placed, written, then recorded.
@@ -263,7 +279,11 @@ pub struct Put {
     /// When each recorded block not being renewed is next due for renewal, and its place:
     /// a turn takes the due ones off the front, touching no other block (audit B08).
     due: BTreeSet<(u64, u64)>,
+    /// The plaintext's MD5: the ETag under SSE-S3, and the check of a `Content-MD5`.
     md5: Option<Hasher>,
+    /// The stored bytes' MD5, each segment as sealed: the ETag under SSE-C (encryption.md §4;
+    /// audit B11).
+    sealed_md5: Option<Hasher>,
     sum: Option<Hasher>,
     etag: Option<String>,
     checked: Option<checksum::Checksum>,
@@ -298,7 +318,20 @@ impl Put {
             });
         }
         let sealer = Segments::new(&keys.data, keys.file)?;
-        let md5 = Hasher::new(Algorithm::Md5)?;
+        // An SSE-S3 object's ETag is the MD5 of its plaintext, as S3's is; an SSE-C object's
+        // is not (research/20 §5.1), and mantle's is the MD5 of its ciphertext
+        // (encryption.md §4). The key's wrapping names which the object is.
+        let customer = matches!(keys.wrapped.by, record::Wrapper::Customer);
+        let md5 = if customer && !body.content_md5 {
+            None
+        } else {
+            Some(Hasher::new(Algorithm::Md5)?)
+        };
+        let sealed_md5 = if customer {
+            Some(Hasher::new(Algorithm::Md5)?)
+        } else {
+            None
+        };
         let sum = body.checksum.map(Hasher::new).transpose()?;
         let sealed_segment = seal::SEGMENT
             .checked_add(seal::TAG)
@@ -322,7 +355,8 @@ impl Put {
             going: None,
             recorded: BTreeMap::new(),
             due: BTreeSet::new(),
-            md5: Some(md5),
+            md5,
+            sealed_md5,
             sum,
             etag: None,
             checked: None,
@@ -462,6 +496,9 @@ impl Put {
         }
         self.sealer
             .seal(self.sealed, next == segments, &mut self.segment)?;
+        if let Some(h) = self.sealed_md5.as_mut() {
+            h.update(&self.segment)?;
+        }
         self.filling.extend_from_slice(&self.segment);
         self.segment.clear();
         self.sealed = next;
@@ -486,13 +523,10 @@ impl Put {
         if self.taken != self.body.length {
             return Err(PutError::IncompleteBody);
         }
-        let digest = self.md5.take().ok_or(PutError::Over)?.finish()?;
-        let md5: [u8; 16] = digest
-            .bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| PutError::Crypto(CryptoError))?;
-        if expected.md5.is_some_and(|sent| sent != md5) {
+        let plain = self.md5.take().map(md5_of).transpose()?;
+        if let Some(sent) = expected.md5
+            && plain.ok_or(PutError::UndeclaredDigest)? != sent
+        {
             return Err(PutError::BadDigest);
         }
         let checked = self.sum.take().map(Hasher::finish).transpose()?;
@@ -501,14 +535,21 @@ impl Put {
         {
             return Err(PutError::BadChecksum);
         }
-        self.etag = Some(checksum::etag(&md5));
         self.checked = checked;
         self.phase = Phase::Ended;
-        if self.body.length == 0 {
-            match self.commit {
-                Commit::Object(_) => return self.commit(None),
-                Commit::Part(_) => self.seal_segment()?,
-            }
+        // An empty part is one empty segment, sealed now, before its ETag, which may be the
+        // MD5 of what is sealed.
+        let empty_part = self.body.length == 0 && matches!(self.commit, Commit::Part(_));
+        if empty_part {
+            self.seal_segment()?;
+        }
+        let etag = match self.sealed_md5.take() {
+            Some(sealed) => md5_of(sealed)?,
+            None => plain.ok_or(PutError::Over)?,
+        };
+        self.etag = Some(checksum::etag(&etag));
+        if self.body.length == 0 && !empty_part {
+            return self.commit(None);
         }
         self.file_if_written()
     }

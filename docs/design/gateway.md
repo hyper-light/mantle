@@ -50,8 +50,11 @@ point:
    block ID for each block as it begins it. Each is random and 128 or 256 bits, never reused:
    a retry writes a new file (metadata.md §2).
 2. **The body streams.** Each 64 KiB of plaintext is sealed as it arrives, the last segment
-   marked at the end, and the ETag's MD5 and any checksum the request asks for run over the
-   plaintext (`mantle-s3` checksum.rs). Sealed segments fill the current block.
+   marked at the end, and any checksum the request asks for runs over the plaintext
+   (`mantle-s3` checksum.rs). The ETag is the MD5 of the plaintext under SSE-S3, and of the
+   segments as sealed under SSE-C (encryption.md §4); the plaintext's MD5 runs under SSE-C
+   only to check a `Content-MD5` the request sent, a header the PUT is told of when it is
+   made. Sealed segments fill the current block.
 3. **A full block goes down.** It is coded into its chunks, and each chunk goes to its own
    volume with its CRC-32C, which the storage node checks before it writes (chunk-store.md §4;
    CLAUDE.md §6). The block's chunks are written at once, on distinct volumes (metadata.md §1).

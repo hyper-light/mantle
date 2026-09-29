@@ -108,6 +108,10 @@ file's ID as additional data.**
   is (20 §5.1).
 - **SSE-C** requires TLS: "Amazon S3 rejects any requests made over HTTP when using SSE-C" (20
   §3.3). The key is used for the request and dropped. An SSE-C object's ETag is not the MD5 of
-  its data (20 §5.1); mantle's is the MD5 of its ciphertext.
+  its data (20 §5.1); mantle's is the MD5 of its ciphertext: the file's segments as sealed, in
+  order, tags included, which an empty part's one sealed segment makes the MD5 of its tag. A
+  `Content-MD5` the request sends is still checked against the plaintext, whose MD5 is taken
+  only then (audit B11). The key's wrapping, by a root key or the customer's, names which rule
+  a PUT follows.
 - **The bucket's configuration** is S3's `ServerSideEncryptionConfiguration`, with SSE-C blocked
   by default and SSE-S3 the only default algorithm (s3-protocol.md §13).

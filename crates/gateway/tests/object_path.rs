@@ -161,13 +161,28 @@ impl Cell {
         }
     }
 
-    /// The plaintext of `file`, read from its rows and chunks and opened under its key: each
-    /// block rebuilt from its data chunks alone and checked against its CRC-32C.
+    /// The plaintext of `file`, read from its rows and chunks and opened under its key.
     fn read_file(&self, f: u128, size: u64, wrapping: &WrappingKey) -> Vec<u8> {
         let header = file::header(&self.files, f).unwrap().unwrap();
         let wrapped = header.key.unwrap();
         let data = DataKey::unwrap(&wrapped.bytes, wrapping).unwrap();
         let segments = Segments::new(&data, f).unwrap();
+        let sealed = self.read_sealed(f, size);
+        let count = seal::segments(size);
+        let mut plain = Vec::new();
+        for (i, s) in sealed.chunks(SEALED as usize).enumerate() {
+            let mut s = s.to_vec();
+            segments
+                .open(i as u64, i as u64 + 1 == count, &mut s)
+                .unwrap();
+            plain.extend(s);
+        }
+        plain
+    }
+
+    /// The bytes `file` stores, its segments as sealed, read from its rows and chunks: each
+    /// block rebuilt from its data chunks alone and checked against its CRC-32C.
+    fn read_sealed(&self, f: u128, size: u64) -> Vec<u8> {
         let mut sealed = Vec::new();
         for (_, extent) in file::extents(&self.files, f, 0, 10_000).unwrap() {
             let Target::Block(b) = extent.target else {
@@ -196,16 +211,7 @@ impl Cell {
             sealed.extend(bytes);
         }
         assert_eq!(sealed.len() as u64, seal::sealed_len(size).unwrap());
-        let count = seal::segments(size);
-        let mut plain = Vec::new();
-        for (i, s) in sealed.chunks(SEALED as usize).enumerate() {
-            let mut s = s.to_vec();
-            segments
-                .open(i as u64, i as u64 + 1 == count, &mut s)
-                .unwrap();
-            plain.extend(s);
-        }
-        plain
+        sealed
     }
 
     /// The current version of `key`.
@@ -232,6 +238,20 @@ fn keys(file: u128, wrapping: &WrappingKey) -> Keys {
         data,
         wrapped: WrappedKey {
             by: Wrapper::Root(1),
+            bytes,
+        },
+    }
+}
+
+/// Keys of an SSE-C file: its data key wrapped under the key the customer sends.
+fn customer_keys(file: u128, customer: &WrappingKey) -> Keys {
+    let data = DataKey::generate().unwrap();
+    let bytes = data.wrap(customer).unwrap();
+    Keys {
+        file,
+        data,
+        wrapped: WrappedKey {
+            by: Wrapper::Customer,
             bytes,
         },
     }
@@ -360,6 +380,7 @@ fn new_put(cell: &Cell, commit: Commit, length: u64, layout: Layout, keys: Keys)
     let body = Body {
         length,
         checksum: Some(Algorithm::Crc64Nvme),
+        content_md5: true,
     };
     Put::new(
         commit,
@@ -385,6 +406,7 @@ fn a_body_past_one_request_is_refused_before_anything_is_asked() {
             Body {
                 length,
                 checksum: None,
+                content_md5: false,
             },
             keys(1, &wrapping),
             Layout::new(Scheme::Copies(3)).unwrap(),
@@ -441,6 +463,101 @@ fn an_object_is_written_bottom_up_and_committed() {
     assert_eq!(kept.value, sent.bytes);
     assert_eq!(file::extents(&cell.files, 77, 0, 100).unwrap().len(), 3);
     assert!(cell.read_file(77, len as u64, &wrapping) == bytes);
+}
+
+/// An SSE-C object's ETag is the MD5 of what it stores, its segments as sealed, and not of its
+/// plaintext, while the request's `Content-MD5` is still checked against the plaintext; an
+/// SSE-S3 object's is the MD5 of its plaintext, as S3's is (encryption.md §4; audit B11).
+#[test]
+fn an_sse_c_objects_etag_is_the_md5_of_its_ciphertext() {
+    let mut cell = Cell::new(5);
+    let customer = WrappingKey::generate().unwrap();
+    let layout = Layout::new(Scheme::Copies(3)).unwrap();
+    let len = (layout.segments_per_block() * seal::SEGMENT as u64 + 12_345) as usize;
+    let bytes = body(len, 11);
+    let expected = Expected {
+        md5: Some(md5(&bytes)),
+        checksum: None,
+    };
+    let mut put = new_put(
+        &cell,
+        object("c"),
+        len as u64,
+        layout,
+        customer_keys(91, &customer),
+    );
+    let stored = run(&mut cell, &mut put, &bytes, &FAST, &expected, |_, _| {}).unwrap();
+    let sealed = cell.read_sealed(91, len as u64);
+    assert_eq!(stored.etag, checksum::etag(&md5(&sealed)));
+    assert_ne!(stored.etag, checksum::etag(&md5(&bytes)));
+    assert_eq!(cell.current("c").etag, stored.etag);
+    assert!(cell.read_file(91, len as u64, &customer) == bytes);
+
+    // A Content-MD5 the plaintext does not match is refused, as under SSE-S3.
+    let wrong = Expected {
+        md5: Some(md5(b"other")),
+        checksum: None,
+    };
+    let mut put = new_put(
+        &cell,
+        object("d"),
+        len as u64,
+        layout,
+        customer_keys(92, &customer),
+    );
+    assert_eq!(
+        run(&mut cell, &mut put, &bytes, &FAST, &wrong, |_, _| {}),
+        Err(PutError::BadDigest)
+    );
+    // A Content-MD5 the PUT was not told of when it was made has not been taken, and is not
+    // taken on trust.
+    let mut put = Put::new(
+        object("e"),
+        Body {
+            length: len as u64,
+            checksum: None,
+            content_md5: false,
+        },
+        customer_keys(93, &customer),
+        layout,
+        HANDOVER,
+        Box::new(Counter(3_000)),
+        cell.clock,
+    )
+    .unwrap();
+    assert_eq!(
+        run(&mut cell, &mut put, &bytes, &FAST, &expected, |_, _| {}),
+        Err(PutError::UndeclaredDigest)
+    );
+}
+
+/// An empty SSE-C part's file holds one empty segment, sealed, and its ETag is the MD5 of that
+/// segment as stored.
+#[test]
+fn an_empty_sse_c_parts_etag_covers_its_sealed_segment() {
+    let mut cell = Cell::new(3);
+    let customer = WrappingKey::generate().unwrap();
+    let layout = Layout::new(Scheme::Copies(3)).unwrap();
+    let upload = cell.create_upload("m");
+    let mut put = new_put(
+        &cell,
+        part("m", &upload, 1),
+        0,
+        layout,
+        customer_keys(94, &customer),
+    );
+    let stored = run(
+        &mut cell,
+        &mut put,
+        &[],
+        &FAST,
+        &Expected::default(),
+        |_, _| {},
+    )
+    .unwrap();
+    let sealed = cell.read_sealed(94, 0);
+    assert_eq!(sealed.len(), seal::TAG);
+    assert_eq!(stored.etag, checksum::etag(&md5(&sealed)));
 }
 
 /// A body coded RS(2,1) is kept in data chunks that hold the block in order and a parity

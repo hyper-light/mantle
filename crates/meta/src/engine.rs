@@ -48,6 +48,14 @@ pub trait Engine: Rows {
 
     /// Makes everything applied durable.
     fn persist(&mut self) -> Result<(), EngineError>;
+
+    /// Every row as of `applied()`: what a snapshot carries to a member that lags
+    /// (docs/design/replica.md §4).
+    fn image(&self) -> Result<Vec<Row>, EngineError>;
+
+    /// Replaces every row with `rows`, as of log entry `index`: a snapshot installed. It is
+    /// durable once `persist` returns.
+    fn install(&mut self, index: u64, rows: Vec<Row>) -> Result<(), EngineError>;
 }
 
 /// An engine held in memory for deterministic simulation (06 §C.b.3): what is applied, and
@@ -118,6 +126,20 @@ impl Engine for Model {
     fn persist(&mut self) -> Result<(), EngineError> {
         self.durable_rows.clone_from(&self.rows);
         self.durable = self.applied;
+        Ok(())
+    }
+
+    fn image(&self) -> Result<Vec<Row>, EngineError> {
+        Ok(self
+            .rows
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect())
+    }
+
+    fn install(&mut self, index: u64, rows: Vec<Row>) -> Result<(), EngineError> {
+        self.rows = rows.into_iter().collect();
+        self.applied = index;
         Ok(())
     }
 }

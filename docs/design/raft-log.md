@@ -80,6 +80,12 @@ with the platform's full flush, and only then publishes the records to readers a
 every submitter. With no artificial delay, a batch is one submission under light load and
 everything queued under heavy load (06 §A9).
 
+A replica cannot have its update refused: once the core has handed over a `Ready`, it takes
+no other call until the `Ready` is made durable (07 §1.2). So a replica submits by waiting
+for room in the queue instead of taking `Busy`. The writer frees room with every batch it
+takes, and a fence wakes every waiter, so the wait lasts no longer than the writer's
+progress.
+
 A replica that leads may send its appends to followers before its own flush completes;
 followers answer only after theirs (06 §C.c, item 2). The log lets both happen: a
 submission returns at once with a handle, and the replica waits on it only for what must

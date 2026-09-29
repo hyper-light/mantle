@@ -57,20 +57,35 @@ Time comes from the entry, which is what lets every replica reach the same rows.
 
 For each `Ready` the core gives, the replica does these steps in order:
 
-1. Sends the messages a leader may send before its own write. The core marks them apart
+1. Installs the `Ready`'s snapshot, if it carries one. The engine takes the snapshot's rows
+   and makes them durable before the log records the snapshot's index as the group's start,
+   so the log never starts past what the engine holds.
+2. Sends the messages a leader may send before its own write. The core marks them apart
    from those that must wait (07 §1.2). A leader writing in parallel with its followers is
    Ongaro's §10.2.1 optimization (06 §A1.9).
-2. Submits the `Ready`'s entries, hard state, snapshot point and fast-track proposals to the
-   log as one update (raft-log.md §2), and waits for it to be durable.
-3. Sends the messages that must follow durability: a follower's acknowledgements and votes.
-4. Applies the committed entries (§2).
-5. Tells the core, which may hand over more committed entries and messages.
+3. Submits the `Ready`'s entries, hard state, snapshot point and fast-track proposals to the
+   log as one update (raft-log.md §2), and waits for it to be durable. The log waits for
+   room rather than refusing a replica's update, since the core takes no other call while
+   a `Ready` is out (raft-log.md §3).
+4. Sends the messages that must follow durability: a follower's acknowledgements and votes.
+5. Applies the committed entries (§2).
+6. Tells the core, which may hand over more committed entries and messages.
 
-## 4. Compaction and restart
+The transport tells the sending replica whether each snapshot arrived. A leader stops
+replicating to a member while that member's snapshot is out, so a lost snapshot left
+unreported would stall the member for good; the simulation found this. A snapshot's own
+stream always learns its fate.
+
+## 4. Compaction, snapshots and restart
 
 The engine makes applied state durable on its own schedule. When it has, the replica writes
 the durable index to the log as the group's new start, keeping a window of entries behind it
 for followers that lag. The log then frees the entries before it (raft-log.md §5; 06 §C.b.2).
+A member that needs entries from before the start is sent a snapshot instead: every row of
+the range as of the index where the replica last compacted, or opened a compacted log, with
+the configuration there. A snapshot's index is at or past the log's start, so the member
+continues from the entries after it. For now the rows travel inside the snapshot message.
+The production engine will move its files out of band instead (12 §6.3).
 
 On restart, the engine opens at its durable index, and that index and the configuration the
 engine holds there are what the core is told it has applied. The log gives the hard state
@@ -80,13 +95,25 @@ rows.
 
 ## 5. Testing
 
-Replicas are tested in deterministic simulation. Several nodes, each with a simulated device
-for its log and a model engine, run over a simulated network that delays, drops, reorders
-and partitions messages. Nodes crash and restart. Every run is its seed (06 §A5). What the
-gateways saw is checked for linearizability per key (metadata.md §5).
+Replicas are tested in deterministic simulation (`crates/range/tests/sim.rs`). Three
+nodes, each with a simulated device for its log and a model engine, run over a simulated
+network that delays, drops, reorders and partitions messages. Nodes crash, losing whatever
+their log and engine had not made durable, and restart. Replicas compact at random, so
+lagging members are caught up by snapshot. A gateway puts keys through whichever member
+leads, retrying through leader changes with its session's serials. Every run is its seed
+(06 §A5). After every run, these must hold:
+
+- every index was applied with the same answers on every member that applied it;
+- once faults stop, every put completes;
+- every answered put exists exactly once on every member, however often it was retried;
+- every member holds the same rows.
+
+A soak of 50,000 seeds passes. The gateways' histories are still to be checked for
+linearizability per key, with reads through ReadIndex (metadata.md §5).
 
 ## 6. Open
 
-- Snapshots, and the window of entries kept for lagging followers before one is sent.
+- The window of entries kept for lagging followers before one is sent a snapshot, and
+  moving snapshots out of band with the production engine.
 - ReadIndex reads, and leases if a deployment states its clock-drift bound (06 §A1.5).
 - The session lifetime and bound, from how long gateways go between commands to a range.

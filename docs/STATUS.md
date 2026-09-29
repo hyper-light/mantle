@@ -124,17 +124,25 @@ random points on the simulated device, and checks after every reopen that each
 acknowledged update survived and the one in flight landed whole or not at all; a soak of
 200,000 histories over segment sizes and quotas passed.
 
+Range replicas (`mantle-range`, [design](design/replica.md)) run focal-raft's core over the
+log and an engine: an entry carries a batch of gateway commands applied as one engine batch,
+client sessions make each command take effect once however often it is retried, and members
+that lag are caught up by snapshot. A deterministic simulation of three members under
+crashes, partitions, dropped and reordered messages and compaction checks after every run
+that each index was applied the same everywhere, that every put completes once faults stop
+and exists exactly once, and that the members agree; a soak of 50,000 seeds passed.
+
 Remaining before it is done:
 
-- The replica: focal-raft's core driven over the log and an engine, and a benchmark of the
-  log's submissions per second and latency against the device's measured flush rate.
+- A benchmark of the log's submissions per second and latency against the device's
+  measured flush rate.
 - The coordinator that runs a bucket's create and delete across the ranges, and the
   collector that finishes what a failed one leaves and removes unreferenced files and
   blocks after a grace period.
 - The production engine, once its binding is chosen (design §4).
-- Ranges replicated with focal's Raft and its fast-track commit, with request
-  deduplication, ReadIndex reads, snapshots and splits, over QUIC for bulk transfers and a
-  UDP transport for consensus messages.
+- ReadIndex reads, membership changes, splits and the fast track under simulation, and
+  the transport: QUIC for bulk transfers and snapshots, and a UDP transport for consensus
+  messages.
 - Done when a linearizability checker accepts histories recorded under network partitions,
   process crashes and disk faults, both in deterministic simulation and with real
   processes.

@@ -113,7 +113,7 @@ impl<F: BlockFile> Writer<F> {
                 return;
             }
             if self.commit(batch).is_err() {
-                self.shared.fenced.store(true, Ordering::Release);
+                self.fence();
                 for s in std::mem::take(&mut self.held) {
                     answer(&s, Err(LogError::Fenced));
                 }
@@ -127,7 +127,17 @@ impl<F: BlockFile> Writer<F> {
             queue.submissions = queue.submissions.saturating_sub(1);
             queue.bytes = queue.bytes.saturating_sub(s.bytes);
         }
+        self.shared.room.notify_all();
         s
+    }
+
+    /// Fences the log: no submission is taken from here on, and every waiter wakes to hear
+    /// it.
+    fn fence(&self) {
+        self.shared.fenced.store(true, Ordering::Release);
+        // Taking the queue's lock orders the fence before any waiter's next look at it.
+        drop(self.shared.queue.lock());
+        self.shared.room.notify_all();
     }
 
     /// Writes one frame of a sweep and updates, then publishes and answers them. An error
@@ -204,7 +214,7 @@ impl<F: BlockFile> Writer<F> {
             }
             Err(e) => {
                 // Fenced before anyone hears of it, so no answer outruns the fence.
-                self.shared.fenced.store(true, Ordering::Release);
+                self.fence();
                 for (s, _) in &taken {
                     answer(s, Err(LogError::Fenced));
                 }

@@ -26,7 +26,7 @@ mod writer;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 
 use mantle_disk::block::BlockFile;
@@ -205,6 +205,8 @@ struct Shared<F> {
     pool: Pool,
     state: RwLock<State>,
     queue: Mutex<Queue>,
+    /// Signalled when the writer takes submissions off the queue, and when the log fences.
+    room: Condvar,
     fenced: AtomicBool,
 }
 
@@ -245,6 +247,7 @@ impl<F: BlockFile + 'static> Log<F> {
             pool: Pool::new(align, largest.saturating_mul(2), largest),
             state: RwLock::new(state),
             queue: Mutex::new(Queue::default()),
+            room: Condvar::new(),
             fenced: AtomicBool::new(false),
         });
         let capacity = config.queue_submissions.max(1);
@@ -264,23 +267,41 @@ impl<F: BlockFile + 'static> Log<F> {
     /// Submits `update` for `group`: refused at once when the queue is full, otherwise
     /// answered through the returned handle once it is durable.
     pub fn submit(&self, group: u128, update: Update) -> Result<Pending, LogError> {
-        if self.shared.fenced.load(Ordering::Acquire) {
-            return Err(LogError::Fenced);
-        }
+        self.send(group, update, false)
+    }
+
+    /// Submits `update` for `group`, waiting for room in the queue rather than refusing. A
+    /// replica cannot have a `Ready` refused, so the log holds it back instead
+    /// (docs/design/replica.md §3). The writer frees room with every batch it takes, and a
+    /// fence wakes every waiter, so the wait lasts no longer than the writer's progress.
+    pub fn submit_waiting(&self, group: u128, update: Update) -> Result<Pending, LogError> {
+        self.send(group, update, true)
+    }
+
+    fn send(&self, group: u128, update: Update, wait: bool) -> Result<Pending, LogError> {
         let bytes = update_bytes(&update);
         {
-            let mut queue = self.shared.queue.lock().map_err(|_| LogError::Fenced)?;
-            let submissions = queue.submissions.checked_add(1).ok_or(LogError::Busy)?;
-            let total = queue.bytes.checked_add(bytes).ok_or(LogError::Busy)?;
             let config = &self.shared.config;
-            // A submission larger than the byte bound is taken into an empty queue.
-            if submissions > config.queue_submissions
-                || (queue.bytes > 0 && total > config.queue_bytes)
-            {
-                return Err(LogError::Busy);
+            let mut queue = self.shared.queue.lock().map_err(|_| LogError::Fenced)?;
+            loop {
+                if self.shared.fenced.load(Ordering::Acquire) {
+                    return Err(LogError::Fenced);
+                }
+                let submissions = queue.submissions.checked_add(1).ok_or(LogError::Busy)?;
+                let total = queue.bytes.checked_add(bytes).ok_or(LogError::Busy)?;
+                // A submission larger than the byte bound is taken into an empty queue.
+                let room = submissions <= config.queue_submissions
+                    && (queue.bytes == 0 || total <= config.queue_bytes);
+                if room {
+                    queue.submissions = submissions;
+                    queue.bytes = total;
+                    break;
+                }
+                if !wait {
+                    return Err(LogError::Busy);
+                }
+                queue = self.shared.room.wait(queue).map_err(|_| LogError::Fenced)?;
             }
-            queue.submissions = submissions;
-            queue.bytes = total;
         }
         let sender = self.sender.as_ref().ok_or(LogError::Closed)?;
         let (reply, answer) = sync_channel(1);
@@ -309,9 +330,15 @@ impl<F: BlockFile + 'static> Log<F> {
         }
     }
 
-    /// Submits `update` and waits until it is durable.
+    /// Submits `update` and waits until it is durable; refused at once when the queue is
+    /// full.
     pub fn write(&self, group: u128, update: Update) -> Result<(), LogError> {
         self.submit(group, update)?.wait()
+    }
+
+    /// Submits `update`, waiting for room, and waits until it is durable.
+    pub fn write_waiting(&self, group: u128, update: Update) -> Result<(), LogError> {
+        self.submit_waiting(group, update)?.wait()
     }
 
     /// The groups the log holds.

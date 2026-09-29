@@ -501,6 +501,36 @@ fn many_submitters_share_flushes() {
     assert!(syncs <= 320, "{syncs} flushes for 320 updates");
 }
 
+/// A replica's update waits for room rather than being refused: through a queue of one,
+/// every waiting submitter gets through.
+#[test]
+fn waiting_submitters_are_never_refused() {
+    let file = sim(11);
+    let mut cfg = config(64, 8);
+    cfg.queue_submissions = 1;
+    let log = Arc::new(Log::create(Arc::clone(&file), cfg, ID).unwrap());
+    let threads: Vec<_> = (0..8u128)
+        .map(|group| {
+            let log = Arc::clone(&log);
+            std::thread::spawn(move || {
+                for i in 1..=20u64 {
+                    let u = Update {
+                        entries: Some(entries(i, &[1])),
+                        ..Update::default()
+                    };
+                    log.write_waiting(group, u).unwrap();
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    for group in 0..8u128 {
+        assert_eq!(log.view(group).unwrap().unwrap().last, 20);
+    }
+}
+
 #[test]
 fn a_failed_flush_fences_the_log_and_loses_nothing_acknowledged() {
     let file = sim(7);

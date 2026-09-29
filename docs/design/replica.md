@@ -128,6 +128,23 @@ simulation found this once members could be lost for good. A leader lost right a
 left a follower that never heard the commit again, and that follower compacted, crashed and
 reopened with its engine ahead of its log.
 
+A member's log may reopen with an uncertainty mark: its last frame, acknowledged, no longer
+reads, and recovery restored the term and vote it held and cut its entries (raft-log.md §6).
+The member may then lack entries it acknowledged, and a vote judged on its shorter log could
+elect a leader without one it helped commit. So until its log holds them again, or an entry
+of a later term, it judges a request for its vote against the last entry it acknowledged, as
+it would have with the entries: a candidate behind that entry gets no answer, one that holds
+it is judged by the core as usual. It cannot lead without the entries, so it does not
+campaign: an explicit campaign is refused with `Uncertain`, and while its election timer
+runs, which keeps it from holding a lease on a leader that is gone, the requests of its own
+campaigns are not sent. An order to take over leadership is dropped too. The mark ends by
+Raft's own properties: a log that reaches the mark's index again holds the leader's entries up
+to it, and an entry of a later term from a leader proves every committed entry the mark
+covers is in the log, since terms never fall along a log (Ongaro and Ousterhout, ATC 2014,
+§5.3–§5.4). A new leader's first entry is of its own term, so a member rejoins as soon as a
+leader reaches it. The simulation found that withholding every vote, or stopping the timer
+instead, left a group with one member lost and one uncertain unable to elect anyone.
+
 ## 5. Testing
 
 Replicas are tested in deterministic simulation (`crates/range/tests/sim.rs`). Three

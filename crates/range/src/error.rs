@@ -18,6 +18,10 @@ pub enum ReplicaError {
     /// neighbours on the log compact, it takes no call but `drive` and `compact`.
     #[error("the replica waits for room in its log")]
     Stalled,
+    /// The member's log may lack entries it acknowledged, so it takes no part in elections
+    /// until it holds them again (docs/design/raft-log.md §6).
+    #[error("the member's log may lack entries it acknowledged; it does not campaign")]
+    Uncertain,
     /// An entry more than the range's bound, which every member's log holds in one frame.
     #[error("an entry of {len} bytes; the range takes {max} at most")]
     EntryTooLarge { len: usize, max: u64 },

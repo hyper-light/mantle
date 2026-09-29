@@ -19,6 +19,8 @@ use proptest::prelude::*;
 
 const ID: u128 = 0x6d61_6e74_6c65_2d6c_6f67;
 const BLOCK: usize = 4096;
+/// The persist area before segment 0 of the logs of `config(16, _)`: one segment's length.
+const AREA: u64 = 16 * BLOCK as u64;
 
 fn config(segment_blocks: u64, max_segments: u32) -> Config {
     Config {
@@ -69,11 +71,43 @@ struct Model {
     entries: Vec<(u64, Vec<u8>)>,
     hard: Option<HardState>,
     proposals: BTreeMap<u64, (u64, Vec<u8>)>,
+    /// The mark a restore left: entries the log may lack (raft-log.md §6).
+    uncertain: Option<Start>,
 }
 
 impl Model {
     fn last(&self) -> u64 {
         self.start.index + self.entries.len() as u64
+    }
+
+    fn last_term(&self) -> u64 {
+        self.entries.last().map_or(self.start.term, |e| e.0)
+    }
+
+    /// A mark ends once the log again reaches its index or holds an entry of a later term.
+    fn settle(&mut self) {
+        if let Some(mark) = self.uncertain
+            && (self.last() >= mark.index || self.last_term() > mark.term)
+        {
+            self.uncertain = None;
+        }
+    }
+
+    /// What recovery restores when the frame of `u` tore before its flush was confirmed but
+    /// after its persist record landed: the torn tail, keeping only a later term or a vote
+    /// given, at the group's own commit.
+    fn kept(&self, u: &Update) -> Self {
+        let mut m = self.clone();
+        if let Some(h) = u.hard_state
+            && m.hard
+                .is_none_or(|c| h.term > c.term || (h.term == c.term && c.vote == 0))
+        {
+            m.hard = Some(HardState {
+                commit: m.hard.map_or(0, |c| c.commit),
+                ..h
+            });
+        }
+        m
     }
 
     fn apply(&mut self, u: &Update) {
@@ -93,6 +127,7 @@ impl Model {
         }
         let last = self.last();
         self.proposals.retain(|&i, _| i > last);
+        self.settle();
         for p in &u.proposals {
             self.proposals.insert(p.index, (p.term, p.bytes.to_vec()));
         }
@@ -124,8 +159,13 @@ fn holds<F: mantle_disk::block::BlockFile>(
         .iter()
         .map(|p| (p.index, (p.term, p.bytes.to_vec())))
         .collect();
-    if (view.start, view.last, view.hard_state, &proposals)
-        != (m.start, m.last(), m.hard, &m.proposals)
+    if (
+        view.start,
+        view.last,
+        view.hard_state,
+        &proposals,
+        view.uncertain,
+    ) != (m.start, m.last(), m.hard, &m.proposals, m.uncertain)
     {
         return false;
     }
@@ -156,8 +196,14 @@ fn check<F: mantle_disk::block::BlockFile>(log: &Log<F>, models: &Models) {
             .map(|p| (p.index, (p.term, p.bytes.to_vec())))
             .collect();
         assert_eq!(
-            (view.start, view.last, view.hard_state, &proposals),
-            (m.start, m.last(), m.hard, &m.proposals),
+            (
+                view.start,
+                view.last,
+                view.hard_state,
+                &proposals,
+                view.uncertain
+            ),
+            (m.start, m.last(), m.hard, &m.proposals, m.uncertain),
             "group {group}"
         );
         assert_eq!(log.term(group, m.start.index).unwrap(), m.start.term);
@@ -547,7 +593,7 @@ fn a_failed_flush_fences_the_log_and_loses_nothing_acknowledged() {
         entries: Some(entries(3, &[1])),
         ..Update::default()
     };
-    assert!(matches!(log.write(1, lost), Err(LogError::Fenced)));
+    assert!(matches!(log.write(1, lost.clone()), Err(LogError::Fenced)));
     assert!(log.is_fenced());
     assert!(matches!(
         log.submit(1, Update::default()),
@@ -556,7 +602,10 @@ fn a_failed_flush_fences_the_log_and_loses_nothing_acknowledged() {
     drop(log);
     file.crash(Crash::LoseAll).unwrap();
     file.clear_faults().unwrap();
-    let (log, _) = Log::open(Arc::clone(&file), config(16, 8), ID).unwrap();
+    let (log, recovery) = Log::open(Arc::clone(&file), config(16, 8), ID).unwrap();
+    // Whatever of the lost frame's persist record the failed flush left durable, the frame
+    // was never confirmed: it is the torn tail, and it held no term or vote to keep.
+    assert!(recovery.restored.is_empty());
     check(&log, &models);
 }
 
@@ -575,8 +624,9 @@ fn damage_to_an_acknowledged_frame_is_reported() {
         .unwrap();
     }
     drop(log);
-    // The second frame, just after the segment header and the empty first frame.
-    let second = 2 * BLOCK as u64 + 70;
+    // The second frame, just after the segment header and the empty first frame, in segment
+    // 0, which follows the persist area of one segment's length.
+    let second = AREA + 2 * BLOCK as u64 + 70;
     file.inject(Fault::BitFlip {
         offset: second,
         bit: 3,
@@ -587,6 +637,382 @@ fn damage_to_an_acknowledged_frame_is_reported() {
         Log::open(Arc::clone(&file), config(16, 8), ID),
         Err(LogError::Damaged(_))
     ));
+}
+
+/// The last frame, flushed and acknowledged, then damaged at rest, whatever part of it no
+/// longer reads: nothing after it proves it was flushed, but its persist record does. Its
+/// group's term and vote come back as the frame left them, never older; the entries it wrote
+/// are cut and marked as possibly lacking, so the replica takes no part in elections until
+/// it holds them again; the restore is durable across reopening; and entries the leader
+/// sends again end the mark (audit S01, the last frame).
+#[test]
+fn damage_to_the_last_acknowledged_frame_is_restored_from_its_persist_record() {
+    for field in [0u64, 8, 40, 64, 70, 120] {
+        let file = sim(30 + field);
+        let cfg = config(16, 8);
+        let log = Log::create(Arc::clone(&file), cfg, ID).unwrap();
+        for i in 1..=3u64 {
+            log.write(
+                1,
+                Update {
+                    entries: Some(entries(i, &[1])),
+                    hard_state: Some(HardState {
+                        term: 1,
+                        vote: 2,
+                        commit: i - 1,
+                    }),
+                    ..Update::default()
+                },
+            )
+            .unwrap();
+        }
+        // The last frame: the replica moved to term 2, voted for 3, and took entry 4.
+        let voted = HardState {
+            term: 2,
+            vote: 3,
+            commit: 3,
+        };
+        log.write(
+            1,
+            Update {
+                entries: Some(entries(4, &[2])),
+                hard_state: Some(voted),
+                ..Update::default()
+            },
+        )
+        .unwrap();
+        drop(log);
+        // Frames of one block each: the empty first frame, then one an update.
+        file.inject(Fault::BitFlip {
+            offset: AREA + 5 * BLOCK as u64 + field,
+            bit: 2,
+            stored: true,
+        })
+        .unwrap();
+        for reopening in 0..2 {
+            let (log, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+            let view = log.view(1).unwrap().unwrap();
+            assert_eq!(
+                view.hard_state,
+                Some(voted),
+                "byte {field}, reopening {reopening}"
+            );
+            assert_eq!(view.last, 3);
+            assert_eq!(view.uncertain, Some(Start { index: 4, term: 2 }));
+            assert_eq!(recovery.damaged, Vec::<u128>::new());
+            if reopening == 0 {
+                assert_eq!(recovery.restored, vec![1]);
+            }
+        }
+        let (log, _) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+        log.write(
+            1,
+            Update {
+                entries: Some(entries(4, &[2])),
+                ..Update::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(log.view(1).unwrap().unwrap().uncertain, None);
+        drop(log);
+        let (log, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+        assert_eq!(recovery.restored, Vec::<u128>::new());
+        let view = log.view(1).unwrap().unwrap();
+        assert_eq!(
+            (view.last, view.uncertain, view.hard_state),
+            (4, None, Some(voted))
+        );
+    }
+}
+
+/// A last frame that held proposals, which its persist record cannot restore, leaves its
+/// group damaged: the log serves it to no one, since a replica opening it as new would vote
+/// again in a term it voted in, and takes nothing for it but its removal, after which the
+/// group may start over. Other groups of the frame are restored.
+#[test]
+fn a_lost_frame_with_proposals_leaves_its_group_damaged_until_removed() {
+    let file = sim(41);
+    let cfg = config(16, 8);
+    let gated = Gated::new(Arc::clone(&file));
+    let log = Log::create(Arc::clone(&gated), cfg, ID).unwrap();
+    for group in [1, 2] {
+        log.write(
+            group,
+            Update {
+                entries: Some(entries(1, &[1])),
+                ..Update::default()
+            },
+        )
+        .unwrap();
+    }
+    // Both groups' next updates go in one frame: the writer is held in a flush meanwhile.
+    let shut = gated.shut();
+    let plug = log
+        .submit(
+            3,
+            Update {
+                entries: Some(entries(1, &[1])),
+                ..Update::default()
+            },
+        )
+        .unwrap();
+    gated.held();
+    let with_proposal = log
+        .submit(
+            1,
+            Update {
+                hard_state: Some(HardState {
+                    term: 2,
+                    vote: 1,
+                    commit: 0,
+                }),
+                proposals: vec![Proposal {
+                    index: 5,
+                    term: 2,
+                    bytes: Arc::from(&b"p"[..]),
+                }],
+                ..Update::default()
+            },
+        )
+        .unwrap();
+    let voted = HardState {
+        term: 3,
+        vote: 2,
+        commit: 1,
+    };
+    let other = log
+        .submit(
+            2,
+            Update {
+                entries: Some(entries(2, &[3])),
+                hard_state: Some(voted),
+                ..Update::default()
+            },
+        )
+        .unwrap();
+    drop(shut);
+    plug.wait().unwrap();
+    with_proposal.wait().unwrap();
+    other.wait().unwrap();
+    drop(log);
+    // That frame, the last, is damaged at rest.
+    let image = file.durable_image().unwrap();
+    let last = valid_frames(&image)
+        .into_iter()
+        .max_by_key(|f| f.2)
+        .unwrap();
+    file.inject(Fault::BitFlip {
+        offset: last.0 + 70,
+        bit: 4,
+        stored: true,
+    })
+    .unwrap();
+    let (log, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+    assert_eq!(recovery.damaged, vec![1]);
+    assert_eq!(recovery.restored, vec![2]);
+    assert!(matches!(log.view(1), Err(LogError::Damaged(_))));
+    assert!(matches!(
+        log.write(1, Update::default()),
+        Err(LogError::Damaged(_))
+    ));
+    let view = log.view(2).unwrap().unwrap();
+    assert_eq!(
+        (view.hard_state, view.uncertain),
+        (Some(voted), Some(Start { index: 2, term: 3 }))
+    );
+    log.write(
+        1,
+        Update {
+            remove: true,
+            ..Update::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(log.view(1).unwrap(), None);
+    log.write(
+        1,
+        Update {
+            entries: Some(entries(1, &[4])),
+            ..Update::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(log.view(1).unwrap().unwrap().last, 1);
+}
+
+/// An uncertainty mark is a live piece of the log: reclaiming the segment it was written in
+/// copies it, as it copies a hard state, and it survives reopening until it ends.
+#[test]
+fn an_uncertainty_mark_survives_reclaiming_its_segment() {
+    let file = sim(42);
+    let cfg = config(8, 6);
+    let log = Log::create(Arc::clone(&file), cfg, ID).unwrap();
+    log.write(
+        1,
+        Update {
+            entries: Some(entries(1, &[1, 1])),
+            ..Update::default()
+        },
+    )
+    .unwrap();
+    log.write(
+        1,
+        Update {
+            entries: Some(entries(3, &[2])),
+            hard_state: Some(HardState {
+                term: 2,
+                vote: 1,
+                commit: 2,
+            }),
+            ..Update::default()
+        },
+    )
+    .unwrap();
+    drop(log);
+    let image = file.durable_image().unwrap();
+    let last = valid_frames(&image)
+        .into_iter()
+        .max_by_key(|f| f.2)
+        .unwrap();
+    file.inject(Fault::BitFlip {
+        offset: last.0 + 70,
+        bit: 4,
+        stored: true,
+    })
+    .unwrap();
+    let (log, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+    assert_eq!(recovery.restored, vec![1]);
+    let mark = Some(Start { index: 3, term: 2 });
+    assert_eq!(log.view(1).unwrap().unwrap().uncertain, mark);
+    // Another group writes and compacts, lap after lap, until every segment has been
+    // reclaimed at least once.
+    let segments = u64::from(cfg.max_segments);
+    let per_segment = cfg.segment_bytes / BLOCK as u64;
+    for i in 1..=segments * per_segment * 3 {
+        log.write(
+            2,
+            Update {
+                start: (i > 1).then(|| Start {
+                    index: i - 1,
+                    term: 1,
+                }),
+                entries: Some(entries(i, &[1])),
+                ..Update::default()
+            },
+        )
+        .unwrap();
+    }
+    assert_eq!(log.view(1).unwrap().unwrap().uncertain, mark);
+    drop(log);
+    let (log, _) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+    assert_eq!(log.view(1).unwrap().unwrap().uncertain, mark);
+}
+
+/// A frame whose flush never completed may still have its persist record on the disk, whole,
+/// beside a torn frame: nothing confirms the frame was flushed, so it is the torn tail and its
+/// entries are gone, but the term and vote it held are kept, since keeping them is always
+/// safe and forgetting a vote given could let the replica vote twice.
+#[test]
+fn an_unconfirmed_torn_frame_keeps_only_its_term_and_vote() {
+    let file = sim(43);
+    let cfg = config(16, 8);
+    let log = Log::create(Arc::clone(&file), cfg, ID).unwrap();
+    log.write(
+        1,
+        Update {
+            entries: Some(entries(1, &[1])),
+            hard_state: Some(HardState {
+                term: 1,
+                vote: 1,
+                commit: 1,
+            }),
+            ..Update::default()
+        },
+    )
+    .unwrap();
+    // The next frame's writes, frame and persist record, reach the device; its flush fails,
+    // and every written sector survives the crash.
+    file.inject(Fault::PowerCut { ops: 2 }).unwrap();
+    let voted = HardState {
+        term: 4,
+        vote: 3,
+        commit: 2,
+    };
+    assert!(matches!(
+        log.write(
+            1,
+            Update {
+                entries: Some(entries(2, &[4])),
+                hard_state: Some(voted),
+                ..Update::default()
+            },
+        ),
+        Err(LogError::Fenced)
+    ));
+    drop(log);
+    file.crash(Crash::KeepAll).unwrap();
+    file.clear_faults().unwrap();
+    // The frame tears: its payload no longer reads.
+    let image = file.durable_image().unwrap();
+    let torn = valid_frames(&image)
+        .into_iter()
+        .max_by_key(|f| f.2)
+        .unwrap();
+    assert_eq!(torn.2, 2, "the unflushed frame's writes survived");
+    file.inject(Fault::BitFlip {
+        offset: torn.0 + 70,
+        bit: 0,
+        stored: true,
+    })
+    .unwrap();
+    let (log, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+    assert_eq!((recovery.restored, recovery.damaged), (vec![1], vec![]));
+    let view = log.view(1).unwrap().unwrap();
+    assert_eq!(view.last, 1);
+    assert_eq!(view.uncertain, None);
+    assert_eq!(
+        view.hard_state,
+        Some(HardState {
+            term: 4,
+            vote: 3,
+            commit: 1,
+        })
+    );
+}
+
+/// A frame torn by a crash before its persist record reached the disk was never
+/// acknowledged: the log is cut before it, and nothing is restored or marked.
+#[test]
+fn a_torn_frame_without_its_persist_record_is_the_torn_tail() {
+    let file = sim(40);
+    let cfg = config(16, 8);
+    let log = Log::create(Arc::clone(&file), cfg, ID).unwrap();
+    log.write(
+        1,
+        Update {
+            entries: Some(entries(1, &[1])),
+            ..Update::default()
+        },
+    )
+    .unwrap();
+    file.inject(Fault::PowerCut { ops: 0 }).unwrap();
+    assert!(matches!(
+        log.write(
+            1,
+            Update {
+                entries: Some(entries(2, &[1])),
+                ..Update::default()
+            },
+        ),
+        Err(LogError::Fenced)
+    ));
+    drop(log);
+    file.crash(Crash::LoseAll).unwrap();
+    file.clear_faults().unwrap();
+    let (log, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+    assert_eq!(recovery.restored, Vec::<u128>::new());
+    let view = log.view(1).unwrap().unwrap();
+    assert_eq!((view.last, view.uncertain), (1, None));
 }
 
 /// Damage to any field of an acknowledged frame, header or payload, is reported when a later
@@ -612,7 +1038,7 @@ fn damage_to_any_field_of_an_acknowledged_frame_is_reported() {
         drop(log);
         // The frame of the first update, after the segment header and the empty first frame.
         file.inject(Fault::BitFlip {
-            offset: 2 * BLOCK as u64 + field,
+            offset: AREA + 2 * BLOCK as u64 + field,
             bit: 0,
             stored: true,
         })
@@ -684,7 +1110,7 @@ fn a_damaged_header_of_the_newest_segment_is_reported() {
     let file = one_frame_each(20, 16);
     let segment = 16 * BLOCK as u64;
     file.inject(Fault::BitFlip {
-        offset: segment,
+        offset: AREA + segment,
         bit: 0,
         stored: true,
     })
@@ -705,7 +1131,7 @@ fn a_damaged_header_of_the_newest_segment_is_reported() {
 #[test]
 fn an_opening_whose_header_never_became_durable_is_the_torn_tail() {
     let file = one_frame_each(21, 15);
-    let segment = 16 * BLOCK as u64;
+    let segment = AREA + 16 * BLOCK as u64;
     let zeros = mantle_disk::buf::AlignedBuf::zeroed(BLOCK, Alignment::new(BLOCK).unwrap())
         .map(|mut b| {
             b.set_len(BLOCK).unwrap();
@@ -739,7 +1165,7 @@ fn damage_at_the_end_of_a_segment_the_log_went_past_is_reported() {
         let file = one_frame_each(22 + field, 16);
         // Update 14's frame, the last in segment 0.
         file.inject(Fault::BitFlip {
-            offset: 15 * BLOCK as u64 + field,
+            offset: AREA + 15 * BLOCK as u64 + field,
             bit: 1,
             stored: true,
         })
@@ -1207,11 +1633,18 @@ proptest! {
                     file.clear_faults().unwrap();
                     cut = false;
                     let (reopened, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+                    // A frame whose flush power cut was never confirmed: never damaged.
                     prop_assert!(recovery.damaged.is_empty());
                     let mut landed = models.clone();
                     apply(&mut landed, group, &u);
                     if holds(&reopened, group, landed.get(&group)) {
                         models = landed;
+                    } else if recovery.restored.contains(&group) {
+                        // The frame tore after its persist record landed: the torn tail, but
+                        // for the term and vote it held.
+                        let kept = models.get(&group).cloned().unwrap_or_default().kept(&u);
+                        prop_assert!(holds(&reopened, group, Some(&kept)));
+                        models.insert(group, kept);
                     }
                     check(&reopened, &models);
                     log = reopened;

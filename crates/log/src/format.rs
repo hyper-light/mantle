@@ -1,16 +1,20 @@
-//! The log's bytes on disk (docs/design/raft-log.md §2): segment headers, frames, records.
+//! The log's bytes on disk (docs/design/raft-log.md §2): segment headers, frames, records,
+//! and the persist records kept apart from the frames.
 //!
 //! Numbers are little-endian. A segment's first block is its header; frames follow it,
 //! each starting on a block boundary and padded to the block. A frame's CRC-32C covers its
 //! header and payload. Each entry and proposal also carries a CRC-32C of its group, index,
 //! term and bytes, so one entry read back alone is verified, and verified as the one asked
-//! for.
+//! for. A persist record says what one frame's flush made durable, group by group, and is
+//! checksummed as a whole.
 
 use mantle_codec::{Reader, Writer};
 
 pub const SEGMENT_MAGIC: [u8; 4] = *b"MNLS";
 pub const FRAME_MAGIC: [u8; 4] = *b"MNLF";
-pub const FORMAT: u8 = 1;
+pub const PERSIST_MAGIC: [u8; 4] = *b"MNLP";
+/// 2: the file begins with the persist area, and records include `Uncertain`.
+pub const FORMAT: u8 = 2;
 
 /// Bytes of a segment header before its padding.
 pub const SEGMENT_HEADER_LEN: usize = 52;
@@ -27,6 +31,14 @@ const HARD_STATE: u8 = 3;
 const START: u8 = 4;
 const PROPOSAL: u8 = 5;
 const REMOVED: u8 = 6;
+const UNCERTAIN: u8 = 7;
+
+/// Bytes of a persist record before its groups: magic, format, padding, the log's ID, the
+/// frame's sequence, the last sequence known flushed, and the count of groups.
+pub const PERSIST_HEADER_LEN: usize = 44;
+/// Bytes of one group in a persist record: its ID, which fields it carries, its hard state,
+/// start, entries and uncertainty.
+pub const PERSIST_GROUP_LEN: usize = 97;
 
 /// A segment's header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,6 +226,13 @@ pub enum Record<'a> {
     Removed {
         group: u128,
     },
+    /// The group's log may lack entries through `mark.index`, of terms up to `mark.term`,
+    /// that a frame no longer readable held: until it holds them again, or an entry of a
+    /// later term, its replica takes no part in elections (§6).
+    Uncertain {
+        group: u128,
+        mark: Start,
+    },
 }
 
 /// Where each piece of a record went in the payload: its entries' or proposal's encoded
@@ -308,6 +327,13 @@ pub fn put(payload: &mut Writer, record: &Record<'_>) -> Option<Placed> {
             payload.u128(group);
             Some(Placed::Record(at))
         }
+        Record::Uncertain { group, mark } => {
+            payload.u8(UNCERTAIN);
+            payload.u128(group);
+            payload.u64(mark.index);
+            payload.u64(mark.term);
+            Some(Placed::Record(at))
+        }
     }
 }
 
@@ -320,7 +346,7 @@ pub fn encoded_len(record: &Record<'_>) -> Option<usize> {
             })?
         }
         Record::HardState { .. } => 24,
-        Record::Start { .. } => 16,
+        Record::Start { .. } | Record::Uncertain { .. } => 16,
         Record::Proposal { bytes, .. } => 24usize.checked_add(bytes.len())?,
         Record::Removed { .. } => 0,
     };
@@ -366,6 +392,11 @@ pub enum Owned {
     },
     Removed {
         group: u128,
+    },
+    Uncertain {
+        at: usize,
+        group: u128,
+        mark: Start,
     },
 }
 
@@ -455,6 +486,14 @@ pub fn records(payload: &[u8], count: u32) -> Option<Vec<Owned>> {
                 }
             }
             REMOVED => Owned::Removed { group },
+            UNCERTAIN => Owned::Uncertain {
+                at,
+                group,
+                mark: Start {
+                    index: r.u64()?,
+                    term: r.u64()?,
+                },
+            },
             _ => return None,
         };
         out.push(record);
@@ -479,6 +518,166 @@ pub fn entry_at(bytes: &[u8], group: u128, index: u64) -> Option<(u64, Vec<u8>)>
     let term = r.u64()?;
     let (crc, payload) = take_bytes(&mut r)?;
     (entry_crc(group, index, term, payload) == crc).then(|| (term, payload.to_vec()))
+}
+
+/// Entries a frame wrote for a group: from `first`, `count` of them, the last of term
+/// `term` (0 when there are none, and the frame only cut the group's log back).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Written {
+    pub first: u64,
+    pub count: u64,
+    pub term: u64,
+}
+
+/// What one frame's flush made durable for one group, kept apart from the frame so that
+/// recovery can restore it when the frame no longer reads (docs/design/raft-log.md §6).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Persisted {
+    pub group: u128,
+    pub hard_state: Option<HardState>,
+    pub start: Option<Start>,
+    pub entries: Option<Written>,
+    pub uncertain: Option<Start>,
+    pub removed: bool,
+    /// The frame held proposals, which a persist record does not restore.
+    pub proposals: bool,
+}
+
+/// The persist record of the frame of `sequence`, or, with no groups, a confirmation that the
+/// frame of `confirms` was flushed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Persist {
+    pub log: u128,
+    pub sequence: u64,
+    /// The last frame known flushed when this record was written: the frame before this one,
+    /// which was written only after that one's flush, or, in a confirmation, this one.
+    pub confirms: u64,
+    pub groups: Vec<Persisted>,
+}
+
+const HAS_HARD_STATE: u8 = 1;
+const HAS_START: u8 = 2;
+const HAS_ENTRIES: u8 = 4;
+const HAS_UNCERTAIN: u8 = 8;
+const IS_REMOVED: u8 = 16;
+const HAS_PROPOSALS: u8 = 32;
+
+fn when<T>(set: bool, value: T) -> Option<T> {
+    if set { Some(value) } else { None }
+}
+
+/// Bytes of a persist record of `groups` groups, with its CRC.
+pub fn persist_len(groups: usize) -> Option<usize> {
+    PERSIST_GROUP_LEN
+        .checked_mul(groups)?
+        .checked_add(PERSIST_HEADER_LEN)?
+        .checked_add(4)
+}
+
+impl Persist {
+    pub fn encode(&self) -> Option<Vec<u8>> {
+        let mut w = Writer::with_capacity(persist_len(self.groups.len())?);
+        w.bytes(&PERSIST_MAGIC);
+        w.u8(FORMAT);
+        w.zeros(3);
+        w.u128(self.log);
+        w.u64(self.sequence);
+        w.u64(self.confirms);
+        w.u32(u32::try_from(self.groups.len()).ok()?);
+        for g in &self.groups {
+            let mut flags = 0u8;
+            for (set, flag) in [
+                (g.hard_state.is_some(), HAS_HARD_STATE),
+                (g.start.is_some(), HAS_START),
+                (g.entries.is_some(), HAS_ENTRIES),
+                (g.uncertain.is_some(), HAS_UNCERTAIN),
+                (g.removed, IS_REMOVED),
+                (g.proposals, HAS_PROPOSALS),
+            ] {
+                if set {
+                    flags |= flag;
+                }
+            }
+            let hard = g.hard_state.unwrap_or_default();
+            let start = g.start.unwrap_or_default();
+            let entries = g.entries.unwrap_or_default();
+            let uncertain = g.uncertain.unwrap_or_default();
+            w.u128(g.group);
+            w.u8(flags);
+            w.u64(hard.term);
+            w.u64(hard.vote);
+            w.u64(hard.commit);
+            w.u64(start.index);
+            w.u64(start.term);
+            w.u64(entries.first);
+            w.u64(entries.count);
+            w.u64(entries.term);
+            w.u64(uncertain.index);
+            w.u64(uncertain.term);
+        }
+        let crc = mantle_crc::crc32c(w.as_slice());
+        w.u32(crc);
+        Some(w.into_vec())
+    }
+
+    /// The persist record at the start of `bytes`, if it is one and its checksum holds.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(bytes.get(..PERSIST_HEADER_LEN)?);
+        if r.take(4)? != PERSIST_MAGIC || r.u8()? != FORMAT {
+            return None;
+        }
+        r.take(3)?;
+        let log = r.u128()?;
+        let sequence = r.u64()?;
+        let confirms = r.u64()?;
+        let count = usize::try_from(r.u32()?).ok()?;
+        let len = persist_len(count)?;
+        let whole = bytes.get(..len)?;
+        let (body, crc) = whole.split_at(len.checked_sub(4)?);
+        if mantle_crc::crc32c(body) != u32::from_le_bytes(crc.try_into().ok()?) {
+            return None;
+        }
+        let mut r = Reader::new(body.get(PERSIST_HEADER_LEN..)?);
+        let mut groups = Vec::with_capacity(count);
+        for _ in 0..count {
+            let group = r.u128()?;
+            let flags = r.u8()?;
+            let hard = HardState {
+                term: r.u64()?,
+                vote: r.u64()?,
+                commit: r.u64()?,
+            };
+            let start = Start {
+                index: r.u64()?,
+                term: r.u64()?,
+            };
+            let entries = Written {
+                first: r.u64()?,
+                count: r.u64()?,
+                term: r.u64()?,
+            };
+            let uncertain = Start {
+                index: r.u64()?,
+                term: r.u64()?,
+            };
+            let has = |flag: u8| flags & flag != 0;
+            groups.push(Persisted {
+                group,
+                hard_state: when(has(HAS_HARD_STATE), hard),
+                start: when(has(HAS_START), start),
+                entries: when(has(HAS_ENTRIES), entries),
+                uncertain: when(has(HAS_UNCERTAIN), uncertain),
+                removed: has(IS_REMOVED),
+                proposals: has(HAS_PROPOSALS),
+            });
+        }
+        Some(Self {
+            log,
+            sequence,
+            confirms,
+            groups,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -514,9 +713,54 @@ mod tests {
         assert!(!header.verifies(&bad));
     }
 
+    /// A persist record reads back as written, and any flipped bit makes it unreadable.
+    #[test]
+    fn persist_records_round_trip_and_refuse_damage() {
+        let record = Persist {
+            log: 7,
+            sequence: 41,
+            confirms: 40,
+            groups: vec![
+                Persisted {
+                    group: 3,
+                    hard_state: Some(HardState {
+                        term: 5,
+                        vote: 2,
+                        commit: 9,
+                    }),
+                    start: None,
+                    entries: Some(Written {
+                        first: 8,
+                        count: 3,
+                        term: 5,
+                    }),
+                    uncertain: None,
+                    removed: false,
+                    proposals: false,
+                },
+                Persisted {
+                    group: 4,
+                    start: Some(Start { index: 20, term: 4 }),
+                    uncertain: Some(Start { index: 25, term: 4 }),
+                    removed: true,
+                    proposals: true,
+                    ..Persisted::default()
+                },
+            ],
+        };
+        let bytes = record.encode().unwrap();
+        assert_eq!(bytes.len(), persist_len(2).unwrap());
+        assert_eq!(Persist::decode(&bytes), Some(record));
+        for i in 0..bytes.len() * 8 {
+            let mut bad = bytes.clone();
+            bad[i / 8] ^= 1 << (i % 8);
+            assert_eq!(Persist::decode(&bad), None, "bit {i}");
+        }
+    }
+
     fn record() -> impl Strategy<Value = (u8, u128, u64, Vec<(u64, Vec<u8>)>)> {
         (
-            0u8..6,
+            0u8..7,
             any::<u128>(),
             0u64..u64::MAX / 2,
             prop::collection::vec(
@@ -545,6 +789,7 @@ mod tests {
                     2 => Record::HardState { group, state: HardState { term: first, vote: 1, commit: 2 } },
                     3 => Record::Start { group, start: Start { index: first, term: 4 } },
                     4 => Record::Proposal { group, index: first, term: 5, bytes },
+                    5 => Record::Uncertain { group, mark: Start { index: first, term: 6 } },
                     _ => Record::Removed { group },
                 };
                 let before = payload.len();

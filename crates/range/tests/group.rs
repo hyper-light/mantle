@@ -468,6 +468,174 @@ fn a_member_whose_engine_is_ahead_of_its_logs_commit_reopens() {
     );
 }
 
+/// A member whose last acknowledged frame is damaged at rest reopens with the term and vote
+/// it had, the entries that frame held cut and marked as possibly lacking. It judges a
+/// request for its vote against the last entry it acknowledged, not its shorter log: a
+/// candidate behind that entry may lack one it helped commit, and gets no answer, while one
+/// that holds it does. It cannot lead without the entries, so it does not campaign, though
+/// its election timer runs. Once the leader has sent it the entries again, it campaigns as
+/// before (audit S01, the last frame; raft-log.md §6).
+#[test]
+fn a_member_whose_last_frame_was_damaged_stays_out_of_elections_until_it_holds_it_again() {
+    use mantle_disk::sim::Fault;
+
+    let file = |id: u64| {
+        Arc::new(
+            SimFile::new(
+                Alignment::new(4096).unwrap(),
+                Alignment::new(512).unwrap(),
+                id,
+            )
+            .unwrap(),
+        )
+    };
+    let log_id = |id: u64| 0x6c6f67 + u128::from(id);
+    let files: Vec<Arc<SimFile>> = (1..=3).map(file).collect();
+    let mut logs: Vec<Arc<Log<Arc<SimFile>>>> = files
+        .iter()
+        .zip(1u64..)
+        .map(|(f, id)| Arc::new(Log::create(Arc::clone(f), log_config(), log_id(id)).unwrap()))
+        .collect();
+    let mut nodes: Vec<Node> = logs
+        .iter()
+        .zip(1u64..)
+        .map(|(log, id)| Node {
+            replica: Replica::open(id, GROUP, Arc::clone(log), first_range(), &range(), id)
+                .unwrap(),
+        })
+        .collect();
+    let mut answers = Vec::new();
+    nodes[0].replica.campaign().unwrap();
+    settle(&mut nodes, &mut answers);
+    let register = |serial| Entry {
+        at_ns: 10,
+        commands: vec![Sessioned {
+            session: 0,
+            serial,
+            unanswered: 0,
+            command: Command::Register,
+        }],
+    };
+    nodes[0].replica.propose(&register(0)).unwrap();
+    settle(&mut nodes, &mut answers);
+
+    // One more entry: members 2 and 3 write it and acknowledge it, and the leader hears
+    // neither answer before member 2 stops.
+    nodes[0].replica.propose(&register(1)).unwrap();
+    let appends = nodes[0].replica.drive().unwrap().messages;
+    for m in appends {
+        let to = usize::try_from(m.to).unwrap() - 1;
+        nodes[to].replica.step(m).unwrap();
+    }
+    for n in &mut nodes[1..] {
+        let acks = n.replica.drive().unwrap().messages;
+        assert!(acks.iter().any(|m| m.to == 1));
+    }
+    let acknowledged = logs[1].view(GROUP).unwrap().unwrap();
+    let index = acknowledged.last;
+    let acknowledged_term = logs[1].term(GROUP, index).unwrap();
+
+    // Its last frame, the append it acknowledged, is damaged at rest: found as the valid
+    // frame of member 2's log with the highest sequence.
+    let image = files[1].durable_image().unwrap();
+    let last_frame = image
+        .chunks(4096)
+        .enumerate()
+        .filter_map(|(i, block)| {
+            let h = mantle_log::format::FrameHeader::decode(block)?;
+            let frame = image.get(i * 4096..i * 4096 + h.frame_len()?)?;
+            (h.log == log_id(2) && h.verifies(frame)).then(|| (h.sequence, i * 4096))
+        })
+        .max()
+        .unwrap()
+        .1;
+    files[1]
+        .inject(Fault::BitFlip {
+            offset: last_frame as u64 + 90,
+            bit: 5,
+            stored: true,
+        })
+        .unwrap();
+
+    // It restarts from its device and its engine.
+    let old = std::mem::replace(&mut nodes[1], node(9, 9));
+    let engine = old.replica.into_engine();
+    let stand_in = Arc::clone(&logs[0]);
+    drop(std::mem::replace(&mut logs[1], stand_in));
+    let (log, recovery) = Log::open(Arc::clone(&files[1]), log_config(), log_id(2)).unwrap();
+    assert_eq!(recovery.restored, vec![GROUP]);
+    logs[1] = Arc::new(log);
+    nodes[1] = Node {
+        replica: Replica::open(2, GROUP, Arc::clone(&logs[1]), engine, &range(), 2).unwrap(),
+    };
+    let view = logs[1].view(GROUP).unwrap().unwrap();
+    assert_eq!(
+        view.hard_state.map(|h| (h.term, h.vote)),
+        acknowledged.hard_state.map(|h| (h.term, h.vote))
+    );
+    assert_eq!(view.last, index - 1);
+    assert_eq!(view.uncertain.map(|m| m.index), Some(index));
+
+    // It will not campaign, and its election timer, which runs, sends no request.
+    assert!(matches!(
+        nodes[1].replica.campaign(),
+        Err(mantle_range::ReplicaError::Uncertain)
+    ));
+    for _ in 0..3 * SETTINGS.election_tick {
+        nodes[1].replica.tick().unwrap();
+    }
+    assert!(nodes[1].replica.drive().unwrap().messages.is_empty());
+    // Member 3 campaigns. Its request, as if from a candidate one entry behind what member
+    // 2 acknowledged, gets no answer; as sent, holding that entry, it gets one.
+    nodes[2].replica.campaign().unwrap();
+    let request = nodes[2]
+        .replica
+        .drive()
+        .unwrap()
+        .messages
+        .into_iter()
+        .find(|m| m.to == 2)
+        .unwrap();
+    assert_eq!(
+        (request.log_term, request.index),
+        (acknowledged_term, index)
+    );
+    let mut behind = request.clone();
+    behind.index = index - 1;
+    nodes[1].replica.step(behind).unwrap();
+    assert!(
+        nodes[1].replica.drive().unwrap().messages.is_empty(),
+        "a candidate behind an entry the member acknowledged was answered"
+    );
+    nodes[1].replica.step(request).unwrap();
+    assert!(
+        nodes[1]
+            .replica
+            .drive()
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| m.to == 3),
+        "a candidate holding every entry the member acknowledged was not answered"
+    );
+
+    // The group goes on, and the leader, hearing from it, sends it the entries again.
+    for _ in 0..20 {
+        for n in &mut nodes {
+            for _ in 0..SETTINGS.heartbeat_tick {
+                n.replica.tick().unwrap();
+            }
+        }
+        settle(&mut nodes, &mut answers);
+        if !nodes[1].replica.is_uncertain().unwrap() {
+            break;
+        }
+    }
+    assert!(!nodes[1].replica.is_uncertain().unwrap());
+    assert!(logs[1].view(GROUP).unwrap().unwrap().last >= index);
+    nodes[1].replica.campaign().unwrap();
+}
+
 /// A log that refuses a ready for want of room keeps the ready waiting, whole, in its
 /// replica, which answers `Stalled` and lets no tick move its timers meanwhile. Once the group
 /// compacts, the next drive writes the same ready and the replica goes on (audit S04).

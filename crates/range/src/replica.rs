@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use focal_raft::proto::protocompat::PbMessageExt;
 use focal_raft::proto::{
-    self, ConfChange, ConfChangeV2, ConfState, Entry, EntryType, Message, Snapshot,
+    self, ConfChange, ConfChangeV2, ConfState, Entry, EntryType, Message, MessageType, Snapshot,
     SnapshotMetadata,
 };
 use focal_raft::{RawNode, StateRole};
@@ -96,6 +96,13 @@ pub struct Replica<F: BlockFile + 'static, E: Engine> {
     max_entry_bytes: u64,
     /// A ready the log has yet to take whole, which the core counts as out (07 §1.2).
     staged: Option<Staged>,
+    /// The last entry this member acknowledged, when its log may lack it: a last frame no
+    /// longer read, whose term and vote recovery restored and whose entries it marked
+    /// (docs/design/raft-log.md §6). Until the log holds them again, or an entry of a later
+    /// term, the member judges a candidate against this entry rather than its shorter log,
+    /// as it would have with the entries, and does not campaign, since it cannot lead
+    /// without them.
+    uncertain: Option<Start>,
 }
 
 /// A ready being made durable: its update's parts not yet written, in order, each fitting a
@@ -203,6 +210,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
             conf: conf.clone(),
             snapshot: None,
         };
+        let uncertain = uncertain_mark(&store)?;
         let node = RawNode::new(&config, store)?;
         let mut replica = Self {
             node,
@@ -215,6 +223,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
             conf_index: applied,
             max_entry_bytes: settings.max_entry_bytes,
             staged: None,
+            uncertain,
         };
         // A log compacted before the restart can serve a lagging member only by snapshot.
         let compacted = replica
@@ -343,10 +352,44 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
         Ok(())
     }
 
+    /// Takes a message. While the member's log may lack entries it acknowledged, it judges a
+    /// request for its vote against the last of them: a candidate behind it may lack an entry
+    /// this member helped commit, and has no answer. Nor does an order to campaign, since the
+    /// member cannot lead without the entries.
     pub fn step(&mut self, message: Message) -> Result<(), ReplicaError> {
         self.ready_for_calls()?;
+        let kind = proto::message_type(&message);
+        let requests_vote = matches!(
+            kind,
+            Some(MessageType::MsgRequestVote | MessageType::MsgRequestPreVote)
+        );
+        let transfers = matches!(kind, Some(MessageType::MsgTimeoutNow));
+        if (requests_vote || transfers)
+            && let Some(mark) = self.uncertainty()?
+        {
+            let behind = message.log_term < mark.term
+                || (message.log_term == mark.term && message.index < mark.index);
+            if transfers || behind {
+                return Ok(());
+            }
+        }
         self.node.step(message)?;
         Ok(())
+    }
+
+    /// Whether the member's log may still lack entries it acknowledged.
+    pub fn is_uncertain(&mut self) -> Result<bool, ReplicaError> {
+        Ok(self.uncertainty()?.is_some())
+    }
+
+    /// The last entry the member acknowledged, while its log may lack it. The log ends the
+    /// mark once it holds the entries again or one of a later term, so it is read afresh
+    /// while it lasts.
+    fn uncertainty(&mut self) -> Result<Option<Start>, ReplicaError> {
+        if self.uncertain.is_some() {
+            self.uncertain = uncertain_mark(self.node.store())?;
+        }
+        Ok(self.uncertain)
     }
 
     /// `Stalled` while a ready waits for room: the core takes no call until it is done.
@@ -382,6 +425,9 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
 
     pub fn campaign(&mut self) -> Result<(), ReplicaError> {
         self.ready_for_calls()?;
+        if self.is_uncertain()? {
+            return Err(ReplicaError::Uncertain);
+        }
         self.node.campaign()?;
         Ok(())
     }
@@ -419,6 +465,17 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
     /// A ready the log refuses for want of room waits in the replica, whole, and the next
     /// drive writes it first (audit S04).
     pub fn drive(&mut self) -> Result<Drive, ReplicaError> {
+        let mut out = self.drive_ready()?;
+        // A member whose log may lack entries it acknowledged cannot lead: its election
+        // timer still runs, which keeps it from holding a lease on a leader that is gone,
+        // but its campaigns ask no one.
+        if self.uncertainty()?.is_some() {
+            out.messages.retain(|m| !campaigns(m));
+        }
+        Ok(out)
+    }
+
+    fn drive_ready(&mut self) -> Result<Drive, ReplicaError> {
         let mut out = Drive::default();
         for _ in 0..DRIVE_BUDGET {
             let staged = match self.staged.take() {
@@ -748,6 +805,21 @@ fn complete_install<F: BlockFile + 'static, E: Engine>(
 /// own) can open ahead of the commit the log kept, which the core refuses. Every entry the
 /// engine applied was committed, and the log holds it, so its index is committed state the
 /// log is told of, as for an install the log never recorded.
+/// The uncertainty mark the group's log carries (`Replica::uncertain`).
+fn uncertain_mark<F: BlockFile + 'static>(
+    store: &LogStore<F>,
+) -> Result<Option<Start>, ReplicaError> {
+    Ok(store.log.view(store.group)?.and_then(|v| v.uncertain))
+}
+
+/// Whether `message` asks for votes for its sender's campaign.
+fn campaigns(message: &Message) -> bool {
+    matches!(
+        proto::message_type(message),
+        Some(MessageType::MsgRequestVote | MessageType::MsgRequestPreVote)
+    )
+}
+
 fn commit_applied<F: BlockFile + 'static>(
     log: &Log<F>,
     group: u128,

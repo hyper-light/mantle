@@ -102,6 +102,11 @@ pub struct View {
     pub last: u64,
     pub hard_state: Option<HardState>,
     pub proposals: Vec<Proposal>,
+    /// Entries the log may lack, through this mark's index and of terms up to its term,
+    /// that a frame no longer readable held (docs/design/raft-log.md §6). Until the log
+    /// again reaches the index, or holds an entry of a later term, the replica takes no part
+    /// in elections: it may have acknowledged what it no longer holds.
+    pub uncertain: Option<Start>,
 }
 
 /// What opening found.
@@ -109,8 +114,12 @@ pub struct View {
 pub struct Recovery {
     /// Frames replayed.
     pub frames: u64,
-    /// Groups whose records do not run unbroken: each recovers from its peers.
+    /// Groups whose records do not run unbroken, or whose lost last frame held what its
+    /// persist record cannot restore: the log serves none of them, and each recovers from
+    /// its peers.
     pub damaged: Vec<u128>,
+    /// Groups restored from the persist record of a last frame that no longer reads.
+    pub restored: Vec<u128>,
 }
 
 /// An update's answer, once it is durable or refused.
@@ -138,6 +147,8 @@ impl Pending {
 struct Submission {
     group: u128,
     update: Update,
+    /// An uncertainty mark written with the update: only by the restore at open.
+    uncertain: Option<Start>,
     bytes: u64,
     reply: SyncSender<Result<(), LogError>>,
 }
@@ -167,6 +178,8 @@ struct Segments {
 
 struct State {
     groups: HashMap<u128, Group>,
+    /// Groups recovery found damaged: served to no one (`Recovery::damaged`).
+    damaged: std::collections::HashSet<u128>,
     live: Live,
     segments: Segments,
     head: Head,
@@ -269,10 +282,20 @@ impl<F: BlockFile + 'static> Log<F> {
         Self::start(file, config, id, state)
     }
 
-    /// Opens log `id` in `file` and recovers it (docs/design/raft-log.md §6).
+    /// Opens log `id` in `file` and recovers it (docs/design/raft-log.md §6). What a last
+    /// frame that no longer reads held, as its persist record says, is written back before
+    /// the log serves anyone.
     pub fn open(file: F, config: Config, id: u128) -> Result<(Self, Recovery), LogError> {
-        let (state, recovery) = recover::open(&file, &config, id)?;
-        Ok((Self::start(file, config, id, state)?, recovery))
+        let (state, recovery, restores) = recover::open(&file, &config, id)?;
+        let log = Self::start(file, config, id, state)?;
+        let mut pending = Vec::with_capacity(restores.len());
+        for r in restores {
+            pending.push(log.send(r.group, r.update, r.uncertain, true)?);
+        }
+        for p in pending {
+            p.wait()?;
+        }
+        Ok((log, recovery))
     }
 
     fn start(file: F, config: Config, id: u128, state: State) -> Result<Self, LogError> {
@@ -310,7 +333,7 @@ impl<F: BlockFile + 'static> Log<F> {
     /// Submits `update` for `group`: refused at once when the queue is full, otherwise
     /// answered through the returned handle once it is durable.
     pub fn submit(&self, group: u128, update: Update) -> Result<Pending, LogError> {
-        self.send(group, update, false)
+        self.send(group, update, None, false)
     }
 
     /// Submits `update` for `group`, waiting for room in the queue rather than refusing. A
@@ -318,10 +341,16 @@ impl<F: BlockFile + 'static> Log<F> {
     /// (docs/design/replica.md §3). The writer frees room with every batch it takes, and a
     /// fence wakes every waiter, so the wait lasts no longer than the writer's progress.
     pub fn submit_waiting(&self, group: u128, update: Update) -> Result<Pending, LogError> {
-        self.send(group, update, true)
+        self.send(group, update, None, true)
     }
 
-    fn send(&self, group: u128, update: Update, wait: bool) -> Result<Pending, LogError> {
+    fn send(
+        &self,
+        group: u128,
+        update: Update,
+        uncertain: Option<Start>,
+        wait: bool,
+    ) -> Result<Pending, LogError> {
         let bytes = update_bytes(&update);
         {
             let config = &self.shared.config;
@@ -355,6 +384,7 @@ impl<F: BlockFile + 'static> Log<F> {
         let submission = Submission {
             group,
             update,
+            uncertain,
             bytes,
             reply,
         };
@@ -515,6 +545,11 @@ impl<F: BlockFile + 'static> Log<F> {
     /// A group's durable state; `None` for a group the log holds nothing of.
     pub fn view(&self, group: u128) -> Result<Option<View>, LogError> {
         let state = self.shared.read_state()?;
+        if state.damaged.contains(&group) {
+            return Err(LogError::Damaged(
+                "the group's acknowledged records are damaged; it recovers from its peers",
+            ));
+        }
         let Some(g) = state.groups.get(&group) else {
             return Ok(None);
         };
@@ -531,6 +566,7 @@ impl<F: BlockFile + 'static> Log<F> {
                     bytes: Arc::clone(&p.bytes),
                 })
                 .collect(),
+            uncertain: g.uncertain.map(|(mark, _)| mark),
         }))
     }
 

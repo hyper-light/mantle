@@ -49,6 +49,19 @@ pub struct Group {
     /// `cache_from` on.
     pub cached: u64,
     pub cache_from: u64,
+    /// Entries through this mark's index, of terms up to its term, that the group's log may
+    /// lack, and where the mark was written (docs/design/raft-log.md §6).
+    pub uncertain: Option<(Start, Place)>,
+}
+
+/// Whether a log whose last entry is `last`, of term `term`, again holds what an uncertainty
+/// mark says it may lack. Past the mark's index it holds the entries there, received again.
+/// With an entry of a later term, from a leader, it holds every committed entry the mark
+/// could cover: terms never fall along a log, so a leader whose log has an entry of a later
+/// term at some index has none of the marked terms after it, and the log matches that
+/// leader's up to that index (docs/design/raft-log.md §6).
+pub fn resolves(mark: Start, last: u64, term: u64) -> bool {
+    last >= mark.index || term > mark.term
 }
 
 impl Group {
@@ -76,12 +89,18 @@ impl Group {
         self.slot(index).map(|s| s.term)
     }
 
+    /// The term of the last entry held, or the start's.
+    pub fn last_term(&self) -> u64 {
+        self.entries.back().map_or(self.start.term, |s| s.term)
+    }
+
     /// Every live piece of the group: where it is and the bytes it takes there.
     pub fn pieces(&self) -> impl Iterator<Item = (Place, u64)> + '_ {
         self.start_at
             .map(|p| (p, START_BYTES))
             .into_iter()
             .chain(self.hard.iter().map(|(_, p)| (*p, HARD_STATE_BYTES)))
+            .chain(self.uncertain.iter().map(|(_, p)| (*p, UNCERTAIN_BYTES)))
             .chain(self.entries.iter().map(|s| (s.place, entry_bytes(s.len))))
             .chain(self.proposals.values().map(|p| {
                 let len = u32::try_from(p.bytes.len()).unwrap_or(u32::MAX);
@@ -92,6 +111,7 @@ impl Group {
 
 /// Bytes a record's pieces take in a payload (format.rs).
 pub const START_BYTES: u64 = 33;
+pub const UNCERTAIN_BYTES: u64 = 33;
 pub const HARD_STATE_BYTES: u64 = 41;
 /// A proposal's bytes beyond an entry's: its record's kind and group, and its index.
 pub const PROPOSAL_EXTRA: u64 = 25;
@@ -161,6 +181,7 @@ pub struct Replayed {
     /// not set it, so it can lag the truth before the first `Entries` replayed, but never
     /// past a proposal written after it.
     pub last: u64,
+    pub uncertain: Option<(Start, Place)>,
 }
 
 impl Replayed {
@@ -170,12 +191,23 @@ impl Replayed {
     }
 
     /// The group's log reached `last`: proposals at or before it end, as they do when the
-    /// update that reached it was applied (07 §1.4).
+    /// update that reached it was applied (07 §1.4), and an uncertainty mark ends when the
+    /// log holds what it covers (`resolves`).
     pub fn reach(&mut self, last: u64) {
         self.last = last;
         match last.checked_add(1) {
             Some(after) => self.proposals = self.proposals.split_off(&after),
             None => self.proposals.clear(),
+        }
+        let term = if last == self.start.index {
+            Some(self.start.term)
+        } else {
+            self.entries.get(&last).map(|s| s.term)
+        };
+        if let (Some((mark, _)), Some(term)) = (self.uncertain, term)
+            && resolves(mark, last, term)
+        {
+            self.uncertain = None;
         }
     }
 
@@ -208,6 +240,7 @@ impl Replayed {
             bytes,
             cached: 0,
             cache_from: last.checked_add(1)?,
+            uncertain: self.uncertain,
         })
     }
 }

@@ -164,7 +164,46 @@ pub(crate) fn check(config: &Config, align: Alignment) -> Result<(), LogError> {
             "room for one group and one submission at least",
         ));
     }
+    let slot = persist_slot(config, align)?;
+    if slot
+        .checked_mul(2)
+        .is_none_or(|area| area > config.segment_bytes)
+    {
+        return Err(LogError::Config(
+            "a segment holds two persist records of the log's groups",
+        ));
+    }
     Ok(())
+}
+
+/// Bytes the file keeps before its first segment slot for persist records: one segment's
+/// length, so that every frame lies at least that far from them (docs/design/raft-log.md §2).
+pub(crate) fn persist_area(config: &Config) -> u64 {
+    config.segment_bytes
+}
+
+/// Bytes of one persist slot: a record of the most groups a frame can carry, padded to the
+/// block. The record of the frame of sequence `s` goes in slot `s mod 2`, so the record of
+/// the frame before it survives a torn write of this one.
+pub(crate) fn persist_slot(config: &Config, align: Alignment) -> Result<u64, LogError> {
+    format::persist_len(config.max_groups)
+        .and_then(|len| u64::try_from(len).ok())
+        .and_then(|len| align.up_u64(len))
+        .ok_or(LogError::Config("persist records past u64"))
+}
+
+/// The file offset of the persist slot of the frame of `sequence`.
+pub(crate) fn persist_at(slot: u64, sequence: u64) -> u64 {
+    if sequence.is_multiple_of(2) { 0 } else { slot }
+}
+
+/// A group's state to write back as it was after a frame that no longer reads, which its
+/// persist record describes, before the log serves anyone (docs/design/raft-log.md §6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Restore {
+    pub group: u128,
+    pub update: crate::Update,
+    pub uncertain: Option<format::Start>,
 }
 
 /// Writes segment 0, incarnation 1: its header and an empty first frame.
@@ -195,10 +234,12 @@ pub(crate) fn create<F: BlockFile>(file: &F, config: &Config, id: u128) -> Resul
         .map_err(|e| LogError::Disk(e.into()))?;
     let bytes = buf.padded().map_err(|e| LogError::Disk(e.into()))?;
     let written = u64::try_from(bytes.len()).map_err(|_| LogError::Config("frame"))?;
-    file.write_all_at(bytes, 0)?;
+    let at = persist_area(config);
+    file.write_all_at(bytes, at)?;
     file.sync_data()?;
     Ok(State {
         groups: HashMap::new(),
+        damaged: std::collections::HashSet::new(),
         live: Live::with_slots(1),
         segments: Segments {
             incarnation: vec![1],
@@ -210,7 +251,7 @@ pub(crate) fn create<F: BlockFile>(file: &F, config: &Config, id: u128) -> Resul
             slot: 0,
             incarnation: 1,
             nonce,
-            offset: written,
+            offset: at.checked_add(written).ok_or(LogError::Config("frame"))?,
         },
         next_sequence: 1,
         next_incarnation: 2,
@@ -243,7 +284,7 @@ pub(crate) fn open<F: BlockFile>(
     file: &F,
     config: &Config,
     id: u128,
-) -> Result<(State, Recovery), LogError> {
+) -> Result<(State, Recovery, Vec<Restore>), LogError> {
     let align = file.alignment();
     check(config, align)?;
     let block = block_of(align)?;
@@ -252,12 +293,21 @@ pub(crate) fn open<F: BlockFile>(
         return Err(LogError::Foreign("the file is empty"));
     }
     let segment = config.segment_bytes;
-    let slots = len.div_ceil(segment);
+    let area = persist_area(config);
+    let slots = len
+        .checked_sub(area)
+        .filter(|&rest| rest > 0)
+        .ok_or(LogError::Foreign("no segment past the persist area"))?
+        .div_ceil(segment);
     let slots = u32::try_from(slots)
         .ok()
         .filter(|&s| s <= config.max_segments)
         .ok_or(LogError::Foreign("more segments than the log's quota"))?;
-    let start_of = |slot: u32| u64::from(slot).checked_mul(segment);
+    let start_of = |slot: u32| {
+        u64::from(slot)
+            .checked_mul(segment)
+            .and_then(|s| s.checked_add(area))
+    };
 
     // 1. Every segment header.
     let mut incarnation = vec![0u64; usize::try_from(slots).unwrap_or(0)];
@@ -444,6 +494,17 @@ pub(crate) fn open<F: BlockFile>(
             None => damaged.push(group),
         }
     }
+    // 4b. A frame after the last valid one may have been flushed and damaged since: its
+    // persist record, written in the same flush, says what it held (AGL+18 §3.3.3).
+    let restores = restores(
+        file,
+        config,
+        align,
+        id,
+        last.sequence,
+        &groups,
+        &mut damaged,
+    )?;
     damaged.sort_unstable();
     let mut live = Live::with_slots(incarnation.len());
     for g in groups.values() {
@@ -497,7 +558,9 @@ pub(crate) fn open<F: BlockFile>(
         })
         .map(|slot| (slot, 0))
         .collect();
+    let restored = restores.iter().map(|r| r.group).collect();
     let state = State {
+        damaged: damaged.iter().copied().collect(),
         groups,
         live,
         segments: Segments {
@@ -522,7 +585,178 @@ pub(crate) fn open<F: BlockFile>(
         durable: last.sequence,
         durable_tail: last.tail,
     };
-    Ok((state, Recovery { frames, damaged }))
+    Ok((
+        state,
+        Recovery {
+            frames,
+            damaged,
+            restored,
+        },
+        restores,
+    ))
+}
+
+/// What the frame after the last valid one held, from its persist record, as the updates that
+/// restore it. A persist record is written in its frame's flush, so it may survive a frame
+/// torn by a crash as well as one damaged since its flush; what tells the two apart is a
+/// confirmation that the frame was flushed: the next frame's record, which is written only
+/// after that flush, or the one the writer writes when the log falls idle or closes.
+///
+/// A confirmed frame was acknowledged, and damaged since (AGL+18 §3.3.3). Each of its groups
+/// gets back the start and hard state the frame left, its entries cut back to where the
+/// frame's began, and, where the frame wrote entries, the mark that the log may lack them; a
+/// group whose frame held proposals, which a persist record does not carry, is damaged and
+/// recovers from its peers. An unconfirmed frame may never have been acknowledged, and is the
+/// torn tail, but for one thing: the term and vote it held are kept. Keeping a term or vote is
+/// always safe, since a replica may raise its term and a vote it may have given only stops it
+/// voting again; forgetting one given could let it vote twice. Its commit is not kept, since it
+/// may name an entry only the frame held. What remains unknowable is an acknowledged frame
+/// damaged before its confirmation became durable: that needs a crash within about one flush
+/// of the acknowledgement and damage to the frame before the restart, and loses its entries
+/// but not its term or vote.
+fn restores<F: BlockFile>(
+    file: &F,
+    config: &Config,
+    align: Alignment,
+    id: u128,
+    last: u64,
+    groups: &HashMap<u128, state::Group>,
+    damaged: &mut Vec<u128>,
+) -> Result<Vec<Restore>, LogError> {
+    let Some(sequence) = last.checked_add(1) else {
+        return Ok(Vec::new());
+    };
+    let slot = persist_slot(config, align)?;
+    let size = usize::try_from(slot).map_err(|_| LogError::Config("a persist slot"))?;
+    let mut records = Vec::with_capacity(2);
+    for at in [0, slot] {
+        let mut bytes = AlignedBuf::zeroed(size, align).map_err(|e| LogError::Disk(e.into()))?;
+        bytes.set_len(size).map_err(|e| LogError::Disk(e.into()))?;
+        file.read_exact_at(bytes.as_mut_slice(), at)?;
+        if let Some(p) = format::Persist::decode(bytes.as_slice()).filter(|p| p.log == id) {
+            records.push((at, p));
+        }
+    }
+    let confirmed = records.iter().any(|(_, p)| p.confirms >= sequence);
+    let Some(record) = records
+        .into_iter()
+        .find(|(at, p)| *at == persist_at(slot, sequence) && p.sequence == sequence)
+        .map(|(_, p)| p)
+    else {
+        return Ok(Vec::new());
+    };
+    let empty = state::Group::default();
+    let mut out = Vec::new();
+    for p in record.groups {
+        if damaged.contains(&p.group) {
+            continue;
+        }
+        let g = groups.get(&p.group).unwrap_or(&empty);
+        let current = g.hard.map(|(h, _)| h);
+        if !confirmed {
+            // The torn tail, keeping only a later term or a vote given.
+            let Some(h) = p.hard_state else {
+                continue;
+            };
+            let later =
+                current.is_none_or(|c| h.term > c.term || (h.term == c.term && c.vote == 0));
+            if later {
+                out.push(Restore {
+                    group: p.group,
+                    update: crate::Update {
+                        hard_state: Some(format::HardState {
+                            commit: current.map_or(0, |c| c.commit),
+                            ..h
+                        }),
+                        ..crate::Update::default()
+                    },
+                    uncertain: None,
+                });
+            }
+            continue;
+        }
+        if p.proposals {
+            damaged.push(p.group);
+            continue;
+        }
+        if p.removed {
+            out.push(Restore {
+                group: p.group,
+                update: crate::Update {
+                    remove: true,
+                    ..crate::Update::default()
+                },
+                uncertain: None,
+            });
+            continue;
+        }
+        let mut update = crate::Update::default();
+        let mut last_index = g.last().ok_or(LogError::Damaged("an index past u64"))?;
+        if let Some(start) = p.start.filter(|s| s.index >= g.start.index) {
+            update.start = Some(start);
+            last_index = last_index.max(start.index);
+        }
+        let mut uncertain = g.uncertain.map(|(mark, _)| mark);
+        if let Some(w) = p.entries {
+            let from = w.first.max(
+                update
+                    .start
+                    .map_or(g.start.index, |s| s.index)
+                    .saturating_add(1),
+            );
+            update.entries = Some(crate::Entries {
+                first: from,
+                entries: Vec::new(),
+            });
+            last_index = last_index.min(from.saturating_sub(1));
+            if w.count > 0 {
+                let mark = format::Start {
+                    index: w
+                        .first
+                        .checked_add(w.count)
+                        .and_then(|end| end.checked_sub(1))
+                        .ok_or(LogError::Damaged("an index past u64"))?,
+                    term: w.term,
+                };
+                uncertain = Some(merge(uncertain, mark));
+            }
+        }
+        if let Some(mark) = p.uncertain {
+            uncertain = Some(merge(uncertain, mark));
+        }
+        let newer = p
+            .hard_state
+            .filter(|h| current.is_none_or(|c| h.term >= c.term));
+        // A commit past the entries the log still holds would name entries it lacks; the
+        // leader tells the replica its commit again.
+        let hard = newer.or(current).map(|h| format::HardState {
+            commit: h.commit.min(last_index),
+            ..h
+        });
+        if hard != current {
+            update.hard_state = hard;
+        }
+        if update == crate::Update::default() && uncertain == g.uncertain.map(|(m, _)| m) {
+            continue;
+        }
+        out.push(Restore {
+            group: p.group,
+            update,
+            uncertain,
+        });
+    }
+    Ok(out)
+}
+
+/// A mark covering both marks.
+fn merge(mark: Option<format::Start>, other: format::Start) -> format::Start {
+    match mark {
+        Some(m) => format::Start {
+            index: m.index.max(other.index),
+            term: m.term.max(other.term),
+        },
+        None => other,
+    }
 }
 
 /// Applies one frame's records, in order, to the groups being rebuilt. `base` is the file
@@ -584,6 +818,9 @@ fn replay(
             }
             Owned::Removed { group } => {
                 groups.remove(&group);
+            }
+            Owned::Uncertain { at, group, mark } => {
+                groups.entry(group).or_default().uncertain = Some((mark, place(at)?));
             }
         }
     }

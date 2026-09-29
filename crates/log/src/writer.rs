@@ -29,7 +29,8 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::time::Duration;
 
 use mantle_codec::Writer as Payload;
 use mantle_disk::block::BlockFile;
@@ -40,7 +41,8 @@ use crate::format::{
     self, FRAME_HEADER_BYTES, FRAME_HEADER_LEN, FrameHeader, Owned, Placed, Record, SegmentHeader,
 };
 use crate::state::{
-    self, Group, HARD_STATE_BYTES, PROPOSAL_EXTRA, Place, START_BYTES, Slot, entry_bytes,
+    self, Group, HARD_STATE_BYTES, PROPOSAL_EXTRA, Place, START_BYTES, Slot, UNCERTAIN_BYTES,
+    entry_bytes, resolves,
 };
 use crate::{LogError, Shared, State, Submission, Update};
 
@@ -51,6 +53,7 @@ struct Placement {
     entries: Vec<(u64, usize)>,
     hard: Option<usize>,
     proposals: Vec<(u64, usize)>,
+    uncertain: Option<usize>,
 }
 
 /// A live piece of the tail copied into the payload.
@@ -60,6 +63,7 @@ enum Moved {
     Hard { group: u128, at: usize },
     Start { group: u128, at: usize },
     Proposal { group: u128, index: u64, at: usize },
+    Uncertain { group: u128, at: usize },
 }
 
 /// A sweep of the tail laid into the payload.
@@ -81,6 +85,10 @@ pub(crate) struct Writer<F> {
     anticipation: Anticipation,
     /// Submissions taken off the channel so far.
     received: u64,
+    /// The last frame flushed, while nothing durable yet says its flush completed: the next
+    /// frame's persist record will, or, if the log falls idle first, a confirmation
+    /// (docs/design/raft-log.md §6).
+    unconfirmed: Option<u64>,
 }
 
 impl<F: BlockFile> Writer<F> {
@@ -93,6 +101,7 @@ impl<F: BlockFile> Writer<F> {
             capacity,
             anticipation: Anticipation::new(),
             received: 0,
+            unconfirmed: None,
         })
     }
 
@@ -104,9 +113,9 @@ impl<F: BlockFile> Writer<F> {
             let mut batch = std::mem::take(&mut self.held);
             let held = u64::try_from(batch.len()).unwrap_or(u64::MAX);
             if batch.is_empty() {
-                match self.receiver.recv() {
-                    Ok(s) => batch.push_back(self.taken(s)),
-                    Err(_) => return,
+                match self.next_when_idle() {
+                    Some(s) => batch.push_back(self.taken(s)),
+                    None => return,
                 }
             }
             while let Ok(s) = self.receiver.try_recv() {
@@ -138,6 +147,57 @@ impl<F: BlockFile> Writer<F> {
                 .submitted
                 .load(Ordering::Acquire)
                 .saturating_sub(self.received);
+        }
+    }
+
+    /// The next submission, once nothing is queued; `None` once the log is closed. The last
+    /// frame's flush is confirmed first if no submission comes within one flush's measured
+    /// time, whose own frame would have confirmed it for nothing, and before the writer stops.
+    fn next_when_idle(&mut self) -> Option<Submission> {
+        if self.unconfirmed.is_some() {
+            let flush = Duration::from_nanos(self.anticipation.service_ns());
+            match self.receiver.recv_timeout(flush) {
+                Ok(s) => return Some(s),
+                Err(RecvTimeoutError::Timeout) => self.confirm(),
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.confirm();
+                    return None;
+                }
+            }
+        }
+        match self.receiver.recv() {
+            Ok(s) => Some(s),
+            Err(_) => {
+                self.confirm();
+                None
+            }
+        }
+    }
+
+    /// Writes and flushes a confirmation that the last frame was flushed, into the persist
+    /// slot the next frame's record would take. A failed write or flush fences the log.
+    fn confirm(&mut self) {
+        let Some(sequence) = self.unconfirmed.take() else {
+            return;
+        };
+        if self.shared.fenced.load(Ordering::Acquire) {
+            return;
+        }
+        let written = sequence
+            .checked_add(1)
+            .ok_or(LogError::Damaged("sequences past u64"))
+            .and_then(|next| {
+                let record = format::Persist {
+                    log: self.shared.id,
+                    sequence,
+                    confirms: sequence,
+                    groups: Vec::new(),
+                };
+                write_persist(&self.shared, &record, next)
+            })
+            .and_then(|()| self.shared.file.sync_data().map_err(LogError::from));
+        if written.is_err() {
+            self.fence();
         }
     }
 
@@ -217,7 +277,7 @@ impl<F: BlockFile> Writer<F> {
                         continue;
                     }
                 };
-                let len = match update_len(s.group, &s.update) {
+                let len = match submission_len(&s) {
                     Some(len) if len <= self.capacity => len,
                     Some(len) => {
                         self.answer(&s, Err(LogError::TooLarge(len)));
@@ -234,7 +294,7 @@ impl<F: BlockFile> Writer<F> {
                     self.held.push_back(s);
                     continue;
                 }
-                let placement = encode(&mut payload, &mut records, s.group, &s.update)
+                let placement = encode(&mut payload, &mut records, s.group, &s.update, s.uncertain)
                     .ok_or(LogError::TooLarge(len))?;
                 if new {
                     new_groups = new_groups.saturating_add(1);
@@ -296,7 +356,8 @@ impl<F: BlockFile> Writer<F> {
             return Ok(false);
         };
         let started = std::time::Instant::now();
-        self.write(&target, records, payload, tail)?;
+        let sequence = self.write(&target, records, payload, tail, taken)?;
+        self.unconfirmed = Some(sequence);
         self.anticipation
             .served(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
         self.publish(&target, sweep, taken, tail)?;
@@ -436,17 +497,21 @@ impl<F: BlockFile> Writer<F> {
         }))
     }
 
-    /// Writes the frame, and the segment's header before it when it opens a segment, then
-    /// flushes the file once.
+    /// Writes the frame, and the segment's header before it when it opens a segment, and the
+    /// frame's persist record, then flushes the file once. Returns the frame's sequence.
     fn write(
         &self,
         target: &Target,
         records: u32,
         payload: &[u8],
         tail: u64,
-    ) -> Result<(), LogError> {
+        taken: &[(Submission, Placement)],
+    ) -> Result<u64, LogError> {
         let shared = &self.shared;
-        let sequence = shared.read_state()?.next_sequence;
+        let (sequence, flushed) = {
+            let state = shared.read_state()?;
+            (state.next_sequence, state.durable)
+        };
         let frame = FrameHeader::frame(
             shared.id,
             target.incarnation,
@@ -487,8 +552,17 @@ impl<F: BlockFile> Writer<F> {
         };
         let bytes = buf.padded().map_err(|e| LogError::Disk(e.into()))?;
         shared.file.write_all_at(bytes, at)?;
+        // What the frame's flush makes durable, apart from the frame, so that recovery can
+        // restore it should the frame be damaged since (§6); it confirms the frame before.
+        let record = format::Persist {
+            log: shared.id,
+            sequence,
+            confirms: flushed,
+            groups: taken.iter().map(|(s, _)| persisted(s)).collect(),
+        };
+        write_persist(shared, &record, sequence)?;
         shared.file.sync_data()?;
-        Ok(())
+        Ok(sequence)
     }
 
     /// Makes the durable frame visible: the segment it opened, where swept pieces now are,
@@ -565,7 +639,7 @@ impl<F: BlockFile> Writer<F> {
             state.segments.free.push_back((sweep.slot, sequence));
         }
         for (s, placement) in taken {
-            apply(state, &config, s.group, &s.update, placement, &place)?;
+            apply(state, &config, s, placement, &place)?;
         }
         drop_dead_tails(state);
         Ok(())
@@ -593,7 +667,59 @@ fn block<F>(shared: &Shared<F>) -> Result<u64, LogError> {
 pub(crate) fn slot_start<F>(shared: &Shared<F>, slot: u32) -> Result<u64, LogError> {
     u64::from(slot)
         .checked_mul(shared.config.segment_bytes)
+        .and_then(|s| s.checked_add(crate::recover::persist_area(&shared.config)))
         .ok_or(LogError::Damaged("an offset past u64"))
+}
+
+/// Writes `record` into the persist slot of the frame of `slot_of`.
+fn write_persist<F: BlockFile>(
+    shared: &Shared<F>,
+    record: &format::Persist,
+    slot_of: u64,
+) -> Result<(), LogError> {
+    let bytes = record
+        .encode()
+        .ok_or(LogError::TooLarge(record.groups.len()))?;
+    let mut buf =
+        AlignedBuf::zeroed(bytes.len(), shared.align).map_err(|e| LogError::Disk(e.into()))?;
+    buf.extend_from_slice(&bytes)
+        .map_err(|e| LogError::Disk(e.into()))?;
+    let slot = crate::recover::persist_slot(&shared.config, shared.align)?;
+    let padded = buf.padded().map_err(|e| LogError::Disk(e.into()))?;
+    shared
+        .file
+        .write_all_at(padded, crate::recover::persist_at(slot, slot_of))?;
+    Ok(())
+}
+
+/// What a submission's frame makes durable for its group, as its persist record says it.
+fn persisted(s: &Submission) -> format::Persisted {
+    let u = &s.update;
+    format::Persisted {
+        group: s.group,
+        hard_state: u.hard_state,
+        start: u.start,
+        entries: u.entries.as_ref().map(|e| format::Written {
+            first: e.first,
+            count: u64::try_from(e.entries.len()).unwrap_or(u64::MAX),
+            term: e.entries.last().map_or(0, |x| x.term),
+        }),
+        uncertain: s.uncertain,
+        removed: u.remove,
+        proposals: !u.proposals.is_empty(),
+    }
+}
+
+/// Bytes a submission's records take in a payload: its update's, and its uncertainty mark's.
+fn submission_len(s: &Submission) -> Option<usize> {
+    let len = update_len(s.group, &s.update)?;
+    match s.uncertain {
+        Some(mark) => len.checked_add(format::encoded_len(&Record::Uncertain {
+            group: s.group,
+            mark,
+        })?),
+        None => Some(len),
+    }
 }
 
 fn incarnation_of(state: &State, slot: u32) -> u64 {
@@ -691,6 +817,10 @@ enum Copy<'a> {
         term: u64,
         bytes: &'a [u8],
     },
+    Uncertain {
+        group: u128,
+        mark: format::Start,
+    },
 }
 
 impl Copy<'_> {
@@ -724,6 +854,10 @@ impl Copy<'_> {
                 term: *term,
                 bytes,
             },
+            Copy::Uncertain { group, mark } => Record::Uncertain {
+                group: *group,
+                mark: *mark,
+            },
         }
     }
 
@@ -748,6 +882,9 @@ impl Copy<'_> {
                     index: *index,
                     at,
                 });
+            }
+            (Copy::Uncertain { group, .. }, Placed::Record(at)) => {
+                out.push(Moved::Uncertain { group: *group, at });
             }
             _ => {}
         }
@@ -857,6 +994,23 @@ fn live_copies<'a>(state: &State, slot: u32, base: u64, records: &'a [Owned]) ->
                     });
                 }
             }
+            Owned::Uncertain {
+                at: offset,
+                group,
+                mark,
+            } => {
+                let live = state
+                    .groups
+                    .get(group)
+                    .and_then(|g| g.uncertain)
+                    .is_some_and(|(_, p)| p == at(*offset));
+                if live {
+                    out.push(Copy::Uncertain {
+                        group: *group,
+                        mark: *mark,
+                    });
+                }
+            }
             Owned::Removed { .. } => {}
         }
     }
@@ -904,6 +1058,13 @@ fn move_piece(
                 live.add(p.place, bytes);
             }
         }
+        Moved::Uncertain { group, at } => {
+            if let Some((_, p)) = groups.get_mut(&group).and_then(|g| g.uncertain.as_mut()) {
+                live.kill(*p, UNCERTAIN_BYTES);
+                *p = place(at)?;
+                live.add(*p, UNCERTAIN_BYTES);
+            }
+        }
     }
     Ok(())
 }
@@ -926,6 +1087,13 @@ fn validate(
 ) -> Result<bool, LogError> {
     let (group, update) = (s.group, &s.update);
     let invalid = |reason| LogError::Invalid { group, reason };
+    // A damaged group takes nothing but its removal, which is how its replica leaves the
+    // device to be rebuilt from its peers.
+    if state.damaged.contains(&group) && !update.remove {
+        return Err(LogError::Damaged(
+            "the group's acknowledged records are damaged; it recovers from its peers",
+        ));
+    }
     let current = state.groups.get(&group);
     if update.remove {
         let alone = update.start.is_none()
@@ -1034,6 +1202,7 @@ fn encode(
     records: &mut u32,
     group: u128,
     update: &Update,
+    uncertain: Option<format::Start>,
 ) -> Option<Placement> {
     let mut placement = Placement::default();
     let mut put = |record: &Record<'_>| {
@@ -1074,6 +1243,11 @@ fn encode(
             placement.proposals.push((p.index, at));
         }
     }
+    if let Some(mark) = uncertain
+        && let Placed::Record(at) = put(&Record::Uncertain { group, mark })?
+    {
+        placement.uncertain = Some(at);
+    }
     Some(placement)
 }
 
@@ -1081,13 +1255,14 @@ fn encode(
 fn apply(
     state: &mut State,
     config: &crate::Config,
-    group: u128,
-    update: &Update,
+    s: &Submission,
     placement: &Placement,
     place: &impl Fn(usize) -> Result<Place, LogError>,
 ) -> Result<(), LogError> {
+    let (group, update) = (s.group, &s.update);
     let live = &mut state.live;
     if update.remove {
+        state.damaged.remove(&group);
         if let Some(g) = state.groups.remove(&group) {
             for (p, bytes) in g.pieces() {
                 live.kill(p, bytes);
@@ -1144,8 +1319,14 @@ fn apply(
         evict(g, config.group_cache);
     }
     // What the log has reached, by entries or by its start, is no longer a proposal
-    // (07 §1.4).
+    // (07 §1.4), and no longer uncertain once it holds what the mark covers.
     let last = g.last().ok_or(LogError::Damaged("an index past u64"))?;
+    if let Some((mark, at)) = g.uncertain
+        && resolves(mark, last, g.last_term())
+    {
+        live.kill(at, UNCERTAIN_BYTES);
+        g.uncertain = None;
+    }
     let reached: Vec<u64> = g.proposals.range(..=last).map(|(&i, _)| i).collect();
     for index in reached {
         if let Some(p) = g.proposals.remove(&index) {
@@ -1175,6 +1356,14 @@ fn apply(
             live.kill(old.place, proposal_bytes(&old.bytes));
         }
         live.add(new_at, bytes);
+    }
+    if let (Some(mark), Some(at)) = (s.uncertain, placement.uncertain) {
+        if let Some((_, old)) = g.uncertain {
+            live.kill(old, UNCERTAIN_BYTES);
+        }
+        let new_at = place(at)?;
+        g.uncertain = Some((mark, new_at));
+        live.add(new_at, UNCERTAIN_BYTES);
     }
     Ok(())
 }

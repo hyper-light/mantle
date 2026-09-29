@@ -33,6 +33,18 @@ a quota, as a file-backed chunk volume grows (chunk-store.md §2). Every offset 
 a multiple of the file's alignment `B`: the larger of 4 KiB and the device's logical and
 physical block sizes, as for the chunk store.
 
+- **The persist area.** The file's first segment's length holds two persist slots, and the
+  segments follow it. Each frame's flush also writes a persist record into the slot of its
+  sequence's parity: for each group the frame carried, the hard state and start it wrote,
+  where its entries began, how many there were and the last one's term, whether it removed
+  the group, and whether it held proposals. A record also says the last frame known flushed
+  when it was written: the frame before it, which it was written only after. It is
+  checksummed whole. Protocol-aware recovery keeps such identifiers apart from the entries,
+  "at least a few megabytes physically apart", because a misdirected write can corrupt an
+  item and an identifier stored beside it (AGL+18 §3.3.4); a segment's length away from every
+  frame, at the sizes a device's geometry gives (16 MiB), is past the 10 MB within which
+  latent sector errors cluster [BGPS07 §5]. Each slot holds a record of the log's most groups.
+
 - **Segments.** A segment's first block is its header: magic, format, the log's 128-bit
   ID, the segment's incarnation, and a random nonce drawn when it opens. The log holds
   segments in incarnation order, not by position, so a free segment anywhere in the file
@@ -63,6 +75,10 @@ physical block sizes, as for the chunk store.
     track, held beside its log until the log reaches that index, even if a later conflict
     shortens the log again (07 §1.4).
   - `Removed`: the replica left this device, and all of its records are dead.
+  - `Uncertain { index, term }`: the group's log may lack entries through `index`, of terms up
+    to `term`, that a frame no longer readable held (§6). It ends once the log reaches
+    `index` again, or holds an entry of a later term, and until then it is a live piece,
+    copied by reclamation like a hard state.
 
 A replica's `Ready` becomes one submission of all its records, and they go in one frame
 when they fit one. A larger update goes in parts that each fit, entries first and hard state
@@ -181,7 +197,37 @@ up to its quota, to hold twice that, the same headroom the chunk store's cleanin
    frames past the first, from a segment newer than any whose header reads, lost a header
    that was durable. The log reports the damage, writes nothing, and its replicas recover
    from their peers. It never truncates silently.
-5. The block where the next frame goes is overwritten with zeros and flushed before any
+5. The last frame has no later frame to vouch for it, which protocol-aware recovery leaves
+   ambiguous: "if e_i is the last entry, then we cannot determine whether it was a crash or
+   a corruption" (AGL+18 §3.3.3). Its persist record answers what it held, and a confirmation
+   answers whether its flush completed: the next frame's record, written only after that
+   flush, or, when the log falls idle for one measured flush time or closes, a record the
+   writer writes and flushes to say so. An idle log pays that one flush; a busy one pays
+   nothing, the next frame confirming the last.
+   - A confirmed frame that no longer reads was acknowledged and damaged since. Each of its
+     groups gets back the start and hard state the frame left, its entries cut back to where
+     the frame's began, and an `Uncertain` mark through the frame's last entry; its commit is
+     cut to the entries left, and the leader tells the replica its commit again. A group whose
+     frame held proposals, which the record does not carry, is damaged: the log serves it to
+     no one, since a replica opening it afresh would vote again in a term it voted in, and
+     takes only its removal, after which it is rebuilt from its peers. The replica keeps out
+     of elections while it is marked (replica.md §4).
+   - An unconfirmed frame may never have been acknowledged: its persist record can reach the
+     disk while the frame tears. It is the torn tail, but for its term and vote, which are
+     kept, since raising a term or keeping a vote that may have been given is always safe and
+     forgetting a vote given could let the replica vote twice. Its commit is not kept: it may
+     name an entry only the frame held.
+   - What stays unknowable is an acknowledged frame damaged before its confirmation became
+     durable. That needs a crash within about one flush of the acknowledgement and damage to
+     that frame before the restart, and it loses the frame's entries but never its term or
+     vote. Treating every unconfirmed record as damage would close it at a cost the
+     simulation measured: a crash that tore a frame after its record landed then marked
+     entries no one had acknowledged, and a group with one member lost and that one marked
+     could elect no one.
+
+   The restore is written through the writer, marks included, before the log serves anyone,
+   so it survives the next restart.
+6. The block where the next frame goes is overwritten with zeros and flushed before any
    write. A frame there was never acknowledged, but it may be partly durable: its header
    whole while its last sectors, or the file's end, are not. Left alone, a later crash
    could complete it with the zeros of a newer frame's padding and bring back an update the
@@ -196,7 +242,7 @@ read rate.
 A replica wraps its group's view in focal-raft's `Storage` trait: `initial_state` from the
 hard state, the engine's configuration and the held proposals; `entries`, `term`,
 `first_index` and `last_index` from the group's slots; and `snapshot` from the engine
-(07 §1.2). The log serves the view, and the replica updates it through the log only after a
+(07 §1.2). The view also carries the group's uncertainty mark, if any (§6). The log serves the view, and the replica updates it through the log only after a
 submission is durable, since `Storage` is what is durable, as the core reads it.
 
 ## 8. Testing
@@ -227,5 +273,6 @@ latency against the device's measured flush rate.
 - The window of entries a leader keeps for lagging followers before it sends a snapshot,
   as a function of the snapshot's cost and the follower's measured lag.
 - Whether hard states also get a periodically written second copy, as protocol-aware
-  recovery keeps its metainformation twice (06 §C.c, item 5), or whether recovering a
-  damaged hard state from peers suffices.
+  recovery keeps its metainformation twice (06 §C.c, item 5). The persist record holds the
+  last frame's hard states a second time; a hard state in an interior frame that is damaged
+  still makes the log refuse to open.

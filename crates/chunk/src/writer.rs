@@ -957,12 +957,27 @@ impl<F: BlockFile> Writer<F> {
         Ok(())
     }
 
-    /// Encodes each region straight into an aligned buffer of its size, writes it, appends
-    /// the batch's index frame and flushes once.
+    /// Encodes each region straight into an aligned buffer of its size and the batch's index
+    /// frame after them, writes them all at once, and flushes once. The flush makes every one
+    /// durable, and until it does they reach the device in any order however they are issued,
+    /// so issuing them together changes nothing recovery sees. The frame written after the
+    /// records made a 32 MiB batch 1.9 ms slower, and written beside them nothing
+    /// (docs/measurements/2026-09-29-frame-overlap.md).
     fn write_batch(&mut self, layout: &Layout, payloads: &[Payload]) -> Result<(), ChunkError> {
         let started = std::time::Instant::now();
         let geometry = self.shared.geometry;
         let block = geometry.block_usize();
+        let align = self.shared.file.alignment();
+        let group = self.cursor.lsn;
+        let mut frames = Vec::with_capacity(2);
+        for (pos, encoded) in self.place_frame(KIND_BATCH, &layout.records, group)?.writes {
+            let mut buf = AlignedBuf::zeroed(encoded.len(), align)
+                .map_err(|e| ChunkError::Device(e.into()))?;
+            buf.extend_from_slice(&encoded)
+                .map_err(|e| ChunkError::Device(e.into()))?;
+            frames.push((geometry.log_offset.saturating_add(pos), buf));
+        }
+        let mut regions = Vec::with_capacity(layout.regions.len());
         for region in &layout.regions {
             let len = usize::try_from(region.end.saturating_sub(region.start))
                 .map_err(|_| ChunkError::Full)?;
@@ -993,13 +1008,14 @@ impl<F: BlockFile> Writer<F> {
                 .segment_offset(region.segment)
                 .and_then(|o| o.checked_add(region.start))
                 .ok_or(ChunkError::Full)?;
-            self.shared
-                .file
-                .write_all_at(buf.as_slice(), at)
-                .map_err(ChunkError::Device)?;
+            regions.push((at, buf));
         }
-        let group = self.cursor.lsn;
-        self.append_frame(KIND_BATCH, &layout.records, group)?;
+        let writes: Vec<(&[u8], u64)> = regions
+            .iter()
+            .map(|(at, buf)| (buf.as_slice(), *at))
+            .chain(frames.iter().map(|(at, buf)| (buf.as_slice(), *at)))
+            .collect();
+        write_together(&self.shared.file, &writes)?;
         self.shared.file.sync_data().map_err(ChunkError::Device)?;
         let took = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.anticipation.served(took);
@@ -1028,8 +1044,26 @@ impl<F: BlockFile> Writer<F> {
         group: u64,
     ) -> Result<(u64, u64), ChunkError> {
         let geometry = self.shared.geometry;
-        let block = geometry.block_usize();
         let align = self.shared.file.alignment();
+        let placed = self.place_frame(kind, records, group)?;
+        for (pos, encoded) in &placed.writes {
+            log::write_frame(&self.shared.file, &geometry, *pos, encoded, align)
+                .map_err(ChunkError::Device)?;
+        }
+        Ok((placed.at, placed.lsn))
+    }
+
+    /// Places one frame in the log, preceded by a wrap frame when it must go around, and
+    /// moves the log's cursor past it. A write that then fails fences the volume, so the
+    /// cursor is not read again before recovery.
+    fn place_frame(
+        &mut self,
+        kind: u16,
+        records: &[LogRecord],
+        group: u64,
+    ) -> Result<Placed, ChunkError> {
+        let geometry = self.shared.geometry;
+        let block = geometry.block_usize();
         let probe = frame::encode(kind, 0, 0, self.shared.volume, records, block)
             .ok_or(ChunkError::Full)?;
         let len = u64::try_from(probe.len()).map_err(|_| ChunkError::Full)?;
@@ -1038,19 +1072,22 @@ impl<F: BlockFile> Writer<F> {
             .place(len, geometry.block, geometry.log_size)
             .ok_or(ChunkError::Full)?;
         let mut lsn = self.cursor.lsn;
+        let mut writes = Vec::with_capacity(2);
         if placement.wrap {
             let wrap = frame::encode(KIND_WRAP, lsn, group, self.shared.volume, &[], block)
                 .ok_or(ChunkError::Full)?;
-            log::write_frame(&self.shared.file, &geometry, self.cursor.pos, &wrap, align)
-                .map_err(ChunkError::Device)?;
+            writes.push((self.cursor.pos, wrap));
             lsn = lsn.saturating_add(1);
         }
         let bytes = frame::encode(kind, lsn, group, self.shared.volume, records, block)
             .ok_or(ChunkError::Full)?;
-        log::write_frame(&self.shared.file, &geometry, placement.at, &bytes, align)
-            .map_err(ChunkError::Device)?;
+        writes.push((placement.at, bytes));
         self.cursor.advance(placement, len, geometry.log_size);
-        Ok((placement.at, lsn))
+        Ok(Placed {
+            writes,
+            at: placement.at,
+            lsn,
+        })
     }
 
     /// Applies a durable batch to the index and segment table, where readers see it.
@@ -1308,6 +1345,57 @@ pub(crate) fn put_of(key: ChunkKey, f: &Fragment, flags: u8, time_ns: u64) -> Lo
         sequence: f.sequence,
         time_ns,
         flags,
+    })
+}
+
+/// A frame placed in the log.
+struct Placed {
+    /// Each frame to write, with its position in the log: a wrap frame first when the log
+    /// goes around, then the frame itself.
+    writes: Vec<(u64, Vec<u8>)>,
+    /// The frame's position and LSN.
+    at: u64,
+    lsn: u64,
+}
+
+/// Writes every `(bytes, offset)` at once: the first on this thread and each other on a thread
+/// of its own, or on this one when no thread can be had. Returns the first failure, after
+/// every write has ended.
+fn write_together<F: BlockFile>(file: &F, writes: &[(&[u8], u64)]) -> Result<(), ChunkError> {
+    let Some((&(bytes, at), rest)) = writes.split_first() else {
+        return Ok(());
+    };
+    let keep = |result: &mut Result<(), ChunkError>, next: Result<(), ChunkError>| {
+        if result.is_ok() {
+            *result = next;
+        }
+    };
+    std::thread::scope(|scope| {
+        let mut result = Ok(());
+        let mut pending = Vec::with_capacity(rest.len());
+        for &(bytes, at) in rest {
+            match std::thread::Builder::new()
+                .spawn_scoped(scope, move || file.write_all_at(bytes, at))
+            {
+                Ok(handle) => pending.push(handle),
+                Err(_) => keep(
+                    &mut result,
+                    file.write_all_at(bytes, at).map_err(ChunkError::Device),
+                ),
+            }
+        }
+        keep(
+            &mut result,
+            file.write_all_at(bytes, at).map_err(ChunkError::Device),
+        );
+        for handle in pending {
+            let joined = match handle.join() {
+                Ok(written) => written.map_err(ChunkError::Device),
+                Err(_) => Err(ChunkError::Internal("a write thread unwound")),
+            };
+            keep(&mut result, joined);
+        }
+        result
     })
 }
 

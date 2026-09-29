@@ -83,9 +83,13 @@ Remaining before it is done:
   layer, each point in rounds until its throughput is within ±5% at 95% confidence or six
   rounds have run, stating the interval it reached
   ([measurements](measurements/2026-09-29-chunk-store-rounds.md)). Remaining: large puts
-  brought closer to the device's durable bandwidth (8 MiB puts at 65–69% of it), and the
-  step and round counts from a dimensioning run, with results that alternate between two
-  states reported per state (docs/research/11 §16.3).
+  brought closer to the device's durable bandwidth. 8 MiB puts reach about 69% of it now
+  that a batch's frame is written beside its records
+  ([measurements](measurements/2026-09-29-frame-overlap.md)); the flush is most of the
+  rest, and overlapping one batch's writes with the last one's flush needs recovery to
+  allow more than one unfinished batch. Also remaining: the step and round counts from a
+  dimensioning run, with results that alternate between two states reported per state
+  (docs/research/11 §16.3).
 - The group-commit wait for submitters slower than half a batch, from the measured
   distribution of their return times (docs/research/11 §2.6), once real clients supply it.
 - Device health in how writes are placed and when a device is drained (docs/research/10).

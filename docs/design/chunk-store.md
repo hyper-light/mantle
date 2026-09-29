@@ -137,10 +137,13 @@ than the byte bound is admitted into a queue holding no other payload, and one n
 can hold is refused as `TooLarge` before it is queued. The cleaner's relocations, one batch
 at a time, pass beside the bound. The loop takes every request that arrived while the
 previous batch was being made durable,
-lays the data records into the open segment for their stream, appends one index frame,
-issues the writes, then **one** flush of the volume (`sync_data`: `fdatasync`,
-`F_FULLFSYNC`, `FlushFileBuffers`), and only then acknowledges every request in the batch
-and publishes the new index entries to readers. There is no artificial delay [research/03
+lays the data records into the open segment for their stream, encodes one index frame,
+issues all of the batch's writes at once, then **one** flush of the volume (`sync_data`:
+`fdatasync`, `F_FULLFSYNC`, `FlushFileBuffers`), and only then acknowledges every request
+in the batch and publishes the new index entries to readers. Until the flush, a batch's
+writes reach the device in any order however they are issued. Issuing the frame after the
+records made a 32 MiB batch a fifth slower, and issuing it beside them costs nothing
+measurable (docs/measurements/2026-09-29-frame-overlap.md). There is no artificial delay [research/03
 G6]: under light load a batch is one request, under heavy load it is everything queued.
 On the development machine a durable flush costs ~4.7 ms whatever its size
 (docs/measurements), so this loop is what turns 245 flushes/s into tens of thousands of

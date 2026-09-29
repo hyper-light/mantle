@@ -21,7 +21,10 @@ pub mod commit;
 pub mod file;
 pub mod histogram;
 pub mod identity;
+#[cfg(all(target_vendor = "apple", any(test, feature = "sim")))]
+pub mod image;
 pub mod measure;
+mod node;
 pub mod probe;
 pub mod rounds;
 pub mod scratch;
@@ -52,4 +55,7 @@ pub enum DiskError {
     },
     #[error(transparent)]
     Buf(#[from] buf::BufError),
+    /// Storage mantle cannot write as it must, refused before any write.
+    #[error("{}: {reason}", path.display())]
+    Unsupported { path: PathBuf, reason: &'static str },
 }

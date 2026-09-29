@@ -14,6 +14,8 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 UNSAFE_ALLOWED = {
     "crates/disk/src/probe/macos.rs": "IOKit and CoreFoundation (device identification)",
     "crates/disk/src/probe/windows.rs": "volume management and IOCTL_STORAGE_QUERY_PROPERTY (device identification)",
+    "crates/disk/src/node/macos.rs": "the disk ioctls of <sys/disk.h> (a device node's capacity and cache flush)",
+    "crates/disk/src/node/windows.rs": "IOCTL_DISK_GET_LENGTH_INFO (a device's capacity)",
 }
 
 ALLOW_UNSAFE = re.compile(r"allow\s*\(\s*unsafe_code\s*\)")

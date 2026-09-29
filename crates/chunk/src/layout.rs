@@ -95,8 +95,9 @@ impl Default for Reads {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
-    /// Bytes per segment, fixed at format. 256 MiB matches host-managed SMR zones and is in
-    /// the range of ZNS zone capacities (docs/design/chunk-store.md §2).
+    /// Bytes per segment, fixed at format. 256 MiB is the zone size of host-managed SMR
+    /// drives and in the range of ZNS zone capacities, though the volume has no zone backend
+    /// and a host-managed device is refused (docs/design/chunk-store.md §2).
     pub segment_size: u64,
     /// log2 of the checksum block size of data records; 16 is 64 KiB (Ghemawat et al.,
     /// SOSP 2003, §5.2).

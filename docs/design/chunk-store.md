@@ -35,10 +35,20 @@ All offsets and lengths are multiples of the volume's block size `B`: the larger
 
 The two superblocks sit 16 MiB apart because latent sector errors cluster within 10 MB
 [BGPS07 §5]; the current one is the valid copy with the higher sequence [RO92, checkpoint
-regions]. `S` defaults to 256 MiB — the zone size of host-managed SMR drives and in the
-range of ZNS zone capacities, so segments map 1:1 onto zones [BAH+21 §2.3; AD15] — and is
-a volume parameter fixed at format. `L` is fixed at format so that three index
-checkpoints of the volume's chunk budget fit (§5).
+regions]. `S` defaults to 256 MiB, the zone size of host-managed SMR drives and in the
+range of ZNS zone capacities [BAH+21 §2.3; AD15], and is a volume parameter fixed at
+format. A segment the size of a zone is what a zoned backend would map one to one, but the
+volume has none: its superblocks, circular index log and reused segments rewrite earlier
+offsets, which a host-managed zoned device refuses. Such a device node, and a zonefs file,
+is therefore refused when it is opened, before any write; a file system mounted over a
+zoned device places its own writes (audit B10; research/02 §6.4a). `L` is fixed at format
+so that three index checkpoints of the volume's chunk budget fit (§5).
+
+A volume on a raw device takes the device's capacity as its length and the device's own
+full flush as its flush: `lseek` to the end and `fdatasync` on Linux, the disk ioctls on
+macOS (where `F_FULLFSYNC` fails on a device node), `IOCTL_DISK_GET_LENGTH_INFO` and
+`FlushFileBuffers` on Windows (research/02 §6.4a). Read as a file, a node's length is zero,
+and recovery would find no superblock (audit §6.2).
 
 A volume is laid out at its full size when it is formatted. Where the file system journals
 the conversion of an extent on its first write, a durable write into preallocated space

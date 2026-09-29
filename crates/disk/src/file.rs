@@ -9,6 +9,10 @@
 //! source (library/std/src/sys/fs/{unix,windows}.rs): `fdatasync(2)` on Linux,
 //! `fcntl(F_FULLFSYNC)` on macOS (plain fsync(2) there leaves data in the drive's volatile
 //! cache, per Apple's fsync(2) man page), and `FlushFileBuffers` on Windows.
+//!
+//! The path may also name a device node, a disk or partition written directly: its length
+//! and full flush are then the device's (`crate::node`). A device that refuses writes out of
+//! a zone's order is refused at open, before any write (`refuse_zones`).
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -16,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use crate::DiskError;
 use crate::buf::Alignment;
+use crate::identity::{FileSystemKind, Zoned};
 
 /// Whether transfers bypass the OS page cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +43,8 @@ pub struct DeviceFile {
     path: PathBuf,
     caching: Caching,
     align: Alignment,
+    /// A device node rather than a regular file.
+    node: bool,
 }
 
 impl DeviceFile {
@@ -56,26 +63,30 @@ impl DeviceFile {
             let path = path.to_path_buf();
             move |source| DiskError::Io { op, path, source }
         };
-        if request == CachingRequest::PreferDirect {
-            match sys::open_direct(path, create) {
-                Ok(file) => {
-                    return Ok(Self {
-                        file,
-                        path: path.to_path_buf(),
-                        caching: Caching::Direct,
-                        align,
-                    });
-                }
-                Err(e) if sys::refuses_direct(&e) => {}
+        let (file, caching, align) = match request {
+            CachingRequest::PreferDirect => match sys::open_direct(path, create) {
+                Ok(file) => (file, Caching::Direct, align),
+                Err(e) if sys::refuses_direct(&e) => (
+                    options(create).open(path).map_err(wrap("open"))?,
+                    Caching::Buffered,
+                    Alignment::BYTE,
+                ),
                 Err(e) => return Err(wrap("open")(e)),
-            }
-        }
-        let file = options(create).open(path).map_err(wrap("open"))?;
+            },
+            CachingRequest::Buffered => (
+                options(create).open(path).map_err(wrap("open"))?,
+                Caching::Buffered,
+                Alignment::BYTE,
+            ),
+        };
+        let node = crate::node::is_node(&file, path).map_err(wrap("stat"))?;
+        refuse_zones(path, node)?;
         Ok(Self {
             file,
             path: path.to_path_buf(),
-            caching: Caching::Buffered,
-            align: Alignment::BYTE,
+            caching,
+            align,
+            node,
         })
     }
 
@@ -147,18 +158,32 @@ impl DeviceFile {
 
     /// Makes every completed write durable, including the device's volatile cache.
     pub fn sync_data(&self) -> Result<(), DiskError> {
-        self.file
-            .sync_data()
-            .map_err(|e| self.io_error("sync_data", e))
+        let synced = if self.node {
+            crate::node::sync(&self.file)
+        } else {
+            self.file.sync_data()
+        };
+        synced.map_err(|e| self.io_error("sync_data", e))
     }
 
     /// Reserves space so the file is `len` bytes long with its blocks allocated. Only for a
-    /// file that is still empty (see `sys::preallocate`).
+    /// file that is still empty (see `sys::preallocate`); a device node's space is the
+    /// device's, and is not allocated.
     pub fn preallocate(&self, len: u64) -> Result<(), DiskError> {
+        if self.node {
+            return Err(DiskError::Unsupported {
+                path: self.path.clone(),
+                reason: "a device node is not allocated: its space is the device's",
+            });
+        }
         sys::preallocate(&self.file, len).map_err(|e| self.io_error("preallocate", e))
     }
 
+    /// The file's length, or a device node's capacity.
     pub fn len(&self) -> Result<u64, DiskError> {
+        if self.node {
+            return crate::node::len(&self.file).map_err(|e| self.io_error("device size", e));
+        }
         self.file
             .metadata()
             .map(|m| m.len())
@@ -213,6 +238,37 @@ impl DeviceFile {
                 format!("transfer at {offset} passes the largest file offset"),
             ),
         )
+    }
+}
+
+/// Refuses what cannot hold a `DeviceFile` (audit B10). Mantle writes anywhere in the file:
+/// superblocks, a circular index log and reused segments all rewrite earlier offsets. A
+/// host-managed zoned device refuses a write anywhere but at its zone's write pointer
+/// (ZBC/ZAC, as Linux's zonefs documentation summarizes), and every zonefs file is a zone.
+/// A file on a file system over such a device is placed by that file system.
+fn refuse_zones(path: &Path, node: bool) -> Result<(), DiskError> {
+    match zone_refusal(&crate::probe::identify(path), node) {
+        Some(reason) => Err(DiskError::Unsupported {
+            path: path.to_path_buf(),
+            reason,
+        }),
+        None => Ok(()),
+    }
+}
+
+fn zone_refusal(id: &crate::identity::Identity, node: bool) -> Option<&'static str> {
+    if node && id.zoned == Zoned::HostManaged {
+        Some(
+            "a host-managed zoned device takes writes only in each zone's order, and mantle \
+             has no zone backend",
+        )
+    } else if id.file_system.kind == FileSystemKind::Zonefs {
+        Some(
+            "a zonefs file is a zone, written only at its write pointer, and mantle has no \
+             zone backend",
+        )
+    } else {
+        None
     }
 }
 
@@ -354,9 +410,61 @@ mod sys {
 mod tests {
     use super::*;
     use crate::buf::AlignedBuf;
+    use crate::identity::{FileSystem, Identity};
 
     fn align() -> Alignment {
         Alignment::new(4096).unwrap()
+    }
+
+    /// A host-managed device node and a zonefs file are refused; a file on a file system
+    /// over a zoned device, and a host-aware device, which takes writes anywhere, are not
+    /// (audit B10).
+    #[test]
+    fn storage_that_takes_writes_only_in_zone_order_is_refused() {
+        let id = |kind: FileSystemKind, zoned: Zoned| {
+            let mut id = Identity::unknown(FileSystem {
+                kind,
+                block_size: None,
+                total_bytes: None,
+                available_bytes: None,
+            });
+            id.zoned = zoned;
+            id
+        };
+        let refused = |kind, zoned, node| zone_refusal(&id(kind, zoned), node).is_some();
+        assert!(refused(FileSystemKind::Device, Zoned::HostManaged, true));
+        assert!(refused(FileSystemKind::Zonefs, Zoned::HostManaged, false));
+        assert!(!refused(FileSystemKind::Btrfs, Zoned::HostManaged, false));
+        assert!(!refused(FileSystemKind::F2fs, Zoned::HostManaged, false));
+        assert!(!refused(FileSystemKind::Device, Zoned::HostAware, true));
+        assert!(!refused(FileSystemKind::Device, Zoned::None, true));
+        assert!(!refused(FileSystemKind::Device, Zoned::Unknown, true));
+    }
+
+    /// A device node's length is its device's capacity, it takes aligned writes and reads
+    /// like a file, and its flush reaches the device (macOS: a disk image's node, where
+    /// F_FULLFSYNC fails and the length of a node reads zero).
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_device_node_has_its_devices_length_and_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = crate::image::DiskImage::attach(dir.path(), 16).unwrap();
+        let file =
+            DeviceFile::open(image.node(), false, CachingRequest::PreferDirect, align()).unwrap();
+        assert_eq!(file.len().unwrap(), 16 << 20);
+        let pattern: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+        let mut out = AlignedBuf::zeroed(8192, align()).unwrap();
+        out.extend_from_slice(&pattern).unwrap();
+        file.write_all_at(out.as_slice(), 1 << 20).unwrap();
+        file.sync_data().unwrap();
+        let mut back = AlignedBuf::zeroed(8192, align()).unwrap();
+        file.read_exact_at(back.as_mut_capacity(), 1 << 20).unwrap();
+        back.set_len(8192).unwrap();
+        assert_eq!(back.as_slice(), pattern.as_slice());
+        assert!(matches!(
+            file.preallocate(1 << 20),
+            Err(DiskError::Unsupported { .. })
+        ));
     }
 
     #[test]

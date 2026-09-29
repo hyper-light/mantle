@@ -1116,6 +1116,53 @@ All probes run on a scratch file inside the data directory and have a bounded ti
 - **Preallocation:** `FileAllocationInfo` + `FileEndOfFileInfo`. Then either `SetFileValidData`, only if `SeManageVolumePrivilege` can be enabled *and* the file's ACL is restricted, or a one-time sequential zero write. Either way, later writes stay inside the VDL, which avoids the synchronous extend-and-zero-fill path (§4.7).
 - **Rename or replace:** `MoveFileExW(…, MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)`, or `FileRenameInfoEx` with `REPLACE_IF_EXISTS|POSIX_SEMANTICS` on a handle opened with `DELETE | FILE_FLAG_WRITE_THROUGH`. Crash-test it.
 
+### 6.4a Device nodes opened directly
+
+A volume may be a whole disk or partition opened by its node (`/dev/nvme0n1`, `/dev/disk4`,
+`\\.\PhysicalDrive1`) rather than a file. Three things differ from a file.
+
+- **Identity.** A node's own device number is `st_rdev`; `st_dev` names the file system that
+  holds the node (devtmpfs on Linux, devfs on macOS), so the path-to-device walk of §2.1 and
+  §3.1 describes the wrong device and, on Linux, classifies a node as tmpfs memory. A node is
+  looked up by `st_rdev` in sysfs (§2.1) and by its own BSD name in the I/O Registry (§3.2;
+  the raw `/dev/rdiskN` names the same media as `/dev/diskN`). A partition node addresses
+  only its partition, so its size is the partition's `size` attribute while its queue
+  attributes are the disk's. On Windows a device path begins `\\.\` [doc] (W, *Naming
+  Files, Paths, and Namespaces*: the prefix "will access the Win32 device namespace instead
+  of the Win32 file namespace"), and the handle answers the same
+  IOCTL_STORAGE_QUERY_PROPERTY queries as a volume handle (§4.2).
+- **Length.** `stat` gives a node no size. On a disk image's node on the research machine,
+  both `st_size` and `lseek(fd, 0, SEEK_END)` returned 0 [obs]. Linux block device files
+  answer `lseek(SEEK_END)` with the device's size (`block/fops.c`, `blkdev_llseek` →
+  `fixed_size_llseek(..., bdev_nr_bytes(bdev))`) [src]; `BLKGETSIZE64` gives the same (§2.6).
+  macOS gives it as `DKIOCGETBLOCKCOUNT` × `DKIOCGETBLOCKSIZE` (§3.5): 32,768 × 512 bytes for
+  a 16 MiB image [obs]. Windows gives it as IOCTL_DISK_GET_LENGTH_INFO
+  (`GET_LENGTH_INFORMATION.Length`), which needs a handle with read access (its control code
+  is `FILE_READ_ACCESS`) [doc].
+- **Full flush.** On Linux, `fdatasync` of a block device file writes the device's cached
+  pages and then issues a cache flush to the device (`block/fops.c`, `blkdev_fsync` →
+  `blkdev_issue_flush`) [src]. On macOS, `F_FULLFSYNC` "is currently implemented on HFS,
+  MS-DOS (FAT), Universal Disk Format (UDF) and APFS file systems" (A1), and on a device node
+  it fails with `ENOTTY` [obs, `/dev/disk4` and `/dev/rdisk4`]. xnu's own description of the
+  file-system implementation is "fsync + flush the journal + DKIOCSYNCHRONIZE" (A8), so a
+  node's equivalent is `fsync` (which writes the node's cached blocks) followed by
+  `DKIOCSYNCHRONIZE` over the whole media: a zeroed `dk_synchronize_t` (offset and length 0,
+  no `DK_SYNCHRONIZE_OPTION_BARRIER`). Both it and the older `DKIOCSYNCHRONIZECACHE`
+  (`_IO('d', 22)`) succeed on a disk image's nodes [obs]. On Windows, `FlushFileBuffers` on a
+  disk or volume handle becomes IRP_MJ_FLUSH_BUFFERS, whose drivers "transfer any data
+  currently cached in the device" (W22); it needs `GENERIC_WRITE` (W20). That this reaches a
+  physical drive's cache on every Windows storage path is **UNVERIFIED** until tested on a
+  Windows host.
+- **Privilege.** IOMediaBSDClient's `owner-uid` override (§3.5) is what hdiutil(1) uses: a disk
+  image attached by a user, with `attach -nomount`, gets `/dev/diskN` and `/dev/rdiskN`
+  owned by that user, mode 0640 [obs]. Tests therefore reach a real macOS
+  block device without root.
+- **Zones.** A host-managed zoned device refuses writes that are not at a zone's write
+  pointer (§2.4 `zoned`; zonefs documents the same rule for its sequential files, L-zonefs).
+  A file system mounted over such a device places its own writes; zonefs does not, since each
+  of its files is a zone. Storage that writes a superblock pair, a circular index log and
+  reused segments in place cannot be one of these without a zone backend.
+
 ### 6.5 Defaults when detection fails
 
 - **Alignment:** 4096 bytes on Linux and Windows, 16 KiB on Apple Silicon for the `F_NOCACHE` direct path. If direct I/O fails, use buffered I/O.

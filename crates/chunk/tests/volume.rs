@@ -121,6 +121,61 @@ fn chunks_read_back_exactly_on_a_real_file() {
     }
 }
 
+/// A volume on a raw device, the device's whole capacity, reopens with its chunks: the
+/// node's length is the device's, so recovery finds the superblocks, and its flush reaches
+/// the device (audit §6.2).
+fn a_volume_on_a_raw_device_reopens(node: &std::path::Path) {
+    let open = || {
+        DeviceFile::open(
+            node,
+            false,
+            CachingRequest::PreferDirect,
+            Alignment::new(4096).unwrap(),
+        )
+        .unwrap()
+    };
+    let file = open();
+    let size = file.len().unwrap();
+    assert!(size >= 16 << 20, "{size}");
+    let v = Volume::format(file, size, config()).unwrap();
+    for n in 0..20u64 {
+        v.put(key(n), &data(n, 10_000 + n as usize)).unwrap();
+    }
+    v.delete(key(3)).unwrap();
+    v.close();
+    let (v, _) = Volume::open(open(), config()).unwrap();
+    for n in 0..20u64 {
+        if n == 3 {
+            assert!(v.stat(&key(n)).unwrap().is_none());
+            continue;
+        }
+        assert_eq!(
+            v.read(&key(n), 0, 10_000 + n).unwrap(),
+            data(n, 10_000 + n as usize)
+        );
+    }
+}
+
+/// macOS: an attached disk image's node, which the attaching user owns.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_volume_on_a_raw_device_reopens_with_its_chunks() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = mantle_disk::image::DiskImage::attach(dir.path(), 16).unwrap();
+    a_volume_on_a_raw_device_reopens(image.node());
+}
+
+/// Linux: a block device named by `MANTLE_TEST_BLOCK_DEVICE`, whose contents the test
+/// destroys; a loop device over a scratch file serves (`losetup --find --show FILE`, as
+/// root). Opening a block device needs a privilege a test run does not have by default.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs MANTLE_TEST_BLOCK_DEVICE, a block device it may overwrite"]
+fn a_volume_on_a_linux_block_device_reopens_with_its_chunks() {
+    let device = std::env::var_os("MANTLE_TEST_BLOCK_DEVICE").unwrap();
+    a_volume_on_a_raw_device_reopens(std::path::Path::new(&device));
+}
+
 #[test]
 fn appends_grow_a_chunk_until_it_is_sealed() {
     let v = Volume::format(sim(2), SIZE, config()).unwrap();

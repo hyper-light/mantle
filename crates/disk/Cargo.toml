@@ -10,7 +10,8 @@ repository.workspace = true
 publish.workspace = true
 
 [features]
-# The simulated power-loss file, for other crates' tests.
+# Test support for other crates: the simulated power-loss file and, on macOS, a disk image
+# attached as a device node.
 sim = []
 
 [dependencies]

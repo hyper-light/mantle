@@ -7,7 +7,9 @@
 //! "Physical Interconnect Location"), the keys of IOKit's IOStorageDeviceCharacteristics.h
 //! and IOStorageProtocolCharacteristics.h. An APFS volume sits on a synthesized container
 //! disk, so the characteristics are found by searching the volume's ancestors
-//! (IORegistryEntrySearchCFProperty with kIORegistryIterateParents).
+//! (IORegistryEntrySearchCFProperty with kIORegistryIterateParents). A device node is the
+//! device itself, found by its own BSD name: statfs(2) of a node describes devfs, which holds
+//! it.
 #![allow(unsafe_code)]
 
 use std::ffi::{CStr, CString, c_char, c_void};
@@ -202,6 +204,14 @@ fn boolean(cf: CFTypeRef) -> Option<bool> {
 }
 
 pub fn identify(path: &Path) -> Identity {
+    if let Ok(stat) = rustix::fs::stat(path)
+        && matches!(
+            rustix::fs::FileType::from_raw_mode(stat.st_mode),
+            rustix::fs::FileType::BlockDevice | rustix::fs::FileType::CharacterDevice
+        )
+    {
+        return node(path);
+    }
     let (file_system, device) = match rustix::fs::statfs(path) {
         Ok(fs) => {
             let name = c_chars(&fs.f_fstypename);
@@ -237,10 +247,45 @@ pub fn identify(path: &Path) -> Identity {
         );
         return identity;
     };
+    describe(bsd, &mut identity);
+    identity
+}
+
+/// A device node: the disk or partition it names, whose size is what the node addresses.
+fn node(path: &Path) -> Identity {
+    let mut identity = Identity::unknown(FileSystem {
+        kind: FileSystemKind::Device,
+        block_size: None,
+        total_bytes: None,
+        available_bytes: None,
+    });
+    // The node's own name, links resolved, is its BSD name; a disk's raw (character) node is
+    // its block node's name after an "r", `rdisk4` beside `disk4`.
+    let name = match std::fs::canonicalize(path) {
+        Ok(real) => real
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        Err(e) => {
+            identity.note(format!("resolve {}", path.display()), e.to_string());
+            return identity;
+        }
+    };
+    let bsd = name
+        .strip_prefix('r')
+        .filter(|n| n.starts_with("disk"))
+        .unwrap_or(&name);
+    describe(bsd, &mut identity);
+    identity.file_system.total_bytes = identity.size_bytes;
+    identity
+}
+
+/// Fills `identity` from the I/O Registry entry of BSD device `bsd` and its ancestors.
+fn describe(bsd: &str, identity: &mut Identity) {
     identity.device = Some(bsd.to_owned());
     let Some(media) = Service::for_bsd_name(bsd) else {
         identity.note(format!("IOBSDNameMatching {bsd}"), "no registry entry");
-        return identity;
+        return;
     };
     identity.logical_block = media
         .property("Preferred Block Size")
@@ -280,7 +325,6 @@ pub fn identify(path: &Path) -> Identity {
     // F_FULLFSYNC always asks the drive to empty its cache (fcntl(2)); whether the drive
     // has a volatile one is not in the registry.
     identity.write_cache = WriteCache::Unknown;
-    identity
 }
 
 fn interconnect_of(interconnect: Option<&str>, location: Option<&str>) -> Interconnect {
@@ -386,6 +430,30 @@ mod tests {
         assert_eq!(id.file_system.kind, FileSystemKind::Hfs);
         assert_eq!(id.interconnect, Interconnect::Virtual, "{id:#?}");
         assert!(id.device.as_deref().is_some_and(|d| d.starts_with("disk")));
+    }
+
+    /// A device node is the device it names, not devfs, which holds it; its raw (character)
+    /// node names the same disk.
+    #[test]
+    fn a_device_node_is_the_device_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = crate::image::DiskImage::attach(dir.path(), 16).unwrap();
+        let bsd = image
+            .node()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let raw = image.node().with_file_name(format!("r{bsd}"));
+        for node in [image.node(), raw.as_path()] {
+            let id = identify(node);
+            assert_eq!(id.file_system.kind, FileSystemKind::Device, "{id:#?}");
+            assert_eq!(id.device.as_deref(), Some(bsd.as_str()));
+            assert_eq!(id.size_bytes, Some(16 << 20));
+            assert_eq!(id.file_system.total_bytes, Some(16 << 20));
+            assert_eq!(id.interconnect, Interconnect::Virtual);
+        }
     }
 
     #[test]

@@ -60,21 +60,25 @@ fn log_config() -> LogConfig {
         segment_bytes: 16 * 4096,
         max_segments: 64,
         max_groups: 4,
-        group_entries: 1 << 16,
-        group_bytes: 1 << 24,
+        group_entries: 1 << 10,
+        group_bytes: 4 << 10,
         group_cache: 1 << 12,
         queue_submissions: 16,
         queue_bytes: 1 << 20,
     }
 }
 
+/// Bounds small enough that a group's retained entries meet the log's bound between
+/// compactions, so readies wait for room and the node compacts to go on (audit S04): a ready
+/// is 3 KiB at most, which the log's bounds on a group hold.
 const SETTINGS: Settings = Settings {
     election_tick: 10,
     heartbeat_tick: 2,
-    max_size_per_msg: 1 << 16,
-    max_inflight_msgs: 16,
-    max_uncommitted_size: 1 << 20,
+    max_size_per_msg: 1 << 10,
+    max_inflight_msgs: 2,
+    max_uncommitted_size: 2 << 10,
     max_committed_size_per_ready: 1 << 20,
+    max_entry_bytes: 1 << 10,
 };
 
 /// The engine of a cell's first Name range, before any entry: its lineage, holding every key.
@@ -271,6 +275,8 @@ struct World {
     lose_at: u64,
     /// Replacements finished.
     replaced: u64,
+    /// Readies the log refused for want of room, each waited out by compacting.
+    stalls: u64,
 }
 
 impl World {
@@ -307,6 +313,7 @@ impl World {
             lost: 0,
             lose_at,
             replaced: 0,
+            stalls: 0,
         }
     }
 
@@ -429,7 +436,7 @@ impl World {
             Next::Propose(change) => {
                 if sent.is_none_or(|at| now - at >= PATIENCE) {
                     match leader.propose_change(&change) {
-                        Ok(()) | Err(ReplicaError::Refused(_)) => {}
+                        Ok(()) | Err(ReplicaError::Refused(_) | ReplicaError::Stalled) => {}
                         Err(e) => panic!("propose a change: {e}"),
                     }
                     self.replacing = Some((replacement, Some(now)));
@@ -454,6 +461,8 @@ impl World {
                 && match receiver.and_then(|n| n.replica.as_mut()) {
                     Some(r) => match r.step(m) {
                         Ok(()) | Err(ReplicaError::Refused(_)) => true,
+                        // A member waiting for room in its log takes no message.
+                        Err(ReplicaError::Stalled) => false,
                         Err(e) => panic!("step: {e}"),
                     },
                     None => false,
@@ -467,7 +476,7 @@ impl World {
                     .and_then(|n| n.replica.as_mut())
             {
                 match sender.report_snapshot(to, arrived) {
-                    Ok(()) | Err(ReplicaError::Refused(_)) => {}
+                    Ok(()) | Err(ReplicaError::Refused(_) | ReplicaError::Stalled) => {}
                     Err(e) => panic!("report: {e}"),
                 }
             }
@@ -479,6 +488,7 @@ impl World {
         let mut applied = Vec::new();
         let mut reads = Vec::new();
         let mut stopped = None;
+        let mut waiting = Vec::new();
         for n in &mut self.nodes {
             let Some(r) = n.replica.as_mut() else {
                 continue;
@@ -495,12 +505,32 @@ impl World {
                     break;
                 }
             };
+            if out.stalled.is_some() {
+                waiting.push(n.id);
+            }
             sent.extend(out.messages);
             applied.extend(out.applied);
             reads.extend(out.reads.into_iter().map(|(index, ctx)| (n.id, index, ctx)));
         }
         if let Some(what) = stopped {
             self.fail(&what);
+        }
+        // A ready waits for room in its member's log: the member compacts, and its next drive
+        // writes the ready.
+        for id in waiting {
+            self.stalls += 1;
+            let keep = self.rng.below(8);
+            let Some(n) = self.nodes.iter_mut().find(|n| n.id == id) else {
+                continue;
+            };
+            let Some(r) = n.replica.as_mut() else {
+                continue;
+            };
+            match r.compact(keep) {
+                Ok(()) => {}
+                Err(ReplicaError::Log(_)) => n.crash(),
+                Err(e) => self.fail(&format!("compact on {id}: {e}")),
+            }
         }
         for m in sent {
             let delay = 1 + self.rng.below(if self.faults { 6 } else { 2 });
@@ -732,7 +762,7 @@ impl World {
             };
             if let Some(leader) = self.leader() {
                 match leader.propose(&entry) {
-                    Ok(()) | Err(ReplicaError::Refused(_)) => {}
+                    Ok(()) | Err(ReplicaError::Refused(_) | ReplicaError::Stalled) => {}
                     Err(e) => panic!("propose: {e}"),
                 }
             }
@@ -741,7 +771,7 @@ impl World {
             && let Some(leader) = self.leader()
         {
             match leader.read_index(context) {
-                Ok(()) | Err(ReplicaError::Refused(_)) => {}
+                Ok(()) | Err(ReplicaError::Refused(_) | ReplicaError::Stalled) => {}
                 Err(e) => panic!("read: {e}"),
             }
         }
@@ -892,7 +922,7 @@ fn versions(m: &Model, key: &str) -> Vec<String> {
 }
 
 /// One run: the replacements it finished.
-fn run(seed: u64) -> u64 {
+fn run(seed: u64) -> (u64, u64) {
     let mut w = World::new(seed);
     for _ in 0..3_000 {
         w.step();
@@ -944,7 +974,7 @@ fn run(seed: u64) -> u64 {
             other => w.fail(&format!("{key}: {other:?} over {} operations", ops.len())),
         }
     }
-    w.replaced
+    (w.replaced, w.stalls)
 }
 
 #[test]
@@ -958,12 +988,18 @@ fn a_group_under_faults_is_linearizable_and_applies_every_put_once() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
     let mut replaced = 0;
+    let mut stalls = 0;
     for seed in first..first + seeds {
         // A member is lost within the faults of every run, and the run settles only once its
         // replacement finishes.
-        let run_replaced = run(seed);
+        let (run_replaced, run_stalls) = run(seed);
         assert!(run_replaced >= 1, "seed {seed} replaced no member");
         replaced += run_replaced;
+        stalls += run_stalls;
     }
-    eprintln!("{seeds} runs replaced {replaced} members lost for good");
+    // Readies waited for room and the members went on: the path audit S04 found stranded.
+    assert!(stalls > 0, "no ready ever waited for room");
+    eprintln!(
+        "{seeds} runs replaced {replaced} members lost for good; {stalls} readies waited for room"
+    );
 }

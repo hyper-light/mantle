@@ -20,6 +20,10 @@ pub struct LogStore<F: BlockFile + 'static> {
 }
 
 /// An entry's bytes in the log.
+/// Bytes an entry's encoding adds to its data and context: its kind and the context's
+/// length.
+pub const ENTRY_OVERHEAD: usize = 5;
+
 pub fn encode_entry(e: &Entry) -> Option<Vec<u8>> {
     let kind = u8::try_from(e.entry_type).ok()?;
     let context_len = u32::try_from(e.context.len()).ok()?;

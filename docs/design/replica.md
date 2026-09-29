@@ -69,8 +69,20 @@ For each `Ready` the core gives, the replica does these steps in order:
    Ongaro's §10.2.1 optimization (06 §A1.9).
 3. Submits the `Ready`'s entries, hard state, snapshot point and fast-track proposals to the
    log as one update (raft-log.md §2), and waits for it to be durable. The log waits for
-   room rather than refusing a replica's update, since the core takes no other call while
-   a `Ready` is out (raft-log.md §3).
+   room in its queue rather than refusing a replica's update, since the core takes no other
+   call while a `Ready` is out (raft-log.md §3). An update larger than a frame goes in parts
+   that each fit, its entries first and its hard state last, the order etcd's raft writes a
+   `Ready` in when the store cannot write it atomically (06 §A10.3); the `Ready` is done once
+   every part is durable, so a crash between parts leaves entries never acknowledged.
+
+   The log may still refuse a part for want of room another write frees: the group retains
+   past its bound, every segment holds live records, or the log holds all the groups it
+   may. Then the `Ready` waits in the replica, whole, with its parts not yet written, and
+   `drive` reports the refusal. The `Ready`'s committed entries are applied at once, since
+   the core gives out only entries committed and durable, so the group can compact past
+   them. Until the node frees room, compacting the group or its neighbours on the log, and
+   drives again, the replica refuses every call with `Stalled` and lets no tick move its
+   timers: a member waiting for room takes no part in the group.
 4. Sends the messages that must follow durability: a follower's acknowledgements and votes.
 5. Applies the committed entries (§2).
 6. Tells the core, which may hand over more committed entries and messages.
@@ -79,6 +91,15 @@ The transport tells the sending replica whether each snapshot arrived. A leader 
 replicating to a member while that member's snapshot is out, so a lost snapshot left
 unreported would stall the member for good; the simulation found this. A snapshot's own
 stream always learns its fate.
+
+**Bounds a member checks at open.** Every member of a range runs the same settings, so an
+entry the leader takes must fit one frame of every member's log: the range bounds an entry
+(`max_entry_bytes`), the leader refuses a larger proposal, and a member whose log's frame
+cannot hold one refuses to open. A group compacted to its applied state retains at most one
+`Ready`'s entries, a leader's uncommitted proposals or the appends in flight to a follower,
+and one entry past either bound, which the core admits alone; a member whose log bounds a
+group below that, in bytes or in entries of the fewest bytes, refuses to open, since a
+`Ready` refused for room there could wait for good.
 
 ## 4. Compaction, snapshots and restart
 

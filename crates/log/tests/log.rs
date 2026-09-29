@@ -862,12 +862,27 @@ impl Gated {
         self.changed.notify_all();
     }
 
+    /// Shuts the gate until the guard is dropped, as a failing test's unwinding drops it too,
+    /// so a log dropped after it never waits on a writer held at the gate.
+    fn shut(self: &Arc<Self>) -> Shut {
+        self.set(false);
+        Shut(Arc::clone(self))
+    }
+
     /// Waits until a flush is held at the shut gate.
     fn held(&self) {
         let mut gate = self.gate.lock().unwrap();
         while gate.1 == 0 {
             gate = self.changed.wait(gate).unwrap();
         }
+    }
+}
+
+struct Shut(Arc<Gated>);
+
+impl Drop for Shut {
+    fn drop(&mut self) {
+        self.0.set(true);
     }
 }
 
@@ -913,7 +928,7 @@ fn a_groups_updates_keep_their_order_when_one_waits_for_room() {
         vote,
         commit: 0,
     };
-    gated.set(false);
+    let shut = gated.shut();
     let first = log
         .submit(
             3,
@@ -958,7 +973,7 @@ fn a_groups_updates_keep_their_order_when_one_waits_for_room() {
             },
         )
         .unwrap();
-    gated.set(true);
+    drop(shut);
     for pending in [first, big, older, newer] {
         pending.wait().unwrap();
     }
@@ -966,6 +981,48 @@ fn a_groups_updates_keep_their_order_when_one_waits_for_room() {
     drop(log);
     let (log, _) = Log::open(Arc::clone(&gated), cfg, ID).unwrap();
     assert_eq!(log.view(1).unwrap().unwrap().hard_state, Some(state(2, 2)));
+}
+
+/// The queue's bound holds everything the writer has not answered: submissions waiting in
+/// the channel, updates held for a later frame and the frame being flushed. A refusal comes
+/// at the bound, never after it (audit S03).
+#[test]
+fn the_queue_bounds_every_submission_not_yet_answered() {
+    let gated = Gated::new(sim(41));
+    let mut cfg = config(16, 8);
+    cfg.queue_submissions = 2;
+    let log = Log::create(Arc::clone(&gated), cfg, ID).unwrap();
+    let small = |term| Update {
+        hard_state: Some(hard(term, 0)),
+        ..Update::default()
+    };
+    let shut = gated.shut();
+    let mut pending = vec![log.submit(1, small(1)).unwrap()];
+    gated.held();
+    // One flush is held: the queue takes one more, from any group, and no third.
+    pending.push(log.submit(2, small(1)).unwrap());
+    assert!(matches!(log.submit(3, small(1)), Err(LogError::Busy)));
+    assert!(matches!(log.submit(1, small(2)), Err(LogError::Busy)));
+    drop(shut);
+    for p in pending.drain(..) {
+        p.wait().unwrap();
+    }
+    // A group holds two submissions at most: the one a frame takes and one for the next.
+    let mut cfg = config(16, 8);
+    cfg.queue_submissions = 8;
+    let gated = Gated::new(sim(42));
+    let log = Log::create(Arc::clone(&gated), cfg, ID).unwrap();
+    let shut = gated.shut();
+    let mut pending = vec![log.submit(1, small(1)).unwrap()];
+    gated.held();
+    pending.push(log.submit(1, small(2)).unwrap());
+    assert!(matches!(log.submit(1, small(3)), Err(LogError::Busy)));
+    pending.push(log.submit(2, small(1)).unwrap());
+    drop(shut);
+    for p in pending {
+        p.wait().unwrap();
+    }
+    assert_eq!(log.view(1).unwrap().unwrap().hard_state, Some(hard(2, 0)));
 }
 
 #[test]
@@ -1181,10 +1238,10 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(200))]
 
-    /// Rounds of updates submitted while the writer is held in a flush, several of a group
-    /// at a time and sized from a few bytes to most of a frame's room, so some wait for room
-    /// behind others: each group's accepted updates become durable in the order submitted,
-    /// as its state before and after reopening shows (audit S02).
+    /// Rounds of updates submitted while the writer is held in a flush, two of a group at a
+    /// time where the queue takes them and sized from a few bytes to most of a frame's room,
+    /// so some wait for room behind others: each group's accepted updates become durable in
+    /// the order submitted, as its state before and after reopening shows (audit S02).
     #[test]
     fn a_groups_queued_updates_become_durable_in_order(
         rounds in prop::collection::vec(
@@ -1205,7 +1262,7 @@ proptest! {
             ..Update::default()
         };
         for round in &rounds {
-            gated.set(false);
+            let shut = gated.shut();
             let plugged = log.submit(99, plug.clone()).unwrap();
             gated.held();
             let mut predicted = models.clone();
@@ -1218,10 +1275,15 @@ proptest! {
                     }
                 }
                 apply(&mut predicted, group, &u);
-                let pending = log.submit(group, u.clone()).unwrap();
+                let pending = match log.submit(group, u.clone()) {
+                    Ok(pending) => pending,
+                    // At the queue's bound, or the group's: refused whole, changing nothing.
+                    Err(LogError::Busy) => continue,
+                    Err(e) => return Err(TestCaseError::fail(format!("{e}"))),
+                };
                 submitted.push((group, u, pending));
             }
-            gated.set(true);
+            drop(shut);
             plugged.wait().unwrap();
             apply(&mut models, 99, &plug);
             for (group, u, pending) in submitted {
@@ -1242,6 +1304,80 @@ proptest! {
         drop(log);
         let (log, recovery) = Log::open(Arc::clone(&gated), cfg, ID).unwrap();
         prop_assert!(recovery.damaged.is_empty());
+        check(&log, &models);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// An update of any size, in parts: each part fits a frame, the hard state comes with or
+    /// after the last entries, and written in order the parts leave the group as the whole
+    /// update would (audit S04).
+    #[test]
+    fn an_update_in_parts_leaves_the_group_as_the_whole_would(
+        held in 0u64..4,
+        sizes in prop::collection::vec(0usize..6_000, 0..40),
+        with_state in any::<bool>(),
+        proposals in prop::collection::vec(0usize..3_000, 0..4),
+        segment_blocks in 4u64..8,
+        seed in any::<u64>(),
+    ) {
+        let file = sim(seed);
+        let cfg = config(segment_blocks, 64);
+        let log = Log::create(Arc::clone(&file), cfg, ID).unwrap();
+        let mut models = Models::new();
+        if held > 0 {
+            let u = Update {
+                entries: Some(entries(1, &vec![1; held as usize])),
+                ..Update::default()
+            };
+            log.write(1, u.clone()).unwrap();
+            apply(&mut models, 1, &u);
+        }
+        let first = held.saturating_sub(1).max(1);
+        let last = first + sizes.len() as u64;
+        let update = Update {
+            entries: Some(Entries {
+                first,
+                entries: sizes
+                    .iter()
+                    .map(|&n| Entry {
+                        term: 2,
+                        bytes: Arc::from(vec![b'e'; n]),
+                    })
+                    .collect(),
+            }),
+            hard_state: with_state.then(|| hard(2, first)),
+            proposals: proposals
+                .iter()
+                .enumerate()
+                .map(|(i, &n)| Proposal {
+                    index: last + 1 + i as u64,
+                    term: 2,
+                    bytes: Arc::from(vec![b'p'; n]),
+                })
+                .collect(),
+            ..Update::default()
+        };
+        let parts = log.parts(1, update.clone()).unwrap();
+        let with_hard = parts.iter().position(|p| p.hard_state.is_some());
+        let last_entries = parts.iter().rposition(|p| p.entries.is_some());
+        if let (Some(h), Some(e)) = (with_hard, last_entries) {
+            prop_assert!(h >= e, "the hard state came before entries");
+        }
+        prop_assert_eq!(
+            parts.iter().filter(|p| p.hard_state.is_some()).count(),
+            usize::from(with_state)
+        );
+        for part in &parts {
+            // A part that did not fit a frame would be refused `TooLarge`.
+            log.write(1, part.clone()).unwrap();
+        }
+        apply(&mut models, 1, &update);
+        check(&log, &models);
+        drop(log);
+        let (log, _) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
         check(&log, &models);
     }
 }

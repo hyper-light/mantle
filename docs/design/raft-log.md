@@ -64,8 +64,11 @@ physical block sizes, as for the chunk store.
     shortens the log again (07 §1.4).
   - `Removed`: the replica left this device, and all of its records are dead.
 
-A replica's `Ready` becomes one submission of all its records, and they go in one frame. The
-frame's single CRC makes them durable together, which meets etcd's rule that entries and
+A replica's `Ready` becomes one submission of all its records, and they go in one frame
+when they fit one. A larger update goes in parts that each fit, entries first and hard state
+last, as etcd's raft writes a `Ready` when its store cannot write atomically (06 §A10.3;
+replica.md §3); the replica's `Ready` is done only once every part is durable. The
+frame's single CRC makes a frame's records durable together, which meets etcd's rule that entries and
 hard state are persisted before the messages that depend on them (06 §C.c, item 1). The log
 stores entries and hard states as the replica gives them. It knows indexes and terms and
 nothing of Raft's message formats, so it depends on no Raft crate.
@@ -74,7 +77,10 @@ nothing of Raft's message formats, so it depends on no Raft crate.
 
 One writer thread per log runs the chunk store's group-commit loop (chunk-store.md §4). A
 bounded queue admits two batches' worth of submissions, by count and bytes, and refuses
-past that with `Busy` [research/11 §4]. The loop takes everything that arrived while the
+past that with `Busy` [research/11 §4]. A submission holds its room until it is answered, so
+the bound covers updates waiting to be taken, those held for a later frame and those being
+written, and each group holds two at most, the two batches' worth of a group that has one
+update in each frame; a hot group waits for its own room and never takes the others'. The loop takes everything that arrived while the
 last batch was being made durable, encodes one frame, writes it, flushes the file once
 with the platform's full flush, and only then publishes the records to readers and answers
 every submitter. Replicas submit in a closed loop, so the writer waits for the replicas it

@@ -29,7 +29,7 @@ fn log_config() -> LogConfig {
         segment_bytes: 64 * 4096,
         max_segments: 16,
         max_groups: 16,
-        group_entries: 1 << 16,
+        group_entries: 1 << 18,
         group_bytes: 1 << 24,
         group_cache: 1 << 16,
         queue_submissions: 64,
@@ -40,10 +40,11 @@ fn log_config() -> LogConfig {
 const SETTINGS: Settings = Settings {
     election_tick: 10,
     heartbeat_tick: 2,
-    max_size_per_msg: 1 << 20,
-    max_inflight_msgs: 64,
-    max_uncommitted_size: 1 << 24,
+    max_size_per_msg: 1 << 16,
+    max_inflight_msgs: 16,
+    max_uncommitted_size: 1 << 20,
     max_committed_size_per_ready: 1 << 22,
+    max_entry_bytes: 1 << 16,
 };
 
 /// The engine of a cell's first Name range, before any entry: its lineage, holding every key.
@@ -465,4 +466,132 @@ fn a_member_whose_engine_is_ahead_of_its_logs_commit_reopens() {
         rows(nodes[1].replica.engine()),
         rows(nodes[0].replica.engine())
     );
+}
+
+/// A log that refuses a ready for want of room keeps the ready waiting, whole, in its
+/// replica, which answers `Stalled` and lets no tick move its timers meanwhile. Once the group
+/// compacts, the next drive writes the same ready and the replica goes on (audit S04).
+#[test]
+fn a_ready_refused_for_room_waits_until_the_group_compacts() {
+    let file = Arc::new(
+        SimFile::new(
+            Alignment::new(4096).unwrap(),
+            Alignment::new(512).unwrap(),
+            7,
+        )
+        .unwrap(),
+    );
+    // A ready of these settings is 512 bytes at most, 102 entries of the fewest bytes, and
+    // the log holds a group to that.
+    let small = Settings {
+        max_size_per_msg: 256,
+        max_inflight_msgs: 1,
+        max_uncommitted_size: 256,
+        max_entry_bytes: 256,
+        ..SETTINGS
+    };
+    let config = LogConfig {
+        group_entries: 102,
+        group_bytes: 1 << 20,
+        ..log_config()
+    };
+    let log = Arc::new(Log::create(file, config, 0x6c6f67).unwrap());
+    let alone = Range {
+        boot: ConfState {
+            voters: vec![1],
+            ..ConfState::default()
+        },
+        settings: small,
+        ..range()
+    };
+    let mut replica = Replica::open(1, GROUP, log, first_range(), &alone, 7).unwrap();
+    replica.campaign().unwrap();
+    assert!(replica.drive().unwrap().stalled.is_none());
+    assert!(replica.is_leader());
+    let register = |serial| Entry {
+        at_ns: 10,
+        commands: vec![Sessioned {
+            session: 0,
+            serial,
+            unanswered: 0,
+            command: Command::Register,
+        }],
+    };
+    // One entry a ready, none compacted, until the group would retain past its bound.
+    let mut stalled = None;
+    for serial in 0..200 {
+        replica.propose(&register(serial)).unwrap();
+        let out = replica.drive().unwrap();
+        if out.stalled.is_some() {
+            stalled = out.stalled;
+            break;
+        }
+    }
+    assert!(
+        matches!(stalled, Some(mantle_log::LogError::Backlog(GROUP))),
+        "{stalled:?}"
+    );
+    let applied = replica.applied();
+    // Waiting: calls are refused, ticks move nothing, and the ready is written first.
+    replica.tick().unwrap();
+    assert!(matches!(
+        replica.propose(&register(999)),
+        Err(mantle_range::ReplicaError::Stalled)
+    ));
+    assert!(replica.drive().unwrap().stalled.is_some());
+    replica.compact(0).unwrap();
+    let out = replica.drive().unwrap();
+    assert!(out.stalled.is_none(), "{:?}", out.stalled);
+    assert_eq!(replica.applied(), applied + 1);
+    // And the group goes on.
+    replica.propose(&register(1_000)).unwrap();
+    replica.drive().unwrap();
+    assert_eq!(replica.applied(), applied + 2);
+}
+
+/// A member refuses settings its log cannot hold to: an entry of the range's largest must
+/// fit one frame, and a ready of the range's largest must fit the group's bounds.
+#[test]
+fn a_member_refuses_settings_its_log_cannot_hold() {
+    let open = |settings: Settings, config: LogConfig| {
+        let file = Arc::new(
+            SimFile::new(
+                Alignment::new(4096).unwrap(),
+                Alignment::new(512).unwrap(),
+                8,
+            )
+            .unwrap(),
+        );
+        let log = Arc::new(Log::create(file, config, 0x6c6f67).unwrap());
+        let r = Range {
+            settings,
+            ..range()
+        };
+        Replica::open(1, GROUP, log, first_range(), &r, 8).map(|_| ())
+    };
+    assert!(open(SETTINGS, log_config()).is_ok());
+    let wide = Settings {
+        max_entry_bytes: 64 * 4096,
+        ..SETTINGS
+    };
+    assert!(matches!(
+        open(wide, log_config()),
+        Err(mantle_range::ReplicaError::Config(_))
+    ));
+    let narrow = LogConfig {
+        group_bytes: 1 << 16,
+        ..log_config()
+    };
+    assert!(matches!(
+        open(SETTINGS, narrow),
+        Err(mantle_range::ReplicaError::Config(_))
+    ));
+    let few = LogConfig {
+        group_entries: 1 << 10,
+        ..log_config()
+    };
+    assert!(matches!(
+        open(SETTINGS, few),
+        Err(mantle_range::ReplicaError::Config(_))
+    ));
 }

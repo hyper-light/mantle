@@ -1,6 +1,7 @@
 //! One member of one range's Raft group (docs/design/replica.md): focal-raft's core, its
 //! group's view of the device's log, the range's engine and its layer's state machine.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use focal_raft::proto::protocompat::PbMessageExt;
@@ -10,7 +11,7 @@ use focal_raft::proto::{
 };
 use focal_raft::{RawNode, StateRole};
 use mantle_disk::block::BlockFile;
-use mantle_log::{Entries, Log, Proposal, Start, Update};
+use mantle_log::{Entries, Log, LogError, Proposal, Start, Update};
 use mantle_meta::apply::{Layer, apply_entry};
 use mantle_meta::engine::{Engine, Write};
 use mantle_meta::session::Rules;
@@ -50,6 +51,10 @@ pub struct Settings {
     pub max_uncommitted_size: u64,
     /// Bytes of committed entries one ready gives to apply at most.
     pub max_committed_size_per_ready: u64,
+    /// Bytes of one entry at most, the same on every member: every member's log holds such an
+    /// entry in one frame, so a ready of any size can be written in parts
+    /// ([`Log::parts`]), and the leader refuses a larger proposal.
+    pub max_entry_bytes: u64,
 }
 
 /// What one call to [`Replica::drive`] produced.
@@ -62,6 +67,10 @@ pub struct Drive {
     /// Reads a quorum confirmed: each read's context and the index the replica must have
     /// applied before it answers from its rows (06 §A1).
     pub reads: Vec<(u64, Vec<u8>)>,
+    /// The log refused the ready being written for want of room, answering this: the ready
+    /// waits, whole, in the replica, which takes no call but `drive` and `compact` until the
+    /// node frees room and drives again (audit S04).
+    pub stalled: Option<LogError>,
 }
 
 /// A normal entry applied: its index, and each command's session, serial and answer, in
@@ -84,6 +93,70 @@ pub struct Replica<F: BlockFile + 'static, E: Engine> {
     /// An index at or past the entry that made `conf`: the entry itself once this member
     /// applies a change, and before that the point it opened at or installed.
     conf_index: u64,
+    max_entry_bytes: u64,
+    /// A ready the log has yet to take whole, which the core counts as out (07 §1.2).
+    staged: Option<Staged>,
+}
+
+/// A ready being made durable: its update's parts not yet written, in order, each fitting a
+/// frame.
+struct Staged {
+    ready: focal_raft::Ready,
+    parts: VecDeque<Update>,
+}
+
+/// Where writing a ready's parts got to.
+enum Persisted {
+    Done(focal_raft::Ready),
+    /// The log refused a part for want of room: the ready waits with the parts left.
+    Waiting(Staged, LogError),
+}
+
+/// Whether a member's log can hold to the range's settings (audit S04). An entry of the
+/// range's largest must fit one frame, so a ready of any size can be written in parts. And a
+/// group compacted to its applied state retains at most one ready's entries: a leader's
+/// uncommitted proposals, or the appends a follower has in flight, and one entry past either
+/// bound, which the core admits alone. The group's bounds must hold such a ready, in bytes
+/// and in entries of the fewest bytes, or a ready refused for room could wait for good.
+fn check_settings<F: BlockFile + 'static>(
+    settings: &Settings,
+    log: &Log<F>,
+) -> Result<(), ReplicaError> {
+    let overhead = u64::try_from(store::ENTRY_OVERHEAD).unwrap_or(u64::MAX);
+    let largest = settings.max_entry_bytes.checked_add(overhead);
+    let room = u64::try_from(log.entry_room()?).unwrap_or(u64::MAX);
+    if largest.is_none_or(|b| b > room) {
+        return Err(ReplicaError::Config(
+            "an entry of the range's largest does not fit one frame of this log",
+        ));
+    }
+    let inflight = u64::try_from(settings.max_inflight_msgs)
+        .ok()
+        .and_then(|n| n.checked_mul(settings.max_size_per_msg));
+    let ready = inflight
+        .map(|f| f.max(settings.max_uncommitted_size))
+        .and_then(|b| b.checked_add(settings.max_entry_bytes));
+    let config = log.config();
+    let fits = ready.is_some_and(|b| {
+        b <= config.group_bytes
+            && b.checked_div(overhead)
+                .is_some_and(|entries| entries <= config.group_entries)
+    });
+    if !fits {
+        return Err(ReplicaError::Config(
+            "the log's bounds on a group hold less than one ready of the range's settings",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether the log refused a write for want of room another write frees: the group's own
+/// retained entries, the log's segments, or its groups.
+fn waits_for_room(e: &LogError) -> bool {
+    matches!(
+        e,
+        LogError::Backlog(_) | LogError::Full | LogError::TooManyGroups(_) | LogError::Busy
+    )
 }
 
 impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
@@ -105,6 +178,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
                 .ok_or_else(|| ReplicaError::Stopped("the configuration does not decode".into()))?,
             None => boot.clone(),
         };
+        check_settings(settings, &log)?;
         let applied = engine.applied();
         complete_install(&log, group, &engine)?;
         commit_applied(&log, group, applied)?;
@@ -139,6 +213,8 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
             applied,
             conf,
             conf_index: applied,
+            max_entry_bytes: settings.max_entry_bytes,
+            staged: None,
         };
         // A log compacted before the restart can serve a lagging member only by snapshot.
         let compacted = replica
@@ -257,20 +333,35 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
         self.engine
     }
 
+    /// A tick of the group's clock. A replica waiting for room takes no part in the group,
+    /// and its timers resume when it does.
     pub fn tick(&mut self) -> Result<(), ReplicaError> {
+        if self.staged.is_some() {
+            return Ok(());
+        }
         self.node.tick()?;
         Ok(())
     }
 
     pub fn step(&mut self, message: Message) -> Result<(), ReplicaError> {
+        self.ready_for_calls()?;
         self.node.step(message)?;
         Ok(())
+    }
+
+    /// `Stalled` while a ready waits for room: the core takes no call until it is done.
+    fn ready_for_calls(&self) -> Result<(), ReplicaError> {
+        match self.staged {
+            Some(_) => Err(ReplicaError::Stalled),
+            None => Ok(()),
+        }
     }
 
     /// Asks the group to confirm a read: once a quorum has, `drive` gives back the read with
     /// the index the rows must reach, and rows at or past it answer the read linearizably.
     /// Only a leader confirms reads; `context` names the read.
     pub fn read_index(&mut self, context: Vec<u8>) -> Result<(), ReplicaError> {
+        self.ready_for_calls()?;
         self.node.read_index(context)?;
         Ok(())
     }
@@ -279,6 +370,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
     /// pauses while its snapshot is out, so the transport reports every snapshot's fate,
     /// which a snapshot's own stream always learns (docs/design/replica.md §3).
     pub fn report_snapshot(&mut self, to: u64, arrived: bool) -> Result<(), ReplicaError> {
+        self.ready_for_calls()?;
         let status = if arrived {
             focal_raft::SnapshotStatus::Finish
         } else {
@@ -289,55 +381,133 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
     }
 
     pub fn campaign(&mut self) -> Result<(), ReplicaError> {
+        self.ready_for_calls()?;
         self.node.campaign()?;
         Ok(())
     }
 
-    /// Proposes an entry of commands; only a leader takes it.
+    /// Proposes an entry of commands; only a leader takes it, and none larger than the
+    /// range's bound.
     pub fn propose(&mut self, entry: &wire::Entry) -> Result<(), ReplicaError> {
-        self.node.propose(Vec::new(), entry.encode()?)?;
+        self.ready_for_calls()?;
+        let data = entry.encode()?;
+        self.bounded(data.len())?;
+        self.node.propose(Vec::new(), data)?;
         Ok(())
     }
 
     pub fn propose_change(&mut self, change: &ConfChangeV2) -> Result<(), ReplicaError> {
+        self.ready_for_calls()?;
+        self.bounded(change.compute_size().try_into().unwrap_or(usize::MAX))?;
         self.node.propose_conf_change(Vec::new(), change)?;
+        Ok(())
+    }
+
+    fn bounded(&self, len: usize) -> Result<(), ReplicaError> {
+        if u64::try_from(len).map_or(true, |l| l > self.max_entry_bytes) {
+            return Err(ReplicaError::EntryTooLarge {
+                len,
+                max: self.max_entry_bytes,
+            });
+        }
         Ok(())
     }
 
     /// Handles what the core asks for, in the order Raft's safety needs
     /// (docs/design/replica.md §3): the messages a leader may send at once, the log write,
     /// the messages that wait for it, the committed entries, and the core's advance.
+    /// A ready the log refuses for want of room waits in the replica, whole, and the next
+    /// drive writes it first (audit S04).
     pub fn drive(&mut self) -> Result<Drive, ReplicaError> {
         let mut out = Drive::default();
         for _ in 0..DRIVE_BUDGET {
-            if !self.node.has_ready() {
-                break;
-            }
-            let mut ready = self.node.ready()?;
-            let installed = match ready.snapshot() {
-                Some(s) if !proto::snapshot_is_empty(s) => Some(self.install(s.clone())?),
-                _ => None,
+            let staged = match self.staged.take() {
+                Some(staged) => staged,
+                None if self.node.has_ready() => self.take_ready(&mut out)?,
+                None => break,
             };
-            out.messages.extend(ready.take_messages());
-            out.reads.extend(
-                ready
-                    .take_read_states()
-                    .into_iter()
-                    .map(|r| (r.index, r.request_ctx)),
-            );
-            if let Some(update) = update_of(&ready, installed)? {
-                self.node.store().log.write_waiting(self.group, update)?;
+            match self.persist(staged)? {
+                Persisted::Done(ready) => self.finish(ready, &mut out)?,
+                Persisted::Waiting(mut staged, refusal) => {
+                    // The core gives out only entries committed and durable, so these apply
+                    // now, and the group can compact past them while the ready waits.
+                    let committed = staged.ready.take_committed_entries();
+                    self.apply(committed, &mut out)?;
+                    self.staged = Some(staged);
+                    out.stalled = Some(refusal);
+                    break;
+                }
             }
-            out.messages.extend(ready.take_persisted_messages());
-            let committed = ready.take_committed_entries();
-            self.apply(committed, &mut out)?;
-            let mut light = self.node.advance_append(ready)?;
-            out.messages.extend(light.take_messages());
-            let committed = light.take_committed_entries();
-            self.apply(committed, &mut out)?;
-            self.node.advance_apply_to(self.applied)?;
         }
         Ok(out)
+    }
+
+    /// Takes the core's next ready: installs its snapshot, gives out the messages a leader
+    /// may send before its own write and the reads confirmed, and lays out its update.
+    fn take_ready(&mut self, out: &mut Drive) -> Result<Staged, ReplicaError> {
+        let mut ready = self.node.ready()?;
+        let installed = match ready.snapshot() {
+            Some(s) if !proto::snapshot_is_empty(s) => Some(self.install(s.clone())?),
+            _ => None,
+        };
+        out.messages.extend(ready.take_messages());
+        out.reads.extend(
+            ready
+                .take_read_states()
+                .into_iter()
+                .map(|r| (r.index, r.request_ctx)),
+        );
+        let parts = match update_of(&ready, installed)? {
+            Some(update) => match self.node.store().log.parts(self.group, update) {
+                Ok(parts) => parts.into(),
+                Err(LogError::TooLarge(len)) => {
+                    return Err(ReplicaError::Stopped(format!(
+                        "a ready holds a record of {len} bytes, more than a frame of this log"
+                    )));
+                }
+                Err(e) => return Err(e.into()),
+            },
+            None => VecDeque::new(),
+        };
+        Ok(Staged { ready, parts })
+    }
+
+    /// Writes a ready's parts in order, each once durable; the ready back once every part
+    /// is, or staged when the log refuses one for want of room.
+    fn persist(&mut self, mut staged: Staged) -> Result<Persisted, ReplicaError> {
+        while let Some(part) = staged.parts.front() {
+            match self
+                .node
+                .store()
+                .log
+                .write_waiting(self.group, part.clone())
+            {
+                Ok(()) => {
+                    staged.parts.pop_front();
+                }
+                Err(e) if waits_for_room(&e) => return Ok(Persisted::Waiting(staged, e)),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(Persisted::Done(staged.ready))
+    }
+
+    /// Finishes a durable ready: the messages that waited for the write, the committed
+    /// entries, and the core's advance.
+    fn finish(
+        &mut self,
+        mut ready: focal_raft::Ready,
+        out: &mut Drive,
+    ) -> Result<(), ReplicaError> {
+        out.messages.extend(ready.take_persisted_messages());
+        let committed = ready.take_committed_entries();
+        self.apply(committed, out)?;
+        let mut light = self.node.advance_append(ready)?;
+        out.messages.extend(light.take_messages());
+        let committed = light.take_committed_entries();
+        self.apply(committed, out)?;
+        self.node.advance_apply_to(self.applied)?;
+        Ok(())
     }
 
     fn apply(&mut self, entries: Vec<Entry>, out: &mut Drive) -> Result<(), ReplicaError> {

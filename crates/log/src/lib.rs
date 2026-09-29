@@ -189,12 +189,31 @@ impl State {
     }
 }
 
-/// The room submissions hold in the writer's queue.
+/// The room submissions hold until the writer answers them: those waiting to be taken, those
+/// held for a later frame, and those in the frame being written (audit S03).
 #[derive(Debug, Default)]
 struct Queue {
     submissions: usize,
     bytes: u64,
+    /// Submissions not yet answered, by group, each at most [`GROUP_SUBMISSIONS`].
+    groups: HashMap<u128, usize>,
 }
+
+/// Payload bytes one frame holds: a segment less its header block and the frame's header.
+pub(crate) fn frame_room(config: &Config, align: Alignment) -> Result<usize, LogError> {
+    let block = u64::try_from(align.get()).map_err(|_| LogError::Config("block"))?;
+    config
+        .segment_bytes
+        .checked_sub(block)
+        .and_then(|room| usize::try_from(room).ok())
+        .and_then(|room| room.checked_sub(format::FRAME_HEADER_LEN))
+        .ok_or(LogError::Config("a segment holds no frame"))
+}
+
+/// Submissions one group may have unanswered: the queue's two batches' worth
+/// [research/11 §4] for a group, which has one update in each frame. A hot group then waits
+/// for its own room and never takes the others'.
+const GROUP_SUBMISSIONS: usize = 2;
 
 struct Shared<F> {
     file: F,
@@ -218,6 +237,22 @@ struct Shared<F> {
 impl<F: BlockFile> Shared<F> {
     fn read_state(&self) -> Result<std::sync::RwLockReadGuard<'_, State>, LogError> {
         self.state.read().map_err(|_| LogError::Fenced)
+    }
+
+    /// Gives back the room of a submission of `group` answered or never sent, and wakes the
+    /// submitters waiting for room.
+    fn release(&self, group: u128, bytes: u64) {
+        if let Ok(mut queue) = self.queue.lock() {
+            queue.submissions = queue.submissions.saturating_sub(1);
+            queue.bytes = queue.bytes.saturating_sub(bytes);
+            if let Some(own) = queue.groups.get_mut(&group) {
+                *own = own.saturating_sub(1);
+                if *own == 0 {
+                    queue.groups.remove(&group);
+                }
+            }
+        }
+        self.room.notify_all();
     }
 }
 
@@ -297,12 +332,15 @@ impl<F: BlockFile + 'static> Log<F> {
                 }
                 let submissions = queue.submissions.checked_add(1).ok_or(LogError::Busy)?;
                 let total = queue.bytes.checked_add(bytes).ok_or(LogError::Busy)?;
+                let own = queue.groups.get(&group).copied().unwrap_or(0);
                 // A submission larger than the byte bound is taken into an empty queue.
                 let room = submissions <= config.queue_submissions
-                    && (queue.bytes == 0 || total <= config.queue_bytes);
+                    && (queue.bytes == 0 || total <= config.queue_bytes)
+                    && own < GROUP_SUBMISSIONS;
                 if room {
                     queue.submissions = submissions;
                     queue.bytes = total;
+                    queue.groups.insert(group, own.saturating_add(1));
                     break;
                 }
                 if !wait {
@@ -323,7 +361,7 @@ impl<F: BlockFile + 'static> Log<F> {
         match sender.try_send(submission) {
             Ok(()) => Ok(Pending { answer }),
             Err(e) => {
-                self.release(bytes);
+                self.shared.release(group, bytes);
                 Err(match e {
                     TrySendError::Full(_) => LogError::Busy,
                     TrySendError::Disconnected(_) => LogError::Closed,
@@ -332,11 +370,130 @@ impl<F: BlockFile + 'static> Log<F> {
         }
     }
 
-    fn release(&self, bytes: u64) {
-        if let Ok(mut queue) = self.shared.queue.lock() {
-            queue.submissions = queue.submissions.saturating_sub(1);
-            queue.bytes = queue.bytes.saturating_sub(bytes);
+    /// The parameters the log runs with.
+    pub fn config(&self) -> Config {
+        self.shared.config
+    }
+
+    /// Payload bytes one frame holds: an update no longer than this fits a frame of its own.
+    pub fn frame_room(&self) -> Result<usize, LogError> {
+        frame_room(&self.shared.config, self.shared.align)
+    }
+
+    /// The most bytes one entry may hold and still fit a frame alone.
+    pub fn entry_room(&self) -> Result<usize, LogError> {
+        let one = format::encoded_len(&format::Record::Entries {
+            group: 0,
+            first: 0,
+            entries: &[(0, &[])],
+        })
+        .ok_or(LogError::Config("an entry's record"))?;
+        self.frame_room()?
+            .checked_sub(one)
+            .ok_or(LogError::Config("a frame holds no entry"))
+    }
+
+    /// `update` for `group` in parts that each fit one frame, in the order they apply: its
+    /// start and entries first, its hard state and proposals last, as etcd's raft persists a
+    /// ready's entries before its hard state, together only when the store writes them
+    /// atomically. An update that fits is one part. Written in order, the parts leave the
+    /// group as the update would, and a crash between them leaves entries whose ready was
+    /// never done, so never acknowledged. `TooLarge` when one entry or proposal alone is
+    /// more than a frame holds.
+    pub fn parts(&self, group: u128, update: Update) -> Result<Vec<Update>, LogError> {
+        let room = self.frame_room()?;
+        let len_of =
+            |u: &Update| writer::update_len(group, u).ok_or(LogError::TooLarge(usize::MAX));
+        if update.remove || len_of(&update)? <= room {
+            return Ok(vec![update]);
         }
+        let record =
+            |r: &format::Record<'_>| format::encoded_len(r).ok_or(LogError::TooLarge(usize::MAX));
+        let Update {
+            start,
+            entries,
+            hard_state,
+            proposals,
+            ..
+        } = update;
+        let mut parts = Vec::new();
+        let mut part = Update {
+            start,
+            ..Update::default()
+        };
+        let mut used = len_of(&part)?;
+        if let Some(e) = entries {
+            let none = record(&format::Record::Entries {
+                group,
+                first: e.first,
+                entries: &[],
+            })?;
+            let mut first = e.first;
+            let mut held: Vec<Entry> = Vec::new();
+            let mut held_len = none;
+            for (index, entry) in (e.first..).zip(e.entries) {
+                let cost = record(&format::Record::Entries {
+                    group,
+                    first: index,
+                    entries: &[(entry.term, &entry.bytes)],
+                })?
+                .saturating_sub(none);
+                if used.saturating_add(held_len).saturating_add(cost) > room {
+                    if held.is_empty() && used == 0 {
+                        return Err(LogError::TooLarge(none.saturating_add(cost)));
+                    }
+                    if !held.is_empty() {
+                        part.entries = Some(Entries {
+                            first,
+                            entries: std::mem::take(&mut held),
+                        });
+                    }
+                    parts.push(std::mem::take(&mut part));
+                    used = 0;
+                    held_len = none;
+                    first = index;
+                    if none.saturating_add(cost) > room {
+                        return Err(LogError::TooLarge(none.saturating_add(cost)));
+                    }
+                }
+                held.push(entry);
+                held_len = held_len.saturating_add(cost);
+            }
+            // Entries of none still say where the group's entries end.
+            part.entries = Some(Entries {
+                first,
+                entries: held,
+            });
+            used = used.saturating_add(held_len);
+        }
+        if let Some(state) = hard_state {
+            let cost = record(&format::Record::HardState { group, state })?;
+            if used.saturating_add(cost) > room {
+                parts.push(std::mem::take(&mut part));
+                used = 0;
+            }
+            part.hard_state = Some(state);
+            used = used.saturating_add(cost);
+        }
+        for p in proposals {
+            let cost = record(&format::Record::Proposal {
+                group,
+                index: p.index,
+                term: p.term,
+                bytes: &p.bytes,
+            })?;
+            if cost > room {
+                return Err(LogError::TooLarge(cost));
+            }
+            if used.saturating_add(cost) > room {
+                parts.push(std::mem::take(&mut part));
+                used = 0;
+            }
+            part.proposals.push(p);
+            used = used.saturating_add(cost);
+        }
+        parts.push(part);
+        Ok(parts)
     }
 
     /// Submits `update` and waits until it is durable; refused at once when the queue is

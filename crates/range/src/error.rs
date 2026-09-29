@@ -14,6 +14,16 @@ pub enum ReplicaError {
     /// it stops and recovers from its durable state or its peers.
     #[error("the replica stopped: {0}")]
     Stopped(String),
+    /// The replica waits for room in its log to make a ready durable: until the group or its
+    /// neighbours on the log compact, it takes no call but `drive` and `compact`.
+    #[error("the replica waits for room in its log")]
+    Stalled,
+    /// An entry more than the range's bound, which every member's log holds in one frame.
+    #[error("an entry of {len} bytes; the range takes {max} at most")]
+    EntryTooLarge { len: usize, max: u64 },
+    /// Settings a member's log cannot hold to.
+    #[error("the range's settings do not fit this member's log: {0}")]
+    Config(&'static str),
     #[error(transparent)]
     Log(#[from] LogError),
     #[error(transparent)]

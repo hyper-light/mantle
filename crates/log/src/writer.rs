@@ -85,14 +85,7 @@ pub(crate) struct Writer<F> {
 
 impl<F: BlockFile> Writer<F> {
     pub fn new(shared: Arc<Shared<F>>, receiver: Receiver<Submission>) -> Result<Self, LogError> {
-        let block = u64::try_from(shared.align.get()).map_err(|_| LogError::Config("block"))?;
-        let capacity = shared
-            .config
-            .segment_bytes
-            .checked_sub(block)
-            .and_then(|room| usize::try_from(room).ok())
-            .and_then(|room| room.checked_sub(FRAME_HEADER_LEN))
-            .ok_or(LogError::Config("a segment holds no frame"))?;
+        let capacity = crate::frame_room(&shared.config, shared.align)?;
         Ok(Self {
             shared,
             receiver,
@@ -123,18 +116,19 @@ impl<F: BlockFile> Writer<F> {
             answered = u64::try_from(batch.len()).unwrap_or(u64::MAX);
             if self.shared.fenced.load(Ordering::Acquire) {
                 for s in batch {
-                    answer(&s, Err(LogError::Fenced));
+                    self.answer(&s, Err(LogError::Fenced));
                 }
                 // Answer what still comes until the log is dropped.
                 while let Ok(s) = self.receiver.recv() {
-                    answer(&self.taken(s), Err(LogError::Fenced));
+                    let s = self.taken(s);
+                    self.answer(&s, Err(LogError::Fenced));
                 }
                 return;
             }
             if self.commit(batch).is_err() {
                 self.fence();
                 for s in std::mem::take(&mut self.held) {
-                    answer(&s, Err(LogError::Fenced));
+                    self.answer(&s, Err(LogError::Fenced));
                 }
             }
             // Submissions sent before these answers went out are queued ahead of any the
@@ -171,15 +165,19 @@ impl<F: BlockFile> Writer<F> {
         self.anticipation.learn(answered, returned(batch));
     }
 
-    /// Gives back the queue room of a submission the writer took.
+    /// Counts a submission the writer took. Its room in the queue is held until it is
+    /// answered, so the queue's bound covers the updates held for a later frame and those in
+    /// the frame being written as well as those waiting (audit S03).
     fn taken(&mut self, s: Submission) -> Submission {
         self.received = self.received.saturating_add(1);
-        if let Ok(mut queue) = self.shared.queue.lock() {
-            queue.submissions = queue.submissions.saturating_sub(1);
-            queue.bytes = queue.bytes.saturating_sub(s.bytes);
-        }
-        self.shared.room.notify_all();
         s
+    }
+
+    /// Answers a submission, and gives back its room in the queue.
+    fn answer(&self, s: &Submission, result: Result<(), LogError>) {
+        // A submitter that stopped waiting has nothing to be told.
+        let _ = s.reply.try_send(result);
+        self.shared.release(s.group, s.bytes);
     }
 
     /// Fences the log: no submission is taken from here on, and every waiter wakes to hear
@@ -215,18 +213,18 @@ impl<F: BlockFile> Writer<F> {
                 let new = match validate(&state, &self.shared.config, &s, new_groups) {
                     Ok(new) => new,
                     Err(e) => {
-                        answer(&s, Err(e));
+                        self.answer(&s, Err(e));
                         continue;
                     }
                 };
                 let len = match update_len(s.group, &s.update) {
                     Some(len) if len <= self.capacity => len,
                     Some(len) => {
-                        answer(&s, Err(LogError::TooLarge(len)));
+                        self.answer(&s, Err(LogError::TooLarge(len)));
                         continue;
                     }
                     None => {
-                        answer(&s, Err(LogError::TooLarge(usize::MAX)));
+                        self.answer(&s, Err(LogError::TooLarge(usize::MAX)));
                         continue;
                     }
                 };
@@ -255,7 +253,7 @@ impl<F: BlockFile> Writer<F> {
                 let updates = u64::try_from(taken.len()).unwrap_or(u64::MAX);
                 self.shared.updates.fetch_add(updates, Ordering::Relaxed);
                 for (s, _) in &taken {
-                    answer(s, Ok(()));
+                    self.answer(s, Ok(()));
                 }
                 Ok(())
             }
@@ -263,7 +261,7 @@ impl<F: BlockFile> Writer<F> {
                 // No segment can take the frame: every one holds live records the tail's
                 // sweep cannot free. Groups must compact.
                 for (s, _) in &taken {
-                    answer(s, Err(LogError::Full));
+                    self.answer(s, Err(LogError::Full));
                 }
                 Ok(())
             }
@@ -271,7 +269,7 @@ impl<F: BlockFile> Writer<F> {
                 // Fenced before anyone hears of it, so no answer outruns the fence.
                 self.fence();
                 for (s, _) in &taken {
-                    answer(s, Err(LogError::Fenced));
+                    self.answer(s, Err(LogError::Fenced));
                 }
                 Err(e)
             }
@@ -586,11 +584,6 @@ struct Target {
     frame_len: u64,
     /// Whether the frame opens its segment, whose header it writes first.
     opens: bool,
-}
-
-fn answer(s: &Submission, result: Result<(), LogError>) {
-    // A submitter that stopped waiting has nothing to be told.
-    let _ = s.reply.try_send(result);
 }
 
 fn block<F>(shared: &Shared<F>) -> Result<u64, LogError> {
@@ -1004,7 +997,7 @@ fn validate(
 }
 
 /// Bytes an update's records take in a payload.
-fn update_len(group: u128, update: &Update) -> Option<usize> {
+pub(crate) fn update_len(group: u128, update: &Update) -> Option<usize> {
     let mut len = 0usize;
     if update.remove {
         return format::encoded_len(&Record::Removed { group });

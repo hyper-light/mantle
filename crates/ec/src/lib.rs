@@ -25,6 +25,8 @@
     )
 )]
 
+pub mod durability;
+
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
@@ -56,6 +58,11 @@ impl From<reed_solomon_simd::Error> for EcError {
         Self::Library(e.to_string())
     }
 }
+
+/// The codes mantle stores blocks in, as `(data, parity)`: each is tested for every loss it
+/// tolerates. RS(6,3) through RS(9,6) are the profiles docs/research/04 §R1.2 names for
+/// clusters of 9 to 15 failure domains; the narrower ones serve fewer domains.
+pub const CODES: [(usize, usize); 7] = [(2, 1), (3, 2), (4, 2), (6, 3), (8, 4), (10, 4), (9, 6)];
 
 /// A systematic Reed–Solomon code of `data` data chunks and `parity` parity chunks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,7 +293,7 @@ mod tests {
     /// and the block reads back exactly from what is left.
     #[test]
     fn every_loss_within_tolerance_is_rebuilt() {
-        for (data, parity) in [(2, 1), (3, 2), (4, 2), (6, 3), (8, 4), (10, 4), (9, 6)] {
+        for (data, parity) in CODES {
             let code = Code::new(data, parity).unwrap();
             // A length that leaves the last data chunk partly padded.
             let len = code.chunk_len(1000).unwrap() * data - 3;

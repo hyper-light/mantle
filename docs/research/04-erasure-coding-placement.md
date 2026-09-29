@@ -363,7 +363,7 @@ The README was substantially rewritten in 2026 around "Leopard2". I read the REA
   The accompanying text: *"failing to account for correlation of node failures typically results in overestimating availability by at least two orders of magnitude, and eight in the case of RS(8,4). Correlation also reduces the benefit of increasing data redundancy."*
 - **§8.4, component rates:** *"Assuming R = 3 … a 10% reduction in the latent disk error rate has a negligible effect on stripe availability … a 10% reduction in the disk failure rate increases stripe availability by less than 1.5% … cutting node failure rates by 10% can increase data availability by 18%."*
 - **§8.5, multi-cell replication** (Table 4):
-  - R=2×2 with a 1-day inter-cell recovery reaches 1.08E+10 days, *"two orders of magnitude longer MTTF than R = 4"*, at about 6.8 MB/day of inter-cell bandwidth per user PB.
+  - R=2×2 with a 1-day inter-cell recovery reaches 1.08E+10 days, *"two orders of magnitude longer MTTF than R = 4"*, at about 6.8 MB/day of inter-cell bandwidth per user PB. The paper gives that figure as R=2's inverse MTTF, which for 1 PB is 6.8 GB/day, so the unit is off by a thousand (note 15 §7 item 5).
   - RS(6,3)×2 reaches 5.32E+13 days (1-day recovery) and 1.22E+15 days (1-hour recovery).
 
 ### Recommendations the authors made [V] (§10)
@@ -375,6 +375,13 @@ The README was substantially rewritten in 2026 around "Leopard2". I read the REA
   - *"Moving towards a dynamic delay before initiating recoveries, based on failure classification and recent history of failures in the cell."*
 
 ### Implications for mantle (A5) [Analysis]
+
+**Correction (2026-09-29, note 15 §1.1).** Ford's chain counts chunks that are *unavailable*
+for 15 minutes or more ("We call a chunk available if the node it is stored on is
+available"; "we focus only on events that are 15 minutes or longer"), so every stripe MTTF
+in Tables 3 and 4 is a mean time to unavailability, not to data loss. The relative lessons
+below hold. The magnitudes are not durability, and mantle's durability model takes permanent
+losses instead (docs/design/durability.md).
 
 1. **Model correlated failures.** Any durability claim mantle makes, or any profile it picks, has to be evaluated under a correlated-failure model: bursts at the rack, power and upgrade-domain level. Independent-failure MTTDLs, like those in A3, are optimistic by 2–8 orders of magnitude (Table 3).
 2. **Stripe width.**

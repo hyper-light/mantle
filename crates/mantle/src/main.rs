@@ -23,6 +23,7 @@ mod bench_hash;
 mod bench_log;
 mod disk;
 mod display;
+mod durability;
 
 #[derive(Parser)]
 #[command(
@@ -46,6 +47,33 @@ enum Command {
     Bench {
         #[command(subcommand)]
         command: BenchCommand,
+    },
+    /// Estimate how likely a block is to be lost in a year under each scheme mantle can store
+    /// it in, and the scheme that meets the durability target at least cost.
+    Durability {
+        /// Failure domains a block's chunks spread over, one to each: racks, or whatever level
+        /// the deployment names.
+        #[arg(long)]
+        domains: usize,
+        /// Each chunk's device's annual failure rate, in percent: 2 to 4 is common for disks in
+        /// the field, and flash runs from 0.07 to 1.2 by model (docs/design/durability.md).
+        #[arg(long)]
+        afr: f64,
+        /// Hours from a chunk's loss to its rebuild, detection included.
+        #[arg(long)]
+        repair_hours: f64,
+        /// Events that destroy a share of the nodes at once, as PER_YEAR:PERCENT; 1:1 is a
+        /// yearly power loss after which 1% of the nodes do not come back. Repeatable.
+        #[arg(long = "burst", value_parser = parse_burst)]
+        bursts: Vec<(f64, f64)>,
+        /// Zones a block's chunks spread over, evenly, and each zone's losses per year, as
+        /// ZONES:PER_YEAR.
+        #[arg(long, value_parser = parse_zones)]
+        zones: Option<(usize, f64)>,
+        /// The highest annual probability of losing a block: S3's design of 99.999999999%
+        /// durability over a year by default.
+        #[arg(long, default_value_t = 1e-11)]
+        target: f64,
     },
 }
 
@@ -150,6 +178,32 @@ fn parse_size(text: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("{text} is not a usable size"))
 }
 
+/// `PER_YEAR:PERCENT`: events a year, and the percent of the nodes each destroys.
+fn parse_burst(text: &str) -> Result<(f64, f64), String> {
+    let bad = || format!("{text} is not PER_YEAR:PERCENT");
+    let (rate, percent) = text.split_once(':').ok_or_else(bad)?;
+    let rate: f64 = rate.trim().parse().map_err(|_| bad())?;
+    let percent: f64 = percent.trim().parse().map_err(|_| bad())?;
+    if rate.is_finite() && rate >= 0.0 && (0.0..=100.0).contains(&percent) {
+        Ok((rate, percent / 100.0))
+    } else {
+        Err(bad())
+    }
+}
+
+/// `ZONES:PER_YEAR`: zones, and each zone's losses a year.
+fn parse_zones(text: &str) -> Result<(usize, f64), String> {
+    let bad = || format!("{text} is not ZONES:PER_YEAR");
+    let (zones, rate) = text.split_once(':').ok_or_else(bad)?;
+    let zones: usize = zones.trim().parse().map_err(|_| bad())?;
+    let rate: f64 = rate.trim().parse().map_err(|_| bad())?;
+    if zones > 0 && rate.is_finite() && rate >= 0.0 {
+        Ok((zones, rate))
+    } else {
+        Err(bad())
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let stdout = std::io::stdout();
@@ -235,6 +289,30 @@ fn main() -> ExitCode {
             }
             Err(_) => Err(format!("--seconds {seconds} is not a duration")),
         },
+        Command::Durability {
+            domains,
+            afr,
+            repair_hours,
+            bursts,
+            zones,
+            target,
+        } => {
+            if (0.0..=100.0).contains(&afr) {
+                durability::durability(
+                    &mut out,
+                    &durability::Options {
+                        domains,
+                        annual_failure: afr / 100.0,
+                        repair_hours,
+                        bursts,
+                        zones,
+                        target,
+                    },
+                )
+            } else {
+                Err(format!("--afr {afr} is not a percentage"))
+            }
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

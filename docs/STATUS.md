@@ -33,6 +33,17 @@ directory and, with `--measure`, benchmarks the device. It is built on:
 - **A simulated device** for crash testing: writes not yet flushed are lost, kept or torn
   at sector granularity when it crashes, a failed flush leaves their durability unknown,
   and reads and writes can be made to fail or return corrupted bytes.
+- **Erasure coding** (`mantle-ec`): systematic Reed–Solomon over GF(2^16) with contiguous
+  data chunks, from `reed-solomon-simd` behind an unwind boundary. Every combination of lost
+  chunks within the tolerance of RS(2,1) through RS(9,6) is rebuilt byte for byte in the
+  tests, and `mantle bench ec` measures encoding and rebuilding per code
+  ([measurements](measurements/2026-09-28-erasure-coding.md)). A block's scheme is chosen
+  from the failure domains available and a durability target, S3's eleven nines by
+  default ([design](design/durability.md)). The choice rests on a Markov model of permanent
+  loss: chunks lost one at a time, whole domains at a time, and in events across domains,
+  with repair one chunk at a time. The model is solved without subtraction and matches
+  Ford et al.'s closed form to 10⁻¹² where elimination loses every digit. `mantle
+  durability` runs it for a deployment's rates.
 
 ## In progress
 
@@ -78,18 +89,6 @@ Remaining before it is done:
 - The group-commit wait for submitters slower than half a batch, from the measured
   distribution of their return times (docs/research/11 §2.6), once real clients supply it.
 - Device health in how writes are placed and when a device is drained (docs/research/10).
-
-**Erasure coding** (`mantle-ec`). Systematic Reed–Solomon over GF(2^16) with contiguous
-data chunks, from `reed-solomon-simd` behind an unwind boundary. Every combination of lost
-chunks within the tolerance of RS(2,1) through RS(9,6) is rebuilt byte for byte in the
-tests, and `mantle bench ec` measures encoding and rebuilding per code
-([measurements](measurements/2026-09-28-erasure-coding.md)).
-
-Remaining before it is done:
-
-- Choosing the code for a block from the failure domains available and a durability
-  target, computed from failure and repair rates under correlated failures
-  (docs/research/04 §A5) rather than from a table.
 
 **S3 protocol** (`mantle-s3`, [design](design/s3-protocol.md)). Signature Version 4 in the
 `Authorization` header and in presigned URLs, and `aws-chunked` bodies with signed chunks and

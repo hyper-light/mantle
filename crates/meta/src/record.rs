@@ -67,6 +67,167 @@ pub struct Part {
     pub modified_ns: u64,
 }
 
+/// A file: its length and how many extents hold it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileHeader {
+    pub length: u64,
+    pub extents: u32,
+}
+
+/// Bytes of a file, up to the end its row's key names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Extent {
+    pub length: u64,
+    pub target: Target,
+}
+
+/// What holds an extent's bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    Block(u128),
+    /// Another file: a completed upload's part.
+    File(u128),
+}
+
+/// A block: its bytes, and how they are split into chunks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockHeader {
+    pub length: u64,
+    /// Data chunks, `k`, and parity chunks, `m`: Reed-Solomon `(k, m)`, and replication to
+    /// `m + 1` copies when `k` is one.
+    pub data: u8,
+    pub parity: u8,
+    /// Bytes of each chunk.
+    pub chunk_len: u64,
+    /// CRC-32C of the block's bytes, checked after they are rebuilt from chunks.
+    pub crc32c: u32,
+}
+
+/// Where one chunk of a block lives: a chunk store volume and the key it holds it under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkPlace {
+    pub volume: u128,
+    pub key: mantle_chunk::ChunkKey,
+}
+
+/// A reverse row: which chunk of its block the volume in its key holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reverse {
+    pub index: u16,
+}
+
+impl FileHeader {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = start();
+        w.u64(self.length);
+        w.u32(self.extents);
+        finish(w)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "file")?;
+        let header = (|| {
+            Some(Self {
+                length: r.u64()?,
+                extents: r.u32()?,
+            })
+        })();
+        decoded(header, &r, "file")
+    }
+}
+
+impl Extent {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = start();
+        w.u64(self.length);
+        match self.target {
+            Target::Block(id) => {
+                w.u8(0);
+                w.u128(id);
+            }
+            Target::File(id) => {
+                w.u8(1);
+                w.u128(id);
+            }
+        }
+        finish(w)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "extent")?;
+        let extent = (|| {
+            let length = r.u64()?;
+            let target = match r.u8()? {
+                0 => Target::Block(r.u128()?),
+                1 => Target::File(r.u128()?),
+                _ => return None,
+            };
+            Some(Self { length, target })
+        })();
+        decoded(extent, &r, "extent")
+    }
+}
+
+impl BlockHeader {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = start();
+        w.u64(self.length);
+        w.u8(self.data);
+        w.u8(self.parity);
+        w.u64(self.chunk_len);
+        w.u32(self.crc32c);
+        finish(w)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "block")?;
+        let header = (|| {
+            Some(Self {
+                length: r.u64()?,
+                data: r.u8()?,
+                parity: r.u8()?,
+                chunk_len: r.u64()?,
+                crc32c: r.u32()?,
+            })
+        })();
+        decoded(header, &r, "block")
+    }
+}
+
+impl ChunkPlace {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = start();
+        w.u128(self.volume);
+        self.key.encode(&mut w);
+        finish(w)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "chunk")?;
+        let place = (|| {
+            Some(Self {
+                volume: r.u128()?,
+                key: mantle_chunk::ChunkKey::decode(&mut r)?,
+            })
+        })();
+        decoded(place, &r, "chunk")
+    }
+}
+
+impl Reverse {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = start();
+        w.u16(self.index);
+        finish(w)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "reverse")?;
+        let reverse = r.u16().map(|index| Self { index });
+        decoded(reverse, &r, "reverse")
+    }
+}
+
 impl Version {
     pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
         let mut w = start();
@@ -352,6 +513,42 @@ mod tests {
             modified_ns: 9,
         };
         assert_eq!(Part::decode(&p.encode().unwrap()), Ok(p));
+    }
+
+    #[test]
+    fn file_and_block_rows_round_trip() {
+        let h = FileHeader {
+            length: 1 << 40,
+            extents: 10_000,
+        };
+        assert_eq!(FileHeader::decode(&h.encode()), Ok(h));
+        for target in [Target::Block(3), Target::File(u128::MAX)] {
+            let e = Extent {
+                length: 5 << 30,
+                target,
+            };
+            assert_eq!(Extent::decode(&e.encode()), Ok(e));
+        }
+        let b = BlockHeader {
+            length: 72 << 20,
+            data: 9,
+            parity: 6,
+            chunk_len: 8 << 20,
+            crc32c: 0xDEAD_BEEF,
+        };
+        assert_eq!(BlockHeader::decode(&b.encode()), Ok(b));
+        let c = ChunkPlace {
+            volume: 42,
+            key: mantle_chunk::ChunkKey {
+                block: 7,
+                epoch: 1,
+                index: 14,
+            },
+        };
+        assert_eq!(ChunkPlace::decode(&c.encode()), Ok(c));
+        assert!(ChunkPlace::decode(&b.encode()).is_err());
+        let r = Reverse { index: 14 };
+        assert_eq!(Reverse::decode(&r.encode()), Ok(r));
     }
 
     /// Every flipped bit and every truncation is refused, never misread.

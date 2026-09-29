@@ -98,25 +98,42 @@ Remaining before it is done:
 - ListObjectVersions paging, once the metadata service fixes how versions are ordered.
 - Tagging and ACL documents.
 
+**Metadata service** (`mantle-meta`, [design](design/metadata.md)). Row keys whose byte
+order is the order the design needs, checked by property tests against the components they
+encode; row values with a format byte and a CRC-32C checked on read, every flipped bit and
+truncation refused; and the state machines of three layers over an engine interface, run
+on an in-memory engine that loses what a crash would. The Name layer: versioning enabled,
+suspended and never enabled, conditional writes judged at commit, delete markers, the null
+version, multipart uploads whose parts are checked at completion, and listings that stop
+within a budget and resume. The File layer: files written once as extents, found from any
+offset with one seek. The Block layer: where each chunk lives, with a reverse row per chunk
+that a property test keeps in step with the chunks through writes, moves and deletes.
+
+Remaining before it is done:
+
+- The Bucket layer, and the emptiness check that deleting a bucket needs.
+- The production engine, once its binding is chosen (design §4).
+- Ranges replicated with focal's Raft and its fast-track commit over a shared per-disk log,
+  with request deduplication, ReadIndex reads, snapshots and splits, over QUIC for bulk
+  transfers and a UDP transport for consensus messages.
+- The collector that removes unreferenced files and blocks after a grace period.
+- Done when a linearizability checker accepts histories recorded under network partitions,
+  process crashes and disk faults, both in deterministic simulation and with real
+  processes.
+
 ## Planned, in order
 
-1. **Metadata service.** Ranges of object names, file layouts and chunk locations, each
-   replicated with focal's Raft implementation and its fast-track commit, over QUIC for
-   bulk transfers and a UDP transport for consensus messages, and lazy deletion that keeps
-   an unreferenced block's chunks for a grace period. Done when a linearizability
-   checker accepts histories recorded under network partitions, process crashes and disk
-   faults, both in deterministic simulation and with real processes.
-2. **S3 gateway.** Request signing (including presigned URLs and chunked uploads with
+1. **S3 gateway.** Request signing (including presigned URLs and chunked uploads with
    trailing checksums), buckets, PUT, GET with byte ranges, HEAD, DELETE and batch
    delete, copy, ListObjects and ListObjectsV2, multipart uploads including resuming an
    interrupted upload, versioning, conditional requests and checksums. Done when
    end-to-end suites using the AWS CLI, boto3 and the AWS SDK for Rust pass against a
    running mantle, and ceph's s3-tests pass for every supported feature.
-3. **Multi-machine operation.** Placement across racks and zones, repair ordered by
+2. **Multi-machine operation.** Placement across racks and zones, repair ordered by
    remaining redundancy, rebalancing, and retiring disks that start to fail. Done when
    tests that fail disks, machines and racks during writes show that every acknowledged
    write can still be read back.
-4. **Cells.** A replicated map of which cell owns each key range, routing from cached
+3. **Cells.** A replicated map of which cell owns each key range, routing from cached
    copies of it with redirects after a range moves, moving a range between cells while it
    is read and written, and adding and retiring cells. Done when ranges move between cells
    under a mixed workload with no lost write and no stale read, and failing or upgrading

@@ -14,7 +14,10 @@
     )
 )]
 
+pub mod block;
 pub mod engine;
+pub mod error;
+pub mod file;
 pub mod key;
 pub mod name;
 pub mod record;

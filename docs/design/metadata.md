@@ -25,11 +25,11 @@ fits the Name layer to S3.
 | Name | (bucket, key, VERSION, order) | a version: object or delete marker | (bucket, key) |
 | Name | (bucket, key, UPLOAD, upload) | a multipart upload in progress | (bucket, key) |
 | Name | (bucket, key, UPLOAD, upload, part) | an uploaded part | (bucket, key) |
-| File | (file, HEADER) | length, checksum | file |
-| File | (file, EXTENT, offset) | a block, or another file, and its length | file |
+| File | (file, HEADER) | length, extent count | file |
+| File | (file, EXTENT, end) | a block, or another file, and its length | file |
 | Block | (block, HEADER) | length, code, chunk size, checksum | block |
 | Block | (block, CHUNK, index) | the chunk store volume and chunk key holding chunk `index` | block |
-| Block | (block, ON, volume) | reverse entry: this block has a chunk on `volume` | block |
+| Block | (ON, volume, block) | reverse entry: which of the block's chunks `volume` holds | block |
 
 - **Everything for one object key is contiguous.** Its null-version pointer, its versions,
   its uploads and their parts sort together under `(bucket, key)`, so a Name range splits
@@ -50,14 +50,23 @@ fits the Name layer to S3.
 - **Files and blocks are named by random 128-bit IDs,** so ranges over them take uniform
   shares of the load, which is what Tectonic's hash partitioning buys [01 §1.5], and two
   IDs collide with probability about `n²/2^129`.
-- **A file is a list of extents,** each a block or another file. An object written by one
-  PUT is a file of blocks. A completed multipart upload is a file whose extents are its
-  parts' files: completing an upload of 10,000 parts writes 10,000 extents and moves no
-  bytes and no block records.
-- **The reverse Block entries are partitioned by block,** beside the forward ones, so a
-  block and its reverse entries change in one range transaction; repair visits every Block
-  range for a failed volume, as Tectonic's repair works "per Block layer shard, per disk"
-  [01 §1.5].
+- **A file is a list of extents,** each a block or another file, keyed by where each ends,
+  so one seek from any offset lands on the extent holding it. An object written by one PUT
+  is a file of blocks. A completed multipart upload is a file whose extents are its parts'
+  files: completing an upload of 10,000 parts writes 10,000 extents and moves no bytes and
+  no block records.
+- **Reverse Block entries sort by volume and live with their block.** Tectonic keys its
+  reverse index `(disk_id, blk_id)` and shards it by block, so a block and its reverse
+  entries change in one shard's transaction and repair works "per Block layer shard, per
+  disk" [01 §1.5, TEC Table 1]. A mantle Block range spans an interval of block IDs and
+  holds, under a prefix of their own, the reverse entries of its blocks keyed by volume and
+  then block, so one scan lists the range's blocks on a volume. A split cuts the forward
+  rows at a block ID and each volume's reverse entries at the same ID. Research note 01
+  (M3) proposes virtual shards for such rows instead, which fixes at creation how many
+  ranges the layer can have and makes every range seek once per virtual shard it owns;
+  cutting per volume costs only when a range splits.
+- **A block's chunks are on distinct volumes,** since chunks on one volume are lost
+  together. The Block layer refuses a block, or a move, that would put two on one.
 - **Bucket rows are few and change rarely,** at most 10,000 a tenant by default [05 §10.4].
   A cell keeps them in its own Bucket ranges, and gateways cache them with the row's
   version. S3 lets a versioning change take "up to 15 minutes" to reach every write
@@ -126,7 +135,8 @@ replica; its log is the node's shared write-ahead log.
   TLA+ before they are built (architecture §6.1, §10).
 - **Transport:** QUIC for snapshots and other bulk transfers, and a separate UDP datagram
   plane for Raft's messages, including Fast Raft's, as the hecate specification lays out
-  (07 §4.7).
+  (07 §4.7). A fast-track proposal carries its entry, so an entry travels as datagrams only
+  while it fits the path MTU (07 §7).
 
 ## 4. The state engine
 
@@ -156,6 +166,9 @@ cover the production engine, which the simulator cannot.
 ## 6. Open
 
 - The production engine and its binding (§4).
+- How an entry larger than a datagram reaches the replicas: over QUIC, or fragmented on the
+  UDP plane. A completion of 10,000 parts is an entry of hundreds of kilobytes in the Name
+  range and another in the File range.
 - How long a Name scan may pass over delete markers before a listing page ends short.
 - The grace period of lazy deletion, which is a recovery-point policy.
 - The bound on a cached bucket row's staleness, and how a versioning change reaches

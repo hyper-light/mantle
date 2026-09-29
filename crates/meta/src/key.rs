@@ -11,6 +11,8 @@
 pub const LOCAL: u8 = 0x00;
 /// The rows of the range's layer.
 pub const DATA: u8 = 0x01;
+/// The Block layer's reverse rows: which of the range's blocks has a chunk on each volume.
+pub const REVERSE: u8 = 0x02;
 
 /// Name-layer rows under `(bucket, key)`, in the order they sort.
 const NULL: u8 = 1;
@@ -107,6 +109,93 @@ pub fn decode_name(k: &[u8]) -> Option<(String, String, NameRow)> {
         String::from_utf8(key).ok()?,
         row,
     ))
+}
+
+/// File-layer rows under a file's ID.
+const HEADER: u8 = 1;
+const EXTENT: u8 = 2;
+/// Block-layer rows under a block's ID, after its header.
+const CHUNK: u8 = 2;
+
+/// The key of a file's header row.
+pub fn file_header(file: u128) -> Vec<u8> {
+    id_row(file, HEADER)
+}
+
+/// The key of a file's extent that ends at byte `end` of the file: keyed by its end, a seek
+/// forward from any offset lands on the extent that holds it.
+pub fn file_extent(file: u128, end: u64) -> Vec<u8> {
+    let mut out = id_row(file, EXTENT);
+    out.extend_from_slice(&end.to_be_bytes());
+    out
+}
+
+/// The end an extent's key names.
+pub fn extent_end(k: &[u8]) -> Option<u64> {
+    Some(u64::from_be_bytes(id_row_tail(k, EXTENT)?.try_into().ok()?))
+}
+
+/// The key of a block's header row.
+pub fn block_header(block: u128) -> Vec<u8> {
+    id_row(block, HEADER)
+}
+
+/// The key of the row locating chunk `index` of a block.
+pub fn block_chunk(block: u128, index: u16) -> Vec<u8> {
+    let mut out = id_row(block, CHUNK);
+    out.extend_from_slice(&index.to_be_bytes());
+    out
+}
+
+/// The first and last possible keys of every row of one file or block.
+pub fn id_rows(id: u128) -> (Vec<u8>, Vec<u8>) {
+    (id_row(id, 0), id_row(id, u8::MAX))
+}
+
+fn id_row(id: u128, kind: u8) -> Vec<u8> {
+    let mut out = Vec::with_capacity(18);
+    out.push(DATA);
+    out.extend_from_slice(&id.to_be_bytes());
+    out.push(kind);
+    out
+}
+
+/// What follows the ID in a File- or Block-layer key of `kind`.
+fn id_row_tail(k: &[u8], kind: u8) -> Option<&[u8]> {
+    let (&prefix, rest) = k.split_first()?;
+    let (&found, tail) = rest.get(16..)?.split_first()?;
+    if prefix == DATA && found == kind {
+        Some(tail)
+    } else {
+        None
+    }
+}
+
+/// The key of the reverse row saying `block` has a chunk on `volume`. It sorts by volume, then
+/// block, so one scan lists a range's blocks on a volume, as Tectonic keys its reverse index
+/// `(disk_id, blk_id)` and shards it by block [01 Table 1]; it is kept in the range of its
+/// block, so it changes in the same transaction as the block's rows.
+pub fn reverse(volume: u128, block: u128) -> Vec<u8> {
+    let mut out = Vec::with_capacity(33);
+    out.push(REVERSE);
+    out.extend_from_slice(&volume.to_be_bytes());
+    out.extend_from_slice(&block.to_be_bytes());
+    out
+}
+
+/// The first key of `volume`'s reverse rows, and a key past its last.
+pub fn reverse_rows(volume: u128) -> (Vec<u8>, Vec<u8>) {
+    let mut past = reverse(volume, u128::MAX);
+    past.push(0);
+    (reverse(volume, 0), past)
+}
+
+/// The volume and block a reverse row's key names.
+pub fn decode_reverse(k: &[u8]) -> Option<(u128, u128)> {
+    let rest = k.strip_prefix(&[REVERSE])?;
+    let volume = u128::from_be_bytes(rest.get(..16)?.try_into().ok()?);
+    let block = u128::from_be_bytes(rest.get(16..)?.try_into().ok()?);
+    Some((volume, block))
 }
 
 /// Appends `s` escaped and ended.
@@ -244,6 +333,19 @@ mod tests {
             prop_assert_eq!(parse_version_id(&version_id(a)), Some(a));
             prop_assert_eq!(version_id(a).cmp(&version_id(b)), a.cmp(&b));
         }
+    }
+
+    #[test]
+    fn file_and_block_keys_decode_only_as_their_kind() {
+        assert_eq!(extent_end(&file_extent(7, 35)), Some(35));
+        assert_eq!(extent_end(&block_chunk(7, 3)), None);
+        assert_eq!(extent_end(&file_header(7)), None);
+        let (from, past) = reverse_rows(4);
+        let k = reverse(4, u128::MAX);
+        assert!(from <= k && k < past && past < reverse(5, 0));
+        assert_eq!(decode_reverse(&k), Some((4, u128::MAX)));
+        assert_eq!(decode_reverse(&past), None);
+        assert_eq!(decode_reverse(&file_header(4)), None);
     }
 
     #[test]

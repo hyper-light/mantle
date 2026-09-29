@@ -7,9 +7,10 @@
 //! time is the later of the command's and just after the range's last, so versions of a key
 //! never share an order.
 
-use crate::engine::{Engine, EngineError, Write};
+use crate::engine::{Engine, Write};
+use crate::error::MetaError;
 use crate::key::{self, NULL_VERSION, NameRow};
-use crate::record::{Checksum, Part, RecordError, Upload, Version};
+use crate::record::{Checksum, Part, Upload, Version};
 
 /// The range's clock: the last time it assigned, nanoseconds since the Unix epoch.
 const CLOCK: &[u8] = &[key::LOCAL, b'c'];
@@ -186,23 +187,12 @@ pub enum Outcome {
     Stale,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum NameError {
-    #[error(transparent)]
-    Engine(#[from] EngineError),
-    #[error(transparent)]
-    Record(#[from] RecordError),
-    /// A row whose key does not decode where a Name row belongs.
-    #[error("a row in the Name layer does not decode")]
-    Corrupt,
-}
-
 /// Applies `command` as log entry `index`. A refused command still advances the index.
 pub fn apply<E: Engine>(
     engine: &mut E,
     index: u64,
     command: &Command,
-) -> Result<Outcome, NameError> {
+) -> Result<Outcome, MetaError> {
     let (outcome, writes) = match command {
         Command::Put(p) => put(engine, p)?,
         Command::Delete(d) => delete(engine, d)?,
@@ -215,7 +205,7 @@ pub fn apply<E: Engine>(
     Ok(outcome)
 }
 
-fn put<E: Engine>(engine: &E, p: &Put) -> Result<(Outcome, Vec<Write>), NameError> {
+fn put<E: Engine>(engine: &E, p: &Put) -> Result<(Outcome, Vec<Write>), MetaError> {
     let (bucket, key, versioning) = (p.bucket.as_str(), p.key.as_str(), p.versioning);
     let (preconditions, at_ns, ordered_ns, version) =
         (&p.preconditions, p.at_ns, p.ordered_ns, &p.version);
@@ -266,7 +256,7 @@ fn put<E: Engine>(engine: &E, p: &Put) -> Result<(Outcome, Vec<Write>), NameErro
     ))
 }
 
-fn delete<E: Engine>(engine: &E, d: &Delete) -> Result<(Outcome, Vec<Write>), NameError> {
+fn delete<E: Engine>(engine: &E, d: &Delete) -> Result<(Outcome, Vec<Write>), MetaError> {
     let (bucket, key, versioning) = (d.bucket.as_str(), d.key.as_str(), d.versioning);
     let (named, if_match, at_ns) = (d.named, d.if_match.as_ref(), d.at_ns);
     if let Some(if_match) = if_match {
@@ -372,7 +362,7 @@ fn delete<E: Engine>(engine: &E, d: &Delete) -> Result<(Outcome, Vec<Write>), Na
 fn create_upload<E: Engine>(
     engine: &E,
     c: &CreateUpload,
-) -> Result<(Outcome, Vec<Write>), NameError> {
+) -> Result<(Outcome, Vec<Write>), MetaError> {
     let (time, mut writes) = tick(engine, c.at_ns)?;
     let upload = key::version_id(time);
     let row = Upload {
@@ -390,7 +380,7 @@ fn create_upload<E: Engine>(
     Ok((Outcome::Created { upload }, writes))
 }
 
-fn put_part<E: Engine>(engine: &E, p: &PutPart) -> Result<(Outcome, Vec<Write>), NameError> {
+fn put_part<E: Engine>(engine: &E, p: &PutPart) -> Result<(Outcome, Vec<Write>), MetaError> {
     if upload(engine, &p.bucket, &p.key, &p.upload)?.is_none() {
         return Ok((Outcome::NoSuchUpload, Vec::new()));
     }
@@ -405,7 +395,7 @@ fn put_part<E: Engine>(engine: &E, p: &PutPart) -> Result<(Outcome, Vec<Write>),
     ))
 }
 
-fn complete<E: Engine>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), NameError> {
+fn complete<E: Engine>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), MetaError> {
     let Some(upload_row) = upload(engine, &c.bucket, &c.key, &c.upload)? else {
         // A retry of a complete that committed finds the version it made (05 §4.4).
         let made = match key::parse_version_id(&c.upload) {
@@ -479,7 +469,7 @@ fn complete<E: Engine>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>)
     Ok((outcome, writes))
 }
 
-fn abort<E: Engine>(engine: &E, a: &Abort) -> Result<(Outcome, Vec<Write>), NameError> {
+fn abort<E: Engine>(engine: &E, a: &Abort) -> Result<(Outcome, Vec<Write>), MetaError> {
     if upload(engine, &a.bucket, &a.key, &a.upload)?.is_none() {
         return Ok((Outcome::NoSuchUpload, Vec::new()));
     }
@@ -495,7 +485,7 @@ fn remove_upload<E: Engine>(
     bucket: &str,
     key: &str,
     upload: &str,
-) -> Result<Vec<Write>, NameError> {
+) -> Result<Vec<Write>, MetaError> {
     let id = upload.as_bytes().to_vec();
     let mut writes = vec![Write::Delete(key::name(
         bucket,
@@ -521,7 +511,7 @@ pub fn upload<E: Engine>(
     bucket: &str,
     key: &str,
     upload: &str,
-) -> Result<Option<Upload>, NameError> {
+) -> Result<Option<Upload>, MetaError> {
     let row = key::name(bucket, key, &NameRow::Upload(upload.as_bytes().to_vec()));
     Ok(engine.get(&row)?.map(|b| Upload::decode(&b)).transpose()?)
 }
@@ -535,7 +525,7 @@ pub fn parts<E: Engine>(
     upload: &str,
     after_part: u16,
     max: usize,
-) -> Result<Vec<(u16, Part)>, NameError> {
+) -> Result<Vec<(u16, Part)>, MetaError> {
     let id = upload.as_bytes().to_vec();
     let Some(first) = after_part.checked_add(1) else {
         return Ok(Vec::new());
@@ -549,7 +539,7 @@ pub fn parts<E: Engine>(
             break;
         };
         let Some((_, _, NameRow::Part(_, number))) = key::decode_name(&k) else {
-            return Err(NameError::Corrupt);
+            return Err(MetaError::Corrupt);
         };
         out.push((number, Part::decode(&v)?));
         from = after(&k);
@@ -562,14 +552,14 @@ pub fn current<E: Engine>(
     engine: &E,
     bucket: &str,
     key: &str,
-) -> Result<Option<(u64, Version)>, NameError> {
+) -> Result<Option<(u64, Version)>, MetaError> {
     let from = key::name(bucket, key, &NameRow::Version(0));
     let to = key::name(bucket, key, &NameRow::Upload(Vec::new()));
     match engine.next(&from, &to)? {
         None => Ok(None),
         Some((k, v)) => match key::decode_name(&k) {
             Some((_, _, NameRow::Version(order))) => Ok(Some((order, Version::decode(&v)?))),
-            _ => Err(NameError::Corrupt),
+            _ => Err(MetaError::Corrupt),
         },
     }
 }
@@ -580,7 +570,7 @@ pub fn version<E: Engine>(
     bucket: &str,
     key: &str,
     named: Named,
-) -> Result<Option<(u64, Version)>, NameError> {
+) -> Result<Option<(u64, Version)>, MetaError> {
     let order = match named {
         Named::Order(order) => order,
         Named::Null => match null_order(engine, bucket, key)? {
@@ -595,11 +585,11 @@ pub fn version<E: Engine>(
 }
 
 /// The order of the key's null version.
-fn null_order<E: Engine>(engine: &E, bucket: &str, key: &str) -> Result<Option<u64>, NameError> {
+fn null_order<E: Engine>(engine: &E, bucket: &str, key: &str) -> Result<Option<u64>, MetaError> {
     match engine.get(&key::name(bucket, key, &NameRow::Null))? {
         None => Ok(None),
         Some(bytes) => Ok(Some(u64::from_be_bytes(
-            bytes.try_into().map_err(|_| NameError::Corrupt)?,
+            bytes.try_into().map_err(|_| MetaError::Corrupt)?,
         ))),
     }
 }
@@ -609,7 +599,7 @@ fn remove_null<E: Engine>(
     engine: &E,
     bucket: &str,
     key: &str,
-) -> Result<(Option<Version>, Vec<Write>), NameError> {
+) -> Result<(Option<Version>, Vec<Write>), MetaError> {
     match version(engine, bucket, key, Named::Null)? {
         None => Ok((None, Vec::new())),
         Some((order, v)) => Ok((
@@ -623,10 +613,10 @@ fn remove_null<E: Engine>(
 }
 
 /// The time a write takes, after the range's last, and the write that records it.
-fn tick<E: Engine>(engine: &E, at_ns: u64) -> Result<(u64, Vec<Write>), NameError> {
+fn tick<E: Engine>(engine: &E, at_ns: u64) -> Result<(u64, Vec<Write>), MetaError> {
     let last = match engine.get(CLOCK)? {
         None => 0,
-        Some(bytes) => u64::from_be_bytes(bytes.try_into().map_err(|_| NameError::Corrupt)?),
+        Some(bytes) => u64::from_be_bytes(bytes.try_into().map_err(|_| MetaError::Corrupt)?),
     };
     let time = at_ns.max(last.saturating_add(1));
     Ok((
@@ -667,7 +657,7 @@ pub fn next_current<E: Engine>(
     bucket: &str,
     from: &[u8],
     budget: usize,
-) -> Result<Scan, NameError> {
+) -> Result<Scan, MetaError> {
     let mut position = key::position(bucket, from);
     // Where the next step starts, in object-key space.
     let mut resume = from.to_vec();
@@ -681,7 +671,7 @@ pub fn next_current<E: Engine>(
             return Ok(Scan::End);
         };
         let Some((_, object, row)) = key::decode_name(&k) else {
-            return Err(NameError::Corrupt);
+            return Err(MetaError::Corrupt);
         };
         match row {
             // The null pointer sorts before the key's versions.

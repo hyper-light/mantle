@@ -107,16 +107,22 @@ suspended and never enabled, conditional writes judged at commit, delete markers
 version, multipart uploads whose parts are checked at completion, and listings that stop
 within a budget and resume. The File layer: files written once as extents, found from any
 offset with one seek. The Block layer: where each chunk lives, with a reverse row per chunk
-that a property test keeps in step with the chunks through writes, moves and deletes.
+that a property test keeps in step with the chunks through writes, moves and deletes. The
+Bucket layer: owners' quotas and listings, and the steps of creating and deleting a bucket
+across ranges, fenced by attempt, with the gates each Name range admits writes through. A
+simulation of one bucket across a Bucket range and two Name ranges checks after every step
+that no acknowledged write is lost to a delete, under 2,000 generated schedules of
+concurrent creates and deletes, coordinators taken over, and writers with stale views.
 
 Remaining before it is done:
 
-- The Bucket layer, and the emptiness check that deleting a bucket needs.
+- The coordinator that runs a bucket's create and delete across the ranges, and the
+  collector that finishes what a failed one leaves and removes unreferenced files and
+  blocks after a grace period.
 - The production engine, once its binding is chosen (design §4).
 - Ranges replicated with focal's Raft and its fast-track commit over a shared per-disk log,
   with request deduplication, ReadIndex reads, snapshots and splits, over QUIC for bulk
   transfers and a UDP transport for consensus messages.
-- The collector that removes unreferenced files and blocks after a grace period.
 - Done when a linearizability checker accepts histories recorded under network partitions,
   process crashes and disk faults, both in deterministic simulation and with real
   processes.

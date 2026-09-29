@@ -12,4 +12,8 @@ pub enum MetaError {
     /// The range's rows do not decode, or contradict one another.
     #[error("the range's rows are inconsistent")]
     Corrupt,
+    /// The range's clock reached its last instant, which only a proposal stamped at the end
+    /// of time can bring about.
+    #[error("the range's clock has no later instant")]
+    ClockExhausted,
 }

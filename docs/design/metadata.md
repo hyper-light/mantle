@@ -20,7 +20,10 @@ fits the Name layer to S3.
 
 | Layer | Key | Value | Partitioned by |
 |---|---|---|---|
-| Bucket | bucket | owner, created, location, versioning state, MFA delete | bucket |
+| Bucket | bucket | owner, creation time, location, versioning state, lifecycle state | bucket |
+| Bucket | (OWNER, owner) | how many buckets the owner has | bucket |
+| Bucket | (OWNER, owner, bucket) | reverse entry: the owner's bucket, its creation time and location | bucket |
+| Name | (GATE, bucket), in each range | the bucket's incarnation, and whether the range admits its writes | (bucket, key) |
 | Name | (bucket, key, NULL) | order of the key's null version | (bucket, key) |
 | Name | (bucket, key, VERSION, order) | a version: object or delete marker | (bucket, key) |
 | Name | (bucket, key, UPLOAD, upload) | a multipart upload in progress | (bucket, key) |
@@ -68,10 +71,15 @@ fits the Name layer to S3.
 - **A block's chunks are on distinct volumes,** since chunks on one volume are lost
   together. The Block layer refuses a block, or a move, that would put two on one.
 - **Bucket rows are few and change rarely,** at most 10,000 a tenant by default [05 §10.4].
-  A cell keeps them in its own Bucket ranges, and gateways cache them with the row's
-  version. S3 lets a versioning change take "up to 15 minutes" to reach every write
-  [05 §7.1]; mantle bounds the cache's staleness below that, and a write carries the state
-  it was made under.
+  A cell keeps them in its own Bucket ranges, and gateways cache them. A write carries the
+  bucket's incarnation and the versioning state it was made under. S3 lets a versioning
+  change take "up to 15 minutes" to reach every write [05 §7.1]; mantle bounds the cache's
+  staleness below that. A stale cache never lets a write into a deleted bucket, since each
+  Name range admits a bucket's writes through its gate (§2).
+- **An owner's buckets are counted and listed** from reverse rows sorted by owner and kept
+  in the range of each bucket, as the Block layer's are by volume. A create past the
+  owner's quota, 10,000 by default as in S3 [05 §10.4], is refused with `TooManyBuckets`.
+  While the Bucket layer is one range, the count and the listing are exact.
 
 ## 2. Operations
 
@@ -101,6 +109,52 @@ layers removes them, as Tectonic's does [01 §1.6].
   parts against the list sent (numbers ascending, ETags and checksums matching;
   body.rs), commits the version, and removes the upload and its part rows. A retried
   complete with the same parts finds the version it made and answers as before (05 §4.4).
+- **Creating and deleting a bucket** touch the Bucket range and every Name range the
+  bucket's keys fall in. Each is a sequence of range transactions, each guarded by what the
+  one before it wrote, with the collector finishing what a failure leaves, as Tectonic moves
+  a directory between shards [01 §1.6].
+  - *Gates.* Each Name range holds a gate for every bucket whose keys it may hold. The gate
+    records the bucket's incarnation, the attempt that last moved it, and whether it is
+    open, closed or condemned. The incarnation is the bucket's creation time in the Bucket
+    range, which a bucket re-created under the same name never repeats, since a range's
+    clock only moves forward. A write names the incarnation it was made under, and a range
+    applies it only through that incarnation's open gate, so a gateway whose cache is stale
+    is refused with `NoSuchBucket`, with no lease or clock bound needed. A range that
+    splits gives each side its floor and the gates of the buckets whose keys it can hold.
+  - *Attempts.* Each create and delete is an attempt, numbered by the Bucket range's clock
+    when it began. A request that finds another attempt in progress, such as a client's retry after
+    its gateway stopped answering, takes it over under a new number. Every step, in the
+    Bucket range and at the gates, names its attempt, and a step older than the attempt
+    that last moved the row or gate is refused, as a Raft proposal carrying an old lease
+    sequence is refused at apply [06 §A4.3]. A Name range also keeps a floor, the attempt of
+    the last gate it removed, below which no attempt may place a gate, so a coordinator
+    left behind cannot reopen a gate for a bucket that is gone, and the range keeps no row
+    for the buckets it has removed. A create refused by the floor that another bucket's
+    removal raised starts again under a new number.
+  - *Create.* The Bucket range records the bucket as being created and counts it against
+    the owner's quota. Each Name range the bucket's keys fall in opens a gate for it, and
+    the Bucket range then marks it active and lists it. The collector deletes a create left
+    unfinished: it takes the create over as a delete, placing closed gates where none was
+    opened.
+  - *Delete.* The Bucket range marks the bucket as being deleted. Each Name range closes
+    its gate and is then read, in pages, for any version or delete marker: S3 deletes a
+    bucket only once "all object versions and delete markers" are gone [05 §10.5]. If one
+    is found, the gates reopen and the delete answers `BucketNotEmpty`. Otherwise the
+    Bucket range marks the bucket deleted, and it answers `NoSuchBucket` from then on. The
+    gates are condemned, and the collector removes the bucket's in-progress uploads, which
+    do not block deleting a general purpose bucket [05 §10.5], then its gates. Only then
+    does the Bucket range forget the name. Until it does, a create of that name answers
+    `OperationAborted` [05 §11], much as S3 "queues the bucket for deletion" [05 §10.5].
+  - *Why no write is lost.* A delete reads each range only after closing its gate under
+    its own attempt, so every write the range admits comes before the read, which sees it,
+    and every later one is refused, including those through a gate an older attempt had
+    reopened. The Bucket range accepts the delete only from the attempt that closed the
+    gates. An acknowledged write therefore either stops the delete or was itself deleted
+    first. A new incarnation never sees a condemned bucket's uploads, since the name is not
+    reused until they and the gates are gone. `crates/meta/tests/bucket_lifecycle.rs`
+    checks these properties after every step of 2,000 generated schedules. The schedules
+    have concurrent creates and deletes, coordinators that stall and are taken over,
+    collectors that resume, and writers with stale views.
 - **Listing** scans the Name range in key order (list.rs), taking the first version of each
   key and skipping keys whose first version is a delete marker (05 §6.4). How far one scan
   may pass over delete markers before a page ends short is a range's to bound (s3-protocol
@@ -166,6 +220,9 @@ cover the production engine, which the simulator cannot.
 ## 6. Open
 
 - The production engine and its binding (§4).
+- An owner's quota and ListBuckets once the Bucket layer outgrows one range.
+- Gates in the TLA+ model of splits and merges (§3), with the create and delete sequences
+  run against them.
 - How an entry larger than a datagram reaches the replicas: over QUIC, or fragmented on the
   UDP plane. A completion of 10,000 parts is an entry of hundreds of kilobytes in the Name
   range and another in the File range.

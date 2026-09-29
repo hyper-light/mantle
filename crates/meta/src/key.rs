@@ -11,7 +11,8 @@
 pub const LOCAL: u8 = 0x00;
 /// The rows of the range's layer.
 pub const DATA: u8 = 0x01;
-/// The Block layer's reverse rows: which of the range's blocks has a chunk on each volume.
+/// Reverse rows: an index kept in the range of the rows it indexes and sorted by another of
+/// their fields, the Block layer's by volume and the Bucket layer's by owner.
 pub const REVERSE: u8 = 0x02;
 
 /// Name-layer rows under `(bucket, key)`, in the order they sort.
@@ -69,6 +70,24 @@ pub fn object(bucket: &str, key: &str) -> Vec<u8> {
 pub fn objects(bucket: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(bucket.len().saturating_add(2));
     out.push(DATA);
+    put_string(&mut out, bucket.as_bytes());
+    out
+}
+
+/// The first key of a bucket's objects' rows, and a key past the last. After the bucket's
+/// name ends, an object key's first byte is never 0xFF, which UTF-8 never holds and escaping
+/// only writes after a 0x00, so every row of the bucket sorts before the second key and every
+/// row of a longer bucket name after it.
+pub fn bucket_span(bucket: &str) -> (Vec<u8>, Vec<u8>) {
+    let from = objects(bucket);
+    let mut past = from.clone();
+    past.push(0xFF);
+    (from, past)
+}
+
+/// The key of a Name range's gate for a bucket (docs/design/metadata.md §2).
+pub fn gate(bucket: &str) -> Vec<u8> {
+    let mut out = vec![LOCAL, b'g'];
     put_string(&mut out, bucket.as_bytes());
     out
 }
@@ -196,6 +215,58 @@ pub fn decode_reverse(k: &[u8]) -> Option<(u128, u128)> {
     let volume = u128::from_be_bytes(rest.get(..16)?.try_into().ok()?);
     let block = u128::from_be_bytes(rest.get(16..)?.try_into().ok()?);
     Some((volume, block))
+}
+
+/// The key of a bucket's row in the Bucket layer.
+pub fn bucket(name: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(name.len().saturating_add(2));
+    out.push(DATA);
+    put_string(&mut out, name.as_bytes());
+    out
+}
+
+/// The key of an owner's row, which counts its buckets. The reverse rows of its buckets
+/// follow it.
+pub fn owner(owner: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(owner.len().saturating_add(2));
+    out.push(REVERSE);
+    put_string(&mut out, owner.as_bytes());
+    out
+}
+
+/// The key of the reverse row saying `owner` owns `bucket`.
+pub fn owned(owner: &str, bucket: &str) -> Vec<u8> {
+    let mut out = self::owner(owner);
+    put_string(&mut out, bucket.as_bytes());
+    out
+}
+
+/// The first key of `owner`'s reverse rows after bucket `after`, or of all of them, and a key
+/// past the last.
+pub fn owned_rows(owner: &str, after: Option<&str>) -> (Vec<u8>, Vec<u8>) {
+    let head = self::owner(owner);
+    let mut past = head.clone();
+    past.push(0xFF);
+    let mut from = match after {
+        Some(bucket) => owned(owner, bucket),
+        None => head,
+    };
+    from.push(0);
+    (from, past)
+}
+
+/// The owner and bucket a reverse row's key names.
+pub fn decode_owned(k: &[u8]) -> Option<(String, String)> {
+    let rest = k.strip_prefix(&[REVERSE])?;
+    let (owner, rest) = take_string(rest)?;
+    let (bucket, rest) = take_string(rest)?;
+    if !rest.is_empty() {
+        return None;
+    }
+    Some((
+        String::from_utf8(owner).ok()?,
+        String::from_utf8(bucket).ok()?,
+    ))
 }
 
 /// Appends `s` escaped and ended.
@@ -333,6 +404,42 @@ mod tests {
             prop_assert_eq!(parse_version_id(&version_id(a)), Some(a));
             prop_assert_eq!(version_id(a).cmp(&version_id(b)), a.cmp(&b));
         }
+    }
+
+    #[test]
+    fn a_bucket_span_holds_its_rows_and_no_other_buckets() {
+        let (from, past) = bucket_span("b");
+        for inside in [
+            name("b", "", &NameRow::Null),
+            name("b", "\0k", &NameRow::Version(0)),
+            name("b", "\u{10FFFF}", &NameRow::Part(vec![0xFF], u16::MAX)),
+        ] {
+            assert!(from <= inside && inside < past, "{inside:?}");
+        }
+        for outside in [
+            name("b\0", "", &NameRow::Null),
+            name("b\0\0", "k", &NameRow::Null),
+            name("ba", "", &NameRow::Null),
+            name("a", "\u{10FFFF}", &NameRow::Null),
+        ] {
+            assert!(outside < from || past <= outside, "{outside:?}");
+        }
+    }
+
+    #[test]
+    fn owner_rows_list_its_buckets_after_its_count() {
+        let (from, past) = owned_rows("o", None);
+        let head = owner("o");
+        assert!(head < from);
+        for bucket in ["a", "b\0", "zz"] {
+            let k = owned("o", bucket);
+            assert!(from <= k && k < past);
+            assert_eq!(decode_owned(&k), Some(("o".into(), bucket.into())));
+        }
+        assert!(owned("o\0", "a") >= past);
+        let (after_a, _) = owned_rows("o", Some("a"));
+        assert!(owned("o", "a") < after_a && after_a < owned("o", "a\0"));
+        assert_eq!(decode_owned(&head), None);
     }
 
     #[test]

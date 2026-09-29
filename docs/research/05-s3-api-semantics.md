@@ -1170,6 +1170,14 @@ Other points:
 - ListBuckets is paginated: `GET /?max-buckets=&continuation-token=&prefix=&bucket-region=`. `max-buckets` ranges 1–10000. "If you specify the `bucket-region`, `prefix`, or `continuation-token` query parameters without using `max-buckets` ... Amazon S3 applies a default page size of 10,000 and provides a continuation token" ([ListBuckets](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListBuckets.html)).
 - The response has `Buckets/Bucket{BucketArn, BucketRegion, CreationDate, Name}`, `Owner`, `ContinuationToken` and `Prefix`. "Unpaginated `ListBuckets` requests are only supported for AWS accounts set to the default general purpose bucket quota of 10,000."
 
+### 10.5 Deleting a bucket (retrieved 2026-09-28)
+
+- [DeleteBucket](https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteBucket.html): "All objects (including all object versions and delete markers) in the bucket must be deleted before the bucket itself can be deleted." A note scoped to directory buckets only: "If multipart uploads in a directory bucket are in progress, you can't delete the bucket until all the in-progress multipart uploads are aborted or completed." Success is `204` with an empty body.
+- [Emptying a general purpose bucket](https://docs.aws.amazon.com/AmazonS3/latest/userguide/empty-bucket.html): "While emptying your bucket, we recommend that you also remove all incomplete multipart uploads. ... In cases where the multipart upload process doesn't finish, the incomplete parts remain in the bucket (in an unusable state). These incomplete parts incur storage costs until the upload process is finished, or until the incomplete parts are removed." Also: "Objects added to the bucket while the empty bucket action is in progress might be deleted."
+- [Deleting a general purpose bucket](https://docs.aws.amazon.com/AmazonS3/latest/userguide/delete-bucket.html): "When you delete a general purpose bucket, the bucket might not be instantly removed. Instead, Amazon S3 queues the bucket for deletion. Because Amazon S3 is distributed across AWS Regions, the deletion process takes time to fully propagate and achieve consistency throughout the system." And: "another AWS account can use the same general purpose bucket name for a new bucket and can therefore potentially receive requests intended for the deleted bucket."
+- **INFERENCE:** in-progress multipart uploads do not block deleting a general purpose bucket. The requirement is stated for directory buckets alone, and for general purpose buckets removing them is a recommendation. No page consulted says what becomes of such an upload once its bucket is deleted.
+- A reimplementation shows the failure modes a bucket delete must close: in-progress uploads surviving into a re-created bucket of the same name, and a PUT racing the delete bringing the bucket back ([Integrated-S3 issue 301](https://github.com/SymoHTL/Integrated-S3/issues/301), title only).
+
 
 ## 11. Error responses
 

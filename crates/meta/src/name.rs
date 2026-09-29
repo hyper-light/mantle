@@ -2,29 +2,21 @@
 //! as commands applied at a log index, and its reads.
 //!
 //! Applying a command reads the key's rows, decides, and writes one batch with the entry's
-//! index, so every replica that applies the same log holds the same rows. Time is part of the
-//! command, as the leader proposed it, and the range's clock only moves forward: a write's
-//! time is the later of the command's and just after the range's last, so versions of a key
-//! never share an order.
+//! index, so every replica that applies the same log holds the same rows. A write's time is
+//! the range's clock's (clock.rs), so versions of a key never share an order. A write to a
+//! bucket's objects passes only through the bucket's open gate for the incarnation it names
+//! (docs/design/metadata.md §2).
 
+use crate::clock;
 use crate::engine::{Engine, Write};
 use crate::error::MetaError;
 use crate::key::{self, NULL_VERSION, NameRow};
-use crate::record::{Checksum, Part, Upload, Version};
+use crate::record::{self, Checksum, Gate, GateState, Part, Upload, Version};
 
-/// The range's clock: the last time it assigned, nanoseconds since the Unix epoch.
-const CLOCK: &[u8] = &[key::LOCAL, b'c'];
+pub use crate::record::Versioning;
 
 /// "Part size: 5 MiB to 5 GiB. There is no minimum size limit on the last part" (05 §4.1).
 pub const MIN_PART: u64 = 5 << 20;
-
-/// A bucket's versioning state, as the write was made under (05 §7.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Versioning {
-    Unversioned,
-    Enabled,
-    Suspended,
-}
 
 /// Entity tags a precondition names, bare of quotes, or `*`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,12 +56,31 @@ pub enum Command {
     PutPart(PutPart),
     Complete(Complete),
     Abort(Abort),
+    Gate(GateChange),
+    Collect(Collect),
+}
+
+impl Command {
+    /// The bucket and incarnation a write to objects names; `None` for the gates' commands.
+    fn write_to(&self) -> Option<(&str, u64)> {
+        match self {
+            Self::Put(c) => Some((&c.bucket, c.incarnation)),
+            Self::Delete(c) => Some((&c.bucket, c.incarnation)),
+            Self::CreateUpload(c) => Some((&c.bucket, c.incarnation)),
+            Self::PutPart(c) => Some((&c.bucket, c.incarnation)),
+            Self::Complete(c) => Some((&c.bucket, c.incarnation)),
+            Self::Abort(c) => Some((&c.bucket, c.incarnation)),
+            Self::Gate(_) | Self::Collect(_) => None,
+        }
+    }
 }
 
 /// A new version of `key`: PutObject, CopyObject's destination, or a completed upload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Put {
     pub bucket: String,
+    /// The bucket's incarnation the write was made under.
+    pub incarnation: u64,
     pub key: String,
     pub versioning: Versioning,
     pub preconditions: Preconditions,
@@ -89,6 +100,8 @@ pub struct Put {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateUpload {
     pub bucket: String,
+    /// The bucket's incarnation the write was made under.
+    pub incarnation: u64,
     pub key: String,
     pub at_ns: u64,
     /// The upload's owner, headers and checksum; its initiation time is the commit's.
@@ -100,6 +113,8 @@ pub struct CreateUpload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PutPart {
     pub bucket: String,
+    /// The bucket's incarnation the write was made under.
+    pub incarnation: u64,
     pub key: String,
     pub upload: String,
     pub number: u16,
@@ -110,6 +125,8 @@ pub struct PutPart {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Complete {
     pub bucket: String,
+    /// The bucket's incarnation the write was made under.
+    pub incarnation: u64,
     pub key: String,
     pub upload: String,
     pub versioning: Versioning,
@@ -139,14 +156,42 @@ pub struct Listed {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Abort {
     pub bucket: String,
+    /// The bucket's incarnation the write was made under.
+    pub incarnation: u64,
     pub key: String,
     pub upload: String,
+}
+
+/// Moves a bucket's gate a step in its creation or deletion (docs/design/metadata.md §2), if
+/// the gate is where the coordinator read it and no later attempt has moved it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateChange {
+    pub bucket: String,
+    pub incarnation: u64,
+    /// The create or delete attempt making the change, as the Bucket range issued it.
+    pub attempt: u64,
+    /// The gate's state now; `None` for no gate.
+    pub from: Option<GateState>,
+    /// Its next state; `None` removes the gate once the range holds no row of the bucket.
+    pub to: Option<GateState>,
+}
+
+/// Removes rows of a condemned bucket, its uploads and their parts, as the collector does
+/// after a delete (docs/design/metadata.md §2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Collect {
+    pub bucket: String,
+    pub incarnation: u64,
+    /// Rows this entry may remove, which bounds its size.
+    pub budget: u32,
 }
 
 /// DeleteObject (05 §7.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Delete {
     pub bucket: String,
+    /// The bucket's incarnation the write was made under.
+    pub incarnation: u64,
     pub key: String,
     pub versioning: Versioning,
     pub named: Option<Named>,
@@ -185,6 +230,18 @@ pub enum Outcome {
     /// A listed part now holds another file than the gateway read: it read the parts again
     /// and retries, since the object it built would name the old part's bytes.
     Stale,
+    /// `404 NoSuchBucket`: the range holds no open gate for the write's incarnation.
+    NoSuchBucket,
+    /// A gate moved, or a retry found it moved.
+    GateMoved,
+    /// The gate is not where the step expects: the coordinator reads the bucket again.
+    Conflict,
+    /// A gate move that creating and deleting a bucket never make.
+    Invalid,
+    /// The range holds rows of the bucket that the step needs gone.
+    NotEmpty,
+    /// Rows of a condemned bucket were removed; `done` once none is left.
+    Collected { done: bool },
 }
 
 /// Applies `command` as log entry `index`. A refused command still advances the index.
@@ -193,16 +250,125 @@ pub fn apply<E: Engine>(
     index: u64,
     command: &Command,
 ) -> Result<Outcome, MetaError> {
+    let admitted = match command.write_to() {
+        Some((bucket, incarnation)) => admits(engine, bucket, incarnation)?,
+        None => true,
+    };
     let (outcome, writes) = match command {
+        _ if !admitted => (Outcome::NoSuchBucket, Vec::new()),
         Command::Put(p) => put(engine, p)?,
         Command::Delete(d) => delete(engine, d)?,
         Command::CreateUpload(c) => create_upload(engine, c)?,
         Command::PutPart(p) => put_part(engine, p)?,
         Command::Complete(c) => complete(engine, c)?,
         Command::Abort(a) => abort(engine, a)?,
+        Command::Gate(g) => move_gate(engine, g)?,
+        Command::Collect(c) => collect(engine, c)?,
     };
     engine.apply(index, &writes)?;
     Ok(outcome)
+}
+
+/// The range's gate floor: no attempt older than it may place a gate where there is none. A
+/// gate's removal raises it to the removing attempt, so a coordinator left behind by a later
+/// attempt cannot open a gate for a bucket that is gone, and the range keeps no row for it.
+const FLOOR: &[u8] = &[key::LOCAL, b'f'];
+
+/// Whether the range admits a write to `bucket` made under `incarnation`.
+fn admits<E: Engine>(engine: &E, bucket: &str, incarnation: u64) -> Result<bool, MetaError> {
+    Ok(gate(engine, bucket)?
+        .is_some_and(|g| g.incarnation == incarnation && g.state == GateState::Open))
+}
+
+fn move_gate<E: Engine>(engine: &E, g: &GateChange) -> Result<(Outcome, Vec<Write>), MetaError> {
+    use GateState::{Closed, Condemned, Open};
+    // The steps creating and deleting a bucket take. A delete that takes over from an
+    // attempt left behind closes each gate again, and one that abandons an unfinished create
+    // places closed gates where none was opened.
+    let step = matches!(
+        (g.from, g.to),
+        (None, Some(Open | Closed))
+            | (Some(Open), Some(Closed))
+            | (Some(Closed), Some(Open | Closed | Condemned))
+            | (Some(Condemned), None)
+    );
+    if !step {
+        return Ok((Outcome::Invalid, Vec::new()));
+    }
+    let now = gate(engine, &g.bucket)?;
+    let moved = g.to.map(|state| Gate {
+        incarnation: g.incarnation,
+        attempt: g.attempt,
+        state,
+    });
+    if now == moved {
+        // A retry finds the gate where it moved it.
+        return Ok((Outcome::GateMoved, Vec::new()));
+    }
+    let row = key::gate(&g.bucket);
+    match now {
+        Some(gate) => {
+            if gate.attempt > g.attempt
+                || gate.incarnation != g.incarnation
+                || Some(gate.state) != g.from
+            {
+                return Ok((Outcome::Conflict, Vec::new()));
+            }
+        }
+        None => {
+            if g.from.is_some() || g.attempt < floor(engine)? {
+                return Ok((Outcome::Conflict, Vec::new()));
+            }
+        }
+    }
+    let Some(next) = moved else {
+        let (from, to) = key::bucket_span(&g.bucket);
+        if engine.next(&from, &to)?.is_some() {
+            return Ok((Outcome::NotEmpty, Vec::new()));
+        }
+        let raised = floor(engine)?.max(g.attempt);
+        return Ok((
+            Outcome::GateMoved,
+            vec![
+                Write::Delete(row),
+                Write::Put(FLOOR.to_vec(), record::encode_number(raised)),
+            ],
+        ));
+    };
+    Ok((Outcome::GateMoved, vec![Write::Put(row, next.encode())]))
+}
+
+fn floor<E: Engine>(engine: &E) -> Result<u64, MetaError> {
+    match engine.get(FLOOR)? {
+        None => Ok(0),
+        Some(bytes) => Ok(record::decode_number(&bytes, "floor")?),
+    }
+}
+
+fn collect<E: Engine>(engine: &E, c: &Collect) -> Result<(Outcome, Vec<Write>), MetaError> {
+    let condemned = gate(engine, &c.bucket)?
+        .is_some_and(|g| g.incarnation == c.incarnation && g.state == GateState::Condemned);
+    if !condemned {
+        return Ok((Outcome::Conflict, Vec::new()));
+    }
+    let (mut from, to) = key::bucket_span(&c.bucket);
+    let mut writes = Vec::new();
+    for _ in 0..c.budget {
+        let Some((k, _)) = engine.next(&from, &to)? else {
+            return Ok((Outcome::Collected { done: true }, writes));
+        };
+        match key::decode_name(&k) {
+            Some((_, _, NameRow::Upload(_) | NameRow::Part(..))) => {}
+            // A version under a condemned gate: the delete never read this range (§2), and
+            // the collector removes no object.
+            Some(_) => return Ok((Outcome::NotEmpty, Vec::new())),
+            None => return Err(MetaError::Corrupt),
+        }
+        from = after(&k);
+        writes.push(Write::Delete(k));
+    }
+    let done = engine.next(&from, &to)?.is_none();
+    Ok((Outcome::Collected { done }, writes))
 }
 
 fn put<E: Engine>(engine: &E, p: &Put) -> Result<(Outcome, Vec<Write>), MetaError> {
@@ -227,7 +393,8 @@ fn put<E: Engine>(engine: &E, p: &Put) -> Result<(Outcome, Vec<Write>), MetaErro
             Some(_) => {}
         }
     }
-    let (time, mut writes) = tick(engine, at_ns)?;
+    let (time, clock) = clock::tick(engine, at_ns)?;
+    let mut writes = vec![clock];
     let when = ordered_ns.unwrap_or(time);
     let order = !when;
     let null = versioning != Versioning::Enabled;
@@ -235,7 +402,7 @@ fn put<E: Engine>(engine: &E, p: &Put) -> Result<(Outcome, Vec<Write>), MetaErro
         writes.extend(remove_null(engine, bucket, key)?.1);
         writes.push(Write::Put(
             key::name(bucket, key, &NameRow::Null),
-            order.to_be_bytes().to_vec(),
+            record::encode_number(order),
         ));
     }
     let written = Version {
@@ -323,13 +490,14 @@ fn delete<E: Engine>(engine: &E, d: &Delete) -> Result<(Outcome, Vec<Write>), Me
                 // Enabled stacks a new marker; suspended replaces the null version with a null
                 // marker (05 §7.3).
                 let null = versioning == Versioning::Suspended;
-                let (time, mut writes) = tick(engine, at_ns)?;
+                let (time, clock) = clock::tick(engine, at_ns)?;
+                let mut writes = vec![clock];
                 let order = !time;
                 if null {
                     writes.extend(remove_null(engine, bucket, key)?.1);
                     writes.push(Write::Put(
                         key::name(bucket, key, &NameRow::Null),
-                        order.to_be_bytes().to_vec(),
+                        record::encode_number(order),
                     ));
                 }
                 let marker = Version {
@@ -363,7 +531,8 @@ fn create_upload<E: Engine>(
     engine: &E,
     c: &CreateUpload,
 ) -> Result<(Outcome, Vec<Write>), MetaError> {
-    let (time, mut writes) = tick(engine, c.at_ns)?;
+    let (time, clock) = clock::tick(engine, c.at_ns)?;
+    let mut writes = vec![clock];
     let upload = key::version_id(time);
     let row = Upload {
         initiated_ns: time,
@@ -444,6 +613,7 @@ fn complete<E: Engine>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>)
         engine,
         &Put {
             bucket: c.bucket.clone(),
+            incarnation: c.incarnation,
             key: c.key.clone(),
             versioning: c.versioning,
             preconditions: c.preconditions.clone(),
@@ -588,9 +758,7 @@ pub fn version<E: Engine>(
 fn null_order<E: Engine>(engine: &E, bucket: &str, key: &str) -> Result<Option<u64>, MetaError> {
     match engine.get(&key::name(bucket, key, &NameRow::Null))? {
         None => Ok(None),
-        Some(bytes) => Ok(Some(u64::from_be_bytes(
-            bytes.try_into().map_err(|_| MetaError::Corrupt)?,
-        ))),
+        Some(bytes) => Ok(Some(record::decode_number(&bytes, "null")?)),
     }
 }
 
@@ -610,19 +778,6 @@ fn remove_null<E: Engine>(
             ],
         )),
     }
-}
-
-/// The time a write takes, after the range's last, and the write that records it.
-fn tick<E: Engine>(engine: &E, at_ns: u64) -> Result<(u64, Vec<Write>), MetaError> {
-    let last = match engine.get(CLOCK)? {
-        None => 0,
-        Some(bytes) => u64::from_be_bytes(bytes.try_into().map_err(|_| MetaError::Corrupt)?),
-    };
-    let time = at_ns.max(last.saturating_add(1));
-    Ok((
-        time,
-        vec![Write::Put(CLOCK.to_vec(), time.to_be_bytes().to_vec())],
-    ))
 }
 
 /// A version's ID: "null" for the null version, else its order's.
@@ -661,11 +816,7 @@ pub fn next_current<E: Engine>(
     let mut position = key::position(bucket, from);
     // Where the next step starts, in object-key space.
     let mut resume = from.to_vec();
-    let mut end = key::objects(bucket);
-    if let Some(last) = end.last_mut() {
-        // Past the bucket name's end marker: after every row of the bucket.
-        *last = 1;
-    }
+    let (_, end) = key::bucket_span(bucket);
     for _ in 0..budget {
         let Some((k, v)) = engine.next(&position, &end)? else {
             return Ok(Scan::End);
@@ -701,6 +852,54 @@ pub fn next_current<E: Engine>(
     Ok(Scan::Paused(resume))
 }
 
+/// The range's gate for `bucket`.
+pub fn gate<E: Engine>(engine: &E, bucket: &str) -> Result<Option<Gate>, MetaError> {
+    Ok(engine
+        .get(&key::gate(bucket))?
+        .map(|b| Gate::decode(&b))
+        .transpose()?)
+}
+
+/// What a read for a bucket's versions found (docs/design/metadata.md §2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Probe {
+    /// A version or a delete marker.
+    Found,
+    /// Neither, anywhere in the range.
+    Clear,
+    /// The budget of rows ran out first: the next read starts at this key.
+    Paused(Vec<u8>),
+}
+
+/// Whether the range holds a version or delete marker of `bucket`, reading at most `budget`
+/// rows from `from`, a paused read's key, or from the bucket's first row. A key's versions
+/// sort before its uploads, so one row answers for each key.
+pub fn probe<E: Engine>(
+    engine: &E,
+    bucket: &str,
+    from: Option<&[u8]>,
+    budget: usize,
+) -> Result<Probe, MetaError> {
+    let (first, to) = key::bucket_span(bucket);
+    let mut position = match from {
+        Some(k) if k > first.as_slice() => k.to_vec(),
+        _ => first,
+    };
+    for _ in 0..budget {
+        let Some((k, _)) = engine.next(&position, &to)? else {
+            return Ok(Probe::Clear);
+        };
+        match key::decode_name(&k) {
+            Some((_, _, NameRow::Null | NameRow::Version(_))) => return Ok(Probe::Found),
+            Some((_, object, NameRow::Upload(_) | NameRow::Part(..))) => {
+                position = beyond_rows(bucket, &object);
+            }
+            None => return Err(MetaError::Corrupt),
+        }
+    }
+    Ok(Probe::Paused(position))
+}
+
 /// The smallest key after `k`.
 fn after(k: &[u8]) -> Vec<u8> {
     let mut next = k.to_vec();
@@ -727,12 +926,34 @@ mod tests {
     }
 
     impl Range {
+        /// A range holding bucket "b", incarnation 1, open.
         fn new() -> Self {
-            Self {
+            let mut r = Self {
                 engine: Model::default(),
                 index: 0,
                 clock: 1_000,
-            }
+            };
+            assert_eq!(r.gate(None, Some(GateState::Open)), Outcome::GateMoved);
+            r
+        }
+
+        fn gate(&mut self, from: Option<GateState>, to: Option<GateState>) -> Outcome {
+            self.gate_at(1, from, to)
+        }
+
+        fn gate_at(
+            &mut self,
+            attempt: u64,
+            from: Option<GateState>,
+            to: Option<GateState>,
+        ) -> Outcome {
+            self.run(Command::Gate(GateChange {
+                bucket: "b".into(),
+                incarnation: 1,
+                attempt,
+                from,
+                to,
+            }))
         }
 
         fn run(&mut self, command: Command) -> Outcome {
@@ -754,6 +975,7 @@ mod tests {
             self.clock += 10;
             self.run(Command::Put(Put {
                 bucket: "b".into(),
+                incarnation: 1,
                 key: key.into(),
                 versioning,
                 preconditions: p,
@@ -767,6 +989,7 @@ mod tests {
             self.clock += 10;
             self.run(Command::Delete(Delete {
                 bucket: "b".into(),
+                incarnation: 1,
                 key: key.into(),
                 versioning,
                 named,
@@ -979,6 +1202,7 @@ mod tests {
             r.index,
             &Command::Put(Put {
                 bucket: "b".into(),
+                incarnation: 1,
                 key: "k".into(),
                 versioning: Versioning::Enabled,
                 preconditions: Preconditions::default(),
@@ -1028,6 +1252,7 @@ mod tests {
             self.clock += 10;
             match self.run(Command::CreateUpload(CreateUpload {
                 bucket: "b".into(),
+                incarnation: 1,
                 key: key.into(),
                 at_ns: self.clock,
                 upload: Upload {
@@ -1045,6 +1270,7 @@ mod tests {
         fn part(&mut self, key: &str, upload: &str, number: u16, size: u64, file: u128) -> Outcome {
             self.run(Command::PutPart(PutPart {
                 bucket: "b".into(),
+                incarnation: 1,
                 key: key.into(),
                 upload: upload.into(),
                 number,
@@ -1062,6 +1288,7 @@ mod tests {
             self.clock += 10;
             self.run(Command::Complete(Complete {
                 bucket: "b".into(),
+                incarnation: 1,
                 key: key.into(),
                 upload: upload.into(),
                 versioning: Versioning::Enabled,
@@ -1180,6 +1407,7 @@ mod tests {
         assert_eq!(
             r.run(Command::Abort(Abort {
                 bucket: "b".into(),
+                incarnation: 1,
                 key: "k".into(),
                 upload: u.clone(),
             })),
@@ -1190,6 +1418,7 @@ mod tests {
         assert_eq!(
             r.run(Command::Abort(Abort {
                 bucket: "b".into(),
+                incarnation: 1,
                 key: "k".into(),
                 upload: u,
             })),
@@ -1205,12 +1434,20 @@ mod tests {
     /// Replaying the log from the durable point after a crash rebuilds the same rows.
     #[test]
     fn replay_after_a_crash_reaches_the_same_rows() {
-        let commands: Vec<Command> = (0..20u64)
-            .map(|i| {
+        let open = Command::Gate(GateChange {
+            bucket: "b".into(),
+            incarnation: 1,
+            attempt: 1,
+            from: None,
+            to: Some(GateState::Open),
+        });
+        let commands: Vec<Command> = std::iter::once(open)
+            .chain((0..20u64).map(|i| {
                 let versioning = [Versioning::Enabled, Versioning::Suspended][(i % 2) as usize];
                 if i % 3 == 0 {
                     Command::Delete(Delete {
                         bucket: "b".into(),
+                        incarnation: 1,
                         key: format!("k{}", i % 4),
                         versioning,
                         named: None,
@@ -1220,6 +1457,7 @@ mod tests {
                 } else {
                     Command::Put(Put {
                         bucket: "b".into(),
+                        incarnation: 1,
                         key: format!("k{}", i % 4),
                         versioning,
                         preconditions: Preconditions::default(),
@@ -1228,7 +1466,7 @@ mod tests {
                         version: object(&format!("e{i}")),
                     })
                 }
-            })
+            }))
             .collect();
         let mut whole = Model::default();
         for (i, c) in commands.iter().enumerate() {
@@ -1255,5 +1493,150 @@ mod tests {
             rows
         };
         assert_eq!(all(&crashed), all(&whole));
+    }
+
+    use GateState::{Closed, Condemned, Open};
+
+    #[test]
+    fn writes_pass_only_an_open_gate_of_their_incarnation() {
+        let mut r = Range::new();
+        assert_eq!(put_id(&r.put("k", "a", Versioning::Unversioned)), "null");
+        let mut stale = Put {
+            bucket: "b".into(),
+            incarnation: 2,
+            key: "k".into(),
+            versioning: Versioning::Unversioned,
+            preconditions: Preconditions::default(),
+            at_ns: 5_000,
+            ordered_ns: None,
+            version: object("x"),
+        };
+        assert_eq!(r.run(Command::Put(stale.clone())), Outcome::NoSuchBucket);
+        stale.bucket = "c".into();
+        stale.incarnation = 1;
+        assert_eq!(r.run(Command::Put(stale)), Outcome::NoSuchBucket);
+        assert_eq!(r.gate(Some(Open), Some(Closed)), Outcome::GateMoved);
+        assert_eq!(
+            r.put("k", "b", Versioning::Unversioned),
+            Outcome::NoSuchBucket
+        );
+        assert_eq!(
+            r.delete("k", Versioning::Unversioned, None),
+            Outcome::NoSuchBucket
+        );
+        assert_eq!(r.gate(Some(Closed), Some(Open)), Outcome::GateMoved);
+        assert_eq!(put_id(&r.put("k", "c", Versioning::Unversioned)), "null");
+        assert_eq!(r.versions("k"), [("null".into(), false, "c".into())]);
+    }
+
+    /// A later attempt takes a gate over; the attempt it left behind can no longer move it.
+    #[test]
+    fn gates_move_by_the_steps_of_the_latest_attempt() {
+        let mut r = Range::new();
+        assert_eq!(r.gate_at(5, Some(Open), Some(Closed)), Outcome::GateMoved);
+        assert_eq!(r.gate_at(5, Some(Open), Some(Closed)), Outcome::GateMoved);
+        assert_eq!(r.gate_at(3, Some(Closed), Some(Open)), Outcome::Conflict);
+        assert_eq!(r.gate_at(6, Some(Closed), Some(Closed)), Outcome::GateMoved);
+        assert_eq!(
+            r.gate_at(5, Some(Closed), Some(Condemned)),
+            Outcome::Conflict
+        );
+        assert_eq!(r.gate_at(6, Some(Open), Some(Closed)), Outcome::GateMoved);
+        assert_eq!(r.gate_at(6, Some(Open), Some(Condemned)), Outcome::Invalid);
+        assert_eq!(r.gate_at(6, None, Some(Condemned)), Outcome::Invalid);
+        assert_eq!(r.gate_at(6, Some(Open), None), Outcome::Invalid);
+        assert_eq!(
+            gate(&r.engine, "b").unwrap(),
+            Some(Gate {
+                incarnation: 1,
+                attempt: 6,
+                state: Closed
+            })
+        );
+        // Another incarnation's step is not this gate's.
+        let other = Command::Gate(GateChange {
+            bucket: "b".into(),
+            incarnation: 2,
+            attempt: 9,
+            from: Some(Closed),
+            to: Some(Open),
+        });
+        assert_eq!(r.run(other), Outcome::Conflict);
+    }
+
+    /// A deleted bucket's uploads are collected, then its gate removed, and the floor keeps
+    /// an attempt left behind from placing a gate again.
+    #[test]
+    fn a_condemned_bucket_is_collected_and_its_gate_removed() {
+        let mut r = Range::new();
+        let upload = r.create("k");
+        for number in 1..=3 {
+            assert_eq!(r.part("k", &upload, number, 1, 1), Outcome::PartWritten);
+        }
+        r.create("m");
+        assert_eq!(r.gate_at(4, Some(Open), Some(Closed)), Outcome::GateMoved);
+        assert_eq!(probe(&r.engine, "b", None, 10).unwrap(), Probe::Clear);
+        let collect = |budget| {
+            Command::Collect(Collect {
+                bucket: "b".into(),
+                incarnation: 1,
+                budget,
+            })
+        };
+        assert_eq!(r.run(collect(10)), Outcome::Conflict, "not yet condemned");
+        assert_eq!(
+            r.gate_at(4, Some(Closed), Some(Condemned)),
+            Outcome::GateMoved
+        );
+        assert_eq!(r.gate_at(4, Some(Condemned), None), Outcome::NotEmpty);
+        assert_eq!(r.run(collect(3)), Outcome::Collected { done: false });
+        assert_eq!(r.run(collect(2)), Outcome::Collected { done: true });
+        assert_eq!(r.run(collect(2)), Outcome::Collected { done: true });
+        let (from, to) = key::bucket_span("b");
+        assert_eq!(r.engine.next(&from, &to).unwrap(), None);
+        assert_eq!(r.gate_at(4, Some(Condemned), None), Outcome::GateMoved);
+        assert_eq!(r.gate_at(4, Some(Condemned), None), Outcome::GateMoved);
+        assert_eq!(gate(&r.engine, "b").unwrap(), None);
+        assert_eq!(r.gate_at(3, None, Some(Open)), Outcome::Conflict);
+        assert_eq!(r.gate_at(4, None, Some(Open)), Outcome::GateMoved);
+    }
+
+    #[test]
+    fn a_condemned_bucket_with_a_version_is_never_collected() {
+        let mut r = Range::new();
+        r.put("k", "a", Versioning::Enabled);
+        r.gate(Some(Open), Some(Closed));
+        r.gate(Some(Closed), Some(Condemned));
+        let collect = Command::Collect(Collect {
+            bucket: "b".into(),
+            incarnation: 1,
+            budget: 10,
+        });
+        assert_eq!(r.run(collect), Outcome::NotEmpty);
+        assert_eq!(r.versions("k").len(), 1);
+    }
+
+    /// The probe finds versions and delete markers, passes over uploads one key at a time,
+    /// and pauses within its budget.
+    #[test]
+    fn a_probe_finds_any_version_or_marker_and_pauses() {
+        let mut r = Range::new();
+        for key in ["a", "b", "c"] {
+            let upload = r.create(key);
+            r.part(key, &upload, 1, 1, 1);
+        }
+        assert_eq!(probe(&r.engine, "b", None, 10).unwrap(), Probe::Clear);
+        r.delete("d", Versioning::Enabled, None);
+        let Probe::Paused(at) = probe(&r.engine, "b", None, 2).unwrap() else {
+            panic!("the budget ran out")
+        };
+        assert_eq!(
+            probe(&r.engine, "b", Some(&at), 1).unwrap(),
+            Probe::Paused(beyond_rows("b", "c"))
+        );
+        assert_eq!(probe(&r.engine, "b", Some(&at), 2).unwrap(), Probe::Found);
+        // A position before the bucket starts at its first row.
+        assert_eq!(probe(&r.engine, "b", Some(&[]), 4).unwrap(), Probe::Found);
+        assert_eq!(probe(&r.engine, "c", None, 4).unwrap(), Probe::Clear);
     }
 }

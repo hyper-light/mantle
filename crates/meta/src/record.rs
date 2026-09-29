@@ -67,6 +67,73 @@ pub struct Part {
     pub modified_ns: u64,
 }
 
+/// A bucket's versioning state (05 §7.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Versioning {
+    Unversioned,
+    Enabled,
+    Suspended,
+}
+
+/// Where a bucket is in being created or deleted (docs/design/metadata.md §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketState {
+    /// Its gates are being opened.
+    Creating,
+    Active,
+    /// Its gates are closed while the Name ranges are read for versions.
+    Deleting,
+    /// Gone to requests; the collector is removing its uploads and gates.
+    Deleted,
+}
+
+/// A bucket's row in the Bucket layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bucket {
+    pub owner: String,
+    /// When the Bucket range created it, which is also its incarnation.
+    pub created_ns: u64,
+    /// The location constraint it was created with; empty for the default.
+    pub location: String,
+    pub versioning: Versioning,
+    pub state: BucketState,
+    /// The create or delete attempt that last moved it: the Bucket range's time when the
+    /// attempt began. A step of an older attempt is refused.
+    pub attempt: u64,
+}
+
+/// Whether a Name range admits a bucket's writes (docs/design/metadata.md §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateState {
+    Open,
+    /// Closed while the range is read for versions, and reopened if the bucket stays.
+    Closed,
+    /// The bucket is deleted: its rows are the collector's.
+    Condemned,
+}
+
+/// A bucket's gate in a Name range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gate {
+    pub incarnation: u64,
+    /// The attempt that last moved it.
+    pub attempt: u64,
+    pub state: GateState,
+}
+
+/// An owner's row: its buckets, counting those being created or deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Owner {
+    pub buckets: u32,
+}
+
+/// A reverse row: one of an owner's active buckets, as ListBuckets shows it (05 §10.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Owned {
+    pub created_ns: u64,
+    pub location: String,
+}
+
 /// A file: its length and how many extents hold it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileHeader {
@@ -214,6 +281,148 @@ impl ChunkPlace {
     }
 }
 
+impl Versioning {
+    fn code(self) -> u8 {
+        match self {
+            Self::Unversioned => 0,
+            Self::Enabled => 1,
+            Self::Suspended => 2,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Unversioned),
+            1 => Some(Self::Enabled),
+            2 => Some(Self::Suspended),
+            _ => None,
+        }
+    }
+}
+
+impl BucketState {
+    fn code(self) -> u8 {
+        match self {
+            Self::Creating => 0,
+            Self::Active => 1,
+            Self::Deleting => 2,
+            Self::Deleted => 3,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Creating),
+            1 => Some(Self::Active),
+            2 => Some(Self::Deleting),
+            3 => Some(Self::Deleted),
+            _ => None,
+        }
+    }
+}
+
+impl Bucket {
+    pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
+        let mut w = start();
+        put_str(&mut w, &self.owner)?;
+        w.u64(self.created_ns);
+        put_str(&mut w, &self.location)?;
+        w.u8(self.versioning.code());
+        w.u8(self.state.code());
+        w.u64(self.attempt);
+        Ok(finish(w))
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "bucket")?;
+        decoded(
+            (|| {
+                Some(Self {
+                    owner: take_str(&mut r)?,
+                    created_ns: r.u64()?,
+                    location: take_str(&mut r)?,
+                    versioning: Versioning::from_code(r.u8()?)?,
+                    state: BucketState::from_code(r.u8()?)?,
+                    attempt: r.u64()?,
+                })
+            })(),
+            &r,
+            "bucket",
+        )
+    }
+}
+
+impl Gate {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = start();
+        w.u64(self.incarnation);
+        w.u64(self.attempt);
+        w.u8(match self.state {
+            GateState::Open => 0,
+            GateState::Closed => 1,
+            GateState::Condemned => 2,
+        });
+        finish(w)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "gate")?;
+        let gate = (|| {
+            let incarnation = r.u64()?;
+            let attempt = r.u64()?;
+            let state = match r.u8()? {
+                0 => GateState::Open,
+                1 => GateState::Closed,
+                2 => GateState::Condemned,
+                _ => return None,
+            };
+            Some(Self {
+                incarnation,
+                attempt,
+                state,
+            })
+        })();
+        decoded(gate, &r, "gate")
+    }
+}
+
+impl Owner {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = start();
+        w.u32(self.buckets);
+        finish(w)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "owner")?;
+        let owner = r.u32().map(|buckets| Self { buckets });
+        decoded(owner, &r, "owner")
+    }
+}
+
+impl Owned {
+    pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
+        let mut w = start();
+        w.u64(self.created_ns);
+        put_str(&mut w, &self.location)?;
+        Ok(finish(w))
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "owned")?;
+        decoded(
+            (|| {
+                Some(Self {
+                    created_ns: r.u64()?,
+                    location: take_str(&mut r)?,
+                })
+            })(),
+            &r,
+            "owned",
+        )
+    }
+}
+
 impl Reverse {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = start();
@@ -356,6 +565,19 @@ impl Part {
             "part",
         )
     }
+}
+
+/// A row that holds one number: a range's clock, a key's null-version pointer.
+pub fn encode_number(n: u64) -> Vec<u8> {
+    let mut w = start();
+    w.u64(n);
+    finish(w)
+}
+
+pub fn decode_number(bytes: &[u8], what: &'static str) -> Result<u64, RecordError> {
+    let mut r = open(bytes, what)?;
+    let n = r.u64();
+    decoded(n, &r, what)
 }
 
 fn start() -> Writer {
@@ -549,6 +771,55 @@ mod tests {
         assert!(ChunkPlace::decode(&b.encode()).is_err());
         let r = Reverse { index: 14 };
         assert_eq!(Reverse::decode(&r.encode()), Ok(r));
+    }
+
+    #[test]
+    fn bucket_rows_round_trip() {
+        for (versioning, state) in [
+            (Versioning::Unversioned, BucketState::Creating),
+            (Versioning::Enabled, BucketState::Active),
+            (Versioning::Suspended, BucketState::Deleting),
+            (Versioning::Enabled, BucketState::Deleted),
+        ] {
+            let b = Bucket {
+                owner: "o".into(),
+                created_ns: 7,
+                location: "eu-west-1".into(),
+                versioning,
+                state,
+                attempt: 8,
+            };
+            assert_eq!(Bucket::decode(&b.encode().unwrap()), Ok(b));
+        }
+        for state in [GateState::Open, GateState::Closed, GateState::Condemned] {
+            let g = Gate {
+                incarnation: u64::MAX,
+                attempt: 3,
+                state,
+            };
+            assert_eq!(Gate::decode(&g.encode()), Ok(g));
+        }
+        let o = Owner { buckets: 10_000 };
+        assert_eq!(Owner::decode(&o.encode()), Ok(o));
+        let owned = Owned {
+            created_ns: 9,
+            location: String::new(),
+        };
+        assert_eq!(Owned::decode(&owned.encode().unwrap()), Ok(owned));
+        assert_eq!(decode_number(&encode_number(u64::MAX), "n"), Ok(u64::MAX));
+        assert!(decode_number(&o.encode(), "n").is_err());
+        let mut bad = Gate {
+            incarnation: 1,
+            attempt: 1,
+            state: GateState::Open,
+        }
+        .encode();
+        // A state code past the last one, with its checksum made good again.
+        let body = bad.len() - 4;
+        bad[body - 1] = 3;
+        let crc = mantle_crc::crc32c(&bad[..body]);
+        bad[body..].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(Gate::decode(&bad), Err(RecordError::Corrupt("gate")));
     }
 
     /// Every flipped bit and every truncation is refused, never misread.

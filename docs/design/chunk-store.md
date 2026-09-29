@@ -217,11 +217,26 @@ a metadata change. Holding deleted chunks here instead would either keep them in
 for the cleaner to copy, or keep freed segments from being discarded, and dead data an SSD
 must still treat as live raises its internal garbage collection [HKA17 Obs. #8, #21].
 
-Cleaning starts when free segments fall below a low watermark and stops at a high one
-[RO92 §3.6]. It picks sealed segments by cost-benefit, `(1−u)·age / (1+u)` with `u` the
-live fraction and `age` the youngest record's age [RO92 §3.6], copies their live records
-to the cleaner's stream (sorted by age), and frees the segment once the copies are
-durable and indexed. A relocated record keeps its sequence; the index accepts it only if
+Cleaning starts when free segments fall below a runway: enough to take writes at the
+fastest rate seen, `W`, while the cleaner reacts (a batch: the writer wakes it after each)
+and cleans one victim (the longest one has taken), plus a batch arriving between wakes,
+and the client's one-segment reserve [research/11 §10.3]. Before a victim has been timed,
+cleaning one counts as two segments of writes, reading and rewriting a wholly live victim at
+the rate writes arrive. LFS set its thresholds without study and found performance
+insensitive to them [RO92 §3.4], and a fraction of the volume holds a 20 TB disk's 1.25 TB
+idle for a runway of a few segments [research/11 §10.3]. A pass cleans until free segments
+are one past the runway. It picks sealed segments by cost-benefit, `(1−u)·age / (1+u)` with
+`u` the live fraction and `age` the youngest record's age [RO92 §3.6], copies their live
+records to the cleaner's stream (sorted by age), and frees the segment once the copies are
+durable and indexed. Victims of live fraction `u` free `1 − u` segments each [RO92 §3.4],
+so a net gain is due once they have held a segment's worth of dead space beyond what
+packing their live data costs; a pass that gains nothing by then stops, and cleaning waits
+until more data is deleted. One pass runs at a time.
+
+A client write with no free segment to go to is `Busy`, to be retried, while cleaning may
+still free one, and `Full` once cleaning has been tried on the data deleted so far and
+gained nothing: only trying tells how tightly relocated records pack. A relocation frees
+no space (an equal copy replaces the old), so only deletes count as new dead data. A relocated record keeps its sequence; the index accepts it only if
 the chunk still points at the old location, so a concurrent delete wins.
 
 The cleaner and the scrubber find a segment's records through the index's record places:

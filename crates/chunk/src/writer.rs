@@ -143,15 +143,30 @@ pub(crate) struct Shared<F> {
     pub fenced: std::sync::atomic::AtomicBool,
     /// Set when the volume closes: background threads stop at their next wake.
     pub stopping: std::sync::atomic::AtomicBool,
-    /// Bytes of records made dead since the volume opened: the cleaner waits for this to grow
-    /// after a pass that could not gain space.
+    /// Bytes of records deleted since the volume opened: the cleaner waits for this to grow
+    /// after a pass that could not gain space. Relocations do not count; they free nothing.
     pub dead_bytes: std::sync::atomic::AtomicU64,
+    /// `dead_bytes` when the cleaner's last pass gained no segment, `u64::MAX` if it gained or
+    /// none has run: while the two are equal, cleaning cannot free space and a client write
+    /// with no segment to go to is `Full` rather than `Busy`.
+    pub futile_at: std::sync::atomic::AtomicU64,
     /// Requests submitted to the writer so far, counted just before each is sent.
     pub submitted: std::sync::atomic::AtomicU64,
     /// Checkpoints written since the volume opened.
     pub checkpoints: std::sync::atomic::AtomicU64,
     /// The room client requests hold in the writer's queue.
     pub queue: std::sync::Mutex<Queue>,
+    /// The fastest the writer has laid down payload, in bytes a second: a batch's payload
+    /// over its service time, the largest since the volume opened.
+    pub peak_rate: std::sync::atomic::AtomicU64,
+    /// The writer's moving average of a batch's service time, in nanoseconds.
+    pub service_ns: std::sync::atomic::AtomicU64,
+    /// The longest the cleaner has taken to clean one victim, in nanoseconds.
+    pub clean_ns: std::sync::atomic::AtomicU64,
+    /// Clean below this many free segments (`runway`).
+    pub low_water: std::sync::atomic::AtomicUsize,
+    /// Held through a cleaning pass: the background cleaner's or one asked for.
+    pub cleaning: std::sync::Mutex<()>,
     pub usage: RwLock<Vec<SegmentInfo>>,
 }
 
@@ -178,7 +193,6 @@ pub(crate) struct Writer<F: BlockFile> {
     pub fragments: u64,
     /// Wakes the cleaner when free segments run low.
     pub poke: Option<SyncSender<()>>,
-    pub low_water: usize,
     /// Buffers for the batches the writer lays out, reused from batch to batch.
     pub pool: Pool,
     /// Moving average of a batch's service time (its writes and flush), in nanoseconds; zero
@@ -488,6 +502,14 @@ impl<F: BlockFile> Writer<F> {
         self.shared.fenced.store(true, Ordering::Release);
     }
 
+    /// Whether cleaning may still free a segment: unless it was tried on exactly the data
+    /// deleted so far and gained nothing. Only trying can tell, since how tightly relocated
+    /// records pack is what decides.
+    fn reclaimable(&self) -> bool {
+        self.shared.futile_at.load(Ordering::Relaxed)
+            != self.shared.dead_bytes.load(Ordering::Relaxed)
+    }
+
     fn free_segments(&self) -> usize {
         self.segments
             .iter()
@@ -496,7 +518,7 @@ impl<F: BlockFile> Writer<F> {
     }
 
     fn poke_cleaner(&self) {
-        if self.free_segments() < self.low_water
+        if self.free_segments() < self.shared.low_water.load(Ordering::Relaxed)
             && let Some(poke) = &self.poke
         {
             // A poke already waiting is as good as a second one.
@@ -857,6 +879,11 @@ impl<F: BlockFile> Writer<F> {
                             layout.records.push(LogRecord::Put(record));
                             ok.push(tx);
                         }
+                        // No free segment for the client: while cleaning can free one, the
+                        // put is to be retried, not refused for good.
+                        Err(ChunkError::Full) if self.reclaimable() => {
+                            answer(tx, Err(ChunkError::Busy));
+                        }
                         Err(e) => answer(tx, Err(e)),
                     }
                 }
@@ -1007,6 +1034,19 @@ impl<F: BlockFile> Writer<F> {
         } else {
             smooth(self.service_ns, took)
         };
+        let laid: u64 = payloads
+            .iter()
+            .map(|p| u64::try_from(p.data.len()).unwrap_or(u64::MAX))
+            .fold(0, u64::saturating_add);
+        let rate = u128::from(laid)
+            .saturating_mul(1_000_000_000)
+            .checked_div(u128::from(took))
+            .and_then(|r| u64::try_from(r).ok())
+            .unwrap_or(0);
+        self.shared.peak_rate.fetch_max(rate, Ordering::Relaxed);
+        self.shared
+            .service_ns
+            .store(self.service_ns, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1079,13 +1119,12 @@ impl<F: BlockFile> Writer<F> {
                             self.fragments = self.fragments.saturating_add(1);
                             true
                         }
+                        // A relocated copy: the old one dies as an equal one is born, so no
+                        // space is freed that cleaning could gain.
                         Inserted::Replaced(old) => {
                             if let Some(info) = slot(&mut self.segments, old.segment) {
                                 info.live = info.live.saturating_sub(u64::from(old.record_len));
                             }
-                            self.shared
-                                .dead_bytes
-                                .fetch_add(u64::from(old.record_len), Ordering::Relaxed);
                             true
                         }
                         Inserted::Unchanged => false,

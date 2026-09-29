@@ -73,7 +73,6 @@ pub struct Volume<F: BlockFile + 'static> {
     scrubber: Option<JoinHandle<()>>,
     findings: SharedFindings,
     superblock: Superblock,
-    watermarks: (usize, usize),
     limits: crate::layout::Limits,
 }
 
@@ -161,20 +160,27 @@ impl<F: BlockFile + 'static> Volume<F> {
             fenced: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             dead_bytes: std::sync::atomic::AtomicU64::new(0),
+            futile_at: std::sync::atomic::AtomicU64::new(u64::MAX),
             submitted: std::sync::atomic::AtomicU64::new(0),
             checkpoints: std::sync::atomic::AtomicU64::new(0),
             queue: std::sync::Mutex::new(crate::writer::Queue::default()),
+            peak_rate: std::sync::atomic::AtomicU64::new(0),
+            cleaning: std::sync::Mutex::new(()),
+            service_ns: std::sync::atomic::AtomicU64::new(0),
+            clean_ns: std::sync::atomic::AtomicU64::new(0),
+            low_water: std::sync::atomic::AtomicUsize::new(crate::clean::runway(
+                0,
+                0,
+                0,
+                u64::try_from(batch).unwrap_or(u64::MAX),
+                geometry.segment_size,
+            )),
             usage: RwLock::new(recovered.segments.clone()),
         });
         // Client requests are admitted up to `queue_requests` (`submit`); the cleaner sends
         // one request at a time beside them.
         let (sender, rx) = sync_channel(config.limits.queue_requests().saturating_add(1));
         let (wake, wakes) = sync_channel(1);
-        // Clean below one sixteenth of the segments free, up to one eighth; never below the
-        // two a relocation needs (one being cleaned, one to write into).
-        let segments = usize::try_from(geometry.segments).unwrap_or(usize::MAX);
-        let low = (segments / 16).max(2);
-        let high = (segments / 8).max(low.saturating_add(1));
         let report = recovered.report;
         let mut opens = recovered.open.into_iter();
         let client = opens.next();
@@ -192,7 +198,6 @@ impl<F: BlockFile + 'static> Volume<F> {
             superblock: superblock.clone(),
             fragments: recovered.fragments,
             poke: Some(wake.clone()),
-            low_water: low,
             // Two batches' buffers kept free, each up to twice a batch.
             pool: Pool::new(
                 shared.file.alignment(),
@@ -226,8 +231,6 @@ impl<F: BlockFile + 'static> Volume<F> {
             shared: Arc::clone(&shared),
             submit: sender.clone(),
             wake: wakes,
-            low,
-            high,
             batch_bytes: config.limits.batch_bytes,
             batch_moves: config.limits.batch_requests,
         };
@@ -264,7 +267,6 @@ impl<F: BlockFile + 'static> Volume<F> {
                 scrubber,
                 findings,
                 superblock,
-                watermarks: (low, high),
                 limits: config.limits,
             },
             report,
@@ -550,8 +552,6 @@ impl<F: BlockFile + 'static> Volume<F> {
             shared: Arc::clone(&self.shared),
             submit,
             wake: wakes,
-            low: self.watermarks.0,
-            high: self.watermarks.1,
             batch_bytes: self.limits.batch_bytes,
             batch_moves: self.limits.batch_requests,
         };

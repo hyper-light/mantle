@@ -158,7 +158,8 @@ fn writer(v: &Volume<Arc<SimFile>>, id: u64, seed: u64, ops: usize) -> Model {
                 model.uncertain = Some((k, op));
                 return model;
             }
-            Err(ChunkError::Full) => {}
+            // Refusals that write nothing.
+            Err(ChunkError::Full | ChunkError::Busy) => {}
             Err(e) => panic!("writer {id} step {step}: unexpected refusal {e}"),
         }
     }

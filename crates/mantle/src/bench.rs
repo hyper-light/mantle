@@ -353,13 +353,27 @@ fn puts(
                         let k = key(point, worker, n);
                         n = n.saturating_add(1);
                         let t = Instant::now();
-                        match v.put(k, &payload) {
+                        // Busy means the store is cleaning to make room: a client backs off
+                        // and puts the same chunk again, and the wait counts in its latency.
+                        let result = loop {
+                            match v.put(k, &payload) {
+                                Err(ChunkError::Busy)
+                                    if deadline.is_none_or(|d| Instant::now() < d) =>
+                                {
+                                    std::thread::yield_now();
+                                }
+                                other => break other,
+                            }
+                        };
+                        match result {
                             Ok(()) => {
                                 latency.record(nanos(t.elapsed()));
                                 keys.push(k);
                                 written.fetch_add(size64, Ordering::Relaxed);
                             }
                             Err(ChunkError::Full) => full.store(true, Ordering::Relaxed),
+                            // Still busy when the step ended: nothing was written.
+                            Err(ChunkError::Busy) => {}
                             Err(e) => {
                                 if let Ok(mut f) = failed.lock() {
                                     f.get_or_insert(e);

@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use mantle_chunk::{ChunkKey, Config, Limits};
+use mantle_chunk::{ChunkError, ChunkKey, Config, Limits, Volume};
 use mantle_disk::buf::Alignment;
 use mantle_disk::sim::SimFile;
 
@@ -30,6 +30,20 @@ pub fn config() -> Config {
 }
 
 pub const SIZE: u64 = 8 << 20;
+
+/// Puts, retrying while the volume answers `Busy`, as a client backs off while the cleaner
+/// frees space. The bound only stops a hang.
+pub fn put_retrying(v: &Volume<Arc<SimFile>>, k: ChunkKey, data: &[u8]) -> Result<(), ChunkError> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match v.put(k, data) {
+            Err(ChunkError::Busy) if std::time::Instant::now() < deadline => {
+                std::thread::yield_now();
+            }
+            other => return other,
+        }
+    }
+}
 
 pub fn sim(seed: u64) -> Arc<SimFile> {
     Arc::new(

@@ -12,7 +12,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{SIZE, config, data, key, sim};
+use common::{SIZE, config, data, key, put_retrying, sim};
 use mantle_chunk::layout::{Geometry, batch_frame_bytes, checkpoint_bytes, largest_frame};
 use mantle_chunk::{ChunkError, Config, Volume};
 use mantle_disk::buf::Alignment;
@@ -267,7 +267,7 @@ fn deleted_space_is_reused_and_a_full_volume_refuses_writes() {
     // Fill the volume with 64 KiB chunks until it refuses.
     let mut written = Vec::new();
     for n in 0..10_000u64 {
-        match v.put(key(n), &data(n, 64 << 10)) {
+        match put_retrying(&v, key(n), &data(n, 64 << 10)) {
             Ok(()) => written.push(n),
             Err(ChunkError::Full) => break,
             Err(e) => panic!("unexpected {e}"),
@@ -287,7 +287,7 @@ fn deleted_space_is_reused_and_a_full_volume_refuses_writes() {
         v.delete(key(n)).unwrap();
     }
     for n in 0..written.len() as u64 {
-        v.put(key(50_000 + n), &data(n, 64 << 10)).unwrap();
+        put_retrying(&v, key(50_000 + n), &data(n, 64 << 10)).unwrap();
     }
     let usage = v.usage().unwrap();
     assert!(usage.live_bytes > 0);
@@ -335,28 +335,29 @@ fn cleaning_reclaims_partly_dead_segments_and_keeps_every_live_byte() {
     // Small chunks, many per segment, until the volume is full.
     let mut written = Vec::new();
     for n in 0..100_000u64 {
-        match v.put(key(n), &data(n, 3000)) {
+        match put_retrying(&v, key(n), &data(n, 3000)) {
             Ok(()) => written.push(n),
             Err(ChunkError::Full) => break,
             Err(e) => panic!("unexpected {e}"),
         }
     }
-    // Delete every other chunk: each sealed segment is about half dead.
+    // Delete every other chunk: each sealed segment is about half dead, and deleting frees
+    // none of them. Cleaning, by the background cleaner and asked for here, does.
+    let before = v.usage().unwrap().free;
     for &n in written.iter().filter(|n| *n % 2 == 0) {
         v.delete(key(n)).unwrap();
     }
-    let before = v.usage().unwrap().free;
     let report = v.clean(8).unwrap();
     let after = v.usage().unwrap().free;
 
-    assert!(report.relocated > 0 && report.corrupt == 0, "{report:?}");
+    assert!(report.corrupt == 0, "{report:?}");
     assert!(
         after > before,
         "free segments {before} -> {after} after {report:?}"
     );
     // Freed space takes new writes.
     for n in 0..20u64 {
-        v.put(key(900_000 + n), &data(n, 3000)).unwrap();
+        put_retrying(&v, key(900_000 + n), &data(n, 3000)).unwrap();
     }
     let check = |v: &Volume<Arc<mantle_disk::sim::SimFile>>| {
         for &n in &written {

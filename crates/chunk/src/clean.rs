@@ -3,16 +3,21 @@
 //! A segment whose chunks are all deleted is freed by the writer without copying anything.
 //! One that is partly dead is cleaned: its live fragments are read back, verified, and handed
 //! to the writer as relocations into the cleaner's own stream; once nothing live is left in
-//! it, the writer frees it. The cleaner runs when free segments fall below a low watermark
-//! and stops at a high one, choosing victims by LFS's cost-benefit ratio
+//! it, the writer frees it. Victims are chosen by LFS's cost-benefit ratio
 //! `(1 − u) · age / (1 + u)`, where `u` is the fraction still live and `age` the time since
 //! its youngest live record was written (Rosenblum and Ousterhout, TOCS 1992, §3.6): old,
 //! mostly dead segments first, since cold data that survived is likely to stay.
+//!
+//! The cleaner runs, woken by the writer after each batch, when free segments fall below a
+//! runway (`runway`): enough to take writes at the fastest rate seen while the cleaner reacts
+//! and cleans one victim. LFS chose its thresholds without study and found performance
+//! insensitive to them, and a fraction of the volume scales with the disk rather than the
+//! write rate (docs/research/11 §10).
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
-use std::time::Duration;
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::time::{Duration, Instant};
 
 use mantle_disk::DiskError;
 use mantle_disk::block::BlockFile;
@@ -22,24 +27,48 @@ use crate::frame::SegmentState;
 use crate::key::ChunkKey;
 use crate::record::{FLAG_FINAL, Payload};
 use crate::recover::{Identity, verify_at};
-use crate::writer::{Move, Op, Request, Shared};
-
-/// How often the cleaner checks free space without being woken.
-const IDLE: Duration = Duration::from_secs(5);
-/// Victims cleaned without a net gain in free segments before a pass gives up.
-const FUTILE_AFTER: u32 = 4;
+use crate::writer::{CLEANER_RESERVE, Move, Op, Request, Shared};
 
 pub(crate) struct Cleaner<F> {
     pub shared: Arc<Shared<F>>,
     pub submit: SyncSender<Request>,
     pub wake: Receiver<()>,
-    /// Start cleaning below this many free segments.
-    pub low: usize,
-    /// Stop at this many.
-    pub high: usize,
     /// Payload bytes and fragments per relocation request: one writer batch each.
     pub batch_bytes: usize,
     pub batch_moves: usize,
+}
+
+/// Free segments to hold before cleaning starts: the client's reserve (writer.rs) and the
+/// runway, `W·(t_react + t_clean) + D` bytes, where `W` is the fastest payload rate seen,
+/// `t_react` a batch (the writer wakes the cleaner after each), `t_clean` the longest one
+/// victim has taken, and `D` one batch arriving between wakes (docs/research/11 §10.3). Until
+/// a victim has been cleaned, `W·t_clean` is taken as two segments: reading and rewriting a
+/// wholly live victim at the rate writes arrive.
+pub(crate) fn runway(
+    rate: u64,
+    react_ns: u64,
+    clean_ns: u64,
+    batch_bytes: u64,
+    segment_size: u64,
+) -> usize {
+    let per_ns = |ns: u64| {
+        u128::from(rate)
+            .saturating_mul(u128::from(ns))
+            .checked_div(1_000_000_000)
+            .unwrap_or(0)
+    };
+    let cleaning = if clean_ns == 0 {
+        u128::from(segment_size).saturating_mul(2)
+    } else {
+        per_ns(clean_ns)
+    };
+    let bytes = per_ns(react_ns)
+        .saturating_add(cleaning)
+        .saturating_add(u128::from(batch_bytes));
+    let segments = bytes.div_ceil(u128::from(segment_size.max(1)));
+    usize::try_from(segments)
+        .unwrap_or(usize::MAX)
+        .saturating_add(CLEANER_RESERVE)
 }
 
 /// What one cleaning pass did.
@@ -55,32 +84,30 @@ pub struct CleanReport {
 
 impl<F: BlockFile> Cleaner<F> {
     pub fn run(self) {
-        // The dead-byte count when a pass last gained nothing: until more data dies, another
-        // pass would copy the same live data around for nothing.
-        let mut futile_at: Option<u64> = None;
-        loop {
-            match self.wake.recv_timeout(IDLE) {
-                Ok(()) | Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
-            }
+        // Every change to free space runs a writer batch, and every batch below the runway
+        // wakes the cleaner, so it waits for nothing else.
+        while self.wake.recv().is_ok() {
             if self.shared.stopping.load(Ordering::Acquire) {
                 return;
             }
             if self.shared.fenced.load(Ordering::Acquire) {
                 continue;
             }
+            // Until more data dies, another pass would copy the same live data around for
+            // nothing (`Shared::futile_at`).
             let dead = self.shared.dead_bytes.load(Ordering::Relaxed);
-            if futile_at == Some(dead) {
+            if self.shared.futile_at.load(Ordering::Relaxed) == dead {
                 continue;
             }
             // A failed pass (the volume fenced, or it closed) ends this round; the next wake
             // retries if there is still work.
             if let Ok(report) = self.pass() {
-                futile_at = if report.segments > 0 && report.gained == 0 {
-                    Some(dead)
+                let futile = if report.segments > 0 && report.gained == 0 {
+                    dead
                 } else {
-                    None
+                    u64::MAX
                 };
+                self.shared.futile_at.store(futile, Ordering::Relaxed);
             }
         }
     }
@@ -94,12 +121,15 @@ impl<F: BlockFile> Cleaner<F> {
         })
     }
 
-    /// Cleans victims until free segments reach the high watermark or none is worth it.
+    /// Cleans victims until free segments are one past the runway, or none is worth it.
     pub fn pass(&self) -> Result<CleanReport, ChunkError> {
-        if self.free() >= self.low {
+        let low = self.shared.low_water.load(Ordering::Relaxed);
+        if self.free() >= low {
             return Ok(CleanReport::default());
         }
-        self.clean_until(|cleaner, _| cleaner.free() < cleaner.high)
+        self.clean_until(|cleaner, _| {
+            cleaner.free() <= cleaner.shared.low_water.load(Ordering::Relaxed)
+        })
     }
 
     /// Cleans the `n` best victims, whatever the free space.
@@ -111,30 +141,73 @@ impl<F: BlockFile> Cleaner<F> {
         &self,
         more: impl Fn(&Self, &CleanReport) -> bool,
     ) -> Result<CleanReport, ChunkError> {
+        // One pass at a time, background or asked for, so two never take the same victims.
+        let _cleaning = self
+            .shared
+            .cleaning
+            .lock()
+            .map_err(|_| ChunkError::Fenced)?;
         let mut report = CleanReport::default();
         let mut tried = Vec::new();
         let start = self.free();
+        let (size, block) = (
+            self.shared.geometry.segment_size,
+            self.shared.geometry.block,
+        );
+        let batch = u64::try_from(self.batch_bytes).unwrap_or(u64::MAX).max(1);
+        // Space the victims cleaned so far should give back once their live data is packed.
+        let mut due = 0u64;
         while more(self, &report) {
             let Some(victim) = self.victim(&tried) else {
                 break;
             };
             tried.push(victim);
+            let live = self.live(victim);
+            let started = Instant::now();
             let (relocated, corrupt) = self.clean(victim)?;
             report.segments = report.segments.saturating_add(1);
             report.relocated = report.relocated.saturating_add(relocated);
             report.corrupt = report.corrupt.saturating_add(corrupt);
             // The writer frees a segment in the batch after the one that emptied it.
             self.flush()?;
-            // Cleaning N segments of live fraction u frees about N(1 − u) (Rosenblum and
-            // Ousterhout, TOCS 1992, §3.4), but a few victims can net nothing while their live
-            // data opens the segment it moves into. Four victims without a net gain mean the live
-            // data does not pack any tighter, and the pass stops.
-            if report.segments >= FUTILE_AFTER && self.free() <= start {
+            self.learn(started.elapsed());
+            // Victims of live fraction u free 1 − u segments each (Rosenblum and Ousterhout,
+            // TOCS 1992, §3.4), so a net gain is due once they have held a segment's worth of
+            // dead space, after ⌈1/(1 − ū)⌉ of them (docs/research/11 §10.3), less what packing
+            // their live data costs: a block of padding per relocation batch and a share of a
+            // segment header. None by then means it packs no tighter, and the pass stops.
+            let packing = live.div_ceil(batch).saturating_add(1).saturating_mul(block);
+            due = due.saturating_add(size.saturating_sub(live).saturating_sub(packing));
+            if due >= size && self.free() <= start {
                 break;
             }
         }
         report.gained = u32::try_from(self.free().saturating_sub(start)).unwrap_or(u32::MAX);
         Ok(report)
+    }
+
+    /// Live bytes of `segment`.
+    fn live(&self, segment: u32) -> u64 {
+        self.shared.usage.read().map_or(0, |usage| {
+            usage
+                .get(usize::try_from(segment).unwrap_or(usize::MAX))
+                .map_or(0, |s| s.live)
+        })
+    }
+
+    /// Records how long a victim took and moves the runway to match.
+    fn learn(&self, took: Duration) {
+        let took = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX);
+        let shared = &self.shared;
+        let clean_ns = shared.clean_ns.fetch_max(took, Ordering::Relaxed).max(took);
+        let low = runway(
+            shared.peak_rate.load(Ordering::Relaxed),
+            shared.service_ns.load(Ordering::Relaxed),
+            clean_ns,
+            u64::try_from(self.batch_bytes).unwrap_or(u64::MAX),
+            shared.geometry.segment_size,
+        );
+        shared.low_water.store(low, Ordering::Relaxed);
     }
 
     /// The sealed segment with the best cost-benefit ratio.

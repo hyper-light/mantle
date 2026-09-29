@@ -28,11 +28,8 @@ use crate::measure::{self, Job, Pattern};
 pub struct Plan {
     /// Bytes of scratch file the jobs touch.
     pub span: u64,
-    /// Rounds per point: at least `min_rounds`, then until the throughput's 95% confidence
-    /// interval is within `precision` of its mean, up to `max_rounds`.
-    pub min_rounds: usize,
-    pub max_rounds: usize,
-    pub precision: f64,
+    /// Rounds per point.
+    pub rounds: Rounds,
     /// Wall-clock budget of one job.
     pub step: Duration,
     /// Queue depths for random reads.
@@ -50,21 +47,50 @@ pub struct Plan {
     pub durable_large: usize,
 }
 
+/// How many rounds a measured point runs: at least `min`, then until the 95% confidence
+/// interval of its throughput is within `precision` of the mean, up to `max`, as Georges,
+/// Buytaert and Eeckhout's JavaStats stops (OOPSLA 2007, §3.3; docs/research/11 §13).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rounds {
+    pub min: usize,
+    pub max: usize,
+    pub precision: f64,
+}
+
+impl Rounds {
+    /// Three rounds are the fewest that estimate a spread; six are enough for their minimum
+    /// and maximum to bracket the median 95% of the time (docs/research/11 §13.3). The
+    /// precision, ±5%, is half the ±10% that comparisons between benchmark runs resolve (§16).
+    pub const STANDARD: Self = Self {
+        min: 3,
+        max: 6,
+        precision: 0.05,
+    };
+
+    /// The most rounds a point runs; an interval needs two.
+    pub fn limit(&self) -> usize {
+        self.max.max(self.min).max(2)
+    }
+
+    /// Whether `throughputs`, one a round, are enough: the limit reached, or at least the
+    /// minimum with an interval within the precision.
+    pub fn enough(&self, throughputs: &[f64]) -> bool {
+        throughputs.len() >= self.limit()
+            || (throughputs.len() >= self.min.max(2)
+                && relative_interval(throughputs) <= self.precision)
+    }
+}
+
 impl Plan {
     /// About twenty seconds on a steady fast SSD, three rounds of half-second jobs a point, and
-    /// up to twice that on a noisy one. Three rounds are the fewest that estimate a spread; six
-    /// are enough for their minimum and maximum to bracket the median 95% of the time
-    /// (docs/research/11 §13.3). The precision, ±5%, is half the ±10% that comparisons between
-    /// benchmark runs resolve (§16).
+    /// up to twice that on a noisy one (`Rounds::STANDARD`).
     pub fn standard(align: Alignment) -> Self {
         let small = align
             .max(Alignment::new(4096).unwrap_or(Alignment::BYTE))
             .get();
         Self {
             span: 256 << 20,
-            min_rounds: 3,
-            max_rounds: 6,
-            precision: 0.05,
+            rounds: Rounds::STANDARD,
             step: Duration::from_millis(500),
             random_depths: vec![1, 4, 16, 64],
             sequential_depths: vec![1, 4],
@@ -197,7 +223,7 @@ pub fn calibrate(
         .unwrap_or(u64::MAX);
     let needed = u64::try_from(plan.large.max(plan.small))
         .unwrap_or(u64::MAX)
-        .max(fresh.saturating_mul(u64::try_from(plan.max_rounds.max(2)).unwrap_or(u64::MAX)));
+        .max(fresh.saturating_mul(u64::try_from(plan.rounds.limit()).unwrap_or(u64::MAX)));
     if span < needed {
         return Err(DiskError::Io {
             op: "calibrate",
@@ -328,17 +354,12 @@ pub fn calibrate(
     })
 }
 
-/// Runs a job in rounds until its throughput's 95% confidence interval is within the plan's
-/// precision of the mean, or the plan's rounds run out.
+/// Runs a job in rounds, as many as the plan's `Rounds` take.
 fn point(file: &DeviceFile, plan: &Plan, job: impl Fn(u64) -> Job) -> Result<Point, DiskError> {
-    let (min, max) = (
-        plan.min_rounds.max(2),
-        plan.max_rounds.max(plan.min_rounds.max(2)),
-    );
+    let max = plan.rounds.limit();
     let mut depth = 1;
     let (mut ops, mut bytes) = (Vec::with_capacity(max), Vec::with_capacity(max));
     let mut latency = crate::histogram::Histogram::new();
-    let mut spread = f64::INFINITY;
     for round in 0..max {
         let j = job(u64::try_from(round).unwrap_or(0));
         let r = measure::run(file, &j)?;
@@ -346,11 +367,11 @@ fn point(file: &DeviceFile, plan: &Plan, job: impl Fn(u64) -> Job) -> Result<Poi
         ops.push(r.ops_per_sec());
         bytes.push(r.bytes_per_sec());
         latency.merge(&r.latency);
-        spread = relative_interval(&ops);
-        if ops.len() >= min && spread <= plan.precision {
+        if plan.rounds.enough(&ops) {
             break;
         }
     }
+    let spread = relative_interval(&ops);
     let samples = latency.count();
     Ok(Point {
         depth,
@@ -363,13 +384,13 @@ fn point(file: &DeviceFile, plan: &Plan, job: impl Fn(u64) -> Job) -> Result<Poi
     })
 }
 
-fn mean(xs: &[f64]) -> f64 {
+pub fn mean(xs: &[f64]) -> f64 {
     let n = u32::try_from(xs.len()).map_or(f64::MAX, f64::from);
     xs.iter().sum::<f64>() / n
 }
 
 /// The half-width of the 95% confidence interval of the mean of `xs`, over the mean.
-fn relative_interval(xs: &[f64]) -> f64 {
+pub fn relative_interval(xs: &[f64]) -> f64 {
     let Some(df) = xs.len().checked_sub(1).filter(|&d| d > 0) else {
         return f64::INFINITY;
     };
@@ -432,6 +453,25 @@ mod tests {
         assert!(!slower(&with(380.0, f64::INFINITY), &with(2_170.0, 0.05)));
     }
 
+    /// A point stops at the minimum once its interval is tight, runs on while it is not, and
+    /// stops at the limit whatever its spread.
+    #[test]
+    fn rounds_stop_when_the_interval_is_tight_or_the_limit_is_reached() {
+        let r = Rounds::STANDARD;
+        assert!(!r.enough(&[100.0, 100.0]));
+        assert!(r.enough(&[100.0, 100.0, 100.0]));
+        assert!(!r.enough(&[50.0, 100.0, 150.0]));
+        assert!(r.enough(&[50.0, 100.0, 150.0, 50.0, 100.0, 150.0]));
+        assert_eq!(r.limit(), 6);
+        let loose = Rounds {
+            min: 1,
+            max: 1,
+            precision: 0.05,
+        };
+        assert_eq!(loose.limit(), 2);
+        assert!(!loose.enough(&[100.0]));
+    }
+
     #[test]
     fn the_interval_follows_students_t() {
         // Mean 100, sample deviation 10, n = 4: t(3) = 3.182, half-width 3.182·10/2.
@@ -449,9 +489,11 @@ mod tests {
         let align = Alignment::new(4096).unwrap();
         let plan = Plan {
             span: 8 << 20,
-            min_rounds: 2,
-            max_rounds: 3,
-            precision: 0.05,
+            rounds: Rounds {
+                min: 2,
+                max: 3,
+                precision: 0.05,
+            },
             step: Duration::from_millis(20),
             random_depths: vec![1, 2],
             sequential_depths: vec![1],

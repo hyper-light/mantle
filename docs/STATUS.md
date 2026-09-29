@@ -69,9 +69,12 @@ Remaining before it is done:
 
 - An I/O path that keeps the measured number of reads in flight.
 - `mantle bench chunk` measures puts and reads next to the same reads through the file
-  layer ([measurements](measurements/2026-09-28-chunk-store-benchmark.md)). Remaining: each
-  point repeated until its result is statistically stable, and large puts brought closer
-  to the device's durable bandwidth.
+  layer, each point in rounds until its throughput is within ±5% at 95% confidence or six
+  rounds have run, stating the interval it reached
+  ([measurements](measurements/2026-09-29-chunk-store-rounds.md)). Remaining: large puts
+  brought closer to the device's durable bandwidth (8 MiB puts at 65–69% of it), and the
+  step and round counts from a dimensioning run, with results that alternate between two
+  states reported per state (docs/research/11 §16.3).
 - The group-commit wait for submitters slower than half a batch, from the measured
   distribution of their return times (docs/research/11 §2.6), once real clients supply it.
 - Device health in how writes are placed and when a device is drained (docs/research/10).

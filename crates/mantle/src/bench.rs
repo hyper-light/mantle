@@ -13,8 +13,12 @@
 //! the same state. Right after each read point, the same number of workers read the same
 //! number of bytes from random places in the volume's segments directly through the file
 //! layer. Background work of the file system and the drive stalls reads at times; running
-//! the two back to back shows what mantle adds, apart from the environment. The scratch file
-//! is removed however the benchmark ends.
+//! the two back to back shows what mantle adds, apart from the environment. Each point runs
+//! in rounds, as calibration's do (`calibrate::Rounds`), until the throughput of its puts,
+//! reads and file-layer reads is each within ±5% at 95% confidence, or six rounds have run:
+//! one pass measures the drive's recent history as much as the store
+//! (docs/measurements/2026-09-28-chunk-store-benchmark.md, finding 7). The scratch file is
+//! removed however the benchmark ends.
 
 use std::fmt;
 use std::io::Write;
@@ -25,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use mantle_chunk::{ChunkError, ChunkKey, Config, Volume};
 use mantle_disk::buf::{AlignedBuf, Alignment};
-use mantle_disk::calibrate::{self, Calibration};
+use mantle_disk::calibrate::{self, Calibration, Rounds};
 use mantle_disk::file::{CachingRequest, DeviceFile};
 use mantle_disk::histogram::Histogram;
 use mantle_disk::measure::SplitMix64;
@@ -69,8 +73,9 @@ pub struct Plan {
     pub sizes: Vec<usize>,
     /// Requests in flight, one worker each; the depths calibration measures reads at.
     pub workers: Vec<usize>,
-    /// How long each put and each read point runs.
+    /// How long each round of a put or read point runs.
     pub step: Duration,
+    pub rounds: Rounds,
 }
 
 impl Plan {
@@ -84,6 +89,7 @@ impl Plan {
             sizes: vec![4 << 10, 64 << 10, 1 << 20, 8 << 20],
             workers: vec![1, 4, 16, 64],
             step,
+            rounds: Rounds::STANDARD,
         }
     }
 }
@@ -116,6 +122,29 @@ impl Outcome {
 
     fn bytes_per_sec(&self) -> f64 {
         rate(self.bytes, self.elapsed)
+    }
+}
+
+/// A point's rounds: each round's throughput, and every round's transfers together.
+#[derive(Debug, Default)]
+struct Series {
+    ops_per_sec: Vec<f64>,
+    bytes_per_sec: Vec<f64>,
+    latency: Histogram,
+    full: bool,
+}
+
+impl Series {
+    fn add(&mut self, o: &Outcome) {
+        self.ops_per_sec.push(o.ops_per_sec());
+        self.bytes_per_sec.push(o.bytes_per_sec());
+        self.latency.merge(&o.latency);
+        self.full |= o.full;
+    }
+
+    /// Enough rounds by `rounds`, or none to judge: reads of a point that wrote nothing.
+    fn enough(&self, rounds: &Rounds) -> bool {
+        self.ops_per_sec.is_empty() || rounds.enough(&self.ops_per_sec)
     }
 }
 
@@ -275,8 +304,8 @@ fn run(
 
     writeln!(
         out,
-        "  {:<14} {:>9} {:>10} {:>12} {:>10} {:>10} {:>10}",
-        "", "in flight", "ops/s", "throughput", "p50", "p99", "p99.9"
+        "  {:<14} {:>9} {:>10} {:>12} {:>5} {:>6} {:>10} {:>10} {:>10}",
+        "", "in flight", "ops/s", "throughput", "±", "rounds", "p50", "p99", "p99.9"
     )?;
     let budget = volume / 3;
     let mut point = 1u64;
@@ -292,34 +321,48 @@ fn run(
                 .unwrap_or(usize::MAX)
                 .clamp(1, config.limits.queue_requests().max(1));
             let writers = workers.min(admitted);
-            let (put, keys) = puts(&v, size, writers, plan.step, budget, point)?;
+            let (mut put, mut get, mut direct) =
+                (Series::default(), Series::default(), Series::default());
+            for _ in 0..plan.rounds.limit() {
+                let (outcome, keys) = puts(&v, size, writers, plan.step, budget, point)?;
+                put.add(&outcome);
+                if !keys.is_empty() {
+                    get.add(&gets(&v, &keys, size, workers, plan.step, point)?);
+                    direct.add(&raw_reads(&raw, &span, size, workers, plan.step, point)?);
+                }
+                deletes(&v, &keys)?;
+                point = point.saturating_add(1);
+                if [&put, &get, &direct].iter().all(|s| s.enough(&plan.rounds)) {
+                    break;
+                }
+            }
             row(out, &format!("put {}", display::size(size)), writers, &put)?;
-            if !keys.is_empty() {
-                let get = gets(&v, &keys, size, workers, plan.step, point)?;
+            if !get.ops_per_sec.is_empty() {
                 row(out, &format!("get {}", display::size(size)), workers, &get)?;
-                let direct = raw_reads(&raw, &span, size, workers, plan.step, point)?;
                 row(out, "  file layer", workers, &direct)?;
             }
-            deletes(&v, &keys)?;
-            point = point.saturating_add(1);
         }
     }
     v.close();
     Ok(())
 }
 
-fn row(out: &mut impl Write, name: &str, workers: usize, o: &Outcome) -> std::io::Result<()> {
+/// A point's row: its mean throughput over the rounds, the half-width of that mean's 95%
+/// confidence interval, and latency quantiles over every round's transfers.
+fn row(out: &mut impl Write, name: &str, workers: usize, s: &Series) -> std::io::Result<()> {
     writeln!(
         out,
-        "  {:<14} {:>9} {:>10} {:>12} {:>10} {:>10} {:>10}{}",
+        "  {:<14} {:>9} {:>10} {:>12} {:>5} {:>6} {:>10} {:>10} {:>10}{}",
         name,
         workers,
-        display::count(o.ops_per_sec()),
-        display::rate(o.bytes_per_sec()),
-        display::nanos(o.latency.p50()),
-        display::nanos(o.latency.p99()),
-        display::nanos(o.latency.p999()),
-        if o.full { "  (volume full)" } else { "" }
+        display::count(calibrate::mean(&s.ops_per_sec)),
+        display::rate(calibrate::mean(&s.bytes_per_sec)),
+        display::percent(calibrate::relative_interval(&s.ops_per_sec)),
+        s.ops_per_sec.len(),
+        display::nanos(s.latency.p50()),
+        display::nanos(s.latency.p99()),
+        display::nanos(s.latency.p999()),
+        if s.full { "  (volume full)" } else { "" }
     )?;
     out.flush()
 }
@@ -618,6 +661,11 @@ mod tests {
             sizes: vec![4 << 10, 1 << 20],
             workers: vec![1, 4],
             step: Duration::from_millis(50),
+            rounds: Rounds {
+                min: 2,
+                max: 2,
+                precision: 0.05,
+            },
         };
         let mut out = Vec::new();
         run(&mut out, dir.path(), align, &plan, false).unwrap();

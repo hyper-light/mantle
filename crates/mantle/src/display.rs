@@ -36,6 +36,15 @@ pub fn count(value: f64) -> String {
     scaled(value, 1000.0, &["", "K", "M", "G"])
 }
 
+/// A relative spread as a whole percentage, or a dash when there is none to state.
+pub fn percent(fraction: f64) -> String {
+    if fraction.is_finite() {
+        format!("{:.0}%", fraction * 100.0)
+    } else {
+        "–".to_owned()
+    }
+}
+
 /// A latency quantile, or a dash when too few transfers ran to estimate it.
 pub fn quantile(ns: Option<u64>) -> String {
     ns.map_or_else(|| "–".to_owned(), nanos)

@@ -1,8 +1,10 @@
 //! The group-commit loop: one per volume (docs/design/chunk-store.md §4).
 //!
-//! It takes every request that arrived while the previous batch was being made durable
-//! (DeWitt et al., SIGMOD 1984, §5.2), validates them against the index, lays their records
-//! into open segments, writes the records and one index frame, and flushes the device once.
+//! It takes every request that arrived while the previous batch was being made durable, the
+//! zero-timer group commit of Helland et al. (Tandem TR 88.1, §2): one log write and flush
+//! commits the group (DeWitt et al., SIGMOD 1984, §5.2). It validates them against the
+//! index, lays their records into open segments, writes the records and one index frame, and
+//! flushes the device once.
 //! Only then does it publish the batch to readers and answer the requests. A failed write or
 //! flush fences the volume; the flush is never retried (Rebello et al., ATC 2020).
 //!
@@ -18,11 +20,20 @@
 //! a batch waits for that batch to finish before its own starts. The expected total latency
 //! falls while `dw < p·S / (n + p)`, so that is how long the writer waits for each next
 //! request, and only while submitters it just answered have yet to return. `S` is measured
-//! on every batch, and `p` is learned as the fraction of answered submitters that return
-//! while the writer waits; both are moving averages with the gain of 1/8 that TCP uses for
-//! its round-trip estimate (Jacobson, SIGCOMM 1988; RFC 6298 §2). The model assumes a batch's
-//! service time does not grow with one more request, which holds while the flush dominates;
-//! the batch limits bound the rest.
+//! on every batch, and `p` is learned as the share of answered submitters that return while
+//! the writer waits, a ratio of running counts so that each submitter weighs the same; both
+//! decay with the gain of 1/8 that TCP uses for its round-trip estimate (Jacobson, SIGCOMM
+//! 1988; RFC 6298 §2), which holds an estimate within 5% for samples varying by 20% and closes
+//! 95% of a step in 23 batches (docs/research/11 §3.3).
+//!
+//! The rule is exact while submitters return well within `S`, the case measured, one newcomer
+//! counts at a time, and a batch's service time does not grow with one more request, which
+//! holds while the flush dominates. Submitters that take longer than `S/2` are never waited
+//! for, even where waiting would lower total latency; the rule that covers them weighs, over
+//! the measured distribution of return times, every returner a wait would gather against the
+//! delay to the batch and to arrivals behind it, as anticipatory scheduling does (Iyer and
+//! Druschel, SOSP 2001, §3.3; docs/research/11 §2.3, §2.6). It needs the return times of real
+//! clients, which the gateway and replication will supply.
 //!
 //! Records go to one of two streams, each with its own open segment: new writes, and the
 //! cleaner's relocations. Keeping relocated data apart groups data by age, which is what
@@ -205,15 +216,15 @@ pub(crate) struct Writer<F: BlockFile> {
     /// Moving average of a batch's service time (its writes and flush), in nanoseconds; zero
     /// until one is measured.
     pub service_ns: u64,
-    /// Moving average of the fraction of answered submitters that return while the writer
-    /// waits, in 1/2^16ths. It starts at one half, the estimate with no observations
-    /// (Laplace's rule of succession).
-    pub return_rate: u64,
+    /// Running counts, in 1/2^16ths and decaying by 1/8 a batch, of answered submitters that
+    /// returned while the writer waited and of submitters answered. They start at one of two,
+    /// Laplace's rule of succession for a share never observed.
+    pub returns: (u64, u64),
     /// Requests received from the queue so far.
     pub received: u64,
 }
 
-/// `return_rate`'s unit: one.
+/// The unit of the return counts and of `p`: one.
 pub(crate) const RATE_ONE: u64 = 1 << 16;
 
 /// One step of a moving average with gain 1/8 (RFC 6298 §2).
@@ -479,7 +490,7 @@ impl<F: BlockFile> Writer<F> {
         while self.service_ns > 0 && returned(batch) < answered && self.room(batch, *bytes) {
             // dw < p·S / (n + p), with p in 1/2^16ths.
             let n = u128::try_from(batch.len()).unwrap_or(u128::MAX);
-            let p = u128::from(self.return_rate);
+            let p = u128::from(self.return_share());
             let step = p
                 .saturating_mul(u128::from(self.service_ns))
                 .checked_div(n.saturating_mul(u128::from(RATE_ONE)).saturating_add(p))
@@ -497,12 +508,24 @@ impl<F: BlockFile> Writer<F> {
                 Err(_) => break,
             }
         }
-        let sample = returned(batch)
-            .min(answered)
+        let came = returned(batch).min(answered).saturating_mul(RATE_ONE);
+        self.returns = (
+            smooth(self.returns.0, came.saturating_mul(8)),
+            smooth(
+                self.returns.1,
+                answered.saturating_mul(RATE_ONE).saturating_mul(8),
+            ),
+        );
+    }
+
+    /// `p`: the share of answered submitters that return while the writer waits.
+    fn return_share(&self) -> u64 {
+        self.returns
+            .0
             .saturating_mul(RATE_ONE)
-            .checked_div(answered)
-            .unwrap_or(0);
-        self.return_rate = smooth(self.return_rate, sample);
+            .checked_div(self.returns.1)
+            .unwrap_or(RATE_ONE / 2)
+            .min(RATE_ONE)
     }
 
     fn fence(&self) {

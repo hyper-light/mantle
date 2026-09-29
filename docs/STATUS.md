@@ -187,9 +187,11 @@ progress; and a deleted bucket's cleanup resumes from any step. Files a stopped 
 and never handed over: every file waits in its File range's queue of unsettled files until a
 sweep settles it, a Name range takes a file only by the deadline the file was written with,
 and the sweep asks the file's Name range, which releases a file it never took once the
-deadline has passed at its own time, so no later handover can take it; a simulation of 2,000
-schedules with gateways that hand over in time, late or never, and sweeps that stop between
-any two steps, finds no file both referenced and released, and none left unsettled.
+deadline has passed at its own time, so no later handover can take it. Blocks a gateway made
+for a file it never wrote are found one layer down the same way, from the file itself. A
+simulation of 2,000 schedules, with gateways that stop at any stage or come late, sweeps that
+stop between any two steps, and leaders whose clocks run behind, finds no file both
+referenced and released, no named block taken apart, and nothing left unsettled or unnamed.
 
 The Raft log (`mantle-log`, [design](design/raft-log.md)), which every range replica on a
 metadata device shares: group commit across ranges with one flush a batch, frames whose
@@ -220,8 +222,8 @@ commands applied twice when either is introduced on purpose.
 
 Remaining before it is done:
 
-- Blocks and chunks a stopped gateway made for a file it never wrote, found one layer down as
-  files are, and the collector's pacing against foreground latency (design §2, §6;
+- Chunks a stopped gateway wrote for a block it never recorded, reconciled per volume once
+  storage nodes run, and the collector's pacing against foreground latency (design §2, §6;
   docs/research/22 §10).
 - The production engine, once its binding is chosen (design §4).
 - Splits, merges and the fast track under simulation, built to the TLA+ model of splits and

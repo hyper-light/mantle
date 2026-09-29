@@ -8,7 +8,7 @@ use mantle_codec::{Reader, Writer};
 
 use crate::record::{
     self, BlockHeader, Checksum, ChunkPlace, DefaultRetention, Extent, GateState, Part,
-    RecordError, Referrer, Upload, Version, Versioning,
+    RecordError, Referrer, Upload, Verdict, Version, Versioning,
 };
 use crate::{block, bucket, file, name};
 
@@ -147,18 +147,27 @@ impl Answer {
                     file::Outcome::Conflict => w.u8(2),
                     file::Outcome::Invalid => w.u8(3),
                     file::Outcome::Settled => w.u8(4),
+                    file::Outcome::Expired => w.u8(5),
+                    file::Outcome::BlocksChecked(verdicts) => {
+                        w.u8(6);
+                        put_verdicts(&mut w, verdicts)?;
+                    }
                 }
             }
             Answer::Block(o) => {
                 w.u8(6);
-                w.u8(match o {
-                    block::Outcome::Written => 0,
-                    block::Outcome::Moved => 1,
-                    block::Outcome::Deleted => 2,
-                    block::Outcome::Conflict => 3,
-                    block::Outcome::Invalid => 4,
-                    block::Outcome::NoSuchBlock => 5,
-                });
+                match o {
+                    block::Outcome::Written { deadline_ns } => {
+                        w.u8(0);
+                        w.u64(*deadline_ns);
+                    }
+                    block::Outcome::Moved => w.u8(1),
+                    block::Outcome::Deleted => w.u8(2),
+                    block::Outcome::Conflict => w.u8(3),
+                    block::Outcome::Invalid => w.u8(4),
+                    block::Outcome::NoSuchBlock => w.u8(5),
+                    block::Outcome::Settled => w.u8(6),
+                }
             }
         }
         Ok(w.into_vec())
@@ -182,15 +191,20 @@ impl Answer {
                     2 => file::Outcome::Conflict,
                     3 => file::Outcome::Invalid,
                     4 => file::Outcome::Settled,
+                    5 => file::Outcome::Expired,
+                    6 => file::Outcome::BlocksChecked(take_verdicts(&mut r)?),
                     _ => return None,
                 }),
                 6 => Answer::Block(match r.u8()? {
-                    0 => block::Outcome::Written,
+                    0 => block::Outcome::Written {
+                        deadline_ns: r.u64()?,
+                    },
                     1 => block::Outcome::Moved,
                     2 => block::Outcome::Deleted,
                     3 => block::Outcome::Conflict,
                     4 => block::Outcome::Invalid,
                     5 => block::Outcome::NoSuchBlock,
+                    6 => block::Outcome::Settled,
                     _ => return None,
                 }),
                 _ => return None,
@@ -221,6 +235,7 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
                     extents,
                     referrer,
                     handover_ns,
+                    blocks_deadline_ns,
                     ..
                 } => {
                     w.u8(0);
@@ -231,6 +246,7 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
                     }
                     record::put_bytes(w, &referrer.encode()?)?;
                     w.u64(*handover_ns);
+                    w.u64(*blocks_deadline_ns);
                 }
                 file::Command::Delete { file } => {
                     w.u8(1);
@@ -243,6 +259,15 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
                         w.u128(f);
                     }
                 }
+                file::Command::CheckBlocks { file, blocks, .. } => {
+                    w.u8(3);
+                    w.u128(*file);
+                    record::put_len(w, blocks.len())?;
+                    for &(block, deadline_ns) in blocks {
+                        w.u128(block);
+                        w.u64(deadline_ns);
+                    }
+                }
             }
         }
         Command::Block(c) => {
@@ -252,6 +277,9 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
                     block,
                     header,
                     chunks,
+                    file,
+                    handover_ns,
+                    ..
                 } => {
                     w.u8(0);
                     w.u128(*block);
@@ -260,6 +288,8 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
                     for c in chunks {
                         record::put_bytes(w, &c.encode())?;
                     }
+                    w.u128(*file);
+                    w.u64(*handover_ns);
                 }
                 block::Command::Move { chunk, from, to } => {
                     w.u8(1);
@@ -270,6 +300,13 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
                 block::Command::Delete { block } => {
                     w.u8(2);
                     w.u128(*block);
+                }
+                block::Command::Settle { blocks } => {
+                    w.u8(3);
+                    record::put_len(w, blocks.len())?;
+                    for &b in blocks {
+                        w.u128(b);
+                    }
                 }
             }
         }
@@ -295,6 +332,7 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
                     extents,
                     referrer: Referrer::decode(&record::take_bytes(r)?).ok()?,
                     handover_ns: r.u64()?,
+                    blocks_deadline_ns: r.u64()?,
                     at_ns,
                 }
             }
@@ -306,6 +344,19 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
                     files.push(r.u128()?);
                 }
                 file::Command::Settle { files }
+            }
+            3 => {
+                let file = r.u128()?;
+                let count = bounded(r, 24)?;
+                let mut blocks = Vec::with_capacity(count);
+                for _ in 0..count {
+                    blocks.push((r.u128()?, r.u64()?));
+                }
+                file::Command::CheckBlocks {
+                    file,
+                    blocks,
+                    at_ns,
+                }
             }
             _ => return None,
         }),
@@ -322,6 +373,9 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
                     block,
                     header,
                     chunks,
+                    file: r.u128()?,
+                    handover_ns: r.u64()?,
+                    at_ns,
                 }
             }
             1 => block::Command::Move {
@@ -330,6 +384,14 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
                 to: r.u128()?,
             },
             2 => block::Command::Delete { block: r.u128()? },
+            3 => {
+                let count = bounded(r, 16)?;
+                let mut blocks = Vec::with_capacity(count);
+                for _ in 0..count {
+                    blocks.push(r.u128()?);
+                }
+                block::Command::Settle { blocks }
+            }
             _ => return None,
         }),
         _ => return None,
@@ -1020,18 +1082,37 @@ fn put_name_outcome(w: &mut Writer, o: &name::Outcome) -> Result<(), RecordError
         O::Expired => w.u8(24),
         O::Checked(verdicts) => {
             w.u8(25);
-            record::put_len(w, verdicts.len())?;
-            for v in verdicts {
-                w.u8(match v {
-                    name::Verdict::Held => 0,
-                    name::Verdict::Released => 1,
-                    name::Verdict::Young => 2,
-                });
-            }
+            put_verdicts(w, verdicts)?;
         }
         O::Unmarked => w.u8(26),
     }
     Ok(())
+}
+
+fn put_verdicts(w: &mut Writer, verdicts: &[Verdict]) -> Result<(), RecordError> {
+    record::put_len(w, verdicts.len())?;
+    for v in verdicts {
+        w.u8(match v {
+            Verdict::Held => 0,
+            Verdict::Released => 1,
+            Verdict::Young => 2,
+        });
+    }
+    Ok(())
+}
+
+fn take_verdicts(r: &mut Reader<'_>) -> Option<Vec<Verdict>> {
+    let count = bounded(r, 1)?;
+    let mut verdicts = Vec::with_capacity(count);
+    for _ in 0..count {
+        verdicts.push(match r.u8()? {
+            0 => Verdict::Held,
+            1 => Verdict::Released,
+            2 => Verdict::Young,
+            _ => return None,
+        });
+    }
+    Some(verdicts)
 }
 
 fn take_name_outcome(r: &mut Reader<'_>) -> Option<name::Outcome> {
@@ -1084,19 +1165,7 @@ fn take_name_outcome(r: &mut Reader<'_>) -> Option<name::Outcome> {
         22 => O::DeleteMarker,
         23 => O::Reclaimed,
         24 => O::Expired,
-        25 => {
-            let count = bounded(r, 1)?;
-            let mut verdicts = Vec::with_capacity(count);
-            for _ in 0..count {
-                verdicts.push(match r.u8()? {
-                    0 => name::Verdict::Held,
-                    1 => name::Verdict::Released,
-                    2 => name::Verdict::Young,
-                    _ => return None,
-                });
-            }
-            O::Checked(verdicts)
-        }
+        25 => O::Checked(take_verdicts(r)?),
         26 => O::Unmarked,
         _ => return None,
     })
@@ -1357,10 +1426,19 @@ mod tests {
                 },
                 handover_ns: 60,
                 at_ns,
+                blocks_deadline_ns: u64::MAX,
             }),
             Command::File(file::Command::Delete { file: 3 }),
             Command::File(file::Command::Settle {
                 files: vec![3, u128::MAX],
+            }),
+            Command::File(file::Command::CheckBlocks {
+                file: 3,
+                blocks: vec![(5, 6), (u128::MAX, u64::MAX)],
+                at_ns,
+            }),
+            Command::Block(block::Command::Settle {
+                blocks: vec![1, u128::MAX],
             }),
             Command::Block(block::Command::Write {
                 block: 5,
@@ -1375,6 +1453,9 @@ mod tests {
                     volume: 1,
                     key: chunk,
                 }],
+                at_ns,
+                file: 1,
+                handover_ns: u64::MAX / 2,
             }),
             Command::Block(block::Command::Move {
                 chunk,
@@ -1501,12 +1582,15 @@ mod tests {
                 file::Outcome::Conflict,
                 file::Outcome::Invalid,
                 file::Outcome::Settled,
+                file::Outcome::Expired,
+                file::Outcome::BlocksChecked(vec![Verdict::Held, Verdict::Young]),
             ]
             .map(Answer::File),
         );
         answers.extend(
             [
-                block::Outcome::Written,
+                block::Outcome::Written { deadline_ns: 3 },
+                block::Outcome::Settled,
                 block::Outcome::Moved,
                 block::Outcome::Deleted,
                 block::Outcome::Conflict,

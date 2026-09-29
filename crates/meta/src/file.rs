@@ -3,14 +3,17 @@
 //!
 //! A file is written for one Name-range write, which must take it by a deadline. Until the
 //! sweep has settled whether it did, the file waits in the range's queue of unsettled files,
-//! so a file whose gateway stopped before handing it over is found without a scan
-//! (docs/design/metadata.md §2).
+//! so a file whose gateway stopped before handing it over is found without a scan. In turn a
+//! file names blocks made for it alone, which it must name by theirs, and the sweep of the
+//! Block ranges asks here whether it did (docs/design/metadata.md §2).
+
+use std::collections::BTreeSet;
 
 use crate::clock;
 use crate::engine::{Rows, Write};
 use crate::error::MetaError;
 use crate::key;
-use crate::record::{Extent, FileHeader, Referrer};
+use crate::record::{Extent, FileHeader, Referrer, Target, Verdict};
 
 /// Extents one file may have: a completed upload's parts, at most 10,000 (05 §4.1). A file
 /// written by one PUT, at most 5 GB (05 §4.1), stays within it while its blocks hold at least
@@ -20,12 +23,15 @@ pub const MAX_EXTENTS: usize = 10_000;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// Writes a file of `extents`, in order from its first byte, for `referrer`'s write, which
-    /// must hand it over within `handover_ns` of the range's time now.
+    /// must hand it over within `handover_ns` of the range's time now. The blocks it names were
+    /// made for it, and the soonest of their deadlines is `blocks_deadline_ns`: past it, the
+    /// sweep may have taken one apart, and the write is refused.
     Write {
         file: u128,
         extents: Vec<Extent>,
         referrer: Referrer,
         handover_ns: u64,
+        blocks_deadline_ns: u64,
         at_ns: u64,
     },
     Delete {
@@ -35,9 +41,16 @@ pub enum Command {
     Settle {
         files: Vec<u128>,
     },
+    /// The sweep of a Block range asks whether `file` names each of these blocks, made for it,
+    /// each with its deadline (docs/design/metadata.md §2).
+    CheckBlocks {
+        file: u128,
+        blocks: Vec<(u128, u64)>,
+        at_ns: u64,
+    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// The file is written, now or by the same request before: the Name range takes it until
     /// `deadline_ns`.
@@ -52,6 +65,12 @@ pub enum Outcome {
     /// No extents, more than `MAX_EXTENTS`, an empty extent, or a length or deadline past
     /// `u64`.
     Invalid,
+    /// The range's time has passed a block's deadline: the gateway makes the blocks again.
+    Expired,
+    /// Each block asked about: named by the file (`Held`); not, and never to be, since the file
+    /// names other extents or the block's deadline has passed with no file written
+    /// (`Released`); or not yet (`Young`).
+    BlocksChecked(Vec<Verdict>),
 }
 
 /// A file whose handover the sweep has yet to settle.
@@ -70,23 +89,44 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
             extents,
             referrer,
             handover_ns,
+            blocks_deadline_ns,
             at_ns,
-        } => write(engine, *file, extents, referrer, *handover_ns, *at_ns)?,
+        } => {
+            let intent = Intent {
+                referrer,
+                handover_ns: *handover_ns,
+                blocks_deadline_ns: *blocks_deadline_ns,
+                at_ns: *at_ns,
+            };
+            write(engine, *file, extents, &intent)?
+        }
         Command::Delete { file } => (Outcome::Deleted, remove(engine, *file)?),
         Command::Settle { files } => (Outcome::Settled, settle(engine, files)?),
+        Command::CheckBlocks {
+            file,
+            blocks,
+            at_ns,
+        } => check_blocks(engine, *file, blocks, *at_ns)?,
     };
     engine.apply(index, &writes)?;
     Ok(outcome)
+}
+
+/// What a file is written for, beside its extents.
+struct Intent<'a> {
+    referrer: &'a Referrer,
+    handover_ns: u64,
+    blocks_deadline_ns: u64,
+    at_ns: u64,
 }
 
 fn write<E: Rows>(
     engine: &E,
     file: u128,
     extents: &[Extent],
-    referrer: &Referrer,
-    handover_ns: u64,
-    at_ns: u64,
+    intent: &Intent<'_>,
 ) -> Result<(Outcome, Vec<Write>), MetaError> {
+    let (referrer, handover_ns, at_ns) = (intent.referrer, intent.handover_ns, intent.at_ns);
     let invalid = Ok((Outcome::Invalid, Vec::new()));
     if extents.is_empty() || extents.len() > MAX_EXTENTS {
         return invalid;
@@ -120,6 +160,9 @@ fn write<E: Rows>(
         return Ok((outcome, Vec::new()));
     }
     let (made_ns, clock) = clock::tick(engine, at_ns)?;
+    if made_ns > intent.blocks_deadline_ns {
+        return Ok((Outcome::Expired, Vec::new()));
+    }
     let Some(deadline_ns) = made_ns.checked_add(handover_ns) else {
         return invalid;
     };
@@ -168,6 +211,44 @@ fn settle<E: Rows>(engine: &E, files: &[u128]) -> Result<Vec<Write>, MetaError> 
         }
     }
     Ok(writes)
+}
+
+/// Whether `file` names each of `blocks`, each with its deadline. A file is written once, whole,
+/// so one written names what it will ever name; one not written by the range's time past a
+/// block's deadline never will, since its write would be refused. The check records that time
+/// as a write's, so every later write reads a time at least as late.
+fn check_blocks<E: Rows>(
+    engine: &E,
+    file: u128,
+    blocks: &[(u128, u64)],
+    at_ns: u64,
+) -> Result<(Outcome, Vec<Write>), MetaError> {
+    let written = header(engine, file)?.is_some();
+    let named: BTreeSet<u128> = if written {
+        extents(engine, file, 0, MAX_EXTENTS)?
+            .into_iter()
+            .filter_map(|(_, e)| match e.target {
+                Target::Block(block) => Some(block),
+                Target::File(_) => None,
+            })
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
+    let (now, clock) = clock::tick(engine, at_ns)?;
+    let verdicts = blocks
+        .iter()
+        .map(|&(block, deadline_ns)| {
+            if named.contains(&block) {
+                Verdict::Held
+            } else if written || now > deadline_ns {
+                Verdict::Released
+            } else {
+                Verdict::Young
+            }
+        })
+        .collect();
+    Ok((Outcome::BlocksChecked(verdicts), vec![clock]))
 }
 
 /// A file's header.
@@ -260,6 +341,7 @@ mod tests {
             referrer: referrer("k"),
             handover_ns: 100,
             at_ns,
+            blocks_deadline_ns: u64::MAX,
         }
     }
 
@@ -364,6 +446,7 @@ mod tests {
             referrer: referrer("k"),
             handover_ns: u64::MAX,
             at_ns: 10,
+            blocks_deadline_ns: u64::MAX,
         };
         assert_eq!(apply(&mut m, 6, &far).unwrap(), Outcome::Invalid);
         assert_eq!(

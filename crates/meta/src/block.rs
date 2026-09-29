@@ -2,21 +2,31 @@
 //! lives, and a reverse row for each chunk, keyed by volume first, so repair lists a range's
 //! blocks on a failed volume with one scan, as Tectonic's repair works per Block shard and
 //! per disk through its reverse index (01 §1.5).
+//!
+//! A block is written for one file, whose write must name it by a deadline. Until the sweep
+//! has settled whether it did, the block waits in the range's queue of unsettled blocks, so a
+//! block whose gateway stopped before writing the file is found without a scan
+//! (docs/design/metadata.md §2).
 
 use mantle_chunk::ChunkKey;
 
+use crate::clock;
 use crate::engine::{Rows, Write};
 use crate::error::MetaError;
 use crate::key;
-use crate::record::{BlockHeader, ChunkPlace, Reverse};
+use crate::record::{BlockHeader, BlockOrigin, ChunkPlace, Reverse};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// Records a block and where each of its chunks was written, in index order.
+    /// Records a block and where each of its chunks was written, in index order, for `file`,
+    /// whose write must name it within `handover_ns` of the range's time now.
     Write {
         block: u128,
         header: BlockHeader,
         chunks: Vec<ChunkPlace>,
+        file: u128,
+        handover_ns: u64,
+        at_ns: u64,
     },
     /// Records that `chunk` lives on volume `to` instead of `from`: repair or rebalancing
     /// wrote it there.
@@ -28,21 +38,39 @@ pub enum Command {
     Delete {
         block: u128,
     },
+    /// The sweep found these blocks named by the files they were made for.
+    Settle {
+        blocks: Vec<u128>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    Written,
+    /// The block is recorded, now or by the same request before: its file's write names it
+    /// until `deadline_ns`.
+    Written {
+        deadline_ns: u64,
+    },
     Moved,
     Deleted,
+    Settled,
     /// The block holds other chunks, the chunk is not on `from`, or `to` holds another of
     /// the block's chunks: the caller reads the block again.
     Conflict,
     /// Chunks other than one of the block per data and parity chunk, in index order, of one
-    /// epoch, each on a volume of its own; a code with no data chunks; or a chunk index past
-    /// the block's.
+    /// epoch, each on a volume of its own; a code with no data chunks; a chunk index past the
+    /// block's; or a deadline past `u64`.
     Invalid,
     NoSuchBlock,
+}
+
+/// A block whose handover the sweep has yet to settle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unsettled {
+    pub block: u128,
+    pub deadline_ns: u64,
+    /// The file it was made for.
+    pub file: u128,
 }
 
 /// Applies `command` as log entry `index`.
@@ -52,9 +80,13 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
             block,
             header,
             chunks,
-        } => write(engine, *block, header, chunks)?,
+            file,
+            handover_ns,
+            at_ns,
+        } => write(engine, *block, header, chunks, *file, *handover_ns, *at_ns)?,
         Command::Move { chunk, from, to } => relocate(engine, chunk, *from, *to)?,
         Command::Delete { block } => delete(engine, *block)?,
+        Command::Settle { blocks } => (Outcome::Settled, settle(engine, blocks)?),
     };
     engine.apply(index, &writes)?;
     Ok(outcome)
@@ -65,19 +97,39 @@ fn write<E: Rows>(
     block: u128,
     header: &BlockHeader,
     chunks: &[ChunkPlace],
+    file: u128,
+    handover_ns: u64,
+    at_ns: u64,
 ) -> Result<(Outcome, Vec<Write>), MetaError> {
     if !valid(block, header, chunks) {
         return Ok((Outcome::Invalid, Vec::new()));
     }
     if let Some((existing, places)) = read(engine, block)? {
-        let outcome = if existing == *header && places == chunks {
-            Outcome::Written
+        let origin = origin(engine, block)?.ok_or(MetaError::Corrupt)?;
+        let outcome = if existing == *header && places == chunks && origin.file == file {
+            Outcome::Written {
+                deadline_ns: origin.deadline_ns,
+            }
         } else {
             Outcome::Conflict
         };
         return Ok((outcome, Vec::new()));
     }
-    let mut writes = vec![Write::Put(key::block_header(block), header.encode())];
+    let (made_ns, clock) = clock::tick(engine, at_ns)?;
+    let Some(deadline_ns) = made_ns.checked_add(handover_ns) else {
+        return Ok((Outcome::Invalid, Vec::new()));
+    };
+    let origin = BlockOrigin {
+        file,
+        made_ns,
+        deadline_ns,
+    };
+    let mut writes = vec![
+        clock,
+        Write::Put(key::block_header(block), header.encode()),
+        Write::Put(key::block_origin(block), origin.encode()),
+        Write::Put(key::unsettled(deadline_ns, block), origin.encode()),
+    ];
     for place in chunks {
         let index = place.key.index;
         writes.push(Write::Put(key::block_chunk(block, index), place.encode()));
@@ -86,7 +138,7 @@ fn write<E: Rows>(
             Reverse { index }.encode(),
         ));
     }
-    Ok((Outcome::Written, writes))
+    Ok((Outcome::Written { deadline_ns }, writes))
 }
 
 /// Whether `chunks` are `block`'s, one per data and parity chunk of `header` in index order,
@@ -154,12 +206,63 @@ fn delete<E: Rows>(engine: &E, block: u128) -> Result<(Outcome, Vec<Write>), Met
     let Some((_, places)) = read(engine, block)? else {
         return Ok((Outcome::Deleted, Vec::new()));
     };
-    let mut writes = vec![Write::Delete(key::block_header(block))];
+    let mut writes = vec![
+        Write::Delete(key::block_header(block)),
+        Write::Delete(key::block_origin(block)),
+    ];
+    if let Some(o) = origin(engine, block)? {
+        writes.push(Write::Delete(key::unsettled(o.deadline_ns, block)));
+    }
     for place in &places {
         writes.push(Write::Delete(key::block_chunk(block, place.key.index)));
         writes.push(Write::Delete(key::reverse(place.volume, block)));
     }
     Ok((Outcome::Deleted, writes))
+}
+
+/// Writes that take `blocks` out of the unsettled queue; a block already out, or removed,
+/// needs none.
+fn settle<E: Rows>(engine: &E, blocks: &[u128]) -> Result<Vec<Write>, MetaError> {
+    let mut writes = Vec::with_capacity(blocks.len());
+    for &block in blocks {
+        if let Some(o) = origin(engine, block)? {
+            writes.push(Write::Delete(key::unsettled(o.deadline_ns, block)));
+        }
+    }
+    Ok(writes)
+}
+
+/// Where a block came from.
+pub fn origin<E: Rows>(engine: &E, block: u128) -> Result<Option<BlockOrigin>, MetaError> {
+    Ok(engine
+        .get(&key::block_origin(block))?
+        .map(|b| BlockOrigin::decode(&b))
+        .transpose()?)
+}
+
+/// The blocks whose handover deadline passed before `before_ns` and the sweep has yet to
+/// settle, soonest deadline first, at most `max`: the sweep's work.
+pub fn unsettled<E: Rows>(
+    engine: &E,
+    before_ns: u64,
+    max: usize,
+) -> Result<Vec<Unsettled>, MetaError> {
+    let (mut from, to) = key::unsettled_before(before_ns);
+    let mut out = Vec::new();
+    while out.len() < max {
+        let Some((k, v)) = engine.next(&from, &to)? else {
+            break;
+        };
+        let (deadline_ns, block) = key::decode_unsettled(&k).ok_or(MetaError::Corrupt)?;
+        out.push(Unsettled {
+            block,
+            deadline_ns,
+            file: BlockOrigin::decode(&v)?.file,
+        });
+        from = k;
+        from.push(0);
+    }
+    Ok(out)
 }
 
 /// Chunks a block of `header`'s code has: its data and parity chunks.
@@ -268,13 +371,21 @@ mod tests {
             block: 5,
             header: header(2, 1),
             chunks: placed.clone(),
+            at_ns: 0,
+            file: 1,
+            handover_ns: u64::MAX / 2,
         };
-        assert_eq!(apply(&mut m, 1, &write).unwrap(), Outcome::Written);
-        assert_eq!(apply(&mut m, 2, &write).unwrap(), Outcome::Written);
+        let written = apply(&mut m, 1, &write).unwrap();
+        assert!(matches!(written, Outcome::Written { .. }));
+        // The same block again changes nothing, and answers the first deadline.
+        assert_eq!(apply(&mut m, 2, &write).unwrap(), written);
         let again = Command::Write {
             block: 5,
             header: header(2, 1),
             chunks: chunks(5, 1, &[10, 11, 13]),
+            at_ns: 0,
+            file: 1,
+            handover_ns: u64::MAX / 2,
         };
         assert_eq!(apply(&mut m, 3, &again).unwrap(), Outcome::Conflict);
         assert_eq!(read(&m, 5).unwrap(), Some((header(2, 1), placed)));
@@ -315,10 +426,11 @@ mod tests {
         assert_eq!(apply(&mut m, 11, &delete).unwrap(), Outcome::Deleted);
         assert_eq!(read(&m, 5).unwrap(), None);
         assert_eq!(
-            m.next(&[], &[u8::MAX]).unwrap(),
+            m.next(&[key::DATA], &[u8::MAX]).unwrap(),
             None,
             "a deleted block leaves no rows"
         );
+        assert!(unsettled(&m, u64::MAX, 10).unwrap().is_empty());
         assert_eq!(apply(&mut m, 12, &delete).unwrap(), Outcome::Deleted);
     }
 
@@ -344,6 +456,9 @@ mod tests {
                 block: 1,
                 header,
                 chunks,
+                at_ns: 0,
+                file: 1,
+                handover_ns: u64::MAX / 2,
             };
             assert_eq!(
                 apply(&mut m, i, &write).unwrap(),
@@ -362,9 +477,15 @@ mod tests {
                 block,
                 header: header(1, 1),
                 chunks: chunks(block, 1, &[7, 100 + block]),
+                at_ns: 0,
+                file: 1,
+                handover_ns: u64::MAX / 2,
             };
             let index = u64::try_from(block).unwrap();
-            assert_eq!(apply(&mut m, index, &write).unwrap(), Outcome::Written);
+            assert!(matches!(
+                apply(&mut m, index, &write).unwrap(),
+                Outcome::Written { .. }
+            ));
         }
         let first = on_volume(&m, 7, None, 2).unwrap();
         assert_eq!(first, [(1, 0), (2, 0)]);
@@ -383,6 +504,9 @@ mod tests {
                     block,
                     header: header(1, parity),
                     chunks: chunks(block, epoch, &volumes),
+                    at_ns: 0,
+                    file: 1,
+                    handover_ns: u64::MAX / 2,
                 }
             }),
             (0u128..3, 0u32..2, 0u16..3, 0u128..6, 0u128..6).prop_map(

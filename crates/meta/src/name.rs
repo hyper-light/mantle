@@ -16,6 +16,8 @@ use crate::record::{
     Version,
 };
 
+pub use crate::record::Verdict;
+
 pub use crate::record::Versioning;
 
 /// "Part size: 5 MiB to 5 GiB. There is no minimum size limit on the last part" (05 §4.1).
@@ -248,17 +250,6 @@ pub struct Unmark {
     pub files: Vec<u128>,
 }
 
-/// What the range answers the sweep of one file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Verdict {
-    /// The range took the file: a version or part references it, or it released it.
-    Held,
-    /// Never handed over, and past its deadline: the range released it, and marked it.
-    Released,
-    /// Not handed over yet, and its deadline has not passed at the range's time.
-    Young,
-}
-
 /// DeleteObject (05 §7.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Delete {
@@ -441,12 +432,13 @@ fn release(now_ns: u64, file: u128) -> [Write; 2] {
 }
 
 /// The range's verdict on each file the sweep asks about, releasing and marking every file
-/// never handed over whose deadline has passed at the range's time. Since that time only moves
-/// forward, a handover that comes after finds the deadline passed and is refused.
+/// never handed over whose deadline has passed at the range's time. The check records that
+/// time as a write's, so every later entry reads a time at least as late, even one a leader
+/// with a slower clock proposed, and a handover that comes after finds the deadline passed.
 fn check<E: Rows>(engine: &E, c: &Check) -> Result<(Outcome, Vec<Write>), MetaError> {
-    let now = clock::now(engine, c.at_ns)?;
+    let (now, clock) = clock::tick(engine, c.at_ns)?;
     let mut verdicts = Vec::with_capacity(c.files.len());
-    let mut writes = Vec::new();
+    let mut writes = vec![clock];
     for &(file, deadline_ns) in &c.files {
         let marked = engine.get(&key::handed(file))?.is_some();
         verdicts.push(if marked {
@@ -3015,6 +3007,39 @@ mod tests {
             Outcome::Reclaimed
         );
         assert!(!marked(&r, 9));
+    }
+
+    /// A leader whose clock runs behind proposes a handover at a time earlier than the check
+    /// that released its file. The check recorded its time, so the range reads the later one and
+    /// refuses the handover; judged at the proposal's time, the handover would take a file the
+    /// collector is to reclaim.
+    #[test]
+    fn a_handover_proposed_behind_the_check_that_released_its_file_is_refused() {
+        let mut r = Range::new();
+        let deadline_ns = r.clock + 50;
+        let released_at = deadline_ns + 1;
+        let check = Command::Check(Check {
+            files: vec![(4, deadline_ns)],
+            at_ns: released_at,
+        });
+        assert_eq!(r.run(check), Outcome::Checked(vec![Verdict::Released]));
+        let put = Command::Put(Put {
+            bucket: "b".into(),
+            incarnation: 1,
+            key: "a".into(),
+            versioning: Versioning::Unversioned,
+            preconditions: Preconditions::default(),
+            at_ns: deadline_ns - 10,
+            ordered_ns: None,
+            version: Version {
+                file: Some(4),
+                ..object("e")
+            },
+            default: None,
+            deadline_ns,
+        });
+        assert_eq!(r.run(put), Outcome::Expired);
+        assert_eq!(current(&r.engine, "b", "a").unwrap(), None);
     }
 
     /// Every range's engine also holds the rows its replica keeps about itself: the group's

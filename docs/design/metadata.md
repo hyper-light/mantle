@@ -175,9 +175,13 @@ layers removes them, as Tectonic's does [01 §1.6].
     - *The sweep* (`crates/meta/src/sweep.rs`) takes the queue as deadlines pass and asks the
       Name range of each file's key, in one command, whether it took the file. A marked file
       was taken. An unmarked one past its deadline, at the Name range's time, is released and
-      marked there and then; since that time only moves forward, a handover that comes after
-      finds the deadline passed and is refused, so the check and the handover are ordered by
-      the range's log, as Giza's no-op and a stalled put contend for one Paxos slot (22 §7.4).
+      marked there and then. The check records its time as a write does, so every later
+      entry reads a time at least as late, even one proposed by a leader whose clock runs
+      behind, and a handover that comes after finds the deadline passed and is refused: the
+      check and the handover are ordered by the range's log, as Giza's no-op and a stalled put
+      contend for one Paxos slot (22 §7.4). Judged at the entry's proposed time without
+      recording it, a handover from a lagging leader could take a file the check had just
+      released.
       The sweep then settles the files in the File range and removes their marks, in that
       order: a mark removed first would read, to a sweep resumed after a stop, as a file never
       handed over. Like the reclaimer, the sweep names each read and command and does no I/O,
@@ -188,18 +192,33 @@ layers removes them, as Tectonic's does [01 §1.6].
       in the queue twice, and the reclaimer's second pass finds it gone. A mark left by a sweep
       that stopped between settling a file and unmarking it goes when the file is released or
       reclaimed, so every mark is on a file a version or part references or on one released.
-    - *Checked.* `crates/meta/tests/orphan_sweep.rs` runs 2,000 generated schedules across a
-      File range and two Name ranges, with gateways that hand their files over in time, late
-      or never, deletes, and sweeps that stop between any two steps. After every step no file
-      a version references is released, and every file written is referenced, released or
-      unsettled; once the faults stop and every deadline passes, a sweep leaves nothing
-      unsettled and every file referenced or released, not both. With the deadline's check
-      removed, it finds a file both referenced and released.
     - *The deadline's length* is the gateway's measured handover time: the per-step deadline
       times its retry budget, plus the clock offset between ranges, as Ceph's 120 s and HDFS's
       60 s bound the same window (22 §10.2). It bounds how long a leftover file waits, not
       correctness: the File range and the Name range may disagree about the time, which only
       makes an honest handover late (22 §10.1).
+    - *Blocks never named.* One layer down, a gateway that stops between writing a block and
+      writing its file leaves a block no file names. A block is made for one file, which alone
+      may name it, and records that file, its time and its deadline, and waits in the Block
+      range's queue of unsettled blocks. A file's write names the soonest deadline of its
+      blocks, and a File range whose time has passed it refuses the write. The block sweep
+      (`BlockSweep`) asks the File range of each block's file, one file at a time, which
+      answers from the file itself: a file is written once, whole, so one written names what
+      it ever will, and one not written by a block's deadline never will. Nothing is marked.
+      A block named is settled; one never to be named is taken apart there and then, its
+      chunks first and its rows and place in the queue last, with no grace period, since no
+      reference ever reached it and there is no deletion by mistake to undo.
+    - *Checked.* `crates/meta/tests/orphan_sweep.rs` runs 2,000 generated schedules across a
+      Block range, a File range and two Name ranges. Gateways write a chunk and its block,
+      then the file, then hand it over, stopping at any stage or coming late to the next;
+      deletes release files; both sweeps stop between any two steps; and leaders whose clocks
+      run behind propose entries at earlier times than entries already applied. After every
+      step, no file a version references is released, every file is referenced, released or
+      unsettled, and every block a file names keeps its rows and chunk. Once the faults stop,
+      nothing is left unsettled in either layer, every file is referenced or released and not
+      both, and no block or chunk is left that nothing names. With the Name range's deadline
+      check removed, the File range's, or either check's recorded time, the simulation loses
+      a file or a block's chunk.
 - **Multipart.** CreateMultipartUpload writes the upload row. UploadPart writes the part's
   chunks, blocks and file, then replaces the part row. CompleteMultipartUpload writes the
   object's file of part extents in its File range, then, in the Name range, checks the
@@ -374,9 +393,9 @@ cover the production engine, which the simulator cannot.
 - How an entry larger than a datagram reaches the replicas: over QUIC, or fragmented on the
   UDP plane. A completion of 10,000 parts is an entry of hundreds of kilobytes in the Name
   range and another in the File range.
-- Blocks and chunks a gateway made for a file it never wrote: the same queue and deadline one
-  layer down, the File range checking a block against the file it names, and each volume's
-  chunks reconciled with the Block layer's reverse rows (22 §10.1, items 6 and 7). And the
+- Chunks a gateway wrote for a block it never recorded: each volume's chunks reconciled with
+  the Block layer's reverse rows, taking those past a deadline that no block names, as GFS
+  and HDFS reconcile chunk reports (22 §10.1, item 6), once storage nodes run. And the
   collector's pacing against foreground latency, with a floor that keeps its backlog bounded
   (22 §10.3). The patience after which an attempt is taken over, and the floor under
   the grace period, the longest read's deadline plus clock offset (22 §10.4), are measured

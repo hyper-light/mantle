@@ -34,7 +34,8 @@ pub mod marker {
     /// The group's configuration.
     pub const CONFIGURATION: u8 = b'r';
     pub const SESSION: u8 = b's';
-    /// The File range's files whose handover the sweep has not yet settled.
+    /// The File range's files, and the Block range's blocks, whose handover the sweep has
+    /// not yet settled.
     pub const UNSETTLED: u8 = b'u';
 
     /// Every marker in use.
@@ -168,14 +169,14 @@ pub fn decode_attempt(k: &[u8]) -> Option<String> {
     String::from_utf8(name).ok()
 }
 
-/// The key of a file in the File range's queue of files whose handover is not yet settled:
-/// its handover deadline, then the file, so the sweep takes them as their deadlines pass
-/// (docs/design/metadata.md §2).
-pub fn unsettled(deadline_ns: u64, file: u128) -> Vec<u8> {
+/// The key of a file in the File range's queue of files whose handover is not yet settled, or
+/// of a block in the Block range's: its handover deadline, then its ID, so the sweep takes them
+/// as their deadlines pass (docs/design/metadata.md §2).
+pub fn unsettled(deadline_ns: u64, id: u128) -> Vec<u8> {
     let mut out = Vec::with_capacity(26);
     out.extend_from_slice(&[LOCAL, marker::UNSETTLED]);
     out.extend_from_slice(&deadline_ns.to_be_bytes());
-    out.extend_from_slice(&file.to_be_bytes());
+    out.extend_from_slice(&id.to_be_bytes());
     out
 }
 
@@ -187,7 +188,7 @@ pub fn unsettled_before(before_ns: u64) -> (Vec<u8>, Vec<u8>) {
     (vec![LOCAL, marker::UNSETTLED], past)
 }
 
-/// The deadline and file an unsettled file's key names; `None` if it is not one.
+/// The deadline and ID an unsettled file's or block's key names; `None` if it is not one.
 pub fn decode_unsettled(k: &[u8]) -> Option<(u64, u128)> {
     let rest = k.strip_prefix(&[LOCAL, marker::UNSETTLED])?;
     let (deadline, file) = rest.split_first_chunk::<8>()?;
@@ -279,6 +280,7 @@ const HEADER: u8 = 1;
 const EXTENT: u8 = 2;
 /// Block-layer rows under a block's ID, after its header.
 const CHUNK: u8 = 2;
+const ORIGIN: u8 = 3;
 
 /// The key of a file's header row.
 pub fn file_header(file: u128) -> Vec<u8> {
@@ -308,6 +310,11 @@ pub fn block_chunk(block: u128, index: u16) -> Vec<u8> {
     let mut out = id_row(block, CHUNK);
     out.extend_from_slice(&index.to_be_bytes());
     out
+}
+
+/// The key of the row recording where a block came from.
+pub fn block_origin(block: u128) -> Vec<u8> {
+    id_row(block, ORIGIN)
 }
 
 /// The first and last possible keys of every row of one file or block.

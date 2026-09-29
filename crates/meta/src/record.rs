@@ -269,6 +269,27 @@ pub struct BlockHeader {
     pub crc32c: u32,
 }
 
+/// Where a block came from: the file it was made for, which alone may name it, and the Block
+/// range's time it was written and by which that file's write must name it
+/// (docs/design/metadata.md §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockOrigin {
+    pub file: u128,
+    pub made_ns: u64,
+    pub deadline_ns: u64,
+}
+
+/// What the range a file or block was handed to answers the sweep of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Taken: something references it, or the range released it.
+    Held,
+    /// Never taken, and past its deadline: no write can take it now, and it is released.
+    Released,
+    /// Not taken yet, and its deadline has not passed at the range's time.
+    Young,
+}
+
 /// Where one chunk of a block lives: a chunk store volume and the key it holds it under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkPlace {
@@ -391,6 +412,28 @@ impl BlockHeader {
             })
         })();
         decoded(header, &r, "block")
+    }
+}
+
+impl BlockOrigin {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = start();
+        w.u128(self.file);
+        w.u64(self.made_ns);
+        w.u64(self.deadline_ns);
+        finish(w)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "origin")?;
+        let origin = (|| {
+            Some(Self {
+                file: r.u128()?,
+                made_ns: r.u64()?,
+                deadline_ns: r.u64()?,
+            })
+        })();
+        decoded(origin, &r, "origin")
     }
 }
 

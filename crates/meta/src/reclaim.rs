@@ -318,10 +318,13 @@ mod tests {
                         crc32c: 0,
                     },
                     chunks,
+                    at_ns: 0,
+                    file: 1,
+                    handover_ns: u64::MAX / 2,
                 },
             )
             .unwrap();
-            assert_eq!(outcome, block::Outcome::Written);
+            assert!(matches!(outcome, block::Outcome::Written { .. }));
         }
 
         fn file(&mut self, file: u128, targets: &[Target]) {
@@ -340,6 +343,7 @@ mod tests {
                 },
                 handover_ns: 1_000,
                 at_ns: index,
+                blocks_deadline_ns: u64::MAX,
             };
             let outcome = file::apply(&mut self.files, index, &write).unwrap();
             assert!(matches!(outcome, file::Outcome::Written { .. }));

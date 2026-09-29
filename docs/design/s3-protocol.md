@@ -2,7 +2,8 @@
 
 Status: design, 2026-09-28. Sources: docs/research/05 (S3 API semantics, cited as "05 §x"),
 docs/research/13 (XML, cited as "13 §x"), docs/research/16 (CORS, cited as "16 §x"),
-docs/research/17 (bucket policies and JSON, cited as "17 §x").
+docs/research/17 (bucket policies and JSON, cited as "17 §x"), docs/research/18 (Object Lock,
+cited as "18 §x").
 
 `mantle-s3` is the protocol layer the gateway (STATUS item 2) is built from: pure functions
 over requests and bodies, with no I/O and no knowledge of where objects live. Each module
@@ -24,6 +25,7 @@ restating S3.
 | `json` | the JSON reader and compact writer, for bucket policies | 17 §1; JSONTestSuite's 318 cases |
 | `policy` | bucket policies checked, and requests judged against them | 17; S3's recorded answers, s3-tests' policies, IAM's documented semantics |
 | `account` | account IDs, and the expected bucket owner a request names | 17 §2.1; S3's recorded answers |
+| `lock` | Object Lock's documents and headers, and the rules for writes that carry locks | 18; S3's recorded answers, s3-tests |
 | `tagging` | tag sets: S3's limits and characters, and the `x-amz-tagging` header | 13 §6.7, s3-tests, S3's observed answers |
 | `acl` | canned and header ACLs, Object Ownership, and whether a request's ACL goes ahead with ACLs disabled | 13 §6.8, s3-tests |
 | `lifecycle` | lifecycle rules checked, when each action falls due, and the expiration and abort headers | 13 §6.9, the user guide's worked examples, s3-tests |
@@ -511,3 +513,39 @@ With ACLs disabled on every bucket (§5), a policy is how a bucket's owner lets 
   change nothing on buckets without ACLs, and are kept so they read back as set. s3-tests sets
   public policies on new buckets without turning these off, and those tests fail against S3 as
   against mantle.
+
+## 11. Object Lock
+
+**Decision: Object Lock's documents and headers are checked as S3 was recorded checking them,
+and the locks are kept and enforced on the versions they protect, in the metadata layer's Name
+ranges** (`crates/s3/src/lock.rs`; 18). A retention or legal hold protects one version, so the
+check that refuses to delete it must read the version in the same step that would remove it.
+
+- **Documents.** A configuration is `ObjectLockEnabled` `Enabled`, with or without a default
+  retention of a mode and one period; every other shape is `MalformedXML`, as S3 answered each
+  LocalStack sent. A period of 0 or less is `InvalidArgument`, "Default retention period must be
+  a positive integer value.", as S3 answers, where s3-tests expects `InvalidRetentionPeriod`, a
+  code S3's error table does not have. A period past 36,500 days or 100 years is "too large", at
+  the longest retention S3 documents. A retention is a mode and a date or, empty, a request to
+  remove one; a legal hold is `ON` or `OFF`.
+- **Headers.** An object write's mode and date come together or not at all; the date must be
+  ISO 8601 and ahead; the legal hold `ON` or `OFF`; the mode one S3 defines, each with S3's
+  message, `ArgumentName` and `ArgumentValue`, in the order the recordings show S3 checking them.
+- **Writes with locks** carry `Content-MD5` or a checksum, a trailer counting and a SigV4
+  payload hash not, and a signature, as S3 requires; a bucket's default retention makes every
+  write to it one with locks. UploadPart of such an upload carries the same.
+- **Bypass.** `x-amz-bypass-governance-retention` on a bucket without Object Lock is refused,
+  `true` or `false`, as S3 refuses it. s3-tests' teardown sends it to every bucket, as it does
+  to S3; running s3-tests against mantle takes its fix, PR #714, as against S3.
+- **Dates** are kept to the millisecond and written as S3 writes a time,
+  `2030-01-01T00:00:00.000Z`; a default retention runs from the version's creation, a year
+  counted as 365 days, as S3 counts one for a retention duration.
+- **Event holds**, added to S3 in September 2026 and documented with no recorded answers, are
+  `501 NotImplemented` until there is behaviour to match.
+- **Enforcement**, the metadata layer's: a version keeps its retention and legal hold; deleting
+  it by ID while either holds is `403 AccessDenied`, "Access Denied because object protected by
+  object lock.", and in DeleteObjects an error for that key; a retention may be extended by
+  anyone who may set one, shortened, removed or moved from GOVERNANCE to COMPLIANCE only under
+  bypass, and in COMPLIANCE never shortened or changed; versioning cannot be suspended on a bucket
+  with Object Lock, nor Object Lock configured on one whose versioning is not enabled, `409
+  InvalidBucketState`; lifecycle leaves locked versions be.

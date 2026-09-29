@@ -24,6 +24,7 @@ pub mod crypto;
 pub mod json;
 pub mod lifecycle;
 pub mod list;
+pub mod lock;
 pub mod policy;
 pub mod range;
 pub mod response;

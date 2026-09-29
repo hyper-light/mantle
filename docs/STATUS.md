@@ -123,7 +123,9 @@ a strict JSON reader checked against JSONTestSuite, checked as S3 was recorded c
 against the Service Authorization Reference's actions and keys, and requests judged against
 them as IAM documents, with its conditions, wildcards and variables, for accounts and the
 anonymous requester; whether a policy is public, as S3 judges it, and Block Public Access, on
-for every new bucket as in S3. A subresource routes to
+for every new bucket as in S3. Object Lock's documents and headers, checked as S3 was recorded
+checking them, with the integrity, signature and bypass rules for writes that carry locks. A
+subresource routes to
 its own operation or to 405, never to the bucket or object itself, nor across from one to the
 other, and `OPTIONS` is a preflight. The documents every response carries, from listings and
 multipart results to batch deletes, errors, bucket settings, tags, ACLs, lifecycle and CORS
@@ -134,8 +136,10 @@ algorithm, signature verification and signed-chunk decoding on one core.
 
 Remaining before it is done:
 
-- The rest of 05 §16.1's later surface: server-side encryption headers, Object Lock and
-  browser POST uploads.
+- Object Lock's enforcement in the Name ranges: each version's retention and legal hold, the
+  deletes and changes they refuse, and the versioning they fix (docs/design/s3-protocol.md §11).
+- The rest of 05 §16.1's later surface: server-side encryption headers and browser POST
+  uploads.
 - The worker that takes lifecycle actions as they fall due, over the Name layer's versions
   and uploads, once the gateway and the metadata layer hold configurations (metadata.md §6).
 

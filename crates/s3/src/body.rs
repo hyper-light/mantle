@@ -61,6 +61,8 @@ pub enum BodyError {
     Lifecycle(#[from] LifecycleError),
     #[error(transparent)]
     Cors(#[from] CorsError),
+    #[error(transparent)]
+    Lock(#[from] crate::lock::LockError),
 }
 
 impl BodyError {
@@ -75,6 +77,7 @@ impl BodyError {
             Self::MalformedAcl(_) => ("MalformedACLError", 400),
             Self::Lifecycle(error) => error.code(),
             Self::Cors(error) => error.code(),
+            Self::Lock(error) => error.code(),
         }
     }
 }
@@ -604,6 +607,127 @@ pub fn ownership_controls(body: &[u8]) -> Result<Ownership, BodyError> {
     }
     reader.finish()?;
     rule.ok_or(schema("OwnershipControls without a rule"))
+}
+
+/// The largest ObjectLockConfiguration body: its rule with the longest mode and period.
+pub const OBJECT_LOCK_LIMIT: usize = SPACE
+    * (PROLOG
+        + "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule>\
+           <DefaultRetention><Mode>GOVERNANCE</Mode><Days>-2147483648</Days></DefaultRetention>\
+           </Rule></ObjectLockConfiguration>"
+            .len());
+
+/// PutObjectLockConfiguration's configuration (18 §1.1): `ObjectLockEnabled`, which must be
+/// `Enabled`, and a rule, which must hold a default retention of a mode and one period. Every
+/// other shape is `MalformedXML`, as S3 answered each LocalStack sent (18 §5); a period out of
+/// range is S3's `InvalidArgument`.
+pub fn object_lock_configuration(body: &[u8]) -> Result<crate::lock::Configuration, BodyError> {
+    use crate::lock::{Mode, PeriodFault, period};
+    let mut reader = Reader::open(body, OBJECT_LOCK_LIMIT, "ObjectLockConfiguration")?;
+    let (mut enabled, mut rule) = (None, None);
+    while let Some(name) = reader.child()? {
+        match name {
+            "ObjectLockEnabled" => once(&mut enabled, reader.text()?.into_owned())?,
+            "Rule" => {
+                let mut retention = None;
+                while let Some(name) = reader.child()? {
+                    if name != "DefaultRetention" {
+                        return Err(schema("an element Rule does not have"));
+                    }
+                    let (mut mode, mut days, mut years) = (None, None, None);
+                    while let Some(name) = reader.child()? {
+                        match name {
+                            "Mode" => once(&mut mode, reader.text()?.into_owned())?,
+                            "Days" => once(&mut days, int(&reader.text()?)?)?,
+                            "Years" => once(&mut years, int(&reader.text()?)?)?,
+                            "DefaultEventHold" => {
+                                return Err(crate::lock::LockError::EventHold.into());
+                            }
+                            _ => return Err(schema("an element DefaultRetention does not have")),
+                        }
+                    }
+                    let mode = mode
+                        .as_deref()
+                        .and_then(Mode::from_name)
+                        .ok_or(schema("a default retention without a mode S3 defines"))?;
+                    let period = match period(days, years) {
+                        Ok(Some(period)) => period,
+                        Ok(None) | Err(PeriodFault::Both) => {
+                            return Err(schema("a default retention without one period"));
+                        }
+                        Err(PeriodFault::Error(error)) => return Err(error.into()),
+                    };
+                    once(&mut retention, (mode, period))?;
+                }
+                let retention = retention.ok_or(schema("a rule without a default retention"))?;
+                once(&mut rule, retention)?;
+            }
+            _ => return Err(schema("an element ObjectLockConfiguration does not have")),
+        }
+    }
+    reader.finish()?;
+    if enabled.as_deref() != Some("Enabled") {
+        return Err(schema("ObjectLockEnabled other than Enabled"));
+    }
+    Ok(crate::lock::Configuration { default: rule })
+}
+
+/// The largest Retention body: a mode and a date at their longest.
+pub const RETENTION_LIMIT: usize = SPACE
+    * (PROLOG
+        + "<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate></RetainUntilDate></Retention>"
+            .len()
+        + DATE_TIME);
+
+/// PutObjectRetention's request (18 §1.2): a mode and a date together, or neither, which asks
+/// to remove the retention. S3 answered a mode alone, and a mode it does not define,
+/// `MalformedXML` (18 §5).
+pub fn retention(body: &[u8]) -> Result<crate::lock::RetentionRequest, BodyError> {
+    use crate::lock::{Mode, Retention, RetentionRequest, instant};
+    let mut reader = Reader::open(body, RETENTION_LIMIT, "Retention")?;
+    let (mut mode, mut until) = (None, None);
+    while let Some(name) = reader.child()? {
+        match name {
+            "Mode" => once(&mut mode, reader.text()?.into_owned())?,
+            "RetainUntilDate" => once(&mut until, reader.text()?.into_owned())?,
+            "EventHold" | "EventHoldDuration" => {
+                return Err(crate::lock::LockError::EventHold.into());
+            }
+            _ => return Err(schema("an element Retention does not have")),
+        }
+    }
+    reader.finish()?;
+    match (mode, until) {
+        (None, None) => Ok(RetentionRequest::Remove),
+        (Some(mode), Some(until)) => Ok(RetentionRequest::Set(Retention {
+            mode: Mode::from_name(&mode).ok_or(schema("a mode S3 does not define"))?,
+            until: instant(collapsed(&until)).ok_or(schema("a date that is not ISO 8601"))?,
+        })),
+        _ => Err(schema("a retention without both a mode and a date")),
+    }
+}
+
+/// The largest LegalHold body.
+pub const LEGAL_HOLD_LIMIT: usize =
+    SPACE * (PROLOG + "<LegalHold><Status>OFF</Status></LegalHold>".len());
+
+/// PutObjectLegalHold's status (18 §1.2): `ON` or `OFF`, exactly; s3-tests expects `abc`
+/// `MalformedXML`.
+pub fn legal_hold(body: &[u8]) -> Result<bool, BodyError> {
+    let mut reader = Reader::open(body, LEGAL_HOLD_LIMIT, "LegalHold")?;
+    let mut status = None;
+    while let Some(name) = reader.child()? {
+        if name != "Status" {
+            return Err(schema("an element LegalHold does not have"));
+        }
+        once(&mut status, reader.text()?.into_owned())?;
+    }
+    reader.finish()?;
+    match status.as_deref() {
+        Some("ON") => Ok(true),
+        Some("OFF") => Ok(false),
+        _ => Err(schema("a legal hold without a status of ON or OFF")),
+    }
 }
 
 /// The largest PublicAccessBlockConfiguration body: its four settings, each at its longest.
@@ -2182,6 +2306,117 @@ mod tests {
             b"<PublicAccessBlockConfiguration><BlockAll>true</BlockAll></PublicAccessBlockConfiguration>",
         ] {
             assert_eq!(public_access_block(bad).map_err(|e| e.code().0), Err("MalformedXML"));
+        }
+    }
+
+    /// PutObjectLockConfiguration's body as botocore writes it, and the shapes S3 was recorded
+    /// refusing (18 §3, §5).
+    #[test]
+    fn object_lock_configurations_read_as_s3_reads_them() {
+        use crate::lock::{Configuration, LockError, Mode, Period};
+        let configured = |inner: &str| {
+            object_lock_configuration(
+                format!("<ObjectLockConfiguration xmlns=\"{NAMESPACE}\">{inner}</ObjectLockConfiguration>")
+                    .as_bytes(),
+            )
+        };
+        assert_eq!(
+            configured(
+                "<ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention>\
+                 <Mode>GOVERNANCE</Mode><Days>1</Days></DefaultRetention></Rule>"
+            ),
+            Ok(Configuration {
+                default: Some((Mode::Governance, Period::Days(1)))
+            })
+        );
+        assert_eq!(
+            configured("<ObjectLockEnabled>Enabled</ObjectLockEnabled>"),
+            Ok(Configuration::default())
+        );
+        for malformed in [
+            "",
+            "<Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>1</Days></DefaultRetention></Rule>",
+            "<ObjectLockEnabled>Disabled</ObjectLockEnabled>",
+            "<ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule></Rule>",
+            "<ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention></DefaultRetention></Rule>",
+            "<ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode></DefaultRetention></Rule>",
+            "<ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>BAD-VALUE</Mode><Days>1</Days></DefaultRetention></Rule>",
+            "<ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>governance</Mode><Days>1</Days></DefaultRetention></Rule>",
+            "<ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>1</Days><Years>1</Years></DefaultRetention></Rule>",
+        ] {
+            assert_eq!(
+                configured(malformed).map_err(|e| e.code().0),
+                Err("MalformedXML"),
+                "{malformed}"
+            );
+        }
+        let zero = configured(
+            "<ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention>\
+             <Mode>GOVERNANCE</Mode><Days>0</Days></DefaultRetention></Rule>",
+        );
+        assert_eq!(
+            zero,
+            Err(BodyError::Lock(LockError::PeriodNotPositive("Days")))
+        );
+        let huge = configured(
+            "<ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention>\
+             <Mode>COMPLIANCE</Mode><Days>999999999</Days></DefaultRetention></Rule>",
+        );
+        assert_eq!(huge.map_err(|e| e.code().0), Err("InvalidArgument"));
+        let held = configured(
+            "<ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>\
+             COMPLIANCE</Mode><Days>365</Days><DefaultEventHold><Days>90</Days></DefaultEventHold>\
+             </DefaultRetention></Rule>",
+        );
+        assert_eq!(held.map_err(|e| e.code()), Err(("NotImplemented", 501)));
+    }
+
+    /// PutObjectRetention's and PutObjectLegalHold's bodies as botocore writes them, and what S3
+    /// and s3-tests refuse (18 §3, §4, §5).
+    #[test]
+    fn retentions_and_legal_holds_read_as_s3_reads_them() {
+        use crate::lock::{Mode, Retention, RetentionRequest, instant};
+        let set = retention(
+            format!(
+                "<Retention xmlns=\"{NAMESPACE}\"><Mode>GOVERNANCE</Mode><RetainUntilDate>\
+                 2030-01-01T12:30:45.123456Z</RetainUntilDate></Retention>"
+            )
+            .as_bytes(),
+        );
+        assert_eq!(
+            set,
+            Ok(RetentionRequest::Set(Retention {
+                mode: Mode::Governance,
+                until: instant("2030-01-01T12:30:45.123Z").unwrap(),
+            }))
+        );
+        let removal = format!("<Retention xmlns=\"{NAMESPACE}\" />");
+        assert_eq!(retention(removal.as_bytes()), Ok(RetentionRequest::Remove));
+        for malformed in [
+            &b"<Retention><Mode>GOVERNANCE</Mode></Retention>"[..],
+            b"<Retention><RetainUntilDate>2030-01-01T00:00:00Z</RetainUntilDate></Retention>",
+            b"<Retention><Mode>governance</Mode><RetainUntilDate>2030-01-01T00:00:00Z</RetainUntilDate></Retention>",
+            b"<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>next year</RetainUntilDate></Retention>",
+        ] {
+            assert_eq!(retention(malformed).map_err(|e| e.code().0), Err("MalformedXML"));
+        }
+        let held = b"<Retention><Mode>COMPLIANCE</Mode><EventHold>ON</EventHold></Retention>";
+        assert_eq!(retention(held).map_err(|e| e.code().1), Err(501));
+        let on = format!("<LegalHold xmlns=\"{NAMESPACE}\"><Status>ON</Status></LegalHold>");
+        assert_eq!(legal_hold(on.as_bytes()), Ok(true));
+        assert_eq!(
+            legal_hold(b"<LegalHold><Status>OFF</Status></LegalHold>"),
+            Ok(false)
+        );
+        for malformed in [
+            &b"<LegalHold><Status>abc</Status></LegalHold>"[..],
+            b"<LegalHold/>",
+            b"",
+        ] {
+            assert_eq!(
+                legal_hold(malformed).map_err(|e| e.code().0),
+                Err("MalformedXML")
+            );
         }
     }
 }

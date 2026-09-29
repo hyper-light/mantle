@@ -163,6 +163,12 @@ pub fn action(operation: crate::route::Operation, versioned: bool) -> Option<&'s
         O::DeleteObjectTagging => either("s3:DeleteObjectTagging", "s3:DeleteObjectVersionTagging"),
         O::GetObjectAcl => either("s3:GetObjectAcl", "s3:GetObjectVersionAcl"),
         O::PutObjectAcl => either("s3:PutObjectAcl", "s3:PutObjectVersionAcl"),
+        O::GetObjectLockConfiguration => Some("s3:GetBucketObjectLockConfiguration"),
+        O::PutObjectLockConfiguration => Some("s3:PutBucketObjectLockConfiguration"),
+        O::GetObjectRetention => Some("s3:GetObjectRetention"),
+        O::PutObjectRetention => Some("s3:PutObjectRetention"),
+        O::GetObjectLegalHold => Some("s3:GetObjectLegalHold"),
+        O::PutObjectLegalHold => Some("s3:PutObjectLegalHold"),
         O::AbortMultipartUpload => Some("s3:AbortMultipartUpload"),
         O::ListParts => Some("s3:ListMultipartUploadParts"),
     }
@@ -1397,6 +1403,8 @@ mod tests {
             O::ListObjectsV2,
             O::ListObjectVersions,
             O::ListMultipartUploads,
+            O::GetObjectLockConfiguration,
+            O::PutObjectLockConfiguration,
         ];
         let object_level = [
             O::DeleteObjects,
@@ -1417,6 +1425,10 @@ mod tests {
             O::CompleteMultipartUpload,
             O::AbortMultipartUpload,
             O::ListParts,
+            O::GetObjectRetention,
+            O::PutObjectRetention,
+            O::GetObjectLegalHold,
+            O::PutObjectLegalHold,
         ];
         let kind_of = |name: &str| {
             catalog::ACTIONS

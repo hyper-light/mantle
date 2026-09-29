@@ -51,6 +51,8 @@ pub enum Operation {
     GetPublicAccessBlock,
     PutPublicAccessBlock,
     DeletePublicAccessBlock,
+    GetObjectLockConfiguration,
+    PutObjectLockConfiguration,
     /// A CORS preflight, `OPTIONS` on a bucket or an object.
     Preflight,
     ListObjects,
@@ -69,6 +71,10 @@ pub enum Operation {
     DeleteObjectTagging,
     GetObjectAcl,
     PutObjectAcl,
+    GetObjectRetention,
+    PutObjectRetention,
+    GetObjectLegalHold,
+    PutObjectLegalHold,
     CreateMultipartUpload,
     UploadPart,
     UploadPartCopy,
@@ -115,7 +121,7 @@ pub const MAX_KEY: usize = 1024;
 
 /// Bucket subresources S3 defines that mantle does not serve: answered `501 NotImplemented`
 /// rather than taken for another operation.
-const UNSUPPORTED: [&str; 15] = [
+const UNSUPPORTED: [&str; 12] = [
     "accelerate",
     "analytics",
     "encryption",
@@ -124,12 +130,9 @@ const UNSUPPORTED: [&str; 15] = [
     "logging",
     "metrics",
     "notification",
-    "object-lock",
     "replication",
     "requestPayment",
     "website",
-    "legal-hold",
-    "retention",
     "restore",
 ];
 
@@ -199,7 +202,7 @@ fn subresource(
 }
 
 /// The subresources of a bucket.
-const BUCKET_SUBRESOURCES: [Subresource; 13] = {
+const BUCKET_SUBRESOURCES: [Subresource; 14] = {
     use Operation as O;
     [
         ("location", &[("GET", O::GetBucketLocation)]),
@@ -253,6 +256,13 @@ const BUCKET_SUBRESOURCES: [Subresource; 13] = {
         ),
         ("policyStatus", &[("GET", O::GetBucketPolicyStatus)]),
         (
+            "object-lock",
+            &[
+                ("GET", O::GetObjectLockConfiguration),
+                ("PUT", O::PutObjectLockConfiguration),
+            ],
+        ),
+        (
             "publicAccessBlock",
             &[
                 ("GET", O::GetPublicAccessBlock),
@@ -267,7 +277,7 @@ const BUCKET_SUBRESOURCES: [Subresource; 13] = {
 };
 
 /// The subresources of an object.
-const OBJECT_SUBRESOURCES: [Subresource; 5] = {
+const OBJECT_SUBRESOURCES: [Subresource; 7] = {
     use Operation as O;
     [
         (
@@ -279,6 +289,20 @@ const OBJECT_SUBRESOURCES: [Subresource; 5] = {
             ],
         ),
         ("acl", &[("GET", O::GetObjectAcl), ("PUT", O::PutObjectAcl)]),
+        (
+            "retention",
+            &[
+                ("GET", O::GetObjectRetention),
+                ("PUT", O::PutObjectRetention),
+            ],
+        ),
+        (
+            "legal-hold",
+            &[
+                ("GET", O::GetObjectLegalHold),
+                ("PUT", O::PutObjectLegalHold),
+            ],
+        ),
         ("attributes", &[("GET", O::GetObjectAttributes)]),
         ("uploads", &[("POST", O::CreateMultipartUpload)]),
         (
@@ -652,6 +676,41 @@ mod tests {
             r("PUT", "s3.example.com", "/b/k", "cors"),
             Err(RouteError::MethodNotAllowed)
         );
+    }
+
+    #[test]
+    fn object_lock_routes() {
+        use Operation as O;
+        assert_eq!(
+            op("GET", "/b", "object-lock"),
+            O::GetObjectLockConfiguration
+        );
+        assert_eq!(
+            op("PUT", "/b", "object-lock"),
+            O::PutObjectLockConfiguration
+        );
+        assert_eq!(
+            op("PUT", "/b/k", "retention&versionId=v"),
+            O::PutObjectRetention
+        );
+        assert_eq!(op("GET", "/b/k", "retention"), O::GetObjectRetention);
+        assert_eq!(op("PUT", "/b/k", "legal-hold"), O::PutObjectLegalHold);
+        assert_eq!(
+            op("GET", "/b/k", "legal-hold&versionId=v"),
+            O::GetObjectLegalHold
+        );
+        for (method, path, query) in [
+            ("DELETE", "/b", "object-lock"),
+            ("DELETE", "/b/k", "retention"),
+            ("PUT", "/b/k", "object-lock"),
+            ("PUT", "/b", "retention"),
+        ] {
+            assert_eq!(
+                r(method, "s3.example.com", path, query),
+                Err(RouteError::MethodNotAllowed),
+                "{method} {path}?{query}"
+            );
+        }
     }
 
     #[test]

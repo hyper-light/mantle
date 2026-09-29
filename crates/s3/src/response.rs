@@ -681,6 +681,44 @@ pub fn lifecycle_configuration(rules: &[Rule]) -> Result<String, TimeOutOfRange>
     }))
 }
 
+/// GetObjectLockConfiguration's `ObjectLockConfiguration` (18 §1.1): `Enabled`, and the default
+/// retention as set, if there is one.
+pub fn object_lock_configuration(configuration: &crate::lock::Configuration) -> String {
+    use crate::lock::Period;
+    Writer::document("ObjectLockConfiguration", true, |w| {
+        w.text("ObjectLockEnabled", "Enabled");
+        if let Some((mode, period)) = configuration.default {
+            w.element("Rule", |w| {
+                w.element("DefaultRetention", |w| {
+                    w.text("Mode", mode.name());
+                    match period {
+                        Period::Days(days) => w.text("Days", &days.to_string()),
+                        Period::Years(years) => w.text("Years", &years.to_string()),
+                    }
+                });
+            });
+        }
+    })
+}
+
+/// GetObjectRetention's `Retention` (18 §1.2), its date written as every time in a response is.
+pub fn retention(retention: &crate::lock::Retention) -> Result<String, TimeOutOfRange> {
+    let until = retention.until_text().ok_or(TimeOutOfRange(
+        retention.until.checked_div(1000).unwrap_or(0),
+    ))?;
+    Ok(Writer::document("Retention", true, |w| {
+        w.text("Mode", retention.mode.name());
+        w.text("RetainUntilDate", &until);
+    }))
+}
+
+/// GetObjectLegalHold's `LegalHold` (18 §1.2).
+pub fn legal_hold(on: bool) -> String {
+    Writer::document("LegalHold", true, |w| {
+        w.text("Status", if on { "ON" } else { "OFF" });
+    })
+}
+
 /// GetPublicAccessBlock's `PublicAccessBlockConfiguration` (17 §7).
 pub fn public_access_block(block: &crate::policy::PublicAccessBlock) -> String {
     let flag = |on: bool| if on { "true" } else { "false" };
@@ -2343,6 +2381,42 @@ mod tests {
         assert_eq!(
             leaves,
             [("/PolicyStatus/IsPublic".to_string(), "true".to_string())]
+        );
+    }
+
+    /// The Object Lock documents read back as they were set (18 §1).
+    #[test]
+    fn object_lock_documents_read_back() {
+        use crate::lock::{Configuration, Mode, Period, Retention, RetentionRequest, instant};
+        for configuration in [
+            Configuration::default(),
+            Configuration {
+                default: Some((Mode::Compliance, Period::Years(7))),
+            },
+        ] {
+            let doc = object_lock_configuration(&configuration);
+            assert_eq!(
+                crate::body::object_lock_configuration(doc.as_bytes()),
+                Ok(configuration)
+            );
+        }
+        let kept = Retention {
+            mode: Mode::Governance,
+            until: instant("2140-01-01T00:00:00Z").unwrap(),
+        };
+        let doc = retention(&kept).unwrap();
+        assert!(doc.contains("<RetainUntilDate>2140-01-01T00:00:00.000Z</RetainUntilDate>"));
+        assert_eq!(
+            crate::body::retention(doc.as_bytes()),
+            Ok(RetentionRequest::Set(kept))
+        );
+        assert_eq!(
+            crate::body::legal_hold(legal_hold(true).as_bytes()),
+            Ok(true)
+        );
+        assert_eq!(
+            crate::body::legal_hold(legal_hold(false).as_bytes()),
+            Ok(false)
         );
     }
 

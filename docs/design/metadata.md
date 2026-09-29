@@ -122,15 +122,15 @@ layers removes them, as Tectonic's does [01 §1.6].
     is refused with `NoSuchBucket`, with no lease or clock bound needed. A range that
     splits gives each side its floor and the gates of the buckets whose keys it can hold.
   - *Attempts.* Each create and delete is an attempt, numbered by the Bucket range's clock
-    when it began. A request that finds another attempt in progress, such as a client's retry after
-    its gateway stopped answering, takes it over under a new number. Every step, in the
-    Bucket range and at the gates, names its attempt, and a step older than the attempt
-    that last moved the row or gate is refused, as a Raft proposal carrying an old lease
-    sequence is refused at apply [06 §A4.3]. A Name range also keeps a floor, the attempt of
-    the last gate it removed, below which no attempt may place a gate, so a coordinator
-    left behind cannot reopen a gate for a bucket that is gone, and the range keeps no row
-    for the buckets it has removed. A create refused by the floor that another bucket's
-    removal raised starts again under a new number.
+    when it began. A request that finds another attempt in progress, such as a client's
+    retry after its gateway stopped answering, takes it over under a new number. Every
+    step, in the Bucket range and at the gates, names its attempt, and a step older than the
+    attempt that last moved the row or gate is refused, as a Raft proposal carrying an old
+    lease sequence is refused at apply [06 §A4.3]. A Name range also keeps a floor, the
+    attempt of the last gate it removed, below which no attempt may place a gate, so a
+    coordinator left behind cannot reopen a gate for a bucket that is gone, and the range
+    keeps no row for the buckets it has removed. A create refused by the floor that another
+    bucket's removal raised starts again under a new number.
   - *Create.* The Bucket range records the bucket as being created and counts it against
     the owner's quota. Each Name range the bucket's keys fall in opens a gate for it, and
     the Bucket range then marks it active and lists it. The collector deletes a create left

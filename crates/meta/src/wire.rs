@@ -167,6 +167,8 @@ impl Answer {
                     block::Outcome::Invalid => w.u8(4),
                     block::Outcome::NoSuchBlock => w.u8(5),
                     block::Outcome::Settled => w.u8(6),
+                    block::Outcome::Released => w.u8(7),
+                    block::Outcome::Expired => w.u8(8),
                 }
             }
         }
@@ -205,6 +207,8 @@ impl Answer {
                     4 => block::Outcome::Invalid,
                     5 => block::Outcome::NoSuchBlock,
                     6 => block::Outcome::Settled,
+                    7 => block::Outcome::Released,
+                    8 => block::Outcome::Expired,
                     _ => return None,
                 }),
                 _ => return None,
@@ -234,6 +238,7 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
                     file,
                     extents,
                     referrer,
+                    key,
                     handover_ns,
                     blocks_deadline_ns,
                     ..
@@ -245,6 +250,7 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
                         record::put_bytes(w, &e.encode())?;
                     }
                     record::put_bytes(w, &referrer.encode()?)?;
+                    record::WrappedKey::put(key.as_ref(), w);
                     w.u64(*handover_ns);
                     w.u64(*blocks_deadline_ns);
                 }
@@ -308,6 +314,22 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
                         w.u128(b);
                     }
                 }
+                block::Command::Renew {
+                    block,
+                    file,
+                    handover_ns,
+                    ..
+                } => {
+                    w.u8(4);
+                    w.u128(*block);
+                    w.u128(*file);
+                    w.u64(*handover_ns);
+                }
+                block::Command::Release { block, deadline_ns } => {
+                    w.u8(5);
+                    w.u128(*block);
+                    w.u64(*deadline_ns);
+                }
             }
         }
     }
@@ -331,6 +353,7 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
                     file,
                     extents,
                     referrer: Referrer::decode(&record::take_bytes(r)?).ok()?,
+                    key: record::WrappedKey::take(r)?,
                     handover_ns: r.u64()?,
                     blocks_deadline_ns: r.u64()?,
                     at_ns,
@@ -392,6 +415,16 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
                 }
                 block::Command::Settle { blocks }
             }
+            4 => block::Command::Renew {
+                block: r.u128()?,
+                file: r.u128()?,
+                handover_ns: r.u64()?,
+                at_ns,
+            },
+            5 => block::Command::Release {
+                block: r.u128()?,
+                deadline_ns: r.u64()?,
+            },
             _ => return None,
         }),
         _ => return None,
@@ -1588,6 +1621,10 @@ mod tests {
                     incarnation: 2,
                     key: "k".into(),
                 },
+                key: Some(crate::record::WrappedKey {
+                    by: crate::record::Wrapper::Root(3),
+                    bytes: [9; 40],
+                }),
                 handover_ns: 60,
                 at_ns,
                 blocks_deadline_ns: u64::MAX,
@@ -1627,6 +1664,16 @@ mod tests {
                 to: 2,
             }),
             Command::Block(block::Command::Delete { block: 5 }),
+            Command::Block(block::Command::Renew {
+                block: u128::MAX,
+                file: 7,
+                handover_ns: 60,
+                at_ns,
+            }),
+            Command::Block(block::Command::Release {
+                block: 5,
+                deadline_ns: u64::MAX,
+            }),
         ]
     }
 
@@ -1787,6 +1834,8 @@ mod tests {
         answers.extend(
             [
                 block::Outcome::Written { deadline_ns: 3 },
+                block::Outcome::Released,
+                block::Outcome::Expired,
                 block::Outcome::Settled,
                 block::Outcome::Moved,
                 block::Outcome::Deleted,

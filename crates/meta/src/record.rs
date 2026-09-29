@@ -229,6 +229,55 @@ pub struct FileHeader {
     /// takes the file; past it the file is refused and released (docs/design/metadata.md §2).
     pub deadline_ns: u64,
     pub referrer: Referrer,
+    /// The data key the file's bytes are sealed under, wrapped; `None` for a file of other
+    /// files, whose bytes each open under their own file's key (docs/design/encryption.md §2).
+    pub key: Option<WrappedKey>,
+}
+
+/// A file's data key, wrapped with AES key wrap, and the key that wrapped it
+/// (docs/design/encryption.md §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WrappedKey {
+    pub by: Wrapper,
+    pub bytes: [u8; 40],
+}
+
+/// What wrapped a file's data key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wrapper {
+    /// The node's root key of this generation: SSE-S3.
+    Root(u32),
+    /// The key the customer sends with every request: SSE-C.
+    Customer,
+}
+
+impl WrappedKey {
+    pub(crate) fn put(key: Option<&Self>, w: &mut Writer) {
+        match key {
+            None => w.u8(0),
+            Some(k) => {
+                match k.by {
+                    Wrapper::Root(generation) => {
+                        w.u8(1);
+                        w.u32(generation);
+                    }
+                    Wrapper::Customer => w.u8(2),
+                }
+                w.bytes(&k.bytes);
+            }
+        }
+    }
+
+    pub(crate) fn take(r: &mut Reader<'_>) -> Option<Option<Self>> {
+        let by = match r.u8()? {
+            0 => return Some(None),
+            1 => Wrapper::Root(r.u32()?),
+            2 => Wrapper::Customer,
+            _ => return None,
+        };
+        let bytes = r.take(40)?.try_into().ok()?;
+        Some(Some(Self { by, bytes }))
+    }
 }
 
 /// The Name-range write a file was made for: the object key whose version or part it is to
@@ -322,14 +371,17 @@ pub struct Holder {
     pub key: String,
 }
 
-/// Where a block came from: the file it was made for, which alone may name it, and the Block
-/// range's time it was written and by which that file's write must name it
-/// (docs/design/metadata.md §2).
+/// Where a block came from: the file it was made for, which alone may name it, the Block
+/// range's time it was written, and the time by which that file's write must name it, which
+/// the writer renews while its body streams in (docs/design/metadata.md §2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockOrigin {
     pub file: u128,
     pub made_ns: u64,
     pub deadline_ns: u64,
+    /// The sweep found that no file will name it: it is no longer renewed, and is being taken
+    /// apart.
+    pub released: bool,
 }
 
 /// What the range a file or block was handed to answers the sweep of it.
@@ -364,6 +416,7 @@ impl FileHeader {
         w.u64(self.made_ns);
         w.u64(self.deadline_ns);
         self.referrer.put(&mut w)?;
+        WrappedKey::put(self.key.as_ref(), &mut w);
         Ok(finish(w))
     }
 
@@ -376,6 +429,7 @@ impl FileHeader {
                 made_ns: r.u64()?,
                 deadline_ns: r.u64()?,
                 referrer: Referrer::take(&mut r)?,
+                key: WrappedKey::take(&mut r)?,
             })
         })();
         decoded(header, &r, "file")
@@ -616,6 +670,7 @@ impl BlockOrigin {
         w.u128(self.file);
         w.u64(self.made_ns);
         w.u64(self.deadline_ns);
+        w.u8(u8::from(self.released));
         finish(w)
     }
 
@@ -626,6 +681,11 @@ impl BlockOrigin {
                 file: r.u128()?,
                 made_ns: r.u64()?,
                 deadline_ns: r.u64()?,
+                released: match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                },
             })
         })();
         decoded(origin, &r, "origin")
@@ -1373,8 +1433,22 @@ mod tests {
                 incarnation: 3,
                 key: "a/\u{0}é".into(),
             },
+            key: Some(WrappedKey {
+                by: Wrapper::Root(u32::MAX),
+                bytes: [7; 40],
+            }),
         };
         assert_eq!(FileHeader::decode(&h.encode().unwrap()), Ok(h.clone()));
+        for key in [
+            None,
+            Some(WrappedKey {
+                by: Wrapper::Customer,
+                bytes: [0xA5; 40],
+            }),
+        ] {
+            let h = FileHeader { key, ..h.clone() };
+            assert_eq!(FileHeader::decode(&h.encode().unwrap()), Ok(h));
+        }
         assert_eq!(
             Referrer::decode(&h.referrer.encode().unwrap()),
             Ok(h.referrer)

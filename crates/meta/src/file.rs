@@ -13,7 +13,7 @@ use crate::clock;
 use crate::engine::{Rows, Write};
 use crate::error::MetaError;
 use crate::key;
-use crate::record::{Extent, FileHeader, Referrer, Target, Verdict};
+use crate::record::{Extent, FileHeader, Referrer, Target, Verdict, WrappedKey};
 
 /// Extents one file may have: a completed upload's parts, at most 10,000 (05 §4.1). A file
 /// written by one PUT, at most 5 GB (05 §4.1), stays within it while its blocks hold at least
@@ -30,6 +30,8 @@ pub enum Command {
         file: u128,
         extents: Vec<Extent>,
         referrer: Referrer,
+        /// The file's data key, wrapped; `None` for a file of other files.
+        key: Option<WrappedKey>,
         handover_ns: u64,
         blocks_deadline_ns: u64,
         at_ns: u64,
@@ -88,12 +90,14 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
             file,
             extents,
             referrer,
+            key,
             handover_ns,
             blocks_deadline_ns,
             at_ns,
         } => {
             let intent = Intent {
                 referrer,
+                key: *key,
                 handover_ns: *handover_ns,
                 blocks_deadline_ns: *blocks_deadline_ns,
                 at_ns: *at_ns,
@@ -115,6 +119,7 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
 /// What a file is written for, beside its extents.
 struct Intent<'a> {
     referrer: &'a Referrer,
+    key: Option<WrappedKey>,
     handover_ns: u64,
     blocks_deadline_ns: u64,
     at_ns: u64,
@@ -149,6 +154,7 @@ fn write<E: Rows>(
         let same = existing.length == end
             && existing.extents == count
             && existing.referrer == *referrer
+            && existing.key == intent.key
             && stored.iter().map(|(_, e)| e).eq(extents);
         let outcome = if same {
             Outcome::Written {
@@ -172,6 +178,7 @@ fn write<E: Rows>(
         made_ns,
         deadline_ns,
         referrer: referrer.clone(),
+        key: intent.key,
     };
     writes.push(Write::Put(key::file_header(file), header.encode()?));
     writes.push(Write::Put(
@@ -339,6 +346,7 @@ mod tests {
             file,
             extents,
             referrer: referrer("k"),
+            key: None,
             handover_ns: 100,
             at_ns,
             blocks_deadline_ns: u64::MAX,
@@ -444,6 +452,7 @@ mod tests {
             file: 2,
             extents: vec![extent(1, 1)],
             referrer: referrer("k"),
+            key: None,
             handover_ns: u64::MAX,
             at_ns: 10,
             blocks_deadline_ns: u64::MAX,

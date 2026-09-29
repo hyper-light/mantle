@@ -365,6 +365,7 @@ mod tests {
                     incarnation: 1,
                     key: "k".into(),
                 },
+                key: None,
                 handover_ns: 1_000,
                 at_ns: index,
                 blocks_deadline_ns: u64::MAX,

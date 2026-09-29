@@ -10,8 +10,9 @@
 //! What a gateway made and never handed over (docs/design/metadata.md §2), found by the sweeps
 //! (`mantle_meta::sweep`) across a Block range, a File range and Name ranges that split while
 //! it happens, under schedules proptest chooses. A gateway writes a block's chunk to a volume
-//! and the block, then the file that names the block, then hands the file to its key's Name
-//! range; it may stop for good at any stage, or come late to the next. Deletes release files,
+//! and the block, renews the block's deadline while its body would still stream in, then
+//! writes the file that names the block, then hands the file to its key's Name range; it may
+//! stop for good at any stage, or come late to the next. Deletes release files,
 //! both sweeps run a step at a time and stop for good between any two steps, leaders whose
 //! clocks run behind propose entries at times earlier than entries already applied, and Name
 //! ranges split and merge, their marks and queues going with their keys, while the gateways
@@ -75,6 +76,8 @@ enum Action {
     },
     /// A gateway takes its next step: writes its file, or hands it over.
     Advance(usize),
+    /// A gateway renews its block's deadline, if its file is not yet written.
+    Renew(usize),
     /// A gateway stops for good where it is.
     Crash(usize),
     /// A delete of the key's null version or current version.
@@ -123,6 +126,7 @@ fn action() -> impl Strategy<Value = Action> {
     prop_oneof![
         3 => (0usize..4).prop_map(|key| Action::Write { key }),
         4 => (0usize..4).prop_map(Action::Advance),
+        2 => (0usize..4).prop_map(Action::Renew),
         1 => (0usize..4).prop_map(Action::Crash),
         1 => (0usize..4, any::<bool>()).prop_map(|(key, versioned)| Action::Delete { key, versioned }),
         3 => Just(Action::Sweep),
@@ -504,6 +508,11 @@ impl World {
                     self.advance(g);
                 }
             }
+            Action::Renew(i) => {
+                if !self.gateways.is_empty() {
+                    self.renew(i % self.gateways.len());
+                }
+            }
             Action::Crash(i) => {
                 if !self.gateways.is_empty() {
                     self.gateways.swap_remove(i % self.gateways.len());
@@ -594,6 +603,7 @@ impl World {
                         incarnation: 1,
                         key: g.key.into(),
                     },
+                    key: None,
                     handover_ns: HANDOVER,
                     blocks_deadline_ns: deadline_ns,
                     at_ns: self.proposed(),
@@ -615,6 +625,30 @@ impl World {
                     self.gateways.push(g);
                 }
             }
+        }
+    }
+
+    /// Gateway `i` renews its block, which holds it for another handover unless the sweep
+    /// released it, or has taken it apart; a gateway whose block was released gives up, as it
+    /// would make the block again.
+    fn renew(&mut self, i: usize) {
+        let Stage::Block { block, .. } = self.gateways[i].stage else {
+            return;
+        };
+        let renew = block::Command::Renew {
+            block,
+            file: self.gateways[i].file,
+            handover_ns: HANDOVER,
+            at_ns: self.proposed(),
+        };
+        match self.block(renew) {
+            block::Outcome::Written { deadline_ns } => {
+                self.gateways[i].stage = Stage::Block { block, deadline_ns };
+            }
+            block::Outcome::Expired | block::Outcome::NoSuchBlock => {
+                self.gateways.swap_remove(i);
+            }
+            other => panic!("{other:?}"),
         }
     }
 
@@ -781,6 +815,15 @@ impl World {
                     block::Outcome::Settled
                 );
                 BlockAnswer::Settled
+            }
+            BlockRequest::Release { block, deadline_ns } => {
+                match self.block(block::Command::Release { block, deadline_ns }) {
+                    block::Outcome::Released => BlockAnswer::Released(true),
+                    block::Outcome::Written { .. } | block::Outcome::NoSuchBlock => {
+                        BlockAnswer::Released(false)
+                    }
+                    other => panic!("{other:?}"),
+                }
             }
             BlockRequest::Block(b) => BlockAnswer::Block(block::read(&self.blocks, b).unwrap()),
             BlockRequest::Chunk(place) => {
@@ -1024,4 +1067,42 @@ fn what_stopped_gateways_left_is_released_and_late_steps_refused() {
     w.advance(late);
     w.check();
     w.finish();
+}
+
+/// A gateway renews its block while the sweep judges it. A renewal that lands after the File
+/// range judged the block, and before the sweep releases it, keeps the block, and the gateway's
+/// file names it in time; a renewal after the release is refused, and that gateway gives up.
+#[test]
+fn a_renewal_keeps_a_block_unless_the_sweep_released_it_first() {
+    let judged = |w: &mut World| {
+        w.act(&Action::Wait);
+        w.act(&Action::Wait);
+        w.act(&Action::BlockSweep);
+        w.act(&Action::BlockSweep);
+        assert!(matches!(
+            w.block_sweep.as_ref().unwrap().next(),
+            Some(BlockRequest::Release { .. })
+        ));
+    };
+
+    let mut w = World::new();
+    w.act(&Action::Write { key: 0 });
+    judged(&mut w);
+    w.act(&Action::Renew(0));
+    w.act(&Action::BlockSweep);
+    assert_eq!(w.recorded().len(), 1, "the renewed block was released");
+    w.act(&Action::Advance(0));
+    assert_eq!(w.written.len(), 1, "the renewed block's file was refused");
+    w.check();
+    w.finish();
+
+    let mut w = World::new();
+    w.act(&Action::Write { key: 0 });
+    judged(&mut w);
+    w.act(&Action::BlockSweep);
+    w.act(&Action::Renew(0));
+    assert!(w.gateways.is_empty(), "a released block was renewed");
+    w.check();
+    w.finish();
+    assert!(w.recorded().is_empty());
 }

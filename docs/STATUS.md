@@ -154,9 +154,9 @@ sealing and opening at rest on one core.
 
 Remaining before it is done:
 
-- Encryption at rest in the gateway's data path: each file's wrapped key in its header row,
-  the root key's file and its generations, and the pass that rewraps under a new one
-  (design/encryption.md).
+- Encryption at rest: the root key's file and its generations, and the pass that rewraps
+  files' keys under a new one (design/encryption.md). Each file's key is wrapped in its
+  header row, and the gateway seals every object and part under it.
 
 - The worker that takes lifecycle actions as they fall due, over the Name layer's versions
   and uploads, once the gateway and the metadata layer hold configurations (metadata.md §6).
@@ -195,9 +195,13 @@ sweep settles it, a Name range takes a file only by the deadline the file was wr
 and the sweep asks the file's Name range, which releases a file it never took once the
 deadline has passed at its own time, so no later handover can take it. Blocks a gateway made
 for a file it never wrote are found one layer down the same way, from the file itself. A
-simulation of 2,000 schedules, with gateways that stop at any stage or come late, sweeps that
-stop between any two steps, and leaders whose clocks run behind, finds no file both
-referenced and released, no named block taken apart, and nothing left unsettled or unnamed.
+gateway renews the blocks of a body still streaming in, and the sweep releases a block only
+at the deadline the File range judged, a released block renewing no more, so a renewal and a
+release are ordered by the Block range's log. A simulation of 2,000 schedules, with gateways
+that renew, stop at any stage or come late, sweeps that stop between any two steps, and
+leaders whose clocks run behind, finds no file both referenced and released, no named block
+taken apart, and nothing left unsettled or unnamed; with either of the release's two checks
+removed, it loses a named block's chunk.
 
 Name ranges split and merge ([design §3](design/metadata.md#3-ranges)), as the TLA+ model
 of splits and merges under a create and a delete lays out: each range records its span and a
@@ -211,6 +215,26 @@ descriptors and starts its phase again when a range has moved on. Both simulatio
 merge ranges while buckets are created and deleted and files are handed over and swept, with
 writers and sweeps that learn of both late and merge drivers that stop, resume, give up and
 send late, and each rule removed on purpose fails one of them or a test of its own.
+
+**Gateway object path** (`mantle-gateway`, [design](design/gateway.md)). A PUT or an upload
+part as a state machine that names each request and does no I/O: the body sealed in 64 KiB
+segments as it streams, cut into blocks of whole segments sized to the scheme's 8 MiB chunks,
+each block coded as copies or Reed–Solomon and its chunks written at once to distinct volumes
+with their CRC-32C, a refused chunk sent to the next volume offered, the block recorded once
+every chunk is durable and renewed while the body streams on, the file written once every
+block is, and the version or part committed last. It holds two blocks at most, the body
+waiting while both are full. An empty object is its version alone; an empty part has a file.
+Tested end to end against volumes and Block, File and Name ranges in memory: every object and
+part reads back from its chunks under its key, coded blocks rebuild from any `data` chunks,
+the body is held to its length and digests, and generated schedules of bodies, client pace
+and refusing volumes commit an object whole or nothing, which fails with renewals removed.
+
+Remaining before it is done:
+
+- The GET path: a range read from the fewest chunks, decoding around a chunk that fails.
+- The server around it: HTTP, the transport to storage nodes and ranges, routing by
+  descriptors, placement across failure domains, and each PUT's memory admitted against the
+  gateway's.
 
 The Raft log (`mantle-log`, [design](design/raft-log.md)), which every range replica on a
 metadata device shares: group commit across ranges with one flush a batch, frames whose

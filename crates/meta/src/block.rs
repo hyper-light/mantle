@@ -3,10 +3,12 @@
 //! blocks on a failed volume with one scan, as Tectonic's repair works per Block shard and
 //! per disk through its reverse index (01 §1.5).
 //!
-//! A block is written for one file, whose write must name it by a deadline. Until the sweep
-//! has settled whether it did, the block waits in the range's queue of unsettled blocks, so a
-//! block whose gateway stopped before writing the file is found without a scan
-//! (docs/design/metadata.md §2).
+//! A block is written for one file, whose write must name it by a deadline. The gateway renews
+//! the deadline while the body the file holds still streams in, and until the sweep has settled
+//! whether the file named the block, the block waits in the range's queue of unsettled blocks,
+//! so a block whose gateway stopped before writing the file is found without a scan
+//! (docs/design/metadata.md §2). The sweep releases a block only at the deadline it asked the
+//! File range about: a renewal since keeps the block, and a released block is renewed no more.
 
 use mantle_chunk::ChunkKey;
 
@@ -28,6 +30,21 @@ pub enum Command {
         handover_ns: u64,
         at_ns: u64,
     },
+    /// Holds a block for its file's write until `handover_ns` past the range's time now, or
+    /// its deadline if later: the gateway renews the blocks it wrote while the body they hold
+    /// still streams in.
+    Renew {
+        block: u128,
+        file: u128,
+        handover_ns: u64,
+        at_ns: u64,
+    },
+    /// Releases a block the File range found no file will name, if its deadline is still
+    /// `deadline_ns`, the one that range judged: a renewal since keeps the block.
+    Release {
+        block: u128,
+        deadline_ns: u64,
+    },
     /// Records that `chunk` lives on volume `to` instead of `from`: repair or rebalancing
     /// wrote it there.
     Move {
@@ -46,11 +63,16 @@ pub enum Command {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// The block is recorded, now or by the same request before: its file's write names it
-    /// until `deadline_ns`.
+    /// The block is recorded, now or by the same request before, and its file's write names
+    /// it until `deadline_ns`, which a renewal may have moved. A block its file named keeps the
+    /// deadline it was settled at.
     Written {
         deadline_ns: u64,
     },
+    /// The block is released: no file will name it, and the sweep takes it apart.
+    Released,
+    /// The sweep released the block: its file's write can no longer name it.
+    Expired,
     Moved,
     Deleted,
     Settled,
@@ -84,6 +106,13 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
             handover_ns,
             at_ns,
         } => write(engine, *block, header, chunks, *file, *handover_ns, *at_ns)?,
+        Command::Renew {
+            block,
+            file,
+            handover_ns,
+            at_ns,
+        } => renew(engine, *block, *file, *handover_ns, *at_ns)?,
+        Command::Release { block, deadline_ns } => release(engine, *block, *deadline_ns)?,
         Command::Move { chunk, from, to } => relocate(engine, chunk, *from, *to)?,
         Command::Delete { block } => delete(engine, *block)?,
         Command::Settle { blocks } => (Outcome::Settled, settle(engine, blocks)?),
@@ -106,12 +135,14 @@ fn write<E: Rows>(
     }
     if let Some((existing, places)) = read(engine, block)? {
         let origin = origin(engine, block)?.ok_or(MetaError::Corrupt)?;
-        let outcome = if existing == *header && places == chunks && origin.file == file {
+        let outcome = if existing != *header || places != chunks || origin.file != file {
+            Outcome::Conflict
+        } else if origin.released {
+            Outcome::Expired
+        } else {
             Outcome::Written {
                 deadline_ns: origin.deadline_ns,
             }
-        } else {
-            Outcome::Conflict
         };
         return Ok((outcome, Vec::new()));
     }
@@ -123,6 +154,7 @@ fn write<E: Rows>(
         file,
         made_ns,
         deadline_ns,
+        released: false,
     };
     let mut writes = vec![
         clock,
@@ -166,6 +198,77 @@ fn valid(block: u128, header: &BlockHeader, chunks: &[ChunkPlace]) -> bool {
         && volumes.len() == chunks.len()
 }
 
+fn renew<E: Rows>(
+    engine: &E,
+    block: u128,
+    file: u128,
+    handover_ns: u64,
+    at_ns: u64,
+) -> Result<(Outcome, Vec<Write>), MetaError> {
+    let Some(origin) = origin(engine, block)? else {
+        return Ok((Outcome::NoSuchBlock, Vec::new()));
+    };
+    if origin.file != file {
+        return Ok((Outcome::Conflict, Vec::new()));
+    }
+    if origin.released {
+        return Ok((Outcome::Expired, Vec::new()));
+    }
+    let queued = key::unsettled(origin.deadline_ns, block);
+    let (now, clock) = clock::tick(engine, at_ns)?;
+    let Some(until) = now.checked_add(handover_ns) else {
+        return Ok((Outcome::Invalid, Vec::new()));
+    };
+    // A block the sweep settled is named by its file, and no deadline holds it any longer.
+    if until <= origin.deadline_ns || engine.get(&queued)?.is_none() {
+        let held = Outcome::Written {
+            deadline_ns: origin.deadline_ns,
+        };
+        return Ok((held, vec![clock]));
+    }
+    let renewed = BlockOrigin {
+        deadline_ns: until,
+        ..origin
+    };
+    let writes = vec![
+        clock,
+        Write::Delete(queued),
+        Write::Put(key::block_origin(block), renewed.encode()),
+        Write::Put(key::unsettled(until, block), renewed.encode()),
+    ];
+    Ok((Outcome::Written { deadline_ns: until }, writes))
+}
+
+fn release<E: Rows>(
+    engine: &E,
+    block: u128,
+    deadline_ns: u64,
+) -> Result<(Outcome, Vec<Write>), MetaError> {
+    let Some(origin) = origin(engine, block)? else {
+        return Ok((Outcome::NoSuchBlock, Vec::new()));
+    };
+    if origin.released {
+        return Ok((Outcome::Released, Vec::new()));
+    }
+    let queued = key::unsettled(origin.deadline_ns, block);
+    // Renewed since the File range judged it, or settled, its file naming it: kept.
+    if origin.deadline_ns != deadline_ns || engine.get(&queued)?.is_none() {
+        let held = Outcome::Written {
+            deadline_ns: origin.deadline_ns,
+        };
+        return Ok((held, Vec::new()));
+    }
+    let released = BlockOrigin {
+        released: true,
+        ..origin
+    };
+    let writes = vec![
+        Write::Put(key::block_origin(block), released.encode()),
+        Write::Put(queued, released.encode()),
+    ];
+    Ok((Outcome::Released, writes))
+}
+
 fn relocate<E: Rows>(
     engine: &E,
     chunk: &ChunkKey,
@@ -175,6 +278,10 @@ fn relocate<E: Rows>(
     let Some((_, places)) = read(engine, chunk.block)? else {
         return Ok((Outcome::NoSuchBlock, Vec::new()));
     };
+    // A released block's chunks are being deleted: repair has nothing to keep.
+    if origin(engine, chunk.block)?.is_some_and(|o| o.released) {
+        return Ok((Outcome::Expired, Vec::new()));
+    }
     let Some(place) = places.get(usize::from(chunk.index)) else {
         return Ok((Outcome::Invalid, Vec::new()));
     };
@@ -221,11 +328,14 @@ fn delete<E: Rows>(engine: &E, block: u128) -> Result<(Outcome, Vec<Write>), Met
 }
 
 /// Writes that take `blocks` out of the unsettled queue; a block already out, or removed,
-/// needs none.
+/// needs none. A released block stays queued until its rows go, so a sweep that stops while
+/// taking it apart finds it again.
 fn settle<E: Rows>(engine: &E, blocks: &[u128]) -> Result<Vec<Write>, MetaError> {
     let mut writes = Vec::with_capacity(blocks.len());
     for &block in blocks {
-        if let Some(o) = origin(engine, block)? {
+        if let Some(o) = origin(engine, block)?
+            && !o.released
+        {
             writes.push(Write::Delete(key::unsettled(o.deadline_ns, block)));
         }
     }
@@ -495,20 +605,146 @@ mod tests {
         assert!(on_volume(&m, 8, None, 10).unwrap().is_empty());
     }
 
+    /// A renewal holds a block for another handover from the range's time. The sweep's
+    /// release at a deadline renewed since keeps the block, and a released block renews no
+    /// more: its write is refused and repair leaves it, while it waits in the queue until its
+    /// rows go.
+    #[test]
+    fn a_block_is_held_by_renewals_until_released_at_the_deadline_judged() {
+        let mut m = Model::default();
+        let write = Command::Write {
+            block: 5,
+            header: header(1, 1),
+            chunks: chunks(5, 1, &[1, 2]),
+            file: 9,
+            handover_ns: 100,
+            at_ns: 1_000,
+        };
+        let held = |deadline_ns| Outcome::Written { deadline_ns };
+        assert_eq!(apply(&mut m, 1, &write).unwrap(), held(1_100));
+        let renew = |file, handover_ns, at_ns| Command::Renew {
+            block: 5,
+            file,
+            handover_ns,
+            at_ns,
+        };
+        assert_eq!(
+            apply(&mut m, 2, &renew(9, 100, 1_050)).unwrap(),
+            held(1_150)
+        );
+        let queued = |m: &Model| -> Vec<u64> {
+            unsettled(m, u64::MAX, 10)
+                .unwrap()
+                .iter()
+                .map(|u| u.deadline_ns)
+                .collect()
+        };
+        assert_eq!(queued(&m), [1_150]);
+        // A renewal never brings the deadline nearer.
+        assert_eq!(apply(&mut m, 3, &renew(9, 10, 1_060)).unwrap(), held(1_150));
+        assert_eq!(
+            apply(&mut m, 4, &renew(8, 100, 1_070)).unwrap(),
+            Outcome::Conflict
+        );
+        let other = Command::Renew {
+            block: 6,
+            file: 9,
+            handover_ns: 100,
+            at_ns: 1_080,
+        };
+        assert_eq!(apply(&mut m, 5, &other).unwrap(), Outcome::NoSuchBlock);
+        // The File range judged the first deadline; the renewal since keeps the block.
+        let release = |deadline_ns| Command::Release {
+            block: 5,
+            deadline_ns,
+        };
+        assert_eq!(apply(&mut m, 6, &release(1_100)).unwrap(), held(1_150));
+        assert_eq!(
+            apply(&mut m, 7, &release(1_150)).unwrap(),
+            Outcome::Released
+        );
+        assert_eq!(
+            apply(&mut m, 8, &release(1_150)).unwrap(),
+            Outcome::Released
+        );
+        assert_eq!(
+            apply(&mut m, 9, &renew(9, 100, 1_200)).unwrap(),
+            Outcome::Expired
+        );
+        assert_eq!(apply(&mut m, 10, &write).unwrap(), Outcome::Expired);
+        let repair = Command::Move {
+            chunk: chunk(5, 0),
+            from: 1,
+            to: 3,
+        };
+        assert_eq!(apply(&mut m, 11, &repair).unwrap(), Outcome::Expired);
+        assert_eq!(queued(&m), [1_150]);
+        let delete = Command::Delete { block: 5 };
+        assert_eq!(apply(&mut m, 12, &delete).unwrap(), Outcome::Deleted);
+        assert!(queued(&m).is_empty());
+        assert_eq!(m.next(&[key::DATA], &[u8::MAX]).unwrap(), None);
+    }
+
+    /// A block its file named, which the sweep settled, is held by the file: renewing it and
+    /// releasing it change nothing.
+    #[test]
+    fn a_settled_block_is_neither_renewed_nor_released() {
+        let mut m = Model::default();
+        let write = Command::Write {
+            block: 5,
+            header: header(1, 1),
+            chunks: chunks(5, 1, &[1, 2]),
+            file: 9,
+            handover_ns: 100,
+            at_ns: 1_000,
+        };
+        apply(&mut m, 1, &write).unwrap();
+        let settle = Command::Settle { blocks: vec![5] };
+        assert_eq!(apply(&mut m, 2, &settle).unwrap(), Outcome::Settled);
+        let renew = Command::Renew {
+            block: 5,
+            file: 9,
+            handover_ns: 100,
+            at_ns: 1_050,
+        };
+        let held = Outcome::Written { deadline_ns: 1_100 };
+        assert_eq!(apply(&mut m, 3, &renew).unwrap(), held);
+        let release = Command::Release {
+            block: 5,
+            deadline_ns: 1_100,
+        };
+        assert_eq!(apply(&mut m, 4, &release).unwrap(), held);
+        assert!(unsettled(&m, u64::MAX, 10).unwrap().is_empty());
+        assert!(!origin(&m, 5).unwrap().unwrap().released);
+    }
+
     fn command() -> impl Strategy<Value = Command> {
         let volumes = prop::collection::vec(0u128..6, 1..4);
         prop_oneof![
-            (0u128..3, 0u32..2, volumes).prop_map(|(block, epoch, volumes)| {
-                let parity = u8::try_from(volumes.len() - 1).unwrap();
-                Command::Write {
+            (0u128..3, 0u32..2, volumes, 1u64..40).prop_map(
+                |(block, epoch, volumes, handover_ns)| {
+                    let parity = u8::try_from(volumes.len() - 1).unwrap();
+                    Command::Write {
+                        block,
+                        header: header(1, parity),
+                        chunks: chunks(block, epoch, &volumes),
+                        at_ns: 0,
+                        file: 1,
+                        handover_ns,
+                    }
+                }
+            ),
+            (0u128..3, 1u128..3, 0u64..40).prop_map(|(block, file, handover_ns)| {
+                Command::Renew {
                     block,
-                    header: header(1, parity),
-                    chunks: chunks(block, epoch, &volumes),
+                    file,
+                    handover_ns,
                     at_ns: 0,
-                    file: 1,
-                    handover_ns: u64::MAX / 2,
                 }
             }),
+            (0u128..3, 0u64..80)
+                .prop_map(|(block, deadline_ns)| Command::Release { block, deadline_ns }),
+            prop::collection::vec(0u128..3, 0..3).prop_map(|blocks| Command::Settle { blocks }),
             (0u128..3, 0u32..2, 0u16..3, 0u128..6, 0u128..6).prop_map(
                 |(block, epoch, index, from, to)| Command::Move {
                     chunk: ChunkKey {
@@ -526,12 +762,37 @@ mod tests {
 
     proptest! {
         /// After any commands, each chunk row has exactly one reverse row, under its volume
-        /// and naming its index, and no other reverse row exists.
+        /// and naming its index, and no other reverse row exists. A block waits in the queue
+        /// once, at its deadline, until the sweep settles it or its rows go; its deadline never
+        /// comes nearer, and once released it stays released.
         #[test]
         fn every_chunk_has_one_reverse_row(commands in prop::collection::vec(command(), 1..40)) {
             let mut m = Model::default();
+            let mut before: Vec<Option<BlockOrigin>> = vec![None; 3];
             for (index, command) in (1..).zip(&commands) {
                 apply(&mut m, index, command).unwrap();
+                let queue = unsettled(&m, u64::MAX, 100).unwrap();
+                for block in 0..3u128 {
+                    let now = origin(&m, block).unwrap();
+                    let queued: Vec<u64> = queue
+                        .iter()
+                        .filter(|u| u.block == block)
+                        .map(|u| u.deadline_ns)
+                        .collect();
+                    match now {
+                        None => prop_assert!(queued.is_empty()),
+                        Some(o) => {
+                            prop_assert!(queued.is_empty() || queued == [o.deadline_ns]);
+                            prop_assert!(!o.released || queued == [o.deadline_ns]);
+                        }
+                    }
+                    let slot = usize::try_from(block).unwrap();
+                    if let (Some(b), Some(n)) = (before[slot], now) {
+                        prop_assert!(n.deadline_ns >= b.deadline_ns);
+                        prop_assert!(n.released || !b.released);
+                    }
+                    before[slot] = now;
+                }
                 let mut forward = Vec::new();
                 for block in 0..3 {
                     if let Some((_, places)) = read(&m, block).unwrap() {

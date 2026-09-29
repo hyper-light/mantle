@@ -511,6 +511,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mantle-gateway"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "getrandom 0.4.3",
+ "mantle-chunk",
+ "mantle-crc",
+ "mantle-ec",
+ "mantle-meta",
+ "mantle-s3",
+ "proptest",
+ "thiserror",
+]
+
+[[package]]
 name = "mantle-log"
 version = "0.1.0"
 dependencies = [

@@ -17,11 +17,14 @@
 //! One layer down, a [`BlockSweep`] does the same for a Block range's blocks, made each for one
 //! file. A file is written once, whole, so the File range answers from the file itself: a file
 //! written names what it ever will, and one not written once the block's deadline has passed at
-//! the File range's time never will, its write being refused past that deadline. A block no
-//! file will name is taken apart there and then, chunks first: no reference ever reached it,
-//! so there is no deletion by mistake for a grace period to undo.
+//! the File range's time never will, its write being refused past that deadline. The gateway
+//! renews its blocks' deadlines while the body they hold streams in, so the sweep first
+//! releases the block in the Block range at the deadline the File range judged: a renewal
+//! since keeps it, and a block released is renewed no more. A released block is taken apart
+//! there and then, chunks first: no reference ever reached it, so there is no deletion by
+//! mistake for a grace period to undo.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::block;
 use crate::file::Unsettled;
@@ -146,7 +149,10 @@ pub enum BlockRequest {
     },
     /// `block::Command::Settle` for blocks their files name.
     Settle(Vec<u128>),
-    /// A read of a block no file will name, for its chunks ([`crate::block::read`]).
+    /// `block::Command::Release` of a block no file will name, at the deadline the File range
+    /// judged it by.
+    Release { block: u128, deadline_ns: u64 },
+    /// A read of a released block, for its chunks ([`crate::block::read`]).
     Block(u128),
     /// Deleting a chunk from its volume, on the node that holds the volume.
     Chunk(ChunkPlace),
@@ -160,6 +166,9 @@ pub enum BlockAnswer {
     Due(Vec<block::Unsettled>),
     Checked(Vec<Verdict>),
     Settled,
+    /// Whether the block is released: not if its writer renewed it since the sweep read it,
+    /// or it is gone.
+    Released(bool),
     Block(Option<(BlockHeader, Vec<ChunkPlace>)>),
     /// The chunk is gone from its volume, deleted now or before.
     Chunk,
@@ -173,18 +182,28 @@ enum BlockPhase {
         /// Blocks of each file still to ask about.
         groups: VecDeque<(u128, Vec<(u128, u64)>)>,
         held: Vec<u128>,
-        orphans: VecDeque<u128>,
+        orphans: VecDeque<(u128, u64)>,
     },
     Settle {
         held: Vec<u128>,
-        orphans: VecDeque<u128>,
+        orphans: VecDeque<(u128, u64)>,
     },
-    /// Taking the front orphan apart: its chunks still to delete, once read.
+    /// Taking the front orphan apart, with the deadline the File range judged it by.
     Reclaim {
-        orphans: VecDeque<u128>,
-        chunks: Option<VecDeque<ChunkPlace>>,
+        orphans: VecDeque<(u128, u64)>,
+        take: Take,
     },
     Done,
+}
+
+/// How far taking an orphan apart has got.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Take {
+    Release,
+    /// Released: its chunks are read next.
+    Read,
+    /// Its chunks still to delete, then its rows.
+    Chunks(VecDeque<ChunkPlace>),
 }
 
 /// One pass over a Block range's unsettled blocks, a page at a time, ending as a [`Sweep`]'s
@@ -219,11 +238,12 @@ impl BlockSweep {
                 }
             }
             BlockPhase::Settle { held, .. } => BlockRequest::Settle(held.clone()),
-            BlockPhase::Reclaim { orphans, chunks } => {
-                let block = *orphans.front()?;
-                match chunks {
-                    None => BlockRequest::Block(block),
-                    Some(left) => match left.front() {
+            BlockPhase::Reclaim { orphans, take } => {
+                let &(block, deadline_ns) = orphans.front()?;
+                match take {
+                    Take::Release => BlockRequest::Release { block, deadline_ns },
+                    Take::Read => BlockRequest::Block(block),
+                    Take::Chunks(left) => match left.front() {
                         Some(place) => BlockRequest::Chunk(*place),
                         None => BlockRequest::Delete(block),
                     },
@@ -233,21 +253,22 @@ impl BlockSweep {
         })
     }
 
-    /// Takes the answer to the request [`next`](Self::next) named, and moves on.
+    /// Takes the answer to the request [`next`](Self::next) named, and moves on. An answer that
+    /// does not fit the request is refused, and the sweep stays where it was.
     pub fn answer(&mut self, answer: BlockAnswer) -> Result<(), SweepError> {
         let phase = std::mem::replace(&mut self.phase, BlockPhase::Done);
         self.phase = match (phase, answer) {
             (BlockPhase::Read, BlockAnswer::Due(due)) if due.is_empty() => BlockPhase::Done,
             (BlockPhase::Read, BlockAnswer::Due(due)) => {
-                let mut groups: VecDeque<(u128, Vec<(u128, u64)>)> = VecDeque::new();
+                let mut by_file: BTreeMap<u128, Vec<(u128, u64)>> = BTreeMap::new();
                 for u in due {
-                    match groups.iter_mut().find(|(file, _)| *file == u.file) {
-                        Some((_, blocks)) => blocks.push((u.block, u.deadline_ns)),
-                        None => groups.push_back((u.file, vec![(u.block, u.deadline_ns)])),
-                    }
+                    by_file
+                        .entry(u.file)
+                        .or_default()
+                        .push((u.block, u.deadline_ns));
                 }
                 BlockPhase::Check {
-                    groups,
+                    groups: by_file.into_iter().collect(),
                     held: Vec::new(),
                     orphans: VecDeque::new(),
                 }
@@ -260,10 +281,18 @@ impl BlockSweep {
                 },
                 BlockAnswer::Checked(verdicts),
             ) => {
-                let Some((_, blocks)) = groups.pop_front() else {
+                // An answer that does not fit leaves the request where it was, to be asked
+                // again.
+                let Some((file, blocks)) = groups.pop_front() else {
+                    self.phase = BlockPhase::Check {
+                        groups,
+                        held,
+                        orphans,
+                    };
                     return Err(SweepError::Mismatch);
                 };
                 if verdicts.len() != blocks.len() {
+                    groups.push_front((file, blocks));
                     self.phase = BlockPhase::Check {
                         groups,
                         held,
@@ -271,10 +300,10 @@ impl BlockSweep {
                     };
                     return Err(SweepError::Count);
                 }
-                for ((b, _), v) in blocks.iter().zip(&verdicts) {
+                for (&(b, deadline_ns), v) in blocks.iter().zip(&verdicts) {
                     match v {
-                        Verdict::Held => held.push(*b),
-                        Verdict::Released => orphans.push_back(*b),
+                        Verdict::Held => held.push(b),
+                        Verdict::Released => orphans.push_back((b, deadline_ns)),
                         Verdict::Young => {}
                     }
                 }
@@ -289,33 +318,41 @@ impl BlockSweep {
                 } else if !orphans.is_empty() {
                     BlockPhase::Reclaim {
                         orphans,
-                        chunks: None,
+                        take: Take::Release,
                     }
                 } else {
                     // Every block of the page is young: the pass ends here.
                     BlockPhase::Done
                 }
             }
-            (BlockPhase::Settle { orphans, .. }, BlockAnswer::Settled) => {
-                if orphans.is_empty() {
-                    BlockPhase::Read
-                } else {
+            (BlockPhase::Settle { orphans, .. }, BlockAnswer::Settled) => next_orphan(orphans),
+            (
+                BlockPhase::Reclaim {
+                    mut orphans,
+                    take: Take::Release,
+                },
+                BlockAnswer::Released(released),
+            ) => {
+                if released {
                     BlockPhase::Reclaim {
                         orphans,
-                        chunks: None,
+                        take: Take::Read,
                     }
+                } else {
+                    orphans.pop_front();
+                    next_orphan(orphans)
                 }
             }
             (
                 BlockPhase::Reclaim {
                     mut orphans,
-                    chunks: None,
+                    take: Take::Read,
                 },
                 BlockAnswer::Block(found),
             ) => match found {
                 Some((_, places)) => BlockPhase::Reclaim {
                     orphans,
-                    chunks: Some(places.into()),
+                    take: Take::Chunks(places.into()),
                 },
                 // Gone already: a pass that stopped part way deleted it.
                 None => {
@@ -326,20 +363,20 @@ impl BlockSweep {
             (
                 BlockPhase::Reclaim {
                     orphans,
-                    chunks: Some(mut left),
+                    take: Take::Chunks(mut left),
                 },
                 BlockAnswer::Chunk,
             ) if !left.is_empty() => {
                 left.pop_front();
                 BlockPhase::Reclaim {
                     orphans,
-                    chunks: Some(left),
+                    take: Take::Chunks(left),
                 }
             }
             (
                 BlockPhase::Reclaim {
                     mut orphans,
-                    chunks: Some(left),
+                    take: Take::Chunks(left),
                 },
                 BlockAnswer::Deleted,
             ) if left.is_empty() => {
@@ -356,13 +393,13 @@ impl BlockSweep {
 }
 
 /// The next orphan to take apart, or the next page once none is left.
-fn next_orphan(orphans: VecDeque<u128>) -> BlockPhase {
+fn next_orphan(orphans: VecDeque<(u128, u64)>) -> BlockPhase {
     if orphans.is_empty() {
         BlockPhase::Read
     } else {
         BlockPhase::Reclaim {
             orphans,
-            chunks: None,
+            take: Take::Release,
         }
     }
 }
@@ -466,6 +503,14 @@ mod tests {
             .unwrap();
         assert_eq!(s.next(), Some(BlockRequest::Settle(vec![1])));
         s.answer(BlockAnswer::Settled).unwrap();
+        assert_eq!(
+            s.next(),
+            Some(BlockRequest::Release {
+                block: 3,
+                deadline_ns: 10
+            })
+        );
+        s.answer(BlockAnswer::Released(true)).unwrap();
         assert_eq!(s.next(), Some(BlockRequest::Block(3)));
         let header = BlockHeader {
             length: 1,
@@ -497,8 +542,52 @@ mod tests {
         again
             .answer(BlockAnswer::Checked(vec![Verdict::Released]))
             .unwrap();
+        again.answer(BlockAnswer::Released(true)).unwrap();
         assert_eq!(again.next(), Some(BlockRequest::Block(3)));
         again.answer(BlockAnswer::Block(None)).unwrap();
         assert_eq!(again.next(), Some(BlockRequest::Due { max: 8 }));
+        // A verdict for too few blocks, or an answer of another kind, is refused, and the
+        // sweep asks the same again.
+        let mut refused = BlockSweep::new(8);
+        refused
+            .answer(BlockAnswer::Due(vec![due(3, 7), due(4, 7)]))
+            .unwrap();
+        let asked = refused.next();
+        assert_eq!(
+            refused.answer(BlockAnswer::Checked(vec![Verdict::Released])),
+            Err(SweepError::Count)
+        );
+        assert_eq!(
+            refused.answer(BlockAnswer::Settled),
+            Err(SweepError::Mismatch)
+        );
+        assert_eq!(refused.next(), asked);
+        refused
+            .answer(BlockAnswer::Checked(vec![Verdict::Held, Verdict::Held]))
+            .unwrap();
+        assert_eq!(refused.next(), Some(BlockRequest::Settle(vec![3, 4])));
+        // An orphan its writer renewed after the sweep read it is kept, and the pass goes on.
+        let mut renewed = BlockSweep::new(8);
+        renewed
+            .answer(BlockAnswer::Due(vec![due(3, 7), due(4, 7)]))
+            .unwrap();
+        renewed
+            .answer(BlockAnswer::Checked(vec![
+                Verdict::Released,
+                Verdict::Released,
+            ]))
+            .unwrap();
+        assert_eq!(
+            renewed.answer(BlockAnswer::Chunk),
+            Err(SweepError::Mismatch)
+        );
+        renewed.answer(BlockAnswer::Released(false)).unwrap();
+        assert_eq!(
+            renewed.next(),
+            Some(BlockRequest::Release {
+                block: 4,
+                deadline_ns: 10
+            })
+        );
     }
 }

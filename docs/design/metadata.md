@@ -209,24 +209,34 @@ layers removes them, as Tectonic's does [01 §1.6].
       writing its file leaves a block no file names. A block is made for one file, which alone
       may name it, and records that file, its time and its deadline, and waits in the Block
       range's queue of unsettled blocks. A file's write names the soonest deadline of its
-      blocks, and a File range whose time has passed it refuses the write. The block sweep
-      (`BlockSweep`) asks the File range of each block's file, one file at a time, which
-      answers from the file itself: a file is written once, whole, so one written names what
-      it ever will, and one not written by a block's deadline never will. Nothing is marked.
-      A block named is settled; one never to be named is taken apart there and then, its
-      chunks first and its rows and place in the queue last, with no grace period, since no
-      reference ever reached it and there is no deletion by mistake to undo.
+      blocks, and a File range whose time has passed it refuses the write. A PUT's first block
+      is written while the rest of its body streams in, and its file only once the body ends,
+      so no fixed deadline serves a body that arrives slowly: the gateway renews each block
+      it wrote, a handover past the Block range's time, while its body streams, as an HDFS
+      writer renews its lease (22 §3.6). The block sweep (`BlockSweep`) asks the File range of
+      each block's file, one file at a time, which answers from the file itself: a file is
+      written once, whole, so one written names what it ever will, and one not written by a
+      block's deadline never will. Nothing is marked. A block named is settled. One never to
+      be named is released in the Block range only if its deadline is still the one the File
+      range judged, and a released block renews no more, so a renewal and a release are
+      ordered by the Block range's log: a renewal first keeps the block, and after a release
+      the writer's file names a deadline the File range has passed and is refused. A
+      released block is taken apart there and then, its chunks first and its rows and place
+      in the queue last, with no grace period, since no reference ever reached it and there
+      is no deletion by mistake to undo.
     - *Checked.* `crates/meta/tests/orphan_sweep.rs` runs 2,000 generated schedules across a
       Block range, a File range and two Name ranges. Gateways write a chunk and its block,
-      then the file, then hand it over, stopping at any stage or coming late to the next;
+      renew it, then write the file, then hand it over, stopping at any stage or coming late
+      to the next;
       deletes release files; both sweeps stop between any two steps; and leaders whose clocks
       run behind propose entries at earlier times than entries already applied. After every
       step, no file a version references is released, every file is referenced, released or
       unsettled, and every block a file names keeps its rows and chunk. Once the faults stop,
       nothing is left unsettled in either layer, every file is referenced or released and not
       both, and no block or chunk is left that nothing names. With the Name range's deadline
-      check removed, the File range's, or either check's recorded time, the simulation loses
-      a file or a block's chunk.
+      check removed, the File range's, either check's recorded time, the release's deadline
+      check, or the refusal to renew a released block, the simulation loses a file or a
+      block's chunk.
 - **Multipart.** CreateMultipartUpload writes the upload row. UploadPart writes the part's
   chunks, blocks and file, then replaces the part row. CompleteMultipartUpload writes the
   object's file of part extents in its File range, then, in the Name range, checks the

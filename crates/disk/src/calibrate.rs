@@ -32,8 +32,14 @@ pub struct Plan {
     pub rounds: Rounds,
     /// Wall-clock budget of one job.
     pub step: Duration,
-    /// Queue depths for random reads.
+    /// Queue depths for random reads. Past the last, the ladder quadruples its depth while
+    /// each step is faster than the one before beyond both intervals, so it reaches the depth
+    /// where throughput stops growing, and goes no deeper than `max_read_depth`.
     pub random_depths: Vec<usize>,
+    /// The deepest random-read point: NVMe queues hold at most 65,535 commands, its 16-bit,
+    /// zero-based maximum queue entries less the slot that tells a full queue from an empty
+    /// one (NVM Express Base Specification, CAP.MQES).
+    pub max_read_depth: usize,
     /// Queue depths for sequential transfers.
     pub sequential_depths: Vec<usize>,
     /// Small transfer: the alignment unit, 4 KiB on flash (Haas and Leis, PVLDB 2023, §2.2).
@@ -93,6 +99,7 @@ impl Plan {
             rounds: Rounds::STANDARD,
             step: Duration::from_millis(500),
             random_depths: vec![1, 4, 16, 64],
+            max_read_depth: 65_535,
             sequential_depths: vec![1, 4],
             small,
             large: 1 << 20,
@@ -162,6 +169,15 @@ impl Calibration {
         knee(&self.random_read)
     }
 
+    /// The shallowest random-read depth whose throughput interval overlaps the fastest
+    /// point's: where throughput stops growing, as far as the rounds can tell (Georges,
+    /// Buytaert and Eeckhout, OOPSLA 2007, §3.3). Past it a read added to the device only
+    /// waits. Kleinrock's optimum (`random_read_knee`) lies at or before it, trading
+    /// throughput for latency.
+    pub fn random_read_saturation(&self) -> Option<Point> {
+        saturation(&self.random_read)
+    }
+
     /// Whether a durable write into preallocated, never-written space is slower than the same
     /// write over written space: the first write's throughput interval lies wholly below the
     /// overwrite's, the test by which Georges, Buytaert and Eeckhout tell two measurements
@@ -177,6 +193,18 @@ impl Calibration {
 /// `a`'s throughput interval lies wholly below `b`'s.
 fn slower(a: &Point, b: &Point) -> bool {
     a.ops_per_sec * (1.0 + a.spread) < b.ops_per_sec * (1.0 - b.spread)
+}
+
+fn saturation(points: &[Point]) -> Option<Point> {
+    let fastest = points
+        .iter()
+        .filter(|p| p.depth > 0)
+        .max_by(|a, b| a.ops_per_sec.total_cmp(&b.ops_per_sec))?;
+    points
+        .iter()
+        .filter(|p| p.depth > 0 && !slower(p, fastest))
+        .min_by_key(|p| p.depth)
+        .copied()
 }
 
 fn knee(points: &[Point]) -> Option<Point> {
@@ -295,6 +323,19 @@ pub fn calibrate(
     };
     let mut random_read = Vec::with_capacity(plan.random_depths.len());
     for &depth in &plan.random_depths {
+        random_read.push(point(&file, plan, |round| {
+            job(Pattern::RandomRead, plan.small, depth, round)
+        })?);
+    }
+    // Throughput still growing at the last depth: the ladder goes on, four times deeper each
+    // step, a bounded number of steps.
+    while let [.., before, last] = random_read.as_slice()
+        && slower(before, last)
+        && let Some(depth) = last
+            .depth
+            .checked_mul(4)
+            .filter(|&d| d <= plan.max_read_depth)
+    {
         random_read.push(point(&file, plan, |round| {
             job(Pattern::RandomRead, plan.small, depth, round)
         })?);
@@ -439,6 +480,29 @@ mod tests {
         assert_eq!(knee(&[]), None);
     }
 
+    /// Throughput stops growing at the shallowest depth whose interval overlaps the fastest
+    /// point's; the power knee, this machine's 16, comes before it when throughput still
+    /// grows (docs/measurements/2026-09-29-read-depth.md).
+    #[test]
+    fn saturation_is_where_throughput_stops_growing() {
+        let with = |depth: usize, ops: f64, spread: f64| Point {
+            spread,
+            ..at(depth, ops)
+        };
+        let points = [
+            with(1, 14_000.0, 0.03),
+            with(4, 54_800.0, 0.03),
+            with(16, 165_000.0, 0.03),
+            with(64, 214_000.0, 0.03),
+            with(256, 218_000.0, 0.03),
+        ];
+        assert_eq!(knee(&points).unwrap().depth, 16);
+        assert_eq!(saturation(&points).unwrap().depth, 64);
+        // Still growing at the last depth: the last depth is the best found.
+        assert_eq!(saturation(&points[..4]).unwrap().depth, 64);
+        assert_eq!(saturation(&[]), None);
+    }
+
     /// A penalty is measured only when the intervals part: 5.7x with tight intervals is one,
     /// and a difference inside the noise is none.
     #[test]
@@ -497,6 +561,8 @@ mod tests {
             },
             step: Duration::from_millis(20),
             random_depths: vec![1, 2],
+            // The ladder goes no deeper than planned, however the reads scale.
+            max_read_depth: 2,
             sequential_depths: vec![1],
             small: 4096,
             large: 1 << 20,

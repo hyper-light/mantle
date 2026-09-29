@@ -50,6 +50,40 @@ impl Limits {
     }
 }
 
+/// How many client reads the volume holds at the device, and how many more may wait for a
+/// turn (docs/design/chunk-store.md §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reads {
+    /// Reads at the device at once: the depth where calibration finds throughput stops
+    /// growing (`mantle_disk::calibrate::Calibration::random_read_saturation`). Past it every
+    /// read added only waits, so holding the device there costs no throughput
+    /// (docs/measurements/2026-09-29-read-depth.md).
+    pub depth: usize,
+    /// Reads that may wait for a turn; a read past them is refused with `Busy`, and the caller
+    /// reads another copy.
+    pub waiting: usize,
+}
+
+impl Reads {
+    /// The measured depth, with as many reads let wait: by Little's law each then waits about
+    /// as long as a read takes at that depth, beyond which another copy serves it sooner.
+    pub fn measured(depth: usize) -> Self {
+        let depth = depth.max(1);
+        Self {
+            depth,
+            waiting: depth,
+        }
+    }
+}
+
+impl Default for Reads {
+    /// A device not measured reads one at a time: no device's depth of greatest power is
+    /// below one.
+    fn default() -> Self {
+        Self::measured(1)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
     /// Bytes per segment, fixed at format. 256 MiB matches host-managed SMR zones and is in
@@ -73,6 +107,7 @@ pub struct Config {
     /// (`mantle_disk::calibrate::Calibration::first_write_penalty`; docs/design/chunk-store.md
     /// §2).
     pub prewrite: bool,
+    pub reads: Reads,
 }
 
 impl Default for Config {
@@ -85,6 +120,7 @@ impl Default for Config {
             scrub_period: Some(std::time::Duration::from_secs(7 * 24 * 3600)),
             limits: Limits::default(),
             prewrite: false,
+            reads: Reads::default(),
         }
     }
 }

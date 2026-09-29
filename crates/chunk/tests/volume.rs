@@ -11,10 +11,11 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use common::{SIZE, config, data, key, put_retrying, sim};
 use mantle_chunk::layout::{Geometry, batch_frame_bytes, checkpoint_bytes, largest_frame};
-use mantle_chunk::{ChunkError, Config, Volume};
+use mantle_chunk::{ChunkError, Config, Reads, Volume};
 use mantle_disk::buf::Alignment;
 use mantle_disk::file::{CachingRequest, DeviceFile};
 
@@ -527,4 +528,48 @@ fn bytes_that_do_not_match_their_senders_checksum_are_refused() {
     v.append_checked(key(2), 0, &more, false, mantle_crc::crc32c(&more))
         .unwrap();
     assert_eq!(v.read(&key(2), 0, 5000).unwrap(), more);
+}
+
+/// Reads past the device's depth wait their turn, and those past the reads let wait are
+/// refused with `Busy`: every read let through returns the chunk's bytes, every refusal is
+/// counted, and no more than the depth are at the device at once.
+#[test]
+fn reads_past_the_depth_wait_or_are_refused() {
+    let config = Config {
+        reads: Reads {
+            depth: 2,
+            waiting: 1,
+        },
+        ..config()
+    };
+    let v = Volume::format(sim(11), SIZE, config).unwrap();
+    for n in 0..8 {
+        v.put(key(n), &data(n, 3000)).unwrap();
+    }
+    let (read, refused) = (AtomicU64::new(0), AtomicU64::new(0));
+    std::thread::scope(|s| {
+        for t in 0..8u64 {
+            let (v, read, refused) = (&v, &read, &refused);
+            s.spawn(move || {
+                for i in 0..200u64 {
+                    let n = (t + i) % 8;
+                    match v.read(&key(n), 0, 3000) {
+                        Ok(bytes) => {
+                            assert_eq!(bytes, data(n, 3000));
+                            read.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(ChunkError::Busy) => {
+                            refused.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => panic!("{e}"),
+                    }
+                }
+            });
+        }
+    });
+    let stats = v.read_stats().unwrap();
+    assert!(stats.most_at_device <= 2, "{stats:?}");
+    let refused = refused.into_inner();
+    assert_eq!(stats.refused, refused);
+    assert_eq!(read.into_inner() + refused, 8 * 200);
 }

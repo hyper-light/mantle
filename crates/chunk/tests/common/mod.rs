@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use mantle_chunk::{ChunkError, ChunkKey, Config, Limits, Volume};
+use mantle_chunk::{ChunkError, ChunkKey, Config, Limits, Reads, Volume};
 use mantle_disk::buf::Alignment;
 use mantle_disk::sim::SimFile;
 
@@ -27,6 +27,7 @@ pub fn config() -> Config {
             fragments_per_chunk: 64,
         },
         prewrite: false,
+        reads: Reads::default(),
     }
 }
 

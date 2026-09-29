@@ -33,7 +33,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use mantle_chunk::{ChunkError, ChunkKey, Config, Volume};
+use mantle_chunk::{ChunkError, ChunkKey, Config, Reads, Volume};
 use mantle_disk::buf::{AlignedBuf, Alignment};
 use mantle_disk::calibrate::{self, Calibration};
 use mantle_disk::file::{CachingRequest, DeviceFile};
@@ -199,9 +199,10 @@ pub fn chunk(out: &mut impl Write, path: &Path, options: &Options) -> Result<(),
         plan.workers.clone_from(&options.workers);
     }
     writeln!(out, "{}", path.display())?;
-    // The volume is formatted as mantle would format it here, which the device measurement
-    // decides; without one it is not pre-written.
+    // The volume is formatted and read as mantle would here, which the device measurement
+    // decides; without one it is not pre-written and reads one at a time.
     let mut prewrite = false;
+    let mut reads = Reads::default();
     if !options.skip_device {
         writeln!(out, "measuring the device (about 30 s)")?;
         out.flush()?;
@@ -214,8 +215,11 @@ pub fn chunk(out: &mut impl Write, path: &Path, options: &Options) -> Result<(),
         .map_err(Error::Disk)?;
         report_device(out, &device)?;
         prewrite = device.first_write_penalty();
+        if let Some(saturation) = device.random_read_saturation() {
+            reads = Reads::measured(saturation.depth);
+        }
     }
-    run(out, path, align, &plan, prewrite)
+    run(out, path, align, &plan, prewrite, reads)
 }
 
 pub(crate) fn report_device(out: &mut impl Write, c: &Calibration) -> std::io::Result<()> {
@@ -265,6 +269,7 @@ fn run(
     align: Alignment,
     plan: &Plan,
     prewrite: bool,
+    reads: Reads,
 ) -> Result<(), Error> {
     let path = dir.join(format!(".mantle-bench-{}", std::process::id()));
     let _scratch = Scratch(path.clone());
@@ -284,6 +289,7 @@ fn run(
             .max(1024),
         scrub_period: None,
         prewrite,
+        reads,
         ..Config::default()
     };
     let v = Volume::format(file, volume, config).map_err(Error::Chunk)?;
@@ -292,13 +298,16 @@ fn run(
     let span = v.data_span();
     writeln!(
         out,
-        "chunk store on a {} volume in a scratch file (removed afterwards){}",
+        "chunk store on a {} volume in a scratch file (removed afterwards){}, reading {} at \
+         a time with {} more let wait",
         display::capacity(volume),
         if prewrite {
             ", written once at format"
         } else {
             ""
-        }
+        },
+        reads.depth,
+        reads.waiting
     )?;
     out.flush()?;
 
@@ -336,14 +345,17 @@ fn run(
                 .unwrap_or(usize::MAX)
                 .clamp(1, config.limits.queue_requests().max(1));
             let writers = workers.min(admitted);
+            // More readers than the store holds at the device and lets wait would be refused
+            // with Busy; the file layer reads as many at once, for comparison.
+            let readers = workers.min(reads.depth.saturating_add(reads.waiting));
             let (mut put, mut get, mut direct) =
                 (Series::default(), Series::default(), Series::default());
             for _ in 0..plan.rounds.limit() {
                 let (outcome, keys) = puts(&v, size, writers, plan.step, budget, point)?;
                 put.add(outcome);
                 if !keys.is_empty() {
-                    get.add(gets(&v, &keys, size, workers, plan.step, point)?);
-                    direct.add(raw_reads(&raw, &span, size, workers, plan.step, point)?);
+                    get.add(gets(&v, &keys, size, readers, plan.step, point)?);
+                    direct.add(raw_reads(&raw, &span, size, readers, plan.step, point)?);
                 }
                 deletes(&v, &keys)?;
                 point = point.saturating_add(1);
@@ -362,11 +374,11 @@ fn run(
                 rows(
                     out,
                     &format!("get {}", display::size(size)),
-                    workers,
+                    readers,
                     size,
                     &get,
                 )?;
-                rows(out, "  file layer", workers, size, &direct)?;
+                rows(out, "  file layer", readers, size, &direct)?;
             }
         }
     }
@@ -741,9 +753,19 @@ mod tests {
             },
         };
         let mut out = Vec::new();
-        run(&mut out, dir.path(), align, &plan, false).unwrap();
+        // As a device measured at four in flight: four readers, none refused.
+        run(
+            &mut out,
+            dir.path(),
+            align,
+            &plan,
+            false,
+            Reads::measured(4),
+        )
+        .unwrap();
         let text = String::from_utf8(out).unwrap();
         for name in [
+            "reading 4 at a time with 4 more let wait",
             "first pass",
             "put 4 KiB",
             "get 4 KiB",

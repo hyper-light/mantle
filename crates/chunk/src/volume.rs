@@ -179,6 +179,7 @@ impl<F: BlockFile + 'static> Volume<F> {
                 geometry.segment_size,
             )),
             usage: RwLock::new(recovered.segments.clone()),
+            reads: crate::read::Gate::new(config.reads),
         });
         // Client requests are admitted up to `queue_requests` (`submit`); the cleaner sends
         // one request at a time beside them.
@@ -456,7 +457,9 @@ impl<F: BlockFile + 'static> Volume<F> {
     }
 
     /// Reads `len` bytes of a chunk from `offset`, verifying every byte returned against the
-    /// record's checksums and every record against the identity the index expects.
+    /// record's checksums and every record against the identity the index expects. The read
+    /// takes a turn at the device, waiting behind at most `Reads::waiting` others, and is
+    /// refused with `Busy` past them (docs/design/chunk-store.md §7).
     pub fn read(&self, key: &ChunkKey, offset: u64, len: u64) -> Result<Vec<u8>, ChunkError> {
         let mut out = Vec::new();
         self.read_into(key, offset, len, &mut out)?;
@@ -495,6 +498,7 @@ impl<F: BlockFile + 'static> Volume<F> {
             usize::try_from(len).map_err(|_| ChunkError::TooLarge { len, max: u64::MAX })?;
         out.reserve(capacity);
         let end = offset.saturating_add(len);
+        let _turn = self.shared.reads.enter()?;
         for fragment in &fragments {
             let from = offset
                 .max(fragment.chunk_offset)
@@ -505,6 +509,11 @@ impl<F: BlockFile + 'static> Volume<F> {
             read::fragment(&self.shared, key, fragment, from, to, out)?;
         }
         Ok(())
+    }
+
+    /// What the read gate has let through and refused since the volume opened.
+    pub fn read_stats(&self) -> Result<crate::ReadStats, ChunkError> {
+        self.shared.reads.stats()
     }
 
     /// Verifies every stored fragment now; returns the number that failed. Failed chunks are

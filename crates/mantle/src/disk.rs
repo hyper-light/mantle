@@ -155,13 +155,14 @@ fn measured(out: &mut impl Write, path: &Path, id: &Identity) -> Result<(), Erro
 
 fn report(out: &mut impl Write, c: &Calibration) -> std::io::Result<()> {
     writeln!(out, "measured in {:.0} s:", c.elapsed.as_secs_f64())?;
-    if let Some(knee) = c.random_read_knee() {
+    if let (Some(knee), Some(saturation)) = (c.random_read_knee(), c.random_read_saturation()) {
         field(
             out,
             "reads",
             &format!(
-                "{} concurrent {} reads keep the device busiest for their wait; mantle uses up to {}",
-                knee.depth,
+                "throughput stops growing at {} concurrent {} reads, which mantle holds at the \
+                 device; {} get the most throughput for their wait",
+                saturation.depth,
                 display::size(c.small),
                 knee.depth
             ),

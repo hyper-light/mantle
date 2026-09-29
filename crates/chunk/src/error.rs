@@ -41,9 +41,10 @@ pub enum ChunkError {
     TooManyFragments(ChunkKey),
     #[error("volume is full")]
     Full,
-    /// The writer's queue holds all it takes (`Limits::queue_requests`, `queue_bytes`):
-    /// nothing was written, and the caller retries later or elsewhere.
-    #[error("volume is busy: its write queue is full")]
+    /// The writer's queue holds all it takes (`Limits::queue_requests`, `queue_bytes`), or
+    /// as many reads wait for a turn at the device as may (`Reads::waiting`): nothing was
+    /// written or read, and the caller retries later or elsewhere.
+    #[error("volume is busy: its queue is full")]
     Busy,
     #[error("volume is closed")]
     Closed,

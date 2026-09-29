@@ -18,8 +18,10 @@ directory and, with `--measure`, benchmarks the device. It is built on:
 - **Calibration**: reads, writes and flush latency measured through the file layer. Each
   point runs until the 95% confidence interval of its throughput is within 5% of its mean
   (three to six rounds), latency quantiles are reported only when enough transfers ran to
-  estimate them, and the read depth reported is the one of greatest power (Kleinrock). The
-  scratch file is removed whether the run succeeds or fails.
+  estimate them, and the random reads go on to deeper queues until throughput stops growing:
+  that depth is what a chunk volume holds at the device, and the depth of greatest power
+  (Kleinrock) is reported beside it ([measurements](measurements/2026-09-29-read-depth.md)).
+  The scratch file is removed whether the run succeeds or fails.
 - **Checksums**: CRC-32C for stored and transmitted data, and CRC-64/NVME for S3
   checksums, both verified against published test vectors.
 - **Cryptography** ([design](design/crypto.md)): AWS-LC through aws-lc-rs, vendored with the
@@ -76,9 +78,13 @@ continuous once damage is found. Damaged chunks, including those whose records c
 read at all, are listed for repair, and a volume with more than 4,096 is marked failing, to
 be drained whole.
 
+Reads are held at the device's measured depth: a volume keeps at most the depth of greatest
+power calibration finds at the device, lets as many more wait in the order they came, and
+refuses the rest with `Busy`, where before every caller's thread read at the device
+unbounded.
+
 Remaining before it is done:
 
-- An I/O path that keeps the measured number of reads in flight.
 - `mantle bench chunk` measures puts and reads next to the same reads through the file
   layer, each point in ten to thirty rounds judged as the [measurement
   design](design/measurement.md) sets out: rounds ordered in time found by the lag-1

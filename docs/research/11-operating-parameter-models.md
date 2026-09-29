@@ -657,6 +657,8 @@ equivalently: N* = argmax_N X(N)²/N      (power X/R with R = N/X in a closed lo
 
 On this machine, 4 KiB reads at 15K/s at depth 1 (`R_min ≈ 66.7 µs`) and about 235K/s at depth 64 give `N* ≈ 15.7`, so 16. The 90% threshold should be replaced by this, with noise handled statistically: among ladder points, take the smallest depth whose throughput confidence interval overlaps the best one's (GBE07 §3.3, PDF p. 7).
 
+Measured (2026-09-29): as a bound on reads held at the device, `N*` is too shallow. This machine's 4 KiB reads still gained 30% from 16 in flight to 64, and fell from 64 to 256; a chunk volume held at 16 with the rest waiting lost more than half its throughput at 32 callers, while one held at 64, the smallest depth whose interval overlaps the best one's, matched the file layer ([measurements/2026-09-29-read-depth.md](../measurements/2026-09-29-read-depth.md)). The ideal device the formula assumes keeps its latency flat until its parallel units fill; a real one's latency climbs before that. Power is the right optimum only where reads past it are refused to another copy with room.
+
 ### 13.4 Inputs and calculation (Recommendation)
 
 - Ladders: geometric in depth, refined by bisection around the maximum of `X²/N`. Transfer size swept to find where IOPS × size reaches the bandwidth plateau, which becomes the large transfer instead of a fixed 1 MiB. `T(b)` measured for durable batches (§5).

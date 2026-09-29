@@ -74,14 +74,15 @@ the same checks on the device that holds a directory:
 $ mantle disk probe ~/mantle-data --measure
 ~/mantle-data
   disk          APPLE SSD AP8192Z, internal flash
-  file system   APFS, 46.0 GB free
+  file system   APFS, 14.5 GB free
   write cache   not reported; mantle flushes the drive cache on every commit
 measuring with a scratch file of up to 268 MB (removed afterwards)
-measured in 19 s:
-  reads         64 concurrent 4 KiB reads give the highest throughput; mantle uses up to 64
-  throughput    14.6 GB/s read, 21.8 GB/s write (1 MiB transfers)
-  commits       4.72 ms per durable write; concurrent writes share a flush
-  batches       5.34 GB/s when 32 MiB is made durable at a time
+measured in 36 s:
+  reads         throughput stops growing at 64 concurrent 4 KiB reads, which mantle holds at the device; 16 get the most throughput for their wait
+  throughput    10.7 GB/s read, 22.0 GB/s write (1 MiB transfers)
+  commits       4.33 ms per durable write; concurrent writes share a flush
+  batches       4.67 GB/s when 32 MiB is made durable at a time
+  first writes  a durable write into new space takes 1.3x one over written space; volumes here are written once at format
 ```
 
 The first three lines come from the operating system and print immediately. The rest
@@ -89,11 +90,13 @@ comes from `--measure`, which benchmarks the device through the same direct-I/O 
 mantle uses for data. It writes a scratch file of at most 256 MB, or a tenth of the free
 space if that is smaller, and deletes it when it finishes, including after an error.
 Mantle uses these results to choose I/O sizes, queue depths and how many writes to group
-into each flush. On this Mac a durable write takes about 4.7 ms, because macOS flushes
+into each flush. On this Mac a durable write takes about 4.3 ms, because macOS flushes
 the drive's write cache (`F_FULLFSYNC`) before the write completes; grouping concurrent
 writes into one flush keeps that cost from limiting how many writes complete per second.
-The last line is how fast the drive makes data durable when a whole batch is flushed at
-once, which is the most that grouped writes can reach.
+The batches line is how fast the drive makes data durable when a whole batch is flushed at
+once, which is the most that grouped writes can reach. The last line says whether a durable
+write into space never written costs more than one over written space; where it does, mantle
+writes a volume once when it formats it.
 `--verbose` lists every property the operating system did not report.
 
 > [!NOTE]

@@ -215,6 +215,27 @@ checksum, identity or incarnation mismatch, or `EIO`, is one condition: a typed
 fragment) and reported for repair [GAA17 §4; research/03 X1]. The node never crashes and
 never returns unverified bytes.
 
+A volume holds at most `Reads::depth` client reads at the device: the shallowest depth at
+which calibration finds throughput stops growing, its interval overlapping the fastest
+point's (Georges et al., OOPSLA 2007, §3.3). Past it each read added only waits, so holding
+the device there costs no throughput, and it leaves the device's queue to the writer's
+flushes rather than to however many reads arrive. The volume lets as many more wait, in the
+order they came, and refuses the rest with `Busy`, after which the caller reads another
+copy, which every chunk has. By Little's law a read let wait then waits about as long as a
+read takes at the depth. A wait lasts while the reads ahead of it take, each bounded by the
+operating system's I/O timeout, and a turn given back wakes only the read it passes to. A
+device not measured reads one at a time. Before this gate nothing bounded the reads a volume
+took at once: every caller's thread read at the device. The scrubber's paced steps (§9) and
+the cleaner's relocations (§8) keep their own pacing outside the gate.
+
+The depth of greatest power, Kleinrock's optimum (research/11 §13.3), is the wrong bound
+here: on this machine it is 16, where 4 KiB reads still gain 30% by 64 in flight, and
+holding the device at 16 with the rest waiting halved throughput at 32 callers and more than
+doubled their median latency against the same reads through the file layer
+([measurements](../measurements/2026-09-29-read-depth.md)). Power trades throughput for
+latency, which pays only where reads refused go to another copy with room; reads made to
+wait in software rather than at the device lose throughput and gain nothing.
+
 ## 8. Deleting and cleaning
 
 A delete appends `Delete` to the index log in the next batch and removes the entry; the

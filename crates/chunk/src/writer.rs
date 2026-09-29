@@ -168,6 +168,8 @@ pub(crate) struct Shared<F> {
     /// Held through a cleaning pass: the background cleaner's or one asked for.
     pub cleaning: std::sync::Mutex<()>,
     pub usage: RwLock<Vec<SegmentInfo>>,
+    /// Holds client reads at the device's measured depth.
+    pub reads: crate::read::Gate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

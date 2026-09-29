@@ -25,6 +25,7 @@ pub mod file;
 pub mod key;
 pub mod name;
 pub mod overlay;
+pub mod reclaim;
 pub mod record;
 pub mod session;
 pub mod wire;

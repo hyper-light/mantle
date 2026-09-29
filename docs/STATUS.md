@@ -156,7 +156,9 @@ removals and changes they refuse at the step that would make them, and a bucket'
 retention, with versioning held enabled while Object Lock is on. Every file a removal stops
 referencing, and every file a refused write carried, is released in the same transaction
 into a queue the collector takes oldest first; a property test over random histories checks
-that each file handed to a range is held in exactly one place after every step. The File layer: files written once as extents, found from any
+that each file handed to a range is held in exactly one place after every step. A reclaimer
+removes a released file's chunks, blocks and rows bottom up, resumable from the queue after
+stopping at any step. The File layer: files written once as extents, found from any
 offset with one seek. The Block layer: where each chunk lives, with a reverse row per chunk
 that a property test keeps in step with the chunks through writes, moves and deletes. The
 Bucket layer: owners' quotas and listings, and the steps of creating and deleting a bucket
@@ -195,9 +197,9 @@ commands applied twice when either is introduced on purpose.
 
 Remaining before it is done:
 
-- The collector's schedule: which buckets it resumes or abandons, and when. Also its
-  reclamation of released files, their blocks and chunks after the grace period, and the
-  sweep for files a stopped gateway made and never handed over (design §2, §6).
+- The collector's schedule: which buckets it resumes or abandons, and which released files it
+  reclaims, when; and the sweep for files a stopped gateway made and never handed over
+  (design §2, §6).
 - The production engine, once its binding is chosen (design §4).
 - Splits and the fast track under simulation, built to the TLA+ model of splits under a
   create and a delete (design §3, `docs/models/RangeSplit.tla`), and the transport:

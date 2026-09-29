@@ -140,11 +140,16 @@ layers removes them, as Tectonic's does [01 §1.6].
     deletes, part uploads, completions and aborts under every versioning state and checks
     after each step that every file handed to the range is held in exactly one place;
     removing any one release, or releasing a listed part, fails it.
-  - *Reclaiming.* The collector takes the queue oldest first, once a file has been released
+    - *Reclaiming.* The collector takes the queue oldest first, once a file has been released
     longer than the grace period, and removes what it holds bottom up: each block's chunks
     from their volumes, then the block's rows, then an adopted part's file, then the file,
-    and last the queue row, each step repeatable, so a collector that stops is resumed from
-    the queue. The grace period is a recovery-point policy, three days by default, as GFS
+    and last the queue row. A reclaimer (`crates/meta/src/reclaim.rs`) names each read and
+    command and moves on with its answer, doing no I/O, as the coordinator does. Every step
+    can be repeated, since a chunk or row already gone stays gone and a removed file reads as
+    one with no extents, so a collector that stops is resumed from the queue. A property test
+    stops reclaimers after random steps over random files of parts and blocks, resumes them
+    from the queue, and checks that every row, block and chunk of the file goes and nothing
+    else does; dropping the queue row first fails it. The grace period is a recovery-point policy, three days by default, as GFS
     keeps a deleted file (chunk-store §8).
   - *What the queue cannot see:* a gateway that stops between writing a file and handing it
     over leaves a file no range ever held. Finding those needs the sweep between layers that
@@ -298,8 +303,8 @@ cover the production engine, which the simulator cannot.
 - How an entry larger than a datagram reaches the replicas: over QUIC, or fragmented on the
   UDP plane. A completion of 10,000 parts is an entry of hundreds of kilobytes in the Name
   range and another in the File range.
-- The collector's reclamation steps and schedule (§2), and the sweep that finds files a
-  stopped gateway made and never handed over.
+- The collector's schedule (§2), and the sweep that finds files a stopped gateway made and
+  never handed over.
 - The bound on a cached bucket row's staleness, and how a versioning change reaches
   gateways within it.
 - Where a bucket's lifecycle and tag configurations live. A lifecycle configuration at its

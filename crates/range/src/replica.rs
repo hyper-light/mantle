@@ -81,6 +81,9 @@ pub struct Replica<F: BlockFile + 'static, E: Engine> {
     applied: u64,
     /// The configuration as of `applied`.
     conf: ConfState,
+    /// An index at or past the entry that made `conf`: the entry itself once this member
+    /// applies a change, and before that the point it opened at or installed.
+    conf_index: u64,
 }
 
 impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
@@ -104,6 +107,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
         };
         let applied = engine.applied();
         complete_install(&log, group, &engine)?;
+        commit_applied(&log, group, applied)?;
         let config = focal_raft::Config {
             election_tick: settings.election_tick,
             heartbeat_tick: settings.heartbeat_tick,
@@ -134,6 +138,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
             rules,
             applied,
             conf,
+            conf_index: applied,
         };
         // A log compacted before the restart can serve a lagging member only by snapshot.
         let compacted = replica
@@ -168,6 +173,44 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
     /// The last entry applied.
     pub fn applied(&self) -> u64 {
         self.applied
+    }
+
+    /// The group's configuration as of the last entry applied.
+    pub fn configuration(&self) -> &ConfState {
+        &self.conf
+    }
+
+    /// Whether this member leads and every voter of its configuration has said it committed
+    /// the entry that made it. Configurations take effect as members apply them, so until
+    /// then a voter that did not learn of the commit still counts the members the change
+    /// removed, and losing the leader could leave no quorum it can elect in; after, losing
+    /// any one member leaves voters that elect under this configuration
+    /// (docs/design/replica.md §6).
+    pub fn configuration_known(&self) -> bool {
+        let tracker = self.node.raft.tracker();
+        let id = self.id();
+        self.is_leader()
+            && self.conf.voters.iter().all(|&voter| {
+                voter == id
+                    || tracker
+                        .get(voter)
+                        .is_some_and(|p| p.committed_index >= self.conf_index)
+            })
+    }
+
+    /// Whether this member leads and `member` has confirmed holding every entry it knows
+    /// committed: a member that could vote now without a quorum waiting on it to catch up
+    /// (docs/design/replica.md §6). The leader's record of what a member holds rises only on
+    /// the member's own answer.
+    pub fn caught_up(&self, member: u64) -> bool {
+        let committed = self.node.raft.log().committed();
+        self.is_leader()
+            && self
+                .node
+                .raft
+                .tracker()
+                .get(member)
+                .is_some_and(|p| p.matched >= committed)
     }
 
     /// A line on the member's state for diagnosis: its term, leader, applied and committed
@@ -300,6 +343,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
     fn apply(&mut self, entries: Vec<Entry>, out: &mut Drive) -> Result<(), ReplicaError> {
         for entry in entries {
             let index = entry.index;
+            let mut changed = false;
             match EntryType::from_i32(entry.entry_type) {
                 // A new leader's empty entry changes no row.
                 Some(EntryType::EntryNormal) if entry.data.is_empty() => {
@@ -324,16 +368,18 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
                     change.merge_from_bytes(&entry.data).map_err(|_| {
                         ReplicaError::Stopped(format!("committed change {index} does not decode"))
                     })?;
-                    let changed = self.node.apply_conf_change(&change);
-                    self.changed(index, changed)?;
+                    let outcome = self.node.apply_conf_change(&change);
+                    self.changed(index, outcome)?;
+                    changed = true;
                 }
                 Some(EntryType::EntryConfChange) => {
                     let mut change = ConfChange::default();
                     change.merge_from_bytes(&entry.data).map_err(|_| {
                         ReplicaError::Stopped(format!("committed change {index} does not decode"))
                     })?;
-                    let changed = self.node.apply_conf_change_v1(&change);
-                    self.changed(index, changed)?;
+                    let outcome = self.node.apply_conf_change_v1(&change);
+                    self.changed(index, outcome)?;
+                    changed = true;
                 }
                 None => {
                     return Err(ReplicaError::Stopped(format!(
@@ -342,8 +388,41 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
                 }
             }
             self.applied = index;
+            if changed && self.snapshot_misses_a_member() {
+                self.prepare()?;
+            }
         }
         Ok(())
+    }
+
+    /// Whether the snapshot prepared for lagging members leaves out a member of the
+    /// configuration. A member refuses a snapshot that does not name it, so a member added
+    /// after the snapshot was prepared could never be caught up by it; the snapshot is then
+    /// prepared again, at the change that added the member (docs/design/replica.md §6).
+    fn snapshot_misses_a_member(&self) -> bool {
+        let Some(named) = self
+            .node
+            .store()
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.metadata.as_ref())
+            .and_then(|m| m.conf_state.as_ref())
+        else {
+            return false;
+        };
+        let names = |c: &ConfState, id: &u64| {
+            c.voters.contains(id)
+                || c.learners.contains(id)
+                || c.voters_outgoing.contains(id)
+                || c.learners_next.contains(id)
+        };
+        let conf = &self.conf;
+        conf.voters
+            .iter()
+            .chain(&conf.learners)
+            .chain(&conf.voters_outgoing)
+            .chain(&conf.learners_next)
+            .any(|id| !names(named, id))
     }
 
     /// Records the configuration a committed change made, in the batch of its entry. A change
@@ -361,6 +440,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
                 self.engine
                     .apply(index, &[Write::Put(conf::ROW.to_vec(), bytes)])?;
                 self.conf = conf;
+                self.conf_index = index;
             }
             Err(e) if !e.is_fatal() => self.engine.apply(index, &[])?,
             Err(e) => return Err(e.into()),
@@ -434,6 +514,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
         self.applied = metadata.index;
         if let Some(conf) = metadata.conf_state {
             self.conf = conf.clone();
+            self.conf_index = metadata.index;
             self.node.store_mut().conf = conf;
         }
         self.node.store_mut().snapshot = Some(snapshot);
@@ -486,6 +567,43 @@ fn complete_install<F: BlockFile + 'static, E: Engine>(
             }),
             proposals: Vec::new(),
             remove: false,
+        },
+    )?;
+    Ok(())
+}
+
+/// Brings the log's durable commit up to the entries the engine applied. A member learns of
+/// commits the core reports after its entries are durable, and applies them without writing
+/// the commit to the log, so an engine that made its rows durable (at compaction, or on its
+/// own) can open ahead of the commit the log kept, which the core refuses. Every entry the
+/// engine applied was committed, and the log holds it, so its index is committed state the
+/// log is told of, as for an install the log never recorded.
+fn commit_applied<F: BlockFile + 'static>(
+    log: &Log<F>,
+    group: u128,
+    applied: u64,
+) -> Result<(), ReplicaError> {
+    let Some(view) = log.view(group)? else {
+        return Ok(());
+    };
+    let hard = view.hard_state.unwrap_or_default();
+    if applied <= hard.commit {
+        return Ok(());
+    }
+    if applied > view.last {
+        return Err(ReplicaError::Stopped(format!(
+            "the engine applied {applied}, past the log's last entry {}",
+            view.last
+        )));
+    }
+    log.write_waiting(
+        group,
+        Update {
+            hard_state: Some(mantle_log::HardState {
+                commit: applied,
+                ..hard
+            }),
+            ..Update::default()
         },
     )?;
     Ok(())

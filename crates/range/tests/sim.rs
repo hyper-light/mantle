@@ -4,7 +4,9 @@
 //! simulated network that delays, drops and partitions messages. Nodes crash, losing what
 //! neither their log nor their engine had made durable, and restart from what was; a
 //! device's write or flush fails, which fences the node's log and takes the node down until
-//! it restarts from what the device kept. Three
+//! it restarts from what the device kept. Once or twice a run a member is lost for good, its
+//! device and all, and a member with a new identity replaces it: added as a learner, caught
+//! up, then swapped in by one joint change (docs/design/replica.md §6). Three
 //! gateways, each with its own session, put and get two keys at once: puts go through the
 //! log, retried through leader changes with the session's serial numbers, and gets through
 //! the leader's ReadIndex. A run is its seed.
@@ -15,7 +17,8 @@
 //! - every put a gateway was answered exists exactly once on every member, however often it
 //!   was retried;
 //! - every member holds the same rows;
-//! - each key's history, as the gateways saw it, is linearizable (docs/research/06 §A6.8).
+//! - each key's history, as the gateways saw it, is linearizable (docs/research/06 §A6.8);
+//! - every member's configuration names the live members as its voters, and nothing else.
 //!
 //! `MANTLE_SIM_SEEDS` sets how many runs, and `MANTLE_SIM_SEED` where they begin.
 #![allow(
@@ -42,11 +45,15 @@ use mantle_meta::name::{self, GateChange, Preconditions, Put};
 use mantle_meta::record::{GateState, Version, Versioning};
 use mantle_meta::session::Rules;
 use mantle_meta::wire::{Answer, Command, Entry, Sessioned};
+use mantle_range::membership::{Next, Replacement};
 use mantle_range::{ConfState, Message, Range, Replica, ReplicaError, Settings};
 use support::linear::{self, Input, Operation, Output, Register, Verdict};
 
 const GROUP: u128 = 0x0072_616e_6765;
+/// Members the group starts with, and keeps: a lost member is replaced.
 const MEMBERS: u64 = 3;
+/// Members each run loses for good, one after another.
+const LOSSES: u64 = 2;
 
 fn log_config() -> LogConfig {
     LogConfig {
@@ -247,10 +254,21 @@ struct World {
     history: Vec<Seen>,
     /// Puts answered, by key: their values.
     put: HashMap<String, Vec<String>>,
+    /// The identity the next new member takes; none is ever reused.
+    next_id: u64,
+    /// The replacement under way, and the step its last change was proposed.
+    replacing: Option<(Replacement, Option<u64>)>,
+    /// Members lost for good so far, and the step at which the next is lost.
+    lost: u64,
+    lose_at: u64,
+    /// Replacements finished.
+    replaced: u64,
 }
 
 impl World {
     fn new(seed: u64) -> Self {
+        let mut rng = Rng(seed);
+        let lose_at = 200 + rng.below(1_000);
         let nodes = (1..=MEMBERS).map(|id| Node::new(id, seed)).collect();
         let gateways = (0..GATEWAYS)
             .map(|id| Gateway {
@@ -265,7 +283,7 @@ impl World {
             .collect();
         Self {
             seed,
-            rng: Rng(seed),
+            rng,
             nodes,
             wire: Vec::new(),
             step: 0,
@@ -276,13 +294,28 @@ impl World {
             gate_open: false,
             history: Vec::new(),
             put: HashMap::new(),
+            next_id: MEMBERS + 1,
+            replacing: None,
+            lost: 0,
+            lose_at,
+            replaced: 0,
         }
     }
 
     fn fail(&self, what: &str) -> ! {
+        eprintln!(
+            "members {:?}, replacing {:?}, lost {}, replaced {}",
+            self.nodes
+                .iter()
+                .map(|n| (n.id, n.replica.is_some()))
+                .collect::<Vec<_>>(),
+            self.replacing,
+            self.lost,
+            self.replaced
+        );
         for n in &self.nodes {
             if let Some(r) = n.replica.as_ref() {
-                eprintln!("{}", r.describe());
+                eprintln!("{} conf {:?}", r.describe(), r.configuration());
             }
         }
         panic!("seed {} step {}: {what}", self.seed, self.step)
@@ -300,6 +333,7 @@ impl World {
         }
         self.deliver();
         self.drive();
+        self.replace();
         self.serve_reads();
         for g in 0..self.gateways.len() {
             self.act(g);
@@ -307,7 +341,10 @@ impl World {
     }
 
     fn inject(&mut self) {
-        let i = self.rng.below(MEMBERS) as usize;
+        if self.replacing.is_none() && self.lost < LOSSES && self.step >= self.lose_at {
+            self.lose();
+        }
+        let i = self.rng.below(self.nodes.len() as u64) as usize;
         let down = self.nodes.iter().filter(|n| n.replica.is_none()).count();
         if self.rng.chance(4) && down == 0 {
             self.nodes[i].crash();
@@ -319,11 +356,9 @@ impl World {
         if self.rng.chance(6) {
             // Cut one member off from the others, both ways.
             let id = self.nodes[i].id;
-            for other in 1..=MEMBERS {
-                if other != id {
-                    self.blocked.insert((id, other));
-                    self.blocked.insert((other, id));
-                }
+            for other in self.nodes.iter().map(|n| n.id).filter(|&o| o != id) {
+                self.blocked.insert((id, other));
+                self.blocked.insert((other, id));
             }
         }
         if self.rng.chance(15) {
@@ -346,6 +381,51 @@ impl World {
                 Ok(()) => {}
                 Err(ReplicaError::Log(_)) => self.nodes[i].crash(),
                 Err(e) => self.fail(&format!("compact: {e}")),
+            }
+        }
+    }
+
+    /// Loses a member for good, its device and engine with it, and starts replacing it with a
+    /// new member under an identity never used before.
+    fn lose(&mut self) {
+        let i = self.rng.below(self.nodes.len() as u64) as usize;
+        let failed = self.nodes.remove(i).id;
+        let joining = self.next_id;
+        self.next_id += 1;
+        self.nodes.push(Node::new(joining, self.seed));
+        self.replacing = Some((Replacement::new(failed, joining).unwrap(), None));
+        self.lost += 1;
+        self.lose_at = self.step + 300 + self.rng.below(800);
+    }
+
+    /// Drives the replacement under way through whichever member leads: the change it asks
+    /// for is proposed, and proposed again if a patience passes without it taking effect.
+    fn replace(&mut self) {
+        let Some((replacement, sent)) = self.replacing else {
+            return;
+        };
+        let now = self.step;
+        let Some(leader) = self.leader() else {
+            return;
+        };
+        match replacement.next(
+            leader.configuration(),
+            leader.caught_up(replacement.joining()),
+            leader.configuration_known(),
+        ) {
+            Next::Done => {
+                self.replacing = None;
+                self.replaced += 1;
+            }
+            Next::Wait => {}
+            Next::Propose(change) => {
+                if sent.is_none_or(|at| now - at >= PATIENCE) {
+                    match leader.propose_change(&change) {
+                        Ok(()) | Err(ReplicaError::Refused(_)) => {}
+                        Err(e) => panic!("propose a change: {e}"),
+                    }
+                    self.replacing = Some((replacement, Some(now)));
+                }
             }
         }
     }
@@ -390,6 +470,7 @@ impl World {
         let mut sent = Vec::new();
         let mut applied = Vec::new();
         let mut reads = Vec::new();
+        let mut stopped = None;
         for n in &mut self.nodes {
             let Some(r) = n.replica.as_mut() else {
                 continue;
@@ -401,11 +482,17 @@ impl World {
                     n.crash();
                     continue;
                 }
-                Err(e) => panic!("drive on {}: {e}", n.id),
+                Err(e) => {
+                    stopped = Some(format!("drive on {}: {e}", n.id));
+                    break;
+                }
             };
             sent.extend(out.messages);
             applied.extend(out.applied);
             reads.extend(out.reads.into_iter().map(|(index, ctx)| (n.id, index, ctx)));
+        }
+        if let Some(what) = stopped {
+            self.fail(&what);
         }
         for m in sent {
             let delay = 1 + self.rng.below(if self.faults { 6 } else { 2 });
@@ -668,7 +755,7 @@ impl World {
             .gateways
             .iter()
             .any(|g| g.left > 0 || !matches!(g.doing, Doing::Idle) || g.session.is_none());
-        if busy {
+        if busy || self.replacing.is_some() {
             return false;
         }
         let applied: Vec<u64> = self
@@ -676,8 +763,31 @@ impl World {
             .iter()
             .filter_map(|n| n.replica.as_ref().map(Replica::applied))
             .collect();
-        applied.len() == MEMBERS as usize && applied.windows(2).all(|w| w[0] == w[1])
+        applied.len() == self.nodes.len()
+            && applied.windows(2).all(|w| w[0] == w[1])
+            && self.nodes.iter().all(|n| {
+                n.replica
+                    .as_ref()
+                    .is_some_and(|r| final_configuration(r.configuration(), &self.live()))
+            })
     }
+
+    /// The live members, in order.
+    fn live(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self.nodes.iter().map(|n| n.id).collect();
+        ids.sort_unstable();
+        ids
+    }
+}
+
+/// Whether `conf` is a settled configuration whose voters are `live` and nothing else.
+fn final_configuration(conf: &ConfState, live: &[u64]) -> bool {
+    let mut voters = conf.voters.clone();
+    voters.sort_unstable();
+    voters == live
+        && conf.learners.is_empty()
+        && conf.voters_outgoing.is_empty()
+        && conf.learners_next.is_empty()
 }
 
 /// The context a gateway's read carries: the gateway and the read's attempt.
@@ -768,7 +878,8 @@ fn versions(m: &Model, key: &str) -> Vec<String> {
     out
 }
 
-fn run(seed: u64) {
+/// One run: the replacements it finished.
+fn run(seed: u64) -> u64 {
     let mut w = World::new(seed);
     for _ in 0..3_000 {
         w.step();
@@ -791,6 +902,14 @@ fn run(seed: u64) {
     if engines[1..].iter().any(|e| rows(e) != first) {
         w.fail("members hold different rows");
     }
+    let live = w.live();
+    if live.len() != MEMBERS as usize
+        || w.nodes
+            .iter()
+            .any(|n| !final_configuration(n.replica.as_ref().unwrap().configuration(), &live))
+    {
+        w.fail("the members' configurations are not the live members");
+    }
     for (key, values) in &w.put {
         let held = versions(engines[0], key);
         for value in values {
@@ -812,6 +931,7 @@ fn run(seed: u64) {
             other => w.fail(&format!("{key}: {other:?} over {} operations", ops.len())),
         }
     }
+    w.replaced
 }
 
 #[test]
@@ -824,7 +944,13 @@ fn a_group_under_faults_is_linearizable_and_applies_every_put_once() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
+    let mut replaced = 0;
     for seed in first..first + seeds {
-        run(seed);
+        // A member is lost within the faults of every run, and the run settles only once its
+        // replacement finishes.
+        let run_replaced = run(seed);
+        assert!(run_replaced >= 1, "seed {seed} replaced no member");
+        replaced += run_replaced;
     }
+    eprintln!("{seeds} runs replaced {replaced} members lost for good");
 }

@@ -97,6 +97,16 @@ and every entry after the start, and the replica applies the committed entries p
 engine's index again. Because applying is deterministic, replaying them rebuilds the same
 rows.
 
+The engine can open past the commit the log kept. A member learns of some commits only
+after persisting their entries (focal-raft's light ready), and applies them without writing
+the commit to the log, while the engine makes applied rows durable on its own schedule. The
+core refuses a member that has applied past what it knows committed. Every entry the engine
+applied was committed, and the log holds it, so on open the replica writes the engine's
+index to the log as its commit, as it finishes an install the log never recorded. The
+simulation found this once members could be lost for good. A leader lost right after a commit
+left a follower that never heard the commit again, and that follower compacted, crashed and
+reopened with its engine ahead of its log.
+
 ## 5. Testing
 
 Replicas are tested in deterministic simulation (`crates/range/tests/sim.rs`). Three
@@ -104,8 +114,10 @@ nodes, each with a simulated device for its log and a model engine, run over a s
 network that delays, drops, reorders and partitions messages. Nodes crash, losing whatever
 their log and engine had not made durable, and restart. Devices fail writes and flushes,
 which fences a node's log and takes the node down until it restarts from what the device
-kept. Replicas compact at random, so
-lagging members are caught up by snapshot. Three gateways, each with its own session, put
+kept. Once or twice a run a member is lost for good, its device and engine with it, and a
+member under a new identity replaces it as §6 describes; a second loss waits for the first
+replacement to finish. Replicas compact at random, so lagging
+members, new ones among them, are caught up by snapshot. Three gateways, each with its own session, put
 and get two keys at once. Puts go through the log, retried through leader changes with the
 session's serials. Gets are confirmed by ReadIndex and answered from the leader's rows once
 they reach the confirmed index. Every run is its seed (06 §A5). After every run, these
@@ -116,14 +128,53 @@ must hold:
 - every answered put exists exactly once on every member, however often it was retried;
 - every member holds the same rows;
 - each key's history, as the gateways saw it in the simulation's time, is linearizable by
-  Horn and Kroening's WGL search (06 §A6.8).
+  Horn and Kroening's WGL search (06 §A6.8);
+- every member's configuration names the live members as its voters, and nothing else, and
+  every run finished at least one replacement.
 
-A soak of 20,000 seeds passes, with thousands of fenced logs among them. Failed flushes
-exposed an install the log never recorded, which restart now finishes. The simulation catches two broken variants on purpose,
+A soak of 20,000 seeds passes, with thousands of fenced logs among them, and with 39,948
+members lost for good and replaced: two in every run but 52. Failed flushes exposed an
+install the log never recorded, which restart now finishes. Losses exposed the two further
+faults §4 and §6 describe: an engine durable past its log's commit, and a replacement ended
+before every voter knew its configuration. The simulation catches two broken variants on purpose,
 within the first seeds: gets served from any member's rows without ReadIndex fail
 linearizability, and a replica that applies a repeated command again stores a put twice.
 
-## 6. Open
+## 6. Replacing a member
+
+A member whose device fails has lost its persistent state, and a member that has "cannot
+safely rejoin the cluster with its prior identity"; a member under a new identity replaces it
+by membership changes (06 §A1.2, Diss §3.8). `membership::Replacement` reads the configuration
+the leader has applied and names the change to propose next, so a change a leader drops, or
+loses with its leadership, is proposed again, and one already applied never is:
+
+1. The new member joins as a learner. It receives entries and votes on nothing, so adding it
+   changes no quorum, whatever state it is in (06 §A1.7; Diss §4.2.1).
+2. Once the leader records that the learner has confirmed holding every entry it knows
+   committed (`Replica::caught_up`), one entry makes it a voter and removes the failed member,
+   as a joint change the group leaves by itself. While joint, commitment and elections need
+   majorities of both configurations (Diss §4.3), so the swap {A,B,C}→{A,B,D} never passes
+   through a configuration a lost member could split. It is the change 06 §C recommends for
+   replica swaps, and the one CockroachDB uses (06 §A4). The 2015 single-server bug does not
+   reach it: learners count toward no quorum, the swap is joint, and focal-raft proposes no
+   change until a new leader has applied its whole log, which first commits an entry of its
+   own term (06 §A1.7).
+3. The replacement ends once every voter of the final configuration has said it committed the
+   entry that made it (`Replica::configuration_known`, from the commit index each follower
+   reports). A member applies a configuration when it applies its entry, and until then still
+   counts the members the change removed. The simulation showed the cost of ending sooner. A
+   leader applied the change that left the joint configuration and was lost before the others
+   learned it had committed. The two survivors still applied the joint configuration, whose
+   old half had lost two of its three members, so they could elect no one. Once every voter
+   knows, losing any one member leaves voters that elect under the final configuration.
+
+The snapshot a replica prepares for lagging members names the configuration it was prepared
+at, and a member refuses a snapshot that does not name it. A member added after the leader
+last compacted could therefore never be caught up by that snapshot. When an applied change
+names a member the prepared snapshot does not, the replica prepares the snapshot again at the
+change. Membership changes are rare, so this costs one image each.
+
+## 7. Open
 
 - The window of entries kept for lagging followers before one is sent a snapshot, and
   moving snapshots out of band with the production engine.

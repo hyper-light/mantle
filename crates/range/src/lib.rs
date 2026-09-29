@@ -15,11 +15,15 @@
 mod conf;
 mod error;
 mod image;
+pub mod membership;
 mod replica;
 mod store;
 
 pub use error::ReplicaError;
-pub use focal_raft::proto::{ConfChangeV2, ConfState, Message, MessageType};
+pub use focal_raft::proto::{
+    ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState, Message,
+    MessageType,
+};
 pub use replica::{Applied, Drive, Range, Replica, Settings};
 
 /// Whether a row is one a member keeps for itself rather than one its range replicates: the

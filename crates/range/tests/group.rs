@@ -15,7 +15,7 @@ use mantle_disk::buf::Alignment;
 use mantle_disk::sim::SimFile;
 use mantle_log::{Config as LogConfig, Log};
 use mantle_meta::apply::Layer;
-use mantle_meta::engine::Model;
+use mantle_meta::engine::{Model, Rows};
 use mantle_meta::name::{self, GateChange, Preconditions, Put};
 use mantle_meta::record::{GateState, Version, Versioning};
 use mantle_meta::session::Rules;
@@ -196,4 +196,259 @@ fn a_group_elects_a_leader_and_applies_the_same_entries_everywhere() {
             .unwrap();
         assert_eq!(current.1.etag, "k");
     }
+}
+
+/// Every row an engine holds that its range replicates.
+fn rows(m: &Model) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut at = Vec::new();
+    while let Some((k, v)) = m.next(&at, &[0xFF]).unwrap() {
+        at = k.clone();
+        at.push(0);
+        if !mantle_range::member_local(&k) {
+            out.push((k, v));
+        }
+    }
+    out
+}
+
+/// Member 3 is lost after the leader compacted its log, and member 4 takes its place: added
+/// as a learner, caught up by snapshot, then swapped in by one joint change. The snapshot the
+/// leader prepared at compaction does not name member 4, which refuses a snapshot that does
+/// not, so the leader must prepare one that does when member 4 is added.
+#[test]
+fn a_member_added_after_compaction_catches_up_and_replaces_a_lost_one() {
+    use mantle_range::membership::{Next, Replacement};
+
+    let mut nodes: Vec<Node> = (1..=4).map(|id| node(id, id)).collect();
+    let live = |id: u64| id != 3;
+    // Delivers in order among the live members until nothing is in flight.
+    let settle_live = |nodes: &mut [Node]| {
+        let mut wire: VecDeque<Message> = VecDeque::new();
+        for _ in 0..10_000 {
+            for n in nodes.iter_mut().filter(|n| live(n.replica.id())) {
+                wire.extend(n.replica.drive().unwrap().messages);
+            }
+            let Some(m) = wire.pop_front() else {
+                return;
+            };
+            if live(m.to) {
+                let _ = nodes[usize::try_from(m.to).unwrap() - 1].replica.step(m);
+            }
+        }
+        panic!("the group never settled");
+    };
+
+    let mut answers = Vec::new();
+    nodes[0].replica.campaign().unwrap();
+    settle(&mut nodes[..3], &mut answers);
+    let register = Sessioned {
+        session: 0,
+        serial: 0,
+        unanswered: 0,
+        command: Command::Register,
+    };
+    nodes[0]
+        .replica
+        .propose(&Entry {
+            at_ns: 10,
+            commands: vec![register],
+        })
+        .unwrap();
+    settle(&mut nodes[..3], &mut answers);
+    let session = answers
+        .iter()
+        .find_map(|(_, _, a)| match a[..] {
+            [Answer::Registered { session }] => Some(session),
+            _ => None,
+        })
+        .unwrap();
+    let open = Command::Name(Box::new(name::Command::Gate(GateChange {
+        bucket: "b".into(),
+        incarnation: 1,
+        attempt: 1,
+        from: None,
+        to: Some(GateState::Open),
+    })));
+    let commands = vec![
+        Sessioned {
+            session,
+            serial: 1,
+            unanswered: 1,
+            command: open,
+        },
+        Sessioned {
+            session,
+            serial: 2,
+            unanswered: 1,
+            command: put("k"),
+        },
+    ];
+    nodes[0]
+        .replica
+        .propose(&Entry {
+            at_ns: 20,
+            commands,
+        })
+        .unwrap();
+    settle(&mut nodes[..3], &mut answers);
+    // The leader keeps nothing behind its snapshot, so a new member needs the snapshot.
+    nodes[0].replica.compact(0).unwrap();
+
+    let replacement = Replacement::new(3, 4).unwrap();
+    let mut done = false;
+    for _ in 0..50 {
+        let leader = &mut nodes[0].replica;
+        match replacement.next(
+            leader.configuration(),
+            leader.caught_up(4),
+            leader.configuration_known(),
+        ) {
+            Next::Done => {
+                done = true;
+                break;
+            }
+            Next::Wait => {}
+            Next::Propose(change) => leader.propose_change(&change).unwrap(),
+        }
+        // Heartbeats carry the leader's progress to followers that answered nothing new.
+        for _ in 0..SETTINGS.heartbeat_tick {
+            nodes[0].replica.tick().unwrap();
+        }
+        settle_live(&mut nodes);
+    }
+    assert!(
+        done,
+        "the replacement never finished: {}",
+        nodes[0].replica.describe()
+    );
+
+    let want = ConfState {
+        voters: vec![1, 2, 4],
+        ..ConfState::default()
+    };
+    for id in [1, 2, 4] {
+        let r = &nodes[usize::try_from(id).unwrap() - 1].replica;
+        let mut conf = r.configuration().clone();
+        conf.voters.sort_unstable();
+        assert_eq!(conf, want, "member {id}");
+        assert_eq!(
+            rows(r.engine()),
+            rows(nodes[0].replica.engine()),
+            "member {id}"
+        );
+    }
+}
+
+/// A member whose engine made its rows durable past the commit its log kept reopens and
+/// carries on. A member learns of commits after its entries are durable and applies them
+/// without writing the commit to its log; its engine can then become durable ahead of it, as
+/// a compaction makes it. Here the log is told an older commit directly, then the member
+/// crashes and opens again.
+#[test]
+fn a_member_whose_engine_is_ahead_of_its_logs_commit_reopens() {
+    use mantle_disk::sim::Crash;
+
+    let file = |id: u64| {
+        Arc::new(
+            SimFile::new(
+                Alignment::new(4096).unwrap(),
+                Alignment::new(512).unwrap(),
+                id,
+            )
+            .unwrap(),
+        )
+    };
+    let files: Vec<Arc<SimFile>> = (1..=3).map(file).collect();
+    let logs: Vec<Arc<Log<Arc<SimFile>>>> = files
+        .iter()
+        .zip(1u64..)
+        .map(|(f, id)| {
+            Arc::new(Log::create(Arc::clone(f), log_config(), 0x6c6f67 + u128::from(id)).unwrap())
+        })
+        .collect();
+    let mut nodes: Vec<Node> = logs
+        .iter()
+        .zip(1u64..)
+        .map(|(log, id)| Node {
+            replica: Replica::open(id, GROUP, Arc::clone(log), Model::default(), &range(), id)
+                .unwrap(),
+        })
+        .collect();
+    let mut answers = Vec::new();
+    nodes[0].replica.campaign().unwrap();
+    settle(&mut nodes, &mut answers);
+    for serial in 0..3 {
+        let register = Sessioned {
+            session: 0,
+            serial,
+            unanswered: 0,
+            command: Command::Register,
+        };
+        nodes[0]
+            .replica
+            .propose(&Entry {
+                at_ns: 10,
+                commands: vec![register],
+            })
+            .unwrap();
+        settle(&mut nodes, &mut answers);
+    }
+    let applied = nodes[1].replica.applied();
+    assert!(applied > 2);
+
+    // Member 2's engine is durable at what it applied; its log keeps an older commit.
+    nodes[1].replica.compact(u64::MAX).unwrap();
+    let hard = logs[1].view(GROUP).unwrap().unwrap().hard_state.unwrap();
+    logs[1]
+        .write_waiting(
+            GROUP,
+            mantle_log::Update {
+                hard_state: Some(mantle_log::HardState { commit: 1, ..hard }),
+                ..mantle_log::Update::default()
+            },
+        )
+        .unwrap();
+
+    // It crashes and opens again from what its device and engine kept.
+    let old = std::mem::replace(&mut nodes[1], node(9, 9));
+    let mut engine = old.replica.into_engine();
+    engine.crash();
+    files[1].crash(Crash::Random).unwrap();
+    let (log, recovery) = Log::open(Arc::clone(&files[1]), log_config(), 0x6c6f67 + 2).unwrap();
+    assert!(recovery.damaged.is_empty());
+    nodes[1] = Node {
+        replica: Replica::open(2, GROUP, Arc::new(log), engine, &range(), 2).unwrap(),
+    };
+    assert_eq!(nodes[1].replica.applied(), applied);
+    // Hearing from no leader, it times out and campaigns before a leader's append could tell
+    // it of the commit.
+    for _ in 0..2 * SETTINGS.election_tick {
+        nodes[1].replica.tick().unwrap();
+    }
+    let out = nodes[1].replica.drive().unwrap();
+    assert!(!out.messages.is_empty());
+
+    // It takes part again: a new entry is applied everywhere.
+    let register = Sessioned {
+        session: 0,
+        serial: 9,
+        unanswered: 0,
+        command: Command::Register,
+    };
+    nodes[0]
+        .replica
+        .propose(&Entry {
+            at_ns: 20,
+            commands: vec![register],
+        })
+        .unwrap();
+    settle(&mut nodes, &mut answers);
+    let last = nodes[0].replica.applied();
+    assert!(last > applied);
+    assert!(nodes.iter().all(|n| n.replica.applied() == last));
+    assert_eq!(
+        rows(nodes[1].replica.engine()),
+        rows(nodes[0].replica.engine())
+    );
 }

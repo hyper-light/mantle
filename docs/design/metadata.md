@@ -196,6 +196,20 @@ replica; its log is the node's shared write-ahead log.
 - **Snapshots, splits and moves** transfer engine files over QUIC, checksummed, and never as
   one Raft message (12 §6.3–§6.5). Splits, merges and moves between cells are modeled in
   TLA+ before they are built (architecture §6.1, §10).
+- **A split under a delete.** `docs/models/RangeSplit.tla` models Name ranges splitting while
+  a bucket is written and deleted. A split is one command in the parent's log, and the new
+  child takes the parent's gate. Writers route by cached descriptors, and a range answers a
+  stale one with its own descriptor and its children's. The delete coordinator's every step
+  names the descriptor generation it read; a range refuses another generation, and the
+  coordinator learns the answer and closes and reads again. TLC checks 547,664 distinct
+  states of three keys, two splits and two delete attempts. The live ranges always divide
+  the keys between them, and no acknowledged write is lost to a delete
+  (`scripts/check-model.sh`).
+  - Without the generation check, TLC finds the loss in eight steps: a split the directory
+    has not learned, then a delete that closes and reads only the parent's half and deletes
+    the bucket while the child holds a version.
+  - So the coordinator (§2) will carry each range's descriptor and generation, where today
+    it counts ranges, before ranges split.
 - **Transport:** QUIC for snapshots and other bulk transfers, and a separate UDP datagram
   plane for Raft's messages, including Fast Raft's, as the hecate specification lays out
   (07 §4.7). A fast-track proposal carries its entry, so an entry travels as datagrams only
@@ -230,8 +244,7 @@ cover the production engine, which the simulator cannot.
 
 - The production engine and its binding (§4).
 - An owner's quota and ListBuckets once the Bucket layer outgrows one range.
-- Gates in the TLA+ model of splits and merges (§3), with the create and delete sequences
-  run against them.
+- Merges in the TLA+ model of splits (§3), and the create sequence run against it.
 - How an entry larger than a datagram reaches the replicas: over QUIC, or fragmented on the
   UDP plane. A completion of 10,000 parts is an entry of hundreds of kilobytes in the Name
   range and another in the File range.

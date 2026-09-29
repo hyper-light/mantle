@@ -173,7 +173,8 @@ Remaining before it is done:
 - The collector's schedule: which buckets it resumes or abandons, and when. Also its removal
   of unreferenced files and blocks after a grace period (design §2, §6).
 - The production engine, once its binding is chosen (design §4).
-- Splits and the fast track under simulation, and the transport:
+- Splits and the fast track under simulation, built to the TLA+ model of splits under a
+  delete (design §3, `docs/models/RangeSplit.tla`), and the transport:
   QUIC for bulk transfers and snapshots, and a UDP transport for consensus messages.
 - Linearizability checked with real processes on the production engine.
 - Done when a linearizability checker accepts histories recorded under network partitions,

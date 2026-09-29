@@ -654,6 +654,11 @@ impl Writer {
         self.end(name);
     }
 
+    /// Text in the element being written, as GetBucketLocation's root holds its region.
+    pub fn content(&mut self, text: &str) {
+        escape(&mut self.out, text);
+    }
+
     fn start(&mut self, name: &str) {
         self.out.push('<');
         self.out.push_str(name);

@@ -19,6 +19,7 @@ pub mod chunked;
 pub mod conditional;
 pub mod list;
 pub mod range;
+pub mod response;
 pub mod route;
 pub mod sigv4;
 pub mod time;

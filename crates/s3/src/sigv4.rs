@@ -615,7 +615,7 @@ pub fn uri_encode(bytes: &[u8], slash: bool) -> String {
 }
 
 /// Decodes `%XX` escapes; `+` stays `+`, as RFC 3986 reads it. `None` for a broken escape.
-fn percent_decode(bytes: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn percent_decode(bytes: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = bytes.iter();
     while let Some(&b) = i.next() {

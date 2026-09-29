@@ -5,11 +5,12 @@ Research note for mantle's S3 protocol layer (`crates/s3/src/xml.rs`, `body.rs`)
 - what XML 1.0 and Namespaces in XML require of a reader and a writer;
 - the security record of XML's entity mechanism;
 - the documents S3's requests carry, their limits, and how S3 writes keys XML cannot carry;
-- the Rust parser evaluated for the job.
+- the Rust parser evaluated for the job;
+- the documents S3's responses carry, as the API reference and its samples show them.
 
 Compiled 2026-09-28 from the W3C recommendations, RFC 7303, the AWS S3 API reference and user
 guide as served that day, and the roxmltree 0.21.1 source. This is research input; the
-decision record is docs/design/s3-protocol.md §2.
+decision records are docs/design/s3-protocol.md §2 and §4.
 
 ---
 
@@ -239,6 +240,119 @@ Source: the crate as published (MIT OR Apache-2.0; one dependency, memchr).
 - Positions are stored as `u32` (`ShortRange::from` casts with only a `debug_assert!`), and
   the source holds panicking operations (`unwrap`, indexing) guarded by internal invariants.
 
+## 9. S3's response documents
+
+Sources: the API reference pages for each operation as served 2026-09-28; botocore's
+`parsers.py` and `handlers.py` at commit 358f8ee; ceph s3-tests at commit 5522d1c.
+
+### 9.1 Element order and namespace
+
+- Each operation's Response Syntax lists the root's elements in one order. ListObjectsV2's
+  `ListBucketResult` holds `IsTruncated`, `Contents`, `Name`, `Prefix`, `Delimiter`,
+  `MaxKeys`, `CommonPrefixes`, `EncodingType`, `KeyCount`, `ContinuationToken`,
+  `NextContinuationToken`, `StartAfter` ([API_ListObjectsV2]). Within a nested type the
+  members are listed alphabetically: `Contents` holds `ChecksumAlgorithm`, `ChecksumType`,
+  `ETag`, `Key`, `LastModified`, `Owner`, `RestoreStatus`, `Size`, `StorageClass`.
+- The samples follow neither that order nor one another's. ListObjectsV2's samples begin
+  with `Name` and `Prefix` and write `IsTruncated` after `MaxKeys`; one ListObjects sample
+  puts `Owner` after `StorageClass` and another before it ([API_ListObjects]);
+  ListObjectVersions' first sample puts `Owner` after `StorageClass` and the others before
+  it ([API_ListObjectVersions]).
+- botocore finds a response's elements by name, with the namespace removed: `_node_tag`
+  returns `self._namespace_re.sub('', node.tag)` for the pattern `{.*}`. It takes the request
+  ID and host ID from the `x-amz-request-id` and `x-amz-id-2` headers ([botocore]).
+- The samples of ListObjects, ListObjectsV2, ListObjectVersions, CreateMultipartUpload,
+  CompleteMultipartUpload, ListParts, ListMultipartUploads, DeleteObjects, GetBucketLocation
+  and GetBucketVersioning declare `xmlns="http://s3.amazonaws.com/doc/2006-03-01/"` on the
+  root. ListBuckets', CopyObject's and UploadPartCopy's declare none. No error sample declares
+  one ([API_CompleteMultipartUpload], [API_DeleteObjects]).
+
+### 9.2 Times
+
+- Every time in the samples of ListObjects, ListObjectsV2, ListObjectVersions, ListParts,
+  ListMultipartUploads, CopyObject and UploadPartCopy is whole seconds with `.000`
+  milliseconds, such as `2009-10-12T17:50:30.000Z`. ListBuckets' samples write
+  `2019-12-11T23:32:47+00:00` ([API_ListBuckets]), and one CopyObject sample
+  `2009-10-28T22:32:00` with no zone ([API_CopyObject]).
+- HEAD's `Last-Modified` is an HTTP-date, which has one-second resolution (RFC 9110
+  §5.6.7). s3-tests compares a listing's `LastModified` with HEAD's after zeroing the
+  listing's sub-second part (`_compare_dates`).
+
+### 9.3 Listings
+
+Rules for which elements a listing writes are in note 05 §6 and §4.6–§4.7. The reference
+pages add:
+
+- ListObjectsV2's `EncodingType`: "If you specify the `encoding-type` request parameter,
+  Amazon S3 includes this element in the response, and returns encoded key name values in
+  the following response elements: `Delimiter, Prefix, Key,` and `StartAfter`."
+  ListObjectVersions names `KeyMarker, NextKeyMarker, Prefix, Key`, and `Delimiter`;
+  ListMultipartUploads names `Delimiter`, `KeyMarker`, `Prefix`, `NextKeyMarker`, `Key`.
+- ListObjectVersions' samples write `<KeyMarker/>` and `<VersionIdMarker/>` when no marker
+  was sent, and `NextKeyMarker` and `NextVersionIdMarker` only in the truncated sample.
+- ListMultipartUploads' Response Syntax: `Bucket`, `KeyMarker`, `UploadIdMarker`,
+  `NextKeyMarker`, `Prefix`, `Delimiter`, `NextUploadIdMarker`, `MaxUploads`, `IsTruncated`,
+  `Upload`, `CommonPrefixes`, `EncodingType`; `Upload` holds `ChecksumAlgorithm`,
+  `ChecksumType`, `Initiated`, `Initiator`, `Key`, `Owner`, `StorageClass`, `UploadId`.
+  "Delimiter: ... If you don't specify a delimiter in your request, this element is absent
+  from the response." All three samples write `NextKeyMarker` and `NextUploadIdMarker`,
+  including the two that are not truncated: one names the last upload listed, the other,
+  which lists only common prefixes, writes both empty. Of the two samples whose request sent
+  no prefix, one writes an empty `Prefix` and the other none ([API_ListMultipartUploads]).
+- ListParts' Response Syntax: `Bucket`, `Key`, `UploadId`, `PartNumberMarker`,
+  `NextPartNumberMarker`, `MaxParts`, `IsTruncated`, `Part`, `Initiator`, `Owner`,
+  `StorageClass`, `ChecksumAlgorithm`, `ChecksumType`; `Part` holds the checksum values,
+  `ETag`, `LastModified`, `PartNumber`, `Size`. "NextPartNumberMarker: When a list is
+  truncated, this element specifies the last part in the list". "Initiator: ... If the
+  initiator is an AWS account, this element provides the same information as the `Owner`
+  element. If the initiator is an IAM User, this element provides the user ARN."
+  ([API_ListParts]).
+- ListBuckets' Response Syntax: `Buckets` (each `Bucket`: `BucketArn`, `BucketRegion`,
+  `CreationDate`, `Name`), `Owner`, `ContinuationToken`, `Prefix`. `BucketArn` "is only
+  supported for S3 directory buckets." `BucketRegion`: "If the request contains at least one
+  valid parameter, it is included in the response." `ContinuationToken` "is included in the
+  response when there are more buckets that can be listed". `Prefix`: "If `Prefix` was sent
+  with the request, it is included in the response." ([API_ListBuckets], [API_Bucket]).
+
+### 9.4 Owner
+
+- API_Owner, as quoted in 2025 in s3path issue 206: "Beginning November 21, 2025, Amazon S3
+  will stop returning DisplayName." Between July 15 and November 21, 2025, responses were to
+  lack it at an increasing rate ([s3path-206]). As served 2026-09-28, the Owner and Grantee
+  pages give `DisplayName` no description ([API_Owner], [API_Grantee]).
+- s3-tests at 5522d1c still reads `Owner.DisplayName` from listings and from uploads:
+  `test_bucket_list_return_data`, `test_bucket_list_return_data_versioning` and
+  `test_list_multipart_upload_owner`.
+
+### 9.5 Results, errors and bucket settings
+
+- `InitiateMultipartUploadResult`: `Bucket`, `Key`, `UploadId` ([API_CreateMultipartUpload]).
+- `CompleteMultipartUploadResult`: `Location` ("The URI that identifies the newly created
+  object"), `Bucket`, `Key`, `ETag`, the ten checksum elements, `ChecksumType`
+  ([API_CompleteMultipartUpload]).
+- `CopyObjectResult`: `ETag`, `LastModified`, `ChecksumType`, the checksum elements
+  ([API_CopyObject]). `CopyPartResult`: `ETag`, `LastModified`, the checksum elements, each
+  present "if the multipart upload request was created with the" algorithm
+  ([API_UploadPartCopy]).
+- `DeleteResult`: `Deleted` (`DeleteMarker`, `DeleteMarkerVersionId`, `Key`, `VersionId`)
+  and `Error` (`Code`, `Key`, `Message`, `VersionId`). The samples write `DeleteMarker` only
+  as `true`, beside `DeleteMarkerVersionId`: a simple delete in a versioned bucket gives
+  `Key`, `DeleteMarker`, `DeleteMarkerVersionId`; deleting a version gives `Key` and
+  `VersionId`; deleting a delete marker by its version gives `Key`, `VersionId`,
+  `DeleteMarker` and `DeleteMarkerVersionId`, with one ID in both ([API_DeleteObjects]).
+- The error samples of CompleteMultipartUpload and DeleteObjects hold `Code`, `Message`,
+  `RequestId`, `HostId`; note 05 §11.1's holds `Code`, `Message`, `Resource`, `RequestId`.
+- GetBucketLocation's Response Syntax shows a `LocationConstraint` inside the root
+  `LocationConstraint`; its sample is one element holding the region,
+  `<LocationConstraint xmlns="...">us-west-2</LocationConstraint>`. "Buckets in Region
+  `us-east-1` have a LocationConstraint of `null`." ([API_GetBucketLocation]). botocore reads
+  the root's text (`parse_get_bucket_location`: `region = root.text`), and s3-tests expects
+  `None` for a bucket created with an empty constraint (`test_bucket_get_location`).
+- GetBucketVersioning: `Status`, then `MfaDelete`, which "is only returned if the bucket has
+  been configured with MFA delete." "If you never enabled (or suspended) versioning on a
+  bucket, the response is: `<VersioningConfiguration xmlns="..."/>`"
+  ([API_GetBucketVersioning]).
+
 ## Sources
 
 - [XML10] Extensible Markup Language (XML) 1.0 (Fifth Edition), W3C Recommendation, 26 November 2008.
@@ -257,3 +371,20 @@ Source: the crate as published (MIT OR Apache-2.0; one dependency, memchr).
 - [API_PutObjectAcl] https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObjectAcl.html
 - [object-tagging] https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-tagging.html
 - [versioning-workflows] https://docs.aws.amazon.com/AmazonS3/latest/userguide/versioning-workflows.html
+- [API_ListObjectsV2] https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html
+- [API_ListObjects] https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjects.html
+- [API_ListObjectVersions] https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectVersions.html
+- [API_ListBuckets] https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListBuckets.html
+- [API_Bucket] https://docs.aws.amazon.com/AmazonS3/latest/API/API_Bucket.html
+- [API_ListParts] https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListParts.html
+- [API_ListMultipartUploads] https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListMultipartUploads.html
+- [API_CreateMultipartUpload] https://docs.aws.amazon.com/AmazonS3/latest/API/API_CreateMultipartUpload.html
+- [API_CopyObject] https://docs.aws.amazon.com/AmazonS3/latest/API/API_CopyObject.html
+- [API_UploadPartCopy] https://docs.aws.amazon.com/AmazonS3/latest/API/API_UploadPartCopy.html
+- [API_DeleteObjects] https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html
+- [API_GetBucketLocation] https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketLocation.html
+- [API_GetBucketVersioning] https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketVersioning.html
+- [API_Owner] https://docs.aws.amazon.com/AmazonS3/latest/API/API_Owner.html
+- [API_Grantee] https://docs.aws.amazon.com/AmazonS3/latest/API/API_Grantee.html
+- [s3path-206] https://github.com/liormizr/s3path/issues/206
+- [botocore] https://github.com/boto/botocore, `botocore/parsers.py` and `botocore/handlers.py` at 358f8eec8c76201bb1a7a35644abcbc9036de7ed

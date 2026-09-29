@@ -9,6 +9,8 @@
 //! CNAME rule only when configured to: otherwise a request to an address the deployment did
 //! not expect would silently name a bucket.
 
+use crate::sigv4::percent_decode;
+
 /// The endpoint's addressing.
 #[derive(Debug, Clone, Default)]
 pub struct Endpoint {
@@ -300,21 +302,6 @@ impl Query {
             .find(|(n, _)| n == name)
             .map(|(_, v)| v.as_str())
     }
-}
-
-fn percent_decode(bytes: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = bytes.iter();
-    while let Some(&b) = i.next() {
-        if b == b'%' {
-            let hi = char::from(*i.next()?).to_digit(16)?;
-            let lo = char::from(*i.next()?).to_digit(16)?;
-            out.push(u8::try_from(hi.checked_mul(16)?.checked_add(lo)?).ok()?);
-        } else {
-            out.push(b);
-        }
-    }
-    Some(out)
 }
 
 #[cfg(test)]

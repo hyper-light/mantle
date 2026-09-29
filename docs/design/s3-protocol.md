@@ -19,7 +19,8 @@ restating S3.
 | `conditional` | `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since` in RFC 9110's order | 05 §2, s3-tests' matrix |
 | `range` | `Range` and `x-amz-copy-source-range` | 05 §12, s3-tests |
 | `list` | ListObjects and ListObjectsV2 paging | 05 §6, s3-tests |
-| `xml`, `body` | reading request documents, writing response documents | 13; roxmltree as an oracle |
+| `xml`, `body` | the XML reader and writer, and request documents read against their schemas | 13; roxmltree as an oracle |
+| `response` | the documents responses carry: listings, multipart and copy results, batch deletes, errors, bucket settings | 23 of AWS's sample responses, s3-tests |
 
 ## 2. XML bodies
 
@@ -84,8 +85,8 @@ list that is out of order before it is malformed reports the order.
 **The writer escapes what a reader would change.** `&` and `<` as XML requires, `>` so that
 `]]>` cannot form (XML 1.0 §2.4), a carriage return as `&#xd;` because a reader turns a
 literal one into a line feed (§2.11), and each character XML 1.0 cannot carry as a character
-reference, as S3 does (13 §7). The error document has no namespace; results carry S3's
-(13 §6.2). A property test reads back exactly whatever text the writer was given.
+reference, as S3 does (13 §7). A property test reads back exactly whatever text the writer
+was given.
 
 ## 3. Listing
 
@@ -109,3 +110,54 @@ Open, for the metadata service: the index leaves out keys whose current version 
 marker (05 §6.4), so one seek can pass many of them. How far one seek may scan before a page
 ends early belongs with the index; the page may end short, since "The response might contain
 fewer keys" (05 §6.2).
+
+## 4. Response documents
+
+**Decision: each response document is written from typed content, in the element order of its
+operation's Response Syntax, and checked against AWS's own sample responses**
+(`crates/s3/src/response.rs`).
+
+- **Order.** SDKs find a response's elements by name: botocore strips the namespace from each
+  tag and looks members up by name (13 §9.1). AWS's samples order elements differently from
+  one another, and the Response Syntax is the one order the reference states, so mantle
+  writes that order.
+- **Namespace.** Every result is in S3's namespace, as ten of the thirteen results' samples
+  are; the error document is in none, as no error sample is (13 §9.1).
+- **Times are whole seconds.** Every listing, multipart and copy sample writes `.000`
+  milliseconds (13 §9.2), and HEAD's `Last-Modified` is an HTTP-date, which has one-second
+  resolution. The gateway takes an object's time in whole seconds once, and the header, the
+  document and the conditional checks all use that value, so a client comparing a listing
+  with a HEAD sees one instant. A time outside the years 0000–9999 is `InternalError`; mantle
+  stores times as unsigned 64-bit nanoseconds, which end in 2554, so none arises.
+- **Owners are IDs.** An `Owner` or `Initiator` holds `ID` alone: S3 stopped returning
+  `DisplayName` in November 2025 (13 §9.4). The three s3-tests that still read it
+  (`test_bucket_list_return_data`, its versioning twin, `test_list_multipart_upload_owner`)
+  are deselected for that reason when the suite runs against mantle.
+- **ETags** are passed without their quotes, the form the metadata layer keeps, and written
+  quoted. **Storage class** is `STANDARD` for every object: mantle stores objects one way.
+
+Where AWS's reference and samples leave a choice, mantle takes the one its evidence shows:
+
+- **Next markers.** ListObjectVersions writes `NextKeyMarker` and `NextVersionIdMarker` only
+  on a truncated page, as its samples do. ListMultipartUploads writes `NextKeyMarker` and
+  `NextUploadIdMarker` on every page, as all three of its samples do, truncated or not.
+  ListParts writes `NextPartNumberMarker` only when truncated, the Response Elements' words;
+  no sample shows an untruncated list (13 §9.3).
+- **Echoed parameters.** `Prefix` is written even when none was sent, in every listing
+  including ListMultipartUploads, whose samples disagree; `Delimiter` only when one was sent
+  and is not empty; `KeyMarker`, `VersionIdMarker` and `UploadIdMarker` always, empty when
+  none was sent, as the samples write them (13 §9.3; 05 §6.2–§6.4).
+- **GetBucketLocation** writes the region as the root's text, as the sample does, rather
+  than the nested element the Response Syntax shows; botocore reads the root's text, and an
+  empty root is S3's `null` for the default region (13 §9.5).
+- **DeleteObjects** writes `DeleteMarker` only as `true`, beside the marker's version ID, as
+  every sample does, and quiet mode leaves out what was deleted (13 §9.5; 05 §8).
+
+**Verified** against 23 of AWS's sample responses covering all fourteen documents: for the
+same content, mantle's document and the sample, both read by roxmltree, hold the same
+elements with the same text, and the same namespace. Tests pin the s3-tests expectations of
+the listings (05 §6.2–§6.3) and the elements `encoding-type=url` reaches. A property test
+lists arbitrary keys and reads each back from the document: exactly, when XML 1.0 can carry
+it, and through percent-decoding with `encoding-type=url` when it cannot, while roxmltree
+refuses the document written without it (13 §7). Breaking any rule above, one at a time,
+fails a test.

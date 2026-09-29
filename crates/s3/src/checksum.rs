@@ -135,6 +135,25 @@ impl Algorithm {
     }
 }
 
+/// How an object's value was formed (05 §3.3): over every byte of the object, or from its
+/// parts' values. "Objects that you upload using `PutObject` use the full object checksum
+/// type."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksumType {
+    FullObject,
+    Composite,
+}
+
+impl ChecksumType {
+    /// The name in `x-amz-checksum-type` and in `ChecksumType` elements.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::FullObject => "FULL_OBJECT",
+            Self::Composite => "COMPOSITE",
+        }
+    }
+}
+
 /// A value: the big-endian bytes of a digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checksum {

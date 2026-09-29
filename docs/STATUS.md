@@ -90,12 +90,15 @@ in RFC 9110's order, byte ranges, and ListObjects paging, each tested against th
 cases for it. An XML reader for request bodies that refuses entity declarations and does
 work linear in the body, checked against roxmltree on generated and mutated documents, with
 the CompleteMultipartUpload, DeleteObjects, CreateBucket and PutBucketVersioning documents
-read against their schemas under size limits computed from S3's own.
+read against their schemas under size limits computed from S3's own. The documents every
+response carries, from listings and multipart results to batch deletes, errors and bucket
+settings, each holding what AWS's sample response holds for the same content when both are
+read by roxmltree.
 
 Remaining before it is done:
 
-- The response documents: listings, multipart results, errors with request IDs.
-- ListObjectVersions paging, once the metadata service fixes how versions are ordered.
+- ListObjectVersions and ListMultipartUploads paging: a scan of the Name layer's versions
+  and uploads, in the order its rows already keep them, and pages over that scan.
 - Tagging and ACL documents.
 
 **Metadata service** (`mantle-meta`, [design](design/metadata.md)). Row keys whose byte

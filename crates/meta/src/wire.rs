@@ -8,7 +8,7 @@ use mantle_codec::{Reader, Writer};
 
 use crate::record::{
     self, BlockHeader, Checksum, ChunkPlace, DefaultRetention, Extent, GateState, Part,
-    RecordError, Upload, Version, Versioning,
+    RecordError, Referrer, Upload, Version, Versioning,
 };
 use crate::{block, bucket, file, name};
 
@@ -138,12 +138,16 @@ impl Answer {
             }
             Answer::File(o) => {
                 w.u8(5);
-                w.u8(match o {
-                    file::Outcome::Written => 0,
-                    file::Outcome::Deleted => 1,
-                    file::Outcome::Conflict => 2,
-                    file::Outcome::Invalid => 3,
-                });
+                match o {
+                    file::Outcome::Written { deadline_ns } => {
+                        w.u8(0);
+                        w.u64(*deadline_ns);
+                    }
+                    file::Outcome::Deleted => w.u8(1),
+                    file::Outcome::Conflict => w.u8(2),
+                    file::Outcome::Invalid => w.u8(3),
+                    file::Outcome::Settled => w.u8(4),
+                }
             }
             Answer::Block(o) => {
                 w.u8(6);
@@ -171,10 +175,13 @@ impl Answer {
                 3 => Answer::Bucket(take_bucket_outcome(&mut r)?),
                 4 => Answer::Name(take_name_outcome(&mut r)?),
                 5 => Answer::File(match r.u8()? {
-                    0 => file::Outcome::Written,
+                    0 => file::Outcome::Written {
+                        deadline_ns: r.u64()?,
+                    },
                     1 => file::Outcome::Deleted,
                     2 => file::Outcome::Conflict,
                     3 => file::Outcome::Invalid,
+                    4 => file::Outcome::Settled,
                     _ => return None,
                 }),
                 6 => Answer::Block(match r.u8()? {
@@ -209,17 +216,32 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
         Command::File(c) => {
             w.u8(3);
             match c {
-                file::Command::Write { file, extents } => {
+                file::Command::Write {
+                    file,
+                    extents,
+                    referrer,
+                    handover_ns,
+                    ..
+                } => {
                     w.u8(0);
                     w.u128(*file);
                     record::put_len(w, extents.len())?;
                     for e in extents {
                         record::put_bytes(w, &e.encode())?;
                     }
+                    record::put_bytes(w, &referrer.encode()?)?;
+                    w.u64(*handover_ns);
                 }
                 file::Command::Delete { file } => {
                     w.u8(1);
                     w.u128(*file);
+                }
+                file::Command::Settle { files } => {
+                    w.u8(2);
+                    record::put_len(w, files.len())?;
+                    for &f in files {
+                        w.u128(f);
+                    }
                 }
             }
         }
@@ -268,9 +290,23 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
                 for _ in 0..count {
                     extents.push(Extent::decode(&record::take_bytes(r)?).ok()?);
                 }
-                file::Command::Write { file, extents }
+                file::Command::Write {
+                    file,
+                    extents,
+                    referrer: Referrer::decode(&record::take_bytes(r)?).ok()?,
+                    handover_ns: r.u64()?,
+                    at_ns,
+                }
             }
             1 => file::Command::Delete { file: r.u128()? },
+            2 => {
+                let count = bounded(r, 16)?;
+                let mut files = Vec::with_capacity(count);
+                for _ in 0..count {
+                    files.push(r.u128()?);
+                }
+                file::Command::Settle { files }
+            }
             _ => return None,
         }),
         4 => Command::Block(match r.u8()? {
@@ -443,6 +479,7 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
             put_option(w, p.ordered_ns);
             record::put_bytes(w, &p.version.encode()?)?;
             put_default(w, p.default);
+            w.u64(p.deadline_ns);
         }
         name::Command::Delete(d) => {
             w.u8(1);
@@ -463,6 +500,7 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
             record::put_str(w, &p.upload)?;
             w.u16(p.number);
             record::put_bytes(w, &p.part.encode()?)?;
+            w.u64(p.deadline_ns);
         }
         name::Command::Complete(c) => {
             w.u8(4);
@@ -489,6 +527,7 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
             }
             record::put_file(w, c.file);
             put_default(w, c.default);
+            w.u64(c.deadline_ns);
         }
         name::Command::Abort(a) => {
             w.u8(5);
@@ -533,6 +572,21 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
             w.u64(c.released_ns);
             w.u128(c.file);
         }
+        name::Command::Check(c) => {
+            w.u8(11);
+            record::put_len(w, c.files.len())?;
+            for &(file, deadline_ns) in &c.files {
+                w.u128(file);
+                w.u64(deadline_ns);
+            }
+        }
+        name::Command::Unmark(u) => {
+            w.u8(12);
+            record::put_len(w, u.files.len())?;
+            for &file in &u.files {
+                w.u128(file);
+            }
+        }
     }
     Ok(())
 }
@@ -551,6 +605,7 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
                 ordered_ns: take_option(r)?,
                 version: Version::decode(&record::take_bytes(r)?).ok()?,
                 default: take_default(r)?,
+                deadline_ns: r.u64()?,
             })
         }
         1 => {
@@ -588,6 +643,7 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
                 number: r.u16()?,
                 part: Part::decode(&record::take_bytes(r)?).ok()?,
                 at_ns,
+                deadline_ns: r.u64()?,
             })
         }
         4 => {
@@ -630,6 +686,7 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
                 checksum,
                 file: record::take_file(r)?,
                 default: take_default(r)?,
+                deadline_ns: r.u64()?,
             })
         }
         5 => {
@@ -659,6 +716,22 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
             released_ns: r.u64()?,
             file: r.u128()?,
         }),
+        11 => {
+            let count = bounded(r, 24)?;
+            let mut files = Vec::with_capacity(count);
+            for _ in 0..count {
+                files.push((r.u128()?, r.u64()?));
+            }
+            name::Command::Check(name::Check { files, at_ns })
+        }
+        12 => {
+            let count = bounded(r, 16)?;
+            let mut files = Vec::with_capacity(count);
+            for _ in 0..count {
+                files.push(r.u128()?);
+            }
+            name::Command::Unmark(name::Unmark { files })
+        }
         8 => {
             let (bucket, incarnation, key) = take_target(r)?;
             let named = take_named(r)?;
@@ -944,6 +1017,19 @@ fn put_name_outcome(w: &mut Writer, o: &name::Outcome) -> Result<(), RecordError
         O::NoSuchVersion => w.u8(21),
         O::DeleteMarker => w.u8(22),
         O::Reclaimed => w.u8(23),
+        O::Expired => w.u8(24),
+        O::Checked(verdicts) => {
+            w.u8(25);
+            record::put_len(w, verdicts.len())?;
+            for v in verdicts {
+                w.u8(match v {
+                    name::Verdict::Held => 0,
+                    name::Verdict::Released => 1,
+                    name::Verdict::Young => 2,
+                });
+            }
+        }
+        O::Unmarked => w.u8(26),
     }
     Ok(())
 }
@@ -997,6 +1083,21 @@ fn take_name_outcome(r: &mut Reader<'_>) -> Option<name::Outcome> {
         21 => O::NoSuchVersion,
         22 => O::DeleteMarker,
         23 => O::Reclaimed,
+        24 => O::Expired,
+        25 => {
+            let count = bounded(r, 1)?;
+            let mut verdicts = Vec::with_capacity(count);
+            for _ in 0..count {
+                verdicts.push(match r.u8()? {
+                    0 => name::Verdict::Held,
+                    1 => name::Verdict::Released,
+                    2 => name::Verdict::Young,
+                    _ => return None,
+                });
+            }
+            O::Checked(verdicts)
+        }
+        26 => O::Unmarked,
         _ => return None,
     })
 }
@@ -1144,6 +1245,7 @@ mod tests {
                     mode: RetentionMode::Governance,
                     period: Period::Days(30),
                 }),
+                deadline_ns: u64::MAX,
             })),
             named(name::Command::Delete(name::Delete {
                 bucket: "b".into(),
@@ -1186,6 +1288,7 @@ mod tests {
                     modified_ns: 0,
                 },
                 at_ns,
+                deadline_ns: u64::MAX,
             })),
             named(name::Command::Complete(name::Complete {
                 bucket: "b".into(),
@@ -1208,6 +1311,7 @@ mod tests {
                     mode: RetentionMode::Compliance,
                     period: Period::Days(1),
                 }),
+                deadline_ns: u64::MAX,
             })),
             named(name::Command::Abort(name::Abort {
                 bucket: "b".into(),
@@ -1233,14 +1337,31 @@ mod tests {
                 released_ns: 5,
                 file: u128::MAX,
             })),
+            named(name::Command::Check(name::Check {
+                files: vec![(1, 2), (u128::MAX, u64::MAX)],
+                at_ns,
+            })),
+            named(name::Command::Unmark(name::Unmark {
+                files: vec![1, u128::MAX],
+            })),
             Command::File(file::Command::Write {
                 file: 3,
                 extents: vec![Extent {
                     length: 7,
                     target: Target::File(1),
                 }],
+                referrer: Referrer {
+                    bucket: "b".into(),
+                    incarnation: 2,
+                    key: "k".into(),
+                },
+                handover_ns: 60,
+                at_ns,
             }),
             Command::File(file::Command::Delete { file: 3 }),
+            Command::File(file::Command::Settle {
+                files: vec![3, u128::MAX],
+            }),
             Command::Block(block::Command::Write {
                 block: 5,
                 header: BlockHeader {
@@ -1362,15 +1483,24 @@ mod tests {
                 N::NoSuchVersion,
                 N::DeleteMarker,
                 N::Reclaimed,
+                N::Expired,
+                N::Checked(vec![
+                    name::Verdict::Held,
+                    name::Verdict::Released,
+                    name::Verdict::Young,
+                ]),
+                N::Checked(Vec::new()),
+                N::Unmarked,
             ]
             .map(Answer::Name),
         );
         answers.extend(
             [
-                file::Outcome::Written,
+                file::Outcome::Written { deadline_ns: 9 },
                 file::Outcome::Deleted,
                 file::Outcome::Conflict,
                 file::Outcome::Invalid,
+                file::Outcome::Settled,
             ]
             .map(Answer::File),
         );

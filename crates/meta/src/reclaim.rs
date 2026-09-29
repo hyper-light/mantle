@@ -330,13 +330,19 @@ mod tests {
                 .map(|&target| Extent { length: 1, target })
                 .collect();
             let index = self.tick();
-            let outcome = file::apply(
-                &mut self.files,
-                index,
-                &file::Command::Write { file, extents },
-            )
-            .unwrap();
-            assert_eq!(outcome, file::Outcome::Written);
+            let write = file::Command::Write {
+                file,
+                extents,
+                referrer: crate::record::Referrer {
+                    bucket: "b".into(),
+                    incarnation: 1,
+                    key: "k".into(),
+                },
+                handover_ns: 1_000,
+                at_ns: index,
+            };
+            let outcome = file::apply(&mut self.files, index, &write).unwrap();
+            assert!(matches!(outcome, file::Outcome::Written { .. }));
         }
 
         /// Sends `request` where it goes and returns its answer.
@@ -430,6 +436,7 @@ mod tests {
                 ordered_ns: None,
                 version: object(file),
                 default: None,
+                deadline_ns: u64::MAX,
             }));
             assert!(matches!(outcome, Outcome::Put { .. }));
         }
@@ -527,6 +534,7 @@ mod tests {
                 ordered_ns: None,
                 version: object(root),
                 default: None,
+                deadline_ns: u64::MAX,
             }));
             cell.run_name(&Command::Delete(Delete {
                 bucket: "b".into(),

@@ -64,6 +64,8 @@ pub enum Command {
     Gate(GateChange),
     Collect(Collect),
     Reclaim(Reclaim),
+    Check(Check),
+    Unmark(Unmark),
 }
 
 impl Command {
@@ -78,17 +80,21 @@ impl Command {
             Self::Abort(c) => Some((&c.bucket, c.incarnation)),
             Self::Retain(c) => Some((&c.bucket, c.incarnation)),
             Self::Hold(c) => Some((&c.bucket, c.incarnation)),
-            Self::Gate(_) | Self::Collect(_) | Self::Reclaim(_) => None,
+            Self::Gate(_)
+            | Self::Collect(_)
+            | Self::Reclaim(_)
+            | Self::Check(_)
+            | Self::Unmark(_) => None,
         }
     }
 
     /// The file a write hands the range, which a version or part will reference if the write
-    /// goes ahead, and the time of the entry that carries it.
-    fn carries(&self) -> Option<(u128, u64)> {
+    /// goes ahead, the time of the entry that carries it, and the file's handover deadline.
+    fn carries(&self) -> Option<(u128, u64, u64)> {
         match self {
-            Self::Put(c) => c.version.file.map(|file| (file, c.at_ns)),
-            Self::PutPart(c) => Some((c.part.file, c.at_ns)),
-            Self::Complete(c) => c.file.map(|file| (file, c.at_ns)),
+            Self::Put(c) => c.version.file.map(|file| (file, c.at_ns, c.deadline_ns)),
+            Self::PutPart(c) => Some((c.part.file, c.at_ns, c.deadline_ns)),
+            Self::Complete(c) => c.file.map(|file| (file, c.at_ns, c.deadline_ns)),
             _ => None,
         }
     }
@@ -114,6 +120,8 @@ pub struct Put {
     /// The bucket's default retention, which a version whose request named no retention takes
     /// from its creation (18 §2.4).
     pub default: Option<DefaultRetention>,
+    /// The version's file's handover deadline, as the File range answered its write.
+    pub deadline_ns: u64,
 }
 
 /// CreateMultipartUpload (05 §4.2). The upload's ID is its initiation time in the version-ID
@@ -143,6 +151,8 @@ pub struct PutPart {
     pub number: u16,
     pub part: Part,
     pub at_ns: u64,
+    /// The part's file's handover deadline, as the File range answered its write.
+    pub deadline_ns: u64,
 }
 
 /// CompleteMultipartUpload (05 §4.4).
@@ -167,6 +177,8 @@ pub struct Complete {
     pub file: Option<u128>,
     /// The bucket's default retention, which the version takes when the upload named none.
     pub default: Option<DefaultRetention>,
+    /// The object file's handover deadline, as the File range answered its write.
+    pub deadline_ns: u64,
 }
 
 /// A part a CompleteMultipartUpload lists.
@@ -219,6 +231,32 @@ pub struct Collect {
 pub struct Reclaim {
     pub released_ns: u64,
     pub file: u128,
+}
+
+/// The sweep asks whether the range took each file, with its handover deadline: a file the
+/// range marked was handed over, and one it did not, once past its deadline, is released
+/// here and now, so no handover can take it after (docs/design/metadata.md §2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Check {
+    pub files: Vec<(u128, u64)>,
+    pub at_ns: u64,
+}
+
+/// The sweep settled these files in their File range: their marks go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unmark {
+    pub files: Vec<u128>,
+}
+
+/// What the range answers the sweep of one file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// The range took the file: a version or part references it, or it released it.
+    Held,
+    /// Never handed over, and past its deadline: the range released it, and marked it.
+    Released,
+    /// Not handed over yet, and its deadline has not passed at the range's time.
+    Young,
 }
 
 /// DeleteObject (05 §7.3).
@@ -322,6 +360,13 @@ pub enum Outcome {
     /// The version is a delete marker, which holds no lock (18 §2.5): `405 MethodNotAllowed`
     /// when a request names it (18 §5).
     DeleteMarker,
+    /// The write's file came past its handover deadline: the range released it, and the
+    /// gateway writes the file again (`500 InternalError`, retried).
+    Expired,
+    /// The sweep's files, each with the range's verdict, in the order it asked.
+    Checked(Vec<Verdict>),
+    /// The marks of settled files went.
+    Unmarked,
 }
 
 /// Applies `command` as log entry `index`. A refused command still advances the index.
@@ -330,8 +375,13 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
         Some((bucket, incarnation)) => admits(engine, bucket, incarnation)?,
         None => true,
     };
+    let expired = match command.carries() {
+        Some((_, at_ns, deadline_ns)) => clock::now(engine, at_ns)? > deadline_ns,
+        None => false,
+    };
     let (outcome, writes) = match command {
         _ if !admitted => (Outcome::NoSuchBucket, Vec::new()),
+        _ if expired => (Outcome::Expired, Vec::new()),
         Command::Put(p) => put(engine, p)?,
         Command::Delete(d) => delete(engine, d)?,
         Command::CreateUpload(c) => create_upload(engine, c)?,
@@ -342,27 +392,77 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
         Command::Hold(h) => hold(engine, h)?,
         Command::Gate(g) => move_gate(engine, g)?,
         Command::Collect(c) => collect(engine, c)?,
+        // The file is gone; so is any mark a sweep that stopped before unmarking left on it.
         Command::Reclaim(r) => (
             Outcome::Reclaimed,
-            vec![Write::Delete(key::released(r.released_ns, r.file))],
+            vec![
+                Write::Delete(key::released(r.released_ns, r.file)),
+                Write::Delete(key::handed(r.file)),
+            ],
+        ),
+        Command::Check(c) => check(engine, c)?,
+        Command::Unmark(u) => (
+            Outcome::Unmarked,
+            u.files
+                .iter()
+                .map(|&f| Write::Delete(key::handed(f)))
+                .collect(),
         ),
     };
     // A file a write carries is referenced if the write goes ahead, and released if it is
-    // refused: the gateway wrote it for this write alone (docs/design/metadata.md §2).
+    // refused: the gateway wrote it for this write alone. Either way the range has taken it,
+    // and one that came within its deadline is marked for the sweep, which settles a file
+    // only once its deadline has passed, so it comes by after and removes the mark. One past
+    // its deadline may come after the sweep settled the file, and a mark would stay; if the
+    // sweep comes by after, it releases the file a second time, which the reclaimer finds
+    // gone (docs/design/metadata.md §2).
     let mut writes = writes;
-    if let Some((file, at_ns)) = command.carries()
-        && !matches!(outcome, Outcome::Put { .. } | Outcome::PartWritten)
-    {
-        writes.push(release(clock::now(engine, at_ns)?, file));
+    if let Some((file, at_ns, _)) = command.carries() {
+        if !matches!(outcome, Outcome::Put { .. } | Outcome::PartWritten) {
+            writes.extend(release(clock::now(engine, at_ns)?, file));
+        }
+        if !expired {
+            writes.push(Write::Put(key::handed(file), Vec::new()));
+        }
     }
     engine.apply(index, &writes)?;
     Ok(outcome)
 }
 
-/// The row that releases `file` at the range's time `now_ns`: nothing references it any more,
-/// and the collector reclaims it once the grace period has passed (docs/design/metadata.md §2).
-fn release(now_ns: u64, file: u128) -> Write {
-    Write::Put(key::released(now_ns, file), record::encode_number(now_ns))
+/// The rows that release `file` at the range's time `now_ns`: nothing references it any more,
+/// and the collector reclaims it once the grace period has passed. A mark the sweep left
+/// behind, stopping between settling the file and unmarking it, goes with it
+/// (docs/design/metadata.md §2).
+fn release(now_ns: u64, file: u128) -> [Write; 2] {
+    [
+        Write::Put(key::released(now_ns, file), record::encode_number(now_ns)),
+        Write::Delete(key::handed(file)),
+    ]
+}
+
+/// The range's verdict on each file the sweep asks about, releasing and marking every file
+/// never handed over whose deadline has passed at the range's time. Since that time only moves
+/// forward, a handover that comes after finds the deadline passed and is refused.
+fn check<E: Rows>(engine: &E, c: &Check) -> Result<(Outcome, Vec<Write>), MetaError> {
+    let now = clock::now(engine, c.at_ns)?;
+    let mut verdicts = Vec::with_capacity(c.files.len());
+    let mut writes = Vec::new();
+    for &(file, deadline_ns) in &c.files {
+        let marked = engine.get(&key::handed(file))?.is_some();
+        verdicts.push(if marked {
+            Verdict::Held
+        } else if now > deadline_ns {
+            writes.push(Write::Put(
+                key::released(now, file),
+                record::encode_number(now),
+            ));
+            writes.push(Write::Put(key::handed(file), Vec::new()));
+            Verdict::Released
+        } else {
+            Verdict::Young
+        });
+    }
+    Ok((Outcome::Checked(verdicts), writes))
 }
 
 /// The files the range released before `before_ns`, oldest first, at most `max`: the
@@ -485,7 +585,7 @@ fn collect<E: Rows>(engine: &E, c: &Collect) -> Result<(Outcome, Vec<Write>), Me
         };
         match key::decode_name(&k) {
             Some((_, _, NameRow::Upload(_))) => {}
-            Some((_, _, NameRow::Part(..))) => writes.push(release(now, Part::decode(&v)?.file)),
+            Some((_, _, NameRow::Part(..))) => writes.extend(release(now, Part::decode(&v)?.file)),
             // A version under a condemned gate: the delete never read this range (§2), and
             // the collector removes no object.
             Some(_) => return Ok((Outcome::NotEmpty, Vec::new())),
@@ -625,7 +725,7 @@ fn delete<E: Rows>(engine: &E, d: &Delete) -> Result<(Outcome, Vec<Write>), Meta
                         writes.push(Write::Delete(key::name(bucket, key, &NameRow::Null)));
                     }
                     if let Some(file) = v.file {
-                        writes.push(release(now, file));
+                        writes.extend(release(now, file));
                     }
                     Some(v)
                 }
@@ -728,7 +828,7 @@ fn put_part<E: Rows>(engine: &E, p: &PutPart) -> Result<(Outcome, Vec<Write>), M
     if let Some(replaced) = engine.get(&row)?.map(|b| Part::decode(&b)).transpose()?
         && replaced.file != p.part.file
     {
-        writes.push(release(clock::now(engine, p.at_ns)?, replaced.file));
+        writes.extend(release(clock::now(engine, p.at_ns)?, replaced.file));
     }
     writes.push(Write::Put(row, p.part.encode()?));
     Ok((Outcome::PartWritten, writes))
@@ -748,7 +848,7 @@ fn complete<E: Rows>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), 
                 if let Some(file) = c.file
                     && v.file != c.file
                 {
-                    writes.push(release(clock::now(engine, c.at_ns)?, file));
+                    writes.extend(release(clock::now(engine, c.at_ns)?, file));
                 }
                 (
                     Outcome::Put {
@@ -812,6 +912,7 @@ fn complete<E: Rows>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), 
                 legal_hold: upload_row.legal_hold,
             },
             default: c.default,
+            deadline_ns: c.deadline_ns,
         },
     )?;
     if matches!(outcome, Outcome::Put { .. }) {
@@ -958,7 +1059,7 @@ fn remove_upload<E: Rows>(
             return Err(MetaError::Corrupt);
         };
         if !kept.contains(&number) {
-            writes.push(release(now_ns, Part::decode(&v)?.file));
+            writes.extend(release(now_ns, Part::decode(&v)?.file));
         }
         from = after(&k);
         writes.push(Write::Delete(k));
@@ -1069,7 +1170,7 @@ fn remove_null<E: Rows>(
                 Write::Delete(key::name(bucket, key, &NameRow::Null)),
             ];
             if let Some(file) = v.file {
-                writes.push(release(now_ns, file));
+                writes.extend(release(now_ns, file));
             }
             Ok((Some(v), writes))
         }
@@ -1444,6 +1545,7 @@ mod tests {
                 ordered_ns: None,
                 version: object(etag),
                 default: None,
+                deadline_ns: u64::MAX,
             }))
         }
 
@@ -1675,6 +1777,7 @@ mod tests {
                 ordered_ns: Some(early),
                 version: object("upload"),
                 default: None,
+                deadline_ns: u64::MAX,
             }),
         )
         .unwrap();
@@ -1894,6 +1997,7 @@ mod tests {
                     modified_ns: 0,
                 },
                 at_ns: 0,
+                deadline_ns: u64::MAX,
             }))
         }
 
@@ -1920,6 +2024,7 @@ mod tests {
                 checksum: None,
                 file: Some(99),
                 default: None,
+                deadline_ns: u64::MAX,
             }))
         }
     }
@@ -2086,6 +2191,7 @@ mod tests {
                         ordered_ns: None,
                         version: object(&format!("e{i}")),
                         default: None,
+                        deadline_ns: u64::MAX,
                     })
                 }
             }))
@@ -2133,6 +2239,7 @@ mod tests {
             ordered_ns: None,
             version: object("x"),
             default: None,
+            deadline_ns: u64::MAX,
         };
         assert_eq!(r.run(Command::Put(stale.clone())), Outcome::NoSuchBucket);
         stale.bucket = "c".into();
@@ -2330,6 +2437,7 @@ mod tests {
                     ..object("e")
                 },
                 default,
+                deadline_ns: u64::MAX,
             })))
         }
 
@@ -2672,6 +2780,7 @@ mod tests {
                             ordered_ns: None,
                             version: Version { file, ..object("e") },
                             default: None,
+                            deadline_ns: u64::MAX,
                         }));
                     }
                     Step::Delete { key, versioning, named } => {
@@ -2719,6 +2828,7 @@ mod tests {
                                 modified_ns: 0,
                             },
                             at_ns: r.clock,
+                            deadline_ns: u64::MAX,
                         }));
                     }
                     Step::Complete { key, upload, mut parts, stale } => {
@@ -2754,6 +2864,7 @@ mod tests {
                             checksum: None,
                             file: Some(file),
                             default: None,
+                            deadline_ns: u64::MAX,
                         }));
                         if matches!(outcome, Outcome::Put { .. })
                             && versions_hold(&r.engine, file)
@@ -2817,6 +2928,93 @@ mod tests {
             Outcome::Reclaimed
         );
         assert_eq!(released(&r.engine, u64::MAX, 10).unwrap(), queue[1..]);
+    }
+
+    /// A handover past its file's deadline is refused, and its file released and marked. The
+    /// sweep's check then finds every file the range took held, releases and marks a file never
+    /// handed over once its deadline has passed, and leaves one alone until then.
+    #[test]
+    fn a_late_handover_is_refused_and_the_sweep_releases_what_was_never_handed_over() {
+        use Verdict::{Held, Released, Young};
+        let mut r = Range::new();
+        let put = |r: &mut Range, key: &str, file: u128, deadline_ns: u64| {
+            r.clock += 10;
+            r.run(Command::Put(Put {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: key.into(),
+                versioning: Versioning::Unversioned,
+                preconditions: Preconditions::default(),
+                at_ns: r.clock,
+                ordered_ns: None,
+                version: Version {
+                    file: Some(file),
+                    ..object("e")
+                },
+                default: None,
+                deadline_ns,
+            }))
+        };
+        let marked = |r: &Range, file| r.engine.get(&key::handed(file)).unwrap().is_some();
+        let queue = |r: &Range| -> Vec<u128> {
+            released(&r.engine, u64::MAX, 10)
+                .unwrap()
+                .into_iter()
+                .map(|(_, file)| file)
+                .collect()
+        };
+        let in_time = r.clock + 10;
+        assert!(matches!(put(&mut r, "a", 5, in_time), Outcome::Put { .. }));
+        // A handover past the deadline may come after the sweep settled the file, so it
+        // releases the file unmarked.
+        assert_eq!(put(&mut r, "b", 6, in_time), Outcome::Expired);
+        assert_eq!(queue(&r), [6]);
+        assert!(marked(&r, 5) && !marked(&r, 6));
+        // 5 was taken; 6 was released when it came late, which the sweep cannot tell, so it
+        // releases it again, which the reclaimer finds gone; 7 was never handed over and is
+        // past its deadline; 8 was never handed over and is not yet.
+        r.clock += 10;
+        let check = |r: &mut Range, files: Vec<(u128, u64)>| {
+            let at_ns = r.clock;
+            r.run(Command::Check(Check { files, at_ns }))
+        };
+        assert_eq!(
+            check(&mut r, vec![(5, 0), (6, 0), (7, 0), (8, u64::MAX)]),
+            Outcome::Checked(vec![Held, Released, Released, Young])
+        );
+        assert_eq!(queue(&r), [6, 6, 7]);
+        // A sweep that stopped before settling asks again, and 7 is not released twice.
+        assert_eq!(check(&mut r, vec![(7, 0)]), Outcome::Checked(vec![Held]));
+        // A handover of 7 after its release finds its deadline passed.
+        assert_eq!(put(&mut r, "c", 7, 0), Outcome::Expired);
+        // Once settled, the marks go; a mark left behind goes when its file is released.
+        let unmark = Command::Unmark(Unmark {
+            files: vec![6, 7, 8],
+        });
+        assert_eq!(r.run(unmark), Outcome::Unmarked);
+        assert!(!marked(&r, 6) && !marked(&r, 7) && marked(&r, 5));
+        assert!(matches!(
+            r.delete("a", Versioning::Unversioned, None),
+            Outcome::Deleted { .. }
+        ));
+        assert!(!marked(&r, 5));
+        // A sweep that released 9 and stopped before unmarking it: the mark goes when the
+        // reclaimer is done with the file.
+        assert_eq!(
+            check(&mut r, vec![(9, 0)]),
+            Outcome::Checked(vec![Released])
+        );
+        assert!(marked(&r, 9));
+        let (released_ns, file) = *released(&r.engine, u64::MAX, 100)
+            .unwrap()
+            .iter()
+            .find(|(_, f)| *f == 9)
+            .unwrap();
+        assert_eq!(
+            r.run(Command::Reclaim(Reclaim { released_ns, file })),
+            Outcome::Reclaimed
+        );
+        assert!(!marked(&r, 9));
     }
 
     /// Every range's engine also holds the rows its replica keeps about itself: the group's

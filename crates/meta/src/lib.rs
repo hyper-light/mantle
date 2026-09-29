@@ -29,4 +29,5 @@ pub mod overlay;
 pub mod reclaim;
 pub mod record;
 pub mod session;
+pub mod sweep;
 pub mod wire;

@@ -183,7 +183,13 @@ schedule and every create and delete must end. The collector's schedule: a relea
 comes due a grace after release, three days by default, and the collector waits on the
 queue's own times; a create or delete is taken over once it has gone its patience without
 progress, which its driver stamps on the bucket's row, read from an index of the attempts in
-progress; and a deleted bucket's cleanup resumes from any step.
+progress; and a deleted bucket's cleanup resumes from any step. Files a stopped gateway made
+and never handed over: every file waits in its File range's queue of unsettled files until a
+sweep settles it, a Name range takes a file only by the deadline the file was written with,
+and the sweep asks the file's Name range, which releases a file it never took once the
+deadline has passed at its own time, so no later handover can take it; a simulation of 2,000
+schedules with gateways that hand over in time, late or never, and sweeps that stop between
+any two steps, finds no file both referenced and released, and none left unsettled.
 
 The Raft log (`mantle-log`, [design](design/raft-log.md)), which every range replica on a
 metadata device shares: group commit across ranges with one flush a batch, frames whose
@@ -214,8 +220,9 @@ commands applied twice when either is introduced on purpose.
 
 Remaining before it is done:
 
-- The sweep for files a stopped gateway made and never handed over, and the collector's
-  pacing against foreground latency (design §2, §6; docs/research/22 §10).
+- Blocks and chunks a stopped gateway made for a file it never wrote, found one layer down as
+  files are, and the collector's pacing against foreground latency (design §2, §6;
+  docs/research/22 §10).
 - The production engine, once its binding is chosen (design §4).
 - Splits, merges and the fast track under simulation, built to the TLA+ model of splits and
   merges under a create and a delete (design §3, `docs/models/RangeSplit.tla`), and the

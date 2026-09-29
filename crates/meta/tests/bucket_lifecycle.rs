@@ -248,6 +248,7 @@ impl World {
                         ordered_ns: None,
                         version: object(),
                         default: None,
+                        deadline_ns: u64::MAX,
                     });
                     if let name::Outcome::Put { .. } = self.name(range_of(key), put) {
                         self.acked.insert(key, incarnation);

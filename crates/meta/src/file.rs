@@ -1,10 +1,16 @@
 //! The File layer's state machine (docs/design/metadata.md §1–§2): a file is written once,
 //! whole, as the list of extents that hold its bytes, and removed whole by the collector.
+//!
+//! A file is written for one Name-range write, which must take it by a deadline. Until the
+//! sweep has settled whether it did, the file waits in the range's queue of unsettled files,
+//! so a file whose gateway stopped before handing it over is found without a scan
+//! (docs/design/metadata.md §2).
 
+use crate::clock;
 use crate::engine::{Rows, Write};
 use crate::error::MetaError;
 use crate::key;
-use crate::record::{Extent, FileHeader};
+use crate::record::{Extent, FileHeader, Referrer};
 
 /// Extents one file may have: a completed upload's parts, at most 10,000 (05 §4.1). A file
 /// written by one PUT, at most 5 GB (05 §4.1), stays within it while its blocks hold at least
@@ -13,32 +19,61 @@ pub const MAX_EXTENTS: usize = 10_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// Writes a file of `extents`, in order from its first byte.
+    /// Writes a file of `extents`, in order from its first byte, for `referrer`'s write, which
+    /// must hand it over within `handover_ns` of the range's time now.
     Write {
         file: u128,
         extents: Vec<Extent>,
+        referrer: Referrer,
+        handover_ns: u64,
+        at_ns: u64,
     },
     Delete {
         file: u128,
+    },
+    /// The sweep settled these files' handovers: the Name range took each, or released it.
+    Settle {
+        files: Vec<u128>,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    Written,
+    /// The file is written, now or by the same request before: the Name range takes it until
+    /// `deadline_ns`.
+    Written {
+        deadline_ns: u64,
+    },
     Deleted,
+    Settled,
     /// A file of that ID holds other extents. IDs are random 128-bit numbers, so a caller
     /// that reuses one has a bug to report.
     Conflict,
-    /// No extents, more than `MAX_EXTENTS`, an empty extent, or a length past `u64`.
+    /// No extents, more than `MAX_EXTENTS`, an empty extent, or a length or deadline past
+    /// `u64`.
     Invalid,
+}
+
+/// A file whose handover the sweep has yet to settle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unsettled {
+    pub file: u128,
+    pub deadline_ns: u64,
+    pub referrer: Referrer,
 }
 
 /// Applies `command` as log entry `index`.
 pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<Outcome, MetaError> {
     let (outcome, writes) = match command {
-        Command::Write { file, extents } => write(engine, *file, extents)?,
+        Command::Write {
+            file,
+            extents,
+            referrer,
+            handover_ns,
+            at_ns,
+        } => write(engine, *file, extents, referrer, *handover_ns, *at_ns)?,
         Command::Delete { file } => (Outcome::Deleted, remove(engine, *file)?),
+        Command::Settle { files } => (Outcome::Settled, settle(engine, files)?),
     };
     engine.apply(index, &writes)?;
     Ok(outcome)
@@ -48,12 +83,15 @@ fn write<E: Rows>(
     engine: &E,
     file: u128,
     extents: &[Extent],
+    referrer: &Referrer,
+    handover_ns: u64,
+    at_ns: u64,
 ) -> Result<(Outcome, Vec<Write>), MetaError> {
     let invalid = Ok((Outcome::Invalid, Vec::new()));
     if extents.is_empty() || extents.len() > MAX_EXTENTS {
         return invalid;
     }
-    let mut writes = Vec::with_capacity(extents.len());
+    let mut writes = Vec::with_capacity(extents.len().saturating_add(3));
     let mut end = 0u64;
     for extent in extents {
         match end.checked_add(extent.length) {
@@ -65,36 +103,69 @@ fn write<E: Rows>(
     let Ok(count) = u32::try_from(extents.len()) else {
         return invalid;
     };
-    let header = FileHeader {
-        length: end,
-        extents: count,
-    };
     if let Some(existing) = self::header(engine, file)? {
         // Written already: a retry of the same file changes nothing.
         let stored = self::extents(engine, file, 0, MAX_EXTENTS)?;
-        let same = existing == header && stored.iter().map(|(_, e)| e).eq(extents);
+        let same = existing.length == end
+            && existing.extents == count
+            && existing.referrer == *referrer
+            && stored.iter().map(|(_, e)| e).eq(extents);
         let outcome = if same {
-            Outcome::Written
+            Outcome::Written {
+                deadline_ns: existing.deadline_ns,
+            }
         } else {
             Outcome::Conflict
         };
         return Ok((outcome, Vec::new()));
     }
-    writes.push(Write::Put(key::file_header(file), header.encode()));
-    Ok((Outcome::Written, writes))
+    let (made_ns, clock) = clock::tick(engine, at_ns)?;
+    let Some(deadline_ns) = made_ns.checked_add(handover_ns) else {
+        return invalid;
+    };
+    let header = FileHeader {
+        length: end,
+        extents: count,
+        made_ns,
+        deadline_ns,
+        referrer: referrer.clone(),
+    };
+    writes.push(Write::Put(key::file_header(file), header.encode()?));
+    writes.push(Write::Put(
+        key::unsettled(deadline_ns, file),
+        referrer.encode()?,
+    ));
+    writes.push(clock);
+    Ok((Outcome::Written { deadline_ns }, writes))
 }
 
-/// Writes that remove every row of `file`: its header and at most `MAX_EXTENTS` extents.
+/// Writes that remove every row of `file`: its header, at most `MAX_EXTENTS` extents, and its
+/// place in the unsettled queue.
 fn remove<E: Rows>(engine: &E, file: u128) -> Result<Vec<Write>, MetaError> {
-    let (mut from, to) = key::id_rows(file);
     let mut writes = Vec::new();
+    if let Some(h) = header(engine, file)? {
+        writes.push(Write::Delete(key::unsettled(h.deadline_ns, file)));
+    }
+    let (mut from, to) = key::id_rows(file);
     while let Some((k, _)) = engine.next(&from, &to)? {
-        if writes.len() > MAX_EXTENTS {
+        if writes.len() > MAX_EXTENTS.saturating_add(1) {
             return Err(MetaError::Corrupt);
         }
         from.clone_from(&k);
         from.push(0);
         writes.push(Write::Delete(k));
+    }
+    Ok(writes)
+}
+
+/// Writes that take `files` out of the unsettled queue; a file already out, or removed,
+/// needs none.
+fn settle<E: Rows>(engine: &E, files: &[u128]) -> Result<Vec<Write>, MetaError> {
+    let mut writes = Vec::with_capacity(files.len());
+    for &file in files {
+        if let Some(h) = header(engine, file)? {
+            writes.push(Write::Delete(key::unsettled(h.deadline_ns, file)));
+        }
     }
     Ok(writes)
 }
@@ -136,6 +207,31 @@ pub fn extents<E: Rows>(
     Ok(out)
 }
 
+/// The files whose handover deadline passed before `before_ns` and the sweep has yet to
+/// settle, soonest deadline first, at most `max`: the sweep's work.
+pub fn unsettled<E: Rows>(
+    engine: &E,
+    before_ns: u64,
+    max: usize,
+) -> Result<Vec<Unsettled>, MetaError> {
+    let (mut from, to) = key::unsettled_before(before_ns);
+    let mut out = Vec::new();
+    while out.len() < max {
+        let Some((k, v)) = engine.next(&from, &to)? else {
+            break;
+        };
+        let (deadline_ns, file) = key::decode_unsettled(&k).ok_or(MetaError::Corrupt)?;
+        out.push(Unsettled {
+            file,
+            deadline_ns,
+            referrer: Referrer::decode(&v)?,
+        });
+        from = k;
+        from.push(0);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,45 +245,103 @@ mod tests {
         }
     }
 
+    fn referrer(key: &str) -> Referrer {
+        Referrer {
+            bucket: "b".into(),
+            incarnation: 1,
+            key: key.into(),
+        }
+    }
+
+    fn write(file: u128, extents: Vec<Extent>, at_ns: u64) -> Command {
+        Command::Write {
+            file,
+            extents,
+            referrer: referrer("k"),
+            handover_ns: 100,
+            at_ns,
+        }
+    }
+
     #[test]
     fn a_file_is_written_once_and_read_from_any_offset() {
         let mut m = Model::default();
         let parts = vec![extent(10, 1), extent(5, 2), extent(20, 3)];
         let placed = vec![(0, parts[0]), (10, parts[1]), (15, parts[2])];
-        let write = Command::Write {
-            file: 7,
-            extents: parts.clone(),
-        };
-        assert_eq!(apply(&mut m, 1, &write).unwrap(), Outcome::Written);
-        assert_eq!(header(&m, 7).unwrap().unwrap().length, 35);
+        let written = Outcome::Written { deadline_ns: 1_100 };
+        assert_eq!(
+            apply(&mut m, 1, &write(7, parts.clone(), 1_000)).unwrap(),
+            written
+        );
+        let h = header(&m, 7).unwrap().unwrap();
+        assert_eq!((h.length, h.made_ns, h.deadline_ns), (35, 1_000, 1_100));
+        assert_eq!(h.referrer, referrer("k"));
         assert_eq!(extents(&m, 7, 0, 10).unwrap(), placed);
         assert_eq!(extents(&m, 7, 9, 1).unwrap(), placed[..1]);
         assert_eq!(extents(&m, 7, 10, 10).unwrap(), placed[1..]);
         assert_eq!(extents(&m, 7, 34, 10).unwrap(), placed[2..]);
         assert!(extents(&m, 7, 35, 10).unwrap().is_empty());
         assert!(extents(&m, 7, u64::MAX, 10).unwrap().is_empty());
-        // The same file again changes nothing; another under its ID is a conflict.
-        assert_eq!(apply(&mut m, 2, &write).unwrap(), Outcome::Written);
-        let other = Command::Write {
-            file: 7,
-            extents: vec![extent(35, 9)],
-        };
-        assert_eq!(apply(&mut m, 3, &other).unwrap(), Outcome::Conflict);
+        // The same file again changes nothing, and answers the first deadline; another
+        // under its ID is a conflict.
+        assert_eq!(apply(&mut m, 2, &write(7, parts, 5_000)).unwrap(), written);
+        assert_eq!(
+            apply(&mut m, 3, &write(7, vec![extent(35, 9)], 5_000)).unwrap(),
+            Outcome::Conflict
+        );
         let delete = Command::Delete { file: 7 };
         assert_eq!(apply(&mut m, 4, &delete).unwrap(), Outcome::Deleted);
         assert_eq!(header(&m, 7).unwrap(), None);
-        assert_eq!(
-            m.next(&[], &[u8::MAX]).unwrap(),
-            None,
-            "a deleted file leaves no rows"
-        );
+        let rest = m.next(&[key::DATA], &[u8::MAX]).unwrap();
+        assert_eq!(rest, None, "a deleted file leaves no rows");
+        assert!(unsettled(&m, u64::MAX, 10).unwrap().is_empty());
         assert_eq!(apply(&mut m, 5, &delete).unwrap(), Outcome::Deleted);
+    }
+
+    /// Every file waits in the unsettled queue from its write until the sweep settles it, and
+    /// comes due once its deadline has passed.
+    #[test]
+    fn a_written_file_waits_unsettled_until_the_sweep_settles_it() {
+        let mut m = Model::default();
+        for (i, (file, at)) in [(2u128, 100u64), (3, 200), (1, 300)]
+            .into_iter()
+            .enumerate()
+        {
+            let i = u64::try_from(i).unwrap() + 1;
+            apply(&mut m, i, &write(file, vec![extent(1, file)], at)).unwrap();
+        }
+        let due = |m: &Model, before| -> Vec<u128> {
+            unsettled(m, before, 10)
+                .unwrap()
+                .into_iter()
+                .map(|u| u.file)
+                .collect()
+        };
+        // Deadlines 200, 300 and 400 in order of their passing.
+        assert_eq!(due(&m, 250), [2]);
+        assert_eq!(due(&m, u64::MAX), [2, 3, 1]);
+        assert_eq!(
+            unsettled(&m, u64::MAX, 10).unwrap()[0].referrer,
+            referrer("k")
+        );
+        let settle = Command::Settle {
+            files: vec![2, 3, 99],
+        };
+        assert_eq!(apply(&mut m, 4, &settle).unwrap(), Outcome::Settled);
+        assert_eq!(due(&m, u64::MAX), [1]);
+        // Settling again, or a removed file, changes nothing.
+        assert_eq!(apply(&mut m, 5, &settle).unwrap(), Outcome::Settled);
+        // A file's clock is the range's: a proposal behind it takes the next instant.
+        assert_eq!(
+            apply(&mut m, 6, &write(4, vec![extent(1, 4)], 50)).unwrap(),
+            Outcome::Written { deadline_ns: 401 }
+        );
     }
 
     #[test]
     fn invalid_files_are_refused() {
         let mut m = Model::default();
-        let mut run = |i, extents| apply(&mut m, i, &Command::Write { file: 1, extents }).unwrap();
+        let mut run = |i, extents| apply(&mut m, i, &write(1, extents, 10)).unwrap();
         assert_eq!(run(1, vec![]), Outcome::Invalid);
         assert_eq!(run(2, vec![extent(0, 1)]), Outcome::Invalid);
         assert_eq!(
@@ -198,13 +352,25 @@ mod tests {
             run(4, vec![extent(1, 1); MAX_EXTENTS + 1]),
             Outcome::Invalid
         );
-        assert_eq!(run(5, vec![extent(1, 1); MAX_EXTENTS]), Outcome::Written);
+        assert_eq!(
+            run(5, vec![extent(1, 1); MAX_EXTENTS]),
+            Outcome::Written { deadline_ns: 110 }
+        );
         let count = header(&m, 1).unwrap().unwrap().extents;
         assert_eq!(usize::try_from(count).unwrap(), MAX_EXTENTS);
+        let far = Command::Write {
+            file: 2,
+            extents: vec![extent(1, 1)],
+            referrer: referrer("k"),
+            handover_ns: u64::MAX,
+            at_ns: 10,
+        };
+        assert_eq!(apply(&mut m, 6, &far).unwrap(), Outcome::Invalid);
         assert_eq!(
-            apply(&mut m, 6, &Command::Delete { file: 1 }).unwrap(),
+            apply(&mut m, 7, &Command::Delete { file: 1 }).unwrap(),
             Outcome::Deleted
         );
-        assert_eq!(m.next(&[], &[u8::MAX]).unwrap(), None);
+        assert_eq!(m.next(&[key::DATA], &[u8::MAX]).unwrap(), None);
+        assert!(unsettled(&m, u64::MAX, 10).unwrap().is_empty());
     }
 }

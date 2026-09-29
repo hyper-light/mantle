@@ -157,9 +157,49 @@ layers removes them, as Tectonic's does [01 §1.6].
     grace from now when the queue is empty, since nothing released after now can come due
     sooner (22 §10.3; `crates/meta/src/collector.rs`). The collector runs beside each range's
     leader; two at once, across a change of leader, only repeat steps that can be repeated.
-  - *What the queue cannot see:* a gateway that stops between writing a file and handing it
-    over leaves a file no range ever held. Finding those needs the sweep between layers that
-    Tectonic runs (01 §1.6), from files to the writes they were made for (§6).
+  - *Files never handed over.* A gateway that stops between writing a file and handing it
+    over leaves a file no range ever held, and the queue cannot see it. Tectonic runs a
+    collector between layers for such leftovers (01 §1.6); scanning every file for a
+    reference, as GFS scans its namespace, costs a pass over the whole layer each period
+    (22 §1.1). Instead every file is registered while its handover is in flight, as HDFS
+    allocates a block before it is written and RocksDB registers a job's outputs while it runs
+    (22 §3.1, §7.3), and the sweep reads only those.
+    - *The deadline.* A file's row records the File range's time it was written, the Name-range
+      write it was made for (bucket, incarnation and key), and a deadline by which that write
+      must take it, the writing gateway's handover time added to the write's. The file waits
+      in the File range's queue of unsettled files, keyed by its deadline. A handover names
+      the deadline, and a Name range whose time has passed it refuses the write and releases
+      the file, as Spanner fails reads older than its version window (22 §6).
+    - *The mark.* A Name range that takes a file within its deadline, referencing it or
+      releasing it for a refused write, marks it.
+    - *The sweep* (`crates/meta/src/sweep.rs`) takes the queue as deadlines pass and asks the
+      Name range of each file's key, in one command, whether it took the file. A marked file
+      was taken. An unmarked one past its deadline, at the Name range's time, is released and
+      marked there and then; since that time only moves forward, a handover that comes after
+      finds the deadline passed and is refused, so the check and the handover are ordered by
+      the range's log, as Giza's no-op and a stalled put contend for one Paxos slot (22 §7.4).
+      The sweep then settles the files in the File range and removes their marks, in that
+      order: a mark removed first would read, to a sweep resumed after a stop, as a file never
+      handed over. Like the reclaimer, the sweep names each read and command and does no I/O,
+      and every step can be repeated.
+    - *What it costs.* A file handed over past its deadline is released unmarked, since it may
+      come after the sweep settled the file, and a mark would stay behind; a file whose mark
+      went with its release before the sweep came by is released again. Either way the file is
+      in the queue twice, and the reclaimer's second pass finds it gone. A mark left by a sweep
+      that stopped between settling a file and unmarking it goes when the file is released or
+      reclaimed, so every mark is on a file a version or part references or on one released.
+    - *Checked.* `crates/meta/tests/orphan_sweep.rs` runs 2,000 generated schedules across a
+      File range and two Name ranges, with gateways that hand their files over in time, late
+      or never, deletes, and sweeps that stop between any two steps. After every step no file
+      a version references is released, and every file written is referenced, released or
+      unsettled; once the faults stop and every deadline passes, a sweep leaves nothing
+      unsettled and every file referenced or released, not both. With the deadline's check
+      removed, it finds a file both referenced and released.
+    - *The deadline's length* is the gateway's measured handover time: the per-step deadline
+      times its retry budget, plus the clock offset between ranges, as Ceph's 120 s and HDFS's
+      60 s bound the same window (22 §10.2). It bounds how long a leftover file waits, not
+      correctness: the File range and the Name range may disagree about the time, which only
+      makes an honest handover late (22 §10.1).
 - **Multipart.** CreateMultipartUpload writes the upload row. UploadPart writes the part's
   chunks, blocks and file, then replaces the part row. CompleteMultipartUpload writes the
   object's file of part extents in its File range, then, in the Name range, checks the
@@ -334,9 +374,11 @@ cover the production engine, which the simulator cannot.
 - How an entry larger than a datagram reaches the replicas: over QUIC, or fragmented on the
   UDP plane. A completion of 10,000 parts is an entry of hundreds of kilobytes in the Name
   range and another in the File range.
-- The sweep that finds files a stopped gateway made and never handed over (§2), and the
+- Blocks and chunks a gateway made for a file it never wrote: the same queue and deadline one
+  layer down, the File range checking a block against the file it names, and each volume's
+  chunks reconciled with the Block layer's reverse rows (22 §10.1, items 6 and 7). And the
   collector's pacing against foreground latency, with a floor that keeps its backlog bounded
-  (22 §10.1–§10.3). The patience after which an attempt is taken over, and the floor under
+  (22 §10.3). The patience after which an attempt is taken over, and the floor under
   the grace period, the longest read's deadline plus clock offset (22 §10.4), are measured
   once the gateway runs.
 - The bound on a cached bucket row's staleness, and how a versioning change reaches

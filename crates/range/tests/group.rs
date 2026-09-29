@@ -129,6 +129,7 @@ fn put(key: &str) -> Command {
             legal_hold: None,
         },
         default: None,
+        deadline_ns: u64::MAX,
     })))
 }
 

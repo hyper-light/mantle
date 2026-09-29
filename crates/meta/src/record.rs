@@ -218,11 +218,26 @@ pub struct Session {
     pub answers: Vec<(u64, Vec<u8>)>,
 }
 
-/// A file: its length and how many extents hold it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A file: its length, how many extents hold it, and the handover it was made for.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHeader {
     pub length: u64,
     pub extents: u32,
+    /// The File range's time when the file's rows committed.
+    pub made_ns: u64,
+    /// The latest time, in the clock of the Name range it is handed to, at which that range
+    /// takes the file; past it the file is refused and released (docs/design/metadata.md §2).
+    pub deadline_ns: u64,
+    pub referrer: Referrer,
+}
+
+/// The Name-range write a file was made for: the object key whose version or part it is to
+/// become. It routes the sweep's question about the file to the range that holds the key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Referrer {
+    pub bucket: String,
+    pub incarnation: u64,
+    pub key: String,
 }
 
 /// Bytes of a file, up to the end its row's key names.
@@ -268,11 +283,14 @@ pub struct Reverse {
 }
 
 impl FileHeader {
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
         let mut w = start();
         w.u64(self.length);
         w.u32(self.extents);
-        finish(w)
+        w.u64(self.made_ns);
+        w.u64(self.deadline_ns);
+        self.referrer.put(&mut w)?;
+        Ok(finish(w))
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
@@ -281,9 +299,40 @@ impl FileHeader {
             Some(Self {
                 length: r.u64()?,
                 extents: r.u32()?,
+                made_ns: r.u64()?,
+                deadline_ns: r.u64()?,
+                referrer: Referrer::take(&mut r)?,
             })
         })();
         decoded(header, &r, "file")
+    }
+}
+
+impl Referrer {
+    pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
+        let mut w = start();
+        self.put(&mut w)?;
+        Ok(finish(w))
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "referrer")?;
+        let referrer = Self::take(&mut r);
+        decoded(referrer, &r, "referrer")
+    }
+
+    pub(crate) fn put(&self, w: &mut Writer) -> Result<(), RecordError> {
+        put_str(w, &self.bucket)?;
+        w.u64(self.incarnation);
+        put_str(w, &self.key)
+    }
+
+    pub(crate) fn take(r: &mut Reader<'_>) -> Option<Self> {
+        Some(Self {
+            bucket: take_str(r)?,
+            incarnation: r.u64()?,
+            key: take_str(r)?,
+        })
     }
 }
 
@@ -1079,8 +1128,19 @@ mod tests {
         let h = FileHeader {
             length: 1 << 40,
             extents: 10_000,
+            made_ns: 7,
+            deadline_ns: u64::MAX,
+            referrer: Referrer {
+                bucket: "b".into(),
+                incarnation: 3,
+                key: "a/\u{0}é".into(),
+            },
         };
-        assert_eq!(FileHeader::decode(&h.encode()), Ok(h));
+        assert_eq!(FileHeader::decode(&h.encode().unwrap()), Ok(h.clone()));
+        assert_eq!(
+            Referrer::decode(&h.referrer.encode().unwrap()),
+            Ok(h.referrer)
+        );
         for target in [Target::Block(3), Target::File(u128::MAX)] {
             let e = Extent {
                 length: 5 << 30,

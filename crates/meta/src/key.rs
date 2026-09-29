@@ -22,6 +22,9 @@ pub mod marker {
     /// The Name range's gate floor.
     pub const FLOOR: u8 = b'f';
     pub const GATE: u8 = b'g';
+    /// The Name range's marks of the files it took responsibility for, until the sweep has
+    /// settled them.
+    pub const HANDED: u8 = b'h';
     /// How many sessions the range holds.
     pub const SESSIONS: u8 = b'n';
     /// The last snapshot a member installed.
@@ -31,14 +34,18 @@ pub mod marker {
     /// The group's configuration.
     pub const CONFIGURATION: u8 = b'r';
     pub const SESSION: u8 = b's';
+    /// The File range's files whose handover the sweep has not yet settled.
+    pub const UNSETTLED: u8 = b'u';
 
     /// Every marker in use.
-    pub const ALL: [u8; 10] = [
+    pub const ALL: [u8; 12] = [
         ATTEMPT,
         CLOCK,
         EXPIRY,
         FLOOR,
         GATE,
+        HANDED,
+        UNSETTLED,
         SESSIONS,
         INSTALLED,
         RELEASED,
@@ -159,6 +166,43 @@ pub fn decode_attempt(k: &[u8]) -> Option<String> {
         return None;
     }
     String::from_utf8(name).ok()
+}
+
+/// The key of a file in the File range's queue of files whose handover is not yet settled:
+/// its handover deadline, then the file, so the sweep takes them as their deadlines pass
+/// (docs/design/metadata.md §2).
+pub fn unsettled(deadline_ns: u64, file: u128) -> Vec<u8> {
+    let mut out = Vec::with_capacity(26);
+    out.extend_from_slice(&[LOCAL, marker::UNSETTLED]);
+    out.extend_from_slice(&deadline_ns.to_be_bytes());
+    out.extend_from_slice(&file.to_be_bytes());
+    out
+}
+
+/// The first key of the unsettled queue, and the first of those whose deadline is at or after
+/// `before_ns`.
+pub fn unsettled_before(before_ns: u64) -> (Vec<u8>, Vec<u8>) {
+    let mut past = vec![LOCAL, marker::UNSETTLED];
+    past.extend_from_slice(&before_ns.to_be_bytes());
+    (vec![LOCAL, marker::UNSETTLED], past)
+}
+
+/// The deadline and file an unsettled file's key names; `None` if it is not one.
+pub fn decode_unsettled(k: &[u8]) -> Option<(u64, u128)> {
+    let rest = k.strip_prefix(&[LOCAL, marker::UNSETTLED])?;
+    let (deadline, file) = rest.split_first_chunk::<8>()?;
+    Some((
+        u64::from_be_bytes(*deadline),
+        u128::from_be_bytes(file.try_into().ok()?),
+    ))
+}
+
+/// The key of the Name range's mark that it took responsibility for `file`.
+pub fn handed(file: u128) -> Vec<u8> {
+    let mut out = Vec::with_capacity(18);
+    out.extend_from_slice(&[LOCAL, marker::HANDED]);
+    out.extend_from_slice(&file.to_be_bytes());
+    out
 }
 
 /// The range's queue of the files it released, oldest first (docs/design/metadata.md §2).

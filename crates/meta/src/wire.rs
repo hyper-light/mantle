@@ -688,6 +688,13 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
                 w.u128(m.file);
             }
         }
+        name::Command::Disown(d) => {
+            w.u8(20);
+            record::put_str(w, &d.bucket)?;
+            record::put_str(w, &d.key)?;
+            w.u128(d.file);
+            w.u128(d.owner);
+        }
         name::Command::Split(s) => {
             w.u8(13);
             w.u64(s.generation);
@@ -908,6 +915,13 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
             }
             name::Command::Unmark(name::Unmark { files })
         }
+        20 => name::Command::Disown(name::Disown {
+            bucket: record::take_str(r)?,
+            key: record::take_str(r)?,
+            file: r.u128()?,
+            owner: r.u128()?,
+            at_ns,
+        }),
         8 => {
             let (bucket, incarnation, key) = take_target(r)?;
             let named = take_named(r)?;
@@ -1199,6 +1213,10 @@ fn put_name_outcome(w: &mut Writer, o: &name::Outcome) -> Result<(), RecordError
             put_verdicts(w, verdicts)?;
         }
         O::Unmarked => w.u8(26),
+        O::Disowned { released } => {
+            w.u8(35);
+            w.u8(u8::from(*released));
+        }
         O::Moved(lineage) => {
             w.u8(27);
             record::put_lineage(w, lineage)?;
@@ -1307,6 +1325,13 @@ fn take_name_outcome(r: &mut Reader<'_>) -> Option<name::Outcome> {
         24 => O::Expired,
         25 => O::Checked(take_verdicts(r)?),
         26 => O::Unmarked,
+        35 => O::Disowned {
+            released: match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            },
+        },
         27 => O::Moved(Box::new(record::take_lineage(r)?)),
         28 => O::Split(Box::new(record::take_lineage(r)?)),
         29 => O::Frozen(Box::new(record::take_lineage(r)?)),
@@ -1586,6 +1611,13 @@ mod tests {
                 released_ns: 5,
                 file: u128::MAX,
             })),
+            named(name::Command::Disown(name::Disown {
+                bucket: "b".into(),
+                key: "k".into(),
+                file: 7,
+                owner: u128::MAX,
+                at_ns,
+            })),
             named(name::Command::Check(name::Check {
                 files: vec![
                     name::Checked {
@@ -1808,6 +1840,8 @@ mod tests {
                 ]),
                 N::Checked(Vec::new()),
                 N::Unmarked,
+                N::Disowned { released: true },
+                N::Disowned { released: false },
                 N::Moved(Box::new(lineage.clone())),
                 N::Split(Box::new(lineage.clone())),
                 N::Frozen(Box::new(lineage.clone())),

@@ -371,6 +371,34 @@ pub struct Holder {
     pub key: String,
 }
 
+/// A file's mark says the Name range holds it. A part file's mark, once a completion commits,
+/// also names the composite file that adopted it, which alone may give it back for
+/// reclaiming: a composite that lost its completion, or was written again for a retry,
+/// never adopted the parts it names (audit B02).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Adopted {
+    pub by: u128,
+}
+
+impl Adopted {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = start();
+        w.u128(self.by);
+        finish(w)
+    }
+
+    /// The composite a mark's value names: none for a mark with no value, a file the range
+    /// holds under its key.
+    pub fn of(mark: &[u8]) -> Result<Option<Self>, RecordError> {
+        if mark.is_empty() {
+            return Ok(None);
+        }
+        let mut r = open(mark, "adopted")?;
+        let adopted = (|| Some(Self { by: r.u128()? }))();
+        decoded(adopted, &r, "adopted").map(Some)
+    }
+}
+
 /// Where a block came from: the file it was made for, which alone may name it, the Block
 /// range's time it was written, and the time by which that file's write must name it, which
 /// the writer renews while its body streams in (docs/design/metadata.md §2).

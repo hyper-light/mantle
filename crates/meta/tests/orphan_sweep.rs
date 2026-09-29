@@ -8,23 +8,26 @@
 )]
 
 //! What a gateway made and never handed over (docs/design/metadata.md §2), found by the sweeps
-//! (`mantle_meta::sweep`) across a Block range, a File range and Name ranges that split while
-//! it happens, under schedules proptest chooses. A gateway writes a block's chunk to a volume
-//! and the block, renews the block's deadline while its body would still stream in, then
-//! writes the file that names the block, then hands the file to its key's Name range; it may
-//! stop for good at any stage, or come late to the next. Deletes release files,
-//! both sweeps run a step at a time and stop for good between any two steps, leaders whose
-//! clocks run behind propose entries at times earlier than entries already applied, and Name
-//! ranges split and merge, their marks and queues going with their keys, while the gateways
-//! and the sweep route by descriptors they learn of late and wait out a merge in flight.
+//! (`mantle_meta::sweep`) and taken apart by the collector (`mantle_meta::reclaim`), across a
+//! Block range, a File range and Name ranges that split and merge while it happens, under
+//! schedules proptest chooses. A gateway writes a block's chunk to a volume and the block,
+//! renews the block's deadline while its body would still stream in, then writes the file that
+//! names the block, then hands the file to its key's Name range; it may stop for good at any
+//! stage, or come late to the next. Uploaders write parts and complete uploads with composite
+//! files of them, have completions refused, retry completions that committed with a composite
+//! made again, and abort. Deletes release files. Two file sweeps run at once, each request
+//! delivered at some later step, and a stopped sweep's request arrives after it; the block
+//! sweep and the collector stop between any two steps; leaders whose clocks run behind propose
+//! entries at times earlier than entries already applied; and Name ranges split and merge,
+//! their marks and queues going with their keys, while everyone routes by descriptors learned
+//! late and waits out a merge in flight.
 //!
-//! After every step, no file a version references is released, every file written is
-//! referenced, released or unsettled, and every block a written file names still has its rows
-//! and its chunk. Once the faults stop and every deadline has passed, the sweeps leave nothing
-//! unsettled in either layer; every file is referenced or released and not both; every block
-//! left is one a file names, and every chunk left one a block holds; and a mark is left only by
-//! a sweep that stopped between settling a file and unmarking it, on a file referenced or
-//! released, which its release or reclaiming removes.
+//! After every step, no file a version, a part or a held composite names is released, and
+//! each such file keeps its rows, its blocks' rows and their chunks. Once the faults stop and
+//! every deadline has passed, the sweeps leave nothing unsettled in either layer, the
+//! collector leaves nothing released, every file is held or reclaimed and not both, every
+//! block left is one a file names, every chunk left one a block holds, and every mark is on a
+//! file held or released.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -35,11 +38,13 @@ use mantle_meta::file::{self, Unsettled};
 use mantle_meta::key::{self, NameRow};
 use mantle_meta::merge::{self, Merger};
 use mantle_meta::name::{
-    self, Check, Checked, GateChange, Marked, Preconditions, Put, Split, Unmark, Verdict,
+    self, Abort, Check, Checked, Complete, CreateUpload, GateChange, Listed, Match, Preconditions,
+    Put, PutPart, Split, Verdict,
 };
+use mantle_meta::reclaim::{self, Reclaimer};
 use mantle_meta::record::{
-    BlockHeader, ChunkPlace, Descriptor, Extent, GateState, Lineage, Referrer, Standing, Target,
-    Version, Versioning,
+    BlockHeader, ChunkPlace, Descriptor, Extent, GateState, Lineage, Part, Referrer, Standing,
+    Target, Upload, Version, Versioning,
 };
 use mantle_meta::sweep::{Answer, BlockAnswer, BlockRequest, BlockSweep, Request, Sweep};
 use proptest::prelude::*;
@@ -85,9 +90,34 @@ enum Action {
         key: usize,
         versioned: bool,
     },
-    /// One step of the file sweep, starting one if none runs.
-    Sweep,
-    SweepStops,
+    /// One step of file sweep 0 or 1, starting one if none runs: a step sends the sweep's
+    /// next request, or delivers the answer to the one it sent, so the other sweep's steps
+    /// and every other action fall between the two.
+    Sweep(usize),
+    /// A sweep stops for good; the request it sent arrives later.
+    SweepStops(usize),
+    /// A stopped sweep's request arrives, late.
+    LateSweep(usize),
+    /// One step of the collector, taking a Name range's oldest released file if it has none.
+    Collect,
+    /// The collector stops; the next starts again from the queue.
+    CollectorStops,
+    /// An uploader creates an upload for a key.
+    Upload {
+        key: usize,
+    },
+    /// An uploader writes its upload's next part: a block, the part's file, and the part.
+    UploadPart(usize),
+    /// An uploader completes its upload with a composite file of its parts, the completion
+    /// refused by its precondition if `refuse`.
+    UploadComplete {
+        uploader: usize,
+        refuse: bool,
+    },
+    /// An uploader whose completion committed retries it with a composite made again.
+    UploadRetry(usize),
+    /// An uploader aborts its upload.
+    UploadAbort(usize),
     /// One step of the block sweep, starting one if none runs.
     BlockSweep,
     BlockSweepStops,
@@ -129,8 +159,17 @@ fn action() -> impl Strategy<Value = Action> {
         2 => (0usize..4).prop_map(Action::Renew),
         1 => (0usize..4).prop_map(Action::Crash),
         1 => (0usize..4, any::<bool>()).prop_map(|(key, versioned)| Action::Delete { key, versioned }),
-        3 => Just(Action::Sweep),
-        1 => Just(Action::SweepStops),
+        3 => (0usize..2).prop_map(Action::Sweep),
+        1 => (0usize..2).prop_map(Action::SweepStops),
+        1 => (0usize..4).prop_map(Action::LateSweep),
+        2 => Just(Action::Collect),
+        1 => Just(Action::CollectorStops),
+        1 => (0usize..4).prop_map(|key| Action::Upload { key }),
+        2 => (0usize..4).prop_map(Action::UploadPart),
+        1 => (0usize..4, any::<bool>())
+            .prop_map(|(uploader, refuse)| Action::UploadComplete { uploader, refuse }),
+        1 => (0usize..4).prop_map(Action::UploadRetry),
+        1 => (0usize..4).prop_map(Action::UploadAbort),
         3 => Just(Action::BlockSweep),
         1 => Just(Action::BlockSweepStops),
         1 => Just(Action::Wait),
@@ -191,9 +230,33 @@ struct World {
     lag: u64,
     next_id: u128,
     gateways: Vec<Gateway>,
-    sweep: Option<Sweep>,
+    sweeps: [Option<Sweep>; 2],
+    /// Each sweep's request sent and not yet answered.
+    sent: [Option<Request>; 2],
+    /// Requests of stopped sweeps, not yet arrived.
+    late_sweeps: Vec<Request>,
     block_sweep: Option<BlockSweep>,
+    collector: Option<Collecting>,
+    uploaders: Vec<Uploader>,
     written: BTreeSet<u128>,
+    /// Files the collector took apart.
+    reclaimed: BTreeSet<u128>,
+}
+
+/// The collector's work: a file released by Name range `range`.
+struct Collecting {
+    range: u64,
+    file: u128,
+    reclaimer: Reclaimer,
+}
+
+/// A multipart upload in progress: its parts, by number, and the composite file its
+/// completion committed, if it did.
+struct Uploader {
+    key: &'static str,
+    upload: String,
+    parts: Vec<(u16, u128)>,
+    completed: Option<u128>,
 }
 
 impl World {
@@ -224,9 +287,14 @@ impl World {
             lag: 0,
             next_id: 1,
             gateways: Vec::new(),
-            sweep: None,
+            sweeps: [None, None],
+            sent: [None, None],
+            late_sweeps: Vec::new(),
             block_sweep: None,
+            collector: None,
+            uploaders: Vec::new(),
             written: BTreeSet::new(),
+            reclaimed: BTreeSet::new(),
         };
         let open = name::Command::Gate(GateChange {
             bucket: BUCKET.into(),
@@ -536,8 +604,57 @@ impl World {
                 });
                 self.send(key, &delete);
             }
-            Action::Sweep => self.sweep_step(),
-            Action::SweepStops => self.sweep = None,
+            Action::Sweep(i) => self.sweep_step(i),
+            Action::SweepStops(i) => {
+                self.sweeps[i] = None;
+                if let Some(request) = self.sent[i].take() {
+                    self.late_sweeps.push(request);
+                }
+            }
+            Action::LateSweep(j) => {
+                if !self.late_sweeps.is_empty() {
+                    let request = self.late_sweeps.swap_remove(j % self.late_sweeps.len());
+                    if self.serve(request.clone()).is_none() {
+                        self.late_sweeps.push(request);
+                    }
+                }
+            }
+            Action::Collect => self.collect_step(),
+            Action::CollectorStops => self.collector = None,
+            Action::Upload { key } => self.create_upload(KEYS[key]),
+            Action::UploadPart(i) => {
+                if !self.uploaders.is_empty() {
+                    self.upload_part(i % self.uploaders.len());
+                }
+            }
+            Action::UploadComplete { uploader, refuse } => {
+                if !self.uploaders.is_empty() {
+                    self.complete(uploader % self.uploaders.len(), refuse, false);
+                }
+            }
+            Action::UploadRetry(i) => {
+                if !self.uploaders.is_empty() {
+                    self.complete(i % self.uploaders.len(), false, true);
+                }
+            }
+            Action::UploadAbort(i) => {
+                if !self.uploaders.is_empty() {
+                    let u = self.uploaders.swap_remove(i % self.uploaders.len());
+                    let abort = name::Command::Abort(Abort {
+                        bucket: BUCKET.into(),
+                        incarnation: 1,
+                        key: u.key.into(),
+                        upload: u.upload.clone(),
+                        at_ns: self.proposed(),
+                    });
+                    match self.send(u.key, &abort) {
+                        Some(name::Outcome::Aborted | name::Outcome::NoSuchUpload) => {}
+                        // A merge in flight holds the key: the uploader tries again later.
+                        None => self.uploaders.push(u),
+                        Some(other) => panic!("abort: {other:?}"),
+                    }
+                }
+            }
             Action::BlockSweep => self.block_sweep_step(),
             Action::BlockSweepStops => self.block_sweep = None,
             Action::Wait => self.clock += HANDOVER,
@@ -690,20 +807,255 @@ impl World {
         true
     }
 
-    fn sweep_step(&mut self) {
-        let sweep = self.sweep.get_or_insert_with(|| Sweep::new(PAGE));
-        let Some(request) = sweep.next() else {
-            self.sweep = None;
+    /// One step of sweep `i`: delivers the answer to the request it sent, or sends its next.
+    fn sweep_step(&mut self, i: usize) {
+        if let Some(request) = self.sent[i].take() {
+            // A key a merge in flight holds leaves the request to be delivered again.
+            let Some(answer) = self.serve(request.clone()) else {
+                self.sent[i] = Some(request);
+                return;
+            };
+            if let Some(sweep) = self.sweeps[i].as_mut() {
+                sweep.answer(answer).unwrap();
+                if sweep.is_done() {
+                    self.sweeps[i] = None;
+                }
+            }
+            return;
+        }
+        let sweep = self.sweeps[i].get_or_insert_with(|| Sweep::new(PAGE));
+        match sweep.next() {
+            Some(request) => self.sent[i] = Some(request),
+            None => self.sweeps[i] = None,
+        }
+    }
+
+    /// One step of the collector: takes the oldest file some Name range released, or moves
+    /// its reclaimer on with the answer to its next request (`mantle_meta::reclaim`).
+    fn collect_step(&mut self) {
+        let Some(c) = self.collector.as_mut() else {
+            for (id, _) in self.owners() {
+                let queue = name::released(&self.names[&id].engine, u64::MAX, 1).unwrap();
+                if let Some(released) = queue.into_iter().next() {
+                    self.collector = Some(Collecting {
+                        range: id,
+                        file: released.file,
+                        reclaimer: Reclaimer::new(released, 2),
+                    });
+                    break;
+                }
+            }
             return;
         };
-        // A key a merge in flight holds leaves the step to be tried again.
-        let Some(answer) = self.serve(request) else {
+        let Some(request) = c.reclaimer.next() else {
+            self.collector = None;
             return;
         };
-        let sweep = self.sweep.as_mut().unwrap();
-        sweep.answer(answer).unwrap();
-        if sweep.is_done() {
-            self.sweep = None;
+        let range = c.range;
+        let answer = match request {
+            reclaim::Request::Extents { file, from, max } => {
+                reclaim::Answer::Extents(file::extents(&self.files, file, from, max).unwrap())
+            }
+            reclaim::Request::Block(b) => {
+                reclaim::Answer::Block(block::read(&self.blocks, b).unwrap())
+            }
+            reclaim::Request::Chunk(place) => {
+                self.volumes.remove(&slot(&place));
+                reclaim::Answer::Chunk
+            }
+            reclaim::Request::BlockCommand(c) => reclaim::Answer::BlockOutcome(self.block(c)),
+            reclaim::Request::FileCommand(c) => reclaim::Answer::FileOutcome(self.file(c)),
+            reclaim::Request::Disown(d) => {
+                let key = d.key.clone();
+                match self.send(&key, &name::Command::Disown(d)) {
+                    Some(outcome) => reclaim::Answer::NameOutcome(outcome),
+                    None => return,
+                }
+            }
+            reclaim::Request::Unmark(u) => {
+                let key = u.files[0].key.clone();
+                match self.send(&key, &name::Command::Unmark(u)) {
+                    Some(outcome) => reclaim::Answer::NameOutcome(outcome),
+                    None => return,
+                }
+            }
+            reclaim::Request::Reclaim(r) => match self.name(range, name::Command::Reclaim(r)) {
+                outcome @ name::Outcome::Reclaimed => reclaim::Answer::NameOutcome(outcome),
+                // The range froze or ended, its queue going with its merge: the collector
+                // takes the row again from where it went.
+                _ => {
+                    self.collector = None;
+                    return;
+                }
+            },
+        };
+        let c = self.collector.as_mut().unwrap();
+        c.reclaimer.step(answer).unwrap();
+        if c.reclaimer.is_done() {
+            self.reclaimed.insert(c.file);
+            self.collector = None;
+        }
+    }
+
+    fn create_upload(&mut self, key: &'static str) {
+        let create = name::Command::CreateUpload(CreateUpload {
+            bucket: BUCKET.into(),
+            incarnation: 1,
+            key: key.into(),
+            at_ns: self.proposed(),
+            upload: Upload {
+                initiated_ns: 0,
+                owner: "o".into(),
+                headers: Vec::new(),
+                checksum: None,
+                retention: None,
+                legal_hold: None,
+            },
+        });
+        if let Some(name::Outcome::Created { upload }) = self.send(key, &create) {
+            self.uploaders.push(Uploader {
+                key,
+                upload,
+                parts: Vec::new(),
+                completed: None,
+            });
+        }
+    }
+
+    /// Writes a block of one chunk for `file`, and `file` of `extents` for `key`; the file's
+    /// handover deadline.
+    fn write_file(&mut self, key: &str, file: u128, extents: Vec<Extent>) -> u64 {
+        let outcome = self.file(file::Command::Write {
+            file,
+            extents,
+            referrer: Referrer {
+                bucket: BUCKET.into(),
+                incarnation: 1,
+                key: key.into(),
+            },
+            key: None,
+            handover_ns: HANDOVER,
+            blocks_deadline_ns: u64::MAX,
+            at_ns: self.proposed(),
+        });
+        let file::Outcome::Written { deadline_ns } = outcome else {
+            panic!("{outcome:?}");
+        };
+        self.written.insert(file);
+        deadline_ns
+    }
+
+    fn upload_part(&mut self, i: usize) {
+        if self.uploaders[i].completed.is_some() || self.uploaders[i].parts.len() >= 3 {
+            return;
+        }
+        let (file, block) = (self.id(), self.id());
+        let place = ChunkPlace {
+            volume: block % 3,
+            key: ChunkKey {
+                block,
+                epoch: 1,
+                index: 0,
+            },
+        };
+        self.volumes.insert(slot(&place));
+        let outcome = self.block(block::Command::Write {
+            block,
+            header: BlockHeader {
+                length: 1,
+                data: 1,
+                parity: 0,
+                chunk_len: 1,
+                crc32c: 0,
+            },
+            chunks: vec![place],
+            file,
+            handover_ns: HANDOVER,
+            at_ns: self.proposed(),
+        });
+        assert!(matches!(outcome, block::Outcome::Written { .. }));
+        let key = self.uploaders[i].key;
+        let deadline_ns = self.write_file(
+            key,
+            file,
+            vec![Extent {
+                length: 1,
+                target: Target::Block(block),
+            }],
+        );
+        let number = u16::try_from(self.uploaders[i].parts.len() + 1).unwrap();
+        let put = name::Command::PutPart(PutPart {
+            bucket: BUCKET.into(),
+            incarnation: 1,
+            key: key.into(),
+            upload: self.uploaders[i].upload.clone(),
+            number,
+            part: Part {
+                etag: format!("p{number}"),
+                size: name::MIN_PART,
+                checksum: None,
+                file,
+                modified_ns: 0,
+            },
+            at_ns: self.proposed(),
+            deadline_ns,
+        });
+        // A part refused, or held up by a merge, is released or left to the sweep.
+        if let Some(name::Outcome::PartWritten) = self.send(key, &put) {
+            self.uploaders[i].parts.push((number, file));
+        }
+    }
+
+    /// Completes uploader `i`'s upload with a composite file of its parts; a retry makes the
+    /// composite again for a completion that committed.
+    fn complete(&mut self, i: usize, refuse: bool, retry: bool) {
+        let u = &self.uploaders[i];
+        if u.parts.is_empty() || u.completed.is_some() != retry {
+            return;
+        }
+        let (key, upload, parts) = (u.key, u.upload.clone(), u.parts.clone());
+        let composite = self.id();
+        let deadline_ns = self.write_file(
+            key,
+            composite,
+            parts
+                .iter()
+                .map(|&(_, file)| Extent {
+                    length: 1,
+                    target: Target::File(file),
+                })
+                .collect(),
+        );
+        let complete = name::Command::Complete(Complete {
+            bucket: BUCKET.into(),
+            incarnation: 1,
+            key: key.into(),
+            upload,
+            versioning: Versioning::Unversioned,
+            preconditions: Preconditions {
+                if_match: refuse.then(|| Match::Tags(vec!["nope".into()])),
+                if_none_match: None,
+            },
+            at_ns: self.proposed(),
+            parts: parts
+                .iter()
+                .map(|&(number, file)| Listed {
+                    number,
+                    etag: format!("p{number}"),
+                    file,
+                })
+                .collect(),
+            etag: format!("m-{}", parts.len()),
+            size: name::MIN_PART * parts.len() as u64,
+            checksum: None,
+            file: Some(composite),
+            default: None,
+            deadline_ns,
+        });
+        if let Some(name::Outcome::Put { .. }) = self.send(key, &complete)
+            && !retry
+        {
+            self.uploaders[i].completed = Some(composite);
         }
     }
 
@@ -774,20 +1126,6 @@ impl World {
                 );
                 Answer::Settled
             }
-            Request::Unmark(files) => {
-                for (referrer, file) in files {
-                    let unmark = name::Command::Unmark(Unmark {
-                        files: vec![Marked {
-                            bucket: referrer.bucket.clone(),
-                            key: referrer.key.clone(),
-                            file,
-                        }],
-                    });
-                    let outcome = self.send(&referrer.key, &unmark)?;
-                    assert_eq!(outcome, name::Outcome::Unmarked);
-                }
-                Answer::Unmarked
-            }
         })
     }
 
@@ -840,17 +1178,32 @@ impl World {
         }
     }
 
-    /// Files a version references, in every Name range.
+    /// Files the Name ranges hold: each a version or an upload's part references, and each
+    /// part a referenced composite adopted.
     fn referenced(&self) -> BTreeSet<u128> {
         let mut out = BTreeSet::new();
         for range in self.owned() {
             let (mut from, to) = key::bucket_span(BUCKET);
             while let Some((k, v)) = range.next(&from, &to).unwrap() {
-                if let Some((_, _, NameRow::Version(_))) = key::decode_name(&k) {
-                    out.extend(Version::decode(&v).unwrap().file);
+                match key::decode_name(&k) {
+                    Some((_, _, NameRow::Version(_))) => {
+                        out.extend(Version::decode(&v).unwrap().file);
+                    }
+                    Some((_, _, NameRow::Part(..))) => {
+                        out.insert(Part::decode(&v).unwrap().file);
+                    }
+                    _ => {}
                 }
                 from = k;
                 from.push(0);
+            }
+        }
+        let composites: Vec<u128> = out.iter().copied().collect();
+        for f in composites {
+            for (_, e) in file::extents(&self.files, f, 0, 16).unwrap() {
+                if let Target::File(part) = e.target {
+                    out.insert(part);
+                }
             }
         }
         out
@@ -914,19 +1267,45 @@ impl World {
             (self.referenced(), self.released(), self.unsettled());
         let lost: Vec<_> = referenced.intersection(&released).collect();
         assert!(lost.is_empty(), "files referenced and released: {lost:?}");
+        // A released composite's parts stay its own until the collector gives them back.
+        let giving_back: BTreeSet<u128> = released
+            .iter()
+            .flat_map(|&f| file::extents(&self.files, f, 0, 16).unwrap())
+            .filter_map(|(_, e)| match e.target {
+                Target::File(part) => Some(part),
+                Target::Block(_) => None,
+            })
+            .collect();
         for f in &self.written {
             assert!(
-                referenced.contains(f) || released.contains(f) || unsettled.contains(f),
+                referenced.contains(f)
+                    || released.contains(f)
+                    || unsettled.contains(f)
+                    || self.reclaimed.contains(f)
+                    || giving_back.contains(f),
                 "file {f} is nowhere"
             );
         }
-        let recorded = self.recorded();
-        for b in self.named() {
-            assert!(recorded.contains(&b), "block {b} of a file was taken apart");
+        // Everything a held file names resolves to bytes: its rows, its blocks' rows and their
+        // chunks (audits B01, B02).
+        let chunked: BTreeSet<u128> = self.volumes.iter().map(|&(_, b, _, _)| b).collect();
+        for &f in &referenced {
             assert!(
-                self.volumes.iter().any(|&(_, block, _, _)| block == b),
-                "the chunk of block {b} of a file was deleted"
+                file::header(&self.files, f).unwrap().is_some(),
+                "file {f}, held, was taken apart"
             );
+            for (_, e) in file::extents(&self.files, f, 0, 16).unwrap() {
+                if let Target::Block(b) = e.target {
+                    assert!(
+                        block::read(&self.blocks, b).unwrap().is_some(),
+                        "block {b} of held file {f} was taken apart"
+                    );
+                    assert!(
+                        chunked.contains(&b),
+                        "the chunk of block {b} of held file {f} was deleted"
+                    );
+                }
+            }
         }
     }
 
@@ -954,31 +1333,59 @@ impl World {
             self.advance(g);
             self.check();
         }
+        // Stopped sweeps' requests arrive, late.
+        while let Some(request) = self.late_sweeps.pop() {
+            self.serve(request).unwrap();
+            self.check();
+        }
         self.clock += 10 * HANDOVER;
         for _ in 0..10_000 {
             let quiet = self.unsettled().is_empty()
-                && self.sweep.is_none()
+                && self.sweeps.iter().all(Option::is_none)
+                && self.sent.iter().all(Option::is_none)
                 && self.unsettled_blocks().is_empty()
                 && self.block_sweep.is_none();
             if quiet {
                 break;
             }
             self.clock += 10;
-            self.sweep_step();
-            self.block_sweep_step();
+            // A sweep in flight goes on; a new one starts only while files wait.
+            for i in 0..2 {
+                let busy = self.sweeps[i].is_some() || self.sent[i].is_some();
+                if busy || !self.unsettled().is_empty() {
+                    self.sweep_step(i);
+                }
+            }
+            if self.block_sweep.is_some() || !self.unsettled_blocks().is_empty() {
+                self.block_sweep_step();
+            }
             self.check();
+        }
+        // The collector takes every released file apart, each checked once it is done: the
+        // steps between were checked as they came during the schedule.
+        for _ in 0..100_000 {
+            if self.collector.is_none() && self.released().is_empty() {
+                break;
+            }
+            let before = self.reclaimed.len();
+            self.collect_step();
+            if self.reclaimed.len() != before {
+                self.check();
+            }
         }
         assert!(self.unsettled().is_empty(), "files left unsettled");
         assert!(self.unsettled_blocks().is_empty(), "blocks left unsettled");
-        let (referenced, released) = (self.referenced(), self.released());
+        assert!(self.released().is_empty(), "files left released");
+        let referenced = self.referenced();
         for f in &self.written {
             assert!(
-                referenced.contains(f) != released.contains(f),
-                "file {f}: referenced {}, released {}",
+                referenced.contains(f) != self.reclaimed.contains(f),
+                "file {f}: referenced {}, reclaimed {}",
                 referenced.contains(f),
-                released.contains(f)
+                self.reclaimed.contains(f)
             );
         }
+        let released = self.released();
         let stray: Vec<u128> = self
             .marked()
             .into_iter()
@@ -1047,14 +1454,15 @@ fn what_stopped_gateways_left_is_released_and_late_steps_refused() {
     w.act(&Action::Write { key: 2 });
     let late = w.gateways.pop().unwrap();
     w.act(&Action::Crash(0));
-    // Before the deadlines the sweeps find nothing due.
-    w.act(&Action::Sweep);
+    // Before the deadlines the sweeps find nothing due: a request sent, and its answer.
     w.act(&Action::BlockSweep);
-    assert!(w.sweep.is_none() && w.block_sweep.is_none());
+    w.act(&Action::Sweep(0));
+    w.act(&Action::Sweep(0));
+    assert!(w.sweeps[0].is_none() && w.block_sweep.is_none());
     w.act(&Action::Wait);
     w.act(&Action::Wait);
-    for _ in 0..12 {
-        w.act(&Action::Sweep);
+    for _ in 0..24 {
+        w.act(&Action::Sweep(0));
         w.act(&Action::BlockSweep);
         w.check();
     }
@@ -1105,4 +1513,42 @@ fn a_renewal_keeps_a_block_unless_the_sweep_released_it_first() {
     w.check();
     w.finish();
     assert!(w.recorded().is_empty());
+}
+
+/// Two sweeps read the same page. The first finds the file taken, settles it and is done;
+/// the second, delayed, asks after that. The file a version references stays held
+/// (audit B01).
+#[test]
+fn a_delayed_sweep_never_releases_a_file_another_settled() {
+    let mut w = World::new();
+    w.act(&Action::Write { key: 0 });
+    w.act(&Action::Advance(0));
+    w.act(&Action::Advance(0));
+    assert_eq!(w.referenced().len(), 1);
+    w.act(&Action::Wait);
+    w.act(&Action::Wait);
+    let mut first = Sweep::new(PAGE);
+    let mut second = Sweep::new(PAGE);
+    for sweep in [&mut first, &mut second] {
+        let read = sweep.next().unwrap();
+        let answer = w.serve(read).unwrap();
+        sweep.answer(answer).unwrap();
+    }
+    while let Some(request) = first.next() {
+        let answer = w.serve(request).unwrap();
+        first.answer(answer).unwrap();
+        if first.is_done() {
+            break;
+        }
+    }
+    while let Some(request) = second.next() {
+        let answer = w.serve(request).unwrap();
+        second.answer(answer).unwrap();
+        w.check();
+        if second.is_done() {
+            break;
+        }
+    }
+    w.check();
+    w.finish();
 }

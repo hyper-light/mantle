@@ -1,12 +1,13 @@
 //! Reclaiming a file the Name layer released (docs/design/metadata.md §2): each block's chunks
-//! from their volumes, then the block's rows, an adopted part's file the same way, then the
-//! file's rows, then any mark a sweep that stopped left on it, wherever its key now is, and
-//! last its row in the Name range's queue.
+//! from their volumes, then the block's rows; each part file it names given back to the Name
+//! range, which releases it only if this file adopted it; then the file's rows, then its mark,
+//! wherever its key now is, and last its row in the Name range's queue.
 //!
 //! A [`Reclaimer`] names its next [`Request`] and moves on with the [`Answer`], doing no I/O
 //! itself, as the coordinator does. Every step can be repeated: a chunk or a row already gone
-//! stays gone, and a file already removed reads as one with no extents. So a collector that
-//! stops part way starts again from the queue row, which goes last.
+//! stays gone, a part given back twice is released once, and a file already removed reads as
+//! one with no extents. So a collector that stops part way starts again from the queue row,
+//! which goes last.
 
 use std::collections::VecDeque;
 
@@ -27,6 +28,11 @@ pub enum Request {
     BlockCommand(block::Command),
     /// A command to the File range that holds the file.
     FileCommand(file::Command),
+    /// Giving back a part file the released file names, as `name::Command::Disown`, at the
+    /// Name range that holds its key now. A part only its adopter gives back: a composite that
+    /// lost its completion, or was written again for a retry, names parts it never adopted,
+    /// which the upload or another composite holds (audit B02).
+    Disown(name::Disown),
     /// Removing the file's mark, as `name::Command::Unmark`, at the Name range that holds its
     /// key now.
     Unmark(name::Unmark),
@@ -53,42 +59,18 @@ pub enum ReclaimError {
     Mismatch,
     #[error("an answer the reclaimer's step cannot have")]
     Unexpected,
-    /// An adopted part's file names another file: a part is written as blocks.
-    #[error("a part's file holds another file")]
-    Nested,
-}
-
-/// A file being taken apart: where its next extents start, and those read but not yet
-/// reclaimed.
-#[derive(Debug, Clone)]
-struct Frame {
-    file: u128,
-    from: u64,
-    /// The last read found the file's end.
-    ended: bool,
-    pending: VecDeque<Extent>,
-}
-
-impl Frame {
-    fn new(file: u128) -> Self {
-        Self {
-            file,
-            from: 0,
-            ended: false,
-            pending: VecDeque::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Phase {
-    /// Reading the top file's next extents, or moving on to its next pending one.
+    /// Reading the file's next extents, or moving on to its next pending one.
     Next,
     ReadBlock(u128),
     /// Deleting the block's chunks, the next one first.
     Chunks(u128),
     DeleteBlock(u128),
-    DeleteFile(u128),
+    Disown(u128),
+    DeleteFile,
     Unmark,
     Reclaim,
     Done,
@@ -98,10 +80,13 @@ enum Phase {
 #[derive(Debug, Clone)]
 pub struct Reclaimer {
     released_ns: u64,
-    root: u128,
+    file: u128,
     holder: Holder,
-    /// The released file, then the adopted part being taken apart: at most two.
-    frames: Vec<Frame>,
+    /// Where the file's next extents start, and whether the last read found its end.
+    from: u64,
+    ended: bool,
+    /// Extents read but not yet reclaimed.
+    pending: VecDeque<Extent>,
     chunks: Vec<ChunkPlace>,
     /// Extents one read returns at most, which bounds what the reclaimer holds.
     budget: usize,
@@ -113,9 +98,11 @@ impl Reclaimer {
     pub fn new(released: name::Released, budget: usize) -> Self {
         Self {
             released_ns: released.released_ns,
-            root: released.file,
+            file: released.file,
             holder: released.holder,
-            frames: vec![Frame::new(released.file)],
+            from: 0,
+            ended: false,
+            pending: VecDeque::new(),
             chunks: Vec::new(),
             budget: budget.max(1),
             phase: Phase::Next,
@@ -129,30 +116,35 @@ impl Reclaimer {
     /// The request to send next; `None` once the file is reclaimed.
     pub fn next(&self) -> Option<Request> {
         Some(match &self.phase {
-            Phase::Next => {
-                let frame = self.frames.last()?;
-                Request::Extents {
-                    file: frame.file,
-                    from: frame.from,
-                    max: self.budget,
-                }
-            }
+            Phase::Next => Request::Extents {
+                file: self.file,
+                from: self.from,
+                max: self.budget,
+            },
             Phase::ReadBlock(block) => Request::Block(*block),
             Phase::Chunks(_) => Request::Chunk(*self.chunks.last()?),
             Phase::DeleteBlock(block) => {
                 Request::BlockCommand(block::Command::Delete { block: *block })
             }
-            Phase::DeleteFile(file) => Request::FileCommand(file::Command::Delete { file: *file }),
+            Phase::Disown(part) => Request::Disown(name::Disown {
+                bucket: self.holder.bucket.clone(),
+                key: self.holder.key.clone(),
+                file: *part,
+                owner: self.file,
+                // The entry that carries a command gives it its time.
+                at_ns: 0,
+            }),
+            Phase::DeleteFile => Request::FileCommand(file::Command::Delete { file: self.file }),
             Phase::Unmark => Request::Unmark(name::Unmark {
                 files: vec![name::Marked {
                     bucket: self.holder.bucket.clone(),
                     key: self.holder.key.clone(),
-                    file: self.root,
+                    file: self.file,
                 }],
             }),
             Phase::Reclaim => Request::Reclaim(name::Reclaim {
                 released_ns: self.released_ns,
-                file: self.root,
+                file: self.file,
             }),
             Phase::Done => return None,
         })
@@ -162,20 +154,19 @@ impl Reclaimer {
     pub fn step(&mut self, answer: Answer) -> Result<(), ReclaimError> {
         match (&self.phase, answer) {
             (Phase::Next, Answer::Extents(extents)) => {
-                let frame = self.frames.last_mut().ok_or(ReclaimError::Unexpected)?;
                 match extents.last() {
-                    None => frame.ended = true,
+                    None => self.ended = true,
                     Some(&(start, last)) => {
-                        frame.from = start
+                        self.from = start
                             .checked_add(last.length)
                             .ok_or(ReclaimError::Unexpected)?;
-                        frame.ended = extents.len() < self.budget;
+                        self.ended = extents.len() < self.budget;
                     }
                 }
-                frame
-                    .pending
+                self.pending
                     .extend(extents.into_iter().map(|(_, extent)| extent));
-                self.advance()
+                self.advance();
+                Ok(())
             }
             (Phase::ReadBlock(block), Answer::Block(read)) => {
                 let block = *block;
@@ -189,9 +180,9 @@ impl Reclaimer {
                         } else {
                             Phase::Chunks(block)
                         };
-                        Ok(())
                     }
                 }
+                Ok(())
             }
             (Phase::Chunks(block), Answer::Chunk) => {
                 let block = *block;
@@ -202,18 +193,24 @@ impl Reclaimer {
                 Ok(())
             }
             (Phase::DeleteBlock(_), Answer::BlockOutcome(outcome)) => match outcome {
-                block::Outcome::Deleted => self.advance(),
+                block::Outcome::Deleted => {
+                    self.advance();
+                    Ok(())
+                }
                 _ => Err(ReclaimError::Unexpected),
             },
-            (Phase::DeleteFile(_), Answer::FileOutcome(outcome)) => match outcome {
+            (Phase::Disown(_), Answer::NameOutcome(outcome)) => match outcome {
+                // Released for its own reclaiming, or held by another: either way done here.
+                name::Outcome::Disowned { .. } => {
+                    self.advance();
+                    Ok(())
+                }
+                _ => Err(ReclaimError::Unexpected),
+            },
+            (Phase::DeleteFile, Answer::FileOutcome(outcome)) => match outcome {
                 file::Outcome::Deleted => {
-                    self.frames.pop();
-                    if self.frames.is_empty() {
-                        self.phase = Phase::Unmark;
-                        Ok(())
-                    } else {
-                        self.advance()
-                    }
+                    self.phase = Phase::Unmark;
+                    Ok(())
                 }
                 _ => Err(ReclaimError::Unexpected),
             },
@@ -235,12 +232,10 @@ impl Reclaimer {
         }
     }
 
-    /// Takes the top file's next pending extent, reads its next ones, or, once it has none
-    /// left, removes it.
-    fn advance(&mut self) -> Result<(), ReclaimError> {
-        let depth = self.frames.len();
-        let frame = self.frames.last_mut().ok_or(ReclaimError::Unexpected)?;
-        self.phase = match frame.pending.pop_front() {
+    /// Takes the file's next pending extent, reads its next ones, or, once it has none left,
+    /// removes it.
+    fn advance(&mut self) {
+        self.phase = match self.pending.pop_front() {
             Some(Extent {
                 target: Target::Block(block),
                 ..
@@ -248,17 +243,10 @@ impl Reclaimer {
             Some(Extent {
                 target: Target::File(part),
                 ..
-            }) => {
-                if depth > 1 {
-                    return Err(ReclaimError::Nested);
-                }
-                self.frames.push(Frame::new(part));
-                Phase::Next
-            }
-            None if frame.ended => Phase::DeleteFile(frame.file),
+            }) => Phase::Disown(part),
+            None if self.ended => Phase::DeleteFile,
             None => Phase::Next,
         };
-        Ok(())
     }
 }
 
@@ -393,6 +381,9 @@ mod tests {
                     let index = self.tick();
                     Answer::FileOutcome(file::apply(&mut self.files, index, &command).unwrap())
                 }
+                Request::Disown(disown) => {
+                    Answer::NameOutcome(self.run_name(&Command::Disown(disown)))
+                }
                 Request::Unmark(unmark) => {
                     Answer::NameOutcome(self.run_name(&Command::Unmark(unmark)))
                 }
@@ -444,51 +435,45 @@ mod tests {
     }
 
     /// A completed upload's file of two part files, each of blocks, and a plain object beside
-    /// it: removing the upload's version releases its file, and reclaiming it removes its
-    /// parts, their blocks and chunks, and the queue row, and nothing of the other object.
+    /// it: removing the upload's version releases its file, and reclaiming it gives back its
+    /// parts, reclaimed in turn to their blocks and chunks, and nothing of the other object.
     #[test]
     fn a_released_upload_is_reclaimed_to_its_chunks() {
         let mut cell = Cell::new();
-        cell.block(11, 3);
-        cell.block(12, 2);
-        cell.block(21, 3);
-        cell.file(100, &[Target::Block(11), Target::Block(12)]);
-        cell.file(200, &[Target::Block(21)]);
-        cell.file(300, &[Target::File(100), Target::File(200)]);
+        let upload = upload(&mut cell, 300);
+        assert!(matches!(
+            complete(&mut cell, &upload, 300, None),
+            Outcome::Put { .. }
+        ));
         cell.block(41, 2);
         cell.file(400, &[Target::Block(41)]);
-        for (key, file) in [("upload", 300), ("other", 400)] {
-            let outcome = cell.run_name(&Command::Put(Put {
-                bucket: "b".into(),
-                incarnation: 1,
-                key: key.into(),
-                versioning: Versioning::Unversioned,
-                preconditions: name::Preconditions::default(),
-                at_ns: 1,
-                ordered_ns: None,
-                version: object(file),
-                default: None,
-                deadline_ns: u64::MAX,
-            }));
-            assert!(matches!(outcome, Outcome::Put { .. }));
-        }
+        let outcome = cell.run_name(&Command::Put(Put {
+            bucket: "b".into(),
+            incarnation: 1,
+            key: "other".into(),
+            versioning: Versioning::Unversioned,
+            preconditions: name::Preconditions::default(),
+            at_ns: 4,
+            ordered_ns: None,
+            version: object(400),
+            default: None,
+            deadline_ns: u64::MAX,
+        }));
+        assert!(matches!(outcome, Outcome::Put { .. }));
         cell.run_name(&Command::Delete(Delete {
             bucket: "b".into(),
             incarnation: 1,
-            key: "upload".into(),
+            key: "k".into(),
             versioning: Versioning::Unversioned,
             named: Some(Named::Null),
             if_match: None,
-            at_ns: 2,
+            at_ns: 5,
             bypass: false,
         }));
-        let mut queue = name::released(&cell.name, u64::MAX, 10).unwrap();
+        let queue = name::released(&cell.name, u64::MAX, 10).unwrap();
         assert_eq!(queue.len(), 1);
-        let released = queue.remove(0);
-        assert_eq!(released.file, 300);
-        let mut reclaimer = Reclaimer::new(released, 1);
-        assert!(cell.drive(&mut reclaimer, 1_000));
-        assert_eq!(name::released(&cell.name, u64::MAX, 10).unwrap(), []);
+        assert_eq!(queue[0].file, 300);
+        reclaim_all(&mut cell);
         for gone in [100, 200, 300] {
             assert_eq!(file::header(&cell.files, gone).unwrap(), None);
         }
@@ -501,6 +486,193 @@ mod tests {
         assert!(block::read(&cell.blocks, 41).unwrap().is_some());
         assert!(file::header(&cell.files, 400).unwrap().is_some());
         assert!(Cell::rows(&cell.blocks) > 0);
+        // No mark is left on a file reclaimed.
+        let (mut from, to) = crate::key::marks_span("b");
+        while let Some((k, _)) = crate::engine::Rows::next(&cell.name, &from, &to).unwrap() {
+            let (_, _, file) = crate::key::decode_mark(&k).unwrap();
+            assert_eq!(file, 400, "a mark left on file {file}");
+            from = k;
+            from.push(0);
+        }
+    }
+
+    /// An upload of two parts, each a file of blocks: part 1 of blocks 11 and 12, part 2 of
+    /// block 21, and a composite `composite` of both written for its completion.
+    fn upload(cell: &mut Cell, composite: u128) -> String {
+        cell.block(11, 3);
+        cell.block(12, 2);
+        cell.block(21, 3);
+        cell.file(100, &[Target::Block(11), Target::Block(12)]);
+        cell.file(200, &[Target::Block(21)]);
+        cell.file(composite, &[Target::File(100), Target::File(200)]);
+        let created = cell.run_name(&Command::CreateUpload(name::CreateUpload {
+            bucket: "b".into(),
+            incarnation: 1,
+            key: "k".into(),
+            at_ns: 1,
+            upload: crate::record::Upload {
+                initiated_ns: 0,
+                owner: "o".into(),
+                headers: Vec::new(),
+                checksum: None,
+                retention: None,
+                legal_hold: None,
+            },
+        }));
+        let Outcome::Created { upload } = created else {
+            panic!("{created:?}")
+        };
+        for (number, file, size) in [(1, 100, name::MIN_PART), (2, 200, 1)] {
+            let outcome = cell.run_name(&Command::PutPart(name::PutPart {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: "k".into(),
+                upload: upload.clone(),
+                number,
+                part: crate::record::Part {
+                    etag: format!("p{number}"),
+                    size,
+                    checksum: None,
+                    file,
+                    modified_ns: 0,
+                },
+                at_ns: 2,
+                deadline_ns: u64::MAX,
+            }));
+            assert_eq!(outcome, Outcome::PartWritten);
+        }
+        upload
+    }
+
+    fn complete(cell: &mut Cell, upload: &str, file: u128, if_match: Option<&str>) -> Outcome {
+        cell.run_name(&Command::Complete(name::Complete {
+            bucket: "b".into(),
+            incarnation: 1,
+            key: "k".into(),
+            upload: upload.into(),
+            versioning: Versioning::Unversioned,
+            preconditions: name::Preconditions {
+                if_match: if_match.map(|t| name::Match::Tags(vec![t.into()])),
+                if_none_match: None,
+            },
+            at_ns: 3,
+            parts: vec![
+                name::Listed {
+                    number: 1,
+                    etag: "p1".into(),
+                    file: 100,
+                },
+                name::Listed {
+                    number: 2,
+                    etag: "p2".into(),
+                    file: 200,
+                },
+            ],
+            etag: "m-2".into(),
+            size: name::MIN_PART + 1,
+            checksum: None,
+            file: Some(file),
+            default: None,
+            deadline_ns: u64::MAX,
+        }))
+    }
+
+    /// Reclaims every file the Name range has released, each to its end.
+    fn reclaim_all(cell: &mut Cell) {
+        for _ in 0..10 {
+            let queue = name::released(&cell.name, u64::MAX, 10).unwrap();
+            if queue.is_empty() {
+                return;
+            }
+            for released in queue {
+                let mut reclaimer = Reclaimer::new(released, 2);
+                assert!(cell.drive(&mut reclaimer, 1_000));
+            }
+        }
+        panic!("the queue never emptied");
+    }
+
+    /// The part files, their blocks and their chunks are all still held.
+    fn parts_held(cell: &Cell) -> bool {
+        [100, 200]
+            .iter()
+            .all(|&f| file::header(&cell.files, f).unwrap().is_some())
+            && [11, 12, 21]
+                .iter()
+                .all(|&b| block::read(&cell.blocks, b).unwrap().is_some())
+            && cell.chunks.len() == 8
+    }
+
+    /// A completion refused, here by its precondition, releases the composite written for
+    /// it; reclaiming that takes nothing of the parts, which the upload still holds, and
+    /// which an abort then releases (audit B02).
+    #[test]
+    fn a_refused_completion_reclaims_none_of_its_parts() {
+        let mut cell = Cell::new();
+        let upload = upload(&mut cell, 300);
+        assert_eq!(
+            complete(&mut cell, &upload, 300, Some("nope")),
+            Outcome::NoSuchKey
+        );
+        reclaim_all(&mut cell);
+        assert_eq!(file::header(&cell.files, 300).unwrap(), None);
+        assert!(parts_held(&cell), "the upload's parts were taken apart");
+        assert_eq!(
+            name::parts(&cell.name, "b", "k", &upload, 0, 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        let aborted = cell.run_name(&Command::Abort(name::Abort {
+            bucket: "b".into(),
+            incarnation: 1,
+            key: "k".into(),
+            upload: upload.clone(),
+            at_ns: 4,
+        }));
+        assert_eq!(aborted, Outcome::Aborted);
+        reclaim_all(&mut cell);
+        assert!(cell.chunks.is_empty());
+    }
+
+    /// A completion retried after it committed, with a composite made again, releases the
+    /// second composite; reclaiming it takes nothing of the parts, which the first holds. The
+    /// object's removal then releases the first, and its parts with it (audit B02).
+    #[test]
+    fn a_retried_completion_reclaims_none_of_the_committed_parts() {
+        let mut cell = Cell::new();
+        let upload = upload(&mut cell, 300);
+        assert!(matches!(
+            complete(&mut cell, &upload, 300, None),
+            Outcome::Put { .. }
+        ));
+        cell.file(301, &[Target::File(100), Target::File(200)]);
+        assert!(matches!(
+            complete(&mut cell, &upload, 301, None),
+            Outcome::Put { .. }
+        ));
+        reclaim_all(&mut cell);
+        assert_eq!(file::header(&cell.files, 301).unwrap(), None);
+        assert!(file::header(&cell.files, 300).unwrap().is_some());
+        assert!(
+            parts_held(&cell),
+            "the committed object's parts were taken apart"
+        );
+        cell.run_name(&Command::Delete(Delete {
+            bucket: "b".into(),
+            incarnation: 1,
+            key: "k".into(),
+            versioning: Versioning::Unversioned,
+            named: Some(Named::Null),
+            if_match: None,
+            at_ns: 5,
+            bypass: false,
+        }));
+        reclaim_all(&mut cell);
+        assert!(cell.chunks.is_empty());
+        for gone in [100, 200, 300] {
+            assert_eq!(file::header(&cell.files, gone).unwrap(), None);
+        }
     }
 
     #[test]
@@ -526,16 +698,20 @@ mod tests {
                 },
             )]))
             .unwrap();
-        // The adopted part holds a file: parts are written as blocks.
+        // A part file is given back to the Name range, named for the file that holds it.
         assert_eq!(
-            reclaimer.step(Answer::Extents(vec![(
-                0,
-                Extent {
-                    length: 1,
-                    target: Target::File(7),
-                },
-            )])),
-            Err(ReclaimError::Nested)
+            reclaimer.next(),
+            Some(Request::Disown(name::Disown {
+                bucket: "b".into(),
+                key: "k".into(),
+                file: 6,
+                owner: 5,
+                at_ns: 0,
+            }))
+        );
+        assert_eq!(
+            reclaimer.step(Answer::NameOutcome(Outcome::Reclaimed)),
+            Err(ReclaimError::Unexpected)
         );
     }
 
@@ -547,12 +723,30 @@ mod tests {
         fn a_reclaimer_stopped_anywhere_resumes_from_the_queue(
             parts in proptest::collection::vec(proptest::collection::vec(1u8..4, 1..4), 1..4),
             budget in 1usize..4,
-            stops in proptest::collection::vec(0usize..12, 0..6),
+            stops in proptest::collection::vec(0usize..12, 0..12),
         ) {
             let mut cell = Cell::new();
+            let created = cell.run_name(&Command::CreateUpload(name::CreateUpload {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: "k".into(),
+                at_ns: 1,
+                upload: crate::record::Upload {
+                    initiated_ns: 0,
+                    owner: "o".into(),
+                    headers: Vec::new(),
+                    checksum: None,
+                    retention: None,
+                    legal_hold: None,
+                },
+            }));
+            let Outcome::Created { upload } = created else {
+                panic!("{created:?}")
+            };
             let mut next = 10u128;
+            let mut listed = Vec::new();
             let mut part_files = Vec::new();
-            for widths in &parts {
+            for (i, widths) in parts.iter().enumerate() {
                 let mut targets = Vec::new();
                 for &width in widths {
                     next += 1;
@@ -562,22 +756,51 @@ mod tests {
                 next += 1;
                 cell.file(next, &targets);
                 part_files.push(Target::File(next));
+                let number = u16::try_from(i + 1).unwrap();
+                let outcome = cell.run_name(&Command::PutPart(name::PutPart {
+                    bucket: "b".into(),
+                    incarnation: 1,
+                    key: "k".into(),
+                    upload: upload.clone(),
+                    number,
+                    part: crate::record::Part {
+                        etag: format!("p{number}"),
+                        size: name::MIN_PART,
+                        checksum: None,
+                        file: next,
+                        modified_ns: 0,
+                    },
+                    at_ns: 2,
+                    deadline_ns: u64::MAX,
+                }));
+                prop_assert_eq!(outcome, Outcome::PartWritten);
+                listed.push(name::Listed {
+                    number,
+                    etag: format!("p{number}"),
+                    file: next,
+                });
             }
             next += 1;
             let root = next;
             cell.file(root, &part_files);
-            cell.run_name(&Command::Put(Put {
+            let completed = cell.run_name(&Command::Complete(name::Complete {
                 bucket: "b".into(),
                 incarnation: 1,
                 key: "k".into(),
+                upload,
                 versioning: Versioning::Unversioned,
                 preconditions: name::Preconditions::default(),
-                at_ns: 1,
-                ordered_ns: None,
-                version: object(root),
+                at_ns: 3,
+                parts: listed,
+                etag: "m".into(),
+                size: name::MIN_PART,
+                checksum: None,
+                file: Some(root),
                 default: None,
                 deadline_ns: u64::MAX,
             }));
+            let committed = matches!(completed, Outcome::Put { .. });
+            prop_assert!(committed, "{:?}", completed);
             cell.run_name(&Command::Delete(Delete {
                 bucket: "b".into(),
                 incarnation: 1,
@@ -585,22 +808,20 @@ mod tests {
                 versioning: Versioning::Unversioned,
                 named: None,
                 if_match: None,
-                at_ns: 2,
+                at_ns: 4,
                 bypass: false,
             }));
+            // Each stop takes the oldest file released and drops its reclaimer after that
+            // many steps; the next starts again from the queue.
             for &stop in &stops {
-                let mut queue = name::released(&cell.name, u64::MAX, 2).unwrap();
-                if queue.len() != 1 {
+                let mut queue = name::released(&cell.name, u64::MAX, 1).unwrap();
+                if queue.is_empty() {
                     break;
                 }
                 let mut reclaimer = Reclaimer::new(queue.remove(0), budget);
                 cell.drive(&mut reclaimer, stop);
             }
-            let mut queue = name::released(&cell.name, u64::MAX, 2).unwrap();
-            if queue.len() == 1 {
-                let mut reclaimer = Reclaimer::new(queue.remove(0), budget);
-                prop_assert!(cell.drive(&mut reclaimer, 10_000));
-            }
+            reclaim_all(&mut cell);
             prop_assert_eq!(name::released(&cell.name, u64::MAX, 2).unwrap(), vec![]);
             prop_assert!(cell.chunks.is_empty());
             prop_assert_eq!(Cell::rows(&cell.files), 0);

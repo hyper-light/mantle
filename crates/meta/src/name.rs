@@ -75,6 +75,7 @@ pub enum Command {
     Reclaim(Reclaim),
     Check(Check),
     Unmark(Unmark),
+    Disown(Disown),
     Split(Split),
     Freeze(Freeze),
     /// Applied by [`merge`], which reads the frozen range's rows; [`apply`] refuses it.
@@ -103,6 +104,7 @@ impl Command {
             Self::Hold(c) => away(&c.bucket, &c.key),
             Self::Check(c) => c.files.iter().any(|f| away(&f.bucket, &f.key)),
             Self::Unmark(u) => u.files.iter().any(|m| away(&m.bucket, &m.key)),
+            Self::Disown(d) => away(&d.bucket, &d.key),
             Self::Gate(g) => g.generation != now.generation,
             Self::Collect(c) => c.generation != now.generation,
             Self::Split(s) => s.generation != now.generation,
@@ -129,6 +131,7 @@ impl Command {
             | Self::Reclaim(_)
             | Self::Check(_)
             | Self::Unmark(_)
+            | Self::Disown(_)
             | Self::Split(_)
             | Self::Freeze(_)
             | Self::Merge(_)
@@ -414,10 +417,24 @@ pub struct Checked {
     pub deadline_ns: u64,
 }
 
-/// These files are settled in their File range, or reclaimed: their marks go.
+/// These files are reclaimed: their marks go. Only the collector removes a mark, for a
+/// file it took apart, which nothing references again; a mark the sweep removed on settling
+/// a file would read, to a sweep delayed past it, as a file never handed over (audit B01).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unmark {
     pub files: Vec<Marked>,
+}
+
+/// The collector, reclaiming released composite file `owner`, gives back a part file it
+/// names: released here if `owner` adopted it when its completion committed, and left
+/// otherwise, since the upload or another composite holds it (audit B02).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Disown {
+    pub bucket: String,
+    pub key: String,
+    pub file: u128,
+    pub owner: u128,
+    pub at_ns: u64,
 }
 
 /// A file's mark: the key it is under.
@@ -545,6 +562,8 @@ pub enum Outcome {
     Checked(Vec<Verdict>),
     /// The marks of settled files went.
     Unmarked,
+    /// A part file given back: `released` if the composite adopted it and it is released now.
+    Disowned { released: bool },
     /// The command was routed by a descriptor the range no longer matches: it took nothing,
     /// and this is where its span went.
     Moved(Box<Lineage>),
@@ -617,6 +636,7 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
                 .map(|m| Write::Delete(key::mark(&m.bucket, &m.key, m.file)))
                 .collect(),
         ),
+        Command::Disown(d) => disown(engine, d)?,
         Command::Split(s) => split(engine, s)?,
         Command::Freeze(f) => freeze(&lineage, f)?,
         Command::Abandon(_) => refuse(lineage.clone())?,
@@ -1476,14 +1496,41 @@ fn complete<E: Rows>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), 
     )?;
     if matches!(outcome, Outcome::Put { .. }) {
         // Parts not listed are discarded with the upload (05 §4.4); those listed are now the
-        // object's file's extents.
+        // object's file's extents, adopted by it: their marks name it, so reclaiming it gives
+        // them back, and reclaiming any other composite of them does not (audit B02). With no
+        // file to adopt them, nothing references them.
         let listed: Vec<u16> = c.parts.iter().map(|p| p.number).collect();
         let now = clock::now(engine, c.at_ns)?;
         writes.extend(remove_upload(
             engine, &c.bucket, &c.key, &c.upload, &listed, now,
         )?);
+        for part in &c.parts {
+            match c.file {
+                Some(by) => writes.push(Write::Put(
+                    key::mark(&c.bucket, &c.key, part.file),
+                    crate::record::Adopted { by }.encode(),
+                )),
+                None => writes.extend(release(now, &c.bucket, &c.key, part.file)?),
+            }
+        }
     }
     Ok((outcome, writes))
+}
+
+/// Releases part file `d.file` if composite `d.owner` adopted it: its mark names `d.owner`.
+fn disown<E: Rows>(engine: &E, d: &Disown) -> Result<(Outcome, Vec<Write>), MetaError> {
+    let mark = key::mark(&d.bucket, &d.key, d.file);
+    let adopted = match engine.get(&mark)? {
+        Some(value) => crate::record::Adopted::of(&value)?,
+        None => None,
+    };
+    if adopted.is_none_or(|a| a.by != d.owner) {
+        return Ok((Outcome::Disowned { released: false }, Vec::new()));
+    }
+    let (now, clock) = clock::tick(engine, d.at_ns)?;
+    let mut writes = vec![clock];
+    writes.extend(release(now, &d.bucket, &d.key, d.file)?);
+    Ok((Outcome::Disowned { released: true }, writes))
 }
 
 fn retain<E: Rows>(engine: &E, r: &Retain) -> Result<(Outcome, Vec<Write>), MetaError> {
@@ -1617,7 +1664,9 @@ fn remove_upload<E: Rows>(
         let Some((_, _, NameRow::Part(_, number))) = key::decode_name(&k) else {
             return Err(MetaError::Corrupt);
         };
-        if !kept.contains(&number) {
+        // `kept` is in ascending order, as a completion's parts must be: a search, not a
+        // scan, keeps a completion of 10,000 parts linear in them (audit P02).
+        if kept.binary_search(&number).is_err() {
             writes.extend(release(now_ns, bucket, key, Part::decode(&v)?.file)?);
         }
         from = after(&k);

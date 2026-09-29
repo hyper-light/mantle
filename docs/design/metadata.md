@@ -145,15 +145,25 @@ layers removes them, as Tectonic's does [01 §1.6].
     removing any one release, or releasing a listed part, fails it.
     - *Reclaiming.* The collector takes the queue oldest first, once a file has been released
     longer than the grace period, and removes what it holds bottom up: each block's chunks
-    from their volumes, then the block's rows, then an adopted part's file, then the file,
-    then any mark a stopped sweep left on it, at the Name range that holds its key by then,
-    and last the queue row. A reclaimer (`crates/meta/src/reclaim.rs`) names each read and
+    from their volumes, then the block's rows; each part file it names given back to the Name
+    range, which releases the part for reclaiming in its turn only if this file adopted it
+    (below); then the file, then its mark, at the Name range that holds its key by then, and
+    last the queue row. A reclaimer (`crates/meta/src/reclaim.rs`) names each read and
     command and moves on with its answer, doing no I/O, as the coordinator does. Every step
-    can be repeated, since a chunk or row already gone stays gone and a removed file reads as
-    one with no extents, so a collector that stops is resumed from the queue. A property test
-    stops reclaimers after random steps over random files of parts and blocks, resumes them
-    from the queue, and checks that every row, block and chunk of the file goes and nothing
-    else does; dropping the queue row first fails it.
+    can be repeated, since a chunk or row already gone stays gone, a part given back twice is
+    released once, and a removed file reads as one with no extents, so a collector that stops
+    is resumed from the queue. A property test stops reclaimers after random steps over
+    uploads of random parts and blocks, resumes them from the queue, and checks that every
+    row, block and chunk of the object and its parts goes and nothing else does; dropping the
+    queue row first fails it.
+    - *Adoption.* A composite file names part files it does not own until its completion
+      commits: a completion refused, by a precondition or a stale or invalid part, leaves the
+      parts with the upload, and a completion retried after it committed writes a composite
+      again, whose parts the first holds. So the Name range records adoption: a committed
+      completion writes each listed part's mark naming the composite, and only that
+      composite's reclaimer can give the part back. A composite that lost its completion is
+      reclaimed to its own rows alone. Reclaiming it recursively took apart parts an upload or
+      a committed object still held (audit B02).
   - *When.* The grace period is a recovery-point policy, not a safety bound: three days by
     default, as GFS keeps a deleted file (chunk-store §8; 22 §1.1, §10.4). A released file
     comes due a grace after its release, in the range's clock, and the collector waits on the
@@ -190,16 +200,21 @@ layers removes them, as Tectonic's does [01 §1.6].
       contend for one Paxos slot (22 §7.4). Judged at the entry's proposed time without
       recording it, a handover from a lagging leader could take a file the check had just
       released.
-      The sweep then settles the files in the File range and removes their marks, in that
-      order: a mark removed first would read, to a sweep resumed after a stop, as a file never
-      handed over. Like the reclaimer, the sweep names each read and command and does no I/O,
-      and every step can be repeated.
-    - *What it costs.* A file handed over past its deadline is released unmarked, since it may
-      come after the sweep settled the file, and a mark would stay behind; a file whose mark
-      went with its release before the sweep came by is released again. Either way the file is
-      in the queue twice, and the reclaimer's second pass finds it gone. A mark left by a sweep
-      that stopped between settling a file and unmarking it goes when the file is released or
-      reclaimed, so every mark is on a file a version or part references or on one released.
+      The sweep then settles the files in the File range and leaves their marks. A mark is
+      the range's record that it holds the file, and goes only with the file, when the
+      collector reclaims it: removed on settling, it would read, to another sweep that read
+      the same file before and asks after, as a file never handed over, and that sweep would
+      release a file a version references. Two sweeps overlap across a change of leader or a
+      sweep that stops while its request is in flight, so the order of steps alone cannot
+      prevent this (audit B01). Like the reclaimer, the sweep names each read and command and
+      does no I/O, and every step can be repeated.
+    - *What it costs.* A mark is a row with no value, or with the adopting composite's ID,
+      for every file the range holds and every file it released and has not yet reclaimed. A
+      file handed over past its deadline is released unmarked, since it may come after the
+      sweep settled the file; a file whose mark went with its release before the sweep came by
+      is released again. Either way the file is in the queue twice, and the reclaimer's second
+      pass finds it gone. So every mark is on a file a version, a part or a held composite
+      names, or on one released and waiting for the collector.
     - *The deadline's length* is the gateway's measured handover time: the per-step deadline
       times its retry budget, plus the clock offset between ranges, as Ceph's 120 s and HDFS's
       60 s bound the same window (22 §10.2). It bounds how long a leftover file waits, not
@@ -225,24 +240,32 @@ layers removes them, as Tectonic's does [01 §1.6].
       in the queue last, with no grace period, since no reference ever reached it and there
       is no deletion by mistake to undo.
     - *Checked.* `crates/meta/tests/orphan_sweep.rs` runs 2,000 generated schedules across a
-      Block range, a File range and two Name ranges. Gateways write a chunk and its block,
-      renew it, then write the file, then hand it over, stopping at any stage or coming late
-      to the next;
-      deletes release files; both sweeps stop between any two steps; and leaders whose clocks
-      run behind propose entries at earlier times than entries already applied. After every
-      step, no file a version references is released, every file is referenced, released or
-      unsettled, and every block a file names keeps its rows and chunk. Once the faults stop,
-      nothing is left unsettled in either layer, every file is referenced or released and not
-      both, and no block or chunk is left that nothing names. With the Name range's deadline
-      check removed, the File range's, either check's recorded time, the release's deadline
-      check, or the refusal to renew a released block, the simulation loses a file or a
-      block's chunk.
+      Block range, a File range and Name ranges that split and merge. Gateways write a chunk
+      and its block, renew it, then write the file, then hand it over, stopping at any stage
+      or coming late to the next; uploaders create uploads, write parts, complete them, have
+      completions refused, retry completions that committed with a composite made again, and
+      abort; deletes release files; two file sweeps run at once, every request of theirs
+      delivered at some later step, and a sweep that stops has its request arrive after it;
+      the block sweep stops between any two steps; a collector reclaims released files and
+      stops part way; and leaders whose clocks run behind propose entries at earlier times
+      than entries already applied. After every step, no file a version, a part or a held
+      composite names is released, every such file keeps its rows, its blocks' rows and their
+      chunks, and every file written is held, released, unsettled, reclaimed or being given
+      back by a composite's reclaimer. Once the faults stop, nothing is left unsettled or
+      released, every file is held or reclaimed and not both, and no block, chunk or stray
+      mark is left. With the Name range's deadline check removed, the File range's, either
+      check's recorded time, the release's deadline check, the refusal to renew a released
+      block, the adoption check, or adoption itself, the simulation loses a file or a block's
+      chunk, or leaks one; `a_delayed_sweep_never_releases_a_file_another_settled` replays
+      audit B01's schedule.
 - **Multipart.** CreateMultipartUpload writes the upload row. UploadPart writes the part's
   chunks, blocks and file, then replaces the part row. CompleteMultipartUpload writes the
   object's file of part extents in its File range, then, in the Name range, checks the
   parts against the list sent (numbers ascending, ETags and checksums matching;
-  body.rs), commits the version, and removes the upload and its part rows. A retried
-  complete with the same parts finds the version it made and answers as before (05 §4.4).
+  body.rs), commits the version, removes the upload and its part rows, and marks each listed
+  part as adopted by the object's file (§2, "Adoption"). A retried complete with the same
+  parts finds the version it made and answers as before, releasing the composite it wrote
+  again (05 §4.4).
 - **Creating and deleting a bucket** touch the Bucket range and every Name range the
   bucket's keys fall in. Each is a sequence of range transactions, each guarded by what the
   one before it wrote, with the collector finishing what a failure leaves, as Tectonic moves

@@ -8,8 +8,10 @@
 //! and then: its time only moves forward, so a handover that comes after finds the deadline
 //! passed and is refused, and the check and the handover are ordered by the range's log, as
 //! Giza's no-op and a stalled put contend for one Paxos slot (22 §7.4). The sweep then settles
-//! the file in the File range and removes the range's mark, in that order: a mark removed first
-//! would read, to a sweep resumed after a stop, as a file never handed over.
+//! the file in the File range. It leaves the range's mark: a mark removed on settling would
+//! read, to another sweep that read the same file and asks after, as a file never handed over,
+//! and that sweep would release a file a version references (audit B01). A mark goes only with
+//! the file, when the collector reclaims it.
 //!
 //! A [`Sweep`] names its next [`Request`] and moves on with the [`Answer`], doing no I/O, as
 //! the coordinator and the reclaimer do. Every step can be repeated.
@@ -28,7 +30,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use crate::block;
 use crate::file::Unsettled;
-use crate::record::{BlockHeader, ChunkPlace, Referrer, Verdict};
+use crate::record::{BlockHeader, ChunkPlace, Verdict};
 
 /// A sweep's next request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,8 +43,6 @@ pub enum Request {
     Check(Vec<Unsettled>),
     /// `file::Command::Settle` for these files.
     Settle(Vec<u128>),
-    /// `name::Command::Unmark` for these files, each sent where its referrer's key falls.
-    Unmark(Vec<(Referrer, u128)>),
 }
 
 /// What a request answered.
@@ -51,7 +51,6 @@ pub enum Answer {
     Due(Vec<Unsettled>),
     Checked(Vec<Verdict>),
     Settled,
-    Unmarked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -66,8 +65,7 @@ pub enum SweepError {
 enum Phase {
     Read,
     Check(Vec<Unsettled>),
-    Settle(Vec<(Referrer, u128)>),
-    Unmark(Vec<(Referrer, u128)>),
+    Settle(Vec<u128>),
     Done,
 }
 
@@ -98,8 +96,7 @@ impl Sweep {
         Some(match &self.phase {
             Phase::Read => Request::Due { max: self.page },
             Phase::Check(files) => Request::Check(files.clone()),
-            Phase::Settle(decided) => Request::Settle(decided.iter().map(|(_, f)| *f).collect()),
-            Phase::Unmark(decided) => Request::Unmark(decided.clone()),
+            Phase::Settle(decided) => Request::Settle(decided.clone()),
             Phase::Done => return None,
         })
     }
@@ -114,11 +111,11 @@ impl Sweep {
                 if verdicts.len() != files.len() {
                     return Err(SweepError::Count);
                 }
-                let decided: Vec<(Referrer, u128)> = files
+                let decided: Vec<u128> = files
                     .iter()
                     .zip(&verdicts)
                     .filter(|(_, v)| **v != Verdict::Young)
-                    .map(|(u, _)| (u.referrer.clone(), u.file))
+                    .map(|(u, _)| u.file)
                     .collect();
                 if decided.is_empty() {
                     Phase::Done
@@ -126,8 +123,7 @@ impl Sweep {
                     Phase::Settle(decided)
                 }
             }
-            (Phase::Settle(decided), Answer::Settled) => Phase::Unmark(decided.clone()),
-            (Phase::Unmark(_), Answer::Unmarked) => Phase::Read,
+            (Phase::Settle(_), Answer::Settled) => Phase::Read,
             _ => return Err(SweepError::Mismatch),
         };
         self.phase = next;
@@ -407,6 +403,7 @@ fn next_orphan(orphans: VecDeque<(u128, u64)>) -> BlockPhase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::record::Referrer;
 
     fn unsettled(file: u128) -> Unsettled {
         Unsettled {
@@ -421,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn a_page_is_checked_then_settled_then_unmarked() {
+    fn a_page_is_checked_then_settled() {
         let mut s = Sweep::new(2);
         assert_eq!(s.next(), Some(Request::Due { max: 2 }));
         s.answer(Answer::Due(vec![unsettled(1), unsettled(2)]))
@@ -436,15 +433,13 @@ mod tests {
         );
         s.answer(Answer::Checked(vec![Verdict::Young, Verdict::Released]))
             .unwrap();
-        // Only the file decided is settled and unmarked; the young one waits.
+        // Only the file decided is settled; the young one waits.
         assert_eq!(s.next(), Some(Request::Settle(vec![2])));
-        assert_eq!(s.answer(Answer::Unmarked), Err(SweepError::Mismatch));
-        s.answer(Answer::Settled).unwrap();
         assert_eq!(
-            s.next(),
-            Some(Request::Unmark(vec![(unsettled(2).referrer, 2)]))
+            s.answer(Answer::Checked(Vec::new())),
+            Err(SweepError::Mismatch)
         );
-        s.answer(Answer::Unmarked).unwrap();
+        s.answer(Answer::Settled).unwrap();
         // The next page holds only the young file: the pass ends there.
         assert_eq!(s.next(), Some(Request::Due { max: 2 }));
         s.answer(Answer::Due(vec![unsettled(1)])).unwrap();

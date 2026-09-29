@@ -50,7 +50,9 @@ parameters are calculated from models and measurements rather than chosen
 a write queue of two batches that refuses with `Busy` beyond them; cleaning on a runway
 set by the measured write rate and cleaning time, with writes `Busy` while cleaning can
 still make room and `Full` once it cannot; and an index of where each live record lies,
-so cleaning and scrubbing never walk the whole index. Tested with
+so cleaning and scrubbing never walk the whole index. Where calibration finds a durable
+write into never-written space slower than one over written space, as ext4's extent
+journaling makes it, format writes the volume once before use. Tested with
 randomized workloads, cleaning included, cut by power loss at every point on the
 simulated device (20,000 runs per soak: no acknowledged write lost, no unverified byte
 returned) and with bit flips, read errors, damaged superblocks, damaged log frames and
@@ -65,7 +67,6 @@ be drained whole.
 
 Remaining before it is done:
 
-- Writing new file regions once before use where calibration measures a first-write penalty.
 - An I/O path that keeps the measured number of reads in flight.
 - `mantle bench chunk` measures puts and reads next to the same reads through the file
   layer ([measurements](measurements/2026-09-28-chunk-store-benchmark.md)). Remaining: each

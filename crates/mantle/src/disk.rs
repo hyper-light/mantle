@@ -200,6 +200,7 @@ fn report(out: &mut impl Write, c: &Calibration) -> std::io::Result<()> {
             display::size(c.durable_large)
         ),
     )?;
+    field(out, "first writes", &first_writes(c))?;
     if c.caching == Caching::Buffered {
         field(
             out,
@@ -208,6 +209,27 @@ fn report(out: &mut impl Write, c: &Calibration) -> std::io::Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// What a durable write into never-written space costs against one over written space, and
+/// what the chunk store does about it.
+pub(crate) fn first_writes(c: &Calibration) -> String {
+    let ratio = if c.first_write.ops_per_sec > 0.0 {
+        c.overwrite.ops_per_sec / c.first_write.ops_per_sec
+    } else {
+        f64::INFINITY
+    };
+    if c.first_write_penalty() {
+        format!(
+            "a durable write into new space takes {ratio:.1}x one over written space; \
+             volumes here are written once at format"
+        )
+    } else {
+        format!(
+            "a durable write into new space takes {ratio:.2}x one over written space, \
+             within the noise; volumes here are not pre-written"
+        )
+    }
 }
 
 #[cfg(test)]

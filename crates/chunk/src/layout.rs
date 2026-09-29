@@ -68,6 +68,11 @@ pub struct Config {
     /// (docs/research/03 §15.9).
     pub scrub_period: Option<std::time::Duration>,
     pub limits: Limits,
+    /// Write the whole volume once with zeros at format, before first use, so appends
+    /// overwrite written blocks: set where calibration measures a first-write penalty
+    /// (`mantle_disk::calibrate::Calibration::first_write_penalty`; docs/design/chunk-store.md
+    /// §2).
+    pub prewrite: bool,
 }
 
 impl Default for Config {
@@ -79,6 +84,7 @@ impl Default for Config {
             compact: false,
             scrub_period: Some(std::time::Duration::from_secs(7 * 24 * 3600)),
             limits: Limits::default(),
+            prewrite: false,
         }
     }
 }
@@ -174,6 +180,11 @@ impl Geometry {
             log_size,
             data_offset,
         })
+    }
+
+    /// The byte just past the last segment: the volume's extent.
+    pub fn end(&self) -> Option<u64> {
+        self.segment_offset(self.segments)
     }
 
     /// The byte offset of a segment.

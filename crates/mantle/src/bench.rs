@@ -160,6 +160,9 @@ pub fn chunk(out: &mut impl Write, path: &Path, options: &Options) -> Result<(),
         plan.workers.clone_from(&options.workers);
     }
     writeln!(out, "{}", path.display())?;
+    // The volume is formatted as mantle would format it here, which the device measurement
+    // decides; without one it is not pre-written.
+    let mut prewrite = false;
     if !options.skip_device {
         writeln!(out, "measuring the device (about 30 s)")?;
         out.flush()?;
@@ -171,8 +174,9 @@ pub fn chunk(out: &mut impl Write, path: &Path, options: &Options) -> Result<(),
         )
         .map_err(Error::Disk)?;
         report_device(out, &device)?;
+        prewrite = device.first_write_penalty();
     }
-    run(out, path, align, &plan)
+    run(out, path, align, &plan, prewrite)
 }
 
 pub(crate) fn report_device(out: &mut impl Write, c: &Calibration) -> std::io::Result<()> {
@@ -194,6 +198,7 @@ pub(crate) fn report_device(out: &mut impl Write, c: &Calibration) -> std::io::R
         display::rate(c.durable_sequential.bytes_per_sec),
         display::size(c.durable_large)
     )?;
+    writeln!(out, "  first writes   {}", crate::disk::first_writes(c))?;
     writeln!(
         out,
         "  throughput     {} read, {} write ({} transfers, no flush)",
@@ -215,7 +220,13 @@ pub(crate) fn report_device(out: &mut impl Write, c: &Calibration) -> std::io::R
     Ok(())
 }
 
-fn run(out: &mut impl Write, dir: &Path, align: Alignment, plan: &Plan) -> Result<(), Error> {
+fn run(
+    out: &mut impl Write,
+    dir: &Path,
+    align: Alignment,
+    plan: &Plan,
+    prewrite: bool,
+) -> Result<(), Error> {
     let path = dir.join(format!(".mantle-bench-{}", std::process::id()));
     let _scratch = Scratch(path.clone());
     let file =
@@ -233,6 +244,7 @@ fn run(out: &mut impl Write, dir: &Path, align: Alignment, plan: &Plan) -> Resul
             .unwrap_or(0)
             .max(1024),
         scrub_period: None,
+        prewrite,
         ..Config::default()
     };
     let v = Volume::format(file, volume, config).map_err(Error::Chunk)?;
@@ -241,8 +253,13 @@ fn run(out: &mut impl Write, dir: &Path, align: Alignment, plan: &Plan) -> Resul
     let span = v.data_span();
     writeln!(
         out,
-        "chunk store on a {} volume in a scratch file (removed afterwards)",
-        display::capacity(volume)
+        "chunk store on a {} volume in a scratch file (removed afterwards){}",
+        display::capacity(volume),
+        if prewrite {
+            ", written once at format"
+        } else {
+            ""
+        }
     )?;
     out.flush()?;
 
@@ -603,7 +620,7 @@ mod tests {
             step: Duration::from_millis(50),
         };
         let mut out = Vec::new();
-        run(&mut out, dir.path(), align, &plan).unwrap();
+        run(&mut out, dir.path(), align, &plan, false).unwrap();
         let text = String::from_utf8(out).unwrap();
         for name in [
             "first pass",

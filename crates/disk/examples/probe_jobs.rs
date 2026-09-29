@@ -28,6 +28,7 @@ fn main() {
             pattern,
             block,
             depth,
+            base: 0,
             span,
             budget: Duration::from_millis(ms),
             max_ops,

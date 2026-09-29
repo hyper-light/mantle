@@ -45,7 +45,9 @@ pub struct Job {
     pub block: usize,
     /// Transfers in flight at once, 1..=MAX_DEPTH.
     pub depth: usize,
-    /// The job touches bytes `[0, span)` of the file; at least one block.
+    /// The job touches bytes `[base, base + span)` of the file: `base` aligned, `span` at
+    /// least one block.
+    pub base: u64,
     pub span: u64,
     pub budget: Duration,
     pub max_ops: u64,
@@ -137,6 +139,11 @@ pub fn run(file: &DeviceFile, job: &Job) -> Result<JobResult, DiskError> {
     if slots == 0 {
         return Err(invalid("span must hold at least one block"));
     }
+    if !align.is_aligned_u64(job.base) || job.base.checked_add(job.span).is_none() {
+        return Err(invalid(
+            "base must be aligned, and the span end within the file's range",
+        ));
+    }
 
     let started = Instant::now();
     let shared = Shared {
@@ -223,7 +230,9 @@ impl Shared<'_> {
                     .checked_rem(self.slots)
                     .unwrap_or(0)
             };
-            let offset = slot.saturating_mul(self.block);
+            // In range: `slot < slots`, so the offset ends within `base + span`, which `run`
+            // checked.
+            let offset = slot.saturating_mul(self.block).saturating_add(job.base);
             let begin = Instant::now();
             if job.pattern.writes() {
                 file.write_all_at(buf.as_slice(), offset)?;
@@ -274,6 +283,7 @@ mod tests {
             pattern,
             block: 4096,
             depth,
+            base: 0,
             span: 1 << 20,
             budget: Duration::from_secs(10),
             max_ops,
@@ -319,6 +329,25 @@ mod tests {
         let mut j = job(Pattern::RandomRead, 1, 1);
         j.span = 100;
         assert!(run(&file, &j).is_err());
+        let mut j = job(Pattern::RandomRead, 1, 1);
+        j.base = 100;
+        assert!(run(&file, &j).is_err());
+    }
+
+    /// A job writes only inside `[base, base + span)`.
+    #[test]
+    fn a_job_stays_within_its_base_and_span() {
+        let (_dir, file) = scratch(1 << 20);
+        let mut j = job(Pattern::SequentialWrite, 2, 64);
+        j.base = 256 << 10;
+        j.span = 256 << 10;
+        run(&file, &j).unwrap();
+        let mut back = AlignedBuf::zeroed(1 << 20, file.alignment()).unwrap();
+        file.read_exact_at(back.as_mut_capacity(), 0).unwrap();
+        for (i, block) in back.as_mut_capacity().chunks(4096).enumerate() {
+            let written = block.iter().any(|&b| b != 0);
+            assert_eq!(written, (64..128).contains(&i), "block {i}");
+        }
     }
 
     #[test]

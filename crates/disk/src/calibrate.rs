@@ -3,8 +3,9 @@
 //! The OS's description of a device is a claim (a virtio disk on flash reports itself
 //! rotational; docs/research notes and the Linux probe test show it). Calibration writes a
 //! scratch file under the data directory and measures random small reads and sequential large
-//! transfers across queue depths, and the latency of a durable write, with the same direct-I/O
-//! file layer the store uses. Runs on a loaded machine vary by 2-4x (docs/measurements), so
+//! transfers across queue depths, the latency of a durable write, and whether a durable write
+//! into space the file system has allocated but never written costs more than one over written
+//! space, with the same direct-I/O file layer the store uses. Runs on a loaded machine vary by 2-4x (docs/measurements), so
 //! every point is measured in rounds until the 95% confidence interval of its throughput is
 //! within the plan's precision of the mean, or the plan's rounds run out, as Georges, Buytaert
 //! and Eeckhout's JavaStats stops (OOPSLA 2007, §3.3; docs/research/11 §13). Latency quantiles
@@ -118,6 +119,10 @@ pub struct Calibration {
     /// `durable_large` bytes written sequentially, then a full flush, one at a time.
     pub durable_sequential: Point,
     pub durable_large: usize,
+    /// Small durable writes, one at a time, into space preallocated and never written.
+    pub first_write: Point,
+    /// The same writes again, over the space they wrote.
+    pub overwrite: Point,
     pub elapsed: Duration,
 }
 
@@ -130,6 +135,22 @@ impl Calibration {
     pub fn random_read_knee(&self) -> Option<Point> {
         knee(&self.random_read)
     }
+
+    /// Whether a durable write into preallocated, never-written space is slower than the same
+    /// write over written space: the first write's throughput interval lies wholly below the
+    /// overwrite's, the test by which Georges, Buytaert and Eeckhout tell two measurements
+    /// apart (OOPSLA 2007, §3.3). Where a file system journals the conversion of an extent on
+    /// its first write, as ext4 does, the flush pays for it (5.7x on ext4;
+    /// docs/measurements/2026-09-28-flush-cost-by-extent-state.md), and the chunk store writes
+    /// a volume once before use (docs/design/chunk-store.md §2).
+    pub fn first_write_penalty(&self) -> bool {
+        slower(&self.first_write, &self.overwrite)
+    }
+}
+
+/// `a`'s throughput interval lies wholly below `b`'s.
+fn slower(a: &Point, b: &Point) -> bool {
+    a.ops_per_sec * (1.0 + a.spread) < b.ops_per_sec * (1.0 - b.spread)
 }
 
 fn knee(points: &[Point]) -> Option<Point> {
@@ -169,7 +190,14 @@ pub fn calibrate(
         None => plan.span,
     };
     let span = align.down_u64(span);
-    let needed = u64::try_from(plan.large.max(plan.small)).unwrap_or(u64::MAX);
+    // First writes need fresh space for every round they may run.
+    let fresh = u64::try_from(plan.small)
+        .ok()
+        .and_then(|small| small.checked_mul(plan.durable_writes.max(1)))
+        .unwrap_or(u64::MAX);
+    let needed = u64::try_from(plan.large.max(plan.small))
+        .unwrap_or(u64::MAX)
+        .max(fresh.saturating_mul(u64::try_from(plan.max_rounds.max(2)).unwrap_or(u64::MAX)));
     if span < needed {
         return Err(DiskError::Io {
             op: "calibrate",
@@ -185,12 +213,37 @@ pub fn calibrate(
     let file = DeviceFile::open(&path, true, CachingRequest::PreferDirect, align)?;
     file.preallocate(span)?;
 
+    // Before anything is written: each round of first writes takes fresh space, and each
+    // round of overwrites rewrites space a round of first writes wrote, the same way.
+    let durable = |base| Job {
+        pattern: Pattern::SequentialWrite,
+        block: plan.small,
+        depth: 1,
+        base,
+        span: fresh,
+        budget: plan.step.saturating_mul(4),
+        max_ops: plan.durable_writes,
+        sync_each: true,
+        seed: 0,
+    };
+    let first_write = point(&file, plan, |round| durable(round.saturating_mul(fresh)))?;
+    let written = u64::try_from(first_write.rounds.max(1)).unwrap_or(1);
+    let overwrite = point(&file, plan, |round| {
+        durable(
+            round
+                .checked_rem(written)
+                .unwrap_or(0)
+                .saturating_mul(fresh),
+        )
+    })?;
+
     // Write the whole span first, so reads measure the medium rather than holes, and so
     // later writes overwrite written blocks (docs/measurements/2026-09-28).
     let fill = Job {
         pattern: Pattern::SequentialWrite,
         block: plan.large,
         depth: 1,
+        base: 0,
         span,
         budget: Duration::from_secs(600),
         max_ops: span
@@ -206,6 +259,7 @@ pub fn calibrate(
         pattern,
         block,
         depth,
+        base: 0,
         span,
         budget: plan.step,
         max_ops: u64::MAX,
@@ -232,6 +286,7 @@ pub fn calibrate(
         pattern: Pattern::RandomWrite,
         block: plan.small,
         depth: 1,
+        base: 0,
         span,
         budget: plan.step.saturating_mul(4),
         max_ops: plan.durable_writes,
@@ -249,6 +304,7 @@ pub fn calibrate(
         pattern: Pattern::SequentialWrite,
         block: durable_large,
         depth: 1,
+        base: 0,
         span,
         budget: plan.step.saturating_mul(4),
         max_ops: u64::MAX,
@@ -266,6 +322,8 @@ pub fn calibrate(
         durable_write,
         durable_sequential,
         durable_large,
+        first_write,
+        overwrite,
         elapsed: started.elapsed(),
     })
 }
@@ -359,6 +417,21 @@ mod tests {
         assert_eq!(knee(&[]), None);
     }
 
+    /// A penalty is measured only when the intervals part: 5.7x with tight intervals is one,
+    /// and a difference inside the noise is none.
+    #[test]
+    fn a_first_write_penalty_needs_intervals_that_part() {
+        let with = |ops: f64, spread: f64| Point {
+            spread,
+            ..at(1, ops)
+        };
+        assert!(slower(&with(380.0, 0.05), &with(2_170.0, 0.05)));
+        assert!(!slower(&with(2_100.0, 0.05), &with(2_170.0, 0.05)));
+        assert!(!slower(&with(380.0, 0.9), &with(2_170.0, 0.9)));
+        assert!(!slower(&with(2_170.0, 0.05), &with(380.0, 0.05)));
+        assert!(!slower(&with(380.0, f64::INFINITY), &with(2_170.0, 0.05)));
+    }
+
     #[test]
     fn the_interval_follows_students_t() {
         // Mean 100, sample deviation 10, n = 4: t(3) = 3.182, half-width 3.182·10/2.
@@ -397,6 +470,8 @@ mod tests {
         assert!((2..=3).contains(&c.durable_write.rounds));
         assert!(c.durable_sequential.bytes_per_sec > 0.0);
         assert_eq!(c.durable_large, 2 << 20);
+        assert!(c.first_write.ops_per_sec > 0.0 && c.overwrite.ops_per_sec > 0.0);
+        assert!((2..=3).contains(&c.first_write.rounds));
         let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
         assert!(leftovers.is_empty(), "scratch file left behind");
     }

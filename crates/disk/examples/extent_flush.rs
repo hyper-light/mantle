@@ -30,6 +30,7 @@ fn main() {
         pattern: Pattern::SequentialWrite,
         block,
         depth: 1,
+        base: 0,
         span,
         budget: Duration::from_secs(120),
         max_ops: ops,

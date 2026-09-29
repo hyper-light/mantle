@@ -40,11 +40,18 @@ range of ZNS zone capacities, so segments map 1:1 onto zones [BAH+21 §2.3; AD15
 a volume parameter fixed at format. `L` is fixed at format so that three index
 checkpoints of the volume's chunk budget fit (§5).
 
-A file-backed volume grows by whole segments up to its quota. Where calibration measures
-a first-write flush penalty (ext4: 5.7x; docs/measurements/2026-09-28), a new region is
-written once with zeros before first use, so steady-state appends overwrite written
-blocks [RO92; AWK+19-F6 reuses WAL files for the same reason]; where it measures none
-(APFS), it is not.
+A volume is laid out at its full size when it is formatted. Where the file system journals
+the conversion of an extent on its first write, a durable write into preallocated space
+that was never written pays for it at the flush: 5.7x the median of an overwrite on ext4,
+nothing on APFS (docs/measurements/2026-09-28-flush-cost-by-extent-state.md). Calibration
+measures it on the device at hand: small durable writes into never-written space, then the
+same writes over the space they wrote, a penalty when the first writes' throughput interval
+lies wholly below the overwrites' (research/11 §13.3, from GBE07 §3.3). Where it finds one, format writes the whole
+volume once with zeros before its superblocks, so every append overwrites written blocks
+[RO92; AWK+19-F6 reuses WAL files for the same reason]; where it finds none, format writes
+only the superblocks. It finds 6.3x on ext4 and none on APFS
+(docs/measurements/2026-09-29-first-write-calibration.md). Raw block devices have no extent
+state.
 
 ## 3. Records
 

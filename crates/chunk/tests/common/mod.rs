@@ -26,6 +26,7 @@ pub fn config() -> Config {
             batch_bytes: 1 << 20,
             fragments_per_chunk: 64,
         },
+        prewrite: false,
     }
 }
 

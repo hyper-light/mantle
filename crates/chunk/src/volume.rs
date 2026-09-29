@@ -8,7 +8,7 @@ use std::thread::JoinHandle;
 
 use mantle_disk::DiskError;
 use mantle_disk::block::BlockFile;
-use mantle_disk::buf::Pool;
+use mantle_disk::buf::{AlignedBuf, Pool};
 
 use crate::clean::{CleanReport, Cleaner};
 use crate::error::ChunkError;
@@ -81,6 +81,9 @@ impl<F: BlockFile + 'static> Volume<F> {
     /// held before is ignored: every structure is bound to the new volume's random id.
     pub fn format(file: F, size: u64, config: Config) -> Result<Self, ChunkError> {
         let geometry = Geometry::plan(size, file.alignment(), &config)?;
+        if config.prewrite {
+            prewrite(&file, &geometry, config.limits.batch_bytes)?;
+        }
         let volume = random_id()?;
         let created_ns = now_ns();
         let base = Superblock {
@@ -595,6 +598,42 @@ impl<F: BlockFile + 'static> Drop for Volume<F> {
 
 /// Reads both superblock copies (and both possible places for B) and returns the valid one
 /// with the highest sequence.
+/// Writes zeros over the whole volume before its superblocks, so its first appends overwrite
+/// written blocks where the file system journals an extent's first write
+/// (docs/design/chunk-store.md §2). Each transfer is the writer's largest batch, the most the
+/// store writes at once; the flush that makes the superblocks durable makes these durable too.
+fn prewrite<F: BlockFile>(
+    file: &F,
+    geometry: &Geometry,
+    batch_bytes: usize,
+) -> Result<(), ChunkError> {
+    let end = geometry
+        .end()
+        .ok_or_else(|| ChunkError::Config("volume too large".into()))?;
+    let align = file.alignment();
+    let step = align.down(batch_bytes).max(align.get());
+    let mut zeros = AlignedBuf::zeroed(step, align).map_err(|e| ChunkError::Device(e.into()))?;
+    zeros
+        .set_len(step)
+        .map_err(|e| ChunkError::Device(e.into()))?;
+    let step = u64::try_from(step).map_err(|_| ChunkError::Config("batch too large".into()))?;
+    // Every region starts and ends on a block, so each transfer is aligned; the loop runs
+    // `end / step` times, rounded up.
+    let mut at = 0u64;
+    while at < end {
+        let len = step.min(end.saturating_sub(at));
+        let bytes = usize::try_from(len)
+            .ok()
+            .and_then(|len| zeros.as_slice().get(..len))
+            .ok_or(ChunkError::Internal(
+                "a pre-write transfer larger than its buffer",
+            ))?;
+        file.write_all_at(bytes, at).map_err(ChunkError::Device)?;
+        at = at.saturating_add(len);
+    }
+    Ok(())
+}
+
 fn read_superblock<F: BlockFile>(file: &F) -> Result<Superblock, ChunkError> {
     let mut best: Option<Superblock> = None;
     let len = file.len().map_err(ChunkError::Device)?;

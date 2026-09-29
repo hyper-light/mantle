@@ -18,6 +18,37 @@ use mantle_chunk::{ChunkError, Config, Volume};
 use mantle_disk::buf::Alignment;
 use mantle_disk::file::{CachingRequest, DeviceFile};
 
+/// A volume formatted to pre-write has every byte of its extent written at format, before
+/// its superblocks; one formatted without has only its superblocks and log (docs/design/
+/// chunk-store.md §2). The pre-written volume opens and works as any other.
+#[test]
+fn a_prewritten_volume_writes_its_whole_extent_once() {
+    let plain = sim(1);
+    let v = Volume::format(Arc::clone(&plain), SIZE, config()).unwrap();
+    let end = v.data_span().end;
+    v.close();
+    assert!((plain.durable_image().unwrap().len() as u64) < end);
+
+    let written = sim(2);
+    let prewrite = Config {
+        prewrite: true,
+        ..config()
+    };
+    let v = Volume::format(Arc::clone(&written), SIZE, prewrite).unwrap();
+    assert_eq!(v.data_span().end, end);
+    v.close();
+    assert_eq!(written.durable_image().unwrap().len() as u64, end);
+    // One transfer per batch's worth of bytes, then the two superblocks.
+    let batch = config().limits.batch_bytes as u64;
+    let writes = written.stats().unwrap().writes;
+    assert!(writes >= end.div_ceil(batch) + 2, "{writes} writes");
+
+    let (v, _) = Volume::open(Arc::clone(&written), config()).unwrap();
+    v.put(key(1), &data(1, 10_000)).unwrap();
+    assert_eq!(v.read(&key(1), 0, 10_000).unwrap(), data(1, 10_000));
+    v.close();
+}
+
 #[test]
 fn chunks_read_back_exactly_on_the_simulated_device() {
     let v = Volume::format(sim(1), SIZE, config()).unwrap();

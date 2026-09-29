@@ -247,13 +247,18 @@ replica; its log is the node's shared write-ahead log.
 - **Snapshots, splits and moves** transfer engine files over QUIC, checksummed, and never as
   one Raft message (12 §6.3–§6.5). Splits, merges and moves between cells are modeled in
   TLA+ before they are built (architecture §6.1, §10).
-- **Splits under a create and a delete.** `docs/models/RangeSplit.tla` models Name ranges
-  splitting while a bucket is created, written and deleted. A split is one command in the
+- **Splits and merges under a create and a delete.** `docs/models/RangeSplit.tla` models
+  Name ranges splitting and merging while a bucket is created, written and deleted. A split is one command in the
   parent's log, and the new child takes the parent's gate. Writers route by cached
   descriptors, and a range answers a stale one with its own descriptor and its children's.
   Each step of a create or delete attempt names the descriptor generation it read; a range
   refuses another generation, and the attempt learns the answer and starts its phase again.
-  TLC checks 1,115,237 distinct states of three keys, two splits, a create and two delete
+  A merge is one command in the lower range's log: it takes the higher range's span and keys
+  at a generation past both and keeps its own gate, and the higher range ends, answering a
+  stale request with the lower's descriptor. The two gates need not agree: an attempt that
+  held either range's descriptor is refused at the new generation and starts its phase
+  again, so it moves the joined gate from wherever the lower one was. TLC checks
+  72,007,924 distinct states of three keys, two splits, a merge, a create and two delete
   attempts (`scripts/check-model.sh`). In every one of them:
   - the live ranges divide the keys between them;
   - no acknowledged write is lost to a delete;
@@ -299,7 +304,7 @@ cover the production engine, which the simulator cannot.
 
 - The production engine and its binding (§4).
 - An owner's quota and ListBuckets once the Bucket layer outgrows one range.
-- Merges in the TLA+ model of splits (§3).
+
 - How an entry larger than a datagram reaches the replicas: over QUIC, or fragmented on the
   UDP plane. A completion of 10,000 parts is an entry of hundreds of kilobytes in the Name
   range and another in the File range.

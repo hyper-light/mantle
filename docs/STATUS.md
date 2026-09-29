@@ -201,8 +201,9 @@ Remaining before it is done:
   reclaims, when; and the sweep for files a stopped gateway made and never handed over
   (design §2, §6).
 - The production engine, once its binding is chosen (design §4).
-- Splits and the fast track under simulation, built to the TLA+ model of splits under a
-  create and a delete (design §3, `docs/models/RangeSplit.tla`), and the transport:
+- Splits, merges and the fast track under simulation, built to the TLA+ model of splits and
+  merges under a create and a delete (design §3, `docs/models/RangeSplit.tla`), and the
+  transport:
   QUIC for bulk transfers and snapshots, and a UDP transport for consensus messages.
 - Linearizability checked with real processes on the production engine.
 - Done when a linearizability checker accepts histories recorded under network partitions,

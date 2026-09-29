@@ -1,7 +1,8 @@
 # S3 protocol: how mantle reads requests and writes responses
 
 Status: design, 2026-09-28. Sources: docs/research/05 (S3 API semantics, cited as "05 §x"),
-docs/research/13 (XML, cited as "13 §x"), docs/research/16 (CORS, cited as "16 §x").
+docs/research/13 (XML, cited as "13 §x"), docs/research/16 (CORS, cited as "16 §x"),
+docs/research/17 (bucket policies and JSON, cited as "17 §x").
 
 `mantle-s3` is the protocol layer the gateway (STATUS item 2) is built from: pure functions
 over requests and bodies, with no I/O and no knowledge of where objects live. Each module
@@ -20,6 +21,7 @@ restating S3.
 | `range` | `Range` and `x-amz-copy-source-range` | 05 §12, s3-tests |
 | `list` | ListObjects and ListObjectsV2 paging | 05 §6, s3-tests |
 | `xml`, `body` | the XML reader and writer, and request documents read against their schemas | 13; roxmltree as an oracle |
+| `json` | the JSON reader and compact writer, for bucket policies | 17 §1; JSONTestSuite's 318 cases |
 | `tagging` | tag sets: S3's limits and characters, and the `x-amz-tagging` header | 13 §6.7, s3-tests, S3's observed answers |
 | `acl` | canned and header ACLs, Object Ownership, and whether a request's ACL goes ahead with ACLs disabled | 13 §6.8, s3-tests |
 | `lifecycle` | lifecycle rules checked, when each action falls due, and the expiration and abort headers | 13 §6.9, the user guide's worked examples, s3-tests |
@@ -419,3 +421,24 @@ enforce, agrees** (`crates/s3/src/cors.rs`; 16).
   an `Origin`, matched or not. S3 sends it only when a rule matches, so a cache in front of it
   may keep an answer without CORS headers and give it to a browser a rule allows; the Fetch
   standard names that failure and prescribes `Vary` against it (16 §4).
+
+## 9. JSON bodies
+
+**Decision: mantle reads JSON with its own reader, strict to RFC 8259's grammar, as it reads
+XML with its own** (`crates/s3/src/json.rs`; 17 §1). A bucket policy is JSON, and its grammar
+forbids a key given twice (17 §3.1). A general reader into a map keeps one of two same-named
+members silently, as RFC 8259 notes "many implementations" do, so a policy read that way could
+be enforced differently from the one its author reviewed.
+
+- **What it refuses.** An object naming a member twice, compared after escapes are replaced,
+  and a string holding an unpaired surrogate: I-JSON's rules for what a receiver may refuse
+  to trust (RFC 7493 §2). Text that is not UTF-8, and a byte order mark, which begins no value.
+  Nesting past 32 levels, where a policy needs six, so a text of 100,000 brackets is refused
+  after 32 of them.
+- **What it keeps.** Numbers as written, since the grammar bounds neither range nor precision
+  and a policy compares a number only under a numeric condition. Member order, so a document
+  written back compactly holds its members as sent.
+- **Checked against JSONTestSuite**, vendored with its license: all 95 cases a parser must
+  accept but the two of a repeated name, all 188 it must refuse, and each of the 35 left to
+  the implementation answered as the rules above say. Property tests read back every value
+  from its compact form, and answer any bytes without a panic.

@@ -1,0 +1,2 @@
+# JSONTestSuite's cases are exact bytes: a checkout never converts their line ends.
+crates/s3/tests/data/JSONTestSuite/** -text

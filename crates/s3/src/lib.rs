@@ -20,6 +20,7 @@ pub mod chunked;
 pub mod conditional;
 pub mod cors;
 pub mod crypto;
+pub mod json;
 pub mod lifecycle;
 pub mod list;
 pub mod range;

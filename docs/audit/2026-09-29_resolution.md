@@ -21,6 +21,7 @@ fix is removed.
 | S09 calibration ladder past the backend's depth | Fixed | `the_ladder_stops_at_the_backends_limit_and_says_so`. | The ladder is capped at the smaller of the plan's bound and the backend's thread limit, and `random_read_capped` says when throughput still grew there. |
 | S10 thread creation panics | Fixed | `a_worker_refused_stops_the_others_before_they_work` injects a refusal. | `mantle_disk::workers::spawn_all` starts workers all or none through `Builder::spawn_scoped`; used by measurement and every benchmark. |
 | S11 zero-capacity buffers | Fixed | `empty_buffers_allocate_nothing_and_are_not_kept`. | Empty buffers allocate nothing and are never pooled; the pool accounts real allocation. |
+| S12 a volume's failed start detaches its threads | Fixed | `a_start_refused_part_way_leaves_nothing_running` (`crates/chunk/src/volume.rs`) refuses the writer, the cleaner and the scrubber in turn through a start seam, and checks after each refusal that nothing still holds the device and that the volume then opens with its data. Starting the threads before the volume owns them fails it at the first partial refusal, with the detached writer holding the device. | The volume owns each thread from the moment it starts; a refused start drops the volume, whose shutdown stops, wakes and joins the threads already running. |
 
 ## Spec defects
 

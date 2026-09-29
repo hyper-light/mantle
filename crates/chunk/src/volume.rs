@@ -113,12 +113,22 @@ impl<F: BlockFile + 'static> Volume<F> {
         write_superblock(&file, &a)?;
         write_superblock(&file, &b)?;
         file.sync_data().map_err(ChunkError::Device)?;
-        let (volume, _) = Self::start(file, b, geometry, config)?;
+        let (volume, _) = Self::start(file, b, geometry, config, usize::MAX)?;
         Ok(volume)
     }
 
     /// Opens a volume, recovering from a clean shutdown or a crash alike.
     pub fn open(file: F, config: Config) -> Result<(Self, RecoveryReport), ChunkError> {
+        Self::open_starting(file, config, usize::MAX)
+    }
+
+    /// `open`, starting at most `may_start` of the volume's threads: the seam that tests a
+    /// start the operating system refuses part way.
+    fn open_starting(
+        file: F,
+        config: Config,
+        may_start: usize,
+    ) -> Result<(Self, RecoveryReport), ChunkError> {
         config.check()?;
         let superblock = read_superblock(&file)?;
         let geometry = Geometry {
@@ -142,7 +152,7 @@ impl<F: BlockFile + 'static> Volume<F> {
             checksum_shift: superblock.checksum_shift,
             ..config
         };
-        Self::start(file, superblock, geometry, config)
+        Self::start(file, superblock, geometry, config, may_start)
     }
 
     fn start(
@@ -150,6 +160,7 @@ impl<F: BlockFile + 'static> Volume<F> {
         superblock: Superblock,
         geometry: Geometry,
         config: Config,
+        may_start: usize,
     ) -> Result<(Self, RecoveryReport), ChunkError> {
         // Read buffers: at most one batch's worth kept free, none larger than a batch.
         let batch = config.limits.batch_bytes;
@@ -221,17 +232,6 @@ impl<F: BlockFile + 'static> Volume<F> {
             writer.checkpoint()?;
         }
         let superblock = writer.superblock.clone();
-        let spawn_error = |e| {
-            ChunkError::Device(DiskError::Io {
-                op: "spawn thread",
-                path: std::path::PathBuf::new(),
-                source: e,
-            })
-        };
-        let handle = std::thread::Builder::new()
-            .name("mantle-chunk-writer".into())
-            .spawn(move || writer.run())
-            .map_err(spawn_error)?;
         let cleaner = Cleaner {
             shared: Arc::clone(&shared),
             submit: sender.clone(),
@@ -239,10 +239,6 @@ impl<F: BlockFile + 'static> Volume<F> {
             batch_bytes: config.limits.batch_bytes,
             batch_moves: config.limits.batch_requests,
         };
-        let cleaner = std::thread::Builder::new()
-            .name("mantle-chunk-cleaner".into())
-            .spawn(move || cleaner.run())
-            .map_err(spawn_error)?;
         let findings: SharedFindings = Arc::new(std::sync::Mutex::new(Findings::default()));
         let (wake_scrubber, scrubber) = match config.scrub_period {
             Some(period) => {
@@ -253,29 +249,34 @@ impl<F: BlockFile + 'static> Volume<F> {
                     wake: wakes,
                     period,
                 };
-                let handle = std::thread::Builder::new()
-                    .name("mantle-chunk-scrubber".into())
-                    .spawn(move || scrubber.run())
-                    .map_err(spawn_error)?;
-                (Some(wake), Some(handle))
+                (Some(wake), Some(scrubber))
             }
             None => (None, None),
         };
-        Ok((
-            Self {
-                shared,
-                sender: Some(sender),
-                writer: Some(handle),
-                wake_cleaner: Some(wake),
-                cleaner: Some(cleaner),
-                wake_scrubber,
-                scrubber,
-                findings,
-                superblock,
-                limits: config.limits,
-            },
-            report,
-        ))
+        // The volume owns each thread from the moment it starts. A thread the operating
+        // system refuses returns the error through `?`, and dropping the volume then stops
+        // and joins those already running (audit S12): left detached, the writer would hold
+        // the cleaner's wake sender and the cleaner the writer's queue, each waiting on the
+        // other for good with the device held open.
+        let mut volume = Self {
+            shared,
+            sender: Some(sender),
+            writer: None,
+            wake_cleaner: Some(wake),
+            cleaner: None,
+            wake_scrubber,
+            scrubber: None,
+            findings,
+            superblock,
+            limits: config.limits,
+        };
+        let mut threads = Threads { left: may_start };
+        volume.writer = Some(threads.start("mantle-chunk-writer", move || writer.run())?);
+        volume.cleaner = Some(threads.start("mantle-chunk-cleaner", move || cleaner.run())?);
+        if let Some(scrubber) = scrubber {
+            volume.scrubber = Some(threads.start("mantle-chunk-scrubber", move || scrubber.run())?);
+        }
+        Ok((volume, report))
     }
 
     pub fn volume_id(&self) -> u128 {
@@ -623,6 +624,35 @@ impl<F: BlockFile + 'static> Drop for Volume<F> {
     }
 }
 
+/// Starts a volume's threads, as many as the operating system makes and at most `left`
+/// more: the bound is the seam that tests a refused start.
+struct Threads {
+    left: usize,
+}
+
+impl Threads {
+    fn start(
+        &mut self,
+        name: &str,
+        run: impl FnOnce() + Send + 'static,
+    ) -> Result<JoinHandle<()>, ChunkError> {
+        let started = match self.left.checked_sub(1) {
+            Some(left) => {
+                self.left = left;
+                std::thread::Builder::new().name(name.into()).spawn(run)
+            }
+            None => Err(std::io::Error::from(std::io::ErrorKind::OutOfMemory)),
+        };
+        started.map_err(|source| {
+            ChunkError::Device(DiskError::Io {
+                op: "start a thread",
+                path: std::path::PathBuf::new(),
+                source,
+            })
+        })
+    }
+}
+
 /// Reads both superblock copies (and both possible places for B) and returns the valid one
 /// with the highest sequence.
 /// Writes zeros over the whole volume before its superblocks, so its first appends overwrite
@@ -715,5 +745,70 @@ impl<F: BlockFile + 'static> Volume<F> {
             .iter()
             .map(|s| (s.state, s.incarnation, s.write_pos, s.live))
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mantle_disk::buf::Alignment;
+    use mantle_disk::sim::SimFile;
+
+    use crate::layout::{Limits, Reads};
+
+    fn config() -> Config {
+        Config {
+            segment_size: 256 << 10,
+            checksum_shift: 12,
+            max_fragments: 2000,
+            compact: true,
+            scrub_period: Some(std::time::Duration::from_secs(3600)),
+            limits: Limits {
+                batch_requests: 64,
+                batch_bytes: 1 << 20,
+                fragments_per_chunk: 64,
+            },
+            prewrite: false,
+            reads: Reads::default(),
+        }
+    }
+
+    /// A start the operating system refuses after the writer, or the writer and the
+    /// cleaner, have started stops and joins them before the error returns: nothing still
+    /// holds the device, and the volume opens again as if the refusal had not happened
+    /// (audit S12).
+    #[test]
+    fn a_start_refused_part_way_leaves_nothing_running() {
+        let file = Arc::new(
+            SimFile::new(
+                Alignment::new(4096).unwrap(),
+                Alignment::new(512).unwrap(),
+                7,
+            )
+            .unwrap(),
+        );
+        let key = ChunkKey {
+            block: 1,
+            epoch: 1,
+            index: 0,
+        };
+        let volume = Volume::format(Arc::clone(&file), 8 << 20, config()).unwrap();
+        volume.put(key, b"acknowledged").unwrap();
+        volume.close();
+        // The writer, the cleaner and the scrubber start in that order; refuse each.
+        for may_start in 0..3 {
+            let refused = Volume::open_starting(Arc::clone(&file), config(), may_start);
+            assert!(matches!(
+                refused,
+                Err(ChunkError::Device(DiskError::Io { ref source, .. }))
+                    if source.kind() == std::io::ErrorKind::OutOfMemory
+            ));
+            // Every thread that started has been joined, and with it every hold on the device.
+            assert_eq!(Arc::strong_count(&file), 1, "refused at {may_start}");
+        }
+        let (volume, _) = Volume::open(Arc::clone(&file), config()).unwrap();
+        assert_eq!(volume.read(&key, 0, 12).unwrap(), b"acknowledged");
+        volume.close();
+        assert_eq!(Arc::strong_count(&file), 1);
     }
 }

@@ -149,6 +149,13 @@ On the development machine a durable flush costs ~4.7 ms whatever its size
 (docs/measurements), so this loop is what turns 245 flushes/s into tens of thousands of
 chunk writes/s.
 
+A volume runs three threads: the writer, the cleaner (§8) and, when scrubbing is on, the
+scrubber (§9). The volume owns each from the moment it starts, so a start the operating
+system refuses part way stops and joins those already running before the error returns,
+and nothing is left holding the device (audit S12). Detached, the writer would keep the
+cleaner's wake channel open and the cleaner the writer's queue, each waiting on the other
+for good.
+
 A failed write or flush fences the volume: the batch fails, no later request is accepted,
 and the volume must be reopened and recovered. A failed flush is never retried, because
 the kernel may already have marked the pages clean [RPA+20 §3]; recovery trusts only what

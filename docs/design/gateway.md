@@ -72,6 +72,14 @@ placement offers that holds none of the block's chunks. When none is left, the P
 are found and released (metadata.md §2), and chunks no block names are reconciled per volume
 (STATUS).
 
+**Admission.** A PUT declares its length, and one longer than a single request carries,
+5 GiB (research/05 §4.1), is refused as `EntityTooLarge` when the PUT is made, before a chunk
+is written (audit B08). Within that length every layout's blocks fit a file's 10,000 extents:
+the layout with the smallest blocks, one copy, holds 127 segments a block, so the longest body
+takes 646 blocks. The File range therefore never refuses a body after all its chunks were
+written, and the blocks a PUT keeps for renewal, with its file's manifest, are bounded by its
+admission.
+
 **Blocks in flight.** A PUT holds at most two blocks: one filling while the one before it is
 written. Two is the fewest that overlap the body's arrival with the chunk writes; with more,
 the body only runs further ahead of writes that cannot keep up, and it waits instead. By
@@ -90,7 +98,11 @@ before its manager's. A renewal the Block range refuses, the sweep having releas
 fails the PUT. Once the body has ended and every block is recorded, the blocks due are renewed
 one last time and the file is written when they answer, so its write starts with every block
 held as long as a one-block PUT's is; those renewals are not repeated while they answer, since
-one slower than a quarter of the handover would find the next already due.
+one slower than a quarter of the handover would find the next already due. The blocks wait for
+renewal in order of when each is due, so a turn takes only the due ones and touches no other,
+and at most every recorded block is due at once, which admission bounds. Renewals of blocks
+that one Block range holds go as separate commands; whether they should go as one, the
+batching of §16.5 of the audit, waits for the gateway's driver, which routes them.
 
 **Checked** (`crates/gateway/tests/object_path.rs`) against volumes that check each chunk's
 CRC-32C and Block, File and Name ranges in memory, their entries stamped by a clock the test

@@ -17,6 +17,7 @@ use mantle_ec::EcError;
 use mantle_ec::durability::Scheme;
 use mantle_meta::record::{self, BlockHeader, ChunkPlace, Extent, Referrer, Target, WrappedKey};
 use mantle_meta::{block, file, name};
+use mantle_s3::body::MAX_UPLOAD;
 use mantle_s3::checksum::{self, Algorithm, Hasher};
 use mantle_s3::crypto::CryptoError;
 use mantle_s3::seal::{self, DataKey, SealError, Segments};
@@ -104,6 +105,11 @@ pub enum PutError {
     Random,
     #[error("a length past what the PUT can address")]
     Overflow,
+    /// A body longer than one request may carry: `400 EntityTooLarge`, before anything is
+    /// written (audit B08).
+    #[error("a body of {length} bytes; one request carries {max} at most")]
+    EntityTooLarge { length: u64, max: u64 },
+
     #[error(transparent)]
     Layout(#[from] LayoutError),
     #[error(transparent)]
@@ -254,6 +260,9 @@ pub struct Put {
     going: Option<Going>,
     /// Blocks recorded, by their place in the file.
     recorded: BTreeMap<u64, Recorded>,
+    /// When each recorded block not being renewed is next due for renewal, and its place:
+    /// a turn takes the due ones off the front, touching no other block (audit B08).
+    due: BTreeSet<(u64, u64)>,
     md5: Option<Hasher>,
     sum: Option<Hasher>,
     etag: Option<String>,
@@ -277,6 +286,17 @@ impl Put {
         ids: Box<dyn Ids + Send>,
         now_ns: u64,
     ) -> Result<Self, PutError> {
+        // What the body may cost is known from its declared length, and is refused whole
+        // before a chunk is written (audit B08). Within it, every layout's blocks fit a
+        // file's extents, so the File range's write never refuses a body after every chunk
+        // was written, and the blocks retained for renewal are bounded
+        // (`the_largest_upload_fits_a_file_under_every_layout`).
+        if body.length > MAX_UPLOAD {
+            return Err(PutError::EntityTooLarge {
+                length: body.length,
+                max: MAX_UPLOAD,
+            });
+        }
         let sealer = Segments::new(&keys.data, keys.file)?;
         let md5 = Hasher::new(Algorithm::Md5)?;
         let sum = body.checksum.map(Hasher::new).transpose()?;
@@ -301,6 +321,7 @@ impl Put {
             waiting: None,
             going: None,
             recorded: BTreeMap::new(),
+            due: BTreeSet::new(),
             md5: Some(md5),
             sum,
             etag: None,
@@ -347,12 +368,7 @@ impl Put {
         if self.outcome.is_some() || !matches!(self.phase, Phase::Body | Phase::Ended) {
             return None;
         }
-        let quarter = self.handover_ns.checked_div(RENEWALS)?;
-        self.recorded
-            .values()
-            .filter(|r| !r.renewing)
-            .map(|r| r.asked_ns.saturating_add(quarter))
-            .min()
+        self.due.first().map(|&(at, _)| at)
     }
 
     /// The next request to send, each once; `None` while every request is in flight or the
@@ -578,6 +594,8 @@ impl Put {
                 r.deadline_ns = deadline_ns;
                 r.asked_ns = asked_ns;
                 r.renewing = false;
+                let next = self.next_renewal(asked_ns)?;
+                self.due.insert((next, index));
                 self.file_when_renewed()
             }
             (
@@ -682,30 +700,38 @@ impl Put {
                 renewing: false,
             },
         );
+        let next = self.next_renewal(asked_ns)?;
+        self.due.insert((next, going.index));
         if let Some(full) = self.waiting.take() {
             self.go(full)?;
         }
         self.file_if_written()
     }
 
-    /// Asks to renew each recorded block whose renewal has come due.
-    fn renew_due(&mut self) -> Result<(), PutError> {
+    /// When a block whose write or renewal was asked at `asked_ns` is due for renewal: a
+    /// quarter of the handover later. A renewal due past the end of the clock never comes.
+    fn next_renewal(&self, asked_ns: u64) -> Result<u64, PutError> {
         let quarter = self
             .handover_ns
             .checked_div(RENEWALS)
             .ok_or(PutError::Overflow)?;
+        Ok(asked_ns.saturating_add(quarter))
+    }
+
+    /// Asks to renew each recorded block whose renewal has come due, earliest first. Only
+    /// the due blocks are touched, and at most every recorded block is due at once, which
+    /// admission bounds (audit B08).
+    fn renew_due(&mut self) -> Result<(), PutError> {
         let now = self.now_ns;
-        let mut due = Vec::new();
-        for (&index, r) in &mut self.recorded {
-            // A renewal due past the end of the clock never comes.
-            if !r.renewing && r.asked_ns.saturating_add(quarter) <= now {
-                r.renewing = true;
-                due.push((index, r.id));
+        while let Some(&(at, index)) = self.due.first() {
+            if at > now {
+                break;
             }
-        }
-        for (index, block) in due {
+            self.due.pop_first();
+            let r = self.recorded.get_mut(&index).ok_or(PutError::Mismatch)?;
+            r.renewing = true;
             let renew = block::Command::Renew {
-                block,
+                block: r.id,
                 file: self.file,
                 handover_ns: self.handover_ns,
                 at_ns: 0,

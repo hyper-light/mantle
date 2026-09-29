@@ -36,6 +36,11 @@ const ETAG: usize = "&quot;d41d8cd98f00b204e9800998ecf8427e-10000&quot;".len();
 /// Parts in a multipart upload (05 §4.1).
 pub const MAX_PARTS: u16 = 10_000;
 
+/// Bytes one PutObject or UploadPart carries at most (05 §4.1): a part runs "5 MiB to 5 GiB",
+/// and a single PUT to "5 GB" as the upload guide writes it. The binary figure never refuses
+/// an upload S3 takes.
+pub const MAX_UPLOAD: u64 = 5 << 30;
+
 /// "The request can contain a list of up to 1,000 keys" (05 §8.1).
 pub const MAX_OBJECTS: usize = 1000;
 

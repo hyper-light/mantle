@@ -229,6 +229,27 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The largest body one request carries fits a file's extents under every layout: the
+    /// layout with the smallest blocks, one copy, holds 127 segments a block, so 5 GiB takes
+    /// 646 blocks of the 10,000 a file holds (audit B08).
+    #[test]
+    fn the_largest_upload_fits_a_file_under_every_layout() {
+        let smallest = Layout::new(Scheme::Copies(1)).unwrap();
+        assert_eq!(smallest.segments_per_block(), 127);
+        let blocks = smallest.blocks(mantle_s3::body::MAX_UPLOAD);
+        assert_eq!(blocks, 646);
+        assert!(blocks <= mantle_meta::file::MAX_EXTENTS as u64);
+        for scheme in [
+            Scheme::Copies(2),
+            Scheme::Copies(3),
+            Scheme::Rs(mantle_ec::Code::new(6, 3).unwrap()),
+            Scheme::Rs(mantle_ec::Code::new(9, 6).unwrap()),
+        ] {
+            let layout = Layout::new(scheme).unwrap();
+            assert!(layout.segments_per_block() >= smallest.segments_per_block());
+        }
+    }
     use mantle_ec::Code;
     use proptest::prelude::*;
 

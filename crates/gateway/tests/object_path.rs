@@ -373,6 +373,36 @@ fn new_put(cell: &Cell, commit: Commit, length: u64, layout: Layout, keys: Keys)
     .unwrap()
 }
 
+/// A body longer than one request carries is refused when the PUT is made, before a chunk,
+/// a block or a file is asked for; the longest one is taken (audit B08).
+#[test]
+fn a_body_past_one_request_is_refused_before_anything_is_asked() {
+    let cell = Cell::new(3);
+    let wrapping = WrappingKey::generate().unwrap();
+    let make = |length| {
+        Put::new(
+            object("k"),
+            Body {
+                length,
+                checksum: None,
+            },
+            keys(1, &wrapping),
+            Layout::new(Scheme::Copies(3)).unwrap(),
+            HANDOVER,
+            Box::new(Counter(1_000)),
+            cell.clock,
+        )
+    };
+    let max = mantle_s3::body::MAX_UPLOAD;
+    assert!(matches!(
+        make(max + 1),
+        Err(PutError::EntityTooLarge { length, max: m }) if length == max + 1 && m == max
+    ));
+    let mut largest = make(max).unwrap();
+    assert!(largest.wants_body());
+    assert!(largest.poll().is_none());
+}
+
 const FAST: Drive = Drive {
     piece: 100_000,
     wait: 0,

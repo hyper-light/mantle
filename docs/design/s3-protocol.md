@@ -473,6 +473,11 @@ With ACLs disabled on every bucket (§5), a policy is how a bucket's owner lets 
 - **Condition keys.** S3's own keys are the catalog's, each accepted only where one of the
   statement's actions carries it; any `aws:` key is accepted, as AWS keeps adding global keys
   and a refusal would break a valid policy.
+- **Each operation's action.** `policy::action` gives the action each routed operation asks
+  for, as S3 authorizes it, in its `Version` form when the request names a version (17 §5); a
+  test holds every one to the catalog, on the kind of resource the operation names. A copy is
+  judged by parts, `s3:PutObject` on its destination and its source as a GetObject, and
+  DeleteObjects key by key. A preflight asks for none.
 - **Judgment.** A denying statement that applies refuses the request, the owner's included;
   the owner's account may do anything else, and may always read, set and delete the policy, as
   S3 keeps a root from locking itself out; anyone else needs an allowing statement. mantle's

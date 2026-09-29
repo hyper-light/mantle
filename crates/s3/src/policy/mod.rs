@@ -106,6 +106,77 @@ pub fn may_set(
     }
 }
 
+/// The action a request asks for, as S3 authorizes its operation (17 §5): the `Version` form
+/// when the request names a version ID. The operations with more than one resource are judged
+/// by parts: a copy as `s3:PutObject` on its destination, its source judged as a GetObject;
+/// DeleteObjects for each key as a DeleteObject. `None` for a preflight, answered from the
+/// bucket's CORS rules without authorization (16 §3), and for ListBuckets, whose
+/// `s3:ListAllMyBuckets` names no bucket and so no bucket policy.
+pub fn action(operation: crate::route::Operation, versioned: bool) -> Option<&'static str> {
+    use crate::route::Operation as O;
+    let either =
+        |plain: &'static str, version: &'static str| Some(if versioned { version } else { plain });
+    match operation {
+        O::ListBuckets | O::Preflight => None,
+        O::CreateBucket => Some("s3:CreateBucket"),
+        O::DeleteBucket => Some("s3:DeleteBucket"),
+        O::HeadBucket | O::ListObjects | O::ListObjectsV2 => Some("s3:ListBucket"),
+        O::ListObjectVersions => Some("s3:ListBucketVersions"),
+        O::ListMultipartUploads => Some("s3:ListBucketMultipartUploads"),
+        O::GetBucketLocation => Some("s3:GetBucketLocation"),
+        O::GetBucketVersioning => Some("s3:GetBucketVersioning"),
+        O::PutBucketVersioning => Some("s3:PutBucketVersioning"),
+        O::GetBucketTagging => Some("s3:GetBucketTagging"),
+        O::PutBucketTagging | O::DeleteBucketTagging => Some("s3:PutBucketTagging"),
+        O::GetBucketAcl => Some("s3:GetBucketAcl"),
+        O::PutBucketAcl => Some("s3:PutBucketAcl"),
+        O::GetBucketOwnershipControls => Some("s3:GetBucketOwnershipControls"),
+        O::PutBucketOwnershipControls | O::DeleteBucketOwnershipControls => {
+            Some("s3:PutBucketOwnershipControls")
+        }
+        O::GetBucketLifecycleConfiguration => Some("s3:GetLifecycleConfiguration"),
+        O::PutBucketLifecycleConfiguration | O::DeleteBucketLifecycle => {
+            Some("s3:PutLifecycleConfiguration")
+        }
+        O::GetBucketCors => Some("s3:GetBucketCORS"),
+        O::PutBucketCors | O::DeleteBucketCors => Some("s3:PutBucketCORS"),
+        O::GetBucketPolicy => Some("s3:GetBucketPolicy"),
+        O::PutBucketPolicy => Some("s3:PutBucketPolicy"),
+        O::DeleteBucketPolicy => Some("s3:DeleteBucketPolicy"),
+        O::GetBucketPolicyStatus => Some("s3:GetBucketPolicyStatus"),
+        O::GetPublicAccessBlock => Some("s3:GetBucketPublicAccessBlock"),
+        O::PutPublicAccessBlock | O::DeletePublicAccessBlock => {
+            Some("s3:PutBucketPublicAccessBlock")
+        }
+        O::GetObject | O::HeadObject | O::GetObjectAttributes => {
+            either("s3:GetObject", "s3:GetObjectVersion")
+        }
+        O::PutObject
+        | O::CopyObject
+        | O::CreateMultipartUpload
+        | O::UploadPart
+        | O::UploadPartCopy
+        | O::CompleteMultipartUpload => Some("s3:PutObject"),
+        O::DeleteObject | O::DeleteObjects => either("s3:DeleteObject", "s3:DeleteObjectVersion"),
+        O::GetObjectTagging => either("s3:GetObjectTagging", "s3:GetObjectVersionTagging"),
+        O::PutObjectTagging => either("s3:PutObjectTagging", "s3:PutObjectVersionTagging"),
+        O::DeleteObjectTagging => either("s3:DeleteObjectTagging", "s3:DeleteObjectVersionTagging"),
+        O::GetObjectAcl => either("s3:GetObjectAcl", "s3:GetObjectVersionAcl"),
+        O::PutObjectAcl => either("s3:PutObjectAcl", "s3:PutObjectVersionAcl"),
+        O::AbortMultipartUpload => Some("s3:AbortMultipartUpload"),
+        O::ListParts => Some("s3:ListMultipartUploadParts"),
+    }
+}
+
+/// The ARN a policy names a request's resource by: the bucket's, or with a key the object's
+/// (17 §5).
+pub fn resource(bucket: &str, key: Option<&str>) -> String {
+    match key {
+        Some(key) => format!("{ARN_PREFIX}{bucket}/{key}"),
+        None => format!("{ARN_PREFIX}{bucket}"),
+    }
+}
+
 /// A bucket policy, checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Policy {
@@ -1287,5 +1358,87 @@ mod tests {
         };
         assert!(may_set(&public, Some(&off)).is_ok());
         assert!(may_set(&public, None).is_ok());
+    }
+
+    /// Every action a routed operation asks for is one the catalog lists, on the kind of
+    /// resource the operation names: a bucket, or with a key an object.
+    #[test]
+    fn every_operation_asks_for_an_action_the_catalog_lists() {
+        use crate::route::Operation as O;
+        let bucket_level = [
+            O::CreateBucket,
+            O::DeleteBucket,
+            O::HeadBucket,
+            O::GetBucketLocation,
+            O::GetBucketVersioning,
+            O::PutBucketVersioning,
+            O::GetBucketTagging,
+            O::PutBucketTagging,
+            O::DeleteBucketTagging,
+            O::GetBucketAcl,
+            O::PutBucketAcl,
+            O::GetBucketOwnershipControls,
+            O::PutBucketOwnershipControls,
+            O::DeleteBucketOwnershipControls,
+            O::GetBucketLifecycleConfiguration,
+            O::PutBucketLifecycleConfiguration,
+            O::DeleteBucketLifecycle,
+            O::GetBucketCors,
+            O::PutBucketCors,
+            O::DeleteBucketCors,
+            O::GetBucketPolicy,
+            O::PutBucketPolicy,
+            O::DeleteBucketPolicy,
+            O::GetBucketPolicyStatus,
+            O::GetPublicAccessBlock,
+            O::PutPublicAccessBlock,
+            O::DeletePublicAccessBlock,
+            O::ListObjects,
+            O::ListObjectsV2,
+            O::ListObjectVersions,
+            O::ListMultipartUploads,
+        ];
+        let object_level = [
+            O::DeleteObjects,
+            O::PutObject,
+            O::CopyObject,
+            O::GetObject,
+            O::HeadObject,
+            O::DeleteObject,
+            O::GetObjectAttributes,
+            O::GetObjectTagging,
+            O::PutObjectTagging,
+            O::DeleteObjectTagging,
+            O::GetObjectAcl,
+            O::PutObjectAcl,
+            O::CreateMultipartUpload,
+            O::UploadPart,
+            O::UploadPartCopy,
+            O::CompleteMultipartUpload,
+            O::AbortMultipartUpload,
+            O::ListParts,
+        ];
+        let kind_of = |name: &str| {
+            catalog::ACTIONS
+                .iter()
+                .find(|known| format!("s3:{}", known.name) == name)
+                .map(|known| known.kind)
+        };
+        for (operations, kind) in [
+            (&bucket_level[..], Kind::Bucket),
+            (&object_level[..], Kind::Object),
+        ] {
+            for operation in operations {
+                for versioned in [false, true] {
+                    let action = action(*operation, versioned).unwrap();
+                    assert_eq!(kind_of(action), Some(kind), "{operation:?} {action}");
+                }
+            }
+        }
+        assert_eq!(action(O::GetObject, true), Some("s3:GetObjectVersion"));
+        assert_eq!(action(O::ListBuckets, false), None);
+        assert_eq!(action(O::Preflight, false), None);
+        assert_eq!(resource("b", Some("a/b:c")), "arn:aws:s3:::b/a/b:c");
+        assert_eq!(resource("b", None), "arn:aws:s3:::b");
     }
 }

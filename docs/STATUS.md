@@ -16,8 +16,10 @@ directory and, with `--measure`, benchmarks the device. It is built on:
 - **The file layer**: direct I/O where the file system supports it, aligned positional
   reads and writes, and each platform's full flush. Tested on APFS, ext4, tmpfs and NTFS.
 - **Calibration**: reads, writes and flush latency measured through the file layer. Each
-  measurement runs three times and the median is reported. The scratch file is removed
-  whether the run succeeds or fails.
+  point runs until the 95% confidence interval of its throughput is within 5% of its mean
+  (three to six rounds), latency quantiles are reported only when enough transfers ran to
+  estimate them, and the read depth reported is the one of greatest power (Kleinrock). The
+  scratch file is removed whether the run succeeds or fails.
 - **Checksums**: CRC-32C for stored and transmitted data, and CRC-64/NVME for S3
   checksums, both verified against published test vectors.
 - **A simulated device** for crash testing: writes not yet flushed are lost, kept or torn
@@ -34,16 +36,24 @@ verify every byte they return, checkpoints and log wrap-around, reuse of segment
 empty out, cleaning of partly dead segments chosen by cost-benefit (relocations batched
 into the cleaner's own stream, a reserve segment kept for it, and passes that stop when
 they cannot gain space), and crash recovery (replay, verification of the last batch,
-roll-forward, and a checkpoint that makes recovery's corrections durable). Tested with
+roll-forward, and a checkpoint that makes recovery's corrections durable). Its operating
+parameters are calculated from models and measurements rather than chosen
+(docs/research/11): checkpoints when the log needs the room, at most half its writes;
+a write queue of two batches that refuses with `Busy` beyond them; cleaning on a runway
+set by the measured write rate and cleaning time, with writes `Busy` while cleaning can
+still make room and `Full` once it cannot; and an index of where each live record lies,
+so cleaning and scrubbing never walk the whole index. Tested with
 randomized workloads, cleaning included, cut by power loss at every point on the
 simulated device (20,000 runs per soak: no acknowledged write lost, no unverified byte
 returned) and with bit flips, read errors, damaged superblocks, damaged log frames and
 failed writes and flushes. On real file systems (APFS, ext4 and tmpfs), a writing process
 killed with `kill -9` at random points loses no write it acknowledged.
 
-The scrubber verifies every live fragment in the background, paced so a pass takes the
-configured period (7 days by default) and continuous once damage is found; damaged
-chunks are listed for repair.
+The scrubber verifies every live record in the background, in 1 MiB steps staggered over
+the volume, paced so a pass takes the configured period (7 days by default) and
+continuous once damage is found. Damaged chunks, including those whose records cannot be
+read at all, are listed for repair, and a volume with more than 4,096 is marked failing, to
+be drained whole.
 
 Remaining before it is done:
 
@@ -53,6 +63,9 @@ Remaining before it is done:
   layer ([measurements](measurements/2026-09-28-chunk-store-benchmark.md)). Remaining: each
   point repeated until its result is statistically stable, and large puts brought closer
   to the device's durable bandwidth.
+- The group-commit wait for submitters slower than half a batch, from the measured
+  distribution of their return times (docs/research/11 §2.6), once real clients supply it.
+- Device health in how writes are placed and when a device is drained (docs/research/10).
 
 **Erasure coding** (`mantle-ec`). Systematic Reed–Solomon over GF(2^16) with contiguous
 data chunks, from `reed-solomon-simd` behind an unwind boundary. Every combination of lost

@@ -9,6 +9,40 @@
 
 /// A range's rows about itself: its applied index and descriptor.
 pub const LOCAL: u8 = 0x00;
+
+/// The byte after `LOCAL` that says which kind of a range's own rows a key holds. Each kind is
+/// read by scanning its marker, so every kind has a marker of its own: two kinds that shared
+/// one would each read the other's rows as their own.
+pub mod marker {
+    pub const CLOCK: u8 = b'c';
+    /// A session's place in the order of last use.
+    pub const EXPIRY: u8 = b'e';
+    /// The Name range's gate floor.
+    pub const FLOOR: u8 = b'f';
+    pub const GATE: u8 = b'g';
+    /// How many sessions the range holds.
+    pub const SESSIONS: u8 = b'n';
+    /// The last snapshot a member installed.
+    pub const INSTALLED: u8 = b'p';
+    /// The Name range's queue of released files.
+    pub const RELEASED: u8 = b'q';
+    /// The group's configuration.
+    pub const CONFIGURATION: u8 = b'r';
+    pub const SESSION: u8 = b's';
+
+    /// Every marker in use.
+    pub const ALL: [u8; 9] = [
+        CLOCK,
+        EXPIRY,
+        FLOOR,
+        GATE,
+        SESSIONS,
+        INSTALLED,
+        RELEASED,
+        CONFIGURATION,
+        SESSION,
+    ];
+}
 /// The rows of the range's layer.
 pub const DATA: u8 = 0x01;
 /// Reverse rows: an index kept in the range of the rows it indexes and sorted by another of
@@ -87,13 +121,13 @@ pub fn bucket_span(bucket: &str) -> (Vec<u8>, Vec<u8>) {
 
 /// The key of a Name range's gate for a bucket (docs/design/metadata.md §2).
 pub fn gate(bucket: &str) -> Vec<u8> {
-    let mut out = vec![LOCAL, b'g'];
+    let mut out = vec![LOCAL, marker::GATE];
     put_string(&mut out, bucket.as_bytes());
     out
 }
 
 /// The range's queue of the files it released, oldest first (docs/design/metadata.md §2).
-const RELEASED: [u8; 2] = [LOCAL, b'r'];
+const RELEASED: [u8; 2] = [LOCAL, marker::RELEASED];
 
 /// The key of a released file's row: the range's time when it was released, then the file,
 /// so the collector takes them in the order they were released.
@@ -377,6 +411,14 @@ pub fn parse_version_id(id: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn every_kind_of_a_ranges_own_rows_has_its_own_marker() {
+        let mut seen = marker::ALL.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), marker::ALL.len());
+    }
 
     fn row() -> impl Strategy<Value = NameRow> {
         let bytes = prop::collection::vec(any::<u8>(), 0..6);

@@ -387,7 +387,7 @@ pub fn released<E: Rows>(
 /// The range's gate floor: no attempt older than it may place a gate where there is none. A
 /// gate's removal raises it to the removing attempt, so a coordinator left behind by a later
 /// attempt cannot open a gate for a bucket that is gone, and the range keeps no row for it.
-const FLOOR: &[u8] = &[key::LOCAL, b'f'];
+const FLOOR: &[u8] = &[key::LOCAL, key::marker::FLOOR];
 
 /// Whether the range admits a write to `bucket` made under `incarnation`.
 fn admits<E: Rows>(engine: &E, bucket: &str, incarnation: u64) -> Result<bool, MetaError> {
@@ -2795,5 +2795,26 @@ mod tests {
             Outcome::Reclaimed
         );
         assert_eq!(released(&r.engine, u64::MAX, 10).unwrap(), queue[1..]);
+    }
+
+    /// Every range's engine also holds the rows its replica keeps about itself: the group's
+    /// configuration, which once began with the queue's marker and read as a corrupt queue
+    /// row, and the last snapshot installed.
+    #[test]
+    fn the_queue_reads_past_the_replicas_own_rows() {
+        let mut r = Range::new();
+        let own: Vec<Write> = [key::marker::CONFIGURATION, key::marker::INSTALLED]
+            .iter()
+            .map(|&m| Write::Put(vec![key::LOCAL, m], vec![1, 2, 3]))
+            .collect();
+        r.index += 1;
+        r.engine.apply(r.index, &own).unwrap();
+        r.clock = 10 * MS;
+        r.put("a", "e", Versioning::Unversioned);
+        r.clock = 20 * MS;
+        r.delete("a", Versioning::Unversioned, None);
+        let queue = released(&r.engine, u64::MAX, 10).unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].0 / MS, 20);
     }
 }

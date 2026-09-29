@@ -8,15 +8,15 @@
 use crate::engine::{Rows, Write};
 use crate::error::MetaError;
 use crate::key::LOCAL;
+use crate::key::marker::{EXPIRY, SESSION, SESSIONS};
 use crate::record::{self, Session};
 use crate::wire::{Answer, MAX_COMMANDS, Sessioned};
 
-/// A session's row: `[LOCAL, 's', session]`.
-const SESSION: u8 = b's';
-/// A session's place in the order of last use: `[LOCAL, 'e', last use, session]`.
-const EXPIRY: u8 = b'e';
+// A session's row is `[LOCAL, SESSION, session]`, and its place in the order of last use
+// `[LOCAL, EXPIRY, last use, session]`.
+
 /// How many sessions the range holds.
-const COUNT: &[u8] = &[LOCAL, b'n'];
+const COUNT: &[u8] = &[LOCAL, SESSIONS];
 
 /// The bounds a range keeps its sessions within, from how long gateways go between commands
 /// and how many commands each keeps in flight (docs/design/replica.md §6).

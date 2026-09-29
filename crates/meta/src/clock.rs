@@ -9,7 +9,7 @@ use crate::key;
 use crate::record;
 
 /// The last time the range assigned, nanoseconds since the Unix epoch.
-const CLOCK: &[u8] = &[key::LOCAL, b'c'];
+const CLOCK: &[u8] = &[key::LOCAL, key::marker::CLOCK];
 
 /// The time a write proposed at `at_ns` takes, the later of that and just after the range's
 /// last, and the write that records it.

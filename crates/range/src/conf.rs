@@ -4,13 +4,13 @@
 
 use focal_raft::proto::ConfState;
 use mantle_codec::{Reader, Writer};
-use mantle_meta::key::LOCAL;
+use mantle_meta::key::{LOCAL, marker};
 
-/// The row that holds the configuration: `[LOCAL, 'r']`.
-pub const ROW: &[u8] = &[LOCAL, b'r'];
+/// The row that holds the configuration.
+pub const ROW: &[u8] = &[LOCAL, marker::CONFIGURATION];
 
-/// The row that holds the index and term of the last snapshot installed: `[LOCAL, 'p']`.
-pub const INSTALLED: &[u8] = &[LOCAL, b'p'];
+/// The row that holds the index and term of the last snapshot installed.
+pub const INSTALLED: &[u8] = &[LOCAL, marker::INSTALLED];
 
 /// A snapshot point's bytes: its index and term, and their CRC-32C.
 pub fn encode_point(index: u64, term: u64) -> Vec<u8> {

@@ -177,7 +177,13 @@ across ranges, fenced by attempt, with the gates each Name range admits writes t
 by a coordinator that names each range read and command and moves on with its answer. A
 simulation of one bucket across a Bucket range and two Name ranges checks after every step
 that no acknowledged write is lost to a delete, under 2,000 generated schedules of
-concurrent creates and deletes, coordinators taken over, and writers with stale views.
+concurrent creates and deletes, coordinators taken over, gateways that stop for good, and
+writers with stale views; once each schedule's faults stop, the collector acts on its
+schedule and every create and delete must end. The collector's schedule: a released file
+comes due a grace after release, three days by default, and the collector waits on the
+queue's own times; a create or delete is taken over once it has gone its patience without
+progress, which its driver stamps on the bucket's row, read from an index of the attempts in
+progress; and a deleted bucket's cleanup resumes from any step.
 
 The Raft log (`mantle-log`, [design](design/raft-log.md)), which every range replica on a
 metadata device shares: group commit across ranges with one flush a batch, frames whose
@@ -208,9 +214,8 @@ commands applied twice when either is introduced on purpose.
 
 Remaining before it is done:
 
-- The collector's schedule: which buckets it resumes or abandons, and which released files it
-  reclaims, when; and the sweep for files a stopped gateway made and never handed over
-  (design §2, §6).
+- The sweep for files a stopped gateway made and never handed over, and the collector's
+  pacing against foreground latency (design §2, §6; docs/research/22 §10).
 - The production engine, once its binding is chosen (design §4).
 - Splits, merges and the fast track under simulation, built to the TLA+ model of splits and
   merges under a create and a delete (design §3, `docs/models/RangeSplit.tla`), and the

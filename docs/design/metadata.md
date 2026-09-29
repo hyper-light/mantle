@@ -2,8 +2,8 @@
 
 Status: design, 2026-09-28. Sources: docs/research/01 (Tectonic, cited as "01 §x" and
 [TEC]), 05 (S3 semantics), 06 (consensus and range-partitioned metadata), 07 (focal's
-consensus stack), 09 (cells), 12 (RocksDB and ZippyDB), 18 (Object Lock);
-docs/design/architecture.md.
+consensus stack), 09 (cells), 12 (RocksDB and ZippyDB), 18 (Object Lock), 22 (garbage
+collection); docs/design/architecture.md.
 
 The metadata service records what exists: buckets, the versions of every object, the
 multipart uploads in progress, which blocks hold an object's bytes, and which chunk stores
@@ -149,11 +149,17 @@ layers removes them, as Tectonic's does [01 §1.6].
     one with no extents, so a collector that stops is resumed from the queue. A property test
     stops reclaimers after random steps over random files of parts and blocks, resumes them
     from the queue, and checks that every row, block and chunk of the file goes and nothing
-    else does; dropping the queue row first fails it. The grace period is a recovery-point policy, three days by default, as GFS
-    keeps a deleted file (chunk-store §8).
+    else does; dropping the queue row first fails it.
+  - *When.* The grace period is a recovery-point policy, not a safety bound: three days by
+    default, as GFS keeps a deleted file (chunk-store §8; 22 §1.1, §10.4). A released file
+    comes due a grace after its release, in the range's clock, and the collector waits on the
+    queue's own times rather than polling: it next looks when the oldest row comes due, or a
+    grace from now when the queue is empty, since nothing released after now can come due
+    sooner (22 §10.3; `crates/meta/src/collector.rs`). The collector runs beside each range's
+    leader; two at once, across a change of leader, only repeat steps that can be repeated.
   - *What the queue cannot see:* a gateway that stops between writing a file and handing it
     over leaves a file no range ever held. Finding those needs the sweep between layers that
-    Tectonic runs (01 §1.6), from files to the writes they were made for.
+    Tectonic runs (01 §1.6), from files to the writes they were made for (§6).
 - **Multipart.** CreateMultipartUpload writes the upload row. UploadPart writes the part's
   chunks, blocks and file, then replaces the part row. CompleteMultipartUpload writes the
   object's file of part extents in its File range, then, in the Name range, checks the
@@ -210,9 +216,29 @@ layers removes them, as Tectonic's does [01 §1.6].
     itself. It names each read and command and the range it goes to, and moves on with the
     answer. It tells the request that started it what that request learns: created,
     deleted, not empty, or taken over by a later attempt. The simulation drives this
-    coordinator, stepping any attempt between any two of its reads and commands. The
-    collector resumes a deleted bucket's cleanup from its row, and takes over a stalled
-    create by abandoning it.
+    coordinator, stepping any attempt between any two of its reads and commands.
+  - *Attempts left behind.* A gateway that stops leaves its attempt where it was. The Bucket
+    range keeps an index of the buckets whose create or delete is in progress, and each
+    bucket's row the range time its attempt last showed progress: when it began, and each
+    `Progress` step its driver sends while the attempt works through the Name ranges. The
+    collector pages the index, and takes over an attempt that has gone its patience without
+    progress: a create by abandoning it as a delete, a delete by running it again under a new
+    attempt, and a deleted bucket's cleanup by resuming it from its row. Measuring from
+    progress rather than from the start keeps a long delete, paging through many uploads,
+    from being taken over while it works (22 §10.5). Taking over early is safe, since every
+    range refuses the steps of an older attempt; it only aborts a slow one. So the patience
+    trades that abort against how long a stalled create keeps its name answering
+    `OperationAborted`; it is the gateway's per-step deadline times its retry budget, plus
+    the clock offset between ranges, measured once the gateway runs (22 §10.5).
+  - *Resuming a cleanup.* Every step of a deleted bucket's cleanup can be repeated from its
+    start: condemning a gate the cleanup already dropped is done, as the range's floor shows
+    the gate was removed by this attempt or a later one, and collecting where the gate is
+    gone is done, since a gate is dropped only once its range holds no row of the bucket.
+    The simulation's schedules include gateways that stop for good mid-attempt, and after
+    every schedule the faults stop, the collector acts on its schedule, and every create and
+    delete must end with the bucket active or its name forgotten. Before the rule for
+    condemning a dropped gate, a cleanup that stopped after its first drop could never be
+    resumed: the simulation found such a schedule within 2,000.
 - **Listing** scans the Name range in key order. ListObjects takes the first version of each
   key and passes keys whose first version is a delete marker (05 §6.4); ListObjectVersions
   takes every version, newest first; ListMultipartUploads takes uploads, reaching a key's
@@ -308,8 +334,11 @@ cover the production engine, which the simulator cannot.
 - How an entry larger than a datagram reaches the replicas: over QUIC, or fragmented on the
   UDP plane. A completion of 10,000 parts is an entry of hundreds of kilobytes in the Name
   range and another in the File range.
-- The collector's schedule (§2), and the sweep that finds files a stopped gateway made and
-  never handed over.
+- The sweep that finds files a stopped gateway made and never handed over (§2), and the
+  collector's pacing against foreground latency, with a floor that keeps its backlog bounded
+  (22 §10.1–§10.3). The patience after which an attempt is taken over, and the floor under
+  the grace period, the longest read's deadline plus clock offset (22 §10.4), are measured
+  once the gateway runs.
 - The bound on a cached bucket row's staleness, and how a versioning change reaches
   gateways within it.
 - Where a bucket's lifecycle and tag configurations live. A lifecycle configuration at its

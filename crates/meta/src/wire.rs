@@ -369,6 +369,13 @@ fn put_bucket(w: &mut Writer, c: &bucket::Command) -> Result<(), RecordError> {
             w.u64(*incarnation);
             put_default(w, *default);
         }
+        bucket::Command::Progress {
+            bucket, attempt, ..
+        } => {
+            w.u8(9);
+            record::put_str(w, bucket)?;
+            w.u64(*attempt);
+        }
     }
     Ok(())
 }
@@ -416,6 +423,11 @@ fn take_bucket(r: &mut Reader<'_>, at_ns: u64) -> Option<bucket::Command> {
             bucket: record::take_str(r)?,
             incarnation: r.u64()?,
             default: take_default(r)?,
+        },
+        9 => bucket::Command::Progress {
+            bucket: record::take_str(r)?,
+            attempt: r.u64()?,
+            at_ns,
         },
         _ => return None,
     })
@@ -846,6 +858,7 @@ fn put_bucket_outcome(w: &mut Writer, o: &bucket::Outcome) {
         O::VersioningLocked => (14, None),
         O::VersioningNotEnabled => (15, None),
         O::LockConfigured => (16, None),
+        O::Progressed => (17, None),
     };
     w.u8(code);
     if let Some((incarnation, attempt)) = attempt {
@@ -880,6 +893,7 @@ fn take_bucket_outcome(r: &mut Reader<'_>) -> Option<bucket::Outcome> {
         14 => O::VersioningLocked,
         15 => O::VersioningNotEnabled,
         16 => O::LockConfigured,
+        17 => O::Progressed,
         _ => return None,
     })
 }
@@ -1083,6 +1097,11 @@ mod tests {
                 bucket: "b".into(),
                 incarnation: 2,
                 default: None,
+            }),
+            Command::Bucket(bucket::Command::Progress {
+                bucket: "b".into(),
+                attempt: 7,
+                at_ns,
             }),
             named(name::Command::Retain(name::Retain {
                 bucket: "b".into(),
@@ -1304,6 +1323,7 @@ mod tests {
                 B::VersioningLocked,
                 B::VersioningNotEnabled,
                 B::LockConfigured,
+                B::Progressed,
             ]
             .map(Answer::Bucket),
         );

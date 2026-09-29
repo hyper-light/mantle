@@ -14,6 +14,8 @@ pub const LOCAL: u8 = 0x00;
 /// read by scanning its marker, so every kind has a marker of its own: two kinds that shared
 /// one would each read the other's rows as their own.
 pub mod marker {
+    /// The Bucket range's creates and deletes in progress.
+    pub const ATTEMPT: u8 = b'a';
     pub const CLOCK: u8 = b'c';
     /// A session's place in the order of last use.
     pub const EXPIRY: u8 = b'e';
@@ -31,7 +33,8 @@ pub mod marker {
     pub const SESSION: u8 = b's';
 
     /// Every marker in use.
-    pub const ALL: [u8; 9] = [
+    pub const ALL: [u8; 10] = [
+        ATTEMPT,
         CLOCK,
         EXPIRY,
         FLOOR,
@@ -124,6 +127,38 @@ pub fn gate(bucket: &str) -> Vec<u8> {
     let mut out = vec![LOCAL, marker::GATE];
     put_string(&mut out, bucket.as_bytes());
     out
+}
+
+/// The key of a bucket's row in the Bucket range's index of creates and deletes in progress,
+/// which the collector reads for attempts to take over (docs/design/metadata.md §2).
+pub fn attempt(bucket: &str) -> Vec<u8> {
+    let mut out = vec![LOCAL, marker::ATTEMPT];
+    put_string(&mut out, bucket.as_bytes());
+    out
+}
+
+/// The keys of the index of attempts in progress after `after`, or from its first, and a key
+/// past its last.
+pub fn attempts_after(after: Option<&str>) -> (Vec<u8>, Vec<u8>) {
+    let from = match after {
+        Some(bucket) => {
+            let mut k = attempt(bucket);
+            k.push(0);
+            k
+        }
+        None => vec![LOCAL, marker::ATTEMPT],
+    };
+    (from, vec![LOCAL, marker::ATTEMPT.saturating_add(1)])
+}
+
+/// The bucket an attempt's index key names; `None` if it is not one.
+pub fn decode_attempt(k: &[u8]) -> Option<String> {
+    let rest = k.strip_prefix(&[LOCAL, marker::ATTEMPT])?;
+    let (name, rest) = take_string(rest)?;
+    if !rest.is_empty() {
+        return None;
+    }
+    String::from_utf8(name).ok()
 }
 
 /// The range's queue of the files it released, oldest first (docs/design/metadata.md §2).

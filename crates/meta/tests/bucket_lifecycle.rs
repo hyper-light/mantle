@@ -11,12 +11,16 @@
 //! (docs/design/metadata.md §2), driven by the coordinator the gateway runs
 //! (`mantle_meta::coordinator`), under schedules proptest chooses: coordinators that stall and
 //! are taken over between any two of their reads and commands, collectors that resume deletes
-//! left behind, and writers whose view of the bucket is stale. After every step, no write a
-//! Name range acknowledged is lost to a delete, and a forgotten bucket leaves no gate behind.
+//! left behind, whether or not the collector's schedule calls for it, and writers whose view
+//! of the bucket is stale. After every step, no write a Name range acknowledged is lost to a
+//! delete, and a forgotten bucket leaves no gate behind. Once the schedule's faults stop,
+//! every coordinator runs and the collector acts on its schedule, and every create and delete
+//! comes to an end: the bucket active, or its name forgotten.
 
 use std::collections::BTreeMap;
 
 use mantle_meta::bucket::{self, Create};
+use mantle_meta::collector::{Schedule, Takeover};
 use mantle_meta::coordinator::{Answer, Coordinator, Request, Settled};
 use mantle_meta::engine::Model;
 use mantle_meta::name::{self, Delete, Preconditions, Probe, Put};
@@ -42,8 +46,13 @@ enum Action {
     Abandon,
     /// The collector resuming a deleted bucket's cleanup.
     Collect,
+    /// The collector acting on its schedule: taking over every attempt that has gone its
+    /// patience without progress.
+    Collector,
     /// One step of one coordinator in flight.
     Step(usize),
+    /// A coordinator's gateway stops for good, leaving its attempt where it was.
+    Crash(usize),
     /// A writer puts or removes a key under one of the incarnations it has seen.
     Put {
         key: usize,
@@ -63,7 +72,9 @@ fn action() -> impl Strategy<Value = Action> {
         1 => Just(Action::Delete),
         1 => Just(Action::Abandon),
         1 => Just(Action::Collect),
+        1 => Just(Action::Collector),
         8 => (0usize..4).prop_map(Action::Step),
+        1 => (0usize..4).prop_map(Action::Crash),
         3 => (0usize..4, 0usize..3).prop_map(|(key, view)| Action::Put { key, view }),
         2 => (0usize..4, 0usize..3).prop_map(|(key, view)| Action::Remove { key, view }),
         2 => Just(Action::Look),
@@ -73,6 +84,13 @@ fn action() -> impl Strategy<Value = Action> {
 /// Rows a coordinator's read or collection passes or removes at a time: one, so every paused
 /// read and partial collection is exercised.
 const BUDGET: u32 = 1;
+
+/// The collector's waits, in the simulation's clock, which moves 10 a step: an attempt whose
+/// coordinator has not stepped for ten steps is taken over.
+const SCHEDULE: Schedule = Schedule {
+    grace_ns: 1_000,
+    patience_ns: 100,
+};
 
 #[derive(Default)]
 struct World {
@@ -166,9 +184,40 @@ impl World {
                     self.coordinators.push(c);
                 }
             }
+            Action::Collector => {
+                for (name, row) in bucket::attempts(&self.buckets, None, 16).unwrap() {
+                    match SCHEDULE.takeover(&row, self.clock) {
+                        None => {}
+                        Some(Takeover::Abandon) => {
+                            let outcome = self.bucket(bucket::Command::Abandon {
+                                bucket: name,
+                                at_ns: self.clock,
+                            });
+                            self.start(outcome);
+                        }
+                        Some(Takeover::Delete) => {
+                            let outcome = self.bucket(bucket::Command::BeginDelete {
+                                bucket: name,
+                                at_ns: self.clock,
+                            });
+                            self.start(outcome);
+                        }
+                        Some(Takeover::Resume) => {
+                            if let Some(c) =
+                                Coordinator::resume(&name, &row, RANGES, BUDGET).unwrap()
+                            {
+                                self.coordinators.push(c);
+                            }
+                        }
+                    }
+                }
+            }
             Action::Step(i) => {
                 if !self.coordinators.is_empty() {
                     let i = i % self.coordinators.len();
+                    // A coordinator that steps is alive, and its driver says so.
+                    let progress = self.coordinators[i].progress(self.clock);
+                    self.bucket(progress);
                     if let Some(request) = self.coordinators[i].next() {
                         let answer = self.serve(request);
                         self.coordinators[i].answer(answer).unwrap();
@@ -177,6 +226,13 @@ impl World {
                         let done = self.coordinators.swap_remove(i);
                         self.settled.push(done.settled());
                     }
+                }
+            }
+            Action::Crash(i) => {
+                if !self.coordinators.is_empty() {
+                    let i = i % self.coordinators.len();
+                    self.coordinators.swap_remove(i);
+                    self.settled.push(None);
                 }
             }
             Action::Put { key, view } => {
@@ -233,6 +289,33 @@ impl World {
             self.act(&Action::Step(i));
             self.check();
         }
+    }
+
+    /// With the faults over, every coordinator runs to its end, and the collector acts on its
+    /// schedule once the attempts left behind have gone their patience: every create and
+    /// delete comes to an end within a few rounds.
+    fn finish(&mut self) {
+        for _ in 0..16 {
+            let mut budget = 10_000;
+            while !self.coordinators.is_empty() && budget > 0 {
+                self.act(&Action::Step(0));
+                self.check();
+                budget -= 1;
+            }
+            assert!(self.coordinators.is_empty(), "a coordinator never finished");
+            if bucket::attempts(&self.buckets, None, 1).unwrap().is_empty() {
+                let state = self.row().map(|r| r.state);
+                assert!(
+                    matches!(state, None | Some(BucketState::Active)),
+                    "no attempt left, yet the bucket is {state:?}"
+                );
+                return;
+            }
+            self.clock += SCHEDULE.patience_ns;
+            self.act(&Action::Collector);
+            self.check();
+        }
+        panic!("attempts left after 16 rounds of the collector");
     }
 
     fn check(&self) {
@@ -300,6 +383,7 @@ proptest! {
             world.act(action);
             world.check();
         }
+        world.finish();
     }
 }
 

@@ -60,6 +60,13 @@ pub enum Command {
         bucket: String,
         attempt: u64,
     },
+    /// The attempt is alive: its driver says so while it works through the Name ranges, so
+    /// the collector does not take it over (docs/design/metadata.md §2).
+    Progress {
+        bucket: String,
+        attempt: u64,
+        at_ns: u64,
+    },
 }
 
 /// CreateBucket's first step: records the bucket as being created, or takes over a create
@@ -96,6 +103,8 @@ pub enum Outcome {
     Restored,
     Deleted,
     Forgotten,
+    /// The attempt's progress was recorded.
+    Progressed,
     /// `409 BucketAlreadyOwnedByYou` (05 §10.3).
     AlreadyOwnedByYou,
     /// `409 BucketAlreadyExists` (05 §10.3).
@@ -162,6 +171,11 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
             Outcome::Deleted,
         )?,
         Command::Forget { bucket, attempt } => forget(engine, bucket, *attempt)?,
+        Command::Progress {
+            bucket,
+            attempt,
+            at_ns,
+        } => progress(engine, bucket, *attempt, *at_ns)?,
     };
     engine.apply(index, &writes)?;
     Ok(outcome)
@@ -177,7 +191,11 @@ fn create<E: Rows>(engine: &E, c: &Create) -> Result<(Outcome, Vec<Write>), Meta
             {
                 // The same request again, after its coordinator stopped answering.
                 let (attempt, clock) = clock::tick(engine, c.at_ns)?;
-                let row = Bucket { attempt, ..row };
+                let row = Bucket {
+                    attempt,
+                    progress_ns: attempt,
+                    ..row
+                };
                 let writes = vec![clock, Write::Put(key::bucket(&c.bucket), row.encode()?)];
                 return Ok((
                     Outcome::Creating {
@@ -211,6 +229,7 @@ fn create<E: Rows>(engine: &E, c: &Create) -> Result<(Outcome, Vec<Write>), Meta
         },
         state: BucketState::Creating,
         attempt: time,
+        progress_ns: time,
         lock: c.lock.then(Lock::default),
     };
     let count = Owner {
@@ -220,6 +239,7 @@ fn create<E: Rows>(engine: &E, c: &Create) -> Result<(Outcome, Vec<Write>), Meta
         clock,
         Write::Put(key::bucket(&c.bucket), row.encode()?),
         Write::Put(key::owner(&c.owner), count.encode()),
+        Write::Put(key::attempt(&c.bucket), Vec::new()),
     ];
     Ok((
         Outcome::Creating {
@@ -321,6 +341,7 @@ fn begin<E: Rows>(
     let row = Bucket {
         state: BucketState::Deleting,
         attempt,
+        progress_ns: attempt,
         ..row
     };
     Ok((
@@ -328,7 +349,11 @@ fn begin<E: Rows>(
             incarnation,
             attempt,
         },
-        vec![clock, Write::Put(key::bucket(bucket), row.encode()?)],
+        vec![
+            clock,
+            Write::Put(key::bucket(bucket), row.encode()?),
+            Write::Put(key::attempt(bucket), Vec::new()),
+        ],
     ))
 }
 
@@ -357,7 +382,7 @@ fn step<E: Rows>(
         return Ok((Outcome::Conflict, Vec::new()));
     }
     let owned = key::owned(&row.owner, bucket);
-    let mut writes = Vec::with_capacity(3);
+    let mut writes = Vec::with_capacity(4);
     match to {
         BucketState::Active => {
             let listed = Owned {
@@ -365,6 +390,8 @@ fn step<E: Rows>(
                 location: row.location.clone(),
             };
             writes.push(Write::Put(owned, listed.encode()?));
+            // The attempt is over: nothing is left for the collector.
+            writes.push(Write::Delete(key::attempt(bucket)));
         }
         BucketState::Deleted => {
             writes.push(Write::Delete(owned));
@@ -384,11 +411,58 @@ fn forget<E: Rows>(
 ) -> Result<(Outcome, Vec<Write>), MetaError> {
     match read(engine, bucket)? {
         None => Ok((Outcome::Forgotten, Vec::new())),
-        Some(row) if row.state == BucketState::Deleted && row.attempt == attempt => {
-            Ok((Outcome::Forgotten, vec![Write::Delete(key::bucket(bucket))]))
-        }
+        Some(row) if row.state == BucketState::Deleted && row.attempt == attempt => Ok((
+            Outcome::Forgotten,
+            vec![
+                Write::Delete(key::bucket(bucket)),
+                Write::Delete(key::attempt(bucket)),
+            ],
+        )),
         Some(_) => Ok((Outcome::Conflict, Vec::new())),
     }
+}
+
+/// Records that `attempt` is alive, if it still owns the bucket's row and has not finished.
+fn progress<E: Rows>(
+    engine: &E,
+    bucket: &str,
+    attempt: u64,
+    at_ns: u64,
+) -> Result<(Outcome, Vec<Write>), MetaError> {
+    let Some(row) = read(engine, bucket)? else {
+        return Ok((Outcome::Conflict, Vec::new()));
+    };
+    if row.attempt != attempt || row.state == BucketState::Active {
+        return Ok((Outcome::Conflict, Vec::new()));
+    }
+    let (progress_ns, clock) = clock::tick(engine, at_ns)?;
+    let row = Bucket { progress_ns, ..row };
+    Ok((
+        Outcome::Progressed,
+        vec![clock, Write::Put(key::bucket(bucket), row.encode()?)],
+    ))
+}
+
+/// The buckets whose create or delete is in progress, after `after` in name order, at most
+/// `max`, with their rows: what the collector looks through for attempts to take over.
+pub fn attempts<E: Rows>(
+    engine: &E,
+    after: Option<&str>,
+    max: usize,
+) -> Result<Vec<(String, Bucket)>, MetaError> {
+    let (mut from, to) = key::attempts_after(after);
+    let mut out = Vec::new();
+    while out.len() < max {
+        let Some((k, _)) = engine.next(&from, &to)? else {
+            break;
+        };
+        let name = key::decode_attempt(&k).ok_or(MetaError::Corrupt)?;
+        let row = read(engine, &name)?.ok_or(MetaError::Corrupt)?;
+        out.push((name, row));
+        from = k;
+        from.push(0);
+    }
+    Ok(out)
 }
 
 /// The write that counts one bucket fewer for `owner`, removing its row at none.
@@ -739,5 +813,85 @@ mod tests {
             r.run(version("c", c, Versioning::Suspended)),
             Outcome::VersioningLocked
         );
+    }
+
+    fn names(r: &Range) -> Vec<String> {
+        attempts(&r.engine, None, 100)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    fn progress(bucket: &str, attempt: u64, at_ns: u64) -> Command {
+        Command::Progress {
+            bucket: bucket.into(),
+            attempt,
+            at_ns,
+        }
+    }
+
+    /// Every create and delete in progress is in the index, stamped with its latest progress,
+    /// until it ends; the collector reads nothing else.
+    #[test]
+    fn attempts_in_progress_are_indexed_and_stamped_until_they_end() {
+        let mut r = Range::default();
+        let (_, a) = begun(r.create("b", "o", 100, 10));
+        let (_, c) = begun(r.create("c", "o", 110, 10));
+        assert_eq!(names(&r), ["b", "c"]);
+        assert_eq!(read(&r.engine, "b").unwrap().unwrap().progress_ns, 100);
+        // Progress moves the stamp forward, in the range's clock; a stale attempt's does not.
+        assert_eq!(r.run(progress("b", a, 150)), Outcome::Progressed);
+        assert_eq!(read(&r.engine, "b").unwrap().unwrap().progress_ns, 150);
+        assert_eq!(r.run(progress("b", a, 120)), Outcome::Progressed);
+        assert_eq!(read(&r.engine, "b").unwrap().unwrap().progress_ns, 151);
+        assert_eq!(r.run(progress("b", a + 1, 200)), Outcome::Conflict);
+        assert_eq!(r.run(progress("nope", 1, 200)), Outcome::Conflict);
+        // Paging resumes after the last bucket read.
+        let first = attempts(&r.engine, None, 1).unwrap();
+        assert_eq!(first.len(), 1);
+        let rest = attempts(&r.engine, Some(&first[0].0), 10).unwrap();
+        assert_eq!(
+            rest.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            ["c"]
+        );
+        // An active bucket has no attempt left: it leaves the index, and takes no progress.
+        assert_eq!(r.run(activate("b", a)), Outcome::Activated);
+        assert_eq!(names(&r), ["c"]);
+        assert_eq!(r.run(progress("b", a, 300)), Outcome::Conflict);
+        // A delete joins the index, stamped at its start, and stays through the cleanup that
+        // follows a deletion, until the name is forgotten.
+        let (_, d) = begun(r.run(Command::BeginDelete {
+            bucket: "b".into(),
+            at_ns: 400,
+        }));
+        assert_eq!(read(&r.engine, "b").unwrap().unwrap().progress_ns, d);
+        assert_eq!(names(&r), ["b", "c"]);
+        let delete = Command::Delete {
+            bucket: "b".into(),
+            attempt: d,
+        };
+        assert_eq!(r.run(delete), Outcome::Deleted);
+        assert_eq!(names(&r), ["b", "c"]);
+        assert_eq!(r.run(progress("b", d, 500)), Outcome::Progressed);
+        let forget = Command::Forget {
+            bucket: "b".into(),
+            attempt: d,
+        };
+        assert_eq!(r.run(forget), Outcome::Forgotten);
+        assert_eq!(names(&r), ["c"]);
+        // A create abandoned by the collector stays in the index as a delete.
+        let (_, e) = begun(r.run(Command::Abandon {
+            bucket: "c".into(),
+            at_ns: 600,
+        }));
+        assert!(e > c);
+        assert_eq!(names(&r), ["c"]);
+        let restore = Command::Restore {
+            bucket: "c".into(),
+            attempt: e,
+        };
+        assert_eq!(r.run(restore), Outcome::Restored);
+        assert!(names(&r).is_empty());
     }
 }

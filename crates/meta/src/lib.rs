@@ -18,6 +18,7 @@ pub mod apply;
 pub mod block;
 pub mod bucket;
 pub mod clock;
+pub mod collector;
 pub mod coordinator;
 pub mod engine;
 pub mod error;

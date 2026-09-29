@@ -431,7 +431,13 @@ fn move_gate<E: Rows>(engine: &E, g: &GateChange) -> Result<(Outcome, Vec<Write>
             }
         }
         None => {
-            if g.from.is_some() || g.attempt < floor(engine)? {
+            let floor = floor(engine)?;
+            // A deleted bucket's cleanup resumed after it dropped this gate: the floor shows
+            // this attempt, or a later one, removed it, and the step it repeats is done.
+            if (g.from, g.to) == (Some(Closed), Some(Condemned)) && g.attempt <= floor {
+                return Ok((Outcome::GateMoved, Vec::new()));
+            }
+            if g.from.is_some() || g.attempt < floor {
                 return Ok((Outcome::Conflict, Vec::new()));
             }
         }
@@ -461,12 +467,16 @@ fn floor<E: Rows>(engine: &E) -> Result<u64, MetaError> {
 }
 
 fn collect<E: Rows>(engine: &E, c: &Collect) -> Result<(Outcome, Vec<Write>), MetaError> {
-    let condemned = gate(engine, &c.bucket)?
-        .is_some_and(|g| g.incarnation == c.incarnation && g.state == GateState::Condemned);
-    if !condemned {
-        return Ok((Outcome::Conflict, Vec::new()));
-    }
     let (mut from, to) = key::bucket_span(&c.bucket);
+    match gate(engine, &c.bucket)? {
+        Some(g) if g.incarnation == c.incarnation && g.state == GateState::Condemned => {}
+        // A gate is dropped only once the range holds no row of its bucket: a cleanup that
+        // resumes after the drop has nothing left to collect here.
+        None if engine.next(&from, &to)?.is_none() => {
+            return Ok((Outcome::Collected { done: true }, Vec::new()));
+        }
+        _ => return Ok((Outcome::Conflict, Vec::new())),
+    }
     let now = clock::now(engine, c.at_ns)?;
     let mut writes = Vec::new();
     for _ in 0..c.budget {
@@ -2221,6 +2231,18 @@ mod tests {
         assert_eq!(files, [11, 12, 13]);
         assert_eq!(r.gate_at(4, Some(Condemned), None), Outcome::GateMoved);
         assert_eq!(r.gate_at(4, Some(Condemned), None), Outcome::GateMoved);
+        assert_eq!(gate(&r.engine, "b").unwrap(), None);
+        // The cleanup resumed from its start after the drop: condemning and collecting are
+        // done already. An attempt past the floor never had this gate to condemn.
+        assert_eq!(
+            r.gate_at(4, Some(Closed), Some(Condemned)),
+            Outcome::GateMoved
+        );
+        assert_eq!(r.run(collect(2)), Outcome::Collected { done: true });
+        assert_eq!(
+            r.gate_at(5, Some(Closed), Some(Condemned)),
+            Outcome::Conflict
+        );
         assert_eq!(gate(&r.engine, "b").unwrap(), None);
         assert_eq!(r.gate_at(3, None, Some(Open)), Outcome::Conflict);
         assert_eq!(r.gate_at(4, None, Some(Open)), Outcome::GateMoved);

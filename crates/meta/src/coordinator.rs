@@ -131,8 +131,9 @@ impl Coordinator {
     }
 
     /// The collector's resumption of a deleted bucket's cleanup, from the Bucket range's row:
-    /// condemn the gates, remove the uploads, drop the gates, forget the name. `None` unless
-    /// the row is deleted.
+    /// condemn the gates, remove the uploads, drop the gates, forget the name. Every step is
+    /// done again, and a gate the cleanup already dropped reads as condemned and swept, so it
+    /// resumes from wherever it stopped. `None` unless the row is deleted.
     pub fn resume(
         bucket: &str,
         row: &Bucket,
@@ -178,6 +179,17 @@ impl Coordinator {
     /// What the attempt's request learns, once the attempt has reached it.
     pub fn settled(&self) -> Option<Settled> {
         self.settled
+    }
+
+    /// The Bucket-range command that records the attempt's progress at `at_ns`: its driver
+    /// sends it while the attempt works through the Name ranges, so the collector leaves the
+    /// attempt alone (collector.rs).
+    pub fn progress(&self, at_ns: u64) -> bucket::Command {
+        bucket::Command::Progress {
+            bucket: self.bucket.clone(),
+            attempt: self.attempt,
+            at_ns,
+        }
     }
 
     pub fn is_done(&self) -> bool {
@@ -314,7 +326,7 @@ impl Coordinator {
             (Phase::Sweep(range), Answer::Name(outcome)) => match outcome {
                 Collected { done: false } => Phase::Sweep(range),
                 Collected { done: true } => self.then(range, Phase::Sweep, Phase::Drop(0)),
-                // Another collector removed the gate first.
+                // The gate is another incarnation's: the name was forgotten and taken again.
                 Conflict => self.superseded(),
                 _ => return Err(CoordinatorError::Unexpected),
             },

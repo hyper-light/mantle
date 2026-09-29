@@ -160,6 +160,10 @@ pub struct Bucket {
     /// The create or delete attempt that last moved it: the Bucket range's time when the
     /// attempt began. A step of an older attempt is refused.
     pub attempt: u64,
+    /// The Bucket range's time when that attempt last showed progress: when it began, or its
+    /// latest `Progress` step. The collector takes over a create or delete that has gone its
+    /// patience without progress (docs/design/metadata.md §2).
+    pub progress_ns: u64,
     /// Its Object Lock configuration, once Object Lock is on, which is for good (18 §2.1).
     pub lock: Option<Lock>,
 }
@@ -410,6 +414,7 @@ impl Bucket {
         w.u8(self.versioning.code());
         w.u8(self.state.code());
         w.u64(self.attempt);
+        w.u64(self.progress_ns);
         match self.lock {
             None => w.u8(0),
             Some(Lock { default: None }) => w.u8(1),
@@ -434,6 +439,7 @@ impl Bucket {
                     versioning: Versioning::from_code(r.u8()?)?,
                     state: BucketState::from_code(r.u8()?)?,
                     attempt: r.u64()?,
+                    progress_ns: r.u64()?,
                     lock: match r.u8()? {
                         0 => None,
                         1 => Some(Lock::default()),
@@ -1029,6 +1035,7 @@ mod tests {
                 state: BucketState::Active,
                 attempt: 1,
                 lock,
+                progress_ns: 0,
             };
             assert_eq!(Bucket::decode(&b.encode().unwrap()), Ok(b));
         }
@@ -1119,6 +1126,7 @@ mod tests {
                 state,
                 attempt: 8,
                 lock: None,
+                progress_ns: 0,
             };
             assert_eq!(Bucket::decode(&b.encode().unwrap()), Ok(b));
         }

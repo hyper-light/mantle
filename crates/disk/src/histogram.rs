@@ -2,11 +2,15 @@
 //!
 //! Values are bucketed by their power of two and, within it, by the next `SUB_BITS` bits, as
 //! HdrHistogram does (Tene, "HdrHistogram: A High Dynamic Range Histogram"), so the relative
-//! error of any reported percentile is below 2^-SUB_BITS (12.5% here) at every magnitude, in
-//! constant memory. Values are nanoseconds; anything at or above 2^41 ns (~37 minutes) lands
-//! in a final overflow bucket whose bound is `u64::MAX`.
+//! error of any reported percentile is below 2^-SUB_BITS at every magnitude, in constant
+//! memory. A percentile is its bucket's upper bound, so the error is one-sided: it never
+//! under-reports a latency. Values are nanoseconds; anything at or above 2^41 ns (~37
+//! minutes) lands in a final overflow bucket whose bound is `u64::MAX`.
 
-const SUB_BITS: u32 = 3;
+/// 3.1% one-sided error in 1,185 buckets (9.5 KB): a third of the ±10% the benchmark's
+/// repeated runs resolve, so quantization is not what decides a comparison between runs
+/// (docs/research/11 §14, §16).
+const SUB_BITS: u32 = 5;
 const SUB: usize = 1 << SUB_BITS;
 /// The largest power of two with its own row.
 const MAX_EXP: u32 = 40;
@@ -170,7 +174,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn percentiles_bound_the_true_value_within_one_eighth(
+        fn percentiles_bound_the_true_value_within_one_thirty_second(
             mut values in proptest::collection::vec(1u64..(1 << 40), 1..2000),
             ppm in 1u32..=1_000_000,
         ) {
@@ -181,7 +185,7 @@ mod tests {
             let truth = values[rank - 1];
             let got = h.quantile(ppm);
             prop_assert!(got >= truth, "q{ppm}: {got} < true {truth}");
-            prop_assert!(got as f64 <= truth as f64 * 1.125 + 1.0, "q{ppm}: {got} >> true {truth}");
+            prop_assert!(got as f64 <= truth as f64 * 1.03125 + 1.0, "q{ppm}: {got} >> true {truth}");
         }
 
         #[test]

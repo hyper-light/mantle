@@ -61,8 +61,15 @@ pub(crate) const CLEANER_RESERVE: usize = 1;
 /// above the reservation. A freed segment keeps its records until they are overwritten, and
 /// a batch whose flush failed may have left records on the device that the log never names;
 /// numbers taken from what the log remembers could repeat theirs, and a reused incarnation
-/// would let roll-forward take a stale record for a new one. A reservation costs one
-/// superblock write and flush; recovery skips what was reserved but not used.
+/// would let roll-forward take a stale record for a new one. Recovery skips what was
+/// reserved but not used, the way Percolator's timestamp oracle does (docs/research/11 §11).
+///
+/// A reservation costs one superblock write and flush, `c`, so reserving `R` at a time for
+/// numbers issued at rate `r` spends a fraction `c·r/R` of the writer's time on it. With the
+/// measured durable 4 KiB write, `c` = 4.7 ms: 2^24 sequences keep that fraction under 10^-3
+/// up to 3.6M puts a second, 1,000 times this machine's measured 3.7K, and 2^16 incarnations
+/// do so to 14K new segments a second, where 3 GB/s into 256 MiB segments opens 11. Each
+/// crash skips at most one reservation of 2^64, so neither space can run out.
 pub(crate) const SEQUENCE_RESERVE: u64 = 1 << 24;
 pub(crate) const INCARNATION_RESERVE: u64 = 1 << 16;
 

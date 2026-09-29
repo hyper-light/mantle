@@ -118,7 +118,11 @@ due, with the `x-amz-expiration` and abort headers, checked against the user gui
 examples and s3-tests, and every configuration read back as it was set, by property test.
 CORS: rules checked as S3 was recorded checking them, preflights answered and refused as S3
 answers them, and the headers an actual cross-origin request's response carries, checked
-against s3-tests' origin tables and LocalStack's recordings of S3. A subresource routes to
+against s3-tests' origin tables and LocalStack's recordings of S3. Bucket policies: read by
+a strict JSON reader checked against JSONTestSuite, checked as S3 was recorded checking them
+against the Service Authorization Reference's actions and keys, and requests judged against
+them as IAM documents, with its conditions, wildcards and variables, for accounts and the
+anonymous requester. A subresource routes to
 its own operation or to 405, never to the bucket or object itself, nor across from one to the
 other, and `OPTIONS` is a preflight. The documents every response carries, from listings and
 multipart results to batch deletes, errors, bucket settings, tags, ACLs, lifecycle and CORS
@@ -129,9 +133,10 @@ algorithm, signature verification and signed-chunk decoding on one core.
 
 Remaining before it is done:
 
-- The rest of 05 §16.1's later surface: bucket policies, the access S3 grants beyond the
-  owner once ACLs are disabled; server-side encryption headers; Object Lock; and browser POST
-  uploads.
+- Whether a policy makes its bucket public, and Block Public Access, which S3 turns on for
+  every new bucket: GetBucketPolicyStatus and the `publicAccessBlock` operations.
+- The rest of 05 §16.1's later surface: server-side encryption headers, Object Lock and
+  browser POST uploads.
 - The worker that takes lifecycle actions as they fall due, over the Name layer's versions
   and uploads, once the gateway and the metadata layer hold configurations (metadata.md §6).
 

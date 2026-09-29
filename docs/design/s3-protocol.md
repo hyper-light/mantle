@@ -22,6 +22,7 @@ restating S3.
 | `list` | ListObjects and ListObjectsV2 paging | 05 §6, s3-tests |
 | `xml`, `body` | the XML reader and writer, and request documents read against their schemas | 13; roxmltree as an oracle |
 | `json` | the JSON reader and compact writer, for bucket policies | 17 §1; JSONTestSuite's 318 cases |
+| `policy` | bucket policies checked, and requests judged against them | 17; S3's recorded answers, s3-tests' policies, IAM's documented semantics |
 | `tagging` | tag sets: S3's limits and characters, and the `x-amz-tagging` header | 13 §6.7, s3-tests, S3's observed answers |
 | `acl` | canned and header ACLs, Object Ownership, and whether a request's ACL goes ahead with ACLs disabled | 13 §6.8, s3-tests |
 | `lifecycle` | lifecycle rules checked, when each action falls due, and the expiration and abort headers | 13 §6.9, the user guide's worked examples, s3-tests |
@@ -442,3 +443,47 @@ be enforced differently from the one its author reviewed.
   accept but the two of a repeated name, all 188 it must refuse, and each of the 35 left to
   the implementation answered as the rules above say. Property tests read back every value
   from its compact form, and answer any bytes without a panic.
+
+## 10. Bucket policies
+
+**Decision: a bucket policy is checked as S3 checks one and judged as IAM documents, for
+mantle's principals: accounts and the anonymous requester** (`crates/s3/src/policy`; 17).
+With ACLs disabled on every bucket (§5), a policy is how a bucket's owner lets anyone else in.
+
+- **Principals.** An account is named as AWS names one, by its 12-digit ID or its root's ARN,
+  or by its canonical user ID, so a policy written for S3 names mantle's accounts unchanged.
+  mantle has no IAM users, roles or federation, so a policy naming one names no principal
+  mantle has, and is refused as S3 refuses one that does not exist, "Invalid principal in
+  policy". `"*"` and `{"AWS": "*"}` are everyone, the anonymous requester included, as IAM and
+  s3-tests have them. A service principal is accepted and matches no requester of mantle's.
+- **The document** is read by the strict JSON reader (§9) from a body of at most 40,960 bytes,
+  and held to 20,480 bytes written compactly, the normalized size S3 was recorded measuring.
+  Each fault is `400 MalformedPolicy` with S3's recorded message, or with the one versitygw
+  reports S3 answering where no recording has one. GetBucketPolicy gives back the bytes set, as
+  s3-tests expects, where S3 re-serializes: a client comparing what it set with what it gets
+  sees them equal.
+- **Actions** are the 106 the Service Authorization Reference lists on a bucket or an object,
+  generated into `policy/catalog.rs` by `scripts/s3-actions.py` from its vendored document and
+  checked against it by a test. A pattern naming none is "Policy has invalid action", and one
+  naming only actions on a kind of resource the statement's resources cannot be is "Action does
+  not apply to any resource(s) in statement", as S3 answered `s3:PutObject` on a bucket's ARN.
+- **Resources** are S3 ARNs whose bucket part can be the policy's own bucket: S3 refused `*`
+  and another bucket. A `*` stands for any run, `/` and `:` included, as IAM documents, and a
+  `?` for one character; resources compare with regard to case, actions without.
+- **Condition keys.** S3's own keys are the catalog's, each accepted only where one of the
+  statement's actions carries it; any `aws:` key is accepted, as AWS keeps adding global keys
+  and a refusal would break a valid policy.
+- **Judgment.** A denying statement that applies refuses the request, the owner's included;
+  the owner's account may do anything else, and may always read, set and delete the policy, as
+  S3 keeps a root from locking itself out; anyone else needs an allowing statement. mantle's
+  requesters are accounts, each its own root, so no identity policy stands between another
+  account and what the bucket policy grants it, as s3-tests expects of another account's root.
+- **Conditions** follow IAM: a missing key fails a positive operator and satisfies a negated
+  one, `...IfExists` and `ForAllValues`; values OR, and NOR under a negated operator. Numbers
+  compare as decimals, dates as instants from ISO 8601, a day or Unix seconds, addresses by
+  CIDR with the whole address when no prefix is given. The requester's keys, `aws:PrincipalArn`
+  and the rest, come from `principal_keys` as IAM gives them for a root and for an anonymous
+  caller.
+- **Variables**, under Version `2012-10-17` only, stand for a key's single value or a default,
+  and match themselves: a value holding `*` is not a wildcard. A resource naming a variable
+  the request has no value for matches nothing.

@@ -44,6 +44,9 @@ pub enum Operation {
     GetBucketCors,
     PutBucketCors,
     DeleteBucketCors,
+    GetBucketPolicy,
+    PutBucketPolicy,
+    DeleteBucketPolicy,
     /// A CORS preflight, `OPTIONS` on a bucket or an object.
     Preflight,
     ListObjects,
@@ -108,7 +111,7 @@ pub const MAX_KEY: usize = 1024;
 
 /// Bucket subresources S3 defines that mantle does not serve: answered `501 NotImplemented`
 /// rather than taken for another operation.
-const UNSUPPORTED: [&str; 18] = [
+const UNSUPPORTED: [&str; 17] = [
     "accelerate",
     "analytics",
     "encryption",
@@ -118,7 +121,6 @@ const UNSUPPORTED: [&str; 18] = [
     "metrics",
     "notification",
     "object-lock",
-    "policy",
     "policyStatus",
     "publicAccessBlock",
     "replication",
@@ -195,7 +197,7 @@ fn subresource(
 }
 
 /// The subresources of a bucket.
-const BUCKET_SUBRESOURCES: [Subresource; 10] = {
+const BUCKET_SUBRESOURCES: [Subresource; 11] = {
     use Operation as O;
     [
         ("location", &[("GET", O::GetBucketLocation)]),
@@ -237,6 +239,14 @@ const BUCKET_SUBRESOURCES: [Subresource; 10] = {
                 ("GET", O::GetBucketCors),
                 ("PUT", O::PutBucketCors),
                 ("DELETE", O::DeleteBucketCors),
+            ],
+        ),
+        (
+            "policy",
+            &[
+                ("GET", O::GetBucketPolicy),
+                ("PUT", O::PutBucketPolicy),
+                ("DELETE", O::DeleteBucketPolicy),
             ],
         ),
         ("versions", &[("GET", O::ListObjectVersions)]),
@@ -634,6 +644,22 @@ mod tests {
     }
 
     #[test]
+    fn policy_is_a_bucket_subresource() {
+        use Operation as O;
+        assert_eq!(op("GET", "/b", "policy"), O::GetBucketPolicy);
+        assert_eq!(op("PUT", "/b", "policy"), O::PutBucketPolicy);
+        assert_eq!(op("DELETE", "/b", "policy"), O::DeleteBucketPolicy);
+        assert_eq!(
+            r("PUT", "s3.example.com", "/b/k", "policy"),
+            Err(RouteError::MethodNotAllowed)
+        );
+        assert_eq!(
+            r("GET", "s3.example.com", "/b", "policyStatus"),
+            Err(RouteError::NotImplemented("policyStatus"))
+        );
+    }
+
+    #[test]
     fn lifecycle_is_a_bucket_subresource() {
         use Operation as O;
         assert_eq!(
@@ -650,8 +676,8 @@ mod tests {
     #[test]
     fn what_is_not_served_is_refused_plainly() {
         assert_eq!(
-            r("GET", "s3.example.com", "/b", "policy"),
-            Err(RouteError::NotImplemented("policy"))
+            r("GET", "s3.example.com", "/b", "replication"),
+            Err(RouteError::NotImplemented("replication"))
         );
         assert_eq!(
             r("DELETE", "s3.example.com", "/b", "website"),

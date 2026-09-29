@@ -103,6 +103,45 @@ fn later_frame<F: BlockFile>(
     }
 }
 
+/// Whether a valid frame of log `log` from a segment newer than incarnation `above` lies in
+/// the blocks after the one at `first`, up to `end`, whatever segment header the slot holds.
+fn newer_frame<F: BlockFile>(
+    file: &F,
+    log: u128,
+    align: Alignment,
+    first: u64,
+    end: u64,
+    above: u64,
+) -> Result<bool, LogError> {
+    let block = block_of(align)?;
+    let len = file.len()?;
+    let mut head = AlignedBuf::zeroed(align.get(), align).map_err(|e| LogError::Disk(e.into()))?;
+    head.set_len(align.get())
+        .map_err(|e| LogError::Disk(e.into()))?;
+    let mut offset = first;
+    loop {
+        offset = match offset.checked_add(block) {
+            Some(next) if next < end && next.checked_add(block).is_some_and(|e| e <= len) => next,
+            _ => return Ok(false),
+        };
+        file.read_exact_at(head.as_mut_slice(), offset)?;
+        let Some(header) = FrameHeader::decode(head.as_slice()) else {
+            continue;
+        };
+        if header.log != log || header.incarnation <= above {
+            continue;
+        }
+        let segment = Segment {
+            log,
+            incarnation: header.incarnation,
+            nonce: header.nonce,
+        };
+        if let Found::Frame(..) = frame_at(file, segment, align, offset, end)? {
+            return Ok(true);
+        }
+    }
+}
+
 fn block_of(align: Alignment) -> Result<u64, LogError> {
     u64::try_from(align.get()).map_err(|_| LogError::Config("block"))
 }
@@ -295,7 +334,7 @@ pub(crate) fn open<F: BlockFile>(
     let mut inc = highest;
     while last.is_none() {
         let mut found: Option<Last> = None;
-        let (stop, invalid) = frames_of(inc, &mut |offset, header, _, padded| {
+        let (stop, _) = frames_of(inc, &mut |offset, header, _, padded| {
             found = Some(Last {
                 incarnation: inc,
                 offset,
@@ -305,19 +344,19 @@ pub(crate) fn open<F: BlockFile>(
             });
             Ok(())
         })?;
-        if invalid {
-            // A frame is written only after the one before it is flushed, so a valid frame
-            // past an invalid one proves the invalid one was acknowledged (06 §A3).
-            let slot = *by_incarnation
-                .get(&inc)
-                .ok_or(LogError::Damaged("a live segment is missing"))?;
-            let end = start_of(slot)
-                .and_then(|s| s.checked_add(segment))
-                .ok_or(LogError::Damaged("an offset past u64"))?;
-            let after = found.map(|f| f.sequence);
-            if later_frame(file, segment_of(slot, inc), align, stop, end, after)? {
-                return Err(LogError::Damaged("an acknowledged frame does not verify"));
-            }
+        // A frame is written only after the one before it is flushed, so a valid frame past
+        // the point where the frames stop proves the frame there was acknowledged, whatever
+        // part of it no longer reads: its checksum, or its magic, format or identity
+        // (06 §A3). Only with none past it is the stop the log's end.
+        let slot = *by_incarnation
+            .get(&inc)
+            .ok_or(LogError::Damaged("a live segment is missing"))?;
+        let end = start_of(slot)
+            .and_then(|s| s.checked_add(segment))
+            .ok_or(LogError::Damaged("an offset past u64"))?;
+        let after = found.map(|f| f.sequence);
+        if later_frame(file, segment_of(slot, inc), align, stop, end, after)? {
+            return Err(LogError::Damaged("an acknowledged frame does not verify"));
         }
         last = found;
         if last.is_none() {
@@ -328,6 +367,29 @@ pub(crate) fn open<F: BlockFile>(
         }
     }
     let last = last.ok_or(LogError::Damaged("no segment holds a valid frame"))?;
+    // A slot whose header no longer reads as this log's may hold a newer segment whose header
+    // was damaged. A segment's header is written with its first frame and flushed with it, so
+    // a valid frame of this log past that first frame, in a segment newer than any whose
+    // header reads, proves the header was durable and is now damaged. The first frame alone
+    // is an opening that may never have been flushed, the torn tail's case.
+    for slot in 0..slots {
+        let i = usize::try_from(slot).map_err(|_| LogError::Damaged("a slot past usize"))?;
+        if incarnation.get(i).is_some_and(|&inc| inc != 0) {
+            continue;
+        }
+        let begin = start_of(slot).ok_or(LogError::Damaged("an offset past u64"))?;
+        let end = begin
+            .checked_add(segment)
+            .ok_or(LogError::Damaged("an offset past u64"))?;
+        let first = begin
+            .checked_add(block)
+            .ok_or(LogError::Damaged("an offset past u64"))?;
+        if newer_frame(file, id, align, first, end, highest)? {
+            return Err(LogError::Damaged(
+                "a segment's header does not read, but its frames do",
+            ));
+        }
+    }
     if last.tail > last.incarnation {
         return Err(LogError::Damaged(
             "a frame names a tail after its own segment",

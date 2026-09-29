@@ -231,7 +231,8 @@ impl<F: BlockFile> Writer<F> {
                     }
                 };
                 if payload.len().saturating_add(len) > self.capacity {
-                    seen.remove(&s.group);
+                    // The group stays taken for this frame: its later updates wait behind
+                    // this one, so its updates become durable in the order submitted.
                     self.held.push_back(s);
                     continue;
                 }

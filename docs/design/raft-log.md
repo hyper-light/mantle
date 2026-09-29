@@ -83,6 +83,10 @@ writer derived (`mantle_disk::commit`). Without it, a few replicas alternate bet
 and each update waits for two flushes
 (docs/measurements/2026-09-28-raft-log-benchmark.md, finding 2).
 
+A group's updates become durable in the order submitted. An update that waits for a frame
+with room holds its group's later updates behind it for that frame, so a newer hard state
+never lands before an older one.
+
 A replica cannot have its update refused: once the core has handed over a `Ready`, it takes
 no other call until the `Ready` is made durable (07 §1.2). So a replica submits by waiting
 for room in the queue instead of taking `Busy`. The writer frees room with every batch it
@@ -161,12 +165,16 @@ up to its quota, to hold twice that, the same headroom the chunk store's cleanin
    tail, and the live segments are those from the tail to the head, in incarnation order.
 3. Replay every live segment's frames in sequence order, rebuilding each group's state. A
    later record wins, and `Entries` replace any entries at or after their first index.
-4. An invalid frame is a torn tail if no valid frame with a later sequence follows it,
-   anywhere after it in its segment or in a later one: it was never acknowledged, so the
-   log is cut there. If a later frame does follow, the acknowledged state was damaged, as
-   protocol-aware recovery tells a crash from corruption (06 §A3; chunk-store.md §3.2).
-   The log reports the damage and its replicas recover from their peers. It never
-   truncates silently.
+4. Where a segment's frames stop, whatever no longer reads there, its checksum or its
+   magic, format or identity, the stop is a torn tail only if no valid frame with a later
+   sequence follows it, anywhere after it in its segment or in a later one: it was never
+   acknowledged, so the log is cut there. If a later frame does follow, the acknowledged
+   state was damaged, as protocol-aware recovery tells a crash from corruption (06 §A3;
+   chunk-store.md §3.2). The same holds one level up: a segment's header is flushed with
+   its first frame, so a slot whose header no longer reads but which holds this log's
+   frames past the first, from a segment newer than any whose header reads, lost a header
+   that was durable. The log reports the damage, writes nothing, and its replicas recover
+   from their peers. It never truncates silently.
 5. The block where the next frame goes is overwritten with zeros and flushed before any
    write. A frame there was never acknowledged, but it may be partly durable: its header
    whole while its last sectors, or the file's end, are not. Left alone, a later crash
@@ -193,7 +201,9 @@ multi-sector writes, fails flushes after marking pages clean, and flips bits on 
 (mantle-disk sim.rs). The tests cover these properties:
 
 - every acknowledged submission survives any crash;
-- a torn tail is cut and corruption is reported;
+- a torn tail is cut and corruption is reported, damage to any field of a frame or of a
+  segment header included, and slots reused by a newer segment prove nothing about it;
+- a group's updates held behind a frame's room become durable in the order submitted;
 - reclamation never loses a live record;
 - a group's state after recovery equals its state before the crash, less what was never
   acknowledged.

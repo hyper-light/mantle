@@ -589,6 +589,385 @@ fn damage_to_an_acknowledged_frame_is_reported() {
     ));
 }
 
+/// Damage to any field of an acknowledged frame, header or payload, is reported when a later
+/// frame proves the frame was flushed: a header whose magic, format or identity no longer
+/// reads is damage, not the log's end (audit S01).
+#[test]
+fn damage_to_any_field_of_an_acknowledged_frame_is_reported() {
+    // Offsets in the frame header: magic, format, padding, log, incarnation, nonce,
+    // sequence, tail, payload length, record count, CRC; then the payload.
+    for field in [0u64, 4, 5, 8, 24, 32, 40, 48, 56, 60, 64, 70] {
+        let file = sim(10 + field);
+        let log = Log::create(Arc::clone(&file), config(16, 8), ID).unwrap();
+        for i in 1..=4u64 {
+            log.write(
+                1,
+                Update {
+                    entries: Some(entries(i, &[1])),
+                    ..Update::default()
+                },
+            )
+            .unwrap();
+        }
+        drop(log);
+        // The frame of the first update, after the segment header and the empty first frame.
+        file.inject(Fault::BitFlip {
+            offset: 2 * BLOCK as u64 + field,
+            bit: 0,
+            stored: true,
+        })
+        .unwrap();
+        let opened = Log::open(Arc::clone(&file), config(16, 8), ID);
+        assert!(
+            matches!(opened, Err(LogError::Damaged(_))),
+            "damage at byte {field} of a frame: {:?}",
+            opened.map(|_| ())
+        );
+    }
+}
+
+/// Each segment header in the durable image, by slot: its offset and incarnation.
+fn segment_headers(image: &[u8], segment: u64) -> Vec<(u64, u64)> {
+    image
+        .chunks(segment as usize)
+        .enumerate()
+        .filter_map(|(slot, s)| {
+            let h = mantle_log::format::SegmentHeader::decode(s)?;
+            Some((slot as u64 * segment, h.incarnation))
+        })
+        .collect()
+}
+
+/// Each valid frame in the durable image: its offset, incarnation and sequence.
+fn valid_frames(image: &[u8]) -> Vec<(u64, u64, u64)> {
+    let mut out = Vec::new();
+    for (i, block) in image.chunks(BLOCK).enumerate() {
+        let Some(h) = mantle_log::format::FrameHeader::decode(block) else {
+            continue;
+        };
+        let start = i * BLOCK;
+        let Some(frame) = h.frame_len().and_then(|len| image.get(start..start + len)) else {
+            continue;
+        };
+        if h.log == ID && h.verifies(frame) {
+            out.push((start as u64, h.incarnation, h.sequence));
+        }
+    }
+    out
+}
+
+/// A log of one group whose `n` updates each took a frame of one block: segment 0 holds the
+/// empty first frame and updates 1 to 14, and segment 1 the rest.
+fn one_frame_each(seed: u64, n: u64) -> Arc<SimFile> {
+    let file = sim(seed);
+    let log = Log::create(Arc::clone(&file), config(16, 8), ID).unwrap();
+    for i in 1..=n {
+        log.write(
+            1,
+            Update {
+                entries: Some(entries(i, &[1])),
+                ..Update::default()
+            },
+        )
+        .unwrap();
+    }
+    drop(log);
+    let frames = valid_frames(&file.durable_image().unwrap());
+    assert_eq!(frames.len() as u64, n + 1, "one frame an update");
+    file
+}
+
+/// A newer segment whose header no longer reads, holding frames after its first, was flushed
+/// with its header: its damage is reported, and the failed open writes nothing.
+#[test]
+fn a_damaged_header_of_the_newest_segment_is_reported() {
+    let file = one_frame_each(20, 16);
+    let segment = 16 * BLOCK as u64;
+    file.inject(Fault::BitFlip {
+        offset: segment,
+        bit: 0,
+        stored: true,
+    })
+    .unwrap();
+    let before = file.durable_image().unwrap();
+    assert!(matches!(
+        Log::open(Arc::clone(&file), config(16, 8), ID),
+        Err(LogError::Damaged(_))
+    ));
+    assert!(
+        file.durable_image().unwrap() == before,
+        "a failed open wrote"
+    );
+}
+
+/// An opening whose header never became durable, with only its first frame, was never
+/// acknowledged: the log is cut before it, and the next update goes on from there.
+#[test]
+fn an_opening_whose_header_never_became_durable_is_the_torn_tail() {
+    let file = one_frame_each(21, 15);
+    let segment = 16 * BLOCK as u64;
+    let zeros = mantle_disk::buf::AlignedBuf::zeroed(BLOCK, Alignment::new(BLOCK).unwrap())
+        .map(|mut b| {
+            b.set_len(BLOCK).unwrap();
+            b
+        })
+        .unwrap();
+    mantle_disk::block::BlockFile::write_all_at(&*file, zeros.as_slice(), segment).unwrap();
+    mantle_disk::block::BlockFile::sync_data(&*file).unwrap();
+    let (log, _) = Log::open(Arc::clone(&file), config(16, 8), ID).unwrap();
+    assert_eq!(log.view(1).unwrap().unwrap().last, 14);
+    log.write(
+        1,
+        Update {
+            entries: Some(entries(15, &[2])),
+            ..Update::default()
+        },
+    )
+    .unwrap();
+    drop(log);
+    let (log, recovery) = Log::open(Arc::clone(&file), config(16, 8), ID).unwrap();
+    assert!(recovery.damaged.is_empty());
+    assert_eq!(log.view(1).unwrap().unwrap().last, 15);
+    assert_eq!(log.term(1, 15).unwrap(), 2);
+}
+
+/// Damage to the last frame of a segment the log went on past is reported: the next
+/// segment's first frame proves it was flushed.
+#[test]
+fn damage_at_the_end_of_a_segment_the_log_went_past_is_reported() {
+    for field in [0u64, 8, 40, 70] {
+        let file = one_frame_each(22 + field, 16);
+        // Update 14's frame, the last in segment 0.
+        file.inject(Fault::BitFlip {
+            offset: 15 * BLOCK as u64 + field,
+            bit: 1,
+            stored: true,
+        })
+        .unwrap();
+        assert!(
+            matches!(
+                Log::open(Arc::clone(&file), config(16, 8), ID),
+                Err(LogError::Damaged(_))
+            ),
+            "damage at byte {field}"
+        );
+    }
+}
+
+/// In a slot reused by a newer segment, the older segment's frames past the newer one's
+/// last prove nothing about it: damage to the newer segment's last frame is its torn tail,
+/// while damage to one followed by the newer segment's own frames is reported.
+#[test]
+fn stale_frames_in_a_reused_slot_prove_nothing() {
+    let file = sim(30);
+    let cfg = config(8, 6);
+    let segment = cfg.segment_bytes;
+    let log = Log::create(Arc::clone(&file), cfg, ID).unwrap();
+    let mut first = 1u64;
+    // Frames of the head's incarnation in a reused slot, stale frames after them, and at
+    // least two of the head's own.
+    let mut found = None;
+    for round in 0..2_000u64 {
+        let mut u = Update {
+            entries: Some(entries(first, &[1])),
+            ..Update::default()
+        };
+        if first > 3 {
+            u.start = Some(Start {
+                index: first - 3,
+                term: 1,
+            });
+        }
+        log.write(1, u).unwrap();
+        first += 1;
+        let image = file.durable_image().unwrap();
+        let headers = segment_headers(&image, segment);
+        let (head_at, head) = *headers.iter().max_by_key(|(_, inc)| *inc).unwrap();
+        let frames = valid_frames(&image);
+        let own: Vec<_> = frames
+            .iter()
+            .filter(|(at, inc, _)| *inc == head && *at >= head_at && *at < head_at + segment)
+            .copied()
+            .collect();
+        let last_own = own.iter().map(|(at, ..)| *at).max();
+        let stale_after = frames.iter().any(|(at, inc, _)| {
+            *inc < head && *at >= head_at && *at < head_at + segment && Some(*at) > last_own
+        });
+        if own.len() >= 3 && stale_after && round > 50 {
+            found = Some(own);
+            break;
+        }
+    }
+    drop(log);
+    let own = found.expect("the head never came to a reused slot with stale frames past it");
+    let (last_at, _, last_seq) = *own.iter().max_by_key(|(_, _, seq)| *seq).unwrap();
+    let (inner_at, ..) = *own
+        .iter()
+        .filter(|(_, _, seq)| *seq < last_seq)
+        .max_by_key(|(_, _, seq)| *seq)
+        .unwrap();
+
+    let torn = sim(31);
+    let image = file.durable_image().unwrap();
+    for (i, chunk) in image.chunks(BLOCK).enumerate() {
+        let mut b =
+            mantle_disk::buf::AlignedBuf::zeroed(BLOCK, Alignment::new(BLOCK).unwrap()).unwrap();
+        b.extend_from_slice(chunk).unwrap();
+        mantle_disk::block::BlockFile::write_all_at(&*torn, b.as_slice(), (i * BLOCK) as u64)
+            .unwrap();
+    }
+    mantle_disk::block::BlockFile::sync_data(&*torn).unwrap();
+
+    file.inject(Fault::BitFlip {
+        offset: last_at,
+        bit: 0,
+        stored: true,
+    })
+    .unwrap();
+    let (log, _) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+    assert_eq!(log.view(1).unwrap().unwrap().last, first - 2);
+    drop(log);
+
+    torn.inject(Fault::BitFlip {
+        offset: inner_at,
+        bit: 0,
+        stored: true,
+    })
+    .unwrap();
+    assert!(matches!(
+        Log::open(Arc::clone(&torn), cfg, ID),
+        Err(LogError::Damaged(_))
+    ));
+}
+
+/// A simulated file whose flushes wait while its gate is shut, so a test can hold the writer
+/// in a flush while it queues submissions behind it.
+struct Gated {
+    file: Arc<SimFile>,
+    gate: std::sync::Mutex<(bool, u64)>,
+    changed: std::sync::Condvar,
+}
+
+impl Gated {
+    fn new(file: Arc<SimFile>) -> Arc<Self> {
+        Arc::new(Self {
+            file,
+            gate: std::sync::Mutex::new((true, 0)),
+            changed: std::sync::Condvar::new(),
+        })
+    }
+
+    fn set(&self, open: bool) {
+        self.gate.lock().unwrap().0 = open;
+        self.changed.notify_all();
+    }
+
+    /// Waits until a flush is held at the shut gate.
+    fn held(&self) {
+        let mut gate = self.gate.lock().unwrap();
+        while gate.1 == 0 {
+            gate = self.changed.wait(gate).unwrap();
+        }
+    }
+}
+
+impl mantle_disk::block::BlockFile for Gated {
+    fn alignment(&self) -> Alignment {
+        self.file.alignment()
+    }
+
+    fn len(&self) -> Result<u64, mantle_disk::DiskError> {
+        mantle_disk::block::BlockFile::len(&*self.file)
+    }
+
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), mantle_disk::DiskError> {
+        self.file.read_exact_at(buf, offset)
+    }
+
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), mantle_disk::DiskError> {
+        self.file.write_all_at(buf, offset)
+    }
+
+    fn sync_data(&self) -> Result<(), mantle_disk::DiskError> {
+        let mut gate = self.gate.lock().unwrap();
+        gate.1 += 1;
+        self.changed.notify_all();
+        while !gate.0 {
+            gate = self.changed.wait(gate).unwrap();
+        }
+        gate.1 -= 1;
+        drop(gate);
+        self.file.sync_data()
+    }
+}
+
+/// A group's updates are made durable in the order it submitted them, even when the older
+/// one waits for a frame with room and a newer one would fit the frame it missed (audit S02).
+#[test]
+fn a_groups_updates_keep_their_order_when_one_waits_for_room() {
+    let gated = Gated::new(sim(40));
+    let cfg = config(4, 8);
+    let log = Log::create(Arc::clone(&gated), cfg, ID).unwrap();
+    let state = |term, vote| HardState {
+        term,
+        vote,
+        commit: 0,
+    };
+    gated.set(false);
+    let first = log
+        .submit(
+            3,
+            Update {
+                hard_state: Some(state(1, 3)),
+                ..Update::default()
+            },
+        )
+        .unwrap();
+    gated.held();
+    let big = log
+        .submit(
+            2,
+            Update {
+                entries: Some(Entries {
+                    first: 1,
+                    entries: vec![entry(1, &"b".repeat(10_000))],
+                }),
+                ..Update::default()
+            },
+        )
+        .unwrap();
+    let older = log
+        .submit(
+            1,
+            Update {
+                entries: Some(Entries {
+                    first: 1,
+                    entries: vec![entry(1, &"a".repeat(3_000))],
+                }),
+                hard_state: Some(state(1, 1)),
+                ..Update::default()
+            },
+        )
+        .unwrap();
+    let newer = log
+        .submit(
+            1,
+            Update {
+                hard_state: Some(state(2, 2)),
+                ..Update::default()
+            },
+        )
+        .unwrap();
+    gated.set(true);
+    for pending in [first, big, older, newer] {
+        pending.wait().unwrap();
+    }
+    assert_eq!(log.view(1).unwrap().unwrap().hard_state, Some(state(2, 2)));
+    drop(log);
+    let (log, _) = Log::open(Arc::clone(&gated), cfg, ID).unwrap();
+    assert_eq!(log.view(1).unwrap().unwrap().hard_state, Some(state(2, 2)));
+}
+
 #[test]
 fn another_log_or_geometry_is_refused() {
     let file = sim(9);
@@ -794,6 +1173,74 @@ proptest! {
         drop(log);
         file.clear_faults().unwrap();
         let (log, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+        prop_assert!(recovery.damaged.is_empty());
+        check(&log, &models);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Rounds of updates submitted while the writer is held in a flush, several of a group
+    /// at a time and sized from a few bytes to most of a frame's room, so some wait for room
+    /// behind others: each group's accepted updates become durable in the order submitted,
+    /// as its state before and after reopening shows (audit S02).
+    #[test]
+    fn a_groups_queued_updates_become_durable_in_order(
+        rounds in prop::collection::vec(
+            prop::collection::vec((step(), 0usize..4), 1..12),
+            1..6,
+        ),
+        seed in any::<u64>(),
+        segment_blocks in 4u64..10,
+    ) {
+        let gated = Gated::new(sim(seed));
+        let cfg = config(segment_blocks, 8);
+        let log = Log::create(Arc::clone(&gated), cfg, ID).unwrap();
+        let segment = cfg.segment_bytes as usize;
+        let sizes = [16, segment / 4, segment / 2 - 200, segment - 2 * BLOCK];
+        let mut models = Models::new();
+        let plug = Update {
+            hard_state: Some(hard(1, 0)),
+            ..Update::default()
+        };
+        for round in &rounds {
+            gated.set(false);
+            let plugged = log.submit(99, plug.clone()).unwrap();
+            gated.held();
+            let mut predicted = models.clone();
+            let mut submitted = Vec::new();
+            for (step, size) in round {
+                let Some((group, mut u)) = update(step, &predicted) else { continue };
+                if let Some(e) = &mut u.entries {
+                    for x in &mut e.entries {
+                        x.bytes = Arc::from(vec![b'x'; sizes[*size]]);
+                    }
+                }
+                apply(&mut predicted, group, &u);
+                let pending = log.submit(group, u.clone()).unwrap();
+                submitted.push((group, u, pending));
+            }
+            gated.set(true);
+            plugged.wait().unwrap();
+            apply(&mut models, 99, &plug);
+            for (group, u, pending) in submitted {
+                match pending.wait() {
+                    Ok(()) => apply(&mut models, group, &u),
+                    Err(
+                        LogError::Invalid { .. }
+                        | LogError::TooLarge(_)
+                        | LogError::Full
+                        | LogError::Backlog(_)
+                        | LogError::TooManyGroups(_),
+                    ) => {}
+                    Err(e) => return Err(TestCaseError::fail(format!("{e}"))),
+                }
+            }
+            check(&log, &models);
+        }
+        drop(log);
+        let (log, recovery) = Log::open(Arc::clone(&gated), cfg, ID).unwrap();
         prop_assert!(recovery.damaged.is_empty());
         check(&log, &models);
     }

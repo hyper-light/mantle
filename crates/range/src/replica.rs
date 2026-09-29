@@ -59,6 +59,9 @@ pub struct Drive {
     pub messages: Vec<Message>,
     /// The normal entries applied.
     pub applied: Vec<Applied>,
+    /// Reads a quorum confirmed: each read's context and the index the replica must have
+    /// applied before it answers from its rows (06 §A1).
+    pub reads: Vec<(u64, Vec<u8>)>,
 }
 
 /// A normal entry applied: its index, and each command's session, serial and answer, in
@@ -220,6 +223,14 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
         Ok(())
     }
 
+    /// Asks the group to confirm a read: once a quorum has, `drive` gives back the read with
+    /// the index the rows must reach, and rows at or past it answer the read linearizably.
+    /// Only a leader confirms reads; `context` names the read.
+    pub fn read_index(&mut self, context: Vec<u8>) -> Result<(), ReplicaError> {
+        self.node.read_index(context)?;
+        Ok(())
+    }
+
     /// Reports whether a snapshot this member sent to `to` arrived. Replication to a member
     /// pauses while its snapshot is out, so the transport reports every snapshot's fate,
     /// which a snapshot's own stream always learns (docs/design/replica.md §3).
@@ -264,6 +275,12 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
                 _ => None,
             };
             out.messages.extend(ready.take_messages());
+            out.reads.extend(
+                ready
+                    .take_read_states()
+                    .into_iter()
+                    .map(|r| (r.index, r.request_ctx)),
+            );
             if let Some(update) = update_of(&ready, installed)? {
                 self.node.store().log.write_waiting(self.group, update)?;
             }

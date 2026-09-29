@@ -2,16 +2,18 @@
 //!
 //! Three replicas, each with its log on a simulated device and a model engine, run over a
 //! simulated network that delays, drops and partitions messages. Nodes crash, losing what
-//! neither their log nor their engine had made durable, and restart from what was. A
-//! gateway puts keys through whichever member leads, retrying through leader changes with
-//! its session's serial numbers. A run is its seed.
+//! neither their log nor their engine had made durable, and restart from what was. Three
+//! gateways, each with its own session, put and get two keys at once: puts go through the
+//! log, retried through leader changes with the session's serial numbers, and gets through
+//! the leader's ReadIndex. A run is its seed.
 //!
 //! After every run:
 //! - every index was applied with the same answers on every member that applied it;
-//! - once faults stop, every put completes;
-//! - every put the gateway was answered exists exactly once on every member, however often
-//!   it was retried;
-//! - every member holds the same rows.
+//! - once faults stop, every operation completes;
+//! - every put a gateway was answered exists exactly once on every member, however often it
+//!   was retried;
+//! - every member holds the same rows;
+//! - each key's history, as the gateways saw it, is linearizable (docs/research/06 §A6.8).
 //!
 //! `MANTLE_SIM_SEEDS` sets how many runs, and `MANTLE_SIM_SEED` where they begin.
 #![allow(
@@ -24,7 +26,9 @@
     clippy::cast_possible_truncation
 )]
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+mod support;
+
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use mantle_disk::buf::Alignment;
@@ -37,6 +41,7 @@ use mantle_meta::record::{GateState, Version, Versioning};
 use mantle_meta::session::Rules;
 use mantle_meta::wire::{Answer, Command, Entry, Sessioned};
 use mantle_range::{ConfState, Message, Range, Replica, ReplicaError, Settings};
+use support::linear::{self, Input, Operation, Output, Register, Verdict};
 
 const GROUP: u128 = 0x0072_616e_6765;
 const MEMBERS: u64 = 3;
@@ -172,30 +177,56 @@ impl Node {
     }
 }
 
-/// A put the gateway has in flight.
+/// What a gateway is doing.
 #[derive(Debug, Clone)]
-struct Op {
-    serial: u64,
-    key: String,
-    etag: String,
-    sent_at: u64,
+enum Doing {
+    /// Waiting for its session.
+    Registering {
+        nonce: u64,
+        sent: u64,
+    },
+    /// A command through the log: the gate's opening or a put.
+    Writing {
+        serial: u64,
+        key: String,
+        value: String,
+        call: u64,
+        sent: u64,
+    },
+    /// A get: its attempt, the member that confirmed it and the index to wait for, once one
+    /// has.
+    Reading {
+        key: String,
+        call: u64,
+        sent: u64,
+        attempt: u64,
+        confirmed: Option<(u64, u64)>,
+    },
+    Idle,
 }
 
-/// A gateway with one session, putting keys one at a time.
 struct Gateway {
+    id: u64,
     session: Option<u64>,
-    /// The nonce and time of a registration in flight.
-    registering: Option<(u64, u64)>,
     next_serial: u64,
-    outstanding: Option<Op>,
-    todo: VecDeque<(String, String)>,
-    /// Puts answered, and their answers.
-    done: Vec<(String, String, Answer)>,
+    /// Operations left, the gate's opening first for the gateway that opens it.
+    left: u64,
+    doing: Doing,
     nonce: u64,
+    ops: u64,
 }
 
-/// Steps without an answer before the gateway sends again.
+/// Steps without an answer before a gateway sends again.
 const PATIENCE: u64 = 40;
+const KEYS: [&str; 2] = ["k0", "k1"];
+const OPS_EACH: u64 = 20;
+const GATEWAYS: u64 = 3;
+
+/// One operation as its gateway saw it, for the checker.
+struct Seen {
+    key: String,
+    op: Operation<Input, Output>,
+}
 
 struct World {
     seed: u64,
@@ -208,16 +239,27 @@ struct World {
     /// Each index's answers, as the first member to apply it gave them.
     by_index: BTreeMap<u64, Vec<(u64, u64, Answer)>>,
     faults: bool,
-    gateway: Gateway,
+    gateways: Vec<Gateway>,
+    /// Whether the bucket's gate has opened; the gateways but the first wait for it.
+    gate_open: bool,
+    history: Vec<Seen>,
+    /// Puts answered, by key: their values.
+    put: HashMap<String, Vec<String>>,
 }
 
 impl World {
-    fn new(seed: u64, puts: usize) -> Self {
+    fn new(seed: u64) -> Self {
         let nodes = (1..=MEMBERS).map(|id| Node::new(id, seed)).collect();
-        // The bucket's gate opens first, as the bucket's creation does
-        // (docs/design/metadata.md §2); an empty key marks it.
-        let todo = std::iter::once((String::new(), "gate".to_owned()))
-            .chain((0..puts).map(|i| (format!("k{}", i % 5), format!("e{i}"))))
+        let gateways = (0..GATEWAYS)
+            .map(|id| Gateway {
+                id,
+                session: None,
+                next_serial: 1,
+                left: OPS_EACH + u64::from(id == 0),
+                doing: Doing::Idle,
+                nonce: 0,
+                ops: 0,
+            })
             .collect();
         Self {
             seed,
@@ -228,19 +270,19 @@ impl World {
             blocked: HashSet::new(),
             by_index: BTreeMap::new(),
             faults: true,
-            gateway: Gateway {
-                session: None,
-                registering: None,
-                next_serial: 1,
-                outstanding: None,
-                todo,
-                done: Vec::new(),
-                nonce: 0,
-            },
+            gateways,
+            gate_open: false,
+            history: Vec::new(),
+            put: HashMap::new(),
         }
     }
 
     fn fail(&self, what: &str) -> ! {
+        for n in &self.nodes {
+            if let Some(r) = n.replica.as_ref() {
+                eprintln!("{}", r.describe());
+            }
+        }
         panic!("seed {} step {}: {what}", self.seed, self.step)
     }
 
@@ -256,7 +298,10 @@ impl World {
         }
         self.deliver();
         self.drive();
-        self.act();
+        self.serve_reads();
+        for g in 0..self.gateways.len() {
+            self.act(g);
+        }
     }
 
     fn inject(&mut self) {
@@ -282,14 +327,12 @@ impl World {
         if self.rng.chance(15) {
             self.blocked.clear();
         }
-        if std::env::var("NO_COMPACT").is_err()
-            && self.rng.chance(10)
+        if self.rng.chance(10)
             && let Some(r) = self.nodes[i].replica.as_mut()
         {
             let keep = self.rng.below(8);
-            match r.compact(keep) {
-                Ok(()) => {}
-                Err(e) => self.fail(&format!("compact: {e}")),
+            if let Err(e) = r.compact(keep) {
+                self.fail(&format!("compact: {e}"));
             }
         }
     }
@@ -302,16 +345,12 @@ impl World {
         self.wire = later;
         for (_, m) in due {
             let (from, to) = (m.from, m.to);
-            let snapshot = focal_raft_message_is_snapshot(&m);
+            let snapshot = m.msg_type == mantle_range::MessageType::MsgSnapshot as i32;
             let dropped =
                 self.blocked.contains(&(from, to)) || (self.faults && self.rng.chance(20));
+            let receiver = self.nodes.iter_mut().find(|n| n.id == to);
             let arrived = !dropped
-                && match self
-                    .nodes
-                    .iter_mut()
-                    .find(|n| n.id == to)
-                    .and_then(|n| n.replica.as_mut())
-                {
+                && match receiver.and_then(|n| n.replica.as_mut()) {
                     Some(r) => match r.step(m) {
                         Ok(()) | Err(ReplicaError::Refused(_)) => true,
                         Err(e) => panic!("step: {e}"),
@@ -337,6 +376,7 @@ impl World {
     fn drive(&mut self) {
         let mut sent = Vec::new();
         let mut applied = Vec::new();
+        let mut reads = Vec::new();
         for n in &mut self.nodes {
             let Some(r) = n.replica.as_mut() else {
                 continue;
@@ -346,6 +386,7 @@ impl World {
                 .unwrap_or_else(|e| panic!("drive on {}: {e}", n.id));
             sent.extend(out.messages);
             applied.extend(out.applied);
+            reads.extend(out.reads.into_iter().map(|(index, ctx)| (n.id, index, ctx)));
         }
         for m in sent {
             let delay = 1 + self.rng.below(if self.faults { 6 } else { 2 });
@@ -363,26 +404,110 @@ impl World {
                 }
             }
         }
+        for (node, index, ctx) in reads {
+            let (Some(g), Some(attempt)) = (read_u64(&ctx, 0), read_u64(&ctx, 8)) else {
+                continue;
+            };
+            if let Some(gw) = self.gateways.get_mut(g as usize)
+                && let Doing::Reading {
+                    attempt: current,
+                    confirmed,
+                    ..
+                } = &mut gw.doing
+                && *current == attempt
+                && confirmed.is_none()
+            {
+                *confirmed = Some((node, index));
+            }
+        }
     }
 
-    /// The gateway reads the answers to what it sent.
-    fn hear(&mut self, answers: &[(u64, u64, Answer)]) {
-        let g = &mut self.gateway;
-        for (session, serial, answer) in answers {
-            if let (Some((nonce, _)), Answer::Registered { session: s }) = (g.registering, answer)
-                && *session == 0
-                && *serial == nonce
-            {
-                g.session = Some(*s);
-                g.registering = None;
+    /// Answers each confirmed get once its member has applied up to the confirmed index.
+    fn serve_reads(&mut self) {
+        let now = self.step;
+        for g in 0..self.gateways.len() {
+            let Doing::Reading {
+                key,
+                call,
+                confirmed: Some((node, index)),
+                ..
+            } = self.gateways[g].doing.clone()
+            else {
+                continue;
+            };
+            let Some(r) = self
+                .nodes
+                .iter()
+                .find(|n| n.id == node)
+                .and_then(|n| n.replica.as_ref())
+            else {
+                continue;
+            };
+            if r.applied() < index {
+                continue;
             }
-            if let Some(op) = &g.outstanding
-                && Some(*session) == g.session
-                && *serial == op.serial
-            {
-                g.done
-                    .push((op.key.clone(), op.etag.clone(), answer.clone()));
-                g.outstanding = None;
+            let seen = name::current(r.engine(), "b", &key)
+                .unwrap()
+                .map(|(_, v)| v.etag);
+            self.history.push(Seen {
+                key,
+                op: Operation {
+                    call,
+                    ret: Some(now),
+                    input: Input::Get,
+                    output: Some(Output::Got(seen)),
+                },
+            });
+            self.gateways[g].doing = Doing::Idle;
+        }
+    }
+
+    /// The gateways read the answers to what they sent.
+    fn hear(&mut self, answers: &[(u64, u64, Answer)]) {
+        let now = self.step;
+        for (session, serial, answer) in answers {
+            for g in &mut self.gateways {
+                match &g.doing {
+                    Doing::Registering { nonce, .. } if *session == 0 && serial == nonce => {
+                        if let Answer::Registered { session: s } = answer {
+                            g.session = Some(*s);
+                            g.doing = Doing::Idle;
+                        }
+                    }
+                    Doing::Writing {
+                        serial: sent,
+                        key,
+                        value,
+                        call,
+                        ..
+                    } if Some(*session) == g.session && serial == sent => {
+                        if key.is_empty() {
+                            if *answer == Answer::Name(name::Outcome::GateMoved) {
+                                self.gate_open = true;
+                            } else {
+                                panic!("the gate answered {answer:?}");
+                            }
+                        } else {
+                            match answer {
+                                Answer::Name(name::Outcome::Put { .. }) => {
+                                    self.history.push(Seen {
+                                        key: key.clone(),
+                                        op: Operation {
+                                            call: *call,
+                                            ret: Some(now),
+                                            input: Input::Put(value.clone()),
+                                            output: Some(Output::Put),
+                                        },
+                                    });
+                                    self.put.entry(key.clone()).or_default().push(value.clone());
+                                }
+                                other => panic!("put {key} {value} answered {other:?}"),
+                            }
+                        }
+                        g.doing = Doing::Idle;
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -394,67 +519,116 @@ impl World {
             .find(|r| r.is_leader())
     }
 
-    fn act(&mut self) {
+    fn act(&mut self, g: usize) {
         let now = self.step;
         let at_ns = now * 1_000_000;
-        let g = &mut self.gateway;
-        let command = if g.session.is_none() {
-            match g.registering {
-                Some((_, sent)) if now - sent < PATIENCE => return,
-                _ => {
-                    g.nonce += 1;
-                    g.registering = Some((g.nonce, now));
-                    Sessioned {
-                        session: 0,
-                        serial: g.nonce,
-                        unanswered: 0,
-                        command: Command::Register,
-                    }
-                }
+        let gate_open = self.gate_open;
+        let rng = self.rng.next();
+        let gw = &mut self.gateways[g];
+        // What to send: an entry, or a read to confirm.
+        let mut entry: Option<Sessioned> = None;
+        let mut read: Option<Vec<u8>> = None;
+        match &mut gw.doing {
+            Doing::Registering { sent, .. } if now - *sent < PATIENCE => return,
+            Doing::Registering { .. } => gw.doing = Doing::Idle,
+            Doing::Writing { sent, .. } if now - *sent < PATIENCE => return,
+            Doing::Writing {
+                serial,
+                key,
+                value,
+                sent,
+                ..
+            } => {
+                *sent = now;
+                entry = Some(write(gw.session, *serial, key, value));
             }
-        } else {
-            let session = g.session.unwrap_or(0);
-            let op = match &mut g.outstanding {
-                Some(op) if now - op.sent_at < PATIENCE => return,
-                Some(op) => {
-                    op.sent_at = now;
-                    op.clone()
-                }
-                None => {
-                    let Some((key, etag)) = g.todo.pop_front() else {
-                        return;
+            Doing::Reading { sent, .. } if now - *sent < PATIENCE => return,
+            Doing::Reading {
+                sent,
+                attempt,
+                confirmed,
+                ..
+            } => {
+                // No answer in time: confirm the read again, as the same operation.
+                *sent = now;
+                *attempt += 1;
+                *confirmed = None;
+                read = Some(context(gw.id, *attempt));
+            }
+            Doing::Idle => {}
+        }
+        if matches!(gw.doing, Doing::Idle) {
+            if gw.session.is_none() {
+                // Registrations are told apart by a nonce no other gateway uses.
+                gw.nonce = (gw.id << 32) | ((gw.nonce & 0xFFFF_FFFF) + 1);
+                gw.doing = Doing::Registering {
+                    nonce: gw.nonce,
+                    sent: now,
+                };
+                entry = Some(Sessioned {
+                    session: 0,
+                    serial: gw.nonce,
+                    unanswered: 0,
+                    command: Command::Register,
+                });
+            } else if gw.left > 0 && (gate_open || gw.id == 0) {
+                gw.left -= 1;
+                gw.ops += 1;
+                let key = KEYS[(rng % KEYS.len() as u64) as usize].to_owned();
+                if gw.id == 0 && !gate_open {
+                    // The gate opens before any put.
+                    let serial = gw.next_serial;
+                    gw.next_serial += 1;
+                    gw.doing = Doing::Writing {
+                        serial,
+                        key: String::new(),
+                        value: "gate".into(),
+                        call: now,
+                        sent: now,
                     };
-                    let op = Op {
-                        serial: g.next_serial,
+                    entry = Some(write(gw.session, serial, "", "gate"));
+                } else if rng & (1 << 20) == 0 {
+                    let serial = gw.next_serial;
+                    gw.next_serial += 1;
+                    let value = format!("g{}o{}", gw.id, gw.ops);
+                    entry = Some(write(gw.session, serial, &key, &value));
+                    gw.doing = Doing::Writing {
+                        serial,
                         key,
-                        etag,
-                        sent_at: now,
+                        value,
+                        call: now,
+                        sent: now,
                     };
-                    g.next_serial += 1;
-                    g.outstanding = Some(op.clone());
-                    op
+                } else {
+                    gw.doing = Doing::Reading {
+                        key,
+                        call: now,
+                        sent: now,
+                        attempt: 0,
+                        confirmed: None,
+                    };
+                    read = Some(context(gw.id, 0));
                 }
-            };
-            let command = if op.key.is_empty() {
-                open_gate()
-            } else {
-                put(&op.key, &op.etag)
-            };
-            Sessioned {
-                session,
-                serial: op.serial,
-                unanswered: op.serial,
-                command,
             }
-        };
-        let entry = Entry {
-            at_ns,
-            commands: vec![command],
-        };
-        if let Some(leader) = self.leader() {
-            match leader.propose(&entry) {
+        }
+        if let Some(command) = entry {
+            let entry = Entry {
+                at_ns,
+                commands: vec![command],
+            };
+            if let Some(leader) = self.leader() {
+                match leader.propose(&entry) {
+                    Ok(()) | Err(ReplicaError::Refused(_)) => {}
+                    Err(e) => panic!("propose: {e}"),
+                }
+            }
+        }
+        if let Some(context) = read
+            && let Some(leader) = self.leader()
+        {
+            match leader.read_index(context) {
                 Ok(()) | Err(ReplicaError::Refused(_)) => {}
-                Err(e) => panic!("propose: {e}"),
+                Err(e) => panic!("read: {e}"),
             }
         }
     }
@@ -469,8 +643,11 @@ impl World {
     }
 
     fn settled(&self) -> bool {
-        let g = &self.gateway;
-        if g.outstanding.is_some() || !g.todo.is_empty() || g.session.is_none() {
+        let busy = self
+            .gateways
+            .iter()
+            .any(|g| g.left > 0 || !matches!(g.doing, Doing::Idle) || g.session.is_none());
+        if busy {
             return false;
         }
         let applied: Vec<u64> = self
@@ -482,8 +659,30 @@ impl World {
     }
 }
 
-fn focal_raft_message_is_snapshot(m: &Message) -> bool {
-    m.msg_type == mantle_range::MessageType::MsgSnapshot as i32
+/// The context a gateway's read carries: the gateway and the read's attempt.
+fn context(gateway: u64, attempt: u64) -> Vec<u8> {
+    let mut ctx = gateway.to_le_bytes().to_vec();
+    ctx.extend_from_slice(&attempt.to_le_bytes());
+    ctx
+}
+
+fn read_u64(bytes: &[u8], at: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
+}
+
+/// A gateway's write: the gate's opening for an empty key, a put otherwise.
+fn write(session: Option<u64>, serial: u64, key: &str, value: &str) -> Sessioned {
+    let command = if key.is_empty() {
+        open_gate()
+    } else {
+        put(key, value)
+    };
+    Sessioned {
+        session: session.unwrap_or(0),
+        serial,
+        unanswered: serial,
+        command,
+    }
 }
 
 fn put(key: &str, etag: &str) -> Command {
@@ -506,6 +705,17 @@ fn put(key: &str, etag: &str) -> Command {
             owner: "o".into(),
             headers: Vec::new(),
         },
+    })))
+}
+
+/// The gate a put needs, opened by the first gateway's first command.
+fn open_gate() -> Command {
+    Command::Name(Box::new(name::Command::Gate(GateChange {
+        bucket: "b".into(),
+        incarnation: 1,
+        attempt: 1,
+        from: None,
+        to: Some(GateState::Open),
     })))
 }
 
@@ -536,7 +746,7 @@ fn versions(m: &Model, key: &str) -> Vec<String> {
 }
 
 fn run(seed: u64) {
-    let mut w = World::new(seed, 30);
+    let mut w = World::new(seed);
     for _ in 0..3_000 {
         w.step();
     }
@@ -545,70 +755,44 @@ fn run(seed: u64) {
     while !w.settled() {
         budget -= 1;
         if budget == 0 {
-            let members: Vec<_> = w
-                .nodes
-                .iter()
-                .map(|n| {
-                    n.replica
-                        .as_ref()
-                        .map(|r| (r.id(), r.is_leader(), r.leader(), r.term(), r.applied()))
-                })
-                .collect();
-            for n in &w.nodes {
-                if let Some(r) = n.replica.as_ref() {
-                    eprintln!("{}", r.describe());
-                }
-            }
-            let g = &w.gateway;
-            w.fail(&format!(
-                "never settled once faults stopped: members {members:?}, session {:?}, \
-                 registering {:?}, outstanding {:?}, todo {}, done {}, in flight {}",
-                g.session,
-                g.registering,
-                g.outstanding,
-                g.todo.len(),
-                g.done.len(),
-                w.wire.len()
-            ));
+            w.fail("never settled once faults stopped");
         }
         w.step();
     }
-    // Every answered put exists exactly once on every member, and the members agree.
     let engines: Vec<&Model> = w
         .nodes
         .iter()
         .map(|n| n.replica.as_ref().unwrap().engine())
         .collect();
     let first = rows(engines[0]);
-    for e in &engines[1..] {
-        if rows(e) != first {
-            w.fail("members hold different rows");
-        }
+    if engines[1..].iter().any(|e| rows(e) != first) {
+        w.fail("members hold different rows");
     }
-    let mut answered: HashMap<String, Vec<String>> = HashMap::new();
-    for (key, etag, answer) in &w.gateway.done {
-        match answer {
-            Answer::Name(name::Outcome::GateMoved) if key.is_empty() => {}
-            Answer::Name(name::Outcome::Put { .. }) => {
-                answered.entry(key.clone()).or_default().push(etag.clone());
-            }
-            other => w.fail(&format!("put {key} {etag} answered {other:?}")),
-        }
-    }
-    for (key, etags) in &answered {
+    for (key, values) in &w.put {
         let held = versions(engines[0], key);
-        for etag in etags {
-            let copies = held.iter().filter(|e| *e == etag).count();
+        for value in values {
+            let copies = held.iter().filter(|v| *v == value).count();
             if copies != 1 {
-                w.fail(&format!("{key} {etag} held {copies} times"));
+                w.fail(&format!("{key} {value} held {copies} times"));
             }
         }
     }
-    assert_eq!(w.gateway.done.len(), 31, "seed {seed}");
+    for key in KEYS {
+        let ops: Vec<_> = w
+            .history
+            .iter()
+            .filter(|s| s.key == key)
+            .map(|s| s.op.clone())
+            .collect();
+        match linear::check(&Register, &ops, 10_000_000) {
+            Verdict::Linearizable => {}
+            other => w.fail(&format!("{key}: {other:?} over {} operations", ops.len())),
+        }
+    }
 }
 
 #[test]
-fn a_group_under_faults_applies_every_put_once_and_agrees() {
+fn a_group_under_faults_is_linearizable_and_applies_every_put_once() {
     let seeds: u64 = std::env::var("MANTLE_SIM_SEEDS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -620,15 +804,4 @@ fn a_group_under_faults_applies_every_put_once_and_agrees() {
     for seed in first..first + seeds {
         run(seed);
     }
-}
-
-/// The gate a put needs, opened by the gateway's first command.
-fn open_gate() -> Command {
-    Command::Name(Box::new(name::Command::Gate(GateChange {
-        bucket: "b".into(),
-        incarnation: 1,
-        attempt: 1,
-        from: None,
-        to: Some(GateState::Open),
-    })))
 }

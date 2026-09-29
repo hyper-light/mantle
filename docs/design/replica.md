@@ -99,17 +99,22 @@ Replicas are tested in deterministic simulation (`crates/range/tests/sim.rs`). T
 nodes, each with a simulated device for its log and a model engine, run over a simulated
 network that delays, drops, reorders and partitions messages. Nodes crash, losing whatever
 their log and engine had not made durable, and restart. Replicas compact at random, so
-lagging members are caught up by snapshot. A gateway puts keys through whichever member
-leads, retrying through leader changes with its session's serials. Every run is its seed
-(06 §A5). After every run, these must hold:
+lagging members are caught up by snapshot. Three gateways, each with its own session, put
+and get two keys at once. Puts go through the log, retried through leader changes with the
+session's serials. Gets are confirmed by ReadIndex and answered from the leader's rows once
+they reach the confirmed index. Every run is its seed (06 §A5). After every run, these
+must hold:
 
 - every index was applied with the same answers on every member that applied it;
-- once faults stop, every put completes;
+- once faults stop, every operation completes;
 - every answered put exists exactly once on every member, however often it was retried;
-- every member holds the same rows.
+- every member holds the same rows;
+- each key's history, as the gateways saw it in the simulation's time, is linearizable by
+  Horn and Kroening's WGL search (06 §A6.8).
 
-A soak of 50,000 seeds passes. The gateways' histories are still to be checked for
-linearizability per key, with reads through ReadIndex (metadata.md §5).
+A soak of 20,000 seeds passes. The simulation catches two broken variants on purpose,
+within the first seeds: gets served from any member's rows without ReadIndex fail
+linearizability, and a replica that applies a repeated command again stores a put twice.
 
 ## 6. Open
 

@@ -127,10 +127,13 @@ acknowledged update survived and the one in flight landed whole or not at all; a
 Range replicas (`mantle-range`, [design](design/replica.md)) run focal-raft's core over the
 log and an engine: an entry carries a batch of gateway commands applied as one engine batch,
 client sessions make each command take effect once however often it is retried, and members
-that lag are caught up by snapshot. A deterministic simulation of three members under
-crashes, partitions, dropped and reordered messages and compaction checks after every run
-that each index was applied the same everywhere, that every put completes once faults stop
-and exists exactly once, and that the members agree; a soak of 50,000 seeds passed.
+that lag are caught up by snapshot, and reads are confirmed by ReadIndex. A deterministic
+simulation of three members and three concurrent gateways, under crashes, partitions,
+dropped and reordered messages and compaction, checks after every run that each index was
+applied the same everywhere, that every operation completes once faults stop, that every
+put exists exactly once, that the members agree, and that each key's history is
+linearizable; a soak of 20,000 seeds passed, and the simulation catches stale reads and
+repeated commands applied twice when either is introduced on purpose.
 
 Remaining before it is done:
 
@@ -140,9 +143,9 @@ Remaining before it is done:
   collector that finishes what a failed one leaves and removes unreferenced files and
   blocks after a grace period.
 - The production engine, once its binding is chosen (design §4).
-- ReadIndex reads, membership changes, splits and the fast track under simulation, and
-  the transport: QUIC for bulk transfers and snapshots, and a UDP transport for consensus
-  messages.
+- Membership changes, splits and the fast track under simulation, and the transport:
+  QUIC for bulk transfers and snapshots, and a UDP transport for consensus messages.
+- Linearizability checked with real processes on the production engine.
 - Done when a linearizability checker accepts histories recorded under network partitions,
   process crashes and disk faults, both in deterministic simulation and with real
   processes.

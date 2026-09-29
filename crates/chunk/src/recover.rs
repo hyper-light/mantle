@@ -17,6 +17,7 @@ use mantle_disk::buf::{Pool, PoolBuf};
 use crate::error::ChunkError;
 use crate::frame::{KIND_BATCH, KIND_WRAP, LogRecord, PutRecord, SegmentState};
 use crate::index::{Fragment, Index, Inserted, SegmentInfo};
+use crate::key::ChunkKey;
 use crate::layout::{Config, Geometry};
 use crate::log::{self, Cursor};
 use crate::record::{self, Prefix};
@@ -28,9 +29,14 @@ use crate::writer::distance;
 pub struct RecoveryReport {
     /// Index frames replayed.
     pub frames: u64,
-    /// Records of the last batch dropped because their data did not verify: that batch's
-    /// flush had not completed, so none of them was acknowledged.
-    pub unflushed_dropped: u64,
+    /// Chunks whose record in the last batch did not verify. Its flush may never have
+    /// completed, or its data may have been damaged since it was acknowledged: the volume
+    /// cannot tell the two apart, so each is kept, reads of it answer that its bytes do not
+    /// verify, and repair or the reconciler decides (AGL+18 §3.3.3; audit S05).
+    pub damaged: Vec<ChunkKey>,
+    /// Relocations of the last batch whose new copy did not verify, put back to the copy they
+    /// moved, which is intact whether or not the batch was acknowledged.
+    pub restored: u64,
     /// Records found past the index log's end in open segments and indexed.
     pub rolled_forward: u64,
 }
@@ -151,8 +157,12 @@ pub(crate) fn recover<F: BlockFile>(
         return Err(ChunkError::CorruptLog { lsn });
     }
 
-    // The last batch's flush may not have completed: keep only records whose data verifies.
-    // They are the last fragments of their chunks, so they come off in reverse order.
+    // The last batch's flush may not have completed, and a record whose data does not
+    // verify may be torn. It may as well be an acknowledged record damaged since, or read
+    // wrong: nothing after the batch tells, as a later frame would for an earlier one. So a
+    // record is never dropped on that evidence (audit S05). A relocation whose new copy does
+    // not verify goes back to the copy it moved, which is intact either way: that segment is
+    // freed only after a relocation is durable. Any other record stays, reported damaged.
     for (put, displaced) in last_batch.iter().rev() {
         let at = u64::from(put.offset);
         let verified = verify_at(
@@ -168,16 +178,13 @@ pub(crate) fn recover<F: BlockFile>(
         if verified {
             continue;
         }
-        // A relocation whose new copy did not reach the disk goes back to the copy it moved:
-        // that segment is freed only after a relocation is durable, so the old copy is intact.
-        let undone = match displaced {
-            Some(old) => index.restore_fragment(&put.key, old),
-            None => index
-                .pop_fragment(&put.key, put.chunk_offset, put.sequence)
-                .is_some(),
-        };
-        if undone {
-            report.unflushed_dropped = report.unflushed_dropped.saturating_add(1);
+        match displaced {
+            Some(old) => {
+                if index.restore_fragment(&put.key, old) {
+                    report.restored = report.restored.saturating_add(1);
+                }
+            }
+            None => report.damaged.push(put.key),
         }
     }
 
@@ -276,6 +283,17 @@ pub(crate) struct Verified {
 }
 
 impl Verified {
+    /// Whether this is the record of `key` that fragment `f` names.
+    pub(crate) fn is(&self, key: &ChunkKey, f: &Fragment) -> bool {
+        let h = &self.prefix.header;
+        h.key == *key
+            && h.incarnation == f.incarnation
+            && h.sequence == f.sequence
+            && h.chunk_offset == f.chunk_offset
+            && h.payload_len == f.payload_len
+            && self.payload_crc == f.payload_crc
+    }
+
     fn matches(&self, put: &PutRecord) -> bool {
         let h = &self.prefix.header;
         h.key == put.key

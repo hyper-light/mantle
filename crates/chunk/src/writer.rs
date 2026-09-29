@@ -43,6 +43,7 @@ use crate::layout::{
 };
 use crate::log::{self, Cursor};
 use crate::record::{self, FLAG_FINAL, Payload, RecordHeader, SegmentHeader, Sink};
+use crate::recover::{Identity, verify_at};
 use crate::superblock::Superblock;
 
 /// Free segments kept back from new writes so the cleaner can always relocate into one
@@ -214,6 +215,14 @@ struct View {
     pending: Vec<(u64, u64, u32)>,
     /// A request earlier in this batch changed the chunk.
     touched: bool,
+}
+
+/// How a durable fragment compares with a retry's bytes.
+enum Stored {
+    Same,
+    Differs,
+    /// It does not verify, or cannot be read.
+    Damaged,
 }
 
 enum Decision {
@@ -578,6 +587,34 @@ impl<F: BlockFile> Writer<F> {
         self.commit(accepted);
     }
 
+    /// Reads the durable fragment `f` of `key` and compares its bytes with `bytes`.
+    fn stored_bytes(&self, key: &ChunkKey, f: &Fragment, bytes: &[u8]) -> Stored {
+        let identity = Identity {
+            volume: self.shared.volume,
+            checksum_shift: self.shared.checksum_shift,
+        };
+        let mut data = Vec::new();
+        let read = verify_at(
+            &self.shared.file,
+            &self.shared.pool,
+            &self.shared.geometry,
+            identity,
+            f.segment,
+            u64::from(f.offset),
+            Some(&mut data),
+        );
+        match read {
+            Ok(Some(v)) if v.is(key, f) => {
+                if data == bytes {
+                    Stored::Same
+                } else {
+                    Stored::Differs
+                }
+            }
+            _ => Stored::Damaged,
+        }
+    }
+
     /// Answers requests that need no write, refuses invalid ones, and returns the rest.
     fn validate(&mut self, batch: Vec<Request>) -> Result<Vec<Accepted>, ()> {
         let index = match self.shared.index.read() {
@@ -627,9 +664,8 @@ impl<F: BlockFile> Writer<F> {
                     let view = view_of(&mut views, key);
                     let len = u64::try_from(payload.data.len()).unwrap_or(u64::MAX);
                     let crc = payload.crc;
-                    let existing = index
-                        .get(key)
-                        .and_then(|e| e.fragment_at(*offset))
+                    let stored = index.get(key).and_then(|e| e.fragment_at(*offset)).copied();
+                    let existing = stored
                         .map(|f| (u64::from(f.payload_len), f.payload_crc))
                         .or_else(|| {
                             view.as_ref().and_then(|v| {
@@ -641,17 +677,45 @@ impl<F: BlockFile> Writer<F> {
                         });
                     match view {
                         Some(v) if *offset < v.len || (v.sealed && *offset == v.len) => {
-                            if existing == Some((len, crc)) && (!seal || v.sealed) {
-                                Ok(Decision::Done)
-                            } else if *offset == 0 && *seal {
-                                Err(ChunkError::Exists(*key))
+                            let refused = if *offset == 0 && *seal {
+                                ChunkError::Exists(*key)
                             } else if v.sealed {
-                                Err(ChunkError::Sealed(*key))
+                                ChunkError::Sealed(*key)
                             } else {
-                                Err(ChunkError::Conflict {
+                                ChunkError::Conflict {
                                     key: *key,
                                     offset: *offset,
-                                })
+                                }
+                            };
+                            if existing != Some((len, crc)) || (*seal && !v.sealed) {
+                                Err(refused)
+                            } else {
+                                // The same length and CRC-32C, which a different payload can
+                                // share: the bytes decide whether this is a retry (audit B05).
+                                match stored {
+                                    Some(f) => match self.stored_bytes(key, &f, &payload.data) {
+                                        Stored::Same => Ok(Decision::Done),
+                                        Stored::Differs => Err(refused),
+                                        // The stored copy no longer verifies: the retry, the
+                                        // same length and CRC as the bytes acknowledged,
+                                        // writes it again (audit S05).
+                                        Stored::Damaged => Ok(Decision::Write(crc)),
+                                    },
+                                    None => {
+                                        let same = accepted.iter().rev().any(|a: &Accepted| {
+                                            matches!(
+                                                &a.request.op,
+                                                Op::Write { key: k, offset: o, payload: p, .. }
+                                                    if k == key && o == offset && p.data == payload.data
+                                            )
+                                        });
+                                        if same {
+                                            Ok(Decision::Done)
+                                        } else {
+                                            Err(refused)
+                                        }
+                                    }
+                                }
                             }
                         }
                         Some(v) if *offset > v.len => Err(ChunkError::Gap {

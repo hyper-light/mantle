@@ -573,3 +573,99 @@ fn reads_past_the_depth_wait_or_are_refused() {
     assert_eq!(stats.refused, refused);
     assert_eq!(read.into_inner() + refused, 8 * 200);
 }
+
+/// Where `bytes` first lie in the file's durable image.
+fn find(file: &mantle_disk::sim::SimFile, bytes: &[u8]) -> u64 {
+    let image = file.durable_image().unwrap();
+    image
+        .windows(bytes.len())
+        .position(|w| w == bytes)
+        .expect("the bytes are on the device") as u64
+}
+
+/// An acknowledged put whose bytes read wrong while the volume recovers is kept and
+/// reported, never dropped: once the fault clears, it reads back whole (audit S05).
+#[test]
+fn a_bad_read_at_recovery_never_drops_an_acknowledged_chunk() {
+    let file = sim(40);
+    let v = Volume::format(Arc::clone(&file), SIZE, config()).unwrap();
+    let bytes = data(40, 9_000);
+    v.put(key(1), &bytes).unwrap();
+    v.close();
+    let at = find(&file, &bytes[..64]) + 100;
+    file.inject(mantle_disk::sim::Fault::BitFlip {
+        offset: at,
+        bit: 2,
+        stored: false,
+    })
+    .unwrap();
+    let (v, report) = Volume::open(Arc::clone(&file), config()).unwrap();
+    assert_eq!(report.damaged, vec![key(1)]);
+    assert_eq!(v.stat(&key(1)).unwrap().unwrap().len, 9_000);
+    assert!(
+        v.read(&key(1), 0, 9_000).is_err(),
+        "a read that does not verify"
+    );
+    file.clear_faults().unwrap();
+    assert_eq!(v.read(&key(1), 0, 9_000).unwrap(), bytes);
+    v.close();
+    let (v, report) = Volume::open(Arc::clone(&file), config()).unwrap();
+    assert!(report.damaged.is_empty());
+    assert_eq!(v.read(&key(1), 0, 9_000).unwrap(), bytes);
+}
+
+/// An acknowledged put damaged on the device is kept, reads of it answer that it does not
+/// verify, and a retry of the same bytes writes it again (audits S05, B05).
+#[test]
+fn a_damaged_chunk_is_reported_and_a_retry_writes_it_again() {
+    let file = sim(41);
+    let v = Volume::format(Arc::clone(&file), SIZE, config()).unwrap();
+    let bytes = data(41, 9_000);
+    v.put(key(1), &bytes).unwrap();
+    v.close();
+    let at = find(&file, &bytes[..64]) + 100;
+    file.inject(mantle_disk::sim::Fault::BitFlip {
+        offset: at,
+        bit: 5,
+        stored: true,
+    })
+    .unwrap();
+    let (v, report) = Volume::open(Arc::clone(&file), config()).unwrap();
+    assert_eq!(report.damaged, vec![key(1)]);
+    assert!(v.read(&key(1), 0, 9_000).is_err());
+    v.put(key(1), &bytes).unwrap();
+    assert_eq!(v.read(&key(1), 0, 9_000).unwrap(), bytes);
+    v.close();
+    let (v, _) = Volume::open(Arc::clone(&file), config()).unwrap();
+    assert_eq!(v.read(&key(1), 0, 9_000).unwrap(), bytes);
+}
+
+/// Two payloads of one length and one CRC-32C are different chunks: the second is refused,
+/// and the first reads back (audit B05).
+#[test]
+fn a_crc_collision_is_not_a_retry() {
+    let a = [0x95, 0xfb, 0xdf, 0x74, 0xc4, 0x93, 0x1b, 0xa0];
+    let b = [0xf0, 0x80, 0xc8, 0x66, 0x4e, 0x34, 0xce, 0x4a];
+    assert_eq!(mantle_crc::crc32c(&a), mantle_crc::crc32c(&b));
+    let v = Volume::format(sim(42), SIZE, config()).unwrap();
+    v.put(key(1), &a).unwrap();
+    assert!(matches!(v.put(key(1), &b), Err(ChunkError::Exists(_))));
+    v.put(key(1), &a).unwrap();
+    assert_eq!(v.read(&key(1), 0, 8).unwrap(), a);
+    // The same within one batch: submitted at once, whichever lands first, the other is
+    // refused, and the one read back is whole.
+    for n in 0..20u64 {
+        let k = key(100 + n);
+        let (ra, rb) = std::thread::scope(|s| {
+            let ha = s.spawn(|| v.put(k, &a));
+            let hb = s.spawn(|| v.put(k, &b));
+            (ha.join().unwrap(), hb.join().unwrap())
+        });
+        let got = v.read(&k, 0, 8).unwrap();
+        match (ra, rb) {
+            (Ok(()), Err(ChunkError::Exists(_))) => assert_eq!(got, a),
+            (Err(ChunkError::Exists(_)), Ok(())) => assert_eq!(got, b),
+            other => panic!("{other:?}"),
+        }
+    }
+}

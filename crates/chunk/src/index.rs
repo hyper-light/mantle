@@ -277,31 +277,6 @@ impl Index {
             _ => false,
         }
     }
-
-    /// Removes `key`'s last fragment if it is the one at `chunk_offset` written with
-    /// `sequence`, unsealing the chunk; removes the chunk if nothing is left. Returns the
-    /// fragment removed.
-    pub fn pop_fragment(
-        &mut self,
-        key: &ChunkKey,
-        chunk_offset: u64,
-        sequence: u64,
-    ) -> Option<Fragment> {
-        let entry = self.map.get_mut(key)?;
-        let last = entry.fragments.last()?;
-        if last.chunk_offset != chunk_offset || last.sequence != sequence {
-            return None;
-        }
-        let popped = entry.fragments.pop();
-        entry.sealed = false;
-        if entry.fragments.is_empty() {
-            self.map.remove(key);
-        }
-        if let Some(f) = &popped {
-            self.placed.remove(&(f.segment, f.offset));
-        }
-        popped
-    }
 }
 
 /// One segment's state as the writer tracks it.
@@ -393,26 +368,6 @@ mod tests {
     }
 
     #[test]
-    fn popping_the_last_fragment_unseals_and_empties() {
-        let key = ChunkKey {
-            block: 1,
-            epoch: 0,
-            index: 0,
-        };
-        let mut index = Index::default();
-        index.insert(key, &put(0, 10, 1, 0), 8).unwrap();
-        index.insert(key, &put(10, 5, 2, FLAG_FINAL), 8).unwrap();
-        assert!(
-            index.pop_fragment(&key, 0, 1).is_none(),
-            "only the last fragment pops"
-        );
-        assert!(index.pop_fragment(&key, 10, 2).is_some());
-        assert!(!index.get(&key).unwrap().sealed);
-        assert!(index.pop_fragment(&key, 0, 1).is_some());
-        assert!(index.get(&key).is_none());
-    }
-
-    #[test]
     fn a_chunk_has_a_bounded_number_of_fragments() {
         let key = ChunkKey {
             block: 1,
@@ -473,7 +428,7 @@ mod tests {
             };
             place += 1;
             sequence += 1;
-            match next() % 6 {
+            match next() % 5 {
                 0 | 1 => {
                     let end = index.get(&key).map_or(0, Entry::len);
                     let _ = index.insert(key, &put(key, place, end, end as u32, sequence), 8);
@@ -490,12 +445,6 @@ mod tests {
                 3 => {
                     if let Some((key, old)) = replaced.pop() {
                         index.restore_fragment(&key, &old);
-                    }
-                }
-                4 => {
-                    let last = index.get(&key).and_then(|e| e.fragments.last()).copied();
-                    if let Some(f) = last {
-                        index.pop_fragment(&key, f.chunk_offset, f.sequence);
                     }
                 }
                 _ => {

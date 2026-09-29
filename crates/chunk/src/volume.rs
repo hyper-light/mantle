@@ -211,11 +211,11 @@ impl<F: BlockFile + 'static> Volume<F> {
             anticipation: mantle_disk::commit::Anticipation::new(),
             received: 0,
         };
-        // Recovery changed the index relative to the log: it dropped records whose flush
-        // never completed, or indexed records the log never named. Both decisions live only
-        // in memory until a checkpoint records them; without one, a later replay would bring
-        // the dropped records back and forget the rolled-forward ones.
-        if report.unflushed_dropped > 0 || report.rolled_forward > 0 {
+        // Recovery changed the index relative to the log: it put relocations back to the
+        // copies they moved, or indexed records the log never named. Both decisions live
+        // only in memory until a checkpoint records them; without one, a later replay would
+        // move the relocations again and forget the rolled-forward records.
+        if report.restored > 0 || report.rolled_forward > 0 {
             writer.checkpoint()?;
         }
         let superblock = writer.superblock.clone();

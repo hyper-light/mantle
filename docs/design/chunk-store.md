@@ -162,6 +162,13 @@ a new one. The superblock therefore records a reservation for each, raised with 
 superblock write and flush before any record carries a number past it (2^24 sequences and
 2^16 incarnations at a time), and recovery resumes above it (docs/bugs/2026-09-28).
 
+A retry is told apart by its bytes. A write of a fragment already there with the same length
+and CRC-32C, which different payloads can share, reads the stored copy and compares: the
+same bytes answer it done, different ones refuse it, and a stored copy that no longer
+verifies is written again from the retry, which carries the bytes acknowledged (audits B05,
+S05). Only a retry pays the read; a write of the same fragment within one batch compares
+with the bytes queued.
+
 Streams: client writes and cleaner relocations append to different open segments, so
 data is grouped by age [RO92 §3.6; HKA17 rule 4]. Appends to one chunk must be contiguous
 (the offset equals the chunk's current length) or an exact repeat of a durable fragment
@@ -198,10 +205,20 @@ availability target to set the budget from.
    incarnations resume above its reservations (§4).
 2. Load the checkpoint it names and replay index frames in LSN order to the end of the
    log (§3.2 torn-versus-corrupt rule).
-3. Roll forward [RO92 §4.2]: from each open segment's last known write position, scan
+3. Check the last batch. Its flush may not have completed, and a record whose data does not
+   verify may be torn; it may as well be an acknowledged record damaged since, or read wrong,
+   and nothing after the batch tells the two apart, as a later frame would for an earlier
+   one [AGL+18 §3.3.3]. So no record is dropped on that evidence. A relocation whose new
+   copy does not verify goes back to the copy it moved, intact either way, since a segment
+   is freed only after the relocation that empties it is durable. Any other record stays
+   and is reported damaged: reads of it answer that its bytes do not verify, repair
+   restores it from the block's other chunks, and a chunk no block names, never
+   acknowledged, goes when the volume is reconciled with the Block layer. Misclassifying a
+   crash as damage costs repair; the reverse loses data (audit S05).
+4. Roll forward [RO92 §4.2]: from each open segment's last known write position, scan
    data records; each whose header, identity, incarnation and checksums verify is added
    to the index. This recovers records whose frame was lost with a torn index write.
-4. Rebuild the segment usage table (live bytes and youngest record time per segment).
+5. Rebuild the segment usage table (live bytes and youngest record time per segment).
 
 If the index log is unreadable, step 3 over every segment rebuilds the index from the
 data records alone: slow, but no acknowledged chunk depends on the log.
@@ -304,5 +321,8 @@ lost, kept, or torn at sector granularity when the simulator crashes it, and rea
 and flushes can fail or return flipped bits on command [PCA+14; GAA17 §3; RPA+20
 recommends block-level fault injection]. Every test that crashes checks the same
 invariants: every acknowledged put reads back exactly; no read returns bytes that do not
-verify; recovery never refuses a volume whose only damage is a torn tail; a
-flush failure fences the volume.
+verify; recovery never refuses a volume whose only damage is a torn tail, and reports damaged
+only records of the last batch, each a write that was in flight; a flush failure fences the
+volume. A read that fails while the volume recovers, or bytes damaged on the device, leave
+an acknowledged chunk kept and reported, never dropped, and a retry of the same bytes writes
+it again; a payload sharing a retry's length and CRC-32C is refused, not taken for it.

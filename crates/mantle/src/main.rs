@@ -19,6 +19,7 @@ use clap::{Parser, Subcommand};
 
 mod bench;
 mod bench_ec;
+mod bench_log;
 mod disk;
 mod display;
 
@@ -65,6 +66,25 @@ enum BenchCommand {
         /// Requests in flight to measure, comma-separated: 1,4,16,64 by default.
         #[arg(long, value_delimiter = ',')]
         workers: Vec<usize>,
+        /// Leave out the measurement of the device itself.
+        #[arg(long)]
+        skip_device: bool,
+    },
+    /// Measure the device under PATH, then the Raft log's appends across entry sizes and
+    /// replicas appending at once, in scratch files (removed afterwards).
+    Log {
+        /// A directory on the device to measure.
+        path: PathBuf,
+        /// Seconds each measurement runs.
+        #[arg(long, default_value_t = 1.0)]
+        seconds: f64,
+        /// Entry sizes, comma-separated, in bytes or with a K or M suffix: 128,1K,16K by
+        /// default.
+        #[arg(long, value_delimiter = ',', value_parser = parse_size)]
+        sizes: Vec<usize>,
+        /// Replicas appending at once, comma-separated: 1,4,16,64,256 by default.
+        #[arg(long, value_delimiter = ',')]
+        replicas: Vec<usize>,
         /// Leave out the measurement of the device itself.
         #[arg(long)]
         skip_device: bool,
@@ -148,6 +168,29 @@ fn main() -> ExitCode {
                     step,
                     sizes,
                     workers,
+                    skip_device,
+                },
+            )
+            .map_err(|e| e.to_string()),
+            Err(_) => Err(format!("--seconds {seconds} is not a duration")),
+        },
+        Command::Bench {
+            command:
+                BenchCommand::Log {
+                    path,
+                    seconds,
+                    sizes,
+                    replicas,
+                    skip_device,
+                },
+        } => match std::time::Duration::try_from_secs_f64(seconds) {
+            Ok(step) => bench_log::log(
+                &mut out,
+                &path,
+                &bench_log::Options {
+                    step,
+                    sizes,
+                    replicas,
                     skip_device,
                 },
             )

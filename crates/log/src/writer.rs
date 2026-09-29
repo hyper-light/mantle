@@ -18,6 +18,13 @@
 //! A freed segment is reused only once a durable frame names a tail past it; the last free
 //! segment is kept for a frame that does so, which is how the log never runs out of room to
 //! free room.
+//!
+//! Replicas submit in a closed loop, each its next update once its last is durable. Formed at
+//! once from whatever is queued, each batch would miss the replicas the last one answered,
+//! and a few replicas would alternate between batches, every update waiting for two flushes
+//! (docs/measurements/2026-09-28-raft-log-benchmark.md). The writer waits for them as long as
+//! waiting is expected to lower total latency, as the chunk store's writer does
+//! (`mantle_disk::commit`).
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -27,6 +34,7 @@ use std::sync::mpsc::Receiver;
 use mantle_codec::Writer as Payload;
 use mantle_disk::block::BlockFile;
 use mantle_disk::buf::AlignedBuf;
+use mantle_disk::commit::Anticipation;
 
 use crate::format::{
     self, FRAME_HEADER_BYTES, FRAME_HEADER_LEN, FrameHeader, Owned, Placed, Record, SegmentHeader,
@@ -70,6 +78,9 @@ pub(crate) struct Writer<F> {
     held: VecDeque<Submission>,
     /// Payload bytes one frame holds.
     capacity: usize,
+    anticipation: Anticipation,
+    /// Submissions taken off the channel so far.
+    received: u64,
 }
 
 impl<F: BlockFile> Writer<F> {
@@ -87,12 +98,18 @@ impl<F: BlockFile> Writer<F> {
             receiver,
             held: VecDeque::new(),
             capacity,
+            anticipation: Anticipation::new(),
+            received: 0,
         })
     }
 
     pub fn run(mut self) {
+        // Submissions the last batch answered, and those already sent when it did.
+        let mut answered = 0u64;
+        let mut backlog = 0u64;
         loop {
             let mut batch = std::mem::take(&mut self.held);
+            let held = u64::try_from(batch.len()).unwrap_or(u64::MAX);
             if batch.is_empty() {
                 match self.receiver.recv() {
                     Ok(s) => batch.push_back(self.taken(s)),
@@ -102,6 +119,8 @@ impl<F: BlockFile> Writer<F> {
             while let Ok(s) = self.receiver.try_recv() {
                 batch.push_back(self.taken(s));
             }
+            self.gather(&mut batch, answered, backlog.saturating_add(held));
+            answered = u64::try_from(batch.len()).unwrap_or(u64::MAX);
             if self.shared.fenced.load(Ordering::Acquire) {
                 for s in batch {
                     answer(&s, Err(LogError::Fenced));
@@ -118,11 +137,43 @@ impl<F: BlockFile> Writer<F> {
                     answer(&s, Err(LogError::Fenced));
                 }
             }
+            // Submissions sent before these answers went out are queued ahead of any the
+            // answered replicas send next.
+            backlog = self
+                .shared
+                .submitted
+                .load(Ordering::Acquire)
+                .saturating_sub(self.received);
         }
     }
 
+    /// Waits for the replicas the last batch answered while waiting is expected to lower
+    /// total latency, and learns how many of them return (`mantle_disk::commit`). The first
+    /// `before` submissions in the batch were sent before the answers.
+    fn gather(&mut self, batch: &mut VecDeque<Submission>, answered: u64, before: u64) {
+        if answered == 0 {
+            return;
+        }
+        let returned = |batch: &VecDeque<Submission>| {
+            u64::try_from(batch.len())
+                .unwrap_or(u64::MAX)
+                .saturating_sub(before)
+        };
+        while returned(batch) < answered && batch.len() < self.shared.config.queue_submissions {
+            let Some(step) = self.anticipation.wait(batch.len()) else {
+                break;
+            };
+            match self.receiver.recv_timeout(step) {
+                Ok(s) => batch.push_back(self.taken(s)),
+                Err(_) => break,
+            }
+        }
+        self.anticipation.learn(answered, returned(batch));
+    }
+
     /// Gives back the queue room of a submission the writer took.
-    fn taken(&self, s: Submission) -> Submission {
+    fn taken(&mut self, s: Submission) -> Submission {
+        self.received = self.received.saturating_add(1);
         if let Ok(mut queue) = self.shared.queue.lock() {
             queue.submissions = queue.submissions.saturating_sub(1);
             queue.bytes = queue.bytes.saturating_sub(s.bytes);
@@ -199,6 +250,9 @@ impl<F: BlockFile> Writer<F> {
         let result = self.place_and_write(&payload, records, sweep, &taken);
         match result {
             Ok(true) => {
+                self.shared.frames.fetch_add(1, Ordering::Relaxed);
+                let updates = u64::try_from(taken.len()).unwrap_or(u64::MAX);
+                self.shared.updates.fetch_add(updates, Ordering::Relaxed);
                 for (s, _) in &taken {
                     answer(s, Ok(()));
                 }
@@ -242,7 +296,10 @@ impl<F: BlockFile> Writer<F> {
         let Some(target) = self.target(payload.len(), advances)? else {
             return Ok(false);
         };
+        let started = std::time::Instant::now();
         self.write(&target, records, payload, tail)?;
+        self.anticipation
+            .served(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
         self.publish(&target, sweep, taken, tail)?;
         Ok(true)
     }

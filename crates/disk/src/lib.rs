@@ -17,6 +17,7 @@ use std::path::PathBuf;
 pub mod block;
 pub mod buf;
 pub mod calibrate;
+pub mod commit;
 pub mod file;
 pub mod histogram;
 pub mod identity;

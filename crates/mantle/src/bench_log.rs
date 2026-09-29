@@ -1,0 +1,220 @@
+//! `mantle bench log`: the Raft log's appends per second and their latency on a device, next
+//! to what one durable write costs there (docs/design/raft-log.md §8).
+//!
+//! A log is created in a scratch file on the device and driven by closed-loop replicas: each
+//! appends one entry to its own group, waits until the log has made it durable, and appends
+//! the next, as a replica does with each `Ready`. Every replica compacts behind itself, so
+//! the log frees and reclaims segments as a running node's does. For each entry size and
+//! number of replicas the replicas append for the step's duration. Besides throughput and
+//! latency, each row says how many appends one flush carried: group commit is what lets
+//! many replicas share one device's flushes (06 §C.c). The scratch file is removed however
+//! the benchmark ends.
+
+use std::io::Write;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use mantle_disk::buf::Alignment;
+use mantle_disk::calibrate;
+use mantle_disk::file::{CachingRequest, DeviceFile};
+use mantle_disk::histogram::Histogram;
+use mantle_log::{Config, Entries, Entry, Log, LogError, Start, Update};
+
+use crate::bench::{Error, Scratch, nanos, rate, report_device};
+use crate::display;
+
+/// Entries a replica keeps behind its last before it compacts, as its engine keeps a
+/// window for followers that lag.
+const KEEP: u64 = 64;
+
+/// What `mantle bench log` was asked to run.
+#[derive(Debug, Clone)]
+pub struct Options {
+    pub step: Duration,
+    /// Entry sizes, in bytes: 128 B, 1 KiB and 16 KiB by default.
+    pub sizes: Vec<usize>,
+    /// Replicas appending at once: 1, 4, 16, 64 and 256 by default.
+    pub replicas: Vec<usize>,
+    pub skip_device: bool,
+}
+
+pub fn log(out: &mut impl Write, path: &Path, options: &Options) -> Result<(), Error> {
+    let id = mantle_disk::probe::identify(path);
+    let align = [id.logical_block, id.physical_block]
+        .into_iter()
+        .flatten()
+        .filter_map(|b| usize::try_from(b).ok())
+        .filter_map(|b| Alignment::new(b).ok())
+        .fold(
+            Alignment::new(4096).unwrap_or(Alignment::BYTE),
+            Alignment::max,
+        );
+    let sizes = if options.sizes.is_empty() {
+        vec![128, 1 << 10, 16 << 10]
+    } else {
+        options.sizes.clone()
+    };
+    let replicas = if options.replicas.is_empty() {
+        vec![1, 4, 16, 64, 256]
+    } else {
+        options.replicas.clone()
+    };
+    writeln!(out, "{}", path.display())?;
+    if !options.skip_device {
+        writeln!(out, "measuring the device (about 30 s)")?;
+        out.flush()?;
+        let device = calibrate::calibrate(
+            path,
+            align,
+            id.file_system.available_bytes,
+            &calibrate::Plan::standard(align),
+        )
+        .map_err(Error::Disk)?;
+        report_device(out, &device)?;
+    }
+    let most = replicas.iter().copied().max().unwrap_or(1).max(1);
+    writeln!(
+        out,
+        "raft log in a scratch file (removed afterwards), one entry an append"
+    )?;
+    writeln!(
+        out,
+        "  {:<12} {:>9} {:>11} {:>12} {:>10} {:>10} {:>10} {:>11}",
+        "", "replicas", "appends/s", "throughput", "p50", "p99", "p99.9", "per flush"
+    )?;
+    let mut point = 0u64;
+    for &size in &sizes {
+        for &count in &replicas {
+            point = point.saturating_add(1);
+            let scratch =
+                Scratch(path.join(format!(".mantle-bench-log-{}-{point}", std::process::id())));
+            let file = DeviceFile::open(&scratch.0, true, CachingRequest::PreferDirect, align)
+                .map_err(Error::Disk)?;
+            let config = Config {
+                segment_bytes: 16 << 20,
+                max_segments: 64,
+                max_groups: most,
+                group_entries: 1 << 20,
+                group_bytes: 1 << 30,
+                group_cache: 1 << 16,
+                queue_submissions: most.saturating_mul(2),
+                queue_bytes: 1 << 30,
+            };
+            let log = Arc::new(Log::create(file, config, u128::from(point)).map_err(log_error)?);
+            let outcome = appends(&log, size, count, options.step)?;
+            let (frames, updates) = log.flushed();
+            let per_flush = if frames == 0 {
+                0.0
+            } else {
+                // Counts of a bounded run are far below 2^53.
+                updates as f64 / frames as f64
+            };
+            writeln!(
+                out,
+                "  {:<12} {:>9} {:>11} {:>12} {:>10} {:>10} {:>10} {:>11.1}",
+                format!("append {}", display::size(size)),
+                count,
+                display::count(rate(outcome.appends, outcome.elapsed)),
+                display::rate(rate(outcome.bytes, outcome.elapsed)),
+                display::nanos(outcome.latency.p50()),
+                display::nanos(outcome.latency.p99()),
+                display::nanos(outcome.latency.p999()),
+                per_flush
+            )?;
+            out.flush()?;
+            drop(log);
+        }
+    }
+    Ok(())
+}
+
+fn log_error(e: LogError) -> Error {
+    Error::Log(e.to_string())
+}
+
+struct Outcome {
+    appends: u64,
+    bytes: u64,
+    elapsed: Duration,
+    latency: Histogram,
+}
+
+/// `count` closed-loop replicas append `size`-byte entries, each to its own group, until
+/// `step` passes.
+fn appends(
+    log: &Arc<Log<DeviceFile>>,
+    size: usize,
+    count: usize,
+    step: Duration,
+) -> Result<Outcome, Error> {
+    let started = Instant::now();
+    let deadline = started.checked_add(step);
+    let failed: Mutex<Option<String>> = Mutex::new(None);
+    let payload: Arc<[u8]> = Arc::from(vec![0x5a; size]);
+    let results: Vec<Option<Histogram>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..count)
+            .map(|replica| {
+                let (failed, payload, log) = (&failed, Arc::clone(&payload), Arc::clone(log));
+                scope.spawn(move || {
+                    let group = u128::from(u64::try_from(replica).unwrap_or(u64::MAX));
+                    let mut latency = Histogram::new();
+                    let mut last = 0u64;
+                    while deadline.is_some_and(|d| Instant::now() < d)
+                        && failed.lock().is_ok_and(|f| f.is_none())
+                    {
+                        let Some(next) = last.checked_add(1) else {
+                            break;
+                        };
+                        let mut update = Update {
+                            entries: Some(Entries {
+                                first: next,
+                                entries: vec![Entry {
+                                    term: 1,
+                                    bytes: Arc::clone(&payload),
+                                }],
+                            }),
+                            ..Update::default()
+                        };
+                        if next > KEEP && next % KEEP == 0 {
+                            update.start = Some(Start {
+                                index: next.saturating_sub(KEEP),
+                                term: 1,
+                            });
+                        }
+                        let t = Instant::now();
+                        match log.write_waiting(group, update) {
+                            Ok(()) => {
+                                latency.record(nanos(t.elapsed()));
+                                last = next;
+                            }
+                            Err(e) => {
+                                if let Ok(mut f) = failed.lock() {
+                                    f.get_or_insert(e.to_string());
+                                }
+                            }
+                        }
+                    }
+                    latency
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().ok()).collect()
+    });
+    let elapsed = started.elapsed();
+    if let Some(e) = failed.into_inner().ok().flatten() {
+        return Err(Error::Log(e));
+    }
+    let mut latency = Histogram::new();
+    for result in results {
+        latency.merge(&result.ok_or(Error::Worker)?);
+    }
+    let appends = latency.count();
+    Ok(Outcome {
+        appends,
+        bytes: appends.saturating_mul(u64::try_from(size).unwrap_or(u64::MAX)),
+        elapsed,
+        latency,
+    })
+}

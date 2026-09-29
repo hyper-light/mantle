@@ -18,6 +18,7 @@ clap.workspace = true
 mantle-chunk = { path = "../chunk" }
 mantle-disk = { path = "../disk" }
 mantle-ec = { path = "../ec" }
+mantle-log = { path = "../log" }
 
 [dev-dependencies]
 tempfile.workspace = true

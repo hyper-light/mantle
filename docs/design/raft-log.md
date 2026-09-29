@@ -77,8 +77,11 @@ bounded queue admits two batches' worth of submissions, by count and bytes, and 
 past that with `Busy` [research/11 §4]. The loop takes everything that arrived while the
 last batch was being made durable, encodes one frame, writes it, flushes the file once
 with the platform's full flush, and only then publishes the records to readers and answers
-every submitter. With no artificial delay, a batch is one submission under light load and
-everything queued under heavy load (06 §A9).
+every submitter. Replicas submit in a closed loop, so the writer waits for the replicas it
+just answered as long as that is expected to lower total latency, the wait the chunk store's
+writer derived (`mantle_disk::commit`). Without it, a few replicas alternate between batches
+and each update waits for two flushes
+(docs/measurements/2026-09-28-raft-log-benchmark.md, finding 2).
 
 A replica cannot have its update refused: once the core has handed over a `Ready`, it takes
 no other call until the `Ready` is made durable (07 §1.2). So a replica submits by waiting

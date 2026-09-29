@@ -204,11 +204,7 @@ impl<F: BlockFile + 'static> Volume<F> {
                 batch.saturating_mul(2),
                 batch.saturating_mul(2),
             ),
-            service_ns: 0,
-            returns: (
-                crate::writer::RATE_ONE,
-                crate::writer::RATE_ONE.saturating_mul(2),
-            ),
+            anticipation: mantle_disk::commit::Anticipation::new(),
             received: 0,
         };
         // Recovery changed the index relative to the log: it dropped records whose flush

@@ -122,7 +122,9 @@ in memory verified by each entry's own checksum. A property test runs generated 
 of appends, conflicts, compactions, snapshots, proposals and removals, cutting power at
 random points on the simulated device, and checks after every reopen that each
 acknowledged update survived and the one in flight landed whole or not at all; a soak of
-200,000 histories over segment sizes and quotas passed.
+200,000 histories over segment sizes and quotas passed. `mantle bench log` measures
+appends against the device: one flush commits every replica's append, from 2 replicas to 256,
+at about one durable write of latency ([measurements](measurements/2026-09-28-raft-log-benchmark.md)).
 
 Range replicas (`mantle-range`, [design](design/replica.md)) run focal-raft's core over the
 log and an engine: an entry carries a batch of gateway commands applied as one engine batch,
@@ -138,8 +140,6 @@ repeated commands applied twice when either is introduced on purpose.
 
 Remaining before it is done:
 
-- A benchmark of the log's submissions per second and latency against the device's
-  measured flush rate.
 - The coordinator that runs a bucket's create and delete across the ranges, and the
   collector that finishes what a failed one leaves and removes unreferenced files and
   blocks after a grace period.

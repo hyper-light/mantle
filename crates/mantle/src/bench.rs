@@ -37,6 +37,7 @@ pub enum Error {
     Output(std::io::Error),
     Disk(mantle_disk::DiskError),
     Chunk(ChunkError),
+    Log(String),
     /// A worker thread unwound; its measurements are lost.
     Worker,
 }
@@ -47,6 +48,7 @@ impl fmt::Display for Error {
             Self::Output(e) => write!(f, "writing output: {e}"),
             Self::Disk(e) => write!(f, "{e}"),
             Self::Chunk(e) => write!(f, "chunk store: {e}"),
+            Self::Log(e) => write!(f, "raft log: {e}"),
             Self::Worker => write!(f, "a benchmark worker stopped unexpectedly"),
         }
     }
@@ -87,7 +89,7 @@ impl Plan {
 }
 
 /// Removes the scratch volume whatever happens to the benchmark.
-struct Scratch(PathBuf);
+pub(crate) struct Scratch(pub(crate) PathBuf);
 
 impl Drop for Scratch {
     fn drop(&mut self) {
@@ -119,7 +121,7 @@ impl Outcome {
 
 // Rates are floating point; u64 -> f64 rounds above 2^53, far beyond any count a bounded
 // point produces.
-fn rate(count: u64, elapsed: Duration) -> f64 {
+pub(crate) fn rate(count: u64, elapsed: Duration) -> f64 {
     let secs = elapsed.as_secs_f64();
     if secs <= 0.0 {
         return 0.0;
@@ -173,7 +175,7 @@ pub fn chunk(out: &mut impl Write, path: &Path, options: &Options) -> Result<(),
     run(out, path, align, &plan)
 }
 
-fn report_device(out: &mut impl Write, c: &Calibration) -> std::io::Result<()> {
+pub(crate) fn report_device(out: &mut impl Write, c: &Calibration) -> std::io::Result<()> {
     let best = |points: &[calibrate::Point]| {
         points
             .iter()
@@ -582,7 +584,7 @@ fn deletes(v: &Volume<DeviceFile>, keys: &[ChunkKey]) -> Result<(), Error> {
     Ok(())
 }
 
-fn nanos(d: Duration) -> u64 {
+pub(crate) fn nanos(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 

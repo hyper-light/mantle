@@ -483,6 +483,7 @@ dependencies = [
  "mantle-chunk",
  "mantle-disk",
  "mantle-ec",
+ "mantle-log",
  "tempfile",
 ]
 

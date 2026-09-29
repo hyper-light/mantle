@@ -24,7 +24,7 @@ mod state;
 mod writer;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
@@ -208,6 +208,11 @@ struct Shared<F> {
     /// Signalled when the writer takes submissions off the queue, and when the log fences.
     room: Condvar,
     fenced: AtomicBool,
+    /// Submissions sent to the writer so far, counted just before each is sent.
+    submitted: AtomicU64,
+    /// Frames written and flushed since the log opened, and the updates they carried.
+    frames: AtomicU64,
+    updates: AtomicU64,
 }
 
 impl<F: BlockFile> Shared<F> {
@@ -249,6 +254,9 @@ impl<F: BlockFile + 'static> Log<F> {
             queue: Mutex::new(Queue::default()),
             room: Condvar::new(),
             fenced: AtomicBool::new(false),
+            submitted: AtomicU64::new(0),
+            frames: AtomicU64::new(0),
+            updates: AtomicU64::new(0),
         });
         let capacity = config.queue_submissions.max(1);
         let (sender, receiver) = sync_channel(capacity);
@@ -305,6 +313,7 @@ impl<F: BlockFile + 'static> Log<F> {
         }
         let sender = self.sender.as_ref().ok_or(LogError::Closed)?;
         let (reply, answer) = sync_channel(1);
+        self.shared.submitted.fetch_add(1, Ordering::AcqRel);
         let submission = Submission {
             group,
             update,
@@ -490,6 +499,15 @@ impl<F: BlockFile + 'static> Log<F> {
         Ok(format::entry_at(at, group, index)
             .filter(|(t, _)| *t == term)
             .map(|(_, bytes)| Arc::from(bytes)))
+    }
+
+    /// Frames written and flushed since the log opened, and the updates they carried: how
+    /// many updates one flush commits.
+    pub fn flushed(&self) -> (u64, u64) {
+        (
+            self.shared.frames.load(Ordering::Relaxed),
+            self.shared.updates.load(Ordering::Relaxed),
+        )
     }
 
     /// Whether a failed write or flush has fenced the log.

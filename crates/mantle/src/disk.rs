@@ -160,7 +160,7 @@ fn report(out: &mut impl Write, c: &Calibration) -> std::io::Result<()> {
             out,
             "reads",
             &format!(
-                "{} concurrent {} reads give the highest throughput; mantle uses up to {}",
+                "{} concurrent {} reads keep the device busiest for their wait; mantle uses up to {}",
                 knee.depth,
                 display::size(c.small),
                 knee.depth
@@ -188,7 +188,7 @@ fn report(out: &mut impl Write, c: &Calibration) -> std::io::Result<()> {
         "commits",
         &format!(
             "{} per durable write; concurrent writes share a flush",
-            display::nanos(c.durable_write.p50_ns)
+            display::quantile(c.durable_write.p50_ns)
         ),
     )?;
     field(

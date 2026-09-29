@@ -36,6 +36,11 @@ pub fn count(value: f64) -> String {
     scaled(value, 1000.0, &["", "K", "M", "G"])
 }
 
+/// A latency quantile, or a dash when too few transfers ran to estimate it.
+pub fn quantile(ns: Option<u64>) -> String {
+    ns.map_or_else(|| "–".to_owned(), nanos)
+}
+
 pub fn nanos(ns: u64) -> String {
     let ns = ns as f64;
     if ns < 1_000.0 {

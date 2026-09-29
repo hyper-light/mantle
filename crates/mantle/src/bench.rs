@@ -183,7 +183,7 @@ fn report_device(out: &mut impl Write, c: &Calibration) -> std::io::Result<()> {
     writeln!(
         out,
         "  durable write  {} ({} write, then a full flush)",
-        display::nanos(c.durable_write.p50_ns),
+        display::quantile(c.durable_write.p50_ns),
         display::size(c.small)
     )?;
     writeln!(
@@ -206,8 +206,8 @@ fn report_device(out: &mut impl Write, c: &Calibration) -> std::io::Result<()> {
             display::size(c.small),
             p.depth,
             display::count(p.ops_per_sec),
-            display::nanos(p.p50_ns),
-            display::nanos(p.p99_ns)
+            display::quantile(p.p50_ns),
+            display::quantile(p.p99_ns)
         )?;
     }
     Ok(())

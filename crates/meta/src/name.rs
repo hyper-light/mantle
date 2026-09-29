@@ -9,10 +9,13 @@
 
 use crate::engine::{Engine, EngineError, Write};
 use crate::key::{self, NULL_VERSION, NameRow};
-use crate::record::{RecordError, Version};
+use crate::record::{Checksum, Part, RecordError, Upload, Version};
 
 /// The range's clock: the last time it assigned, nanoseconds since the Unix epoch.
 const CLOCK: &[u8] = &[key::LOCAL, b'c'];
+
+/// "Part size: 5 MiB to 5 GiB. There is no minimum size limit on the last part" (05 §4.1).
+pub const MIN_PART: u64 = 5 << 20;
 
 /// A bucket's versioning state, as the write was made under (05 §7.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +59,10 @@ pub enum Named {
 pub enum Command {
     Put(Put),
     Delete(Delete),
+    CreateUpload(CreateUpload),
+    PutPart(PutPart),
+    Complete(Complete),
+    Abort(Abort),
 }
 
 /// A new version of `key`: PutObject, CopyObject's destination, or a completed upload.
@@ -72,6 +79,67 @@ pub struct Put {
     /// that orders it.
     pub ordered_ns: Option<u64>,
     pub version: Version,
+}
+
+/// CreateMultipartUpload (05 §4.2). The upload's ID is its initiation time in the version-ID
+/// alphabet: a key's uploads then sort in initiation order, as ListMultipartUploads lists
+/// them and as paging by `upload-id-marker` needs (05 §4.7), and the version that completes
+/// it sits at that time's order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateUpload {
+    pub bucket: String,
+    pub key: String,
+    pub at_ns: u64,
+    /// The upload's owner, headers and checksum; its initiation time is the commit's.
+    pub upload: Upload,
+}
+
+/// UploadPart and UploadPartCopy: the part's row, replacing any of the same number
+/// (05 §4.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PutPart {
+    pub bucket: String,
+    pub key: String,
+    pub upload: String,
+    pub number: u16,
+    pub part: Part,
+}
+
+/// CompleteMultipartUpload (05 §4.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Complete {
+    pub bucket: String,
+    pub key: String,
+    pub upload: String,
+    pub versioning: Versioning,
+    pub preconditions: Preconditions,
+    pub at_ns: u64,
+    /// The parts the request lists, in its order, each with the ETag it sent and the file the
+    /// gateway read for it.
+    pub parts: Vec<Listed>,
+    /// The object as the gateway combined it from those parts: its ETag, size and checksum,
+    /// and the file of their extents.
+    pub etag: String,
+    pub size: u64,
+    pub checksum: Option<Checksum>,
+    pub file: Option<u128>,
+}
+
+/// A part a CompleteMultipartUpload lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub number: u16,
+    /// Bare of quotes.
+    pub etag: String,
+    pub file: u128,
+}
+
+/// AbortMultipartUpload (05 §4.8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Abort {
+    pub bucket: String,
+    pub key: String,
+    pub upload: String,
 }
 
 /// DeleteObject (05 §7.3).
@@ -99,6 +167,23 @@ pub enum Outcome {
     PreconditionFailed,
     /// `404 NoSuchKey`: `If-Match` with no current version (05 §2.2).
     NoSuchKey,
+    /// An upload was created; its ID.
+    Created { upload: String },
+    /// A part's row was written.
+    PartWritten,
+    /// An upload and its parts were removed.
+    Aborted,
+    /// `404 NoSuchUpload`.
+    NoSuchUpload,
+    /// `400 InvalidPart`: a listed part was never uploaded, or its ETag differs.
+    InvalidPart,
+    /// `400 InvalidPartOrder`: parts not listed in ascending order of number.
+    InvalidPartOrder,
+    /// `400 EntityTooSmall`: a part other than the last is under `MIN_PART`.
+    EntityTooSmall,
+    /// A listed part now holds another file than the gateway read: it read the parts again
+    /// and retries, since the object it built would name the old part's bytes.
+    Stale,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -121,6 +206,10 @@ pub fn apply<E: Engine>(
     let (outcome, writes) = match command {
         Command::Put(p) => put(engine, p)?,
         Command::Delete(d) => delete(engine, d)?,
+        Command::CreateUpload(c) => create_upload(engine, c)?,
+        Command::PutPart(p) => put_part(engine, p)?,
+        Command::Complete(c) => complete(engine, c)?,
+        Command::Abort(a) => abort(engine, a)?,
     };
     engine.apply(index, &writes)?;
     Ok(outcome)
@@ -278,6 +367,194 @@ fn delete<E: Engine>(engine: &E, d: &Delete) -> Result<(Outcome, Vec<Write>), Na
             }
         },
     }
+}
+
+fn create_upload<E: Engine>(
+    engine: &E,
+    c: &CreateUpload,
+) -> Result<(Outcome, Vec<Write>), NameError> {
+    let (time, mut writes) = tick(engine, c.at_ns)?;
+    let upload = key::version_id(time);
+    let row = Upload {
+        initiated_ns: time,
+        ..c.upload.clone()
+    };
+    writes.push(Write::Put(
+        key::name(
+            &c.bucket,
+            &c.key,
+            &NameRow::Upload(upload.clone().into_bytes()),
+        ),
+        row.encode()?,
+    ));
+    Ok((Outcome::Created { upload }, writes))
+}
+
+fn put_part<E: Engine>(engine: &E, p: &PutPart) -> Result<(Outcome, Vec<Write>), NameError> {
+    if upload(engine, &p.bucket, &p.key, &p.upload)?.is_none() {
+        return Ok((Outcome::NoSuchUpload, Vec::new()));
+    }
+    let row = key::name(
+        &p.bucket,
+        &p.key,
+        &NameRow::Part(p.upload.clone().into_bytes(), p.number),
+    );
+    Ok((
+        Outcome::PartWritten,
+        vec![Write::Put(row, p.part.encode()?)],
+    ))
+}
+
+fn complete<E: Engine>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), NameError> {
+    let Some(upload_row) = upload(engine, &c.bucket, &c.key, &c.upload)? else {
+        // A retry of a complete that committed finds the version it made (05 §4.4).
+        let made = match key::parse_version_id(&c.upload) {
+            Some(initiated) => version(engine, &c.bucket, &c.key, Named::Order(!initiated))?,
+            None => None,
+        };
+        return Ok(match made {
+            Some((order, v)) if !v.marker && v.etag == c.etag => (
+                Outcome::Put {
+                    version: id(v.null, order),
+                },
+                Vec::new(),
+            ),
+            _ => (Outcome::NoSuchUpload, Vec::new()),
+        });
+    };
+    if c.parts.is_empty()
+        || !c
+            .parts
+            .windows(2)
+            .all(|w| matches!(w, [a, b] if a.number < b.number))
+    {
+        return Ok((Outcome::InvalidPartOrder, Vec::new()));
+    }
+    let last = c.parts.len().saturating_sub(1);
+    for (i, listed) in c.parts.iter().enumerate() {
+        let row = key::name(
+            &c.bucket,
+            &c.key,
+            &NameRow::Part(c.upload.clone().into_bytes(), listed.number),
+        );
+        let Some(part) = engine.get(&row)?.map(|b| Part::decode(&b)).transpose()? else {
+            return Ok((Outcome::InvalidPart, Vec::new()));
+        };
+        if part.etag != listed.etag {
+            return Ok((Outcome::InvalidPart, Vec::new()));
+        }
+        if part.file != listed.file {
+            return Ok((Outcome::Stale, Vec::new()));
+        }
+        if i < last && part.size < MIN_PART {
+            return Ok((Outcome::EntityTooSmall, Vec::new()));
+        }
+    }
+    let (outcome, mut writes) = put(
+        engine,
+        &Put {
+            bucket: c.bucket.clone(),
+            key: c.key.clone(),
+            versioning: c.versioning,
+            preconditions: c.preconditions.clone(),
+            at_ns: c.at_ns,
+            ordered_ns: Some(upload_row.initiated_ns),
+            version: Version {
+                marker: false,
+                null: false,
+                modified_ns: 0,
+                etag: c.etag.clone(),
+                size: c.size,
+                checksum: c.checksum.clone(),
+                file: c.file,
+                owner: upload_row.owner,
+                headers: upload_row.headers,
+            },
+        },
+    )?;
+    if matches!(outcome, Outcome::Put { .. }) {
+        // Parts not listed are discarded with the upload (05 §4.4).
+        writes.extend(remove_upload(engine, &c.bucket, &c.key, &c.upload)?);
+    }
+    Ok((outcome, writes))
+}
+
+fn abort<E: Engine>(engine: &E, a: &Abort) -> Result<(Outcome, Vec<Write>), NameError> {
+    if upload(engine, &a.bucket, &a.key, &a.upload)?.is_none() {
+        return Ok((Outcome::NoSuchUpload, Vec::new()));
+    }
+    Ok((
+        Outcome::Aborted,
+        remove_upload(engine, &a.bucket, &a.key, &a.upload)?,
+    ))
+}
+
+/// Writes that remove an upload's row and every one of its parts: at most 10,000 (05 §4.1).
+fn remove_upload<E: Engine>(
+    engine: &E,
+    bucket: &str,
+    key: &str,
+    upload: &str,
+) -> Result<Vec<Write>, NameError> {
+    let id = upload.as_bytes().to_vec();
+    let mut writes = vec![Write::Delete(key::name(
+        bucket,
+        key,
+        &NameRow::Upload(id.clone()),
+    ))];
+    let mut from = key::name(bucket, key, &NameRow::Part(id.clone(), 0));
+    let mut to = key::name(bucket, key, &NameRow::Part(id, u16::MAX));
+    to.push(0);
+    for _ in 0..=u16::MAX {
+        let Some((k, _)) = engine.next(&from, &to)? else {
+            break;
+        };
+        from = after(&k);
+        writes.push(Write::Delete(k));
+    }
+    Ok(writes)
+}
+
+/// An upload in progress.
+pub fn upload<E: Engine>(
+    engine: &E,
+    bucket: &str,
+    key: &str,
+    upload: &str,
+) -> Result<Option<Upload>, NameError> {
+    let row = key::name(bucket, key, &NameRow::Upload(upload.as_bytes().to_vec()));
+    Ok(engine.get(&row)?.map(|b| Upload::decode(&b)).transpose()?)
+}
+
+/// An upload's parts numbered after `after`, in order, at most `max` of them: ListParts'
+/// page (05 §4.6).
+pub fn parts<E: Engine>(
+    engine: &E,
+    bucket: &str,
+    key: &str,
+    upload: &str,
+    after_part: u16,
+    max: usize,
+) -> Result<Vec<(u16, Part)>, NameError> {
+    let id = upload.as_bytes().to_vec();
+    let Some(first) = after_part.checked_add(1) else {
+        return Ok(Vec::new());
+    };
+    let mut from = key::name(bucket, key, &NameRow::Part(id.clone(), first));
+    let mut to = key::name(bucket, key, &NameRow::Part(id, u16::MAX));
+    to.push(0);
+    let mut out = Vec::new();
+    while out.len() < max {
+        let Some((k, v)) = engine.next(&from, &to)? else {
+            break;
+        };
+        let Some((_, _, NameRow::Part(_, number))) = key::decode_name(&k) else {
+            return Err(NameError::Corrupt);
+        };
+        out.push((number, Part::decode(&v)?));
+        from = after(&k);
+    }
+    Ok(out)
 }
 
 /// The key's current version: its newest, a delete marker or not.
@@ -754,6 +1031,185 @@ mod tests {
             next_current(&r.engine, "other", b"", 10).unwrap(),
             Scan::End
         );
+    }
+
+    impl Range {
+        fn create(&mut self, key: &str) -> String {
+            self.clock += 10;
+            match self.run(Command::CreateUpload(CreateUpload {
+                bucket: "b".into(),
+                key: key.into(),
+                at_ns: self.clock,
+                upload: Upload {
+                    initiated_ns: 0,
+                    owner: "o".into(),
+                    headers: vec![("content-type".into(), "a/b".into())],
+                    checksum: None,
+                },
+            })) {
+                Outcome::Created { upload } => upload,
+                other => panic!("{other:?}"),
+            }
+        }
+
+        fn part(&mut self, key: &str, upload: &str, number: u16, size: u64, file: u128) -> Outcome {
+            self.run(Command::PutPart(PutPart {
+                bucket: "b".into(),
+                key: key.into(),
+                upload: upload.into(),
+                number,
+                part: Part {
+                    etag: format!("e{number}"),
+                    size,
+                    checksum: None,
+                    file,
+                    modified_ns: 0,
+                },
+            }))
+        }
+
+        fn complete(&mut self, key: &str, upload: &str, parts: &[(u16, &str, u128)]) -> Outcome {
+            self.clock += 10;
+            self.run(Command::Complete(Complete {
+                bucket: "b".into(),
+                key: key.into(),
+                upload: upload.into(),
+                versioning: Versioning::Enabled,
+                preconditions: Preconditions::default(),
+                at_ns: self.clock,
+                parts: parts
+                    .iter()
+                    .map(|&(number, etag, file)| Listed {
+                        number,
+                        etag: etag.into(),
+                        file,
+                    })
+                    .collect(),
+                etag: "whole-2".into(),
+                size: 11 << 20,
+                checksum: None,
+                file: Some(99),
+            }))
+        }
+    }
+
+    #[test]
+    fn a_completed_upload_becomes_a_version_and_its_parts_go() {
+        let mut r = Range::new();
+        let first = r.create("k");
+        let second = r.create("k");
+        assert!(first < second, "uploads sort in initiation order");
+        assert_eq!(r.part("k", &first, 1, MIN_PART, 11), Outcome::PartWritten);
+        assert_eq!(r.part("k", &first, 2, 1 << 20, 12), Outcome::PartWritten);
+        assert_eq!(r.part("k", &first, 3, 1, 13), Outcome::PartWritten);
+        // A part uploaded again replaces the first.
+        r.part("k", &first, 2, 6 << 20, 22);
+        let pages = parts(&r.engine, "b", "k", &first, 0, 2).unwrap();
+        assert_eq!(pages.iter().map(|(n, _)| *n).collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(pages[1].1.file, 22);
+        assert_eq!(parts(&r.engine, "b", "k", &first, 2, 10).unwrap().len(), 1);
+
+        let done = r.complete("k", &first, &[(1, "e1", 11), (2, "e2", 22)]);
+        let Outcome::Put { version } = done.clone() else {
+            panic!("{done:?}")
+        };
+        // Ordered at its initiation, with the upload's metadata.
+        let order = key::parse_version_id(&version).unwrap();
+        assert_eq!(order, !key::parse_version_id(&first).unwrap());
+        let (_, v) = current(&r.engine, "b", "k").unwrap().unwrap();
+        assert_eq!(
+            (v.etag.as_str(), v.file, v.headers.len()),
+            ("whole-2", Some(99), 1)
+        );
+        // The upload and every part, listed or not, are gone; the other upload remains.
+        assert_eq!(upload(&r.engine, "b", "k", &first).unwrap(), None);
+        assert!(
+            parts(&r.engine, "b", "k", &first, 0, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(upload(&r.engine, "b", "k", &second).unwrap().is_some());
+        // A retried complete answers as the first did (05 §4.4).
+        assert_eq!(
+            r.complete("k", &first, &[(1, "e1", 11), (2, "e2", 22)]),
+            done
+        );
+        assert_eq!(r.part("k", &first, 4, 1, 14), Outcome::NoSuchUpload);
+    }
+
+    #[test]
+    fn a_complete_checks_every_listed_part() {
+        let mut r = Range::new();
+        let u = r.create("k");
+        r.part("k", &u, 1, MIN_PART - 1, 11);
+        r.part("k", &u, 2, MIN_PART, 12);
+        r.part("k", &u, 3, 1, 13);
+        assert_eq!(r.complete("k", &u, &[]), Outcome::InvalidPartOrder);
+        assert_eq!(
+            r.complete("k", &u, &[(2, "e2", 12), (1, "e1", 11)]),
+            Outcome::InvalidPartOrder
+        );
+        assert_eq!(
+            r.complete("k", &u, &[(2, "e2", 12), (2, "e2", 12)]),
+            Outcome::InvalidPartOrder
+        );
+        assert_eq!(
+            r.complete("k", &u, &[(2, "e2", 12), (9, "e9", 19)]),
+            Outcome::InvalidPart
+        );
+        assert_eq!(
+            r.complete("k", &u, &[(2, "zz", 12), (3, "e3", 13)]),
+            Outcome::InvalidPart
+        );
+        assert_eq!(
+            r.complete("k", &u, &[(2, "e2", 77), (3, "e3", 13)]),
+            Outcome::Stale
+        );
+        assert_eq!(
+            r.complete("k", &u, &[(1, "e1", 11), (3, "e3", 13)]),
+            Outcome::EntityTooSmall
+        );
+        // The last part may be any size; nothing refused removed the upload.
+        assert!(matches!(
+            r.complete("k", &u, &[(2, "e2", 12), (3, "e3", 13)]),
+            Outcome::Put { .. }
+        ));
+        assert_eq!(
+            r.complete("k", "0000000000000", &[(1, "e1", 1)]),
+            Outcome::NoSuchUpload
+        );
+    }
+
+    #[test]
+    fn an_abort_removes_the_upload_and_its_parts() {
+        let mut r = Range::new();
+        let u = r.create("k");
+        for n in 1..=5 {
+            r.part("k", &u, n, 1, u128::from(n));
+        }
+        assert_eq!(
+            r.run(Command::Abort(Abort {
+                bucket: "b".into(),
+                key: "k".into(),
+                upload: u.clone(),
+            })),
+            Outcome::Aborted
+        );
+        assert_eq!(upload(&r.engine, "b", "k", &u).unwrap(), None);
+        assert!(parts(&r.engine, "b", "k", &u, 0, 10).unwrap().is_empty());
+        assert_eq!(
+            r.run(Command::Abort(Abort {
+                bucket: "b".into(),
+                key: "k".into(),
+                upload: u,
+            })),
+            Outcome::NoSuchUpload
+        );
+        // Uploads alone give a key no current version, and a listing passes over it.
+        let other = r.create("m");
+        r.part("m", &other, 1, 1, 1);
+        assert_eq!(current(&r.engine, "b", "m").unwrap(), None);
+        assert_eq!(next_current(&r.engine, "b", b"", 10).unwrap(), Scan::End);
     }
 
     /// Replaying the log from the durable point after a crash rebuilds the same rows.

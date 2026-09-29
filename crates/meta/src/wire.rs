@@ -516,6 +516,11 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
             w.u64(c.incarnation);
             w.u32(c.budget);
         }
+        name::Command::Reclaim(c) => {
+            w.u8(10);
+            w.u64(c.released_ns);
+            w.u128(c.file);
+        }
     }
     Ok(())
 }
@@ -570,6 +575,7 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
                 upload: record::take_str(r)?,
                 number: r.u16()?,
                 part: Part::decode(&record::take_bytes(r)?).ok()?,
+                at_ns,
             })
         }
         4 => {
@@ -621,6 +627,7 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
                 incarnation,
                 key,
                 upload: record::take_str(r)?,
+                at_ns,
             })
         }
         6 => name::Command::Gate(name::GateChange {
@@ -634,6 +641,11 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
             bucket: record::take_str(r)?,
             incarnation: r.u64()?,
             budget: r.u32()?,
+            at_ns,
+        }),
+        10 => name::Command::Reclaim(name::Reclaim {
+            released_ns: r.u64()?,
+            file: r.u128()?,
         }),
         8 => {
             let (bucket, incarnation, key) = take_target(r)?;
@@ -917,6 +929,7 @@ fn put_name_outcome(w: &mut Writer, o: &name::Outcome) -> Result<(), RecordError
         O::Locked => w.u8(20),
         O::NoSuchVersion => w.u8(21),
         O::DeleteMarker => w.u8(22),
+        O::Reclaimed => w.u8(23),
     }
     Ok(())
 }
@@ -969,6 +982,7 @@ fn take_name_outcome(r: &mut Reader<'_>) -> Option<name::Outcome> {
         20 => O::Locked,
         21 => O::NoSuchVersion,
         22 => O::DeleteMarker,
+        23 => O::Reclaimed,
         _ => return None,
     })
 }
@@ -1152,6 +1166,7 @@ mod tests {
                     file: 4,
                     modified_ns: 0,
                 },
+                at_ns,
             })),
             named(name::Command::Complete(name::Complete {
                 bucket: "b".into(),
@@ -1180,6 +1195,7 @@ mod tests {
                 incarnation: 1,
                 key: "k".into(),
                 upload: "u".into(),
+                at_ns,
             })),
             named(name::Command::Gate(name::GateChange {
                 bucket: "b".into(),
@@ -1192,6 +1208,11 @@ mod tests {
                 bucket: "b".into(),
                 incarnation: 1,
                 budget: 64,
+                at_ns,
+            })),
+            named(name::Command::Reclaim(name::Reclaim {
+                released_ns: 5,
+                file: u128::MAX,
             })),
             Command::File(file::Command::Write {
                 file: 3,
@@ -1320,6 +1341,7 @@ mod tests {
                 N::Locked,
                 N::NoSuchVersion,
                 N::DeleteMarker,
+                N::Reclaimed,
             ]
             .map(Answer::Name),
         );

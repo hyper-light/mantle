@@ -217,6 +217,8 @@ impl Coordinator {
                     bucket,
                     incarnation: self.incarnation,
                     budget: self.budget,
+                    // The entry that carries it gives it its time (wire.rs).
+                    at_ns: 0,
                 })),
             },
             Phase::Drop(range) => self.gate(*range, Some(Condemned), None),

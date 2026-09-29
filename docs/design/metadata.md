@@ -29,6 +29,7 @@ fits the Name layer to S3.
 | Name | (bucket, key, VERSION, order) | a version: object or delete marker | (bucket, key) |
 | Name | (bucket, key, UPLOAD, upload) | a multipart upload in progress | (bucket, key) |
 | Name | (bucket, key, UPLOAD, upload, part) | an uploaded part | (bucket, key) |
+| Name | (RELEASED, time, file), in each range | a file nothing references any more, for the collector | the range's |
 | File | (file, HEADER) | length, extent count | file |
 | File | (file, EXTENT, end) | a block, or another file, and its length | file |
 | Block | (block, HEADER) | length, code, chunk size, checksum | block |
@@ -121,6 +122,33 @@ layers removes them, as Tectonic's does [01 §1.6].
   grace period, so a deletion by mistake can still be undone by a metadata change, as GFS
   keeps a deleted file three days and Tectonic deletes lazily between layers (chunk-store
   §8; 01 §1.6).
+  - *Every file has one referrer:* the version or part whose row names it, or, once an
+    upload completes, the object's file that takes it as an extent. A write hands the Name
+    range a file the gateway made for it alone. If the write goes ahead, the file is
+    referenced; if it is refused, the range releases it, and the gateway makes a new file
+    for any retry, never reusing one. Copies must keep the rule: a copy that took the source's
+    blocks without moving data, as Tectonic's does (01 §1.6), would give them two referrers,
+    and would need Tectonic's owner rows (R2) before the collector could tell when they are
+    free.
+  - *Releasing.* Whatever removes a reference writes, in the same transaction, a row in the
+    range's queue of released files, keyed by the range's time and then the file: a version
+    removed by ID, a null version replaced, a part uploaded again, an upload's parts that
+    its completion did not list, an aborted or collected upload's parts, and a refused
+    write's file. A completed upload's listed parts are not released: they are the object's
+    extents. So no file is forgotten by the step that stops referencing it, and none is
+    released while something still names it. A property test runs random histories of puts,
+    deletes, part uploads, completions and aborts under every versioning state and checks
+    after each step that every file handed to the range is held in exactly one place;
+    removing any one release, or releasing a listed part, fails it.
+  - *Reclaiming.* The collector takes the queue oldest first, once a file has been released
+    longer than the grace period, and removes what it holds bottom up: each block's chunks
+    from their volumes, then the block's rows, then an adopted part's file, then the file,
+    and last the queue row, each step repeatable, so a collector that stops is resumed from
+    the queue. The grace period is a recovery-point policy, three days by default, as GFS
+    keeps a deleted file (chunk-store §8).
+  - *What the queue cannot see:* a gateway that stops between writing a file and handing it
+    over leaves a file no range ever held. Finding those needs the sweep between layers that
+    Tectonic runs (01 §1.6), from files to the writes they were made for.
 - **Multipart.** CreateMultipartUpload writes the upload row. UploadPart writes the part's
   chunks, blocks and file, then replaces the part row. CompleteMultipartUpload writes the
   object's file of part extents in its File range, then, in the Name range, checks the
@@ -270,7 +298,8 @@ cover the production engine, which the simulator cannot.
 - How an entry larger than a datagram reaches the replicas: over QUIC, or fragmented on the
   UDP plane. A completion of 10,000 parts is an entry of hundreds of kilobytes in the Name
   range and another in the File range.
-- The grace period of lazy deletion, which is a recovery-point policy.
+- The collector's reclamation steps and schedule (§2), and the sweep that finds files a
+  stopped gateway made and never handed over.
 - The bound on a cached bucket row's staleness, and how a versioning change reaches
   gateways within it.
 - Where a bucket's lifecycle and tag configurations live. A lifecycle configuration at its

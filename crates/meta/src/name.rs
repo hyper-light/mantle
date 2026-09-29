@@ -63,6 +63,7 @@ pub enum Command {
     Hold(Hold),
     Gate(GateChange),
     Collect(Collect),
+    Reclaim(Reclaim),
 }
 
 impl Command {
@@ -77,7 +78,18 @@ impl Command {
             Self::Abort(c) => Some((&c.bucket, c.incarnation)),
             Self::Retain(c) => Some((&c.bucket, c.incarnation)),
             Self::Hold(c) => Some((&c.bucket, c.incarnation)),
-            Self::Gate(_) | Self::Collect(_) => None,
+            Self::Gate(_) | Self::Collect(_) | Self::Reclaim(_) => None,
+        }
+    }
+
+    /// The file a write hands the range, which a version or part will reference if the write
+    /// goes ahead, and the time of the entry that carries it.
+    fn carries(&self) -> Option<(u128, u64)> {
+        match self {
+            Self::Put(c) => c.version.file.map(|file| (file, c.at_ns)),
+            Self::PutPart(c) => Some((c.part.file, c.at_ns)),
+            Self::Complete(c) => c.file.map(|file| (file, c.at_ns)),
+            _ => None,
         }
     }
 }
@@ -130,6 +142,7 @@ pub struct PutPart {
     pub upload: String,
     pub number: u16,
     pub part: Part,
+    pub at_ns: u64,
 }
 
 /// CompleteMultipartUpload (05 §4.4).
@@ -173,6 +186,7 @@ pub struct Abort {
     pub incarnation: u64,
     pub key: String,
     pub upload: String,
+    pub at_ns: u64,
 }
 
 /// Moves a bucket's gate a step in its creation or deletion (docs/design/metadata.md §2), if
@@ -197,6 +211,14 @@ pub struct Collect {
     pub incarnation: u64,
     /// Rows this entry may remove, which bounds its size.
     pub budget: u32,
+    pub at_ns: u64,
+}
+
+/// The collector reclaimed a released file, its blocks and chunks: its row in the queue goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reclaim {
+    pub released_ns: u64,
+    pub file: u128,
 }
 
 /// DeleteObject (05 §7.3).
@@ -286,6 +308,8 @@ pub enum Outcome {
     NotEmpty,
     /// Rows of a condemned bucket were removed; `done` once none is left.
     Collected { done: bool },
+    /// A released file's row went.
+    Reclaimed,
     /// A version's retention was set or removed.
     Retained,
     /// A version's legal hold was set.
@@ -318,9 +342,46 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
         Command::Hold(h) => hold(engine, h)?,
         Command::Gate(g) => move_gate(engine, g)?,
         Command::Collect(c) => collect(engine, c)?,
+        Command::Reclaim(r) => (
+            Outcome::Reclaimed,
+            vec![Write::Delete(key::released(r.released_ns, r.file))],
+        ),
     };
+    // A file a write carries is referenced if the write goes ahead, and released if it is
+    // refused: the gateway wrote it for this write alone (docs/design/metadata.md §2).
+    let mut writes = writes;
+    if let Some((file, at_ns)) = command.carries()
+        && !matches!(outcome, Outcome::Put { .. } | Outcome::PartWritten)
+    {
+        writes.push(release(clock::now(engine, at_ns)?, file));
+    }
     engine.apply(index, &writes)?;
     Ok(outcome)
+}
+
+/// The row that releases `file` at the range's time `now_ns`: nothing references it any more,
+/// and the collector reclaims it once the grace period has passed (docs/design/metadata.md §2).
+fn release(now_ns: u64, file: u128) -> Write {
+    Write::Put(key::released(now_ns, file), record::encode_number(now_ns))
+}
+
+/// The files the range released before `before_ns`, oldest first, at most `max`: the
+/// collector's work.
+pub fn released<E: Rows>(
+    engine: &E,
+    before_ns: u64,
+    max: usize,
+) -> Result<Vec<(u64, u128)>, MetaError> {
+    let (mut from, to) = key::released_before(before_ns);
+    let mut out = Vec::new();
+    while out.len() < max {
+        let Some((k, _)) = engine.next(&from, &to)? else {
+            break;
+        };
+        out.push(key::decode_released(&k).ok_or(MetaError::Corrupt)?);
+        from = after(&k);
+    }
+    Ok(out)
 }
 
 /// The range's gate floor: no attempt older than it may place a gate where there is none. A
@@ -406,13 +467,15 @@ fn collect<E: Rows>(engine: &E, c: &Collect) -> Result<(Outcome, Vec<Write>), Me
         return Ok((Outcome::Conflict, Vec::new()));
     }
     let (mut from, to) = key::bucket_span(&c.bucket);
+    let now = clock::now(engine, c.at_ns)?;
     let mut writes = Vec::new();
     for _ in 0..c.budget {
-        let Some((k, _)) = engine.next(&from, &to)? else {
+        let Some((k, v)) = engine.next(&from, &to)? else {
             return Ok((Outcome::Collected { done: true }, writes));
         };
         match key::decode_name(&k) {
-            Some((_, _, NameRow::Upload(_) | NameRow::Part(..))) => {}
+            Some((_, _, NameRow::Upload(_))) => {}
+            Some((_, _, NameRow::Part(..))) => writes.push(release(now, Part::decode(&v)?.file)),
             // A version under a condemned gate: the delete never read this range (§2), and
             // the collector removes no object.
             Some(_) => return Ok((Outcome::NotEmpty, Vec::new())),
@@ -462,7 +525,7 @@ fn put<E: Rows>(engine: &E, p: &Put) -> Result<(Outcome, Vec<Write>), MetaError>
     let when = ordered_ns.unwrap_or(time);
     let order = !when;
     if null {
-        writes.extend(remove_null(engine, bucket, key)?.1);
+        writes.extend(remove_null(engine, bucket, key, time)?.1);
         writes.push(Write::Put(
             key::name(bucket, key, &NameRow::Null),
             record::encode_number(order),
@@ -526,9 +589,10 @@ fn delete<E: Rows>(engine: &E, d: &Delete) -> Result<(Outcome, Vec<Write>), Meta
     {
         return Ok((Outcome::Locked, Vec::new()));
     }
+    let now = clock::now(engine, at_ns)?;
     match named {
         Some(Named::Null) => {
-            let (removed, writes) = remove_null(engine, bucket, key)?;
+            let (removed, writes) = remove_null(engine, bucket, key, now)?;
             Ok((
                 Outcome::Deleted {
                     marker: removed.is_some_and(|v| v.marker),
@@ -550,6 +614,9 @@ fn delete<E: Rows>(engine: &E, d: &Delete) -> Result<(Outcome, Vec<Write>), Meta
                     if v.null {
                         writes.push(Write::Delete(key::name(bucket, key, &NameRow::Null)));
                     }
+                    if let Some(file) = v.file {
+                        writes.push(release(now, file));
+                    }
                     Some(v)
                 }
             };
@@ -563,7 +630,7 @@ fn delete<E: Rows>(engine: &E, d: &Delete) -> Result<(Outcome, Vec<Write>), Meta
         }
         None => match versioning {
             Versioning::Unversioned => {
-                let (_, writes) = remove_null(engine, bucket, key)?;
+                let (_, writes) = remove_null(engine, bucket, key, now)?;
                 Ok((
                     Outcome::Deleted {
                         marker: false,
@@ -580,7 +647,7 @@ fn delete<E: Rows>(engine: &E, d: &Delete) -> Result<(Outcome, Vec<Write>), Meta
                 let mut writes = vec![clock];
                 let order = !time;
                 if null {
-                    writes.extend(remove_null(engine, bucket, key)?.1);
+                    writes.extend(remove_null(engine, bucket, key, time)?.1);
                     writes.push(Write::Put(
                         key::name(bucket, key, &NameRow::Null),
                         record::encode_number(order),
@@ -646,10 +713,15 @@ fn put_part<E: Rows>(engine: &E, p: &PutPart) -> Result<(Outcome, Vec<Write>), M
         &p.key,
         &NameRow::Part(p.upload.clone().into_bytes(), p.number),
     );
-    Ok((
-        Outcome::PartWritten,
-        vec![Write::Put(row, p.part.encode()?)],
-    ))
+    let mut writes = Vec::with_capacity(2);
+    // A part uploaded again replaces the first (05 §4.3), whose file nothing then references.
+    if let Some(replaced) = engine.get(&row)?.map(|b| Part::decode(&b)).transpose()?
+        && replaced.file != p.part.file
+    {
+        writes.push(release(clock::now(engine, p.at_ns)?, replaced.file));
+    }
+    writes.push(Write::Put(row, p.part.encode()?));
+    Ok((Outcome::PartWritten, writes))
 }
 
 fn complete<E: Rows>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), MetaError> {
@@ -660,12 +732,21 @@ fn complete<E: Rows>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), 
             None => None,
         };
         return Ok(match made {
-            Some((order, v)) if !v.marker && v.etag == c.etag => (
-                Outcome::Put {
-                    version: id(v.null, order),
-                },
-                Vec::new(),
-            ),
+            Some((order, v)) if !v.marker && v.etag == c.etag => {
+                // A retry the gateway made a file for again: the version holds the first.
+                let mut writes = Vec::new();
+                if let Some(file) = c.file
+                    && v.file != c.file
+                {
+                    writes.push(release(clock::now(engine, c.at_ns)?, file));
+                }
+                (
+                    Outcome::Put {
+                        version: id(v.null, order),
+                    },
+                    writes,
+                )
+            }
             _ => (Outcome::NoSuchUpload, Vec::new()),
         });
     };
@@ -724,8 +805,13 @@ fn complete<E: Rows>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), 
         },
     )?;
     if matches!(outcome, Outcome::Put { .. }) {
-        // Parts not listed are discarded with the upload (05 §4.4).
-        writes.extend(remove_upload(engine, &c.bucket, &c.key, &c.upload)?);
+        // Parts not listed are discarded with the upload (05 §4.4); those listed are now the
+        // object's file's extents.
+        let listed: Vec<u16> = c.parts.iter().map(|p| p.number).collect();
+        let now = clock::now(engine, c.at_ns)?;
+        writes.extend(remove_upload(
+            engine, &c.bucket, &c.key, &c.upload, &listed, now,
+        )?);
     }
     Ok((outcome, writes))
 }
@@ -828,18 +914,22 @@ fn abort<E: Rows>(engine: &E, a: &Abort) -> Result<(Outcome, Vec<Write>), MetaEr
     if upload(engine, &a.bucket, &a.key, &a.upload)?.is_none() {
         return Ok((Outcome::NoSuchUpload, Vec::new()));
     }
+    let now = clock::now(engine, a.at_ns)?;
     Ok((
         Outcome::Aborted,
-        remove_upload(engine, &a.bucket, &a.key, &a.upload)?,
+        remove_upload(engine, &a.bucket, &a.key, &a.upload, &[], now)?,
     ))
 }
 
-/// Writes that remove an upload's row and every one of its parts: at most 10,000 (05 §4.1).
+/// Writes that remove an upload's row and every one of its parts, at most 10,000 (05 §4.1),
+/// releasing at `now_ns` the files of the parts not `kept`.
 fn remove_upload<E: Rows>(
     engine: &E,
     bucket: &str,
     key: &str,
     upload: &str,
+    kept: &[u16],
+    now_ns: u64,
 ) -> Result<Vec<Write>, MetaError> {
     let id = upload.as_bytes().to_vec();
     let mut writes = vec![Write::Delete(key::name(
@@ -851,9 +941,15 @@ fn remove_upload<E: Rows>(
     let mut to = key::name(bucket, key, &NameRow::Part(id, u16::MAX));
     to.push(0);
     for _ in 0..=u16::MAX {
-        let Some((k, _)) = engine.next(&from, &to)? else {
+        let Some((k, v)) = engine.next(&from, &to)? else {
             break;
         };
+        let Some((_, _, NameRow::Part(_, number))) = key::decode_name(&k) else {
+            return Err(MetaError::Corrupt);
+        };
+        if !kept.contains(&number) {
+            writes.push(release(now_ns, Part::decode(&v)?.file));
+        }
         from = after(&k);
         writes.push(Write::Delete(k));
     }
@@ -947,21 +1043,26 @@ fn null_order<E: Rows>(engine: &E, bucket: &str, key: &str) -> Result<Option<u64
     }
 }
 
-/// Writes that remove the key's null version and its pointer, and the version removed.
+/// Writes that remove the key's null version and its pointer, releasing its file at `now_ns`,
+/// and the version removed.
 fn remove_null<E: Rows>(
     engine: &E,
     bucket: &str,
     key: &str,
+    now_ns: u64,
 ) -> Result<(Option<Version>, Vec<Write>), MetaError> {
     match version(engine, bucket, key, Named::Null)? {
         None => Ok((None, Vec::new())),
-        Some((order, v)) => Ok((
-            Some(v),
-            vec![
+        Some((order, v)) => {
+            let mut writes = vec![
                 Write::Delete(key::name(bucket, key, &NameRow::Version(order))),
                 Write::Delete(key::name(bucket, key, &NameRow::Null)),
-            ],
-        )),
+            ];
+            if let Some(file) = v.file {
+                writes.push(release(now_ns, file));
+            }
+            Ok((Some(v), writes))
+        }
     }
 }
 
@@ -1782,6 +1883,7 @@ mod tests {
                     file,
                     modified_ns: 0,
                 },
+                at_ns: 0,
             }))
         }
 
@@ -1912,6 +2014,7 @@ mod tests {
                 incarnation: 1,
                 key: "k".into(),
                 upload: u.clone(),
+                at_ns: 0,
             })),
             Outcome::Aborted
         );
@@ -1923,6 +2026,7 @@ mod tests {
                 incarnation: 1,
                 key: "k".into(),
                 upload: u,
+                at_ns: 0,
             })),
             Outcome::NoSuchUpload
         );
@@ -2080,7 +2184,10 @@ mod tests {
         let mut r = Range::new();
         let upload = r.create("k");
         for number in 1..=3 {
-            assert_eq!(r.part("k", &upload, number, 1, 1), Outcome::PartWritten);
+            assert_eq!(
+                r.part("k", &upload, number, 1, 10 + u128::from(number)),
+                Outcome::PartWritten
+            );
         }
         r.create("m");
         assert_eq!(r.gate_at(4, Some(Open), Some(Closed)), Outcome::GateMoved);
@@ -2090,6 +2197,7 @@ mod tests {
                 bucket: "b".into(),
                 incarnation: 1,
                 budget,
+                at_ns: 0,
             })
         };
         assert_eq!(r.run(collect(10)), Outcome::Conflict, "not yet condemned");
@@ -2103,6 +2211,14 @@ mod tests {
         assert_eq!(r.run(collect(2)), Outcome::Collected { done: true });
         let (from, to) = key::bucket_span("b");
         assert_eq!(r.engine.next(&from, &to).unwrap(), None);
+        // The parts' files are released for the collector to reclaim.
+        let mut files: Vec<u128> = released(&r.engine, u64::MAX, 10)
+            .unwrap()
+            .into_iter()
+            .map(|(_, file)| file)
+            .collect();
+        files.sort_unstable();
+        assert_eq!(files, [11, 12, 13]);
         assert_eq!(r.gate_at(4, Some(Condemned), None), Outcome::GateMoved);
         assert_eq!(r.gate_at(4, Some(Condemned), None), Outcome::GateMoved);
         assert_eq!(gate(&r.engine, "b").unwrap(), None);
@@ -2120,6 +2236,7 @@ mod tests {
             bucket: "b".into(),
             incarnation: 1,
             budget: 10,
+            at_ns: 0,
         });
         assert_eq!(r.run(collect), Outcome::NotEmpty);
         assert_eq!(r.versions("k").len(), 1);
@@ -2408,5 +2525,275 @@ mod tests {
             r.put("k", "c", Versioning::Enabled),
             Outcome::Put { .. }
         ));
+    }
+
+    /// One step of a history the release property drives.
+    #[derive(Debug, Clone)]
+    enum Step {
+        Put {
+            key: u8,
+            versioning: u8,
+            empty: bool,
+        },
+        Delete {
+            key: u8,
+            versioning: u8,
+            named: Option<u8>,
+        },
+        Create {
+            key: u8,
+        },
+        Part {
+            key: u8,
+            upload: u8,
+            number: u16,
+        },
+        Complete {
+            key: u8,
+            upload: u8,
+            parts: Vec<u16>,
+            stale: bool,
+        },
+        Abort {
+            key: u8,
+            upload: u8,
+        },
+    }
+
+    fn step() -> impl proptest::strategy::Strategy<Value = Step> {
+        use proptest::prelude::*;
+        prop_oneof![
+            (0u8..3, 0u8..3, any::<bool>()).prop_map(|(key, versioning, empty)| Step::Put {
+                key,
+                versioning,
+                empty
+            }),
+            (0u8..3, 0u8..3, proptest::option::of(0u8..8)).prop_map(|(key, versioning, named)| {
+                Step::Delete {
+                    key,
+                    versioning,
+                    named,
+                }
+            }),
+            (0u8..3).prop_map(|key| Step::Create { key }),
+            (0u8..3, 0u8..3, 1u16..4).prop_map(|(key, upload, number)| Step::Part {
+                key,
+                upload,
+                number
+            }),
+            (
+                0u8..3,
+                0u8..3,
+                proptest::collection::vec(1u16..4, 0..4),
+                any::<bool>()
+            )
+                .prop_map(|(key, upload, parts, stale)| Step::Complete {
+                    key,
+                    upload,
+                    parts,
+                    stale
+                }),
+            (0u8..3, 0u8..3).prop_map(|(key, upload)| Step::Abort { key, upload }),
+        ]
+    }
+
+    /// Every file of a version or a part in the range, and every released one.
+    fn files_held(engine: &Model) -> (Vec<u128>, Vec<u128>, Vec<u128>) {
+        let (mut versions, mut parts) = (Vec::new(), Vec::new());
+        let (mut from, to) = key::bucket_span("b");
+        while let Some((k, v)) = engine.next(&from, &to).unwrap() {
+            match key::decode_name(&k).unwrap() {
+                (_, _, NameRow::Version(_)) => versions.extend(Version::decode(&v).unwrap().file),
+                (_, _, NameRow::Part(..)) => parts.push(Part::decode(&v).unwrap().file),
+                _ => {}
+            }
+            from = after(&k);
+        }
+        let released = released(engine, u64::MAX, usize::MAX)
+            .unwrap()
+            .into_iter()
+            .map(|(_, file)| file)
+            .collect();
+        (versions, parts, released)
+    }
+
+    proptest::proptest! {
+        /// Every file a write hands the range is held in exactly one place after every step:
+        /// by a version, by a part, as an extent of a completed object's file that is held or
+        /// released, or in the released queue. No removal loses a file, and none is released
+        /// while something still references it (docs/design/metadata.md §2).
+        #[test]
+        fn every_file_is_referenced_or_released_exactly_once(
+            steps in proptest::collection::vec(step(), 1..60),
+        ) {
+            use std::collections::{BTreeMap, BTreeSet};
+            let mut r = Range::new();
+            let mut next_file = 1000u128;
+            let mut carried: BTreeSet<u128> = BTreeSet::new();
+            // A completed object's file and the part files it took as extents.
+            let mut adopted: BTreeMap<u128, Vec<u128>> = BTreeMap::new();
+            let mut uploads: BTreeMap<(u8, u8), String> = BTreeMap::new();
+            let versionings = [Versioning::Enabled, Versioning::Suspended, Versioning::Unversioned];
+            for s in steps {
+                r.clock += 10;
+                match s {
+                    Step::Put { key, versioning, empty } => {
+                        let file = (!empty).then(|| { next_file += 1; next_file });
+                        carried.extend(file);
+                        r.run(Command::Put(Put {
+                            bucket: "b".into(),
+                            incarnation: 1,
+                            key: format!("k{key}"),
+                            versioning: versionings[usize::from(versioning)],
+                            preconditions: Preconditions::default(),
+                            at_ns: r.clock,
+                            ordered_ns: None,
+                            version: Version { file, ..object("e") },
+                            default: None,
+                        }));
+                    }
+                    Step::Delete { key, versioning, named } => {
+                        let named = named.map(|n| match n {
+                            0 => Named::Null,
+                            n => {
+                                let versions = r.versions(&format!("k{key}"));
+                                versions
+                                    .get(usize::from(n) % versions.len().max(1))
+                                    .and_then(|(id, _, _)| key::parse_version_id(id))
+                                    .map_or(Named::Order(u64::from(n)), Named::Order)
+                            }
+                        });
+                        r.run(Command::Delete(Delete {
+                            bucket: "b".into(),
+                            incarnation: 1,
+                            key: format!("k{key}"),
+                            versioning: versionings[usize::from(versioning)],
+                            named,
+                            if_match: None,
+                            at_ns: r.clock,
+                            bypass: false,
+                        }));
+                    }
+                    Step::Create { key } => {
+                        let upload = r.create(&format!("k{key}"));
+                        let slot = uploads.keys().filter(|(k, _)| *k == key).count();
+                        uploads.insert((key, u8::try_from(slot % 3).unwrap()), upload);
+                    }
+                    Step::Part { key, upload, number } => {
+                        let Some(id) = uploads.get(&(key, upload)).cloned() else { continue };
+                        next_file += 1;
+                        carried.insert(next_file);
+                        r.run(Command::PutPart(PutPart {
+                            bucket: "b".into(),
+                            incarnation: 1,
+                            key: format!("k{key}"),
+                            upload: id,
+                            number,
+                            part: Part {
+                                etag: format!("e{number}"),
+                                size: MIN_PART,
+                                checksum: None,
+                                file: next_file,
+                                modified_ns: 0,
+                            },
+                            at_ns: r.clock,
+                        }));
+                    }
+                    Step::Complete { key, upload, mut parts, stale } => {
+                        let Some(id) = uploads.get(&(key, upload)).cloned() else { continue };
+                        parts.sort_unstable();
+                        parts.dedup();
+                        let held = super::parts(&r.engine, "b", &format!("k{key}"), &id, 0, 10).unwrap();
+                        let listed: Vec<Listed> = parts
+                            .iter()
+                            .map(|&number| Listed {
+                                number,
+                                etag: format!("e{number}"),
+                                file: held
+                                    .iter()
+                                    .find(|(n, _)| *n == number)
+                                    .map_or(0, |(_, p)| p.file + u128::from(stale)),
+                            })
+                            .collect();
+                        next_file += 1;
+                        let file = next_file;
+                        carried.insert(file);
+                        let outcome = r.run(Command::Complete(Complete {
+                            bucket: "b".into(),
+                            incarnation: 1,
+                            key: format!("k{key}"),
+                            upload: id,
+                            versioning: Versioning::Enabled,
+                            preconditions: Preconditions::default(),
+                            at_ns: r.clock,
+                            parts: listed.clone(),
+                            etag: "whole".into(),
+                            size: 1,
+                            checksum: None,
+                            file: Some(file),
+                            default: None,
+                        }));
+                        if matches!(outcome, Outcome::Put { .. })
+                            && versions_hold(&r.engine, file)
+                        {
+                            adopted.insert(file, listed.iter().map(|l| l.file).collect());
+                        }
+                    }
+                    Step::Abort { key, upload } => {
+                        let Some(id) = uploads.get(&(key, upload)).cloned() else { continue };
+                        r.run(Command::Abort(Abort {
+                            bucket: "b".into(),
+                            incarnation: 1,
+                            key: format!("k{key}"),
+                            upload: id,
+                            at_ns: r.clock,
+                        }));
+                    }
+                }
+                let (versions, part_files, released) = files_held(&r.engine);
+                let children: Vec<u128> = adopted
+                    .iter()
+                    .filter(|(root, _)| versions.contains(root) || released.contains(root))
+                    .flat_map(|(_, children)| children.iter().copied())
+                    .collect();
+                for file in &carried {
+                    let places = [&versions, &part_files, &released, &children]
+                        .iter()
+                        .map(|held| held.iter().filter(|f| *f == file).count())
+                        .sum::<usize>();
+                    proptest::prop_assert_eq!(places, 1, "file {} after {:?}", file, r.versions("k0"));
+                }
+            }
+        }
+    }
+
+    fn versions_hold(engine: &Model, file: u128) -> bool {
+        files_held(engine).0.contains(&file)
+    }
+
+    /// The collector reads the released queue oldest first, up to a time, and a reclaimed
+    /// file's row goes.
+    #[test]
+    fn released_files_are_read_oldest_first_and_reclaimed() {
+        let mut r = Range::new();
+        for (key, at) in [("a", 30u64), ("b", 10), ("c", 20)] {
+            r.clock = at * MS;
+            r.put(key, "e", Versioning::Unversioned);
+        }
+        for (key, at) in [("a", 300u64), ("b", 100), ("c", 200)] {
+            r.clock = at * MS;
+            r.delete(key, Versioning::Unversioned, None);
+        }
+        let queue = released(&r.engine, u64::MAX, 10).unwrap();
+        let times: Vec<u64> = queue.iter().map(|(t, _)| t / MS).collect();
+        assert_eq!(times, [100, 200, 300]);
+        assert_eq!(released(&r.engine, 200 * MS, 10).unwrap().len(), 1);
+        assert_eq!(released(&r.engine, u64::MAX, 2).unwrap(), queue[..2]);
+        let (released_ns, file) = queue[0];
+        assert_eq!(
+            r.run(Command::Reclaim(Reclaim { released_ns, file })),
+            Outcome::Reclaimed
+        );
+        assert_eq!(released(&r.engine, u64::MAX, 10).unwrap(), queue[1..]);
     }
 }

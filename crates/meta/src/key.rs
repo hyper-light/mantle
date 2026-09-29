@@ -92,6 +92,37 @@ pub fn gate(bucket: &str) -> Vec<u8> {
     out
 }
 
+/// The range's queue of the files it released, oldest first (docs/design/metadata.md §2).
+const RELEASED: [u8; 2] = [LOCAL, b'r'];
+
+/// The key of a released file's row: the range's time when it was released, then the file,
+/// so the collector takes them in the order they were released.
+pub fn released(time_ns: u64, file: u128) -> Vec<u8> {
+    let mut out = Vec::with_capacity(26);
+    out.extend_from_slice(&RELEASED);
+    out.extend_from_slice(&time_ns.to_be_bytes());
+    out.extend_from_slice(&file.to_be_bytes());
+    out
+}
+
+/// The first key of the released queue, and the first of those released at or after
+/// `before_ns`.
+pub fn released_before(before_ns: u64) -> (Vec<u8>, Vec<u8>) {
+    let mut past = RELEASED.to_vec();
+    past.extend_from_slice(&before_ns.to_be_bytes());
+    (RELEASED.to_vec(), past)
+}
+
+/// The time and file a released file's key names; `None` if it is not one.
+pub fn decode_released(k: &[u8]) -> Option<(u64, u128)> {
+    let rest = k.strip_prefix(&RELEASED)?;
+    let (time, file) = rest.split_first_chunk::<8>()?;
+    Some((
+        u64::from_be_bytes(*time),
+        u128::from_be_bytes(file.try_into().ok()?),
+    ))
+}
+
 /// Where in the bucket's rows the object keys at or after `from` begin. `from` is any byte
 /// string, as a listing's seek positions are (s3 list.rs), not only a key: escaping keeps
 /// order and prefixes, so the first row at or after this is the first object key at or after

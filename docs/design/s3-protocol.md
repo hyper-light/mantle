@@ -3,7 +3,7 @@
 Status: design, 2026-09-28. Sources: docs/research/05 (S3 API semantics, cited as "05 §x"),
 docs/research/13 (XML, cited as "13 §x"), docs/research/16 (CORS, cited as "16 §x"),
 docs/research/17 (bucket policies and JSON, cited as "17 §x"), docs/research/18 (Object Lock,
-cited as "18 §x").
+cited as "18 §x"), docs/research/19 (browser uploads, cited as "19 §x").
 
 `mantle-s3` is the protocol layer the gateway (STATUS item 2) is built from: pure functions
 over requests and bodies, with no I/O and no knowledge of where objects live. Each module
@@ -26,6 +26,8 @@ restating S3.
 | `policy` | bucket policies checked, and requests judged against them | 17; S3's recorded answers, s3-tests' policies, IAM's documented semantics |
 | `account` | account IDs, and the expected bucket owner a request names | 17 §2.1; S3's recorded answers |
 | `lock` | Object Lock's documents and headers, and the rules for writes that carry locks | 18; S3's recorded answers, s3-tests |
+| `form` | `multipart/form-data` bodies, decoded as they stream: the fields before the file, then the file | RFC 7578 and RFC 2046; property tests over every cut of a body |
+| `post` | browser uploads: a form's policy, its signature and conditions, and the answer to it | AWS's signed example and botocore's presigned POST, byte for byte; S3's recorded answers, s3-tests' policies |
 | `tagging` | tag sets: S3's limits and characters, and the `x-amz-tagging` header | 13 §6.7, s3-tests, S3's observed answers |
 | `acl` | canned and header ACLs, Object Ownership, and whether a request's ACL goes ahead with ACLs disabled | 13 §6.8, s3-tests |
 | `lifecycle` | lifecycle rules checked, when each action falls due, and the expiration and abort headers | 13 §6.9, the user guide's worked examples, s3-tests |
@@ -307,7 +309,8 @@ upload without `partNumber` is refused the same way rather than written as the o
 So is a subresource S3 defines only on buckets sent with a key, and one defined only on
 objects sent to a bucket: `PUT /bucket/key?lifecycle` writes no object, and
 `DELETE /bucket?uploadId=u` deletes no bucket. Subresources S3 defines and mantle does not
-serve are `501 NotImplemented` whatever the method.
+serve are `501 NotImplemented` whatever the method. A `POST` to a bucket with none is a browser
+upload (§12), which a form sends to "the URL of the bucket" (19 §2.1).
 
 ## 7. Lifecycle configuration
 
@@ -549,3 +552,88 @@ check that refuses to delete it must read the version in the same step that woul
   bypass, and in COMPLIANCE never shortened or changed; versioning cannot be suspended on a bucket
   with Object Lock, nor Object Lock configured on one whose versioning is not enabled, `409
   InvalidBucketState`; lifecycle leaves locked versions be.
+
+## 12. Browser uploads
+
+**Decision: a browser's upload is decoded as it streams and checked as S3 was recorded
+checking one: the fields before the file are read whole, within S3's bound; the policy, its
+signature and its conditions are checked before any of the file is kept; the file streams
+through; and whatever follows it is ignored** (`crates/s3/src/form.rs`,
+`crates/s3/src/post.rs`; 19). POST Object is the one upload whose authority travels in its
+body, so nothing of the object may be kept until the fields that authorize it are read.
+
+- **The body** is read as RFC 7578 and RFC 2046 define it: a boundary of RFC 2046's grammar,
+  CRLF line ends, and on every part a `Content-Disposition` of `form-data` with a name; the
+  preamble, transport padding and epilogue are ignored, and so is every other header field of
+  a part, as RFC 7578 §4.8 requires. A part's own `Content-Type` is one of them: an object's
+  type is its `Content-Type` field's, which the policy covers, and never a header no condition
+  can reach. A request that is not `multipart/form-data` is `412 PreconditionFailed` with S3's
+  `Condition` (19 §8.1).
+- **The fields before the file** are bounded at 20 KiB: AWS's "20KB" read as 20,480 bytes,
+  the larger of its two meanings, so no form S3 accepts is refused (19 §2.1, §11). The fields
+  with `${filename}` expanded are held to the same bound, since S3 checks the policy against
+  the expanded form (19 §4.4) and a short form could otherwise expand to megabytes.
+- **The file** is the part named `file`, in any case, never a part merely carrying a
+  `filename`: Python's `requests`, which s3-tests posts with, names one on every part (19 §5.5).
+  It ends at the delimiter, whose line may hold only padding, then a CRLF or `--`. Any other
+  byte means the boundary appeared inside the file, which RFC 2046 forbids a sender; taking it
+  for the end would store a file cut short, and "Amazon S3 never stores partial objects"
+  (19 §2.1), so the body is refused. memchr's SIMD search over the Two-Way algorithm finds the
+  delimiter in time linear in the file, and the decoder holds at most a delimiter's length of
+  it between pieces: 29–36 GB/s on one core, over thirty times the MD5 every upload pays
+  (docs/measurements/2026-09-29-form-decoding.md).
+- **Quoted strings.** A backslash quotes the `"` or `\` after it, the only characters RFC 9110
+  §5.6.4 has a sender quote; before any other it stands for itself. A Windows path in a
+  `filename` keeps its separators, as S3 documents reading
+  `C:\Program Files\directory1\file.txt` as `file.txt` (19 §2.3).
+- **`${filename}`** becomes the file's name after its last `/` or `\` in every field, and
+  nothing for `filename=""`, a browser's empty file input. A file part with no `filename`
+  leaves it as written, as S3 was recorded doing in 2026, where AWS's text says it becomes
+  empty (19 §10 item 4). A field sent twice holds its values joined by commas, as AWS's text
+  says to write their condition (19 §2.4).
+- **Signed or anonymous.** A form with none of `x-amz-algorithm`, `x-amz-credential`,
+  `x-amz-date` and `x-amz-signature` is anonymous, with or without a policy, as S3 treated one
+  (19 §8.1), and uploads where a bucket policy lets anyone `s3:PutObject`. Signature Version
+  2's fields are refused, as its header is. A signed form holds all four and `policy`; the
+  first missing is named in S3's spelling and message, `X-Amz-Algorithm` before
+  `X-Amz-Credential`, and `key` before any. The credential's scope must be this endpoint's
+  region and `s3`, and its day the `x-amz-date`'s.
+- **The signature** is the policy's as sent, under the day's signing key (19 §3.2), checked
+  before the policy is decoded: a policy changed after signing is `SignatureDoesNotMatch` with
+  the policy as `StringToSign`, as S3 answered one (19 §8.1). AWS's example and botocore's
+  presigned POST verify byte for byte. `x-amz-date`'s age is not checked: a form is signed
+  ahead of its use, and the policy's expiration is the bound AWS documents.
+- **The policy** is read by the strict JSON reader (§9): `expiration` and `conditions`, named
+  exactly so, as s3-tests expects; the expiration an ISO 8601 time with its zone, after which
+  the policy is "not valid". Conditions are simple (one member, a string), `eq`, `starts-with`
+  and `content-length-range`; operators and field names in any case, values compared in
+  theirs, and `starts-with` on `Content-Type` item by item of a comma list (19 §4.2). A
+  `bucket` condition holds the bucket the URL names. A condition on a field the form lacks
+  fails, even `starts-with ""`, as on S3 (19 §8.2), where RGW passes it. A range's bounds are
+  inclusive; a number must be whole and not negative; a string holding digits is read as the
+  number, and any other fails the condition, as S3 answered `"5"` and `"test"` (19 §8.1).
+  Every field but `x-amz-signature`, `file`, `policy` and `x-ignore-*` must be named by a
+  condition; the first that is not is named lowercase, as S3 names it.
+- **S3's answers win over its error table** where they differ (19 §10): a failed condition is
+  `403 AccessDenied`, "Invalid according to Policy: Policy Condition failed: [...]", the
+  condition written as S3 writes it; a missing field is `400 InvalidArgument`; an expired
+  policy `403 AccessDenied`; a malformed one `400 InvalidPolicyDocument`, "Invalid Policy:
+  ...". A file outside the range is `EntityTooLarge` or `EntityTooSmall` with its proposed
+  size and the bound. Where no answer of S3's is recorded, a credential of another region or
+  form, an unknown algorithm, and the policy's other faults, the code is its recorded
+  neighbour's and the message mantle's (19 §11).
+- **The upload's settings are its fields**: `acl` for `x-amz-acl`, the content fields, and every
+  `x-amz-` field but those that sign the form, each as PutObject's header of the same name, and
+  `tagging` as a `Tagging` document. The request's own headers set nothing, so the policy stays
+  the upload's one authority; an `x-amz-` header that disagrees with the field of the same
+  meaning is `400 InvalidRequest`, "Conflicting values provided in HTTP headers and POST form
+  fields." (19 §2.6). The upload is judged as `s3:PutObject` on the key its form names.
+- **The answer.** A `success_action_redirect`, or the deprecated `redirect`, that is an
+  absolute `http` or `https` URL a `Location` header can carry is `303` to it with `bucket`,
+  `key` and the quoted `etag` appended; S3 ignored a relative one (19 §8.1). Otherwise
+  `success_action_status` `201` is a `PostResponse` in no namespace, its `Location` holding the
+  key percent-encoded with its `/`, as S3's captured bodies do, `200` an empty 200, and anything
+  else an empty 204 (19 §2.2, §8.2).
+- **s3-tests** signs every authenticated POST with Signature Version 2, which mantle refuses,
+  and its anonymous ones need public-read-write ACLs, which mantle's buckets do not have; the
+  unit tests take the same policies signed with Version 4 (19 §5).

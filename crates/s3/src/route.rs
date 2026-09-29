@@ -61,6 +61,8 @@ pub enum Operation {
     ListMultipartUploads,
     DeleteObjects,
     PutObject,
+    /// An upload from an HTML form, `POST` to the bucket (docs/research/19).
+    PostObject,
     CopyObject,
     GetObject,
     HeadObject,
@@ -340,6 +342,8 @@ fn bucket_operation(method: &str, q: &Query) -> Result<Operation, RouteError> {
         "PUT" => Ok(O::CreateBucket),
         "DELETE" => Ok(O::DeleteBucket),
         "HEAD" => Ok(O::HeadBucket),
+        // "The action ... must be set to the URL of the bucket" (19 §2.1).
+        "POST" => Ok(O::PostObject),
         _ => Err(RouteError::MethodNotAllowed),
     }
 }
@@ -521,6 +525,14 @@ mod tests {
         );
         let v6 = r("PUT", "[::1]:9000", "/b/k", "").unwrap();
         assert_eq!(v6.bucket.as_deref(), Some("b"));
+        // A form posts to the bucket's URL in either style (19 §2.1, §6.1).
+        for (host, path) in [("b.s3.example.com", "/"), ("s3.example.com", "/b")] {
+            let post = r("POST", host, path, "").unwrap();
+            assert_eq!(
+                (post.operation, post.bucket.as_deref(), post.key),
+                (Operation::PostObject, Some("b"), None)
+            );
+        }
         // Keys are never normalized (05 §1.2.2).
         let odd = r("GET", "s3.example.com", "/b/a//b/./c/../d", "").unwrap();
         assert_eq!(odd.key.as_deref(), Some("a//b/./c/../d"));
@@ -550,6 +562,8 @@ mod tests {
         assert_eq!(op("GET", "/b", "versions"), O::ListObjectVersions);
         assert_eq!(op("GET", "/b/", "uploads"), O::ListMultipartUploads);
         assert_eq!(op("POST", "/b", "delete"), O::DeleteObjects);
+        assert_eq!(op("POST", "/b", ""), O::PostObject);
+        assert_eq!(op("POST", "/b/", ""), O::PostObject);
         assert_eq!(op("PUT", "/b", "versioning"), O::PutBucketVersioning);
         assert_eq!(op("POST", "/b/k", "uploads"), O::CreateMultipartUpload);
         assert_eq!(op("PUT", "/b/k", "partNumber=1&uploadId=u"), O::UploadPart);

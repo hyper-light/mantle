@@ -124,22 +124,25 @@ against the Service Authorization Reference's actions and keys, and requests jud
 them as IAM documents, with its conditions, wildcards and variables, for accounts and the
 anonymous requester; whether a policy is public, as S3 judges it, and Block Public Access, on
 for every new bucket as in S3. Object Lock's documents and headers, checked as S3 was recorded
-checking them, with the integrity, signature and bypass rules for writes that carry locks. A
-subresource routes to
-its own operation or to 405, never to the bucket or object itself, nor across from one to the
-other, and `OPTIONS` is a preflight. The documents every response carries, from listings and
+checking them, with the integrity, signature and bypass rules for writes that carry locks.
+Browser uploads: `multipart/form-data` bodies decoded as they stream, strictly as RFC 7578 and
+RFC 2046 define them, the fields before the file bounded as S3 bounds them, and the form's
+policy, its signature and its conditions checked as S3 was recorded checking them, against
+AWS's signed example and botocore's presigned POST byte for byte. A subresource routes to its
+own operation or to 405, never to the bucket or object itself, nor across from one to the
+other; `OPTIONS` is a preflight, and a `POST` to a bucket a browser upload. The documents every response carries, from listings and
 multipart results to batch deletes, errors, bucket settings, tags, ACLs, lifecycle and CORS
 rules, each holding what AWS's sample response holds for the same content when both are read
 by roxmltree. Its SHA-1, SHA-256, SHA-512, MD5 and HMAC-SHA256 come from AWS-LC, every
 call fallible and behind an unwind boundary. `mantle bench hash` measures each checksum
-algorithm, signature verification and signed-chunk decoding on one core.
+algorithm, signature verification, signed-chunk and form decoding, and a form's policy check on
+one core.
 
 Remaining before it is done:
 
 - Object Lock's enforcement in the Name ranges: each version's retention and legal hold, the
   deletes and changes they refuse, and the versioning they fix (docs/design/s3-protocol.md §11).
-- The rest of 05 §16.1's later surface: server-side encryption headers and browser POST
-  uploads.
+- The rest of 05 §16.1's later surface: server-side encryption headers.
 - The worker that takes lifecycle actions as they fall due, over the Name layer's versions
   and uploads, once the gateway and the metadata layer hold configurations (metadata.md §6).
 

@@ -556,6 +556,7 @@ dependencies = [
  "aws-lc-rs",
  "base64",
  "mantle-crc",
+ "memchr",
  "proptest",
  "roxmltree",
  "thiserror",

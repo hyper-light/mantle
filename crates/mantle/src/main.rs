@@ -129,8 +129,9 @@ enum BenchCommand {
         #[arg(long, value_delimiter = ',', value_parser = parse_size)]
         sizes: Vec<usize>,
     },
-    /// Measure the S3 gateway's cryptography on one core: each checksum algorithm across
-    /// buffer sizes, verifying a request's signature, and decoding signed chunks.
+    /// Measure the S3 gateway's cryptography and framing on one core: each checksum algorithm
+    /// across buffer sizes, verifying a request's signature, decoding signed chunks and form
+    /// bodies, and checking a form's policy.
     Hash {
         /// Seconds each measurement runs.
         #[arg(long, default_value_t = 0.5)]

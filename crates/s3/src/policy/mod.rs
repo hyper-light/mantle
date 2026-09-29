@@ -109,7 +109,8 @@ pub fn may_set(
 /// The action a request asks for, as S3 authorizes its operation (17 §5): the `Version` form
 /// when the request names a version ID. The operations with more than one resource are judged
 /// by parts: a copy as `s3:PutObject` on its destination, its source judged as a GetObject;
-/// DeleteObjects for each key as a DeleteObject. `None` for a preflight, answered from the
+/// DeleteObjects for each key as a DeleteObject; a POST upload as `s3:PutObject` on the key its
+/// form names (19 §2.1). `None` for a preflight, answered from the
 /// bucket's CORS rules without authorization (16 §3), and for ListBuckets, whose
 /// `s3:ListAllMyBuckets` names no bucket and so no bucket policy.
 pub fn action(operation: crate::route::Operation, versioned: bool) -> Option<&'static str> {
@@ -152,6 +153,7 @@ pub fn action(operation: crate::route::Operation, versioned: bool) -> Option<&'s
             either("s3:GetObject", "s3:GetObjectVersion")
         }
         O::PutObject
+        | O::PostObject
         | O::CopyObject
         | O::CreateMultipartUpload
         | O::UploadPart

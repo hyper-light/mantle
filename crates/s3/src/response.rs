@@ -561,6 +561,18 @@ pub fn error(failure: &Failure<'_>) -> String {
     })
 }
 
+/// POST Object's `PostResponse`, for `success_action_status` 201 (19 §2.5): in no namespace,
+/// which s3-tests expects in finding `Key` (19 §5), `Location` the object's URL, `Key` as
+/// stored and the ETag quoted, in the order S3's captured bodies hold them (19 §8.2).
+pub fn post_response(location: &str, bucket: &str, key: &str, etag: &str) -> String {
+    Writer::document("PostResponse", false, |w| {
+        w.text("Location", location);
+        w.text("Bucket", bucket);
+        w.text("Key", key);
+        w.text("ETag", &quoted(etag));
+    })
+}
+
 /// GetBucketLocation's `LocationConstraint`: the region as the root's text, empty for S3's
 /// null, the default region (13 §9.5).
 pub fn location_constraint(location: &str) -> String {

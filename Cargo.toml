@@ -20,6 +20,8 @@ base64 = "0.23"
 bytes = "1.12"
 clap = { version = "4.6", features = ["derive"] }
 getrandom = "0.4"
+# SIMD substring search, for the delimiters of form bodies (docs/design/s3-protocol.md §12).
+memchr = "2.8"
 crc-fast = { version = "1.10", default-features = false, features = ["std"] }
 proptest = "1.11"
 reed-solomon-simd = "3.1"

@@ -49,3 +49,36 @@ the change and after it. Each run's point ran six one-second rounds.
 writes together and flushes once. Every write of a batch is made durable by that one flush,
 and until the flush any of them may reach the device in any order however they are issued.
 So recovery sees nothing it did not before, and the crash soak checks it.
+
+## The next batch during the last one's flush
+
+**Question.** Would a writer that writes batch N+1 while batch N flushes, with flushes
+still one at a time, reach more of the device's durable bandwidth? Two independent streams
+each writing and flushing reached 5.99 GB/s against 5.12 for one (finding 9 of the first
+benchmark). A group-commit writer cannot run two flushes at once, so the pipelined pattern
+is its own measurement.
+
+**Method.** `cargo run --release -p mantle-disk --example flush_pipeline -- . 32 8`, and the
+same at 8 MiB. Each batch is its data and a 4 KiB frame, issued together.
+
+- Serially, a batch is written and then flushed.
+- Pipelined, a flusher thread flushes batch N while the caller writes batch N+1, and the next
+  flush starts once both have ended.
+- The two alternate in blocks of 16 batches, 8 blocks each.
+
+| Batch | Serial | Pipelined |
+|---|---|---|
+| 32 MiB | 4.84 GB/s | 5.31 GB/s |
+| 8 MiB | 1.49 GB/s | 1.45 GB/s |
+
+**Reading.** At 8 MiB, a 1.2 ms write overlapped with a 4.5 ms flush would shorten the batch
+by a fifth if the two overlapped. Nothing is gained, so writes issued during an
+`F_FULLFSYNC` wait for it. At 32 MiB the overlap gains 10%.
+
+**Consequence.** A pipelined writer must validate each batch against the one still flushing,
+fail both batches when a flush fails, and let recovery verify every batch after the last
+completed flush. Frames already carry that point as their group. That complexity is not
+worth 10% at the largest batches and nothing at 8 MiB on this device. The writer stays
+serial until a device measures more, for example NVMe under `fdatasync`, where a flush may
+not hold writes.
+

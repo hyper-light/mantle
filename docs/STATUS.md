@@ -86,8 +86,9 @@ Remaining before it is done:
   brought closer to the device's durable bandwidth. 8 MiB puts reach about 69% of it now
   that a batch's frame is written beside its records
   ([measurements](measurements/2026-09-29-frame-overlap.md)); the flush is most of the
-  rest, and overlapping one batch's writes with the last one's flush needs recovery to
-  allow more than one unfinished batch. Also remaining: the step and round counts from a
+  rest. Writing the next batch during the last one's flush gains 10% at 32 MiB batches and
+  nothing at 8 MiB here, where `F_FULLFSYNC` holds writes issued during it: not worth a
+  pipelined writer's complexity until a device measures more. Also remaining: the step and round counts from a
   dimensioning run, with results that alternate between two states reported per state
   (docs/research/11 §16.3).
 - The group-commit wait for submitters slower than half a batch, from the measured

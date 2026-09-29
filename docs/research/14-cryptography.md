@@ -7,7 +7,8 @@ Research note for mantle's cryptography (`crates/s3/src/crypto.rs`, `vendor/`). 
 - how the operating systems' generators fail;
 - where AWS-LC aborts the process, and where aws-lc-rs panics;
 - what HMAC costs in AWS-LC, and how SigV4 derives its keys;
-- how aws-lc-rs is built for other targets.
+- how aws-lc-rs is built for other targets;
+- how TLS 1.3 protects a record, and what sealing one from pieces requires.
 
 Compiled 2026-09-28 and 2026-09-29 from the vendored AWS-LC and aws-lc-rs sources, the GitHub
 issues and pull requests named below as served those days, the Linux kernel source, Intel's
@@ -195,6 +196,48 @@ Without the `prebuilt-nasm` feature, prebuilt objects are used only if
 `aws-lc-fips-sys` 0.13.9's self-test (`static const uint8_t kAESKey[16] = "BoringCrypto
 Key";`) [LCRS935]. The report is against the FIPS crate.
 
+## 9. TLS 1.3 records
+
+**The record.** A record's plaintext is `TLSInnerPlaintext`: the content, then its
+`ContentType type`, then `uint8 zeros[length_of_padding]`. It is sealed as
+`AEAD-Encrypt(write_key, nonce, additional_data, plaintext)`, where `additional_data` is the
+record header: `TLSCiphertext.opaque_type || TLSCiphertext.legacy_record_version ||
+TLSCiphertext.length` [RFC8446 §5.2].
+
+**The nonce.** "A 64-bit sequence number is maintained separately for reading and writing
+records. The appropriate sequence number is incremented by one after reading or writing each
+record. Each sequence number is set to zero at the beginning of a connection and whenever the
+key is changed ... If a TLS implementation would need to wrap a sequence number, it MUST either
+rekey (Section 4.6.3) or terminate the connection." The nonce is the sequence number "encoded
+in network byte order and padded to the left with zeros to iv_length", "XORed with either the
+static client_write_iv or server_write_iv" [RFC8446 §5.3].
+
+**Limits.** "For AES-GCM, up to 2^24.5 full-size records (about 24 million) may be encrypted on
+a given connection while keeping a safety margin of approximately 2^-57 for Authenticated
+Encryption (AE) security" [RFC8446 §5.5].
+
+**AWS-LC's TLS 1.3 AEAD.** `aead_aes_gcm_tls13_seal_scatter` takes the mask from the first nonce
+it seals, assuming sequence number 0, and then refuses a nonce whose counter is `UINT64_MAX`
+or below the next one allowed: `if (given_counter == UINT64_MAX || given_counter <
+gcm_ctx->min_next_nonce)` [E-AES]. Its input is one contiguous buffer and an extra tail
+[LCRS].
+
+**Sealing from pieces.** aws/aws-lc-rs#1241 asks for "one AES-GCM invocation over the logical
+concatenation of those slices, using one nonce and producing one authentication tag". Its
+acceptance criteria: byte-identical output to the existing TLS AEAD for AES-128-GCM and
+AES-256-GCM; one nonce and one tag, "including unaligned and empty slices"; "strictly
+increasing sequence numbers, no sequence wrap, and no key reuse after partially executed
+encryption fails"; "safe output bounds even when an iterator yields a different length than
+declared"; "preservation of existing output prefixes; no exposure of uninitialized bytes";
+no change to FIPS behavior [LCRS1241]. AWS-LC's incremental GCM finishes a partial block left
+between updates one byte at a time (`CRYPTO_gcm128_encrypt_ctr32`) [GCM-C].
+
+**A trace to test against.** RFC 8448 §3 traces a TLS 1.3 handshake with every secret. The
+server's first encrypted record carries EncryptedExtensions (40 octets), Certificate (445),
+CertificateVerify (136) and Finished (36), each traced on its own, under the key and IV of
+"{server} derive write traffic keys for handshake data". It gives the complete record, 679
+octets, beginning `17 03 03 02 a2` [RFC8448 §3].
+
 ## Sources
 
 - [ENT] AWS-LC `crypto/fipsmodule/rand/entropy/entropy_sources.c`, commit 02561621ffa4cf17c0c4f70bc11a82df36b42ae9, as vendored in `vendor/aws-lc-sys/aws-lc/`.
@@ -228,4 +271,9 @@ Key";`) [LCRS935]. The report is against the FIPS crate.
 - [PROCESSPRNG] "ProcessPrng function", Microsoft Learn, https://learn.microsoft.com/en-us/windows/win32/seccng/processprng.
 - [RFC2104] H. Krawczyk, M. Bellare, R. Canetti, "HMAC: Keyed-Hashing for Message Authentication", RFC 2104, February 1997.
 - [RFC4231] M. Nystrom, "Identifiers and Test Vectors for HMAC-SHA-224, HMAC-SHA-256, HMAC-SHA-384, and HMAC-SHA-512", RFC 4231, December 2005.
+- [E-AES] AWS-LC `crypto/fipsmodule/cipher/e_aes.c`, `aead_aes_gcm_tls13_seal_scatter`.
+- [GCM-C] AWS-LC `crypto/fipsmodule/modes/gcm.c`, `CRYPTO_gcm128_encrypt_ctr32`.
+- [LCRS1241] aws/aws-lc-rs#1241, "Support TLS 1.3 AES-GCM sealing from multiple borrowed input slices", https://github.com/aws/aws-lc-rs/issues/1241.
+- [RFC8446] E. Rescorla, "The Transport Layer Security (TLS) Protocol Version 1.3", RFC 8446, August 2018, §5.2, §5.3, §5.5.
+- [RFC8448] M. Thomson, "Example Handshake Traces for TLS 1.3", RFC 8448, January 2019, §3.
 - [SIGV4] "Create a signed AWS API request", AWS IAM User Guide, https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv-create-signed-request.html, "Derive a signing key".

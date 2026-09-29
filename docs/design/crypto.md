@@ -109,8 +109,8 @@ aws-lc-sys 0.45.0 and aws-lc-rs 1.18.1 are their crates.io packages plus the cha
 vendor/UPSTREAM.md, which also records checksums, upstream commits, and how to update. In
 brief: jitter entropy off by default; a system AWS-LC used only on request; the RNDR retry
 backported, with the operating-system fallback; the fallible digest entry points and the
-one-shot HMAC; MD5; `Clone` for `LessSafeKey` (aws/aws-lc-rs#1165); and upstream's test
-data, so both crates' suites run. `cargo test --manifest-path vendor/Cargo.toml --workspace
+one-shot HMAC; MD5; `Clone` for `LessSafeKey` (aws/aws-lc-rs#1165); sealing a TLS 1.3
+record from several slices (§8); and upstream's test data, so both crates' suites run. `cargo test --manifest-path vendor/Cargo.toml --workspace
 --locked` is a gate, run on every CI target.
 
 x86_64 Windows builds AWS-LC's NASM sources rather than linking the prebuilt objects the
@@ -130,9 +130,27 @@ GCC 15's `-Werror=unterminated-string-initialization`, aws/aws-lc-rs#935, does n
 this copy. aws-lc-sys builds with GCC 15.3.0 under both its builders, including CMake with
 `-Werror`, with no such diagnostic (vendor/UPSTREAM.md).
 
-## 8. Open
+## 8. TLS 1.3 records from pieces
 
-- aws/aws-lc-rs#1241: TLS 1.3 AES-GCM sealing from several borrowed slices, for the
-  transport's record layer.
+The transport's records often hold a payload in several buffers, followed by the inner
+content type (14 §9). `aead::Tls13VectoredSealingKey` in the vendored aws-lc-rs seals them where
+they lie, as aws/aws-lc-rs#1241 proposes. It is one AES-GCM invocation with one nonce and one
+tag, through AWS-LC's incremental GCM, and its output matches `TlsRecordSealingKey` byte for
+byte. RFC 8448's first encrypted server record, sealed from its four separately traced
+messages, is its test vector.
+
+The key keeps TLS's nonce rules itself, since the incremental interface does not. Each nonce
+is the sequence number XORed into the traffic IV, and sequence numbers must increase.
+`u64::MAX` is refused, as AWS-LC's own TLS 1.3 AEAD refuses it. A seal spends its sequence
+number before encrypting, and a key whose seal fails partway refuses every later one, so a
+nonce is never used twice (RFC 8446 §5.3).
+
+A full 16 KiB record seals 8–11% faster from its pieces than gathered and sealed in one call.
+Below about 1 KiB, gathering is as fast or faster
+(docs/measurements/2026-09-29-tls13-vectored-seal.md). It is for the transport's bulk records;
+the transport does not exist yet.
+
+## 9. Open
+
 - aws/aws-lc-rs#617: JWE generation and validation, pending a use in mantle that settles its
   scope.

@@ -26,8 +26,9 @@ directory and, with `--measure`, benchmarks the device. It is built on:
   changes vendor/UPSTREAM.md lists. Processes seed from the operating system rather than CPU
   jitter entropy, 17.6 ms sooner, and a CPU random-number instruction that keeps failing gives
   way to the operating system instead of aborting the process, tested with generators that
-  fail on demand. Both crates' own suites run on every target, and every target lints from
-  one machine with cross C toolchains.
+  fail on demand. A TLS 1.3 record seals from several slices in one AES-GCM invocation, byte
+  for byte as RFC 8448 traces it (aws/aws-lc-rs#1241). Both crates' own suites run on every
+  target, and every target lints from one machine with cross C toolchains.
 - **A simulated device** for crash testing: writes not yet flushed are lost, kept or torn
   at sector granularity when it crashes, a failed flush leaves their durability unknown,
   and reads and writes can be made to fail or return corrupted bytes.

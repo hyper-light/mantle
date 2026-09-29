@@ -50,6 +50,7 @@ it stands.
 | `src/digest.rs`, `src/digest/sha.rs` | `digest::MD5_FOR_LEGACY_USE_ONLY` over AWS-LC's `EVP_md5`, with RFC 1321's test suite. | S3 ETags and `Content-MD5` are MD5 (docs/research/05 §5.1). |
 | `src/digest.rs` | `Context::try_new`, and `try_update` and `try_finish` made public: the fallible forms of `new`, `update` and `finish`, which panic on failure. Tested against the panicking forms and against input past the algorithm's maximum. | Production code never panics (CLAUDE.md §1). |
 | `src/hmac.rs` | `hmac::sign_once`: HMAC with a key used once, through AWS-LC's one-shot `HMAC`, tested against RFC 4231 and against `sign` for every algorithm and key lengths either side of the block size. | Keying a `Key` and signing with a copy of its 1,224-byte context took 255 ns for a 170-byte message where the one-shot took 187 ns (docs/measurements/2026-09-28-aws-lc-crypto.md, finding 3). mantle computes every HMAC with it. |
+| `src/aead/tls.rs`, `src/aead.rs`, `tests/tls13_vectored_seal.rs` | `aead::Tls13VectoredSealingKey`: AES-GCM sealing of a TLS 1.3 record whose plaintext is several borrowed slices, as one AES-GCM invocation with one nonce and one tag. It seals into a slice or into a `Vec`'s spare capacity, which it exposes only after success. It makes each nonce from the sequence number and the traffic IV, refuses sequence numbers that do not increase and `u64::MAX`, spends a sequence number before encrypting, and refuses every seal after one that fails partway. Built on AWS-LC's incremental `EVP_CIPHER` GCM, and not built with `fips`. Tested against RFC 8448's first encrypted server record, sealed from its four handshake messages, against `TlsRecordSealingKey` for both key sizes, and with slices that overrun, underrun or panic. | aws/aws-lc-rs#1241. A full 16 KiB record seals 8–11% faster from its pieces than gathered and sealed in one call; below about 1 KiB, gathering is as fast or faster (docs/measurements/2026-09-29-tls13-vectored-seal.md). |
 | `src/aead/aead_ctx.rs`, `src/aead/unbound_key.rs`, `src/aead.rs` | `Clone` for `aead::LessSafeKey`, through `EVP_AEAD_CTX_copy`, with a test that clones are independent. | aws/aws-lc-rs#1165. The AES-GCM, AES-GCM-SIV and ChaCha20-Poly1305 contexts have copy hooks. |
 | `Cargo.toml` | `autotests = true`. | Runs the integration tests below, which the published manifest turns off because the package leaves them out. |
 | `src/aead/data`, `src/agreement/data`, `src/cipher/data`, `src/data`, `src/test`, `tests/`, `third_party/NIST` | Upstream's test data and integration tests, 119 files, from the `v1.18.1` tag's source archive (`aws-lc-rs-v1.18.1.tar.gz`, SHA-256 `aa5a8cf64b17e2e0bf758a5a5c12799502bc48bea68146eab09532a6c3d10fca`). | The package leaves them out, so its own suite could not run. |
@@ -60,12 +61,13 @@ it stands.
 |---|---|
 | aws/aws-lc-rs#935: GCC 15's `-Werror=unterminated-string-initialization` | Not present in this copy. aws-lc-sys builds with GCC 15.3.0 under both of its builders, including CMake with AWS-LC's `-Werror`, with no such diagnostic. |
 | aws/aws-lc-rs#1165: `Clone` for `LessSafeKey` | Done (above). |
+| aws/aws-lc-rs#1241: TLS 1.3 AES-GCM sealing from several borrowed slices | Done (above), meeting the issue's acceptance criteria. |
 | aws/aws-lc-rs#1233, aws/aws-lc#3453, aws/aws-lc#3475: first-use latency of jitter entropy; RNDR failures | Jitter entropy off by default; retry backported; operating-system fallback added (above). |
 
 ## Verification
 
 On macOS 26.4.1, Apple M5 Max, `cargo test --manifest-path vendor/Cargo.toml --workspace`
-ran 829 tests with none failing: aws-lc-rs's unit tests, integration tests and doc tests, and
+ran 837 tests with none failing: aws-lc-rs's unit tests, integration tests and doc tests, and
 aws-lc-sys's binding layout tests, sanity tests and `hw_rng_fallback`. CI runs the same
 command on the six targets.
 

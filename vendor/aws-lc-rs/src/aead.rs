@@ -204,6 +204,9 @@ pub use self::chacha::CHACHA20_POLY1305;
 pub use self::nonce::{Nonce, NONCE_LEN};
 pub use self::rand_nonce::RandomizedNonceKey;
 pub use self::tls::{TlsProtocolId, TlsRecordOpeningKey, TlsRecordSealingKey};
+// mantle: aws-lc-rs#1241 (vendor/UPSTREAM.md).
+#[cfg(not(feature = "fips"))]
+pub use self::tls::Tls13VectoredSealingKey;
 pub use self::unbound_key::UnboundKey;
 
 /// A sequences of unique nonces.

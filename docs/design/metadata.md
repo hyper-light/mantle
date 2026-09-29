@@ -155,6 +155,13 @@ layers removes them, as Tectonic's does [01 §1.6].
     checks these properties after every step of 2,000 generated schedules. The schedules
     have concurrent creates and deletes, coordinators that stall and are taken over,
     collectors that resume, and writers with stale views.
+  - *The coordinator* (`crates/meta/src/coordinator.rs`) runs one attempt, and does no I/O
+    itself. It names each read and command and the range it goes to, and moves on with the
+    answer. It tells the request that started it what that request learns: created,
+    deleted, not empty, or taken over by a later attempt. The simulation drives this
+    coordinator, stepping any attempt between any two of its reads and commands. The
+    collector resumes a deleted bucket's cleanup from its row, and takes over a stalled
+    create by abandoning it.
 - **Listing** scans the Name range in key order. ListObjects takes the first version of each
   key and passes keys whose first version is a delete marker (05 §6.4); ListObjectVersions
   takes every version, newest first; ListMultipartUploads takes uploads, reaching a key's

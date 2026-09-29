@@ -130,7 +130,8 @@ within a budget and resume. The File layer: files written once as extents, found
 offset with one seek. The Block layer: where each chunk lives, with a reverse row per chunk
 that a property test keeps in step with the chunks through writes, moves and deletes. The
 Bucket layer: owners' quotas and listings, and the steps of creating and deleting a bucket
-across ranges, fenced by attempt, with the gates each Name range admits writes through. A
+across ranges, fenced by attempt, with the gates each Name range admits writes through, run
+by a coordinator that names each range read and command and moves on with its answer. A
 simulation of one bucket across a Bucket range and two Name ranges checks after every step
 that no acknowledged write is lost to a delete, under 2,000 generated schedules of
 concurrent creates and deletes, coordinators taken over, and writers with stale views.
@@ -164,9 +165,8 @@ commands applied twice when either is introduced on purpose.
 
 Remaining before it is done:
 
-- The coordinator that runs a bucket's create and delete across the ranges, and the
-  collector that finishes what a failed one leaves and removes unreferenced files and
-  blocks after a grace period.
+- The collector's schedule: which buckets it resumes or abandons, and when. Also its removal
+  of unreferenced files and blocks after a grace period (design §2, §6).
 - The production engine, once its binding is chosen (design §4).
 - Splits and the fast track under simulation, and the transport:
   QUIC for bulk transfers and snapshots, and a UDP transport for consensus messages.

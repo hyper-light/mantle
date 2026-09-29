@@ -3,7 +3,7 @@
 //! incarnation (docs/design/metadata.md §1–§2). Time is part of the command, as the leader
 //! proposed it, so every replica assigns the same.
 
-use crate::engine::{Engine, Write};
+use crate::engine::{Rows, Write};
 use crate::error::MetaError;
 use crate::key;
 use crate::record;
@@ -13,7 +13,7 @@ const CLOCK: &[u8] = &[key::LOCAL, b'c'];
 
 /// The time a write proposed at `at_ns` takes, the later of that and just after the range's
 /// last, and the write that records it.
-pub fn tick<E: Engine>(engine: &E, at_ns: u64) -> Result<(u64, Write), MetaError> {
+pub fn tick<E: Rows>(engine: &E, at_ns: u64) -> Result<(u64, Write), MetaError> {
     let last = match engine.get(CLOCK)? {
         None => 0,
         Some(bytes) => record::decode_number(&bytes, "clock")?,

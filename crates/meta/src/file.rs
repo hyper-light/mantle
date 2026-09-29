@@ -1,7 +1,7 @@
 //! The File layer's state machine (docs/design/metadata.md §1–§2): a file is written once,
 //! whole, as the list of extents that hold its bytes, and removed whole by the collector.
 
-use crate::engine::{Engine, Write};
+use crate::engine::{Rows, Write};
 use crate::error::MetaError;
 use crate::key;
 use crate::record::{Extent, FileHeader};
@@ -35,11 +35,7 @@ pub enum Outcome {
 }
 
 /// Applies `command` as log entry `index`.
-pub fn apply<E: Engine>(
-    engine: &mut E,
-    index: u64,
-    command: &Command,
-) -> Result<Outcome, MetaError> {
+pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<Outcome, MetaError> {
     let (outcome, writes) = match command {
         Command::Write { file, extents } => write(engine, *file, extents)?,
         Command::Delete { file } => (Outcome::Deleted, remove(engine, *file)?),
@@ -48,7 +44,7 @@ pub fn apply<E: Engine>(
     Ok(outcome)
 }
 
-fn write<E: Engine>(
+fn write<E: Rows>(
     engine: &E,
     file: u128,
     extents: &[Extent],
@@ -89,7 +85,7 @@ fn write<E: Engine>(
 }
 
 /// Writes that remove every row of `file`: its header and at most `MAX_EXTENTS` extents.
-fn remove<E: Engine>(engine: &E, file: u128) -> Result<Vec<Write>, MetaError> {
+fn remove<E: Rows>(engine: &E, file: u128) -> Result<Vec<Write>, MetaError> {
     let (mut from, to) = key::id_rows(file);
     let mut writes = Vec::new();
     while let Some((k, _)) = engine.next(&from, &to)? {
@@ -104,7 +100,7 @@ fn remove<E: Engine>(engine: &E, file: u128) -> Result<Vec<Write>, MetaError> {
 }
 
 /// A file's header.
-pub fn header<E: Engine>(engine: &E, file: u128) -> Result<Option<FileHeader>, MetaError> {
+pub fn header<E: Rows>(engine: &E, file: u128) -> Result<Option<FileHeader>, MetaError> {
     Ok(engine
         .get(&key::file_header(file))?
         .map(|b| FileHeader::decode(&b))
@@ -113,7 +109,7 @@ pub fn header<E: Engine>(engine: &E, file: u128) -> Result<Option<FileHeader>, M
 
 /// A file's extents from the one holding byte `offset`, at most `max` of them, in order, each
 /// with the offset of its first byte.
-pub fn extents<E: Engine>(
+pub fn extents<E: Rows>(
     engine: &E,
     file: u128,
     offset: u64,

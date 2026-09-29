@@ -7,7 +7,7 @@
 //! steps of the attempt left behind are refused from then on, here and at the gates.
 
 use crate::clock;
-use crate::engine::{Engine, Write};
+use crate::engine::{Rows, Write};
 use crate::error::MetaError;
 use crate::key;
 use crate::record::{Bucket, BucketState, Owned, Owner, Versioning};
@@ -104,11 +104,7 @@ pub enum Outcome {
 }
 
 /// Applies `command` as log entry `index`.
-pub fn apply<E: Engine>(
-    engine: &mut E,
-    index: u64,
-    command: &Command,
-) -> Result<Outcome, MetaError> {
+pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<Outcome, MetaError> {
     use BucketState::{Active, Creating, Deleted, Deleting};
     let (outcome, writes) = match command {
         Command::Create(c) => create(engine, c)?,
@@ -149,7 +145,7 @@ pub fn apply<E: Engine>(
     Ok(outcome)
 }
 
-fn create<E: Engine>(engine: &E, c: &Create) -> Result<(Outcome, Vec<Write>), MetaError> {
+fn create<E: Rows>(engine: &E, c: &Create) -> Result<(Outcome, Vec<Write>), MetaError> {
     if let Some(row) = read(engine, &c.bucket)? {
         let outcome = match row.state {
             BucketState::Creating if row.owner == c.owner && row.location == c.location => {
@@ -203,7 +199,7 @@ fn create<E: Engine>(engine: &E, c: &Create) -> Result<(Outcome, Vec<Write>), Me
     ))
 }
 
-fn version<E: Engine>(
+fn version<E: Rows>(
     engine: &E,
     bucket: &str,
     incarnation: u64,
@@ -232,7 +228,7 @@ fn version<E: Engine>(
 }
 
 /// Starts a delete of a bucket in state `from`, or takes over a delete in progress.
-fn begin<E: Engine>(
+fn begin<E: Rows>(
     engine: &E,
     bucket: &str,
     at_ns: u64,
@@ -268,7 +264,7 @@ fn begin<E: Engine>(
 /// Moves the bucket from `from` to `to` for `attempt`, with the owner's rows that change with
 /// it: its listing holds the buckets that are active or being deleted, and its count every
 /// bucket not yet deleted.
-fn step<E: Engine>(
+fn step<E: Rows>(
     engine: &E,
     bucket: &str,
     attempt: u64,
@@ -310,7 +306,7 @@ fn step<E: Engine>(
     Ok((done, writes))
 }
 
-fn forget<E: Engine>(
+fn forget<E: Rows>(
     engine: &E,
     bucket: &str,
     attempt: u64,
@@ -325,7 +321,7 @@ fn forget<E: Engine>(
 }
 
 /// The write that counts one bucket fewer for `owner`, removing its row at none.
-fn uncount<E: Engine>(engine: &E, owner: &str) -> Result<Write, MetaError> {
+fn uncount<E: Rows>(engine: &E, owner: &str) -> Result<Write, MetaError> {
     let buckets = owned_count(engine, owner)?
         .checked_sub(1)
         .ok_or(MetaError::Corrupt)?;
@@ -338,7 +334,7 @@ fn uncount<E: Engine>(engine: &E, owner: &str) -> Result<Write, MetaError> {
 }
 
 /// A bucket's row.
-pub fn read<E: Engine>(engine: &E, bucket: &str) -> Result<Option<Bucket>, MetaError> {
+pub fn read<E: Rows>(engine: &E, bucket: &str) -> Result<Option<Bucket>, MetaError> {
     Ok(engine
         .get(&key::bucket(bucket))?
         .map(|b| Bucket::decode(&b))
@@ -346,7 +342,7 @@ pub fn read<E: Engine>(engine: &E, bucket: &str) -> Result<Option<Bucket>, MetaE
 }
 
 /// How many buckets `owner` has, counting those being created or deleted.
-pub fn owned_count<E: Engine>(engine: &E, owner: &str) -> Result<u32, MetaError> {
+pub fn owned_count<E: Rows>(engine: &E, owner: &str) -> Result<u32, MetaError> {
     match engine.get(&key::owner(owner))? {
         None => Ok(0),
         Some(bytes) => Ok(Owner::decode(&bytes)?.buckets),
@@ -355,7 +351,7 @@ pub fn owned_count<E: Engine>(engine: &E, owner: &str) -> Result<u32, MetaError>
 
 /// `owner`'s active buckets and those being deleted, by name after `after`, at most `max`:
 /// a page of ListBuckets (05 §10.4).
-pub fn owned<E: Engine>(
+pub fn owned<E: Rows>(
     engine: &E,
     owner: &str,
     after: Option<&str>,

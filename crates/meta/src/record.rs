@@ -134,6 +134,17 @@ pub struct Owned {
     pub location: String,
 }
 
+/// A gateway's session with a range (docs/design/replica.md §1).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Session {
+    /// The time of the entry that last used the session.
+    pub last_ns: u64,
+    /// Serials below this were answered and are forgotten.
+    pub low: u64,
+    /// The answers kept, in serial order, each encoded.
+    pub answers: Vec<(u64, Vec<u8>)>,
+}
+
 /// A file: its length and how many extents hold it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileHeader {
@@ -282,7 +293,7 @@ impl ChunkPlace {
 }
 
 impl Versioning {
-    fn code(self) -> u8 {
+    pub(crate) fn code(self) -> u8 {
         match self {
             Self::Unversioned => 0,
             Self::Enabled => 1,
@@ -290,7 +301,7 @@ impl Versioning {
         }
     }
 
-    fn from_code(code: u8) -> Option<Self> {
+    pub(crate) fn from_code(code: u8) -> Option<Self> {
         match code {
             0 => Some(Self::Unversioned),
             1 => Some(Self::Enabled),
@@ -420,6 +431,43 @@ impl Owned {
             &r,
             "owned",
         )
+    }
+}
+
+impl Session {
+    pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
+        let mut w = start();
+        w.u64(self.last_ns);
+        w.u64(self.low);
+        put_len(&mut w, self.answers.len())?;
+        for (serial, answer) in &self.answers {
+            w.u64(*serial);
+            put_bytes(&mut w, answer)?;
+        }
+        Ok(finish(w))
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "session")?;
+        let session = (|| {
+            let last_ns = r.u64()?;
+            let low = r.u64()?;
+            let count = usize::try_from(r.u32()?).ok()?;
+            // An answer takes twelve bytes at least.
+            if count > r.remaining() / 12 {
+                return None;
+            }
+            let mut answers = Vec::with_capacity(count);
+            for _ in 0..count {
+                answers.push((r.u64()?, take_bytes(&mut r)?));
+            }
+            Some(Self {
+                last_ns,
+                low,
+                answers,
+            })
+        })();
+        decoded(session, &r, "session")
     }
 }
 
@@ -618,22 +666,22 @@ fn decoded<T>(value: Option<T>, r: &Reader<'_>, what: &'static str) -> Result<T,
         .ok_or(RecordError::Corrupt(what))
 }
 
-fn put_len(w: &mut Writer, len: usize) -> Result<(), RecordError> {
+pub(crate) fn put_len(w: &mut Writer, len: usize) -> Result<(), RecordError> {
     w.u32(u32::try_from(len).map_err(|_| RecordError::TooLarge(len))?);
     Ok(())
 }
 
-fn put_bytes(w: &mut Writer, b: &[u8]) -> Result<(), RecordError> {
+pub(crate) fn put_bytes(w: &mut Writer, b: &[u8]) -> Result<(), RecordError> {
     put_len(w, b.len())?;
     w.bytes(b);
     Ok(())
 }
 
-fn put_str(w: &mut Writer, s: &str) -> Result<(), RecordError> {
+pub(crate) fn put_str(w: &mut Writer, s: &str) -> Result<(), RecordError> {
     put_bytes(w, s.as_bytes())
 }
 
-fn put_file(w: &mut Writer, file: Option<u128>) {
+pub(crate) fn put_file(w: &mut Writer, file: Option<u128>) {
     match file {
         None => w.u8(0),
         Some(id) => {
@@ -643,7 +691,7 @@ fn put_file(w: &mut Writer, file: Option<u128>) {
     }
 }
 
-fn put_pairs(w: &mut Writer, pairs: &[(String, String)]) -> Result<(), RecordError> {
+pub(crate) fn put_pairs(w: &mut Writer, pairs: &[(String, String)]) -> Result<(), RecordError> {
     put_len(w, pairs.len())?;
     for (name, value) in pairs {
         put_str(w, name)?;
@@ -652,16 +700,16 @@ fn put_pairs(w: &mut Writer, pairs: &[(String, String)]) -> Result<(), RecordErr
     Ok(())
 }
 
-fn take_bytes(r: &mut Reader<'_>) -> Option<Vec<u8>> {
+pub(crate) fn take_bytes(r: &mut Reader<'_>) -> Option<Vec<u8>> {
     let len = usize::try_from(r.u32()?).ok()?;
     Some(r.take(len)?.to_vec())
 }
 
-fn take_str(r: &mut Reader<'_>) -> Option<String> {
+pub(crate) fn take_str(r: &mut Reader<'_>) -> Option<String> {
     String::from_utf8(take_bytes(r)?).ok()
 }
 
-fn take_file(r: &mut Reader<'_>) -> Option<Option<u128>> {
+pub(crate) fn take_file(r: &mut Reader<'_>) -> Option<Option<u128>> {
     match r.u8()? {
         0 => Some(None),
         1 => Some(Some(r.u128()?)),
@@ -669,7 +717,7 @@ fn take_file(r: &mut Reader<'_>) -> Option<Option<u128>> {
     }
 }
 
-fn take_pairs(r: &mut Reader<'_>) -> Option<Vec<(String, String)>> {
+pub(crate) fn take_pairs(r: &mut Reader<'_>) -> Option<Vec<(String, String)>> {
     let count = usize::try_from(r.u32()?).ok()?;
     // Each pair takes at least eight bytes, so a count the value cannot hold is corrupt
     // before anything is allocated for it.

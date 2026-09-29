@@ -8,7 +8,7 @@
 //! (docs/design/metadata.md §2).
 
 use crate::clock;
-use crate::engine::{Engine, Write};
+use crate::engine::{Rows, Write};
 use crate::error::MetaError;
 use crate::key::{self, NULL_VERSION, NameRow};
 use crate::record::{self, Checksum, Gate, GateState, Part, Upload, Version};
@@ -245,11 +245,7 @@ pub enum Outcome {
 }
 
 /// Applies `command` as log entry `index`. A refused command still advances the index.
-pub fn apply<E: Engine>(
-    engine: &mut E,
-    index: u64,
-    command: &Command,
-) -> Result<Outcome, MetaError> {
+pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<Outcome, MetaError> {
     let admitted = match command.write_to() {
         Some((bucket, incarnation)) => admits(engine, bucket, incarnation)?,
         None => true,
@@ -275,12 +271,12 @@ pub fn apply<E: Engine>(
 const FLOOR: &[u8] = &[key::LOCAL, b'f'];
 
 /// Whether the range admits a write to `bucket` made under `incarnation`.
-fn admits<E: Engine>(engine: &E, bucket: &str, incarnation: u64) -> Result<bool, MetaError> {
+fn admits<E: Rows>(engine: &E, bucket: &str, incarnation: u64) -> Result<bool, MetaError> {
     Ok(gate(engine, bucket)?
         .is_some_and(|g| g.incarnation == incarnation && g.state == GateState::Open))
 }
 
-fn move_gate<E: Engine>(engine: &E, g: &GateChange) -> Result<(Outcome, Vec<Write>), MetaError> {
+fn move_gate<E: Rows>(engine: &E, g: &GateChange) -> Result<(Outcome, Vec<Write>), MetaError> {
     use GateState::{Closed, Condemned, Open};
     // The steps creating and deleting a bucket take. A delete that takes over from an
     // attempt left behind closes each gate again, and one that abandons an unfinished create
@@ -338,14 +334,14 @@ fn move_gate<E: Engine>(engine: &E, g: &GateChange) -> Result<(Outcome, Vec<Writ
     Ok((Outcome::GateMoved, vec![Write::Put(row, next.encode())]))
 }
 
-fn floor<E: Engine>(engine: &E) -> Result<u64, MetaError> {
+fn floor<E: Rows>(engine: &E) -> Result<u64, MetaError> {
     match engine.get(FLOOR)? {
         None => Ok(0),
         Some(bytes) => Ok(record::decode_number(&bytes, "floor")?),
     }
 }
 
-fn collect<E: Engine>(engine: &E, c: &Collect) -> Result<(Outcome, Vec<Write>), MetaError> {
+fn collect<E: Rows>(engine: &E, c: &Collect) -> Result<(Outcome, Vec<Write>), MetaError> {
     let condemned = gate(engine, &c.bucket)?
         .is_some_and(|g| g.incarnation == c.incarnation && g.state == GateState::Condemned);
     if !condemned {
@@ -371,7 +367,7 @@ fn collect<E: Engine>(engine: &E, c: &Collect) -> Result<(Outcome, Vec<Write>), 
     Ok((Outcome::Collected { done }, writes))
 }
 
-fn put<E: Engine>(engine: &E, p: &Put) -> Result<(Outcome, Vec<Write>), MetaError> {
+fn put<E: Rows>(engine: &E, p: &Put) -> Result<(Outcome, Vec<Write>), MetaError> {
     let (bucket, key, versioning) = (p.bucket.as_str(), p.key.as_str(), p.versioning);
     let (preconditions, at_ns, ordered_ns, version) =
         (&p.preconditions, p.at_ns, p.ordered_ns, &p.version);
@@ -423,7 +419,7 @@ fn put<E: Engine>(engine: &E, p: &Put) -> Result<(Outcome, Vec<Write>), MetaErro
     ))
 }
 
-fn delete<E: Engine>(engine: &E, d: &Delete) -> Result<(Outcome, Vec<Write>), MetaError> {
+fn delete<E: Rows>(engine: &E, d: &Delete) -> Result<(Outcome, Vec<Write>), MetaError> {
     let (bucket, key, versioning) = (d.bucket.as_str(), d.key.as_str(), d.versioning);
     let (named, if_match, at_ns) = (d.named, d.if_match.as_ref(), d.at_ns);
     if let Some(if_match) = if_match {
@@ -527,7 +523,7 @@ fn delete<E: Engine>(engine: &E, d: &Delete) -> Result<(Outcome, Vec<Write>), Me
     }
 }
 
-fn create_upload<E: Engine>(
+fn create_upload<E: Rows>(
     engine: &E,
     c: &CreateUpload,
 ) -> Result<(Outcome, Vec<Write>), MetaError> {
@@ -549,7 +545,7 @@ fn create_upload<E: Engine>(
     Ok((Outcome::Created { upload }, writes))
 }
 
-fn put_part<E: Engine>(engine: &E, p: &PutPart) -> Result<(Outcome, Vec<Write>), MetaError> {
+fn put_part<E: Rows>(engine: &E, p: &PutPart) -> Result<(Outcome, Vec<Write>), MetaError> {
     if upload(engine, &p.bucket, &p.key, &p.upload)?.is_none() {
         return Ok((Outcome::NoSuchUpload, Vec::new()));
     }
@@ -564,7 +560,7 @@ fn put_part<E: Engine>(engine: &E, p: &PutPart) -> Result<(Outcome, Vec<Write>),
     ))
 }
 
-fn complete<E: Engine>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), MetaError> {
+fn complete<E: Rows>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), MetaError> {
     let Some(upload_row) = upload(engine, &c.bucket, &c.key, &c.upload)? else {
         // A retry of a complete that committed finds the version it made (05 §4.4).
         let made = match key::parse_version_id(&c.upload) {
@@ -639,7 +635,7 @@ fn complete<E: Engine>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>)
     Ok((outcome, writes))
 }
 
-fn abort<E: Engine>(engine: &E, a: &Abort) -> Result<(Outcome, Vec<Write>), MetaError> {
+fn abort<E: Rows>(engine: &E, a: &Abort) -> Result<(Outcome, Vec<Write>), MetaError> {
     if upload(engine, &a.bucket, &a.key, &a.upload)?.is_none() {
         return Ok((Outcome::NoSuchUpload, Vec::new()));
     }
@@ -650,7 +646,7 @@ fn abort<E: Engine>(engine: &E, a: &Abort) -> Result<(Outcome, Vec<Write>), Meta
 }
 
 /// Writes that remove an upload's row and every one of its parts: at most 10,000 (05 §4.1).
-fn remove_upload<E: Engine>(
+fn remove_upload<E: Rows>(
     engine: &E,
     bucket: &str,
     key: &str,
@@ -676,7 +672,7 @@ fn remove_upload<E: Engine>(
 }
 
 /// An upload in progress.
-pub fn upload<E: Engine>(
+pub fn upload<E: Rows>(
     engine: &E,
     bucket: &str,
     key: &str,
@@ -688,7 +684,7 @@ pub fn upload<E: Engine>(
 
 /// An upload's parts numbered after `after`, in order, at most `max` of them: ListParts'
 /// page (05 §4.6).
-pub fn parts<E: Engine>(
+pub fn parts<E: Rows>(
     engine: &E,
     bucket: &str,
     key: &str,
@@ -718,7 +714,7 @@ pub fn parts<E: Engine>(
 }
 
 /// The key's current version: its newest, a delete marker or not.
-pub fn current<E: Engine>(
+pub fn current<E: Rows>(
     engine: &E,
     bucket: &str,
     key: &str,
@@ -735,7 +731,7 @@ pub fn current<E: Engine>(
 }
 
 /// The version a request names.
-pub fn version<E: Engine>(
+pub fn version<E: Rows>(
     engine: &E,
     bucket: &str,
     key: &str,
@@ -755,7 +751,7 @@ pub fn version<E: Engine>(
 }
 
 /// The order of the key's null version.
-fn null_order<E: Engine>(engine: &E, bucket: &str, key: &str) -> Result<Option<u64>, MetaError> {
+fn null_order<E: Rows>(engine: &E, bucket: &str, key: &str) -> Result<Option<u64>, MetaError> {
     match engine.get(&key::name(bucket, key, &NameRow::Null))? {
         None => Ok(None),
         Some(bytes) => Ok(Some(record::decode_number(&bytes, "null")?)),
@@ -763,7 +759,7 @@ fn null_order<E: Engine>(engine: &E, bucket: &str, key: &str) -> Result<Option<u
 }
 
 /// Writes that remove the key's null version and its pointer, and the version removed.
-fn remove_null<E: Engine>(
+fn remove_null<E: Rows>(
     engine: &E,
     bucket: &str,
     key: &str,
@@ -807,7 +803,7 @@ pub enum Scan {
 /// The first key at or after `from`, in object-key byte order, whose current version is an
 /// object rather than a delete marker, reading at most `budget` rows: a bucket whose keys are
 /// mostly delete markers pauses the scan rather than running it unbounded.
-pub fn next_current<E: Engine>(
+pub fn next_current<E: Rows>(
     engine: &E,
     bucket: &str,
     from: &[u8],
@@ -853,7 +849,7 @@ pub fn next_current<E: Engine>(
 }
 
 /// The range's gate for `bucket`.
-pub fn gate<E: Engine>(engine: &E, bucket: &str) -> Result<Option<Gate>, MetaError> {
+pub fn gate<E: Rows>(engine: &E, bucket: &str) -> Result<Option<Gate>, MetaError> {
     Ok(engine
         .get(&key::gate(bucket))?
         .map(|b| Gate::decode(&b))
@@ -874,7 +870,7 @@ pub enum Probe {
 /// Whether the range holds a version or delete marker of `bucket`, reading at most `budget`
 /// rows from `from`, a paused read's key, or from the bucket's first row. A key's versions
 /// sort before its uploads, so one row answers for each key.
-pub fn probe<E: Engine>(
+pub fn probe<E: Rows>(
     engine: &E,
     bucket: &str,
     from: Option<&[u8]>,
@@ -917,7 +913,7 @@ fn beyond_rows(bucket: &str, object: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::Model;
+    use crate::engine::{Engine, Model};
 
     struct Range {
         engine: Model,

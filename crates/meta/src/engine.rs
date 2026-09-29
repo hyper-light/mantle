@@ -26,17 +26,20 @@ pub enum EngineError {
     Fenced,
 }
 
-/// A range's rows.
-pub trait Engine {
+/// Rows as a state machine reads and writes them.
+pub trait Rows {
     /// The value of `key`.
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError>;
 
     /// The first row in `[from, to)`.
     fn next(&self, from: &[u8], to: &[u8]) -> Result<Option<Row>, EngineError>;
 
-    /// Applies `writes` atomically as log entry `index`, which must be past `applied()`.
+    /// Applies `writes` atomically as log entry `index`.
     fn apply(&mut self, index: u64, writes: &[Write]) -> Result<(), EngineError>;
+}
 
+/// A range's rows, and what of them a crash keeps.
+pub trait Engine: Rows {
     /// The last log entry applied.
     fn applied(&self) -> u64;
 
@@ -65,7 +68,7 @@ impl Model {
     }
 }
 
-impl Engine for Model {
+impl Rows for Model {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
         Ok(self.rows.get(key).cloned())
     }
@@ -101,7 +104,9 @@ impl Engine for Model {
         self.applied = index;
         Ok(())
     }
+}
 
+impl Engine for Model {
     fn applied(&self) -> u64 {
         self.applied
     }

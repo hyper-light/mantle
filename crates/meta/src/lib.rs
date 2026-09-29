@@ -14,6 +14,7 @@
     )
 )]
 
+pub mod apply;
 pub mod block;
 pub mod bucket;
 pub mod clock;
@@ -22,4 +23,7 @@ pub mod error;
 pub mod file;
 pub mod key;
 pub mod name;
+pub mod overlay;
 pub mod record;
+pub mod session;
+pub mod wire;

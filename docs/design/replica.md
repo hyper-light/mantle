@@ -1,0 +1,92 @@
+# Range replicas: how a range runs its log
+
+Status: design, 2026-09-28. Sources: docs/research/06 (consensus, "06 §x"), 07 (focal's
+consensus stack); docs/design/metadata.md, whose ranges this runs, and raft-log.md, the log
+it writes to.
+
+A replica is one member of one range's Raft group on one node. It holds focal-raft's core
+(`RawNode`, 07 §1.2), its group's view of the device's log, the range's engine, and the state
+machine of the range's layer: Bucket, Name, File or Block (metadata.md §1). It turns what the
+core asks for into log submissions, engine batches and messages, in the order Raft's safety
+needs.
+
+## 1. What an entry carries
+
+A normal entry carries a batch of commands, each from a gateway. Batching many commands into
+one entry, and many entries into one flush, is where a consensus log's throughput comes from
+(06 §A9). A configuration change is focal's `ConfChangeV2` entry.
+
+Each command names the gateway's session, its serial number, and the lowest serial number
+whose response the gateway has not yet received, following the Raft dissertation's client
+sessions (06 §A1.8):
+
+- **Registration is a command.** A gateway registers with a range before its first command,
+  and the session's ID is the index of the entry that registered it, which no other entry
+  shares.
+- **A duplicate is answered, not applied.** The range keeps, per session, the responses to
+  commands at or after the lowest serial number not yet acknowledged, and answers a
+  duplicate from them. So a command takes effect "exactly once according to [its] first
+  appearance in the Raft log" (06 §A1.8), including when the gateway retries after its
+  leader fails, or re-proposes an entry the fast track displaced (07 §1.4).
+- **Expiry is decided by the log.** Every entry carries the leader's time when it was
+  proposed, as LogCabin's leader stamps its entries (06 §A1.8), and sessions unused for the
+  range's session lifetime expire at the entry that passes it. Every replica decides the same.
+  A range also holds at most a configured number of sessions, and registering past it
+  expires the one least recently used. A command whose session is unknown or expired is
+  refused, never run in a new session, since running it could apply it a second time.
+
+Sessions live in the engine beside the range's rows, so they change in the entry's batch
+and survive a restart with them.
+
+## 2. Applying an entry
+
+The commands of one entry apply as one engine batch at the entry's index. That keeps the
+engine's applied index at an entry boundary, so replay after a crash starts cleanly at the
+first entry after it (metadata.md §3). Within the entry, each command reads what the
+commands before it wrote, through an overlay that buffers the entry's writes over the
+engine and answers reads from both. A command whose effects the layer refuses, a failed
+precondition say, answers its refusal and writes nothing. A committed entry that does not
+decode, or whose command breaks the state machine, fences the replica. Every replica applies
+the same log, so the break is in the data. The replica then recovers from its peers, and the
+range carries on without it.
+
+Applying never reads the clock, the network or anything else a replica does not share.
+Time comes from the entry, which is what lets every replica reach the same rows.
+
+## 3. The order of a `Ready`
+
+For each `Ready` the core gives, the replica does these steps in order:
+
+1. Sends the messages a leader may send before its own write. The core marks them apart
+   from those that must wait (07 §1.2). A leader writing in parallel with its followers is
+   Ongaro's §10.2.1 optimization (06 §A1.9).
+2. Submits the `Ready`'s entries, hard state, snapshot point and fast-track proposals to the
+   log as one update (raft-log.md §2), and waits for it to be durable.
+3. Sends the messages that must follow durability: a follower's acknowledgements and votes.
+4. Applies the committed entries (§2).
+5. Tells the core, which may hand over more committed entries and messages.
+
+## 4. Compaction and restart
+
+The engine makes applied state durable on its own schedule. When it has, the replica writes
+the durable index to the log as the group's new start, keeping a window of entries behind it
+for followers that lag. The log then frees the entries before it (raft-log.md §5; 06 §C.b.2).
+
+On restart, the engine opens at its durable index, and that index and the configuration the
+engine holds there are what the core is told it has applied. The log gives the hard state
+and every entry after the start, and the replica applies the committed entries past the
+engine's index again. Because applying is deterministic, replaying them rebuilds the same
+rows.
+
+## 5. Testing
+
+Replicas are tested in deterministic simulation. Several nodes, each with a simulated device
+for its log and a model engine, run over a simulated network that delays, drops, reorders
+and partitions messages. Nodes crash and restart. Every run is its seed (06 §A5). What the
+gateways saw is checked for linearizability per key (metadata.md §5).
+
+## 6. Open
+
+- Snapshots, and the window of entries kept for lagging followers before one is sent.
+- ReadIndex reads, and leases if a deployment states its clock-drift bound (06 §A1.5).
+- The session lifetime and bound, from how long gateways go between commands to a range.

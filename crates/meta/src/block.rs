@@ -5,7 +5,7 @@
 
 use mantle_chunk::ChunkKey;
 
-use crate::engine::{Engine, Write};
+use crate::engine::{Rows, Write};
 use crate::error::MetaError;
 use crate::key;
 use crate::record::{BlockHeader, ChunkPlace, Reverse};
@@ -46,11 +46,7 @@ pub enum Outcome {
 }
 
 /// Applies `command` as log entry `index`.
-pub fn apply<E: Engine>(
-    engine: &mut E,
-    index: u64,
-    command: &Command,
-) -> Result<Outcome, MetaError> {
+pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<Outcome, MetaError> {
     let (outcome, writes) = match command {
         Command::Write {
             block,
@@ -64,7 +60,7 @@ pub fn apply<E: Engine>(
     Ok(outcome)
 }
 
-fn write<E: Engine>(
+fn write<E: Rows>(
     engine: &E,
     block: u128,
     header: &BlockHeader,
@@ -118,7 +114,7 @@ fn valid(block: u128, header: &BlockHeader, chunks: &[ChunkPlace]) -> bool {
         && volumes.len() == chunks.len()
 }
 
-fn relocate<E: Engine>(
+fn relocate<E: Rows>(
     engine: &E,
     chunk: &ChunkKey,
     from: u128,
@@ -154,7 +150,7 @@ fn relocate<E: Engine>(
     Ok((Outcome::Moved, writes))
 }
 
-fn delete<E: Engine>(engine: &E, block: u128) -> Result<(Outcome, Vec<Write>), MetaError> {
+fn delete<E: Rows>(engine: &E, block: u128) -> Result<(Outcome, Vec<Write>), MetaError> {
     let Some((_, places)) = read(engine, block)? else {
         return Ok((Outcome::Deleted, Vec::new()));
     };
@@ -172,7 +168,7 @@ fn width(header: &BlockHeader) -> Option<u16> {
 }
 
 /// A block's header and its chunks' places, in index order.
-pub fn read<E: Engine>(
+pub fn read<E: Rows>(
     engine: &E,
     block: u128,
 ) -> Result<Option<(BlockHeader, Vec<ChunkPlace>)>, MetaError> {
@@ -197,7 +193,7 @@ pub fn read<E: Engine>(
 
 /// The range's blocks with a chunk on `volume`, after block `after`, at most `max` of them in
 /// block order, each with the index of its chunk there.
-pub fn on_volume<E: Engine>(
+pub fn on_volume<E: Rows>(
     engine: &E,
     volume: u128,
     after: Option<u128>,

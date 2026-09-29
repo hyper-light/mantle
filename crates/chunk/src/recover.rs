@@ -49,7 +49,7 @@ pub(crate) struct Recovered {
     pub incarnation: u64,
     pub fragments: u64,
     /// Open segments, newest first: the first two continue the writer's two streams, the
-    /// rest are sealed by its first batch.
+    /// rest are sealed when the volume starts.
     pub open: Vec<u32>,
     pub report: RecoveryReport,
 }

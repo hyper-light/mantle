@@ -295,8 +295,9 @@ fn checkpoints_come_only_when_the_log_needs_the_room() {
     let checkpoints = v.usage().unwrap().checkpoints - before;
     let block = geometry.block;
     let checkpoint = checkpoint_bytes(chunks + 1, u64::from(geometry.segments), block).unwrap();
-    let batch = batch_frame_bytes(config.limits.batch_requests, block).unwrap();
-    let wrap = largest_frame(&config, block).unwrap();
+    let requests = config.limits.batch_requests;
+    let batch = batch_frame_bytes(requests, requests, block).unwrap();
+    let wrap = largest_frame(&config, u64::from(geometry.segments), block).unwrap();
     let room = geometry.log_size - 2 * checkpoint - batch - 2 * wrap;
     let bound = (frames * block).div_ceil(room) + 1;
     assert!(

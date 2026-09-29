@@ -152,6 +152,7 @@ impl<F: BlockFile + 'static> Volume<F> {
             checksum_shift: superblock.checksum_shift,
             ..config
         };
+        geometry.holds(&config)?;
         Self::start(file, superblock, geometry, config, may_start)
     }
 
@@ -165,7 +166,22 @@ impl<F: BlockFile + 'static> Volume<F> {
         // Read buffers: at most one batch's worth kept free, none larger than a batch.
         let batch = config.limits.batch_bytes;
         let pool = Pool::new(file.alignment(), batch, batch);
-        let recovered = recover::recover(&file, &pool, &superblock, &geometry, &config)?;
+        let mut recovered = recover::recover(&file, &pool, &superblock, &geometry, &config)?;
+        // Recovery continues one open segment per stream. One found open beyond those is
+        // sealed where recovery left its end, and the checkpoint below records it, so no
+        // batch's frame carries more than its requests do (layout::batch_frame_payload).
+        let mut opens = std::mem::take(&mut recovered.open).into_iter();
+        let (client, clean) = (opens.next(), opens.next());
+        let mut sealed = 0usize;
+        for segment in opens {
+            if let Some(info) = usize::try_from(segment)
+                .ok()
+                .and_then(|i| recovered.segments.get_mut(i))
+            {
+                info.state = SegmentState::Sealed;
+                sealed = sealed.saturating_add(1);
+            }
+        }
         let shared = Arc::new(Shared {
             pool,
             file,
@@ -199,16 +215,12 @@ impl<F: BlockFile + 'static> Volume<F> {
         let (sender, rx) = sync_channel(config.limits.queue_requests().saturating_add(1));
         let (wake, wakes) = sync_channel(1);
         let report = recovered.report;
-        let mut opens = recovered.open.into_iter();
-        let client = opens.next();
-        let clean = opens.next();
         let mut writer = Writer {
             shared: Arc::clone(&shared),
             config,
             rx,
             segments: recovered.segments,
             opens: [client, clean],
-            stale: opens.collect(),
             incarnation: recovered.incarnation,
             sequence: recovered.sequence,
             cursor: recovered.cursor,
@@ -225,10 +237,11 @@ impl<F: BlockFile + 'static> Volume<F> {
             received: 0,
         };
         // Recovery changed the index relative to the log: it put relocations back to the
-        // copies they moved, or indexed records the log never named. Both decisions live
-        // only in memory until a checkpoint records them; without one, a later replay would
-        // move the relocations again and forget the rolled-forward records.
-        if report.restored > 0 || report.rolled_forward > 0 {
+        // copies they moved, indexed records the log never named, or sealed segments left
+        // open. These decisions live only in memory until a checkpoint records them; without
+        // one, a later replay would move the relocations again, forget the rolled-forward
+        // records and find the segments open.
+        if report.restored > 0 || report.rolled_forward > 0 || sealed > 0 {
             writer.checkpoint()?;
         }
         let superblock = writer.superblock.clone();
@@ -753,8 +766,442 @@ mod tests {
     use super::*;
     use mantle_disk::buf::Alignment;
     use mantle_disk::sim::SimFile;
+    use std::sync::mpsc::Receiver;
+    use std::sync::{Condvar, Mutex};
 
+    use crate::frame::LogRecord;
     use crate::layout::{Limits, Reads};
+
+    /// A simulated file whose flushes wait while its gate is shut, so a test can queue
+    /// requests behind a batch the writer is flushing, and know when it is.
+    struct Gated {
+        file: Arc<SimFile>,
+        state: Mutex<(bool, u64)>,
+        changed: Condvar,
+    }
+
+    impl Gated {
+        fn new(file: Arc<SimFile>) -> Arc<Self> {
+            Arc::new(Self {
+                file,
+                state: Mutex::new((false, 0)),
+                changed: Condvar::new(),
+            })
+        }
+
+        fn shut(&self, shut: bool) {
+            self.state.lock().unwrap().0 = shut;
+            self.changed.notify_all();
+        }
+
+        /// Waits until a flush has begun since `seen` flushes, and returns the new count.
+        fn flushing_after(&self, seen: u64) -> u64 {
+            let mut state = self.state.lock().unwrap();
+            while state.1 <= seen {
+                state = self.changed.wait(state).unwrap();
+            }
+            state.1
+        }
+
+        fn flushes(&self) -> u64 {
+            self.state.lock().unwrap().1
+        }
+    }
+
+    impl BlockFile for Gated {
+        fn alignment(&self) -> Alignment {
+            self.file.alignment()
+        }
+        fn len(&self) -> Result<u64, DiskError> {
+            self.file.len()
+        }
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), DiskError> {
+            self.file.read_exact_at(buf, offset)
+        }
+        fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError> {
+            self.file.write_all_at(buf, offset)
+        }
+        fn sync_data(&self) -> Result<(), DiskError> {
+            let mut state = self.state.lock().unwrap();
+            state.1 += 1;
+            self.changed.notify_all();
+            while state.0 {
+                state = self.changed.wait(state).unwrap();
+            }
+            drop(state);
+            self.file.sync_data()
+        }
+    }
+
+    /// Queues a put without waiting for its answer, as `write` does before it waits.
+    fn queue_put<F: BlockFile + 'static>(
+        v: &Volume<F>,
+        key: ChunkKey,
+        data: &[u8],
+    ) -> Receiver<Result<(), ChunkError>> {
+        let len = data.len() as u64;
+        let mut ticket = v.admit(len).unwrap();
+        let payload = Payload::new(data.to_vec(), v.shared.checksum_shift).unwrap();
+        let (reply, answer) = sync_channel(1);
+        v.sender
+            .as_ref()
+            .unwrap()
+            .try_send(Request {
+                op: Op::Write {
+                    key,
+                    offset: 0,
+                    payload,
+                    seal: true,
+                },
+                reply,
+                queued: Some(len),
+            })
+            .map_err(|_| ())
+            .unwrap();
+        ticket.sent = true;
+        answer
+    }
+
+    fn key(n: u64) -> ChunkKey {
+        ChunkKey {
+            block: u128::from(n),
+            epoch: 1,
+            index: 0,
+        }
+    }
+
+    fn batch_config(requests: usize) -> Config {
+        Config {
+            segment_size: 16 << 20,
+            checksum_shift: 12,
+            max_fragments: requests as u64 + 1,
+            compact: true,
+            scrub_period: None,
+            limits: Limits {
+                batch_requests: requests,
+                batch_bytes: 1 << 20,
+                fragments_per_chunk: 1,
+            },
+            prewrite: false,
+            reads: Reads::default(),
+        }
+    }
+
+    fn sim(seed: u64) -> Arc<SimFile> {
+        Arc::new(
+            SimFile::new(
+                Alignment::new(4096).unwrap(),
+                Alignment::new(512).unwrap(),
+                seed,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// Puts `requests` one-byte chunks as one batch, behind a first put that fills its
+    /// segment, so the batch opens the next segment and only its frame says so: roll-forward,
+    /// which rescans the segments the log left open, cannot find records in a segment whose
+    /// opening the log lost. Every put must be acknowledged, and every one must survive a
+    /// reopen.
+    fn one_batch_survives_reopening(file: &Arc<Gated>, config: Config, requests: usize) {
+        let volume = Volume::format(Arc::clone(file), 128 << 20, config).unwrap();
+        file.shut(true);
+        let seen = file.flushes();
+        let whole = crate::writer::max_payload(&volume.shared.geometry, config.checksum_shift);
+        let first = queue_put(&volume, key(0), &vec![7u8; whole as usize]);
+        file.flushing_after(seen);
+        let answers: Vec<_> = (1..=requests as u64)
+            .map(|n| queue_put(&volume, key(n), b"y"))
+            .collect();
+        file.shut(false);
+        first.recv().unwrap().unwrap();
+        for answer in answers {
+            answer.recv().unwrap().unwrap();
+        }
+        volume.close();
+        let (volume, report) = Volume::open(Arc::clone(file), config).unwrap();
+        let kept = (0..=requests as u64)
+            .filter(|&n| volume.stat(&key(n)).unwrap().is_some())
+            .count();
+        assert_eq!(
+            kept,
+            requests + 1,
+            "acknowledged puts lost on reopen; {} frames replayed",
+            report.frames
+        );
+    }
+
+    /// The audit's reproduction of S13: 70,000 one-byte puts in one batch make a 5.3 MB
+    /// frame, which recovery, reading no frame past 4 MiB, took for the log's end: every
+    /// put was acknowledged and all but the first were gone after a reopen. The settings
+    /// are now refused before any I/O.
+    #[test]
+    fn a_batch_whose_frame_recovery_cannot_read_is_refused_before_any_io() {
+        let file = sim(9);
+        let refused = Volume::format(Arc::clone(&file), 128 << 20, batch_config(70_000));
+        assert!(matches!(refused, Err(ChunkError::Config(_))));
+        assert_eq!(file.stats().unwrap().writes, 0);
+    }
+
+    /// Were the accounting that keeps batches within the frame bound wrong, the batch whose
+    /// frame recovery could not read fails, typed, and is never written: nothing it held is
+    /// acknowledged, and what was is kept (audit S13). The volume is started past the
+    /// settings check, as nothing but a fault in it could.
+    #[test]
+    fn a_frame_past_the_bound_fails_its_batch_and_is_never_written() {
+        let (legal, requests) = (17_000usize, 70_000usize);
+        let sim = sim(15);
+        let file = Gated::new(Arc::clone(&sim));
+        Volume::format(Arc::clone(&file), 128 << 20, batch_config(legal))
+            .unwrap()
+            .close();
+        let superblock = read_superblock(&file).unwrap();
+        let geometry = Geometry {
+            block: u64::from(superblock.block),
+            segment_size: superblock.segment_size,
+            segments: superblock.segments,
+            offset_b: superblock.offset_b,
+            log_offset: superblock.log_offset,
+            log_size: superblock.log_size,
+            data_offset: superblock.data_offset,
+        };
+        let unchecked = batch_config(requests);
+        assert!(unchecked.check().is_err());
+        let (volume, _) = Volume::start(
+            Arc::clone(&file),
+            superblock,
+            geometry,
+            unchecked,
+            usize::MAX,
+        )
+        .unwrap();
+        file.shut(true);
+        let seen = file.flushes();
+        let whole = crate::writer::max_payload(&geometry, unchecked.checksum_shift);
+        let first = queue_put(&volume, key(0), &vec![7u8; whole as usize]);
+        file.flushing_after(seen);
+        let answers: Vec<_> = (1..=requests as u64)
+            .map(|n| queue_put(&volume, key(n), b"y"))
+            .collect();
+        file.shut(false);
+        first.recv().unwrap().unwrap();
+        let failed = answers
+            .into_iter()
+            .map(|a| a.recv().unwrap())
+            .filter(|r| matches!(r, Err(ChunkError::Internal(_) | ChunkError::Fenced)))
+            .count();
+        assert_eq!(failed, requests);
+        assert!(volume.is_fenced());
+        volume.close();
+        let (volume, _) = Volume::open(Arc::clone(&file), batch_config(legal)).unwrap();
+        assert_eq!(volume.read(&key(0), 0, 1).unwrap(), [7u8]);
+        assert!(volume.stat(&key(1)).unwrap().is_none());
+    }
+
+    /// The largest batch the settings allow is acknowledged and reopens whole.
+    #[test]
+    fn the_largest_batch_the_settings_allow_reopens_whole() {
+        let largest = (1..=70_000usize)
+            .rev()
+            .find(|&n| batch_config(n).check().is_ok())
+            .unwrap();
+        assert!(batch_config(largest + 1).check().is_err());
+        let file = Gated::new(sim(10));
+        one_batch_survives_reopening(&file, batch_config(largest), largest);
+    }
+
+    /// Every batch frame the writer makes stays within the bound its settings are checked
+    /// against (audit S13), under eight writers whose puts each seal a segment and open the
+    /// next, deletes that leave segments to free, and the cleaner's relocations. The log's
+    /// frames are read back from every block where one can start.
+    #[test]
+    fn batch_frames_stay_within_the_bound_their_settings_are_checked_against() {
+        let requests = 8usize;
+        let config = Config {
+            segment_size: 16 << 10,
+            checksum_shift: 12,
+            max_fragments: 4096,
+            compact: true,
+            scrub_period: None,
+            limits: Limits {
+                batch_requests: requests,
+                batch_bytes: 1 << 20,
+                fragments_per_chunk: 64,
+            },
+            prewrite: false,
+            reads: Reads::default(),
+        };
+        let file = sim(11);
+        let volume = Volume::format(Arc::clone(&file), 48 << 20, config).unwrap();
+        // Two such records never share a segment.
+        let len = crate::writer::max_payload(&volume.shared.geometry, 12) as usize / 2 + 1;
+        std::thread::scope(|s| {
+            for t in 0..8u64 {
+                let v = &volume;
+                s.spawn(move || {
+                    for i in 0..150u64 {
+                        let n = t * 1000 + i;
+                        loop {
+                            match v.put(key(n), &vec![n as u8; len]) {
+                                Err(ChunkError::Busy) => std::thread::yield_now(),
+                                other => break other.unwrap(),
+                            }
+                        }
+                        if i >= 2 {
+                            v.delete(key(n - 2)).unwrap();
+                        }
+                    }
+                });
+            }
+            s.spawn(|| {
+                for _ in 0..40 {
+                    volume.clean(2).unwrap();
+                }
+            });
+        });
+        let geometry = volume.shared.geometry;
+        let id = volume.volume_id();
+        volume.close();
+        let bound = crate::layout::batch_frame_payload(requests, requests).unwrap();
+        let one = crate::layout::batch_frame_payload(1, 0).unwrap();
+        let (mut batches, mut largest) = (0u64, 0u64);
+        let mut pos = 0u64;
+        while pos < geometry.log_size {
+            if let Some((header, records, _)) =
+                crate::log::read_frame(&file, &geometry, id, pos).unwrap()
+                && header.kind == crate::frame::KIND_BATCH
+            {
+                let payload: u64 = records.iter().map(|r| r.encoded_len() as u64).sum();
+                assert!(payload <= bound, "{payload} bytes of records past {bound}");
+                largest = largest.max(payload);
+                batches += 1;
+            }
+            pos += geometry.block;
+        }
+        assert!(batches > 0);
+        // Batches of several requests formed, so the bound was tested past one request's.
+        assert!(largest > one, "{largest} bytes at most");
+    }
+
+    /// A checkpoint whose records fill frames to their bound reopens whole: its first frame
+    /// carries the segments' states and the first fragments, the next the rest (audit S13).
+    #[test]
+    fn a_checkpoint_of_full_frames_reopens_whole() {
+        let fragments = 60_000u64;
+        let config = Config {
+            segment_size: 1 << 20,
+            checksum_shift: 12,
+            max_fragments: fragments + 1,
+            compact: true,
+            scrub_period: None,
+            limits: Limits::default(),
+            prewrite: false,
+            reads: Reads::default(),
+        };
+        let file = sim(12);
+        let volume = Volume::format(Arc::clone(&file), 96 << 20, config).unwrap();
+        let wave = config.limits.queue_requests() as u64;
+        let mut n = 0u64;
+        while n < fragments {
+            let end = (n + wave).min(fragments);
+            let answers: Vec<_> = (n..end).map(|k| queue_put(&volume, key(k), b"z")).collect();
+            for answer in answers {
+                answer.recv().unwrap().unwrap();
+            }
+            n = end;
+        }
+        volume.checkpoint().unwrap();
+        volume.close();
+        let (volume, report) = Volume::open(Arc::clone(&file), config).unwrap();
+        // The beginning, a chunk and the end.
+        assert!(report.frames >= 3, "{report:?}");
+        for k in 0..fragments {
+            assert_eq!(volume.read(&key(k), 0, 1).unwrap(), b"z");
+        }
+    }
+
+    /// Settings the log, sized at format, cannot hold are refused when the volume is
+    /// opened, before anything is written (audit S13).
+    #[test]
+    fn settings_the_log_was_not_sized_for_are_refused_at_open() {
+        let file = sim(13);
+        let volume = Volume::format(Arc::clone(&file), 8 << 20, config()).unwrap();
+        volume.put(key(1), b"kept").unwrap();
+        volume.close();
+        let writes = file.stats().unwrap().writes;
+        let mut larger = config();
+        larger.limits.batch_requests = 16_000;
+        larger.check().unwrap();
+        assert!(matches!(
+            Volume::open(Arc::clone(&file), larger),
+            Err(ChunkError::Config(_))
+        ));
+        assert_eq!(file.stats().unwrap().writes, writes);
+        let (volume, _) = Volume::open(Arc::clone(&file), config()).unwrap();
+        assert_eq!(volume.read(&key(1), 0, 4).unwrap(), b"kept");
+    }
+
+    /// Segments recovery finds open beyond the writer's two streams, which no writer of this
+    /// format leaves, are sealed when the volume starts and recorded by a checkpoint, so no
+    /// batch carries them (audit S13). The log here is given a frame opening two more.
+    #[test]
+    fn open_segments_beyond_the_streams_are_sealed_at_start() {
+        let mut settings = config();
+        settings.scrub_period = None;
+        let file = sim(14);
+        let volume = Volume::format(Arc::clone(&file), 8 << 20, settings).unwrap();
+        volume.put(key(1), b"kept").unwrap();
+        let geometry = volume.shared.geometry;
+        volume.close();
+        let superblock = read_superblock(&file).unwrap();
+        let pool = Pool::new(file.alignment(), 1 << 20, 1 << 20);
+        let recovered = recover::recover(&file, &pool, &superblock, &geometry, &settings).unwrap();
+        let last = geometry.segments - 1;
+        let opened: Vec<LogRecord> = [last, last - 1]
+            .into_iter()
+            .zip(1u64..)
+            .map(|(segment, i)| {
+                LogRecord::Segment(crate::frame::SegmentRecord {
+                    segment,
+                    incarnation: recovered.incarnation + i,
+                    state: SegmentState::Open,
+                    write_pos: geometry.block as u32,
+                })
+            })
+            .collect();
+        let lsn = recovered.cursor.lsn;
+        let frame = crate::frame::encode(
+            crate::frame::KIND_BATCH,
+            lsn,
+            lsn,
+            superblock.volume,
+            &opened,
+            geometry.block_usize(),
+        )
+        .unwrap();
+        crate::log::write_frame(
+            &file,
+            &geometry,
+            recovered.cursor.pos,
+            &frame,
+            file.alignment(),
+        )
+        .unwrap();
+        file.sync_data().unwrap();
+        let open = |v: &Volume<Arc<SimFile>>| {
+            v.segments()
+                .unwrap()
+                .iter()
+                .filter(|(state, ..)| *state == SegmentState::Open)
+                .count()
+        };
+        let (volume, _) = Volume::open(Arc::clone(&file), settings).unwrap();
+        assert_eq!(open(&volume), 2);
+        volume.close();
+        let (volume, _) = Volume::open(Arc::clone(&file), settings).unwrap();
+        assert_eq!(open(&volume), 2);
+        assert_eq!(volume.read(&key(1), 0, 4).unwrap(), b"kept");
+    }
 
     fn config() -> Config {
         Config {

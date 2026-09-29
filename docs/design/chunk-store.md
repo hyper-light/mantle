@@ -204,9 +204,25 @@ log space before the checkpoint is then free. It checkpoints when the log could 
 otherwise hold more: before a batch, if the live log, the batch's frame, a wrap and a
 checkpoint of the index as the batch may leave it would not fit in `L`.
 
+Every frame, of a batch or a checkpoint, is at most `MAX_FRAME_BYTES` (4 MiB), the most
+memory reading or writing one takes, and recovery reads no larger frame: it would take one
+for the log's end and lose what it held and everything after (audit S13). So a batch's
+frame is bounded before any I/O. A request's worst is a record placed with a seal of the
+full segment before it and an open of the next, and one segment the batch frees; at most
+one request in a batch is a relocation, since one cleaning pass runs at a time and waits
+for each relocation it sends, and its moves are placed as puts are. Settings whose largest
+batch frame passes the bound are refused at format and open. A checkpoint packs its
+records, each segment's state and then each fragment, into frames in order, streaming the
+fragments from the index; recovery replays any frame's records alike, so a checkpoint of
+any size reads back whole. The writer refuses to write a frame past the bound, failing
+its batch, so a fault in this accounting loses nothing. Segments recovery finds open
+beyond the writer's two streams are sealed when the volume starts and recorded by a
+checkpoint then.
+
 `L` holds three checkpoints of the full budget `C_max`, one batch frame, and the wraps
 before two checkpoints, the one being written and the one before it, whose skipped tail
-stays live until the next (a wrap skips less than the largest frame). So a checkpoint of
+stays live until the next (a wrap skips less than the largest frame). Settings are checked
+against `L` again when a volume opens, since the log was sized for those given at format. So a checkpoint of
 size `C` follows at least `3·C_max − 2·C` bytes of other frames: checkpoints take at most
 half the log's writes, at the full budget, and far less below it, which is Raft's rule of
 snapshotting at a log size well above the snapshot's [research/11 §9.2: RAFTX §7]; and

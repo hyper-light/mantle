@@ -38,7 +38,7 @@ use crate::frame::{
 use crate::index::{Fragment, Index, Inserted, SegmentInfo};
 use crate::key::ChunkKey;
 use crate::layout::{
-    CHECKPOINT_RECORDS_PER_FRAME, Config, Geometry, batch_frame_bytes, checkpoint_bytes,
+    Config, FRAME_PAYLOAD, Geometry, MAX_FRAME_BYTES, batch_frame_bytes, checkpoint_bytes,
     largest_frame,
 };
 use crate::log::{self, Cursor};
@@ -187,8 +187,6 @@ pub(crate) struct Writer<F: BlockFile> {
     pub segments: Vec<SegmentInfo>,
     /// The open segment of each stream.
     pub opens: [Option<u32>; 2],
-    /// Segments recovery found open beyond one per stream; sealed by the first batch.
-    pub stale: Vec<u32>,
     pub incarnation: u64,
     pub sequence: u64,
     pub cursor: Cursor,
@@ -563,8 +561,9 @@ impl<F: BlockFile> Writer<F> {
                 u64::from(geometry.segments),
                 geometry.block,
             )?;
-            let batch = batch_frame_bytes(self.config.limits.batch_requests, geometry.block)?;
-            let wrap = largest_frame(&self.config, geometry.block)?;
+            let requests = self.config.limits.batch_requests;
+            let batch = batch_frame_bytes(requests, requests, geometry.block)?;
+            let wrap = largest_frame(&self.config, u64::from(geometry.segments), geometry.block)?;
             checkpoint
                 .checked_add(batch)?
                 .checked_add(wrap)?
@@ -581,7 +580,7 @@ impl<F: BlockFile> Writer<F> {
         };
         let block = self.shared.geometry.block;
         let reclaimable = self.segments.iter().any(|s| reclaimable(s, block));
-        if accepted.is_empty() && self.stale.is_empty() && !reclaimable {
+        if accepted.is_empty() && !reclaimable {
             return;
         }
         self.commit(accepted);
@@ -812,8 +811,8 @@ impl<F: BlockFile> Writer<F> {
             }
         }
         // Sealed segments with nothing live are freed in this frame, so this batch may reuse
-        // them; at most one per request keeps the frame within the log's headroom
-        // (layout::batch_frame_bytes).
+        // them; at most one per request keeps the frame within its bound
+        // (layout::batch_frame_payload).
         let block = self.shared.geometry.block;
         let freed: Vec<u32> = self
             .segments
@@ -852,19 +851,6 @@ impl<F: BlockFile> Writer<F> {
                 }));
             }
         }
-        let mut sealed = Vec::new();
-        for &segment in &self.stale {
-            if let Some(&(incarnation, pos)) = before.get(&segment) {
-                let pos = u32::try_from(pos).unwrap_or(u32::MAX);
-                records.push(LogRecord::Segment(SegmentRecord {
-                    segment,
-                    incarnation,
-                    state: SegmentState::Sealed,
-                    write_pos: pos,
-                }));
-                sealed.push((segment, pos));
-            }
-        }
         Layout {
             geometry: self.shared.geometry,
             volume: self.shared.volume,
@@ -873,7 +859,7 @@ impl<F: BlockFile> Writer<F> {
             regions: Vec::new(),
             positions: HashMap::new(),
             opened: Vec::new(),
-            sealed,
+            sealed: Vec::new(),
             freed,
             opens,
             incarnation: self.incarnation,
@@ -993,7 +979,6 @@ impl<F: BlockFile> Writer<F> {
             Ok(()) => {
                 self.incarnation = layout.incarnation;
                 self.sequence = sequence;
-                self.stale.clear();
                 for tx in ok {
                     answer(tx, Ok(()));
                 }
@@ -1133,6 +1118,15 @@ impl<F: BlockFile> Writer<F> {
         let probe = frame::encode(kind, 0, 0, self.shared.volume, records, block)
             .ok_or(ChunkError::Full)?;
         let len = u64::try_from(probe.len()).map_err(|_| ChunkError::Full)?;
+        // Recovery reads no larger frame, and would take this one for the log's end, losing
+        // what it holds and everything after it (audit S13). The settings checked at format
+        // and open keep batches within it and checkpoints pack their records into it, so
+        // reaching this is a fault in that accounting: the batch fails, and nothing is lost.
+        if len > MAX_FRAME_BYTES {
+            return Err(ChunkError::Internal(
+                "an index frame larger than recovery reads",
+            ));
+        }
         let placement = self
             .cursor
             .place(len, geometry.block, geometry.log_size)
@@ -1246,7 +1240,11 @@ impl<F: BlockFile> Writer<F> {
     }
 
     /// Writes the whole index into the log and points the superblock at it, freeing the log
-    /// before it (docs/design/chunk-store.md §5).
+    /// before it (docs/design/chunk-store.md §5). The records, each segment's state and then
+    /// each fragment, are packed into frames of at most `MAX_FRAME_BYTES`, the first a
+    /// checkpoint's beginning, the rest its chunks; recovery replays them as it replays any
+    /// frame, so a checkpoint of any size is read back whole (audit S13). The fragments are
+    /// read from the index as they are written, not gathered first.
     pub(crate) fn checkpoint(&mut self) -> Result<(), ChunkError> {
         let segment_records: Vec<LogRecord> = self
             .segments
@@ -1262,33 +1260,37 @@ impl<F: BlockFile> Writer<F> {
                 }))
             })
             .collect();
-        let puts: Vec<LogRecord> = {
-            let index = self.shared.index.read().map_err(|_| ChunkError::Fenced)?;
-            index
-                .iter()
-                .flat_map(|(key, entry)| {
-                    let last = entry.fragments.len().saturating_sub(1);
-                    entry.fragments.iter().enumerate().map(move |(i, f)| {
-                        let flags = if entry.sealed && i == last {
-                            FLAG_FINAL
-                        } else {
-                            0
-                        };
-                        put_of(*key, f, flags, entry.time_ns)
-                    })
-                })
-                .collect()
-        };
+        // Only this thread changes the index, so holding it to read while the frames are
+        // written keeps no writer waiting.
+        let shared = Arc::clone(&self.shared);
+        let index = shared.index.read().map_err(|_| ChunkError::Fenced)?;
+        let puts = index.iter().flat_map(|(key, entry)| {
+            let last = entry.fragments.len().saturating_sub(1);
+            entry.fragments.iter().enumerate().map(move |(i, f)| {
+                let flags = if entry.sealed && i == last {
+                    FLAG_FINAL
+                } else {
+                    0
+                };
+                put_of(*key, f, flags, entry.time_ns)
+            })
+        });
         // Every frame of the checkpoint shares one flush.
         let group = self.cursor.lsn;
+        let mut begin = None;
+        pack(segment_records.into_iter().chain(puts), |frame| {
+            let kind = if begin.is_none() {
+                KIND_CHECKPOINT_BEGIN
+            } else {
+                KIND_CHECKPOINT_CHUNK
+            };
+            let at = self.append_frame(kind, frame, group)?;
+            begin.get_or_insert(at);
+            Ok(())
+        })?;
+        drop(index);
         let (begin_pos, begin_lsn) =
-            self.append_frame(KIND_CHECKPOINT_BEGIN, &segment_records, group)?;
-        let per_frame = usize::try_from(CHECKPOINT_RECORDS_PER_FRAME)
-            .unwrap_or(1)
-            .max(1);
-        for chunk in puts.chunks(per_frame) {
-            self.append_frame(KIND_CHECKPOINT_CHUNK, chunk, group)?;
-        }
+            begin.ok_or(ChunkError::Internal("a checkpoint without its first frame"))?;
         self.append_frame(KIND_CHECKPOINT_END, &[], group)?;
         self.shared.file.sync_data().map_err(ChunkError::Device)?;
 
@@ -1321,6 +1323,33 @@ pub(crate) fn max_payload(geometry: &Geometry, checksum_shift: u8) -> u64 {
         .saturating_sub(table)
         .saturating_sub(record::RECORD_ALIGN as u64)
         .min(u64::from(u32::MAX))
+}
+
+/// Packs `records`, in order, into frames whose records fill at most `FRAME_PAYLOAD` bytes,
+/// a frame closing only when the next record does not fit, and hands each to `write`. It
+/// writes at least one frame, empty when there are no records.
+fn pack<E>(
+    records: impl Iterator<Item = LogRecord>,
+    mut write: impl FnMut(&[LogRecord]) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut frame: Vec<LogRecord> = Vec::new();
+    let mut bytes = 0u64;
+    let mut written = false;
+    for record in records {
+        let len = record.encoded_len() as u64;
+        if !frame.is_empty() && bytes.saturating_add(len) > FRAME_PAYLOAD {
+            write(&frame)?;
+            written = true;
+            frame.clear();
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(len);
+        frame.push(record);
+    }
+    if !frame.is_empty() || !written {
+        write(&frame)?;
+    }
+    Ok(())
 }
 
 /// What a record says about the fragment it holds, apart from its placement.
@@ -1488,6 +1517,78 @@ fn request_bytes(request: &Request) -> usize {
 mod tests {
     use super::*;
     use crate::layout::Limits;
+
+    /// A checkpoint of any size packs into frames recovery reads (audit S13): 300,000
+    /// segments' states, more than one 4 MiB frame holds, then 60,000 fragments. Every frame
+    /// fits `MAX_FRAME_BYTES` once encoded, a frame closes only when the next record does not
+    /// fit, the records keep their order, the space they take is within what the log was
+    /// sized for, and an empty checkpoint still writes its first frame.
+    #[test]
+    fn a_checkpoint_of_any_size_packs_into_frames_recovery_reads() {
+        let (segments, fragments) = (300_000u32, 60_000u64);
+        let records = (0..segments)
+            .map(|segment| {
+                LogRecord::Segment(SegmentRecord {
+                    segment,
+                    incarnation: 1,
+                    state: SegmentState::Sealed,
+                    write_pos: 4096,
+                })
+            })
+            .chain((0..fragments).map(|n| {
+                LogRecord::Put(PutRecord {
+                    key: ChunkKey {
+                        block: u128::from(n),
+                        epoch: 1,
+                        index: 0,
+                    },
+                    segment: 0,
+                    incarnation: 1,
+                    offset: 4096,
+                    record_len: 4096,
+                    chunk_offset: 0,
+                    payload_len: 1,
+                    payload_crc: 0,
+                    sequence: n,
+                    time_ns: 0,
+                    flags: FLAG_FINAL,
+                })
+            }));
+        let mut frames: Vec<Vec<LogRecord>> = Vec::new();
+        pack(records, |frame| {
+            frames.push(frame.to_vec());
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        let block = 4096usize;
+        let mut space = 0u64;
+        for frame in &frames {
+            let encoded = frame::encode(KIND_CHECKPOINT_CHUNK, 1, 1, 7, frame, block).unwrap();
+            assert!(encoded.len() as u64 <= MAX_FRAME_BYTES);
+            space += encoded.len() as u64;
+        }
+        for pair in frames.windows(2) {
+            let used: u64 = pair[0].iter().map(|r| r.encoded_len() as u64).sum();
+            assert!(used + pair[1][0].encoded_len() as u64 > FRAME_PAYLOAD);
+        }
+        let flat: Vec<LogRecord> = frames.concat();
+        assert_eq!(flat.len(), segments as usize + fragments as usize);
+        assert!(
+            matches!(flat[segments as usize - 1], LogRecord::Segment(s) if s.segment == segments - 1)
+        );
+        assert!(matches!(flat[segments as usize], LogRecord::Put(p) if p.sequence == 0));
+        // The end frame is one block.
+        space += block as u64;
+        assert!(space <= checkpoint_bytes(fragments, u64::from(segments), block as u64).unwrap());
+        let mut empty = 0;
+        pack(std::iter::empty(), |frame| {
+            assert!(frame.is_empty());
+            empty += 1;
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        assert_eq!(empty, 1);
+    }
 
     fn limits() -> Limits {
         Limits {

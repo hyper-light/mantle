@@ -25,29 +25,43 @@ What it does not measure is how losses cluster across blocks. The copyset placem
 
 ## 2. The model
 
-A stripe is a continuous-time Markov chain over how many of its chunks are lost, in the
-manner of Ford et al. (15 §1). Ford's chain counts chunks unavailable for fifteen minutes or
-more; this one counts chunks lost for good, which is durability rather than availability
-(15 §1.1). A stripe loses chunks four ways:
+A stripe is a continuous-time Markov chain over where its surviving chunks are, in the manner
+of Ford et al. (15 §1). Ford's chain counts chunks unavailable for fifteen minutes or more;
+this one counts chunks lost for good, which is durability rather than availability (15 §1.1).
+Its chunks are placed over the failure domains as evenly as they go, and a state is how many
+domains hold each count of them: a chunk lost is lost from its own domain, and the domains
+are alike, so which domain holds what does not matter, only how many hold each count. A
+stripe loses chunks four ways:
 
 - **One at a time,** each chunk at its device's failure rate.
-- **A whole failure domain at a time,** each domain at its own rate, with the stripe's
-  chunks spread over the domains as evenly as they go. A rack holding one chunk is one more
-  way to lose a chunk; a zone holding three of RS(6,3)'s nine takes three at once.
+- **A whole failure domain at a time,** each domain at its own rate, taking the chunks it
+  holds then. A rack holding one chunk is one more way to lose a chunk; a zone holding three
+  of RS(6,3)'s nine takes three at once, and after it the zones still holding chunks are two.
 - **Several across domains at once:** events that destroy each chunk with some probability,
-  so the chunks struck are binomial. Cidon et al.'s power outage is one, after which 1% of
-  the nodes do not come back (04 §A6.1).
-- **Repair, one chunk at a time,** at one rate covering detection and rebuild. This is
-  Ford's serial repair, chosen "to gain more conservative estimates" (15 §1.4).
+  so the chunks struck in each domain are binomial. Cidon et al.'s power outage is one, after
+  which 1% of the nodes do not come back (04 §A6.1).
+- **Repair, one chunk at a time,** at one rate covering detection and rebuild, each chunk
+  rebuilt in a domain holding the fewest of the stripe's chunks, which restores the even
+  placement; a lost domain is replaced and takes chunks again. This is Ford's serial repair,
+  chosen "to gain more conservative estimates" (15 §1.4).
 
-A degraded stripe's remaining chunks count as a placement of their own; Ford does not say
-how else a burst meets chunks already lost (15 §1.3). The stripe is lost once fewer chunks
-remain than it needs.
+The stripe is lost once fewer chunks remain than it needs. With no more chunks than domains,
+every domain holds one chunk or none, and the chain is Ford's over how many are lost. With
+more, the chain once spread a degraded stripe's survivors evenly again, which the audit
+showed wrong for a real placement (audit B09): RS(6,3), three chunks to each of three zones
+lost at λ and nothing repaired, is lost at 5/(6λ) on average, where spreading the six
+survivors gave 2/(3λ). The tests check that case exactly, and check the chain over counts
+against one over labelled domains built by the same rules.
 
 The annual loss probability is 1 − e^(−t/M), for t a year and M the chain's mean time to
-loss. Loss is rare against repair: a stripe returns to whole many times before it is lost,
-so the time to loss is close to exponential. The tests check the law against the exact
-transient, computed by uniformization, to within 0.1%.
+loss, where loss is rare against repair: a stripe returns to whole many times before it is
+lost, and the time to loss is then close to exponential, to within the ratio of an
+excursion's length to M (Keilson; 15 §4.5). The law is taken where that ratio, the spare
+chunks' repair time over M, is within a thousandth, the precision the report keeps. Where it
+is not, as with slow repair or none, the probability is computed exactly by uniformization,
+whose terms are all non-negative (15 §4.4): without repair the time to loss is a sum of
+exponentials, and in the zone case above the law puts the loss within t at 1.2λt against an
+exact 3λ²t² when λt is small.
 
 ## 3. Solving it
 
@@ -106,7 +120,7 @@ These are the results of `mantle durability` with 4% annual failures, one-hour r
 | The same outage, 15 domains, target 10⁻⁹ | RS(9,6) | 6.1×10⁻¹¹ |
 | Three zones, each lost once a century (`--zones 3:0.01`) | R3, one copy a zone | 9.8×10⁻¹² |
 
-In the zone case, RS(6,3) falls to 1.9×10⁻⁶: every zone holds three of its chunks.
+In the zone case, RS(6,3) falls to 1.8×10⁻⁶: every zone holds three of its chunks.
 
 Correlated loss dominates, as Ford found for availability (04 §A5). Inside one cell exposed
 to cluster-wide events, eleven nines a block needs wider parity than the named profiles,

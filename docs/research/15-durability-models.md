@@ -279,6 +279,22 @@ tiny beside the other rates, so elimination cancels.
   whose Taylor series "involves no subtractions", and so avoids 1 − Σ over the transient
   states, which at 1e-11 keeps about five digits.
 
+### 4.5 When the time to loss is exponential (Keilson, *Markov Chain Models: Rarity and Exponentiality*, Springer, 1979)
+
+- A chain that returns often to a recurrent set and reaches a rare set seldom has a first
+  passage time to the rare set that is close to exponential; the approximation's error is of
+  the order of the ratio of the time the chain spends away from the recurrent set on each
+  excursion to the mean passage time. This is the ground for the law 1 − e^(−t/M) in a
+  stripe's chain, where repair returns a degraded stripe to whole (DERIVED for the stripe: an
+  excursion lasts about the spare chunks' repair time).
+- Without that return, as with no repair, it fails: the time to loss is then a sum of
+  exponential phases, whose early distribution is far from the exponential of the same mean.
+  RS(6,3) over three zones lost at λ with nothing repaired is lost after a zone loss at 3λ
+  and then one at 2λ: P(T ≤ t) = 1 − 3e^(−2λt) + 2e^(−3λt) ≈ 3λ²t², where the exponential
+  law with mean 5/(6λ) gives 1.2λt (DERIVED).
+- Where the law does not hold, the transient is computed by uniformization, as §4.4 says:
+  every term non-negative.
+
 ---
 
 ## 5. Field failure rates, and S3's target

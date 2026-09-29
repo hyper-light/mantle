@@ -15,9 +15,11 @@ const KEY: &str = "3fce516009c21727d0f2e4e86ee403bc";
 /// The same step's iv expanded.
 const IV: &str = "5d313eb2671276ee13000b30";
 /// `{server} construct an EncryptedExtensions handshake message`.
-const ENCRYPTED_EXTENSIONS: &str = "080000240022000a00140012001d00170018001901000101010201030104001c0002400100000000";
+const ENCRYPTED_EXTENSIONS: &str =
+    "080000240022000a00140012001d00170018001901000101010201030104001c0002400100000000";
 /// `{server} construct a Certificate handshake message`.
-const CERTIFICATE: &str = "0b0001b9000001b50001b0308201ac30820115a003020102020102300d06092a864886f70d01010b0500300e\
+const CERTIFICATE: &str =
+    "0b0001b9000001b50001b0308201ac30820115a003020102020102300d06092a864886f70d01010b0500300e\
     310c300a06035504031303727361301e170d3136303733303031323335395a170d3236303733303031323335\
     395a300e310c300a0603550403130372736130819f300d06092a864886f70d010101050003818d0030818902\
     818100b4bb498f8279303d980836399b36c6988c0c68de55e1bdb826d3901a2461eafd2de49a91d015abbc9a\
@@ -29,14 +31,16 @@ const CERTIFICATE: &str = "0b0001b9000001b50001b0308201ac30820115a00302010202010
     99be5c3eb7107c3c54e9b9eb2bd5203b1c3b84e0a8b2f759409ba3eac9d91d402dcc0cc8f8961229ac9187b4\
     2b4de10000";
 /// `{server} construct a CertificateVerify handshake message`.
-const CERTIFICATE_VERIFY: &str = "0f000084080400805a747c5d88fa9bd2e55ab085a61015b7211f824cd484145ab3ff52f1fda8477b0b7abc90\
+const CERTIFICATE_VERIFY: &str =
+    "0f000084080400805a747c5d88fa9bd2e55ab085a61015b7211f824cd484145ab3ff52f1fda8477b0b7abc90\
     db78e2d33a5c141a078653fa6bef780c5ea248eeaaa785c4f394cab6d30bbe8d4859ee511f602957b15411ac\
     027671459e46445c9ea58c181e818e95b8c3fb0bf3278409d3be152a3da5043e063dda65cdf5aea20d53dfac\
     d42f74f3";
 /// `{server} construct a Finished handshake message`.
 const FINISHED: &str = "140000209b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454b78f0718";
 /// `{server} send handshake record`: the complete record, header then ciphertext and tag.
-const RECORD: &str = "17030302a2d1ff334a56f5bff6594a07cc87b580233f500f45e489e7f33af35edf7869fcf40aa40aa2b8ea73\
+const RECORD: &str =
+    "17030302a2d1ff334a56f5bff6594a07cc87b580233f500f45e489e7f33af35edf7869fcf40aa40aa2b8ea73\
     f848a7ca07612ef9f945cb960b4068905123ea78b111b429ba9191cd05d2a389280f526134aadc7fc78c4b72\
     9df828b5ecf7b13bd9aefb0e57f271585b8ea9bb355c7c79020716cfb9b1183ef3ab20e37d57a6b9d7477609\
     aee6e122a4cf51427325250c7d0e509289444c9b3a648f1d71035d2ed65b0e3cdd0cbae8bf2d0b227812cbb3\
@@ -63,8 +67,7 @@ const TRAFFIC_IV: [u8; NONCE_LEN] = [
 const UNWRITTEN: u8 = 0xAA;
 
 fn new_key(algorithm: &'static Algorithm) -> Tls13VectoredSealingKey {
-    Tls13VectoredSealingKey::new(algorithm, &KEY_BYTES[..algorithm.key_len()], &TRAFFIC_IV)
-        .unwrap()
+    Tls13VectoredSealingKey::new(algorithm, &KEY_BYTES[..algorithm.key_len()], &TRAFFIC_IV).unwrap()
 }
 
 /// RFC 8446 §5.3's nonce for `sequence`, as a caller of `TlsRecordSealingKey` builds it.
@@ -93,10 +96,15 @@ fn pieces<'a>(data: &'a [u8], cuts: &[usize]) -> Vec<&'a [u8]> {
 
 #[test]
 fn rfc_8448_server_handshake_record() {
-    let messages: Vec<Vec<u8>> = [ENCRYPTED_EXTENSIONS, CERTIFICATE, CERTIFICATE_VERIFY, FINISHED]
-        .iter()
-        .map(|h| from_hex(h).unwrap())
-        .collect();
+    let messages: Vec<Vec<u8>> = [
+        ENCRYPTED_EXTENSIONS,
+        CERTIFICATE,
+        CERTIFICATE_VERIFY,
+        FINISHED,
+    ]
+    .iter()
+    .map(|h| from_hex(h).unwrap())
+    .collect();
     let record = from_hex(RECORD).unwrap();
     let (header, sealed) = record.split_at(5);
     let mut slices: Vec<&[u8]> = messages.iter().map(Vec::as_slice).collect();
@@ -172,7 +180,13 @@ fn records_match_tls_record_sealing_key() {
 
             let mut out = vec![UNWRITTEN; len + algorithm.tag_len()];
             vectored
-                .seal_vectored(sequence, Aad::from(header), pieces(&plaintext, cuts), len, &mut out)
+                .seal_vectored(
+                    sequence,
+                    Aad::from(header),
+                    pieces(&plaintext, cuts),
+                    len,
+                    &mut out,
+                )
                 .unwrap();
             assert_eq!(out, expected, "{algorithm:?} len={len}");
 
@@ -192,10 +206,16 @@ fn sequence_numbers_strictly_increase_and_never_wrap() {
         key.seal_vectored(sequence, Aad::empty(), [&b"x"[..]], 1, &mut out)
     };
     assert!(seal(&mut key, 0).is_ok());
-    assert!(seal(&mut key, 0).is_err(), "a sequence number is sealed once");
+    assert!(
+        seal(&mut key, 0).is_err(),
+        "a sequence number is sealed once"
+    );
     assert!(seal(&mut key, 5).is_ok(), "numbers may skip");
     assert!(seal(&mut key, 3).is_err(), "numbers only increase");
-    assert!(seal(&mut key, 6).is_ok(), "a refused number leaves the key usable");
+    assert!(
+        seal(&mut key, 6).is_ok(),
+        "a refused number leaves the key usable"
+    );
     assert!(seal(&mut key, u64::MAX).is_err(), "the number would wrap");
     assert!(seal(&mut key, u64::MAX - 1).is_ok());
     assert!(seal(&mut key, u64::MAX).is_err());
@@ -216,7 +236,13 @@ fn refusals_before_encrypting_leave_output_and_key_alone() {
         .unwrap();
 
     assert!(key
-        .seal_vectored(1, Aad::empty(), [plaintext.as_slice()], usize::MAX, &mut out)
+        .seal_vectored(
+            1,
+            Aad::empty(),
+            [plaintext.as_slice()],
+            usize::MAX,
+            &mut out
+        )
         .is_err());
     key.seal_vectored(1, Aad::empty(), [plaintext.as_slice()], 100, &mut out)
         .unwrap();
@@ -232,7 +258,10 @@ fn slices_that_do_not_add_up_fail_the_key_without_writing_past_the_record() {
     assert!(key
         .seal_vectored(0, Aad::empty(), too_many, 64, &mut out)
         .is_err());
-    assert!(out[64..].iter().all(|&b| b == UNWRITTEN), "wrote past the plaintext");
+    assert!(
+        out[64..].iter().all(|&b| b == UNWRITTEN),
+        "wrote past the plaintext"
+    );
     assert!(
         key.seal_vectored(1, Aad::empty(), [plaintext.as_slice()], 64, &mut out)
             .is_err(),
@@ -277,8 +306,14 @@ fn appending_keeps_the_prefix_and_exposes_only_sealed_bytes() {
     let mut key = new_key(&AES_128_GCM);
     let mut out = b"prefix".to_vec();
     out.shrink_to_fit();
-    key.seal_vectored_append(0, Aad::empty(), pieces(&plaintext, &[7, 150]), 300, &mut out)
-        .unwrap();
+    key.seal_vectored_append(
+        0,
+        Aad::empty(),
+        pieces(&plaintext, &[7, 150]),
+        300,
+        &mut out,
+    )
+    .unwrap();
     assert_eq!(out.len(), 6 + 300 + 16);
     assert_eq!(&out[..6], b"prefix");
 
@@ -290,8 +325,8 @@ fn appending_keeps_the_prefix_and_exposes_only_sealed_bytes() {
     assert_eq!(out, before);
 
     // The appended record opens.
-    let opening = TlsRecordOpeningKey::new(&AES_128_GCM, TlsProtocolId::TLS13, &KEY_BYTES[..16])
-        .unwrap();
+    let opening =
+        TlsRecordOpeningKey::new(&AES_128_GCM, TlsProtocolId::TLS13, &KEY_BYTES[..16]).unwrap();
     let mut sealed = before[6..].to_vec();
     let opened = opening
         .open_in_place(nonce(0), Aad::empty(), &mut sealed)
@@ -303,6 +338,8 @@ fn appending_keeps_the_prefix_and_exposes_only_sealed_bytes() {
 fn keys_other_than_aes_gcm_with_a_12_byte_iv_are_refused() {
     assert!(Tls13VectoredSealingKey::new(&CHACHA20_POLY1305, &KEY_BYTES, &TRAFFIC_IV).is_err());
     assert!(Tls13VectoredSealingKey::new(&AES_128_GCM, &KEY_BYTES, &TRAFFIC_IV).is_err());
-    assert!(Tls13VectoredSealingKey::new(&AES_128_GCM, &KEY_BYTES[..16], &TRAFFIC_IV[..8]).is_err());
+    assert!(
+        Tls13VectoredSealingKey::new(&AES_128_GCM, &KEY_BYTES[..16], &TRAFFIC_IV[..8]).is_err()
+    );
     assert!(Tls13VectoredSealingKey::new(&AES_256_GCM, &KEY_BYTES, &TRAFFIC_IV).is_ok());
 }

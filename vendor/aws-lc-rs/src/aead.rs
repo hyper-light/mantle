@@ -189,6 +189,8 @@ use core::stringify;
 
 mod aead_ctx;
 mod aes_gcm;
+// mantle: aws-lc-rs#617 (vendor/UPSTREAM.md).
+pub mod cbc_hmac;
 mod chacha;
 pub mod chacha20_poly1305_openssh;
 mod nonce;

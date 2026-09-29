@@ -8,7 +8,8 @@ Research note for mantle's cryptography (`crates/s3/src/crypto.rs`, `vendor/`). 
 - where AWS-LC aborts the process, and where aws-lc-rs panics;
 - what HMAC costs in AWS-LC, and how SigV4 derives its keys;
 - how aws-lc-rs is built for other targets;
-- how TLS 1.3 protects a record, and what sealing one from pieces requires.
+- how TLS 1.3 protects a record, and what sealing one from pieces requires;
+- what JSON Web Encryption's algorithms need from a cryptographic library.
 
 Compiled 2026-09-28 and 2026-09-29 from the vendored AWS-LC and aws-lc-rs sources, the GitHub
 issues and pull requests named below as served those days, the Linux kernel source, Intel's
@@ -238,6 +239,44 @@ CertificateVerify (136) and Finished (36), each traced on its own, under the key
 "{server} derive write traffic keys for handshake data". It gives the complete record, 679
 octets, beginning `17 03 03 02 a2` [RFC8448 §3].
 
+## 10. JSON Web Encryption's algorithms
+
+**The scope asked of aws-lc-rs.** aws/aws-lc-rs#617 asks for JWE generation and validation. An
+aws-lc-rs maintainer's reply: "While support for JOSE's high-level operations may be out of
+scope for our library, I see value in ensuring that our library provides whatever
+cryptographic operations are required for its implementation" [LCRS617].
+
+**The algorithms.** RFC 7518 registers JWE's key-management algorithms (§4.1): RSA1_5,
+RSA-OAEP and RSA-OAEP-256; A128KW, A192KW and A256KW (AES Key Wrap, RFC 3394); dir; ECDH-ES
+and ECDH-ES with each AES Key Wrap; A128GCMKW, A192GCMKW and A256GCMKW; and PBES2 with
+HS256+A128KW, HS384+A192KW and HS512+A256KW. ECDH-ES derives its key with "the Concat KDF, as
+defined in Section 5.8.1 of [NIST.800-56A], where the Digest Method is SHA-256" (§4.6.2). Its
+content-encryption algorithms (§5.1) are A128CBC-HS256, A192CBC-HS384 and A256CBC-HS512, and
+A128GCM, A192GCM and A256GCM [RFC7518].
+
+**AES_CBC_HMAC_SHA2 (§5.2.2.1).** "MAC_KEY consists of the initial MAC_KEY_LEN octets of K, in
+order. ENC_KEY consists of the final ENC_KEY_LEN octets of K, in order." "The IV used is a
+128-bit value generated randomly or pseudorandomly." "The plaintext is CBC encrypted using
+PKCS #7 padding using ENC_KEY as the key and the IV." "The octet string AL is equal to the
+number of bits in the Additional Authenticated Data A expressed as a 64-bit unsigned big-endian
+integer." The tag is HMAC over "the Additional Authenticated Data A, the Initialization Vector
+IV, the ciphertext E ..., and the octet string AL", keyed with MAC_KEY, of which "the first
+T_LEN octets of M are used as T." Decryption (§5.2.2.2) checks the HMAC first: "If those
+values are identical, then A and E are considered valid, and processing is continued.
+Otherwise, all of the data used in the MAC validation are discarded, and the authenticated
+decryption operation returns an indication that it failed." Appendix B gives test cases for
+all three [RFC7518].
+
+**AES Key Wrap with a 192-bit key.** RFC 3394 §4.2 and §4.4 give 192-bit-KEK test vectors
+[RFC3394]; RFC 5649 §6 gives two padded key-wrap examples under a 192-bit KEK [RFC5649].
+aws-lc-rs wraps with AWS-LC's `AES_wrap_key` under a key set by `AES_set_encrypt_key` with
+the KEK's length in bits, and offers AES_128 and AES_256 KEKs [LCRS].
+
+**A worked example.** RFC 7516 Appendix A.3 encrypts "Live long and prosper." with A128KW and
+A128CBC-HS256 and gives every intermediate value and the compact serialization. "Since both the
+AES Key Wrap and AES GCM computations are deterministic, the resulting JWE value will be the
+same for all encryptions performed using these inputs" [RFC7516 §A.3.8].
+
 ## Sources
 
 - [ENT] AWS-LC `crypto/fipsmodule/rand/entropy/entropy_sources.c`, commit 02561621ffa4cf17c0c4f70bc11a82df36b42ae9, as vendored in `vendor/aws-lc-sys/aws-lc/`.
@@ -273,6 +312,11 @@ octets, beginning `17 03 03 02 a2` [RFC8448 §3].
 - [RFC4231] M. Nystrom, "Identifiers and Test Vectors for HMAC-SHA-224, HMAC-SHA-256, HMAC-SHA-384, and HMAC-SHA-512", RFC 4231, December 2005.
 - [E-AES] AWS-LC `crypto/fipsmodule/cipher/e_aes.c`, `aead_aes_gcm_tls13_seal_scatter`.
 - [GCM-C] AWS-LC `crypto/fipsmodule/modes/gcm.c`, `CRYPTO_gcm128_encrypt_ctr32`.
+- [LCRS617] aws/aws-lc-rs#617, "Support JWE generation and validation", https://github.com/aws/aws-lc-rs/issues/617, with the reply of 2024-11-26.
+- [RFC3394] J. Schaad, R. Housley, "Advanced Encryption Standard (AES) Key Wrap Algorithm", RFC 3394, September 2002, §4.2, §4.4.
+- [RFC5649] R. Housley, M. Dworkin, "Advanced Encryption Standard (AES) Key Wrap with Padding Algorithm", RFC 5649, September 2009, §6.
+- [RFC7516] M. Jones, J. Hildebrand, "JSON Web Encryption (JWE)", RFC 7516, May 2015, Appendix A.3.
+- [RFC7518] M. Jones, "JSON Web Algorithms (JWA)", RFC 7518, May 2015, §4.1, §4.6.2, §5.1, §5.2, Appendix B.
 - [LCRS1241] aws/aws-lc-rs#1241, "Support TLS 1.3 AES-GCM sealing from multiple borrowed input slices", https://github.com/aws/aws-lc-rs/issues/1241.
 - [RFC8446] E. Rescorla, "The Transport Layer Security (TLS) Protocol Version 1.3", RFC 8446, August 2018, §5.2, §5.3, §5.5.
 - [RFC8448] M. Thomson, "Example Handshake Traces for TLS 1.3", RFC 8448, January 2019, §3.

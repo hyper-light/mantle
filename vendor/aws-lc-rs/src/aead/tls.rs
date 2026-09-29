@@ -342,8 +342,7 @@ mod vectored {
     use super::super::{Aad, Algorithm, AlgorithmID, NONCE_LEN};
     use crate::aws_lc::{
         EVP_CIPHER_CTX_ctrl, EVP_CIPHER_CTX_new, EVP_EncryptFinal_ex, EVP_EncryptInit_ex,
-        EVP_EncryptUpdate, EVP_aes_128_gcm, EVP_aes_256_gcm, EVP_CIPHER_CTX,
-        EVP_CTRL_GCM_GET_TAG,
+        EVP_EncryptUpdate, EVP_aes_128_gcm, EVP_aes_256_gcm, EVP_CIPHER_CTX, EVP_CTRL_GCM_GET_TAG,
     };
     use crate::error::Unspecified;
     use crate::ptr::LcPtr;
@@ -540,7 +539,10 @@ mod vectored {
             // RFC 8446 §5.3: the sequence number, big-endian and left-padded to the IV's
             // length, XORed with the IV.
             let mut nonce = self.iv;
-            for (n, s) in nonce[NONCE_LEN - 8..].iter_mut().zip(sequence.to_be_bytes()) {
+            for (n, s) in nonce[NONCE_LEN - 8..]
+                .iter_mut()
+                .zip(sequence.to_be_bytes())
+            {
                 *n ^= s;
             }
             // With no cipher and no key, AWS-LC keeps both and starts a new message under

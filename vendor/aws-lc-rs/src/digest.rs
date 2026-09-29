@@ -43,9 +43,9 @@ use core::ffi::c_uint;
 use core::mem::MaybeUninit;
 use digest_ctx::DigestContext;
 pub use sha::{
-    MD5_FOR_LEGACY_USE_ONLY, MD5_OUTPUT_LEN, SHA1_FOR_LEGACY_USE_ONLY, SHA1_OUTPUT_LEN, SHA224, SHA224_OUTPUT_LEN, SHA256,
-    SHA256_OUTPUT_LEN, SHA384, SHA384_OUTPUT_LEN, SHA3_256, SHA3_384, SHA3_512, SHA512, SHA512_256,
-    SHA512_256_OUTPUT_LEN, SHA512_OUTPUT_LEN,
+    MD5_FOR_LEGACY_USE_ONLY, MD5_OUTPUT_LEN, SHA1_FOR_LEGACY_USE_ONLY, SHA1_OUTPUT_LEN, SHA224,
+    SHA224_OUTPUT_LEN, SHA256, SHA256_OUTPUT_LEN, SHA384, SHA384_OUTPUT_LEN, SHA3_256, SHA3_384,
+    SHA3_512, SHA512, SHA512_256, SHA512_256_OUTPUT_LEN, SHA512_OUTPUT_LEN,
 };
 
 /// A context for multi-step (Init-Update-Finish) digest calculations.
@@ -450,7 +450,10 @@ mod tests {
             (b"a", "0cc175b9c0f1b6a831c399e269772661"),
             (b"abc", "900150983cd24fb0d6963f7d28e17f72"),
             (b"message digest", "f96b697d7cb7938d525a2f31aaf161d0"),
-            (b"abcdefghijklmnopqrstuvwxyz", "c3fcd3d76192e4007dfb496cca67e13b"),
+            (
+                b"abcdefghijklmnopqrstuvwxyz",
+                "c3fcd3d76192e4007dfb496cca67e13b",
+            ),
             (
                 b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
                 "d174ab98d277d9f5a5611c2c9f419d9f",

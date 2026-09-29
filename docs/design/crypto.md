@@ -110,7 +110,8 @@ vendor/UPSTREAM.md, which also records checksums, upstream commits, and how to u
 brief: jitter entropy off by default; a system AWS-LC used only on request; the RNDR retry
 backported, with the operating-system fallback; the fallible digest entry points and the
 one-shot HMAC; MD5; `Clone` for `LessSafeKey` (aws/aws-lc-rs#1165); sealing a TLS 1.3
-record from several slices (§8); and upstream's test data, so both crates' suites run. `cargo test --manifest-path vendor/Cargo.toml --workspace
+record from several slices (§8); JWE's missing primitives (§9); and upstream's test data, so
+both crates' suites run. `cargo test --manifest-path vendor/Cargo.toml --workspace
 --locked` is a gate, run on every CI target.
 
 x86_64 Windows builds AWS-LC's NASM sources rather than linking the prebuilt objects the
@@ -150,7 +151,13 @@ Below about 1 KiB, gathering is as fast or faster
 (docs/measurements/2026-09-29-tls13-vectored-seal.md). It is for the transport's bulk records;
 the transport does not exist yet.
 
-## 9. Open
+## 9. JSON Web Encryption's primitives
 
-- aws/aws-lc-rs#617: JWE generation and validation, pending a use in mantle that settles its
-  scope.
+aws/aws-lc-rs#617 asks for JWE. Its maintainers scope the library's part as the cryptographic
+operations JWE needs, not JOSE's headers and serializations (14 §10). Two were missing from
+aws-lc-rs, and the vendored copy adds both. `aead::cbc_hmac` is RFC 7518 §5.2's AES-CBC with
+HMAC-SHA-2, which opens nothing until its tag checks in constant time. `key_wrap::AES_192` is
+a 192-bit key-encryption key. With what aws-lc-rs already had, every JWE algorithm RFC 7518
+registers can be built on the vendored copy. Its tests reproduce RFC 7518 Appendix B, RFC 3394
+and RFC 5649's 192-bit vectors, and RFC 7516 A.3's JWE from its compact serialization. mantle
+itself has no use for JOSE, so it carries no JOSE layer.

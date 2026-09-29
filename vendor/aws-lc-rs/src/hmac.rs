@@ -96,8 +96,8 @@
 //! [RFC 2104]: https://tools.ietf.org/html/rfc2104
 
 use crate::aws_lc::{
-    HMAC_CTX_cleanup, HMAC_CTX_copy_ex, HMAC_CTX_init, HMAC_Final, HMAC_Init_ex, HMAC_Update,
-    HMAC, HMAC_CTX,
+    HMAC_CTX_cleanup, HMAC_CTX_copy_ex, HMAC_CTX_init, HMAC_Final, HMAC_Init_ex, HMAC_Update, HMAC,
+    HMAC_CTX,
 };
 use crate::error::Unspecified;
 use crate::fips::indicator_check;
@@ -298,7 +298,8 @@ impl Key {
         Key::try_new(algorithm, key_value).expect("Unable to create HmacContext")
     }
 
-    fn try_new(algorithm: Algorithm, key_value: &[u8]) -> Result<Self, Unspecified> {
+    // mantle: crate-visible for `aead::cbc_hmac` (vendor/UPSTREAM.md).
+    pub(crate) fn try_new(algorithm: Algorithm, key_value: &[u8]) -> Result<Self, Unspecified> {
         unsafe {
             let mut ctx = MaybeUninit::<HMAC_CTX>::uninit();
             HMAC_CTX_init(ctx.as_mut_ptr());
@@ -322,6 +323,14 @@ impl Key {
 
     unsafe fn get_hmac_ctx_ptr(&mut self) -> *mut HMAC_CTX {
         self.ctx.as_mut_ptr()
+    }
+
+    // mantle: a copy that reports failure, for `Context::try_with_key` (vendor/UPSTREAM.md).
+    fn try_clone(&self) -> Result<Self, Unspecified> {
+        Ok(Self {
+            algorithm: self.algorithm,
+            ctx: self.ctx.try_clone()?,
+        })
     }
 
     /// The digest algorithm for the key.
@@ -391,8 +400,16 @@ impl Context {
         Self::try_update(self, data).expect("HMAC_Update failed");
     }
 
+    /// `with_key`, reporting a failure to copy the key instead of panicking.
+    // mantle: crate-visible for `aead::cbc_hmac` (vendor/UPSTREAM.md).
+    pub(crate) fn try_with_key(signing_key: &Key) -> Result<Self, Unspecified> {
+        Ok(Self {
+            key: signing_key.try_clone()?,
+        })
+    }
+
     #[inline]
-    fn try_update(&mut self, data: &[u8]) -> Result<(), Unspecified> {
+    pub(crate) fn try_update(&mut self, data: &[u8]) -> Result<(), Unspecified> {
         unsafe {
             if 1 != HMAC_Update(self.key.get_hmac_ctx_ptr(), data.as_ptr(), data.len()) {
                 return Err(Unspecified);
@@ -425,7 +442,7 @@ impl Context {
         Self::try_sign(self).expect("HMAC_Final failed")
     }
     #[inline]
-    fn try_sign(mut self) -> Result<Tag, Unspecified> {
+    pub(crate) fn try_sign(mut self) -> Result<Tag, Unspecified> {
         let mut output = [0u8; digest::MAX_OUTPUT_LEN];
         let msg_len = {
             let result = internal_sign(&mut self, &mut output)?;

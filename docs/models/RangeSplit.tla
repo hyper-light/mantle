@@ -14,23 +14,30 @@
 (* by a descriptor it no longer matches, a range answers with its own      *)
 (* descriptor and those of the children it made, and never with data.      *)
 (*                                                                         *)
-(* A delete attempt closes the gate of every range it knows, reads each    *)
-(* for versions, and deletes the bucket if none holds one, or reopens the  *)
-(* gates and restores it.  Each of its steps names the descriptor it read, *)
-(* and a range refuses a step whose generation it no longer has; the       *)
-(* attempt then learns the range's answer and closes and reads again.  A   *)
-(* gate refuses a step older than the attempt that last moved it, so a     *)
-(* later attempt that takes over stops an earlier one.                     *)
+(* A create attempt opens the gate of every range it knows, then           *)
+(* activates the bucket.  A delete attempt closes the gate of every range  *)
+(* it knows, reads each for versions, and deletes the bucket if none holds *)
+(* one, or reopens the gates and restores it.  Each step of an attempt     *)
+(* names the descriptor it read, and a range refuses a step whose          *)
+(* generation it no longer has; the attempt then learns the range's        *)
+(* answer and starts its phase again.  A gate refuses a step older than    *)
+(* the attempt that last moved it, so a later attempt that takes over      *)
+(* stops an earlier one.                                                   *)
 (*                                                                         *)
 (* FENCED FALSE drops the generation check, the rule this model exists to  *)
-(* justify: RangeSplitUnfenced.cfg must find a write lost to a delete.     *)
+(* justify.  RangeSplitUnfenced.cfg must then find a write lost to a       *)
+(* delete, and RangeSplitUnfencedCreate.cfg an active bucket with a range  *)
+(* whose gate never opened.                                                *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS Keys,      \* the bucket's keys, as numbers in their order
           MaxSplits, \* splits the model takes
-          Attempts,  \* delete attempts, as numbers in the order they begin
+          Creates,   \* create attempts, and
+          Deletes,   \* delete attempts, as numbers in the order they begin
           FENCED     \* whether ranges refuse steps of an older generation
+
+Attempts == Creates \cup Deletes
 
 Bottom == CHOOSE k \in Keys : \A j \in Keys : k <= j
 End == (CHOOSE k \in Keys : \A j \in Keys : j <= k) + 1
@@ -39,7 +46,7 @@ Ids == 1..(MaxSplits + 1)
 VARIABLES ranges,    \* id -> the range, or one not yet made
           directory, \* the descriptors the directory holds
           cache,     \* the writer's descriptors
-          bucket,    \* "active", "deleting" or "deleted"
+          bucket,    \* "none", "creating", "active", "deleting" or "deleted"
           owner,     \* the attempt that last moved the bucket's row
           coord,     \* each attempt: where it is, and what it knows
           acked,     \* keys whose last acknowledged write made a version
@@ -65,11 +72,11 @@ Idle == [phase |-> "idle", known |-> {}, done |-> {}]
 Init ==
     /\ ranges = [i \in Ids |->
          IF i = 1 THEN [lo |-> Bottom, hi |-> End, gen |-> 1, keys |-> {},
-                        gate |-> "open", gatt |-> 0, live |-> TRUE, kids |-> {}]
+                        gate |-> "none", gatt |-> 0, live |-> TRUE, kids |-> {}]
                   ELSE Unmade]
     /\ directory = {Desc(1)}
     /\ cache = directory
-    /\ bucket = "active"
+    /\ bucket = "none"
     /\ owner = 0
     /\ coord = [a \in Attempts |-> Idle]
     /\ acked = {}
@@ -122,22 +129,34 @@ Publish ==
     /\ UNCHANGED <<ranges, cache, bucket, owner, coord, acked, splits>>
 
 (***************************************************************************)
-(* A delete attempt.  `known` is the descriptors it works through, `done`  *)
+(* Attempts.  `known` is the descriptors an attempt works through, `done`  *)
 (* the ids it has handled in its current phase.                            *)
 (***************************************************************************)
 
-Begin(a) ==
+BeginCreate(a) ==
+    /\ a \in Creates
     /\ coord[a].phase = "idle"
-    /\ bucket # "deleted"
+    /\ bucket = "none"
+    /\ a > owner
+    /\ bucket' = "creating"
+    /\ owner' = a
+    /\ coord' = [coord EXCEPT ![a] = [phase |-> "open", known |-> directory, done |-> {}]]
+    /\ UNCHANGED <<ranges, directory, cache, acked, splits>>
+
+Begin(a) ==
+    /\ a \in Deletes
+    /\ coord[a].phase = "idle"
+    /\ bucket \in {"active", "deleting"}
     /\ a > owner
     /\ bucket' = "deleting"
     /\ owner' = a
     /\ coord' = [coord EXCEPT ![a] = [phase |-> "close", known |-> directory, done |-> {}]]
     /\ UNCHANGED <<ranges, directory, cache, acked, splits>>
 
-\* The attempt learns a range's answer, and closes and reads again.
+\* The attempt learns a range's answer, and starts its phase again: a create opens
+\* again, a delete closes and reads again.
 Relearn(a, d) ==
-    coord' = [coord EXCEPT ![a] = [phase |-> "close",
+    coord' = [coord EXCEPT ![a] = [phase |-> IF a \in Creates THEN "open" ELSE "close",
                                    known |-> (@.known \ {d}) \cup Answer(d),
                                    done |-> {}]]
 
@@ -151,6 +170,24 @@ Move(a, d, from, to) ==
                   /\ UNCHANGED ranges
       ELSE /\ Relearn(a, d)
            /\ UNCHANGED ranges
+
+Open(a) ==
+    /\ coord[a].phase = "open"
+    /\ \E d \in coord[a].known :
+         /\ d.id \notin coord[a].done
+         /\ Move(a, d, {"none", "open"}, "open")
+    /\ UNCHANGED <<directory, cache, bucket, owner, acked, splits>>
+
+\* Every range it knows open, and they cover the bucket: it is active.
+Activate(a) ==
+    /\ coord[a].phase = "open"
+    /\ \A d \in coord[a].known : d.id \in coord[a].done
+    /\ Covers(coord[a].known)
+    /\ IF owner = a /\ bucket = "creating"
+         THEN bucket' = "active"
+         ELSE UNCHANGED bucket
+    /\ coord' = [coord EXCEPT ![a].phase = "finished"]
+    /\ UNCHANGED <<ranges, directory, cache, owner, acked, splits>>
 
 Close(a) ==
     /\ coord[a].phase = "close"
@@ -169,7 +206,7 @@ Closed(a) ==
 
 \* What it knows no longer covers the bucket: it starts over from the directory.
 Lost(a) ==
-    /\ coord[a].phase \in {"close", "probe", "reopen"}
+    /\ coord[a].phase \in {"open", "close", "probe", "reopen"}
     /\ ~Covers(coord[a].known)
     /\ coord' = [coord EXCEPT ![a].known = directory, ![a].done = {}]
     /\ UNCHANGED <<ranges, directory, cache, bucket, owner, acked, splits>>
@@ -219,6 +256,7 @@ Next ==
     \/ \E i \in Ids, m \in Keys : Split(i, m)
     \/ Publish
     \/ \E a \in Attempts :
+         \/ BeginCreate(a) \/ Open(a) \/ Activate(a)
          \/ Begin(a) \/ Close(a) \/ Closed(a) \/ Lost(a) \/ Probe(a)
          \/ Finish(a) \/ Reopen(a) \/ Restore(a)
 
@@ -240,5 +278,8 @@ Held ==
 
 \* No acknowledged write is lost to a delete.
 NoLostWrite == bucket = "deleted" => acked = {}
+
+\* An active bucket takes writes to every key: every range's gate is open.
+ActiveOpen == bucket = "active" => \A i \in Live : ranges[i].gate = "open"
 
 =============================================================================

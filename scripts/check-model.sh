@@ -5,7 +5,8 @@
 #
 #   scripts/check-model.sh             every model as mantle builds it
 #   scripts/check-model.sh unfenced    splits without generation checks: the check passes
-#                                      when the checker finds the write it loses
+#                                      when the checker finds the lost write and the gate
+#                                      a create never opened
 set -euo pipefail
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 tools="${TLA_TOOLS:-$root/target/tla}"
@@ -43,16 +44,18 @@ tlc() { # MODEL CONFIG
 case "${1:-}" in
   "") tlc RangeSplit RangeSplit.cfg ;;
   unfenced)
-    status=0
-    tlc RangeSplit RangeSplitUnfenced.cfg || status=$?
-    # 12: an invariant was violated.
-    if [ "$status" -eq 12 ] && grep -q "Invariant NoLostWrite is violated" \
-        "$tools/run-RangeSplitUnfenced/out.log"; then
-      echo "the checker finds the write lost without generation checks"
-      exit 0
-    fi
-    echo "the checker did not find the lost write (exit $status)" >&2
-    exit 1
+    # 12: an invariant was violated. Each control must fail on the invariant it is for.
+    for control in "RangeSplitUnfenced NoLostWrite" "RangeSplitUnfencedCreate ActiveOpen"; do
+      set -- $control
+      status=0
+      tlc RangeSplit "$1.cfg" || status=$?
+      if [ "$status" -eq 12 ] && grep -q "Invariant $2 is violated" "$tools/run-$1/out.log"; then
+        echo "$1: the checker finds $2 broken without generation checks"
+      else
+        echo "$1: the checker did not find $2 broken (exit $status)" >&2
+        exit 1
+      fi
+    done
     ;;
   *) echo "unknown model: $1" >&2; exit 2 ;;
 esac

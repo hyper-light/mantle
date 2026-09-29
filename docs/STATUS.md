@@ -98,17 +98,23 @@ in RFC 9110's order, byte ranges, and paging of keys, versions and multipart upl
 tested against the s3-tests cases for it. A page passes at most 1,000 keys that list nothing
 and resumes past them without dropping a common prefix, over the Name layer's scans. An XML reader for request bodies that refuses entity declarations and does
 work linear in the body, checked against roxmltree on generated and mutated documents, with
-the CompleteMultipartUpload, DeleteObjects, CreateBucket and PutBucketVersioning documents
-read against their schemas under size limits computed from S3's own. The documents every
-response carries, from listings and multipart results to batch deletes, errors and bucket
-settings, each holding what AWS's sample response holds for the same content when both are
-read by roxmltree. Its SHA-1, SHA-256, SHA-512, MD5 and HMAC-SHA256 come from AWS-LC, every
+the CompleteMultipartUpload, DeleteObjects, CreateBucket, PutBucketVersioning, Tagging,
+AccessControlPolicy and OwnershipControls documents read against their schemas under size
+limits computed from S3's own. Tags held to S3's limits and characters in documents and in
+the `x-amz-tagging` header. ACLs disabled on every bucket, as S3's default Object Ownership
+has them since 2023: canned, header and document ACLs read, and only the bucket owner's full
+control accepted, as s3-tests expects. A subresource routes to its own operation or to 405,
+never to the bucket or object itself. The documents every response carries, from listings
+and multipart results to batch deletes, errors, bucket settings, tags and ACLs, each holding
+what AWS's sample response holds for the same content when both are read by roxmltree. Its SHA-1, SHA-256, SHA-512, MD5 and HMAC-SHA256 come from AWS-LC, every
 call fallible and behind an unwind boundary. `mantle bench hash` measures each checksum
 algorithm, signature verification and signed-chunk decoding on one core.
 
 Remaining before it is done:
 
-- Tagging and ACL documents.
+- The rest of 05 §16.1's later surface: bucket policies, the access S3 grants beyond the
+  owner once ACLs are disabled; CORS; lifecycle; server-side encryption headers; Object
+  Lock; and browser POST uploads.
 
 **Metadata service** (`mantle-meta`, [design](design/metadata.md)). Row keys whose byte
 order is the order the design needs, checked by property tests against the components they
@@ -171,7 +177,8 @@ Remaining before it is done:
 1. **S3 gateway.** Request signing (including presigned URLs and chunked uploads with
    trailing checksums), buckets, PUT, GET with byte ranges, HEAD, DELETE and batch
    delete, copy, ListObjects and ListObjectsV2, multipart uploads including resuming an
-   interrupted upload, versioning, conditional requests and checksums. Done when
+   interrupted upload, versioning, conditional requests, checksums, tags, and ACLs as S3's
+   bucket owner enforced default answers them. Done when
    end-to-end suites using the AWS CLI, boto3 and the AWS SDK for Rust pass against a
    running mantle, and ceph's s3-tests pass for every supported feature.
 2. **Multi-machine operation.** Placement across racks and zones, repair ordered by

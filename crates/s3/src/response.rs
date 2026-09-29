@@ -1,5 +1,5 @@
 //! The XML documents S3's responses carry (docs/research/13 §9): listings, multipart results,
-//! copy results, batch deletes, errors and bucket settings.
+//! copy results, batch deletes, errors, bucket settings, tags and ACLs.
 //!
 //! Each document writes its elements in the order of its operation's Response Syntax, and
 //! every result is in S3's namespace; the error document is in none. SDKs read elements by
@@ -12,9 +12,11 @@
 
 use std::borrow::Cow;
 
+use crate::acl::{Ownership, Permission};
 use crate::body::Versioning;
 use crate::checksum::{Algorithm, Checksum, ChecksumType};
 use crate::list::{Page, Request, Start, url_encode};
+use crate::tagging::Tag;
 use crate::time::iso8601;
 use crate::xml::Writer;
 
@@ -571,6 +573,47 @@ pub fn versioning_configuration(status: Option<Versioning>) -> String {
                 },
             );
         }
+    })
+}
+
+/// GetObjectTagging's and GetBucketTagging's `Tagging`, with the tags in the order given,
+/// the key order S3 gives them back in (13 §6.7, §9.6).
+pub fn tagging(tags: &[Tag]) -> String {
+    Writer::document("Tagging", true, |w| {
+        w.element("TagSet", |w| {
+            for tag in tags {
+                w.element("Tag", |w| {
+                    w.text("Key", &tag.key);
+                    w.text("Value", &tag.value);
+                });
+            }
+        });
+    })
+}
+
+/// GetBucketAcl's and GetObjectAcl's `AccessControlPolicy`. mantle's buckets have ACLs
+/// disabled, and S3 answers such a bucket, and every object in it, with its owner's full
+/// control: "Requests to read ACLs always return a response that shows full control for the
+/// bucket owner" (13 §6.8, §9.6).
+pub fn access_control_policy(bucket_owner: &str) -> String {
+    Writer::document("AccessControlPolicy", true, |w| {
+        owner(w, "Owner", bucket_owner);
+        w.element("AccessControlList", |w| {
+            w.element("Grant", |w| {
+                w.typed("Grantee", "CanonicalUser", |w| w.text("ID", bucket_owner));
+                w.text("Permission", Permission::FullControl.name());
+            });
+        });
+    })
+}
+
+/// GetBucketOwnershipControls' `OwnershipControls`: bucket owner enforced, the one setting
+/// mantle's buckets have (13 §6.8).
+pub fn ownership_controls() -> String {
+    Writer::document("OwnershipControls", true, |w| {
+        w.element("Rule", |w| {
+            w.text("ObjectOwnership", Ownership::BucketOwnerEnforced.name())
+        });
     })
 }
 
@@ -1461,6 +1504,122 @@ mod tests {
             r#"<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>"#,
             NS,
         );
+    }
+
+    /// GetObjectTagging's and GetBucketTagging's samples (13 §9.6), and an empty set, which
+    /// an object without tags answers.
+    #[test]
+    fn tagging_holds_what_aws_samples_hold() {
+        let tag = |key: &str, value: &str| Tag {
+            key: key.into(),
+            value: value.into(),
+        };
+        same(
+            &tagging(&[tag("tag1", "val1"), tag("tag2", "val2")]),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+            <Tagging xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+               <TagSet>
+                 <Tag>
+                   <Key>tag1</Key>
+                   <Value>val1</Value>
+                </Tag>
+                <Tag>
+                    <Key>tag2</Key>
+                    <Value>val2</Value>
+                 </Tag>
+              </TagSet>
+            </Tagging> "#,
+            NS,
+        );
+        same(
+            &tagging(&[tag("Project", "Project One"), tag("User", "jsmith")]),
+            "<Tagging>
+           <TagSet>
+              <Tag>
+                <Key>Project</Key>
+               <Value>Project One</Value>
+              </Tag>
+              <Tag>
+                <Key>User</Key>
+                <Value>jsmith</Value>
+              </Tag>
+           </TagSet>
+         </Tagging>",
+            NS,
+        );
+        let empty = tagging(&[]);
+        let tree = roxmltree::Document::parse(&empty).unwrap();
+        let set = tree.root_element().first_element_child().unwrap();
+        assert_eq!(set.tag_name().name(), "TagSet");
+        assert_eq!(set.children().count(), 0);
+        // What the writer writes, the reader reads back.
+        let tags = vec![tag("a&b", "<v>"), tag("k", "")];
+        assert_eq!(
+            crate::body::tagging(tagging(&tags).as_bytes(), crate::tagging::Tagged::Object)
+                .map_err(|e| e.code()),
+            Err(("InvalidTag", 400)),
+            "escaped, so the reader reaches the tag rules, which refuse & and <"
+        );
+        let tags = vec![tag("Cost Center", "a+b"), tag("k", "")];
+        assert_eq!(
+            crate::body::tagging(tagging(&tags).as_bytes(), crate::tagging::Tagged::Object),
+            Ok(tags)
+        );
+    }
+
+    /// GetBucketOwnershipControls' sample for bucket owner enforced (13 §6.8).
+    #[test]
+    fn ownership_controls_holds_what_aws_samples_hold() {
+        same(
+            &ownership_controls(),
+            r#"<OwnershipControls xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+            <Rule>
+              <ObjectOwnership>BucketOwnerEnforced</ObjectOwnership>
+            </Rule>
+          </OwnershipControls>"#,
+            NS,
+        );
+        assert_eq!(
+            crate::body::ownership_controls(ownership_controls().as_bytes()),
+            Ok(Ownership::BucketOwnerEnforced)
+        );
+    }
+
+    /// GetBucketAcl's sample: the owner and one grant of full control to it, the grantee
+    /// typed by `xsi:type` (13 §9.6).
+    #[test]
+    fn access_control_policy_holds_what_aws_samples_hold() {
+        let owner = "75aa57f09aa0c8caeab4f8c24e99d10f8e7faeebf76c078efc7c6caea54ba06a";
+        let doc = access_control_policy(owner);
+        same(
+            &doc,
+            r#"<AccessControlPolicy>
+  <Owner>
+    <ID>75aa57f09aa0c8caeab4f8c24e99d10f8e7faeebf76c078efc7c6caea54ba06a</ID>
+  </Owner>
+  <AccessControlList>
+    <Grant>
+      <Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+			xsi:type="CanonicalUser">
+        <ID>75aa57f09aa0c8caeab4f8c24e99d10f8e7faeebf76c078efc7c6caea54ba06a</ID>
+      </Grantee>
+      <Permission>FULL_CONTROL</Permission>
+    </Grant>
+  </AccessControlList>
+</AccessControlPolicy> "#,
+            NS,
+        );
+        let tree = roxmltree::Document::parse(&doc).unwrap();
+        let grantee = tree
+            .descendants()
+            .find(|n| n.has_tag_name("Grantee"))
+            .unwrap();
+        assert_eq!(
+            grantee.attribute(("http://www.w3.org/2001/XMLSchema-instance", "type")),
+            Some("CanonicalUser")
+        );
+        // The policy mantle answers is the one it takes back.
+        assert_eq!(crate::acl::put_acl(None, doc.as_bytes(), owner), Ok(()));
     }
 
     /// Every element ListObjectsV2 can write, in the Response Syntax's order (13 §9.1).

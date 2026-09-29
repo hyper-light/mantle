@@ -16,6 +16,8 @@ use std::borrow::Cow;
 pub const NAMESPACE: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
 const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
+/// XML Schema's instance namespace, whose `type` attribute names an ACL grantee's kind (13 §6.8).
+const XSI_NAMESPACE: &str = "http://www.w3.org/2001/XMLSchema-instance";
 
 /// Attributes one tag may carry. AWS's samples carry at most two on a tag (`xmlns:xsi` and
 /// `xsi:type` on an ACL grantee, 13 §6.8); the bound holds the duplicate check, quadratic in the
@@ -58,6 +60,10 @@ pub struct Reader<'a> {
     bindings: Vec<Binding<'a>>,
     /// The element last given was an empty-element tag: its content is empty and it is closed.
     closed: bool,
+    /// The element that may carry `xsi:type`, as an ACL's `Grantee` does.
+    typed: Option<&'static str>,
+    /// The local part of the `xsi:type` of the element last given, if it carries one.
+    xsi_type: Option<String>,
 }
 
 struct Binding<'a> {
@@ -84,6 +90,8 @@ impl<'a> Reader<'a> {
             open: Vec::new(),
             bindings: Vec::new(),
             closed: false,
+            typed: None,
+            xsi_type: None,
         };
         reader.declaration()?;
         reader.misc()?;
@@ -99,6 +107,20 @@ impl<'a> Reader<'a> {
             return Err(XmlError::Schema("not the root element this request takes"));
         }
         Ok(reader)
+    }
+
+    /// Admits `xsi:type` on the elements named `element` after the root, as ACL documents
+    /// carry it on a grantee (13 §6.8); every other element refuses it with the rest of the
+    /// attributes S3 does not use.
+    pub fn admit_types(mut self, element: &'static str) -> Self {
+        self.typed = Some(element);
+        self
+    }
+
+    /// The local part of the `xsi:type` the element last given carries, in S3's namespace or
+    /// none, as its elements are.
+    pub fn xsi_type(&self) -> Option<&str> {
+        self.xsi_type.as_deref()
     }
 
     /// The local name of the next child of the element last given, or `None` once that
@@ -333,12 +355,38 @@ impl<'a> Reader<'a> {
             .len()
             .checked_add(1)
             .ok_or(XmlError::Schema("elements nested too deeply"))?;
+        // Declarations first: an attribute's prefix may be declared on its own tag.
+        let mut typed = Vec::new();
         for (name, value) in attributes {
-            self.declare(depth, name, value)?;
+            if name == "xmlns" || name.starts_with("xmlns:") {
+                self.declare(depth, name, value)?;
+            } else {
+                typed.push((name, value));
+            }
+        }
+        self.xsi_type = None;
+        for (name, value) in typed {
+            let (prefix, local) = split_qualified(name)?;
+            // An unprefixed attribute is in no namespace (Namespaces in XML 1.0 §6.2).
+            if self.typed.is_none()
+                || prefix.is_empty()
+                || local != "type"
+                || self.namespace(prefix)? != Some(XSI_NAMESPACE)
+            {
+                return Err(XmlError::Schema("an attribute S3's documents do not carry"));
+            }
+            // Two attributes with one expanded name (Namespaces in XML 1.0 §6.3).
+            if self.xsi_type.is_some() {
+                return Err(XmlError::NotWellFormed("an attribute given twice"));
+            }
+            self.xsi_type = Some(self.type_name(&value)?.to_owned());
         }
         let (prefix, local) = split_qualified(qualified)?;
         if self.namespace(prefix)?.is_some_and(|n| n != NAMESPACE) {
             return Err(XmlError::Schema("an element outside S3's namespace"));
+        }
+        if self.xsi_type.is_some() && self.typed != Some(local) {
+            return Err(XmlError::Schema("an attribute S3's documents do not carry"));
         }
         if empty {
             self.unbind(depth);
@@ -349,8 +397,21 @@ impl<'a> Reader<'a> {
         Ok(local)
     }
 
+    /// The local part of an `xsi:type` value, a QName: collapsed as XML Schema collapses one
+    /// (Part 2 §3.2.18), its prefix resolved like an element's, to S3's namespace or none.
+    fn type_name<'v>(&self, value: &'v str) -> Result<&'v str, XmlError> {
+        let (prefix, local) = split_qualified(value.trim_matches(is_space))?;
+        if !local.starts_with(is_name_start) || !local.chars().all(is_name_char) {
+            return Err(XmlError::Schema("an xsi:type that is not a name"));
+        }
+        if self.namespace(prefix)?.is_some_and(|n| n != NAMESPACE) {
+            return Err(XmlError::Schema("an xsi:type outside S3's namespace"));
+        }
+        Ok(local)
+    }
+
     /// A namespace declaration (Namespaces in XML 1.0 §3 and its constraints). S3's request
-    /// documents carry no other attribute.
+    /// documents carry no other attribute but `xsi:type`.
     fn declare(
         &mut self,
         depth: usize,
@@ -647,6 +708,20 @@ impl Writer {
         self.end(name);
     }
 
+    /// An element of the kind `xsi_type` names, holding what `body` writes, with `xsi`
+    /// declared on it as AWS's samples declare it on an ACL grantee (13 §6.8).
+    pub fn typed(&mut self, name: &str, xsi_type: &str, body: impl FnOnce(&mut Self)) {
+        self.out.push('<');
+        self.out.push_str(name);
+        self.out.push_str(" xmlns:xsi=\"");
+        self.out.push_str(XSI_NAMESPACE);
+        self.out.push_str("\" xsi:type=\"");
+        escape_attribute(&mut self.out, xsi_type);
+        self.out.push_str("\">");
+        body(self);
+        self.end(name);
+    }
+
     /// An element holding `text`.
     pub fn text(&mut self, name: &str, text: &str) {
         self.start(name);
@@ -669,6 +744,24 @@ impl Writer {
         self.out.push_str("</");
         self.out.push_str(name);
         self.out.push('>');
+    }
+}
+
+/// `text` as a double-quoted attribute value: `&`, `<` and `"` escaped as XML 1.0 [10]
+/// requires, and white space as character references, which a reader would otherwise
+/// normalize to spaces (§3.3.3).
+fn escape_attribute(out: &mut String, text: &str) {
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '"' => out.push_str("&quot;"),
+            '\t' => out.push_str("&#x9;"),
+            '\n' => out.push_str("&#xa;"),
+            '\r' => out.push_str("&#xd;"),
+            c if is_char(c) => out.push(c),
+            c => out.push_str(&format!("&#x{:x};", u32::from(c))),
+        }
     }
 }
 
@@ -853,6 +946,94 @@ mod tests {
         }
         let many: String = (0..17).map(|i| format!(" xmlns:p{i}='u'")).collect();
         assert!(read(&format!("<Delete{many}/>"), &shape).is_err());
+    }
+
+    /// `xsi:type` on an ACL grantee (13 §6.8), in the forms Namespaces in XML allows, and only
+    /// where a document admits it.
+    #[test]
+    fn xsi_type_is_read_where_admitted() {
+        let grantee = |attributes: &str| {
+            format!(
+                "<AccessControlPolicy xmlns='http://s3.amazonaws.com/doc/2006-03-01/'>\
+                 <Grantee {attributes}><ID>i</ID></Grantee></AccessControlPolicy>"
+            )
+        };
+        let read_type = |body: &str| -> Result<Option<String>, XmlError> {
+            let mut r = Reader::open(body.as_bytes(), 1 << 12, "AccessControlPolicy")?
+                .admit_types("Grantee");
+            assert_eq!(r.child()?, Some("Grantee"));
+            let kind = r.xsi_type().map(str::to_owned);
+            assert_eq!(r.child()?, Some("ID"));
+            assert_eq!(r.xsi_type(), None, "a child carries its parent's type");
+            r.text()?;
+            assert_eq!(r.child()?, None);
+            assert_eq!(r.child()?, None);
+            r.finish()?;
+            Ok(kind)
+        };
+        let xsi = "xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance'";
+        // AWS's sample form, another prefix, and a value prefixed with S3's namespace.
+        assert_eq!(
+            read_type(&grantee(&format!("{xsi} xsi:type='CanonicalUser'"))),
+            Ok(Some("CanonicalUser".into()))
+        );
+        assert_eq!(
+            read_type(&grantee(
+                "xmlns:i='http://www.w3.org/2001/XMLSchema-instance' i:type=' Group '"
+            )),
+            Ok(Some("Group".into()))
+        );
+        assert_eq!(
+            read_type(&grantee(&format!(
+                "{xsi} xmlns:s3='http://s3.amazonaws.com/doc/2006-03-01/' xsi:type='s3:Group'"
+            ))),
+            Ok(Some("Group".into()))
+        );
+        assert_eq!(read_type(&grantee("")), Ok(None));
+        // Refused: another attribute, an unprefixed `type`, a value in another namespace or
+        // not a name, one type given twice under two prefixes, and an undeclared prefix.
+        for refused in [
+            format!("{xsi} xsi:nil='true'"),
+            "type='CanonicalUser'".to_string(),
+            format!("{xsi} xmlns:o='urn:other' xsi:type='o:CanonicalUser'"),
+            format!("{xsi} xsi:type='Canonical User'"),
+            format!(
+                "{xsi} xmlns:i='http://www.w3.org/2001/XMLSchema-instance' \
+                 xsi:type='Group' i:type='Group'"
+            ),
+            "xsi:type='CanonicalUser'".to_string(),
+        ] {
+            assert!(read_type(&grantee(&refused)).is_err(), "{refused}");
+        }
+        // Nor is a type read on an element other than the one admitted.
+        let on_id = format!(
+            "<AccessControlPolicy><Grantee><ID {xsi} xsi:type='CanonicalUser'>i</ID>\
+             </Grantee></AccessControlPolicy>"
+        );
+        assert!(read_type(&on_id).is_err());
+        // A document that does not admit types refuses one.
+        let body = grantee(&format!("{xsi} xsi:type='CanonicalUser'"));
+        let mut r = Reader::open(body.as_bytes(), 1 << 12, "AccessControlPolicy").unwrap();
+        assert!(r.child().is_err());
+    }
+
+    /// What the writer writes as a typed element, the reader reads back.
+    #[test]
+    fn a_typed_element_reads_back() {
+        let doc = Writer::document("AccessControlPolicy", true, |w| {
+            w.typed("Grantee", "CanonicalUser", |w| w.text("ID", "a\"b"))
+        });
+        assert!(doc.contains(
+            "<Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" \
+             xsi:type=\"CanonicalUser\"><ID>a\"b</ID></Grantee>"
+        ));
+        let mut r = Reader::open(doc.as_bytes(), 1 << 12, "AccessControlPolicy")
+            .unwrap()
+            .admit_types("Grantee");
+        assert_eq!(r.child(), Ok(Some("Grantee")));
+        assert_eq!(r.xsi_type(), Some("CanonicalUser"));
+        assert_eq!(r.child(), Ok(Some("ID")));
+        assert_eq!(r.text().unwrap(), "a\"b");
     }
 
     #[test]

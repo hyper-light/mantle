@@ -6,8 +6,10 @@
 //! serializer uses, and as much white space again. The gateway refuses a longer body before
 //! reading it.
 
+use crate::acl::{Grant, Grantee, MAX_GRANTS, Ownership, Permission, Policy};
 use crate::checksum::Algorithm;
 use crate::route::MAX_KEY;
+use crate::tagging::{self, Tag, TagError, Tagged};
 use crate::xml::{NAMESPACE, Reader, XmlError};
 
 /// A field of arbitrary text at its longest: every byte written as `&quot;`, `&apos;` or
@@ -46,16 +48,22 @@ pub enum BodyError {
     InvalidPartOrder,
     #[error("{0}, which mantle does not implement")]
     NotImplemented(&'static str),
+    #[error(transparent)]
+    Tag(#[from] TagError),
+    #[error("the ACL is not well-formed or does not validate against S3's schema: {0}")]
+    MalformedAcl(XmlError),
 }
 
 impl BodyError {
-    /// The S3 error code and status (05 §4.4, §11.2).
+    /// The S3 error code and status (05 §4.4, §11.2; 13 §6.7, §6.8).
     pub fn code(&self) -> (&'static str, u16) {
         match self {
             Self::Xml(error) => error.code(),
             Self::InvalidPart => ("InvalidPart", 400),
             Self::InvalidPartOrder => ("InvalidPartOrder", 400),
             Self::NotImplemented(_) => ("NotImplemented", 501),
+            Self::Tag(error) => error.code(),
+            Self::MalformedAcl(_) => ("MalformedACLError", 400),
         }
     }
 }
@@ -235,28 +243,267 @@ fn object(reader: &mut Reader<'_>) -> Result<ObjectIdentifier, BodyError> {
 /// octets (RFC 1035 §2.3.4) of letters, digits and hyphens, which need no escape.
 const MAX_REGION: usize = 63;
 
-/// The largest CreateBucketConfiguration body mantle reads: a location constraint.
+/// UTF-8 bytes in one UTF-16 code unit at most: a character in the Basic Multilingual Plane
+/// is one unit and at most three bytes, and one beyond it two units and four bytes
+/// (RFC 3629 §3; RFC 2781 §2.1).
+const UTF8_PER_UTF16: usize = 3;
+
+/// One tag at its longest: a 128-unit key and a 256-unit value (13 §6.7), every unit three
+/// bytes, written escaped.
+const TAG: usize = "<Tag><Key></Key><Value></Value></Tag>".len()
+    + ESCAPED * UTF8_PER_UTF16 * (tagging::MAX_KEY + tagging::MAX_VALUE);
+
+/// CreateBucket's configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CreateBucketConfiguration {
+    /// The location constraint, as sent.
+    pub location: Option<String>,
+    /// The new bucket's tags, checked, in key order.
+    pub tags: Vec<Tag>,
+}
+
+/// The largest CreateBucketConfiguration body mantle reads: a location constraint and a
+/// bucket's 50 tags.
 pub const CREATE_BUCKET_LIMIT: usize = SPACE
     * (PROLOG
         + "<CreateBucketConfiguration></CreateBucketConfiguration>".len()
         + "<LocationConstraint></LocationConstraint>".len()
-        + MAX_REGION);
+        + MAX_REGION
+        + "<Tags></Tags>".len()
+        + Tagged::Bucket.limit() * TAG);
 
-/// CreateBucket's `LocationConstraint`, as sent (13 §6.5). A CreateBucket without a body has
-/// none; this reads a body that is there.
-pub fn create_bucket(body: &[u8]) -> Result<Option<String>, BodyError> {
+/// CreateBucket's configuration (13 §6.5): its `LocationConstraint`, as sent, and the tags
+/// S3 applies to a new general purpose bucket, checked as a bucket's (13 §6.7). A
+/// CreateBucket without a body has neither; this reads a body that is there.
+pub fn create_bucket(body: &[u8]) -> Result<CreateBucketConfiguration, BodyError> {
     let mut reader = Reader::open(body, CREATE_BUCKET_LIMIT, "CreateBucketConfiguration")?;
-    let mut location = None;
+    let (mut location, mut tags) = (None, None);
     while let Some(name) = reader.child()? {
         match name {
             "LocationConstraint" => once(&mut location, reader.text()?.into_owned())?,
+            "Tags" => once(&mut tags, tag_list(&mut reader, Tagged::Bucket)?)?,
             "Location" | "Bucket" => return Err(BodyError::NotImplemented("directory buckets")),
-            "Tags" => return Err(BodyError::NotImplemented("tags on a new bucket")),
             _ => return Err(schema("an element CreateBucketConfiguration does not have")),
         }
     }
     reader.finish()?;
-    Ok(location)
+    Ok(CreateBucketConfiguration {
+        location,
+        tags: tagging::check(tags.unwrap_or_default(), Tagged::Bucket)?,
+    })
+}
+
+/// The root and set of a `Tagging` document.
+const TAGGING: usize = PROLOG + "<Tagging><TagSet></TagSet></Tagging>".len();
+
+/// The largest PutObjectTagging body: an object's 10 tags, each at its longest.
+pub const OBJECT_TAGGING_LIMIT: usize = SPACE * (TAGGING + Tagged::Object.limit() * TAG);
+
+/// The largest PutBucketTagging body: a bucket's 50 tags, each at its longest.
+pub const BUCKET_TAGGING_LIMIT: usize = SPACE * (TAGGING + Tagged::Bucket.limit() * TAG);
+
+/// PutObjectTagging's or PutBucketTagging's tags, checked, in key order (13 §6.7). The set
+/// may be empty: "If you send this request with an empty tag set, Amazon S3 deletes the
+/// existing tag set on the object."
+pub fn tagging(body: &[u8], tagged: Tagged) -> Result<Vec<Tag>, BodyError> {
+    let limit = match tagged {
+        Tagged::Object => OBJECT_TAGGING_LIMIT,
+        Tagged::Bucket => BUCKET_TAGGING_LIMIT,
+    };
+    let mut reader = Reader::open(body, limit, "Tagging")?;
+    let mut set = None;
+    while let Some(name) = reader.child()? {
+        match name {
+            "TagSet" => once(&mut set, tag_list(&mut reader, tagged)?)?,
+            _ => return Err(schema("an element Tagging does not have")),
+        }
+    }
+    reader.finish()?;
+    let tags = set.ok_or(schema("a Tagging without a TagSet"))?;
+    Ok(tagging::check(tags, tagged)?)
+}
+
+/// The tags a `TagSet`, or CreateBucket's `Tags`, holds: each is counted as it is read, so
+/// the list never holds more than `tagged` may.
+fn tag_list(reader: &mut Reader<'_>, tagged: Tagged) -> Result<Vec<Tag>, BodyError> {
+    let mut tags = Vec::new();
+    while let Some(name) = reader.child()? {
+        if name != "Tag" {
+            return Err(schema("an element other than Tag in a list of tags"));
+        }
+        if tags.len() >= tagged.limit() {
+            return Err(TagError::TooMany.into());
+        }
+        tags.push(tag(reader)?);
+    }
+    Ok(tags)
+}
+
+/// A `Tag`: its `Key` and its `Value`, both required, the value possibly empty (13 §6.7).
+fn tag(reader: &mut Reader<'_>) -> Result<Tag, BodyError> {
+    let (mut key, mut value) = (None, None);
+    while let Some(name) = reader.child()? {
+        let field = match name {
+            "Key" => &mut key,
+            "Value" => &mut value,
+            _ => return Err(schema("an element Tag does not have")),
+        };
+        once(field, reader.text()?.into_owned())?;
+    }
+    Ok(Tag {
+        key: key.ok_or(schema("a tag without a key"))?,
+        value: value.ok_or(schema("a tag without a value"))?,
+    })
+}
+
+/// An email address at its longest, 254 octets: SMTP's 256-octet path less its angle
+/// brackets (RFC 5321 §4.5.3.1.3).
+const MAX_EMAIL: usize = 254;
+
+/// A canonical user ID: 64 hexadecimal digits in every AWS sample (13 §6.8), counted as
+/// arbitrary text, since an owner mantle names need not be hex.
+const MAX_ID: usize = 64;
+
+/// A `DisplayName`, which S3 ignores in a request, at the longest an email address is: the
+/// display names in S3's samples are email addresses (13 §6.8).
+const MAX_DISPLAY_NAME: usize = MAX_EMAIL;
+
+/// One grant at its longest: a grantee named by email, the longest of the three ways to
+/// name one, with a display name; the `xsi` declaration and type AWS's samples write; and
+/// the `xmlns=""` AWS's PutBucketAcl sample puts on its leaves (13 §6.8).
+const GRANT: usize = "<Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" \
+    xsi:type=\"AmazonCustomerByEmail\"><EmailAddress xmlns=\"\"></EmailAddress>\
+    <DisplayName xmlns=\"\"></DisplayName></Grantee>\
+    <Permission xmlns=\"\">FULL_CONTROL</Permission></Grant>"
+    .len()
+    + ESCAPED * (MAX_EMAIL + MAX_DISPLAY_NAME);
+
+/// The largest AccessControlPolicy body: an owner and 100 grants, each at its longest.
+pub const ACL_LIMIT: usize = SPACE
+    * (PROLOG
+        + "<AccessControlPolicy><AccessControlList></AccessControlList>\
+           <Owner><ID></ID><DisplayName></DisplayName></Owner></AccessControlPolicy>"
+            .len()
+        + ESCAPED * (MAX_ID + MAX_DISPLAY_NAME)
+        + MAX_GRANTS * GRANT);
+
+/// PutBucketAcl's or PutObjectAcl's `AccessControlPolicy` (13 §6.8). A grantee is read by
+/// its `xsi:type` and named by the one element that type takes; a `DisplayName` is read and
+/// dropped, as S3 ignores it. A document S3's schema refuses is `MalformedACLError`.
+pub fn access_control_policy(body: &[u8]) -> Result<Policy, BodyError> {
+    policy(body).map_err(|error| match error {
+        BodyError::Xml(error @ (XmlError::NotWellFormed(_) | XmlError::Schema(_))) => {
+            BodyError::MalformedAcl(error)
+        }
+        error => error,
+    })
+}
+
+fn policy(body: &[u8]) -> Result<Policy, BodyError> {
+    let mut reader = Reader::open(body, ACL_LIMIT, "AccessControlPolicy")?.admit_types("Grantee");
+    let (mut owner, mut grants) = (None, None);
+    while let Some(name) = reader.child()? {
+        match name {
+            "Owner" => once(&mut owner, acl_owner(&mut reader)?)?,
+            "AccessControlList" => once(&mut grants, grant_list(&mut reader)?)?,
+            _ => return Err(schema("an element AccessControlPolicy does not have")),
+        }
+    }
+    reader.finish()?;
+    Ok(Policy {
+        owner,
+        grants: grants.unwrap_or_default(),
+    })
+}
+
+/// An `Owner`'s ID; its display name is dropped.
+fn acl_owner(reader: &mut Reader<'_>) -> Result<String, BodyError> {
+    let (mut id, mut display_name) = (None, None);
+    while let Some(name) = reader.child()? {
+        let field = match name {
+            "ID" => &mut id,
+            "DisplayName" => &mut display_name,
+            _ => return Err(schema("an element Owner does not have")),
+        };
+        once(field, reader.text()?.into_owned())?;
+    }
+    id.ok_or(schema("an owner without an ID"))
+}
+
+/// An `AccessControlList`'s grants, counted as they are read.
+fn grant_list(reader: &mut Reader<'_>) -> Result<Vec<Grant>, BodyError> {
+    let mut grants = Vec::new();
+    while let Some(name) = reader.child()? {
+        if name != "Grant" {
+            return Err(schema("an element AccessControlList does not have"));
+        }
+        if grants.len() >= MAX_GRANTS {
+            return Err(schema("more than 100 grants"));
+        }
+        grants.push(grant(reader)?);
+    }
+    Ok(grants)
+}
+
+/// A grantee's kind, from its `xsi:type` (13 §6.8).
+#[derive(Clone, Copy)]
+enum Kind {
+    User,
+    Email,
+    Group,
+}
+
+fn grant(reader: &mut Reader<'_>) -> Result<Grant, BodyError> {
+    let (mut grantee, mut permission) = (None, None);
+    while let Some(name) = reader.child()? {
+        match name {
+            "Grantee" => {
+                let kind = match reader.xsi_type() {
+                    Some("CanonicalUser") => Kind::User,
+                    Some("AmazonCustomerByEmail") => Kind::Email,
+                    Some("Group") => Kind::Group,
+                    Some(_) => return Err(schema("a grantee type S3 does not define")),
+                    None => return Err(schema("a grantee without an xsi:type")),
+                };
+                once(&mut grantee, acl_grantee(reader, kind)?)?;
+            }
+            "Permission" => once(&mut permission, reader.text()?.into_owned())?,
+            _ => return Err(schema("an element Grant does not have")),
+        }
+    }
+    let grantee = grantee.ok_or(schema("a grant without a grantee"))?;
+    // An enumeration of `xs:string` keeps its white space (13 §5).
+    let permission = permission
+        .as_deref()
+        .and_then(Permission::from_name)
+        .ok_or(schema("a grant without a permission S3 defines"))?;
+    Ok(Grant {
+        grantee,
+        permission,
+    })
+}
+
+/// A grantee, named by the one element its kind takes; a display name is dropped.
+fn acl_grantee(reader: &mut Reader<'_>, kind: Kind) -> Result<Grantee, BodyError> {
+    let (mut id, mut email, mut uri, mut display_name) = (None, None, None, None);
+    while let Some(name) = reader.child()? {
+        let field = match name {
+            "ID" => &mut id,
+            "EmailAddress" => &mut email,
+            "URI" => &mut uri,
+            "DisplayName" => &mut display_name,
+            _ => return Err(schema("an element Grantee does not have")),
+        };
+        once(field, reader.text()?.into_owned())?;
+    }
+    match (kind, id, email, uri) {
+        (Kind::User, Some(id), None, None) => Ok(Grantee::User(id)),
+        (Kind::Email, None, Some(email), None) => Ok(Grantee::Email(email)),
+        (Kind::Group, None, None, Some(uri)) => Ok(Grantee::Group(uri)),
+        _ => Err(schema(
+            "a grantee not named by the one element its type takes",
+        )),
+    }
 }
 
 /// PutBucketVersioning's request (13 §6.6).
@@ -314,6 +561,38 @@ pub fn versioning(body: &[u8]) -> Result<VersioningConfiguration, BodyError> {
         }
     };
     Ok(configuration)
+}
+
+/// The largest OwnershipControls body: its rule with the longest setting.
+pub const OWNERSHIP_CONTROLS_LIMIT: usize = SPACE
+    * (PROLOG
+        + "<OwnershipControls></OwnershipControls><Rule></Rule>".len()
+        + "<ObjectOwnership>BucketOwnerPreferred</ObjectOwnership>".len());
+
+/// PutBucketOwnershipControls' setting (13 §6.8): the one `Rule` a bucket has, holding its
+/// `ObjectOwnership`, exact, as an enumeration of `xs:string` keeps its white space (13 §5).
+pub fn ownership_controls(body: &[u8]) -> Result<Ownership, BodyError> {
+    let mut reader = Reader::open(body, OWNERSHIP_CONTROLS_LIMIT, "OwnershipControls")?;
+    let mut rule = None;
+    while let Some(name) = reader.child()? {
+        if name != "Rule" {
+            return Err(schema("an element OwnershipControls does not have"));
+        }
+        let mut setting = None;
+        while let Some(name) = reader.child()? {
+            if name != "ObjectOwnership" {
+                return Err(schema("an element Rule does not have"));
+            }
+            once(&mut setting, reader.text()?.into_owned())?;
+        }
+        let ownership = setting
+            .as_deref()
+            .and_then(Ownership::from_name)
+            .ok_or(schema("a rule without an ObjectOwnership S3 defines"))?;
+        once(&mut rule, ownership)?;
+    }
+    reader.finish()?;
+    rule.ok_or(schema("OwnershipControls without a rule"))
 }
 
 const fn schema(reason: &'static str) -> BodyError {
@@ -567,19 +846,454 @@ mod tests {
         let body =
             b"<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"> \n\
              <LocationConstraint>EU</LocationConstraint> \n</CreateBucketConfiguration >";
-        assert_eq!(create_bucket(body), Ok(Some("EU".into())));
-        assert_eq!(create_bucket(b"<CreateBucketConfiguration/>"), Ok(None));
-        let tagged =
-            b"<CreateBucketConfiguration><Tags><Tag><Key>a</Key><Value>b</Value></Tag></Tags>\
-             </CreateBucketConfiguration>";
         assert_eq!(
-            create_bucket(tagged).map_err(|e| e.code()),
-            Err(("NotImplemented", 501))
+            create_bucket(body).map(|c| c.location),
+            Ok(Some("EU".into()))
+        );
+        assert_eq!(
+            create_bucket(b"<CreateBucketConfiguration/>"),
+            Ok(CreateBucketConfiguration::default())
         );
         assert_eq!(
             create_bucket(b"<CreateBucketConfiguration><Location/></CreateBucketConfiguration>")
                 .map_err(|e| e.code().0),
             Err("NotImplemented")
+        );
+    }
+
+    /// A new general purpose bucket's tags are read and checked as a bucket's (13 §6.5,
+    /// §6.7).
+    #[test]
+    fn create_bucket_reads_tags() {
+        let body = |tags: &str| {
+            format!(
+                "<CreateBucketConfiguration><LocationConstraint>eu-west-1</LocationConstraint>\
+                 <Tags>{tags}</Tags></CreateBucketConfiguration>"
+            )
+        };
+        let tag = |k: &str, v: &str| format!("<Tag><Key>{k}</Key><Value>{v}</Value></Tag>");
+        assert_eq!(
+            create_bucket(
+                body(&(tag("User", "jsmith") + &tag("Project", "Project One"))).as_bytes()
+            ),
+            Ok(CreateBucketConfiguration {
+                location: Some("eu-west-1".into()),
+                tags: vec![
+                    Tag {
+                        key: "Project".into(),
+                        value: "Project One".into()
+                    },
+                    Tag {
+                        key: "User".into(),
+                        value: "jsmith".into()
+                    },
+                ],
+            })
+        );
+        let code = |tags: String| create_bucket(body(&tags).as_bytes()).map_err(|e| e.code().0);
+        let many = |n: usize| (0..n).map(|i| tag(&i.to_string(), "")).collect::<String>();
+        assert!(code(many(50)).is_ok());
+        assert_eq!(code(many(51)), Err("BadRequest"));
+        assert_eq!(code(tag("aws:createdBy", "x")), Err("InvalidTag"));
+        assert_eq!(code(tag("a", "1") + &tag("a", "2")), Err("InvalidTag"));
+    }
+
+    /// AWS's PutObjectTagging and PutBucketTagging samples, whose roots carry no namespace
+    /// (13 §6.7).
+    #[test]
+    fn tagging_reads_aws_samples() {
+        let object = b"<Tagging>
+   <TagSet>
+      <Tag>
+         <Key>tag1</Key>
+         <Value>val1</Value>
+      </Tag>
+      <Tag>
+         <Key>tag2</Key>
+         <Value>val2</Value>
+      </Tag>
+   </TagSet>
+</Tagging>
+         ";
+        let tag = |key: &str, value: &str| Tag {
+            key: key.into(),
+            value: value.into(),
+        };
+        assert_eq!(
+            tagging(object, Tagged::Object),
+            Ok(vec![tag("tag1", "val1"), tag("tag2", "val2")])
+        );
+        let bucket = b"<Tagging>
+  <TagSet>
+    <Tag>
+      <Key>User</Key>
+      <Value>jsmith</Value>
+    </Tag>
+    <Tag>
+      <Key>Project</Key>
+      <Value>Project One</Value>
+    </Tag>
+  </TagSet>
+</Tagging>";
+        assert_eq!(
+            tagging(bucket, Tagged::Bucket),
+            Ok(vec![tag("Project", "Project One"), tag("User", "jsmith")])
+        );
+        // An empty set removes an object's tags (13 §6.7).
+        assert_eq!(
+            tagging(b"<Tagging><TagSet/></Tagging>", Tagged::Object),
+            Ok(Vec::new())
+        );
+    }
+
+    #[test]
+    fn tagging_refusals_are_s3s() {
+        let code = |set: &str, tagged| {
+            tagging(format!("<Tagging>{set}</Tagging>").as_bytes(), tagged).map_err(|e| e.code().0)
+        };
+        let tags = |n: usize| {
+            let tags: String = (0..n)
+                .map(|i| format!("<Tag><Key>{i}</Key><Value>{i}</Value></Tag>"))
+                .collect();
+            format!("<TagSet>{tags}</TagSet>")
+        };
+        assert!(code(&tags(10), Tagged::Object).is_ok());
+        // What S3 answered PutObjectTagging with more than 10 tags (13 §6.7).
+        assert_eq!(code(&tags(11), Tagged::Object), Err("BadRequest"));
+        assert!(code(&tags(50), Tagged::Bucket).is_ok());
+        assert_eq!(code(&tags(51), Tagged::Bucket), Err("BadRequest"));
+        for (set, expected) in [
+            ("", "MalformedXML"),
+            ("<TagSet/><TagSet/>", "MalformedXML"),
+            ("<TagSet><Tag><Key>k</Key></Tag></TagSet>", "MalformedXML"),
+            (
+                "<TagSet><Tag><Value>v</Value></Tag></TagSet>",
+                "MalformedXML",
+            ),
+            (
+                "<TagSet><Tag><Key>k</Key><Key>j</Key><Value/></Tag></TagSet>",
+                "MalformedXML",
+            ),
+            (
+                "<TagSet><Tag><Key>k</Key><Value/><Other/></Tag></TagSet>",
+                "MalformedXML",
+            ),
+            (
+                "<TagSet><Tag><Key></Key><Value/></Tag></TagSet>",
+                "InvalidTag",
+            ),
+            (
+                "<TagSet><Tag><Key>a,b</Key><Value/></Tag></TagSet>",
+                "InvalidTag",
+            ),
+            (
+                "<TagSet><Tag><Key>k</Key><Value>&lt;</Value></Tag></TagSet>",
+                "InvalidTag",
+            ),
+            (
+                "<TagSet><Tag><Key>k</Key><Value/></Tag><Tag><Key>k</Key><Value/></Tag></TagSet>",
+                "InvalidTag",
+            ),
+        ] {
+            assert_eq!(code(set, Tagged::Object), Err(expected), "{set}");
+        }
+    }
+
+    /// The limits admit the longest bodies S3's limits allow: every tag with a key and value
+    /// of characters that each take three bytes and are written as character references.
+    #[test]
+    fn tagging_limits_admit_the_longest_bodies() {
+        for (tagged, limit) in [
+            (Tagged::Object, OBJECT_TAGGING_LIMIT),
+            (Tagged::Bucket, BUCKET_TAGGING_LIMIT),
+        ] {
+            let tags: String = (0..tagged.limit())
+                .map(|i| {
+                    // U+4E00 and on: letters of three bytes, one UTF-16 unit each.
+                    let key: String = (0..tagging::MAX_KEY)
+                        .map(|j| format!("&#{};", 0x4E00 + i * tagging::MAX_KEY + j))
+                        .collect();
+                    let value = "&#x9FA5;".repeat(tagging::MAX_VALUE);
+                    format!("<Tag><Key>{key}</Key><Value>{value}</Value></Tag>")
+                })
+                .collect();
+            let body = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Tagging xmlns=\"{NAMESPACE}\">\
+                 <TagSet>{tags}</TagSet></Tagging>"
+            );
+            assert!(body.len() * 2 <= limit, "{} > {limit}", body.len());
+            assert_eq!(
+                tagging(body.as_bytes(), tagged).unwrap().len(),
+                tagged.limit()
+            );
+        }
+        let longest_create = format!(
+            "<CreateBucketConfiguration><LocationConstraint>{}</LocationConstraint><Tags>{}</Tags>\
+             </CreateBucketConfiguration>",
+            "a".repeat(MAX_REGION),
+            (0..50)
+                .map(|i| format!(
+                    "<Tag><Key>{i:0>128}</Key><Value>{}</Value></Tag>",
+                    "&#x9FA5;".repeat(tagging::MAX_VALUE)
+                ))
+                .collect::<String>()
+        );
+        assert!(longest_create.len() * 2 <= CREATE_BUCKET_LIMIT);
+        assert_eq!(
+            create_bucket(longest_create.as_bytes()).unwrap().tags.len(),
+            50
+        );
+    }
+
+    const OWNER: &str = "852b113e7a2f25102679df27bb0ae12b3f85be6BucketOwnerCanonicalUserID";
+
+    /// AWS's PutBucketAcl sample: a namespaced root whose leaves undeclare the default
+    /// namespace, and every kind of grantee (13 §6.8).
+    #[test]
+    fn access_control_policy_reads_aws_samples() {
+        let bucket = br#"<AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Owner>
+    <ID>852b113e7a2f25102679df27bb0ae12b3f85be6BucketOwnerCanonicalUserID</ID>
+    <DisplayName>OwnerDisplayName</DisplayName>
+  </Owner>
+  <AccessControlList>
+    <Grant>
+      <Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="CanonicalUser">
+        <ID>852b113e7a2f25102679df27bb0ae12b3f85be6BucketOwnerCanonicalUserID</ID>
+        <DisplayName>OwnerDisplayName</DisplayName>
+      </Grantee>
+      <Permission>FULL_CONTROL</Permission>
+    </Grant>
+    <Grant>
+      <Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="Group">
+        <URI xmlns="">http://acs.amazonaws.com/groups/global/AllUsers</URI>
+      </Grantee>
+      <Permission xmlns="">READ</Permission>
+    </Grant>
+    <Grant>
+      <Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="Group">
+        <URI xmlns="">http://acs.amazonaws.com/groups/s3/LogDelivery</URI>
+      </Grantee>
+      <Permission xmlns="">WRITE</Permission>
+    </Grant>
+    <Grant>
+      <Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="AmazonCustomerByEmail">
+        <EmailAddress xmlns="">xyz@amazon.com</EmailAddress>
+      </Grantee>
+      <Permission xmlns="">WRITE_ACP</Permission>
+    </Grant>
+    <Grant>
+      <Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="CanonicalUser">
+        <ID xmlns="">f30716ab7115dcb44a5ef76e9d74b8e20567f63TestAccountCanonicalUserID</ID>
+      </Grantee>
+      <Permission xmlns="">READ_ACP</Permission>
+    </Grant>
+  </AccessControlList>
+</AccessControlPolicy>
+         "#;
+        let grant = |grantee, permission| Grant {
+            grantee,
+            permission,
+        };
+        assert_eq!(
+            access_control_policy(bucket),
+            Ok(Policy {
+                owner: Some(OWNER.into()),
+                grants: vec![
+                    grant(Grantee::User(OWNER.into()), Permission::FullControl),
+                    grant(
+                        Grantee::Group("http://acs.amazonaws.com/groups/global/AllUsers".into()),
+                        Permission::Read
+                    ),
+                    grant(
+                        Grantee::Group("http://acs.amazonaws.com/groups/s3/LogDelivery".into()),
+                        Permission::Write
+                    ),
+                    grant(
+                        Grantee::Email("xyz@amazon.com".into()),
+                        Permission::WriteAcp
+                    ),
+                    grant(
+                        Grantee::User(
+                            "f30716ab7115dcb44a5ef76e9d74b8e20567f63TestAccountCanonicalUserID"
+                                .into()
+                        ),
+                        Permission::ReadAcp
+                    ),
+                ],
+            })
+        );
+        // PutObjectAcl's sample, whose root carries no namespace.
+        let object = br#"<AccessControlPolicy>
+  <Owner>
+    <ID>75aa57f09aa0c8caeab4f8c24e99d10f8e7faeebf76c078efc7c6caea54ba06a</ID>
+    <DisplayName>mtd@amazon.com</DisplayName>
+  </Owner>
+  <AccessControlList>
+    <Grant>
+      <Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="CanonicalUser">
+        <ID>75aa57f09aa0c8caeab4f8c24e99d10f8e7faeebf76c078efc7c6caea54ba06a</ID>
+        <DisplayName>mtd@amazon.com</DisplayName>
+      </Grantee>
+      <Permission>FULL_CONTROL</Permission>
+    </Grant>
+  </AccessControlList>
+</AccessControlPolicy>"#;
+        let read = access_control_policy(object).unwrap();
+        assert_eq!(read.grants.len(), 1);
+        assert_eq!(
+            read.owner.as_deref(),
+            Some("75aa57f09aa0c8caeab4f8c24e99d10f8e7faeebf76c078efc7c6caea54ba06a")
+        );
+        // Neither grants nor owner: an empty list.
+        assert_eq!(
+            access_control_policy(b"<AccessControlPolicy/>"),
+            Ok(Policy::default())
+        );
+    }
+
+    #[test]
+    fn access_control_policy_refusals_are_malformed_acls() {
+        let xsi = "xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"";
+        let code = |list: &str| {
+            access_control_policy(
+                format!(
+                    "<AccessControlPolicy><AccessControlList>{list}</AccessControlList>\
+                     </AccessControlPolicy>"
+                )
+                .as_bytes(),
+            )
+            .map_err(|e| e.code().0)
+        };
+        let user = |attributes: &str, inner: &str, permission: &str| {
+            format!(
+                "<Grant><Grantee {attributes}>{inner}</Grantee>\
+                 <Permission>{permission}</Permission></Grant>"
+            )
+        };
+        let typed = |kind: &str| format!("{xsi} xsi:type=\"{kind}\"");
+        assert!(code(&user(&typed("CanonicalUser"), "<ID>a</ID>", "READ")).is_ok());
+        for refused in [
+            // No type, an unknown one, and GetObjectAcl's sample's `Type` element.
+            user(xsi, "<ID>a</ID>", "READ"),
+            user(&typed("Canonical User"), "<ID>a</ID>", "READ"),
+            user(&typed("Owner"), "<ID>a</ID>", "READ"),
+            user(xsi, "<ID>a</ID><Type>CanonicalUser</Type>", "READ"),
+            // The element the type does not take, none, or two.
+            user(&typed("CanonicalUser"), "<URI>u</URI>", "READ"),
+            user(&typed("Group"), "<ID>a</ID>", "READ"),
+            user(&typed("CanonicalUser"), "", "READ"),
+            user(
+                &typed("CanonicalUser"),
+                "<ID>a</ID><EmailAddress>e</EmailAddress>",
+                "READ",
+            ),
+            // A permission S3 does not define, or written otherwise.
+            user(&typed("CanonicalUser"), "<ID>a</ID>", "read"),
+            user(&typed("CanonicalUser"), "<ID>a</ID>", " READ"),
+            user(&typed("CanonicalUser"), "<ID>a</ID>", "FULL-CONTROL"),
+            // A grant without a grantee or permission, or a type on another element.
+            "<Grant><Permission>READ</Permission></Grant>".into(),
+            format!(
+                "<Grant><Grantee {}><ID>a</ID></Grantee></Grant>",
+                typed("CanonicalUser")
+            ),
+            format!(
+                "<Grant {}><Grantee {}><ID>a</ID></Grantee><Permission>READ</Permission></Grant>",
+                typed("CanonicalUser"),
+                typed("CanonicalUser")
+            ),
+            "<Other/>".into(),
+        ] {
+            assert_eq!(code(&refused), Err("MalformedACLError"), "{refused}");
+        }
+        let grants = |n: usize| user(&typed("CanonicalUser"), "<ID>a</ID>", "READ").repeat(n);
+        assert_eq!(
+            code(&grants(MAX_GRANTS)).map(|p| p.grants.len()),
+            Ok(MAX_GRANTS)
+        );
+        assert_eq!(code(&grants(MAX_GRANTS + 1)), Err("MalformedACLError"));
+        assert_eq!(
+            access_control_policy(b"<AccessControlPolicy><Owner/></AccessControlPolicy>")
+                .map_err(|e| e.code().0),
+            Err("MalformedACLError")
+        );
+        assert_eq!(
+            access_control_policy(b"not xml").map_err(|e| e.code().0),
+            Err("MalformedACLError")
+        );
+        assert_eq!(
+            access_control_policy(&vec![b' '; ACL_LIMIT + 1]).map_err(|e| e.code().0),
+            Err("MaxMessageLengthExceeded")
+        );
+    }
+
+    /// PutBucketOwnershipControls' sample (13 §6.8).
+    #[test]
+    fn ownership_controls_reads_the_one_rule() {
+        let sample = br#"<?xml version="1.0" encoding="UTF-8"?>
+          <OwnershipControls xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+            <Rule>
+              <ObjectOwnership>BucketOwnerEnforced</ObjectOwnership>
+            </Rule>
+          </OwnershipControls>"#;
+        assert_eq!(
+            ownership_controls(sample),
+            Ok(Ownership::BucketOwnerEnforced)
+        );
+        let rule =
+            |setting: &str| format!("<Rule><ObjectOwnership>{setting}</ObjectOwnership></Rule>");
+        let code = |rules: String| {
+            ownership_controls(format!("<OwnershipControls>{rules}</OwnershipControls>").as_bytes())
+                .map_err(|e| e.code().0)
+        };
+        assert_eq!(
+            code(rule("ObjectWriter")).map(Ownership::name),
+            Ok("ObjectWriter")
+        );
+        for refused in [
+            String::new(),
+            rule("BucketOwnerEnforced").repeat(2),
+            rule(" BucketOwnerEnforced"),
+            rule("bucketownerenforced"),
+            "<Rule/>".into(),
+            "<Rule><ObjectOwnership>ObjectWriter</ObjectOwnership><Other/></Rule>".into(),
+        ] {
+            assert_eq!(code(refused.clone()), Err("MalformedXML"), "{refused}");
+        }
+        let longest = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><OwnershipControls xmlns=\"{NAMESPACE}\">{}\
+             </OwnershipControls>",
+            rule("BucketOwnerPreferred")
+        );
+        assert!(longest.len() * 2 <= OWNERSHIP_CONTROLS_LIMIT);
+        assert!(ownership_controls(longest.as_bytes()).is_ok());
+    }
+
+    /// The limit admits 100 grants each naming an email address of 254 octets, every one
+    /// written as `&apos;`, with display names as long.
+    #[test]
+    fn acl_limit_admits_the_longest_body() {
+        let long = "&apos;".repeat(MAX_EMAIL);
+        let grant = format!(
+            "<Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" \
+             xsi:type=\"AmazonCustomerByEmail\"><EmailAddress xmlns=\"\">{long}</EmailAddress>\
+             <DisplayName xmlns=\"\">{long}</DisplayName></Grantee>\
+             <Permission xmlns=\"\">FULL_CONTROL</Permission></Grant>"
+        );
+        let body = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><AccessControlPolicy xmlns=\"{NAMESPACE}\">\
+             <AccessControlList>{}</AccessControlList><Owner><ID>{}</ID>\
+             <DisplayName>{long}</DisplayName></Owner></AccessControlPolicy>",
+            grant.repeat(MAX_GRANTS),
+            "&quot;".repeat(MAX_ID)
+        );
+        assert!(body.len() * 2 <= ACL_LIMIT, "{} > {ACL_LIMIT}", body.len());
+        let read = access_control_policy(body.as_bytes()).unwrap();
+        assert_eq!(read.grants.len(), MAX_GRANTS);
+        assert_eq!(
+            read.grants[0].grantee,
+            Grantee::Email("'".repeat(MAX_EMAIL))
         );
     }
 

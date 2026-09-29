@@ -33,6 +33,11 @@ pub enum Operation {
     GetBucketTagging,
     PutBucketTagging,
     DeleteBucketTagging,
+    GetBucketAcl,
+    PutBucketAcl,
+    GetBucketOwnershipControls,
+    PutBucketOwnershipControls,
+    DeleteBucketOwnershipControls,
     ListObjects,
     ListObjectsV2,
     ListObjectVersions,
@@ -47,6 +52,8 @@ pub enum Operation {
     GetObjectTagging,
     PutObjectTagging,
     DeleteObjectTagging,
+    GetObjectAcl,
+    PutObjectAcl,
     CreateMultipartUpload,
     UploadPart,
     UploadPartCopy,
@@ -93,9 +100,8 @@ pub const MAX_KEY: usize = 1024;
 
 /// Bucket subresources S3 defines that mantle does not serve: answered `501 NotImplemented`
 /// rather than taken for another operation.
-const UNSUPPORTED: [&str; 22] = [
+const UNSUPPORTED: [&str; 20] = [
     "accelerate",
-    "acl",
     "analytics",
     "cors",
     "encryption",
@@ -106,7 +112,6 @@ const UNSUPPORTED: [&str; 22] = [
     "metrics",
     "notification",
     "object-lock",
-    "ownershipControls",
     "policy",
     "policyStatus",
     "publicAccessBlock",
@@ -136,52 +141,125 @@ pub fn route(
     let copy = headers
         .iter()
         .any(|(n, _)| n.eq_ignore_ascii_case("x-amz-copy-source"));
-    use Operation as O;
-    let operation = match (bucket.is_some(), key.is_some(), method) {
-        (false, _, "GET") => O::ListBuckets,
-        (false, _, _) => return Err(RouteError::MethodNotAllowed),
-        (true, false, "GET") if q.has("location") => O::GetBucketLocation,
-        (true, false, "GET") if q.has("versioning") => O::GetBucketVersioning,
-        (true, false, "PUT") if q.has("versioning") => O::PutBucketVersioning,
-        (true, false, "GET") if q.has("tagging") => O::GetBucketTagging,
-        (true, false, "PUT") if q.has("tagging") => O::PutBucketTagging,
-        (true, false, "DELETE") if q.has("tagging") => O::DeleteBucketTagging,
-        (true, false, "GET") if q.has("versions") => O::ListObjectVersions,
-        (true, false, "GET") if q.has("uploads") => O::ListMultipartUploads,
-        (true, false, "GET") if q.value("list-type") == Some("2") => O::ListObjectsV2,
-        (true, false, "GET") => O::ListObjects,
-        (true, false, "POST") if q.has("delete") => O::DeleteObjects,
-        (true, false, "PUT") => O::CreateBucket,
-        (true, false, "DELETE") => O::DeleteBucket,
-        (true, false, "HEAD") => O::HeadBucket,
-        (true, false, _) => return Err(RouteError::MethodNotAllowed),
-        (true, true, "PUT") if q.has("tagging") => O::PutObjectTagging,
-        (true, true, "GET") if q.has("tagging") => O::GetObjectTagging,
-        (true, true, "DELETE") if q.has("tagging") => O::DeleteObjectTagging,
-        (true, true, "PUT") if q.has("partNumber") && q.has("uploadId") => {
-            if copy {
-                O::UploadPartCopy
-            } else {
-                O::UploadPart
-            }
-        }
-        (true, true, "PUT") if copy => O::CopyObject,
-        (true, true, "PUT") => O::PutObject,
-        (true, true, "GET") if q.has("uploadId") => O::ListParts,
-        (true, true, "GET") if q.has("attributes") => O::GetObjectAttributes,
-        (true, true, "GET") => O::GetObject,
-        (true, true, "HEAD") => O::HeadObject,
-        (true, true, "DELETE") if q.has("uploadId") => O::AbortMultipartUpload,
-        (true, true, "DELETE") => O::DeleteObject,
-        (true, true, "POST") if q.has("uploads") => O::CreateMultipartUpload,
-        (true, true, "POST") if q.has("uploadId") => O::CompleteMultipartUpload,
-        (true, true, _) => return Err(RouteError::MethodNotAllowed),
+    let operation = match (&bucket, &key) {
+        (None, _) if method == "GET" => Operation::ListBuckets,
+        (None, _) => return Err(RouteError::MethodNotAllowed),
+        (Some(_), None) => bucket_operation(method, &q)?,
+        (Some(_), Some(_)) => object_operation(method, &q, copy)?,
     };
     Ok(Route {
         operation,
         bucket,
         key,
     })
+}
+
+/// A subresource and the operation each method names on it.
+type Subresource = (&'static str, &'static [(&'static str, Operation)]);
+
+/// The operation `method` names on the first of `subresources` the query carries, or `None`
+/// if it carries none. A method the subresource does not define is `MethodNotAllowed`, never
+/// the operation on the bucket or object itself: `DELETE /bucket?versioning` deletes no
+/// bucket, and `PUT /bucket/key?attributes` writes no object.
+fn subresource(
+    subresources: &[Subresource],
+    method: &str,
+    q: &Query,
+) -> Option<Result<Operation, RouteError>> {
+    let (_, methods) = subresources.iter().find(|(name, _)| q.has(name))?;
+    Some(
+        methods
+            .iter()
+            .find(|(m, _)| *m == method)
+            .map(|&(_, operation)| operation)
+            .ok_or(RouteError::MethodNotAllowed),
+    )
+}
+
+fn bucket_operation(method: &str, q: &Query) -> Result<Operation, RouteError> {
+    use Operation as O;
+    const SUBRESOURCES: [Subresource; 8] = [
+        ("location", &[("GET", O::GetBucketLocation)]),
+        (
+            "versioning",
+            &[
+                ("GET", O::GetBucketVersioning),
+                ("PUT", O::PutBucketVersioning),
+            ],
+        ),
+        (
+            "tagging",
+            &[
+                ("GET", O::GetBucketTagging),
+                ("PUT", O::PutBucketTagging),
+                ("DELETE", O::DeleteBucketTagging),
+            ],
+        ),
+        ("acl", &[("GET", O::GetBucketAcl), ("PUT", O::PutBucketAcl)]),
+        (
+            "ownershipControls",
+            &[
+                ("GET", O::GetBucketOwnershipControls),
+                ("PUT", O::PutBucketOwnershipControls),
+                ("DELETE", O::DeleteBucketOwnershipControls),
+            ],
+        ),
+        ("versions", &[("GET", O::ListObjectVersions)]),
+        ("uploads", &[("GET", O::ListMultipartUploads)]),
+        ("delete", &[("POST", O::DeleteObjects)]),
+    ];
+    if let Some(operation) = subresource(&SUBRESOURCES, method, q) {
+        return operation;
+    }
+    match method {
+        "GET" if q.value("list-type") == Some("2") => Ok(O::ListObjectsV2),
+        "GET" => Ok(O::ListObjects),
+        "PUT" => Ok(O::CreateBucket),
+        "DELETE" => Ok(O::DeleteBucket),
+        "HEAD" => Ok(O::HeadBucket),
+        _ => Err(RouteError::MethodNotAllowed),
+    }
+}
+
+fn object_operation(method: &str, q: &Query, copy: bool) -> Result<Operation, RouteError> {
+    use Operation as O;
+    const SUBRESOURCES: [Subresource; 5] = [
+        (
+            "tagging",
+            &[
+                ("GET", O::GetObjectTagging),
+                ("PUT", O::PutObjectTagging),
+                ("DELETE", O::DeleteObjectTagging),
+            ],
+        ),
+        ("acl", &[("GET", O::GetObjectAcl), ("PUT", O::PutObjectAcl)]),
+        ("attributes", &[("GET", O::GetObjectAttributes)]),
+        ("uploads", &[("POST", O::CreateMultipartUpload)]),
+        (
+            "uploadId",
+            &[
+                ("GET", O::ListParts),
+                ("PUT", O::UploadPart),
+                ("POST", O::CompleteMultipartUpload),
+                ("DELETE", O::AbortMultipartUpload),
+            ],
+        ),
+    ];
+    match subresource(&SUBRESOURCES, method, q) {
+        // A part is named by its number; a PUT to an upload without one names nothing, and
+        // is never taken for a PutObject that would replace the object with the part.
+        Some(Ok(O::UploadPart)) if !q.has("partNumber") => Err(RouteError::MethodNotAllowed),
+        Some(Ok(O::UploadPart)) if copy => Ok(O::UploadPartCopy),
+        Some(operation) => operation,
+        None => match method {
+            "PUT" if copy => Ok(O::CopyObject),
+            "PUT" => Ok(O::PutObject),
+            "GET" => Ok(O::GetObject),
+            "HEAD" => Ok(O::HeadObject),
+            "DELETE" => Ok(O::DeleteObject),
+            _ => Err(RouteError::MethodNotAllowed),
+        },
+    }
 }
 
 /// The bucket and key a request names (05 §14).
@@ -393,10 +471,71 @@ mod tests {
     }
 
     #[test]
+    fn tags_and_acls_are_subresources() {
+        use Operation as O;
+        assert_eq!(op("GET", "/b", "tagging"), O::GetBucketTagging);
+        assert_eq!(op("DELETE", "/b", "tagging"), O::DeleteBucketTagging);
+        assert_eq!(op("GET", "/b", "acl"), O::GetBucketAcl);
+        assert_eq!(op("PUT", "/b", "acl"), O::PutBucketAcl);
+        assert_eq!(
+            op("PUT", "/b/k", "tagging&versionId=v"),
+            O::PutObjectTagging
+        );
+        assert_eq!(op("GET", "/b/k", "acl&versionId=v"), O::GetObjectAcl);
+        assert_eq!(op("PUT", "/b/k", "acl"), O::PutObjectAcl);
+        assert_eq!(
+            op("GET", "/b", "ownershipControls"),
+            O::GetBucketOwnershipControls
+        );
+        assert_eq!(
+            op("DELETE", "/b", "ownershipControls"),
+            O::DeleteBucketOwnershipControls
+        );
+    }
+
+    /// A subresource's undefined methods are refused, never taken for the operation on the
+    /// bucket or object itself.
+    #[test]
+    fn a_subresource_is_never_its_bucket_or_object() {
+        let refused = |method: &str, path: &str, query: &str| {
+            assert_eq!(
+                r(method, "s3.example.com", path, query),
+                Err(RouteError::MethodNotAllowed),
+                "{method} {path}?{query}"
+            );
+        };
+        for query in [
+            "versioning",
+            "location",
+            "acl",
+            "versions",
+            "uploads",
+            "delete",
+        ] {
+            refused("DELETE", "/b", query);
+        }
+        for query in ["location", "versions", "uploads", "delete"] {
+            refused("PUT", "/b", query);
+        }
+        refused("DELETE", "/b/k", "acl");
+        refused("DELETE", "/b/k", "attributes");
+        refused("PUT", "/b/k", "attributes");
+        refused("PUT", "/b/k", "uploads");
+        refused("GET", "/b/k", "uploads");
+        refused("PUT", "/b/k", "uploadId=u");
+        refused("POST", "/b/k", "tagging");
+        refused("HEAD", "/b", "acl");
+    }
+
+    #[test]
     fn what_is_not_served_is_refused_plainly() {
         assert_eq!(
-            r("GET", "s3.example.com", "/b", "acl"),
-            Err(RouteError::NotImplemented("acl"))
+            r("GET", "s3.example.com", "/b", "policy"),
+            Err(RouteError::NotImplemented("policy"))
+        );
+        assert_eq!(
+            r("DELETE", "s3.example.com", "/b", "cors"),
+            Err(RouteError::NotImplemented("cors"))
         );
         assert_eq!(
             r("POST", "s3.example.com", "/", ""),

@@ -28,6 +28,8 @@ rustix = { version = "1.1", features = ["fs", "system", "param"] }
 tempfile = "3.20"
 thiserror = "2.0"
 twox-hash = { version = "2.1", default-features = false, features = ["std", "xxhash64", "xxhash3_64", "xxhash3_128"] }
+# Unicode 16.0.0 general categories, for the characters S3 allows in a tag (docs/research/13 §6.7).
+unicode-general-category = "1.1"
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Security",

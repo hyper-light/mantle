@@ -13,6 +13,7 @@
     )
 )]
 
+pub mod acl;
 pub mod body;
 pub mod checksum;
 pub mod chunked;
@@ -23,5 +24,6 @@ pub mod range;
 pub mod response;
 pub mod route;
 pub mod sigv4;
+pub mod tagging;
 pub mod time;
 pub mod xml;

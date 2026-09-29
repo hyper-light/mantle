@@ -22,9 +22,6 @@ pub mod marker {
     /// The Name range's gate floor.
     pub const FLOOR: u8 = b'f';
     pub const GATE: u8 = b'g';
-    /// The Name range's marks of the files it took responsibility for, until the sweep has
-    /// settled them.
-    pub const HANDED: u8 = b'h';
     /// How many sessions the range holds.
     pub const SESSIONS: u8 = b'n';
     /// The last snapshot a member installed.
@@ -39,13 +36,12 @@ pub mod marker {
     pub const UNSETTLED: u8 = b'u';
 
     /// Every marker in use.
-    pub const ALL: [u8; 12] = [
+    pub const ALL: [u8; 11] = [
         ATTEMPT,
         CLOCK,
         EXPIRY,
         FLOOR,
         GATE,
-        HANDED,
         UNSETTLED,
         SESSIONS,
         INSTALLED,
@@ -59,6 +55,10 @@ pub const DATA: u8 = 0x01;
 /// Reverse rows: an index kept in the range of the rows it indexes and sorted by another of
 /// their fields, the Block layer's by volume and the Bucket layer's by owner.
 pub const REVERSE: u8 = 0x02;
+/// The Name range's marks of the files it took, until the sweep settles them, ordered by
+/// object key as its rows are: a split cuts them at the same key, and listings never see them
+/// (docs/design/metadata.md §2).
+pub const MARKS: u8 = 0x03;
 
 /// Name-layer rows under `(bucket, key)`, in the order they sort.
 const NULL: u8 = 1;
@@ -169,6 +169,41 @@ pub fn decode_attempt(k: &[u8]) -> Option<String> {
     String::from_utf8(name).ok()
 }
 
+/// The key of the Name range's mark that it took `file`, made for `key` in `bucket`.
+pub fn mark(bucket: &str, key: &str, file: u128) -> Vec<u8> {
+    let mut out = marks_of(bucket);
+    put_string(&mut out, key.as_bytes());
+    out.extend_from_slice(&file.to_be_bytes());
+    out
+}
+
+/// The first key of a bucket's marks, and a key past its last.
+pub fn marks_span(bucket: &str) -> (Vec<u8>, Vec<u8>) {
+    let from = marks_of(bucket);
+    let mut past = from.clone();
+    past.push(0xFF);
+    (from, past)
+}
+
+/// The file a mark's key names; `None` if it is not one.
+pub fn decode_mark(k: &[u8]) -> Option<(String, String, u128)> {
+    let rest = k.strip_prefix(&[MARKS])?;
+    let (bucket, rest) = take_string(rest)?;
+    let (key, rest) = take_string(rest)?;
+    Some((
+        String::from_utf8(bucket).ok()?,
+        String::from_utf8(key).ok()?,
+        u128::from_be_bytes(rest.try_into().ok()?),
+    ))
+}
+
+fn marks_of(bucket: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bucket.len().saturating_add(2));
+    out.push(MARKS);
+    put_string(&mut out, bucket.as_bytes());
+    out
+}
+
 /// The key of a file in the File range's queue of files whose handover is not yet settled, or
 /// of a block in the Block range's: its handover deadline, then its ID, so the sweep takes them
 /// as their deadlines pass (docs/design/metadata.md §2).
@@ -196,14 +231,6 @@ pub fn decode_unsettled(k: &[u8]) -> Option<(u64, u128)> {
         u64::from_be_bytes(*deadline),
         u128::from_be_bytes(file.try_into().ok()?),
     ))
-}
-
-/// The key of the Name range's mark that it took responsibility for `file`.
-pub fn handed(file: u128) -> Vec<u8> {
-    let mut out = Vec::with_capacity(18);
-    out.extend_from_slice(&[LOCAL, marker::HANDED]);
-    out.extend_from_slice(&file.to_be_bytes());
-    out
 }
 
 /// The range's queue of the files it released, oldest first (docs/design/metadata.md §2).

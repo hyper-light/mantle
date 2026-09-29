@@ -30,7 +30,9 @@ use mantle_meta::block;
 use mantle_meta::engine::{Model, Rows};
 use mantle_meta::file::{self, Unsettled};
 use mantle_meta::key::{self, NameRow};
-use mantle_meta::name::{self, Check, GateChange, Preconditions, Put, Unmark, Verdict};
+use mantle_meta::name::{
+    self, Check, Checked, GateChange, Marked, Preconditions, Put, Unmark, Verdict,
+};
 use mantle_meta::record::{
     BlockHeader, ChunkPlace, Extent, GateState, Referrer, Target, Version, Versioning,
 };
@@ -385,7 +387,15 @@ impl World {
                         continue;
                     }
                     let check = name::Command::Check(Check {
-                        files: mine.iter().map(|(_, u)| (u.file, u.deadline_ns)).collect(),
+                        files: mine
+                            .iter()
+                            .map(|(_, u)| Checked {
+                                bucket: u.referrer.bucket.clone(),
+                                key: u.referrer.key.clone(),
+                                file: u.file,
+                                deadline_ns: u.deadline_ns,
+                            })
+                            .collect(),
                         at_ns: self.proposed(),
                     });
                     let name::Outcome::Checked(answered) = self.name(range, check) else {
@@ -406,10 +416,14 @@ impl World {
             }
             Request::Unmark(files) => {
                 for range in 0..2 {
-                    let mine: Vec<u128> = files
+                    let mine: Vec<Marked> = files
                         .iter()
                         .filter(|(r, _)| range_of(&r.key) == range)
-                        .map(|(_, f)| *f)
+                        .map(|(r, f)| Marked {
+                            bucket: r.bucket.clone(),
+                            key: r.key.clone(),
+                            file: *f,
+                        })
                         .collect();
                     if !mine.is_empty() {
                         let unmark = name::Command::Unmark(Unmark { files: mine });
@@ -481,7 +495,7 @@ impl World {
         self.names
             .iter()
             .flat_map(|r| name::released(r, u64::MAX, usize::MAX).unwrap())
-            .map(|(_, file)| file)
+            .map(|r| r.file)
             .collect()
     }
 
@@ -516,16 +530,18 @@ impl World {
             .collect()
     }
 
+    /// Files marked in any Name range, under whatever key.
     fn marked(&self) -> BTreeSet<u128> {
-        self.written
-            .iter()
-            .copied()
-            .filter(|&f| {
-                self.names
-                    .iter()
-                    .any(|r| r.get(&key::handed(f)).unwrap().is_some())
-            })
-            .collect()
+        let mut out = BTreeSet::new();
+        for range in &self.names {
+            let (mut from, to) = key::marks_span(BUCKET);
+            while let Some((k, _)) = range.next(&from, &to).unwrap() {
+                out.insert(key::decode_mark(&k).unwrap().2);
+                from = k;
+                from.push(0);
+            }
+        }
+        out
     }
 
     fn check(&self) {

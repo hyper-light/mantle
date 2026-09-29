@@ -131,7 +131,8 @@ layers removes them, as Tectonic's does [01 §1.6].
     and would need Tectonic's owner rows (R2) before the collector could tell when they are
     free.
   - *Releasing.* Whatever removes a reference writes, in the same transaction, a row in the
-    range's queue of released files, keyed by the range's time and then the file: a version
+    range's queue of released files, keyed by the range's time and then the file and naming
+    the object key the file was held under: a version
     removed by ID, a null version replaced, a part uploaded again, an upload's parts that
     its completion did not list, an aborted or collected upload's parts, and a refused
     write's file. A completed upload's listed parts are not released: they are the object's
@@ -143,6 +144,7 @@ layers removes them, as Tectonic's does [01 §1.6].
     - *Reclaiming.* The collector takes the queue oldest first, once a file has been released
     longer than the grace period, and removes what it holds bottom up: each block's chunks
     from their volumes, then the block's rows, then an adopted part's file, then the file,
+    then any mark a stopped sweep left on it, at the Name range that holds its key by then,
     and last the queue row. A reclaimer (`crates/meta/src/reclaim.rs`) names each read and
     command and moves on with its answer, doing no I/O, as the coordinator does. Every step
     can be repeated, since a chunk or row already gone stays gone and a removed file reads as
@@ -171,7 +173,11 @@ layers removes them, as Tectonic's does [01 §1.6].
       the deadline, and a Name range whose time has passed it refuses the write and releases
       the file, as Spanner fails reads older than its version window (22 §6).
     - *The mark.* A Name range that takes a file within its deadline, referencing it or
-      releasing it for a refused write, marks it.
+      releasing it for a refused write, marks it. The mark is keyed by the object key the
+      file was made for, in a space of its own that listings never read, so a split cuts a
+      range's marks at the same key as its rows and a file's mark stays with the rows that
+      may reference it. A mark keyed by the file alone would stay behind in the old range, and
+      the sweep, asking the range that holds the key now, would release a referenced file.
     - *The sweep* (`crates/meta/src/sweep.rs`) takes the queue as deadlines pass and asks the
       Name range of each file's key, in one command, whether it took the file. A marked file
       was taken. An unmarked one past its deadline, at the Name range's time, is released and

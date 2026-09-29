@@ -269,6 +269,15 @@ pub struct BlockHeader {
     pub crc32c: u32,
 }
 
+/// The object key a released file was held under: the version, part or handover that took
+/// it. It routes the removal of the file's mark to the range that holds the key, wherever
+/// splits and merges have moved it by then (docs/design/metadata.md §2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Holder {
+    pub bucket: String,
+    pub key: String,
+}
+
 /// Where a block came from: the file it was made for, which alone may name it, and the Block
 /// range's time it was written and by which that file's write must name it
 /// (docs/design/metadata.md §2).
@@ -412,6 +421,26 @@ impl BlockHeader {
             })
         })();
         decoded(header, &r, "block")
+    }
+}
+
+impl Holder {
+    pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
+        let mut w = start();
+        put_str(&mut w, &self.bucket)?;
+        put_str(&mut w, &self.key)?;
+        Ok(finish(w))
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "holder")?;
+        let holder = (|| {
+            Some(Self {
+                bucket: take_str(&mut r)?,
+                key: take_str(&mut r)?,
+            })
+        })();
+        decoded(holder, &r, "holder")
     }
 }
 

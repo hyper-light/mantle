@@ -1,6 +1,7 @@
 //! Reclaiming a file the Name layer released (docs/design/metadata.md §2): each block's chunks
 //! from their volumes, then the block's rows, an adopted part's file the same way, then the
-//! file's rows, and last its row in the Name range's queue.
+//! file's rows, then any mark a sweep that stopped left on it, wherever its key now is, and
+//! last its row in the Name range's queue.
 //!
 //! A [`Reclaimer`] names its next [`Request`] and moves on with the [`Answer`], doing no I/O
 //! itself, as the coordinator does. Every step can be repeated: a chunk or a row already gone
@@ -9,7 +10,7 @@
 
 use std::collections::VecDeque;
 
-use crate::record::{BlockHeader, ChunkPlace, Extent, Target};
+use crate::record::{BlockHeader, ChunkPlace, Extent, Holder, Target};
 use crate::{block, file, name};
 
 /// A reclaimer's next request.
@@ -26,6 +27,9 @@ pub enum Request {
     BlockCommand(block::Command),
     /// A command to the File range that holds the file.
     FileCommand(file::Command),
+    /// Removing the file's mark, as `name::Command::Unmark`, at the Name range that holds its
+    /// key now.
+    Unmark(name::Unmark),
     /// Dropping the file's row from the queue of the Name range that released it, as
     /// `name::Command::Reclaim`.
     Reclaim(name::Reclaim),
@@ -85,6 +89,7 @@ enum Phase {
     Chunks(u128),
     DeleteBlock(u128),
     DeleteFile(u128),
+    Unmark,
     Reclaim,
     Done,
 }
@@ -94,6 +99,7 @@ enum Phase {
 pub struct Reclaimer {
     released_ns: u64,
     root: u128,
+    holder: Holder,
     /// The released file, then the adopted part being taken apart: at most two.
     frames: Vec<Frame>,
     chunks: Vec<ChunkPlace>,
@@ -103,12 +109,13 @@ pub struct Reclaimer {
 }
 
 impl Reclaimer {
-    /// The reclamation of `file`, released at `released_ns` ([`name::released`]).
-    pub fn new(released_ns: u64, file: u128, budget: usize) -> Self {
+    /// The reclamation of a released file ([`name::released`]).
+    pub fn new(released: name::Released, budget: usize) -> Self {
         Self {
-            released_ns,
-            root: file,
-            frames: vec![Frame::new(file)],
+            released_ns: released.released_ns,
+            root: released.file,
+            holder: released.holder,
+            frames: vec![Frame::new(released.file)],
             chunks: Vec::new(),
             budget: budget.max(1),
             phase: Phase::Next,
@@ -136,6 +143,13 @@ impl Reclaimer {
                 Request::BlockCommand(block::Command::Delete { block: *block })
             }
             Phase::DeleteFile(file) => Request::FileCommand(file::Command::Delete { file: *file }),
+            Phase::Unmark => Request::Unmark(name::Unmark {
+                files: vec![name::Marked {
+                    bucket: self.holder.bucket.clone(),
+                    key: self.holder.key.clone(),
+                    file: self.root,
+                }],
+            }),
             Phase::Reclaim => Request::Reclaim(name::Reclaim {
                 released_ns: self.released_ns,
                 file: self.root,
@@ -195,11 +209,18 @@ impl Reclaimer {
                 file::Outcome::Deleted => {
                     self.frames.pop();
                     if self.frames.is_empty() {
-                        self.phase = Phase::Reclaim;
+                        self.phase = Phase::Unmark;
                         Ok(())
                     } else {
                         self.advance()
                     }
+                }
+                _ => Err(ReclaimError::Unexpected),
+            },
+            (Phase::Unmark, Answer::NameOutcome(outcome)) => match outcome {
+                name::Outcome::Unmarked => {
+                    self.phase = Phase::Reclaim;
+                    Ok(())
                 }
                 _ => Err(ReclaimError::Unexpected),
             },
@@ -368,6 +389,9 @@ mod tests {
                     let index = self.tick();
                     Answer::FileOutcome(file::apply(&mut self.files, index, &command).unwrap())
                 }
+                Request::Unmark(unmark) => {
+                    Answer::NameOutcome(self.run_name(&Command::Unmark(unmark)))
+                }
                 Request::Reclaim(reclaim) => {
                     Answer::NameOutcome(self.run_name(&Command::Reclaim(reclaim)))
                 }
@@ -454,11 +478,11 @@ mod tests {
             at_ns: 2,
             bypass: false,
         }));
-        let queue = name::released(&cell.name, u64::MAX, 10).unwrap();
+        let mut queue = name::released(&cell.name, u64::MAX, 10).unwrap();
         assert_eq!(queue.len(), 1);
-        let (released_ns, file) = queue[0];
-        assert_eq!(file, 300);
-        let mut reclaimer = Reclaimer::new(released_ns, file, 1);
+        let released = queue.remove(0);
+        assert_eq!(released.file, 300);
+        let mut reclaimer = Reclaimer::new(released, 1);
         assert!(cell.drive(&mut reclaimer, 1_000));
         assert_eq!(name::released(&cell.name, u64::MAX, 10).unwrap(), []);
         for gone in [100, 200, 300] {
@@ -477,7 +501,17 @@ mod tests {
 
     #[test]
     fn answers_out_of_turn_are_refused() {
-        let mut reclaimer = Reclaimer::new(1, 5, 4);
+        let mut reclaimer = Reclaimer::new(
+            name::Released {
+                released_ns: 1,
+                file: 5,
+                holder: crate::record::Holder {
+                    bucket: "b".into(),
+                    key: "k".into(),
+                },
+            },
+            4,
+        );
         assert_eq!(reclaimer.step(Answer::Chunk), Err(ReclaimError::Mismatch));
         reclaimer
             .step(Answer::Extents(vec![(
@@ -551,14 +585,16 @@ mod tests {
                 bypass: false,
             }));
             for &stop in &stops {
-                let [(released_ns, file)] = name::released(&cell.name, u64::MAX, 2).unwrap()[..] else {
+                let mut queue = name::released(&cell.name, u64::MAX, 2).unwrap();
+                if queue.len() != 1 {
                     break;
-                };
-                let mut reclaimer = Reclaimer::new(released_ns, file, budget);
+                }
+                let mut reclaimer = Reclaimer::new(queue.remove(0), budget);
                 cell.drive(&mut reclaimer, stop);
             }
-            if let [(released_ns, file)] = name::released(&cell.name, u64::MAX, 2).unwrap()[..] {
-                let mut reclaimer = Reclaimer::new(released_ns, file, budget);
+            let mut queue = name::released(&cell.name, u64::MAX, 2).unwrap();
+            if queue.len() == 1 {
+                let mut reclaimer = Reclaimer::new(queue.remove(0), budget);
                 prop_assert!(cell.drive(&mut reclaimer, 10_000));
             }
             prop_assert_eq!(name::released(&cell.name, u64::MAX, 2).unwrap(), vec![]);

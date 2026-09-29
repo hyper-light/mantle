@@ -637,16 +637,20 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
         name::Command::Check(c) => {
             w.u8(11);
             record::put_len(w, c.files.len())?;
-            for &(file, deadline_ns) in &c.files {
-                w.u128(file);
-                w.u64(deadline_ns);
+            for f in &c.files {
+                record::put_str(w, &f.bucket)?;
+                record::put_str(w, &f.key)?;
+                w.u128(f.file);
+                w.u64(f.deadline_ns);
             }
         }
         name::Command::Unmark(u) => {
             w.u8(12);
             record::put_len(w, u.files.len())?;
-            for &file in &u.files {
-                w.u128(file);
+            for m in &u.files {
+                record::put_str(w, &m.bucket)?;
+                record::put_str(w, &m.key)?;
+                w.u128(m.file);
             }
         }
     }
@@ -779,18 +783,28 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
             file: r.u128()?,
         }),
         11 => {
-            let count = bounded(r, 24)?;
+            // Two strings' lengths, a file and a deadline at least.
+            let count = bounded(r, 32)?;
             let mut files = Vec::with_capacity(count);
             for _ in 0..count {
-                files.push((r.u128()?, r.u64()?));
+                files.push(name::Checked {
+                    bucket: record::take_str(r)?,
+                    key: record::take_str(r)?,
+                    file: r.u128()?,
+                    deadline_ns: r.u64()?,
+                });
             }
             name::Command::Check(name::Check { files, at_ns })
         }
         12 => {
-            let count = bounded(r, 16)?;
+            let count = bounded(r, 24)?;
             let mut files = Vec::with_capacity(count);
             for _ in 0..count {
-                files.push(r.u128()?);
+                files.push(name::Marked {
+                    bucket: record::take_str(r)?,
+                    key: record::take_str(r)?,
+                    file: r.u128()?,
+                });
             }
             name::Command::Unmark(name::Unmark { files })
         }
@@ -1407,11 +1421,28 @@ mod tests {
                 file: u128::MAX,
             })),
             named(name::Command::Check(name::Check {
-                files: vec![(1, 2), (u128::MAX, u64::MAX)],
+                files: vec![
+                    name::Checked {
+                        bucket: "b".into(),
+                        key: "k\0é".into(),
+                        file: 1,
+                        deadline_ns: 2,
+                    },
+                    name::Checked {
+                        bucket: "b".into(),
+                        key: String::new(),
+                        file: u128::MAX,
+                        deadline_ns: u64::MAX,
+                    },
+                ],
                 at_ns,
             })),
             named(name::Command::Unmark(name::Unmark {
-                files: vec![1, u128::MAX],
+                files: vec![name::Marked {
+                    bucket: "b".into(),
+                    key: "k".into(),
+                    file: u128::MAX,
+                }],
             })),
             Command::File(file::Command::Write {
                 file: 3,

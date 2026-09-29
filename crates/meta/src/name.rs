@@ -12,8 +12,8 @@ use crate::engine::{Rows, Write};
 use crate::error::MetaError;
 use crate::key::{self, NULL_VERSION, NameRow};
 use crate::record::{
-    self, Checksum, DefaultRetention, Gate, GateState, Part, Retention, RetentionMode, Upload,
-    Version,
+    self, Checksum, DefaultRetention, Gate, GateState, Holder, Part, Retention, RetentionMode,
+    Upload, Version,
 };
 
 pub use crate::record::Verdict;
@@ -91,15 +91,32 @@ impl Command {
     }
 
     /// The file a write hands the range, which a version or part will reference if the write
-    /// goes ahead, the time of the entry that carries it, and the file's handover deadline.
-    fn carries(&self) -> Option<(u128, u64, u64)> {
-        match self {
-            Self::Put(c) => c.version.file.map(|file| (file, c.at_ns, c.deadline_ns)),
-            Self::PutPart(c) => Some((c.part.file, c.at_ns, c.deadline_ns)),
-            Self::Complete(c) => c.file.map(|file| (file, c.at_ns, c.deadline_ns)),
-            _ => None,
-        }
+    /// goes ahead, with the key it is for, the time of the entry that carries it, and the
+    /// file's handover deadline.
+    fn carries(&self) -> Option<Carried<'_>> {
+        let (bucket, key, file, at_ns, deadline_ns) = match self {
+            Self::Put(c) => (&c.bucket, &c.key, c.version.file?, c.at_ns, c.deadline_ns),
+            Self::PutPart(c) => (&c.bucket, &c.key, c.part.file, c.at_ns, c.deadline_ns),
+            Self::Complete(c) => (&c.bucket, &c.key, c.file?, c.at_ns, c.deadline_ns),
+            _ => return None,
+        };
+        Some(Carried {
+            bucket,
+            key,
+            file,
+            at_ns,
+            deadline_ns,
+        })
     }
+}
+
+/// A file a write carries.
+struct Carried<'a> {
+    bucket: &'a str,
+    key: &'a str,
+    file: u128,
+    at_ns: u64,
+    deadline_ns: u64,
 }
 
 /// A new version of `key`: PutObject, CopyObject's destination, or a completed upload.
@@ -240,14 +257,40 @@ pub struct Reclaim {
 /// here and now, so no handover can take it after (docs/design/metadata.md §2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Check {
-    pub files: Vec<(u128, u64)>,
+    pub files: Vec<Checked>,
     pub at_ns: u64,
 }
 
-/// The sweep settled these files in their File range: their marks go.
+/// A file the sweep asks about: the key it was made for, and its handover deadline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checked {
+    pub bucket: String,
+    pub key: String,
+    pub file: u128,
+    pub deadline_ns: u64,
+}
+
+/// These files are settled in their File range, or reclaimed: their marks go.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unmark {
-    pub files: Vec<u128>,
+    pub files: Vec<Marked>,
+}
+
+/// A file's mark: the key it is under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Marked {
+    pub bucket: String,
+    pub key: String,
+    pub file: u128,
+}
+
+/// A file in the range's queue of released files: when it was released, and the key it was
+/// held under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Released {
+    pub released_ns: u64,
+    pub file: u128,
+    pub holder: Holder,
 }
 
 /// DeleteObject (05 §7.3).
@@ -367,7 +410,7 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
         None => true,
     };
     let expired = match command.carries() {
-        Some((_, at_ns, deadline_ns)) => clock::now(engine, at_ns)? > deadline_ns,
+        Some(c) => clock::now(engine, c.at_ns)? > c.deadline_ns,
         None => false,
     };
     let (outcome, writes) = match command {
@@ -383,20 +426,16 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
         Command::Hold(h) => hold(engine, h)?,
         Command::Gate(g) => move_gate(engine, g)?,
         Command::Collect(c) => collect(engine, c)?,
-        // The file is gone; so is any mark a sweep that stopped before unmarking left on it.
         Command::Reclaim(r) => (
             Outcome::Reclaimed,
-            vec![
-                Write::Delete(key::released(r.released_ns, r.file)),
-                Write::Delete(key::handed(r.file)),
-            ],
+            vec![Write::Delete(key::released(r.released_ns, r.file))],
         ),
         Command::Check(c) => check(engine, c)?,
         Command::Unmark(u) => (
             Outcome::Unmarked,
             u.files
                 .iter()
-                .map(|&f| Write::Delete(key::handed(f)))
+                .map(|m| Write::Delete(key::mark(&m.bucket, &m.key, m.file)))
                 .collect(),
         ),
     };
@@ -408,27 +447,33 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
     // sweep comes by after, it releases the file a second time, which the reclaimer finds
     // gone (docs/design/metadata.md §2).
     let mut writes = writes;
-    if let Some((file, at_ns, _)) = command.carries() {
+    if let Some(c) = command.carries() {
         if !matches!(outcome, Outcome::Put { .. } | Outcome::PartWritten) {
-            writes.extend(release(clock::now(engine, at_ns)?, file));
+            let now = clock::now(engine, c.at_ns)?;
+            writes.extend(release(now, c.bucket, c.key, c.file)?);
         }
         if !expired {
-            writes.push(Write::Put(key::handed(file), Vec::new()));
+            let mark = key::mark(c.bucket, c.key, c.file);
+            writes.push(Write::Put(mark, Vec::new()));
         }
     }
     engine.apply(index, &writes)?;
     Ok(outcome)
 }
 
-/// The rows that release `file` at the range's time `now_ns`: nothing references it any more,
-/// and the collector reclaims it once the grace period has passed. A mark the sweep left
-/// behind, stopping between settling the file and unmarking it, goes with it
-/// (docs/design/metadata.md §2).
-fn release(now_ns: u64, file: u128) -> [Write; 2] {
-    [
-        Write::Put(key::released(now_ns, file), record::encode_number(now_ns)),
-        Write::Delete(key::handed(file)),
-    ]
+/// The rows that release `file`, held under `key`, at the range's time `now_ns`: nothing
+/// references it any more, and the collector reclaims it once the grace period has passed. A
+/// mark the sweep left behind, stopping between settling the file and unmarking it, goes with
+/// it (docs/design/metadata.md §2).
+fn release(now_ns: u64, bucket: &str, key: &str, file: u128) -> Result<[Write; 2], MetaError> {
+    let holder = Holder {
+        bucket: bucket.to_owned(),
+        key: key.to_owned(),
+    };
+    Ok([
+        Write::Put(key::released(now_ns, file), holder.encode()?),
+        Write::Delete(key::mark(bucket, key, file)),
+    ])
 }
 
 /// The range's verdict on each file the sweep asks about, releasing and marking every file
@@ -439,16 +484,14 @@ fn check<E: Rows>(engine: &E, c: &Check) -> Result<(Outcome, Vec<Write>), MetaEr
     let (now, clock) = clock::tick(engine, c.at_ns)?;
     let mut verdicts = Vec::with_capacity(c.files.len());
     let mut writes = vec![clock];
-    for &(file, deadline_ns) in &c.files {
-        let marked = engine.get(&key::handed(file))?.is_some();
-        verdicts.push(if marked {
+    for f in &c.files {
+        let mark = key::mark(&f.bucket, &f.key, f.file);
+        verdicts.push(if engine.get(&mark)?.is_some() {
             Verdict::Held
-        } else if now > deadline_ns {
-            writes.push(Write::Put(
-                key::released(now, file),
-                record::encode_number(now),
-            ));
-            writes.push(Write::Put(key::handed(file), Vec::new()));
+        } else if now > f.deadline_ns {
+            let [queued, _] = release(now, &f.bucket, &f.key, f.file)?;
+            writes.push(queued);
+            writes.push(Write::Put(mark, Vec::new()));
             Verdict::Released
         } else {
             Verdict::Young
@@ -463,14 +506,19 @@ pub fn released<E: Rows>(
     engine: &E,
     before_ns: u64,
     max: usize,
-) -> Result<Vec<(u64, u128)>, MetaError> {
+) -> Result<Vec<Released>, MetaError> {
     let (mut from, to) = key::released_before(before_ns);
     let mut out = Vec::new();
     while out.len() < max {
-        let Some((k, _)) = engine.next(&from, &to)? else {
+        let Some((k, v)) = engine.next(&from, &to)? else {
             break;
         };
-        out.push(key::decode_released(&k).ok_or(MetaError::Corrupt)?);
+        let (released_ns, file) = key::decode_released(&k).ok_or(MetaError::Corrupt)?;
+        out.push(Released {
+            released_ns,
+            file,
+            holder: Holder::decode(&v)?,
+        });
         from = after(&k);
     }
     Ok(out)
@@ -577,7 +625,9 @@ fn collect<E: Rows>(engine: &E, c: &Collect) -> Result<(Outcome, Vec<Write>), Me
         };
         match key::decode_name(&k) {
             Some((_, _, NameRow::Upload(_))) => {}
-            Some((_, _, NameRow::Part(..))) => writes.extend(release(now, Part::decode(&v)?.file)),
+            Some((_, object, NameRow::Part(..))) => {
+                writes.extend(release(now, &c.bucket, &object, Part::decode(&v)?.file)?);
+            }
             // A version under a condemned gate: the delete never read this range (§2), and
             // the collector removes no object.
             Some(_) => return Ok((Outcome::NotEmpty, Vec::new())),
@@ -717,7 +767,7 @@ fn delete<E: Rows>(engine: &E, d: &Delete) -> Result<(Outcome, Vec<Write>), Meta
                         writes.push(Write::Delete(key::name(bucket, key, &NameRow::Null)));
                     }
                     if let Some(file) = v.file {
-                        writes.extend(release(now, file));
+                        writes.extend(release(now, bucket, key, file)?);
                     }
                     Some(v)
                 }
@@ -820,7 +870,8 @@ fn put_part<E: Rows>(engine: &E, p: &PutPart) -> Result<(Outcome, Vec<Write>), M
     if let Some(replaced) = engine.get(&row)?.map(|b| Part::decode(&b)).transpose()?
         && replaced.file != p.part.file
     {
-        writes.extend(release(clock::now(engine, p.at_ns)?, replaced.file));
+        let now = clock::now(engine, p.at_ns)?;
+        writes.extend(release(now, &p.bucket, &p.key, replaced.file)?);
     }
     writes.push(Write::Put(row, p.part.encode()?));
     Ok((Outcome::PartWritten, writes))
@@ -840,7 +891,8 @@ fn complete<E: Rows>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), 
                 if let Some(file) = c.file
                     && v.file != c.file
                 {
-                    writes.extend(release(clock::now(engine, c.at_ns)?, file));
+                    let now = clock::now(engine, c.at_ns)?;
+                    writes.extend(release(now, &c.bucket, &c.key, file)?);
                 }
                 (
                     Outcome::Put {
@@ -1051,7 +1103,7 @@ fn remove_upload<E: Rows>(
             return Err(MetaError::Corrupt);
         };
         if !kept.contains(&number) {
-            writes.extend(release(now_ns, Part::decode(&v)?.file));
+            writes.extend(release(now_ns, bucket, key, Part::decode(&v)?.file)?);
         }
         from = after(&k);
         writes.push(Write::Delete(k));
@@ -1162,7 +1214,7 @@ fn remove_null<E: Rows>(
                 Write::Delete(key::name(bucket, key, &NameRow::Null)),
             ];
             if let Some(file) = v.file {
-                writes.extend(release(now_ns, file));
+                writes.extend(release(now_ns, bucket, key, file)?);
             }
             Ok((Some(v), writes))
         }
@@ -2324,7 +2376,7 @@ mod tests {
         let mut files: Vec<u128> = released(&r.engine, u64::MAX, 10)
             .unwrap()
             .into_iter()
-            .map(|(_, file)| file)
+            .map(|r| r.file)
             .collect();
         files.sort_unstable();
         assert_eq!(files, [11, 12, 13]);
@@ -2734,7 +2786,7 @@ mod tests {
         let released = released(engine, u64::MAX, usize::MAX)
             .unwrap()
             .into_iter()
-            .map(|(_, file)| file)
+            .map(|r| r.file)
             .collect();
         (versions, parts, released)
     }
@@ -2910,11 +2962,14 @@ mod tests {
             r.delete(key, Versioning::Unversioned, None);
         }
         let queue = released(&r.engine, u64::MAX, 10).unwrap();
-        let times: Vec<u64> = queue.iter().map(|(t, _)| t / MS).collect();
+        let times: Vec<u64> = queue.iter().map(|r| r.released_ns / MS).collect();
         assert_eq!(times, [100, 200, 300]);
+        // Each row names the key its file was held under.
+        let keys: Vec<&str> = queue.iter().map(|r| r.holder.key.as_str()).collect();
+        assert_eq!(keys, ["b", "c", "a"]);
         assert_eq!(released(&r.engine, 200 * MS, 10).unwrap().len(), 1);
         assert_eq!(released(&r.engine, u64::MAX, 2).unwrap(), queue[..2]);
-        let (released_ns, file) = queue[0];
+        let (released_ns, file) = (queue[0].released_ns, queue[0].file);
         assert_eq!(
             r.run(Command::Reclaim(Reclaim { released_ns, file })),
             Outcome::Reclaimed
@@ -2947,13 +3002,22 @@ mod tests {
                 deadline_ns,
             }))
         };
-        let marked = |r: &Range, file| r.engine.get(&key::handed(file)).unwrap().is_some();
+        let marked = |r: &Range, k: &str, file| {
+            let mark = key::mark("b", k, file);
+            r.engine.get(&mark).unwrap().is_some()
+        };
         let queue = |r: &Range| -> Vec<u128> {
             released(&r.engine, u64::MAX, 10)
                 .unwrap()
                 .into_iter()
-                .map(|(_, file)| file)
+                .map(|r| r.file)
                 .collect()
+        };
+        let asked = |k: &str, file, deadline_ns| Checked {
+            bucket: "b".into(),
+            key: k.into(),
+            file,
+            deadline_ns,
         };
         let in_time = r.clock + 10;
         assert!(matches!(put(&mut r, "a", 5, in_time), Outcome::Put { .. }));
@@ -2961,52 +3025,73 @@ mod tests {
         // releases the file unmarked.
         assert_eq!(put(&mut r, "b", 6, in_time), Outcome::Expired);
         assert_eq!(queue(&r), [6]);
-        assert!(marked(&r, 5) && !marked(&r, 6));
+        assert!(marked(&r, "a", 5) && !marked(&r, "b", 6));
         // 5 was taken; 6 was released when it came late, which the sweep cannot tell, so it
         // releases it again, which the reclaimer finds gone; 7 was never handed over and is
         // past its deadline; 8 was never handed over and is not yet.
         r.clock += 10;
-        let check = |r: &mut Range, files: Vec<(u128, u64)>| {
+        let check = |r: &mut Range, files: Vec<Checked>| {
             let at_ns = r.clock;
             r.run(Command::Check(Check { files, at_ns }))
         };
         assert_eq!(
-            check(&mut r, vec![(5, 0), (6, 0), (7, 0), (8, u64::MAX)]),
+            check(
+                &mut r,
+                vec![
+                    asked("a", 5, 0),
+                    asked("b", 6, 0),
+                    asked("c", 7, 0),
+                    asked("d", 8, u64::MAX)
+                ]
+            ),
             Outcome::Checked(vec![Held, Released, Released, Young])
         );
         assert_eq!(queue(&r), [6, 6, 7]);
         // A sweep that stopped before settling asks again, and 7 is not released twice.
-        assert_eq!(check(&mut r, vec![(7, 0)]), Outcome::Checked(vec![Held]));
+        assert_eq!(
+            check(&mut r, vec![asked("c", 7, 0)]),
+            Outcome::Checked(vec![Held])
+        );
         // A handover of 7 after its release finds its deadline passed.
         assert_eq!(put(&mut r, "c", 7, 0), Outcome::Expired);
         // Once settled, the marks go; a mark left behind goes when its file is released.
-        let unmark = Command::Unmark(Unmark {
-            files: vec![6, 7, 8],
-        });
-        assert_eq!(r.run(unmark), Outcome::Unmarked);
-        assert!(!marked(&r, 6) && !marked(&r, 7) && marked(&r, 5));
+        let marks = |files: &[(&str, u128)]| {
+            Command::Unmark(Unmark {
+                files: files
+                    .iter()
+                    .map(|&(k, file)| Marked {
+                        bucket: "b".into(),
+                        key: k.into(),
+                        file,
+                    })
+                    .collect(),
+            })
+        };
+        assert_eq!(
+            r.run(marks(&[("b", 6), ("c", 7), ("d", 8)])),
+            Outcome::Unmarked
+        );
+        assert!(!marked(&r, "b", 6) && !marked(&r, "c", 7) && marked(&r, "a", 5));
         assert!(matches!(
             r.delete("a", Versioning::Unversioned, None),
             Outcome::Deleted { .. }
         ));
-        assert!(!marked(&r, 5));
-        // A sweep that released 9 and stopped before unmarking it: the mark goes when the
-        // reclaimer is done with the file.
+        assert!(!marked(&r, "a", 5));
+        // A sweep that released 9 and stopped before unmarking it: the reclaimer removes the
+        // mark, routed by the key the queue row names, before the row.
         assert_eq!(
-            check(&mut r, vec![(9, 0)]),
+            check(&mut r, vec![asked("e", 9, 0)]),
             Outcome::Checked(vec![Released])
         );
-        assert!(marked(&r, 9));
-        let (released_ns, file) = *released(&r.engine, u64::MAX, 100)
+        assert!(marked(&r, "e", 9));
+        let row = released(&r.engine, u64::MAX, 100)
             .unwrap()
-            .iter()
-            .find(|(_, f)| *f == 9)
+            .into_iter()
+            .find(|r| r.file == 9)
             .unwrap();
-        assert_eq!(
-            r.run(Command::Reclaim(Reclaim { released_ns, file })),
-            Outcome::Reclaimed
-        );
-        assert!(!marked(&r, 9));
+        assert_eq!(row.holder.key, "e");
+        assert_eq!(r.run(marks(&[("e", 9)])), Outcome::Unmarked);
+        assert!(!marked(&r, "e", 9));
     }
 
     /// A leader whose clock runs behind proposes a handover at a time earlier than the check
@@ -3019,7 +3104,12 @@ mod tests {
         let deadline_ns = r.clock + 50;
         let released_at = deadline_ns + 1;
         let check = Command::Check(Check {
-            files: vec![(4, deadline_ns)],
+            files: vec![Checked {
+                bucket: "b".into(),
+                key: "a".into(),
+                file: 4,
+                deadline_ns,
+            }],
             at_ns: released_at,
         });
         assert_eq!(r.run(check), Outcome::Checked(vec![Verdict::Released]));
@@ -3060,6 +3150,6 @@ mod tests {
         r.delete("a", Versioning::Unversioned, None);
         let queue = released(&r.engine, u64::MAX, 10).unwrap();
         assert_eq!(queue.len(), 1);
-        assert_eq!(queue[0].0 / MS, 20);
+        assert_eq!(queue[0].released_ns / MS, 20);
     }
 }

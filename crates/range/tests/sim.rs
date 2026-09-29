@@ -2,7 +2,9 @@
 //!
 //! Three replicas, each with its log on a simulated device and a model engine, run over a
 //! simulated network that delays, drops and partitions messages. Nodes crash, losing what
-//! neither their log nor their engine had made durable, and restart from what was. Three
+//! neither their log nor their engine had made durable, and restart from what was; a
+//! device's write or flush fails, which fences the node's log and takes the node down until
+//! it restarts from what the device kept. Three
 //! gateways, each with its own session, put and get two keys at once: puts go through the
 //! log, retried through leader changes with the session's serial numbers, and gets through
 //! the leader's ReadIndex. A run is its seed.
@@ -32,7 +34,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use mantle_disk::buf::Alignment;
-use mantle_disk::sim::{Crash, SimFile};
+use mantle_disk::sim::{Crash, Fault, SimFile};
 use mantle_log::{Config as LogConfig, Log};
 use mantle_meta::apply::Layer;
 use mantle_meta::engine::{Model, Rows};
@@ -327,12 +329,23 @@ impl World {
         if self.rng.chance(15) {
             self.blocked.clear();
         }
+        if self.rng.chance(2) && self.nodes[i].replica.is_some() {
+            // The device fails its next write or flush, which fences the log.
+            let fault = if self.rng.chance(500) {
+                Fault::WriteError
+            } else {
+                Fault::SyncError
+            };
+            self.nodes[i].file.inject(fault).unwrap();
+        }
         if self.rng.chance(10)
             && let Some(r) = self.nodes[i].replica.as_mut()
         {
             let keep = self.rng.below(8);
-            if let Err(e) = r.compact(keep) {
-                self.fail(&format!("compact: {e}"));
+            match r.compact(keep) {
+                Ok(()) => {}
+                Err(ReplicaError::Log(_)) => self.nodes[i].crash(),
+                Err(e) => self.fail(&format!("compact: {e}")),
             }
         }
     }
@@ -381,9 +394,15 @@ impl World {
             let Some(r) = n.replica.as_mut() else {
                 continue;
             };
-            let out = r
-                .drive()
-                .unwrap_or_else(|e| panic!("drive on {}: {e}", n.id));
+            let out = match r.drive() {
+                Ok(out) => out,
+                // A fenced log takes its node down; it restarts from what its device kept.
+                Err(ReplicaError::Log(_)) => {
+                    n.crash();
+                    continue;
+                }
+                Err(e) => panic!("drive on {}: {e}", n.id),
+            };
             sent.extend(out.messages);
             applied.extend(out.applied);
             reads.extend(out.reads.into_iter().map(|(index, ctx)| (n.id, index, ctx)));
@@ -638,6 +657,8 @@ impl World {
         self.blocked.clear();
         let seed = self.seed;
         for n in &mut self.nodes {
+            // A fault armed on a running node would still fire after the faults stop.
+            n.file.clear_faults().unwrap();
             n.restart(seed);
         }
     }
@@ -719,14 +740,16 @@ fn open_gate() -> Command {
     })))
 }
 
-/// Every row of an engine.
+/// Every row of an engine that its range replicates.
 fn rows(m: &Model) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut out = Vec::new();
     let mut at = Vec::new();
     while let Some((k, v)) = m.next(&at, &[0xFF]).unwrap() {
         at = k.clone();
         at.push(0);
-        out.push((k, v));
+        if !mantle_range::member_local(&k) {
+            out.push((k, v));
+        }
     }
     out
 }

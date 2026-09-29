@@ -103,6 +103,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
             None => boot.clone(),
         };
         let applied = engine.applied();
+        complete_install(&log, group, &engine)?;
         let config = focal_raft::Config {
             election_tick: settings.election_tick,
             heartbeat_tick: settings.heartbeat_tick,
@@ -418,8 +419,16 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
             .metadata
             .clone()
             .ok_or_else(|| ReplicaError::Stopped("a snapshot without metadata".into()))?;
-        let rows = image::decode(&snapshot.data)
+        let mut rows = image::decode(&snapshot.data)
             .ok_or_else(|| ReplicaError::Stopped("a snapshot's rows do not decode".into()))?;
+        // The engine keeps the snapshot's point beside its rows, so a restart can finish an
+        // install whose log write failed after the engine took it.
+        rows.retain(|(k, _)| k.as_slice() != conf::INSTALLED);
+        rows.push((
+            conf::INSTALLED.to_vec(),
+            conf::encode_point(metadata.index, metadata.term),
+        ));
+        rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         self.engine.install(metadata.index, rows)?;
         self.engine.persist()?;
         self.applied = metadata.index;
@@ -433,6 +442,53 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
             term: metadata.term,
         })
     }
+}
+
+/// Finishes an install the log never recorded. The engine takes a snapshot and makes it
+/// durable before the log records the snapshot's point; if that log write failed, the engine
+/// stands at the snapshot while the log ends before it. The snapshot is committed state, and
+/// nothing was acknowledged for the failed write, so the log is brought to it: it starts at
+/// the snapshot's point, holds nothing past it, and knows it committed.
+fn complete_install<F: BlockFile + 'static, E: Engine>(
+    log: &Log<F>,
+    group: u128,
+    engine: &E,
+) -> Result<(), ReplicaError> {
+    let Some(bytes) = engine.get(conf::INSTALLED)? else {
+        return Ok(());
+    };
+    let (index, term) = conf::decode_point(&bytes)
+        .ok_or_else(|| ReplicaError::Stopped("the snapshot point does not decode".into()))?;
+    let view = log.view(group)?;
+    let recorded = match log.term(group, index) {
+        Ok(t) => t == term,
+        Err(mantle_log::LogError::Compacted { .. }) => true,
+        Err(_) => false,
+    };
+    if recorded {
+        return Ok(());
+    }
+    let hard = view.and_then(|v| v.hard_state).unwrap_or_default();
+    let first = index
+        .checked_add(1)
+        .ok_or_else(|| ReplicaError::Stopped("an index past u64".into()))?;
+    log.write_waiting(
+        group,
+        Update {
+            start: Some(Start { index, term }),
+            entries: Some(Entries {
+                first,
+                entries: Vec::new(),
+            }),
+            hard_state: Some(mantle_log::HardState {
+                commit: hard.commit.max(index),
+                ..hard
+            }),
+            proposals: Vec::new(),
+            remove: false,
+        },
+    )?;
+    Ok(())
 }
 
 /// What a ready asks to be made durable, as one update of the log: after a snapshot

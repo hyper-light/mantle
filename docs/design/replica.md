@@ -59,7 +59,11 @@ For each `Ready` the core gives, the replica does these steps in order:
 
 1. Installs the `Ready`'s snapshot, if it carries one. The engine takes the snapshot's rows
    and makes them durable before the log records the snapshot's index as the group's start,
-   so the log never starts past what the engine holds.
+   so the log never starts past what the engine holds. The engine keeps the snapshot's
+   index and term beside its rows. If the log write then fails, the replica finishes the
+   install on restart: the engine stands at the snapshot, which is committed state, and
+   the failed write was never acknowledged. So the log starts at the snapshot, holds nothing
+   past it, and records it as committed.
 2. Sends the messages a leader may send before its own write. The core marks them apart
    from those that must wait (07 §1.2). A leader writing in parallel with its followers is
    Ongaro's §10.2.1 optimization (06 §A1.9).
@@ -98,7 +102,9 @@ rows.
 Replicas are tested in deterministic simulation (`crates/range/tests/sim.rs`). Three
 nodes, each with a simulated device for its log and a model engine, run over a simulated
 network that delays, drops, reorders and partitions messages. Nodes crash, losing whatever
-their log and engine had not made durable, and restart. Replicas compact at random, so
+their log and engine had not made durable, and restart. Devices fail writes and flushes,
+which fences a node's log and takes the node down until it restarts from what the device
+kept. Replicas compact at random, so
 lagging members are caught up by snapshot. Three gateways, each with its own session, put
 and get two keys at once. Puts go through the log, retried through leader changes with the
 session's serials. Gets are confirmed by ReadIndex and answered from the leader's rows once
@@ -112,7 +118,8 @@ must hold:
 - each key's history, as the gateways saw it in the simulation's time, is linearizable by
   Horn and Kroening's WGL search (06 §A6.8).
 
-A soak of 20,000 seeds passes. The simulation catches two broken variants on purpose,
+A soak of 20,000 seeds passes, with thousands of fenced logs among them. Failed flushes
+exposed an install the log never recorded, which restart now finishes. The simulation catches two broken variants on purpose,
 within the first seeds: gets served from any member's rows without ReadIndex fail
 linearizability, and a replica that applies a repeated command again stores a put twice.
 

@@ -128,8 +128,9 @@ Range replicas (`mantle-range`, [design](design/replica.md)) run focal-raft's co
 log and an engine: an entry carries a batch of gateway commands applied as one engine batch,
 client sessions make each command take effect once however often it is retried, and members
 that lag are caught up by snapshot, and reads are confirmed by ReadIndex. A deterministic
-simulation of three members and three concurrent gateways, under crashes, partitions,
-dropped and reordered messages and compaction, checks after every run that each index was
+simulation of three members and three concurrent gateways, under crashes, failed writes
+and flushes, partitions, dropped and reordered messages and compaction, checks after every
+run that each index was
 applied the same everywhere, that every operation completes once faults stop, that every
 put exists exactly once, that the members agree, and that each key's history is
 linearizable; a soak of 20,000 seeds passed, and the simulation catches stale reads and

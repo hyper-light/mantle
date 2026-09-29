@@ -21,6 +21,8 @@ use crate::writer::Shared;
 pub struct ReadStats {
     /// The most reads at the device at once since the volume opened.
     pub most_at_device: usize,
+    /// The most bytes the reads at the device buffered at once since the volume opened.
+    pub most_bytes: u64,
     /// Reads refused with `Busy` since the volume opened.
     pub refused: u64,
 }
@@ -28,17 +30,37 @@ pub struct ReadStats {
 #[derive(Debug, Default)]
 struct Turns {
     at_device: usize,
-    /// The reads waiting, in the order they arrived: each one's ticket, and its thread, woken
-    /// alone when its turn comes.
-    waiting: VecDeque<(u64, Thread)>,
+    /// Bytes the reads at the device buffer.
+    bytes: u64,
+    /// The reads waiting, in the order they arrived: each one's ticket, the bytes it will
+    /// buffer, and its thread, woken alone when its turn comes.
+    waiting: VecDeque<(u64, u64, Thread)>,
     /// Tickets handed out, and turns handed to waiting reads, in the order they arrived.
     issued: u64,
     admitted: u64,
     stats: ReadStats,
 }
 
-/// Holds client reads at `Reads::depth` at the device, lets `Reads::waiting` more wait in the
-/// order they arrived, and refuses the rest with `Busy`. A wait lasts while the reads ahead
+impl Turns {
+    /// Whether a read that buffers `cost` bytes may go to the device now: a turn is free, and
+    /// its bytes fit, or it goes alone.
+    fn fits(&self, reads: &Reads, cost: u64) -> bool {
+        self.at_device < reads.depth
+            && (self.at_device == 0 || self.bytes.saturating_add(cost) <= reads.bytes)
+    }
+
+    fn admit(&mut self, cost: u64) {
+        self.at_device = self.at_device.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(cost);
+        self.stats.most_at_device = self.stats.most_at_device.max(self.at_device);
+        self.stats.most_bytes = self.stats.most_bytes.max(self.bytes);
+    }
+}
+
+/// Holds client reads at `Reads::depth` at the device and their buffers at `Reads::bytes`,
+/// lets `Reads::waiting` more wait in the order they arrived, and refuses the rest with
+/// `Busy`. A read is let through before its buffers are taken, so what the reads hold is
+/// bounded by the gate, not by how many arrive (audit S07). A wait lasts while the reads ahead
 /// take, each bounded by the operating system's I/O timeout.
 #[derive(Debug)]
 pub(crate) struct Gate {
@@ -46,10 +68,11 @@ pub(crate) struct Gate {
     turns: Mutex<Turns>,
 }
 
-/// A read's turn at the device, given back when dropped: to the read that has waited longest,
-/// if one waits.
+/// A read's turn at the device and the bytes it buffers, given back when dropped: to the reads
+/// that have waited longest, in order, as many as then fit.
 pub(crate) struct Turn<'a> {
     gate: &'a Gate,
+    cost: u64,
 }
 
 impl Gate {
@@ -60,18 +83,20 @@ impl Gate {
         }
     }
 
-    /// A turn at the device, at once if one is free, after the reads that came first if one
-    /// may wait, and otherwise `Busy`.
-    pub fn enter(&self) -> Result<Turn<'_>, ChunkError> {
+    /// A turn for a read that buffers `cost` bytes: at once if it fits and none waits, after
+    /// the reads that came first if one may wait, and otherwise `Busy`.
+    pub fn enter(&self, cost: u64) -> Result<Turn<'_>, ChunkError> {
         let mut turns = self.turns.lock().map_err(|_| ChunkError::Fenced)?;
-        if turns.at_device < self.reads.depth && turns.waiting.is_empty() {
-            turns.at_device = turns.at_device.checked_add(1).ok_or(ChunkError::Busy)?;
+        if turns.waiting.is_empty() && turns.fits(&self.reads, cost) {
+            turns.admit(cost);
         } else if turns.waiting.len() < self.reads.waiting {
             let ticket = turns.issued;
             turns.issued = ticket.checked_add(1).ok_or(ChunkError::Busy)?;
-            turns.waiting.push_back((ticket, std::thread::current()));
-            // A turn given back is handed to the next ticket, counted at the device for it,
-            // and only that read is woken. A wake-up before the park is kept by it.
+            turns
+                .waiting
+                .push_back((ticket, cost, std::thread::current()));
+            // A turn given back admits the reads at the head that fit, counts them at the
+            // device, and wakes only them. A wake-up before the park is kept by it.
             while turns.admitted <= ticket {
                 drop(turns);
                 std::thread::park();
@@ -81,8 +106,7 @@ impl Gate {
             turns.stats.refused = turns.stats.refused.saturating_add(1);
             return Err(ChunkError::Busy);
         }
-        turns.stats.most_at_device = turns.stats.most_at_device.max(turns.at_device);
-        Ok(Turn { gate: self })
+        Ok(Turn { gate: self, cost })
     }
 
     pub fn stats(&self) -> Result<ReadStats, ChunkError> {
@@ -95,17 +119,38 @@ impl Drop for Turn<'_> {
         let Ok(mut turns) = self.gate.turns.lock() else {
             return;
         };
-        if let Some(next) = turns.admitted.checked_add(1)
-            && let Some((_, reader)) = turns.waiting.pop_front()
-        {
-            // The turn passes to the read that has waited longest, still at the device.
-            turns.admitted = next;
-            drop(turns);
+        turns.at_device = turns.at_device.saturating_sub(1);
+        turns.bytes = turns.bytes.saturating_sub(self.cost);
+        let mut woken = Vec::new();
+        // In the order they arrived: a read at the head that does not fit holds the rest.
+        while let Some(&(_, cost, _)) = turns.waiting.front() {
+            if !turns.fits(&self.gate.reads, cost) {
+                break;
+            }
+            let Some((_, cost, reader)) = turns.waiting.pop_front() else {
+                break;
+            };
+            turns.admit(cost);
+            turns.admitted = turns.admitted.saturating_add(1);
+            woken.push(reader);
+        }
+        drop(turns);
+        for reader in woken {
             reader.unpark();
-        } else if let Some(left) = turns.at_device.checked_sub(1) {
-            turns.at_device = left;
         }
     }
+}
+
+/// Bytes a read of `fragment`'s payload up to `to` buffers from the device: the record's
+/// header and checksum table, and the checksum blocks up to the one holding `to`.
+pub(crate) fn span_len(shift: u8, fragment: &Fragment, to: u64) -> Option<u64> {
+    let block_size = 1u64.checked_shl(u32::from(shift))?;
+    let prefix_len = u64::try_from(record::prefix_len(fragment.payload_len, shift)?).ok()?;
+    let last_block_end = to
+        .div_ceil(block_size)
+        .saturating_mul(block_size)
+        .min(u64::from(fragment.payload_len));
+    Some(prefix_len.saturating_add(last_block_end))
 }
 
 /// Appends payload bytes `[from, to)` of `fragment` to `out`. A device error or any failed
@@ -138,7 +183,7 @@ pub(crate) fn fragment<F: BlockFile>(
         .min(u64::from(fragment.payload_len));
     let payload_from = first_block.saturating_mul(block_size);
     // One read covering the header and the checksum blocks that hold the range.
-    let span_len = prefix_len.saturating_add(last_block_end);
+    let span_len = span_len(shift, fragment, to).ok_or_else(|| corrupt("record size"))?;
     let span = match read_span(
         &shared.file,
         &shared.pool,
@@ -203,15 +248,16 @@ mod tests {
         let gate = Arc::new(Gate::new(Reads {
             depth: 2,
             waiting: 2,
+            bytes: u64::MAX,
         }));
-        let first = gate.enter().unwrap();
-        let second = gate.enter().unwrap();
+        let first = gate.enter(1).unwrap();
+        let second = gate.enter(1).unwrap();
         let (admitted, order) = mpsc::channel();
         let waiters: Vec<_> = (0..2)
             .map(|n| {
                 let (theirs, admitted) = (Arc::clone(&gate), admitted.clone());
                 let waiter = std::thread::spawn(move || {
-                    let _turn = theirs.enter().unwrap();
+                    let _turn = theirs.enter(1).unwrap();
                     admitted.send(n).unwrap();
                 });
                 // The next one arrives only once this one waits.
@@ -221,7 +267,7 @@ mod tests {
                 waiter
             })
             .collect();
-        assert!(matches!(gate.enter(), Err(ChunkError::Busy)));
+        assert!(matches!(gate.enter(1), Err(ChunkError::Busy)));
         drop(first);
         assert_eq!(order.recv().unwrap(), 0);
         drop(second);
@@ -235,19 +281,83 @@ mod tests {
         assert_eq!((turns.at_device, turns.waiting.len()), (0, 0));
     }
 
-    /// However many readers come at once, no more than the depth are at the device, and every
-    /// turn taken is given back.
+    /// The gate holds the reads' buffers to its bytes as it holds them to its depth: a read
+    /// whose bytes do not fit waits with a turn free, the reads behind it wait in order, and a
+    /// read larger than the bytes goes only alone (audit S07).
     #[test]
-    fn many_readers_never_pass_the_depth() {
+    fn the_gate_holds_its_bytes_and_takes_a_larger_read_alone() {
+        let gate = Arc::new(Gate::new(Reads {
+            depth: 4,
+            waiting: 4,
+            bytes: 100,
+        }));
+        let first = gate.enter(60).unwrap();
+        let (admitted, order) = mpsc::channel();
+        let costs = [50u64, 10, 500];
+        let waiters: Vec<_> = costs
+            .iter()
+            .enumerate()
+            .map(|(n, &cost)| {
+                let (theirs, admitted) = (Arc::clone(&gate), admitted.clone());
+                let waiter = std::thread::spawn(move || {
+                    let turn = theirs.enter(cost).unwrap();
+                    admitted.send((n, turn.cost)).unwrap();
+                    // Held until the test has seen who is at the device.
+                    std::thread::park();
+                    drop(turn);
+                });
+                while waiting(&gate) < n + 1 {
+                    std::thread::yield_now();
+                }
+                waiter
+            })
+            .collect();
+        // Behind the one that does not fit, a read that would fit waits too.
+        assert_eq!(gate.turns.lock().unwrap().at_device, 1);
+        drop(first);
+        // The first two fit together; the large one waits for the device to empty.
+        let mut seen = vec![order.recv().unwrap(), order.recv().unwrap()];
+        seen.sort_unstable();
+        assert_eq!(seen, vec![(0, 50), (1, 10)]);
+        assert_eq!(waiting(&gate), 1);
+        waiters[0].thread().unpark();
+        waiters[1].thread().unpark();
+        assert_eq!(order.recv().unwrap(), (2, 500));
+        assert_eq!(gate.turns.lock().unwrap().at_device, 1);
+        waiters[2].thread().unpark();
+        for waiter in waiters {
+            waiter.join().unwrap();
+        }
+        let stats = gate.stats().unwrap();
+        assert_eq!(stats.most_bytes, 500);
+        let turns = gate.turns.lock().unwrap();
+        assert_eq!(
+            (turns.at_device, turns.bytes, turns.waiting.len()),
+            (0, 0, 0)
+        );
+    }
+
+    /// However many readers come at once, no more than the depth are at the device, their
+    /// bytes stay within the budget but for a read alone, and every turn taken is given back.
+    #[test]
+    fn many_readers_never_pass_the_depth_or_the_bytes() {
         let gate = Gate::new(Reads {
             depth: 3,
             waiting: 5,
+            bytes: 1_000,
         });
         std::thread::scope(|s| {
-            for _ in 0..16 {
-                s.spawn(|| {
-                    for _ in 0..2_000 {
-                        match gate.enter() {
+            for t in 0..16u64 {
+                let gate = &gate;
+                s.spawn(move || {
+                    for i in 0..2_000u64 {
+                        // Mostly reads that fit, now and then one larger than the budget.
+                        let cost = if (t + i) % 97 == 0 {
+                            5_000
+                        } else {
+                            100 + (t * 37 + i) % 400
+                        };
+                        match gate.enter(cost) {
                             Ok(turn) => drop(turn),
                             Err(ChunkError::Busy) => std::thread::yield_now(),
                             Err(e) => panic!("{e}"),
@@ -258,7 +368,11 @@ mod tests {
         });
         let stats = gate.stats().unwrap();
         assert!(stats.most_at_device <= 3, "{stats:?}");
+        assert!(stats.most_bytes <= 5_000, "{stats:?}");
         let turns = gate.turns.lock().unwrap();
-        assert_eq!((turns.at_device, turns.waiting.len()), (0, 0));
+        assert_eq!(
+            (turns.at_device, turns.bytes, turns.waiting.len()),
+            (0, 0, 0)
+        );
     }
 }

@@ -80,6 +80,7 @@ impl<F: BlockFile + 'static> Volume<F> {
     /// Lays out a new, empty volume of `size` bytes in `file` and opens it. Whatever `file`
     /// held before is ignored: every structure is bound to the new volume's random id.
     pub fn format(file: F, size: u64, config: Config) -> Result<Self, ChunkError> {
+        config.check()?;
         let geometry = Geometry::plan(size, file.alignment(), &config)?;
         if config.prewrite {
             prewrite(&file, &geometry, config.limits.batch_bytes)?;
@@ -118,6 +119,7 @@ impl<F: BlockFile + 'static> Volume<F> {
 
     /// Opens a volume, recovering from a clean shutdown or a crash alike.
     pub fn open(file: F, config: Config) -> Result<(Self, RecoveryReport), ChunkError> {
+        config.check()?;
         let superblock = read_superblock(&file)?;
         let geometry = Geometry {
             block: u64::from(superblock.block),
@@ -494,11 +496,27 @@ impl<F: BlockFile + 'static> Volume<F> {
                 .copied()
                 .collect::<Vec<Fragment>>()
         };
+        let end = offset.saturating_add(len);
+        // The fragments are read one at a time, so the read buffers the most any one needs.
+        let mut cost = 0u64;
+        for fragment in &fragments {
+            let to = end
+                .min(fragment.end())
+                .saturating_sub(fragment.chunk_offset);
+            let span = read::span_len(self.shared.checksum_shift, fragment, to).ok_or(
+                ChunkError::Corrupt {
+                    key: *key,
+                    detail: "record size".into(),
+                },
+            )?;
+            cost = cost.max(span);
+        }
+        // Let through before anything is taken: a read refused or waiting holds no memory.
+        let _turn = self.shared.reads.enter(cost)?;
         let capacity =
             usize::try_from(len).map_err(|_| ChunkError::TooLarge { len, max: u64::MAX })?;
-        out.reserve(capacity);
-        let end = offset.saturating_add(len);
-        let _turn = self.shared.reads.enter()?;
+        out.try_reserve(capacity)
+            .map_err(|_| ChunkError::TooLarge { len, max: 0 })?;
         for fragment in &fragments {
             let from = offset
                 .max(fragment.chunk_offset)

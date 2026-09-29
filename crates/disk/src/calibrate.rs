@@ -15,13 +15,14 @@
 //! The scratch file's size is bounded by the plan and by a tenth of the free space, and it is
 //! removed however calibration ends.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::DiskError;
 use crate::buf::Alignment;
 use crate::file::{Caching, CachingRequest, DeviceFile};
 use crate::measure::{self, Job, Pattern};
+use crate::scratch::Scratch;
 
 /// What to measure and how hard.
 #[derive(Debug, Clone)]
@@ -145,6 +146,10 @@ pub struct Calibration {
     pub small: usize,
     pub large: usize,
     pub random_read: Vec<Point>,
+    /// Random-read throughput still grew at the deepest depth the plan or the measuring
+    /// backend allows: saturation lies deeper, and `random_read_saturation` is the fastest
+    /// depth measured, not where throughput stops growing.
+    pub random_read_capped: bool,
     pub sequential_read: Vec<Point>,
     pub sequential_write: Vec<Point>,
     /// A small write followed by the platform's full flush, one at a time.
@@ -178,6 +183,14 @@ impl Calibration {
         saturation(&self.random_read)
     }
 
+    /// The shallowest sequential-read depth of `large` transfers whose throughput interval
+    /// overlaps the fastest point's: its bytes in flight are where large reads stop gaining
+    /// throughput, and past them bytes added to the device only wait (Little's law; Georges,
+    /// Buytaert and Eeckhout, OOPSLA 2007, §3.3).
+    pub fn sequential_read_saturation(&self) -> Option<Point> {
+        saturation(&self.sequential_read)
+    }
+
     /// Whether a durable write into preallocated, never-written space is slower than the same
     /// write over written space: the first write's throughput interval lies wholly below the
     /// overwrite's, the test by which Georges, Buytaert and Eeckhout tell two measurements
@@ -207,6 +220,23 @@ fn saturation(points: &[Point]) -> Option<Point> {
         .copied()
 }
 
+/// Whether the last point is faster than the one before beyond both intervals.
+fn still_growing(points: &[Point]) -> bool {
+    matches!(points, [.., before, last] if slower(before, last))
+}
+
+/// The random-read ladder's next depth: four times the last, or `cap` if that is nearer,
+/// while throughput still grows; `None` once it stops growing or the cap is measured.
+fn next_depth(points: &[Point], cap: usize) -> Option<usize> {
+    let last = points.last()?.depth;
+    let next = last.saturating_mul(4).min(cap);
+    if still_growing(points) && next > last {
+        Some(next)
+    } else {
+        None
+    }
+}
+
 fn knee(points: &[Point]) -> Option<Point> {
     points
         .iter()
@@ -218,16 +248,6 @@ fn knee(points: &[Point]) -> Option<Point> {
 fn power(p: &Point) -> f64 {
     let depth = u32::try_from(p.depth).map_or(f64::MAX, f64::from);
     p.ops_per_sec * p.ops_per_sec / depth
-}
-
-/// Removes the scratch file whatever happens to the calibration.
-struct Scratch(PathBuf);
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        // Nothing to report to: the file is ours and absent is the goal.
-        let _ = std::fs::remove_file(&self.0);
-    }
 }
 
 /// Measures the device under `dir`. `available` is the free space the caller knows of; the
@@ -262,9 +282,8 @@ pub fn calibrate(
             ),
         });
     }
-    let path = dir.join(format!(".mantle-calibrate-{}", std::process::id()));
-    let _scratch = Scratch(path.clone());
-    let file = DeviceFile::open(&path, true, CachingRequest::PreferDirect, align)?;
+    let scratch = Scratch::create(dir, ".mantle-calibrate")?;
+    let file = DeviceFile::open(scratch.path(), false, CachingRequest::PreferDirect, align)?;
     file.preallocate(span)?;
 
     // Before anything is written: each round of first writes takes fresh space, and each
@@ -328,18 +347,15 @@ pub fn calibrate(
         })?);
     }
     // Throughput still growing at the last depth: the ladder goes on, four times deeper each
-    // step, a bounded number of steps.
-    while let [.., before, last] = random_read.as_slice()
-        && slower(before, last)
-        && let Some(depth) = last
-            .depth
-            .checked_mul(4)
-            .filter(|&d| d <= plan.max_read_depth)
-    {
+    // step, no deeper than the plan allows or the measuring backend can run (audit S09).
+    let cap = plan.max_read_depth.min(measure::MAX_DEPTH);
+    while let Some(depth) = next_depth(&random_read, cap) {
         random_read.push(point(&file, plan, |round| {
             job(Pattern::RandomRead, plan.small, depth, round)
         })?);
     }
+    let random_read_capped =
+        still_growing(&random_read) && random_read.last().is_some_and(|p| p.depth >= cap);
     let mut sequential_read = Vec::with_capacity(plan.sequential_depths.len());
     let mut sequential_write = Vec::with_capacity(plan.sequential_depths.len());
     for &depth in &plan.sequential_depths {
@@ -385,6 +401,7 @@ pub fn calibrate(
         small: plan.small,
         large: plan.large,
         random_read,
+        random_read_capped,
         sequential_read,
         sequential_write,
         durable_write,
@@ -483,6 +500,32 @@ mod tests {
     /// Throughput stops growing at the shallowest depth whose interval overlaps the fastest
     /// point's; the power knee, this machine's 16, comes before it when throughput still
     /// grows (docs/measurements/2026-09-29-read-depth.md).
+    /// The ladder goes four times deeper while throughput grows, stops at the backend's
+    /// limit, and says when throughput was still growing there: 64, then 256, and no 1,024
+    /// on a backend of 256 threads (audit S09).
+    #[test]
+    fn the_ladder_stops_at_the_backends_limit_and_says_so() {
+        let at = |depth: usize, ops: f64| Point {
+            depth,
+            ops_per_sec: ops,
+            bytes_per_sec: ops * 4096.0,
+            spread: 0.01,
+            rounds: 3,
+            p50_ns: None,
+            p99_ns: None,
+        };
+        let growing = [at(16, 100.0), at(64, 200.0)];
+        assert_eq!(next_depth(&growing, 256), Some(256));
+        assert_eq!(next_depth(&growing, 100), Some(100));
+        let at_cap = [at(64, 200.0), at(256, 400.0)];
+        assert_eq!(next_depth(&at_cap, 256), None);
+        assert!(still_growing(&at_cap));
+        let flat = [at(64, 200.0), at(256, 201.0)];
+        assert_eq!(next_depth(&flat, 1024), None);
+        assert!(!still_growing(&flat));
+        assert_eq!(next_depth(&[at(4, 10.0)], 256), None);
+    }
+
     #[test]
     fn saturation_is_where_throughput_stops_growing() {
         let with = |depth: usize, ops: f64, spread: f64| Point {
@@ -583,6 +626,29 @@ mod tests {
         assert!((2..=3).contains(&c.first_write.rounds));
         let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
         assert!(leftovers.is_empty(), "scratch file left behind");
+    }
+
+    /// A calibration that fails leaves its directory as it found it: a file already there,
+    /// even one named as scratch files once were, is neither written nor removed, and no
+    /// scratch file stays behind (audit S06).
+    #[test]
+    fn a_failed_calibration_leaves_the_directory_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let theirs = dir
+            .path()
+            .join(format!(".mantle-calibrate-{}", std::process::id()));
+        std::fs::write(&theirs, b"customer-data").unwrap();
+        let plan = Plan {
+            small: 0,
+            ..Plan::standard(Alignment::new(4096).unwrap())
+        };
+        assert!(calibrate(dir.path(), Alignment::new(4096).unwrap(), None, &plan).is_err());
+        assert_eq!(std::fs::read(&theirs).unwrap(), b"customer-data");
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(left, vec![theirs]);
     }
 
     #[test]

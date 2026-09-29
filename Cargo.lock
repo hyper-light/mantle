@@ -494,6 +494,7 @@ dependencies = [
 name = "mantle-disk"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.4.3",
  "proptest",
  "rustix 1.1.5",
  "tempfile",

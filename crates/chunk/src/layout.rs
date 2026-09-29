@@ -62,25 +62,34 @@ pub struct Reads {
     /// Reads that may wait for a turn; a read past them is refused with `Busy`, and the caller
     /// reads another copy.
     pub waiting: usize,
+    /// Bytes the reads at the device may buffer at once: the bytes in flight where calibration
+    /// finds large sequential reads stop gaining throughput
+    /// (`mantle_disk::calibrate::Calibration::sequential_read_saturation`), past which bytes
+    /// added only wait, as reads added past `depth` do. A read that buffers more alone is taken
+    /// when no other read is at the device, as the writer's queue takes a payload larger than
+    /// its bound, so the reads' buffers never exceed this or one read's (audit S07).
+    pub bytes: u64,
 }
 
 impl Reads {
-    /// The measured depth, with as many reads let wait: by Little's law each then waits about
-    /// as long as a read takes at that depth, beyond which another copy serves it sooner.
-    pub fn measured(depth: usize) -> Self {
+    /// The measured depth and bytes, with as many reads let wait: by Little's law each then
+    /// waits about as long as a read takes at that depth, beyond which another copy serves it
+    /// sooner.
+    pub fn measured(depth: usize, bytes: u64) -> Self {
         let depth = depth.max(1);
         Self {
             depth,
             waiting: depth,
+            bytes,
         }
     }
 }
 
 impl Default for Reads {
-    /// A device not measured reads one at a time: no device's depth of greatest power is
-    /// below one.
+    /// A device not measured reads one at a time, each read alone: no device's depth of
+    /// greatest power is below one.
     fn default() -> Self {
-        Self::measured(1)
+        Self::measured(1, 0)
     }
 }
 
@@ -108,6 +117,31 @@ pub struct Config {
     /// §2).
     pub prewrite: bool,
     pub reads: Reads,
+}
+
+impl Config {
+    /// Refuses settings no volume can run with, before any I/O or thread (audit S08): a
+    /// read gate of no depth admits no read and parks every one for good, and a batch, queue
+    /// or chunk of no room takes nothing.
+    pub fn check(&self) -> Result<(), ChunkError> {
+        let bad = |m: &str| Err(ChunkError::Config(m.to_owned()));
+        if self.reads.depth == 0 {
+            return bad("a read depth of none admits no read");
+        }
+        if self.limits.batch_requests == 0 || self.limits.batch_bytes == 0 {
+            return bad("a batch of no requests or no bytes takes nothing");
+        }
+        if self.limits.fragments_per_chunk == 0 {
+            return bad("a chunk of no fragments holds nothing");
+        }
+        if self.max_fragments == 0 {
+            return bad("a volume of no fragments indexes nothing");
+        }
+        if !(9..=24).contains(&self.checksum_shift) {
+            return bad("checksum block must be between 512 B and 16 MiB");
+        }
+        Ok(())
+    }
 }
 
 impl Default for Config {

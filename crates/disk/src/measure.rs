@@ -162,24 +162,28 @@ pub fn run(file: &DeviceFile, job: &Job) -> Result<JobResult, DiskError> {
         issued: AtomicU64::new(0),
     };
 
-    let outcomes: Vec<Result<(u64, Histogram), DiskError>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..job.depth)
-            .map(|worker| {
-                let shared = &shared;
-                scope.spawn(move || {
-                    let seed = job.seed ^ u64::try_from(worker).unwrap_or(0).rotate_left(32);
-                    shared.work(seed)
-                })
-            })
-            .collect();
-        handles
+    type Outcomes = Vec<Result<(u64, Histogram), DiskError>>;
+    let outcomes: Result<Outcomes, std::io::Error> = std::thread::scope(|scope| {
+        let handles = crate::workers::spawn_all(scope, job.depth, |worker| {
+            let shared = &shared;
+            move || {
+                let seed = job.seed ^ u64::try_from(worker).unwrap_or(0).rotate_left(32);
+                shared.work(seed)
+            }
+        })?;
+        Ok(handles
             .into_iter()
-            .map(|h| {
-                h.join()
-                    .unwrap_or_else(|_| Err(invalid("measurement worker unwound")))
+            .map(|h| match h.join() {
+                Ok(Some(outcome)) => outcome,
+                Ok(None) | Err(_) => Err(invalid("measurement worker unwound")),
             })
-            .collect()
+            .collect())
     });
+    let outcomes = outcomes.map_err(|source| DiskError::Io {
+        op: "start a measurement worker",
+        path: file.path().to_path_buf(),
+        source,
+    })?;
     let elapsed = started.elapsed();
 
     let mut latency = Histogram::new();

@@ -539,6 +539,7 @@ fn reads_past_the_depth_wait_or_are_refused() {
         reads: Reads {
             depth: 2,
             waiting: 1,
+            bytes: u64::MAX,
         },
         ..config()
     };
@@ -668,4 +669,110 @@ fn a_crc_collision_is_not_a_retry() {
             other => panic!("{other:?}"),
         }
     }
+}
+
+/// Settings no volume can run with are refused at format and at open, before any I/O: a read
+/// depth of none would park every read for good (audit S08).
+#[test]
+fn settings_no_volume_can_run_with_are_refused_before_any_io() {
+    let broken = [
+        Config {
+            reads: Reads {
+                depth: 0,
+                waiting: 1,
+                bytes: u64::MAX,
+            },
+            ..config()
+        },
+        Config {
+            limits: mantle_chunk::Limits {
+                batch_requests: 0,
+                ..config().limits
+            },
+            ..config()
+        },
+        Config {
+            limits: mantle_chunk::Limits {
+                batch_bytes: 0,
+                ..config().limits
+            },
+            ..config()
+        },
+        Config {
+            limits: mantle_chunk::Limits {
+                fragments_per_chunk: 0,
+                ..config().limits
+            },
+            ..config()
+        },
+        Config {
+            max_fragments: 0,
+            ..config()
+        },
+        Config {
+            checksum_shift: 30,
+            ..config()
+        },
+    ];
+    for (i, c) in broken.into_iter().enumerate() {
+        let file = sim(60 + i as u64);
+        assert!(matches!(
+            Volume::format(Arc::clone(&file), SIZE, c),
+            Err(ChunkError::Config(_))
+        ));
+        assert!(matches!(
+            Volume::open(Arc::clone(&file), c),
+            Err(ChunkError::Config(_))
+        ));
+        let stats = file.stats().unwrap();
+        assert_eq!(
+            (stats.reads, stats.writes, stats.syncs),
+            (0, 0, 0),
+            "setting {i}"
+        );
+    }
+}
+
+/// Concurrent reads hold their buffers to the volume's read bytes, a read larger than them
+/// going alone: the most the reads buffered at once is within the bytes or one large read's
+/// (audit S07).
+#[test]
+fn reads_hold_their_buffers_to_the_read_bytes() {
+    let budget = 64 << 10;
+    let config = Config {
+        reads: Reads {
+            depth: 4,
+            waiting: 64,
+            bytes: budget,
+        },
+        ..config()
+    };
+    let v = Volume::format(sim(70), SIZE, config).unwrap();
+    for n in 0..8 {
+        v.put(key(n), &data(n, 3_000)).unwrap();
+    }
+    v.put(key(100), &data(100, 200_000)).unwrap();
+    std::thread::scope(|s| {
+        for t in 0..8u64 {
+            let v = &v;
+            s.spawn(move || {
+                for i in 0..200u64 {
+                    let (k, len) = if (t + i) % 23 == 0 {
+                        (key(100), 200_000)
+                    } else {
+                        (key((t + i) % 8), 3_000)
+                    };
+                    match v.read(&k, 0, len) {
+                        Ok(bytes) => assert_eq!(bytes.len() as u64, len),
+                        Err(ChunkError::Busy) => std::thread::yield_now(),
+                        Err(e) => panic!("{e}"),
+                    }
+                }
+            });
+        }
+    });
+    let stats = v.read_stats().unwrap();
+    // The large read's buffer: its header and table, and its payload.
+    assert!(stats.most_bytes <= 220_000, "{stats:?}");
+    assert!(stats.most_bytes > 0);
 }

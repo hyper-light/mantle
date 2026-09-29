@@ -28,7 +28,7 @@
 
 use std::fmt;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -40,6 +40,7 @@ use mantle_disk::file::{CachingRequest, DeviceFile};
 use mantle_disk::histogram::Histogram;
 use mantle_disk::measure::SplitMix64;
 use mantle_disk::rounds::{self, Order, Policy};
+use mantle_disk::scratch::Scratch;
 
 use crate::display;
 
@@ -51,6 +52,8 @@ pub enum Error {
     Log(String),
     /// A worker thread unwound; its measurements are lost.
     Worker,
+    /// The operating system could not start a worker thread; none worked.
+    Spawn(std::io::Error),
 }
 
 impl fmt::Display for Error {
@@ -61,6 +64,7 @@ impl fmt::Display for Error {
             Self::Chunk(e) => write!(f, "chunk store: {e}"),
             Self::Log(e) => write!(f, "raft log: {e}"),
             Self::Worker => write!(f, "a benchmark worker stopped unexpectedly"),
+            Self::Spawn(e) => write!(f, "starting a benchmark worker: {e}"),
         }
     }
 }
@@ -101,16 +105,6 @@ impl Plan {
                 ..Policy::STANDARD
             },
         }
-    }
-}
-
-/// Removes the scratch volume whatever happens to the benchmark.
-pub(crate) struct Scratch(pub(crate) PathBuf);
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        // Nothing to report to: the file is ours and absent is the goal.
-        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -215,8 +209,16 @@ pub fn chunk(out: &mut impl Write, path: &Path, options: &Options) -> Result<(),
         .map_err(Error::Disk)?;
         report_device(out, &device)?;
         prewrite = device.first_write_penalty();
-        if let Some(saturation) = device.random_read_saturation() {
-            reads = Reads::measured(saturation.depth);
+        if let (Some(random), Some(sequential)) = (
+            device.random_read_saturation(),
+            device.sequential_read_saturation(),
+        ) {
+            let bytes = u64::try_from(sequential.depth)
+                .ok()
+                .zip(u64::try_from(device.large).ok())
+                .and_then(|(d, l)| d.checked_mul(l))
+                .unwrap_or(u64::MAX);
+            reads = Reads::measured(random.depth, bytes);
         }
     }
     run(out, path, align, &plan, prewrite, reads)
@@ -260,6 +262,12 @@ pub(crate) fn report_device(out: &mut impl Write, c: &Calibration) -> std::io::R
             display::quantile(p.p99_ns)
         )?;
     }
+    if c.random_read_capped {
+        writeln!(
+            out,
+            "  still faster at the deepest depth this machine measures: the device saturates deeper"
+        )?;
+    }
     Ok(())
 }
 
@@ -271,10 +279,10 @@ fn run(
     prewrite: bool,
     reads: Reads,
 ) -> Result<(), Error> {
-    let path = dir.join(format!(".mantle-bench-{}", std::process::id()));
-    let _scratch = Scratch(path.clone());
+    let scratch = Scratch::create(dir, ".mantle-bench").map_err(Error::Disk)?;
+    let path = scratch.path();
     let file =
-        DeviceFile::open(&path, true, CachingRequest::PreferDirect, align).map_err(Error::Disk)?;
+        DeviceFile::open(path, false, CachingRequest::PreferDirect, align).map_err(Error::Disk)?;
     let volume = align.down_u64(plan.volume);
     file.preallocate(volume).map_err(Error::Disk)?;
     // Room in the index for a third of the volume in the smallest chunks, twice over.
@@ -294,7 +302,7 @@ fn run(
     };
     let v = Volume::format(file, volume, config).map_err(Error::Chunk)?;
     let raw =
-        DeviceFile::open(&path, false, CachingRequest::PreferDirect, align).map_err(Error::Disk)?;
+        DeviceFile::open(path, false, CachingRequest::PreferDirect, align).map_err(Error::Disk)?;
     let span = v.data_span();
     writeln!(
         out,
@@ -479,61 +487,64 @@ fn puts(
     let full = AtomicBool::new(false);
     let failed: Mutex<Option<ChunkError>> = Mutex::new(None);
     let size64 = u64::try_from(size).unwrap_or(u64::MAX);
-    let results: Vec<Option<(Histogram, Vec<ChunkKey>)>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..workers)
-            .map(|worker| {
-                let (written, full, failed) = (&written, &full, &failed);
-                scope.spawn(move || {
-                    let mut payload = vec![0u8; size];
-                    SplitMix64::new(point ^ u64::try_from(worker).unwrap_or(0)).fill(&mut payload);
-                    let mut latency = Histogram::new();
-                    let mut keys = Vec::new();
-                    let mut n = 0u64;
-                    loop {
-                        if deadline.is_some_and(|d| Instant::now() >= d)
-                            || written.load(Ordering::Relaxed) >= budget
-                            || full.load(Ordering::Relaxed)
-                            || !failed.lock().is_ok_and(|f| f.is_none())
-                        {
-                            break;
+    type Written = Vec<Option<(Histogram, Vec<ChunkKey>)>>;
+    let results: Result<Written, std::io::Error> = std::thread::scope(|scope| {
+        let handles = mantle_disk::workers::spawn_all(scope, workers, |worker| {
+            let (written, full, failed) = (&written, &full, &failed);
+            move || {
+                let mut payload = vec![0u8; size];
+                SplitMix64::new(point ^ u64::try_from(worker).unwrap_or(0)).fill(&mut payload);
+                let mut latency = Histogram::new();
+                let mut keys = Vec::new();
+                let mut n = 0u64;
+                loop {
+                    if deadline.is_some_and(|d| Instant::now() >= d)
+                        || written.load(Ordering::Relaxed) >= budget
+                        || full.load(Ordering::Relaxed)
+                        || !failed.lock().is_ok_and(|f| f.is_none())
+                    {
+                        break;
+                    }
+                    let k = key(point, worker, n);
+                    n = n.saturating_add(1);
+                    let t = Instant::now();
+                    // Busy means the store is cleaning to make room: a client backs off
+                    // and puts the same chunk again, and the wait counts in its latency.
+                    let result = loop {
+                        match v.put(k, &payload) {
+                            Err(ChunkError::Busy)
+                                if deadline.is_none_or(|d| Instant::now() < d) =>
+                            {
+                                std::thread::yield_now();
+                            }
+                            other => break other,
                         }
-                        let k = key(point, worker, n);
-                        n = n.saturating_add(1);
-                        let t = Instant::now();
-                        // Busy means the store is cleaning to make room: a client backs off
-                        // and puts the same chunk again, and the wait counts in its latency.
-                        let result = loop {
-                            match v.put(k, &payload) {
-                                Err(ChunkError::Busy)
-                                    if deadline.is_none_or(|d| Instant::now() < d) =>
-                                {
-                                    std::thread::yield_now();
-                                }
-                                other => break other,
-                            }
-                        };
-                        match result {
-                            Ok(()) => {
-                                latency.record(nanos(t.elapsed()));
-                                keys.push(k);
-                                written.fetch_add(size64, Ordering::Relaxed);
-                            }
-                            Err(ChunkError::Full) => full.store(true, Ordering::Relaxed),
-                            // Still busy when the step ended: nothing was written.
-                            Err(ChunkError::Busy) => {}
-                            Err(e) => {
-                                if let Ok(mut f) = failed.lock() {
-                                    f.get_or_insert(e);
-                                }
+                    };
+                    match result {
+                        Ok(()) => {
+                            latency.record(nanos(t.elapsed()));
+                            keys.push(k);
+                            written.fetch_add(size64, Ordering::Relaxed);
+                        }
+                        Err(ChunkError::Full) => full.store(true, Ordering::Relaxed),
+                        // Still busy when the step ended: nothing was written.
+                        Err(ChunkError::Busy) => {}
+                        Err(e) => {
+                            if let Ok(mut f) = failed.lock() {
+                                f.get_or_insert(e);
                             }
                         }
                     }
-                    (latency, keys)
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().ok()).collect()
+                }
+                (latency, keys)
+            }
+        })?;
+        Ok(handles
+            .into_iter()
+            .map(|h| h.join().ok().flatten())
+            .collect())
     });
+    let results = results.map_err(Error::Spawn)?;
     let elapsed = started.elapsed();
     if let Some(e) = failed.into_inner().ok().flatten() {
         return Err(Error::Chunk(e));
@@ -573,40 +584,42 @@ fn gets(
     let failed: Mutex<Option<ChunkError>> = Mutex::new(None);
     let size64 = u64::try_from(size).unwrap_or(u64::MAX);
     let count = u64::try_from(keys.len()).unwrap_or(u64::MAX);
-    let results: Vec<Option<Histogram>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..workers)
-            .map(|worker| {
-                let failed = &failed;
-                scope.spawn(move || {
-                    let mut rng = SplitMix64::new(!point ^ u64::try_from(worker).unwrap_or(0));
-                    let mut latency = Histogram::new();
-                    let mut buf = Vec::new();
-                    loop {
-                        if deadline.is_some_and(|d| Instant::now() >= d)
-                            || !failed.lock().is_ok_and(|f| f.is_none())
-                        {
-                            break;
-                        }
-                        let pick = usize::try_from(rng.below(count)).unwrap_or(0);
-                        let Some(k) = keys.get(pick) else {
-                            break;
-                        };
-                        let t = Instant::now();
-                        match v.read_into(k, 0, size64, &mut buf) {
-                            Ok(()) => latency.record(nanos(t.elapsed())),
-                            Err(e) => {
-                                if let Ok(mut f) = failed.lock() {
-                                    f.get_or_insert(e);
-                                }
+    let results: Result<Vec<Option<Histogram>>, std::io::Error> = std::thread::scope(|scope| {
+        let handles = mantle_disk::workers::spawn_all(scope, workers, |worker| {
+            let failed = &failed;
+            move || {
+                let mut rng = SplitMix64::new(!point ^ u64::try_from(worker).unwrap_or(0));
+                let mut latency = Histogram::new();
+                let mut buf = Vec::new();
+                loop {
+                    if deadline.is_some_and(|d| Instant::now() >= d)
+                        || !failed.lock().is_ok_and(|f| f.is_none())
+                    {
+                        break;
+                    }
+                    let pick = usize::try_from(rng.below(count)).unwrap_or(0);
+                    let Some(k) = keys.get(pick) else {
+                        break;
+                    };
+                    let t = Instant::now();
+                    match v.read_into(k, 0, size64, &mut buf) {
+                        Ok(()) => latency.record(nanos(t.elapsed())),
+                        Err(e) => {
+                            if let Ok(mut f) = failed.lock() {
+                                f.get_or_insert(e);
                             }
                         }
                     }
-                    latency
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().ok()).collect()
+                }
+                latency
+            }
+        })?;
+        Ok(handles
+            .into_iter()
+            .map(|h| h.join().ok().flatten())
+            .collect())
     });
+    let results = results.map_err(Error::Spawn)?;
     let elapsed = started.elapsed();
     if let Some(e) = failed.into_inner().ok().flatten() {
         return Err(Error::Chunk(e));
@@ -649,51 +662,53 @@ fn raw_reads(
     let started = Instant::now();
     let deadline = started.checked_add(step);
     let failed: Mutex<Option<mantle_disk::DiskError>> = Mutex::new(None);
-    let results: Vec<Option<Histogram>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..workers)
-            .map(|worker| {
-                let failed = &failed;
-                scope.spawn(move || {
-                    let seed = point.rotate_left(17) ^ u64::try_from(worker).unwrap_or(0);
-                    let mut rng = SplitMix64::new(seed);
-                    let mut latency = Histogram::new();
-                    let mut buf = match AlignedBuf::zeroed(len, align) {
-                        Ok(buf) => buf,
-                        Err(e) => {
-                            if let Ok(mut f) = failed.lock() {
-                                f.get_or_insert(e.into());
-                            }
-                            return latency;
+    let results: Result<Vec<Option<Histogram>>, std::io::Error> = std::thread::scope(|scope| {
+        let handles = mantle_disk::workers::spawn_all(scope, workers, |worker| {
+            let failed = &failed;
+            move || {
+                let seed = point.rotate_left(17) ^ u64::try_from(worker).unwrap_or(0);
+                let mut rng = SplitMix64::new(seed);
+                let mut latency = Histogram::new();
+                let mut buf = match AlignedBuf::zeroed(len, align) {
+                    Ok(buf) => buf,
+                    Err(e) => {
+                        if let Ok(mut f) = failed.lock() {
+                            f.get_or_insert(e.into());
                         }
-                    };
-                    if buf.set_len(len).is_err() {
                         return latency;
                     }
-                    loop {
-                        if deadline.is_some_and(|d| Instant::now() >= d)
-                            || !failed.lock().is_ok_and(|f| f.is_none())
-                        {
-                            break;
-                        }
-                        let at = span
-                            .start
-                            .saturating_add(rng.below(slots).saturating_mul(block));
-                        let t = Instant::now();
-                        match file.read_exact_at(buf.as_mut_slice(), at) {
-                            Ok(()) => latency.record(nanos(t.elapsed())),
-                            Err(e) => {
-                                if let Ok(mut f) = failed.lock() {
-                                    f.get_or_insert(e);
-                                }
+                };
+                if buf.set_len(len).is_err() {
+                    return latency;
+                }
+                loop {
+                    if deadline.is_some_and(|d| Instant::now() >= d)
+                        || !failed.lock().is_ok_and(|f| f.is_none())
+                    {
+                        break;
+                    }
+                    let at = span
+                        .start
+                        .saturating_add(rng.below(slots).saturating_mul(block));
+                    let t = Instant::now();
+                    match file.read_exact_at(buf.as_mut_slice(), at) {
+                        Ok(()) => latency.record(nanos(t.elapsed())),
+                        Err(e) => {
+                            if let Ok(mut f) = failed.lock() {
+                                f.get_or_insert(e);
                             }
                         }
                     }
-                    latency
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().ok()).collect()
+                }
+                latency
+            }
+        })?;
+        Ok(handles
+            .into_iter()
+            .map(|h| h.join().ok().flatten())
+            .collect())
     });
+    let results = results.map_err(Error::Spawn)?;
     let elapsed = started.elapsed();
     if let Some(e) = failed.into_inner().ok().flatten() {
         return Err(Error::Disk(e));
@@ -716,13 +731,19 @@ fn raw_reads(
 fn deletes(v: &Volume<DeviceFile>, keys: &[ChunkKey]) -> Result<(), Error> {
     const WORKERS: usize = 64;
     let per = keys.len().div_ceil(WORKERS).max(1);
-    let results: Vec<Option<Result<(), ChunkError>>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = keys
-            .chunks(per)
-            .map(|part| scope.spawn(move || part.iter().try_for_each(|k| v.delete(*k))))
-            .collect();
-        handles.into_iter().map(|h| h.join().ok()).collect()
-    });
+    let parts: Vec<&[ChunkKey]> = keys.chunks(per).collect();
+    let results: Result<Vec<Option<Result<(), ChunkError>>>, std::io::Error> =
+        std::thread::scope(|scope| {
+            let handles = mantle_disk::workers::spawn_all(scope, parts.len(), |i| {
+                let part = parts.get(i).copied().unwrap_or_default();
+                move || part.iter().try_for_each(|k| v.delete(*k))
+            })?;
+            Ok(handles
+                .into_iter()
+                .map(|h| h.join().ok().flatten())
+                .collect())
+        });
+    let results = results.map_err(Error::Spawn)?;
     for result in results {
         result.ok_or(Error::Worker)?.map_err(Error::Chunk)?;
     }
@@ -760,7 +781,7 @@ mod tests {
             align,
             &plan,
             false,
-            Reads::measured(4),
+            Reads::measured(4, 4 << 20),
         )
         .unwrap();
         let text = String::from_utf8(out).unwrap();

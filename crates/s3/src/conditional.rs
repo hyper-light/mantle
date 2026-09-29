@@ -5,8 +5,11 @@
 //! Reads follow RFC 9110 §13.2.2's order, which gives exactly the two combinations AWS
 //! documents. Writes and deletes are judged against the object's current version at the moment
 //! they commit, not when the request arrives (05 §2.2), so the caller evaluates them inside the
-//! metadata layer's compare-and-set; this module only states the rule. ETags compare without
-//! their quotes, since clients send them either way (05 §2.2).
+//! metadata layer's compare-and-set; this module states the rule, and names the tags a header
+//! gives that commit ([`named`]). ETags compare without their quotes, since clients send them
+//! either way (05 §2.2). `If-Match` compares strongly, so a weak tag in it names nothing, and
+//! `If-None-Match` weakly, so its tags' `W/` is set aside (RFC 9110 §13.1.1–§13.1.2, §8.8.3.2;
+//! audit B04). S3's own ETags are strong; what S3 answers a weak tag is not recorded.
 
 /// The object's current version, as a precondition sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,7 +54,7 @@ pub fn read(c: &Conditions<'_>, current: &Current<'_>) -> Outcome {
         return Outcome::NotFound;
     };
     match c.if_match {
-        Some(list) if !matches_any(list, etag) => return Outcome::Failed,
+        Some(list) if !matches_any(list, etag, STRONG) => return Outcome::Failed,
         Some(_) => {}
         None => {
             if let Some(since) = c.if_unmodified_since.and_then(crate::time::parse_http_date)
@@ -62,7 +65,7 @@ pub fn read(c: &Conditions<'_>, current: &Current<'_>) -> Outcome {
         }
     }
     match c.if_none_match {
-        Some(list) if matches_any(list, etag) => return Outcome::NotModified,
+        Some(list) if matches_any(list, etag, WEAK) => return Outcome::NotModified,
         Some(_) => {}
         None => {
             if let Some(since) = c.if_modified_since.and_then(crate::time::parse_http_date)
@@ -86,13 +89,13 @@ pub fn write(c: &Conditions<'_>, current: &Current<'_>) -> Outcome {
     };
     if let Some(list) = c.if_none_match
         && let Some(etag) = etag
-        && matches_any(list, etag)
+        && matches_any(list, etag, WEAK)
     {
         return Outcome::Failed;
     }
     match (c.if_match, etag) {
         (Some(_), None) => Outcome::NotFound,
-        (Some(list), Some(etag)) if !matches_any(list, etag) => Outcome::Failed,
+        (Some(list), Some(etag)) if !matches_any(list, etag, STRONG) => Outcome::Failed,
         _ => Outcome::Proceed,
     }
 }
@@ -106,17 +109,48 @@ pub fn delete(c: &Conditions<'_>, current: &Current<'_>) -> Outcome {
     match current {
         Current::Missing => Outcome::NotFound,
         Current::DeleteMarker => Outcome::Failed,
-        Current::Present { etag, .. } if matches_any(list, etag) => Outcome::Proceed,
+        Current::Present { etag, .. } if matches_any(list, etag, STRONG) => Outcome::Proceed,
         Current::Present { .. } => Outcome::Failed,
     }
 }
 
+/// `If-Match`'s comparison: a weak tag matches nothing (RFC 9110 §13.1.1, §8.8.3.2).
+const STRONG: bool = true;
+/// `If-None-Match`'s comparison: a tag matches with or without its `W/` (RFC 9110 §13.1.2).
+const WEAK: bool = false;
+
 /// Whether a header's list of entity tags (or `*`) names `etag`.
-fn matches_any(list: &str, etag: &str) -> bool {
+fn matches_any(list: &str, etag: &str, strong: bool) -> bool {
     let etag = bare(etag);
-    list.split(',').map(str::trim).any(|candidate| {
-        candidate == "*" || bare(candidate.strip_prefix("W/").unwrap_or(candidate)) == etag
-    })
+    list.split(',')
+        .map(str::trim)
+        .any(|candidate| candidate == "*" || tag(candidate, strong) == Some(etag))
+}
+
+/// A listed tag, bare, as `strong` or weak comparison takes it; `None` for a weak tag under
+/// strong comparison, which names nothing.
+fn tag(candidate: &str, strong: bool) -> Option<&str> {
+    match candidate.strip_prefix("W/") {
+        Some(_) if strong => None,
+        Some(weak) => Some(bare(weak)),
+        None => Some(bare(candidate)),
+    }
+}
+
+/// The tags an `If-Match` (`strong`) or `If-None-Match` header names, bare, as the metadata
+/// layer compares them when a write or delete commits; `None` for `*`. A weak tag in
+/// `If-Match` names nothing and is left out.
+pub fn named(list: &str, strong: bool) -> Option<Vec<String>> {
+    let mut tags = Vec::new();
+    for candidate in list.split(',').map(str::trim) {
+        if candidate == "*" {
+            return None;
+        }
+        if let Some(t) = tag(candidate, strong) {
+            tags.push(t.to_owned());
+        }
+    }
+    Some(tags)
 }
 
 fn bare(etag: &str) -> &str {
@@ -137,6 +171,37 @@ mod tests {
             etag: ETAG,
             modified: crate::time::parse_http_date("Tue, 24 Sep 2024 12:00:00 GMT").unwrap(),
         }
+    }
+
+    /// `If-Match` compares strongly and `If-None-Match` weakly: a weak tag in `If-Match` names
+    /// nothing for reads, writes and deletes, and one in `If-None-Match` names the ETag it
+    /// carries (RFC 9110 §13.1.1–§13.1.2; audit B04).
+    #[test]
+    fn if_match_compares_strongly_and_if_none_match_weakly() {
+        let weak = "W/\"6805f2cfc46c0f04559748bb039d69ae\"";
+        let c = |im, inm| Conditions {
+            if_match: im,
+            if_none_match: inm,
+            if_modified_since: None,
+            if_unmodified_since: None,
+        };
+        let p = present();
+        assert_eq!(read(&c(Some(weak), None), &p), Outcome::Failed);
+        assert_eq!(write(&c(Some(weak), None), &p), Outcome::Failed);
+        assert_eq!(delete(&c(Some(weak), None), &p), Outcome::Failed);
+        // Strong in a list with a weak one still matches.
+        let both = format!("{weak}, {ETAG}");
+        assert_eq!(read(&c(Some(&both), None), &p), Outcome::Proceed);
+        assert_eq!(write(&c(Some(&both), None), &p), Outcome::Proceed);
+        assert_eq!(delete(&c(Some(&both), None), &p), Outcome::Proceed);
+        assert_eq!(read(&c(None, Some(weak)), &p), Outcome::NotModified);
+        assert_eq!(write(&c(None, Some(weak)), &p), Outcome::Failed);
+        // What a commit is handed: weak tags out of If-Match, bare in If-None-Match.
+        assert_eq!(named(&both, STRONG), Some(vec![bare(ETAG).to_owned()]));
+        assert_eq!(named(weak, STRONG), Some(Vec::new()));
+        assert_eq!(named(weak, WEAK), Some(vec![bare(ETAG).to_owned()]));
+        assert_eq!(named("*", STRONG), None);
+        assert_eq!(named(&format!("{ETAG}, *"), WEAK), None);
     }
 
     /// The s3-tests read cases and AWS's two documented combinations (05 §2.4).

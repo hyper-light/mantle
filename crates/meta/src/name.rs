@@ -1884,8 +1884,12 @@ impl Versioned {
 pub enum VersionFrom<'a> {
     /// The first version of the first key at or after these object-key bytes.
     Key(&'a [u8]),
-    /// The version after the one `version_id` names, `null` included (05 §7.1). An ID that
-    /// names no version of the key starts at the key's first, so no version is skipped.
+    /// The version after the one `version_id` names, `null` included (05 §7.1). An ID carries
+    /// its version's place in the key's order, so the scan resumes after that place even when
+    /// no version is there, as when it was deleted between pages: nothing is listed twice or
+    /// skipped (audit B07; what S3 answers such a marker is not recorded, 05 §6.4). A `null`
+    /// naming no version, or an ID that does not parse, carries no place and starts at the
+    /// key's first.
     After { key: &'a str, version_id: &'a str },
 }
 
@@ -2547,6 +2551,17 @@ mod tests {
             .1,
             marker
         );
+        // A version deleted between pages still marks its place: the scan goes on after it.
+        let gone = seen[1].1.clone();
+        let order = key::parse_version_id(&gone).unwrap();
+        r.delete("a", Versioning::Enabled, Some(Named::Order(order)));
+        let mut budget = 10;
+        let after_gone = VersionFrom::After {
+            key: "a",
+            version_id: &gone,
+        };
+        let step = next_version(&r.engine, "b", after_gone, &end, &mut budget).unwrap();
+        assert_eq!(found(step).1, "null");
         r.delete("a", Versioning::Enabled, Some(Named::Null));
         let mut budget = 10;
         let after_null = VersionFrom::After {

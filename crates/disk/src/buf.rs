@@ -124,11 +124,18 @@ impl AlignedBuf {
         }
     }
 
-    /// A zero-filled buffer of at least `capacity` bytes, rounded up to the alignment.
+    /// A zero-filled buffer of at least `capacity` bytes, rounded up to the alignment. A
+    /// buffer of no capacity allocates nothing, not even the slack alignment takes (audit S11).
     pub fn zeroed(capacity: usize, align: Alignment) -> Result<Self, BufError> {
         let capacity = align.up(capacity).ok_or(BufError::TooLarge(capacity))?;
         if capacity > MAX_BUFFER {
             return Err(BufError::TooLarge(capacity));
+        }
+        if capacity == 0 {
+            return Ok(Self {
+                align,
+                ..Self::empty()
+            });
         }
         // capacity <= 2^30 and mask < 2^20, so the sum cannot overflow.
         let total = capacity
@@ -148,6 +155,11 @@ impl AlignedBuf {
 
     pub fn alignment(&self) -> Alignment {
         self.align
+    }
+
+    /// Bytes the buffer allocated: its capacity and the slack its alignment took.
+    fn allocated(&self) -> usize {
+        self.storage.len()
     }
 
     pub fn capacity(&self) -> usize {
@@ -331,7 +343,7 @@ impl Pool {
             if list.is_empty() {
                 free.by_capacity.remove(&fit);
             }
-            free.held = free.held.saturating_sub(buf.capacity());
+            free.held = free.held.saturating_sub(buf.allocated());
             Some(buf)
         });
         let mut buf = match reused {
@@ -350,17 +362,20 @@ impl Pool {
         self.free.lock().map_or(0, |free| free.held)
     }
 
+    /// Keeps `buf` for reuse while the pool's limit holds what it allocated. A buffer of no
+    /// capacity has nothing to reuse and is not kept.
     fn give(&self, buf: AlignedBuf) {
         let capacity = buf.capacity();
-        if capacity > self.largest || buf.alignment() != self.align {
+        if capacity == 0 || capacity > self.largest || buf.alignment() != self.align {
             return;
         }
+        let allocated = buf.allocated();
         // A poisoned lock only means another thread unwound while holding it; the free list
         // is still a valid list of buffers, but dropping this one is the conservative choice.
         if let Ok(mut free) = self.free.lock()
-            && free.held.saturating_add(capacity) <= self.limit
+            && free.held.saturating_add(allocated) <= self.limit
         {
-            free.held = free.held.saturating_add(capacity);
+            free.held = free.held.saturating_add(allocated);
             free.by_capacity.entry(capacity).or_default().push(buf);
         }
     }
@@ -455,6 +470,9 @@ mod tests {
     #[test]
     fn a_pool_reuses_buffers_within_its_bounds() {
         let align = Alignment::new(4096).unwrap();
+        // What a buffer of `capacity` allocates: its capacity and the slack its alignment
+        // takes, which the pool counts against its limit.
+        let allocates = |capacity: usize| capacity + 4095;
         let pool = Pool::new(align, 64 << 10, 32 << 10);
         let first = {
             let mut b = pool.take(5000).unwrap();
@@ -462,7 +480,7 @@ mod tests {
             b.extend_from_slice(&[7; 100]).unwrap();
             b.as_mut_capacity().as_ptr().addr()
         };
-        assert_eq!(pool.held(), 8192);
+        assert_eq!(pool.held(), allocates(8192));
         // The same buffer comes back, emptied, for a request it fits within twice over.
         let b = pool.take(4097).unwrap();
         assert_eq!(b.as_slice().len(), 0);
@@ -470,23 +488,39 @@ mod tests {
         assert_eq!(again, first);
         assert_eq!(pool.held(), 0);
         drop(b);
-        assert_eq!(pool.held(), 8192);
+        assert_eq!(pool.held(), allocates(8192));
         // Buffers past `largest`, or past `limit` in total, are freed rather than kept.
         drop(pool.take(40 << 10).unwrap());
-        assert_eq!(pool.held(), 8192);
+        assert_eq!(pool.held(), allocates(8192));
 
         // A request under half the size of every free buffer gets a buffer of its own.
         let pool = Pool::new(align, 64 << 10, 32 << 10);
         drop(pool.take(20_000).unwrap());
-        assert_eq!(pool.held(), 20480);
+        assert_eq!(pool.held(), allocates(20480));
         let small = pool.take(100).unwrap();
         assert_eq!(small.capacity(), 4096);
-        assert_eq!(pool.held(), 20480);
+        assert_eq!(pool.held(), allocates(20480));
         drop(small);
-        assert_eq!(pool.held(), 20480 + 4096);
+        assert_eq!(pool.held(), allocates(20480) + allocates(4096));
         let held: Vec<_> = (0..10).map(|_| pool.take(16 << 10).unwrap()).collect();
         drop(held);
         assert!(pool.held() <= 64 << 10);
+    }
+
+    /// A buffer of no capacity allocates nothing and is never kept: however many are taken
+    /// and given back, a pool of no room holds none (audit S11).
+    #[test]
+    fn empty_buffers_allocate_nothing_and_are_not_kept() {
+        let align = Alignment::new(4096).unwrap();
+        let empty = AlignedBuf::zeroed(0, align).unwrap();
+        assert_eq!((empty.capacity(), empty.allocated()), (0, 0));
+        assert_eq!(empty.alignment(), align);
+        let pool = Pool::new(align, 0, 1 << 20);
+        for _ in 0..1_000 {
+            drop(pool.take(0).unwrap());
+        }
+        assert_eq!(pool.held(), 0);
+        assert!(pool.free.lock().unwrap().by_capacity.is_empty());
     }
 
     proptest! {

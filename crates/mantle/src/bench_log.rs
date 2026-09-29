@@ -22,8 +22,9 @@ use mantle_disk::file::{CachingRequest, DeviceFile};
 use mantle_disk::histogram::Histogram;
 use mantle_log::{Config, Entries, Entry, Log, LogError, Start, Update};
 
-use crate::bench::{Error, Scratch, nanos, rate, report_device};
+use crate::bench::{Error, nanos, rate, report_device};
 use crate::display;
+use mantle_disk::scratch::Scratch;
 
 /// Entries a replica keeps behind its last before it compacts, as its engine keeps a
 /// window for followers that lag.
@@ -88,9 +89,8 @@ pub fn log(out: &mut impl Write, path: &Path, options: &Options) -> Result<(), E
     for &size in &sizes {
         for &count in &replicas {
             point = point.saturating_add(1);
-            let scratch =
-                Scratch(path.join(format!(".mantle-bench-log-{}-{point}", std::process::id())));
-            let file = DeviceFile::open(&scratch.0, true, CachingRequest::PreferDirect, align)
+            let scratch = Scratch::create(path, ".mantle-bench-log").map_err(Error::Disk)?;
+            let file = DeviceFile::open(scratch.path(), false, CachingRequest::PreferDirect, align)
                 .map_err(Error::Disk)?;
             let config = Config {
                 segment_bytes: 16 << 20,
@@ -153,55 +153,57 @@ fn appends(
     let deadline = started.checked_add(step);
     let failed: Mutex<Option<String>> = Mutex::new(None);
     let payload: Arc<[u8]> = Arc::from(vec![0x5a; size]);
-    let results: Vec<Option<Histogram>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..count)
-            .map(|replica| {
-                let (failed, payload, log) = (&failed, Arc::clone(&payload), Arc::clone(log));
-                scope.spawn(move || {
-                    let group = u128::from(u64::try_from(replica).unwrap_or(u64::MAX));
-                    let mut latency = Histogram::new();
-                    let mut last = 0u64;
-                    while deadline.is_some_and(|d| Instant::now() < d)
-                        && failed.lock().is_ok_and(|f| f.is_none())
-                    {
-                        let Some(next) = last.checked_add(1) else {
-                            break;
-                        };
-                        let mut update = Update {
-                            entries: Some(Entries {
-                                first: next,
-                                entries: vec![Entry {
-                                    term: 1,
-                                    bytes: Arc::clone(&payload),
-                                }],
-                            }),
-                            ..Update::default()
-                        };
-                        if next > KEEP && next % KEEP == 0 {
-                            update.start = Some(Start {
-                                index: next.saturating_sub(KEEP),
+    let results: Result<Vec<Option<Histogram>>, std::io::Error> = std::thread::scope(|scope| {
+        let handles = mantle_disk::workers::spawn_all(scope, count, |replica| {
+            let (failed, payload, log) = (&failed, Arc::clone(&payload), Arc::clone(log));
+            move || {
+                let group = u128::from(u64::try_from(replica).unwrap_or(u64::MAX));
+                let mut latency = Histogram::new();
+                let mut last = 0u64;
+                while deadline.is_some_and(|d| Instant::now() < d)
+                    && failed.lock().is_ok_and(|f| f.is_none())
+                {
+                    let Some(next) = last.checked_add(1) else {
+                        break;
+                    };
+                    let mut update = Update {
+                        entries: Some(Entries {
+                            first: next,
+                            entries: vec![Entry {
                                 term: 1,
-                            });
+                                bytes: Arc::clone(&payload),
+                            }],
+                        }),
+                        ..Update::default()
+                    };
+                    if next > KEEP && next % KEEP == 0 {
+                        update.start = Some(Start {
+                            index: next.saturating_sub(KEEP),
+                            term: 1,
+                        });
+                    }
+                    let t = Instant::now();
+                    match log.write_waiting(group, update) {
+                        Ok(()) => {
+                            latency.record(nanos(t.elapsed()));
+                            last = next;
                         }
-                        let t = Instant::now();
-                        match log.write_waiting(group, update) {
-                            Ok(()) => {
-                                latency.record(nanos(t.elapsed()));
-                                last = next;
-                            }
-                            Err(e) => {
-                                if let Ok(mut f) = failed.lock() {
-                                    f.get_or_insert(e.to_string());
-                                }
+                        Err(e) => {
+                            if let Ok(mut f) = failed.lock() {
+                                f.get_or_insert(e.to_string());
                             }
                         }
                     }
-                    latency
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().ok()).collect()
+                }
+                latency
+            }
+        })?;
+        Ok(handles
+            .into_iter()
+            .map(|h| h.join().ok().flatten())
+            .collect())
     });
+    let results = results.map_err(Error::Spawn)?;
     let elapsed = started.elapsed();
     if let Some(e) = failed.into_inner().ok().flatten() {
         return Err(Error::Log(e));

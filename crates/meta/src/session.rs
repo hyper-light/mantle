@@ -41,6 +41,8 @@ pub enum Check {
     /// Answered, and the answer is kept.
     Answered(Answer),
     New,
+    /// The session's serials are spent.
+    Spent,
 }
 
 fn session_key(session: u64) -> Vec<u8> {
@@ -70,11 +72,16 @@ fn count<R: Rows>(rows: &R) -> Result<u64, MetaError> {
     })
 }
 
-/// What `session` says of the command with `serial`.
+/// What `session` says of the command with `serial`. The last serial is spent: past it an
+/// answer forgotten could not be told from one never given, so a command bearing it is
+/// refused before it takes effect, and the gateway registers a session anew (audit B03).
 pub fn check<R: Rows>(rows: &R, session: u64, serial: u64) -> Result<Check, MetaError> {
     let Some(s) = read(rows, session)? else {
         return Ok(Check::Unknown);
     };
+    if serial == u64::MAX {
+        return Ok(Check::Spent);
+    }
     if serial < s.low {
         return Ok(Check::Repeated);
     }
@@ -144,7 +151,9 @@ pub fn record<R: Rows>(
     }
     while s.answers.len() > rules.max_answers {
         let (forgotten, _) = s.answers.remove(0);
-        s.low = s.low.max(forgotten.saturating_add(1));
+        // Below the spent last serial, which `check` refuses, so one more is exact.
+        let past = forgotten.checked_add(1).ok_or(MetaError::Corrupt)?;
+        s.low = s.low.max(past);
     }
     s.last_ns = at_ns;
     writes.push(Write::Put(session_key(session), s.encode()?));

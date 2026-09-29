@@ -24,8 +24,10 @@ pub mod identity;
 pub mod measure;
 pub mod probe;
 pub mod rounds;
+pub mod scratch;
 #[cfg(any(test, feature = "sim"))]
 pub mod sim;
+pub mod workers;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DiskError {

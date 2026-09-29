@@ -37,7 +37,8 @@ pub fn apply_entry<R: Rows>(
                     session: session::register(&mut overlay, index, position, entry.at_ns, rules)?,
                 },
                 command => match session::check(&overlay, c.session, c.serial)? {
-                    Check::Unknown => Answer::SessionExpired,
+                    // A session whose serials are spent is done: the gateway registers anew.
+                    Check::Unknown | Check::Spent => Answer::SessionExpired,
                     Check::Repeated => Answer::Repeated,
                     Check::Answered(answer) => {
                         session::record(&mut overlay, index, c, None, entry.at_ns, rules)?;
@@ -218,6 +219,53 @@ mod tests {
         assert_eq!(answers[1], Answer::SessionExpired);
         assert!(matches!(answers[2], Answer::Name(Outcome::Put { .. })));
         assert_eq!(answers[3], Answer::Repeated);
+    }
+
+    /// The last serial is refused before it takes effect, so forgetting its answer cannot
+    /// let a retry of it take effect twice, as it could when eviction's watermark saturated
+    /// there (audit B03).
+    #[test]
+    fn the_spent_last_serial_never_takes_effect() {
+        let mut m = name_range();
+        let rules = Rules {
+            max_answers: 1,
+            ..RULES
+        };
+        let run = |m: &mut Model, index, e: Entry| {
+            apply_entry(m, index, &e, Layer::Name, &rules).unwrap()
+        };
+        let answers = run(&mut m, 1, entry(10, vec![from(0, 0, Command::Register)]));
+        let [Answer::Registered { session }] = answers[..] else {
+            panic!("{answers:?}")
+        };
+        run(&mut m, 2, entry(20, vec![from(session, 1, open_gate())]));
+        let last = |etag: &str| Sessioned {
+            session,
+            serial: u64::MAX,
+            unanswered: 1,
+            command: put("k", etag, false),
+        };
+        // The audit's order: the last serial, a reordered one before it that evicts the
+        // first's answer, and the last again.
+        assert_eq!(
+            run(&mut m, 3, entry(30, vec![last("a")])),
+            [Answer::SessionExpired]
+        );
+        let before = Sessioned {
+            session,
+            serial: u64::MAX - 1,
+            unanswered: 1,
+            command: put("j", "x", false),
+        };
+        assert!(matches!(
+            run(&mut m, 4, entry(40, vec![before]))[..],
+            [Answer::Name(Outcome::Put { .. })]
+        ));
+        assert_eq!(
+            run(&mut m, 5, entry(50, vec![last("a")])),
+            [Answer::SessionExpired]
+        );
+        assert!(crate::name::current(&m, "b", "k").unwrap().is_none());
     }
 
     #[test]

@@ -7,8 +7,8 @@
 use mantle_codec::{Reader, Writer};
 
 use crate::record::{
-    self, BlockHeader, Checksum, ChunkPlace, Extent, GateState, Part, RecordError, Upload, Version,
-    Versioning,
+    self, BlockHeader, Checksum, ChunkPlace, DefaultRetention, Extent, GateState, Part,
+    RecordError, Upload, Version, Versioning,
 };
 use crate::{block, bucket, file, name};
 
@@ -319,6 +319,7 @@ fn put_bucket(w: &mut Writer, c: &bucket::Command) -> Result<(), RecordError> {
             record::put_str(w, &c.owner)?;
             record::put_str(w, &c.location)?;
             w.u32(c.quota);
+            w.u8(u8::from(c.lock));
         }
         bucket::Command::Activate { bucket, attempt } => {
             w.u8(1);
@@ -358,6 +359,16 @@ fn put_bucket(w: &mut Writer, c: &bucket::Command) -> Result<(), RecordError> {
             record::put_str(w, bucket)?;
             w.u64(*attempt);
         }
+        bucket::Command::Lock {
+            bucket,
+            incarnation,
+            default,
+        } => {
+            w.u8(8);
+            record::put_str(w, bucket)?;
+            w.u64(*incarnation);
+            put_default(w, *default);
+        }
     }
     Ok(())
 }
@@ -370,6 +381,7 @@ fn take_bucket(r: &mut Reader<'_>, at_ns: u64) -> Option<bucket::Command> {
             location: record::take_str(r)?,
             at_ns,
             quota: r.u32()?,
+            lock: take_bool(r)?,
         }),
         1 => bucket::Command::Activate {
             bucket: record::take_str(r)?,
@@ -400,6 +412,11 @@ fn take_bucket(r: &mut Reader<'_>, at_ns: u64) -> Option<bucket::Command> {
             bucket: record::take_str(r)?,
             attempt: r.u64()?,
         },
+        8 => bucket::Command::Lock {
+            bucket: record::take_str(r)?,
+            incarnation: r.u64()?,
+            default: take_default(r)?,
+        },
         _ => return None,
     })
 }
@@ -413,20 +430,15 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
             put_preconditions(w, &p.preconditions)?;
             put_option(w, p.ordered_ns);
             record::put_bytes(w, &p.version.encode()?)?;
+            put_default(w, p.default);
         }
         name::Command::Delete(d) => {
             w.u8(1);
             put_target(w, &d.bucket, d.incarnation, &d.key)?;
             w.u8(d.versioning.code());
-            match d.named {
-                None => w.u8(0),
-                Some(name::Named::Null) => w.u8(1),
-                Some(name::Named::Order(order)) => {
-                    w.u8(2);
-                    w.u64(order);
-                }
-            }
+            put_named(w, d.named);
             put_match(w, d.if_match.as_ref())?;
+            w.u8(u8::from(d.bypass));
         }
         name::Command::CreateUpload(c) => {
             w.u8(2);
@@ -464,11 +476,31 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
                 }
             }
             record::put_file(w, c.file);
+            put_default(w, c.default);
         }
         name::Command::Abort(a) => {
             w.u8(5);
             put_target(w, &a.bucket, a.incarnation, &a.key)?;
             record::put_str(w, &a.upload)?;
+        }
+        name::Command::Retain(c) => {
+            w.u8(8);
+            put_target(w, &c.bucket, c.incarnation, &c.key)?;
+            put_named(w, c.named);
+            match c.retention {
+                None => w.u8(0),
+                Some(retention) => {
+                    w.u8(1);
+                    record::put_retention(w, Some(retention));
+                }
+            }
+            w.u8(u8::from(c.bypass));
+        }
+        name::Command::Hold(c) => {
+            w.u8(9);
+            put_target(w, &c.bucket, c.incarnation, &c.key)?;
+            put_named(w, c.named);
+            w.u8(u8::from(c.on));
         }
         name::Command::Gate(g) => {
             w.u8(6);
@@ -501,17 +533,13 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
                 at_ns,
                 ordered_ns: take_option(r)?,
                 version: Version::decode(&record::take_bytes(r)?).ok()?,
+                default: take_default(r)?,
             })
         }
         1 => {
             let (bucket, incarnation, key) = take_target(r)?;
             let versioning = Versioning::from_code(r.u8()?)?;
-            let named = match r.u8()? {
-                0 => None,
-                1 => Some(name::Named::Null),
-                2 => Some(name::Named::Order(r.u64()?)),
-                _ => return None,
-            };
+            let named = take_named(r)?;
             name::Command::Delete(name::Delete {
                 bucket,
                 incarnation,
@@ -520,6 +548,7 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
                 named,
                 if_match: take_match(r)?,
                 at_ns,
+                bypass: take_bool(r)?,
             })
         }
         2 => {
@@ -582,6 +611,7 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
                 size,
                 checksum,
                 file: record::take_file(r)?,
+                default: take_default(r)?,
             })
         }
         5 => {
@@ -605,8 +635,82 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
             incarnation: r.u64()?,
             budget: r.u32()?,
         }),
+        8 => {
+            let (bucket, incarnation, key) = take_target(r)?;
+            let named = take_named(r)?;
+            let retention = match r.u8()? {
+                0 => None,
+                1 => record::take_retention(r, true)?,
+                _ => return None,
+            };
+            name::Command::Retain(name::Retain {
+                bucket,
+                incarnation,
+                key,
+                named,
+                retention,
+                bypass: take_bool(r)?,
+                at_ns,
+            })
+        }
+        9 => {
+            let (bucket, incarnation, key) = take_target(r)?;
+            name::Command::Hold(name::Hold {
+                bucket,
+                incarnation,
+                key,
+                named: take_named(r)?,
+                on: take_bool(r)?,
+            })
+        }
         _ => return None,
     })
+}
+
+fn put_named(w: &mut Writer, named: Option<name::Named>) {
+    match named {
+        None => w.u8(0),
+        Some(name::Named::Null) => w.u8(1),
+        Some(name::Named::Order(order)) => {
+            w.u8(2);
+            w.u64(order);
+        }
+    }
+}
+
+fn take_named(r: &mut Reader<'_>) -> Option<Option<name::Named>> {
+    Some(match r.u8()? {
+        0 => None,
+        1 => Some(name::Named::Null),
+        2 => Some(name::Named::Order(r.u64()?)),
+        _ => return None,
+    })
+}
+
+fn take_bool(r: &mut Reader<'_>) -> Option<bool> {
+    match r.u8()? {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+fn put_default(w: &mut Writer, default: Option<DefaultRetention>) {
+    match default {
+        None => w.u8(0),
+        Some(default) => {
+            w.u8(1);
+            record::put_default(w, default);
+        }
+    }
+}
+
+fn take_default(r: &mut Reader<'_>) -> Option<Option<DefaultRetention>> {
+    match r.u8()? {
+        0 => Some(None),
+        1 => Some(Some(record::take_default(r)?)),
+        _ => None,
+    }
 }
 
 fn put_target(
@@ -727,6 +831,9 @@ fn put_bucket_outcome(w: &mut Writer, o: &bucket::Outcome) {
         O::NoSuchBucket => (11, None),
         O::Conflict => (12, None),
         O::Invalid => (13, None),
+        O::VersioningLocked => (14, None),
+        O::VersioningNotEnabled => (15, None),
+        O::LockConfigured => (16, None),
     };
     w.u8(code);
     if let Some((incarnation, attempt)) = attempt {
@@ -758,6 +865,9 @@ fn take_bucket_outcome(r: &mut Reader<'_>) -> Option<bucket::Outcome> {
         11 => O::NoSuchBucket,
         12 => O::Conflict,
         13 => O::Invalid,
+        14 => O::VersioningLocked,
+        15 => O::VersioningNotEnabled,
+        16 => O::LockConfigured,
         _ => return None,
     })
 }
@@ -802,6 +912,11 @@ fn put_name_outcome(w: &mut Writer, o: &name::Outcome) -> Result<(), RecordError
         O::Conflict => w.u8(15),
         O::Invalid => w.u8(16),
         O::NotEmpty => w.u8(17),
+        O::Retained => w.u8(18),
+        O::Held => w.u8(19),
+        O::Locked => w.u8(20),
+        O::NoSuchVersion => w.u8(21),
+        O::DeleteMarker => w.u8(22),
     }
     Ok(())
 }
@@ -849,6 +964,11 @@ fn take_name_outcome(r: &mut Reader<'_>) -> Option<name::Outcome> {
         15 => O::Conflict,
         16 => O::Invalid,
         17 => O::NotEmpty,
+        18 => O::Retained,
+        19 => O::Held,
+        20 => O::Locked,
+        21 => O::NoSuchVersion,
+        22 => O::DeleteMarker,
         _ => return None,
     })
 }
@@ -856,7 +976,7 @@ fn take_name_outcome(r: &mut Reader<'_>) -> Option<name::Outcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::{Target, Upload};
+    use crate::record::{Period, Retention, RetentionMode, Target, Upload};
     use mantle_chunk::ChunkKey;
     use proptest::prelude::*;
 
@@ -875,6 +995,11 @@ mod tests {
             file: Some(9),
             owner: "o".into(),
             headers: vec![("content-type".into(), "a/b".into())],
+            retention: Some(Retention {
+                mode: RetentionMode::Compliance,
+                until_ms: 1_893_456_000_000,
+            }),
+            legal_hold: Some(false),
         }
     }
 
@@ -901,6 +1026,7 @@ mod tests {
                 location: "eu".into(),
                 at_ns,
                 quota: 10,
+                lock: true,
             })),
             Command::Bucket(bucket::Command::Activate {
                 bucket: "b".into(),
@@ -931,6 +1057,47 @@ mod tests {
                 bucket: "b".into(),
                 attempt: 6,
             }),
+            Command::Bucket(bucket::Command::Lock {
+                bucket: "b".into(),
+                incarnation: 2,
+                default: Some(DefaultRetention {
+                    mode: RetentionMode::Compliance,
+                    period: Period::Years(3),
+                }),
+            }),
+            Command::Bucket(bucket::Command::Lock {
+                bucket: "b".into(),
+                incarnation: 2,
+                default: None,
+            }),
+            named(name::Command::Retain(name::Retain {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: "k".into(),
+                named: Some(name::Named::Null),
+                retention: Some(Retention {
+                    mode: RetentionMode::Governance,
+                    until_ms: 1_893_456_000_000,
+                }),
+                bypass: true,
+                at_ns,
+            })),
+            named(name::Command::Retain(name::Retain {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: "k".into(),
+                named: None,
+                retention: None,
+                bypass: false,
+                at_ns,
+            })),
+            named(name::Command::Hold(name::Hold {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: "k".into(),
+                named: Some(name::Named::Order(3)),
+                on: true,
+            })),
             named(name::Command::Put(name::Put {
                 bucket: "b".into(),
                 incarnation: 1,
@@ -940,6 +1107,10 @@ mod tests {
                 at_ns,
                 ordered_ns: Some(7),
                 version: version(),
+                default: Some(DefaultRetention {
+                    mode: RetentionMode::Governance,
+                    period: Period::Days(30),
+                }),
             })),
             named(name::Command::Delete(name::Delete {
                 bucket: "b".into(),
@@ -949,6 +1120,7 @@ mod tests {
                 named: Some(name::Named::Order(9)),
                 if_match: None,
                 at_ns,
+                bypass: true,
             })),
             named(name::Command::CreateUpload(name::CreateUpload {
                 bucket: "b".into(),
@@ -960,6 +1132,11 @@ mod tests {
                     owner: "o".into(),
                     headers: Vec::new(),
                     checksum: Some((2, true)),
+                    retention: Some(Retention {
+                        mode: RetentionMode::Governance,
+                        until_ms: 1,
+                    }),
+                    legal_hold: Some(true),
                 },
             })),
             named(name::Command::PutPart(name::PutPart {
@@ -993,6 +1170,10 @@ mod tests {
                 size: 10,
                 checksum: None,
                 file: Some(8),
+                default: Some(DefaultRetention {
+                    mode: RetentionMode::Compliance,
+                    period: Period::Days(1),
+                }),
             })),
             named(name::Command::Abort(name::Abort {
                 bucket: "b".into(),
@@ -1099,6 +1280,9 @@ mod tests {
                 B::NoSuchBucket,
                 B::Conflict,
                 B::Invalid,
+                B::VersioningLocked,
+                B::VersioningNotEnabled,
+                B::LockConfigured,
             ]
             .map(Answer::Bucket),
         );
@@ -1131,6 +1315,11 @@ mod tests {
                 N::Conflict,
                 N::Invalid,
                 N::NotEmpty,
+                N::Retained,
+                N::Held,
+                N::Locked,
+                N::NoSuchVersion,
+                N::DeleteMarker,
             ]
             .map(Answer::Name),
         );

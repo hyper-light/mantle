@@ -545,13 +545,15 @@ check that refuses to delete it must read the version in the same step that woul
   counted as 365 days, as S3 counts one for a retention duration.
 - **Event holds**, added to S3 in September 2026 and documented with no recorded answers, are
   `501 NotImplemented` until there is behaviour to match.
-- **Enforcement**, the metadata layer's: a version keeps its retention and legal hold; deleting
-  it by ID while either holds is `403 AccessDenied`, "Access Denied because object protected by
-  object lock.", and in DeleteObjects an error for that key; a retention may be extended by
-  anyone who may set one, shortened, removed or moved from GOVERNANCE to COMPLIANCE only under
-  bypass, and in COMPLIANCE never shortened or changed; versioning cannot be suspended on a bucket
-  with Object Lock, nor Object Lock configured on one whose versioning is not enabled, `409
-  InvalidBucketState`; lifecycle leaves locked versions be.
+- **Enforcement**, the metadata layer's (`crates/meta/src/name.rs`, `bucket.rs`; metadata.md
+  §2): a version keeps its retention and legal hold; deleting it by ID while either holds is
+  `403 AccessDenied`, "Access Denied because object protected by object lock.", and in
+  DeleteObjects an error for that key; a retention holds while its date is ahead, as a date
+  placed must be; it may be extended by anyone who may set one, shortened, removed or moved from
+  GOVERNANCE to COMPLIANCE only under bypass, as s3-tests expects of the move with no S3
+  recording (18 §6 item 6), and in COMPLIANCE never shortened or changed; versioning cannot be
+  suspended on a bucket with Object Lock, nor Object Lock configured on one whose versioning is
+  not enabled, `409 InvalidBucketState`; lifecycle leaves locked versions be.
 
 ## 12. Browser uploads
 

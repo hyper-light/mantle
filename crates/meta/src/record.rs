@@ -34,6 +34,62 @@ pub struct Version {
     pub owner: String,
     /// Content headers and user metadata, as the object was written with them.
     pub headers: Vec<(String, String)>,
+    /// Its Object Lock retention, if one was placed (18 §1.2).
+    pub retention: Option<Retention>,
+    /// Its legal hold: `None` if none was ever placed, which GetObjectLegalHold answers
+    /// `NoSuchObjectLockConfiguration`, else on or off (18 §5).
+    pub legal_hold: Option<bool>,
+}
+
+/// A retention's mode (18 §2.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionMode {
+    /// Changed, shortened or removed only under `s3:BypassGovernanceRetention`.
+    Governance,
+    /// Never shortened, changed or removed while it lasts.
+    Compliance,
+}
+
+/// An Object Lock retention: its mode, and the instant it lasts until, Unix milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retention {
+    pub mode: RetentionMode,
+    pub until_ms: i64,
+}
+
+/// A bucket's default retention: a mode and a period, days or years (18 §1.1, §2.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultRetention {
+    pub mode: RetentionMode,
+    pub period: Period,
+}
+
+/// A default retention's period, kept in the unit it was set in, so the configuration reads
+/// back as set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Period {
+    Days(u32),
+    Years(u32),
+}
+
+/// Milliseconds in a day.
+const DAY_MS: i64 = 86_400_000;
+
+impl DefaultRetention {
+    /// The retention a version created at `created_ms` takes: "adding the specified duration
+    /// to the object version's creation timestamp", a year counted as 365 days, as S3 counts
+    /// one for a retention duration (18 §2.4, §2.6). A period reaching past the last instant an
+    /// `i64` holds lasts until that instant, as no later one can be compared with it.
+    pub fn from(&self, created_ms: i64) -> Retention {
+        let days = match self.period {
+            Period::Days(days) => i64::from(days),
+            Period::Years(years) => i64::from(years).saturating_mul(365),
+        };
+        Retention {
+            mode: self.mode,
+            until_ms: created_ms.saturating_add(days.saturating_mul(DAY_MS)),
+        }
+    }
 }
 
 /// An object's checksum as S3 returns it (05 §3.3).
@@ -55,6 +111,10 @@ pub struct Upload {
     pub headers: Vec<(String, String)>,
     /// The checksum algorithm and whether values combine as full-object or composite.
     pub checksum: Option<(u8, bool)>,
+    /// The retention and legal hold CreateMultipartUpload's headers named, which the
+    /// completed version takes (18 §1.3).
+    pub retention: Option<Retention>,
+    pub legal_hold: Option<bool>,
 }
 
 /// A part of an upload.
@@ -100,6 +160,15 @@ pub struct Bucket {
     /// The create or delete attempt that last moved it: the Bucket range's time when the
     /// attempt began. A step of an older attempt is refused.
     pub attempt: u64,
+    /// Its Object Lock configuration, once Object Lock is on, which is for good (18 §2.1).
+    pub lock: Option<Lock>,
+}
+
+/// A bucket's Object Lock configuration: Object Lock is on, and new versions may take a
+/// default retention (18 §1.1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Lock {
+    pub default: Option<DefaultRetention>,
 }
 
 /// Whether a Name range admits a bucket's writes (docs/design/metadata.md §2).
@@ -341,6 +410,16 @@ impl Bucket {
         w.u8(self.versioning.code());
         w.u8(self.state.code());
         w.u64(self.attempt);
+        match self.lock {
+            None => w.u8(0),
+            Some(Lock { default: None }) => w.u8(1),
+            Some(Lock {
+                default: Some(default),
+            }) => {
+                w.u8(2);
+                put_default(&mut w, default);
+            }
+        }
         Ok(finish(w))
     }
 
@@ -355,6 +434,14 @@ impl Bucket {
                     versioning: Versioning::from_code(r.u8()?)?,
                     state: BucketState::from_code(r.u8()?)?,
                     attempt: r.u64()?,
+                    lock: match r.u8()? {
+                        0 => None,
+                        1 => Some(Lock::default()),
+                        2 => Some(Lock {
+                            default: Some(take_default(&mut r)?),
+                        }),
+                        _ => return None,
+                    },
                 })
             })(),
             &r,
@@ -488,7 +575,9 @@ impl Reverse {
 impl Version {
     pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
         let mut w = start();
-        w.u8(u8::from(self.marker) | (u8::from(self.null) << 1));
+        w.u8(u8::from(self.marker)
+            | (u8::from(self.null) << 1)
+            | lock_flags(self.retention, self.legal_hold) << 2);
         w.u64(self.modified_ns);
         put_str(&mut w, &self.etag)?;
         w.u64(self.size);
@@ -504,6 +593,7 @@ impl Version {
         put_file(&mut w, self.file);
         put_str(&mut w, &self.owner)?;
         put_pairs(&mut w, &self.headers)?;
+        put_retention(&mut w, self.retention);
         Ok(finish(w))
     }
 
@@ -512,7 +602,8 @@ impl Version {
         decoded(
             (|| {
                 let flags = r.u8()?;
-                let version = Self {
+                let (has_retention, legal_hold) = take_lock_flags(flags >> 2)?;
+                Some(Self {
                     marker: flags & 1 != 0,
                     null: flags & 2 != 0,
                     modified_ns: r.u64()?,
@@ -530,8 +621,9 @@ impl Version {
                     file: take_file(&mut r)?,
                     owner: take_str(&mut r)?,
                     headers: take_pairs(&mut r)?,
-                };
-                if flags < 4 { Some(version) } else { None }
+                    retention: take_retention(&mut r, has_retention)?,
+                    legal_hold,
+                })
             })(),
             &r,
             "version",
@@ -545,13 +637,15 @@ impl Upload {
         w.u64(self.initiated_ns);
         put_str(&mut w, &self.owner)?;
         put_pairs(&mut w, &self.headers)?;
+        let lock = lock_flags(self.retention, self.legal_hold) << 2;
         match self.checksum {
-            None => w.u8(0),
+            None => w.u8(lock),
             Some((algorithm, full)) => {
-                w.u8(1 | (u8::from(full) << 1));
+                w.u8(1 | (u8::from(full) << 1) | lock);
                 w.u8(algorithm);
             }
         }
+        put_retention(&mut w, self.retention);
         Ok(finish(w))
     }
 
@@ -559,15 +653,23 @@ impl Upload {
         let mut r = open(bytes, "upload")?;
         decoded(
             (|| {
+                let initiated_ns = r.u64()?;
+                let owner = take_str(&mut r)?;
+                let headers = take_pairs(&mut r)?;
+                let flags = r.u8()?;
+                let (has_retention, legal_hold) = take_lock_flags(flags >> 2)?;
+                let checksum = match flags & 3 {
+                    0 => None,
+                    flag @ (1 | 3) => Some((r.u8()?, flag == 3)),
+                    _ => return None,
+                };
                 Some(Self {
-                    initiated_ns: r.u64()?,
-                    owner: take_str(&mut r)?,
-                    headers: take_pairs(&mut r)?,
-                    checksum: match r.u8()? {
-                        0 => None,
-                        flag @ (1 | 3) => Some((r.u8()?, flag == 3)),
-                        _ => return None,
-                    },
+                    initiated_ns,
+                    owner,
+                    headers,
+                    checksum,
+                    retention: take_retention(&mut r, has_retention)?,
+                    legal_hold,
                 })
             })(),
             &r,
@@ -666,6 +768,84 @@ fn decoded<T>(value: Option<T>, r: &Reader<'_>, what: &'static str) -> Result<T,
         .ok_or(RecordError::Corrupt(what))
 }
 
+/// A lock's flags: bit 0 a retention follows, bit 1 a legal hold was placed, bit 2 it is on.
+fn lock_flags(retention: Option<Retention>, legal_hold: Option<bool>) -> u8 {
+    u8::from(retention.is_some())
+        | match legal_hold {
+            None => 0,
+            Some(false) => 2,
+            Some(true) => 6,
+        }
+}
+
+/// Whether a retention follows, and the legal hold, from flags `lock_flags` wrote: any other
+/// value is corrupt, so every row has one encoding.
+fn take_lock_flags(flags: u8) -> Option<(bool, Option<bool>)> {
+    let legal_hold = match flags >> 1 {
+        0 => None,
+        1 => Some(false),
+        3 => Some(true),
+        _ => return None,
+    };
+    Some((flags & 1 != 0, legal_hold))
+}
+
+fn mode_code(mode: RetentionMode) -> u8 {
+    match mode {
+        RetentionMode::Governance => 0,
+        RetentionMode::Compliance => 1,
+    }
+}
+
+fn take_mode(r: &mut Reader<'_>) -> Option<RetentionMode> {
+    match r.u8()? {
+        0 => Some(RetentionMode::Governance),
+        1 => Some(RetentionMode::Compliance),
+        _ => None,
+    }
+}
+
+pub(crate) fn put_retention(w: &mut Writer, retention: Option<Retention>) {
+    if let Some(retention) = retention {
+        w.u8(mode_code(retention.mode));
+        w.u64(retention.until_ms.cast_unsigned());
+    }
+}
+
+pub(crate) fn take_retention(r: &mut Reader<'_>, present: bool) -> Option<Option<Retention>> {
+    if !present {
+        return Some(None);
+    }
+    Some(Some(Retention {
+        mode: take_mode(r)?,
+        until_ms: r.u64()?.cast_signed(),
+    }))
+}
+
+pub(crate) fn put_default(w: &mut Writer, default: DefaultRetention) {
+    w.u8(mode_code(default.mode));
+    match default.period {
+        Period::Days(days) => {
+            w.u8(0);
+            w.u32(days);
+        }
+        Period::Years(years) => {
+            w.u8(1);
+            w.u32(years);
+        }
+    }
+}
+
+pub(crate) fn take_default(r: &mut Reader<'_>) -> Option<DefaultRetention> {
+    let mode = take_mode(r)?;
+    let period = match r.u8()? {
+        0 => Period::Days(r.u32()?),
+        1 => Period::Years(r.u32()?),
+        _ => return None,
+    };
+    Some(DefaultRetention { mode, period })
+}
+
 pub(crate) fn put_len(w: &mut Writer, len: usize) -> Result<(), RecordError> {
     w.u32(u32::try_from(len).map_err(|_| RecordError::TooLarge(len))?);
     Ok(())
@@ -753,6 +933,8 @@ mod tests {
                 ("content-type".into(), "text/plain".into()),
                 ("x-amz-meta-a".into(), "é".into()),
             ],
+            retention: None,
+            legal_hold: None,
         }
     }
 
@@ -773,6 +955,8 @@ mod tests {
             owner: "o".into(),
             headers: vec![("content-type".into(), "a/b".into())],
             checksum: Some((2, true)),
+            retention: None,
+            legal_hold: None,
         };
         assert_eq!(Upload::decode(&u.encode().unwrap()), Ok(u));
         let p = Part {
@@ -783,6 +967,104 @@ mod tests {
             modified_ns: 9,
         };
         assert_eq!(Part::decode(&p.encode().unwrap()), Ok(p));
+    }
+
+    /// Every lock a version, an upload and a bucket can hold reads back as written, and every
+    /// flag value no lock writes is corrupt, so each row has one encoding.
+    #[test]
+    fn locks_round_trip() {
+        let retentions = [
+            None,
+            Some(Retention {
+                mode: RetentionMode::Governance,
+                until_ms: 1_893_456_000_000,
+            }),
+            Some(Retention {
+                mode: RetentionMode::Compliance,
+                until_ms: i64::MIN,
+            }),
+        ];
+        for retention in retentions {
+            for legal_hold in [None, Some(false), Some(true)] {
+                let v = Version {
+                    retention,
+                    legal_hold,
+                    ..version()
+                };
+                assert_eq!(Version::decode(&v.encode().unwrap()), Ok(v));
+                for checksum in [None, Some((1, false)), Some((4, true))] {
+                    let u = Upload {
+                        initiated_ns: 1,
+                        owner: "o".into(),
+                        headers: Vec::new(),
+                        checksum,
+                        retention,
+                        legal_hold,
+                    };
+                    assert_eq!(Upload::decode(&u.encode().unwrap()), Ok(u));
+                }
+            }
+        }
+        for lock in [
+            None,
+            Some(Lock::default()),
+            Some(Lock {
+                default: Some(DefaultRetention {
+                    mode: RetentionMode::Compliance,
+                    period: Period::Days(36_500),
+                }),
+            }),
+            Some(Lock {
+                default: Some(DefaultRetention {
+                    mode: RetentionMode::Governance,
+                    period: Period::Years(100),
+                }),
+            }),
+        ] {
+            let b = Bucket {
+                owner: "o".into(),
+                created_ns: 1,
+                location: String::new(),
+                versioning: Versioning::Enabled,
+                state: BucketState::Active,
+                attempt: 1,
+                lock,
+            };
+            assert_eq!(Bucket::decode(&b.encode().unwrap()), Ok(b));
+        }
+        // A legal hold on that was never placed, and flags past the last.
+        for flags in [4u8 << 2, 1 << 5, 1 << 7] {
+            let mut bytes = Version {
+                checksum: None,
+                ..version()
+            }
+            .encode()
+            .unwrap();
+            let body = bytes.len() - 4;
+            bytes[1] |= flags;
+            let crc = mantle_crc::crc32c(&bytes[..body]);
+            bytes[body..].copy_from_slice(&crc.to_le_bytes());
+            assert_eq!(
+                Version::decode(&bytes),
+                Err(RecordError::Corrupt("version"))
+            );
+        }
+    }
+
+    /// A default runs from the version's creation, a year as 365 days, and past the last
+    /// instant lasts until it.
+    #[test]
+    fn a_default_retention_dates_from_creation() {
+        let default = |period| DefaultRetention {
+            mode: RetentionMode::Governance,
+            period,
+        };
+        assert_eq!(default(Period::Days(1)).from(5).until_ms, 5 + DAY_MS);
+        assert_eq!(default(Period::Years(2)).from(0).until_ms, 2 * 365 * DAY_MS);
+        assert_eq!(
+            default(Period::Years(u32::MAX)).from(i64::MAX - 1).until_ms,
+            i64::MAX
+        );
     }
 
     #[test]
@@ -836,6 +1118,7 @@ mod tests {
                 versioning,
                 state,
                 attempt: 8,
+                lock: None,
             };
             assert_eq!(Bucket::decode(&b.encode().unwrap()), Ok(b));
         }

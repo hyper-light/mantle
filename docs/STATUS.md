@@ -140,8 +140,6 @@ one core.
 
 Remaining before it is done:
 
-- Object Lock's enforcement in the Name ranges: each version's retention and legal hold, the
-  deletes and changes they refuse, and the versioning they fix (docs/design/s3-protocol.md §11).
 - The rest of 05 §16.1's later surface: server-side encryption headers.
 - The worker that takes lifecycle actions as they fall due, over the Name layer's versions
   and uploads, once the gateway and the metadata layer hold configurations (metadata.md §6).
@@ -152,8 +150,10 @@ encode; row values with a format byte and a CRC-32C checked on read, every flipp
 truncation refused; and the state machines of three layers over an engine interface, run
 on an in-memory engine that loses what a crash would. The Name layer: versioning enabled,
 suspended and never enabled, conditional writes judged at commit, delete markers, the null
-version, multipart uploads whose parts are checked at completion, and listings that stop
-within a budget and resume. The File layer: files written once as extents, found from any
+version, multipart uploads whose parts are checked at completion, listings that stop
+within a budget and resume, and Object Lock: each version's retention and legal hold, the
+removals and changes they refuse at the step that would make them, and a bucket's default
+retention, with versioning held enabled while Object Lock is on. The File layer: files written once as extents, found from any
 offset with one seek. The Block layer: where each chunk lives, with a reverse row per chunk
 that a property test keeps in step with the chunks through writes, moves and deletes. The
 Bucket layer: owners' quotas and listings, and the steps of creating and deleting a bucket

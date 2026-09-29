@@ -14,16 +14,27 @@ const CLOCK: &[u8] = &[key::LOCAL, b'c'];
 /// The time a write proposed at `at_ns` takes, the later of that and just after the range's
 /// last, and the write that records it.
 pub fn tick<E: Rows>(engine: &E, at_ns: u64) -> Result<(u64, Write), MetaError> {
-    let last = match engine.get(CLOCK)? {
-        None => 0,
-        Some(bytes) => record::decode_number(&bytes, "clock")?,
-    };
-    let next = last.checked_add(1).ok_or(MetaError::ClockExhausted)?;
+    let next = last(engine)?
+        .checked_add(1)
+        .ok_or(MetaError::ClockExhausted)?;
     let time = at_ns.max(next);
     Ok((
         time,
         Write::Put(CLOCK.to_vec(), record::encode_number(time)),
     ))
+}
+
+/// The range's time at an entry proposed at `at_ns`, the later of that and the range's last,
+/// read without taking an instant: what a lock's expiry is judged against.
+pub fn now<E: Rows>(engine: &E, at_ns: u64) -> Result<u64, MetaError> {
+    Ok(at_ns.max(last(engine)?))
+}
+
+fn last<E: Rows>(engine: &E) -> Result<u64, MetaError> {
+    match engine.get(CLOCK)? {
+        None => Ok(0),
+        Some(bytes) => Ok(record::decode_number(&bytes, "clock")?),
+    }
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@ use crate::clock;
 use crate::engine::{Rows, Write};
 use crate::error::MetaError;
 use crate::key;
-use crate::record::{Bucket, BucketState, Owned, Owner, Versioning};
+use crate::record::{Bucket, BucketState, DefaultRetention, Lock, Owned, Owner, Versioning};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -26,6 +26,13 @@ pub enum Command {
         bucket: String,
         incarnation: u64,
         versioning: Versioning,
+    },
+    /// PutObjectLockConfiguration: turns Object Lock on, with a default retention or none
+    /// (18 §1.1).
+    Lock {
+        bucket: String,
+        incarnation: u64,
+        default: Option<DefaultRetention>,
     },
     /// Marks the bucket as being deleted, or takes over a delete in progress: DeleteBucket's
     /// first step.
@@ -66,6 +73,9 @@ pub struct Create {
     pub at_ns: u64,
     /// Buckets the owner may have.
     pub quota: u32,
+    /// `x-amz-bucket-object-lock-enabled: true`: the bucket is made with Object Lock on and
+    /// versioning enabled, as Object Lock needs (18 §2.1).
+    pub lock: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +87,7 @@ pub enum Outcome {
     },
     Activated,
     Versioned,
+    LockConfigured,
     /// The bucket is being deleted: the Name ranges close its gates next and are read.
     Deleting {
         incarnation: u64,
@@ -101,6 +112,12 @@ pub enum Outcome {
     Conflict,
     /// Versioning set back to unversioned, which S3 never allows once enabled (05 §7.1).
     Invalid,
+    /// `409 InvalidBucketState`, "An Object Lock configuration is present on this bucket, so
+    /// the versioning state cannot be changed." (18 §5).
+    VersioningLocked,
+    /// `409 InvalidBucketState`, "Versioning must be 'Enabled' on the bucket to apply a Object
+    /// Lock configuration" (18 §5).
+    VersioningNotEnabled,
 }
 
 /// Applies `command` as log entry `index`.
@@ -121,6 +138,11 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
             incarnation,
             versioning,
         } => version(engine, bucket, *incarnation, *versioning)?,
+        Command::Lock {
+            bucket,
+            incarnation,
+            default,
+        } => lock(engine, bucket, *incarnation, *default)?,
         Command::BeginDelete { bucket, at_ns } => begin(engine, bucket, *at_ns, Active)?,
         Command::Abandon { bucket, at_ns } => begin(engine, bucket, *at_ns, Creating)?,
         Command::Restore { bucket, attempt } => step(
@@ -148,7 +170,11 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
 fn create<E: Rows>(engine: &E, c: &Create) -> Result<(Outcome, Vec<Write>), MetaError> {
     if let Some(row) = read(engine, &c.bucket)? {
         let outcome = match row.state {
-            BucketState::Creating if row.owner == c.owner && row.location == c.location => {
+            BucketState::Creating
+                if row.owner == c.owner
+                    && row.location == c.location
+                    && row.lock.is_some() == c.lock =>
+            {
                 // The same request again, after its coordinator stopped answering.
                 let (attempt, clock) = clock::tick(engine, c.at_ns)?;
                 let row = Bucket { attempt, ..row };
@@ -178,9 +204,14 @@ fn create<E: Rows>(engine: &E, c: &Create) -> Result<(Outcome, Vec<Write>), Meta
         owner: c.owner.clone(),
         created_ns: time,
         location: c.location.clone(),
-        versioning: Versioning::Unversioned,
+        versioning: if c.lock {
+            Versioning::Enabled
+        } else {
+            Versioning::Unversioned
+        },
         state: BucketState::Creating,
         attempt: time,
+        lock: c.lock.then(Lock::default),
     };
     let count = Owner {
         buckets: buckets.checked_add(1).ok_or(MetaError::Corrupt)?,
@@ -208,23 +239,63 @@ fn version<E: Rows>(
     if versioning == Versioning::Unversioned {
         return Ok((Outcome::Invalid, Vec::new()));
     }
-    let row = match read(engine, bucket)? {
-        Some(row) if row.created_ns == incarnation => row,
-        _ => return Ok((Outcome::NoSuchBucket, Vec::new())),
+    let row = match active(engine, bucket, incarnation)? {
+        Ok(row) => row,
+        Err(outcome) => return Ok((outcome, Vec::new())),
     };
-    let outcome = match row.state {
-        BucketState::Active => Outcome::Versioned,
-        BucketState::Deleting => Outcome::OperationAborted,
-        BucketState::Creating | BucketState::Deleted => Outcome::NoSuchBucket,
-    };
-    if outcome != Outcome::Versioned {
-        return Ok((outcome, Vec::new()));
+    // "After you enable Object Lock on a bucket, you can't disable Object Lock or suspend
+    // versioning for that bucket" (18 §2.1).
+    if row.lock.is_some() && versioning != Versioning::Enabled {
+        return Ok((Outcome::VersioningLocked, Vec::new()));
     }
     let row = Bucket { versioning, ..row };
     Ok((
         Outcome::Versioned,
         vec![Write::Put(key::bucket(bucket), row.encode()?)],
     ))
+}
+
+/// Sets the bucket's Object Lock configuration, which "works only in buckets that have S3
+/// Versioning enabled" (18 §2.1).
+fn lock<E: Rows>(
+    engine: &E,
+    bucket: &str,
+    incarnation: u64,
+    default: Option<DefaultRetention>,
+) -> Result<(Outcome, Vec<Write>), MetaError> {
+    let row = match active(engine, bucket, incarnation)? {
+        Ok(row) => row,
+        Err(outcome) => return Ok((outcome, Vec::new())),
+    };
+    if row.versioning != Versioning::Enabled {
+        return Ok((Outcome::VersioningNotEnabled, Vec::new()));
+    }
+    let row = Bucket {
+        lock: Some(Lock { default }),
+        ..row
+    };
+    Ok((
+        Outcome::LockConfigured,
+        vec![Write::Put(key::bucket(bucket), row.encode()?)],
+    ))
+}
+
+/// The row of `bucket`'s `incarnation` while it is active, or the answer to a setting's change
+/// otherwise.
+fn active<E: Rows>(
+    engine: &E,
+    bucket: &str,
+    incarnation: u64,
+) -> Result<Result<Bucket, Outcome>, MetaError> {
+    let row = match read(engine, bucket)? {
+        Some(row) if row.created_ns == incarnation => row,
+        _ => return Ok(Err(Outcome::NoSuchBucket)),
+    };
+    Ok(match row.state {
+        BucketState::Active => Ok(row),
+        BucketState::Deleting => Err(Outcome::OperationAborted),
+        BucketState::Creating | BucketState::Deleted => Err(Outcome::NoSuchBucket),
+    })
 }
 
 /// Starts a delete of a bucket in state `from`, or takes over a delete in progress.
@@ -395,6 +466,7 @@ mod tests {
                 location: String::new(),
                 at_ns,
                 quota,
+                lock: false,
             }))
         }
 
@@ -581,5 +653,91 @@ mod tests {
         };
         assert_eq!(r.run(active), Outcome::Conflict);
         assert_eq!(r.state("c"), Some(BucketState::Active));
+    }
+
+    /// Object Lock needs versioning enabled and keeps it so (18 §2.1, §5).
+    #[test]
+    fn object_lock_holds_versioning_enabled() {
+        use crate::record::{DefaultRetention, Period, RetentionMode};
+        let mut r = Range::default();
+        let version = |bucket: &str, incarnation, versioning| Command::Version {
+            bucket: bucket.into(),
+            incarnation,
+            versioning,
+        };
+        let lock = |bucket: &str, incarnation, default| Command::Lock {
+            bucket: bucket.into(),
+            incarnation,
+            default,
+        };
+        let default = Some(DefaultRetention {
+            mode: RetentionMode::Governance,
+            period: Period::Years(1),
+        });
+        // Configured on a bucket whose versioning is not enabled: refused, then accepted once
+        // it is.
+        let (b, a) = begun(r.create("b", "o", 100, 10));
+        r.run(activate("b", a));
+        assert_eq!(r.run(lock("b", b, None)), Outcome::VersioningNotEnabled);
+        assert_eq!(
+            r.run(version("b", b, Versioning::Suspended)),
+            Outcome::Versioned
+        );
+        assert_eq!(r.run(lock("b", b, None)), Outcome::VersioningNotEnabled);
+        assert_eq!(
+            r.run(version("b", b, Versioning::Enabled)),
+            Outcome::Versioned
+        );
+        assert_eq!(r.run(lock("b", b, default)), Outcome::LockConfigured);
+        let row = read(&r.engine, "b").unwrap().unwrap();
+        assert_eq!(row.lock, Some(Lock { default }));
+        // Removing the default keeps Object Lock on; versioning cannot be suspended.
+        assert_eq!(r.run(lock("b", b, None)), Outcome::LockConfigured);
+        assert_eq!(
+            read(&r.engine, "b").unwrap().unwrap().lock,
+            Some(Lock::default())
+        );
+        assert_eq!(
+            r.run(version("b", b, Versioning::Suspended)),
+            Outcome::VersioningLocked
+        );
+        assert_eq!(
+            r.run(version("b", b, Versioning::Enabled)),
+            Outcome::Versioned
+        );
+        assert_eq!(r.run(lock("b", b + 1, None)), Outcome::NoSuchBucket);
+
+        // Made with Object Lock: versioning enabled from the start.
+        let created = r.run(Command::Create(Create {
+            bucket: "c".into(),
+            owner: "o".into(),
+            location: String::new(),
+            at_ns: 200,
+            quota: 10,
+            lock: true,
+        }));
+        let (c, a) = begun(created);
+        let row = read(&r.engine, "c").unwrap().unwrap();
+        assert_eq!(
+            (row.versioning, row.lock),
+            (Versioning::Enabled, Some(Lock::default()))
+        );
+        // A retry of that create is the same request; one without Object Lock is not.
+        assert!(matches!(
+            r.run(Command::Create(Create {
+                bucket: "c".into(),
+                owner: "o".into(),
+                location: String::new(),
+                at_ns: 210,
+                quota: 10,
+                lock: false,
+            })),
+            Outcome::OperationAborted
+        ));
+        r.run(activate("c", a));
+        assert_eq!(
+            r.run(version("c", c, Versioning::Suspended)),
+            Outcome::VersioningLocked
+        );
     }
 }

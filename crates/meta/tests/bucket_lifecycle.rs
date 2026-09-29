@@ -141,6 +141,7 @@ impl World {
                     location: String::new(),
                     at_ns: self.clock,
                     quota: 10,
+                    lock: false,
                 }));
                 self.start(outcome);
             }
@@ -190,6 +191,7 @@ impl World {
                         at_ns: self.clock,
                         ordered_ns: None,
                         version: object(),
+                        default: None,
                     });
                     if let name::Outcome::Put { .. } = self.name(range_of(key), put) {
                         self.acked.insert(key, incarnation);
@@ -207,6 +209,7 @@ impl World {
                         named: None,
                         if_match: None,
                         at_ns: self.clock,
+                        bypass: false,
                     });
                     if let name::Outcome::Deleted { .. } = self.name(range_of(key), delete) {
                         self.acked.remove(key);
@@ -282,6 +285,8 @@ fn object() -> Version {
         file: Some(1),
         owner: "o".into(),
         headers: Vec::new(),
+        retention: None,
+        legal_hold: None,
     }
 }
 

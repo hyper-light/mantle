@@ -110,7 +110,10 @@ mod tests {
                 file: Some(1),
                 owner: "o".into(),
                 headers: Vec::new(),
+                retention: None,
+                legal_hold: None,
             },
+            default: None,
         })))
     }
 

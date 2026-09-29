@@ -2,7 +2,8 @@
 
 Status: design, 2026-09-28. Sources: docs/research/01 (Tectonic, cited as "01 §x" and
 [TEC]), 05 (S3 semantics), 06 (consensus and range-partitioned metadata), 07 (focal's
-consensus stack), 09 (cells), 12 (RocksDB and ZippyDB); docs/design/architecture.md.
+consensus stack), 09 (cells), 12 (RocksDB and ZippyDB), 18 (Object Lock);
+docs/design/architecture.md.
 
 The metadata service records what exists: buckets, the versions of every object, the
 multipart uploads in progress, which blocks hold an object's bytes, and which chunk stores
@@ -99,6 +100,23 @@ layers removes them, as Tectonic's does [01 §1.6].
 - **DeleteObject** writes in the Name range only: a delete marker, the null version's
   removal, or a version's removal, by the bucket's versioning state [05 §7.3]. A version
   removed leaves its file and blocks unreferenced.
+- **Object Lock** (docs/research/18; s3-protocol §11). A version's retention and legal hold
+  live in its row, so the step that would remove a version reads its lock in the same
+  transaction. A write carries the retention and legal hold its request names and the
+  bucket's default retention as the gateway read it; the default runs from the version's
+  creation, a year as 365 days [18 §2.4], and a completed upload takes the lock its creation
+  named. Removing a version by ID, or replacing a null version, is refused while its legal
+  hold is on or its retention's date is ahead, a GOVERNANCE retention yielding to bypass
+  [18 §2.2, §2.3]; a delete marker still stacks over a locked version [18 §2.1]. A
+  retention may be extended by anyone who may set one, and shortened, removed or moved out of
+  GOVERNANCE only under bypass; a COMPLIANCE one never changes while it lasts. A lock's expiry
+  is judged at the range's time for the entry, the later of the leader's proposal and the
+  range's clock, so every replica judges it alike. The null version is checked though Object
+  Lock keeps versioning enabled: a gateway whose view of the bucket predates Object Lock could
+  otherwise replace a locked one. The Bucket range keeps a bucket's Object Lock configuration
+  in its row, set only while versioning is enabled, after which versioning cannot be
+  suspended [18 §5]. The lifecycle worker removes versions with Name-range deletes that never
+  bypass, so no locked version expires [18 §2.5].
 - **Lazy deletion.** Unreferenced files and blocks are removed by the collector after a
   grace period, so a deletion by mistake can still be undone by a metadata change, as GFS
   keeps a deleted file three days and Tectonic deletes lazily between layers (chunk-store

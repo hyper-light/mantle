@@ -11,7 +11,10 @@ use crate::clock;
 use crate::engine::{Rows, Write};
 use crate::error::MetaError;
 use crate::key::{self, NULL_VERSION, NameRow};
-use crate::record::{self, Checksum, Gate, GateState, Part, Upload, Version};
+use crate::record::{
+    self, Checksum, DefaultRetention, Gate, GateState, Part, Retention, RetentionMode, Upload,
+    Version,
+};
 
 pub use crate::record::Versioning;
 
@@ -56,6 +59,8 @@ pub enum Command {
     PutPart(PutPart),
     Complete(Complete),
     Abort(Abort),
+    Retain(Retain),
+    Hold(Hold),
     Gate(GateChange),
     Collect(Collect),
 }
@@ -70,6 +75,8 @@ impl Command {
             Self::PutPart(c) => Some((&c.bucket, c.incarnation)),
             Self::Complete(c) => Some((&c.bucket, c.incarnation)),
             Self::Abort(c) => Some((&c.bucket, c.incarnation)),
+            Self::Retain(c) => Some((&c.bucket, c.incarnation)),
+            Self::Hold(c) => Some((&c.bucket, c.incarnation)),
             Self::Gate(_) | Self::Collect(_) => None,
         }
     }
@@ -90,7 +97,11 @@ pub struct Put {
     /// does not document a completed upload's `Last-Modified`; the version's is the time
     /// that orders it.
     pub ordered_ns: Option<u64>,
+    /// The version, with the retention and legal hold its request named, if any.
     pub version: Version,
+    /// The bucket's default retention, which a version whose request named no retention takes
+    /// from its creation (18 §2.4).
+    pub default: Option<DefaultRetention>,
 }
 
 /// CreateMultipartUpload (05 §4.2). The upload's ID is its initiation time in the version-ID
@@ -141,6 +152,8 @@ pub struct Complete {
     pub size: u64,
     pub checksum: Option<Checksum>,
     pub file: Option<u128>,
+    /// The bucket's default retention, which the version takes when the upload named none.
+    pub default: Option<DefaultRetention>,
 }
 
 /// A part a CompleteMultipartUpload lists.
@@ -197,6 +210,37 @@ pub struct Delete {
     pub named: Option<Named>,
     pub if_match: Option<Match>,
     pub at_ns: u64,
+    /// `x-amz-bypass-governance-retention: true` from a requester allowed
+    /// `s3:BypassGovernanceRetention` (18 §2.2).
+    pub bypass: bool,
+}
+
+/// PutObjectRetention (18 §1.2): places, extends, shortens or removes a version's retention.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Retain {
+    pub bucket: String,
+    /// The bucket's incarnation the write was made under.
+    pub incarnation: u64,
+    pub key: String,
+    /// The version; `None` for the current one.
+    pub named: Option<Named>,
+    /// The retention the version is to have; `None`, an empty `Retention`, removes it.
+    pub retention: Option<Retention>,
+    /// As DeleteObject's (18 §2.2).
+    pub bypass: bool,
+    pub at_ns: u64,
+}
+
+/// PutObjectLegalHold (18 §1.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hold {
+    pub bucket: String,
+    /// The bucket's incarnation the write was made under.
+    pub incarnation: u64,
+    pub key: String,
+    /// The version; `None` for the current one.
+    pub named: Option<Named>,
+    pub on: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,6 +286,18 @@ pub enum Outcome {
     NotEmpty,
     /// Rows of a condemned bucket were removed; `done` once none is left.
     Collected { done: bool },
+    /// A version's retention was set or removed.
+    Retained,
+    /// A version's legal hold was set.
+    Held,
+    /// `403 AccessDenied`, "Access Denied because object protected by object lock." (18 §5):
+    /// the write would remove, overwrite or weaken a lock that holds.
+    Locked,
+    /// `404 NoSuchVersion`: the version named does not exist.
+    NoSuchVersion,
+    /// The version is a delete marker, which holds no lock (18 §2.5): `405 MethodNotAllowed`
+    /// when a request names it (18 §5).
+    DeleteMarker,
 }
 
 /// Applies `command` as log entry `index`. A refused command still advances the index.
@@ -258,6 +314,8 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
         Command::PutPart(p) => put_part(engine, p)?,
         Command::Complete(c) => complete(engine, c)?,
         Command::Abort(a) => abort(engine, a)?,
+        Command::Retain(r) => retain(engine, r)?,
+        Command::Hold(h) => hold(engine, h)?,
         Command::Gate(g) => move_gate(engine, g)?,
         Command::Collect(c) => collect(engine, c)?,
     };
@@ -371,6 +429,16 @@ fn put<E: Rows>(engine: &E, p: &Put) -> Result<(Outcome, Vec<Write>), MetaError>
     let (bucket, key, versioning) = (p.bucket.as_str(), p.key.as_str(), p.versioning);
     let (preconditions, at_ns, ordered_ns, version) =
         (&p.preconditions, p.at_ns, p.ordered_ns, &p.version);
+    let null = versioning != Versioning::Enabled;
+    // A write that replaces the null version may not replace a locked one: "a protected object
+    // version can't be overwritten" (18 §2.2). Object Lock keeps versioning enabled, so only a
+    // write made under a stale view of the bucket reaches here.
+    if null
+        && let Some((_, v)) = self::version(engine, bucket, key, Named::Null)?
+        && protected(&v, clock::now(engine, at_ns)?, false)?
+    {
+        return Ok((Outcome::Locked, Vec::new()));
+    }
     // A delete marker is no current version to a write (05 §2.2).
     let current = current(engine, bucket, key)?.filter(|(_, v)| !v.marker);
     if let Some(none_match) = &preconditions.if_none_match
@@ -393,7 +461,6 @@ fn put<E: Rows>(engine: &E, p: &Put) -> Result<(Outcome, Vec<Write>), MetaError>
     let mut writes = vec![clock];
     let when = ordered_ns.unwrap_or(time);
     let order = !when;
-    let null = versioning != Versioning::Enabled;
     if null {
         writes.extend(remove_null(engine, bucket, key)?.1);
         writes.push(Write::Put(
@@ -401,10 +468,18 @@ fn put<E: Rows>(engine: &E, p: &Put) -> Result<(Outcome, Vec<Write>), MetaError>
             record::encode_number(order),
         ));
     }
+    // "the object version's individual Object Lock settings override any bucket property
+    // retention settings" (18 §2.4).
+    let retention = match (version.retention, p.default) {
+        (Some(retention), _) => Some(retention),
+        (None, Some(default)) => Some(default.from(millis(when)?)),
+        (None, None) => None,
+    };
     let written = Version {
         marker: false,
         null,
         modified_ns: when,
+        retention,
         ..version.clone()
     };
     writes.push(Write::Put(
@@ -435,6 +510,21 @@ fn delete<E: Rows>(engine: &E, d: &Delete) -> Result<(Outcome, Vec<Write>), Meta
             }
             Some(_) => {}
         }
+    }
+    // A version is removed when one is named, or when an unversioned or suspended bucket's
+    // delete replaces the null version; a locked one is refused (18 §2.5). A marker stacked
+    // on a locked version is not: "Retention periods and legal holds don't prevent ... delete
+    // markers to be added on top of the object" (18 §2.1).
+    let removes = match named {
+        Some(named) => Some(named),
+        None if versioning != Versioning::Enabled => Some(Named::Null),
+        None => None,
+    };
+    if let Some(removes) = removes
+        && let Some((_, v)) = self::version(engine, bucket, key, removes)?
+        && protected(&v, clock::now(engine, at_ns)?, d.bypass)?
+    {
+        return Ok((Outcome::Locked, Vec::new()));
     }
     match named {
         Some(Named::Null) => {
@@ -506,6 +596,8 @@ fn delete<E: Rows>(engine: &E, d: &Delete) -> Result<(Outcome, Vec<Write>), Meta
                     file: None,
                     owner: String::new(),
                     headers: Vec::new(),
+                    retention: None,
+                    legal_hold: None,
                 };
                 writes.push(Write::Put(
                     key::name(bucket, key, &NameRow::Version(order)),
@@ -625,7 +717,10 @@ fn complete<E: Rows>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), 
                 file: c.file,
                 owner: upload_row.owner,
                 headers: upload_row.headers,
+                retention: upload_row.retention,
+                legal_hold: upload_row.legal_hold,
             },
+            default: c.default,
         },
     )?;
     if matches!(outcome, Outcome::Put { .. }) {
@@ -633,6 +728,100 @@ fn complete<E: Rows>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), 
         writes.extend(remove_upload(engine, &c.bucket, &c.key, &c.upload)?);
     }
     Ok((outcome, writes))
+}
+
+fn retain<E: Rows>(engine: &E, r: &Retain) -> Result<(Outcome, Vec<Write>), MetaError> {
+    let (order, version) = match target(engine, &r.bucket, &r.key, r.named)? {
+        Ok(found) => found,
+        Err(outcome) => return Ok((outcome, Vec::new())),
+    };
+    let now = millis(clock::now(engine, r.at_ns)?)?;
+    if !may_retain(version.retention, r.retention, now, r.bypass) {
+        return Ok((Outcome::Locked, Vec::new()));
+    }
+    let written = Version {
+        retention: r.retention,
+        ..version
+    };
+    Ok((
+        Outcome::Retained,
+        vec![Write::Put(
+            key::name(&r.bucket, &r.key, &NameRow::Version(order)),
+            written.encode()?,
+        )],
+    ))
+}
+
+/// "Legal holds can be freely placed and removed by any user who has the
+/// `s3:PutObjectLegalHold` permission" (18 §2.3).
+fn hold<E: Rows>(engine: &E, h: &Hold) -> Result<(Outcome, Vec<Write>), MetaError> {
+    let (order, version) = match target(engine, &h.bucket, &h.key, h.named)? {
+        Ok(found) => found,
+        Err(outcome) => return Ok((outcome, Vec::new())),
+    };
+    let written = Version {
+        legal_hold: Some(h.on),
+        ..version
+    };
+    Ok((
+        Outcome::Held,
+        vec![Write::Put(
+            key::name(&h.bucket, &h.key, &NameRow::Version(order)),
+            written.encode()?,
+        )],
+    ))
+}
+
+/// The version a lock's change names, or the current one: an object's, never a delete
+/// marker's.
+fn target<E: Rows>(
+    engine: &E,
+    bucket: &str,
+    key: &str,
+    named: Option<Named>,
+) -> Result<Result<(u64, Version), Outcome>, MetaError> {
+    let found = match named {
+        None => current(engine, bucket, key)?,
+        Some(named) => version(engine, bucket, key, named)?,
+    };
+    Ok(match found {
+        None if named.is_some() => Err(Outcome::NoSuchVersion),
+        None => Err(Outcome::NoSuchKey),
+        Some((_, v)) if v.marker => Err(Outcome::DeleteMarker),
+        Some(found) => Ok(found),
+    })
+}
+
+/// Whether a version's retention may become `next` at `now`, Unix milliseconds (18 §2.2).
+/// Once no retention holds, any may be placed. One that holds may be extended in its mode by
+/// anyone who may place one; otherwise a GOVERNANCE retention changes only under bypass, and
+/// a COMPLIANCE one "can't be changed, and its retention period can't be shortened".
+fn may_retain(held: Option<Retention>, next: Option<Retention>, now: i64, bypass: bool) -> bool {
+    let Some(held) = held.filter(|r| r.until_ms > now) else {
+        return true;
+    };
+    match next {
+        Some(next) if next.mode == held.mode && next.until_ms >= held.until_ms => true,
+        _ => held.mode == RetentionMode::Governance && bypass,
+    }
+}
+
+/// Whether `version` is protected at `now_ns` from removal or overwrite: under a legal hold,
+/// which bypass does not lift, or while a retention holds, a GOVERNANCE one unless the
+/// request bypasses it (18 §2.2, §2.3).
+fn protected(version: &Version, now_ns: u64, bypass: bool) -> Result<bool, MetaError> {
+    let now = millis(now_ns)?;
+    Ok(version.legal_hold == Some(true)
+        || version
+            .retention
+            .is_some_and(|r| r.until_ms > now && (r.mode == RetentionMode::Compliance || !bypass)))
+}
+
+/// Nanoseconds since the Unix epoch as milliseconds, the unit S3 dates a retention in.
+fn millis(ns: u64) -> Result<i64, MetaError> {
+    ns.checked_div(1_000_000)
+        .and_then(|ms| i64::try_from(ms).ok())
+        .ok_or(MetaError::Corrupt)
 }
 
 fn abort<E: Rows>(engine: &E, a: &Abort) -> Result<(Outcome, Vec<Write>), MetaError> {
@@ -1143,6 +1332,7 @@ mod tests {
                 at_ns: self.clock,
                 ordered_ns: None,
                 version: object(etag),
+                default: None,
             }))
         }
 
@@ -1156,6 +1346,7 @@ mod tests {
                 named,
                 if_match: None,
                 at_ns: self.clock,
+                bypass: false,
             }))
         }
 
@@ -1187,6 +1378,8 @@ mod tests {
             file: Some(1),
             owner: "o".into(),
             headers: Vec::new(),
+            retention: None,
+            legal_hold: None,
         }
     }
 
@@ -1370,6 +1563,7 @@ mod tests {
                 at_ns: r.clock + 100,
                 ordered_ns: Some(early),
                 version: object("upload"),
+                default: None,
             }),
         )
         .unwrap();
@@ -1565,6 +1759,8 @@ mod tests {
                     owner: "o".into(),
                     headers: vec![("content-type".into(), "a/b".into())],
                     checksum: None,
+                    retention: None,
+                    legal_hold: None,
                 },
             })) {
                 Outcome::Created { upload } => upload,
@@ -1611,6 +1807,7 @@ mod tests {
                 size: 11 << 20,
                 checksum: None,
                 file: Some(99),
+                default: None,
             }))
         }
     }
@@ -1762,6 +1959,7 @@ mod tests {
                         named: None,
                         if_match: None,
                         at_ns: 100 + i,
+                        bypass: false,
                     })
                 } else {
                     Command::Put(Put {
@@ -1773,6 +1971,7 @@ mod tests {
                         at_ns: 100 + i,
                         ordered_ns: None,
                         version: object(&format!("e{i}")),
+                        default: None,
                     })
                 }
             }))
@@ -1819,6 +2018,7 @@ mod tests {
             at_ns: 5_000,
             ordered_ns: None,
             version: object("x"),
+            default: None,
         };
         assert_eq!(r.run(Command::Put(stale.clone())), Outcome::NoSuchBucket);
         stale.bucket = "c".into();
@@ -1947,5 +2147,266 @@ mod tests {
         // A position before the bucket starts at its first row.
         assert_eq!(probe(&r.engine, "b", Some(&[]), 4).unwrap(), Probe::Found);
         assert_eq!(probe(&r.engine, "c", None, 4).unwrap(), Probe::Clear);
+    }
+
+    const MS: u64 = 1_000_000;
+
+    fn governance(until_ms: i64) -> Option<Retention> {
+        Some(Retention {
+            mode: RetentionMode::Governance,
+            until_ms,
+        })
+    }
+
+    fn compliance(until_ms: i64) -> Option<Retention> {
+        Some(Retention {
+            mode: RetentionMode::Compliance,
+            until_ms,
+        })
+    }
+
+    impl Range {
+        /// A version of `key` written at millisecond `at_ms` with the lock its request names,
+        /// and the bucket's default retention.
+        fn put_locked(
+            &mut self,
+            key: &str,
+            at_ms: u64,
+            retention: Option<Retention>,
+            legal_hold: Option<bool>,
+            default: Option<DefaultRetention>,
+        ) -> String {
+            self.clock = at_ms * MS;
+            put_id(&self.run(Command::Put(Put {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: key.into(),
+                versioning: Versioning::Enabled,
+                preconditions: Preconditions::default(),
+                at_ns: self.clock,
+                ordered_ns: None,
+                version: Version {
+                    retention,
+                    legal_hold,
+                    ..object("e")
+                },
+                default,
+            })))
+        }
+
+        fn remove(&mut self, key: &str, id: &str, at_ms: u64, bypass: bool) -> Outcome {
+            self.run(Command::Delete(Delete {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: key.into(),
+                versioning: Versioning::Enabled,
+                named: Some(Named::Order(key::parse_version_id(id).unwrap())),
+                if_match: None,
+                at_ns: at_ms * MS,
+                bypass,
+            }))
+        }
+
+        fn retain(
+            &mut self,
+            key: &str,
+            named: Option<Named>,
+            retention: Option<Retention>,
+            at_ms: u64,
+            bypass: bool,
+        ) -> Outcome {
+            self.run(Command::Retain(Retain {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: key.into(),
+                named,
+                retention,
+                bypass,
+                at_ns: at_ms * MS,
+            }))
+        }
+
+        fn hold(&mut self, key: &str, named: Option<Named>, on: bool) -> Outcome {
+            self.run(Command::Hold(Hold {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: key.into(),
+                named,
+                on,
+            }))
+        }
+
+        fn lock_of(&self, key: &str, id: &str) -> (Option<Retention>, Option<bool>) {
+            let order = key::parse_version_id(id).unwrap();
+            let (_, v) = version(&self.engine, "b", key, Named::Order(order))
+                .unwrap()
+                .unwrap();
+            (v.retention, v.legal_hold)
+        }
+    }
+
+    /// "If you issued a permanent DELETE request ... Amazon S3 returns an Access Denied"; a
+    /// simple one stacks a marker (18 §2.5). GOVERNANCE yields to bypass, COMPLIANCE to
+    /// nothing but time, and a legal hold to nothing but its removal (18 §2.2, §2.3).
+    #[test]
+    fn a_locked_version_is_not_deleted_until_its_lock_lifts() {
+        let mut r = Range::new();
+        let g = r.put_locked("k", 10, governance(1_000), None, None);
+        assert_eq!(r.remove("k", &g, 20, false), Outcome::Locked);
+        // A simple delete stacks a marker over it; the version stays.
+        assert!(matches!(
+            r.delete("k", Versioning::Enabled, None),
+            Outcome::Deleted { marker: true, .. }
+        ));
+        assert_eq!(r.versions("k").len(), 2);
+        assert!(matches!(
+            r.remove("k", &g, 30, true),
+            Outcome::Deleted { .. }
+        ));
+        assert_eq!(r.versions("k").len(), 1);
+
+        let c = r.put_locked("k", 40, compliance(1_000), None, None);
+        assert_eq!(r.remove("k", &c, 50, false), Outcome::Locked);
+        assert_eq!(r.remove("k", &c, 50, true), Outcome::Locked);
+        // It holds while its date is ahead, as a date placed must be (lock::ahead), and lifts
+        // at that instant.
+        assert_eq!(r.remove("k", &c, 999, false), Outcome::Locked);
+        assert!(matches!(
+            r.remove("k", &c, 1_000, false),
+            Outcome::Deleted { .. }
+        ));
+
+        let h = r.put_locked("k", 1_100, None, Some(true), None);
+        assert_eq!(r.remove("k", &h, 1_200, true), Outcome::Locked);
+        assert_eq!(r.hold("k", None, false), Outcome::Held);
+        assert_eq!(r.lock_of("k", &h), (None, Some(false)));
+        assert!(matches!(
+            r.remove("k", &h, 1_200, false),
+            Outcome::Deleted { .. }
+        ));
+    }
+
+    /// A retention may be extended by anyone; shortened, removed or moved to COMPLIANCE only
+    /// under bypass in GOVERNANCE, and never in COMPLIANCE; and anything once it has lapsed (18
+    /// §2.2, §5).
+    #[test]
+    fn a_retention_changes_as_its_mode_allows() {
+        let mut r = Range::new();
+        let v = r.put_locked("k", 10, governance(1_000), None, None);
+        let named = Some(Named::Order(key::parse_version_id(&v).unwrap()));
+        let retain = |r: &mut Range, retention, bypass| r.retain("k", named, retention, 20, bypass);
+        assert_eq!(retain(&mut r, governance(2_000), false), Outcome::Retained);
+        assert_eq!(retain(&mut r, governance(2_000), false), Outcome::Retained);
+        assert_eq!(retain(&mut r, governance(1_500), false), Outcome::Locked);
+        assert_eq!(retain(&mut r, None, false), Outcome::Locked);
+        assert_eq!(retain(&mut r, compliance(3_000), false), Outcome::Locked);
+        assert_eq!(r.lock_of("k", &v).0, governance(2_000));
+        assert_eq!(retain(&mut r, governance(1_500), true), Outcome::Retained);
+        assert_eq!(retain(&mut r, None, true), Outcome::Retained);
+        assert_eq!(r.lock_of("k", &v).0, None);
+        assert_eq!(retain(&mut r, compliance(3_000), false), Outcome::Retained);
+        assert_eq!(retain(&mut r, compliance(4_000), false), Outcome::Retained);
+        for (retention, bypass) in [
+            (compliance(3_500), true),
+            (governance(5_000), true),
+            (None, true),
+        ] {
+            assert_eq!(retain(&mut r, retention, bypass), Outcome::Locked);
+        }
+        assert_eq!(r.lock_of("k", &v).0, compliance(4_000));
+        // At its date, a COMPLIANCE retention no longer binds.
+        assert_eq!(
+            r.retain("k", named, governance(5_000), 4_000, false),
+            Outcome::Retained
+        );
+        // The current version, a marker, a version or key that is not there.
+        assert_eq!(
+            r.retain("k", None, governance(6_000), 4_002, false),
+            Outcome::Retained
+        );
+        r.delete("k", Versioning::Enabled, None);
+        assert_eq!(
+            r.retain("k", None, governance(7_000), 4_003, false),
+            Outcome::DeleteMarker
+        );
+        assert_eq!(r.hold("k", None, true), Outcome::DeleteMarker);
+        assert_eq!(
+            r.retain("k", Some(Named::Order(7)), None, 4_004, false),
+            Outcome::NoSuchVersion
+        );
+        assert_eq!(r.hold("gone", None, true), Outcome::NoSuchKey);
+    }
+
+    /// A version takes the bucket's default retention from its creation unless its request
+    /// named one (18 §2.4), and a completed upload the lock its creation named.
+    #[test]
+    fn a_default_retention_runs_from_the_version_s_creation() {
+        use crate::record::Period;
+        let mut r = Range::new();
+        let default = Some(DefaultRetention {
+            mode: RetentionMode::Compliance,
+            period: Period::Days(2),
+        });
+        let v = r.put_locked("k", 5_000, None, Some(true), default);
+        assert_eq!(
+            r.lock_of("k", &v),
+            (compliance(5_000 + 2 * 86_400_000), Some(true))
+        );
+        let named = r.put_locked("k", 6_000, governance(9_000), None, default);
+        assert_eq!(r.lock_of("k", &named), (governance(9_000), None));
+        let years = Some(DefaultRetention {
+            mode: RetentionMode::Governance,
+            period: Period::Years(1),
+        });
+        let y = r.put_locked("k", 7_000, None, None, years);
+        assert_eq!(r.lock_of("k", &y).0, governance(7_000 + 365 * 86_400_000));
+
+        // An upload's lock, placed at its creation, goes to the version it completes.
+        r.clock = 8_000 * MS;
+        let Outcome::Created { upload } = r.run(Command::CreateUpload(CreateUpload {
+            bucket: "b".into(),
+            incarnation: 1,
+            key: "m".into(),
+            at_ns: r.clock,
+            upload: Upload {
+                initiated_ns: 0,
+                owner: "o".into(),
+                headers: Vec::new(),
+                checksum: None,
+                retention: compliance(50_000),
+                legal_hold: Some(true),
+            },
+        })) else {
+            panic!("no upload")
+        };
+        r.part("m", &upload, 1, 1, 7);
+        let Outcome::Put { version: m } = r.complete("m", &upload, &[(1, "e1", 7)]) else {
+            panic!("not completed")
+        };
+        assert_eq!(r.lock_of("m", &m), (compliance(50_000), Some(true)));
+    }
+
+    /// A write that would replace a locked null version is refused, as could only come from a
+    /// gateway that read the bucket before Object Lock kept its versioning enabled.
+    #[test]
+    fn a_locked_null_version_is_not_replaced() {
+        let mut r = Range::new();
+        r.put("k", "a", Versioning::Unversioned);
+        assert_eq!(
+            r.retain("k", Some(Named::Null), governance(1_000), 0, false),
+            Outcome::Retained
+        );
+        assert_eq!(r.put("k", "b", Versioning::Suspended), Outcome::Locked);
+        assert_eq!(r.delete("k", Versioning::Suspended, None), Outcome::Locked);
+        assert_eq!(
+            r.delete("k", Versioning::Enabled, Some(Named::Null)),
+            Outcome::Locked
+        );
+        assert_eq!(r.versions("k"), [("null".into(), false, "a".into())]);
+        // Versioning enabled writes over it as a new version.
+        assert!(matches!(
+            r.put("k", "c", Versioning::Enabled),
+            Outcome::Put { .. }
+        ));
     }
 }

@@ -15,13 +15,15 @@ use crate::error::ChunkError;
 use crate::frame::SegmentState;
 use crate::index::{Fragment, Segments};
 use crate::key::ChunkKey;
-use crate::layout::{Config, Geometry};
+use crate::layout::{Config, Geometry, MAX_FRAME_BYTES};
 use crate::read;
 use crate::record::Payload;
 use crate::recover::{self, RecoveryReport, read_span};
 use crate::scrub::{Findings, Scrubber, SharedFindings, scrub_all};
 use crate::superblock::{OFFSET_A, OFFSET_B_COMPACT, OFFSET_B_STANDARD, Superblock};
-use crate::writer::{Op, Request, Shared, Writer, write_superblock};
+use crate::writer::{
+    INCARNATION_RESERVE, Op, Request, SEQUENCE_RESERVE, Shared, Writer, write_superblock,
+};
 
 /// A chunk's size and state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -721,8 +723,17 @@ fn prewrite<F: BlockFile>(
     Ok(())
 }
 
+/// The valid superblock copy with the higher sequence. When its twin does not read, it may be
+/// the older copy, one write behind a newer one now damaged or torn, whose reservations it
+/// lacks (writer.rs `reserve`): records may carry numbers past its own. The newer copy's are
+/// at most one batch's numbers and one reservation past them, and a batch issues fewer
+/// sequences than one frame holds bytes and opens at most every segment. So the reservations
+/// are taken past that, and no number that might be on the device is issued twice. The next
+/// superblock written goes to the twin's slot and rewrites it.
 fn read_superblock<F: BlockFile>(file: &F) -> Result<Superblock, ChunkError> {
     let mut best: Option<Superblock> = None;
+    // Offsets of the copies that read, whichever block size they were read at.
+    let mut read = Vec::new();
     let len = file.len().map_err(ChunkError::Device)?;
     let pool = Pool::new(file.alignment(), 64 << 10, 64 << 10);
     for offset in [OFFSET_A, OFFSET_B_COMPACT, OFFSET_B_STANDARD] {
@@ -744,13 +755,30 @@ fn read_superblock<F: BlockFile>(file: &F) -> Result<Superblock, ChunkError> {
             };
             if let Some(sb) = Superblock::decode(span.bytes())
                 && sb.offset_of(sb.slot()) == offset
-                && best.as_ref().is_none_or(|b| sb.sequence > b.sequence)
             {
-                best = Some(sb);
+                read.push((sb.volume, offset));
+                if best.as_ref().is_none_or(|b| sb.sequence > b.sequence) {
+                    best = Some(sb);
+                }
             }
         }
     }
-    best.ok_or_else(|| ChunkError::Format("no valid superblock".into()))
+    let mut sb = best.ok_or_else(|| ChunkError::Format("no valid superblock".into()))?;
+    let twin = sb.offset_of(1u8.saturating_sub(sb.slot()));
+    if !read.contains(&(sb.volume, twin)) {
+        let past = || ChunkError::Format("superblock reservations past u64".into());
+        sb.sequence_limit = sb
+            .sequence_limit
+            .checked_add(SEQUENCE_RESERVE)
+            .and_then(|l| l.checked_add(MAX_FRAME_BYTES))
+            .ok_or_else(past)?;
+        sb.incarnation_limit = sb
+            .incarnation_limit
+            .checked_add(INCARNATION_RESERVE)
+            .and_then(|l| l.checked_add(u64::from(sb.segments)))
+            .ok_or_else(past)?;
+    }
+    Ok(sb)
 }
 
 fn now_ns() -> u64 {
@@ -1017,6 +1045,33 @@ mod tests {
         let report = cleaning.join().unwrap().unwrap();
         assert_eq!(report.segments, 2, "{report:?}");
         assert_eq!(report.gained, 1, "{report:?}");
+    }
+
+    /// With the newer superblock copy unreadable, the older one opens the volume, and its
+    /// reservations may be a write behind: records may carry sequences and incarnations past
+    /// them, and resuming at them would issue those numbers again. The reservations read are
+    /// at least the newer copy's.
+    #[test]
+    fn reservations_read_from_the_older_copy_cover_the_newer_ones() {
+        let file = sim(908);
+        let volume = Volume::format(Arc::clone(&file), 128 << 20, batch_config(8)).unwrap();
+        volume.put(key(1), b"reserves").unwrap();
+        volume.close();
+        let newer = read_superblock(&file).unwrap();
+        assert!(newer.sequence_limit > 0 && newer.incarnation_limit > 0);
+        file.inject(mantle_disk::sim::Fault::BitFlip {
+            offset: newer.offset_of(newer.slot()) + 40,
+            bit: 1,
+            stored: true,
+        })
+        .unwrap();
+        let older = read_superblock(&file).unwrap();
+        assert!(older.sequence < newer.sequence, "the older copy was read");
+        assert!(older.sequence_limit >= newer.sequence_limit, "{older:?}");
+        assert!(
+            older.incarnation_limit >= newer.incarnation_limit,
+            "{older:?}"
+        );
     }
 
     /// A second delete of a chunk finds it gone: removed by a first delete not yet confirmed,

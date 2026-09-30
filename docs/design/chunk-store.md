@@ -266,7 +266,11 @@ availability target to set the budget from.
 ## 6. Recovery
 
 1. Read both superblocks; take the valid one with the higher sequence. Sequences and
-   incarnations resume above its reservations (§4).
+   incarnations resume above its reservations (§4). When the other copy does not read, the
+   one taken may be a write behind the damaged one and its reservations one reservation
+   short, so they are raised past the most one batch can issue and one reservation more:
+   fewer sequences than a frame holds bytes, and no more incarnations than there are
+   segments. The next superblock written rewrites the damaged copy.
 2. Load the checkpoint it names and replay index frames in LSN order to the end of the
    log (§3.2 torn-versus-corrupt rule). A replay that ends inside the checkpoint met damage
    and the volume refuses to open.

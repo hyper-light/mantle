@@ -119,3 +119,13 @@ pub fn damage_frame(file: &SimFile, at: u64) {
     })
     .unwrap();
 }
+
+/// Asserts the frame at `at` is a confirmation: a batch frame (kind 1) of no records, the
+/// count 36 bytes in (frame.rs). Damage to it may lose nothing answered.
+pub fn assert_confirmation(file: &SimFile, at: u64) {
+    let image = file.durable_image().unwrap();
+    let at = at as usize;
+    let kind = u16::from_le_bytes([image[at + 6], image[at + 7]]);
+    let count = u32::from_le_bytes(image[at + 36..at + 40].try_into().unwrap());
+    assert_eq!((kind, count), (1, 0), "not a confirmation frame");
+}

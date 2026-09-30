@@ -224,11 +224,18 @@ fn run(seed: u64, writers: u64, crash: Crash) {
         let handles: Vec<_> = (0..writers)
             .map(|id| {
                 let v = &v;
-                s.spawn(move || writer(v, id, seed, 80))
+                // Each writer runs until the cut fails its request, at most this many steps:
+                // far more than the most device operations a cut is drawn below.
+                s.spawn(move || writer(v, id, seed, 10_000))
             })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
+    // A cut that never came would test only a clean reopen.
+    assert!(
+        models.iter().any(|m| m.uncertain.is_some()),
+        "seed {seed}: the power cut never came"
+    );
     drop(v);
     file.crash(crash).unwrap();
     file.clear_faults().unwrap();

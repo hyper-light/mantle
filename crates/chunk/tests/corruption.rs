@@ -15,7 +15,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{SIZE, config, damage_frame, data, frames, key, last_frame, sim};
+use common::{SIZE, assert_confirmation, config, damage_frame, data, frames, key, last_frame, sim};
 use mantle_chunk::{ChunkError, Volume};
 use mantle_disk::block::BlockFile;
 use mantle_disk::sim::{Crash, Fault, SimFile};
@@ -90,15 +90,30 @@ fn a_read_error_is_reported_as_corruption() {
     assert_eq!(v.read(&key(4), 0, 9000).unwrap(), a);
 }
 
+/// The superblock sequence each copy holds: A at 0, B at 64 KiB in a compact volume, the
+/// sequence 32 bytes into either (superblock.rs).
+fn superblock_sequences(file: &SimFile) -> [(u64, u64); 2] {
+    let image = file.durable_image().unwrap();
+    [0u64, 64 << 10].map(|at| {
+        let from = at as usize + 32;
+        (
+            at,
+            u64::from_le_bytes(image[from..from + 8].try_into().unwrap()),
+        )
+    })
+}
+
 #[test]
 fn a_damaged_superblock_falls_back_to_its_twin() {
     let file = sim(23);
     let v = Volume::format(Arc::clone(&file), SIZE, config()).unwrap();
     v.put(key(5), &data(5, 3000)).unwrap();
     drop(v);
-    // Superblock B (the newer copy after format) lives at 64 KiB in a compact volume.
+    // Damage the newer copy, which recovery would otherwise read: the older is the fallback.
+    let [a, b] = superblock_sequences(&file);
+    let (newer, older) = if a.1 > b.1 { (a, b) } else { (b, a) };
     file.inject(Fault::BitFlip {
-        offset: (64 << 10) + 40,
+        offset: newer.0 + 40,
         bit: 1,
         stored: true,
     })
@@ -108,7 +123,7 @@ fn a_damaged_superblock_falls_back_to_its_twin() {
     drop(v);
     // With both copies damaged, the volume is refused rather than guessed at.
     file.inject(Fault::BitFlip {
-        offset: 40,
+        offset: older.0 + 40,
         bit: 1,
         stored: true,
     })
@@ -147,7 +162,9 @@ fn damage_inside_the_log_refuses_to_open_but_a_torn_tail_does_not() {
     // Damage only the last frame: indistinguishable from a torn write, so the volume opens
     // without that batch, and loses nothing it answered.
     damage_frame(&file, at(last));
-    let (v, _) = Volume::open(Arc::clone(&file), config()).unwrap();
+    let (v, report) = Volume::open(Arc::clone(&file), config()).unwrap();
+    // The last put's record, whose frame was dropped, is found again in its segment.
+    assert_eq!(report.rolled_forward, 1, "{report:?}");
     for n in 0..10u64 {
         assert_eq!(v.read(&key(n), 0, 500).unwrap(), data(n, 500));
     }
@@ -286,6 +303,9 @@ fn a_delete_answered_is_never_in_the_last_frame() {
             .into_iter()
             .find(|&(_, _, lsn)| lsn == last - from_last)
             .unwrap();
+        if from_last == 0 {
+            assert_confirmation(&file, at);
+        }
         damage_frame(&file, at);
         match Volume::open(Arc::clone(&file), config()) {
             Ok((v, _)) => {
@@ -325,6 +345,7 @@ fn a_put_that_opens_a_segment_survives_damage_to_the_last_frame() {
         );
         drop(v);
         let (at, _, _) = last_frame(&file, volume);
+        assert_confirmation(&file, at);
         damage_frame(&file, at);
         let (v, report) = Volume::open(Arc::clone(&file), config()).unwrap();
         for n in (0..before).chain([100]) {

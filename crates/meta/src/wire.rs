@@ -1350,9 +1350,137 @@ fn take_name_outcome(r: &mut Reader<'_>) -> Option<name::Outcome> {
     })
 }
 
+/// Bytes of the largest entry a Name, File or Block range must take: one command, the largest
+/// a gateway sends, in the session wrapping it carries. A range whose `max_entry_bytes` or log
+/// frame is smaller refuses a request S3 allows (audit §16.5). The largest is a
+/// CompleteMultipartUpload of 10,000 parts, each with its 32-digit ETag, of the longest
+/// bucket and key, with the most preconditions a request's headers hold, or the file of parts
+/// it writes, of 10,000 extents; each is encoded here at its longest and the larger taken.
+pub fn largest_entry_bytes() -> Result<usize, RecordError> {
+    // S3's limits: a key of 1,024 bytes (05 §10.1), a request's headers within 8 KB (05
+    // §10.2), a bucket name of 63 (05 §10.3), and 10,000 parts (05 §4.1). An upload ID is one
+    // the Name range made, and a gateway sends no other.
+    const MAX_BUCKET: usize = 63;
+    const MAX_KEY: usize = 1024;
+    const MAX_HEADERS: usize = 8 << 10;
+    const MAX_PARTS: usize = 10_000;
+    const ETAG_HEX: usize = 32;
+    // The most tags an If-Match within the headers names: one character and a comma each.
+    let tags = || Some(name::Match::Tags(vec!["t".to_owned(); MAX_HEADERS / 2]));
+    let complete = name::Complete {
+        bucket: "b".repeat(MAX_BUCKET),
+        incarnation: u64::MAX,
+        key: "k".repeat(MAX_KEY),
+        upload: crate::key::version_id(u64::MAX),
+        versioning: Versioning::Enabled,
+        preconditions: name::Preconditions {
+            if_match: tags(),
+            if_none_match: None,
+        },
+        at_ns: u64::MAX,
+        parts: (1..=MAX_PARTS)
+            .map(|n| name::Listed {
+                number: u16::try_from(n).unwrap_or(u16::MAX),
+                etag: "e".repeat(ETAG_HEX),
+                file: u128::MAX,
+            })
+            .collect(),
+        etag: format!("{}-{MAX_PARTS}", "e".repeat(ETAG_HEX)),
+        size: u64::MAX,
+        checksum: Some(Checksum {
+            algorithm: u8::MAX,
+            parts: u16::MAX,
+            // SHA-512's, the longest value S3 takes.
+            value: vec![0; 64],
+        }),
+        file: Some(u128::MAX),
+        default: Some(DefaultRetention {
+            mode: record::RetentionMode::Compliance,
+            period: record::Period::Years(u32::MAX),
+        }),
+        deadline_ns: u64::MAX,
+    };
+    let write = file::Command::Write {
+        file: u128::MAX,
+        extents: (0..MAX_PARTS)
+            .map(|_| Extent {
+                length: u64::MAX,
+                target: record::Target::File(u128::MAX),
+            })
+            .collect(),
+        referrer: Referrer {
+            bucket: "b".repeat(MAX_BUCKET),
+            incarnation: u64::MAX,
+            key: "k".repeat(MAX_KEY),
+        },
+        key: None,
+        handover_ns: u64::MAX,
+        blocks_deadline_ns: u64::MAX,
+        at_ns: u64::MAX,
+    };
+    let mut largest = 0usize;
+    for command in [
+        Command::Name(Box::new(name::Command::Complete(complete))),
+        Command::File(write),
+    ] {
+        let entry = Entry {
+            at_ns: u64::MAX,
+            commands: vec![Sessioned {
+                session: u64::MAX,
+                serial: u64::MAX,
+                unanswered: u64::MAX,
+                command,
+            }],
+        };
+        largest = largest.max(entry.encode()?.len());
+    }
+    Ok(largest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bound covers a real completion of 10,000 parts, its session and entry around it,
+    /// and stays within a MiB, which a range's settings and log frame must admit.
+    #[test]
+    fn the_largest_entry_covers_a_completion_of_every_part() {
+        let largest = largest_entry_bytes().unwrap();
+        let complete = name::Complete {
+            bucket: "photos".into(),
+            incarnation: 3,
+            key: "a/key".into(),
+            upload: crate::key::version_id(7),
+            versioning: Versioning::Enabled,
+            preconditions: name::Preconditions::default(),
+            at_ns: 1,
+            parts: (1..=10_000u16)
+                .map(|number| name::Listed {
+                    number,
+                    etag: "0123456789abcdef0123456789abcdef".into(),
+                    file: u128::from(number),
+                })
+                .collect(),
+            etag: "0123456789abcdef0123456789abcdef-10000".into(),
+            size: 50 << 40,
+            checksum: None,
+            file: Some(9),
+            default: None,
+            deadline_ns: 2,
+        };
+        let entry = Entry {
+            at_ns: 1,
+            commands: vec![Sessioned {
+                session: 1,
+                serial: 1,
+                unanswered: 1,
+                command: Command::Name(Box::new(name::Command::Complete(complete))),
+            }],
+        };
+        let real = entry.encode().unwrap().len();
+        assert!(real <= largest && largest < 1 << 20, "{real} {largest}");
+        eprintln!("largest entry: {largest} bytes; a completion of 10,000 parts: {real}");
+    }
     use crate::record::{Period, Retention, RetentionMode, Target, Upload};
     use mantle_chunk::ChunkKey;
     use proptest::prelude::*;

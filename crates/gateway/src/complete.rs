@@ -10,7 +10,8 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use mantle_meta::file;
-use mantle_meta::name::{self, Listed, MIN_PART};
+use mantle_meta::key;
+use mantle_meta::name::{self, Listed, MAX_PART_NUMBER, MIN_PART};
 use mantle_meta::record::{self, Extent, Part, Referrer, Target, Upload};
 use mantle_s3::checksum::{self, Algorithm, Checksum, Hasher};
 use mantle_s3::crypto::CryptoError;
@@ -133,7 +134,19 @@ impl Completion {
         file: u128,
         handover_ns: u64,
     ) -> Result<Self, CompleteError> {
-        // Refused before anything is asked, as the Name range would refuse it (05 §4.4).
+        // Refused before anything is asked, as the Name range would refuse it (05 §4.4). An
+        // upload ID the Name range never made names no upload, and what a request sends goes
+        // no further than this, so the Complete sent is within the largest entry a range
+        // takes (`mantle_meta::wire::largest_entry_bytes`; audit §16.5).
+        if key::parse_version_id(&complete.upload).is_none() {
+            return Err(CompleteError::NoSuchUpload);
+        }
+        if listed
+            .iter()
+            .any(|(n, _)| !(1..=MAX_PART_NUMBER).contains(n))
+        {
+            return Err(CompleteError::InvalidPart);
+        }
         let ascending = listed.windows(2).all(|w| matches!(w, [a, b] if a.0 < b.0));
         if listed.is_empty() || !ascending {
             return Err(CompleteError::InvalidPartOrder);

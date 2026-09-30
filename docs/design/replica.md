@@ -265,6 +265,13 @@ change. Membership changes are rare, so this costs one image each.
 
 ## 7. Open
 
+- A range's `max_entry_bytes`, and its log's frame, must hold the largest entry its gateways
+  send, `mantle_meta::wire::largest_entry_bytes`: a CompleteMultipartUpload of 10,000 parts at
+  S3's longest bucket, key and headers, 561,804 bytes; one of 10,000 parts with ordinary names
+  is 540,167 (audit §16.5). The gateway refuses an upload ID the Name range never made and
+  part numbers outside S3's before proposing, so no request makes a larger one. The node that
+  sets a range's settings checks them against it.
+
 - More than one ready of a range in flight. The log answers an update only once a later
   record confirms its flush (raft-log.md §6), so a range that waits on each ready before
   taking the next waits two flushes an update, and closed-loop appends run at half the rate

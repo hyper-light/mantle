@@ -160,6 +160,11 @@ gains a basis lowers the ceiling.
 | `crates/meta/src/name.rs` `MIN_PART` | external | The S3 minimum part size of 5 MiB, with no minimum for the last part (docs/research/05 §4.1, AWS S3 multipart limits). |
 | `crates/meta/src/record.rs` `DAY_MS` | derived | Unit conversion: 86,400 s × 1,000 ms per day, for S3 Object Lock retention days and years (docs/research/18 §2.4, §2.6). |
 | `crates/meta/src/record.rs` `FORMAT` | format | Version byte 1 that begins every row value written by this code. |
+| `crates/meta/src/wire.rs` `MAX_BUCKET` | external | A bucket name of at most 63 characters (research/05 §10.3). |
+| `crates/meta/src/wire.rs` `MAX_KEY` | external | An object key of at most 1,024 bytes (research/05 §10.1). |
+| `crates/meta/src/wire.rs` `MAX_HEADERS` | external | A request's headers within 8 KB (research/05 §10.2), which bound its preconditions. |
+| `crates/meta/src/wire.rs` `MAX_PARTS` | external | 10,000 parts to an upload (research/05 §4.1). |
+| `crates/meta/src/wire.rs` `ETAG_HEX` | external | A part's ETag, the hex of its 16-byte MD5 (research/05 §4.5). |
 | `crates/meta/src/wire.rs` `FORMAT` | format | Version byte 1 of an encoded log entry. |
 | `crates/meta/src/wire.rs` `MAX_COMMANDS` | bound | 2^16 command places per entry, so a session ID is index × 2^16 + place (session.rs `register`); the audit (§12.6) keeps it as a versioned encoding bound with byte and work budgets beside it. |
 | `crates/range/src/conf.rs` `FORMAT` | format | Version byte of the encoded configuration row. |

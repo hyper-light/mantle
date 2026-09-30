@@ -1548,6 +1548,31 @@ fn a_completion_is_held_to_its_parts() {
         ),
         Err(CompleteError::InvalidPartOrder)
     ));
+    // An upload ID the Name range never made, and part numbers S3 never gives, are refused
+    // before anything is asked: what goes on is within the largest entry a range takes.
+    for (upload, parts) in [
+        ("x".repeat(5000), listed(&[1])),
+        (upload.clone(), vec![(0, etags[0].clone())]),
+        (upload.clone(), vec![(10_001, etags[0].clone())]),
+    ] {
+        let refused = Completion::new(
+            name::Complete {
+                upload: upload.clone(),
+                ..template_complete("k", &upload)
+            },
+            parts,
+            700,
+            HANDOVER,
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(CompleteError::NoSuchUpload | CompleteError::InvalidPart)
+            ),
+            "{:?}",
+            refused.err()
+        );
+    }
     let mut wrong = listed(&[1, 3]);
     wrong[1].1 = "0".repeat(32);
     assert_eq!(

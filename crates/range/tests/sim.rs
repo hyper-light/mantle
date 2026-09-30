@@ -1,7 +1,8 @@
 //! Deterministic simulation of one range's group (docs/design/replica.md §5).
 //!
-//! Three replicas, each with its log on a simulated device and a model engine, run over a
-//! simulated network that delays, drops and partitions messages. Nodes crash, losing what
+//! Three or five replicas, odd seeds three and even seeds five, each with its log on a
+//! simulated device and a model engine, run over a simulated network that delays, drops,
+//! duplicates and partitions messages; with five, two may be down at once. Nodes crash, losing what
 //! neither their log nor their engine had made durable, and restart from what was; a
 //! device's write or flush fails, which fences the node's log and takes the node down until
 //! it restarts from what the device kept. Once or twice a run a member is lost for good, its
@@ -50,8 +51,6 @@ use mantle_range::{ConfState, Message, Range, Replica, ReplicaError, Settings};
 use support::linear::{self, Input, Operation, Output, Register, Verdict};
 
 const GROUP: u128 = 0x0072_616e_6765;
-/// Members the group starts with, and keeps: a lost member is replaced.
-const MEMBERS: u64 = 3;
 /// Members each run loses for good, one after another.
 const LOSSES: u64 = 2;
 
@@ -89,12 +88,14 @@ fn first_range() -> Model {
     m
 }
 
-fn range() -> Range {
+/// A range whose group starts with `members` voters, and keeps that many: a lost member is
+/// replaced.
+fn range(members: u64) -> Range {
     Range {
         layer: Layer::Name,
         rules: RULES,
         boot: ConfState {
-            voters: (1..=3).collect(),
+            voters: (1..=members).collect(),
             ..ConfState::default()
         },
         settings: SETTINGS,
@@ -139,6 +140,8 @@ struct Node {
     engine: Option<Model>,
     /// Restarts so far, which seed its next core.
     lives: u64,
+    /// Voters the group starts with.
+    members: u64,
 }
 
 fn log_id(id: u64) -> u128 {
@@ -146,7 +149,7 @@ fn log_id(id: u64) -> u128 {
 }
 
 impl Node {
-    fn new(id: u64, seed: u64) -> Self {
+    fn new(id: u64, seed: u64, members: u64) -> Self {
         let file = Arc::new(
             SimFile::new(
                 Alignment::new(4096).unwrap(),
@@ -156,13 +159,15 @@ impl Node {
             .unwrap(),
         );
         let log = Arc::new(Log::create(Arc::clone(&file), log_config(), log_id(id)).unwrap());
-        let replica = Replica::open(id, GROUP, log, first_range(), &range(), seed ^ id).unwrap();
+        let replica =
+            Replica::open(id, GROUP, log, first_range(), &range(members), seed ^ id).unwrap();
         Self {
             id,
             file,
             replica: Some(replica),
             engine: None,
             lives: 0,
+            members,
         }
     }
 
@@ -191,7 +196,7 @@ impl Node {
             GROUP,
             Arc::new(log),
             engine,
-            &range(),
+            &range(self.members),
             seed ^ self.id ^ (self.lives << 40),
         )
         .unwrap();
@@ -252,6 +257,8 @@ struct Seen {
 
 struct World {
     seed: u64,
+    /// Voters the group keeps.
+    members: u64,
     rng: Rng,
     nodes: Vec<Node>,
     /// Messages in flight, each with the step it arrives at.
@@ -280,13 +287,27 @@ struct World {
     stalls: u64,
     /// Readies begun and left flushing past a step.
     flushing: u64,
+    /// Steps at which two members were down at once, and messages sent twice.
+    two_down: u64,
+    duplicated: u64,
+}
+
+/// What a run exercised.
+struct Ran {
+    replaced: u64,
+    stalls: u64,
+    flushing: u64,
+    two_down: u64,
+    duplicated: u64,
 }
 
 impl World {
-    fn new(seed: u64) -> Self {
+    fn new(seed: u64, members: u64) -> Self {
         let mut rng = Rng(seed);
         let lose_at = 200 + rng.below(1_000);
-        let nodes = (1..=MEMBERS).map(|id| Node::new(id, seed)).collect();
+        let nodes = (1..=members)
+            .map(|id| Node::new(id, seed, members))
+            .collect();
         let gateways = (0..GATEWAYS)
             .map(|id| Gateway {
                 id,
@@ -300,6 +321,7 @@ impl World {
             .collect();
         Self {
             seed,
+            members,
             rng,
             nodes,
             wire: Vec::new(),
@@ -311,13 +333,15 @@ impl World {
             gate_open: false,
             history: Vec::new(),
             put: HashMap::new(),
-            next_id: MEMBERS + 1,
+            next_id: members + 1,
             replacing: None,
             lost: 0,
             lose_at,
             replaced: 0,
             stalls: 0,
             flushing: 0,
+            two_down: 0,
+            duplicated: 0,
         }
     }
 
@@ -364,9 +388,13 @@ impl World {
             self.lose();
         }
         let i = self.rng.below(self.nodes.len() as u64) as usize;
-        let down = self.nodes.iter().filter(|n| n.replica.is_none()).count();
-        if self.rng.chance(4) && down == 0 {
+        // As many members down at once as leave a quorum: one of three, two of five.
+        let down = self.nodes.iter().filter(|n| n.replica.is_none()).count() as u64;
+        if self.rng.chance(4) && down < (self.members - 1) / 2 {
             self.nodes[i].crash();
+        }
+        if self.nodes.iter().filter(|n| n.replica.is_none()).count() >= 2 {
+            self.two_down += 1;
         }
         if self.rng.chance(20) && self.nodes[i].replica.is_none() {
             let seed = self.seed;
@@ -411,7 +439,7 @@ impl World {
         let failed = self.nodes.remove(i).id;
         let joining = self.next_id;
         self.next_id += 1;
-        self.nodes.push(Node::new(joining, self.seed));
+        self.nodes.push(Node::new(joining, self.seed, self.members));
         self.replacing = Some((Replacement::new(failed, joining).unwrap(), None));
         self.lost += 1;
         self.lose_at = self.step + 300 + self.rng.below(800);
@@ -549,6 +577,12 @@ impl World {
         }
         for m in sent {
             let delay = 1 + self.rng.below(if self.faults { 6 } else { 2 });
+            // Under faults a message now and then arrives twice, the copy at another time.
+            if self.faults && self.rng.chance(50) {
+                let again = 1 + self.rng.below(12);
+                self.wire.push((self.step + again, m.clone()));
+                self.duplicated += 1;
+            }
             self.wire.push((self.step + delay, m));
         }
         for a in applied {
@@ -937,8 +971,8 @@ fn versions(m: &Model, key: &str) -> Vec<String> {
 }
 
 /// One run: the replacements it finished.
-fn run(seed: u64) -> (u64, u64, u64) {
-    let mut w = World::new(seed);
+fn run(seed: u64, members: u64) -> Ran {
+    let mut w = World::new(seed, members);
     for _ in 0..3_000 {
         w.step();
     }
@@ -961,7 +995,7 @@ fn run(seed: u64) -> (u64, u64, u64) {
         w.fail("members hold different rows");
     }
     let live = w.live();
-    if live.len() != MEMBERS as usize
+    if live.len() != w.members as usize
         || w.nodes
             .iter()
             .any(|n| !final_configuration(n.replica.as_ref().unwrap().configuration(), &live))
@@ -989,7 +1023,13 @@ fn run(seed: u64) -> (u64, u64, u64) {
             other => w.fail(&format!("{key}: {other:?} over {} operations", ops.len())),
         }
     }
-    (w.replaced, w.stalls, w.flushing)
+    Ran {
+        replaced: w.replaced,
+        stalls: w.stalls,
+        flushing: w.flushing,
+        two_down: w.two_down,
+        duplicated: w.duplicated,
+    }
 }
 
 #[test]
@@ -1002,24 +1042,32 @@ fn a_group_under_faults_is_linearizable_and_applies_every_put_once() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
-    let mut replaced = 0;
-    let mut stalls = 0;
-    let mut flushing = 0;
+    let (mut replaced, mut stalls, mut flushing, mut two_down, mut duplicated) = (0, 0, 0, 0, 0);
     for seed in first..first + seeds {
+        // Odd seeds run a group of three, even ones of five.
+        let members = if seed % 2 == 0 { 5 } else { 3 };
+        let ran = run(seed, members);
         // A member is lost within the faults of every run, and the run settles only once its
         // replacement finishes.
-        let (run_replaced, run_stalls, run_flushing) = run(seed);
-        assert!(run_replaced >= 1, "seed {seed} replaced no member");
-        replaced += run_replaced;
-        stalls += run_stalls;
-        flushing += run_flushing;
+        assert!(ran.replaced >= 1, "seed {seed} replaced no member");
+        replaced += ran.replaced;
+        stalls += ran.stalls;
+        flushing += ran.flushing;
+        two_down += ran.two_down;
+        duplicated += ran.duplicated;
     }
     // Readies waited for room and the members went on: the path audit S04 found stranded.
     assert!(stalls > 0, "no ready ever waited for room");
     // Readies were left flushing across steps, their members refusing messages meanwhile.
     assert!(flushing > 0, "no ready was begun and left flushing");
+    // Groups of five lost two members at once and went on, and messages arrived twice.
+    assert!(
+        two_down > 0 && duplicated > 0,
+        "{two_down} steps two down, {duplicated} duplicated"
+    );
     eprintln!(
         "{seeds} runs replaced {replaced} members lost for good; {stalls} readies waited for \
-         room; {flushing} were left flushing across a step"
+         room; {flushing} were left flushing across a step; two of five were down at {two_down} \
+         steps; {duplicated} messages were sent twice"
     );
 }

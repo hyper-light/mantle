@@ -171,9 +171,11 @@ instead, left a group with one member lost and one uncertain unable to elect any
 ## 5. Testing
 
 Replicas are tested in deterministic simulation (`crates/range/tests/sim.rs`). Three
-nodes, each with a simulated device for its log and a model engine, run over a simulated
-network that delays, drops, reorders and partitions messages. Nodes crash, losing whatever
-their log and engine had not made durable, and restart. Devices fail writes and flushes,
+nodes, or five on even seeds, each with a simulated device for its log and a model engine,
+run over a simulated network that delays, drops, reorders, duplicates and partitions
+messages. Nodes crash, losing whatever their log and engine had not made durable, and
+restart; a group of five has two down at once for about a quarter of its steps. Half the
+members' `Ready`s under faults are taken with `begin` and finished at a later step (§3). Devices fail writes and flushes,
 which fences a node's log and takes the node down until it restarts from what the device
 kept. Once or twice a run a member is lost for good, its device and engine with it, and a
 member under a new identity replaces it as §6 describes; a second loss waits for the first

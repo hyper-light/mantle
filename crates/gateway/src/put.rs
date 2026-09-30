@@ -568,13 +568,32 @@ impl Put {
                 let one = Bytes::from(bytes);
                 (1, (0..n).map(|_| (one.clone(), crc32c)).collect())
             }
+            // The data chunks are slices of the block, which they share; only the parity, and
+            // a last data chunk the block does not fill, which is padded, are new bytes (audit
+            // P08).
             Scheme::Rs(code) => {
-                let chunks = code
-                    .encode(&bytes)?
+                let parity = code.parity_of(&bytes)?;
+                let block = Bytes::from(bytes);
+                let c = code.chunk_len(block.len())?;
+                let mut chunks = Vec::with_capacity(code.width());
+                for i in 0..code.data() {
+                    let span = code.data_span(block.len(), i)?;
+                    let chunk = if span.len() == c {
+                        block.slice(span)
+                    } else {
+                        let mut padded = Vec::with_capacity(c);
+                        padded.extend_from_slice(block.get(span).unwrap_or_default());
+                        padded.resize(c, 0);
+                        Bytes::from(padded)
+                    };
+                    chunks.push(chunk);
+                }
+                chunks.extend(parity.into_iter().map(Bytes::from));
+                let chunks = chunks
                     .into_iter()
-                    .map(|c| {
-                        let crc = mantle_crc::crc32c(&c);
-                        (Bytes::from(c), crc)
+                    .map(|chunk| {
+                        let crc = mantle_crc::crc32c(&chunk);
+                        (chunk, crc)
                     })
                     .collect();
                 (code.data(), chunks)

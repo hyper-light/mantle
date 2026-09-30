@@ -1,11 +1,14 @@
 //! `mantle bench ec`: erasure-coding throughput on one core, for each code and chunk size.
 //!
-//! For each code, a block of `data` chunks is encoded, and rebuilt from its chunks after
-//! losing one data chunk and after losing as many data chunks as the code tolerates, the
-//! most expensive rebuild. Throughput counts the block's bytes, so it compares directly with
-//! the rate at which blocks are written and read. The codes are those research note 04 §0
-//! weighs for mantle's durability profiles; the sizes run from a small object's chunk to an
-//! 8 MiB shard of a large block.
+//! For each code, a block of `data` chunks is coded and read back as the store does it:
+//! encoded into chunks of their own, and coded for a PUT, whose data chunks are slices of the
+//! block and only the parity new; read whole with every data chunk present, after losing one
+//! data chunk, and after losing as many data chunks as the code tolerates, the most expensive;
+//! and repaired, one lost data chunk rebuilt, and one lost parity chunk, from the others.
+//! Throughput counts the block's bytes, so it compares directly with the rate at which blocks
+//! are written and read. The codes are those research note 04 §0 weighs for mantle's
+//! durability profiles; the sizes run from a small object's chunk to an 8 MiB shard of a
+//! large block.
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -54,8 +57,16 @@ pub fn ec(
 ) -> Result<(), Error> {
     writeln!(
         out,
-        "  {:<10} {:>8} {:>12} {:>16} {:>18}",
-        "code", "chunk", "encode", "rebuild 1 lost", "rebuild most lost"
+        "  {:<10} {:>8} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
+        "code",
+        "chunk",
+        "encode",
+        "for a PUT",
+        "read",
+        "1 lost",
+        "most lost",
+        "data chunk",
+        "parity"
     )?;
     for &(data, parity) in codes {
         let code = Code::new(data, parity)?;
@@ -64,27 +75,38 @@ pub fn ec(
             let mut block = vec![0u8; len];
             SplitMix64::new(u64::try_from(len).unwrap_or(0)).fill(&mut block);
             let encode = rate(len, step, || code.encode(&block).map(|_| ()))?;
+            let put = rate(len, step, || code.parity_of(&block).map(|_| ()))?;
             let chunks = code.encode(&block)?;
-            let without = |lost: usize| -> Vec<(usize, &[u8])> {
+            let without = |lost: &[usize]| -> Vec<(usize, &[u8])> {
                 chunks
                     .iter()
                     .enumerate()
-                    .skip(lost)
+                    .filter(|(i, _)| !lost.contains(i))
                     .map(|(i, c)| (i, c.as_slice()))
                     .collect()
             };
-            let one = without(1);
-            let most = without(parity);
-            let rebuild_one = rate(len, step, || code.decode(&one, len).map(|_| ()))?;
-            let rebuild_most = rate(len, step, || code.decode(&most, len).map(|_| ()))?;
+            let all = without(&[]);
+            let one = without(&[0]);
+            let most: Vec<usize> = (0..parity).collect();
+            let most = without(&most);
+            let read = rate(len, step, || code.decode(&all, len).map(|_| ()))?;
+            let read_one = rate(len, step, || code.decode(&one, len).map(|_| ()))?;
+            let read_most = rate(len, step, || code.decode(&most, len).map(|_| ()))?;
+            let repair_data = rate(len, step, || code.rebuild(&one, &[0]).map(|_| ()))?;
+            let no_parity = without(&[data]);
+            let repair_parity = rate(len, step, || code.rebuild(&no_parity, &[data]).map(|_| ()))?;
             writeln!(
                 out,
-                "  {:<10} {:>8} {:>12} {:>16} {:>18}",
+                "  {:<10} {:>8} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
                 format!("RS({data},{parity})"),
                 display::size(size),
                 display::rate(encode),
-                display::rate(rebuild_one),
-                display::rate(rebuild_most),
+                display::rate(put),
+                display::rate(read),
+                display::rate(read_one),
+                display::rate(read_most),
+                display::rate(repair_data),
+                display::rate(repair_parity),
             )?;
             out.flush()?;
         }

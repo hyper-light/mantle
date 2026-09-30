@@ -25,7 +25,11 @@ An object's bytes pass through three shapes on the way down.
   the scheme's data chunks at the chunk size (below); the last block holds the rest.
 - **Chunks.** A block is stored in its scheme (durability.md §4): as copies, each chunk the
   whole block, or Reed–Solomon coded into data chunks that hold the block's bytes in order and
-  parity chunks (`mantle-ec`). Each chunk is at most the chunk size.
+  parity chunks (`mantle-ec`). Each chunk is at most the chunk size. The data chunks are
+  slices of the block, which they share, and the parity is computed from them where they
+  lie, so coding a block adds only its parity and a last data chunk the block does not fill,
+  padded; each data chunk was a copy, and a PUT held the block twice while coding it (audit
+  P08; [measurements](../measurements/2026-09-29-erasure-copies.md)).
 
 **Decision: chunks of up to 8 MiB.** Tectonic divides blocks "into smaller chunks (typically
 8 MiB)", 72 MiB blocks being RS(9,6)'s nine data chunks (01 §1.14), with "block sizes large
@@ -131,8 +135,12 @@ A GET reads top down:
 ## 4. Open
 
 - Memory: each PUT holds up to two blocks' bytes and one block's parity, 192 MiB under
-  RS(9,6), so the gateway admits PUTs against the memory it has, as every other queue is
-  bounded.
+  RS(9,6), and while it codes a block the coder's work space, which the coding library sizes
+  to the code: 128 MiB to encode 8 MiB chunks under RS(9,6), and a read that decodes one,
+  256 MiB (research: the library's `work_count`, measurements/2026-09-29-erasure-copies.md).
+  The gateway admits PUTs and reads against the memory it has, as every other queue is
+  bounded, and decides whether to keep coders between blocks, which saves 6–10% of coding
+  time at 1–8 MiB chunks for memory held between them.
 - Hedged writes: Tectonic reserves more storage nodes than a block needs and writes to the
   first that answer (01 §1.8); mantle writes to the volumes placement offers first.
 - Small objects: a coded block of a few kilobytes costs as many writes as its code is wide,

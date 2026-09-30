@@ -543,12 +543,14 @@ pub(crate) fn open<F: BlockFile>(
         let slot = *by_incarnation
             .get(&inc)
             .ok_or(LogError::Damaged("a live segment is missing"))?;
+        let mut held = 0u64;
         let (end, invalid) = frames_of(&mut reader, inc, &mut |offset, header, bytes, _| {
             if expected.is_some_and(|e| e != header.sequence) {
                 return Err(LogError::Damaged("a frame is missing"));
             }
             expected = header.sequence.checked_add(1);
             frames = frames.saturating_add(1);
+            held = held.saturating_add(1);
             let payload = bytes
                 .get(format::FRAME_HEADER_LEN..header.frame_len().unwrap_or(0))
                 .ok_or(LogError::Damaged("a frame shorter than its header says"))?;
@@ -559,6 +561,15 @@ pub(crate) fn open<F: BlockFile>(
                 .ok_or(LogError::Damaged("an offset past u64"))?;
             replay(&mut replayed, slot, base, records)
         })?;
+        // A segment's header is flushed with its first frame, so a live segment before the
+        // last frame's holds a frame at least. With none, its frames were written over or
+        // damaged where they begin: the torn opening of a later frame in its reused slot, where
+        // the last frame, which freed it, no longer reads. Sequences are checked only from the
+        // first frame replayed, so without this the segment's pieces vanished unreported
+        // (docs/design/raft-log.md §6, step 4).
+        if held == 0 && inc < last.incarnation {
+            return Err(LogError::Damaged("a live segment holds no frame"));
+        }
         if invalid {
             // Damage unless it lies after the last valid frame: then it is the torn tail.
             let before_last =
@@ -650,20 +661,31 @@ pub(crate) fn open<F: BlockFile>(
             .and_then(|s| s.checked_add(block))
             .ok_or(LogError::Damaged("an offset past u64"))?
     };
-    let head_end = start_of(head_slot)
-        .and_then(|s| s.checked_add(segment))
-        .ok_or(LogError::Damaged("an offset past u64"))?;
-    if head_offset
-        .checked_add(block)
-        .is_some_and(|end| end <= head_end)
-    {
-        let mut zeros =
-            AlignedBuf::zeroed(align.get(), align).map_err(|e| LogError::Disk(e.into()))?;
-        zeros
-            .set_len(align.get())
-            .map_err(|e| LogError::Disk(e.into()))?;
-        file.write_all_at(zeros.as_slice(), head_offset)?;
-        flush = true;
+    let end_of = |inc: u64| {
+        by_incarnation
+            .get(&inc)
+            .and_then(|&slot| start_of(slot))
+            .and_then(|s| s.checked_add(segment))
+            .ok_or(LogError::Damaged("an offset past u64"))
+    };
+    // Where the head is a newer segment than the last frame's, an opening whose frame never
+    // became durable, the block after the last frame is erased as well. A frame there was
+    // flushed before that opening was written, and no longer reads: the lost frame. Left in
+    // the tail, a sweep of that segment took it for a live frame damaged, and the restore's
+    // own frame fenced the log (docs/design/raft-log.md §6, step 6).
+    let mut erase = vec![(head_offset, end_of(highest)?)];
+    if highest != last.incarnation {
+        erase.push((last.after, end_of(last.incarnation)?));
+    }
+    let mut zeros = AlignedBuf::zeroed(align.get(), align).map_err(|e| LogError::Disk(e.into()))?;
+    zeros
+        .set_len(align.get())
+        .map_err(|e| LogError::Disk(e.into()))?;
+    for (at, end) in erase {
+        if at.checked_add(block).is_some_and(|stop| stop <= end) {
+            file.write_all_at(zeros.as_slice(), at)?;
+            flush = true;
+        }
     }
     if flush {
         file.sync_data()?;

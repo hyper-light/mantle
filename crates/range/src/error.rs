@@ -18,6 +18,13 @@ pub enum ReplicaError {
     /// neighbours on the log compact, it takes no call but `drive` and `compact`.
     #[error("the replica waits for room in its log")]
     Stalled,
+    /// A message came while a ready's update flushes, and the messages held until it is done
+    /// would pass their bound: it is refused, as the network may drop it, and the sender's
+    /// retries cover it.
+    #[error(
+        "messages held while a ready flushes would take {bytes} bytes; the replica holds {max}"
+    )]
+    MessagesHeld { bytes: u64, max: u64 },
     /// The member's log may lack entries it acknowledged, so it takes no part in elections
     /// until it holds them again (docs/design/raft-log.md §6).
     #[error("the member's log may lack entries it acknowledged; it does not campaign")]

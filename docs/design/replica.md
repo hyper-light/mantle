@@ -122,7 +122,9 @@ For each `Ready` the core gives, the replica does these steps in order:
    the core gives out only entries committed and durable, so the group can compact past
    them. Until the node frees room, compacting the group or its neighbours on the log, and
    drives again, the replica refuses every call with `Stalled` and lets no tick move its
-   timers: a member waiting for room takes no part in the group.
+   timers: a member waiting for room takes no part in the group. Messages and ticks held
+   while the update flushed, before the log refused a part, stay held until the `Ready` is
+   done.
 4. Sends the messages that must follow durability: a follower's acknowledgements and votes.
 5. Applies the committed entries (§2).
 6. Tells the core, which may hand over more committed entries and messages.
@@ -134,18 +136,54 @@ node sends the messages while the log flushes, and a node driving many ranges su
 range's update before the one flush that makes them all durable. A later `begin` or `drive`
 finds the update durable and does steps 4 to 6; `begin` never looks at an update it has just
 submitted, since that flush is not done microseconds later and whether it happened to be
-would make what `begin` gives out depend on the log's thread. A range still has one `Ready` out at a time,
-and refuses every other call with `Stalled` until it is done, but for a snapshot's report:
-replication to a member pauses until its snapshot's fate is known, so a report that comes
-while a ready is out is kept, the latest for each member, and taken once the ready is done,
-where refused and lost it left the member paused for good (a seed of the simulation found
-it); a follower's acknowledgement
-never leaves before its write is durable. Before, `drive` returned only after the flush, so
-the messages a leader may send during it waited for it (audit §5.1). The simulation takes
-half its members' `Ready`s this way under faults, leaving about two hundred a run flushing
-across a step, and checks linearizability as before. What the node's scheduler owes the
-ranges it drives, time for heartbeats, reads and applying beside the flushes it waits on, is
-the node's, which is not built (STATUS).
+would make what `begin` gives out depend on the log's thread. A range still has one `Ready`
+out at a time, and a follower's acknowledgement never leaves before its write is durable.
+Before, `drive` returned only after the flush, so the messages a leader may send during it
+waited for it (audit §5.1). The simulation takes half its members' `Ready`s this way,
+leaving about 170 a run flushing across a step, and checks linearizability as before. What
+the node's scheduler owes the ranges it drives, time for heartbeats, reads and applying
+beside the flushes it waits on, is the node's, which is not built (STATUS).
+
+**What comes while a `Ready` flushes.** focal-raft's core takes no call while a `Ready` is
+out: every mutation returns `Invariant("an operation while a ready is out")`, and
+`advance_append` refuses a term or vote that moved meanwhile (07 §1.2; focal-raft
+`src/node.rs`, `RawNode::operate` and `advance_append`). focal's own durable shell refuses
+the same calls with a retryable `PersistencePending` and says the host is to "retain or
+requeue [its] input", keeping no second ingress queue itself (07 §2.3; focal-consensus
+`README.md`). etcd's raft, whose semantics focal ports, keeps taking messages, proposals and
+ticks between handing out a `Ready` and its `Advance`: its node loop stops only offering the
+next `Ready` while one is out (etcd-io/raft `node.go`, `func (n *node) run`, fetched
+2026-09-30; docs/research/06 §A10.3).
+
+The replica is that host, and it refused instead: while a `Ready` was out, `step` returned
+`Stalled` and ticks were dropped. Under steady load a node overlapping its flushes finds
+each member's `Ready` out whenever the network next delivers, so every acknowledgement
+reached a leader that was flushing and was lost, and the leader's clock stood still, sending
+no heartbeat. `a_leader_whose_answers_come_while_it_flushes_still_commits`
+(`crates/range/tests/group.rs`) drives three members that way for 200 rounds: before, none
+of the leader's 200 proposals committed and its followers' match stayed at 1; now the leader
+takes 101, flushing between them, and 99 commit, the last two still in flight. `ticks_while_a_ready_flushes_still_count` shows a leader whose every tick lands
+during a flush sending no heartbeats before, and heartbeats to both followers now.
+
+So while a `Ready`'s update flushes, the replica holds the messages and ticks it is given,
+in the order they came, and takes them once the `Ready` is done, before it takes the next
+`Ready`: snapshots' reports first, as before, then each message after the ticks that came
+before it. Ticks are never refused, and are held up to the longest election timeout the core
+draws, twice `election_tick` (focal-consensus `set_randomized_election_timeout`): the core
+acts on a timer at most once in that many ticks, and a device stalled for many timeouts
+replayed each of them, a follower asking for votes 116 times in one burst
+(`ticks_held_through_a_long_flush_replay_at_most_one_timeouts_worth`). Past that bound a tick
+is counted as already held. Messages hold at most, for each other
+member of the configuration, one flow-control window of appends: `max_inflight_msgs` of
+`max_size_per_msg` bytes and one entry past it (`max_entry_bytes`), which the core admits
+alone, each message charged its encoding and its in-memory frame. A member's heartbeats,
+votes and answers are small beside that. A message past the bound is refused with
+`MessagesHeld`, as the network may drop it: Raft's messages may be lost, and its senders
+retry (Ongaro and Ousterhout, ATC 2014, §5.1). Proposals, reads and campaigns are still
+refused with `Stalled` while a `Ready` is out; their callers retry. A snapshot's report is
+kept, the latest for each member, even while the replica waits for room: replication to a
+member pauses until its snapshot's fate is known, and a report refused and lost left the
+member paused for good (a seed of the simulation found it).
 
 **Reads.** A replica confirms reads a round at a time. One round is out at a time, carrying
 every read asked before it began, and one quorum's heartbeats confirm them all at the commit
@@ -226,7 +264,9 @@ nodes, or five on even seeds, each with a simulated device for its log and a mod
 run over a simulated network that delays, drops, reorders, duplicates and partitions
 messages. Nodes crash, losing whatever their log and engine had not made durable, and
 restart; a group of five has two down at once for about a quarter of its steps. Half the
-members' `Ready`s under faults are taken with `begin` and finished at a later step (§3). Devices fail writes and flushes,
+members' `Ready`s are taken with `begin` and finished at a later step (§3), during faults and
+after them, so each member's next tick and the messages delivered to it come while its
+`Ready` flushes and are held: about 220 messages and 170 ticks a run. Devices fail writes and flushes,
 which fences a node's log and takes the node down until it restarts from what the device
 kept. Once or twice a run a member is lost for good, its device and engine with it, and a
 member under a new identity replaces it as §6 describes; a second loss waits for the first
@@ -251,7 +291,12 @@ A soak of 20,000 seeds passes, with thousands of fenced logs among them, and wit
 members lost for good and replaced: two in every run but 52. Failed flushes exposed an
 install the log never recorded, which restart now finishes. Losses exposed the two further
 faults §4 and §6 describe: an engine durable past its log's commit, and a replacement ended
-before every voter knew its configuration. The simulation catches two broken variants on purpose,
+before every voter knew its configuration. With messages and ticks held while a `Ready`
+flushes (§3), a soak of 20,000 seeds passes holding 4,376,190 messages and 3,331,225 ticks,
+and refusing 4 messages past the bound. With the hold reverted, 2,000 seeds stay linearizable
+and live, since only half the `Ready`s are begun and a refused message is retried: the
+harm needs the steady overlap `a_leader_whose_answers_come_while_it_flushes_still_commits`
+drives, and the simulation's count of held messages is what catches the revert. The simulation catches two broken variants on purpose,
 within the first seeds: gets served from any member's rows without ReadIndex fail
 linearizability, and a replica that applies a repeated command again stores a put twice.
 
@@ -316,7 +361,18 @@ change. Membership changes are rare, so this costs one image each.
   `Node::ready` refuses a ready while one is out, so this needs the core to hand out readies
   ahead of their persistence, as raft-rs's asynchronous ready does. Advancing a ready at its
   flush and holding back only its acknowledgements is not safe: a leader would count toward
-  commitment a frame recovery may still take for a torn tail.
+  commitment a frame recovery may still take for a torn tail. The core also takes no
+  message or tick while a ready is out, so the replica holds them until it is done (§3);
+  with readies in flight ahead of their persistence the core would step them directly, as
+  etcd's does, and the hold would go.
+- The bound on messages held while a ready flushes, a window of appends for each other
+  member, assumes a flush is shorter than a heartbeat interval, so that a member's
+  heartbeats, votes and answers beside its appends are few. The node's measured flush times
+  against its tick should confirm it; until then a flush that outlasts it refuses messages
+  past the bound, which Raft's retries cover, and the simulation counts those refusals.
+- Proposals, reads and campaigns are refused with `Stalled` while a ready is out, and their
+  callers retry. A node whose ranges are always flushing under load needs them held as
+  messages are, or a scheduler that gives each range a moment between readies (§3).
 - The window of entries kept for lagging followers before one is sent a snapshot, and
   moving snapshots out of band with the production engine.
 - Read leases, if a deployment states its clock-drift bound (06 §A1.5); reads are confirmed

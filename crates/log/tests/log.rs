@@ -1176,7 +1176,9 @@ fn an_update_is_answered_only_once_its_frame_is_confirmed() {
 }
 
 /// A frame torn by a crash before its persist record reached the disk was never
-/// acknowledged: the log is cut before it, and nothing is restored or marked.
+/// acknowledged: the log is cut before it, and nothing is restored or marked. The frame's
+/// write reaches the disk and its record's write fails, and the frame then tears, so recovery
+/// finds a frame that no longer reads with no record of it.
 #[test]
 fn a_torn_frame_without_its_persist_record_is_the_torn_tail() {
     let file = sim(40);
@@ -1190,7 +1192,7 @@ fn a_torn_frame_without_its_persist_record_is_the_torn_tail() {
         },
     )
     .unwrap();
-    file.inject(Fault::PowerCut { ops: 0 }).unwrap();
+    file.inject(Fault::PowerCut { ops: 1 }).unwrap();
     assert!(matches!(
         log.write(
             1,
@@ -1202,8 +1204,19 @@ fn a_torn_frame_without_its_persist_record_is_the_torn_tail() {
         Err(LogError::Fenced)
     ));
     drop(log);
-    file.crash(Crash::LoseAll).unwrap();
+    file.crash(Crash::KeepAll).unwrap();
     file.clear_faults().unwrap();
+    let image = file.durable_image().unwrap();
+    let torn = *valid_frames(&image)
+        .iter()
+        .find(|f| f.2 == 2)
+        .expect("the frame's write reached the disk");
+    // The frame of sequence 2 keeps its record in the first persist slot.
+    assert!(
+        mantle_log::format::Persist::decode(&image).is_none_or(|p| p.sequence != 2),
+        "the frame's persist record reached the disk"
+    );
+    damage(&file, torn.0 + 70);
     let (log, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
     assert_eq!(recovery.restored, Vec::<u128>::new());
     let view = log.view(1).unwrap().unwrap();
@@ -2271,7 +2284,11 @@ impl mantle_disk::block::BlockFile for Gate {
 /// entry is held or marked, never dropped as a torn tail.
 #[test]
 fn a_confirmation_outlives_a_torn_record_of_the_next_frame() {
-    let mut reopened = 0;
+    let (mut reopened, mut torn) = (0, 0u32);
+    // The second persist slot: a record of the log's most groups, padded to the block.
+    let slot = mantle_log::format::persist_len(64)
+        .unwrap()
+        .next_multiple_of(BLOCK);
     for seed in 0..64u64 {
         let file = sim(seed);
         let gate = Gate::new(Arc::clone(&file));
@@ -2329,23 +2346,52 @@ fn a_confirmation_outlives_a_torn_record_of_the_next_frame() {
         drop(log);
         file.crash(Crash::Random).unwrap();
         file.clear_faults().unwrap();
-        let frames = valid_frames(&file.durable_image().unwrap());
+        let image = file.durable_image().unwrap();
+        let frames = valid_frames(&image);
         // A third frame that survived whole proves the second was flushed: damage to it is
         // reported, which other tests cover.
         if frames.iter().any(|f| f.2 == 3) {
             continue;
         }
+        // The third frame's record, in the second persist slot, where a confirmation written
+        // into the next frame's slot would have been: torn means it no longer reads at all.
+        let record = mantle_log::format::Persist::decode(&image[slot..]);
+        let tore = record.is_none();
         let two = frames.iter().find(|f| f.2 == 2).unwrap();
         damage(&file, two.0 + 70);
         let (log, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
-        let view = log.view(1).unwrap().unwrap();
-        assert!(
-            view.last >= 2 || view.uncertain == Some(Start { index: 2, term: 1 }),
-            "seed {seed}: an entry answered Ok was dropped without a mark: {recovery:?} {view:?}"
+        let at = format!("seed {seed}, record {record:?}");
+        // The second frame was answered, so it is restored: its entry cut and marked, the
+        // hard state the first frame left, and nothing of the third frame, never answered.
+        assert_eq!(
+            (recovery.restored, recovery.damaged),
+            (vec![1], vec![]),
+            "{at}"
         );
+        let view = log.view(1).unwrap().unwrap();
+        assert_eq!(
+            (view.last, view.uncertain, view.hard_state),
+            (
+                1,
+                Some(Start { index: 2, term: 1 }),
+                Some(HardState {
+                    term: 1,
+                    vote: 1,
+                    commit: 1,
+                })
+            ),
+            "{at}"
+        );
+        for g in 10..16u128 {
+            assert!(log.view(g).unwrap().is_none(), "{at}: group {g}");
+        }
         reopened += 1;
+        torn += u32::from(tore);
     }
-    assert!(reopened > 0, "no seed lost the third frame");
+    assert!(
+        torn > 0,
+        "no seed tore the third frame's record ({reopened} lost the frame)"
+    );
 }
 
 /// A commit that fails before its frame is written, here as its sweep of the tail reads the
@@ -2502,6 +2548,366 @@ fn power_lost_while_restoring_a_lost_frame_loses_nothing_acknowledged() {
                     view.last >= 1 || view.uncertain == Some(Start { index: 1, term: 2 }),
                     "{at}: group {g} lost its entry unmarked: {view:?}"
                 );
+            }
+        }
+    }
+}
+
+/// The tail of each valid frame in the durable image, by sequence.
+fn frame_tails(image: &[u8]) -> BTreeMap<u64, (u64, u64)> {
+    valid_frames(image)
+        .into_iter()
+        .map(|(at, _, seq)| {
+            let h = mantle_log::format::FrameHeader::decode(&image[at as usize..]).unwrap();
+            (seq, (at, h.tail))
+        })
+        .collect()
+}
+
+/// A frame that swept the tail, freeing its segment, is the last frame, filling its own
+/// segment, and is confirmed. The next frame opens a segment in the freed slot, and power
+/// fails as it is written, so any of its sectors may have reached the disk, over the freed
+/// segment's header and first frames. Then the swept frame is damaged at rest. Recovery falls
+/// back to the frame before it, whose tail is the freed segment: the pieces the sweep moved
+/// are in that segment and in the lost frame, and nowhere else. Where the torn opening wrote
+/// over the segment, they are lost, and the log must say so; where it did not, the log opens
+/// with every acknowledged piece. It never opens without them and without a word.
+#[test]
+fn a_torn_opening_over_a_segment_swept_by_a_lost_frame_loses_nothing_unreported() {
+    let cfg = config_now(4, 4);
+    let segment = cfg.segment_bytes;
+    let slot0 = segment;
+    let (mut unframed, mut refused, mut intact, mut clobbered_open) = (0, 0, 0, 0);
+    for ops in 1..=2u64 {
+        for seed in 0..200u64 {
+            let file = sim(5000 + seed);
+            let log = Log::create(Arc::clone(&file), cfg, ID).unwrap();
+            // Group 2's entry stays live in segment 0; group 1's hard states die as they go.
+            log.write(
+                2,
+                Update {
+                    entries: Some(entries(1, &[1])),
+                    ..Update::default()
+                },
+            )
+            .unwrap();
+            for term in 1..=5 {
+                log.write(
+                    1,
+                    Update {
+                        hard_state: Some(hard(term, 0)),
+                        ..Update::default()
+                    },
+                )
+                .unwrap();
+            }
+            // Three segments hold frames and one may still be added: the next frame sweeps
+            // segment 0, moving group 2's entry, and fills the rest of segment 2.
+            log.write(
+                1,
+                Update {
+                    entries: Some(Entries {
+                        first: 1,
+                        entries: vec![Entry {
+                            term: 6,
+                            bytes: Arc::from(vec![7u8; 5000]),
+                        }],
+                    }),
+                    hard_state: Some(hard(6, 0)),
+                    ..Update::default()
+                },
+            )
+            .unwrap();
+            let image = file.durable_image().unwrap();
+            let tails = frame_tails(&image);
+            let (&swept, &(swept_at, tail)) = tails.iter().next_back().unwrap();
+            assert_eq!(swept, 7, "seed {seed}");
+            assert_eq!(tails[&(swept - 1)].1, 1, "the frame before names segment 0");
+            assert_eq!(tail, 2, "the sweep names segment 1 as the tail");
+            assert_eq!(swept_at, slot0 + 2 * segment + 2 * BLOCK as u64);
+            let before = image[slot0 as usize..(slot0 + segment) as usize].to_vec();
+            // The next frame opens segment 0 again; power fails after `ops` of its writes. Its
+            // sectors differ from what they overwrite, so any of them may tear.
+            file.inject(Fault::PowerCut { ops }).unwrap();
+            assert!(
+                log.write(
+                    1,
+                    Update {
+                        entries: Some(Entries {
+                            first: 1,
+                            entries: vec![Entry {
+                                term: 7,
+                                bytes: (0..3000u32).map(|i| (i % 251) as u8 + 1).collect(),
+                            }],
+                        }),
+                        hard_state: Some(hard(7, 0)),
+                        ..Update::default()
+                    },
+                )
+                .is_err()
+            );
+            drop(log);
+            file.crash(Crash::Random).unwrap();
+            file.clear_faults().unwrap();
+            let image = file.durable_image().unwrap();
+            if frame_tails(&image).contains_key(&(swept + 1)) {
+                // The opening survived whole and proves the swept frame was flushed: damage to
+                // it is damage to an interior frame, which other tests cover.
+                continue;
+            }
+            let untouched = image[slot0 as usize..(slot0 + segment) as usize] == before[..];
+            damage(&file, swept_at + 70);
+            let at = format!("power cut after {ops} writes, seed {seed}");
+            let damaged = file.durable_image().unwrap();
+            match Log::open(Arc::clone(&file), cfg, ID) {
+                Err(LogError::Damaged(why)) => {
+                    assert!(!untouched, "{at}: refused with segment 0 intact");
+                    // Segment 0's header still reads, and its frames begin with the opening's.
+                    unframed += u32::from(why == "a live segment holds no frame");
+                    assert!(
+                        file.durable_image().unwrap() == damaged,
+                        "{at}: a failed open wrote"
+                    );
+                    refused += 1;
+                }
+                Err(e) => panic!("{at}: {e:?}"),
+                Ok((log, recovery)) => {
+                    let two = log.view(2).unwrap();
+                    assert!(
+                        recovery.damaged.contains(&2) || two.is_some_and(|v| v.last == 1),
+                        "{at}: group 2's acknowledged entry is gone unreported: {recovery:?}"
+                    );
+                    if !recovery.damaged.contains(&2) {
+                        assert_eq!(log.entries(2, 1, 2, u64::MAX).unwrap()[0].term, 1);
+                    }
+                    let one = log.view(1).unwrap().unwrap();
+                    assert_eq!(one.hard_state.map(|h| h.term), Some(6), "{at}");
+                    if untouched {
+                        intact += 1;
+                    } else {
+                        clobbered_open += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        unframed > 0 && refused > 0 && intact > 0,
+        "{unframed} of {refused} refused with segment 0 frameless, {intact} intact, \
+         {clobbered_open} opened over a torn opening"
+    );
+}
+
+/// Damage where the tail segment's first frame begins, to its magic or its identity, ends
+/// that segment's frames before the first. A later segment's frames follow, so the damage is
+/// of acknowledged frames and is reported, never taken for a segment that held nothing:
+/// group 2, whose only record lies in that segment, would otherwise vanish unreported.
+#[test]
+fn a_live_segment_whose_first_frame_no_longer_reads_is_reported() {
+    for field in [0u64, 8, 24, 32] {
+        let file = sim(60 + field);
+        let log = Log::create(Arc::clone(&file), config(16, 8), ID).unwrap();
+        log.write(
+            2,
+            Update {
+                entries: Some(entries(1, &[1])),
+                ..Update::default()
+            },
+        )
+        .unwrap();
+        for i in 1..=15u64 {
+            log.write(
+                1,
+                Update {
+                    entries: Some(entries(i, &[1])),
+                    ..Update::default()
+                },
+            )
+            .unwrap();
+        }
+        drop(log);
+        let frames = valid_frames(&file.durable_image().unwrap());
+        assert!(
+            frames.iter().any(|f| f.1 == 2),
+            "the log went on to segment 1"
+        );
+        // The empty first frame of segment 0, after its header.
+        file.inject(Fault::BitFlip {
+            offset: AREA + BLOCK as u64 + field,
+            bit: 0,
+            stored: true,
+        })
+        .unwrap();
+        let opened = Log::open(Arc::clone(&file), config(16, 8), ID);
+        assert!(
+            matches!(opened, Err(LogError::Damaged(_))),
+            "damage at byte {field} of the first frame: {:?}",
+            opened.map(|(_, r)| r)
+        );
+    }
+}
+
+/// The last frame, confirmed, then damaged at rest, where the next frame opened a segment
+/// whose header reached the disk and whose frame did not. The restore at open finds free
+/// segments short and sweeps the tail, the lost frame's own segment: the frame there after the
+/// last that reads was never live in what recovery rebuilt, and the sweep must not take it for
+/// a live frame damaged. The log opens and restores the lost frame.
+#[test]
+fn a_lost_last_frame_before_a_torn_opening_is_restored_while_its_segment_is_swept() {
+    let cfg = config_now(4, 3);
+    let segment = cfg.segment_bytes;
+    let mut hit = 0;
+    for seed in 0..64u64 {
+        let file = sim(7000 + seed);
+        let log = Log::create(Arc::clone(&file), cfg, ID).unwrap();
+        // Segment 0 fills, segment 1 opens and fills, and segment 0, dead, is free again.
+        for term in 1..=5 {
+            log.write(
+                1,
+                Update {
+                    hard_state: Some(hard(term, 0)),
+                    ..Update::default()
+                },
+            )
+            .unwrap();
+        }
+        let image = file.durable_image().unwrap();
+        let tails = frame_tails(&image);
+        let (&lost, &(lost_at, _)) = tails.iter().next_back().unwrap();
+        assert_eq!(lost, 5, "seed {seed}");
+        assert_eq!(
+            lost_at,
+            2 * segment + 3 * BLOCK as u64,
+            "the last block of segment 1"
+        );
+        // The next frame opens segment 0 again, and power fails before its flush.
+        file.inject(Fault::PowerCut { ops: 1 }).unwrap();
+        assert!(
+            log.write(
+                1,
+                Update {
+                    hard_state: Some(hard(6, 0)),
+                    ..Update::default()
+                },
+            )
+            .is_err()
+        );
+        drop(log);
+        file.crash(Crash::Random).unwrap();
+        file.clear_faults().unwrap();
+        let image = file.durable_image().unwrap();
+        let opened = segment_headers(&image, segment).contains(&(segment, 3));
+        if !opened || frame_tails(&image).contains_key(&(lost + 1)) {
+            // No opening, or a whole one, which proves the lost frame was flushed.
+            continue;
+        }
+        hit += 1;
+        damage(&file, lost_at + 70);
+        let at = format!("seed {seed}");
+        let (log, recovery) =
+            Log::open(Arc::clone(&file), cfg, ID).unwrap_or_else(|e| panic!("{at}: {e:?}"));
+        assert_eq!(
+            (recovery.restored, recovery.damaged),
+            (vec![1], vec![]),
+            "{at}"
+        );
+        assert_eq!(log.view(1).unwrap().unwrap().hard_state, Some(hard(5, 0)));
+        drop(log);
+        let (log, _) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+        assert_eq!(log.view(1).unwrap().unwrap().hard_state, Some(hard(5, 0)));
+    }
+    assert!(
+        hit > 0,
+        "no seed left the opening's header without its frame"
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// Generated histories cut by power loss, and then the last frame that still reads
+    /// damaged at rest, whether it was acknowledged or not: after the reopen every group
+    /// acknowledged before the cut, but the one in flight, is reported damaged or holds its
+    /// start, a term and vote no older, and every entry it held or a mark that it may lack
+    /// it. A refusal to open reports the damage too; nothing acknowledged goes unreported.
+    #[test]
+    fn damage_after_power_loss_never_loses_acknowledged_state_unreported(
+        steps in prop::collection::vec(step(), 1..60),
+        seed in any::<u64>(),
+        segment_blocks in 4u64..10,
+        max_segments in 3u32..8,
+    ) {
+        let file = sim(seed);
+        let cfg = config_now(segment_blocks, max_segments);
+        let log = Log::create(Arc::clone(&file), cfg, ID).unwrap();
+        let mut models = Models::new();
+        for step in &steps {
+            if let Step::Crash { ops } = step {
+                file.inject(Fault::PowerCut { ops: *ops }).unwrap();
+                continue;
+            }
+            let Some((group, u)) = update(step, &models) else { continue };
+            match log.write(group, u.clone()) {
+                Ok(()) => apply(&mut models, group, &u),
+                Err(LogError::Fenced) => {
+                    drop(log);
+                    file.crash(Crash::Random).unwrap();
+                    file.clear_faults().unwrap();
+                    let image = file.durable_image().unwrap();
+                    let frames = valid_frames(&image);
+                    let Some(last) = frames.iter().max_by_key(|f| f.2) else {
+                        return Ok(());
+                    };
+                    file.inject(Fault::BitFlip {
+                        offset: last.0 + 70,
+                        bit: 0,
+                        stored: true,
+                    })
+                    .unwrap();
+                    let (reopened, recovery) = match Log::open(Arc::clone(&file), cfg, ID) {
+                        Err(LogError::Damaged(_)) => return Ok(()),
+                        Err(e) => return Err(TestCaseError::fail(format!("{e}"))),
+                        Ok(r) => r,
+                    };
+                    for (&g, m) in &models {
+                        if g == group || recovery.damaged.contains(&g) {
+                            continue;
+                        }
+                        let view = reopened.view(g).unwrap();
+                        prop_assert!(view.is_some(), "group {g} gone: {recovery:?}");
+                        let view = view.unwrap();
+                        prop_assert_eq!(view.start, m.start, "group {}", g);
+                        if let Some(h) = m.hard {
+                            let got = view.hard_state.unwrap();
+                            prop_assert!(
+                                got.term > h.term || (got.term == h.term && got.vote == h.vote),
+                                "group {g}: {got:?} regressed from {h:?}"
+                            );
+                        }
+                        for (i, (term, bytes)) in (m.start.index + 1..).zip(&m.entries) {
+                            if i <= view.last {
+                                let got = reopened.entries(g, i, i + 1, u64::MAX).unwrap();
+                                prop_assert!(
+                                    got[0].term == *term && *got[0].bytes == bytes[..],
+                                    "group {g} entry {i} differs"
+                                );
+                            } else {
+                                prop_assert!(
+                                    view.uncertain.is_some_and(|mark| mark.index >= i),
+                                    "group {g} entry {i} lost unmarked: {view:?} {recovery:?}"
+                                );
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+                Err(
+                    LogError::Invalid { .. }
+                    | LogError::Backlog(_)
+                    | LogError::TooManyGroups(_)
+                    | LogError::Full,
+                ) => {}
+                Err(e) => return Err(TestCaseError::fail(format!("{e}"))),
             }
         }
     }

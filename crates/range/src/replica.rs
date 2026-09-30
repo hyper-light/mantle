@@ -72,8 +72,9 @@ pub struct Drive {
     /// node frees room and drives again (audit S04).
     pub stalled: Option<LogError>,
     /// From [`Replica::begin`]: a ready's update is on its way to being durable. The
-    /// messages above may go now; the replica takes no call but `begin` and `drive` until the
-    /// update is durable, which `drive` waits for.
+    /// messages above may go now. Until the update is durable, which `drive` waits for, the
+    /// replica holds the messages and ticks it is given, to take once the ready is done, and
+    /// refuses proposals, reads and campaigns with `Stalled`.
     pub persisting: bool,
 }
 
@@ -100,6 +101,18 @@ pub struct Replica<F: BlockFile + 'static, E: Engine> {
     max_entry_bytes: u64,
     /// A ready the log has yet to take whole, which the core counts as out (07 §1.2).
     staged: Option<Staged>,
+    /// Messages and ticks that came while the ready's update flushed, taken in order once it
+    /// is done (`Held`).
+    held: Held,
+    /// The bytes of messages one other member may have held: a flow-control window of
+    /// appends (`Held`).
+    window_bytes: u64,
+    /// The most ticks held while a ready flushes: the longest election timeout the core may
+    /// draw, `2 · election_tick` (focal-consensus `set_randomized_election_timeout`), which
+    /// the heartbeat timeout is shorter than. The core acts on a timer at most once in that
+    /// many ticks, so more held ticks would replay as a burst of campaigns, each with its
+    /// messages, for one stall of the device.
+    max_held_ticks: u64,
     /// The last entry this member acknowledged, when its log may lack it: a last frame no
     /// longer read, whose term and vote recovery restored and whose entries it marked
     /// (docs/design/raft-log.md §6). Until the log holds them again, or an entry of a later
@@ -147,6 +160,39 @@ fn round_of(context: &[u8]) -> Option<u64> {
 }
 
 const ROUND: &[u8] = b"mantle-read-round:";
+
+/// Messages and ticks that come while a ready's update flushes. focal-raft's core takes no
+/// call while a ready is out (07 §1.2, `RawNode::operate`), and focal's own durable shell
+/// leaves its host to retain what comes meanwhile (07 §2.3); etcd's node keeps stepping and
+/// ticking between a ready and its advance (docs/design/replica.md §3). Refused, every answer
+/// to a leader under steady load came during a flush and was lost, and nothing committed.
+///
+/// Each message keeps the ticks that came before it, so the core sees them in the order they
+/// came. Ticks are counted, never refused: a clock that stood still for every flush left a
+/// loaded leader without heartbeats. Messages hold at most, for each other member of the
+/// configuration, one flow-control window of appends: `max_inflight_msgs` of
+/// `max_size_per_msg` bytes and one entry past it, which the core admits alone. A member's
+/// heartbeats, votes and answers are small beside them. Past the bound a message is refused,
+/// as the network may drop it; Raft's retries cover a lost message (Ongaro and Ousterhout,
+/// ATC 2014, §5.1).
+#[derive(Debug, Default)]
+struct Held {
+    /// Each message with the ticks that came between it and the one before.
+    messages: VecDeque<(u64, Message)>,
+    /// What the messages take: their encoded bytes and their in-memory frame.
+    bytes: u64,
+    /// Ticks after the last message.
+    ticks: u64,
+    /// Ticks held in all, before messages and after, at most `Replica::max_held_ticks`.
+    all_ticks: u64,
+}
+
+/// What a held message is charged: its encoding and the frame that holds it. A charge past
+/// u64::MAX saturates, which passes every bound and is refused, as the true charge would be.
+fn held_bytes(message: &Message) -> u64 {
+    let frame = u64::try_from(std::mem::size_of::<Message>()).unwrap_or(u64::MAX);
+    u64::from(message.compute_size()).saturating_add(frame)
+}
 
 /// A ready being made durable: its update's parts not yet durable, in order, each fitting a
 /// frame, the log's handle for the first once it is submitted, and the log's answer once it
@@ -258,6 +304,17 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
             conf: conf.clone(),
             snapshot: None,
         };
+        let window_bytes = u64::try_from(settings.max_inflight_msgs)
+            .ok()
+            .and_then(|n| n.checked_mul(settings.max_size_per_msg))
+            .and_then(|b| b.checked_add(settings.max_entry_bytes))
+            .ok_or(ReplicaError::Config(
+                "a flow-control window of appends past u64 bytes",
+            ))?;
+        let max_held_ticks = u64::try_from(settings.election_tick)
+            .ok()
+            .and_then(|t| t.checked_mul(2))
+            .ok_or(ReplicaError::Config("an election timeout past u64 ticks"))?;
         let uncertain = uncertain_mark(&store)?;
         let node = RawNode::new(&config, store)?;
         let mut replica = Self {
@@ -271,6 +328,9 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
             conf_index: applied,
             max_entry_bytes: settings.max_entry_bytes,
             staged: None,
+            held: Held::default(),
+            window_bytes,
+            max_held_ticks,
             uncertain,
             reads: Rounds::default(),
             round_ticks: u64::try_from(settings.election_tick).unwrap_or(u64::MAX),
@@ -393,12 +453,24 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
         self.engine
     }
 
-    /// A tick of the group's clock. A replica waiting for room takes no part in the group,
-    /// and its timers resume when it does.
+    /// A tick of the group's clock. One that comes while a ready's update flushes is counted
+    /// and taken once the ready is done (`Held`). A replica waiting for room takes no part in
+    /// the group, and its timers resume when it does.
     pub fn tick(&mut self) -> Result<(), ReplicaError> {
-        if self.staged.is_some() {
-            return Ok(());
+        match &self.staged {
+            None => self.tick_now(),
+            Some(staged) if staged.pending.is_some() => {
+                if self.held.all_ticks < self.max_held_ticks {
+                    self.held.ticks = self.held.ticks.saturating_add(1);
+                    self.held.all_ticks = self.held.all_ticks.saturating_add(1);
+                }
+                Ok(())
+            }
+            Some(_) => Ok(()),
         }
+    }
+
+    fn tick_now(&mut self) -> Result<(), ReplicaError> {
         self.node.tick()?;
         if let Some((_, age, _)) = self.reads.out.as_mut() {
             *age = age.saturating_add(1);
@@ -413,8 +485,74 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
     /// request for its vote against the last of them: a candidate behind it may lack an entry
     /// this member helped commit, and has no answer. Nor does an order to campaign, since the
     /// member cannot lead without the entries.
+    ///
+    /// A message that comes while a ready's update flushes is held, and taken once the ready
+    /// is done; past the bound on held messages it is refused with `MessagesHeld`, and while
+    /// the replica waits for room, with `Stalled` (`Held`).
     pub fn step(&mut self, message: Message) -> Result<(), ReplicaError> {
-        self.ready_for_calls()?;
+        match &self.staged {
+            None => self.step_now(message),
+            Some(staged) if staged.pending.is_some() => self.hold(message),
+            Some(_) => Err(ReplicaError::Stalled),
+        }
+    }
+
+    fn hold(&mut self, message: Message) -> Result<(), ReplicaError> {
+        let max = self.held_bound();
+        // A sum past u64::MAX saturates, and is refused as past the bound.
+        let bytes = self.held.bytes.saturating_add(held_bytes(&message));
+        if bytes > max {
+            return Err(ReplicaError::MessagesHeld { bytes, max });
+        }
+        let ticks = std::mem::take(&mut self.held.ticks);
+        self.held.messages.push_back((ticks, message));
+        self.held.bytes = bytes;
+        Ok(())
+    }
+
+    /// The bytes of messages held at most: a window of appends for each other member of the
+    /// configuration (`Held`). A product past u64::MAX saturates: no memory holds that many
+    /// bytes, so the bound it would state is no tighter.
+    fn held_bound(&self) -> u64 {
+        let c = &self.conf;
+        let members: std::collections::BTreeSet<u64> =
+            [&c.voters, &c.learners, &c.voters_outgoing, &c.learners_next]
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&m| m != self.id())
+                .collect();
+        u64::try_from(members.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(self.window_bytes)
+    }
+
+    /// Takes what came while a ready was out, once it is done: snapshots' reports, then the
+    /// messages and ticks in the order they came. A message the core refuses changes nothing,
+    /// as when it is stepped at once.
+    fn take_held(&mut self) -> Result<(), ReplicaError> {
+        for (to, arrived) in std::mem::take(&mut self.reports) {
+            self.take_report(to, arrived)?;
+        }
+        let held = std::mem::take(&mut self.held);
+        for (ticks, message) in held.messages {
+            self.ticks(ticks)?;
+            match self.step_now(message) {
+                Ok(()) | Err(ReplicaError::Refused(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        self.ticks(held.ticks)
+    }
+
+    fn ticks(&mut self, count: u64) -> Result<(), ReplicaError> {
+        for _ in 0..count {
+            self.tick_now()?;
+        }
+        Ok(())
+    }
+
+    fn step_now(&mut self, message: Message) -> Result<(), ReplicaError> {
         let kind = proto::message_type(&message);
         let requests_vote = matches!(
             kind,
@@ -449,7 +587,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
         Ok(self.uncertain)
     }
 
-    /// `Stalled` while a ready waits for room: the core takes no call until it is done.
+    /// `Stalled` while a ready is out: the core takes no call until it is done.
     fn ready_for_calls(&self) -> Result<(), ReplicaError> {
         match self.staged {
             Some(_) => Err(ReplicaError::Stalled),
@@ -634,7 +772,10 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
                 None => break,
             };
             match self.persist(staged, wait)? {
-                Persisted::Done(ready) => self.finish(ready, &mut out)?,
+                Persisted::Done(ready) => {
+                    self.finish(ready, &mut out)?;
+                    self.take_held()?;
+                }
                 Persisted::Flushing(mut staged) => {
                     // As while the log refuses room: what is committed is durable already,
                     // and applies while the update flushes.
@@ -653,12 +794,6 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
                     out.stalled = Some(refusal);
                     break;
                 }
-            }
-        }
-        // Reports of snapshots that came while the ready was out.
-        if self.staged.is_none() {
-            for (to, arrived) in std::mem::take(&mut self.reports) {
-                self.take_report(to, arrived)?;
             }
         }
         // The reads that waited on a round now confirmed go in the next.

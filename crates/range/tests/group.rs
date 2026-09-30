@@ -291,8 +291,9 @@ fn kind(m: &Message) -> Option<mantle_range::MessageType> {
 
 /// `begin` gives out a leader's appends while its own write of the entries is still being made
 /// durable, so they travel during its flush; it gives out a follower's acknowledgement only once
-/// the follower's write is durable, which `drive` waits for; and a member takes no other call
-/// while its ready is outstanding (audit §5.1). The entry then commits and applies everywhere.
+/// the follower's write is durable, which `drive` waits for; and a member holds the messages
+/// that come while its ready is outstanding, taking them once it is done, and refuses proposals
+/// meanwhile (audit §5.1). The entry then commits and applies everywhere.
 #[test]
 fn a_leader_sends_while_it_flushes_and_a_follower_acknowledges_after() {
     let mut nodes: Vec<GatedMember> = (1..=3).map(gated).collect();
@@ -362,7 +363,10 @@ fn a_leader_sends_while_it_flushes_and_a_follower_acknowledges_after() {
     assert_eq!(acks.iter().map(|m| m.from).collect::<Vec<_>>(), [3]);
     assert!(nodes[1].0.persisting());
     assert!(matches!(
-        nodes[1].0.step(acks[0].clone()),
+        nodes[1].0.propose(&Entry {
+            at_ns: 20,
+            commands: Vec::new(),
+        }),
         Err(mantle_range::ReplicaError::Stalled)
     ));
     // Once its write is durable, follower 2 acknowledges.
@@ -376,16 +380,18 @@ fn a_leader_sends_while_it_flushes_and_a_follower_acknowledges_after() {
     );
     assert_eq!(acks.len(), 2);
 
-    // The leader takes the acknowledgements once its own ready is done, and the entry applies
-    // at every member.
-    assert!(matches!(
-        nodes[0].0.step(acks[0].clone()),
-        Err(mantle_range::ReplicaError::Stalled)
-    ));
-    nodes[0].1.shut(false);
-    nodes[0].0.drive().unwrap();
+    // The leader holds the acknowledgements while its own flush is held and takes them once
+    // its ready is done, and the entry applies at every member.
+    let applied = nodes[0].0.applied();
     for ack in acks {
         nodes[0].0.step(ack).unwrap();
+    }
+    assert_eq!(nodes[0].0.applied(), applied);
+    nodes[0].1.shut(false);
+    let out = nodes[0].0.drive().unwrap();
+    assert!(nodes[0].0.applied() > applied, "{out:?}");
+    for m in out.messages {
+        let _ = nodes[usize::try_from(m.to).unwrap() - 1].0.step(m);
     }
     deliver(&mut nodes);
     for (r, _) in &nodes {
@@ -1139,5 +1145,140 @@ fn a_snapshot_report_that_comes_while_a_ready_is_out_is_kept() {
         nodes[0].replica.applied(),
         "member 3 never caught up: {}",
         nodes[0].replica.describe()
+    );
+}
+
+/// A node that overlaps its members' flushes (`begin`) finds each member's ready still out when
+/// the network next delivers to it: under steady load the leader always has one, and so, a
+/// round after each append, do its followers. The messages that come then are taken once the
+/// ready is done, as focal's own shell has its host retain them (docs/design/replica.md §3).
+/// Refused instead, as they were, every acknowledgement reached the leader while it flushed and
+/// was lost, and none of the load ever committed.
+#[test]
+fn a_leader_whose_answers_come_while_it_flushes_still_commits() {
+    let mut nodes: Vec<Node> = (1..=3).map(|id| node(id, 60 + id)).collect();
+    let mut answers = Vec::new();
+    nodes[0].replica.campaign().unwrap();
+    settle(&mut nodes, &mut answers);
+    assert!(nodes[0].replica.is_leader());
+    let before = nodes[0].replica.applied();
+
+    let mut wire: Vec<Message> = Vec::new();
+    let mut proposed = 0u64;
+    for round in 0..200u64 {
+        // Each node finishes the ready whose flush it waited out, proposes when it leads and
+        // takes proposals, and begins its next ready.
+        for (i, n) in nodes.iter_mut().enumerate() {
+            n.replica.wait_persisted();
+            wire.extend(n.replica.begin().unwrap().messages);
+            if i == 0
+                && n.replica
+                    .propose(&Entry {
+                        at_ns: 100 + round,
+                        commands: Vec::new(),
+                    })
+                    .is_ok()
+            {
+                proposed += 1;
+                wire.extend(n.replica.begin().unwrap().messages);
+            }
+        }
+        // What was sent arrives, and the clock ticks, while those readies flush.
+        for m in std::mem::take(&mut wire) {
+            let to = usize::try_from(m.to).unwrap() - 1;
+            let _ = nodes[to].replica.step(m);
+        }
+        for n in nodes.iter_mut() {
+            n.replica.tick().unwrap();
+        }
+    }
+    let committed = nodes[0].replica.applied() - before;
+    assert!(proposed >= 50, "the leader took {proposed} proposals");
+    // All but the proposals of the last rounds, still in flight, commit.
+    assert!(
+        committed + 3 >= proposed,
+        "{committed} of {proposed} proposals committed: {}",
+        nodes[0].replica.describe()
+    );
+    assert!(nodes[0].replica.is_leader());
+}
+
+/// Ticks that come while a ready flushes still move the member's clock once it is done: a
+/// leader whose every tick lands during a flush still sends its heartbeats. Dropped, as they
+/// were, its clock stood still for as long as it had load.
+#[test]
+fn ticks_while_a_ready_flushes_still_count() {
+    let mut nodes: Vec<Node> = (1..=3).map(|id| node(id, 70 + id)).collect();
+    let mut answers = Vec::new();
+    nodes[0].replica.campaign().unwrap();
+    settle(&mut nodes, &mut answers);
+    nodes[0]
+        .replica
+        .propose(&Entry {
+            at_ns: 10,
+            commands: Vec::new(),
+        })
+        .unwrap();
+    let out = nodes[0].replica.begin().unwrap();
+    assert!(out.persisting);
+    for _ in 0..SETTINGS.heartbeat_tick {
+        nodes[0].replica.tick().unwrap();
+    }
+    nodes[0].replica.wait_persisted();
+    let out = nodes[0].replica.drive().unwrap();
+    let mut to: Vec<u64> = out
+        .messages
+        .iter()
+        .filter(|m| kind(m) == Some(mantle_range::MessageType::MsgHeartbeat))
+        .map(|m| m.to)
+        .collect();
+    to.sort_unstable();
+    assert_eq!(to, [2, 3], "{:?}", out.messages);
+}
+
+/// Ticks held while a ready flushes stop at the longest election timeout the core draws: the
+/// core acts on a timer at most once in that many, and a follower whose device stalled for
+/// many timeouts would otherwise replay them as a burst of campaigns, each with its messages.
+#[test]
+fn ticks_held_through_a_long_flush_replay_at_most_one_timeouts_worth() {
+    let mut nodes: Vec<Node> = (1..=3).map(|id| node(id, 80 + id)).collect();
+    let mut answers = Vec::new();
+    nodes[0].replica.campaign().unwrap();
+    settle(&mut nodes, &mut answers);
+    nodes[0]
+        .replica
+        .propose(&Entry {
+            at_ns: 10,
+            commands: Vec::new(),
+        })
+        .unwrap();
+    let out = nodes[0].replica.begin().unwrap();
+    for m in out.messages.into_iter().filter(|m| m.to == 2) {
+        nodes[1].replica.step(m).unwrap();
+    }
+    assert!(nodes[1].replica.begin().unwrap().persisting);
+    for _ in 0..100 * SETTINGS.election_tick {
+        nodes[1].replica.tick().unwrap();
+    }
+    nodes[1].replica.wait_persisted();
+    let out = nodes[1].replica.drive().unwrap();
+    let campaigns = out
+        .messages
+        .iter()
+        .filter(|m| {
+            matches!(
+                kind(m),
+                Some(
+                    mantle_range::MessageType::MsgRequestVote
+                        | mantle_range::MessageType::MsgRequestPreVote
+                )
+            )
+        })
+        .count();
+    // Two timeouts at most, each asking both other members.
+    assert!(
+        campaigns <= 4,
+        "{campaigns} requests for votes: {:?}",
+        out.messages
     );
 }

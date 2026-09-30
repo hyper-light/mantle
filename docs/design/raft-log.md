@@ -138,7 +138,7 @@ read of the tail being swept, and every update the writer holds is answered `Fen
 wherever its commit failed: those laid into the frame, those of the batch not yet reached,
 those held for a later frame, and those of the frame before, whose confirmation will not
 come. A commit that failed before it wrote its frame once left the last two unanswered, and
-their submitters waited as long as the log lived (review of 2026-09-30, D2). A failed flush
+their submitters waited as long as the log lived (audit review R08). A failed flush
 is never retried, because the kernel may already have marked the pages clean [RPA+20 §3].
 The log must be reopened, and recovery trusts only what verifies.
 
@@ -214,7 +214,11 @@ up to its quota, to hold twice that, the same headroom the chunk store's cleanin
    its first frame, so a slot whose header no longer reads but which holds this log's
    frames past the first, from a segment newer than any whose header reads, lost a header
    that was durable. The log reports the damage, writes nothing, and its replicas recover
-   from their peers. It never truncates silently.
+   from their peers. It never truncates silently. For the same reason every live segment
+   before the last frame's holds a frame at least: sequences are checked from the first frame
+   replayed on, so a tail segment whose frames no longer began where they should once
+   dropped out of the replay whole, and the groups whose only records lay there vanished
+   without a mark (audit review R17).
 5. The last frame has no later frame to vouch for it, which protocol-aware recovery leaves
    ambiguous: "if e_i is the last entry, then we cannot determine whether it was a crash or
    a corruption" (AGL+18 §3.3.3). Its persist record answers what it held, and a confirmation
@@ -268,7 +272,7 @@ up to its quota, to hold twice that, the same headroom the chunk store's cleanin
    answered, which recovery may drop as it drops a torn tail. It was an empty record in the
    other slot: the next frame's record, written there before that frame's flush, took it
    away when it tore, and a frame answered and then damaged at rest was cut as a torn tail,
-   its entries dropped without a mark (review of 2026-09-30, D1). Format 3 records this.
+   its entries dropped without a mark (audit review R07). Format 3 records this.
 
    The restore is written through the writer, marks included, before the log serves anyone,
    so it survives the next restart. It is the writer's first batch and goes in one frame, or
@@ -277,8 +281,8 @@ up to its quota, to hold twice that, the same headroom the chunk store's cleanin
    first had written over the lost frame's record. That frame takes the lost frame's
    sequence, and so its slot, and its record, written there before its flush, could tear and
    take the lost frame's record with it while the restore never became durable: the next
-   open found no record, and restored nothing, marked nothing and fenced nothing (review of
-   2026-09-30, D3). The open therefore copies the lost frame's record, saying whether the
+   open found no record, and restored nothing, marked nothing and fenced nothing (audit
+   review R09). The open therefore copies the lost frame's record, saying whether the
    frame was confirmed, into the other slot, and flushes the copy with the erasure of step
    6 before the restore is written. The other slot then held the record of the frame before,
    which reads whole, or of a frame after, which never became durable, so was never
@@ -286,11 +290,25 @@ up to its quota, to hold twice that, the same headroom the chunk store's cleanin
    frame's record from its own slot, and from the copy where that no longer reads. A
    restore's record that landed beside a restore frame that tore is read before the copy,
    and restores the same state, being the restore of the lost frame's record.
+
+   A persist record says what a frame's updates made durable, not what its sweep moved. A
+   lost last frame that swept the tail freed that segment, and the next frame may already
+   have opened in its slot. Where that opening tore after writing over the segment's header
+   or first frames, the pieces the sweep moved were in the lost frame and nowhere else, and
+   the frame before it, which recovery falls back to, names the overwritten segment as its
+   tail. That is damage to acknowledged records no durable copy holds, as in an interior
+   frame, and the log reports it and writes nothing (R17). Where the opening wrote nothing
+   there, the segment replays and the lost frame is restored.
 6. The block where the next frame goes is overwritten with zeros and flushed before any
    write. A frame there was never acknowledged, but it may be partly durable: its header
    whole while its last sectors, or the file's end, are not. Left alone, a later crash
    could complete it with the zeros of a newer frame's padding and bring back an update the
-   replica had already been told was lost, such as a vote.
+   replica had already been told was lost, such as a vote. Where the head is a segment newer
+   than the last frame's, an opening whose frame never became durable, the block after the
+   last frame is erased too. A frame there was flushed before the opening was written, and no
+   longer reads: it is the lost frame, whose restore goes in the head. Left in its segment,
+   which is then the tail, it was taken by the restore frame's sweep for a live frame damaged,
+   the sweep fenced the log, and the open failed where the frame was to be restored (R18).
 
 Recovery reads the live log through a window of one segment, the most any frame takes. A
 frame the window holds is verified there, and the window moves to the start of one it does
@@ -329,7 +347,8 @@ multi-sector writes, fails flushes after marking pages clean, and flips bits on 
 - a torn tail is cut and corruption is reported, damage to any field of a frame or of a
   segment header included, and slots reused by a newer segment prove nothing about it;
 - a group's updates held behind a frame's room become durable in the order submitted;
-- reclamation never loses a live record;
+- reclamation never loses a live record, and a lost frame that swept the tail loses
+  nothing unreported when the next frame's opening tears over the segment it freed;
 - a group's state after recovery equals its state before the crash, less what was never
   acknowledged.
 
@@ -345,6 +364,11 @@ latency against the device's measured flush rate.
 
 - The window of entries a leader keeps for lagging followers before it sends a snapshot,
   as a function of the snapshot's cost and the follower's measured lag.
+- Whether a segment a sweep freed waits to be reused until a frame after the sweep's is
+  durable. The sweep's frame would then no longer be the only copy of what it moved while it
+  is the last frame, and a torn opening in the freed slot would leave the log to open and
+  restore it (§6, R17). It costs room: the frame after the sweep needs a place other than the
+  freed segment, so the log would keep a second segment free where it keeps one (§5).
 - Whether hard states also get a periodically written second copy, as protocol-aware
   recovery keeps its metainformation twice (06 §C.c, item 5). The persist record holds the
   last frame's hard states a second time; a hard state in an interior frame that is damaged

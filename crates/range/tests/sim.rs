@@ -297,6 +297,11 @@ struct World {
     duplicated: u64,
     /// Clocks stepped, forward or back.
     stepped: u64,
+    /// Messages and ticks a member held while its ready flushed, and messages it refused
+    /// for want of room to hold them.
+    held: u64,
+    held_ticks: u64,
+    refused: u64,
 }
 
 /// What a run exercised, and what its gateways saw at which steps.
@@ -308,6 +313,9 @@ struct Ran {
     two_down: u64,
     duplicated: u64,
     stepped: u64,
+    held: u64,
+    held_ticks: u64,
+    refused: u64,
     steps: u64,
     history: Vec<String>,
 }
@@ -354,6 +362,9 @@ impl World {
             two_down: 0,
             duplicated: 0,
             stepped: 0,
+            held: 0,
+            held_ticks: 0,
+            refused: 0,
         }
     }
 
@@ -383,6 +394,9 @@ impl World {
         }
         for n in &mut self.nodes {
             if let Some(r) = n.replica.as_mut() {
+                if r.persisting() {
+                    self.held_ticks += 1;
+                }
                 r.tick().unwrap_or_else(|e| panic!("tick: {e}"));
             }
         }
@@ -509,11 +523,22 @@ impl World {
             let receiver = self.nodes.iter_mut().find(|n| n.id == to);
             let arrived = !dropped
                 && match receiver.and_then(|n| n.replica.as_mut()) {
-                    Some(r) => match r.step(m) {
-                        Ok(()) | Err(ReplicaError::Refused(_)) => true,
+                    Some(r) => match (r.persisting(), r.step(m)) {
+                        // A member whose ready flushes holds the message until it is done.
+                        (true, Ok(())) => {
+                            self.held += 1;
+                            true
+                        }
+                        (_, Ok(()) | Err(ReplicaError::Refused(_))) => true,
+                        // Past its bound on held messages a member refuses one, as the network
+                        // may drop it.
+                        (_, Err(ReplicaError::MessagesHeld { .. })) => {
+                            self.refused += 1;
+                            false
+                        }
                         // A member waiting for room in its log takes no message.
-                        Err(ReplicaError::Stalled) => false,
-                        Err(e) => panic!("step: {e}"),
+                        (_, Err(ReplicaError::Stalled)) => false,
+                        (_, Err(e)) => panic!("step: {e}"),
                     },
                     None => false,
                 };
@@ -543,12 +568,13 @@ impl World {
             let Some(r) = n.replica.as_mut() else {
                 continue;
             };
-            // Under faults, a member half the time takes its ready without waiting for its log
-            // and finishes it at a later step, messages to it meanwhile refused, as a node
-            // overlapping its members' flushes does (audit §5.1).
+            // A member half the time takes its ready without waiting for its log and finishes
+            // it at a later step, holding the ticks and messages that come meanwhile, as a node
+            // overlapping its members' flushes does (audit §5.1). It does so after faults stop
+            // too, so a group whose messages come while its readies flush must still finish.
             // The flush is waited for before the step ends, so what the next step finds does
             // not hang on the log's thread: every run is its seed.
-            let out = if self.faults && self.rng.chance(500) {
+            let out = if self.rng.chance(500) {
                 let out = r.begin();
                 r.wait_persisted();
                 out
@@ -926,12 +952,17 @@ fn read_u64(bytes: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
 }
 
-/// A gateway's write: the gate's opening for an empty key, a put otherwise.
+/// A gateway's write: the gate's opening for an empty key, a put otherwise. A put carries the
+/// file its gateway wrote for it, one per session and serial, so its retries carry the same.
 fn write(session: Option<u64>, serial: u64, key: &str, value: &str) -> Sessioned {
     let command = if key.is_empty() {
         open_gate()
     } else {
-        put(key, value)
+        put(
+            key,
+            value,
+            (u128::from(session.unwrap_or(0)) << 64) | u128::from(serial),
+        )
     };
     Sessioned {
         session: session.unwrap_or(0),
@@ -941,7 +972,7 @@ fn write(session: Option<u64>, serial: u64, key: &str, value: &str) -> Sessioned
     }
 }
 
-fn put(key: &str, etag: &str) -> Command {
+fn put(key: &str, etag: &str, file: u128) -> Command {
     Command::Name(Box::new(name::Command::Put(Put {
         bucket: "b".into(),
         incarnation: 1,
@@ -957,7 +988,7 @@ fn put(key: &str, etag: &str) -> Command {
             etag: etag.into(),
             size: 1,
             checksum: None,
-            file: Some(1),
+            file: Some(file),
             owner: "o".into(),
             headers: Vec::new(),
             retention: None,
@@ -1069,6 +1100,9 @@ fn run(seed: u64, members: u64) -> Ran {
         two_down: w.two_down,
         duplicated: w.duplicated,
         stepped: w.stepped,
+        held: w.held,
+        held_ticks: w.held_ticks,
+        refused: w.refused,
         steps: w.step,
         history: w
             .history
@@ -1089,7 +1123,7 @@ fn a_group_under_faults_is_linearizable_and_applies_every_put_once() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
     let (mut replaced, mut stalls, mut flushing, mut two_down, mut duplicated) = (0, 0, 0, 0, 0);
-    let mut stepped = 0;
+    let (mut stepped, mut held, mut held_ticks, mut refused) = (0, 0, 0, 0);
     for seed in first..first + seeds {
         // Odd seeds run a group of three, even ones of five.
         let members = if seed % 2 == 0 { 5 } else { 3 };
@@ -1103,13 +1137,21 @@ fn a_group_under_faults_is_linearizable_and_applies_every_put_once() {
         two_down += ran.two_down;
         duplicated += ran.duplicated;
         stepped += ran.stepped;
+        held += ran.held;
+        held_ticks += ran.held_ticks;
+        refused += ran.refused;
     }
     // Leaders' clocks stepped back and forth, and every run stayed linearizable.
     assert!(stepped > 0, "no clock was stepped");
     // Readies waited for room and the members went on: the path audit S04 found stranded.
     assert!(stalls > 0, "no ready ever waited for room");
-    // Readies were left flushing across steps, their members refusing messages meanwhile.
+    // Readies were left flushing across steps, their members holding the messages and ticks
+    // that came meanwhile.
     assert!(flushing > 0, "no ready was begun and left flushing");
+    assert!(
+        held > 0 && held_ticks > 0,
+        "{held} messages and {held_ticks} ticks held"
+    );
     // Groups of five lost two members at once and went on, and messages arrived twice.
     assert!(
         two_down > 0 && duplicated > 0,
@@ -1118,7 +1160,9 @@ fn a_group_under_faults_is_linearizable_and_applies_every_put_once() {
     eprintln!(
         "{seeds} runs replaced {replaced} members lost for good; {stalls} readies waited for \
          room; {flushing} were left flushing across a step; two of five were down at {two_down} \
-         steps; {duplicated} messages were sent twice; {stepped} clocks were stepped"
+         steps; {duplicated} messages were sent twice; {stepped} clocks were stepped; \
+         {held} messages and {held_ticks} ticks were held while a ready flushed, {refused} \
+         messages refused past the bound"
     );
 }
 

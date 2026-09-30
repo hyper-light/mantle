@@ -199,3 +199,11 @@ order.
   where Tectonic appends small blobs replicated and re-encodes them sealed (01 §1.9).
 - Placement across failure domains is the placement driver's (STATUS, planned 2); the path
   takes the volumes it is offered.
+- A block decoded around a lost chunk pays a cost fixed per decode, whatever its size: the
+  coding library evaluates the erasure locator with two Walsh–Hadamard transforms over all
+  65,536 elements of GF(2^16) (reed-solomon-simd 3.1, `rate_low.rs`/`rate_high.rs` calling
+  `eval_poly` with `GF_ORDER`), of which only the positions of the code's chunks are used.
+  Small blocks, and their repair, are read far slower degraded than whole. The locator
+  depends only on which chunks are missing, so it could be kept per loss pattern, or
+  evaluated at those positions alone: a change to the library, to be made in a vendored copy
+  with its tests and offered upstream, and measured on an idle machine.

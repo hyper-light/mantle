@@ -15,7 +15,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{SIZE, config, data, key, sim};
+use common::{SIZE, config, damage_frame, data, frames, key, last_frame, sim};
 use mantle_chunk::{ChunkError, Volume};
 use mantle_disk::block::BlockFile;
 use mantle_disk::sim::{Crash, Fault, SimFile};
@@ -123,19 +123,21 @@ fn a_damaged_superblock_falls_back_to_its_twin() {
 fn damage_inside_the_log_refuses_to_open_but_a_torn_tail_does_not() {
     let file = sim(24);
     let v = Volume::format(Arc::clone(&file), SIZE, config()).unwrap();
+    let volume = v.volume_id();
     for n in 0..10u64 {
         v.put(key(n), &data(n, 500)).unwrap();
     }
     drop(v);
-    // Each small batch is one 4 KiB frame; the log starts at 128 KiB in a compact volume.
-    // Damage the third frame: acknowledged frames follow it, so this is not a crash.
-    let log = 128u64 << 10;
-    file.inject(Fault::BitFlip {
-        offset: log + 2 * 4096 + 60,
-        bit: 3,
-        stored: true,
-    })
-    .unwrap();
+    // Damage a frame acknowledged frames follow: this is not a crash.
+    let (_, _, last) = last_frame(&file, volume);
+    let at = |lsn: u64| {
+        frames(&file, volume)
+            .into_iter()
+            .find(|&(_, _, l)| l == lsn)
+            .unwrap()
+            .0
+    };
+    damage_frame(&file, at(last - 3));
     assert!(matches!(
         Volume::open(Arc::clone(&file), config()),
         Err(ChunkError::CorruptLog { .. })
@@ -143,15 +145,10 @@ fn damage_inside_the_log_refuses_to_open_but_a_torn_tail_does_not() {
     file.clear_faults().unwrap();
 
     // Damage only the last frame: indistinguishable from a torn write, so the volume opens
-    // without that batch.
-    file.inject(Fault::BitFlip {
-        offset: log + 9 * 4096 + 60,
-        bit: 3,
-        stored: true,
-    })
-    .unwrap();
+    // without that batch, and loses nothing it answered.
+    damage_frame(&file, at(last));
     let (v, _) = Volume::open(Arc::clone(&file), config()).unwrap();
-    for n in 0..9u64 {
+    for n in 0..10u64 {
         assert_eq!(v.read(&key(n), 0, 500).unwrap(), data(n, 500));
     }
 }
@@ -274,22 +271,22 @@ fn the_background_scrubber_finds_damage_on_its_own() {
 /// (audit S15).
 #[test]
 fn a_delete_answered_is_never_in_the_last_frame() {
-    let log = 128u64 << 10;
-    // Ten one-frame batches of puts, the delete's frame, then its confirmation's.
-    for (frame, opens) in [(10u64, false), (11, true)] {
-        let file = sim(25 + frame);
+    // The delete's frame, then its confirmation's, the last.
+    for (from_last, opens) in [(1u64, false), (0, true)] {
+        let file = sim(35 + from_last);
         let v = Volume::format(Arc::clone(&file), SIZE, config()).unwrap();
+        let volume = v.volume_id();
         for n in 0..10u64 {
             v.put(key(n), &data(n, 500)).unwrap();
         }
         v.delete(key(3)).unwrap();
         drop(v);
-        file.inject(Fault::BitFlip {
-            offset: log + frame * 4096 + 60,
-            bit: 3,
-            stored: true,
-        })
-        .unwrap();
+        let (_, _, last) = last_frame(&file, volume);
+        let (at, _, _) = frames(&file, volume)
+            .into_iter()
+            .find(|&(_, _, lsn)| lsn == last - from_last)
+            .unwrap();
+        damage_frame(&file, at);
         match Volume::open(Arc::clone(&file), config()) {
             Ok((v, _)) => {
                 assert!(opens, "damage to the delete's frame was not refused");
@@ -301,6 +298,74 @@ fn a_delete_answered_is_never_in_the_last_frame() {
             Err(e) => {
                 assert!(!opens, "{e}");
                 assert!(matches!(e, ChunkError::CorruptLog { .. }), "{e}");
+            }
+        }
+    }
+}
+
+/// A put whose batch opens a segment is answered only once a later frame confirms the batch's:
+/// recovery rolls forward through the segments the log left open, and only that frame says the
+/// new one is, so with the frame damaged and nothing after it the put was lost. Now damage to
+/// the last frame, the confirmation, loses nothing answered. The first put of a volume opens
+/// its first segment; the fifth 50 KiB put here opens the second.
+#[test]
+fn a_put_that_opens_a_segment_survives_damage_to_the_last_frame() {
+    for (seed, before) in [(905u64, 4u64), (904, 0)] {
+        let file = sim(seed);
+        let v = Volume::format(Arc::clone(&file), SIZE, config()).unwrap();
+        let volume = v.volume_id();
+        for n in 0..before {
+            v.put(key(n), &data(n, 50 << 10)).unwrap();
+        }
+        let free = v.usage().unwrap().free;
+        v.put(key(100), &data(100, 50 << 10)).unwrap();
+        assert!(
+            v.usage().unwrap().free < free,
+            "the last put opened no segment"
+        );
+        drop(v);
+        let (at, _, _) = last_frame(&file, volume);
+        damage_frame(&file, at);
+        let (v, report) = Volume::open(Arc::clone(&file), config()).unwrap();
+        for n in (0..before).chain([100]) {
+            assert!(
+                v.stat(&key(n)).unwrap().is_some(),
+                "seed {seed}: acknowledged put {n} lost with the last frame; {report:?}"
+            );
+        }
+    }
+}
+
+/// The superblock names a checkpoint only once all of it is durable, and its frames share one
+/// flush, so no later flush group need follow them. Before, damage to the checkpoint's first
+/// frame looked like a torn tail and the volume opened empty, saying nothing; now the replay
+/// must reach the checkpoint's end, which the superblock records, and damage to any of its
+/// frames is refused.
+#[test]
+fn damage_to_a_checkpoint_is_refused() {
+    for (seed, kind) in [(900u64, 3u16), (906, 5)] {
+        let file = sim(seed);
+        let v = Volume::format(Arc::clone(&file), SIZE, config()).unwrap();
+        let volume = v.volume_id();
+        for n in 0..10u64 {
+            v.put(key(n), &data(n, 3000)).unwrap();
+        }
+        v.checkpoint().unwrap();
+        drop(v);
+        let (at, _, _) = frames(&file, volume)
+            .into_iter()
+            .filter(|&(_, k, _)| k == kind)
+            .max_by_key(|&(_, _, lsn)| lsn)
+            .unwrap();
+        damage_frame(&file, at);
+        match Volume::open(Arc::clone(&file), config()) {
+            Err(ChunkError::CorruptLog { .. }) => {}
+            Err(e) => panic!("kind {kind}: refused, but as {e}"),
+            Ok((v, report)) => {
+                let kept = (0..10u64)
+                    .filter(|&n| v.stat(&key(n)).unwrap().is_some())
+                    .count();
+                panic!("kind {kind}: opened with {kept} of 10 chunks; {report:?}");
             }
         }
     }

@@ -78,3 +78,44 @@ pub fn data(seed: u64, len: usize) -> Vec<u8> {
         })
         .collect()
 }
+
+/// The index frames of `volume` the device durably holds, as (byte offset in the file, kind,
+/// LSN), in the order they sit on the device. A frame starts with its magic, version and
+/// kind, then its LSN and the volume's ID (frame.rs).
+pub fn frames(file: &SimFile, volume: u128) -> Vec<(u64, u16, u64)> {
+    let image = file.durable_image().unwrap();
+    image
+        .as_chunks::<4096>()
+        .0
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| {
+            &b[0..4] == b"MNIX" && u128::from_le_bytes(b[16..32].try_into().unwrap()) == volume
+        })
+        .map(|(i, b)| {
+            let kind = u16::from_le_bytes([b[6], b[7]]);
+            let lsn = u64::from_le_bytes(b[8..16].try_into().unwrap());
+            (i as u64 * 4096, kind, lsn)
+        })
+        .collect()
+}
+
+/// The frame with the highest LSN.
+pub fn last_frame(file: &SimFile, volume: u128) -> (u64, u16, u64) {
+    frames(file, volume)
+        .into_iter()
+        .max_by_key(|&(_, _, lsn)| lsn)
+        .expect("no frame")
+}
+
+/// Damages the frame at `at` for good: a stored bit of its CRC-32C, which every frame has,
+/// where its records may be too short to reach a given offset and bytes past them are padding
+/// no checksum covers.
+pub fn damage_frame(file: &SimFile, at: u64) {
+    file.inject(mantle_disk::sim::Fault::BitFlip {
+        offset: at + 44,
+        bit: 3,
+        stored: true,
+    })
+    .unwrap();
+}

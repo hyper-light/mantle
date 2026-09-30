@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use common::{SIZE, config, data, key, put_retrying, sim};
 use mantle_chunk::layout::{Geometry, batch_frame_bytes, checkpoint_bytes, largest_frame};
-use mantle_chunk::{ChunkError, Config, Reads, Volume};
+use mantle_chunk::{ChunkError, ChunkKey, Config, Reads, Volume};
 use mantle_disk::buf::Alignment;
 use mantle_disk::file::{CachingRequest, DeviceFile};
 use mantle_disk::sim::{Fault, SimFile};
@@ -767,6 +767,9 @@ fn find(file: &mantle_disk::sim::SimFile, bytes: &[u8]) -> u64 {
 fn a_bad_read_at_recovery_never_drops_an_acknowledged_chunk() {
     let file = sim(40);
     let v = Volume::format(Arc::clone(&file), SIZE, config()).unwrap();
+    // The first put opens a segment, and a later frame confirms its batch; the put under
+    // test is the last batch, whose records recovery reads back.
+    v.put(key(0), &data(0, 100)).unwrap();
     let bytes = data(40, 9_000);
     v.put(key(1), &bytes).unwrap();
     v.close();
@@ -798,6 +801,9 @@ fn a_bad_read_at_recovery_never_drops_an_acknowledged_chunk() {
 fn a_damaged_chunk_is_reported_and_a_retry_writes_it_again() {
     let file = sim(41);
     let v = Volume::format(Arc::clone(&file), SIZE, config()).unwrap();
+    // The first put opens a segment, and a later frame confirms its batch; the put under
+    // test is the last batch, whose records recovery reads back.
+    v.put(key(0), &data(0, 100)).unwrap();
     let bytes = data(41, 9_000);
     v.put(key(1), &bytes).unwrap();
     v.close();
@@ -954,4 +960,27 @@ fn reads_hold_their_buffers_to_the_read_bytes() {
     // The large read's buffer: its header and table, and its payload.
     assert!(stats.most_bytes <= 220_000, "{stats:?}");
     assert!(stats.most_bytes > 0);
+}
+
+/// Cleaning has the writer run a batch of its own after each victim, to free what it emptied.
+/// It did so by deleting a key no client was meant to use, but clients may use any key: a
+/// chunk stored under it was deleted, acknowledged or not. The cleaner now sends a request
+/// that deletes nothing.
+#[test]
+fn cleaning_deletes_no_client_chunk() {
+    let file = sim(901);
+    let v = Volume::format(Arc::clone(&file), SIZE, config()).unwrap();
+    let edge = ChunkKey {
+        block: 0,
+        epoch: u32::MAX,
+        index: u16::MAX,
+    };
+    v.put(edge, &data(77, 100)).unwrap();
+    for n in 0..8u64 {
+        v.put(key(n), &data(n, 50 << 10)).unwrap();
+    }
+    assert!(v.usage().unwrap().sealed >= 1);
+    let report = v.clean(1).unwrap();
+    assert!(report.segments >= 1, "{report:?}");
+    assert_eq!(v.read(&edge, 0, 100).unwrap(), data(77, 100));
 }

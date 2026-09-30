@@ -101,6 +101,8 @@ impl<F: BlockFile + 'static> Volume<F> {
             data_offset: geometry.data_offset,
             start_lsn: 1,
             start_pos: 0,
+            // No checkpoint yet: nothing the replay must reach.
+            end_lsn: 1,
             // Nothing issued, nothing reserved: the first batch reserves.
             sequence_limit: 0,
             incarnation_limit: 0,
@@ -195,6 +197,7 @@ impl<F: BlockFile + 'static> Volume<F> {
             dead_bytes: std::sync::atomic::AtomicU64::new(0),
             futile_at: std::sync::atomic::AtomicU64::new(u64::MAX),
             submitted: std::sync::atomic::AtomicU64::new(0),
+            clean_opened: std::sync::atomic::AtomicU64::new(0),
             checkpoints: std::sync::atomic::AtomicU64::new(0),
             queue: std::sync::Mutex::new(crate::writer::Queue::default()),
             peak_rate: std::sync::atomic::AtomicU64::new(0),
@@ -788,10 +791,11 @@ mod tests {
     use crate::layout::{Limits, Reads};
 
     /// A simulated file whose flushes wait while its gate is shut, so a test can queue
-    /// requests behind a batch the writer is flushing, and know when it is.
+    /// requests behind a batch the writer is flushing, and know when it is. State: whether
+    /// the gate is shut, flushes begun, and flushes the shut gate still lets through.
     struct Gated {
         file: Arc<SimFile>,
-        state: Mutex<(bool, u64)>,
+        state: Mutex<(bool, u64, u64)>,
         changed: Condvar,
     }
 
@@ -799,7 +803,7 @@ mod tests {
         fn new(file: Arc<SimFile>) -> Arc<Self> {
             Arc::new(Self {
                 file,
-                state: Mutex::new((false, 0)),
+                state: Mutex::new((false, 0, 0)),
                 changed: Condvar::new(),
             })
         }
@@ -821,6 +825,27 @@ mod tests {
         fn flushes(&self) -> u64 {
             self.state.lock().unwrap().1
         }
+
+        /// Opens the gate when dropped, so a test that fails with it shut ends rather than
+        /// leaving the writer waiting while the volume's drop joins it.
+        fn reopen_on_drop(self: &Arc<Self>) -> impl Drop {
+            struct Reopen(Arc<Gated>);
+            impl Drop for Reopen {
+                fn drop(&mut self) {
+                    if let Ok(mut state) = self.0.state.lock() {
+                        state.0 = false;
+                    }
+                    self.0.changed.notify_all();
+                }
+            }
+            Reopen(Arc::clone(self))
+        }
+
+        /// Lets `n` more flushes through the shut gate.
+        fn pass(&self, n: u64) {
+            self.state.lock().unwrap().2 += n;
+            self.changed.notify_all();
+        }
     }
 
     impl BlockFile for Gated {
@@ -840,8 +865,11 @@ mod tests {
             let mut state = self.state.lock().unwrap();
             state.1 += 1;
             self.changed.notify_all();
-            while state.0 {
+            while state.0 && state.2 == 0 {
                 state = self.changed.wait(state).unwrap();
+            }
+            if state.0 {
+                state.2 -= 1;
             }
             drop(state);
             self.file.sync_data()
@@ -882,6 +910,149 @@ mod tests {
             block: u128::from(n),
             epoch: 1,
             index: 0,
+        }
+    }
+
+    /// Queues a delete without waiting for its answer.
+    fn queue_delete<F: BlockFile + 'static>(
+        v: &Volume<F>,
+        key: ChunkKey,
+    ) -> Receiver<Result<(), ChunkError>> {
+        let mut ticket = v.admit(0).unwrap();
+        let (reply, answer) = sync_channel(1);
+        v.sender
+            .as_ref()
+            .unwrap()
+            .try_send(Request {
+                op: Op::Delete { key },
+                reply,
+                queued: Some(0),
+            })
+            .map_err(|_| ())
+            .unwrap();
+        ticket.sent = true;
+        answer
+    }
+
+    /// Requests that write nothing, retries of a put already durable, come in while a delete
+    /// waits for a later frame to confirm its batch's. They write no frame, and before, the
+    /// delete was confirmed only when the queue next ran empty, so a steady stream of them
+    /// held it, and every answer behind it, for as long as it lasted (audit S15). Now a batch
+    /// that writes no frame confirms at once: the confirmation's flush begins while the later
+    /// batches are still queued.
+    #[test]
+    fn a_batch_that_writes_nothing_confirms_the_delete_before_it() {
+        let file = Gated::new(sim(902));
+        let batch = 8;
+        let volume = Volume::format(Arc::clone(&file), 128 << 20, batch_config(batch)).unwrap();
+        volume.put(key(1), b"retried").unwrap();
+        volume.put(key(2), b"deleted").unwrap();
+        let _reopen = file.reopen_on_drop();
+        file.shut(true);
+        let seen = file.flushes();
+        let delete = queue_delete(&volume, key(2));
+        file.flushing_after(seen);
+        // All the queue holds besides the delete: more than one batch.
+        let retries: Vec<_> = (1..volume.limits.queue_requests())
+            .map(|_| queue_put(&volume, key(1), b"retried"))
+            .collect();
+        file.pass(1);
+        file.flushing_after(seen + 1);
+        let queued = volume.shared.queue.lock().unwrap().requests();
+        file.shut(false);
+        delete.recv().unwrap().unwrap();
+        for retry in retries {
+            retry.recv().unwrap().unwrap();
+        }
+        assert!(
+            queued > 0,
+            "the delete was confirmed only once the queue ran empty"
+        );
+    }
+
+    /// What a cleaning pass gains is the victims it frees less the segments its relocations
+    /// open. It was measured as the change in free segments, which client writes during the
+    /// pass spend as well, so a pass that freed a segment while a client opened one looked
+    /// futile, and a futile pass answers client writes `Full` while space could still be
+    /// reclaimed. Here two half-dead victims pack into one segment, and a client write that
+    /// opens a segment lands between the relocation and the victims' freeing.
+    #[test]
+    fn a_pass_gains_what_it_frees_whatever_clients_write_meanwhile() {
+        let file = Gated::new(sim(907));
+        let config = Config {
+            segment_size: 256 << 10,
+            checksum_shift: 12,
+            max_fragments: 2000,
+            compact: true,
+            scrub_period: None,
+            limits: Limits {
+                batch_requests: 64,
+                batch_bytes: 1 << 20,
+                fragments_per_chunk: 64,
+            },
+            prewrite: false,
+            reads: Reads::default(),
+        };
+        let volume = Arc::new(Volume::format(Arc::clone(&file), 8 << 20, config).unwrap());
+        let chunk = vec![3u8; 50 << 10];
+        // Four chunks a segment: two sealed segments and a third open.
+        for n in 0..9 {
+            volume.put(key(n), &chunk).unwrap();
+        }
+        for n in [0, 1, 4, 5] {
+            volume.delete(key(n)).unwrap();
+        }
+        let _reopen = file.reopen_on_drop();
+        file.shut(true);
+        let seen = file.flushes();
+        let cleaning = {
+            let volume = Arc::clone(&volume);
+            std::thread::spawn(move || volume.clean(2))
+        };
+        file.flushing_after(seen);
+        // Too large for the client's open segment: it seals it and opens another.
+        let client = queue_put(&volume, key(100), &vec![5u8; 250 << 10]);
+        file.shut(false);
+        client.recv().unwrap().unwrap();
+        let report = cleaning.join().unwrap().unwrap();
+        assert_eq!(report.segments, 2, "{report:?}");
+        assert_eq!(report.gained, 1, "{report:?}");
+    }
+
+    /// A second delete of a chunk finds it gone: removed by a first delete not yet confirmed,
+    /// in an earlier batch or earlier in its own. Its answer rests on the first's, and before,
+    /// it was answered at once; with the confirmation, or the batch, then failing, the first
+    /// was refused and the second said the chunk was deleted, which after a crash and damage
+    /// to the first's frame it was not. It now waits for the first and fails with it.
+    #[test]
+    fn a_repeated_delete_is_answered_with_the_first() {
+        for same_batch in [false, true] {
+            let sim = sim(903);
+            let file = Gated::new(Arc::clone(&sim));
+            let volume = Volume::format(Arc::clone(&file), 128 << 20, batch_config(8)).unwrap();
+            volume.put(key(5), b"chunk").unwrap();
+            let _reopen = file.reopen_on_drop();
+            file.shut(true);
+            let seen = file.flushes();
+            let (first, second) = if same_batch {
+                let _held = queue_put(&volume, key(6), b"ahead");
+                file.flushing_after(seen);
+                (queue_delete(&volume, key(5)), queue_delete(&volume, key(5)))
+            } else {
+                let first = queue_delete(&volume, key(5));
+                file.flushing_after(seen);
+                (first, queue_delete(&volume, key(5)))
+            };
+            // The flush being held completes; every write after it fails.
+            sim.inject(mantle_disk::sim::Fault::PowerCut { ops: 1 })
+                .unwrap();
+            file.shut(false);
+            assert!(first.recv().unwrap().is_err(), "same batch {same_batch}");
+            let second = second.recv().unwrap();
+            assert!(
+                second.is_err(),
+                "same batch {same_batch}: the repeat was answered {second:?} and the first failed"
+            );
         }
     }
 

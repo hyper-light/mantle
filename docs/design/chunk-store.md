@@ -132,9 +132,12 @@ field rate of lost writes [BGS+08] against the measured cost per device class.
 
 Frames carry consecutive LSNs. Recovery tells a torn tail from corruption by what follows
 an invalid frame [AGL+18 §3.3.3; GAA17 §4.2]: nothing with the next LSN means a crash
-(the frame was never acknowledged, discard it); a valid frame with a later LSN means
+(the frame was never acknowledged, discard it); a valid frame of a later flush group means
 corruption of acknowledged state, which is reported and recovered from the data records
-(§6), never truncated.
+(§6), never truncated. The frames of a checkpoint share one flush group, so none of them
+proves another durable; the superblock, written only once the whole checkpoint is, records
+the LSN after its last frame, and a replay that stops short of it met damage. Before, damage
+to a checkpoint's first frame passed for a torn tail and the volume opened empty.
 
 ## 4. Writing
 
@@ -150,14 +153,23 @@ previous batch was being made durable,
 lays the data records into the open segment for their stream, encodes one index frame,
 issues all of the batch's writes at once, then **one** flush of the volume (`sync_data`:
 `fdatasync`, `F_FULLFSYNC`, `FlushFileBuffers`), and only then acknowledges the batch's
-writes and publishes the new index entries to readers. Its deletes it acknowledges once a
-later frame is durable too: the next batch's, a checkpoint's, or, when no request is
-queued, an empty frame written and flushed at once. A write's record describes itself in its
-segment, so roll-forward finds it when its frame is the torn tail recovery discards (§6); a
-delete lives only in its frame, and the frame of an acknowledged delete must never be the
-last, where damage after the flush is indistinguishable from a torn write and discarding it
-brought the deleted chunk back (audit S15). Damage to a frame a later one follows is
-corruption, reported and never truncated (§3.2). Deletes come from the reclaimer, a layer
+writes and publishes the new index entries to readers. Some of a batch's requests it
+acknowledges only once a later frame is durable too: the next batch's, a checkpoint's, or an
+empty frame written and flushed at once, when no request is queued or the next batch writes
+no frame of its own. A write's record describes itself in its segment, and roll-forward
+finds it when its frame is the torn tail recovery discards (§6), but only in a segment the
+log already left open: a write in a segment its own batch opens is found only through that
+frame's record of the opening. A delete lives only in its frame. So the frame of an
+acknowledged delete, or of a write in a segment its batch opened, must never be the last,
+where damage after the flush is indistinguishable from a torn write and discarding it lost
+the write or brought the deleted chunk back (audit S15). Damage to a frame a later one
+follows is corruption, reported and never truncated (§3.2). An answer decided without
+writing rests on what it was decided on, and waits for it: a second delete of a chunk an
+unconfirmed delete removed, a retry of a write not yet confirmed, a refusal of bytes that
+differ from them. So while any request is held, every answer decided without writing is held
+behind it, and one decided on a request earlier in its own batch stands only if that request
+is written, `Busy` otherwise. A batch that writes no frame confirms at once, so no answer
+waits longer than a batch while requests that write nothing keep coming. Deletes come from the reclaimer, a layer
 below any client's request, so the second flush they wait for costs no client latency. Until the flush, a batch's
 writes reach the device in any order however they are issued. Issuing the frame after the
 records made a 32 MiB batch a fifth slower, and issuing it beside them costs nothing
@@ -217,8 +229,9 @@ its needle index [HAY §3.4]. Its size is bounded by the volume's chunk budget; 
 the budget is refused with `Full`, never an allocation failure.
 
 Recovery must not scan the device [HAY §3.5: the index file]. The loop writes the whole
-index into the log as a checkpoint, then records it in the superblock (alternating A/B);
-log space before the checkpoint is then free. It checkpoints when the log could not
+index into the log as a checkpoint, then records it in the superblock (alternating A/B),
+with the LSNs of its first frame and of the frame after its last; log space before the
+checkpoint is then free. It checkpoints when the log could not
 otherwise hold more: before a batch, if the live log, the batch's frame, a wrap and a
 checkpoint of the index as the batch may leave it would not fit in `L`.
 
@@ -255,7 +268,8 @@ availability target to set the budget from.
 1. Read both superblocks; take the valid one with the higher sequence. Sequences and
    incarnations resume above its reservations (§4).
 2. Load the checkpoint it names and replay index frames in LSN order to the end of the
-   log (§3.2 torn-versus-corrupt rule).
+   log (§3.2 torn-versus-corrupt rule). A replay that ends inside the checkpoint met damage
+   and the volume refuses to open.
 3. Check the last batch. Its flush may not have completed, and a record whose data does not
    verify may be torn; it may as well be an acknowledged record damaged since, or read wrong,
    and nothing after the batch tells the two apart, as a later frame would for an earlier
@@ -358,7 +372,12 @@ records to the cleaner's stream (sorted by age), and frees the segment once the 
 durable and indexed. Victims of live fraction `u` free `1 − u` segments each [RO92 §3.4],
 so a net gain is due once they have held a segment's worth of dead space beyond what
 packing their live data costs; a pass that gains nothing by then stops, and cleaning waits
-until more data is deleted. A segment whose dead bytes do not pay for packing its live data
+until more data is deleted. A pass's gain is the victims it frees less the segments its
+relocations open, counted by the writer; the change in free segments over the pass counts
+client writes as well, and a pass that freed a segment while a client opened one read as
+futile, which answers writes `Full` while space could be reclaimed. The cleaner has the
+writer free its victims with a request of its own; it used to delete a key it took no
+client to use, and deleted a client's chunk stored under it. A segment whose dead bytes do not pay for packing its live data
 is no victim at all: cleaning it only moves its data, and a volume filled in chunks of
 nearly a segment each, whose only dead bytes are padding, was cleaned victim after victim
 for nothing. A pass that finds no victim is futile as one that gains nothing is (audit P06).

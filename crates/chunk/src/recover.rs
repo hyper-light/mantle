@@ -2,9 +2,10 @@
 //!
 //! Recovery replays the index log from the checkpoint the superblock names, frame by frame
 //! in LSN order, to the first frame that is not there. It then decides whether that frame is
-//! the torn tail of a crash or damage to acknowledged state: if any valid frame with a later
-//! LSN exists anywhere in the log, the log was damaged, which a crash cannot cause, and the
-//! volume refuses to open (Alagappan et al., FAST 2018, §3.3.3). The records of the last
+//! the torn tail of a crash or damage to acknowledged state: if it lies within the checkpoint,
+//! whose end the superblock records, or any valid frame of a later flush group exists anywhere
+//! in the log, the log was damaged, which a crash cannot cause, and the volume refuses to open
+//! (Alagappan et al., FAST 2018, §3.3.3). The records of the last
 //! replayed batch are read back, because that batch's flush may not have completed and its
 //! frame can reach the disk before its data. Finally it rolls forward through each open
 //! segment past the last indexed record, adding every record that verifies (Rosenblum and
@@ -152,7 +153,7 @@ pub(crate) fn recover<F: BlockFile>(
         }
     }
     report.frames = frames;
-    if later_frame_exists(&mut log, geometry, lsn)? {
+    if lsn < sb.end_lsn || later_frame_exists(&mut log, geometry, lsn)? {
         return Err(ChunkError::CorruptLog { lsn });
     }
 

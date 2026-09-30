@@ -25,7 +25,6 @@ use mantle_disk::block::BlockFile;
 
 use crate::error::ChunkError;
 use crate::frame::SegmentState;
-use crate::key::ChunkKey;
 use crate::record::{FLAG_FINAL, Payload};
 use crate::recover::{Identity, verify_at};
 use crate::writer::{CLEANER_RESERVE, Move, Op, Request, Shared};
@@ -148,7 +147,19 @@ impl<F: BlockFile> Cleaner<F> {
             .map_err(|_| ChunkError::Fenced)?;
         let mut report = CleanReport::default();
         let mut tried = HashSet::new();
-        let start = self.free();
+        // What the pass gains: the victims it frees, less the segments its relocations open.
+        // Not the change in free segments, which client writes during the pass spend as well:
+        // a pass that freed space would look futile, and futility answers writes `Full`.
+        let spent_before = self.shared.clean_opened.load(Ordering::Relaxed);
+        let mut freed = 0u64;
+        let gained = |freed: u64| {
+            let spent = self
+                .shared
+                .clean_opened
+                .load(Ordering::Relaxed)
+                .saturating_sub(spent_before);
+            freed.saturating_sub(spent)
+        };
         let size = self.shared.geometry.segment_size;
         // Space the victims cleaned so far should give back once their live data is packed.
         let mut due = 0u64;
@@ -158,6 +169,7 @@ impl<F: BlockFile> Cleaner<F> {
             };
             tried.insert(victim);
             let live = self.live(victim);
+            let incarnation = self.incarnation(victim);
             let started = Instant::now();
             let (relocated, corrupt) = self.clean(victim)?;
             report.segments = report.segments.saturating_add(1);
@@ -165,17 +177,21 @@ impl<F: BlockFile> Cleaner<F> {
             report.corrupt = report.corrupt.saturating_add(corrupt);
             // The writer frees a segment in the batch after the one that emptied it.
             self.flush()?;
+            // Freed, and perhaps opened again since by another batch.
+            if self.incarnation(victim) != incarnation {
+                freed = freed.saturating_add(1);
+            }
             self.learn(started.elapsed());
             // Victims of live fraction u free 1 − u segments each (Rosenblum and Ousterhout,
             // TOCS 1992, §3.4), so a net gain is due once they have held a segment's worth of
             // dead space, after ⌈1/(1 − ū)⌉ of them (docs/research/11 §10.3), less what packing
             // their live data costs. None by then means it packs no tighter, and the pass stops.
             due = due.saturating_add(self.gain(live));
-            if due >= size && self.free() <= start {
+            if due >= size && gained(freed) == 0 {
                 break;
             }
         }
-        report.gained = u32::try_from(self.free().saturating_sub(start)).unwrap_or(u32::MAX);
+        report.gained = u32::try_from(gained(freed)).unwrap_or(u32::MAX);
         Ok(report)
     }
 
@@ -190,6 +206,16 @@ impl<F: BlockFile> Cleaner<F> {
         let batch = u64::try_from(self.batch_bytes).unwrap_or(u64::MAX).max(1);
         let packing = live.div_ceil(batch).saturating_add(1).saturating_mul(block);
         size.saturating_sub(live).saturating_sub(packing)
+    }
+
+    /// The incarnation of `segment`, or none while it is free.
+    fn incarnation(&self, segment: u32) -> Option<u64> {
+        self.shared.usage.read().ok().and_then(|usage| {
+            usage
+                .get(segment)
+                .filter(|s| s.state != SegmentState::Free)
+                .map(|s| s.incarnation)
+        })
     }
 
     /// Live bytes of `segment`.
@@ -351,20 +377,13 @@ impl<F: BlockFile> Cleaner<F> {
         Ok(count)
     }
 
-    /// Submits a request that writes nothing, so the writer runs a batch and frees empty
-    /// segments.
+    /// Has the writer run a batch that frees the segments left empty, and waits for it.
     fn flush(&self) -> Result<(), ChunkError> {
         let (reply, answer) = sync_channel(1);
         self.shared.submitted.fetch_add(1, Ordering::AcqRel);
         self.submit
             .send(Request {
-                op: Op::Delete {
-                    key: ChunkKey {
-                        block: 0,
-                        epoch: u32::MAX,
-                        index: u16::MAX,
-                    },
-                },
+                op: Op::Free,
                 reply,
                 queued: None,
             })

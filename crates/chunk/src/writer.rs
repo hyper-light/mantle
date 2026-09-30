@@ -85,6 +85,10 @@ pub(crate) enum Op {
     },
     /// Writes the whole index into the log after the batch it arrives in.
     Checkpoint,
+    /// Runs a batch that writes nothing of its own, so sealed segments left with nothing
+    /// live are freed in its frame; answered once that frame is durable. The cleaner sends
+    /// it after each victim.
+    Free,
 }
 
 /// One fragment the cleaner moves.
@@ -130,6 +134,12 @@ impl Queue {
         self.requests = self.requests.saturating_sub(1);
         self.bytes = self.bytes.saturating_sub(bytes);
     }
+
+    /// Requests queued and not yet taken by the writer.
+    #[cfg(test)]
+    pub fn requests(&self) -> usize {
+        self.requests
+    }
 }
 
 /// What readers, the writer and the cleaner share.
@@ -153,6 +163,11 @@ pub(crate) struct Shared<F> {
     pub futile_at: std::sync::atomic::AtomicU64,
     /// Requests submitted to the writer so far, counted just before each is sent.
     pub submitted: std::sync::atomic::AtomicU64,
+    /// Segments the cleaner's stream has opened since the volume opened: the free space
+    /// cleaning spends, which the cleaner weighs against the victims it frees. Client writes
+    /// spend free space during a pass too, so the free count alone does not say what the
+    /// pass gained.
+    pub clean_opened: std::sync::atomic::AtomicU64,
     /// Checkpoints written since the volume opened.
     pub checkpoints: std::sync::atomic::AtomicU64,
     /// The room client requests hold in the writer's queue.
@@ -202,9 +217,10 @@ pub(crate) struct Writer<F: BlockFile> {
     pub anticipation: Anticipation,
     /// Requests received from the queue so far.
     pub received: u64,
-    /// The deletes of the last batch, whose frame is durable, answered once a later frame
-    /// is: at most one batch's requests.
-    pub unconfirmed: Vec<Reply>,
+    /// Answers held until a later frame confirms the last batch's: its deletes and the puts
+    /// in segments it opened, and every answer that rests on them (`Writer::settle`). At most
+    /// one batch's requests and the next one's.
+    pub unconfirmed: Vec<Held>,
 }
 
 /// A chunk as the batch being validated sees it: the index plus earlier requests in the batch.
@@ -233,6 +249,8 @@ enum Decision {
     /// Relocate the moves at these positions; the others' chunks changed.
     Relocate(Vec<usize>),
     Delete,
+    /// Free what the batch can (`Op::Free`).
+    Free,
     /// Nothing to write: the request is already satisfied (a retry, a relocation of a chunk
     /// that changed, or deleting nothing).
     Done,
@@ -241,6 +259,18 @@ enum Decision {
 struct Accepted {
     request: Request,
     decision: Decision,
+}
+
+/// An answer held until what it rests on is durable and confirmed.
+pub(crate) type Held = (Reply, Result<(), ChunkError>);
+
+/// A request validation answered without writing, and what its answer rests on.
+struct Answered {
+    reply: Reply,
+    result: Result<(), ChunkError>,
+    /// The accepted request of this batch that last changed the chunk, when the answer was
+    /// decided on that change: the answer stands only if it is written.
+    leader: Option<usize>,
 }
 
 /// One contiguous run of one segment written by this batch: where it starts and ends, and
@@ -276,6 +306,8 @@ struct Layout {
     positions: HashMap<u32, u64>,
     /// Segments this batch opened, with their incarnations.
     opened: Vec<(u32, u64)>,
+    /// How many of them the cleaner's stream opened.
+    clean_opened: u64,
     sealed: Vec<(u32, u32)>,
     freed: Vec<u32>,
     opens: [Option<u32>; 2],
@@ -356,6 +388,9 @@ impl Layout {
         });
         self.positions.insert(next, block);
         self.opened.push((next, self.incarnation));
+        if stream == Stream::Clean {
+            self.clean_opened = self.clean_opened.saturating_add(1);
+        }
         if let Some(o) = self.opens.get_mut(slot) {
             *o = Some(next);
         }
@@ -447,11 +482,19 @@ impl<F: BlockFile> Writer<F> {
                     reply(request, Err(ChunkError::Fenced));
                 }
             } else {
+                let lsn = self.cursor.lsn;
                 self.process(batch);
+                // A batch that wrote no frame confirmed nothing: its requests may have been
+                // retries or deletes of nothing, and while such requests keep coming the
+                // queue is never empty. The held answers get their frame now, so none waits
+                // longer than one batch (audit S15).
+                if self.cursor.lsn == lsn {
+                    self.confirm();
+                }
                 self.poke_cleaner();
             }
             if self.shared.fenced.load(Ordering::Acquire) {
-                for tx in std::mem::take(&mut self.unconfirmed) {
+                for (tx, _) in std::mem::take(&mut self.unconfirmed) {
                     answer(tx, Err(ChunkError::Fenced));
                 }
             }
@@ -538,21 +581,49 @@ impl<F: BlockFile> Writer<F> {
             }
         };
         let mut first = result.err();
-        for tx in std::mem::take(&mut self.unconfirmed) {
+        for (tx, held) in std::mem::take(&mut self.unconfirmed) {
             match first.take() {
                 Some(e) => answer(tx, Err(e)),
                 None if self.shared.fenced.load(Ordering::Acquire) => {
                     answer(tx, Err(ChunkError::Fenced));
                 }
-                None => answer(tx, Ok(())),
+                None => answer(tx, held),
             }
         }
     }
 
-    /// The last batch's frame has a later one, durable: its deletes are answered.
+    /// The last batch's frame has a later one, durable: the answers held for it go out.
     fn confirmed(&mut self) {
-        for tx in std::mem::take(&mut self.unconfirmed) {
-            answer(tx, Ok(()));
+        for (tx, held) in std::mem::take(&mut self.unconfirmed) {
+            answer(tx, held);
+        }
+    }
+
+    /// Answers requests validation decided without writing whose answers had to wait for the
+    /// batch (`validate`). An answer decided on a change earlier in the batch stands only if
+    /// that change was written: otherwise nothing was, and the request is to be retried. Any
+    /// answer decided while changes are unconfirmed rests on them, as a delete of a chunk an
+    /// unconfirmed delete removed does, or a refusal of a put that differs from an
+    /// unconfirmed one, and is held with them.
+    fn settle(&mut self, answered: Vec<Answered>, written: &[bool]) {
+        for Answered {
+            reply,
+            result,
+            leader,
+        } in answered
+        {
+            let result = if self.shared.fenced.load(Ordering::Acquire) {
+                Err(ChunkError::Fenced)
+            } else if leader.is_some_and(|i| !written.get(i).copied().unwrap_or(false)) {
+                Err(ChunkError::Busy)
+            } else {
+                result
+            };
+            if self.unconfirmed.is_empty() || matches!(result, Err(ChunkError::Fenced)) {
+                answer(reply, result);
+            } else {
+                self.unconfirmed.push((reply, result));
+            }
         }
     }
 
@@ -643,15 +714,17 @@ impl<F: BlockFile> Writer<F> {
 
     /// Validates and commits the batch's writes, deletes and relocations.
     fn handle(&mut self, batch: Vec<Request>) {
-        let accepted = match self.validate(batch) {
-            Ok(accepted) => accepted,
+        let (accepted, answered) = match self.validate(batch) {
+            Ok(validated) => validated,
             Err(()) => return,
         };
         let reclaimable = self.segments.reclaimable().next().is_some();
-        if accepted.is_empty() && !reclaimable {
-            return;
-        }
-        self.commit(accepted);
+        let written = if accepted.is_empty() && !reclaimable {
+            Vec::new()
+        } else {
+            self.commit(accepted)
+        };
+        self.settle(answered, &written);
     }
 
     /// Reads the durable fragment `f` of `key` and compares its bytes with `bytes`.
@@ -682,8 +755,11 @@ impl<F: BlockFile> Writer<F> {
         }
     }
 
-    /// Answers requests that need no write, refuses invalid ones, and returns the rest.
-    fn validate(&mut self, batch: Vec<Request>) -> Result<Vec<Accepted>, ()> {
+    /// Answers requests that need no write, refuses invalid ones, and returns the rest, with
+    /// the answers that must wait for the batch: those decided on a change earlier in it, and
+    /// any decided while the last batch is unconfirmed (`settle`). The rest rest on the index
+    /// alone, durable and confirmed, and go out at once.
+    fn validate(&mut self, batch: Vec<Request>) -> Result<(Vec<Accepted>, Vec<Answered>), ()> {
         let index = match self.shared.index.read() {
             Ok(index) => index,
             Err(_) => {
@@ -699,6 +775,9 @@ impl<F: BlockFile> Writer<F> {
         let mut views: HashMap<ChunkKey, Option<View>> = HashMap::new();
         let mut added: u64 = 0;
         let mut accepted = Vec::with_capacity(batch.len());
+        let mut answered = Vec::new();
+        // The position in `accepted` of the last write or delete of each chunk.
+        let mut changed_by: HashMap<ChunkKey, usize> = HashMap::new();
         let view_of = |views: &mut HashMap<ChunkKey, Option<View>>, key: &ChunkKey| {
             views
                 .entry(*key)
@@ -714,6 +793,10 @@ impl<F: BlockFile> Writer<F> {
                 .clone()
         };
         for request in batch {
+            let key = match &request.op {
+                Op::Write { key, .. } | Op::Delete { key } => Some(*key),
+                Op::Relocate { .. } | Op::Checkpoint | Op::Free => None,
+            };
             let decision = match &request.op {
                 Op::Write {
                     key,
@@ -857,16 +940,33 @@ impl<F: BlockFile> Writer<F> {
                         Ok(Decision::Relocate(current))
                     }
                 }
+                Op::Free => Ok(Decision::Free),
                 // Taken out of the batch before validation (`process`).
                 Op::Checkpoint => Ok(Decision::Done),
             };
-            match decision {
-                Ok(Decision::Done) => reply(request, Ok(())),
-                Ok(decision) => accepted.push(Accepted { request, decision }),
-                Err(e) => reply(request, Err(e)),
+            let result = match decision {
+                Ok(Decision::Done) => Ok(()),
+                Ok(decision) => {
+                    if let (Some(key), Decision::Write(_) | Decision::Delete) = (key, &decision) {
+                        changed_by.insert(key, accepted.len());
+                    }
+                    accepted.push(Accepted { request, decision });
+                    continue;
+                }
+                Err(e) => Err(e),
+            };
+            let leader = key.and_then(|k| changed_by.get(&k).copied());
+            if leader.is_none() && self.unconfirmed.is_empty() {
+                reply(request, result);
+            } else {
+                answered.push(Answered {
+                    reply: request.reply,
+                    result,
+                    leader,
+                });
             }
         }
-        Ok(accepted)
+        Ok((accepted, answered))
     }
 
     /// Where a batch of `requests` requests placing at most `records` records can go.
@@ -922,6 +1022,7 @@ impl<F: BlockFile> Writer<F> {
             regions: Vec::new(),
             positions: HashMap::new(),
             opened: Vec::new(),
+            clean_opened: 0,
             sealed: Vec::new(),
             freed,
             opens,
@@ -932,8 +1033,9 @@ impl<F: BlockFile> Writer<F> {
         }
     }
 
-    /// Lays out, writes, flushes, publishes and answers one batch.
-    fn commit(&mut self, accepted: Vec<Accepted>) {
+    /// Lays out, writes, flushes, publishes and answers one batch, and says which of the
+    /// accepted requests it wrote.
+    fn commit(&mut self, accepted: Vec<Accepted>) -> Vec<bool> {
         let records = accepted
             .iter()
             .map(|a| match &a.decision {
@@ -945,11 +1047,20 @@ impl<F: BlockFile> Writer<F> {
         let mut layout = self.layout(accepted.len(), records);
         let mut sequence = self.sequence;
         let mut ok: Vec<Reply> = Vec::with_capacity(accepted.len());
-        // Deletes, answered once a later frame confirms this batch's (`confirm`).
-        let mut deletes: Vec<Reply> = Vec::new();
+        // Answered once a later frame confirms this batch's (`confirm`): deletes, which live
+        // only in the frame, and puts in segments the batch opens, which recovery finds only
+        // through the frame's record of the opening, since it rolls forward through open
+        // segments alone.
+        let mut held: Vec<Reply> = Vec::new();
+        let mut written = vec![false; accepted.len()];
         let mut payloads: Vec<Payload> = Vec::with_capacity(accepted.len());
         let shift = self.shared.checksum_shift;
-        for Accepted { request, decision } in accepted {
+        for (i, Accepted { request, decision }) in accepted.into_iter().enumerate() {
+            let mut wrote = || {
+                if let Some(w) = written.get_mut(i) {
+                    *w = true;
+                }
+            };
             let Request { op, reply: tx, .. } = request;
             match (op, decision) {
                 (
@@ -975,8 +1086,14 @@ impl<F: BlockFile> Writer<F> {
                     let index = payloads.len().saturating_sub(1);
                     match place_record(&mut layout, Stream::Client, shift, &put, &payloads, index) {
                         Ok(record) => {
+                            let opened = layout.opened.iter().any(|&(s, _)| s == record.segment);
                             layout.records.push(LogRecord::Put(record));
-                            ok.push(tx);
+                            wrote();
+                            if opened {
+                                held.push(tx);
+                            } else {
+                                ok.push(tx);
+                            }
                         }
                         // No free segment for the client: while cleaning can free one, the
                         // put is to be retried, not refused for good.
@@ -1018,7 +1135,10 @@ impl<F: BlockFile> Writer<F> {
                         }
                     }
                     match result {
-                        Ok(()) => ok.push(tx),
+                        Ok(()) => {
+                            wrote();
+                            ok.push(tx);
+                        }
                         Err(e) => answer(tx, Err(e)),
                     }
                 }
@@ -1029,17 +1149,25 @@ impl<F: BlockFile> Writer<F> {
                         sequence,
                         time_ns: layout.now,
                     }));
-                    deletes.push(tx);
+                    wrote();
+                    held.push(tx);
                 }
-                _ => answer(tx, Ok(())),
+                (Op::Free, Decision::Free) => ok.push(tx),
+                _ => {
+                    self.fence();
+                    answer(
+                        tx,
+                        Err(ChunkError::Internal("a request and its decision disagree")),
+                    );
+                }
             }
         }
-        if ok.is_empty()
-            && deletes.is_empty()
-            && layout.freed.is_empty()
-            && layout.sealed.is_empty()
-        {
-            return;
+        // Nothing placed, sealed or freed: no frame, and a free has nothing to wait for.
+        if layout.records.is_empty() {
+            for tx in ok {
+                answer(tx, Ok(()));
+            }
+            return written;
         }
 
         let result = self
@@ -1050,19 +1178,24 @@ impl<F: BlockFile> Writer<F> {
             Err(e) => {
                 self.fence();
                 let mut first = Some(e);
-                for tx in ok.into_iter().chain(deletes) {
+                for tx in ok.into_iter().chain(held) {
                     answer(tx, Err(first.take().unwrap_or(ChunkError::Fenced)));
                 }
+                vec![false; written.len()]
             }
             Ok(()) => {
                 self.incarnation = layout.incarnation;
                 self.sequence = sequence;
+                self.shared
+                    .clean_opened
+                    .fetch_add(layout.clean_opened, Ordering::Relaxed);
                 for tx in ok {
                     answer(tx, Ok(()));
                 }
                 // This batch's frame, durable, confirms the last one's.
                 self.confirmed();
-                self.unconfirmed = deletes;
+                self.unconfirmed = held.into_iter().map(|tx| (tx, Ok(()))).collect();
+                written
             }
         }
     }
@@ -1382,6 +1515,7 @@ impl<F: BlockFile> Writer<F> {
         superblock.sequence = superblock.sequence.saturating_add(1);
         superblock.start_lsn = begin_lsn;
         superblock.start_pos = begin_pos;
+        superblock.end_lsn = self.cursor.lsn;
         write_superblock(&self.shared.file, &superblock)?;
         self.shared.file.sync_data().map_err(ChunkError::Device)?;
         self.superblock = superblock;
@@ -1587,7 +1721,7 @@ fn request_bytes(request: &Request) -> usize {
     match &request.op {
         Op::Write { payload, .. } => payload.data.len(),
         Op::Relocate { moves } => moves.iter().map(|m| m.payload.data.len()).sum(),
-        Op::Delete { .. } | Op::Checkpoint => 0,
+        Op::Delete { .. } | Op::Checkpoint | Op::Free => 0,
     }
 }
 

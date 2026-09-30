@@ -9,7 +9,7 @@
 use mantle_codec::{Reader, Writer};
 
 pub const MAGIC: [u8; 8] = *b"MNTLVOL1";
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// Superblock A's offset.
 pub const OFFSET_A: u64 = 0;
@@ -37,6 +37,11 @@ pub struct Superblock {
     pub start_lsn: u64,
     /// That frame's byte position within the log region.
     pub start_pos: u64,
+    /// The LSN after the checkpoint's last frame. The superblock is written only once the
+    /// whole checkpoint is durable, so a replay that stops short of it met damage, not a torn
+    /// tail: the checkpoint's frames share one flush group, and no later group need follow
+    /// them to show it.
+    pub end_lsn: u64,
     /// Every record sequence and segment incarnation issued so far is at most these. They
     /// are raised here before any record uses a higher number, and recovery resumes above
     /// them, so no number that might still be on the device is issued twice.
@@ -65,6 +70,7 @@ impl Superblock {
         w.u64(self.data_offset);
         w.u64(self.start_lsn);
         w.u64(self.start_pos);
+        w.u64(self.end_lsn);
         w.u64(self.sequence_limit);
         w.u64(self.incarnation_limit);
         let body = size.saturating_sub(4);
@@ -108,6 +114,7 @@ impl Superblock {
             data_offset: r.u64()?,
             start_lsn: r.u64()?,
             start_pos: r.u64()?,
+            end_lsn: r.u64()?,
             sequence_limit: r.u64()?,
             incarnation_limit: r.u64()?,
         };
@@ -144,6 +151,7 @@ mod tests {
             data_offset: 2 << 20,
             start_lsn: 1,
             start_pos: 0,
+            end_lsn: 3,
             sequence_limit: 1 << 24,
             incarnation_limit: 1 << 16,
         }

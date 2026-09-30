@@ -108,7 +108,18 @@ share's interval when there are two states, and latency quantiles over the state
 transfers; and, on the first row, whether the rounds persist or alternate. A state without an
 interval shows a dash. No mean or coefficient of variation is reported (21 §9.6).
 
-## 7. Open
+## 7. What a transfer is timed against
+
+A measurement job's time runs from when its first worker begins work, once every worker's
+thread has started, to when its last worker ends; starting and joining up to 256 threads,
+which a job's timing included, is outside it, and the budget counts from the same start
+(audit P09). Every block a write job sends differs from every other, a fresh random word at
+the head of each of the device's blocks, stamped before the write is timed, so a device that
+compresses or deduplicates is measured writing what mantle's data would make it write, and
+making the payload is not charged to the device. Before, each worker wrote one buffer again
+and again.
+
+## 8. Open
 
 - **Where states change in time.** Rounds found ordered are reported without an interval; the
   rounds at which a state begins and ends are not located. Changepoint segmentation, as Barrett
@@ -127,3 +138,10 @@ interval shows a dash. No mean or coefficient of variation is reported (21 §9.6
 - **Calibration** still judges its points by the mean's t-interval over three to six
   half-second rounds, what its budget of tens of seconds allows; the judgment here needs ten
   rounds a point.
+- **The backend and the workload measured** (audit P09). Depth is a thread per transfer in
+  flight, the portable path; a platform's asynchronous interface (io_uring, IOCP) issuing the
+  same transfers is not yet measured against it. Calibration measures homogeneous points,
+  reads or writes alone, a first write and an overwrite; reads during durable writes, a
+  cleaner or scrubber beside the foreground, and a device near full are not measured, and
+  the foreground depth and background budgets that should follow from them are not derived
+  yet.

@@ -6,9 +6,15 @@
 //! positional I/O, which is how the portable I/O path issues it; a measurement describes
 //! the path mantle will use, not the device in the abstract.
 //!
-//! Write payloads are pseudo-random: some devices compress or deduplicate, and zero or
-//! repeated buffers would measure that instead of the medium.
+//! Write payloads are pseudo-random, and every block a job writes differs from every other:
+//! some devices compress or deduplicate, and zero or repeated buffers would measure that
+//! instead of the medium. Each write's blocks are stamped afresh before it is timed, so making
+//! the payload costs nothing the device is charged for (audit P09).
+//!
+//! A job's time runs from when its workers begin work to when the last ends: starting and
+//! joining their threads is outside it (audit P09).
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -151,18 +157,17 @@ pub fn run(file: &DeviceFile, job: &Job) -> Result<JobResult, DiskError> {
         return Err(invalid("a job needs a budget or an operation count"));
     }
 
-    let started = Instant::now();
     let shared = Shared {
         file,
         job,
         block,
         slots,
-        deadline: job.budget.and_then(|budget| started.checked_add(budget)),
+        began: OnceLock::new(),
         next: AtomicU64::new(0),
         issued: AtomicU64::new(0),
     };
 
-    type Outcomes = Vec<Result<(u64, Histogram), DiskError>>;
+    type Outcomes = Vec<Result<Worked, DiskError>>;
     let outcomes: Result<Outcomes, std::io::Error> = std::thread::scope(|scope| {
         let handles = crate::workers::spawn_all(scope, job.depth, |worker| {
             let shared = &shared;
@@ -184,15 +189,19 @@ pub fn run(file: &DeviceFile, job: &Job) -> Result<JobResult, DiskError> {
         path: file.path().to_path_buf(),
         source,
     })?;
-    let elapsed = started.elapsed();
-
     let mut latency = Histogram::new();
     let mut ops = 0u64;
+    let mut ended: Option<Instant> = None;
     for outcome in outcomes {
-        let (worker_ops, hist) = outcome?;
-        ops = ops.saturating_add(worker_ops);
-        latency.merge(&hist);
+        let worked = outcome?;
+        ops = ops.saturating_add(worked.ops);
+        latency.merge(&worked.latency);
+        ended = ended.max(Some(worked.ended));
     }
+    let elapsed = match (shared.began.get(), ended) {
+        (Some(began), Some(ended)) => ended.saturating_duration_since(*began),
+        _ => Duration::ZERO,
+    };
     Ok(JobResult {
         ops,
         bytes: ops.saturating_mul(block),
@@ -201,13 +210,21 @@ pub fn run(file: &DeviceFile, job: &Job) -> Result<JobResult, DiskError> {
     })
 }
 
+/// What one worker did: its transfers, their latencies, and when it stopped.
+struct Worked {
+    ops: u64,
+    latency: Histogram,
+    ended: Instant,
+}
+
 /// What every worker of one job reads.
 struct Shared<'a> {
     file: &'a DeviceFile,
     job: &'a Job,
     block: u64,
     slots: u64,
-    deadline: Option<Instant>,
+    /// When the first worker began work, which starts the job's time and its budget.
+    began: OnceLock<Instant>,
     /// The next sequential slot.
     next: AtomicU64,
     /// Operations claimed so far, across workers.
@@ -215,7 +232,7 @@ struct Shared<'a> {
 }
 
 impl Shared<'_> {
-    fn work(&self, seed: u64) -> Result<(u64, Histogram), DiskError> {
+    fn work(&self, seed: u64) -> Result<Worked, DiskError> {
         let (file, job) = (self.file, self.job);
         let mut rng = SplitMix64::new(seed);
         let mut buf = AlignedBuf::zeroed(job.block, file.alignment())?;
@@ -223,16 +240,27 @@ impl Shared<'_> {
             rng.fill(buf.as_mut_capacity());
         }
         buf.set_len(job.block)?;
+        let unit = file.alignment().get();
         let mut hist = Histogram::new();
         let mut ops = 0u64;
+        let began = *self.began.get_or_init(Instant::now);
+        let deadline = job.budget.and_then(|budget| began.checked_add(budget));
         loop {
             // Claim an operation before issuing it, so the job never exceeds max_ops.
             if self.issued.fetch_add(1, Ordering::Relaxed) >= job.max_ops
-                || self
-                    .deadline
-                    .is_some_and(|deadline| Instant::now() >= deadline)
+                || deadline.is_some_and(|deadline| Instant::now() >= deadline)
             {
                 break;
+            }
+            if job.pattern.writes() {
+                // A fresh random word at the head of each of the device's blocks: no block
+                // this job writes repeats another, and all stay incompressible.
+                for block in buf.as_mut_slice().chunks_mut(unit) {
+                    let word = rng.next_u64().to_le_bytes();
+                    for (dst, src) in block.iter_mut().zip(word) {
+                        *dst = src;
+                    }
+                }
             }
             let slot = if job.pattern.random() {
                 rng.below(self.slots)
@@ -258,7 +286,11 @@ impl Shared<'_> {
             hist.record(nanos);
             ops = ops.saturating_add(1);
         }
-        Ok((ops, hist))
+        Ok(Worked {
+            ops,
+            latency: hist,
+            ended: Instant::now(),
+        })
     }
 }
 
@@ -327,6 +359,21 @@ mod tests {
         for block in back.as_mut_capacity().chunks(4096) {
             assert!(block.iter().any(|&b| b != 0), "a block was never written");
         }
+    }
+
+    /// No two blocks a job writes are alike, even the same block written again, so a device
+    /// that deduplicates stores every one (audit P09).
+    #[test]
+    fn every_block_written_is_distinct() {
+        let (_dir, file) = scratch(1 << 20);
+        let mut j = job(Pattern::SequentialWrite, 1, 512);
+        j.block = 8192;
+        run(&file, &j).unwrap();
+        let mut back = AlignedBuf::zeroed(1 << 20, file.alignment()).unwrap();
+        file.read_exact_at(back.as_mut_capacity(), 0).unwrap();
+        let blocks: std::collections::HashSet<&[u8]> =
+            back.as_mut_capacity().chunks(4096).collect();
+        assert_eq!(blocks.len(), (1 << 20) / 4096);
     }
 
     #[test]

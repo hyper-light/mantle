@@ -3,7 +3,7 @@
 //! that the engine takes the whole entry as one batch at its index.
 
 use crate::engine::Rows;
-use crate::error::MetaError;
+use crate::error::{MetaError, reserved};
 use crate::overlay::Overlay;
 use crate::session::{self, Check, Rules, Touched};
 use crate::wire::{Answer, Command, Entry};
@@ -31,7 +31,7 @@ pub fn apply_entry<R: Rows>(
         let mut overlay = Overlay::new(&*rows);
         session::expire(&mut overlay, index, entry.at_ns, rules)?;
         let mut touched = Touched::default();
-        let mut answers = Vec::with_capacity(entry.commands.len());
+        let mut answers = reserved(entry.commands.len())?;
         for (position, c) in entry.commands.iter().enumerate() {
             let answer = match &c.command {
                 // Registering may expire the session least recently used, which it finds by

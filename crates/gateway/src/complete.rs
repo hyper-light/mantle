@@ -152,7 +152,7 @@ impl Completion {
         {
             return Err(CompleteError::InvalidPart);
         }
-        let ascending = listed.windows(2).all(|w| matches!(w, [a, b] if a.0 < b.0));
+        let ascending = listed.array_windows::<2>().all(|[a, b]| a.0 < b.0);
         if listed.is_empty() || !ascending {
             return Err(CompleteError::InvalidPartOrder);
         }
@@ -306,7 +306,12 @@ impl Completion {
             }
         }
         let last = self.listed.len().saturating_sub(1);
-        let mut parts = Vec::with_capacity(self.listed.len());
+        // The list is the client's, already parsed and held; a reservation the allocator
+        // refuses is a completion too large to address, not an abort.
+        let mut parts = Vec::new();
+        parts
+            .try_reserve_exact(self.listed.len())
+            .map_err(|_| CompleteError::Overflow)?;
         for (i, (number, etag)) in self.listed.iter().enumerate() {
             let part = self.rows.get(number).ok_or(CompleteError::InvalidPart)?;
             if part.etag != *etag {
@@ -452,11 +457,23 @@ fn md5_of_hex(etag: &str) -> Option<[u8; 16]> {
     }
     let mut out = [0u8; 16];
     let (pairs, _) = hex.as_chunks::<2>();
-    for (byte, pair) in out.iter_mut().zip(pairs) {
-        let text = std::str::from_utf8(pair).ok()?;
-        *byte = u8::from_str_radix(text, 16).ok()?;
+    for (byte, [high, low]) in out.iter_mut().zip(pairs) {
+        *byte = hex_digit(*high)?
+            .checked_mul(16)?
+            .checked_add(hex_digit(*low)?)?;
     }
     Some(out)
+}
+
+/// One hexadecimal digit's value, either case; decoded by hand because `from_str_radix`
+/// panics on a radix outside 2..=36 and the lint cannot see the radix is a constant.
+fn hex_digit(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => c.checked_sub(b'0'),
+        b'a'..=b'f' => c.checked_sub(b'a')?.checked_add(10),
+        b'A'..=b'F' => c.checked_sub(b'A')?.checked_add(10),
+        _ => None,
+    }
 }
 
 /// The object's checksum from its parts', in the algorithm and form the upload named: the

@@ -1,6 +1,6 @@
 # Durability: the scheme a block is stored in
 
-Status: design, 2026-09-29. Sources: docs/research/15 (durability models, cited as
+Status: design, 2026-09-29; error bounds and field inputs 2026-09-30. Sources: docs/research/15 (durability models, cited as
 "15 §x") and docs/research/04 (erasure coding and placement, "04 §x").
 
 A block is stored as whole copies or as a Reed–Solomon code, one chunk to each failure
@@ -53,15 +53,12 @@ lost at λ and nothing repaired, is lost at 5/(6λ) on average, where spreading 
 survivors gave 2/(3λ). The tests check that case exactly, and check the chain over counts
 against one over labelled domains built by the same rules.
 
-The annual loss probability is 1 − e^(−t/M), for t a year and M the chain's mean time to
-loss, where loss is rare against repair: a stripe returns to whole many times before it is
-lost, and the time to loss is then close to exponential, to within the ratio of an
-excursion's length to M (Keilson; 15 §4.5). The law is taken where that ratio, the spare
-chunks' repair time over M, is within a thousandth, the precision the report keeps. Where it
-is not, as with slow repair or none, the probability is computed exactly by uniformization,
-whose terms are all non-negative (15 §4.4): without repair the time to loss is a sum of
-exponentials, and in the zone case above the law puts the loss within t at 1.2λt against an
-exact 3λ²t² when λt is small.
+The annual loss probability is the chain's transient: the whole state's entry for loss in
+e^(Qt), for t a year. It was once taken as 1 − e^(−t/M) for M the mean time to loss, where
+loss is rare against repair (Keilson; 15 §4.5), but that law is an approximation of stated
+order, not a bound, and without repair it is far off: in the zone case above it puts the loss
+within t at 1.2λt against an exact 3λ²t² when λt is small, and below the exact value past
+about 1.25 M. The probability is now computed as an enclosure (§3).
 
 ## 3. Solving it
 
@@ -77,6 +74,25 @@ of leaving is the sum of its exits, never one minus its self-loop.
 The result matches Ford's closed form for independent failures (15 §1.7) to 10⁻¹². It does
 so for one to five copies and for RS(2,1) to RS(9,6), at ratios of repair to failure from
 one to 10¹².
+
+**Decision: the loss probability is an enclosure, and the upper end is what is reported and
+compared with the target (audit B09b).** The transient is computed by scaling and squaring
+the uniformized series, every term non-negative, every operation rounded outward, the
+series' tail added to the upper end, and e^(−Λτ) enclosed as one over the weights' sum
+rather than by a library exponential whose precision the standard library leaves unstated.
+The exact probability of the chain lies between the two ends whatever the rates (15 §4.6
+proves it). The ends are within 2×10⁻¹³ of each other without repair, 1.6×10⁻⁹ with
+one-hour repair over a year, and grow in proportion to the repairs in the year: 8.4×10⁻⁴ at
+3.6 ms. A scheme is never chosen on rounding in its favour.
+
+The tests hold the enclosure to closed forms: the binomial tail without repair, from a
+billionth of a lifetime to ten; the two-copy chain with repair; the zone case above; and a
+bound proven for every chain, P(T ≤ t) ≤ q₀·p·t for q₀ the whole state's exit rate and p the
+chance a stay in it ends in loss (15 §4.6). Against the enclosure the exponential law was
+high by at most 7×10⁻⁴ at one-hour repair, so the results of §6 did not move in their two
+figures.
+
+Solving the chain exactly does not make the chain the fleet. What it leaves out is §5's.
 
 ## 4. The choice
 
@@ -94,31 +110,48 @@ code.
 ## 5. The rates
 
 The rates are inputs. They come from mantle's own measurements once device health records
-them (docs/research/10). Until then, the literature gives:
+them (docs/research/10). Until then, the field data of 15 §5 and §8 gives the defaults, each
+the conservative end of its source, in `mantle_ec::durability::field` (audit B09a):
 
-| Input | Value | Source |
-|---|---|---|
-| Disk annual failure rate | "2-4% common", 3.01% weighted average, up to 13% | Schroeder and Gibson (15 §5) |
-| Flash annual failure rate | 0.07–1.2% by model, 0.22% on average; about 1–2.6% a year from four-year replacement rates | Maneas et al.; Schroeder et al. 2016 (15 §5) |
-| Correlated loss | 1% of nodes lost in a yearly power outage, from reports of 0.5–1% | Cidon et al. (04 §A6.1) |
-| Repair | detection and rebuild of one chunk | measured repair bandwidth (04 §R3) |
+| Input | Default | Why this value | Source |
+|---|---|---|---|
+| Disk annual failure rate | 6.3% | The worst model in Backblaze's 2025 fleet, 4.6 times its 1.36% mean; a stripe's chunks can share a model and batch. Schroeder and Gibson's "2-4% common" and up to 13% bracket it | 15 §8.1 |
+| Flash annual failure rate | 2.7% | The worst four-year replacement fraction of Schroeder et al. (FAST 2016), 10.31%, as a constant hazard; above Maneas et al.'s worst model, 1.2% | 15 §8.2 |
+| Power loss | once a year, destroying 1% of nodes | HDFS: "one-half to one percent of the nodes will not survive a full power-on restart"; the once-a-year is Cidon's, UNVERIFIED at his cited source | 15 §8.4 |
+| Rack, zone or site loss | none | No fetched source gives a permanent-loss rate; Ford's and Dean's rack events are transient. A deployment states its own (`--zones`) | 15 §8.4 |
+| Repair | detection and rebuild of one chunk | measured repair bandwidth; Ford's mean exceeds 20 minutes | 04 §R3, 15 §8.4 |
 
-Failures cluster in time as well: two disks failing within an hour of each other are four
-times likelier than the exponential says (Schroeder and Gibson). In a RAID group, a second
-replacement follows a first within a week 180 times more often than at random (Maneas et
-al.). A chain with constant rates does not hold these; the burst events stand in for them.
+What the constant-rate chain leaves out, and where the sources show which way it errs
+(15 §8.5):
+
+- Failures cluster in time: two disks within an hour four times likelier than the
+  exponential, a second RAID-group replacement within a week 180 times likelier, shelf
+  failures 6 to 25 times likelier in pairs. The chain is optimistic for a second loss during
+  a rebuild; the burst events stand in for part of it. A stripe's chunks go to distinct
+  domains, so an enclosure named as a domain removes the shelf's share.
+- Hazard rises with age. The worst-model rate is pessimistic for a young fleet and may be
+  optimistic for one past its fourth year.
+- Latent sector errors found during a rebuild, and controller, cable and path failures, have
+  no state: optimistic unless the chunk rate is measured over the whole path, as
+  docs/research/10's device health will.
+- Repair is exponential and serial; after a burst it queues. Optimistic after bursts.
+- The burst rate and size distribution are unpublished, and no site-disaster rate exists.
+  These are what `--burst` and `--zones` take from the deployment.
 
 ## 6. What the model says
 
-These are the results of `mantle durability` with 4% annual failures, one-hour repair, and
-12 failure domains:
+These are the upper ends of the enclosures, one-hour repair (the test
+`the_design_tables_choices_hold` holds the field-default rows):
 
-| Case | Choice | Annual loss |
-|---|---|---|
-| Independent failures only | RS(6,3) | 1.1×10⁻¹⁴ |
-| With a yearly outage losing 1% of nodes (`--burst 1:1`) | none within 12 domains; RS(8,4) comes closest | 7.5×10⁻⁸ |
-| The same outage, 15 domains, target 10⁻⁹ | RS(9,6) | 6.1×10⁻¹¹ |
-| Three zones, each lost once a century (`--zones 3:0.01`) | R3, one copy a zone | 9.8×10⁻¹² |
+| Case | Domains | Choice | Annual loss at most |
+|---|---|---|---|
+| 4% annual failures, independent | 12 | RS(6,3) | 1.1×10⁻¹⁴ |
+| The same, with a yearly outage losing 1% of nodes (`--burst 1:1`) | 12 | none within 10⁻¹¹; RS(8,4) comes closest | 7.5×10⁻⁸ |
+| The same outage, target 10⁻⁹ | 15 | RS(9,6) | 6.1×10⁻¹¹ |
+| Three zones, each lost once a century (`--zones 3:0.01`) | 12 | R3, one copy a zone | 9.8×10⁻¹² |
+| Field defaults: 6.3% disks, independent | 12 | RS(6,3) | 7.1×10⁻¹⁴ |
+| Field defaults with the yearly power loss | 12 | none within 10⁻¹¹; RS(8,4) comes closest | 7.5×10⁻⁸ |
+| The same, target 10⁻⁹ | 15 | RS(9,6) | 6.1×10⁻¹¹ |
 
 In the zone case, RS(6,3) falls to 1.8×10⁻⁶: every zone holds three of its chunks.
 
@@ -131,7 +164,10 @@ margin left after one zone's loss.
 ## 7. Open
 
 - Rates from mantle's own device and node history, in place of the literature's
-  (docs/research/10).
+  (docs/research/10), over the whole path to a chunk, with its clustering in time: the
+  chain's constant rates are the least-qualified part of every number above (§5).
+- A permanent-loss rate for racks, zones and sites, and the burst frequency, which no
+  fetched source states.
 - Prioritized and parallel repair. Both raise durability, and Ford leaves both out (15 §1.4).
 - The copyset family that bounds the chance of losing any block in one event, beside this
   per-block probability (04 §A6.3, §R2).

@@ -641,7 +641,12 @@ fn code_point(digits: &str, radix: u32) -> Option<u32> {
     if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
         return None;
     }
-    u32::from_str_radix(digits, radix).ok()
+    // Every character is a digit of `radix`, so neither parse meets a sign.
+    let value = match radix {
+        16 => crate::sigv4::hex_value(digits.as_bytes())?,
+        _ => digits.parse::<u64>().ok()?,
+    };
+    u32::try_from(value).ok()
 }
 
 /// XML 1.0 [3] S.

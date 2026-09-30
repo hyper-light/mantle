@@ -10,7 +10,7 @@
 //! longest legal form bounds it (`MAX_LINE`).
 
 use crate::crypto::{self, CryptoError};
-use crate::sigv4::{AuthError, Chain, unhex};
+use crate::sigv4::{AuthError, Chain, hex_value, unhex};
 
 /// "The chunk size must be at least 8 KB ... except the last one" (S3 developer guide,
 /// Transfer Payload in Multiple Chunks; 05 §1.8). The rule also bounds the signature checks a
@@ -113,7 +113,7 @@ impl Decoder {
             declared,
             decoded: 0,
             state: State::Header,
-            line: Vec::with_capacity(MAX_LINE),
+            line: Vec::new(),
             hasher: None,
             signature: [0; 32],
             short: false,
@@ -128,7 +128,9 @@ impl Decoder {
             match self.state {
                 State::Data(left) => {
                     let take = usize::try_from(left).unwrap_or(usize::MAX).min(input.len());
-                    let (data, rest) = input.split_at(take);
+                    let (data, rest) = input
+                        .split_at_checked(take)
+                        .ok_or(ChunkError::Framing("a chunk's data overran its input"))?;
                     if let Some(hasher) = &mut self.hasher {
                         hasher.update(data)?;
                     }
@@ -214,8 +216,9 @@ impl Decoder {
                 "a chunk size is not 1 to 16 hex digits",
             ));
         }
-        let size = u64::from_str_radix(size, 16)
-            .map_err(|_| ChunkError::Framing("a chunk size is not hex"))?;
+        // RFC 9112 §7.1: chunk-size = 1*HEXDIG, so no sign.
+        let size =
+            hex_value(size.as_bytes()).ok_or(ChunkError::Framing("a chunk size is not hex"))?;
         self.signature = signature;
         self.hasher = match self.chain {
             Some(_) => Some(crypto::Digest::new(&crypto::SHA256)?),

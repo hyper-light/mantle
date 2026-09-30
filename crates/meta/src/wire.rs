@@ -107,7 +107,7 @@ impl Entry {
             if count > MAX_COMMANDS || count > r.remaining() / 25 {
                 return None;
             }
-            let mut commands = Vec::with_capacity(count);
+            let mut commands = crate::record::reserved(count)?;
             for _ in 0..count {
                 commands.push(Sessioned {
                     session: r.u64()?,
@@ -355,7 +355,7 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
             0 => {
                 let file = r.u128()?;
                 let count = bounded(r, 4)?;
-                let mut extents = Vec::with_capacity(count);
+                let mut extents = crate::record::reserved(count)?;
                 for _ in 0..count {
                     extents.push(Extent::decode(&record::take_bytes(r)?).ok()?);
                 }
@@ -372,7 +372,7 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
             1 => file::Command::Delete { file: r.u128()? },
             2 => {
                 let count = bounded(r, 16)?;
-                let mut files = Vec::with_capacity(count);
+                let mut files = crate::record::reserved(count)?;
                 for _ in 0..count {
                     files.push(r.u128()?);
                 }
@@ -381,7 +381,7 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
             3 => {
                 let file = r.u128()?;
                 let count = bounded(r, 24)?;
-                let mut blocks = Vec::with_capacity(count);
+                let mut blocks = crate::record::reserved(count)?;
                 for _ in 0..count {
                     blocks.push((r.u128()?, r.u64()?));
                 }
@@ -398,7 +398,7 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
                 let block = r.u128()?;
                 let header = BlockHeader::decode(&record::take_bytes(r)?).ok()?;
                 let count = bounded(r, 4)?;
-                let mut chunks = Vec::with_capacity(count);
+                let mut chunks = crate::record::reserved(count)?;
                 for _ in 0..count {
                     chunks.push(ChunkPlace::decode(&record::take_bytes(r)?).ok()?);
                 }
@@ -419,7 +419,7 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
             2 => block::Command::Delete { block: r.u128()? },
             3 => {
                 let count = bounded(r, 16)?;
-                let mut blocks = Vec::with_capacity(count);
+                let mut blocks = crate::record::reserved(count)?;
                 for _ in 0..count {
                     blocks.push(r.u128()?);
                 }
@@ -803,7 +803,7 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
             let preconditions = take_preconditions(r)?;
             // A listed part takes 22 bytes at least.
             let count = bounded(r, 22)?;
-            let mut parts = Vec::with_capacity(count);
+            let mut parts = crate::record::reserved(count)?;
             for _ in 0..count {
                 parts.push(name::Listed {
                     number: r.u16()?,
@@ -894,7 +894,7 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
         11 => {
             // Two strings' lengths, a file and a deadline at least.
             let count = bounded(r, 32)?;
-            let mut files = Vec::with_capacity(count);
+            let mut files = crate::record::reserved(count)?;
             for _ in 0..count {
                 files.push(name::Checked {
                     bucket: record::take_str(r)?,
@@ -907,7 +907,7 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
         }
         12 => {
             let count = bounded(r, 24)?;
-            let mut files = Vec::with_capacity(count);
+            let mut files = crate::record::reserved(count)?;
             for _ in 0..count {
                 files.push(name::Marked {
                     bucket: record::take_str(r)?,
@@ -1056,7 +1056,7 @@ fn take_match(r: &mut Reader<'_>) -> Option<Option<name::Match>> {
         1 => Some(name::Match::Any),
         2 => {
             let count = bounded(r, 4)?;
-            let mut tags = Vec::with_capacity(count);
+            let mut tags = crate::record::reserved(count)?;
             for _ in 0..count {
                 tags.push(record::take_str(r)?);
             }
@@ -1303,7 +1303,7 @@ fn put_verdicts(w: &mut Writer, verdicts: &[Verdict]) -> Result<(), RecordError>
 
 fn take_verdicts(r: &mut Reader<'_>) -> Option<Vec<Verdict>> {
     let count = bounded(r, 1)?;
-    let mut verdicts = Vec::with_capacity(count);
+    let mut verdicts = crate::record::reserved(count)?;
     for _ in 0..count {
         verdicts.push(match r.u8()? {
             0 => Verdict::Held,

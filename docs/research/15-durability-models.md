@@ -7,7 +7,8 @@ what a model of permanent loss needs:
 - the structure of Ford et al.'s Markov model, which note 04 summarizes but does not state;
 - the argument over MTTDL and the metrics that replace it;
 - how to solve such a chain without losing its digits;
-- the field failure rates that feed it;
+- the field failure rates that feed it, and what the chain leaves out of them (§8);
+- a guaranteed bound on the error of solving it (§4.6);
 - S3's own durability target.
 
 Compiled 2026-09-29. Each paper was fetched and read. Formulas were transcribed from pages
@@ -295,6 +296,81 @@ tiny beside the other rates, so elimination cancels.
 - Where the law does not hold, the transient is computed by uniformization, as §4.4 says:
   every term non-negative.
 
+### 4.6 A guaranteed enclosure of the transient (DERIVED; audit B09b)
+
+The law of §4.5 is an approximation whose error is "of the order of" a ratio, not a bound,
+and uniformization truncated at a relative tolerance (the method it replaced) bounds its tail
+only if the floating-point sums are exact. What follows states a bound that holds for every
+chain and every input, and is what `loss_bounds` computes.
+
+**Facts used.**
+
+- *Uniformization* (Jensen 1953; Grassmann, *Computers & Operations Research* 4:47–53, 1977;
+  Stewart, *Introduction to the Numerical Solution of Markov Chains*, Princeton 1994, §8.4):
+  for any Λ ≥ maxᵢ qᵢ, P = I + Q/Λ is stochastic and e^(Qt) = Σₙ e^(−Λt)(Λt)ⁿ/n! Pⁿ. Every
+  term is non-negative. (Standard; the texts were not re-fetched for this note.)
+- *Rounding* (IEEE 754-2019 §4.3.1, round to nearest): the computed result of +, ×, ÷ on
+  doubles lies within half a unit in the last place of the exact result, so the exact result
+  lies strictly between the neighbours `next_down` and `next_up` of the computed one (Rust
+  1.98 `f64::next_up`/`next_down`: "the least number greater than self", "the greatest
+  number less than self"). This holds in the subnormal range and when a positive result
+  underflows to zero.
+- *Sterbenz's lemma*: for y ∈ [½, 2], 1 − y is exact in floating point.
+
+**Lemma 1 (outward rounding).** Carry each non-negative quantity as [lo, hi]. Compute lo by
+the operation on the lower ends (on the upper end of a divisor) and step it down; hi by the
+operation on the upper ends (the lower end of a divisor) and step it up. Since +, × and ÷ by
+a positive number are monotone on non-negative numbers, the exact value stays inside at every
+step. 1 − y for y ∈ [lo, hi] ⊂ [0, 1] is enclosed by [1 − hi, 1 − lo], each stepped outward
+unless Sterbenz makes it exact. ∎
+
+**Lemma 2 (the series and its tail).** Let x = Λτ ≤ ½ and S_K = Σ_{n≤K} xⁿ/n! Pⁿ. Every
+Pⁿ is stochastic, so each entry of Σ_{n>K} xⁿ/n! Pⁿ is at most
+r_K = Σ_{n>K} xⁿ/n! ≤ (x^K/K!)·x/(K+1)·1/(1 − x/(K+2)) ≤ 2·(x^K/K!)·x/(K+1). With
+c_K = Σ_{n≤K} xⁿ/n!, e^x ∈ [c_K, c_K + r_K], so e^(−x) ∈ [1/(c_K + r_K), 1/c_K]. Hence,
+entrywise, S_K/(c_K + r_K) ≤ e^(Qτ) ≤ (S_K + r_K·J)/c_K on the transient rows, with J the
+matrix of ones, and the loss row is exactly the unit row. No library exponential is called;
+Rust's `exp` has "unspecified precision". ∎
+
+**Lemma 3 (squaring).** If 0 ≤ L ≤ E ≤ U entrywise then L² ≤ E² ≤ U² entrywise, as every
+entry of a product of non-negative matrices is monotone in every entry. Entries of the
+stochastic e^(Qτ) are at most 1, so U may be capped at 1. With τ = t/2ˢ, s squarings give
+e^(Qt) = (e^(Qτ))^(2ˢ) enclosed. ∎
+
+**Theorem.** The computed [lower, upper] for the whole state's entry of loss in e^(Qt) holds
+the chain's exact P(T ≤ t). Nothing in it depends on repair being fast, loss being rare, or
+the rates' spread. The generator's own entries (binomial burst probabilities, products of
+counts and rates) are enclosed by Lemma 1 too, taking the input rates as exact.
+
+**Width, measured.** Each squaring doubles the relative width and adds a few roundings, so
+the width grows as about 2Λt·u (u = 2⁻⁵³): `the_enclosure_is_narrow_across_repair_rates`
+measured 2×10⁻¹³ without repair, 1.6×10⁻⁹ with one-hour repair over a year, 1.5×10⁻⁶ at
+3.6-second repair and 8.4×10⁻⁴ at 3.6 ms. The series stops once its tail's effect,
+r_K·states·2ˢ, is below the least positive normal double, or at K = 170, past which r_K
+cannot fall (170! is the largest factorial a double holds). Squarings are at most 1100,
+since a finite double is below 2¹⁰²⁴.
+
+**The exponential law, qualified.** A bound that holds for every chain and uses only the
+reduced chain of §4.4: let q₀ be the whole state's exit rate and p the chance that a stay in
+it ends in loss before the stripe is whole again. The stripe is lost only at the end of such
+a doomed stay; departures from the whole state within t number q₀·∫₀ᵗ 1{whole} ds ≤ q₀t in
+expectation (the counting process's compensator), and whether a departure is doomed depends
+only on the chain after it (strong Markov property), so
+
+  P(T ≤ t) ≤ E[doomed departures by t] ≤ q₀·p·t.
+
+Since M = H/p with H ≥ 1/q₀ the reduced holding time, t/M ≤ q₀pt, and q₀pt/(t/M) = q₀H =
+1/π₀, for π₀ the whole state's share of time in the chain restarted at loss. So where the
+stripe is whole nearly all the time, the law 1 − e^(−t/M) ≤ t/M lies under a proven bound
+that is within 1/π₀ − 1 of it. The test `the_enclosure_is_within_the_renewal_bound` checks
+the enclosure against it. Measured against the enclosure at 4% a year and one-hour repair,
+the law was high by 1.1×10⁻⁴ (two copies) to 6.9×10⁻⁴ (RS(9,6)); with bursts, by at most
+3×10⁻⁶. Without repair (§4.5's zone case) it is high by orders of magnitude for small t,
+and low, so optimistic, from about 1.25 M on.
+
+The enclosure bounds the error of solving the chain, not the chain's fidelity to a fleet:
+§8 states what the chain leaves out.
+
 ---
 
 ## 5. Field failure rates, and S3's target
@@ -382,6 +458,183 @@ return after a power outage, citing reports of 0.5–1%, and one outage a year (
 9. Hunter's subtraction-free form of a general first-passage denominator is conjectured. The
    algorithm of §4.4 does not need it.
 
+## 8. Field data for the fleet model (audit B09a)
+
+Compiled 2026-09-30. Each source was fetched and read; tables published as images (Ford
+Table 2, [SLM16] Table 5, Backblaze's tables) were read from page renders. What §5 records is
+not repeated.
+
+### 8.1 Disks: rates, age, and time between failures
+
+**Schroeder and Gibson, FAST 2007 [SG07]:**
+
+- **Age.** "replacement rates in our data grew constantly with age, an effect often assumed
+  not to set in until after a nominal lifetime of 5 years" (abstract, p. 1). "In year 4 and
+  year 5 … the actual replacement rates are 7–10 times higher than the failure rates we
+  expected based on datasheet MTTF" (§4.2, p. 9).
+- **Infant mortality.** Observation 6: "Early onset of wear-out seems to have a much stronger
+  impact on lifecycle replacement rates than infant mortality" (p. 9).
+- **Autocorrelation.** "The correlation coefficient between consecutive weeks is 0.72, and
+  the correlation coefficient between consecutive months is 0.79" (§5.2, p. 11). "we observe
+  strong autocorrelation even for large lags in the range of 100 weeks (nearly 2 years)"
+  (p. 12). "we determine a Hurst exponent between 0.6-0.8 at the weekly granularity" (p. 12).
+- **Time between replacements** (§5.3, p. 13): "we can reject the hypothesis that the
+  underlying distribution is exponential or lognormal at a significance level of 0.05". "The
+  data has a C2 of 2.4, which is more than two times higher than the C2 of an exponential
+  distribution". Weibull shape 0.71–0.76 for HPC1, "a shape parameter less than 1, a clear
+  indicator of decreasing hazard rates". These fit the gap between replacements anywhere in
+  the cluster, "not the hazard rate of disk lifetime distributions" (§2.4, p. 5).
+- **Model input:** none directly; behaviour a constant-rate chain cannot hold (§8.5).
+
+**Pinheiro, Weber, Barroso, FAST 2007 [PWB07]:**
+
+- "The higher baseline AFR for 3 and 4 year old drives is more strongly influenced by the
+  underlying reliability of the particular models in that vintage than by disk drive aging
+  effects" (§3.1, PDF p. 4).
+- "Out of all failed drives, over 56% of them have no count in any of the four strong SMART
+  signals … over 36% of all failed drives had zero counts on all variables" (§3.5.6, PDF
+  p. 10).
+- **Model input:** the chunk rate varies by model and vintage; SMART does not turn most
+  failures into planned repair.
+
+**Backblaze Drive Stats for 2025 [BB25]** (published 2026-02-12):
+
+- The formula, from [BB-Q222]: "AFR = ( drive_failures / ( drive_days / 365 )) * 100" — a
+  pooled failures-per-drive-year rate.
+- "This leaves us with 344,196 drives divided across 30 different drive models". "This year
+  finishes strong at 1.36%, down from 1.55% in 2024." "Lifetime AFR is 1.30% this quarter".
+  DERIVED: the tables' totals (4,317 failures in 115,638,676 drive days; 19,890 in
+  557,699,373) reproduce both under the formula.
+- Per model, 2025: highest Toshiba MG08ACA16TEY 6.30% (318 failures in 1,843,841 drive
+  days), then Seagate ST10000NM0086 5.66% and ST12000NM0007 5.48%; lowest 0.22%. DERIVED:
+  the table has 31 rows, not the text's 30; median 1.35%, 90th percentile 5.31%. The
+  three-year table's highest model-year is ST12000NM0007 at 11.38% in 2024; its totals row
+  gives 1.57% for 2024, not the text's 1.55%.
+- **Model input:** the disk chunk rate. A stripe whose chunks share a model sees that
+  model's rate, not the fleet's.
+
+**Jiang, Hu, Zhou, Kanevsky, FAST 2008 [JHZK08]** (about 1.8 million disks, 155,000 shelves,
+44 months):
+
+- "in low-end storage systems, the AFR for storage subsystems is about 4.6%, while the AFR
+  for disks is only 0.9%, about 20% of overall AFR" (§3, p. 116); physical interconnects are
+  "27-68%" of subsystem failures (§1).
+- "About 48% of overall storage subsystem failures arrive at the same shelf within 10,000
+  seconds of the previous failure" (§5.1, p. 121).
+- "for disk failure, the observed empirical P(2) is higher than theoretical P(2) by a factor
+  of 6. For other types of storage subsystem failures … by a factor of 10-25" (§5.2.2,
+  p. 122).
+- **Model input:** the enclosure is a correlated domain; the loss rate of the whole path to a
+  chunk exceeds the disk's.
+
+**Bairavasundaram et al., SIGMETRICS 2007 [BGPS07]:** "A total of 3.45% of 1.53 million disks
+developed latent sector errors over a period of 32 months" (Table 1); "Latent sector errors
+are not independent of each other" (Table 1); "the fraction of disks with errors at the end of
+24 months could vary from 5% to 20% for nearline disks" (§4). **Model input:** none; a latent
+error found during a rebuild has no state in the chain.
+
+### 8.2 Flash
+
+**Schroeder, Lagisetty, Merchant, FAST 2016 [SLM16]:**
+
+- "for most drive models 6-9% of their population at some point required repairs, there are
+  some drive models, e.g. SLC-B and SLC-C, that enter repairs at significantly higher rates
+  of 30% and 26%" (§6.3, p. 77). "The vast majority (96%) of drives that go to repairs, go
+  there only once in their life" (p. 78).
+- "The most common type of non-transparent errors are uncorrectable errors, which affect 2–6
+  out of 1,000 drive days" (§3, p. 69).
+- DERIVED: the worst four-year replacement fraction in Table 5, 10.31%, is 2.68% a year under
+  a constant hazard, 1 − (1 − 0.1031)^(1/4).
+
+**Meza, Wu, Kumar, Mutlu, SIGMETRICS 2015 [MWKM15]:** their failure is not device loss — "We
+refer to the occurrence of such uncorrectable errors in an SSD as an SSD failure" (§2), errors
+"uncorrectable by the SSD but correctable by the host". "the lifecycle failure rates we
+observe with the amount of data written to flash cells does not follow the conventional
+bathtub curve" (PDF p. 6). **Model input:** none to the chunk rate; the hazard follows bytes
+written, not time.
+
+### 8.3 Recurrence
+
+**Nightingale, Douceur, Orgovan, EuroSys 2011 [NDO11]** (about 950,000 consumer PCs): disk
+subsystem crashes, at 5 days' minimum CPU time, "1 in 470" for a first and "1 in 3.4" for a
+second given one (Figure 2); "observed failure inter-occurrence times are not exponential and
+therefore not memoryless" (§4.5). Consumer machines, and crashes rather than loss.
+
+### 8.4 Correlated events: domains and bursts
+
+**Ford et al., OSDI 2010 [FLP+10]:**
+
+- Table 2: MTTF "Disk 10-50 years", "Node 4.3 months", "Rack 10.2 years", of unavailability:
+  "The vast majority of such unavailability events are transient and do not result in
+  permanent data loss" (§2.1).
+- "we observe that 37% of failures are part of a burst of at least 2 nodes" (§4.1, window
+  120 s). Steep bursts follow "a power outage in a datacenter" (§4.2). "All our failure
+  bursts of more than 20 nodes have rack affinity greater than 0.7, and those of more than 40
+  nodes have affinity at least 0.9" (§4.3); high affinity also comes from "a bad batch of
+  components or new storage node binary or kernel".
+- Burst classes "small (0-0.001), medium (0.001-0.01), large (0.01-0.1)" of all nodes
+  (Figure 10); "for all encodings except R = 1, large failure bursts are the biggest
+  contributor to unavailability" (§5.2). Burst rates are not published.
+- The 120 s window "is less than a tenth of the average time it takes our system to recover
+  a chunk" (§4.1). DERIVED: mean chunk recovery over 20 minutes.
+
+**Dean, LADIS 2009 keynote [Dea09], slide 10:** "Typical first year for a new cluster: ~0.5
+overheating (power down most machines in <5 mins, ~1-2 days to recover) ~1 PDU failure
+(~500-1000 machines suddenly disappear, ~6 hours to come back) ~1 rack-move … ~20 rack
+failures (40-80 machines instantly disappear, 1-6 hours to get back) … ~1000 individual
+machine failures ~thousands of hard drive failures". Slide 7: "Cluster (30+ racks)". All
+transient. The list is not in *The Datacenter as a Computer*, 3rd edition [BHR18]; whether
+the 1st or 2nd edition has it: UNVERIFIED.
+
+**Shvachko, Kuang, Radia, Chansler, MSST 2010 [SKRC10]** (§IV.A): "about 0.8 percent of nodes
+fail each month"; "one-half to one percent of the nodes will not survive a full power-on
+restart. Statistically, and in practice, a large cluster will lose a handful of blocks during
+a power-on restart."
+
+**Chansler, ;login: 37(1), 2012 [Cha12]:** "(One percent of nodes fail each month.)" (p. 19);
+on about 4,000 nodes "a few dozen nodes will not immediately restart" (p. 21). Cidon et al.
+write that such outages "occur once or twice per year in a given data center [7]" (ATC 2013,
+§2) citing this article, which contains no such frequency: UNVERIFIED at its cited source.
+
+**Gunawi et al., SoCC 2016 [GHS+16]:** "POWER failures represent 6% of outages in our study"
+(§5.7); outage impacts include "data loss (2%)" (§6). Shares of outages, not rates.
+
+### 8.5 Analysis, and what remains unqualified
+
+- **The disk rate depends on the statistic.** The fleet's 1.30–1.36% is a mean over
+  drive-days; models range from 0.22% to 6.30%, one model-year reached 11.38%, and [SG07]
+  saw up to 13%. mantle's default takes the worst current model (docs/design/durability.md
+  §5).
+- **Every correlated event with a stated size is transient** — Ford's racks, Dean's racks
+  and PDUs. The only permanent correlated loss with a stated size is the power-on restart,
+  0.5–1% of nodes [SKRC10]; its frequency is UNVERIFIED (§8.4).
+- **No fetched primary source gives a permanent-loss rate for a rack, a zone or a site.**
+
+What the constant-rate chain does not hold, and the direction of its error where the sources
+show one:
+
+1. Hazard rising with age [SG07], [BB25]: optimistic for an aging fleet; the worst-model
+   default is pessimistic for a young one.
+2. Clustering in time — Weibull shape 0.71–0.76, C² 2.4, two failures within an hour four
+   times likelier than exponential, Hurst 0.6–0.8 [SG07]: optimistic for a second loss during
+   rebuild. No source gives a correction for a stripe spread over domains.
+3. Shelf correlation, P(2) 6 times the independent value for disks and 10–25 for other
+   failures [JHZK08]: optimistic unless the enclosure is a domain.
+4. Recurrence after repair [NDO11] against 96% single repair visits [SLM16]: the sources
+   conflict; optimistic if a returned device counts as new.
+5. Burst rate and size distribution: unpublished [FLP+10], frequency UNVERIFIED; direction
+   unknown.
+6. Repair time distribution: serial and exponential in the chain; evidence is a mean over
+   20 minutes [FLP+10] and "a day—or more" after a power-on restart [Cha12]; optimistic after
+   bursts, when recovery queues.
+7. Latent sector errors during rebuild [BGPS07]: no state; optimistic.
+8. Flash hazard following bytes written [MWKM15]: direction unknown.
+9. Site disasters: no rate; optimistic.
+10. Controller, cable and path failures, 27–68% of subsystem failures [JHZK08]: optimistic if
+    the chunk rate is a drive AFR alone.
+
+---
+
 ## Sources
 
 - [FLP+10] D. Ford, F. Labelle, F. I. Popovici, M. Stokely, V.-A. Truong, L. Barroso,
@@ -417,3 +670,39 @@ return after a power outage, citing reports of 0.5–1%, and one outage a year (
 - [S3-DD] Amazon S3 User Guide, "Data protection in Amazon S3".
   https://docs.aws.amazon.com/AmazonS3/latest/userguide/DataDurability.html
 - [S3-FAQ] Amazon S3 FAQs. https://aws.amazon.com/s3/faqs/
+- [Jen53] A. Jensen. "Markoff chains as an aid in the study of Markoff processes."
+  Skandinavisk Aktuarietidskrift 36:87–91, 1953. (Not fetched.)
+- [Gra77] W. K. Grassmann. "Transient solutions in Markovian queueing systems." Computers &
+  Operations Research 4(1):47–53, 1977. doi:10.1016/0305-0548(77)90007-7 (Not fetched.)
+- [Ste94] W. J. Stewart. *Introduction to the Numerical Solution of Markov Chains.* Princeton
+  University Press, 1994, §8.4. (Not fetched.)
+- [IEEE754] IEEE Std 754-2019, "IEEE Standard for Floating-Point Arithmetic", §4.3.1.
+- [Rust-f64] Rust 1.98 standard library, `f64::next_up`, `f64::next_down`, `f64::exp`.
+  https://doc.rust-lang.org/1.98.0/std/primitive.f64.html
+- [BB25] Backblaze. "Backblaze Drive Stats for 2025." 2026-02-12.
+  https://www.backblaze.com/blog/backblaze-drive-stats-for-2025/
+- [BB-Q222] Backblaze. "Backblaze Drive Stats for Q2 2022", "Computing the Annualized Failure
+  Rate". https://www.backblaze.com/blog/backblaze-drive-stats-for-q2-2022/
+- [JHZK08] W. Jiang, C. Hu, Y. Zhou, A. Kanevsky. "Are Disks the Dominant Contributor for
+  Storage Failures?" FAST 2008, pp. 111–125.
+  https://www.usenix.org/legacy/events/fast08/tech/full_papers/jiang/jiang.pdf
+- [BGPS07] L. N. Bairavasundaram, G. R. Goodson, S. Pasupathy, J. Schindler. "An Analysis of
+  Latent Sector Errors in Disk Drives." SIGMETRICS 2007.
+  https://research.cs.wisc.edu/wind/Publications/latent-sigmetrics07.pdf
+- [MWKM15] J. Meza, Q. Wu, S. Kumar, O. Mutlu. "A Large-Scale Study of Flash Memory Failures
+  in the Field." SIGMETRICS 2015. doi:10.1145/2745844.2745848
+- [NDO11] E. B. Nightingale, J. R. Douceur, V. Orgovan. "Cycles, Cells and Platters: An
+  Empirical Analysis of Hardware Failures on a Million Consumer PCs." EuroSys 2011.
+- [Dea09] J. Dean. "Designs, Lessons and Advice from Building Large Distributed Systems."
+  LADIS 2009 keynote. https://www.cs.cornell.edu/projects/ladis2009/talks/dean-keynote-ladis2009.pdf
+- [BHR18] L. A. Barroso, U. Hölzle, P. Ranganathan. *The Datacenter as a Computer*, 3rd ed.
+  Morgan & Claypool, 2018. doi:10.2200/S00874ED3V01Y201809CAC046
+- [SKRC10] K. Shvachko, H. Kuang, S. Radia, R. Chansler. "The Hadoop Distributed File
+  System." MSST 2010.
+- [Cha12] R. J. Chansler. "Data Availability and Durability with the Hadoop Distributed File
+  System." ;login: 37(1), 2012.
+  https://www.usenix.org/system/files/login/articles/chansler_0.pdf
+- [CRS+13] A. Cidon, S. Rumble, R. Stutsman, S. Katti, J. Ousterhout, M. Rosenblum.
+  "Copysets: Reducing the Frequency of Data Loss in Cloud Storage." USENIX ATC 2013.
+- [GHS+16] H. S. Gunawi et al. "Why Does the Cloud Stop Computing? Lessons from Hundreds of
+  Service Outages." SoCC 2016.

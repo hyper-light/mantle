@@ -16,7 +16,7 @@
 
 use crate::clock;
 use crate::engine::{Row, Rows, Write};
-use crate::error::MetaError;
+use crate::error::{MetaError, reserved};
 use crate::key::{self, NULL_VERSION, NameRow};
 use crate::record::{
     self, Checksum, DefaultRetention, Descriptor, Gate, GateState, Holder, How, LISTING, Lineage,
@@ -1129,7 +1129,7 @@ fn unmark<E: Rows>(engine: &E, u: &Unmark) -> Result<(Outcome, Vec<Write>), Meta
 /// with a slower clock proposed, and a handover that comes after finds the deadline passed.
 fn check<E: Rows>(engine: &E, c: &Check) -> Result<(Outcome, Vec<Write>), MetaError> {
     let (now, clock) = clock::tick(engine, c.at_ns)?;
-    let mut verdicts = Vec::with_capacity(c.files.len());
+    let mut verdicts = reserved(c.files.len())?;
     let mut writes = vec![clock];
     for f in &c.files {
         let mark = key::mark(&f.bucket, &f.key, f.file);
@@ -1537,7 +1537,7 @@ fn put_part<E: Rows>(engine: &E, p: &PutPart) -> Result<(Outcome, Vec<Write>), M
         &p.key,
         &NameRow::Part(p.upload.clone().into_bytes(), p.number),
     );
-    let mut writes = Vec::with_capacity(3);
+    let mut writes = Vec::new();
     // A part uploaded again replaces the first (05 §4.3), whose file nothing then references.
     if let Some(replaced) = engine.get(&row)?.map(|b| Part::decode(&b)).transpose()?
         && replaced.file != p.part.file
@@ -1581,8 +1581,8 @@ fn complete<E: Rows>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), 
     if c.parts.is_empty()
         || !c
             .parts
-            .windows(2)
-            .all(|w| matches!(w, [a, b] if a.number < b.number))
+            .array_windows::<2>()
+            .all(|[a, b]| a.number < b.number)
     {
         return Ok((Outcome::InvalidPartOrder, Vec::new()));
     }
@@ -1590,7 +1590,7 @@ fn complete<E: Rows>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), 
     let mut total = 0u64;
     let mut empty = Vec::new();
     // Each listed part's deadline, from its row, for the mark adopting it keeps.
-    let mut deadlines = Vec::with_capacity(c.parts.len());
+    let mut deadlines = reserved(c.parts.len())?;
     for (i, listed) in c.parts.iter().enumerate() {
         let row = key::name(
             &c.bucket,

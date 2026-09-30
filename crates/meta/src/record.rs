@@ -1012,7 +1012,7 @@ impl Session {
             if count > r.remaining() / 12 {
                 return None;
             }
-            let mut answers = Vec::with_capacity(count);
+            let mut answers = reserved(count)?;
             for _ in 0..count {
                 answers.push((r.u64()?, take_bytes(&mut r)?));
             }
@@ -1231,7 +1231,9 @@ fn open<'a>(bytes: &'a [u8], what: &'static str) -> Result<Reader<'a>, RecordErr
         .len()
         .checked_sub(4)
         .ok_or(RecordError::Corrupt(what))?;
-    let (body, crc) = bytes.split_at(body_len);
+    let (body, crc) = bytes
+        .split_at_checked(body_len)
+        .ok_or(RecordError::Corrupt(what))?;
     let crc = u32::from_le_bytes(crc.try_into().map_err(|_| RecordError::Corrupt(what))?);
     if mantle_crc::crc32c(body) != crc {
         return Err(RecordError::Corrupt(what));
@@ -1285,6 +1287,16 @@ fn take_mode(r: &mut Reader<'_>) -> Option<RetentionMode> {
         1 => Some(RetentionMode::Compliance),
         _ => None,
     }
+}
+
+/// An empty vector with room for the `count` items a decoder has checked against the bytes
+/// left, or `None`, the decoder's refusal, when the room cannot be reserved:
+/// `Vec::with_capacity` panics on a capacity past `isize::MAX` bytes and aborts when the
+/// allocation fails.
+pub(crate) fn reserved<T>(count: usize) -> Option<Vec<T>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(count).ok()?;
+    Some(out)
 }
 
 pub(crate) fn take_listing(r: &mut Reader<'_>) -> Option<[u8; LISTING]> {
@@ -1390,7 +1402,7 @@ pub(crate) fn take_pairs(r: &mut Reader<'_>) -> Option<Vec<(String, String)>> {
     if count > r.remaining() / 8 {
         return None;
     }
-    let mut pairs = Vec::with_capacity(count);
+    let mut pairs = reserved(count)?;
     for _ in 0..count {
         pairs.push((take_str(r)?, take_str(r)?));
     }

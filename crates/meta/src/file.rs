@@ -9,7 +9,7 @@
 
 use crate::clock;
 use crate::engine::{Rows, Write};
-use crate::error::MetaError;
+use crate::error::{MetaError, reserved};
 use crate::key;
 use crate::record::{Extent, FileHeader, Referrer, Target, Verdict, WrappedKey};
 
@@ -134,7 +134,7 @@ fn write<E: Rows>(
     if extents.is_empty() || extents.len() > MAX_EXTENTS {
         return invalid;
     }
-    let mut writes = Vec::with_capacity(extents.len().saturating_mul(2).saturating_add(3));
+    let mut writes = reserved(extents.len().saturating_mul(2).saturating_add(3))?;
     let mut end = 0u64;
     for extent in extents {
         match end.checked_add(extent.length) {
@@ -214,7 +214,7 @@ fn remove<E: Rows>(engine: &E, file: u128) -> Result<Vec<Write>, MetaError> {
 /// Writes that take `files` out of the unsettled queue; a file already out, or removed,
 /// needs none.
 fn settle<E: Rows>(engine: &E, files: &[u128]) -> Result<Vec<Write>, MetaError> {
-    let mut writes = Vec::with_capacity(files.len());
+    let mut writes = reserved(files.len())?;
     for &file in files {
         if let Some(h) = header(engine, file)? {
             writes.push(Write::Delete(key::unsettled(h.deadline_ns, file)));
@@ -238,7 +238,7 @@ fn check_blocks<E: Rows>(
     // Each block is one read of the file's row for it: a scan of the file's extents for every
     // check cost a page of blocks from distinct files one scan each, 60.8 ms for 512 blocks
     // of files of 646 (docs/measurements/2026-09-30-review-fixes.md).
-    let mut verdicts = Vec::with_capacity(blocks.len());
+    let mut verdicts = reserved(blocks.len())?;
     for &(block, deadline_ns) in blocks {
         let verdict = if written && engine.get(&key::file_named(file, block))?.is_some() {
             Verdict::Held

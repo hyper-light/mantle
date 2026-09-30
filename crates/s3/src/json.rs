@@ -153,10 +153,7 @@ impl Reader<'_> {
         // Names compare after escapes are replaced (RFC 8259 §8.3; RFC 7493 §2.3).
         let mut names: Vec<&str> = members.iter().map(|(name, _)| name.as_str()).collect();
         names.sort_unstable();
-        if names
-            .windows(2)
-            .any(|pair| matches!(pair, [a, b] if a == b))
-        {
+        if names.array_windows::<2>().any(|[a, b]| a == b) {
             return Err(JsonError::Duplicate);
         }
         Ok(Value::Object(members))
@@ -319,8 +316,9 @@ impl Reader<'_> {
         if !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(JsonError::Syntax("a \\u escape without four hex digits"));
         }
-        let unit = u32::from_str_radix(digits, 16)
-            .map_err(|_| JsonError::Syntax("a \\u escape without four hex digits"))?;
+        let unit = crate::sigv4::hex_value(digits.as_bytes())
+            .and_then(|unit| u32::try_from(unit).ok())
+            .ok_or(JsonError::Syntax("a \\u escape without four hex digits"))?;
         self.advance(4)?;
         Ok(unit)
     }

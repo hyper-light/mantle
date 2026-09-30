@@ -12,6 +12,7 @@
 //! trips otherwise add up (audit §16.3, §16.7).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::num::NonZeroU64;
 use std::ops::Range;
 
 use bytes::Bytes;
@@ -487,7 +488,10 @@ impl Get {
         let data = self.keyring.unwrap(key)?;
         let segment = u64::try_from(seal::SEGMENT).map_err(|_| GetError::Overflow)?;
         let next = range.start.checked_div(segment).ok_or(GetError::Overflow)?;
-        let end = range.end.div_ceil(segment);
+        let end = crate::div_ceil(
+            range.end,
+            NonZeroU64::new(segment).ok_or(GetError::Overflow)?,
+        );
         self.plain = Some(Plain {
             file,
             segments: Segments::new(&data, file)?,
@@ -551,7 +555,7 @@ impl Get {
                 "a block that does not hold whole segments",
             ));
         }
-        let holds_end = end.div_ceil(SEALED);
+        let holds_end = crate::div_ceil(end, NonZeroU64::new(SEALED).ok_or(GetError::Overflow)?);
         let last = plain.end.min(holds_end);
         let segments = plain.next..last;
         let stored_end = last
@@ -734,7 +738,11 @@ impl Get {
         if have.checked_add(next.len()).ok_or(GetError::Overflow)? < needed {
             return Err(GetError::Unreadable(block));
         }
-        let mut requests = Vec::with_capacity(next.len());
+        // A reservation the allocator refuses is an error, not an abort.
+        let mut requests = Vec::new();
+        requests
+            .try_reserve_exact(next.len())
+            .map_err(|_| GetError::Overflow)?;
         for c in next {
             let place = places.get(c).ok_or(GetError::Overflow)?;
             whole.asked.insert(c);
@@ -814,7 +822,10 @@ impl Get {
                 if reading.spans.iter().any(|s| s.got.is_none()) {
                     return Ok(());
                 }
-                let mut sealed = Vec::with_capacity(want_len);
+                let mut sealed = Vec::new();
+                sealed
+                    .try_reserve_exact(want_len)
+                    .map_err(|_| GetError::Overflow)?;
                 for span in &reading.spans {
                     sealed.extend_from_slice(span.got.as_deref().unwrap_or_default());
                 }
@@ -825,7 +836,9 @@ impl Get {
         let plain = self.plain.as_mut().ok_or(GetError::Mismatch)?;
         let segment = u64::try_from(seal::SEGMENT).map_err(|_| GetError::Overflow)?;
         let last = plain.count.checked_sub(1).ok_or(GetError::Overflow)?;
-        let mut out = Vec::with_capacity(want_len);
+        let mut out = Vec::new();
+        out.try_reserve_exact(want_len)
+            .map_err(|_| GetError::Overflow)?;
         let mut rest = sealed.as_slice();
         for s in reading.segments.clone() {
             let len = if s == last {

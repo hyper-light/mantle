@@ -183,16 +183,17 @@ fn nonce(index: u64, last: bool) -> Result<[u8; 12], SealError> {
         return Err(SealError::Size);
     }
     let counter = if last { index | LAST } else { index };
-    let mut nonce = [0u8; 12];
-    let (_, field) = nonce.split_at_mut(4);
-    field.copy_from_slice(&counter.to_be_bytes());
-    Ok(nonce)
+    let [a, b, c, d, e, f, g, h] = counter.to_be_bytes();
+    Ok([0, 0, 0, 0, a, b, c, d, e, f, g, h])
 }
 
 /// Segments a file of `plain` bytes is sealed in: every 64 KiB, and one, empty, for an empty
 /// file, so that its end is sealed too.
 pub fn segments(plain: u64) -> u64 {
-    plain.div_ceil(PLAIN_SEGMENT).max(1)
+    let whole = plain / PLAIN_SEGMENT;
+    let part = u64::from(!plain.is_multiple_of(PLAIN_SEGMENT));
+    // A quotient by 64 KiB is far below u64::MAX, so adding one cannot overflow.
+    whole.checked_add(part).unwrap_or(whole).max(1)
 }
 
 /// Bytes a file of `plain` bytes takes sealed: a tag for each segment.

@@ -271,7 +271,7 @@ pub fn register<R: Rows>(
         .and_then(|p| index.checked_mul(places)?.checked_add(p))
         .ok_or(MetaError::Corrupt)?;
     let mut held = count(rows)?;
-    let mut writes = Vec::with_capacity(5);
+    let mut writes = Vec::new();
     if held >= rules.max_sessions {
         let (from, to) = (vec![LOCAL, EXPIRY], vec![LOCAL, EXPIRY.saturating_add(1)]);
         let (k, _) = rows.next(&from, &to)?.ok_or(MetaError::Corrupt)?;

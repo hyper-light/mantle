@@ -195,7 +195,7 @@ impl PostError {
 /// Bytes as S3's `StringToSignBytes` writes them: two lowercase hex digits each, spaced.
 fn spaced_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len().saturating_mul(3));
+    let mut out = String::new();
     for (i, &b) in bytes.iter().enumerate() {
         if i > 0 {
             out.push(' ');

@@ -600,7 +600,7 @@ fn collapse(value: &str) -> String {
 /// `/` too unless `slash` is false (05 §1.2.1).
 pub fn uri_encode(bytes: &[u8], slash: bool) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut out = String::with_capacity(bytes.len());
+    let mut out = String::new();
     for &b in bytes {
         let keep = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~');
         if keep || (b == b'/' && !slash) {
@@ -620,7 +620,7 @@ pub fn uri_encode(bytes: &[u8], slash: bool) -> String {
 
 /// Decodes `%XX` escapes; `+` stays `+`, as RFC 3986 reads it. `None` for a broken escape.
 pub(crate) fn percent_decode(bytes: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(bytes.len());
+    let mut out = Vec::new();
     let mut i = bytes.iter();
     while let Some(&b) = i.next() {
         if b == b'%' {
@@ -643,9 +643,20 @@ fn hex_digit(b: u8) -> Option<u8> {
     }
 }
 
+/// The value of `digits`, all hex digits and at least one: `None` otherwise or past `u64`.
+/// Unlike `from_str_radix`, no leading `+` is taken, which no grammar here allows.
+pub(crate) fn hex_value(digits: &[u8]) -> Option<u64> {
+    if digits.is_empty() {
+        return None;
+    }
+    digits.iter().try_fold(0u64, |value, &b| {
+        value.checked_mul(16)?.checked_add(u64::from(hex_digit(b)?))
+    })
+}
+
 pub fn hex(bytes: &[u8; 32]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(64);
+    let mut out = String::new();
     for &b in bytes {
         out.push(char::from(
             HEX.get(usize::from(b >> 4)).copied().unwrap_or(b'0'),
@@ -664,10 +675,9 @@ pub fn unhex(text: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut out = [0u8; 32];
-    for (slot, pair) in out.iter_mut().zip(bytes.chunks(2)) {
-        let hi = hex_digit(*pair.first()?)?;
-        let lo = hex_digit(*pair.get(1)?)?;
-        *slot = (hi << 4) | lo;
+    // Sixty-four bytes are exactly thirty-two pairs, so no remainder is left over.
+    for (slot, &[hi, lo]) in out.iter_mut().zip(bytes.as_chunks::<2>().0) {
+        *slot = (hex_digit(hi)? << 4) | hex_digit(lo)?;
     }
     Some(out)
 }
@@ -675,6 +685,19 @@ pub fn unhex(text: &str) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hex values take digits alone: no sign, which `from_str_radix` would take, nothing
+    /// empty, and nothing past u64.
+    #[test]
+    fn hex_values_are_digits_alone() {
+        assert_eq!(hex_value(b"0"), Some(0));
+        assert_eq!(hex_value(b"fFfF"), Some(0xffff));
+        assert_eq!(hex_value(b"ffffffffffffffff"), Some(u64::MAX));
+        assert_eq!(hex_value(b"10000000000000000"), None);
+        assert_eq!(hex_value(b"+1f"), None);
+        assert_eq!(hex_value(b""), None);
+        assert_eq!(hex_value(b"1g"), None);
+    }
 
     const KEY: &str = "AKIAIOSFODNN7EXAMPLE";
     const SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";

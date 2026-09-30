@@ -30,6 +30,20 @@ use crate::layout::{Layout, LayoutError};
 /// (docs/research/09 §7.2.2).
 const RENEWALS: u64 = 4;
 
+/// A data chunk that shares its block's bytes: a span checked to lie within the block when
+/// it is made, taken through `Bytes::from_owner` because `Bytes::slice` panics on a span
+/// past the end and has no checked form (bytes 1.12).
+struct Span {
+    block: Bytes,
+    span: std::ops::Range<usize>,
+}
+
+impl AsRef<[u8]> for Span {
+    fn as_ref(&self) -> &[u8] {
+        self.block.get(self.span.clone()).unwrap_or_default()
+    }
+}
+
 /// A request's name among those in flight.
 pub type Id = u64;
 
@@ -369,6 +383,11 @@ impl Put {
         let sealed_segment = seal::SEGMENT
             .checked_add(seal::TAG)
             .ok_or(PutError::Overflow)?;
+        // A reservation the allocator refuses is an error, not an abort.
+        let mut segment = Vec::new();
+        segment
+            .try_reserve_exact(sealed_segment)
+            .map_err(|_| PutError::Overflow)?;
         Ok(Self {
             commit,
             body,
@@ -380,7 +399,7 @@ impl Put {
             ids,
             now_ns,
             taken: 0,
-            segment: Vec::with_capacity(sealed_segment),
+            segment,
             sealed: 0,
             filling: Vec::new(),
             filling_index: 0,
@@ -526,7 +545,8 @@ impl Put {
                 .layout
                 .block_len(self.body.length, self.filling_index)?;
             self.filling
-                .reserve_exact(usize::try_from(len).map_err(|_| PutError::Overflow)?);
+                .try_reserve_exact(usize::try_from(len).map_err(|_| PutError::Overflow)?)
+                .map_err(|_| PutError::Overflow)?;
         }
         self.sealer
             .seal(self.sealed, next == segments, &mut self.segment)?;
@@ -609,14 +629,26 @@ impl Put {
                 let parity = code.parity_of(&bytes)?;
                 let block = Bytes::from(bytes);
                 let c = code.chunk_len(block.len())?;
-                let mut chunks = Vec::with_capacity(code.width());
+                let mut chunks = Vec::new();
+                chunks
+                    .try_reserve_exact(code.width())
+                    .map_err(|_| PutError::Overflow)?;
                 for i in 0..code.data() {
                     let span = code.data_span(block.len(), i)?;
+                    let Some(data) = block.get(span.clone()) else {
+                        return Err(PutError::Overflow);
+                    };
                     let chunk = if span.len() == c {
-                        block.slice(span)
+                        Bytes::from_owner(Span {
+                            block: block.clone(),
+                            span,
+                        })
                     } else {
-                        let mut padded = Vec::with_capacity(c);
-                        padded.extend_from_slice(block.get(span).unwrap_or_default());
+                        let mut padded = Vec::new();
+                        padded
+                            .try_reserve_exact(c)
+                            .map_err(|_| PutError::Overflow)?;
+                        padded.extend_from_slice(data);
                         padded.resize(c, 0);
                         Bytes::from(padded)
                     };
@@ -722,7 +754,10 @@ impl Put {
         if volumes.len() < width {
             return Err(PutError::Unplaced(going.id));
         }
-        let mut sends = Vec::with_capacity(width);
+        let mut sends = Vec::new();
+        sends
+            .try_reserve_exact(width)
+            .map_err(|_| PutError::Overflow)?;
         for (i, ((bytes, crc), &volume)) in going.chunks.iter().zip(&volumes).enumerate() {
             sends.push((i, chunk(going.id, i, volume, bytes, *crc)?));
         }

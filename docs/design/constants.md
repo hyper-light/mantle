@@ -88,7 +88,13 @@ gains a basis lowers the ceiling.
 | `crates/disk/src/probe/windows.rs` `VOLUME_GUID_CHARS` | external | 50 characters, the size GetVolumeNameForVolumeMountPointW's documentation gives for the largest volume GUID path (Microsoft Learn). |
 | `crates/disk/src/rounds.rs` `MAX_ROUNDS` | bound | 120 rounds, the most for which the exact binomial and runs-test sums fit in u128 (40 · 2^n). |
 | `crates/disk/src/sim.rs` `MAX_SIM_LEN` | bound | 1 GiB cap on the simulated file, which tests hold twice in memory. |
-| `crates/ec/src/durability.rs` `PRECISION` | bound | Relative tolerance of 1e-3 on loss probabilities, argued in the code: the report prints two significant figures, and 1e-3 keeps the third correct (docs/research/15 §4.4–4.5). |
+| `crates/ec/src/durability.rs` `DISK_FAILURES` | cited | 6.3% a year: the highest per-model annualized failure rate in Backblaze's 2025 Drive Stats (Toshiba MG08ACA16TEY); research/15 §8.1, design/durability.md §5. |
+| `crates/ec/src/durability.rs` `FLASH_FAILURES` | cited | 2.7% a year: Schroeder et al. FAST 2016 Table 5's worst four-year replacement fraction, 10.31%, as a constant hazard; research/15 §8.2. |
+| `crates/ec/src/durability.rs` `POWER_LOSSES` | cited | One node-losing power-on restart a year, Cidon et al. ATC 2013 ("once or twice per year"); UNVERIFIED at its own cited source (Chansler 2012), so the least-qualified field input, until mantle's node history of restarts replaces it; research/15 §8.4. |
+| `crates/ec/src/durability.rs` `POWER_LOSS_FRACTION` | cited | 1% of nodes: the upper end of HDFS's "one-half to one percent of the nodes will not survive a full power-on restart" (Shvachko et al. MSST 2010); research/15 §8.4. |
+| `crates/ec/src/durability.rs` `MAX_SQUARINGS` | bound | 1100 halvings of Λt: a finite double is below 2¹⁰²⁴, so no finite Λt needs more to reach ½; research/15 §4.6. |
+| `crates/ec/src/durability.rs` `MAX_TERMS` | bound | 170 series terms at Λτ ≤ ½: past it the tail bound 2·(½)^(K+1)/(K+1)! is below every positive double (170! is the largest factorial a double holds); research/15 §4.6. |
+| `crates/ec/src/durability.rs` `MOST_COPIES` | cited | Three copies, the replication of a block still being written; research/04 §R1.1. |
 | `crates/ec/src/durability.rs` `YEAR` | derived | Unit conversion: 365.25 days × 24 h = 8766 hours. |
 | `crates/engine/src/table/format.rs` `CONTEXT_CHECKSUM_FORMAT_VERSION` | format | The first block-based table format_version whose block and footer checksums carry the context modifier [R table/format.h:218-220] (docs/research/24 §1.2). |
 | `crates/engine/src/table/format.rs` `LAST_BYTE_PRIME` | format | `kRandomPrime` 0x6b9083d9 of `ModifyChecksumForLastByte`, folding a block's compression-type byte into its XXH3 checksum [R table/format.cc:606-612] (docs/research/24 §1.2). |

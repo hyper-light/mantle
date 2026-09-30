@@ -120,7 +120,7 @@ pub fn object(bucket: &str, key: &str) -> Vec<u8> {
 
 /// The prefix every row of a bucket's objects begins with.
 pub fn objects(bucket: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bucket.len().saturating_add(2));
+    let mut out = Vec::new();
     out.push(DATA);
     put_string(&mut out, bucket.as_bytes());
     out
@@ -162,7 +162,7 @@ pub fn decode_gate(k: &[u8]) -> Option<String> {
 /// 0xFF, so a span between two routing keys bounds the rows of its keys by bytes in every
 /// space, and a Name range's span is such a pair (docs/design/metadata.md §3).
 pub fn route(bucket: &str, key: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bucket.len().saturating_add(key.len()).saturating_add(2));
+    let mut out = Vec::new();
     put_string(&mut out, bucket.as_bytes());
     put_string(&mut out, key.as_bytes());
     out
@@ -184,7 +184,7 @@ pub fn decode_route(r: &[u8]) -> Option<(String, String)> {
 /// The routing keys of a bucket's object keys lie in `[from, past)`: `from` is its empty
 /// key's, the least, and no routing key of another bucket falls between.
 pub fn bucket_routes(bucket: &str) -> (Vec<u8>, Vec<u8>) {
-    let mut from = Vec::with_capacity(bucket.len().saturating_add(2));
+    let mut from = Vec::new();
     put_string(&mut from, bucket.as_bytes());
     let mut past = from.clone();
     from.push(0x00);
@@ -268,7 +268,7 @@ pub fn decode_mark(k: &[u8]) -> Option<(String, String, u128)> {
 }
 
 fn marks_of(bucket: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bucket.len().saturating_add(2));
+    let mut out = Vec::new();
     out.push(MARKS);
     put_string(&mut out, bucket.as_bytes());
     out
@@ -278,7 +278,7 @@ fn marks_of(bucket: &str) -> Vec<u8> {
 /// of a block in the Block range's: its handover deadline, then its ID, so the sweep takes them
 /// as their deadlines pass (docs/design/metadata.md §2).
 pub fn unsettled(deadline_ns: u64, id: u128) -> Vec<u8> {
-    let mut out = Vec::with_capacity(26);
+    let mut out = Vec::new();
     out.extend_from_slice(&[LOCAL, marker::UNSETTLED]);
     out.extend_from_slice(&deadline_ns.to_be_bytes());
     out.extend_from_slice(&id.to_be_bytes());
@@ -309,7 +309,7 @@ const RELEASED: [u8; 2] = [LOCAL, marker::RELEASED];
 /// The key of a released file's row: the range's time when it was released, then the file,
 /// so the collector takes them in the order they were released.
 pub fn released(time_ns: u64, file: u128) -> Vec<u8> {
-    let mut out = Vec::with_capacity(26);
+    let mut out = Vec::new();
     out.extend_from_slice(&RELEASED);
     out.extend_from_slice(&time_ns.to_be_bytes());
     out.extend_from_slice(&file.to_be_bytes());
@@ -442,7 +442,7 @@ pub fn id_rows(id: u128) -> (Vec<u8>, Vec<u8>) {
 }
 
 fn id_row(id: u128, kind: u8) -> Vec<u8> {
-    let mut out = Vec::with_capacity(18);
+    let mut out = Vec::new();
     out.push(DATA);
     out.extend_from_slice(&id.to_be_bytes());
     out.push(kind);
@@ -465,7 +465,7 @@ fn id_row_tail(k: &[u8], kind: u8) -> Option<&[u8]> {
 /// `(disk_id, blk_id)` and shards it by block [01 Table 1]; it is kept in the range of its
 /// block, so it changes in the same transaction as the block's rows.
 pub fn reverse(volume: u128, block: u128) -> Vec<u8> {
-    let mut out = Vec::with_capacity(33);
+    let mut out = Vec::new();
     out.push(REVERSE);
     out.extend_from_slice(&volume.to_be_bytes());
     out.extend_from_slice(&block.to_be_bytes());
@@ -489,7 +489,7 @@ pub fn decode_reverse(k: &[u8]) -> Option<(u128, u128)> {
 
 /// The key of a bucket's row in the Bucket layer.
 pub fn bucket(name: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(name.len().saturating_add(2));
+    let mut out = Vec::new();
     out.push(DATA);
     put_string(&mut out, name.as_bytes());
     out
@@ -498,7 +498,7 @@ pub fn bucket(name: &str) -> Vec<u8> {
 /// The key of an owner's row, which counts its buckets. The reverse rows of its buckets
 /// follow it.
 pub fn owner(owner: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(owner.len().saturating_add(2));
+    let mut out = Vec::new();
     out.push(REVERSE);
     put_string(&mut out, owner.as_bytes());
     out

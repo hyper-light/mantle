@@ -96,8 +96,16 @@ impl Code {
     /// The length of each chunk of a block of `len` bytes: the block spread over the data
     /// chunks, rounded up to whole two-byte symbols, and at least one symbol.
     pub fn chunk_len(&self, len: usize) -> Result<usize, EcError> {
-        len.div_ceil(self.data)
-            .checked_next_multiple_of(2)
+        // `new` refuses zero data chunks, so the division is defined; checked all the same,
+        // since `div_ceil` panics on a zero divisor.
+        let whole = len.checked_div(self.data).ok_or(EcError::Unsupported {
+            data: self.data,
+            parity: self.parity,
+        })?;
+        let part = usize::from(len.checked_rem(self.data).is_some_and(|r| r > 0));
+        whole
+            .checked_add(part)
+            .and_then(|c| c.checked_next_multiple_of(2))
             .map(|c| c.max(2))
             .ok_or(EcError::TooLarge(len))
     }
@@ -155,9 +163,17 @@ impl Code {
     /// slices of it instead (`data_span`) and only the parity from here (`parity_of`).
     pub fn encode(&self, block: &[u8]) -> Result<Vec<Vec<u8>>, EcError> {
         let c = self.chunk_len(block.len())?;
-        let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(self.width());
+        // The reservations are fallible: a block too large to hold twice is refused rather
+        // than aborting the process.
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        chunks
+            .try_reserve_exact(self.width())
+            .map_err(|_| EcError::TooLarge(block.len()))?;
         for i in 0..self.data {
-            let mut chunk = Vec::with_capacity(c);
+            let mut chunk = Vec::new();
+            chunk
+                .try_reserve_exact(c)
+                .map_err(|_| EcError::TooLarge(block.len()))?;
             chunk.extend_from_slice(
                 block
                     .get(self.data_span(block.len(), i)?)
@@ -227,7 +243,12 @@ impl Code {
                 expected: self.chunk_len(len)?,
             });
         }
-        let mut block = Vec::with_capacity(len);
+        // `len` is the caller's record of the block's length: a length too large to allocate
+        // is refused rather than aborting the process.
+        let mut block = Vec::new();
+        block
+            .try_reserve_exact(len)
+            .map_err(|_| EcError::TooLarge(len))?;
         self.each_data(present, c, &mut |_, chunk| {
             let take = len.saturating_sub(block.len()).min(chunk.len());
             block.extend_from_slice(chunk.get(..take).unwrap_or_default());

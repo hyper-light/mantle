@@ -14,7 +14,7 @@ use mantle_chunk::ChunkKey;
 
 use crate::clock;
 use crate::engine::{Rows, Write};
-use crate::error::MetaError;
+use crate::error::{MetaError, reserved};
 use crate::key;
 use crate::record::{BlockHeader, BlockOrigin, ChunkPlace, Reverse};
 
@@ -331,7 +331,7 @@ fn delete<E: Rows>(engine: &E, block: u128) -> Result<(Outcome, Vec<Write>), Met
 /// needs none. A released block stays queued until its rows go, so a sweep that stops while
 /// taking it apart finds it again.
 fn settle<E: Rows>(engine: &E, blocks: &[u128]) -> Result<Vec<Write>, MetaError> {
-    let mut writes = Vec::with_capacity(blocks.len());
+    let mut writes = reserved(blocks.len())?;
     for &block in blocks {
         if let Some(o) = origin(engine, block)?
             && !o.released
@@ -390,7 +390,7 @@ pub fn read<E: Rows>(
     };
     let header = BlockHeader::decode(&bytes)?;
     let width = width(&header).ok_or(MetaError::Corrupt)?;
-    let mut places = Vec::with_capacity(usize::from(width));
+    let mut places = reserved(usize::from(width))?;
     for index in 0..width {
         let bytes = engine
             .get(&key::block_chunk(block, index))?

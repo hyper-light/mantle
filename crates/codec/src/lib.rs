@@ -20,10 +20,16 @@ pub struct Writer {
 }
 
 impl Writer {
+    /// A writer that reserves `capacity` bytes up front. The capacity is a hint: a reservation
+    /// the allocator refuses leaves the buffer empty, and the writes that follow grow it as
+    /// they would from `Default`, where `Vec::with_capacity` would panic on a capacity past
+    /// `isize::MAX` bytes.
     pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            buf: Vec::with_capacity(capacity),
+        let mut buf = Vec::new();
+        if buf.try_reserve_exact(capacity).is_err() {
+            buf = Vec::new();
         }
+        Self { buf }
     }
 
     pub fn u8(&mut self, v: u8) {

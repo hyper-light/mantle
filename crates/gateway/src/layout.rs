@@ -2,6 +2,7 @@
 //! in 64 KiB segments, the sealed stream cut into blocks of whole segments, and each block
 //! stored in its scheme's chunks.
 
+use std::num::NonZeroU64;
 use std::ops::Range;
 
 use mantle_ec::durability::Scheme;
@@ -32,7 +33,7 @@ pub enum LayoutError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Layout {
     scheme: Scheme,
-    per_block: u64,
+    per_block: NonZeroU64,
 }
 
 /// The part of a block a range of plaintext needs.
@@ -64,8 +65,9 @@ impl Layout {
             .checked_mul(CHUNK)
             .ok_or(LayoutError::Overflow)?
             .checked_div(SEALED)
-            .ok_or(LayoutError::Overflow)?
-            .max(1);
+            .ok_or(LayoutError::Overflow)?;
+        // At least one segment a block, which the type keeps for every division by it.
+        let per_block = NonZeroU64::new(per_block).unwrap_or(NonZeroU64::MIN);
         Ok(Self { scheme, per_block })
     }
 
@@ -75,12 +77,12 @@ impl Layout {
 
     /// Segments a block holds, the last block excepted.
     pub fn segments_per_block(&self) -> u64 {
-        self.per_block
+        self.per_block.get()
     }
 
     /// Blocks a file of `plain` plaintext bytes is stored in.
     pub fn blocks(&self, plain: u64) -> u64 {
-        seal::segments(plain).div_ceil(self.per_block)
+        crate::div_ceil(seal::segments(plain), self.per_block)
     }
 
     /// The stored length of segment `s` of a file of `plain` bytes: a whole sealed segment,
@@ -105,13 +107,13 @@ impl Layout {
     pub fn block_segments(&self, plain: u64, block: u64) -> Result<Range<u64>, LayoutError> {
         let segments = seal::segments(plain);
         let first = block
-            .checked_mul(self.per_block)
+            .checked_mul(self.per_block.get())
             .ok_or(LayoutError::Overflow)?;
         if first >= segments {
             return Err(LayoutError::Range);
         }
         let end = first
-            .checked_add(self.per_block)
+            .checked_add(self.per_block.get())
             .ok_or(LayoutError::Overflow)?
             .min(segments);
         Ok(first..end)
@@ -131,7 +133,7 @@ impl Layout {
         segments: Range<u64>,
     ) -> Result<Range<u64>, LayoutError> {
         let first = block
-            .checked_mul(self.per_block)
+            .checked_mul(self.per_block.get())
             .ok_or(LayoutError::Overflow)?;
         let last = segments.end.checked_sub(1).ok_or(LayoutError::Range)?;
         let offset = |s: u64| {
@@ -170,12 +172,13 @@ impl Layout {
         }
         let segment = u64::try_from(seal::SEGMENT).map_err(|_| LayoutError::Overflow)?;
         let first = from.checked_div(segment).ok_or(LayoutError::Overflow)?;
-        let end = to.div_ceil(segment).min(seal::segments(plain));
+        let segment = NonZeroU64::new(segment).ok_or(LayoutError::Overflow)?;
+        let end = crate::div_ceil(to, segment).min(seal::segments(plain));
         let mut pieces = Vec::new();
         let mut at = first;
         while at < end {
             let block = at
-                .checked_div(self.per_block)
+                .checked_div(self.per_block.get())
                 .ok_or(LayoutError::Overflow)?;
             let holds = self.block_segments(plain, block)?;
             let segments = at..holds.end.min(end);

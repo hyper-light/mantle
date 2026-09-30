@@ -96,10 +96,7 @@ pub fn check(mut tags: Vec<Tag>, tagged: Tagged) -> Result<Vec<Tag>, TagError> {
         }
     }
     tags.sort_unstable_by(|a, b| a.key.cmp(&b.key));
-    if tags
-        .windows(2)
-        .any(|pair| matches!(pair, [a, b] if a.key == b.key))
-    {
+    if tags.array_windows::<2>().any(|[a, b]| a.key == b.key) {
         return Err(TagError::Duplicate);
     }
     Ok(tags)

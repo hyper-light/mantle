@@ -102,7 +102,10 @@ const CHECKSUMS: usize = {
     let mut total = 0;
     let mut rest: &[Algorithm] = &Algorithm::ALL;
     while let [algorithm, tail @ ..] = rest {
-        total += 2 * algorithm.element().len() + "<></>".len() + 4 * algorithm.width().div_ceil(3);
+        // Base64's four-character groups: one per three bytes and one for a rest.
+        let width = algorithm.width();
+        let base64_groups = width / 3 + if width.is_multiple_of(3) { 0 } else { 1 };
+        total += 2 * algorithm.element().len() + "<></>".len() + 4 * base64_groups;
         rest = tail;
     }
     total

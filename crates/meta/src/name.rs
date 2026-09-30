@@ -541,6 +541,10 @@ pub enum Outcome {
     /// A listed part now holds another file than the gateway read: it read the parts again
     /// and retries, since the object it built would name the old part's bytes.
     Stale,
+    /// The object's size is not the sum of its listed parts', or its ETag does not name their
+    /// number: the gateway combined them wrong (`500 InternalError`). The upload is untouched,
+    /// and the file the write carried released, as any refused write's is.
+    Miscombined,
     /// `404 NoSuchBucket`: the range holds no open gate for the write's incarnation.
     NoSuchBucket,
     /// A gate moved, or a retry found it moved.
@@ -1465,6 +1469,8 @@ fn complete<E: Rows>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), 
         return Ok((Outcome::InvalidPartOrder, Vec::new()));
     }
     let last = c.parts.len().saturating_sub(1);
+    let mut total = 0u64;
+    let mut empty = Vec::new();
     for (i, listed) in c.parts.iter().enumerate() {
         let row = key::name(
             &c.bucket,
@@ -1483,6 +1489,16 @@ fn complete<E: Rows>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), 
         if i < last && part.size < MIN_PART {
             return Ok((Outcome::EntityTooSmall, Vec::new()));
         }
+        total = total.checked_add(part.size).ok_or(MetaError::Corrupt)?;
+        if part.size == 0 {
+            empty.push(part.file);
+        }
+    }
+    // The object is its parts: what the gateway combined from them is checked against the
+    // rows here (audit §16.5). The ETag's digest and the checksum need the protocol layer's
+    // hashes, which the gateway's driver derives from these same rows.
+    if c.size != total || !c.etag.ends_with(&format!("-{}", c.parts.len())) {
+        return Ok((Outcome::Miscombined, Vec::new()));
     }
     let (outcome, mut writes) = put(
         engine,
@@ -1521,13 +1537,15 @@ fn complete<E: Rows>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), 
         writes.extend(remove_upload(
             engine, &c.bucket, &c.key, &c.upload, &listed, now,
         )?);
+        // An empty part holds no byte of the object, and a file of parts names no empty
+        // extent, so it is given back with the upload rather than adopted.
         for part in &c.parts {
             match c.file {
-                Some(by) => writes.push(Write::Put(
+                Some(by) if !empty.contains(&part.file) => writes.push(Write::Put(
                     key::mark(&c.bucket, &c.key, part.file),
                     crate::record::Adopted { by }.encode(),
                 )),
-                None => writes.extend(release(now, &c.bucket, &c.key, part.file)?),
+                _ => writes.extend(release(now, &c.bucket, &c.key, part.file)?),
             }
         }
     }
@@ -2703,6 +2721,25 @@ mod tests {
         }
 
         fn complete(&mut self, key: &str, upload: &str, parts: &[(u16, &str, u128)]) -> Outcome {
+            // Combined as the gateway combines them: the size the listed parts' sum.
+            let held = super::parts(&self.engine, "b", key, upload, 0, 10_000).unwrap();
+            let size = parts
+                .iter()
+                .filter_map(|&(n, _, _)| held.iter().find(|(h, _)| *h == n))
+                .map(|(_, p)| p.size)
+                .sum();
+            let etag = format!("whole-{}", parts.len());
+            self.complete_as(key, upload, parts, size, &etag)
+        }
+
+        fn complete_as(
+            &mut self,
+            key: &str,
+            upload: &str,
+            parts: &[(u16, &str, u128)],
+            size: u64,
+            etag: &str,
+        ) -> Outcome {
             self.clock += 10;
             self.run(Command::Complete(Complete {
                 bucket: "b".into(),
@@ -2720,8 +2757,8 @@ mod tests {
                         file,
                     })
                     .collect(),
-                etag: "whole-2".into(),
-                size: 11 << 20,
+                etag: etag.into(),
+                size,
                 checksum: None,
                 file: Some(99),
                 default: None,
@@ -2847,6 +2884,49 @@ mod tests {
         assert_eq!(
             r.complete("k", "0000000000000", &[(1, "e1", 1)]),
             Outcome::NoSuchUpload
+        );
+    }
+
+    /// What a completion combined from its parts is checked against them: a size that is not
+    /// the listed parts' sum, or an ETag that does not name their number, is refused and the
+    /// upload left as it was (audit §16.5). An empty last part is given back with the upload
+    /// rather than adopted by the object's file, which names no empty extent.
+    #[test]
+    fn a_complete_is_checked_against_its_parts() {
+        let mut r = Range::new();
+        let u = r.create("k");
+        r.part("k", &u, 1, MIN_PART, 21);
+        r.part("k", &u, 2, 0, 22);
+        let listed = [(1, "e1", 21), (2, "e2", 22)];
+        for (size, etag) in [
+            (MIN_PART + 1, "whole-2"),
+            (MIN_PART, "whole-3"),
+            (MIN_PART, "whole"),
+        ] {
+            assert_eq!(
+                r.complete_as("k", &u, &listed, size, etag),
+                Outcome::Miscombined,
+                "{size} {etag}"
+            );
+        }
+        assert!(upload(&r.engine, "b", "k", &u).unwrap().is_some());
+        assert!(matches!(
+            r.complete_as("k", &u, &listed, MIN_PART, "whole-2"),
+            Outcome::Put { .. }
+        ));
+        let released: Vec<u128> = released(&r.engine, u64::MAX, 10)
+            .unwrap()
+            .iter()
+            .map(|f| f.file)
+            .collect();
+        assert!(
+            released.contains(&22) && !released.contains(&21),
+            "{released:?}"
+        );
+        let adopted = r.engine.get(&key::mark("b", "k", 21)).unwrap().unwrap();
+        assert_eq!(
+            crate::record::Adopted::of(&adopted).unwrap().map(|a| a.by),
+            Some(99)
         );
     }
 
@@ -3615,8 +3695,12 @@ mod tests {
                             preconditions: Preconditions::default(),
                             at_ns: r.clock,
                             parts: listed.clone(),
-                            etag: "whole".into(),
-                            size: 1,
+                            etag: format!("whole-{}", listed.len()),
+                            size: parts
+                                .iter()
+                                .filter_map(|&n| held.iter().find(|(h, _)| *h == n))
+                                .map(|(_, p)| p.size)
+                                .sum(),
                             checksum: None,
                             file: Some(file),
                             default: None,

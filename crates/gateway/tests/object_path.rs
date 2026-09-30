@@ -19,6 +19,7 @@ use bytes::Bytes;
 use mantle_chunk::ChunkKey;
 use mantle_ec::Code;
 use mantle_ec::durability::Scheme;
+use mantle_gateway::complete::{self, CompleteError, Completed, Completion};
 use mantle_gateway::get::{self, Get, GetError, Keyring};
 use mantle_gateway::layout::{Layout, SEALED};
 use mantle_gateway::put::{
@@ -191,6 +192,12 @@ impl Cell {
     }
 
     fn create_upload(&mut self, key: &str) -> String {
+        self.create_upload_with(key, None)
+    }
+
+    /// An upload whose parts carry checksums in `checksum`'s algorithm, combined full-object
+    /// or composite.
+    fn create_upload_with(&mut self, key: &str, checksum: Option<(u8, bool)>) -> String {
         let create = name::Command::CreateUpload(CreateUpload {
             bucket: BUCKET.into(),
             incarnation: 1,
@@ -200,7 +207,7 @@ impl Cell {
                 initiated_ns: 0,
                 owner: "o".into(),
                 headers: Vec::new(),
-                checksum: None,
+                checksum,
                 retention: None,
                 legal_hold: None,
             },
@@ -208,6 +215,25 @@ impl Cell {
         match self.name(create) {
             name::Outcome::Created { upload } => upload,
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// What the cell answers a completion's request for `key`'s upload `upload`.
+    fn serve_complete(
+        &mut self,
+        key: &str,
+        upload: &str,
+        request: complete::Request,
+    ) -> complete::Answer {
+        match request {
+            complete::Request::Upload => {
+                complete::Answer::Upload(name::upload(&self.names, BUCKET, key, upload).unwrap())
+            }
+            complete::Request::Parts { after, max } => complete::Answer::Parts(
+                name::parts(&self.names, BUCKET, key, upload, after, max).unwrap(),
+            ),
+            complete::Request::File(c) => complete::Answer::File(self.file(c)),
+            complete::Request::Name(c) => complete::Answer::Name(self.name(*c)),
         }
     }
 
@@ -1295,5 +1321,250 @@ proptest! {
         let file = if len > 0 { Some(120) } else { None };
         let got = read(&mut cell, file, len as u64, range.clone(), &wrapping, lifo).unwrap();
         prop_assert!(got == bytes[range.start as usize..range.end as usize]);
+    }
+}
+
+/// Uploads `bodies` as parts 1, 2, … of `key`'s upload `upload`, each in its own file from
+/// `first_file` on, and returns each part's ETag.
+fn upload_parts(
+    cell: &mut Cell,
+    key: &str,
+    upload: &str,
+    bodies: &[Vec<u8>],
+    first_file: u128,
+    checksum: Option<Algorithm>,
+    wrapping: &WrappingKey,
+) -> Vec<String> {
+    let layout = Layout::new(Scheme::Copies(2)).unwrap();
+    let mut etags = Vec::new();
+    for (i, bytes) in bodies.iter().enumerate() {
+        let file = first_file + i as u128;
+        let body = Body {
+            length: bytes.len() as u64,
+            checksum,
+            content_md5: false,
+        };
+        let mut put = Put::new(
+            part(key, upload, i as u16 + 1),
+            body,
+            keys(file, wrapping),
+            layout,
+            HANDOVER,
+            Box::new(Counter(file * 1_000)),
+            cell.clock,
+        )
+        .unwrap();
+        let stored = run(
+            cell,
+            &mut put,
+            bytes,
+            &FAST,
+            &Expected::default(),
+            |_, _| {},
+        )
+        .unwrap();
+        etags.push(stored.etag);
+    }
+    etags
+}
+
+/// Completes `key`'s upload `upload` with the parts `listed` into file `file`.
+fn complete_upload(
+    cell: &mut Cell,
+    key: &str,
+    upload: &str,
+    listed: Vec<(u16, String)>,
+    file: u128,
+) -> Result<Completed, CompleteError> {
+    let template = name::Complete {
+        bucket: BUCKET.into(),
+        incarnation: 1,
+        key: key.into(),
+        upload: upload.into(),
+        versioning: Versioning::Unversioned,
+        preconditions: Preconditions::default(),
+        at_ns: 0,
+        parts: Vec::new(),
+        etag: String::new(),
+        size: 0,
+        checksum: None,
+        file: None,
+        default: None,
+        deadline_ns: 0,
+    };
+    let mut completion = Completion::new(template, listed, file, HANDOVER)?;
+    loop {
+        if let Some(outcome) = completion.outcome() {
+            return outcome.clone();
+        }
+        let (id, request) = completion.poll().expect("a completion waits on nothing");
+        let answer = cell.serve_complete(key, upload, request);
+        completion.answer(id, answer)?;
+    }
+}
+
+/// An upload of three parts, each with its CRC-64/NVME, completes into an object whose size,
+/// ETag and checksum are its parts' combined, as S3 combines them, and whose bytes read back
+/// as the parts' in order, whole and across a part's end.
+#[test]
+fn a_completed_upload_is_its_parts() {
+    let mut cell = Cell::new(3);
+    let wrapping = WrappingKey::generate().unwrap();
+    let full = Some((Algorithm::Crc64Nvme.code(), true));
+    let upload = cell.create_upload_with("k", full);
+    let bodies = [body((5 << 20) + 7, 1), body(5 << 20, 2), body(100, 3)];
+    let etags = upload_parts(
+        &mut cell,
+        "k",
+        &upload,
+        &bodies,
+        200,
+        Some(Algorithm::Crc64Nvme),
+        &wrapping,
+    );
+    let listed: Vec<(u16, String)> = (1..=3).zip(etags.iter().cloned()).collect();
+    let done = complete_upload(&mut cell, "k", &upload, listed.clone(), 300).unwrap();
+    let whole: Vec<u8> = bodies.concat();
+    let digests: Vec<[u8; 16]> = bodies.iter().map(|b| md5(b)).collect();
+    assert_eq!(done.size, whole.len() as u64);
+    assert_eq!(done.etag, checksum::multipart_etag(&digests).unwrap());
+    let crc = checksum::checksum(Algorithm::Crc64Nvme, &whole).unwrap();
+    assert_eq!(
+        done.checksum.as_ref().map(|c| c.value.clone()),
+        Some(crc.bytes)
+    );
+    let v = cell.current("k");
+    assert_eq!(
+        (v.size, v.etag.clone(), v.file),
+        (done.size, done.etag.clone(), Some(300))
+    );
+    let size = whole.len() as u64;
+    let first = bodies[0].len() as u64;
+    for range in [0..size, first - 5..first + 5, size - 100..size] {
+        let got = read(&mut cell, v.file, size, range.clone(), &wrapping, false).unwrap();
+        assert!(
+            got == whole[range.start as usize..range.end as usize],
+            "{range:?}"
+        );
+    }
+    // A retry once the upload is gone finds the version it made.
+    let again = complete_upload(&mut cell, "k", &upload, listed, 301).unwrap();
+    assert_eq!(again.version, done.version);
+}
+
+/// A composite checksum is the hash of the parts' values, with the number of parts.
+#[test]
+fn a_composite_checksum_hashes_the_parts_values() {
+    let mut cell = Cell::new(3);
+    let wrapping = WrappingKey::generate().unwrap();
+    let composite = Some((Algorithm::Sha256.code(), false));
+    let upload = cell.create_upload_with("k", composite);
+    let bodies = [body(5 << 20, 4), body(10, 5)];
+    let etags = upload_parts(
+        &mut cell,
+        "k",
+        &upload,
+        &bodies,
+        400,
+        Some(Algorithm::Sha256),
+        &wrapping,
+    );
+    let done = complete_upload(&mut cell, "k", &upload, (1..=2).zip(etags).collect(), 500).unwrap();
+    let values: Vec<u8> = bodies
+        .iter()
+        .flat_map(|b| checksum::checksum(Algorithm::Sha256, b).unwrap().bytes)
+        .collect();
+    let expected = checksum::checksum(Algorithm::Sha256, &values).unwrap();
+    let got = done.checksum.unwrap();
+    assert_eq!((got.parts, got.value), (2, expected.bytes));
+}
+
+/// What a completion refuses: parts out of order before anything is asked, a part never
+/// uploaded or with another ETag, a part other than the last under 5 MiB; parts not listed
+/// are left out; and an empty last part adds nothing to the object's file.
+#[test]
+fn a_completion_is_held_to_its_parts() {
+    let mut cell = Cell::new(3);
+    let wrapping = WrappingKey::generate().unwrap();
+    let upload = cell.create_upload("k");
+    let bodies = [
+        body(5 << 20, 6),
+        body(1000, 7),
+        body(5 << 20, 8),
+        Vec::new(),
+    ];
+    let etags = upload_parts(&mut cell, "k", &upload, &bodies, 600, None, &wrapping);
+    let listed = |numbers: &[u16]| -> Vec<(u16, String)> {
+        numbers
+            .iter()
+            .map(|&n| (n, etags[usize::from(n) - 1].clone()))
+            .collect()
+    };
+    assert!(matches!(
+        Completion::new(
+            name::Complete {
+                parts: Vec::new(),
+                ..template_complete("k", &upload)
+            },
+            listed(&[2, 1]),
+            700,
+            HANDOVER
+        ),
+        Err(CompleteError::InvalidPartOrder)
+    ));
+    let mut wrong = listed(&[1, 3]);
+    wrong[1].1 = "0".repeat(32);
+    assert_eq!(
+        complete_upload(&mut cell, "k", &upload, wrong, 700),
+        Err(CompleteError::InvalidPart)
+    );
+    assert_eq!(
+        complete_upload(
+            &mut cell,
+            "k",
+            &upload,
+            vec![(1, etags[0].clone()), (5, "0".repeat(32))],
+            701
+        ),
+        Err(CompleteError::InvalidPart)
+    );
+    assert_eq!(
+        complete_upload(&mut cell, "k", &upload, listed(&[2, 3]), 702),
+        Err(CompleteError::EntityTooSmall)
+    );
+    // Parts 1 and 3, part 2 left out, and the empty part 4 last.
+    let done = complete_upload(&mut cell, "k", &upload, listed(&[1, 3, 4]), 703).unwrap();
+    assert_eq!(done.size, 10 << 20);
+    let extents = file::extents(&cell.files, 703, 0, 10).unwrap();
+    assert_eq!(extents.len(), 2);
+    let whole: Vec<u8> = [bodies[0].clone(), bodies[2].clone()].concat();
+    let got = read(
+        &mut cell,
+        Some(703),
+        done.size,
+        0..done.size,
+        &wrapping,
+        false,
+    )
+    .unwrap();
+    assert!(got == whole);
+}
+
+fn template_complete(key: &str, upload: &str) -> name::Complete {
+    name::Complete {
+        bucket: BUCKET.into(),
+        incarnation: 1,
+        key: key.into(),
+        upload: upload.into(),
+        versioning: Versioning::Unversioned,
+        preconditions: Preconditions::default(),
+        at_ns: 0,
+        parts: Vec::new(),
+        etag: String::new(),
+        size: 0,
+        checksum: None,
+        file: None,
+        default: None,
+        deadline_ns: 0,
     }
 }

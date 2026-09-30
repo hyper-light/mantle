@@ -1247,6 +1247,7 @@ fn put_name_outcome(w: &mut Writer, o: &name::Outcome) -> Result<(), RecordError
             record::put_lineage(w, lineage)?;
         }
         O::Resolved => w.u8(34),
+        O::Miscombined => w.u8(36),
     }
     Ok(())
 }
@@ -1344,6 +1345,7 @@ fn take_name_outcome(r: &mut Reader<'_>) -> Option<name::Outcome> {
         32 => O::Ended,
         33 => O::Thawed(Box::new(record::take_lineage(r)?)),
         34 => O::Resolved,
+        36 => O::Miscombined,
         _ => return None,
     })
 }
@@ -1856,6 +1858,7 @@ mod tests {
                 N::Ended,
                 N::Thawed(Box::new(lineage)),
                 N::Resolved,
+                N::Miscombined,
             ]
             .map(Answer::Name),
         );

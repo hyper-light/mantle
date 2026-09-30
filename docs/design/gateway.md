@@ -123,6 +123,19 @@ refused chunks land elsewhere, released blocks fail the PUT, empty objects and p
 shapes above, and generated schedules of bodies, client pace and refusing volumes commit each
 object whole or nothing; without renewals, a slow client's PUT fails.
 
+**Completing an upload** (`complete.rs`) reads the upload's row and its parts from the Name
+range, a page at a time as many as the parts listed past the last read, and checks the listed
+parts against them: each uploaded, with the ETag the request sent, and each but the last at
+least 5 MiB (05 §4.4). The object's size, ETag and checksum are derived from those rows and
+never taken from the request: the size the parts' sum, the ETag the MD5 of their MD5s with
+their number (05 §4.5), and the checksum, in the algorithm the upload named, the full-object
+CRC combined from each part's value and length, or the composite hash of the parts' values
+(05 §3.4). The object's file of parts is written with each part's plaintext length, an empty
+part left out, and the Name range's Complete checks the parts again against its own rows,
+refusing a size that is not their sum or an ETag that does not name their number
+(`Miscombined`), and commits (audit §16.5). A completion whose upload is gone asks the Name
+range for the version a completion of the same parts made, and gets it or `NoSuchUpload`.
+
 ## 3. Reading an object
 
 A GET reads top down (`get.rs`), from the version the Name range read, whose preconditions,

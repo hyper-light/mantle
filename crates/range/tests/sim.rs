@@ -63,7 +63,6 @@ fn log_config() -> LogConfig {
         group_bytes: 4 << 10,
         group_cache: 1 << 12,
         queue_submissions: 16,
-        queue_bytes: 1 << 20,
         // Each member has one update out at a time, so none returns within a wait.
         waits: Waits::Never,
     }

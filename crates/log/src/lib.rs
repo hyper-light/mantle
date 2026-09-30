@@ -55,9 +55,9 @@ pub struct Config {
     pub group_bytes: u64,
     /// Payload bytes of recent entries one group keeps in memory.
     pub group_cache: u64,
-    /// Submissions the queue admits, and their bytes: two batches' worth [research/11 §4].
+    /// Submissions the queue admits [research/11 §4]. Their bytes are bounded by
+    /// [`Log::queue_bytes`], which the frame's size gives.
     pub queue_submissions: usize,
-    pub queue_bytes: u64,
     /// What the writer waits for between frames.
     pub waits: Waits,
 }
@@ -107,6 +107,20 @@ pub struct Update {
     /// The replica left this device: every record of the group is dead. Nothing else may
     /// come with it.
     pub remove: bool,
+}
+
+/// How urgently a submission is wanted durable, as Tectonic's TrafficClasses order a node's
+/// work: latency-sensitive, normal and background [research/01 §1.11]. A frame with room for
+/// only some of the waiting updates takes them by class, most urgent first, after those it
+/// passed over before (docs/design/raft-log.md §3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Class {
+    /// A replica whose callers wait on the write: a metadata range's ready.
+    Latency,
+    #[default]
+    Normal,
+    /// Work no caller waits on: a compaction's start, a rebuild's catch-up.
+    Background,
 }
 
 /// A group's durable state, as focal-raft's `Storage` reads it.
@@ -172,7 +186,11 @@ struct Submission {
     group: u128,
     update: Update,
     marks: Marks,
+    /// What it holds of the queue's byte bound, and what the writer's fair queue charges it.
     bytes: u64,
+    class: Class,
+    /// Where the writer's fair queue placed it when taken (docs/design/raft-log.md §3).
+    tags: writer::Tags,
     reply: SyncSender<Result<(), LogError>>,
 }
 
@@ -247,6 +265,14 @@ pub(crate) fn frame_room(config: &Config, align: Alignment) -> Result<usize, Log
         .ok_or(LogError::Config("a segment holds no frame"))
 }
 
+/// Frames' worth of charged bytes the log holds for submissions not yet answered: the frame
+/// flushed and awaiting the persist record that confirms it, the frame being written, whose
+/// record does, and the frame gathering while that flush runs (docs/design/raft-log.md §3). With
+/// less, the next frame could gather only once a flush ended and would go out short; bytes past
+/// a third frame cannot be written before the third flush from now, so by Little's law they
+/// add only waiting [research/11 §4, §5.2].
+const PIPELINE_FRAMES: u64 = 3;
+
 /// Submissions one group may have unanswered: the most its replica sends at once, the part of
 /// its ready in flight and a compaction, each of which waits for its answer before the next
 /// (docs/design/replica.md §3–§4); the writes a replica makes as it opens come before any
@@ -258,6 +284,10 @@ struct Shared<F> {
     id: u128,
     config: Config,
     align: Alignment,
+    /// Payload bytes one frame holds: no submission whose records take more is admitted.
+    frame_room: usize,
+    /// Charged bytes the queue holds at most (`PIPELINE_FRAMES`).
+    queue_bytes: u64,
     /// Buffers for reading entries back.
     pool: Pool,
     state: RwLock<State>,
@@ -331,11 +361,17 @@ impl<F: BlockFile + 'static> Log<F> {
         let align = file.alignment();
         let largest = usize::try_from(config.segment_bytes)
             .map_err(|_| LogError::Config("segment larger than memory"))?;
+        let frame_room = frame_room(&config, align)?;
+        let queue_bytes = writer::charge(frame_room)
+            .and_then(|largest| largest.checked_mul(PIPELINE_FRAMES))
+            .ok_or(LogError::Config("a queue of three frames past u64"))?;
         let shared = Arc::new(Shared {
             file,
             id,
             config,
             align,
+            frame_room,
+            queue_bytes,
             pool: Pool::new(align, largest.saturating_mul(2), largest),
             state: RwLock::new(state),
             queue: Mutex::new(Queue::default()),
@@ -354,7 +390,13 @@ impl<F: BlockFile + 'static> Log<F> {
         {
             let mut queue = shared.queue.lock().map_err(|_| LogError::Fenced)?;
             for r in restores {
-                let bytes = update_bytes(&r.update);
+                let marks = Marks {
+                    uncertain: r.uncertain,
+                    damaged: r.damaged,
+                };
+                let bytes = writer::submission_len(r.group, &r.update, marks)
+                    .and_then(writer::charge)
+                    .ok_or(LogError::TooLarge(usize::MAX))?;
                 queue.submissions = queue.submissions.checked_add(1).ok_or(LogError::Busy)?;
                 queue.bytes = queue.bytes.checked_add(bytes).ok_or(LogError::Busy)?;
                 let own = queue.groups.entry(r.group).or_insert(0);
@@ -364,11 +406,10 @@ impl<F: BlockFile + 'static> Log<F> {
                 first.push(Submission {
                     group: r.group,
                     update: r.update,
-                    marks: Marks {
-                        uncertain: r.uncertain,
-                        damaged: r.damaged,
-                    },
+                    marks,
                     bytes,
+                    class: Class::Normal,
+                    tags: writer::Tags::default(),
                     reply,
                 });
             }
@@ -390,11 +431,22 @@ impl<F: BlockFile + 'static> Log<F> {
         ))
     }
 
-    /// Submits `update` for `group`: refused at once when the queue is full, otherwise
+    /// Submits `update` for `group`: refused at once with `Busy` when the queue is full, and
+    /// with `TooLarge` when its records take more than a frame holds, otherwise
     /// answered through the returned handle once it is durable and a later record confirms
     /// so.
     pub fn submit(&self, group: u128, update: Update) -> Result<Pending, LogError> {
-        self.send(group, update, false)
+        self.send(group, Class::Normal, update, false)
+    }
+
+    /// Submits `update` for `group` as `submit` does, in `class`.
+    pub fn submit_in(
+        &self,
+        group: u128,
+        class: Class,
+        update: Update,
+    ) -> Result<Pending, LogError> {
+        self.send(group, class, update, false)
     }
 
     /// Submits `update` for `group`, waiting for room in the queue rather than refusing. A
@@ -402,11 +454,34 @@ impl<F: BlockFile + 'static> Log<F> {
     /// (docs/design/replica.md §3). The writer frees room with every batch it takes, and a
     /// fence wakes every waiter, so the wait lasts no longer than the writer's progress.
     pub fn submit_waiting(&self, group: u128, update: Update) -> Result<Pending, LogError> {
-        self.send(group, update, true)
+        self.send(group, Class::Normal, update, true)
     }
 
-    fn send(&self, group: u128, update: Update, wait: bool) -> Result<Pending, LogError> {
-        let bytes = update_bytes(&update);
+    /// Submits `update` for `group` as `submit_waiting` does, in `class`.
+    pub fn submit_waiting_in(
+        &self,
+        group: u128,
+        class: Class,
+        update: Update,
+    ) -> Result<Pending, LogError> {
+        self.send(group, class, update, true)
+    }
+
+    fn send(
+        &self,
+        group: u128,
+        class: Class,
+        update: Update,
+        wait: bool,
+    ) -> Result<Pending, LogError> {
+        // Refused before it holds any room: no frame could take it, and every admitted
+        // submission fits the byte bound alone, so none waits for a queue that cannot hold it.
+        let len = writer::submission_len(group, &update, Marks::default())
+            .ok_or(LogError::TooLarge(usize::MAX))?;
+        if len > self.shared.frame_room {
+            return Err(LogError::TooLarge(len));
+        }
+        let bytes = writer::charge(len).ok_or(LogError::TooLarge(len))?;
         {
             let config = &self.shared.config;
             let mut queue = self.shared.queue.lock().map_err(|_| LogError::Fenced)?;
@@ -417,9 +492,10 @@ impl<F: BlockFile + 'static> Log<F> {
                 let submissions = queue.submissions.checked_add(1).ok_or(LogError::Busy)?;
                 let total = queue.bytes.checked_add(bytes).ok_or(LogError::Busy)?;
                 let own = queue.groups.get(&group).copied().unwrap_or(0);
-                // A submission larger than the byte bound is taken into an empty queue.
+                // A group's two submissions of the largest charge hold two thirds of the byte
+                // bound at most, so one group never takes the room the others need.
                 let room = submissions <= config.queue_submissions
-                    && (queue.bytes == 0 || total <= config.queue_bytes)
+                    && total <= self.shared.queue_bytes
                     && own < GROUP_SUBMISSIONS;
                 if room {
                     queue.submissions = submissions;
@@ -441,6 +517,8 @@ impl<F: BlockFile + 'static> Log<F> {
             update,
             marks: Marks::default(),
             bytes,
+            class,
+            tags: writer::Tags::default(),
             reply,
         };
         match sender.try_send(submission) {
@@ -462,7 +540,15 @@ impl<F: BlockFile + 'static> Log<F> {
 
     /// Payload bytes one frame holds: an update no longer than this fits a frame of its own.
     pub fn frame_room(&self) -> Result<usize, LogError> {
-        frame_room(&self.shared.config, self.shared.align)
+        Ok(self.shared.frame_room)
+    }
+
+    /// Charged bytes the queue holds at most for submissions not yet answered: three frames
+    /// of the largest charge (docs/design/raft-log.md §3). A submission is charged the bytes
+    /// its records take in a frame, headers included, and its row in the frame's persist
+    /// record, so an empty entry or an update of no records still costs what it holds.
+    pub fn queue_bytes(&self) -> u64 {
+        self.shared.queue_bytes
     }
 
     /// The most bytes one entry may hold and still fit a frame alone.
@@ -841,15 +927,4 @@ impl<F: BlockFile + 'static> Drop for Log<F> {
             let _ = handle.join();
         }
     }
-}
-
-/// The payload bytes an update carries, which the queue's byte bound counts.
-fn update_bytes(update: &Update) -> u64 {
-    let entries = update.entries.iter().flat_map(|e| &e.entries);
-    let sizes = entries
-        .map(|e| e.bytes.len())
-        .chain(update.proposals.iter().map(|p| p.bytes.len()));
-    sizes.fold(0u64, |sum, len| {
-        sum.saturating_add(u64::try_from(len).unwrap_or(u64::MAX))
-    })
 }

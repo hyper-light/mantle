@@ -92,11 +92,13 @@ nothing of Raft's message formats, so it depends on no Raft crate.
 ## 3. Writing
 
 One writer thread per log runs the chunk store's group-commit loop (chunk-store.md §4). A
-bounded queue admits two batches' worth of submissions, by count and bytes, and refuses
-past that with `Busy` [research/11 §4]. A submission holds its room until it is answered, so
-the bound covers updates waiting to be taken, those held for a later frame and those being
-written, and each group holds two at most, the two batches' worth of a group that has one
-update in each frame; a hot group waits for its own room and never takes the others'. The loop takes everything that arrived while the
+bounded queue admits submissions by count and by bytes and refuses past either with `Busy`
+[research/11 §4] (§3.1). A submission holds its room until it is answered, so the bound
+covers updates waiting to be taken, those held for a later frame, those being written and
+those flushed and awaiting their confirmation, and each group holds two at most, the two
+batches' worth of a group that has one update in each frame; a hot group waits for its own
+room and never takes the others'. When more waits than a frame holds, the writer chooses
+what goes by class and by fair share of bytes (§3.2). The loop takes everything that arrived while the
 last batch was being made durable, encodes one frame, writes it, flushes the file once
 with the platform's full flush, and publishes the records to readers. It answers the frame's
 submitters once a later durable record confirms that flush (§6): the next frame's persist
@@ -114,7 +116,8 @@ a frame; on this machine a flush's variance hides it in throughput, and peak mem
 16 KiB-entry benchmark fell from 88.6 and 82.1 MB to 80.9 and 71.0 MB in two alternating
 pairs of runs.
 
-That wait runs on the clock. `Config::waits` chooses: `Waits::Measured` is what a node
+That wait runs on the clock, and ends once the batch holds a frame's worth of charged bytes
+(§3.1): what came next would go in a later frame whatever the wait. `Config::waits` chooses: `Waits::Measured` is what a node
 runs; under `Waits::Never` a batch is what is queued when the writer looks, for the replica
 simulation, whose members have one update out at a time and so never return within a wait.
 
@@ -141,6 +144,117 @@ come. A commit that failed before it wrote its frame once left the last two unan
 their submitters waited as long as the log lived (audit review R08). A failed flush
 is never retried, because the kernel may already have marked the pages clean [RPA+20 §3].
 The log must be reopened, and recovery trusts only what verifies.
+
+### 3.1 The queue's byte bound
+
+A submission is charged what it holds: the bytes its records take in a frame's payload,
+record and entry headers included, and its group's row in the frame's persist record, 97
+bytes (§2). An entry of no bytes costs its 29-byte record header and 16-byte entry header besides
+its row, and an update of no records its row. The queue once counted entries' and proposals'
+payload bytes alone, which charged such updates nothing, so a flood of them was bounded only
+by count (audit S03). A submission whose records take more than a frame holds is refused
+`TooLarge` when it is sent, before it holds any room, since no frame could take it.
+
+The bound is three frames of the largest charge, `B = 3·(F + 97)`, where `F` is the payload
+a frame holds, a segment less its header block and the frame header. It is derived, not
+configured. Three frames are what the writer can have in hand at once: the frame flushed and
+awaiting the persist record that confirms it (§6), the frame being written, whose record
+does, and the frame gathering while that flush runs. With two, the next frame could gather
+only once a flush had ended and would go out short; bytes past the third cannot be written
+before the third flush from now, so by Little's law they add only waiting [research/11 §4,
+§5.2]. A group's two submissions hold at most two thirds of `B`, so one group never holds
+the last frame's worth that the others need.
+
+### 3.2 Sharing a full frame
+
+A frame takes at most one update of a group, as before. When the updates waiting do not all
+fit, the writer orders them and walks the order once, laying each that fits and passing over
+each that does not. The order is by tier, and within a tier by start tag:
+
+1. updates an earlier frame passed over for room, those passed over first ahead, and those
+   of one frame by class;
+2. latency-class updates, then normal, then background.
+
+The node sets the class with `Log::submit_in` and `submit_waiting_in`; `submit` and
+`submit_waiting` are normal. The classes are Tectonic's TrafficClasses, "Gold, Silver or
+Bronze, corresponding to latency-sensitive, normal and background applications", ordered on
+Tectonic's storage nodes by three protections: a lower-class request may cede its turn to a
+higher class "if the request will have enough time to complete after the higher-TrafficClass
+request", non-Gold traffic is held back while Gold waits, and "scheduling of non-Gold
+requests to a disk stops once a Gold request has been pending there for a threshold time"
+[research/01 §1.11, TEC §4.1]. Here a lower class cedes its place in a frame to a higher one,
+and its threshold is one frame: once passed over it goes before every class, since the
+writer decides once a frame and cannot wait less than one. A group's update takes the later
+of its own place and that of its update submitted before it, as Tectonic gives traffic that
+borrows another TrafficGroup's resources "the minimum TrafficClass of the two", so a group's
+updates stay in the order submitted (§3) whatever their classes.
+
+Within a tier, groups share the frame by start-time fair queueing in charged bytes [SFQ96].
+A submission taken by the writer is stamped with the start tag `S = max(v, F_prev)`, the
+larger of the virtual time and its group's last finish tag, and the finish tag `S + charge`
+[SFQ96 §2, eqs. 4–5]; `v` is the start tag of the last update laid into a frame, and when the
+backlog empties it is set to the largest finish tag, as SFQ sets it at the end of a busy
+period. For any interval in which two groups are backlogged, the difference in the bytes
+they are served, over their weights, is at most their largest charges over their weights
+[SFQ96 Theorem 1], and the proof makes no assumption about the server's rate: "Theorem 1
+holds regardless of the characteristics of the server". A frame's service time varies with
+the device's flush and with the frame's size (research/11 §5.3), so fairness that does not
+depend on a known rate is what the log needs, and weighted fair queueing, which computes its
+virtual time from the link's capacity, does not give it [SFQ96 §1]. The delay bound depends on
+the other flows' largest packets rather than on a flow's share [SFQ96 Theorem 4], which gives
+"low average as well as maximum delay for low-throughput applications" [SFQ96 §1]: a group
+with small updates goes ahead of one that has just had a large one written. SFQ also reports
+"considerably better fairness properties and smaller maximum delay than DRR" [SFQ96 §1],
+which node.md §2.3 uses for a shard's turns; the log's server is the frame, whose capacity
+varies, where the shard's is a pass. The finish tags are kept for the groups the log holds or
+that have an update waiting, and only while ahead of the virtual time, so they are bounded by
+`max_groups` and `queue_submissions`.
+
+Every group weighs the same. Tectonic's class shares and thresholds are not published
+(research/01 §1.11), and no caller yet has a deadline from which a class's rate could be
+derived (research/11 §4.5); the classes order tiers instead of weighting one group's bytes
+over another's. Tectonic's weighted round robin "provisionally skips a TrafficGroup's turn if
+it will exceed its resource quota" (research/01 §1.11). The start tag is that quota: a group
+that has had more than its share has a start tag ahead of the others and is walked after
+them. Skipping it outright would leave room empty that it could fill, where SFQ serves it
+whenever the others leave room.
+
+**Bounds.** A latency-class update is laid in the first frame that walks it unless the
+updates passed over before it and the latency updates ahead of it fill that frame. Any update
+is walked in the first frame after the writer takes it, or the next if its group's update
+before it is in that one. Once passed over it is laid within `2⌈B/F⌉` frames, eight at these
+sizes: every update ahead of it in the first tier was taken before it and waits with it, so
+together they hold at most `B`; in any two consecutive frames before it is laid, the first
+passed-over update not laid in the first frame is laid first in the second, and what the
+first frame laid ahead of it and it together exceed `F`. Frames that sweep the tail (§5) are
+not counted. `latency_traffic_does_not_starve_background_work` and
+`hot_groups_do_not_starve_a_cold_one` step the writer a frame at a time and find such an
+update written in the frame after the one that passed it over.
+
+**Measured** (`crates/log/tests/fairness.rs`, the simulated device stepped a flush at a time,
+400 frames a mix, so each run is the same run). A hot group keeps two updates of a share of a
+frame outstanding, cold groups one each, all closed loops. Waits are frames from sending to
+being written; two is the least, the frame flushing when the update is sent and the next.
+
+| Mix (share of a frame) | Arrival order (before) | Passed over first, then arrival | SFQ with class tiers |
+|---|---|---|---|
+| hot 0.9, 8 cold 0.05 | cold wait mean 2.403, max 4; hot 0.665/frame, cold 3.31/frame | 2.402, max 3; 0.662, 3.32 | **2.004, max 3; 0.497, 3.98** |
+| hot 0.6, 16 cold 0.05 | 2.003, max 3; 0.665, 7.96 | 2.003, max 3; 0.665, 7.96 | 2.003, max 3; 0.665, 7.96 |
+| hot 0.9, 4 cold 0.3 | 4.003, max 5; 0.500, 0.99 | 2.008, max 3; 0.662, 1.00 | 2.008, max 3; 0.662, 1.00 |
+| hot 0.9 background, 8 cold 0.05 latency | 2.403, max 4; 0.665, 3.31 | 2.402, max 3; 0.662, 3.32 | **2.000, max 2; 0.497, 3.98** |
+
+SFQ with class tiers is kept. Where the frames are full it gives the cold groups every update
+they ask for, at the least wait, and the latency class never waits past the least. The hot
+group's rate falls from 0.665 to 0.497 updates a frame in the first mix: it asked for 0.9 of
+every frame while the cold groups asked for 0.2, and max-min fairness serves the smaller
+demand whole [SFQ96 Theorem 1]; an update of 0.9 of a frame fits only beside less than 0.1
+of others, so the frames the cold groups share carry less in all. Arrival order let the hot
+group take that room and the cold groups waited for it, and passing over for room first
+bounded the waits of large cold updates (the third mix) but not the share.
+
+[SFQ96]: P. Goyal, H. M. Vin, H. Cheng. "Start-time Fair Queuing: A Scheduling Algorithm for
+Integrated Services Packet Switching Networks." SIGCOMM '96, pp. 157–168.
+http://conferences.sigcomm.org/sigcomm/1996/papers/goyal.pdf
 
 ## 4. What a group holds in memory
 
@@ -346,7 +460,11 @@ multi-sector writes, fails flushes after marking pages clean, and flips bits on 
 - every acknowledged submission survives any crash;
 - a torn tail is cut and corruption is reported, damage to any field of a frame or of a
   segment header included, and slots reused by a newer segment prove nothing about it;
-- a group's updates held behind a frame's room become durable in the order submitted;
+- a group's updates held behind a frame's room become durable in the order submitted, whatever
+  their classes;
+- the queue refuses past its byte bound with `Busy`, charging empty entries their records;
+- a full frame takes updates by class and by fair share, and an update passed over for room
+  is written in the next frame under hot traffic of any class;
 - reclamation never loses a live record, and a lost frame that swept the tail loses
   nothing unreported when the next frame's opening tears over the segment it freed;
 - a group's state after recovery equals its state before the crash, less what was never
@@ -362,6 +480,8 @@ latency against the device's measured flush rate.
   workload is measured. A sweep reads a whole segment in one batch, which that batch's
   submitters wait for.
 
+- Weights for the classes, once callers carry deadlines from which a class's share of a full
+  frame can be derived (research/11 §4.5); until then the classes are tiers of equal weight.
 - The window of entries a leader keeps for lagging followers before it sends a snapshot,
   as a function of the snapshot's cost and the follower's measured lag.
 - Whether a segment a sweep freed waits to be reused until a frame after the sweep's is

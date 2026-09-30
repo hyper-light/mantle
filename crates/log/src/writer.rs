@@ -28,7 +28,7 @@
 //! waiting is expected to lower total latency, as the chunk store's writer does
 //! (`mantle_disk::commit`). Under `Waits::Never` it forms each batch from what is queued.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
@@ -45,7 +45,62 @@ use crate::state::{
     self, DAMAGED_BYTES, Group, HARD_STATE_BYTES, PROPOSAL_EXTRA, Place, START_BYTES, Slot,
     UNCERTAIN_BYTES, entry_bytes, resolves,
 };
-use crate::{LogError, Shared, State, Submission, Update, Waits};
+use crate::{Class, LogError, Shared, State, Submission, Update, Waits};
+
+/// Where the writer's fair queue placed a submission (docs/design/raft-log.md §3).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Tags {
+    /// Its place in the order the writer took submissions.
+    seq: u64,
+    /// Its start tag in start-time fair queueing: the larger of the virtual time when it was
+    /// taken and its group's last finish tag, in charged bytes [SFQ96 §2 eq. 4].
+    start: u128,
+    /// The frame that first passed it over for room, if one has.
+    passed: Option<u64>,
+}
+
+/// The order a frame considers a submission in: its tier (passed over, then each class), then
+/// when it was passed over and its class, or its start tag, then when it was taken.
+type Key = (u8, u128, u64);
+
+fn key(s: &Submission) -> Key {
+    let class = match s.class {
+        Class::Latency => 1u8,
+        Class::Normal => 2,
+        Class::Background => 3,
+    };
+    match s.tags.passed {
+        // Those one frame passed over go by class among themselves, all before any a later
+        // frame passes over.
+        Some(frame) => (0, u128::from(frame) << 2 | u128::from(class), s.tags.seq),
+        None => (class, s.tags.start, s.tags.seq),
+    }
+}
+
+/// Puts the backlog in the order a frame considers it (docs/design/raft-log.md §3). A group's
+/// update never sorts before one of its own taken earlier: it takes the later key of the two,
+/// as Tectonic gives traffic that borrows another TrafficGroup's resources the lower of their
+/// classes [research/01 §1.11], so a group's updates stay in the order submitted.
+fn order(batch: &mut VecDeque<Submission>) {
+    let mut taken: Vec<Submission> = std::mem::take(batch).into();
+    taken.sort_by_key(|s| s.tags.seq);
+    let mut last: HashMap<u128, Key> = HashMap::new();
+    let mut keyed: Vec<(Key, Submission)> = taken
+        .into_iter()
+        .map(|s| {
+            let own = key(&s);
+            let k = match last.get(&s.group) {
+                Some(&before) if before > own => before,
+                _ => own,
+            };
+            last.insert(s.group, k);
+            (k, s)
+        })
+        .collect();
+    // Stable: a group's updates of one key keep the order they were taken in.
+    keyed.sort_by_key(|(k, _)| *k);
+    batch.extend(keyed.into_iter().map(|(_, s)| s));
+}
 
 /// Where an update's pieces went in the payload.
 #[derive(Debug, Default)]
@@ -81,8 +136,18 @@ struct Sweep {
 pub(crate) struct Writer<F> {
     shared: Arc<Shared<F>>,
     receiver: Receiver<Submission>,
-    /// Updates held for the next batch: a group's second update waits for its first.
+    /// Updates held for the next batch: those a frame passed over for room, and those whose
+    /// group had an update in it.
     held: VecDeque<Submission>,
+    /// Start-time fair queueing's virtual time, in charged bytes: the largest start tag laid
+    /// into a frame, and the largest finish tag once the backlog empties [SFQ96 §2].
+    virtual_time: u128,
+    /// Each group's last finish tag, while it is ahead of the virtual time and the group is
+    /// one the log holds or has an update waiting: at most `max_groups` and
+    /// `queue_submissions` entries.
+    finish: HashMap<u128, u128>,
+    /// Frames laid out so far, which date a submission passed over.
+    walks: u64,
     /// Payload bytes one frame holds.
     capacity: usize,
     anticipation: Anticipation,
@@ -123,6 +188,9 @@ impl<F: BlockFile> Writer<F> {
             capacity,
             anticipation: Anticipation::new(),
             received: 0,
+            virtual_time: 0,
+            finish: HashMap::new(),
+            walks: 0,
             unconfirmed: None,
             frame: None,
         })
@@ -145,6 +213,11 @@ impl<F: BlockFile> Writer<F> {
                     backlog = self.backlog();
                     continue;
                 }
+                // The backlog is empty: the busy period ends at the largest finish tag
+                // [SFQ96 §2], and no group's past service counts against it any longer.
+                let last = self.finish.values().copied().max().unwrap_or(0);
+                self.virtual_time = self.virtual_time.max(last);
+                self.finish.clear();
                 match self.receiver.recv() {
                     Ok(s) => batch.push_back(self.taken(s)),
                     Err(_) => return,
@@ -170,8 +243,25 @@ impl<F: BlockFile> Writer<F> {
                 // The commit fenced the log and answered every update it held.
                 Err(_) => 0,
             };
+            self.forget();
             backlog = self.backlog();
         }
+    }
+
+    /// Drops the finish tags that no longer order anything: those the virtual time has passed,
+    /// which a start tag would take the virtual time over, and those of groups the log no
+    /// longer holds with nothing waiting, so the map is bounded by the log's groups and the
+    /// queue's submissions.
+    fn forget(&mut self) {
+        let waiting: HashSet<u128> = self.held.iter().map(|s| s.group).collect();
+        let Ok(state) = self.shared.read_state() else {
+            self.finish.clear();
+            return;
+        };
+        let now = self.virtual_time;
+        self.finish.retain(|group, finish| {
+            *finish > now && (state.groups.contains_key(group) || waiting.contains(group))
+        });
     }
 
     /// Submissions sent before the answers just given went out: they are queued ahead of any
@@ -244,12 +334,24 @@ impl<F: BlockFile> Writer<F> {
                 .unwrap_or(u64::MAX)
                 .saturating_sub(before)
         };
-        while returned(batch) < answered && batch.len() < self.shared.config.queue_submissions {
+        // A batch that holds a frame's worth already is not waited on: what came next would
+        // go in a later frame whatever the wait.
+        let full = u64::try_from(self.capacity).unwrap_or(u64::MAX);
+        let mut gathered = batch
+            .iter()
+            .fold(0u64, |sum, s| sum.saturating_add(s.bytes));
+        while returned(batch) < answered
+            && batch.len() < self.shared.config.queue_submissions
+            && gathered < full
+        {
             let Some(step) = self.anticipation.wait(batch.len()) else {
                 break;
             };
             match self.receiver.recv_timeout(step) {
-                Ok(s) => batch.push_back(self.taken(s)),
+                Ok(s) => {
+                    gathered = gathered.saturating_add(s.bytes);
+                    batch.push_back(self.taken(s));
+                }
                 Err(_) => break,
             }
         }
@@ -259,8 +361,26 @@ impl<F: BlockFile> Writer<F> {
     /// Counts a submission the writer took. Its room in the queue is held until it is
     /// answered, so the queue's bound covers the updates held for a later frame and those in
     /// the frame being written as well as those waiting (audit S03).
-    fn taken(&mut self, s: Submission) -> Submission {
+    ///
+    /// It is stamped for the fair queue: its start tag is the larger of the virtual time and
+    /// its group's last finish tag, and its finish tag its start plus its charge [SFQ96 §2
+    /// eqs. 4–5]. Every group weighs the same, so a group's share of a full frame's bytes is the
+    /// others' (Theorem 1); the class orders tiers instead of weighting them.
+    fn taken(&mut self, mut s: Submission) -> Submission {
         self.received = self.received.saturating_add(1);
+        let start = self
+            .finish
+            .get(&s.group)
+            .map_or(self.virtual_time, |&f| f.max(self.virtual_time));
+        // Charged bytes over the log's life stay far below 2^128: saturation is unreachable,
+        // and would only order the group last.
+        self.finish
+            .insert(s.group, start.saturating_add(u128::from(s.bytes)));
+        s.tags = Tags {
+            seq: self.received,
+            start,
+            passed: None,
+        };
         s
     }
 
@@ -325,18 +445,20 @@ impl<F: BlockFile> Writer<F> {
             None
         };
         let mut refused = false;
+        self.walks = self.walks.saturating_add(1);
+        order(batch);
         {
             let state = self.shared.read_state()?;
             let mut seen = HashSet::new();
             let mut new_groups = 0usize;
-            while let Some(s) = batch.pop_front() {
+            while let Some(mut s) = batch.pop_front() {
                 if !seen.insert(s.group) {
                     self.held.push_back(s);
                     continue;
                 }
                 let checked =
                     validate(&state, &self.shared.config, &s, new_groups).and_then(|new| {
-                        match submission_len(&s) {
+                        match submission_len(s.group, &s.update, s.marks) {
                             Some(len) if len <= self.capacity => Ok((new, len)),
                             Some(len) => Err(LogError::TooLarge(len)),
                             None => Err(LogError::TooLarge(usize::MAX)),
@@ -352,7 +474,10 @@ impl<F: BlockFile> Writer<F> {
                 };
                 if payload.len().saturating_add(len) > self.capacity {
                     // The group stays taken for this frame: its later updates wait behind
-                    // this one, so its updates become durable in the order submitted.
+                    // this one, so its updates become durable in the order submitted. Passed
+                    // over, it goes ahead of every class from the next frame on, behind only
+                    // those passed over before it.
+                    s.tags.passed.get_or_insert(self.walks);
                     self.held.push_back(s);
                     continue;
                 }
@@ -362,6 +487,7 @@ impl<F: BlockFile> Writer<F> {
                     batch.push_front(s);
                     return Err(LogError::TooLarge(len));
                 };
+                self.virtual_time = self.virtual_time.max(s.tags.start);
                 if new {
                     new_groups = new_groups.saturating_add(1);
                 }
@@ -812,18 +938,23 @@ fn persisted(s: &Submission) -> format::Persisted {
 }
 
 /// Bytes a submission's records take in a payload: its update's and its marks'.
-fn submission_len(s: &Submission) -> Option<usize> {
-    if s.marks.damaged {
-        return format::encoded_len(&Record::Damaged { group: s.group });
+pub(crate) fn submission_len(group: u128, update: &Update, marks: crate::Marks) -> Option<usize> {
+    if marks.damaged {
+        return format::encoded_len(&Record::Damaged { group });
     }
-    let len = update_len(s.group, &s.update)?;
-    match s.marks.uncertain {
-        Some(mark) => len.checked_add(format::encoded_len(&Record::Uncertain {
-            group: s.group,
-            mark,
-        })?),
+    let len = update_len(group, update)?;
+    match marks.uncertain {
+        Some(mark) => len.checked_add(format::encoded_len(&Record::Uncertain { group, mark })?),
         None => Some(len),
     }
+}
+
+/// What a submission whose records take `len` payload bytes holds of the queue's byte bound
+/// until it is answered: those bytes, record and entry headers included, and its group's row in
+/// the frame's persist record. An empty entry costs its header and an update of no records its
+/// row, so a flood of them fills the bound as surely as large ones do (audit S03).
+pub(crate) fn charge(len: usize) -> Option<u64> {
+    u64::try_from(len.checked_add(format::PERSIST_GROUP_LEN)?).ok()
 }
 
 fn incarnation_of(state: &State, slot: u32) -> u64 {

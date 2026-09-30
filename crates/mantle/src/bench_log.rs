@@ -111,7 +111,6 @@ pub fn log(out: &mut impl Write, path: &Path, options: &Options) -> Result<(), E
                 group_bytes: 1 << 30,
                 group_cache: 1 << 16,
                 queue_submissions: most.saturating_mul(2),
-                queue_bytes: 1 << 30,
                 waits: Waits::Measured,
             };
             let log = Arc::new(Log::create(file, config, u128::from(point)).map_err(log_error)?);

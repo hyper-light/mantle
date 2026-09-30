@@ -16,9 +16,12 @@ use mantle_disk::block::BlockFile;
 use mantle_disk::buf::{AlignedBuf, Alignment};
 use mantle_disk::sim::{Crash, Fault, SimFile};
 use mantle_log::{
-    Config, Entries, Entry, HardState, Log, LogError, Proposal, Start, Update, View, Waits,
+    Class, Config, Entries, Entry, HardState, Log, LogError, Proposal, Start, Update, View, Waits,
 };
 use proptest::prelude::*;
+
+mod common;
+use common::{Released, Stepped};
 
 const ID: u128 = 0x6d61_6e74_6c65_2d6c_6f67;
 const BLOCK: usize = 4096;
@@ -34,7 +37,6 @@ fn config(segment_blocks: u64, max_segments: u32) -> Config {
         group_bytes: 1 << 24,
         group_cache: 1 << 10,
         queue_submissions: 256,
-        queue_bytes: 1 << 24,
         waits: Waits::Measured,
     }
 }
@@ -1777,6 +1779,309 @@ fn the_queue_bounds_every_submission_not_yet_answered() {
     assert_eq!(log.view(1).unwrap().unwrap().hard_state, Some(hard(2, 0)));
 }
 
+/// An update of one entry whose records take `len` payload bytes.
+fn sized(first: u64, len: usize) -> Update {
+    let header = mantle_log::format::encoded_len(&mantle_log::format::Record::Entries {
+        group: 0,
+        first,
+        entries: &[(1, &[])],
+    })
+    .unwrap();
+    Update {
+        entries: Some(Entries {
+            first,
+            entries: vec![Entry {
+                term: 1,
+                bytes: Arc::from(vec![b'x'; len - header]),
+            }],
+        }),
+        ..Update::default()
+    }
+}
+
+/// What a submission of `len` payload bytes holds of the queue's byte bound: its records and
+/// its row in the frame's persist record.
+fn charged(len: usize) -> u64 {
+    (len + mantle_log::format::PERSIST_GROUP_LEN) as u64
+}
+
+/// The queue's byte bound is three frames of the largest charge, and holds every submission
+/// not yet answered by the bytes its records take: one group's flood of frame-sized updates is
+/// refused at its own two, another group still gets in, and the bound refuses past three
+/// though the count bound has room (audit S03).
+#[test]
+fn the_queue_bounds_the_bytes_of_every_submission_not_yet_answered() {
+    let stepped = Stepped::new(sim(43));
+    let cfg = config_now(16, 64);
+    let log = Log::create(Arc::clone(&stepped), cfg, ID).unwrap();
+    let room = log.frame_room().unwrap();
+    assert_eq!(log.queue_bytes(), 3 * charged(room));
+    let full = |first| sized(first, room);
+    stepped.hold();
+    let _released = Released(Arc::clone(&stepped));
+    let mut pending = vec![log.submit(1, full(1)).unwrap()];
+    stepped.held();
+    // One group floods: its second is taken, and its third refused at its own bound.
+    pending.push(log.submit(1, full(2)).unwrap());
+    assert!(matches!(log.submit(1, full(3)), Err(LogError::Busy)));
+    // Another group still gets in, and the three fill the byte bound: a fourth is refused
+    // with most of the count bound free.
+    pending.push(log.submit(2, full(1)).unwrap());
+    assert!(matches!(log.submit(3, full(1)), Err(LogError::Busy)));
+    // A submission more than a frame holds is refused before it holds any room.
+    assert!(matches!(
+        log.submit(3, sized(1, room + 1)),
+        Err(LogError::TooLarge(len)) if len == room + 1
+    ));
+    stepped.release();
+    for p in pending {
+        p.wait().unwrap();
+    }
+    assert_eq!(log.view(1).unwrap().unwrap().last, 2);
+    assert_eq!(log.view(2).unwrap().unwrap().last, 1);
+    // Answered, they give their room back: every group gets in again.
+    log.write(3, full(1)).unwrap();
+}
+
+/// Tiny and empty updates are charged the bytes their records and persist rows take, so a
+/// flood of them from many groups fills the byte bound as large ones do (audit S03).
+#[test]
+fn empty_entries_are_charged_their_records() {
+    let stepped = Stepped::new(sim(44));
+    let mut cfg = config_now(16, 64);
+    cfg.queue_submissions = 4096;
+    let log = Log::create(Arc::clone(&stepped), cfg, ID).unwrap();
+    let empty = Update {
+        entries: Some(Entries {
+            first: 1,
+            entries: vec![Entry {
+                term: 1,
+                bytes: Arc::from(Vec::new()),
+            }],
+        }),
+        ..Update::default()
+    };
+    let len = mantle_log::format::encoded_len(&mantle_log::format::Record::Entries {
+        group: 0,
+        first: 1,
+        entries: &[(1, &[])],
+    })
+    .unwrap();
+    let cost = charged(len);
+    let nothing = charged(0);
+    let fit = log.queue_bytes() / cost;
+    assert!(fit < cfg.queue_submissions as u64);
+    stepped.hold();
+    let _released = Released(Arc::clone(&stepped));
+    let mut pending = vec![log.submit(0, empty.clone()).unwrap()];
+    stepped.held();
+    let mut group = 1u128;
+    while let Ok(p) = log.submit(group, empty.clone()) {
+        pending.push(p);
+        group += 1;
+    }
+    assert_eq!(pending.len() as u64, fit, "admitted past the byte bound");
+    assert!(matches!(
+        log.submit(group, empty.clone()),
+        Err(LogError::Busy)
+    ));
+    // An update of no records still costs its persist row: as many as the rest admits.
+    let left = log.queue_bytes() - fit * cost;
+    let mut more = 0;
+    while let Ok(p) = log.submit(group, Update::default()) {
+        pending.push(p);
+        group += 1;
+        more += 1;
+    }
+    assert_eq!(more, left / nothing);
+    stepped.release();
+    // Groups past the log's bound are refused once the writer takes them.
+    for p in pending {
+        assert!(matches!(p.wait(), Ok(()) | Err(LogError::TooManyGroups(_))));
+    }
+}
+
+/// A frame takes first the updates the frame before passed over for room, ahead of those held
+/// only because their group had one in it, so a passed-over update is written in the next
+/// frame (docs/design/raft-log.md §3).
+#[test]
+fn an_update_passed_over_for_room_is_written_in_the_next_frame() {
+    let stepped = Stepped::new(sim(45));
+    let cfg = config_now(16, 64);
+    let log = Log::create(Arc::clone(&stepped), cfg, ID).unwrap();
+    let room = log.frame_room().unwrap();
+    let (hot, cold) = (room * 45 / 100, room * 60 / 100);
+    stepped.hold();
+    let _released = Released(Arc::clone(&stepped));
+    let mut pending = vec![log.submit(9, Update::default()).unwrap()];
+    stepped.held();
+    // The next frame takes 1's first, holds 1's second behind it, and passes 2 over.
+    pending.push(log.submit(1, sized(1, hot)).unwrap());
+    pending.push(log.submit(1, sized(2, hot)).unwrap());
+    pending.push(log.submit(2, sized(1, cold)).unwrap());
+    stepped.step();
+    stepped.step();
+    assert_eq!(log.view(1).unwrap().unwrap().last, 1);
+    assert!(log.view(2).unwrap().is_none());
+    stepped.step();
+    assert!(log.view(2).unwrap().is_some(), "passed over twice");
+    assert_eq!(log.view(1).unwrap().unwrap().last, 1);
+    stepped.release();
+    for p in pending {
+        p.wait().unwrap();
+    }
+    assert_eq!(log.view(1).unwrap().unwrap().last, 2);
+}
+
+/// Hot groups keep every frame full, each with an update arriving for every frame; a cold
+/// group's update passed over for room is still written in the next frame, and the hot ones
+/// keep going (audit S03).
+#[test]
+fn hot_groups_do_not_starve_a_cold_one() {
+    hot_beside_cold(46, Class::Normal, Class::Normal);
+}
+
+/// The same when the hot groups are latency-sensitive and the cold update background work:
+/// passed over once, it goes before every class (docs/design/raft-log.md §3).
+#[test]
+fn latency_traffic_does_not_starve_background_work() {
+    hot_beside_cold(50, Class::Latency, Class::Background);
+}
+
+fn hot_beside_cold(seed: u64, hot_class: Class, cold_class: Class) {
+    let stepped = Stepped::new(sim(seed));
+    let cfg = config_now(16, 64);
+    let log = Log::create(Arc::clone(&stepped), cfg, ID).unwrap();
+    let room = log.frame_room().unwrap();
+    let (hot, cold) = (room * 55 / 100, room * 60 / 100);
+    stepped.hold();
+    let _released = Released(Arc::clone(&stepped));
+    let mut pending = vec![log.submit(9, Update::default()).unwrap()];
+    stepped.held();
+    // A group has one update in a frame at most, so two stand in for a range whose next
+    // update arrives for every frame.
+    let mut next = [1u64, 1u64];
+    let mut feed =
+        |log: &Log<Arc<Stepped>>, frame: usize, pending: &mut Vec<mantle_log::Pending>| {
+            let g = frame % 2;
+            let update = sized(next[g], hot);
+            pending.push(log.submit_in(g as u128 + 1, hot_class, update).unwrap());
+            next[g] += 1;
+        };
+    feed(&log, 0, &mut pending);
+    pending.push(log.submit_in(3, cold_class, sized(1, cold)).unwrap());
+    let before = log.flushed().0;
+    let mut written = None;
+    for frame in 1..=12 {
+        stepped.step();
+        if written.is_none() && log.view(3).unwrap().is_some() {
+            written = Some(log.flushed().0 - before);
+        }
+        feed(&log, frame, &mut pending);
+    }
+    // The held frame, the frame that passed the cold update over, and the next.
+    assert_eq!(written, Some(3), "a cold update waited behind hot ones");
+    stepped.release();
+    for p in pending {
+        p.wait().unwrap();
+    }
+    let (a, b) = (
+        log.view(1).unwrap().unwrap().last,
+        log.view(2).unwrap().unwrap().last,
+    );
+    assert_eq!((a, b), (next[0] - 1, next[1] - 1));
+}
+
+/// A frame with room for only some of the waiting updates takes them by class, and those it
+/// passes over by class again in the next: latency before normal before background, whatever
+/// the order they came in (docs/design/raft-log.md §3).
+#[test]
+fn a_full_frame_takes_updates_by_class() {
+    let stepped = Stepped::new(sim(47));
+    let log = Log::create(Arc::clone(&stepped), config_now(16, 64), ID).unwrap();
+    let big = log.frame_room().unwrap() * 60 / 100;
+    stepped.hold();
+    let _released = Released(Arc::clone(&stepped));
+    let mut pending = vec![log.submit(9, Update::default()).unwrap()];
+    stepped.held();
+    pending.push(log.submit_in(3, Class::Background, sized(1, big)).unwrap());
+    pending.push(log.submit_in(2, Class::Normal, sized(1, big)).unwrap());
+    pending.push(log.submit_in(1, Class::Latency, sized(1, big)).unwrap());
+    let written = |log: &Log<Arc<Stepped>>| -> Vec<bool> {
+        (1..=3).map(|g| log.view(g).unwrap().is_some()).collect()
+    };
+    stepped.step();
+    stepped.step();
+    assert_eq!(written(&log), [true, false, false]);
+    stepped.step();
+    assert_eq!(written(&log), [true, true, false]);
+    stepped.step();
+    assert_eq!(written(&log), [true, true, true]);
+    stepped.release();
+    for p in pending {
+        p.wait().unwrap();
+    }
+}
+
+/// A group's update of a more urgent class never goes before one of its own submitted
+/// earlier: it takes the earlier one's place in the order (docs/design/raft-log.md §3).
+#[test]
+fn a_groups_urgent_update_waits_behind_its_own_earlier_one() {
+    let stepped = Stepped::new(sim(48));
+    let log = Log::create(Arc::clone(&stepped), config_now(16, 64), ID).unwrap();
+    let big = log.frame_room().unwrap() * 60 / 100;
+    stepped.hold();
+    let _released = Released(Arc::clone(&stepped));
+    let first = log.submit(9, Update::default()).unwrap();
+    stepped.held();
+    let older = log.submit_in(1, Class::Background, sized(1, big)).unwrap();
+    let newer = log
+        .submit_in(
+            1,
+            Class::Latency,
+            Update {
+                entries: Some(entries(2, &[1])),
+                ..Update::default()
+            },
+        )
+        .unwrap();
+    stepped.release();
+    for p in [first, older, newer] {
+        p.wait().unwrap();
+    }
+    assert_eq!(log.view(1).unwrap().unwrap().last, 2);
+}
+
+/// Groups of one class share a full frame by start-time fair queueing in bytes: a group that
+/// just had a large update written waits behind a group taken after it that has had none
+/// (docs/design/raft-log.md §3).
+#[test]
+fn a_group_just_served_waits_behind_one_that_was_not() {
+    let stepped = Stepped::new(sim(49));
+    let log = Log::create(Arc::clone(&stepped), config_now(16, 64), ID).unwrap();
+    let room = log.frame_room().unwrap();
+    let (hot, cold) = (room * 60 / 100, room * 50 / 100);
+    stepped.hold();
+    let _released = Released(Arc::clone(&stepped));
+    let mut pending = vec![log.submit(9, Update::default()).unwrap()];
+    stepped.held();
+    pending.push(log.submit(1, sized(1, hot)).unwrap());
+    pending.push(log.submit(1, sized(2, hot)).unwrap());
+    stepped.step();
+    // The frame now flushing holds group 1's first; its second waits for the next.
+    pending.push(log.submit(2, sized(1, cold)).unwrap());
+    stepped.step();
+    assert_eq!(log.view(1).unwrap().unwrap().last, 1);
+    stepped.step();
+    assert!(log.view(2).unwrap().is_some(), "taken after, written after");
+    assert_eq!(log.view(1).unwrap().unwrap().last, 1);
+    stepped.release();
+    for p in pending {
+        p.wait().unwrap();
+    }
+    assert_eq!(log.view(1).unwrap().unwrap().last, 2);
+}
+
 #[test]
 fn another_log_or_geometry_is_refused() {
     let file = sim(9);
@@ -2047,8 +2352,9 @@ proptest! {
                 apply(&mut predicted, group, &u);
                 let pending = match log.submit(group, u.clone()) {
                     Ok(pending) => pending,
-                    // At the queue's bound, or the group's: refused whole, changing nothing.
-                    Err(LogError::Busy) => continue,
+                    // At the queue's bound, or the group's, or more than a frame holds: refused
+                    // whole, changing nothing.
+                    Err(LogError::Busy | LogError::TooLarge(_)) => continue,
                     Err(e) => return Err(TestCaseError::fail(format!("{e}"))),
                 };
                 submitted.push((group, u, pending));

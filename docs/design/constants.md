@@ -170,6 +170,7 @@ gains a basis lowers the ceiling.
 | `crates/log/src/format.rs` `START` | format | Record kind code 4 in the frame payload encoding. |
 | `crates/log/src/format.rs` `UNCERTAIN` | format | Record kind code 7 in the frame payload encoding. |
 | `crates/log/src/lib.rs` `GROUP_SUBMISSIONS` | derived | The most a replica has unanswered at once: its ready's part in flight and a compaction, each waiting for its answer (replica.md §3–§4). A replica with more than one ready in flight (§7) raises it. |
+| `crates/log/src/lib.rs` `PIPELINE_FRAMES` | derived | 3: the frames a submission's room may span, the one flushed awaiting its confirming persist record, the one being written, and the one gathering while that flush runs (raft-log.md §3). The queue's byte bound is this many of the largest charge, a frame's payload plus its persist row, so it follows the segment size and is not configured; a third frame's bytes cannot be written sooner than the third flush, so more adds only waiting [research/11 §4, §5.2]. |
 | `crates/log/src/state.rs` `DAMAGED_BYTES` | format | Encoded size of a `Damaged` record (kind and group) in the frame payload. |
 | `crates/log/src/state.rs` `HARD_STATE_BYTES` | format | Encoded size of a `HardState` record in the frame payload. |
 | `crates/log/src/state.rs` `PROPOSAL_EXTRA` | format | A proposal's encoded bytes beyond an entry's: kind, group and index (1 + 16 + 8). |
@@ -316,7 +317,7 @@ parameters. The gate does not parse these; they are kept here with the same kind
 | `crates/mantle/src/bench.rs:346` run fill_size and fill workers 8 | open | The first pass fills with 1 MiB chunks from eight writers; neither is derived. |
 | `crates/mantle/src/bench.rs:366` run budget | open | A put round writes at most a third of the volume; the fraction lacks a derivation. |
 | `crates/mantle/src/bench_log.rs:58` sizes and replicas | open | Entry sizes 128 B, 1 KiB, 16 KiB and replicas 1–256 are recorded in the raft-log benchmark without a derivation. |
-| `crates/mantle/src/bench_log.rs:107` log Config | open | 16 MiB segments, 64 segments, 2^20 entries and 1 GiB per group, 64 KiB cache, queue of twice the replicas and 1 GiB: set above use, not derived. |
+| `crates/mantle/src/bench_log.rs:107` log Config | open | 16 MiB segments, 64 segments, 2^20 entries and 1 GiB per group, 64 KiB cache, queue of twice the replicas: set above use, not derived. |
 | `crates/mantle/src/bench_log.rs:54` log alignment floor 4096 | open | As the chunk benchmark's floor. |
 | `crates/mantle/src/bench_meta.rs:96` at least 5 runs | open | The minimum lacks a statistical derivation. |
 | `crates/mantle/src/bench_meta.rs:124` parts, commands, ranges, pages, extents | open | Ladders ending at the production limits they exercise (10,000 parts is S3's); the ladders themselves are not derived. |

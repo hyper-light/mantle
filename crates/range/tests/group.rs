@@ -33,7 +33,6 @@ fn log_config() -> LogConfig {
         group_bytes: 1 << 24,
         group_cache: 1 << 16,
         queue_submissions: 64,
-        queue_bytes: 1 << 22,
         waits: Waits::Measured,
     }
 }

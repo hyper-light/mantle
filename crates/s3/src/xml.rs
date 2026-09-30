@@ -73,8 +73,13 @@ struct Binding<'a> {
 impl<'a> Reader<'a> {
     /// Opens a body of at most `limit` bytes whose root element is `root`.
     pub fn open(body: &'a [u8], limit: usize, root: &str) -> Result<Self, XmlError> {
+        // The limit counts the document without the white space between its elements, as
+        // the gateway keeps it while reading (`Compact`), so a body reads alike as sent or as
+        // kept.
         if body.len() > limit {
-            return Err(XmlError::TooLarge { limit });
+            let mut counted = Compact::counting(limit);
+            counted.push(body)?;
+            counted.finish()?;
         }
         let text = std::str::from_utf8(body).map_err(|_| XmlError::NotWellFormed("not UTF-8"))?;
         // Every character of a document matches Char (XML 1.0 §2.2); markup is built from them.
@@ -772,6 +777,287 @@ fn escape(out: &mut String, text: &str) {
             c if is_char(c) => out.push(c),
             c => out.push_str(&format!("&#x{:x};", u32::from(c))),
         }
+    }
+}
+
+/// A request document with the white space between its elements dropped as it is read, so a
+/// size limit bounds what is kept rather than the white space around it
+/// (docs/design/s3-protocol.md §2).
+///
+/// S3's request documents give each element either elements or text, never both (13 §6), so
+/// a run of white space after an end tag, an empty-element tag or the XML declaration, or
+/// before a start tag, lies between elements and carries nothing, and is dropped; a run inside
+/// an element that holds text, a key of one space, is kept. Inside a tag, a run of white space
+/// outside an attribute's value is kept as one space. Comments, processing instructions and
+/// CDATA sections are kept as they are. A run that cannot yet be placed, which only the byte
+/// after it decides, is counted, and its bytes kept only while they fit the limit, so white
+/// space costs the reader time but no memory past the limit.
+pub struct Compact {
+    kept: Vec<u8>,
+    /// Bytes kept, and whether they are stored or only counted.
+    len: usize,
+    store: bool,
+    limit: usize,
+    state: Markup,
+    /// A run of white space not yet placed: its bytes, while they fit, and its length.
+    run: Vec<u8>,
+    run_len: usize,
+    /// White space here lies between elements.
+    between: bool,
+    /// No markup has been read yet.
+    start: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Markup {
+    Text,
+    /// Just read `<`: the byte after it says what it opens.
+    Open,
+    /// Just read `<!`.
+    Bang,
+    /// A start or end tag, up to its `>`: the quote of the value being read, whether the last
+    /// byte kept was a space, whether it is an end tag, and its last byte that is not space.
+    Tag {
+        quote: Option<u8>,
+        space: bool,
+        end: bool,
+        last: u8,
+    },
+    /// Kept as it is until `end`, of which `matched` bytes have been read; then white space
+    /// lies between elements if `between`.
+    Until {
+        end: &'static [u8],
+        matched: usize,
+        between: bool,
+    },
+}
+
+impl Compact {
+    /// A reader that keeps at most `limit` bytes of the document.
+    pub fn new(limit: usize) -> Self {
+        Self {
+            kept: Vec::new(),
+            len: 0,
+            store: true,
+            limit,
+            state: Markup::Text,
+            run: Vec::new(),
+            run_len: 0,
+            between: false,
+            start: true,
+        }
+    }
+
+    /// A reader that only counts what it would keep, refusing past `limit`.
+    pub fn counting(limit: usize) -> Self {
+        Self {
+            store: false,
+            ..Self::new(limit)
+        }
+    }
+
+    /// Reads the next bytes of the document.
+    pub fn push(&mut self, bytes: &[u8]) -> Result<(), XmlError> {
+        for &b in bytes {
+            self.byte(b)?;
+        }
+        Ok(())
+    }
+
+    /// The document as kept.
+    pub fn finish(mut self) -> Result<Vec<u8>, XmlError> {
+        // A run the document ends in is kept, for the reader to judge.
+        self.flush_run()?;
+        Ok(self.kept)
+    }
+
+    fn keep(&mut self, bytes: &[u8]) -> Result<(), XmlError> {
+        let len = self.len.saturating_add(bytes.len());
+        if len > self.limit {
+            return Err(XmlError::TooLarge { limit: self.limit });
+        }
+        self.len = len;
+        if self.store {
+            self.kept.extend_from_slice(bytes);
+        }
+        Ok(())
+    }
+
+    /// Keeps the run of white space before this byte: it is data. Nothing is kept past the
+    /// run's start while it runs, so its bytes were all stored if it fits.
+    fn flush_run(&mut self) -> Result<(), XmlError> {
+        let len = self.len.saturating_add(self.run_len);
+        if len > self.limit {
+            return Err(XmlError::TooLarge { limit: self.limit });
+        }
+        self.len = len;
+        let run = std::mem::take(&mut self.run);
+        self.run_len = 0;
+        if self.store {
+            self.kept.extend_from_slice(&run);
+        }
+        Ok(())
+    }
+
+    fn drop_run(&mut self) {
+        self.run.clear();
+        self.run_len = 0;
+    }
+
+    fn byte(&mut self, b: u8) -> Result<(), XmlError> {
+        let space = matches!(b, b' ' | b'\t' | b'\r' | b'\n');
+        match self.state {
+            Markup::Text => {
+                if b == b'<' {
+                    self.state = Markup::Open;
+                } else if space {
+                    if !self.between {
+                        self.run_len = self.run_len.saturating_add(1);
+                        // Its bytes are held only while they could still fit.
+                        if self.store && self.len.saturating_add(self.run_len) <= self.limit {
+                            self.run.push(b);
+                        }
+                    }
+                } else {
+                    self.flush_run()?;
+                    self.keep(&[b])?;
+                    self.between = false;
+                }
+            }
+            Markup::Open => {
+                let first = self.start;
+                self.start = false;
+                match b {
+                    b'/' => {
+                        self.flush_run()?;
+                        self.keep(b"</")?;
+                        self.state = Markup::Tag {
+                            quote: None,
+                            space: false,
+                            end: true,
+                            last: b'/',
+                        };
+                    }
+                    b'?' => {
+                        self.flush_run()?;
+                        self.keep(b"<?")?;
+                        // After the XML declaration, white space precedes the root.
+                        self.state = Markup::Until {
+                            end: b"?>",
+                            matched: 0,
+                            between: first,
+                        };
+                    }
+                    b'!' => {
+                        self.flush_run()?;
+                        self.keep(b"<!")?;
+                        self.state = Markup::Bang;
+                    }
+                    _ => {
+                        // A start tag: the run before it lies between elements.
+                        self.drop_run();
+                        self.keep(&[b'<', b])?;
+                        self.state = Markup::Tag {
+                            quote: None,
+                            space: false,
+                            end: false,
+                            last: b,
+                        };
+                    }
+                }
+            }
+            Markup::Bang => {
+                self.keep(&[b])?;
+                let end: &'static [u8] = match b {
+                    b'-' => b"-->",
+                    b'[' => b"]]>",
+                    _ => b">",
+                };
+                // "<!-" has read the comment's first dash of its opening.
+                self.state = Markup::Until {
+                    end,
+                    matched: 0,
+                    between: false,
+                };
+                if b == b'>' {
+                    self.state = Markup::Text;
+                }
+            }
+            Markup::Tag {
+                quote,
+                space: was_space,
+                end,
+                last,
+            } => {
+                if let Some(q) = quote {
+                    self.keep(&[b])?;
+                    self.state = Markup::Tag {
+                        quote: if b == q { None } else { Some(q) },
+                        space: false,
+                        end,
+                        last: b,
+                    };
+                } else if space {
+                    if !was_space {
+                        self.keep(b" ")?;
+                    }
+                    self.state = Markup::Tag {
+                        quote: None,
+                        space: true,
+                        end,
+                        last,
+                    };
+                } else if b == b'>' {
+                    self.keep(b">")?;
+                    // After an end tag or an empty-element tag, white space lies between
+                    // elements; after a start tag it may be an element's text.
+                    self.between = end || last == b'/';
+                    self.state = Markup::Text;
+                } else {
+                    self.keep(&[b])?;
+                    let quote = if b == b'"' || b == b'\'' {
+                        Some(b)
+                    } else {
+                        None
+                    };
+                    self.state = Markup::Tag {
+                        quote,
+                        space: false,
+                        end,
+                        last: b,
+                    };
+                }
+            }
+            Markup::Until {
+                end,
+                matched,
+                between,
+            } => {
+                self.keep(&[b])?;
+                let expected = end.get(matched).copied();
+                let matched = if expected == Some(b) {
+                    matched.saturating_add(1)
+                } else if matched == 2 && end.first() == end.get(1) && end.first() == Some(&b) {
+                    // "--->" and "]]]>": the last two of the repeated byte still count.
+                    2
+                } else if end.first() == Some(&b) {
+                    1
+                } else {
+                    0
+                };
+                if matched == end.len() {
+                    self.between = between;
+                    self.state = Markup::Text;
+                } else {
+                    self.state = Markup::Until {
+                        end,
+                        matched,
+                        between,
+                    };
+                }
+            }
+        }
+        Ok(())
     }
 }
 

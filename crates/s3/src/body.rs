@@ -3,8 +3,9 @@
 //!
 //! Each body has a size limit computed from S3's own limits (docs/design/s3-protocol.md §2):
 //! the most items S3 allows, every field at its longest and written with the most escaping a
-//! serializer uses, and as much white space again. The gateway refuses a longer body before
-//! reading it.
+//! serializer uses. White space between elements, which carries nothing, is dropped as the
+//! body is read (`xml::Compact`), so the limit bounds what is kept and a body is refused once
+//! what is kept passes it; each reader here takes the body as kept.
 
 use crate::acl::{Grant, Grantee, MAX_GRANTS, Ownership, Permission, Policy};
 use crate::checksum::Algorithm;
@@ -21,10 +22,6 @@ use crate::xml::{NAMESPACE, Reader, XmlError};
 /// `&#x0D;`, six bytes, the longest escape of one byte that XML 1.0 §2.4 or S3's key rules
 /// call for (05 §10.1). Digits, hex and base64 need no escape and count once.
 const ESCAPED: usize = 6;
-
-/// White space between elements carries nothing and has no length of its own to bound, so
-/// a body may hold as much of it as of everything else.
-const SPACE: usize = 2;
 
 /// The XML declaration and the root's namespace declaration.
 const PROLOG: usize =
@@ -113,13 +110,10 @@ const CHECKSUMS: usize = {
 
 /// The largest CompleteMultipartUpload body: 10,000 parts, each with a five-digit number, the
 /// longest ETag and all ten checksums.
-pub const COMPLETE_LIMIT: usize = SPACE
-    * (PROLOG
-        + "<CompleteMultipartUpload></CompleteMultipartUpload>".len()
-        + MAX_PARTS as usize
-            * ("<Part></Part><PartNumber>10000</PartNumber><ETag></ETag>".len()
-                + ETAG
-                + CHECKSUMS));
+pub const COMPLETE_LIMIT: usize = PROLOG
+    + "<CompleteMultipartUpload></CompleteMultipartUpload>".len()
+    + MAX_PARTS as usize
+        * ("<Part></Part><PartNumber>10000</PartNumber><ETag></ETag>".len() + ETAG + CHECKSUMS);
 
 /// CompleteMultipartUpload's parts. Each part is checked as it is read, so a list never holds
 /// more than 10,000: numbers from 1 to 10,000 (`InvalidPart`) in ascending order
@@ -196,17 +190,15 @@ pub struct ObjectIdentifier {
 /// The largest DeleteObjects body: 1,000 objects, each with the longest key, version ID and
 /// ETag, and the directory-bucket conditions at their longest: an ISO 8601 time with
 /// nanoseconds and an offset, and the most negative 64-bit size.
-pub const DELETE_LIMIT: usize = SPACE
-    * (PROLOG
-        + "<Delete></Delete><Quiet>false</Quiet>".len()
-        + MAX_OBJECTS
-            * ("<Object></Object><Key></Key><VersionId></VersionId><ETag></ETag>".len()
-                + ESCAPED * MAX_KEY
-                + MAX_VERSION_ID
-                + ETAG
-                + "<LastModifiedTime>1970-01-01T00:00:00.000000000+00:00</LastModifiedTime>"
-                    .len()
-                + "<Size>-9223372036854775808</Size>".len()));
+pub const DELETE_LIMIT: usize = PROLOG
+    + "<Delete></Delete><Quiet>false</Quiet>".len()
+    + MAX_OBJECTS
+        * ("<Object></Object><Key></Key><VersionId></VersionId><ETag></ETag>".len()
+            + ESCAPED * MAX_KEY
+            + MAX_VERSION_ID
+            + ETAG
+            + "<LastModifiedTime>1970-01-01T00:00:00.000000000+00:00</LastModifiedTime>".len()
+            + "<Size>-9223372036854775808</Size>".len());
 
 /// DeleteObjects' objects, from 1 to 1,000, each with a key of at least one byte (13 §6.3).
 pub fn delete(body: &[u8]) -> Result<Delete, BodyError> {
@@ -286,13 +278,18 @@ pub struct CreateBucketConfiguration {
 
 /// The largest CreateBucketConfiguration body mantle reads: a location constraint and a
 /// bucket's 50 tags.
-pub const CREATE_BUCKET_LIMIT: usize = SPACE
-    * (PROLOG
+pub const CREATE_BUCKET_LIMIT: usize = PROLOG
         + "<CreateBucketConfiguration></CreateBucketConfiguration>".len()
         + "<LocationConstraint></LocationConstraint>".len()
         + MAX_REGION
+        // A directory bucket's zone and redundancy (13 §6.5), which are refused as not
+        // implemented, and so read: a zone's name is held to a DNS label, as a region's.
+        + "<Location><Name></Name><Type>AvailabilityZone</Type></Location><Bucket>\
+           <DataRedundancy>SingleAvailabilityZone</DataRedundancy><Type>Directory</Type></Bucket>"
+            .len()
+        + MAX_REGION
         + "<Tags></Tags>".len()
-        + Tagged::Bucket.limit() * TAG);
+        + Tagged::Bucket.limit() * TAG;
 
 /// CreateBucket's configuration (13 §6.5): its `LocationConstraint`, as sent, and the tags
 /// S3 applies to a new general purpose bucket, checked as a bucket's (13 §6.7). A
@@ -319,10 +316,10 @@ pub fn create_bucket(body: &[u8]) -> Result<CreateBucketConfiguration, BodyError
 const TAGGING: usize = PROLOG + "<Tagging><TagSet></TagSet></Tagging>".len();
 
 /// The largest PutObjectTagging body: an object's 10 tags, each at its longest.
-pub const OBJECT_TAGGING_LIMIT: usize = SPACE * (TAGGING + Tagged::Object.limit() * TAG);
+pub const OBJECT_TAGGING_LIMIT: usize = TAGGING + Tagged::Object.limit() * TAG;
 
 /// The largest PutBucketTagging body: a bucket's 50 tags, each at its longest.
-pub const BUCKET_TAGGING_LIMIT: usize = SPACE * (TAGGING + Tagged::Bucket.limit() * TAG);
+pub const BUCKET_TAGGING_LIMIT: usize = TAGGING + Tagged::Bucket.limit() * TAG;
 
 /// PutObjectTagging's or PutBucketTagging's tags, checked, in key order (13 §6.7). The set
 /// may be empty: "If you send this request with an empty tag set, Amazon S3 deletes the
@@ -401,13 +398,12 @@ const GRANT: usize = "<Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSche
     + ESCAPED * (MAX_EMAIL + MAX_DISPLAY_NAME);
 
 /// The largest AccessControlPolicy body: an owner and 100 grants, each at its longest.
-pub const ACL_LIMIT: usize = SPACE
-    * (PROLOG
-        + "<AccessControlPolicy><AccessControlList></AccessControlList>\
+pub const ACL_LIMIT: usize = PROLOG
+    + "<AccessControlPolicy><AccessControlList></AccessControlList>\
            <Owner><ID></ID><DisplayName></DisplayName></Owner></AccessControlPolicy>"
-            .len()
-        + ESCAPED * (MAX_ID + MAX_DISPLAY_NAME)
-        + MAX_GRANTS * GRANT);
+        .len()
+    + ESCAPED * (MAX_ID + MAX_DISPLAY_NAME)
+    + MAX_GRANTS * GRANT;
 
 /// PutBucketAcl's or PutObjectAcl's `AccessControlPolicy` (13 §6.8). A grantee is read by
 /// its `xsi:type` and named by the one element that type takes; a `DisplayName` is read and
@@ -543,10 +539,9 @@ pub enum Versioning {
 }
 
 /// The largest VersioningConfiguration body.
-pub const VERSIONING_LIMIT: usize = SPACE
-    * (PROLOG
-        + "<VersioningConfiguration></VersioningConfiguration>".len()
-        + "<Status>Suspended</Status><MfaDelete>Disabled</MfaDelete>".len());
+pub const VERSIONING_LIMIT: usize = PROLOG
+    + "<VersioningConfiguration></VersioningConfiguration>".len()
+    + "<Status>Suspended</Status><MfaDelete>Disabled</MfaDelete>".len();
 
 /// PutBucketVersioning's configuration. Its values are exact: an enumeration of `xs:string`
 /// keeps its white space (XML Schema Part 2 §4.3.6; 13 §5).
@@ -586,10 +581,9 @@ pub fn versioning(body: &[u8]) -> Result<VersioningConfiguration, BodyError> {
 }
 
 /// The largest OwnershipControls body: its rule with the longest setting.
-pub const OWNERSHIP_CONTROLS_LIMIT: usize = SPACE
-    * (PROLOG
-        + "<OwnershipControls></OwnershipControls><Rule></Rule>".len()
-        + "<ObjectOwnership>BucketOwnerPreferred</ObjectOwnership>".len());
+pub const OWNERSHIP_CONTROLS_LIMIT: usize = PROLOG
+    + "<OwnershipControls></OwnershipControls><Rule></Rule>".len()
+    + "<ObjectOwnership>BucketOwnerPreferred</ObjectOwnership>".len();
 
 /// PutBucketOwnershipControls' setting (13 §6.8): the one `Rule` a bucket has, holding its
 /// `ObjectOwnership`, exact, as an enumeration of `xs:string` keeps its white space (13 §5).
@@ -618,12 +612,13 @@ pub fn ownership_controls(body: &[u8]) -> Result<Ownership, BodyError> {
 }
 
 /// The largest ObjectLockConfiguration body: its rule with the longest mode and period.
-pub const OBJECT_LOCK_LIMIT: usize = SPACE
-    * (PROLOG
-        + "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule>\
-           <DefaultRetention><Mode>GOVERNANCE</Mode><Days>-2147483648</Days></DefaultRetention>\
-           </Rule></ObjectLockConfiguration>"
-            .len());
+pub const OBJECT_LOCK_LIMIT: usize = PROLOG
+    + "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule>\
+           <DefaultRetention><Mode>GOVERNANCE</Mode><Days></Days><Years></Years>\
+           <DefaultEventHold><Days></Days><Years></Years></DefaultEventHold>\
+           </DefaultRetention></Rule></ObjectLockConfiguration>"
+        .len()
+    + 4 * INT;
 
 /// PutObjectLockConfiguration's configuration (18 §1.1): `ObjectLockEnabled`, which must be
 /// `Enabled`, and a rule, which must hold a default retention of a mode and one period. Every
@@ -681,11 +676,16 @@ pub fn object_lock_configuration(body: &[u8]) -> Result<crate::lock::Configurati
 }
 
 /// The largest Retention body: a mode and a date at their longest.
-pub const RETENTION_LIMIT: usize = SPACE
-    * (PROLOG
+pub const RETENTION_LIMIT: usize = PROLOG
         + "<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate></RetainUntilDate></Retention>"
             .len()
-        + DATE_TIME);
+        + DATE_TIME
+        // Event holds (18 §2.6), refused as not implemented, and so read: their duration of
+        // days or years, as `DefaultEventHold` holds it (18 §1.1).
+        + "<EventHold>false</EventHold><EventHoldDuration><Days></Days><Years></Years>\
+           </EventHoldDuration>"
+            .len()
+        + 2 * INT;
 
 /// PutObjectRetention's request (18 §1.2): a mode and a date together, or neither, which asks
 /// to remove the retention. S3 answered a mode alone, and a mode it does not define,
@@ -716,8 +716,7 @@ pub fn retention(body: &[u8]) -> Result<crate::lock::RetentionRequest, BodyError
 }
 
 /// The largest LegalHold body.
-pub const LEGAL_HOLD_LIMIT: usize =
-    SPACE * (PROLOG + "<LegalHold><Status>OFF</Status></LegalHold>".len());
+pub const LEGAL_HOLD_LIMIT: usize = PROLOG + "<LegalHold><Status>OFF</Status></LegalHold>".len();
 
 /// PutObjectLegalHold's status (18 §1.2): `ON` or `OFF`, exactly; s3-tests expects `abc`
 /// `MalformedXML`.
@@ -739,13 +738,12 @@ pub fn legal_hold(body: &[u8]) -> Result<bool, BodyError> {
 }
 
 /// The largest PublicAccessBlockConfiguration body: its four settings, each at its longest.
-pub const PUBLIC_ACCESS_BLOCK_LIMIT: usize = SPACE
-    * (PROLOG
-        + "<PublicAccessBlockConfiguration></PublicAccessBlockConfiguration>".len()
-        + "<BlockPublicAcls>false</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls>\
+pub const PUBLIC_ACCESS_BLOCK_LIMIT: usize = PROLOG
+    + "<PublicAccessBlockConfiguration></PublicAccessBlockConfiguration>".len()
+    + "<BlockPublicAcls>false</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls>\
            <BlockPublicPolicy>false</BlockPublicPolicy>\
            <RestrictPublicBuckets>false</RestrictPublicBuckets>"
-            .len());
+        .len();
 
 /// PutPublicAccessBlock's settings (17 §7): each an `xs:boolean`, and one the document leaves
 /// out off, as the settings are replaced whole.
@@ -781,16 +779,15 @@ pub fn public_access_block(body: &[u8]) -> Result<crate::policy::PublicAccessBlo
 
 /// The largest ServerSideEncryptionConfiguration body: one rule with its default, the longest KMS
 /// key ID botocore's model allows (2048), its Bucket Key flag, and both blocked types (20 §4.1).
-pub const SSE_LIMIT: usize = SPACE
-    * (PROLOG
-        + "<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault>\
+pub const SSE_LIMIT: usize = PROLOG
+    + "<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault>\
            <SSEAlgorithm>aws:kms:dsse</SSEAlgorithm><KMSMasterKeyID></KMSMasterKeyID>\
            </ApplyServerSideEncryptionByDefault><BucketKeyEnabled>false</BucketKeyEnabled>\
            <BlockedEncryptionTypes><EncryptionType>SSE-C</EncryptionType>\
            <EncryptionType>NONE</EncryptionType></BlockedEncryptionTypes></Rule>\
            </ServerSideEncryptionConfiguration>"
-            .len()
-        + 2048);
+        .len()
+    + 2048;
 
 /// PutBucketEncryption's rule (20 §4.1): exactly one `Rule`, S3 answering none or two
 /// `MalformedXML` (20 §4.3); a default of `AES256`, SSE-KMS and DSSE-KMS not being implemented,
@@ -866,6 +863,10 @@ pub const CORS_LIMIT: usize = cors::LIMIT;
 /// [`cors::check`]. Rules are counted as they are read, so a document never holds more than
 /// 100.
 pub fn cors(body: &[u8]) -> Result<Vec<cors::Rule>, BodyError> {
+    // S3's limit is on the document as sent, white space and all (16 §1.1).
+    if body.len() > CORS_LIMIT {
+        return Err(XmlError::TooLarge { limit: CORS_LIMIT }.into());
+    }
     let mut reader = Reader::open(body, CORS_LIMIT, "CORSConfiguration")?;
     let mut rules = Vec::new();
     while let Some(name) = reader.child()? {
@@ -931,7 +932,8 @@ const LIFECYCLE_FILTER: usize = "<Filter><And><Prefix></Prefix><ObjectSizeGreate
 /// A lifecycle rule at its longest: the longest ID and filter, each action once at its
 /// longest, and a transition and a noncurrent transition to each class.
 const LIFECYCLE_RULE: usize = "<Rule><ID></ID><Status>Disabled</Status><Expiration><Date>\
-    </Date></Expiration><NoncurrentVersionExpiration><NoncurrentDays></NoncurrentDays>\
+    </Date><Days></Days><ExpiredObjectDeleteMarker>false</ExpiredObjectDeleteMarker>\
+    </Expiration><NoncurrentVersionExpiration><NoncurrentDays></NoncurrentDays>\
     <NewerNoncurrentVersions></NewerNoncurrentVersions></NoncurrentVersionExpiration>\
     <AbortIncompleteMultipartUpload><DaysAfterInitiation></DaysAfterInitiation>\
     </AbortIncompleteMultipartUpload></Rule>"
@@ -939,10 +941,12 @@ const LIFECYCLE_RULE: usize = "<Rule><ID></ID><Status>Disabled</Status><Expirati
     + ESCAPED * UTF8_PER_UTF16 * lifecycle::MAX_ID
     + LIFECYCLE_FILTER
     + DATE_TIME
-    + 3 * INT
+    + 4 * INT
     + lifecycle::CLASSES.len()
-        * ("<Transition><Date></Date><StorageClass></StorageClass></Transition>".len()
+        * ("<Transition><Date></Date><Days></Days><StorageClass></StorageClass></Transition>"
+            .len()
             + DATE_TIME
+            + INT
             + CLASS
             + "<NoncurrentVersionTransition><NoncurrentDays></NoncurrentDays>\
                <NewerNoncurrentVersions></NewerNoncurrentVersions><StorageClass></StorageClass>\
@@ -952,10 +956,9 @@ const LIFECYCLE_RULE: usize = "<Rule><ID></ID><Status>Disabled</Status><Expirati
             + CLASS);
 
 /// The largest LifecycleConfiguration body: 1,000 rules, each at its longest.
-pub const LIFECYCLE_LIMIT: usize = SPACE
-    * (PROLOG
-        + "<LifecycleConfiguration></LifecycleConfiguration>".len()
-        + lifecycle::MAX_RULES * LIFECYCLE_RULE);
+pub const LIFECYCLE_LIMIT: usize = PROLOG
+    + "<LifecycleConfiguration></LifecycleConfiguration>".len()
+    + lifecycle::MAX_RULES * LIFECYCLE_RULE;
 
 /// PutBucketLifecycleConfiguration's rules (13 §6.9): read against S3's schema, then checked
 /// by [`lifecycle::check`]. The deprecated PutBucketLifecycle sends the same request with each
@@ -1312,7 +1315,7 @@ mod tests {
              {parts}</CompleteMultipartUpload>"
         );
         assert!(
-            body.len() * 2 <= COMPLETE_LIMIT + 1,
+            body.len() <= COMPLETE_LIMIT,
             "{} > {COMPLETE_LIMIT}",
             body.len()
         );
@@ -1400,7 +1403,7 @@ mod tests {
             object.repeat(MAX_OBJECTS)
         );
         assert!(
-            body.len() * 2 <= DELETE_LIMIT,
+            body.len() <= DELETE_LIMIT,
             "{} > {DELETE_LIMIT}",
             body.len()
         );
@@ -1590,7 +1593,7 @@ mod tests {
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Tagging xmlns=\"{NAMESPACE}\">\
                  <TagSet>{tags}</TagSet></Tagging>"
             );
-            assert!(body.len() * 2 <= limit, "{} > {limit}", body.len());
+            assert!(body.len() <= limit, "{} > {limit}", body.len());
             assert_eq!(
                 tagging(body.as_bytes(), tagged).unwrap().len(),
                 tagged.limit()
@@ -1607,7 +1610,7 @@ mod tests {
                 ))
                 .collect::<String>()
         );
-        assert!(longest_create.len() * 2 <= CREATE_BUCKET_LIMIT);
+        assert!(longest_create.len() <= CREATE_BUCKET_LIMIT);
         assert_eq!(
             create_bucket(longest_create.as_bytes()).unwrap().tags.len(),
             50
@@ -1835,7 +1838,7 @@ mod tests {
              </OwnershipControls>",
             rule("BucketOwnerPreferred")
         );
-        assert!(longest.len() * 2 <= OWNERSHIP_CONTROLS_LIMIT);
+        assert!(longest.len() <= OWNERSHIP_CONTROLS_LIMIT);
         assert!(ownership_controls(longest.as_bytes()).is_ok());
     }
 
@@ -1857,7 +1860,7 @@ mod tests {
             grant.repeat(MAX_GRANTS),
             "&quot;".repeat(MAX_ID)
         );
-        assert!(body.len() * 2 <= ACL_LIMIT, "{} > {ACL_LIMIT}", body.len());
+        assert!(body.len() <= ACL_LIMIT, "{} > {ACL_LIMIT}", body.len());
         let read = access_control_policy(body.as_bytes()).unwrap();
         assert_eq!(read.grants.len(), MAX_GRANTS);
         assert_eq!(
@@ -2236,7 +2239,7 @@ mod tests {
             configuration(&rules)
         );
         assert!(
-            body.len() * 2 <= LIFECYCLE_LIMIT,
+            body.len() <= LIFECYCLE_LIMIT,
             "{} > {LIFECYCLE_LIMIT}",
             body.len()
         );
@@ -2574,5 +2577,113 @@ mod tests {
                 Err("MalformedXML")
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+    use crate::xml::Compact;
+    use proptest::prelude::*;
+
+    fn compact(doc: &[u8], limit: usize) -> Result<Vec<u8>, XmlError> {
+        let mut c = Compact::new(limit);
+        c.push(doc)?;
+        c.finish()
+    }
+
+    /// A document written with white space between its elements reads, compacted, as written;
+    /// the white space in an element's text is kept; read a byte at a time or all at once, the
+    /// same bytes are kept; and a limit counts only what is kept, so a megabyte of white space
+    /// between elements is read within a limit of the document's own size, while white space in
+    /// an element's text past the limit is refused (docs/design/s3-protocol.md §2).
+    #[test]
+    fn white_space_between_elements_is_dropped_as_it_is_read() {
+        let pretty = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Delete xmlns=\"{NAMESPACE}\">\n  \
+             <Object>\n    <Key> spaced key </Key>\n    <VersionId>v1</VersionId>\n  </Object>\n  \
+             <!-- a comment --> <Object ><Key> </Key></Object>\n  <Quiet>true</Quiet>\n</Delete>\n"
+        );
+        let kept = compact(pretty.as_bytes(), usize::MAX).unwrap();
+        let mut one = Compact::new(usize::MAX);
+        for b in pretty.as_bytes() {
+            one.push(&[*b]).unwrap();
+        }
+        assert_eq!(one.finish().unwrap(), kept);
+        let read = delete(&kept).unwrap();
+        assert_eq!(read, delete(pretty.as_bytes()).unwrap());
+        let keys: Vec<&str> = read.objects.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(keys, [" spaced key ", " "]);
+        assert!(!String::from_utf8_lossy(&kept).contains("\n  "));
+        let padded = pretty.replace('\n', &format!("\n{}", " ".repeat(1 << 20)));
+        assert_eq!(compact(padded.as_bytes(), kept.len()).unwrap(), kept);
+        // Read as sent, the limit counts the document as kept.
+        assert_eq!(delete(padded.as_bytes()).unwrap(), read);
+        let long = format!(
+            "<Delete><Object><Key>{}</Key></Object></Delete>",
+            " ".repeat(100)
+        );
+        assert_eq!(
+            compact(long.as_bytes(), 60),
+            Err(XmlError::TooLarge { limit: 60 })
+        );
+    }
+
+    fn space() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop_oneof![Just(' '), Just('\t'), Just('\n'), Just('\r')],
+            0..4,
+        )
+        .prop_map(|c| c.into_iter().collect())
+    }
+
+    proptest! {
+        /// Any Tagging document, its keys and values holding white space of their own, with
+        /// white space put anywhere between its elements, reads the same compacted as sent.
+        #[test]
+        fn a_compacted_document_reads_as_sent(
+            tags in prop::collection::vec(("[ a-z]{0,6}", "[ a-z]{0,6}"), 0..6),
+            gaps in prop::collection::vec(space(), 64),
+        ) {
+            let mut gap = gaps.iter().cycle();
+            let mut g = || gap.next().cloned().unwrap_or_default();
+            let mut doc = format!("<?xml version=\"1.0\"?>{}<Tagging xmlns=\"{NAMESPACE}\">{}<TagSet>", g(), g());
+            for (k, v) in &tags {
+                doc.push_str(&format!(
+                    "{}<Tag>{}<Key>{k}</Key>{}<Value>{v}</Value>{}</Tag>{}",
+                    g(), g(), g(), g(), g()
+                ));
+            }
+            doc.push_str(&format!("</TagSet>{}</Tagging>{}", g(), g()));
+            let kept = compact(doc.as_bytes(), usize::MAX).unwrap();
+            prop_assert_eq!(
+                tagging(&kept, Tagged::Object),
+                tagging(doc.as_bytes(), Tagged::Object)
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod cors_limit_tests {
+    use super::*;
+
+    /// A CORS configuration is held to S3's 64 KB as sent, white space included (16 §1.1).
+    #[test]
+    fn a_cors_configuration_is_held_to_its_size_as_sent() {
+        let rule = "<CORSRule><AllowedMethod>GET</AllowedMethod><AllowedOrigin>*</AllowedOrigin>\
+                    </CORSRule>";
+        let body = |space: usize| {
+            format!(
+                "<CORSConfiguration xmlns=\"{NAMESPACE}\">{}{rule}</CORSConfiguration>",
+                " ".repeat(space)
+            )
+        };
+        let base = body(0).len();
+        assert!(cors(body(CORS_LIMIT - base).as_bytes()).is_ok());
+        assert_eq!(
+            cors(body(CORS_LIMIT - base + 1).as_bytes()).map_err(|e| e.code().0),
+            Err("MaxMessageLengthExceeded")
+        );
     }
 }

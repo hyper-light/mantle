@@ -25,7 +25,7 @@ UNSAFE_ALLOWED = {
 INVENTORY = ROOT / "docs/design/constants.md"
 KINDS = {"format", "external", "derived", "cited", "measured", "bound", "open"}
 # Rows marked open may number at most this; it only falls, as open constants gain a basis.
-OPEN_CEILING = 15
+OPEN_CEILING = 14
 NUMERIC = {
     "u8", "u16", "u32", "u64", "u128", "usize",
     "i8", "i16", "i32", "i64", "i128", "isize",

@@ -172,22 +172,22 @@ gains a basis lowers the ceiling.
 | `crates/range/src/replica.rs` `DRIVE_BUDGET` | open | 64 readies per `drive` call; audit §12.6 calls it a counted termination guard with no wall-time or work proof and asks for slices derived from control deadlines. |
 | `crates/range/src/store.rs` `ENTRY_OVERHEAD` | format | An entry encoding's kind byte plus u32 context length (1 + 4), per `encode_entry`. |
 | `crates/s3/src/acl.rs` `MAX_GRANTS` | external | AWS S3 API reference via docs/research/13 §6.8: "An ACL can have up to 100 grants". |
-| `crates/s3/src/body.rs` `ACL_LIMIT` | derived | SPACE × (prolog + owner fields escaped + MAX_GRANTS × GRANT); s3-protocol.md §2 gives 662,054 bytes. |
-| `crates/s3/src/body.rs` `BUCKET_TAGGING_LIMIT` | derived | SPACE × (TAGGING + 50 bucket tags × TAG). |
+| `crates/s3/src/body.rs` `ACL_LIMIT` | derived | (prolog + owner fields escaped + MAX_GRANTS × GRANT); s3-protocol.md §2 gives 662,054 bytes. |
+| `crates/s3/src/body.rs` `BUCKET_TAGGING_LIMIT` | derived | (TAGGING + 50 bucket tags × TAG). |
 | `crates/s3/src/body.rs` `CHECKSUMS` | derived | Computed at compile time by summing each `Algorithm`'s element tags and base64 width. |
 | `crates/s3/src/body.rs` `CLASS` | derived | Length of "INTELLIGENT_TIERING", the longest name in `lifecycle::CLASSES`. |
-| `crates/s3/src/body.rs` `COMPLETE_LIMIT` | derived | SPACE × (prolog + 10,000 parts × (part markup + ETAG + CHECKSUMS)); s3-protocol.md §2 gives 14,040,274 bytes. |
+| `crates/s3/src/body.rs` `COMPLETE_LIMIT` | derived | (prolog + 10,000 parts × (part markup + ETAG + CHECKSUMS)); s3-protocol.md §2 gives 14,040,274 bytes. |
 | `crates/s3/src/body.rs` `CORS_LIMIT` | derived | Equal to `cors::LIMIT`, S3's 64 KB CORS document limit. |
-| `crates/s3/src/body.rs` `CREATE_BUCKET_LIMIT` | derived | SPACE × (prolog + location constraint of MAX_REGION + 50 bucket tags × TAG). |
+| `crates/s3/src/body.rs` `CREATE_BUCKET_LIMIT` | derived | (prolog + location constraint of MAX_REGION + 50 bucket tags × TAG). |
 | `crates/s3/src/body.rs` `DATE_TIME` | derived | Length of the longest ISO 8601 time a serializer writes, with nanoseconds and a zone offset. |
-| `crates/s3/src/body.rs` `DELETE_LIMIT` | derived | SPACE × (prolog + 1,000 objects × (escaped key, version ID, ETag, time and size fields at their longest)); s3-protocol.md §2. |
+| `crates/s3/src/body.rs` `DELETE_LIMIT` | derived | (prolog + 1,000 objects × (escaped key, version ID, ETag, time and size fields at their longest)); s3-protocol.md §2. |
 | `crates/s3/src/body.rs` `ESCAPED` | external | Six bytes, the longest one-byte escape (`&quot;`, `&apos;`, `&#x0D;`) under XML 1.0 §2.4 and S3's key rules (05 §10.1); docs/design/s3-protocol.md §2. |
 | `crates/s3/src/body.rs` `ETAG` | derived | Length of the longest ETag mantle writes (a 10,000-part multipart ETag) with its quotes escaped. |
 | `crates/s3/src/body.rs` `GRANT` | derived | Length of the longest grant markup (email grantee with xsi type) plus ESCAPED × (MAX_EMAIL + MAX_DISPLAY_NAME). |
 | `crates/s3/src/body.rs` `INT` | external | Length of "-2147483648", the longest `xs:int` a serializer writes (XML Schema Part 2 int range). |
-| `crates/s3/src/body.rs` `LEGAL_HOLD_LIMIT` | derived | SPACE × (prolog + the LegalHold markup). |
+| `crates/s3/src/body.rs` `LEGAL_HOLD_LIMIT` | derived | (prolog + the LegalHold markup). |
 | `crates/s3/src/body.rs` `LIFECYCLE_FILTER` | derived | Filter markup + ESCAPED × MAX_KEY + 2 × LONG + MAX_FILTER_TAGS × TAG. |
-| `crates/s3/src/body.rs` `LIFECYCLE_LIMIT` | derived | SPACE × (prolog + 1,000 rules × LIFECYCLE_RULE). |
+| `crates/s3/src/body.rs` `LIFECYCLE_LIMIT` | derived | (prolog + 1,000 rules × LIFECYCLE_RULE). |
 | `crates/s3/src/body.rs` `LIFECYCLE_RULE` | derived | Rule markup + escaped ID + LIFECYCLE_FILTER + dates, ints and one transition per class, each at its longest. |
 | `crates/s3/src/body.rs` `LONG` | external | Length of "-9223372036854775808", the longest `xs:long` (XML Schema Part 2 long range). |
 | `crates/s3/src/body.rs` `MAX_DISPLAY_NAME` | derived | Equal to MAX_EMAIL, because S3's sample display names are email addresses (13 §6.8). |
@@ -198,18 +198,17 @@ gains a basis lowers the ceiling.
 | `crates/s3/src/body.rs` `MAX_REGION` | external | A region name is a DNS label, at most 63 octets (RFC 1035 §2.3.4). |
 | `crates/s3/src/body.rs` `MAX_UPLOAD` | external | AWS S3 limits via 05 §4.1: a part runs 5 MiB to 5 GiB and a single PUT to 5 GB; 5 << 30 is the binary reading, so it never refuses an upload S3 accepts. |
 | `crates/s3/src/body.rs` `MAX_VERSION_ID` | external | AWS S3 docs via 13 §6.4: version IDs are opaque strings "no more than 1,024 bytes long". |
-| `crates/s3/src/body.rs` `OBJECT_LOCK_LIMIT` | derived | SPACE × (prolog + ObjectLockConfiguration markup with the longest mode and an `xs:int` period). |
-| `crates/s3/src/body.rs` `OBJECT_TAGGING_LIMIT` | derived | SPACE × (TAGGING + 10 object tags × TAG). |
-| `crates/s3/src/body.rs` `OWNERSHIP_CONTROLS_LIMIT` | derived | SPACE × (prolog + a rule holding the longest ObjectOwnership value). |
+| `crates/s3/src/body.rs` `OBJECT_LOCK_LIMIT` | derived | (prolog + ObjectLockConfiguration markup with the longest mode and an `xs:int` period). |
+| `crates/s3/src/body.rs` `OBJECT_TAGGING_LIMIT` | derived | (TAGGING + 10 object tags × TAG). |
+| `crates/s3/src/body.rs` `OWNERSHIP_CONTROLS_LIMIT` | derived | (prolog + a rule holding the longest ObjectOwnership value). |
 | `crates/s3/src/body.rs` `PROLOG` | derived | Length of the XML declaration and root `xmlns` declaration plus `NAMESPACE.len()`. |
-| `crates/s3/src/body.rs` `PUBLIC_ACCESS_BLOCK_LIMIT` | derived | SPACE × (prolog + the four boolean settings' markup). |
-| `crates/s3/src/body.rs` `RETENTION_LIMIT` | derived | SPACE × (prolog + Retention markup + DATE_TIME). |
-| `crates/s3/src/body.rs` `SPACE` | open | Factor of 2 allowing "as much white space again" in every XML body limit; s3-protocol.md §2 says white space has no bound, which does not establish 2. |
-| `crates/s3/src/body.rs` `SSE_LIMIT` | derived | SPACE × (prolog + the longest rule markup + 2048, botocore's longest KMS key ID); docs/research/20 §4.1. |
+| `crates/s3/src/body.rs` `PUBLIC_ACCESS_BLOCK_LIMIT` | derived | (prolog + the four boolean settings' markup). |
+| `crates/s3/src/body.rs` `RETENTION_LIMIT` | derived | (prolog + Retention markup + DATE_TIME). |
+| `crates/s3/src/body.rs` `SSE_LIMIT` | derived | (prolog + the longest rule markup + 2048, botocore's longest KMS key ID); docs/research/20 §4.1. |
 | `crates/s3/src/body.rs` `TAG` | derived | Tag markup plus ESCAPED × UTF8_PER_UTF16 × (128 + 256) code units, the key and value limits from 13 §6.7. |
 | `crates/s3/src/body.rs` `TAGGING` | derived | PROLOG plus the length of the `Tagging`/`TagSet` markup. |
 | `crates/s3/src/body.rs` `UTF8_PER_UTF16` | external | At most 3 UTF-8 bytes per UTF-16 code unit (RFC 3629 §3; RFC 2781 §2.1). |
-| `crates/s3/src/body.rs` `VERSIONING_LIMIT` | derived | SPACE × (prolog + the longest Status and MfaDelete markup). |
+| `crates/s3/src/body.rs` `VERSIONING_LIMIT` | derived | (prolog + the longest Status and MfaDelete markup). |
 | `crates/s3/src/chunked.rs` `MAX_LINE` | derived | 16 hex size digits + 17 bytes of `;chunk-signature=` + 64 signature hex digits, the longest aws-chunked framing line (05 §1.8–§1.9). |
 | `crates/s3/src/chunked.rs` `MIN_CHUNK` | external | S3 developer guide, Transfer Payload in Multiple Chunks (05 §1.8): each chunk except the last is at least 8 KB. |
 | `crates/s3/src/cors.rs` `LIMIT` | external | AWS S3 CORS docs via 16 §1.1: "The document is limited to 64 KB in size"; the binary reading is used. |
@@ -229,7 +228,7 @@ gains a basis lowers the ceiling.
 | `crates/s3/src/lock.rs` `DAY` | derived | 86,400,000, the milliseconds in a day. |
 | `crates/s3/src/lock.rs` `MAX_DAYS` | external | S3 Object Lock docs via docs/research/18 §2.4, §2.6: a 100-year maximum at 365 days per year. |
 | `crates/s3/src/lock.rs` `MAX_YEARS` | external | S3 Object Lock docs via 18 §2.4: "The maximum retention period is 100 years". |
-| `crates/s3/src/policy/mod.rs` `BODY_LIMIT` | open | 2 × MAX_SIZE; the factor 2 is the same unargued white-space allowance as `body::SPACE`, written here as a literal. |
+| `crates/s3/src/policy/mod.rs` `BODY_LIMIT` | open | Twice the 20 KB compact limit, as a raw bound on a policy kept as sent (17 §2.2); what S3 keeps of a policy's white space is not recorded, and a recording of S3 would settle it. |
 | `crates/s3/src/policy/mod.rs` `MAX_SIZE` | external | S3's 20 KB bucket policy limit; S3 reported "maximum allowed size of 20480 bytes" (docs/research/17 §2.3). |
 | `crates/s3/src/route.rs` `MAX_KEY` | external | AWS S3 object key docs via 05 §10.1: keys are at most 1,024 bytes of UTF-8. |
 | `crates/s3/src/seal.rs` `LAST` | format | 1 << 63, the top bit of the nonce counter that marks a file's last segment (encryption.md nonce layout, STREAM construction). |
@@ -300,9 +299,8 @@ parameters. The gate does not parse these; they are kept here with the same kind
 - `measure::MAX_DEPTH`: an executor credit from the node's CPU, memory and thread allowance.
 - `log::GROUP_SUBMISSIONS` and `replica::DRIVE_BUDGET`: the node's scheduler (audit §5.1),
   whose ranges keep more than one ready in flight and share work by deadline.
-- The XML and JSON bodies' white-space allowance (`body::SPACE`, `policy::BODY_LIMIT`): a
-  reader that drops white space between elements as it reads, so the limit bounds what is
-  kept rather than doubling it.
+- A bucket policy's raw body limit (`policy::BODY_LIMIT`): a recording of how much white space
+  S3 keeps in a policy it gives back as set.
 - The benchmarks' ladders and step lengths: the regimes each exercises, in their
   measurement records, or step lengths from the samples their quantiles need
   (research 11 §16).

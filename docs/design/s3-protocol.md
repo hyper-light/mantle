@@ -77,27 +77,44 @@ Three deliberate differences from XML 1.0, each for a stated reason:
    and `xsi:type` on an ACL's `Grantee`, the one other attribute AWS's samples and service
    model put on a request (13 §6.8). An ACL document admits it there and nowhere else.
 
-**Size limits are computed, not chosen.** Each document's limit is the longest body S3's own
-limits allow, doubled for white space (`crates/s3/src/body.rs`):
+**Size limits are computed, not chosen.** Each document's limit is the longest document S3's
+schema admits with every element in it at most once, alternatives S3 refuses together
+included, so that each refusal gets its own answer (`crates/s3/src/body.rs`):
 
 - every field at its longest: keys 1,024 bytes (05 §10.1), version IDs 1,024 (13 §6.4),
-  the longest ETag mantle writes, all ten checksums on a part (13 §6.2), a region name as a
-  63-octet DNS label (RFC 1035 §2.3.4), tag keys and values of 128 and 256 UTF-16 units at
-  three bytes a unit (13 §6.7; RFC 3629 §3), an email address of 254 octets (RFC 5321
-  §4.5.3.1.3), and an ACL's IDs and ignored display names as 13 §6.8 bounds them;
+  the longest ETag mantle writes, all ten checksums on a part (13 §6.2), a region name, and a
+  directory bucket's zone, as a 63-octet DNS label (RFC 1035 §2.3.4), tag keys and values of
+  128 and 256 UTF-16 units at three bytes a unit (13 §6.7; RFC 3629 §3), an email address of
+  254 octets (RFC 5321 §4.5.3.1.3), an ACL's IDs and ignored display names as 13 §6.8 bounds
+  them, and every integer at `xs:int`'s or `xs:long`'s longest;
 - arbitrary text written at six bytes a byte (`&quot;`, `&apos;`, `&#x0D;`, the longest
   escapes of one byte), while digits, hex and base64, which never need escaping, count once;
 - the most items S3 allows: 10,000 parts (05 §4.1), 1,000 objects (05 §8.1), 10 tags on an
-  object and 50 on a bucket (13 §6.7), 100 grants (13 §6.8);
-- then as much white space again, since white space carries nothing and has no length of
-  its own to bound.
+  object and 50 on a bucket (13 §6.7), 100 grants (13 §6.8), 1,000 lifecycle rules.
 
-That gives 14,040,274 bytes for CompleteMultipartUpload, 14,774,246 for DeleteObjects,
-695,416 for CreateBucketConfiguration with its tags, 388 for VersioningConfiguration, 139,224
-and 695,144 for an object's and a bucket's Tagging, 662,054 for AccessControlPolicy and 386
-for OwnershipControls. The gateway reads no more
-than the limit and answers `MaxMessageLengthExceeded` beyond it (05 §11.2). A compact
-10,000-part body with one CRC-32 per part is about 1.3 MB, so real bodies sit far inside.
+White space between elements is not counted: S3's documents give each element either
+elements or text, never both (13 §6), so a run of white space after an end tag, an
+empty-element tag or the XML declaration, or before a start tag, carries nothing, and the
+gateway drops it as the body arrives (`xml::Compact`), keeping a run inside an element's text,
+a key of one space, as data. The limit bounds what is kept, and a body is refused with
+`MaxMessageLengthExceeded` (05 §11.2) once what is kept passes it; white space costs the
+gateway the time to read it and no memory. A reader given a body as sent counts it the same
+way, so a document reads alike as sent or as kept. Before, each limit was doubled as an
+allowance for white space, a factor nothing established, and the doubling hid four limits
+that left out elements their readers answer: Object Lock's `DefaultEventHold` and `Years`,
+Retention's event holds, a lifecycle expiration's `Days` and `ExpiredObjectDeleteMarker`, and
+CreateBucket's directory-bucket elements.
+
+That gives 7,020,137 bytes for CompleteMultipartUpload, 7,387,123 for DeleteObjects, 347,928
+for CreateBucketConfiguration with its tags, 194 for VersioningConfiguration, 69,612 and
+347,572 for an object's and a bucket's Tagging, 331,027 for AccessControlPolicy, 193 for
+OwnershipControls, 393 for ObjectLockConfiguration, 319 for Retention and 83,033,135 for a
+LifecycleConfiguration of 1,000 rules at their longest. A compact 10,000-part body with one
+CRC-32 per part is about 1.3 MB, so real bodies sit far inside. A CORS configuration is held
+to S3's own limit, 64 KB for the document as sent (16 §1.1), and read as sent. A bucket
+policy is kept as sent, since GetBucketPolicy gives back the bytes set (17 §2.2), and S3 counts
+its compact form against 20 KB; what S3 keeps of a policy's white space is not recorded, so
+its body limit, twice the compact one, awaits a recording of S3.
 
 **Each part is checked as it is read.** CompleteMultipartUpload's parts must run from 1 to
 10,000 (`InvalidPart`) in ascending order (`InvalidPartOrder`) (13 §6.2). Checking each part

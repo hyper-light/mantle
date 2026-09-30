@@ -104,7 +104,10 @@ mod tests {
         expiries_per_entry: 8,
     };
 
+    /// A PUT carrying a file made for it alone, which the same key, ETag and precondition
+    /// name: a command sent again carries the same file, and another carries another.
     fn put(key: &str, etag: &str, none_match: bool) -> Command {
+        let file = mantle_crc::crc32c(format!("{key}/{etag}/{none_match}").as_bytes());
         Command::Name(Box::new(crate::name::Command::Put(Put {
             bucket: "b".into(),
             incarnation: 1,
@@ -123,7 +126,7 @@ mod tests {
                 etag: etag.into(),
                 size: 1,
                 checksum: None,
-                file: Some(1),
+                file: Some(u128::from(file)),
                 owner: "o".into(),
                 headers: Vec::new(),
                 retention: None,

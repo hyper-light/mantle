@@ -4,7 +4,7 @@
 use mantle_codec::{Reader, Writer};
 
 /// Values written by this code.
-const FORMAT: u8 = 2;
+const FORMAT: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RecordError {
@@ -378,31 +378,65 @@ pub struct Holder {
     pub key: String,
 }
 
-/// A file's mark says the Name range holds it. A part file's mark, once a completion commits,
-/// also names the composite file that adopted it, which alone may give it back for
-/// reclaiming: a composite that lost its completion, or was written again for a retry,
-/// never adopted the parts it names (audit B02).
+/// A file's mark: the Name range took the file, and how. A file ID is used by one write
+/// alone, so a write carrying a marked file is a copy of one the range already applied,
+/// delivered again after its session forgot it (docs/design/replica.md §1): it is answered as
+/// the first was, and neither takes the file again nor releases it. The mark stays until the
+/// collector reclaims the file, whatever references it by then.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Adopted {
-    pub by: u128,
+pub enum Mark {
+    /// No write took it: the one that carried it was refused, or none came by its deadline.
+    /// The range released it then.
+    Refused,
+    /// A PUT or a completion made version `order` of its key naming it.
+    Version { order: u64, null: bool },
+    /// An UploadPart's part row named it.
+    Part,
+    /// A part, adopted by composite file `by` when its completion committed: only `by`'s
+    /// reclaimer may give it back. A composite that lost its completion, or was written again
+    /// for a retry, never adopted the parts it names (audit B02).
+    Adopted { by: u128 },
 }
 
-impl Adopted {
+impl Mark {
+    /// A refused file's mark has no value, as the sweep writes it for every file it releases.
     pub fn encode(&self) -> Vec<u8> {
         let mut w = start();
-        w.u128(self.by);
+        match *self {
+            Self::Refused => return Vec::new(),
+            Self::Version { order, null } => {
+                w.u8(0);
+                w.u64(order);
+                w.u8(u8::from(null));
+            }
+            Self::Part => w.u8(1),
+            Self::Adopted { by } => {
+                w.u8(2);
+                w.u128(by);
+            }
+        }
         finish(w)
     }
 
-    /// The composite a mark's value names: none for a mark with no value, a file the range
-    /// holds under its key.
-    pub fn of(mark: &[u8]) -> Result<Option<Self>, RecordError> {
+    pub fn decode(mark: &[u8]) -> Result<Self, RecordError> {
         if mark.is_empty() {
-            return Ok(None);
+            return Ok(Self::Refused);
         }
-        let mut r = open(mark, "adopted")?;
-        let adopted = (|| Some(Self { by: r.u128()? }))();
-        decoded(adopted, &r, "adopted").map(Some)
+        let mut r = open(mark, "mark")?;
+        let decoded_mark = (|| match r.u8()? {
+            0 => Some(Self::Version {
+                order: r.u64()?,
+                null: match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                },
+            }),
+            1 => Some(Self::Part),
+            2 => Some(Self::Adopted { by: r.u128()? }),
+            _ => None,
+        })();
+        decoded(decoded_mark, &r, "mark")
     }
 }
 
@@ -1476,6 +1510,31 @@ mod tests {
             default(Period::Years(u32::MAX)).from(i64::MAX - 1).until_ms,
             i64::MAX
         );
+    }
+
+    /// Every mark decodes as written, a refused file's with no value, and a mark whose
+    /// kind or flag no writer makes is corrupt.
+    #[test]
+    fn marks_round_trip() {
+        for mark in [
+            Mark::Refused,
+            Mark::Version {
+                order: 7,
+                null: true,
+            },
+            Mark::Part,
+            Mark::Adopted { by: 9 },
+        ] {
+            assert_eq!(Mark::decode(&mark.encode()), Ok(mark));
+        }
+        assert!(Mark::Refused.encode().is_empty());
+        for body in [&[3][..], &[0, 7, 0, 0, 0, 0, 0, 0, 0, 2]] {
+            let mut w = start();
+            for b in body {
+                w.u8(*b);
+            }
+            assert_eq!(Mark::decode(&finish(w)), Err(RecordError::Corrupt("mark")));
+        }
     }
 
     #[test]

@@ -185,7 +185,14 @@ layers removes them, as Tectonic's does [01 §1.6].
       the deadline, and a Name range whose time has passed it refuses the write and releases
       the file, as Spanner fails reads older than its version window (22 §6).
     - *The mark.* A Name range that takes a file within its deadline, referencing it or
-      releasing it for a refused write, marks it. The mark is keyed by the object key the
+      releasing it for a refused write, marks it with how it took it: the version a PUT or
+      completion made (its order), a part, a part adopted by a composite, or refused. A
+      write that carries a file already marked is a copy of one the range applied, delivered
+      again outside the session that would have filtered it (replica.md §1): the range
+      answers it as the first was answered and neither takes nor releases the file, so no
+      file gets a second referrer and no refusal releases a file something holds. A copy
+      comes past its deadline as often as not, so the mark is read before the deadline is.
+      The mark is keyed by the object key the
       file was made for, in a space of its own that listings never read, so a split cuts a
       range's marks at the same key as its rows and a file's mark stays with the rows that
       may reference it. A mark keyed by the file alone would stay behind in the old range, and
@@ -208,13 +215,19 @@ layers removes them, as Tectonic's does [01 §1.6].
       sweep that stops while its request is in flight, so the order of steps alone cannot
       prevent this (audit B01). Like the reclaimer, the sweep names each read and command and
       does no I/O, and every step can be repeated.
-    - *What it costs.* A mark is a row with no value, or with the adopting composite's ID,
-      for every file the range holds and every file it released and has not yet reclaimed. A
-      file handed over past its deadline is released unmarked, since it may come after the
-      sweep settled the file; a file whose mark went with its release before the sweep came by
-      is released again. Either way the file is in the queue twice, and the reclaimer's second
+    - *What it costs.* A mark is a row with no value for a refused file, or a few bytes
+      naming the version, part or adopting composite, for every file the range holds and
+      every file it released and has not yet reclaimed. A release leaves the mark: the mark
+      once went with the release, and a copy of the write that came after found the file
+      unmarked and took it again, a released file named by a new version. A file handed over
+      past its deadline, and not marked, is released unmarked, since it may come after the
+      sweep settled the file; the file is then in the queue twice, and the reclaimer's second
       pass finds it gone. So every mark is on a file a version, a part or a held composite
-      names, or on one released and waiting for the collector.
+      names, or on one released and waiting for the collector. The collector removes a mark
+      only after the grace period, three days, far past any handover deadline (below, as
+      Ceph's 120 s and HDFS's 60 s bound the same window), so a copy that comes after its mark went is past its deadline and
+      refused, and the file it names, already reclaimed, is released a second time into a
+      queue where the reclaimer finds it gone.
     - *The deadline's length* is the gateway's measured handover time: the per-step deadline
       times its retry budget, plus the clock offset between ranges, as Ceph's 120 s and HDFS's
       60 s bound the same window (22 §10.2). It bounds how long a leftover file waits, not
@@ -271,7 +284,8 @@ layers removes them, as Tectonic's does [01 §1.6].
   body.rs), commits the version, removes the upload and its part rows, and marks each listed
   part as adopted by the object's file (§2, "Adoption"). A retried complete with the same
   parts finds the version it made and answers as before, releasing the composite it wrote
-  again (05 §4.4).
+  again (05 §4.4); a copy of the completion itself, carrying the composite the version names,
+  is answered from that file's mark and releases nothing (§2, "The mark").
 - **Creating and deleting a bucket** touch the Bucket range and every Name range the
   bucket's keys fall in. Each is a sequence of range transactions, each guarded by what the
   one before it wrote, with the collector finishing what a failure leaves, as Tectonic moves

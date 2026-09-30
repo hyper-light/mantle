@@ -59,6 +59,25 @@ answered, and every command after, retries and serials still in flight alike, is
 from an expired session, never applied, so the gateway registers anew knowing which commands
 took effect.
 
+Sessions filter duplicates only within a session, and a command can outlive its own: one in
+flight when its session expired has an unknown outcome, and the dissertation leaves the
+client an error and nothing more, LogCabin crashing the client (06 §A1.8). A gateway that
+re-sends such a command in a new session, or a copy delayed past its session's end, reaches
+the range as a new command. So every Name-range write that carries a file is idempotent by
+the file itself, not by its session. The gateway makes a file for each write attempt and
+never reuses one (metadata.md §2), and the range marks every file it takes with how it took
+it: the version a PUT or completion made, a part, a part adopted by a composite, or a file
+released because its write was refused. The mark stays until the collector has reclaimed the
+file. A write whose file is already marked is a copy. It is answered as the first was, the
+version's ID or `PartWritten`, or `Expired` if the first was refused, and it neither takes
+nor releases anything. Without this, a part re-sent after its completion was refused
+`NoSuchUpload` and released a file the object's version held, and a PUT re-sent made a second
+version of one file, which a delete of either released under the other. The rule for a
+gateway is the dissertation's: after `SessionExpired`, register anew and re-send the command
+unchanged, carrying the same file, and take its answer. A write that carries no file, an
+empty object's PUT, has nothing to recognise it by: re-sent, it makes another version, as a
+client's own retry of a PUT does in S3.
+
 ## 2. Applying an entry
 
 The commands of one entry apply as one engine batch at the entry's index. That keeps the

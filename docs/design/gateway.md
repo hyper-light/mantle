@@ -157,6 +157,14 @@ a list the first completion would refuse as `InvalidPart` was answered as the ob
 answer to a retry carries the version's size and checksum, which the gateway, holding no part
 rows, reports as the first completion did.
 
+A Name command whose session expired before it was answered has an unknown outcome
+(replica.md §1, 06 §A1.8): the gateway registers anew and re-sends it unchanged, with the
+same file. The range recognises the file it already took and answers as it answered the
+first delivery, a PUT or completion with its version's ID and a part with `PartWritten`, or
+`Expired` when the first was refused and its file released, after which the gateway writes a
+new file and makes the request again as a new attempt. A copy never takes or releases the
+file, so no re-send can give a file a second referrer or release one a version holds.
+
 ## 3. Reading an object
 
 A GET reads top down (`get.rs`), from the version the Name range read, whose preconditions,

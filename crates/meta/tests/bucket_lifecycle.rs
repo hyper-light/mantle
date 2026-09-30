@@ -180,6 +180,8 @@ struct World {
     acked: BTreeMap<&'static str, u64>,
     /// What each finished attempt told its request, in the order they finished.
     settled: Vec<Option<Settled>>,
+    /// The file the next put carries: a writer makes one for each write.
+    file: u128,
 }
 
 impl World {
@@ -209,6 +211,7 @@ impl World {
             views: Vec::new(),
             acked: BTreeMap::new(),
             settled: Vec::new(),
+            file: 1,
         };
         w.split(1, key::route(BUCKET, "m"));
         w.act(&Action::Publish);
@@ -464,6 +467,7 @@ impl World {
             Action::Put { key, view } => {
                 if let Some(&incarnation) = self.views.get(view % self.views.len().max(1)) {
                     let key = KEYS[*key];
+                    self.file += 1;
                     let put = name::Command::Put(Put {
                         bucket: BUCKET.into(),
                         incarnation,
@@ -472,7 +476,10 @@ impl World {
                         preconditions: Preconditions::default(),
                         at_ns: self.clock,
                         ordered_ns: None,
-                        version: object(),
+                        version: Version {
+                            file: Some(self.file),
+                            ..object()
+                        },
                         default: None,
                         deadline_ns: u64::MAX,
                     });
@@ -753,7 +760,7 @@ fn object() -> Version {
         etag: "e".into(),
         size: 1,
         checksum: None,
-        file: Some(1),
+        file: None,
         owner: "o".into(),
         headers: Vec::new(),
         retention: None,

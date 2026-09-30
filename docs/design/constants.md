@@ -116,7 +116,7 @@ gains a basis lowers the ceiling.
 | `crates/log/src/format.rs` `SEGMENT_HEADER_LEN` | format | Byte length of the encoded segment header before padding, fixed by the layout in format.rs and raft-log.md §2. |
 | `crates/log/src/format.rs` `START` | format | Record kind code 4 in the frame payload encoding. |
 | `crates/log/src/format.rs` `UNCERTAIN` | format | Record kind code 7 in the frame payload encoding. |
-| `crates/log/src/lib.rs` `GROUP_SUBMISSIONS` | open | Two unanswered submissions per group; research/11 §4 derives ⌈μ·d⌉, not 2, and audit §12.6 asks for queue credit derived from service, deadline and memory limits. |
+| `crates/log/src/lib.rs` `GROUP_SUBMISSIONS` | derived | The most a replica has unanswered at once: its ready's part in flight and a compaction, each waiting for its answer (replica.md §3–§4). A replica with more than one ready in flight (§7) raises it. |
 | `crates/log/src/state.rs` `DAMAGED_BYTES` | format | Encoded size of a `Damaged` record (kind and group) in the frame payload. |
 | `crates/log/src/state.rs` `HARD_STATE_BYTES` | format | Encoded size of a `HardState` record in the frame payload. |
 | `crates/log/src/state.rs` `PROPOSAL_EXTRA` | format | A proposal's encoded bytes beyond an entry's: kind, group and index (1 + 16 + 8). |
@@ -297,8 +297,8 @@ parameters. The gate does not parse these; they are kept here with the same kind
   and tolerance from the service objective they serve, or from a cited source, and a round
   budget from the time a startup may take.
 - `measure::MAX_DEPTH`: an executor credit from the node's CPU, memory and thread allowance.
-- `log::GROUP_SUBMISSIONS` and `replica::DRIVE_BUDGET`: the node's scheduler (audit §5.1),
-  whose ranges keep more than one ready in flight and share work by deadline.
+- `replica::DRIVE_BUDGET`: the node's scheduler (audit §5.1), which shares work among its
+  ranges by deadline.
 - A bucket policy's raw body limit (`policy::BODY_LIMIT`): a recording of how much white space
   S3 keeps in a policy it gives back as set.
 - The benchmarks' ladders and step lengths: the regimes each exercises, in their

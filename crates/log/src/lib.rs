@@ -247,9 +247,10 @@ pub(crate) fn frame_room(config: &Config, align: Alignment) -> Result<usize, Log
         .ok_or(LogError::Config("a segment holds no frame"))
 }
 
-/// Submissions one group may have unanswered: the queue's two batches' worth
-/// [research/11 §4] for a group, which has one update in each frame. A hot group then waits
-/// for its own room and never takes the others'.
+/// Submissions one group may have unanswered: the most its replica sends at once, the part of
+/// its ready in flight and a compaction, each of which waits for its answer before the next
+/// (docs/design/replica.md §3–§4); the writes a replica makes as it opens come before any
+/// ready. A caller that sends more waits for its own room, and never takes another group's.
 const GROUP_SUBMISSIONS: usize = 2;
 
 struct Shared<F> {

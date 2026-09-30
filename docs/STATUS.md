@@ -57,7 +57,12 @@ verify every byte they return, checkpoints and log wrap-around, reuse of segment
 empty out, cleaning of partly dead segments chosen by cost-benefit (relocations batched
 into the cleaner's own stream, a reserve segment kept for it, and passes that stop when
 they cannot gain space), and crash recovery (replay, verification of the last batch,
-roll-forward, and a checkpoint that makes recovery's corrections durable). Its operating
+roll-forward, and a checkpoint that makes recovery's corrections durable). A delete, and a
+put in a segment its batch opened, are answered once a later frame confirms their batch's,
+since recovery finds neither without its frame, and an answer decided without writing waits
+for whatever unconfirmed request it rests on. Damage to any frame of the checkpoint the
+superblock names is refused, and a superblock read without its twin resumes past what the
+twin may have reserved. Its operating
 parameters are calculated from models and measurements rather than chosen
 (docs/research/11): checkpoints when the log needs the room, at most half its writes;
 a write queue of two batches that refuses with `Busy` beyond them; cleaning on a runway
@@ -249,28 +254,37 @@ metadata device shares: group commit across ranges with one flush a batch, frame
 sequences tell a torn tail from damage to acknowledged state, updates answered only once a
 later durable record confirms their frame's flush, segments reclaimed oldest first by
 sweeping their live records forward in one frame, and reads of entries no longer in memory
-verified by each entry's own checksum. A property test runs generated histories of appends,
+verified by each entry's own checksum. A confirmation rewrites its frame's own record, a
+commit that fails answers every update it holds, an open restoring a lost frame keeps that
+frame's record until the restore is durable, and a live segment that yields no frame is
+reported as damage. A property test runs generated histories of appends,
 conflicts, compactions, snapshots, proposals and removals, cutting power at random points on
 the simulated device, and checks after every reopen that each acknowledged update survived
 and the one in flight landed whole or not at all; a soak of 200,000 histories over segment
-sizes and quotas passed. `mantle bench log` measures appends against the device: one flush
+sizes and quotas passed. A second property test damages the last frame after power loss and
+checks every acknowledged group is kept or reported: 20,000 cases a run. `mantle bench log` measures appends against the device: one flush
 commits every replica's append, from 2 replicas to 256; an append waits for two flushes, its
 frame's and its confirmation's, where none follows at once
 ([measurements](measurements/2026-09-29-log-confirmation.md)).
 
 Range replicas (`mantle-range`, [design](design/replica.md)) run focal-raft's core over the
 log and an engine: an entry carries a batch of gateway commands applied as one engine batch,
-client sessions make each command take effect once however often it is retried, and members
+client sessions make each command take effect once however often it is retried, a write
+delivered again in a new session is recognised by its file, or for a write with no file by
+the ID the gateway drew for its request, and answered as its first delivery was, and members
 that lag are caught up by snapshot, and reads are confirmed by ReadIndex. A member lost for
 good is replaced by one under a new identity: added as a learner, caught up, swapped in by
-one joint change, and done once every voter knows the new configuration committed. A
+one joint change, and done once every voter knows the new configuration committed. While a
+`Ready` flushes, a replica holds the messages and ticks it is given, within a window of
+appends per member and one election timeout, and takes them in order after; refusing them
+left a leader under steady load committing nothing. A
 deterministic simulation of three members and three concurrent gateways, under crashes,
 failed writes and flushes, partitions, dropped and reordered messages, compaction, and one
 or two members lost for good in every run, checks after every run that each index was
 applied the same everywhere, that every operation completes once faults stop, that every
 put exists exactly once, that the members agree, that each key's history is linearizable,
-and that every member's configuration names the live members. A soak of 20,000 seeds passed,
-replacing 39,948 members lost for good, and the simulation catches stale reads and repeated
+and that every member's configuration names the live members. A soak of 20,000 seeds passed, holding 4.4 million messages and 3.3 million ticks
+through flushes and replacing 39,898 members lost for good, and the simulation catches stale reads and repeated
 commands applied twice when either is introduced on purpose.
 
 Remaining before it is done:

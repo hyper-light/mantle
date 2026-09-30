@@ -25,6 +25,10 @@ pub enum ReplicaError {
     /// An entry more than the range's bound, which every member's log holds in one frame.
     #[error("an entry of {len} bytes; the range takes {max} at most")]
     EntryTooLarge { len: usize, max: u64 },
+    /// Reads waiting for the next round of confirmation would hold more bytes of contexts
+    /// than the range's entry bound: the read is to be asked again once a round is confirmed.
+    #[error("reads waiting would hold {bytes} bytes of contexts; the range takes {max}")]
+    ReadsWaiting { bytes: u64, max: u64 },
     /// Settings a member's log cannot hold to.
     #[error("the range's settings do not fit this member's log: {0}")]
     Config(&'static str),

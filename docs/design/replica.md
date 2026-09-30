@@ -110,6 +110,20 @@ across a step, and checks linearizability as before. What the node's scheduler o
 ranges it drives, time for heartbeats, reads and applying beside the flushes it waits on, is
 the node's, which is not built (STATUS).
 
+**Reads.** A replica confirms reads a round at a time. One round is out at a time, carrying
+every read asked before it began, and one quorum's heartbeats confirm them all at the commit
+index the round began at. A read asked while a round is out waits for the next: that round's
+index may predate a write committed since, whose client may already have its answer, and the
+read must see it (06 §A1.5). Before, each read asked for its own round of heartbeats. A round
+whose confirmation never comes, its leader gone or its heartbeat lost, is dropped after an
+election timeout's ticks with its reads, as a lost message's reads are, and those waiting go in
+a new round; the reads waiting hold at most an entry's bytes of contexts, past which a read is
+refused to be asked again. `a_read_asked_while_a_round_is_out_waits_for_the_next`
+(`crates/range/tests/group.rs`) holds a round's heartbeats while a write commits: the read
+asked after it is confirmed at or past the write, and letting it join the round out confirms
+it before the write. Without the bound on a lost round, reads in the simulation never finish
+(audit §5.5). Leases are not used.
+
 The transport tells the sending replica whether each snapshot arrived. A leader stops
 replicating to a member while that member's snapshot is out, so a lost snapshot left
 unreported would stall the member for good; the simulation found this. A snapshot's own
@@ -203,6 +217,14 @@ before every voter knew its configuration. The simulation catches two broken var
 within the first seeds: gets served from any member's rows without ReadIndex fail
 linearizability, and a replica that applies a repeated command again stores a put twice.
 
+A run is its seed as far as the simulation's own choices go, but each member's log writer
+runs on its own thread and waits on the clock, for returning submitters and for an idle
+confirmation (raft-log.md §3, §6), so which updates share a frame, and what a crash between
+them keeps, can differ between runs of one seed: over 300 seeds, counts of what was exercised
+differed between two runs by under 1%. Failing seeds have reproduced run after run so far.
+Runs exactly their seeds need the log's waits on a clock the simulation drives and a writer it
+steps, which is not built.
+
 ## 6. Replacing a member
 
 A member whose device fails has lost its persistent state, and a member that has "cannot
@@ -241,7 +263,8 @@ change. Membership changes are rare, so this costs one image each.
 
 - The window of entries kept for lagging followers before one is sent a snapshot, and
   moving snapshots out of band with the production engine.
-- ReadIndex reads, and leases if a deployment states its clock-drift bound (06 §A1.5).
+- Read leases, if a deployment states its clock-drift bound (06 §A1.5); reads are confirmed
+  by ReadIndex rounds (§3) until then.
 - The session lifetime and bounds, sessions a range holds and the answers and bytes of
   answers one keeps, from how long gateways go between commands to a range and how many
   they keep in flight.

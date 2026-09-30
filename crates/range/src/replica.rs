@@ -107,14 +107,51 @@ pub struct Replica<F: BlockFile + 'static, E: Engine> {
     /// as it would have with the entries, and does not campaign, since it cannot lead
     /// without them.
     uncertain: Option<Start>,
+    /// Reads asked of the group, confirmed a round at a time.
+    reads: Rounds,
+    /// Ticks a round of reads may be out before it is taken as lost: an election timeout.
+    round_ticks: u64,
 }
 
+/// Reads confirmed a round at a time (audit §5.5). One round is out at a time, and one quorum's
+/// confirmation serves every read it carries. A read asked while a round is out waits for the
+/// next: the round's index is the commit index when it began, which may predate a write the
+/// read must see (06 §A1.5), so a read never joins a round begun before it. A round whose
+/// confirmation never comes, its leader gone or its message lost, is dropped after an election
+/// timeout's ticks, its reads with it, as a lost message's are, and their callers ask again.
+#[derive(Debug, Default)]
+struct Rounds {
+    /// The round out: its number, the ticks it has been out, and the reads it carries.
+    out: Option<(u64, u64, Vec<Vec<u8>>)>,
+    /// Reads waiting for the next round, and their bytes.
+    waiting: Vec<Vec<u8>>,
+    waiting_bytes: u64,
+    next: u64,
+}
+
+/// The context a round of reads is asked under: its number, under a tag no other context of
+/// the replica's takes.
+fn round_context(number: u64) -> Vec<u8> {
+    let mut context = ROUND.to_vec();
+    context.extend_from_slice(&number.to_be_bytes());
+    context
+}
+
+fn round_of(context: &[u8]) -> Option<u64> {
+    let number = context.strip_prefix(ROUND)?;
+    Some(u64::from_be_bytes(number.try_into().ok()?))
+}
+
+const ROUND: &[u8] = b"mantle-read-round:";
+
 /// A ready being made durable: its update's parts not yet durable, in order, each fitting a
-/// frame, and the log's answer for the first once it is submitted.
+/// frame, the log's handle for the first once it is submitted, and the log's answer once it
+/// has been waited for.
 struct Staged {
     ready: focal_raft::Ready,
     parts: VecDeque<Update>,
     pending: Option<Pending>,
+    answered: Option<Result<(), LogError>>,
 }
 
 /// Where writing a ready's parts got to.
@@ -231,6 +268,8 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
             max_entry_bytes: settings.max_entry_bytes,
             staged: None,
             uncertain,
+            reads: Rounds::default(),
+            round_ticks: u64::try_from(settings.election_tick).unwrap_or(u64::MAX),
         };
         // A log compacted before the restart can serve a lagging member only by snapshot.
         let compacted = replica
@@ -356,7 +395,13 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
             return Ok(());
         }
         self.node.tick()?;
-        Ok(())
+        if let Some((_, age, _)) = self.reads.out.as_mut() {
+            *age = age.saturating_add(1);
+            if *age >= self.round_ticks {
+                self.reads.out = None;
+            }
+        }
+        self.next_round()
     }
 
     /// Takes a message. While the member's log may lack entries it acknowledged, it judges a
@@ -409,11 +454,62 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
 
     /// Asks the group to confirm a read: once a quorum has, `drive` gives back the read with
     /// the index the rows must reach, and rows at or past it answer the read linearizably.
-    /// Only a leader confirms reads; `context` names the read.
+    /// `context` names the read. Reads are confirmed a round at a time, and a read waits for
+    /// the round after any that is out (`Rounds`); the reads waiting hold at most an entry's
+    /// bytes of contexts, past which a read is refused, to be asked again.
     pub fn read_index(&mut self, context: Vec<u8>) -> Result<(), ReplicaError> {
         self.ready_for_calls()?;
-        self.node.read_index(context)?;
+        let len = u64::try_from(context.len()).unwrap_or(u64::MAX);
+        let waiting = self.reads.waiting_bytes.saturating_add(len);
+        if waiting > self.max_entry_bytes {
+            return Err(ReplicaError::ReadsWaiting {
+                bytes: waiting,
+                max: self.max_entry_bytes,
+            });
+        }
+        self.reads.waiting.push(context);
+        self.reads.waiting_bytes = waiting;
+        self.next_round()
+    }
+
+    /// Asks for the next round of reads, carrying every read waiting, when none is out and the
+    /// replica takes calls.
+    fn next_round(&mut self) -> Result<(), ReplicaError> {
+        if self.reads.out.is_some() || self.reads.waiting.is_empty() || self.staged.is_some() {
+            return Ok(());
+        }
+        let number = self.reads.next;
+        match self.node.read_index(round_context(number)) {
+            Ok(()) => {}
+            // The core cannot ask now, having no leader to ask: the reads wait, and a later
+            // tick or drive asks.
+            Err(e) if !e.is_fatal() => return Ok(()),
+            Err(e) => return Err(e.into()),
+        }
+        self.reads.next = number.wrapping_add(1);
+        let reads = std::mem::take(&mut self.reads.waiting);
+        self.reads.waiting_bytes = 0;
+        self.reads.out = Some((number, 0, reads));
         Ok(())
+    }
+
+    /// The reads a confirmation serves: every read of the round out that it names, each at the
+    /// round's index. A confirmation of a round already dropped serves none; its reads were
+    /// dropped with it.
+    fn confirmed(&mut self, index: u64, context: &[u8], out: &mut Drive) {
+        let Some(number) = round_of(context) else {
+            return;
+        };
+        if self
+            .reads
+            .out
+            .as_ref()
+            .is_some_and(|(n, _, _)| *n == number)
+            && let Some((_, _, reads)) = self.reads.out.take()
+        {
+            out.reads
+                .extend(reads.into_iter().map(|read| (index, read)));
+        }
     }
 
     /// Reports whether a snapshot this member sent to `to` arrived. Replication to a member
@@ -492,6 +588,18 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
         self.staged.as_ref().is_some_and(|s| s.pending.is_some())
     }
 
+    /// Waits until the part of a ready's update now submitted is durable, or refused, and
+    /// keeps the answer for the next `begin` or `drive`, which finish the ready: a node that
+    /// has sent what `begin` gave out and has nothing else to do waits here for the flush.
+    pub fn wait_persisted(&mut self) {
+        if let Some(staged) = self.staged.as_mut()
+            && staged.answered.is_none()
+            && let Some(pending) = staged.pending.as_ref()
+        {
+            staged.answered = Some(pending.wait());
+        }
+    }
+
     fn drive_ready(&mut self, wait: bool) -> Result<Drive, ReplicaError> {
         let mut out = Drive::default();
         for _ in 0..DRIVE_BUDGET {
@@ -522,6 +630,8 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
                 }
             }
         }
+        // The reads that waited on a round now confirmed go in the next.
+        self.next_round()?;
         // A member whose log may lack entries it acknowledged cannot lead: its election
         // timer still runs, which keeps it from holding a lease on a leader that is gone,
         // but its campaigns ask no one.
@@ -540,12 +650,9 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
             _ => None,
         };
         out.messages.extend(ready.take_messages());
-        out.reads.extend(
-            ready
-                .take_read_states()
-                .into_iter()
-                .map(|r| (r.index, r.request_ctx)),
-        );
+        for read in ready.take_read_states() {
+            self.confirmed(read.index, &read.request_ctx, out);
+        }
         let parts = match update_of(&ready, installed)? {
             Some(update) => match self.node.store().log.parts(self.group, update) {
                 Ok(parts) => parts.into(),
@@ -562,6 +669,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
             ready,
             parts,
             pending: None,
+            answered: None,
         })
     }
 
@@ -571,10 +679,10 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
     fn persist(&mut self, mut staged: Staged, wait: bool) -> Result<Persisted, ReplicaError> {
         loop {
             if let Some(pending) = staged.pending.as_ref() {
-                let answer = if wait {
-                    Some(pending.wait())
-                } else {
-                    pending.poll()
+                let answer = match staged.answered.take() {
+                    Some(answer) => Some(answer),
+                    None if wait => Some(pending.wait()),
+                    None => pending.poll(),
                 };
                 match answer {
                     None => return Ok(Persisted::Flushing(staged)),

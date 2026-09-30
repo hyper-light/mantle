@@ -392,6 +392,99 @@ fn a_leader_sends_while_it_flushes_and_a_follower_acknowledges_after() {
     assert!(nodes[0].0.applied() >= 2);
 }
 
+/// A read asked while a round of confirmation is out waits for the next round, which every
+/// read waiting shares: the round out has the commit index of when it began, and a write
+/// committed since, whose answer came before the read was asked, must be seen (audit §5.5).
+#[test]
+fn a_read_asked_while_a_round_is_out_waits_for_the_next() {
+    let mut nodes: Vec<Node> = (1..=3).map(|id| node(id, id)).collect();
+    let mut answers = Vec::new();
+    nodes[0].replica.campaign().unwrap();
+    settle(&mut nodes, &mut answers);
+    assert!(nodes[0].replica.is_leader());
+    let is = |m: &Message, t: mantle_range::MessageType| kind(m) == Some(t);
+
+    // Round one carries the first read; its heartbeats are held. The second, asked after the
+    // round began, waits.
+    nodes[0].replica.read_index(b"first".to_vec()).unwrap();
+    nodes[0].replica.read_index(b"second".to_vec()).unwrap();
+    let held: Vec<Message> = nodes[0].replica.drive().unwrap().messages;
+    assert!(
+        held.iter()
+            .all(|m| is(m, mantle_range::MessageType::MsgHeartbeat))
+    );
+
+    // A write commits meanwhile, its appends and their answers delivered.
+    let register = Sessioned {
+        session: 0,
+        serial: 0,
+        unanswered: 0,
+        command: Command::Register,
+    };
+    nodes[0]
+        .replica
+        .propose(&Entry {
+            at_ns: 10,
+            commands: vec![register],
+        })
+        .unwrap();
+    let mut wire: VecDeque<Message> = nodes[0].replica.drive().unwrap().messages.into();
+    let mut written = None;
+    while let Some(m) = wire.pop_front() {
+        if is(&m, mantle_range::MessageType::MsgHeartbeat) {
+            continue;
+        }
+        let to = usize::try_from(m.to).unwrap() - 1;
+        nodes[to].replica.step(m).unwrap();
+        let out = nodes[to].replica.drive().unwrap();
+        if to == 0
+            && let Some(a) = out.applied.last()
+        {
+            written = Some(a.index);
+        }
+        wire.extend(
+            out.messages
+                .into_iter()
+                .filter(|m| !is(m, mantle_range::MessageType::MsgHeartbeat)),
+        );
+    }
+    let written = written.expect("the write committed at the leader");
+
+    // A read asked now must see the write: it waits for the next round with the second.
+    nodes[0].replica.read_index(b"third".to_vec()).unwrap();
+    let mut wire: VecDeque<Message> = held.into();
+    wire.extend(nodes[0].replica.drive().unwrap().messages);
+    let mut confirmed = Vec::new();
+    for _ in 0..1_000 {
+        let Some(m) = wire.pop_front() else {
+            break;
+        };
+        let to = usize::try_from(m.to).unwrap() - 1;
+        let _ = nodes[to].replica.step(m);
+        for n in nodes.iter_mut() {
+            let out = n.replica.drive().unwrap();
+            if n.replica.id() == 1 {
+                confirmed.extend(out.reads);
+            }
+            wire.extend(out.messages);
+        }
+    }
+    let at = |read: &[u8]| {
+        confirmed
+            .iter()
+            .find(|(_, r)| r.as_slice() == read)
+            .map(|(i, _)| *i)
+            .unwrap_or_else(|| panic!("{:?} not confirmed", String::from_utf8_lossy(read)))
+    };
+    assert!(at(b"first") < written);
+    assert_eq!(at(b"second"), at(b"third"));
+    assert!(
+        at(b"third") >= written,
+        "a read confirmed at {} before the write at {written}",
+        at(b"third")
+    );
+}
+
 /// Every row an engine holds that its range replicates.
 fn rows(m: &Model) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut out = Vec::new();

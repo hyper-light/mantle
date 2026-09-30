@@ -528,16 +528,25 @@ impl World {
             // Under faults, a member half the time takes its ready without waiting for its log
             // and finishes it at a later step, messages to it meanwhile refused, as a node
             // overlapping its members' flushes does (audit §5.1).
+            // The flush is waited for before the step ends, so what the next step finds does
+            // not hang on the log's thread: every run is its seed.
             let out = if self.faults && self.rng.chance(500) {
-                r.begin()
+                let out = r.begin();
+                r.wait_persisted();
+                out
             } else {
                 r.drive()
             };
             let out = match out {
                 Ok(out) => out,
-                // A fenced log takes its node down; it restarts from what its device kept.
+                // A fenced log takes its node down; it restarts from what its device kept. A
+                // ready begun under faults can find its log fenced a step after they stop, and
+                // its node restarts at once, as the heal would have restarted it.
                 Err(ReplicaError::Log(_)) => {
                     n.crash();
+                    if !self.faults {
+                        n.restart(self.seed);
+                    }
                     continue;
                 }
                 Err(e) => {
@@ -571,7 +580,12 @@ impl World {
             };
             match r.compact(keep) {
                 Ok(()) => {}
-                Err(ReplicaError::Log(_)) => n.crash(),
+                Err(ReplicaError::Log(_)) => {
+                    n.crash();
+                    if !self.faults {
+                        n.restart(self.seed);
+                    }
+                }
                 Err(e) => self.fail(&format!("compact on {id}: {e}")),
             }
         }

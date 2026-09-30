@@ -222,35 +222,41 @@ segments as it streams, cut into blocks of whole segments sized to the scheme's 
 each block coded as copies or Reed–Solomon and its chunks written at once to distinct volumes
 with their CRC-32C, a refused chunk sent to the next volume offered, the block recorded once
 every chunk is durable and renewed while the body streams on, the file written once every
-block is, and the version or part committed last. It holds two blocks at most, the body
-waiting while both are full. An empty object is its version alone; an empty part has a file.
-Tested end to end against volumes and Block, File and Name ranges in memory: every object and
-part reads back from its chunks under its key, coded blocks rebuild from any `data` chunks,
-the body is held to its length and digests, and generated schedules of bodies, client pace
-and refusing volumes commit an object whole or nothing, which fails with renewals removed.
+block is, and the version or part committed last. It holds the block filling and as many full
+blocks going down at once as its caller admits, the body waiting while that many go. A GET
+seeks by the byte it wants, reads only the chunk bytes that hold its range, reads another copy
+or decodes a block around a chunk that fails, reads an object of parts by its parts'
+plaintext, and holds as many blocks as its caller admits. Completing an upload derives the
+object's size, ETag and checksum, full-object or composite, from its parts' rows, and the Name
+range checks them against its own. An empty object is its version alone; an empty part has a
+file. Tested end to end against volumes and Block, File and Name ranges in memory: every object
+and part reads back through the GET, in any range and with chunks lost, coded blocks rebuild
+from any `data` chunks, the body is held to its length and digests, and generated schedules of
+bodies, client pace, windows and refusing volumes commit an object whole or nothing, which
+fails with renewals removed. `mantle bench gateway` measures both paths on one core and counts
+the round trips each waits through.
 
 Remaining before it is done:
 
-- The GET path's lookahead and flight window, from measurements of the path. The path reads
-  a range from the chunk bytes that hold it, reads another copy or decodes a block around a
-  chunk that fails, reads objects of parts by their parts' plaintext, and holds two blocks.
-- Completing an upload is derived from its parts' rows: size, ETag and checksum, full-object or
-  composite, checked by the Name range, and the object read back through the GET.
+- The windows a gateway admits, from its memory and measured latency; the rates of the paths
+  measured on an idle machine.
 - The server around it: HTTP, the transport to storage nodes and ranges, routing by
-  descriptors, placement across failure domains, and each PUT's memory admitted against the
-  gateway's.
+  descriptors, placement across failure domains, and each request's memory admitted against
+  the gateway's.
 
 The Raft log (`mantle-log`, [design](design/raft-log.md)), which every range replica on a
 metadata device shares: group commit across ranges with one flush a batch, frames whose
-sequences tell a torn tail from damage to acknowledged state, segments reclaimed oldest
-first by sweeping their live records forward in one frame, and reads of entries no longer
-in memory verified by each entry's own checksum. A property test runs generated histories
-of appends, conflicts, compactions, snapshots, proposals and removals, cutting power at
-random points on the simulated device, and checks after every reopen that each
-acknowledged update survived and the one in flight landed whole or not at all; a soak of
-200,000 histories over segment sizes and quotas passed. `mantle bench log` measures
-appends against the device: one flush commits every replica's append, from 2 replicas to 256,
-at about one durable write of latency ([measurements](measurements/2026-09-28-raft-log-benchmark.md)).
+sequences tell a torn tail from damage to acknowledged state, updates answered only once a
+later durable record confirms their frame's flush, segments reclaimed oldest first by
+sweeping their live records forward in one frame, and reads of entries no longer in memory
+verified by each entry's own checksum. A property test runs generated histories of appends,
+conflicts, compactions, snapshots, proposals and removals, cutting power at random points on
+the simulated device, and checks after every reopen that each acknowledged update survived
+and the one in flight landed whole or not at all; a soak of 200,000 histories over segment
+sizes and quotas passed. `mantle bench log` measures appends against the device: one flush
+commits every replica's append, from 2 replicas to 256; an append waits for two flushes, its
+frame's and its confirmation's, where none follows at once
+([measurements](measurements/2026-09-29-log-confirmation.md)).
 
 Range replicas (`mantle-range`, [design](design/replica.md)) run focal-raft's core over the
 log and an engine: an entry carries a batch of gateway commands applied as one engine batch,

@@ -12,7 +12,7 @@ use crate::record::{
 };
 use crate::{block, bucket, file, name};
 
-const FORMAT: u8 = 3;
+const FORMAT: u8 = 4;
 
 /// Commands one entry carries at most: a session is named by the index of the entry that
 /// registered it and the registration's place in that entry.
@@ -597,7 +597,6 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
             record::put_str(w, &p.upload)?;
             w.u16(p.number);
             record::put_bytes(w, &p.part.encode()?)?;
-            w.u64(p.deadline_ns);
         }
         name::Command::Complete(c) => {
             w.u8(4);
@@ -785,7 +784,6 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
                 number: r.u16()?,
                 part: Part::decode(&record::take_bytes(r)?).ok()?,
                 at_ns,
-                deadline_ns: r.u64()?,
             })
         }
         4 => {
@@ -1712,9 +1710,9 @@ mod tests {
                     checksum: None,
                     file: 4,
                     modified_ns: 0,
+                    deadline_ns: u64::MAX,
                 },
                 at_ns,
-                deadline_ns: u64::MAX,
             })),
             named(name::Command::Complete(name::Complete {
                 bucket: "b".into(),

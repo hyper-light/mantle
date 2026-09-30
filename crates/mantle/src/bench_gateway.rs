@@ -22,6 +22,7 @@ use bytes::Bytes;
 use mantle_chunk::ChunkKey;
 use mantle_disk::measure::SplitMix64;
 use mantle_ec::durability::Scheme;
+use mantle_gateway::complete::{self, CompleteError, Completion};
 use mantle_gateway::get::{self, Get, GetError, Keyring};
 use mantle_gateway::layout::{Layout, LayoutError};
 use mantle_gateway::put::{
@@ -30,7 +31,7 @@ use mantle_gateway::put::{
 use mantle_meta::engine::Model;
 use mantle_meta::error::MetaError;
 use mantle_meta::name::{self, GateChange, Preconditions};
-use mantle_meta::record::{GateState, Version, Versioning, WrappedKey, Wrapper};
+use mantle_meta::record::{GateState, Part, Upload, Version, Versioning, WrappedKey, Wrapper};
 use mantle_meta::{block, file};
 use mantle_s3::checksum::Algorithm;
 use mantle_s3::seal::{DataKey, SealError, WrappingKey};
@@ -47,6 +48,7 @@ pub enum Error {
     Output(std::io::Error),
     Put(PutError),
     Get(GetError),
+    Complete(CompleteError),
     Meta(MetaError),
     Seal(SealError),
     Layout(LayoutError),
@@ -60,6 +62,7 @@ impl std::fmt::Display for Error {
             Self::Output(e) => write!(f, "writing output: {e}"),
             Self::Put(e) => write!(f, "PUT: {e}"),
             Self::Get(e) => write!(f, "GET: {e}"),
+            Self::Complete(e) => write!(f, "completion: {e}"),
             Self::Meta(e) => write!(f, "applying: {e}"),
             Self::Seal(e) => write!(f, "sealing: {e}"),
             Self::Layout(e) => write!(f, "layout: {e}"),
@@ -77,6 +80,12 @@ impl From<std::io::Error> for Error {
 impl From<PutError> for Error {
     fn from(e: PutError) -> Self {
         Self::Put(e)
+    }
+}
+
+impl From<CompleteError> for Error {
+    fn from(e: CompleteError) -> Self {
+        Self::Complete(e)
     }
 }
 
@@ -403,6 +412,104 @@ fn get(
     }
 }
 
+/// The gateway's completion driver alone, for an upload of `parts` parts: the File and Name
+/// ranges' answers are made up front and handed back at once, and each page of part rows is a
+/// slice of rows already read, so the time is the driver's own, pairing the listed parts with
+/// the rows, deriving the ETag and the file of parts, and building the Complete.
+fn completion(parts: u16) -> Result<Duration, Error> {
+    let listed: Vec<(u16, String)> = (1..=parts)
+        .map(|n| (n, format!("{:032x}", u128::from(n))))
+        .collect();
+    let rows: Vec<(u16, Part)> = listed
+        .iter()
+        .map(|(n, etag)| {
+            (
+                *n,
+                Part {
+                    etag: etag.clone(),
+                    size: name::MIN_PART,
+                    checksum: None,
+                    file: u128::from(*n),
+                    modified_ns: 0,
+                    deadline_ns: u64::MAX,
+                },
+            )
+        })
+        .collect();
+    let upload = Upload {
+        initiated_ns: 0,
+        owner: "bench".into(),
+        headers: Vec::new(),
+        checksum: None,
+        retention: None,
+        legal_hold: None,
+    };
+    let template = name::Complete {
+        bucket: BUCKET.into(),
+        incarnation: 1,
+        key: "k".into(),
+        upload: mantle_meta::key::version_id(1),
+        versioning: Versioning::Enabled,
+        preconditions: Preconditions::default(),
+        at_ns: 0,
+        parts: Vec::new(),
+        etag: String::new(),
+        size: 0,
+        checksum: None,
+        file: None,
+        default: None,
+        id: 0,
+        deadline_ns: 0,
+        listing: [0; mantle_meta::record::LISTING],
+    };
+    let started = Instant::now();
+    let mut driver = Completion::new(template, listed, u128::MAX, 1_000, 0)?;
+    loop {
+        if let Some(outcome) = driver.outcome() {
+            outcome.clone()?;
+            return Ok(started.elapsed());
+        }
+        let (id, request) = driver
+            .poll()
+            .ok_or_else(|| Error::Unexpected("a completion waits on nothing".into()))?;
+        let answer = match request {
+            complete::Request::Upload => complete::Answer::Upload(Some(upload.clone())),
+            // Part n is row n - 1: the page after `after` starts there.
+            complete::Request::Parts { after, max } => complete::Answer::Parts(
+                rows.get(usize::from(after)..)
+                    .unwrap_or_default()
+                    .iter()
+                    .take(max)
+                    .cloned()
+                    .collect(),
+            ),
+            complete::Request::File(_) => {
+                complete::Answer::File(file::Outcome::Written { deadline_ns: 1_000 })
+            }
+            complete::Request::Name(_) => complete::Answer::Name(name::Outcome::Put {
+                version: mantle_meta::key::version_id(2),
+            }),
+        };
+        driver.answer(id, answer)?;
+    }
+}
+
+/// The median and slowest of runs of `f` repeated for `step`, and how many ran.
+fn times(
+    step: Duration,
+    mut f: impl FnMut() -> Result<Duration, Error>,
+) -> Result<(Duration, Duration, usize), Error> {
+    let started = Instant::now();
+    let mut runs = vec![f()?];
+    while started.elapsed() < step {
+        runs.push(f()?);
+    }
+    runs.sort_unstable();
+    let median = runs.get(runs.len() / 2).copied().unwrap_or_default();
+    let slowest = runs.last().copied().unwrap_or_default();
+    Ok((median, slowest, runs.len()))
+}
+
 /// Plaintext bytes a second over runs of `f` repeated for `step`, and what the last run gave.
 fn rate<T>(
     bytes: usize,
@@ -500,6 +607,19 @@ pub fn gateway(
             )?;
             out.flush()?;
         }
+    }
+    writeln!(out)?;
+    writeln!(out, "  completion driver alone     p50        max    runs")?;
+    for parts in [1u16, 1_000, 10_000] {
+        let (median, slowest, runs) = times(step, || completion(parts))?;
+        writeln!(
+            out,
+            "  {:<22} {:>10} {:>10} {:>7}",
+            format!("{parts} parts"),
+            display::nanos(u64::try_from(median.as_nanos()).unwrap_or(u64::MAX)),
+            display::nanos(u64::try_from(slowest.as_nanos()).unwrap_or(u64::MAX)),
+            runs
+        )?;
     }
     Ok(())
 }

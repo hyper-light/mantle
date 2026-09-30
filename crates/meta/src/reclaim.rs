@@ -576,9 +576,9 @@ mod tests {
                     checksum: None,
                     file,
                     modified_ns: 0,
+                    deadline_ns: DEADLINE,
                 },
                 at_ns: 2,
-                deadline_ns: DEADLINE,
             }));
             assert_eq!(outcome, Outcome::PartWritten);
         }
@@ -857,9 +857,9 @@ mod tests {
                         checksum: None,
                         file: next,
                         modified_ns: 0,
+                        deadline_ns: DEADLINE,
                     },
                     at_ns: 2,
-                    deadline_ns: DEADLINE,
                 }));
                 prop_assert_eq!(outcome, Outcome::PartWritten);
                 listed.push(name::Listed {

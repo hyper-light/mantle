@@ -159,14 +159,14 @@ gains a basis lowers the ceiling.
 | `crates/meta/src/name.rs` `MAX_PART_NUMBER` | external | S3 part numbers run from 1 to 10,000 (docs/research/05 §4.3, AWS UploadPart reference). |
 | `crates/meta/src/name.rs` `MIN_PART` | external | The S3 minimum part size of 5 MiB, with no minimum for the last part (docs/research/05 §4.1, AWS S3 multipart limits). |
 | `crates/meta/src/record.rs` `DAY_MS` | derived | Unit conversion: 86,400 s × 1,000 ms per day, for S3 Object Lock retention days and years (docs/research/18 §2.4, §2.6). |
-| `crates/meta/src/record.rs` `FORMAT` | format | Version byte 4 that begins every row value written by this code; 4 since a mark records its write's handover deadline and a queue row whether its ID names a file, 3 since a file's mark records how the range took it (a version's order, a part, an adopting composite, or refused), 2 since a version records its completion's part listing. |
+| `crates/meta/src/record.rs` `FORMAT` | format | Version byte 5 that begins every row value written by this code; 5 since a part's row records its file's handover deadline, which the completion adopting it gives the part's mark without reading it, 4 since a mark records its write's handover deadline and a queue row whether its ID names a file, 3 since a file's mark records how the range took it (a version's order, a part, an adopting composite, or refused), 2 since a version records its completion's part listing. |
 | `crates/meta/src/record.rs` `LISTING` | external | Bytes of a completion's listing digest: SHA-256's 256-bit output (FIPS 180-4 §1). |
 | `crates/meta/src/wire.rs` `MAX_BUCKET` | external | A bucket name of at most 63 characters (research/05 §10.3). |
 | `crates/meta/src/wire.rs` `MAX_KEY` | external | An object key of at most 1,024 bytes (research/05 §10.1). |
 | `crates/meta/src/wire.rs` `MAX_HEADERS` | external | A request's headers within 8 KB (research/05 §10.2), which bound its preconditions. |
 | `crates/meta/src/wire.rs` `MAX_PARTS` | external | 10,000 parts to an upload (research/05 §4.1). |
 | `crates/meta/src/wire.rs` `ETAG_HEX` | external | A part's ETag, the hex of its 16-byte MD5 (research/05 §4.5). |
-| `crates/meta/src/wire.rs` `FORMAT` | format | Version byte 3 of an encoded log entry; 3 since a PUT and a completion carry the ID of their request, which names a write with no file, and a mark kept past an unmark is answered with its deadline, 2 since a completion carries its part listing's digest. |
+| `crates/meta/src/wire.rs` `FORMAT` | format | Version byte 4 of an encoded log entry; 4 since a part carries its file's handover deadline in place of the command beside it, 3 since a PUT and a completion carry the ID of their request, which names a write with no file, and a mark kept past an unmark is answered with its deadline, 2 since a completion carries its part listing's digest. |
 | `crates/meta/src/wire.rs` `MAX_COMMANDS` | bound | 2^16 command places per entry, so a session ID is index × 2^16 + place (session.rs `register`); the audit (§12.6) keeps it as a versioned encoding bound with byte and work budgets beside it. |
 | `crates/range/src/conf.rs` `FORMAT` | format | Version byte of the encoded configuration row. |
 | `crates/range/src/image.rs` `FORMAT` | format | Version byte of the encoded snapshot image. |

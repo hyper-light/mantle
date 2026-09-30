@@ -265,3 +265,28 @@ fn appends(
         latency,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A small run reaches every step's answer, so a change the benchmark no longer fits is
+    /// caught where the gates run it.
+    #[test]
+    fn a_small_run_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        log(
+            &mut out,
+            dir.path(),
+            &Options {
+                step: Duration::from_millis(20),
+                sizes: vec![128],
+                replicas: vec![1, 4],
+                skip_device: true,
+            },
+        )
+        .unwrap();
+        assert!(!out.is_empty());
+    }
+}

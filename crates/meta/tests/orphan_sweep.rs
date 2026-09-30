@@ -1000,9 +1000,9 @@ impl World {
                 checksum: None,
                 file,
                 modified_ns: 0,
+                deadline_ns,
             },
             at_ns: self.proposed(),
-            deadline_ns,
         });
         // A part refused, or held up by a merge, is released or left to the sweep.
         if let Some(name::Outcome::PartWritten) = self.send(key, &put) {

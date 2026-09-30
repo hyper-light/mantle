@@ -226,7 +226,10 @@ layers removes them, as Tectonic's does [01 §1.6].
       sweep's check does, so a copy from a leader whose clock runs behind reads a time past
       the deadline too. A reclaimer that asks sooner is answered with the deadline, keeps
       the queue row, and asks again after it (`crates/meta/src/reclaim.rs`). A part carries
-      its write's deadline through adoption and give-back; the sweep's mark, written only for
+      its write's deadline through adoption and give-back, and its row records it, so the
+      completion adopting it takes the deadline from the row it reads anyway rather than read
+      each part's mark, 10% of a completion of 10,000 parts
+      ([measurements/2026-09-30-review-fixes.md](../measurements/2026-09-30-review-fixes.md)); the sweep's mark, written only for
       a file past its deadline, has no value and reads as passed.
     - *Keyed by the object key.* The mark is keyed by the object key the
       file was made for, in a space of its own that listings never read, so a split cuts a

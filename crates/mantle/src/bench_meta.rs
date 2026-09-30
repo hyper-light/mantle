@@ -206,9 +206,9 @@ fn completion(parts: u16) -> Result<Duration, Error> {
                 checksum: None,
                 file: u128::from(number),
                 modified_ns: 0,
+                deadline_ns: u64::MAX,
             },
             at_ns: 20,
-            deadline_ns: u64::MAX,
         });
         name::apply(&mut m, index, &part)?;
         index = index.saturating_add(1);
@@ -228,7 +228,8 @@ fn completion(parts: u16) -> Result<Duration, Error> {
                 file: u128::from(number),
             })
             .collect(),
-        etag: "whole".into(),
+        // A multipart ETag ends in its part count, which the range checks.
+        etag: format!("whole-{parts}"),
         size: MIN_PART.saturating_mul(u64::from(parts)),
         checksum: None,
         file: Some(u128::from(u16::MAX) + 1),
@@ -451,5 +452,19 @@ fn check_blocks(extents: usize, page: usize) -> Result<Duration, Error> {
     match checked {
         file::Outcome::BlocksChecked(v) if v.len() == page => Ok(took),
         other => Err(Error::Unexpected(format!("{other:?}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every step runs to its answer: a benchmark whose command the range now refuses is
+    /// caught here, where the gates run it, not when someone next measures.
+    #[test]
+    fn every_step_runs() {
+        let mut out = Vec::new();
+        meta(&mut out, Duration::from_millis(1)).unwrap();
+        assert!(!out.is_empty());
     }
 }

@@ -4,7 +4,7 @@
 use mantle_codec::{Reader, Writer};
 
 /// Values written by this code.
-const FORMAT: u8 = 4;
+const FORMAT: u8 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RecordError {
@@ -131,6 +131,9 @@ pub struct Part {
     pub checksum: Option<Vec<u8>>,
     pub file: u128,
     pub modified_ns: u64,
+    /// The file's handover deadline, as the File range answered its write: the deadline the
+    /// file's mark keeps, adopted or not, which the completion adopting it reads here.
+    pub deadline_ns: u64,
 }
 
 /// A bucket's versioning state (05 §7.1).
@@ -1169,6 +1172,7 @@ impl Part {
         }
         w.u128(self.file);
         w.u64(self.modified_ns);
+        w.u64(self.deadline_ns);
         Ok(finish(w))
     }
 
@@ -1186,6 +1190,7 @@ impl Part {
                     },
                     file: r.u128()?,
                     modified_ns: r.u64()?,
+                    deadline_ns: r.u64()?,
                 })
             })(),
             &r,
@@ -1452,6 +1457,7 @@ mod tests {
             checksum: None,
             file: 7,
             modified_ns: 9,
+            deadline_ns: 11,
         };
         assert_eq!(Part::decode(&p.encode().unwrap()), Ok(p));
     }

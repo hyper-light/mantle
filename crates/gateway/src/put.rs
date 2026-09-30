@@ -943,7 +943,7 @@ impl Put {
                 p.part.size = self.body.length;
                 p.part.etag = etag;
                 p.part.checksum = self.checked.as_ref().map(|c| c.bytes.clone());
-                p.deadline_ns = deadline_ns;
+                p.part.deadline_ns = deadline_ns;
                 name::Command::PutPart(p)
             }
             // A part always has a file.

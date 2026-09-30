@@ -168,7 +168,7 @@ impl Command {
                 Some(c.part.file),
                 c.part.file,
                 c.at_ns,
-                c.deadline_ns,
+                c.part.deadline_ns,
             ),
             Self::Complete(c) => (&c.bucket, &c.key, c.file, c.id, c.at_ns, c.deadline_ns),
             _ => return None,
@@ -251,10 +251,9 @@ pub struct PutPart {
     pub key: String,
     pub upload: String,
     pub number: u16,
+    /// The part, with its file's handover deadline, as the File range answered its write.
     pub part: Part,
     pub at_ns: u64,
-    /// The part's file's handover deadline, as the File range answered its write.
-    pub deadline_ns: u64,
 }
 
 /// CompleteMultipartUpload (05 §4.4).
@@ -1549,7 +1548,7 @@ fn put_part<E: Rows>(engine: &E, p: &PutPart) -> Result<(Outcome, Vec<Write>), M
     writes.push(Write::Put(row, p.part.encode()?));
     let mark = Mark {
         how: How::Part,
-        deadline_ns: p.deadline_ns,
+        deadline_ns: p.part.deadline_ns,
     };
     writes.push(Write::Put(
         key::mark(&p.bucket, &p.key, p.part.file),
@@ -1590,6 +1589,8 @@ fn complete<E: Rows>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), 
     let last = c.parts.len().saturating_sub(1);
     let mut total = 0u64;
     let mut empty = Vec::new();
+    // Each listed part's deadline, from its row, for the mark adopting it keeps.
+    let mut deadlines = Vec::with_capacity(c.parts.len());
     for (i, listed) in c.parts.iter().enumerate() {
         let row = key::name(
             &c.bucket,
@@ -1612,6 +1613,7 @@ fn complete<E: Rows>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), 
         if part.size == 0 {
             empty.push(part.file);
         }
+        deadlines.push(part.deadline_ns);
     }
     // The object is its parts: what the gateway combined from them is checked against the
     // rows here (audit §16.5). The ETag's digest and the checksum need the protocol layer's
@@ -1660,14 +1662,19 @@ fn complete<E: Rows>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), 
         )?);
         // An empty part holds no byte of the object, and a file of parts names no empty
         // extent, so it is given back with the upload rather than adopted. An adopted part
-        // keeps its write's deadline, which bounds when its mark may go.
-        for part in &c.parts {
+        // keeps its write's deadline, which bounds when its mark may go; its row, read above,
+        // holds it, so no mark is read.
+        for (part, &deadline_ns) in c.parts.iter().zip(&deadlines) {
             match c.file {
                 Some(by) if !empty.contains(&part.file) => {
-                    let mark = key::mark(&c.bucket, &c.key, part.file);
-                    let held = engine.get(&mark)?.ok_or(MetaError::Corrupt)?;
-                    let adopted = Mark::decode(&held)?.with(How::Adopted { by });
-                    writes.push(Write::Put(mark, adopted.encode()));
+                    let adopted = Mark {
+                        how: How::Adopted { by },
+                        deadline_ns,
+                    };
+                    writes.push(Write::Put(
+                        key::mark(&c.bucket, &c.key, part.file),
+                        adopted.encode(),
+                    ));
                 }
                 _ => writes.push(release(now, &c.bucket, &c.key, part.file)?),
             }
@@ -2871,9 +2878,9 @@ mod tests {
                     checksum: None,
                     file,
                     modified_ns: 0,
+                    deadline_ns: u64::MAX,
                 },
                 at_ns: 0,
-                deadline_ns: u64::MAX,
             }))
         }
 
@@ -3160,9 +3167,9 @@ mod tests {
                     checksum: None,
                     file: 21,
                     modified_ns: 0,
+                    deadline_ns,
                 },
                 at_ns,
-                deadline_ns,
             })
         };
         assert_eq!(r.run(sent(r.clock, r.clock + 100)), Outcome::PartWritten);
@@ -3400,9 +3407,9 @@ mod tests {
                 checksum: None,
                 file: 21,
                 modified_ns: 0,
+                deadline_ns: part_deadline,
             },
             at_ns: r.clock,
-            deadline_ns: part_deadline,
         });
         assert_eq!(r.run(part), Outcome::PartWritten);
         let composite = r.composite;
@@ -4309,9 +4316,9 @@ mod tests {
                                 checksum: None,
                                 file: next_file,
                                 modified_ns: 0,
+                                deadline_ns,
                             },
                             at_ns: r.clock,
-                            deadline_ns,
                         }));
                         answered.push(outcome);
                     }

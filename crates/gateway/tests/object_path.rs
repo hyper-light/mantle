@@ -457,9 +457,9 @@ fn part(key: &str, upload: &str, number: u16) -> Commit {
             checksum: None,
             file: 0,
             modified_ns: 0,
+            deadline_ns: 0,
         },
         at_ns: 0,
-        deadline_ns: 0,
     })
 }
 

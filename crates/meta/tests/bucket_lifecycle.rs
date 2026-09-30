@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use mantle_meta::bucket::{self, Create};
 use mantle_meta::collector::{Schedule, Takeover};
-use mantle_meta::coordinator::{Answer, Coordinator, Request, Settled};
+use mantle_meta::coordinator::{Answer, Bounds, Coordinator, Request, Settled};
 use mantle_meta::engine::{Engine, Model};
 use mantle_meta::key::{self, NameRow};
 use mantle_meta::merge::{self, Merger};
@@ -135,8 +135,12 @@ fn action() -> impl Strategy<Value = Action> {
 const MAX_ROWS: u64 = 64;
 
 /// Rows a coordinator's read or collection passes or removes at a time: one, so every paused
-/// read and partial collection is exercised.
-const BUDGET: u32 = 1;
+/// read and partial collection is exercised; and ranges the cell holds, more than the
+/// simulation's splits make.
+const BOUNDS: Bounds = Bounds {
+    budget: 1,
+    ranges: 64,
+};
 
 /// The collector's waits, in the simulation's clock, which moves 10 a step: an attempt whose
 /// coordinator has not stepped for ten steps is taken over.
@@ -260,7 +264,7 @@ impl World {
     /// The attempt `outcome` started, if it started one; any other outcome answers the request
     /// with an error, and nothing is left in flight.
     fn start(&mut self, outcome: bucket::Outcome) {
-        if let Some(c) = Coordinator::start(BUCKET, &outcome, &self.directory, BUDGET).unwrap() {
+        if let Some(c) = Coordinator::start(BUCKET, &outcome, &self.directory, BOUNDS).unwrap() {
             self.coordinators.push(c);
         }
     }
@@ -401,7 +405,7 @@ impl World {
             Action::Collect => {
                 if let Some(row) = self.row()
                     && let Some(c) =
-                        Coordinator::resume(BUCKET, &row, &self.directory, BUDGET).unwrap()
+                        Coordinator::resume(BUCKET, &row, &self.directory, BOUNDS).unwrap()
                 {
                     self.coordinators.push(c);
                 }
@@ -426,7 +430,7 @@ impl World {
                         }
                         Some(Takeover::Resume) => {
                             if let Some(c) =
-                                Coordinator::resume(&name, &row, &self.directory, BUDGET).unwrap()
+                                Coordinator::resume(&name, &row, &self.directory, BOUNDS).unwrap()
                             {
                                 self.coordinators.push(c);
                             }

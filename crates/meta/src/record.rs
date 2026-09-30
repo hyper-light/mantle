@@ -214,7 +214,8 @@ pub struct Session {
     pub last_ns: u64,
     /// Serials below this were answered and are forgotten.
     pub low: u64,
-    /// The answers kept, in serial order, each encoded.
+    /// The answers kept, oldest first, each encoded: a command reordered on its way to the
+    /// log is answered after one with a later serial.
     pub answers: Vec<(u64, Vec<u8>)>,
 }
 

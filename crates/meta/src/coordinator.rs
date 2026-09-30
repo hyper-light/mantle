@@ -21,6 +21,7 @@
 //! reads the directory.
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
 use crate::bucket;
 use crate::key;
@@ -84,6 +85,20 @@ pub enum CoordinatorError {
     Unexpected,
     #[error("descriptors that do not cover the bucket's keys")]
     NoRanges,
+    /// More ranges than the cell holds: a directory, or what an attempt learned since, past
+    /// the cell's bound (docs/design/architecture.md §3).
+    #[error("more ranges than the cell holds")]
+    TooManyRanges,
+}
+
+/// What bounds one attempt's work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bounds {
+    /// Rows one read or one collection may pass or remove, which bounds an entry's size.
+    pub budget: u32,
+    /// Ranges the cell holds at most (docs/design/architecture.md §3): the attempt keeps no
+    /// more descriptors than that.
+    pub ranges: usize,
 }
 
 /// A Name range a step goes to: its place among the ranges the attempt knows, and the
@@ -132,10 +147,9 @@ pub struct Coordinator {
     incarnation: u64,
     attempt: u64,
     /// The descriptors of the Name ranges the bucket's keys fall in, as far as the attempt
-    /// knows, in key order.
+    /// knows, in key order: the newest of each range, at most `bounds.ranges`.
     known: Vec<Descriptor>,
-    /// Rows one read or one collection may pass or remove, which bounds an entry's size.
-    budget: u32,
+    bounds: Bounds,
     phase: Phase,
     settled: Option<Settled>,
 }
@@ -149,7 +163,7 @@ impl Coordinator {
         bucket: &str,
         outcome: &bucket::Outcome,
         directory: &[Descriptor],
-        budget: u32,
+        bounds: Bounds,
     ) -> Result<Option<Self>, CoordinatorError> {
         let (incarnation, attempt, restart) = match *outcome {
             bucket::Outcome::Creating {
@@ -162,7 +176,7 @@ impl Coordinator {
             } => (incarnation, attempt, Restart::Close),
             _ => return Ok(None),
         };
-        Self::new(bucket, incarnation, attempt, directory, budget, restart).map(Some)
+        Self::new(bucket, incarnation, attempt, directory, bounds, restart).map(Some)
     }
 
     /// The collector's resumption of a deleted bucket's cleanup, from the Bucket range's row:
@@ -173,7 +187,7 @@ impl Coordinator {
         bucket: &str,
         row: &Bucket,
         directory: &[Descriptor],
-        budget: u32,
+        bounds: Bounds,
     ) -> Result<Option<Self>, CoordinatorError> {
         if row.state != BucketState::Deleted {
             return Ok(None);
@@ -183,7 +197,7 @@ impl Coordinator {
             row.created_ns,
             row.attempt,
             directory,
-            budget,
+            bounds,
             Restart::Cleanup,
         )
         .map(Some)
@@ -194,7 +208,7 @@ impl Coordinator {
         incarnation: u64,
         attempt: u64,
         directory: &[Descriptor],
-        budget: u32,
+        bounds: Bounds,
         restart: Restart,
     ) -> Result<Self, CoordinatorError> {
         let mut c = Self {
@@ -202,7 +216,10 @@ impl Coordinator {
             incarnation,
             attempt,
             known: Vec::new(),
-            budget: budget.max(1),
+            bounds: Bounds {
+                budget: bounds.budget.max(1),
+                ..bounds
+            },
             phase: Phase::Done,
             settled: None,
         };
@@ -249,7 +266,7 @@ impl Coordinator {
                 range: at.range.id,
                 generation: at.range.generation,
                 from: from.clone(),
-                budget: usize::try_from(self.budget).unwrap_or(usize::MAX),
+                budget: usize::try_from(self.bounds.budget).unwrap_or(usize::MAX),
             },
             Phase::Reopen(at) => self.gate(at, Some(Closed), Some(Open)),
             Phase::Restore => Request::Bucket(bucket::Command::Restore {
@@ -266,7 +283,7 @@ impl Coordinator {
                 command: Box::new(name::Command::Collect(Collect {
                     bucket,
                     incarnation: self.incarnation,
-                    budget: self.budget,
+                    budget: self.bounds.budget,
                     // The entry that carries it gives it its time (wire.rs).
                     at_ns: 0,
                     generation: at.range.generation,
@@ -454,7 +471,9 @@ impl Coordinator {
         for d in [own, lineage.child, lineage.into].into_iter().flatten() {
             self.learn(d);
         }
-        if self.covers() {
+        self.known.sort_by(|a, b| a.lo.cmp(&b.lo));
+        // Past the cell's bound, what the attempt learned is stale: the directory says anew.
+        if self.known.len() <= self.bounds.ranges && self.covers() {
             self.restart(restart)
         } else {
             Ok(Phase::Directory(restart))
@@ -467,10 +486,22 @@ impl Coordinator {
         directory: &[Descriptor],
         restart: Restart,
     ) -> Result<Phase, CoordinatorError> {
-        self.known.clear();
-        for d in directory {
-            self.learn(d.clone());
+        // The newest descriptor of each range whose span meets the bucket's keys, gathered
+        // once and ordered once, where each descriptor learned was looked up and the whole
+        // list sorted again (audit P03).
+        let (first, past) = key::bucket_routes(&self.bucket);
+        let mut newest: BTreeMap<u64, &Descriptor> = BTreeMap::new();
+        for d in directory.iter().filter(|d| d.meets(&first, &past)) {
+            let held = newest.entry(d.id).or_insert(d);
+            if held.generation < d.generation {
+                *held = d;
+            }
         }
+        if newest.len() > self.bounds.ranges {
+            return Err(CoordinatorError::TooManyRanges);
+        }
+        self.known = newest.into_values().cloned().collect();
+        self.known.sort_by(|a, b| a.lo.cmp(&b.lo));
         if !self.covers() {
             return Err(CoordinatorError::NoRanges);
         }
@@ -478,7 +509,7 @@ impl Coordinator {
     }
 
     /// Adds `d` to what the attempt knows if its span meets the bucket's keys and it is newer
-    /// than what the attempt holds for its range.
+    /// than what the attempt holds for its range; the caller orders the list after.
     fn learn(&mut self, d: Descriptor) {
         let (first, past) = key::bucket_routes(&self.bucket);
         if !d.meets(&first, &past) {
@@ -489,21 +520,26 @@ impl Coordinator {
             Some(held) => *held = d,
             None => self.known.push(d),
         }
-        self.known.sort_by(|a, b| a.lo.cmp(&b.lo));
     }
 
-    /// Whether the spans the attempt knows cover every routing key of the bucket.
+    /// Whether the spans the attempt knows, in key order, cover every routing key of the
+    /// bucket. One walk: the spans that start at or before the point reached so far are taken
+    /// in order, the furthest end among those holding it is the next point, and a span passed
+    /// is never looked at again, since the point only moves on; before, each step looked at
+    /// every span (audit P03).
     fn covers(&self) -> bool {
         let (mut at, past) = key::bucket_routes(&self.bucket);
-        // Each pass moves `at` to the end of a span that holds it, past where it was, so the
-        // walk ends within a pass a span.
-        for _ in 0..=self.known.len() {
-            let reach = self
-                .known
-                .iter()
-                .filter(|d| d.holds(&at))
-                .map(|d| d.hi.as_deref())
-                .max_by(|a, b| end_order(*a, *b));
+        let mut spans = self.known.iter().peekable();
+        loop {
+            let mut reach: Option<Option<&[u8]>> = None;
+            while let Some(d) = spans.next_if(|d| d.lo.as_slice() <= at.as_slice()) {
+                if d.holds(&at) {
+                    let end = d.hi.as_deref();
+                    if reach.is_none_or(|r| end_order(end, r) == Ordering::Greater) {
+                        reach = Some(end);
+                    }
+                }
+            }
             match reach {
                 None => return false,
                 Some(None) => return true,
@@ -511,7 +547,6 @@ impl Coordinator {
                 Some(Some(hi)) => at = hi.to_vec(),
             }
         }
-        false
     }
 
     fn settle(&mut self, settled: Settled) -> Phase {
@@ -555,6 +590,11 @@ fn end_order(a: Option<&[u8]>, b: Option<&[u8]>) -> Ordering {
 mod tests {
     use super::*;
 
+    /// Bounds of `budget` rows, in a cell of 64 ranges at most.
+    fn bounds(budget: u32) -> Bounds {
+        Bounds { budget, ranges: 64 }
+    }
+
     fn gate(incarnation: u64, attempt: u64, state: GateState) -> Routed<Option<Gate>> {
         Routed::Here(Some(Gate {
             incarnation,
@@ -574,6 +614,108 @@ mod tests {
 
     fn whole() -> Vec<Descriptor> {
         vec![range(1, None, None, 1)]
+    }
+
+    /// Coverage as it was decided before: each step looked at every span for the furthest
+    /// that holds the point reached.
+    fn covers_by_rescanning(known: &[Descriptor], bucket: &str) -> bool {
+        let (mut at, past) = key::bucket_routes(bucket);
+        for _ in 0..=known.len() {
+            let reach = known
+                .iter()
+                .filter(|d| d.holds(&at))
+                .map(|d| d.hi.as_deref())
+                .max_by(|a, b| end_order(*a, *b));
+            match reach {
+                None => return false,
+                Some(None) => return true,
+                Some(Some(hi)) if hi >= past.as_slice() => return true,
+                Some(Some(hi)) => at = hi.to_vec(),
+            }
+        }
+        false
+    }
+
+    /// One walk decides coverage as rescanning every span at every step did, over random sets
+    /// of spans of the bucket's keys: overlapping, nested, stale, with gaps and without
+    /// (audit P03).
+    #[test]
+    fn one_walk_decides_coverage_as_rescanning_did() {
+        let creating = bucket::Outcome::Creating {
+            incarnation: 7,
+            attempt: 7,
+        };
+        let mut c = Coordinator::start("b", &creating, &whole(), bounds(8))
+            .unwrap()
+            .unwrap();
+        let keys = ["a", "c", "e", "g", "i", "k", "m"];
+        let mut rng = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move |n: usize| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng % n as u64) as usize
+        };
+        let mut covered = 0;
+        for _ in 0..20_000 {
+            let mut known: Vec<Descriptor> = (0..1 + next(6))
+                .map(|id| {
+                    let lo = next(keys.len() + 1);
+                    let hi = lo + 1 + next(keys.len() + 1 - lo);
+                    range(
+                        id as u64,
+                        lo.checked_sub(1).map(|i| keys[i]),
+                        keys.get(hi - 1).copied().filter(|_| hi <= keys.len()),
+                        1,
+                    )
+                })
+                .collect();
+            known.sort_by(|a, b| a.lo.cmp(&b.lo));
+            c.known = known;
+            let want = covers_by_rescanning(&c.known, "b");
+            assert_eq!(c.covers(), want, "{:?}", c.known);
+            covered += usize::from(want);
+        }
+        // Both answers were exercised.
+        assert!((2_000..18_000).contains(&covered), "{covered} covered");
+    }
+
+    /// A directory of more ranges than the cell holds is refused, and an attempt that learns
+    /// past the bound reads the directory anew rather than keep what it learned; the newest
+    /// descriptor of a range is the one kept.
+    #[test]
+    fn what_an_attempt_knows_stays_within_the_cells_bound() {
+        let creating = bucket::Outcome::Creating {
+            incarnation: 7,
+            attempt: 7,
+        };
+        let three = [
+            range(1, None, Some("f"), 1),
+            range(2, Some("f"), Some("m"), 1),
+            range(3, Some("m"), None, 1),
+        ];
+        let within = |ranges| Bounds { budget: 8, ranges };
+        assert_eq!(
+            Coordinator::start("b", &creating, &three, within(2)).err(),
+            Some(CoordinatorError::TooManyRanges)
+        );
+        assert!(Coordinator::start("b", &creating, &three, within(3)).is_ok());
+        // Two descriptors of one range: the newer is kept.
+        let stale = [range(1, None, Some("m"), 1), range(1, None, None, 2)];
+        let c = Coordinator::start("b", &creating, &stale, within(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.known, [range(1, None, None, 2)]);
+        // A split learned from a range's answer would make two: past the bound of one.
+        let mut c = Coordinator::start("b", &creating, &whole(), within(1))
+            .unwrap()
+            .unwrap();
+        let lineage = moved(
+            range(1, None, Some("f"), 3),
+            Some(range(5, Some("f"), None, 3)),
+        );
+        c.answer(Answer::Gate(Routed::Moved(lineage))).unwrap();
+        assert_eq!(c.next(), Some(Request::Directory));
     }
 
     fn moved(now: Descriptor, child: Option<Descriptor>) -> Box<Lineage> {
@@ -612,7 +754,7 @@ mod tests {
             attempt: 7,
         };
         let directory = [range(2, Some("m"), None, 2), range(1, None, Some("m"), 2)];
-        let mut c = Coordinator::start("b", &creating, &directory, 8)
+        let mut c = Coordinator::start("b", &creating, &directory, bounds(8))
             .unwrap()
             .unwrap();
         for id in [1, 2] {
@@ -661,7 +803,7 @@ mod tests {
             incarnation: 7,
             attempt: 9,
         };
-        let mut c = Coordinator::start("b", &deleting, &whole(), 8)
+        let mut c = Coordinator::start("b", &deleting, &whole(), bounds(8))
             .unwrap()
             .unwrap();
         c.answer(Answer::Gate(gate(7, 7, GateState::Open))).unwrap();
@@ -672,7 +814,7 @@ mod tests {
         c.answer(Answer::Bucket(bucket::Outcome::Restored)).unwrap();
         assert_eq!(c.settled(), Some(Settled::NotEmpty));
 
-        let mut late = Coordinator::start("b", &deleting, &whole(), 8)
+        let mut late = Coordinator::start("b", &deleting, &whole(), bounds(8))
             .unwrap()
             .unwrap();
         late.answer(Answer::Gate(gate(7, 9, GateState::Closed)))
@@ -690,7 +832,7 @@ mod tests {
             incarnation: 7,
             attempt: 9,
         };
-        let mut c = Coordinator::start("b", &deleting, &whole(), 1)
+        let mut c = Coordinator::start("b", &deleting, &whole(), bounds(1))
             .unwrap()
             .unwrap();
         c.answer(Answer::Gate(Routed::Here(None))).unwrap();
@@ -729,7 +871,7 @@ mod tests {
             incarnation: 7,
             attempt: 9,
         };
-        let mut c = Coordinator::start("b", &deleting, &whole(), 8)
+        let mut c = Coordinator::start("b", &deleting, &whole(), bounds(8))
             .unwrap()
             .unwrap();
         c.answer(Answer::Gate(gate(7, 7, GateState::Open))).unwrap();
@@ -789,7 +931,7 @@ mod tests {
             incarnation: 7,
             attempt: 7,
         };
-        let mut c = Coordinator::start("b", &creating, &whole(), 8)
+        let mut c = Coordinator::start("b", &creating, &whole(), bounds(8))
             .unwrap()
             .unwrap();
         let lineage = moved(
@@ -829,7 +971,7 @@ mod tests {
             Some(Request::Bucket(bucket::Command::Activate { .. }))
         ));
         // A directory that leaves keys uncovered is refused.
-        let mut d = Coordinator::start("b", &creating, &whole(), 8)
+        let mut d = Coordinator::start("b", &creating, &whole(), bounds(8))
             .unwrap()
             .unwrap();
         d.answer(Answer::Gate(Routed::Moved(moved(
@@ -849,7 +991,7 @@ mod tests {
             incarnation: 1,
             attempt: 1,
         };
-        let mut c = Coordinator::start("b", &creating, &whole(), 8)
+        let mut c = Coordinator::start("b", &creating, &whole(), bounds(8))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -865,11 +1007,11 @@ mod tests {
             })
         );
         assert_eq!(
-            Coordinator::start("b", &creating, &[], 8).err(),
+            Coordinator::start("b", &creating, &[], bounds(8)).err(),
             Some(CoordinatorError::NoRanges)
         );
         assert!(
-            Coordinator::start("b", &bucket::Outcome::AlreadyExists, &whole(), 8)
+            Coordinator::start("b", &bucket::Outcome::AlreadyExists, &whole(), bounds(8))
                 .unwrap()
                 .is_none()
         );

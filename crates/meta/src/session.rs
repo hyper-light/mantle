@@ -5,6 +5,8 @@
 //! times pass its lifetime without it, so every replica expires the same sessions at the
 //! same entry.
 
+use std::collections::{BTreeMap, VecDeque};
+
 use crate::engine::{Rows, Write};
 use crate::error::MetaError;
 use crate::key::LOCAL;
@@ -27,6 +29,9 @@ pub struct Rules {
     pub max_sessions: u64,
     /// Answers one session keeps: past it, the oldest is forgotten.
     pub max_answers: usize,
+    /// Encoded bytes of the answers one session keeps: past it, the oldest are forgotten
+    /// too, since a count bounds no answer's size (audit P04).
+    pub max_answer_bytes: usize,
     /// Sessions one entry expires at most, which bounds the entry's work.
     pub expiries_per_entry: usize,
 }
@@ -72,22 +77,145 @@ fn count<R: Rows>(rows: &R) -> Result<u64, MetaError> {
     })
 }
 
-/// What `session` says of the command with `serial`. The last serial is spent: past it an
-/// answer forgotten could not be told from one never given, so a command bearing it is
-/// refused before it takes effect, and the gateway registers a session anew (audit B03).
-pub fn check<R: Rows>(rows: &R, session: u64, serial: u64) -> Result<Check, MetaError> {
-    let Some(s) = read(rows, session)? else {
-        return Ok(Check::Unknown);
-    };
-    if serial == u64::MAX {
-        return Ok(Check::Spent);
+/// A session as an entry holds it: read and decoded at the first command that names it, changed
+/// in memory by each command after, and written once (`Touched::write`).
+#[derive(Debug)]
+struct Held {
+    /// The last use its row records, whose place in the order of last use the entry moves.
+    found_ns: u64,
+    last_ns: u64,
+    low: u64,
+    /// The answers kept, oldest first, each encoded, and their bytes.
+    answers: VecDeque<(u64, Vec<u8>)>,
+    bytes: usize,
+    changed: bool,
+}
+
+/// The sessions one entry's commands name. Each is read and decoded at its first command,
+/// checked and changed in memory by every command after, and written once, so a command
+/// costs what it changes: before, every command read, searched and wrote back every answer its
+/// session kept, and an entry of many commands from one session did so for each (audit P04).
+/// Commands see each other's effects on their session as they did, since they run in order
+/// against the same held state.
+#[derive(Debug, Default)]
+pub struct Touched {
+    held: BTreeMap<u64, Held>,
+}
+
+impl Touched {
+    /// The held state of `session`, read from `rows` at its first use; `None` if it has none.
+    fn held<R: Rows>(&mut self, rows: &R, session: u64) -> Result<Option<&mut Held>, MetaError> {
+        Ok(match self.held.entry(session) {
+            std::collections::btree_map::Entry::Occupied(held) => Some(held.into_mut()),
+            std::collections::btree_map::Entry::Vacant(place) => match read(rows, session)? {
+                None => None,
+                Some(s) => Some(
+                    place.insert(Held {
+                        found_ns: s.last_ns,
+                        last_ns: s.last_ns,
+                        low: s.low,
+                        bytes: s
+                            .answers
+                            .iter()
+                            .fold(0usize, |sum, (_, a)| sum.saturating_add(a.len())),
+                        answers: s.answers.into(),
+                        changed: false,
+                    }),
+                ),
+            },
+        })
     }
-    if serial < s.low {
-        return Ok(Check::Repeated);
+
+    /// What `session` says of the command with `serial`. The last serial is spent: past it an
+    /// answer forgotten could not be told from one never given, so a command bearing it is
+    /// refused before it takes effect, and the gateway registers a session anew (audit B03).
+    pub fn check<R: Rows>(
+        &mut self,
+        rows: &R,
+        session: u64,
+        serial: u64,
+    ) -> Result<Check, MetaError> {
+        let Some(s) = self.held(rows, session)? else {
+            return Ok(Check::Unknown);
+        };
+        if serial == u64::MAX {
+            return Ok(Check::Spent);
+        }
+        if serial < s.low {
+            return Ok(Check::Repeated);
+        }
+        match s.answers.iter().find(|(kept, _)| *kept == serial) {
+            Some((_, answer)) => Ok(Check::Answered(Answer::decode(answer)?)),
+            None => Ok(Check::New),
+        }
     }
-    match s.answers.iter().find(|(kept, _)| *kept == serial) {
-        Some((_, answer)) => Ok(Check::Answered(Answer::decode(answer)?)),
-        None => Ok(Check::New),
+
+    /// Records that `command`'s session, which `check` found, was used at `at_ns`: forgets the
+    /// answers the gateway has received, those before `command.unanswered`, keeps `answer` for
+    /// `command.serial` if there is one, and moves the session in the order of last use.
+    pub fn record(
+        &mut self,
+        command: &Sessioned,
+        answer: Option<&Answer>,
+        at_ns: u64,
+        rules: &Rules,
+    ) -> Result<(), MetaError> {
+        let Some(s) = self.held.get_mut(&command.session) else {
+            return Ok(());
+        };
+        s.low = s.low.max(command.unanswered);
+        let low = s.low;
+        let mut bytes = s.bytes;
+        s.answers.retain(|(kept, a)| {
+            let keep = *kept >= low;
+            if !keep {
+                bytes = bytes.saturating_sub(a.len());
+            }
+            keep
+        });
+        s.bytes = bytes;
+        if let Some(answer) = answer {
+            let encoded = answer.encode()?;
+            s.bytes = s.bytes.saturating_add(encoded.len());
+            s.answers.push_back((command.serial, encoded));
+        }
+        while s.answers.len() > rules.max_answers || s.bytes > rules.max_answer_bytes {
+            let Some((forgotten, a)) = s.answers.pop_front() else {
+                break;
+            };
+            s.bytes = s.bytes.saturating_sub(a.len());
+            // Below the spent last serial, which `check` refuses, so one more is exact.
+            let past = forgotten.checked_add(1).ok_or(MetaError::Corrupt)?;
+            s.low = s.low.max(past);
+        }
+        s.last_ns = at_ns;
+        s.changed = true;
+        Ok(())
+    }
+
+    /// Writes every session the entry changed, and moves each in the order of last use, then
+    /// lets them go: a command after reads them anew.
+    pub fn write<R: Rows>(&mut self, rows: &mut R, index: u64) -> Result<(), MetaError> {
+        let mut writes = Vec::new();
+        for (session, s) in std::mem::take(&mut self.held) {
+            if !s.changed {
+                continue;
+            }
+            if s.found_ns != s.last_ns {
+                writes.push(Write::Delete(expiry_key(s.found_ns, session)));
+            }
+            let row = Session {
+                last_ns: s.last_ns,
+                low: s.low,
+                answers: s.answers.into(),
+            };
+            writes.push(Write::Put(session_key(session), row.encode()?));
+            writes.push(Write::Put(expiry_key(s.last_ns, session), Vec::new()));
+        }
+        if !writes.is_empty() {
+            rows.apply(index, &writes)?;
+        }
+        Ok(())
     }
 }
 
@@ -126,40 +254,6 @@ pub fn register<R: Rows>(
     writes.push(Write::Put(COUNT.to_vec(), record::encode_number(held)));
     rows.apply(index, &writes)?;
     Ok(session)
-}
-
-/// Records that `command`'s session was used at `at_ns`: forgets the answers the gateway has
-/// received, those before `command.unanswered`, keeps `answer` for `command.serial` if there
-/// is one, and moves the session in the order of last use.
-pub fn record<R: Rows>(
-    rows: &mut R,
-    index: u64,
-    command: &Sessioned,
-    answer: Option<&Answer>,
-    at_ns: u64,
-    rules: &Rules,
-) -> Result<(), MetaError> {
-    let (session, serial, unanswered) = (command.session, command.serial, command.unanswered);
-    let Some(mut s) = read(rows, session)? else {
-        return Ok(());
-    };
-    let mut writes = vec![Write::Delete(expiry_key(s.last_ns, session))];
-    s.low = s.low.max(unanswered);
-    s.answers.retain(|(kept, _)| *kept >= s.low);
-    if let Some(answer) = answer {
-        s.answers.push((serial, answer.encode()?));
-    }
-    while s.answers.len() > rules.max_answers {
-        let (forgotten, _) = s.answers.remove(0);
-        // Below the spent last serial, which `check` refuses, so one more is exact.
-        let past = forgotten.checked_add(1).ok_or(MetaError::Corrupt)?;
-        s.low = s.low.max(past);
-    }
-    s.last_ns = at_ns;
-    writes.push(Write::Put(session_key(session), s.encode()?));
-    writes.push(Write::Put(expiry_key(at_ns, session), Vec::new()));
-    rows.apply(index, &writes)?;
-    Ok(())
 }
 
 /// Expires the sessions whose lifetime entry time `at_ns` has passed, at most
@@ -229,6 +323,7 @@ mod tests {
         lifetime_ns: 100,
         max_sessions: 2,
         max_answers: 2,
+        max_answer_bytes: usize::MAX,
         expiries_per_entry: 8,
     };
 
@@ -245,6 +340,25 @@ mod tests {
         Answer::Name(Outcome::Created {
             upload: format!("u{n}"),
         })
+    }
+
+    fn check(m: &Model, session: u64, serial: u64) -> Result<Check, MetaError> {
+        Touched::default().check(m, session, serial)
+    }
+
+    /// One command's use of its session, in an entry of its own.
+    fn record(
+        m: &mut Model,
+        index: u64,
+        command: &Sessioned,
+        answer: Option<&Answer>,
+        at_ns: u64,
+        rules: &Rules,
+    ) -> Result<(), MetaError> {
+        let mut touched = Touched::default();
+        touched.check(&*m, command.session, command.serial)?;
+        touched.record(command, answer, at_ns, rules)?;
+        touched.write(m, index)
     }
 
     #[test]
@@ -265,6 +379,62 @@ mod tests {
         assert_eq!(check(&m, s, 2).unwrap(), Check::Repeated);
         assert_eq!(check(&m, s, 4).unwrap(), Check::Answered(answer(4)));
         assert_eq!(check(&m, s + 1, 1).unwrap(), Check::Unknown);
+    }
+
+    /// The answers a gateway has received are forgotten wherever they lie among those kept: a
+    /// command reordered on its way to the log is answered after one with a later serial.
+    #[test]
+    fn received_answers_are_forgotten_in_any_order() {
+        let mut m = Model::default();
+        let rules = Rules {
+            max_answers: 8,
+            ..RULES
+        };
+        let s = register(&mut m, 1, 0, 10, &rules).unwrap();
+        record(&mut m, 2, &used(s, 5, 1), Some(&answer(5)), 20, &rules).unwrap();
+        record(&mut m, 3, &used(s, 3, 1), Some(&answer(3)), 30, &rules).unwrap();
+        // The gateway has every answer before 4: 3's is forgotten, 5's kept.
+        record(&mut m, 4, &used(s, 6, 4), Some(&answer(6)), 40, &rules).unwrap();
+        let kept: Vec<u64> = read(&m, s)
+            .unwrap()
+            .unwrap()
+            .answers
+            .iter()
+            .map(|(k, _)| *k)
+            .collect();
+        assert_eq!(kept, [5, 6]);
+        assert_eq!(check(&m, s, 3).unwrap(), Check::Repeated);
+        assert_eq!(check(&m, s, 5).unwrap(), Check::Answered(answer(5)));
+    }
+
+    /// Past the bytes a session may keep, the oldest answers are forgotten as past the count:
+    /// a retry of one is a repeat.
+    #[test]
+    fn answers_past_the_byte_budget_are_forgotten_oldest_first() {
+        let mut m = Model::default();
+        let size = answer(1).encode().unwrap().len();
+        let rules = Rules {
+            max_answers: 8,
+            max_answer_bytes: 2 * size,
+            ..RULES
+        };
+        let s = register(&mut m, 1, 0, 10, &rules).unwrap();
+        for serial in 1..=3u8 {
+            let at = 10 * u64::from(serial);
+            let command = used(s, u64::from(serial), 1);
+            record(
+                &mut m,
+                1 + u64::from(serial),
+                &command,
+                Some(&answer(serial)),
+                at,
+                &rules,
+            )
+            .unwrap();
+        }
+        assert_eq!(check(&m, s, 1).unwrap(), Check::Repeated);
+        assert_eq!(check(&m, s, 2).unwrap(), Check::Answered(answer(2)));
+        assert_eq!(check(&m, s, 3).unwrap(), Check::Answered(answer(3)));
     }
 
     #[test]

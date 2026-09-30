@@ -71,6 +71,7 @@ const RULES: Rules = Rules {
     lifetime_ns: 3_600_000_000_000,
     max_sessions: 64,
     max_answers: 16,
+    max_answer_bytes: usize::MAX,
     expiries_per_entry: 8,
 };
 

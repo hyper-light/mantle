@@ -36,7 +36,16 @@ sessions (06 §A1.8):
   refused, never run in a new session, since running it could apply it a second time.
 
 Sessions live in the engine beside the range's rows, so they change in the entry's batch
-and survive a restart with them.
+and survive a restart with them. An entry reads each session it names once, at its first
+command, checks and changes it in memory command by command, and writes it once at the end;
+a registration, which may expire the session least recently used by the order of last use,
+first writes the sessions changed so far. Each command read, searched and wrote back every
+answer its session kept: an entry of 256 commands from a session keeping 256 answers took
+2.6 ms and takes 328 µs, and its answers and rows are the same, which a test checks against
+the command-by-command order over random entries (audit P04;
+[measurements](../measurements/2026-09-29-metadata-apply.md)). A session keeps its answers
+within a count and a budget of bytes; past either, the oldest are forgotten, and a retry of
+one is a repeat.
 
 ## 2. Applying an entry
 
@@ -217,4 +226,6 @@ change. Membership changes are rare, so this costs one image each.
 - The window of entries kept for lagging followers before one is sent a snapshot, and
   moving snapshots out of band with the production engine.
 - ReadIndex reads, and leases if a deployment states its clock-drift bound (06 §A1.5).
-- The session lifetime and bound, from how long gateways go between commands to a range.
+- The session lifetime and bounds, sessions a range holds and the answers and bytes of
+  answers one keeps, from how long gateways go between commands to a range and how many
+  they keep in flight.

@@ -5,7 +5,7 @@
 use crate::engine::Rows;
 use crate::error::MetaError;
 use crate::overlay::Overlay;
-use crate::session::{self, Check, Rules};
+use crate::session::{self, Check, Rules, Touched};
 use crate::wire::{Answer, Command, Entry};
 use crate::{block, bucket, file, name};
 
@@ -30,29 +30,43 @@ pub fn apply_entry<R: Rows>(
     let (answers, writes) = {
         let mut overlay = Overlay::new(&*rows);
         session::expire(&mut overlay, index, entry.at_ns, rules)?;
+        let mut touched = Touched::default();
         let mut answers = Vec::with_capacity(entry.commands.len());
         for (position, c) in entry.commands.iter().enumerate() {
             let answer = match &c.command {
-                Command::Register => Answer::Registered {
-                    session: session::register(&mut overlay, index, position, entry.at_ns, rules)?,
-                },
-                command => match session::check(&overlay, c.session, c.serial)? {
+                // Registering may expire the session least recently used, which it finds by
+                // the order of last use: the sessions used so far are written first, and read
+                // anew after.
+                Command::Register => {
+                    touched.write(&mut overlay, index)?;
+                    Answer::Registered {
+                        session: session::register(
+                            &mut overlay,
+                            index,
+                            position,
+                            entry.at_ns,
+                            rules,
+                        )?,
+                    }
+                }
+                command => match touched.check(&overlay, c.session, c.serial)? {
                     // A session whose serials are spent is done: the gateway registers anew.
                     Check::Unknown | Check::Spent => Answer::SessionExpired,
                     Check::Repeated => Answer::Repeated,
                     Check::Answered(answer) => {
-                        session::record(&mut overlay, index, c, None, entry.at_ns, rules)?;
+                        touched.record(c, None, entry.at_ns, rules)?;
                         answer
                     }
                     Check::New => {
                         let answer = run(&mut overlay, index, command, layer)?;
-                        session::record(&mut overlay, index, c, Some(&answer), entry.at_ns, rules)?;
+                        touched.record(c, Some(&answer), entry.at_ns, rules)?;
                         answer
                     }
                 },
             };
             answers.push(answer);
         }
+        touched.write(&mut overlay, index)?;
         (answers, overlay.into_writes())
     };
     rows.apply(index, &writes)?;
@@ -77,7 +91,7 @@ fn run<R: Rows>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{Engine, Model};
+    use crate::engine::{Engine, Model, Write};
     use crate::name::{GateChange, Match, Outcome, Preconditions, Put};
     use crate::record::{GateState, Version, Versioning};
     use crate::wire::Sessioned;
@@ -86,6 +100,7 @@ mod tests {
         lifetime_ns: 1_000,
         max_sessions: 8,
         max_answers: 4,
+        max_answer_bytes: usize::MAX,
         expiries_per_entry: 8,
     };
 
@@ -284,6 +299,208 @@ mod tests {
         );
     }
 
+    /// Every row of a model engine, in key order.
+    fn all(m: &Model) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut rows = Vec::new();
+        let mut at = Vec::new();
+        while let Some((k, v)) = m.next(&at, &[0xFF]).unwrap() {
+            at = k.clone();
+            at.push(0);
+            rows.push((k, v));
+        }
+        rows
+    }
+
+    /// How entries applied before sessions were held for the entry: each command read,
+    /// decoded, searched, changed, encoded and wrote its session back.
+    fn apply_per_command(
+        rows: &mut Model,
+        index: u64,
+        entry: &Entry,
+        layer: Layer,
+        rules: &Rules,
+    ) -> Vec<Answer> {
+        use crate::record::Session;
+        let key = |session: u64| {
+            let mut k = vec![crate::key::LOCAL, crate::key::marker::SESSION];
+            k.extend_from_slice(&session.to_be_bytes());
+            k
+        };
+        let expiry = |last_ns: u64, session: u64| {
+            let mut k = vec![crate::key::LOCAL, crate::key::marker::EXPIRY];
+            k.extend_from_slice(&last_ns.to_be_bytes());
+            k.extend_from_slice(&session.to_be_bytes());
+            k
+        };
+        let read = |rows: &Overlay<'_, Model>, session: u64| {
+            rows.get(&key(session))
+                .unwrap()
+                .map(|b| Session::decode(&b).unwrap())
+        };
+        let (answers, writes) = {
+            let mut overlay = Overlay::new(&*rows);
+            session::expire(&mut overlay, index, entry.at_ns, rules).unwrap();
+            let mut answers = Vec::new();
+            for (position, c) in entry.commands.iter().enumerate() {
+                let answer = match &c.command {
+                    Command::Register => Answer::Registered {
+                        session: session::register(
+                            &mut overlay,
+                            index,
+                            position,
+                            entry.at_ns,
+                            rules,
+                        )
+                        .unwrap(),
+                    },
+                    command => {
+                        let check = match read(&overlay, c.session) {
+                            None => Check::Unknown,
+                            Some(_) if c.serial == u64::MAX => Check::Spent,
+                            Some(s) if c.serial < s.low => Check::Repeated,
+                            Some(s) => match s.answers.iter().find(|(k, _)| *k == c.serial) {
+                                Some((_, a)) => Check::Answered(Answer::decode(a).unwrap()),
+                                None => Check::New,
+                            },
+                        };
+                        let given = match check {
+                            Check::Unknown | Check::Spent => {
+                                answers.push(Answer::SessionExpired);
+                                continue;
+                            }
+                            Check::Repeated => {
+                                answers.push(Answer::Repeated);
+                                continue;
+                            }
+                            Check::Answered(answer) => (answer, false),
+                            Check::New => (run(&mut overlay, index, command, layer).unwrap(), true),
+                        };
+                        let mut s = read(&overlay, c.session).unwrap();
+                        let mut writes = vec![Write::Delete(expiry(s.last_ns, c.session))];
+                        s.low = s.low.max(c.unanswered);
+                        s.answers.retain(|(kept, _)| *kept >= s.low);
+                        if given.1 {
+                            s.answers.push((c.serial, given.0.encode().unwrap()));
+                        }
+                        let bytes =
+                            |s: &Session| s.answers.iter().map(|(_, a)| a.len()).sum::<usize>();
+                        while s.answers.len() > rules.max_answers
+                            || bytes(&s) > rules.max_answer_bytes
+                        {
+                            let (forgotten, _) = s.answers.remove(0);
+                            s.low = s.low.max(forgotten + 1);
+                        }
+                        s.last_ns = entry.at_ns;
+                        writes.push(Write::Put(key(c.session), s.encode().unwrap()));
+                        writes.push(Write::Put(expiry(entry.at_ns, c.session), Vec::new()));
+                        overlay.apply(index, &writes).unwrap();
+                        given.0
+                    }
+                };
+                answers.push(answer);
+            }
+            (answers, overlay.into_writes())
+        };
+        rows.apply(index, &writes).unwrap();
+        answers
+    }
+
+    /// Holding an entry's sessions changes no answer and no row: random entries of up to 64
+    /// commands, from sessions registered, forgotten and expired along the way, with serials
+    /// repeated, reordered and spent, answer the same and leave the same rows as applying
+    /// each command's session change on its own did (audit P04).
+    #[test]
+    fn holding_an_entrys_sessions_answers_and_writes_as_each_command_did() {
+        // A budget of bytes two answers pass, so both bounds forget answers.
+        let one = Answer::Name(Outcome::PreconditionFailed)
+            .encode()
+            .unwrap()
+            .len();
+        let rules = Rules {
+            lifetime_ns: 400,
+            max_sessions: 4,
+            max_answers: 3,
+            max_answer_bytes: 12 * one,
+            expiries_per_entry: 2,
+        };
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+        let (mut held, mut each) = (name_range(), name_range());
+        // Each session registered, with the highest serial its gateway has sent.
+        let mut sessions: Vec<(u64, u64)> = Vec::new();
+        // Answers seen: repeated, refused for an unknown session, and run.
+        let mut seen = [0u64; 3];
+        let mut registered = 0u64;
+        let mut at_ns = 0u64;
+        for index in 1..=400u64 {
+            at_ns += next(20);
+            let commands = (0..1 + next(64))
+                .map(|_| {
+                    if sessions.is_empty() || next(64) == 0 {
+                        return from(0, 0, Command::Register);
+                    }
+                    let pick = next(sessions.len() as u64) as usize;
+                    let (session, sent) = &mut sessions[pick];
+                    // Mostly the next serial, some sent before it again or out of order, and
+                    // now and then the spent last one.
+                    let serial = match next(16) {
+                        0 => u64::MAX,
+                        1..=4 => sent.saturating_sub(next(4)),
+                        5 | 6 => *sent + 1 + next(2),
+                        _ => *sent + 1,
+                    };
+                    if serial != u64::MAX {
+                        *sent = (*sent).max(serial);
+                    }
+                    let command = match next(4) {
+                        0 => open_gate(),
+                        _ => put(
+                            &format!("k{}", next(3)),
+                            &format!("e{}", next(4)),
+                            next(2) == 0,
+                        ),
+                    };
+                    Sessioned {
+                        session: *session,
+                        serial,
+                        unanswered: sent.saturating_sub(next(5)),
+                        command,
+                    }
+                })
+                .collect();
+            let e = entry(at_ns, commands);
+            let a = apply_entry(&mut held, index, &e, Layer::Name, &rules).unwrap();
+            let b = apply_per_command(&mut each, index, &e, Layer::Name, &rules);
+            assert_eq!(a, b, "entry {index}");
+            assert_eq!(all(&held), all(&each), "entry {index}");
+            for (answer, c) in a.iter().zip(&e.commands) {
+                match answer {
+                    Answer::Registered { session } => {
+                        sessions.push((*session, 0));
+                        registered += 1;
+                    }
+                    Answer::Repeated => seen[0] += 1,
+                    // The gateway registers anew, as it would.
+                    Answer::SessionExpired => {
+                        seen[1] += 1;
+                        if c.serial != u64::MAX {
+                            sessions.retain(|(s, _)| *s != c.session);
+                        }
+                    }
+                    _ => seen[2] += 1,
+                }
+            }
+        }
+        // Sessions came and went, and commands were repeated, refused and run.
+        assert!(registered > 10, "{registered} sessions");
+        assert!(seen.iter().all(|&n| n > 500), "{seen:?}");
+    }
+
     /// Two replicas applying the same entries hold the same rows, however the entries were
     /// batched into commands.
     #[test]
@@ -309,16 +526,6 @@ mod tests {
                 apply_entry(&mut b, i, e, Layer::Name, &RULES).unwrap()
             );
         }
-        let all = |m: &Model| {
-            let mut rows = Vec::new();
-            let mut at = Vec::new();
-            while let Some((k, v)) = m.next(&at, &[0xFF]).unwrap() {
-                at = k.clone();
-                at.push(0);
-                rows.push((k, v));
-            }
-            rows
-        };
         assert_eq!(all(&a), all(&b));
     }
 }

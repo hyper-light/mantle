@@ -231,7 +231,13 @@ layers removes them, as Tectonic's does [01 §1.6].
       writer renews its lease (22 §3.6). The block sweep (`BlockSweep`) asks the File range of
       each block's file, one file at a time, which answers from the file itself: a file is
       written once, whole, so one written names what it ever will, and one not written by a
-      block's deadline never will. Nothing is marked. A block named is settled. One never to
+      block's deadline never will. Answering reads the file's extents once, whatever the page
+      asks: 1.7 ms for a file of the most extents, 10,000, as long as writing it took. No file
+      names more than 646 blocks, what the smallest blocks of the largest PUT body make (audit
+      B08), so a page of that many due blocks asks about a file at most twice; an index of
+      each file's blocks would save those reads for a row a block written with the file, and
+      is not kept (audit P05; [measurements](../measurements/2026-09-29-metadata-apply.md)).
+      Nothing is marked. A block named is settled. One never to
       be named is released in the Block range only if its deadline is still the one the File
       range judged, and a released block renews no more, so a renewal and a release are
       ordered by the Block range's log: a renewal first keeps the block, and after a release
@@ -316,7 +322,14 @@ layers removes them, as Tectonic's does [01 §1.6].
     itself. It names each read and command and the range it goes to, and moves on with the
     answer. It tells the request that started it what that request learns: created,
     deleted, not empty, or taken over by a later attempt. The simulation drives this
-    coordinator, stepping any attempt between any two of its reads and commands.
+    coordinator, stepping any attempt between any two of its reads and commands. It learns a
+    directory in one pass, keeping each range's newest descriptor and ordering them once, and
+    decides whether they cover the bucket in one walk of them in key order; it keeps no more
+    ranges than the cell holds (architecture §3), refusing a directory past that and reading
+    the directory anew when what it learns would pass it. Each descriptor learned was looked
+    up and the whole list sorted again, and each step of the coverage walk looked at every
+    range: an attempt learning 10,000 ranges took 436–453 ms and takes 590 µs (audit P03;
+    [measurements](../measurements/2026-09-29-metadata-apply.md)).
   - *Attempts left behind.* A gateway that stops leaves its attempt where it was. The Bucket
     range keeps an index of the buckets whose create or delete is in progress, and each
     bucket's row the range time its attempt last showed progress: when it began, and each

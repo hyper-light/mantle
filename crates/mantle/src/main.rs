@@ -21,6 +21,7 @@ mod bench;
 mod bench_ec;
 mod bench_hash;
 mod bench_log;
+mod bench_meta;
 mod disk;
 mod display;
 mod durability;
@@ -150,6 +151,15 @@ enum BenchCommand {
         /// 8K,64K,1M,8M by default.
         #[arg(long, value_delimiter = ',', value_parser = parse_size)]
         sizes: Vec<usize>,
+    },
+    /// Measure what applying the metadata layers' heaviest commands costs on one core: a
+    /// multipart completion of up to 10,000 parts, an entry of many commands from one session,
+    /// a create or delete attempt learning up to 10,000 ranges, and the sweep's check of a
+    /// page of blocks against a large file.
+    Meta {
+        /// Seconds each measurement runs.
+        #[arg(long, default_value_t = 0.5)]
+        seconds: f64,
     },
 }
 
@@ -302,6 +312,12 @@ fn main() -> ExitCode {
                 };
                 bench_hash::hash(&mut out, &sizes, step).map_err(|e| e.to_string())
             }
+            Err(_) => Err(format!("--seconds {seconds} is not a duration")),
+        },
+        Command::Bench {
+            command: BenchCommand::Meta { seconds },
+        } => match std::time::Duration::try_from_secs_f64(seconds) {
+            Ok(step) => bench_meta::meta(&mut out, step).map_err(|e| e.to_string()),
             Err(_) => Err(format!("--seconds {seconds} is not a duration")),
         },
         Command::Durability {

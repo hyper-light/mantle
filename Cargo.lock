@@ -458,6 +458,7 @@ dependencies = [
  "mantle-disk",
  "mantle-ec",
  "mantle-log",
+ "mantle-meta",
  "mantle-s3",
  "tempfile",
 ]

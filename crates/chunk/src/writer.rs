@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, RwLock};
 
 use mantle_disk::block::BlockFile;
@@ -202,6 +202,9 @@ pub(crate) struct Writer<F: BlockFile> {
     pub anticipation: Anticipation,
     /// Requests received from the queue so far.
     pub received: u64,
+    /// The deletes of the last batch, whose frame is durable, answered once a later frame
+    /// is: at most one batch's requests.
+    pub unconfirmed: Vec<Reply>,
 }
 
 /// A chunk as the batch being validated sees it: the index plus earlier requests in the batch.
@@ -406,7 +409,24 @@ impl<F: BlockFile> Writer<F> {
         // Requests the previous batch answered, and requests already submitted when it did.
         let mut answered = 0u64;
         let mut backlog = 0u64;
-        while let Ok(first) = self.rx.recv() {
+        loop {
+            let first = match self.rx.try_recv() {
+                Ok(first) => first,
+                // No batch follows at once to confirm the last one's deletes: a frame of its
+                // own does, before the writer waits.
+                Err(TryRecvError::Empty) if !self.unconfirmed.is_empty() => {
+                    self.confirm();
+                    continue;
+                }
+                Err(TryRecvError::Empty) => match self.rx.recv() {
+                    Ok(first) => first,
+                    Err(_) => return,
+                },
+                Err(TryRecvError::Disconnected) => {
+                    self.confirm();
+                    return;
+                }
+            };
             self.dequeued(&first);
             let mut bytes = request_bytes(&first);
             let mut batch = vec![first];
@@ -429,6 +449,11 @@ impl<F: BlockFile> Writer<F> {
             } else {
                 self.process(batch);
                 self.poke_cleaner();
+            }
+            if self.shared.fenced.load(Ordering::Acquire) {
+                for tx in std::mem::take(&mut self.unconfirmed) {
+                    answer(tx, Err(ChunkError::Fenced));
+                }
             }
             // Requests submitted before these answers went out are queued ahead of any the
             // answered submitters send next.
@@ -484,6 +509,51 @@ impl<F: BlockFile> Writer<F> {
 
     fn fence(&self) {
         self.shared.fenced.store(true, Ordering::Release);
+    }
+
+    /// Confirms the last batch's frame with a later one, flushed, and answers its deletes: a
+    /// checkpoint when one is due, which the log's reserve holds room for, and otherwise an
+    /// empty frame, which the reserve for a batch's frame holds room for. A delete lives only
+    /// in its frame, where a put's record describes itself in its segment, so an answered
+    /// delete must be in a frame recovery never takes for a torn tail: one a later frame
+    /// follows (docs/design/chunk-store.md §6; audit S15).
+    fn confirm(&mut self) {
+        if self.unconfirmed.is_empty() {
+            return;
+        }
+        let result = if self.shared.fenced.load(Ordering::Acquire) {
+            Err(ChunkError::Fenced)
+        } else if self.checkpoint_due(0) {
+            self.checkpoint()
+        } else {
+            let group = self.cursor.lsn;
+            self.append_frame(KIND_BATCH, &[], group)
+                .and_then(|_| self.shared.file.sync_data().map_err(ChunkError::Device))
+        };
+        let result = match result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.fence();
+                Err(e)
+            }
+        };
+        let mut first = result.err();
+        for tx in std::mem::take(&mut self.unconfirmed) {
+            match first.take() {
+                Some(e) => answer(tx, Err(e)),
+                None if self.shared.fenced.load(Ordering::Acquire) => {
+                    answer(tx, Err(ChunkError::Fenced));
+                }
+                None => answer(tx, Ok(())),
+            }
+        }
+    }
+
+    /// The last batch's frame has a later one, durable: its deletes are answered.
+    fn confirmed(&mut self) {
+        for tx in std::mem::take(&mut self.unconfirmed) {
+            answer(tx, Ok(()));
+        }
     }
 
     /// Whether cleaning may still free a segment: unless it was tried on exactly the data
@@ -875,6 +945,8 @@ impl<F: BlockFile> Writer<F> {
         let mut layout = self.layout(accepted.len(), records);
         let mut sequence = self.sequence;
         let mut ok: Vec<Reply> = Vec::with_capacity(accepted.len());
+        // Deletes, answered once a later frame confirms this batch's (`confirm`).
+        let mut deletes: Vec<Reply> = Vec::new();
         let mut payloads: Vec<Payload> = Vec::with_capacity(accepted.len());
         let shift = self.shared.checksum_shift;
         for Accepted { request, decision } in accepted {
@@ -957,12 +1029,16 @@ impl<F: BlockFile> Writer<F> {
                         sequence,
                         time_ns: layout.now,
                     }));
-                    ok.push(tx);
+                    deletes.push(tx);
                 }
                 _ => answer(tx, Ok(())),
             }
         }
-        if ok.is_empty() && layout.freed.is_empty() && layout.sealed.is_empty() {
+        if ok.is_empty()
+            && deletes.is_empty()
+            && layout.freed.is_empty()
+            && layout.sealed.is_empty()
+        {
             return;
         }
 
@@ -974,7 +1050,7 @@ impl<F: BlockFile> Writer<F> {
             Err(e) => {
                 self.fence();
                 let mut first = Some(e);
-                for tx in ok {
+                for tx in ok.into_iter().chain(deletes) {
                     answer(tx, Err(first.take().unwrap_or(ChunkError::Fenced)));
                 }
             }
@@ -984,6 +1060,9 @@ impl<F: BlockFile> Writer<F> {
                 for tx in ok {
                     answer(tx, Ok(()));
                 }
+                // This batch's frame, durable, confirms the last one's.
+                self.confirmed();
+                self.unconfirmed = deletes;
             }
         }
     }
@@ -1312,6 +1391,8 @@ impl<F: BlockFile> Writer<F> {
         self.cursor.start_lsn = begin_lsn;
         self.cursor.used = distance(begin_pos, self.cursor.pos, self.shared.geometry.log_size);
         self.shared.checkpoints.fetch_add(1, Ordering::Relaxed);
+        // The checkpoint's frames, durable, follow the last batch's.
+        self.confirmed();
         Ok(())
     }
 }

@@ -149,8 +149,16 @@ at a time, pass beside the bound. The loop takes every request that arrived whil
 previous batch was being made durable,
 lays the data records into the open segment for their stream, encodes one index frame,
 issues all of the batch's writes at once, then **one** flush of the volume (`sync_data`:
-`fdatasync`, `F_FULLFSYNC`, `FlushFileBuffers`), and only then acknowledges every request
-in the batch and publishes the new index entries to readers. Until the flush, a batch's
+`fdatasync`, `F_FULLFSYNC`, `FlushFileBuffers`), and only then acknowledges the batch's
+writes and publishes the new index entries to readers. Its deletes it acknowledges once a
+later frame is durable too: the next batch's, a checkpoint's, or, when no request is
+queued, an empty frame written and flushed at once. A write's record describes itself in its
+segment, so roll-forward finds it when its frame is the torn tail recovery discards (§6); a
+delete lives only in its frame, and the frame of an acknowledged delete must never be the
+last, where damage after the flush is indistinguishable from a torn write and discarding it
+brought the deleted chunk back (audit S15). Damage to a frame a later one follows is
+corruption, reported and never truncated (§3.2). Deletes come from the reclaimer, a layer
+below any client's request, so the second flush they wait for costs no client latency. Until the flush, a batch's
 writes reach the device in any order however they are issued. Issuing the frame after the
 records made a 32 MiB batch a fifth slower, and issuing it beside them costs nothing
 measurable (docs/measurements/2026-09-29-frame-overlap.md). There is no artificial delay [research/03
@@ -324,7 +332,8 @@ wait in software rather than at the device lose throughput and gain nothing.
 ## 8. Deleting and cleaning
 
 A delete appends `Delete` to the index log in the next batch and removes the entry; the
-record's bytes become dead in its segment's usage, and cleaning may reclaim them at once.
+record's bytes become dead in its segment's usage, and cleaning may reclaim them at once. It
+is acknowledged once a later frame is durable (§4).
 The net under deleting data by mistake is lazy deletion one layer up: the metadata service
 deletes a block's chunks only after the block has gone unreferenced for a grace period, as
 GFS keeps a deleted file for three days before reclaiming its chunks [GGL03 §4.4] and

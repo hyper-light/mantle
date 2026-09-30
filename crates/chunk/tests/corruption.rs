@@ -266,3 +266,42 @@ fn the_background_scrubber_finds_damage_on_its_own() {
     }
     assert_eq!(v.damaged().unwrap(), vec![key(11)]);
 }
+
+/// A delete is answered only once a later frame confirms its batch's, so its frame is never
+/// the log's last: damage to it is damage inside the log, refused, and damage to the last
+/// frame, the confirmation, loses nothing answered. Before, a delete answered in the last
+/// batch was lost with that batch's frame damaged, and the chunk it removed came back
+/// (audit S15).
+#[test]
+fn a_delete_answered_is_never_in_the_last_frame() {
+    let log = 128u64 << 10;
+    // Ten one-frame batches of puts, the delete's frame, then its confirmation's.
+    for (frame, opens) in [(10u64, false), (11, true)] {
+        let file = sim(25 + frame);
+        let v = Volume::format(Arc::clone(&file), SIZE, config()).unwrap();
+        for n in 0..10u64 {
+            v.put(key(n), &data(n, 500)).unwrap();
+        }
+        v.delete(key(3)).unwrap();
+        drop(v);
+        file.inject(Fault::BitFlip {
+            offset: log + frame * 4096 + 60,
+            bit: 3,
+            stored: true,
+        })
+        .unwrap();
+        match Volume::open(Arc::clone(&file), config()) {
+            Ok((v, _)) => {
+                assert!(opens, "damage to the delete's frame was not refused");
+                assert!(
+                    v.stat(&key(3)).unwrap().is_none(),
+                    "a deleted chunk came back"
+                );
+            }
+            Err(e) => {
+                assert!(!opens, "{e}");
+                assert!(matches!(e, ChunkError::CorruptLog { .. }), "{e}");
+            }
+        }
+    }
+}

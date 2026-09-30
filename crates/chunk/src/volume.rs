@@ -236,6 +236,7 @@ impl<F: BlockFile + 'static> Volume<F> {
             ),
             anticipation: mantle_disk::commit::Anticipation::new(),
             received: 0,
+            unconfirmed: Vec::new(),
         };
         // Recovery changed the index relative to the log: it put relocations back to the
         // copies they moved, indexed records the log never named, or sealed segments left

@@ -112,6 +112,7 @@ impl Group {
 /// Bytes a record's pieces take in a payload (format.rs).
 pub const START_BYTES: u64 = 33;
 pub const UNCERTAIN_BYTES: u64 = 33;
+pub const DAMAGED_BYTES: u64 = 17;
 pub const HARD_STATE_BYTES: u64 = 41;
 /// A proposal's bytes beyond an entry's: its record's kind and group, and its index.
 pub const PROPOSAL_EXTRA: u64 = 25;
@@ -182,6 +183,8 @@ pub struct Replayed {
     /// past a proposal written after it.
     pub last: u64,
     pub uncertain: Option<(Start, Place)>,
+    /// Where a `Damaged` record fenced the group, which then holds nothing else.
+    pub damaged: Option<Place>,
 }
 
 impl Replayed {

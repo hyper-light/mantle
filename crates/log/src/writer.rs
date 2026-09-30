@@ -2,9 +2,11 @@
 //!
 //! It runs the chunk store's group-commit loop (chunk-store.md §4): it takes every update
 //! that arrived while the last flush ran, lays them into one frame, writes the frame, flushes
-//! the file once, and only then publishes the updates to readers and answers them. One frame
-//! is one batch, so a valid frame with a later sequence proves an earlier one was flushed,
-//! which is what lets recovery tell a torn tail from damage (§6).
+//! the file once, and publishes the updates to readers. It answers them once a later durable
+//! record confirms that flush: the next frame's persist record, or a confirmation written on
+//! its own when no frame follows at once (raft-log.md §6). One frame is one batch, so a valid
+//! frame with a later sequence proves an earlier one was flushed, which is what lets recovery
+//! tell a torn tail from damage (§6).
 //!
 //! Segments are freed oldest first, so the live ones are always a run of incarnations that
 //! each frame's tail names. A tail with no live piece left is freed at once. When updates
@@ -24,14 +26,12 @@
 //! and a few replicas would alternate between batches, every update waiting for two flushes
 //! (docs/measurements/2026-09-28-raft-log-benchmark.md). The writer waits for them as long as
 //! waiting is expected to lower total latency, as the chunk store's writer does
-//! (`mantle_disk::commit`). Under `Waits::Asked` it waits on no clock at all, for a caller
-//! that steps the log itself.
+//! (`mantle_disk::commit`). Under `Waits::Never` it forms each batch from what is queued.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::time::Duration;
+use std::sync::mpsc::Receiver;
 
 use mantle_codec::Writer as Payload;
 use mantle_disk::block::BlockFile;
@@ -42,10 +42,10 @@ use crate::format::{
     self, FRAME_HEADER_BYTES, FRAME_HEADER_LEN, FrameHeader, Owned, Placed, Record, SegmentHeader,
 };
 use crate::state::{
-    self, Group, HARD_STATE_BYTES, PROPOSAL_EXTRA, Place, START_BYTES, Slot, UNCERTAIN_BYTES,
-    entry_bytes, resolves,
+    self, DAMAGED_BYTES, Group, HARD_STATE_BYTES, PROPOSAL_EXTRA, Place, START_BYTES, Slot,
+    UNCERTAIN_BYTES, entry_bytes, resolves,
 };
-use crate::{LogError, Shared, State, Submission, Update, Waits, Work};
+use crate::{LogError, Shared, State, Submission, Update, Waits};
 
 /// Where an update's pieces went in the payload.
 #[derive(Debug, Default)]
@@ -55,6 +55,7 @@ struct Placement {
     hard: Option<usize>,
     proposals: Vec<(u64, usize)>,
     uncertain: Option<usize>,
+    damaged: Option<usize>,
 }
 
 /// A live piece of the tail copied into the payload.
@@ -65,6 +66,7 @@ enum Moved {
     Start { group: u128, at: usize },
     Proposal { group: u128, index: u64, at: usize },
     Uncertain { group: u128, at: usize },
+    Damaged { group: u128, at: usize },
 }
 
 /// A sweep of the tail laid into the payload.
@@ -78,10 +80,7 @@ struct Sweep {
 
 pub(crate) struct Writer<F> {
     shared: Arc<Shared<F>>,
-    receiver: Receiver<Work>,
-    /// Requests to confirm the last frame's flush, answered at the end of the batch they
-    /// arrived in: at most one, since `Log::confirm` sends one at a time.
-    confirms: Vec<std::sync::mpsc::SyncSender<Result<(), LogError>>>,
+    receiver: Receiver<Submission>,
     /// Updates held for the next batch: a group's second update waits for its first.
     held: VecDeque<Submission>,
     /// Payload bytes one frame holds.
@@ -90,18 +89,23 @@ pub(crate) struct Writer<F> {
     /// Submissions taken off the channel so far.
     received: u64,
     /// The last frame flushed, while nothing durable yet says its flush completed: the next
-    /// frame's persist record will, or, if the log falls idle first, a confirmation
-    /// (docs/design/raft-log.md §6).
-    unconfirmed: Option<u64>,
+    /// frame's persist record will, or a confirmation written when no frame follows at once
+    /// (docs/design/raft-log.md §3, §6). Its updates are answered only then.
+    unconfirmed: Option<Unconfirmed>,
+}
+
+/// A frame flushed and not yet confirmed, and the updates it carried: at most one frame's.
+struct Unconfirmed {
+    sequence: u64,
+    updates: Vec<Submission>,
 }
 
 impl<F: BlockFile> Writer<F> {
-    pub fn new(shared: Arc<Shared<F>>, receiver: Receiver<Work>) -> Result<Self, LogError> {
+    pub fn new(shared: Arc<Shared<F>>, receiver: Receiver<Submission>) -> Result<Self, LogError> {
         let capacity = crate::frame_room(&shared.config, shared.align)?;
         Ok(Self {
             shared,
             receiver,
-            confirms: Vec::new(),
             held: VecDeque::new(),
             capacity,
             anticipation: Anticipation::new(),
@@ -111,116 +115,118 @@ impl<F: BlockFile> Writer<F> {
     }
 
     pub fn run(mut self) {
-        // Submissions the last batch answered, and those already sent when it did.
+        // Submissions the last confirmation answered, and those already sent when it did.
         let mut answered = 0u64;
         let mut backlog = 0u64;
         loop {
             let mut batch = std::mem::take(&mut self.held);
             let held = u64::try_from(batch.len()).unwrap_or(u64::MAX);
+            while let Ok(s) = self.receiver.try_recv() {
+                batch.push_back(self.taken(s));
+            }
             if batch.is_empty() {
-                match self.next_when_idle() {
-                    Some(w) => self.take(w, &mut batch),
-                    None => return,
+                if self.unconfirmed.is_some() {
+                    // No frame would carry the confirmation: it goes on its own, at once.
+                    answered = self.confirm();
+                    backlog = self.backlog();
+                    continue;
+                }
+                match self.receiver.recv() {
+                    Ok(s) => batch.push_back(self.taken(s)),
+                    Err(_) => return,
                 }
             }
-            while let Ok(w) = self.receiver.try_recv() {
-                self.take(w, &mut batch);
-            }
             self.gather(&mut batch, answered, backlog.saturating_add(held));
-            answered = u64::try_from(batch.len()).unwrap_or(u64::MAX);
             if self.shared.fenced.load(Ordering::Acquire) {
                 for s in batch {
                     self.answer(&s, Err(LogError::Fenced));
                 }
-                self.answer_confirms();
                 // Answer what still comes until the log is dropped.
-                while let Ok(w) = self.receiver.recv() {
-                    match w {
-                        Work::Update(s) => {
-                            let s = self.taken(s);
-                            self.answer(&s, Err(LogError::Fenced));
-                        }
-                        Work::Confirm(reply) => {
-                            let _ = reply.try_send(Err(LogError::Fenced));
-                        }
-                    }
+                while let Ok(s) = self.receiver.recv() {
+                    let s = self.taken(s);
+                    self.answer(&s, Err(LogError::Fenced));
                 }
                 return;
             }
-            if !batch.is_empty() && self.commit(batch).is_err() {
-                self.fence();
-                for s in std::mem::take(&mut self.held) {
-                    self.answer(&s, Err(LogError::Fenced));
+            answered = match self.commit(batch) {
+                Ok(Some(confirmed)) => confirmed,
+                // No frame was written, so none confirms the last: a confirmation does, so that
+                // no answer waits on traffic that may only ever be refused.
+                Ok(None) => self.confirm(),
+                Err(_) => {
+                    self.fence();
+                    for s in std::mem::take(&mut self.held) {
+                        self.answer(&s, Err(LogError::Fenced));
+                    }
+                    0
                 }
-            }
-            self.answer_confirms();
-            // Submissions sent before these answers went out are queued ahead of any the
-            // answered replicas send next.
-            backlog = self
-                .shared
-                .submitted
-                .load(Ordering::Acquire)
-                .saturating_sub(self.received);
+            };
+            backlog = self.backlog();
         }
     }
 
-    /// The next work, once nothing is queued; `None` once the log is closed. Under
-    /// `Waits::Measured` the last frame's flush is confirmed first if nothing comes within one
-    /// flush's measured time, whose own frame would have confirmed it for nothing; under
-    /// either, before the writer stops.
-    fn next_when_idle(&mut self) -> Option<Work> {
-        if self.unconfirmed.is_some() && self.shared.config.waits == Waits::Measured {
-            let flush = Duration::from_nanos(self.anticipation.service_ns());
-            match self.receiver.recv_timeout(flush) {
-                Ok(s) => return Some(s),
-                Err(RecvTimeoutError::Timeout) => self.confirm(),
-                Err(RecvTimeoutError::Disconnected) => {
-                    self.confirm();
-                    return None;
-                }
-            }
-        }
-        match self.receiver.recv() {
-            Ok(s) => Some(s),
-            Err(_) => {
-                self.confirm();
-                None
-            }
-        }
+    /// Submissions sent before the answers just given went out: they are queued ahead of any
+    /// the answered replicas send next.
+    fn backlog(&self) -> u64 {
+        self.shared
+            .submitted
+            .load(Ordering::Acquire)
+            .saturating_sub(self.received)
     }
 
     /// Writes and flushes a confirmation that the last frame was flushed, into the persist
-    /// slot the next frame's record would take. A failed write or flush fences the log.
-    fn confirm(&mut self) {
-        let Some(sequence) = self.unconfirmed.take() else {
-            return;
+    /// slot the next frame's record would take, and answers the frame's updates: the number
+    /// answered. A failed write or flush fences the log, and they are answered `Fenced`.
+    fn confirm(&mut self) -> u64 {
+        let Some(frame) = self.unconfirmed.take() else {
+            return 0;
         };
-        if self.shared.fenced.load(Ordering::Acquire) {
-            return;
-        }
-        let written = sequence
-            .checked_add(1)
-            .ok_or(LogError::Damaged("sequences past u64"))
-            .and_then(|next| {
-                let record = format::Persist {
-                    log: self.shared.id,
-                    sequence,
-                    confirms: sequence,
-                    groups: Vec::new(),
-                };
-                write_persist(&self.shared, &record, next)
-            })
-            .and_then(|()| self.shared.file.sync_data().map_err(LogError::from));
-        if written.is_err() {
-            self.fence();
+        let written = if self.shared.fenced.load(Ordering::Acquire) {
+            Err(LogError::Fenced)
+        } else {
+            frame
+                .sequence
+                .checked_add(1)
+                .ok_or(LogError::Damaged("sequences past u64"))
+                .and_then(|next| {
+                    let record = format::Persist {
+                        log: self.shared.id,
+                        sequence: frame.sequence,
+                        confirms: frame.sequence,
+                        groups: Vec::new(),
+                    };
+                    write_persist(&self.shared, &record, next)
+                })
+                .and_then(|()| self.shared.file.sync_data().map_err(LogError::from))
+        };
+        match written {
+            Ok(()) => self.settle(frame, Ok(())),
+            Err(_) => {
+                self.fence();
+                self.settle(frame, Err(()));
+                0
+            }
         }
     }
 
-    /// Waits for the replicas the last batch answered while waiting is expected to lower
-    /// total latency, and learns how many of them return (`mantle_disk::commit`). The first
-    /// `before` submissions in the batch were sent before the answers.
+    /// Answers the updates of a frame whose confirmation is durable, `Ok`, or will never be,
+    /// `Fenced`; the number answered.
+    fn settle(&self, frame: Unconfirmed, result: Result<(), ()>) -> u64 {
+        for s in &frame.updates {
+            let answer = match result {
+                Ok(()) => Ok(()),
+                Err(()) => Err(LogError::Fenced),
+            };
+            self.answer(s, answer);
+        }
+        u64::try_from(frame.updates.len()).unwrap_or(u64::MAX)
+    }
+
+    /// Waits for the replicas the last confirmation answered while waiting is expected to
+    /// lower total latency, and learns how many of them return (`mantle_disk::commit`). The
+    /// first `before` submissions in the batch were sent before the answers.
     fn gather(&mut self, batch: &mut VecDeque<Submission>, answered: u64, before: u64) {
-        if answered == 0 || self.shared.config.waits == Waits::Asked {
+        if answered == 0 || self.shared.config.waits == Waits::Never {
             return;
         }
         let returned = |batch: &VecDeque<Submission>| {
@@ -233,38 +239,11 @@ impl<F: BlockFile> Writer<F> {
                 break;
             };
             match self.receiver.recv_timeout(step) {
-                Ok(w) => self.take(w, batch),
+                Ok(s) => batch.push_back(self.taken(s)),
                 Err(_) => break,
             }
         }
         self.anticipation.learn(answered, returned(batch));
-    }
-
-    /// Puts work taken off the channel where it waits: an update into the batch, a request
-    /// to confirm among those answered after it.
-    fn take(&mut self, w: Work, batch: &mut VecDeque<Submission>) {
-        match w {
-            Work::Update(s) => batch.push_back(self.taken(s)),
-            Work::Confirm(reply) => self.confirms.push(reply),
-        }
-    }
-
-    /// Confirms the last frame's flush for the requests that asked, and answers them.
-    fn answer_confirms(&mut self) {
-        if self.confirms.is_empty() {
-            return;
-        }
-        self.confirm();
-        let fenced = self.shared.fenced.load(Ordering::Acquire);
-        for reply in std::mem::take(&mut self.confirms) {
-            let result = if fenced {
-                Err(LogError::Fenced)
-            } else {
-                Ok(())
-            };
-            // A caller that stopped waiting has nothing to be told.
-            let _ = reply.try_send(result);
-        }
     }
 
     /// Counts a submission the writer took. Its room in the queue is held until it is
@@ -291,10 +270,12 @@ impl<F: BlockFile> Writer<F> {
         self.shared.room.notify_all();
     }
 
-    /// Writes one frame of a sweep and updates, then publishes and answers them. An error
-    /// returned fences the log, and every update taken is answered `Fenced`; updates refused
-    /// on their own are answered here.
-    fn commit(&mut self, batch: VecDeque<Submission>) -> Result<(), LogError> {
+    /// Writes one frame of a sweep and updates and publishes it. Its persist record confirms
+    /// the frame before, whose updates are answered, and the number answered is returned; its
+    /// own updates wait for their confirmation. `None` if no frame was written. An error
+    /// returned fences the log, and every update taken or waiting is answered `Fenced`;
+    /// updates refused on their own are answered here.
+    fn commit(&mut self, batch: VecDeque<Submission>) -> Result<Option<u64>, LogError> {
         let mut payload = Payload::default();
         let mut records = 0u32;
         let sweep = if self.sweepable()? {
@@ -336,7 +317,7 @@ impl<F: BlockFile> Writer<F> {
                     self.held.push_back(s);
                     continue;
                 }
-                let placement = encode(&mut payload, &mut records, s.group, &s.update, s.uncertain)
+                let placement = encode(&mut payload, &mut records, s.group, &s.update, s.marks)
                     .ok_or(LogError::TooLarge(len))?;
                 if new {
                     new_groups = new_groups.saturating_add(1);
@@ -345,27 +326,32 @@ impl<F: BlockFile> Writer<F> {
             }
         }
         if taken.is_empty() && sweep.is_none() {
-            return Ok(());
+            return Ok(None);
         }
         let payload = payload.into_vec();
         let result = self.place_and_write(&payload, records, sweep, &taken);
         match result {
-            Ok(true) => {
+            Ok(Some(sequence)) => {
                 self.shared.frames.fetch_add(1, Ordering::Relaxed);
                 let updates = u64::try_from(taken.len()).unwrap_or(u64::MAX);
                 self.shared.updates.fetch_add(updates, Ordering::Relaxed);
-                for (s, _) in &taken {
-                    self.answer(s, Ok(()));
-                }
-                Ok(())
+                let confirmed = self
+                    .unconfirmed
+                    .take()
+                    .map_or(0, |before| self.settle(before, Ok(())));
+                self.unconfirmed = Some(Unconfirmed {
+                    sequence,
+                    updates: taken.into_iter().map(|(s, _)| s).collect(),
+                });
+                Ok(Some(confirmed))
             }
-            Ok(false) => {
+            Ok(None) => {
                 // No segment can take the frame: every one holds live records the tail's
                 // sweep cannot free. Groups must compact.
                 for (s, _) in &taken {
                     self.answer(s, Err(LogError::Full));
                 }
-                Ok(())
+                Ok(None)
             }
             Err(e) => {
                 // Fenced before anyone hears of it, so no answer outruns the fence.
@@ -373,19 +359,23 @@ impl<F: BlockFile> Writer<F> {
                 for (s, _) in &taken {
                     self.answer(s, Err(LogError::Fenced));
                 }
+                if let Some(before) = self.unconfirmed.take() {
+                    self.settle(before, Err(()));
+                }
                 Err(e)
             }
         }
     }
 
-    /// Places, writes and publishes the frame; `false` if no segment can take it.
+    /// Places, writes and publishes the frame: its sequence, or `None` if no segment can take
+    /// it.
     fn place_and_write(
         &mut self,
         payload: &[u8],
         records: u32,
         sweep: Option<Sweep>,
         taken: &[(Submission, Placement)],
-    ) -> Result<bool, LogError> {
+    ) -> Result<Option<u64>, LogError> {
         let (tail, advances) = {
             let state = self.shared.read_state()?;
             let tail = match &sweep {
@@ -395,15 +385,14 @@ impl<F: BlockFile> Writer<F> {
             (tail, tail > state.durable_tail)
         };
         let Some(target) = self.target(payload.len(), advances)? else {
-            return Ok(false);
+            return Ok(None);
         };
         let started = std::time::Instant::now();
         let sequence = self.write(&target, records, payload, tail, taken)?;
-        self.unconfirmed = Some(sequence);
         self.anticipation
             .served(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
         self.publish(&target, sweep, taken, tail)?;
-        Ok(true)
+        Ok(Some(sequence))
     }
 
     /// Whether the tail should be swept now: free segments are short, a segment follows the
@@ -765,16 +754,20 @@ fn persisted(s: &Submission) -> format::Persisted {
             count: u64::try_from(e.entries.len()).unwrap_or(u64::MAX),
             term: e.entries.last().map_or(0, |x| x.term),
         }),
-        uncertain: s.uncertain,
+        uncertain: s.marks.uncertain,
         removed: u.remove,
         proposals: !u.proposals.is_empty(),
+        damaged: s.marks.damaged,
     }
 }
 
-/// Bytes a submission's records take in a payload: its update's, and its uncertainty mark's.
+/// Bytes a submission's records take in a payload: its update's and its marks'.
 fn submission_len(s: &Submission) -> Option<usize> {
+    if s.marks.damaged {
+        return format::encoded_len(&Record::Damaged { group: s.group });
+    }
     let len = update_len(s.group, &s.update)?;
-    match s.uncertain {
+    match s.marks.uncertain {
         Some(mark) => len.checked_add(format::encoded_len(&Record::Uncertain {
             group: s.group,
             mark,
@@ -858,6 +851,9 @@ enum Copy<'a> {
         group: u128,
         mark: format::Start,
     },
+    Damaged {
+        group: u128,
+    },
 }
 
 impl Copy<'_> {
@@ -895,6 +891,7 @@ impl Copy<'_> {
                 group: *group,
                 mark: *mark,
             },
+            Copy::Damaged { group } => Record::Damaged { group: *group },
         }
     }
 
@@ -922,6 +919,9 @@ impl Copy<'_> {
             }
             (Copy::Uncertain { group, .. }, Placed::Record(at)) => {
                 out.push(Moved::Uncertain { group: *group, at });
+            }
+            (Copy::Damaged { group }, Placed::Record(at)) => {
+                out.push(Moved::Damaged { group: *group, at });
             }
             _ => {}
         }
@@ -1048,6 +1048,11 @@ fn live_copies<'a>(state: &State, slot: u32, base: u64, records: &'a [Owned]) ->
                     });
                 }
             }
+            Owned::Damaged { at: offset, group } => {
+                if state.damaged.get(group) == Some(&Some(at(*offset))) {
+                    out.push(Copy::Damaged { group: *group });
+                }
+            }
             Owned::Removed { .. } => {}
         }
     }
@@ -1060,7 +1065,7 @@ fn move_piece(
     moved: &Moved,
     place: &impl Fn(usize) -> Result<Place, LogError>,
 ) -> Result<(), LogError> {
-    let (live, groups) = (&mut state.live, &mut state.groups);
+    let (live, groups, damaged) = (&mut state.live, &mut state.groups, &mut state.damaged);
     match *moved {
         Moved::Entry { group, index, at } => {
             if let Some(slot) = groups.get_mut(&group).and_then(|g| slot_mut(g, index)) {
@@ -1102,6 +1107,13 @@ fn move_piece(
                 live.add(*p, UNCERTAIN_BYTES);
             }
         }
+        Moved::Damaged { group, at } => {
+            if let Some(Some(p)) = damaged.get_mut(&group) {
+                live.kill(*p, DAMAGED_BYTES);
+                *p = place(at)?;
+                live.add(*p, DAMAGED_BYTES);
+            }
+        }
     }
     Ok(())
 }
@@ -1124,9 +1136,17 @@ fn validate(
 ) -> Result<bool, LogError> {
     let (group, update) = (s.group, &s.update);
     let invalid = |reason| LogError::Invalid { group, reason };
+    // The fence recovery writes on a damaged group carries nothing else.
+    if s.marks.damaged {
+        return if *update == Update::default() {
+            Ok(false)
+        } else {
+            Err(invalid("a damage mark carries nothing else"))
+        };
+    }
     // A damaged group takes nothing but its removal, which is how its replica leaves the
     // device to be rebuilt from its peers.
-    if state.damaged.contains(&group) && !update.remove {
+    if state.damaged.contains_key(&group) && !update.remove {
         return Err(LogError::Damaged(
             "the group's acknowledged records are damaged; it recovers from its peers",
         ));
@@ -1144,7 +1164,9 @@ fn validate(
         };
     }
     let new = current.is_none();
-    if new && state.groups.len().saturating_add(new_groups) >= config.max_groups {
+    // A fenced group holds its place among the groups until it is removed.
+    let held = state.groups.len().saturating_add(state.damaged.len());
+    if new && held.saturating_add(new_groups) >= config.max_groups {
         return Err(LogError::TooManyGroups(config.max_groups));
     }
     let empty = Group::default();
@@ -1239,13 +1261,19 @@ fn encode(
     records: &mut u32,
     group: u128,
     update: &Update,
-    uncertain: Option<format::Start>,
+    marks: crate::Marks,
 ) -> Option<Placement> {
     let mut placement = Placement::default();
     let mut put = |record: &Record<'_>| {
         *records = records.checked_add(1)?;
         format::put(payload, record)
     };
+    if marks.damaged {
+        if let Placed::Record(at) = put(&Record::Damaged { group })? {
+            placement.damaged = Some(at);
+        }
+        return Some(placement);
+    }
     if update.remove {
         put(&Record::Removed { group })?;
         return Some(placement);
@@ -1280,7 +1308,7 @@ fn encode(
             placement.proposals.push((p.index, at));
         }
     }
-    if let Some(mark) = uncertain
+    if let Some(mark) = marks.uncertain
         && let Placed::Record(at) = put(&Record::Uncertain { group, mark })?
     {
         placement.uncertain = Some(at);
@@ -1298,8 +1326,26 @@ fn apply(
 ) -> Result<(), LogError> {
     let (group, update) = (s.group, &s.update);
     let live = &mut state.live;
+    if s.marks.damaged {
+        // Whatever the group held is gone; only the fence is live.
+        if let Some(g) = state.groups.remove(&group) {
+            for (p, bytes) in g.pieces() {
+                live.kill(p, bytes);
+            }
+        }
+        if let Some(at) = placement.damaged {
+            let new_at = place(at)?;
+            if let Some(Some(old)) = state.damaged.insert(group, Some(new_at)) {
+                live.kill(old, DAMAGED_BYTES);
+            }
+            live.add(new_at, DAMAGED_BYTES);
+        }
+        return Ok(());
+    }
     if update.remove {
-        state.damaged.remove(&group);
+        if let Some(Some(at)) = state.damaged.remove(&group) {
+            live.kill(at, DAMAGED_BYTES);
+        }
         if let Some(g) = state.groups.remove(&group) {
             for (p, bytes) in g.pieces() {
                 live.kill(p, bytes);
@@ -1394,7 +1440,7 @@ fn apply(
         }
         live.add(new_at, bytes);
     }
-    if let (Some(mark), Some(at)) = (s.uncertain, placement.uncertain) {
+    if let (Some(mark), Some(at)) = (s.marks.uncertain, placement.uncertain) {
         if let Some((_, old)) = g.uncertain {
             live.kill(old, UNCERTAIN_BYTES);
         }

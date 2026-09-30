@@ -98,21 +98,17 @@ the bound covers updates waiting to be taken, those held for a later frame and t
 written, and each group holds two at most, the two batches' worth of a group that has one
 update in each frame; a hot group waits for its own room and never takes the others'. The loop takes everything that arrived while the
 last batch was being made durable, encodes one frame, writes it, flushes the file once
-with the platform's full flush, and only then publishes the records to readers and answers
-every submitter. Replicas submit in a closed loop, so the writer waits for the replicas it
+with the platform's full flush, and publishes the records to readers. It answers the frame's
+submitters once a later durable record confirms that flush (§6): the next frame's persist
+record, when work is queued, or a confirmation written on its own at once. Replicas submit in a closed loop, so the writer waits for the replicas it
 just answered as long as that is expected to lower total latency, the wait the chunk store's
 writer derived (`mantle_disk::commit`). Without it, a few replicas alternate between batches
 and each update waits for two flushes
 (docs/measurements/2026-09-28-raft-log-benchmark.md, finding 2).
 
-Those waits, and the idle confirmation of §6, run on the clock, which a node wants and a
-deterministic simulation cannot have: whether a confirmation lands before a crash, and so
-what the simulated device writes and which of its seeded faults each write draws, would
-hang on thread timing. `Config::waits` chooses: `Waits::Measured` is what a node runs, and
-under `Waits::Asked` the writer never waits on the clock, a batch is what is queued when it
-looks, and it confirms the last frame's flush only when `Log::confirm` asks or the log
-closes. `Log::confirm` goes through the writer's channel, which has room for the queue's
-submissions and the one request a mutex lets through at a time.
+That wait runs on the clock. `Config::waits` chooses: `Waits::Measured` is what a node
+runs; under `Waits::Never` a batch is what is queued when the writer looks, for the replica
+simulation, whose members have one update out at a time and so never return within a wait.
 
 A group's updates become durable in the order submitted. An update that waits for a frame
 with room holds its group's later updates behind it for that frame, so a newer hard state
@@ -210,9 +206,10 @@ up to its quota, to hold twice that, the same headroom the chunk store's cleanin
    ambiguous: "if e_i is the last entry, then we cannot determine whether it was a crash or
    a corruption" (AGL+18 §3.3.3). Its persist record answers what it held, and a confirmation
    answers whether its flush completed: the next frame's record, written only after that
-   flush, or, when the log falls idle for one measured flush time or closes, a record the
-   writer writes and flushes to say so. An idle log pays that one flush; a busy one pays
-   nothing, the next frame confirming the last.
+   flush, or, when no frame follows at once, a record the writer writes and flushes to say
+   so. A frame's updates are answered only once its confirmation is durable, so an
+   unconfirmed frame was never acknowledged, and the ambiguity AGL+18 leaves to the
+   replication protocol does not arise.
    - A confirmed frame that no longer reads was acknowledged and damaged since. Each of its
      groups gets back the start and hard state the frame left, its entries cut back to where
      the frame's began, and an `Uncertain` mark through the frame's last entry; its commit is
@@ -221,18 +218,30 @@ up to its quota, to hold twice that, the same headroom the chunk store's cleanin
      no one, since a replica opening it afresh would vote again in a term it voted in, and
      takes only its removal, after which it is rebuilt from its peers. The replica keeps out
      of elections while it is marked (replica.md §4).
-   - An unconfirmed frame may never have been acknowledged: its persist record can reach the
-     disk while the frame tears. It is the torn tail, but for its term and vote, which are
-     kept, since raising a term or keeping a vote that may have been given is always safe and
-     forgetting a vote given could let the replica vote twice. Its commit is not kept: it may
-     name an entry only the frame held.
-   - What stays unknowable is an acknowledged frame damaged before its confirmation became
-     durable. That needs a crash within about one flush of the acknowledgement and damage to
-     that frame before the restart, and it loses the frame's entries but never its term or
-     vote. Treating every unconfirmed record as damage would close it at a cost the
-     simulation measured: a crash that tore a frame after its record landed then marked
-     entries no one had acknowledged, and a group with one member lost and that one marked
-     could elect no one.
+   - A group found damaged, by a record missing or by a lost frame's proposals, is fenced by
+     a `Damaged` record written before the log serves anyone, which replaces whatever the
+     group held and lives, copied by sweeps, until the group's removal. What showed the
+     damage does not last: the next frame overwrites the lost one, and a sweep may reclaim
+     the segments around a missing record, and without the fence the next open found the
+     group as its older records left it (audit S16). The fence's persist record carries it
+     too, and recovery keeps a fence whether or not its frame was confirmed, since a power
+     cut can tear the frame that wrote it after the one that showed the damage was erased,
+     and marking a group damaged is always safe.
+   - An unconfirmed frame was never acknowledged, and its persist record can reach the disk
+     while the frame tears. It is the torn tail, but for its term and vote, which are kept:
+     raising a term or keeping a vote is always safe. Its commit is not kept: it may name an
+     entry only the frame held.
+
+   Before, a frame was answered at its own flush, and one damaged before its confirmation
+   was durable could not be told from a torn one: the audit (S01, round three) cut power
+   after the flush and before the confirmation, damaged the frame, and recovery dropped an
+   acknowledged entry without a mark. Marking every unconfirmed frame instead would have
+   closed that at a cost the simulation measured: a crash that tore a frame after its record
+   landed marked entries no one had acknowledged, and a group with one member lost and that
+   one marked could elect no one; a power loss that tore the frame on a leader and a follower
+   alike would leave them both marked. Answering after the confirmation costs one more flush
+   of latency where no frame follows at once
+   (docs/measurements/2026-09-29-log-confirmation.md).
 
    The restore is written through the writer, marks included, before the log serves anyone,
    so it survives the next restart.

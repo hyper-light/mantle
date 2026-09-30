@@ -259,6 +259,8 @@ pub(crate) struct Restore {
     pub group: u128,
     pub update: crate::Update,
     pub uncertain: Option<format::Start>,
+    /// The group is marked damaged; the update is empty.
+    pub damaged: bool,
 }
 
 /// Writes segment 0, incarnation 1: its header and an empty first frame.
@@ -294,7 +296,7 @@ pub(crate) fn create<F: BlockFile>(file: &F, config: &Config, id: u128) -> Resul
     file.sync_data()?;
     Ok(State {
         groups: HashMap::new(),
-        damaged: std::collections::HashSet::new(),
+        damaged: HashMap::new(),
         live: Live::with_slots(1),
         segments: Segments {
             incarnation: vec![1],
@@ -542,10 +544,16 @@ pub(crate) fn open<F: BlockFile>(
         return Err(LogError::Damaged("a frame is missing"));
     }
 
-    // 4. The groups as they run; those with a record missing recover from their peers.
+    // 4. The groups as they run; those with a record missing recover from their peers, and
+    // so do those an earlier recovery fenced as damaged.
     let mut groups = HashMap::new();
     let mut damaged = Vec::new();
+    let mut fenced = HashMap::new();
     for (group, r) in replayed {
+        if let Some(at) = r.damaged {
+            fenced.insert(group, at);
+            continue;
+        }
         match r.finish() {
             Some(g) => {
                 groups.insert(group, g);
@@ -558,18 +566,32 @@ pub(crate) fn open<F: BlockFile>(
     let restores = restores(
         file,
         config,
-        align,
         id,
         last.sequence,
         &groups,
+        &fenced,
         &mut damaged,
     )?;
     damaged.sort_unstable();
+    damaged.dedup();
+    // A group newly found damaged is fenced by a record written before the log serves
+    // anyone, so that the fence outlives what showed the damage: the frame is overwritten
+    // by the next, and a record missing may be swept away (audit S16).
+    let mut restores = restores;
+    restores.extend(damaged.iter().map(|&group| Restore {
+        group,
+        update: crate::Update::default(),
+        uncertain: None,
+        damaged: true,
+    }));
     let mut live = Live::with_slots(incarnation.len());
     for g in groups.values() {
         for (place, bytes) in g.pieces() {
             live.add(place, bytes);
         }
+    }
+    for &place in fenced.values() {
+        live.add(place, state::DAMAGED_BYTES);
     }
 
     // 5. The block where the next frame goes is erased. A frame there was never acknowledged
@@ -617,9 +639,17 @@ pub(crate) fn open<F: BlockFile>(
         })
         .map(|slot| (slot, 0))
         .collect();
-    let restored = restores.iter().map(|r| r.group).collect();
+    let restored = restores
+        .iter()
+        .filter(|r| !r.damaged)
+        .map(|r| r.group)
+        .collect();
     let state = State {
-        damaged: damaged.iter().copied().collect(),
+        damaged: damaged
+            .iter()
+            .map(|&group| (group, None))
+            .chain(fenced.iter().map(|(&group, &at)| (group, Some(at))))
+            .collect(),
         groups,
         live,
         segments: Segments {
@@ -648,7 +678,11 @@ pub(crate) fn open<F: BlockFile>(
         state,
         Recovery {
             frames,
-            damaged,
+            damaged: {
+                let mut all: Vec<u128> = damaged.into_iter().chain(fenced.into_keys()).collect();
+                all.sort_unstable();
+                all
+            },
             restored,
         },
         restores,
@@ -659,32 +693,30 @@ pub(crate) fn open<F: BlockFile>(
 /// restore it. A persist record is written in its frame's flush, so it may survive a frame
 /// torn by a crash as well as one damaged since its flush; what tells the two apart is a
 /// confirmation that the frame was flushed: the next frame's record, which is written only
-/// after that flush, or the one the writer writes when the log falls idle or closes.
+/// after that flush, or the one the writer writes when no frame follows at once. A frame's
+/// updates are answered only once it is confirmed.
 ///
 /// A confirmed frame was acknowledged, and damaged since (AGL+18 §3.3.3). Each of its groups
 /// gets back the start and hard state the frame left, its entries cut back to where the
 /// frame's began, and, where the frame wrote entries, the mark that the log may lack them; a
 /// group whose frame held proposals, which a persist record does not carry, is damaged and
-/// recovers from its peers. An unconfirmed frame may never have been acknowledged, and is the
-/// torn tail, but for one thing: the term and vote it held are kept. Keeping a term or vote is
-/// always safe, since a replica may raise its term and a vote it may have given only stops it
-/// voting again; forgetting one given could let it vote twice. Its commit is not kept, since it
-/// may name an entry only the frame held. What remains unknowable is an acknowledged frame
-/// damaged before its confirmation became durable: that needs a crash within about one flush
-/// of the acknowledgement and damage to the frame before the restart, and loses its entries
-/// but not its term or vote.
+/// recovers from its peers. An unconfirmed frame was never acknowledged, and is the torn tail,
+/// but for its term and vote, which are kept, since raising a term or keeping a vote is always
+/// safe. Its commit is not kept, since it may name an entry only the frame held. A fence the
+/// frame put on a damaged group is kept, confirmed or not.
 fn restores<F: BlockFile>(
     file: &F,
     config: &Config,
-    align: Alignment,
     id: u128,
     last: u64,
     groups: &HashMap<u128, state::Group>,
+    fenced: &HashMap<u128, Place>,
     damaged: &mut Vec<u128>,
 ) -> Result<Vec<Restore>, LogError> {
     let Some(sequence) = last.checked_add(1) else {
         return Ok(Vec::new());
     };
+    let align = file.alignment();
     let slot = persist_slot(config, align)?;
     let size = usize::try_from(slot).map_err(|_| LogError::Config("a persist slot"))?;
     let mut records = Vec::with_capacity(2);
@@ -707,7 +739,13 @@ fn restores<F: BlockFile>(
     let empty = state::Group::default();
     let mut out = Vec::new();
     for p in record.groups {
-        if damaged.contains(&p.group) {
+        if damaged.contains(&p.group) || (fenced.contains_key(&p.group) && !p.removed) {
+            continue;
+        }
+        // A fence the frame wrote is kept whether or not the frame was confirmed: marking a
+        // group damaged is always safe, and the frame it fenced may be gone.
+        if p.damaged {
+            damaged.push(p.group);
             continue;
         }
         let g = groups.get(&p.group).unwrap_or(&empty);
@@ -730,6 +768,7 @@ fn restores<F: BlockFile>(
                         ..crate::Update::default()
                     },
                     uncertain: None,
+                    damaged: false,
                 });
             }
             continue;
@@ -746,6 +785,7 @@ fn restores<F: BlockFile>(
                     ..crate::Update::default()
                 },
                 uncertain: None,
+                damaged: false,
             });
             continue;
         }
@@ -802,6 +842,7 @@ fn restores<F: BlockFile>(
             group: p.group,
             update,
             uncertain,
+            damaged: false,
         });
     }
     Ok(out)
@@ -880,6 +921,12 @@ fn replay(
             }
             Owned::Uncertain { at, group, mark } => {
                 groups.entry(group).or_default().uncertain = Some((mark, place(at)?));
+            }
+            Owned::Damaged { at, group } => {
+                *groups.entry(group).or_default() = Replayed {
+                    damaged: Some(place(at)?),
+                    ..Replayed::default()
+                };
             }
         }
     }

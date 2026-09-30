@@ -219,15 +219,15 @@ before every voter knew its configuration. The simulation catches two broken var
 within the first seeds: gets served from any member's rows without ReadIndex fail
 linearizability, and a replica that applies a repeated command again stores a put twice.
 
-A run is exactly its seed. Each member's log runs under `Waits::Asked` (raft-log.md §3): its
-writer waits on no clock, each member has one update out at a time and the simulation waits
-for it before the step ends, so every frame holds what the seed put in it, and the idle
-confirmation a node's writer makes on its own the simulation asks for at seeded steps. A
-test runs two seeds twice each and compares every count and every operation the gateways
-saw, with its steps; over 300 seeds two runs gave the same counts. Before, the writer's
-clock decided whether a confirmation was written before a crash, which moved the simulated
-device's seeded faults, and `begin` looked at an update just submitted, whose flush the
-writer might have finished: counts differed between runs of a seed by under 1%.
+A run is exactly its seed. Each member has one update out at a time and the simulation waits
+for it before the step ends, so every frame holds what the seed put in it, and each frame is
+confirmed before its update is answered (raft-log.md §6), so no write the device sees hangs
+on the writer's timing; the logs run under `Waits::Never`, since no submitter returns within
+a wait. A test runs two seeds twice each and compares every count and every operation the
+gateways saw, with its steps; over 300 seeds two runs gave the same counts. Before, the
+writer's clock decided whether an idle confirmation was written before a crash, which moved
+the simulated device's seeded faults, and `begin` looked at an update just submitted, whose
+flush the writer might have finished: counts differed between runs of a seed by under 1%.
 
 ## 6. Replacing a member
 

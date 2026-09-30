@@ -32,6 +32,7 @@ const START: u8 = 4;
 const PROPOSAL: u8 = 5;
 const REMOVED: u8 = 6;
 const UNCERTAIN: u8 = 7;
+const DAMAGED: u8 = 8;
 
 /// Bytes of a persist record before its groups: magic, format, padding, the log's ID, the
 /// frame's sequence, the last sequence known flushed, and the count of groups.
@@ -233,6 +234,12 @@ pub enum Record<'a> {
         group: u128,
         mark: Start,
     },
+    /// The group's acknowledged records are damaged: until its removal the log serves it to
+    /// no one, and its replica is rebuilt from its peers (§6). Whatever the group held before
+    /// is gone.
+    Damaged {
+        group: u128,
+    },
 }
 
 /// Where each piece of a record went in the payload: its entries' or proposal's encoded
@@ -334,6 +341,11 @@ pub fn put(payload: &mut Writer, record: &Record<'_>) -> Option<Placed> {
             payload.u64(mark.term);
             Some(Placed::Record(at))
         }
+        Record::Damaged { group } => {
+            payload.u8(DAMAGED);
+            payload.u128(group);
+            Some(Placed::Record(at))
+        }
     }
 }
 
@@ -348,7 +360,7 @@ pub fn encoded_len(record: &Record<'_>) -> Option<usize> {
         Record::HardState { .. } => 24,
         Record::Start { .. } | Record::Uncertain { .. } => 16,
         Record::Proposal { bytes, .. } => 24usize.checked_add(bytes.len())?,
-        Record::Removed { .. } => 0,
+        Record::Removed { .. } | Record::Damaged { .. } => 0,
     };
     body.checked_add(17)
 }
@@ -397,6 +409,10 @@ pub enum Owned {
         at: usize,
         group: u128,
         mark: Start,
+    },
+    Damaged {
+        at: usize,
+        group: u128,
     },
 }
 
@@ -494,6 +510,7 @@ pub fn records(payload: &[u8], count: u32) -> Option<Vec<Owned>> {
                     term: r.u64()?,
                 },
             },
+            DAMAGED => Owned::Damaged { at, group },
             _ => return None,
         };
         out.push(record);
@@ -541,6 +558,8 @@ pub struct Persisted {
     pub removed: bool,
     /// The frame held proposals, which a persist record does not restore.
     pub proposals: bool,
+    /// The frame marked the group damaged.
+    pub damaged: bool,
 }
 
 /// The persist record of the frame of `sequence`, or, with no groups, a confirmation that the
@@ -561,6 +580,7 @@ const HAS_ENTRIES: u8 = 4;
 const HAS_UNCERTAIN: u8 = 8;
 const IS_REMOVED: u8 = 16;
 const HAS_PROPOSALS: u8 = 32;
+const IS_DAMAGED: u8 = 64;
 
 fn when<T>(set: bool, value: T) -> Option<T> {
     if set { Some(value) } else { None }
@@ -593,6 +613,7 @@ impl Persist {
                 (g.uncertain.is_some(), HAS_UNCERTAIN),
                 (g.removed, IS_REMOVED),
                 (g.proposals, HAS_PROPOSALS),
+                (g.damaged, IS_DAMAGED),
             ] {
                 if set {
                     flags |= flag;
@@ -669,6 +690,7 @@ impl Persist {
                 uncertain: when(has(HAS_UNCERTAIN), uncertain),
                 removed: has(IS_REMOVED),
                 proposals: has(HAS_PROPOSALS),
+                damaged: has(IS_DAMAGED),
             });
         }
         Some(Self {
@@ -737,6 +759,7 @@ mod tests {
                     uncertain: None,
                     removed: false,
                     proposals: false,
+                    damaged: true,
                 },
                 Persisted {
                     group: 4,
@@ -760,7 +783,7 @@ mod tests {
 
     fn record() -> impl Strategy<Value = (u8, u128, u64, Vec<(u64, Vec<u8>)>)> {
         (
-            0u8..7,
+            0u8..8,
             any::<u128>(),
             0u64..u64::MAX / 2,
             prop::collection::vec(
@@ -790,6 +813,7 @@ mod tests {
                     3 => Record::Start { group, start: Start { index: first, term: 4 } },
                     4 => Record::Proposal { group, index: first, term: 5, bytes },
                     5 => Record::Uncertain { group, mark: Start { index: first, term: 6 } },
+                    6 => Record::Damaged { group },
                     _ => Record::Removed { group },
                 };
                 let before = payload.len();

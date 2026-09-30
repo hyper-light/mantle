@@ -64,8 +64,8 @@ fn log_config() -> LogConfig {
         group_cache: 1 << 12,
         queue_submissions: 16,
         queue_bytes: 1 << 20,
-        // The simulation confirms flushes itself, so the device sees only writes a seed chose.
-        waits: Waits::Asked,
+        // Each member has one update out at a time, so none returns within a wait.
+        waits: Waits::Never,
     }
 }
 
@@ -139,9 +139,6 @@ struct Node {
     file: Arc<SimFile>,
     /// `None` while the node is down; its engine is kept as the crash left it.
     replica: Option<Member>,
-    /// The replica's log, which the simulation asks to confirm its last flush when a node's
-    /// writer, left idle, would (raft-log.md §6); `None` while the node is down.
-    log: Option<Arc<Log<Arc<SimFile>>>>,
     engine: Option<Model>,
     /// Restarts so far, which seed its next core.
     lives: u64,
@@ -164,20 +161,12 @@ impl Node {
             .unwrap(),
         );
         let log = Arc::new(Log::create(Arc::clone(&file), log_config(), log_id(id)).unwrap());
-        let replica = Replica::open(
-            id,
-            GROUP,
-            Arc::clone(&log),
-            first_range(),
-            &range(members),
-            seed ^ id,
-        )
-        .unwrap();
+        let replica =
+            Replica::open(id, GROUP, log, first_range(), &range(members), seed ^ id).unwrap();
         Self {
             id,
             file,
             replica: Some(replica),
-            log: Some(log),
             engine: None,
             lives: 0,
             members,
@@ -190,8 +179,6 @@ impl Node {
             return;
         };
         let mut engine = replica.into_engine();
-        // The log's writer stops with its last handle, before the device loses power.
-        self.log = None;
         engine.crash();
         self.engine = Some(engine);
         self.file.crash(Crash::Random).unwrap();
@@ -206,12 +193,10 @@ impl Node {
         let (log, recovery) =
             Log::open(Arc::clone(&self.file), log_config(), log_id(self.id)).unwrap();
         assert!(recovery.damaged.is_empty(), "{recovery:?}");
-        let log = Arc::new(log);
-        self.log = Some(Arc::clone(&log));
         let replica = Replica::open(
             self.id,
             GROUP,
-            log,
+            Arc::new(log),
             engine,
             &range(self.members),
             seed ^ self.id ^ (self.lives << 40),
@@ -307,8 +292,6 @@ struct World {
     /// Steps at which two members were down at once, and messages sent twice.
     two_down: u64,
     duplicated: u64,
-    /// Flushes confirmed at the simulation's asking.
-    confirmed: u64,
 }
 
 /// What a run exercised, and what its gateways saw at which steps.
@@ -319,7 +302,6 @@ struct Ran {
     flushing: u64,
     two_down: u64,
     duplicated: u64,
-    confirmed: u64,
     steps: u64,
     history: Vec<String>,
 }
@@ -365,7 +347,6 @@ impl World {
             flushing: 0,
             two_down: 0,
             duplicated: 0,
-            confirmed: 0,
         }
     }
 
@@ -546,18 +527,6 @@ impl World {
         let mut stopped = None;
         let mut waiting = Vec::new();
         for n in &mut self.nodes {
-            // A writer left idle confirms its last frame's flush on its own (raft-log.md §6);
-            // here the seed says when, so the device sees the same writes in every run.
-            if let Some(log) = n.log.as_ref().filter(|_| self.rng.chance(250)) {
-                if log.confirm().is_err() {
-                    n.crash();
-                    if !self.faults {
-                        n.restart(self.seed);
-                    }
-                    continue;
-                }
-                self.confirmed += 1;
-            }
             let Some(r) = n.replica.as_mut() else {
                 continue;
             };
@@ -1079,7 +1048,6 @@ fn run(seed: u64, members: u64) -> Ran {
         flushing: w.flushing,
         two_down: w.two_down,
         duplicated: w.duplicated,
-        confirmed: w.confirmed,
         steps: w.step,
         history: w
             .history
@@ -1100,7 +1068,6 @@ fn a_group_under_faults_is_linearizable_and_applies_every_put_once() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
     let (mut replaced, mut stalls, mut flushing, mut two_down, mut duplicated) = (0, 0, 0, 0, 0);
-    let mut confirmed = 0;
     for seed in first..first + seeds {
         // Odd seeds run a group of three, even ones of five.
         let members = if seed % 2 == 0 { 5 } else { 3 };
@@ -1113,7 +1080,6 @@ fn a_group_under_faults_is_linearizable_and_applies_every_put_once() {
         flushing += ran.flushing;
         two_down += ran.two_down;
         duplicated += ran.duplicated;
-        confirmed += ran.confirmed;
     }
     // Readies waited for room and the members went on: the path audit S04 found stranded.
     assert!(stalls > 0, "no ready ever waited for room");
@@ -1124,14 +1090,10 @@ fn a_group_under_faults_is_linearizable_and_applies_every_put_once() {
         two_down > 0 && duplicated > 0,
         "{two_down} steps two down, {duplicated} duplicated"
     );
-    assert!(
-        confirmed > 0,
-        "no flush was confirmed at the simulation's asking"
-    );
     eprintln!(
         "{seeds} runs replaced {replaced} members lost for good; {stalls} readies waited for \
          room; {flushing} were left flushing across a step; two of five were down at {two_down} \
-         steps; {duplicated} messages were sent twice; {confirmed} flushes were confirmed"
+         steps; {duplicated} messages were sent twice"
     );
 }
 

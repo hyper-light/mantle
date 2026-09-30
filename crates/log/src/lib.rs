@@ -3,7 +3,8 @@
 //!
 //! A replica submits its `Ready`'s entries, hard state, start and proposals as one [`Update`];
 //! the writer thread gathers every update that arrived while the last flush ran into one
-//! frame, writes and flushes it, and only then publishes it to readers and answers. Reads
+//! frame, writes and flushes it, publishes it to readers, and answers once a later durable
+//! record confirms the flush. Reads
 //! serve the view focal-raft's `Storage` needs: bounds, terms and entries.
 #![cfg_attr(
     test,
@@ -64,15 +65,13 @@ pub struct Config {
 /// What the writer waits for between frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Waits {
-    /// Waits on the clock: for the submitters the last batch answered while waiting is
-    /// expected to lower total latency, and, once idle for one flush's measured time, confirms
-    /// the last frame's flush (docs/design/raft-log.md §3, §6). What a node runs.
+    /// Waits for the submitters the last batch answered while waiting is expected to lower
+    /// total latency (docs/design/raft-log.md §3). What a node runs.
     Measured,
-    /// Never waits on the clock: a batch is what is queued when the writer looks, and the
-    /// last frame's flush is confirmed only when [`Log::confirm`] asks or the log closes, so
-    /// a caller that steps the log, as the replica simulation does, decides every write the
-    /// device sees.
-    Asked,
+    /// Never waits: a batch is what is queued when the writer looks. For a caller whose
+    /// submitters never return within a wait, as the replica simulation's, which drives each
+    /// member's submissions one at a time.
+    Never,
 }
 
 /// Entries to write from `first` on, replacing any the group holds at or after it.
@@ -159,19 +158,20 @@ impl Pending {
     }
 }
 
-/// What the writer is sent.
-enum Work {
-    Update(Submission),
-    /// A request to confirm the last frame's flush, answered once the confirmation is durable.
-    Confirm(SyncSender<Result<(), LogError>>),
+/// What only the restore at open writes with an update (docs/design/raft-log.md §6).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Marks {
+    /// The group's log may lack entries through this mark.
+    uncertain: Option<Start>,
+    /// The group's acknowledged records are damaged: the update is otherwise empty.
+    damaged: bool,
 }
 
 /// An update on its way to the writer.
 struct Submission {
     group: u128,
     update: Update,
-    /// An uncertainty mark written with the update: only by the restore at open.
-    uncertain: Option<Start>,
+    marks: Marks,
     bytes: u64,
     reply: SyncSender<Result<(), LogError>>,
 }
@@ -201,8 +201,9 @@ struct Segments {
 
 struct State {
     groups: HashMap<u128, Group>,
-    /// Groups recovery found damaged: served to no one (`Recovery::damaged`).
-    damaged: std::collections::HashSet<u128>,
+    /// Groups found damaged, served to no one until removed (`Recovery::damaged`), each with
+    /// where its `Damaged` record is: `None` only while open writes it.
+    damaged: HashMap<u128, Option<Place>>,
     live: Live,
     segments: Segments,
     head: Head,
@@ -294,11 +295,8 @@ impl<F: BlockFile> Shared<F> {
 
 pub struct Log<F: BlockFile + 'static> {
     shared: Arc<Shared<F>>,
-    sender: Option<SyncSender<Work>>,
+    sender: Option<SyncSender<Submission>>,
     writer: Option<JoinHandle<()>>,
-    /// Held by the one caller of [`Log::confirm`] whose request is in the channel, which has
-    /// room for it beside the queue's submissions.
-    confirming: Mutex<()>,
 }
 
 impl<F: BlockFile + 'static> Log<F> {
@@ -316,7 +314,11 @@ impl<F: BlockFile + 'static> Log<F> {
         let log = Self::start(file, config, id, state)?;
         let mut pending = Vec::with_capacity(restores.len());
         for r in restores {
-            pending.push(log.send(r.group, r.update, r.uncertain, true)?);
+            let marks = Marks {
+                uncertain: r.uncertain,
+                damaged: r.damaged,
+            };
+            pending.push(log.send(r.group, r.update, marks, true)?);
         }
         for p in pending {
             p.wait()?;
@@ -342,8 +344,7 @@ impl<F: BlockFile + 'static> Log<F> {
             frames: AtomicU64::new(0),
             updates: AtomicU64::new(0),
         });
-        // Room for every submission the queue admits and one confirmation request.
-        let capacity = config.queue_submissions.max(1).saturating_add(1);
+        let capacity = config.queue_submissions.max(1);
         let (sender, receiver) = sync_channel(capacity);
         let writer = writer::Writer::new(Arc::clone(&shared), receiver)?;
         let handle = std::thread::Builder::new()
@@ -354,14 +355,14 @@ impl<F: BlockFile + 'static> Log<F> {
             shared,
             sender: Some(sender),
             writer: Some(handle),
-            confirming: Mutex::new(()),
         })
     }
 
     /// Submits `update` for `group`: refused at once when the queue is full, otherwise
-    /// answered through the returned handle once it is durable.
+    /// answered through the returned handle once it is durable and a later record confirms
+    /// so.
     pub fn submit(&self, group: u128, update: Update) -> Result<Pending, LogError> {
-        self.send(group, update, None, false)
+        self.send(group, update, Marks::default(), false)
     }
 
     /// Submits `update` for `group`, waiting for room in the queue rather than refusing. A
@@ -369,14 +370,14 @@ impl<F: BlockFile + 'static> Log<F> {
     /// (docs/design/replica.md §3). The writer frees room with every batch it takes, and a
     /// fence wakes every waiter, so the wait lasts no longer than the writer's progress.
     pub fn submit_waiting(&self, group: u128, update: Update) -> Result<Pending, LogError> {
-        self.send(group, update, None, true)
+        self.send(group, update, Marks::default(), true)
     }
 
     fn send(
         &self,
         group: u128,
         update: Update,
-        uncertain: Option<Start>,
+        marks: Marks,
         wait: bool,
     ) -> Result<Pending, LogError> {
         let bytes = update_bytes(&update);
@@ -412,11 +413,11 @@ impl<F: BlockFile + 'static> Log<F> {
         let submission = Submission {
             group,
             update,
-            uncertain,
+            marks,
             bytes,
             reply,
         };
-        match sender.try_send(Work::Update(submission)) {
+        match sender.try_send(submission) {
             Ok(()) => Ok(Pending { answer }),
             Err(e) => {
                 self.shared.release(group, bytes);
@@ -426,20 +427,6 @@ impl<F: BlockFile + 'static> Log<F> {
                 })
             }
         }
-    }
-
-    /// Confirms the last frame's flush on the device, as the writer does by itself once idle
-    /// under [`Waits::Measured`], and returns once the confirmation is durable. Frames queued
-    /// before the request are written first; with nothing written since the last
-    /// confirmation, it writes nothing.
-    pub fn confirm(&self) -> Result<(), LogError> {
-        let _one = self.confirming.lock().map_err(|_| LogError::Fenced)?;
-        let sender = self.sender.as_ref().ok_or(LogError::Closed)?;
-        let (reply, answer) = sync_channel(1);
-        sender
-            .try_send(Work::Confirm(reply))
-            .map_err(|_| LogError::Busy)?;
-        answer.recv().map_err(|_| LogError::Closed)?
     }
 
     /// The parameters the log runs with.
@@ -587,7 +574,7 @@ impl<F: BlockFile + 'static> Log<F> {
     /// A group's durable state; `None` for a group the log holds nothing of.
     pub fn view(&self, group: u128) -> Result<Option<View>, LogError> {
         let state = self.shared.read_state()?;
-        if state.damaged.contains(&group) {
+        if state.damaged.contains_key(&group) {
             return Err(LogError::Damaged(
                 "the group's acknowledged records are damaged; it recovers from its peers",
             ));

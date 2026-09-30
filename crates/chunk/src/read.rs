@@ -59,9 +59,13 @@ impl Turns {
 
 /// Holds client reads at `Reads::depth` at the device and their buffers at `Reads::bytes`,
 /// lets `Reads::waiting` more wait in the order they arrived, and refuses the rest with
-/// `Busy`. A read is let through before its buffers are taken, so what the reads hold is
-/// bounded by the gate, not by how many arrive (audit S07). A wait lasts while the reads ahead
-/// take, each bounded by the operating system's I/O timeout.
+/// `Busy`. A read is let through before it takes anything, so what reads hold is bounded by
+/// the reads let through, not by how many arrive (audit S07): their device buffers by
+/// `Reads::bytes`, or one read's when it goes alone, and their outputs, the bytes each caller
+/// asked for, by at most `Reads::depth` of them at once. The outputs are not counted against
+/// `Reads::bytes`, which is the device's measure of bytes in flight rather than a budget of
+/// memory; what a node lets its callers ask for is its own admission. A wait lasts while the
+/// reads ahead take, each bounded by the operating system's I/O timeout.
 #[derive(Debug)]
 pub(crate) struct Gate {
     reads: Reads,

@@ -148,7 +148,84 @@ pub fn meta(out: &mut impl Write, step: Duration) -> Result<(), Error> {
             &times,
         )?;
     }
+    // The block sweep's pages at the largest file a PUT makes, 646 blocks (audit B08): one
+    // block of each of a page's files, and one file's blocks over pages (audit P05).
+    let times = timed(step, || check_files(512, LARGEST_FILE, 1))?;
+    row(
+        out,
+        format!("check 1 block of each of 512 {LARGEST_FILE}-block files"),
+        &times,
+    )?;
+    let times = timed(step, || check_files(1, LARGEST_FILE, 64))?;
+    row(
+        out,
+        format!("check a {LARGEST_FILE}-block file 64 blocks a page"),
+        &times,
+    )?;
     Ok(())
+}
+
+/// The most blocks one PUT's file names: 5 GiB in the smallest blocks any layout makes
+/// (`mantle_gateway::layout`, `the_largest_upload_fits_a_file_under_every_layout`).
+const LARGEST_FILE: usize = 646;
+
+/// The sweep's checks of `files` files of `blocks` blocks each, `page` blocks of a file to a
+/// check, over every block of every file: the time of the checks alone.
+fn check_files(files: usize, blocks: usize, page: usize) -> Result<Duration, Error> {
+    let mut m = Model::default();
+    let per = u128::try_from(blocks).map_err(|_| Error::Unexpected("blocks".into()))?;
+    let mut index = 1u64;
+    for f in 1..=u128::try_from(files).map_err(|_| Error::Unexpected("files".into()))? {
+        let first = f.saturating_mul(per);
+        let write = file::Command::Write {
+            file: f,
+            extents: (first..first.saturating_add(per))
+                .map(|block| Extent {
+                    length: 1 << 20,
+                    target: Target::Block(block),
+                })
+                .collect(),
+            referrer: Referrer {
+                bucket: BUCKET.into(),
+                incarnation: 1,
+                key: format!("k{f}"),
+            },
+            key: None,
+            handover_ns: 100,
+            blocks_deadline_ns: u64::MAX,
+            at_ns: 10,
+        };
+        file::apply(&mut m, index, &write)?;
+        index = index.saturating_add(1);
+    }
+    // Each file's blocks from its end, where a scan of its extents finds them last, a page
+    // to a check, as the sweep groups a page's blocks by file; one page per file when
+    // `page` is 1, as the blocks of a page from distinct files come.
+    let mut checks = Vec::new();
+    for f in 1..=u128::try_from(files).map_err(|_| Error::Unexpected("files".into()))? {
+        let first = f.saturating_mul(per);
+        let all: Vec<(u128, u64)> = (first..first.saturating_add(per))
+            .rev()
+            .map(|b| (b, u64::MAX))
+            .collect();
+        let take = if files == 1 { all.len() } else { 1 };
+        for chunk in all.get(..take).unwrap_or_default().chunks(page) {
+            checks.push(file::Command::CheckBlocks {
+                file: f,
+                blocks: chunk.to_vec(),
+                at_ns: 20,
+            });
+        }
+    }
+    let started = Instant::now();
+    for check in &checks {
+        match file::apply(&mut m, index, check)? {
+            file::Outcome::BlocksChecked(_) => {}
+            other => return Err(Error::Unexpected(format!("{other:?}"))),
+        }
+        index = index.saturating_add(1);
+    }
+    Ok(started.elapsed())
 }
 
 /// A Name range holding every key, its gate for the bucket open.

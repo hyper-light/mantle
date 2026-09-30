@@ -4,7 +4,7 @@
 use mantle_codec::{Reader, Writer};
 
 /// Values written by this code.
-const FORMAT: u8 = 5;
+const FORMAT: u8 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RecordError {

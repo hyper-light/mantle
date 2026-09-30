@@ -286,12 +286,14 @@ layers removes them, as Tectonic's does [01 §1.6].
       writer renews its lease (22 §3.6). The block sweep (`BlockSweep`) asks the File range of
       each block's file, one file at a time, which answers from the file itself: a file is
       written once, whole, so one written names what it ever will, and one not written by a
-      block's deadline never will. Answering reads the file's extents once, whatever the page
-      asks: 1.7 ms for a file of the most extents, 10,000, as long as writing it took. No file
-      names more than 646 blocks, what the smallest blocks of the largest PUT body make (audit
-      B08), so a page of that many due blocks asks about a file at most twice; an index of
-      each file's blocks would save those reads for a row a block written with the file, and
-      is not kept (audit P05; [measurements](../measurements/2026-09-29-metadata-apply.md)).
+      block's deadline never will. A file keeps a row for each block it names, written with
+      it and removed with it, and answering reads that row for each block asked. Answering by
+      a scan of the file's extents cost a page of blocks from distinct files one scan each:
+      60.8 ms for one block of each of 512 files of 646 blocks, the most a PUT's file names
+      (audit B08), against 393 µs by the rows, and one such file over pages of 64, 983 µs
+      against 51 µs. The rows double a file write's, 1.70 ms to 2.95 ms for 10,000 extents,
+      paid once where checks come for every page of due blocks (audit P05;
+      [measurements](../measurements/2026-09-30-review-fixes.md)).
       Nothing is marked. A block named is settled. One never to
       be named is released in the Block range only if its deadline is still the one the File
       range judged, and a released block renews no more, so a renewal and a release are

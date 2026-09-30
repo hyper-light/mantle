@@ -61,4 +61,19 @@ takes: nothing else says a file was taken, and the mark is what outlives the ver
 session. Its cost falls on the model engine here; on a device the mark shares the engine's
 batch with the version's rows.
 
+**4. The block sweep's checks by a row per block named: 155 times faster across files.**
+`mantle bench meta`, this tree before and after the change, two runs after; files of 646 blocks,
+the most a PUT's file names (audit B08):
+
+| Check | By scanning the file's extents | By the file's row per block |
+|---|---|---|
+| One block of each of 512 files | 60.8 ms | 385–393 µs |
+| One file's 646 blocks, 64 a page | 983 µs | 51.2 µs |
+| 512 blocks of a 10,000-extent file | 1.74 ms | 50.2 µs |
+| Writing a file of 10,000 extents | 1.70 ms | 2.95–3.01 ms |
+
+A scan read every extent of the file for each check, and the sweep checks each file of a page
+apart, so a page of blocks from distinct files cost one scan a block. The rows double a file
+write's, once, where checks come for every page of due blocks (audit P05). Row format 6.
+
 Rates on an idle machine remain to be recorded; these comparisons stand without them.

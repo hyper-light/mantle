@@ -7,8 +7,6 @@
 //! file names blocks made for it alone, which it must name by theirs, and the sweep of the
 //! Block ranges asks here whether it did (docs/design/metadata.md §2).
 
-use std::collections::BTreeSet;
-
 use crate::clock;
 use crate::engine::{Rows, Write};
 use crate::error::MetaError;
@@ -136,7 +134,7 @@ fn write<E: Rows>(
     if extents.is_empty() || extents.len() > MAX_EXTENTS {
         return invalid;
     }
-    let mut writes = Vec::with_capacity(extents.len().saturating_add(3));
+    let mut writes = Vec::with_capacity(extents.len().saturating_mul(2).saturating_add(3));
     let mut end = 0u64;
     for extent in extents {
         match end.checked_add(extent.length) {
@@ -144,6 +142,10 @@ fn write<E: Rows>(
             _ => return invalid,
         }
         writes.push(Write::Put(key::file_extent(file, end), extent.encode()));
+        // The block sweep asks whether the file names a block (`check_blocks`).
+        if let Target::Block(block) = extent.target {
+            writes.push(Write::Put(key::file_named(file, block), Vec::new()));
+        }
     }
     let Ok(count) = u32::try_from(extents.len()) else {
         return invalid;
@@ -198,7 +200,8 @@ fn remove<E: Rows>(engine: &E, file: u128) -> Result<Vec<Write>, MetaError> {
     }
     let (mut from, to) = key::id_rows(file);
     while let Some((k, _)) = engine.next(&from, &to)? {
-        if writes.len() > MAX_EXTENTS.saturating_add(1) {
+        // A header, an extent and a named block's row for each extent, and the unsettled row.
+        if writes.len() > MAX_EXTENTS.saturating_mul(2).saturating_add(2) {
             return Err(MetaError::Corrupt);
         }
         from.clone_from(&k);
@@ -231,30 +234,21 @@ fn check_blocks<E: Rows>(
     at_ns: u64,
 ) -> Result<(Outcome, Vec<Write>), MetaError> {
     let written = header(engine, file)?.is_some();
-    let named: BTreeSet<u128> = if written {
-        extents(engine, file, 0, MAX_EXTENTS)?
-            .into_iter()
-            .filter_map(|(_, e)| match e.target {
-                Target::Block(block) => Some(block),
-                Target::File(_) => None,
-            })
-            .collect()
-    } else {
-        BTreeSet::new()
-    };
     let (now, clock) = clock::tick(engine, at_ns)?;
-    let verdicts = blocks
-        .iter()
-        .map(|&(block, deadline_ns)| {
-            if named.contains(&block) {
-                Verdict::Held
-            } else if written || now > deadline_ns {
-                Verdict::Released
-            } else {
-                Verdict::Young
-            }
-        })
-        .collect();
+    // Each block is one read of the file's row for it: a scan of the file's extents for every
+    // check cost a page of blocks from distinct files one scan each, 60.8 ms for 512 blocks
+    // of files of 646 (docs/measurements/2026-09-30-review-fixes.md).
+    let mut verdicts = Vec::with_capacity(blocks.len());
+    for &(block, deadline_ns) in blocks {
+        let verdict = if written && engine.get(&key::file_named(file, block))?.is_some() {
+            Verdict::Held
+        } else if written || now > deadline_ns {
+            Verdict::Released
+        } else {
+            Verdict::Young
+        };
+        verdicts.push(verdict);
+    }
     Ok((Outcome::BlocksChecked(verdicts), vec![clock]))
 }
 
@@ -279,7 +273,7 @@ pub fn extents<E: Rows>(
         return Ok(Vec::new());
     };
     let mut from = key::file_extent(file, past);
-    let (_, to) = key::id_rows(file);
+    let to = key::file_extents_end(file);
     let mut out = Vec::new();
     while out.len() < max {
         let Some((k, v)) = engine.next(&from, &to)? else {

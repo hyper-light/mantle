@@ -382,6 +382,8 @@ pub fn decode_name(k: &[u8]) -> Option<(String, String, NameRow)> {
 /// File-layer rows under a file's ID.
 const HEADER: u8 = 1;
 const EXTENT: u8 = 2;
+/// A file's row for each block it names, so a block's membership is one read (audit P05).
+const NAMED: u8 = 4;
 /// Block-layer rows under a block's ID, after its header.
 const CHUNK: u8 = 2;
 const ORIGIN: u8 = 3;
@@ -396,6 +398,19 @@ pub fn file_header(file: u128) -> Vec<u8> {
 pub fn file_extent(file: u128, end: u64) -> Vec<u8> {
     let mut out = id_row(file, EXTENT);
     out.extend_from_slice(&end.to_be_bytes());
+    out
+}
+
+/// The key just past a file's last extent row: extents are read up to it, not past it into the
+/// file's other rows.
+pub fn file_extents_end(file: u128) -> Vec<u8> {
+    id_row(file, EXTENT.saturating_add(1))
+}
+
+/// The key of the row saying file `file` names block `block`.
+pub fn file_named(file: u128, block: u128) -> Vec<u8> {
+    let mut out = id_row(file, NAMED);
+    out.extend_from_slice(&block.to_be_bytes());
     out
 }
 

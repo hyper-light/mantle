@@ -154,7 +154,7 @@ impl Cell {
     fn serve_get(&mut self, request: get::Request) -> get::Answer {
         let kind = match &request {
             get::Request::Header { .. } => "header",
-            get::Request::Extent { .. } => "extent",
+            get::Request::Extents { .. } => "extent",
             get::Request::Block { .. } => "block",
             get::Request::Chunk { .. } => "chunk",
         };
@@ -163,12 +163,9 @@ impl Cell {
             get::Request::Header { file } => {
                 get::Answer::Header(file::header(&self.files, file).unwrap())
             }
-            get::Request::Extent { file, offset } => get::Answer::Extent(
-                file::extents(&self.files, file, offset, 1)
-                    .unwrap()
-                    .into_iter()
-                    .next(),
-            ),
+            get::Request::Extents { file, offset, max } => {
+                get::Answer::Extents(file::extents(&self.files, file, offset, max).unwrap())
+            }
             get::Request::Block { block } => {
                 get::Answer::Block(block::read(&self.blocks, block).unwrap())
             }
@@ -334,8 +331,21 @@ fn read(
     wrapping: &WrappingKey,
     lifo: bool,
 ) -> Result<Vec<u8>, GetError> {
+    read_in(cell, file, size, range, wrapping, lifo, 2)
+}
+
+/// Reads as `read` does, holding at most `window` blocks.
+fn read_in(
+    cell: &mut Cell,
+    file: Option<u128>,
+    size: u64,
+    range: Range<u64>,
+    wrapping: &WrappingKey,
+    lifo: bool,
+    window: usize,
+) -> Result<Vec<u8>, GetError> {
     let root = Root(WrappingKey::new(wrapping.bytes()));
-    let mut get = Get::new(file, size, range, Box::new(root))?;
+    let mut get = Get::new(file, size, range, Box::new(root), window)?;
     let mut out = Vec::new();
     let mut pending = VecDeque::new();
     loop {
@@ -1301,7 +1311,7 @@ fn a_get_holds_two_blocks_at_most() {
     let bytes = body(len, 19);
     let (mut cell, wrapping) = stored(Scheme::Copies(1), &bytes, 110, 2);
     let root = Root(WrappingKey::new(wrapping.bytes()));
-    let mut get = Get::new(Some(110), len as u64, 0..len as u64, Box::new(root)).unwrap();
+    let mut get = Get::new(Some(110), len as u64, 0..len as u64, Box::new(root), 2).unwrap();
     let mut blocks = 0;
     let serve = |get: &mut Get, cell: &mut Cell| {
         let mut asked = false;
@@ -1337,13 +1347,15 @@ proptest! {
         b in any::<prop::sample::Index>(),
         lifo in any::<bool>(),
         seed in any::<u8>(),
+        window in 1usize..=4,
     ) {
         let bytes = body(len, seed);
         let (mut cell, wrapping) = stored(scheme, &bytes, 120, 6);
         let (x, y) = (a.index(len + 1), b.index(len + 1));
         let range = x.min(y) as u64..x.max(y) as u64;
         let file = if len > 0 { Some(120) } else { None };
-        let got = read(&mut cell, file, len as u64, range.clone(), &wrapping, lifo).unwrap();
+        let got =
+            read_in(&mut cell, file, len as u64, range.clone(), &wrapping, lifo, window).unwrap();
         prop_assert!(got == bytes[range.start as usize..range.end as usize]);
     }
 }
@@ -1699,6 +1711,60 @@ fn blocks_go_down_together_as_the_window_admits() {
             cell.read_file(130, len as u64, &wrapping) == bytes,
             "window {window}"
         );
+        rounds.push(n);
+    }
+    assert!(rounds[0] > rounds[1] && rounds[1] > rounds[2], "{rounds:?}");
+}
+
+/// A GET holds as many blocks as its window: with the caller taking nothing, it reads that
+/// many and no more; and a wider window reads an object of four blocks in fewer round trips,
+/// its blocks read out of order given out in order (audit §16.3).
+#[test]
+fn a_get_reads_as_many_blocks_at_once_as_its_window() {
+    let len = 4 * 127 * seal::SEGMENT;
+    let bytes = body(len, 31);
+    let (mut cell, wrapping) = stored(Scheme::Copies(1), &bytes, 140, 2);
+    let mut rounds = Vec::new();
+    for window in [1usize, 2, 4] {
+        let root = Root(WrappingKey::new(wrapping.bytes()));
+        let mut get =
+            Get::new(Some(140), len as u64, 0..len as u64, Box::new(root), window).unwrap();
+        cell.gets.clear();
+        let (mut n, mut out) = (0u64, Vec::new());
+        let mut first = true;
+        loop {
+            let mut asked = Vec::new();
+            while let Some(r) = get.poll() {
+                asked.push(r);
+            }
+            if asked.is_empty() {
+                if first {
+                    // Nothing taken yet: as many blocks read as the window holds.
+                    assert_eq!(cell.gets["block"], window.min(4), "window {window}");
+                    first = false;
+                }
+                match get.take() {
+                    Some(b) => out.extend_from_slice(&b),
+                    None => break,
+                }
+                continue;
+            }
+            n += 1;
+            // Chunk reads answered latest block first: blocks finish out of order.
+            asked.sort_by_key(|(_, r)| match r {
+                get::Request::Chunk { key, .. } => std::cmp::Reverse(key.block),
+                _ => std::cmp::Reverse(0),
+            });
+            for (id, request) in asked {
+                let answer = cell.serve_get(request);
+                get.answer(id, answer).unwrap();
+            }
+        }
+        while let Some(b) = get.take() {
+            out.extend_from_slice(&b);
+        }
+        assert_eq!(get.outcome(), Some(&Ok(())));
+        assert!(out == bytes, "window {window}");
         rounds.push(n);
     }
     assert!(rounds[0] > rounds[1] && rounds[1] > rounds[2], "{rounds:?}");

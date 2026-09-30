@@ -207,11 +207,9 @@ impl Cell {
     fn serve_get(&mut self, request: get::Request) -> Result<get::Answer, Error> {
         Ok(match request {
             get::Request::Header { file } => get::Answer::Header(file::header(&self.files, file)?),
-            get::Request::Extent { file, offset } => get::Answer::Extent(
-                file::extents(&self.files, file, offset, 1)?
-                    .into_iter()
-                    .next(),
-            ),
+            get::Request::Extents { file, offset, max } => {
+                get::Answer::Extents(file::extents(&self.files, file, offset, max)?)
+            }
             get::Request::Block { block } => get::Answer::Block(block::read(&self.blocks, block)?),
             get::Request::Chunk {
                 volume,
@@ -371,9 +369,10 @@ fn get(
     file: u128,
     size: u64,
     wrapping: &WrappingKey,
+    window: usize,
 ) -> Result<(u64, u64), Error> {
     let root = Root(WrappingKey::new(wrapping.bytes()));
-    let mut get = Get::new(Some(file), size, 0..size, Box::new(root))?;
+    let mut get = Get::new(Some(file), size, 0..size, Box::new(root), window)?;
     let (mut read, mut rounds) = (0u64, 0u64);
     loop {
         while let Some(bytes) = get.take() {
@@ -428,8 +427,8 @@ pub fn gateway(
 ) -> Result<(), Error> {
     writeln!(
         out,
-        "  {:<10} {:>8} {:>11} {:>7} {:>8} {:>11} {:>7} {:>11}",
-        "scheme", "object", "PUT", "rounds", "all out", "GET", "rounds", "GET 1 lost"
+        "  {:<10} {:>8} {:>11} {:>7} {:>8} {:>11} {:>7} {:>8} {:>11}",
+        "scheme", "object", "PUT", "rounds", "all out", "GET", "rounds", "all out", "GET 1 lost"
     )?;
     let wrapping = WrappingKey::generate()?;
     for &scheme in schemes {
@@ -469,18 +468,20 @@ pub fn gateway(
             )?;
             cell.empty();
             put(&mut cell, &bytes, layout, stored, &mut ids, &wrapping, 1)?;
+            // Two blocks held, one read while one waits, and every block of the object.
             let (get_rate, (read, get_rounds)) =
-                rate(size, step, || get(&mut cell, stored, length, &wrapping))?;
+                rate(size, step, || get(&mut cell, stored, length, &wrapping, 2))?;
+            let (_, wide_get_rounds) = get(&mut cell, stored, length, &wrapping, blocks.max(1))?;
             if read != length {
                 return Err(Error::Unexpected(format!(
                     "a GET read {read} of {length} bytes"
                 )));
             }
             cell.failing = cell.volumes.keys().next().copied();
-            let (lost_rate, _) = rate(size, step, || get(&mut cell, stored, length, &wrapping))?;
+            let (lost_rate, _) = rate(size, step, || get(&mut cell, stored, length, &wrapping, 2))?;
             writeln!(
                 out,
-                "  {:<10} {:>8} {:>11} {:>7} {:>8} {:>11} {:>7} {:>11}",
+                "  {:<10} {:>8} {:>11} {:>7} {:>8} {:>11} {:>7} {:>8} {:>11}",
                 match scheme {
                     Scheme::Copies(n) => format!("{n} copies"),
                     Scheme::Rs(code) => format!("RS({},{})", code.data(), code.parity()),
@@ -491,6 +492,7 @@ pub fn gateway(
                 wide_rounds,
                 display::rate(get_rate),
                 get_rounds,
+                wide_get_rounds,
                 display::rate(lost_rate),
             )?;
             out.flush()?;

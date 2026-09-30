@@ -1,14 +1,15 @@
-//! Reading an object or a range of it (docs/design/gateway.md §3): the extent holding each
-//! wanted byte found by one seek, each block's row read for its chunks' places, only the chunk
-//! bytes holding the wanted segments read, a chunk that fails replaced by another copy or by
-//! decoding its block from any `data` of its chunks, and each segment opened under its file's
-//! key.
+//! Reading an object or a range of it (docs/design/gateway.md §3): the extents holding the
+//! wanted bytes found a page at a time from the one holding the first, each block's row read
+//! for its chunks' places, only the chunk bytes holding the wanted segments read, a chunk that
+//! fails replaced by another copy or by decoding its block from any `data` of its chunks, and
+//! each segment opened under its file's key.
 //!
 //! A [`Get`] names each request and moves on with its answer, doing no I/O, as a PUT does. It
 //! starts from the version the Name range read, whose preconditions, lock and range the caller
-//! has judged, and gives out the range's plaintext in order. It holds at most two blocks'
-//! plaintext: one read while the one before it waits for the caller to take it, the fewest
-//! that overlap reading with sending, as a PUT's two blocks overlap receiving with writing.
+//! has judged, and gives out the range's plaintext in order. It holds at most as many blocks,
+//! being read or waiting to be taken, as its caller admits: with two, one is read while the one
+//! before it waits for the caller; with more, the reads of several blocks overlap, whose round
+//! trips otherwise add up (audit §16.3, §16.7).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Range;
@@ -24,17 +25,15 @@ use crate::layout::SEALED;
 /// A request's name among those in flight.
 pub type Id = u64;
 
-/// Blocks' plaintext a GET holds at most: one being read and one waiting to be taken.
-const HELD: usize = 2;
-
 /// A GET's request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     /// A file's header, from the File range that holds it.
     Header { file: u128 },
-    /// The extent of `file` holding byte `offset`, with the offset of its first byte: a
-    /// stored byte of a file of blocks, a plaintext byte of a file of parts.
-    Extent { file: u128, offset: u64 },
+    /// The extents of `file` from the one holding byte `offset`, in order, at most `max`, each
+    /// with the offset of its first byte: stored bytes of a file of blocks, plaintext of a file
+    /// of parts.
+    Extents { file: u128, offset: u64, max: usize },
     /// A block's header and its chunks' places, from the Block range that holds it.
     Block { block: u128 },
     /// Bytes `[offset, offset + len)` of a chunk, from its volume, which verifies them.
@@ -50,8 +49,8 @@ pub enum Request {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Answer {
     Header(Option<FileHeader>),
-    /// The extent and the offset of its first byte; `None` past the file's end.
-    Extent(Option<(u64, Extent)>),
+    /// The extents asked for, each with the offset of its first byte; fewer past the end.
+    Extents(Vec<(u64, Extent)>),
     Block(Option<(BlockHeader, Vec<ChunkPlace>)>),
     Chunk(Bytes),
     /// The volume did not give the bytes: it failed, did not answer in time, or found them
@@ -73,6 +72,9 @@ pub enum GetError {
     Corrupt(u128),
     #[error("a range outside the object")]
     Range,
+    /// A GET admitted no block at once.
+    #[error("a GET needs room for one block")]
+    Window,
     #[error("an answer of another kind than its request")]
     Mismatch,
     #[error("an answer to no request in flight: {0}")]
@@ -105,9 +107,13 @@ struct Plain {
     count: u64,
     from: u64,
     to: u64,
-    /// The next segment to read, and the one past the range's last.
+    /// The next segment no block begun holds, and the one past the range's last.
     next: u64,
     end: u64,
+    /// The first segment of the next block to give out.
+    emit: u64,
+    /// Extents a page gave, not yet begun.
+    extents: VecDeque<(u64, Extent)>,
 }
 
 /// A part of a chunk read for a block, and what it gave.
@@ -131,9 +137,10 @@ struct Reading {
     want: Range<u64>,
     row: Option<(BlockHeader, Vec<ChunkPlace>)>,
     spans: Vec<Span>,
-    /// Once a span of a coded block fails: the whole chunks read to decode it, by index,
-    /// those asked and not yet answered, and those that failed.
+    /// Once a span of a coded block fails: the whole chunks read to decode it.
     whole: Option<Whole>,
+    /// Its requests in flight: it finishes only once none is, so no answer outlives it.
+    inflight: usize,
 }
 
 #[derive(Default)]
@@ -143,7 +150,7 @@ struct Whole {
     failed: BTreeSet<usize>,
 }
 
-/// What a request in flight asked.
+/// What a request in flight asked. Blocks are named by the first segment they hold.
 #[derive(Debug, Clone, Copy)]
 enum Asked {
     /// The header of the object's file.
@@ -156,24 +163,31 @@ enum Asked {
     },
     /// The extent of the object's file of parts holding plaintext byte `at`.
     PartExtent,
-    /// The extent of the file being read holding its stored byte `at`.
-    BlockExtent,
-    Block,
-    Span(usize),
-    Whole(usize),
+    /// A page of the extents of the file being read.
+    Extents,
+    Block(u64),
+    Span(u64, usize),
+    Whole(u64, usize),
 }
 
 pub struct Get {
     file: Option<u128>,
     size: u64,
     keyring: Box<dyn Keyring + Send>,
+    /// Blocks held at most, being read or waiting to be taken.
+    window: usize,
     /// The object's plaintext wanted, and the first byte of it not yet handed to a file.
     to: u64,
     at: u64,
     /// The object's file of parts, once its header says it is one.
     parts: Option<u128>,
     plain: Option<Plain>,
-    reading: Option<Reading>,
+    /// A header or extent request in flight, which what comes next waits on.
+    meta: bool,
+    reading: BTreeMap<u64, Reading>,
+    /// Blocks read, waiting their turn to be given out, by first segment: the segment past
+    /// them, and their plaintext.
+    read: BTreeMap<u64, (u64, Bytes)>,
     /// Plaintext ready for the caller, a block's at a time.
     out: VecDeque<Bytes>,
     ready: VecDeque<(Id, Request)>,
@@ -184,25 +198,32 @@ pub struct Get {
 
 impl Get {
     /// A GET of plaintext `range` of an object of `size` bytes held in `file`, none for an
-    /// empty object, whose keys `keyring` unwraps.
+    /// empty object, whose keys `keyring` unwraps, holding at most `window` blocks at once.
     pub fn new(
         file: Option<u128>,
         size: u64,
         range: Range<u64>,
         keyring: Box<dyn Keyring + Send>,
+        window: usize,
     ) -> Result<Self, GetError> {
         if range.start > range.end || range.end > size {
             return Err(GetError::Range);
+        }
+        if window == 0 {
+            return Err(GetError::Window);
         }
         let mut get = Self {
             file,
             size,
             keyring,
+            window,
             to: range.end,
             at: range.start,
             parts: None,
             plain: None,
-            reading: None,
+            meta: false,
+            reading: BTreeMap::new(),
+            read: BTreeMap::new(),
             out: VecDeque::new(),
             ready: VecDeque::new(),
             asked: BTreeMap::new(),
@@ -234,7 +255,7 @@ impl Get {
     /// The next plaintext of the range, in order; `None` while none is ready.
     pub fn take(&mut self) -> Option<Bytes> {
         let bytes = self.out.pop_front()?;
-        // The room it held may let the next block be read.
+        // The room it held may let another block be read.
         if let Err(e) = self.advance() {
             self.fail(e);
         }
@@ -268,29 +289,69 @@ impl Get {
         self.ready.clear();
         self.asked.clear();
         self.out.clear();
+        self.read.clear();
+        self.reading.clear();
     }
 
     fn ask(&mut self, request: Request, asked: Asked) -> Result<(), GetError> {
         let id = self.next_id;
         self.next_id = id.checked_add(1).ok_or(GetError::Overflow)?;
+        match asked {
+            Asked::Block(key) | Asked::Span(key, _) | Asked::Whole(key, _) => {
+                let reading = self.reading.get_mut(&key).ok_or(GetError::Mismatch)?;
+                reading.inflight = reading.inflight.checked_add(1).ok_or(GetError::Overflow)?;
+            }
+            Asked::Top | Asked::Part { .. } | Asked::PartExtent | Asked::Extents => {
+                self.meta = true;
+            }
+        }
         self.asked.insert(id, asked);
         self.ready.push_back((id, request));
         Ok(())
     }
 
-    /// Asks for what comes next, when nothing it waits on is in flight.
+    /// Blocks held: being read, read and waiting their turn, or ready for the caller.
+    fn held(&self) -> usize {
+        self.reading
+            .len()
+            .saturating_add(self.read.len())
+            .saturating_add(self.out.len())
+    }
+
+    /// Asks for what comes next: blocks begun from the extents in hand while the window has
+    /// room, a page of extents when none is in hand, and the next part or the end once a file
+    /// is read.
     fn advance(&mut self) -> Result<(), GetError> {
-        if self.outcome.is_some() || self.reading.is_some() || !self.asked.is_empty() {
+        if self.outcome.is_some() || self.meta {
             return Ok(());
         }
-        if let Some(plain) = &self.plain {
-            if plain.next < plain.end {
-                if self.out.len() >= HELD {
-                    return Ok(());
+        if self.plain.is_some() {
+            loop {
+                let held = self.held();
+                let Some(plain) = self.plain.as_mut() else {
+                    return Err(GetError::Mismatch);
+                };
+                if plain.next >= plain.end || held >= self.window {
+                    break;
                 }
+                let Some((start, extent)) = plain.extents.pop_front() else {
+                    break;
+                };
+                self.begin(start, extent)?;
+            }
+            let room = self.window.saturating_sub(self.held());
+            let plain = self.plain.as_mut().ok_or(GetError::Mismatch)?;
+            if plain.next < plain.end && plain.extents.is_empty() && room > 0 {
                 let offset = plain.next.checked_mul(SEALED).ok_or(GetError::Overflow)?;
                 let file = plain.file;
-                return self.ask(Request::Extent { file, offset }, Asked::BlockExtent);
+                // No more than the blocks the window has room for, nor than the range holds.
+                let segments =
+                    usize::try_from(plain.end.saturating_sub(plain.next)).unwrap_or(usize::MAX);
+                let max = room.min(segments);
+                return self.ask(Request::Extents { file, offset, max }, Asked::Extents);
+            }
+            if plain.next < plain.end || !self.reading.is_empty() || !self.read.is_empty() {
+                return Ok(());
             }
             self.plain = None;
         }
@@ -302,9 +363,10 @@ impl Get {
             (None, _) => Err(GetError::Range),
             (Some(file), None) => self.ask(Request::Header { file }, Asked::Top),
             (Some(_), Some(parts)) => self.ask(
-                Request::Extent {
+                Request::Extents {
                     file: parts,
                     offset: self.at,
+                    max: 1,
                 },
                 Asked::PartExtent,
             ),
@@ -312,18 +374,24 @@ impl Get {
     }
 
     fn answered(&mut self, asked: Asked, answer: Answer) -> Result<(), GetError> {
+        if let Asked::Block(key) | Asked::Span(key, _) | Asked::Whole(key, _) = asked {
+            let reading = self.reading.get_mut(&key).ok_or(GetError::Mismatch)?;
+            reading.inflight = reading.inflight.checked_sub(1).ok_or(GetError::Mismatch)?;
+        } else {
+            self.meta = false;
+        }
         match (asked, answer) {
             (Asked::Top, Answer::Header(header)) => self.top(header),
             (Asked::Part { file, start, len }, Answer::Header(header)) => {
                 self.part(file, start, len, header)
             }
-            (Asked::PartExtent, Answer::Extent(extent)) => self.part_extent(extent),
-            (Asked::BlockExtent, Answer::Extent(extent)) => self.block_extent(extent),
-            (Asked::Block, Answer::Block(row)) => self.block_row(row),
-            (Asked::Span(i), Answer::Chunk(bytes)) => self.span(i, Some(bytes)),
-            (Asked::Span(i), Answer::Unreadable) => self.span(i, None),
-            (Asked::Whole(i), Answer::Chunk(bytes)) => self.whole(i, Some(bytes)),
-            (Asked::Whole(i), Answer::Unreadable) => self.whole(i, None),
+            (Asked::PartExtent, Answer::Extents(extents)) => self.part_extent(extents),
+            (Asked::Extents, Answer::Extents(extents)) => self.page(extents),
+            (Asked::Block(key), Answer::Block(row)) => self.block_row(key, row),
+            (Asked::Span(key, i), Answer::Chunk(bytes)) => self.span(key, i, Some(bytes)),
+            (Asked::Span(key, i), Answer::Unreadable) => self.span(key, i, None),
+            (Asked::Whole(key, c), Answer::Chunk(bytes)) => self.whole(key, c, Some(bytes)),
+            (Asked::Whole(key, c), Answer::Unreadable) => self.whole(key, c, None),
             _ => Err(GetError::Mismatch),
         }
     }
@@ -353,8 +421,8 @@ impl Get {
     }
 
     /// The part of a file of parts that holds the object's plaintext byte `at`.
-    fn part_extent(&mut self, extent: Option<(u64, Extent)>) -> Result<(), GetError> {
-        let (start, extent) = extent.ok_or(GetError::Inconsistent(
+    fn part_extent(&mut self, extents: Vec<(u64, Extent)>) -> Result<(), GetError> {
+        let (start, extent) = extents.into_iter().next().ok_or(GetError::Inconsistent(
             "a file of parts ends before its size",
         ))?;
         let Target::File(file) = extent.target else {
@@ -429,15 +497,48 @@ impl Get {
             to: range.end,
             next,
             end,
+            emit: next,
+            extents: VecDeque::new(),
         });
         Ok(())
     }
 
-    /// The block holding the next wanted segment: the segments of it the range wants.
-    fn block_extent(&mut self, extent: Option<(u64, Extent)>) -> Result<(), GetError> {
-        let plain = self.plain.as_ref().ok_or(GetError::Mismatch)?;
-        let (start, extent) =
-            extent.ok_or(GetError::Inconsistent("a file ends before its length"))?;
+    /// A page of extents, from the one holding the next wanted segment: each must follow the
+    /// one before it, and those past the range are left.
+    fn page(&mut self, extents: Vec<(u64, Extent)>) -> Result<(), GetError> {
+        let plain = self.plain.as_mut().ok_or(GetError::Mismatch)?;
+        if extents.is_empty() {
+            return Err(GetError::Inconsistent("a file ends before its length"));
+        }
+        let mut at = plain.next.checked_mul(SEALED).ok_or(GetError::Overflow)?;
+        let wanted_end = plain.end.checked_mul(SEALED).ok_or(GetError::Overflow)?;
+        for (i, (start, extent)) in extents.into_iter().enumerate() {
+            let end = start.checked_add(extent.length).ok_or(GetError::Overflow)?;
+            // The first holds the next wanted byte; each after begins where the one before
+            // ends.
+            let placed = if i == 0 {
+                start <= at && at < end
+            } else {
+                start == at
+            };
+            if !placed {
+                return Err(GetError::Inconsistent(
+                    "extents that do not follow each other",
+                ));
+            }
+            if start >= wanted_end {
+                break;
+            }
+            plain.extents.push_back((start, extent));
+            at = end;
+        }
+        Ok(())
+    }
+
+    /// Begins reading the block of extent `(start, extent)`: the segments of it the range
+    /// wants.
+    fn begin(&mut self, start: u64, extent: Extent) -> Result<(), GetError> {
+        let plain = self.plain.as_mut().ok_or(GetError::Mismatch)?;
         let Target::Block(block) = extent.target else {
             return Err(GetError::Inconsistent("a file of blocks names a file"));
         };
@@ -459,21 +560,31 @@ impl Get {
             .min(plain.stored);
         let want = at.checked_sub(start).ok_or(GetError::Overflow)?
             ..stored_end.checked_sub(start).ok_or(GetError::Overflow)?;
-        self.reading = Some(Reading {
-            block,
-            stored: start..end,
-            segments,
-            want,
-            row: None,
-            spans: Vec::new(),
-            whole: None,
-        });
-        self.ask(Request::Block { block }, Asked::Block)
+        let key = plain.next;
+        plain.next = last;
+        self.reading.insert(
+            key,
+            Reading {
+                block,
+                stored: start..end,
+                segments,
+                want,
+                row: None,
+                spans: Vec::new(),
+                whole: None,
+                inflight: 0,
+            },
+        );
+        self.ask(Request::Block { block }, Asked::Block(key))
     }
 
     /// The block's row: reads the chunk bytes that hold the wanted range.
-    fn block_row(&mut self, row: Option<(BlockHeader, Vec<ChunkPlace>)>) -> Result<(), GetError> {
-        let reading = self.reading.as_mut().ok_or(GetError::Mismatch)?;
+    fn block_row(
+        &mut self,
+        key: u64,
+        row: Option<(BlockHeader, Vec<ChunkPlace>)>,
+    ) -> Result<(), GetError> {
+        let reading = self.reading.get_mut(&key).ok_or(GetError::Mismatch)?;
         let (header, places) = row.ok_or(GetError::Inconsistent("a file's block is gone"))?;
         let len = reading
             .stored
@@ -521,21 +632,18 @@ impl Get {
                 }
             }
         }
+        let count = spans.len();
         reading.spans = spans;
         reading.row = Some((header, places));
-        for i in 0..self.span_count() {
-            self.ask_span(i)?;
+        for i in 0..count {
+            self.ask_span(key, i)?;
         }
-        self.finish_block()
+        self.finish(key)
     }
 
-    fn span_count(&self) -> usize {
-        self.reading.as_ref().map_or(0, |r| r.spans.len())
-    }
-
-    /// Asks for span `i` from the chunk it now names.
-    fn ask_span(&mut self, i: usize) -> Result<(), GetError> {
-        let reading = self.reading.as_ref().ok_or(GetError::Mismatch)?;
+    /// Asks for span `i` of block `key` from the chunk it now names.
+    fn ask_span(&mut self, key: u64, i: usize) -> Result<(), GetError> {
+        let reading = self.reading.get(&key).ok_or(GetError::Mismatch)?;
         let span = reading.spans.get(i).ok_or(GetError::Mismatch)?;
         let (_, places) = reading.row.as_ref().ok_or(GetError::Mismatch)?;
         let place = places.get(span.chunk).ok_or(GetError::Overflow)?;
@@ -550,13 +658,13 @@ impl Get {
             offset: span.range.start,
             len,
         };
-        self.ask(request, Asked::Span(i))
+        self.ask(request, Asked::Span(key, i))
     }
 
-    /// Span `i` answered: kept, or, when it failed, asked of another copy, or the block
-    /// decoded from whole chunks instead.
-    fn span(&mut self, i: usize, got: Option<Bytes>) -> Result<(), GetError> {
-        let reading = self.reading.as_mut().ok_or(GetError::Mismatch)?;
+    /// Span `i` of block `key` answered: kept, or, when it failed, asked of another copy, or
+    /// the block decoded from whole chunks instead.
+    fn span(&mut self, key: u64, i: usize, got: Option<Bytes>) -> Result<(), GetError> {
+        let reading = self.reading.get_mut(&key).ok_or(GetError::Mismatch)?;
         let block = reading.block;
         let (header, _) = reading.row.as_ref().ok_or(GetError::Mismatch)?;
         let (data, width) = (
@@ -585,26 +693,25 @@ impl Get {
                     .ok_or(GetError::Unreadable(block))?;
                 span.tried.insert(next);
                 span.chunk = next;
-                self.ask_span(i)?;
+                self.ask_span(key, i)?;
             }
             None => {
-                if reading.whole.is_none() {
-                    reading.whole = Some(Whole::default());
-                }
                 let chunk = span.chunk;
-                if let Some(whole) = reading.whole.as_mut() {
-                    whole.failed.insert(chunk);
-                }
-                self.ask_wholes()?;
+                reading
+                    .whole
+                    .get_or_insert_with(Whole::default)
+                    .failed
+                    .insert(chunk);
+                self.ask_wholes(key)?;
             }
         }
-        self.finish_block()
+        self.finish(key)
     }
 
-    /// Asks for as many whole chunks, not yet asked or failed, as decoding the block still
-    /// needs, data chunks first.
-    fn ask_wholes(&mut self) -> Result<(), GetError> {
-        let reading = self.reading.as_mut().ok_or(GetError::Mismatch)?;
+    /// Asks for as many whole chunks of block `key`, not yet asked or failed, as decoding it
+    /// still needs, data chunks first.
+    fn ask_wholes(&mut self, key: u64) -> Result<(), GetError> {
+        let reading = self.reading.get_mut(&key).ok_or(GetError::Mismatch)?;
         let block = reading.block;
         let (header, places) = reading.row.as_ref().ok_or(GetError::Mismatch)?;
         let needed = usize::from(header.data);
@@ -638,7 +745,7 @@ impl Get {
                     offset: 0,
                     len: chunk_len,
                 },
-                Asked::Whole(c),
+                Asked::Whole(key, c),
             ));
         }
         for (request, asked) in requests {
@@ -647,9 +754,9 @@ impl Get {
         Ok(())
     }
 
-    /// A whole chunk read to decode the block answered.
-    fn whole(&mut self, c: usize, got: Option<Bytes>) -> Result<(), GetError> {
-        let reading = self.reading.as_mut().ok_or(GetError::Mismatch)?;
+    /// A whole chunk read to decode block `key` answered.
+    fn whole(&mut self, key: u64, c: usize, got: Option<Bytes>) -> Result<(), GetError> {
+        let reading = self.reading.get_mut(&key).ok_or(GetError::Mismatch)?;
         let chunk_len = reading.row.as_ref().map_or(0, |(h, _)| h.chunk_len);
         let whole = reading.whole.as_mut().ok_or(GetError::Mismatch)?;
         whole.asked.remove(&c);
@@ -660,25 +767,23 @@ impl Get {
             Some(_) => return Err(GetError::Inconsistent("a chunk of another length")),
             None => {
                 whole.failed.insert(c);
-                self.ask_wholes()?;
+                self.ask_wholes(key)?;
             }
         }
-        self.finish_block()
+        self.finish(key)
     }
 
-    /// Once the block's wanted bytes are all in hand, and none of its reads is in flight, opens
-    /// their segments and gives out the range's plaintext of them. A read still in flight is
-    /// waited for, so that no answer outlives the block it was for.
-    fn finish_block(&mut self) -> Result<(), GetError> {
-        if !self.asked.is_empty() {
-            return Ok(());
-        }
-        let Some(reading) = self.reading.as_ref() else {
-            return Ok(());
-        };
+    /// Once block `key`'s wanted bytes are all in hand and none of its reads is in flight,
+    /// opens its segments, and gives out, in order, the range's plaintext of every block read
+    /// whose turn has come.
+    fn finish(&mut self, key: u64) -> Result<(), GetError> {
+        let reading = self.reading.get(&key).ok_or(GetError::Mismatch)?;
         let Some((header, _)) = reading.row.as_ref() else {
             return Ok(());
         };
+        if reading.inflight > 0 {
+            return Ok(());
+        }
         let block = reading.block;
         let want_len = usize::try_from(
             reading
@@ -716,7 +821,7 @@ impl Get {
                 sealed
             }
         };
-        let reading = self.reading.take().ok_or(GetError::Mismatch)?;
+        let reading = self.reading.remove(&key).ok_or(GetError::Mismatch)?;
         let plain = self.plain.as_mut().ok_or(GetError::Mismatch)?;
         let segment = u64::try_from(seal::SEGMENT).map_err(|_| GetError::Overflow)?;
         let last = plain.count.checked_sub(1).ok_or(GetError::Overflow)?;
@@ -750,9 +855,16 @@ impl Get {
             let hi = usize::try_from(hi).map_err(|_| GetError::Overflow)?;
             out.extend_from_slice(bytes.get(lo..hi).ok_or(GetError::Overflow)?);
         }
-        plain.next = reading.segments.end;
-        if !out.is_empty() {
-            self.out.push_back(Bytes::from(out));
+        self.read.insert(
+            reading.segments.start,
+            (reading.segments.end, Bytes::from(out)),
+        );
+        // Blocks read out of order wait for the ones before them.
+        while let Some((end, bytes)) = self.read.remove(&plain.emit) {
+            plain.emit = end;
+            if !bytes.is_empty() {
+                self.out.push_back(bytes);
+            }
         }
         Ok(())
     }

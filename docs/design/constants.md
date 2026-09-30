@@ -90,7 +90,6 @@ gains a basis lowers the ceiling.
 | `crates/disk/src/sim.rs` `MAX_SIM_LEN` | bound | 1 GiB cap on the simulated file, which tests hold twice in memory. |
 | `crates/ec/src/durability.rs` `PRECISION` | bound | Relative tolerance of 1e-3 on loss probabilities, argued in the code: the report prints two significant figures, and 1e-3 keeps the third correct (docs/research/15 §4.4–4.5). |
 | `crates/ec/src/durability.rs` `YEAR` | derived | Unit conversion: 365.25 days × 24 h = 8766 hours. |
-| `crates/gateway/src/get.rs` `HELD` | derived | Two blocks, the fewest that overlap reading one with the caller taking the one before, as a PUT's two overlap receiving with writing (gateway.md §2, §3). |
 | `crates/gateway/src/layout.rs` `CHUNK` | cited | Tectonic's "typically 8 MiB" chunk (docs/research/01 §1.14). docs/design/gateway.md says measured transfer sizing will replace it, and audit §12.6/§16.2 requires per-upload sizing. |
 | `crates/gateway/src/layout.rs` `SEALED` | derived | `seal::SEGMENT + seal::TAG`: a 64 KiB plaintext segment plus its 16-byte AEAD tag (docs/design/gateway.md §1). |
 | `crates/gateway/src/put.rs` `RENEWALS` | cited | Quarter-lease renewal from Centrifuge's 15 s renewals of 60 s leases (docs/research/09 §7.2.2). Audit §12.6 requires deriving it from control-delay and outage distributions. |

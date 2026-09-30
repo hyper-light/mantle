@@ -163,11 +163,16 @@ lock and range the S3 layer has judged:
 4. Each segment is opened, its tag checked under the file's key and its index, the last marked
    as sealed, and the range cut exactly.
 
-A GET holds at most two blocks' plaintext, one read while the one before it waits for the
-caller to take it, as a PUT holds two blocks. It asks one extent at a time, so a read of the
-last byte of an object of 10,000 parts asks for one part's header and one block. What it asks
-ahead of the bytes it gives out, and how many blocks' chunks it reads at once, are the
-lookahead and flight window of audit §16.3 and §16.7, which wait for measurements of the path.
+A GET holds at most `window` blocks, being read or read and waiting to be taken, a number
+its caller admits from the memory it gives the GET: with two, one is read while the one
+before it waits for the caller. It asks for extents a page at a time, as many as the window
+has room for, reads that many blocks' rows and chunks at once, and gives out blocks in order
+whichever finishes first. A 64 MiB object in three copies, eight blocks, takes 16 round trips
+with two blocks held, where reading one block's extent, row and chunks after another took 28,
+and 4 with every block out, as a one-block object does (`mantle bench gateway`; round trips do
+not depend on the machine). Parts are read one after
+another, each found by one seek, so a read of the last byte of an object of 10,000 parts asks
+for one part's header and one block.
 
 **Checked** (`crates/gateway/tests/object_path.rs`): objects under copies and codes read back
 whole and in ranges across segment and block boundaries, with requests answered in either
@@ -175,7 +180,9 @@ order, and any range of generated objects; a chunk a volume cannot read is read 
 copy or decoded, and a GET with more lost than its scheme tolerates fails naming the block;
 bytes that are not the block's fail by a segment's tag, and by the block's CRC-32C once
 decoded; an object of a part of 5 MiB and one byte and a part of one byte reads by its parts'
-plaintext; and a GET whose caller takes nothing reads two blocks and no more.
+plaintext; and a GET whose caller takes nothing reads as many blocks as its window and no
+more, a wider window taking fewer round trips, blocks finished out of order given out in
+order.
 
 ## 4. Open
 

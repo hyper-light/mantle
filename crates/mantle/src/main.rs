@@ -19,6 +19,7 @@ use clap::{Parser, Subcommand};
 
 mod bench;
 mod bench_ec;
+mod bench_gateway;
 mod bench_hash;
 mod bench_log;
 mod bench_meta;
@@ -137,6 +138,17 @@ enum BenchCommand {
         seconds: f64,
         /// Chunk sizes to measure, comma-separated, in bytes or with a K or M suffix: 64K,1M,8M
         /// by default.
+        #[arg(long, value_delimiter = ',', value_parser = parse_size)]
+        sizes: Vec<usize>,
+    },
+    /// Measure the object path's PUT and GET on one core against a cell in memory, with the
+    /// round trips each waits through: three copies and RS(6,3), across object sizes.
+    Gateway {
+        /// Seconds each measurement runs.
+        #[arg(long, default_value_t = 0.5)]
+        seconds: f64,
+        /// Object sizes, comma-separated, in bytes or with a K or M suffix: 64K,8M,64M by
+        /// default.
         #[arg(long, value_delimiter = ',', value_parser = parse_size)]
         sizes: Vec<usize>,
     },
@@ -298,6 +310,21 @@ fn main() -> ExitCode {
                     sizes
                 };
                 bench_ec::ec(&mut out, &bench_ec::CODES, &sizes, step).map_err(|e| e.to_string())
+            }
+            Err(_) => Err(format!("--seconds {seconds} is not a duration")),
+        },
+        Command::Bench {
+            command: BenchCommand::Gateway { seconds, sizes },
+        } => match std::time::Duration::try_from_secs_f64(seconds) {
+            Ok(step) => {
+                let sizes = if sizes.is_empty() {
+                    vec![64 << 10, 8 << 20, 64 << 20]
+                } else {
+                    sizes
+                };
+                bench_gateway::schemes()
+                    .and_then(|schemes| bench_gateway::gateway(&mut out, &schemes, &sizes, step))
+                    .map_err(|e| e.to_string())
             }
             Err(_) => Err(format!("--seconds {seconds} is not a duration")),
         },

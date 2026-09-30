@@ -124,6 +124,7 @@ gains a basis lowers the ceiling.
 | `crates/log/src/state.rs` `START_BYTES` | format | Encoded size of a `Start` record (kind, group, index, term) in the frame payload. |
 | `crates/log/src/state.rs` `UNCERTAIN_BYTES` | format | Encoded size of an `Uncertain` record in the frame payload. |
 | `crates/mantle/src/bench.rs` `WORKERS` | open | 64 concurrent deleters "so they share flushes"; the count lacks a derivation or measurement. |
+| `crates/mantle/src/bench_gateway.rs` `HANDOVER` | bound | 2^40 ticks of a cell clock that moves one tick a command, past any number of commands a bounded run applies, so no deadline expires in a benchmark. |
 | `crates/mantle/src/bench_hash.rs` `CHUNKED_BODY` | open | 16 MiB signed-chunk body measured; no derivation in code or the measurement docs. |
 | `crates/mantle/src/bench_hash.rs` `FORM_FILE` | open | 16 MiB form file measured, set equal to CHUNKED_BODY; lacks a derivation. |
 | `crates/mantle/src/bench_log.rs` `KEEP` | open | A replica compacts every 64 entries, keeping 64 behind; it stands in for a follower window but lacks a derivation. |

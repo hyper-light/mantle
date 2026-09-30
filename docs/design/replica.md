@@ -31,14 +31,19 @@ sessions (06 §A1.8):
 - **Expiry is decided by the log.** Every entry carries the leader's time when it was
   proposed, as LogCabin's leader stamps its entries (06 §A1.8), and sessions unused for the
   range's session lifetime expire at the entry that passes it. Every replica decides the same.
-  A range also holds at most a configured number of sessions, and registering past it
-  expires the one least recently used. A command whose session is unknown or expired is
+  A range also holds at most a configured number of sessions. Past it, a registration takes
+  the place of the least recently used session only once that session's lifetime has passed,
+  and is otherwise refused `SessionsFull`, with the time that lifetime ends: a session within
+  its lifetime may have commands in flight whose outcome its gateway learns only through it,
+  and expiring it to make room took a live session from each gateway in turn (audit S17;
+  `sessions_expire_by_entry_time_and_the_least_recent_makes_room`). A command whose session is unknown or expired is
   refused, never run in a new session, since running it could apply it a second time.
 
 Sessions live in the engine beside the range's rows, so they change in the entry's batch
 and survive a restart with them. An entry reads each session it names once, at its first
 command, checks and changes it in memory command by command, and writes it once at the end;
-a registration, which may expire the session least recently used by the order of last use,
+a registration, which may take the place of a session whose lifetime has passed, found by
+the order of last use,
 first writes the sessions changed so far. Each command read, searched and wrote back every
 answer its session kept: an entry of 256 commands from a session keeping 256 answers took
 2.6 ms and takes 328 µs, and its answers and rows are the same, which a test checks against
@@ -190,9 +195,12 @@ every read asked before it began, and one quorum's heartbeats confirm them all a
 index the round began at. A read asked while a round is out waits for the next: that round's
 index may predate a write committed since, whose client may already have its answer, and the
 read must see it (06 §A1.5). Before, each read asked for its own round of heartbeats. A round
-whose confirmation never comes, its leader gone or its heartbeat lost, is dropped after an
-election timeout's ticks with its reads, as a lost message's reads are, and those waiting go in
-a new round; the reads waiting hold at most an entry's bytes of contexts, past which a read is
+whose confirmation never comes, its leader gone or its heartbeat lost, is given up after an
+election timeout's ticks, and `drive` gives its reads back to their callers as unconfirmed, to
+be answered or asked again; dropped with the round, a read's caller waited for an answer that
+never came (audit S14; `reads_of_a_round_no_quorum_confirms_go_back_to_their_callers`). No new
+round starts while they wait to go back, so one round's are held at most, and those waiting go
+in the round after; the reads waiting hold at most an entry's bytes of contexts, past which a read is
 refused to be asked again. `a_read_asked_while_a_round_is_out_waits_for_the_next`
 (`crates/range/tests/group.rs`) holds a round's heartbeats while a write commits: the read
 asked after it is confirmed at or past the write, and letting it join the round out confirms

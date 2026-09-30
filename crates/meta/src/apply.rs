@@ -39,14 +39,11 @@ pub fn apply_entry<R: Rows>(
                 // anew after.
                 Command::Register => {
                     touched.write(&mut overlay, index)?;
-                    Answer::Registered {
-                        session: session::register(
-                            &mut overlay,
-                            index,
-                            position,
-                            entry.at_ns,
-                            rules,
-                        )?,
+                    match session::register(&mut overlay, index, position, entry.at_ns, rules)? {
+                        session::Registration::Session(session) => Answer::Registered { session },
+                        session::Registration::Full { until_ns } => {
+                            Answer::SessionsFull { until_ns }
+                        }
                     }
                 }
                 command => match touched.check(&overlay, c.session, c.serial)? {
@@ -440,16 +437,18 @@ mod tests {
             let mut answers = Vec::new();
             for (position, c) in entry.commands.iter().enumerate() {
                 let answer = match &c.command {
-                    Command::Register => Answer::Registered {
-                        session: session::register(
-                            &mut overlay,
-                            index,
-                            position,
-                            entry.at_ns,
-                            rules,
-                        )
-                        .unwrap(),
-                    },
+                    Command::Register => {
+                        match session::register(&mut overlay, index, position, entry.at_ns, rules)
+                            .unwrap()
+                        {
+                            session::Registration::Session(session) => {
+                                Answer::Registered { session }
+                            }
+                            session::Registration::Full { until_ns } => {
+                                Answer::SessionsFull { until_ns }
+                            }
+                        }
+                    }
                     command => {
                         let check = match read(&overlay, c.session) {
                             None => Check::Unknown,

@@ -237,15 +237,33 @@ impl Touched {
     }
 }
 
-/// Registers a session at the command in place `position` of entry `index`, expiring the
-/// least recently used when the range holds its bound, and returns its ID.
+/// What a registration gives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Registration {
+    Session(u64),
+    /// The range holds `max_sessions` sessions, each within its lifetime: none is taken
+    /// from its gateway, and one ends its lifetime at `until_ns`, unless used again.
+    Full {
+        until_ns: u64,
+    },
+}
+
+/// Registers a session at the command in place `position` of entry `index`, and returns its
+/// ID. A range holding its bound takes the place of the least recently used session only once
+/// that session's lifetime has passed. A session within its lifetime may have commands in
+/// flight, whose outcome its gateway learns only through it; expired to make room, their
+/// retries were refused `SessionExpired`, their outcome unknown to the gateway, and a
+/// registration past the bound took a live session from each gateway in turn (audit S17).
+/// The Raft dissertation expires sessions by a rule all replicas apply alike, the lifetime,
+/// and has a client whose session expired treat its commands' outcome as unknown (06 §A1.8),
+/// so a bound on sessions is kept by refusing registration, not by expiring the living.
 pub fn register<R: Rows>(
     rows: &mut R,
     index: u64,
     position: usize,
     at_ns: u64,
     rules: &Rules,
-) -> Result<u64, MetaError> {
+) -> Result<Registration, MetaError> {
     let places = u64::try_from(MAX_COMMANDS).map_err(|_| MetaError::Corrupt)?;
     let session = u64::try_from(position)
         .ok()
@@ -256,10 +274,16 @@ pub fn register<R: Rows>(
     let mut writes = Vec::with_capacity(5);
     if held >= rules.max_sessions {
         let (from, to) = (vec![LOCAL, EXPIRY], vec![LOCAL, EXPIRY.saturating_add(1)]);
-        if let Some((k, _)) = rows.next(&from, &to)? {
-            writes.extend(removal(&k)?);
-            held = held.checked_sub(1).ok_or(MetaError::Corrupt)?;
+        let (k, _) = rows.next(&from, &to)?.ok_or(MetaError::Corrupt)?;
+        let ends_ns = last_used(&k)?.saturating_add(rules.lifetime_ns);
+        // Within its lifetime at `ends_ns` itself, as `expire` counts it.
+        if ends_ns >= at_ns {
+            return Ok(Registration::Full {
+                until_ns: ends_ns.saturating_add(1),
+            });
         }
+        writes.extend(removal(&k)?);
+        held = held.checked_sub(1).ok_or(MetaError::Corrupt)?;
     }
     let row = Session {
         last_ns: at_ns,
@@ -271,7 +295,7 @@ pub fn register<R: Rows>(
     writes.push(Write::Put(expiry_key(at_ns, session), Vec::new()));
     writes.push(Write::Put(COUNT.to_vec(), record::encode_number(held)));
     rows.apply(index, &writes)?;
-    Ok(session)
+    Ok(Registration::Session(session))
 }
 
 /// Expires the sessions whose lifetime entry time `at_ns` has passed, at most
@@ -289,11 +313,7 @@ pub fn expire<R: Rows>(
         let Some((k, _)) = rows.next(&from, &to)? else {
             break;
         };
-        let last_ns = k
-            .get(2..10)
-            .and_then(|b| b.try_into().ok())
-            .map(u64::from_be_bytes)
-            .ok_or(MetaError::Corrupt)?;
+        let last_ns = last_used(&k)?;
         // A lifetime past the end of time never expires.
         if last_ns.saturating_add(rules.lifetime_ns) >= at_ns {
             break;
@@ -312,6 +332,14 @@ pub fn expire<R: Rows>(
     writes.push(Write::Put(COUNT.to_vec(), record::encode_number(held)));
     rows.apply(index, &writes)?;
     Ok(())
+}
+
+/// When the session an expiry row names was last used.
+fn last_used(k: &[u8]) -> Result<u64, MetaError> {
+    k.get(2..10)
+        .and_then(|b| b.try_into().ok())
+        .map(u64::from_be_bytes)
+        .ok_or(MetaError::Corrupt)
 }
 
 /// The session an expiry row names.
@@ -358,6 +386,19 @@ mod tests {
         Answer::Name(Outcome::Created {
             upload: format!("u{n}"),
         })
+    }
+
+    fn register(
+        m: &mut Model,
+        index: u64,
+        position: usize,
+        at_ns: u64,
+        rules: &Rules,
+    ) -> Result<u64, MetaError> {
+        match super::register(m, index, position, at_ns, rules)? {
+            Registration::Session(s) => Ok(s),
+            Registration::Full { .. } => Err(MetaError::Corrupt),
+        }
     }
 
     fn check(m: &Model, session: u64, serial: u64) -> Result<Check, MetaError> {
@@ -467,16 +508,27 @@ mod tests {
         let a = register(&mut m, 1, 0, 10, &RULES).unwrap();
         let b = register(&mut m, 2, 0, 20, &RULES).unwrap();
         record(&mut m, 3, &used(a, 1, 0), Some(&answer(1)), 30, &RULES).unwrap();
-        // A third session expires b, now the least recently used.
-        let c = register(&mut m, 4, 0, 40, &RULES).unwrap();
+        // At the bound, with both sessions live, a third is refused until b's lifetime ends,
+        // b being the least recently used, and neither is taken from its gateway.
+        assert_eq!(
+            super::register(&mut m, 4, 0, 40, &RULES).unwrap(),
+            Registration::Full { until_ns: 121 }
+        );
+        assert_eq!(
+            super::register(&mut m, 4, 0, 120, &RULES).unwrap(),
+            Registration::Full { until_ns: 121 }
+        );
+        assert_eq!(check(&m, b, 1).unwrap(), Check::New);
+        // At 121 b's lifetime has passed, and its place goes to a new session.
+        let c = register(&mut m, 4, 0, 121, &RULES).unwrap();
         assert_eq!(check(&m, b, 1).unwrap(), Check::Unknown);
         assert_eq!(check(&m, a, 1).unwrap(), Check::Answered(answer(1)));
-        // An entry at 131 passes a's lifetime (30 + 100) but not c's (40 + 100).
+        // An entry at 131 passes a's lifetime (30 + 100) but not c's (121 + 100).
         expire(&mut m, 5, 131, &RULES).unwrap();
         assert_eq!(check(&m, a, 1).unwrap(), Check::Unknown);
         assert_eq!(check(&m, c, 1).unwrap(), Check::New);
         assert_eq!(count(&m).unwrap(), 1);
-        expire(&mut m, 6, 141, &RULES).unwrap();
+        expire(&mut m, 6, 222, &RULES).unwrap();
         assert_eq!(count(&m).unwrap(), 0);
     }
 }

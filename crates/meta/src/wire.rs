@@ -12,7 +12,7 @@ use crate::record::{
 };
 use crate::{block, bucket, file, name};
 
-const FORMAT: u8 = 4;
+const FORMAT: u8 = 5;
 
 /// Commands one entry carries at most: a session is named by the index of the entry that
 /// registered it and the registration's place in that entry.
@@ -53,6 +53,11 @@ pub enum Answer {
     },
     /// The session is unknown or expired, and the command was not applied.
     SessionExpired,
+    /// No session was registered: the range holds as many as it may, each within its
+    /// lifetime, and one's ends at `until_ns` unless it is used again (`session::register`).
+    SessionsFull {
+        until_ns: u64,
+    },
     /// A serial the session answered and has since forgotten, as the gateway acknowledged
     /// it: a repeat, not applied again.
     Repeated,
@@ -126,6 +131,10 @@ impl Answer {
                 w.u64(*session);
             }
             Answer::SessionExpired => w.u8(1),
+            Answer::SessionsFull { until_ns } => {
+                w.u8(8);
+                w.u64(*until_ns);
+            }
             Answer::WrongLayer => w.u8(2),
             Answer::Repeated => w.u8(7),
             Answer::Bucket(o) => {
@@ -181,6 +190,7 @@ impl Answer {
             Some(match r.u8()? {
                 0 => Answer::Registered { session: r.u64()? },
                 1 => Answer::SessionExpired,
+                8 => Answer::SessionsFull { until_ns: r.u64()? },
                 2 => Answer::WrongLayer,
                 7 => Answer::Repeated,
                 3 => Answer::Bucket(take_bucket_outcome(&mut r)?),
@@ -1945,6 +1955,7 @@ mod tests {
         let mut answers = vec![
             Answer::Registered { session: 7 },
             Answer::SessionExpired,
+            Answer::SessionsFull { until_ns: 9 },
             Answer::WrongLayer,
             Answer::Repeated,
         ];

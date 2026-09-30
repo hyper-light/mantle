@@ -1284,3 +1284,26 @@ fn ticks_held_through_a_long_flush_replay_at_most_one_timeouts_worth() {
         out.messages
     );
 }
+
+/// A round of reads no quorum confirms within an election timeout, as when the leader's
+/// heartbeats never arrive, is given up, and its reads go back to their callers through
+/// `drive`, to be answered or asked again. Before, they were dropped with the round, and a
+/// caller waited for an answer that never came.
+#[test]
+fn reads_of_a_round_no_quorum_confirms_go_back_to_their_callers() {
+    let mut nodes: Vec<Node> = (1..=3).map(|id| node(id, 90 + id)).collect();
+    let mut answers = Vec::new();
+    nodes[0].replica.campaign().unwrap();
+    settle(&mut nodes, &mut answers);
+    assert!(nodes[0].replica.is_leader());
+    nodes[0].replica.read_index(b"lost".to_vec()).unwrap();
+    // Nothing the leader sends is delivered from here on.
+    let mut given_back = Vec::new();
+    for _ in 0..2 * SETTINGS.election_tick {
+        nodes[0].replica.tick().unwrap();
+        let out = nodes[0].replica.drive().unwrap();
+        assert!(out.reads.is_empty(), "a read confirmed with no quorum");
+        given_back.extend(out.unconfirmed);
+    }
+    assert_eq!(given_back, [b"lost".to_vec()]);
+}

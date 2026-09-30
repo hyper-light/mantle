@@ -67,6 +67,10 @@ pub struct Drive {
     /// Reads a quorum confirmed: each read's context and the index the replica must have
     /// applied before it answers from its rows (06 §A1).
     pub reads: Vec<(u64, Vec<u8>)>,
+    /// Reads whose round no quorum confirmed within an election timeout, as when the leader
+    /// has lost its quorum or its leadership: each is answered by its caller, which may ask
+    /// again. Dropped without an answer, a read's caller waited for good.
+    pub unconfirmed: Vec<Vec<u8>>,
     /// The log refused the ready being written for want of room, answering this: the ready
     /// waits, whole, in the replica, which takes no call but `drive` and `compact` until the
     /// node frees room and drives again (audit S04).
@@ -143,6 +147,9 @@ struct Rounds {
     /// Reads waiting for the next round, and their bytes.
     waiting: Vec<Vec<u8>>,
     waiting_bytes: u64,
+    /// The reads of a round given up on, until `drive` gives them back: one round's at most,
+    /// since a round starts only once the last is confirmed or given up.
+    given_up: Vec<Vec<u8>>,
     next: u64,
 }
 
@@ -474,8 +481,10 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
         self.node.tick()?;
         if let Some((_, age, _)) = self.reads.out.as_mut() {
             *age = age.saturating_add(1);
-            if *age >= self.round_ticks {
-                self.reads.out = None;
+            if *age >= self.round_ticks
+                && let Some((_, _, reads)) = self.reads.out.take()
+            {
+                self.reads.given_up.extend(reads);
             }
         }
         self.next_round()
@@ -618,7 +627,13 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
     /// Asks for the next round of reads, carrying every read waiting, when none is out and the
     /// replica takes calls.
     fn next_round(&mut self) -> Result<(), ReplicaError> {
-        if self.reads.out.is_some() || self.reads.waiting.is_empty() || self.staged.is_some() {
+        // No round starts while a given-up round's reads wait for `drive` to give them back,
+        // so at most one round's are held.
+        if self.reads.out.is_some()
+            || self.reads.waiting.is_empty()
+            || self.staged.is_some()
+            || !self.reads.given_up.is_empty()
+        {
             return Ok(());
         }
         let number = self.reads.next;
@@ -796,7 +811,9 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
                 }
             }
         }
-        // The reads that waited on a round now confirmed go in the next.
+        // Reads of a round given up go back to their callers, and those waiting on a round
+        // now confirmed or given up go in the next.
+        out.unconfirmed = std::mem::take(&mut self.reads.given_up);
         self.next_round()?;
         // A member whose log may lack entries it acknowledged cannot lead: its election
         // timer still runs, which keeps it from holding a lease on a leader that is gone,

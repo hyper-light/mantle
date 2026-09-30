@@ -304,30 +304,30 @@ impl<F: BlockFile + 'static> Log<F> {
     /// Formats a new log `id` in `file`, which must be empty.
     pub fn create(file: F, config: Config, id: u128) -> Result<Self, LogError> {
         let state = recover::create(&file, &config, id)?;
-        Self::start(file, config, id, state)
+        let (log, _) = Self::start(file, config, id, state, Vec::new())?;
+        Ok(log)
     }
 
     /// Opens log `id` in `file` and recovers it (docs/design/raft-log.md §6). What a last
     /// frame that no longer reads held, as its persist record says, is written back before
-    /// the log serves anyone.
+    /// the log serves anyone, in one frame.
     pub fn open(file: F, config: Config, id: u128) -> Result<(Self, Recovery), LogError> {
         let (state, recovery, restores) = recover::open(&file, &config, id)?;
-        let log = Self::start(file, config, id, state)?;
-        let mut pending = Vec::with_capacity(restores.len());
-        for r in restores {
-            let marks = Marks {
-                uncertain: r.uncertain,
-                damaged: r.damaged,
-            };
-            pending.push(log.send(r.group, r.update, marks, true)?);
-        }
+        let (log, pending) = Self::start(file, config, id, state, restores)?;
         for p in pending {
             p.wait()?;
         }
         Ok((log, recovery))
     }
 
-    fn start(file: F, config: Config, id: u128, state: State) -> Result<Self, LogError> {
+    /// Starts the writer, whose first batch is `restores`: the handles that answer them.
+    fn start(
+        file: F,
+        config: Config,
+        id: u128,
+        state: State,
+        restores: Vec<recover::Restore>,
+    ) -> Result<(Self, Vec<Pending>), LogError> {
         let align = file.alignment();
         let largest = usize::try_from(config.segment_bytes)
             .map_err(|_| LogError::Config("segment larger than memory"))?;
@@ -345,25 +345,56 @@ impl<F: BlockFile + 'static> Log<F> {
             frames: AtomicU64::new(0),
             updates: AtomicU64::new(0),
         });
+        // The restore is handed to the writer as its first batch, not sent: sent one by one,
+        // it could be taken in several batches, and a restore in parts is not atomic. It holds
+        // its room in the queue as a sent one does, past the queue's bound if it must, since
+        // one frame bounds it.
+        let mut pending = Vec::with_capacity(restores.len());
+        let mut first = Vec::with_capacity(restores.len());
+        {
+            let mut queue = shared.queue.lock().map_err(|_| LogError::Fenced)?;
+            for r in restores {
+                let bytes = update_bytes(&r.update);
+                queue.submissions = queue.submissions.checked_add(1).ok_or(LogError::Busy)?;
+                queue.bytes = queue.bytes.checked_add(bytes).ok_or(LogError::Busy)?;
+                let own = queue.groups.entry(r.group).or_insert(0);
+                *own = own.checked_add(1).ok_or(LogError::Busy)?;
+                let (reply, answer) = sync_channel(1);
+                pending.push(Pending { answer });
+                first.push(Submission {
+                    group: r.group,
+                    update: r.update,
+                    marks: Marks {
+                        uncertain: r.uncertain,
+                        damaged: r.damaged,
+                    },
+                    bytes,
+                    reply,
+                });
+            }
+        }
         let capacity = config.queue_submissions.max(1);
         let (sender, receiver) = sync_channel(capacity);
-        let writer = writer::Writer::new(Arc::clone(&shared), receiver)?;
+        let writer = writer::Writer::new(Arc::clone(&shared), receiver, first)?;
         let handle = std::thread::Builder::new()
             .name("mantle-log".into())
             .spawn(move || writer.run())
             .map_err(|_| LogError::Closed)?;
-        Ok(Self {
-            shared,
-            sender: Some(sender),
-            writer: Some(handle),
-        })
+        Ok((
+            Self {
+                shared,
+                sender: Some(sender),
+                writer: Some(handle),
+            },
+            pending,
+        ))
     }
 
     /// Submits `update` for `group`: refused at once when the queue is full, otherwise
     /// answered through the returned handle once it is durable and a later record confirms
     /// so.
     pub fn submit(&self, group: u128, update: Update) -> Result<Pending, LogError> {
-        self.send(group, update, Marks::default(), false)
+        self.send(group, update, false)
     }
 
     /// Submits `update` for `group`, waiting for room in the queue rather than refusing. A
@@ -371,16 +402,10 @@ impl<F: BlockFile + 'static> Log<F> {
     /// (docs/design/replica.md §3). The writer frees room with every batch it takes, and a
     /// fence wakes every waiter, so the wait lasts no longer than the writer's progress.
     pub fn submit_waiting(&self, group: u128, update: Update) -> Result<Pending, LogError> {
-        self.send(group, update, Marks::default(), true)
+        self.send(group, update, true)
     }
 
-    fn send(
-        &self,
-        group: u128,
-        update: Update,
-        marks: Marks,
-        wait: bool,
-    ) -> Result<Pending, LogError> {
+    fn send(&self, group: u128, update: Update, wait: bool) -> Result<Pending, LogError> {
         let bytes = update_bytes(&update);
         {
             let config = &self.shared.config;
@@ -414,7 +439,7 @@ impl<F: BlockFile + 'static> Log<F> {
         let submission = Submission {
             group,
             update,
-            marks,
+            marks: Marks::default(),
             bytes,
             reply,
         };

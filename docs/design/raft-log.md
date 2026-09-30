@@ -133,7 +133,12 @@ followers answer only after theirs (06 §C.c, item 2). The log lets both happen:
 submission returns at once with a handle, and the replica waits on it only for what must
 follow durability.
 
-A failed write or flush fences the log, and no later submission is taken. A failed flush
+A failed write or flush fences the log, and no later submission is taken. So does a failed
+read of the tail being swept, and every update the writer holds is answered `Fenced`
+wherever its commit failed: those laid into the frame, those of the batch not yet reached,
+those held for a later frame, and those of the frame before, whose confirmation will not
+come. A commit that failed before it wrote its frame once left the last two unanswered, and
+their submitters waited as long as the log lived (review of 2026-09-30, D2). A failed flush
 is never retried, because the kernel may already have marked the pages clean [RPA+20 §3].
 The log must be reopened, and recovery trusts only what verifies.
 
@@ -214,8 +219,9 @@ up to its quota, to hold twice that, the same headroom the chunk store's cleanin
    ambiguous: "if e_i is the last entry, then we cannot determine whether it was a crash or
    a corruption" (AGL+18 §3.3.3). Its persist record answers what it held, and a confirmation
    answers whether its flush completed: the next frame's record, written only after that
-   flush, or, when no frame follows at once, a record the writer writes and flushes to say
-   so. A frame's updates are answered only once its confirmation is durable, so an
+   flush, or, when no frame follows at once, the frame's own record written again, in its
+   own slot, saying the frame was flushed. A frame's updates are answered only once its
+   confirmation is durable, so an
    unconfirmed frame was never acknowledged, and the ambiguity AGL+18 leaves to the
    replication protocol does not arise.
    - A confirmed frame that no longer reads was acknowledged and damaged since. Each of its
@@ -251,8 +257,35 @@ up to its quota, to hold twice that, the same headroom the chunk store's cleanin
    of latency where no frame follows at once
    (docs/measurements/2026-09-29-log-confirmation.md).
 
+   Where each record goes is what keeps these answers. A record is written into its slot
+   before its frame's flush, and a record larger than what the device writes atomically, a
+   sector, can reach the disk part old and part new (research/02, `physical_block_size` and
+   `RWF_ATOMIC`); a record of five groups spans two 512-byte sectors. So a slot is written
+   over only when what it holds is no longer needed, or tells of a frame never answered. The
+   next frame's record takes the slot of the frame before the last, which the last frame,
+   durable, has superseded. A confirmation written on its own is the last frame's record
+   again, in the frame's own slot, where the record it replaces is of a frame not yet
+   answered, which recovery may drop as it drops a torn tail. It was an empty record in the
+   other slot: the next frame's record, written there before that frame's flush, took it
+   away when it tore, and a frame answered and then damaged at rest was cut as a torn tail,
+   its entries dropped without a mark (review of 2026-09-30, D1). Format 3 records this.
+
    The restore is written through the writer, marks included, before the log serves anyone,
-   so it survives the next restart.
+   so it survives the next restart. It is the writer's first batch and goes in one frame, or
+   the open fails and writes nothing: sent one at a time, a restore could be taken in
+   several frames, and a crash between them would leave the rest restored nowhere once the
+   first had written over the lost frame's record. That frame takes the lost frame's
+   sequence, and so its slot, and its record, written there before its flush, could tear and
+   take the lost frame's record with it while the restore never became durable: the next
+   open found no record, and restored nothing, marked nothing and fenced nothing (review of
+   2026-09-30, D3). The open therefore copies the lost frame's record, saying whether the
+   frame was confirmed, into the other slot, and flushes the copy with the erasure of step
+   6 before the restore is written. The other slot then held the record of the frame before,
+   which reads whole, or of a frame after, which never became durable, so was never
+   answered, and whose confirmation of the lost frame the copy carries. Recovery reads a
+   frame's record from its own slot, and from the copy where that no longer reads. A
+   restore's record that landed beside a restore frame that tore is read before the copy,
+   and restores the same state, being the restore of the lost frame's record.
 6. The block where the next frame goes is overwritten with zeros and flushed before any
    write. A frame there was never acknowledged, but it may be partly durable: its header
    whole while its last sectors, or the file's end, are not. Left alone, a later crash

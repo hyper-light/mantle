@@ -13,8 +13,11 @@ use mantle_codec::{Reader, Writer};
 pub const SEGMENT_MAGIC: [u8; 4] = *b"MNLS";
 pub const FRAME_MAGIC: [u8; 4] = *b"MNLF";
 pub const PERSIST_MAGIC: [u8; 4] = *b"MNLP";
-/// 2: the file begins with the persist area, and records include `Uncertain`.
-pub const FORMAT: u8 = 2;
+/// 2: the file begins with the persist area, and records include `Uncertain`. 3: a frame's
+/// confirmation is its own persist record rewritten in its own slot, and a record of a frame's
+/// sequence in the other slot is the copy an open restoring it made; before, a confirmation
+/// there held no groups, and would read now as a lost frame's record that restores nothing.
+pub const FORMAT: u8 = 3;
 
 /// Bytes of a segment header before its padding.
 pub const SEGMENT_HEADER_LEN: usize = 52;

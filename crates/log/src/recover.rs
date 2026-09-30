@@ -258,6 +258,28 @@ pub(crate) fn persist_at(slot: u64, sequence: u64) -> u64 {
     if sequence.is_multiple_of(2) { 0 } else { slot }
 }
 
+/// Writes `record` at `at`, the start of a persist slot, padded to the block.
+pub(crate) fn write_record<F: BlockFile>(
+    file: &F,
+    record: &format::Persist,
+    at: u64,
+) -> Result<(), LogError> {
+    let bytes = record
+        .encode()
+        .ok_or(LogError::TooLarge(record.groups.len()))?;
+    let mut buf =
+        AlignedBuf::zeroed(bytes.len(), file.alignment()).map_err(|e| LogError::Disk(e.into()))?;
+    buf.extend_from_slice(&bytes)
+        .map_err(|e| LogError::Disk(e.into()))?;
+    let padded = buf.padded().map_err(|e| LogError::Disk(e.into()))?;
+    file.write_all_at(padded, at)?;
+    Ok(())
+}
+
+/// A lost frame's persist record as copied into the other slot before its restore is written:
+/// the slot's offset and the record (docs/design/raft-log.md §6).
+type RecordCopy = (u64, format::Persist);
+
 /// A group's state to write back as it was after a frame that no longer reads, which its
 /// persist record describes, before the log serves anyone (docs/design/raft-log.md §6).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -569,7 +591,7 @@ pub(crate) fn open<F: BlockFile>(
     }
     // 4b. A frame after the last valid one may have been flushed and damaged since: its
     // persist record, written in the same flush, says what it held (AGL+18 §3.3.3).
-    let restores = restores(
+    let (mut restores, copy) = restores(
         file,
         config,
         id,
@@ -583,7 +605,6 @@ pub(crate) fn open<F: BlockFile>(
     // A group newly found damaged is fenced by a record written before the log serves
     // anyone, so that the fence outlives what showed the damage: the frame is overwritten
     // by the next, and a record missing may be swept away (audit S16).
-    let mut restores = restores;
     restores.extend(damaged.iter().map(|&group| Restore {
         group,
         update: crate::Update::default(),
@@ -605,6 +626,20 @@ pub(crate) fn open<F: BlockFile>(
     // end, are not; left alone, a later crash could complete it with the zeros of a newer
     // frame's padding and bring it back. Erased, it can neither return nor be taken for
     // damage once frames follow it elsewhere.
+    //
+    // The restore's frame takes the lost frame's sequence, so its persist record goes in the
+    // lost frame's slot, before its flush, and may tear there while the frame does not become
+    // durable. The lost frame's record, and whether it was confirmed, are copied to the other
+    // slot first and flushed with the erasure: what restores the lost frame then survives
+    // until the restore itself is durable. The other slot holds nothing recovery still
+    // needs: the record of the frame before, which reads whole, or of the frame after, which
+    // never became durable and so was never answered, and whose confirmation of the lost
+    // frame the copy carries.
+    let mut flush = false;
+    if let Some((at, record)) = copy.filter(|_| !restores.is_empty()) {
+        write_record(file, &record, at)?;
+        flush = true;
+    }
     let head_slot = *by_incarnation
         .get(&highest)
         .ok_or(LogError::Damaged("a live segment is missing"))?;
@@ -628,6 +663,9 @@ pub(crate) fn open<F: BlockFile>(
             .set_len(align.get())
             .map_err(|e| LogError::Disk(e.into()))?;
         file.write_all_at(zeros.as_slice(), head_offset)?;
+        flush = true;
+    }
+    if flush {
         file.sync_data()?;
     }
 
@@ -710,6 +748,14 @@ pub(crate) fn open<F: BlockFile>(
 /// but for its term and vote, which are kept, since raising a term or keeping a vote is always
 /// safe. Its commit is not kept, since it may name an entry only the frame held. A fence the
 /// frame put on a damaged group is kept, confirmed or not.
+///
+/// The frame's record is the one in its own slot or, where that one no longer reads, the copy
+/// in the other slot that an open restoring the frame made before the restore's frame took the
+/// lost frame's sequence, and so its slot (§6). Where the restore's frame tore after its record
+/// landed, that record is the one read: it holds the restore, and restoring from it leaves
+/// each group as restoring from the lost frame's record does. Also returns the copy to make
+/// before a restore is written, when the record read is in its own slot: where the copy goes,
+/// and the record saying whether the frame was confirmed.
 fn restores<F: BlockFile>(
     file: &F,
     config: &Config,
@@ -718,9 +764,9 @@ fn restores<F: BlockFile>(
     groups: &HashMap<u128, state::Group>,
     fenced: &HashMap<u128, Place>,
     damaged: &mut Vec<u128>,
-) -> Result<Vec<Restore>, LogError> {
+) -> Result<(Vec<Restore>, Option<RecordCopy>), LogError> {
     let Some(sequence) = last.checked_add(1) else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     };
     let align = file.alignment();
     let slot = persist_slot(config, align)?;
@@ -735,13 +781,26 @@ fn restores<F: BlockFile>(
         }
     }
     let confirmed = records.iter().any(|(_, p)| p.confirms >= sequence);
-    let Some(record) = records
-        .into_iter()
-        .find(|(at, p)| *at == persist_at(slot, sequence) && p.sequence == sequence)
-        .map(|(_, p)| p)
-    else {
-        return Ok(Vec::new());
+    let own = persist_at(slot, sequence);
+    let other = if own == 0 { slot } else { 0 };
+    let chosen = [own, other].into_iter().find_map(|from| {
+        records
+            .iter()
+            .find(|(at, p)| *at == from && p.sequence == sequence)
+            .map(|(_, p)| (from, p.clone()))
+    });
+    let Some((from, record)) = chosen else {
+        return Ok((Vec::new(), None));
     };
+    let copy = (from == own).then(|| {
+        (
+            other,
+            format::Persist {
+                confirms: if confirmed { sequence } else { record.confirms },
+                ..record.clone()
+            },
+        )
+    });
     let empty = state::Group::default();
     let mut out = Vec::new();
     for p in record.groups {
@@ -851,7 +910,7 @@ fn restores<F: BlockFile>(
             damaged: false,
         });
     }
-    Ok(out)
+    Ok((out, copy))
 }
 
 /// A mark covering both marks.

@@ -97,7 +97,7 @@ gains a basis lowers the ceiling.
 | `crates/log/src/format.rs` `ENTRIES` | format | Record kind code 1 in the frame payload encoding. |
 | `crates/log/src/format.rs` `ENTRY_HEADER_BYTES` | format | The same 16-byte entry header length as a u64 for byte accounting. |
 | `crates/log/src/format.rs` `ENTRY_HEADER_LEN` | format | Entry header of term, length and CRC (16 bytes) in the frame payload encoding. |
-| `crates/log/src/format.rs` `FORMAT` | format | Version byte of the log's on-disk format (2: persist area first, `Uncertain` records); raft-log.md §2. |
+| `crates/log/src/format.rs` `FORMAT` | format | Version byte of the log's on-disk format (3: a confirmation rewrites its frame's record in its own slot, and an open restoring a lost frame copies its record to the other slot; 2: persist area first, `Uncertain` records); raft-log.md §2, §6. |
 | `crates/log/src/format.rs` `FRAME_HEADER_BYTES` | format | The same 68-byte frame header length as a u64 for byte accounting. |
 | `crates/log/src/format.rs` `FRAME_HEADER_LEN` | format | Byte length of the encoded frame header, fixed by the frame layout in format.rs and raft-log.md §2. |
 | `crates/log/src/format.rs` `HARD_STATE` | format | Record kind code 3 in the frame payload encoding. |

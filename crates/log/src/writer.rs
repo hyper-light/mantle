@@ -96,6 +96,9 @@ pub(crate) struct Writer<F> {
     /// bytes at most, a segment and a block, which the log's settings hold within one I/O
     /// buffer.
     frame: Option<AlignedBuf>,
+    /// The first batch is the restore of a lost frame at open, which goes in one frame or not
+    /// at all (docs/design/raft-log.md §6).
+    restoring: bool,
 }
 
 /// A frame flushed and not yet confirmed, and the updates it carried: at most one frame's.
@@ -105,12 +108,18 @@ struct Unconfirmed {
 }
 
 impl<F: BlockFile> Writer<F> {
-    pub fn new(shared: Arc<Shared<F>>, receiver: Receiver<Submission>) -> Result<Self, LogError> {
+    /// A writer whose first batch is `restores`, the restore of a lost frame at open, if any.
+    pub fn new(
+        shared: Arc<Shared<F>>,
+        receiver: Receiver<Submission>,
+        restores: Vec<Submission>,
+    ) -> Result<Self, LogError> {
         let capacity = crate::frame_room(&shared.config, shared.align)?;
         Ok(Self {
             shared,
             receiver,
-            held: VecDeque::new(),
+            restoring: !restores.is_empty(),
+            held: restores.into(),
             capacity,
             anticipation: Anticipation::new(),
             received: 0,
@@ -158,13 +167,8 @@ impl<F: BlockFile> Writer<F> {
                 // No frame was written, so none confirms the last: a confirmation does, so that
                 // no answer waits on traffic that may only ever be refused.
                 Ok(None) => self.confirm(),
-                Err(_) => {
-                    self.fence();
-                    for s in std::mem::take(&mut self.held) {
-                        self.answer(&s, Err(LogError::Fenced));
-                    }
-                    0
-                }
+                // The commit fenced the log and answered every update it held.
+                Err(_) => 0,
             };
             backlog = self.backlog();
         }
@@ -179,9 +183,16 @@ impl<F: BlockFile> Writer<F> {
             .saturating_sub(self.received)
     }
 
-    /// Writes and flushes a confirmation that the last frame was flushed, into the persist
-    /// slot the next frame's record would take, and answers the frame's updates: the number
-    /// answered. A failed write or flush fences the log, and they are answered `Fenced`.
+    /// Writes and flushes a confirmation that the last frame was flushed, and answers the
+    /// frame's updates: the number answered. A failed write or flush fences the log, and they
+    /// are answered `Fenced`.
+    ///
+    /// The confirmation is the frame's own persist record again, now saying the frame was
+    /// flushed, written over the record in the frame's own slot. The next frame's record goes
+    /// in the other slot before that frame's flush and may tear; a confirmation kept there
+    /// would tear with it, and a frame answered and then damaged at rest would be taken for a
+    /// torn one (docs/design/raft-log.md §6). The rewrite puts at risk only the record of a
+    /// frame not yet answered, which recovery may drop as it drops a torn tail.
     fn confirm(&mut self) -> u64 {
         let Some(frame) = self.unconfirmed.take() else {
             return 0;
@@ -189,19 +200,13 @@ impl<F: BlockFile> Writer<F> {
         let written = if self.shared.fenced.load(Ordering::Acquire) {
             Err(LogError::Fenced)
         } else {
-            frame
-                .sequence
-                .checked_add(1)
-                .ok_or(LogError::Damaged("sequences past u64"))
-                .and_then(|next| {
-                    let record = format::Persist {
-                        log: self.shared.id,
-                        sequence: frame.sequence,
-                        confirms: frame.sequence,
-                        groups: Vec::new(),
-                    };
-                    write_persist(&self.shared, &record, next)
-                })
+            let record = format::Persist {
+                log: self.shared.id,
+                sequence: frame.sequence,
+                confirms: frame.sequence,
+                groups: frame.updates.iter().map(persisted).collect(),
+            };
+            write_persist(&self.shared, &record, frame.sequence)
                 .and_then(|()| self.shared.file.sync_data().map_err(LogError::from))
         };
         match written {
@@ -278,9 +283,40 @@ impl<F: BlockFile> Writer<F> {
     /// Writes one frame of a sweep and updates and publishes it. Its persist record confirms
     /// the frame before, whose updates are answered, and the number answered is returned; its
     /// own updates wait for their confirmation. `None` if no frame was written. An error
-    /// returned fences the log, and every update taken or waiting is answered `Fenced`;
-    /// updates refused on their own are answered here.
+    /// returned has fenced the log and answered `Fenced` every update the writer holds: those
+    /// taken for the frame, those of the batch not reached, those held for a later frame, and
+    /// those of the frame before, whose confirmation will never come. Wherever the commit
+    /// fails, no submitter waits on an answer that cannot come, and every submission's room in
+    /// the queue is given back. Updates refused on their own are answered as they are refused.
     fn commit(&mut self, batch: VecDeque<Submission>) -> Result<Option<u64>, LogError> {
+        let mut batch = batch;
+        let mut taken = Vec::new();
+        let result = self.frame(&mut batch, &mut taken);
+        if result.is_err() {
+            // Fenced before anyone hears of it, so no answer outruns the fence.
+            self.fence();
+            let held = std::mem::take(&mut self.held);
+            let untaken = batch.iter().chain(&held);
+            for s in taken.iter().map(|(s, _)| s).chain(untaken) {
+                self.answer(s, Err(LogError::Fenced));
+            }
+            if let Some(before) = self.unconfirmed.take() {
+                self.settle(before, Err(()));
+            }
+        }
+        result
+    }
+
+    /// Lays the batch into a frame after any sweep, then writes and publishes it and answers
+    /// the frame before. Each update laid out moves from `batch` to `taken`, and leaves `taken`
+    /// only once it is answered or awaits its confirmation, so that on an error `commit`
+    /// answers every update this left.
+    fn frame(
+        &mut self,
+        batch: &mut VecDeque<Submission>,
+        taken: &mut Vec<(Submission, Placement)>,
+    ) -> Result<Option<u64>, LogError> {
+        let whole = std::mem::replace(&mut self.restoring, false);
         let mut payload = Payload::default();
         let mut records = 0u32;
         let sweep = if self.sweepable()? {
@@ -288,31 +324,29 @@ impl<F: BlockFile> Writer<F> {
         } else {
             None
         };
-        let mut taken: Vec<(Submission, Placement)> = Vec::new();
+        let mut refused = false;
         {
             let state = self.shared.read_state()?;
             let mut seen = HashSet::new();
             let mut new_groups = 0usize;
-            for s in batch {
+            while let Some(s) = batch.pop_front() {
                 if !seen.insert(s.group) {
                     self.held.push_back(s);
                     continue;
                 }
-                let new = match validate(&state, &self.shared.config, &s, new_groups) {
-                    Ok(new) => new,
+                let checked =
+                    validate(&state, &self.shared.config, &s, new_groups).and_then(|new| {
+                        match submission_len(&s) {
+                            Some(len) if len <= self.capacity => Ok((new, len)),
+                            Some(len) => Err(LogError::TooLarge(len)),
+                            None => Err(LogError::TooLarge(usize::MAX)),
+                        }
+                    });
+                let (new, len) = match checked {
+                    Ok(checked) => checked,
                     Err(e) => {
                         self.answer(&s, Err(e));
-                        continue;
-                    }
-                };
-                let len = match submission_len(&s) {
-                    Some(len) if len <= self.capacity => len,
-                    Some(len) => {
-                        self.answer(&s, Err(LogError::TooLarge(len)));
-                        continue;
-                    }
-                    None => {
-                        self.answer(&s, Err(LogError::TooLarge(usize::MAX)));
+                        refused = true;
                         continue;
                     }
                 };
@@ -322,21 +356,39 @@ impl<F: BlockFile> Writer<F> {
                     self.held.push_back(s);
                     continue;
                 }
-                let placement = encode(&mut payload, &mut records, s.group, &s.update, s.marks)
-                    .ok_or(LogError::TooLarge(len))?;
+                let Some(placement) =
+                    encode(&mut payload, &mut records, s.group, &s.update, s.marks)
+                else {
+                    batch.push_front(s);
+                    return Err(LogError::TooLarge(len));
+                };
                 if new {
                     new_groups = new_groups.saturating_add(1);
                 }
                 taken.push((s, placement));
             }
         }
+        if whole && (refused || !self.held.is_empty()) {
+            // A restore in parts would overwrite the lost frame's persist record with the
+            // first part's, and a crash before the last part was durable would leave the rest
+            // restored nowhere: none of it is written, and the open fails (raft-log.md §6).
+            let parts = taken.drain(..).map(|(s, _)| s);
+            for s in parts.chain(std::mem::take(&mut self.held)) {
+                self.answer(
+                    &s,
+                    Err(LogError::Damaged(
+                        "a lost frame's restore does not fit one frame",
+                    )),
+                );
+            }
+            return Ok(None);
+        }
         if taken.is_empty() && sweep.is_none() {
             return Ok(None);
         }
         let payload = payload.into_vec();
-        let result = self.place_and_write(&payload, records, sweep, &taken);
-        match result {
-            Ok(Some(sequence)) => {
+        match self.place_and_write(&payload, records, sweep, taken)? {
+            Some(sequence) => {
                 self.shared.frames.fetch_add(1, Ordering::Relaxed);
                 let updates = u64::try_from(taken.len()).unwrap_or(u64::MAX);
                 self.shared.updates.fetch_add(updates, Ordering::Relaxed);
@@ -346,28 +398,17 @@ impl<F: BlockFile> Writer<F> {
                     .map_or(0, |before| self.settle(before, Ok(())));
                 self.unconfirmed = Some(Unconfirmed {
                     sequence,
-                    updates: taken.into_iter().map(|(s, _)| s).collect(),
+                    updates: taken.drain(..).map(|(s, _)| s).collect(),
                 });
                 Ok(Some(confirmed))
             }
-            Ok(None) => {
+            None => {
                 // No segment can take the frame: every one holds live records the tail's
                 // sweep cannot free. Groups must compact.
-                for (s, _) in &taken {
-                    self.answer(s, Err(LogError::Full));
+                for (s, _) in taken.drain(..) {
+                    self.answer(&s, Err(LogError::Full));
                 }
                 Ok(None)
-            }
-            Err(e) => {
-                // Fenced before anyone hears of it, so no answer outruns the fence.
-                self.fence();
-                for (s, _) in &taken {
-                    self.answer(s, Err(LogError::Fenced));
-                }
-                if let Some(before) = self.unconfirmed.take() {
-                    self.settle(before, Err(()));
-                }
-                Err(e)
             }
         }
     }
@@ -743,19 +784,12 @@ fn write_persist<F: BlockFile>(
     record: &format::Persist,
     slot_of: u64,
 ) -> Result<(), LogError> {
-    let bytes = record
-        .encode()
-        .ok_or(LogError::TooLarge(record.groups.len()))?;
-    let mut buf =
-        AlignedBuf::zeroed(bytes.len(), shared.align).map_err(|e| LogError::Disk(e.into()))?;
-    buf.extend_from_slice(&bytes)
-        .map_err(|e| LogError::Disk(e.into()))?;
     let slot = crate::recover::persist_slot(&shared.config, shared.align)?;
-    let padded = buf.padded().map_err(|e| LogError::Disk(e.into()))?;
-    shared
-        .file
-        .write_all_at(padded, crate::recover::persist_at(slot, slot_of))?;
-    Ok(())
+    crate::recover::write_record(
+        &shared.file,
+        record,
+        crate::recover::persist_at(slot, slot_of),
+    )
 }
 
 /// What a submission's frame makes durable for its group, as its persist record says it.

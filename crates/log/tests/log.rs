@@ -2138,3 +2138,371 @@ proptest! {
         check(&log, &models);
     }
 }
+
+/// The settings of `config` with a writer that forms each batch from what is queued, so a
+/// test that holds the writer knows which submissions share a frame.
+fn config_now(segment_blocks: u64, max_segments: u32) -> Config {
+    Config {
+        waits: Waits::Never,
+        ..config(segment_blocks, max_segments)
+    }
+}
+
+/// Flips a bit of the byte at `offset` on the medium itself, so that the damage outlasts a
+/// test's clearing of faults.
+fn damage(file: &SimFile, offset: u64) {
+    let block = offset / BLOCK as u64 * BLOCK as u64;
+    let mut buf = AlignedBuf::zeroed(BLOCK, Alignment::new(BLOCK).unwrap()).unwrap();
+    buf.set_len(BLOCK).unwrap();
+    file.read_exact_at(buf.as_mut_slice(), block).unwrap();
+    buf.as_mut_slice()[(offset - block) as usize] ^= 1;
+    file.write_all_at(buf.as_slice(), block).unwrap();
+    file.sync_data().unwrap();
+}
+
+#[derive(Default)]
+struct Gates {
+    /// Flushes let through before the next is held; `None` lets every one through.
+    permits: Option<u64>,
+    /// Flushes held now.
+    held: u64,
+    /// Reads overlapping this range are held until released.
+    trap: Option<(u64, u64)>,
+    trapped: u64,
+}
+
+/// A simulated file that lets its flushes through a counted number at a time and holds reads
+/// of a range, so a test can stop the writer at a chosen flush or read.
+struct Gate {
+    file: Arc<SimFile>,
+    state: std::sync::Mutex<Gates>,
+    changed: std::sync::Condvar,
+}
+
+impl Gate {
+    fn new(file: Arc<SimFile>) -> Arc<Self> {
+        Arc::new(Self {
+            file,
+            state: std::sync::Mutex::new(Gates::default()),
+            changed: std::sync::Condvar::new(),
+        })
+    }
+
+    fn permits(&self, permits: Option<u64>) {
+        self.state.lock().unwrap().permits = permits;
+        self.changed.notify_all();
+    }
+
+    /// Waits until a flush is held.
+    fn flush_held(&self) {
+        let mut s = self.state.lock().unwrap();
+        while s.held == 0 {
+            s = self.changed.wait(s).unwrap();
+        }
+    }
+
+    fn trap(&self, from: u64, len: u64) {
+        self.state.lock().unwrap().trap = Some((from, from + len));
+    }
+
+    /// Waits until a read is held.
+    fn read_held(&self) {
+        let mut s = self.state.lock().unwrap();
+        while s.trapped == 0 {
+            s = self.changed.wait(s).unwrap();
+        }
+    }
+
+    fn release(&self) {
+        self.state.lock().unwrap().trap = None;
+        self.changed.notify_all();
+    }
+}
+
+impl mantle_disk::block::BlockFile for Gate {
+    fn alignment(&self) -> Alignment {
+        self.file.alignment()
+    }
+
+    fn len(&self) -> Result<u64, mantle_disk::DiskError> {
+        mantle_disk::block::BlockFile::len(&*self.file)
+    }
+
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), mantle_disk::DiskError> {
+        let mut s = self.state.lock().unwrap();
+        let end = offset + buf.len() as u64;
+        if s.trap.is_some_and(|(a, b)| offset < b && a < end) {
+            s.trapped += 1;
+            self.changed.notify_all();
+            while s.trap.is_some() {
+                s = self.changed.wait(s).unwrap();
+            }
+        }
+        drop(s);
+        self.file.read_exact_at(buf, offset)
+    }
+
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), mantle_disk::DiskError> {
+        self.file.write_all_at(buf, offset)
+    }
+
+    fn sync_data(&self) -> Result<(), mantle_disk::DiskError> {
+        let mut s = self.state.lock().unwrap();
+        if s.permits == Some(0) {
+            s.held += 1;
+            self.changed.notify_all();
+            while s.permits == Some(0) {
+                s = self.changed.wait(s).unwrap();
+            }
+            s.held -= 1;
+        }
+        if let Some(p) = s.permits.as_mut() {
+            *p -= 1;
+        }
+        drop(s);
+        self.file.sync_data()
+    }
+}
+
+/// A frame confirmed on its own is answered, and the confirmation must outlast the next
+/// frame's persist record, which is written before that frame's flush and may tear: a record
+/// of five groups or more spans two sectors. Power fails at the next frame's flush, the
+/// confirmed frame is damaged at rest, and recovery must still know it was acknowledged: its
+/// entry is held or marked, never dropped as a torn tail.
+#[test]
+fn a_confirmation_outlives_a_torn_record_of_the_next_frame() {
+    let mut reopened = 0;
+    for seed in 0..64u64 {
+        let file = sim(seed);
+        let gate = Gate::new(Arc::clone(&file));
+        let cfg = config_now(16, 8);
+        let log = Log::create(Arc::clone(&gate), cfg, ID).unwrap();
+        log.write(
+            1,
+            Update {
+                entries: Some(entries(1, &[1])),
+                hard_state: Some(HardState {
+                    term: 1,
+                    vote: 1,
+                    commit: 1,
+                }),
+                ..Update::default()
+            },
+        )
+        .unwrap();
+        // The second frame's flush passes; the flush of its confirmation is held.
+        gate.permits(Some(1));
+        let second = log
+            .submit(
+                1,
+                Update {
+                    entries: Some(entries(2, &[1])),
+                    ..Update::default()
+                },
+            )
+            .unwrap();
+        gate.flush_held();
+        let others: Vec<_> = (10..16u128)
+            .map(|g| {
+                log.submit(
+                    g,
+                    Update {
+                        hard_state: Some(HardState {
+                            term: 1,
+                            vote: 0,
+                            commit: 0,
+                        }),
+                        ..Update::default()
+                    },
+                )
+                .unwrap()
+            })
+            .collect();
+        // The confirmation's flush succeeds; the third frame's writes, its frame and its
+        // record, reach the device, and its flush fails.
+        file.inject(Fault::PowerCut { ops: 3 }).unwrap();
+        gate.permits(None);
+        second.wait().unwrap();
+        for o in others {
+            assert!(matches!(o.wait(), Err(LogError::Fenced)));
+        }
+        drop(log);
+        file.crash(Crash::Random).unwrap();
+        file.clear_faults().unwrap();
+        let frames = valid_frames(&file.durable_image().unwrap());
+        // A third frame that survived whole proves the second was flushed: damage to it is
+        // reported, which other tests cover.
+        if frames.iter().any(|f| f.2 == 3) {
+            continue;
+        }
+        let two = frames.iter().find(|f| f.2 == 2).unwrap();
+        damage(&file, two.0 + 70);
+        let (log, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+        let view = log.view(1).unwrap().unwrap();
+        assert!(
+            view.last >= 2 || view.uncertain == Some(Start { index: 2, term: 1 }),
+            "seed {seed}: an entry answered Ok was dropped without a mark: {recovery:?} {view:?}"
+        );
+        reopened += 1;
+    }
+    assert!(reopened > 0, "no seed lost the third frame");
+}
+
+/// A commit that fails before its frame is written, here as its sweep of the tail reads the
+/// tail, fences the log and answers every update it held: the last frame's, which no
+/// confirmation will follow, and the batch's, whose room in the queue is given back.
+#[test]
+fn a_commit_that_fails_before_its_frame_answers_every_update() {
+    let file = sim(7);
+    let gate = Gate::new(Arc::clone(&file));
+    let cfg = config_now(4, 3);
+    let log = Log::create(Arc::clone(&gate), cfg, ID).unwrap();
+    let state = |term| Update {
+        hard_state: Some(HardState {
+            term,
+            vote: 1,
+            commit: 0,
+        }),
+        ..Update::default()
+    };
+    // Group 2's entry stays live; group 1's hard states fill segment 0.
+    log.write(
+        2,
+        Update {
+            entries: Some(entries(1, &[1])),
+            ..Update::default()
+        },
+    )
+    .unwrap();
+    log.write(1, state(1)).unwrap();
+    // The next frame opens segment 1 and is held in its flush while another update queues.
+    gate.permits(Some(0));
+    let a = log.submit(1, state(2)).unwrap();
+    gate.flush_held();
+    let b = log.submit(1, state(3)).unwrap();
+    // The commit after it sweeps segment 0, whose read is held, and fails.
+    let segment_zero = cfg.segment_bytes;
+    gate.trap(segment_zero, cfg.segment_bytes);
+    gate.permits(None);
+    gate.read_held();
+    let d = log.submit(4, state(1)).unwrap();
+    file.inject(Fault::ReadError {
+        offset: segment_zero,
+        len: cfg.segment_bytes,
+    })
+    .unwrap();
+    gate.release();
+    // Answered after the failed commit, by which time every answer it gives has gone out.
+    assert!(matches!(d.wait(), Err(LogError::Fenced)));
+    assert!(log.is_fenced());
+    assert!(
+        matches!(b.poll(), Some(Err(LogError::Fenced))),
+        "{:?}",
+        b.poll()
+    );
+    assert!(
+        matches!(a.poll(), Some(Err(LogError::Fenced))),
+        "{:?}",
+        a.poll()
+    );
+}
+
+/// Power fails at each write and flush of the open that restores an acknowledged last frame
+/// that no longer reads. The restore's own frame and persist record may tear, and must not
+/// take with them what recovery needs to restore the lost frame: whatever reached the disk,
+/// the next open holds each group's acknowledged vote, marks its lost entry, and keeps the
+/// group whose frame held a proposal damaged.
+#[test]
+fn power_lost_while_restoring_a_lost_frame_loses_nothing_acknowledged() {
+    let cfg = config_now(16, 8);
+    let groups = 10..16u128;
+    for ops in 0..8 {
+        for seed in 0..24u64 {
+            let file = sim(1000 + seed);
+            let gate = Gate::new(Arc::clone(&file));
+            let log = Log::create(Arc::clone(&gate), cfg, ID).unwrap();
+            for g in groups.clone() {
+                let voted = HardState {
+                    term: 1,
+                    vote: 0,
+                    commit: 0,
+                };
+                log.write(
+                    g,
+                    Update {
+                        hard_state: Some(voted),
+                        ..Update::default()
+                    },
+                )
+                .unwrap();
+            }
+            // One frame, held in its flush, while the six groups queue: the next frame carries
+            // all six, so its persist record spans sectors and can tear.
+            gate.permits(Some(0));
+            let plug = log
+                .submit(
+                    1,
+                    Update {
+                        hard_state: Some(hard(1, 0)),
+                        ..Update::default()
+                    },
+                )
+                .unwrap();
+            gate.flush_held();
+            let pending: Vec<_> = groups
+                .clone()
+                .map(|g| {
+                    let proposals = if g == 15 {
+                        vec![Proposal {
+                            index: 5,
+                            term: 2,
+                            bytes: Arc::from(&b"p"[..]),
+                        }]
+                    } else {
+                        Vec::new()
+                    };
+                    let u = Update {
+                        entries: Some(entries(1, &[2])),
+                        hard_state: Some(HardState {
+                            term: 2,
+                            vote: 2,
+                            commit: 0,
+                        }),
+                        proposals,
+                        ..Update::default()
+                    };
+                    log.submit(g, u).unwrap()
+                })
+                .collect();
+            gate.permits(None);
+            plug.wait().unwrap();
+            for p in pending {
+                p.wait().unwrap();
+            }
+            drop(log);
+            let frames = valid_frames(&file.durable_image().unwrap());
+            let last = frames.iter().max_by_key(|f| f.2).unwrap();
+            assert_eq!(last.2, 8, "the six groups share the last frame");
+            damage(&file, last.0 + 70);
+            file.inject(Fault::PowerCut { ops }).unwrap();
+            drop(Log::open(Arc::clone(&file), cfg, ID));
+            file.crash(Crash::Random).unwrap();
+            file.clear_faults().unwrap();
+            let (log, recovery) = Log::open(Arc::clone(&file), cfg, ID).unwrap();
+            let at = format!("power cut after {ops} operations, seed {seed}");
+            assert_eq!(recovery.damaged, vec![15], "{at}: {recovery:?}");
+            for g in 10..15u128 {
+                let view = log.view(g).unwrap().unwrap();
+                assert_eq!(
+                    view.hard_state.map(|h| (h.term, h.vote)),
+                    Some((2, 2)),
+                    "{at}: group {g}"
+                );
+                assert!(
+                    view.last >= 1 || view.uncertain == Some(Start { index: 1, term: 2 }),
+                    "{at}: group {g} lost its entry unmarked: {view:?}"
+                );
+            }
+        }
+    }
+}

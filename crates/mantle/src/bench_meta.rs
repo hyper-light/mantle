@@ -302,8 +302,10 @@ fn session_entry(commands: usize) -> Result<Duration, Error> {
     let sessioned = |serial: u64| Sessioned {
         session,
         serial,
-        // The gateway has received no answer: every one is kept.
-        unanswered: 1,
+        // The gateway has received every answer but the last `HISTORY`: each command's
+        // acknowledgement forgets the oldest kept, and the history stays full without passing
+        // the bound, past which the session would expire.
+        unanswered: serial.saturating_sub(HISTORY).saturating_add(1),
         command: put(format!("k{serial}")),
     };
     let fill = Entry {

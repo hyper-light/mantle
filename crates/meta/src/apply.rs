@@ -283,6 +283,98 @@ mod tests {
         assert!(crate::name::current(&m, "b", "k").unwrap().is_none());
     }
 
+    /// Answers are forgotten only once the gateway has acknowledged them. A session whose
+    /// answers pass its bounds expires, so a reordered command still in flight is refused, not
+    /// taken for a repeat and never applied; before, the oldest answer kept was forgotten and
+    /// the watermark raised past it, past serials not yet applied.
+    #[test]
+    fn a_reordered_command_is_applied_or_refused_never_taken_for_a_repeat() {
+        let one = Answer::Name(Outcome::Put {
+            version: crate::key::version_id(!12_345u64),
+        })
+        .encode()
+        .unwrap()
+        .len();
+        let put = |serial: u64, unanswered: u64| Sessioned {
+            session: 0,
+            serial,
+            unanswered,
+            command: put(&format!("k{serial}"), "e", false),
+        };
+        let applied = |m: &Model, serial: u64| {
+            crate::name::current(m, "b", &format!("k{serial}"))
+                .unwrap()
+                .is_some()
+        };
+        for (budget, kept) in [(one, false), (3 * one, true)] {
+            let rules = Rules {
+                max_answers: 8,
+                max_answer_bytes: budget,
+                ..RULES
+            };
+            let mut m = name_range();
+            let run = |m: &mut Model, index, commands: Vec<Sessioned>| {
+                apply_entry(m, index, &entry(10 * index, commands), Layer::Name, &rules).unwrap()
+            };
+            let [Answer::Registered { session }] =
+                run(&mut m, 1, vec![from(0, 0, Command::Register)])[..]
+            else {
+                panic!()
+            };
+            let sessioned = |c: Sessioned| Sessioned { session, ..c };
+            run(&mut m, 2, vec![from(session, 1, open_gate())]);
+            // Serials 2, 3 and 4 in flight, reaching the log in the order 4, 2, 3.
+            let mut answers = Vec::new();
+            for (index, serial) in [(3, 4), (4, 2), (5, 3)] {
+                answers.extend(run(&mut m, index, vec![sessioned(put(serial, 2))]));
+            }
+            for (answer, serial) in answers.iter().zip([4, 2, 3]) {
+                match answer {
+                    Answer::Name(Outcome::Put { .. }) => assert!(applied(&m, serial)),
+                    Answer::SessionExpired => assert!(!applied(&m, serial)),
+                    other => panic!("serial {serial} answered {other:?}"),
+                }
+            }
+            assert_eq!(applied(&m, 3), kept, "{answers:?}");
+            // A retry is answered from what was kept, or refused once the session expired.
+            let retries = run(&mut m, 6, [4, 2, 3].map(|s| sessioned(put(s, 2))).to_vec());
+            if kept {
+                assert_eq!(retries, answers);
+            } else {
+                assert!(
+                    retries.iter().all(|a| *a == Answer::SessionExpired),
+                    "{retries:?}"
+                );
+            }
+        }
+        // Acknowledged, answers are forgotten wherever they lie, and a retry is a repeat.
+        let rules = Rules {
+            max_answers: 8,
+            max_answer_bytes: usize::MAX,
+            ..RULES
+        };
+        let mut m = name_range();
+        let run = |m: &mut Model, index, commands: Vec<Sessioned>| {
+            apply_entry(m, index, &entry(10 * index, commands), Layer::Name, &rules).unwrap()
+        };
+        let [Answer::Registered { session }] =
+            run(&mut m, 1, vec![from(0, 0, Command::Register)])[..]
+        else {
+            panic!()
+        };
+        let sessioned = |c: Sessioned| Sessioned { session, ..c };
+        run(&mut m, 2, vec![from(session, 1, open_gate())]);
+        let four = run(&mut m, 3, vec![sessioned(put(4, 2))]);
+        let two = run(&mut m, 4, vec![sessioned(put(2, 2))]);
+        assert_eq!(run(&mut m, 5, vec![sessioned(put(2, 2))]), two);
+        let three = run(&mut m, 6, vec![sessioned(put(3, 3))]);
+        assert_eq!(
+            run(&mut m, 7, vec![sessioned(put(2, 4)), sessioned(put(4, 4))]),
+            [Answer::Repeated, four[0].clone()]
+        );
+        assert!(matches!(three[..], [Answer::Name(Outcome::Put { .. })]));
+    }
+
     #[test]
     fn a_session_unused_past_its_lifetime_expires_at_the_entry_that_passes_it() {
         let mut m = name_range();
@@ -384,15 +476,18 @@ mod tests {
                         }
                         let bytes =
                             |s: &Session| s.answers.iter().map(|(_, a)| a.len()).sum::<usize>();
-                        while s.answers.len() > rules.max_answers
-                            || bytes(&s) > rules.max_answer_bytes
+                        if s.answers.len() > rules.max_answers || bytes(&s) > rules.max_answer_bytes
                         {
-                            let (forgotten, _) = s.answers.remove(0);
-                            s.low = s.low.max(forgotten + 1);
+                            let count = vec![crate::key::LOCAL, crate::key::marker::SESSIONS];
+                            let held = overlay.get(&count).unwrap().unwrap();
+                            let held = crate::record::decode_number(&held, "sessions").unwrap();
+                            writes.push(Write::Delete(key(c.session)));
+                            writes.push(Write::Put(count, crate::record::encode_number(held - 1)));
+                        } else {
+                            s.last_ns = entry.at_ns;
+                            writes.push(Write::Put(key(c.session), s.encode().unwrap()));
+                            writes.push(Write::Put(expiry(entry.at_ns, c.session), Vec::new()));
                         }
-                        s.last_ns = entry.at_ns;
-                        writes.push(Write::Put(key(c.session), s.encode().unwrap()));
-                        writes.push(Write::Put(expiry(entry.at_ns, c.session), Vec::new()));
                         overlay.apply(index, &writes).unwrap();
                         given.0
                     }
@@ -411,16 +506,18 @@ mod tests {
     /// each command's session change on its own did (audit P04).
     #[test]
     fn holding_an_entrys_sessions_answers_and_writes_as_each_command_did() {
-        // A budget of bytes two answers pass, so both bounds forget answers.
-        let one = Answer::Name(Outcome::PreconditionFailed)
-            .encode()
-            .unwrap()
-            .len();
+        // A budget of bytes four puts' answers pass, so both bounds expire sessions.
+        let one = Answer::Name(Outcome::Put {
+            version: crate::key::version_id(!12_345u64),
+        })
+        .encode()
+        .unwrap()
+        .len();
         let rules = Rules {
             lifetime_ns: 400,
             max_sessions: 4,
-            max_answers: 3,
-            max_answer_bytes: 12 * one,
+            max_answers: 4,
+            max_answer_bytes: 3 * one + one / 2,
             expiries_per_entry: 2,
         };
         let mut rng = 0x9E37_79B9_7F4A_7C15u64;

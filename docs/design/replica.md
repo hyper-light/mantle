@@ -43,9 +43,21 @@ first writes the sessions changed so far. Each command read, searched and wrote 
 answer its session kept: an entry of 256 commands from a session keeping 256 answers took
 2.6 ms and takes 328 µs, and its answers and rows are the same, which a test checks against
 the command-by-command order over random entries (audit P04;
-[measurements](../measurements/2026-09-29-metadata-apply.md)). A session keeps its answers
-within a count and a budget of bytes; past either, the oldest are forgotten, and a retry of
-one is a repeat.
+[measurements](../measurements/2026-09-29-metadata-apply.md)).
+
+A session forgets an answer only once its gateway has acknowledged it, by naming a lowest
+unanswered serial past it; that serial is the session's watermark, and a serial below it is a
+repeat. In the dissertation, the client piggybacks the lowest sequence number it has no
+response for, and that is what lets the state machine discard older responses (06 §A1.8);
+nothing else may. Commands reach the log in any order, a
+gateway's retries and the fast track's re-proposals among them, so the answer kept longest
+need not be the lowest serial: forgetting it for room, as the range once did, raised the
+watermark past serials still in flight, which were then taken for repeats and never applied.
+A session keeps its unacknowledged answers within a count and a budget of bytes, and past
+either it expires, as the dissertation bounds sessions: the command that passed the bound is
+answered, and every command after, retries and serials still in flight alike, is refused as
+from an expired session, never applied, so the gateway registers anew knowing which commands
+took effect.
 
 ## 2. Applying an entry
 

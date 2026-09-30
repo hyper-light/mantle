@@ -1037,3 +1037,106 @@ fn a_member_refuses_settings_its_log_cannot_hold() {
         Err(mantle_range::ReplicaError::Config(_))
     ));
 }
+
+/// A snapshot's fate reported while its sender has a ready out is kept, not refused: the
+/// leader pauses replication to a member until it learns its snapshot's fate, and a report
+/// refused and lost left it paused for good. A seed of the simulation found it, a member one
+/// snapshot behind forever once faults stopped.
+#[test]
+fn a_snapshot_report_that_comes_while_a_ready_is_out_is_kept() {
+    let mut nodes: Vec<Node> = (1..=3).map(|id| node(id, 40 + id)).collect();
+    let mut answers = Vec::new();
+    nodes[0].replica.campaign().unwrap();
+    settle(&mut nodes, &mut answers);
+    let register = Sessioned {
+        session: 0,
+        serial: 0,
+        unanswered: 0,
+        command: Command::Register,
+    };
+    let entry = |commands| Entry {
+        at_ns: 10,
+        commands,
+    };
+    nodes[0].replica.propose(&entry(vec![register])).unwrap();
+    settle(&mut nodes, &mut answers);
+    // Entries member 3 never hears of, then a compaction that leaves it a snapshot behind.
+    let cut_off = |nodes: &mut [Node]| {
+        let mut wire: VecDeque<Message> = VecDeque::new();
+        for _ in 0..10_000 {
+            for n in nodes.iter_mut().take(2) {
+                wire.extend(n.replica.drive().unwrap().messages);
+            }
+            let Some(m) = wire.pop_front() else { return };
+            if m.to != 3 {
+                let _ = nodes[usize::try_from(m.to).unwrap() - 1].replica.step(m);
+            }
+        }
+        panic!("never settled");
+    };
+    for _ in 0..3 {
+        nodes[0].replica.propose(&entry(Vec::new())).unwrap();
+        cut_off(&mut nodes);
+    }
+    nodes[0].replica.compact(0).unwrap();
+    // The leader sends member 3 its snapshot, which is lost.
+    let mut snapshot = None;
+    for _ in 0..200 {
+        nodes[0].replica.tick().unwrap();
+        for m in nodes[0].replica.drive().unwrap().messages {
+            if m.to == 3 && kind(&m) == Some(mantle_range::MessageType::MsgSnapshot) {
+                snapshot = Some(m);
+            } else if m.to == 3 {
+                let _ = nodes[2].replica.step(m);
+                for back in nodes[2].replica.drive().unwrap().messages {
+                    let _ = nodes[0].replica.step(back);
+                }
+            }
+        }
+        if snapshot.is_some() {
+            break;
+        }
+    }
+    assert!(
+        snapshot.is_some(),
+        "no snapshot was sent: {}",
+        nodes[0].replica.describe()
+    );
+    // Its loss is reported while the leader has a ready out.
+    nodes[0].replica.propose(&entry(Vec::new())).unwrap();
+    let out = nodes[0].replica.begin().unwrap();
+    assert!(out.persisting, "the leader holds a ready");
+    nodes[0].replica.report_snapshot(3, false).unwrap();
+    nodes[0].replica.wait_persisted();
+    // Delivered in order from here, every snapshot reported as it arrives.
+    let mut wire: VecDeque<Message> = out.messages.into();
+    for _ in 0..10_000 {
+        for n in &mut nodes {
+            wire.extend(n.replica.drive().unwrap().messages);
+        }
+        let Some(m) = wire.pop_front() else { break };
+        let (from, to) = (m.from, m.to);
+        let is_snapshot = kind(&m) == Some(mantle_range::MessageType::MsgSnapshot);
+        let _ = nodes[usize::try_from(to).unwrap() - 1].replica.step(m);
+        if is_snapshot {
+            nodes[usize::try_from(from).unwrap() - 1]
+                .replica
+                .report_snapshot(to, true)
+                .unwrap();
+        }
+        if wire.is_empty() {
+            for _ in 0..SETTINGS.heartbeat_tick {
+                nodes[0].replica.tick().unwrap();
+            }
+        }
+        if nodes[2].replica.applied() == nodes[0].replica.applied() {
+            break;
+        }
+    }
+    assert_eq!(
+        nodes[2].replica.applied(),
+        nodes[0].replica.applied(),
+        "member 3 never caught up: {}",
+        nodes[0].replica.describe()
+    );
+}

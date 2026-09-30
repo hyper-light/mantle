@@ -104,7 +104,11 @@ range's update before the one flush that makes them all durable. A later `begin`
 finds the update durable and does steps 4 to 6; `begin` never looks at an update it has just
 submitted, since that flush is not done microseconds later and whether it happened to be
 would make what `begin` gives out depend on the log's thread. A range still has one `Ready` out at a time,
-and refuses every other call with `Stalled` until it is done; a follower's acknowledgement
+and refuses every other call with `Stalled` until it is done, but for a snapshot's report:
+replication to a member pauses until its snapshot's fate is known, so a report that comes
+while a ready is out is kept, the latest for each member, and taken once the ready is done,
+where refused and lost it left the member paused for good (a seed of the simulation found
+it); a follower's acknowledgement
 never leaves before its write is durable. Before, `drive` returned only after the flush, so
 the messages a leader may send during it waited for it (audit §5.1). The simulation takes
 half its members' `Ready`s this way under faults, leaving about two hundred a run flushing
@@ -195,7 +199,8 @@ members' `Ready`s under faults are taken with `begin` and finished at a later st
 which fences a node's log and takes the node down until it restarts from what the device
 kept. Once or twice a run a member is lost for good, its device and engine with it, and a
 member under a new identity replaces it as §6 describes; a second loss waits for the first
-replacement to finish. Replicas compact at random, so lagging
+replacement to finish. Members' clocks step forward and back by up to two seconds, and a leader stamps the entries
+it proposes with its own time. Replicas compact at random, so lagging
 members, new ones among them, are caught up by snapshot. Three gateways, each with its own session, put
 and get two keys at once. Puts go through the log, retried through leader changes with the
 session's serials. Gets are confirmed by ReadIndex and answered from the leader's rows once

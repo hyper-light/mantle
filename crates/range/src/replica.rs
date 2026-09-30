@@ -1,7 +1,7 @@
 //! One member of one range's Raft group (docs/design/replica.md): focal-raft's core, its
 //! group's view of the device's log, the range's engine and its layer's state machine.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use focal_raft::proto::protocompat::PbMessageExt;
@@ -111,6 +111,10 @@ pub struct Replica<F: BlockFile + 'static, E: Engine> {
     reads: Rounds,
     /// Ticks a round of reads may be out before it is taken as lost: an election timeout.
     round_ticks: u64,
+    /// Snapshots' fates reported while a ready was out, the latest for each member, taken
+    /// once it is done: replication to a member pauses until its snapshot's fate is known, so
+    /// a report is never refused, as a message or a proposal may be. At most one a member.
+    reports: BTreeMap<u64, bool>,
 }
 
 /// Reads confirmed a round at a time (audit §5.5). One round is out at a time, and one quorum's
@@ -270,6 +274,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
             uncertain,
             reads: Rounds::default(),
             round_ticks: u64::try_from(settings.election_tick).unwrap_or(u64::MAX),
+            reports: BTreeMap::new(),
         };
         // A log compacted before the restart can serve a lagging member only by snapshot.
         let compacted = replica
@@ -514,9 +519,21 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
 
     /// Reports whether a snapshot this member sent to `to` arrived. Replication to a member
     /// pauses while its snapshot is out, so the transport reports every snapshot's fate,
-    /// which a snapshot's own stream always learns (docs/design/replica.md §3).
+    /// which a snapshot's own stream always learns (docs/design/replica.md §3). A report that
+    /// comes while a ready is out is kept and taken once the ready is done: refused, a lost
+    /// report would pause replication to `to` for good. One for a member not in the
+    /// configuration is dropped, as the core would drop it.
     pub fn report_snapshot(&mut self, to: u64, arrived: bool) -> Result<(), ReplicaError> {
-        self.ready_for_calls()?;
+        if self.staged.is_some() {
+            if self.is_member(to) {
+                self.reports.insert(to, arrived);
+            }
+            return Ok(());
+        }
+        self.take_report(to, arrived)
+    }
+
+    fn take_report(&mut self, to: u64, arrived: bool) -> Result<(), ReplicaError> {
         let status = if arrived {
             focal_raft::SnapshotStatus::Finish
         } else {
@@ -524,6 +541,14 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
         };
         self.node.report_snapshot(to, status)?;
         Ok(())
+    }
+
+    /// Whether `id` is a voter or learner of the configuration, joint or not.
+    fn is_member(&self, id: u64) -> bool {
+        let c = &self.conf;
+        [&c.voters, &c.learners, &c.voters_outgoing, &c.learners_next]
+            .iter()
+            .any(|ids| ids.contains(&id))
     }
 
     pub fn campaign(&mut self) -> Result<(), ReplicaError> {
@@ -628,6 +653,12 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
                     out.stalled = Some(refusal);
                     break;
                 }
+            }
+        }
+        // Reports of snapshots that came while the ready was out.
+        if self.staged.is_none() {
+            for (to, arrived) in std::mem::take(&mut self.reports) {
+                self.take_report(to, arrived)?;
             }
         }
         // The reads that waited on a round now confirmed go in the next.

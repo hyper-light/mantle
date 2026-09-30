@@ -144,6 +144,8 @@ struct Node {
     lives: u64,
     /// Voters the group starts with.
     members: u64,
+    /// How far its clock runs ahead of the simulation's, in steps, or behind.
+    skew: i64,
 }
 
 fn log_id(id: u64) -> u128 {
@@ -170,6 +172,7 @@ impl Node {
             engine: None,
             lives: 0,
             members,
+            skew: 0,
         }
     }
 
@@ -292,6 +295,8 @@ struct World {
     /// Steps at which two members were down at once, and messages sent twice.
     two_down: u64,
     duplicated: u64,
+    /// Clocks stepped, forward or back.
+    stepped: u64,
 }
 
 /// What a run exercised, and what its gateways saw at which steps.
@@ -302,6 +307,7 @@ struct Ran {
     flushing: u64,
     two_down: u64,
     duplicated: u64,
+    stepped: u64,
     steps: u64,
     history: Vec<String>,
 }
@@ -347,6 +353,7 @@ impl World {
             flushing: 0,
             two_down: 0,
             duplicated: 0,
+            stepped: 0,
         }
     }
 
@@ -415,6 +422,12 @@ impl World {
         }
         if self.rng.chance(15) {
             self.blocked.clear();
+        }
+        if self.rng.chance(5) {
+            // A member's clock steps, forward or back, by up to two seconds: a leader stamps
+            // the entries it proposes with its own time (docs/design/replica.md §1).
+            self.nodes[i].skew = i64::try_from(self.rng.below(4_001)).unwrap() - 2_000;
+            self.stepped += 1;
         }
         if self.rng.chance(2) && self.nodes[i].replica.is_some() {
             // The device fails its next write or flush, which fences the log.
@@ -733,7 +746,13 @@ impl World {
 
     fn act(&mut self, g: usize) {
         let now = self.step;
-        let at_ns = now * 1_000_000;
+        // The leader's time, which its clock's skew moves.
+        let skew = self
+            .nodes
+            .iter()
+            .find(|n| n.replica.as_ref().is_some_and(|r| r.is_leader()))
+            .map_or(0, |n| n.skew);
+        let at_ns = u64::try_from((i64::try_from(now).unwrap() + skew).max(0)).unwrap() * 1_000_000;
         let gate_open = self.gate_open;
         let rng = self.rng.next();
         let gw = &mut self.gateways[g];
@@ -1048,6 +1067,7 @@ fn run(seed: u64, members: u64) -> Ran {
         flushing: w.flushing,
         two_down: w.two_down,
         duplicated: w.duplicated,
+        stepped: w.stepped,
         steps: w.step,
         history: w
             .history
@@ -1068,6 +1088,7 @@ fn a_group_under_faults_is_linearizable_and_applies_every_put_once() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
     let (mut replaced, mut stalls, mut flushing, mut two_down, mut duplicated) = (0, 0, 0, 0, 0);
+    let mut stepped = 0;
     for seed in first..first + seeds {
         // Odd seeds run a group of three, even ones of five.
         let members = if seed % 2 == 0 { 5 } else { 3 };
@@ -1080,7 +1101,10 @@ fn a_group_under_faults_is_linearizable_and_applies_every_put_once() {
         flushing += ran.flushing;
         two_down += ran.two_down;
         duplicated += ran.duplicated;
+        stepped += ran.stepped;
     }
+    // Leaders' clocks stepped back and forth, and every run stayed linearizable.
+    assert!(stepped > 0, "no clock was stepped");
     // Readies waited for room and the members went on: the path audit S04 found stranded.
     assert!(stalls > 0, "no ready ever waited for room");
     // Readies were left flushing across steps, their members refusing messages meanwhile.
@@ -1093,7 +1117,7 @@ fn a_group_under_faults_is_linearizable_and_applies_every_put_once() {
     eprintln!(
         "{seeds} runs replaced {replaced} members lost for good; {stalls} readies waited for \
          room; {flushing} were left flushing across a step; two of five were down at {two_down} \
-         steps; {duplicated} messages were sent twice"
+         steps; {duplicated} messages were sent twice; {stepped} clocks were stepped"
     );
 }
 

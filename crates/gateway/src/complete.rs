@@ -55,6 +55,15 @@ pub enum CompleteError {
     /// `400 EntityTooSmall`: a part other than the last is under 5 MiB.
     #[error("a part other than the last is under 5 MiB")]
     EntityTooSmall,
+    /// The upload names a checksum combination its algorithm does not have: full-object for a
+    /// hash, composite for CRC-64/NVME (05 §3.3). Creating the upload refuses these, so this
+    /// is a row no request could make (`500 InternalError`).
+    #[error("the upload names a checksum combination its algorithm does not have")]
+    ChecksumType,
+    /// Parts of an upload with composite checksums not numbered 1, 2, 3, …: S3 answers
+    /// `500 InternalError` for them, and mantle `400 InvalidPart` (05 §3.3).
+    #[error("composite checksums need parts numbered from 1 without a gap")]
+    NotConsecutive,
     /// A listed part was uploaded again while the completion ran: the request is retried.
     #[error("a listed part changed while the upload completed")]
     Stale,
@@ -246,6 +255,14 @@ impl Completion {
     /// its file of parts.
     fn combine(&mut self) -> Result<(), CompleteError> {
         let upload = self.upload.as_ref().ok_or(CompleteError::Mismatch)?;
+        if let Some((_, false)) = upload.checksum {
+            let consecutive = (1u16..)
+                .zip(&self.listed)
+                .all(|(n, (number, _))| n == *number);
+            if !consecutive {
+                return Err(CompleteError::NotConsecutive);
+            }
+        }
         let last = self.listed.len().saturating_sub(1);
         let mut parts = Vec::with_capacity(self.listed.len());
         for (i, (number, etag)) in self.listed.iter().enumerate() {
@@ -383,7 +400,15 @@ fn combined(
     full: bool,
     parts: &[(u16, &Part)],
 ) -> Result<record::Checksum, CompleteError> {
-    let algorithm = Algorithm::from_code(code).ok_or(CompleteError::InvalidPart)?;
+    let algorithm = Algorithm::from_code(code).ok_or(CompleteError::ChecksumType)?;
+    let combines = if full {
+        algorithm.full_object()
+    } else {
+        algorithm.composite()
+    };
+    if !combines {
+        return Err(CompleteError::ChecksumType);
+    }
     let values: Vec<(Checksum, u64)> = parts
         .iter()
         .map(|(_, p)| {

@@ -130,7 +130,9 @@ least 5 MiB (05 §4.4). The object's size, ETag and checksum are derived from th
 never taken from the request: the size the parts' sum, the ETag the MD5 of their MD5s with
 their number (05 §4.5), and the checksum, in the algorithm the upload named, the full-object
 CRC combined from each part's value and length, or the composite hash of the parts' values
-(05 §3.4). The object's file of parts is written with each part's plaintext length, an empty
+(05 §3.4). Composite checksums need parts numbered from 1 without a gap, which S3 answers
+with a 500 and mantle refuses as `InvalidPart` (05 §3.3), and an upload whose row names a
+combination its algorithm lacks is refused. The object's file of parts is written with each part's plaintext length, an empty
 part left out, and the Name range's Complete checks the parts again against its own rows,
 refusing a size that is not their sum or an ETag that does not name their number
 (`Miscombined`), and commits (audit §16.5). A completion whose upload is gone asks the Name

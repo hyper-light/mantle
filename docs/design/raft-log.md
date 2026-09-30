@@ -106,6 +106,14 @@ writer derived (`mantle_disk::commit`). Without it, a few replicas alternate bet
 and each update waits for two flushes
 (docs/measurements/2026-09-28-raft-log-benchmark.md, finding 2).
 
+A frame is laid out once: its header, whose checksum covers the payload where it lies, and
+then the payload, go straight into the aligned buffer the last frame used, kept while it is
+large enough, where before the payload was copied into a frame and the frame into a fresh
+zeroed buffer each time (audit §12.2). That is one whole-frame copy and one allocation fewer
+a frame; on this machine a flush's variance hides it in throughput, and peak memory of a
+16 KiB-entry benchmark fell from 88.6 and 82.1 MB to 80.9 and 71.0 MB in two alternating
+pairs of runs.
+
 That wait runs on the clock. `Config::waits` chooses: `Waits::Measured` is what a node
 runs; under `Waits::Never` a batch is what is queued when the writer looks, for the replica
 simulation, whose members have one update out at a time and so never return within a wait.

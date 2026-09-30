@@ -1568,3 +1568,49 @@ fn template_complete(key: &str, upload: &str) -> name::Complete {
         deadline_ns: 0,
     }
 }
+
+/// An upload with composite checksums completes only from parts numbered 1, 2, 3, … (05
+/// §3.3), and one whose row names a combination its algorithm lacks is refused.
+#[test]
+fn composite_checksums_need_consecutive_parts_and_a_combining_algorithm() {
+    let mut cell = Cell::new(3);
+    let wrapping = WrappingKey::generate().unwrap();
+    let composite = Some((Algorithm::Sha256.code(), false));
+    let upload = cell.create_upload_with("k", composite);
+    let bodies = [body(5 << 20, 21), body(5 << 20, 22), body(10, 23)];
+    let etags = upload_parts(
+        &mut cell,
+        "k",
+        &upload,
+        &bodies,
+        800,
+        Some(Algorithm::Sha256),
+        &wrapping,
+    );
+    let gap = vec![(1, etags[0].clone()), (3, etags[2].clone())];
+    assert_eq!(
+        complete_upload(&mut cell, "k", &upload, gap, 900),
+        Err(CompleteError::NotConsecutive)
+    );
+    let from_two = vec![(2, etags[1].clone()), (3, etags[2].clone())];
+    assert_eq!(
+        complete_upload(&mut cell, "k", &upload, from_two, 901),
+        Err(CompleteError::NotConsecutive)
+    );
+    assert!(complete_upload(&mut cell, "k", &upload, (1..=3).zip(etags).collect(), 902).is_ok());
+    // CRC-64/NVME has no composite form.
+    let wrong = cell.create_upload_with("j", Some((Algorithm::Crc64Nvme.code(), false)));
+    let etags = upload_parts(
+        &mut cell,
+        "j",
+        &wrong,
+        &[body(10, 24)],
+        910,
+        Some(Algorithm::Crc64Nvme),
+        &wrapping,
+    );
+    assert_eq!(
+        complete_upload(&mut cell, "j", &wrong, vec![(1, etags[0].clone())], 920),
+        Err(CompleteError::ChecksumType)
+    );
+}

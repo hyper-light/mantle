@@ -92,6 +92,10 @@ pub(crate) struct Writer<F> {
     /// frame's persist record will, or a confirmation written when no frame follows at once
     /// (docs/design/raft-log.md §3, §6). Its updates are answered only then.
     unconfirmed: Option<Unconfirmed>,
+    /// The aligned buffer the last frame was laid out in, kept for the next: one frame's
+    /// bytes at most, a segment and a block, which the log's settings hold within one I/O
+    /// buffer.
+    frame: Option<AlignedBuf>,
 }
 
 /// A frame flushed and not yet confirmed, and the updates it carried: at most one frame's.
@@ -111,6 +115,7 @@ impl<F: BlockFile> Writer<F> {
             anticipation: Anticipation::new(),
             received: 0,
             unconfirmed: None,
+            frame: None,
         })
     }
 
@@ -550,19 +555,19 @@ impl<F: BlockFile> Writer<F> {
     /// Writes the frame, and the segment's header before it when it opens a segment, and the
     /// frame's persist record, then flushes the file once. Returns the frame's sequence.
     fn write(
-        &self,
+        &mut self,
         target: &Target,
         records: u32,
         payload: &[u8],
         tail: u64,
         taken: &[(Submission, Placement)],
     ) -> Result<u64, LogError> {
-        let shared = &self.shared;
+        let shared = Arc::clone(&self.shared);
         let (sequence, flushed) = {
             let state = shared.read_state()?;
             (state.next_sequence, state.durable)
         };
-        let frame = FrameHeader::frame(
+        let frame = FrameHeader::header(
             shared.id,
             target.incarnation,
             target.nonce,
@@ -579,8 +584,13 @@ impl<F: BlockFile> Writer<F> {
         let total = header_room
             .checked_add(frame_len)
             .ok_or(LogError::TooLarge(payload.len()))?;
-        let mut buf =
-            AlignedBuf::zeroed(total, shared.align).map_err(|e| LogError::Disk(e.into()))?;
+        // The last frame's buffer, reused while it is large enough: every byte up to the padded
+        // end is written below, so nothing of the frame before survives into this one.
+        let mut buf = match self.frame.take() {
+            Some(buf) if buf.capacity() >= total => buf,
+            _ => AlignedBuf::zeroed(total, shared.align).map_err(|e| LogError::Disk(e.into()))?,
+        };
+        buf.clear();
         if target.opens {
             let header = SegmentHeader {
                 log: shared.id,
@@ -595,13 +605,19 @@ impl<F: BlockFile> Writer<F> {
         }
         buf.extend_from_slice(&frame)
             .map_err(|e| LogError::Disk(e.into()))?;
+        buf.extend_from_slice(payload)
+            .map_err(|e| LogError::Disk(e.into()))?;
         let at = if target.opens {
-            slot_start(shared, target.slot)?
+            slot_start(&shared, target.slot)?
         } else {
             target.offset
         };
-        let bytes = buf.padded().map_err(|e| LogError::Disk(e.into()))?;
-        shared.file.write_all_at(bytes, at)?;
+        let written = buf
+            .padded()
+            .map_err(|e| LogError::Disk(e.into()))
+            .and_then(|bytes| shared.file.write_all_at(bytes, at).map_err(LogError::from));
+        self.frame = Some(buf);
+        written?;
         // What the frame's flush makes durable, apart from the frame, so that recovery can
         // restore it should the frame be damaged since (§6); it confirms the frame before.
         let record = format::Persist {
@@ -610,7 +626,7 @@ impl<F: BlockFile> Writer<F> {
             confirms: flushed,
             groups: taken.iter().map(|(s, _)| persisted(s)).collect(),
         };
-        write_persist(shared, &record, sequence)?;
+        write_persist(&shared, &record, sequence)?;
         shared.file.sync_data()?;
         Ok(sequence)
     }

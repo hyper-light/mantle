@@ -117,8 +117,24 @@ impl FrameHeader {
         records: u32,
         payload: &[u8],
     ) -> Option<Vec<u8>> {
+        let mut frame = Self::header(log, incarnation, nonce, sequence, tail, records, payload)?;
+        frame.extend_from_slice(payload);
+        Some(frame)
+    }
+
+    /// The header of the frame of `payload`, its CRC computed over both, for a writer that
+    /// lays the payload after it where it already is.
+    pub fn header(
+        log: u128,
+        incarnation: u64,
+        nonce: u64,
+        sequence: u64,
+        tail: u64,
+        records: u32,
+        payload: &[u8],
+    ) -> Option<Vec<u8>> {
         let payload_len = u32::try_from(payload.len()).ok()?;
-        let mut w = Writer::with_capacity(FRAME_HEADER_LEN.checked_add(payload.len())?);
+        let mut w = Writer::with_capacity(FRAME_HEADER_LEN);
         w.bytes(&FRAME_MAGIC);
         w.u8(FORMAT);
         w.zeros(3);
@@ -133,7 +149,6 @@ impl FrameHeader {
         crc.update(w.as_slice());
         crc.update(payload);
         w.u32(crc.finish());
-        w.bytes(payload);
         Some(w.into_vec())
     }
 

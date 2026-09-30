@@ -22,7 +22,9 @@ use std::mem::{offset_of, size_of};
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, MAX_PATH,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     BusType1394, BusTypeAta, BusTypeAtapi, BusTypeFibre, BusTypeFileBackedVirtual, BusTypeMmc,
     BusTypeNvme, BusTypeRAID, BusTypeSCM, BusTypeSas, BusTypeSata, BusTypeScsi, BusTypeSd,
@@ -34,12 +36,13 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{
     DEVICE_SEEK_PENALTY_DESCRIPTOR, IOCTL_STORAGE_QUERY_PROPERTY, PropertyStandardQuery,
-    STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR, STORAGE_DEVICE_DESCRIPTOR, STORAGE_PROPERTY_ID,
-    STORAGE_PROPERTY_QUERY, STORAGE_WRITE_CACHE_PROPERTY, STORAGE_ZONED_DEVICE_DESCRIPTOR,
-    StorageAccessAlignmentProperty, StorageDeviceProperty, StorageDeviceSeekPenaltyProperty,
-    StorageDeviceWriteCacheProperty, StorageDeviceZonedDeviceProperty, WriteCacheDisabled,
-    WriteCacheEnabled, WriteCacheTypeWriteBack, WriteCacheTypeWriteThrough,
-    ZonedDeviceTypeDeviceManaged, ZonedDeviceTypeHostAware, ZonedDeviceTypeHostManaged,
+    STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR, STORAGE_DESCRIPTOR_HEADER, STORAGE_DEVICE_DESCRIPTOR,
+    STORAGE_PROPERTY_ID, STORAGE_PROPERTY_QUERY, STORAGE_WRITE_CACHE_PROPERTY,
+    STORAGE_ZONED_DEVICE_DESCRIPTOR, StorageAccessAlignmentProperty, StorageDeviceProperty,
+    StorageDeviceSeekPenaltyProperty, StorageDeviceWriteCacheProperty,
+    StorageDeviceZonedDeviceProperty, WriteCacheDisabled, WriteCacheEnabled,
+    WriteCacheTypeWriteBack, WriteCacheTypeWriteThrough, ZonedDeviceTypeDeviceManaged,
+    ZonedDeviceTypeHostAware, ZonedDeviceTypeHostManaged,
 };
 use windows_sys::Win32::System::WindowsProgramming::{DRIVE_RAMDISK, DRIVE_REMOTE};
 
@@ -47,11 +50,10 @@ use crate::identity::{
     FileSystem, FileSystemKind, Identity, Interconnect, Medium, WriteCache, Zoned,
 };
 
-/// Wide-character buffer for a path or volume name (MAX_PATH is 260; long paths and
-/// volume GUID paths fit in this).
-const NAME_CHARS: usize = 1024;
-/// Bytes of a STORAGE_DEVICE_DESCRIPTOR with its vendor, product and serial strings.
-const DESCRIPTOR_BYTES: usize = 4096;
+/// Wide characters of a volume GUID path with its terminator: "A reasonable size for the
+/// buffer to accommodate the largest possible volume GUID path is 50 characters"
+/// (GetVolumeNameForVolumeMountPointW, Microsoft Learn).
+const VOLUME_GUID_CHARS: usize = 50;
 
 /// A kernel handle this code owns, closed on drop.
 struct Handle(HANDLE);
@@ -193,7 +195,17 @@ fn describe(volume: &Handle, identity: &mut Identity) {
 /// The mount point holding `path`, with its trailing separator.
 fn volume_root(path: &Path, identity: &mut Identity) -> Option<String> {
     let path_w = wide(path.as_os_str());
-    let mut root = vec![0u16; NAME_CHARS];
+    // "A reasonable size for the buffer to accommodate the largest possible volume path is the
+    // length of the full path specified by lpszFileName" (GetVolumePathNameW, Microsoft
+    // Learn), and one more for the separator a mount point's path gains.
+    let full = match std::path::absolute(path) {
+        Ok(full) => wide(full.as_os_str()).len(),
+        Err(e) => {
+            identity.note(format!("absolute {}", path.display()), e.to_string());
+            return None;
+        }
+    };
+    let mut root = vec![0u16; full.checked_add(1)?];
     let len = u32::try_from(root.len()).ok()?;
     // SAFETY: `path_w` is NUL-terminated; `root` is writable for `len` wide characters.
     let ok = unsafe { GetVolumePathNameW(path_w.as_ptr(), root.as_mut_ptr(), len) };
@@ -208,7 +220,8 @@ fn volume_root(path: &Path, identity: &mut Identity) -> Option<String> {
 }
 
 fn file_system(root_w: &[u16], identity: &mut Identity) -> FileSystem {
-    let mut name = vec![0u16; 64];
+    // "The maximum buffer size is MAX_PATH+1" (GetVolumeInformationW, Microsoft Learn).
+    let mut name = vec![0u16; usize::try_from(MAX_PATH).unwrap_or(0).saturating_add(1)];
     let name_len = u32::try_from(name.len()).unwrap_or(0);
     // SAFETY: `root_w` is NUL-terminated; `name` is writable for `name_len` wide characters;
     // the optional outputs are null.
@@ -253,7 +266,7 @@ fn file_system(root_w: &[u16], identity: &mut Identity) -> FileSystem {
 /// Opens the volume under `root` by its GUID path with no access rights: enough for
 /// IOCTL_STORAGE_QUERY_PROPERTY, and it needs no privilege.
 fn open_volume(root_w: &[u16], identity: &mut Identity) -> Option<Handle> {
-    let mut guid = vec![0u16; NAME_CHARS];
+    let mut guid = vec![0u16; VOLUME_GUID_CHARS];
     let len = u32::try_from(guid.len()).ok()?;
     // SAFETY: `root_w` is NUL-terminated; `guid` is writable for `len` wide characters.
     let ok = unsafe { GetVolumeNameForVolumeMountPointW(root_w.as_ptr(), guid.as_mut_ptr(), len) };
@@ -294,14 +307,33 @@ fn open_device(name: &str, identity: &mut Identity) -> Option<Handle> {
     Some(Handle(handle))
 }
 
-/// Runs a standard IOCTL_STORAGE_QUERY_PROPERTY query and returns the bytes written.
+/// Runs a standard IOCTL_STORAGE_QUERY_PROPERTY query and returns the bytes written: first
+/// for the descriptor's header, whose `Size` is the bytes the whole descriptor takes, then
+/// for the descriptor in a buffer of that size (IOCTL_STORAGE_QUERY_PROPERTY, Microsoft
+/// Learn).
 fn query(volume: &Handle, property: STORAGE_PROPERTY_ID) -> Result<Vec<u8>, String> {
+    let header = query_into(volume, property, size_of::<STORAGE_DESCRIPTOR_HEADER>())?;
+    let size = u32_at(&header, offset_of!(STORAGE_DESCRIPTOR_HEADER, Size))
+        .ok_or("a descriptor header shorter than its fields")?;
+    let size = usize::try_from(size).map_err(|e| e.to_string())?;
+    if size > crate::buf::MAX_BUFFER {
+        return Err(format!("a descriptor of {size} bytes"));
+    }
+    query_into(volume, property, size.max(header.len()))
+}
+
+/// One IOCTL_STORAGE_QUERY_PROPERTY query into a buffer of `len` bytes.
+fn query_into(
+    volume: &Handle,
+    property: STORAGE_PROPERTY_ID,
+    len: usize,
+) -> Result<Vec<u8>, String> {
     let request = STORAGE_PROPERTY_QUERY {
         PropertyId: property,
         QueryType: PropertyStandardQuery,
         AdditionalParameters: [0],
     };
-    let mut out = vec![0u8; DESCRIPTOR_BYTES];
+    let mut out = vec![0u8; len];
     let mut returned = 0u32;
     let in_len = u32::try_from(size_of::<STORAGE_PROPERTY_QUERY>()).map_err(|e| e.to_string())?;
     let out_len = u32::try_from(out.len()).map_err(|e| e.to_string())?;

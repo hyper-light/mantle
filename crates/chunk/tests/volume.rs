@@ -124,7 +124,8 @@ fn chunks_read_back_exactly_on_a_real_file() {
 
 /// A volume on a raw device, the device's whole capacity, reopens with its chunks: the
 /// node's length is the device's, so recovery finds the superblocks, and its flush reaches
-/// the device (audit §6.2).
+/// the device (audit §6.2). Windows has no such test yet.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 fn a_volume_on_a_raw_device_reopens(node: &std::path::Path) {
     let open = || {
         DeviceFile::open(

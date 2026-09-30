@@ -1784,6 +1784,17 @@ fn another_log_or_geometry_is_refused() {
         Log::create(sim(10), config(3, 8), ID),
         Err(LogError::Config(_))
     ));
+    // A segment one block past a buffer's bound, refused before the file is touched.
+    let past = Config {
+        segment_bytes: mantle_disk::buf::MAX_BUFFER as u64 + BLOCK as u64,
+        ..config(16, 8)
+    };
+    let untouched = sim(11);
+    assert!(matches!(
+        Log::create(Arc::clone(&untouched), past, ID),
+        Err(LogError::Config(_))
+    ));
+    assert!(untouched.durable_image().unwrap().is_empty());
 }
 
 /// A step of a generated history.

@@ -1,6 +1,6 @@
 //! Volume geometry and configuration.
 
-use mantle_disk::buf::Alignment;
+use mantle_disk::buf::{Alignment, MAX_BUFFER};
 
 use crate::error::ChunkError;
 use crate::frame::{DELETE_LEN, FRAME_HEADER, PUT_LEN, SEGMENT_LEN};
@@ -211,6 +211,12 @@ impl Geometry {
         if config.segment_size > u64::from(u32::MAX) {
             return Err(bad("segment size must be below 4 GiB"));
         }
+        // A record may fill its segment, and is written and read in one buffer.
+        if config.segment_size > u64::try_from(MAX_BUFFER).unwrap_or(u64::MAX) {
+            return Err(bad(
+                "segment size must fit one I/O buffer (mantle_disk::buf::MAX_BUFFER)",
+            ));
+        }
         if !(9..=24).contains(&config.checksum_shift) {
             return Err(bad("checksum block must be between 512 B and 16 MiB"));
         }
@@ -411,5 +417,16 @@ mod tests {
             ..Config::default()
         };
         assert!(Geometry::plan(1 << 20, a, &c).is_err(), "too small");
+        // A segment one block past a buffer's bound, on a volume with room for many.
+        let c = Config {
+            segment_size: MAX_BUFFER as u64 + 4096,
+            ..Config::default()
+        };
+        assert!(Geometry::plan(1 << 40, a, &c).is_err(), "past one buffer");
+        let c = Config {
+            segment_size: MAX_BUFFER as u64,
+            ..Config::default()
+        };
+        assert!(Geometry::plan(1 << 40, a, &c).is_ok(), "one buffer");
     }
 }

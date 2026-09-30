@@ -15,8 +15,11 @@ use std::sync::Mutex;
 /// buffer can waste.
 pub const MAX_ALIGNMENT: usize = 1 << 20;
 
-/// The largest single buffer. A buffer holds one I/O; the largest I/O mantle issues is well
-/// below this, and the bound turns a corrupt length into a refusal instead of an allocation.
+/// The largest single buffer. A buffer holds one I/O, and the bound turns a corrupt length
+/// into a refusal instead of an allocation. The largest I/O mantle issues is a chunk record
+/// that fills its segment, and the chunk store refuses a segment larger than this before any
+/// I/O (`mantle_chunk::layout::Geometry::plan`); every other I/O is bounded by a frame or a
+/// batch, far below it.
 pub const MAX_BUFFER: usize = 1 << 30;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use mantle_disk::block::BlockFile;
-use mantle_disk::buf::{AlignedBuf, Alignment};
+use mantle_disk::buf::{AlignedBuf, Alignment, MAX_BUFFER};
 
 use crate::format::{self, FRAME_HEADER_BYTES, FrameHeader, Owned, SegmentHeader};
 use crate::state::{self, Live, Place, Replayed, Slot};
@@ -207,6 +207,12 @@ pub(crate) fn check(config: &Config, align: Alignment) -> Result<(), LogError> {
     if !align.is_aligned_u64(config.segment_bytes) || blocks < 4 {
         return Err(LogError::Config(
             "a segment is a multiple of the alignment, four blocks at least",
+        ));
+    }
+    // Recovery reads a segment through one window, and a frame may fill a segment.
+    if config.segment_bytes > u64::try_from(MAX_BUFFER).unwrap_or(u64::MAX) {
+        return Err(LogError::Config(
+            "a segment fits one I/O buffer (mantle_disk::buf::MAX_BUFFER)",
         ));
     }
     if u64::from(config.max_segments) < 3 {

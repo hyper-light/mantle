@@ -6,11 +6,13 @@
 //! bounded, so a deep text is refused rather than followed down the stack; the caller bounds
 //! the text's size.
 
-/// The deepest nesting read. A bucket policy nests six levels, a statement's condition values
-/// inside its operator inside its `Condition` inside the statement inside `Statement` inside
-/// the policy (17 §3.1); the bound leaves room for the grammar's other shapes, which a
-/// policy's checks refuse with S3's messages.
-pub const MAX_DEPTH: usize = 32;
+/// The deepest nesting read: one level past the deepest document read. A bucket policy nests
+/// six levels, a statement's condition values inside its operator inside its `Condition`
+/// inside the statement inside `Statement` inside the policy (17 §3.1), and a POST policy
+/// three, a condition's operands inside the condition inside `conditions` (19 §4.2). The
+/// seventh level lets a policy's checks find an object or array where a value belongs and
+/// refuse it with S3's message for it; a deeper one is refused as JSON too deep.
+pub const MAX_DEPTH: usize = 7;
 
 /// A JSON value.
 #[derive(Debug, Clone, PartialEq, Eq)]

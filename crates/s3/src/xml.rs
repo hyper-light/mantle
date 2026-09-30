@@ -11,6 +11,7 @@
 //! be one a client can send back (13 §7). Bodies are UTF-8 (docs/design/s3-protocol.md §2).
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 
 /// S3's namespace. Request documents may carry it or none (13 §6.1).
 pub const NAMESPACE: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
@@ -18,11 +19,6 @@ const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
 const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
 /// XML Schema's instance namespace, whose `type` attribute names an ACL grantee's kind (13 §6.8).
 const XSI_NAMESPACE: &str = "http://www.w3.org/2001/XMLSchema-instance";
-
-/// Attributes one tag may carry. AWS's samples carry at most two on a tag (`xmlns:xsi` and
-/// `xsi:type` on an ACL grantee, 13 §6.8); the bound holds the duplicate check, quadratic in the
-/// count, to 120 comparisons.
-const MAX_ATTRIBUTES: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum XmlError {
@@ -319,7 +315,10 @@ impl<'a> Reader<'a> {
     fn start_tag(&mut self) -> Result<&'a str, XmlError> {
         self.rest = strip(self.rest, "<")?;
         let qualified = self.name()?;
+        // The names seen, sorted, so that finding one given twice costs a search, not a pass:
+        // the body's size limit bounds how many a tag holds.
         let mut attributes: Vec<(&'a str, Cow<'a, str>)> = Vec::new();
+        let mut names = BTreeSet::new();
         let empty = loop {
             let spaced = self.skip_space();
             if let Some(rest) = self.rest.strip_prefix("/>") {
@@ -335,17 +334,12 @@ impl<'a> Reader<'a> {
                     "attributes not separated by white space",
                 ));
             }
-            if attributes.len() >= MAX_ATTRIBUTES {
-                return Err(XmlError::Schema(
-                    "more attributes than S3's documents carry",
-                ));
-            }
             let name = self.name()?;
             self.skip_space();
             self.rest = strip(self.rest, "=")?;
             self.skip_space();
             let value = self.attribute_value()?;
-            if attributes.iter().any(|(seen, _)| *seen == name) {
+            if !names.insert(name) {
                 return Err(XmlError::NotWellFormed("an attribute given twice"));
             }
             attributes.push((name, value));
@@ -944,8 +938,16 @@ mod tests {
                 read(body, &shape)
             );
         }
-        let many: String = (0..17).map(|i| format!(" xmlns:p{i}='u'")).collect();
-        assert!(read(&format!("<Delete{many}/>"), &shape).is_err());
+        // Declarations are read however many a tag carries, and one given twice among them is
+        // found.
+        let many: String = (0..1000).map(|i| format!(" xmlns:p{i}='u'")).collect();
+        let tag = format!("<Delete{many}><Object><Key>k</Key></Object></Delete>");
+        assert!(read(&tag, &shape).is_ok());
+        let twice = format!("<Delete{many} xmlns:p500='v'><Object><Key>k</Key></Object></Delete>");
+        assert_eq!(
+            read(&twice, &shape).map(|_| ()),
+            Err(XmlError::NotWellFormed("an attribute given twice"))
+        );
     }
 
     /// `xsi:type` on an ACL grantee (13 §6.8), in the forms Namespaces in XML allows, and only

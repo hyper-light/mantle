@@ -9,6 +9,7 @@
 //! Documentation/ABI/stable/sysfs-block. File system types are the statfs(2) `f_type` magic
 //! numbers of include/uapi/linux/magic.h.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use rustix::fs::FileType;
@@ -17,10 +18,10 @@ use crate::identity::{
     FileSystem, FileSystemKind, Identity, Interconnect, Medium, WriteCache, Zoned,
 };
 
-/// Composite devices nest (dm-crypt over LVM over md); the walk stops past this depth.
+/// Composite devices nest (dm-crypt over LVM over md, three deep); the walk, which recurses,
+/// stops past this depth and leaves the composite's medium unknown rather than guess it, so
+/// the device is measured and treated as rule 5 of CLAUDE.md treats an undescribed one.
 const MAX_DEPTH: usize = 8;
-/// Members described per composite device.
-const MAX_MEMBERS: usize = 64;
 
 pub fn identify(path: &Path) -> Identity {
     let stat = rustix::fs::stat(path);
@@ -98,16 +99,19 @@ fn describe_number(number: rustix::fs::Dev, identity: &mut Identity) -> Option<P
         }
     };
     if !dir.join("partition").exists() {
-        describe(&dir, identity, 0);
+        describe(&dir, identity, 0, &mut HashSet::new());
         return None;
     }
     let disk = dir.parent().map_or_else(|| dir.clone(), Path::to_path_buf);
-    describe(&disk, identity, 0);
+    describe(&disk, identity, 0, &mut HashSet::new());
     Some(dir)
 }
 
-/// Fills `identity` from the sysfs directory of a whole block device.
-fn describe(disk: &Path, identity: &mut Identity, depth: usize) {
+/// Fills `identity` from the sysfs directory of a whole block device. `seen` holds the devices
+/// the walk has described, each once, so the walk does no more work than the system has
+/// block devices, however they share members.
+fn describe(disk: &Path, identity: &mut Identity, depth: usize, seen: &mut HashSet<PathBuf>) {
+    seen.insert(disk.to_path_buf());
     let name = disk
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -150,7 +154,7 @@ fn describe(disk: &Path, identity: &mut Identity, depth: usize) {
     identity.model = read_str(&disk.join("device"), "model", identity);
 
     if identity.interconnect == Interconnect::Composite {
-        members(disk, identity, depth);
+        members(disk, identity, depth, seen);
     }
 }
 
@@ -190,12 +194,13 @@ fn interconnect(name: &str, canonical: &str, disk: &Path, identity: &mut Identit
     Interconnect::Unknown
 }
 
-fn members(disk: &Path, identity: &mut Identity, depth: usize) {
+fn members(disk: &Path, identity: &mut Identity, depth: usize, seen: &mut HashSet<PathBuf>) {
     if depth >= MAX_DEPTH {
         identity.note(
             "slaves",
             format!("nesting deeper than {MAX_DEPTH}; not followed"),
         );
+        identity.medium = Medium::Unknown;
         return;
     }
     let slaves = disk.join("slaves");
@@ -206,7 +211,8 @@ fn members(disk: &Path, identity: &mut Identity, depth: usize) {
             return;
         }
     };
-    for entry in entries.flatten().take(MAX_MEMBERS) {
+    let mut shared = false;
+    for entry in entries.flatten() {
         let Ok(dir) = std::fs::canonicalize(entry.path()) else {
             continue;
         };
@@ -215,8 +221,18 @@ fn members(disk: &Path, identity: &mut Identity, depth: usize) {
         } else {
             dir
         };
+        // A device under two members of the stack is described once; the composite's medium
+        // then rests on a member not described here, and is left unknown.
+        if seen.contains(&whole) {
+            identity.note(
+                format!("slave {}", whole.display()),
+                "described under another member".to_owned(),
+            );
+            shared = true;
+            continue;
+        }
         let mut member = Identity::unknown(identity.file_system.clone());
-        describe(&whole, &mut member, depth.saturating_add(1));
+        describe(&whole, &mut member, depth.saturating_add(1), seen);
         identity.members.push(member);
     }
     // A composite device is as slow as its slowest member: rotational if any member is.
@@ -226,6 +242,8 @@ fn members(disk: &Path, identity: &mut Identity, depth: usize) {
         .any(|m| m.medium == Medium::Rotational)
     {
         identity.medium = Medium::Rotational;
+    } else if shared {
+        identity.medium = Medium::Unknown;
     }
 }
 

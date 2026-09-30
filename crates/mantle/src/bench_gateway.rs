@@ -8,7 +8,8 @@
 //! CRC-64/NVME, as the SDKs send one by default. A GET reads the whole object, and again with
 //! the volume of its first chunk failing every read, so that each block it held is decoded.
 //!
-//! Beside each rate, the round trips a PUT or GET waits through: every request it has out
+//! Beside each rate, the round trips a PUT or GET waits through, a PUT's with one full block going
+//! down at a time and with every block of the object at once ("all out"): every request it has out
 //! answered together is one. With the cell's answers each taking a latency `T` rather than
 //! none, an object of `S` bytes takes at least its round trips times `T`, whatever the path's
 //! speed per byte, which is what bounds a latency-limited transfer (audit §16.3).
@@ -23,7 +24,9 @@ use mantle_disk::measure::SplitMix64;
 use mantle_ec::durability::Scheme;
 use mantle_gateway::get::{self, Get, GetError, Keyring};
 use mantle_gateway::layout::{Layout, LayoutError};
-use mantle_gateway::put::{Answer, Body, Commit, Expected, Ids, Keys, Put, PutError, Request};
+use mantle_gateway::put::{
+    Answer, Body, Commit, Expected, Holding, Ids, Keys, Put, PutError, Request,
+};
 use mantle_meta::engine::Model;
 use mantle_meta::error::MetaError;
 use mantle_meta::name::{self, GateChange, Preconditions};
@@ -299,6 +302,7 @@ fn put(
     file: u128,
     ids: &mut u128,
     wrapping: &WrappingKey,
+    window: usize,
 ) -> Result<u64, Error> {
     let data = DataKey::generate()?;
     let keys = Keys {
@@ -325,7 +329,10 @@ fn put(
         body,
         keys,
         layout,
-        HANDOVER,
+        Holding {
+            handover_ns: HANDOVER,
+            window,
+        },
         Box::new(Counter(first)),
         0,
     )?;
@@ -421,8 +428,8 @@ pub fn gateway(
 ) -> Result<(), Error> {
     writeln!(
         out,
-        "  {:<10} {:>8} {:>11} {:>7} {:>11} {:>7} {:>11}",
-        "scheme", "object", "PUT", "rounds", "GET", "rounds", "GET 1 lost"
+        "  {:<10} {:>8} {:>11} {:>7} {:>8} {:>11} {:>7} {:>11}",
+        "scheme", "object", "PUT", "rounds", "all out", "GET", "rounds", "GET 1 lost"
     )?;
     let wrapping = WrappingKey::generate()?;
     for &scheme in schemes {
@@ -433,19 +440,35 @@ pub fn gateway(
         for &size in sizes {
             let mut bytes = vec![0u8; size];
             SplitMix64::new(u64::try_from(size).unwrap_or(0)).fill(&mut bytes);
+            let length =
+                u64::try_from(size).map_err(|_| Error::Unexpected("a size past u64".into()))?;
             let mut cell = Cell::new(volumes)?;
             let mut ids = 0u128;
             let mut file = 1u128;
             let (put_rate, put_rounds) = rate(size, step, || {
                 cell.empty();
                 file = file.saturating_add(1);
-                put(&mut cell, &bytes, layout, file, &mut ids, &wrapping)
+                put(&mut cell, &bytes, layout, file, &mut ids, &wrapping, 1)
             })?;
             cell.empty();
             let stored = u128::MAX;
-            put(&mut cell, &bytes, layout, stored, &mut ids, &wrapping)?;
-            let length =
-                u64::try_from(size).map_err(|_| Error::Unexpected("a size past u64".into()))?;
+            put(&mut cell, &bytes, layout, stored, &mut ids, &wrapping, 1)?;
+            // Every block of the object in flight at once: the fewest round trips a window
+            // can bring the PUT to.
+            let blocks = usize::try_from(layout.blocks(length))
+                .map_err(|_| Error::Unexpected("blocks past usize".into()))?;
+            cell.empty();
+            let wide_rounds = put(
+                &mut cell,
+                &bytes,
+                layout,
+                stored,
+                &mut ids,
+                &wrapping,
+                blocks.max(1),
+            )?;
+            cell.empty();
+            put(&mut cell, &bytes, layout, stored, &mut ids, &wrapping, 1)?;
             let (get_rate, (read, get_rounds)) =
                 rate(size, step, || get(&mut cell, stored, length, &wrapping))?;
             if read != length {
@@ -457,7 +480,7 @@ pub fn gateway(
             let (lost_rate, _) = rate(size, step, || get(&mut cell, stored, length, &wrapping))?;
             writeln!(
                 out,
-                "  {:<10} {:>8} {:>11} {:>7} {:>11} {:>7} {:>11}",
+                "  {:<10} {:>8} {:>11} {:>7} {:>8} {:>11} {:>7} {:>11}",
                 match scheme {
                     Scheme::Copies(n) => format!("{n} copies"),
                     Scheme::Rs(code) => format!("RS({},{})", code.data(), code.parity()),
@@ -465,6 +488,7 @@ pub fn gateway(
                 display::size(size),
                 display::rate(put_rate),
                 put_rounds,
+                wide_rounds,
                 display::rate(get_rate),
                 get_rounds,
                 display::rate(lost_rate),

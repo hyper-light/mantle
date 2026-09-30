@@ -92,10 +92,16 @@ takes 646 blocks. The File range therefore never refuses a body after all its ch
 written, and the blocks a PUT keeps for renewal, with its file's manifest, are bounded by its
 admission.
 
-**Blocks in flight.** A PUT holds at most two blocks: one filling while the one before it is
-written. Two is the fewest that overlap the body's arrival with the chunk writes; with more,
-the body only runs further ahead of writes that cannot keep up, and it waits instead. By
-Little's law the pipe sustains a body up to a block's bytes each block-write time.
+**Blocks in flight.** A PUT holds the block filling and at most `window` full blocks going
+down at once, a number its caller admits from the memory it gives the PUT; the body waits
+while that many go down. Each block's write is a chain of round trips, placement, its chunks
+and its Block row, so with one block going down a body's round trips add up block by block:
+a 64 MiB object in three copies, eight blocks, took 29, and a single part's rate is bounded
+by a block's bytes each chain (audit §16.3). With every block of it admitted at once the
+same object takes 5, as a one-block object does (`mantle bench gateway`, "all out"; round
+trips do not depend on the machine). By Little's law a window of `w` sustains `w` blocks'
+bytes each chain's latency, and the memory it takes is `w` blocks and their parity; what `w`
+a gateway admits follows from its memory and the latency it measures, which the node sets.
 
 **Deadlines** pass up the layers: each write answers with the deadline by which the layer
 above must take what it wrote, and the gateway's handover time is the per-step deadline times

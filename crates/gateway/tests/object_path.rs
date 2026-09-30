@@ -23,7 +23,7 @@ use mantle_gateway::complete::{self, CompleteError, Completed, Completion};
 use mantle_gateway::get::{self, Get, GetError, Keyring};
 use mantle_gateway::layout::{Layout, SEALED};
 use mantle_gateway::put::{
-    Answer, Body, Commit, Expected, Ids, Keys, Put, PutError, Request, Stored,
+    Answer, Body, Commit, Expected, Holding, Ids, Keys, Put, PutError, Request, Stored,
 };
 use mantle_meta::engine::{Engine, Model};
 use mantle_meta::name::{self, CreateUpload, GateChange, Preconditions, PutPart};
@@ -297,6 +297,14 @@ impl Cell {
 }
 
 /// Block IDs counted from a start.
+/// Held a handover at a time, `window` full blocks going down at once.
+fn holding(window: usize) -> Holding {
+    Holding {
+        handover_ns: HANDOVER,
+        window,
+    }
+}
+
 struct Counter(u128);
 
 impl Ids for Counter {
@@ -517,6 +525,18 @@ fn run(
 }
 
 fn new_put(cell: &Cell, commit: Commit, length: u64, layout: Layout, keys: Keys) -> Put {
+    new_put_in(cell, commit, length, layout, keys, 1)
+}
+
+/// A PUT with `window` full blocks going down at once.
+fn new_put_in(
+    cell: &Cell,
+    commit: Commit,
+    length: u64,
+    layout: Layout,
+    keys: Keys,
+    window: usize,
+) -> Put {
     let body = Body {
         length,
         checksum: Some(Algorithm::Crc64Nvme),
@@ -527,7 +547,7 @@ fn new_put(cell: &Cell, commit: Commit, length: u64, layout: Layout, keys: Keys)
         body,
         keys,
         layout,
-        HANDOVER,
+        holding(window),
         Box::new(Counter(1_000)),
         cell.clock,
     )
@@ -550,7 +570,7 @@ fn a_body_past_one_request_is_refused_before_anything_is_asked() {
             },
             keys(1, &wrapping),
             Layout::new(Scheme::Copies(3)).unwrap(),
-            HANDOVER,
+            holding(1),
             Box::new(Counter(1_000)),
             cell.clock,
         )
@@ -581,7 +601,7 @@ fn a_part_numbered_outside_s3s_range_is_refused_before_anything_is_asked() {
             },
             keys(1, &wrapping),
             Layout::new(Scheme::Copies(3)).unwrap(),
-            HANDOVER,
+            holding(1),
             Box::new(Counter(1_000)),
             cell.clock,
         )
@@ -689,7 +709,7 @@ fn an_sse_c_objects_etag_is_the_md5_of_its_ciphertext() {
         },
         customer_keys(93, &customer),
         layout,
-        HANDOVER,
+        holding(1),
         Box::new(Counter(3_000)),
         cell.clock,
     )
@@ -1004,13 +1024,15 @@ proptest! {
         step in 0..=HANDOVER / 20,
         refusing in prop::collection::btree_set(1u128..7, 0..4),
         seed in any::<u8>(),
+        window in 1usize..=4,
     ) {
         let mut cell = Cell::new(6);
         cell.refusing = refusing;
         let wrapping = WrappingKey::generate().unwrap();
         let layout = Layout::new(scheme).unwrap();
         let bytes = body(len, seed);
-        let mut put = new_put(&cell, object("k"), len as u64, layout, keys(50, &wrapping));
+        let mut put =
+            new_put_in(&cell, object("k"), len as u64, layout, keys(50, &wrapping), window);
         let drive = Drive { piece: len.div_ceil(pieces).max(1), wait, step };
         let usable = 6 - cell.refusing.len();
         match run(&mut cell, &mut put, &bytes, &drive, &Expected::default(), |_, _| {}) {
@@ -1040,12 +1062,14 @@ proptest! {
         wait in 0..=HANDOVER,
         step in 0..=2 * HANDOVER,
         seed in any::<u8>(),
+        window in 1usize..=4,
     ) {
         let mut cell = Cell::new(3);
         let wrapping = WrappingKey::generate().unwrap();
         let layout = Layout::new(Scheme::Copies(2)).unwrap();
         let bytes = body(len, seed);
-        let mut put = new_put(&cell, object("k"), len as u64, layout, keys(60, &wrapping));
+        let mut put =
+            new_put_in(&cell, object("k"), len as u64, layout, keys(60, &wrapping), window);
         let drive = Drive { piece: len.div_ceil(pieces).max(1), wait, step };
         match run(&mut cell, &mut put, &bytes, &drive, &Expected::default(), |_, _| {}) {
             Ok(_) if len > 0 => {
@@ -1212,7 +1236,7 @@ fn an_object_of_parts_reads_by_its_parts_plaintext() {
             body,
             keys(file, &wrapping),
             layout,
-            HANDOVER,
+            holding(1),
             ids,
             cell.clock,
         )
@@ -1349,7 +1373,7 @@ fn upload_parts(
             body,
             keys(file, wrapping),
             layout,
-            HANDOVER,
+            holding(1),
             Box::new(Counter(file * 1_000)),
             cell.clock,
         )
@@ -1613,4 +1637,69 @@ fn composite_checksums_need_consecutive_parts_and_a_combining_algorithm() {
         complete_upload(&mut cell, "j", &wrong, vec![(1, etags[0].clone())], 920),
         Err(CompleteError::ChecksumType)
     );
+}
+
+/// A PUT sends down at most as many full blocks at once as its window admits, and a wider
+/// window overlaps their writes: a body of four blocks, arriving at once, takes fewer round
+/// trips with every block in flight than with one, and reads back the same (audit §16.3).
+#[test]
+fn blocks_go_down_together_as_the_window_admits() {
+    let len = 4 * 127 * seal::SEGMENT;
+    let bytes = body(len, 29);
+    let wrapping = WrappingKey::generate().unwrap();
+    let layout = Layout::new(Scheme::Copies(1)).unwrap();
+    let mut rounds = Vec::new();
+    for window in [1usize, 2, 4] {
+        let mut cell = Cell::new(2);
+        let mut put = new_put_in(
+            &cell,
+            object("k"),
+            len as u64,
+            layout,
+            keys(130, &wrapping),
+            window,
+        );
+        let (mut at, mut ended, mut n) = (0usize, false, 0u64);
+        loop {
+            while at < len && put.wants_body() {
+                at += put.feed(&bytes[at..]).unwrap();
+            }
+            if at == len && !ended {
+                put.end(&Expected::default()).unwrap();
+                ended = true;
+            }
+            let mut asked = Vec::new();
+            while let Some(request) = put.poll() {
+                asked.push(request);
+            }
+            if asked.is_empty() {
+                assert!(matches!(put.outcome(), Some(Ok(_))), "{:?}", put.outcome());
+                break;
+            }
+            // The blocks whose chunks are out at once.
+            let going: BTreeSet<u128> = asked
+                .iter()
+                .filter_map(|(_, r)| match r {
+                    Request::Chunk { key, .. } => Some(key.block),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                going.len() <= window,
+                "{} blocks out with a window of {window}",
+                going.len()
+            );
+            n += 1;
+            for (id, request) in asked {
+                let answer = cell.serve(request);
+                put.answer(id, answer).unwrap();
+            }
+        }
+        assert!(
+            cell.read_file(130, len as u64, &wrapping) == bytes,
+            "window {window}"
+        );
+        rounds.push(n);
+    }
+    assert!(rounds[0] > rounds[1] && rounds[1] > rounds[2], "{rounds:?}");
 }

@@ -6,8 +6,8 @@
 //!
 //! A [`Put`] names each request and moves on with its answer, doing no I/O, as the bucket
 //! coordinator does. Its requests go out many at once, each with an id its answer names, and
-//! the caller tells it the time. It holds at most two blocks: one filling while the one before
-//! it is written, the body waiting while both are full.
+//! the caller tells it the time. It holds the block filling and at most as many full blocks
+//! going down at once as the caller admits, the body waiting while that many go down.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -108,6 +108,9 @@ pub enum PutError {
     Random,
     #[error("a length past what the PUT can address")]
     Overflow,
+    /// A PUT admitted no block going down at once.
+    #[error("a PUT needs room for one block going down")]
+    Window,
     /// A body longer than one request may carry: `400 EntityTooLarge`, before anything is
     /// written (audit B08).
     #[error("a body of {length} bytes; one request carries {max} at most")]
@@ -158,6 +161,17 @@ pub struct Expected {
     pub md5: Option<[u8; 16]>,
     /// `x-amz-checksum-*`, from a header or a trailer.
     pub checksum: Option<checksum::Checksum>,
+}
+
+/// How a PUT holds what it wrote and what it has yet to write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Holding {
+    /// How long each block and the file are held for the layer above, in the ranges' time.
+    pub handover_ns: u64,
+    /// Full blocks going down at once, the memory the caller admits the PUT beside the block
+    /// filling: one is the fewest, and overlaps the body's arrival with the writes; more
+    /// overlap the writes of several blocks, whose round trips otherwise add up (audit §16.3).
+    pub window: usize,
 }
 
 /// A file's identity and key: a file ID never used before, and its data key, wrapped as the
@@ -232,12 +246,12 @@ struct Recorded {
     renewing: bool,
 }
 
-/// What a request in flight asked.
+/// What a request in flight asked, for the block at its place in the file.
 #[derive(Debug, Clone, Copy)]
 enum Asked {
-    Place,
-    Chunk(usize),
-    Block { asked_ns: u64 },
+    Place(u64),
+    Chunk(u64, usize),
+    Block { index: u64, asked_ns: u64 },
     Renew { index: u64, asked_ns: u64 },
     File,
     Name,
@@ -276,9 +290,11 @@ pub struct Put {
     /// The block being filled, sealed, and its place in the file.
     filling: Vec<u8>,
     filling_index: u64,
-    /// A full block waiting for the one before it to be recorded.
+    /// A full block waiting for room among the blocks going down.
     waiting: Option<Vec<u8>>,
-    going: Option<Going>,
+    /// The blocks going down, by their place in the file: at most `window`.
+    going: BTreeMap<u64, Going>,
+    window: usize,
     /// Blocks recorded, by their place in the file.
     recorded: BTreeMap<u64, Recorded>,
     /// When each recorded block not being renewed is next due for renewal, and its place:
@@ -301,16 +317,23 @@ pub struct Put {
 
 impl Put {
     /// A PUT of `body` ending in `commit`, sealed under `keys`, its blocks laid out by `layout`
-    /// and held for its file's write `handover_ns` at a time, at the caller's time `now_ns`.
+    /// and held as `holding` says, at the caller's time `now_ns`.
     pub fn new(
         commit: Commit,
         body: Body,
         keys: Keys,
         layout: Layout,
-        handover_ns: u64,
+        holding: Holding,
         ids: Box<dyn Ids + Send>,
         now_ns: u64,
     ) -> Result<Self, PutError> {
+        let Holding {
+            handover_ns,
+            window,
+        } = holding;
+        if window == 0 {
+            return Err(PutError::Window);
+        }
         // What the body may cost is known from its declared length, and is refused whole
         // before a chunk is written (audit B08). Within it, every layout's blocks fit a
         // file's extents, so the File range's write never refuses a body after every chunk
@@ -362,7 +385,8 @@ impl Put {
             filling: Vec::new(),
             filling_index: 0,
             waiting: None,
-            going: None,
+            going: BTreeMap::new(),
+            window,
             recorded: BTreeMap::new(),
             due: BTreeSet::new(),
             md5,
@@ -517,7 +541,7 @@ impl Put {
             .block_segments(self.body.length, self.filling_index)?;
         if self.sealed == holds.end {
             let full = std::mem::take(&mut self.filling);
-            if self.going.is_some() {
+            if self.going.len() >= self.window {
                 self.waiting = Some(full);
             } else {
                 self.go(full)?;
@@ -618,18 +642,21 @@ impl Put {
             chunk_len,
             crc32c,
         };
-        self.going = Some(Going {
+        self.going.insert(
             index,
-            id,
-            len,
-            header,
-            chunks,
-            volumes: Vec::new(),
-            next: 0,
-            at: vec![None; width],
-        });
+            Going {
+                index,
+                id,
+                len,
+                header,
+                chunks,
+                volumes: Vec::new(),
+                next: 0,
+                at: vec![None; width],
+            },
+        );
         self.ask(
-            Asked::Place,
+            Asked::Place(index),
             Request::Place {
                 block: id,
                 width,
@@ -649,12 +676,13 @@ impl Put {
     fn answered(&mut self, id: Id, answer: Answer) -> Result<(), PutError> {
         let asked = self.asked.remove(&id).ok_or(PutError::Unknown(id))?;
         match (asked, answer) {
-            (Asked::Place, Answer::Volumes(volumes)) => self.placed(volumes),
-            (Asked::Chunk(i), Answer::Stored) => self.stored(i),
-            (Asked::Chunk(i), Answer::Refused) => self.refused(i),
-            (Asked::Block { asked_ns }, Answer::Block(block::Outcome::Written { deadline_ns })) => {
-                self.recorded_block(deadline_ns, asked_ns)
-            }
+            (Asked::Place(index), Answer::Volumes(volumes)) => self.placed(index, volumes),
+            (Asked::Chunk(index, i), Answer::Stored) => self.stored(index, i),
+            (Asked::Chunk(index, i), Answer::Refused) => self.refused(index, i),
+            (
+                Asked::Block { index, asked_ns },
+                Answer::Block(block::Outcome::Written { deadline_ns }),
+            ) => self.recorded_block(index, deadline_ns, asked_ns),
             (Asked::Block { .. }, Answer::Block(outcome)) => Err(PutError::Block(outcome)),
             (
                 Asked::Renew { index, asked_ns },
@@ -685,8 +713,8 @@ impl Put {
         }
     }
 
-    fn placed(&mut self, offered: Vec<u128>) -> Result<(), PutError> {
-        let going = self.going.as_mut().ok_or(PutError::Mismatch)?;
+    fn placed(&mut self, index: u64, offered: Vec<u128>) -> Result<(), PutError> {
+        let going = self.going.get_mut(&index).ok_or(PutError::Mismatch)?;
         // Each volume once, in the order offered.
         let mut seen = BTreeSet::new();
         let volumes: Vec<u128> = offered.into_iter().filter(|v| seen.insert(*v)).collect();
@@ -704,13 +732,13 @@ impl Put {
         going.next = width;
         going.volumes = volumes;
         for (i, request) in sends {
-            self.ask(Asked::Chunk(i), request);
+            self.ask(Asked::Chunk(index, i), request);
         }
         Ok(())
     }
 
-    fn stored(&mut self, i: usize) -> Result<(), PutError> {
-        let going = self.going.as_mut().ok_or(PutError::Mismatch)?;
+    fn stored(&mut self, index: u64, i: usize) -> Result<(), PutError> {
+        let going = self.going.get_mut(&index).ok_or(PutError::Mismatch)?;
         let slot = going.at.get_mut(i).ok_or(PutError::Mismatch)?;
         let (volume, _) = slot.ok_or(PutError::Mismatch)?;
         *slot = Some((volume, true));
@@ -739,14 +767,14 @@ impl Put {
             at_ns: 0,
         };
         let asked_ns = self.now_ns;
-        self.ask(Asked::Block { asked_ns }, Request::Block(command));
+        self.ask(Asked::Block { index, asked_ns }, Request::Block(command));
         Ok(())
     }
 
     /// Sends a refused chunk to the next volume the placement offered, which holds none of the
     /// block's chunks.
-    fn refused(&mut self, i: usize) -> Result<(), PutError> {
-        let going = self.going.as_mut().ok_or(PutError::Mismatch)?;
+    fn refused(&mut self, index: u64, i: usize) -> Result<(), PutError> {
+        let going = self.going.get_mut(&index).ok_or(PutError::Mismatch)?;
         let Some(&volume) = going.volumes.get(going.next) else {
             return Err(PutError::Unplaced(going.id));
         };
@@ -754,12 +782,17 @@ impl Put {
         let (bytes, crc) = going.chunks.get(i).ok_or(PutError::Mismatch)?;
         let request = chunk(going.id, i, volume, bytes, *crc)?;
         *going.at.get_mut(i).ok_or(PutError::Mismatch)? = Some((volume, false));
-        self.ask(Asked::Chunk(i), request);
+        self.ask(Asked::Chunk(index, i), request);
         Ok(())
     }
 
-    fn recorded_block(&mut self, deadline_ns: u64, asked_ns: u64) -> Result<(), PutError> {
-        let going = self.going.take().ok_or(PutError::Mismatch)?;
+    fn recorded_block(
+        &mut self,
+        index: u64,
+        deadline_ns: u64,
+        asked_ns: u64,
+    ) -> Result<(), PutError> {
+        let going = self.going.remove(&index).ok_or(PutError::Mismatch)?;
         self.recorded.insert(
             going.index,
             Recorded {

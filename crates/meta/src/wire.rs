@@ -583,6 +583,7 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
             put_named(w, d.named);
             put_match(w, d.if_match.as_ref())?;
             w.u8(u8::from(d.bypass));
+            record::put_bytes(w, d.owner.as_bytes())?;
         }
         name::Command::CreateUpload(c) => {
             w.u8(2);
@@ -764,6 +765,7 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
                 if_match: take_match(r)?,
                 at_ns,
                 bypass: take_bool(r)?,
+                owner: String::from_utf8(record::take_bytes(r)?).ok()?,
             })
         }
         2 => {
@@ -1504,6 +1506,7 @@ mod tests {
                 if_match: None,
                 at_ns,
                 bypass: true,
+                owner: "o".into(),
             })),
             named(name::Command::CreateUpload(name::CreateUpload {
                 bucket: "b".into(),

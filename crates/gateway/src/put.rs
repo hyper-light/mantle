@@ -17,7 +17,7 @@ use mantle_ec::EcError;
 use mantle_ec::durability::Scheme;
 use mantle_meta::record::{self, BlockHeader, ChunkPlace, Extent, Referrer, Target, WrappedKey};
 use mantle_meta::{block, file, name};
-use mantle_s3::body::MAX_UPLOAD;
+use mantle_s3::body::{MAX_PARTS, MAX_UPLOAD};
 use mantle_s3::checksum::{self, Algorithm, Hasher};
 use mantle_s3::crypto::CryptoError;
 use mantle_s3::seal::{self, DataKey, SealError, Segments};
@@ -112,6 +112,11 @@ pub enum PutError {
     /// written (audit B08).
     #[error("a body of {length} bytes; one request carries {max} at most")]
     EntityTooLarge { length: u64, max: u64 },
+    /// A part number outside 1 to 10,000 (05 §4.3), refused before anything is written; AWS
+    /// names no code for it (05 §4.3, UNVERIFIED), and `400 InvalidArgument` is S3's for a
+    /// parameter out of range.
+    #[error("part number {0}; parts are numbered 1 to 10,000")]
+    InvalidPartNumber(u16),
 
     #[error(transparent)]
     Layout(#[from] LayoutError),
@@ -316,6 +321,11 @@ impl Put {
                 length: body.length,
                 max: MAX_UPLOAD,
             });
+        }
+        if let Commit::Part(p) = &commit
+            && !(1..=MAX_PARTS).contains(&p.number)
+        {
+            return Err(PutError::InvalidPartNumber(p.number));
         }
         let sealer = Segments::new(&keys.data, keys.file)?;
         // An SSE-S3 object's ETag is the MD5 of its plaintext, as S3's is; an SSE-C object's

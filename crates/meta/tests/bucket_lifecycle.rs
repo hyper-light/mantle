@@ -493,6 +493,7 @@ impl World {
                         if_match: None,
                         at_ns: self.clock,
                         bypass: false,
+                        owner: "o".into(),
                     });
                     if let Some(name::Outcome::Deleted { .. }) = self.write(key, delete) {
                         self.acked.remove(key);

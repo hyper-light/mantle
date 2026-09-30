@@ -469,6 +469,7 @@ mod tests {
             if_match: None,
             at_ns: 5,
             bypass: false,
+            owner: "o".into(),
         }));
         let queue = name::released(&cell.name, u64::MAX, 10).unwrap();
         assert_eq!(queue.len(), 1);
@@ -667,6 +668,7 @@ mod tests {
             if_match: None,
             at_ns: 5,
             bypass: false,
+            owner: "o".into(),
         }));
         reclaim_all(&mut cell);
         assert!(cell.chunks.is_empty());
@@ -810,6 +812,7 @@ mod tests {
                 if_match: None,
                 at_ns: 4,
                 bypass: false,
+                owner: "o".into(),
             }));
             // Each stop takes the oldest file released and drops its reclaimer after that
             // many steps; the next starts again from the queue.

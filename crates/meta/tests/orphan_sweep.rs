@@ -601,6 +601,7 @@ impl World {
                     if_match: None,
                     at_ns: self.proposed(),
                     bypass: false,
+                    owner: "o".into(),
                 });
                 self.send(key, &delete);
             }

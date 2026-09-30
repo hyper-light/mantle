@@ -425,6 +425,35 @@ fn a_body_past_one_request_is_refused_before_anything_is_asked() {
     assert!(largest.poll().is_none());
 }
 
+/// A part numbered outside 1 to 10,000 is refused before anything is asked or written, and the
+/// numbers at either end are taken (audit §7.1).
+#[test]
+fn a_part_numbered_outside_s3s_range_is_refused_before_anything_is_asked() {
+    let cell = Cell::new(3);
+    let wrapping = WrappingKey::generate().unwrap();
+    let make = |number| {
+        Put::new(
+            part("k", "u", number),
+            Body {
+                length: 1,
+                checksum: None,
+                content_md5: false,
+            },
+            keys(1, &wrapping),
+            Layout::new(Scheme::Copies(3)).unwrap(),
+            HANDOVER,
+            Box::new(Counter(1_000)),
+            cell.clock,
+        )
+    };
+    for number in [0, mantle_s3::body::MAX_PARTS + 1] {
+        assert!(matches!(make(number), Err(PutError::InvalidPartNumber(n)) if n == number));
+    }
+    for number in [1, mantle_s3::body::MAX_PARTS] {
+        assert!(make(number).is_ok());
+    }
+}
+
 const FAST: Drive = Drive {
     piece: 100_000,
     wait: 0,

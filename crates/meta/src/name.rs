@@ -30,6 +30,12 @@ pub use crate::record::Versioning;
 /// "Part size: 5 MiB to 5 GiB. There is no minimum size limit on the last part" (05 §4.1).
 pub const MIN_PART: u64 = 5 << 20;
 
+/// The most a part holds, 5 GiB (05 §4.1), and the highest part number, 10,000 (05 §4.3). A
+/// gateway refuses more before it writes anything; the range refuses a part row past them
+/// too, since every replica applies what reaches the log.
+pub const MAX_PART: u64 = 5 << 30;
+pub const MAX_PART_NUMBER: u16 = 10_000;
+
 /// Entity tags a precondition names, bare of quotes, or `*`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Match {
@@ -468,6 +474,10 @@ pub struct Delete {
     /// `x-amz-bypass-governance-retention: true` from a requester allowed
     /// `s3:BypassGovernanceRetention` (18 §2.2).
     pub bypass: bool,
+    /// The canonical ID a delete marker this makes is owned by, as a version's owner is
+    /// the one its `Put` names: under bucket-owner-enforced ownership, the bucket's owner
+    /// (05 §5.1). Listings render it as the marker's `Owner`.
+    pub owner: String,
 }
 
 /// PutObjectRetention (18 §1.2): places, extends, shortens or removes a version's retention.
@@ -1348,7 +1358,7 @@ fn delete<E: Rows>(engine: &E, d: &Delete) -> Result<(Outcome, Vec<Write>), Meta
                     size: 0,
                     checksum: None,
                     file: None,
-                    owner: String::new(),
+                    owner: d.owner.clone(),
                     headers: Vec::new(),
                     retention: None,
                     legal_hold: None,
@@ -1392,6 +1402,9 @@ fn create_upload<E: Rows>(
 }
 
 fn put_part<E: Rows>(engine: &E, p: &PutPart) -> Result<(Outcome, Vec<Write>), MetaError> {
+    if !(1..=MAX_PART_NUMBER).contains(&p.number) || p.part.size > MAX_PART {
+        return Ok((Outcome::Invalid, Vec::new()));
+    }
     if upload(engine, &p.bucket, &p.key, &p.upload)?.is_none() {
         return Ok((Outcome::NoSuchUpload, Vec::new()));
     }
@@ -2216,6 +2229,23 @@ mod tests {
                 if_match: None,
                 at_ns: self.clock,
                 bypass: false,
+                owner: "o".into(),
+            }))
+        }
+
+        /// A delete of `key` by `owner`, stacking a marker in a versioned bucket.
+        fn delete_by(&mut self, key: &str, owner: &str) -> Outcome {
+            self.clock += 10;
+            self.run(Command::Delete(Delete {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: key.into(),
+                versioning: Versioning::Enabled,
+                named: None,
+                if_match: None,
+                at_ns: self.clock,
+                bypass: false,
+                owner: owner.into(),
             }))
         }
 
@@ -2696,6 +2726,39 @@ mod tests {
         }
     }
 
+    /// A delete marker is owned as its delete says, as a version is as its put says, so a
+    /// listing renders its owner rather than an empty one (audit §7.1).
+    #[test]
+    fn a_delete_marker_is_owned_as_its_delete_says() {
+        let mut r = Range::new();
+        r.put("k", "e1", Versioning::Enabled);
+        let Outcome::Deleted { marker: true, .. } = r.delete_by("k", "bucket-owner") else {
+            panic!("no marker")
+        };
+        let (_, marker) = current(&r.engine, "b", "k").unwrap().unwrap();
+        assert!(marker.marker);
+        assert_eq!(marker.owner, "bucket-owner");
+    }
+
+    /// A part numbered outside 1 to 10,000, or larger than 5 GiB, is refused and leaves no
+    /// row, whatever reached the log (audit §7.1).
+    #[test]
+    fn parts_outside_s3s_limits_are_refused() {
+        let mut r = Range::new();
+        let u = r.create("k");
+        assert_eq!(r.part("k", &u, 0, 1, 11), Outcome::Invalid);
+        assert_eq!(
+            r.part("k", &u, MAX_PART_NUMBER + 1, 1, 12),
+            Outcome::Invalid
+        );
+        assert_eq!(r.part("k", &u, 1, MAX_PART + 1, 13), Outcome::Invalid);
+        assert!(parts(&r.engine, "b", "k", &u, 0, 10).unwrap().is_empty());
+        assert_eq!(
+            r.part("k", &u, MAX_PART_NUMBER, MAX_PART, 14),
+            Outcome::PartWritten
+        );
+    }
+
     #[test]
     fn a_completed_upload_becomes_a_version_and_its_parts_go() {
         let mut r = Range::new();
@@ -2847,6 +2910,7 @@ mod tests {
                         if_match: None,
                         at_ns: 100 + i,
                         bypass: false,
+                        owner: "o".into(),
                     })
                 } else {
                     Command::Put(Put {
@@ -3137,6 +3201,7 @@ mod tests {
                 if_match: None,
                 at_ns: at_ms * MS,
                 bypass,
+                owner: "o".into(),
             }))
         }
 
@@ -3489,6 +3554,7 @@ mod tests {
                             if_match: None,
                             at_ns: r.clock,
                             bypass: false,
+                            owner: "o".into(),
                         }));
                     }
                     Step::Create { key } => {

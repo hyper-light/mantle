@@ -5,6 +5,11 @@ and the test that now fails if the cause returns. A finding is closed only by a 
 that failed before the fix and passes after it, and by a check that the test fails when the
 fix is removed.
 
+Sections 5 to 17 of the audit state requirements rather than findings: what must be built,
+measured or proven before each stage of operation. Every one of them, 456 in all, is itemized
+with its status in [the requirement checklist](2026-09-29_requirements.md), which is updated as
+each is closed.
+
 ## Standards defects
 
 | Finding | State | Reproduction and regression | Fix |

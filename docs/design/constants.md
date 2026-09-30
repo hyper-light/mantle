@@ -90,6 +90,53 @@ gains a basis lowers the ceiling.
 | `crates/disk/src/sim.rs` `MAX_SIM_LEN` | bound | 1 GiB cap on the simulated file, which tests hold twice in memory. |
 | `crates/ec/src/durability.rs` `PRECISION` | bound | Relative tolerance of 1e-3 on loss probabilities, argued in the code: the report prints two significant figures, and 1e-3 keeps the third correct (docs/research/15 §4.4–4.5). |
 | `crates/ec/src/durability.rs` `YEAR` | derived | Unit conversion: 365.25 days × 24 h = 8766 hours. |
+| `crates/engine/src/table/format.rs` `CONTEXT_CHECKSUM_FORMAT_VERSION` | format | The first block-based table format_version whose block and footer checksums carry the context modifier [R table/format.h:218-220] (docs/research/24 §1.2). |
+| `crates/engine/src/table/format.rs` `LAST_BYTE_PRIME` | format | `kRandomPrime` 0x6b9083d9 of `ModifyChecksumForLastByte`, folding a block's compression-type byte into its XXH3 checksum [R table/format.cc:606-612] (docs/research/24 §1.2). |
+| `crates/engine/src/util/coding.rs` `CONTINUATION` | format | 0x80, the LEB128 varint's continuation bit [R util/coding.cc:27] (docs/research/24 §1.1). |
+| `crates/engine/src/util/coding.rs` `MAX_VARINT32_LENGTH` | format | 5 bytes, the longest varint32: 32 bits at 7 per byte [R util/coding.h:156] (docs/research/24 §1.1). |
+| `crates/engine/src/util/coding.rs` `MAX_VARINT64_LENGTH` | format | 10 bytes, `kMaxVarint64Length` [R util/coding.h:36] (docs/research/24 §1.1). |
+| `crates/engine/src/util/coding.rs` `PAYLOAD` | format | 0x7F, the 7 payload bits of a varint byte [R util/coding.cc:63]. |
+| `crates/engine/src/util/coding.rs` `VARINT32_LAST_BYTE_MAX` | derived | 0x0F: the 4 bits a fifth varint32 byte can carry after 28; larger values are refused where RocksDB drops the bits (docs/research/24 §1.1 DECISION). |
+| `crates/engine/src/util/coding.rs` `VARINT64_LAST_BYTE_MAX` | derived | 0x01: the 1 bit a tenth varint64 byte can carry after 63; larger values are refused (docs/research/24 §1.1 DECISION). |
+| `crates/engine/src/util/crc32c.rs` `MASK_DELTA` | format | `kMaskDelta` 0xa282ead8, added to a stored CRC after rotating it [R util/crc32c.h:37] (docs/research/24 §1.2). |
+| `crates/engine/src/util/crc32c.rs` `MASK_ROTATION` | format | 15, the right rotation of `crc32c::Mask` [R util/crc32c.h:44-47]. |
+| `crates/engine/src/util/hash.rs` `AVALANCHE` | format | 0x165667919E3779F9, XXH3's avalanche multiplier, in `BijectiveHash2x64` [R util/hash.cc:132-137]; shapes the SST unique ID [R table/unique_id.cc]. |
+| `crates/engine/src/util/hash.rs` `AVALANCHE_INVERSE` | derived | 0x8da8ee41d6df849, the inverse of `AVALANCHE` modulo 2^64 [R util/hash.cc:141]. |
+| `crates/engine/src/util/hash.rs` `BITFLIP_HIGH` | format | 0xc202797692d63d58, the part of XXH3's secret `BijectiveHash2x64` adds the seed to [R util/hash.cc:152]. |
+| `crates/engine/src/util/hash.rs` `BITFLIP_LOW` | format | 0x59973f0033362349, the part of XXH3's secret `BijectiveHash2x64` subtracts the seed from [R util/hash.cc:151]. |
+| `crates/engine/src/util/hash.rs` `BLOOM_HASH_SEED` | format | 0xbc9f1d34, `BloomHash`'s seed, keying the legacy Bloom filter [R util/hash.h:93-95] (docs/research/24 §1.2, §5 R2). |
+| `crates/engine/src/util/hash.rs` `HIGH_WORD` | derived | 0xFFFFFFFF00000000, the high 32 bits of a 64-bit word, in `BijectiveUnhash2x64` [R util/hash.cc:184-185]. |
+| `crates/engine/src/util/hash.rs` `LEN16_MARK` | format | 0x3c0000000000000 = (16 - 1) << 54, XXH3's length term for a 16-byte input [R util/hash.cc:157]. |
+| `crates/engine/src/util/hash.rs` `MURMUR_M` | format | 0xc6a4a793, `Hash`'s multiplier [R util/hash.cc:29] (docs/research/24 §1.2). |
+| `crates/engine/src/util/hash.rs` `MURMUR_R` | format | 24, `Hash`'s final shift [R util/hash.cc:30]. |
+| `crates/engine/src/util/hash.rs` `PRIME32_2_INVERSE` | derived | 0xb6c92f47, the inverse of 0x85EBCA77 modulo 2^32 [R util/hash.cc:182]. |
+| `crates/engine/src/util/hash.rs` `PRIME32_2_MINUS_1` | format | 0x85EBCA76, XXH3's PRIME32_2 - 1 as `BijectiveHash2x64` uses it [R util/hash.cc:159]. |
+| `crates/engine/src/util/hash.rs` `PRIME64_1` | format | 0x9E3779B185EBCA87, XXH3's PRIME64_1 [R util/hash.cc:154]. |
+| `crates/engine/src/util/hash.rs` `PRIME64_1_INVERSE` | derived | 0x887493432badb37, the inverse of `PRIME64_1` modulo 2^64 [R util/hash.cc:180]. |
+| `crates/engine/src/util/hash.rs` `PRIME64_2` | format | 0xC2B2AE3D27D4EB4F, XXH3's PRIME64_2 [R util/hash.cc:161]. |
+| `crates/engine/src/util/hash.rs` `PRIME64_2_INVERSE` | derived | 0xba79078168d4baf, the inverse of `PRIME64_2` modulo 2^64 [R util/hash.cc:175]. |
+| `crates/engine/src/util/hash.rs` `SLICE_HASH_SEED` | format | 397, `GetSliceHash`'s seed, keying the data-block hash index [R util/hash.h:121-123] (docs/research/24 §1.2, §5 R2). |
+| `crates/engine/src/util/prefix_varint.rs` `MAX_PREFIX_VARINT32_LENGTH` | format | 5 bytes, `kMaxPrefixVarint32Length` [R util/prefix_varint.h:58]. |
+| `crates/engine/src/util/prefix_varint.rs` `MAX_PREFIX_VARINT64_LENGTH` | format | 9 bytes, `kMaxPrefixVarint64Length`: a zero byte and a fixed64 [R util/prefix_varint.h:65]. |
+| `crates/engine/src/util/xxph3.rs` `BLOCK_LEN` | derived | `STRIPE_LEN × STRIPES_PER_BLOCK` = 1024 bytes between scrambles [R util/xxph3.h:1520]. |
+| `crates/engine/src/util/xxph3.rs` `MIDSIZE_LASTOFFSET` | format | 17, the secret offset back from `SECRET_SIZE_MIN` for the mid-size path's last 16 bytes [R util/xxph3.h:1690] (docs/research/24 §5 R1). |
+| `crates/engine/src/util/xxph3.rs` `MIDSIZE_MAX` | format | 240, the longest input on XXPH3's mid-size path [R util/xxph3.h:1679]. |
+| `crates/engine/src/util/xxph3.rs` `MIDSIZE_STARTOFFSET` | format | 3, the secret offset of the mid-size path's rounds after the eighth [R util/xxph3.h:1689]. |
+| `crates/engine/src/util/xxph3.rs` `PRIME32_1` | format | 0x9E3779B1, xxHash's PRIME32_1 [R util/xxph3.h:564]. |
+| `crates/engine/src/util/xxph3.rs` `PRIME32_2` | format | 0x85EBCA77, xxHash's PRIME32_2 [R util/xxph3.h:565]. |
+| `crates/engine/src/util/xxph3.rs` `PRIME32_3` | format | 0xC2B2AE3D, xxHash's PRIME32_3 [R util/xxph3.h:566]. |
+| `crates/engine/src/util/xxph3.rs` `PRIME64_1` | format | 0x9E3779B185EBCA87, xxHash's PRIME64_1 [R util/xxph3.h:642]. |
+| `crates/engine/src/util/xxph3.rs` `PRIME64_2` | format | 0xC2B2AE3D27D4EB4F, xxHash's PRIME64_2 [R util/xxph3.h:643]. |
+| `crates/engine/src/util/xxph3.rs` `PRIME64_3` | format | 0x165667B19E3779F9, xxHash's PRIME64_3 [R util/xxph3.h:644]. |
+| `crates/engine/src/util/xxph3.rs` `PRIME64_4` | format | 0x85EBCA77C2B2AE63, xxHash's PRIME64_4 [R util/xxph3.h:645]. |
+| `crates/engine/src/util/xxph3.rs` `PRIME64_5` | format | 0x27D4EB2F165667C5, xxHash's PRIME64_5 [R util/xxph3.h:646]. |
+| `crates/engine/src/util/xxph3.rs` `SECRET_CONSUME_RATE` | format | 8 secret bytes consumed per stripe [R util/xxph3.h:1146]. |
+| `crates/engine/src/util/xxph3.rs` `SECRET_DEFAULT_SIZE` | format | 192, the length of XXPH3's default secret `kSecret` [R util/xxph3.h:914-935]; the secret's bytes are in `SECRET` beside it (docs/research/24 §1.19). |
+| `crates/engine/src/util/xxph3.rs` `SECRET_LASTACC_START` | format | 7, the secret offset of the long path's last stripe [R util/xxph3.h:1541]. |
+| `crates/engine/src/util/xxph3.rs` `SECRET_MERGEACCS_START` | format | 11, the secret offset of the accumulators' merge [R util/xxph3.h:1580]. |
+| `crates/engine/src/util/xxph3.rs` `SECRET_SIZE_MIN` | format | 136, `XXPH3_SECRET_SIZE_MIN`, the base of the mid-size path's last offset [R util/xxph3.h:283]. |
+| `crates/engine/src/util/xxph3.rs` `STRIPES_PER_BLOCK` | derived | `(SECRET_DEFAULT_SIZE - STRIPE_LEN) / SECRET_CONSUME_RATE` = 16 stripes per block [R util/xxph3.h:1519]. |
+| `crates/engine/src/util/xxph3.rs` `STRIPE_LEN` | format | 64 bytes hashed per accumulation [R util/xxph3.h:1145]. |
 | `crates/gateway/src/layout.rs` `CHUNK` | cited | Tectonic's "typically 8 MiB" chunk (docs/research/01 §1.14). docs/design/gateway.md says measured transfer sizing will replace it, and audit §12.6/§16.2 requires per-upload sizing. |
 | `crates/gateway/src/layout.rs` `SEALED` | derived | `seal::SEGMENT + seal::TAG`: a 64 KiB plaintext segment plus its 16-byte AEAD tag (docs/design/gateway.md §1). |
 | `crates/gateway/src/put.rs` `RENEWALS` | cited | Quarter-lease renewal from Centrifuge's 15 s renewals of 60 s leases (docs/research/09 §7.2.2). Audit §12.6 requires deriving it from control-delay and outage distributions. |

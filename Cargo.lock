@@ -515,6 +515,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mantle-engine"
+version = "0.1.0"
+dependencies = [
+ "mantle-crc",
+ "proptest",
+ "thiserror",
+ "twox-hash",
+]
+
+[[package]]
 name = "mantle-gateway"
 version = "0.1.0"
 dependencies = [

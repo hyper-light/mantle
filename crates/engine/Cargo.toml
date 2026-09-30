@@ -1,0 +1,21 @@
+[package]
+name = "mantle-engine"
+description = "mantle's Rust conversion of RocksDB 11.8.1, byte-compatible with its files"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+mantle-crc = { path = "../crc" }
+thiserror.workspace = true
+twox-hash.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

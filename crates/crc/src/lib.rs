@@ -103,6 +103,15 @@ reflected_crc!(c32c, u32, 32, 0x82F6_3B78);
 reflected_crc!(c32, u32, 32, 0xEDB8_8320);
 reflected_crc!(c64nvme, u64, 64, 0x9A6C_9329_AC4B_C9B5);
 
+/// The CRC-32C of `a ‖ data`, given `crc32c(a)`: the register resumes from `a`'s state, the
+/// complement of its CRC (CRC-32C's final XOR is all ones), so extending costs one pass over
+/// `data` where combining would add a shift across it.
+pub fn crc32c_extend(crc_a: u32, data: &[u8]) -> u32 {
+    let mut digest = Digest::new_with_init_state(CrcAlgorithm::Crc32Iscsi, u64::from(!crc_a));
+    digest.update(data);
+    u32::try_from(digest.finalize()).unwrap_or(0)
+}
+
 /// The CRC-32C of `a ‖ b`, given `crc32c(a)`, `crc32c(b)` and `b.len()`.
 pub fn crc32c_combine(crc_a: u32, crc_b: u32, len_b: u64) -> u32 {
     c32c::combine(crc_a, crc_b, len_b)
@@ -254,6 +263,9 @@ mod tests {
             crc32c_combine(crc32c(b"1234"), crc32c(b"56789"), 5),
             0xE306_9283
         );
+        assert_eq!(crc32c_extend(crc32c(b"1234"), b"56789"), 0xE306_9283);
+        assert_eq!(crc32c_extend(c, &[]), c);
+        assert_eq!(crc32c_extend(0, b"123456789"), c);
     }
 
     proptest! {
@@ -287,6 +299,13 @@ mod tests {
             }
             let whole: Vec<u8> = blocks.concat();
             prop_assert_eq!(acc, crc32c(&whole));
+        }
+
+        #[test]
+        fn extending_equals_whole(a in proptest::collection::vec(any::<u8>(), 0..5000),
+                                  b in proptest::collection::vec(any::<u8>(), 0..5000)) {
+            let whole: Vec<u8> = a.iter().chain(b.iter()).copied().collect();
+            prop_assert_eq!(crc32c_extend(crc32c(&a), &b), crc32c(&whole));
         }
 
         #[test]

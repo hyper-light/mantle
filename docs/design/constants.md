@@ -127,6 +127,7 @@ gains a basis lowers the ceiling.
 | `crates/mantle/src/bench_hash.rs` `CHUNKED_BODY` | open | 16 MiB signed-chunk body measured; no derivation in code or the measurement docs. |
 | `crates/mantle/src/bench_hash.rs` `FORM_FILE` | open | 16 MiB form file measured, set equal to CHUNKED_BODY; lacks a derivation. |
 | `crates/mantle/src/bench_log.rs` `KEEP` | open | A replica compacts every 64 entries, keeping 64 behind; it stands in for a follower window but lacks a derivation. |
+| `crates/mantle/src/bench_meta.rs` `LARGEST_FILE` | derived | 646 blocks, the most one PUT's file names: 5 GiB in the smallest blocks any layout makes, pinned by `the_largest_upload_fits_a_file_under_every_layout` (`crates/gateway/src/layout.rs`; audit B08). |
 | `crates/mantle/src/bench_meta.rs` `HISTORY` | open | Session answer history of 256; the metadata-apply measurement states it without a derivation. |
 | `crates/meta/src/collector.rs` `GRACE_NS` | cited | GFS keeps deleted files for three days (GGL03 §4.4, docs/research/22 §1.1). A recovery-point policy, not a safety bound (22 §10.4). |
 | `crates/meta/src/file.rs` `MAX_EXTENTS` | external | The S3 limit of 10,000 parts per upload (docs/research/05 §4.1). Audit §12.6 says single-PUT block manifests reuse this count and need their own derived fanout limit. |
@@ -140,6 +141,7 @@ gains a basis lowers the ceiling.
 | `crates/meta/src/key.rs` `FLOOR` | format | Marker byte `f` after `LOCAL` for the Name range's gate floor. |
 | `crates/meta/src/key.rs` `GATE` | format | Marker byte `g` after `LOCAL` for gate rows. |
 | `crates/meta/src/key.rs` `HEADER` | format | File-layer row tag 1 for a file's header. |
+| `crates/meta/src/key.rs` `NAMED` | format | File-layer row tag 4 for the row saying a file names a block, after the extents' tag so a scan of extents stops before it. |
 | `crates/meta/src/key.rs` `INSTALLED` | format | Marker byte `p` after `LOCAL` for the last installed snapshot. |
 | `crates/meta/src/key.rs` `LINEAGE` | format | Marker byte `l` after `LOCAL` for the Name range's lineage row. |
 | `crates/meta/src/key.rs` `LOCAL` | format | Key-space prefix byte 0x00 for a range's own rows (docs/design/metadata.md §1). |

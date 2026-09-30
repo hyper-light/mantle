@@ -265,6 +265,15 @@ change. Membership changes are rare, so this costs one image each.
 
 ## 7. Open
 
+- More than one ready of a range in flight. The log answers an update only once a later
+  record confirms its flush (raft-log.md §6), so a range that waits on each ready before
+  taking the next waits two flushes an update, and closed-loop appends run at half the rate
+  they did (measurements/2026-09-29-log-confirmation.md). With the next ready's frame
+  behind the last, its record would confirm the last at no flush of its own. focal-raft's
+  `Node::ready` refuses a ready while one is out, so this needs the core to hand out readies
+  ahead of their persistence, as raft-rs's asynchronous ready does. Advancing a ready at its
+  flush and holding back only its acknowledgements is not safe: a leader would count toward
+  commitment a frame recovery may still take for a torn tail.
 - The window of entries kept for lagging followers before one is sent a snapshot, and
   moving snapshots out of band with the production engine.
 - Read leases, if a deployment states its clock-drift bound (06 §A1.5); reads are confirmed

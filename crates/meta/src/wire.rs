@@ -12,7 +12,7 @@ use crate::record::{
 };
 use crate::{block, bucket, file, name};
 
-const FORMAT: u8 = 1;
+const FORMAT: u8 = 2;
 
 /// Commands one entry carries at most: a session is named by the index of the entry that
 /// registered it and the registration's place in that entry.

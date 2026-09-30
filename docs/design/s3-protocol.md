@@ -96,7 +96,11 @@ White space between elements is not counted: S3's documents give each element ei
 elements or text, never both (13 §6), so a run of white space after an end tag, an
 empty-element tag or the XML declaration, or before a start tag, carries nothing, and the
 gateway drops it as the body arrives (`xml::Compact`), keeping a run inside an element's text,
-a key of one space, as data. The limit bounds what is kept, and a body is refused with
+a key of one space, as data. Comments, CDATA sections and processing instructions are kept
+whole, their end sought only after their whole opening as XML 1.0 [15], [16] and [18] read
+them: `<!--->` opens a comment whose content starts `->`, so markup inside it that looks like
+an end tag never makes the white space after the comment look like it lies between elements.
+The limit bounds what is kept, and a body is refused with
 `MaxMessageLengthExceeded` (05 §11.2) once what is kept passes it; white space costs the
 gateway the time to read it and no memory. A reader given a body as sent counts it the same
 way, so a document reads alike as sent or as kept. Before, each limit was doubled as an

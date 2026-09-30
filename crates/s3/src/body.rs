@@ -2629,6 +2629,54 @@ mod compact_tests {
         );
     }
 
+    /// A comment's `-->`, a CDATA section's `]]>` and a processing instruction's `?>` are
+    /// sought only after the whole of their opening, as XML 1.0 [15], [16] and [18] read them:
+    /// `<!--->` opens a comment whose content starts `->`, and `<?>` closes nothing. Markup that
+    /// only looks like an end tag inside them leaves the white space after them in the key, and
+    /// the counting reader behind `Reader::open` counts that white space against the limit.
+    #[test]
+    fn markup_ends_only_after_its_whole_opening() {
+        let docs = [
+            (
+                "<Delete><Object><Key><!---> </x -->  a</Key></Object></Delete>",
+                "  a",
+            ),
+            (
+                "<Delete><Object><Key><!----> a</Key></Object></Delete>",
+                " a",
+            ),
+            (
+                "<Delete><Object><Key><![CDATA[]> </x>]]>  a</Key></Object></Delete>",
+                "]> </x>  a",
+            ),
+            (
+                "<Delete><Object><Key><?p </x ?>  a</Key></Object></Delete>",
+                "  a",
+            ),
+        ];
+        for (doc, key) in docs {
+            let sent = delete(doc.as_bytes()).unwrap();
+            assert_eq!(sent.objects[0].key, key, "{doc}");
+            let kept = compact(doc.as_bytes(), DELETE_LIMIT).unwrap();
+            assert_eq!(delete(&kept).unwrap(), sent, "{doc}");
+        }
+        // `<?>` is no processing instruction, so the reader refuses it; kept, it is refused alike.
+        let doc = "<Delete><Object><Key><?> </x ?>  a</Key></Object></Delete>";
+        let kept = compact(doc.as_bytes(), DELETE_LIMIT).unwrap();
+        assert_eq!(kept, doc.as_bytes());
+        assert!(delete(doc.as_bytes()).is_err());
+        // Counted, the key's white space after the comment is part of the document.
+        let padded = format!(
+            "<Delete><Object><Key><!---> </x -->{}a</Key></Object></Delete>",
+            " ".repeat(64)
+        );
+        let limit = padded.len() - 1;
+        assert_eq!(
+            crate::xml::Reader::open(padded.as_bytes(), limit, "Delete").err(),
+            Some(XmlError::TooLarge { limit })
+        );
+    }
+
     fn space() -> impl Strategy<Value = String> {
         prop::collection::vec(
             prop_oneof![Just(' '), Just('\t'), Just('\n'), Just('\r')],

@@ -815,6 +815,13 @@ enum Markup {
     Open,
     /// Just read `<!`.
     Bang,
+    /// Inside the opening of a comment or a CDATA section, `rest` of it still to read; its
+    /// `end` is sought only once the opening is whole, so the opening's own bytes never count
+    /// towards it (XML 1.0 [15], [18]: `<!--->` is an open comment whose content starts `->`).
+    Opening {
+        rest: &'static [u8],
+        end: &'static [u8],
+    },
     /// A start or end tag, up to its `>`: the quote of the value being read, whether the last
     /// byte kept was a space, whether it is an end tag, and its last byte that is not space.
     Tag {
@@ -899,6 +906,15 @@ impl Compact {
         Ok(())
     }
 
+    /// `<!` markup other than a comment or a CDATA section, kept to its `>`.
+    fn declaration() -> Markup {
+        Markup::Until {
+            end: b">",
+            matched: 0,
+            between: false,
+        }
+    }
+
     fn drop_run(&mut self) {
         self.run.clear();
         self.run_len = 0;
@@ -968,20 +984,33 @@ impl Compact {
             }
             Markup::Bang => {
                 self.keep(&[b])?;
-                let end: &'static [u8] = match b {
-                    b'-' => b"-->",
-                    b'[' => b"]]>",
-                    _ => b">",
+                self.state = match b {
+                    b'-' => Markup::Opening {
+                        rest: b"-",
+                        end: b"-->",
+                    },
+                    b'[' => Markup::Opening {
+                        rest: b"CDATA[",
+                        end: b"]]>",
+                    },
+                    b'>' => Markup::Text,
+                    _ => Self::declaration(),
                 };
-                // "<!-" has read the comment's first dash of its opening.
-                self.state = Markup::Until {
-                    end,
-                    matched: 0,
-                    between: false,
+            }
+            Markup::Opening { rest, end } => {
+                self.keep(&[b])?;
+                self.state = match rest.split_first() {
+                    Some((&want, [])) if want == b => Markup::Until {
+                        end,
+                        matched: 0,
+                        between: false,
+                    },
+                    Some((&want, rest)) if want == b => Markup::Opening { rest, end },
+                    // Neither a comment nor a CDATA section, which the reader refuses; it is
+                    // kept to its `>` as any other `<!` markup is.
+                    _ if b == b'>' => Markup::Text,
+                    _ => Self::declaration(),
                 };
-                if b == b'>' {
-                    self.state = Markup::Text;
-                }
             }
             Markup::Tag {
                 quote,

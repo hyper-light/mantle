@@ -12,12 +12,14 @@
 //! before they keep it, and a Block, a File and a Name range that apply commands as their logs
 //! would, each entry stamped with a clock the test moves. The gateway's time is the same clock.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ops::Range;
 
 use bytes::Bytes;
 use mantle_chunk::ChunkKey;
 use mantle_ec::Code;
 use mantle_ec::durability::Scheme;
+use mantle_gateway::get::{self, Get, GetError, Keyring};
 use mantle_gateway::layout::{Layout, SEALED};
 use mantle_gateway::put::{
     Answer, Body, Commit, Expected, Ids, Keys, Put, PutError, Request, Stored,
@@ -25,7 +27,7 @@ use mantle_gateway::put::{
 use mantle_meta::engine::{Engine, Model};
 use mantle_meta::name::{self, CreateUpload, GateChange, Preconditions, PutPart};
 use mantle_meta::record::{
-    GateState, Part, Target, Upload, Version, Versioning, WrappedKey, Wrapper,
+    Extent, GateState, Part, Referrer, Target, Upload, Version, Versioning, WrappedKey, Wrapper,
 };
 use mantle_meta::{block, file};
 use mantle_s3::checksum::{self, Algorithm};
@@ -49,6 +51,10 @@ struct Cell {
     clock: u64,
     /// The requests served, by kind: what a test asks of the path's traffic.
     renewals: usize,
+    /// Volumes whose reads fail.
+    unreadable: BTreeSet<u128>,
+    /// A GET's requests served, by kind.
+    gets: BTreeMap<&'static str, usize>,
 }
 
 impl Cell {
@@ -67,6 +73,8 @@ impl Cell {
             name_index: 0,
             clock: 1_000_000,
             renewals: 0,
+            unreadable: BTreeSet::new(),
+            gets: BTreeMap::new(),
         };
         let open = name::Command::Gate(GateChange {
             bucket: BUCKET.into(),
@@ -137,6 +145,48 @@ impl Cell {
             Request::Block(c) => Answer::Block(self.block(c)),
             Request::File(c) => Answer::File(self.file(c)),
             Request::Name(c) => Answer::Name(self.name(*c)),
+        }
+    }
+
+    /// What the cell answers a GET's request: rows read as a range reads them, and chunk
+    /// bytes from volumes that fail those in `unreadable`.
+    fn serve_get(&mut self, request: get::Request) -> get::Answer {
+        let kind = match &request {
+            get::Request::Header { .. } => "header",
+            get::Request::Extent { .. } => "extent",
+            get::Request::Block { .. } => "block",
+            get::Request::Chunk { .. } => "chunk",
+        };
+        *self.gets.entry(kind).or_default() += 1;
+        match request {
+            get::Request::Header { file } => {
+                get::Answer::Header(file::header(&self.files, file).unwrap())
+            }
+            get::Request::Extent { file, offset } => get::Answer::Extent(
+                file::extents(&self.files, file, offset, 1)
+                    .unwrap()
+                    .into_iter()
+                    .next(),
+            ),
+            get::Request::Block { block } => {
+                get::Answer::Block(block::read(&self.blocks, block).unwrap())
+            }
+            get::Request::Chunk {
+                volume,
+                key,
+                offset,
+                len,
+            } => {
+                if self.unreadable.contains(&volume) {
+                    return get::Answer::Unreadable;
+                }
+                match self.volumes.get(&volume).and_then(|v| v.get(&key)) {
+                    Some(b) if offset + len <= b.len() as u64 => {
+                        get::Answer::Chunk(b.slice(offset as usize..(offset + len) as usize))
+                    }
+                    _ => get::Answer::Unreadable,
+                }
+            }
         }
     }
 
@@ -228,6 +278,70 @@ impl Ids for Counter {
         self.0 += 1;
         Ok(self.0)
     }
+}
+
+/// The node's root key, which unwraps every file's key in these tests.
+struct Root(WrappingKey);
+
+impl Keyring for Root {
+    fn unwrap(&self, key: &WrappedKey) -> Result<DataKey, GetError> {
+        DataKey::unwrap(&key.bytes, &self.0).map_err(|_| GetError::Key)
+    }
+}
+
+/// Reads plaintext `range` of an object of `size` bytes in `file` from `cell`, answering the
+/// GET's requests first in, first out, or last in, first out; and the most blocks of
+/// plaintext the GET held at once.
+fn read(
+    cell: &mut Cell,
+    file: Option<u128>,
+    size: u64,
+    range: Range<u64>,
+    wrapping: &WrappingKey,
+    lifo: bool,
+) -> Result<Vec<u8>, GetError> {
+    let root = Root(WrappingKey::new(wrapping.bytes()));
+    let mut get = Get::new(file, size, range, Box::new(root))?;
+    let mut out = Vec::new();
+    let mut pending = VecDeque::new();
+    loop {
+        while let Some(bytes) = get.take() {
+            out.extend_from_slice(&bytes);
+        }
+        if let Some(outcome) = get.outcome() {
+            return outcome.clone().map(|()| out);
+        }
+        while let Some(request) = get.poll() {
+            pending.push_back(request);
+        }
+        let next = if lifo {
+            pending.pop_back()
+        } else {
+            pending.pop_front()
+        };
+        let (id, request) = next.expect("a GET waits on nothing");
+        let answer = cell.serve_get(request);
+        get.answer(id, answer)?;
+    }
+}
+
+/// Puts an object of `bytes` in `scheme` as `file` and returns the cell and its wrapping key.
+fn stored(scheme: Scheme, bytes: &[u8], file: u128, volumes: u128) -> (Cell, WrappingKey) {
+    let mut cell = Cell::new(volumes);
+    let wrapping = WrappingKey::generate().unwrap();
+    let layout = Layout::new(scheme).unwrap();
+    let len = bytes.len() as u64;
+    let mut put = new_put(&cell, object("k"), len, layout, keys(file, &wrapping));
+    run(
+        &mut cell,
+        &mut put,
+        bytes,
+        &FAST,
+        &Expected::default(),
+        |_, _| {},
+    )
+    .unwrap();
+    (cell, wrapping)
 }
 
 fn keys(file: u128, wrapping: &WrappingKey) -> Keys {
@@ -926,5 +1040,260 @@ proptest! {
                 prop_assert!(name::current(&cell.names, BUCKET, "k").unwrap().is_none());
             }
         }
+    }
+}
+
+/// An object reads back whole, and in ranges that start and end anywhere: on a segment's
+/// boundary or across one, across a block's, at the first byte and the last, under copies and
+/// codes, with the reads answered in either order.
+#[test]
+fn an_object_reads_back_in_any_range() {
+    let segment = seal::SEGMENT as u64;
+    for (scheme, len) in [
+        (Scheme::Copies(1), 9_000_000usize),
+        (Scheme::Copies(3), 300_000),
+        (Scheme::Rs(Code::new(2, 1).unwrap()), 17_000_000),
+    ] {
+        let bytes = body(len, 7);
+        let (mut cell, wrapping) = stored(scheme, &bytes, 70, 4);
+        let len = len as u64;
+        let layout = Layout::new(scheme).unwrap();
+        let block = layout.segments_per_block() * segment;
+        let ranges = [
+            0..len,
+            0..1,
+            len - 1..len,
+            segment - 1..segment + 1,
+            segment..2 * segment,
+            (block - 10).min(len - 20)..(block + 10).min(len),
+            len / 3..len / 2,
+        ];
+        for range in ranges {
+            for lifo in [false, true] {
+                let got = read(&mut cell, Some(70), len, range.clone(), &wrapping, lifo).unwrap();
+                assert!(
+                    got == bytes[range.start as usize..range.end as usize],
+                    "{scheme:?} {range:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A range that holds no byte, of any object, and an empty object's, need no request; a range
+/// past the object's end is refused.
+#[test]
+fn an_empty_range_asks_nothing() {
+    let wrapping = WrappingKey::generate().unwrap();
+    let mut cell = Cell::new(1);
+    assert_eq!(
+        read(&mut cell, None, 0, 0..0, &wrapping, false),
+        Ok(Vec::new())
+    );
+    assert_eq!(
+        read(&mut cell, Some(9), 100, 50..50, &wrapping, false),
+        Ok(Vec::new())
+    );
+    assert!(cell.gets.is_empty());
+    assert_eq!(
+        read(&mut cell, Some(9), 100, 50..101, &wrapping, false),
+        Err(GetError::Range)
+    );
+}
+
+/// A chunk that cannot be read is read from another copy, or its block decoded from any data
+/// chunks; with more lost than the scheme tolerates, the GET fails and says which block.
+#[test]
+fn a_chunk_that_cannot_be_read_is_read_elsewhere() {
+    let len = 300_000usize;
+    for scheme in [Scheme::Copies(3), Scheme::Rs(Code::new(2, 1).unwrap())] {
+        let bytes = body(len, 9);
+        let (mut cell, wrapping) = stored(scheme, &bytes, 80, 3);
+        let (_, e) = file::extents(&cell.files, 80, 0, 1).unwrap()[0];
+        let Target::Block(b) = e.target else { panic!() };
+        let (_, places) = block::read(&cell.blocks, b).unwrap().unwrap();
+        cell.unreadable.insert(places[0].volume);
+        let got = read(
+            &mut cell,
+            Some(80),
+            len as u64,
+            1000..250_000,
+            &wrapping,
+            false,
+        )
+        .unwrap();
+        assert!(got == bytes[1000..250_000], "{scheme:?}");
+        let tolerated = scheme.width() - scheme.needed();
+        for p in &places[1..=tolerated] {
+            cell.unreadable.insert(p.volume);
+        }
+        assert_eq!(
+            read(&mut cell, Some(80), len as u64, 0..10, &wrapping, false),
+            Err(GetError::Unreadable(b)),
+            "{scheme:?}"
+        );
+    }
+}
+
+/// Bytes a volume hands back that are not the block's fail the GET: a segment's tag when read
+/// directly, the block's CRC-32C when decoded from its chunks.
+#[test]
+fn bytes_that_are_not_the_blocks_fail_the_get() {
+    let len = 300_000usize;
+    let bytes = body(len, 11);
+    let (mut cell, wrapping) = stored(Scheme::Rs(Code::new(2, 1).unwrap()), &bytes, 90, 3);
+    let (_, e) = file::extents(&cell.files, 90, 0, 1).unwrap()[0];
+    let Target::Block(b) = e.target else { panic!() };
+    let (_, places) = block::read(&cell.blocks, b).unwrap().unwrap();
+    // The second data chunk's first byte, as its volume keeps it, flipped.
+    let tamper = |cell: &mut Cell| {
+        let chunk = cell.volumes.get_mut(&places[1].volume).unwrap();
+        let mut bad = chunk[&places[1].key].to_vec();
+        bad[0] ^= 1;
+        chunk.insert(places[1].key, Bytes::from(bad));
+    };
+    tamper(&mut cell);
+    let span = |cell: &mut Cell| read(cell, Some(90), len as u64, 0..len as u64, &wrapping, false);
+    assert_eq!(span(&mut cell), Err(GetError::Corrupt(b)));
+    // With the first data chunk unreadable, the block is decoded from the tampered one.
+    cell.unreadable.insert(places[0].volume);
+    assert_eq!(span(&mut cell), Err(GetError::Corrupt(b)));
+}
+
+/// An object of parts reads by its parts' plaintext: a part of 5 MiB and one byte and a last of
+/// one byte, the case where the stored lengths, one tag longer each, would misplace the last
+/// byte (audit §16.7). A read of the last byte asks only for the last part's block.
+#[test]
+fn an_object_of_parts_reads_by_its_parts_plaintext() {
+    let mut cell = Cell::new(3);
+    let wrapping = WrappingKey::generate().unwrap();
+    let upload = cell.create_upload("k");
+    let layout = Layout::new(Scheme::Copies(2)).unwrap();
+    let first = body((5 << 20) + 1, 13);
+    let last = body(1, 17);
+    for (number, (file, bytes)) in [(100u128, &first), (101, &last)].into_iter().enumerate() {
+        let len = bytes.len() as u64;
+        let commit = part("k", &upload, number as u16 + 1);
+        let body = Body {
+            length: len,
+            checksum: None,
+            content_md5: false,
+        };
+        // Each part draws its blocks' IDs from a range of its own.
+        let ids = Box::new(Counter(file * 1_000));
+        let mut put = Put::new(
+            commit,
+            body,
+            keys(file, &wrapping),
+            layout,
+            HANDOVER,
+            ids,
+            cell.clock,
+        )
+        .unwrap();
+        run(
+            &mut cell,
+            &mut put,
+            bytes,
+            &FAST,
+            &Expected::default(),
+            |_, _| {},
+        )
+        .unwrap();
+    }
+    let size = (first.len() + last.len()) as u64;
+    let write = file::Command::Write {
+        file: 102,
+        extents: vec![
+            Extent {
+                length: first.len() as u64,
+                target: Target::File(100),
+            },
+            Extent {
+                length: last.len() as u64,
+                target: Target::File(101),
+            },
+        ],
+        referrer: Referrer {
+            bucket: BUCKET.into(),
+            incarnation: 1,
+            key: "k".into(),
+        },
+        key: None,
+        handover_ns: HANDOVER,
+        blocks_deadline_ns: u64::MAX,
+        at_ns: 0,
+    };
+    assert!(matches!(cell.file(write), file::Outcome::Written { .. }));
+    let whole: Vec<u8> = first.iter().chain(&last).copied().collect();
+    for range in [
+        0..size,
+        size - 1..size,
+        size - 3..size,
+        5 << 20..(5 << 20) + 1,
+    ] {
+        let got = read(&mut cell, Some(102), size, range.clone(), &wrapping, false).unwrap();
+        assert!(
+            got == whole[range.start as usize..range.end as usize],
+            "{range:?}"
+        );
+    }
+    cell.gets.clear();
+    read(&mut cell, Some(102), size, size - 1..size, &wrapping, false).unwrap();
+    assert_eq!(cell.gets["block"], 1);
+}
+
+/// A GET holds at most two blocks' plaintext: while the caller takes none, it asks for no more
+/// once two are ready, and asks again once one is taken.
+#[test]
+fn a_get_holds_two_blocks_at_most() {
+    let len = 3 * 127 * seal::SEGMENT;
+    let bytes = body(len, 19);
+    let (mut cell, wrapping) = stored(Scheme::Copies(1), &bytes, 110, 2);
+    let root = Root(WrappingKey::new(wrapping.bytes()));
+    let mut get = Get::new(Some(110), len as u64, 0..len as u64, Box::new(root)).unwrap();
+    let mut blocks = 0;
+    let serve = |get: &mut Get, cell: &mut Cell| {
+        let mut asked = false;
+        while let Some((id, request)) = get.poll() {
+            let answer = cell.serve_get(request);
+            get.answer(id, answer).unwrap();
+            asked = true;
+        }
+        asked
+    };
+    while serve(&mut get, &mut cell) {}
+    assert_eq!(cell.gets["block"], 2, "two blocks read before any is taken");
+    let mut out = Vec::new();
+    while let Some(b) = get.take() {
+        out.extend_from_slice(&b);
+        blocks += 1;
+        while serve(&mut get, &mut cell) {}
+    }
+    assert_eq!(blocks, 3);
+    assert!(out == bytes);
+    assert_eq!(get.outcome(), Some(&Ok(())));
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Whatever the object's length and scheme, any range of it reads back as its bytes, with
+    /// the reads answered in either order.
+    #[test]
+    fn any_range_reads_back(
+        (scheme, len) in case(),
+        a in any::<prop::sample::Index>(),
+        b in any::<prop::sample::Index>(),
+        lifo in any::<bool>(),
+        seed in any::<u8>(),
+    ) {
+        let bytes = body(len, seed);
+        let (mut cell, wrapping) = stored(scheme, &bytes, 120, 6);
+        let (x, y) = (a.index(len + 1), b.index(len + 1));
+        let range = x.min(y) as u64..x.max(y) as u64;
+        let file = if len > 0 { Some(120) } else { None };
+        let got = read(&mut cell, file, len as u64, range.clone(), &wrapping, lifo).unwrap();
+        prop_assert!(got == bytes[range.start as usize..range.end as usize]);
     }
 }

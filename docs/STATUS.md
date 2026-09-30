@@ -231,7 +231,9 @@ and refusing volumes commit an object whole or nothing, which fails with renewal
 
 Remaining before it is done:
 
-- The GET path: a range read from the fewest chunks, decoding around a chunk that fails.
+- The GET path's lookahead and flight window, from measurements of the path. The path reads
+  a range from the chunk bytes that hold it, reads another copy or decodes a block around a
+  chunk that fails, reads objects of parts by their parts' plaintext, and holds two blocks.
 - The server around it: HTTP, the transport to storage nodes and ranges, routing by
   descriptors, placement across failure domains, and each PUT's memory admitted against the
   gateway's.

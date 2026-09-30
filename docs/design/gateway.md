@@ -41,7 +41,12 @@ Measuring where a device's transfers reach its bandwidth, as calibration's plan 
 The File row's extents are the blocks in order, each its stored length. The File header holds
 the stored length, and the data key wrapped (encryption.md §2): an upload's part is a file
 with a key of its own, and a completed upload is a file of part files, whose bytes each open
-under their own part's key. An empty object is its version alone, with no file, as the
+under their own part's key. A file of parts is addressed by plaintext: its extents are its
+parts' plaintext lengths, and its header's length the object's size. Each part seals its own
+last segment, so no arithmetic maps the object's plaintext to its parts' stored bytes; keyed
+by plaintext, the part holding any byte is one seek away, where stored lengths, each part a
+tag or more longer, would place the tail of a 10,000-part object only after reading every
+part before it (audit §16.7). An empty object is its version alone, with no file, as the
 version row allows; a part row names a file, so an empty part has one, of one block holding
 its one empty segment, sealed.
 
@@ -120,17 +125,36 @@ object whole or nothing; without renewals, a slow client's PUT fails.
 
 ## 3. Reading an object
 
-A GET reads top down:
+A GET reads top down (`get.rs`), from the version the Name range read, whose preconditions,
+lock and range the S3 layer has judged:
 
-1. The version, current or named, from the Name range; then the File header and the extents
-   covering the range. The data key is unwrapped.
-2. The plaintext range becomes the sealed segments that hold it, and those the blocks that
-   hold them. Each block's row gives its chunks' volumes.
-3. Of a coded block the data chunks covering the segments are read, only the bytes needed. A
-   chunk read that fails or does not verify, the chunk store's `Corrupt` (chunk-store.md §7),
-   is served from the block's other chunks instead: any `data` of them decode the block.
-4. Each segment is opened, its tag checked under the file's key and its index, and the range
-   returned.
+1. The version's File header. A file of blocks has its data key, which is unwrapped; a file of
+   parts names, by plaintext, the part holding each byte, and each part is read as a file of
+   blocks under its own key.
+2. The next wanted segment's stored offset, the segment's index times a sealed segment, finds
+   the block holding it by one seek of the file's extents, and the block's row gives its
+   chunks' volumes. Addressing by the extents rather than by the layout's arithmetic reads a
+   file whatever block size it was written with.
+3. Only the chunk bytes holding the wanted segments are read: a copy's, or each data chunk's
+   part of them. A chunk read that fails or does not verify, the chunk store's `Corrupt`
+   (chunk-store.md §7), is read from another copy, or its block decoded from any `data` whole
+   chunks, checked against the block's CRC-32C.
+4. Each segment is opened, its tag checked under the file's key and its index, the last marked
+   as sealed, and the range cut exactly.
+
+A GET holds at most two blocks' plaintext, one read while the one before it waits for the
+caller to take it, as a PUT holds two blocks. It asks one extent at a time, so a read of the
+last byte of an object of 10,000 parts asks for one part's header and one block. What it asks
+ahead of the bytes it gives out, and how many blocks' chunks it reads at once, are the
+lookahead and flight window of audit §16.3 and §16.7, which wait for measurements of the path.
+
+**Checked** (`crates/gateway/tests/object_path.rs`): objects under copies and codes read back
+whole and in ranges across segment and block boundaries, with requests answered in either
+order, and any range of generated objects; a chunk a volume cannot read is read from another
+copy or decoded, and a GET with more lost than its scheme tolerates fails naming the block;
+bytes that are not the block's fail by a segment's tag, and by the block's CRC-32C once
+decoded; an object of a part of 5 MiB and one byte and a part of one byte reads by its parts'
+plaintext; and a GET whose caller takes nothing reads two blocks and no more.
 
 ## 4. Open
 

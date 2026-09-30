@@ -399,15 +399,34 @@ impl<F: BlockFile> Writer<F> {
                 next,
             )
         };
-        let mut offset = slot_start(&self.shared, slot)?
+        let begin = slot_start(&self.shared, slot)?;
+        let end = begin
+            .checked_add(self.shared.config.segment_bytes)
+            .ok_or(LogError::Damaged("an offset past u64"))?;
+        let mut offset = begin
             .checked_add(block(&self.shared)?)
             .ok_or(LogError::Damaged("an offset past u64"))?;
+        let segment = crate::recover::Segment {
+            log: self.shared.id,
+            incarnation,
+            nonce,
+        };
+        // The tail is read through a window of a segment: nothing writes it while it is swept.
+        let mut reader = crate::recover::Reader::new(
+            &self.shared.file,
+            self.shared.align,
+            self.shared.config.segment_bytes,
+        )?;
         let mut moved = Vec::new();
-        while let Some((header, bytes, padded)) =
-            read_frame(&self.shared, slot, incarnation, nonce, offset)?
-        {
+        loop {
+            let (header, bytes, padded) = match reader.frame_at(segment, offset, end)? {
+                crate::recover::Found::Frame(header, bytes, padded) => (header, bytes, padded),
+                crate::recover::Found::End => break,
+                crate::recover::Found::Invalid => {
+                    return Err(LogError::Damaged("a live frame does not verify"));
+                }
+            };
             let body = bytes
-                .as_slice()
                 .get(FRAME_HEADER_LEN..header.frame_len().unwrap_or(0))
                 .ok_or(LogError::Damaged("a frame shorter than its header says"))?;
             let decoded = format::records(body, header.records)
@@ -766,30 +785,6 @@ fn drop_dead_tails(state: &mut State) {
         }
         state.segments.live.pop_front();
         state.segments.free.push_back((tail, state.next_sequence));
-    }
-}
-
-/// Reads the frame of segment `slot`, incarnation `incarnation`, at `offset`: its header, its
-/// bytes and its padded length, or `None` where the segment's frames end.
-pub(crate) fn read_frame<F: BlockFile>(
-    shared: &Shared<F>,
-    slot: u32,
-    incarnation: u64,
-    nonce: u64,
-    offset: u64,
-) -> Result<Option<(FrameHeader, AlignedBuf, u64)>, LogError> {
-    let end = slot_start(shared, slot)?
-        .checked_add(shared.config.segment_bytes)
-        .ok_or(LogError::Damaged("an offset past u64"))?;
-    let segment = crate::recover::Segment {
-        log: shared.id,
-        incarnation,
-        nonce,
-    };
-    match crate::recover::frame_at(&shared.file, segment, shared.align, offset, end)? {
-        crate::recover::Found::Frame(header, bytes, padded) => Ok(Some((header, bytes, padded))),
-        crate::recover::Found::End => Ok(None),
-        crate::recover::Found::Invalid => Err(LogError::Damaged("a live frame does not verify")),
     }
 }
 

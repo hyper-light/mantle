@@ -7,8 +7,10 @@
 //! the log frees and reclaims segments as a running node's does. For each entry size and
 //! number of replicas the replicas append for the step's duration. Besides throughput and
 //! latency, each row says how many appends one flush carried: group commit is what lets
-//! many replicas share one device's flushes (06 §C.c). The scratch file is removed however
-//! the benchmark ends.
+//! many replicas share one device's flushes (06 §C.c). Each point ends with a restart: the
+//! log reopened, timed, and every replica's kept entries read back from the file, as a
+//! leader reads what it sends a follower that lags. The scratch file is removed however the
+//! benchmark ends.
 
 use std::io::Write;
 use std::path::Path;
@@ -82,8 +84,17 @@ pub fn log(out: &mut impl Write, path: &Path, options: &Options) -> Result<(), E
     )?;
     writeln!(
         out,
-        "  {:<12} {:>9} {:>11} {:>12} {:>10} {:>10} {:>10} {:>11}",
-        "", "replicas", "appends/s", "throughput", "p50", "p99", "p99.9", "per flush"
+        "  {:<12} {:>9} {:>11} {:>12} {:>10} {:>10} {:>10} {:>11} {:>10} {:>20}",
+        "",
+        "replicas",
+        "appends/s",
+        "throughput",
+        "p50",
+        "p99",
+        "p99.9",
+        "per flush",
+        "reopen",
+        "read back"
     )?;
     let mut point = 0u64;
     for &size in &sizes {
@@ -111,9 +122,18 @@ pub fn log(out: &mut impl Write, path: &Path, options: &Options) -> Result<(), E
                 // Counts of a bounded run are far below 2^53.
                 updates as f64 / frames as f64
             };
+            drop(log);
+            let file = DeviceFile::open(scratch.path(), false, CachingRequest::PreferDirect, align)
+                .map_err(Error::Disk)?;
+            let started = Instant::now();
+            let (log, _) = Log::open(file, config, u128::from(point)).map_err(log_error)?;
+            let reopen = started.elapsed();
+            let started = Instant::now();
+            let read = read_back(&log, count)?;
+            let read_back = started.elapsed();
             writeln!(
                 out,
-                "  {:<12} {:>9} {:>11} {:>12} {:>10} {:>10} {:>10} {:>11.1}",
+                "  {:<12} {:>9} {:>11} {:>12} {:>10} {:>10} {:>10} {:>11.1} {:>10} {:>20}",
                 format!("append {}", display::size(size)),
                 count,
                 display::count(rate(outcome.appends, outcome.elapsed)),
@@ -121,7 +141,9 @@ pub fn log(out: &mut impl Write, path: &Path, options: &Options) -> Result<(), E
                 display::nanos(outcome.latency.p50()),
                 display::nanos(outcome.latency.p99()),
                 display::nanos(outcome.latency.p999()),
-                per_flush
+                per_flush,
+                display::nanos(nanos(reopen)),
+                format!("{} in {}", read, display::nanos(nanos(read_back)))
             )?;
             out.flush()?;
             drop(log);
@@ -132,6 +154,28 @@ pub fn log(out: &mut impl Write, path: &Path, options: &Options) -> Result<(), E
 
 fn log_error(e: LogError) -> Error {
     Error::Log(e.to_string())
+}
+
+/// Reads back from the file every entry the `count` replicas' groups keep; returns how many.
+fn read_back(log: &Log<DeviceFile>, count: usize) -> Result<u64, Error> {
+    let mut read = 0u64;
+    for replica in 0..count {
+        let group = u128::from(u64::try_from(replica).unwrap_or(u64::MAX));
+        let Some(view) = log.view(group).map_err(log_error)? else {
+            continue;
+        };
+        let (Some(first), Some(high)) = (view.start.index.checked_add(1), view.last.checked_add(1))
+        else {
+            continue;
+        };
+        if first < high {
+            let entries = log
+                .entries(group, first, high, u64::MAX)
+                .map_err(log_error)?;
+            read = read.saturating_add(u64::try_from(entries.len()).unwrap_or(u64::MAX));
+        }
+    }
+    Ok(read)
 }
 
 struct Outcome {

@@ -1342,6 +1342,124 @@ impl mantle_disk::block::BlockFile for Gated {
     }
 }
 
+/// A simulated file that counts its reads and the looks at its length.
+struct Counting {
+    file: Arc<SimFile>,
+    reads: std::sync::atomic::AtomicU64,
+    lengths: std::sync::atomic::AtomicU64,
+}
+
+impl Counting {
+    fn new(file: Arc<SimFile>) -> Arc<Self> {
+        Arc::new(Self {
+            file,
+            reads: std::sync::atomic::AtomicU64::new(0),
+            lengths: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// Reads and looks at the length since the last call.
+    fn take(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::SeqCst;
+        (self.reads.swap(0, SeqCst), self.lengths.swap(0, SeqCst))
+    }
+}
+
+impl mantle_disk::block::BlockFile for Counting {
+    fn alignment(&self) -> Alignment {
+        self.file.alignment()
+    }
+
+    fn len(&self) -> Result<u64, mantle_disk::DiskError> {
+        self.lengths
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        mantle_disk::block::BlockFile::len(&*self.file)
+    }
+
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), mantle_disk::DiskError> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.file.read_exact_at(buf, offset)
+    }
+
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), mantle_disk::DiskError> {
+        self.file.write_all_at(buf, offset)
+    }
+
+    fn sync_data(&self) -> Result<(), mantle_disk::DiskError> {
+        self.file.sync_data()
+    }
+}
+
+/// Opening a log reads each segment it walks through a window of the segment, where it read
+/// each frame's first block and then the frame, and looked at the file's length for each
+/// (audit P07): an open replaying segments of one-block frames takes a few reads a segment
+/// and one look at the length, and finds every update.
+#[test]
+fn opening_reads_each_segment_through_a_window() {
+    let counting = Counting::new(sim(41));
+    let settings = config(16, 8);
+    let mut models = Models::new();
+    let log = Log::create(Arc::clone(&counting), settings, ID).unwrap();
+    for n in 1..=120u64 {
+        let u = Update {
+            entries: Some(entries(n, &[1])),
+            ..Update::default()
+        };
+        apply(&mut models, 1, &u);
+        log.write(1, u).unwrap();
+    }
+    drop(log);
+    let len = mantle_disk::block::BlockFile::len(&*counting.file).unwrap();
+    let segments = (len - AREA).div_ceil(settings.segment_bytes);
+    counting.take();
+    let (log, recovery) = Log::open(Arc::clone(&counting), settings, ID).unwrap();
+    let (reads, lengths) = counting.take();
+    // The writer reclaimed the oldest segments as it went; three at least hold one-block
+    // frames that the open replays, a block after each segment's header.
+    let per_segment = settings.segment_bytes / BLOCK as u64 - 1;
+    assert!(
+        recovery.frames >= 3 * per_segment,
+        "{} frames",
+        recovery.frames
+    );
+    assert!(segments >= 4, "{segments} segments");
+    // Each segment's header, each segment walked twice (for the last frame, then in the
+    // replay) and the two persist slots.
+    assert!(
+        reads <= 3 * segments + 2,
+        "{reads} reads to open {segments} segments of {} frames",
+        recovery.frames
+    );
+    assert!(lengths <= 2, "{lengths} looks at the length");
+    check(&log, &models);
+}
+
+/// Entries no longer in memory are read from the file, and a run of them that lies together
+/// in one read, each still verified as its group's entry of its term (audit P07).
+#[test]
+fn entries_not_in_memory_that_lie_together_are_read_at_once() {
+    let counting = Counting::new(sim(42));
+    let settings = Config {
+        group_cache: 0,
+        ..config(16, 8)
+    };
+    let log = Log::create(Arc::clone(&counting), settings, ID).unwrap();
+    let terms = vec![1u64; 200];
+    log.write(
+        1,
+        Update {
+            entries: Some(entries(1, &terms)),
+            ..Update::default()
+        },
+    )
+    .unwrap();
+    counting.take();
+    let got = log.entries(1, 1, 201, u64::MAX).unwrap();
+    let (reads, _) = counting.take();
+    assert_eq!(got, entries(1, &terms).entries);
+    assert_eq!(reads, 1, "{reads} reads for 200 entries written together");
+}
+
 /// A group's updates are made durable in the order it submitted them, even when the older
 /// one waits for a frame with room and a newer one would fit the frame it missed (audit S02).
 #[test]

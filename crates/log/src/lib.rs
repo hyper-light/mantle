@@ -619,16 +619,85 @@ impl<F: BlockFile + 'static> Log<F> {
                 wanted.push((index, slot.term, slot.place, slot.len, slot.cached.clone()));
             }
         }
-        wanted
-            .into_iter()
-            .map(|(index, term, place, len, cached)| {
-                let bytes = match cached {
-                    Some(bytes) => bytes,
-                    None => self.read_entry(group, index, term, place, len)?,
+        // Entries no longer in memory are read from the file, those whose blocks touch in one
+        // read: an update's entries lie together in its frame, and a replica catching up asks
+        // for runs of them (audit P07).
+        let mut out = Vec::with_capacity(wanted.len());
+        let mut rest = wanted.as_slice();
+        while let Some(((index, term, place, len, cached), after)) = rest.split_first() {
+            if let Some(bytes) = cached {
+                out.push(Entry {
+                    term: *term,
+                    bytes: Arc::clone(bytes),
+                });
+                rest = after;
+                continue;
+            }
+            let (begin, mut end) = self.span(place, *len).ok_or(LogError::Corrupt {
+                group,
+                index: *index,
+            })?;
+            let mut run = 1usize;
+            for (_, _, next, next_len, next_cached) in after {
+                let Some((b, e)) = self.span(next, *next_len) else {
+                    break;
                 };
-                Ok(Entry { term, bytes })
-            })
-            .collect()
+                if next_cached.is_some() || next.slot != place.slot || b < begin || b > end {
+                    break;
+                }
+                end = end.max(e);
+                run = run.saturating_add(1);
+            }
+            let (these, later) = rest.split_at(run.min(rest.len()));
+            let bytes = self.read_span(begin, end)?;
+            for (index, term, place, len, _) in these {
+                let skip = usize::try_from(place.offset.saturating_sub(begin)).map_err(|_| {
+                    LogError::Corrupt {
+                        group,
+                        index: *index,
+                    }
+                })?;
+                let found = bytes
+                    .as_slice()
+                    .get(skip..)
+                    .and_then(|at| format::entry_at(at, group, *index))
+                    .filter(|(t, _)| t == term)
+                    .map(|(_, b)| Arc::<[u8]>::from(b));
+                let bytes = match found {
+                    Some(bytes) => bytes,
+                    // Moved since its place was taken: looked up again.
+                    None => self.read_entry(group, *index, *term, *place, *len)?,
+                };
+                out.push(Entry { term: *term, bytes });
+            }
+            rest = later;
+        }
+        Ok(out)
+    }
+
+    /// The block-aligned span of the file holding an entry of `len` payload bytes at `place`.
+    fn span(&self, place: &Place, len: u32) -> Option<(u64, u64)> {
+        let align = self.shared.align;
+        let end = place
+            .offset
+            .checked_add(format::ENTRY_HEADER_BYTES)?
+            .checked_add(u64::from(len))
+            .and_then(|e| align.up_u64(e))?;
+        Some((align.down_u64(place.offset), end))
+    }
+
+    /// The file's bytes `[begin, end)`, block-aligned, in a buffer from the pool.
+    fn read_span(&self, begin: u64, end: u64) -> Result<mantle_disk::buf::PoolBuf<'_>, LogError> {
+        let size = usize::try_from(end.saturating_sub(begin))
+            .map_err(|_| LogError::Damaged("a read past usize"))?;
+        let mut buf = self
+            .shared
+            .pool
+            .take(size)
+            .map_err(|e| LogError::Disk(e.into()))?;
+        buf.set_len(size).map_err(|e| LogError::Disk(e.into()))?;
+        self.shared.file.read_exact_at(buf.as_mut_slice(), begin)?;
+        Ok(buf)
     }
 
     /// Reads one entry from the file, verified as `group`'s entry `index` of `term`. An entry

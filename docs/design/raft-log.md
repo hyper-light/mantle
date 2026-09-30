@@ -233,9 +233,17 @@ up to its quota, to hold twice that, the same headroom the chunk store's cleanin
    could complete it with the zeros of a newer frame's padding and bring back an update the
    replica had already been told was lost, such as a vote.
 
-Recovery reads the live log once, sequentially. Reclamation bounds the live log (§5), so
-the time to recover is bounded by the live bytes over the device's measured sequential
-read rate.
+Recovery reads the live log through a window of one segment, the most any frame takes. A
+frame the window holds is verified there, and the window moves to the start of one it does
+not hold, which then lies wholly within it, so each segment is read in one read, or two where
+a walk begins part way, and the searches past the last frame and through slots whose header
+does not read examine every block from memory. The file's length is taken once. Before, each
+frame took a read of its first block, another of the whole frame and a look at the file's
+length, and each search read a block at a time: reopening a log after five seconds of
+appends took 98–365 ms on this machine's SSD, and takes 8–108 ms (audit P07;
+[measurements](../measurements/2026-09-29-recovery-reads.md)). Reclamation bounds the live log
+(§5), so the time to recover is bounded by the live bytes over the device's sequential read
+rate. The writer's sweep reads the tail segment through the same window.
 
 ## 7. What a replica reads
 
@@ -244,6 +252,12 @@ hard state, the engine's configuration and the held proposals; `entries`, `term`
 `first_index` and `last_index` from the group's slots; and `snapshot` from the engine
 (07 §1.2). The view also carries the group's uncertainty mark, if any (§6). The log serves the view, and the replica updates it through the log only after a
 submission is durable, since `Storage` is what is durable, as the core reads it.
+
+Entries no longer in memory are read from the file, a run of them whose blocks touch in one
+read, as an update's entries lie together in its frame; each is verified as its group's entry
+of its term, and one moved since its place was taken is looked up again. Reading back one
+replica's 86–116 kept entries, one to a one-block frame, took 5–6 ms and takes 0.4–1.1 ms. Entries of many groups interleaved in larger frames lie apart and are still read
+one at a time (audit P07).
 
 ## 8. Testing
 

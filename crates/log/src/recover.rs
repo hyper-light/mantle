@@ -10,9 +10,9 @@ use crate::state::{self, Live, Place, Replayed, Slot};
 use crate::{Config, Head, LogError, Recovery, Segments, State};
 
 /// What a frame's position holds.
-pub(crate) enum Found {
+pub(crate) enum Found<'a> {
     /// A verified frame: its header, its bytes and its padded length.
-    Frame(FrameHeader, AlignedBuf, u64),
+    Frame(FrameHeader, &'a [u8], u64),
     /// No frame of this segment: its frames end before here.
     End,
     /// A frame of this segment whose checksum fails, or that runs past the segment or file.
@@ -27,117 +27,172 @@ pub(crate) struct Segment {
     pub nonce: u64,
 }
 
-/// The frame of `segment` at `offset`, reading no further than `end`, the segment's end.
-pub(crate) fn frame_at<F: BlockFile>(
-    file: &F,
-    segment: Segment,
+/// Reads a log file's frames through a window of one segment's bytes, the most any frame
+/// takes. A frame the window holds is verified there, and the window moves to the start of one
+/// it does not hold, which then lies wholly within it. A walk of a segment, or a search of its
+/// blocks, then reads it in one read, or two where the walk began part way; each frame took a
+/// read of its first block, another of the whole frame and a look at the file's length, and a
+/// search read the segment a block at a time (audit P07).
+pub(crate) struct Reader<'a, F> {
+    file: &'a F,
     align: Alignment,
-    offset: u64,
-    end: u64,
-) -> Result<Found, LogError> {
-    let block = u64::try_from(align.get()).map_err(|_| LogError::Config("block"))?;
-    let len = file.len()?;
-    let Some(first_end) = offset.checked_add(block) else {
-        return Ok(Found::End);
-    };
-    if first_end > end || first_end > len {
-        return Ok(Found::End);
-    }
-    let mut head = AlignedBuf::zeroed(align.get(), align).map_err(|e| LogError::Disk(e.into()))?;
-    head.set_len(align.get())
-        .map_err(|e| LogError::Disk(e.into()))?;
-    file.read_exact_at(head.as_mut_slice(), offset)?;
-    let Some(header) = FrameHeader::decode(head.as_slice()) else {
-        return Ok(Found::End);
-    };
-    if header.log != segment.log
-        || header.incarnation != segment.incarnation
-        || header.nonce != segment.nonce
-    {
-        return Ok(Found::End);
-    }
-    let Some(frame_len) = header.frame_len().and_then(|l| u64::try_from(l).ok()) else {
-        return Ok(Found::Invalid);
-    };
-    let Some(padded) = align.up_u64(frame_len) else {
-        return Ok(Found::Invalid);
-    };
-    let fits = offset
-        .checked_add(padded)
-        .is_some_and(|e| e <= end && e <= len);
-    if !fits {
-        return Ok(Found::Invalid);
-    }
-    let size = usize::try_from(padded).map_err(|_| LogError::Damaged("a frame past usize"))?;
-    let mut bytes = AlignedBuf::zeroed(size, align).map_err(|e| LogError::Disk(e.into()))?;
-    bytes.set_len(size).map_err(|e| LogError::Disk(e.into()))?;
-    file.read_exact_at(bytes.as_mut_slice(), offset)?;
-    if !header.verifies(bytes.as_slice()) {
-        return Ok(Found::Invalid);
-    }
-    Ok(Found::Frame(header, bytes, padded))
+    /// The file's length when the reader was made: nothing writes the file while a reader
+    /// walks it.
+    len: u64,
+    window: AlignedBuf,
+    /// The file offset of the window's first byte, and the bytes it holds.
+    start: u64,
+    held: u64,
 }
 
-/// Whether `segment` holds a valid frame after the block at `from`, up to `end`, with a
-/// sequence past `after`.
-fn later_frame<F: BlockFile>(
-    file: &F,
-    segment: Segment,
-    align: Alignment,
-    from: u64,
-    end: u64,
-    after: Option<u64>,
-) -> Result<bool, LogError> {
-    let block = block_of(align)?;
-    let mut offset = from;
-    loop {
-        offset = match offset.checked_add(block) {
-            Some(next) if next < end => next,
-            _ => return Ok(false),
+impl<'a, F: BlockFile> Reader<'a, F> {
+    /// A reader of `file` whose window holds `segment_bytes`.
+    pub fn new(file: &'a F, align: Alignment, segment_bytes: u64) -> Result<Self, LogError> {
+        let size = usize::try_from(segment_bytes).map_err(|_| LogError::Config("segment"))?;
+        Ok(Self {
+            file,
+            align,
+            len: file.len()?,
+            window: AlignedBuf::zeroed(size, align).map_err(|e| LogError::Disk(e.into()))?,
+            start: 0,
+            held: 0,
+        })
+    }
+
+    /// File bytes `[at, at + n)`, `n` at most the window's size, moving the window to `at` when
+    /// it does not hold them. `None` when they run past the file.
+    fn bytes(&mut self, at: u64, n: u64) -> Result<Option<&[u8]>, LogError> {
+        let Some(end) = at.checked_add(n).filter(|&e| e <= self.len) else {
+            return Ok(None);
         };
-        if let Found::Frame(header, ..) = frame_at(file, segment, align, offset, end)?
-            && after.is_none_or(|seq| header.sequence > seq)
+        if at < self.start || end > self.start.saturating_add(self.held) {
+            let capacity = u64::try_from(self.window.capacity()).unwrap_or(0);
+            if n > capacity {
+                return Ok(None);
+            }
+            // Whole blocks: the file's end may fall within one, past the last frame.
+            let want = self
+                .align
+                .down_u64(capacity.min(self.len.saturating_sub(at)));
+            self.held = 0;
+            self.window
+                .set_len(usize::try_from(want).unwrap_or(0))
+                .map_err(|e| LogError::Disk(e.into()))?;
+            self.file.read_exact_at(self.window.as_mut_slice(), at)?;
+            self.start = at;
+            self.held = want;
+        }
+        let from = usize::try_from(at.saturating_sub(self.start)).unwrap_or(usize::MAX);
+        let to = usize::try_from(end.saturating_sub(self.start)).unwrap_or(usize::MAX);
+        Ok(self.window.as_slice().get(from..to))
+    }
+
+    /// The header in the block at `offset`, if one decodes there, not yet verified.
+    fn header(&mut self, offset: u64) -> Result<Option<FrameHeader>, LogError> {
+        let block = block_of(self.align)?;
+        Ok(self.bytes(offset, block)?.and_then(FrameHeader::decode))
+    }
+
+    /// The frame of `segment` at `offset`, reading no further than `end`, the segment's end.
+    pub fn frame_at(
+        &mut self,
+        segment: Segment,
+        offset: u64,
+        end: u64,
+    ) -> Result<Found<'_>, LogError> {
+        let block = block_of(self.align)?;
+        let Some(first_end) = offset.checked_add(block) else {
+            return Ok(Found::End);
+        };
+        if first_end > end || first_end > self.len {
+            return Ok(Found::End);
+        }
+        let Some(header) = self.header(offset)? else {
+            return Ok(Found::End);
+        };
+        if header.log != segment.log
+            || header.incarnation != segment.incarnation
+            || header.nonce != segment.nonce
         {
-            return Ok(true);
+            return Ok(Found::End);
+        }
+        let Some(frame_len) = header.frame_len().and_then(|l| u64::try_from(l).ok()) else {
+            return Ok(Found::Invalid);
+        };
+        let Some(padded) = self.align.up_u64(frame_len) else {
+            return Ok(Found::Invalid);
+        };
+        let fits = offset
+            .checked_add(padded)
+            .is_some_and(|e| e <= end && e <= self.len);
+        if !fits {
+            return Ok(Found::Invalid);
+        }
+        match self.bytes(offset, padded)? {
+            Some(bytes) if header.verifies(bytes) => Ok(Found::Frame(header, bytes, padded)),
+            _ => Ok(Found::Invalid),
         }
     }
-}
 
-/// Whether a valid frame of log `log` from a segment newer than incarnation `above` lies in
-/// the blocks after the one at `first`, up to `end`, whatever segment header the slot holds.
-fn newer_frame<F: BlockFile>(
-    file: &F,
-    log: u128,
-    align: Alignment,
-    first: u64,
-    end: u64,
-    above: u64,
-) -> Result<bool, LogError> {
-    let block = block_of(align)?;
-    let len = file.len()?;
-    let mut head = AlignedBuf::zeroed(align.get(), align).map_err(|e| LogError::Disk(e.into()))?;
-    head.set_len(align.get())
-        .map_err(|e| LogError::Disk(e.into()))?;
-    let mut offset = first;
-    loop {
-        offset = match offset.checked_add(block) {
-            Some(next) if next < end && next.checked_add(block).is_some_and(|e| e <= len) => next,
-            _ => return Ok(false),
-        };
-        file.read_exact_at(head.as_mut_slice(), offset)?;
-        let Some(header) = FrameHeader::decode(head.as_slice()) else {
-            continue;
-        };
-        if header.log != log || header.incarnation <= above {
-            continue;
+    /// Whether `segment` holds a valid frame after the block at `from`, up to `end`, with a
+    /// sequence past `after`.
+    fn later_frame(
+        &mut self,
+        segment: Segment,
+        from: u64,
+        end: u64,
+        after: Option<u64>,
+    ) -> Result<bool, LogError> {
+        let block = block_of(self.align)?;
+        let mut offset = from;
+        loop {
+            offset = match offset.checked_add(block) {
+                Some(next) if next < end => next,
+                _ => return Ok(false),
+            };
+            if let Found::Frame(header, ..) = self.frame_at(segment, offset, end)?
+                && after.is_none_or(|seq| header.sequence > seq)
+            {
+                return Ok(true);
+            }
         }
-        let segment = Segment {
-            log,
-            incarnation: header.incarnation,
-            nonce: header.nonce,
-        };
-        if let Found::Frame(..) = frame_at(file, segment, align, offset, end)? {
-            return Ok(true);
+    }
+
+    /// Whether a valid frame of log `log` from a segment newer than incarnation `above` lies
+    /// in the blocks after the one at `first`, up to `end`, whatever segment header the slot
+    /// holds.
+    fn newer_frame(
+        &mut self,
+        log: u128,
+        first: u64,
+        end: u64,
+        above: u64,
+    ) -> Result<bool, LogError> {
+        let block = block_of(self.align)?;
+        let mut offset = first;
+        loop {
+            offset = match offset.checked_add(block) {
+                Some(next)
+                    if next < end && next.checked_add(block).is_some_and(|e| e <= self.len) =>
+                {
+                    next
+                }
+                _ => return Ok(false),
+            };
+            let Some(header) = self.header(offset)? else {
+                continue;
+            };
+            if header.log != log || header.incarnation <= above {
+                continue;
+            }
+            let segment = Segment {
+                log,
+                incarnation: header.incarnation,
+                nonce: header.nonce,
+            };
+            if let Found::Frame(..) = self.frame_at(segment, offset, end)? {
+                return Ok(true);
+            }
         }
     }
 }
@@ -355,7 +410,11 @@ pub(crate) fn open<F: BlockFile>(
     };
 
     // 2. The last valid frame, in the highest segment that holds one.
-    let frames_of = |inc: u64, visit: &mut Visit<'_>| -> Result<(u64, bool), LogError> {
+    let mut reader = Reader::new(file, align, segment)?;
+    let frames_of = |reader: &mut Reader<'_, F>,
+                     inc: u64,
+                     visit: &mut Visit<'_>|
+     -> Result<(u64, bool), LogError> {
         let slot = *by_incarnation
             .get(&inc)
             .ok_or(LogError::Damaged("a live segment is missing"))?;
@@ -368,9 +427,9 @@ pub(crate) fn open<F: BlockFile>(
             .checked_add(block)
             .ok_or(LogError::Damaged("an offset past u64"))?;
         loop {
-            match frame_at(file, which, align, offset, end)? {
+            match reader.frame_at(which, offset, end)? {
                 Found::Frame(header, bytes, padded) => {
-                    visit(offset, &header, bytes.as_slice(), padded)?;
+                    visit(offset, &header, bytes, padded)?;
                     offset = offset
                         .checked_add(padded)
                         .ok_or(LogError::Damaged("an offset past u64"))?;
@@ -384,7 +443,7 @@ pub(crate) fn open<F: BlockFile>(
     let mut inc = highest;
     while last.is_none() {
         let mut found: Option<Last> = None;
-        let (stop, _) = frames_of(inc, &mut |offset, header, _, padded| {
+        let (stop, _) = frames_of(&mut reader, inc, &mut |offset, header, _, padded| {
             found = Some(Last {
                 incarnation: inc,
                 offset,
@@ -405,7 +464,7 @@ pub(crate) fn open<F: BlockFile>(
             .and_then(|s| s.checked_add(segment))
             .ok_or(LogError::Damaged("an offset past u64"))?;
         let after = found.map(|f| f.sequence);
-        if later_frame(file, segment_of(slot, inc), align, stop, end, after)? {
+        if reader.later_frame(segment_of(slot, inc), stop, end, after)? {
             return Err(LogError::Damaged("an acknowledged frame does not verify"));
         }
         last = found;
@@ -434,7 +493,7 @@ pub(crate) fn open<F: BlockFile>(
         let first = begin
             .checked_add(block)
             .ok_or(LogError::Damaged("an offset past u64"))?;
-        if newer_frame(file, id, align, first, end, highest)? {
+        if reader.newer_frame(id, first, end, highest)? {
             return Err(LogError::Damaged(
                 "a segment's header does not read, but its frames do",
             ));
@@ -454,7 +513,7 @@ pub(crate) fn open<F: BlockFile>(
         let slot = *by_incarnation
             .get(&inc)
             .ok_or(LogError::Damaged("a live segment is missing"))?;
-        let (end, invalid) = frames_of(inc, &mut |offset, header, bytes, _| {
+        let (end, invalid) = frames_of(&mut reader, inc, &mut |offset, header, bytes, _| {
             if expected.is_some_and(|e| e != header.sequence) {
                 return Err(LogError::Damaged("a frame is missing"));
             }

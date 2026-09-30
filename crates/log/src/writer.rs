@@ -24,7 +24,8 @@
 //! and a few replicas would alternate between batches, every update waiting for two flushes
 //! (docs/measurements/2026-09-28-raft-log-benchmark.md). The writer waits for them as long as
 //! waiting is expected to lower total latency, as the chunk store's writer does
-//! (`mantle_disk::commit`).
+//! (`mantle_disk::commit`). Under `Waits::Asked` it waits on no clock at all, for a caller
+//! that steps the log itself.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -44,7 +45,7 @@ use crate::state::{
     self, Group, HARD_STATE_BYTES, PROPOSAL_EXTRA, Place, START_BYTES, Slot, UNCERTAIN_BYTES,
     entry_bytes, resolves,
 };
-use crate::{LogError, Shared, State, Submission, Update};
+use crate::{LogError, Shared, State, Submission, Update, Waits, Work};
 
 /// Where an update's pieces went in the payload.
 #[derive(Debug, Default)]
@@ -77,7 +78,10 @@ struct Sweep {
 
 pub(crate) struct Writer<F> {
     shared: Arc<Shared<F>>,
-    receiver: Receiver<Submission>,
+    receiver: Receiver<Work>,
+    /// Requests to confirm the last frame's flush, answered at the end of the batch they
+    /// arrived in: at most one, since `Log::confirm` sends one at a time.
+    confirms: Vec<std::sync::mpsc::SyncSender<Result<(), LogError>>>,
     /// Updates held for the next batch: a group's second update waits for its first.
     held: VecDeque<Submission>,
     /// Payload bytes one frame holds.
@@ -92,11 +96,12 @@ pub(crate) struct Writer<F> {
 }
 
 impl<F: BlockFile> Writer<F> {
-    pub fn new(shared: Arc<Shared<F>>, receiver: Receiver<Submission>) -> Result<Self, LogError> {
+    pub fn new(shared: Arc<Shared<F>>, receiver: Receiver<Work>) -> Result<Self, LogError> {
         let capacity = crate::frame_room(&shared.config, shared.align)?;
         Ok(Self {
             shared,
             receiver,
+            confirms: Vec::new(),
             held: VecDeque::new(),
             capacity,
             anticipation: Anticipation::new(),
@@ -114,12 +119,12 @@ impl<F: BlockFile> Writer<F> {
             let held = u64::try_from(batch.len()).unwrap_or(u64::MAX);
             if batch.is_empty() {
                 match self.next_when_idle() {
-                    Some(s) => batch.push_back(self.taken(s)),
+                    Some(w) => self.take(w, &mut batch),
                     None => return,
                 }
             }
-            while let Ok(s) = self.receiver.try_recv() {
-                batch.push_back(self.taken(s));
+            while let Ok(w) = self.receiver.try_recv() {
+                self.take(w, &mut batch);
             }
             self.gather(&mut batch, answered, backlog.saturating_add(held));
             answered = u64::try_from(batch.len()).unwrap_or(u64::MAX);
@@ -127,19 +132,28 @@ impl<F: BlockFile> Writer<F> {
                 for s in batch {
                     self.answer(&s, Err(LogError::Fenced));
                 }
+                self.answer_confirms();
                 // Answer what still comes until the log is dropped.
-                while let Ok(s) = self.receiver.recv() {
-                    let s = self.taken(s);
-                    self.answer(&s, Err(LogError::Fenced));
+                while let Ok(w) = self.receiver.recv() {
+                    match w {
+                        Work::Update(s) => {
+                            let s = self.taken(s);
+                            self.answer(&s, Err(LogError::Fenced));
+                        }
+                        Work::Confirm(reply) => {
+                            let _ = reply.try_send(Err(LogError::Fenced));
+                        }
+                    }
                 }
                 return;
             }
-            if self.commit(batch).is_err() {
+            if !batch.is_empty() && self.commit(batch).is_err() {
                 self.fence();
                 for s in std::mem::take(&mut self.held) {
                     self.answer(&s, Err(LogError::Fenced));
                 }
             }
+            self.answer_confirms();
             // Submissions sent before these answers went out are queued ahead of any the
             // answered replicas send next.
             backlog = self
@@ -150,11 +164,12 @@ impl<F: BlockFile> Writer<F> {
         }
     }
 
-    /// The next submission, once nothing is queued; `None` once the log is closed. The last
-    /// frame's flush is confirmed first if no submission comes within one flush's measured
-    /// time, whose own frame would have confirmed it for nothing, and before the writer stops.
-    fn next_when_idle(&mut self) -> Option<Submission> {
-        if self.unconfirmed.is_some() {
+    /// The next work, once nothing is queued; `None` once the log is closed. Under
+    /// `Waits::Measured` the last frame's flush is confirmed first if nothing comes within one
+    /// flush's measured time, whose own frame would have confirmed it for nothing; under
+    /// either, before the writer stops.
+    fn next_when_idle(&mut self) -> Option<Work> {
+        if self.unconfirmed.is_some() && self.shared.config.waits == Waits::Measured {
             let flush = Duration::from_nanos(self.anticipation.service_ns());
             match self.receiver.recv_timeout(flush) {
                 Ok(s) => return Some(s),
@@ -205,7 +220,7 @@ impl<F: BlockFile> Writer<F> {
     /// total latency, and learns how many of them return (`mantle_disk::commit`). The first
     /// `before` submissions in the batch were sent before the answers.
     fn gather(&mut self, batch: &mut VecDeque<Submission>, answered: u64, before: u64) {
-        if answered == 0 {
+        if answered == 0 || self.shared.config.waits == Waits::Asked {
             return;
         }
         let returned = |batch: &VecDeque<Submission>| {
@@ -218,11 +233,38 @@ impl<F: BlockFile> Writer<F> {
                 break;
             };
             match self.receiver.recv_timeout(step) {
-                Ok(s) => batch.push_back(self.taken(s)),
+                Ok(w) => self.take(w, batch),
                 Err(_) => break,
             }
         }
         self.anticipation.learn(answered, returned(batch));
+    }
+
+    /// Puts work taken off the channel where it waits: an update into the batch, a request
+    /// to confirm among those answered after it.
+    fn take(&mut self, w: Work, batch: &mut VecDeque<Submission>) {
+        match w {
+            Work::Update(s) => batch.push_back(self.taken(s)),
+            Work::Confirm(reply) => self.confirms.push(reply),
+        }
+    }
+
+    /// Confirms the last frame's flush for the requests that asked, and answers them.
+    fn answer_confirms(&mut self) {
+        if self.confirms.is_empty() {
+            return;
+        }
+        self.confirm();
+        let fenced = self.shared.fenced.load(Ordering::Acquire);
+        for reply in std::mem::take(&mut self.confirms) {
+            let result = if fenced {
+                Err(LogError::Fenced)
+            } else {
+                Ok(())
+            };
+            // A caller that stopped waiting has nothing to be told.
+            let _ = reply.try_send(result);
+        }
     }
 
     /// Counts a submission the writer took. Its room in the queue is held until it is

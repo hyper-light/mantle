@@ -57,6 +57,22 @@ pub struct Config {
     /// Submissions the queue admits, and their bytes: two batches' worth [research/11 §4].
     pub queue_submissions: usize,
     pub queue_bytes: u64,
+    /// What the writer waits for between frames.
+    pub waits: Waits,
+}
+
+/// What the writer waits for between frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Waits {
+    /// Waits on the clock: for the submitters the last batch answered while waiting is
+    /// expected to lower total latency, and, once idle for one flush's measured time, confirms
+    /// the last frame's flush (docs/design/raft-log.md §3, §6). What a node runs.
+    Measured,
+    /// Never waits on the clock: a batch is what is queued when the writer looks, and the
+    /// last frame's flush is confirmed only when [`Log::confirm`] asks or the log closes, so
+    /// a caller that steps the log, as the replica simulation does, decides every write the
+    /// device sees.
+    Asked,
 }
 
 /// Entries to write from `first` on, replacing any the group holds at or after it.
@@ -141,6 +157,13 @@ impl Pending {
             Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(LogError::Closed)),
         }
     }
+}
+
+/// What the writer is sent.
+enum Work {
+    Update(Submission),
+    /// A request to confirm the last frame's flush, answered once the confirmation is durable.
+    Confirm(SyncSender<Result<(), LogError>>),
 }
 
 /// An update on its way to the writer.
@@ -271,8 +294,11 @@ impl<F: BlockFile> Shared<F> {
 
 pub struct Log<F: BlockFile + 'static> {
     shared: Arc<Shared<F>>,
-    sender: Option<SyncSender<Submission>>,
+    sender: Option<SyncSender<Work>>,
     writer: Option<JoinHandle<()>>,
+    /// Held by the one caller of [`Log::confirm`] whose request is in the channel, which has
+    /// room for it beside the queue's submissions.
+    confirming: Mutex<()>,
 }
 
 impl<F: BlockFile + 'static> Log<F> {
@@ -316,7 +342,8 @@ impl<F: BlockFile + 'static> Log<F> {
             frames: AtomicU64::new(0),
             updates: AtomicU64::new(0),
         });
-        let capacity = config.queue_submissions.max(1);
+        // Room for every submission the queue admits and one confirmation request.
+        let capacity = config.queue_submissions.max(1).saturating_add(1);
         let (sender, receiver) = sync_channel(capacity);
         let writer = writer::Writer::new(Arc::clone(&shared), receiver)?;
         let handle = std::thread::Builder::new()
@@ -327,6 +354,7 @@ impl<F: BlockFile + 'static> Log<F> {
             shared,
             sender: Some(sender),
             writer: Some(handle),
+            confirming: Mutex::new(()),
         })
     }
 
@@ -388,7 +416,7 @@ impl<F: BlockFile + 'static> Log<F> {
             bytes,
             reply,
         };
-        match sender.try_send(submission) {
+        match sender.try_send(Work::Update(submission)) {
             Ok(()) => Ok(Pending { answer }),
             Err(e) => {
                 self.shared.release(group, bytes);
@@ -398,6 +426,20 @@ impl<F: BlockFile + 'static> Log<F> {
                 })
             }
         }
+    }
+
+    /// Confirms the last frame's flush on the device, as the writer does by itself once idle
+    /// under [`Waits::Measured`], and returns once the confirmation is durable. Frames queued
+    /// before the request are written first; with nothing written since the last
+    /// confirmation, it writes nothing.
+    pub fn confirm(&self) -> Result<(), LogError> {
+        let _one = self.confirming.lock().map_err(|_| LogError::Fenced)?;
+        let sender = self.sender.as_ref().ok_or(LogError::Closed)?;
+        let (reply, answer) = sync_channel(1);
+        sender
+            .try_send(Work::Confirm(reply))
+            .map_err(|_| LogError::Busy)?;
+        answer.recv().map_err(|_| LogError::Closed)?
     }
 
     /// The parameters the log runs with.

@@ -105,6 +105,15 @@ writer derived (`mantle_disk::commit`). Without it, a few replicas alternate bet
 and each update waits for two flushes
 (docs/measurements/2026-09-28-raft-log-benchmark.md, finding 2).
 
+Those waits, and the idle confirmation of §6, run on the clock, which a node wants and a
+deterministic simulation cannot have: whether a confirmation lands before a crash, and so
+what the simulated device writes and which of its seeded faults each write draws, would
+hang on thread timing. `Config::waits` chooses: `Waits::Measured` is what a node runs, and
+under `Waits::Asked` the writer never waits on the clock, a batch is what is queued when it
+looks, and it confirms the last frame's flush only when `Log::confirm` asks or the log
+closes. `Log::confirm` goes through the writer's channel, which has room for the queue's
+submissions and the one request a mutex lets through at a time.
+
 A group's updates become durable in the order submitted. An update that waits for a frame
 with room holds its group's later updates behind it for that frame, so a newer hard state
 never lands before an older one.

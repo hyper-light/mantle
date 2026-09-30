@@ -14,7 +14,9 @@ use std::sync::Arc;
 
 use mantle_disk::buf::Alignment;
 use mantle_disk::sim::{Crash, Fault, SimFile};
-use mantle_log::{Config, Entries, Entry, HardState, Log, LogError, Proposal, Start, Update, View};
+use mantle_log::{
+    Config, Entries, Entry, HardState, Log, LogError, Proposal, Start, Update, View, Waits,
+};
 use proptest::prelude::*;
 
 const ID: u128 = 0x6d61_6e74_6c65_2d6c_6f67;
@@ -32,6 +34,7 @@ fn config(segment_blocks: u64, max_segments: u32) -> Config {
         group_cache: 1 << 10,
         queue_submissions: 256,
         queue_bytes: 1 << 24,
+        waits: Waits::Measured,
     }
 }
 
@@ -1347,6 +1350,7 @@ struct Counting {
     file: Arc<SimFile>,
     reads: std::sync::atomic::AtomicU64,
     lengths: std::sync::atomic::AtomicU64,
+    syncs: std::sync::atomic::AtomicU64,
 }
 
 impl Counting {
@@ -1355,7 +1359,13 @@ impl Counting {
             file,
             reads: std::sync::atomic::AtomicU64::new(0),
             lengths: std::sync::atomic::AtomicU64::new(0),
+            syncs: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Flushes so far.
+    fn syncs(&self) -> u64 {
+        self.syncs.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Reads and looks at the length since the last call.
@@ -1386,8 +1396,60 @@ impl mantle_disk::block::BlockFile for Counting {
     }
 
     fn sync_data(&self) -> Result<(), mantle_disk::DiskError> {
+        self.syncs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.file.sync_data()
     }
+}
+
+/// Under `Waits::Asked` the writer confirms a frame's flush when asked: `confirm` writes and
+/// flushes the confirmation once, a second finds nothing to confirm, and the confirmation is
+/// durable, so the frame, damaged at rest after power fails, is restored from its persist
+/// record and marked, rather than cut as a torn tail.
+#[test]
+fn an_asked_log_confirms_its_last_flush_when_asked() {
+    let counting = Counting::new(sim(44));
+    let cfg = Config {
+        waits: Waits::Asked,
+        ..config(16, 8)
+    };
+    let log = Log::create(Arc::clone(&counting), cfg, ID).unwrap();
+    let voted = HardState {
+        term: 1,
+        vote: 2,
+        commit: 0,
+    };
+    log.write(
+        1,
+        Update {
+            entries: Some(entries(1, &[1])),
+            hard_state: Some(voted),
+            ..Update::default()
+        },
+    )
+    .unwrap();
+    let written = counting.syncs();
+    log.confirm().unwrap();
+    assert_eq!(counting.syncs(), written + 1);
+    log.confirm().unwrap();
+    assert_eq!(counting.syncs(), written + 1);
+    // Power fails with the log running: only what was flushed survives.
+    counting.file.crash(Crash::LoseAll).unwrap();
+    drop(log);
+    // Frames of one block each: the empty first frame, then the update's.
+    counting
+        .file
+        .inject(Fault::BitFlip {
+            offset: AREA + 2 * BLOCK as u64 + 70,
+            bit: 2,
+            stored: true,
+        })
+        .unwrap();
+    let (log, recovery) = Log::open(Arc::clone(&counting.file), cfg, ID).unwrap();
+    assert_eq!((recovery.restored, recovery.damaged), (vec![1], vec![]));
+    let view = log.view(1).unwrap().unwrap();
+    assert_eq!(view.last, 0);
+    assert_eq!(view.hard_state, Some(voted));
+    assert_eq!(view.uncertain, Some(Start { index: 1, term: 1 }));
 }
 
 /// Opening a log reads each segment it walks through a window of the segment, where it read

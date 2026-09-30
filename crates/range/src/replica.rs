@@ -675,13 +675,18 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
 
     /// Writes a ready's parts in order, each submitted once the one before it is durable;
     /// the ready back once every part is, staged while one flushes and `wait` is false, or
-    /// staged when the log refuses one for want of room.
+    /// staged when the log refuses one for want of room. Without `wait`, a part submitted
+    /// here is left flushing rather than looked at at once: a flush is not done microseconds
+    /// after its submission, and whether it happened to be would make what `begin` gives
+    /// out hang on the log's thread rather than on what the caller did.
     fn persist(&mut self, mut staged: Staged, wait: bool) -> Result<Persisted, ReplicaError> {
+        let mut submitted = false;
         loop {
             if let Some(pending) = staged.pending.as_ref() {
                 let answer = match staged.answered.take() {
                     Some(answer) => Some(answer),
                     None if wait => Some(pending.wait()),
+                    None if submitted => None,
                     None => pending.poll(),
                 };
                 match answer {
@@ -706,7 +711,10 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
                 .log
                 .submit_waiting(self.group, part.clone())
             {
-                Ok(pending) => staged.pending = Some(pending),
+                Ok(pending) => {
+                    staged.pending = Some(pending);
+                    submitted = true;
+                }
                 Err(e) if waits_for_room(&e) => return Ok(Persisted::Waiting(staged, e)),
                 Err(e) => return Err(e.into()),
             }

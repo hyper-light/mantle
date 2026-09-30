@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use mantle_disk::buf::Alignment;
 use mantle_disk::sim::SimFile;
-use mantle_log::{Config as LogConfig, Log};
+use mantle_log::{Config as LogConfig, Log, Waits};
 use mantle_meta::apply::Layer;
 use mantle_meta::engine::{Engine, Model, Rows};
 use mantle_meta::name::{self, GateChange, Preconditions, Put};
@@ -34,6 +34,7 @@ fn log_config() -> LogConfig {
         group_cache: 1 << 16,
         queue_submissions: 64,
         queue_bytes: 1 << 22,
+        waits: Waits::Measured,
     }
 }
 

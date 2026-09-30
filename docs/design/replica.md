@@ -101,7 +101,9 @@ wait: it gives out step 2's messages and the reads confirmed, submits the update
 entries already committed, and returns with the `Ready` still out and `persisting` set, so the
 node sends the messages while the log flushes, and a node driving many ranges submits every
 range's update before the one flush that makes them all durable. A later `begin` or `drive`
-finds the update durable and does steps 4 to 6. A range still has one `Ready` out at a time,
+finds the update durable and does steps 4 to 6; `begin` never looks at an update it has just
+submitted, since that flush is not done microseconds later and whether it happened to be
+would make what `begin` gives out depend on the log's thread. A range still has one `Ready` out at a time,
 and refuses every other call with `Stalled` until it is done; a follower's acknowledgement
 never leaves before its write is durable. Before, `drive` returned only after the flush, so
 the messages a leader may send during it waited for it (audit §5.1). The simulation takes
@@ -217,13 +219,15 @@ before every voter knew its configuration. The simulation catches two broken var
 within the first seeds: gets served from any member's rows without ReadIndex fail
 linearizability, and a replica that applies a repeated command again stores a put twice.
 
-A run is its seed as far as the simulation's own choices go, but each member's log writer
-runs on its own thread and waits on the clock, for returning submitters and for an idle
-confirmation (raft-log.md §3, §6), so which updates share a frame, and what a crash between
-them keeps, can differ between runs of one seed: over 300 seeds, counts of what was exercised
-differed between two runs by under 1%. Failing seeds have reproduced run after run so far.
-Runs exactly their seeds need the log's waits on a clock the simulation drives and a writer it
-steps, which is not built.
+A run is exactly its seed. Each member's log runs under `Waits::Asked` (raft-log.md §3): its
+writer waits on no clock, each member has one update out at a time and the simulation waits
+for it before the step ends, so every frame holds what the seed put in it, and the idle
+confirmation a node's writer makes on its own the simulation asks for at seeded steps. A
+test runs two seeds twice each and compares every count and every operation the gateways
+saw, with its steps; over 300 seeds two runs gave the same counts. Before, the writer's
+clock decided whether a confirmation was written before a crash, which moved the simulated
+device's seeded faults, and `begin` looked at an update just submitted, whose flush the
+writer might have finished: counts differed between runs of a seed by under 1%.
 
 ## 6. Replacing a member
 

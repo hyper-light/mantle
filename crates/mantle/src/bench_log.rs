@@ -22,7 +22,7 @@ use mantle_disk::buf::Alignment;
 use mantle_disk::calibrate;
 use mantle_disk::file::{CachingRequest, DeviceFile};
 use mantle_disk::histogram::Histogram;
-use mantle_log::{Config, Entries, Entry, Log, LogError, Start, Update};
+use mantle_log::{Config, Entries, Entry, Log, LogError, Start, Update, Waits};
 
 use crate::bench::{Error, nanos, rate, report_device};
 use crate::display;
@@ -112,6 +112,7 @@ pub fn log(out: &mut impl Write, path: &Path, options: &Options) -> Result<(), E
                 group_cache: 1 << 16,
                 queue_submissions: most.saturating_mul(2),
                 queue_bytes: 1 << 30,
+                waits: Waits::Measured,
             };
             let log = Arc::new(Log::create(file, config, u128::from(point)).map_err(log_error)?);
             let outcome = appends(&log, size, count, options.step)?;

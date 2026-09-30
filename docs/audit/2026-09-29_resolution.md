@@ -61,7 +61,7 @@ tested.
 
 | Section | State | Where |
 |---|---|---|
-| 5.1 staged Ready | Open | |
+| 5.1 staged Ready | Replica interface done; node scheduler open | `Replica::begin` takes the core's ready without waiting for the log: it gives out the messages a leader may send before its own write and the confirmed reads, submits the update, applies what is already committed, and returns with `persisting` set; a later `begin` or `drive` finishes the ready once the update is durable, giving out a follower's acknowledgements only then. `drive` keeps its waiting form. One ready of a range is out at a time: every other call is `Stalled` meanwhile. `a_leader_sends_while_it_flushes_and_a_follower_acknowledges_after` (`crates/range/tests/group.rs`) holds a leader's and a follower's flushes: the leader's appends leave during its flush, the held follower does not acknowledge, the other does, both acknowledge once durable, and the entry applies everywhere; giving out acknowledgements before the flush fails it. The simulation takes half its members' readies with `begin` under faults, about 80,000 left flushing across a step over 400 seeds, and stays linearizable. The node scheduler that stages many ranges before their shared flush, and reserves time for heartbeats, reads and applying, and the commit-latency measurements under mixed groups and RTTs, wait on the node process (docs/design/replica.md §3). |
 | 5.2 aggregate limits | Open | |
 | 5.3 engine durability contract | Open | |
 | 5.4 streamed snapshots | Open | |

@@ -278,6 +278,8 @@ struct World {
     replaced: u64,
     /// Readies the log refused for want of room, each waited out by compacting.
     stalls: u64,
+    /// Readies begun and left flushing past a step.
+    flushing: u64,
 }
 
 impl World {
@@ -315,6 +317,7 @@ impl World {
             lose_at,
             replaced: 0,
             stalls: 0,
+            flushing: 0,
         }
     }
 
@@ -494,7 +497,15 @@ impl World {
             let Some(r) = n.replica.as_mut() else {
                 continue;
             };
-            let out = match r.drive() {
+            // Under faults, a member half the time takes its ready without waiting for its log
+            // and finishes it at a later step, messages to it meanwhile refused, as a node
+            // overlapping its members' flushes does (audit §5.1).
+            let out = if self.faults && self.rng.chance(500) {
+                r.begin()
+            } else {
+                r.drive()
+            };
+            let out = match out {
                 Ok(out) => out,
                 // A fenced log takes its node down; it restarts from what its device kept.
                 Err(ReplicaError::Log(_)) => {
@@ -508,6 +519,9 @@ impl World {
             };
             if out.stalled.is_some() {
                 waiting.push(n.id);
+            }
+            if out.persisting {
+                self.flushing += 1;
             }
             sent.extend(out.messages);
             applied.extend(out.applied);
@@ -923,7 +937,7 @@ fn versions(m: &Model, key: &str) -> Vec<String> {
 }
 
 /// One run: the replacements it finished.
-fn run(seed: u64) -> (u64, u64) {
+fn run(seed: u64) -> (u64, u64, u64) {
     let mut w = World::new(seed);
     for _ in 0..3_000 {
         w.step();
@@ -975,7 +989,7 @@ fn run(seed: u64) -> (u64, u64) {
             other => w.fail(&format!("{key}: {other:?} over {} operations", ops.len())),
         }
     }
-    (w.replaced, w.stalls)
+    (w.replaced, w.stalls, w.flushing)
 }
 
 #[test]
@@ -990,17 +1004,22 @@ fn a_group_under_faults_is_linearizable_and_applies_every_put_once() {
         .unwrap_or(1);
     let mut replaced = 0;
     let mut stalls = 0;
+    let mut flushing = 0;
     for seed in first..first + seeds {
         // A member is lost within the faults of every run, and the run settles only once its
         // replacement finishes.
-        let (run_replaced, run_stalls) = run(seed);
+        let (run_replaced, run_stalls, run_flushing) = run(seed);
         assert!(run_replaced >= 1, "seed {seed} replaced no member");
         replaced += run_replaced;
         stalls += run_stalls;
+        flushing += run_flushing;
     }
     // Readies waited for room and the members went on: the path audit S04 found stranded.
     assert!(stalls > 0, "no ready ever waited for room");
+    // Readies were left flushing across steps, their members refusing messages meanwhile.
+    assert!(flushing > 0, "no ready was begun and left flushing");
     eprintln!(
-        "{seeds} runs replaced {replaced} members lost for good; {stalls} readies waited for room"
+        "{seeds} runs replaced {replaced} members lost for good; {stalls} readies waited for \
+         room; {flushing} were left flushing across a step"
     );
 }

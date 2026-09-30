@@ -11,7 +11,7 @@ use focal_raft::proto::{
 };
 use focal_raft::{RawNode, StateRole};
 use mantle_disk::block::BlockFile;
-use mantle_log::{Entries, Log, LogError, Proposal, Start, Update};
+use mantle_log::{Entries, Log, LogError, Pending, Proposal, Start, Update};
 use mantle_meta::apply::{Layer, apply_entry};
 use mantle_meta::engine::{Engine, Write};
 use mantle_meta::session::Rules;
@@ -71,6 +71,10 @@ pub struct Drive {
     /// waits, whole, in the replica, which takes no call but `drive` and `compact` until the
     /// node frees room and drives again (audit S04).
     pub stalled: Option<LogError>,
+    /// From [`Replica::begin`]: a ready's update is on its way to being durable. The
+    /// messages above may go now; the replica takes no call but `begin` and `drive` until the
+    /// update is durable, which `drive` waits for.
+    pub persisting: bool,
 }
 
 /// A normal entry applied: its index, and each command's session, serial and answer, in
@@ -105,16 +109,19 @@ pub struct Replica<F: BlockFile + 'static, E: Engine> {
     uncertain: Option<Start>,
 }
 
-/// A ready being made durable: its update's parts not yet written, in order, each fitting a
-/// frame.
+/// A ready being made durable: its update's parts not yet durable, in order, each fitting a
+/// frame, and the log's answer for the first once it is submitted.
 struct Staged {
     ready: focal_raft::Ready,
     parts: VecDeque<Update>,
+    pending: Option<Pending>,
 }
 
 /// Where writing a ready's parts got to.
 enum Persisted {
     Done(focal_raft::Ready),
+    /// A part is submitted and not yet durable: the ready waits for the log's flush.
+    Flushing(Staged),
     /// The log refused a part for want of room: the ready waits with the parts left.
     Waiting(Staged, LogError),
 }
@@ -465,17 +472,27 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
     /// A ready the log refuses for want of room waits in the replica, whole, and the next
     /// drive writes it first (audit S04).
     pub fn drive(&mut self) -> Result<Drive, ReplicaError> {
-        let mut out = self.drive_ready()?;
-        // A member whose log may lack entries it acknowledged cannot lead: its election
-        // timer still runs, which keeps it from holding a lease on a leader that is gone,
-        // but its campaigns ask no one.
-        if self.uncertainty()?.is_some() {
-            out.messages.retain(|m| !campaigns(m));
-        }
-        Ok(out)
+        self.drive_ready(true)
     }
 
-    fn drive_ready(&mut self) -> Result<Drive, ReplicaError> {
+    /// Does what `drive` does without waiting on the log (docs/design/replica.md §3): takes
+    /// the core's ready, gives out the messages a leader may send before its own write,
+    /// submits the ready's update, and applies the entries already committed, then returns
+    /// with `persisting` set while the update is not yet durable. The caller sends those
+    /// messages while the log flushes, and the flush serves every group that submitted before
+    /// it; `drive` or `begin` again finishes the ready once the update is durable, giving out
+    /// the messages that waited for it, such as a follower's acknowledgement. One ready of a
+    /// group is outstanding at a time (audit §5.1).
+    pub fn begin(&mut self) -> Result<Drive, ReplicaError> {
+        self.drive_ready(false)
+    }
+
+    /// Whether a ready's update is on its way to being durable.
+    pub fn persisting(&self) -> bool {
+        self.staged.as_ref().is_some_and(|s| s.pending.is_some())
+    }
+
+    fn drive_ready(&mut self, wait: bool) -> Result<Drive, ReplicaError> {
         let mut out = Drive::default();
         for _ in 0..DRIVE_BUDGET {
             let staged = match self.staged.take() {
@@ -483,8 +500,17 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
                 None if self.node.has_ready() => self.take_ready(&mut out)?,
                 None => break,
             };
-            match self.persist(staged)? {
+            match self.persist(staged, wait)? {
                 Persisted::Done(ready) => self.finish(ready, &mut out)?,
+                Persisted::Flushing(mut staged) => {
+                    // As while the log refuses room: what is committed is durable already,
+                    // and applies while the update flushes.
+                    let committed = staged.ready.take_committed_entries();
+                    self.apply(committed, &mut out)?;
+                    self.staged = Some(staged);
+                    out.persisting = true;
+                    break;
+                }
                 Persisted::Waiting(mut staged, refusal) => {
                     // The core gives out only entries committed and durable, so these apply
                     // now, and the group can compact past them while the ready waits.
@@ -495,6 +521,12 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
                     break;
                 }
             }
+        }
+        // A member whose log may lack entries it acknowledged cannot lead: its election
+        // timer still runs, which keeps it from holding a lease on a leader that is gone,
+        // but its campaigns ask no one.
+        if self.uncertainty()?.is_some() {
+            out.messages.retain(|m| !campaigns(m));
         }
         Ok(out)
     }
@@ -526,27 +558,51 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
             },
             None => VecDeque::new(),
         };
-        Ok(Staged { ready, parts })
+        Ok(Staged {
+            ready,
+            parts,
+            pending: None,
+        })
     }
 
-    /// Writes a ready's parts in order, each once durable; the ready back once every part
-    /// is, or staged when the log refuses one for want of room.
-    fn persist(&mut self, mut staged: Staged) -> Result<Persisted, ReplicaError> {
-        while let Some(part) = staged.parts.front() {
+    /// Writes a ready's parts in order, each submitted once the one before it is durable;
+    /// the ready back once every part is, staged while one flushes and `wait` is false, or
+    /// staged when the log refuses one for want of room.
+    fn persist(&mut self, mut staged: Staged, wait: bool) -> Result<Persisted, ReplicaError> {
+        loop {
+            if let Some(pending) = staged.pending.as_ref() {
+                let answer = if wait {
+                    Some(pending.wait())
+                } else {
+                    pending.poll()
+                };
+                match answer {
+                    None => return Ok(Persisted::Flushing(staged)),
+                    Some(Ok(())) => {
+                        staged.pending = None;
+                        staged.parts.pop_front();
+                    }
+                    Some(Err(e)) if waits_for_room(&e) => {
+                        staged.pending = None;
+                        return Ok(Persisted::Waiting(staged, e));
+                    }
+                    Some(Err(e)) => return Err(e.into()),
+                }
+            }
+            let Some(part) = staged.parts.front() else {
+                return Ok(Persisted::Done(staged.ready));
+            };
             match self
                 .node
                 .store()
                 .log
-                .write_waiting(self.group, part.clone())
+                .submit_waiting(self.group, part.clone())
             {
-                Ok(()) => {
-                    staged.parts.pop_front();
-                }
+                Ok(pending) => staged.pending = Some(pending),
                 Err(e) if waits_for_room(&e) => return Ok(Persisted::Waiting(staged, e)),
                 Err(e) => return Err(e.into()),
             }
         }
-        Ok(Persisted::Done(staged.ready))
     }
 
     /// Finishes a durable ready: the messages that waited for the write, the committed

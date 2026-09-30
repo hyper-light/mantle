@@ -129,7 +129,7 @@ pub struct Pending {
 }
 
 impl Pending {
-    pub fn wait(self) -> Result<(), LogError> {
+    pub fn wait(&self) -> Result<(), LogError> {
         self.answer.recv().map_err(|_| LogError::Closed)?
     }
 

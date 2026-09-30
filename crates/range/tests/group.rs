@@ -213,6 +213,185 @@ fn a_group_elects_a_leader_and_applies_the_same_entries_everywhere() {
     }
 }
 
+/// A simulated file whose flushes wait while its gate is shut.
+struct Gated {
+    file: SimFile,
+    shut: std::sync::Mutex<bool>,
+    opened: std::sync::Condvar,
+}
+
+impl Gated {
+    fn shut(&self, shut: bool) {
+        *self.shut.lock().unwrap() = shut;
+        self.opened.notify_all();
+    }
+}
+
+impl mantle_disk::block::BlockFile for Gated {
+    fn alignment(&self) -> Alignment {
+        self.file.alignment()
+    }
+    fn len(&self) -> Result<u64, mantle_disk::DiskError> {
+        mantle_disk::block::BlockFile::len(&self.file)
+    }
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), mantle_disk::DiskError> {
+        self.file.read_exact_at(buf, offset)
+    }
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), mantle_disk::DiskError> {
+        self.file.write_all_at(buf, offset)
+    }
+    fn sync_data(&self) -> Result<(), mantle_disk::DiskError> {
+        let mut shut = self.shut.lock().unwrap();
+        while *shut {
+            shut = self.opened.wait(shut).unwrap();
+        }
+        drop(shut);
+        self.file.sync_data()
+    }
+}
+
+/// A member whose log's flushes can be held, and its gate.
+type GatedMember = (Replica<Arc<Gated>, Model>, Arc<Gated>);
+
+/// A member whose log's flushes can be held.
+fn gated(id: u64) -> GatedMember {
+    let gate = Arc::new(Gated {
+        file: SimFile::new(
+            Alignment::new(4096).unwrap(),
+            Alignment::new(512).unwrap(),
+            id,
+        )
+        .unwrap(),
+        shut: std::sync::Mutex::new(false),
+        opened: std::sync::Condvar::new(),
+    });
+    let log =
+        Arc::new(Log::create(Arc::clone(&gate), log_config(), 0x6c6f67 + u128::from(id)).unwrap());
+    let replica = Replica::open(id, GROUP, log, first_range(), &range(), id).unwrap();
+    (replica, gate)
+}
+
+/// Opens every gate when dropped, as a failing test unwinds, so no log's writer is left
+/// holding a flush while its log is dropped.
+struct Opens(Vec<Arc<Gated>>);
+
+impl Drop for Opens {
+    fn drop(&mut self) {
+        for gate in &self.0 {
+            gate.shut(false);
+        }
+    }
+}
+
+fn kind(m: &Message) -> Option<mantle_range::MessageType> {
+    mantle_range::MessageType::from_i32(m.msg_type)
+}
+
+/// `begin` gives out a leader's appends while its own write of the entries is still being made
+/// durable, so they travel during its flush; it gives out a follower's acknowledgement only once
+/// the follower's write is durable, which `drive` waits for; and a member takes no other call
+/// while its ready is outstanding (audit §5.1). The entry then commits and applies everywhere.
+#[test]
+fn a_leader_sends_while_it_flushes_and_a_follower_acknowledges_after() {
+    let mut nodes: Vec<GatedMember> = (1..=3).map(gated).collect();
+    let _opens = Opens(nodes.iter().map(|(_, g)| Arc::clone(g)).collect());
+    let deliver = |nodes: &mut Vec<GatedMember>| {
+        let mut wire: VecDeque<Message> = VecDeque::new();
+        for _ in 0..10_000 {
+            for (r, _) in nodes.iter_mut() {
+                wire.extend(r.drive().unwrap().messages);
+            }
+            let Some(m) = wire.pop_front() else {
+                return;
+            };
+            let _ = nodes[usize::try_from(m.to).unwrap() - 1].0.step(m);
+        }
+        panic!("the group never settled");
+    };
+    nodes[0].0.campaign().unwrap();
+    deliver(&mut nodes);
+    assert!(nodes[0].0.is_leader());
+
+    // The leader's flush is held: its appends go out regardless.
+    nodes[0].1.shut(true);
+    let register = Sessioned {
+        session: 0,
+        serial: 0,
+        unanswered: 0,
+        command: Command::Register,
+    };
+    nodes[0]
+        .0
+        .propose(&Entry {
+            at_ns: 10,
+            commands: vec![register],
+        })
+        .unwrap();
+    let out = nodes[0].0.begin().unwrap();
+    assert!(out.persisting && nodes[0].0.persisting());
+    let appends: Vec<Message> = out
+        .messages
+        .into_iter()
+        .filter(|m| kind(m) == Some(mantle_range::MessageType::MsgAppend))
+        .collect();
+    let mut to: Vec<u64> = appends.iter().map(|m| m.to).collect();
+    to.sort_unstable();
+    assert_eq!(to, [2, 3]);
+
+    // Follower 2's flush is held too: it takes the append but does not acknowledge it, while
+    // follower 3, whose flush is not, acknowledges once its write is durable.
+    nodes[1].1.shut(true);
+    let mut acks = Vec::new();
+    for m in appends {
+        let to = m.to;
+        let follower = &mut nodes[usize::try_from(to).unwrap() - 1].0;
+        follower.step(m).unwrap();
+        let out = if to == 2 {
+            follower.begin().unwrap()
+        } else {
+            follower.drive().unwrap()
+        };
+        acks.extend(
+            out.messages
+                .into_iter()
+                .filter(|m| kind(m) == Some(mantle_range::MessageType::MsgAppendResponse)),
+        );
+    }
+    assert_eq!(acks.iter().map(|m| m.from).collect::<Vec<_>>(), [3]);
+    assert!(nodes[1].0.persisting());
+    assert!(matches!(
+        nodes[1].0.step(acks[0].clone()),
+        Err(mantle_range::ReplicaError::Stalled)
+    ));
+    // Once its write is durable, follower 2 acknowledges.
+    nodes[1].1.shut(false);
+    let out = nodes[1].0.drive().unwrap();
+    assert!(!out.persisting);
+    acks.extend(
+        out.messages
+            .into_iter()
+            .filter(|m| kind(m) == Some(mantle_range::MessageType::MsgAppendResponse)),
+    );
+    assert_eq!(acks.len(), 2);
+
+    // The leader takes the acknowledgements once its own ready is done, and the entry applies
+    // at every member.
+    assert!(matches!(
+        nodes[0].0.step(acks[0].clone()),
+        Err(mantle_range::ReplicaError::Stalled)
+    ));
+    nodes[0].1.shut(false);
+    nodes[0].0.drive().unwrap();
+    for ack in acks {
+        nodes[0].0.step(ack).unwrap();
+    }
+    deliver(&mut nodes);
+    for (r, _) in &nodes {
+        assert_eq!(r.applied(), nodes[0].0.applied());
+    }
+    assert!(nodes[0].0.applied() >= 2);
+}
+
 /// Every row an engine holds that its range replicates.
 fn rows(m: &Model) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut out = Vec::new();

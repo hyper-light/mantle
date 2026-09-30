@@ -96,6 +96,20 @@ For each `Ready` the core gives, the replica does these steps in order:
 5. Applies the committed entries (§2).
 6. Tells the core, which may hand over more committed entries and messages.
 
+`drive` does these steps and waits at step 3 for the update to be durable. `begin` does not
+wait: it gives out step 2's messages and the reads confirmed, submits the update, applies the
+entries already committed, and returns with the `Ready` still out and `persisting` set, so the
+node sends the messages while the log flushes, and a node driving many ranges submits every
+range's update before the one flush that makes them all durable. A later `begin` or `drive`
+finds the update durable and does steps 4 to 6. A range still has one `Ready` out at a time,
+and refuses every other call with `Stalled` until it is done; a follower's acknowledgement
+never leaves before its write is durable. Before, `drive` returned only after the flush, so
+the messages a leader may send during it waited for it (audit §5.1). The simulation takes
+half its members' `Ready`s this way under faults, leaving about two hundred a run flushing
+across a step, and checks linearizability as before. What the node's scheduler owes the
+ranges it drives, time for heartbeats, reads and applying beside the flushes it waits on, is
+the node's, which is not built (STATUS).
+
 The transport tells the sending replica whether each snapshot arrived. A leader stops
 replicating to a member while that member's snapshot is out, so a lost snapshot left
 unreported would stall the member for good; the simulation found this. A snapshot's own

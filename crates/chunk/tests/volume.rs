@@ -561,6 +561,31 @@ fn cleaning_reclaims_partly_dead_segments_and_keeps_every_live_byte() {
     check(&v);
 }
 
+/// A segment whose dead bytes would not pay for packing its live data elsewhere is never a
+/// victim. Filled with chunks of the most a record holds, a segment's only dead bytes are its
+/// record's padding: cleaning such a volume would move every chunk and free nothing, so it
+/// moves none, and a put finds the volume full rather than waiting on the cleaner (audit P06).
+#[test]
+fn segments_whose_dead_space_would_not_pay_for_packing_are_never_cleaned() {
+    let file = sim(23);
+    let v = Volume::format(Arc::clone(&file), SIZE, config()).unwrap();
+    let len = usize::try_from(v.max_payload()).unwrap();
+    let mut written = 0u64;
+    loop {
+        match put_retrying(&v, key(written), &data(written, len)) {
+            Ok(()) => written += 1,
+            Err(ChunkError::Full) => break,
+            Err(e) => panic!("unexpected {e}"),
+        }
+    }
+    assert!(written > 8, "{written} chunks");
+    let report = v.clean(64).unwrap();
+    assert_eq!((report.segments, report.relocated), (0, 0), "{report:?}");
+    for n in 0..written {
+        assert_eq!(v.read(&key(n), 0, len as u64).unwrap(), data(n, len));
+    }
+}
+
 #[test]
 fn cleaning_leaves_a_corrupt_fragment_in_place() {
     let file = sim(10);

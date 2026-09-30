@@ -64,54 +64,122 @@ pub struct Placement {
     pub consumed: u64,
 }
 
-/// Reads the frame at `pos`. `Ok(None)` when no valid frame of `volume` starts there: the end
-/// of the log, a torn frame, or stale bytes from an earlier lap or volume.
-pub fn read_frame<F: BlockFile>(
-    file: &F,
-    geometry: &Geometry,
+/// Reads the log's frames through a window of up to `MAX_FRAME_BYTES`. A frame is taken from
+/// the window when the window holds it, and the window moves to start at the frame when it
+/// does not, so a replay, or a search of every block, reads the log in large sequential reads,
+/// each byte at most twice: a window moves either past its end or to a frame that runs past
+/// it, which then lies wholly within the next. Before, each frame took a read of its first
+/// block and another of the whole frame, and a search of the log read it one block at a time
+/// (audit P07).
+pub struct Frames<'a, F> {
+    file: &'a F,
+    geometry: &'a Geometry,
     volume: u128,
-    pos: u64,
-) -> Result<Option<(FrameHeader, Vec<LogRecord>, u64)>, DiskError> {
-    let block = geometry.block_usize();
-    let align = file.alignment();
-    let Some(at) = geometry.log_offset.checked_add(pos) else {
-        return Ok(None);
-    };
-    if pos.saturating_add(geometry.block) > geometry.log_size {
-        return Ok(None);
+    window: AlignedBuf,
+    /// The log position of the window's first byte, and the bytes it holds.
+    start: u64,
+    held: u64,
+}
+
+impl<'a, F: BlockFile> Frames<'a, F> {
+    pub fn new(file: &'a F, geometry: &'a Geometry, volume: u128) -> Result<Self, DiskError> {
+        let size = usize::try_from(MAX_FRAME_BYTES.min(geometry.log_size)).unwrap_or(0);
+        Ok(Self {
+            file,
+            geometry,
+            volume,
+            window: AlignedBuf::zeroed(size, file.alignment())?,
+            start: 0,
+            held: 0,
+        })
     }
-    let mut first = AlignedBuf::zeroed(block, align)?;
-    first.set_len(block)?;
-    match file.read_exact_at(first.as_mut_slice(), at) {
-        Ok(()) => {}
-        Err(DiskError::ShortRead { .. }) => return Ok(None),
-        Err(e) => return Err(e),
+
+    /// The frame of this volume at `pos`, verified whole, its records and its padded length.
+    /// `Ok(None)` when no valid frame of the volume starts there: the end of the log, a torn
+    /// frame, or stale bytes from an earlier lap or volume.
+    pub fn frame(
+        &mut self,
+        pos: u64,
+    ) -> Result<Option<(FrameHeader, Vec<LogRecord>, u64)>, DiskError> {
+        let Some((_, len)) = self.header(pos)? else {
+            return Ok(None);
+        };
+        let volume = self.volume;
+        Ok(self
+            .bytes(pos, len)?
+            .and_then(|bytes| frame::decode(bytes, volume))
+            .map(|(h, r)| (h, r, len)))
     }
-    let Some(header) = frame::peek(first.as_slice()) else {
-        return Ok(None);
-    };
-    if header.volume != volume {
-        return Ok(None);
-    }
-    let Some(len) = header.frame_len(block).and_then(|l| u64::try_from(l).ok()) else {
-        return Ok(None);
-    };
-    if len > MAX_FRAME_BYTES || pos.saturating_add(len) > geometry.log_size {
-        return Ok(None);
-    }
-    let bytes = if len == geometry.block {
-        first
-    } else {
-        let mut whole = AlignedBuf::zeroed(usize::try_from(len).unwrap_or(0), align)?;
-        whole.set_len(usize::try_from(len).unwrap_or(0))?;
-        match file.read_exact_at(whole.as_mut_slice(), at) {
-            Ok(()) => {}
-            Err(DiskError::ShortRead { .. }) => return Ok(None),
-            Err(e) => return Err(e),
+
+    /// The header of a frame of this volume that starts at `pos`, not yet verified, and the
+    /// frame's padded length, when the frame would lie within the log.
+    pub fn header(&mut self, pos: u64) -> Result<Option<(FrameHeader, u64)>, DiskError> {
+        let (block, log_size, volume) = (self.geometry.block, self.geometry.log_size, self.volume);
+        let block_len = self.geometry.block_usize();
+        let Some(first) = self.bytes(pos, block)? else {
+            return Ok(None);
+        };
+        let Some(header) = frame::peek(first) else {
+            return Ok(None);
+        };
+        if header.volume != volume {
+            return Ok(None);
         }
-        whole
-    };
-    Ok(frame::decode(bytes.as_slice(), volume).map(|(h, r)| (h, r, len)))
+        let Some(len) = header
+            .frame_len(block_len)
+            .and_then(|l| u64::try_from(l).ok())
+        else {
+            return Ok(None);
+        };
+        if len > MAX_FRAME_BYTES || pos.checked_add(len).is_none_or(|end| end > log_size) {
+            return Ok(None);
+        }
+        Ok(Some((header, len)))
+    }
+
+    /// Log bytes `[pos, pos + len)`, `len` at most the window's size, moving the window to
+    /// `pos` when it does not hold them. `None` past the log's end or the file's.
+    fn bytes(&mut self, pos: u64, len: u64) -> Result<Option<&[u8]>, DiskError> {
+        let log_size = self.geometry.log_size;
+        let Some(end) = pos.checked_add(len).filter(|&e| e <= log_size) else {
+            return Ok(None);
+        };
+        let held_end = self.start.saturating_add(self.held);
+        if pos < self.start || end > held_end {
+            let capacity = u64::try_from(self.window.capacity()).unwrap_or(0);
+            if len > capacity {
+                return Ok(None);
+            }
+            let Some(at) = self.geometry.log_offset.checked_add(pos) else {
+                return Ok(None);
+            };
+            // As much of the log from `pos` as the window holds; where the file ends first,
+            // just the bytes asked for.
+            self.held = 0;
+            let mut read = |want: u64| -> Result<bool, DiskError> {
+                let want = usize::try_from(want).unwrap_or(0);
+                self.window.set_len(want)?;
+                match self.file.read_exact_at(self.window.as_mut_slice(), at) {
+                    Ok(()) => Ok(true),
+                    Err(DiskError::ShortRead { .. }) => Ok(false),
+                    Err(e) => Err(e),
+                }
+            };
+            let wide = capacity.min(log_size.saturating_sub(pos));
+            let held = if read(wide)? {
+                wide
+            } else if read(len)? {
+                len
+            } else {
+                return Ok(None);
+            };
+            self.start = pos;
+            self.held = held;
+        }
+        let from = usize::try_from(pos.saturating_sub(self.start)).unwrap_or(usize::MAX);
+        let to = usize::try_from(end.saturating_sub(self.start)).unwrap_or(usize::MAX);
+        Ok(self.window.as_slice().get(from..to))
+    }
 }
 
 /// Copies an encoded frame into an aligned buffer and writes it at `pos`.

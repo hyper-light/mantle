@@ -35,7 +35,7 @@ use crate::frame::{
     self, DeleteRecord, KIND_BATCH, KIND_CHECKPOINT_BEGIN, KIND_CHECKPOINT_CHUNK,
     KIND_CHECKPOINT_END, KIND_WRAP, LogRecord, PutRecord, SegmentRecord, SegmentState,
 };
-use crate::index::{Fragment, Index, Inserted, SegmentInfo};
+use crate::index::{Fragment, Index, Inserted, SegmentInfo, Segments};
 use crate::key::ChunkKey;
 use crate::layout::{
     Config, FRAME_PAYLOAD, Geometry, MAX_FRAME_BYTES, batch_frame_bytes, checkpoint_bytes,
@@ -168,7 +168,8 @@ pub(crate) struct Shared<F> {
     pub low_water: std::sync::atomic::AtomicUsize,
     /// Held through a cleaning pass: the background cleaner's or one asked for.
     pub cleaning: std::sync::Mutex<()>,
-    pub usage: RwLock<Vec<SegmentInfo>>,
+    /// The segment table as of the last durable batch.
+    pub usage: RwLock<Segments>,
     /// Holds client reads at the device's measured depth.
     pub reads: crate::read::Gate,
 }
@@ -184,7 +185,7 @@ pub(crate) struct Writer<F: BlockFile> {
     pub shared: Arc<Shared<F>>,
     pub config: Config,
     pub rx: Receiver<Request>,
-    pub segments: Vec<SegmentInfo>,
+    pub segments: Segments,
     /// The open segment of each stream.
     pub opens: [Option<u32>; 2],
     pub incarnation: u64,
@@ -276,8 +277,12 @@ struct Layout {
     freed: Vec<u32>,
     opens: [Option<u32>; 2],
     incarnation: u64,
+    /// The free segments this batch may open, lowest last.
     free: Vec<u32>,
-    /// Incarnation and write position of each segment before this batch.
+    /// Free segments left, counting those `free` does not list.
+    free_left: usize,
+    /// Incarnation and write position before this batch of each segment it may seal or
+    /// free.
     before: HashMap<u32, (u64, u64)>,
 }
 
@@ -322,10 +327,11 @@ impl Layout {
         } else {
             0
         };
-        if self.free.len() <= reserve {
+        if self.free_left <= reserve {
             return None;
         }
         let next = self.free.pop()?;
+        self.free_left = self.free_left.saturating_sub(1);
         self.incarnation = self.incarnation.saturating_add(1);
         self.records.push(LogRecord::Segment(SegmentRecord {
             segment: next,
@@ -393,10 +399,6 @@ fn answer(tx: Reply, result: Result<(), ChunkError>) {
 
 fn reply(request: Request, result: Result<(), ChunkError>) {
     answer(request.reply, result);
-}
-
-fn slot<T>(items: &mut [T], index: u32) -> Option<&mut T> {
-    items.get_mut(usize::try_from(index).ok()?)
 }
 
 impl<F: BlockFile> Writer<F> {
@@ -493,10 +495,7 @@ impl<F: BlockFile> Writer<F> {
     }
 
     fn free_segments(&self) -> usize {
-        self.segments
-            .iter()
-            .filter(|s| s.state == SegmentState::Free)
-            .count()
+        self.segments.free_count()
     }
 
     fn poke_cleaner(&self) {
@@ -578,8 +577,7 @@ impl<F: BlockFile> Writer<F> {
             Ok(accepted) => accepted,
             Err(()) => return,
         };
-        let block = self.shared.geometry.block;
-        let reclaimable = self.segments.iter().any(|s| reclaimable(s, block));
+        let reclaimable = self.segments.reclaimable().next().is_some();
         if accepted.is_empty() && !reclaimable {
             return;
         }
@@ -801,27 +799,22 @@ impl<F: BlockFile> Writer<F> {
         Ok(accepted)
     }
 
-    fn layout(&self, requests: usize) -> Layout {
-        let mut before = HashMap::new();
-        for (i, s) in self.segments.iter().enumerate() {
-            if s.state != SegmentState::Free
-                && let Ok(i) = u32::try_from(i)
-            {
-                before.insert(i, (s.incarnation, u64::from(s.write_pos)));
-            }
-        }
+    /// Where a batch of `requests` requests placing at most `records` records can go.
+    fn layout(&self, requests: usize, records: usize) -> Layout {
         // Sealed segments with nothing live are freed in this frame, so this batch may reuse
         // them; at most one per request keeps the frame within its bound
         // (layout::batch_frame_payload).
-        let block = self.shared.geometry.block;
-        let freed: Vec<u32> = self
-            .segments
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| reclaimable(s, block))
-            .filter_map(|(i, _)| u32::try_from(i).ok())
-            .take(requests.max(1))
-            .collect();
+        let freed: Vec<u32> = self.segments.reclaimable().take(requests.max(1)).collect();
+        // Incarnation and write position, before this batch, of each segment it may seal or
+        // free.
+        let mut before = HashMap::new();
+        for &segment in self.opens.iter().flatten().chain(&freed) {
+            if let Some(s) = self.segments.get(segment)
+                && s.state != SegmentState::Free
+            {
+                before.insert(segment, (s.incarnation, u64::from(s.write_pos)));
+            }
+        }
         // A stream whose open segment is freed opens a new one when it next writes.
         let mut opens = self.opens;
         for open in &mut opens {
@@ -829,17 +822,17 @@ impl<F: BlockFile> Writer<F> {
                 *open = None;
             }
         }
+        // Each record opens at most one segment (`Layout::place`), so the lowest `records`
+        // of the free segments and those freed in this frame are all the batch can take.
         let mut free: Vec<u32> = self
             .segments
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s.state == SegmentState::Free)
-            .filter_map(|(i, _)| u32::try_from(i).ok())
+            .free()
+            .take(records)
             .chain(freed.iter().copied())
             .collect();
         // Lowest segment first: popped from the end.
         free.sort_unstable_by(|a, b| b.cmp(a));
-        free.dedup();
+        let free_left = self.segments.free_count().saturating_add(freed.len());
         let mut records = Vec::new();
         for &segment in &freed {
             if let Some(&(incarnation, _)) = before.get(&segment) {
@@ -864,13 +857,22 @@ impl<F: BlockFile> Writer<F> {
             opens,
             incarnation: self.incarnation,
             free,
+            free_left,
             before,
         }
     }
 
     /// Lays out, writes, flushes, publishes and answers one batch.
     fn commit(&mut self, accepted: Vec<Accepted>) {
-        let mut layout = self.layout(accepted.len());
+        let records = accepted
+            .iter()
+            .map(|a| match &a.decision {
+                Decision::Write(_) => 1,
+                Decision::Relocate(current) => current.len(),
+                _ => 0,
+            })
+            .fold(0usize, usize::saturating_add);
+        let mut layout = self.layout(accepted.len(), records);
         let mut sequence = self.sequence;
         let mut ok: Vec<Reply> = Vec::with_capacity(accepted.len());
         let mut payloads: Vec<Payload> = Vec::with_capacity(accepted.len());
@@ -1156,12 +1158,11 @@ impl<F: BlockFile> Writer<F> {
         let block = self.shared.geometry.block;
         let mut index = self.shared.index.write().map_err(|_| ChunkError::Fenced)?;
         for &segment in &layout.freed {
-            if let Some(info) = slot(&mut self.segments, segment) {
-                *info = SegmentInfo::FREE;
-            }
+            self.segments
+                .update(segment, |info| *info = SegmentInfo::FREE);
         }
         for &(segment, incarnation) in &layout.opened {
-            if let Some(info) = slot(&mut self.segments, segment) {
+            self.segments.update(segment, |info| {
                 *info = SegmentInfo {
                     state: SegmentState::Open,
                     incarnation,
@@ -1169,7 +1170,7 @@ impl<F: BlockFile> Writer<F> {
                     live: 0,
                     youngest_ns: 0,
                 };
-            }
+            });
         }
         for record in &layout.records {
             match record {
@@ -1188,25 +1189,27 @@ impl<F: BlockFile> Writer<F> {
                         // A relocated copy: the old one dies as an equal one is born, so no
                         // space is freed that cleaning could gain.
                         Inserted::Replaced(old) => {
-                            if let Some(info) = slot(&mut self.segments, old.segment) {
+                            self.segments.update(old.segment, |info| {
                                 info.live = info.live.saturating_sub(u64::from(old.record_len));
-                            }
+                            });
                             true
                         }
                         Inserted::Unchanged => false,
                     };
-                    if credit && let Some(info) = slot(&mut self.segments, p.segment) {
-                        info.live = info.live.saturating_add(u64::from(p.record_len));
-                        info.youngest_ns = info.youngest_ns.max(p.time_ns);
+                    if credit {
+                        self.segments.update(p.segment, |info| {
+                            info.live = info.live.saturating_add(u64::from(p.record_len));
+                            info.youngest_ns = info.youngest_ns.max(p.time_ns);
+                        });
                     }
                 }
                 LogRecord::Delete(d) => {
                     if let Some(entry) = index.remove(&d.key) {
                         for f in &entry.fragments {
                             self.fragments = self.fragments.saturating_sub(1);
-                            if let Some(info) = slot(&mut self.segments, f.segment) {
+                            self.segments.update(f.segment, |info| {
                                 info.live = info.live.saturating_sub(u64::from(f.record_len));
-                            }
+                            });
                             self.shared
                                 .dead_bytes
                                 .fetch_add(u64::from(f.record_len), Ordering::Relaxed);
@@ -1218,23 +1221,26 @@ impl<F: BlockFile> Writer<F> {
         }
         drop(index);
         for region in &layout.regions {
-            if let Some(info) = slot(&mut self.segments, region.segment) {
-                let end = region
-                    .end
-                    .checked_next_multiple_of(block)
-                    .unwrap_or(region.end);
-                info.write_pos = u32::try_from(end).unwrap_or(u32::MAX).max(info.write_pos);
-            }
+            let end = region
+                .end
+                .checked_next_multiple_of(block)
+                .unwrap_or(region.end);
+            let end = u32::try_from(end).unwrap_or(u32::MAX);
+            self.segments.update(region.segment, |info| {
+                info.write_pos = info.write_pos.max(end);
+            });
         }
         for &(segment, pos) in &layout.sealed {
-            if let Some(info) = slot(&mut self.segments, segment) {
+            self.segments.update(segment, |info| {
                 info.state = SegmentState::Sealed;
                 info.write_pos = info.write_pos.max(pos);
-            }
+            });
         }
         self.opens = layout.opens;
+        // Readers get the segments this batch changed, not a copy of the table.
+        let changed = self.segments.take_changed();
         if let Ok(mut usage) = self.shared.usage.write() {
-            usage.clone_from(&self.segments);
+            usage.copy(&self.segments, &changed);
         }
         Ok(())
     }
@@ -1249,15 +1255,14 @@ impl<F: BlockFile> Writer<F> {
         let segment_records: Vec<LogRecord> = self
             .segments
             .iter()
-            .enumerate()
             .filter(|(_, s)| s.state != SegmentState::Free)
-            .filter_map(|(i, s)| {
-                Some(LogRecord::Segment(SegmentRecord {
-                    segment: u32::try_from(i).ok()?,
+            .map(|(segment, s)| {
+                LogRecord::Segment(SegmentRecord {
+                    segment,
                     incarnation: s.incarnation,
                     state: s.state,
                     write_pos: s.write_pos,
-                }))
+                })
             })
             .collect();
         // Only this thread changes the index, so holding it to read while the frames are
@@ -1408,14 +1413,6 @@ fn place_record(
         time_ns: put.time_ns,
         flags: put.flags,
     })
-}
-
-/// A segment the writer can free without copying: written to, and nothing in it is live.
-/// That includes a stream's open segment once every chunk written into it is deleted.
-fn reclaimable(s: &SegmentInfo, block: u64) -> bool {
-    s.live == 0
-        && (s.state == SegmentState::Sealed
-            || (s.state == SegmentState::Open && u64::from(s.write_pos) > block))
 }
 
 /// Bytes from `from` forward to `to` in a circular region of `size` bytes.

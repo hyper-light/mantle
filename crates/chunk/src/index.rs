@@ -300,11 +300,229 @@ impl SegmentInfo {
         live: 0,
         youngest_ns: 0,
     };
+
+    /// Written to and holding nothing live, so the writer can free it without copying. That
+    /// includes a stream's open segment once every chunk written into it is deleted.
+    pub fn reclaimable(&self, block: u64) -> bool {
+        self.live == 0
+            && (self.state == SegmentState::Sealed
+                || (self.state == SegmentState::Open && u64::from(self.write_pos) > block))
+    }
+}
+
+/// The segment table, with what the writer, the cleaner and the scrubber ask of it kept as
+/// segments change: the free segments, the segments the writer can free without copying,
+/// the count in each state and the live bytes. A batch, a scrub step or a count of free
+/// segments then costs what changed rather than a pass over every segment, of which a 20 TB
+/// device of 256 MiB segments has about 75,000 (audit P06).
+#[derive(Debug, Clone)]
+pub struct Segments {
+    table: Vec<SegmentInfo>,
+    block: u64,
+    /// Free segments, lowest first.
+    free: BTreeSet<u32>,
+    /// Segments `SegmentInfo::reclaimable` holds for, lowest first.
+    reclaimable: BTreeSet<u32>,
+    open: u32,
+    sealed: u32,
+    live: u64,
+    /// Segments changed since `take_changed`, each once, so never more than the table.
+    changed: BTreeSet<u32>,
+}
+
+impl Segments {
+    /// The table of `table`'s segments, written in blocks of `block` bytes.
+    pub fn new(table: Vec<SegmentInfo>, block: u64) -> Self {
+        let mut segments = Self {
+            table: Vec::with_capacity(table.len()),
+            block,
+            free: BTreeSet::new(),
+            reclaimable: BTreeSet::new(),
+            open: 0,
+            sealed: 0,
+            live: 0,
+            changed: BTreeSet::new(),
+        };
+        // A volume numbers its segments in a u32 (`Geometry::segments`).
+        for info in table {
+            let Ok(i) = u32::try_from(segments.table.len()) else {
+                break;
+            };
+            segments.add(i, &info);
+            segments.table.push(info);
+        }
+        segments
+    }
+
+    /// The number of segments.
+    pub fn count(&self) -> usize {
+        self.table.len()
+    }
+
+    pub fn get(&self, segment: u32) -> Option<&SegmentInfo> {
+        self.table.get(usize::try_from(segment).ok()?)
+    }
+
+    /// Every segment with its number.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, &SegmentInfo)> {
+        self.table
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| Some((u32::try_from(i).ok()?, s)))
+    }
+
+    /// Free segments, lowest first.
+    pub fn free(&self) -> impl Iterator<Item = u32> + '_ {
+        self.free.iter().copied()
+    }
+
+    pub fn free_count(&self) -> usize {
+        self.free.len()
+    }
+
+    /// Segments the writer can free without copying, lowest first.
+    pub fn reclaimable(&self) -> impl Iterator<Item = u32> + '_ {
+        self.reclaimable.iter().copied()
+    }
+
+    pub fn open_count(&self) -> u32 {
+        self.open
+    }
+
+    pub fn sealed_count(&self) -> u32 {
+        self.sealed
+    }
+
+    /// Bytes of records some chunk still references, over every segment.
+    pub fn live(&self) -> u64 {
+        self.live
+    }
+
+    /// Changes `segment` through `f`, keeping what the table keeps; a segment the table does
+    /// not have is left alone.
+    pub fn update(&mut self, segment: u32, f: impl FnOnce(&mut SegmentInfo)) {
+        if self.change(segment, f) {
+            self.changed.insert(segment);
+        }
+    }
+
+    /// The segments `update` changed since the last call, lowest first.
+    pub fn take_changed(&mut self) -> BTreeSet<u32> {
+        std::mem::take(&mut self.changed)
+    }
+
+    /// Takes `from`'s state of each of `segments`.
+    pub fn copy(&mut self, from: &Self, segments: &BTreeSet<u32>) {
+        for &segment in segments {
+            if let Some(&info) = from.get(segment) {
+                self.change(segment, |s| *s = info);
+            }
+        }
+    }
+
+    fn change(&mut self, segment: u32, f: impl FnOnce(&mut SegmentInfo)) -> bool {
+        let Some(slot) = usize::try_from(segment)
+            .ok()
+            .and_then(|i| self.table.get_mut(i))
+        else {
+            return false;
+        };
+        let old = *slot;
+        f(slot);
+        let new = *slot;
+        if old == new {
+            return false;
+        }
+        self.remove(segment, &old);
+        self.add(segment, &new);
+        true
+    }
+
+    fn add(&mut self, segment: u32, info: &SegmentInfo) {
+        match info.state {
+            SegmentState::Free => {
+                self.free.insert(segment);
+            }
+            SegmentState::Open => self.open = self.open.saturating_add(1),
+            SegmentState::Sealed => self.sealed = self.sealed.saturating_add(1),
+        }
+        if info.reclaimable(self.block) {
+            self.reclaimable.insert(segment);
+        }
+        self.live = self.live.saturating_add(info.live);
+    }
+
+    fn remove(&mut self, segment: u32, info: &SegmentInfo) {
+        match info.state {
+            SegmentState::Free => {
+                self.free.remove(&segment);
+            }
+            SegmentState::Open => self.open = self.open.saturating_sub(1),
+            SegmentState::Sealed => self.sealed = self.sealed.saturating_sub(1),
+        }
+        self.reclaimable.remove(&segment);
+        self.live = self.live.saturating_sub(info.live);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mantle_disk::measure::SplitMix64;
+
+    /// What the table keeps, counted from scratch.
+    fn recount(t: &Segments, block: u64) {
+        let free: Vec<u32> = t
+            .iter()
+            .filter(|(_, s)| s.state == SegmentState::Free)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(t.free().collect::<Vec<_>>(), free);
+        assert_eq!(t.free_count(), free.len());
+        let reclaimable: Vec<u32> = t
+            .iter()
+            .filter(|(_, s)| s.reclaimable(block))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(t.reclaimable().collect::<Vec<_>>(), reclaimable);
+        let count = |state| t.iter().filter(|(_, s)| s.state == state).count() as u32;
+        assert_eq!(t.open_count(), count(SegmentState::Open));
+        assert_eq!(t.sealed_count(), count(SegmentState::Sealed));
+        assert_eq!(t.live(), t.iter().map(|(_, s)| s.live).sum::<u64>());
+    }
+
+    /// Through any changes the table's sets and sums match a count from scratch, and copying
+    /// the segments it changed makes the readers' table equal to the writer's.
+    #[test]
+    fn the_segment_table_keeps_its_sets_and_sums_through_any_changes() {
+        let block = 4096;
+        let mut rng = SplitMix64::new(7);
+        let mut table = Segments::new(vec![SegmentInfo::FREE; 64], block);
+        let mut readers = table.clone();
+        let states = [SegmentState::Free, SegmentState::Open, SegmentState::Sealed];
+        for round in 0..4_000u64 {
+            // Two numbers past the table's end, which change nothing.
+            let segment = rng.below(66) as u32;
+            let state = states[rng.below(3) as usize];
+            let live = rng.below(3) * 4096;
+            let write_pos = rng.below(3) as u32 * 4096;
+            table.update(segment, |s| {
+                s.state = state;
+                s.live = live;
+                s.write_pos = write_pos;
+                s.incarnation = round;
+            });
+            recount(&table, block);
+            if rng.below(8) == 0 {
+                let changed = table.take_changed();
+                assert!(changed.iter().all(|&s| s < 64));
+                readers.copy(&table, &changed);
+                assert!(readers.iter().eq(table.iter()));
+                recount(&readers, block);
+            }
+        }
+        assert_eq!(table.count(), 64);
+    }
 
     fn put(offset: u64, len: u32, seq: u64, flags: u8) -> PutRecord {
         PutRecord {

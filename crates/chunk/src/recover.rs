@@ -19,7 +19,7 @@ use crate::frame::{KIND_BATCH, KIND_WRAP, LogRecord, PutRecord, SegmentState};
 use crate::index::{Fragment, Index, Inserted, SegmentInfo};
 use crate::key::ChunkKey;
 use crate::layout::{Config, Geometry};
-use crate::log::{self, Cursor};
+use crate::log::{Cursor, Frames};
 use crate::record::{self, Prefix};
 use crate::superblock::Superblock;
 use crate::writer::distance;
@@ -81,13 +81,12 @@ pub(crate) fn recover<F: BlockFile>(
         .unwrap_or(0)
         .saturating_add(2);
     let mut frames = 0u64;
+    let mut log = Frames::new(file, geometry, sb.volume).map_err(ChunkError::Device)?;
     loop {
         if frames > max_frames {
             return Err(ChunkError::CorruptLog { lsn });
         }
-        let Some((header, records, len)) =
-            log::read_frame(file, geometry, sb.volume, pos).map_err(ChunkError::Device)?
-        else {
+        let Some((header, records, len)) = log.frame(pos).map_err(ChunkError::Device)? else {
             break;
         };
         if header.lsn != lsn {
@@ -153,7 +152,7 @@ pub(crate) fn recover<F: BlockFile>(
         }
     }
     report.frames = frames;
-    if later_frame_exists(file, geometry, sb.volume, lsn)? {
+    if later_frame_exists(&mut log, geometry, lsn)? {
         return Err(ChunkError::CorruptLog { lsn });
     }
 
@@ -255,18 +254,20 @@ pub(crate) fn recover<F: BlockFile>(
 /// previous group's flush completes, so such a frame proves the missing one was durable and
 /// has since been damaged. Frames of the same group (a wrap and its batch, the frames of a
 /// checkpoint) can survive a crash that tore an earlier one, and prove nothing.
+///
+/// Every block of the log is examined, through the reader's window; only a frame whose header
+/// names such a group is verified whole, since the header it is verified with is the same.
 fn later_frame_exists<F: BlockFile>(
-    file: &F,
+    log: &mut Frames<'_, F>,
     geometry: &Geometry,
-    volume: u128,
     lsn: u64,
 ) -> Result<bool, ChunkError> {
     let mut pos = 0u64;
     while pos < geometry.log_size {
-        if let Some((header, _, _)) =
-            log::read_frame(file, geometry, volume, pos).map_err(ChunkError::Device)?
+        if let Some((header, _)) = log.header(pos).map_err(ChunkError::Device)?
             && header.lsn >= lsn
             && header.group > lsn
+            && log.frame(pos).map_err(ChunkError::Device)?.is_some()
         {
             return Ok(true);
         }

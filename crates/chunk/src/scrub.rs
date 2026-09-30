@@ -178,7 +178,7 @@ fn scrub_range<F: BlockFile>(
 fn incarnation<F: BlockFile>(shared: &Shared<F>, segment: u32) -> Result<Option<u64>, ChunkError> {
     let usage = shared.usage.read().map_err(|_| ChunkError::Fenced)?;
     Ok(usage
-        .get(usize::try_from(segment).unwrap_or(usize::MAX))
+        .get(segment)
         .filter(|s| s.state != SegmentState::Free && s.live > 0)
         .map(|s| s.incarnation))
 }
@@ -243,12 +243,7 @@ impl<F: BlockFile> Scrubber<F> {
             if self.shared.stopping.load(Ordering::Acquire) {
                 return;
             }
-            let volume_bytes = self
-                .shared
-                .usage
-                .read()
-                .map(|usage| usage.iter().map(|s| s.live).sum::<u64>())
-                .unwrap_or(0);
+            let volume_bytes = self.shared.usage.read().map_or(0, |usage| usage.live());
             if volume_bytes == 0 || count == 0 {
                 // Nothing stored: wait a period, or until woken.
                 if self.wait(self.period) {

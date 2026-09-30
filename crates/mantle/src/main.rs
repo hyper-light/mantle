@@ -103,6 +103,11 @@ enum BenchCommand {
         /// Leave out the measurement of the device itself.
         #[arg(long)]
         skip_device: bool,
+        /// Bytes of each of the scratch volume's segments, with a K or M suffix: a volume's
+        /// 256 MiB by default. Smaller segments give the store as many to keep as a larger
+        /// device would have.
+        #[arg(long, value_parser = parse_size)]
+        segment_size: Option<usize>,
     },
     /// Measure the device under PATH, then the Raft log's appends across entry sizes and
     /// replicas appending at once, in scratch files (removed afterwards).
@@ -232,6 +237,7 @@ fn main() -> ExitCode {
                     workers,
                     rounds,
                     skip_device,
+                    segment_size,
                 },
         } => match std::time::Duration::try_from_secs_f64(seconds) {
             Ok(step) => bench::chunk(
@@ -243,6 +249,7 @@ fn main() -> ExitCode {
                     workers,
                     rounds,
                     skip_device,
+                    segment_size,
                 },
             )
             .map_err(|e| e.to_string()),

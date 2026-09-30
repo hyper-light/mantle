@@ -14,6 +14,7 @@
 //! insensitive to them, and a fraction of the volume scales with the disk rather than the
 //! write rate (docs/research/11 §10).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -101,35 +102,33 @@ impl<F: BlockFile> Cleaner<F> {
             }
             // A failed pass (the volume fenced, or it closed) ends this round; the next wake
             // retries if there is still work.
-            if let Ok(report) = self.pass() {
-                let futile = if report.segments > 0 && report.gained == 0 {
-                    dead
-                } else {
-                    u64::MAX
-                };
+            // A pass that ran and gained nothing, having found no victim worth cleaning or
+            // cleaned some to no gain, is futile until more data dies.
+            if let Ok(Some(report)) = self.pass() {
+                let futile = if report.gained == 0 { dead } else { u64::MAX };
                 self.shared.futile_at.store(futile, Ordering::Relaxed);
             }
         }
     }
 
     fn free(&self) -> usize {
-        self.shared.usage.read().map_or(0, |usage| {
-            usage
-                .iter()
-                .filter(|s| s.state == SegmentState::Free)
-                .count()
-        })
+        self.shared
+            .usage
+            .read()
+            .map_or(0, |usage| usage.free_count())
     }
 
-    /// Cleans victims until free segments are one past the runway, or none is worth it.
-    pub fn pass(&self) -> Result<CleanReport, ChunkError> {
+    /// Cleans victims until free segments are one past the runway, or none is worth it;
+    /// `None` when free segments are at the runway already.
+    pub fn pass(&self) -> Result<Option<CleanReport>, ChunkError> {
         let low = self.shared.low_water.load(Ordering::Relaxed);
         if self.free() >= low {
-            return Ok(CleanReport::default());
+            return Ok(None);
         }
         self.clean_until(|cleaner, _| {
             cleaner.free() <= cleaner.shared.low_water.load(Ordering::Relaxed)
         })
+        .map(Some)
     }
 
     /// Cleans the `n` best victims, whatever the free space.
@@ -148,20 +147,16 @@ impl<F: BlockFile> Cleaner<F> {
             .lock()
             .map_err(|_| ChunkError::Fenced)?;
         let mut report = CleanReport::default();
-        let mut tried = Vec::new();
+        let mut tried = HashSet::new();
         let start = self.free();
-        let (size, block) = (
-            self.shared.geometry.segment_size,
-            self.shared.geometry.block,
-        );
-        let batch = u64::try_from(self.batch_bytes).unwrap_or(u64::MAX).max(1);
+        let size = self.shared.geometry.segment_size;
         // Space the victims cleaned so far should give back once their live data is packed.
         let mut due = 0u64;
         while more(self, &report) {
             let Some(victim) = self.victim(&tried) else {
                 break;
             };
-            tried.push(victim);
+            tried.insert(victim);
             let live = self.live(victim);
             let started = Instant::now();
             let (relocated, corrupt) = self.clean(victim)?;
@@ -174,10 +169,8 @@ impl<F: BlockFile> Cleaner<F> {
             // Victims of live fraction u free 1 − u segments each (Rosenblum and Ousterhout,
             // TOCS 1992, §3.4), so a net gain is due once they have held a segment's worth of
             // dead space, after ⌈1/(1 − ū)⌉ of them (docs/research/11 §10.3), less what packing
-            // their live data costs: a block of padding per relocation batch and a share of a
-            // segment header. None by then means it packs no tighter, and the pass stops.
-            let packing = live.div_ceil(batch).saturating_add(1).saturating_mul(block);
-            due = due.saturating_add(size.saturating_sub(live).saturating_sub(packing));
+            // their live data costs. None by then means it packs no tighter, and the pass stops.
+            due = due.saturating_add(self.gain(live));
             if due >= size && self.free() <= start {
                 break;
             }
@@ -186,13 +179,25 @@ impl<F: BlockFile> Cleaner<F> {
         Ok(report)
     }
 
+    /// Space cleaning a segment holding `live` live bytes gives back: its dead bytes, less
+    /// what packing its live data costs, a block of padding per relocation batch and a share
+    /// of a segment header.
+    fn gain(&self, live: u64) -> u64 {
+        let (size, block) = (
+            self.shared.geometry.segment_size,
+            self.shared.geometry.block,
+        );
+        let batch = u64::try_from(self.batch_bytes).unwrap_or(u64::MAX).max(1);
+        let packing = live.div_ceil(batch).saturating_add(1).saturating_mul(block);
+        size.saturating_sub(live).saturating_sub(packing)
+    }
+
     /// Live bytes of `segment`.
     fn live(&self, segment: u32) -> u64 {
-        self.shared.usage.read().map_or(0, |usage| {
-            usage
-                .get(usize::try_from(segment).unwrap_or(usize::MAX))
-                .map_or(0, |s| s.live)
-        })
+        self.shared
+            .usage
+            .read()
+            .map_or(0, |usage| usage.get(segment).map_or(0, |s| s.live))
     }
 
     /// Records how long a victim took and moves the runway to match.
@@ -210,8 +215,13 @@ impl<F: BlockFile> Cleaner<F> {
         shared.low_water.store(low, Ordering::Relaxed);
     }
 
-    /// The sealed segment with the best cost-benefit ratio.
-    fn victim(&self, tried: &[u32]) -> Option<u32> {
+    /// The sealed segment with the best cost-benefit ratio of those cleaning gains space from.
+    /// A segment whose dead bytes do not cover packing its live data is none of them: cleaning
+    /// it only moves its data, and a pass over such segments alone, as a volume filled in
+    /// chunks of nearly a segment each leaves, would move every one and gain nothing. Scores
+    /// change with the clock, so each victim is chosen over every segment: one pass of the
+    /// table against the victim's relocation, which reads and writes what is live in it.
+    fn victim(&self, tried: &HashSet<u32>) -> Option<u32> {
         let usage = self.shared.usage.read().ok()?;
         let size = self.shared.geometry.segment_size;
         let now = std::time::SystemTime::now()
@@ -220,11 +230,8 @@ impl<F: BlockFile> Cleaner<F> {
             .unwrap_or(0);
         usage
             .iter()
-            .enumerate()
             .filter(|(i, s)| {
-                s.state == SegmentState::Sealed
-                    && s.live < size
-                    && u32::try_from(*i).is_ok_and(|i| !tried.contains(&i))
+                s.state == SegmentState::Sealed && self.gain(s.live) > 0 && !tried.contains(i)
             })
             .map(|(i, s)| {
                 // Scores are compared, not reported: f64's rounding does not change the order
@@ -235,7 +242,7 @@ impl<F: BlockFile> Cleaner<F> {
             })
             .filter(|(score, _)| score.is_finite())
             .max_by(|a, b| a.0.total_cmp(&b.0))
-            .and_then(|(_, i)| u32::try_from(i).ok())
+            .map(|(_, i)| i)
     }
 
     /// Relocates every live record of `segment`, found where they lie in the index's record
@@ -246,7 +253,7 @@ impl<F: BlockFile> Cleaner<F> {
             .usage
             .read()
             .map_err(|_| ChunkError::Fenced)?
-            .get(usize::try_from(segment).unwrap_or(usize::MAX))
+            .get(segment)
             .map(|s| s.incarnation)
             .ok_or(ChunkError::Fenced)?;
         let offsets = self

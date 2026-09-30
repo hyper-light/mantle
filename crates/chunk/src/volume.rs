@@ -13,7 +13,7 @@ use mantle_disk::buf::{AlignedBuf, Pool};
 use crate::clean::{CleanReport, Cleaner};
 use crate::error::ChunkError;
 use crate::frame::SegmentState;
-use crate::index::Fragment;
+use crate::index::{Fragment, Segments};
 use crate::key::ChunkKey;
 use crate::layout::{Config, Geometry};
 use crate::read;
@@ -182,6 +182,7 @@ impl<F: BlockFile + 'static> Volume<F> {
                 sealed = sealed.saturating_add(1);
             }
         }
+        let segments = Segments::new(recovered.segments, geometry.block);
         let shared = Arc::new(Shared {
             pool,
             file,
@@ -207,7 +208,7 @@ impl<F: BlockFile + 'static> Volume<F> {
                 u64::try_from(batch).unwrap_or(u64::MAX),
                 geometry.segment_size,
             )),
-            usage: RwLock::new(recovered.segments.clone()),
+            usage: RwLock::new(segments.clone()),
             reads: crate::read::Gate::new(config.reads),
         });
         // Client requests are admitted up to `queue_requests` (`submit`); the cleaner sends
@@ -219,7 +220,7 @@ impl<F: BlockFile + 'static> Volume<F> {
             shared: Arc::clone(&shared),
             config,
             rx,
-            segments: recovered.segments,
+            segments,
             opens: [client, clean],
             incarnation: recovered.incarnation,
             sequence: recovered.sequence,
@@ -454,22 +455,26 @@ impl<F: BlockFile + 'static> Volume<F> {
         Ok(keys)
     }
 
+    /// Bytes of the index log.
+    pub fn log_bytes(&self) -> u64 {
+        self.shared.geometry.log_size
+    }
+
+    /// The most payload bytes one record holds: a segment less its header and the record's.
+    pub fn max_payload(&self) -> u64 {
+        crate::writer::max_payload(&self.shared.geometry, self.shared.checksum_shift)
+    }
+
     pub fn usage(&self) -> Result<Usage, ChunkError> {
         let segments = self.shared.usage.read().map_err(|_| ChunkError::Fenced)?;
-        let mut usage = Usage {
-            segments: u32::try_from(segments.len()).unwrap_or(u32::MAX),
+        Ok(Usage {
+            segments: u32::try_from(segments.count()).unwrap_or(u32::MAX),
+            free: u32::try_from(segments.free_count()).unwrap_or(u32::MAX),
+            open: segments.open_count(),
+            sealed: segments.sealed_count(),
+            live_bytes: segments.live(),
             checkpoints: self.shared.checkpoints.load(Ordering::Relaxed),
-            ..Usage::default()
-        };
-        for s in segments.iter() {
-            match s.state {
-                SegmentState::Free => usage.free = usage.free.saturating_add(1),
-                SegmentState::Open => usage.open = usage.open.saturating_add(1),
-                SegmentState::Sealed => usage.sealed = usage.sealed.saturating_add(1),
-            }
-            usage.live_bytes = usage.live_bytes.saturating_add(s.live);
-        }
-        Ok(usage)
+        })
     }
 
     /// Reads `len` bytes of a chunk from `offset`, verifying every byte returned against the
@@ -764,7 +769,7 @@ impl<F: BlockFile + 'static> Volume<F> {
         let usage = self.shared.usage.read().map_err(|_| ChunkError::Fenced)?;
         Ok(usage
             .iter()
-            .map(|s| (s.state, s.incarnation, s.write_pos, s.live))
+            .map(|(_, s)| (s.state, s.incarnation, s.write_pos, s.live))
             .collect())
     }
 }
@@ -774,6 +779,7 @@ mod tests {
     use super::*;
     use mantle_disk::buf::Alignment;
     use mantle_disk::sim::SimFile;
+    use std::sync::atomic::AtomicU64;
     use std::sync::mpsc::Receiver;
     use std::sync::{Condvar, Mutex};
 
@@ -1073,10 +1079,10 @@ mod tests {
         let bound = crate::layout::batch_frame_payload(requests, requests).unwrap();
         let one = crate::layout::batch_frame_payload(1, 0).unwrap();
         let (mut batches, mut largest) = (0u64, 0u64);
+        let mut log = crate::log::Frames::new(&file, &geometry, id).unwrap();
         let mut pos = 0u64;
         while pos < geometry.log_size {
-            if let Some((header, records, _)) =
-                crate::log::read_frame(&file, &geometry, id, pos).unwrap()
+            if let Some((header, records, _)) = log.frame(pos).unwrap()
                 && header.kind == crate::frame::KIND_BATCH
             {
                 let payload: u64 = records.iter().map(|r| r.encoded_len() as u64).sum();
@@ -1225,6 +1231,71 @@ mod tests {
             },
             prewrite: false,
             reads: Reads::default(),
+        }
+    }
+
+    /// A simulated file that counts the reads that start in its log.
+    struct Tally {
+        file: Arc<SimFile>,
+        log: Mutex<std::ops::Range<u64>>,
+        log_reads: AtomicU64,
+    }
+
+    impl BlockFile for Tally {
+        fn alignment(&self) -> Alignment {
+            self.file.alignment()
+        }
+        fn len(&self) -> Result<u64, DiskError> {
+            self.file.len()
+        }
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), DiskError> {
+            if self.log.lock().unwrap().contains(&offset) {
+                self.log_reads.fetch_add(1, Ordering::SeqCst);
+            }
+            self.file.read_exact_at(buf, offset)
+        }
+        fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError> {
+            self.file.write_all_at(buf, offset)
+        }
+        fn sync_data(&self) -> Result<(), DiskError> {
+            self.file.sync_data()
+        }
+    }
+
+    /// Opening a volume reads its log a window at a time. It read each frame's first block
+    /// and then the frame, and then every block of the log one at a time to prove no later
+    /// frame was lost (audit P07); now the replay and the search each read the log in at most
+    /// twice as many reads as it has windows, and the volume comes back whole.
+    #[test]
+    fn opening_reads_the_log_a_window_at_a_time() {
+        let tally = Arc::new(Tally {
+            file: sim(31),
+            log: Mutex::new(0..0),
+            log_reads: AtomicU64::new(0),
+        });
+        let settings = Config {
+            max_fragments: 20_000,
+            ..config()
+        };
+        let volume = Volume::format(Arc::clone(&tally), 64 << 20, settings).unwrap();
+        let chunks = 600u64;
+        for n in 0..chunks {
+            volume.put(key(n), &n.to_le_bytes()).unwrap();
+        }
+        let geometry = volume.shared.geometry;
+        volume.close();
+        *tally.log.lock().unwrap() = geometry.log_offset..geometry.log_offset + geometry.log_size;
+        let (volume, report) = Volume::open(Arc::clone(&tally), settings).unwrap();
+        assert!(report.frames >= chunks, "{} frames replayed", report.frames);
+        let windows = geometry.log_size.div_ceil(crate::layout::MAX_FRAME_BYTES);
+        let reads = tally.log_reads.load(Ordering::SeqCst);
+        assert!(
+            reads <= 4 * windows,
+            "{reads} reads of a log of {windows} windows holding {} frames",
+            report.frames
+        );
+        for n in 0..chunks {
+            assert_eq!(volume.read(&key(n), 0, 8).unwrap(), n.to_le_bytes());
         }
     }
 

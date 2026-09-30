@@ -90,6 +90,8 @@ pub struct Plan {
     /// How long each round of a put or read point runs.
     pub step: Duration,
     pub rounds: Policy,
+    /// The scratch volume's segment size; a volume's default when `None`.
+    pub segment_size: Option<u64>,
 }
 
 impl Plan {
@@ -107,6 +109,7 @@ impl Plan {
                 max: rounds,
                 ..Policy::STANDARD
             },
+            segment_size: None,
         }
     }
 }
@@ -175,6 +178,8 @@ pub struct Options {
     pub rounds: usize,
     /// Leave out the device measurement.
     pub skip_device: bool,
+    /// The scratch volume's segment size; a volume's default when `None`.
+    pub segment_size: Option<usize>,
 }
 
 pub fn chunk(out: &mut impl Write, path: &Path, options: &Options) -> Result<(), Error> {
@@ -195,6 +200,7 @@ pub fn chunk(out: &mut impl Write, path: &Path, options: &Options) -> Result<(),
     if !options.workers.is_empty() {
         plan.workers.clone_from(&options.workers);
     }
+    plan.segment_size = options.segment_size.and_then(|s| u64::try_from(s).ok());
     writeln!(out, "{}", path.display())?;
     // The volume is formatted and read as mantle would here, which the device measurement
     // decides; without one it is not pre-written and reads one at a time.
@@ -290,6 +296,7 @@ fn run(
     file.preallocate(volume).map_err(Error::Disk)?;
     // Room in the index for a third of the volume in the smallest chunks, twice over.
     let smallest = plan.sizes.iter().copied().min().unwrap_or(4096).max(1);
+    let defaults = Config::default();
     let config = Config {
         max_fragments: volume
             .checked_div(u64::try_from(smallest).unwrap_or(u64::MAX))
@@ -298,20 +305,33 @@ fn run(
             .checked_div(3)
             .unwrap_or(0)
             .max(1024),
+        segment_size: plan.segment_size.unwrap_or(defaults.segment_size),
         scrub_period: None,
         prewrite,
         reads,
-        ..Config::default()
+        ..defaults
     };
     let v = Volume::format(file, volume, config).map_err(Error::Chunk)?;
+    // Every chunk must fit a segment's record.
+    let largest = v.max_payload();
+    for &size in &plan.sizes {
+        let len = u64::try_from(size).unwrap_or(u64::MAX);
+        if len > largest {
+            return Err(Error::Chunk(ChunkError::TooLarge { len, max: largest }));
+        }
+    }
+    let segments = v.usage().map_err(Error::Chunk)?.segments;
     let raw =
         DeviceFile::open(path, false, CachingRequest::PreferDirect, align).map_err(Error::Disk)?;
     let span = v.data_span();
     writeln!(
         out,
-        "chunk store on a {} volume in a scratch file (removed afterwards){}, reading {} at \
-         a time with {} more let wait, and through at most {} of a record to reach its range",
+        "chunk store on a {} volume of {} segments of {} in a scratch file (removed \
+         afterwards){}, reading {} at a time with {} more let wait, and through at most {} of a \
+         record to reach its range",
         display::capacity(volume),
+        segments,
+        display::size(usize::try_from(config.segment_size).unwrap_or(usize::MAX)),
         if prewrite {
             ", written once at format"
         } else {
@@ -323,7 +343,7 @@ fn run(
     )?;
     out.flush()?;
 
-    let fill_size = 1 << 20;
+    let fill_size = usize::try_from(largest).map_or(1 << 20, |l| l.min(1 << 20));
     let (filled, keys) = puts(&v, fill_size, 8, Duration::MAX, u64::MAX, 0)?;
     writeln!(
         out,
@@ -408,6 +428,20 @@ fn run(
             }
         }
     }
+    // A restart: the volume closed and opened again, which replays its log since the last
+    // checkpoint and searches the whole log for a frame past the end it found.
+    v.close();
+    let file =
+        DeviceFile::open(path, false, CachingRequest::PreferDirect, align).map_err(Error::Disk)?;
+    let started = Instant::now();
+    let (v, report) = Volume::open(file, config).map_err(Error::Chunk)?;
+    writeln!(
+        out,
+        "  reopened       in {}, replaying {} index frames of a {} log",
+        display::nanos(nanos(started.elapsed())),
+        report.frames,
+        display::capacity(v.log_bytes())
+    )?;
     v.close();
     Ok(())
 }
@@ -798,6 +832,7 @@ mod tests {
                 max: 2,
                 precision: 0.05,
             },
+            segment_size: None,
         };
         let mut out = Vec::new();
         // As a device measured at four in flight: four readers, none refused.
@@ -820,6 +855,7 @@ mod tests {
             "get 1 MiB",
             "file layer",
             "4 KiB range",
+            "reopened",
         ] {
             assert!(text.contains(name), "{name} missing from:\n{text}");
         }

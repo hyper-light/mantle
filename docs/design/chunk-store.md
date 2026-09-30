@@ -159,6 +159,16 @@ On the development machine a durable flush costs ~4.7 ms whatever its size
 (docs/measurements), so this loop is what turns 245 flushes/s into tens of thousands of
 chunk writes/s.
 
+The writer keeps the segment table with what batches, the cleaner and the scrubber ask of
+it: the free segments in order, the segments it can free without copying, the count in each
+state and the live bytes, each kept as a segment changes. A batch changes only the segments
+it writes into, seals, opens or frees, and hands readers only those, so its bookkeeping
+costs what it did rather than a pass over the table; a 20 TB device of 256 MiB segments has
+about 75,000. Before, every batch walked the table several times, built a map of every
+segment in use, sorted every free one and copied the whole table for readers, and every
+1 MiB scrub step summed every segment's live bytes (audit P06;
+[measurements](../measurements/2026-09-29-segment-table.md)).
+
 A volume runs three threads: the writer, the cleaner (§8) and, when scrubbing is on, the
 scrubber (§9). The volume owns each from the moment it starts, so a start the operating
 system refuses part way stops and joins those already running before the error returns,
@@ -256,6 +266,16 @@ availability target to set the budget from.
 If the index log is unreadable, step 3 over every segment rebuilds the index from the
 data records alone: slow, but no acknowledged chunk depends on the log.
 
+Steps 2 and the search behind the torn-versus-corrupt rule read the log through a window
+of one largest frame, 4 MiB: a frame the window holds is verified there, and the window
+moves to the start of one it does not hold, which then lies wholly within it. The replay and
+the search, which examines every block of the log for a later flush group's frame, read the
+log in reads of 4 MiB, each byte at most twice, and verify in full only the frames whose
+header names a later group. Before, each frame took a read of its first block and another
+of the whole frame, and the search read the log one block at a time, 41,000 reads for a log
+of 168 MB: an open took about a second on this machine's SSD, and now takes 50–80 ms (audit
+P07; [measurements](../measurements/2026-09-29-recovery-reads.md)).
+
 ## 7. Reading
 
 A read looks up the fragments covering the requested range and, for each, reads the
@@ -322,12 +342,18 @@ the rate writes arrive. LFS set its thresholds without study and found performan
 insensitive to them [RO92 §3.4], and a fraction of the volume holds a 20 TB disk's 1.25 TB
 idle for a runway of a few segments [research/11 §10.3]. A pass cleans until free segments
 are one past the runway. It picks sealed segments by cost-benefit, `(1−u)·age / (1+u)` with
-`u` the live fraction and `age` the youngest record's age [RO92 §3.6], copies their live
+`u` the live fraction and `age` the youngest record's age [RO92 §3.6]; the scores move with
+the clock, so each victim is chosen over the whole table, one pass against the victim's
+relocation, which reads and writes what is live in it. It copies their live
 records to the cleaner's stream (sorted by age), and frees the segment once the copies are
 durable and indexed. Victims of live fraction `u` free `1 − u` segments each [RO92 §3.4],
 so a net gain is due once they have held a segment's worth of dead space beyond what
 packing their live data costs; a pass that gains nothing by then stops, and cleaning waits
-until more data is deleted. One pass runs at a time.
+until more data is deleted. A segment whose dead bytes do not pay for packing its live data
+is no victim at all: cleaning it only moves its data, and a volume filled in chunks of
+nearly a segment each, whose only dead bytes are padding, was cleaned victim after victim
+for nothing. A pass that finds no victim is futile as one that gains nothing is (audit P06).
+One pass runs at a time.
 
 A client write with no free segment to go to is `Busy`, to be retried, while cleaning may
 still free one, and `Full` once cleaning has been tried on the data deleted so far and

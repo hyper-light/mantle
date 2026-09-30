@@ -141,8 +141,21 @@ with a 500 and mantle refuses as `InvalidPart` (05 §3.3), and an upload whose r
 combination its algorithm lacks is refused. The object's file of parts is written with each part's plaintext length, an empty
 part left out, and the Name range's Complete checks the parts again against its own rows,
 refusing a size that is not their sum or an ETag that does not name their number
-(`Miscombined`), and commits (audit §16.5). A completion whose upload is gone asks the Name
-range for the version a completion of the same parts made, and gets it or `NoSuchUpload`.
+(`Miscombined`), and commits (audit §16.5). The pages and the listed parts both ascend by
+number, so the completion matches them in one walk along each, not a search of the list for
+each row.
+
+A completion whose upload is gone asks the Name range for the version a completion of the
+same parts made, and gets it or `NoSuchUpload`, the error AWS gives for an upload that "might
+have been ... completed" (05 §4.4). S3 re-completes an identical part list, returning the same
+ETag and checksum, as s3-tests checks and SDK retries rely on (05 §4.4), so a retry is matched
+as strictly as a first completion: each Complete carries the SHA-256 of the parts listed, their
+numbers and their ETags as sent (FIPS 180-4), the version keeps it, and a retry is answered
+only if its list has the same digest and the version the same ETag. Before, a retry was matched
+by the multipart ETag alone, which names neither the parts' numbers nor their ETags' text, so
+a list the first completion would refuse as `InvalidPart` was answered as the object. The
+answer to a retry carries the version's size and checksum, which the gateway, holding no part
+rows, reports as the first completion did.
 
 ## 3. Reading an object
 

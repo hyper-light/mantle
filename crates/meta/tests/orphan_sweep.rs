@@ -794,6 +794,7 @@ impl World {
                 headers: Vec::new(),
                 retention: None,
                 legal_hold: None,
+                listing: None,
             },
             default: None,
             deadline_ns,
@@ -1053,6 +1054,7 @@ impl World {
             file: Some(composite),
             default: None,
             deadline_ns,
+            listing: [0; mantle_meta::record::LISTING],
         });
         if let Some(name::Outcome::Put { .. }) = self.send(key, &complete)
             && !retry

@@ -436,6 +436,7 @@ fn object(key: &str) -> Commit {
             headers: Vec::new(),
             retention: None,
             legal_hold: None,
+            listing: None,
         },
         default: None,
         deadline_ns: 0,
@@ -1427,6 +1428,7 @@ fn complete_upload(
         file: None,
         default: None,
         deadline_ns: 0,
+        listing: [0; mantle_meta::record::LISTING],
     };
     let mut completion = Completion::new(template, listed, file, HANDOVER)?;
     loop {
@@ -1483,9 +1485,52 @@ fn a_completed_upload_is_its_parts() {
             "{range:?}"
         );
     }
-    // A retry once the upload is gone finds the version it made.
+    // A retry once the upload is gone finds the version it made, and reports the object as
+    // the first completion did.
     let again = complete_upload(&mut cell, "k", &upload, listed, 301).unwrap();
-    assert_eq!(again.version, done.version);
+    assert_eq!(again, done);
+}
+
+/// A retry once the upload is gone is matched as strictly as the first completion: the parts
+/// it lists, their numbers and their ETags as sent, must be those the object was made from,
+/// or the upload is no more (`NoSuchUpload`, 05 §4.4). Before, a retry was matched by the
+/// multipart ETag alone, which names neither the parts' numbers nor their ETags' case.
+#[test]
+fn a_retried_completion_is_matched_as_strictly_as_the_first() {
+    let mut cell = Cell::new(3);
+    let wrapping = WrappingKey::generate().unwrap();
+    let upload = cell.create_upload_with("k", Some((Algorithm::Crc64Nvme.code(), true)));
+    let bodies = [body(5 << 20, 1), body(100, 3)];
+    let etags = upload_parts(
+        &mut cell,
+        "k",
+        &upload,
+        &bodies,
+        200,
+        Some(Algorithm::Crc64Nvme),
+        &wrapping,
+    );
+    let listed: Vec<(u16, String)> = (1..=2).zip(etags.iter().cloned()).collect();
+    let done = complete_upload(&mut cell, "k", &upload, listed.clone(), 300).unwrap();
+    assert_eq!(done.size, (5 << 20) + 100);
+    assert!(done.checksum.is_some());
+    // The first completion refuses these as parts the upload does not have.
+    for other in [
+        vec![(3, etags[0].to_uppercase()), (7, etags[1].clone())],
+        vec![(1, etags[0].to_uppercase()), (2, etags[1].clone())],
+        vec![(1, etags[0].clone()), (3, etags[1].clone())],
+        vec![(2, etags[0].clone()), (3, etags[1].clone())],
+    ] {
+        assert_eq!(
+            complete_upload(&mut cell, "k", &upload, other.clone(), 301),
+            Err(CompleteError::NoSuchUpload),
+            "{other:?}"
+        );
+    }
+    assert_eq!(
+        complete_upload(&mut cell, "k", &upload, listed, 302),
+        Ok(done)
+    );
 }
 
 /// A composite checksum is the hash of the parts' values, with the number of parts.
@@ -1627,6 +1672,7 @@ fn template_complete(key: &str, upload: &str) -> name::Complete {
         file: None,
         default: None,
         deadline_ns: 0,
+        listing: [0; mantle_meta::record::LISTING],
     }
 }
 

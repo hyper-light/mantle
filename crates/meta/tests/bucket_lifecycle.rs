@@ -758,6 +758,7 @@ fn object() -> Version {
         headers: Vec::new(),
         retention: None,
         legal_hold: None,
+        listing: None,
     }
 }
 

@@ -612,16 +612,9 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
             }
             record::put_str(w, &c.etag)?;
             w.u64(c.size);
-            match &c.checksum {
-                None => w.u8(0),
-                Some(sum) => {
-                    w.u8(1);
-                    w.u8(sum.algorithm);
-                    w.u16(sum.parts);
-                    record::put_bytes(w, &sum.value)?;
-                }
-            }
+            put_checksum(w, c.checksum.as_ref())?;
             record::put_file(w, c.file);
+            w.bytes(&c.listing);
             put_default(w, c.default);
             w.u64(c.deadline_ns);
         }
@@ -809,15 +802,7 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
             }
             let etag = record::take_str(r)?;
             let size = r.u64()?;
-            let checksum = match r.u8()? {
-                0 => None,
-                1 => Some(Checksum {
-                    algorithm: r.u8()?,
-                    parts: r.u16()?,
-                    value: record::take_bytes(r)?,
-                }),
-                _ => return None,
-            };
+            let checksum = take_checksum(r)?;
             name::Command::Complete(name::Complete {
                 bucket,
                 incarnation,
@@ -831,6 +816,7 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
                 size,
                 checksum,
                 file: record::take_file(r)?,
+                listing: record::take_listing(r)?,
                 default: take_default(r)?,
                 deadline_ns: r.u64()?,
             })
@@ -1172,6 +1158,16 @@ fn put_name_outcome(w: &mut Writer, o: &name::Outcome) -> Result<(), RecordError
             w.u8(0);
             record::put_str(w, version)?;
         }
+        O::Completed {
+            version,
+            size,
+            checksum,
+        } => {
+            w.u8(37);
+            record::put_str(w, version)?;
+            w.u64(*size);
+            put_checksum(w, checksum.as_ref())?;
+        }
         O::Deleted { marker, version } => {
             w.u8(1);
             w.u8(u8::from(*marker));
@@ -1252,6 +1248,31 @@ fn put_name_outcome(w: &mut Writer, o: &name::Outcome) -> Result<(), RecordError
     Ok(())
 }
 
+fn put_checksum(w: &mut Writer, checksum: Option<&Checksum>) -> Result<(), RecordError> {
+    match checksum {
+        None => w.u8(0),
+        Some(sum) => {
+            w.u8(1);
+            w.u8(sum.algorithm);
+            w.u16(sum.parts);
+            record::put_bytes(w, &sum.value)?;
+        }
+    }
+    Ok(())
+}
+
+fn take_checksum(r: &mut Reader<'_>) -> Option<Option<Checksum>> {
+    Some(match r.u8()? {
+        0 => None,
+        1 => Some(Checksum {
+            algorithm: r.u8()?,
+            parts: r.u16()?,
+            value: record::take_bytes(r)?,
+        }),
+        _ => return None,
+    })
+}
+
 fn put_verdicts(w: &mut Writer, verdicts: &[Verdict]) -> Result<(), RecordError> {
     record::put_len(w, verdicts.len())?;
     for v in verdicts {
@@ -1283,6 +1304,11 @@ fn take_name_outcome(r: &mut Reader<'_>) -> Option<name::Outcome> {
     Some(match r.u8()? {
         0 => O::Put {
             version: record::take_str(r)?,
+        },
+        37 => O::Completed {
+            version: record::take_str(r)?,
+            size: r.u64()?,
+            checksum: take_checksum(r)?,
         },
         1 => {
             let marker = match r.u8()? {
@@ -1394,6 +1420,7 @@ pub fn largest_entry_bytes() -> Result<usize, RecordError> {
             value: vec![0; 64],
         }),
         file: Some(u128::MAX),
+        listing: [u8::MAX; record::LISTING],
         default: Some(DefaultRetention {
             mode: record::RetentionMode::Compliance,
             period: record::Period::Years(u32::MAX),
@@ -1467,6 +1494,7 @@ mod tests {
             file: Some(9),
             default: None,
             deadline_ns: 2,
+            listing: [0; crate::record::LISTING],
         };
         let entry = Entry {
             at_ns: 1,
@@ -1505,6 +1533,7 @@ mod tests {
                 until_ms: 1_893_456_000_000,
             }),
             legal_hold: Some(false),
+            listing: None,
         }
     }
 
@@ -1695,6 +1724,7 @@ mod tests {
                     period: Period::Days(1),
                 }),
                 deadline_ns: u64::MAX,
+                listing: [0; crate::record::LISTING],
             })),
             named(name::Command::Abort(name::Abort {
                 bucket: "b".into(),
@@ -1937,6 +1967,20 @@ mod tests {
             [
                 N::Put {
                     version: "v".into(),
+                },
+                N::Completed {
+                    version: "v".into(),
+                    size: u64::MAX,
+                    checksum: None,
+                },
+                N::Completed {
+                    version: "v".into(),
+                    size: 5,
+                    checksum: Some(Checksum {
+                        algorithm: 2,
+                        parts: 0,
+                        value: vec![1; 8],
+                    }),
                 },
                 N::Deleted {
                     marker: true,

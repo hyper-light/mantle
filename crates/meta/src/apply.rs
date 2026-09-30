@@ -128,6 +128,7 @@ mod tests {
                 headers: Vec::new(),
                 retention: None,
                 legal_hold: None,
+                listing: None,
             },
             default: None,
             deadline_ns: u64::MAX,

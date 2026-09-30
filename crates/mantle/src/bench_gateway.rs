@@ -286,6 +286,7 @@ fn commit() -> Commit {
             headers: Vec::new(),
             retention: None,
             legal_hold: None,
+            listing: None,
         },
         default: None,
         deadline_ns: 0,

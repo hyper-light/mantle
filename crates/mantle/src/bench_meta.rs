@@ -234,6 +234,7 @@ fn completion(parts: u16) -> Result<Duration, Error> {
         file: Some(u128::from(u16::MAX) + 1),
         default: None,
         deadline_ns: u64::MAX,
+        listing: [0; mantle_meta::record::LISTING],
     });
     let started = Instant::now();
     let done = name::apply(&mut m, index, &complete)?;
@@ -266,6 +267,7 @@ fn put(key: String) -> Command {
             headers: Vec::new(),
             retention: None,
             legal_hold: None,
+            listing: None,
         },
         default: None,
         deadline_ns: u64::MAX,

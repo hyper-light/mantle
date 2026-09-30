@@ -39,7 +39,13 @@ pub struct Version {
     /// Its legal hold: `None` if none was ever placed, which GetObjectLegalHold answers
     /// `NoSuchObjectLockConfiguration`, else on or off (18 §5).
     pub legal_hold: Option<bool>,
+    /// For a version a multipart upload made, the digest of the parts its completion listed
+    /// (`name::Complete::listing`), which a retry of the completion must list again.
+    pub listing: Option<[u8; LISTING]>,
 }
+
+/// Bytes of a completion's listing digest: a SHA-256 (FIPS 180-4).
+pub const LISTING: usize = 32;
 
 /// A retention's mode (18 §2.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -976,6 +982,13 @@ impl Version {
         put_str(&mut w, &self.owner)?;
         put_pairs(&mut w, &self.headers)?;
         put_retention(&mut w, self.retention);
+        match &self.listing {
+            None => w.u8(0),
+            Some(listing) => {
+                w.u8(1);
+                w.bytes(listing);
+            }
+        }
         Ok(finish(w))
     }
 
@@ -1005,6 +1018,11 @@ impl Version {
                     headers: take_pairs(&mut r)?,
                     retention: take_retention(&mut r, has_retention)?,
                     legal_hold,
+                    listing: match r.u8()? {
+                        0 => None,
+                        1 => Some(take_listing(&mut r)?),
+                        _ => return None,
+                    },
                 })
             })(),
             &r,
@@ -1187,6 +1205,10 @@ fn take_mode(r: &mut Reader<'_>) -> Option<RetentionMode> {
     }
 }
 
+pub(crate) fn take_listing(r: &mut Reader<'_>) -> Option<[u8; LISTING]> {
+    r.take(LISTING)?.try_into().ok()
+}
+
 pub(crate) fn put_retention(w: &mut Writer, retention: Option<Retention>) {
     if let Some(retention) = retention {
         w.u8(mode_code(retention.mode));
@@ -1317,6 +1339,7 @@ mod tests {
             ],
             retention: None,
             legal_hold: None,
+            listing: None,
         }
     }
 
@@ -1332,6 +1355,11 @@ mod tests {
             ..version()
         };
         assert_eq!(Version::decode(&marker.encode().unwrap()), Ok(marker));
+        let completed = Version {
+            listing: Some([7; LISTING]),
+            ..version()
+        };
+        assert_eq!(Version::decode(&completed.encode().unwrap()), Ok(completed));
         let u = Upload {
             initiated_ns: 5,
             owner: "o".into(),

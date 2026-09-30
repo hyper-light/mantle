@@ -431,6 +431,7 @@ mod tests {
             headers: Vec::new(),
             retention: None,
             legal_hold: None,
+            listing: None,
         }
     }
 
@@ -575,6 +576,7 @@ mod tests {
             file: Some(file),
             default: None,
             deadline_ns: u64::MAX,
+            listing: [0; crate::record::LISTING],
         }))
     }
 
@@ -650,7 +652,7 @@ mod tests {
         cell.file(301, &[Target::File(100), Target::File(200)]);
         assert!(matches!(
             complete(&mut cell, &upload, 301, None),
-            Outcome::Put { .. }
+            Outcome::Completed { .. }
         ));
         reclaim_all(&mut cell);
         assert_eq!(file::header(&cell.files, 301).unwrap(), None);
@@ -800,6 +802,7 @@ mod tests {
                 file: Some(root),
                 default: None,
                 deadline_ns: u64::MAX,
+                listing: [0; crate::record::LISTING],
             }));
             let committed = matches!(completed, Outcome::Put { .. });
             prop_assert!(committed, "{:?}", completed);

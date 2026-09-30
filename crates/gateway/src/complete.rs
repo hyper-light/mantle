@@ -12,9 +12,9 @@ use std::collections::{BTreeMap, VecDeque};
 use mantle_meta::file;
 use mantle_meta::key;
 use mantle_meta::name::{self, Listed, MAX_PART_NUMBER, MIN_PART};
-use mantle_meta::record::{self, Extent, Part, Referrer, Target, Upload};
+use mantle_meta::record::{self, Extent, LISTING, Part, Referrer, Target, Upload};
 use mantle_s3::checksum::{self, Algorithm, Checksum, Hasher};
-use mantle_s3::crypto::CryptoError;
+use mantle_s3::crypto::{self, CryptoError};
 
 /// A request's name among those in flight.
 pub type Id = u64;
@@ -117,6 +117,10 @@ pub struct Completion {
     /// The upload's parts read so far, by number, and the number the next page starts after.
     rows: BTreeMap<u16, Part>,
     after: u16,
+    /// How many of the parts listed are numbered at most `after`: those a page has passed.
+    /// Both lists ascend, so one walk along each matches them, rather than a search of the
+    /// list for every row, which for 10,000 parts was some 10^8 comparisons.
+    passed: usize,
     ready: VecDeque<(Id, Request)>,
     asked: BTreeMap<Id, Asked>,
     next_id: Id,
@@ -151,6 +155,10 @@ impl Completion {
         if listed.is_empty() || !ascending {
             return Err(CompleteError::InvalidPartOrder);
         }
+        let complete = name::Complete {
+            listing: listing(&listed)?,
+            ..complete
+        };
         let mut completion = Self {
             complete,
             listed,
@@ -159,6 +167,7 @@ impl Completion {
             upload: None,
             rows: BTreeMap::new(),
             after: 0,
+            passed: 0,
             ready: VecDeque::new(),
             asked: BTreeMap::new(),
             next_id: 0,
@@ -230,7 +239,7 @@ impl Completion {
     /// Asks for the next page of parts: as many as the parts listed after the last one read,
     /// which the parts not listed between them may push to later pages.
     fn next_page(&mut self) -> Result<(), CompleteError> {
-        let left = self.listed.iter().filter(|(n, _)| *n > self.after).count();
+        let left = self.listed.get(self.passed..).map_or(0, <[_]>::len);
         self.ask(
             Asked::Parts,
             Request::Parts {
@@ -250,8 +259,20 @@ impl Completion {
                 return Err(CompleteError::Mismatch);
             }
             self.after = number;
-            if self.listed.iter().any(|(n, _)| *n == number) {
+            while self
+                .listed
+                .get(self.passed)
+                .is_some_and(|(n, _)| *n < number)
+            {
+                self.passed = self.passed.checked_add(1).ok_or(CompleteError::Overflow)?;
+            }
+            if self
+                .listed
+                .get(self.passed)
+                .is_some_and(|(n, _)| *n == number)
+            {
                 self.rows.insert(number, part);
+                self.passed = self.passed.checked_add(1).ok_or(CompleteError::Overflow)?;
             }
             if number >= last_listed {
                 ended = true;
@@ -339,7 +360,8 @@ impl Completion {
     }
 
     /// A retry of a completion whose upload is gone: the Name range answers with the version
-    /// it made if its ETag is the one these parts make, or `NoSuchUpload`.
+    /// it made if the parts listed, their numbers and ETags as sent, are those it was made from
+    /// (`name::Complete::listing`), or `NoSuchUpload`.
     fn retry(&mut self) -> Result<(), CompleteError> {
         self.complete.etag = multipart_etag(self.listed.iter().map(|(_, e)| e.as_str()))?;
         self.complete.parts = Vec::new();
@@ -364,6 +386,16 @@ impl Completion {
     fn done(&mut self, outcome: name::Outcome) -> Result<(), CompleteError> {
         let version = match outcome {
             name::Outcome::Put { version } => version,
+            // A retry: the object is the version the first completion made.
+            name::Outcome::Completed {
+                version,
+                size,
+                checksum,
+            } => {
+                self.complete.size = size;
+                self.complete.checksum = checksum;
+                version
+            }
             name::Outcome::NoSuchUpload => return Err(CompleteError::NoSuchUpload),
             name::Outcome::InvalidPart => return Err(CompleteError::InvalidPart),
             name::Outcome::InvalidPartOrder => return Err(CompleteError::InvalidPartOrder),
@@ -379,6 +411,20 @@ impl Completion {
         }));
         Ok(())
     }
+}
+
+/// The SHA-256 of the parts a request lists, in its order: each part's number, its ETag's
+/// length and its ETag as sent, so that two lists share a digest only if they are the same
+/// list (FIPS 180-4's collision resistance).
+fn listing(listed: &[(u16, String)]) -> Result<[u8; LISTING], CompleteError> {
+    let mut h = crypto::Digest::new(&crypto::SHA256)?;
+    for (number, etag) in listed {
+        let len = u32::try_from(etag.len()).map_err(|_| CompleteError::Overflow)?;
+        h.update(&number.to_be_bytes())?;
+        h.update(&len.to_be_bytes())?;
+        h.update(etag.as_bytes())?;
+    }
+    Ok(h.finish_array()?)
 }
 
 /// The multipart ETag of parts with these ETags, each the hex MD5 a part's PUT made

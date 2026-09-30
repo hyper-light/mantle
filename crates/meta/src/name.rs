@@ -19,7 +19,7 @@ use crate::engine::{Row, Rows, Write};
 use crate::error::MetaError;
 use crate::key::{self, NULL_VERSION, NameRow};
 use crate::record::{
-    self, Checksum, DefaultRetention, Descriptor, Gate, GateState, Holder, Lineage, Part,
+    self, Checksum, DefaultRetention, Descriptor, Gate, GateState, Holder, LISTING, Lineage, Part,
     Retention, RetentionMode, Standing, Taken, Upload, Version,
 };
 
@@ -252,6 +252,11 @@ pub struct Complete {
     pub size: u64,
     pub checksum: Option<Checksum>,
     pub file: Option<u128>,
+    /// The SHA-256 of the parts the request lists, each its number and its ETag as sent, in
+    /// order (FIPS 180-4). The version keeps it, and a retry once the upload is gone, which
+    /// has no part rows to be checked against, is matched to the version by it, as strictly
+    /// as `parts` is checked against the rows.
+    pub listing: [u8; LISTING],
     /// The bucket's default retention, which the version takes when the upload named none.
     pub default: Option<DefaultRetention>,
     /// The object file's handover deadline, as the File range answered its write.
@@ -514,6 +519,13 @@ pub struct Hold {
 pub enum Outcome {
     /// A version was written; its ID.
     Put { version: String },
+    /// A retried completion found the version the completion made: its ID, and the size and
+    /// checksum the completion gave it.
+    Completed {
+        version: String,
+        size: u64,
+        checksum: Option<Checksum>,
+    },
     /// A delete was done: whether the version it made or removed is a delete marker, and
     /// that version's ID. An unversioned delete names none.
     Deleted {
@@ -1370,6 +1382,7 @@ fn delete<E: Rows>(engine: &E, d: &Delete) -> Result<(Outcome, Vec<Write>), Meta
                     headers: Vec::new(),
                     retention: None,
                     legal_hold: None,
+                    listing: None,
                 };
                 writes.push(Write::Put(
                     key::name(bucket, key, &NameRow::Version(order)),
@@ -1441,7 +1454,7 @@ fn complete<E: Rows>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), 
             None => None,
         };
         return Ok(match made {
-            Some((order, v)) if !v.marker && v.etag == c.etag => {
+            Some((order, v)) if !v.marker && v.etag == c.etag && v.listing == Some(c.listing) => {
                 // A retry the gateway made a file for again: the version holds the first.
                 let mut writes = Vec::new();
                 if let Some(file) = c.file
@@ -1451,8 +1464,10 @@ fn complete<E: Rows>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), 
                     writes.extend(release(now, &c.bucket, &c.key, file)?);
                 }
                 (
-                    Outcome::Put {
+                    Outcome::Completed {
                         version: id(v.null, order),
+                        size: v.size,
+                        checksum: v.checksum,
                     },
                     writes,
                 )
@@ -1522,6 +1537,7 @@ fn complete<E: Rows>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), 
                 headers: upload_row.headers,
                 retention: upload_row.retention,
                 legal_hold: upload_row.legal_hold,
+                listing: Some(c.listing),
             },
             default: c.default,
             deadline_ns: c.deadline_ns,
@@ -2301,6 +2317,7 @@ mod tests {
             headers: Vec::new(),
             retention: None,
             legal_hold: None,
+            listing: None,
         }
     }
 
@@ -2763,8 +2780,23 @@ mod tests {
                 file: Some(99),
                 default: None,
                 deadline_ns: u64::MAX,
+                listing: listing(parts),
             }))
         }
+    }
+
+    /// A digest of the parts listed, their numbers and ETags, standing in for the gateway's
+    /// SHA-256: distinct for the lists these tests send.
+    fn listing(parts: &[(u16, &str, u128)]) -> [u8; crate::record::LISTING] {
+        let mut text = Vec::new();
+        for (number, etag, _) in parts {
+            text.extend_from_slice(&number.to_be_bytes());
+            text.extend_from_slice(etag.as_bytes());
+            text.push(0);
+        }
+        let mut digest = [0; crate::record::LISTING];
+        digest[..4].copy_from_slice(&mantle_crc::crc32c(&text).to_be_bytes());
+        digest
     }
 
     /// A delete marker is owned as its delete says, as a version is as its put says, so a
@@ -2836,11 +2868,23 @@ mod tests {
                 .is_empty()
         );
         assert!(upload(&r.engine, "b", "k", &second).unwrap().is_some());
-        // A retried complete answers as the first did (05 §4.4).
+        // A retried complete answers with the version the first made, its size and checksum
+        // (05 §4.4), and only for the parts the first listed, numbered as it numbered them.
         assert_eq!(
             r.complete("k", &first, &[(1, "e1", 11), (2, "e2", 22)]),
-            done
+            Outcome::Completed {
+                version,
+                size: v.size,
+                checksum: v.checksum.clone(),
+            }
         );
+        for other in [
+            &[(1, "e1", 11), (3, "e2", 22)][..],
+            &[(2, "e1", 11), (3, "e2", 22)],
+            &[(1, "E1", 11), (2, "e2", 22)],
+        ] {
+            assert_eq!(r.complete("k", &first, other), Outcome::NoSuchUpload);
+        }
         assert_eq!(r.part("k", &first, 4, 1, 14), Outcome::NoSuchUpload);
     }
 
@@ -3705,6 +3749,7 @@ mod tests {
                             file: Some(file),
                             default: None,
                             deadline_ns: u64::MAX,
+                            listing: [0; crate::record::LISTING],
                         }));
                         if matches!(outcome, Outcome::Put { .. })
                             && versions_hold(&r.engine, file)

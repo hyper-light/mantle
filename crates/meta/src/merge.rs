@@ -85,19 +85,21 @@ pub struct Merger {
     lower: Descriptor,
     /// The higher range's ID.
     upper: u64,
-    /// Rows the merge may take, which bounds its entry.
+    /// Rows the merge may take, and their bytes, which bound its batch.
     max_rows: u64,
+    max_bytes: u64,
     phase: Phase,
     merged: Option<bool>,
 }
 
 impl Merger {
     /// A merge of `upper` into `lower`, the range just below it, as the driver read both.
-    pub fn new(lower: Descriptor, upper: Descriptor, max_rows: u64) -> Self {
+    pub fn new(lower: Descriptor, upper: Descriptor, max_rows: u64, max_bytes: u64) -> Self {
         Self {
             lower,
             upper: upper.id,
             max_rows,
+            max_bytes,
             phase: Phase::Freeze(upper),
             merged: None,
         }
@@ -106,12 +108,13 @@ impl Merger {
     /// The merge a range's lineage shows left behind by a driver that stopped: a range frozen
     /// for one, whose merge is judged from the lower range, or a range holding one it took,
     /// whose frozen range is ended if it has not.
-    pub fn resume(range: &Lineage, max_rows: u64) -> Result<Self, MergeError> {
+    pub fn resume(range: &Lineage, max_rows: u64, max_bytes: u64) -> Result<Self, MergeError> {
         match (range.standing, &range.into, range.taken) {
             (Standing::Frozen, Some(lower), _) => Ok(Self {
                 lower: lower.clone(),
                 upper: range.now.id,
                 max_rows,
+                max_bytes,
                 phase: Phase::Judge(range.now.clone()),
                 merged: None,
             }),
@@ -122,6 +125,7 @@ impl Merger {
                 },
                 upper: from,
                 max_rows,
+                max_bytes,
                 phase: Phase::Upper(range.now.clone()),
                 merged: Some(true),
             }),
@@ -159,6 +163,7 @@ impl Merger {
                     generation: self.lower.generation,
                     from: frozen.clone(),
                     max_rows: self.max_rows,
+                    max_bytes: self.max_bytes,
                 },
             },
             Phase::Judge(_) => Request::Lineage {
@@ -377,7 +382,7 @@ mod tests {
     #[test]
     fn a_merge_freezes_is_taken_ends_and_resolves() {
         let mut cell = Cell::new();
-        let mut m = Merger::new(cell.lineage(1).now, cell.lineage(2).now, 64);
+        let mut m = Merger::new(cell.lineage(1).now, cell.lineage(2).now, 64, u64::MAX);
         cell.drive(&mut m, 16);
         assert!(m.is_done());
         assert_eq!(m.merged(), Some(true));
@@ -392,10 +397,13 @@ mod tests {
     fn a_merge_resumes_from_either_range_after_any_step() {
         for stop in 0..5 {
             let mut cell = Cell::new();
-            let mut m = Merger::new(cell.lineage(1).now, cell.lineage(2).now, 64);
+            let mut m = Merger::new(cell.lineage(1).now, cell.lineage(2).now, 64, u64::MAX);
             cell.drive(&mut m, stop);
             let (upper, lower) = (cell.lineage(2), cell.lineage(1));
-            let resumed = [Merger::resume(&upper, 64), Merger::resume(&lower, 64)];
+            let resumed = [
+                Merger::resume(&upper, 64, u64::MAX),
+                Merger::resume(&lower, 64, u64::MAX),
+            ];
             let Some(mut r) = resumed.into_iter().find_map(Result::ok) else {
                 // Not begun, or done: nothing left to resume.
                 assert!(stop == 0 || m.is_done(), "stopped after {stop} steps");
@@ -413,7 +421,7 @@ mod tests {
     #[test]
     fn an_abandoned_merge_thaws_and_stays_untaken() {
         let mut cell = Cell::new();
-        let mut m = Merger::new(cell.lineage(1).now, cell.lineage(2).now, 64);
+        let mut m = Merger::new(cell.lineage(1).now, cell.lineage(2).now, 64, u64::MAX);
         cell.drive(&mut m, 1);
         let Some(Request::Merge {
             range,
@@ -437,7 +445,7 @@ mod tests {
         assert!(matches!(late, Answer::Name(name::Outcome::Moved(_))));
         assert_eq!(cell.lineage(1).now.hi, Some(key::route("b", "m")));
         assert_eq!(
-            Merger::resume(&cell.lineage(2), 64).err(),
+            Merger::resume(&cell.lineage(2), 64, u64::MAX).err(),
             Some(MergeError::NotMerging)
         );
     }

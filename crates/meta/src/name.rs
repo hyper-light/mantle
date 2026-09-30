@@ -349,15 +349,17 @@ pub struct Freeze {
 
 /// The lower range's decision on the merge its driver read it for at `generation`: it takes
 /// `from`, the frozen range as it froze, keeping its own gates, if it holds no merge not yet
-/// resolved, `from` begins where it ends, and `from` holds at most `max_rows` rows; otherwise
-/// it refuses. Either way its generation moves on, so the merge is decided once, and a command
+/// resolved, `from` begins where it ends, and `from` holds at most `max_rows` rows of at most
+/// `max_bytes` bytes; otherwise it refuses. Either way its generation moves on, so the merge is decided once, and a command
 /// for it that comes later, however late, is routed by a generation the range no longer has.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Merge {
     pub generation: u64,
     pub from: Descriptor,
-    /// Rows the merge may take, which bounds its entry.
+    /// Rows the merge may take, and their bytes, keys and values: together they bound the
+    /// batch the merge writes, since a count bounds no row's size (audit §5.2).
     pub max_rows: u64,
+    pub max_bytes: u64,
 }
 
 /// A driver abandons a merge not yet decided: the lower range, at the generation the merge
@@ -848,11 +850,13 @@ fn taking<E: Rows, F: Rows>(
     spans.push(key::released_all());
     let (gates, gates_end) = (vec![key::LOCAL, key::marker::GATE], key::GATES_END.to_vec());
     spans.push((gates, gates_end));
-    let mut rows: u64 = 0;
+    let (mut rows, mut bytes) = (0u64, 0u64);
     for (mut at, to) in spans {
         while let Some((k, v)) = from.next(&at, &to)? {
             rows = rows.checked_add(1).ok_or(MetaError::Corrupt)?;
-            if rows > m.max_rows {
+            let row = u64::try_from(k.len().saturating_add(v.len())).unwrap_or(u64::MAX);
+            bytes = bytes.saturating_add(row);
+            if rows > m.max_rows || bytes > m.max_bytes {
                 return Ok(None);
             }
             at = after(&k);
@@ -4119,6 +4123,7 @@ mod tests {
             generation: lower.generation,
             from: frozen.now.clone(),
             max_rows: 64,
+            max_bytes: u64::MAX,
         };
         // Only `merge`, with the frozen range's rows, takes it.
         assert_eq!(r.run(Command::Merge(m.clone())), Outcome::Invalid);
@@ -4215,6 +4220,7 @@ mod tests {
             generation: lower.generation,
             from: frozen.now,
             max_rows: 64,
+            max_bytes: u64::MAX,
         };
         r.index += 1;
         assert!(matches!(
@@ -4270,6 +4276,7 @@ mod tests {
             generation: lower.generation,
             from,
             max_rows: 64,
+            max_bytes: u64::MAX,
         };
         let thaw = Command::Thaw(Thaw {
             generation: lower.generation,
@@ -4293,6 +4300,26 @@ mod tests {
             generation: lower.generation,
             from,
             max_rows: 1,
+            max_bytes: u64::MAX,
+        };
+        r.index += 1;
+        assert!(matches!(
+            merge(&mut r.engine, r.index, &m, &c.engine).unwrap(),
+            Outcome::Refused(_)
+        ));
+        // As is one whose rows hold more bytes than it may take, however few they are
+        // (audit §5.2): the refused merge's range thaws and freezes again for it.
+        let thaw = Command::Thaw(Thaw {
+            generation: lower.generation,
+        });
+        assert!(matches!(c.run(thaw), Outcome::Thawed(_)));
+        let lower = lineage(&r.engine).unwrap().now;
+        let from = freeze(&mut c, &lower);
+        let m = Merge {
+            generation: lower.generation,
+            from,
+            max_rows: 64,
+            max_bytes: 1,
         };
         r.index += 1;
         assert!(matches!(
@@ -4306,6 +4333,7 @@ mod tests {
             generation: lower.generation,
             from: lineage(&c.engine).unwrap().now,
             max_rows: 64,
+            max_bytes: u64::MAX,
         };
         r.index += 1;
         assert_eq!(

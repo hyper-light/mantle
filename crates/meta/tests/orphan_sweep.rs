@@ -394,7 +394,7 @@ impl World {
     fn resume_merges(&mut self) {
         let ids: Vec<u64> = self.names.keys().copied().collect();
         for id in ids {
-            if let Ok(m) = Merger::resume(&self.lineage(id), MAX_ROWS) {
+            if let Ok(m) = Merger::resume(&self.lineage(id), MAX_ROWS, u64::MAX) {
                 self.mergers.push(m);
             }
         }
@@ -671,7 +671,8 @@ impl World {
                 let directory = self.directory();
                 let upper = directory[range % directory.len()].clone();
                 if let Some(lower) = directory.iter().find(|d| d.hi.as_ref() == Some(&upper.lo)) {
-                    self.mergers.push(Merger::new(lower.clone(), upper, rows));
+                    self.mergers
+                        .push(Merger::new(lower.clone(), upper, rows, u64::MAX));
                 }
             }
             Action::MergeStep(i) => {

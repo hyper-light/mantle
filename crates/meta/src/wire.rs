@@ -712,6 +712,7 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
             w.u64(m.generation);
             record::put_descriptor(w, &m.from)?;
             w.u64(m.max_rows);
+            w.u64(m.max_bytes);
         }
         name::Command::Abandon(a) => {
             w.u8(16);
@@ -872,6 +873,7 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
             generation: r.u64()?,
             from: record::take_descriptor(r)?,
             max_rows: r.u64()?,
+            max_bytes: r.u64()?,
         }),
         16 => name::Command::Abandon(name::Abandon {
             generation: r.u64()?,
@@ -1599,6 +1601,7 @@ mod tests {
                 generation: 6,
                 from: descriptor.clone(),
                 max_rows: 1 << 20,
+                max_bytes: u64::MAX,
             })),
             named(name::Command::Abandon(name::Abandon { generation: 7 })),
             named(name::Command::End(name::End {

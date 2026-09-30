@@ -129,14 +129,15 @@ pub struct Completion {
 
 impl Completion {
     /// Completes `complete`'s upload with the parts `listed`, as the request lists them, into
-    /// file `file`, held `handover_ns` for the Name range. What `complete` says of the object,
-    /// its parts' files, ETag, size, checksum, file and deadline, is replaced by what the
-    /// completion derives from the upload's rows.
+    /// file `file`, held `handover_ns` for the Name range, at the caller's time `now_ns`. What
+    /// `complete` says of the object, its parts' files, ETag, size, checksum, file, ID and
+    /// deadline, is replaced by what the completion derives from the upload's rows.
     pub fn new(
         complete: name::Complete,
         listed: Vec<(u16, String)>,
         file: u128,
         handover_ns: u64,
+        now_ns: u64,
     ) -> Result<Self, CompleteError> {
         // Refused before anything is asked, as the Name range would refuse it (05 §4.4). An
         // upload ID the Name range never made names no upload, and what a request sends goes
@@ -155,8 +156,15 @@ impl Completion {
         if listed.is_empty() || !ascending {
             return Err(CompleteError::InvalidPartOrder);
         }
+        // A completion with no file, of parts all empty, or a retry once the upload is gone, is
+        // named by the file's ID, which no file then takes, and held to the same handover from
+        // the caller's time now, so a copy of it is recognised (docs/design/metadata.md §2).
         let complete = name::Complete {
             listing: listing(&listed)?,
+            id: file,
+            deadline_ns: now_ns
+                .checked_add(handover_ns)
+                .ok_or(CompleteError::Overflow)?,
             ..complete
         };
         let mut completion = Self {

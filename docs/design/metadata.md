@@ -140,15 +140,21 @@ layers removes them, as Tectonic's does [01 §1.6].
     write's file. A completed upload's listed parts are not released: they are the object's
     extents. So no file is forgotten by the step that stops referencing it, and none is
     released while something still names it. A property test runs random histories of puts,
-    deletes, part uploads, completions and aborts under every versioning state and checks
-    after each step that every file handed to the range is held in exactly one place;
-    removing any one release, or releasing a listed part, fails it.
+    empty ones among them, deletes, part uploads, completions and aborts under every
+    versioning state, with copies of earlier writes delivered again as time passes their
+    deadlines and the collector reclaiming any queued row at any time, and checks after each
+    step that every file handed to the range is held in exactly one place, reclaimed files
+    counting as released, and that no copy of a write that made a version makes another;
+    removing any one release, releasing a listed part, removing a mark before its deadline,
+    or leaving a write with no file unmarked fails it.
     - *Reclaiming.* The collector takes the queue oldest first, once a file has been released
     longer than the grace period, and removes what it holds bottom up: each block's chunks
     from their volumes, then the block's rows; each part file it names given back to the Name
     range, which releases the part for reclaiming in its turn only if this file adopted it
-    (below); then the file, then its mark, at the Name range that holds its key by then, and
-    last the queue row. A reclaimer (`crates/meta/src/reclaim.rs`) names each read and
+    (below); then the file, then its mark, at the Name range that holds its key by then, once
+    that range's time has passed the deadline of the write that carried the file ("No mark
+    goes", below), and last the queue row. A row naming no file, a write with no file, has
+    only its mark to remove. A reclaimer (`crates/meta/src/reclaim.rs`) names each read and
     command and moves on with its answer, doing no I/O, as the coordinator does. Every step
     can be repeated, since a chunk or row already gone stays gone, a part given back twice is
     released once, and a removed file reads as one with no extents, so a collector that stops
@@ -185,14 +191,44 @@ layers removes them, as Tectonic's does [01 §1.6].
       the deadline, and a Name range whose time has passed it refuses the write and releases
       the file, as Spanner fails reads older than its version window (22 §6).
     - *The mark.* A Name range that takes a file within its deadline, referencing it or
-      releasing it for a refused write, marks it with how it took it: the version a PUT or
-      completion made (its order), a part, a part adopted by a composite, or refused. A
-      write that carries a file already marked is a copy of one the range applied, delivered
-      again outside the session that would have filtered it (replica.md §1): the range
-      answers it as the first was answered and neither takes nor releases the file, so no
-      file gets a second referrer and no refusal releases a file something holds. A copy
-      comes past its deadline as often as not, so the mark is read before the deadline is.
-      The mark is keyed by the object key the
+      releasing it for a refused write, marks it with how it took it, the version a PUT or
+      completion made (its order), a part, a part adopted by a composite, or refused, and
+      with the write's deadline. A write that carries a file already marked is a copy of one
+      the range applied, delivered again outside the session that would have filtered it
+      (replica.md §1): the range answers it as the first was answered and neither takes nor
+      releases the file, so no file gets a second referrer and no refusal releases a file
+      something holds. A copy comes past its deadline as often as not, so the mark is read
+      before the deadline is.
+    - *Writes with no file.* An empty object's PUT, and a completion of parts all empty,
+      carry no file, and a copy of one would make a second version the client never asked
+      for. Every PUT and completion carries an ID the gateway drew for the request, as it
+      draws a file's (gateway.md §2): a write with a file is named by the file, and one with
+      none by this ID, which the range marks exactly as it marks a file when the write makes
+      a version, as a Raft session answers a duplicate from the record of its first
+      execution rather than execute it again (06 §A1.8). Such a write has no File range to
+      give it a deadline, so the gateway sets one
+      a handover from its own time when it commits, the same bound a file's is held to, and
+      the range refuses it past that deadline as it refuses a late file. A write with no file
+      that the range refuses changed nothing and releases nothing, so it is not marked and a
+      copy of it is judged afresh. The version's mark has no file whose release would bring
+      the collector, so the range queues the write's ID in its queue of released files, as a
+      row naming no file, when it makes the version; the collector removes the mark and the
+      row, and nothing else.
+    - *No mark goes while a write carrying its file could still be applied.* A copy that
+      finds no mark is applied as a new write if the range's time has not passed its
+      deadline, so a mark removed before then would let a copy of a write whose file was
+      released and reclaimed take the file again, a version naming a file taken apart. The
+      grace period does not prevent this: it is a recovery-point policy chosen apart from
+      the handover time, and a file can be released a moment after it was taken, its write
+      refused or its version deleted. So the range removes a mark only once its time has
+      passed the deadline the mark records, judged by the time agreed through the log, as a
+      Raft session's expiry must be (06 §A1.8), and records that time as a write's, as the
+      sweep's check does, so a copy from a leader whose clock runs behind reads a time past
+      the deadline too. A reclaimer that asks sooner is answered with the deadline, keeps
+      the queue row, and asks again after it (`crates/meta/src/reclaim.rs`). A part carries
+      its write's deadline through adoption and give-back; the sweep's mark, written only for
+      a file past its deadline, has no value and reads as passed.
+    - *Keyed by the object key.* The mark is keyed by the object key the
       file was made for, in a space of its own that listings never read, so a split cuts a
       range's marks at the same key as its rows and a file's mark stays with the rows that
       may reference it. A mark keyed by the file alone would stay behind in the old range, and
@@ -215,19 +251,22 @@ layers removes them, as Tectonic's does [01 §1.6].
       sweep that stops while its request is in flight, so the order of steps alone cannot
       prevent this (audit B01). Like the reclaimer, the sweep names each read and command and
       does no I/O, and every step can be repeated.
-    - *What it costs.* A mark is a row with no value for a refused file, or a few bytes
-      naming the version, part or adopting composite, for every file the range holds and
-      every file it released and has not yet reclaimed. A release leaves the mark: the mark
-      once went with the release, and a copy of the write that came after found the file
-      unmarked and took it again, a released file named by a new version. A file handed over
-      past its deadline, and not marked, is released unmarked, since it may come after the
-      sweep settled the file; the file is then in the queue twice, and the reclaimer's second
-      pass finds it gone. So every mark is on a file a version, a part or a held composite
-      names, or on one released and waiting for the collector. The collector removes a mark
-      only after the grace period, three days, far past any handover deadline (below, as
-      Ceph's 120 s and HDFS's 60 s bound the same window), so a copy that comes after its mark went is past its deadline and
+    - *What it costs.* A mark is a row of a few bytes, the deadline and the version, part or
+      adopting composite, or with no value for a file the sweep released, for every file the
+      range holds, every file it released and has not yet reclaimed, and every version made
+      by a write with no file until the collector comes by for it. A release leaves the
+      mark: the mark once went with the release, and a copy of the write that came after
+      found the file unmarked and took it again, a released file named by a new version. A
+      file handed over past its deadline, and not marked, is released unmarked, since it may
+      come after the sweep settled the file; the file is then in the queue twice, and the
+      reclaimer's second pass finds it gone. So every mark is on a file a version, a part or
+      a held composite names, on one released and waiting for the collector, or on a write
+      with no file whose ID waits in the queue, and each goes with its row in the queue,
+      once past its deadline. A copy that comes after its mark went is past its deadline and
       refused, and the file it names, already reclaimed, is released a second time into a
-      queue where the reclaimer finds it gone.
+      queue where the reclaimer finds it gone; the gateway makes the request again as a new
+      attempt. The deadline the collector waits for is the handover time, which a file's rows
+      in the File range wait for already.
     - *The deadline's length* is the gateway's measured handover time: the per-step deadline
       times its retry budget, plus the clock offset between ranges, as Ceph's 120 s and HDFS's
       60 s bound the same window (22 §10.2). It bounds how long a leftover file waits, not

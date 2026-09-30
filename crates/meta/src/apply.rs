@@ -134,6 +134,7 @@ mod tests {
                 listing: None,
             },
             default: None,
+            id: 0,
             deadline_ns: u64::MAX,
         })))
     }

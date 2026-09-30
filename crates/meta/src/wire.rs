@@ -12,7 +12,7 @@ use crate::record::{
 };
 use crate::{block, bucket, file, name};
 
-const FORMAT: u8 = 2;
+const FORMAT: u8 = 3;
 
 /// Commands one entry carries at most: a session is named by the index of the entry that
 /// registered it and the registration's place in that entry.
@@ -574,6 +574,7 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
             put_option(w, p.ordered_ns);
             record::put_bytes(w, &p.version.encode()?)?;
             put_default(w, p.default);
+            w.u128(p.id);
             w.u64(p.deadline_ns);
         }
         name::Command::Delete(d) => {
@@ -616,6 +617,7 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
             record::put_file(w, c.file);
             w.bytes(&c.listing);
             put_default(w, c.default);
+            w.u128(c.id);
             w.u64(c.deadline_ns);
         }
         name::Command::Abort(a) => {
@@ -743,6 +745,7 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
                 ordered_ns: take_option(r)?,
                 version: Version::decode(&record::take_bytes(r)?).ok()?,
                 default: take_default(r)?,
+                id: r.u128()?,
                 deadline_ns: r.u64()?,
             })
         }
@@ -818,6 +821,7 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
                 file: record::take_file(r)?,
                 listing: record::take_listing(r)?,
                 default: take_default(r)?,
+                id: r.u128()?,
                 deadline_ns: r.u64()?,
             })
         }
@@ -903,7 +907,7 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
                     file: r.u128()?,
                 });
             }
-            name::Command::Unmark(name::Unmark { files })
+            name::Command::Unmark(name::Unmark { files, at_ns })
         }
         20 => name::Command::Disown(name::Disown {
             bucket: record::take_str(r)?,
@@ -1213,6 +1217,10 @@ fn put_name_outcome(w: &mut Writer, o: &name::Outcome) -> Result<(), RecordError
             put_verdicts(w, verdicts)?;
         }
         O::Unmarked => w.u8(26),
+        O::Awaits { deadline_ns } => {
+            w.u8(38);
+            w.u64(*deadline_ns);
+        }
         O::Disowned { released } => {
             w.u8(35);
             w.u8(u8::from(*released));
@@ -1356,6 +1364,9 @@ fn take_name_outcome(r: &mut Reader<'_>) -> Option<name::Outcome> {
         24 => O::Expired,
         25 => O::Checked(take_verdicts(r)?),
         26 => O::Unmarked,
+        38 => O::Awaits {
+            deadline_ns: r.u64()?,
+        },
         35 => O::Disowned {
             released: match r.u8()? {
                 0 => false,
@@ -1425,6 +1436,7 @@ pub fn largest_entry_bytes() -> Result<usize, RecordError> {
             mode: record::RetentionMode::Compliance,
             period: record::Period::Years(u32::MAX),
         }),
+        id: u128::MAX,
         deadline_ns: u64::MAX,
     };
     let write = file::Command::Write {
@@ -1493,6 +1505,7 @@ mod tests {
             checksum: None,
             file: Some(9),
             default: None,
+            id: 0,
             deadline_ns: 2,
             listing: [0; crate::record::LISTING],
         };
@@ -1656,6 +1669,7 @@ mod tests {
                     mode: RetentionMode::Governance,
                     period: Period::Days(30),
                 }),
+                id: 0,
                 deadline_ns: u64::MAX,
             })),
             named(name::Command::Delete(name::Delete {
@@ -1723,6 +1737,7 @@ mod tests {
                     mode: RetentionMode::Compliance,
                     period: Period::Days(1),
                 }),
+                id: 0,
                 deadline_ns: u64::MAX,
                 listing: [0; crate::record::LISTING],
             })),
@@ -1807,6 +1822,7 @@ mod tests {
                     key: "k".into(),
                     file: u128::MAX,
                 }],
+                at_ns,
             })),
             Command::File(file::Command::Write {
                 file: 3,
@@ -2020,6 +2036,7 @@ mod tests {
                 ]),
                 N::Checked(Vec::new()),
                 N::Unmarked,
+                N::Awaits { deadline_ns: 12 },
                 N::Disowned { released: true },
                 N::Disowned { released: false },
                 N::Moved(Box::new(lineage.clone())),

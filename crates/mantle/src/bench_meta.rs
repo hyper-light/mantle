@@ -233,6 +233,7 @@ fn completion(parts: u16) -> Result<Duration, Error> {
         checksum: None,
         file: Some(u128::from(u16::MAX) + 1),
         default: None,
+        id: 0,
         deadline_ns: u64::MAX,
         listing: [0; mantle_meta::record::LISTING],
     });
@@ -270,6 +271,7 @@ fn put(key: String) -> Command {
             listing: None,
         },
         default: None,
+        id: 0,
         deadline_ns: u64::MAX,
     })))
 }

@@ -481,6 +481,7 @@ impl World {
                             ..object()
                         },
                         default: None,
+                        id: 0,
                         deadline_ns: u64::MAX,
                     });
                     if let Some(name::Outcome::Put { .. }) = self.write(key, put) {

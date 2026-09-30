@@ -19,8 +19,8 @@ use crate::engine::{Row, Rows, Write};
 use crate::error::MetaError;
 use crate::key::{self, NULL_VERSION, NameRow};
 use crate::record::{
-    self, Checksum, DefaultRetention, Descriptor, Gate, GateState, Holder, LISTING, Lineage, Mark,
-    Part, Retention, RetentionMode, Standing, Taken, Upload, Version,
+    self, Checksum, DefaultRetention, Descriptor, Gate, GateState, Holder, How, LISTING, Lineage,
+    Mark, Part, Retention, RetentionMode, Standing, Taken, Upload, Version,
 };
 
 pub use crate::record::Verdict;
@@ -148,19 +148,35 @@ impl Command {
         }
     }
 
-    /// The file a write hands the range, which a version or part will reference if the write
-    /// goes ahead, with the key it is for, the time of the entry that carries it, and the
-    /// file's handover deadline.
+    /// What names a write that makes a version or a part: its file, which a version or part
+    /// will reference if the write goes ahead, or, for a write that carries none, the ID the
+    /// gateway drew for it; with the key it is for, the time of the entry that carries it, and
+    /// its handover deadline.
     fn carries(&self) -> Option<Carried<'_>> {
-        let (bucket, key, file, at_ns, deadline_ns) = match self {
-            Self::Put(c) => (&c.bucket, &c.key, c.version.file?, c.at_ns, c.deadline_ns),
-            Self::PutPart(c) => (&c.bucket, &c.key, c.part.file, c.at_ns, c.deadline_ns),
-            Self::Complete(c) => (&c.bucket, &c.key, c.file?, c.at_ns, c.deadline_ns),
+        let (bucket, key, file, id, at_ns, deadline_ns) = match self {
+            Self::Put(c) => (
+                &c.bucket,
+                &c.key,
+                c.version.file,
+                c.id,
+                c.at_ns,
+                c.deadline_ns,
+            ),
+            Self::PutPart(c) => (
+                &c.bucket,
+                &c.key,
+                Some(c.part.file),
+                c.part.file,
+                c.at_ns,
+                c.deadline_ns,
+            ),
+            Self::Complete(c) => (&c.bucket, &c.key, c.file, c.id, c.at_ns, c.deadline_ns),
             _ => return None,
         };
         Some(Carried {
             bucket,
             key,
+            id: file.unwrap_or(id),
             file,
             at_ns,
             deadline_ns,
@@ -168,11 +184,13 @@ impl Command {
     }
 }
 
-/// A file a write carries.
+/// A write that makes a version or a part: the ID its mark is under, and the file it carries,
+/// if any, whose ID that is.
 struct Carried<'a> {
     bucket: &'a str,
     key: &'a str,
-    file: u128,
+    id: u128,
+    file: Option<u128>,
     at_ns: u64,
     deadline_ns: u64,
 }
@@ -197,7 +215,14 @@ pub struct Put {
     /// The bucket's default retention, which a version whose request named no retention takes
     /// from its creation (18 §2.4).
     pub default: Option<DefaultRetention>,
-    /// The version's file's handover deadline, as the File range answered its write.
+    /// An ID the gateway drew for the request, as it draws a file's, which no other write
+    /// carries: a copy of the write carries it again. A write that carries a file is named by
+    /// the file; one that carries none, an empty object's, is marked under this, as a file is
+    /// (docs/design/metadata.md §2).
+    pub id: u128,
+    /// The write's handover deadline: its file's, as the File range answered its write, or for
+    /// a write with no file, the gateway's time at the request plus the handover it holds a
+    /// file for. A range whose time has passed it refuses the write.
     pub deadline_ns: u64,
 }
 
@@ -259,7 +284,10 @@ pub struct Complete {
     pub listing: [u8; LISTING],
     /// The bucket's default retention, which the version takes when the upload named none.
     pub default: Option<DefaultRetention>,
-    /// The object file's handover deadline, as the File range answered its write.
+    /// As a PUT's: the ID that names a completion with no file, of parts all empty.
+    pub id: u128,
+    /// As a PUT's: the object file's handover deadline, or the gateway's for a completion
+    /// with no file.
     pub deadline_ns: u64,
 }
 
@@ -430,12 +458,16 @@ pub struct Checked {
     pub deadline_ns: u64,
 }
 
-/// These files are reclaimed: their marks go. Only the collector removes a mark, for a
-/// file it took apart, which nothing references again; a mark the sweep removed on settling
-/// a file would read, to a sweep delayed past it, as a file never handed over (audit B01).
+/// These files are reclaimed: their marks go, each once the range's time has passed its
+/// deadline. Only the collector removes a mark, for a file it took apart, which nothing
+/// references again; a mark the sweep removed on settling a file would read, to a sweep
+/// delayed past it, as a file never handed over (audit B01). A mark removed before its
+/// deadline would let a copy of the write that carried the file take it as new, naming a
+/// file already taken apart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unmark {
     pub files: Vec<Marked>,
+    pub at_ns: u64,
 }
 
 /// The collector, reclaiming released composite file `owner`, gives back a part file it
@@ -588,8 +620,12 @@ pub enum Outcome {
     Expired,
     /// The sweep's files, each with the range's verdict, in the order it asked.
     Checked(Vec<Verdict>),
-    /// The marks of settled files went.
+    /// The marks of reclaimed files went.
     Unmarked,
+    /// A mark stays, and the others went: a copy of the write that carried its file could
+    /// still be applied until the range's time passes `deadline_ns`, the latest of those
+    /// kept, and the collector asks again then.
+    Awaits { deadline_ns: u64 },
     /// A part file given back: `released` if the composite adopted it and it is released now.
     Disowned { released: bool },
     /// The command was routed by a descriptor the range no longer matches: it took nothing,
@@ -631,12 +667,13 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
         engine.apply(index, &writes)?;
         return Ok(outcome);
     }
-    // A write carrying a file the range has marked is a copy of one it applied, delivered
-    // again after its session forgot it (docs/design/replica.md §1). Applied again it could
-    // make a second version of the file, or be refused and release a file a version or a
-    // composite holds: it is answered as the first was, and takes and releases nothing.
+    // A write carrying a file the range has marked, or a write with no file whose ID it has
+    // marked, is a copy of one it applied, delivered again after its session forgot it
+    // (docs/design/replica.md §1). Applied again it could make a second version, or be
+    // refused and release a file a version or a composite holds: it is answered as the first
+    // was, and takes and releases nothing.
     if let Some(c) = command.carries()
-        && let Some(mark) = engine.get(&key::mark(c.bucket, c.key, c.file))?
+        && let Some(mark) = engine.get(&key::mark(c.bucket, c.key, c.id))?
     {
         let outcome = copy(command, Mark::decode(&mark)?);
         engine.apply(index, &[])?;
@@ -668,13 +705,7 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
             vec![Write::Delete(key::released(r.released_ns, r.file))],
         ),
         Command::Check(c) => check(engine, c)?,
-        Command::Unmark(u) => (
-            Outcome::Unmarked,
-            u.files
-                .iter()
-                .map(|m| Write::Delete(key::mark(&m.bucket, &m.key, m.file)))
-                .collect(),
-        ),
+        Command::Unmark(u) => unmark(engine, u)?,
         Command::Disown(d) => disown(engine, d)?,
         Command::Split(s) => split(engine, s)?,
         Command::Freeze(f) => freeze(&lineage, f)?,
@@ -688,16 +719,22 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
     // this write alone. One refused within its deadline is marked too, for the sweep and for
     // a copy of the write. One past its deadline is not: it may come after the sweep settled
     // the file, and a mark would stay; if the sweep comes by after, it releases the file a
-    // second time, which the reclaimer finds gone (docs/design/metadata.md §2).
+    // second time, which the reclaimer finds gone (docs/design/metadata.md §2). A refused
+    // write with no file changed nothing, so a copy of it is judged afresh, as the first was,
+    // and nothing marks it.
     let mut writes = writes;
     if let Some(c) = command.carries()
+        && let Some(file) = c.file
         && !matches!(outcome, Outcome::Put { .. } | Outcome::PartWritten)
     {
         let now = clock::now(engine, c.at_ns)?;
-        writes.push(release(now, c.bucket, c.key, c.file)?);
+        writes.push(release(now, c.bucket, c.key, file)?);
         if !expired {
-            let mark = key::mark(c.bucket, c.key, c.file);
-            writes.push(Write::Put(mark, Mark::Refused.encode()));
+            let mark = Mark {
+                how: How::Refused,
+                deadline_ns: c.deadline_ns,
+            };
+            writes.push(Write::Put(key::mark(c.bucket, c.key, file), mark.encode()));
         }
     }
     engine.apply(index, &writes)?;
@@ -1031,24 +1068,60 @@ pub fn child<E: Rows>(engine: &E, s: &Split) -> Result<Option<Child>, MetaError>
 /// The file's mark stays until the collector has reclaimed it, so a copy of the write that
 /// handed it over is still recognised (docs/design/metadata.md §2).
 fn release(now_ns: u64, bucket: &str, key: &str, file: u128) -> Result<Write, MetaError> {
+    queue(now_ns, bucket, key, file, true)
+}
+
+/// The row that puts `id`, held under `key`, in the queue of released files at `now_ns`:
+/// a file's ID, or the ID of a write that carried none, whose mark alone the collector
+/// removes.
+fn queue(now_ns: u64, bucket: &str, key: &str, id: u128, file: bool) -> Result<Write, MetaError> {
     let holder = Holder {
         bucket: bucket.to_owned(),
         key: key.to_owned(),
+        file,
     };
-    Ok(Write::Put(key::released(now_ns, file), holder.encode()?))
+    Ok(Write::Put(key::released(now_ns, id), holder.encode()?))
 }
 
-/// The answer to a copy of a write whose file the range marked: what the write answered when
-/// it took the file. A write refused, or one that never came, released the file, and its copy
-/// is refused as a write past its deadline is, so the gateway writes the file again.
+/// The answer to a copy of a write the range marked: what the write answered when the range
+/// took it. A write refused, or one that never came, released its file, and its copy is
+/// refused as a write past its deadline is, so the gateway writes the file again.
 fn copy(command: &Command, mark: Mark) -> Outcome {
-    match (command, mark) {
-        (Command::Put(_) | Command::Complete(_), Mark::Version { order, null }) => Outcome::Put {
+    match (command, mark.how) {
+        (Command::Put(_) | Command::Complete(_), How::Version { order, null }) => Outcome::Put {
             version: id(null, order),
         },
-        (Command::PutPart(_), Mark::Part | Mark::Adopted { .. }) => Outcome::PartWritten,
+        (Command::PutPart(_), How::Part | How::Adopted { .. }) => Outcome::PartWritten,
         _ => Outcome::Expired,
     }
+}
+
+/// Removes the marks of reclaimed files, each only once the range's time has passed its
+/// deadline: until then a copy of the write that carried the file is applied as new if it
+/// finds no mark, and would name a file the collector took apart. The time is recorded as a
+/// write's, as the sweep's check records it, so a copy that comes after, even from a leader
+/// whose clock runs behind, reads a time past the deadline and is refused.
+fn unmark<E: Rows>(engine: &E, u: &Unmark) -> Result<(Outcome, Vec<Write>), MetaError> {
+    let (now, clock) = clock::tick(engine, u.at_ns)?;
+    let mut writes = vec![clock];
+    let mut kept = None;
+    for m in &u.files {
+        let mark = key::mark(&m.bucket, &m.key, m.file);
+        let Some(value) = engine.get(&mark)? else {
+            continue;
+        };
+        let deadline_ns = Mark::decode(&value)?.deadline_ns;
+        if now > deadline_ns {
+            writes.push(Write::Delete(mark));
+        } else {
+            kept = kept.max(Some(deadline_ns));
+        }
+    }
+    let outcome = match kept {
+        None => Outcome::Unmarked,
+        Some(deadline_ns) => Outcome::Awaits { deadline_ns },
+    };
+    Ok((outcome, writes))
 }
 
 /// The range's verdict on each file the sweep asks about, releasing and marking every file
@@ -1065,7 +1138,7 @@ fn check<E: Rows>(engine: &E, c: &Check) -> Result<(Outcome, Vec<Write>), MetaEr
             Verdict::Held
         } else if now > f.deadline_ns {
             writes.push(release(now, &f.bucket, &f.key, f.file)?);
-            writes.push(Write::Put(mark, Mark::Refused.encode()));
+            writes.push(Write::Put(mark, Mark::SWEPT.encode()));
             Verdict::Released
         } else {
             Verdict::Young
@@ -1285,11 +1358,17 @@ fn put<E: Rows>(engine: &E, p: &Put) -> Result<(Outcome, Vec<Write>), MetaError>
         key::name(bucket, key, &NameRow::Version(order)),
         written.encode()?,
     ));
-    if let Some(file) = version.file {
-        writes.push(Write::Put(
-            key::mark(bucket, key, file),
-            Mark::Version { order, null }.encode(),
-        ));
+    // The version's file is marked with it; a version with no file is marked under its
+    // write's ID, which the queue of released files holds for the collector to unmark once
+    // the deadline has passed, since no release of a file will.
+    let mark = Mark {
+        how: How::Version { order, null },
+        deadline_ns: p.deadline_ns,
+    };
+    let named = version.file.unwrap_or(p.id);
+    writes.push(Write::Put(key::mark(bucket, key, named), mark.encode()));
+    if version.file.is_none() {
+        writes.push(queue(time, bucket, key, p.id, false)?);
     }
     Ok((
         Outcome::Put {
@@ -1468,9 +1547,13 @@ fn put_part<E: Rows>(engine: &E, p: &PutPart) -> Result<(Outcome, Vec<Write>), M
         writes.push(release(now, &p.bucket, &p.key, replaced.file)?);
     }
     writes.push(Write::Put(row, p.part.encode()?));
+    let mark = Mark {
+        how: How::Part,
+        deadline_ns: p.deadline_ns,
+    };
     writes.push(Write::Put(
         key::mark(&p.bucket, &p.key, p.part.file),
-        Mark::Part.encode(),
+        mark.encode(),
     ));
     Ok((Outcome::PartWritten, writes))
 }
@@ -1561,6 +1644,7 @@ fn complete<E: Rows>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), 
                 listing: Some(c.listing),
             },
             default: c.default,
+            id: c.id,
             deadline_ns: c.deadline_ns,
         },
     )?;
@@ -1575,13 +1659,16 @@ fn complete<E: Rows>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), 
             engine, &c.bucket, &c.key, &c.upload, &listed, now,
         )?);
         // An empty part holds no byte of the object, and a file of parts names no empty
-        // extent, so it is given back with the upload rather than adopted.
+        // extent, so it is given back with the upload rather than adopted. An adopted part
+        // keeps its write's deadline, which bounds when its mark may go.
         for part in &c.parts {
             match c.file {
-                Some(by) if !empty.contains(&part.file) => writes.push(Write::Put(
-                    key::mark(&c.bucket, &c.key, part.file),
-                    Mark::Adopted { by }.encode(),
-                )),
+                Some(by) if !empty.contains(&part.file) => {
+                    let mark = key::mark(&c.bucket, &c.key, part.file);
+                    let held = engine.get(&mark)?.ok_or(MetaError::Corrupt)?;
+                    let adopted = Mark::decode(&held)?.with(How::Adopted { by });
+                    writes.push(Write::Put(mark, adopted.encode()));
+                }
                 _ => writes.push(release(now, &c.bucket, &c.key, part.file)?),
             }
         }
@@ -1593,18 +1680,18 @@ fn complete<E: Rows>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), 
 /// Its mark goes back to a part's, so a second give-back releases it no more.
 fn disown<E: Rows>(engine: &E, d: &Disown) -> Result<(Outcome, Vec<Write>), MetaError> {
     let mark = key::mark(&d.bucket, &d.key, d.file);
-    let adopted = match engine.get(&mark)? {
-        Some(value) => Mark::decode(&value)? == Mark::Adopted { by: d.owner },
-        None => false,
+    let held = match engine.get(&mark)? {
+        Some(value) => Mark::decode(&value)?,
+        None => return Ok((Outcome::Disowned { released: false }, Vec::new())),
     };
-    if !adopted {
+    if held.how != (How::Adopted { by: d.owner }) {
         return Ok((Outcome::Disowned { released: false }, Vec::new()));
     }
     let (now, clock) = clock::tick(engine, d.at_ns)?;
     let writes = vec![
         clock,
         release(now, &d.bucket, &d.key, d.file)?,
-        Write::Put(mark, Mark::Part.encode()),
+        Write::Put(mark, held.with(How::Part).encode()),
     ];
     Ok((Outcome::Disowned { released: true }, writes))
 }
@@ -2302,6 +2389,7 @@ mod tests {
                     ..object(etag)
                 },
                 default: None,
+                id: 0,
                 deadline_ns: u64::MAX,
             }))
         }
@@ -2553,6 +2641,7 @@ mod tests {
                 ordered_ns: Some(early),
                 version: object("upload"),
                 default: None,
+                id: 0,
                 deadline_ns: u64::MAX,
             }),
         )
@@ -2832,6 +2921,7 @@ mod tests {
                 checksum: None,
                 file: Some(file),
                 default: None,
+                id: 0,
                 deadline_ns: u64::MAX,
                 listing: listing(parts),
             }))
@@ -3022,7 +3112,10 @@ mod tests {
         );
         // Each attempt carried a file made for it; the fourth's composite adopted the part.
         let adopted = r.engine.get(&key::mark("b", "k", 21)).unwrap().unwrap();
-        assert_eq!(Mark::decode(&adopted), Ok(Mark::Adopted { by: 102 }));
+        assert_eq!(
+            Mark::decode(&adopted).map(|m| m.how),
+            Ok(How::Adopted { by: 102 })
+        );
     }
 
     /// The files in the released queue, as the collector would take them.
@@ -3165,6 +3258,7 @@ mod tests {
                     ..object("e")
                 },
                 default: None,
+                id: 0,
                 deadline_ns: u64::MAX,
             })
         };
@@ -3215,6 +3309,7 @@ mod tests {
                 ..object("e")
             },
             default: None,
+            id: 0,
             deadline_ns: u64::MAX,
         });
         let first = put_id(&r.put("k", "a", Versioning::Enabled));
@@ -3225,6 +3320,216 @@ mod tests {
         assert_eq!(naming(&r, "k", 6), 0, "{again:?} took a released file");
         assert_eq!(queued(&r).iter().filter(|f| **f == 6).count(), 1);
         assert_eq!(again, Outcome::Expired);
+    }
+
+    /// The collector reclaims a released file whenever its grace has passed, and a write's
+    /// handover deadline is the gateway's to choose: nothing orders the two. A write refused
+    /// and its file released, then reclaimed before the write's deadline, keeps its mark until
+    /// the range's time has passed the deadline, so a copy of the write that comes before then,
+    /// once what refused it has changed, is still refused rather than taken as new naming a
+    /// file taken apart. After the deadline the mark goes, and a copy is past its deadline even
+    /// from a leader whose clock runs behind, since the removal recorded its time.
+    #[test]
+    fn a_mark_outlives_its_write_s_deadline() {
+        let mut r = Range::new();
+        let deadline_ns = r.clock + 1_000;
+        let guarded = |at_ns: u64| {
+            Command::Put(Put {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: "k".into(),
+                versioning: Versioning::Enabled,
+                preconditions: Preconditions {
+                    if_match: None,
+                    if_none_match: Some(Match::Any),
+                },
+                at_ns,
+                ordered_ns: None,
+                version: Version {
+                    file: Some(6),
+                    ..object("e")
+                },
+                default: None,
+                id: 0,
+                deadline_ns,
+            })
+        };
+        let first = put_id(&r.put("k", "a", Versioning::Enabled));
+        r.clock += 10;
+        assert_eq!(r.run(guarded(r.clock)), Outcome::PreconditionFailed);
+        assert_eq!(queued(&r), [6]);
+        let unmark = |at_ns: u64| {
+            Command::Unmark(Unmark {
+                files: vec![Marked {
+                    bucket: "b".into(),
+                    key: "k".into(),
+                    file: 6,
+                }],
+                at_ns,
+            })
+        };
+        // Reclaimed before the deadline: the mark stays.
+        r.clock += 10;
+        let kept = r.run(unmark(r.clock));
+        let order = key::parse_version_id(&first).unwrap();
+        r.delete("k", Versioning::Enabled, Some(Named::Order(order)));
+        r.clock += 10;
+        let again = r.run(guarded(r.clock));
+        assert_eq!(naming(&r, "k", 6), 0, "{again:?} took a reclaimed file");
+        assert_eq!(again, Outcome::Expired);
+        assert_eq!(kept, Outcome::Awaits { deadline_ns });
+        // Past the deadline the mark goes, and no copy is taken after, however its leader's
+        // clock runs.
+        assert_eq!(r.run(unmark(deadline_ns + 1)), Outcome::Unmarked);
+        assert!(r.engine.get(&key::mark("b", "k", 6)).unwrap().is_none());
+        assert_eq!(r.run(guarded(deadline_ns - 1)), Outcome::Expired);
+        assert_eq!(naming(&r, "k", 6), 0);
+        // A part keeps its write's deadline through adoption and give-back.
+        let u = r.create("p");
+        r.clock += 10;
+        let part_deadline = r.clock + 1_000;
+        let part = Command::PutPart(PutPart {
+            bucket: "b".into(),
+            incarnation: 1,
+            key: "p".into(),
+            upload: u.clone(),
+            number: 1,
+            part: Part {
+                etag: "e1".into(),
+                size: MIN_PART,
+                checksum: None,
+                file: 21,
+                modified_ns: 0,
+            },
+            at_ns: r.clock,
+            deadline_ns: part_deadline,
+        });
+        assert_eq!(r.run(part), Outcome::PartWritten);
+        let composite = r.composite;
+        assert!(matches!(
+            r.complete("p", &u, &[(1, "e1", 21)]),
+            Outcome::Put { .. }
+        ));
+        let give_back = Command::Disown(Disown {
+            bucket: "b".into(),
+            key: "p".into(),
+            file: 21,
+            owner: composite,
+            at_ns: r.clock,
+        });
+        assert_eq!(r.run(give_back), Outcome::Disowned { released: true });
+        let unmark_part = Command::Unmark(Unmark {
+            files: vec![Marked {
+                bucket: "b".into(),
+                key: "p".into(),
+                file: 21,
+            }],
+            at_ns: r.clock,
+        });
+        assert_eq!(
+            r.run(unmark_part),
+            Outcome::Awaits {
+                deadline_ns: part_deadline
+            }
+        );
+    }
+
+    /// An empty object's PUT carries no file: its write is named by the ID the gateway drew
+    /// for it, marked as a file is, so a copy is answered with the version the first made and
+    /// makes no second, as is a copy of a completion of empty parts. The queue holds the ID,
+    /// naming no file, for the collector to remove the mark once the deadline has passed. A
+    /// refused write with no file changed nothing, and is neither marked nor queued.
+    #[test]
+    fn an_empty_put_sent_again_makes_one_version() {
+        let mut r = Range::new();
+        let deadline_ns = r.clock + 1_000;
+        let empty = |id: u128, at_ns: u64, none_match: bool| {
+            Command::Put(Put {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: "k".into(),
+                versioning: Versioning::Enabled,
+                preconditions: Preconditions {
+                    if_match: None,
+                    if_none_match: if none_match { Some(Match::Any) } else { None },
+                },
+                at_ns,
+                ordered_ns: None,
+                version: Version {
+                    size: 0,
+                    ..object("empty")
+                },
+                default: None,
+                id,
+                deadline_ns,
+            })
+        };
+        r.clock += 10;
+        let first = r.run(empty(500, r.clock, false));
+        r.clock += 10;
+        let again = r.run(empty(500, r.clock, false));
+        assert_eq!(again, first);
+        assert_eq!(r.versions("k").len(), 1, "{again:?}");
+        // Another request, with an ID of its own, is another version.
+        r.clock += 10;
+        assert_ne!(r.run(empty(501, r.clock, false)), first);
+        assert_eq!(r.versions("k").len(), 2);
+        // Refused, a write with no file leaves no mark and no row.
+        r.clock += 10;
+        assert_eq!(
+            r.run(empty(502, r.clock, true)),
+            Outcome::PreconditionFailed
+        );
+        assert!(r.engine.get(&key::mark("b", "k", 502)).unwrap().is_none());
+        let rows = released(&r.engine, u64::MAX, 10).unwrap();
+        let ids: Vec<(u128, bool)> = rows.iter().map(|q| (q.file, q.holder.file)).collect();
+        assert_eq!(ids, [(500, false), (501, false)]);
+        // A completion of empty parts, which the gateway writes no file for.
+        let u = r.create("j");
+        r.part("j", &u, 1, 0, 31);
+        r.clock += 10;
+        let complete = Command::Complete(Complete {
+            bucket: "b".into(),
+            incarnation: 1,
+            key: "j".into(),
+            upload: u.clone(),
+            versioning: Versioning::Enabled,
+            preconditions: Preconditions::default(),
+            at_ns: r.clock,
+            parts: vec![Listed {
+                number: 1,
+                etag: "e1".into(),
+                file: 31,
+            }],
+            etag: "whole-1".into(),
+            size: 0,
+            checksum: None,
+            file: None,
+            default: None,
+            id: 600,
+            deadline_ns,
+            listing: listing(&[(1, "e1", 31)]),
+        });
+        let completed = r.run(complete.clone());
+        assert!(matches!(completed, Outcome::Put { .. }), "{completed:?}");
+        assert_eq!(r.run(complete), completed);
+        assert_eq!(r.versions("j").len(), 1);
+        // The collector removes the mark only once the deadline has passed, and a copy after
+        // is past its deadline too.
+        let unmark = |at_ns: u64| {
+            Command::Unmark(Unmark {
+                files: vec![Marked {
+                    bucket: "b".into(),
+                    key: "k".into(),
+                    file: 500,
+                }],
+                at_ns,
+            })
+        };
+        assert_eq!(r.run(unmark(r.clock)), Outcome::Awaits { deadline_ns });
+        assert_eq!(r.run(unmark(deadline_ns + 1)), Outcome::Unmarked);
+        assert_eq!(r.run(empty(500, deadline_ns - 1, false)), Outcome::Expired);
+        assert_eq!(r.versions("k").len(), 2);
     }
 
     #[test]
@@ -3304,6 +3609,7 @@ mod tests {
                         ordered_ns: None,
                         version: object(&format!("e{i}")),
                         default: None,
+                        id: u128::from(i),
                         deadline_ns: u64::MAX,
                     })
                 }
@@ -3352,6 +3658,7 @@ mod tests {
             ordered_ns: None,
             version: object("x"),
             default: None,
+            id: 0,
             deadline_ns: u64::MAX,
         };
         assert_eq!(r.run(Command::Put(stale.clone())), Outcome::NoSuchBucket);
@@ -3554,6 +3861,7 @@ mod tests {
             default: Option<DefaultRetention>,
         ) -> String {
             self.clock = at_ms * MS;
+            let id = self.fresh();
             put_id(&self.run(Command::Put(Put {
                 bucket: "b".into(),
                 incarnation: 1,
@@ -3568,6 +3876,7 @@ mod tests {
                     ..object("e")
                 },
                 default,
+                id,
                 deadline_ns: u64::MAX,
             })))
         }
@@ -3820,11 +4129,18 @@ mod tests {
             key: u8,
             upload: u8,
         },
-        /// A write sent before, delivered again under a new session, within its deadline or
-        /// past it.
+        /// A write sent before, delivered again under a new session, as it was sent: within
+        /// its deadline or past it, as time has gone.
         Resend {
             pick: u8,
-            late: bool,
+        },
+        /// Time passes, half a handover.
+        Wait,
+        /// The collector reclaims a released file, or the mark of a write that carried none,
+        /// whatever its grace: its part files given back, its mark removed if the range lets
+        /// it, and then its queue row.
+        Reclaim {
+            pick: u8,
         },
     }
 
@@ -3862,8 +4178,23 @@ mod tests {
                     stale
                 }),
             (0u8..3, 0u8..3).prop_map(|(key, upload)| Step::Abort { key, upload }),
-            (any::<u8>(), any::<bool>()).prop_map(|(pick, late)| Step::Resend { pick, late }),
+            any::<u8>().prop_map(|pick| Step::Resend { pick }),
+            Just(Step::Wait),
+            any::<u8>().prop_map(|pick| Step::Reclaim { pick }),
         ]
+    }
+
+    /// Every version row of bucket "b".
+    fn version_rows(engine: &Model) -> Vec<Vec<u8>> {
+        let mut rows = Vec::new();
+        let (mut from, to) = key::bucket_span("b");
+        while let Some((k, _)) = engine.next(&from, &to).unwrap() {
+            if let Some((_, _, NameRow::Version(_))) = key::decode_name(&k) {
+                rows.push(k.clone());
+            }
+            from = after(&k);
+        }
+        rows
     }
 
     /// Every file of a version or a part in the range, and every released one.
@@ -3889,27 +4220,37 @@ mod tests {
     proptest::proptest! {
         /// Every file a write hands the range is held in exactly one place after every step:
         /// by a version, by a part, as an extent of a completed object's file that is held or
-        /// released, or in the released queue. No removal loses a file, and none is released
-        /// while something still references it (docs/design/metadata.md §2).
+        /// released, or released, in the queue or reclaimed. No removal loses a file, none is
+        /// released while something still references it, and none is referenced once
+        /// reclaimed, however soon the collector comes after a release and however late a copy
+        /// of the write that carried it (docs/design/metadata.md §2). A copy of a write that
+        /// made a version, an empty object's included, makes none.
         #[test]
         fn every_file_is_referenced_or_released_exactly_once(
-            steps in proptest::collection::vec(step(), 1..60),
+            steps in proptest::collection::vec(step(), 1..80),
         ) {
             use std::collections::{BTreeMap, BTreeSet};
+            const HANDOVER: u64 = 200;
             let mut r = Range::new();
             let mut next_file = 1000u128;
             let mut carried: BTreeSet<u128> = BTreeSet::new();
-            // A completed object's file and the part files it took as extents.
+            let mut reclaimed: BTreeSet<u128> = BTreeSet::new();
+            // What each write in `r.history` answered when first sent.
+            let mut answered: Vec<Outcome> = Vec::new();
+            // A completed object's file and the part files it took as extents, until its
+            // reclaimer gives them back.
             let mut adopted: BTreeMap<u128, Vec<u128>> = BTreeMap::new();
             let mut uploads: BTreeMap<(u8, u8), String> = BTreeMap::new();
             let versionings = [Versioning::Enabled, Versioning::Suspended, Versioning::Unversioned];
             for s in steps {
                 r.clock += 10;
+                let deadline_ns = r.clock + HANDOVER;
                 match s {
                     Step::Put { key, versioning, empty } => {
-                        let file = (!empty).then(|| { next_file += 1; next_file });
+                        next_file += 1;
+                        let file = if empty { None } else { Some(next_file) };
                         carried.extend(file);
-                        r.sent(Command::Put(Put {
+                        let outcome = r.sent(Command::Put(Put {
                             bucket: "b".into(),
                             incarnation: 1,
                             key: format!("k{key}"),
@@ -3919,8 +4260,10 @@ mod tests {
                             ordered_ns: None,
                             version: Version { file, ..object("e") },
                             default: None,
-                            deadline_ns: u64::MAX,
+                            id: next_file,
+                            deadline_ns,
                         }));
+                        answered.push(outcome);
                     }
                     Step::Delete { key, versioning, named } => {
                         let named = named.map(|n| match n {
@@ -3954,7 +4297,7 @@ mod tests {
                         let Some(id) = uploads.get(&(key, upload)).cloned() else { continue };
                         next_file += 1;
                         carried.insert(next_file);
-                        r.sent(Command::PutPart(PutPart {
+                        let outcome = r.sent(Command::PutPart(PutPart {
                             bucket: "b".into(),
                             incarnation: 1,
                             key: format!("k{key}"),
@@ -3968,8 +4311,9 @@ mod tests {
                                 modified_ns: 0,
                             },
                             at_ns: r.clock,
-                            deadline_ns: u64::MAX,
+                            deadline_ns,
                         }));
+                        answered.push(outcome);
                     }
                     Step::Complete { key, upload, mut parts, stale } => {
                         let Some(id) = uploads.get(&(key, upload)).cloned() else { continue };
@@ -4008,7 +4352,8 @@ mod tests {
                             checksum: None,
                             file: Some(file),
                             default: None,
-                            deadline_ns: u64::MAX,
+                            id: file,
+                            deadline_ns,
                             listing: [0; crate::record::LISTING],
                         }));
                         if matches!(outcome, Outcome::Put { .. })
@@ -4016,6 +4361,7 @@ mod tests {
                         {
                             adopted.insert(file, listed.iter().map(|l| l.file).collect());
                         }
+                        answered.push(outcome);
                     }
                     Step::Abort { key, upload } => {
                         let Some(id) = uploads.get(&(key, upload)).cloned() else { continue };
@@ -4027,19 +4373,57 @@ mod tests {
                             at_ns: r.clock,
                         }));
                     }
-                    Step::Resend { pick, late } => {
-                        let Some(mut command) = r.history.get(usize::from(pick) % r.history.len().max(1)).cloned() else { continue };
-                        let (at_ns, deadline_ns) = match &mut command {
-                            Command::Put(c) => (&mut c.at_ns, &mut c.deadline_ns),
-                            Command::PutPart(c) => (&mut c.at_ns, &mut c.deadline_ns),
-                            Command::Complete(c) => (&mut c.at_ns, &mut c.deadline_ns),
+                    Step::Resend { pick } => {
+                        let i = usize::from(pick) % r.history.len().max(1);
+                        let Some(mut command) = r.history.get(i).cloned() else { continue };
+                        match &mut command {
+                            Command::Put(c) => c.at_ns = r.clock,
+                            Command::PutPart(c) => c.at_ns = r.clock,
+                            Command::Complete(c) => c.at_ns = r.clock,
                             _ => continue,
-                        };
-                        *at_ns = r.clock;
-                        if late {
-                            *deadline_ns = 0;
                         }
-                        r.run(command);
+                        let before = version_rows(&r.engine);
+                        let outcome = r.run(command);
+                        // A copy of a write that made a version is answered with that version,
+                        // or refused once its mark has gone past its deadline, and makes none.
+                        if let Some(first @ Outcome::Put { .. }) = answered.get(i) {
+                            proptest::prop_assert!(
+                                outcome == *first || outcome == Outcome::Expired,
+                                "{:?} answered {:?}", first, outcome
+                            );
+                            proptest::prop_assert_eq!(&version_rows(&r.engine), &before);
+                        }
+                    }
+                    Step::Wait => r.clock += HANDOVER / 2,
+                    Step::Reclaim { pick } => {
+                        let queue = released(&r.engine, u64::MAX, usize::MAX).unwrap();
+                        let Some(row) = queue.get(usize::from(pick) % queue.len().max(1)).cloned() else { continue };
+                        for child in adopted.remove(&row.file).unwrap_or_default() {
+                            r.run(Command::Disown(Disown {
+                                bucket: row.holder.bucket.clone(),
+                                key: row.holder.key.clone(),
+                                file: child,
+                                owner: row.file,
+                                at_ns: r.clock,
+                            }));
+                        }
+                        let unmarked = r.run(Command::Unmark(Unmark {
+                            files: vec![Marked {
+                                bucket: row.holder.bucket.clone(),
+                                key: row.holder.key.clone(),
+                                file: row.file,
+                            }],
+                            at_ns: r.clock,
+                        }));
+                        if unmarked == Outcome::Unmarked {
+                            r.run(Command::Reclaim(Reclaim {
+                                released_ns: row.released_ns,
+                                file: row.file,
+                            }));
+                            if row.holder.file {
+                                reclaimed.insert(row.file);
+                            }
+                        }
                     }
                 }
                 let (versions, part_files, released) = files_held(&r.engine);
@@ -4049,11 +4433,15 @@ mod tests {
                     .flat_map(|(_, children)| children.iter().copied())
                     .collect();
                 for file in &carried {
-                    let places = [&versions, &part_files, &released, &children]
+                    let held = [&versions, &part_files, &children]
                         .iter()
                         .map(|held| held.iter().filter(|f| *f == file).count())
                         .sum::<usize>();
-                    proptest::prop_assert_eq!(places, 1, "file {} after {:?}", file, r.versions("k0"));
+                    let gone = usize::from(released.contains(file) || reclaimed.contains(file));
+                    proptest::prop_assert_eq!(
+                        held + gone, 1,
+                        "file {} after {:?}; reclaimed {}", file, r.versions("k0"), reclaimed.contains(file)
+                    );
                 }
             }
         }
@@ -4114,6 +4502,7 @@ mod tests {
                     ..object("e")
                 },
                 default: None,
+                id: 0,
                 deadline_ns,
             }))
         };
@@ -4170,7 +4559,7 @@ mod tests {
         // A handover of 7 after its release finds its deadline passed.
         assert_eq!(put(&mut r, "c", 7, 0), Outcome::Expired);
         // The collector removes the marks of the files it reclaimed.
-        let marks = |files: &[(&str, u128)]| {
+        let marks = |at_ns: u64, files: &[(&str, u128)]| {
             Command::Unmark(Unmark {
                 files: files
                     .iter()
@@ -4180,10 +4569,11 @@ mod tests {
                         file,
                     })
                     .collect(),
+                at_ns,
             })
         };
         assert_eq!(
-            r.run(marks(&[("b", 6), ("c", 7), ("d", 8)])),
+            r.run(marks(r.clock, &[("b", 6), ("c", 7), ("d", 8)])),
             Outcome::Unmarked
         );
         assert!(!marked(&r, "b", 6) && !marked(&r, "c", 7) && marked(&r, "a", 5));
@@ -4197,7 +4587,7 @@ mod tests {
         assert!(matches!(put(&mut r, "a", 5, in_time), Outcome::Put { .. }));
         assert_eq!(queue(&r).iter().filter(|f| **f == 5).count(), 1);
         assert!(r.versions("a").is_empty());
-        assert_eq!(r.run(marks(&[("a", 5)])), Outcome::Unmarked);
+        assert_eq!(r.run(marks(r.clock, &[("a", 5)])), Outcome::Unmarked);
         assert!(!marked(&r, "a", 5));
         // A sweep that released 9 and stopped before unmarking it: the reclaimer removes the
         // mark, routed by the key the queue row names, before the row.
@@ -4212,7 +4602,7 @@ mod tests {
             .find(|r| r.file == 9)
             .unwrap();
         assert_eq!(row.holder.key, "e");
-        assert_eq!(r.run(marks(&[("e", 9)])), Outcome::Unmarked);
+        assert_eq!(r.run(marks(r.clock, &[("e", 9)])), Outcome::Unmarked);
         assert!(!marked(&r, "e", 9));
     }
 
@@ -4248,6 +4638,7 @@ mod tests {
                 ..object("e")
             },
             default: None,
+            id: 0,
             deadline_ns,
         });
         assert_eq!(r.run(put), Outcome::Expired);
@@ -4459,6 +4850,7 @@ mod tests {
                 ..object("e")
             },
             default: None,
+            id: 0,
             deadline_ns,
         });
         assert_eq!(c.run(put), Outcome::Expired);
@@ -4502,6 +4894,7 @@ mod tests {
                     ..object("e")
                 },
                 default: None,
+                id: 0,
                 deadline_ns: u64::MAX,
             }))
         };
@@ -4653,6 +5046,7 @@ mod tests {
                 ..object("e")
             },
             default: None,
+            id: 0,
             deadline_ns,
         });
         assert_eq!(r.run(put), Outcome::Expired);

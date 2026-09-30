@@ -911,12 +911,22 @@ impl Put {
     }
 
     /// Commits the version or part, with the file's handover deadline, or with no file for an
-    /// empty object.
+    /// empty object. An empty object's write is named by the file ID drawn for the PUT, which
+    /// no file takes, so a copy of it is recognised as a file's would be, and is held to a
+    /// deadline of the same handover from the caller's time now (docs/design/metadata.md §2).
     fn commit(&mut self, deadline_ns: Option<u64>) -> Result<(), PutError> {
         let etag = self.etag.clone().ok_or(PutError::Over)?;
         let command = match (&self.commit, deadline_ns) {
             (Commit::Object(p), deadline_ns) => {
                 let mut p = p.clone();
+                p.id = self.file;
+                p.deadline_ns = match deadline_ns {
+                    Some(deadline_ns) => deadline_ns,
+                    None => self
+                        .now_ns
+                        .checked_add(self.handover_ns)
+                        .ok_or(PutError::Overflow)?,
+                };
                 p.version.file = deadline_ns.map(|_| self.file);
                 p.version.size = self.body.length;
                 p.version.etag = etag;
@@ -925,7 +935,6 @@ impl Put {
                     parts: 0,
                     value: c.bytes.clone(),
                 });
-                p.deadline_ns = deadline_ns.unwrap_or(p.deadline_ns);
                 name::Command::Put(p)
             }
             (Commit::Part(p), Some(deadline_ns)) => {

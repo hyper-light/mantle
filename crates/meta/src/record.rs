@@ -4,7 +4,7 @@
 use mantle_codec::{Reader, Writer};
 
 /// Values written by this code.
-const FORMAT: u8 = 3;
+const FORMAT: u8 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RecordError {
@@ -376,15 +376,30 @@ pub struct Taken {
 pub struct Holder {
     pub bucket: String,
     pub key: String,
+    /// Whether the row's ID names a file. A version made by a write that carried none, an
+    /// empty object's, is queued by its write's ID alone, so the collector removes its mark
+    /// and has no file to take apart.
+    pub file: bool,
 }
 
-/// A file's mark: the Name range took the file, and how. A file ID is used by one write
-/// alone, so a write carrying a marked file is a copy of one the range already applied,
-/// delivered again after its session forgot it (docs/design/replica.md §1): it is answered as
-/// the first was, and neither takes the file again nor releases it. The mark stays until the
-/// collector reclaims the file, whatever references it by then.
+/// A write's mark: the Name range took the write's file, or the write itself when it carried
+/// none, and how, and until when a copy of the write could still be applied. A file ID, or a
+/// write's own ID, is used by one write alone, so a write carrying a marked ID is a copy of
+/// one the range already applied, delivered again after its session forgot it
+/// (docs/design/replica.md §1): it is answered as the first was, and neither takes the file
+/// again nor releases it. The mark stays until the collector reclaims the file, and never
+/// goes before the range's time has passed `deadline_ns`, after which a copy is refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mark {
+pub struct Mark {
+    pub how: How,
+    /// The write's handover deadline, as it carried it. A copy of the write is applied as a
+    /// new write only while the range's time has not passed it.
+    pub deadline_ns: u64,
+}
+
+/// How the Name range took a write's file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum How {
     /// No write took it: the one that carried it was refused, or none came by its deadline.
     /// The range released it then.
     Refused,
@@ -399,44 +414,66 @@ pub enum Mark {
 }
 
 impl Mark {
-    /// A refused file's mark has no value, as the sweep writes it for every file it releases.
+    /// The mark the sweep writes for every file it releases, never handed over and past its
+    /// deadline at the range's time: it has no value, and reads as a deadline already passed.
+    pub const SWEPT: Self = Self {
+        how: How::Refused,
+        deadline_ns: 0,
+    };
+
     pub fn encode(&self) -> Vec<u8> {
+        if *self == Self::SWEPT {
+            return Vec::new();
+        }
         let mut w = start();
-        match *self {
-            Self::Refused => return Vec::new(),
-            Self::Version { order, null } => {
+        match self.how {
+            How::Version { order, null } => {
                 w.u8(0);
                 w.u64(order);
                 w.u8(u8::from(null));
             }
-            Self::Part => w.u8(1),
-            Self::Adopted { by } => {
+            How::Part => w.u8(1),
+            How::Adopted { by } => {
                 w.u8(2);
                 w.u128(by);
             }
+            How::Refused => w.u8(3),
         }
+        w.u64(self.deadline_ns);
         finish(w)
     }
 
     pub fn decode(mark: &[u8]) -> Result<Self, RecordError> {
         if mark.is_empty() {
-            return Ok(Self::Refused);
+            return Ok(Self::SWEPT);
         }
         let mut r = open(mark, "mark")?;
-        let decoded_mark = (|| match r.u8()? {
-            0 => Some(Self::Version {
-                order: r.u64()?,
-                null: match r.u8()? {
-                    0 => false,
-                    1 => true,
-                    _ => return None,
+        let decoded_mark = (|| {
+            let how = match r.u8()? {
+                0 => How::Version {
+                    order: r.u64()?,
+                    null: match r.u8()? {
+                        0 => false,
+                        1 => true,
+                        _ => return None,
+                    },
                 },
-            }),
-            1 => Some(Self::Part),
-            2 => Some(Self::Adopted { by: r.u128()? }),
-            _ => None,
+                1 => How::Part,
+                2 => How::Adopted { by: r.u128()? },
+                3 => How::Refused,
+                _ => return None,
+            };
+            Some(Self {
+                how,
+                deadline_ns: r.u64()?,
+            })
         })();
         decoded(decoded_mark, &r, "mark")
+    }
+
+    /// The same deadline, taken another way: a part adopted, or given back.
+    pub fn with(self, how: How) -> Self {
+        Self { how, ..self }
     }
 }
 
@@ -718,6 +755,7 @@ impl Holder {
         let mut w = start();
         put_str(&mut w, &self.bucket)?;
         put_str(&mut w, &self.key)?;
+        w.u8(u8::from(self.file));
         Ok(finish(w))
     }
 
@@ -727,6 +765,11 @@ impl Holder {
             Some(Self {
                 bucket: take_str(&mut r)?,
                 key: take_str(&mut r)?,
+                file: match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                },
             })
         })();
         decoded(holder, &r, "holder")
@@ -1512,23 +1555,34 @@ mod tests {
         );
     }
 
-    /// Every mark decodes as written, a refused file's with no value, and a mark whose
-    /// kind or flag no writer makes is corrupt.
+    /// Every mark decodes as written with its deadline, the sweep's with no value, and a mark
+    /// whose kind or flag no writer makes is corrupt.
     #[test]
     fn marks_round_trip() {
-        for mark in [
-            Mark::Refused,
-            Mark::Version {
+        for how in [
+            How::Refused,
+            How::Version {
                 order: 7,
                 null: true,
             },
-            Mark::Part,
-            Mark::Adopted { by: 9 },
+            How::Part,
+            How::Adopted { by: 9 },
         ] {
-            assert_eq!(Mark::decode(&mark.encode()), Ok(mark));
+            for deadline_ns in [0, 11, u64::MAX] {
+                let mark = Mark { how, deadline_ns };
+                assert_eq!(Mark::decode(&mark.encode()), Ok(mark));
+            }
         }
-        assert!(Mark::Refused.encode().is_empty());
-        for body in [&[3][..], &[0, 7, 0, 0, 0, 0, 0, 0, 0, 2]] {
+        assert!(Mark::SWEPT.encode().is_empty());
+        let refused = Mark {
+            how: How::Refused,
+            deadline_ns: 5,
+        };
+        assert!(!refused.encode().is_empty(), "a refusal's deadline is kept");
+        for body in [
+            &[4, 0, 0, 0, 0, 0, 0, 0, 0][..],
+            &[0, 7, 0, 0, 0, 0, 0, 0, 0, 2],
+        ] {
             let mut w = start();
             for b in body {
                 w.u8(*b);

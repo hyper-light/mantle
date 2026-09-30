@@ -48,7 +48,8 @@ by plaintext, the part holding any byte is one seek away, where stored lengths, 
 tag or more longer, would place the tail of a 10,000-part object only after reading every
 part before it (audit §16.7). An empty object is its version alone, with no file, as the
 version row allows; a part row names a file, so an empty part has one, of one block holding
-its one empty segment, sealed.
+its one empty segment, sealed. An empty object's write still carries the file ID the PUT
+drew, which no file takes, as its own ID (§2).
 
 ## 2. Writing an object
 
@@ -76,7 +77,11 @@ point:
    the key wrapped, the object key it is for, and a deadline no later than its blocks'
    earliest.
 6. **The version is committed** in the Name range, carrying the file and its deadline.
-   Preconditions, versioning and Object Lock are judged there (metadata.md §2).
+   Preconditions, versioning and Object Lock are judged there (metadata.md §2). An empty
+   object has no file and no File range to give it a deadline: its write carries the file ID
+   drawn in step 1 as its own ID, and a deadline of the same handover time from the gateway's
+   clock when it commits, so the Name range recognises a copy of it as it would a file's
+   (metadata.md §2, "The mark").
 
 **A chunk refused** by its volume, busy, full, failed or unreachable, goes to another volume the
 placement offers that holds none of the block's chunks. When none is left, the PUT fails with
@@ -159,11 +164,18 @@ rows, reports as the first completion did.
 
 A Name command whose session expired before it was answered has an unknown outcome
 (replica.md §1, 06 §A1.8): the gateway registers anew and re-sends it unchanged, with the
-same file. The range recognises the file it already took and answers as it answered the
-first delivery, a PUT or completion with its version's ID and a part with `PartWritten`, or
-`Expired` when the first was refused and its file released, after which the gateway writes a
-new file and makes the request again as a new attempt. A copy never takes or releases the
-file, so no re-send can give a file a second referrer or release one a version holds.
+same file and the same ID. The range recognises the file it already took, or for a write
+with no file, an empty object's or a completion of empty parts, the ID, and answers as it
+answered the first delivery, a PUT or completion with its version's ID and a part with
+`PartWritten`, or `Expired` when the first was refused and its file released, after which
+the gateway writes a new file and makes the request again as a new attempt. A copy never
+takes or releases the file, so no re-send can give a file a second referrer, release one a
+version holds, or make a second version of one request. A write with no file that was
+refused changed nothing, so its copy is judged afresh. A copy that comes after its write's
+deadline, once the range has let the mark go, is refused `Expired` like any late write
+(metadata.md §2). Every Completion carries its file's ID as its own and a deadline a
+handover from the gateway's time, which the File range's deadline replaces when it writes
+the file of parts.
 
 ## 3. Reading an object
 

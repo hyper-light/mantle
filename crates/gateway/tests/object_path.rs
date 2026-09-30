@@ -439,6 +439,7 @@ fn object(key: &str) -> Commit {
             listing: None,
         },
         default: None,
+        id: 0,
         deadline_ns: 0,
     })
 }
@@ -945,6 +946,64 @@ fn an_empty_object_has_no_file_and_an_empty_part_has_one() {
     assert!(cell.read_file(21, 0, &wrapping).is_empty());
 }
 
+/// An empty object's write carries no file, so the PUT names it by the file ID it drew and
+/// holds it to a handover from its time. Delivered again, as a gateway re-sends a write whose
+/// session expired (docs/design/gateway.md §2), it is answered with the version the first
+/// made, and makes no second one.
+#[test]
+fn an_empty_object_sent_again_makes_one_version() {
+    let mut cell = Cell::new(3);
+    let wrapping = WrappingKey::generate().unwrap();
+    let layout = Layout::new(Scheme::Copies(3)).unwrap();
+    let Commit::Object(mut versioned) = object("e") else {
+        panic!("not an object")
+    };
+    versioned.versioning = Versioning::Enabled;
+    let asked_at = cell.clock;
+    let mut put = new_put(
+        &cell,
+        Commit::Object(versioned),
+        0,
+        layout,
+        keys(20, &wrapping),
+    );
+    let mut sent = None;
+    let stored = run(
+        &mut cell,
+        &mut put,
+        &[],
+        &FAST,
+        &Expected::default(),
+        |_, r| {
+            if let Request::Name(command) = r {
+                sent = Some(command.clone());
+            }
+        },
+    )
+    .unwrap();
+    let Some(sent) = sent else {
+        panic!("no Name write")
+    };
+    let name::Command::Put(p) = sent.as_ref() else {
+        panic!("{sent:?}")
+    };
+    assert_eq!((p.id, p.version.file), (20, None));
+    assert!(p.deadline_ns >= asked_at + HANDOVER && p.deadline_ns <= cell.clock + HANDOVER);
+    let again = cell.name(*sent.clone());
+    assert_eq!(
+        again,
+        name::Outcome::Put {
+            version: stored.version.clone().unwrap()
+        }
+    );
+    let (order, _) = name::current(&cell.names, BUCKET, "e").unwrap().unwrap();
+    assert_eq!(
+        Some(mantle_meta::key::version_id(order)),
+        stored.version,
+        "the copy made a version of its own"
+    );
+}
+
 /// The body is held to its declared length and to the digests the request sent; a PUT that
 /// failed takes nothing more.
 #[test]
@@ -1427,10 +1486,11 @@ fn complete_upload(
         checksum: None,
         file: None,
         default: None,
+        id: 0,
         deadline_ns: 0,
         listing: [0; mantle_meta::record::LISTING],
     };
-    let mut completion = Completion::new(template, listed, file, HANDOVER)?;
+    let mut completion = Completion::new(template, listed, file, HANDOVER, cell.clock)?;
     loop {
         if let Some(outcome) = completion.outcome() {
             return outcome.clone();
@@ -1589,7 +1649,8 @@ fn a_completion_is_held_to_its_parts() {
             },
             listed(&[2, 1]),
             700,
-            HANDOVER
+            HANDOVER,
+            cell.clock,
         ),
         Err(CompleteError::InvalidPartOrder)
     ));
@@ -1608,6 +1669,7 @@ fn a_completion_is_held_to_its_parts() {
             parts,
             700,
             HANDOVER,
+            cell.clock,
         );
         assert!(
             matches!(
@@ -1671,6 +1733,7 @@ fn template_complete(key: &str, upload: &str) -> name::Complete {
         checksum: None,
         file: None,
         default: None,
+        id: 0,
         deadline_ns: 0,
         listing: [0; mantle_meta::record::LISTING],
     }

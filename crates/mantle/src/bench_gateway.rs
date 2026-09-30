@@ -289,6 +289,8 @@ fn commit() -> Commit {
             listing: None,
         },
         default: None,
+        // Set per request, as the gateway draws it.
+        id: 0,
         deadline_ns: 0,
     })
 }

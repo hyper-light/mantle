@@ -996,6 +996,8 @@ fn put(key: &str, etag: &str, file: u128) -> Command {
             listing: None,
         },
         default: None,
+        // The write carries its file, which names it.
+        id: 0,
         deadline_ns: u64::MAX,
     })))
 }

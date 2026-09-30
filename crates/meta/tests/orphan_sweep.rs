@@ -797,6 +797,7 @@ impl World {
                 listing: None,
             },
             default: None,
+            id: 0,
             deadline_ns,
         });
         let late =
@@ -1053,6 +1054,7 @@ impl World {
             checksum: None,
             file: Some(composite),
             default: None,
+            id: 0,
             deadline_ns,
             listing: [0; mantle_meta::record::LISTING],
         });

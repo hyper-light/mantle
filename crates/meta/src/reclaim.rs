@@ -7,7 +7,12 @@
 //! itself, as the coordinator does. Every step can be repeated: a chunk or a row already gone
 //! stays gone, a part given back twice is released once, and a file already removed reads as
 //! one with no extents. So a collector that stops part way starts again from the queue row,
-//! which goes last.
+//! which goes last. A row that names no file, queued for the mark of a write that carried
+//! none, has only its mark to remove.
+//!
+//! A mark goes only once the Name range's time has passed its write's deadline, since a copy
+//! of the write that finds no mark before then is applied as new: the range keeps a mark
+//! until then, and the reclaimer asks again once that time has come ([`Reclaimer::after_ns`]).
 
 use std::collections::VecDeque;
 
@@ -34,7 +39,7 @@ pub enum Request {
     /// which the upload or another composite holds (audit B02).
     Disown(name::Disown),
     /// Removing the file's mark, as `name::Command::Unmark`, at the Name range that holds its
-    /// key now.
+    /// key now, once its time is past [`Reclaimer::after_ns`].
     Unmark(name::Unmark),
     /// Dropping the file's row from the queue of the Name range that released it, as
     /// `name::Command::Reclaim`.
@@ -90,12 +95,20 @@ pub struct Reclaimer {
     chunks: Vec<ChunkPlace>,
     /// Extents one read returns at most, which bounds what the reclaimer holds.
     budget: usize,
+    /// The deadline of a mark the Name range kept.
+    after_ns: Option<u64>,
     phase: Phase,
 }
 
 impl Reclaimer {
-    /// The reclamation of a released file ([`name::released`]).
+    /// The reclamation of a released file ([`name::released`]), or of the mark of a write
+    /// that carried none.
     pub fn new(released: name::Released, budget: usize) -> Self {
+        let phase = if released.holder.file {
+            Phase::Next
+        } else {
+            Phase::Unmark
+        };
         Self {
             released_ns: released.released_ns,
             file: released.file,
@@ -105,12 +118,19 @@ impl Reclaimer {
             pending: VecDeque::new(),
             chunks: Vec::new(),
             budget: budget.max(1),
-            phase: Phase::Next,
+            after_ns: None,
+            phase,
         }
     }
 
     pub fn is_done(&self) -> bool {
         self.phase == Phase::Done
+    }
+
+    /// The Name range's time the next request waits past: the deadline of the mark the range
+    /// kept, before which asking again is refused again. `None` when nothing holds it.
+    pub fn after_ns(&self) -> Option<u64> {
+        self.after_ns
     }
 
     /// The request to send next; `None` once the file is reclaimed.
@@ -141,6 +161,8 @@ impl Reclaimer {
                     key: self.holder.key.clone(),
                     file: self.file,
                 }],
+                // The entry that carries a command gives it its time.
+                at_ns: 0,
             }),
             Phase::Reclaim => Request::Reclaim(name::Reclaim {
                 released_ns: self.released_ns,
@@ -216,7 +238,14 @@ impl Reclaimer {
             },
             (Phase::Unmark, Answer::NameOutcome(outcome)) => match outcome {
                 name::Outcome::Unmarked => {
+                    self.after_ns = None;
                     self.phase = Phase::Reclaim;
+                    Ok(())
+                }
+                // A copy of the write that carried the file could still be applied: the mark
+                // stays, and so does the queue row, until the range's time passes the deadline.
+                name::Outcome::Awaits { deadline_ns } => {
+                    self.after_ns = Some(deadline_ns);
                     Ok(())
                 }
                 _ => Err(ReclaimError::Unexpected),
@@ -260,6 +289,11 @@ mod tests {
     use proptest::prelude::*;
     use std::collections::BTreeSet;
 
+    /// The handover deadline of every write these tests hand the Name range, and when the
+    /// collector comes by: a grace after the writes, past the deadline.
+    const DEADLINE: u64 = 1_000;
+    const COLLECTED: u64 = 2 * DEADLINE;
+
     /// A cell's worth of ranges on model engines, and the chunks its volumes hold.
     struct Cell {
         name: Model,
@@ -267,6 +301,8 @@ mod tests {
         blocks: Model,
         chunks: BTreeSet<(u128, ChunkKey)>,
         index: u64,
+        /// The time of the entries that carry the reclaimer's commands to the Name range.
+        now_ns: u64,
     }
 
     impl Cell {
@@ -279,6 +315,7 @@ mod tests {
                 blocks: Model::default(),
                 chunks: BTreeSet::new(),
                 index: 0,
+                now_ns: COLLECTED,
             };
             cell.run_name(&Command::Gate(name::GateChange {
                 bucket: "b".into(),
@@ -356,7 +393,7 @@ mod tests {
                 key: None,
                 handover_ns: 1_000,
                 at_ns: index,
-                blocks_deadline_ns: u64::MAX,
+                blocks_deadline_ns: DEADLINE,
             };
             let outcome = file::apply(&mut self.files, index, &write).unwrap();
             assert!(matches!(outcome, file::Outcome::Written { .. }));
@@ -384,7 +421,8 @@ mod tests {
                 Request::Disown(disown) => {
                     Answer::NameOutcome(self.run_name(&Command::Disown(disown)))
                 }
-                Request::Unmark(unmark) => {
+                Request::Unmark(mut unmark) => {
+                    unmark.at_ns = self.now_ns;
                     Answer::NameOutcome(self.run_name(&Command::Unmark(unmark)))
                 }
                 Request::Reclaim(reclaim) => {
@@ -458,7 +496,8 @@ mod tests {
             ordered_ns: None,
             version: object(400),
             default: None,
-            deadline_ns: u64::MAX,
+            id: 0,
+            deadline_ns: DEADLINE,
         }));
         assert!(matches!(outcome, Outcome::Put { .. }));
         cell.run_name(&Command::Delete(Delete {
@@ -539,7 +578,7 @@ mod tests {
                     modified_ns: 0,
                 },
                 at_ns: 2,
-                deadline_ns: u64::MAX,
+                deadline_ns: DEADLINE,
             }));
             assert_eq!(outcome, Outcome::PartWritten);
         }
@@ -575,7 +614,8 @@ mod tests {
             checksum: None,
             file: Some(file),
             default: None,
-            deadline_ns: u64::MAX,
+            id: 0,
+            deadline_ns: DEADLINE,
             listing: [0; crate::record::LISTING],
         }))
     }
@@ -679,6 +719,49 @@ mod tests {
         }
     }
 
+    /// An empty object's write carries no file, and its queue row names none: the reclaimer
+    /// has only its mark to remove. The range keeps the mark until its time has passed the
+    /// write's deadline, the reclaimer waits past it and asks again, and the row goes last.
+    #[test]
+    fn a_mark_with_no_file_goes_once_its_deadline_has_passed() {
+        let mut cell = Cell::new();
+        let outcome = cell.run_name(&Command::Put(Put {
+            bucket: "b".into(),
+            incarnation: 1,
+            key: "k".into(),
+            versioning: Versioning::Unversioned,
+            preconditions: name::Preconditions::default(),
+            at_ns: 4,
+            ordered_ns: None,
+            version: Version {
+                file: None,
+                size: 0,
+                ..object(0)
+            },
+            default: None,
+            id: 700,
+            deadline_ns: DEADLINE,
+        }));
+        assert!(matches!(outcome, Outcome::Put { .. }));
+        let mut queue = name::released(&cell.name, u64::MAX, 10).unwrap();
+        assert_eq!(queue.len(), 1);
+        assert!(!queue[0].holder.file);
+        let mut reclaimer = Reclaimer::new(queue.remove(0), 2);
+        cell.now_ns = DEADLINE;
+        let first = reclaimer.next();
+        assert!(matches!(first, Some(Request::Unmark(_))), "{first:?}");
+        let answer = cell.answer(first.unwrap());
+        reclaimer.step(answer).unwrap();
+        assert_eq!(reclaimer.after_ns(), Some(DEADLINE));
+        assert!(matches!(reclaimer.next(), Some(Request::Unmark(_))));
+        cell.now_ns = COLLECTED;
+        assert!(cell.drive(&mut reclaimer, 3));
+        assert_eq!(reclaimer.after_ns(), None);
+        assert!(name::released(&cell.name, u64::MAX, 10).unwrap().is_empty());
+        let mark = crate::key::mark("b", "k", 700);
+        assert_eq!(crate::engine::Rows::get(&cell.name, &mark).unwrap(), None);
+    }
+
     #[test]
     fn answers_out_of_turn_are_refused() {
         let mut reclaimer = Reclaimer::new(
@@ -688,6 +771,7 @@ mod tests {
                 holder: crate::record::Holder {
                     bucket: "b".into(),
                     key: "k".into(),
+                    file: true,
                 },
             },
             4,
@@ -775,7 +859,7 @@ mod tests {
                         modified_ns: 0,
                     },
                     at_ns: 2,
-                    deadline_ns: u64::MAX,
+                    deadline_ns: DEADLINE,
                 }));
                 prop_assert_eq!(outcome, Outcome::PartWritten);
                 listed.push(name::Listed {
@@ -801,7 +885,8 @@ mod tests {
                 checksum: None,
                 file: Some(root),
                 default: None,
-                deadline_ns: u64::MAX,
+                id: 0,
+                deadline_ns: DEADLINE,
                 listing: [0; crate::record::LISTING],
             }));
             let committed = matches!(completed, Outcome::Put { .. });

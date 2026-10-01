@@ -385,12 +385,40 @@ appears in constants.md as derived, with its model.
 
 ## 3. Transport
 
-Nodes talk over two layers, as the hecate specification lays them out (07 §4.7): QUIC for
-everything stateful, through quinn with rustls on AWS-LC (crypto.md), and a separate plane of
-sealed UDP datagrams for consensus control and membership. Neither is built; focal-wire's
-transport core is the starting point for the first, ported rather than depended on, since the
-crate is coupled to focal's domain (07 §4.8, §7.2 C), and slates' unwired control-datagram codec
-is the starting point for the second (07 §4.7).
+Nodes, and clients through mantle's client library, talk over two layers, as the hecate
+specification lays them out (07 §4.7): QUIC for everything stateful, and a separate plane of
+sealed UDP datagrams for consensus control and membership. Neither is built.
+
+The QUIC layer combines standard QUIC with slates' measured work, each layer taken from the side
+that does it better (research 30 §6):
+
+- **The wire is standard QUIC** (RFC 9000, 9001, 9002), through a vendored quinn-proto with rustls
+  on AWS-LC (crypto.md). The standard brings what slates' private dialect lacks or departs from:
+  connection migration and path validation, so a laptop that moves between networks keeps its
+  connections; key update, stateless reset and connection IDs; loss recovery whose probe timeout
+  doubles without a cap and whose bytes in flight count headers and AEAD overhead (RFC 9002
+  §6.2.1, §B.2), where slates caps the backoff, counts payload alone and sends its first handshake
+  retransmit at 1 ms; and a wire that standard tools decode.
+- **slates' measured refinements are patches to that quinn-proto**: Copa as focal ports it, a pacing
+  quantum of 1 ms of the rate with a floor of two datagrams (quinn's floor of ten is 1.5 s of
+  burst at 64 kbit/s), RACK-style adaptive reordering tolerance (0.254 to 0.540 of capacity on a
+  reordering path in slates' measurements, neutral elsewhere), and slates' path-MTU fixes; with
+  quinn's 1,024-gap limit on a stream's receive buffer, which bounds a stream's window, derived
+  into the window rather than left implicit (30 §4.2–§4.5). Each is offered upstream.
+- **The application protocol is mantle's own, in slates' shape**: one connection per peer,
+  bidirectional exchanges of a request and a reply, classes of message with a credit reserve for
+  the classes above, absolute credits and typed refusals (§3.1–§3.3). Two of slates' choices are
+  left behind: the class is set by the message's kind and the sender's role, never carried in a
+  stream ID a peer chooses (audit §13.3), and bodies stream through reservations rather than
+  being retained whole (audit §11.8).
+
+The same protocol runs over TLS on TCP when a network blocks UDP, so mantle's client keeps every
+operation and its semantics there, at the cost of head-of-line blocking on that path alone
+(research 30 §4.9). focal-wire's transport core is the starting point for the application layer,
+ported rather than depended on, since the crate is coupled to focal's domain (07 §4.8, §7.2 C),
+and slates' unwired control-datagram codec is the starting point for the datagram plane (07 §4.7).
+The network matrix of audit §13.6 qualifies the combination and could still reverse a piece of
+it.
 
 ### 3.1 Classes of message
 

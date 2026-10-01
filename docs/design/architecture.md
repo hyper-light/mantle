@@ -87,6 +87,14 @@ a cell.
 
 ## 5. Routing
 
+Every hop runs over QUIC. Nodes speak mantle's own protocol over QUIC to one another, and
+clients speak the same protocol through mantle's client library and CLI, with S3's semantics as
+its operations, as slates carries its own protocol over QUIC (08); Fast Raft and SWIM use a
+separate UDP plane (node.md §3). Stock S3 tools reach a cell through an HTTP/1.1 listener that
+speaks the S3 wire protocol, on by default, which translates each request onto the same path.
+No other HTTP version is offered, since Amazon S3 serves none: offered HTTP/2 by ALPN its
+endpoints answer HTTP/1.1, and none advertises HTTP/3 (node.md §4.1).
+
 | Hop | How | On a stale route |
 |---|---|---|
 | Client → cell | Virtual-hosted-style requests resolve the bucket's DNS name to the owning cell's gateways; path-style requests and buckets split across cells go through a thin router that reads the bucket (and key, when needed) against its in-memory map, with no signature checks and no metadata reads. | The cell answers with a redirect naming the owner and the map epoch; the router refreshes and retries once. |

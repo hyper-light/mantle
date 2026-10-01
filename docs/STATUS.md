@@ -245,7 +245,8 @@ Remaining before it is done:
 
 - The windows a gateway admits, from its memory and measured latency; the rates of the paths
   measured on an idle machine.
-- The server around it: HTTP, the transport to storage nodes and ranges, routing by
+- The server around it: mantle's protocol over QUIC for its client and its nodes, the HTTP/1.1
+  listener for stock S3 clients, the transport to storage nodes and ranges, routing by
   descriptors, placement across failure domains, and each request's memory admitted against
   the gateway's.
 

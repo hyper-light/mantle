@@ -14,8 +14,9 @@
 Mantle is a distributed object store and file system for the data that AI agents
 produce: checkpoints, transcripts, datasets, embeddings and build artifacts. It implements
 the S3 API, so the AWS CLI, boto3, the AWS SDKs, rclone and other S3 clients work with it
-unchanged. The same binary runs as a single process on a laptop or as a cluster of many
-machines.
+unchanged over HTTP/1.1, as they do with S3 itself. Mantle's own client and its nodes speak
+mantle's protocol over QUIC. The same binary runs as a single process on a laptop or as a
+cluster of many machines.
 
 Mantle acknowledges a write only after the data is durable on every node that stores it,
 and a read that starts after that returns the new data. Agents can coordinate through

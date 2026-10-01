@@ -216,9 +216,9 @@ volume's start already does this for its own threads (audit S12), and the node a
 same rule to every owner. No thread outlives a failed start.
 
 A stop is safe at any instant, because nothing is acknowledged before it is durable and every
-owner recovers from its own records. An orderly stop is kinder to the cell: the S3 listener
-stops taking connections (HTTP/1.1 answers carry `Connection: close`, HTTP/2 connections get a
-`GOAWAY` with `NO_ERROR`; 25 §2), requests in flight finish within their deadlines, each range
+owner recovers from its own records. An orderly stop is kinder to the cell: the client
+listeners stop taking connections (native connections are told to drain by the protocol's own
+close; HTTP/1.1 answers carry `Connection: close`), requests in flight finish within their deadlines, each range
 this node leads hands leadership to a successor and waits until the successor has shown it
 leads, since a leader that only steps down can leave a rolling update with no leader (audit
 §11.7), and then the shards finish their outstanding `Ready`s and the logs and volumes close.
@@ -593,13 +593,30 @@ qualified (§9).
 
 ## 4. The S3 front end
 
-### 4.1 The server
+### 4.1 The protocols
 
-HTTP/1.1 and HTTP/2 through hyper, over TLS from rustls with its AWS-LC provider (25 §5),
-negotiated by ALPN. On a laptop the listener may serve plain HTTP on the loopback address; SigV4
-still authenticates every request there, and a request carrying SSE-C headers is refused over
-plain HTTP, as S3 "rejects any requests made over HTTP when using SSE-C" (20 §3.3). HTTP/3 needs
-its own integration (audit §11.8) and is not offered.
+Clients reach a node two ways, and both lead to the same request path (§4.2), drivers and
+admission authority.
+
+- **mantle's own protocol over QUIC** is the native one, as slates carries its own (08): QUIC
+  from quinn with rustls on the AWS-LC provider (25 §5), with S3's semantics (buckets, keys,
+  versions, multipart uploads, conditional requests, checksums, storage classes) as its
+  operations, used through mantle's client library and CLI. It is the same transport the nodes
+  speak to each other (§3), so a client gets independent streams with no head-of-line blocking
+  between requests, connection migration as a laptop moves between networks, and admission
+  signals and credits before it sends data. Its framing, flow control, priorities, resumption
+  and congestion control are designed in research notes 27 (upload scheduling), 30 (resilient
+  transfer) and 31 (caching, ordering and integrity).
+- **An HTTP/1.1 listener speaking the S3 wire protocol,** on by default, so stock S3 tools (the
+  AWS CLI, boto3, the AWS SDKs, rclone) work unchanged; it translates each request onto the same
+  path. HTTP/1.1 is the only HTTP version, because it is the only one Amazon S3 serves: offered
+  HTTP/2 by ALPN, its endpoints (`s3.amazonaws.com`, `s3.us-east-1`, `s3.us-west-2`,
+  `s3.dualstack.us-east-1` and `s3express-control.us-east-1`) answered `http/1.1`, and none
+  advertised HTTP/3 by `Alt-Svc` (checked 2026-09-30; AWS documents HTTP/3 only for CloudFront).
+  HTTP/2 and HTTP/3 are not offered. The listener is hyper's HTTP/1.1 server over TLS from rustls.
+  On a laptop it may serve plain HTTP on the loopback address; SigV4 still authenticates every
+  request there, and a request carrying SSE-C headers is refused over plain HTTP, as S3 "rejects
+  any requests made over HTTP when using SSE-C" (20 §3.3).
 
 hyper's defaults are its own choices ("Default is 200, but not part of the stability of hyper
 ... You are encouraged to set your own limit", 25 §2), so the node sets each from its budget:
@@ -607,16 +624,7 @@ hyper's defaults are its own choices ("Default is 200, but not part of the stabi
 - HTTP/1.1's buffer holds one request head at S3's limit of 8 KB (05 §10.2) and the body
   segment being read. hyper panics below 8,192 bytes (25 §2), so the node checks the value
   before the call, as CLAUDE.md §1 requires of any dependency that can panic.
-- HTTP/2's concurrent streams per connection are the requests the node has room to admit for
-  that connection; a stream's window is what its request's reservation can take ahead of the
-  driver (§4.3), and the connection's window the sum over its admitted streams (RFC 9113 lets a
-  receiver "set any window size that it desires", 25 §2). Header lists are bounded at S3's 8 KB
-  (05 §10.2).
-- Reset floods are bounded by h2's pending-reset limit and its limit on resets it sends
-  itself, both explicit (`max_pending_accept_reset_streams`, `max_local_error_reset_streams`;
-  25 §2). hyper was not affected by Rapid Reset because it cancels a reset stream before a
-  handler sees it (25 §2); the node still sets both limits from its budget, since hyper's
-  defaults "can change".
+- Header lists are bounded at S3's 8 KB (05 §10.2).
 - No header timer. hyper's `header_read_timeout` defaults to 30 seconds and panics when set
   without a timer (25 §2). A slow client holds only its connection's reservation; when the node
   needs the room, it closes the connection that has made the least progress for longest.
@@ -648,7 +656,7 @@ hyper's defaults are its own choices ("Default is 200, but not part of the stabi
 ### 4.3 Bodies
 
 A body is read only when the `Put` driver `wants_body`, one segment at a time, and backpressure
-reaches the client through TCP or HTTP/2 flow control. An `aws-chunked` body is decoded as it
+reaches the client through the native protocol's flow control or, on the HTTP/1.1 listener, TCP's. An `aws-chunked` body is decoded as it
 streams by `mantle_s3::chunked`, each chunk's signature checked, and a trailing checksum checked
 at the end. Nothing is committed in the Name range until the body's length, digests, chunk
 signatures and trailer have all checked (audit §9): the `Put` driver takes `end` with the
@@ -690,10 +698,10 @@ closed, as RFC 9112 requires for a framing error in a request (25 §2).
 A tenant's share is decided at the gateway, by tokens from the cell's admission service, as
 DynamoDB's routers hold tokens from its global admission control; per-range and per-node limits
 remain as ceilings (architecture §8; 09 §3.6). Over its share, or when an authority cannot fund
-the request, the answer is `503 SlowDown` before the body. On HTTP/1.1 a refusal to a client that
-did not wait for `100 Continue` carries `Connection: close` and the body is not read; on HTTP/2
-the stream is reset with `NO_ERROR` after the response, which RFC 9113 permits when the response
-does not depend on the rest of the request (25 §2).
+the request, the answer is a refusal before the body: on the native protocol a typed refusal
+with the wait it derives (research 27), and on the HTTP/1.1 listener `503 SlowDown`, where a
+refusal to a client that did not wait for `100 Continue` carries `Connection: close` and the body
+is not read.
 
 SlowDown sheds load only if its cause lasts no longer than clients retry. Under the standard
 retry mode as AWS now documents it, a throttled request is tried three times, backing off a
@@ -1016,7 +1024,7 @@ research 24 §3.1 it needs.
 | Phase | Builds | Engine | Done when |
 |---|---|---|---|
 | A. The node inside | tickets with wakers for the log and volumes; per-device readers; shards with the staged turn, deficit round robin and timers; the admission authorities and budgets; directories, `LOCK` and profiles; startup, stop and rollback; the loopback peer; the many-group simulation host | the model engine | the many-group simulation passes its invariants at thousands of ranges per device with every mutation caught; real processes driving tickets and shards over real logs and volumes, killed at random, lose no acknowledged update or chunk |
-| B. A laptop that serves S3 (audit §17, third) | the hyper and rustls front end; the request path, bodies, errors and overload of §4; the drivers served in-process (§5); sessions; placement from local volumes; the key authority of §4.6; chunk reconciliation per volume | P1–P10 and P14 (the port opening, writing, flushing, recovering, reading and compacting, with shared budgets); P15 for baselines | the laptop row of §9.3 |
+| B. A laptop that serves S3 (audit §17, third) | the native QUIC protocol and the HTTP/1.1 S3 listener; the request path, bodies, errors and overload of §4; the drivers served in-process (§5); sessions; placement from local volumes; the key authority of §4.6; chunk reconciliation per volume | P1–P10 and P14 (the port opening, writing, flushing, recovering, reading and compacting, with shared budgets); P15 for baselines | the laptop row of §9.3 |
 | C. A cell of several nodes (audit §17, fourth, first half) | QUIC transport with its classes, credits and defenses; the datagram plane; SWIM; invitations and joining; remote chunks; snapshots over QUIC; voters across domains; the replica side of splits, merges and moves | P12 (range deletions) and P13 (checkpoint, export, ingest) | 3- and 5-voter histories accepted under crashes, partitions and disk faults, in simulation and with real processes; a node lost for good replaced with no acknowledged write lost |
 | D. A regional cell (audit §17, fourth) | repair ordered by margin; rebalancing and drains behind the operation gate; device health in placement; adaptive device plans; the network matrix; the multipart and GET pipeline for massive objects (audit §16); the fast track as an experiment with its own proof (audit §5.6) | P9's cache measured in both regimes (23 §0 item 6) | the regional row of §9.3, at the largest cell the deployment declares, within its stated latency, resource and rebuild limits |
 | E. Cells and the fleet (audit §17, fifth) | the cell map in the root range, the router, the mover between cells after its TLA+ model; key authority across cells; versioned upgrades and rollback (audit §8.7); the chosen geographic contract (audit §8.1) | none new | the fleet row of §9.3: growth, cell retirement, stale routes and region failover keep ownership, with measured recovery objectives |

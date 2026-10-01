@@ -635,10 +635,22 @@ impl<F: BlockFile> Writer<F> {
             .and_then(|h| h.checked_add(copies))
             .and_then(|len| self.shared.align.up_u64(len))
             .ok_or(LogError::Damaged("a frame past u64"))?;
-        // A tail copied into a frame as large as its own frames frees one segment and fills
-        // as much of another: no room is made, and the writer once swept every segment in turn
-        // while the updates waiting never fitted beside the copies.
-        Ok(frame < state.live.used(tail))
+        // The sweep makes room if the segment after the tail holds nothing live, so that the
+        // frame naming a later tail frees it too, or if its frame takes less than the
+        // tail's frames. A tail copied into a segment of its own, as large as its own frames,
+        // frees one segment and fills another: the writer once swept every segment in turn so,
+        // while the updates waiting never fitted beside the copies. And a small live record
+        // left in the oldest segment once held back every dead segment behind it: its copy was
+        // as large as its frame, so it was never swept, and no frame larger than the head's
+        // room went in again.
+        // The segment after the tail, unless it is the head, which takes the next frame.
+        let dead_behind = state.segments.live.len() > 2
+            && state
+                .segments
+                .live
+                .get(1)
+                .is_some_and(|&slot| state.live.of(slot).0 == 0);
+        Ok(dead_behind || frame < state.live.used(tail))
     }
 
     /// Lays copies of every live piece of the tail into the payload.

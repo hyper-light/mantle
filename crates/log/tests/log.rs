@@ -2233,6 +2233,73 @@ fn a_reopened_log_sweeps_the_segments_it_recovered() {
     check(&log, &models);
 }
 
+/// A log that answered `Full` takes any frame that fits a segment once its groups compact:
+/// a group's small live record in the oldest segment holds back the dead segments behind it
+/// only until a sweep copies it, and that sweep must go in whatever room the log has
+/// (docs/design/raft-log.md §5). Entries from a frame's room down to a quarter of it.
+#[test]
+fn a_full_log_takes_any_frame_once_its_groups_compact() {
+    for segments in [4u32, 8] {
+        for share in 1..=4usize {
+            let settings = Config {
+                max_groups: 16,
+                ..config(4, segments)
+            };
+            let log = Log::create(sim(80), settings, ID).unwrap();
+            let size = log.entry_room().unwrap() / share;
+            let one = |first: u64, fill: u8| Update {
+                entries: Some(Entries {
+                    first,
+                    entries: vec![Entry {
+                        term: 1,
+                        bytes: Arc::from(vec![fill; size]),
+                    }],
+                }),
+                ..Update::default()
+            };
+            log.write(
+                1,
+                Update {
+                    hard_state: Some(HardState {
+                        term: 1,
+                        vote: 1,
+                        commit: 0,
+                    }),
+                    ..Update::default()
+                },
+            )
+            .unwrap();
+            // Each round fills the log from group 7 until refused, compacts it all away, and
+            // writes one entry of group 1, whose hard state stays live in the oldest segment;
+            // then group 1 compacts that entry too.
+            let (mut last, mut mine) = (0u64, 0u64);
+            for round in 0..u64::from(segments) {
+                let full = loop {
+                    match log.write(7, one(last + 1, 7)) {
+                        Ok(()) => last += 1,
+                        Err(e) => break e,
+                    }
+                };
+                assert!(matches!(full, LogError::Full), "{full}");
+                let compact = |index: u64| Update {
+                    start: Some(Start { index, term: 1 }),
+                    ..Update::default()
+                };
+                log.write(7, compact(last)).unwrap();
+                mine += 1;
+                log.write(1, one(mine, 1)).unwrap_or_else(|e| {
+                    panic!(
+                        "{segments} segments, entries of 1/{share} of a frame, round {round}: \
+                         {e} after compacting"
+                    )
+                });
+                log.write(1, compact(mine)).unwrap();
+            }
+            assert_eq!(log.view(1).unwrap().unwrap().last, mine);
+        }
+    }
+}
+
 #[test]
 fn another_log_or_geometry_is_refused() {
     let file = sim(9);

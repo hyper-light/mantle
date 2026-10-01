@@ -15,7 +15,7 @@
 mod common;
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::task::Waker;
 
 use common::{config, data, issuer, key, sim};
@@ -28,10 +28,14 @@ use mantle_disk::sim::{Crash, SimFile};
 
 /// A simulated file that watches its writes: how many are in flight at once, the threads the
 /// process runs while each is, the most written between two flushes, and, when armed, fails
-/// the write that makes `fail_at` since the last flush.
+/// the write that makes `fail_at` since the last flush. While held, every write waits: a test
+/// holds the device while it submits a round, so the writer's batches are made of what was
+/// queued, never of how the scheduler happened to interleave the submissions.
 struct Watch {
     file: Arc<SimFile>,
     seen: Mutex<Seen>,
+    held: Mutex<bool>,
+    released: Condvar,
 }
 
 #[derive(Default)]
@@ -51,7 +55,16 @@ impl Watch {
         Arc::new(Self {
             file,
             seen: Mutex::new(Seen::default()),
+            held: Mutex::new(false),
+            released: Condvar::new(),
         })
+    }
+    fn hold(&self) {
+        *self.held.lock().unwrap() = true;
+    }
+    fn release(&self) {
+        *self.held.lock().unwrap() = false;
+        self.released.notify_all();
     }
 }
 
@@ -66,6 +79,11 @@ impl BlockFile for Watch {
         self.file.read_exact_at(buf, offset)
     }
     fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError> {
+        let mut held = self.held.lock().unwrap();
+        while *held {
+            held = self.released.wait(held).unwrap();
+        }
+        drop(held);
         let mut seen = self.seen.lock().unwrap();
         seen.in_flight += 1;
         seen.most_in_flight = seen.most_in_flight.max(seen.in_flight);
@@ -117,12 +135,20 @@ fn small_segments() -> Config {
 const CHUNK: usize = 40_000;
 const SIZE: u64 = 32 << 20;
 
-/// Submits `n` puts from `first` at once, as many clients would, and waits for every answer;
-/// a put refused when submitted answers with its refusal.
-fn put_together(v: &Volume<Arc<Watch>>, first: u64, n: u64) -> Vec<Result<(), ChunkError>> {
+/// Submits `n` puts from `first` at once, as many clients would, with the device held until
+/// every one is queued, and waits for every answer; a put refused when submitted answers with
+/// its refusal.
+fn put_together(
+    v: &Volume<Arc<Watch>>,
+    file: &Watch,
+    first: u64,
+    n: u64,
+) -> Vec<Result<(), ChunkError>> {
+    file.hold();
     let answers: Vec<_> = (first..first + n)
         .map(|k| v.put_waking(key(k), &data(k, CHUNK), Waker::noop().clone()))
         .collect();
+    file.release();
     answers
         .into_iter()
         .map(|a| a.and_then(|a| a.wait()))
@@ -158,7 +184,7 @@ fn batches_spanning_many_regions_start_no_threads() {
     // workers.
     assert!(idle >= 4 + 1 + issuer.depth(), "{idle} threads");
     for round in 0..3 {
-        for result in put_together(&v, round * 32, 32) {
+        for result in put_together(&v, &file, round * 32, 32) {
             result.unwrap();
         }
     }
@@ -195,7 +221,7 @@ fn a_failed_region_fails_its_batch() {
     let v = Volume::format(issuer(), Arc::clone(&file), SIZE, small_segments()).unwrap();
     v.put(key(1000), &data(1000, CHUNK)).unwrap();
     file.seen.lock().unwrap().fail_at = Some(3);
-    let results = put_together(&v, 0, 32);
+    let results = put_together(&v, &file, 0, 32);
     assert!(
         results
             .iter()

@@ -12,16 +12,20 @@
 
 use std::process::Command;
 
-/// The replicas and threads of each `append` row of `mantle bench log`'s output.
-fn rows(out: &str) -> Vec<(usize, usize)> {
+/// The replicas, threads and idle threads of each `append` row of `mantle bench log`'s output.
+fn rows(out: &str) -> Vec<(usize, usize, usize)> {
     out.lines()
         .filter_map(|line| {
             let tokens: Vec<&str> = line.split_whitespace().collect();
-            // "append", the size and its unit, the replicas, the threads.
+            // "append", the size and its unit, the replicas, the threads, the idle threads.
             if tokens.first() != Some(&"append") {
                 return None;
             }
-            Some((tokens[3].parse().unwrap(), tokens[4].parse().unwrap()))
+            Some((
+                tokens[3].parse().unwrap(),
+                tokens[4].parse().unwrap(),
+                tokens[5].parse().unwrap(),
+            ))
         })
         .collect()
 }
@@ -70,6 +74,12 @@ fn bench_log_runs_the_same_threads_at_ten_and_a_hundred_times_the_replicas() {
         threads.iter().all(|&t| t == threads[0]),
         "threads {threads:?} at replicas {counts:?}"
     );
-    // A driver a core, the log's writer and the main thread: nothing a replica.
-    assert!(threads[0] <= cores + 2, "{threads:?} for {cores} cores");
+    // Above what the process runs idle (the main thread, and what the operating system runs in
+    // every process): a driver a core and the log's writer, nothing a replica.
+    let added: Vec<usize> = rows.iter().map(|r| r.1.saturating_sub(r.2)).collect();
+    assert!(
+        added.iter().all(|&a| a <= cores + 1),
+        "{added:?} above idle {:?} for {cores} cores",
+        rows.iter().map(|r| r.2).collect::<Vec<_>>()
+    );
 }

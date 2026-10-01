@@ -40,15 +40,35 @@ pub fn drivers(clients: usize) -> usize {
 pub struct Started<'scope, T> {
     handles: Vec<ScopedJoinHandle<'scope, Option<T>>>,
     _budget: Reservation,
+    /// The threads the process ran just before these started, as the OS counts them.
+    before: usize,
+    /// When they started.
+    began: Instant,
 }
 
 impl<T> Started<'_, T> {
-    /// Each thread's answer, `None` for one that unwound or never worked.
+    /// Each thread's answer, `None` for one that unwound or never worked, once the OS no longer
+    /// counts the threads.
+    ///
+    /// A join returns when the kernel clears the thread's ID as it exits (set_tid_address(2)),
+    /// before it leaves the process's thread group; for that moment the OS still counts it, and a
+    /// count taken next (the next point's) would include it. So the join waits until the count is
+    /// back where it was before these threads started. Their release is the tail of their own run,
+    /// so it is given as long again as they ran; a count still above then is not a release in
+    /// progress but threads that remain, and is left for the next count to report.
     pub fn join(self) -> Vec<Option<T>> {
-        self.handles
+        let answers = self
+            .handles
             .into_iter()
             .map(|h| h.join().ok().flatten())
-            .collect()
+            .collect();
+        let joined = Instant::now();
+        let ran = joined.saturating_duration_since(self.began);
+        let until = joined.checked_add(ran).unwrap_or(joined);
+        while thread_count() > self.before && Instant::now() < until {
+            std::thread::yield_now();
+        }
+        answers
     }
 }
 
@@ -68,6 +88,8 @@ where
     T: Send + 'scope,
 {
     let budget = threads::reserve(n, path).map_err(Error::Disk)?;
+    let before = thread_count();
+    let began = Instant::now();
     let work: Vec<F> = (0..n).map(make).collect();
     let mut handles = Vec::with_capacity(n);
     let mut senders = Vec::with_capacity(n);
@@ -89,6 +111,8 @@ where
     Ok(Started {
         handles,
         _budget: budget,
+        before,
+        began,
     })
 }
 

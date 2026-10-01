@@ -444,7 +444,17 @@ struct Clients {
     lateness: Histogram,
 }
 
-/// `load.clients` clients PUT `bytes` for `step`, all on this thread, each a record.
+/// How long clients PUT: for a measured time, as the benchmark runs, or until a number of PUTs
+/// are stored, as a test needs a counted fact rather than a wall-clock window.
+#[derive(Clone, Copy, Debug)]
+enum Until {
+    Elapsed(Duration),
+    /// Tests only: the benchmark measures for a time.
+    #[cfg(test)]
+    Stored(u64),
+}
+
+/// `load.clients` clients PUT `bytes` until `until`, all on this thread, each a record.
 fn clients_put(
     cell: &mut Cell,
     bytes: &[u8],
@@ -452,13 +462,27 @@ fn clients_put(
     ids: &mut u128,
     wrapping: &WrappingKey,
     load: Load,
-    step: Duration,
+    until: Until,
 ) -> Result<Clients, Error> {
     let Load { clients, rate } = load;
     let length =
         u64::try_from(bytes.len()).map_err(|_| Error::Unexpected("a body past u64".into()))?;
     let started = Instant::now();
-    let deadline = started.checked_add(step);
+    let deadline = match until {
+        Until::Elapsed(step) => started.checked_add(step),
+        #[cfg(test)]
+        Until::Stored(_) => None,
+    };
+    // Whether another PUT may start: before the deadline, or, in a test, while fewer have
+    // started than are to be stored.
+    #[cfg(test)]
+    let going = |launched: u64| match until {
+        Until::Elapsed(_) => deadline.is_some_and(|d| Instant::now() < d),
+        Until::Stored(target) => launched < target,
+    };
+    #[cfg(not(test))]
+    let going = |_: u64| deadline.is_some_and(|d| Instant::now() < d);
+    let mut launched = 0u64;
     let mut schedules: Vec<drive::Schedule> = (0..clients)
         .map(|c| drive::Schedule::new(rate, clients, u64::try_from(c).unwrap_or(0)))
         .collect();
@@ -474,8 +498,8 @@ fn clients_put(
     let (mut latency, mut lateness) = (Histogram::new(), Histogram::new());
     let (mut stored, mut out, mut file) = (0u64, 0usize, 0u128);
     loop {
-        let going = deadline.is_some_and(|d| Instant::now() < d);
-        while deadline.is_some_and(|d| Instant::now() < d) {
+        let more = going(launched);
+        while going(launched) {
             let now = Instant::now();
             let Some(&Reverse((at, c))) = idle.peek().filter(|r| r.0.0 <= now) else {
                 break;
@@ -486,6 +510,7 @@ fn clients_put(
                 .checked_add(1)
                 .ok_or(Error::Unexpected("file IDs ran out".into()))?;
             let putting = begin(length, layout, file, ids, wrapping, 1)?;
+            launched = launched.saturating_add(1);
             if let Some(slot) = active.get_mut(c) {
                 *slot = Some((putting, at));
                 out = out.saturating_add(1);
@@ -494,7 +519,7 @@ fn clients_put(
             lateness.record(nanos(now.saturating_duration_since(could)));
         }
         if out == 0 {
-            if !going {
+            if !more {
                 break;
             }
             // Nothing under way: the next PUT's arrival is what comes next; an early return
@@ -800,7 +825,15 @@ pub fn gateway(
                 SplitMix64::new(u64::try_from(size).unwrap_or(0)).fill(&mut bytes);
                 let mut cell = Cell::new(volumes)?;
                 let mut ids = 0u128;
-                let c = clients_put(&mut cell, &bytes, layout, &mut ids, &wrapping, load, step)?;
+                let c = clients_put(
+                    &mut cell,
+                    &bytes,
+                    layout,
+                    &mut ids,
+                    &wrapping,
+                    load,
+                    Until::Elapsed(step),
+                )?;
                 writeln!(
                     out,
                     "  {:<10} {:>8} {:>8} {:>10} {:>11} {:>10} {:>10} {:>10} {:>8}",
@@ -888,10 +921,11 @@ mod tests {
                 &mut ids,
                 &wrapping,
                 load,
-                Duration::from_millis(50),
+                // Every client stores two PUTs: a counted fact, not a window of wall time.
+                Until::Stored(2 * load.clients as u64),
             )
             .unwrap();
-            assert!(c.latency.count() > 0, "{load:?}");
+            assert_eq!(c.latency.count(), 2 * load.clients as u64, "{load:?}");
             assert!(c.rate > 0.0);
             assert!(cell.volumes.values().all(HashMap::is_empty));
         }

@@ -7,7 +7,10 @@
 //! threads, at most one a granted core, each hold their share of the replicas, submit for each
 //! whose answer came, and hear of each answer through the replica's waker, so the process runs
 //! as many threads at a thousand replicas as at ten (docs/design/measurement.md §10). Each row
-//! says the threads the process ran, as the OS counts them, and the drivers' CPU time. Every replica compacts behind itself, so
+//! says the threads the process ran, as the OS counts them, beside the threads it ran idle just
+//! before the point began: what the operating system runs in every process of its own (Windows'
+//! loader starts a pool of workers in each) is in both, so the point's own threads are their
+//! difference. It also says the drivers' CPU time. Every replica compacts behind itself, so
 //! the log frees and reclaims segments as a running node's does. For each entry size and
 //! number of replicas the replicas append for the step's duration. Besides throughput and
 //! latency, each row says how many appends one flush carried: group commit is what lets
@@ -91,10 +94,11 @@ pub fn log(out: &mut impl Write, path: &Path, options: &Options) -> Result<(), E
     )?;
     writeln!(
         out,
-        "  {:<12} {:>9} {:>8} {:>8} {:>11} {:>12} {:>10} {:>10} {:>10} {:>11} {:>10} {:>20}",
+        "  {:<12} {:>9} {:>8} {:>5} {:>8} {:>11} {:>12} {:>10} {:>10} {:>10} {:>11} {:>10} {:>20}",
         "",
         "replicas",
         "threads",
+        "idle",
         "cpu",
         "appends/s",
         "throughput",
@@ -122,6 +126,7 @@ pub fn log(out: &mut impl Write, path: &Path, options: &Options) -> Result<(), E
                 queue_submissions: most.saturating_mul(2),
                 waits: Waits::Measured,
             };
+            let idle = drive::thread_count();
             let log = Log::create(file, config, u128::from(point)).map_err(log_error)?;
             let outcome = appends(&log, scratch.path(), size, count, options.step)?;
             let (frames, updates) = log.flushed();
@@ -142,10 +147,11 @@ pub fn log(out: &mut impl Write, path: &Path, options: &Options) -> Result<(), E
             let read_back = started.elapsed();
             writeln!(
                 out,
-                "  {:<12} {:>9} {:>8} {:>8} {:>11} {:>12} {:>10} {:>10} {:>10} {:>11.1} {:>10} {:>20}",
+                "  {:<12} {:>9} {:>8} {:>5} {:>8} {:>11} {:>12} {:>10} {:>10} {:>10} {:>11.1} {:>10} {:>20}",
                 format!("append {}", display::size(size)),
                 count,
                 outcome.threads,
+                idle,
                 display::nanos(nanos(outcome.cpu)),
                 display::count(rate(outcome.appends, outcome.elapsed)),
                 display::rate(rate(outcome.bytes, outcome.elapsed)),

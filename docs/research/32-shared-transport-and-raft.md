@@ -470,7 +470,7 @@ application layer (§3.4); **excluded** = with its reason.
 | D4 | Acceptance order: length, prologue, keyring lookup before crypto, AEAD, envelope, replay | slates `accept.rs:1-14` | `x-datagram`, with fencing by epoch and term added after the AEAD (owed in slates) |
 | D5 | High-water advanced only after the tag verifies | slates `seal.rs:30-32` | `x-datagram`, kept inside an RFC 4303 window whose width follows the measured reordering |
 | D6 | Counter-zero sealer per key | slates `enrollment.rs:60` | **excluded**: nonce reuse after a restart under an unchanged key (audit §11.8); exporter keys are new per connection epoch |
-| D7 | Golden vector for a sealed datagram | slates `a_sealed_datagram_matches_its_golden_vector` | kept: AES-GCM is deterministic for a key, nonce and AAD, so the AWS-LC build must reproduce slates' vector byte for byte |
+| D7 | Golden vector for a sealed datagram | slates `a_sealed_datagram_matches_its_golden_vector` | **superseded (2026-10-01)**: the plane's wire is a new version 1 (counter in the authenticated prologue, CRC-32C body, packed messages; node.md §3.4), so slates' vector pins a format the plane replaces. hyper-datagram carries its own golden vector, verified against an independent implementation (hyper-raft `crates/hyper-datagram/ORIGIN.md`) |
 | D8 | Hostile-input and plane tests | slates `tests/hostile.rs`, `tests/plane.rs` | kept |
 | D9 | One packed datagram per peer per heartbeat; size ≤ quinn's `max_datagram_size` for the peer, else 1,280 (IPv6) / 576 (IPv4); never more than RFC 8085's one datagram per RTT originated when sending few; nothing retransmitted | `node.md` §3.4 | `x-datagram` |
 | D10 | A socket of its own, outside QUIC's congestion controller | `node.md` §3.4; 25 §6 | `x-datagram` |

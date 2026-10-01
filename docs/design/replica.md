@@ -1,8 +1,8 @@
 # Range replicas: how a range runs its log
 
-Status: design, 2026-09-28. Sources: docs/research/06 (consensus, "06 §x"), 07 (focal's
-consensus stack); docs/design/metadata.md, whose ranges this runs, and raft-log.md, the log
-it writes to.
+Status: design, 2026-09-28; command checksums and digests 2026-09-30. Sources:
+docs/research/06 (consensus, "06 §x"), 07 (focal's consensus stack), 31 (integrity);
+docs/design/metadata.md, whose ranges this runs, and raft-log.md, the log it writes to.
 
 A replica is one member of one range's Raft group on one node. It holds focal-raft's core
 (`RawNode`, 07 §1.2), its group's view of the device's log, the range's engine, and the state
@@ -97,6 +97,24 @@ range carries on without it.
 
 Applying never reads the clock, the network or anything else a replica does not share.
 Time comes from the entry, which is what lets every replica reach the same rows.
+
+**A command carries its own checksum** (research/31 §5.4, B12; D16). A command is encoded in the
+gateway's memory and then replicated, so a flip before its encoding goes to every replica alike,
+and the log's frame CRC, computed later, protects it. Each command therefore carries a CRC-32C
+computed where it is built, at the gateway, over its encoding, and every replica checks it at
+apply. A mismatch fences the command, not the replica: the command is answered as corrupt, writes
+nothing on any member, since every member finds the same mismatch in the same entry, and its
+gateway sends it again from the request it still holds; the failure is attributed to the
+gateway's node and core (node.md §5.6). The engine's per-key-value protection guards the rows
+after apply (engine.md §3).
+
+**Members compare digests** (research/31 §5.8, D21). Replicas apply the same log
+deterministically, so a digest of a range's rows at an applied index is the same on every member
+whose state is right. Members compute it at an index the leader names, paced as the scrubber is,
+and compare; a member whose digest differs while its log agrees holds wrong state, the case of
+protocol-aware recovery where the log is right and the state is not, and it is rebuilt from its
+peers as §6 rebuilds a damaged member. Meta found 40% of its RocksDB corruptions already copied to
+other replicas, and named comparing replicas cheaply as the open problem (research/31 §5.8).
 
 ## 3. The order of a `Ready`
 

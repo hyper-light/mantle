@@ -1,6 +1,7 @@
 # S3 protocol: how mantle reads requests and writes responses
 
-Status: design, 2026-09-28. Sources: docs/research/05 (S3 API semantics, cited as "05 §x"),
+Status: design, 2026-09-28; storage classes 2026-09-30. Sources: docs/research/05 (S3 API
+semantics, cited as "05 §x"), docs/research/28 (storage classes),
 docs/research/13 (XML, cited as "13 §x"), docs/research/16 (CORS, cited as "16 §x"),
 docs/research/17 (bucket policies and JSON, cited as "17 §x"), docs/research/18 (Object Lock,
 cited as "18 §x"), docs/research/19 (browser uploads, cited as "19 §x"), docs/research/20
@@ -227,7 +228,10 @@ operation's Response Syntax, and checked against AWS's own sample responses**
   (`test_bucket_list_return_data`, its versioning twin, `test_list_multipart_upload_owner`)
   are deselected for that reason when the suite runs against mantle.
 - **ETags** are passed without their quotes, the form the metadata layer keeps, and written
-  quoted. **Storage class** is `STANDARD` for every object: mantle stores objects one way.
+  quoted. **Storage class** is each object's own, stored per version and written as S3 writes
+  it: in every listing, ListParts and ListMultipartUploads, and on HEAD and GET for every class
+  but STANDARD (storage-classes.md §2). It was `STANDARD` for every object, which held only while
+  mantle stored objects one way.
 
 Where AWS's reference and samples leave a choice, mantle takes the one its evidence shows:
 
@@ -334,7 +338,8 @@ upload without `partNumber` is refused the same way rather than written as the o
 So is a subresource S3 defines only on buckets sent with a key, and one defined only on
 objects sent to a bucket: `PUT /bucket/key?lifecycle` writes no object, and
 `DELETE /bucket?uploadId=u` deletes no bucket. Subresources S3 defines and mantle does not
-serve are `501 NotImplemented` whatever the method. A `POST` to a bucket with none is a browser
+serve are `501 NotImplemented` whatever the method; `restore` and `intelligent-tiering`, once
+answered so, are served as storage-classes.md §2 sets out. A `POST` to a bucket with none is a browser
 upload (§12), which a form sends to "the URL of the bucket" (19 §2.1).
 
 ## 7. Lifecycle configuration
@@ -343,14 +348,16 @@ upload (§12), which a form sends to "the URL of the bucket" (19 §2.1).
 expiration actions: of current versions, of noncurrent versions, of delete markers left
 alone, and of incomplete multipart uploads** (`crates/s3/src/lifecycle.rs`; 13 §6.9).
 
-- **Transitions are refused.** mantle stores every object in one class, so a rule with a
-  `Transition` or `NoncurrentVersionTransition` is `501 NotImplemented`. The configuration is
-  checked first, so one S3 would refuse is answered as S3 answers it, as s3-tests expects of a
-  transition dated at no midnight. The checks S3 was recorded making of transitions are made:
-  a class it defines, 30 days before `STANDARD_IA` or `ONEZONE_IA`, no class twice, no dates
-  beside day counts. The order S3 requires between classes is not, since no transition is
-  taken. Accepting a transition and never making it would give back a configuration that does
-  not describe the bucket.
+- **Transitions are taken** (storage-classes.md §2, §7). A rule with a `Transition` or
+  `NoncurrentVersionTransition` is accepted once checked as S3 checks it: a class it defines, 30
+  days before `STANDARD_IA` or `ONEZONE_IA`, no class twice, no dates beside day counts, and the
+  order S3 requires between classes, its waterfall, one way into `DEEP_ARCHIVE`, with "the S3
+  Glacier Deep Archive transition must occur after at least 94 days" where a rule passes through
+  GLACIER first (research/28 §2.5–§2.6), recorded against S3 before it is relied on. A transition
+  falls due as an expiration does (below), the lifecycle executor commits the class change, and
+  the move follows as background work. Until storage classes were designed these rules were
+  answered `501 NotImplemented`, since accepting a transition never made would have given back a
+  configuration that did not describe the bucket.
 - **Two forms, as S3 has them.** A configuration whose first rule has a `Filter` is what S3
   calls Lifecycle V2; one whose first rule has its own `Prefix` is the form before it. S3
   refuses the other form beside the first, and in the older form refuses

@@ -1,7 +1,9 @@
 # Durability: the scheme a block is stored in
 
-Status: design, 2026-09-29; error bounds and field inputs 2026-09-30. Sources: docs/research/15 (durability models, cited as
-"15 §x") and docs/research/04 (erasure coding and placement, "04 §x").
+Status: design, 2026-09-29; error bounds and field inputs 2026-09-30; classes, detection and
+flush-unverified copies 2026-09-30. Sources: docs/research/15 (durability models, cited as
+"15 §x"), docs/research/04 (erasure coding and placement, "04 §x"), docs/research/28 (storage
+classes, "28 §x") and 29 (device classes, "29 §x").
 
 A block is stored as whole copies or as a Reed–Solomon code, one chunk to each failure
 domain (04 §R1.2, §R2). The scheme a block uses follows from how likely each scheme is to
@@ -22,6 +24,14 @@ infinite horizon, and it compares systems of different sizes.
 
 What it does not measure is how losses cluster across blocks. The copyset placement of
 04 §R2 bounds that separately: the chance that an event loses any block at all (04 §A6.3).
+
+**Per class.** Every S3 storage class but Reduced Redundancy is designed for the same eleven
+nines, archive included (28 §1, finding 1), so the target is the same; a class changes the
+failure domains a block may use (one zone, or several), the pool whose rates it is evaluated with,
+and the pool's repair rate (§5). One-zone classes are evaluated with the zone's loss rate at
+zero, as AWS's figure for them means, and their exposure to the zone reported beside it; Reduced
+Redundancy keeps this target unless the operator adopts AWS's 10⁻⁴ of objects; and any class may
+be given a stricter one (storage-classes.md §4).
 
 ## 2. The model
 
@@ -119,7 +129,24 @@ the conservative end of its source, in `mantle_ec::durability::field` (audit B09
 | Flash annual failure rate | 2.7% | The worst four-year replacement fraction of Schroeder et al. (FAST 2016), 10.31%, as a constant hazard; above Maneas et al.'s worst model, 1.2% | 15 §8.2 |
 | Power loss | once a year, destroying 1% of nodes | HDFS: "one-half to one percent of the nodes will not survive a full power-on restart"; the once-a-year is Cidon's, UNVERIFIED at his cited source | 15 §8.4 |
 | Rack, zone or site loss | none | No fetched source gives a permanent-loss rate; Ford's and Dean's rack events are transient. A deployment states its own (`--zones`) | 15 §8.4 |
-| Repair | detection and rebuild of one chunk | measured repair bandwidth; Ford's mean exceeds 20 minutes | 04 §R3, 15 §8.4 |
+| Repair | one over the mean time to detect a loss plus the time to rebuild one chunk, per pool | measured repair bandwidth and detection time; Ford's mean exceeds 20 minutes | 04 §R3, 15 §8.4, 28 §3.3 |
+
+**Detection is part of repair** (28 §3.3, D4). A device's loss is detected in seconds on online
+media; a latent sector error only when the scrubber reads it, on average half a scrub period
+after it occurs, so the repair rate of a pool is at most `1/(T_scrub/2 + T_rebuild)` for latent
+errors, and on spun-down media both wait for the group to spin up. The chain therefore takes
+latent errors as a loss of their own, at the rate measured on the pool's devices (research/10),
+repaired at that rate. The scrub period is the device's (chunk-store.md §9.1): the longest
+period at which the blocks it holds meet the target, never shorter than the device's workload and
+bandwidth bounds; where those bounds exceed what the target allows, the pool needs a wider
+scheme, and §4 chooses one, never a rating exceeded.
+
+**A copy on a device whose flush mantle cannot verify is weaker** (29 §3.8, §6.2, D4): a USB
+device, a cloud volume under ReadWrite host caching, or a drive whose volatile-memory backup has
+failed. Thirteen of fifteen SSDs lost flushed data when their power was cut (29 §3.8). Placement
+counts such a chunk toward a block's scheme only with the device's loss rate raised by its power
+losses, the yearly event of the table above taken as losing the chunk, and reports the device as
+flush-unverified.
 
 What the constant-rate chain leaves out, and where the sources show which way it errs
 (15 §8.5):
@@ -173,3 +200,6 @@ margin left after one zone's loss.
   per-block probability (04 §A6.3, §R2).
 - Choosing each block's scheme when it is sealed, with the placement service (STATUS,
   multi-machine operation).
+- Detection times per pool, spun-down groups above all, and whether a cold pool's measured rates
+  call for a code wider than the tested set, which would be added to `mantle-ec`'s tests first
+  (storage-classes.md §4).

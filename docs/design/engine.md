@@ -83,6 +83,18 @@ drops or replaces, and its file's port says which.
 - **Module layout follows RocksDB's tree** in Rust naming (`util/coding.rs` converts
   `util/coding.h`, `table/format.rs` converts `table/format.{h,cc}`), and each module's comment
   names the files it converts, so a reader can hold the two side by side.
+- **Integrity in memory** (research/31 §5.4, B13; D16). RocksDB's per-key-value protection,
+  "per-key-value checksums in memtables and write batches", off by default upstream, is on in
+  mantle's use, so a flip in a memtable or a batch between apply and flush is caught rather than
+  written into a table under a fresh block checksum; its cost is measured against RocksDB with
+  protection on in note 23's matrix. A block-cache hit returns bytes no checksum checks again,
+  ZFS's page-cache finding in mantle's metadata; cached blocks are verified on serve at a sampled
+  rate whose cost is measured, and a block that fails is dropped and read again and the failure
+  attributed (node.md §5.6).
+- **The block cache keeps RocksDB's policies.** HyperClockCache is lock-free on hits, the property
+  mantle asks of every cache (gateway.md §5), and the conversion keeps RocksDB's behaviour, so
+  the engine does not take the policy simulation mantle's own caches run; its size is its share of
+  the node's division of cache memory by miss-ratio curves (node.md §2.5), sampled the same way.
 - **Constants** that are format facts are kind `format` in constants.md with their RocksDB line;
   option defaults the engine inherits are not format and are set from note 12 §2's models or
   cited, never silently inherited (24 §1.19; CLAUDE.md §4).

@@ -1,9 +1,11 @@
 # Metadata: how mantle records buckets, objects and where their bytes live
 
-Status: design, 2026-09-28. Sources: docs/research/01 (Tectonic, cited as "01 §x" and
+Status: design, 2026-09-28; operation rows, resumable uploads, storage-class rows and validated
+reads 2026-09-30. Sources: docs/research/01 (Tectonic, cited as "01 §x" and
 [TEC]), 05 (S3 semantics), 06 (consensus and range-partitioned metadata), 07 (focal's
 consensus stack), 09 (cells), 12 (RocksDB and ZippyDB), 18 (Object Lock), 22 (garbage
-collection); docs/design/architecture.md.
+collection), 27 (upload scheduling), 28 (storage classes), 30 (resilient transfer), 31
+(caching); docs/design/architecture.md, gateway.md, storage-classes.md.
 
 The metadata service records what exists: buckets, the versions of every object, the
 multipart uploads in progress, which blocks hold an object's bytes, and which chunk stores
@@ -30,6 +32,7 @@ fits the Name layer to S3.
 | Name | (bucket, key, UPLOAD, upload) | a multipart upload in progress | (bucket, key) |
 | Name | (bucket, key, UPLOAD, upload, part) | an uploaded part | (bucket, key) |
 | Name | (MARKS, bucket, key, file) | a file the range took, until the sweep settles it | (bucket, key) |
+| Name | (OPERATIONS, bucket, key, principal, identity) | what a client's operation made and the answer its first delivery got, until its horizon passes | (bucket, key) |
 | Name | (RELEASED, time, file), in each range | a file nothing references any more, for the collector | the range's |
 | Name | (LINEAGE), in each range | the range's descriptor, and the child of its last split | the range's |
 | File | (file, HEADER) | length, extent count | file |
@@ -38,6 +41,14 @@ fits the Name layer to S3.
 | Block | (block, CHUNK, index) | the chunk store volume and chunk key holding chunk `index` | block |
 | Block | (ON, volume, block) | reverse entry: which of the block's chunks `volume` holds | block |
 
+- **A version carries its storage class,** and with it the fields S3's API reports about it:
+  for INTELLIGENT_TIERING its access tier and the last day it was accessed, and for an
+  archived version its restore record, whether a restore is in progress, its request date, its
+  completion and its copy's expiry (storage-classes.md §2, §7). The class is the logical one
+  the API answers by; where its blocks are is the File and Block layers' and may lag it during a
+  move (storage-classes.md §1). An upload carries the class its creation named, and a native
+  resumable upload also its source's identity, its resume horizon, its checksum algorithms and
+  the running state of each block hash at its last run (gateway.md §2.1).
 - **Everything for one object key is contiguous.** Its null-version pointer, its versions,
   its uploads and their parts sort together under `(bucket, key)`, so a Name range splits
   only between object keys and every operation on one key stays in one range, as
@@ -321,6 +332,37 @@ layers removes them, as Tectonic's does [01 §1.6].
       block, the adoption check, or adoption itself, the simulation loses a file or a block's
       chunk, or leaks one; `a_delayed_sweep_never_releases_a_file_another_settled` replays
       audit B01's schedule.
+- **Operations** (research/30 §3.4, D2; gateway.md §2.1). A version, part or completion whose
+  request carries an operation identity is committed in one transaction with an operation row,
+  keyed under its object key by the authenticated principal and the identity, naming what the
+  commit made (the version's order, or the part's number and file) and the answer the first
+  delivery got, its version ID, ETag and checksum. A later write carrying the same identity finds
+  the row, applies nothing, releases its own file as a refused write's is released, and is
+  answered from the row; so one identity has at most one effect, and an attempt that finds its
+  row never replaces what a later write made, which S3 does not promise. A refused first attempt
+  writes no row. The row lives for the horizon its client declared, capped by the server's
+  maximum, and the collector removes it once the range's time, the time agreed through the log
+  as marks are judged, passes its commit plus that horizon; an attempt after that is past the
+  horizon its own client stated and is refused `Expired` natively, and is a new write through
+  the HTTP listener, as in S3. The rows are bounded by the admitted mutation rate times the
+  horizon, which admission controls per principal, and the server's maximum is the bytes the
+  operator gives the operation rows over that rate: a budget, not a picked period. Keyed by the
+  object key, a row moves with the key's rows at a split, as marks do. Its proof is §2's
+  property test extended: every attempt of every identity delivered at any step, across
+  gateways, splits and clocks that run behind, with at most one effect, the same answer, no stale
+  replacement and each file released once; removing the row, its scope or its horizon check
+  fails it.
+- **Resumable native uploads** (research/30 §3.5, D3). A native upload is a multipart upload
+  whose parts, runs, are numbered by the range as the gateway hands them over, each committed
+  with the upload row's new durable offset and hash states in one transaction, so the offset
+  only rises and cannot drift from the runs. A run's commit is a part's: from it the run needs no
+  renewal. Abort, expiry and completion release or adopt each run exactly once by the existing
+  rules (below, "Adoption").
+- **Validated reads** (research/31 §3.6, D3; gateway.md §5). A gateway holding a key's row asks
+  the range, in a read confirmed by ReadIndex like any other, whether the key's first row is
+  still the version it holds; the range answers "unchanged" with no row, or with the current row,
+  a delete marker's or an absence's included. One read round confirms every validation asked
+  before it began, and one asked while a round is out waits for the next (replica.md §3).
 - **Multipart.** CreateMultipartUpload writes the upload row. UploadPart writes the part's
   chunks, blocks and file, then replaces the part row. CompleteMultipartUpload writes the
   object's file of part extents in its File range, then, in the Name range, checks the
@@ -628,6 +670,11 @@ cover the production engine, which the simulator cannot.
   once the gateway runs.
 - The bound on a cached bucket row's staleness, and how a versioning change reaches
   gateways within it.
+- Open uploads held by one principal: their rows are bounded per upload (10,000 parts), and their
+  bytes are reported per bucket and principal and removed by `AbortIncompleteMultipartUpload`
+  (gateway.md §2.1); S3 states no cap on uploads in progress (research/27 §11 item 7), so the
+  bound is the tenant's storage contract, which open uploads' bytes count against, once
+  contracts are stored.
 - Where a bucket's lifecycle and tag configurations live. A lifecycle configuration at its
   largest, 1,000 rules with the longest IDs, prefixes and tags, is about 13 MB unescaped
   (docs/design/s3-protocol.md §7). That is too large for the bucket's row, which every

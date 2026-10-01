@@ -1,7 +1,8 @@
 # The Raft log: one log per metadata device, shared by every range on it
 
-Status: design, 2026-09-28. Sources: docs/research/06 (consensus, cited as "06 §x"), 07
-(focal's consensus stack), 03 and 11 (I/O and the operating-parameter models), 01
+Status: design, 2026-09-28; waking, alignment and power 2026-09-30. Sources: docs/research/06
+(consensus, cited as "06 §x"), 07 (focal's consensus stack), 03 and 11 (I/O and the
+operating-parameter models), 26, 28 and 29 (concurrency, power, device classes), 01
 (Tectonic, Ceph BlueStore as [AWK+19]); docs/design/chunk-store.md, whose techniques this
 log reuses, and docs/design/metadata.md §3, which places it.
 
@@ -30,8 +31,11 @@ log's segments are reused the same way (§2, §5).
 
 The log is one file of fixed-size segments, preallocated a segment at a time and grown up to
 a quota, as a file-backed chunk volume grows (chunk-store.md §2). Every offset and length is
-a multiple of the file's alignment `B`: the larger of 4 KiB and the device's logical and
-physical block sizes, as for the chunk store.
+a multiple of the file's alignment `B`: the largest of 4 KiB, the device's logical and
+physical block sizes and its write unit, as for the chunk store (chunk-store.md §2). A log of
+small frames is where a unit above the physical block costs most: each frame padded to 4 KiB on
+a drive whose unit is 16 or 64 KiB made the drive rewrite its unit once per frame (research/29
+§3.3), so the padding goes to the unit. Before, `B` took the logical and physical sizes alone.
 
 - **The persist area.** The file's first segment's length holds two persist slots, and the
   segments follow it. Each frame's flush also writes a persist record into the slot of its
@@ -91,7 +95,8 @@ nothing of Raft's message formats, so it depends on no Raft crate.
 
 ## 3. Writing
 
-One writer thread per log runs the chunk store's group-commit loop (chunk-store.md §4). A
+One writer per log runs the chunk store's group-commit loop (chunk-store.md §4), as a state
+machine on its device's issuer (node.md §1.2), which is one thread for everything on the device. A
 bounded queue admits submissions by count and by bytes and refuses past either with `Busy`
 [research/11 §4] (§3.1). A submission holds its room until it is answered, so the bound
 covers updates waiting to be taken, those held for a later frame, those being written and
@@ -127,9 +132,24 @@ never lands before an older one.
 
 A replica cannot have its update refused: once the core has handed over a `Ready`, it takes
 no other call until the `Ready` is made durable (07 §1.2). So a replica submits by waiting
-for room in the queue instead of taking `Busy`. The writer frees room with every batch it
-takes, and a fence wakes every waiter, so the wait lasts no longer than the writer's
-progress.
+for room in the queue instead of taking `Busy`. Waiters wait in arrival order, each in a slot of
+its own; room the writer frees is handed to the waiters it fits, in order, and only those are
+woken, one wake each, and a fence completes every waiter's slot with its answer once (node.md
+§1.3). The waiting list is bounded by construction: a group waits with at most its two
+submissions, and the log holds at most `max_groups`. The wait lasts no longer than the writer's
+progress. Before, room was a condition variable the writer broadcast to every waiter on every
+answered submission; on macOS that broadcast walks every waiter inside one kernel spinlock, and a
+benchmark of thousands of replicas, each a thread, held it until the kernel panicked
+(research/26 §1.3–§1.4).
+
+The writer's wait follows the chunk store's rules for power (chunk-store.md §4): on battery or
+in saver mode it waits for its returning replicas up to the measured batch service time, which
+loses no throughput and at most doubles a lone update's latency (research/28 §4.5, D14), and an
+update is answered when it is durable whatever the power. The log does not overlap frames even
+on a device whose flush measured free (measurement.md §9, C2), where the chunk store does
+(chunk-store.md §4): a frame's persist record states that the frame before it was flushed, and
+recovery's rule that a valid later frame proves every earlier one acknowledged (§2, §6) rests on
+each frame being written only after the one before is flushed.
 
 A replica that leads may send its appends to followers before its own flush completes;
 followers answer only after theirs (06 §C.c, item 2). The log lets both happen: a
@@ -308,9 +328,16 @@ frames do: it frees one segment and fills that much of another. Each segment cou
 bytes its frames take, padded, since it opened; recovery counts them as it replays. The
 copies take at most the tail's live bytes and a relocated record's header for each live
 piece, as if no two entries ran together. The tail is swept only when those copies fit one
-frame and their padded frame is smaller than the tail's frames. A tail of frames that each
-held a few small pieces is swept, since its copies pack into one frame; a tail of one large
-live entry is not, since its copy would take a frame as large. Before, the writer swept any
+frame, and either their padded frame is smaller than the tail's frames or the segment after
+the tail, unless it is the head, holds nothing live. A tail of frames that each held a few
+small pieces is swept, since its copies pack into one frame. So is a tail whose small live
+record holds back a dead segment behind it, since the frame naming the later tail frees both
+(tails are freed oldest first, so a dead segment waits for the tail to pass it). A tail of
+one large live entry with live segments behind it is not swept, since its copy would take a
+frame as large. Before, a group's hard state left alone in the oldest segment, in a frame
+as small as its copy, was never swept. Every dead segment behind it stayed live in the log's
+count, and once the log had answered `Full`, no frame larger than the head's remaining room
+went in again, however much its groups compacted. Before, the writer swept any
 tail whose live bytes were below a frame's room. A tail with nothing to free was copied into
 a segment of its own, freeing one and taking one; the update waiting never fitted beside the
 copies, so the writer swept segment after segment without ever answering it. Where no
@@ -495,7 +522,9 @@ multi-sector writes, fails flushes after marking pages clean, and flips bits on 
   is written in the next frame under hot traffic of any class;
 - a log whose segments are all live answers `Full` within one frame and one sweep's reads,
   takes the compaction it waits for even after writes that followed a small compaction,
-  and goes on once groups compact; a reopened log sweeps the segments it recovered;
+  and goes on once groups compact; a reopened log sweeps the segments it recovered; once
+  its groups compact, a log that answered `Full` takes entries of any size up to a frame's
+  room, though a small live record sits in its oldest segment;
 - reclamation never loses a live record, and a lost frame that swept the tail loses
   nothing unreported when the next frame's opening tears over the segment it freed;
 - a group's state after recovery equals its state before the crash, less what was never

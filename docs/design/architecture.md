@@ -1,8 +1,9 @@
 # Architecture: regions, cells and ranges
 
-Status: design, 2026-09-28. Sources: docs/research/09 (cells, routing, moving data; cited
-as "09 §x"), 01 (Tectonic and Meta's storage), 04 (erasure coding and placement), 05 (S3
-semantics), 06 (consensus and range-partitioned metadata), 07 (focal's consensus stack).
+Status: design, 2026-09-28; fleet shares and caches 2026-09-30. Sources: docs/research/09
+(cells, routing, moving data; cited as "09 §x"), 27 and 31 (scheduling, caching), 01
+(Tectonic and Meta's storage), 04 (erasure coding and placement), 05 (S3 semantics), 06
+(consensus and range-partitioned metadata), 07 (focal's consensus stack).
 Parameters named here are sized by models or measurements in docs/research/11; none is
 chosen by hand.
 
@@ -87,9 +88,10 @@ a cell.
 
 ## 5. Routing
 
-Every hop runs over QUIC. Nodes speak mantle's own protocol over QUIC to one another, and
-clients speak the same protocol through mantle's client library and CLI, with S3's semantics as
-its operations, as slates carries its own protocol over QUIC (08); Fast Raft and SWIM use a
+Every hop runs over QUIC, and over TLS on TCP where a network blocks UDP (node.md §3). Nodes
+speak mantle's own protocol over QUIC to one another, and clients speak the same protocol
+through mantle's client library and CLI (gateway.md §6), with S3's semantics as its operations,
+as slates carries its own protocol over QUIC (08); Fast Raft and SWIM use a
 separate UDP plane (node.md §3). Stock S3 tools reach a cell through an HTTP/1.1 listener that
 speaks the S3 wire protocol, on by default, which translates each request onto the same path.
 No other HTTP version is offered, since Amazon S3 serves none: offered HTTP/2 by ALPN its
@@ -175,7 +177,21 @@ leadership transfer and replica moves.
 - **Admission control per tenant at the gateway,** with time-limited tokens vended to
   gateways, as DynamoDB moved to after per-partition limits diluted throughput on splits
   (09 §0 item 9); per-range and per-node limits stay as ceilings. Over budget, or while a
-  range splits, the answer is `503 SlowDown`, which S3 clients retry with backoff.
+  range splits, the answer is `503 SlowDown`, which S3 clients retry with backoff, or on the
+  native protocol a withheld credit and a typed refusal (node.md §4.5). Within a tenant,
+  principals share by fair queueing with state bounded by admitted work, never by the
+  principals that exist (node.md §2.7).
+- **A tenant's share across the fleet without a global bottleneck** (research/27 §7.6,
+  D13–D16). Every level decides locally on a summary that moves: within a cell, the admission
+  service divides a tenant's contract among the gateways serving it in proportion to their
+  measured demand, DRL's FPS; within a region the same division among cells on a longer
+  interval, principal limits that span cells counted by count-min sketches merged by addition
+  from cells to region, their error set against the smallest regional limit; across the fleet
+  the same again, slower. DRL proves "a distributed limiter cannot be simultaneously perfectly
+  accurate and responsive", which is the stated staleness each level accepts in place of a
+  global limiter on the request path. With one participant at a level, its mechanism is the
+  level below's and no message is sent. A hot bucket that outgrows its cell splits across
+  cells by §6.1; the router stays thin.
 - **Shuffle sharding of request resources** (gateways, admission queues): a tenant's shard
   size is its client's retry count plus one, and isolation needs a pool of at least
   16–64 (09 §8.3, derived). Metadata ranges and chunk placement are not shuffle-sharded.
@@ -199,6 +215,12 @@ configuration (09 §9.9).
 3. Configuration moves by constant work: full snapshots on a loop.
 4. Every control-plane action has a rate limit and a stop switch.
 5. The control plane keeps its state in mantle's own Raft ranges, in the root range.
+
+Caches never span regions. S3's consistency is per region, and a bucket lives in one; every
+cache that answers for a key validates against the range that owns it (gateway.md §5), and a
+deployment that states a clock-drift bound may let leaders, or a quorum's members, validate under
+a lease so that clients far from a leader do not pay a round trip per read (research/31 §6;
+replica.md §7).
 
 ## 10. Verified before built
 

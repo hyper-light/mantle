@@ -1,8 +1,11 @@
 # Chunk store: how mantle writes bytes to a device
 
-Status: design, 2026-09-28. Sources: docs/research/03 (cited by its keys, e.g. [RO92]),
-docs/research/01 (Tectonic, Haystack, Ambry), docs/research/11 (models for the operating
-parameters, cited as "research/11 §x"), docs/measurements.
+Status: design, 2026-09-28; device classes, power, budgets and carried checksums 2026-09-30.
+Sources: docs/research/03 (cited by its keys, e.g. [RO92]), docs/research/01 (Tectonic,
+Haystack, Ambry), docs/research/11 (models for the operating parameters, cited as
+"research/11 §x"), docs/research/26–31 (concurrency, upload scheduling, storage classes and
+power, device classes, resilient transfer, caching and integrity; cited as "research/29 §x"),
+docs/measurements.
 
 A chunk is the unit one device stores: one replica or one erasure-coded shard of a
 block. The chunk store owns a device and keeps chunks durably, verifies them on every
@@ -23,8 +26,73 @@ storage server run the same code.
 
 ## 2. Volume layout
 
-All offsets and lengths are multiples of the volume's block size `B`: the larger of 4 KiB
-[HL23 §2.2] and the device's logical and physical block sizes (`mantle-disk` identity).
+All offsets and lengths are multiples of the volume's block size `B`: the largest of 4 KiB
+[HL23 §2.2], the device's logical and physical block sizes, and its write unit (`mantle-disk`
+identity). The write unit is the smallest write the device takes without a read-modify-write:
+on NVMe the namespace's preferred write granularity, NPWG, "the smallest recommended write
+granularity", which the host "should minimally construct writes" to meet (research/29 §3.3).
+Linux reports it as `queue/minimum_io_size`, and reports `physical_block_size` as the *smaller*
+of NPWG and the atomic-write unit, because "Linux filesystems assume writing a single physical
+block is an atomic operation"; so a QLC drive with a 16 KiB or 64 KiB indirection unit and 4 KiB
+atomic writes reads 4096 there and its unit only in `minimum_io_size` (research/29 §3.3, finding
+1). For random aligned writes of `s` below the unit `IU` the device programs whole units, a
+write amplification of `IU/s` from that cause alone, and a log that appends small batches into
+one unit rewrites it once per batch. Where the device does not report a unit (SATA, USB, SD,
+eMMC, cloud volumes, NVMe without NPWG, and macOS, which exposes none found), calibration
+measures it at format: durable aligned random writes of 4 to 64 KiB, the unit being the smallest
+size above which throughput per byte stops rising (measurement.md §9, C3). `B` is fixed at
+format and recorded in the device's profile (node.md §1.6). Before, `B` took the logical and
+physical sizes alone, and on such a drive every batch padded to 4 KiB paid the device a
+read-modify-write of its unit.
+
+### 2.1 The device's plan by class
+
+The plan a volume runs on its device follows from the device's identity, confirmed by
+measurement (CLAUDE.md §5), never from a class assumed. Each row is research/29 §8.1–§8.7;
+measurement.md §9 lists the probes.
+
+| Input | NVMe flash | SATA flash | Disk (CMR) | USB, SD, eMMC | Cloud block volume |
+|---|---|---|---|---|---|
+| `B` | max(4 KiB, logical, physical, NPWG) | measured unit | physical sector | measured unit | measured unit |
+| Write size the writer issues | multiples of NOWS where reported, else the calibrated knee | the knee | at least `s = 9·R·t_p` per positioning, `R` and `t_p` calibrated: 90% of a positioning's time transferring (research/29 §5.1) | at most `max_hw_sectors_kb` | 256 KiB on an SSD volume, 1 MiB on an HDD volume, the sizes EBS counts as one I/O (research/29 §6.4) |
+| Depth | the measured knee, reads and writes apart | ≤ 32 (NCQ) | the knee, small | 1 under Bulk-Only Transport; the knee under UAS | provisioned IOPS / 1,000, AWS's stated depth, and the knee where it is lower |
+| Flush | per batch; free where the drive reports no volatile cache (§4) | per batch, a whole-cache FLUSH CACHE EXT, Linux sending no FUA to SATA by default | per batch | per batch; recorded flush-unverified (§4) | per batch; recorded flush-unverified where host caching is ReadWrite |
+| Placement handles | one per stream where the operator provisioned FDP (§4) | none | none | none | none |
+| Discard | whole freed segments (§8) | the same | none | the same | none on instance store, which arrives trimmed |
+
+A parity RAID or md device under a volume is planned as one device with the stack's
+`minimum_io_size` (the stripe chunk) and `optimal_io_size` (the stripe width); mantle codes
+across failure domains itself, so the array's write hole and small-write penalty buy redundancy
+mantle does not use, and deployment guidance is to give mantle the member disks (research/29
+§6.5). Drive-managed SMR takes the disk row with writes of at least 8 MiB, never interleaved,
+and idle time for its own cleaning (research/03 W3); host-managed zoned devices stay refused
+until a zone backend exists: the index log as a chain of zones, superblocks in zones of their
+own, a segment per zone, open segments within the device's open-zone limit, and frames issued
+after their records under Zone Append, which returns the address it wrote only on completion
+(research/29 §4.1, §4.5). FDP gives most of the device-side benefit with none of these changes,
+so it comes first. Instance-store volumes vanish on any stop
+(research/29 §6.4), which placement treats as a failure domain's loss, not a planner input.
+
+**Host over-provisioning is derived, not set.** A volume uses its whole device and discards
+freed segments (§8). It leaves space unallocated only where the device's Endurance Group log
+shows device write amplification rising with fullness on that device; FDP25 measured 1.3 at
+half full and 3.5 full without segregation, and about 1.03 at any fullness with it (research/29
+§3.4).
+
+**The index log of a volume on a disk lives on flash where the node has flash.** Each group
+commit writes its records into the open segment and its frame into the index log at a fixed
+offset, two places on the platter: at 7,200 rpm rotational latency alone averages 4.17 ms, so
+an idle-to-busy commit costs two positionings and a flush, and light-load commits on a disk run
+at tens a second however small the requests (research/29 §8.4, finding 7). Where the node has a
+flash device, the volume's index log is a file there (a metadata device's file system,
+raft-log.md §1), named by the volume's superblocks with its own identity and sequence; the frame
+keeps its separate I/O and so its power to reveal a lost data write [BGS+08-F7], and the commit
+pays one positioning. A volume whose log device is lost rebuilds its index from the data records
+alone (§6). A disk-only node keeps the log in the volume, at the low LBAs that sit on the fast
+outer tracks (research/29 §5.1), and pays the second positioning, which calibration measures and
+`mantle status` reports (measurement.md §9, C7). Folding the frame into the segment beside its
+batch would save that positioning at the price of the separate copy, turning a lost write into
+an undetected one; mantle keeps the copy (§3.2).
 
 | Region | Offset | Size | Contents |
 |---|---|---|---|
@@ -102,6 +170,16 @@ is the Castagnoli polynomial [CBH93; Koo02]. A read verifies the header CRC, the
 against what the index expects, the incarnation against the segment's, and the CRC of
 every checksum block it returns.
 
+**The checksum table is carried, not recomputed.** A chunk write carries the CRC-32C of each
+64 KiB block of its payload as the gateway computed them over the bytes it coded, and the volume
+verifies each block against its value and stores those values in the record's table. It never
+writes a table of its own recomputation over bytes in its memory, since a checksum made after a
+corruption protects the corruption: ZFS found that "any corruption to blocks that are dirty ...
+is written to disk permanently on a flush" for exactly that reason (research/31 §5.5, boundary
+B5). The chunk's whole CRC-32C is the combination of the table's, which needs no second pass
+over the bytes (research/31 §5.3). A read returns the stored values for the blocks it returns,
+so the gateway verifies what left the node's memory (B8).
+
 ### 3.2 Index frames
 
 The index log holds a second copy of every record's identity and location, written in
@@ -128,7 +206,10 @@ seek per batch. The separate copy is what turns a lost data write into a detecte
 frame written in the same I/O as its data, or lazily after it (Haystack writes its index
 asynchronously and rebuilds the tail from needles [HAY §3.5]), would give that up for
 acknowledged writes the metadata service alone would then have to catch. Deciding needs the
-field rate of lost writes [BGS+08] against the measured cost per device class.
+field rate of lost writes [BGS+08] against the measured cost per device class. On a disk the
+cost is a positioning per batch, which §2 removes where the node has flash by moving the log
+there; on flash it is the bandwidth above, which C2's split of a flush's cost by dirty bytes
+(measurement.md §9) attributes per device.
 
 Frames carry consecutive LSNs. Recovery tells a torn tail from corruption by what follows
 an invalid frame [AGL+18 §3.3.3; GAA17 §4.2]: nothing with the next LSN means a crash
@@ -189,12 +270,70 @@ segment in use, sorted every free one and copied the whole table for readers, an
 1 MiB scrub step summed every segment's live bytes (audit P06;
 [measurements](../measurements/2026-09-29-segment-table.md)).
 
-A volume runs three threads: the writer, the cleaner (§8) and, when scrubbing is on, the
-scrubber (§9). The volume owns each from the moment it starts, so a start the operating
-system refuses part way stops and joins those already running before the error returns,
-and nothing is left holding the device (audit S12). Detached, the writer would keep the
-cleaner's wake channel open and the cleaner the writer's queue, each waiting on the other
-for good.
+**How a batch reaches the device.** A batch's writes are issued in pieces of the plan's write
+size (§2.1) and never larger than the device dispatcher's unit `u`, the smallest transfer at
+which the device reaches its bandwidth (node.md §2.7): at 200 MB/s one 8 MiB write is 42 ms in
+which a small read behind it waits (research/27 §6.4). Cutting a record into several device
+writes weakens nothing: durability is decided at the flush, and recovery already takes a batch's
+writes as having landed in any order (§6). Research note 27 left this open (§11 item 5); the
+flush's semantics close it.
+
+**The flush, by what the device declares and what it measures.** A drive that reports no
+volatile write cache (NVMe's VWC clear; Linux's `queue/write_cache` "write through" with `fua`
+off) is one where a Flush "shall have no effect" (research/29 §3.8), as drives with power-loss
+capacitors report. Calibration measures the flush twice, after dirty writes and on an empty
+cache (measurement.md §9, C2): where both are the cost of the command alone, the batch's
+service time is its write time, and the writer issues the next batch's writes as soon as the
+last batch's writes have completed, without waiting for its flush call to return (research/11
+§5), answering each batch in order once its own flush is done. A later batch's frame is thus
+still written only after the earlier batch's writes completed, which on such a device is when
+they are durable; if the drive's claim is false, recovery finds an earlier batch damaged beneath
+a later frame and reports it, the direction that costs repair and never loses an acknowledged
+write (§6). Where the flush costs the dirty data's
+programming, as on consumer NVMe, every SATA device and every disk, the flush is the cost the
+group commit amortizes and batches go one at a time. A declaration is the drive's claim:
+thirteen of fifteen SSDs, "enterprise-class" ones among them, lost data their kernel had flushed
+when Zheng et al. cut their power (research/29 §3.8, finding 4). So a device whose flush mantle
+cannot verify, every USB-attached device (whose bridge may never see a flush, research/29
+§6.2), a cloud volume under ReadWrite host caching, and a drive whose SMART log reports its
+volatile-memory backup failed, is recorded flush-unverified, and placement counts a chunk there
+as a weaker copy (durability.md §5).
+
+**The wait, by class and by power.** The writer's wait for returning submitters is the derived
+wait (`mantle_disk::commit`; research/11 §2) with three changes. A batch holding an
+EXPRESS_ONEZONE write does not wait: a lone request is flushed at once (research/11 §2.4;
+storage-classes.md §5). On battery or under the OS's saver mode, the writer waits until every
+outstanding submitter has returned, the batch limits are reached, or the measured batch service
+time `S` has passed, whichever comes first: each request that joins a batch saves a flush's
+energy, and within `S` the wait costs no throughput, so the longest wait the bound allows is the
+energy-minimizing one, and a lone request's latency at most doubles, `S` to `2S`
+(research/28 §4.5; research/11 §2.3). Under thermal state Serious or worse every class, Express
+included, takes that rule (node.md §1.8). Acknowledgement never changes: a write is answered when
+it is durable, on battery as on mains.
+
+**Placement handles.** On a drive the operator provisioned with Flexible Data Placement, each
+stream writes under its own placement handle: client writes, each of the cleaner's three age
+streams, the index log, the superblocks, and the long-lived stream of storage classes with a
+minimum duration (§8) while handles last, so data of one death time fills the device's reclaim
+units together (research/29 §4.2, §4.5). With segregation FDP25 held device write amplification
+at about 1.03 at any fullness, against 1.3 to 3.5 without (research/29 §3.3). A reclaim unit
+(gigabytes) is far larger than a segment, so the claim that the cleaner frees a stream's
+segments nearly in write order, which keeps the device's amplification near one under initially
+isolated handles, is checked on each device from its Endurance Group log (measurement.md §9,
+C10), never assumed. Enabling FDP deletes every namespace of the endurance group (research/29
+§4.2), so it is an operator's step at drive intake; mantle never does it. Linux carries the
+handle as io_uring's per-write `write_stream`; macOS and Windows expose no interface the research
+found, and there the streams write as today.
+
+**One issuer per physical device.** The writer, the cleaner and the scrubber of every volume on
+a device, and the device's Raft log writer where the device holds metadata, are state machines
+run by that device's issuer thread, which submits their I/O through the platform's asynchronous
+interface or the device's bounded pool of blocking workers (node.md §1.2). Each was a thread of
+its own, three per volume, 300 at 100 volumes (audit §14.1), and `write_together` started a
+scoped thread for each region of a batch after the first; neither grows with volumes or batches
+now (research/26 §4.7, recommendation 7). The issuer owns its volumes from the moment it starts
+them, so a start the operating system refuses part way stops what it started, in reverse, before
+the error returns, and nothing is left holding the device (audit S12).
 
 A failed write or flush fences the volume: the batch fails, no later request is accepted,
 and the volume must be reopened and recovered. A failed flush is never retried, because
@@ -339,6 +478,27 @@ device not measured reads one at a time. Before this gate nothing bounded the re
 took at once: every caller's thread read at the device. The scrubber's paced steps (§9) and
 the cleaner's relocations (§8) keep their own pacing outside the gate.
 
+The gate is the device dispatcher's (node.md §2.7): the reads that wait are taken in start-tag
+order across tenants and principals rather than in arrival order, and each is charged its cost
+in the device's measured units, so one principal's flood of reads waits behind its own share.
+On a disk, the reads the dispatcher releases together are issued sorted by address, ascending,
+so the drive's queue can reorder them (C-LOOK "achieves the highest performance among
+seek-reducing algorithms", research/29 §5.2); one at a time forfeits it. A latency sample taken
+on a device records the idle time before its request, so the exit from a low-power state (up to
+6 ms on a consumer NVMe drive after 100 ms idle under Linux's defaults, research/29 §3.9) is a
+known second state of the device and not a fault or noise (research/29 §9 item 14; research/10
+R5).
+
+**A chunk cache in front of the device, where it pays.** The volume reads with direct I/O and
+the page cache is bypassed (§1). A node may hold verified chunk bytes in memory, and on flash in
+front of disks, keyed by chunk key, which is never reused and names bytes that never change, so
+the cache needs no invalidation (research/31 §3.1). It is filled only with bytes that verified
+and served only after they verify again against their stored checksums (research/31 §5.8). Its
+size is the node's division of memory by measured miss-ratio curves (node.md §2.5), which may
+give it nothing, the right answer on a laptop where the gateway's caches filter the stream
+first. A flash tier's admissions are paced so its writes stay within the flash device's rated
+endurance (research/31 §3.3).
+
 The depth of greatest power, Kleinrock's optimum (research/11 §13.3), is the wrong bound
 here: on this machine it is 16, where 4 KiB reads still gain 30% by 64 in flight, and
 holding the device at 16 with the rest waiting halved throughput at 32 callers and more than
@@ -346,6 +506,23 @@ doubled their median latency against the same reads through the file layer
 ([measurements](../measurements/2026-09-29-read-depth.md)). Power trades throughput for
 latency, which pays only where reads refused go to another copy with room; reads made to
 wait in software rather than at the device lose throughput and gain nothing.
+
+A read is let through the gate for everything it holds at once, counted together against
+`Reads::bytes`: the buffers the device reads into, the output it fills, and the fragment it
+reads (audit S07). The output used to go uncounted, and a read of a chunk appended in many
+fragments gathered all of them first, so the gate bounded the device's bytes in flight but
+not the memory reads held. A buffered read (`Volume::read`) holds its whole range, so it
+takes at most the larger of what one record holds, the most a put writes, and the gate's
+bytes; a larger range is `TooLarge`, and is read with `Volume::stream`, which reads it a
+piece at a time into the caller's buffer, each piece verified like any read and let through
+the gate on its own, from one fragment looked up as it is reached. A chunk of any size is
+then read holding one piece's buffers and output: a test streams a 2.4 MB chunk of 24
+fragments through a 64 KiB gate from four readers at once and never holds more. A stream
+reads the chunk it began with: the chunk's first fragment's length and checksum, which
+relocation keeps, are checked at each piece, and a chunk deleted and written again under its
+key reads as not found rather than as a mix of the two. Range reads, cold and warm, alone and
+beside writes, are measured in
+[measurements](../measurements/2026-09-30-chunk-range-reads.md).
 
 ## 8. Deleting and cleaning
 
@@ -363,17 +540,55 @@ must still treat as live raises its internal garbage collection [HKA17 Obs. #8, 
 Cleaning starts when free segments fall below a runway: enough to take writes at the
 fastest rate seen, `W`, while the cleaner reacts (a batch: the writer wakes it after each)
 and cleans one victim (the longest one has taken), plus a batch arriving between wakes,
-and the client's one-segment reserve [research/11 §10.3]. Before a victim has been timed,
+and the reserve kept from client writes, a segment for each of the cleaner's three streams
+[research/11 §10.3]. Before a victim has been timed,
 cleaning one counts as two segments of writes, reading and rewriting a wholly live victim at
 the rate writes arrive. LFS set its thresholds without study and found performance
 insensitive to them [RO92 §3.4], and a fraction of the volume holds a 20 TB disk's 1.25 TB
 idle for a runway of a few segments [research/11 §10.3]. A pass cleans until free segments
-are one past the runway. It picks sealed segments by cost-benefit, `(1−u)·age / (1+u)` with
-`u` the live fraction and `age` the youngest record's age [RO92 §3.6]; the scores move with
-the clock, so each victim is chosen over the whole table, one pass against the victim's
-relocation, which reads and writes what is live in it. It copies their live
-records to the cleaner's stream (sorted by age), and frees the segment once the copies are
-durable and indexed. Victims of live fraction `u` free `1 − u` segments each [RO92 §3.4],
+are one past the runway. It picks sealed segments by cost-benefit, `(1−u)·age / u` with
+`u` the live fraction and `age` the time since the segment was opened. That is LFS's ratio
+[RO92 §3.6] with RAMCloud's two corrections [RKO14 §9]: the cleaner reads and rewrites only
+the live data, so a victim costs `u` each way, not LFS's `1 + u` for reading it whole; and the
+age is the segment's, reset when its data is cleaned into another, not its youngest
+record's. A relocated record keeps the time its chunk was written, so by the youngest
+record's age the segments the cleaner writes look as old as their data, and the policy
+cleans them again at high utilization; RAMCloud found the same, and 70% more write
+throughput at 90% utilization from the change. Each segment's opening time is in its
+segment record, so recovery restores it.
+
+The scores move with the clock, and a pass over the table for each victim held the table's
+lock against the writer's publication for the pass (audit P06). The table keeps the
+candidates in a kinetic tournament instead [BGH99 §4]: a score is a line in time,
+`(a/b)·(t − o)` with `a = S − L`, `b = L`, so each match of a tournament tree over the
+segments holds its winner at the tree's time with the time its loser's line passes the
+winner's, found exactly, and the earliest such time below it. Moving the clock replays only
+the matches whose certificates have failed, a segment's change replays its path to the
+root, and a victim skipped in the pass is passed over best-first, a subtree at a time.
+Scores compare exactly, in 256-bit products with ties to the lower segment, so the
+tournament names the segment a scan of the table names, which a property test checks over
+random tables, changes and times, forward and back (a clock stepped back replays every
+match). At 62,403 segments a choice took 262 µs at the median by the pass and 19.5 µs by
+the tournament with eight segments changed since the last
+([measurements](../measurements/2026-09-30-chunk-victims.md)). The victim is cleaned only in
+the incarnation it was chosen in.
+
+The cleaner moves a victim's live records into one of three streams of its own by the age of
+their data, the time since the chunk was written: below 4ℓ, below 16ℓ, and older, where ℓ is
+the mean time client segments lived before they were cleaned, taken over each 16 cleaned.
+These are SepBIT's classes of rewritten data [WLL+22 §3.4], deployed at Alibaba Cloud;
+data written once and deleted later, as chunks are, has only its age to predict when it will
+die, and grouping data of like age makes segments that die together. The client's writes
+keep their own stream, as LFS kept cleaned data apart [RO92 §3.6]. Until ℓ is known, all go
+to the youngest's stream. Each segment's stream is in its segment record, so recovery
+continues each stream's newest open segment. A model of the volume's cleaning measured the
+choices against each other, uniform, hot-and-cold and heavy-tailed lifetimes at 75–90% live
+([measurements](../measurements/2026-09-30-chunk-cleaning.md)): the old policy, youngest
+record's age and one cleaner stream, wrote 2.38–6.17 times what clients wrote under
+uniform deletes, 1.65–3.04 under hot-and-cold and 1.79–2.52 under the heavy tail; this one
+writes 6–10%, 7–19% and 9–12% less. Greedy, the emptiest segment first, which is optimal
+when deletes are uniform [Des14], is 1–3% better there and 20–95% worse under skew. The
+copies are freed once they are durable and indexed. Victims of live fraction `u` free `1 − u` segments each [RO92 §3.4],
 so a net gain is due once they have held a segment's worth of dead space beyond what
 packing their live data costs; a pass that gains nothing by then stops, and cleaning waits
 until more data is deleted. A pass's gain is the victims it frees less the segments its
@@ -386,6 +601,34 @@ is no victim at all: cleaning it only moves its data, and a volume filled in chu
 nearly a segment each, whose only dead bytes are padding, was cleaned victim after victim
 for nothing. A pass that finds no victim is futile as one that gains nothing is (audit P06).
 One pass runs at a time.
+
+**A storage class is a second predictor of death.** A write whose object declares a class with
+a minimum duration (STANDARD_IA, ONEZONE_IA and GLACIER_IR for 30 or 90 days; archived classes
+moving to a cold pool) is written straight into the oldest cleaner stream rather than the
+client's: "data written once and deleted later ... has only its age to predict when it will
+die", and the class is the client's own statement that it will live months (research/28 §3.4,
+D6). The cleaner then need not copy it there. The cleaning model of
+measurements/2026-09-30-chunk-cleaning.md, run on a class-labelled trace, measures the write
+amplification saved.
+
+**Freed segments are discarded.** When the cleaner frees a segment, the volume discards its
+range, aligned to the device's `discard_granularity` and split at `discard_max_bytes`, since "some
+devices exhibit large latencies when large discards are issued" (research/29 §3.5); dead data the
+drive must keep as live raises its garbage collection [HKA17 Obs. #8, #21]. A discarded range
+reads back as zeros, ones or its old bytes as the drive reports (DLFEAT), which recovery already
+treats as no record, since roll-forward takes nothing without its checksum and a sequence above
+the superblock's reservation (§6). On a file volume a discard is a hole, and a hole is
+never-written space: where calibration found the first-write penalty (§2), discarding brings the
+penalty back on the segment's next pass, so there the volume weighs the device's measured
+garbage-collection cost against its own measured penalty and discards only where the first is
+larger (research/29 §3.5, D12). A device that arrives trimmed, as instance store does, is not
+discarded whole at format.
+
+**Reads apart from write bursts.** On flash, random reads beside sequential writes cost the
+writes a factor of 4.5 in Chen et al.'s measurement, where either alone was "largely independent
+of access patterns" (research/29 §3.7). The cleaner's victim reads and the scrubber's steps are
+dispatched in the gaps between the writer's bursts on that device, not interleaved with them;
+client reads, which cannot wait, are what hedged reads across replicas are for (gateway.md §3).
 
 A client write with no free segment to go to is `Busy`, to be retried, while cleaning may
 still free one, and `Full` once cleaning has been tried on the data deleted so far and
@@ -403,11 +646,59 @@ is read where it lies and verified from its own header, then counted only if the
 still names it; a record too damaged to name itself is attributed by a search of the map,
 which only damage pays for.
 
+References for this section: [RKO14] S. M. Rumble, A. Kejriwal, J. Ousterhout, "Log-structured
+Memory for DRAM-based Storage", FAST 2014. [WLL+22] Q. Wang, J. Li, P. P. C. Lee, T. Ouyang,
+C. Shi, L. Huang, "Separating Data via Block Invalidation Time Inference for Write
+Amplification Reduction in Log-Structured Storage", FAST 2022. [Des14] P. Desnoyers,
+"Analytic Models of SSD Write Performance", ACM TOS 10(2), 2014. [BGH99] J. Basch,
+L. J. Guibas, J. Hershberger, "Data Structures for Mobile Data", J. Algorithms 31(1), 1999.
+
 ## 9. Scrubbing
 
-Every sealed segment is read and verified at least every 14 days, targeting 7, at the
-lowest I/O priority [BGPS07 §6; SDG10 §5; AWK+19 §5.1]; seven days is practice rather than
-a derived period [research/11 §12.2]. The order is staggered: SDG10 reads 128 MiB regions in
+### 9.1 The period
+
+**Decision: the scrub period is derived per device from three bounds, and is the longest period
+at which the blocks the device holds still meet their durability target.** It was "at least
+every 14 days, targeting 7", which is practice, not a derivation [BGPS07 §6; SDG10 §5; AWK+19
+§5.1; research/11 §12.2], and on a large disk that practice breaks the drive's rating: a disk's
+rated workload counts reads, "(Lifetime Writes + Lifetime Reads) * (8760 / Lifetime Power On
+Hours)", and current 24–28 TB disks are rated for 550 TB a year, so scrubbing a full 24 TB disk
+every 7 days reads 1,251 TB a year, 2.3 times the rating, and every 14 days 626 TB; an 8 TB
+desktop disk rated 55 TB a year is overrun 7.6 times by a weekly scrub (research/28 §5.2, D11;
+research/29 §5.5, finding 6). Vendors derate the drive's failure rate above the rating; Pelican
+stopped scrubbing for this reason (research/28 §5.2).
+
+For a device holding `V` bytes of live records across its volumes, with rated annual workload
+`L`, measured annual client traffic `W_c` and cleaner traffic `W_g` (reads and rewrites), and the
+background share of its bandwidth `B_scrub` (node.md §2.6), the period `T` satisfies:
+
+- **The workload bound, on disks:** `T ≥ V / (L − W_c − W_g)`, in years. For a full 24 TB disk
+  with no other traffic that is 15.9 days; with 300 TB a year of client and cleaner traffic, 35
+  days (research/29 §5.5). It counts every volume and log on the physical device, since the
+  rating is the device's.
+- **The bandwidth bound:** `T ≥ V / B_scrub`, research/11 §12.4's, so scrubbing stays within the
+  share that keeps foreground latency within its bound.
+- **The durability bound:** `T` is at most the period at which the scheme of every block the
+  device holds still meets the target, with detection in the repair rate: a latent error found
+  on average half a period after it occurs makes the repair rate at most `1/(T/2 + T_rebuild)`
+  (durability.md §2; research/28 §3.3, D4).
+
+The scrubber runs at the longest period the durability bound allows and no shorter than the
+other two: a shorter period than durability needs spends the device's rated workload, its energy
+and its read bandwidth on margin nobody asked for. Where the lower bounds exceed the durability
+bound, the conflict is resolved by parity, never by exceeding the rating: the device's pool is
+reported as needing a wider code, and blocks placed there take one (durability.md §4). The
+rating comes from the device where it reports one, from the operator otherwise, and in the
+absence of both from the most conservative datasheet value of the device's class, 55 TB a year
+for a disk (research/28 §5.3), as durability.md §5 takes failure rates from the conservative end
+of their sources. Flash carries no rated read workload, so on flash the workload bound is absent.
+`mantle status` prints each device's period and the bound that set it.
+
+### 9.2 How the scrubber reads
+
+The scrubber reads at the lowest I/O priority, and beneath mantle's own pacing, which works
+whether or not the operating system honours the priority (research/28 §4.5). The order is
+staggered: SDG10 reads 128 MiB regions in
 1 MiB steps, one step of every region before the next, which shortens the mean time to
 detect an error by 10–20% at 7–14-day periods [research/11 §12.3: SDG10 §5.2.3]. The
 scrubber does the same over the data area, the segments laid end to end: each step
@@ -418,6 +709,49 @@ bad block triggers an immediate scan of its ±10 MiB neighbourhood and marks the
 risk for 30 days [BGPS07 §5; SLM16 §5]. Damaged chunks are listed for repair up to 4,096;
 more than 80% of disks with latent errors had fewer than 50 [BGPS07-F2], so a volume past
 that is failing and is drained whole [research/11 §12.4].
+
+How the steps are timed depends on the device and its power:
+
+- **On a disk**, a step's reads are issued sorted by address (§7), and steps are batched into
+  bursts spaced either below the drive's head-unload timer or far above it, never just over it.
+  Disks rate 600,000 load/unload cycles, 329 a day over a five-year warranty; background I/O
+  that arrives just after each unload spends a cycle each time, up to 1,440 a day at a
+  one-minute spacing past a short timer (research/29 §5.6, D8). The timers are read from the
+  drive's power-condition pages where mantle has the privilege, and otherwise from the first-I/O
+  latency after idle gaps (measurement.md §9, C5), which shows an unload as the time to reload
+  the heads.
+- **On flash**, steps run in the gaps between the writer's bursts (§8).
+- **On battery or under the OS's saver mode**, the period's work is scheduled into mains time
+  first, and runs on battery only when the period would otherwise be missed; when it runs, it
+  runs in dense bursts at the device's measured knee and then leaves the device idle long
+  enough for its low-power state to pay, rather than trickling at the constant rate `V/T`
+  research/11 §12.6 paces at (research/28 §4.5; research/29 §7.5, D15). Under thermal state Fair
+  or worse it is deferred as background work is (node.md §1.8).
+
+### 9.3 Device budgets
+
+Every device carries a budget for each rating it has, and every class of work on it spends from
+it (research/28 §5.3, D12):
+
+| Budget | Disk | Flash |
+|---|---|---|
+| Bytes | read plus written, against the rated annual workload | media bytes written, against the drive's Endurance Estimate, over the planned service life |
+| Cycles | load/unload; start/stop where spun down (storage-classes.md §3) | — |
+| Hours | rated power-on hours a year (2,400 on a desktop disk, 24×7 on a data-center one) | — |
+
+Each rating comes from the device where it reports one (NVMe's Endurance Estimate and Percentage
+Used), from the operator otherwise, and else from the most conservative cited datasheet value
+for the class (55 TB a year and 50,000 cycles for disks). Spending is counted from mantle's own
+I/O, always available, and checked against the drive's counters where readable (measurement.md
+§9, C10–C11). Device write amplification multiplies into a flash budget: device bytes are client
+bytes times the cleaner's amplification, measured exactly, times the drive's own, Δ media units
+over Δ data units where reported (research/28 §5.1). Repair at a margin of one chunk or less is
+never refused for budget; the scrub period takes what is left (§9.1); placement prefers, among
+feasible devices, the one whose projected exhaustion is latest, keeping a stripe's members from
+converging on one date (research/10 R9; node.md §7); and a device whose budget will run out
+before its planned retirement is drained early enough to finish under the background budget,
+PACEMAKER's rule (research/10 R6). Running past a rating is evidence for a higher failure rate,
+which enters the device's failure probability as a covariate (research/10 R3), not a hard stop.
 
 ## 10. Testing
 
@@ -432,3 +766,12 @@ only records of the last batch, each a write that was in flight; a flush failure
 volume. A read that fails while the volume recovers, or bytes damaged on the device, leave
 an acknowledged chunk kept and reported, never dropped, and a retry of the same bytes writes
 it again; a payload sharing a retry's length and CRC-32C is refused, not taken for it.
+
+The simulated file also misdirects and loses writes, a write landing at another record's offset
+or reported done and not done, as Krioukov et al. enumerate them (research/31 §8, T4), and
+discards ranges returning zeros, ones or stale bytes; the invariants are the same, with no
+acknowledged chunk unreadable while its scheme's tolerance holds. A flip injected into the
+volume's receive buffer between a chunk's arrival and its write is caught by the carried table
+before the write (§3.1). Tests on the device plan check that `B` takes `minimum_io_size` where
+Linux reports a unit above the physical block, that batches pipeline only where the flush
+measured free, and that the derived scrub period never passes a device's workload bound.

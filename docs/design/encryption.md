@@ -1,8 +1,9 @@
 # Encryption at rest
 
-Status: design, 2026-09-29. Sources: docs/research/20 (server-side encryption, cited as
-"20 §x"), docs/research/14 (AWS-LC, cited as "14 §x"); docs/design/crypto.md for the library
-and its no-panic boundary.
+Status: design, 2026-09-29; verified seals, sealed caches and resumed uploads 2026-09-30.
+Sources: docs/research/20 (server-side encryption, cited as "20 §x"), docs/research/14
+(AWS-LC, cited as "14 §x"), docs/research/30 and 31 (resilient transfer, integrity);
+docs/design/crypto.md for the library and its no-panic boundary.
 
 mantle encrypts every object's data at rest. This record states what it encrypts, under which
 keys, how the bytes are sealed, and what S3's encryption headers mean against that.
@@ -91,6 +92,20 @@ file's ID as additional data.**
   metadata ranges hold only ciphertext and wrapped keys. The chunk store's CRC-32C still checks
   every stored byte, as CLAUDE.md §6 requires of every record; GCM's tag authenticates the
   plaintext end to end.
+- **Every seal is checked by an open on another core** before its block goes down, and the
+  plaintext's CRC compared with the one taken as it arrived (node.md §5.6). A seal authenticates
+  whatever plaintext it is given, so a flip in the buffer before it is sealed in, and Google saw an
+  AES fault that was "self-inverting: encrypting and decrypting on the same core yielded the
+  identity function, but decryption elsewhere yielded gibberish" (research/31 §5.6). The open costs
+  about what the seal does.
+- **Caches hold ciphertext.** A gateway's block cache keeps sealed segments, so an SSE-C object is
+  never served without its key and every serve re-verifies the tag; unwrapped data keys are not
+  kept across requests (gateway.md §5).
+- **A resumed upload changes keys.** A native upload that resumes does so in runs, each a file
+  under its own data key, so no segment index is ever sealed twice under one key, whatever the
+  client resends (gateway.md §2.1). An SSE-C upload's key is sent again at each resume and checked
+  the way every SSE-C request's is, by unwrapping a committed run's data key with it (§2), so
+  nothing derived from the customer's key is stored for the resume either.
 - **Sizes.** A segment of `n` plaintext bytes is `n + 16` stored bytes, so a file's stored length
   and a byte's stored offset follow from its plaintext length and offset alone.
 - **Cost.** Sealing runs at about 8 GB/s and opening at 8.4 GB/s on one core, a ninth of the

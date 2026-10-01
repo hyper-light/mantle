@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-09-29. A component is complete when its tests pass on all six CI targets
+Updated 2026-09-30. A component is complete when its tests pass on all six CI targets
 (Linux, macOS and Windows on x86_64 and arm64) and the evidence listed for it has been
 recorded.
 
@@ -83,10 +83,11 @@ continuous once damage is found. Damaged chunks, including those whose records c
 read at all, are listed for repair, and a volume with more than 4,096 is marked failing, to
 be drained whole.
 
-Reads are held at the device's measured depth: a volume keeps at most the depth of greatest
-power calibration finds at the device, lets as many more wait in the order they came, and
-refuses the rest with `Busy`, where before every caller's thread read at the device
-unbounded.
+Reads are held at the device's measured depth: a volume keeps at most the shallowest depth at
+which calibration finds throughput stops growing (the depth of greatest power, which this
+section once named, is reported beside it and is not the bound; design §7), lets as many more
+wait in the order they came, and refuses the rest with `Busy`, where before every caller's
+thread read at the device unbounded.
 
 Remaining before it is done:
 
@@ -311,19 +312,197 @@ Remaining before it is done:
 
 ## Planned, in order
 
-1. **S3 gateway.** Request signing (including presigned URLs and chunked uploads with
-   trailing checksums), buckets, PUT, GET with byte ranges, HEAD, DELETE and batch
-   delete, copy, ListObjects and ListObjectsV2, multipart uploads including resuming an
-   interrupted upload, versioning, conditional requests, checksums, tags, and ACLs as S3's
-   bucket owner enforced default answers them. Done when
-   end-to-end suites using the AWS CLI, boto3 and the AWS SDK for Rust pass against a
-   running mantle, and ceph's s3-tests pass for every supported feature.
-2. **Multi-machine operation.** Placement across racks and zones, repair ordered by
-   remaining redundancy, rebalancing, and retiring disks that start to fail. Done when
-   tests that fail disks, machines and racks during writes show that every acknowledged
-   write can still be read back.
-3. **Cells.** A replicated map of which cell owns each key range, routing from cached
-   copies of it with redirects after a range moves, moving a range between cells while it
-   is read and written, and adding and retiring cells. Done when ranges move between cells
-   under a mixed workload with no lost write and no stale read, and failing or upgrading
-   one cell leaves the requests of every other cell unaffected.
+The work the designs of 2026-09-30 create (research notes 26–31, folded into node.md,
+gateway.md, metadata.md, chunk-store.md, measurement.md, durability.md, raft-log.md,
+replica.md, engine.md, encryption.md, crypto.md, s3-protocol.md, architecture.md and the new
+storage-classes.md), in the audit's stage order (audit §17). Each item is done when its test
+passes on all six CI targets.
+
+### First: stop the demonstrated safety failures
+
+1. **No broadcast wakes.** The log's `room`, `workers.rs`'s latch and every `Barrier` or
+   `notify_all` over a pool or population replaced by per-waiter slots woken one to one in
+   arrival order, with a bounded waiting list, and a fence completing each slot once (node.md
+   §1.3; raft-log.md §3). Done when an instrumented test with `W` waiters and `K` completions
+   counts at most `K` plus the waiters admitted, a fence wakes each exactly once, and `bench log`
+   at thousands of logical replicas runs on macOS without a kernel spinlock timeout.
+2. **Depth without a thread per transfer.** Calibration's depth kept by io_uring on Linux, an
+   overlapped completion port on Windows, and a reusable pool of exactly `depth` workers with
+   per-worker slots on macOS and where io_uring is unusable, inside a process thread budget read
+   from `kern.wq_max_threads` on macOS, refused before any thread starts; achieved depth sampled
+   and reported (measurement.md §8). Done when a measurement at a device's full reported depth
+   never exceeds the pool bound in the OS's own thread count, a request past the budget starts
+   no thread, and the achieved depth reaches the depth asked or reports its shortfall.
+3. **Logical clients as records.** `bench log`, `bench` and `bench gateway` multiplex clients on
+   at most the granted cores' driver threads through `submit` and a `Waker`; the replica ladder
+   ends at the stated replica bound; generators report their CPU and lateness (measurement.md
+   §10). Done when the same benchmark at `R` and `10R` clients shows the same peak thread count.
+
+### Second: make overload and retry behaviour dependable
+
+4. **One issuer per physical device**, running every volume's writer, cleaner and scrubber and the
+   device's log writer as state machines, `write_together` without threads per region, startup
+   rollback per issuer (node.md §1.2; chunk-store.md §4). Done when 100 volumes on one device run
+   on one issuer and its pool, the process thread count matches `3C + D + Σ p_i`, and the
+   chunk store's crash soak passes unchanged.
+5. **The device dispatcher**: start-tag order across tenants and principals, in-flight budget
+   `D_b`, `D_n` and dispatch unit `u` from calibration, background shares, the log, engines and
+   chunks of a laptop's one device under one authority (node.md §2.7; chunk-store.md §4, §7).
+   Done when a small read's p99 beside a saturating large write stays within `(D_b + n·u)/C` and
+   throughput stays within measurement of the calibrated plateau.
+6. **Charges and fair queues**: dominant-share charging from calibrated per-device cost models,
+   hierarchical SFQ (tenant, principal, request) with state bounded by admitted work, contract
+   classes with mClock reservations and an Aequitas admit probability, a Space-Saving heavy-hitter
+   table, and per-range tenant SFQ with the range's admission level on answers (node.md §2.3,
+   §2.7). Done when the owner's scenario (node.md §9.1) holds at laptop scale: the large upload's
+   goodput during the spike within measurement of its weighted share, the small PUTs within the
+   §2.7 bound of their latency alone, recovery within one chain latency, and every table within
+   its bound under a new principal per request.
+7. **Overload as sojourn, shed by hashed principal**: the shared authority for both listeners,
+   CoDel's sojourn test, `503 SlowDown` before `100 Continue` on HTTP, retries shed first by the
+   attempt header, a deterministic subset of principals shed at the measured excess, the retry
+   ratio held below `C/λ − 1` (node.md §4.5). Done when steps to 1.5× and 10× capacity, open loop
+   and corrected for coordinated omission, leave overload once the trigger stops, with retries
+   shed before first attempts and completed multi-request steps per second reported.
+8. **Fair-share windows**: a PUT's window from the entitled rate, a GET's from the latency at the
+   hedge quantile (node.md §2.6; gateway.md §2–§3). Done when a lone upload's goodput reaches
+   `min(client rate, device plateau)` and its window shrinks and regrows across a spike.
+9. **Operation identity**: client-drawn identities, `amz-sdk-invocation-id` on the listener,
+   operation rows in the Name range with the first answer, the horizon capped by the operation
+   table's budget, removal by the collector, carried by splits (gateway.md §2.1; metadata.md §2).
+   Done when the orphan-sweep simulation extended with every attempt of every identity at any
+   step, across gateways, splits and lagging clocks, holds the five obligations, each broken
+   variant fails it, and a gateway killed between commit and answer in a versioned bucket leaves
+   one version after a retry through another gateway.
+10. **The device plan by class**: `B` from `minimum_io_size` or C3, batches padded to it, write
+    size from NOWS, depth caps for SATA, USB Bulk-Only and EBS, flush measured twice and batches
+    overlapped only where it is free, flush-unverified devices recorded (chunk-store.md §2.1, §4;
+    raft-log.md §2; measurement.md §9). Done when tests on reported and simulated geometries
+    take the right `B` and plan, and C1–C3 run on each OS's devices.
+11. **The derived scrub period** from the workload, bandwidth and durability bounds, per device,
+    with `mantle status` naming the binding bound (chunk-store.md §9.1; durability.md §5). Done
+    when a simulated 24 TB disk at 550 TB/yr scrubs no more often than its workload bound and the
+    durability model counts latent errors detected at the chosen period.
+
+### Third: establish a real laptop serving baseline
+
+12. **The native protocol and the client library and CLI**: S3's operations natively, credits,
+    typed refusals and the admission level, the server's upload plan, per-block GET streams with
+    CRC-64/NVME, migration on interface change, TLS session resumption without early data, the
+    TLS-over-TCP route, and the journal with its flush rules (node.md §3.9, §4.1; gateway.md §3,
+    §6). Done when the client killed and its storage cut at every journal write and protocol step
+    ends every operation answered, resumed or provably restarted, and a Wi-Fi to cellular switch
+    mid-upload continues or resumes with no committed run sent again.
+13. **Resumable native uploads** in server-cut runs with progress frames, the checkpoint interval
+    of gateway.md §2.1, MD5 and block-hash state carried across runs, and digest-state export
+    and import in the vendored aws-lc-rs (gateway.md §2.1; metadata.md §2; crypto.md §10). Done
+    when the six obligations hold under interruption at every frame, a changed source ends in
+    `BadDigest`, and the ETag equals S3's for objects at and above 5 GiB.
+14. **The HTTP/1.1 listener's resilience**: exact `ListParts`, `AbortIncompleteMultipartUpload`,
+    open-upload bytes reported, completion answered directly unless near clients' read
+    timeouts, pinned resumed downloads (gateway.md §2.1). Done when the AWS CLI's and boto3's
+    multipart uploads with the connection cut at every part and at completion finish or resume,
+    and s3-tests' multipart suite passes.
+15. **The gateway's caches**: sealed-block, File and Block row caches; Name rows and absences
+    validated by ReadIndex taken after arrival; coalesced fetches and next-round validations;
+    policy by scaled-down simulation and size by SHARDS curves within the node's division
+    (gateway.md §5; node.md §2.5; metadata.md §2). Done when the linearizability checker accepts
+    every history with every cache on and catches the four broken variants (node.md §9.1).
+16. **Integrity across the path**: per-segment plaintext CRCs and seals opened on another core,
+    the parity's random linear check, carried CRC tables to and from storage nodes, command CRCs
+    checked at apply, the engine's per-key-value protection, CRCs kept with cached rows, and
+    attribution per node and core (node.md §5.6; chunk-store.md §3.1; replica.md §2; engine.md
+    §3). Done when the flips and the faulty core of node.md §9.1 are caught at their boundaries
+    before acknowledgement or service, and the core is attributed; and CRC-64/NVME's Hamming
+    distances at 64 KiB and 8 MiB are computed by a program that reproduces Koopman's CRC-32C and
+    "Jones" figures (node.md §5.6).
+17. **Storage classes on one device**: the class stored, validated and answered on every
+    operation, archived reads refused, RestoreObject, lifecycle transitions, Intelligent-Tiering
+    with day-resolution tracking, Reduced Redundancy, directory buckets with `CreateSession`, the
+    class's writer rule and stream, and the achieved bound reported (storage-classes.md §2, §5,
+    §8; s3-protocol.md §4, §7). Done when S3's recorded answers replay, s3-tests'
+    `storage_class`, `lifecycle_transition` and `restore` markers pass, and the controlled-clock
+    restore and tiering tests pass.
+18. **Power, thermal state and background work**: the OS's inputs by notification, the battery
+    wait rule in the chunk store's and log's writers, background deferral by deadline, Apple's
+    thermal responses, background I/O priority, sleep reconciliation (node.md §1.8). Done when
+    toggled inputs on each OS defer exactly the work the table names, no acknowledgement precedes
+    durability across a switch, and energy per acknowledged byte on battery falls under the rule
+    by measurement.md §9's differential method with the `2S` latency bound holding.
+19. **Device probes and energy**: C1–C14 where each applies, idle-gap tagging of latency samples,
+    and calibration refused on battery unless forced (measurement.md §9; chunk-store.md §7).
+    Done when each probe's result is recorded for the development machines' devices with its
+    device cost.
+
+The S3 gateway profile listed before stays this stage's frame: request signing, buckets, PUT,
+GET with ranges, HEAD, DELETE and batch delete, copy, listings, multipart uploads with resume,
+versioning, conditional requests, checksums, tags and ACLs; done when end-to-end suites with the
+AWS CLI, boto3 and the AWS SDK for Rust, and the native client library, pass against a running
+mantle, and ceph's s3-tests pass for every supported feature.
+
+### Fourth: prove heterogeneous regional operation
+
+20. **The QUIC layer on a vendored quinn-proto**: the pacing quantum and operating packet size,
+    adaptive reordering, the PMTU raise rule, Copa with focal's half stride, idle timeout from
+    the probe timeout, keep-alive from the measured NAT lifetime, stream windows under the
+    2,048-frame ceiling, the connection credit reserve, key update before AES-GCM's limit (node.md
+    §3.3, §3.8–§3.9). Done when control-message p99 beside saturating bulk at 8, 16, 64 and 256
+    kbit/s beats stock quinn with goodput reported, a fuzzed alternate-frame loss at the window
+    ceiling never closes a connection, and the congestion qualification over the audit §13.6
+    matrix is recorded with its selection rule and rows.
+21. **Brownouts and reconnects**: the four clocks, equal-jitter backoff from the probe timeout,
+    replacement by certificate, election timing from durable-ack tails, the bulk queue bound
+    (node.md §3.8). Done when a 64 kbit/s upload with 5–120 s outages completes, returning its
+    memory within one run commit of each stall, and elections per hour during a rate collapse
+    with saturating bulk stay at the level of the run without bulk.
+22. **Cell-wide shares**: node credits on responses with dmClock counters, tenant contracts
+    divided among gateways by measured demand, hedged reads at the derived quantile and
+    reservation-hedged writes (node.md §3.3, §4.5, §5.4). Done when a tenant whose load lands on
+    few nodes keeps its cell-wide share, and its rate across gateways stays within its contract as
+    its load moves.
+23. **Placement by credits and budgets**: two random choices on credits, devices chosen by latest
+    projected budget exhaustion, device budgets for workload, cycles, hours and flash wear, early
+    drains, flush-unverified copies weighed (node.md §7; chunk-store.md §9.3; durability.md §5).
+    Done when per-device load spread and small-request p99 beat random and least-loaded placement
+    in the same run, and endurance accounting tracks the drives' own counters.
+24. **Media pools, moves and restores**: pools from measurement, class eligibility, copysets per
+    pool, cold pools with spin-down groups and start/stop budgets, staging writes for archived
+    classes, copy-switch-release moves spread under the background cap, bounded restore queues
+    per tier (storage-classes.md §3–§7). Done when crash tests at every step of a move leave each
+    object at one class with every block referenced once, a simulated day of billions of due
+    moves stays under the cap with no deadline missed, and restore completion times meet their
+    tiers' documented times under load.
+25. **Device-specific placement**: FDP handles per stream on provisioned drives with DLWA checked
+    from the Endurance Group log; disk volumes' index logs on flash; disk reads sorted; scrub and
+    cleaner reads in the writer's gaps on flash; head-load-aware background bursts; discard by
+    measured cost (chunk-store.md §2, §4, §7–§9). Done when DLWA, commit latency (C7) and
+    load/unload counts are recorded against their baselines on real drives.
+26. **Fleet-scale integrity**: replica digests compared at a leader-named index, core quarantine
+    and node fencing by comparison with the cell's background rate, correctable-memory counters
+    as health, repair that verifies every source and its rebuilt chunk (replica.md §2; node.md
+    §5.6). Done when an injected divergent member is found and rebuilt, an injected faulty core
+    is quarantined, a week without faults measures the false-positive rate that sets the
+    thresholds, and repair with one corrupt source and one lost chunk rebuilds from a verified
+    subset or refuses, never writing a chunk that fails the block's CRC.
+
+Multi-machine operation keeps its frame: placement across racks and zones, repair ordered by
+remaining redundancy, rebalancing, and retiring disks that start to fail; done when tests that
+fail disks, machines and racks during writes show every acknowledged write can still be read
+back.
+
+### Fifth: make fleet growth and geography safe
+
+27. **Regional and fleet shares**: contracts divided among cells and regions by demand on longer
+    intervals, principal limits across cells by count-min sketches merged by addition
+    (architecture §8). Done when simulation shows the regional share error and the sketches'
+    overestimate within their stated bounds against exact counts.
+28. **Zonal storage classes**: one-zone and multi-zone classes physically distinct with zone
+    exposure reported, directory buckets placed near compute, lifecycle due dates spread across
+    cells' budgets, restore rates per principal (storage-classes.md §9). Done when a zone's loss
+    in simulation loses no multi-zone object and reports one-zone exposure as computed.
+
+Cells keep their frame: a replicated map of which cell owns each key range, routing from cached
+copies with redirects after a range moves, moving a range between cells while it is read and
+written, and adding and retiring cells; done when ranges move between cells under a mixed
+workload with no lost write and no stale read, and failing or upgrading one cell leaves every
+other cell's requests unaffected.

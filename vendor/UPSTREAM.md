@@ -93,7 +93,17 @@ The crates mantle shares with focal and slates come from github.com/hyper-light/
 - hyper-raft's CI runs their suites on all six targets, and mantle's own suites run against the
   snapshot;
 - a change is made in hyper-raft and taken here by a new snapshot, never edited in place.
+- snapshots that depend on each other by path sit side by side here, as they do under
+  hyper-raft's `crates/`, so those paths resolve: `hyper-log` on `hyper-block`, and on
+  `hyper-measure` for its own tests and benchmarks, which cargo reads but mantle does not build.
 
 | Snapshot | Revision | Used by |
 |---|---|---|
 | `hyper-raft` | `SNAPSHOT` (`dce1daa`: R-2, its own message types and wire format, hyper-raft `docs/raft.md` §3.1) | `crates/range`, as `focal-raft` (Cargo rename) |
+| `hyper-log` | `SNAPSHOT` (`50a711d`: mantle's `crates/log` at `147f035` with its history, L-1; one owner thread answering by ticket, L-2; hyper-log `ORIGIN.md`) | `crates/range` (the replica's log), `crates/mantle` (`mantle bench log`) |
+| `hyper-block` | `SNAPSHOT` (`50a711d`: mantle-disk's block, buf, commit, file, issuer, thread budget, scratch and simulated device at `147f035`, each with one owner, L-2; hyper-block `ORIGIN.md`) | `hyper-log`, `crates/chunk`, `crates/disk` (measurement and calibration through its files, buffers and thread budget), `crates/range`, `crates/mantle` |
+| `hyper-measure` | `SNAPSHOT` (`50a711d`) | `hyper-log`'s tests and benchmarks only; no mantle crate |
+
+mantle's `crates/log` and the parts of `crates/disk` that hyper-block took were deleted when
+mantle moved onto these (research/32 §5.3); identification, calibration, measurement and the
+benchmark rounds stay in `crates/disk`.

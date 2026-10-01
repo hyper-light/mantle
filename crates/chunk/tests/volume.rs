@@ -13,12 +13,13 @@ mod common;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use common::device::{Handle, Sim, SimDevice};
 use common::{SIZE, config, data, issuer, key, put_retrying, sim};
+use hyper_block::buf::Alignment;
+use hyper_block::file::{CachingRequest, DeviceFile};
+use hyper_block::sim::Fault;
 use mantle_chunk::layout::{Geometry, batch_frame_bytes, checkpoint_bytes, largest_frame};
 use mantle_chunk::{ChunkError, ChunkKey, Config, Reads, Volume};
-use mantle_disk::buf::Alignment;
-use mantle_disk::file::{CachingRequest, DeviceFile};
-use mantle_disk::sim::{Fault, SimFile};
 
 /// A volume formatted to pre-write has every byte of its extent written at format, before
 /// its superblocks; one formatted without has only its superblocks and log (docs/design/
@@ -26,7 +27,7 @@ use mantle_disk::sim::{Fault, SimFile};
 #[test]
 fn a_prewritten_volume_writes_its_whole_extent_once() {
     let plain = sim(1);
-    let v = Volume::format(issuer(), Arc::clone(&plain), SIZE, config()).unwrap();
+    let v = Volume::format(issuer(), plain.clone(), SIZE, config()).unwrap();
     let end = v.data_span().end;
     v.close();
     assert!((plain.durable_image().unwrap().len() as u64) < end);
@@ -36,7 +37,7 @@ fn a_prewritten_volume_writes_its_whole_extent_once() {
         prewrite: true,
         ..config()
     };
-    let v = Volume::format(issuer(), Arc::clone(&written), SIZE, prewrite).unwrap();
+    let v = Volume::format(issuer(), written.clone(), SIZE, prewrite).unwrap();
     assert_eq!(v.data_span().end, end);
     v.close();
     assert_eq!(written.durable_image().unwrap().len() as u64, end);
@@ -45,7 +46,7 @@ fn a_prewritten_volume_writes_its_whole_extent_once() {
     let writes = written.stats().unwrap().writes;
     assert!(writes >= end.div_ceil(batch) + 2, "{writes} writes");
 
-    let (v, _) = Volume::open(issuer(), Arc::clone(&written), config()).unwrap();
+    let (v, _) = Volume::open(issuer(), written.clone(), config()).unwrap();
     v.put(key(1), &data(1, 10_000)).unwrap();
     assert_eq!(v.read(&key(1), 0, 10_000).unwrap(), data(1, 10_000));
     v.close();
@@ -163,7 +164,7 @@ fn a_volume_on_a_raw_device_reopens(node: &std::path::Path) {
 #[test]
 fn a_volume_on_a_raw_device_reopens_with_its_chunks() {
     let dir = tempfile::tempdir().unwrap();
-    let image = mantle_disk::image::DiskImage::attach(dir.path(), 16).unwrap();
+    let image = hyper_block::image::DiskImage::attach(dir.path(), 16).unwrap();
     a_volume_on_a_raw_device_reopens(image.node());
 }
 
@@ -180,25 +181,25 @@ fn a_volume_on_a_linux_block_device_reopens_with_its_chunks() {
 
 /// A simulated file that counts the bytes read from it.
 struct Counting {
-    file: Arc<SimFile>,
+    file: SimDevice,
     read: AtomicU64,
 }
 
-impl mantle_disk::block::BlockFile for Counting {
+impl hyper_block::block::BlockFile for Counting {
     fn alignment(&self) -> Alignment {
         self.file.alignment()
     }
-    fn len(&self) -> Result<u64, mantle_disk::DiskError> {
-        mantle_disk::block::BlockFile::len(&*self.file)
+    fn len(&self) -> Result<u64, hyper_block::DiskError> {
+        hyper_block::block::BlockFile::len(&*self.file)
     }
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), mantle_disk::DiskError> {
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), hyper_block::DiskError> {
         self.read.fetch_add(buf.len() as u64, Ordering::SeqCst);
         self.file.read_exact_at(buf, offset)
     }
-    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), mantle_disk::DiskError> {
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), hyper_block::DiskError> {
         self.file.write_all_at(buf, offset)
     }
-    fn sync_data(&self) -> Result<(), mantle_disk::DiskError> {
+    fn sync_data(&self) -> Result<(), hyper_block::DiskError> {
         self.file.sync_data()
     }
 }
@@ -225,16 +226,16 @@ fn a_range_read_reads_its_checksum_blocks_and_not_the_payload_before_them() {
         reads: Reads::measured(1, 0, gap),
     };
     let sim = sim(21);
-    let counting = Arc::new(Counting {
-        file: Arc::clone(&sim),
+    let counting = Handle::new(Counting {
+        file: sim.clone(),
         read: AtomicU64::new(0),
     });
     let whole = 8u64 << 20;
     let bytes = data(5, whole as usize);
-    let v = Volume::format(issuer(), Arc::clone(&counting), 64 << 20, config(0)).unwrap();
+    let v = Volume::format(issuer(), counting.clone(), 64 << 20, config(0)).unwrap();
     v.put(key(1), &bytes).unwrap();
     let tail = whole - 4096;
-    let read = |v: &Volume<Arc<Counting>>| {
+    let read = |v: &Volume<Handle<Counting>>| {
         counting.read.store(0, Ordering::SeqCst);
         let got = v.read(&key(1), tail, 4096);
         (got, counting.read.load(Ordering::SeqCst))
@@ -244,13 +245,13 @@ fn a_range_read_reads_its_checksum_blocks_and_not_the_payload_before_them() {
     assert!(apart <= 72 << 10, "{apart} bytes read for 4 KiB");
     v.close();
     // A gap as long as the payload: the one read of old.
-    let (v, _) = Volume::open(issuer(), Arc::clone(&counting), config(whole)).unwrap();
+    let (v, _) = Volume::open(issuer(), counting.clone(), config(whole)).unwrap();
     let (got, together) = read(&v);
     assert_eq!(got.unwrap(), &bytes[tail as usize..]);
     assert!(together >= whole, "{together} bytes read in one");
     v.close();
     // The record is the first in the first segment, after the segment's header block.
-    let (v, _) = Volume::open(issuer(), Arc::clone(&counting), config(0)).unwrap();
+    let (v, _) = Volume::open(issuer(), counting.clone(), config(0)).unwrap();
     let payload = v.data_span().start
         + 4096
         + mantle_chunk::record::prefix_len(whole as u32, 16).unwrap() as u64;
@@ -331,7 +332,7 @@ fn invalid_writes_are_refused_and_retries_succeed() {
 #[test]
 fn appending_nothing_writes_nothing_and_survives_checkpoints() {
     let file = sim(8);
-    let v = Volume::format(issuer(), Arc::clone(&file), SIZE, config()).unwrap();
+    let v = Volume::format(issuer(), file.clone(), SIZE, config()).unwrap();
     let k = key(1);
     v.append(k, 0, b"", false).unwrap();
     assert!(
@@ -349,7 +350,7 @@ fn appending_nothing_writes_nothing_and_survives_checkpoints() {
         v.put(key(n), &data(n, 100)).unwrap();
     }
     drop(v);
-    let (v, _) = Volume::open(issuer(), Arc::clone(&file), config()).unwrap();
+    let (v, _) = Volume::open(issuer(), file.clone(), config()).unwrap();
     assert_eq!(v.read(&k, 0, 6).unwrap(), b"abcdef");
     assert!(v.stat(&k).unwrap().unwrap().sealed);
 }
@@ -413,7 +414,7 @@ fn a_chunk_larger_than_a_segment_is_refused() {
 #[test]
 fn reopening_after_many_checkpoints_and_log_wraps_restores_everything() {
     let file = sim(5);
-    let v = Volume::format(issuer(), Arc::clone(&file), SIZE, config()).unwrap();
+    let v = Volume::format(issuer(), file.clone(), SIZE, config()).unwrap();
     // Each put is its own batch and frame; over a thousand frames forces checkpoints and
     // takes the log around its region several times.
     for n in 0..1200u64 {
@@ -423,7 +424,7 @@ fn reopening_after_many_checkpoints_and_log_wraps_restores_everything() {
         }
     }
     drop(v);
-    let (v, report) = Volume::open(issuer(), Arc::clone(&file), config()).unwrap();
+    let (v, report) = Volume::open(issuer(), file.clone(), config()).unwrap();
     assert!(
         report.frames < 1200,
         "recovery replayed {} frames: no checkpoint was used",
@@ -485,7 +486,7 @@ fn deleted_space_is_reused_and_a_full_volume_refuses_writes() {
 #[test]
 fn concurrent_writers_share_group_commits() {
     let file = sim(7);
-    let v = Arc::new(Volume::format(issuer(), Arc::clone(&file), SIZE, config()).unwrap());
+    let v = Arc::new(Volume::format(issuer(), file.clone(), SIZE, config()).unwrap());
     let before = file.stats().unwrap().syncs;
     std::thread::scope(|s| {
         for t in 0..8u64 {
@@ -514,7 +515,7 @@ fn concurrent_writers_share_group_commits() {
 #[test]
 fn cleaning_reclaims_partly_dead_segments_and_keeps_every_live_byte() {
     let file = sim(9);
-    let v = Volume::format(issuer(), Arc::clone(&file), SIZE, config()).unwrap();
+    let v = Volume::format(issuer(), file.clone(), SIZE, config()).unwrap();
     // Small chunks, many per segment, until the volume is full.
     let mut written = Vec::new();
     for n in 0..100_000u64 {
@@ -542,7 +543,7 @@ fn cleaning_reclaims_partly_dead_segments_and_keeps_every_live_byte() {
     for n in 0..20u64 {
         put_retrying(&v, key(900_000 + n), &data(n, 3000)).unwrap();
     }
-    let check = |v: &Volume<Arc<mantle_disk::sim::SimFile>>| {
+    let check = |v: &Volume<SimDevice>| {
         for &n in &written {
             let got = v
                 .stat(&key(n))
@@ -558,7 +559,7 @@ fn cleaning_reclaims_partly_dead_segments_and_keeps_every_live_byte() {
     };
     check(&v);
     drop(v);
-    let (v, _) = Volume::open(issuer(), Arc::clone(&file), config()).unwrap();
+    let (v, _) = Volume::open(issuer(), file.clone(), config()).unwrap();
     check(&v);
 }
 
@@ -569,7 +570,7 @@ fn cleaning_reclaims_partly_dead_segments_and_keeps_every_live_byte() {
 #[test]
 fn segments_whose_dead_space_would_not_pay_for_packing_are_never_cleaned() {
     let file = sim(23);
-    let v = Volume::format(issuer(), Arc::clone(&file), SIZE, config()).unwrap();
+    let v = Volume::format(issuer(), file.clone(), SIZE, config()).unwrap();
     let len = usize::try_from(v.max_payload()).unwrap();
     let mut written = 0u64;
     loop {
@@ -590,7 +591,7 @@ fn segments_whose_dead_space_would_not_pay_for_packing_are_never_cleaned() {
 #[test]
 fn cleaning_leaves_a_corrupt_fragment_in_place() {
     let file = sim(10);
-    let v = Volume::format(issuer(), Arc::clone(&file), SIZE, config()).unwrap();
+    let v = Volume::format(issuer(), file.clone(), SIZE, config()).unwrap();
     for n in 0..300u64 {
         v.put(key(n), &data(n, 3000)).unwrap();
     }
@@ -604,7 +605,7 @@ fn cleaning_leaves_a_corrupt_fragment_in_place() {
         .windows(needle.len())
         .position(|w| w == needle)
         .unwrap() as u64;
-    file.inject(mantle_disk::sim::Fault::BitFlip {
+    file.inject(hyper_block::sim::Fault::BitFlip {
         offset: at,
         bit: 4,
         stored: true,
@@ -631,7 +632,7 @@ fn cleaning_leaves_a_corrupt_fragment_in_place() {
 #[test]
 fn deleted_chunks_stay_deleted_when_their_segment_is_reused_after_a_restart() {
     let file = sim(11);
-    let v = Volume::format(issuer(), Arc::clone(&file), SIZE, config()).unwrap();
+    let v = Volume::format(issuer(), file.clone(), SIZE, config()).unwrap();
     // Two chunks fill the first segment; the third opens the second segment, and three
     // small ones follow it there, each in a batch of its own.
     v.put(key(1), &data(1, 1000)).unwrap();
@@ -651,7 +652,7 @@ fn deleted_chunks_stay_deleted_when_their_segment_is_reused_after_a_restart() {
 
     // After a restart, the next segment opened is written up to exactly where the deleted
     // small chunks' records begin.
-    let (v, _) = Volume::open(issuer(), Arc::clone(&file), config()).unwrap();
+    let (v, _) = Volume::open(issuer(), file.clone(), config()).unwrap();
     v.put(key(7), &data(7, 200 << 10)).unwrap();
     let after: u64 = v
         .segments()
@@ -667,7 +668,7 @@ fn deleted_chunks_stay_deleted_when_their_segment_is_reused_after_a_restart() {
     );
     drop(v);
 
-    let (v, report) = Volume::open(issuer(), Arc::clone(&file), config()).unwrap();
+    let (v, report) = Volume::open(issuer(), file.clone(), config()).unwrap();
     for n in 3..7u64 {
         assert_eq!(
             v.stat(&key(n)).unwrap(),
@@ -753,7 +754,7 @@ fn reads_past_the_depth_wait_or_are_refused() {
 }
 
 /// Where `bytes` first lie in the file's durable image.
-fn find(file: &mantle_disk::sim::SimFile, bytes: &[u8]) -> u64 {
+fn find(file: &Sim, bytes: &[u8]) -> u64 {
     let image = file.durable_image().unwrap();
     image
         .windows(bytes.len())
@@ -766,7 +767,7 @@ fn find(file: &mantle_disk::sim::SimFile, bytes: &[u8]) -> u64 {
 #[test]
 fn a_bad_read_at_recovery_never_drops_an_acknowledged_chunk() {
     let file = sim(40);
-    let v = Volume::format(issuer(), Arc::clone(&file), SIZE, config()).unwrap();
+    let v = Volume::format(issuer(), file.clone(), SIZE, config()).unwrap();
     // The first put opens a segment, and a later frame confirms its batch; the put under
     // test is the last batch, whose records recovery reads back.
     v.put(key(0), &data(0, 100)).unwrap();
@@ -774,13 +775,13 @@ fn a_bad_read_at_recovery_never_drops_an_acknowledged_chunk() {
     v.put(key(1), &bytes).unwrap();
     v.close();
     let at = find(&file, &bytes[..64]) + 100;
-    file.inject(mantle_disk::sim::Fault::BitFlip {
+    file.inject(hyper_block::sim::Fault::BitFlip {
         offset: at,
         bit: 2,
         stored: false,
     })
     .unwrap();
-    let (v, report) = Volume::open(issuer(), Arc::clone(&file), config()).unwrap();
+    let (v, report) = Volume::open(issuer(), file.clone(), config()).unwrap();
     assert_eq!(report.damaged, vec![key(1)]);
     assert_eq!(v.stat(&key(1)).unwrap().unwrap().len, 9_000);
     assert!(
@@ -790,7 +791,7 @@ fn a_bad_read_at_recovery_never_drops_an_acknowledged_chunk() {
     file.clear_faults().unwrap();
     assert_eq!(v.read(&key(1), 0, 9_000).unwrap(), bytes);
     v.close();
-    let (v, report) = Volume::open(issuer(), Arc::clone(&file), config()).unwrap();
+    let (v, report) = Volume::open(issuer(), file.clone(), config()).unwrap();
     assert!(report.damaged.is_empty());
     assert_eq!(v.read(&key(1), 0, 9_000).unwrap(), bytes);
 }
@@ -800,7 +801,7 @@ fn a_bad_read_at_recovery_never_drops_an_acknowledged_chunk() {
 #[test]
 fn a_damaged_chunk_is_reported_and_a_retry_writes_it_again() {
     let file = sim(41);
-    let v = Volume::format(issuer(), Arc::clone(&file), SIZE, config()).unwrap();
+    let v = Volume::format(issuer(), file.clone(), SIZE, config()).unwrap();
     // The first put opens a segment, and a later frame confirms its batch; the put under
     // test is the last batch, whose records recovery reads back.
     v.put(key(0), &data(0, 100)).unwrap();
@@ -808,19 +809,19 @@ fn a_damaged_chunk_is_reported_and_a_retry_writes_it_again() {
     v.put(key(1), &bytes).unwrap();
     v.close();
     let at = find(&file, &bytes[..64]) + 100;
-    file.inject(mantle_disk::sim::Fault::BitFlip {
+    file.inject(hyper_block::sim::Fault::BitFlip {
         offset: at,
         bit: 5,
         stored: true,
     })
     .unwrap();
-    let (v, report) = Volume::open(issuer(), Arc::clone(&file), config()).unwrap();
+    let (v, report) = Volume::open(issuer(), file.clone(), config()).unwrap();
     assert_eq!(report.damaged, vec![key(1)]);
     assert!(v.read(&key(1), 0, 9_000).is_err());
     v.put(key(1), &bytes).unwrap();
     assert_eq!(v.read(&key(1), 0, 9_000).unwrap(), bytes);
     v.close();
-    let (v, _) = Volume::open(issuer(), Arc::clone(&file), config()).unwrap();
+    let (v, _) = Volume::open(issuer(), file.clone(), config()).unwrap();
     assert_eq!(v.read(&key(1), 0, 9_000).unwrap(), bytes);
 }
 
@@ -901,11 +902,11 @@ fn settings_no_volume_can_run_with_are_refused_before_any_io() {
     for (i, c) in broken.into_iter().enumerate() {
         let file = sim(60 + i as u64);
         assert!(matches!(
-            Volume::format(issuer(), Arc::clone(&file), SIZE, c),
+            Volume::format(issuer(), file.clone(), SIZE, c),
             Err(ChunkError::Config(_))
         ));
         assert!(matches!(
-            Volume::open(issuer(), Arc::clone(&file), c),
+            Volume::open(issuer(), file.clone(), c),
             Err(ChunkError::Config(_))
         ));
         let stats = file.stats().unwrap();
@@ -969,7 +970,7 @@ fn reads_hold_their_buffers_to_the_read_bytes() {
 #[test]
 fn cleaning_deletes_no_client_chunk() {
     let file = sim(901);
-    let v = Volume::format(issuer(), Arc::clone(&file), SIZE, config()).unwrap();
+    let v = Volume::format(issuer(), file.clone(), SIZE, config()).unwrap();
     let edge = ChunkKey {
         block: 0,
         epoch: u32::MAX,

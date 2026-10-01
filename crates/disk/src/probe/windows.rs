@@ -316,7 +316,7 @@ fn query(volume: &Handle, property: STORAGE_PROPERTY_ID) -> Result<Vec<u8>, Stri
     let size = u32_at(&header, offset_of!(STORAGE_DESCRIPTOR_HEADER, Size))
         .ok_or("a descriptor header shorter than its fields")?;
     let size = usize::try_from(size).map_err(|e| e.to_string())?;
-    if size > crate::buf::MAX_BUFFER {
+    if size > hyper_block::buf::MAX_BUFFER {
         return Err(format!("a descriptor of {size} bytes"));
     }
     query_into(volume, property, size.max(header.len()))

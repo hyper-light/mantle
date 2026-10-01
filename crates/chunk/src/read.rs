@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::thread::Thread;
 
-use mantle_disk::block::BlockFile;
+use hyper_block::block::BlockFile;
 
 use crate::error::ChunkError;
 use crate::index::Fragment;

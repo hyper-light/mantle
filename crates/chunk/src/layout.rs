@@ -1,6 +1,6 @@
 //! Volume geometry and configuration.
 
-use mantle_disk::buf::{Alignment, MAX_BUFFER};
+use hyper_block::buf::{Alignment, MAX_BUFFER};
 
 use crate::error::ChunkError;
 use crate::frame::{DELETE_LEN, FRAME_HEADER, PUT_LEN, SEGMENT_LEN};
@@ -214,7 +214,7 @@ impl Geometry {
         // A record may fill its segment, and is written and read in one buffer.
         if config.segment_size > u64::try_from(MAX_BUFFER).unwrap_or(u64::MAX) {
             return Err(bad(
-                "segment size must fit one I/O buffer (mantle_disk::buf::MAX_BUFFER)",
+                "segment size must fit one I/O buffer (hyper_block::buf::MAX_BUFFER)",
             ));
         }
         if !(9..=24).contains(&config.checksum_shift) {

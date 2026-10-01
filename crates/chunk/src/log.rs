@@ -1,9 +1,9 @@
 //! The circular index log: reading and writing frames at positions within its region, and
 //! tracking which part of it is still needed.
 
-use mantle_disk::DiskError;
-use mantle_disk::block::BlockFile;
-use mantle_disk::buf::AlignedBuf;
+use hyper_block::DiskError;
+use hyper_block::block::BlockFile;
+use hyper_block::buf::AlignedBuf;
 
 use crate::frame::{self, FrameHeader, LogRecord};
 use crate::layout::{Geometry, MAX_FRAME_BYTES};

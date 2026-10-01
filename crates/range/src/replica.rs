@@ -10,8 +10,8 @@ use focal_raft::proto::{
 };
 use focal_raft::wire::Record;
 use focal_raft::{RawNode, StateRole};
-use mantle_disk::block::BlockFile;
-use mantle_log::{Entries, Log, LogError, Pending, Proposal, Start, Update};
+use hyper_block::block::BlockFile;
+use hyper_log::{Entries, Log, LogError, Pending, Proposal, Start, Update};
 use mantle_meta::apply::{Layer, apply_entry};
 use mantle_meta::engine::{Engine, Write};
 use mantle_meta::session::Rules;
@@ -327,12 +327,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
             seed,
             ..focal_raft::Config::new(id)
         };
-        let store = LogStore {
-            log,
-            group,
-            conf: conf.clone(),
-            snapshot: None,
-        };
+        let store = LogStore::new(log, group, conf.clone());
         let window_bytes = u64::try_from(settings.max_inflight_msgs)
             .ok()
             .and_then(|n| n.checked_mul(settings.max_size_per_msg))
@@ -392,9 +387,11 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
     /// finding the group empty, opens `joining` again by calling this again.
     ///
     /// `log` is shared as [`Replica::open`] takes it: one log serves every range's member on
-    /// the device, each opened, rebuilt and dropped on its own schedule, and its writer
-    /// thread holds it, so no one member owns it and none can borrow it from an owner whose
-    /// scope spans theirs until the node that holds every range owns the log.
+    /// the device, each opened, rebuilt and dropped on its own schedule, and the log is
+    /// reopened over its file while the device's other members go on, so no one member owns
+    /// it and none can borrow it from an owner whose scope spans theirs until the node that
+    /// holds every range owns the log. The handle is all that is shared: the log's state is
+    /// its owner thread's (hyper-log), reached by message.
     pub fn rebuild(
         failed: u64,
         joining: u64,
@@ -1049,6 +1046,9 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
                     None if submitted => None,
                     None => pending.poll(),
                 };
+                if answer.is_some() {
+                    self.node.store().written();
+                }
                 match answer {
                     None => return Ok(Persisted::Flushing(staged)),
                     Some(Ok(())) => {
@@ -1065,12 +1065,13 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
             let Some(part) = staged.parts.front() else {
                 return Ok(Persisted::Done(staged.ready));
             };
-            match self
-                .node
-                .store()
-                .log
-                .submit_waiting(self.group, part.clone())
-            {
+            let store = self.node.store();
+            store.writing();
+            let submitted_part = store.log.submit_waiting(self.group, part.clone());
+            if submitted_part.is_err() {
+                store.written();
+            }
+            match submitted_part {
                 Ok(pending) => {
                     staged.pending = Some(pending);
                     submitted = true;
@@ -1204,7 +1205,8 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
         // The log is borrowed from the store while the write is made, and the borrow ends
         // before the replica is fenced on its answer.
         let written = {
-            let log = &self.node.store().log;
+            let store = self.node.store();
+            let log = &store.log;
             let Some(view) = log.view(self.group)? else {
                 return Ok(());
             };
@@ -1212,13 +1214,16 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
                 return Ok(());
             }
             let term = log.term(self.group, index)?;
-            log.write_waiting(
+            store.writing();
+            let written = log.write_waiting(
                 self.group,
                 Update {
                     start: Some(Start { index, term }),
                     ..Update::default()
                 },
-            )
+            );
+            store.written();
+            written
         };
         match written {
             Ok(()) => {}
@@ -1299,7 +1304,7 @@ fn complete_install<F: BlockFile + 'static, E: Engine>(
     let view = log.view(group)?;
     let recorded = match log.term(group, index) {
         Ok(t) => t == term,
-        Err(mantle_log::LogError::Compacted { .. }) => true,
+        Err(hyper_log::LogError::Compacted { .. }) => true,
         Err(_) => false,
     };
     if recorded {
@@ -1317,7 +1322,7 @@ fn complete_install<F: BlockFile + 'static, E: Engine>(
                 first,
                 entries: Vec::new(),
             }),
-            hard_state: Some(mantle_log::HardState {
+            hard_state: Some(hyper_log::HardState {
                 commit: hard.commit.max(index),
                 ..hard
             }),
@@ -1376,7 +1381,7 @@ fn commit_applied<F: BlockFile + 'static>(
         log.write_waiting(
             group,
             Update {
-                hard_state: Some(mantle_log::HardState {
+                hard_state: Some(hyper_log::HardState {
                     commit: applied,
                     ..hard
                 }),
@@ -1410,7 +1415,7 @@ fn commit_applied<F: BlockFile + 'static>(
                 first,
                 entries: Vec::new(),
             }),
-            hard_state: Some(mantle_log::HardState {
+            hard_state: Some(hyper_log::HardState {
                 commit: applied,
                 ..hard
             }),
@@ -1448,9 +1453,9 @@ fn update_of(
             entries: all
                 .iter()
                 .map(|e| {
-                    Ok(mantle_log::Entry {
+                    Ok(hyper_log::Entry {
                         term: e.term,
-                        bytes: Arc::from(encode(e)?),
+                        bytes: encode(e)?,
                     })
                 })
                 .collect::<Result<_, ReplicaError>>()?,
@@ -1463,7 +1468,7 @@ fn update_of(
             Ok(Proposal {
                 index: p.index,
                 term: p.term,
-                bytes: Arc::from(encode(p)?),
+                bytes: encode(p)?,
             })
         })
         .collect::<Result<Vec<_>, ReplicaError>>()?;

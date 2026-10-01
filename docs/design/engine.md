@@ -28,7 +28,7 @@ meet the gates" (12 §5.6, §5.8 item 4).
 On 2026-09-30 the owner decided to take that option with RocksDB itself as the design: convert
 RocksDB 11.8.1 to Rust inside mantle, in full. A conversion keeps what made RocksDB the choice
 (its formats, its compaction behaviour, its years of production and of bug fixes, 12 §1.13) and
-removes what the binding broke: the file layer is mantle-disk with the platform's full flush
+removes what the binding broke: the file layer is hyper-block's device file with the platform's full flush
 (24 §2.2), the code lints and tests on all six targets like the rest of mantle, the background
 work is schedulable by the simulator (24 §5 R17), and every failure is a typed error instead of
 an abort or an unchecked read (24 §2.3, §5 R6). Note 24 is the specification the conversion is
@@ -59,7 +59,7 @@ each side wrote (CLAUDE.md §8), built outside the repository.
   program compiled from RocksDB's own sources prints each function's output over every input
   length 0–4,096, several seeds and random draws; the engine's tests recompute them (§6).
 - **The test harness** replaces three C++ facilities (24 §3.0): `SyncPoint` becomes hook
-  points compiled only in tests; `FaultInjectionTestFS` becomes mantle-disk's `SimFile` and a
+  points compiled only in tests; `FaultInjectionTestFS` becomes hyper-block's `SimFile` and a
   simulated directory (24 §5 R16); `DBTestBase` becomes a Rust fixture with the same helper
   names, so a ported test reads line for line against its C++.
 

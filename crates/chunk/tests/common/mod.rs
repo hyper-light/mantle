@@ -6,12 +6,14 @@
     clippy::cast_possible_truncation
 )]
 
-use std::sync::{Arc, OnceLock};
+pub mod device;
 
+use std::sync::OnceLock;
+
+use hyper_block::issuer::Issuer;
 use mantle_chunk::{ChunkError, ChunkKey, Config, Limits, Reads, Volume};
-use mantle_disk::buf::Alignment;
-use mantle_disk::issuer::Issuer;
-use mantle_disk::sim::SimFile;
+
+use device::{Sim, SimDevice};
 
 /// The issuer of the one device every volume of a test binary is on, as a device's volumes
 /// share one, keeping four transfers in flight, as a device measured there.
@@ -43,7 +45,7 @@ pub const SIZE: u64 = 8 << 20;
 
 /// Puts, retrying while the volume answers `Busy`, as a client backs off while the cleaner
 /// frees space. The bound only stops a hang.
-pub fn put_retrying(v: &Volume<Arc<SimFile>>, k: ChunkKey, data: &[u8]) -> Result<(), ChunkError> {
+pub fn put_retrying(v: &Volume<SimDevice>, k: ChunkKey, data: &[u8]) -> Result<(), ChunkError> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         match v.put(k, data) {
@@ -55,15 +57,9 @@ pub fn put_retrying(v: &Volume<Arc<SimFile>>, k: ChunkKey, data: &[u8]) -> Resul
     }
 }
 
-pub fn sim(seed: u64) -> Arc<SimFile> {
-    Arc::new(
-        SimFile::new(
-            Alignment::new(4096).unwrap(),
-            Alignment::new(512).unwrap(),
-            seed,
-        )
-        .unwrap(),
-    )
+/// A simulated device whose crashes and faults replay from `seed`.
+pub fn sim(seed: u64) -> SimDevice {
+    device::sim(seed)
 }
 
 pub fn key(n: u64) -> ChunkKey {
@@ -90,7 +86,7 @@ pub fn data(seed: u64, len: usize) -> Vec<u8> {
 /// The index frames of `volume` the device durably holds, as (byte offset in the file, kind,
 /// LSN), in the order they sit on the device. A frame starts with its magic, version and
 /// kind, then its LSN and the volume's ID (frame.rs).
-pub fn frames(file: &SimFile, volume: u128) -> Vec<(u64, u16, u64)> {
+pub fn frames(file: &Sim, volume: u128) -> Vec<(u64, u16, u64)> {
     let image = file.durable_image().unwrap();
     image
         .as_chunks::<4096>()
@@ -109,7 +105,7 @@ pub fn frames(file: &SimFile, volume: u128) -> Vec<(u64, u16, u64)> {
 }
 
 /// The frame with the highest LSN.
-pub fn last_frame(file: &SimFile, volume: u128) -> (u64, u16, u64) {
+pub fn last_frame(file: &Sim, volume: u128) -> (u64, u16, u64) {
     frames(file, volume)
         .into_iter()
         .max_by_key(|&(_, _, lsn)| lsn)
@@ -119,8 +115,8 @@ pub fn last_frame(file: &SimFile, volume: u128) -> (u64, u16, u64) {
 /// Damages the frame at `at` for good: a stored bit of its CRC-32C, which every frame has,
 /// where its records may be too short to reach a given offset and bytes past them are padding
 /// no checksum covers.
-pub fn damage_frame(file: &SimFile, at: u64) {
-    file.inject(mantle_disk::sim::Fault::BitFlip {
+pub fn damage_frame(file: &Sim, at: u64) {
+    file.inject(hyper_block::sim::Fault::BitFlip {
         offset: at + 44,
         bit: 3,
         stored: true,
@@ -130,7 +126,7 @@ pub fn damage_frame(file: &SimFile, at: u64) {
 
 /// Asserts the frame at `at` is a confirmation: a batch frame (kind 1) of no records, the
 /// count 36 bytes in (frame.rs). Damage to it may lose nothing answered.
-pub fn assert_confirmation(file: &SimFile, at: u64) {
+pub fn assert_confirmation(file: &Sim, at: u64) {
     let image = file.durable_image().unwrap();
     let at = at as usize;
     let kind = u16::from_le_bytes([image[at + 6], image[at + 7]]);

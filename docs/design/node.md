@@ -12,11 +12,13 @@ constants.md.
 
 `mantle serve` is the process that runs mantle. The pieces it runs exist as libraries: chunk
 volumes that group-commit and verify every read (`mantle-chunk`), a Raft log shared by every
-range on a device (`mantle-log`), range replicas that run focal-raft's core over that log and an
+range on a device (`hyper-log`, vendored from hyper-raft), range replicas that run hyper-raft's
+core over that log and an
 engine (`mantle-range`), the Name, File, Block and Bucket layers with their sessions, sweeps,
 reclaimer, collector and coordinator (`mantle-meta`), the gateway's PUT, GET and completion
 drivers (`mantle-gateway`), the S3 protocol (`mantle-s3`), device identification and
-calibration (`mantle-disk`), and erasure coding (`mantle-ec`). Each is either sans-I/O, naming
+calibration (`mantle-disk`), aligned direct I/O, the full flush and the device issuer
+(`hyper-block`, vendored from hyper-raft), and erasure coding (`mantle-ec`). Each is either sans-I/O, naming
 the requests it needs and taking their answers, or owns threads of its own behind a bounded
 queue. None of them has a process around it yet. This record says what that process is: the
 threads it runs and how they meet, what it measures and what it is told, how it drives
@@ -82,7 +84,7 @@ the fleet does not, and because the native path is the more efficient at any siz
 its polling core are used only where the node's measured CPU per I/O shows a core's worth of
 saving (26 §7).
 
-*As built (2026-10-01).* `mantle_disk::issuer` is the pool path, and it runs on every
+*As built (2026-10-01).* `hyper_block::issuer` is the pool path, and it runs on every
 platform: io_uring on Linux and the completion port on Windows are not yet built, so Linux and
 Windows keep their depth with blocked workers as macOS does. The issuer's thread and its
 `min(device queue, measured depth, budget left)` workers start when the device opens and draw
@@ -96,7 +98,7 @@ the cap Apple's workqueue under GCD and Swift concurrency applies to itself (26 
 elsewhere the pools exist only where io_uring is unusable, under the same budget, whose ceiling
 on Linux is the smaller of `kernel.threads-max` and the soft `RLIMIT_NPROC`, and on Windows the
 500 worker threads Microsoft states as a thread pool's default maximum ("Thread Pools", Best
-Practices) (`mantle_disk::threads`). A pool that
+Practices) (`hyper_block::threads`). A pool that
 would pass it is refused, naming the device and depth, before any thread exists (26
 recommendation 4); the device then runs at the depth the budget leaves.
 
@@ -128,10 +130,10 @@ measured demand serves better than the operating system's sharing is open (§11)
 Nothing on a tokio worker waits on a device, and nothing on a device thread waits on the
 network. Three mechanisms keep it so.
 
-**Tickets for writes.** The log already answers a submission through a `Pending` that can be
-polled or waited on (`mantle_log::Pending`), but its answer travels a `std::sync::mpsc` channel
-that wakes nothing. The submission gains a `std::task::Waker`, which the writer thread wakes
-when it sets the answer. A chunk volume gets the same: today `Volume::put` returns only once
+**Tickets for writes.** The log answers every call through a ticket (`hyper_log::Pending`,
+`hyper_log::Fetching`): the answer travels a reply port only its caller receives on, so it
+unparks that caller and no other, and a submission or fetch may carry a `std::task::Waker`,
+which the log's owner thread wakes once, after the answer (hyper-log `ORIGIN.md`, L-2). A chunk volume gets the same: today `Volume::put` returns only once
 the chunk is durable, holding its caller's thread for a flush; it gains a submission that
 returns a ticket at once. A tokio task awaits a ticket with its own waker. A shard's waker
 pushes the range onto the shard's ready queue and unparks the thread, so a completion wakes the
@@ -1379,7 +1381,7 @@ attribution.
 
 The production engine is mantle's Rust port of RocksDB 11.8.1 (research 24), one instance per
 range replica with its WAL off, as ZippyDB and TiKV run one instance per shard (12 §6.1). The
-port's file system is `mantle-disk` (24 §2.2), so its flushes are the platform's full flush and
+port's file system is `hyper-block`'s device file (24 §2.2), so its flushes are the platform's full flush and
 its files can live on the simulated device (§9.1). Every instance on a node shares one write
 buffer manager, one block cache, one rate limiter per device, the flush and compaction pools,
 and one SST file manager, each a node object from engine phase P14; where RocksDB would stall a
@@ -1537,8 +1539,8 @@ written the same way. The shard loop, the admission authorities, the routing lay
 sessions, the transport's framing, classes and credits, and SWIM are state machines that take
 events and name their effects; tokio, the sockets and the threads are thin shims around them.
 The simulation runs many nodes in one thread on a virtual clock: volumes and logs on the
-simulated device that loses, keeps or tears unflushed writes (`mantle_disk::sim`), engines on
-the model engine and, once the port runs over `mantle-disk`, on the port itself, which
+simulated device that loses, keeps or tears unflushed writes (`hyper_block::sim`), engines on
+the model engine and, once the port runs over `hyper-block`, on the port itself, which
 FoundationDB could not do with a storage engine outside its simulator (06 §A5). The network is
 focal-sim's fabric of paths, links, loss, MTU black holes and NAT rebinding (07 §5.2), and QUIC
 runs as quinn-proto's sans-I/O endpoints over it, as focal's congestion test drives them (07

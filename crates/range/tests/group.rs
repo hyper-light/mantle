@@ -11,9 +11,9 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use mantle_disk::buf::Alignment;
-use mantle_disk::sim::SimFile;
-use mantle_log::{Config as LogConfig, Log, Waits};
+use hyper_block::buf::Alignment;
+use hyper_block::sim::SimFile;
+use hyper_log::{Config as LogConfig, Log, Waits};
 use mantle_meta::apply::Layer;
 use mantle_meta::engine::{Engine, Model, Rows};
 use mantle_meta::name::{self, GateChange, Preconditions, Put};
@@ -75,20 +75,31 @@ const RULES: Rules = Rules {
     expiries_per_entry: 8,
 };
 
+/// A simulated device of 4 KiB blocks and 512-byte sectors whose faults replay from `seed`.
+fn sim(seed: u64) -> SimFile {
+    SimFile::new(
+        Alignment::new(4096).unwrap(),
+        Alignment::new(512).unwrap(),
+        seed,
+    )
+    .unwrap()
+}
+
+/// The device of a log whose last handle the test holds, given back once the log has answered
+/// everything it took: what a log owns, the test reaches again only when the log closes.
+fn close(log: Arc<Log<SimFile>>) -> SimFile {
+    Arc::into_inner(log)
+        .expect("the test holds the log's last handle")
+        .close()
+        .unwrap()
+}
+
 struct Node {
-    replica: Replica<Arc<SimFile>, Model>,
+    replica: Replica<SimFile, Model>,
 }
 
 fn node(id: u64, seed: u64) -> Node {
-    let file = Arc::new(
-        SimFile::new(
-            Alignment::new(4096).unwrap(),
-            Alignment::new(512).unwrap(),
-            seed,
-        )
-        .unwrap(),
-    );
-    let log = Arc::new(Log::create(file, log_config(), 0x6c6f67 + u128::from(id)).unwrap());
+    let log = Arc::new(Log::create(sim(seed), log_config(), 0x6c6f67 + u128::from(id)).unwrap());
     let replica = Replica::open(id, GROUP, log, first_range(), &range(), seed).unwrap();
     Node { replica }
 }
@@ -216,37 +227,44 @@ fn a_group_elects_a_leader_and_applies_the_same_entries_everywhere() {
     }
 }
 
-/// A simulated file whose flushes wait while its gate is shut.
-struct Gated {
-    file: SimFile,
+/// A gate the test shuts to hold a device's flushes. The test and the log's device thread
+/// share it: the log owns its device, `'static`, so no scope of the test's spans that thread.
+#[derive(Default)]
+struct Gate {
     shut: std::sync::Mutex<bool>,
     opened: std::sync::Condvar,
 }
 
-impl Gated {
+impl Gate {
     fn shut(&self, shut: bool) {
         *self.shut.lock().unwrap() = shut;
         self.opened.notify_all();
     }
 }
 
-impl mantle_disk::block::BlockFile for Gated {
+/// A simulated file whose flushes wait while its gate is shut.
+struct Gated {
+    file: SimFile,
+    gate: Arc<Gate>,
+}
+
+impl hyper_block::block::BlockFile for Gated {
     fn alignment(&self) -> Alignment {
         self.file.alignment()
     }
-    fn len(&self) -> Result<u64, mantle_disk::DiskError> {
-        mantle_disk::block::BlockFile::len(&self.file)
+    fn len(&self) -> Result<u64, hyper_block::DiskError> {
+        hyper_block::block::BlockFile::len(&self.file)
     }
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), mantle_disk::DiskError> {
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), hyper_block::DiskError> {
         self.file.read_exact_at(buf, offset)
     }
-    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), mantle_disk::DiskError> {
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), hyper_block::DiskError> {
         self.file.write_all_at(buf, offset)
     }
-    fn sync_data(&self) -> Result<(), mantle_disk::DiskError> {
-        let mut shut = self.shut.lock().unwrap();
+    fn sync_data(&self) -> Result<(), hyper_block::DiskError> {
+        let mut shut = self.gate.shut.lock().unwrap();
         while *shut {
-            shut = self.opened.wait(shut).unwrap();
+            shut = self.gate.opened.wait(shut).unwrap();
         }
         drop(shut);
         self.file.sync_data()
@@ -254,29 +272,23 @@ impl mantle_disk::block::BlockFile for Gated {
 }
 
 /// A member whose log's flushes can be held, and its gate.
-type GatedMember = (Replica<Arc<Gated>, Model>, Arc<Gated>);
+type GatedMember = (Replica<Gated, Model>, Arc<Gate>);
 
 /// A member whose log's flushes can be held.
 fn gated(id: u64) -> GatedMember {
-    let gate = Arc::new(Gated {
-        file: SimFile::new(
-            Alignment::new(4096).unwrap(),
-            Alignment::new(512).unwrap(),
-            id,
-        )
-        .unwrap(),
-        shut: std::sync::Mutex::new(false),
-        opened: std::sync::Condvar::new(),
-    });
-    let log =
-        Arc::new(Log::create(Arc::clone(&gate), log_config(), 0x6c6f67 + u128::from(id)).unwrap());
+    let gate = Arc::new(Gate::default());
+    let file = Gated {
+        file: sim(id),
+        gate: Arc::clone(&gate),
+    };
+    let log = Arc::new(Log::create(file, log_config(), 0x6c6f67 + u128::from(id)).unwrap());
     let replica = Replica::open(id, GROUP, log, first_range(), &range(), id).unwrap();
     (replica, gate)
 }
 
-/// Opens every gate when dropped, as a failing test unwinds, so no log's writer is left
+/// Opens every gate when dropped, as a failing test unwinds, so no log's device is left
 /// holding a flush while its log is dropped.
-struct Opens(Vec<Arc<Gated>>);
+struct Opens(Vec<Arc<Gate>>);
 
 impl Drop for Opens {
     fn drop(&mut self) {
@@ -648,25 +660,10 @@ fn a_member_added_after_compaction_catches_up_and_replaces_a_lost_one() {
 /// crashes and opens again.
 #[test]
 fn a_member_whose_engine_is_ahead_of_its_logs_commit_reopens() {
-    use mantle_disk::sim::Crash;
+    use hyper_block::sim::Crash;
 
-    let file = |id: u64| {
-        Arc::new(
-            SimFile::new(
-                Alignment::new(4096).unwrap(),
-                Alignment::new(512).unwrap(),
-                id,
-            )
-            .unwrap(),
-        )
-    };
-    let files: Vec<Arc<SimFile>> = (1..=3).map(file).collect();
-    let logs: Vec<Arc<Log<Arc<SimFile>>>> = files
-        .iter()
-        .zip(1u64..)
-        .map(|(f, id)| {
-            Arc::new(Log::create(Arc::clone(f), log_config(), 0x6c6f67 + u128::from(id)).unwrap())
-        })
+    let mut logs: Vec<Arc<Log<SimFile>>> = (1..=3)
+        .map(|id| Arc::new(Log::create(sim(id), log_config(), 0x6c6f67 + u128::from(id)).unwrap()))
         .collect();
     let mut nodes: Vec<Node> = logs
         .iter()
@@ -704,9 +701,9 @@ fn a_member_whose_engine_is_ahead_of_its_logs_commit_reopens() {
     logs[1]
         .write_waiting(
             GROUP,
-            mantle_log::Update {
-                hard_state: Some(mantle_log::HardState { commit: 1, ..hard }),
-                ..mantle_log::Update::default()
+            hyper_log::Update {
+                hard_state: Some(hyper_log::HardState { commit: 1, ..hard }),
+                ..hyper_log::Update::default()
             },
         )
         .unwrap();
@@ -715,8 +712,9 @@ fn a_member_whose_engine_is_ahead_of_its_logs_commit_reopens() {
     let old = std::mem::replace(&mut nodes[1], node(9, 9));
     let mut engine = old.replica.into_engine();
     engine.crash();
-    files[1].crash(Crash::Random).unwrap();
-    let (log, recovery) = Log::open(Arc::clone(&files[1]), log_config(), 0x6c6f67 + 2).unwrap();
+    let file = close(logs.remove(1));
+    file.crash(Crash::Random).unwrap();
+    let (log, recovery) = Log::open(file, log_config(), 0x6c6f67 + 2).unwrap();
     assert!(recovery.damaged.is_empty());
     nodes[1] = Node {
         replica: Replica::open(2, GROUP, Arc::new(log), engine, &range(), 2).unwrap(),
@@ -763,24 +761,11 @@ fn a_member_whose_engine_is_ahead_of_its_logs_commit_reopens() {
 /// before (audit S01, the last frame; raft-log.md §6).
 #[test]
 fn a_member_whose_last_frame_was_damaged_stays_out_of_elections_until_it_holds_it_again() {
-    use mantle_disk::sim::Fault;
+    use hyper_block::sim::Fault;
 
-    let file = |id: u64| {
-        Arc::new(
-            SimFile::new(
-                Alignment::new(4096).unwrap(),
-                Alignment::new(512).unwrap(),
-                id,
-            )
-            .unwrap(),
-        )
-    };
     let log_id = |id: u64| 0x6c6f67 + u128::from(id);
-    let files: Vec<Arc<SimFile>> = (1..=3).map(file).collect();
-    let mut logs: Vec<Arc<Log<Arc<SimFile>>>> = files
-        .iter()
-        .zip(1u64..)
-        .map(|(f, id)| Arc::new(Log::create(Arc::clone(f), log_config(), log_id(id)).unwrap()))
+    let mut logs: Vec<Arc<Log<SimFile>>> = (1..=3)
+        .map(|id| Arc::new(Log::create(sim(id), log_config(), log_id(id)).unwrap()))
         .collect();
     let mut nodes: Vec<Node> = logs
         .iter()
@@ -823,32 +808,35 @@ fn a_member_whose_last_frame_was_damaged_stays_out_of_elections_until_it_holds_i
 
     // Its last frame, the append it acknowledged, is damaged at rest: found as the valid
     // frame of member 2's log with the highest sequence.
-    let image = files[1].durable_image().unwrap();
+    let image = logs[1].with_file(|f| f.durable_image()).unwrap().unwrap();
     let last_frame = image
         .chunks(4096)
         .enumerate()
         .filter_map(|(i, block)| {
-            let h = mantle_log::format::FrameHeader::decode(block)?;
+            let h = hyper_log::format::FrameHeader::decode(block)?;
             let frame = image.get(i * 4096..i * 4096 + h.frame_len()?)?;
             (h.log == log_id(2) && h.verifies(frame)).then(|| (h.sequence, i * 4096))
         })
         .max()
         .unwrap()
         .1;
-    files[1]
-        .inject(Fault::BitFlip {
-            offset: last_frame as u64 + 90,
-            bit: 5,
-            stored: true,
+    logs[1]
+        .with_file(move |f| {
+            f.inject(Fault::BitFlip {
+                offset: last_frame as u64 + 90,
+                bit: 5,
+                stored: true,
+            })
         })
+        .unwrap()
         .unwrap();
 
     // It restarts from its device and its engine.
     let old = std::mem::replace(&mut nodes[1], node(9, 9));
     let engine = old.replica.into_engine();
     let stand_in = Arc::clone(&logs[0]);
-    drop(std::mem::replace(&mut logs[1], stand_in));
-    let (log, recovery) = Log::open(Arc::clone(&files[1]), log_config(), log_id(2)).unwrap();
+    let file = close(std::mem::replace(&mut logs[1], stand_in));
+    let (log, recovery) = Log::open(file, log_config(), log_id(2)).unwrap();
     assert_eq!(recovery.restored, vec![GROUP]);
     logs[1] = Arc::new(log);
     nodes[1] = Node {
@@ -927,14 +915,6 @@ fn a_member_whose_last_frame_was_damaged_stays_out_of_elections_until_it_holds_i
 /// compacts, the next drive writes the same ready and the replica goes on (audit S04).
 #[test]
 fn a_ready_refused_for_room_waits_until_the_group_compacts() {
-    let file = Arc::new(
-        SimFile::new(
-            Alignment::new(4096).unwrap(),
-            Alignment::new(512).unwrap(),
-            7,
-        )
-        .unwrap(),
-    );
     // A ready of these settings is 512 bytes at most, 102 entries of the fewest bytes, and
     // the log holds a group to that.
     let small = Settings {
@@ -949,7 +929,7 @@ fn a_ready_refused_for_room_waits_until_the_group_compacts() {
         group_bytes: 1 << 20,
         ..log_config()
     };
-    let log = Arc::new(Log::create(file, config, 0x6c6f67).unwrap());
+    let log = Arc::new(Log::create(sim(7), config, 0x6c6f67).unwrap());
     let alone = Range {
         boot: ConfState {
             voters: vec![1],
@@ -982,7 +962,7 @@ fn a_ready_refused_for_room_waits_until_the_group_compacts() {
         }
     }
     assert!(
-        matches!(stalled, Some(mantle_log::LogError::Backlog(GROUP))),
+        matches!(stalled, Some(hyper_log::LogError::Backlog(GROUP))),
         "{stalled:?}"
     );
     let applied = replica.applied();
@@ -1008,15 +988,7 @@ fn a_ready_refused_for_room_waits_until_the_group_compacts() {
 #[test]
 fn a_member_refuses_settings_its_log_cannot_hold() {
     let open = |settings: Settings, config: LogConfig| {
-        let file = Arc::new(
-            SimFile::new(
-                Alignment::new(4096).unwrap(),
-                Alignment::new(512).unwrap(),
-                8,
-            )
-            .unwrap(),
-        );
-        let log = Arc::new(Log::create(file, config, 0x6c6f67).unwrap());
+        let log = Arc::new(Log::create(sim(8), config, 0x6c6f67).unwrap());
         let r = Range {
             settings,
             ..range()
@@ -1317,13 +1289,13 @@ fn reads_of_a_round_no_quorum_confirms_go_back_to_their_callers() {
 /// Members of a group of three, each with its own device and log, found by identity: a
 /// member rebuilt under a new identity keeps its device.
 ///
-/// A device is shared between the test, which injects faults into it and damages its medium,
-/// and its log, whose writer thread holds it: `Log` takes its file by value, `'static`, so
-/// the test cannot lend it one. A log is shared between its member, as `Replica::open` takes
-/// it, and the test, which reads what it holds; a stopped member's log is `None`.
+/// A device is its log's while the member runs, and the test reaches it through the log
+/// (`Devices::with_file`); a stopped member's log is `None` and its device the test's, to
+/// damage at rest. A log is shared between its member, as `Replica::open` takes it, and the
+/// test, which reads what it holds.
 struct Devices {
-    files: Vec<Arc<SimFile>>,
-    logs: Vec<Option<Arc<Log<Arc<SimFile>>>>>,
+    files: Vec<Option<SimFile>>,
+    logs: Vec<Option<Arc<Log<SimFile>>>>,
     nodes: Vec<Node>,
 }
 
@@ -1333,24 +1305,12 @@ fn log_id(slot: usize) -> u128 {
 
 impl Devices {
     fn new(seed: u64) -> Self {
-        let files: Vec<Arc<SimFile>> = (0..3)
-            .map(|i| {
-                Arc::new(
-                    SimFile::new(
-                        Alignment::new(4096).unwrap(),
-                        Alignment::new(512).unwrap(),
-                        seed + i,
-                    )
-                    .unwrap(),
-                )
-            })
-            .collect();
-        let logs: Vec<Option<Arc<Log<Arc<SimFile>>>>> = files
-            .iter()
-            .enumerate()
-            .map(|(slot, f)| {
+        let files = (0..3).map(|_| None).collect();
+        let logs: Vec<Option<Arc<Log<SimFile>>>> = (0..3)
+            .map(|slot| {
+                let device = sim(seed + u64::try_from(slot).unwrap());
                 Some(Arc::new(
-                    Log::create(Arc::clone(f), log_config(), log_id(slot)).unwrap(),
+                    Log::create(device, log_config(), log_id(slot)).unwrap(),
                 ))
             })
             .collect();
@@ -1377,8 +1337,22 @@ impl Devices {
     /// engine, which the caller keeps or drops, comes back.
     fn stop(&mut self, slot: usize) -> Model {
         let old = std::mem::replace(&mut self.nodes[slot], node(9, 9));
-        self.logs[slot] = None;
-        old.replica.into_engine()
+        let engine = old.replica.into_engine();
+        self.files[slot] = self.logs[slot].take().map(close);
+        engine
+    }
+
+    /// Runs `look` on the device in `slot`, through its log while it runs.
+    fn with_file<R: Send + 'static>(
+        &self,
+        slot: usize,
+        look: impl FnOnce(&SimFile) -> R + Send + 'static,
+    ) -> R {
+        match (&self.logs[slot], &self.files[slot]) {
+            (Some(log), _) => log.with_file(look).unwrap(),
+            (None, Some(file)) => look(file),
+            (None, None) => panic!("slot {slot} has no device"),
+        }
     }
 
     fn slot(&self, id: u64) -> Option<usize> {
@@ -1396,7 +1370,7 @@ impl Devices {
         &mut self,
         out: &[u64],
         answers: &mut Vec<(u64, u64, Vec<Answer>)>,
-        mut check: impl FnMut(&Message, &Log<Arc<SimFile>>),
+        mut check: impl FnMut(&Message, &Log<SimFile>),
     ) {
         let mut wire: VecDeque<Message> = VecDeque::new();
         for _ in 0..10_000 {
@@ -1491,7 +1465,7 @@ fn agreed(answers: &[(u64, u64, Vec<Answer>)]) -> std::collections::BTreeMap<u64
 /// reports, compaction and drives. The two others go on without it, electing a leader if it
 /// led, and commit. A log that only refused the ready for room leaves the member waiting with
 /// it instead (`a_ready_refused_for_room_waits_until_the_group_compacts` and those after it).
-fn a_durability_failure_fences(fault: &mantle_disk::sim::Fault, failing: u64) {
+fn a_durability_failure_fences(fault: &hyper_block::sim::Fault, failing: u64) {
     use mantle_range::{ConfChangeV2, MessageType, ReplicaError};
 
     let mut d = Devices::new(60 + failing);
@@ -1503,7 +1477,8 @@ fn a_durability_failure_fences(fault: &mantle_disk::sim::Fault, failing: u64) {
     let before = d.nodes[0].replica.applied();
 
     let slot = d.slot(failing).unwrap();
-    d.files[slot].inject(fault.clone()).unwrap();
+    let fault = fault.clone();
+    d.with_file(slot, move |f| f.inject(fault)).unwrap();
     d.nodes[0].replica.propose(&registration(1)).unwrap();
     let entry = before + 1;
     // Drive in order, as `settle` does, until the failing member meets its fault.
@@ -1599,7 +1574,7 @@ fn a_durability_failure_fences(fault: &mantle_disk::sim::Fault, failing: u64) {
 #[test]
 fn a_failed_flush_fences_the_member_and_the_group_goes_on_without_it() {
     for failing in [2, 1] {
-        a_durability_failure_fences(&mantle_disk::sim::Fault::SyncError, failing);
+        a_durability_failure_fences(&hyper_block::sim::Fault::SyncError, failing);
     }
 }
 
@@ -1607,22 +1582,14 @@ fn a_failed_flush_fences_the_member_and_the_group_goes_on_without_it() {
 #[test]
 fn a_failed_write_fences_the_member_and_the_group_goes_on_without_it() {
     for failing in [2, 1] {
-        a_durability_failure_fences(&mantle_disk::sim::Fault::WriteError, failing);
+        a_durability_failure_fences(&hyper_block::sim::Fault::WriteError, failing);
     }
 }
 
 /// A group of one on a log that holds `config`'s groups and segments. The log is shared with
 /// the test, which writes other groups to it, as `Replica::open` takes it (`Devices`).
-fn alone(config: LogConfig, settings: Settings, seed: u64) -> (Arc<Log<Arc<SimFile>>>, Member) {
-    let file = Arc::new(
-        SimFile::new(
-            Alignment::new(4096).unwrap(),
-            Alignment::new(512).unwrap(),
-            seed,
-        )
-        .unwrap(),
-    );
-    let log = Arc::new(Log::create(file, config, 0x6c6f67).unwrap());
+fn alone(config: LogConfig, settings: Settings, seed: u64) -> (Arc<Log<SimFile>>, Member) {
+    let log = Arc::new(Log::create(sim(seed), config, 0x6c6f67).unwrap());
     let range = Range {
         boot: ConfState {
             voters: vec![1],
@@ -1635,7 +1602,7 @@ fn alone(config: LogConfig, settings: Settings, seed: u64) -> (Arc<Log<Arc<SimFi
     (log, replica)
 }
 
-type Member = Replica<Arc<SimFile>, Model>;
+type Member = Replica<SimFile, Model>;
 
 /// A log that holds all the groups it may refuses a new member's first ready: the ready
 /// waits, whole, the member is not fenced, and once another group leaves the log the next
@@ -1650,13 +1617,13 @@ fn a_ready_refused_for_want_of_a_group_waits_until_one_leaves() {
     for group in [7, 8] {
         log.write(
             group,
-            mantle_log::Update {
-                hard_state: Some(mantle_log::HardState {
+            hyper_log::Update {
+                hard_state: Some(hyper_log::HardState {
                     term: 1,
                     vote: 0,
                     commit: 0,
                 }),
-                ..mantle_log::Update::default()
+                ..hyper_log::Update::default()
             },
         )
         .unwrap();
@@ -1664,7 +1631,7 @@ fn a_ready_refused_for_want_of_a_group_waits_until_one_leaves() {
     replica.campaign().unwrap();
     let out = replica.drive().unwrap();
     assert!(
-        matches!(out.stalled, Some(mantle_log::LogError::TooManyGroups(2))),
+        matches!(out.stalled, Some(hyper_log::LogError::TooManyGroups(2))),
         "{:?}",
         out.stalled
     );
@@ -1677,9 +1644,9 @@ fn a_ready_refused_for_want_of_a_group_waits_until_one_leaves() {
     assert!(replica.drive().unwrap().stalled.is_some());
     log.write(
         7,
-        mantle_log::Update {
+        hyper_log::Update {
             remove: true,
-            ..mantle_log::Update::default()
+            ..hyper_log::Update::default()
         },
     )
     .unwrap();
@@ -1751,28 +1718,29 @@ fn a_member_whose_group_was_damaged_at_rest_is_rebuilt_from_its_peers() {
     // Member 3 stops. Its last frame, as a member on the fast track leaves one, holds a
     // proposal of its own; then that frame is damaged on the medium.
     drop(d.stop(2));
-    let file = Arc::clone(&d.files[2]);
-    {
-        let (log, _) = Log::open(Arc::clone(&file), log_config(), log_id(2)).unwrap();
+    let file = d.files[2].take().unwrap();
+    let file = {
+        let (log, _) = Log::open(file, log_config(), log_id(2)).unwrap();
         let view = log.view(GROUP).unwrap().unwrap();
         let term = view.hard_state.unwrap().term;
         log.write(
             GROUP,
-            mantle_log::Update {
-                proposals: vec![mantle_log::Proposal {
+            hyper_log::Update {
+                proposals: vec![hyper_log::Proposal {
                     index: view.last + 1,
                     term,
-                    bytes: Arc::from(&b"fast"[..]),
+                    bytes: b"fast".to_vec(),
                 }],
-                ..mantle_log::Update::default()
+                ..hyper_log::Update::default()
             },
         )
         .unwrap();
-    }
+        log.close().unwrap()
+    };
     damage_last_frame(&file, log_id(2));
 
     // It restarts: the log reports its group damaged, and the member does not open.
-    let (log, recovery) = Log::open(Arc::clone(&file), log_config(), log_id(2)).unwrap();
+    let (log, recovery) = Log::open(file, log_config(), log_id(2)).unwrap();
     assert_eq!(recovery.damaged, vec![GROUP]);
     let log = Arc::new(log);
     assert!(matches!(
@@ -1846,15 +1814,15 @@ fn a_member_whose_group_was_damaged_at_rest_is_rebuilt_from_its_peers() {
 /// Flips a bit of the last frame of log `id` on `file`'s medium, as damage at rest does: a
 /// fault written to the medium, so no clearing of faults heals it.
 fn damage_last_frame(file: &SimFile, id: u128) {
-    use mantle_disk::block::BlockFile;
-    use mantle_disk::buf::AlignedBuf;
+    use hyper_block::block::BlockFile;
+    use hyper_block::buf::AlignedBuf;
 
     let image = file.durable_image().unwrap();
     let last_frame = image
         .chunks(4096)
         .enumerate()
         .filter_map(|(i, block)| {
-            let h = mantle_log::format::FrameHeader::decode(block)?;
+            let h = hyper_log::format::FrameHeader::decode(block)?;
             let frame = image.get(i * 4096..i * 4096 + h.frame_len()?)?;
             (h.log == id && h.verifies(frame)).then(|| (h.sequence, i * 4096))
         })
@@ -1880,7 +1848,7 @@ fn damage_last_frame(file: &SimFile, id: u128) {
 /// and 5 in the last frame, the engine's index, and the start the log takes, if any.
 #[test]
 fn a_member_whose_engine_applied_what_its_damaged_log_lost_keeps_its_identity_when_it_can() {
-    use mantle_log::{Entries, HardState, Start, Update};
+    use hyper_log::{Entries, HardState, Start, Update};
 
     let cases: [(u64, [u64; 2], u64, Option<u64>); 5] = [
         (2, [2, 2], 4, Some(2)),
@@ -1890,25 +1858,17 @@ fn a_member_whose_engine_applied_what_its_damaged_log_lost_keeps_its_identity_wh
         (1, [2, 2], 4, None),
     ];
     for (case, (early, late, applied, start)) in cases.into_iter().enumerate() {
-        let file = Arc::new(
-            SimFile::new(
-                Alignment::new(4096).unwrap(),
-                Alignment::new(512).unwrap(),
-                80 + case as u64,
-            )
-            .unwrap(),
-        );
-        let entry = |term: u64| mantle_log::Entry {
+        let entry = |term: u64| hyper_log::Entry {
             term,
-            bytes: Arc::from(&[0u8, 0, 0, 0, 0][..]),
+            bytes: vec![0u8; 5],
         };
         let voted = HardState {
             term: 2,
             vote: 1,
             commit: 0,
         };
-        {
-            let log = Log::create(Arc::clone(&file), log_config(), 0x6c6f67).unwrap();
+        let file = {
+            let log = Log::create(sim(80 + case as u64), log_config(), 0x6c6f67).unwrap();
             log.write(
                 GROUP,
                 Update {
@@ -1933,9 +1893,10 @@ fn a_member_whose_engine_applied_what_its_damaged_log_lost_keeps_its_identity_wh
                 },
             )
             .unwrap();
-        }
+            log.close().unwrap()
+        };
         damage_last_frame(&file, 0x6c6f67);
-        let (log, recovery) = Log::open(Arc::clone(&file), log_config(), 0x6c6f67).unwrap();
+        let (log, recovery) = Log::open(file, log_config(), 0x6c6f67).unwrap();
         assert_eq!(recovery.restored, vec![GROUP], "case {case}");
         let mark = Start {
             index: 5,
@@ -2013,10 +1974,10 @@ fn a_member_whose_engine_applied_what_its_damaged_log_lost_is_repaired_in_place(
     d.nodes[1].replica.compact(u64::MAX).unwrap();
     let engine = d.stop(1);
     assert_eq!(engine.durable(), entry);
-    let file = Arc::clone(&d.files[1]);
+    let file = d.files[1].take().unwrap();
     damage_last_frame(&file, log_id(1));
 
-    let (log, recovery) = Log::open(Arc::clone(&file), log_config(), log_id(1)).unwrap();
+    let (log, recovery) = Log::open(file, log_config(), log_id(1)).unwrap();
     assert_eq!(recovery.restored, vec![GROUP]);
     let view = log.view(GROUP).unwrap().unwrap();
     assert!(view.last < entry, "the lost frame held no applied entry");
@@ -2069,16 +2030,8 @@ fn a_ready_refused_for_a_full_log_waits_until_another_group_compacts() {
         max_segments: 4,
         ..log_config()
     };
-    let file = Arc::new(
-        SimFile::new(
-            Alignment::new(4096).unwrap(),
-            Alignment::new(512).unwrap(),
-            12,
-        )
-        .unwrap(),
-    );
     // Shared with the member as `Replica::open` takes it; the test writes another group.
-    let log = Arc::new(Log::create(file, config, 0x6c6f67).unwrap());
+    let log = Arc::new(Log::create(sim(12), config, 0x6c6f67).unwrap());
     let room = log.entry_room().unwrap();
     let quarter = room / 4;
     // An entry's encoding adds its kind and its context's length to its data.
@@ -2111,20 +2064,20 @@ fn a_ready_refused_for_a_full_log_waits_until_another_group_compacts() {
     loop {
         let written = log.write(
             7,
-            mantle_log::Update {
-                entries: Some(mantle_log::Entries {
+            hyper_log::Update {
+                entries: Some(hyper_log::Entries {
                     first: last + 1,
-                    entries: vec![mantle_log::Entry {
+                    entries: vec![hyper_log::Entry {
                         term: 1,
-                        bytes: Arc::from(vec![7u8; quarter]),
+                        bytes: vec![7u8; quarter],
                     }],
                 }),
-                ..mantle_log::Update::default()
+                ..hyper_log::Update::default()
             },
         );
         match written {
             Ok(()) => last += 1,
-            Err(mantle_log::LogError::Full) => break,
+            Err(hyper_log::LogError::Full) => break,
             Err(e) => panic!("{e}"),
         }
         assert!(
@@ -2153,7 +2106,7 @@ fn a_ready_refused_for_a_full_log_waits_until_another_group_compacts() {
     let applied = replica.applied();
     let out = replica.drive().unwrap();
     assert!(
-        matches!(out.stalled, Some(mantle_log::LogError::Full)),
+        matches!(out.stalled, Some(hyper_log::LogError::Full)),
         "{:?}",
         out.stalled
     );
@@ -2165,12 +2118,12 @@ fn a_ready_refused_for_a_full_log_waits_until_another_group_compacts() {
     // The other group compacts past everything it holds.
     log.write(
         7,
-        mantle_log::Update {
-            start: Some(mantle_log::Start {
+        hyper_log::Update {
+            start: Some(hyper_log::Start {
                 index: last,
                 term: 1,
             }),
-            ..mantle_log::Update::default()
+            ..hyper_log::Update::default()
         },
     )
     .unwrap();

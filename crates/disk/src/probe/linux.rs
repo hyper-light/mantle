@@ -347,8 +347,14 @@ mod tests {
         let name = name.file_name().unwrap().to_str().unwrap();
         assert_eq!(id.file_system.kind, FileSystemKind::Device, "{id:#?}");
         assert_eq!(id.device.as_deref(), Some(name), "{id:#?}");
-        let file = std::fs::File::open(path).unwrap();
-        let size = crate::node::len(&file).unwrap();
+        let file = hyper_block::file::DeviceFile::open(
+            path,
+            false,
+            hyper_block::file::CachingRequest::Buffered,
+            hyper_block::buf::Alignment::BYTE,
+        )
+        .unwrap();
+        let size = file.len().unwrap();
         assert!(size > 0);
         assert_eq!(id.size_bytes, Some(size), "{id:#?}");
         assert_ne!(id.medium, Medium::Memory, "{id:#?}");

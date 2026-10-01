@@ -15,8 +15,8 @@
 
 use std::time::Instant;
 
-use mantle_disk::buf::{AlignedBuf, Alignment};
-use mantle_disk::file::{CachingRequest, DeviceFile};
+use hyper_block::buf::{AlignedBuf, Alignment};
+use hyper_block::file::{CachingRequest, DeviceFile};
 
 fn main() {
     let mut args = std::env::args().skip(1);

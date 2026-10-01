@@ -19,9 +19,9 @@
 
 use std::time::Instant;
 
-use mantle_disk::buf::{AlignedBuf, Alignment};
-use mantle_disk::file::{CachingRequest, DeviceFile};
-use mantle_disk::issuer::Issuer;
+use hyper_block::buf::{AlignedBuf, Alignment};
+use hyper_block::file::{CachingRequest, DeviceFile};
+use hyper_block::issuer::Issuer;
 
 fn buf(len: usize, byte: u8, align: Alignment) -> AlignedBuf {
     let mut b = AlignedBuf::zeroed(len, align).unwrap();

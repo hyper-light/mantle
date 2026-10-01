@@ -16,11 +16,12 @@ path = "src/main.rs"
 [dependencies]
 bytes.workspace = true
 clap.workspace = true
+hyper-block = { path = "../../vendor/hyper-block" }
+hyper-log = { path = "../../vendor/hyper-log" }
 mantle-chunk = { path = "../chunk" }
 mantle-disk = { path = "../disk" }
 mantle-ec = { path = "../ec" }
 mantle-gateway = { path = "../gateway" }
-mantle-log = { path = "../log" }
 mantle-meta = { path = "../meta" }
 mantle-s3 = { path = "../s3" }
 

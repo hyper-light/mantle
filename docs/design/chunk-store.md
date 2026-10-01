@@ -300,7 +300,7 @@ volatile-memory backup failed, is recorded flush-unverified, and placement count
 as a weaker copy (durability.md §5).
 
 **The wait, by class and by power.** The writer's wait for returning submitters is the derived
-wait (`mantle_disk::commit`; research/11 §2) with three changes. A batch holding an
+wait (`hyper_block::commit`; research/11 §2) with three changes. A batch holding an
 EXPRESS_ONEZONE write does not wait: a lone request is flushed at once (research/11 §2.4;
 storage-classes.md §5). On battery or under the OS's saver mode, the writer waits until every
 outstanding submitter has returned, the batch limits are reached, or the measured batch service
@@ -337,7 +337,7 @@ started, in reverse, before the error returns, and nothing is left holding the d
 S12).
 
 *As built (2026-10-01; STATUS item 4).* Every write and flush of every volume on a device goes
-through the device's issuer (`mantle_disk::issuer`): one thread and a pool of blocking workers,
+through the device's issuer (`hyper_block::issuer`, vendored from hyper-raft): one thread and a pool of blocking workers,
 all started when the device opens, `min(the device's reported queue, the depth calibration
 measured throughput to stop growing at, the process's thread budget)` of them (node.md §1.2).
 A volume attaches a second handle to its file and hands the issuer a batch's regions and frame

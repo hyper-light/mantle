@@ -11,13 +11,15 @@ publish.workspace = true
 
 [dependencies]
 getrandom.workspace = true
+# Block I/O and the device issuer, vendored from hyper-raft (vendor/hyper-block/SNAPSHOT).
+hyper-block = { path = "../../vendor/hyper-block" }
 mantle-codec = { path = "../codec" }
 mantle-crc = { path = "../crc" }
 mantle-disk = { path = "../disk" }
 thiserror.workspace = true
 
 [dev-dependencies]
-mantle-disk = { path = "../disk", features = ["sim"] }
+hyper-block = { path = "../../vendor/hyper-block", features = ["sim"] }
 proptest.workspace = true
 tempfile.workspace = true
 

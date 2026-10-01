@@ -24,6 +24,12 @@ here, when a row names a constant that no longer exists, and when the rows marke
 outnumber its ceiling, which only falls: a new unfounded constant cannot land, and one that
 gains a basis lowers the ceiling.
 
+The shared crates mantle vendors from hyper-raft (`vendor/UPSTREAM.md`) are not mantle's
+production code here: the Raft log (`vendor/hyper-log`) and the block layer under it and the
+chunk store (`vendor/hyper-block`), with their format constants, the queue's pipeline depth,
+the process thread budget's ceilings and `UNDESCRIBED_QUEUE_DEPTH`. hyper-raft's rules give
+every one of their constants its derivation or citation where it is defined.
+
 ## Constants
 
 | Constant | Kind | Basis |
@@ -62,12 +68,8 @@ gains a basis lowers the ceiling.
 | `crates/chunk/src/writer.rs` `SEQUENCE_RESERVE` | bound | 2^24 keeps reservation cost under 10^-3 at the measured 4.7 ms flush (research 11 §11.3); audit §12.6 asks to parameterize it by the measured rate and fence cost. |
 | `crates/crc/src/lib.rs` `POLY` | external | The bit-reflected generator polynomial of CRC-32C (0x82F63B78), CRC-32/ISO-HDLC (0xEDB88320) and CRC-64/NVME (0x9A6C9329AC4BC9B5), one per `reflected_crc!` instance. |
 | `crates/crc/src/lib.rs` `TOP` | derived | `1 << (bits - 1)`: x^0 in the reflected register of the macro's width, as in zlib crc32.c `multmodp`/`x2nmodp`. |
-| `crates/disk/src/buf.rs` `MAX_ALIGNMENT` | bound | 1 MiB alignment cap above the 512 B–64 KiB direct-I/O alignments of every target (open(2) O_DIRECT notes; Windows File Buffering). |
-| `crates/disk/src/buf.rs` `MAX_BUFFER` | bound | Turns a corrupt length into a refusal; sufficient for every I/O, since the chunk store and the Raft log refuse a segment larger than one buffer before any I/O and every other I/O is a frame or batch. |
-| `crates/disk/src/calibrate.rs` `UNDESCRIBED_QUEUE_DEPTH` | cited | 32, the commands Native Command Queuing holds (Serial ATA Revision 2.6 §13.6.2; AHCI 1.3.1 §1.1), the shallowest queue of a command-queuing interface: the queue assumed of a device the OS cannot describe, which the read ladder then measures (CLAUDE.md §5; measurement.md §8). |
 | `crates/disk/src/calibrate.rs` `P50_SAMPLES` | open | 16 from n ≥ 1.96²q(1−q)/δ² at δ = (1−q)/2 (research 11 §13.3); the 95% level and the δ rule are chosen, not cited. |
 | `crates/disk/src/calibrate.rs` `P99_SAMPLES` | open | 1,522 from the same binomial normal approximation; the 95% confidence and δ = (1−q)/2 tolerance have no cited basis. |
-| `crates/disk/src/commit.rs` `RATE_ONE` | open | 2^16 fixed-point unit for return counts and the share p; the resolution p needs is not derived. |
 | `crates/disk/src/histogram.rs` `BUCKETS` | derived | OVERFLOW + 1. |
 | `crates/disk/src/histogram.rs` `MAX_EXP` | open | Rows up to 2^41 ns (about 37 minutes); research 11 §14.3 says the top should be the longest latency a consumer acts on. |
 | `crates/disk/src/histogram.rs` `OVERFLOW` | derived | ROWS × SUB, the overflow bucket's index. |
@@ -75,9 +77,6 @@ gains a basis lowers the ceiling.
 | `crates/disk/src/histogram.rs` `SUB` | derived | 2^SUB_BITS sub-buckets per row. |
 | `crates/disk/src/histogram.rs` `SUB_BITS` | open | 5 bits (3.1% error) by research 11 §14.3's α ≤ ε/2 rule, but ε = ±10% is an example resolution, not measured or cited. |
 | `crates/disk/src/histogram.rs` `SUB_MASK` | derived | SUB − 1 as a bit mask. |
-| `crates/disk/src/node/macos.rs` `BLOCK_COUNT` | external | DKIOCGETBLOCKCOUNT, _IOR('d', 25, uint64_t), macOS <sys/disk.h>. |
-| `crates/disk/src/node/macos.rs` `BLOCK_SIZE` | external | DKIOCGETBLOCKSIZE, _IOR('d', 24, uint32_t), macOS <sys/disk.h>. |
-| `crates/disk/src/node/macos.rs` `SYNCHRONIZE` | external | DKIOCSYNCHRONIZE, _IOW('d', 22, dk_synchronize_t), macOS <sys/disk.h>. |
 | `crates/disk/src/probe/linux.rs` `MAX_DEPTH` | bound | Stack bound on the recursive sysfs walk, past the three-deep dm-crypt, LVM and md stack; a deeper composite's medium is left unknown, never guessed (CLAUDE.md rule 5). |
 | `crates/disk/src/probe/macos.rs` `CF_NUMBER_SINT64` | external | kCFNumberSInt64Type = 4, CoreFoundation CFNumber.h. |
 | `crates/disk/src/probe/macos.rs` `ITERATE_PARENTS` | external | kIORegistryIterateParents = 0x2, IOKit IOKitKeys.h. |
@@ -87,10 +86,6 @@ gains a basis lowers the ceiling.
 | `crates/disk/src/probe/macos.rs` `UTF8` | external | kCFStringEncodingUTF8 (0x08000100), CoreFoundation CFString.h. |
 | `crates/disk/src/probe/windows.rs` `VOLUME_GUID_CHARS` | external | 50 characters, the size GetVolumeNameForVolumeMountPointW's documentation gives for the largest volume GUID path (Microsoft Learn). |
 | `crates/disk/src/rounds.rs` `MAX_ROUNDS` | bound | 120 rounds, the most for which the exact binomial and runs-test sums fit in u128 (40 · 2^n). |
-| `crates/disk/src/threads/macos.rs` `PROC_PIDTASKINFO` | external | 4, the `proc_pidinfo` flavor that fills a `struct proc_taskinfo`, <sys/proc_info.h>. |
-| `crates/disk/src/threads/windows.rs` `FILETIME_NANOS` | external | 100 ns, the unit of a `FILETIME` (Microsoft, `FILETIME` structure, Remarks). |
-| `crates/disk/src/threads/windows.rs` `POOL_THREADS` | cited | 500, "By default, each thread pool has a maximum of 500 worker threads" (Microsoft, "Thread Pools", Best Practices): the process thread budget's ceiling on Windows, as `kern.wq_max_threads` is on macOS (node.md §1.2; research/26 §1.5). |
-| `crates/disk/src/sim.rs` `MAX_SIM_LEN` | bound | 1 GiB cap on the simulated file, which tests hold twice in memory. |
 | `crates/ec/src/durability.rs` `DISK_FAILURES` | cited | 6.3% a year: the highest per-model annualized failure rate in Backblaze's 2025 Drive Stats (Toshiba MG08ACA16TEY); research/15 §8.1, design/durability.md §5. |
 | `crates/ec/src/durability.rs` `FLASH_FAILURES` | cited | 2.7% a year: Schroeder et al. FAST 2016 Table 5's worst four-year replacement fraction, 10.31%, as a constant hazard; research/15 §8.2. |
 | `crates/ec/src/durability.rs` `POWER_LOSSES` | cited | One node-losing power-on restart a year, Cidon et al. ATC 2013 ("once or twice per year"); UNVERIFIED at its own cited source (Chansler 2012), so the least-qualified field input, until mantle's node history of restarts replaces it; research/15 §8.4. |
@@ -149,36 +144,6 @@ gains a basis lowers the ceiling.
 | `crates/gateway/src/layout.rs` `CHUNK` | cited | Tectonic's "typically 8 MiB" chunk (docs/research/01 §1.14). docs/design/gateway.md says measured transfer sizing will replace it, and audit §12.6/§16.2 requires per-upload sizing. |
 | `crates/gateway/src/layout.rs` `SEALED` | derived | `seal::SEGMENT + seal::TAG`: a 64 KiB plaintext segment plus its 16-byte AEAD tag (docs/design/gateway.md §1). |
 | `crates/gateway/src/put.rs` `RENEWALS` | cited | Quarter-lease renewal from Centrifuge's 15 s renewals of 60 s leases (docs/research/09 §7.2.2). Audit §12.6 requires deriving it from control-delay and outage distributions. |
-| `crates/log/src/format.rs` `DAMAGED` | format | Record kind code 8 in the frame payload encoding. |
-| `crates/log/src/format.rs` `ENTRIES` | format | Record kind code 1 in the frame payload encoding. |
-| `crates/log/src/format.rs` `ENTRY_HEADER_BYTES` | format | The same 16-byte entry header length as a u64 for byte accounting. |
-| `crates/log/src/format.rs` `ENTRY_HEADER_LEN` | format | Entry header of term, length and CRC (16 bytes) in the frame payload encoding. |
-| `crates/log/src/format.rs` `FORMAT` | format | Version byte of the log's on-disk format (3: a confirmation rewrites its frame's record in its own slot, and an open restoring a lost frame copies its record to the other slot; 2: persist area first, `Uncertain` records); raft-log.md §2, §6. |
-| `crates/log/src/format.rs` `FRAME_HEADER_BYTES` | format | The same 68-byte frame header length as a u64 for byte accounting. |
-| `crates/log/src/format.rs` `FRAME_HEADER_LEN` | format | Byte length of the encoded frame header, fixed by the frame layout in format.rs and raft-log.md §2. |
-| `crates/log/src/format.rs` `HARD_STATE` | format | Record kind code 3 in the frame payload encoding. |
-| `crates/log/src/format.rs` `HAS_ENTRIES` | format | Bit 2 of a persist group's field flags byte. |
-| `crates/log/src/format.rs` `HAS_HARD_STATE` | format | Bit 0 of a persist group's field flags byte. |
-| `crates/log/src/format.rs` `HAS_PROPOSALS` | format | Bit 5 of a persist group's field flags byte. |
-| `crates/log/src/format.rs` `HAS_START` | format | Bit 1 of a persist group's field flags byte. |
-| `crates/log/src/format.rs` `HAS_UNCERTAIN` | format | Bit 3 of a persist group's field flags byte. |
-| `crates/log/src/format.rs` `IS_DAMAGED` | format | Bit 6 of a persist group's field flags byte. |
-| `crates/log/src/format.rs` `IS_REMOVED` | format | Bit 4 of a persist group's field flags byte. |
-| `crates/log/src/format.rs` `PERSIST_GROUP_LEN` | format | Encoded length of one group in a persist record (ID, flags, hard state, start, entries, uncertainty). |
-| `crates/log/src/format.rs` `PERSIST_HEADER_LEN` | format | Persist record header length (magic, format, padding, log ID, sequence, confirms, count), as its doc comment lists the fields. |
-| `crates/log/src/format.rs` `PROPOSAL` | format | Record kind code 5 in the frame payload encoding. |
-| `crates/log/src/format.rs` `RELOCATED` | format | Record kind code 2 in the frame payload encoding. |
-| `crates/log/src/format.rs` `REMOVED` | format | Record kind code 6 in the frame payload encoding. |
-| `crates/log/src/format.rs` `SEGMENT_HEADER_LEN` | format | Byte length of the encoded segment header before padding, fixed by the layout in format.rs and raft-log.md §2. |
-| `crates/log/src/format.rs` `START` | format | Record kind code 4 in the frame payload encoding. |
-| `crates/log/src/format.rs` `UNCERTAIN` | format | Record kind code 7 in the frame payload encoding. |
-| `crates/log/src/room.rs` `GROUP_SUBMISSIONS` | derived | The most a replica has unanswered at once: its ready's part in flight and a compaction, each waiting for its answer (replica.md §3–§4). A replica with more than one ready in flight (§7) raises it. It also bounds a group's waiters, so the waiting list holds at most `max_groups` times it (raft-log.md §3). |
-| `crates/log/src/lib.rs` `PIPELINE_FRAMES` | derived | 3: the frames a submission's room may span, the one flushed awaiting its confirming persist record, the one being written, and the one gathering while that flush runs (raft-log.md §3). The queue's byte bound is this many of the largest charge, a frame's payload plus its persist row, so it follows the segment size and is not configured; a third frame's bytes cannot be written sooner than the third flush, so more adds only waiting [research/11 §4, §5.2]. |
-| `crates/log/src/state.rs` `DAMAGED_BYTES` | format | Encoded size of a `Damaged` record (kind and group) in the frame payload. |
-| `crates/log/src/state.rs` `HARD_STATE_BYTES` | format | Encoded size of a `HardState` record in the frame payload. |
-| `crates/log/src/state.rs` `PROPOSAL_EXTRA` | format | A proposal's encoded bytes beyond an entry's: kind, group and index (1 + 16 + 8). |
-| `crates/log/src/state.rs` `START_BYTES` | format | Encoded size of a `Start` record (kind, group, index, term) in the frame payload. |
-| `crates/log/src/state.rs` `UNCERTAIN_BYTES` | format | Encoded size of an `Uncertain` record in the frame payload. |
 | `crates/mantle/src/bench_gateway.rs` `HANDOVER` | bound | 2^40 ticks of a cell clock that moves one tick a command, past any number of commands a bounded run applies, so no deadline expires in a benchmark. |
 | `crates/mantle/src/bench_hash.rs` `CHUNKED_BODY` | open | 16 MiB signed-chunk body measured; no derivation in code or the measurement docs. |
 | `crates/mantle/src/bench_hash.rs` `FORM_FILE` | open | 16 MiB form file measured, set equal to CHUNKED_BODY; lacks a derivation. |

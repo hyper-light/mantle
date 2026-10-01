@@ -443,7 +443,7 @@ mod tests {
     #[test]
     fn a_device_node_is_the_device_it_names() {
         let dir = tempfile::tempdir().unwrap();
-        let image = crate::image::DiskImage::attach(dir.path(), 16).unwrap();
+        let image = hyper_block::image::DiskImage::attach(dir.path(), 16).unwrap();
         let bsd = image
             .node()
             .file_name()

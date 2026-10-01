@@ -21,22 +21,21 @@
 
 use std::io::Write;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::time::{Duration, Instant};
 
-use mantle_disk::buf::Alignment;
+use hyper_block::buf::Alignment;
+use hyper_block::file::{CachingRequest, DeviceFile};
+use hyper_log::{Class, Config, Entries, Entry, Log, LogError, Pending, Start, Update, Waits};
 use mantle_disk::calibrate;
-use mantle_disk::file::{CachingRequest, DeviceFile};
 use mantle_disk::histogram::Histogram;
-use mantle_log::{Class, Config, Entries, Entry, Log, LogError, Pending, Start, Update, Waits};
 
 use crate::bench::{Error, nanos, rate, report_device};
 use crate::display;
 use crate::drive;
-use mantle_disk::scratch::Scratch;
+use hyper_block::scratch::Scratch;
 
 /// Entries a replica keeps behind its last before it compacts, as its engine keeps a
 /// window for followers that lag.
@@ -227,7 +226,7 @@ fn appends(
     let deadline = started.checked_add(step);
     let failed: Mutex<Option<String>> = Mutex::new(None);
     let peak = AtomicUsize::new(0);
-    let payload: Arc<[u8]> = Arc::from(vec![0x5a; size]);
+    let payload = vec![0x5a; size];
     let drivers = drive::drivers(count);
     let shared = Drivers {
         log,
@@ -270,7 +269,7 @@ fn appends(
 /// What every driver of one point reads.
 struct Drivers<'a> {
     log: &'a Log<DeviceFile>,
-    payload: &'a Arc<[u8]>,
+    payload: &'a [u8],
     drivers: usize,
     count: usize,
     deadline: Option<Instant>,
@@ -321,9 +320,10 @@ impl Drivers<'_> {
             let mut update = Update {
                 entries: Some(Entries {
                     first: next,
+                    // The log takes the entry's bytes and keeps them while the entry is recent.
                     entries: vec![Entry {
                         term: 1,
-                        bytes: Arc::clone(payload),
+                        bytes: payload.to_vec(),
                     }],
                 }),
                 ..Update::default()

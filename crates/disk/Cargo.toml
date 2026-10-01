@@ -1,6 +1,6 @@
 [package]
 name = "mantle-disk"
-description = "Local storage devices: identification, measurement, aligned direct I/O and exact durability"
+description = "Local storage devices: identification and measurement, over hyper-block's aligned direct I/O"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -9,14 +9,9 @@ rust-version.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-[features]
-# Test support for other crates: the simulated power-loss file and, on macOS, a disk image
-# attached as a device node.
-sim = []
-
 [dependencies]
-getrandom.workspace = true
-thiserror.workspace = true
+# Block I/O, vendored from hyper-raft (vendor/hyper-block/SNAPSHOT).
+hyper-block = { path = "../../vendor/hyper-block" }
 
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
@@ -25,6 +20,7 @@ rustix.workspace = true
 windows-sys.workspace = true
 
 [dev-dependencies]
+hyper-block = { path = "../../vendor/hyper-block", features = ["sim"] }
 proptest.workspace = true
 tempfile.workspace = true
 

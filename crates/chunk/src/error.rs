@@ -1,4 +1,4 @@
-use mantle_disk::DiskError;
+use hyper_block::DiskError;
 
 use crate::key::ChunkKey;
 

@@ -18,16 +18,13 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 UNSAFE_ALLOWED = {
     "crates/disk/src/probe/macos.rs": "IOKit and CoreFoundation (device identification)",
     "crates/disk/src/probe/windows.rs": "volume management and IOCTL_STORAGE_QUERY_PROPERTY (device identification)",
-    "crates/disk/src/node/macos.rs": "the disk ioctls of <sys/disk.h> (a device node's capacity and cache flush)",
-    "crates/disk/src/node/windows.rs": "IOCTL_DISK_GET_LENGTH_INFO (a device's capacity)",
-    "crates/disk/src/threads/macos.rs": "proc_pidinfo and sysctlbyname (the process's threads and the workqueue's thread ceiling)",
-    "crates/disk/src/threads/windows.rs": "ToolHelp snapshots and GetThreadTimes (the process's threads and a thread's CPU time)",
 }
 
 INVENTORY = ROOT / "docs/design/constants.md"
 KINDS = {"format", "external", "derived", "cited", "measured", "bound", "open"}
-# Rows marked open may number at most this; it only falls, as open constants gain a basis.
-OPEN_CEILING = 10
+# Rows marked open may number at most this; it only falls, as open constants gain a basis or
+# leave mantle's production code.
+OPEN_CEILING = 9
 NUMERIC = {
     "u8", "u16", "u32", "u64", "u128", "usize",
     "i8", "i16", "i32", "i64", "i128", "isize",

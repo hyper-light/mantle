@@ -1,0 +1,42 @@
+[package]
+name = "hyper-block"
+description = "Block I/O for the shared log: aligned direct I/O, the platform's full flush, buffers that meet the device's alignment, group commit's wait, a device issuer and a simulated device with power-loss semantics"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+repository = "https://github.com/hyper-light/hyper-raft"
+publish = false
+
+[features]
+# Test support for other crates: the simulated power-loss file and, on macOS, a disk image
+# attached as a device node.
+sim = []
+
+[dependencies]
+getrandom = "0.4"
+thiserror = "2.0"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs", "system", "param", "process", "time"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
+  "Win32_System_Ioctl",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+  "Win32_System_WindowsProgramming",
+] }
+
+[dev-dependencies]
+proptest = "1.11"
+tempfile = "3.20"
+
+
+# A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside any consumer workspace.
+[workspace]

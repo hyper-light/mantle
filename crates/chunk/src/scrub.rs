@@ -17,8 +17,8 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use mantle_disk::DiskError;
-use mantle_disk::block::BlockFile;
+use hyper_block::DiskError;
+use hyper_block::block::BlockFile;
 
 use crate::error::ChunkError;
 use crate::frame::SegmentState;

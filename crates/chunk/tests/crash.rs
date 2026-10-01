@@ -30,11 +30,11 @@
 mod common;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
+use common::device::SimDevice;
 use common::{SIZE, config, data, issuer, key, sim};
+use hyper_block::sim::{Crash, Fault};
 use mantle_chunk::{ChunkError, ChunkKey, Volume};
-use mantle_disk::sim::{Crash, Fault, SimFile};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct State {
@@ -92,7 +92,7 @@ impl Rng {
 }
 
 /// Runs one writer's operations until one fails; returns its model.
-fn writer(v: &Volume<Arc<SimFile>>, id: u64, seed: u64, ops: usize) -> Model {
+fn writer(v: &Volume<SimDevice>, id: u64, seed: u64, ops: usize) -> Model {
     let mut rng = Rng(seed ^ (id << 48));
     let keys: Vec<ChunkKey> = (0..6).map(|i| key(id * 1000 + i)).collect();
     let mut model = Model {
@@ -170,7 +170,7 @@ fn writer(v: &Volume<Arc<SimFile>>, id: u64, seed: u64, ops: usize) -> Model {
 }
 
 /// A chunk as read back: `Err` with the error when its bytes do not verify.
-fn read_all(v: &Volume<Arc<SimFile>>, k: &ChunkKey) -> Result<Option<State>, ChunkError> {
+fn read_all(v: &Volume<SimDevice>, k: &ChunkKey) -> Result<Option<State>, ChunkError> {
     let Some(stat) = v.stat(k).unwrap() else {
         return Ok(None);
     };
@@ -181,7 +181,7 @@ fn read_all(v: &Volume<Arc<SimFile>>, k: &ChunkKey) -> Result<Option<State>, Chu
     }))
 }
 
-fn check(v: &Volume<Arc<SimFile>>, models: &[Model], damaged: &[ChunkKey], seed: u64) {
+fn check(v: &Volume<SimDevice>, models: &[Model], damaged: &[ChunkKey], seed: u64) {
     for model in models {
         for (k, acked) in &model.acked {
             let allowed_uncertain = model
@@ -214,7 +214,7 @@ fn check(v: &Volume<Arc<SimFile>>, models: &[Model], damaged: &[ChunkKey], seed:
 
 fn run(seed: u64, writers: u64, crash: Crash) {
     let file = sim(seed);
-    let v = Volume::format(issuer(), Arc::clone(&file), SIZE, config()).unwrap();
+    let v = Volume::format(issuer(), file.clone(), SIZE, config()).unwrap();
     let mut rng = Rng(seed);
     file.inject(Fault::PowerCut {
         ops: rng.below(400),
@@ -240,7 +240,7 @@ fn run(seed: u64, writers: u64, crash: Crash) {
     file.crash(crash).unwrap();
     file.clear_faults().unwrap();
 
-    let (v, report) = Volume::open(issuer(), Arc::clone(&file), config())
+    let (v, report) = Volume::open(issuer(), file.clone(), config())
         .unwrap_or_else(|e| panic!("seed {seed}: recovery refused the volume: {e}"));
     if std::env::var("MANTLE_CRASH_TRACE").is_ok() {
         eprintln!("recovery: {report:?}");
@@ -282,7 +282,7 @@ fn run(seed: u64, writers: u64, crash: Crash) {
     let fresh = key(999_999);
     v.put(fresh, &data(seed, 5000)).unwrap();
     drop(v);
-    let (v, _) = Volume::open(issuer(), Arc::clone(&file), config()).unwrap();
+    let (v, _) = Volume::open(issuer(), file.clone(), config()).unwrap();
     check(&v, &models, &report.damaged, seed);
     assert_eq!(v.read(&fresh, 0, 5000).unwrap(), data(seed, 5000));
 }

@@ -1,6 +1,6 @@
 //! What a replica fails with.
 
-use mantle_log::LogError;
+use hyper_log::LogError;
 use mantle_meta::engine::EngineError;
 use mantle_meta::error::MetaError;
 use mantle_meta::record::RecordError;

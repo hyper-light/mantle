@@ -20,9 +20,9 @@ use std::task::{Wake, Waker};
 use std::thread::{Builder, Scope, ScopedJoinHandle};
 use std::time::{Duration, Instant};
 
+use hyper_block::threads::{self, Reservation};
 use mantle_disk::histogram::Histogram;
 use mantle_disk::measure::SplitMix64;
-use mantle_disk::threads::{self, Reservation};
 
 use crate::bench::Error;
 
@@ -247,7 +247,7 @@ mod tests {
         let refused = std::thread::scope(|s| start(s, path, past, |_| || ()).map(|_| ()));
         assert!(matches!(
             refused,
-            Err(Error::Disk(mantle_disk::DiskError::Threads { .. }))
+            Err(Error::Disk(hyper_block::DiskError::Threads { .. }))
         ));
     }
 }

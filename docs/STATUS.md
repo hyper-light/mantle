@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-09-30. A component is complete when its tests pass on all six CI targets
+Updated 2026-10-01. A component is complete when its tests pass on all six CI targets
 (Linux, macOS and Windows on x86_64 and arm64) and the evidence listed for it has been
 recorded.
 
@@ -255,8 +255,9 @@ Remaining before it is done:
   descriptors, placement across failure domains, and each request's memory admitted against
   the gateway's.
 
-The Raft log (`mantle-log`, [design](design/raft-log.md)), which every range replica on a
-metadata device shares: group commit across ranges with one flush a batch, frames whose
+The Raft log (`hyper-log`, vendored from hyper-raft with the block layer under it,
+`hyper-block`; [design](design/raft-log.md), vendor/UPSTREAM.md), which every range replica on
+a metadata device shares: group commit across ranges with one flush a batch, frames whose
 sequences tell a torn tail from damage to acknowledged state, updates answered only once a
 later durable record confirms their frame's flush, segments reclaimed oldest first by
 sweeping their live records forward in one frame, and reads of entries no longer in memory
@@ -271,10 +272,20 @@ sizes and quotas passed. A second property test damages the last frame after pow
 checks every acknowledged group is kept or reported: 20,000 cases a run. `mantle bench log` measures appends against the device: one flush
 commits every replica's append, from 2 replicas to 256; an append waits for two flushes, its
 frame's and its confirmation's, where none follows at once
-([measurements](measurements/2026-09-29-log-confirmation.md)).
+([measurements](measurements/2026-09-29-log-confirmation.md)). The log was mantle's
+`crates/log` until hyper-raft took it with its history (research/32 §5.2, L-1) and gave its
+state to one owner thread that answers every call by ticket, waking only its caller (L-2);
+mantle runs on that crate since 2026-10-01 and `crates/log` is gone (§5.3). The range
+simulation's recorded seeds 1 to 48 replay to the same histories, step for step, on it as on
+`crates/log`. Each read of the log is a round trip to its owner, about 30 µs at a load
+average of 34 against a lock's read before, so a replica keeps its group's bounds and last
+term between its own writes, which alone move them, and asks the log while one is out. A
+committed entry of a three-member group allocates half what it did, 127 against 262, and
+takes 0.8 ms against 0.16 ms of wall time driven in one process, from the writes' own round
+trips ([measurements](measurements/2026-10-01-shared-log.md)).
 
-Range replicas (`mantle-range`, [design](design/replica.md)) run focal-raft's core over the
-log and an engine: an entry carries a batch of gateway commands applied as one engine batch,
+Range replicas (`mantle-range`, [design](design/replica.md)) run hyper-raft's core (vendored,
+named `focal-raft` in the crate) over the log and an engine: an entry carries a batch of gateway commands applied as one engine batch,
 client sessions make each command take effect once however often it is retried, a write
 delivered again in a new session is recognised by its file, or for a write with no file by
 the ID the gateway drew for its request, and answered as its first delivery was, and members
@@ -330,8 +341,8 @@ passes on all six CI targets.
    §1.3; raft-log.md §3). Done when an instrumented test with `W` waiters and `K` completions
    counts at most `K` plus the waiters admitted, a fence wakes each exactly once, and `bench log`
    at thousands of logical replicas runs on macOS without a kernel spinlock timeout.
-   *Done on macOS (2026-09-30)*: `mantle_log`'s `Room` hands freed room to waiters in arrival
-   order, each woken by its own `unpark`, its list bounded at `max_groups` times a group's two;
+   *Done on macOS (2026-09-30)*: the log's `Room` (now hyper-log's, held by its owner thread)
+   hands freed room to waiters in arrival order, each woken by its own `unpark`, its list bounded at `max_groups` times a group's two;
    `room::tests::each_answer_wakes_only_the_waiter_it_admits_and_a_fence_wakes_each_once`
    counts 16 wakes for 16 answers among 48 waiters and 48 in all after the fence;
    `workers.rs` is gone. A submission can carry a `Waker`, woken exactly once
@@ -345,7 +356,8 @@ passes on all six CI targets.
    and reported (measurement.md §8). Done when a measurement at a device's full reported depth
    never exceeds the pool bound in the OS's own thread count, a request past the budget starts
    no thread, and the achieved depth reaches the depth asked or reports its shortfall.
-   *The portable pool is done on macOS (2026-09-30)*: `mantle_disk::threads` reads the budget's
+   *The portable pool is done on macOS (2026-09-30)*: the process thread budget (now
+   `hyper_block::threads`, which mantle-disk's measurement and the issuer both draw on) reads its
    ceiling from `kern.wq_max_threads` on macOS, the smaller of `kernel.threads-max` and the soft
    `RLIMIT_NPROC` on Linux, and Microsoft's stated 500 pool threads on Windows, and counts the
    process's threads from the OS (`proc_pidinfo`, `/proc/self/status`, a ToolHelp snapshot);
@@ -380,7 +392,7 @@ passes on all six CI targets.
    rollback per issuer (node.md §1.2; chunk-store.md §4). Done when 100 volumes on one device run
    on one issuer and its pool, the process thread count matches `3C + D + Σ p_i`, and the
    chunk store's crash soak passes unchanged.
-   *Writes through the issuer done on macOS (2026-10-01)*: `mantle_disk::issuer` is one thread
+   *Writes through the issuer done on macOS (2026-10-01)*: the issuer (now `hyper_block::issuer`) is one thread
    and a pool of `min(device queue, measured depth, thread budget left)` blocking workers per
    device, all started when the device opens (`issuer::depth`; one worker on a device
    calibration has not measured). Every write and flush of every volume goes through it: a

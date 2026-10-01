@@ -15,14 +15,16 @@ publish.workspace = true
 focal-raft = { package = "hyper-raft", path = "../../vendor/hyper-raft" }
 mantle-codec = { path = "../codec" }
 mantle-crc = { path = "../crc" }
-mantle-disk = { path = "../disk" }
-mantle-log = { path = "../log" }
+# The shared log and its block layer, vendored from hyper-raft (vendor/hyper-log/SNAPSHOT,
+# vendor/hyper-block/SNAPSHOT).
+hyper-block = { path = "../../vendor/hyper-block" }
+hyper-log = { path = "../../vendor/hyper-log" }
 mantle-meta = { path = "../meta" }
 thiserror.workspace = true
 
 [dev-dependencies]
 mantle-chunk = { path = "../chunk" }
-mantle-disk = { path = "../disk", features = ["sim"] }
+hyper-block = { path = "../../vendor/hyper-block", features = ["sim"] }
 proptest.workspace = true
 
 [lints]

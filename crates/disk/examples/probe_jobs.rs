@@ -9,8 +9,8 @@
 
 use std::time::Duration;
 
-use mantle_disk::buf::Alignment;
-use mantle_disk::file::{CachingRequest, DeviceFile};
+use hyper_block::buf::Alignment;
+use hyper_block::file::{CachingRequest, DeviceFile};
 use mantle_disk::measure::{Job, Pattern, run};
 
 fn main() {

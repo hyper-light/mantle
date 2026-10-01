@@ -44,15 +44,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::time::{Duration, Instant};
 
+use hyper_block::buf::{AlignedBuf, Alignment};
+use hyper_block::file::{CachingRequest, DeviceFile};
+use hyper_block::issuer::{self, Issuer};
+use hyper_block::scratch::Scratch;
 use mantle_chunk::{ChunkError, ChunkKey, Config, Reads, Volume};
-use mantle_disk::buf::{AlignedBuf, Alignment};
 use mantle_disk::calibrate::{self, Calibration};
-use mantle_disk::file::{CachingRequest, DeviceFile};
 use mantle_disk::histogram::Histogram;
-use mantle_disk::issuer::{self, Issuer};
 use mantle_disk::measure::SplitMix64;
 use mantle_disk::rounds::{self, Order, Policy};
-use mantle_disk::scratch::Scratch;
 
 use crate::display;
 use crate::drive;
@@ -60,7 +60,7 @@ use crate::drive;
 #[derive(Debug)]
 pub enum Error {
     Output(std::io::Error),
-    Disk(mantle_disk::DiskError),
+    Disk(hyper_block::DiskError),
     Chunk(ChunkError),
     Log(String),
     /// A worker thread unwound; its measurements are lost.

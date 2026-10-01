@@ -262,6 +262,16 @@ and one entry past either bound, which the core admits alone; a member whose log
 group below that, in bytes or in entries of the fewest bytes, refuses to open, since a
 `Ready` refused for room there could wait for good.
 
+**What the core reads of the log.** The core reads the group's durable state through the
+replica's store: its bounds, terms and entries. Each read of the log is a message to the log's
+owner thread and its answer (hyper-log), tens of microseconds on a loaded machine where a lock
+took a fraction of one, and the core asks for the group's bounds on most of its calls. Only the
+group's own updates move its bounds, and this member writes all of them, so between its writes
+the store keeps the start, the last entry and that entry's term as the log last gave them, and
+while one of its writes is out it asks the log every time, since a write's records reach
+readers before its answer. Entries are fetched into a reservation the store keeps, no larger
+than a segment's (measurements/2026-10-01-shared-log.md).
+
 ## 4. Compaction, snapshots and restart
 
 The engine makes applied state durable on its own schedule. When it has, the replica writes

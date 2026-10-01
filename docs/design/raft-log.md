@@ -6,6 +6,10 @@ operating-parameter models), 26, 28 and 29 (concurrency, power, device classes),
 (Tectonic, Ceph BlueStore as [AWK+19]); docs/design/chunk-store.md, whose techniques this
 log reuses, and docs/design/metadata.md §3, which places it.
 
+Code: `hyper-log`, vendored from hyper-raft (`vendor/hyper-log`, `vendor/UPSTREAM.md`), which
+took mantle's `crates/log` with its history (step L-1 of research/32 §5.2) and holds its state
+in one owner thread answering by ticket (L-2); the format and every rule here are unchanged.
+
 A range replica persists its Raft state here: its entries, its hard state, the point its
 log starts after, and the entries it approved for Fast Raft's fast track. Every replica on
 a device shares the device's one log, so one flush commits every group's writes, as
@@ -109,7 +113,7 @@ with the platform's full flush, and publishes the records to readers. It answers
 submitters once a later durable record confirms that flush (§6): the next frame's persist
 record, when work is queued, or a confirmation written on its own at once. Replicas submit in a closed loop, so the writer waits for the replicas it
 just answered as long as that is expected to lower total latency, the wait the chunk store's
-writer derived (`mantle_disk::commit`). Without it, a few replicas alternate between batches
+writer derived (`hyper_block::commit`). Without it, a few replicas alternate between batches
 and each update waits for two flushes
 (docs/measurements/2026-09-28-raft-log-benchmark.md, finding 2).
 
@@ -251,7 +255,7 @@ not counted. `latency_traffic_does_not_starve_background_work` and
 `hot_groups_do_not_starve_a_cold_one` step the writer a frame at a time and find such an
 update written in the frame after the one that passed it over.
 
-**Measured** (`crates/log/tests/fairness.rs`, the simulated device stepped a flush at a time,
+**Measured** (`crates/log/tests/fairness.rs`, now hyper-log's `tests/fairness.rs`, the simulated device stepped a flush at a time,
 400 frames a mix, so each run is the same run). A hot group keeps two updates of a share of a
 frame outstanding, cold groups one each, all closed loops. Waits are frames from sending to
 being written; two is the least, the frame flushing when the update is sent and the next.
@@ -507,10 +511,10 @@ one at a time (audit P07).
 
 ## 8. Testing
 
-The log is written against `mantle-disk`'s `BlockFile`, so the same code runs on a real file
+The log is written against `hyper-block`'s `BlockFile`, so the same code runs on a real file
 and on the simulated device. That device loses unflushed sectors at a crash, tears
 multi-sector writes, fails flushes after marking pages clean, and flips bits on read
-(mantle-disk sim.rs). The tests cover these properties:
+(hyper-block sim.rs). The tests cover these properties:
 
 - every acknowledged submission survives any crash;
 - a torn tail is cut and corruption is reported, damage to any field of a frame or of a

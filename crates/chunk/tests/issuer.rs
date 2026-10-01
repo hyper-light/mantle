@@ -15,16 +15,17 @@
 mod common;
 
 use std::path::Path;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Condvar, Mutex};
 use std::task::Waker;
 
+use common::device::{Handle, SimDevice};
 use common::{config, data, issuer, key, sim};
+use hyper_block::DiskError;
+use hyper_block::block::BlockFile;
+use hyper_block::buf::Alignment;
+use hyper_block::issuer::Issuer;
+use hyper_block::sim::Crash;
 use mantle_chunk::{ChunkError, Config, Limits, Volume};
-use mantle_disk::DiskError;
-use mantle_disk::block::BlockFile;
-use mantle_disk::buf::Alignment;
-use mantle_disk::issuer::Issuer;
-use mantle_disk::sim::{Crash, SimFile};
 
 /// A simulated file that watches its writes: how many are in flight at once, the threads the
 /// process runs while each is, the most written between two flushes, and, when armed, fails
@@ -32,7 +33,7 @@ use mantle_disk::sim::{Crash, SimFile};
 /// holds the device while it submits a round, so the writer's batches are made of what was
 /// queued, never of how the scheduler happened to interleave the submissions.
 struct Watch {
-    file: Arc<SimFile>,
+    file: SimDevice,
     seen: Mutex<Seen>,
     held: Mutex<bool>,
     released: Condvar,
@@ -51,8 +52,8 @@ struct Seen {
 }
 
 impl Watch {
-    fn new(file: Arc<SimFile>) -> Arc<Self> {
-        Arc::new(Self {
+    fn new(file: SimDevice) -> Handle<Self> {
+        Handle::new(Self {
             file,
             seen: Mutex::new(Seen::default()),
             held: Mutex::new(false),
@@ -94,7 +95,7 @@ impl BlockFile for Watch {
         drop(seen);
         // The process's threads while this write is in flight: a thread started for another
         // region of the batch would be running now.
-        let threads = mantle_disk::threads::count().unwrap();
+        let threads = hyper_block::threads::count().unwrap();
         let result = if fail {
             Err(DiskError::Io {
                 op: "write",
@@ -139,7 +140,7 @@ const SIZE: u64 = 32 << 20;
 /// every one is queued, and waits for every answer; a put refused when submitted answers with
 /// its refusal.
 fn put_together(
-    v: &Volume<Arc<Watch>>,
+    v: &Volume<Handle<Watch>>,
     file: &Watch,
     first: u64,
     n: u64,
@@ -178,8 +179,8 @@ fn batches_spanning_many_regions_start_no_threads() {
     }
     let issuer = Issuer::start(Path::new("test device"), 4).unwrap();
     let file = Watch::new(sim(1));
-    let v = Volume::format(&issuer, Arc::clone(&file), SIZE, small_segments()).unwrap();
-    let idle = mantle_disk::threads::count().unwrap();
+    let v = Volume::format(&issuer, file.clone(), SIZE, small_segments()).unwrap();
+    let idle = hyper_block::threads::count().unwrap();
     // The harness's thread and this test's, the writer and the cleaner, the issuer and its
     // workers.
     assert!(idle >= 4 + 1 + issuer.depth(), "{idle} threads");
@@ -209,7 +210,7 @@ fn batches_spanning_many_regions_start_no_threads() {
         assert_eq!(v.read(&key(k), 0, CHUNK as u64).unwrap(), data(k, CHUNK));
     }
     v.close();
-    assert_eq!(mantle_disk::threads::count().unwrap(), idle - 2);
+    assert_eq!(hyper_block::threads::count().unwrap(), idle - 2);
 }
 
 /// A batch whose third write fails, a region of a batch spanning many: the batch's puts are
@@ -218,7 +219,7 @@ fn batches_spanning_many_regions_start_no_threads() {
 #[test]
 fn a_failed_region_fails_its_batch() {
     let file = Watch::new(sim(2));
-    let v = Volume::format(issuer(), Arc::clone(&file), SIZE, small_segments()).unwrap();
+    let v = Volume::format(issuer(), file.clone(), SIZE, small_segments()).unwrap();
     v.put(key(1000), &data(1000, CHUNK)).unwrap();
     file.seen.lock().unwrap().fail_at = Some(3);
     let results = put_together(&v, &file, 0, 32);
@@ -236,7 +237,7 @@ fn a_failed_region_fails_its_batch() {
     let acknowledged: Vec<u64> = (0..32).filter(|&k| results[k as usize].is_ok()).collect();
     drop(v);
     file.file.crash(Crash::LoseAll).unwrap();
-    let (v, _) = Volume::open(issuer(), Arc::clone(&file), small_segments()).unwrap();
+    let (v, _) = Volume::open(issuer(), file.clone(), small_segments()).unwrap();
     for k in acknowledged.into_iter().chain([1000]) {
         assert_eq!(v.read(&key(k), 0, CHUNK as u64).unwrap(), data(k, CHUNK));
     }

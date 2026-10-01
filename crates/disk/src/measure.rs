@@ -10,7 +10,7 @@
 //! A pool's workers are started once and reused across jobs: each has a channel of its own
 //! that its job arrives on, and is woken alone; none waits at a latch, because a worker that
 //! has not received a job does nothing. Its threads are drawn from the process's budget
-//! ([`crate::threads`]) before any starts, and a pool grows only as deep as a job asks, so a
+//! (`hyper_block::threads`) before any starts, and a pool grows only as deep as a job asks, so a
 //! ladder of depths never runs more workers than its deepest step. Each completion samples the
 //! transfers in flight, and a job reports the depth it achieved beside the depth it asked for,
 //! as fio advises (research/26 §2.1).
@@ -30,11 +30,11 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::{Builder, Scope, ScopedJoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::DiskError;
-use crate::buf::AlignedBuf;
-use crate::file::DeviceFile;
 use crate::histogram::Histogram;
-use crate::threads::{self, Reservation};
+use hyper_block::DiskError;
+use hyper_block::buf::AlignedBuf;
+use hyper_block::file::DeviceFile;
+use hyper_block::threads::{self, Reservation};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pattern {
@@ -478,8 +478,8 @@ fn invalid(what: &str) -> DiskError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buf::Alignment;
-    use crate::file::CachingRequest;
+    use hyper_block::buf::Alignment;
+    use hyper_block::file::CachingRequest;
 
     fn scratch(len: u64) -> (tempfile::TempDir, DeviceFile) {
         let dir = tempfile::tempdir().unwrap();

@@ -22,8 +22,8 @@
 
 use std::time::{Duration, Instant};
 
-use mantle_disk::buf::{AlignedBuf, Alignment};
-use mantle_disk::file::{CachingRequest, DeviceFile};
+use hyper_block::buf::{AlignedBuf, Alignment};
+use hyper_block::file::{CachingRequest, DeviceFile};
 use mantle_disk::measure::SplitMix64;
 
 const BLOCK: usize = 64 << 10;

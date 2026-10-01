@@ -11,9 +11,11 @@
 //! segment past the last indexed record, adding every record that verifies (Rosenblum and
 //! Ousterhout, TOCS 1992, §4.2): a batch whose data reached the disk but whose frame did not.
 
-use mantle_disk::DiskError;
-use mantle_disk::block::BlockFile;
-use mantle_disk::buf::{Pool, PoolBuf};
+use std::sync::Mutex;
+
+use hyper_block::DiskError;
+use hyper_block::block::BlockFile;
+use hyper_block::buf::{AlignedBuf, Pool};
 
 use crate::error::ChunkError;
 use crate::frame::{KIND_BATCH, KIND_WRAP, LogRecord, PutRecord, SegmentState};
@@ -57,7 +59,7 @@ pub(crate) struct Recovered {
 
 pub(crate) fn recover<F: BlockFile>(
     file: &F,
-    pool: &Pool,
+    pool: &ReadPool,
     sb: &Superblock,
     geometry: &Geometry,
     config: &Config,
@@ -345,7 +347,7 @@ impl Identity {
 /// intact record of this volume and segment is there.
 pub(crate) fn verify_at<F: BlockFile>(
     file: &F,
-    pool: &Pool,
+    pool: &ReadPool,
     geometry: &Geometry,
     identity: Identity,
     segment: u32,
@@ -414,10 +416,39 @@ pub(crate) fn verify_at<F: BlockFile>(
     }))
 }
 
-/// Bytes read from the device into a pooled buffer, which returns to its pool when the span
-/// is dropped.
+/// Buffers for reading records, which the volume's readers, writer, cleaner and scrubber share:
+/// hyper-block's pool has one owner, so the volume's threads reach it through a lock held only
+/// to take a buffer and to give it back, as mantle-disk's pool held its own around its free
+/// lists. Each buffer is lent for one read and given back when its span drops.
+pub(crate) struct ReadPool(Mutex<Pool>);
+
+impl ReadPool {
+    pub(crate) fn new(pool: Pool) -> Self {
+        Self(Mutex::new(pool))
+    }
+
+    /// An empty buffer of at least `capacity` bytes, lent until the span holding it drops.
+    fn take(&self, capacity: usize) -> Result<AlignedBuf, ChunkError> {
+        self.0
+            .lock()
+            .map_err(|_| ChunkError::Internal("the read buffers' lock is poisoned"))?
+            .take(capacity)
+            .map_err(|e| ChunkError::Device(e.into()))
+    }
+
+    /// Gives a lent buffer back; behind a poisoned lock it is freed instead.
+    fn give(&self, buf: AlignedBuf) {
+        if let Ok(mut pool) = self.0.lock() {
+            pool.give(buf);
+        }
+    }
+}
+
+/// Bytes read from the device into a buffer lent from a [`ReadPool`], which takes it back when
+/// the span is dropped.
 pub(crate) struct Span<'p> {
-    buf: PoolBuf<'p>,
+    buf: Option<AlignedBuf>,
+    pool: &'p ReadPool,
     skip: usize,
     len: usize,
 }
@@ -425,9 +456,20 @@ pub(crate) struct Span<'p> {
 impl Span<'_> {
     pub fn bytes(&self) -> &[u8] {
         self.buf
-            .as_slice()
-            .get(self.skip..self.skip.saturating_add(self.len))
+            .as_ref()
+            .and_then(|b| {
+                b.as_slice()
+                    .get(self.skip..self.skip.saturating_add(self.len))
+            })
             .unwrap_or_default()
+    }
+}
+
+impl Drop for Span<'_> {
+    fn drop(&mut self) {
+        if let Some(buf) = self.buf.take() {
+            self.pool.give(buf);
+        }
     }
 }
 
@@ -435,7 +477,7 @@ impl Span<'_> {
 /// from `pool`. `None` if the span runs past the end of the file.
 pub(crate) fn read_span<'p, F: BlockFile>(
     file: &F,
-    pool: &'p Pool,
+    pool: &'p ReadPool,
     geometry: &Geometry,
     base: u64,
     offset: u64,
@@ -451,20 +493,29 @@ pub(crate) fn read_span<'p, F: BlockFile>(
     let aligned_end = end
         .checked_next_multiple_of(block)
         .ok_or(ChunkError::Full)?;
-    let span =
+    let span_len =
         usize::try_from(aligned_end.saturating_sub(aligned_start)).map_err(|_| ChunkError::Full)?;
-    let mut buf = pool.take(span).map_err(|e| ChunkError::Device(e.into()))?;
-    buf.set_len(span)
-        .map_err(|e| ChunkError::Device(e.into()))?;
-    match file.read_exact_at(buf.as_mut_slice(), aligned_start) {
-        Ok(()) => {}
-        Err(DiskError::ShortRead { .. }) => return Ok(None),
-        Err(e) => return Err(ChunkError::Device(e)),
-    }
+    let mut buf = pool.take(span_len)?;
+    let read = buf
+        .set_len(span_len)
+        .map_err(|e| ChunkError::Device(e.into()))
+        .and_then(
+            |()| match file.read_exact_at(buf.as_mut_slice(), aligned_start) {
+                Ok(()) => Ok(true),
+                Err(DiskError::ShortRead { .. }) => Ok(false),
+                Err(e) => Err(ChunkError::Device(e)),
+            },
+        );
     let skip = usize::try_from(start.saturating_sub(aligned_start)).unwrap_or(0);
     let len = usize::try_from(len).unwrap_or(0);
-    if skip.saturating_add(len) > span {
+    let span = Span {
+        buf: Some(buf),
+        pool,
+        skip,
+        len,
+    };
+    if !read? || skip.saturating_add(len) > span_len {
         return Ok(None);
     }
-    Ok(Some(Span { buf, skip, len }))
+    Ok(Some(span))
 }

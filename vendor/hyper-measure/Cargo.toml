@@ -1,0 +1,17 @@
+[package]
+name = "hyper-measure"
+description = "What a run costs: allocations, reallocations, bytes and page faults, counted by the allocator and read from the OS. For benchmarks and tests only."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+repository = "https://github.com/hyper-light/hyper-raft"
+publish = false
+
+[target.'cfg(unix)'.dependencies]
+# getrusage(2) and, on macOS, task_info(3) from the Mach interface.
+libc = "0.2.189"
+
+
+# A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside any consumer workspace.
+[workspace]

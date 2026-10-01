@@ -75,10 +75,11 @@ fn bench_log_runs_the_same_threads_at_ten_and_a_hundred_times_the_replicas() {
         "threads {threads:?} at replicas {counts:?}"
     );
     // Above what the process runs idle (the main thread, and what the operating system runs in
-    // every process): a driver a core and the log's writer, nothing a replica.
+    // every process): a driver a core and the log's two, its owner and its device thread
+    // (hyper-log), nothing a replica.
     let added: Vec<usize> = rows.iter().map(|r| r.1.saturating_sub(r.2)).collect();
     assert!(
-        added.iter().all(|&a| a <= cores + 1),
+        added.iter().all(|&a| a <= cores + 2),
         "{added:?} above idle {:?} for {cores} cores",
         rows.iter().map(|r| r.2).collect::<Vec<_>>()
     );

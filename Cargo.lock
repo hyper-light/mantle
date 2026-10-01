@@ -316,6 +316,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "hyper-block"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "rustix",
+ "thiserror",
+ "windows-sys",
+]
+
+[[package]]
+name = "hyper-log"
+version = "0.1.0"
+dependencies = [
+ "crc32c",
+ "getrandom 0.4.3",
+ "hyper-block",
+ "thiserror",
+]
+
+[[package]]
 name = "hyper-raft"
 version = "0.1.0"
 dependencies = [
@@ -357,11 +377,12 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "clap",
+ "hyper-block",
+ "hyper-log",
  "mantle-chunk",
  "mantle-disk",
  "mantle-ec",
  "mantle-gateway",
- "mantle-log",
  "mantle-meta",
  "mantle-s3",
  "tempfile",
@@ -372,6 +393,7 @@ name = "mantle-chunk"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.4.3",
+ "hyper-block",
  "mantle-codec",
  "mantle-crc",
  "mantle-disk",
@@ -399,11 +421,10 @@ dependencies = [
 name = "mantle-disk"
 version = "0.1.0"
 dependencies = [
- "getrandom 0.4.3",
+ "hyper-block",
  "proptest",
  "rustix",
  "tempfile",
- "thiserror",
  "windows-sys",
 ]
 
@@ -442,19 +463,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mantle-log"
-version = "0.1.0"
-dependencies = [
- "getrandom 0.4.3",
- "mantle-codec",
- "mantle-crc",
- "mantle-disk",
- "proptest",
- "tempfile",
- "thiserror",
-]
-
-[[package]]
 name = "mantle-meta"
 version = "0.1.0"
 dependencies = [
@@ -469,12 +477,12 @@ dependencies = [
 name = "mantle-range"
 version = "0.1.0"
 dependencies = [
+ "hyper-block",
+ "hyper-log",
  "hyper-raft",
  "mantle-chunk",
  "mantle-codec",
  "mantle-crc",
- "mantle-disk",
- "mantle-log",
  "mantle-meta",
  "proptest",
  "thiserror",

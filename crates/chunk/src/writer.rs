@@ -14,7 +14,7 @@
 //! flushes (docs/measurements/2026-09-28-chunk-store-benchmark.md, finding 5). The writer
 //! waits for them as long as waiting is expected to lower total latency, a wait derived from
 //! the measured service time and the learned share of submitters that return
-//! (`mantle_disk::commit`).
+//! (`hyper_block::commit`).
 //!
 //! Records go to one of two streams, each with its own open segment: new writes, and the
 //! cleaner's relocations. Keeping relocated data apart groups data by age, which is what
@@ -26,10 +26,10 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, RwLock};
 
-use mantle_disk::block::BlockFile;
-use mantle_disk::buf::{AlignedBuf, Alignment, Pool};
-use mantle_disk::commit::Anticipation;
-use mantle_disk::issuer::Attached;
+use hyper_block::block::BlockFile;
+use hyper_block::buf::{AlignedBuf, Alignment, Pool};
+use hyper_block::commit::Anticipation;
+use hyper_block::issuer::Attached;
 
 use crate::error::ChunkError;
 use crate::frame::{
@@ -150,7 +150,7 @@ pub(crate) struct Shared<F> {
     pub volume: u128,
     pub checksum_shift: u8,
     /// Buffers for reading records: reads, verification, cleaning and scrubbing.
-    pub pool: Pool,
+    pub pool: crate::recover::ReadPool,
     pub index: RwLock<Index>,
     pub fenced: std::sync::atomic::AtomicBool,
     /// Set when the volume closes: background threads stop at their next wake.
@@ -1274,10 +1274,10 @@ impl<F: BlockFile> Writer<F> {
                 .map_err(|e| ChunkError::Device(e.into()))?;
             for part in &region.parts {
                 let encoded = match part {
-                    Part::Segment(header) => (*buf).put(&header.encode(block)),
+                    Part::Segment(header) => buf.put(&header.encode(block)),
                     Part::Record { header, payload } => payloads
                         .get(*payload)
-                        .and_then(|p| record::encode(header, &p.table, &p.data, &mut *buf)),
+                        .and_then(|p| record::encode(header, &p.table, &p.data, &mut buf)),
                 };
                 encoded.ok_or(ChunkError::Internal("a record did not encode as placed"))?;
             }
@@ -1292,7 +1292,7 @@ impl<F: BlockFile> Writer<F> {
                 .segment_offset(region.segment)
                 .and_then(|o| o.checked_add(region.start))
                 .ok_or(ChunkError::Full)?;
-            writes.push((buf.into_inner(), at));
+            writes.push((buf, at));
         }
         writes.extend(frames);
         let written = self.io.write(writes, true).map_err(ChunkError::Device)?;
@@ -1339,7 +1339,7 @@ impl<F: BlockFile> Writer<F> {
     /// A placed frame's writes: each encoded frame in an aligned buffer from the writer's
     /// pool, at its offset in the file. The buffers come back to the pool once written, as the
     /// regions' do, so the pool holds frames' buffers for frames and never fills with them.
-    fn frame_writes(&self, placed: Placed) -> Result<Vec<(AlignedBuf, u64)>, ChunkError> {
+    fn frame_writes(&mut self, placed: Placed) -> Result<Vec<(AlignedBuf, u64)>, ChunkError> {
         let geometry = self.shared.geometry;
         placed
             .writes
@@ -1351,7 +1351,7 @@ impl<F: BlockFile> Writer<F> {
                     .map_err(|e| ChunkError::Device(e.into()))?;
                 buf.extend_from_slice(&encoded)
                     .map_err(|e| ChunkError::Device(e.into()))?;
-                Ok((buf.into_inner(), geometry.log_offset.saturating_add(pos)))
+                Ok((buf, geometry.log_offset.saturating_add(pos)))
             })
             .collect()
     }

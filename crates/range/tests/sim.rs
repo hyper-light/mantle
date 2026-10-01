@@ -43,10 +43,10 @@ mod support;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use mantle_disk::block::BlockFile;
-use mantle_disk::buf::{AlignedBuf, Alignment};
-use mantle_disk::sim::{Crash, Fault, SimFile};
-use mantle_log::{Config as LogConfig, Log, LogError, Waits};
+use hyper_block::block::BlockFile;
+use hyper_block::buf::{AlignedBuf, Alignment};
+use hyper_block::sim::{Crash, Fault, SimFile};
+use hyper_log::{Config as LogConfig, Log, LogError, Recovery, Waits};
 use mantle_meta::apply::Layer;
 use mantle_meta::engine::{Engine, Model, Rows};
 use mantle_meta::name::{self, GateChange, Preconditions, Put};
@@ -138,13 +138,17 @@ impl Rng {
     }
 }
 
-type Member = Replica<Arc<SimFile>, Model>;
+type Member = Replica<SimFile, Model>;
 
 struct Node {
     id: u64,
     /// The identity of its log, which a member rebuilt on the same device keeps.
     log_id: u128,
-    file: Arc<SimFile>,
+    /// Its log while it runs, or while its member is quarantined on it. The log owns the
+    /// device then, and the node reaches the device through the log (`Node::with_file`).
+    log: Option<Arc<Log<SimFile>>>,
+    /// Its device while no log holds it: the node is down.
+    file: Option<SimFile>,
     /// `None` while the node is down; its engine is kept as the crash left it.
     replica: Option<Member>,
     engine: Option<Model>,
@@ -166,10 +170,10 @@ struct Node {
 /// Damage a restart found.
 enum Found {
     /// The group's records on the log, or entries its engine applied beyond the term it can
-    /// know: the member is rebuilt under a new identity on the same log. The node keeps a
-    /// handle beside the one `Replica::open` consumes, since open may answer `Damaged` only
-    /// after taking it.
-    Group(Arc<Log<Arc<SimFile>>>),
+    /// know: the member is rebuilt under a new identity on the same log, which the node keeps
+    /// open (`Node::log`), since `Replica::open` may answer `Damaged` only after taking a
+    /// handle.
+    Group,
     /// The log as a whole: the device is replaced.
     Log,
 }
@@ -197,21 +201,27 @@ fn log_id(id: u64) -> u128 {
 
 impl Node {
     fn new(id: u64, seed: u64, members: u64) -> Self {
-        let file = Arc::new(
-            SimFile::new(
-                Alignment::new(4096).unwrap(),
-                Alignment::new(512).unwrap(),
-                seed ^ (id << 32),
-            )
-            .unwrap(),
-        );
-        let log = Arc::new(Log::create(Arc::clone(&file), log_config(), log_id(id)).unwrap());
-        let replica =
-            Replica::open(id, GROUP, log, first_range(), &range(members), seed ^ id).unwrap();
+        let file = SimFile::new(
+            Alignment::new(4096).unwrap(),
+            Alignment::new(512).unwrap(),
+            seed ^ (id << 32),
+        )
+        .unwrap();
+        let log = Arc::new(Log::create(file, log_config(), log_id(id)).unwrap());
+        let replica = Replica::open(
+            id,
+            GROUP,
+            Arc::clone(&log),
+            first_range(),
+            &range(members),
+            seed ^ id,
+        )
+        .unwrap();
         Self {
             id,
             log_id: log_id(id),
-            file,
+            log: Some(log),
+            file: None,
             replica: Some(replica),
             engine: None,
             lives: 0,
@@ -223,6 +233,35 @@ impl Node {
         }
     }
 
+    /// Runs `look` on the node's device: through its log while one holds it, between the
+    /// log's own I/O, or directly while the node is down.
+    fn with_file<R: Send + 'static>(&self, look: impl FnOnce(&SimFile) -> R + Send + 'static) -> R {
+        match (&self.log, &self.file) {
+            (Some(log), _) => log.with_file(look).unwrap(),
+            (None, Some(file)) => look(file),
+            (None, None) => panic!("node {} has no device", self.id),
+        }
+    }
+
+    /// The device, given back by the log once it has answered everything it took: the node
+    /// holds the log's last handle, the member's having gone with the member.
+    fn device(&mut self) -> &SimFile {
+        if let Some(log) = self.log.take() {
+            let log = Arc::into_inner(log).expect("the node holds the log's last handle");
+            self.file = Some(log.close().unwrap());
+        }
+        self.file.as_ref().unwrap()
+    }
+
+    /// Opens the log on the node's device, which a refusal gives back.
+    fn open_log(&mut self) -> Result<(Log<SimFile>, Recovery), LogError> {
+        let file = self.file.take().unwrap();
+        Log::try_open(file, log_config(), self.log_id).map_err(|refused| {
+            self.file = refused.file;
+            refused.error
+        })
+    }
+
     /// Loses power: the process and whatever its log and engine had not made durable.
     fn crash(&mut self) {
         let Some(replica) = self.replica.take() else {
@@ -231,7 +270,7 @@ impl Node {
         let mut engine = replica.into_engine();
         engine.crash();
         self.engine = Some(engine);
-        self.file.crash(Crash::Random).unwrap();
+        self.device().crash(Crash::Random).unwrap();
     }
 
     /// Restarts from what the device and engine kept. Damage the restart finds quarantines
@@ -242,8 +281,8 @@ impl Node {
         };
         let latent = std::mem::take(&mut self.latent);
         self.lives += 1;
-        self.file.clear_faults().unwrap();
-        let (log, recovery) = match Log::open(Arc::clone(&self.file), log_config(), self.log_id) {
+        self.device().clear_faults().unwrap();
+        let (log, recovery) = match self.open_log() {
             Ok(opened) => opened,
             Err(LogError::Damaged(_)) if latent => {
                 self.found = Some(Found::Log);
@@ -252,9 +291,10 @@ impl Node {
             Err(e) => panic!("member {} reopens its log: {e}", self.id),
         };
         let log = Arc::new(log);
+        self.log = Some(Arc::clone(&log));
         if !recovery.damaged.is_empty() {
             assert!(latent && recovery.damaged == [GROUP], "{recovery:?}");
-            self.found = Some(Found::Group(log));
+            self.found = Some(Found::Group);
             return;
         }
         let ahead = log
@@ -264,7 +304,7 @@ impl Node {
         match Replica::open(
             self.id,
             GROUP,
-            Arc::clone(&log),
+            log,
             engine,
             &range(self.members),
             seed ^ self.id ^ (self.lives << 40),
@@ -287,7 +327,7 @@ impl Node {
             }
             Err(ReplicaError::Damaged) if latent && ahead => {
                 damage.ahead_rebuilt += 1;
-                self.found = Some(Found::Group(log));
+                self.found = Some(Found::Group);
             }
             Err(e) => panic!("member {} reopens: {e}", self.id),
         }
@@ -298,36 +338,38 @@ impl Node {
     /// before it, 2 its last after it takes a fast-track proposal of its own, which a persist
     /// record does not carry.
     fn damage(&mut self, kind: u64, rng: &mut Rng) {
-        self.file.clear_faults().unwrap();
+        self.device().clear_faults().unwrap();
         if kind == 2 {
-            let (log, recovery) =
-                Log::open(Arc::clone(&self.file), log_config(), self.log_id).unwrap();
+            let (log, recovery) = self.open_log().unwrap();
             assert!(recovery.damaged.is_empty());
             if let Some(view) = log.view(GROUP).unwrap() {
                 let term = view.hard_state.map_or(1, |h| h.term.max(1));
                 log.write(
                     GROUP,
-                    mantle_log::Update {
-                        proposals: vec![mantle_log::Proposal {
+                    hyper_log::Update {
+                        proposals: vec![hyper_log::Proposal {
                             index: view.last + 1,
                             term,
-                            bytes: Arc::from(&b"fast"[..]),
+                            bytes: b"fast".to_vec(),
                         }],
-                        ..mantle_log::Update::default()
+                        ..hyper_log::Update::default()
                     },
                 )
                 .unwrap();
             }
+            self.file = Some(log.close().unwrap());
         }
-        let image = self.file.durable_image().unwrap();
+        let log_id = self.log_id;
+        let file = self.device();
+        let image = file.durable_image().unwrap();
         let mut frames: Vec<(u64, usize, usize)> = image
             .chunks(4096)
             .enumerate()
             .filter_map(|(i, block)| {
-                let h = mantle_log::format::FrameHeader::decode(block)?;
+                let h = hyper_log::format::FrameHeader::decode(block)?;
                 let len = h.frame_len()?;
                 let frame = image.get(i * 4096..i * 4096 + len)?;
-                (h.log == self.log_id && h.verifies(frame)).then(|| (h.sequence, i * 4096, len))
+                (h.log == log_id && h.verifies(frame)).then(|| (h.sequence, i * 4096, len))
             })
             .collect();
         frames.sort_unstable();
@@ -348,10 +390,10 @@ impl Node {
         let block = offset / 4096 * 4096;
         let mut buf = AlignedBuf::zeroed(4096, Alignment::new(4096).unwrap()).unwrap();
         buf.set_len(4096).unwrap();
-        self.file.read_exact_at(buf.as_mut_slice(), block).unwrap();
+        file.read_exact_at(buf.as_mut_slice(), block).unwrap();
         buf.as_mut_slice()[(offset - block) as usize] ^= 1 << rng.below(8);
-        self.file.write_all_at(buf.as_slice(), block).unwrap();
-        self.file.sync_data().unwrap();
+        file.write_all_at(buf.as_slice(), block).unwrap();
+        file.sync_data().unwrap();
         self.latent = true;
     }
 }
@@ -623,7 +665,7 @@ impl World {
             } else {
                 Fault::SyncError
             };
-            self.nodes[i].file.inject(fault).unwrap();
+            self.nodes[i].with_file(move |f| f.inject(fault)).unwrap();
         }
         if self.rng.chance(10)
             && let Some(r) = self.nodes[i].replica.as_mut()
@@ -664,7 +706,8 @@ impl World {
         let joining = self.next_id;
         self.next_id += 1;
         let replacement = match self.nodes[i].found.take() {
-            Some(Found::Group(log)) => {
+            Some(Found::Group) => {
+                let log = Arc::clone(self.nodes[i].log.as_ref().unwrap());
                 let (replica, replacement) = Replica::rebuild(
                     failed,
                     joining,
@@ -1117,7 +1160,7 @@ impl World {
         let seed = self.seed;
         for n in &mut self.nodes {
             // A fault armed on a running node would still fire after the faults stop.
-            n.file.clear_faults().unwrap();
+            n.with_file(SimFile::clear_faults).unwrap();
             n.restart(seed, &mut self.damage);
         }
     }

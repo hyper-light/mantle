@@ -13,12 +13,12 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use mantle_disk::DiskError;
-use mantle_disk::buf::Alignment;
-use mantle_disk::calibrate::UNDESCRIBED_QUEUE_DEPTH;
-use mantle_disk::file::{CachingRequest, DeviceFile};
+use hyper_block::DiskError;
+use hyper_block::buf::Alignment;
+use hyper_block::file::{CachingRequest, DeviceFile};
+use hyper_block::issuer::UNDESCRIBED_QUEUE_DEPTH;
+use hyper_block::threads;
 use mantle_disk::measure::{self, Job, Pattern};
-use mantle_disk::threads;
 
 #[test]
 fn a_full_depth_measurement_stays_within_its_pool_and_past_the_budget_starts_nothing() {

@@ -4,9 +4,9 @@ use std::fmt;
 use std::io::Write;
 use std::path::Path;
 
-use mantle_disk::buf::Alignment;
+use hyper_block::buf::Alignment;
+use hyper_block::file::Caching;
 use mantle_disk::calibrate::{self, Calibration, Plan};
-use mantle_disk::file::Caching;
 use mantle_disk::identity::{FileSystemKind, Identity, Interconnect, Medium, WriteCache, Zoned};
 
 use crate::display;
@@ -14,7 +14,7 @@ use crate::display;
 #[derive(Debug)]
 pub enum Error {
     Output(std::io::Error),
-    Disk(mantle_disk::DiskError),
+    Disk(hyper_block::DiskError),
 }
 
 impl fmt::Display for Error {

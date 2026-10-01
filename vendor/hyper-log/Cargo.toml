@@ -1,0 +1,27 @@
+[package]
+name = "hyper-log"
+description = "The shared Raft log: one log per device, shared by every group on it, so that one flush commits every group's writes"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+repository = "https://github.com/hyper-light/hyper-raft"
+publish = false
+
+[dependencies]
+crc32c = "0.6"
+getrandom = "0.4"
+hyper-block = { path = "../hyper-block" }
+thiserror = "2.0"
+
+[dev-dependencies]
+hyper-block = { path = "../hyper-block", features = ["sim"] }
+hyper-measure = { path = "../hyper-measure" }
+proptest = "1.11"
+tempfile = "3.20"
+
+
+
+
+# A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside any consumer workspace.
+[workspace]

@@ -13,6 +13,11 @@
 )]
 
 mod clean;
+// Test devices shared with the integration tests (tests/common), which use what these do not.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../tests/common/device.rs"]
+mod device;
 mod error;
 pub mod frame;
 pub mod index;

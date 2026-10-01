@@ -18,12 +18,13 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::DiskError;
-use crate::buf::Alignment;
-use crate::file::{Caching, CachingRequest, DeviceFile};
 use crate::measure::{self, Job, Pattern, Pool};
-use crate::scratch::Scratch;
-use crate::threads;
+use hyper_block::DiskError;
+use hyper_block::buf::Alignment;
+use hyper_block::file::{Caching, CachingRequest, DeviceFile};
+use hyper_block::issuer::UNDESCRIBED_QUEUE_DEPTH;
+use hyper_block::scratch::Scratch;
+use hyper_block::threads;
 
 /// What to measure and how hard.
 #[derive(Debug, Clone)]
@@ -133,11 +134,6 @@ pub struct Point {
     /// `depth` when the path could not keep the depth asked (research/26 §2.1).
     pub achieved: f64,
 }
-
-/// The queue assumed of a device the OS cannot describe: Native Command Queuing's 32 commands,
-/// the shallowest queue of a command-queuing interface (Serial ATA Revision 2.6, §13.6.2;
-/// AHCI 1.3.1 §1.1), which calibration's ladder then measures (CLAUDE.md §5).
-pub const UNDESCRIBED_QUEUE_DEPTH: usize = 32;
 
 /// Transfers needed to report a quantile `q`: enough that the order statistic lies within
 /// half the tail's rank of `q` with 95% confidence, `n ≥ 1.96²·q(1−q)/δ²` at `δ = (1−q)/2`

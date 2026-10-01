@@ -25,9 +25,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use common::{SIZE, config, data, issuer, key};
+use hyper_block::buf::Alignment;
+use hyper_block::file::{CachingRequest, DeviceFile};
 use mantle_chunk::{ChunkKey, Volume};
-use mantle_disk::buf::Alignment;
-use mantle_disk::file::{CachingRequest, DeviceFile};
 
 const KEYS: u64 = 8;
 

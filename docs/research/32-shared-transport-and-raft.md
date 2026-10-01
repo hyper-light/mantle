@@ -1141,8 +1141,12 @@ both require.
 
 **Decided by the owner, 2026-09-30.**
 
-- Item 1: the repository is `github.com/hyper-light/hyper-raft`. The crate names are still
-  placeholders.
+- Item 1: the repository is `github.com/hyper-light/hyper-raft`. The crates take the `hyper-`
+  prefix in place of `x-`: `hyper-quic`, `hyper-transport`, `hyper-datagram`, `hyper-swim`,
+  `hyper-timing`, `hyper-raft`, `hyper-durable`, `hyper-log`, `hyper-multilog`, `hyper-sim`,
+  `hyper-check`, plus the adapter crate `hyper-tokio`.
+- Item 5: slates, mantle and focal vendor a snapshot of the shared crates for now. Each snapshot
+  records the hyper-raft revision it was taken from, so it can later become a git pin.
 - Item 6: the tokio adapter is a separate crate in that repository. The core crates stay free of
   any runtime, and slates never depends on the adapter.
 - Item 7: TLC runs in hyper-raft's CI only, never on the owner's machine and never in slates' CI,
@@ -1152,6 +1156,13 @@ both require.
   minimal-`Arc`, no-panic rules, removing panics where removal makes sense. No `Arc` exception is
   taken at their configuration signatures. The upstream-merge cost this note names under item 8
   is accepted.
+- Item 9: slates has no release (its README says so, and its version is 0.1.0), so no running
+  fleet has to survive the change. X-1 and X-2 re-found groups on a fresh start; no in-place
+  conversion of on-disk state and no rolling ALPN change is built. The new ALPN is still
+  versioned, so later changes can roll.
+- Item 10: the shared crates are now maintained across all three projects as one body of work.
+  A change lands in hyper-raft only once every consumer's suite passes against it. A consumer
+  updates its vendored snapshot in its own gated commit, under that repository's own rules.
 
 **Risks.**
 

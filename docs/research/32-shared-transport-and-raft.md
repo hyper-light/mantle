@@ -1139,6 +1139,20 @@ both require.
     may land when one consumer's downstream job fails (proposed: it may, since pins protect the
     consumer, but the failure is recorded and the consumer's owner decides).
 
+**Decided by the owner, 2026-09-30.**
+
+- Item 1: the repository is `github.com/hyper-light/hyper-raft`. The crate names are still
+  placeholders.
+- Item 6: the tokio adapter is a separate crate in that repository. The core crates stay free of
+  any runtime, and slates never depends on the adapter.
+- Item 7: TLC runs in hyper-raft's CI only, never on the owner's machine and never in slates' CI,
+  with a fixed worker count and an explicit state and time budget. `x-check`'s exhaustive Rust
+  explorer runs beside it, so item 2's fast-track decision has both checks as evidence.
+- Item 8: neither option. quinn-proto and rustls are both vendored and conformed to the
+  minimal-`Arc`, no-panic rules, removing panics where removal makes sense. No `Arc` exception is
+  taken at their configuration signatures. The upstream-merge cost this note names under item 8
+  is accepted.
+
 **Risks.**
 
 - **Three fast-moving projects behind one gate.** slates' ledger holds 277 bug records; focal

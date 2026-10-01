@@ -21,13 +21,15 @@
 mod error;
 pub mod format;
 mod recover;
+mod room;
 mod state;
 mod writer;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
+use std::task::Waker;
 use std::thread::JoinHandle;
 
 use mantle_disk::block::BlockFile;
@@ -192,6 +194,25 @@ struct Submission {
     /// Where the writer's fair queue placed it when taken (docs/design/raft-log.md §3).
     tags: writer::Tags,
     reply: SyncSender<Result<(), LogError>>,
+    /// Woken once the answer is sent, or once the submission is dropped unanswered, so a
+    /// caller that waits on many answers is told of each (docs/design/node.md §1.3).
+    waker: std::cell::Cell<Option<Waker>>,
+}
+
+impl Submission {
+    /// Wakes the submitter's waker, once.
+    fn wake(&self) {
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
+    }
+}
+
+impl Drop for Submission {
+    fn drop(&mut self) {
+        // Its answer's sender goes with it: the handle reads `Closed`.
+        self.wake();
+    }
 }
 
 /// Where the next frame goes.
@@ -244,16 +265,6 @@ impl State {
     }
 }
 
-/// The room submissions hold until the writer answers them: those waiting to be taken, those
-/// held for a later frame, and those in the frame being written (audit S03).
-#[derive(Debug, Default)]
-struct Queue {
-    submissions: usize,
-    bytes: u64,
-    /// Submissions not yet answered, by group, each at most [`GROUP_SUBMISSIONS`].
-    groups: HashMap<u128, usize>,
-}
-
 /// Payload bytes one frame holds: a segment less its header block and the frame's header.
 pub(crate) fn frame_room(config: &Config, align: Alignment) -> Result<usize, LogError> {
     let block = u64::try_from(align.get()).map_err(|_| LogError::Config("block"))?;
@@ -273,12 +284,6 @@ pub(crate) fn frame_room(config: &Config, align: Alignment) -> Result<usize, Log
 /// add only waiting [research/11 §4, §5.2].
 const PIPELINE_FRAMES: u64 = 3;
 
-/// Submissions one group may have unanswered: the most its replica sends at once, the part of
-/// its ready in flight and a compaction, each of which waits for its answer before the next
-/// (docs/design/replica.md §3–§4); the writes a replica makes as it opens come before any
-/// ready. A caller that sends more waits for its own room, and never takes another group's.
-const GROUP_SUBMISSIONS: usize = 2;
-
 struct Shared<F> {
     file: F,
     id: u128,
@@ -291,9 +296,8 @@ struct Shared<F> {
     /// Buffers for reading entries back.
     pool: Pool,
     state: RwLock<State>,
-    queue: Mutex<Queue>,
-    /// Signalled when the writer takes submissions off the queue, and when the log fences.
-    room: Condvar,
+    /// Room in the queue, and the submitters waiting for it.
+    room: room::Room,
     fenced: AtomicBool,
     /// Submissions sent to the writer so far, counted just before each is sent.
     submitted: AtomicU64,
@@ -307,20 +311,10 @@ impl<F: BlockFile> Shared<F> {
         self.state.read().map_err(|_| LogError::Fenced)
     }
 
-    /// Gives back the room of a submission of `group` answered or never sent, and wakes the
-    /// submitters waiting for room.
+    /// Gives back the room of a submission of `group` answered or never sent, and hands it to
+    /// the submitters waiting for it.
     fn release(&self, group: u128, bytes: u64) {
-        if let Ok(mut queue) = self.queue.lock() {
-            queue.submissions = queue.submissions.saturating_sub(1);
-            queue.bytes = queue.bytes.saturating_sub(bytes);
-            if let Some(own) = queue.groups.get_mut(&group) {
-                *own = own.saturating_sub(1);
-                if *own == 0 {
-                    queue.groups.remove(&group);
-                }
-            }
-        }
-        self.room.notify_all();
+        self.room.release(group, bytes);
     }
 }
 
@@ -374,8 +368,14 @@ impl<F: BlockFile + 'static> Log<F> {
             queue_bytes,
             pool: Pool::new(align, largest.saturating_mul(2), largest),
             state: RwLock::new(state),
-            queue: Mutex::new(Queue::default()),
-            room: Condvar::new(),
+            room: room::Room::new(room::Limits {
+                submissions: config.queue_submissions,
+                bytes: queue_bytes,
+                waiters: config
+                    .max_groups
+                    .checked_mul(room::GROUP_SUBMISSIONS)
+                    .ok_or(LogError::Config("waiters past usize"))?,
+            }),
             fenced: AtomicBool::new(false),
             submitted: AtomicU64::new(0),
             frames: AtomicU64::new(0),
@@ -388,7 +388,6 @@ impl<F: BlockFile + 'static> Log<F> {
         let mut pending = Vec::with_capacity(restores.len());
         let mut first = Vec::with_capacity(restores.len());
         {
-            let mut queue = shared.queue.lock().map_err(|_| LogError::Fenced)?;
             for r in restores {
                 let marks = Marks {
                     uncertain: r.uncertain,
@@ -397,10 +396,7 @@ impl<F: BlockFile + 'static> Log<F> {
                 let bytes = writer::submission_len(r.group, &r.update, marks)
                     .and_then(writer::charge)
                     .ok_or(LogError::TooLarge(usize::MAX))?;
-                queue.submissions = queue.submissions.checked_add(1).ok_or(LogError::Busy)?;
-                queue.bytes = queue.bytes.checked_add(bytes).ok_or(LogError::Busy)?;
-                let own = queue.groups.entry(r.group).or_insert(0);
-                *own = own.checked_add(1).ok_or(LogError::Busy)?;
+                shared.room.hold(r.group, bytes)?;
                 let (reply, answer) = sync_channel(1);
                 pending.push(Pending { answer });
                 first.push(Submission {
@@ -411,6 +407,7 @@ impl<F: BlockFile + 'static> Log<F> {
                     class: Class::Normal,
                     tags: writer::Tags::default(),
                     reply,
+                    waker: std::cell::Cell::new(None),
                 });
             }
         }
@@ -436,7 +433,7 @@ impl<F: BlockFile + 'static> Log<F> {
     /// answered through the returned handle once it is durable and a later record confirms
     /// so.
     pub fn submit(&self, group: u128, update: Update) -> Result<Pending, LogError> {
-        self.send(group, Class::Normal, update, false)
+        self.send(group, Class::Normal, update, false, None)
     }
 
     /// Submits `update` for `group` as `submit` does, in `class`.
@@ -446,15 +443,16 @@ impl<F: BlockFile + 'static> Log<F> {
         class: Class,
         update: Update,
     ) -> Result<Pending, LogError> {
-        self.send(group, class, update, false)
+        self.send(group, class, update, false, None)
     }
 
     /// Submits `update` for `group`, waiting for room in the queue rather than refusing. A
     /// replica cannot have a `Ready` refused, so the log holds it back instead
-    /// (docs/design/replica.md §3). The writer frees room with every batch it takes, and a
-    /// fence wakes every waiter, so the wait lasts no longer than the writer's progress.
+    /// (docs/design/replica.md §3). Room the writer frees goes to waiters in arrival order, each
+    /// woken alone, and a fence wakes each once, so the wait lasts no longer than the writer's
+    /// progress (docs/design/raft-log.md §3).
     pub fn submit_waiting(&self, group: u128, update: Update) -> Result<Pending, LogError> {
-        self.send(group, Class::Normal, update, true)
+        self.send(group, Class::Normal, update, true, None)
     }
 
     /// Submits `update` for `group` as `submit_waiting` does, in `class`.
@@ -464,7 +462,21 @@ impl<F: BlockFile + 'static> Log<F> {
         class: Class,
         update: Update,
     ) -> Result<Pending, LogError> {
-        self.send(group, class, update, true)
+        self.send(group, class, update, true, None)
+    }
+
+    /// Submits `update` for `group` in `class` as `submit_waiting` does, and wakes `waker` once
+    /// its answer has come, so one thread can keep many submissions out and learn of each
+    /// answer as it comes (docs/design/node.md §1.3, measurement.md §10). The waker is woken
+    /// exactly once, also when the log closes before it answers.
+    pub fn submit_waking(
+        &self,
+        group: u128,
+        class: Class,
+        update: Update,
+        waker: Waker,
+    ) -> Result<Pending, LogError> {
+        self.send(group, class, update, true, Some(waker))
     }
 
     fn send(
@@ -473,6 +485,7 @@ impl<F: BlockFile + 'static> Log<F> {
         class: Class,
         update: Update,
         wait: bool,
+        waker: Option<Waker>,
     ) -> Result<Pending, LogError> {
         // Refused before it holds any room: no frame could take it, and every admitted
         // submission fits the byte bound alone, so none waits for a queue that cannot hold it.
@@ -482,33 +495,10 @@ impl<F: BlockFile + 'static> Log<F> {
             return Err(LogError::TooLarge(len));
         }
         let bytes = writer::charge(len).ok_or(LogError::TooLarge(len))?;
-        {
-            let config = &self.shared.config;
-            let mut queue = self.shared.queue.lock().map_err(|_| LogError::Fenced)?;
-            loop {
-                if self.shared.fenced.load(Ordering::Acquire) {
-                    return Err(LogError::Fenced);
-                }
-                let submissions = queue.submissions.checked_add(1).ok_or(LogError::Busy)?;
-                let total = queue.bytes.checked_add(bytes).ok_or(LogError::Busy)?;
-                let own = queue.groups.get(&group).copied().unwrap_or(0);
-                // A group's two submissions of the largest charge hold two thirds of the byte
-                // bound at most, so one group never takes the room the others need.
-                let room = submissions <= config.queue_submissions
-                    && total <= self.shared.queue_bytes
-                    && own < GROUP_SUBMISSIONS;
-                if room {
-                    queue.submissions = submissions;
-                    queue.bytes = total;
-                    queue.groups.insert(group, own.saturating_add(1));
-                    break;
-                }
-                if !wait {
-                    return Err(LogError::Busy);
-                }
-                queue = self.shared.room.wait(queue).map_err(|_| LogError::Fenced)?;
-            }
+        if self.shared.fenced.load(Ordering::Acquire) {
+            return Err(LogError::Fenced);
         }
+        self.shared.room.take(group, bytes, wait)?;
         let sender = self.sender.as_ref().ok_or(LogError::Closed)?;
         let (reply, answer) = sync_channel(1);
         self.shared.submitted.fetch_add(1, Ordering::AcqRel);
@@ -520,10 +510,13 @@ impl<F: BlockFile + 'static> Log<F> {
             class,
             tags: writer::Tags::default(),
             reply,
+            waker: std::cell::Cell::new(waker),
         };
         match sender.try_send(submission) {
             Ok(()) => Ok(Pending { answer }),
             Err(e) => {
+                // The submission comes back in the error and is dropped here, which wakes its
+                // waker: the caller hears of the refusal from the result.
                 self.shared.release(group, bytes);
                 Err(match e {
                     TrySendError::Full(_) => LogError::Busy,

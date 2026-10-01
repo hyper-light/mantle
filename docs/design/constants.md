@@ -64,6 +64,7 @@ gains a basis lowers the ceiling.
 | `crates/crc/src/lib.rs` `TOP` | derived | `1 << (bits - 1)`: x^0 in the reflected register of the macro's width, as in zlib crc32.c `multmodp`/`x2nmodp`. |
 | `crates/disk/src/buf.rs` `MAX_ALIGNMENT` | bound | 1 MiB alignment cap above the 512 B–64 KiB direct-I/O alignments of every target (open(2) O_DIRECT notes; Windows File Buffering). |
 | `crates/disk/src/buf.rs` `MAX_BUFFER` | bound | Turns a corrupt length into a refusal; sufficient for every I/O, since the chunk store and the Raft log refuse a segment larger than one buffer before any I/O and every other I/O is a frame or batch. |
+| `crates/disk/src/calibrate.rs` `UNDESCRIBED_QUEUE_DEPTH` | cited | 32, the commands Native Command Queuing holds (Serial ATA Revision 2.6 §13.6.2; AHCI 1.3.1 §1.1), the shallowest queue of a command-queuing interface: the queue assumed of a device the OS cannot describe, which the read ladder then measures (CLAUDE.md §5; measurement.md §8). |
 | `crates/disk/src/calibrate.rs` `P50_SAMPLES` | open | 16 from n ≥ 1.96²q(1−q)/δ² at δ = (1−q)/2 (research 11 §13.3); the 95% level and the δ rule are chosen, not cited. |
 | `crates/disk/src/calibrate.rs` `P99_SAMPLES` | open | 1,522 from the same binomial normal approximation; the 95% confidence and δ = (1−q)/2 tolerance have no cited basis. |
 | `crates/disk/src/commit.rs` `RATE_ONE` | open | 2^16 fixed-point unit for return counts and the share p; the resolution p needs is not derived. |
@@ -74,7 +75,6 @@ gains a basis lowers the ceiling.
 | `crates/disk/src/histogram.rs` `SUB` | derived | 2^SUB_BITS sub-buckets per row. |
 | `crates/disk/src/histogram.rs` `SUB_BITS` | open | 5 bits (3.1% error) by research 11 §14.3's α ≤ ε/2 rule, but ε = ±10% is an example resolution, not measured or cited. |
 | `crates/disk/src/histogram.rs` `SUB_MASK` | derived | SUB − 1 as a bit mask. |
-| `crates/disk/src/measure.rs` `MAX_DEPTH` | open | 256 threads per measurement job; audit §12.6 says it is a backend ceiling, not the device's depth, to be derived from CPU, RAM and thread allowances. |
 | `crates/disk/src/node/macos.rs` `BLOCK_COUNT` | external | DKIOCGETBLOCKCOUNT, _IOR('d', 25, uint64_t), macOS <sys/disk.h>. |
 | `crates/disk/src/node/macos.rs` `BLOCK_SIZE` | external | DKIOCGETBLOCKSIZE, _IOR('d', 24, uint32_t), macOS <sys/disk.h>. |
 | `crates/disk/src/node/macos.rs` `SYNCHRONIZE` | external | DKIOCSYNCHRONIZE, _IOW('d', 22, dk_synchronize_t), macOS <sys/disk.h>. |
@@ -87,6 +87,9 @@ gains a basis lowers the ceiling.
 | `crates/disk/src/probe/macos.rs` `UTF8` | external | kCFStringEncodingUTF8 (0x08000100), CoreFoundation CFString.h. |
 | `crates/disk/src/probe/windows.rs` `VOLUME_GUID_CHARS` | external | 50 characters, the size GetVolumeNameForVolumeMountPointW's documentation gives for the largest volume GUID path (Microsoft Learn). |
 | `crates/disk/src/rounds.rs` `MAX_ROUNDS` | bound | 120 rounds, the most for which the exact binomial and runs-test sums fit in u128 (40 · 2^n). |
+| `crates/disk/src/threads/macos.rs` `PROC_PIDTASKINFO` | external | 4, the `proc_pidinfo` flavor that fills a `struct proc_taskinfo`, <sys/proc_info.h>. |
+| `crates/disk/src/threads/windows.rs` `FILETIME_NANOS` | external | 100 ns, the unit of a `FILETIME` (Microsoft, `FILETIME` structure, Remarks). |
+| `crates/disk/src/threads/windows.rs` `POOL_THREADS` | cited | 500, "By default, each thread pool has a maximum of 500 worker threads" (Microsoft, "Thread Pools", Best Practices): the process thread budget's ceiling on Windows, as `kern.wq_max_threads` is on macOS (node.md §1.2; research/26 §1.5). |
 | `crates/disk/src/sim.rs` `MAX_SIM_LEN` | bound | 1 GiB cap on the simulated file, which tests hold twice in memory. |
 | `crates/ec/src/durability.rs` `DISK_FAILURES` | cited | 6.3% a year: the highest per-model annualized failure rate in Backblaze's 2025 Drive Stats (Toshiba MG08ACA16TEY); research/15 §8.1, design/durability.md §5. |
 | `crates/ec/src/durability.rs` `FLASH_FAILURES` | cited | 2.7% a year: Schroeder et al. FAST 2016 Table 5's worst four-year replacement fraction, 10.31%, as a constant hazard; research/15 §8.2. |
@@ -169,14 +172,13 @@ gains a basis lowers the ceiling.
 | `crates/log/src/format.rs` `SEGMENT_HEADER_LEN` | format | Byte length of the encoded segment header before padding, fixed by the layout in format.rs and raft-log.md §2. |
 | `crates/log/src/format.rs` `START` | format | Record kind code 4 in the frame payload encoding. |
 | `crates/log/src/format.rs` `UNCERTAIN` | format | Record kind code 7 in the frame payload encoding. |
-| `crates/log/src/lib.rs` `GROUP_SUBMISSIONS` | derived | The most a replica has unanswered at once: its ready's part in flight and a compaction, each waiting for its answer (replica.md §3–§4). A replica with more than one ready in flight (§7) raises it. |
+| `crates/log/src/room.rs` `GROUP_SUBMISSIONS` | derived | The most a replica has unanswered at once: its ready's part in flight and a compaction, each waiting for its answer (replica.md §3–§4). A replica with more than one ready in flight (§7) raises it. It also bounds a group's waiters, so the waiting list holds at most `max_groups` times it (raft-log.md §3). |
 | `crates/log/src/lib.rs` `PIPELINE_FRAMES` | derived | 3: the frames a submission's room may span, the one flushed awaiting its confirming persist record, the one being written, and the one gathering while that flush runs (raft-log.md §3). The queue's byte bound is this many of the largest charge, a frame's payload plus its persist row, so it follows the segment size and is not configured; a third frame's bytes cannot be written sooner than the third flush, so more adds only waiting [research/11 §4, §5.2]. |
 | `crates/log/src/state.rs` `DAMAGED_BYTES` | format | Encoded size of a `Damaged` record (kind and group) in the frame payload. |
 | `crates/log/src/state.rs` `HARD_STATE_BYTES` | format | Encoded size of a `HardState` record in the frame payload. |
 | `crates/log/src/state.rs` `PROPOSAL_EXTRA` | format | A proposal's encoded bytes beyond an entry's: kind, group and index (1 + 16 + 8). |
 | `crates/log/src/state.rs` `START_BYTES` | format | Encoded size of a `Start` record (kind, group, index, term) in the frame payload. |
 | `crates/log/src/state.rs` `UNCERTAIN_BYTES` | format | Encoded size of an `Uncertain` record in the frame payload. |
-| `crates/mantle/src/bench.rs` `WORKERS` | open | 64 concurrent deleters "so they share flushes"; the count lacks a derivation or measurement. |
 | `crates/mantle/src/bench_gateway.rs` `HANDOVER` | bound | 2^40 ticks of a cell clock that moves one tick a command, past any number of commands a bounded run applies, so no deadline expires in a benchmark. |
 | `crates/mantle/src/bench_hash.rs` `CHUNKED_BODY` | open | 16 MiB signed-chunk body measured; no derivation in code or the measurement docs. |
 | `crates/mantle/src/bench_hash.rs` `FORM_FILE` | open | 16 MiB form file measured, set equal to CHUNKED_BODY; lacks a derivation. |
@@ -353,7 +355,6 @@ parameters. The gate does not parse these; they are kept here with the same kind
   precision, the histogram's resolution and range, `commit::RATE_ONE`): a confidence level
   and tolerance from the service objective they serve, or from a cited source, and a round
   budget from the time a startup may take.
-- `measure::MAX_DEPTH`: an executor credit from the node's CPU, memory and thread allowance.
 - A bucket policy's raw body limit (`policy::BODY_LIMIT`): a recording of how much white space
   S3 keeps in a policy it gives back as set.
 - The benchmarks' ladders and step lengths: the regimes each exercises, in their

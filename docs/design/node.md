@@ -86,7 +86,10 @@ saving (26 §7).
 starts, so devices times depth cannot add up past it. On macOS its ceiling is the OS's own
 statement of what one process may run, `kern.wq_max_threads` (512 on the development machine),
 the cap Apple's workqueue under GCD and Swift concurrency applies to itself (26 §1.5, §2.5);
-elsewhere the pools exist only where io_uring is unusable, under the same budget. A pool that
+elsewhere the pools exist only where io_uring is unusable, under the same budget, whose ceiling
+on Linux is the smaller of `kernel.threads-max` and the soft `RLIMIT_NPROC`, and on Windows the
+500 worker threads Microsoft states as a thread pool's default maximum ("Thread Pools", Best
+Practices) (`mantle_disk::threads`). A pool that
 would pass it is refused, naming the device and depth, before any thread exists (26
 recommendation 4); the device then runs at the depth the budget leaves.
 

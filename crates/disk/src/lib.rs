@@ -30,7 +30,7 @@ pub mod rounds;
 pub mod scratch;
 #[cfg(any(test, feature = "sim"))]
 pub mod sim;
-pub mod workers;
+pub mod threads;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DiskError {
@@ -55,6 +55,18 @@ pub enum DiskError {
     },
     #[error(transparent)]
     Buf(#[from] buf::BufError),
+    /// A pool for `path` would take more threads than the process budget has left; refused
+    /// before any thread starts (docs/design/node.md §1.2).
+    #[error(
+        "{}: {asked} threads asked of a process budget with {left} of {ceiling} left",
+        path.display()
+    )]
+    Threads {
+        path: PathBuf,
+        asked: usize,
+        left: usize,
+        ceiling: usize,
+    },
     /// Storage mantle cannot write as it must, refused before any write.
     #[error("{}: {reason}", path.display())]
     Unsupported { path: PathBuf, reason: &'static str },

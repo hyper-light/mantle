@@ -170,7 +170,9 @@ the smaller of the device's reported queue, the knee the ladder measured, and th
 thread budget (node.md §1.2), and a request past the budget is the typed refusal
 `DiskError::Threads`, naming the device and depth, before any thread exists (26 recommendation 4).
 Thread start-up, about 90 µs a thread in Apple's figure, is paid once per calibration and never
-inside a timed interval.
+inside a timed interval. The pool starts its workers as the ladder deepens, each drawn from the
+budget before it starts, so it never holds more than the deepest step measured
+(`mantle_disk::measure::Pool`).
 
 **The depth achieved is measured, not assumed.** Each completion samples the number in flight,
 and a point reports the achieved depth's distribution beside the depth asked for, as fio does

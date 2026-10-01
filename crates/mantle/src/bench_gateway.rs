@@ -13,13 +13,22 @@
 //! answered together is one. With the cell's answers each taking a latency `T` rather than
 //! none, an object of `S` bytes takes at least its round trips times `T`, whatever the path's
 //! speed per byte, which is what bounds a latency-limited transfer (audit §16.3).
+//!
+//! With more than one client, the PUTs of every client run at once on the one thread, each
+//! client a record holding its PUT's state machine: a round answers every request each client
+//! has out, so the clients share the core as a gateway's tasks share theirs, and no client is a
+//! thread (docs/design/measurement.md §10). Closed loop, a client starts its next PUT when its
+//! last is stored; open loop, with a rate, its PUTs arrive at intended times drawn from a
+//! Poisson process, and a PUT's latency runs from its intended start (research/26 §3.2).
 
-use std::collections::{BTreeMap, HashMap};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::io::Write;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use mantle_chunk::ChunkKey;
+use mantle_disk::histogram::Histogram;
 use mantle_disk::measure::SplitMix64;
 use mantle_ec::durability::Scheme;
 use mantle_gateway::complete::{self, CompleteError, Completion};
@@ -37,6 +46,7 @@ use mantle_s3::checksum::Algorithm;
 use mantle_s3::seal::{DataKey, SealError, WrappingKey};
 
 use crate::display;
+use crate::drive;
 
 const BUCKET: &str = "bench";
 
@@ -246,6 +256,13 @@ impl Cell {
         })
     }
 
+    /// Drops the chunks of the blocks `blocks` names.
+    fn drop_blocks(&mut self, blocks: &std::ops::Range<u128>) {
+        for chunks in self.volumes.values_mut() {
+            chunks.retain(|key, _| !blocks.contains(&key.block));
+        }
+    }
+
     /// Drops every chunk and row an earlier PUT left, but the bucket's gate.
     fn empty(&mut self) {
         for chunks in self.volumes.values_mut() {
@@ -304,16 +321,24 @@ fn commit() -> Commit {
     })
 }
 
-/// PUTs `bytes` as file `file`; the round trips it waited through.
-fn put(
-    cell: &mut Cell,
-    bytes: &[u8],
+/// A PUT under way: its state machine and how much body it has taken.
+struct Putting {
+    put: Put,
+    at: usize,
+    ended: bool,
+    /// The block IDs it draws from, so that its chunks can be dropped once it is stored.
+    blocks: std::ops::Range<u128>,
+}
+
+/// Begins a PUT of `length` bytes as file `file`, its block IDs the next 2^32 of `ids`.
+fn begin(
+    length: u64,
     layout: Layout,
     file: u128,
     ids: &mut u128,
     wrapping: &WrappingKey,
     window: usize,
-) -> Result<u64, Error> {
+) -> Result<Putting, Error> {
     let data = DataKey::generate()?;
     let keys = Keys {
         file,
@@ -323,8 +348,6 @@ fn put(
         },
         data,
     };
-    let length =
-        u64::try_from(bytes.len()).map_err(|_| Error::Unexpected("a body past u64".into()))?;
     let body = Body {
         length,
         checksum: Some(Algorithm::Crc64Nvme),
@@ -334,7 +357,7 @@ fn put(
     *ids = ids
         .checked_add(1 << 32)
         .ok_or(Error::Unexpected("block IDs ran out".into()))?;
-    let mut put = Put::new(
+    let put = Put::new(
         commit(),
         body,
         keys,
@@ -346,33 +369,182 @@ fn put(
         Box::new(Counter(first)),
         0,
     )?;
-    let (mut at, mut ended, mut rounds) = (0usize, false, 0u64);
-    loop {
-        while at < bytes.len() && put.wants_body() {
-            let took = put.feed(bytes.get(at..).unwrap_or_default())?;
-            at = at.checked_add(took).ok_or(PutError::Overflow)?;
+    Ok(Putting {
+        put,
+        at: 0,
+        ended: false,
+        blocks: first..*ids,
+    })
+}
+
+impl Putting {
+    /// One round: feeds what body the PUT takes and answers every request it has out. `true`
+    /// once it is stored.
+    fn round(&mut self, cell: &mut Cell, bytes: &[u8]) -> Result<bool, Error> {
+        while self.at < bytes.len() && self.put.wants_body() {
+            let took = self.put.feed(bytes.get(self.at..).unwrap_or_default())?;
+            self.at = self.at.checked_add(took).ok_or(PutError::Overflow)?;
         }
-        if at == bytes.len() && !ended {
-            put.end(&Expected::default())?;
-            ended = true;
+        if self.at == bytes.len() && !self.ended {
+            self.put.end(&Expected::default())?;
+            self.ended = true;
         }
         let mut asked = Vec::new();
-        while let Some(request) = put.poll() {
+        while let Some(request) = self.put.poll() {
             asked.push(request);
         }
         if asked.is_empty() {
-            return match put.outcome() {
-                Some(Ok(_)) => Ok(rounds),
+            return match self.put.outcome() {
+                Some(Ok(_)) => Ok(true),
                 Some(Err(e)) => Err(e.clone().into()),
                 None => Err(Error::Unexpected("a PUT waits on nothing".into())),
             };
         }
-        rounds = rounds.saturating_add(1);
         for (id, request) in asked {
             let answer = cell.serve_put(request)?;
-            put.answer(id, answer)?;
+            self.put.answer(id, answer)?;
+        }
+        Ok(false)
+    }
+}
+
+/// PUTs `bytes` as file `file`; the round trips it waited through.
+fn put(
+    cell: &mut Cell,
+    bytes: &[u8],
+    layout: Layout,
+    file: u128,
+    ids: &mut u128,
+    wrapping: &WrappingKey,
+    window: usize,
+) -> Result<u64, Error> {
+    let length =
+        u64::try_from(bytes.len()).map_err(|_| Error::Unexpected("a body past u64".into()))?;
+    let mut putting = begin(length, layout, file, ids, wrapping, window)?;
+    let mut rounds = 0u64;
+    while !putting.round(cell, bytes)? {
+        rounds = rounds.saturating_add(1);
+    }
+    Ok(rounds)
+}
+
+/// The clients of a row: how many, and how their PUTs arrive.
+#[derive(Debug, Clone, Copy)]
+pub struct Load {
+    pub clients: usize,
+    /// PUTs a second in all, arriving open loop; `None` for a closed loop.
+    pub rate: Option<f64>,
+}
+
+/// What the clients' PUTs measured: plaintext bytes a second, each PUT's latency from its
+/// intended start, and how late the generator started PUTs past when they could start.
+struct Clients {
+    rate: f64,
+    latency: Histogram,
+    lateness: Histogram,
+}
+
+/// `load.clients` clients PUT `bytes` for `step`, all on this thread, each a record.
+fn clients_put(
+    cell: &mut Cell,
+    bytes: &[u8],
+    layout: Layout,
+    ids: &mut u128,
+    wrapping: &WrappingKey,
+    load: Load,
+    step: Duration,
+) -> Result<Clients, Error> {
+    let Load { clients, rate } = load;
+    let length =
+        u64::try_from(bytes.len()).map_err(|_| Error::Unexpected("a body past u64".into()))?;
+    let started = Instant::now();
+    let deadline = started.checked_add(step);
+    let mut schedules: Vec<drive::Schedule> = (0..clients)
+        .map(|c| drive::Schedule::new(rate, clients, u64::try_from(c).unwrap_or(0)))
+        .collect();
+    // Each client's PUT under way, with when it was meant to start.
+    let mut active: Vec<Option<(Putting, Instant)>> = (0..clients).map(|_| None).collect();
+    // The clients with no PUT under way, by when their next is meant to start.
+    let mut idle: BinaryHeap<Reverse<(Instant, usize)>> = schedules
+        .iter_mut()
+        .enumerate()
+        .map(|(c, s)| Reverse((s.next(started, started), c)))
+        .collect();
+    let mut free: Vec<Instant> = vec![started; clients];
+    let (mut latency, mut lateness) = (Histogram::new(), Histogram::new());
+    let (mut stored, mut out, mut file) = (0u64, 0usize, 0u128);
+    loop {
+        let going = deadline.is_some_and(|d| Instant::now() < d);
+        while deadline.is_some_and(|d| Instant::now() < d) {
+            let now = Instant::now();
+            let Some(&Reverse((at, c))) = idle.peek().filter(|r| r.0.0 <= now) else {
+                break;
+            };
+            idle.pop();
+            // A file of its own for every PUT, as a gateway draws one for each.
+            file = file
+                .checked_add(1)
+                .ok_or(Error::Unexpected("file IDs ran out".into()))?;
+            let putting = begin(length, layout, file, ids, wrapping, 1)?;
+            if let Some(slot) = active.get_mut(c) {
+                *slot = Some((putting, at));
+                out = out.saturating_add(1);
+            }
+            let could = free.get(c).copied().unwrap_or(at).max(at);
+            lateness.record(nanos(now.saturating_duration_since(could)));
+        }
+        if out == 0 {
+            if !going {
+                break;
+            }
+            // Nothing under way: the next PUT's arrival is what comes next; an early return
+            // looks again.
+            if let Some(Reverse((at, _))) = idle.peek() {
+                std::thread::park_timeout(at.saturating_duration_since(Instant::now()));
+            }
+            continue;
+        }
+        // One round of every PUT under way.
+        for (c, slot) in active.iter_mut().enumerate() {
+            let Some((putting, _)) = slot.as_mut() else {
+                continue;
+            };
+            if !putting.round(cell, bytes)? {
+                continue;
+            }
+            let Some((putting, at)) = slot.take() else {
+                continue;
+            };
+            out = out.saturating_sub(1);
+            let now = Instant::now();
+            latency.record(nanos(now.saturating_duration_since(at)));
+            stored = stored.saturating_add(1);
+            // Its chunks go once it is stored, so the cell holds only the PUTs under way.
+            cell.drop_blocks(&putting.blocks);
+            if let Some(f) = free.get_mut(c) {
+                *f = now;
+            }
+            if let Some(s) = schedules.get_mut(c) {
+                idle.push(Reverse((s.next(at, now), c)));
+            }
         }
     }
+    let secs = started.elapsed().as_secs_f64();
+    // u64 -> f64 rounds above 2^53, far beyond any count a bounded run produces.
+    let rate = if secs > 0.0 {
+        stored as f64 * bytes.len() as f64 / secs
+    } else {
+        0.0
+    };
+    Ok(Clients {
+        rate,
+        latency,
+        lateness,
+    })
+}
+
+fn nanos(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// GETs the whole of file `file` of `size` bytes; the bytes read and the round trips.
@@ -533,6 +705,7 @@ pub fn gateway(
     out: &mut impl Write,
     schemes: &[Scheme],
     sizes: &[usize],
+    loads: &[Load],
     step: Duration,
 ) -> Result<(), Error> {
     writeln!(
@@ -608,6 +781,49 @@ pub fn gateway(
             out.flush()?;
         }
     }
+    if !loads.is_empty() {
+        writeln!(out)?;
+        writeln!(
+            out,
+            "  {:<10} {:>8} {:>8} {:>10} {:>11} {:>10} {:>10} {:>10} {:>8}",
+            "scheme", "object", "clients", "offered", "PUT", "p50", "p99", "late p99", "threads"
+        )?;
+    }
+    for &load in loads {
+        for &scheme in schemes {
+            let layout = Layout::new(scheme)?;
+            let volumes = u128::try_from(scheme.width())
+                .map_err(|_| Error::Unexpected("a scheme past u128".into()))?
+                .saturating_add(1);
+            for &size in sizes {
+                let mut bytes = vec![0u8; size];
+                SplitMix64::new(u64::try_from(size).unwrap_or(0)).fill(&mut bytes);
+                let mut cell = Cell::new(volumes)?;
+                let mut ids = 0u128;
+                let c = clients_put(&mut cell, &bytes, layout, &mut ids, &wrapping, load, step)?;
+                writeln!(
+                    out,
+                    "  {:<10} {:>8} {:>8} {:>10} {:>11} {:>10} {:>10} {:>10} {:>8}",
+                    match scheme {
+                        Scheme::Copies(n) => format!("{n} copies"),
+                        Scheme::Rs(code) => format!("RS({},{})", code.data(), code.parity()),
+                    },
+                    display::size(size),
+                    load.clients,
+                    load.rate.map_or_else(
+                        || "closed".to_owned(),
+                        |r| format!("{}/s", display::count(r))
+                    ),
+                    display::rate(c.rate),
+                    display::nanos(c.latency.p50()),
+                    display::nanos(c.latency.p99()),
+                    display::nanos(c.lateness.p99()),
+                    drive::thread_count(),
+                )?;
+                out.flush()?;
+            }
+        }
+    }
     writeln!(out)?;
     writeln!(out, "  completion driver alone     p50        max    runs")?;
     for parts in [1u16, 1_000, 10_000] {
@@ -635,6 +851,7 @@ mod tests {
             &mut out,
             &schemes().unwrap(),
             &[100_000],
+            &[],
             Duration::from_millis(1),
         )
         .unwrap();
@@ -643,5 +860,40 @@ mod tests {
             text.contains("3 copies") && text.contains("RS(6,3)"),
             "{text}"
         );
+    }
+
+    /// Many clients' PUTs, closed and open, run as records on the calling thread: each PUT is
+    /// stored and timed, and the cell keeps only the chunks of PUTs under way.
+    #[test]
+    fn clients_are_records_on_one_thread() {
+        let wrapping = WrappingKey::generate().unwrap();
+        let layout = Layout::new(Scheme::Copies(3)).unwrap();
+        for load in [
+            Load {
+                clients: 32,
+                rate: None,
+            },
+            Load {
+                clients: 32,
+                rate: Some(2_000.0),
+            },
+        ] {
+            let mut cell = Cell::new(4).unwrap();
+            let mut ids = 0u128;
+            let bytes = vec![7u8; 100_000];
+            let c = clients_put(
+                &mut cell,
+                &bytes,
+                layout,
+                &mut ids,
+                &wrapping,
+                load,
+                Duration::from_millis(50),
+            )
+            .unwrap();
+            assert!(c.latency.count() > 0, "{load:?}");
+            assert!(c.rate > 0.0);
+            assert!(cell.volumes.values().all(HashMap::is_empty));
+        }
     }
 }

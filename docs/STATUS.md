@@ -21,7 +21,11 @@ directory and, with `--measure`, benchmarks the device. It is built on:
   estimate them, and the random reads go on to deeper queues until throughput stops growing:
   that depth is what a chunk volume holds at the device, and the depth of greatest power
   (Kleinrock) is reported beside it ([measurements](measurements/2026-09-29-read-depth.md)).
-  The scratch file is removed whether the run succeeds or fails.
+  The scratch file is removed whether the run succeeds or fails. Depth is kept by one pool of
+  blocking workers started once a calibration and reused across its points, growing only as
+  deep as its deepest step, no deeper than the device's reported queue (`nr_requests`,
+  `IOCommandPoolSize`, or SATA NCQ's 32 where the OS cannot say) and the process thread
+  budget; each point reports the depth it achieved beside the depth asked.
 - **Checksums**: CRC-32C for stored and transmitted data, and CRC-64/NVME for S3
   checksums, both verified against published test vectors.
 - **Cryptography** ([design](design/crypto.md)): AWS-LC through aws-lc-rs, vendored with the
@@ -326,6 +330,14 @@ passes on all six CI targets.
    §1.3; raft-log.md §3). Done when an instrumented test with `W` waiters and `K` completions
    counts at most `K` plus the waiters admitted, a fence wakes each exactly once, and `bench log`
    at thousands of logical replicas runs on macOS without a kernel spinlock timeout.
+   *Done on macOS (2026-09-30)*: `mantle_log`'s `Room` hands freed room to waiters in arrival
+   order, each woken by its own `unpark`, its list bounded at `max_groups` times a group's two;
+   `room::tests::each_answer_wakes_only_the_waiter_it_admits_and_a_fence_wakes_each_once`
+   counts 16 wakes for 16 answers among 48 waiters and 48 in all after the fence;
+   `workers.rs` is gone. A submission can carry a `Waker`, woken exactly once
+   (`a_waker_is_woken_once_for_each_answer`). `bench log` ran 16,384 logical replicas on 20
+   threads on the development Mac. No production `notify_all` or `Barrier` remains; the tests'
+   simulated files keep theirs, waited on by a few test threads.
 2. **Depth without a thread per transfer.** Calibration's depth kept by io_uring on Linux, an
    overlapped completion port on Windows, and a reusable pool of exactly `depth` workers with
    per-worker slots on macOS and where io_uring is unusable, inside a process thread budget read
@@ -333,10 +345,33 @@ passes on all six CI targets.
    and reported (measurement.md §8). Done when a measurement at a device's full reported depth
    never exceeds the pool bound in the OS's own thread count, a request past the budget starts
    no thread, and the achieved depth reaches the depth asked or reports its shortfall.
+   *The portable pool is done on macOS (2026-09-30)*: `mantle_disk::threads` reads the budget's
+   ceiling from `kern.wq_max_threads` on macOS, the smaller of `kernel.threads-max` and the soft
+   `RLIMIT_NPROC` on Linux, and Microsoft's stated 500 pool threads on Windows, and counts the
+   process's threads from the OS (`proc_pidinfo`, `/proc/self/status`, a ToolHelp snapshot);
+   `measure::Pool` draws from it before any thread starts and refuses with
+   `DiskError::Threads`. `tests/depth.rs` measured at the NVMe controller's 253: 2 threads
+   before, a peak of 256 (the pool and the test's sampler), a mean of 228.7 in flight and
+   253 at most; a depth past the budget started none. *Remaining*: io_uring on Linux and the
+   completion port on Windows, which the pool stands in for on every OS until they land; the
+   Linux and Windows thread counters have been type-checked for their targets but not yet run
+   there; macOS reads its queue from `IOCommandPoolSize`, Windows reports none yet.
 3. **Logical clients as records.** `bench log`, `bench` and `bench gateway` multiplex clients on
    at most the granted cores' driver threads through `submit` and a `Waker`; the replica ladder
    ends at the stated replica bound; generators report their CPU and lateness (measurement.md
    §10). Done when the same benchmark at `R` and `10R` clients shows the same peak thread count.
+   *Done on macOS (2026-09-30)*: replicas and clients are records on at most
+   `available_parallelism` drivers, answered through `Log::submit_waking` and the chunk store's
+   new `Volume::put_waking`/`delete_waking`; `bench chunk --rate` and `bench gateway --clients
+   --rate` generate open loop from a Poisson process with latency from intended start. Rows
+   report the OS's thread count, the drivers' CPU and the generator's lateness.
+   `tests/clients.rs` ran `mantle bench log` at 18, 180 and 1,800 replicas on 20 threads each;
+   `bench::tests::clients_cost_no_threads` ran puts at 18 and 180 clients closed and 180 open
+   on 22 threads each. No ladder doubles until a spawn fails. *Remaining*: chunk reads still
+   block, so a read is a thread, as many as the store's measured read bound, until the
+   device's dispatcher (item 5) takes them; open loop needs a stated `--rate`; the replica
+   bound is the list the run states until node.md §11 derives the replicas a node hosts; the
+   resident memory per client (measurement.md §10) is not yet reported.
 
 ### Second: make overload and retry behaviour dependable
 

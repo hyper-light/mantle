@@ -21,8 +21,9 @@ use std::time::{Duration, Instant};
 use crate::DiskError;
 use crate::buf::Alignment;
 use crate::file::{Caching, CachingRequest, DeviceFile};
-use crate::measure::{self, Job, Pattern};
+use crate::measure::{self, Job, Pattern, Pool};
 use crate::scratch::Scratch;
+use crate::threads;
 
 /// What to measure and how hard.
 #[derive(Debug, Clone)]
@@ -35,12 +36,16 @@ pub struct Plan {
     pub step: Duration,
     /// Queue depths for random reads. Past the last, the ladder quadruples its depth while
     /// each step is faster than the one before beyond both intervals, so it reaches the depth
-    /// where throughput stops growing, and goes no deeper than `max_read_depth`.
+    /// where throughput stops growing, and goes no deeper than `max_read_depth`, the device's
+    /// queue or the process's thread budget (docs/design/measurement.md §8).
     pub random_depths: Vec<usize>,
     /// The deepest random-read point: NVMe queues hold at most 65,535 commands, its 16-bit,
     /// zero-based maximum queue entries less the slot that tells a full queue from an empty
     /// one (NVM Express Base Specification, CAP.MQES).
     pub max_read_depth: usize,
+    /// The commands the device queues, as the OS reports it (`nr_requests` on Linux,
+    /// `IOCommandPoolSize` on macOS); `None` when it cannot say.
+    pub device_queue: Option<u32>,
     /// Queue depths for sequential transfers.
     pub sequential_depths: Vec<usize>,
     /// Small transfer: the alignment unit, 4 KiB on flash (Haas and Leis, PVLDB 2023, §2.2).
@@ -91,7 +96,7 @@ impl Rounds {
 impl Plan {
     /// About twenty seconds on a steady fast SSD, three rounds of half-second jobs a point, and
     /// up to twice that on a noisy one (`Rounds::STANDARD`).
-    pub fn standard(align: Alignment) -> Self {
+    pub fn standard(align: Alignment, device_queue: Option<u32>) -> Self {
         let small = align
             .max(Alignment::new(4096).unwrap_or(Alignment::BYTE))
             .get();
@@ -101,6 +106,7 @@ impl Plan {
             step: Duration::from_millis(500),
             random_depths: vec![1, 4, 16, 64],
             max_read_depth: 65_535,
+            device_queue,
             sequential_depths: vec![1, 4],
             small,
             large: 1 << 20,
@@ -123,7 +129,15 @@ pub struct Point {
     /// Latency quantiles over every round's transfers, when enough ran to estimate them.
     pub p50_ns: Option<u64>,
     pub p99_ns: Option<u64>,
+    /// Transfers in flight, sampled at each completion over every round: their mean. Below
+    /// `depth` when the path could not keep the depth asked (research/26 §2.1).
+    pub achieved: f64,
 }
+
+/// The queue assumed of a device the OS cannot describe: Native Command Queuing's 32 commands,
+/// the shallowest queue of a command-queuing interface (Serial ATA Revision 2.6, §13.6.2;
+/// AHCI 1.3.1 §1.1), which calibration's ladder then measures (CLAUDE.md §5).
+pub const UNDESCRIBED_QUEUE_DEPTH: usize = 32;
 
 /// Transfers needed to report a quantile `q`: enough that the order statistic lies within
 /// half the tail's rank of `q` with 95% confidence, `n ≥ 1.96²·q(1−q)/δ²` at `δ = (1−q)/2`
@@ -154,6 +168,9 @@ pub struct Calibration {
     pub sequential_write: Vec<Point>,
     /// A small write followed by the platform's full flush, one at a time.
     pub durable_write: Point,
+    /// Measurement workers the calibration started: its deepest step, never more than the
+    /// device's queue or the process's thread budget.
+    pub workers: usize,
     /// `durable_large` bytes written sequentially, then a full flush, one at a time.
     pub durable_sequential: Point,
     pub durable_large: usize,
@@ -305,10 +322,41 @@ pub fn calibrate(
             ),
         });
     }
+    // The deepest the device can be driven: its queue, the plan's bound and the threads the
+    // process budget has left, decided before any worker starts (docs/design/node.md §1.2).
+    let queue = plan
+        .device_queue
+        .and_then(|q| usize::try_from(q).ok())
+        .filter(|&q| q > 0)
+        .unwrap_or(UNDESCRIBED_QUEUE_DEPTH);
+    let cap = plan.max_read_depth.min(queue).min(threads::left()?);
+    if cap == 0 {
+        return Err(DiskError::Threads {
+            path: dir.to_path_buf(),
+            asked: 1,
+            left: 0,
+            ceiling: threads::ceiling()?,
+        });
+    }
     let scratch = Scratch::create(dir, ".mantle-calibrate")?;
     let file = DeviceFile::open(scratch.path(), false, CachingRequest::PreferDirect, align)?;
     file.preallocate(span)?;
+    measure::with_pool(&file, cap, |pool| {
+        measured(pool, &file, plan, span, fresh, cap, started)
+    })
+}
 
+/// Every measurement of a calibration, on one pool of workers that grows as deep as its
+/// deepest step.
+fn measured(
+    pool: &mut Pool<'_, '_>,
+    file: &DeviceFile,
+    plan: &Plan,
+    span: u64,
+    fresh: u64,
+    cap: usize,
+    started: Instant,
+) -> Result<Calibration, DiskError> {
     // Before anything is written: each round of first writes takes fresh space, and each
     // round of overwrites rewrites space a round of first writes wrote, the same way.
     let durable = |base| Job {
@@ -322,9 +370,9 @@ pub fn calibrate(
         sync_each: true,
         seed: 0,
     };
-    let first_write = point(&file, plan, |round| durable(round.saturating_mul(fresh)))?;
+    let first_write = point(pool, plan, |round| durable(round.saturating_mul(fresh)))?;
     let written = u64::try_from(first_write.rounds.max(1)).unwrap_or(1);
-    let overwrite = point(&file, plan, |round| {
+    let overwrite = point(pool, plan, |round| {
         durable(
             round
                 .checked_rem(written)
@@ -349,7 +397,7 @@ pub fn calibrate(
         sync_each: false,
         seed: 1,
     };
-    measure::run(&file, &fill)?;
+    pool.run(&fill)?;
     file.sync_data()?;
 
     let job = |pattern, block, depth, seed| Job {
@@ -364,16 +412,20 @@ pub fn calibrate(
         seed,
     };
     let mut random_read = Vec::with_capacity(plan.random_depths.len());
-    for &depth in &plan.random_depths {
-        random_read.push(point(&file, plan, |round| {
+    let planned = |depths: &[usize]| {
+        let mut depths: Vec<usize> = depths.iter().map(|&d| d.min(cap)).collect();
+        depths.dedup();
+        depths
+    };
+    for depth in planned(&plan.random_depths) {
+        random_read.push(point(pool, plan, |round| {
             job(Pattern::RandomRead, plan.small, depth, round)
         })?);
     }
     // Throughput still growing at the last depth: the ladder goes on, four times deeper each
-    // step, no deeper than the plan allows or the measuring backend can run (audit S09).
-    let cap = plan.max_read_depth.min(measure::MAX_DEPTH);
+    // step, no deeper than the plan, the device's queue or the thread budget allow (audit S09).
     while let Some(depth) = next_depth(&random_read, cap) {
-        random_read.push(point(&file, plan, |round| {
+        random_read.push(point(pool, plan, |round| {
             job(Pattern::RandomRead, plan.small, depth, round)
         })?);
     }
@@ -381,15 +433,15 @@ pub fn calibrate(
         still_growing(&random_read) && random_read.last().is_some_and(|p| p.depth >= cap);
     let mut sequential_read = Vec::with_capacity(plan.sequential_depths.len());
     let mut sequential_write = Vec::with_capacity(plan.sequential_depths.len());
-    for &depth in &plan.sequential_depths {
-        sequential_read.push(point(&file, plan, |round| {
+    for depth in planned(&plan.sequential_depths) {
+        sequential_read.push(point(pool, plan, |round| {
             job(Pattern::SequentialRead, plan.large, depth, round)
         })?);
-        sequential_write.push(point(&file, plan, |round| {
+        sequential_write.push(point(pool, plan, |round| {
             job(Pattern::SequentialWrite, plan.large, depth, round)
         })?);
     }
-    let durable_write = point(&file, plan, |round| Job {
+    let durable_write = point(pool, plan, |round| Job {
         pattern: Pattern::RandomWrite,
         block: plan.small,
         depth: 1,
@@ -407,7 +459,7 @@ pub fn calibrate(
         .unwrap_or(0)
         .saturating_mul(plan.small)
         .max(plan.small);
-    let durable_sequential = point(&file, plan, |round| Job {
+    let durable_sequential = point(pool, plan, |round| Job {
         pattern: Pattern::SequentialWrite,
         block: durable_large,
         depth: 1,
@@ -430,6 +482,7 @@ pub fn calibrate(
         durable_write,
         durable_sequential,
         durable_large,
+        workers: pool.workers(),
         first_write,
         overwrite,
         elapsed: started.elapsed(),
@@ -437,14 +490,22 @@ pub fn calibrate(
 }
 
 /// Runs a job in rounds, as many as the plan's `Rounds` take.
-fn point(file: &DeviceFile, plan: &Plan, job: impl Fn(u64) -> Job) -> Result<Point, DiskError> {
+fn point(
+    pool: &mut Pool<'_, '_>,
+    plan: &Plan,
+    job: impl Fn(u64) -> Job,
+) -> Result<Point, DiskError> {
     let max = plan.rounds.limit();
     let mut depth = 1;
     let (mut ops, mut bytes) = (Vec::with_capacity(max), Vec::with_capacity(max));
     let mut latency = crate::histogram::Histogram::new();
+    let (mut in_flight, mut completions) = (0.0f64, 0u64);
     for round in 0..max {
         let j = job(u64::try_from(round).unwrap_or(0));
-        let r = measure::run(file, &j)?;
+        let r = pool.run(&j)?;
+        // Counts of bounded rounds are far below 2^53.
+        in_flight += r.achieved * r.ops as f64;
+        completions = completions.saturating_add(r.ops);
         depth = j.depth;
         ops.push(r.ops_per_sec());
         bytes.push(r.bytes_per_sec());
@@ -463,6 +524,11 @@ fn point(file: &DeviceFile, plan: &Plan, job: impl Fn(u64) -> Job) -> Result<Poi
         rounds: ops.len(),
         p50_ns: (samples >= P50_SAMPLES).then(|| latency.p50()),
         p99_ns: (samples >= P99_SAMPLES).then(|| latency.p99()),
+        achieved: if completions == 0 {
+            0.0
+        } else {
+            in_flight / completions as f64
+        },
     })
 }
 
@@ -497,6 +563,7 @@ mod tests {
             rounds: 3,
             p50_ns: None,
             p99_ns: None,
+            achieved: depth as f64,
         }
     }
 
@@ -525,6 +592,7 @@ mod tests {
             durable_write: durable,
             durable_sequential: durable,
             durable_large: 1 << 20,
+            workers: 4,
             first_write: durable,
             overwrite: durable,
             elapsed: Duration::ZERO,
@@ -570,6 +638,7 @@ mod tests {
             rounds: 3,
             p50_ns: None,
             p99_ns: None,
+            achieved: depth as f64,
         };
         let growing = [at(16, 100.0), at(64, 200.0)];
         assert_eq!(next_depth(&growing, 256), Some(256));
@@ -663,6 +732,7 @@ mod tests {
             random_depths: vec![1, 2],
             // The ladder goes no deeper than planned, however the reads scale.
             max_read_depth: 2,
+            device_queue: None,
             sequential_depths: vec![1],
             small: 4096,
             large: 1 << 20,
@@ -697,7 +767,7 @@ mod tests {
         std::fs::write(&theirs, b"customer-data").unwrap();
         let plan = Plan {
             small: 0,
-            ..Plan::standard(Alignment::new(4096).unwrap())
+            ..Plan::standard(Alignment::new(4096).unwrap(), None)
         };
         assert!(calibrate(dir.path(), Alignment::new(4096).unwrap(), None, &plan).is_err());
         assert_eq!(std::fs::read(&theirs).unwrap(), b"customer-data");
@@ -712,7 +782,7 @@ mod tests {
     fn too_little_space_is_refused_before_writing() {
         let dir = tempfile::tempdir().unwrap();
         let align = Alignment::new(4096).unwrap();
-        let plan = Plan::standard(align);
+        let plan = Plan::standard(align, None);
         let err = calibrate(dir.path(), align, Some(1 << 20), &plan).unwrap_err();
         assert!(matches!(
             err,

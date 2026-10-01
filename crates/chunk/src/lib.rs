@@ -33,4 +33,4 @@ pub use key::ChunkKey;
 pub use layout::{Config, Limits, Reads};
 pub use read::ReadStats;
 pub use recover::RecoveryReport;
-pub use volume::{ChunkStat, Usage, Volume};
+pub use volume::{Answer, ChunkStat, Usage, Volume};

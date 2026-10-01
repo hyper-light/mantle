@@ -27,7 +27,7 @@ use crate::error::ChunkError;
 use crate::frame::SegmentState;
 use crate::record::{FLAG_FINAL, Payload};
 use crate::recover::{Identity, verify_at};
-use crate::writer::{CLEANER_RESERVE, Move, Op, Request, Shared};
+use crate::writer::{CLEANER_RESERVE, Move, Op, Reply, Request, Shared};
 
 pub(crate) struct Cleaner<F> {
     pub shared: Arc<Shared<F>>,
@@ -369,7 +369,7 @@ impl<F: BlockFile> Cleaner<F> {
         self.submit
             .send(Request {
                 op: Op::Relocate { moves },
-                reply,
+                reply: Reply::new(reply, None),
                 queued: None,
             })
             .map_err(|_| ChunkError::Closed)?;
@@ -384,7 +384,7 @@ impl<F: BlockFile> Cleaner<F> {
         self.submit
             .send(Request {
                 op: Op::Free,
-                reply,
+                reply: Reply::new(reply, None),
                 queued: None,
             })
             .map_err(|_| ChunkError::Closed)?;

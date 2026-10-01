@@ -158,7 +158,7 @@ fn measured(out: &mut impl Write, path: &Path, id: &Identity) -> Result<(), Erro
             Alignment::new(4096).unwrap_or(Alignment::BYTE),
             Alignment::max,
         );
-    let plan = Plan::standard(align);
+    let plan = Plan::standard(align, id.queue_depth);
     writeln!(
         out,
         "measuring with a scratch file of up to {} (removed afterwards)",
@@ -186,6 +186,20 @@ fn report(out: &mut impl Write, c: &Calibration) -> std::io::Result<()> {
             ),
         )?;
     }
+    field(
+        out,
+        "depth",
+        &format!(
+            "{} measurement workers at the deepest step, within the device's queue and the \
+             process's thread budget; achieved {}",
+            c.workers,
+            c.random_read
+                .iter()
+                .map(|p| format!("{:.1} of {}", p.achieved, p.depth))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )?;
     let best = |points: &[calibrate::Point]| {
         points
             .iter()

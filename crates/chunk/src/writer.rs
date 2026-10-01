@@ -102,7 +102,7 @@ pub(crate) struct Move {
 
 pub(crate) struct Request {
     pub op: Op,
-    pub reply: SyncSender<Result<(), ChunkError>>,
+    pub reply: Reply,
     /// Payload bytes the request holds of the client queue's room (`Queue`); `None` for the
     /// cleaner's requests, which it sends one at a time outside that room.
     pub queued: Option<u64>,
@@ -428,11 +428,32 @@ fn now_ns() -> u64 {
         .unwrap_or(0)
 }
 
-type Reply = SyncSender<Result<(), ChunkError>>;
+/// Where a request's answer goes, and the waker told once it is there, so that a caller with
+/// many requests out learns of each answer as it comes (docs/design/node.md §1.3).
+pub(crate) struct Reply {
+    tx: SyncSender<Result<(), ChunkError>>,
+    waker: Option<std::task::Waker>,
+}
+
+impl Reply {
+    pub fn new(tx: SyncSender<Result<(), ChunkError>>, waker: Option<std::task::Waker>) -> Self {
+        Self { tx, waker }
+    }
+}
+
+impl Drop for Reply {
+    /// Wakes the submitter once: after its answer is sent, or when the request is dropped
+    /// unanswered, which its receiver then reads as closed.
+    fn drop(&mut self) {
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
+    }
+}
 
 fn answer(tx: Reply, result: Result<(), ChunkError>) {
     // The submitter may have given up waiting; its answer has nowhere to go.
-    let _ = tx.send(result);
+    let _ = tx.tx.send(result);
 }
 
 fn reply(request: Request, result: Result<(), ChunkError>) {

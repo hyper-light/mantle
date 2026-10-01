@@ -300,6 +300,12 @@ fn describe(bsd: &str, identity: &mut Identity) {
         .and_then(|v| number(v.0))
         .and_then(|v| u64::try_from(v).ok());
     identity.removable = media.property("Removable").and_then(|v| boolean(v.0));
+    // The commands the nearest controller above the media queues: 253 on this machine's NVMe
+    // controller (`ioreg`, research/26 §1.1).
+    identity.queue_depth = media
+        .inherited("IOCommandPoolSize")
+        .and_then(|v| number(v.0))
+        .and_then(|v| u32::try_from(v).ok());
 
     match media.inherited("Device Characteristics") {
         Some(chars) => {

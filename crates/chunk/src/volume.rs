@@ -2,8 +2,9 @@
 //! delete chunks through its group-commit writer, and read them back verified.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, RwLock};
+use std::task::Waker;
 use std::thread::JoinHandle;
 
 use mantle_disk::DiskError;
@@ -22,8 +23,29 @@ use crate::recover::{self, RecoveryReport, read_span};
 use crate::scrub::{Findings, Scrubber, SharedFindings, scrub_all};
 use crate::superblock::{OFFSET_A, OFFSET_B_COMPACT, OFFSET_B_STANDARD, Superblock};
 use crate::writer::{
-    INCARNATION_RESERVE, Op, Request, SEQUENCE_RESERVE, Shared, Writer, write_superblock,
+    INCARNATION_RESERVE, Op, Reply, Request, SEQUENCE_RESERVE, Shared, Writer, write_superblock,
 };
+
+/// A request's answer, once it is durable or refused.
+#[derive(Debug)]
+pub struct Answer {
+    answer: Receiver<Result<(), ChunkError>>,
+}
+
+impl Answer {
+    pub fn wait(&self) -> Result<(), ChunkError> {
+        self.answer.recv().map_err(|_| ChunkError::Closed)?
+    }
+
+    /// The answer if it has come.
+    pub fn poll(&self) -> Option<Result<(), ChunkError>> {
+        match self.answer.try_recv() {
+            Ok(answer) => Some(answer),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(ChunkError::Closed)),
+        }
+    }
+}
 
 /// A chunk's size and state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -363,6 +385,19 @@ impl<F: BlockFile + 'static> Volume<F> {
         seal: bool,
         expected: Option<u32>,
     ) -> Result<(), ChunkError> {
+        let (op, ticket) = self.write_op(key, offset, data, seal, expected)?;
+        self.send(op, ticket)
+    }
+
+    /// The write `write` submits, admitted to the queue.
+    fn write_op(
+        &self,
+        key: ChunkKey,
+        offset: u64,
+        data: &[u8],
+        seal: bool,
+        expected: Option<u32>,
+    ) -> Result<(Op, Ticket<'_>), ChunkError> {
         let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
         let max = crate::writer::max_payload(&self.shared.geometry, self.shared.checksum_shift);
         if len > max {
@@ -380,7 +415,7 @@ impl<F: BlockFile + 'static> Volume<F> {
                 actual: payload.crc,
             });
         }
-        self.send(
+        Ok((
             Op::Write {
                 key,
                 offset,
@@ -388,12 +423,32 @@ impl<F: BlockFile + 'static> Volume<F> {
                 seal,
             },
             ticket,
-        )
+        ))
     }
 
     /// Deletes a chunk; deleting one that does not exist succeeds.
     pub fn delete(&self, key: ChunkKey) -> Result<(), ChunkError> {
         self.submit(Op::Delete { key })
+    }
+
+    /// Writes a whole chunk as [`Volume::put`] does, but returns once the request is queued:
+    /// the answer comes through the returned [`Answer`], and `waker` is woken exactly once,
+    /// when it has come or when the volume closes without answering. One thread can so keep
+    /// many requests out (docs/design/node.md §1.3, measurement.md §10).
+    pub fn put_waking(
+        &self,
+        key: ChunkKey,
+        data: &[u8],
+        waker: Waker,
+    ) -> Result<Answer, ChunkError> {
+        let (op, ticket) = self.write_op(key, 0, data, true, None)?;
+        self.dispatch(op, ticket, Some(waker))
+    }
+
+    /// Deletes a chunk as [`Volume::delete`] does, answering as [`Volume::put_waking`] does.
+    pub fn delete_waking(&self, key: ChunkKey, waker: Waker) -> Result<Answer, ChunkError> {
+        let ticket = self.admit(0)?;
+        self.dispatch(Op::Delete { key }, ticket, Some(waker))
     }
 
     /// Writes the whole index into the log and points the superblock at it, so the next open
@@ -426,13 +481,23 @@ impl<F: BlockFile + 'static> Volume<F> {
     }
 
     /// Sends an admitted request and waits for its answer.
-    fn send(&self, op: Op, mut ticket: Ticket<'_>) -> Result<(), ChunkError> {
+    fn send(&self, op: Op, ticket: Ticket<'_>) -> Result<(), ChunkError> {
+        self.dispatch(op, ticket, None)?.wait()
+    }
+
+    /// Sends an admitted request; its answer comes through what is returned.
+    fn dispatch(
+        &self,
+        op: Op,
+        mut ticket: Ticket<'_>,
+        waker: Option<Waker>,
+    ) -> Result<Answer, ChunkError> {
         let sender = self.sender.as_ref().ok_or(ChunkError::Closed)?;
         let (reply, answer) = sync_channel(1);
         self.shared.submitted.fetch_add(1, Ordering::AcqRel);
         let request = Request {
             op,
-            reply,
+            reply: Reply::new(reply, waker),
             queued: Some(ticket.bytes),
         };
         match sender.try_send(request) {
@@ -441,7 +506,7 @@ impl<F: BlockFile + 'static> Volume<F> {
             Err(TrySendError::Full(_)) => return Err(ChunkError::Busy),
             Err(TrySendError::Disconnected(_)) => return Err(ChunkError::Closed),
         }
-        answer.recv().map_err(|_| ChunkError::Closed)?
+        Ok(Answer { answer })
     }
 
     pub fn stat(&self, key: &ChunkKey) -> Result<Option<ChunkStat>, ChunkError> {
@@ -924,7 +989,7 @@ mod tests {
                     payload,
                     seal: true,
                 },
-                reply,
+                reply: Reply::new(reply, None),
                 queued: Some(len),
             })
             .map_err(|_| ())
@@ -953,7 +1018,7 @@ mod tests {
             .unwrap()
             .try_send(Request {
                 op: Op::Delete { key },
-                reply,
+                reply: Reply::new(reply, None),
                 queued: Some(0),
             })
             .map_err(|_| ())

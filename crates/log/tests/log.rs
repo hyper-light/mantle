@@ -3436,3 +3436,50 @@ proptest! {
         }
     }
 }
+
+/// One thread keeps many groups' submissions out at once through `submit_waking`: each
+/// answer wakes its submitter's waker once, naming which submission it was, so the thread
+/// learns of every answer without looking at the others (docs/design/measurement.md §10).
+#[test]
+fn a_waker_is_woken_once_for_each_answer() {
+    struct Ready {
+        index: usize,
+        ready: std::sync::mpsc::SyncSender<usize>,
+    }
+    impl std::task::Wake for Ready {
+        fn wake(self: Arc<Self>) {
+            self.ready.try_send(self.index).unwrap();
+        }
+    }
+    const GROUPS: usize = 32;
+    let file = sim(23);
+    let log = Log::create(Arc::clone(&file), config(64, 8), ID).unwrap();
+    let (ready, woken) = std::sync::mpsc::sync_channel(GROUPS);
+    let mut out: Vec<Option<mantle_log::Pending>> = (0..GROUPS)
+        .map(|g| {
+            let waker = std::task::Waker::from(Arc::new(Ready {
+                index: g,
+                ready: ready.clone(),
+            }));
+            let u = Update {
+                entries: Some(entries(1, &[1])),
+                ..Update::default()
+            };
+            Some(
+                log.submit_waking(g as u128, mantle_log::Class::Normal, u, waker)
+                    .unwrap(),
+            )
+        })
+        .collect();
+    drop(ready);
+    for _ in 0..GROUPS {
+        let g = woken.recv().unwrap();
+        let pending = out[g].take().expect("a waker woken twice");
+        pending.poll().unwrap().unwrap();
+    }
+    // Every waker went with its submission, and none woke again.
+    assert!(woken.recv().is_err());
+    for g in 0..GROUPS {
+        assert_eq!(log.view(g as u128).unwrap().unwrap().last, 1);
+    }
+}

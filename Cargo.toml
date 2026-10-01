@@ -26,7 +26,7 @@ crc-fast = { version = "1.10", default-features = false, features = ["std"] }
 proptest = "1.11"
 reed-solomon-simd = "3.1"
 roxmltree = "0.21"
-rustix = { version = "1.1", features = ["fs", "system", "param"] }
+rustix = { version = "1.1", features = ["fs", "system", "param", "process", "time"] }
 tempfile = "3.20"
 thiserror = "2.0"
 twox-hash = { version = "2.1", default-features = false, features = ["std", "xxhash32", "xxhash64", "xxhash3_64", "xxhash3_128"] }
@@ -37,6 +37,7 @@ zeroize = "1.9"
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Security",
+  "Win32_System_Diagnostics_ToolHelp",
   "Win32_Storage_FileSystem",
   "Win32_System_IO",
   "Win32_System_Ioctl",

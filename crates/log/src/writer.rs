@@ -393,15 +393,14 @@ impl<F: BlockFile> Writer<F> {
         // A submitter that stopped waiting has nothing to be told.
         let _ = s.reply.try_send(result);
         self.shared.release(s.group, s.bytes);
+        s.wake();
     }
 
     /// Fences the log: no submission is taken from here on, and every waiter wakes to hear
     /// it.
     fn fence(&self) {
         self.shared.fenced.store(true, Ordering::Release);
-        // Taking the queue's lock orders the fence before any waiter's next look at it.
-        drop(self.shared.queue.lock());
-        self.shared.room.notify_all();
+        self.shared.room.fence();
     }
 
     /// Writes one frame of a sweep and updates and publishes it. Its persist record confirms

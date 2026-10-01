@@ -288,7 +288,7 @@ a flushed frame records a tail past it, so recovery never takes a reused segment
 one.
 
 When updates are waiting and fewer than two segments are free, the writer sweeps the
-oldest segment, provided some of it is dead. It reads the segment and, for each piece the
+oldest segment, provided sweeping it makes room (below). It reads the segment and, for each piece the
 in-memory state still points at, writes a `Relocated`, `HardState`, `Start` or `Proposal`
 copy at the front of the next frame. That frame names the segment after it as the tail.
 This is the cleaning of a log-structured file system applied to the end of a log [RO92],
@@ -301,11 +301,39 @@ A sweep always completes in one frame. A group's live entries run unbroken from 
 to its last, and an entry dies either from the front of the log, by a start, or from its
 back, by a replacement. So the live part of any record is a single run, and its copy is no
 larger than the record. The copies of a whole segment therefore fit in one frame. A freed
-segment is reused only once a durable frame names a tail past it. The last free segment is
-kept for a frame that names a later tail, whose durability frees a segment in turn, so the
-log never runs out of room to make room. When every segment is live and the sweep would
-free nothing, updates are refused with `Full` and the groups compact. Sweeping only while
-updates wait keeps an idle or full log from reading its tail again and again.
+segment is reused only once a durable frame names a tail past it.
+
+**Room.** A sweep makes room only if the frame of its copies takes less than the tail's
+frames do: it frees one segment and fills that much of another. Each segment counts the
+bytes its frames take, padded, since it opened; recovery counts them as it replays. The
+copies take at most the tail's live bytes and a relocated record's header for each live
+piece, as if no two entries ran together. The tail is swept only when those copies fit one
+frame and their padded frame is smaller than the tail's frames. A tail of frames that each
+held a few small pieces is swept, since its copies pack into one frame; a tail of one large
+live entry is not, since its copy would take a frame as large. Before, the writer swept any
+tail whose live bytes were below a frame's room. A tail with nothing to free was copied into
+a segment of its own, freeing one and taking one; the update waiting never fitted beside the
+copies, so the writer swept segment after segment without ever answering it. Where no
+segment could take the sweep's frame, it laid the sweep out again and again without writing
+anything. A log whose segments were all live never answered `Full`.
+
+The last free segment is kept for a frame that makes room. Such a frame names a later tail,
+whose durability frees a segment in turn, or carries only updates that free what their
+groups hold: a compaction or snapshot's start with no entry or proposal, a removal, or a
+damage fence. While no segment is free, the head's remaining room is kept for those frames
+too. So the compaction a full log waits for always has somewhere to go, and so does the
+frame that names the tail past what it freed. Before, an update frame could fill the head,
+and the compaction that would free the log found no room: once the head filled, the log
+answered `Full` to the very write that frees it.
+
+When no segment can take the frame, its updates are refused `Full` and the groups compact.
+If the frame was only a sweep, the updates it was making room for are refused too, since no
+room can come. The writer also counts frames in a row that swept and carried no update while
+updates waited. Each such sweep reclaims the tail's dead pieces and padding, and its copies
+are packed and live. So after `max_segments` of them every segment has been swept once,
+and the updates still waiting are refused `Full`. This is the loop's counted budget
+(CLAUDE.md §2), derived from the log's size rather than chosen. Sweeping only while updates
+wait keeps an idle or full log from reading its tail again and again.
 
 The file therefore holds each group's live log plus the segments being reclaimed. By
 Little's law, the live bytes are the node's append rate times the time an entry waits for
@@ -465,6 +493,9 @@ multi-sector writes, fails flushes after marking pages clean, and flips bits on 
 - the queue refuses past its byte bound with `Busy`, charging empty entries their records;
 - a full frame takes updates by class and by fair share, and an update passed over for room
   is written in the next frame under hot traffic of any class;
+- a log whose segments are all live answers `Full` within one frame and one sweep's reads,
+  takes the compaction it waits for even after writes that followed a small compaction,
+  and goes on once groups compact; a reopened log sweeps the segments it recovered;
 - reclamation never loses a live record, and a lost frame that swept the tail loses
   nothing unreported when the next frame's opening tears over the segment it freed;
 - a group's state after recovery equals its state before the crash, less what was never

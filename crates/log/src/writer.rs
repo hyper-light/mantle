@@ -148,6 +148,9 @@ pub(crate) struct Writer<F> {
     finish: HashMap<u128, u128>,
     /// Frames laid out so far, which date a submission passed over.
     walks: u64,
+    /// Frames written in a row that swept and carried no update while updates waited: at most
+    /// `max_segments` before those waiting are refused `Full`.
+    fruitless: u64,
     /// Payload bytes one frame holds.
     capacity: usize,
     anticipation: Anticipation,
@@ -191,6 +194,7 @@ impl<F: BlockFile> Writer<F> {
             virtual_time: 0,
             finish: HashMap::new(),
             walks: 0,
+            fruitless: 0,
             unconfirmed: None,
             frame: None,
         })
@@ -522,6 +526,18 @@ impl<F: BlockFile> Writer<F> {
                     .unconfirmed
                     .take()
                     .map_or(0, |before| self.settle(before, Ok(())));
+                // Frames that sweep and carry no update, in a row, while updates wait: each
+                // copies a tail with a dead piece, and its copies are all live, so after a
+                // sweep of every segment no dead piece is left to free. Past that many, the
+                // log cannot make room for what waits (docs/design/raft-log.md §5).
+                if taken.is_empty() {
+                    self.fruitless = self.fruitless.saturating_add(1);
+                    if self.fruitless >= u64::from(self.shared.config.max_segments) {
+                        self.refuse_held();
+                    }
+                } else {
+                    self.fruitless = 0;
+                }
                 self.unconfirmed = Some(Unconfirmed {
                     sequence,
                     updates: taken.drain(..).map(|(s, _)| s).collect(),
@@ -530,12 +546,26 @@ impl<F: BlockFile> Writer<F> {
             }
             None => {
                 // No segment can take the frame: every one holds live records the tail's
-                // sweep cannot free. Groups must compact.
+                // sweep cannot free. Groups must compact. A frame that carried no update was
+                // a sweep making room for those held: none can come, and they are refused
+                // too, where before they were laid out again, and again, without an answer.
+                let sweep_only = taken.is_empty();
                 for (s, _) in taken.drain(..) {
                     self.answer(&s, Err(LogError::Full));
                 }
+                if sweep_only {
+                    self.refuse_held();
+                }
                 Ok(None)
             }
+        }
+    }
+
+    /// Answers every held update `Full`: no room can be made for them until groups compact.
+    fn refuse_held(&mut self) {
+        self.fruitless = 0;
+        for s in std::mem::take(&mut self.held) {
+            self.answer(&s, Err(LogError::Full));
         }
     }
 
@@ -556,7 +586,11 @@ impl<F: BlockFile> Writer<F> {
             };
             (tail, tail > state.durable_tail)
         };
-        let Some(target) = self.target(payload.len(), advances)? else {
+        // A frame makes room if it names a later tail, whose durability frees a segment, or if
+        // its every update only frees what its group held: a compaction, a removal, a fence.
+        let makes_room =
+            advances || (!taken.is_empty() && taken.iter().all(|(s, _)| frees(&s.update, s.marks)));
+        let Some(target) = self.target(payload.len(), makes_room)? else {
             return Ok(None);
         };
         let started = std::time::Instant::now();
@@ -568,16 +602,43 @@ impl<F: BlockFile> Writer<F> {
     }
 
     /// Whether the tail should be swept now: free segments are short, a segment follows the
-    /// tail, and some of the tail is dead.
+    /// tail, and sweeping it makes room: its copies fit one frame, and that frame takes less
+    /// than the tail's frames do.
     fn sweepable(&self) -> Result<bool, LogError> {
         let state = self.shared.read_state()?;
         let usable = usable_segments(&state, self.shared.config.max_segments);
         let Some(&tail) = state.segments.live.front() else {
             return Ok(false);
         };
-        let live_bytes = state.live.of(tail).1;
+        if usable >= 2 || state.segments.live.len() < 2 {
+            return Ok(false);
+        }
+        // The copies' bytes at most: every live piece, and a relocated record's header for
+        // each, as if no two entries ran together.
+        let (count, live_bytes) = state.live.of(tail);
+        let run = format::encoded_len(&Record::Relocated {
+            group: 0,
+            first: 0,
+            entries: &[],
+        })
+        .and_then(|len| u64::try_from(len).ok())
+        .ok_or(LogError::Config("a relocated record's header"))?;
+        let copies = count
+            .checked_mul(run)
+            .and_then(|h| h.checked_add(live_bytes));
         let room = u64::try_from(self.capacity).unwrap_or(u64::MAX);
-        Ok(usable < 2 && state.segments.live.len() > 1 && live_bytes < room)
+        let Some(copies) = copies.filter(|&c| c <= room) else {
+            return Ok(false);
+        };
+        let frame = u64::try_from(FRAME_HEADER_LEN)
+            .ok()
+            .and_then(|h| h.checked_add(copies))
+            .and_then(|len| self.shared.align.up_u64(len))
+            .ok_or(LogError::Damaged("a frame past u64"))?;
+        // A tail copied into a frame as large as its own frames frees one segment and fills
+        // as much of another: no room is made, and the writer once swept every segment in turn
+        // while the updates waiting never fitted beside the copies.
+        Ok(frame < state.live.used(tail))
     }
 
     /// Lays copies of every live piece of the tail into the payload.
@@ -662,9 +723,11 @@ impl<F: BlockFile> Writer<F> {
     }
 
     /// Where the next frame of `payload_len` bytes goes: the head, or a segment opened for
-    /// it. The last free segment is kept for a frame that names a later tail, whose
-    /// durability frees one. `None` when no segment can take it.
-    fn target(&self, payload_len: usize, advances: bool) -> Result<Option<Target>, LogError> {
+    /// it. The last free segment is kept for a frame that makes room, and while no segment is
+    /// free the head's room is too, so that the compaction or the tail's advance a full log
+    /// waits for always has somewhere to go (docs/design/raft-log.md §5). `None` when no
+    /// segment can take it.
+    fn target(&self, payload_len: usize, makes_room: bool) -> Result<Option<Target>, LogError> {
         let shared = &self.shared;
         let block = block(shared)?;
         let frame_len = FRAME_HEADER_LEN
@@ -677,10 +740,12 @@ impl<F: BlockFile> Writer<F> {
         let head_end = slot_start(shared, head.slot)?
             .checked_add(shared.config.segment_bytes)
             .ok_or(LogError::Damaged("an offset past u64"))?;
+        let usable = usable_segments(&state, shared.config.max_segments);
         if head
             .offset
             .checked_add(frame_len)
             .is_some_and(|end| end <= head_end)
+            && (usable > 0 || makes_room)
         {
             return Ok(Some(Target {
                 slot: head.slot,
@@ -691,8 +756,7 @@ impl<F: BlockFile> Writer<F> {
                 opens: false,
             }));
         }
-        let usable = usable_segments(&state, shared.config.max_segments);
-        if usable == 0 || (usable == 1 && !advances) {
+        if usable == 0 || (usable == 1 && !makes_room) {
             return Ok(None);
         }
         let reusable = state
@@ -837,6 +901,7 @@ impl<F: BlockFile> Writer<F> {
             if let Some(entry) = state.segments.nonce.get_mut(slot) {
                 *entry = target.nonce;
             }
+            state.live.open(target.slot);
             state.segments.free.retain(|(s, _)| *s != target.slot);
             state.segments.live.push_back(target.slot);
             state.next_incarnation = state
@@ -844,6 +909,7 @@ impl<F: BlockFile> Writer<F> {
                 .checked_add(1)
                 .ok_or(LogError::Damaged("incarnations past u64"))?;
         }
+        state.live.wrote(target.slot, target.frame_len);
         let sequence = state.next_sequence;
         state.durable = sequence;
         state.durable_tail = tail;
@@ -1306,6 +1372,19 @@ fn slot_mut(g: &mut Group, index: u64) -> Option<&mut Slot> {
 
 fn proposal_bytes(bytes: &[u8]) -> u64 {
     entry_bytes(u32::try_from(bytes.len()).unwrap_or(u32::MAX)).saturating_add(PROPOSAL_EXTRA)
+}
+
+/// Whether an update only frees what its group holds: a removal, a damage fence, or a new start
+/// that writes no entry or proposal, as a compaction or a snapshot's install does. Such a frame
+/// may take the room the log keeps for making room (docs/design/raft-log.md §5).
+fn frees(update: &Update, marks: crate::Marks) -> bool {
+    if update.remove || marks.damaged {
+        return true;
+    }
+    update.start.is_some()
+        && update.proposals.is_empty()
+        && marks.uncertain.is_none()
+        && update.entries.as_ref().is_none_or(|e| e.entries.is_empty())
 }
 
 /// Whether `s` may be written as the group stands, and whether it makes a new group.

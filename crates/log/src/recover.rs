@@ -539,12 +539,15 @@ pub(crate) fn open<F: BlockFile>(
     let mut replayed: HashMap<u128, Replayed> = HashMap::new();
     let mut expected: Option<u64> = None;
     let mut frames = 0u64;
+    // The bytes each live segment's frames take, padded, by slot: one entry for each of the
+    // log's segments at most.
+    let mut used: HashMap<u32, u64> = HashMap::new();
     for inc in last.tail..=highest {
         let slot = *by_incarnation
             .get(&inc)
             .ok_or(LogError::Damaged("a live segment is missing"))?;
         let mut held = 0u64;
-        let (end, invalid) = frames_of(&mut reader, inc, &mut |offset, header, bytes, _| {
+        let (end, invalid) = frames_of(&mut reader, inc, &mut |offset, header, bytes, padded| {
             if expected.is_some_and(|e| e != header.sequence) {
                 return Err(LogError::Damaged("a frame is missing"));
             }
@@ -559,6 +562,8 @@ pub(crate) fn open<F: BlockFile>(
             let base = offset
                 .checked_add(FRAME_HEADER_BYTES)
                 .ok_or(LogError::Damaged("an offset past u64"))?;
+            let bytes_used = used.entry(slot).or_insert(0);
+            *bytes_used = bytes_used.saturating_add(padded);
             replay(&mut replayed, slot, base, records)
         })?;
         // A segment's header is flushed with its first frame, so a live segment before the
@@ -630,6 +635,9 @@ pub(crate) fn open<F: BlockFile>(
     }
     for &place in fenced.values() {
         live.add(place, state::DAMAGED_BYTES);
+    }
+    for (&slot, &bytes) in &used {
+        live.wrote(slot, bytes);
     }
 
     // 5. The block where the next frame goes is erased. A frame there was never acknowledged

@@ -2082,6 +2082,157 @@ fn a_group_just_served_waits_behind_one_that_was_not() {
     assert_eq!(log.view(1).unwrap().unwrap().last, 2);
 }
 
+/// A log whose every segment holds live records answers `Full`, and never goes on sweeping
+/// without making room: once groups compact, the next write goes in (docs/design/raft-log.md
+/// §5). The writer's frames and reads are counted, so a writer that loops without answering
+/// fails the test rather than hanging it: a sweep reads its segment, and writes a frame.
+#[test]
+fn a_log_whose_segments_are_all_live_answers_full() {
+    for (seed, (blocks, segments, len)) in (60..).zip([
+        (4, 4, 7 << 10),
+        (4, 4, 1 << 10),
+        (4, 8, 7 << 10),
+        (16, 4, 1 << 10),
+    ]) {
+        let file = Counting::new(sim(seed));
+        let log = Log::create(Arc::clone(&file), config(blocks, segments), ID).unwrap();
+        // The answer, or `None` once the writer has gone past what one update takes: one
+        // frame, which sweeps at most once, and a sweep reads its segment in two reads at most
+        // (raft-log.md §6).
+        let write = |update: Update| -> Option<Result<(), LogError>> {
+            file.take();
+            let pending = log.submit(1, update).unwrap();
+            let before = log.flushed().0;
+            let mut reads = 0;
+            loop {
+                if let Some(answer) = pending.poll() {
+                    return Some(answer);
+                }
+                reads += file.take().0;
+                if reads > 2 || log.flushed().0 > before + 2 {
+                    return None;
+                }
+                std::thread::yield_now();
+            }
+        };
+        let looping = format!(
+            "{blocks}-block segments, {segments} of them, {len}-byte entries: \
+             the writer loops without answering"
+        );
+        let mut index = 1;
+        let full = loop {
+            let update = Update {
+                entries: Some(Entries {
+                    first: index,
+                    entries: vec![Entry {
+                        term: 1,
+                        bytes: Arc::from(vec![b'x'; len]),
+                    }],
+                }),
+                ..Update::default()
+            };
+            match write(update) {
+                Some(Ok(())) => index += 1,
+                Some(Err(e)) => break e,
+                None => {
+                    // Dropping the log would join a writer that never returns.
+                    let _ = std::mem::ManuallyDrop::new(log);
+                    panic!("{looping}");
+                }
+            }
+        };
+        assert!(matches!(full, LogError::Full), "{full}");
+        assert!(index > 1, "nothing written before the log filled");
+        // The group compacts everything it wrote, and the log makes room again.
+        let compact = Update {
+            start: Some(Start {
+                index: index - 1,
+                term: 1,
+            }),
+            ..Update::default()
+        };
+        let next = Update {
+            entries: Some(entries(index, &[1])),
+            ..Update::default()
+        };
+        for update in [compact, next] {
+            match write(update) {
+                Some(answer) => answer.unwrap(),
+                None => {
+                    let _ = std::mem::ManuallyDrop::new(log);
+                    panic!("{looping}");
+                }
+            }
+        }
+        assert_eq!(log.view(1).unwrap().unwrap().last, index);
+    }
+}
+
+/// While no segment is free, the head's room is kept for frames that make room: a full log
+/// whose groups compact a little and then write again until refused still takes the
+/// compaction that frees it (docs/design/raft-log.md §5).
+#[test]
+fn a_full_log_keeps_room_for_the_compaction_it_waits_for() {
+    let log = Log::create(sim(70), config(4, 4), ID).unwrap();
+    let one = |index: u64| Update {
+        entries: Some(Entries {
+            first: index,
+            entries: vec![Entry {
+                term: 1,
+                bytes: Arc::from(vec![b'x'; 1 << 10]),
+            }],
+        }),
+        ..Update::default()
+    };
+    let compact = |index: u64| Update {
+        start: Some(Start { index, term: 1 }),
+        ..Update::default()
+    };
+    let mut index = 1;
+    let fill = |index: &mut u64| loop {
+        match log.write(1, one(*index)) {
+            Ok(()) => *index += 1,
+            Err(LogError::Full) => return,
+            Err(e) => panic!("{e}"),
+        }
+    };
+    fill(&mut index);
+    // A compaction that frees no segment: the oldest entry only.
+    log.write(1, compact(1)).unwrap();
+    fill(&mut index);
+    log.write(1, compact(index - 1)).unwrap();
+    log.write(1, one(index)).unwrap();
+    assert_eq!(log.view(1).unwrap().unwrap().last, index);
+}
+
+/// A reopened log sweeps the segments it recovered as the writer swept those it wrote: it
+/// knows the bytes their frames take. Frames of one small entry each fill segments that a
+/// sweep packs into one frame, and the log fills no sooner for having been reopened.
+#[test]
+fn a_reopened_log_sweeps_the_segments_it_recovered() {
+    let file = sim(71);
+    let settings = config(16, 8);
+    let mut models = Models::new();
+    let write = |log: &Log<Arc<SimFile>>, models: &mut Models, n: u64| {
+        let u = Update {
+            entries: Some(entries(n, &[1])),
+            ..Update::default()
+        };
+        apply(models, 1, &u);
+        log.write(1, u).unwrap();
+    };
+    let log = Log::create(Arc::clone(&file), settings, ID).unwrap();
+    for n in 1..=100u64 {
+        write(&log, &mut models, n);
+    }
+    drop(log);
+    let (log, _) = Log::open(Arc::clone(&file), settings, ID).unwrap();
+    for n in 101..=200u64 {
+        write(&log, &mut models, n);
+    }
+    check(&log, &models);
+}
+
 #[test]
 fn another_log_or_geometry_is_refused() {
     let file = sim(9);

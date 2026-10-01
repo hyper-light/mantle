@@ -3,7 +3,7 @@
 
 use mantle_disk::DiskError;
 use mantle_disk::block::BlockFile;
-use mantle_disk::buf::{AlignedBuf, Alignment};
+use mantle_disk::buf::AlignedBuf;
 
 use crate::frame::{self, FrameHeader, LogRecord};
 use crate::layout::{Geometry, MAX_FRAME_BYTES};
@@ -180,20 +180,6 @@ impl<'a, F: BlockFile> Frames<'a, F> {
         let to = usize::try_from(end.saturating_sub(self.start)).unwrap_or(usize::MAX);
         Ok(self.window.as_slice().get(from..to))
     }
-}
-
-/// Copies an encoded frame into an aligned buffer and writes it at `pos`.
-pub fn write_frame<F: BlockFile>(
-    file: &F,
-    geometry: &Geometry,
-    pos: u64,
-    encoded: &[u8],
-    align: Alignment,
-) -> Result<(), DiskError> {
-    let mut buf = AlignedBuf::zeroed(encoded.len(), align)?;
-    buf.extend_from_slice(encoded)?;
-    let at = geometry.log_offset.saturating_add(pos);
-    file.write_all_at(buf.as_slice(), at)
 }
 
 #[cfg(test)]

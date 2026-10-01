@@ -94,6 +94,24 @@ impl DeviceFile {
         &self.path
     }
 
+    /// A second handle to the same open file (`dup` on Unix, `DuplicateHandle` on Windows,
+    /// through `File::try_clone`): it shares the open file description, so its direct-I/O
+    /// setting, and its positional writes and flushes are the file's own.
+    pub fn try_clone(&self) -> Result<Self, DiskError> {
+        let file = self.file.try_clone().map_err(|source| DiskError::Io {
+            op: "duplicate",
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(Self {
+            file,
+            path: self.path.clone(),
+            caching: self.caching,
+            align: self.align,
+            node: self.node,
+        })
+    }
+
     pub fn caching(&self) -> Caching {
         self.caching
     }

@@ -380,6 +380,24 @@ passes on all six CI targets.
    rollback per issuer (node.md §1.2; chunk-store.md §4). Done when 100 volumes on one device run
    on one issuer and its pool, the process thread count matches `3C + D + Σ p_i`, and the
    chunk store's crash soak passes unchanged.
+   *Writes through the issuer done on macOS (2026-10-01)*: `mantle_disk::issuer` is one thread
+   and a pool of `min(device queue, measured depth, thread budget left)` blocking workers per
+   device, all started when the device opens (`issuer::depth`; one worker on a device
+   calibration has not measured). Every write and flush of every volume goes through it: a
+   batch's regions and frame together, its one flush only once all have completed and only if
+   all succeeded; index frames written alone, checkpoints, superblocks and the format's
+   pre-write likewise. `write_together` and its thread per region are gone. Files are
+   duplicated into an arena the issuer's thread owns and its scoped workers borrow; no `Arc`.
+   `tests/issuer.rs` ran batches of up to 21 writes on a depth-4 issuer at 9 threads idle and 9
+   while writing, at most 4 in flight; a failed region fails its batch with no flush;
+   `bench::tests::clients_cost_no_threads` ran 18 and 180 clients closed and 180 open at 27
+   threads each. Batch latency before and after: measurements/2026-10-01-device-issuer.md.
+   *Remaining*: each volume's writer, cleaner and scrubber are still threads of their own, not
+   state machines on the issuer's thread, so the count is `2V` or `3V` plus `D + Σ p_i`, not yet
+   `3C + D + Σ p_i`; the Raft log's writer does not go through the issuer; startup rollback is
+   still each volume's own; io_uring on Linux and the completion port on Windows are not built,
+   the pool runs there (node.md §1.2); the 100-volume test is not written; reads go through the
+   issuer with item 5.
 5. **The device dispatcher**: start-tag order across tenants and principals, in-flight budget
    `D_b`, `D_n` and dispatch unit `u` from calibration, background shares, the log, engines and
    chunks of a laptop's one device under one authority (node.md §2.7; chunk-store.md §4, §7).

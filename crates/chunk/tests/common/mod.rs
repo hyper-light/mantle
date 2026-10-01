@@ -6,11 +6,19 @@
     clippy::cast_possible_truncation
 )]
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use mantle_chunk::{ChunkError, ChunkKey, Config, Limits, Reads, Volume};
 use mantle_disk::buf::Alignment;
+use mantle_disk::issuer::Issuer;
 use mantle_disk::sim::SimFile;
+
+/// The issuer of the one device every volume of a test binary is on, as a device's volumes
+/// share one, keeping four transfers in flight, as a device measured there.
+pub fn issuer() -> &'static Issuer {
+    static ISSUER: OnceLock<Issuer> = OnceLock::new();
+    ISSUER.get_or_init(|| Issuer::start(std::path::Path::new("test device"), 4).unwrap())
+}
 
 /// A small compact volume: 256 KiB segments, 4 KiB checksum blocks, a short log so tests
 /// reach checkpoints and wrap-around quickly.

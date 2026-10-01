@@ -24,6 +24,20 @@ pub trait BlockFile: Send + Sync {
     /// Makes every completed write durable. A failure leaves durability of those writes
     /// unknown (Rebello et al., ATC 2020): the caller must stop trusting what it wrote.
     fn sync_data(&self) -> Result<(), DiskError>;
+
+    /// A second handle to the same file, whose writes and flushes are the file's own: what a
+    /// volume hands its device's issuer while it keeps reading through its own handle
+    /// (crate::issuer). A file that has no second handle refuses.
+    fn try_clone(&self) -> Result<Self, DiskError>
+    where
+        Self: Sized,
+    {
+        Err(DiskError::Io {
+            op: "duplicate a file handle",
+            path: std::path::PathBuf::new(),
+            source: std::io::Error::from(std::io::ErrorKind::Unsupported),
+        })
+    }
 }
 
 impl BlockFile for DeviceFile {
@@ -46,6 +60,10 @@ impl BlockFile for DeviceFile {
     fn sync_data(&self) -> Result<(), DiskError> {
         DeviceFile::sync_data(self)
     }
+
+    fn try_clone(&self) -> Result<Self, DiskError> {
+        DeviceFile::try_clone(self)
+    }
 }
 
 impl<T: BlockFile + ?Sized> BlockFile for std::sync::Arc<T> {
@@ -67,5 +85,9 @@ impl<T: BlockFile + ?Sized> BlockFile for std::sync::Arc<T> {
 
     fn sync_data(&self) -> Result<(), DiskError> {
         (**self).sync_data()
+    }
+
+    fn try_clone(&self) -> Result<Self, DiskError> {
+        Ok(std::sync::Arc::clone(self))
     }
 }

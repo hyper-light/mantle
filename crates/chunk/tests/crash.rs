@@ -32,7 +32,7 @@ mod common;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use common::{SIZE, config, data, key, sim};
+use common::{SIZE, config, data, issuer, key, sim};
 use mantle_chunk::{ChunkError, ChunkKey, Volume};
 use mantle_disk::sim::{Crash, Fault, SimFile};
 
@@ -214,7 +214,7 @@ fn check(v: &Volume<Arc<SimFile>>, models: &[Model], damaged: &[ChunkKey], seed:
 
 fn run(seed: u64, writers: u64, crash: Crash) {
     let file = sim(seed);
-    let v = Volume::format(Arc::clone(&file), SIZE, config()).unwrap();
+    let v = Volume::format(issuer(), Arc::clone(&file), SIZE, config()).unwrap();
     let mut rng = Rng(seed);
     file.inject(Fault::PowerCut {
         ops: rng.below(400),
@@ -240,7 +240,7 @@ fn run(seed: u64, writers: u64, crash: Crash) {
     file.crash(crash).unwrap();
     file.clear_faults().unwrap();
 
-    let (v, report) = Volume::open(Arc::clone(&file), config())
+    let (v, report) = Volume::open(issuer(), Arc::clone(&file), config())
         .unwrap_or_else(|e| panic!("seed {seed}: recovery refused the volume: {e}"));
     if std::env::var("MANTLE_CRASH_TRACE").is_ok() {
         eprintln!("recovery: {report:?}");
@@ -282,7 +282,7 @@ fn run(seed: u64, writers: u64, crash: Crash) {
     let fresh = key(999_999);
     v.put(fresh, &data(seed, 5000)).unwrap();
     drop(v);
-    let (v, _) = Volume::open(Arc::clone(&file), config()).unwrap();
+    let (v, _) = Volume::open(issuer(), Arc::clone(&file), config()).unwrap();
     check(&v, &models, &report.damaged, seed);
     assert_eq!(v.read(&fresh, 0, 5000).unwrap(), data(seed, 5000));
 }

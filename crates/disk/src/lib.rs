@@ -23,6 +23,7 @@ pub mod histogram;
 pub mod identity;
 #[cfg(all(target_vendor = "apple", any(test, feature = "sim")))]
 pub mod image;
+pub mod issuer;
 pub mod measure;
 mod node;
 pub mod probe;

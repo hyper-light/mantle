@@ -49,6 +49,7 @@ use mantle_disk::buf::{AlignedBuf, Alignment};
 use mantle_disk::calibrate::{self, Calibration};
 use mantle_disk::file::{CachingRequest, DeviceFile};
 use mantle_disk::histogram::Histogram;
+use mantle_disk::issuer::{self, Issuer};
 use mantle_disk::measure::SplitMix64;
 use mantle_disk::rounds::{self, Order, Policy};
 use mantle_disk::scratch::Scratch;
@@ -228,6 +229,7 @@ pub fn chunk(out: &mut impl Write, path: &Path, options: &Options) -> Result<(),
     // decides; without one it is not pre-written and reads one at a time.
     let mut prewrite = false;
     let mut reads = Reads::default();
+    let mut measured = None;
     if !options.skip_device {
         writeln!(out, "measuring the device (about 30 s)")?;
         out.flush()?;
@@ -250,9 +252,11 @@ pub fn chunk(out: &mut impl Write, path: &Path, options: &Options) -> Result<(),
                 .and_then(|(d, l)| d.checked_mul(l))
                 .unwrap_or(u64::MAX);
             reads = Reads::measured(random.depth, bytes, device.read_gap().unwrap_or(0));
+            measured = Some(random.depth);
         }
     }
-    run(out, path, align, &plan, prewrite, reads)
+    let depth = issuer::depth(id.queue_depth, measured);
+    run(out, path, align, &plan, prewrite, reads, depth)
 }
 
 pub(crate) fn report_device(out: &mut impl Write, c: &Calibration) -> std::io::Result<()> {
@@ -316,9 +320,13 @@ fn run(
     plan: &Plan,
     prewrite: bool,
     reads: Reads,
+    depth: usize,
 ) -> Result<(), Error> {
     let scratch = Scratch::create(dir, ".mantle-bench").map_err(Error::Disk)?;
     let path = scratch.path();
+    // The device's issuer, which every write of the volume goes through, at the depth where
+    // the device's throughput stopped growing (docs/design/node.md §1.2).
+    let issuer = Issuer::start(path, depth).map_err(Error::Disk)?;
     let file =
         DeviceFile::open(path, false, CachingRequest::PreferDirect, align).map_err(Error::Disk)?;
     let volume = align.down_u64(plan.volume);
@@ -340,7 +348,7 @@ fn run(
         reads,
         ..defaults
     };
-    let v = Volume::format(file, volume, config).map_err(Error::Chunk)?;
+    let v = Volume::format(&issuer, file, volume, config).map_err(Error::Chunk)?;
     // Every chunk must fit a segment's record.
     let largest = v.max_payload();
     for &size in &plan.sizes {
@@ -356,8 +364,8 @@ fn run(
     writeln!(
         out,
         "chunk store on a {} volume of {} segments of {} in a scratch file (removed \
-         afterwards){}, reading {} at a time with {} more let wait, and through at most {} of a \
-         record to reach its range",
+         afterwards){}, writing {} at a time, reading {} at a time with {} more let wait, and \
+         through at most {} of a record to reach its range",
         display::capacity(volume),
         segments,
         display::size(usize::try_from(config.segment_size).unwrap_or(usize::MAX)),
@@ -366,6 +374,7 @@ fn run(
         } else {
             ""
         },
+        issuer.depth(),
         reads.depth,
         reads.waiting,
         display::capacity(reads.gap)
@@ -493,7 +502,7 @@ fn run(
     let file =
         DeviceFile::open(path, false, CachingRequest::PreferDirect, align).map_err(Error::Disk)?;
     let started = Instant::now();
-    let (v, report) = Volume::open(file, config).map_err(Error::Chunk)?;
+    let (v, report) = Volume::open(&issuer, file, config).map_err(Error::Chunk)?;
     writeln!(
         out,
         "  reopened       in {}, replaying {} index frames of a {} log",
@@ -1132,11 +1141,12 @@ mod tests {
             &plan,
             false,
             Reads::measured(4, 4 << 20, 0),
+            4,
         )
         .unwrap();
         let text = String::from_utf8(out).unwrap();
         for name in [
-            "reading 4 at a time with 4 more let wait",
+            "writing 4 at a time, reading 4 at a time with 4 more let wait",
             "first pass",
             "put 4 KiB",
             "get 4 KiB",
@@ -1187,7 +1197,9 @@ mod tests {
             scrub_period: None,
             ..Config::default()
         };
-        let v = Volume::format(file, size, config).unwrap();
+        // As a device measured at four in flight.
+        let issuer = Issuer::start(&path, 4).unwrap();
+        let v = Volume::format(&issuer, file, size, config).unwrap();
         let cores = drive::drivers(usize::MAX);
         let mut seen = Vec::new();
         for (point, (clients, rate)) in [

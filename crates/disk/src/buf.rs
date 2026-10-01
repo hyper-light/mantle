@@ -367,7 +367,7 @@ impl Pool {
 
     /// Keeps `buf` for reuse while the pool's limit holds what it allocated. A buffer of no
     /// capacity has nothing to reuse and is not kept.
-    fn give(&self, buf: AlignedBuf) {
+    pub fn give(&self, buf: AlignedBuf) {
         let capacity = buf.capacity();
         if capacity == 0 || capacity > self.largest || buf.alignment() != self.align {
             return;
@@ -388,6 +388,13 @@ impl Pool {
 pub struct PoolBuf<'a> {
     pool: &'a Pool,
     buf: Option<AlignedBuf>,
+}
+
+impl PoolBuf<'_> {
+    /// The buffer itself, to hand to another thread; [`Pool::give`] takes it back.
+    pub fn into_inner(mut self) -> AlignedBuf {
+        self.buf.take().unwrap_or_else(AlignedBuf::empty)
+    }
 }
 
 impl std::ops::Deref for PoolBuf<'_> {

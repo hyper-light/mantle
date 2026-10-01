@@ -55,8 +55,8 @@ threads grow (26 §4.2).
 | Network runtime | a tokio multi-thread runtime, one worker per core the process is granted | QUIC connections and the datagram plane (§3), SWIM, HTTP connections (§4), the drivers of each S3 request, the routing layer (§5), clients and connections as tasks |
 | Metadata shards | one per granted core | range replicas: stepping, ticking, proposing, `begin`, applying, serving confirmed reads (§2) |
 | Coding pool | one per granted core | erasure encoding and decoding of whole blocks, block checksums, the write path's inverse checks (§5.6) |
-| Device issuers | one per physical device | every volume's writer, cleaner and scrubber and the device's Raft log writer, as state machines (chunk-store.md §4; raft-log.md §3); the device's dispatcher (§2.7) |
-| Device pools | per device, at most the device's measured depth, only where the platform has no asynchronous interface the device can use (below) | blocking reads, writes and flushes the issuer hands them |
+| Device issuers | one per physical device | every volume's writer, cleaner and scrubber and the device's Raft log writer, as state machines (chunk-store.md §4; raft-log.md §3); the device's dispatcher (§2.7). As built: every volume's writes and flushes, dispatched to the device's pool; the writers, cleaners and scrubbers are still threads of their own (STATUS item 4) |
+| Device pools | per device, at most the device's measured depth, only where the platform has no asynchronous interface the device can use (below) | blocking reads, writes and flushes the issuer hands them. As built: the volumes' writes and flushes, on every platform (below) |
 | Engine background | flush and compaction pools shared by every engine instance on the node (24 §4.7, engine P14), whose file I/O goes through the device's dispatcher | the engine's own background work |
 
 With `C` granted cores, `D` physical devices and pools of `p_i` workers, the process's
@@ -81,6 +81,13 @@ path per platform from laptop to fleet, where one chosen by scale would run the 
 the fleet does not, and because the native path is the more efficient at any size. SQPOLL and
 its polling core are used only where the node's measured CPU per I/O shows a core's worth of
 saving (26 §7).
+
+*As built (2026-10-01).* `mantle_disk::issuer` is the pool path, and it runs on every
+platform: io_uring on Linux and the completion port on Windows are not yet built, so Linux and
+Windows keep their depth with blocked workers as macOS does. The issuer's thread and its
+`min(device queue, measured depth, budget left)` workers start when the device opens and draw
+on the process budget before any starts; a device calibration has not measured runs one worker
+(`issuer::depth`), as its reads go one at a time (chunk-store.md §7).
 
 **A process thread budget.** Every pool draws from one budget, decided before any thread
 starts, so devices times depth cannot add up past it. On macOS its ceiling is the OS's own

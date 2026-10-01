@@ -330,10 +330,26 @@ a device, and the device's Raft log writer where the device holds metadata, are 
 run by that device's issuer thread, which submits their I/O through the platform's asynchronous
 interface or the device's bounded pool of blocking workers (node.md §1.2). Each was a thread of
 its own, three per volume, 300 at 100 volumes (audit §14.1), and `write_together` started a
-scoped thread for each region of a batch after the first; neither grows with volumes or batches
-now (research/26 §4.7, recommendation 7). The issuer owns its volumes from the moment it starts
-them, so a start the operating system refuses part way stops what it started, in reverse, before
-the error returns, and nothing is left holding the device (audit S12).
+scoped thread for each region of a batch after the first: a thread start on the write path,
+whose count grew with load (research/26 §4.7, recommendation 7). The issuer owns its volumes from
+the moment it starts them, so a start the operating system refuses part way stops what it
+started, in reverse, before the error returns, and nothing is left holding the device (audit
+S12).
+
+*As built (2026-10-01; STATUS item 4).* Every write and flush of every volume on a device goes
+through the device's issuer (`mantle_disk::issuer`): one thread and a pool of blocking workers,
+all started when the device opens, `min(the device's reported queue, the depth calibration
+measured throughput to stop growing at, the process's thread budget)` of them (node.md §1.2).
+A volume attaches a second handle to its file and hands the issuer a batch's regions and frame
+together; the issuer issues them as deep as its workers go, and once all have completed, and
+only if all succeeded, the batch's one flush, then answers. A failed region fails its batch
+with no flush issued, and the writer fences the volume. Index frames written alone, checkpoints,
+superblocks and the pre-write at format go the same way. No thread starts for a batch or a
+region: at four workers, batches of 32 regions ran with the process's thread count unchanged
+(`tests/issuer.rs`). The writer, cleaner and scrubber are still threads of each volume, two or
+three per volume, not yet state machines on the issuer's thread; the cleaner's relocations
+reach the device through the writer's batches and the scrubber writes nothing. A refused start
+is still unwound by the volume itself (`Volume::start`).
 
 A failed write or flush fences the volume: the batch fails, no later request is accepted,
 and the volume must be reopened and recovered. A failed flush is never retried, because

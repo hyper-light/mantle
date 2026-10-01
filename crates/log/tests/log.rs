@@ -1480,15 +1480,33 @@ fn stale_frames_in_a_reused_slot_prove_nothing() {
 /// in a flush while it queues submissions behind it.
 struct Gated {
     file: Arc<SimFile>,
-    gate: std::sync::Mutex<(bool, u64)>,
+    /// Whether the gate is open, the flushes held at it, and the latest round whose plug was
+    /// answered (`Told`).
+    gate: std::sync::Mutex<(bool, u64, u64)>,
     changed: std::sync::Condvar,
+}
+
+/// A plug's waker: tells the gate that round `.1`'s plug was answered, so a round waits for the
+/// plug's flush or its answer, whichever comes; a log full of what the groups keep refuses the
+/// plug with no frame written, and no flush ever comes.
+struct Told(Arc<Gated>, u64);
+
+impl std::task::Wake for Told {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        let mut gate = self.0.gate.lock().unwrap();
+        gate.2 = gate.2.max(self.1);
+        self.0.changed.notify_all();
+    }
 }
 
 impl Gated {
     fn new(file: Arc<SimFile>) -> Arc<Self> {
         Arc::new(Self {
             file,
-            gate: std::sync::Mutex::new((true, 0)),
+            gate: std::sync::Mutex::new((true, 0, 0)),
             changed: std::sync::Condvar::new(),
         })
     }
@@ -1511,6 +1529,16 @@ impl Gated {
         while gate.1 == 0 {
             gate = self.changed.wait(gate).unwrap();
         }
+    }
+
+    /// Waits until a flush is held at the shut gate, or round `round`'s plug is answered
+    /// without one; whether a flush is held.
+    fn held_or_told(&self, round: u64) -> bool {
+        let mut gate = self.gate.lock().unwrap();
+        while gate.1 == 0 && gate.2 < round {
+            gate = self.changed.wait(gate).unwrap();
+        }
+        gate.1 > 0
     }
 }
 
@@ -2554,10 +2582,13 @@ proptest! {
             hard_state: Some(hard(1, 0)),
             ..Update::default()
         };
-        for round in &rounds {
+        for (number, round) in (1u64..).zip(&rounds) {
             let shut = gated.shut();
-            let plugged = log.submit(99, plug.clone()).unwrap();
-            gated.held();
+            let told = std::task::Waker::from(Arc::new(Told(Arc::clone(&gated), number)));
+            let plugged = log.submit_waking(99, mantle_log::Class::Normal, plug.clone(), told).unwrap();
+            // A log full of what the groups keep refuses the plug Full (or Backlog) and writes
+            // no frame: the round then runs unheld (hyper-log 02d19cb found this hang).
+            gated.held_or_told(number);
             let mut predicted = models.clone();
             let mut submitted = Vec::new();
             for (step, size) in round {
@@ -2578,8 +2609,11 @@ proptest! {
                 submitted.push((group, u, pending));
             }
             drop(shut);
-            plugged.wait().unwrap();
-            apply(&mut models, 99, &plug);
+            match plugged.wait() {
+                Ok(()) => apply(&mut models, 99, &plug),
+                Err(LogError::Full | LogError::Backlog(_)) => {}
+                Err(e) => return Err(TestCaseError::fail(format!("{e}"))),
+            }
             for (group, u, pending) in submitted {
                 match pending.wait() {
                     Ok(()) => apply(&mut models, group, &u),

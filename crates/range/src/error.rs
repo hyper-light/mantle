@@ -14,6 +14,20 @@ pub enum ReplicaError {
     /// it stops and recovers from its durable state or its peers.
     #[error("the replica stopped: {0}")]
     Stopped(String),
+    /// The member's log failed to make a write durable, a failed write or flush that fenced
+    /// it, or refused one for a reason no retry clears: what the failed write carried may be
+    /// on the device or not, so the member takes no call that could acknowledge anything
+    /// again. Every call answers this until the node reopens the log, from what its device
+    /// kept, and opens the member afresh; the group goes on without it meanwhile
+    /// (docs/design/replica.md §3, audit S04).
+    #[error("the replica is fenced: {0}")]
+    Fenced(String),
+    /// The group's records on this member's log are damaged (docs/design/raft-log.md §6),
+    /// or its log lost entries its engine had applied: the member does not open under its
+    /// identity, which may have voted in terms the log no longer shows. It is quarantined,
+    /// and rebuilt from its peers under a new identity ([`crate::Replica::rebuild`]).
+    #[error("the member's log is damaged; it is rebuilt from its peers under a new identity")]
+    Damaged,
     /// The replica waits for room in its log to make a ready durable: until the group or its
     /// neighbours on the log compact, it takes no call but `drive` and `compact`.
     #[error("the replica waits for room in its log")]

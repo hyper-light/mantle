@@ -149,6 +149,29 @@ leaving about 170 a run flushing across a step, and checks linearizability as be
 the node's scheduler owes the ranges it drives, time for heartbeats, reads and applying
 beside the flushes it waits on, is the node's, which is not built (STATUS).
 
+**A write the log cannot make durable.** A refusal for room leaves the `Ready` waiting, whole,
+as step 3 says: the log wrote nothing of it, and room another write frees lets it go on
+(`Backlog`, `Full`, `TooManyGroups`, `Busy`). Anything else the log answers a part with, a
+failed write or flush above all, fences the replica. A failed flush leaves each sector it
+covered durable or not while reads return the new bytes (Rebello et al., ATC 2020;
+research/03 §6), so nothing the process holds says what the device kept, and the log has
+fenced itself too. The replica drops the `Ready`, whose acknowledgements wait for the
+write, with the messages, ticks and reports held for it, and from then on every call that
+could acknowledge anything or move its state, `tick`, `step`, `propose`, `propose_change`,
+`read_index`, `campaign`, `report_snapshot`, `compact`, `drive` and `begin`, answers
+`Fenced` with the log's cause. Before, the error went back to the caller while the core
+still counted the `Ready` out, and the calls after failed each with whatever the core made
+of that. The node reopens the log, which recovers what is durable (raft-log.md §6), and opens
+the member afresh from it; the group goes on without it meanwhile.
+`a_failed_flush_fences_the_member_and_the_group_goes_on_without_it` and
+`a_failed_write_fences_the_member_and_the_group_goes_on_without_it` fail the device of a
+follower, then of the leader: the member sends no acknowledgement of the entry its write
+held, every call answers `Fenced`, and the other two elect a leader where needed and commit.
+`a_ready_refused_for_room_waits_until_the_group_compacts`,
+`a_ready_refused_for_a_full_log_waits_until_another_group_compacts` and
+`a_ready_refused_for_want_of_a_group_waits_until_one_leaves` show the refusals for room
+leave the member unfenced, waiting with its `Ready`, and going on once room is freed.
+
 **What comes while a `Ready` flushes.** focal-raft's core takes no call while a `Ready` is
 out: every mutation returns `Invariant("an operation while a ready is out")`, and
 `advance_append` refuses a term or vote that moved meanwhile (07 §1.2; focal-raft
@@ -265,6 +288,72 @@ covers is in the log, since terms never fall along a log (Ongaro and Ousterhout,
 leader reaches it. The simulation found that withholding every vote, or stopping the timer
 instead, left a group with one member lost and one uncertain unable to elect anyone.
 
+**Damage and its repair.** Alagappan et al. (FAST 2018, "AGL+18"; research/03 §AGL+18)
+compare what a replicated log can do with a member whose storage is damaged. Crashing the
+member is safe and leaves it down for good; truncating its log, or wiping it and restarting
+it as a voter, is unsafe, since a member that forgets an entry it acknowledged can form a
+majority with members that never had it; marking it non-voting loses its promises; and
+reconfiguring it out needs a majority to commit the change (AGL+18-F1). Their protocol,
+CTRL, repairs the member in place instead. It tells a crash from damage by a persist record
+per entry, keeps its node-specific state, term and vote, in two copies because no peer holds
+it, and has a damaged follower name its faulty entries to the leader, which sends them
+again, while a leader with faulty entries learns from its followers whether each was
+committed before it serves (AGL+18-F3 to F6). Where both copies of the node-specific state
+are lost it crashes the node. Its guarantee: a committed entry with a correct copy anywhere
+is recovered, or the group waits for it (AGL+18 §3.2).
+
+A member here is repaired in place wherever what it lost is replicated state, and replaced
+only where it lost its own promises, which no peer holds:
+
+- *Entries lost, hard state whole.* The log restores the term and vote of a lost last frame
+  from its persist record and marks the entries (raft-log.md §6). The member keeps its
+  identity. Where CTRL asks its peers entry by entry, the member judges votes against the
+  last entry it acknowledged and does not lead while marked (above). A candidate behind the
+  mark would need a majority that lacks an entry this member may have helped commit, which is
+  the question CTRL's `dontHave` majority answers, and the two wait in the same cases: where
+  no correct copy of the entry answers, neither elects.
+- *The leader counts what the member lost.* A leader's record of what a member holds only
+  rises: focal-raft's `Progress::maybe_decrease_to`, as raft-rs's, never sends below it, and
+  takes a refusal at or below it for a stale one. A member that acknowledged entry 39 and lost
+  it was therefore never sent it again while that leader led, and stayed one entry behind
+  for good; seed 64 of the simulation, once damage at rest was in its faults, found it. As in
+  CTRL, the member names what it lacks. A heartbeat carries the leader's commit capped at
+  its record of the member (focal-raft `raft.rs`, the heartbeat's `commit`), so one naming a
+  commit past the member's log shows the leader counts entries the member lost; a member
+  loses what it acknowledged only by damage, so only a marked one can see this. It answers
+  with a refusal through its mark asking for a snapshot that reaches it, the
+  `request_snapshot` refusal focal-raft ports from raft-rs, which a leader takes at or above
+  its record. The leader prepares a snapshot that reaches the request once it has applied
+  that far, one for each request past the last, and the member installs it, which ends the
+  mark. CTRL sends the faulty entries alone, kilobytes against a snapshot's image
+  (AGL+18-F9); the core offers no way to send below the record, and a range's image is
+  bounded by its split size, so the snapshot is the repair until the core has one.
+  `Replica::repair`, `serve_requests`.
+- *The engine applied entries the log lost.* A member that made its rows durable past what
+  the damaged log kept holds committed state, and its hard state is whole. It keeps its
+  identity: its log starts at the engine's index, as after an install, and the mark stays.
+  The start needs that entry's term, which the core checks a leader's appends against, and
+  the log no longer holds it. Terms never fall along a log, and the mark carries its own
+  entry's term, so the term is known where the engine's index is the mark's, or where the
+  last entry left is of the mark's term (Ongaro and Ousterhout, ATC 2014, §5.3). Elsewhere the
+  member is rebuilt, below. `a_member_whose_engine_applied_what_its_damaged_log_lost_keeps_its_identity_when_it_can`
+  checks both sides of that line;
+  `a_member_whose_engine_applied_what_its_damaged_log_lost_is_repaired_in_place` repairs such a
+  member in a group of three, every acknowledgement it sends naming only entries its log
+  holds.
+- *Promises lost.* A group whose lost frame held fast-track proposals, which its persist
+  record does not carry, or whose records do not run unbroken, is damaged: the log serves it
+  to no one (raft-log.md §6). What the member promised, a vote or an approval at an index, is
+  its own; forgotten, it could promise the opposite in the same term, and no peer can say what
+  it promised. CTRL crashes such a node. The member here does not open under its identity
+  (`ReplicaError::Damaged`); the node rebuilds it under a new one on the same device
+  (`Replica::rebuild`, §6), which is safe where wiping it as a voter is not (AGL+18-F1;
+  research/03 R7.4) and brings the group back to full strength where a crash leaves it short.
+- *The whole log damaged.* A frame that no longer reads with a later frame after it fails the
+  log's open (raft-log.md §6), for every group on the device; the device is replaced, and each
+  member on it with it, as a member lost for good (§6). CTRL would repair such a frame's entries
+  from peers in place (§7).
+
 ## 5. Testing
 
 Replicas are tested in deterministic simulation (`crates/range/tests/sim.rs`). Three
@@ -278,7 +367,13 @@ after them, so each member's next tick and the messages delivered to it come whi
 which fences a node's log and takes the node down until it restarts from what the device
 kept. Once or twice a run a member is lost for good, its device and engine with it, and a
 member under a new identity replaces it as §6 describes; a second loss waits for the first
-replacement to finish. Members' clocks step forward and back by up to two seconds, and a leader stamps the entries
+replacement to finish. A down member's device is damaged at rest now and then, one bit of
+one of its log's frames flipped on the medium, as §4 describes: its last frame, which its
+restart restores and marks, and the member is repaired in place; its last frame after it takes
+a fast-track proposal of its own, which leaves its group damaged, and the member is rebuilt
+under a new identity on its device; or an earlier frame, which leaves its log damaged, and the
+device is replaced. One member's data is short or being rebuilt at a time, the most a group
+of three survives, and no member is lost for good meanwhile. Members' clocks step forward and back by up to two seconds, and a leader stamps the entries
 it proposes with its own time. Replicas compact at random, so lagging
 members, new ones among them, are caught up by snapshot. Three gateways, each with its own session, put
 and get two keys at once. Puts go through the log, retried through leader changes with the
@@ -294,6 +389,16 @@ must hold:
   Horn and Kroening's WGL search (06 §A6.8);
 - every member's configuration names the live members as its voters, and nothing else, and
   every run finished at least one replacement.
+
+A run settles only once every member marked by damage has been repaired, its log holding
+again what it acknowledged, and each run checks that every mark it made ended. With damage
+at rest in the faults, 6,000 seeds are linearizable and live: 5,022 frames damaged, 255
+members marked and all 255 repaired in place, 103 of them with an engine past their log kept
+under their identity, 1,681 members rebuilt on their device and 1,262 devices replaced
+(`MANTLE_SIM_SEEDS=6000`, one ready a drive, 2026-09-30, this machine, 103 s). The same
+seeds pass with 64 readies a drive: how many a drive takes only splits the work across
+calls. A mark can end while its member is down, the entries written back by a drive whose
+flush then failed, and is seen ended at the restart.
 
 A soak of 20,000 seeds passes, with thousands of fenced logs among them, and with 39,948
 members lost for good and replaced: two in every run but 52. Failed flushes exposed an
@@ -346,6 +451,17 @@ loses with its leadership, is proposed again, and one already applied never is:
    old half had lost two of its three members, so they could elect no one. Once every voter
    knows, losing any one member leaves voters that elect under the final configuration.
 
+A member whose group its log found damaged is rebuilt the same way on its own device
+(`Replica::rebuild`): the group's records are removed, which is all the log takes of a
+damaged group, a member under a new identity opens there from a new engine, and the leader
+runs the replacement of the damaged identity by the new one. The damaged identity never opens
+again, since it may have voted in terms its log no longer shows; the node records the new
+identity as the group's member on the device before the removal, so a restart after it opens
+the new one again. `a_member_whose_group_was_damaged_at_rest_is_rebuilt_from_its_peers`
+damages a member's last frame holding a proposal: its open answers `Damaged`, the group goes
+on, the rebuilt member catches up and replaces it, and every entry any member applied is
+held, with its answers, on every member after.
+
 The snapshot a replica prepares for lagging members names the configuration it was prepared
 at, and a member refuses a snapshot that does not name it. A member added after the leader
 last compacted could therefore never be caught up by that snapshot. When an applied change
@@ -378,6 +494,19 @@ change. Membership changes are rare, so this costs one image each.
   heartbeats, votes and answers beside its appends are few. The node's measured flush times
   against its tick should confirm it; until then a flush that outlasts it refuses messages
   past the bound, which Raft's retries cover, and the simulation counts those refusals.
+- A frame damaged with a later one after it fails the whole log's open, and every member on
+  the device is replaced (§4). CTRL repairs such entries in place from peers, the persist
+  record naming what the frame held (AGL+18-F5, F6); the log would report the groups the frame
+  touched as marked through its entries rather than refusing to open, which is the log's
+  (raft-log.md §6).
+- A log that has refused `Full` does not recover room for a frame larger than about a quarter
+  of its room, even once every other record in it is compacted dead: no frame is written
+  after, so no sweep frees a segment (a probe of the log at 2026-09-30, reported to the log).
+  `a_ready_refused_for_a_full_log_waits_until_another_group_compacts` uses entries of a
+  quarter of a frame until it does.
+- The repair of a member its leader counts past its log ships a snapshot, where CTRL ships the
+  faulty entries (§4). Sending below a member's record needs the core to take a refusal that
+  names a regression, which focal-raft does not.
 - Proposals, reads and campaigns are refused with `Stalled` while a ready is out, and their
   callers retry. A node whose ranges are always flushing under load needs them held as
   messages are, or a scheduler that gives each range a moment between readies (§3).

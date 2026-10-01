@@ -389,9 +389,13 @@ fn a_leader_sends_while_it_flushes_and_a_follower_acknowledges_after() {
     }
     assert_eq!(nodes[0].0.applied(), applied);
     nodes[0].1.shut(false);
-    let out = nodes[0].0.drive().unwrap();
-    assert!(nodes[0].0.applied() > applied, "{out:?}");
-    for m in out.messages {
+    // A drive takes one ready: the one flushing, then the one the acknowledgements made.
+    let mut messages = Vec::new();
+    for _ in 0..2 {
+        messages.extend(nodes[0].0.drive().unwrap().messages);
+    }
+    assert!(nodes[0].0.applied() > applied, "{messages:?}");
+    for m in messages {
         let _ = nodes[usize::try_from(m.to).unwrap() - 1].0.step(m);
     }
     deliver(&mut nodes);
@@ -1226,15 +1230,18 @@ fn ticks_while_a_ready_flushes_still_count() {
         nodes[0].replica.tick().unwrap();
     }
     nodes[0].replica.wait_persisted();
-    let out = nodes[0].replica.drive().unwrap();
-    let mut to: Vec<u64> = out
-        .messages
+    // A drive takes one ready: the one flushing, then the one its held ticks made.
+    let mut messages = Vec::new();
+    for _ in 0..2 {
+        messages.extend(nodes[0].replica.drive().unwrap().messages);
+    }
+    let mut to: Vec<u64> = messages
         .iter()
         .filter(|m| kind(m) == Some(mantle_range::MessageType::MsgHeartbeat))
         .map(|m| m.to)
         .collect();
     to.sort_unstable();
-    assert_eq!(to, [2, 3], "{:?}", out.messages);
+    assert_eq!(to, [2, 3], "{messages:?}");
 }
 
 /// Ticks held while a ready flushes stop at the longest election timeout the core draws: the
@@ -1305,4 +1312,873 @@ fn reads_of_a_round_no_quorum_confirms_go_back_to_their_callers() {
         given_back.extend(out.unconfirmed);
     }
     assert_eq!(given_back, [b"lost".to_vec()]);
+}
+
+/// Members of a group of three, each with its own device and log, found by identity: a
+/// member rebuilt under a new identity keeps its device.
+///
+/// A device is shared between the test, which injects faults into it and damages its medium,
+/// and its log, whose writer thread holds it: `Log` takes its file by value, `'static`, so
+/// the test cannot lend it one. A log is shared between its member, as `Replica::open` takes
+/// it, and the test, which reads what it holds; a stopped member's log is `None`.
+struct Devices {
+    files: Vec<Arc<SimFile>>,
+    logs: Vec<Option<Arc<Log<Arc<SimFile>>>>>,
+    nodes: Vec<Node>,
+}
+
+fn log_id(slot: usize) -> u128 {
+    0x6c6f67 + u128::try_from(slot).unwrap() + 1
+}
+
+impl Devices {
+    fn new(seed: u64) -> Self {
+        let files: Vec<Arc<SimFile>> = (0..3)
+            .map(|i| {
+                Arc::new(
+                    SimFile::new(
+                        Alignment::new(4096).unwrap(),
+                        Alignment::new(512).unwrap(),
+                        seed + i,
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect();
+        let logs: Vec<Option<Arc<Log<Arc<SimFile>>>>> = files
+            .iter()
+            .enumerate()
+            .map(|(slot, f)| {
+                Some(Arc::new(
+                    Log::create(Arc::clone(f), log_config(), log_id(slot)).unwrap(),
+                ))
+            })
+            .collect();
+        let nodes = logs
+            .iter()
+            .flatten()
+            .zip(1u64..)
+            .map(|(log, id)| Node {
+                replica: Replica::open(
+                    id,
+                    GROUP,
+                    Arc::clone(log),
+                    first_range(),
+                    &range(),
+                    seed + id,
+                )
+                .unwrap(),
+            })
+            .collect();
+        Self { files, logs, nodes }
+    }
+
+    /// Stops the member in `slot`, as a crash does once its log and engine are durable: its
+    /// engine, which the caller keeps or drops, comes back.
+    fn stop(&mut self, slot: usize) -> Model {
+        let old = std::mem::replace(&mut self.nodes[slot], node(9, 9));
+        self.logs[slot] = None;
+        old.replica.into_engine()
+    }
+
+    fn slot(&self, id: u64) -> Option<usize> {
+        self.nodes.iter().position(|n| n.replica.id() == id)
+    }
+
+    /// Drives every member but those in `out` until no message is left in flight, delivering
+    /// in order: each applied entry's answers go to `answers` by member.
+    fn settle(&mut self, out: &[u64], answers: &mut Vec<(u64, u64, Vec<Answer>)>) {
+        self.settle_checking(out, answers, |_, _| {});
+    }
+
+    /// As `settle`, showing `check` every message a member sends, with that member's log.
+    fn settle_checking(
+        &mut self,
+        out: &[u64],
+        answers: &mut Vec<(u64, u64, Vec<Answer>)>,
+        mut check: impl FnMut(&Message, &Log<Arc<SimFile>>),
+    ) {
+        let mut wire: VecDeque<Message> = VecDeque::new();
+        for _ in 0..10_000 {
+            for (n, log) in self.nodes.iter_mut().zip(&self.logs) {
+                let id = n.replica.id();
+                if out.contains(&id) {
+                    continue;
+                }
+                let drove = n.replica.drive().unwrap();
+                if let Some(log) = log {
+                    for m in &drove.messages {
+                        check(m, log);
+                    }
+                }
+                wire.extend(drove.messages);
+                answers.extend(drove.applied.into_iter().map(|a| {
+                    (
+                        id,
+                        a.index,
+                        a.answers.into_iter().map(|(_, _, x)| x).collect(),
+                    )
+                }));
+            }
+            let Some(m) = wire.pop_front() else {
+                return;
+            };
+            if out.contains(&m.to) {
+                continue;
+            }
+            if let Some(slot) = self.slot(m.to) {
+                // A message the core refuses changes nothing.
+                let _ = self.nodes[slot].replica.step(m);
+            }
+        }
+        panic!("the group never settled");
+    }
+
+    /// Ticks every member but those in `out` for a heartbeat, then settles.
+    fn beat(&mut self, out: &[u64], answers: &mut Vec<(u64, u64, Vec<Answer>)>) {
+        for n in &mut self.nodes {
+            if !out.contains(&n.replica.id()) {
+                for _ in 0..SETTINGS.heartbeat_tick {
+                    n.replica.tick().unwrap();
+                }
+            }
+        }
+        self.settle(out, answers);
+    }
+
+    /// The member among those not in `out` that leads, once one does.
+    fn leader(&mut self, out: &[u64], answers: &mut Vec<(u64, u64, Vec<Answer>)>) -> usize {
+        for _ in 0..10 * SETTINGS.election_tick {
+            if let Some(slot) = self
+                .nodes
+                .iter()
+                .position(|n| !out.contains(&n.replica.id()) && n.replica.is_leader())
+            {
+                return slot;
+            }
+            self.beat(out, answers);
+        }
+        panic!("no leader among the members left");
+    }
+}
+
+fn registration(serial: u64) -> Entry {
+    Entry {
+        at_ns: 10,
+        commands: vec![Sessioned {
+            session: 0,
+            serial,
+            unanswered: 0,
+            command: Command::Register,
+        }],
+    }
+}
+
+/// Every member's answers at each index, which must agree with every other's.
+fn agreed(answers: &[(u64, u64, Vec<Answer>)]) -> std::collections::BTreeMap<u64, Vec<Answer>> {
+    let mut by_index = std::collections::BTreeMap::new();
+    for (id, index, a) in answers {
+        let first = by_index.entry(*index).or_insert_with(|| a.clone());
+        assert_eq!(first, a, "member {id} applied index {index} another way");
+    }
+    by_index
+}
+
+/// A member whose device fails the write or flush of a ready: the member is fenced. The call
+/// that met the failure answers `Fenced`, the member sent no acknowledgement of what that
+/// ready held, and every later call that could acknowledge anything or move its state
+/// answers `Fenced` too: ticks, messages, proposals, changes, reads, campaigns, snapshot
+/// reports, compaction and drives. The two others go on without it, electing a leader if it
+/// led, and commit. A log that only refused the ready for room leaves the member waiting with
+/// it instead (`a_ready_refused_for_room_waits_until_the_group_compacts` and those after it).
+fn a_durability_failure_fences(fault: &mantle_disk::sim::Fault, failing: u64) {
+    use mantle_range::{ConfChangeV2, MessageType, ReplicaError};
+
+    let mut d = Devices::new(60 + failing);
+    let mut answers = Vec::new();
+    d.nodes[0].replica.campaign().unwrap();
+    d.settle(&[], &mut answers);
+    d.nodes[0].replica.propose(&registration(0)).unwrap();
+    d.settle(&[], &mut answers);
+    let before = d.nodes[0].replica.applied();
+
+    let slot = d.slot(failing).unwrap();
+    d.files[slot].inject(fault.clone()).unwrap();
+    d.nodes[0].replica.propose(&registration(1)).unwrap();
+    let entry = before + 1;
+    // Drive in order, as `settle` does, until the failing member meets its fault.
+    let mut wire: VecDeque<Message> = VecDeque::new();
+    let mut failure = None;
+    'drive: for _ in 0..1_000 {
+        for n in &mut d.nodes {
+            match n.replica.drive() {
+                Ok(out) => {
+                    if n.replica.id() == failing {
+                        // An acknowledgement of the entry leaves only once it is durable.
+                        assert!(
+                            !out.messages.iter().any(|m| {
+                                m.msg_type == MessageType::MsgAppendResponse as i32
+                                    && !m.reject
+                                    && m.index >= entry
+                            }),
+                            "the failing member acknowledged the entry"
+                        );
+                    }
+                    wire.extend(out.messages);
+                }
+                Err(e) => {
+                    assert_eq!(n.replica.id(), failing, "{e}");
+                    failure = Some(e);
+                    break 'drive;
+                }
+            }
+        }
+        let Some(m) = wire.pop_front() else {
+            break;
+        };
+        if let Some(to) = d.slot(m.to) {
+            let _ = d.nodes[to].replica.step(m);
+        }
+    }
+    assert!(
+        matches!(failure, Some(ReplicaError::Fenced(_))),
+        "{failure:?}"
+    );
+    let fenced = &mut d.nodes[slot].replica;
+    assert!(fenced.is_fenced());
+    let heartbeat = Message {
+        msg_type: MessageType::MsgHeartbeat as i32,
+        from: if failing == 1 { 2 } else { 1 },
+        to: failing,
+        term: fenced.term(),
+        ..Message::default()
+    };
+    let calls: [(&str, Result<(), ReplicaError>); 10] = [
+        ("tick", fenced.tick()),
+        ("step", fenced.step(heartbeat)),
+        ("propose", fenced.propose(&registration(2))),
+        (
+            "propose_change",
+            fenced.propose_change(&ConfChangeV2::default()),
+        ),
+        ("read_index", fenced.read_index(b"r".to_vec())),
+        ("campaign", fenced.campaign()),
+        ("report_snapshot", fenced.report_snapshot(3, true)),
+        ("compact", fenced.compact(0)),
+        ("drive", fenced.drive().map(|_| ())),
+        ("begin", fenced.begin().map(|_| ())),
+    ];
+    for (call, result) in calls {
+        assert!(
+            matches!(result, Err(ReplicaError::Fenced(_))),
+            "{call} on a fenced member: {result:?}"
+        );
+    }
+    let applied = d.nodes[slot].replica.applied();
+
+    // The others go on without it: one leads, and an entry proposed now commits on both.
+    let out = [failing];
+    let leader = d.leader(&out, &mut answers);
+    d.nodes[leader].replica.propose(&registration(3)).unwrap();
+    d.settle(&out, &mut answers);
+    let last = d.nodes[leader].replica.applied();
+    assert!(
+        last > entry,
+        "the group committed nothing after the failure"
+    );
+    for n in &d.nodes {
+        if n.replica.id() != failing {
+            assert_eq!(n.replica.applied(), last, "member {}", n.replica.id());
+        }
+    }
+    assert_eq!(d.nodes[slot].replica.applied(), applied);
+    agreed(&answers);
+}
+
+/// A failed flush fences the member, whether it follows or leads (audit S04).
+#[test]
+fn a_failed_flush_fences_the_member_and_the_group_goes_on_without_it() {
+    for failing in [2, 1] {
+        a_durability_failure_fences(&mantle_disk::sim::Fault::SyncError, failing);
+    }
+}
+
+/// A failed write fences the member, whether it follows or leads (audit S04).
+#[test]
+fn a_failed_write_fences_the_member_and_the_group_goes_on_without_it() {
+    for failing in [2, 1] {
+        a_durability_failure_fences(&mantle_disk::sim::Fault::WriteError, failing);
+    }
+}
+
+/// A group of one on a log that holds `config`'s groups and segments. The log is shared with
+/// the test, which writes other groups to it, as `Replica::open` takes it (`Devices`).
+fn alone(config: LogConfig, settings: Settings, seed: u64) -> (Arc<Log<Arc<SimFile>>>, Member) {
+    let file = Arc::new(
+        SimFile::new(
+            Alignment::new(4096).unwrap(),
+            Alignment::new(512).unwrap(),
+            seed,
+        )
+        .unwrap(),
+    );
+    let log = Arc::new(Log::create(file, config, 0x6c6f67).unwrap());
+    let range = Range {
+        boot: ConfState {
+            voters: vec![1],
+            ..ConfState::default()
+        },
+        settings,
+        ..range()
+    };
+    let replica = Replica::open(1, GROUP, Arc::clone(&log), first_range(), &range, seed).unwrap();
+    (log, replica)
+}
+
+type Member = Replica<Arc<SimFile>, Model>;
+
+/// A log that holds all the groups it may refuses a new member's first ready: the ready
+/// waits, whole, the member is not fenced, and once another group leaves the log the next
+/// drive writes the same ready and the member goes on (audit S04).
+#[test]
+fn a_ready_refused_for_want_of_a_group_waits_until_one_leaves() {
+    let config = LogConfig {
+        max_groups: 2,
+        ..log_config()
+    };
+    let (log, mut replica) = alone(config, SETTINGS, 11);
+    for group in [7, 8] {
+        log.write(
+            group,
+            mantle_log::Update {
+                hard_state: Some(mantle_log::HardState {
+                    term: 1,
+                    vote: 0,
+                    commit: 0,
+                }),
+                ..mantle_log::Update::default()
+            },
+        )
+        .unwrap();
+    }
+    replica.campaign().unwrap();
+    let out = replica.drive().unwrap();
+    assert!(
+        matches!(out.stalled, Some(mantle_log::LogError::TooManyGroups(2))),
+        "{:?}",
+        out.stalled
+    );
+    assert!(!replica.is_fenced());
+    assert!(matches!(
+        replica.propose(&registration(0)),
+        Err(mantle_range::ReplicaError::Stalled)
+    ));
+    // Still waiting while nothing has left.
+    assert!(replica.drive().unwrap().stalled.is_some());
+    log.write(
+        7,
+        mantle_log::Update {
+            remove: true,
+            ..mantle_log::Update::default()
+        },
+    )
+    .unwrap();
+    let out = replica.drive().unwrap();
+    assert!(out.stalled.is_none(), "{:?}", out.stalled);
+    assert!(replica.is_leader());
+    let applied = replica.applied();
+    replica.propose(&registration(0)).unwrap();
+    replica.drive().unwrap();
+    assert_eq!(replica.applied(), applied + 1);
+}
+
+/// A member whose group's records on its log are damaged at rest, found when it restarts, is
+/// quarantined and rebuilt from its peers (audit S01c; raft-log.md §6, replica.md §6). Its
+/// last frame held a fast-track proposal, which a persist record does not carry, so the log
+/// fences the group and serves it to no one. The member does not open under its identity:
+/// it may have voted in terms its log no longer shows. The group goes on without it. The
+/// node rebuilds it under a new identity on the same device: the group's records are
+/// removed, a new member opens there, and the leader runs the replacement, adding it as a
+/// learner, catching it up, and swapping it for the damaged one. After, the group is whole,
+/// every member holds every entry any member applied with the same answers, and the same
+/// rows, and it goes on committing.
+#[test]
+fn a_member_whose_group_was_damaged_at_rest_is_rebuilt_from_its_peers() {
+    use mantle_range::ReplicaError;
+    use mantle_range::membership::Next;
+
+    let mut d = Devices::new(70);
+    let mut answers = Vec::new();
+    d.nodes[0].replica.campaign().unwrap();
+    d.settle(&[], &mut answers);
+    d.nodes[0].replica.propose(&registration(0)).unwrap();
+    d.settle(&[], &mut answers);
+    let agreed_now = agreed(&answers);
+    let session = agreed_now
+        .values()
+        .find_map(|a| match a[..] {
+            [Answer::Registered { session }] => Some(session),
+            _ => None,
+        })
+        .unwrap();
+    let open = Command::Name(Box::new(name::Command::Gate(GateChange {
+        bucket: "b".into(),
+        incarnation: 1,
+        attempt: 1,
+        from: None,
+        to: Some(GateState::Open),
+        generation: 1,
+    })));
+    let write = |serial: u64, command: Command| Entry {
+        at_ns: 20,
+        commands: vec![Sessioned {
+            session,
+            serial,
+            unanswered: serial,
+            command,
+        }],
+    };
+    d.nodes[0].replica.propose(&write(1, open)).unwrap();
+    d.settle(&[], &mut answers);
+    for (serial, key) in [(2, "k1"), (3, "k2")] {
+        d.nodes[0]
+            .replica
+            .propose(&write(serial, put(key)))
+            .unwrap();
+        d.settle(&[], &mut answers);
+    }
+
+    // Member 3 stops. Its last frame, as a member on the fast track leaves one, holds a
+    // proposal of its own; then that frame is damaged on the medium.
+    drop(d.stop(2));
+    let file = Arc::clone(&d.files[2]);
+    {
+        let (log, _) = Log::open(Arc::clone(&file), log_config(), log_id(2)).unwrap();
+        let view = log.view(GROUP).unwrap().unwrap();
+        let term = view.hard_state.unwrap().term;
+        log.write(
+            GROUP,
+            mantle_log::Update {
+                proposals: vec![mantle_log::Proposal {
+                    index: view.last + 1,
+                    term,
+                    bytes: Arc::from(&b"fast"[..]),
+                }],
+                ..mantle_log::Update::default()
+            },
+        )
+        .unwrap();
+    }
+    damage_last_frame(&file, log_id(2));
+
+    // It restarts: the log reports its group damaged, and the member does not open.
+    let (log, recovery) = Log::open(Arc::clone(&file), log_config(), log_id(2)).unwrap();
+    assert_eq!(recovery.damaged, vec![GROUP]);
+    let log = Arc::new(log);
+    assert!(matches!(
+        Replica::open(3, GROUP, Arc::clone(&log), first_range(), &range(), 3),
+        Err(ReplicaError::Damaged)
+    ));
+
+    // The group goes on without it.
+    let out = [3, 9];
+    d.nodes[0].replica.propose(&write(4, put("k3"))).unwrap();
+    d.settle(&out, &mut answers);
+
+    // The node rebuilds it as member 4, and the leader runs the replacement.
+    let (rebuilt, replacement) =
+        Replica::rebuild(3, 4, GROUP, Arc::clone(&log), first_range(), &range(), 4).unwrap();
+    assert_eq!(rebuilt.id(), 4);
+    d.nodes[2] = Node { replica: rebuilt };
+    d.logs[2] = Some(log);
+    let mut done = false;
+    for _ in 0..50 {
+        let leader = d.leader(&[3], &mut answers);
+        let l = &mut d.nodes[leader].replica;
+        match replacement.next(l.configuration(), l.caught_up(4), l.configuration_known()) {
+            Next::Done => {
+                done = true;
+                break;
+            }
+            Next::Wait => {}
+            Next::Propose(change) => l.propose_change(&change).unwrap(),
+        }
+        d.beat(&[3], &mut answers);
+    }
+    assert!(
+        done,
+        "the rebuild never finished: {}",
+        d.nodes[0].replica.describe()
+    );
+
+    // The group is whole again, and goes on.
+    let leader = d.leader(&[3], &mut answers);
+    d.nodes[leader]
+        .replica
+        .propose(&write(5, put("k4")))
+        .unwrap();
+    d.settle(&[3], &mut answers);
+    let want = ConfState {
+        voters: vec![1, 2, 4],
+        ..ConfState::default()
+    };
+    let by_index = agreed(&answers);
+    let last = *by_index.keys().max().unwrap();
+    let rows_of_leader = rows(d.nodes[leader].replica.engine());
+    for n in &d.nodes {
+        let r = &n.replica;
+        let mut conf = r.configuration().clone();
+        conf.voters.sort_unstable();
+        assert_eq!(conf, want, "member {}", r.id());
+        assert!(r.applied() >= last, "member {}", r.id());
+        assert_eq!(rows(r.engine()), rows_of_leader, "member {}", r.id());
+        for key in ["k1", "k2", "k3", "k4"] {
+            let current = name::current(r.engine(), "b", key).unwrap().unwrap();
+            assert_eq!(current.1.etag, key, "member {}", r.id());
+        }
+    }
+    // Every entry acknowledged before the damage is held with the answers it had then.
+    for (index, a) in agreed_now {
+        assert_eq!(by_index.get(&index), Some(&a), "index {index}");
+    }
+}
+
+/// Flips a bit of the last frame of log `id` on `file`'s medium, as damage at rest does: a
+/// fault written to the medium, so no clearing of faults heals it.
+fn damage_last_frame(file: &SimFile, id: u128) {
+    use mantle_disk::block::BlockFile;
+    use mantle_disk::buf::AlignedBuf;
+
+    let image = file.durable_image().unwrap();
+    let last_frame = image
+        .chunks(4096)
+        .enumerate()
+        .filter_map(|(i, block)| {
+            let h = mantle_log::format::FrameHeader::decode(block)?;
+            let frame = image.get(i * 4096..i * 4096 + h.frame_len()?)?;
+            (h.log == id && h.verifies(frame)).then(|| (h.sequence, i * 4096))
+        })
+        .max()
+        .unwrap()
+        .1;
+    let mut block = AlignedBuf::zeroed(4096, Alignment::new(4096).unwrap()).unwrap();
+    block.set_len(4096).unwrap();
+    file.read_exact_at(block.as_mut_slice(), last_frame as u64)
+        .unwrap();
+    block.as_mut_slice()[90] ^= 1 << 5;
+    file.write_all_at(block.as_slice(), last_frame as u64)
+        .unwrap();
+    file.sync_data().unwrap();
+}
+
+/// A member whose engine applied entries its last frame held, a frame recovery then found
+/// damaged and cut back, keeps its identity where the applied entry's term is known: its log
+/// starts at the engine's index, of that term, and its mark stays. Terms never fall along a
+/// log, so the term is known when the engine's index is the mark's, or when the last entry
+/// left is of the mark's term; otherwise the member is `Damaged` and rebuilt
+/// (docs/design/replica.md §4). Each case: the terms of entries 1 to 3, those of entries 4
+/// and 5 in the last frame, the engine's index, and the start the log takes, if any.
+#[test]
+fn a_member_whose_engine_applied_what_its_damaged_log_lost_keeps_its_identity_when_it_can() {
+    use mantle_log::{Entries, HardState, Start, Update};
+
+    let cases: [(u64, [u64; 2], u64, Option<u64>); 5] = [
+        (2, [2, 2], 4, Some(2)),
+        (2, [2, 2], 5, Some(2)),
+        (1, [1, 2], 5, Some(2)),
+        (1, [1, 2], 4, None),
+        (1, [2, 2], 4, None),
+    ];
+    for (case, (early, late, applied, start)) in cases.into_iter().enumerate() {
+        let file = Arc::new(
+            SimFile::new(
+                Alignment::new(4096).unwrap(),
+                Alignment::new(512).unwrap(),
+                80 + case as u64,
+            )
+            .unwrap(),
+        );
+        let entry = |term: u64| mantle_log::Entry {
+            term,
+            bytes: Arc::from(&[0u8, 0, 0, 0, 0][..]),
+        };
+        let voted = HardState {
+            term: 2,
+            vote: 1,
+            commit: 0,
+        };
+        {
+            let log = Log::create(Arc::clone(&file), log_config(), 0x6c6f67).unwrap();
+            log.write(
+                GROUP,
+                Update {
+                    entries: Some(Entries {
+                        first: 1,
+                        entries: vec![entry(early); 3],
+                    }),
+                    hard_state: Some(HardState { commit: 3, ..voted }),
+                    ..Update::default()
+                },
+            )
+            .unwrap();
+            log.write(
+                GROUP,
+                Update {
+                    entries: Some(Entries {
+                        first: 4,
+                        entries: late.iter().map(|&t| entry(t)).collect(),
+                    }),
+                    hard_state: Some(HardState { commit: 5, ..voted }),
+                    ..Update::default()
+                },
+            )
+            .unwrap();
+        }
+        damage_last_frame(&file, 0x6c6f67);
+        let (log, recovery) = Log::open(Arc::clone(&file), log_config(), 0x6c6f67).unwrap();
+        assert_eq!(recovery.restored, vec![GROUP], "case {case}");
+        let mark = Start {
+            index: 5,
+            term: late[1],
+        };
+        let view = log.view(GROUP).unwrap().unwrap();
+        assert_eq!((view.last, view.uncertain), (3, Some(mark)), "case {case}");
+        let log = Arc::new(log);
+        // The engine made its rows durable through `applied`.
+        let mut engine = first_range();
+        for index in 1..=applied {
+            engine.apply(index, &[]).unwrap();
+        }
+        engine.persist().unwrap();
+        let opened = Replica::open(1, GROUP, Arc::clone(&log), engine, &range(), 1);
+        match start {
+            Some(term) => {
+                let mut member = opened.unwrap_or_else(|e| panic!("case {case}: {e}"));
+                let view = log.view(GROUP).unwrap().unwrap();
+                assert_eq!(
+                    view.start,
+                    Start {
+                        index: applied,
+                        term
+                    },
+                    "case {case}"
+                );
+                assert_eq!(view.last, applied, "case {case}");
+                assert_eq!(
+                    view.hard_state.map(|h| (h.term, h.vote, h.commit)),
+                    Some((voted.term, voted.vote, applied)),
+                    "case {case}"
+                );
+                // The mark stays while the log lacks an entry it covers.
+                assert_eq!(member.is_uncertain().unwrap(), applied < mark.index);
+                assert_eq!(member.applied(), applied);
+            }
+            None => assert!(
+                matches!(opened, Err(mantle_range::ReplicaError::Damaged)),
+                "case {case}: {:?}",
+                opened.err()
+            ),
+        }
+    }
+}
+
+/// A member of a group of three applies an entry its last frame held, makes its rows durable,
+/// and stops; the frame is damaged at rest. It reopens in place, under its identity, its log
+/// starting at the entry its engine applied, and the group repairs it from its peers: every
+/// acknowledgement it sends names only entries its log holds, it takes the entries after, and
+/// the group, whole, commits on. No entry any member applied is lost, and every member holds
+/// the same rows (audit S01c).
+#[test]
+fn a_member_whose_engine_applied_what_its_damaged_log_lost_is_repaired_in_place() {
+    use mantle_range::MessageType;
+
+    let mut d = Devices::new(90);
+    let mut answers = Vec::new();
+    d.nodes[0].replica.campaign().unwrap();
+    d.settle(&[], &mut answers);
+    d.nodes[0].replica.propose(&registration(0)).unwrap();
+    d.settle(&[], &mut answers);
+    // Member 2 is cut off while the others commit an entry; then it takes the entry and the
+    // commit in one append, and applies it.
+    d.nodes[0].replica.propose(&registration(1)).unwrap();
+    d.settle(&[2], &mut answers);
+    let entry = d.nodes[0].replica.applied();
+    for _ in 0..4 {
+        d.beat(&[], &mut answers);
+        if d.nodes[1].replica.applied() == entry {
+            break;
+        }
+    }
+    assert_eq!(d.nodes[1].replica.applied(), entry);
+    d.nodes[1].replica.compact(u64::MAX).unwrap();
+    let engine = d.stop(1);
+    assert_eq!(engine.durable(), entry);
+    let file = Arc::clone(&d.files[1]);
+    damage_last_frame(&file, log_id(1));
+
+    let (log, recovery) = Log::open(Arc::clone(&file), log_config(), log_id(1)).unwrap();
+    assert_eq!(recovery.restored, vec![GROUP]);
+    let view = log.view(GROUP).unwrap().unwrap();
+    assert!(view.last < entry, "the lost frame held no applied entry");
+    assert_eq!(view.uncertain.map(|m| m.index), Some(entry));
+    let log = Arc::new(log);
+    let member = Replica::open(2, GROUP, Arc::clone(&log), engine, &range(), 2).unwrap();
+    assert_eq!(member.applied(), entry);
+    d.nodes[1] = Node { replica: member };
+    d.logs[1] = Some(log);
+
+    // The group goes on, and repairs it: what it acknowledges, its log holds.
+    let mut acknowledged = 0;
+    for serial in 2..5 {
+        d.nodes[0].replica.propose(&registration(serial)).unwrap();
+        d.settle_checking(&[], &mut answers, |m, log| {
+            if m.from == 2 && m.msg_type == MessageType::MsgAppendResponse as i32 && !m.reject {
+                let last = log.view(GROUP).unwrap().unwrap().last;
+                assert!(m.index <= last, "acknowledged {} holding {last}", m.index);
+                acknowledged += 1;
+            }
+        });
+    }
+    assert!(acknowledged > 0);
+    let last = d.nodes[0].replica.applied();
+    agreed(&answers);
+    for n in &d.nodes {
+        assert_eq!(n.replica.applied(), last, "member {}", n.replica.id());
+        assert_eq!(
+            rows(n.replica.engine()),
+            rows(d.nodes[0].replica.engine()),
+            "member {}",
+            n.replica.id()
+        );
+    }
+    assert!(!d.nodes[1].replica.is_uncertain().unwrap());
+}
+
+/// A log whose every segment holds live records refuses a ready it has no room for with
+/// `Full`: the ready waits, whole, the member is not fenced, and once the group holding the
+/// segments compacts, the member's next drives write the same ready and it goes on (audit
+/// S04). The log is the smallest its configuration takes, segments of four blocks, so it
+/// fills within a few frames. Every entry is a quarter of what one frame holds, as the log
+/// says (`Log::entry_room`), so several share a segment and compacting them frees one; a log
+/// refused `Full` does not yet recover room for a frame much larger than that (reported to
+/// the log, docs/design/replica.md §7).
+#[test]
+fn a_ready_refused_for_a_full_log_waits_until_another_group_compacts() {
+    let config = LogConfig {
+        segment_bytes: 4 * 4096,
+        max_segments: 4,
+        ..log_config()
+    };
+    let file = Arc::new(
+        SimFile::new(
+            Alignment::new(4096).unwrap(),
+            Alignment::new(512).unwrap(),
+            12,
+        )
+        .unwrap(),
+    );
+    // Shared with the member as `Replica::open` takes it; the test writes another group.
+    let log = Arc::new(Log::create(file, config, 0x6c6f67).unwrap());
+    let room = log.entry_room().unwrap();
+    let quarter = room / 4;
+    // An entry's encoding adds its kind and its context's length to its data.
+    let largest = u64::try_from(room).unwrap() - 5;
+    let settings = Settings {
+        max_size_per_msg: largest,
+        max_inflight_msgs: 1,
+        max_uncommitted_size: largest,
+        max_entry_bytes: largest,
+        ..SETTINGS
+    };
+    let alone = Range {
+        boot: ConfState {
+            voters: vec![1],
+            ..ConfState::default()
+        },
+        settings,
+        ..range()
+    };
+    let mut replica = Replica::open(1, GROUP, Arc::clone(&log), first_range(), &alone, 12).unwrap();
+    replica.campaign().unwrap();
+    // A drive takes one ready at least: the campaign's, then its leader's empty entry.
+    for _ in 0..2 {
+        let out = replica.drive().unwrap();
+        assert!(out.stalled.is_none(), "{:?}", out.stalled);
+    }
+    assert!(replica.is_leader());
+    // Another group's entries fill every segment with live records.
+    let mut last = 0;
+    loop {
+        let written = log.write(
+            7,
+            mantle_log::Update {
+                entries: Some(mantle_log::Entries {
+                    first: last + 1,
+                    entries: vec![mantle_log::Entry {
+                        term: 1,
+                        bytes: Arc::from(vec![7u8; quarter]),
+                    }],
+                }),
+                ..mantle_log::Update::default()
+            },
+        );
+        match written {
+            Ok(()) => last += 1,
+            Err(mantle_log::LogError::Full) => break,
+            Err(e) => panic!("{e}"),
+        }
+        assert!(
+            last <= 4 * u64::from(config.max_segments),
+            "the log never filled"
+        );
+    }
+    // An entry as large as the other group's: registrations until one more would pass it.
+    let mut many = Entry {
+        at_ns: 10,
+        commands: Vec::new(),
+    };
+    for serial in 0.. {
+        many.commands.push(Sessioned {
+            session: 0,
+            serial,
+            unanswered: 0,
+            command: Command::Register,
+        });
+        if many.encode().unwrap().len() > quarter {
+            many.commands.pop();
+            break;
+        }
+    }
+    replica.propose(&many).unwrap();
+    let applied = replica.applied();
+    let out = replica.drive().unwrap();
+    assert!(
+        matches!(out.stalled, Some(mantle_log::LogError::Full)),
+        "{:?}",
+        out.stalled
+    );
+    assert!(!replica.is_fenced());
+    assert!(matches!(
+        replica.propose(&registration(0)),
+        Err(mantle_range::ReplicaError::Stalled)
+    ));
+    // The other group compacts past everything it holds.
+    log.write(
+        7,
+        mantle_log::Update {
+            start: Some(mantle_log::Start {
+                index: last,
+                term: 1,
+            }),
+            ..mantle_log::Update::default()
+        },
+    )
+    .unwrap();
+    // The next drive writes the waiting ready, and the one after it applies the entry, which
+    // a member of one commits at once.
+    for drive in 0..2 {
+        let out = replica.drive().unwrap();
+        assert!(out.stalled.is_none(), "drive {drive}: {:?}", out.stalled);
+    }
+    assert_eq!(replica.applied(), applied + 1);
 }

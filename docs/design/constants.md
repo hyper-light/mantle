@@ -226,7 +226,7 @@ gains a basis lowers the ceiling.
 | `crates/meta/src/wire.rs` `MAX_COMMANDS` | bound | 2^16 command places per entry, so a session ID is index × 2^16 + place (session.rs `register`); the audit (§12.6) keeps it as a versioned encoding bound with byte and work budgets beside it. |
 | `crates/range/src/conf.rs` `FORMAT` | format | Version byte of the encoded configuration row. |
 | `crates/range/src/image.rs` `FORMAT` | format | Version byte of the encoded snapshot image. |
-| `crates/range/src/replica.rs` `DRIVE_BUDGET` | open | 64 readies per `drive` call; audit §12.6 calls it a counted termination guard with no wall-time or work proof and asks for slices derived from control deadlines. |
+| `crates/range/src/replica.rs` `DRIVE_BUDGET` | cited | 1 `Ready` a `drive`: the node shares its shards among ranges by deficit round robin, whose O(1) work and fairness within one unit hold when "Quantum_i ≥ Max" (Shreedhar and Varghese, Theorem 4.5; research 25 §7), and a turn's largest unit is one `Ready` (node.md §2.3). |
 | `crates/range/src/store.rs` `ENTRY_OVERHEAD` | format | An entry encoding's kind byte plus u32 context length (1 + 4), per `encode_entry`. |
 | `crates/s3/src/acl.rs` `MAX_GRANTS` | external | AWS S3 API reference via docs/research/13 §6.8: "An ACL can have up to 100 grants". |
 | `crates/s3/src/body.rs` `ACL_LIMIT` | derived | (prolog + owner fields escaped + MAX_GRANTS × GRANT); s3-protocol.md §2 gives 662,054 bytes. |
@@ -354,8 +354,6 @@ parameters. The gate does not parse these; they are kept here with the same kind
   and tolerance from the service objective they serve, or from a cited source, and a round
   budget from the time a startup may take.
 - `measure::MAX_DEPTH`: an executor credit from the node's CPU, memory and thread allowance.
-- `replica::DRIVE_BUDGET`: the node's scheduler (audit §5.1), which shares work among its
-  ranges by deadline.
 - A bucket policy's raw body limit (`policy::BODY_LIMIT`): a recording of how much white space
   S3 keeps in a policy it gives back as set.
 - The benchmarks' ladders and step lengths: the regimes each exercises, in their

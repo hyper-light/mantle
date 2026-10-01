@@ -7,7 +7,13 @@
 //! device's write or flush fails, which fences the node's log and takes the node down until
 //! it restarts from what the device kept. Once or twice a run a member is lost for good, its
 //! device and all, and a member with a new identity replaces it: added as a learner, caught
-//! up, then swapped in by one joint change (docs/design/replica.md §6). Three
+//! up, then swapped in by one joint change (docs/design/replica.md §6). A down member's
+//! device is damaged at rest now and then, a bit of one of its log's frames flipped on the
+//! medium: its last frame, which its restart restores and marks, and the member is repaired
+//! in place from its peers; its last frame holding a fast-track proposal, which leaves its
+//! group damaged, and the member is rebuilt under a new identity on its device; or an earlier
+//! frame, which leaves its whole log damaged, and the device is replaced (docs/design/replica.md
+//! §4). Three
 //! gateways, each with its own session, put and get two keys at once: puts go through the
 //! log, retried through leader changes with the session's serial numbers, and gets through
 //! the leader's ReadIndex. A run is its seed.
@@ -37,9 +43,10 @@ mod support;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use mantle_disk::buf::Alignment;
+use mantle_disk::block::BlockFile;
+use mantle_disk::buf::{AlignedBuf, Alignment};
 use mantle_disk::sim::{Crash, Fault, SimFile};
-use mantle_log::{Config as LogConfig, Log, Waits};
+use mantle_log::{Config as LogConfig, Log, LogError, Waits};
 use mantle_meta::apply::Layer;
 use mantle_meta::engine::{Engine, Model, Rows};
 use mantle_meta::name::{self, GateChange, Preconditions, Put};
@@ -135,6 +142,8 @@ type Member = Replica<Arc<SimFile>, Model>;
 
 struct Node {
     id: u64,
+    /// The identity of its log, which a member rebuilt on the same device keeps.
+    log_id: u128,
     file: Arc<SimFile>,
     /// `None` while the node is down; its engine is kept as the crash left it.
     replica: Option<Member>,
@@ -145,6 +154,41 @@ struct Node {
     members: u64,
     /// How far its clock runs ahead of the simulation's, in steps, or behind.
     skew: i64,
+    /// Its device was damaged at rest since it went down.
+    latent: bool,
+    /// What its last restart found damaged: the member is quarantined, down until the group
+    /// rebuilds it.
+    found: Option<Found>,
+    /// Whether its log may lack entries it acknowledged, as last seen.
+    uncertain: bool,
+}
+
+/// Damage a restart found.
+enum Found {
+    /// The group's records on the log, or entries its engine applied beyond the term it can
+    /// know: the member is rebuilt under a new identity on the same log. The node keeps a
+    /// handle beside the one `Replica::open` consumes, since open may answer `Damaged` only
+    /// after taking it.
+    Group(Arc<Log<Arc<SimFile>>>),
+    /// The log as a whole: the device is replaced.
+    Log,
+}
+
+/// What restarts found of damage at rest.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Damage {
+    /// Frames damaged at rest, on members down.
+    injected: u64,
+    /// Restarts whose member opened marked, and marks that ended as the group repaired it.
+    marked: u64,
+    unmarked: u64,
+    /// Members rebuilt under a new identity on their device, and devices replaced.
+    rebuilt: u64,
+    replaced: u64,
+    /// Restarts whose engine had applied entries the damaged log lost: kept in place, the
+    /// applied entry's term known, or rebuilt.
+    ahead_kept: u64,
+    ahead_rebuilt: u64,
 }
 
 fn log_id(id: u64) -> u128 {
@@ -166,12 +210,16 @@ impl Node {
             Replica::open(id, GROUP, log, first_range(), &range(members), seed ^ id).unwrap();
         Self {
             id,
+            log_id: log_id(id),
             file,
             replica: Some(replica),
             engine: None,
             lives: 0,
             members,
             skew: 0,
+            latent: false,
+            found: None,
+            uncertain: false,
         }
     }
 
@@ -186,25 +234,125 @@ impl Node {
         self.file.crash(Crash::Random).unwrap();
     }
 
-    fn restart(&mut self, seed: u64) {
+    /// Restarts from what the device and engine kept. Damage the restart finds quarantines
+    /// the member: it stays down until the group rebuilds it (`World::rebuild`).
+    fn restart(&mut self, seed: u64, damage: &mut Damage) {
         let Some(engine) = self.engine.take() else {
             return;
         };
+        let latent = std::mem::take(&mut self.latent);
         self.lives += 1;
         self.file.clear_faults().unwrap();
-        let (log, recovery) =
-            Log::open(Arc::clone(&self.file), log_config(), log_id(self.id)).unwrap();
-        assert!(recovery.damaged.is_empty(), "{recovery:?}");
-        let replica = Replica::open(
+        let (log, recovery) = match Log::open(Arc::clone(&self.file), log_config(), self.log_id) {
+            Ok(opened) => opened,
+            Err(LogError::Damaged(_)) if latent => {
+                self.found = Some(Found::Log);
+                return;
+            }
+            Err(e) => panic!("member {} reopens its log: {e}", self.id),
+        };
+        let log = Arc::new(log);
+        if !recovery.damaged.is_empty() {
+            assert!(latent && recovery.damaged == [GROUP], "{recovery:?}");
+            self.found = Some(Found::Group(log));
+            return;
+        }
+        let ahead = log
+            .view(GROUP)
+            .unwrap()
+            .is_some_and(|v| engine.applied() > v.last);
+        match Replica::open(
             self.id,
             GROUP,
-            Arc::new(log),
+            Arc::clone(&log),
             engine,
             &range(self.members),
             seed ^ self.id ^ (self.lives << 40),
-        )
-        .unwrap();
-        self.replica = Some(replica);
+        ) {
+            Ok(mut replica) => {
+                damage.ahead_kept += u64::from(ahead);
+                // A mark lasts across restarts until the group repairs the member.
+                let before = self.uncertain;
+                self.uncertain = replica.is_uncertain().unwrap();
+                if self.uncertain && !before {
+                    assert!(latent, "member {} marked with no damage", self.id);
+                    damage.marked += 1;
+                }
+                // The log reached its mark before the member went down: a drive that wrote the
+                // entries back, then met a failed flush.
+                if before && !self.uncertain {
+                    damage.unmarked += 1;
+                }
+                self.replica = Some(replica);
+            }
+            Err(ReplicaError::Damaged) if latent && ahead => {
+                damage.ahead_rebuilt += 1;
+                self.found = Some(Found::Group(log));
+            }
+            Err(e) => panic!("member {} reopens: {e}", self.id),
+        }
+    }
+
+    /// Damages a frame of the member's log at rest, the device down: a bit flipped on the
+    /// medium, which no clearing of faults heals. `kind` picks the frame: 0 its last, 1 one
+    /// before it, 2 its last after it takes a fast-track proposal of its own, which a persist
+    /// record does not carry.
+    fn damage(&mut self, kind: u64, rng: &mut Rng) {
+        self.file.clear_faults().unwrap();
+        if kind == 2 {
+            let (log, recovery) =
+                Log::open(Arc::clone(&self.file), log_config(), self.log_id).unwrap();
+            assert!(recovery.damaged.is_empty());
+            if let Some(view) = log.view(GROUP).unwrap() {
+                let term = view.hard_state.map_or(1, |h| h.term.max(1));
+                log.write(
+                    GROUP,
+                    mantle_log::Update {
+                        proposals: vec![mantle_log::Proposal {
+                            index: view.last + 1,
+                            term,
+                            bytes: Arc::from(&b"fast"[..]),
+                        }],
+                        ..mantle_log::Update::default()
+                    },
+                )
+                .unwrap();
+            }
+        }
+        let image = self.file.durable_image().unwrap();
+        let mut frames: Vec<(u64, usize, usize)> = image
+            .chunks(4096)
+            .enumerate()
+            .filter_map(|(i, block)| {
+                let h = mantle_log::format::FrameHeader::decode(block)?;
+                let len = h.frame_len()?;
+                let frame = image.get(i * 4096..i * 4096 + len)?;
+                (h.log == self.log_id && h.verifies(frame)).then(|| (h.sequence, i * 4096, len))
+            })
+            .collect();
+        frames.sort_unstable();
+        let Some(&last) = frames.last() else {
+            return;
+        };
+        let (_, at, len) = if kind == 1 && frames.len() > 1 {
+            frames[rng.below(frames.len() as u64 - 1) as usize]
+        } else {
+            last
+        };
+        // Within the frame's whole blocks, which an aligned read reaches.
+        let whole = (image.len() / 4096 * 4096).saturating_sub(at).min(len);
+        if whole == 0 {
+            return;
+        }
+        let offset = (at + rng.below(whole as u64) as usize) as u64;
+        let block = offset / 4096 * 4096;
+        let mut buf = AlignedBuf::zeroed(4096, Alignment::new(4096).unwrap()).unwrap();
+        buf.set_len(4096).unwrap();
+        self.file.read_exact_at(buf.as_mut_slice(), block).unwrap();
+        buf.as_mut_slice()[(offset - block) as usize] ^= 1 << rng.below(8);
+        self.file.write_all_at(buf.as_slice(), block).unwrap();
+        self.file.sync_data().unwrap();
+        self.latent = true;
     }
 }
 
@@ -301,6 +449,7 @@ struct World {
     held: u64,
     held_ticks: u64,
     refused: u64,
+    damage: Damage,
 }
 
 /// What a run exercised, and what its gateways saw at which steps.
@@ -315,6 +464,7 @@ struct Ran {
     held: u64,
     held_ticks: u64,
     refused: u64,
+    damage: Damage,
     steps: u64,
     history: Vec<String>,
 }
@@ -364,6 +514,7 @@ impl World {
             held: 0,
             held_ticks: 0,
             refused: 0,
+            damage: Damage::default(),
         }
     }
 
@@ -372,7 +523,7 @@ impl World {
             "members {:?}, replacing {:?}, lost {}, replaced {}",
             self.nodes
                 .iter()
-                .map(|n| (n.id, n.replica.is_some()))
+                .map(|n| (n.id, n.replica.is_some(), n.found.is_some(), n.uncertain))
                 .collect::<Vec<_>>(),
             self.replacing,
             self.lost,
@@ -401,6 +552,7 @@ impl World {
         }
         self.deliver();
         self.drive();
+        self.rebuild();
         self.replace();
         self.serve_reads();
         for g in 0..self.gateways.len() {
@@ -408,8 +560,21 @@ impl World {
         }
     }
 
+    /// Whether a member's data may be short of what it acknowledged, or is to be rebuilt:
+    /// damaged at rest and not yet restarted, marked, quarantined, or being replaced. The
+    /// simulation damages or loses one member's data at a time, the most a group of three
+    /// survives: two members short of an entry both acknowledged may leave its only copy lost
+    /// (AGL+18 §3.2).
+    fn repairing(&self) -> bool {
+        self.replacing.is_some()
+            || self
+                .nodes
+                .iter()
+                .any(|n| n.latent || n.uncertain || n.found.is_some())
+    }
+
     fn inject(&mut self) {
-        if self.replacing.is_none() && self.lost < LOSSES && self.step >= self.lose_at {
+        if !self.repairing() && self.lost < LOSSES && self.step >= self.lose_at {
             self.lose();
         }
         let i = self.rng.below(self.nodes.len() as u64) as usize;
@@ -421,9 +586,18 @@ impl World {
         if self.nodes.iter().filter(|n| n.replica.is_none()).count() >= 2 {
             self.two_down += 1;
         }
+        if self.rng.chance(3)
+            && !self.repairing()
+            && self.nodes[i].replica.is_none()
+            && self.nodes[i].engine.is_some()
+        {
+            let kind = self.rng.below(3);
+            self.nodes[i].damage(kind, &mut self.rng);
+            self.damage.injected += 1;
+        }
         if self.rng.chance(20) && self.nodes[i].replica.is_none() {
             let seed = self.seed;
-            self.nodes[i].restart(seed);
+            self.nodes[i].restart(seed, &mut self.damage);
         }
         if self.rng.chance(6) {
             // Cut one member off from the others, both ways.
@@ -457,7 +631,7 @@ impl World {
             let keep = self.rng.below(8);
             match r.compact(keep) {
                 Ok(()) => {}
-                Err(ReplicaError::Log(_)) => self.nodes[i].crash(),
+                Err(ReplicaError::Fenced(_) | ReplicaError::Log(_)) => self.nodes[i].crash(),
                 Err(e) => self.fail(&format!("compact: {e}")),
             }
         }
@@ -474,6 +648,49 @@ impl World {
         self.replacing = Some((Replacement::new(failed, joining).unwrap(), None));
         self.lost += 1;
         self.lose_at = self.step + 300 + self.rng.below(800);
+    }
+
+    /// Rebuilds a quarantined member once no replacement is under way: under a new identity,
+    /// on its device where the damage was its group's, on a new device where it was its whole
+    /// log's. The group's leader then replaces the damaged member with it.
+    fn rebuild(&mut self) {
+        if self.replacing.is_some() {
+            return;
+        }
+        let Some(i) = self.nodes.iter().position(|n| n.found.is_some()) else {
+            return;
+        };
+        let failed = self.nodes[i].id;
+        let joining = self.next_id;
+        self.next_id += 1;
+        let replacement = match self.nodes[i].found.take() {
+            Some(Found::Group(log)) => {
+                let (replica, replacement) = Replica::rebuild(
+                    failed,
+                    joining,
+                    GROUP,
+                    log,
+                    first_range(),
+                    &range(self.members),
+                    self.seed ^ joining,
+                )
+                .unwrap_or_else(|e| self.fail(&format!("rebuild {failed}: {e}")));
+                let n = &mut self.nodes[i];
+                n.id = joining;
+                n.replica = Some(replica);
+                n.lives = 0;
+                n.uncertain = false;
+                self.damage.rebuilt += 1;
+                replacement
+            }
+            Some(Found::Log) => {
+                self.nodes[i] = Node::new(joining, self.seed, self.members);
+                self.damage.replaced += 1;
+                Replacement::new(failed, joining).unwrap()
+            }
+            None => return,
+        };
+        self.replacing = Some((replacement, None));
     }
 
     /// Drives the replacement under way through whichever member leads: the change it asks
@@ -582,13 +799,13 @@ impl World {
             };
             let out = match out {
                 Ok(out) => out,
-                // A fenced log takes its node down; it restarts from what its device kept. A
-                // ready begun under faults can find its log fenced a step after they stop, and
-                // its node restarts at once, as the heal would have restarted it.
-                Err(ReplicaError::Log(_)) => {
+                // A fenced member takes its node down; it restarts from what its device kept.
+                // A ready begun under faults can find its log fenced a step after they stop,
+                // and its node restarts at once, as the heal would have restarted it.
+                Err(ReplicaError::Fenced(_)) => {
                     n.crash();
                     if !self.faults {
-                        n.restart(self.seed);
+                        n.restart(self.seed, &mut self.damage);
                     }
                     continue;
                 }
@@ -602,6 +819,11 @@ impl World {
             }
             if out.persisting {
                 self.flushing += 1;
+            }
+            // A mark ends as the group repairs the member: its log holds the entries again.
+            if n.uncertain && !r.is_uncertain().unwrap() {
+                n.uncertain = false;
+                self.damage.unmarked += 1;
             }
             sent.extend(out.messages);
             applied.extend(out.applied);
@@ -623,10 +845,10 @@ impl World {
             };
             match r.compact(keep) {
                 Ok(()) => {}
-                Err(ReplicaError::Log(_)) => {
+                Err(ReplicaError::Fenced(_) | ReplicaError::Log(_)) => {
                     n.crash();
                     if !self.faults {
-                        n.restart(self.seed);
+                        n.restart(self.seed, &mut self.damage);
                     }
                 }
                 Err(e) => self.fail(&format!("compact on {id}: {e}")),
@@ -896,7 +1118,7 @@ impl World {
         for n in &mut self.nodes {
             // A fault armed on a running node would still fire after the faults stop.
             n.file.clear_faults().unwrap();
-            n.restart(seed);
+            n.restart(seed, &mut self.damage);
         }
     }
 
@@ -913,8 +1135,11 @@ impl World {
             .iter()
             .filter_map(|n| n.replica.as_ref().map(Replica::applied))
             .collect();
+        // A member marked by damage is repaired once faults stop: its log holds what it
+        // acknowledged again.
         applied.len() == self.nodes.len()
             && applied.windows(2).all(|w| w[0] == w[1])
+            && self.nodes.iter().all(|n| !n.uncertain)
             && self.nodes.iter().all(|n| {
                 n.replica
                     .as_ref()
@@ -1065,6 +1290,10 @@ fn run(seed: u64, members: u64) -> Ran {
     if engines[1..].iter().any(|e| rows(e) != first) {
         w.fail("members hold different rows");
     }
+    // Every member marked by damage was repaired from its peers.
+    if w.damage.marked != w.damage.unmarked {
+        w.fail(&format!("marks left unrepaired: {:?}", w.damage));
+    }
     let live = w.live();
     if live.len() != w.members as usize
         || w.nodes
@@ -1104,6 +1333,7 @@ fn run(seed: u64, members: u64) -> Ran {
         held: w.held,
         held_ticks: w.held_ticks,
         refused: w.refused,
+        damage: w.damage,
         steps: w.step,
         history: w
             .history
@@ -1125,6 +1355,7 @@ fn a_group_under_faults_is_linearizable_and_applies_every_put_once() {
         .unwrap_or(1);
     let (mut replaced, mut stalls, mut flushing, mut two_down, mut duplicated) = (0, 0, 0, 0, 0);
     let (mut stepped, mut held, mut held_ticks, mut refused) = (0, 0, 0, 0);
+    let mut damage = Damage::default();
     for seed in first..first + seeds {
         // Odd seeds run a group of three, even ones of five.
         let members = if seed % 2 == 0 { 5 } else { 3 };
@@ -1141,6 +1372,13 @@ fn a_group_under_faults_is_linearizable_and_applies_every_put_once() {
         held += ran.held;
         held_ticks += ran.held_ticks;
         refused += ran.refused;
+        damage.injected += ran.damage.injected;
+        damage.marked += ran.damage.marked;
+        damage.unmarked += ran.damage.unmarked;
+        damage.rebuilt += ran.damage.rebuilt;
+        damage.replaced += ran.damage.replaced;
+        damage.ahead_kept += ran.damage.ahead_kept;
+        damage.ahead_rebuilt += ran.damage.ahead_rebuilt;
     }
     // Leaders' clocks stepped back and forth, and every run stayed linearizable.
     assert!(stepped > 0, "no clock was stepped");
@@ -1158,6 +1396,14 @@ fn a_group_under_faults_is_linearizable_and_applies_every_put_once() {
         two_down > 0 && duplicated > 0,
         "{two_down} steps two down, {duplicated} duplicated"
     );
+    // Devices were damaged at rest, and each way a restart finds damage was repaired: members
+    // marked and repaired in place, members rebuilt under a new identity on their device, and
+    // devices replaced.
+    assert!(
+        damage.marked > 0 && damage.unmarked > 0 && damage.rebuilt > 0 && damage.replaced > 0,
+        "{damage:?}"
+    );
+    eprintln!("{damage:?}");
     eprintln!(
         "{seeds} runs replaced {replaced} members lost for good; {stalls} readies waited for \
          room; {flushing} were left flushing across a step; two of five were down at {two_down} \

@@ -45,7 +45,6 @@ pub(crate) fn copy_entry(entry: &Entry) -> Result<Entry> {
         index: entry.index,
         data,
         context,
-        sync_log: entry.sync_log,
     })
 }
 /// Copies the entries after `into`'s, reserving for exactly that many: a
@@ -70,7 +69,9 @@ pub(crate) fn copy_entries(entries: &[Entry], into: &mut Vec<Entry>) -> Result<(
     Ok(())
 }
 /// Keeps as many entries as `max_bytes` of their encoding admit, and one at
-/// least: the longest prefix whose running total fits.
+/// least: the longest prefix whose running total fits. The reference the
+/// tests hold a page to; the log builds its pages by [`page_and_bytes`].
+#[cfg(test)]
 pub(crate) fn limit_bytes(entries: &mut Vec<Entry>, max_bytes: u64) {
     if entries.len() <= 1 || max_bytes == u64::MAX {
         return;
@@ -78,25 +79,87 @@ pub(crate) fn limit_bytes(entries: &mut Vec<Entry>, max_bytes: u64) {
     let kept = page_of(entries, 0, 0, max_bytes);
     entries.truncate(kept);
 }
-/// How many of `entries`, in order, a page admits that already holds
-/// `held` entries of `used` bytes: the rule of [`limit_bytes`] carried on
-/// across a boundary, so that a page is chosen before any of it is copied.
-/// Every entry is taken while the running total fits, and the first is
-/// taken whatever its bytes when the page holds nothing yet.
+/// As [`page_and_bytes`], the count alone.
+#[cfg(test)]
 pub(crate) fn page_of(entries: &[Entry], held: usize, used: u64, max_bytes: u64) -> usize {
+    page_and_bytes(entries, held, used, max_bytes).0
+}
+/// How many of `entries`, in order, a page admits that already holds
+/// `held` entries of `used` bytes: the page's rule carried on across a
+/// boundary, so that a page is chosen before any of it is copied.
+/// Every entry is taken while the running total fits, and the first is
+/// taken whatever its bytes when the page holds nothing yet. With it, the
+/// running total of the page once the entries taken are in it; with no
+/// bound the total is not counted, and is `used`.
+pub(crate) fn page_and_bytes(
+    entries: &[Entry],
+    held: usize,
+    used: u64,
+    max_bytes: u64,
+) -> (usize, u64) {
+    let (taken, bytes, _) = page_bytes_payload(entries, held, used, max_bytes, false);
+    (taken, bytes)
+}
+/// As [`page_and_bytes`], with what the buffers of the entries taken hold
+/// by capacity ([`payload_of`]) when `payload` asks for it: counted in the
+/// same walk, so that a page's entries are read once. With no bound and
+/// `payload` asked for, the running total is counted in that walk too, for
+/// the window it is charged to ([`Page::bytes`]).
+fn page_bytes_payload(
+    entries: &[Entry],
+    held: usize,
+    used: u64,
+    max_bytes: u64,
+    payload: bool,
+) -> (usize, u64, usize) {
+    let mut held_payload = 0usize;
     if max_bytes == u64::MAX {
-        return entries.len();
+        if !payload {
+            return (entries.len(), used, held_payload);
+        }
+        let (bytes, held_payload) = counted(entries, used);
+        return (entries.len(), bytes, held_payload);
     }
     let mut bytes = used;
     let mut taken = 0usize;
     for entry in entries {
-        bytes = bytes.saturating_add(proto::encoded_bytes(entry));
-        if held.saturating_add(taken) > 0 && bytes > max_bytes {
+        let next = bytes.saturating_add(proto::encoded_bytes(entry));
+        if held.saturating_add(taken) > 0 && next > max_bytes {
             break;
         }
+        bytes = next;
         taken = taken.saturating_add(1);
+        if payload {
+            held_payload = held_payload.saturating_add(payload_of(entry));
+        }
     }
-    taken
+    (taken, bytes, held_payload)
+}
+
+/// The running total of `entries`' encodings from `used`, and what their
+/// buffers hold by capacity, in one walk.
+fn counted(entries: &[Entry], used: u64) -> (u64, usize) {
+    entries
+        .iter()
+        .fold((used, 0usize), |(bytes, payload), entry| {
+            (
+                bytes.saturating_add(proto::encoded_bytes(entry)),
+                payload.saturating_add(payload_of(entry)),
+            )
+        })
+}
+
+/// A page of entries copied out of the log, what their buffers hold by
+/// capacity ([`payload_of`]), and the bytes of their encodings by the
+/// page's rule, counted as the page was chosen.
+#[derive(Debug, Default)]
+pub(crate) struct Page {
+    pub(crate) entries: Vec<Entry>,
+    pub(crate) payload: usize,
+    /// The bytes of the entries' encodings ([`proto::encoded_bytes`]): what
+    /// a member's window is charged for the page. Counted only when the
+    /// page was asked for them ([`Log::page`]); zero otherwise.
+    pub(crate) bytes: u64,
 }
 /// The bytes an entry's buffers hold, by capacity.
 pub(crate) fn payload_of(entry: &Entry) -> usize {
@@ -132,31 +195,38 @@ impl Unstable {
         self.offset
             .saturating_add(u64::try_from(self.entries.len()).unwrap_or(u64::MAX))
     }
-    fn truncate_and_append(&mut self, entries: &[Entry], limit: usize) -> Result<()> {
+    /// How many held entries an append that begins at `after` keeps: all of
+    /// them when it follows the last, none when it begins at or before the
+    /// first, and those before it otherwise.
+    fn kept_before(&self, after: u64) -> Result<usize> {
+        if after == self.end() {
+            Ok(self.entries.len())
+        } else if after <= self.offset {
+            Ok(0)
+        } else {
+            position(after, self.offset).ok_or(Error::Invariant("an index before the offset"))
+        }
+    }
+    /// Takes `entries` after what is held, replacing what they overlap.
+    /// Nothing is copied: the entries move in, and when none is kept the
+    /// entries' own buffer becomes the log's, so an append to a log that holds
+    /// nothing not yet durable allocates nothing.
+    fn truncate_and_append(&mut self, mut entries: Vec<Entry>, limit: usize) -> Result<()> {
         let Some(first) = entries.first() else {
             return Ok(());
         };
         let after = first.index;
-        let kept = if after == self.end() {
-            self.entries.len()
-        } else if after <= self.offset {
-            0
-        } else {
-            position(after, self.offset).ok_or(Error::Invariant("an index before the offset"))?
-        };
+        let kept = self.kept_before(after)?;
         if kept.saturating_add(entries.len()) > limit {
             return Err(Error::Capacity("entries not yet durable"));
         }
         // Everything that can refuse has, before anything is replaced.
-        let mut copies = Vec::new();
-        copy_entries(entries, &mut copies)?;
-        self.entries
-            .try_reserve(
-                copies
-                    .len()
-                    .saturating_sub(self.entries.len().saturating_sub(kept)),
-            )
-            .map_err(|_| Error::Memory)?;
+        if kept > 0 {
+            let replaced = self.entries.len().saturating_sub(kept);
+            self.entries
+                .try_reserve(entries.len().saturating_sub(replaced))
+                .map_err(|_| Error::Memory)?;
+        }
         if after <= self.offset && after != self.end() {
             self.offset = after;
         }
@@ -164,10 +234,14 @@ impl Unstable {
             self.bytes = self.bytes.saturating_sub(proto::approximate_bytes(&entry));
             self.payload = self.payload.saturating_sub(payload_of(&entry));
         }
-        for entry in copies {
-            self.bytes = self.bytes.saturating_add(proto::approximate_bytes(&entry));
-            self.payload = self.payload.saturating_add(payload_of(&entry));
-            self.entries.push(entry);
+        for entry in &entries {
+            self.bytes = self.bytes.saturating_add(proto::approximate_bytes(entry));
+            self.payload = self.payload.saturating_add(payload_of(entry));
+        }
+        if kept == 0 {
+            self.entries = entries;
+        } else {
+            self.entries.append(&mut entries);
         }
         Ok(())
     }
@@ -239,6 +313,30 @@ impl Unstable {
         }
         Ok(())
     }
+}
+
+/// Entries committed and durable, given to apply where storage holds them
+/// ([`Log::next_range_since`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommittedRange {
+    /// The first index of the range.
+    pub first: u64,
+    /// The last index of the range.
+    pub last: u64,
+    /// The bytes of the data of the entries of the range above the index
+    /// asked about.
+    pub data_above: usize,
+}
+
+/// What an append will do, decided before the log changes
+/// ([`Log::append_after`]).
+struct AppendPlan {
+    /// The first index the entries replace; zero when they replace none.
+    conflict: u64,
+    /// Where in the entries sent the part to append begins.
+    from: usize,
+    /// The last index sent.
+    last_new: u64,
 }
 
 /// The log of one member: storage, what follows it in memory, and the
@@ -388,6 +486,58 @@ impl<S: Storage> Log<S> {
         entries: &[Entry],
         committed_agrees: bool,
     ) -> Result<Option<(u64, u64)>> {
+        let Some(plan) = self.plan_append(index, term, entries, committed_agrees)? else {
+            return Ok(None);
+        };
+        if plan.conflict != 0 {
+            let suffix = entries
+                .get(plan.from..)
+                .ok_or(Error::Violation("entries out of order"))?;
+            let mut copies = Vec::new();
+            copy_entries(suffix, &mut copies)?;
+            self.append_owned(copies)?;
+            // What replaced a durable entry is not durable.
+            self.persisted = self.persisted.min(plan.conflict.saturating_sub(1));
+        }
+        self.commit_to(committed.min(plan.last_new))?;
+        Ok(Some((plan.conflict, plan.last_new)))
+    }
+    /// As [`Log::append_after`], taking the leader's entries: what the log
+    /// does not hold yet moves in uncopied, and what it holds is dropped.
+    pub fn append_after_owned(
+        &mut self,
+        index: u64,
+        term: u64,
+        committed: u64,
+        mut entries: Vec<Entry>,
+        committed_agrees: bool,
+    ) -> Result<Option<(u64, u64)>> {
+        let Some(plan) = self.plan_append(index, term, &entries, committed_agrees)? else {
+            return Ok(None);
+        };
+        if plan.conflict != 0 {
+            if plan.from > entries.len() {
+                return Err(Error::Violation("entries out of order"));
+            }
+            entries.drain(..plan.from);
+            self.append_owned(entries)?;
+            // What replaced a durable entry is not durable.
+            self.persisted = self.persisted.min(plan.conflict.saturating_sub(1));
+        }
+        self.commit_to(committed.min(plan.last_new))?;
+        Ok(Some((plan.conflict, plan.last_new)))
+    }
+    /// What an append of `entries` after `(index, term)` does, decided before
+    /// the log changes: `None` when the log does not hold `(index, term)`;
+    /// otherwise the first index the entries replace (zero for none), where in
+    /// `entries` the part to append begins, and the last index sent.
+    fn plan_append(
+        &self,
+        index: u64,
+        term: u64,
+        entries: &[Entry],
+        committed_agrees: bool,
+    ) -> Result<Option<AppendPlan>> {
         let agreed = if committed_agrees { self.committed } else { 0 };
         if (index > agreed || !committed_agrees) && !self.match_term(index, term) {
             return Ok(None);
@@ -396,27 +546,29 @@ impl<S: Storage> Log<S> {
             .iter()
             .take_while(|entry| entry.index <= agreed)
             .count();
-        let entries = entries.get(skipped..).unwrap_or(&[]);
+        let rest = entries.get(skipped..).unwrap_or(&[]);
         let index = index.saturating_add(u64::try_from(skipped).unwrap_or(u64::MAX));
         let last_new = index
-            .checked_add(u64::try_from(entries.len()).unwrap_or(u64::MAX))
+            .checked_add(u64::try_from(rest.len()).unwrap_or(u64::MAX))
             .ok_or(Error::Violation("an index beyond what can be counted"))?;
-        let conflict = self.find_conflict(entries);
+        let conflict = self.find_conflict(rest);
+        let mut from = entries.len();
         if conflict != 0 {
             if conflict <= self.committed {
                 return Err(Error::Violation("an entry replaces a committed one"));
             }
             let start = position(conflict, index.saturating_add(1))
                 .ok_or(Error::Violation("entries out of order"))?;
-            let suffix = entries
-                .get(start..)
+            from = skipped
+                .checked_add(start)
+                .filter(|from| *from <= entries.len())
                 .ok_or(Error::Violation("entries out of order"))?;
-            self.append(suffix)?;
-            // What replaced a durable entry is not durable.
-            self.persisted = self.persisted.min(conflict.saturating_sub(1));
         }
-        self.commit_to(committed.min(last_new))?;
-        Ok(Some((conflict, last_new)))
+        Ok(Some(AppendPlan {
+            conflict,
+            from,
+            last_new,
+        }))
     }
     /// Commits through `to`; a commit at or below the one known changes
     /// nothing, and one beyond the log is a violation.
@@ -448,6 +600,12 @@ impl<S: Storage> Log<S> {
     }
     /// The entries through `(index, term)` are handed to storage.
     pub fn stable_entries(&mut self, index: u64, term: u64) -> Result<()> {
+        self.take_stable_entries(index, term).map(drop)
+    }
+    /// As [`Log::stable_entries`], giving the entries up to the caller: the
+    /// log holds them no more, and storage, which holds them now, may keep
+    /// these very ones.
+    pub fn take_stable_entries(&mut self, index: u64, term: u64) -> Result<Vec<Entry>> {
         if self.unstable.snapshot.is_some() {
             return Err(Error::Invariant(
                 "entries made durable before their snapshot",
@@ -466,25 +624,36 @@ impl<S: Storage> Log<S> {
         self.unstable.offset = index.saturating_add(1);
         // Given up, and not emptied: a member that rests holds what it
         // held before it was written to.
-        self.unstable.entries = Vec::new();
         self.unstable.bytes = 0;
         self.unstable.payload = 0;
-        Ok(())
+        Ok(std::mem::take(&mut self.unstable.entries))
     }
     /// The snapshot at `index` is handed to storage.
     pub fn stable_snapshot(&mut self, index: u64) -> Result<()> {
-        match &self.unstable.snapshot {
-            Some(snapshot) if proto::snapshot_index(snapshot) == index => {
-                self.unstable.snapshot = None;
-                Ok(())
+        self.take_stable_snapshot(index).map(drop)
+    }
+    /// As [`Log::stable_snapshot`], giving the snapshot up to the caller.
+    pub fn take_stable_snapshot(&mut self, index: u64) -> Result<Snapshot> {
+        match self.unstable.snapshot.take() {
+            Some(snapshot) if proto::snapshot_index(&snapshot) == index => Ok(snapshot),
+            held => {
+                self.unstable.snapshot = held;
+                Err(Error::Invariant(
+                    "the snapshot made durable is not the one given",
+                ))
             }
-            _ => Err(Error::Invariant(
-                "the snapshot made durable is not the one given",
-            )),
         }
     }
-    /// Appends after what is committed, replacing what follows.
+    /// Appends a copy of `entries` after what is committed, replacing what
+    /// follows.
     pub fn append(&mut self, entries: &[Entry]) -> Result<u64> {
+        let mut copies = Vec::new();
+        copy_entries(entries, &mut copies)?;
+        self.append_owned(copies)
+    }
+    /// Appends `entries` after what is committed, replacing what follows.
+    /// They move in uncopied ([`Unstable`]).
+    pub fn append_owned(&mut self, entries: Vec<Entry>) -> Result<u64> {
         let Some(first) = entries.first() else {
             return self.last_index();
         };
@@ -502,14 +671,20 @@ impl<S: Storage> Log<S> {
     /// byte-limited page to `max_entries` would, and copies no more than
     /// the page.
     pub fn entries(&self, index: u64, max_bytes: u64, max_entries: usize) -> Result<Vec<Entry>> {
+        self.page(index, max_bytes, max_entries)
+            .map(|page| page.entries)
+    }
+    /// As [`Log::entries`], with what the page's buffers hold and the bytes
+    /// of its encodings, counted as it was chosen.
+    pub(crate) fn page(&self, index: u64, max_bytes: u64, max_entries: usize) -> Result<Page> {
         let last = self.last_index()?;
         if index > last {
-            return Ok(Vec::new());
+            return Ok(Page::default());
         }
         let high = index
             .saturating_add(u64::try_from(max_entries).unwrap_or(u64::MAX))
             .min(last.saturating_add(1));
-        self.slice(index, high, max_bytes)
+        self.slice_page(index, high, max_bytes, true)
     }
     /// Whether a log that ends at `(last_index, term)` is at least as up to
     /// date as this one (Raft §5.4.1): a later last term, or the same and
@@ -535,6 +710,56 @@ impl<S: Storage> Log<S> {
         } else {
             Ok(Vec::new())
         }
+    }
+    /// The entries after `since` that are committed and durable, as the
+    /// range of them storage holds: the page [`Log::next_entries_since`]
+    /// gives, chosen by the same rule (the longest prefix whose encoding fits
+    /// `max_bytes`, and one at least) and copied nowhere. With it, the bytes
+    /// of the data of those entries above `above`, which a leader counts
+    /// uncommitted until they are given to apply. None when there are none.
+    ///
+    /// Entries committed and durable are always in storage: `persisted` is
+    /// below the first entry not yet durable whatever replaced what, so what
+    /// is given to apply is read where storage holds it.
+    pub fn next_range_since(
+        &self,
+        since: u64,
+        max_bytes: u64,
+        above: u64,
+    ) -> Result<Option<CommittedRange>> {
+        let offset = since.saturating_add(1).max(self.first_index()?);
+        let high = self.apply_bound().saturating_add(1);
+        if high <= offset {
+            return Ok(None);
+        }
+        if high > self.unstable.offset {
+            return Err(Error::Invariant("committed entries not yet durable"));
+        }
+        let mut taken = 0u64;
+        let mut bytes = 0u64;
+        let mut data_above = 0usize;
+        self.store.any_entry(offset, high, &mut |entry| {
+            let next = bytes.saturating_add(proto::encoded_bytes(entry));
+            if taken > 0 && max_bytes != u64::MAX && next > max_bytes {
+                return true;
+            }
+            bytes = next;
+            taken = taken.saturating_add(1);
+            if entry.index > above {
+                data_above = data_above.saturating_add(entry.data.len());
+            }
+            false
+        })?;
+        let last = offset
+            .checked_add(taken)
+            .and_then(|end| end.checked_sub(1))
+            .filter(|last| *last >= offset)
+            .ok_or(Error::Invariant("storage held none of what is committed"))?;
+        Ok(Some(CommittedRange {
+            first: offset,
+            last,
+            data_above,
+        }))
     }
     /// A copy of a snapshot at `request_index` or later for the member `to`:
     /// the one not yet durable if it is late enough, else storage's.
@@ -635,15 +860,30 @@ impl<S: Storage> Log<S> {
     /// gives the whole of what was asked of it, the running total carries
     /// on into what is not yet durable, which is read where it is and
     /// copied only as far as the page reaches. The result is what copying
-    /// everything and then cutting it ([`limit_bytes`]) would give, for
+    /// everything and then cutting it would give, for
     /// both keep the longest prefix that fits and the first entry whatever
-    /// its bytes; the cut is kept after all the same, so that a storage
-    /// that gives more than its part admits is cut here.
+    /// its bytes. A storage that gives the whole of what was asked, more
+    /// than its part admits, is cut here by the same rule; every entry's
+    /// bytes are counted once.
     pub fn slice(&self, low: u64, high: u64, max_bytes: u64) -> Result<Vec<Entry>> {
+        self.slice_page(low, high, max_bytes, false)
+            .map(|page| page.entries)
+    }
+    /// As [`Log::slice`], with what the page's buffers hold by capacity,
+    /// counted in the walk that chooses it; and, when `charged`, the bytes
+    /// of its encodings ([`Page::bytes`]), which the rule counts anyway
+    /// wherever it cuts and which are counted in that same walk where it
+    /// does not.
+    fn slice_page(&self, low: u64, high: u64, max_bytes: u64, charged: bool) -> Result<Page> {
         self.bounded(low, high)?;
         let mut entries = Vec::new();
+        let mut payload = 0usize;
         if low == high {
-            return Ok(entries);
+            return Ok(Page {
+                entries,
+                payload,
+                bytes: 0,
+            });
         }
         // The bytes of the page so far, by the rule the cut counts.
         let mut used = 0u64;
@@ -653,28 +893,66 @@ impl<S: Storage> Log<S> {
                 .entries(low, stored_high, max_bytes, &mut entries)?;
             let wanted = stored_high.saturating_sub(low);
             if u64::try_from(entries.len()).unwrap_or(u64::MAX) < wanted {
-                // Storage cut the page: it is complete.
-                return Ok(entries);
-            }
-            if max_bytes != u64::MAX {
-                used = entries.iter().fold(0u64, |bytes, entry| {
-                    bytes.saturating_add(proto::encoded_bytes(entry))
+                // Storage cut the page: it is complete. Storage counted its
+                // bytes by its own walk, so they are counted here, in the
+                // walk that counts its buffers, when they are charged.
+                let bytes;
+                (bytes, payload) = if charged {
+                    counted(&entries, 0)
+                } else {
+                    let held = entries
+                        .iter()
+                        .fold(0usize, |sum, entry| sum.saturating_add(payload_of(entry)));
+                    (0, held)
+                };
+                return Ok(Page {
+                    entries,
+                    payload,
+                    bytes,
                 });
             }
+            // Storage gave all it was asked for. It is held to the rule
+            // here, once: a storage that gave more than its part admits is
+            // cut, and the page is complete; otherwise the running total
+            // carries on into what is not yet durable.
+            let (kept, bytes, held) = page_bytes_payload(&entries, 0, 0, max_bytes, true);
+            payload = held;
+            if kept < entries.len() {
+                entries.truncate(kept);
+                return Ok(Page {
+                    entries,
+                    payload,
+                    bytes,
+                });
+            }
+            used = bytes;
         }
         if high > self.unstable.offset {
             let from = low.max(self.unstable.offset);
             let tail = self.unstable.slice(from, high)?;
-            let taken = page_of(tail, entries.len(), used, max_bytes);
+            let (taken, bytes) = page_and_bytes(tail, entries.len(), used, max_bytes);
+            used = bytes;
+            // With no bound the rule counted nothing; the bytes charged are
+            // counted in the walk that copies.
+            let count = charged && max_bytes == u64::MAX;
             entries
                 .try_reserve_exact(taken)
                 .map_err(|_| Error::Memory)?;
             for entry in tail.get(..taken).unwrap_or(&[]) {
-                entries.push(copy_entry(entry)?);
+                let copy = copy_entry(entry)?;
+                payload = payload.saturating_add(payload_of(&copy));
+                if count {
+                    used = used.saturating_add(proto::encoded_bytes(&copy));
+                }
+                entries.push(copy);
             }
         }
-        limit_bytes(&mut entries, max_bytes);
-        Ok(entries)
+        // Built by the rule from end to end: nothing is left to cut.
+        Ok(Page {
+            entries,
+            payload,
+            bytes: if charged { used } else { 0 },
+        })
     }
     /// The log begins again after `snapshot`.
     pub fn restore(&mut self, snapshot: Snapshot) -> Result<()> {
@@ -726,6 +1004,9 @@ pub(crate) mod tests {
         pub entries: Vec<Entry>,
         /// What the member approved by itself.
         pub proposals: Vec<Entry>,
+        /// Gives every entry asked for, whatever the bytes: a storage that
+        /// does not page by the rule, which the log cuts.
+        pub greedy: bool,
     }
     impl Memory {
         pub fn with_voters(voters: &[u64]) -> Self {
@@ -775,7 +1056,7 @@ pub(crate) mod tests {
     impl Storage for Memory {
         fn initial_state(&self) -> std::result::Result<InitialState, StorageError> {
             Ok(InitialState {
-                hard_state: self.hard_state.clone(),
+                hard_state: self.hard_state,
                 configuration: self.configuration.clone(),
                 proposals: self.proposals.clone(),
             })
@@ -795,7 +1076,11 @@ pub(crate) mod tests {
                 return Err(StorageError::Unavailable);
             }
             let range = &self.entries[(low - first) as usize..(high - first) as usize];
-            let taken = page_of(range, 0, 0, max_bytes);
+            let taken = if self.greedy {
+                range.len()
+            } else {
+                page_of(range, 0, 0, max_bytes)
+            };
             into.try_reserve_exact(taken)
                 .map_err(|_| StorageError::Unavailable)?;
             into.extend(range[..taken].iter().cloned());
@@ -1267,6 +1552,12 @@ pub(crate) mod tests {
                 for entry in &page {
                     assert_eq!(entry.data.capacity(), entry.data.len());
                 }
+                // A leader's page is the same, with its buffers and the
+                // bytes of its encodings counted as it was chosen.
+                let counted = log.page(low, max, usize::MAX).unwrap();
+                assert_eq!(indexes(&counted.entries), indexes(&page), "{low} {max}");
+                assert_eq!(counted.bytes, encoded(&page), "{low} {max}");
+                assert_eq!(counted.payload, held(&page), "{low} {max}");
             }
         }
         // An oversized first entry is taken alone, stable or not.
@@ -1288,6 +1579,100 @@ pub(crate) mod tests {
         // What follows an oversized stable entry is left for the next page.
         assert_eq!(indexes(&log.slice(2, 5, one).unwrap()), vec![(2, 1)]);
         assert_eq!(indexes(&log.slice(2, 5, 2 * one).unwrap()), vec![(2, 1)]);
+    }
+    /// What is given to apply in place is the range of the page copies would
+    /// give, at every bound, with the data bytes above any index counted.
+    #[test]
+    fn a_range_given_to_apply_is_the_page_copies_would_give() {
+        let sized = |index: u64| Entry {
+            index,
+            term: 1,
+            data: vec![3; (index as usize % 5) * 700],
+            ..Entry::default()
+        };
+        let mut store = Memory::default();
+        store.append(&(1..=12).map(sized).collect::<Vec<_>>());
+        let mut log = Log::new(store, 1024).unwrap();
+        log.commit_to(10).unwrap();
+        let one = proto::encoded_bytes(&sized(4));
+        for since in [0, 1, 5, 9, 10] {
+            for max in [0, 1, one - 1, one, 2 * one, 3 * one + 5, u64::MAX] {
+                let copies = log.next_entries_since(since, max).unwrap();
+                let range = log.next_range_since(since, max, 6).unwrap();
+                match (copies.first(), copies.last(), range) {
+                    (None, None, None) => {}
+                    (Some(first), Some(last), Some(range)) => {
+                        assert_eq!((range.first, range.last), (first.index, last.index));
+                        let above: usize = copies
+                            .iter()
+                            .filter(|entry| entry.index > 6)
+                            .map(|entry| entry.data.len())
+                            .sum();
+                        assert_eq!(range.data_above, above, "{since} {max}");
+                    }
+                    other => panic!("{since} {max}: {other:?}"),
+                }
+            }
+        }
+        // What is committed and not yet durable is never given in place.
+        log.append(&[entry(13, 1)]).unwrap();
+        log.commit_to(13).unwrap();
+        assert_eq!(
+            log.next_range_since(10, u64::MAX, 0)
+                .unwrap()
+                .map(|r| r.last),
+            Some(12)
+        );
+    }
+    /// A storage that gives more than its part admits is cut by the rule,
+    /// and nothing not yet durable is added to a page it filled.
+    #[test]
+    fn a_storage_that_gives_too_much_is_cut_by_the_rule() {
+        let payload = |index| Entry {
+            index,
+            term: 1,
+            data: vec![7; 4096],
+            ..Entry::default()
+        };
+        let one = proto::encoded_bytes(&payload(1));
+        let mut store = Memory {
+            greedy: true,
+            ..Memory::default()
+        };
+        store.append(&(1..=6).map(payload).collect::<Vec<_>>());
+        let mut log = Log::new(store, 1024).unwrap();
+        log.append(&(7..=9).map(payload).collect::<Vec<_>>())
+            .unwrap();
+        for (low, max, expected) in [
+            (1, 2 * one, vec![(1, 1), (2, 1)]),
+            (1, one - 1, vec![(1, 1)]),
+            (5, 3 * one, vec![(5, 1), (6, 1), (7, 1)]),
+            (6, u64::MAX, (6..=9).map(|index| (index, 1)).collect()),
+        ] {
+            assert_eq!(
+                indexes(&log.slice(low, 10, max).unwrap()),
+                expected,
+                "{low} {max}"
+            );
+            let counted = log.page(low, max, usize::MAX).unwrap();
+            assert_eq!(indexes(&counted.entries), expected, "{low} {max}");
+            assert_eq!(counted.bytes, encoded(&counted.entries), "{low} {max}");
+            assert_eq!(counted.payload, held(&counted.entries), "{low} {max}");
+        }
+        // A storage that cuts the page itself: the page's bytes are counted
+        // here all the same.
+        let mut store = Memory::default();
+        store.append(&(1..=6).map(payload).collect::<Vec<_>>());
+        let log = Log::new(store, 1024).unwrap();
+        let counted = log.page(1, 2 * one, usize::MAX).unwrap();
+        assert_eq!(indexes(&counted.entries), vec![(1, 1), (2, 1)]);
+        assert_eq!(counted.bytes, 2 * one);
+    }
+    fn encoded(entries: &[Entry]) -> u64 {
+        entries.iter().map(proto::encoded_bytes).sum()
+    }
+    fn held(entries: &[Entry]) -> usize {
+        entries.iter().map(payload_of).sum()
     }
     #[test]
     fn a_rejection_names_where_the_logs_may_still_agree() {
@@ -1325,7 +1710,7 @@ pub(crate) mod tests {
             indexes(log.unstable.entries()),
             vec![(1, 1), (2, 2), (3, 2)]
         );
-        assert_eq!(log.unstable.bytes, 36);
+        assert_eq!(log.unstable.bytes, 3 * crate::wire::ENTRY_FIXED_BYTES);
         assert!(log.unstable.resident_bytes() > 0);
         assert_eq!(log.unstable.payload, 0);
         log.unstable.check().unwrap();

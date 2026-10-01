@@ -4,11 +4,11 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
-use focal_raft::proto::protocompat::PbMessageExt;
 use focal_raft::proto::{
-    self, ConfChange, ConfChangeV2, ConfState, Entry, EntryType, Message, MessageType, Snapshot,
+    self, ConfChangeV2, ConfState, Entry, EntryType, Message, MessageType, Snapshot,
     SnapshotMetadata,
 };
+use focal_raft::wire::Record;
 use focal_raft::{RawNode, StateRole};
 use mantle_disk::block::BlockFile;
 use mantle_log::{Entries, Log, LogError, Pending, Proposal, Start, Update};
@@ -211,7 +211,9 @@ struct Held {
 /// u64::MAX saturates, which passes every bound and is refused, as the true charge would be.
 fn held_bytes(message: &Message) -> u64 {
     let frame = u64::try_from(std::mem::size_of::<Message>()).unwrap_or(u64::MAX);
-    u64::from(message.compute_size()).saturating_add(frame)
+    u64::try_from(message.encoded_len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(frame)
 }
 
 /// A ready being made durable: its update's parts not yet durable, in order, each fitting a
@@ -654,12 +656,12 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
     }
 
     fn step_now(&mut self, message: Message) -> Result<(), ReplicaError> {
-        let kind = proto::message_type(&message);
+        let kind = message.msg_type;
         let requests_vote = matches!(
             kind,
-            Some(MessageType::MsgRequestVote | MessageType::MsgRequestPreVote)
+            MessageType::MsgRequestVote | MessageType::MsgRequestPreVote
         );
-        let transfers = matches!(kind, Some(MessageType::MsgTimeoutNow));
+        let transfers = kind == MessageType::MsgTimeoutNow;
         if (requests_vote || transfers)
             && let Some(mark) = self.uncertainty()?
         {
@@ -669,7 +671,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
                 return Ok(());
             }
         }
-        if kind == Some(MessageType::MsgHeartbeat)
+        if kind == MessageType::MsgHeartbeat
             && self.uncertainty()?.is_some()
             && message.commit > self.last_index()?
         {
@@ -710,7 +712,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
             return Ok(());
         }
         out.messages.push(Message {
-            msg_type: MessageType::MsgAppendResponse as i32,
+            msg_type: MessageType::MsgAppendResponse,
             to: leader,
             from: self.id(),
             term: self.term(),
@@ -897,7 +899,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
 
     pub fn propose_change(&mut self, change: &ConfChangeV2) -> Result<(), ReplicaError> {
         self.ready_for_calls()?;
-        self.bounded(change.compute_size().try_into().unwrap_or(usize::MAX))?;
+        self.bounded(change.encoded_len())?;
         self.node.propose_conf_change(Vec::new(), change)?;
         Ok(())
     }
@@ -1101,12 +1103,12 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
         for entry in entries {
             let index = entry.index;
             let mut changed = false;
-            match EntryType::from_i32(entry.entry_type) {
+            match entry.entry_type {
                 // A new leader's empty entry changes no row.
-                Some(EntryType::EntryNormal) if entry.data.is_empty() => {
+                EntryType::EntryNormal if entry.data.is_empty() => {
                     self.engine.apply(index, &[])?;
                 }
-                Some(EntryType::EntryNormal) => {
+                EntryType::EntryNormal => {
                     let batch = wire::Entry::decode(&entry.data).map_err(|_| {
                         ReplicaError::Stopped(format!("committed entry {index} does not decode"))
                     })?;
@@ -1120,28 +1122,15 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
                         .collect();
                     out.applied.push(Applied { index, answers });
                 }
-                Some(EntryType::EntryConfChangeV2) => {
-                    let mut change = ConfChangeV2::default();
-                    change.merge_from_bytes(&entry.data).map_err(|_| {
+                // A change in either encoding, read as hyper-raft states it (`change_of`): a
+                // change entry with no data is the empty change.
+                EntryType::EntryConfChange | EntryType::EntryConfChangeV2 => {
+                    let change = proto::change_of(&entry).ok().flatten().ok_or_else(|| {
                         ReplicaError::Stopped(format!("committed change {index} does not decode"))
                     })?;
                     let outcome = self.node.apply_conf_change(&change);
                     self.changed(index, outcome)?;
                     changed = true;
-                }
-                Some(EntryType::EntryConfChange) => {
-                    let mut change = ConfChange::default();
-                    change.merge_from_bytes(&entry.data).map_err(|_| {
-                        ReplicaError::Stopped(format!("committed change {index} does not decode"))
-                    })?;
-                    let outcome = self.node.apply_conf_change_v1(&change);
-                    self.changed(index, outcome)?;
-                    changed = true;
-                }
-                None => {
-                    return Err(ReplicaError::Stopped(format!(
-                        "committed entry {index} has no known type"
-                    )));
                 }
             }
             self.applied = index;
@@ -1349,8 +1338,8 @@ fn uncertain_mark<F: BlockFile + 'static>(
 /// Whether `message` asks for votes for its sender's campaign.
 fn campaigns(message: &Message) -> bool {
     matches!(
-        proto::message_type(message),
-        Some(MessageType::MsgRequestVote | MessageType::MsgRequestPreVote)
+        message.msg_type,
+        MessageType::MsgRequestVote | MessageType::MsgRequestPreVote
     )
 }
 

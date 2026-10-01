@@ -733,7 +733,7 @@ impl World {
         self.wire = later;
         for (_, m) in due {
             let (from, to) = (m.from, m.to);
-            let snapshot = m.msg_type == mantle_range::MessageType::MsgSnapshot as i32;
+            let snapshot = m.msg_type == mantle_range::MessageType::MsgSnapshot;
             let dropped =
                 self.blocked.contains(&(from, to)) || (self.faults && self.rng.chance(20));
             let receiver = self.nodes.iter_mut().find(|n| n.id == to);

@@ -71,22 +71,22 @@ impl Reached {
             self.snapshots += output.snapshots.len() as u64;
             self.reads += output.reads.len() as u64;
             self.refusals += u64::from(report.accepted == Some(false));
-            if output
-                .committed
-                .iter()
-                .any(|said| said.3.is_empty() && said.2 == 0)
-            {
+            if output.committed.iter().any(|said| {
+                said.3.is_empty() && said.2 == hyper_raft::proto::EntryType::EntryNormal
+            }) {
                 // A leader's first entry: a term that was led.
                 self.terms += 1;
             }
             for message in &output.messages {
-                match hyper_raft::proto::message_type(message) {
-                    Some(MessageType::MsgAppendResponse) if message.reject => self.rejections += 1,
-                    Some(MessageType::MsgTimeoutNow) => self.transfers += 1,
-                    Some(
-                        MessageType::MsgRequestVoteResponse
-                        | MessageType::MsgRequestPreVoteResponse,
-                    ) if message.reject => self.votes_refused += 1,
+                match message.msg_type {
+                    MessageType::MsgAppendResponse if message.reject => self.rejections += 1,
+                    MessageType::MsgTimeoutNow => self.transfers += 1,
+                    MessageType::MsgRequestVoteResponse
+                    | MessageType::MsgRequestPreVoteResponse
+                        if message.reject =>
+                    {
+                        self.votes_refused += 1
+                    }
                     _ => {}
                 }
             }
@@ -113,7 +113,7 @@ fn tells_one_that_asks(group: &Cluster<New>, op: &Op) -> bool {
     let Some(message) = group.net.get(*at) else {
         return false;
     };
-    message.msg_type == MessageType::MsgTimeoutNow as i32
+    message.msg_type == MessageType::MsgTimeoutNow
         && group.peek(message.to).is_some_and(|member| {
             let view = member.view();
             view.role == 3 && view.term == message.term
@@ -126,7 +126,7 @@ fn brief(message: &hyper_raft::proto::Message) -> String {
         .iter()
         .map(|entry| {
             format!(
-                "{}@{}/{}:{}b",
+                "{}@{}/{:?}:{}b",
                 entry.index,
                 entry.term,
                 entry.entry_type,
@@ -136,7 +136,7 @@ fn brief(message: &hyper_raft::proto::Message) -> String {
         .collect();
     format!(
         "{:?} {}->{} term {} log {}@{} commit {}@{} reject {} hint {} request {} context {:?} priority {} snapshot {:?} [{}]",
-        hyper_raft::proto::message_type(message),
+        message.msg_type,
         message.from,
         message.to,
         message.term,
@@ -301,6 +301,65 @@ fn run(seed: u64, steps: u64, settings: Settings, mix: Mix, reached: &mut Reache
     End::Ran
 }
 
+/// This core alone on a schedule, held to its byte bounds as it measures them, after every step.
+///
+/// Where a bound counts bytes, the two cores count different ones: raft-rs an entry's
+/// protocol-buffers length, this core its length in its own format (`docs/raft.md` §3.1). A page,
+/// a ready's committed entries and the uncommitted bound then cut at different entries by design,
+/// and raft-rs is no oracle for where; each core is held to its own bound instead.
+fn alone(seed: u64, steps: u64, settings: Settings, mix: Mix, reached: &mut Reached) {
+    let voters = [1, 2, 3];
+    let mut new: Cluster<New> = Cluster::new(5, &voters, settings, seed);
+    let mut rng = Seeded(seed);
+    let mut largest = 0usize;
+    for step in 0..steps {
+        let op = new.choose(&mut rng, &mix);
+        let reports = new.act(&op);
+        for report in &reports {
+            for said in &report.output.persisted {
+                largest = largest.max(said.3.len());
+            }
+            for message in &report.output.messages {
+                if message.msg_type == MessageType::MsgAppend && message.entries.len() > 1 {
+                    let bytes: u64 = message
+                        .entries
+                        .iter()
+                        .map(hyper_raft::proto::encoded_bytes)
+                        .sum();
+                    assert!(
+                        bytes <= settings.max_size_per_msg,
+                        "seed {seed}, step {step}: an append of {bytes} bytes past its page of {}",
+                        settings.max_size_per_msg
+                    );
+                }
+            }
+            // At least one proposal is admitted with nothing uncommitted, whatever its size.
+            let bound = settings.max_uncommitted_size as usize + largest;
+            assert!(
+                report.view.uncommitted <= bound,
+                "seed {seed}, step {step}: {} bytes uncommitted past {bound}",
+                report.view.uncommitted
+            );
+        }
+        reached.note(&op, &reports);
+    }
+}
+
+/// [`alone`] over the seeds, with the coverage a campaign must reach.
+fn bounded(name: &str, settings: Settings, mix: Mix) -> Reached {
+    let mut reached = Reached::default();
+    let seeds = count("HYPER_RAFT_SEEDS", 96);
+    let steps = count("HYPER_RAFT_STEPS", 4_000);
+    let first = count("HYPER_RAFT_SEED", 0);
+    for seed in first..first + seeds {
+        alone(seed, steps, settings, mix, &mut reached);
+    }
+    println!("{name}: {seeds} schedules of {steps} steps, held to the bounds: {reached:?}");
+    assert!(reached.terms >= seeds, "{name}: {reached:?}");
+    assert!(reached.committed >= seeds * 8, "{name}: {reached:?}");
+    reached
+}
+
 fn campaign(name: &str, settings: Settings, mix: Mix) -> Reached {
     let mut reached = Reached::default();
     let seeds = count("HYPER_RAFT_SEEDS", 96);
@@ -344,6 +403,84 @@ fn campaign(name: &str, settings: Settings, mix: Mix) -> Reached {
     reached
 }
 
+/// Every campaign again with this core's members given their `Ready`s in
+/// place (`RawNode::ready_in_place`): what they persist and apply is read
+/// where it is, and every step still says what `raft-rs` says.
+#[test]
+fn the_cores_agree_with_readies_given_in_place() {
+    let place = |settings: Settings| Settings {
+        in_place: true,
+        ..settings
+    };
+    let shell = campaign(
+        "shell in place",
+        place(Settings::shell()),
+        Mix::everything(),
+    );
+    assert!(shell.changes > 0 && shell.snapshots > 0 && shell.restarts > 0);
+    for (name, settings, mix) in [
+        (
+            "plain in place",
+            Settings {
+                check_quorum: false,
+                pre_vote: false,
+                ..Settings::shell()
+            },
+            Mix::everything(),
+        ),
+        (
+            "narrow in place",
+            Settings {
+                max_inflight_msgs: 2,
+                max_size_per_msg: 1,
+                max_committed_size_per_ready: 64,
+                ..Settings::shell()
+            },
+            Mix::everything(),
+        ),
+        (
+            "paged in place",
+            Settings {
+                max_size_per_msg: 100,
+                max_committed_size_per_ready: 100,
+                max_inflight_msgs: 4,
+                ..Settings::shell()
+            },
+            Mix::everything(),
+        ),
+        (
+            "whole in place",
+            Settings::shell(),
+            Mix {
+                restarts: false,
+                partitions: false,
+                lose: 0,
+                repeat: 0,
+                ..Mix::everything()
+            },
+        ),
+        (
+            "uncommitted in place",
+            Settings {
+                max_uncommitted_size: 96,
+                max_size_per_msg: 64,
+                ..Settings::shell()
+            },
+            Mix {
+                changes: false,
+                ..Mix::everything()
+            },
+        ),
+    ] {
+        let reached = if settings.max_size_per_msg == 100 || settings.max_size_per_msg == 64 {
+            bounded(name, place(settings), mix)
+        } else {
+            campaign(name, place(settings), mix)
+        };
+        assert!(reached.committed > 0);
+    }
+}
+
 #[test]
 fn the_cores_agree_as_the_shell_sets_them() {
     let reached = campaign("shell", Settings::shell(), Mix::everything());
@@ -382,25 +519,26 @@ fn the_cores_agree_with_a_window_of_two_and_a_message_of_one_entry() {
 }
 
 /// Pages of a hundred bytes and a window of four: a lagging member is
-/// caught up a page at a time, each sized before it is copied, and the
-/// cores still say the same. Every page the new core sends is checked
-/// to hold no spare room (`support::New::drain`).
+/// caught up a page at a time, each sized before it is copied. The page
+/// counts bytes, so this core is held to it alone ([`alone`]); every page
+/// it sends is checked to hold no spare room (`support::New::drain`).
 #[test]
-fn the_cores_agree_on_pages_of_a_hundred_bytes_and_a_window_of_four() {
+fn pages_of_a_hundred_bytes_and_a_window_of_four_hold_their_bound() {
     let settings = Settings {
         max_size_per_msg: 100,
         max_committed_size_per_ready: 100,
         max_inflight_msgs: 4,
         ..Settings::shell()
     };
-    let reached = campaign("paged", settings, Mix::everything());
+    let reached = bounded("paged", settings, Mix::everything());
     assert!(reached.committed > 0 && reached.rejections > 0);
 }
 
 #[test]
-fn the_cores_agree_on_what_a_leader_may_hold_uncommitted() {
+fn what_a_leader_may_hold_uncommitted_holds_its_bound() {
     // A change that is refused for its size leaves `raft-rs` believing one
-    // is pending; this core does not. No change is proposed here.
+    // is pending; this core does not. No change is proposed here. The page
+    // counts bytes, so this core is held to its bounds alone ([`alone`]).
     let settings = Settings {
         max_uncommitted_size: 96,
         max_size_per_msg: 64,
@@ -410,7 +548,7 @@ fn the_cores_agree_on_what_a_leader_may_hold_uncommitted() {
         changes: false,
         ..Mix::everything()
     };
-    let reached = campaign("uncommitted", settings, mix);
+    let reached = bounded("uncommitted", settings, mix);
     assert!(reached.committed > 0);
 }
 

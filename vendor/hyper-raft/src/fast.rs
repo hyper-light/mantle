@@ -13,12 +13,16 @@
 //! in it: the log holds what a leader approved and nothing else, so the
 //! log is the classic one, elections compare it as they always did, and a
 //! leader's entry takes the place of what a member held by taking its
-//! index.
+//! index. Because elections see only the log, what a member holds beside
+//! it counts for a fast commit only once its log holds an entry of the
+//! committing leader's term ([`crate::track`]): an election weighs the log,
+//! and the log must then say the member took that leader's word.
 //!
 //! A leader stamps what it takes with its own term. The term a proposer
 //! gave says nothing of the entry, for two proposers of one term propose
 //! different entries for one index, and an index and a term name one entry
 //! of the log only while one member alone writes each term.
+use crate::proto::MessageType;
 use crate::{
     NodeId,
     error::{Error, Result},
@@ -28,14 +32,9 @@ use crate::{
 
 /// A proposal, from a proposer to every voter. It bears no term: what is
 /// held may come from anyone.
-///
-/// A wire identifier, not a tunable: any value outside raft-proto's
-/// `MessageType` (0 to 18, `MsgHup` to `MsgRequestPreVoteResponse`) keeps it
-/// from being read as a classic message; every member must use the same.
-pub const FAST_PROPOSE: i32 = 100;
-/// What a voter holds at an index, to the leader. A wire identifier, as
-/// [`FAST_PROPOSE`].
-pub const FAST_VOTE: i32 = 101;
+pub const FAST_PROPOSE: MessageType = MessageType::MsgFastPropose;
+/// What a voter holds at an index, to the leader.
+pub const FAST_VOTE: MessageType = MessageType::MsgFastVote;
 
 /// Whether two entries state the same. Their index is where they are held,
 /// and their term who stamped them; neither is what they state.

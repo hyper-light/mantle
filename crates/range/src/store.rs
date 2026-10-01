@@ -25,7 +25,7 @@ pub struct LogStore<F: BlockFile + 'static> {
 pub const ENTRY_OVERHEAD: usize = 5;
 
 pub fn encode_entry(e: &Entry) -> Option<Vec<u8>> {
-    let kind = u8::try_from(e.entry_type).ok()?;
+    let kind = e.entry_type.byte();
     let context_len = u32::try_from(e.context.len()).ok()?;
     let mut out = Vec::with_capacity(e.context.len().checked_add(e.data.len())?.checked_add(5)?);
     out.push(kind);
@@ -38,17 +38,16 @@ pub fn encode_entry(e: &Entry) -> Option<Vec<u8>> {
 /// The entry at `index` of `term` whose bytes are `bytes`.
 pub fn decode_entry(index: u64, term: u64, bytes: &[u8]) -> Option<Entry> {
     let (&kind, rest) = bytes.split_first()?;
-    EntryType::from_i32(i32::from(kind))?;
+    let entry_type = EntryType::from_byte(kind)?;
     let (len, rest) = rest.split_at_checked(4)?;
     let len = usize::try_from(u32::from_le_bytes(len.try_into().ok()?)).ok()?;
     let (context, data) = rest.split_at_checked(len)?;
     Some(Entry {
-        entry_type: i32::from(kind),
+        entry_type,
         term,
         index,
         data: data.to_vec(),
         context: context.to_vec(),
-        ..Entry::default()
     })
 }
 
@@ -194,12 +193,11 @@ mod tests {
     #[test]
     fn entries_round_trip_through_their_log_bytes() {
         let e = Entry {
-            entry_type: EntryType::EntryConfChangeV2 as i32,
+            entry_type: EntryType::EntryConfChangeV2,
             term: 3,
             index: 9,
             data: b"data".to_vec(),
             context: b"ctx".to_vec(),
-            ..Entry::default()
         };
         let bytes = encode_entry(&e).unwrap();
         assert_eq!(decode_entry(9, 3, &bytes), Some(e));

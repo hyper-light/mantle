@@ -144,7 +144,7 @@ fn a_proposal_is_committed_once_a_fast_quorum_holds_it() {
         !group
             .net
             .iter()
-            .any(|message| message.msg_type == MessageType::MsgAppendResponse as i32)
+            .any(|message| message.msg_type == MessageType::MsgAppendResponse)
     );
     // The members learn of the commit from the leader, and hold the entry
     // from it.
@@ -331,9 +331,9 @@ fn what_a_member_holds_it_holds_after_it_stopped() {
 fn while_the_group_changes_the_fast_quorum_commits_nothing() {
     let mut group = group(5);
     let joint = ConfChangeV2 {
-        transition: ConfChangeTransition::Explicit as i32,
+        transition: ConfChangeTransition::Explicit,
         changes: vec![ConfChangeSingle {
-            change_type: ConfChangeType::RemoveNode as i32,
+            change_type: ConfChangeType::RemoveNode,
             node_id: 5,
         }],
         context: vec![],
@@ -376,7 +376,7 @@ fn what_may_not_go_by_the_fast_track_is_refused() {
         ..Message::default()
     };
     let change = Entry {
-        entry_type: EntryType::EntryConfChangeV2 as i32,
+        entry_type: EntryType::EntryConfChangeV2,
         index: 2,
         data: vec![1],
         ..Entry::default()
@@ -431,8 +431,9 @@ fn what_may_not_go_by_the_fast_track_is_refused() {
     assert!(plain.peek(2).unwrap().held().is_empty() && plain.net.is_empty());
 }
 
-#[test]
-fn a_group_with_the_fast_track_is_safe_and_settles() {
+/// Groups with the fast track under schedules: the terms they led, the
+/// entries they committed, and what the fast track did.
+fn fast_schedules(settings: Settings) -> (usize, usize, hyper_raft::FastStats) {
     let seeds = count("HYPER_RAFT_SEEDS", 96);
     let steps = count("HYPER_RAFT_STEPS", 4_000);
     let first = count("HYPER_RAFT_SEED", 0);
@@ -444,25 +445,96 @@ fn a_group_with_the_fast_track_is_safe_and_settles() {
     let (mut terms, mut committed) = (0, 0);
     let mut did = hyper_raft::FastStats::default();
     for seed in first..first + seeds {
-        let mut group: Cluster<New> = Cluster::new(5, &[1, 2, 3, 4, 5], Settings::fast(), seed);
-        let mut rng = Seeded(seed);
-        for _ in 0..steps {
-            let op = group.choose(&mut rng, &mix);
-            // What a member did it forgets when it stops.
-            if let Op::Restart(member) = op
-                && let Some(node) = group.peek(member)
-            {
-                add(&mut did, node.fast_stats());
-            }
-            group.act(&op);
-        }
-        assert!(group.settles(400), "seed {seed}: the group did not settle");
-        for member in group.up() {
-            add(&mut did, group.peek(member).unwrap().fast_stats());
-        }
+        let group = fast_schedule(settings, seed, steps, &mix, &mut did);
         terms += group.leaders.len();
         committed += group.chosen.len();
     }
+    (terms, committed, did)
+}
+
+/// One group with the fast track under the schedule of `seed`, which is
+/// safe and settles; what the fast track did is added to `did`.
+fn fast_schedule(
+    settings: Settings,
+    seed: u64,
+    steps: u64,
+    mix: &Mix,
+    did: &mut hyper_raft::FastStats,
+) -> Cluster<New> {
+    let mut group: Cluster<New> = Cluster::new(5, &[1, 2, 3, 4, 5], settings, seed);
+    let mut rng = Seeded(seed);
+    for _ in 0..steps {
+        let op = group.choose(&mut rng, mix);
+        // What a member did it forgets when it stops.
+        if let Op::Restart(member) = op
+            && let Some(node) = group.peek(member)
+        {
+            add(did, node.fast_stats());
+        }
+        group.act(&op);
+    }
+    assert!(group.settles(400), "seed {seed}: the group did not settle");
+    for member in group.up() {
+        add(did, group.peek(member).unwrap().fast_stats());
+    }
+    group
+}
+
+/// The schedule that found an election committing a second entry at an
+/// index that held a committed one (seed 9843 of 40,000 from seed 3,000,
+/// on the core before focal's F43, F41 and F42, whose rules it keeps
+/// here so that it runs as it was found). A leader of term 3 committed
+/// index 32 by the fast quorum of members 1, 2 and 4, of which 2 and 4
+/// held the entry beside their logs and had told the leader nothing of
+/// their logs; member 3, whose log held an entry of an older term at 32,
+/// was later elected by them, kept its own entry and committed it. A
+/// member's held entry now counts for a fast commit only once the leader
+/// knows its log holds an entry of the leader's term (`docs/raft.md`).
+#[test]
+fn an_election_never_commits_a_second_entry_at_a_committed_index() {
+    let found = Settings {
+        round_each: true,
+        max_inflight_bytes: u64::MAX,
+        bare_answers: true,
+        ..Settings::fast()
+    };
+    let mix = Mix {
+        leader_leaves: true,
+        fast: 60,
+        ..Mix::everything()
+    };
+    let mut did = hyper_raft::FastStats::default();
+    let group = fast_schedule(found, 9843, 4_000, &mix, &mut did);
+    // It went on past the index, and every member agreed on it.
+    assert!(group.chosen.len() > 32, "{did:?}");
+}
+
+/// The schedule that found an election under a configuration a member had
+/// not yet applied committing a second entry (seed 54104 of 40,000 from
+/// seed 43,000, once the rule above was in). The leader of term 2, whose
+/// configuration had demoted member 3 to a learner, committed index 11 by
+/// the fast quorum of three of its four voters. Member 2, one of them, had
+/// not committed the demotion and counted by the five voters before it: it
+/// was elected by members 3 and 4, which held another entry at 11, and took
+/// theirs. A fast quorum now counts only where it is a fast quorum of every
+/// configuration a member that holds an entry of the term may count by
+/// (`docs/raft.md`).
+#[test]
+fn a_member_that_counts_by_the_configuration_before_commits_no_second_entry() {
+    let mix = Mix {
+        leader_leaves: true,
+        fast: 60,
+        ..Mix::everything()
+    };
+    let mut did = hyper_raft::FastStats::default();
+    let group = fast_schedule(Settings::fast(), 54104, 4_000, &mix, &mut did);
+    assert!(group.chosen.len() > 11, "{did:?}");
+}
+
+#[test]
+fn a_group_with_the_fast_track_is_safe_and_settles() {
+    let seeds = count("HYPER_RAFT_SEEDS", 96);
+    let (terms, committed, did) = fast_schedules(Settings::fast());
     println!("{seeds} schedules led {terms} terms and committed {committed} entries: {did:?}");
     assert!(terms as u64 > seeds && committed as u64 > seeds * 8);
     // A schedule that never takes the fast track says nothing of it.
@@ -472,4 +544,17 @@ fn a_group_with_the_fast_track_is_safe_and_settles() {
         "{did:?}"
     );
     assert!(did.displaced > seeds, "{did:?}");
+}
+
+/// The same schedules with every member given its `Ready`s in place
+/// (`RawNode::ready_in_place`): the group decides exactly what it decided
+/// with copies.
+#[test]
+fn a_group_given_its_readies_in_place_decides_the_same() {
+    let copied = fast_schedules(Settings::fast());
+    let in_place = fast_schedules(Settings {
+        in_place: true,
+        ..Settings::fast()
+    });
+    assert_eq!(copied, in_place);
 }

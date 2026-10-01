@@ -8,16 +8,17 @@ license = "MIT"
 repository = "https://github.com/hyper-light/hyper-raft"
 
 [dependencies]
-raft-proto = { version = "0.7.0", git = "https://github.com/tikv/raft-rs", rev = "8e4cef172421bf77b2ae1c26628a9531b0be41f0", default-features = false, features = ["prost-codec"] }
+crc32c = "0.6"
 thiserror = "2.0"
 
 [dev-dependencies]
 # The core focal ran on before this one: the differential tests run both on
 # one schedule and compare what they say.
 raft = { version = "0.7.0", git = "https://github.com/tikv/raft-rs", rev = "8e4cef172421bf77b2ae1c26628a9531b0be41f0", default-features = false, features = ["prost-codec"] }
+raft-proto = { version = "0.7.0", git = "https://github.com/tikv/raft-rs", rev = "8e4cef172421bf77b2ae1c26628a9531b0be41f0", default-features = false, features = ["prost-codec"] }
 slog = "2.7"
 
 
 
-# A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside the vendor workspace.
+# A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside any consumer workspace.
 [workspace]

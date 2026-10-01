@@ -287,7 +287,7 @@ impl Drop for Opens {
 }
 
 fn kind(m: &Message) -> Option<mantle_range::MessageType> {
-    mantle_range::MessageType::from_i32(m.msg_type)
+    Some(m.msg_type)
 }
 
 /// `begin` gives out a leader's appends while its own write of the entries is still being made
@@ -1517,7 +1517,7 @@ fn a_durability_failure_fences(fault: &mantle_disk::sim::Fault, failing: u64) {
                         // An acknowledgement of the entry leaves only once it is durable.
                         assert!(
                             !out.messages.iter().any(|m| {
-                                m.msg_type == MessageType::MsgAppendResponse as i32
+                                m.msg_type == MessageType::MsgAppendResponse
                                     && !m.reject
                                     && m.index >= entry
                             }),
@@ -1547,7 +1547,7 @@ fn a_durability_failure_fences(fault: &mantle_disk::sim::Fault, failing: u64) {
     let fenced = &mut d.nodes[slot].replica;
     assert!(fenced.is_fenced());
     let heartbeat = Message {
-        msg_type: MessageType::MsgHeartbeat as i32,
+        msg_type: MessageType::MsgHeartbeat,
         from: if failing == 1 { 2 } else { 1 },
         to: failing,
         term: fenced.term(),
@@ -2032,7 +2032,7 @@ fn a_member_whose_engine_applied_what_its_damaged_log_lost_is_repaired_in_place(
     for serial in 2..5 {
         d.nodes[0].replica.propose(&registration(serial)).unwrap();
         d.settle_checking(&[], &mut answers, |m, log| {
-            if m.from == 2 && m.msg_type == MessageType::MsgAppendResponse as i32 && !m.reject {
+            if m.from == 2 && m.msg_type == MessageType::MsgAppendResponse && !m.reject {
                 let last = log.view(GROUP).unwrap().unwrap().last;
                 assert!(m.index <= last, "acknowledged {} holding {last}", m.index);
                 acknowledged += 1;

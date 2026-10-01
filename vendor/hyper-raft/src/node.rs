@@ -6,7 +6,7 @@
 //! after what the same `Ready` persists is durable
 //! ([`Ready::persisted_messages`]). A leader's may go at once: what it
 //! sends its members persist for themselves (Ongaro's thesis §10.2.1).
-use raft_proto::protocompat::PbMessageExt;
+use crate::wire::Record;
 
 use crate::{
     NodeId,
@@ -58,6 +58,8 @@ fn is_answer(kind: MessageType) -> bool {
 pub struct LightReady {
     commit_index: Option<u64>,
     committed_entries: Vec<Entry>,
+    /// What to apply, where storage holds it, for a `Ready` given in place.
+    committed_range: Option<(u64, u64)>,
     messages: Vec<Message>,
 }
 impl LightReady {
@@ -72,6 +74,13 @@ impl LightReady {
     /// Takes the entries to apply, leaving none.
     pub fn take_committed_entries(&mut self) -> Vec<Entry> {
         std::mem::take(&mut self.committed_entries)
+    }
+    /// Committed and durable here, to apply where storage holds them: the
+    /// first and last index, for a `Ready` given in place
+    /// ([`RawNode::ready_in_place`]), whose
+    /// [`LightReady::committed_entries`] are none.
+    pub fn committed_range(&self) -> Option<(u64, u64)> {
+        self.committed_range
     }
     /// To send.
     pub fn messages(&self) -> &[Message] {
@@ -121,6 +130,8 @@ impl Ready {
         std::mem::take(&mut self.read_states)
     }
     /// To persist, replacing what storage holds from the first of them on.
+    /// A `Ready` given in place gives none here; its entries are read with
+    /// [`RawNode::to_persist`].
     pub fn entries(&self) -> &[Entry] {
         &self.entries
     }
@@ -145,7 +156,9 @@ impl Ready {
     pub fn take_displaced(&mut self) -> Vec<Entry> {
         std::mem::take(&mut self.displaced)
     }
-    /// To persist before the entries: the log begins again after it.
+    /// To persist before the entries: the log begins again after it. A
+    /// `Ready` given in place gives none here; its snapshot is read with
+    /// [`RawNode::to_persist`].
     pub fn snapshot(&self) -> Option<&Snapshot> {
         self.snapshot.as_ref()
     }
@@ -156,6 +169,11 @@ impl Ready {
     /// Takes the entries to apply, leaving none.
     pub fn take_committed_entries(&mut self) -> Vec<Entry> {
         self.light.take_committed_entries()
+    }
+    /// Committed and durable here, to apply where storage holds them, for a
+    /// `Ready` given in place ([`LightReady::committed_range`]).
+    pub fn committed_range(&self) -> Option<(u64, u64)> {
+        self.light.committed_range()
     }
     /// To send at once.
     pub fn messages(&self) -> &[Message] {
@@ -197,12 +215,38 @@ impl Ready {
     }
 }
 
+/// What a `Ready` given in place asks to persist, where the member holds
+/// it, beside the storage it goes to ([`RawNode::to_persist`]).
+#[derive(Debug)]
+pub struct ToPersist<'a, S> {
+    /// The storage, to write to.
+    pub store: &'a mut S,
+    /// The snapshot to persist first, if there is one.
+    pub snapshot: Option<&'a Snapshot>,
+    /// The entries to persist, replacing what storage holds from the first
+    /// of them on.
+    pub entries: &'a [Entry],
+}
+
+/// What a `Ready` gave to persist, given up by the member once it is durable
+/// ([`RawNode::advance_append_keeping`]).
+#[derive(Debug, Default, PartialEq)]
+pub struct Kept {
+    /// The snapshot, if the `Ready` gave one.
+    pub snapshot: Option<Snapshot>,
+    /// The entries.
+    pub entries: Vec<Entry>,
+}
+
 /// What a [`Ready`] gave to persist.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Given {
     number: u64,
     last_entry: Option<(u64, u64)>,
     snapshot: Option<u64>,
+    /// Given in place: its entries are read where the member holds them,
+    /// and what it gives to apply where storage holds it.
+    in_place: bool,
 }
 
 /// A member as its owner drives it: operations in, one [`Ready`] at a time
@@ -261,6 +305,11 @@ impl<S: Storage> RawNode<S> {
     pub fn set_priority(&mut self, priority: i64) {
         self.raft.set_priority(priority);
     }
+    /// What the path to `member` carries before it answers
+    /// ([`Raft::set_inflight_bytes`]).
+    pub fn set_inflight_bytes(&mut self, member: u64, bytes: u64) -> bool {
+        self.raft.set_inflight_bytes(member, bytes)
+    }
     /// One tick of time has passed. True when the member acted on it: it
     /// campaigned, checked its quorum or sent heartbeats.
     pub fn tick(&mut self) -> Result<bool> {
@@ -297,9 +346,13 @@ impl<S: Storage> RawNode<S> {
     pub fn propose_conf_change(&mut self, context: Vec<u8>, change: &ConfChangeV2) -> Result<()> {
         // What could not be read when it is applied is not proposed.
         Plan::of(change)?;
-        let data = change
-            .write_to_bytes()
-            .map_err(|_| Error::Capacity("a change's encoding"))?;
+        // The empty change, leaving the joint configuration, is written as no data, as the
+        // leader writes its own leave: one change, one encoding.
+        let data = if *change == ConfChangeV2::default() {
+            Vec::new()
+        } else {
+            change.encode_to_vec()
+        };
         self.operate(|raft| {
             let mut message = proto::message(0, MessageType::MsgPropose);
             message
@@ -307,7 +360,7 @@ impl<S: Storage> RawNode<S> {
                 .try_reserve_exact(1)
                 .map_err(|_| Error::Capacity("a proposal"))?;
             message.entries.push(Entry {
-                entry_type: EntryType::EntryConfChangeV2 as i32,
+                entry_type: EntryType::EntryConfChangeV2,
                 data,
                 context,
                 ..Entry::default()
@@ -326,14 +379,7 @@ impl<S: Storage> RawNode<S> {
     }
     /// A committed change in the older encoding is applied.
     pub fn apply_conf_change_v1(&mut self, change: &ConfChange) -> Result<ConfState> {
-        let entry = Entry {
-            entry_type: EntryType::EntryConfChange as i32,
-            data: change
-                .write_to_bytes()
-                .map_err(|_| Error::Capacity("a change's encoding"))?,
-            ..Entry::default()
-        };
-        let plan = Plan::of_entry(&entry)?.ok_or(Error::Invariant("a change that states none"))?;
+        let plan = Plan::of(&proto::joint(change))?;
         self.raft.settle_priority();
         let outcome = self.raft.apply_conf_change(&plan);
         self.raft.settle_priority();
@@ -346,7 +392,7 @@ impl<S: Storage> RawNode<S> {
         {
             return self.operate(|raft| raft.step(message));
         }
-        let kind = proto::message_type(&message).ok_or(Error::Violation("a message of no kind"))?;
+        let kind = message.msg_type;
         if is_local(kind) {
             return Err(Error::StepLocalMessage);
         }
@@ -408,23 +454,55 @@ impl<S: Storage> RawNode<S> {
         }
     }
 
-    fn light(&mut self) -> Result<LightReady> {
+    fn light(&mut self, in_place: bool) -> Result<LightReady> {
+        if in_place {
+            return self.light_in_place();
+        }
         let committed_entries = self
             .raft
             .log()
             .next_entries_since(self.commit_since, self.raft.committed_bytes_per_ready())?;
         self.raft.reduce_uncommitted(&committed_entries);
         if let Some(last) = committed_entries.last() {
-            if self.commit_since >= last.index {
-                return Err(Error::Invariant("entries given to apply twice"));
-            }
-            self.commit_since = last.index;
+            self.given_through(last.index)?;
         }
         Ok(LightReady {
             commit_index: None,
             committed_entries,
+            committed_range: None,
             messages: self.raft.msgs.take(),
         })
+    }
+    /// As [`RawNode::light`], giving what to apply as the range storage
+    /// holds it, copied nowhere.
+    fn light_in_place(&mut self) -> Result<LightReady> {
+        let range = self.raft.log().next_range_since(
+            self.commit_since,
+            self.raft.committed_bytes_per_ready(),
+            self.raft.leader_tail(),
+        )?;
+        let committed_range = match range {
+            Some(range) => {
+                self.raft.reduce_uncommitted_bytes(range.data_above);
+                self.given_through(range.last)?;
+                Some((range.first, range.last))
+            }
+            None => None,
+        };
+        Ok(LightReady {
+            commit_index: None,
+            committed_entries: Vec::new(),
+            committed_range,
+            messages: self.raft.msgs.take(),
+        })
+    }
+    /// Entries through `last` were given to apply.
+    fn given_through(&mut self, last: u64) -> Result<()> {
+        if self.commit_since >= last {
+            return Err(Error::Invariant("entries given to apply twice"));
+        }
+        self.commit_since = last;
+        Ok(())
     }
     /// Whether every counter the member trusts for what it holds says what
     /// a walk says ([`Raft::check_accounting`]).
@@ -435,6 +513,7 @@ impl<S: Storage> RawNode<S> {
     pub fn has_ready(&self) -> bool {
         let raft = &self.raft;
         !raft.msgs.is_empty()
+            || raft.reads_unasked()
             || raft.soft_state() != self.previous_soft
             || raft.hard_state() != self.previous_hard
             || !raft.read_states.is_empty()
@@ -452,6 +531,38 @@ impl<S: Storage> RawNode<S> {
     /// What there is to do. It is done, and advanced, before the member
     /// is given anything else.
     pub fn ready(&mut self) -> Result<Ready> {
+        self.ready_given(false)
+    }
+    /// What there is to do, as [`RawNode::ready`] says it, with nothing
+    /// copied that the owner can read where it is:
+    /// - the entries to persist are read with [`RawNode::to_persist`] while
+    ///   the `Ready` is out, and persisted before anything else is asked of
+    ///   the member; [`Ready::entries`] are none;
+    /// - what is committed is given as the range storage holds it
+    ///   ([`Ready::committed_range`], [`LightReady::committed_range`]),
+    ///   chosen by the rule [`Log::next_entries_since`] pages by, and
+    ///   [`Ready::committed_entries`] are none.
+    ///
+    /// An owner that writes entries out (to a file, to a device) and applies
+    /// what it holds copies nothing; the member's decisions are those of
+    /// [`RawNode::ready`] exactly.
+    ///
+    /// [`Log::next_entries_since`]: crate::log::Log::next_entries_since
+    pub fn ready_in_place(&mut self) -> Result<Ready> {
+        self.ready_given(true)
+    }
+    /// The storage, and what the `Ready` that is out gives to persist,
+    /// where the member holds it ([`RawNode::ready_in_place`]): the snapshot
+    /// first, if there is one, then the entries.
+    pub fn to_persist(&mut self) -> ToPersist<'_, S> {
+        let log = &mut self.raft.log;
+        ToPersist {
+            store: &mut log.store,
+            snapshot: log.unstable.snapshot.as_ref(),
+            entries: log.unstable.entries.as_slice(),
+        }
+    }
+    fn ready_given(&mut self, in_place: bool) -> Result<Ready> {
         if self.given.is_some() {
             return Err(Error::Invariant("a ready asked for while one is out"));
         }
@@ -459,12 +570,17 @@ impl<S: Storage> RawNode<S> {
             .number
             .checked_add(1)
             .ok_or(Error::Capacity("readies"))?;
+        // One round for the reads asked since the last (`Raft::ask_reads`): it
+        // leaves with this `Ready`. A round refused is asked for again by
+        // the next `Ready`, and by the heartbeat the leader's clock sends.
+        self.raft.ask_reads()?;
         let mut ready = Ready {
             number,
             ..Ready::default()
         };
         let mut given = Given {
             number,
+            in_place,
             ..Given::default()
         };
         // Everything that can refuse does before the member is changed.
@@ -482,17 +598,28 @@ impl<S: Storage> RawNode<S> {
                     "a snapshot with entries to apply after it",
                 ));
             }
-            ready.snapshot = Some(crate::log::copy_snapshot(snapshot)?);
+            if !in_place {
+                ready.snapshot = Some(crate::log::copy_snapshot(snapshot)?);
+            }
             given.snapshot = Some(index);
             ready.must_sync = true;
         }
-        crate::log::copy_entries(self.raft.log().unstable().entries(), &mut ready.entries)?;
+        if !in_place {
+            crate::log::copy_entries(self.raft.log().unstable().entries(), &mut ready.entries)?;
+        }
+        let last_entry = self
+            .raft
+            .log()
+            .unstable()
+            .entries()
+            .last()
+            .map(|last| (last.index, last.term));
         self.raft.unstable_proposals(&mut ready.proposals)?;
 
         if let Some(index) = given.snapshot {
             self.commit_since = index;
         }
-        ready.light = self.light()?;
+        ready.light = self.light(in_place)?;
         self.number = number;
         let soft = self.raft.soft_state();
         if soft != self.previous_soft {
@@ -512,9 +639,9 @@ impl<S: Storage> RawNode<S> {
         if !ready.proposals.is_empty() {
             ready.must_sync = true;
         }
-        if let Some(last) = ready.entries.last() {
+        if last_entry.is_some() {
             ready.must_sync = true;
-            given.last_entry = Some((last.index, last.term));
+            given.last_entry = last_entry;
         }
         ready.after_persisting = self.raft.state() != StateRole::Leader;
         self.given = Some(given);
@@ -522,6 +649,19 @@ impl<S: Storage> RawNode<S> {
     }
     /// What `ready` gave to persist is durable, and storage answers for it.
     pub fn advance_append(&mut self, ready: Ready) -> Result<LightReady> {
+        self.advance_append_keeping(ready, |_, _| {})
+    }
+    /// As [`RawNode::advance_append`], handing what `ready` gave to persist
+    /// to `keep`, with the storage, before the member reads storage for it:
+    /// an owner that wrote it out where it was ([`RawNode::ready_in_place`])
+    /// and keeps it in memory too keeps these very entries and this very
+    /// snapshot, and copies none. `keep` must leave storage holding them, as
+    /// `advance_append` requires; what else it does with them is the owner's.
+    pub fn advance_append_keeping(
+        &mut self,
+        ready: Ready,
+        keep: impl FnOnce(&mut S, Kept),
+    ) -> Result<LightReady> {
         let given = self
             .given
             .filter(|given| given.number == ready.number)
@@ -532,11 +672,15 @@ impl<S: Storage> RawNode<S> {
         if let Some(hard) = ready.hard_state {
             self.previous_hard = hard;
         }
+        let mut kept = Kept::default();
         if let Some(index) = given.snapshot {
-            self.raft.log.stable_snapshot(index)?;
+            kept.snapshot = Some(self.raft.log.take_stable_snapshot(index)?);
         }
         if let Some((index, term)) = given.last_entry {
-            self.raft.log.stable_entries(index, term)?;
+            kept.entries = self.raft.log.take_stable_entries(index, term)?;
+        }
+        if kept.snapshot.is_some() || !kept.entries.is_empty() {
+            keep(&mut self.raft.log.store, kept);
         }
         self.given = None;
         self.raft.settle_priority();
@@ -551,7 +695,7 @@ impl<S: Storage> RawNode<S> {
         // What is to send now is sent after what `ready` persisted, whoever
         // sends it: a leader that a change it applied made a follower has
         // its last messages here.
-        let mut light = self.light()?;
+        let mut light = self.light(given.in_place)?;
         let hard = self.raft.hard_state();
         if hard.commit > self.previous_hard.commit {
             light.commit_index = Some(hard.commit);

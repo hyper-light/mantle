@@ -97,11 +97,11 @@ impl Replacement {
 /// for more.
 fn change(changes: &[(ConfChangeType, u64)]) -> ConfChangeV2 {
     ConfChangeV2 {
-        transition: ConfChangeTransition::Auto as i32,
+        transition: ConfChangeTransition::Auto,
         changes: changes
             .iter()
             .map(|&(kind, node_id)| ConfChangeSingle {
-                change_type: kind as i32,
+                change_type: kind,
                 node_id,
             })
             .collect(),
@@ -123,7 +123,7 @@ mod tests {
         }
     }
 
-    fn kinds(next: &Next) -> Vec<(i32, u64)> {
+    fn kinds(next: &Next) -> Vec<(ConfChangeType, u64)> {
         match next {
             Next::Propose(c) => c
                 .changes
@@ -134,9 +134,9 @@ mod tests {
         }
     }
 
-    const ADD: i32 = ConfChangeType::AddNode as i32;
-    const LEARN: i32 = ConfChangeType::AddLearnerNode as i32;
-    const REMOVE: i32 = ConfChangeType::RemoveNode as i32;
+    const ADD: ConfChangeType = ConfChangeType::AddNode;
+    const LEARN: ConfChangeType = ConfChangeType::AddLearnerNode;
+    const REMOVE: ConfChangeType = ConfChangeType::RemoveNode;
 
     #[test]
     fn a_replacement_learns_catches_up_swaps_and_ends() {
@@ -151,7 +151,7 @@ mod tests {
         let swap = r.next(&learning, true, true);
         assert_eq!(kinds(&swap), [(ADD, 4), (REMOVE, 3)]);
         if let Next::Propose(c) = &swap {
-            assert_eq!(c.transition, ConfChangeTransition::Auto as i32);
+            assert_eq!(c.transition, ConfChangeTransition::Auto);
         }
         // The group leaves the joint configuration by itself.
         assert_eq!(

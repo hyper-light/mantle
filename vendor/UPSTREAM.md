@@ -96,4 +96,4 @@ The crates mantle shares with focal and slates come from github.com/hyper-light/
 
 | Snapshot | Revision | Used by |
 |---|---|---|
-| `hyper-raft` | `SNAPSHOT` | `crates/range`, as `focal-raft` (Cargo rename) |
+| `hyper-raft` | `SNAPSHOT` (`dce1daa`: R-2, its own message types and wire format, hyper-raft `docs/raft.md` §3.1) | `crates/range`, as `focal-raft` (Cargo rename) |

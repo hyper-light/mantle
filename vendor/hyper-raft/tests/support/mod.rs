@@ -7,7 +7,9 @@ use hyper_raft::proto::{
     CAMPAIGN_TRANSFER, ConfChange, ConfChangeV2, ConfState, Entry, EntryType, HardState, Message,
     MessageType, Snapshot, SnapshotMetadata,
 };
-use raft::protocompat::{PbMessage, PbMessageExt};
+use hyper_raft::wire::Record;
+
+pub mod convert;
 
 /// SplitMix64: the schedule of a run is its seed.
 #[derive(Clone)]
@@ -111,12 +113,36 @@ impl Disk {
         let last = self.last_index();
         self.proposals.retain(|held| held.index > last);
     }
+    /// Keeps the entries a member gave up once durable, as they are: what
+    /// they replace is cut first, as `append` cuts it.
+    pub fn keep(&mut self, entries: Vec<Entry>) {
+        let Some(first) = entries.first() else {
+            return;
+        };
+        assert!(
+            first.index >= self.first_index() && first.index <= self.last_index() + 1,
+            "a gap in what is kept"
+        );
+        self.entries
+            .truncate((first.index - self.first_index()) as usize);
+        self.entries.extend(entries);
+        self.trim_proposals();
+    }
+    /// What the log reached is approved by itself no more.
+    pub fn trim_proposals(&mut self) {
+        let last = self.last_index();
+        self.proposals.retain(|held| held.index > last);
+    }
     pub fn install(&mut self, snapshot: &Snapshot) {
+        self.install_owned(snapshot.clone());
+    }
+    /// Installs the snapshot itself.
+    pub fn install_owned(&mut self, snapshot: Snapshot) {
         let metadata = snapshot.metadata.clone().unwrap_or_default();
         self.conf = sorted(metadata.conf_state.unwrap_or_default());
         self.hard_state.commit = self.hard_state.commit.max(metadata.index);
         self.entries.clear();
-        self.snapshot = snapshot.clone();
+        self.snapshot = snapshot;
         self.proposals.retain(|held| held.index > metadata.index);
     }
     /// Everything through `index` becomes the snapshot.
@@ -145,13 +171,14 @@ impl Disk {
     }
     /// The page is chosen before it is copied, as the core's own storage
     /// chooses it: what is returned holds no spare room.
-    fn slice(&self, low: u64, high: u64, max_bytes: u64) -> Vec<Entry> {
+    /// Each core measures a page in its own bytes: `measure`.
+    fn slice(&self, low: u64, high: u64, max_bytes: u64, measure: fn(&Entry) -> u64) -> Vec<Entry> {
         let first = self.first_index();
         let range = &self.entries[(low - first) as usize..(high - first) as usize];
         let mut bytes = 0u64;
         let mut kept = 0usize;
         for entry in range {
-            bytes += entry.encoded_len() as u64;
+            bytes += measure(entry);
             if kept > 0 && bytes > max_bytes {
                 break;
             }
@@ -187,8 +214,8 @@ impl raft::Storage for Store {
     fn initial_state(&self) -> raft::Result<raft::RaftState> {
         let disk = &self.0;
         Ok(raft::RaftState {
-            hard_state: disk.hard_state.clone(),
-            conf_state: disk.conf.clone(),
+            hard_state: convert::hard_to(&disk.hard_state),
+            conf_state: convert::conf_to(&disk.conf),
         })
     }
     fn entries(
@@ -197,7 +224,7 @@ impl raft::Storage for Store {
         high: u64,
         max_size: impl Into<Option<u64>>,
         _context: raft::GetEntriesContext,
-    ) -> raft::Result<Vec<Entry>> {
+    ) -> raft::Result<Vec<raft::prelude::Entry>> {
         let disk = &self.0;
         if low < disk.first_index() {
             return Err(raft::StorageError::Compacted.into());
@@ -205,7 +232,16 @@ impl raft::Storage for Store {
         if low > high || high > disk.last_index() + 1 {
             return Err(raft::StorageError::Unavailable.into());
         }
-        Ok(disk.slice(low, high, max_size.into().unwrap_or(u64::MAX)))
+        Ok(disk
+            .slice(
+                low,
+                high,
+                max_size.into().unwrap_or(u64::MAX),
+                convert::old_bytes,
+            )
+            .iter()
+            .map(convert::entry_to)
+            .collect())
     }
     fn term(&self, index: u64) -> raft::Result<u64> {
         let disk = &self.0;
@@ -221,19 +257,19 @@ impl raft::Storage for Store {
     fn last_index(&self) -> raft::Result<u64> {
         Ok(self.0.last_index())
     }
-    fn snapshot(&self, request_index: u64, _to: u64) -> raft::Result<Snapshot> {
+    fn snapshot(&self, request_index: u64, _to: u64) -> raft::Result<raft::prelude::Snapshot> {
         let disk = &self.0;
         if disk.snapshot_index() == 0 || disk.snapshot_index() < request_index {
             return Err(raft::StorageError::SnapshotTemporarilyUnavailable.into());
         }
-        Ok(disk.snapshot.clone())
+        Ok(convert::snapshot_to(&disk.snapshot))
     }
 }
 impl hyper_raft::Storage for Store {
     fn initial_state(&self) -> Result<hyper_raft::InitialState, hyper_raft::StorageError> {
         let disk = &self.0;
         Ok(hyper_raft::InitialState {
-            hard_state: disk.hard_state.clone(),
+            hard_state: disk.hard_state,
             configuration: disk.conf.clone(),
             proposals: disk.proposals.clone(),
         })
@@ -252,7 +288,7 @@ impl hyper_raft::Storage for Store {
         if low > high || high > disk.last_index() + 1 {
             return Err(hyper_raft::StorageError::Unavailable);
         }
-        let page = disk.slice(low, high, max_bytes);
+        let page = disk.slice(low, high, max_bytes, hyper_raft::proto::encoded_bytes);
         into.try_reserve_exact(page.len())
             .map_err(|_| hyper_raft::StorageError::Unavailable)?;
         into.extend(page);
@@ -342,7 +378,7 @@ impl App {
     }
 }
 
-pub type Said = (u64, u64, i32, Vec<u8>);
+pub type Said = (u64, u64, EntryType, Vec<u8>);
 fn said(entry: &Entry) -> Said {
     (
         entry.index,
@@ -402,14 +438,27 @@ pub struct Settings {
     pub heartbeat_tick: usize,
     pub max_size_per_msg: u64,
     pub max_inflight_msgs: usize,
+    /// The bytes of entries a member is sent ahead of its answers;
+    /// `raft-rs` has no such bound.
+    pub max_inflight_bytes: u64,
     pub max_uncommitted_size: u64,
     pub max_committed_size_per_ready: u64,
     pub check_quorum: bool,
     pub pre_vote: bool,
     /// Whether priority yields to a longer log alone, as in `raft-rs`.
     pub by_length: bool,
+    /// Whether a leader sends a round of heartbeats for each read as it is
+    /// asked, as in `raft-rs`.
+    pub round_each: bool,
+    /// Whether a heartbeat's answer says nothing of the member's log and
+    /// frees a full window's first message, as in `raft-rs`.
+    pub bare_answers: bool,
     /// Whether the group has the fast track.
     pub fast: bool,
+    /// Whether this core's members are driven by `RawNode::ready_in_place`,
+    /// persisting their entries and applying what is committed where they
+    /// are, rather than by `RawNode::ready`'s copies.
+    pub in_place: bool,
 }
 impl Settings {
     /// As focal's shell sets a group.
@@ -419,18 +468,27 @@ impl Settings {
             heartbeat_tick: 2,
             max_size_per_msg: 4 * 1024 * 1024 + 1024,
             max_inflight_msgs: 128,
+            max_inflight_bytes: u64::MAX,
             max_uncommitted_size: 32 * 1024 * 1024,
             max_committed_size_per_ready: 16 * 1024 * 1024,
             check_quorum: true,
             pre_vote: true,
             by_length: true,
+            round_each: true,
+            bare_answers: true,
             fast: false,
+            in_place: false,
         }
     }
     /// As focal runs this core.
     pub fn focal() -> Self {
         Self {
             by_length: false,
+            round_each: false,
+            bare_answers: false,
+            // A few of a schedule's entries: the window fills by its
+            // bytes long before it fills by its places.
+            max_inflight_bytes: 256,
             ..Self::shell()
         }
     }
@@ -463,6 +521,9 @@ pub trait Replica: Sized {
     fn unreachable(&mut self, member: u64);
     fn snapshot_status(&mut self, member: u64, arrived: bool);
     fn set_priority(&mut self, priority: i64);
+    /// What the path to `member` carries before it answers. `raft-rs` has
+    /// no such bound and does nothing.
+    fn set_window(&mut self, _member: u64, _bytes: u64) {}
     fn set_timeout(&mut self, ticks: usize);
     fn drain(&mut self) -> Output;
     fn view(&self) -> View;
@@ -495,18 +556,12 @@ fn canonical(mut messages: Vec<Message>) -> Vec<Message> {
     messages
 }
 fn change_of(entry: &Entry) -> Option<Result<ConfChangeV2, ConfChange>> {
-    match EntryType::from_i32(entry.entry_type)? {
+    match entry.entry_type {
         EntryType::EntryNormal => None,
-        EntryType::EntryConfChange => {
-            let mut change = ConfChange::default();
-            change.merge_from_bytes(&entry.data).ok()?;
-            Some(Err(change))
-        }
-        EntryType::EntryConfChangeV2 => {
-            let mut change = ConfChangeV2::default();
-            change.merge_from_bytes(&entry.data).ok()?;
-            Some(Ok(change))
-        }
+        EntryType::EntryConfChange if entry.data.is_empty() => Some(Err(ConfChange::default())),
+        EntryType::EntryConfChange => ConfChange::decode(&entry.data).ok().map(Err),
+        EntryType::EntryConfChangeV2 if entry.data.is_empty() => Some(Ok(ConfChangeV2::default())),
+        EntryType::EntryConfChangeV2 => ConfChangeV2::decode(&entry.data).ok().map(Ok),
     }
 }
 fn role(state: u8) -> u8 {
@@ -520,10 +575,18 @@ pub struct Old {
     pub raw: raft::RawNode<Store>,
     priority: i64,
     app: App,
+    /// What the changes raft-rs counts as uncommitted take in this core's format beyond what
+    /// they take in raft-rs's, kept by raft-rs's own rule (`Old::note_lead`).
+    change_bytes: isize,
+    /// The term this member last led, and its log's last index as it took the lead: raft-rs
+    /// counts what it appends past that index and forgets the count when it next leads.
+    led: (u64, u64),
 }
 impl Old {
     fn settle(&mut self) {
-        let effective = if self.raw.raft.term == 0 {
+        // As this core settles it: no term, or no voter, and the priority
+        // judges nothing.
+        let effective = if self.raw.raft.term == 0 || !self.raw.raft.promotable() {
             0
         } else {
             self.priority
@@ -540,6 +603,10 @@ impl Old {
     }
     fn apply(&mut self, entries: Vec<Entry>, output: &mut Output) {
         for entry in entries {
+            // raft-rs takes a committed entry past the tail off its count while it leads.
+            if self.raw.raft.state == raft::StateRole::Leader && entry.index > self.led.1 {
+                self.change_bytes -= extra(&entry);
+            }
             output.committed.push(said(&entry));
             self.app.apply(&entry);
             let Some(change) = change_of(&entry) else {
@@ -547,12 +614,12 @@ impl Old {
             };
             let led = self.raw.raft.state == raft::StateRole::Leader;
             let applied = match change {
-                Ok(change) => self.raw.apply_conf_change(&change),
-                Err(change) => self.raw.apply_conf_change(&change),
+                Ok(change) => self.raw.apply_conf_change(&convert::change_to(&change)),
+                Err(change) => self.raw.apply_conf_change(&convert::single_to(&change)),
             };
             match applied {
                 Ok(conf) => {
-                    let conf = sorted(conf);
+                    let conf = sorted(convert::conf_from(conf));
                     if led && !votes(&conf, self.raw.raft.id) {
                         output.leader_left = true;
                     }
@@ -592,6 +659,8 @@ impl Replica for Old {
             raw,
             priority: 0,
             app,
+            change_bytes: 0,
+            led: (0, 0),
         }
     }
     fn id(&self) -> u64 {
@@ -609,20 +678,23 @@ impl Replica for Old {
     fn step(&mut self, message: Message) -> bool {
         self.operate(|raw| {
             // Priority never judges the vote a transfer asks for.
-            if message.msg_type == MessageType::MsgRequestVote as i32
+            if message.msg_type == MessageType::MsgRequestVote
                 && message.context.as_slice() == CAMPAIGN_TRANSFER
                 && raw.raft.priority != 0
             {
                 raw.set_priority(0);
             }
-            raw.step(message).is_ok()
+            raw.step(convert::message_to(&message)).is_ok()
         })
     }
     fn propose(&mut self, data: Vec<u8>) -> bool {
         self.operate(|raw| raw.propose(Vec::new(), data).is_ok())
     }
     fn propose_change(&mut self, change: &ConfChangeV2) -> bool {
-        self.operate(|raw| raw.propose_conf_change(Vec::new(), change.clone()).is_ok())
+        self.operate(|raw| {
+            raw.propose_conf_change(Vec::new(), convert::change_to(change))
+                .is_ok()
+        })
     }
     fn campaign(&mut self) -> bool {
         // As the shell asks: `raft-rs` lets one that is no voter campaign,
@@ -665,20 +737,36 @@ impl Replica for Old {
         while self.raw.has_ready() {
             let mut ready = self.raw.ready();
             if !ready.snapshot().is_empty() {
-                let snapshot = ready.snapshot().clone();
+                let snapshot = convert::snapshot_from(ready.snapshot());
                 let metadata = snapshot.metadata.clone().unwrap_or_default();
                 output.snapshots.push((metadata.index, metadata.term));
                 self.app = App::decode(&snapshot.data);
                 self.raw.mut_store().0.install(&snapshot);
             }
-            output.persisted.extend(ready.entries().iter().map(said));
-            self.raw.mut_store().0.append(ready.entries());
+            let entries: Vec<Entry> = ready.entries().iter().map(convert::entry_from).collect();
+            self.note_lead();
+            if self.raw.raft.state == raft::StateRole::Leader {
+                // What a leader persists in its term past the tail it appended itself, and
+                // counted as it appended it.
+                for entry in &entries {
+                    if entry.term == self.led.0 && entry.index > self.led.1 {
+                        self.change_bytes += extra(entry);
+                    }
+                }
+            }
+            output.persisted.extend(entries.iter().map(said));
+            self.raw.mut_store().0.append(&entries);
             if let Some(hard) = ready.hs() {
                 output.hard_states.push((hard.term, hard.vote, hard.commit));
-                self.raw.mut_store().0.hard_state = hard.clone();
+                self.raw.mut_store().0.hard_state = convert::hard_from(hard);
             }
-            messages.extend(ready.take_messages());
-            messages.extend(ready.take_persisted_messages());
+            messages.extend(ready.take_messages().into_iter().map(convert::message_from));
+            messages.extend(
+                ready
+                    .take_persisted_messages()
+                    .into_iter()
+                    .map(convert::message_from),
+            );
             output.reads.extend(
                 ready
                     .take_read_states()
@@ -686,7 +774,10 @@ impl Replica for Old {
                     .map(|read| (read.index, read.request_ctx)),
             );
             let committed = ready.take_committed_entries();
-            self.apply(committed, &mut output);
+            self.apply(
+                committed.iter().map(convert::entry_from).collect(),
+                &mut output,
+            );
             let mut light = self.raw.advance_append(ready);
             if let Some(commit) = light.commit_index() {
                 let disk = &mut self.raw.mut_store().0;
@@ -695,9 +786,12 @@ impl Replica for Old {
                     .hard_states
                     .push((disk.hard_state.term, disk.hard_state.vote, commit));
             }
-            messages.extend(light.take_messages());
+            messages.extend(light.take_messages().into_iter().map(convert::message_from));
             let committed = light.take_committed_entries();
-            self.apply(committed, &mut output);
+            self.apply(
+                committed.iter().map(convert::entry_from).collect(),
+                &mut output,
+            );
             self.raw.advance_apply_to(self.app.index);
             self.settle();
         }
@@ -748,7 +842,7 @@ impl Replica for Old {
             pending_conf: raft.pending_conf_index,
             transferee: raft.lead_transferee,
             promotable: raft.promotable(),
-            uncommitted: raft.uncommitted_size(),
+            uncommitted: self.uncommitted(),
             pending_reads: raft.pending_read_count(),
             app: self.app,
             members,
@@ -759,12 +853,47 @@ impl Replica for Old {
     }
 }
 
+/// What a change entry's data takes in this core's format beyond raft-rs's.
+fn extra(entry: &Entry) -> isize {
+    if entry.entry_type == EntryType::EntryNormal {
+        return 0;
+    }
+    entry.data.len() as isize - convert::entry_to(entry).data.len() as isize
+}
+
+impl Old {
+    /// raft-rs's uncommitted bytes as this core counts them: each change raft-rs counted in its
+    /// encoding is counted in this core's (`docs/raft.md` §3.1).
+    fn uncommitted(&self) -> usize {
+        // A count of nothing holds no change: raft-rs's floor at zero forgets them too.
+        match self.raw.raft.uncommitted_size() {
+            0 => 0,
+            counted => (counted as isize + self.change_bytes) as usize,
+        }
+    }
+    /// raft-rs's rule: a member that takes the lead forgets its count, and counts what it
+    /// appends past its log's last index as it took the lead.
+    fn note_lead(&mut self) {
+        let raft = &self.raw.raft;
+        if raft.state != raft::StateRole::Leader || raft.term == self.led.0 {
+            return;
+        }
+        let mut tail = raft.raft_log.last_index();
+        while tail > raft.raft_log.committed && raft.raft_log.term(tail).ok() == Some(raft.term) {
+            tail -= 1;
+        }
+        self.led = (raft.term, tail);
+        self.change_bytes = 0;
+    }
+}
+
 // ---------------------------------------------------------------------
 // hyper-raft.
 
 pub struct New {
     pub raw: hyper_raft::RawNode<Store>,
     app: App,
+    in_place: bool,
 }
 impl New {
     fn apply(&mut self, entries: Vec<Entry>, output: &mut Output) {
@@ -805,6 +934,25 @@ fn heard<T>(outcome: hyper_raft::Result<T>) -> Option<T> {
     }
 }
 impl New {
+    /// What a `Ready` gives to apply: its copies, or, given in place, the
+    /// range read from storage.
+    fn committed(&self, copies: Vec<Entry>, range: Option<(u64, u64)>) -> Vec<Entry> {
+        let Some((first, last)) = range else {
+            return copies;
+        };
+        assert!(
+            copies.is_empty(),
+            "a ready in place copied what it gives to apply"
+        );
+        assert!(
+            self.in_place,
+            "a range given to apply by a ready that copies"
+        );
+        let disk = &self.raw.store().0;
+        (first..=last)
+            .map(|index| disk.entries[(index - disk.first_index()) as usize].clone())
+            .collect()
+    }
     pub fn fast_stats(&self) -> hyper_raft::FastStats {
         self.raw.raft.fast_stats()
     }
@@ -832,6 +980,7 @@ impl Replica for New {
             applied,
             max_size_per_msg: settings.max_size_per_msg,
             max_inflight_msgs: settings.max_inflight_msgs,
+            max_inflight_bytes: settings.max_inflight_bytes,
             max_uncommitted_size: settings.max_uncommitted_size,
             max_committed_size_per_ready: settings.max_committed_size_per_ready,
             check_quorum: settings.check_quorum,
@@ -841,12 +990,26 @@ impl Replica for New {
             } else {
                 hyper_raft::Precedence::Log
             },
+            read_rounds: if settings.round_each {
+                hyper_raft::ReadRounds::Each
+            } else {
+                hyper_raft::ReadRounds::Shared
+            },
+            heartbeat_answers: if settings.bare_answers {
+                hyper_raft::HeartbeatAnswers::Bare
+            } else {
+                hyper_raft::HeartbeatAnswers::Position
+            },
             fast: settings.fast,
             seed,
             ..hyper_raft::Config::new(id)
         };
         let raw = hyper_raft::RawNode::new(&config, store).expect("hyper-raft opens");
-        Self { raw, app }
+        Self {
+            raw,
+            app,
+            in_place: settings.in_place,
+        }
     }
     fn id(&self) -> u64 {
         self.raw.raft.id()
@@ -898,6 +1061,9 @@ impl Replica for New {
     fn set_priority(&mut self, priority: i64) {
         self.raw.set_priority(priority);
     }
+    fn set_window(&mut self, member: u64, bytes: u64) {
+        self.raw.set_inflight_bytes(member, bytes);
+    }
     fn set_timeout(&mut self, ticks: usize) {
         self.raw
             .raft
@@ -908,15 +1074,37 @@ impl Replica for New {
         let mut output = Output::default();
         let mut messages = Vec::new();
         while self.raw.has_ready() {
-            let mut ready = self.raw.ready().expect("a ready");
+            let mut ready = if self.in_place {
+                self.raw.ready_in_place().expect("a ready")
+            } else {
+                self.raw.ready().expect("a ready")
+            };
             if let Some(snapshot) = ready.snapshot() {
                 let metadata = snapshot.metadata.clone().unwrap_or_default();
                 output.snapshots.push((metadata.index, metadata.term));
                 self.app = App::decode(&snapshot.data);
                 self.raw.store_mut().0.install(snapshot);
             }
-            output.persisted.extend(ready.entries().iter().map(said));
-            {
+            if self.in_place {
+                // Read where the member holds them, and persisted before
+                // anything else is asked of it; the snapshot and the entries
+                // themselves are kept when the ready advances.
+                assert!(
+                    ready.entries().is_empty() && ready.snapshot().is_none(),
+                    "a ready in place copied what it persists"
+                );
+                let persist = self.raw.to_persist();
+                if let Some(snapshot) = persist.snapshot {
+                    let metadata = snapshot.metadata.clone().unwrap_or_default();
+                    output.snapshots.push((metadata.index, metadata.term));
+                    self.app = App::decode(&snapshot.data);
+                }
+                output.persisted.extend(persist.entries.iter().map(said));
+                let disk = &mut persist.store.0;
+                disk.proposals.extend(ready.proposals().iter().cloned());
+                disk.trim_proposals();
+            } else {
+                output.persisted.extend(ready.entries().iter().map(said));
                 let disk = &mut self.raw.store_mut().0;
                 disk.proposals.extend(ready.proposals().iter().cloned());
                 disk.append(ready.entries());
@@ -924,7 +1112,7 @@ impl Replica for New {
             output.displaced.extend(ready.displaced().iter().map(said));
             if let Some(hard) = ready.hard_state() {
                 output.hard_states.push((hard.term, hard.vote, hard.commit));
-                self.raw.store_mut().0.hard_state = hard.clone();
+                self.raw.store_mut().0.hard_state = *hard;
             }
             for message in ready.messages().iter().chain(ready.persisted_messages()) {
                 // A page is sized before it is copied: it holds no spare
@@ -944,9 +1132,20 @@ impl Replica for New {
                     .into_iter()
                     .map(|read| (read.index, read.request_ctx)),
             );
-            let committed = ready.take_committed_entries();
+            let committed = self.committed(ready.take_committed_entries(), ready.committed_range());
             self.apply(committed, &mut output);
-            let mut light = self.raw.advance_append(ready).expect("advanced");
+            let mut light = if self.in_place {
+                self.raw
+                    .advance_append_keeping(ready, |store, kept| {
+                        if let Some(snapshot) = kept.snapshot {
+                            store.0.install_owned(snapshot);
+                        }
+                        store.0.keep(kept.entries);
+                    })
+                    .expect("advanced")
+            } else {
+                self.raw.advance_append(ready).expect("advanced")
+            };
             if let Some(commit) = light.commit_index() {
                 let disk = &mut self.raw.store_mut().0;
                 disk.hard_state.commit = commit;
@@ -955,7 +1154,7 @@ impl Replica for New {
                     .push((disk.hard_state.term, disk.hard_state.vote, commit));
             }
             messages.extend(light.take_messages());
-            let committed = light.take_committed_entries();
+            let committed = self.committed(light.take_committed_entries(), light.committed_range());
             self.apply(committed, &mut output);
             self.raw.advance_apply_to(self.app.index).expect("applied");
         }
@@ -1091,6 +1290,9 @@ impl Replica for Either {
     }
     fn set_priority(&mut self, priority: i64) {
         either!(self, node => node.set_priority(priority))
+    }
+    fn set_window(&mut self, member: u64, bytes: u64) {
+        either!(self, node => node.set_window(member, bytes))
     }
     fn set_timeout(&mut self, ticks: usize) {
         either!(self, node => node.set_timeout(ticks))

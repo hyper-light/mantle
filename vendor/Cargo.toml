@@ -2,6 +2,9 @@
 # copy (vendor/UPSTREAM.md): cargo test --manifest-path vendor/Cargo.toml --workspace --locked
 [workspace]
 members = ["aws-lc-rs", "aws-lc-sys"]
+# Shared crates from hyper-raft are their own roots: hyper-raft's CI runs their suites on every
+# target, and mantle's suites run against them (vendor/UPSTREAM.md).
+exclude = ["hyper-raft"]
 resolver = "2"
 
 [patch.crates-io]

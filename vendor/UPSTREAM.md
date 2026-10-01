@@ -83,3 +83,17 @@ command on the six targets.
 3. Replace the test data from the new tag's source archive.
 4. Run the vendored suites and mantle's gates. Update the versions, checksums, commits and
    test count in this file.
+
+## hyper-raft (shared crates)
+
+The crates mantle shares with focal and slates come from github.com/hyper-light/hyper-raft:
+- each is a snapshot of one crate, its manifest made self-contained, with its source revision in
+  `SNAPSHOT`;
+- each is a workspace root of its own, excluded from this workspace;
+- hyper-raft's CI runs their suites on all six targets, and mantle's own suites run against the
+  snapshot;
+- a change is made in hyper-raft and taken here by a new snapshot, never edited in place.
+
+| Snapshot | Revision | Used by |
+|---|---|---|
+| `hyper-raft` | `SNAPSHOT` | `crates/range`, as `focal-raft` (Cargo rename) |

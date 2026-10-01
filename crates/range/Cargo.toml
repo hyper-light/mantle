@@ -1,6 +1,6 @@
 [package]
 name = "mantle-range"
-description = "A range replica: focal-raft's core driven over the shared log and a state engine"
+description = "A range replica: hyper-raft's core driven over the shared log and a state engine"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -10,7 +10,9 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-focal-raft = { git = "https://github.com/hyper-light/focal", rev = "1395e223c065e85158ec1611fdc72073d28fd8a0" }
+# The shared Raft core, vendored from hyper-raft (vendor/hyper-raft/SNAPSHOT); named focal-raft so
+# the replica's `focal_raft::` paths are unchanged.
+focal-raft = { package = "hyper-raft", path = "../../vendor/hyper-raft" }
 mantle-codec = { path = "../codec" }
 mantle-crc = { path = "../crc" }
 mantle-disk = { path = "../disk" }

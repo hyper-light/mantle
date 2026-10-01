@@ -124,6 +124,39 @@ impl<F: BlockFile + 'static> Storage for LogStore<F> {
         Ok(())
     }
 
+    /// Walks `[low, high)` a page at a time, a page being one log segment's bytes, the most one
+    /// read of the log returns; it stops at the first entry `predicate` accepts, so no more is
+    /// read than the answer needs and no page outgrows a segment.
+    fn any_entry(
+        &self,
+        low: u64,
+        high: u64,
+        predicate: &mut dyn FnMut(&Entry) -> bool,
+    ) -> Result<bool, StorageError> {
+        let page_bytes = self.log.config().segment_bytes;
+        let mut next = low;
+        while next < high {
+            let entries = self
+                .log
+                .entries(self.group, next, high, page_bytes)
+                .map_err(|e| storage(&e))?;
+            if entries.is_empty() {
+                return Err(StorageError::Unavailable);
+            }
+            for e in entries {
+                let entry = decode_entry(next, e.term, &e.bytes)
+                    .ok_or(StorageError::Other("an entry does not decode"))?;
+                if predicate(&entry) {
+                    return Ok(true);
+                }
+                next = next
+                    .checked_add(1)
+                    .ok_or(StorageError::Other("an index past u64"))?;
+            }
+        }
+        Ok(false)
+    }
+
     fn term(&self, index: u64) -> Result<u64, StorageError> {
         match self.log.term(self.group, index) {
             Ok(term) => Ok(term),

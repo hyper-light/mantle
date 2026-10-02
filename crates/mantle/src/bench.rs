@@ -48,7 +48,7 @@ use hyper_block::buf::{AlignedBuf, Alignment};
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::issuer::{self, Issuer};
 use hyper_block::scratch::Scratch;
-use mantle_chunk::{ChunkError, ChunkKey, Config, Reads, Volume};
+use mantle_chunk::{ChunkError, ChunkKey, Config, ReadBuffers, Reads, Volume};
 use mantle_disk::calibrate::{self, Calibration};
 use mantle_disk::histogram::Histogram;
 use mantle_disk::measure::SplitMix64;
@@ -951,15 +951,16 @@ fn gets(
         path,
         load,
         !load.point,
-        || Ok(Vec::new()),
-        |buf: &mut Vec<u8>, rng: &mut SplitMix64| {
+        // Each reader's output and its own read buffers.
+        || Ok((Vec::new(), v.read_buffers())),
+        |(buf, buffers): &mut (Vec<u8>, ReadBuffers), rng: &mut SplitMix64| {
             // In range: `pick < count`, the keys' number.
             let pick = usize::try_from(rng.below(count)).unwrap_or(0);
             let k = keys
                 .get(pick)
                 .ok_or(ChunkError::Internal("a key past the keys"))?;
             let from = rng.below(places).saturating_mul(len64);
-            v.read_into(k, from, len64, buf)
+            v.read_into(k, from, len64, buf, buffers)
         },
     )?;
     if let Some(e) = failed {

@@ -74,7 +74,7 @@ impl BlockFile for Watch {
         self.file.alignment()
     }
     fn len(&self) -> Result<u64, DiskError> {
-        BlockFile::len(&*self.file)
+        BlockFile::len(&self.file)
     }
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), DiskError> {
         self.file.read_exact_at(buf, offset)

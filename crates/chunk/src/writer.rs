@@ -44,7 +44,7 @@ use crate::layout::{
 };
 use crate::log::Cursor;
 use crate::record::{self, FLAG_FINAL, Payload, RecordHeader, SegmentHeader, Sink};
-use crate::recover::{Identity, verify_at};
+use crate::recover::{Identity, ReadPool, verify_at};
 use crate::superblock::Superblock;
 
 /// Free segments kept back from new writes so the cleaner can always relocate into one
@@ -149,8 +149,6 @@ pub(crate) struct Shared<F> {
     pub geometry: Geometry,
     pub volume: u128,
     pub checksum_shift: u8,
-    /// Buffers for reading records: reads, verification, cleaning and scrubbing.
-    pub pool: crate::recover::ReadPool,
     pub index: RwLock<Index>,
     pub fenced: std::sync::atomic::AtomicBool,
     /// Set when the volume closes: background threads stop at their next wake.
@@ -213,6 +211,9 @@ pub(crate) struct Writer<F: BlockFile> {
     pub poke: Option<SyncSender<()>>,
     /// Buffers for the batches the writer lays out, reused from batch to batch.
     pub pool: Pool,
+    /// The writer thread's own read buffers, for the stored copy a retry is compared with:
+    /// recovery's, handed on when the volume starts.
+    pub reads: ReadPool,
     /// The device's issuer, which every write and flush of the volume goes through
     /// (docs/design/chunk-store.md §4).
     pub io: Attached,
@@ -752,16 +753,22 @@ impl<F: BlockFile> Writer<F> {
     }
 
     /// Reads the durable fragment `f` of `key` and compares its bytes with `bytes`.
-    fn stored_bytes(&self, key: &ChunkKey, f: &Fragment, bytes: &[u8]) -> Stored {
+    fn stored_bytes(
+        shared: &Shared<F>,
+        reads: &mut ReadPool,
+        key: &ChunkKey,
+        f: &Fragment,
+        bytes: &[u8],
+    ) -> Stored {
         let identity = Identity {
-            volume: self.shared.volume,
-            checksum_shift: self.shared.checksum_shift,
+            volume: shared.volume,
+            checksum_shift: shared.checksum_shift,
         };
         let mut data = Vec::new();
         let read = verify_at(
-            &self.shared.file,
-            &self.shared.pool,
-            &self.shared.geometry,
+            &shared.file,
+            reads,
+            &shared.geometry,
             identity,
             f.segment,
             u64::from(f.offset),
@@ -867,7 +874,13 @@ impl<F: BlockFile> Writer<F> {
                                 // The same length and CRC-32C, which a different payload can
                                 // share: the bytes decide whether this is a retry (audit B05).
                                 match stored {
-                                    Some(f) => match self.stored_bytes(key, &f, &payload.data) {
+                                    Some(f) => match Self::stored_bytes(
+                                        &self.shared,
+                                        &mut self.reads,
+                                        key,
+                                        &f,
+                                        &payload.data,
+                                    ) {
                                         Stored::Same => Ok(Decision::Done),
                                         Stored::Differs => Err(refused),
                                         // The stored copy no longer verifies: the retry, the

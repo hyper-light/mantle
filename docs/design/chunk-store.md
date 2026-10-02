@@ -540,6 +540,12 @@ key reads as not found rather than as a mix of the two. Range reads, cold and wa
 beside writes, are measured in
 [measurements](../measurements/2026-09-30-chunk-range-reads.md).
 
+The aligned buffers a read fills from the device are its reader's own: each caller of a read
+keeps its own (`ReadBuffers`, `Volume::read_into`), and the writer, the cleaner, the scrubber
+and recovery each keep theirs, at most a batch's bytes free, what that reader's own reads
+took. hyper-block's pool has one owner, the thread that issues the I/O its buffers carry, so no
+reader takes a buffer from another's and none waits on another for one.
+
 ## 8. Deleting and cleaning
 
 A delete appends `Delete` to the index log in the next batch and removes the entry; the

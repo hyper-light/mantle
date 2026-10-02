@@ -13,7 +13,7 @@ use crate::index::Fragment;
 use crate::key::ChunkKey;
 use crate::layout::Reads;
 use crate::record;
-use crate::recover::read_span;
+use crate::recover::{ReadPool, Span, read_span};
 use crate::writer::Shared;
 
 /// What the gate has let through and refused.
@@ -195,10 +195,11 @@ impl Plan {
     }
 }
 
-/// Appends payload bytes `[from, to)` of `fragment` to `out`. A device error or any failed
-/// check is `Corrupt`: the caller reads another copy.
+/// Appends payload bytes `[from, to)` of `fragment` to `out`, read through the caller's own
+/// buffers. A device error or any failed check is `Corrupt`: the caller reads another copy.
 pub(crate) fn fragment<F: BlockFile>(
     shared: &Shared<F>,
+    reads: &mut ReadPool,
     key: &ChunkKey,
     fragment: &Fragment,
     from: u64,
@@ -211,17 +212,15 @@ pub(crate) fn fragment<F: BlockFile>(
     };
     let geometry = &shared.geometry;
     let shift = shared.checksum_shift;
-    let block_size = 1u64.checked_shl(u32::from(shift)).unwrap_or(u64::MAX);
     let plan = Plan::new(shift, fragment, from, to, shared.reads.gap())
         .ok_or_else(|| corrupt("record size"))?;
     let (payload_from, last_block_end) = plan.blocks;
-    let first_block = payload_from.checked_div(block_size).unwrap_or(0);
     let base = geometry
         .segment_offset(fragment.segment)
         .ok_or_else(|| corrupt("segment"))?;
-    let read = |offset: u64, len: u64| match read_span(
+    let read = |reads: &mut ReadPool, offset: u64, len: u64| match read_span(
         &shared.file,
-        &shared.pool,
+        reads,
         geometry,
         base,
         offset,
@@ -236,23 +235,64 @@ pub(crate) fn fragment<F: BlockFile>(
     // The header and table, with the blocks when they are near enough to read past the
     // payload before them; the blocks apart otherwise.
     let head = if plan.apart {
-        read(record_at, plan.prefix)?
+        read(reads, record_at, plan.prefix)?
     } else {
-        read(record_at, plan.bytes())?
+        read(reads, record_at, plan.bytes())?
     };
     let apart = if plan.apart {
-        Some(read(
-            record_at
-                .checked_add(plan.prefix)
-                .and_then(|at| at.checked_add(payload_from))
-                .ok_or_else(|| corrupt("offset"))?,
-            last_block_end.saturating_sub(payload_from),
-        )?)
+        let at = record_at
+            .checked_add(plan.prefix)
+            .and_then(|at| at.checked_add(payload_from))
+            .ok_or_else(|| corrupt("offset"));
+        match at.and_then(|at| read(reads, at, last_block_end.saturating_sub(payload_from))) {
+            Ok(span) => Some(span),
+            Err(e) => {
+                reads.give(head);
+                return Err(e);
+            }
+        }
     } else {
         None
     };
-    let prefix = record::decode_prefix(head.bytes())
-        .ok_or_else(|| corrupt("record header did not verify"))?;
+    let checked = check(
+        shared,
+        key,
+        fragment,
+        &plan,
+        (from, to),
+        (head.bytes(), apart.as_ref().map(Span::bytes)),
+        out,
+    );
+    reads.give(head);
+    if let Some(span) = apart {
+        reads.give(span);
+    }
+    checked
+}
+
+/// Verifies a read of `fragment` against the index and its checksums, from the header and
+/// table in `head` and the checksum blocks in `apart`, or after the table in `head` when
+/// read with it, and appends payload bytes `[from, to)` to `out`.
+fn check<F>(
+    shared: &Shared<F>,
+    key: &ChunkKey,
+    fragment: &Fragment,
+    plan: &Plan,
+    (from, to): (u64, u64),
+    (head, apart): (&[u8], Option<&[u8]>),
+    out: &mut Vec<u8>,
+) -> Result<(), ChunkError> {
+    let corrupt = |detail: &str| ChunkError::Corrupt {
+        key: *key,
+        detail: detail.to_owned(),
+    };
+    let block_size = 1u64
+        .checked_shl(u32::from(shared.checksum_shift))
+        .unwrap_or(u64::MAX);
+    let (payload_from, last_block_end) = plan.blocks;
+    let first_block = payload_from.checked_div(block_size).unwrap_or(0);
+    let prefix =
+        record::decode_prefix(head).ok_or_else(|| corrupt("record header did not verify"))?;
     let h = &prefix.header;
     if h.key != *key
         || h.volume != shared.volume
@@ -264,15 +304,14 @@ pub(crate) fn fragment<F: BlockFile>(
     {
         return Err(corrupt("record identity does not match the index"));
     }
-    let blocks = match &apart {
-        Some(span) => span.bytes(),
+    let blocks = match apart {
+        Some(bytes) => bytes,
         None => {
             let start = usize::try_from(plan.prefix.saturating_add(payload_from))
                 .map_err(|_| corrupt("offset"))?;
             let stop = usize::try_from(plan.prefix.saturating_add(last_block_end))
                 .map_err(|_| corrupt("offset"))?;
-            head.bytes()
-                .get(start..stop)
+            head.get(start..stop)
                 .ok_or_else(|| corrupt("short record"))?
         }
     };

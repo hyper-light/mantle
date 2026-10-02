@@ -13,7 +13,7 @@
 
 mod common;
 
-use common::device::Sim;
+use common::device::SimDevice;
 use common::{
     SIZE, assert_confirmation, config, damage_frame, data, frames, issuer, key, last_frame, sim,
 };
@@ -22,7 +22,7 @@ use hyper_block::sim::{Crash, Fault};
 use mantle_chunk::{ChunkError, Volume};
 
 /// Where `needle` sits in what the device durably holds.
-fn find(file: &Sim, needle: &[u8]) -> u64 {
+fn find(file: &SimDevice, needle: &[u8]) -> u64 {
     let image = file.durable_image().unwrap();
     let at = image
         .windows(needle.len())
@@ -93,7 +93,7 @@ fn a_read_error_is_reported_as_corruption() {
 
 /// The superblock sequence each copy holds: A at 0, B at 64 KiB in a compact volume, the
 /// sequence 32 bytes into either (superblock.rs).
-fn superblock_sequences(file: &Sim) -> [(u64, u64); 2] {
+fn superblock_sequences(file: &SimDevice) -> [(u64, u64); 2] {
     let image = file.durable_image().unwrap();
     [0u64, 64 << 10].map(|at| {
         let from = at as usize + 32;

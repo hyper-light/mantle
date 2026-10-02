@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use hyper_block::issuer::Issuer;
 use mantle_chunk::{ChunkError, ChunkKey, Config, Limits, Reads, Volume};
 
-use device::{Sim, SimDevice};
+use device::SimDevice;
 
 /// The issuer of the one device every volume of a test binary is on, as a device's volumes
 /// share one, keeping four transfers in flight, as a device measured there.
@@ -86,7 +86,7 @@ pub fn data(seed: u64, len: usize) -> Vec<u8> {
 /// The index frames of `volume` the device durably holds, as (byte offset in the file, kind,
 /// LSN), in the order they sit on the device. A frame starts with its magic, version and
 /// kind, then its LSN and the volume's ID (frame.rs).
-pub fn frames(file: &Sim, volume: u128) -> Vec<(u64, u16, u64)> {
+pub fn frames(file: &SimDevice, volume: u128) -> Vec<(u64, u16, u64)> {
     let image = file.durable_image().unwrap();
     image
         .as_chunks::<4096>()
@@ -105,7 +105,7 @@ pub fn frames(file: &Sim, volume: u128) -> Vec<(u64, u16, u64)> {
 }
 
 /// The frame with the highest LSN.
-pub fn last_frame(file: &Sim, volume: u128) -> (u64, u16, u64) {
+pub fn last_frame(file: &SimDevice, volume: u128) -> (u64, u16, u64) {
     frames(file, volume)
         .into_iter()
         .max_by_key(|&(_, _, lsn)| lsn)
@@ -115,7 +115,7 @@ pub fn last_frame(file: &Sim, volume: u128) -> (u64, u16, u64) {
 /// Damages the frame at `at` for good: a stored bit of its CRC-32C, which every frame has,
 /// where its records may be too short to reach a given offset and bytes past them are padding
 /// no checksum covers.
-pub fn damage_frame(file: &Sim, at: u64) {
+pub fn damage_frame(file: &SimDevice, at: u64) {
     file.inject(hyper_block::sim::Fault::BitFlip {
         offset: at + 44,
         bit: 3,
@@ -126,7 +126,7 @@ pub fn damage_frame(file: &Sim, at: u64) {
 
 /// Asserts the frame at `at` is a confirmation: a batch frame (kind 1) of no records, the
 /// count 36 bytes in (frame.rs). Damage to it may lose nothing answered.
-pub fn assert_confirmation(file: &Sim, at: u64) {
+pub fn assert_confirmation(file: &SimDevice, at: u64) {
     let image = file.durable_image().unwrap();
     let at = at as usize;
     let kind = u16::from_le_bytes([image[at + 6], image[at + 7]]);

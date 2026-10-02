@@ -13,7 +13,7 @@ mod common;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use common::device::{Handle, Sim, SimDevice};
+use common::device::{Handle, SimDevice};
 use common::{SIZE, config, data, issuer, key, put_retrying, sim};
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
@@ -190,7 +190,7 @@ impl hyper_block::block::BlockFile for Counting {
         self.file.alignment()
     }
     fn len(&self) -> Result<u64, hyper_block::DiskError> {
-        hyper_block::block::BlockFile::len(&*self.file)
+        hyper_block::block::BlockFile::len(&self.file)
     }
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), hyper_block::DiskError> {
         self.read.fetch_add(buf.len() as u64, Ordering::SeqCst);
@@ -754,7 +754,7 @@ fn reads_past_the_depth_wait_or_are_refused() {
 }
 
 /// Where `bytes` first lie in the file's durable image.
-fn find(file: &Sim, bytes: &[u8]) -> u64 {
+fn find(file: &SimDevice, bytes: &[u8]) -> u64 {
     let image = file.durable_image().unwrap();
     image
         .windows(bytes.len())

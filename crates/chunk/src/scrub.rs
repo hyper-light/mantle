@@ -23,7 +23,7 @@ use hyper_block::block::BlockFile;
 use crate::error::ChunkError;
 use crate::frame::SegmentState;
 use crate::key::ChunkKey;
-use crate::recover::{Identity, verify_at};
+use crate::recover::{Identity, ReadPool, verify_at};
 use crate::writer::Shared;
 
 /// Damaged chunks remembered for repair. More than 80% of disks with latent sector errors had
@@ -84,6 +84,7 @@ pub(crate) struct Step {
 /// end to end.
 pub(crate) fn scrub_window<F: BlockFile>(
     shared: &Shared<F>,
+    reads: &mut ReadPool,
     findings: &SharedFindings,
     window: Range<u64>,
 ) -> Result<Step, ChunkError> {
@@ -97,7 +98,7 @@ pub(crate) fn scrub_window<F: BlockFile>(
         let from = u32::try_from(at.saturating_sub(base)).unwrap_or(u32::MAX);
         let to = u32::try_from(end.saturating_sub(base)).unwrap_or(u32::MAX);
         let segment = u32::try_from(segment).map_err(|_| ChunkError::Fenced)?;
-        scrub_range(shared, findings, segment, from..to, &mut step)?;
+        scrub_range(shared, reads, findings, segment, from..to, &mut step)?;
         at = end;
     }
     let mut f = findings.lock().map_err(|_| ChunkError::Fenced)?;
@@ -110,6 +111,7 @@ pub(crate) fn scrub_window<F: BlockFile>(
 /// and each checked against the index before it counts.
 fn scrub_range<F: BlockFile>(
     shared: &Shared<F>,
+    reads: &mut ReadPool,
     findings: &SharedFindings,
     segment: u32,
     offsets: Range<u32>,
@@ -134,7 +136,7 @@ fn scrub_range<F: BlockFile>(
         let at = u64::from(offset);
         let read = verify_at(
             &shared.file,
-            &shared.pool,
+            reads,
             &shared.geometry,
             identity,
             segment,
@@ -207,6 +209,7 @@ fn damaged_owner<F: BlockFile>(
 /// Scrubs the whole volume once, in the staggered order; returns the damaged records found.
 pub(crate) fn scrub_all<F: BlockFile>(
     shared: &Shared<F>,
+    reads: &mut ReadPool,
     findings: &SharedFindings,
 ) -> Result<u64, ChunkError> {
     let data = data_bytes(shared);
@@ -216,7 +219,8 @@ pub(crate) fn scrub_all<F: BlockFile>(
             break;
         }
         if let Some(window) = window(p, data) {
-            damaged = damaged.saturating_add(scrub_window(shared, findings, window)?.damaged);
+            damaged =
+                damaged.saturating_add(scrub_window(shared, reads, findings, window)?.damaged);
         }
     }
     let mut f = findings.lock().map_err(|_| ChunkError::Fenced)?;
@@ -232,10 +236,12 @@ pub(crate) struct Scrubber<F> {
     pub findings: SharedFindings,
     pub wake: std::sync::mpsc::Receiver<()>,
     pub period: Duration,
+    /// The scrubber thread's own read buffers.
+    pub reads: ReadPool,
 }
 
 impl<F: BlockFile> Scrubber<F> {
-    pub fn run(self) {
+    pub fn run(mut self) {
         let data = data_bytes(&self.shared);
         let count = positions(data);
         let (mut p, mut pass_bytes) = (0u64, 0u64);
@@ -256,7 +262,7 @@ impl<F: BlockFile> Scrubber<F> {
             let Some(window) = window(position, data) else {
                 continue;
             };
-            let bytes = match scrub_window(&self.shared, &self.findings, window) {
+            let bytes = match scrub_window(&self.shared, &mut self.reads, &self.findings, window) {
                 Ok(step) => step.bytes,
                 // The volume is fenced or closing: stop until woken.
                 Err(_) => {

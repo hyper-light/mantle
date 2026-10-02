@@ -26,7 +26,7 @@ use hyper_block::block::BlockFile;
 use crate::error::ChunkError;
 use crate::frame::SegmentState;
 use crate::record::{FLAG_FINAL, Payload};
-use crate::recover::{Identity, verify_at};
+use crate::recover::{Identity, ReadPool, verify_at};
 use crate::writer::{CLEANER_RESERVE, Move, Op, Reply, Request, Shared};
 
 pub(crate) struct Cleaner<F> {
@@ -84,6 +84,8 @@ pub struct CleanReport {
 
 impl<F: BlockFile> Cleaner<F> {
     pub fn run(self) {
+        // The cleaner thread's own read buffers.
+        let mut reads = self.reads();
         // Every change to free space runs a writer batch, and every batch below the runway
         // wakes the cleaner, so it waits for nothing else.
         while self.wake.recv().is_ok() {
@@ -103,11 +105,17 @@ impl<F: BlockFile> Cleaner<F> {
             // retries if there is still work.
             // A pass that ran and gained nothing, having found no victim worth cleaning or
             // cleaned some to no gain, is futile until more data dies.
-            if let Ok(Some(report)) = self.pass() {
+            if let Ok(Some(report)) = self.pass(&mut reads) {
                 let futile = if report.gained == 0 { dead } else { u64::MAX };
                 self.shared.futile_at.store(futile, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Read buffers for one cleaning thread, a batch's at most: a pass reads one record at a
+    /// time and relocates a batch at a time.
+    pub fn reads(&self) -> ReadPool {
+        ReadPool::of_batch(self.shared.file.alignment(), self.batch_bytes)
     }
 
     fn free(&self) -> usize {
@@ -119,24 +127,25 @@ impl<F: BlockFile> Cleaner<F> {
 
     /// Cleans victims until free segments are one past the runway, or none is worth it;
     /// `None` when free segments are at the runway already.
-    pub fn pass(&self) -> Result<Option<CleanReport>, ChunkError> {
+    pub fn pass(&self, reads: &mut ReadPool) -> Result<Option<CleanReport>, ChunkError> {
         let low = self.shared.low_water.load(Ordering::Relaxed);
         if self.free() >= low {
             return Ok(None);
         }
-        self.clean_until(|cleaner, _| {
+        self.clean_until(reads, |cleaner, _| {
             cleaner.free() <= cleaner.shared.low_water.load(Ordering::Relaxed)
         })
         .map(Some)
     }
 
     /// Cleans the `n` best victims, whatever the free space.
-    pub fn clean_best(&self, n: u32) -> Result<CleanReport, ChunkError> {
-        self.clean_until(|_, report| report.segments < n)
+    pub fn clean_best(&self, reads: &mut ReadPool, n: u32) -> Result<CleanReport, ChunkError> {
+        self.clean_until(reads, |_, report| report.segments < n)
     }
 
     fn clean_until(
         &self,
+        reads: &mut ReadPool,
         more: impl Fn(&Self, &CleanReport) -> bool,
     ) -> Result<CleanReport, ChunkError> {
         // One pass at a time, background or asked for, so two never take the same victims.
@@ -171,7 +180,7 @@ impl<F: BlockFile> Cleaner<F> {
             let live = self.live(victim);
             let incarnation = self.incarnation(victim);
             let started = Instant::now();
-            let (relocated, corrupt) = self.clean(victim)?;
+            let (relocated, corrupt) = self.clean(reads, victim)?;
             report.segments = report.segments.saturating_add(1);
             report.relocated = report.relocated.saturating_add(relocated);
             report.corrupt = report.corrupt.saturating_add(corrupt);
@@ -273,7 +282,7 @@ impl<F: BlockFile> Cleaner<F> {
 
     /// Relocates every live record of `segment`, found where they lie in the index's record
     /// places and each checked against the index as it is read; returns (relocated, corrupt).
-    fn clean(&self, segment: u32) -> Result<(u64, u64), ChunkError> {
+    fn clean(&self, reads: &mut ReadPool, segment: u32) -> Result<(u64, u64), ChunkError> {
         let incarnation = self
             .shared
             .usage
@@ -299,7 +308,7 @@ impl<F: BlockFile> Cleaner<F> {
             let mut data = Vec::new();
             let read = verify_at(
                 &self.shared.file,
-                &self.shared.pool,
+                reads,
                 &self.shared.geometry,
                 identity,
                 segment,

@@ -90,6 +90,12 @@ impl Drop for Ticket<'_> {
 /// A volume's file is read by its callers and its writer, cleaner and scrubber threads at once,
 /// so it is `Sync`, as a device file's descriptor is; its writes go through the device's issuer,
 /// on a duplicate handle of the issuer's own.
+/// One caller's buffers for the aligned reads [`Volume::read_into`] makes from the device,
+/// kept between its reads. Each caller owns its own, and no reader shares buffers with
+/// another: hyper-block's pool has one owner, the thread that issues the reads (hyper-block
+/// buf.rs). It keeps at most a batch's bytes free, what the caller's own reads took.
+pub struct ReadBuffers(ReadPool);
+
 pub struct Volume<F: BlockFile + Sync + 'static> {
     shared: Arc<Shared<F>>,
     sender: Option<SyncSender<Request>>,
@@ -206,10 +212,10 @@ impl<F: BlockFile + Sync + 'static> Volume<F> {
         config: Config,
         may_start: usize,
     ) -> Result<(Self, RecoveryReport), ChunkError> {
-        // Read buffers: at most one batch's worth kept free, none larger than a batch.
+        // Recovery's read buffers, the writer's once the volume runs.
         let batch = config.limits.batch_bytes;
-        let pool = ReadPool::new(Pool::new(file.alignment(), batch, batch));
-        let mut recovered = recover::recover(&file, &pool, &superblock, &geometry, &config)?;
+        let mut reads = ReadPool::of_batch(file.alignment(), batch);
+        let mut recovered = recover::recover(&file, &mut reads, &superblock, &geometry, &config)?;
         // Recovery continues one open segment per stream. One found open beyond those is
         // sealed where recovery left its end, and the checkpoint below records it, so no
         // batch's frame carries more than its requests do (layout::batch_frame_payload).
@@ -227,7 +233,6 @@ impl<F: BlockFile + Sync + 'static> Volume<F> {
         }
         let segments = Segments::new(recovered.segments, geometry.block);
         let shared = Arc::new(Shared {
-            pool,
             file,
             geometry,
             volume: superblock.volume,
@@ -278,6 +283,7 @@ impl<F: BlockFile + Sync + 'static> Volume<F> {
                 batch.saturating_mul(2),
                 batch.saturating_mul(2),
             ),
+            reads,
             io,
             anticipation: hyper_block::commit::Anticipation::new(),
             received: 0,
@@ -308,6 +314,7 @@ impl<F: BlockFile + Sync + 'static> Volume<F> {
                     findings: Arc::clone(&findings),
                     wake: wakes,
                     period,
+                    reads: ReadPool::of_batch(shared.file.alignment(), batch),
                 };
                 (Some(wake), Some(scrubber))
             }
@@ -572,18 +579,28 @@ impl<F: BlockFile + Sync + 'static> Volume<F> {
     /// refused with `Busy` past them (docs/design/chunk-store.md §7).
     pub fn read(&self, key: &ChunkKey, offset: u64, len: u64) -> Result<Vec<u8>, ChunkError> {
         let mut out = Vec::new();
-        self.read_into(key, offset, len, &mut out)?;
+        self.read_into(key, offset, len, &mut out, &mut self.read_buffers())?;
         Ok(out)
     }
 
-    /// Reads like [`Volume::read`] into `out`, replacing what it held. A caller that reads in a
-    /// loop with the same `out` allocates nothing once `out` is large enough.
+    /// Buffers for one caller's reads ([`ReadBuffers`]).
+    pub fn read_buffers(&self) -> ReadBuffers {
+        ReadBuffers(ReadPool::of_batch(
+            self.shared.file.alignment(),
+            self.limits.batch_bytes,
+        ))
+    }
+
+    /// Reads like [`Volume::read`] into `out`, replacing what it held, through the caller's
+    /// own `buffers`. A caller that reads in a loop with the same `out` and `buffers` takes no
+    /// new buffer from the allocator for its bytes once they are large enough.
     pub fn read_into(
         &self,
         key: &ChunkKey,
         offset: u64,
         len: u64,
         out: &mut Vec<u8>,
+        buffers: &mut ReadBuffers,
     ) -> Result<(), ChunkError> {
         out.clear();
         let fragments = {
@@ -640,7 +657,7 @@ impl<F: BlockFile + Sync + 'static> Volume<F> {
             let to = end
                 .min(fragment.end())
                 .saturating_sub(fragment.chunk_offset);
-            read::fragment(&self.shared, key, fragment, from, to, out)?;
+            read::fragment(&self.shared, &mut buffers.0, key, fragment, from, to, out)?;
         }
         Ok(())
     }
@@ -653,7 +670,8 @@ impl<F: BlockFile + Sync + 'static> Volume<F> {
     /// Verifies every stored fragment now; returns the number that failed. Failed chunks are
     /// listed by `damaged`.
     pub fn scrub(&self) -> Result<u64, ChunkError> {
-        scrub_all(&self.shared, &self.findings)
+        let mut reads = ReadPool::of_batch(self.shared.file.alignment(), self.limits.batch_bytes);
+        scrub_all(&self.shared, &mut reads, &self.findings)
     }
 
     /// Chunks with a fragment that failed verification, found by reads of the scrubber, for
@@ -700,7 +718,8 @@ impl<F: BlockFile + Sync + 'static> Volume<F> {
             batch_bytes: self.limits.batch_bytes,
             batch_moves: self.limits.batch_requests,
         };
-        cleaner.clean_best(n)
+        let mut reads = cleaner.reads();
+        cleaner.clean_best(&mut reads, n)
     }
 
     /// Stops the writer after it answers what is queued. Everything acknowledged is already
@@ -827,7 +846,7 @@ fn read_superblock<F: BlockFile>(file: &F) -> Result<Superblock, ChunkError> {
     // Offsets of the copies that read, whichever block size they were read at.
     let mut read = Vec::new();
     let len = file.len().map_err(ChunkError::Device)?;
-    let pool = ReadPool::new(Pool::new(file.alignment(), 64 << 10, 64 << 10));
+    let mut pool = ReadPool::new(Pool::new(file.alignment(), 64 << 10, 64 << 10));
     for offset in [OFFSET_A, OFFSET_B_COMPACT, OFFSET_B_STANDARD] {
         for block in [4096u64, 8192, 16384, 32768, 65536] {
             if offset.saturating_add(block) > len || !file.alignment().is_aligned_u64(block) {
@@ -842,10 +861,12 @@ fn read_superblock<F: BlockFile>(file: &F) -> Result<Superblock, ChunkError> {
                 log_size: 0,
                 data_offset: 0,
             };
-            let Ok(Some(span)) = read_span(file, &pool, &base, 0, offset, block) else {
+            let Ok(Some(span)) = read_span(file, &mut pool, &base, 0, offset, block) else {
                 continue;
             };
-            if let Some(sb) = Superblock::decode(span.bytes())
+            let decoded = Superblock::decode(span.bytes());
+            pool.give(span);
+            if let Some(sb) = decoded
                 && sb.offset_of(sb.slot()) == offset
             {
                 read.push((sb.volume, offset));
@@ -1487,8 +1508,9 @@ mod tests {
         let geometry = volume.shared.geometry;
         volume.close();
         let superblock = read_superblock(&file).unwrap();
-        let pool = ReadPool::new(Pool::new(file.alignment(), 1 << 20, 1 << 20));
-        let recovered = recover::recover(&file, &pool, &superblock, &geometry, &settings).unwrap();
+        let mut pool = ReadPool::new(Pool::new(file.alignment(), 1 << 20, 1 << 20));
+        let recovered =
+            recover::recover(&file, &mut pool, &superblock, &geometry, &settings).unwrap();
         let last = geometry.segments - 1;
         let opened: Vec<LogRecord> = [last, last - 1]
             .into_iter()
@@ -1621,7 +1643,9 @@ mod tests {
     /// (audit S12).
     #[test]
     fn a_start_refused_part_way_leaves_nothing_running() {
-        let file = sim(7);
+        // Every handle the volume takes is a clone of the test's, so the count of them is
+        // the holds on the device.
+        let file = Handle::new(sim(7));
         let key = ChunkKey {
             block: 1,
             epoch: 1,

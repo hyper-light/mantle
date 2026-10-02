@@ -11,8 +11,6 @@
 //! segment past the last indexed record, adding every record that verifies (Rosenblum and
 //! Ousterhout, TOCS 1992, §4.2): a batch whose data reached the disk but whose frame did not.
 
-use std::sync::Mutex;
-
 use hyper_block::DiskError;
 use hyper_block::block::BlockFile;
 use hyper_block::buf::{AlignedBuf, Pool};
@@ -59,7 +57,7 @@ pub(crate) struct Recovered {
 
 pub(crate) fn recover<F: BlockFile>(
     file: &F,
-    pool: &ReadPool,
+    pool: &mut ReadPool,
     sb: &Superblock,
     geometry: &Geometry,
     config: &Config,
@@ -347,7 +345,7 @@ impl Identity {
 /// intact record of this volume and segment is there.
 pub(crate) fn verify_at<F: BlockFile>(
     file: &F,
-    pool: &ReadPool,
+    pool: &mut ReadPool,
     geometry: &Geometry,
     identity: Identity,
     segment: u32,
@@ -369,120 +367,118 @@ pub(crate) fn verify_at<F: BlockFile>(
     else {
         return Ok(None);
     };
-    let Some(first) = record::peek_lengths(header_span.bytes()) else {
-        return Ok(None);
-    };
-    let Some(record_len) = record::record_len(first.payload_len, first.checksum_shift) else {
+    let record_len = record::peek_lengths(header_span.bytes())
+        .and_then(|first| record::record_len(first.payload_len, first.checksum_shift));
+    pool.give(header_span);
+    let Some(record_len) = record_len else {
         return Ok(None);
     };
     let record_len64 = u64::try_from(record_len).unwrap_or(u64::MAX);
     if offset.saturating_add(record_len64) > geometry.segment_size {
         return Ok(None);
     }
-    drop(header_span);
     let Some(span) = read_span(file, pool, geometry, base, offset, record_len64)? else {
         return Ok(None);
     };
-    let bytes = span.bytes();
-    let Some(prefix) = record::decode_prefix(bytes) else {
-        return Ok(None);
-    };
+    let verified = verify_record(span.bytes(), identity, segment, record_len, payload_out);
+    pool.give(span);
+    Ok(verified)
+}
+
+/// The record in `bytes`, if it is one of this volume and segment whose every checksum block
+/// verifies; its payload is appended to `payload_out` when given one.
+fn verify_record(
+    bytes: &[u8],
+    identity: Identity,
+    segment: u32,
+    record_len: usize,
+    payload_out: Option<&mut Vec<u8>>,
+) -> Option<Verified> {
+    let prefix = record::decode_prefix(bytes)?;
     let h = &prefix.header;
     if h.volume != identity.volume
         || h.segment != segment
         || h.checksum_shift != identity.checksum_shift
     {
-        return Ok(None);
+        return None;
     }
-    let Some(start) = h.prefix_len() else {
-        return Ok(None);
-    };
-    let Some(payload) =
-        bytes.get(start..start.saturating_add(usize::try_from(h.payload_len).unwrap_or(0)))
-    else {
-        return Ok(None);
-    };
+    let start = h.prefix_len()?;
+    let payload =
+        bytes.get(start..start.saturating_add(usize::try_from(h.payload_len).unwrap_or(0)))?;
     if !record::verify(&prefix, 0, payload) {
-        return Ok(None);
+        return None;
     }
     let payload_crc = mantle_crc::crc32c(payload);
     if let Some(out) = payload_out {
         out.extend_from_slice(payload);
     }
-    Ok(Some(Verified {
+    Some(Verified {
         prefix,
         payload_crc,
         record_len: u32::try_from(record_len).unwrap_or(u32::MAX),
-    }))
+    })
 }
 
-/// Buffers for reading records, which the volume's readers, writer, cleaner and scrubber share:
-/// hyper-block's pool has one owner, so the volume's threads reach it through a lock held only
-/// to take a buffer and to give it back, as mantle-disk's pool held its own around its free
-/// lists. Each buffer is lent for one read and given back when its span drops.
-pub(crate) struct ReadPool(Mutex<Pool>);
+/// Buffers for reading records, each pool owned by the one thread that reads with it: the
+/// writer, the cleaner and the scrubber their own, recovery its own, and each caller of a read
+/// its own (`ReadBuffers`), as hyper-block's pool has one owner, the thread that issues the I/O
+/// its buffers carry (hyper-block buf.rs). Each buffer is lent for one read and given back
+/// once the span read into it has been looked at.
+pub(crate) struct ReadPool(Pool);
 
 impl ReadPool {
     pub(crate) fn new(pool: Pool) -> Self {
-        Self(Mutex::new(pool))
+        Self(pool)
     }
 
-    /// An empty buffer of at least `capacity` bytes, lent until the span holding it drops.
-    fn take(&self, capacity: usize) -> Result<AlignedBuf, ChunkError> {
+    /// The pool each reader of a volume keeps: at most one batch's bytes free, in no buffer
+    /// larger than a batch, which holds the largest record the writer lays out. A reader keeps
+    /// what its own reads took, at most that.
+    pub(crate) fn of_batch(align: hyper_block::buf::Alignment, batch_bytes: usize) -> Self {
+        Self(Pool::new(align, batch_bytes, batch_bytes))
+    }
+
+    /// An empty buffer of at least `capacity` bytes, lent until its span is given back.
+    fn take(&mut self, capacity: usize) -> Result<AlignedBuf, ChunkError> {
         self.0
-            .lock()
-            .map_err(|_| ChunkError::Internal("the read buffers' lock is poisoned"))?
             .take(capacity)
             .map_err(|e| ChunkError::Device(e.into()))
     }
 
-    /// Gives a lent buffer back; behind a poisoned lock it is freed instead.
-    fn give(&self, buf: AlignedBuf) {
-        if let Ok(mut pool) = self.0.lock() {
-            pool.give(buf);
-        }
+    /// Takes back the buffer of a span read through this pool. A span dropped instead, on a
+    /// path that gives up on its read, frees its buffer.
+    pub(crate) fn give(&mut self, span: Span) {
+        self.0.give(span.buf);
     }
 }
 
-/// Bytes read from the device into a buffer lent from a [`ReadPool`], which takes it back when
-/// the span is dropped.
-pub(crate) struct Span<'p> {
-    buf: Option<AlignedBuf>,
-    pool: &'p ReadPool,
+/// Bytes read from the device into a buffer lent from a [`ReadPool`], given back with
+/// [`ReadPool::give`].
+pub(crate) struct Span {
+    buf: AlignedBuf,
     skip: usize,
     len: usize,
 }
 
-impl Span<'_> {
+impl Span {
     pub fn bytes(&self) -> &[u8] {
         self.buf
-            .as_ref()
-            .and_then(|b| {
-                b.as_slice()
-                    .get(self.skip..self.skip.saturating_add(self.len))
-            })
+            .as_slice()
+            .get(self.skip..self.skip.saturating_add(self.len))
             .unwrap_or_default()
-    }
-}
-
-impl Drop for Span<'_> {
-    fn drop(&mut self) {
-        if let Some(buf) = self.buf.take() {
-            self.pool.give(buf);
-        }
     }
 }
 
 /// Reads `len` bytes at `offset` within the segment at `base`, through an aligned buffer
 /// from `pool`. `None` if the span runs past the end of the file.
-pub(crate) fn read_span<'p, F: BlockFile>(
+pub(crate) fn read_span<F: BlockFile>(
     file: &F,
-    pool: &'p ReadPool,
+    pool: &mut ReadPool,
     geometry: &Geometry,
     base: u64,
     offset: u64,
     len: u64,
-) -> Result<Option<Span<'p>>, ChunkError> {
+) -> Result<Option<Span>, ChunkError> {
     let block = geometry.block;
     let start = base.checked_add(offset).ok_or(ChunkError::Full)?;
     let end = start.checked_add(len).ok_or(ChunkError::Full)?;
@@ -508,14 +504,16 @@ pub(crate) fn read_span<'p, F: BlockFile>(
         );
     let skip = usize::try_from(start.saturating_sub(aligned_start)).unwrap_or(0);
     let len = usize::try_from(len).unwrap_or(0);
-    let span = Span {
-        buf: Some(buf),
-        pool,
-        skip,
-        len,
-    };
-    if !read? || skip.saturating_add(len) > span_len {
-        return Ok(None);
+    let span = Span { buf, skip, len };
+    match read {
+        Ok(true) if skip.saturating_add(len) <= span_len => Ok(Some(span)),
+        Ok(_) => {
+            pool.give(span);
+            Ok(None)
+        }
+        Err(e) => {
+            pool.give(span);
+            Err(e)
+        }
     }
-    Ok(Some(span))
 }

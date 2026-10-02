@@ -28,6 +28,12 @@
 //! - every member's configuration names the live members as its voters, and nothing else.
 //!
 //! `MANTLE_SIM_SEEDS` sets how many runs, and `MANTLE_SIM_SEED` where they begin.
+//!
+//! Directed runs, after the seeded ones, cut a member's power at each of its device's writes
+//! and flushes in turn while its group changes configuration, for a leader, a follower, a sole
+//! voter and a founder removing its only peer, and check the commit fence
+//! (docs/design/replica.md §3, §5): the member reopens with any configuration it applied, and
+//! the group goes on.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -40,7 +46,7 @@
 
 mod support;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use hyper_block::block::BlockFile;
 use hyper_block::buf::{AlignedBuf, Alignment};
@@ -53,7 +59,10 @@ use mantle_meta::record::{GateState, Version, Versioning};
 use mantle_meta::session::Rules;
 use mantle_meta::wire::{Answer, Command, Entry, Sessioned};
 use mantle_range::membership::{Next, Replacement};
-use mantle_range::{ConfState, Message, Range, Replica, ReplicaError, Settings};
+use mantle_range::{
+    ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState, Message,
+    Range, Replica, ReplicaError, Settings,
+};
 use support::linear::{self, Input, Operation, Output, Register, Verdict};
 
 const GROUP: u128 = 0x0072_616e_6765;
@@ -254,13 +263,18 @@ impl Node {
 
     /// Loses power: the process and whatever its log and engine had not made durable.
     fn crash(&mut self) {
+        self.crash_losing(Crash::Random);
+    }
+
+    /// Loses power, the device keeping its unflushed sectors as `crash` says.
+    fn crash_losing(&mut self, crash: Crash) {
         let Some(replica) = self.replica.take() else {
             return;
         };
         let mut engine = replica.into_engine();
         engine.crash();
         self.engine = Some(engine);
-        self.device().crash(Crash::Random).unwrap();
+        self.device().crash(crash).unwrap();
     }
 
     /// Restarts from what the device and engine kept. Damage the restart finds quarantines
@@ -1455,4 +1469,412 @@ fn a_seed_runs_the_same_every_time() {
         let again = run(seed, members);
         assert_eq!(first, again, "seed {seed} ran differently");
     }
+}
+
+/// How a member takes its readies in a directed run: waiting for each write (`drive`), or
+/// leaving it flushing while the node does other work (`begin`, then `wait_persisted`), as a
+/// node overlapping its members' flushes does (audit §5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Takes {
+    Waiting,
+    Overlapping,
+}
+
+/// A change of configuration a group founded by `1..=members` makes under member 1's lead,
+/// and the member whose power is cut while it does.
+#[derive(Debug)]
+struct Case {
+    members: u64,
+    target: u64,
+    change: ConfChangeV2,
+    /// The configuration the change makes.
+    made: ConfState,
+    /// The member the change removes. The operator stops it for good once the leader says
+    /// every voter knows the change committed (`Replica::configuration_known`), as a
+    /// replacement ends (`mantle_range::membership`).
+    removes: Option<u64>,
+}
+
+/// Rounds a directed run waits for what a group with a quorum and no faults does within a few
+/// election timeouts (elect a leader, commit an entry): twenty of the longest timeout the core
+/// draws, `2 · election_tick`. Reaching it is the failure the run looks for, not a wait.
+const PATIENT_ROUNDS: usize = 40 * SETTINGS.election_tick;
+
+/// A group run by hand, without faults but the power cut a run arms: messages arrive in the
+/// order they were sent, a round after.
+struct Directed {
+    seed: u64,
+    nodes: Vec<Node>,
+    wire: VecDeque<Message>,
+    damage: Damage,
+    /// The registrations each member applied: (member, nonce).
+    registered: HashSet<(u64, u64)>,
+}
+
+impl Directed {
+    fn new(case: &Case, seed: u64) -> Self {
+        Self {
+            seed,
+            nodes: (1..=case.members)
+                .map(|id| Node::new(id, seed, case.members))
+                .collect(),
+            wire: VecDeque::new(),
+            damage: Damage::default(),
+            registered: HashSet::new(),
+        }
+    }
+
+    fn replica(&mut self, id: u64) -> Option<&mut Member> {
+        self.nodes
+            .iter_mut()
+            .find(|n| n.id == id)
+            .and_then(|n| n.replica.as_mut())
+    }
+
+    fn leader(&mut self) -> Option<&mut Member> {
+        self.nodes
+            .iter_mut()
+            .filter_map(|n| n.replica.as_mut())
+            .find(|r| r.is_leader())
+    }
+
+    /// The operator: stops the member the change removed for good once the leader has applied
+    /// the change and says every voter knows it committed.
+    fn operate(&mut self, case: &Case) {
+        let Some(removed) = case.removes else {
+            return;
+        };
+        let known = self.leader().is_some_and(|r| {
+            !r.configuration().voters.contains(&removed) && r.configuration_known()
+        });
+        if known {
+            self.nodes.retain(|n| n.id != removed);
+        }
+    }
+
+    /// One round: every member ticks, takes its ready, the operator looking on after each, and
+    /// the messages sent arrive. The target's configuration as it stood when its device's power
+    /// was cut, once the member learns it: its log fenced.
+    fn round(&mut self, case: &Case, takes: Takes) -> Option<ConfState> {
+        let ids: Vec<u64> = self.nodes.iter().map(|n| n.id).collect();
+        for &id in &ids {
+            if let Some(r) = self.replica(id)
+                && !r.is_fenced()
+            {
+                r.tick().unwrap();
+            }
+        }
+        let mut cut = None;
+        for &id in &ids {
+            let overlap = id == case.target && takes == Takes::Overlapping;
+            let Some(r) = self.replica(id) else {
+                continue;
+            };
+            if r.is_fenced() {
+                continue;
+            }
+            let out = if overlap { r.begin() } else { r.drive() };
+            match out {
+                Ok(out) => {
+                    self.wire.extend(out.messages);
+                    for a in out.applied {
+                        for (session, serial, answer) in a.answers {
+                            if session == 0 && matches!(answer, Answer::Registered { .. }) {
+                                self.registered.insert((id, serial));
+                            }
+                        }
+                    }
+                }
+                Err(ReplicaError::Fenced(_)) if id == case.target => {
+                    cut = Some(r.configuration().clone());
+                    continue;
+                }
+                Err(e) => panic!("drive on {id}: {e}"),
+            }
+            // The operator acts on what the members say, whenever it looks: here, while the
+            // target's write may still be flushing.
+            self.operate(case);
+            if overlap && let Some(r) = self.replica(id) {
+                r.wait_persisted();
+            }
+        }
+        let sent = std::mem::take(&mut self.wire);
+        for m in sent {
+            let to = m.to;
+            if let Some(r) = self.replica(to) {
+                match r.step(m) {
+                    Ok(())
+                    | Err(
+                        ReplicaError::Refused(_)
+                        | ReplicaError::Stalled
+                        | ReplicaError::MessagesHeld { .. }
+                        | ReplicaError::Fenced(_),
+                    ) => {}
+                    Err(e) => panic!("step on {to}: {e}"),
+                }
+            }
+        }
+        cut
+    }
+
+    /// Whether every member has applied the change, and the member it removes is stopped.
+    fn changed(&self, case: &Case) -> bool {
+        self.nodes.iter().all(|n| {
+            n.replica
+                .as_ref()
+                .is_some_and(|r| same_configuration(r.configuration(), &case.made))
+        }) && case
+            .removes
+            .is_none_or(|removed| self.nodes.iter().all(|n| n.id != removed))
+    }
+}
+
+/// Whether two configurations name the same members in the same roles.
+fn same_configuration(a: &ConfState, b: &ConfState) -> bool {
+    let sorted = |ids: &[u64]| {
+        let mut ids = ids.to_vec();
+        ids.sort_unstable();
+        ids
+    };
+    sorted(&a.voters) == sorted(&b.voters)
+        && sorted(&a.learners) == sorted(&b.learners)
+        && sorted(&a.voters_outgoing) == sorted(&b.voters_outgoing)
+        && sorted(&a.learners_next) == sorted(&b.learners_next)
+}
+
+fn simple_change(kind: ConfChangeType, node_id: u64) -> ConfChangeV2 {
+    ConfChangeV2 {
+        transition: ConfChangeTransition::Auto,
+        changes: vec![ConfChangeSingle {
+            change_type: kind,
+            node_id,
+        }],
+        context: Vec::new(),
+    }
+}
+
+fn registration(nonce: u64) -> Entry {
+    Entry {
+        at_ns: 0,
+        commands: vec![Sessioned {
+            session: 0,
+            serial: nonce,
+            unanswered: 0,
+            command: Command::Register,
+        }],
+    }
+}
+
+/// One directed run of `case`: member 1 is elected, proposes the change, and the target's
+/// device cuts the power at its `ops`-th write or flush after the proposal, or, for `None`,
+/// once the change is made everywhere. The target restarts from what its device kept.
+///
+/// Then, against the commit fence (hyper-raft docs/durable.md §4.1, I5): the target, driven
+/// alone, reaches the configuration it had applied when the power went from its own durable
+/// state, so nothing it applied, and nothing the operator did on its word, ran ahead of what
+/// it reopens with; and the group goes on: a leader is elected and an entry commits on every
+/// member. Returns whether the power was cut; `false` for `Some(ops)` past the last
+/// operation the run makes.
+fn directed(case: &Case, takes: Takes, ops: Option<u64>, seed: u64) -> bool {
+    let mut d = Directed::new(case, seed);
+    d.replica(1).unwrap().campaign().unwrap();
+    let mut elected = false;
+    for _ in 0..PATIENT_ROUNDS {
+        assert!(d.round(case, Takes::Waiting).is_none());
+        if d.replica(1).is_some_and(|r| r.is_leader()) {
+            elected = true;
+            break;
+        }
+    }
+    assert!(elected, "member 1 is never elected");
+    if let Some(ops) = ops {
+        let target = d.nodes.iter().find(|n| n.id == case.target).unwrap();
+        target
+            .with_file(move |f| f.inject(Fault::PowerCut { ops }))
+            .unwrap();
+    }
+    d.replica(1).unwrap().propose_change(&case.change).unwrap();
+    // Until the power is cut, or the change is made and a heartbeat's rounds more pass.
+    let mut cut = None;
+    let mut quiet = 0;
+    for _ in 0..PATIENT_ROUNDS {
+        cut = d.round(case, takes);
+        if cut.is_some() {
+            break;
+        }
+        if d.changed(case) {
+            quiet += 1;
+            if quiet > SETTINGS.heartbeat_tick * 2 {
+                break;
+            }
+        }
+    }
+    let at_cut = match (cut, ops) {
+        (Some(conf), _) => conf,
+        (None, Some(_)) => {
+            assert!(d.changed(case), "{case:?} {takes:?} never made its change");
+            return false;
+        }
+        (None, None) => {
+            assert!(d.changed(case), "{case:?} {takes:?} never made its change");
+            d.replica(case.target).unwrap().configuration().clone()
+        }
+    };
+    let seed = d.seed;
+    let mut damage = std::mem::take(&mut d.damage);
+    let node = d.nodes.iter_mut().find(|n| n.id == case.target).unwrap();
+    node.crash_losing(Crash::LoseAll);
+    node.restart(seed, &mut damage);
+    let mut found = Vec::new();
+    // Alone, the target reaches what its own durable state says is committed.
+    let r = node.replica.as_mut().expect("the target reopens");
+    let mut settled = false;
+    for _ in 0..PATIENT_ROUNDS {
+        let before = (r.applied(), r.configuration().clone());
+        r.drive().unwrap();
+        if (r.applied(), r.configuration().clone()) == before {
+            settled = true;
+            break;
+        }
+    }
+    assert!(settled, "the target alone never stops applying");
+    // Its durable state may hold a commit it had not applied yet, never the reverse.
+    let reopened = r.configuration().clone();
+    if same_configuration(&at_cut, &case.made) && !same_configuration(&reopened, &case.made) {
+        found.push(format!(
+            "member {} applied {at_cut:?} and acted on it, but its durable state reopens at \
+             {reopened:?}",
+            case.target
+        ));
+    }
+    // The group goes on: a leader, the change made, proposed again by the leader if the cut
+    // lost it, and an entry committed on every member.
+    let nonce = 0x5157;
+    let mut proposed = false;
+    let mut live = false;
+    for round in 0..PATIENT_ROUNDS {
+        assert!(d.round(case, takes).is_none(), "a second cut");
+        if let Some(leader) = d.leader() {
+            if !proposed {
+                proposed = leader.propose(&registration(nonce)).is_ok();
+            }
+            if round % PATIENCE as usize == 0
+                && !same_configuration(leader.configuration(), &case.made)
+            {
+                match leader.propose_change(&case.change) {
+                    Ok(()) | Err(ReplicaError::Refused(_) | ReplicaError::Stalled) => {}
+                    Err(e) => panic!("propose the change again: {e}"),
+                }
+            }
+        }
+        if proposed
+            && d.changed(case)
+            && d.nodes
+                .iter()
+                .all(|n| d.registered.contains(&(n.id, nonce)))
+        {
+            live = true;
+            break;
+        }
+    }
+    if !live {
+        let states: Vec<String> = d
+            .nodes
+            .iter()
+            .filter_map(|n| n.replica.as_ref())
+            .map(|r| format!("{} conf {:?}", r.describe(), r.configuration()))
+            .collect();
+        found.push(format!(
+            "the group never elected a leader that committed an entry on every member: \
+             {states:?}"
+        ));
+    }
+    assert!(
+        found.is_empty(),
+        "{case:?}, {takes:?}, power cut at operation {ops:?} after the proposal: {found:#?}"
+    );
+    true
+}
+
+/// Runs `case` with the power cut at each of the target's device operations after the change
+/// is proposed in turn, and once after the change is made, both ways of taking readies.
+fn every_cut(case: &Case) {
+    // A run makes a few dozen writes and flushes; this bounds the enumeration far past them.
+    const MAX_OPS: u64 = 1 << 12;
+    let seed = 0x51;
+    for takes in [Takes::Waiting, Takes::Overlapping] {
+        let mut ops = 0;
+        while directed(case, takes, Some(ops), seed) {
+            ops += 1;
+            assert!(ops < MAX_OPS, "{case:?} never ran out of operations");
+        }
+        assert!(ops > 0, "{case:?} {takes:?} cut the power nowhere");
+        directed(case, takes, None, seed);
+    }
+}
+
+/// The founder of a group of two removes its only peer, which the operator stops once the
+/// founder says the change is known; the founder's power is cut anywhere in the change. The
+/// founder, alone, must still elect itself: a founder that applied the removal on a commit
+/// its log never held reopens counting the peer, and no vote ever comes (focal F17).
+#[test]
+fn a_founder_that_removes_its_only_peer_elects_itself_after_a_cut_anywhere() {
+    every_cut(&Case {
+        members: 2,
+        target: 1,
+        change: simple_change(ConfChangeType::RemoveNode, 2),
+        made: ConfState {
+            voters: vec![1],
+            ..ConfState::default()
+        },
+        removes: Some(2),
+    });
+}
+
+/// A leader of three removes a member; the leader's power is cut anywhere in the change.
+#[test]
+fn a_leader_cut_inside_a_change_reopens_with_what_it_applied() {
+    every_cut(&Case {
+        members: 3,
+        target: 1,
+        change: simple_change(ConfChangeType::RemoveNode, 3),
+        made: ConfState {
+            voters: vec![1, 2],
+            ..ConfState::default()
+        },
+        removes: Some(3),
+    });
+}
+
+/// A follower of three applies the removal of another; its power is cut anywhere in the
+/// change.
+#[test]
+fn a_follower_cut_inside_a_change_reopens_with_what_it_applied() {
+    every_cut(&Case {
+        members: 3,
+        target: 2,
+        change: simple_change(ConfChangeType::RemoveNode, 3),
+        made: ConfState {
+            voters: vec![1, 2],
+            ..ConfState::default()
+        },
+        removes: Some(3),
+    });
+}
+
+/// The sole voter of a group adds a learner, a change it commits alone; its power is cut
+/// anywhere in the change.
+#[test]
+fn a_sole_voter_cut_inside_a_change_reopens_with_what_it_applied() {
+    every_cut(&Case {
+        members: 1,
+        target: 1,
+        change: simple_change(ConfChangeType::AddLearnerNode, 2),
+        made: ConfState {
+            voters: vec![1],
+            learners: vec![2],
+            ..ConfState::default()
+        },
+        removes: None,
+    });
 }

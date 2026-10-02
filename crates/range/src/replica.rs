@@ -79,8 +79,8 @@ pub struct Drive {
     /// waits, whole, in the replica, which takes no call but `drive` and `compact` until the
     /// node frees room and drives again (audit S04).
     pub stalled: Option<LogError>,
-    /// From [`Replica::begin`]: a ready's update is on its way to being durable. The
-    /// messages above may go now. Until the update is durable, which `drive` waits for, the
+    /// From [`Replica::begin`]: a ready's update, or a write of the commit alone, is on its
+    /// way to being durable. The messages above may go now. Until the update is durable, which `drive` waits for, the
     /// replica holds the messages and ticks it is given, to take once the ready is done, and
     /// refuses proposals, reads and campaigns with `Stalled`.
     pub persisting: bool,
@@ -106,8 +106,23 @@ pub struct Replica<F: BlockFile + 'static, E: Engine> {
     /// applies a change, and before that the point it opened at or installed.
     conf_index: u64,
     max_entry_bytes: u64,
-    /// A ready the log has yet to take whole, which the core counts as out (07 §1.2).
+    /// A ready the log has yet to take whole, which the core counts as out (07 §1.2), or a
+    /// write of the commit alone (`Replica::commit_write`).
     staged: Option<Staged>,
+    /// The commit the member's log states durably: the greatest commit of its writes answered
+    /// durable, or what it opened with.
+    logged_commit: u64,
+    /// Committed entries held behind the commit fence (hyper-raft docs/durable.md §4.1, I5):
+    /// from the first change of configuration past `logged_commit`, in order. A configuration
+    /// takes effect as the member applies it, and a commit is volatile (Ongaro, thesis §3.8):
+    /// applied on a commit its log does not state, a change is undone by a crash while what
+    /// others did on the member's word stands, as when the operator stops a member the change
+    /// removed and the member reopens counting it (focal F17). So a change applies only once
+    /// the log states its commit, and what follows it waits behind it. The fence holds at most
+    /// one ready's committed entries and its light ready's, `2 · max_committed_size_per_ready`
+    /// bytes: while it holds any, the core is asked for no ready until a write states the
+    /// commit (`drive_ready`).
+    behind_fence: VecDeque<Entry>,
     /// Messages and ticks that came while the ready's update flushed, taken in order once it
     /// is done (`Held`).
     held: Held,
@@ -214,11 +229,11 @@ fn held_bytes(message: &Message) -> u64 {
         .saturating_add(frame)
 }
 
-/// A ready being made durable: its update's parts not yet durable, in order, each fitting a
-/// frame, whether the first is out on the group's handle, and the log's answer once it has
-/// been waited for.
+/// A ready being made durable, or `None` for a write of the commit alone: its update's parts
+/// not yet durable, in order, each fitting a frame, whether the first is out on the group's
+/// handle, and the log's answer once it has been waited for.
 struct Staged {
-    ready: focal_raft::Ready,
+    ready: Option<focal_raft::Ready>,
     parts: VecDeque<Update>,
     out: bool,
     answered: Option<Result<(), LogError>>,
@@ -226,7 +241,7 @@ struct Staged {
 
 /// Where writing a ready's parts got to.
 enum Persisted {
-    Done(focal_raft::Ready),
+    Done(Option<focal_raft::Ready>),
     /// A part is submitted and not yet durable: the ready waits for the log's flush.
     Flushing(Staged),
     /// The log refused a part for want of room: the ready waits with the parts left.
@@ -340,6 +355,11 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
             .and_then(|t| t.checked_mul(2))
             .ok_or(ReplicaError::Config("an election timeout past u64 ticks"))?;
         let uncertain = uncertain_mark(&store)?;
+        let logged_commit = store
+            .group
+            .view()?
+            .and_then(|v| v.hard_state)
+            .map_or(0, |h| h.commit);
         let node = RawNode::new(&config, store)?;
         let mut replica = Self {
             node,
@@ -351,6 +371,8 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
             conf_index: applied,
             max_entry_bytes: settings.max_entry_bytes,
             staged: None,
+            logged_commit,
+            behind_fence: VecDeque::new(),
             held: Held::default(),
             window_bytes,
             max_held_ticks,
@@ -434,6 +456,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
     fn fence(&mut self, e: &LogError) -> ReplicaError {
         let cause = e.to_string();
         self.staged = None;
+        self.behind_fence.clear();
         self.held = Held::default();
         self.reports.clear();
         self.reads = Rounds::default();
@@ -469,7 +492,8 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
     /// then a voter that did not learn of the commit still counts the members the change
     /// removed, and losing the leader could leave no quorum it can elect in; after, losing
     /// any one member leaves voters that elect under this configuration
-    /// (docs/design/replica.md §6).
+    /// (docs/design/replica.md §6). The leader counts itself: it applied the configuration
+    /// only once its own log stated the commit (`Replica::behind_fence`).
     pub fn configuration_known(&self) -> bool {
         let tracker = self.node.raft.tracker();
         let id = self.id();
@@ -704,7 +728,9 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
             index: mark.index,
             reject_hint: self.last_index()?,
             request_snapshot: mark.index,
-            commit: self.node.raft.log().committed(),
+            // What the leader counts toward `configuration_known`: the commit this member's
+            // log states, which a restart keeps.
+            commit: self.logged_commit,
             ..Message::default()
         });
         Ok(())
@@ -919,7 +945,8 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
         self.drive_ready(false)
     }
 
-    /// Whether a ready's update is on its way to being durable.
+    /// Whether a ready's update, or a write of the commit alone, is on its way to being
+    /// durable.
     pub fn persisting(&self) -> bool {
         self.staged.as_ref().is_some_and(|s| s.out)
     }
@@ -941,21 +968,34 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
         self.live()?;
         let mut out = Drive::default();
         for _ in 0..DRIVE_BUDGET {
+            // Entries held behind the fence wait for a write stating their commit, which the
+            // core's next ready may never carry: its hard state names a commit only when it
+            // moved since the last, and a commit that moved in `advance_append` is never in one
+            // (a leader that commits alone). The core is asked for nothing more meanwhile.
             let staged = match self.staged.take() {
                 Some(staged) => staged,
+                None if !self.behind_fence.is_empty() => self.commit_write()?,
                 None if self.node.has_ready() => self.take_ready(&mut out)?,
                 None => break,
             };
             match self.persist(staged, wait)? {
-                Persisted::Done(ready) => {
+                Persisted::Done(Some(ready)) => {
                     self.finish(ready, &mut out)?;
+                    self.take_held()?;
+                }
+                Persisted::Done(None) => {
+                    self.apply(Vec::new(), &mut out)?;
+                    self.node.advance_apply_to(self.applied)?;
                     self.take_held()?;
                 }
                 Persisted::Flushing(mut staged) => {
                     // As while the log refuses room: what is committed is durable already,
-                    // and applies while the update flushes.
-                    let committed = staged.ready.take_committed_entries();
-                    self.apply(committed, &mut out)?;
+                    // and applies while the update flushes, but for a change of
+                    // configuration, which waits for the commit to be durable too.
+                    if let Some(ready) = staged.ready.as_mut() {
+                        let committed = ready.take_committed_entries();
+                        self.apply(committed, &mut out)?;
+                    }
                     self.staged = Some(staged);
                     out.persisting = true;
                     break;
@@ -963,8 +1003,10 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
                 Persisted::Waiting(mut staged, refusal) => {
                     // The core gives out only entries committed and durable, so these apply
                     // now, and the group can compact past them while the ready waits.
-                    let committed = staged.ready.take_committed_entries();
-                    self.apply(committed, &mut out)?;
+                    if let Some(ready) = staged.ready.as_mut() {
+                        let committed = ready.take_committed_entries();
+                        self.apply(committed, &mut out)?;
+                    }
                     self.staged = Some(staged);
                     out.stalled = Some(refusal);
                     break;
@@ -1011,7 +1053,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
             None => VecDeque::new(),
         };
         Ok(Staged {
-            ready,
+            ready: Some(ready),
             parts,
             out: false,
             answered: None,
@@ -1043,9 +1085,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
                 };
                 staged.out = false;
                 match answer {
-                    Ok(()) => {
-                        staged.parts.pop_front();
-                    }
+                    Ok(()) => self.durable_part(&mut staged),
                     Err(e) if waits_for_room(&e) => return Ok(Persisted::Waiting(staged, e)),
                     Err(e) => return Err(self.fence(&e)),
                 }
@@ -1056,9 +1096,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
             let group = &mut self.node.store_mut().group;
             if wait {
                 match group.write(part.clone()) {
-                    Ok(()) => {
-                        staged.parts.pop_front();
-                    }
+                    Ok(()) => self.durable_part(&mut staged),
                     Err(e) if waits_for_room(&e) => return Ok(Persisted::Waiting(staged, e)),
                     Err(e) => return Err(self.fence(&e)),
                 }
@@ -1073,6 +1111,43 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
                 Err(e) => return Err(self.fence(&e)),
             }
         }
+    }
+
+    /// The first of `staged`'s parts is durable: the commit it states is the log's.
+    fn durable_part(&mut self, staged: &mut Staged) {
+        if let Some(hard) = staged.parts.pop_front().and_then(|part| part.hard_state) {
+            self.logged_commit = self.logged_commit.max(hard.commit);
+        }
+    }
+
+    /// A write of the commit alone, through the last entry held behind the fence, with the
+    /// term and vote the log holds: no ready is out, so the log's group state is every write
+    /// answered, and a later ready writes a newer term or vote in its turn. Every entry held
+    /// was given to apply, so it is committed and the log holds it (I7). One such write is
+    /// one flush for each change of configuration, which are rare (docs/durable.md §4.1;
+    /// focal 27 §9).
+    fn commit_write(&mut self) -> Result<Staged, ReplicaError> {
+        let held = self.behind_fence.back().map_or(0, |e| e.index);
+        let hard = self
+            .node
+            .store()
+            .group
+            .view()?
+            .and_then(|v| v.hard_state)
+            .unwrap_or_default();
+        let update = Update {
+            hard_state: Some(hyper_log::HardState {
+                commit: hard.commit.max(held),
+                ..hard
+            }),
+            ..Update::default()
+        };
+        Ok(Staged {
+            ready: None,
+            parts: VecDeque::from([update]),
+            out: false,
+            answered: None,
+        })
     }
 
     /// Finishes a durable ready: the messages that waited for the write, the committed
@@ -1093,44 +1168,65 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
         Ok(())
     }
 
+    /// Applies committed entries in order, those held behind the fence first, up to the first
+    /// change of configuration the log's durable commit does not cover, which waits with what
+    /// follows it (`Replica::behind_fence`). The engine's durable index never covers such a
+    /// change, which it has not applied, so the log's commit is the whole of the member's
+    /// durable commit here (docs/durable.md §4.1).
     fn apply(&mut self, entries: Vec<Entry>, out: &mut Drive) -> Result<(), ReplicaError> {
-        for entry in entries {
-            let index = entry.index;
-            let mut changed = false;
-            match entry.entry_type {
-                // A new leader's empty entry changes no row.
-                EntryType::EntryNormal if entry.data.is_empty() => {
-                    self.engine.apply(index, &[])?;
-                }
-                EntryType::EntryNormal => {
-                    let batch = wire::Entry::decode(&entry.data).map_err(|_| {
-                        ReplicaError::Stopped(format!("committed entry {index} does not decode"))
-                    })?;
-                    let answers =
-                        apply_entry(&mut self.engine, index, &batch, self.layer, &self.rules)?;
-                    let answers = batch
-                        .commands
-                        .iter()
-                        .zip(answers)
-                        .map(|(c, a)| (c.session, c.serial, a))
-                        .collect();
-                    out.applied.push(Applied { index, answers });
-                }
-                // A change in either encoding, read as hyper-raft states it (`change_of`): a
-                // change entry with no data is the empty change.
-                EntryType::EntryConfChange | EntryType::EntryConfChangeV2 => {
-                    let change = proto::change_of(&entry).ok().flatten().ok_or_else(|| {
-                        ReplicaError::Stopped(format!("committed change {index} does not decode"))
-                    })?;
-                    let outcome = self.node.apply_conf_change(&change);
-                    self.changed(index, outcome)?;
-                    changed = true;
-                }
+        self.behind_fence.extend(entries);
+        while let Some(entry) = self.behind_fence.front() {
+            let change = matches!(
+                entry.entry_type,
+                EntryType::EntryConfChange | EntryType::EntryConfChangeV2
+            );
+            if change && entry.index > self.logged_commit {
+                break;
             }
-            self.applied = index;
-            if changed && self.snapshot_misses_a_member() {
-                self.prepare()?;
+            let Some(entry) = self.behind_fence.pop_front() else {
+                break;
+            };
+            self.apply_one(entry, out)?;
+        }
+        Ok(())
+    }
+
+    fn apply_one(&mut self, entry: Entry, out: &mut Drive) -> Result<(), ReplicaError> {
+        let index = entry.index;
+        let mut changed = false;
+        match entry.entry_type {
+            // A new leader's empty entry changes no row.
+            EntryType::EntryNormal if entry.data.is_empty() => {
+                self.engine.apply(index, &[])?;
             }
+            EntryType::EntryNormal => {
+                let batch = wire::Entry::decode(&entry.data).map_err(|_| {
+                    ReplicaError::Stopped(format!("committed entry {index} does not decode"))
+                })?;
+                let answers =
+                    apply_entry(&mut self.engine, index, &batch, self.layer, &self.rules)?;
+                let answers = batch
+                    .commands
+                    .iter()
+                    .zip(answers)
+                    .map(|(c, a)| (c.session, c.serial, a))
+                    .collect();
+                out.applied.push(Applied { index, answers });
+            }
+            // A change in either encoding, read as hyper-raft states it (`change_of`): a
+            // change entry with no data is the empty change.
+            EntryType::EntryConfChange | EntryType::EntryConfChangeV2 => {
+                let change = proto::change_of(&entry).ok().flatten().ok_or_else(|| {
+                    ReplicaError::Stopped(format!("committed change {index} does not decode"))
+                })?;
+                let outcome = self.node.apply_conf_change(&change);
+                self.changed(index, outcome)?;
+                changed = true;
+            }
+        }
+        self.applied = index;
+        if changed && self.snapshot_misses_a_member() {
+            self.prepare()?;
         }
         Ok(())
     }

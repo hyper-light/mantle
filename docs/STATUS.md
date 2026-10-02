@@ -300,7 +300,12 @@ good is replaced by one under a new identity: added as a learner, caught up, swa
 one joint change, and done once every voter knows the new configuration committed. While a
 `Ready` flushes, a replica holds the messages and ticks it is given, within a window of
 appends per member and one election timeout, and takes them in order after; refusing them
-left a leader under steady load committing nothing. A
+left a leader under steady load committing nothing. A change of configuration applies only
+once the member's log states its commit (hyper-raft's commit fence, focal's F17): applied on a
+volatile commit, a founder that removed its only peer and lost power while the commit's write
+flushed reopened counting the stopped peer and never elected again, which directed power cuts
+at every write and flush of a change now check for a leader, a follower, a sole voter and a
+group shrinking to one. A
 deterministic simulation of three members and three concurrent gateways, under crashes,
 failed writes and flushes, partitions, dropped and reordered messages, compaction, and one
 or two members lost for good in every run, checks after every run that each index was

@@ -154,7 +154,7 @@ For each `Ready` the core gives, the replica does these steps in order:
 
 `drive` does these steps and waits at step 3 for the update to be durable. `begin` does not
 wait: it gives out step 2's messages and the reads confirmed, submits the update, applies the
-entries already committed, and returns with the `Ready` still out and `persisting` set, so the
+entries already committed but a change of configuration (below), and returns with the `Ready` still out and `persisting` set, so the
 node sends the messages while the log flushes, and a node driving many ranges submits every
 range's update before the one flush that makes them all durable. A later `begin` or `drive`
 finds the update durable and does steps 4 to 6; `begin` never looks at an update it has just
@@ -189,6 +189,30 @@ held, every call answers `Fenced`, and the other two elect a leader where needed
 `a_ready_refused_for_a_full_log_waits_until_another_group_compacts` and
 `a_ready_refused_for_want_of_a_group_waits_until_one_leaves` show the refusals for room
 leave the member unfenced, waiting with its `Ready`, and going on once room is freed.
+
+**A change of configuration applies only on a commit the log holds.** A member's commit is
+volatile (Diss §3.8) and its configuration takes effect when it applies the change, as in
+etcd's core, not when the entry is appended as in the thesis (Diss §4.1; research/07 §2.11).
+A change applied on a commit its log does not state reverts in a crash, while what others did
+on the member's word stands. The directed runs of §5 showed it: a founder of two that removed
+its only peer applied the removal while the write stating the commit flushed (`begin`), said
+every voter knew it, and was stopped with its peer; it reopened counting the peer and never
+elected a leader again. A sole voter's commit is never written at all: it moves in
+`advance_append`, and the core puts a commit in a `Ready`'s hard state only when it moved
+since the last. So the replica keeps the commit its log states durably, and applies a change
+of configuration only once that commit covers it; the entries after a held change wait behind
+it (`behind_fence`). While any wait, the replica asks the core for no `Ready`: its next unit of
+work is the `Ready` already out, whose hard state may state the commit, or else a write of the
+hard state alone, with the term and vote the log holds and the commit through the last entry
+held, which every entry given to apply is, so the log holds them all. This is the commit fence
+of hyper-raft `docs/durable.md` §4.1 (I5) and focal's F17 (research/07 §2.11). It holds at most
+one `Ready`'s committed entries and its light `Ready`'s, and costs a sole voter one flush a
+change; a member with peers learns the commit in a `Ready` whose own write states it, so its
+change waits only for that write, which `drive` waits for anyway. The engine's durable index
+never covers a held change, which it has not applied, so the log's commit is the member's whole
+durable commit here. Mantle's layers have no entry a member acts on at its next start before
+its group tells it, the fence's other case (`acts_at_start` in `docs/durable.md`), so changes
+of configuration are all it holds.
 
 **What comes while a `Ready` flushes.** focal-raft's core takes no call while a `Ready` is
 out: every mutation returns `Invariant("an operation while a ready is out")`, and
@@ -446,6 +470,28 @@ drives, and the simulation's count of held messages is what catches the revert. 
 within the first seeds: gets served from any member's rows without ReadIndex fail
 linearizability, and a replica that applies a repeated command again stores a put twice.
 
+Directed runs in the same file put the power cut where the commit fence (§3) is needed. A
+group founded by member 1 makes one change of configuration: a founder of two removes its only
+peer, which the operator stops once the founder says every voter knows; a leader of three, and
+then a follower, each lose power while the leader removes the third; a sole voter adds a
+learner. The member's device cuts the power at each of its writes and flushes after the change
+is proposed in turn, `Fault::PowerCut`, and once after the change is made everywhere, with its
+`Ready`s taken by `drive` and by `begin`. The member restarts from what its device kept and,
+driven alone, must reach any configuration it had applied, and the group must elect a leader
+and commit an entry on every member. Before the fence, every case failed: the founder, its
+`Ready` begun, applied the removal while the commit's write flushed, its power cut after ten writes and
+flushes, and never elected again, counting its stopped peer; the leader and the follower of three
+reopened counting the member they had removed; the sole voter, killed after the change was
+made, reopened without the learner it had added, its commit never logged.
+
+With the fence, seeds 1 to 48 give the same counts and gateway histories as before but for
+23, 26 and 39. The fence holds a change on every seed, from 4 to 25 times a run; on those three
+a member taking a `Ready` by `begin` held a replacement's change for one flush, the
+replacement moved on a step later, and the simulation's faults, drawn according to what is
+down and what is being repaired, followed another schedule from there: seed 23 finished two
+replacements rather than three, seed 39 replaced two and rebuilt none, seed 26 had two of five
+down at 1,644 steps rather than 616. Every invariant holds on all 48 (2026-10-02, this machine).
+
 A run is exactly its seed. Each member has one update out at a time and the simulation waits
 for it before the step ends, so every frame holds what the seed put in it, and each frame is
 confirmed before its update is answered (raft-log.md §6), so no write the device sees hangs
@@ -478,7 +524,13 @@ loses with its leadership, is proposed again, and one already applied never is:
 3. The replacement ends once every voter of the final configuration has said it committed the
    entry that made it (`Replica::configuration_known`, from the commit index each follower
    reports). A member applies a configuration when it applies its entry, and until then still
-   counts the members the change removed. The simulation showed the cost of ending sooner. A
+   counts the members the change removed. The leader counts itself without a report: it
+   applies the change only once its own log states the commit (§3). A follower's report
+   leaves after the write that states it, since a follower's messages wait for its `Ready`'s
+   write; the one exception is a member that committed alone as leader, in `advance_append`,
+   and stepped down in the same term, whose answers carry a commit no write stated until its
+   next one. Closing that needs the core to carry the durable commit in answers
+   (hyper-raft `docs/durable.md` R-6). The simulation showed the cost of ending sooner. A
    leader applied the change that left the joint configuration and was lost before the others
    learned it had committed. The two survivors still applied the joint configuration, whose
    old half had lost two of its three members, so they could elect no one. Once every voter

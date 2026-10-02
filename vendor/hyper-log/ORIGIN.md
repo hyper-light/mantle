@@ -176,6 +176,56 @@ when it waited for the device left the count where it was, since the wake was th
 
 The 48 equivalence files are byte-identical to mantle-log's throughout.
 
+## A group's handle splits its own updates
+
+- **`GroupLog::parts`** (`src/group.rs`): an update in the parts that each fit a frame, exactly as
+  `Log::parts` gives them, both now `parts` of `src/lib.rs` over the frame's room, which the handle
+  holds; no message to the owner. mantle's range store kept the log beside the handle only to call
+  `Log::parts`: a replica needs nothing but its handle.
+- **Test** `a_handle_splits_an_update_as_the_log_does`: a property test over updates that fit, split
+  into several frames, or are refused as too large; the handle's parts are the log's, and it asks
+  the owner nothing.
+
+## A waking submitter does not wait for its admission
+
+mantle measured its `mantle bench log` at 256 replicas of 128 B on this crate 2–4% below its
+`crates/log` (mantle `docs/measurements/2026-10-01-group-log.md`), its frames gathering nearly
+every replica where mantle-log's carried 127–253.
+
+- **The cause** was not the writer's wait, whose rule and inputs are unchanged. `Log::submit_waking`
+  waited for its admission, a round trip to the owner on every submission, and the owner woke each
+  caller as it admitted it. A thread keeping many submissions out could send its next only once the
+  owner had admitted the last, so the submitters a frame answered came back one owner wake apart
+  (about 4 µs each at load 30) and the writer's gathering of them, 1.1–1.2 ms a frame, was the
+  owner's own work while the file sat idle: it was blocked on its inbox for 55–65 µs of it, and 145
+  of its 191 busy samples were in `Ticket::admit`'s wake. The wait went on because each next
+  submitter came within it. Counting the file's flushes showed the rest of mantle's reading: both
+  logs carry about 128 appends a flush, the protocol's bound at 256 replicas (a replica's append
+  takes its frame's flush and the next durable record's), so the frame counts compared frames, not
+  flushes.
+- **The change** (`src/lib.rs`): `Log::submit_waking` returns once the submission is on its way; the
+  caller hears everything through its waker, as a group's handle already did. A submission without
+  room still waits in the log; a refusal at admission (`Busy` past the waiters, `Fenced`, `Claimed`)
+  is its answer. `Log::submit` and `Log::submit_waiting` are unchanged.
+- **Measured** (`docs/benchmarks.md`, "Many small appends"; `hyper-log-compare` now drives mantle-log
+  `a2021df` in-process exactly as it drives hyper-log, and counts the file's flushes): at load 26–34,
+  29,772 appends a second at 128 B and 256 replicas against mantle-log's 27,726 and main's 26,703,
+  ahead in every paired round, p50 and p99 lower; 23,079 at 16 KiB against 20,555 and 21,470; one
+  replica unchanged (the device's); the replica's path, allocations and reallocations unchanged.
+- **Built, measured and not kept**: the device waiting for a frame to follow before confirming one
+  on its own, and the wait weighing the unconfirmed frame's appends. Together with the change they
+  ran 4% below the change alone.
+
+### Tests
+
+- `a_waking_submitter_does_not_wait_for_its_admission`: with the queue's one submission held in a
+  flush, a waking submission returns at once and waits in the log; once the flush is let through it
+  is written and answered, its waker woken. It hangs before the change, the call waiting for room
+  behind the held flush.
+
+The 48 equivalence files are byte-identical to main's, `EXPECTED` unchanged; on Linux the
+equivalence passed pinned to one core 200 times and unpinned 50.
+
 ## Not done
 
 - The writes through hyper-block's device issuer (mantle `docs/design/node.md` §1.2): the log does

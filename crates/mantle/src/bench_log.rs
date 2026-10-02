@@ -335,6 +335,9 @@ impl Drivers<'_> {
                 });
             }
             replica.started = Instant::now();
+            // The call returns once the update is sent, refusing only what no frame could hold
+            // or a log that has stopped; whatever the log says of it after, a refusal at
+            // admission included, is its answer, heard through the waker.
             replica.pending =
                 Some(log.submit_waking(replica.group, Class::Normal, update, waker.clone())?);
             Ok(())
@@ -379,6 +382,8 @@ impl Drivers<'_> {
                         }
                     }
                 }
+                // A refusal at admission (`Busy` past the log's waiters, a fence) as any other:
+                // the queue holds every replica's append, so none is expected.
                 Err(e) => fail(e),
             }
         }

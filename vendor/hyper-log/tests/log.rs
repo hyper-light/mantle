@@ -3548,6 +3548,50 @@ fn a_waker_is_woken_once_for_each_answer() {
     }
 }
 
+/// A waking submitter hears everything through its waker, its admission included: the call
+/// returns once the submission is on its way, without waiting for the owner to admit it. With
+/// the queue's one submission held in a flush, the waking submission waits in the log for room
+/// while its caller goes on; once the flush is let through, it is admitted, written and
+/// answered, and its waker woken once. The call once waited for its admission, a round trip to
+/// the owner that woke the caller for every submission (`docs/benchmarks.md`, "Many small
+/// appends"); here it would wait for room behind the held flush for good.
+#[test]
+fn a_waking_submitter_does_not_wait_for_its_admission() {
+    let (device, holder) = held_telling(sim(52));
+    let mut cfg = config(16, 8);
+    cfg.queue_submissions = 1;
+    let log = Log::create(device, cfg, ID).unwrap();
+    holder.hold();
+    let _released = holder.released();
+    let first = log
+        .submit(
+            1,
+            Update {
+                entries: Some(entries(1, &[1])),
+                ..Update::default()
+            },
+        )
+        .unwrap();
+    holder.held();
+    let waking = log
+        .submit_waking(
+            2,
+            Class::Normal,
+            Update {
+                entries: Some(entries(1, &[2])),
+                ..Update::default()
+            },
+            holder.waker(0),
+        )
+        .unwrap();
+    assert!(waking.poll().is_none(), "answered while its room is held");
+    holder.release();
+    first.wait().unwrap();
+    assert!(!holder.held_or_told(0), "the waker is told");
+    waking.poll().expect("woken before its answer").unwrap();
+    assert_eq!(log.view(2).unwrap().unwrap().last, 1);
+}
+
 /// Many submitters, each with a waker, keep updates out across many frames: an answer wakes
 /// its own submitter's waker and no other's, once (mantle note 26 §5.3, note 32 L-2).
 #[test]

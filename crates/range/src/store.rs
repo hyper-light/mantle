@@ -3,22 +3,20 @@
 //! are the entry's type, context and data.
 
 use std::cell::Cell;
-use std::sync::Arc;
 
 use focal_raft::proto::{ConfState, Entry, EntryType, HardState, Snapshot};
 use focal_raft::{InitialState, Storage, StorageError};
 use hyper_block::block::BlockFile;
-use hyper_log::{Fetched, GroupLog, Log, LogError, Start};
+use hyper_log::{Fetched, GroupLog, LogError, Start};
 
 pub struct LogStore<F: BlockFile + 'static> {
     /// The group's handle on the log (hyper-log `GroupLog`): the member writes the group
     /// through it alone, and it answers the core's reads where the replica is, from the
-    /// group's state as the member's answered writes left it. Declared before `log`, so that
-    /// its release reaches the log's owner before a last handle on the log stops it.
+    /// group's state as the member's answered writes left it, and cuts a ready's update into
+    /// parts that each fit one of the log's frames.
     pub group: GroupLog<F>,
-    /// The device's log, which one log serves to every range's member on the device: a
-    /// ready's update is cut into parts that each fit one of its frames (`Log::parts`).
-    pub log: Arc<Log<F>>,
+    /// The log's segment size: the most entry bytes one frame takes.
+    segment_bytes: u64,
     /// The configuration of the state the engine opened at.
     pub conf: ConfState,
     /// The snapshot the replica last prepared, at an index at or past the log's start, for
@@ -33,10 +31,10 @@ pub struct LogStore<F: BlockFile + 'static> {
 }
 
 impl<F: BlockFile + 'static> LogStore<F> {
-    pub fn new(log: Arc<Log<F>>, group: GroupLog<F>, conf: ConfState) -> Self {
+    pub fn new(group: GroupLog<F>, segment_bytes: u64, conf: ConfState) -> Self {
         Self {
             group,
-            log,
+            segment_bytes,
             conf,
             snapshot: None,
             fetched: Cell::new(None),
@@ -69,7 +67,7 @@ impl<F: BlockFile + 'static> LogStore<F> {
             .iter()
             .map(|(_, bytes)| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
             .fold(0, u64::saturating_add);
-        if held <= self.log.config().segment_bytes {
+        if held <= self.segment_bytes {
             self.fetched.set(Some(fetched));
         }
     }
@@ -212,7 +210,7 @@ impl<F: BlockFile + 'static> Storage for LogStore<F> {
         high: u64,
         predicate: &mut dyn FnMut(&Entry) -> bool,
     ) -> Result<bool, StorageError> {
-        let page_bytes = self.log.config().segment_bytes;
+        let page_bytes = self.segment_bytes;
         let mut next = low;
         while next < high {
             let fetched = self.fetch(next, high, page_bytes)?;
@@ -259,9 +257,9 @@ mod tests {
     use super::*;
     use hyper_block::buf::Alignment;
     use hyper_block::sim::SimFile;
-    use hyper_log::{Config, Entries, Update, Waits};
+    use hyper_log::{Config, Entries, Log, Update, Waits};
 
-    fn log() -> Arc<Log<SimFile>> {
+    fn log() -> Log<SimFile> {
         let file = SimFile::new(
             Alignment::new(4096).unwrap(),
             Alignment::new(512).unwrap(),
@@ -278,7 +276,7 @@ mod tests {
             queue_submissions: 16,
             waits: Waits::Never,
         };
-        Arc::new(Log::create(file, config, 1).unwrap())
+        Log::create(file, config, 1).unwrap()
     }
 
     fn entries(first: u64, terms: &[u64]) -> Update {
@@ -303,11 +301,8 @@ mod tests {
     #[test]
     fn the_cores_reads_are_answered_by_the_groups_handle_as_the_log_answers_them() {
         let log = log();
-        let mut store = LogStore::new(
-            Arc::clone(&log),
-            log.group(7).unwrap(),
-            ConfState::default(),
-        );
+        let segment_bytes = log.config().segment_bytes;
+        let mut store = LogStore::new(log.group(7).unwrap(), segment_bytes, ConfState::default());
         assert_eq!(
             (store.first_index().unwrap(), store.last_index().unwrap()),
             (1, 0)

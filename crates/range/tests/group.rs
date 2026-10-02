@@ -85,23 +85,23 @@ fn sim(seed: u64) -> SimFile {
     .unwrap()
 }
 
-/// The device of a log whose last handle the test holds, given back once the log has answered
-/// everything it took: what a log owns, the test reaches again only when the log closes.
-fn close(log: Arc<Log<SimFile>>) -> SimFile {
-    Arc::into_inner(log)
-        .expect("the test holds the log's last handle")
-        .close()
-        .unwrap()
+/// The device of a log, given back once the log has answered everything it took: what a log
+/// owns, the test reaches again only when the log closes.
+fn close(log: Log<SimFile>) -> SimFile {
+    log.close().unwrap()
 }
 
+/// A member and the log of its device. The member holds only its group's handle on the log,
+/// so it is dropped first.
 struct Node {
     replica: Replica<SimFile, Model>,
+    log: Log<SimFile>,
 }
 
 fn node(id: u64, seed: u64) -> Node {
-    let log = Arc::new(Log::create(sim(seed), log_config(), 0x6c6f67 + u128::from(id)).unwrap());
-    let replica = Replica::open(id, GROUP, log, first_range(), &range(), seed).unwrap();
-    Node { replica }
+    let log = Log::create(sim(seed), log_config(), 0x6c6f67 + u128::from(id)).unwrap();
+    let replica = Replica::open(id, GROUP, &log, first_range(), &range(), seed).unwrap();
+    Node { replica, log }
 }
 
 /// Drives every node until no message is left in flight, delivering in order.
@@ -271,8 +271,8 @@ impl hyper_block::block::BlockFile for Gated {
     }
 }
 
-/// A member whose log's flushes can be held, and its gate.
-type GatedMember = (Replica<Gated, Model>, Arc<Gate>);
+/// A member whose log's flushes can be held, its gate, and its log.
+type GatedMember = (Replica<Gated, Model>, Arc<Gate>, Log<Gated>);
 
 /// A member whose log's flushes can be held.
 fn gated(id: u64) -> GatedMember {
@@ -281,9 +281,9 @@ fn gated(id: u64) -> GatedMember {
         file: sim(id),
         gate: Arc::clone(&gate),
     };
-    let log = Arc::new(Log::create(file, log_config(), 0x6c6f67 + u128::from(id)).unwrap());
-    let replica = Replica::open(id, GROUP, log, first_range(), &range(), id).unwrap();
-    (replica, gate)
+    let log = Log::create(file, log_config(), 0x6c6f67 + u128::from(id)).unwrap();
+    let replica = Replica::open(id, GROUP, &log, first_range(), &range(), id).unwrap();
+    (replica, gate, log)
 }
 
 /// Opens every gate when dropped, as a failing test unwinds, so no log's device is left
@@ -310,11 +310,11 @@ fn kind(m: &Message) -> Option<mantle_range::MessageType> {
 #[test]
 fn a_leader_sends_while_it_flushes_and_a_follower_acknowledges_after() {
     let mut nodes: Vec<GatedMember> = (1..=3).map(gated).collect();
-    let _opens = Opens(nodes.iter().map(|(_, g)| Arc::clone(g)).collect());
+    let _opens = Opens(nodes.iter().map(|(_, g, _)| Arc::clone(g)).collect());
     let deliver = |nodes: &mut Vec<GatedMember>| {
         let mut wire: VecDeque<Message> = VecDeque::new();
         for _ in 0..10_000 {
-            for (r, _) in nodes.iter_mut() {
+            for (r, _, _) in nodes.iter_mut() {
                 wire.extend(r.drive().unwrap().messages);
             }
             let Some(m) = wire.pop_front() else {
@@ -411,7 +411,7 @@ fn a_leader_sends_while_it_flushes_and_a_follower_acknowledges_after() {
         let _ = nodes[usize::try_from(m.to).unwrap() - 1].0.step(m);
     }
     deliver(&mut nodes);
-    for (r, _) in &nodes {
+    for (r, _, _) in &nodes {
         assert_eq!(r.applied(), nodes[0].0.applied());
     }
     assert!(nodes[0].0.applied() >= 2);
@@ -662,17 +662,7 @@ fn a_member_added_after_compaction_catches_up_and_replaces_a_lost_one() {
 fn a_member_whose_engine_is_ahead_of_its_logs_commit_reopens() {
     use hyper_block::sim::Crash;
 
-    let mut logs: Vec<Arc<Log<SimFile>>> = (1..=3)
-        .map(|id| Arc::new(Log::create(sim(id), log_config(), 0x6c6f67 + u128::from(id)).unwrap()))
-        .collect();
-    let mut nodes: Vec<Node> = logs
-        .iter()
-        .zip(1u64..)
-        .map(|(log, id)| Node {
-            replica: Replica::open(id, GROUP, Arc::clone(log), first_range(), &range(), id)
-                .unwrap(),
-        })
-        .collect();
+    let mut nodes: Vec<Node> = (1..=3).map(|id| node(id, id)).collect();
     let mut answers = Vec::new();
     nodes[0].replica.campaign().unwrap();
     settle(&mut nodes, &mut answers);
@@ -701,8 +691,8 @@ fn a_member_whose_engine_is_ahead_of_its_logs_commit_reopens() {
     nodes[1].replica.compact(u64::MAX).unwrap();
     let old = std::mem::replace(&mut nodes[1], node(9, 9));
     let mut engine = old.replica.into_engine();
-    let hard = logs[1].view(GROUP).unwrap().unwrap().hard_state.unwrap();
-    logs[1]
+    let hard = old.log.view(GROUP).unwrap().unwrap().hard_state.unwrap();
+    old.log
         .write_waiting(
             GROUP,
             hyper_log::Update {
@@ -714,12 +704,13 @@ fn a_member_whose_engine_is_ahead_of_its_logs_commit_reopens() {
 
     // It crashes and opens again from what its device and engine kept.
     engine.crash();
-    let file = close(logs.remove(1));
+    let file = close(old.log);
     file.crash(Crash::Random).unwrap();
     let (log, recovery) = Log::open(file, log_config(), 0x6c6f67 + 2).unwrap();
     assert!(recovery.damaged.is_empty());
     nodes[1] = Node {
-        replica: Replica::open(2, GROUP, Arc::new(log), engine, &range(), 2).unwrap(),
+        replica: Replica::open(2, GROUP, &log, engine, &range(), 2).unwrap(),
+        log,
     };
     assert_eq!(nodes[1].replica.applied(), applied);
     // Hearing from no leader, it times out and campaigns before a leader's append could tell
@@ -766,17 +757,7 @@ fn a_member_whose_last_frame_was_damaged_stays_out_of_elections_until_it_holds_i
     use hyper_block::sim::Fault;
 
     let log_id = |id: u64| 0x6c6f67 + u128::from(id);
-    let mut logs: Vec<Arc<Log<SimFile>>> = (1..=3)
-        .map(|id| Arc::new(Log::create(sim(id), log_config(), log_id(id)).unwrap()))
-        .collect();
-    let mut nodes: Vec<Node> = logs
-        .iter()
-        .zip(1u64..)
-        .map(|(log, id)| Node {
-            replica: Replica::open(id, GROUP, Arc::clone(log), first_range(), &range(), id)
-                .unwrap(),
-        })
-        .collect();
+    let mut nodes: Vec<Node> = (1..=3).map(|id| node(id, id)).collect();
     let mut answers = Vec::new();
     nodes[0].replica.campaign().unwrap();
     settle(&mut nodes, &mut answers);
@@ -804,13 +785,17 @@ fn a_member_whose_last_frame_was_damaged_stays_out_of_elections_until_it_holds_i
         let acks = n.replica.drive().unwrap().messages;
         assert!(acks.iter().any(|m| m.to == 1));
     }
-    let acknowledged = logs[1].view(GROUP).unwrap().unwrap();
+    let acknowledged = nodes[1].log.view(GROUP).unwrap().unwrap();
     let index = acknowledged.last;
-    let acknowledged_term = logs[1].term(GROUP, index).unwrap();
+    let acknowledged_term = nodes[1].log.term(GROUP, index).unwrap();
 
     // Its last frame, the append it acknowledged, is damaged at rest: found as the valid
     // frame of member 2's log with the highest sequence.
-    let image = logs[1].with_file(|f| f.durable_image()).unwrap().unwrap();
+    let image = nodes[1]
+        .log
+        .with_file(|f| f.durable_image())
+        .unwrap()
+        .unwrap();
     let last_frame = image
         .chunks(4096)
         .enumerate()
@@ -822,7 +807,8 @@ fn a_member_whose_last_frame_was_damaged_stays_out_of_elections_until_it_holds_i
         .max()
         .unwrap()
         .1;
-    logs[1]
+    nodes[1]
+        .log
         .with_file(move |f| {
             f.inject(Fault::BitFlip {
                 offset: last_frame as u64 + 90,
@@ -836,15 +822,14 @@ fn a_member_whose_last_frame_was_damaged_stays_out_of_elections_until_it_holds_i
     // It restarts from its device and its engine.
     let old = std::mem::replace(&mut nodes[1], node(9, 9));
     let engine = old.replica.into_engine();
-    let stand_in = Arc::clone(&logs[0]);
-    let file = close(std::mem::replace(&mut logs[1], stand_in));
+    let file = close(old.log);
     let (log, recovery) = Log::open(file, log_config(), log_id(2)).unwrap();
     assert_eq!(recovery.restored, vec![GROUP]);
-    logs[1] = Arc::new(log);
     nodes[1] = Node {
-        replica: Replica::open(2, GROUP, Arc::clone(&logs[1]), engine, &range(), 2).unwrap(),
+        replica: Replica::open(2, GROUP, &log, engine, &range(), 2).unwrap(),
+        log,
     };
-    let view = logs[1].view(GROUP).unwrap().unwrap();
+    let view = nodes[1].log.view(GROUP).unwrap().unwrap();
     assert_eq!(
         view.hard_state.map(|h| (h.term, h.vote)),
         acknowledged.hard_state.map(|h| (h.term, h.vote))
@@ -908,7 +893,7 @@ fn a_member_whose_last_frame_was_damaged_stays_out_of_elections_until_it_holds_i
         }
     }
     assert!(!nodes[1].replica.is_uncertain().unwrap());
-    assert!(logs[1].view(GROUP).unwrap().unwrap().last >= index);
+    assert!(nodes[1].log.view(GROUP).unwrap().unwrap().last >= index);
     nodes[1].replica.campaign().unwrap();
 }
 
@@ -931,7 +916,7 @@ fn a_ready_refused_for_room_waits_until_the_group_compacts() {
         group_bytes: 1 << 20,
         ..log_config()
     };
-    let log = Arc::new(Log::create(sim(7), config, 0x6c6f67).unwrap());
+    let log = Log::create(sim(7), config, 0x6c6f67).unwrap();
     let alone = Range {
         boot: ConfState {
             voters: vec![1],
@@ -940,7 +925,7 @@ fn a_ready_refused_for_room_waits_until_the_group_compacts() {
         settings: small,
         ..range()
     };
-    let mut replica = Replica::open(1, GROUP, log, first_range(), &alone, 7).unwrap();
+    let mut replica = Replica::open(1, GROUP, &log, first_range(), &alone, 7).unwrap();
     replica.campaign().unwrap();
     assert!(replica.drive().unwrap().stalled.is_none());
     assert!(replica.is_leader());
@@ -990,12 +975,12 @@ fn a_ready_refused_for_room_waits_until_the_group_compacts() {
 #[test]
 fn a_member_refuses_settings_its_log_cannot_hold() {
     let open = |settings: Settings, config: LogConfig| {
-        let log = Arc::new(Log::create(sim(8), config, 0x6c6f67).unwrap());
+        let log = Log::create(sim(8), config, 0x6c6f67).unwrap();
         let r = Range {
             settings,
             ..range()
         };
-        Replica::open(1, GROUP, log, first_range(), &r, 8).map(|_| ())
+        Replica::open(1, GROUP, &log, first_range(), &r, 8).map(|_| ())
     };
     assert!(open(SETTINGS, log_config()).is_ok());
     let wide = Settings {
@@ -1292,12 +1277,11 @@ fn reads_of_a_round_no_quorum_confirms_go_back_to_their_callers() {
 /// member rebuilt under a new identity keeps its device.
 ///
 /// A device is its log's while the member runs, and the test reaches it through the log
-/// (`Devices::with_file`); a stopped member's log is `None` and its device the test's, to
-/// damage at rest. A log is shared between its member, as `Replica::open` takes it, and the
-/// test, which reads what it holds.
+/// (`Devices::with_file`); a stopped member's device is the test's, to damage at rest, and a
+/// stand-in on a device of its own holds its slot. A member's log is its node's, which the
+/// test reads.
 struct Devices {
     files: Vec<Option<SimFile>>,
-    logs: Vec<Option<Arc<Log<SimFile>>>>,
     nodes: Vec<Node>,
 }
 
@@ -1308,31 +1292,17 @@ fn log_id(slot: usize) -> u128 {
 impl Devices {
     fn new(seed: u64) -> Self {
         let files = (0..3).map(|_| None).collect();
-        let logs: Vec<Option<Arc<Log<SimFile>>>> = (0..3)
-            .map(|slot| {
-                let device = sim(seed + u64::try_from(slot).unwrap());
-                Some(Arc::new(
-                    Log::create(device, log_config(), log_id(slot)).unwrap(),
-                ))
-            })
-            .collect();
-        let nodes = logs
-            .iter()
-            .flatten()
+        let nodes = (0..3)
             .zip(1u64..)
-            .map(|(log, id)| Node {
-                replica: Replica::open(
-                    id,
-                    GROUP,
-                    Arc::clone(log),
-                    first_range(),
-                    &range(),
-                    seed + id,
-                )
-                .unwrap(),
+            .map(|(slot, id)| {
+                let device = sim(seed + u64::try_from(slot).unwrap());
+                let log = Log::create(device, log_config(), log_id(slot)).unwrap();
+                let replica =
+                    Replica::open(id, GROUP, &log, first_range(), &range(), seed + id).unwrap();
+                Node { replica, log }
             })
             .collect();
-        Self { files, logs, nodes }
+        Self { files, nodes }
     }
 
     /// Stops the member in `slot`, as a crash does once its log and engine are durable: its
@@ -1340,7 +1310,7 @@ impl Devices {
     fn stop(&mut self, slot: usize) -> Model {
         let old = std::mem::replace(&mut self.nodes[slot], node(9, 9));
         let engine = old.replica.into_engine();
-        self.files[slot] = self.logs[slot].take().map(close);
+        self.files[slot] = Some(close(old.log));
         engine
     }
 
@@ -1350,10 +1320,9 @@ impl Devices {
         slot: usize,
         look: impl FnOnce(&SimFile) -> R + Send + 'static,
     ) -> R {
-        match (&self.logs[slot], &self.files[slot]) {
-            (Some(log), _) => log.with_file(look).unwrap(),
-            (None, Some(file)) => look(file),
-            (None, None) => panic!("slot {slot} has no device"),
+        match &self.files[slot] {
+            Some(file) => look(file),
+            None => self.nodes[slot].log.with_file(look).unwrap(),
         }
     }
 
@@ -1376,15 +1345,16 @@ impl Devices {
     ) {
         let mut wire: VecDeque<Message> = VecDeque::new();
         for _ in 0..10_000 {
-            for (n, log) in self.nodes.iter_mut().zip(&self.logs) {
+            for (n, file) in self.nodes.iter_mut().zip(&self.files) {
                 let id = n.replica.id();
                 if out.contains(&id) {
                     continue;
                 }
                 let drove = n.replica.drive().unwrap();
-                if let Some(log) = log {
+                // A running member's log; a stopped one's device is the test's.
+                if file.is_none() {
                     for m in &drove.messages {
-                        check(m, log);
+                        check(m, &n.log);
                     }
                 }
                 wire.extend(drove.messages);
@@ -1588,10 +1558,10 @@ fn a_failed_write_fences_the_member_and_the_group_goes_on_without_it() {
     }
 }
 
-/// A group of one on a log that holds `config`'s groups and segments. The log is shared with
-/// the test, which writes other groups to it, as `Replica::open` takes it (`Devices`).
-fn alone(config: LogConfig, settings: Settings, seed: u64) -> (Arc<Log<SimFile>>, Member) {
-    let log = Arc::new(Log::create(sim(seed), config, 0x6c6f67).unwrap());
+/// A group of one on a log that holds `config`'s groups and segments. The test keeps the log,
+/// and writes other groups to it.
+fn alone(config: LogConfig, settings: Settings, seed: u64) -> (Log<SimFile>, Member) {
+    let log = Log::create(sim(seed), config, 0x6c6f67).unwrap();
     let range = Range {
         boot: ConfState {
             voters: vec![1],
@@ -1600,7 +1570,7 @@ fn alone(config: LogConfig, settings: Settings, seed: u64) -> (Arc<Log<SimFile>>
         settings,
         ..range()
     };
-    let replica = Replica::open(1, GROUP, Arc::clone(&log), first_range(), &range, seed).unwrap();
+    let replica = Replica::open(1, GROUP, &log, first_range(), &range, seed).unwrap();
     (log, replica)
 }
 
@@ -1744,9 +1714,8 @@ fn a_member_whose_group_was_damaged_at_rest_is_rebuilt_from_its_peers() {
     // It restarts: the log reports its group damaged, and the member does not open.
     let (log, recovery) = Log::open(file, log_config(), log_id(2)).unwrap();
     assert_eq!(recovery.damaged, vec![GROUP]);
-    let log = Arc::new(log);
     assert!(matches!(
-        Replica::open(3, GROUP, Arc::clone(&log), first_range(), &range(), 3),
+        Replica::open(3, GROUP, &log, first_range(), &range(), 3),
         Err(ReplicaError::Damaged)
     ));
 
@@ -1757,10 +1726,12 @@ fn a_member_whose_group_was_damaged_at_rest_is_rebuilt_from_its_peers() {
 
     // The node rebuilds it as member 4, and the leader runs the replacement.
     let (rebuilt, replacement) =
-        Replica::rebuild(3, 4, GROUP, Arc::clone(&log), first_range(), &range(), 4).unwrap();
+        Replica::rebuild(3, 4, GROUP, &log, first_range(), &range(), 4).unwrap();
     assert_eq!(rebuilt.id(), 4);
-    d.nodes[2] = Node { replica: rebuilt };
-    d.logs[2] = Some(log);
+    d.nodes[2] = Node {
+        replica: rebuilt,
+        log,
+    };
     let mut done = false;
     for _ in 0..50 {
         let leader = d.leader(&[3], &mut answers);
@@ -1906,14 +1877,13 @@ fn a_member_whose_engine_applied_what_its_damaged_log_lost_keeps_its_identity_wh
         };
         let view = log.view(GROUP).unwrap().unwrap();
         assert_eq!((view.last, view.uncertain), (3, Some(mark)), "case {case}");
-        let log = Arc::new(log);
         // The engine made its rows durable through `applied`.
         let mut engine = first_range();
         for index in 1..=applied {
             engine.apply(index, &[]).unwrap();
         }
         engine.persist().unwrap();
-        let opened = Replica::open(1, GROUP, Arc::clone(&log), engine, &range(), 1);
+        let opened = Replica::open(1, GROUP, &log, engine, &range(), 1);
         match start {
             Some(term) => {
                 let mut member = opened.unwrap_or_else(|e| panic!("case {case}: {e}"));
@@ -1984,11 +1954,12 @@ fn a_member_whose_engine_applied_what_its_damaged_log_lost_is_repaired_in_place(
     let view = log.view(GROUP).unwrap().unwrap();
     assert!(view.last < entry, "the lost frame held no applied entry");
     assert_eq!(view.uncertain.map(|m| m.index), Some(entry));
-    let log = Arc::new(log);
-    let member = Replica::open(2, GROUP, Arc::clone(&log), engine, &range(), 2).unwrap();
+    let member = Replica::open(2, GROUP, &log, engine, &range(), 2).unwrap();
     assert_eq!(member.applied(), entry);
-    d.nodes[1] = Node { replica: member };
-    d.logs[1] = Some(log);
+    d.nodes[1] = Node {
+        replica: member,
+        log,
+    };
 
     // The group goes on, and repairs it: what it acknowledges, its log holds.
     let mut acknowledged = 0;
@@ -2032,8 +2003,8 @@ fn a_ready_refused_for_a_full_log_waits_until_another_group_compacts() {
         max_segments: 4,
         ..log_config()
     };
-    // Shared with the member as `Replica::open` takes it; the test writes another group.
-    let log = Arc::new(Log::create(sim(12), config, 0x6c6f67).unwrap());
+    // The test keeps the log, and writes another group to it.
+    let log = Log::create(sim(12), config, 0x6c6f67).unwrap();
     let room = log.entry_room().unwrap();
     let quarter = room / 4;
     // An entry's encoding adds its kind and its context's length to its data.
@@ -2053,7 +2024,7 @@ fn a_ready_refused_for_a_full_log_waits_until_another_group_compacts() {
         settings,
         ..range()
     };
-    let mut replica = Replica::open(1, GROUP, Arc::clone(&log), first_range(), &alone, 12).unwrap();
+    let mut replica = Replica::open(1, GROUP, &log, first_range(), &alone, 12).unwrap();
     replica.campaign().unwrap();
     // A drive takes one ready at least: the campaign's, then its leader's empty entry.
     for _ in 0..2 {

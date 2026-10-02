@@ -2,7 +2,6 @@
 //! group's view of the device's log, the range's engine and its layer's state machine.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::Arc;
 
 use focal_raft::proto::{
     self, ConfChangeV2, ConfState, Entry, EntryType, Message, MessageType, Snapshot,
@@ -97,7 +96,6 @@ pub struct Applied {
 
 pub struct Replica<F: BlockFile + 'static, E: Engine> {
     node: RawNode<LogStore<F>>,
-    group: u128,
     engine: E,
     layer: Layer,
     rules: Rules,
@@ -289,7 +287,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
     pub fn open(
         id: u64,
         group: u128,
-        log: Arc<Log<F>>,
+        log: &Log<F>,
         engine: E,
         range: &Range,
         seed: u64,
@@ -308,10 +306,10 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
                 .ok_or_else(|| ReplicaError::Stopped("the configuration does not decode".into()))?,
             None => boot.clone(),
         };
-        check_settings(settings, &log)?;
+        check_settings(settings, log)?;
         let applied = engine.applied();
-        complete_install(&log, group, &engine)?;
-        commit_applied(&log, group, applied)?;
+        complete_install(log, group, &engine)?;
+        commit_applied(log, group, applied)?;
         let config = focal_raft::Config {
             election_tick: settings.election_tick,
             heartbeat_tick: settings.heartbeat_tick,
@@ -329,7 +327,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
         };
         // From here the member writes and reads its group through the group's handle alone.
         let handle = log.group(group)?;
-        let store = LogStore::new(log, handle, conf.clone());
+        let store = LogStore::new(handle, log.config().segment_bytes, conf.clone());
         let window_bytes = u64::try_from(settings.max_inflight_msgs)
             .ok()
             .and_then(|n| n.checked_mul(settings.max_size_per_msg))
@@ -345,7 +343,6 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
         let node = RawNode::new(&config, store)?;
         let mut replica = Self {
             node,
-            group,
             engine,
             layer,
             rules,
@@ -383,17 +380,15 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
     /// group's member on this device before it calls this, and a restart after the removal,
     /// finding the group empty, opens `joining` again by calling this again.
     ///
-    /// `log` is shared as [`Replica::open`] takes it: one log serves every range's member on
-    /// the device, each opened, rebuilt and dropped on its own schedule, and the log is
-    /// reopened over its file while the device's other members go on, so no one member owns
-    /// it and none can borrow it from an owner whose scope spans theirs until the node that
-    /// holds every range owns the log. The handle is all that is shared: the log's state is
-    /// its owner thread's (hyper-log), reached by message.
+    /// `log` is borrowed as [`Replica::open`] borrows it: one log serves every range's member
+    /// on the device, and a member keeps only its group's handle on it (hyper-log
+    /// `GroupLog`), which reaches the log's owner thread by message. The handle answers
+    /// `Closed` once the log has stopped.
     pub fn rebuild(
         failed: u64,
         joining: u64,
         group: u128,
-        log: Arc<Log<F>>,
+        log: &Log<F>,
         engine: E,
         range: &Range,
         seed: u64,
@@ -1004,7 +999,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
             self.confirmed(read.index, &read.request_ctx, out);
         }
         let parts = match update_of(&ready, installed)? {
-            Some(update) => match self.node.store().log.parts(self.group, update) {
+            Some(update) => match self.node.store().group.parts(update) {
                 Ok(parts) => parts.into(),
                 Err(LogError::TooLarge(len)) => {
                     return Err(ReplicaError::Stopped(format!(

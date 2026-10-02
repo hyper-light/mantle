@@ -278,17 +278,17 @@ state to one owner thread that answers every call by ticket, waking only its cal
 mantle runs on that crate since 2026-10-01 and `crates/log` is gone (§5.3). The range
 simulation's recorded seeds 1 to 48 replay to the same histories, step for step, on it as on
 `crates/log`. A replica writes and reads its group through the group's handle on the log
-(hyper-log `GroupLog`, at hyper-raft `8fe3f23`), which answers the core's reads on the
-replica's thread from what the replica's own answered writes left, and a blocking write does
-its own frame's I/O on the writer's thread. A committed entry of a three-member group,
-driven in one process, allocates 127.2 times and reallocates 4.0 against `crates/log`'s 262.2
-and 25.0, and takes a median 117 µs against 133 µs at a load average of 32 (74 against 76 at
-8), faster in 25 of 31 paired rounds; on the move to hyper-log before the handle it took
-0.83 ms ([measurements](measurements/2026-10-01-group-log.md),
+(hyper-log `GroupLog`, at hyper-raft `63cb65d`), which answers the core's reads and cuts its
+updates into frames on the replica's thread, from what the replica's own answered writes
+left; a blocking write does its own frame's I/O on the writer's thread, and the member holds
+no handle on the log itself. A committed entry of a three-member group, driven in one
+process, allocates 127.2 times and reallocates 4.0 against `crates/log`'s 262.2 and 25.0, and
+takes a median 143 µs against 151 µs at a load average of 34–35, faster in 27 of 31 paired
+rounds; on the move to hyper-log before the handle it took 0.83 ms
+([measurements](measurements/2026-10-01-group-log.md),
 [before](measurements/2026-10-01-shared-log.md)). `mantle bench log` matches `crates/log`
-with one replica and is within 4% either way at 256 appends of 16 KiB; at 256 appends of
-128 B it carries 249–254 appends a flush where `crates/log` carried 127–253, and runs 2–4%
-fewer appends a second.
+with one replica and runs more appends a second at 256 replicas: 29.3K against 27.1K at
+128 B, in 12 of 12 paired rounds, and 23.1K against 21.1K at 16 KiB, in 11 of 12.
 
 Range replicas (`mantle-range`, [design](design/replica.md)) run hyper-raft's core (vendored,
 named `focal-raft` in the crate) over the log and an engine: an entry carries a batch of gateway commands applied as one engine batch,

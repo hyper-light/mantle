@@ -208,6 +208,36 @@ proptest! {
     ) {
         handle_reads_as_the_log_does(&steps, cache, seed)?;
     }
+
+    /// A handle splits an update into the parts the log would, whole or in several frames or
+    /// refused as too large, without asking the log's owner: a replica needs nothing but its
+    /// handle to write a ready larger than a frame.
+    #[test]
+    fn a_handle_splits_an_update_as_the_log_does(
+        start in prop::option::of(0u64..8),
+        count in 0u64..40,
+        len in 0usize..3_000,
+        hard in any::<bool>(),
+        proposals in prop::collection::vec(0usize..70_000, 0..3),
+    ) {
+        let log = Log::create(sim(9), config(1 << 20), ID).unwrap();
+        let h = log.group(1).unwrap();
+        let last = start.unwrap_or(0) + count;
+        let update = Update {
+            start: start.map(|index| Start { index, term: 1 }),
+            entries: (count > 0).then(|| entries(start.unwrap_or(0) + 1, count, 1, len)),
+            hard_state: hard.then_some(HardState { term: 1, vote: 0, commit: 0 }),
+            proposals: (last + 1..)
+                .zip(&proposals)
+                .map(|(index, &len)| Proposal { index, term: 1, bytes: vec![7; len] })
+                .collect(),
+            ..Update::default()
+        };
+        let theirs = format!("{:?}", log.parts(1, update.clone()));
+        let ours = format!("{:?}", h.parts(update));
+        prop_assert_eq!(ours, theirs);
+        prop_assert_eq!(h.asked(), 0);
+    }
 }
 
 /// The log holds a group for its handle: its other writers are refused, a second handle is

@@ -41,7 +41,6 @@
 mod support;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
 
 use hyper_block::block::BlockFile;
 use hyper_block::buf::{AlignedBuf, Alignment};
@@ -146,7 +145,7 @@ struct Node {
     log_id: u128,
     /// Its log while it runs, or while its member is quarantined on it. The log owns the
     /// device then, and the node reaches the device through the log (`Node::with_file`).
-    log: Option<Arc<Log<SimFile>>>,
+    log: Option<Log<SimFile>>,
     /// Its device while no log holds it: the node is down.
     file: Option<SimFile>,
     /// `None` while the node is down; its engine is kept as the crash left it.
@@ -207,16 +206,9 @@ impl Node {
             seed ^ (id << 32),
         )
         .unwrap();
-        let log = Arc::new(Log::create(file, log_config(), log_id(id)).unwrap());
-        let replica = Replica::open(
-            id,
-            GROUP,
-            Arc::clone(&log),
-            first_range(),
-            &range(members),
-            seed ^ id,
-        )
-        .unwrap();
+        let log = Log::create(file, log_config(), log_id(id)).unwrap();
+        let replica =
+            Replica::open(id, GROUP, &log, first_range(), &range(members), seed ^ id).unwrap();
         Self {
             id,
             log_id: log_id(id),
@@ -243,11 +235,9 @@ impl Node {
         }
     }
 
-    /// The device, given back by the log once it has answered everything it took: the node
-    /// holds the log's last handle, the member's having gone with the member.
+    /// The device, given back by the log once it has answered everything it took.
     fn device(&mut self) -> &SimFile {
         if let Some(log) = self.log.take() {
-            let log = Arc::into_inner(log).expect("the node holds the log's last handle");
             self.file = Some(log.close().unwrap());
         }
         self.file.as_ref().unwrap()
@@ -290,8 +280,7 @@ impl Node {
             }
             Err(e) => panic!("member {} reopens its log: {e}", self.id),
         };
-        let log = Arc::new(log);
-        self.log = Some(Arc::clone(&log));
+        let log = &*self.log.insert(log);
         if !recovery.damaged.is_empty() {
             assert!(latent && recovery.damaged == [GROUP], "{recovery:?}");
             self.found = Some(Found::Group);
@@ -707,7 +696,7 @@ impl World {
         self.next_id += 1;
         let replacement = match self.nodes[i].found.take() {
             Some(Found::Group) => {
-                let log = Arc::clone(self.nodes[i].log.as_ref().unwrap());
+                let log = self.nodes[i].log.as_ref().unwrap();
                 let (replica, replacement) = Replica::rebuild(
                     failed,
                     joining,

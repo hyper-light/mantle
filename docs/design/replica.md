@@ -273,9 +273,9 @@ hard state and marks, and the bytes of the recent entries within the log's `grou
 answers the core from them with no message to the log's owner thread, and asks the owner only
 for entries older than its cache, a view while proposals are out, and every read after a
 failure it cannot account for. Entries are fetched into a reservation the store keeps, no
-larger than a segment's. A ready's update is cut into parts that each fit a frame by the log
-(`Log::parts`), which the store reaches through the device's log it was opened on
-(measurements/2026-10-01-group-log.md).
+larger than a segment's. The handle also cuts a ready's update into parts that each fit a
+frame (`GroupLog::parts`, exactly `Log::parts`), so the member holds no handle on the log
+itself: it borrows the log only to open (measurements/2026-10-01-group-log.md).
 
 ## 4. Compaction, snapshots and restart
 

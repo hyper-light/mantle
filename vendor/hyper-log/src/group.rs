@@ -316,6 +316,13 @@ impl<F: BlockFile + 'static> GroupLog<F> {
         self.out.len()
     }
 
+    /// `update` in parts that each fit one frame, in the order they apply, exactly as
+    /// `Log::parts` gives them for the group: a pure function of the update and the frame's
+    /// room, which the handle holds, so it is answered here with no message to the log's owner.
+    pub fn parts(&self, update: Update) -> Result<Vec<Update>, LogError> {
+        crate::parts(self.p.frame_room, self.group, update)
+    }
+
     /// Submits `update`, which waits in the log for room rather than being refused, as
     /// `Log::submit_waiting` does; it returns once the update is on its way, and its answer is
     /// taken with [`GroupLog::wait`] or [`GroupLog::poll`], in the order submitted. `Busy` when

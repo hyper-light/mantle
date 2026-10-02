@@ -29,7 +29,9 @@ use std::fmt::Write as _;
 
 use hyper_block::buf::Alignment;
 use hyper_block::sim::{Crash, Fault, SimFile};
-use hyper_log::{Config, Entries, Entry, HardState, Log, LogError, Proposal, Start, Update, Waits};
+use hyper_log::{
+    Class, Config, Entries, Entry, HardState, Log, LogError, Proposal, Start, Update, Waits,
+};
 
 mod common;
 use common::Holder;
@@ -203,6 +205,7 @@ fn answer(r: Result<(), LogError>) -> &'static str {
         Err(LogError::Damaged(_)) => "damaged",
         Err(LogError::Foreign(_)) => "foreign",
         Err(LogError::Config(_)) => "config",
+        Err(LogError::Claimed(_)) => "claimed",
         Err(LogError::Disk(_)) => "disk",
     }
 }
@@ -243,13 +246,16 @@ const PLUG: u64 = GROUPS + 1;
 
 /// One round: a plug update is written alone and held in its flush while the round's updates
 /// are submitted, so they make the next frame together. A plug the log refuses (it is full)
-/// holds nothing, and the round's updates are then written one at a time.
+/// holds nothing, and the round's updates are then written one at a time. The round waits for
+/// the one or the other, each a fact the holder hears of: the plug's flush held, or the plug's
+/// answer, through its waker; and it begins with nothing heard from the round before.
 fn round(log: &Log<common::Held>, stepped: &Holder, rng: &mut Rng, n: u64, out: &mut String) {
     let mut groups: Vec<u64> = (1..=GROUPS).collect();
     for i in (1..groups.len()).rev() {
         groups.swap(i, rng.below(i as u64 + 1) as usize);
     }
     let k = 1 + rng.below(GROUPS) as usize;
+    stepped.settle();
     stepped.hold();
     let _released = stepped.released();
     let plug = Update {
@@ -260,15 +266,14 @@ fn round(log: &Log<common::Held>, stepped: &Holder, rng: &mut Rng, n: u64, out: 
         }),
         ..Update::default()
     };
-    let plug = log.submit(u128::from(PLUG), plug).unwrap();
+    let tag = usize::try_from(n).unwrap();
+    let plug = log
+        .submit_waking(u128::from(PLUG), Class::Normal, plug, stepped.waker(tag))
+        .unwrap();
     let mut plug_answer = None;
-    while !stepped.is_held() {
-        if let Some(a) = plug.poll() {
-            plug_answer = Some(answer(a));
-            stepped.release();
-            break;
-        }
-        std::thread::yield_now();
+    if !stepped.held_or_told(tag) {
+        plug_answer = Some(answer(plug.poll().unwrap()));
+        stepped.release();
     }
     let _ = write!(out, "r{n}");
     let mut pending = Vec::new();
@@ -368,7 +373,7 @@ fn run(seed: u64) -> (String, Vec<u8>) {
     let mut out = String::new();
     let mut n = 0u64;
     for cycle in 0..CYCLES {
-        let (device, stepped) = common::held(file);
+        let (device, stepped) = common::held_telling(file);
         let log = if cycle == 0 {
             Log::create(device, config(), ID).unwrap()
         } else {

@@ -1,47 +1,199 @@
-//! The log's device thread: the one owner of the log's file (hyper-raft CLAUDE.md §1, the
-//! sans-io rule's exception). It takes jobs from the log's owner one at a time, in order, and
-//! answers each into the owner's inbox: a frame written and flushed, a confirmation, a tail read
-//! for a sweep, entries read back, and a caller's own look at the file.
+//! The log's file and what is done with it: the I/O the log's owner asks for, done by a caller
+//! that waits on the frame's answer or by the log's I/O thread (`serve`), never by the owner's.
+//! The device is one owner's: it travels with the job, in a [`Carrier`], to the thread that does
+//! it and comes back to the owner with the completion (hyper-raft CLAUDE.md §1, the sans-io rule's
+//! exception).
 //!
-//! The owner never waits on the device: it hands a job over and goes on answering its callers,
-//! and the job's completion comes back as a message like any other. Its jobs are at most one of
-//! each kind at once (`owner::Owner`), so the device's queue never holds more than [`JOBS`].
+//! The completion comes back through the owner's returns, which wake no one: the owner reads them
+//! before every message it takes, so anything a caller sends after hearing an answer the device
+//! gave is heard after the completion that freed its room, as when the writer answered under its
+//! lock. The thread that did the job wakes the owner only when the completion leaves the owner
+//! something to answer (a frame another frame will confirm, a failure, a sweep, a read, a look);
+//! the owner, when it has work waiting on the device, asks the I/O thread to wake it once the job
+//! is back (`Request::Watch`). So a write whose frame confirms itself, with no one else
+//! submitting, crosses from its caller to the owner and back: the owner sleeps once and the
+//! caller once, as mantle's writer and its caller did.
 //!
 //! The operations of a frame are mantle's, in mantle's order: the frame, its persist record, then
 //! one flush, nothing after a failed write, and a failed flush never retried (mantle
-//! docs/design/raft-log.md §3).
+//! docs/design/raft-log.md §3). The thread that flushed a frame finishes it as mantle's writer
+//! did, without handing back first: the frame before it is confirmed by this one's record, so its
+//! callers are answered; then, unless the owner has said another frame follows
+//! (`Device::follows`), this frame is confirmed on its own, as the owner would have had it be,
+//! and its callers are answered too. The owner hears of the flush before the confirmation is
+//! written, and publishes the frame then, as the writer published a frame once flushed. Each
+//! answer goes out only after the owner's inbox holds the message that frees its room, so a
+//! caller that submits again on hearing it finds the room given back, as it did when the writer
+//! answered under its lock.
 
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::cell::RefCell;
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
 use std::time::Instant;
 
 use hyper_block::block::BlockFile;
 use hyper_block::buf::{AlignedBuf, Alignment, Pool};
 
-use crate::LogError;
 use crate::format::{self, FRAME_HEADER_BYTES, FRAME_HEADER_LEN, Owned};
 use crate::owner::Message;
 use crate::recover::{Found, Reader, Segment};
+use crate::ticket::{Answer, Ticket};
+use crate::{Entry, LogError};
 
-/// Jobs the device's queue holds at most: one frame or confirmation, one read of entries and
-/// one caller's look at the file, each of which the owner keeps to one at a time.
+/// Jobs the owner holds for the device at most: one write-path job (a sweep, a frame or a
+/// confirmation), one read of entries and one caller's look at the file, each of which the owner
+/// keeps to one at a time.
 pub(crate) const JOBS: usize = 3;
 
-/// A look at the file a caller runs on the device thread.
+/// Frames the owner may say another follows for before the device looks: the frame on the device,
+/// and a stale word about the frame before, which the device drops.
+pub(crate) const MORE: usize = 2;
+
+/// Requests the I/O thread holds at most: the job out, and the owner's ask to be woken once it is
+/// back; the owner has one job out at a time and asks once for it.
+pub(crate) const REQUESTS: usize = 2;
+
+/// Tokens the owner's token channel holds while the owner holds its receiver: the owner empties
+/// it as it takes each job back and as a watch gives it back, one job is out at a time, and a
+/// job's token is sent after the job is back, so the last job's token can follow the emptying and
+/// the next job's join it before the next. While the I/O thread watches, it takes each token as
+/// it comes, so a job's thread that finds the channel full waits only for it.
+pub(crate) const TOKENS: usize = 2;
+
+/// A look at the file a caller runs on the thread that holds the device.
 pub(crate) type Look<F> = Box<dyn FnOnce(&F) + Send>;
+
+/// I/O handed to a thread to do: a job and the device, which go back to the owner once done.
+pub(crate) trait Io: Send {
+    /// Does the job, gives the owner back the device and the completion, and gives the answers
+    /// the job gave.
+    fn run(self: Box<Self>);
+}
+
+/// What the I/O thread is asked to do.
+pub(crate) enum Request {
+    /// A job, no caller doing it.
+    Job(Box<dyn Io>),
+    /// Wake the owner once the job of this sequence is back, the token of each job back coming
+    /// through this receiver; the receiver goes back to the owner with the word.
+    Watch(u64, Receiver<u64>),
+}
+
+/// A job and the device on their way to the thread that does it, and the completion and the
+/// device on their way back: one box, kept by the owner from job to job.
+pub(crate) struct Carrier<F> {
+    pub(crate) job: Option<Job<F>>,
+    pub(crate) device: Option<Device<F>>,
+    pub(crate) completion: Option<Completion>,
+    /// The job's place among the jobs the owner has given out.
+    pub(crate) sequence: u64,
+}
+
+impl<F> Carrier<F> {
+    pub(crate) fn new(job: Job<F>, device: Device<F>, sequence: u64) -> Self {
+        Self {
+            job: Some(job),
+            device: Some(device),
+            completion: None,
+            sequence,
+        }
+    }
+}
+
+thread_local! {
+    /// The answers a job gives once the owner holds its completion, kept by each thread that does
+    /// jobs from one job to the next: at most one frame's updates and the frame's before it.
+    static ANSWERS: RefCell<Vec<Answering>> = const { RefCell::new(Vec::new()) };
+}
+
+impl<F: BlockFile + Send + 'static> Io for Carrier<F> {
+    fn run(mut self: Box<Self>) {
+        let (Some(job), Some(mut device)) = (self.job.take(), self.device.take()) else {
+            return;
+        };
+        let mut answers = ANSWERS
+            .try_with(|a| a.try_borrow_mut().map(|mut a| std::mem::take(&mut *a)).ok())
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let completion = device.execute(job, &mut answers);
+        // A confirmation that held answered every caller it confirms: the owner has only room to
+        // give back and the frame to settle, which it does before the next message it takes.
+        let tell = !matches!(completion, Completion::Confirm { result: Ok(()), .. });
+        let (returns, tokens, inbox) = (
+            device.returns.clone(),
+            device.tokens.clone(),
+            device.inbox.clone(),
+        );
+        let sequence = self.sequence;
+        self.completion = Some(completion);
+        self.device = Some(device);
+        // The owner holds the completion before anyone hears an answer the job gave; should the
+        // owner have gone, the answers are dropped and each caller hears the log closed.
+        if returns.send(self).is_ok() {
+            // Every token is sent, so a watch for this job ends (`TOKENS`).
+            let _ = tokens.send(sequence);
+            if tell {
+                let _ = inbox.send(Message::Returned);
+            }
+            for answering in answers.drain(..) {
+                answering.durable();
+            }
+        }
+        answers.clear();
+        let _ = ANSWERS.try_with(|a| {
+            if let Ok(mut a) = a.try_borrow_mut() {
+                *a = answers;
+            }
+        });
+    }
+}
+
+/// The log's I/O thread: it does the jobs no caller does, and wakes the owner when it asks to be
+/// woken for a job back. It ends once the owner has.
+pub(crate) fn serve<F>(requests: &Receiver<Request>, inbox: &SyncSender<Message<F>>) {
+    while let Ok(request) = requests.recv() {
+        match request {
+            Request::Job(io) => io.run(),
+            Request::Watch(sequence, tokens) => {
+                loop {
+                    match tokens.recv() {
+                        Ok(back) if back >= sequence => break,
+                        Ok(_) => {}
+                        Err(_) => return,
+                    }
+                }
+                if inbox.send(Message::Watched(tokens)).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// One caller's answer for an update of a frame: its ticket, and the entries a handle's write
+/// gets back.
+pub(crate) struct Answering {
+    pub(crate) ticket: Ticket,
+    pub(crate) entries: Vec<Entry>,
+}
+
+impl Answering {
+    /// Answers the update durable.
+    pub(crate) fn durable(mut self) {
+        self.ticket.answer(Ok(Answer::Durable(self.entries)));
+    }
+}
 
 /// What the owner asks of the device.
 pub(crate) enum Job<F> {
-    /// A frame, and its persist record, then one flush.
-    Frame {
-        frame: AlignedBuf,
-        at: u64,
-        record: AlignedBuf,
-        record_at: u64,
-    },
-    /// A confirmation: a persist record written again, then one flush.
+    /// A frame, and its persist record, then one flush; then the frame before is answered and,
+    /// unless another frame follows, this one confirmed and answered.
+    Frame(Frame),
+    /// A confirmation: a persist record written again, then one flush, then its frame answered.
     Confirm {
         record: AlignedBuf,
         record_at: u64,
+        these: Vec<Answering>,
     },
     /// The tail's frames, read through a window of a segment and decoded.
     Sweep {
@@ -54,18 +206,46 @@ pub(crate) enum Job<F> {
     Look(Look<F>),
 }
 
+/// A frame for the device.
+pub(crate) struct Frame {
+    pub(crate) frame: AlignedBuf,
+    pub(crate) at: u64,
+    pub(crate) record: AlignedBuf,
+    pub(crate) record_at: u64,
+    /// The frame's sequence.
+    pub(crate) sequence: u64,
+    /// The frame's own confirmation, written over its record should no frame follow.
+    pub(crate) confirm: AlignedBuf,
+    /// The answers of the frame before, which this frame's record confirms.
+    pub(crate) before: Vec<Answering>,
+    /// The answers of this frame's updates.
+    pub(crate) these: Vec<Answering>,
+    /// The owner knew when it laid the frame out that another follows.
+    pub(crate) more: bool,
+}
+
 /// What the device answers.
 pub(crate) enum Completion {
+    /// A frame flushed, or failed. With `confirming`, the device goes on to confirm it on its
+    /// own, and a `Confirm` completion follows with the device.
     Frame {
         frame: AlignedBuf,
         record: AlignedBuf,
+        /// The frame's own confirmation, unless the device is writing it.
+        confirm: AlignedBuf,
         result: Result<(), LogError>,
         /// The batch's service time: its writes and its flush.
         took_ns: u64,
+        confirming: bool,
+        /// Answers not given: the frame before's when the frame failed, and this frame's unless
+        /// the device is confirming it. Emptied lists come back for later frames.
+        before: Vec<Answering>,
+        these: Vec<Answering>,
     },
     Confirm {
         record: AlignedBuf,
         result: Result<(), LogError>,
+        these: Vec<Answering>,
     },
     Sweep(Result<Vec<Swept>, LogError>),
     Read(Reads),
@@ -130,142 +310,199 @@ pub(crate) struct Wanted {
     pub(crate) len: u32,
 }
 
-/// The device thread: owns `file` until the owner's queue closes, then gives it back.
-pub(crate) fn run<F: BlockFile>(
-    file: F,
-    jobs: &Receiver<Job<F>>,
-    done: &SyncSender<Message<F>>,
-    pool: Pool,
-    segment_bytes: u64,
-) -> F {
-    let mut device = Device {
-        file,
-        pool,
-        segment_bytes,
-    };
-    while let Ok(job) = jobs.recv() {
-        let kind = Kind::of(&job);
-        // The file is the caller's code: should it unwind, the job fails as a failed write or
-        // read would, and the device, the file with it, goes on (mantle CLAUDE.md §1).
-        let completion = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| device.job(job)))
-            .unwrap_or_else(|_| kind.unwound());
-        // The owner reads its inbox until it ends, and it ends only once every job it handed
-        // over has come back, so the inbox takes this.
-        if done.send(Message::Done(completion)).is_err() {
-            break;
-        }
-    }
-    device.file
+/// The failure a file operation that unwound is taken for.
+fn unwound() -> LogError {
+    LogError::Disk(hyper_block::DiskError::Io {
+        op: "a file operation unwound",
+        path: std::path::PathBuf::new(),
+        source: std::io::Error::other("the file unwound"),
+    })
 }
 
-/// What kind of job a job was, to answer it should the file unwind in it.
-#[derive(Clone, Copy)]
-enum Kind {
-    Frame,
-    Confirm,
-    Sweep,
-    Read(u128),
-    Look,
+/// Runs `op` on the file inside an unwind boundary: the file is the caller's code, and should it
+/// unwind the operation fails as a failed write, flush or read would (CLAUDE.md §1).
+fn guarded<R>(op: impl FnOnce() -> Result<R, LogError>) -> Result<R, LogError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(op)).unwrap_or_else(|_| Err(unwound()))
 }
 
-impl Kind {
-    fn of<F>(job: &Job<F>) -> Self {
-        match job {
-            Job::Frame { .. } => Self::Frame,
-            Job::Confirm { .. } => Self::Confirm,
-            Job::Sweep { .. } => Self::Sweep,
-            Job::Read(reads) => Self::Read(reads.group),
-            Job::Look(_) => Self::Look,
-        }
-    }
-
-    /// The answer to a job whose file unwound: its write, flush or read failed.
-    fn unwound(self) -> Completion {
-        let failed = || {
-            LogError::Disk(hyper_block::DiskError::Io {
-                op: "a file operation unwound",
-                path: std::path::PathBuf::new(),
-                source: std::io::Error::other("the file unwound"),
-            })
-        };
-        match self {
-            Self::Frame => Completion::Frame {
-                frame: AlignedBuf::empty(),
-                record: AlignedBuf::empty(),
-                result: Err(failed()),
-                took_ns: 0,
-            },
-            Self::Confirm => Completion::Confirm {
-                record: AlignedBuf::empty(),
-                result: Err(failed()),
-            },
-            Self::Sweep => Completion::Sweep(Err(failed())),
-            Self::Read(group) => Completion::Read(Reads {
-                group,
-                result: Err(failed()),
-                ..Reads::none()
-            }),
-            Self::Look => Completion::Looked,
-        }
-    }
-}
-
-struct Device<F> {
-    file: F,
+/// The log's file, with what reading it back keeps, and where the owner says another frame
+/// follows.
+pub(crate) struct Device<F> {
+    pub(crate) file: F,
     /// Buffers for reading entries back, kept between reads.
     pool: Pool,
     segment_bytes: u64,
+    /// The owner's word that another frame follows the one with this sequence.
+    more: Receiver<u64>,
+    /// Where the owner hears of a frame's flush while the device confirms it, before the frame
+    /// before's callers do (`owner::Owner::flushes`).
+    flushed: SyncSender<Completion>,
+    /// The owner's inbox, for a word that cannot wait in `flushed`, and to wake the owner for a
+    /// completion it must answer.
+    inbox: SyncSender<Message<F>>,
+    /// Where the carrier goes back to the owner, and where each job back is told by its
+    /// sequence, for a watch (`serve`).
+    returns: SyncSender<Box<Carrier<F>>>,
+    tokens: SyncSender<u64>,
+}
+
+/// Where a device's jobs go back to the owner (`Device::returns`, `Device::tokens`).
+pub(crate) struct Returns<F> {
+    pub(crate) returns: SyncSender<Box<Carrier<F>>>,
+    pub(crate) tokens: SyncSender<u64>,
 }
 
 impl<F: BlockFile> Device<F> {
-    fn job(&mut self, job: Job<F>) -> Completion {
+    pub(crate) fn new(
+        file: F,
+        pool: Pool,
+        segment_bytes: u64,
+        more: Receiver<u64>,
+        flushed: SyncSender<Completion>,
+        inbox: SyncSender<Message<F>>,
+        back: Returns<F>,
+    ) -> Self {
+        Self {
+            file,
+            pool,
+            segment_bytes,
+            more,
+            flushed,
+            inbox,
+            returns: back.returns,
+            tokens: back.tokens,
+        }
+    }
+
+    /// The file, the device done with.
+    pub(crate) fn into_file(self) -> F {
+        self.file
+    }
+
+    /// Does `job`: the completion for the owner, with `answers` holding the answers to give once
+    /// the owner's inbox holds it.
+    pub(crate) fn execute(&mut self, job: Job<F>, answers: &mut Vec<Answering>) -> Completion {
         match job {
-            Job::Frame {
-                frame,
-                at,
-                record,
-                record_at,
-            } => self.frame(frame, at, record, record_at),
+            Job::Frame(frame) => self.frame(frame, answers),
             Job::Confirm {
                 mut record,
                 record_at,
+                mut these,
             } => {
-                let result = self
-                    .write(&mut record, record_at)
-                    .and_then(|()| self.file.sync_data().map_err(LogError::from));
-                Completion::Confirm { record, result }
+                let result = guarded(|| self.flushed(&mut record, record_at));
+                if result.is_ok() {
+                    answers.append(&mut these);
+                }
+                Completion::Confirm {
+                    record,
+                    result,
+                    these,
+                }
             }
             Job::Sweep {
                 segment,
                 offset,
                 end,
-            } => Completion::Sweep(self.sweep(segment, offset, end)),
-            Job::Read(reads) => Completion::Read(self.read(reads)),
+            } => Completion::Sweep(guarded(|| self.sweep(segment, offset, end))),
+            Job::Read(reads) => {
+                let group = reads.group;
+                let read =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.read(reads)))
+                        .unwrap_or_else(|_| Reads {
+                            group,
+                            result: Err(unwound()),
+                            ..Reads::none()
+                        });
+                Completion::Read(read)
+            }
             Job::Look(look) => {
-                look(&self.file);
+                let file = &self.file;
+                // A look that unwinds is its caller's: the caller hears the log closed.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| look(file)));
                 Completion::Looked
             }
         }
     }
 
-    fn frame(
-        &mut self,
-        mut frame: AlignedBuf,
-        at: u64,
-        mut record: AlignedBuf,
-        record_at: u64,
-    ) -> Completion {
+    /// A frame, its record and one flush; the frame before answered; this one confirmed and
+    /// answered unless another frame follows.
+    fn frame(&mut self, mut f: Frame, answers: &mut Vec<Answering>) -> Completion {
         let started = Instant::now();
-        let result = self
-            .write(&mut frame, at)
-            .and_then(|()| self.write(&mut record, record_at))
-            .and_then(|()| self.file.sync_data().map_err(LogError::from));
-        Completion::Frame {
-            frame,
-            record,
-            result,
-            took_ns: u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        let result = guarded(|| {
+            self.write(&mut f.frame, f.at)?;
+            self.flushed(&mut f.record, f.record_at)
+        });
+        let took_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let confirming = result.is_ok() && !(f.more || self.follows(f.sequence));
+        if result.is_ok() {
+            // This frame's record confirms the frame before.
+            answers.append(&mut f.before);
         }
+        if !confirming {
+            return Completion::Frame {
+                frame: f.frame,
+                record: f.record,
+                confirm: f.confirm,
+                result,
+                took_ns,
+                confirming,
+                before: f.before,
+                these: f.these,
+            };
+        }
+        // The owner publishes the frame, and gives back the frame before's room, while the
+        // confirmation is written; the frame before's callers are answered then.
+        let flushed = Completion::Frame {
+            frame: f.frame,
+            record: f.record,
+            confirm: AlignedBuf::empty(),
+            result,
+            took_ns,
+            confirming,
+            before: f.before,
+            these: Vec::new(),
+        };
+        // The owner reads the word before any message a caller sends on hearing its answer. It
+        // has read the last frame's word before it hands over the next frame, so the slot is free;
+        // should it not be, the word goes through the inbox.
+        let heard = match self.flushed.try_send(flushed) {
+            Ok(()) => true,
+            Err(TrySendError::Full(word) | TrySendError::Disconnected(word)) => {
+                self.inbox.send(Message::Done(word)).is_ok()
+            }
+        };
+        if heard {
+            for answering in answers.drain(..) {
+                answering.durable();
+            }
+        }
+        let result = guarded(|| self.flushed(&mut f.confirm, f.record_at));
+        if result.is_ok() {
+            answers.append(&mut f.these);
+        }
+        Completion::Confirm {
+            record: f.confirm,
+            result,
+            these: f.these,
+        }
+    }
+
+    /// Whether the owner has said another frame follows the one of `sequence`; older words are
+    /// dropped.
+    fn follows(&self, sequence: u64) -> bool {
+        let mut follows = false;
+        loop {
+            match self.more.try_recv() {
+                Ok(s) => follows |= s == sequence,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return follows,
+            }
+        }
+    }
+
+    /// Writes `buf` at `at` and flushes the file.
+    fn flushed(&self, buf: &mut AlignedBuf, at: u64) -> Result<(), LogError> {
+        self.write(buf, at)?;
+        self.file.sync_data().map_err(LogError::from)
     }
 
     /// Writes `buf`, padded with zeros to the file's alignment, at `at`.

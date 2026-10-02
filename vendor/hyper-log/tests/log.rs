@@ -3590,3 +3590,148 @@ fn a_completion_wakes_only_its_submitter() {
     }
     assert!(woken.try_recv().is_err(), "a wake with no answer");
 }
+
+/// A file that tells which thread flushed it.
+struct Flushing {
+    file: SimFile,
+    flushed: std::sync::mpsc::SyncSender<std::thread::ThreadId>,
+}
+
+impl BlockFile for Flushing {
+    fn alignment(&self) -> Alignment {
+        self.file.alignment()
+    }
+
+    fn len(&self) -> Result<u64, hyper_block::DiskError> {
+        self.file.len()
+    }
+
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), hyper_block::DiskError> {
+        self.file.read_exact_at(buf, offset)
+    }
+
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), hyper_block::DiskError> {
+        self.file.write_all_at(buf, offset)
+    }
+
+    fn sync_data(&self) -> Result<(), hyper_block::DiskError> {
+        let _ = self.flushed.try_send(std::thread::current().id());
+        self.file.sync_data()
+    }
+}
+
+/// A blocking write's frame is written, flushed and confirmed on its caller's thread, as
+/// mantle's writer did on its own; a submission whose caller does not wait on it is done by the
+/// log's I/O thread.
+#[test]
+fn a_blocking_writer_flushes_its_own_frame() {
+    let (flushed, flushes) = std::sync::mpsc::sync_channel(1 << 10);
+    let file = Flushing {
+        file: sim(49),
+        flushed,
+    };
+    let log = Log::create(file, config(16, 8), ID).unwrap();
+    while flushes.try_recv().is_ok() {}
+    let me = std::thread::current().id();
+    for term in 1..=4 {
+        log.write(
+            1,
+            Update {
+                hard_state: Some(hard(term, 0)),
+                ..Update::default()
+            },
+        )
+        .unwrap();
+        let threads: Vec<_> = flushes.try_iter().collect();
+        // The frame's flush, then its confirmation's.
+        assert_eq!(threads, [me, me], "write {term}");
+    }
+    log.submit(
+        1,
+        Update {
+            hard_state: Some(hard(5, 0)),
+            ..Update::default()
+        },
+    )
+    .unwrap()
+    .wait()
+    .unwrap();
+    let threads: Vec<_> = flushes.try_iter().collect();
+    assert_eq!(threads.len(), 2);
+    assert!(threads.iter().all(|t| *t != me), "{threads:?}");
+}
+
+/// A frame that confirms itself comes back to the owner waking no one. A submission the log took
+/// while that confirmation was written waits on the frame to come back, and the owner, having
+/// asked the I/O thread to wake it then, writes and answers it.
+#[test]
+fn a_submission_taken_while_a_frame_confirms_itself_is_written() {
+    let (device, holder) = held(sim(50));
+    let log = Log::create(device, config(16, 8), ID).unwrap();
+    let small = |term| Update {
+        hard_state: Some(hard(term, 0)),
+        ..Update::default()
+    };
+    std::thread::scope(|s| {
+        holder.hold();
+        let _released = holder.released();
+        let writer = s.spawn(|| log.write(1, small(1)));
+        // The frame's flush; once it is let through with nothing submitted, the device confirms
+        // the frame on its own, and that flush is held.
+        holder.held();
+        holder.step();
+        let taken = log.submit(2, small(1)).unwrap();
+        holder.release();
+        writer.join().unwrap().unwrap();
+        taken.wait().unwrap();
+    });
+    assert_eq!(log.view(2).unwrap().unwrap().hard_state, Some(hard(1, 0)));
+}
+
+/// A caller hears its answer only once the room its update held in the queue is given back,
+/// whether the log refused the update or wrote it, and whichever thread gave the answer: a caller
+/// that submits again at once, into a queue with room for one, is never refused for the room its
+/// own answered update held (focal `5219002` found its writer answering first).
+#[test]
+fn room_is_given_back_before_the_answer() {
+    let mut cfg = config(16, 8);
+    cfg.queue_submissions = 1;
+    let log = Log::create(sim(51), cfg, ID).unwrap();
+    for i in 1..=100u64 {
+        // Written, and answered by this thread, which did the frame's I/O.
+        log.write(
+            1,
+            Update {
+                entries: Some(entries(i, &[1])),
+                ..Update::default()
+            },
+        )
+        .unwrap();
+        // At once, with no room to wait for: written, and answered by the log's I/O thread.
+        log.submit(
+            1,
+            Update {
+                hard_state: Some(hard(1, i)),
+                ..Update::default()
+            },
+        )
+        .unwrap()
+        .wait()
+        .unwrap();
+        // Refused as the frame is laid out, by the owner.
+        let gap = Update {
+            entries: Some(entries(i + 2, &[1])),
+            ..Update::default()
+        };
+        assert!(matches!(log.write(1, gap), Err(LogError::Invalid { .. })));
+        let gap = Update {
+            entries: Some(entries(i + 2, &[1])),
+            ..Update::default()
+        };
+        assert!(matches!(
+            log.submit(1, gap).unwrap().wait(),
+            Err(LogError::Invalid { .. })
+        ));
+    }
+    assert_eq!(log.view(1).unwrap().unwrap().last, 100);
+}

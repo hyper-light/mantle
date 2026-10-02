@@ -277,12 +277,18 @@ frame's and its confirmation's, where none follows at once
 state to one owner thread that answers every call by ticket, waking only its caller (L-2);
 mantle runs on that crate since 2026-10-01 and `crates/log` is gone (§5.3). The range
 simulation's recorded seeds 1 to 48 replay to the same histories, step for step, on it as on
-`crates/log`. Each read of the log is a round trip to its owner, about 30 µs at a load
-average of 34 against a lock's read before, so a replica keeps its group's bounds and last
-term between its own writes, which alone move them, and asks the log while one is out. A
-committed entry of a three-member group allocates half what it did, 127 against 262, and
-takes 0.8 ms against 0.16 ms of wall time driven in one process, from the writes' own round
-trips ([measurements](measurements/2026-10-01-shared-log.md)).
+`crates/log`. A replica writes and reads its group through the group's handle on the log
+(hyper-log `GroupLog`, at hyper-raft `8fe3f23`), which answers the core's reads on the
+replica's thread from what the replica's own answered writes left, and a blocking write does
+its own frame's I/O on the writer's thread. A committed entry of a three-member group,
+driven in one process, allocates 127.2 times and reallocates 4.0 against `crates/log`'s 262.2
+and 25.0, and takes a median 117 µs against 133 µs at a load average of 32 (74 against 76 at
+8), faster in 25 of 31 paired rounds; on the move to hyper-log before the handle it took
+0.83 ms ([measurements](measurements/2026-10-01-group-log.md),
+[before](measurements/2026-10-01-shared-log.md)). `mantle bench log` matches `crates/log`
+with one replica and is within 4% either way at 256 appends of 16 KiB; at 256 appends of
+128 B it carries 249–254 appends a flush where `crates/log` carried 127–253, and runs 2–4%
+fewer appends a second.
 
 Range replicas (`mantle-range`, [design](design/replica.md)) run hyper-raft's core (vendored,
 named `focal-raft` in the crate) over the log and an engine: an entry carries a batch of gateway commands applied as one engine batch,

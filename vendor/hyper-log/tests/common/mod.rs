@@ -1,8 +1,8 @@
 //! Simulated devices a test holds the writer at, shared by the log's tests.
 //!
-//! A log owns its file, on its device thread, so a test does not share the device with it: each
-//! wrapper here is moved into the log, and the test keeps the other end of a channel to it, over
-//! which it lets flushes and reads through and hears when one is held. A test reaches the file
+//! A log owns its file, on the thread that does its I/O, so a test does not share the device with
+//! it: each wrapper here is moved into the log, and the test keeps the other end of a channel to
+//! it, over which it lets flushes and reads through and hears when one is held. A test reaches the file
 //! itself through `Log::with_file` while the log runs, and takes it back with `Log::close`.
 #![allow(
     clippy::unwrap_used,
@@ -72,7 +72,7 @@ pub struct Holder {
     /// The device's end of `events`, kept for the wakers a test makes; `None` unless asked for,
     /// so that a test whose log has gone hears the channel close.
     tell: Option<SyncSender<usize>>,
-    /// Events heard by `is_held` and not yet waited for.
+    /// Events heard and not yet waited for.
     flushes: Cell<u64>,
     reads: Cell<u64>,
     /// One more than the greatest waker tag told, 0 if none.
@@ -205,12 +205,6 @@ impl Holder {
     /// Waits until the writer is held in a flush.
     pub fn held(&self) {
         self.wait_for(Event::Flush);
-    }
-
-    /// Whether the writer is held in a flush now.
-    pub fn is_held(&self) -> bool {
-        self.listen();
-        self.flushes.get() > 0
     }
 
     /// Lets one more flush through before the next is held.

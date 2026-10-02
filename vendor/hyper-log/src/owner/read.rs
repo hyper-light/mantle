@@ -187,12 +187,7 @@ impl<F: BlockFile + 'static> Owner<F> {
             return;
         };
         let reads = std::mem::replace(&mut fetch.reads, Reads::none());
-        if self.device.try_send(Job::Read(reads)).is_err() {
-            // The device ended: no fetch can be read.
-            for mut fetch in std::mem::take(&mut self.fetches) {
-                fetch.ticket.answer(Err(LogError::Closed));
-            }
-        }
+        self.io.push_back((Job::Read(reads), None));
     }
 
     /// A fetch's reads are back: entries that missed their place are looked up again, once, as

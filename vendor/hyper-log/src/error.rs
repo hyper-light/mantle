@@ -67,6 +67,9 @@ pub enum LogError {
     /// The file holds no log, another log, or another geometry.
     #[error("the file is not this log: {0}")]
     Foreign(&'static str),
+    /// The group has a handle (`Log::group`), through which alone it is written.
+    #[error("group {0:032x} is written through its handle")]
+    Claimed(u128),
     /// A configuration the log cannot run with.
     #[error("the log's configuration is invalid: {0}")]
     Config(&'static str),

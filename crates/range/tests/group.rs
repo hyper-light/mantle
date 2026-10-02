@@ -695,8 +695,12 @@ fn a_member_whose_engine_is_ahead_of_its_logs_commit_reopens() {
     let applied = nodes[1].replica.applied();
     assert!(applied > 2);
 
-    // Member 2's engine is durable at what it applied; its log keeps an older commit.
+    // Member 2's engine is durable at what it applied; its log keeps an older commit, written
+    // once the member has stopped, since the log takes the group's writes from the member's
+    // handle alone while it runs.
     nodes[1].replica.compact(u64::MAX).unwrap();
+    let old = std::mem::replace(&mut nodes[1], node(9, 9));
+    let mut engine = old.replica.into_engine();
     let hard = logs[1].view(GROUP).unwrap().unwrap().hard_state.unwrap();
     logs[1]
         .write_waiting(
@@ -709,8 +713,6 @@ fn a_member_whose_engine_is_ahead_of_its_logs_commit_reopens() {
         .unwrap();
 
     // It crashes and opens again from what its device and engine kept.
-    let old = std::mem::replace(&mut nodes[1], node(9, 9));
-    let mut engine = old.replica.into_engine();
     engine.crash();
     let file = close(logs.remove(1));
     file.crash(Crash::Random).unwrap();

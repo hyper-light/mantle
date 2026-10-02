@@ -11,7 +11,7 @@ use focal_raft::proto::{
 use focal_raft::wire::Record;
 use focal_raft::{RawNode, StateRole};
 use hyper_block::block::BlockFile;
-use hyper_log::{Entries, Log, LogError, Pending, Proposal, Start, Update};
+use hyper_log::{Entries, Log, LogError, Proposal, Start, Update};
 use mantle_meta::apply::{Layer, apply_entry};
 use mantle_meta::engine::{Engine, Write};
 use mantle_meta::session::Rules;
@@ -217,12 +217,12 @@ fn held_bytes(message: &Message) -> u64 {
 }
 
 /// A ready being made durable: its update's parts not yet durable, in order, each fitting a
-/// frame, the log's handle for the first once it is submitted, and the log's answer once it
-/// has been waited for.
+/// frame, whether the first is out on the group's handle, and the log's answer once it has
+/// been waited for.
 struct Staged {
     ready: focal_raft::Ready,
     parts: VecDeque<Update>,
-    pending: Option<Pending>,
+    out: bool,
     answered: Option<Result<(), LogError>>,
 }
 
@@ -327,7 +327,9 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
             seed,
             ..focal_raft::Config::new(id)
         };
-        let store = LogStore::new(log, group, conf.clone());
+        // From here the member writes and reads its group through the group's handle alone.
+        let handle = log.group(group)?;
+        let store = LogStore::new(log, handle, conf.clone());
         let window_bytes = u64::try_from(settings.max_inflight_msgs)
             .ok()
             .and_then(|n| n.checked_mul(settings.max_size_per_msg))
@@ -363,12 +365,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
             repair: None,
         };
         // A log compacted before the restart can serve a lagging member only by snapshot.
-        let compacted = replica
-            .node
-            .store()
-            .log
-            .view(group)?
-            .is_some_and(|v| v.start.index > 0);
+        let compacted = replica.node.store().group.bounds()?.0.index > 0;
         if compacted {
             replica.prepare()?;
         }
@@ -508,7 +505,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
     /// A line on the member's state for diagnosis: its term, leader, applied and committed
     /// indexes, log bounds and prepared snapshot, and its view of every member's progress.
     pub fn describe(&self) -> String {
-        let view = self.node.store().log.view(self.group).ok().flatten();
+        let view = self.node.store().group.view().ok().flatten();
         let snap = self
             .node
             .store()
@@ -556,7 +553,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
         self.live()?;
         match &self.staged {
             None => self.tick_now(),
-            Some(staged) if staged.pending.is_some() => {
+            Some(staged) if staged.out => {
                 if self.held.all_ticks < self.max_held_ticks {
                     self.held.ticks = self.held.ticks.saturating_add(1);
                     self.held.all_ticks = self.held.all_ticks.saturating_add(1);
@@ -592,7 +589,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
         self.live()?;
         match &self.staged {
             None => self.step_now(message),
-            Some(staged) if staged.pending.is_some() => self.hold(message),
+            Some(staged) if staged.out => self.hold(message),
             Some(_) => Err(ReplicaError::Stalled),
         }
     }
@@ -680,12 +677,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
 
     /// The last entry the member's log holds.
     fn last_index(&self) -> Result<u64, ReplicaError> {
-        Ok(self
-            .node
-            .store()
-            .log
-            .view(self.group)?
-            .map_or(0, |v| v.last))
+        Ok(self.node.store().group.bounds()?.1)
     }
 
     /// Asks the leader to repair this member, whose log lacks entries it acknowledged, once
@@ -934,7 +926,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
 
     /// Whether a ready's update is on its way to being durable.
     pub fn persisting(&self) -> bool {
-        self.staged.as_ref().is_some_and(|s| s.pending.is_some())
+        self.staged.as_ref().is_some_and(|s| s.out)
     }
 
     /// Waits until the part of a ready's update now submitted is durable, or refused, and
@@ -943,9 +935,10 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
     pub fn wait_persisted(&mut self) {
         if let Some(staged) = self.staged.as_mut()
             && staged.answered.is_none()
-            && let Some(pending) = staged.pending.as_ref()
+            && staged.out
         {
-            staged.answered = Some(pending.wait());
+            let answer = self.node.store_mut().group.wait();
+            staged.answered = Some(answer.unwrap_or(Err(LogError::Closed)));
         }
     }
 
@@ -1025,7 +1018,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
         Ok(Staged {
             ready,
             parts,
-            pending: None,
+            out: false,
             answered: None,
         })
     }
@@ -1035,45 +1028,50 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
     /// staged when the log refuses one for want of room. Without `wait`, a part submitted
     /// here is left flushing rather than looked at at once: a flush is not done microseconds
     /// after its submission, and whether it happened to be would make what `begin` gives
-    /// out hang on the log's thread rather than on what the caller did.
+    /// out hang on the log's thread rather than on what the caller did. With `wait`, each
+    /// part is written and waited for at once, so the log may give its frame's write and
+    /// flush to this thread, which waits for them anyway (hyper-log `GroupLog::write`).
+    /// A part refused is kept: the log takes an update whole or not at all.
     fn persist(&mut self, mut staged: Staged, wait: bool) -> Result<Persisted, ReplicaError> {
         let mut submitted = false;
         loop {
-            if let Some(pending) = staged.pending.as_ref() {
+            if staged.out {
+                let group = &mut self.node.store_mut().group;
                 let answer = match staged.answered.take() {
                     Some(answer) => Some(answer),
-                    None if wait => Some(pending.wait()),
+                    None if wait => Some(group.wait().unwrap_or(Err(LogError::Closed))),
                     None if submitted => None,
-                    None => pending.poll(),
+                    None => group.poll(),
                 };
-                if answer.is_some() {
-                    self.node.store().written();
-                }
+                let Some(answer) = answer else {
+                    return Ok(Persisted::Flushing(staged));
+                };
+                staged.out = false;
                 match answer {
-                    None => return Ok(Persisted::Flushing(staged)),
-                    Some(Ok(())) => {
-                        staged.pending = None;
+                    Ok(()) => {
                         staged.parts.pop_front();
                     }
-                    Some(Err(e)) if waits_for_room(&e) => {
-                        staged.pending = None;
-                        return Ok(Persisted::Waiting(staged, e));
-                    }
-                    Some(Err(e)) => return Err(self.fence(&e)),
+                    Err(e) if waits_for_room(&e) => return Ok(Persisted::Waiting(staged, e)),
+                    Err(e) => return Err(self.fence(&e)),
                 }
             }
             let Some(part) = staged.parts.front() else {
                 return Ok(Persisted::Done(staged.ready));
             };
-            let store = self.node.store();
-            store.writing();
-            let submitted_part = store.log.submit_waiting(self.group, part.clone());
-            if submitted_part.is_err() {
-                store.written();
+            let group = &mut self.node.store_mut().group;
+            if wait {
+                match group.write(part.clone()) {
+                    Ok(()) => {
+                        staged.parts.pop_front();
+                    }
+                    Err(e) if waits_for_room(&e) => return Ok(Persisted::Waiting(staged, e)),
+                    Err(e) => return Err(self.fence(&e)),
+                }
+                continue;
             }
-            match submitted_part {
-                Ok(pending) => {
-                    staged.pending = Some(pending);
+            match group.submit(part.clone()) {
+                Ok(()) => {
+                    staged.out = true;
                     submitted = true;
                 }
                 Err(e) if waits_for_room(&e) => return Ok(Persisted::Waiting(staged, e)),
@@ -1202,29 +1200,21 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
         self.engine.persist()?;
         // Keeping more entries than the engine has made durable keeps them all.
         let index = self.engine.durable().saturating_sub(keep);
-        // The log is borrowed from the store while the write is made, and the borrow ends
-        // before the replica is fenced on its answer.
-        let written = {
-            let store = self.node.store();
-            let log = &store.log;
-            let Some(view) = log.view(self.group)? else {
-                return Ok(());
-            };
-            if index <= view.start.index {
-                return Ok(());
-            }
-            let term = log.term(self.group, index)?;
-            store.writing();
-            let written = log.write_waiting(
-                self.group,
-                Update {
-                    start: Some(Start { index, term }),
-                    ..Update::default()
-                },
-            );
-            store.written();
-            written
+        // A part of a ready out on the group's handle is answered first: the handle answers
+        // its writes in the order they were submitted, and its reads as of those answered.
+        self.wait_persisted();
+        let group = &mut self.node.store_mut().group;
+        let Some(view) = group.view()? else {
+            return Ok(());
         };
+        if index <= view.start.index {
+            return Ok(());
+        }
+        let term = group.term(index)?;
+        let written = group.write(Update {
+            start: Some(Start { index, term }),
+            ..Update::default()
+        });
         match written {
             Ok(()) => {}
             Err(e) if waits_for_room(&e) => return Err(e.into()),
@@ -1237,7 +1227,7 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
     /// or past the log's start, with the configuration there.
     fn prepare(&mut self) -> Result<(), ReplicaError> {
         let index = self.applied;
-        let term = self.node.store().log.term(self.group, index)?;
+        let term = self.node.store().group.term(index)?;
         let data = image::encode(&self.engine.image()?)
             .ok_or_else(|| ReplicaError::Stopped("a snapshot past u32 bytes a row".into()))?;
         let snapshot = Snapshot {
@@ -1337,7 +1327,7 @@ fn complete_install<F: BlockFile + 'static, E: Engine>(
 fn uncertain_mark<F: BlockFile + 'static>(
     store: &LogStore<F>,
 ) -> Result<Option<Start>, ReplicaError> {
-    Ok(store.log.view(store.group)?.and_then(|v| v.uncertain))
+    Ok(store.uncertain()?)
 }
 
 /// Whether `message` asks for votes for its sender's campaign.

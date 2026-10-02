@@ -103,9 +103,82 @@ Appends and fetches into a reservation allocate nothing once warm: `docs/benchma
   `log.proptest-regressions` recorded are run as the inputs they shrank to
   (`recorded_regressions_hold`), since the file's seeds replay other inputs under the new strategy.
 
+## Reads where the replica is, two hand-offs a write (commits `d04934e`, `7585e19`)
+
+mantle measured its replica path on this crate at 828 µs a committed entry against 159 µs on its
+own `crates/log` (mantle `docs/measurements/2026-10-01-shared-log.md`): every read was a round trip
+to the owner thread, and every write crossed four threads. Both are fixed at their cause.
+
+- **A group's handle** (`src/group.rs`, `Log::group`). A replica reads and writes its group
+  through the group's `GroupLog`, which keeps, on the replica's thread, what the core reads: the
+  start, the last entry, the term of every retained entry as runs of one term, the hard state and
+  marks, and the bytes of the recent entries within `group_cache`, by the log's own cache rule. It
+  is exact because the core reads its storage only between its own writes (hyper-raft's `RawNode`
+  takes no call while a `Ready` is out) and only the group's own writes move what it reads; each
+  write's answer brings its entries back, the log having written them, and the handle applies it
+  as the log did (`writer::apply`). It asks the owner only for entries older than its cache, a view
+  with proposals, and everything after a failure it cannot account for. The log holds the group
+  for its handle: another writer is refused `LogError::Claimed`. No shared memory, no atomics, no
+  `unsafe`. A property test checks every read of the handle against the log's own after every
+  write of a random history (`tests/group.rs`).
+- **Leader/followers** (`src/owner/mod.rs`, Schmidt, O'Ryan, Pyarali, Kircher and Buschmann,
+  PLoP 2000), since replaced ("The owner on its own thread", below). The two threads take turns holding the owner; the one with I/O to do hands the owner
+  to the other and does the I/O itself, the device travelling with the job. It finishes a frame as
+  mantle's writer did: the frame before answered once this frame's record confirms it; then, unless
+  the owner said another frame follows, this frame confirmed and answered. The owner hears of the
+  flush before the confirmation is written, through a side channel it reads before every message,
+  so a frame is published once flushed without waking it. A write crosses from its caller to the
+  thread that flushes it and back. A blocking write is no longer woken for its admission.
+- **Fixed with it** (`7585e19`): a round's framing no longer depends on how fast its callers
+  return. The busy period of the fair queue ends when the answers go out with nothing queued, not
+  after the owner has drained what answered callers sent since; and the device hears that another
+  frame follows before the caller hears it is admitted. The equivalence's rounds now wait for the
+  plug's flush or its answer: `is_held` never consumed its event. Together these were the
+  equivalence failures on Windows and macOS CI, reproduced pinned to one core
+  (`docs/benchmarks.md`, "Equivalence").
+
+## The owner on its own thread, the blocking caller flushing its own frame
+
+The replica's path cost one context switch a write more than mantle-log (19.5 a committed entry
+against 12.1, six writes). The cause was the hand-off itself: with leader/followers, the thread
+that took a submission handed the owner to the other thread before flushing, so the other woke,
+took the owner, and went to sleep on the inbox while the frame was flushed; then both log threads
+slept for every write (the one waiting to lead again, the one waiting for the next message) as
+well as the caller. mantle's writer had one thread sleep besides the caller. Waking the owner only
+when it waited for the device left the count where it was, since the wake was the hand-off's.
+
+- **The owner stays on its thread** (`src/owner/mod.rs`) and never does I/O. It hands each job,
+  with the device, in a box kept from job to job (`device::Carrier`), to a thread that does it:
+  a caller whose update the frame carries and who waits on its answer from the moment it
+  submitted (`Log::write`, `Log::write_waiting`, `GroupLog::write` with nothing else out), which
+  is awake for its answer anyway, through its reply port (`Reply::Io`); otherwise the log's I/O
+  thread (`device::serve`). The caller does the frame's write, flush, confirmation and answers on
+  its own thread, as mantle's writer did on its. A caller that leaves its wait with a job in its
+  port does the job as it leaves.
+- **Jobs come back without a wake.** The completion and the device go into the owner's returns,
+  which the owner reads before every message, so anything sent after an answer the job gave is
+  heard after the completion that gave back its room: release, then answer, as when mantle's
+  writer answered under its lock. The job's thread wakes the owner (`Message::Returned`) only for
+  a completion that leaves it something to answer: a frame another frame will confirm, a failure,
+  a sweep, a read, a look. When the owner has work waiting on the device (submissions for the
+  next frame, waiters for room, I/O, a close), it asks the I/O thread to wake it once the job is
+  back (`Request::Watch`): every job's thread sends the job's sequence on a token channel after
+  the job is back, which the I/O thread reads while it watches and the owner empties otherwise.
+- **Measured** (`docs/benchmarks.md`, "The replica's path"): 12.0 switches a committed entry,
+  mantle-log's count, and the wall time at or below mantle-log's in the same runs; allocations
+  and reallocations unchanged (72.2, 0.2).
+- **Tests**: a blocking writer's two flushes happen on its own thread, a non-waiting submitter's
+  on another (`a_blocking_writer_flushes_its_own_frame`); a submission taken while a frame
+  confirms itself is written (`a_submission_taken_while_a_frame_confirms_itself_is_written`,
+  which hangs with the watch removed); and room is given back before the answer, for a write, a
+  submission answered by the I/O thread and two refusals, with a queue of one
+  (`room_is_given_back_before_the_answer`, the check focal's `5219002` asked of every writer).
+
+The 48 equivalence files are byte-identical to mantle-log's throughout.
+
 ## Not done
 
-- The writes through hyper-block's device issuer (mantle `docs/design/node.md` §1.2): the log has its
-  own device thread until then.
-- Entries read from the file wait behind a frame's write and flush on the one device thread.
+- The writes through hyper-block's device issuer (mantle `docs/design/node.md` §1.2): the log does
+  its own I/O on its second thread until then.
+- Entries read from the file wait behind a frame's write and flush: one I/O at a time.
 - mantle's replica shell on this crate (D-1), and mantle and focal consuming it (F-1).

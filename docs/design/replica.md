@@ -263,14 +263,19 @@ group below that, in bytes or in entries of the fewest bytes, refuses to open, s
 `Ready` refused for room there could wait for good.
 
 **What the core reads of the log.** The core reads the group's durable state through the
-replica's store: its bounds, terms and entries. Each read of the log is a message to the log's
-owner thread and its answer (hyper-log), tens of microseconds on a loaded machine where a lock
-took a fraction of one, and the core asks for the group's bounds on most of its calls. Only the
-group's own updates move its bounds, and this member writes all of them, so between its writes
-the store keeps the start, the last entry and that entry's term as the log last gave them, and
-while one of its writes is out it asks the log every time, since a write's records reach
-readers before its answer. Entries are fetched into a reservation the store keeps, no larger
-than a segment's (measurements/2026-10-01-shared-log.md).
+replica's store: its bounds, terms and entries. The store holds the group's handle on the log
+(hyper-log `GroupLog`, claimed when the member opens), through which the member makes every
+write of its group and which the log refuses to anyone else. The core reads its storage only
+between its own writes (`RawNode` takes no call while a `Ready` is out), and only the group's
+own writes move what it reads, so the handle keeps, on the replica's thread, what those
+writes left: the start, the last entry, every retained entry's term as runs of one term, the
+hard state and marks, and the bytes of the recent entries within the log's `group_cache`. It
+answers the core from them with no message to the log's owner thread, and asks the owner only
+for entries older than its cache, a view while proposals are out, and every read after a
+failure it cannot account for. Entries are fetched into a reservation the store keeps, no
+larger than a segment's. A ready's update is cut into parts that each fit a frame by the log
+(`Log::parts`), which the store reaches through the device's log it was opened on
+(measurements/2026-10-01-group-log.md).
 
 ## 4. Compaction, snapshots and restart
 

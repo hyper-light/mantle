@@ -45,6 +45,18 @@ pub(crate) struct Submission {
     pub(crate) tags: Tags,
     /// Where its admission and its answer go.
     pub(crate) ticket: Ticket,
+    /// Whether its caller waits to hear it admitted: a caller that waits only for its answer is
+    /// not told.
+    pub(crate) admit: bool,
+    /// Whether it comes from its group's handle (`group.rs`), which keeps the entries' bytes:
+    /// they go back with its answer rather than into the log's cache.
+    pub(crate) handle: bool,
+    /// For a handle's write laid into a frame, where its entries' terms and lengths are in the
+    /// frame's list (`owner::Buffers::lens`), the entries having gone back with its answer.
+    pub(crate) lens: (usize, usize),
+    /// Whether its caller waits on its ticket from the moment it sends it until its answer, so
+    /// that its frame's I/O may be given to it to do (`owner::Owner::start`).
+    pub(crate) waits: bool,
 }
 
 /// Where the writer's fair queue placed a submission (mantle docs/design/raft-log.md §3).
@@ -967,6 +979,7 @@ pub(crate) fn publish(
     sweep: Option<Sweep>,
     taken: &mut [(Submission, Placement)],
     tail: u64,
+    lens: &[(u64, u32)],
 ) -> Result<(), LogError> {
     let base = target
         .offset
@@ -1012,7 +1025,8 @@ pub(crate) fn publish(
         state.segments.free.push_back((sweep.slot, sequence));
     }
     for (s, placement) in taken.iter_mut() {
-        apply(state, &p.config, s, placement, &place)?;
+        let handed = lens.get(s.lens.0..s.lens.1).unwrap_or_default();
+        apply(state, &p.config, s, placement, &place, handed)?;
     }
     drop_dead_tails(state);
     Ok(())
@@ -1052,6 +1066,7 @@ fn apply(
     s: &mut Submission,
     placement: &Placement,
     place: &Places<'_>,
+    handed: &[(u64, u32)],
 ) -> Result<(), LogError> {
     let (group, marks) = (s.group, s.marks);
     if marks.damaged {
@@ -1068,7 +1083,8 @@ fn apply(
     });
     let update = &mut s.update;
     apply_start(g, live, update, placement, place)?;
-    apply_entries(g, live, config, update, placement, place)?;
+    let handed = s.handle.then_some(handed);
+    apply_entries(g, live, config, update, handed, placement, place)?;
     reach(g, live)?;
     apply_hard(g, live, update, placement, place)?;
     apply_proposals(g, live, update, placement, place)?;
@@ -1140,12 +1156,15 @@ fn apply_start(
     Ok(())
 }
 
-/// Entries replace the group's suffix from their first; their bytes are kept while recent.
+/// Entries replace the group's suffix from their first; their bytes are kept while recent, by
+/// the log or, for a group written through its handle, by the handle, which has them back: what
+/// the log keeps of those is their terms and lengths, `handed`.
 fn apply_entries(
     g: &mut Group,
     live: &mut state::Live,
     config: &Config,
     update: &mut Update,
+    handed: Option<&[(u64, u32)]>,
     placement: &Placement,
     place: &Places<'_>,
 ) -> Result<(), LogError> {
@@ -1161,22 +1180,36 @@ fn apply_entries(
     let mut at = placement
         .entries
         .and_then(|record| record.checked_add(format::ENTRIES_HEADER_LEN));
-    for entry in &mut e.entries {
+    let mut add = |g: &mut Group, term: u64, len: u32, cached: Option<Vec<u8>>| {
         let here = at.ok_or(LogError::Damaged("an offset past usize"))?;
         at = here
             .checked_add(format::ENTRY_HEADER_LEN)
-            .and_then(|a| a.checked_add(entry.bytes.len()));
-        let len = u32::try_from(entry.bytes.len()).map_err(|_| LogError::TooLarge(usize::MAX))?;
+            .and_then(|a| a.checked_add(usize::try_from(len).ok()?));
         let slot = Slot {
-            term: entry.term,
+            term,
             place: place(here)?,
             len,
-            cached: Some(std::mem::take(&mut entry.bytes)),
+            cached,
         };
         live.add(slot.place, entry_bytes(len));
         g.bytes = g.bytes.saturating_add(u64::from(len));
-        g.cached = g.cached.saturating_add(u64::from(len));
+        if slot.cached.is_some() {
+            g.cached = g.cached.saturating_add(u64::from(len));
+        }
         g.entries.push_back(slot);
+        Ok::<(), LogError>(())
+    };
+    if let Some(handed) = handed {
+        for &(term, len) in handed {
+            add(g, term, len, None)?;
+        }
+        // The handle holds the bytes: the log's cache starts past the last entry.
+        g.cache_from = g.last().map_or(g.cache_from, |last| last.saturating_add(1));
+        return Ok(());
+    }
+    for entry in &mut e.entries {
+        let len = u32::try_from(entry.bytes.len()).map_err(|_| LogError::TooLarge(usize::MAX))?;
+        add(g, entry.term, len, Some(std::mem::take(&mut entry.bytes)))?;
     }
     g.cache_from = g
         .cache_from

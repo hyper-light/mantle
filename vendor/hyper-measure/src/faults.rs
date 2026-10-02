@@ -94,6 +94,15 @@ pub fn read() -> Result<Faults, FaultsError> {
     os::read()
 }
 
+/// The context switches charged to this process since it began, voluntary and involuntary
+/// together: every time one of its threads gave up a core, by waiting or by being preempted
+/// (getrusage(2)'s `ru_nvcsw` and `ru_nivcsw`). A thread woken by another and put to sleep again
+/// counts once, so the difference of two reads counts the hand-offs between threads. Windows
+/// keeps the count per thread only: `Unsupported` there.
+pub fn switches() -> Result<u64, FaultsError> {
+    os::switches()
+}
+
 #[cfg(unix)]
 mod os {
     use super::{Faults, FaultsError};
@@ -102,7 +111,14 @@ mod os {
         u64::try_from(value).map_err(|_| FaultsError::Range)
     }
 
-    pub(super) fn read() -> Result<Faults, FaultsError> {
+    pub(super) fn switches() -> Result<u64, FaultsError> {
+        let usage = usage()?;
+        count(usage.ru_nvcsw)?
+            .checked_add(count(usage.ru_nivcsw)?)
+            .ok_or(FaultsError::Range)
+    }
+
+    fn usage() -> Result<libc::rusage, FaultsError> {
         let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
         // SAFETY: `usage` is a writable `rusage` that lives across the call,
         // and `RUSAGE_SELF` is a valid `who` (getrusage(2)); the call writes
@@ -117,7 +133,11 @@ mod os {
         }
         // SAFETY: getrusage returned 0, so it filled `usage`; and a zeroed
         // `rusage` is a valid one in any case, all its fields being integers.
-        let usage = unsafe { usage.assume_init() };
+        Ok(unsafe { usage.assume_init() })
+    }
+
+    pub(super) fn read() -> Result<Faults, FaultsError> {
+        let usage = usage()?;
         Ok(Faults {
             minor: count(usage.ru_minflt)?,
             major: Some(count(usage.ru_majflt)?),
@@ -195,6 +215,10 @@ mod os {
 mod os {
     use super::{Faults, FaultsError};
 
+    pub(super) fn switches() -> Result<u64, FaultsError> {
+        Err(FaultsError::Unsupported)
+    }
+
     /// Win32 `PROCESS_MEMORY_COUNTERS` (psapi.h).
     #[repr(C)]
     /// The fields keep Win32's order; their names are this crate's.
@@ -250,6 +274,10 @@ mod os {
 #[cfg(not(any(unix, windows)))]
 mod os {
     use super::{Faults, FaultsError};
+
+    pub(super) fn switches() -> Result<u64, FaultsError> {
+        Err(FaultsError::Unsupported)
+    }
 
     pub(super) fn read() -> Result<Faults, FaultsError> {
         Err(FaultsError::Unsupported)

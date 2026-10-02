@@ -8,8 +8,13 @@
 //! the batch is laid into a frame after the sweep's copies, and the frame is written and flushed
 //! on the device; once it is, the frame is published, the frame before it answered, and the loop
 //! goes round. Mantle's writer did each of these in turn on its own thread, blocking on the
-//! device; here the owner hands each I/O to the device thread and goes on answering callers until
-//! it comes back, and the order of everything the log decides is the same.
+//! device; here the owner hands each I/O to the device, done by a caller of the frame that waits
+//! on its answer or by the log's I/O thread (`owner.rs`), and goes on answering callers until it
+//! comes back, and the order of everything the log decides is the same. The device finishes a frame as the writer did after its flush
+//! (`device.rs`): the frame before is answered, its confirmation being this frame's record, and
+//! this frame confirmed on its own unless the owner has said another follows, which is when
+//! submissions were admitted while the frame was on the device: what the writer found queued
+//! when its flush returned.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::Receiver;
@@ -20,15 +25,20 @@ use hyper_block::buf::AlignedBuf;
 
 use super::{Message, Owner};
 use crate::codec::Writer as Payload;
-use crate::device::{Completion, Job, Swept};
+use crate::device::{Answering, Frame, Job, Swept};
 use crate::format::{self, SegmentHeader};
+use crate::ticket::Answer;
 use crate::writer::{self, Placement, Submission, Sweep, SweepRead, Target};
 use crate::{LogError, Waits};
 
-/// A frame flushed and not yet confirmed, and the updates it carried: at most one frame's.
+/// A frame flushed and not yet confirmed, and the updates it carried: at most one frame's. Its
+/// answers are the owner's while no frame on the device carries them.
 pub(super) struct Unconfirmed {
     sequence: u64,
     updates: Vec<(Submission, Placement)>,
+    answering: Vec<Answering>,
+    /// The frame's own confirmation, laid out with the frame.
+    confirm: Option<AlignedBuf>,
 }
 
 /// What the writer is waiting on the device for.
@@ -47,6 +57,18 @@ pub(super) enum Phase {
     Confirming { frame: Unconfirmed, forget: bool },
 }
 
+/// What the device says of a frame's flush (`device::Completion::Frame`).
+pub(super) struct Flushed {
+    pub(super) result: Result<(), LogError>,
+    pub(super) took_ns: u64,
+    /// The device is confirming the frame on its own.
+    pub(super) confirming: bool,
+    /// The frame's own confirmation, unless the device is writing it.
+    pub(super) confirm: AlignedBuf,
+    pub(super) before: Vec<Answering>,
+    pub(super) these: Vec<Answering>,
+}
+
 /// A frame on the device.
 pub(super) struct Writing {
     taken: Vec<(Submission, Placement)>,
@@ -54,6 +76,13 @@ pub(super) struct Writing {
     target: Target,
     tail: u64,
     sequence: u64,
+}
+
+impl Writing {
+    /// The frame's sequence.
+    pub(super) fn sequence(&self) -> u64 {
+        self.sequence
+    }
 }
 
 /// The writer's wait for the submitters the last frame answered (`hyper_block::commit`).
@@ -146,14 +175,26 @@ impl<F: BlockFile + 'static> Owner<F> {
             self.schedule.backlog = self.queued(inbox);
             return true;
         }
-        // The backlog is empty: the busy period ends at the largest finish tag [SFQ96 §2], and
-        // no group's past service counts against it any longer.
+        self.end_busy_period();
+        self.parked = true;
+        false
+    }
+
+    /// The backlog is empty: the busy period ends at the largest finish tag [SFQ96 §2], and no
+    /// group's past service counts against it any longer.
+    fn end_busy_period(&mut self) {
         let schedule = &mut self.schedule;
         let last = schedule.finish.values().copied().max().unwrap_or(0);
         schedule.virtual_time = schedule.virtual_time.max(last);
         schedule.finish.clear();
-        self.parked = true;
-        false
+    }
+
+    /// Submissions queued when the device answered: every message sent before the device's word
+    /// has been heard before it (the inbox in order, the side channel before each message), so
+    /// they are those taken. What comes after the word comes from callers who may have heard
+    /// their answers, and joins the next batch at the next step.
+    fn backlog_at_answers(&self) -> u64 {
+        u64::try_from(self.intake.len()).unwrap_or(u64::MAX)
     }
 
     /// Submissions sent before the answers about to go out: they are queued ahead of any the
@@ -273,7 +314,7 @@ impl<F: BlockFile + 'static> Owner<F> {
                     end: read.end,
                 };
                 self.phase = Phase::Sweeping { batch, whole, read };
-                self.dispatch(job, inbox);
+                self.dispatch(job);
             }
             Ok(None) => {
                 let mut payload = std::mem::take(&mut self.buffers.payload);
@@ -284,27 +325,9 @@ impl<F: BlockFile + 'static> Owner<F> {
         }
     }
 
-    /// Hands a write-path job to the device. Its queue holds one such job, which the owner
-    /// never exceeds; a device that ended fails the job as a failed write would.
-    fn dispatch(&mut self, job: Job<F>, inbox: &Receiver<Message<F>>) {
-        if self.device.try_send(job).is_ok() {
-            return;
-        }
-        let completion = match &self.phase {
-            Phase::Sweeping { .. } => Completion::Sweep(Err(LogError::Closed)),
-            Phase::Writing(_) => Completion::Frame {
-                frame: AlignedBuf::empty(),
-                record: AlignedBuf::empty(),
-                result: Err(LogError::Closed),
-                took_ns: 0,
-            },
-            Phase::Confirming { .. } => Completion::Confirm {
-                record: AlignedBuf::empty(),
-                result: Err(LogError::Closed),
-            },
-            Phase::Idle => return,
-        };
-        self.done(completion, inbox);
+    /// Hands a write-path job to the device: one at a time, the owner waiting for each.
+    fn dispatch(&mut self, job: Job<F>) {
+        self.io.push_back((job, None));
     }
 
     /// The tail is read: its live pieces go first in the payload, then the batch.
@@ -503,7 +526,8 @@ impl<F: BlockFile + 'static> Owner<F> {
         }
     }
 
-    /// Lays the frame and its persist record into aligned buffers and hands them to the device.
+    /// Lays the frame, its persist record and its own confirmation into aligned buffers and hands
+    /// them to the device, with the answers of its updates and of the frame before.
     fn write(
         &mut self,
         payload: Payload,
@@ -517,22 +541,36 @@ impl<F: BlockFile + 'static> Owner<F> {
         self.buffers.payload = payload;
         let confirms = self.state.durable;
         let job = built.and_then(|frame| {
-            let record = self.record_of(sequence, confirms, laid.taken.iter().map(|(s, _)| s))?;
+            let updates = || laid.taken.iter().map(|(s, _)| s);
+            let kept = self.buffers.record.take();
+            let record = self.record_of(sequence, confirms, updates(), kept)?;
+            let kept = self.buffers.confirms.pop();
+            let confirm = self.record_of(sequence, sequence, updates(), kept)?;
             let at = if target.opens {
                 writer::slot_start(&self.p.config, target.slot)?
             } else {
                 target.offset
             };
-            Ok(Job::Frame {
-                frame,
-                at,
-                record,
-                record_at: self.record_at(sequence)?,
-            })
+            Ok((frame, at, record, self.record_at(sequence)?, confirm))
         });
         match job {
-            Ok(job) => {
-                let Laid { sweep, taken, .. } = laid;
+            Ok((frame, at, record, record_at, confirm)) => {
+                let Laid {
+                    sweep, mut taken, ..
+                } = laid;
+                // A caller of the frame that waits on its answer does the frame's I/O.
+                let doer = taken
+                    .iter()
+                    .find(|(s, _)| s.waits)
+                    .and_then(|(s, _)| s.ticket.port());
+                let these = self.answers_of(&mut taken);
+                let before = self
+                    .unconfirmed
+                    .as_mut()
+                    .map(|u| std::mem::take(&mut u.answering))
+                    .unwrap_or_default();
+                let more = !self.intake.is_empty() || !self.schedule.held.is_empty();
+                self.more_told = more;
                 self.phase = Phase::Writing(Writing {
                     taken,
                     sweep,
@@ -540,10 +578,50 @@ impl<F: BlockFile + 'static> Owner<F> {
                     tail,
                     sequence,
                 });
-                self.dispatch(job, inbox);
+                self.io.push_back((
+                    Job::Frame(Frame {
+                        frame,
+                        at,
+                        record,
+                        record_at,
+                        sequence,
+                        confirm,
+                        before,
+                        these,
+                        more,
+                    }),
+                    doer,
+                ));
             }
             Err(e) => self.failed(VecDeque::new(), laid.taken, e, inbox),
         }
+    }
+
+    /// The answers of a frame's updates, taken from them for the device to give: each ticket,
+    /// and a handle's entries, whose terms and lengths stay for publishing the frame.
+    fn answers_of(&mut self, taken: &mut [(Submission, Placement)]) -> Vec<Answering> {
+        let mut these = self.buffers.answering.pop().unwrap_or_default();
+        self.buffers.lens.clear();
+        for (s, _) in taken.iter_mut() {
+            let entries = if s.handle {
+                let entries = crate::group::given_back(&mut s.update);
+                let from = self.buffers.lens.len();
+                self.buffers.lens.extend(
+                    entries
+                        .iter()
+                        .map(|e| (e.term, u32::try_from(e.bytes.len()).unwrap_or(u32::MAX))),
+                );
+                s.lens = (from, self.buffers.lens.len());
+                entries
+            } else {
+                Vec::new()
+            };
+            these.push(Answering {
+                ticket: s.ticket.take(),
+                entries,
+            });
+        }
+        these
     }
 
     /// The frame's bytes: the segment's header first when it opens one, the frame's header, its
@@ -595,12 +673,13 @@ impl<F: BlockFile + 'static> Owner<F> {
     }
 
     /// The persist record of the frame of `sequence`, which confirms the frame of `confirms`,
-    /// for `updates`, laid into the last record's buffer while it is large enough.
+    /// for `updates`, laid into `kept` while it is large enough.
     fn record_of<'a>(
         &mut self,
         sequence: u64,
         confirms: u64,
         updates: impl Iterator<Item = &'a Submission>,
+        kept: Option<AlignedBuf>,
     ) -> Result<AlignedBuf, LogError> {
         let b = &mut self.buffers;
         b.persist.log = self.p.id;
@@ -612,7 +691,7 @@ impl<F: BlockFile + 'static> Owner<F> {
         b.persist
             .encode_into(&mut b.record_bytes)
             .ok_or(LogError::TooLarge(b.persist.groups.len()))?;
-        let mut buf = aligned(b.record.take(), b.record_bytes.len(), self.p.align)?;
+        let mut buf = aligned(kept, b.record_bytes.len(), self.p.align)?;
         buf.extend_from_slice(b.record_bytes.as_slice())
             .map_err(|e| LogError::Disk(e.into()))?;
         Ok(buf)
@@ -624,14 +703,22 @@ impl<F: BlockFile + 'static> Owner<F> {
         Ok(crate::recover::persist_at(slot, sequence))
     }
 
-    /// The frame is on the device: published, the frame before answered, and the loop goes on.
-    pub(super) fn written(
-        &mut self,
-        result: Result<(), LogError>,
-        took_ns: u64,
-        inbox: &Receiver<Message<F>>,
-    ) {
+    /// The frame is on the device: published, the frame before answered, and the loop goes on,
+    /// with the frame's own confirmation on the device when no other frame follows.
+    pub(super) fn written(&mut self, done: Flushed, inbox: &Receiver<Message<F>>) {
+        let Flushed {
+            result,
+            took_ns,
+            confirming,
+            confirm,
+            before,
+            these,
+        } = done;
         let Phase::Writing(w) = std::mem::replace(&mut self.phase, Phase::Idle) else {
+            self.fence();
+            for list in [before, these] {
+                self.answer_each(list, Err(LogError::Fenced));
+            }
             return;
         };
         let Writing {
@@ -641,11 +728,28 @@ impl<F: BlockFile + 'static> Owner<F> {
             tail,
             sequence,
         } = w;
+        // The frame before's answers come back only when this frame failed.
+        match self.unconfirmed.as_mut() {
+            Some(u) if !before.is_empty() => u.answering = before,
+            _ => self.keep_answers(before),
+        }
         let published = result.and_then(|()| {
             self.schedule.anticipation.served(took_ns);
-            writer::publish(&mut self.state, &self.p, &target, sweep, &mut taken, tail)
+            writer::publish(
+                &mut self.state,
+                &self.p,
+                &target,
+                sweep,
+                &mut taken,
+                tail,
+                &self.buffers.lens,
+            )
         });
         if let Err(e) = published {
+            // Fenced before anyone hears of it, so no answer outruns the fence.
+            self.fence();
+            self.answer_each(these, Err(LogError::Fenced));
+            self.give_confirm(confirm);
             self.failed(VecDeque::new(), taken, e, inbox);
             return;
         }
@@ -653,20 +757,54 @@ impl<F: BlockFile + 'static> Owner<F> {
         schedule.frames = schedule.frames.saturating_add(1);
         let updates = u64::try_from(taken.len()).unwrap_or(u64::MAX);
         schedule.updates = schedule.updates.saturating_add(updates);
-        let backlog = self.queued(inbox);
+        let backlog = self.backlog_at_answers();
         let confirmed = match self.unconfirmed.take() {
             Some(before) => self.settle(before, Ok(())),
             None => 0,
         };
         self.count_fruitless(taken.is_empty());
-        self.unconfirmed = Some(Unconfirmed {
+        let frame = Unconfirmed {
             sequence,
             updates: taken,
-        });
+            answering: these,
+            confirm: None,
+        };
+        if confirming {
+            self.give_confirm(confirm);
+            self.phase = Phase::Confirming {
+                frame,
+                forget: false,
+            };
+        } else {
+            self.unconfirmed = Some(Unconfirmed {
+                confirm: Some(confirm),
+                ..frame
+            });
+        }
         self.schedule.answered = confirmed;
         self.forget();
         self.schedule.backlog = backlog;
         self.step(inbox);
+    }
+
+    /// Keeps a confirmation's buffer for a later frame's: one for each frame whose confirmation
+    /// is laid out at once, the frame awaiting it and the frame on the device.
+    pub(super) fn give_confirm(&mut self, buf: AlignedBuf) {
+        if buf.capacity() > 0 && self.buffers.confirms.len() < super::SPARE_FRAMES {
+            self.buffers.confirms.push(buf);
+        }
+    }
+
+    /// Answers each of `list` with `result`, and keeps the list.
+    fn answer_each(&mut self, mut list: Vec<Answering>, result: Result<(), LogError>) {
+        for answering in list.drain(..) {
+            let mut ticket = answering.ticket;
+            match &result {
+                Ok(()) => ticket.answer(Ok(Answer::Durable(answering.entries))),
+                Err(_) => ticket.answer(Err(LogError::Fenced)),
+            }
+        }
+        self.keep_answers(list);
     }
 
     /// Frames that sweep and carry no update, in a row, while updates wait: each copies a tail
@@ -755,7 +893,7 @@ impl<F: BlockFile + 'static> Owner<F> {
     /// risk only the record of a frame not yet answered, which recovery may drop as it drops a
     /// torn tail.
     fn confirm(&mut self, forget: bool) -> bool {
-        let Some(frame) = self.unconfirmed.take() else {
+        let Some(mut frame) = self.unconfirmed.take() else {
             self.schedule.answered = 0;
             return false;
         };
@@ -763,24 +901,19 @@ impl<F: BlockFile + 'static> Owner<F> {
             self.unanswerable(frame);
             return false;
         }
-        let sequence = frame.sequence;
-        let record = self.record_of(sequence, sequence, frame.updates.iter().map(|(s, _)| s));
-        let job = record.and_then(|record| {
-            self.record_at(sequence)
-                .map(|record_at| Job::Confirm { record, record_at })
-        });
-        let Ok(job) = job else {
+        // The confirmation was laid out with the frame, while its updates were whole.
+        let (Some(record), Ok(record_at)) = (frame.confirm.take(), self.record_at(frame.sequence))
+        else {
             self.fence();
             self.unanswerable(frame);
             return false;
         };
-        if let Err(e) = self.device.try_send(job) {
-            // The device ended: the record went with it, and the confirmation never will.
-            drop(e);
-            self.fence();
-            self.unanswerable(frame);
-            return false;
-        }
+        let these = std::mem::take(&mut frame.answering);
+        self.dispatch(Job::Confirm {
+            record,
+            record_at,
+            these,
+        });
         self.phase = Phase::Confirming { frame, forget };
         true
     }
@@ -793,12 +926,26 @@ impl<F: BlockFile + 'static> Owner<F> {
 
     /// The confirmation is durable, or failed and fenced the log: its frame's updates are
     /// answered, and the loop goes on.
-    pub(super) fn confirmed(&mut self, result: Result<(), LogError>, inbox: &Receiver<Message<F>>) {
-        let Phase::Confirming { frame, forget } = std::mem::replace(&mut self.phase, Phase::Idle)
+    pub(super) fn confirmed(
+        &mut self,
+        result: Result<(), LogError>,
+        these: Vec<Answering>,
+        inbox: &Receiver<Message<F>>,
+    ) {
+        let Phase::Confirming { mut frame, forget } =
+            std::mem::replace(&mut self.phase, Phase::Idle)
         else {
+            self.fence();
+            self.answer_each(these, Err(LogError::Fenced));
             return;
         };
-        let backlog = self.queued(inbox);
+        frame.answering = these;
+        let backlog = self.backlog_at_answers();
+        // Nothing was queued when the answers went out: the busy period ended then, whenever
+        // the answered callers' next submissions reach the inbox.
+        if backlog == 0 && self.schedule.held.is_empty() && self.unconfirmed.is_none() {
+            self.end_busy_period();
+        }
         self.schedule.answered = match result {
             Ok(()) => self.settle(frame, Ok(())),
             Err(_) => {
@@ -814,14 +961,25 @@ impl<F: BlockFile + 'static> Owner<F> {
         self.step(inbox);
     }
 
-    /// Answers the updates of a frame whose confirmation is durable, `Ok`, or will never be,
-    /// `Fenced`; the number answered. Its list is kept for the next frame's.
+    /// Gives back the room of the updates of a frame whose confirmation is durable, `Ok`, or
+    /// will never be, `Fenced`, answering those the device has not: the number settled. Its lists
+    /// are kept for later frames.
     fn settle(&mut self, frame: Unconfirmed, result: Result<(), ()>) -> u64 {
-        let mut updates = frame.updates;
+        let Unconfirmed {
+            mut updates,
+            answering,
+            confirm,
+            ..
+        } = frame;
+        let fenced = || result.map_err(|()| LogError::Fenced);
+        self.answer_each(answering, fenced());
+        if let Some(buf) = confirm {
+            self.give_confirm(buf);
+        }
         let count = u64::try_from(updates.len()).unwrap_or(u64::MAX);
         for (s, _) in updates.drain(..) {
-            let answer = result.map_err(|()| LogError::Fenced);
-            self.answer(s, answer);
+            // Its ticket went with the frame's answers: this gives back its room.
+            self.answer(s, fenced());
         }
         self.keep_list(updates);
         count

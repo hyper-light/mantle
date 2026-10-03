@@ -55,7 +55,7 @@ threads grow (26 §4.2).
 | Owner | Threads | What runs there |
 |---|---|---|
 | Network runtime | a tokio multi-thread runtime, one worker per core the process is granted | QUIC connections and the datagram plane (§3), SWIM, HTTP connections (§4), the drivers of each S3 request, the routing layer (§5), clients and connections as tasks |
-| Metadata shards | one per granted core | range replicas: stepping, ticking, proposing, `begin`, applying, serving confirmed reads (§2) |
+| Metadata shards | one per granted core | range replicas: stepping, ticking, proposing, driving, applying, serving confirmed reads (§2) |
 | Coding pool | one per granted core | erasure encoding and decoding of whole blocks, block checksums, the write path's inverse checks (§5.6) |
 | Device issuers | one per physical device | every volume's writer, cleaner and scrubber and the device's Raft log writer, as state machines (chunk-store.md §4; raft-log.md §3); the device's dispatcher (§2.7). As built: every volume's writes and flushes, dispatched to the device's pool; the writers, cleaners and scrubbers are still threads of their own (STATUS item 4) |
 | Device pools | per device, at most the device's measured depth, only where the platform has no asynchronous interface the device can use (below) | blocking reads, writes and flushes the issuer hands them. As built: the volumes' writes and flushes, on every platform (below) |
@@ -389,45 +389,46 @@ nothing but its timer (§2.4).
 
 ### 2.2 A range's turn
 
-The replica API already has the shape audit §5.1 asks for: `begin` gives out the messages a
-leader may send before its own write, submits the update without waiting, applies what is
-already committed, and returns with `persisting` set; a later `begin` finishes the `Ready` once
-its update is durable (replica.md §3). A range's turn does this, in order:
+A range's replica is hyper-raft's durable shell (replica.md §3; hyper-raft `docs/durable.md`),
+whose one entry point for work, `drive`, never waits: it takes the log's answers to the
+replica's writes, applies what the commit fence allows, at most one page of committed entries
+(`max_committed_size_per_ready`) or one entry larger than it, and takes at most one `Ready`,
+giving out at once the messages that answer for no write and submitting its write with the
+shard's waker. Readies are taken ahead of their writes' answers to the log's depth, three
+frames, so a range's next update need not wait for its last one's flush (audit §5.1). A range's
+turn does this, in order:
 
-1. Take the messages that arrived, with `step`. While the range's `Ready` is out the replica
-   holds them, within one flow-control window of appends per member, and refuses the rest with
-   `MessagesHeld`, which the shard counts and drops, as the network may (replica.md §3).
-2. Take the ticks that came due, with `tick`.
-3. If no `Ready` is out: propose the commands waiting for the range as one entry of at most
-   `max_entry_bytes` (replica.md §1), and start the reads waiting, with `read_index`.
-4. Call `begin`. Hand every message it gives to the transport at once: a leader's appends go
-   out while its own write flushes, and a follower's acknowledgement is given out only once its
-   write is durable, which the replica enforces. Answer the commands in `applied` to the
-   gateways waiting for them, serve the confirmed `reads` from the engine once it has applied
-   their index, and give `unconfirmed` reads back to their callers.
-5. If `persisting` is set, the range waits for its ticket; its completion puts the range back on
-   the ready queue, and its next `begin` finishes the `Ready`. If `stalled` is set, the log has
-   refused the update for want of room: the range waits on the device authority (§2.5), which
-   asks the engines on that log to flush so the ranges can compact (§6.2), and wakes it when a
-   compaction frees room. If the replica answers `Fenced`, its log failed to make a write
-   durable and nothing the process holds says what the device kept; every replica on that log is
-   taken off its shard, the log is reopened, which recovers what is durable, and its members
-   open afresh from it.
+1. Take the messages that arrived, with `step`, and the ticks that came due, with `tick`. The
+   replica takes both while its writes are out; one waiting for room refuses messages with
+   `Stalled`, which the shard counts and drops, as the network may, and is not ticked
+   (replica.md §3).
+2. Propose the commands waiting for the range as one entry of at most `max_entry_bytes`
+   (replica.md §1), and start the reads waiting, with `read_index`.
+3. Call `drive`. Hand every message it gives to the transport at once: a leader's appends go
+   out while its own write flushes, and a follower's acknowledgement and every vote are given
+   out only once the write that holds what they say is durable, which the shell enforces.
+   Answer the commands in `applied` to the gateways waiting for them, and serve the confirmed
+   `reads`, which come once the engine has applied their index.
+4. If `Driven::more` is set, the range has more to do without an answer from the log (a
+   committed page past this drive's, or another `Ready` within the depth): it goes back on the
+   ready queue for its next turn. Otherwise it waits: the log's answer to one of its writes
+   wakes it through the shard's waker, which puts it back on the queue. If `Driven::stalled`
+   is set, the log refused a write for want of room: the range waits on the device authority
+   (§2.5), which asks the engines on that log to flush so the ranges can compact (§6.2), and
+   calls `resume` when a compaction frees room. If the replica answers `Fenced`, its log
+   failed to make a write durable and nothing the process holds says what the device kept;
+   every replica on that log is taken off its shard, the log is reopened, which recovers what
+   is durable, and its members open afresh from it.
 
-A shard never calls `drive` or `wait_persisted`, which wait on the log. It begins every
-runnable range in one pass before any of their flushes completes, so their updates meet in one
-frame on each log, which is what audit §5.1 asks a scheduler to do.
-
-While a `Ready` flushes the replica refuses proposals, reads and campaigns with `Stalled`
-(replica.md §3, §7). The shard holds a range's waiting commands and reads in the range's own
-queue instead, and proposes them at the next turn with no `Ready` out, so no caller sees
-`Stalled`. The queue is bounded in bytes by Little's law: the range's measured command rate
-times the delay the queue may add, and at least one largest entry, so the largest command a
-range accepts always fits (11 §4.4–§4.5). Past the bound a command is refused `Busy`, which the
-gateway answers with `503 SlowDown` or retries within its deadline (§5.4).
-
-More than one `Ready` of a range in flight would halve each update's wait (replica.md §7) and
-needs a core that hands out `Ready`s ahead of their persistence; it stays open.
+A shard drives every runnable range in one pass before any of their flushes completes, so
+their updates meet in one frame on each log, which is what audit §5.1 asks a scheduler to do.
+The shard holds a range's waiting commands and reads in the range's own queue and proposes
+them at its next turn. The queue is bounded in bytes by Little's law: the range's measured
+command rate times the delay the queue may add, and at least one largest entry, so the largest
+command a range accepts always fits (11 §4.4–§4.5). Past the bound a command is refused
+`Busy`, which the gateway answers with `503 SlowDown` or retries within its deadline (§5.4).
+A leader whose uncommitted proposals reach `max_uncommitted_size` refuses more, `Refused`,
+and the shard keeps them queued.
 
 ### 2.3 Fairness, and the reserve for control
 
@@ -437,16 +438,17 @@ it submits and the committed entries it applies. Deficit round robin keeps each 
 range within one largest unit of its fair share over any number of rounds, and does O(1) work a
 turn when the quantum is at least that unit: "The Work for Deficit Round Robin is O(1), if for
 all i, Quantum_i ≥ Max" (25 §7). The quantum is therefore the largest unit a turn can carry: one
-`max_entry_bytes` entry proposed plus one `Ready` of `max_committed_size_per_ready` applied.
-This replaces the replica's count of 64 `Ready`s a drive, which bounded neither bytes nor time
-(audit §12.6).
+`max_entry_bytes` entry proposed plus one drive's page of `max_committed_size_per_ready` applied,
+which the shell holds a drive to (hyper-raft `docs/durable.md` §2.2). This replaces the
+replica's count of 64 `Ready`s a drive, which bounded neither bytes nor time (audit §12.6).
 
-Control comes first in every pass: ticks, votes, heartbeats and their answers, and the second
-half of `Ready`s whose updates are durable. Strict priority protects urgent work only when the
-urgent work is itself bounded (audit §13.3), and this work is: each range's held messages are
-bounded by its flow-control window, and its ticks by one election timeout (replica.md §3). A
-pass spends at most one round of data work before it returns to control, and a round is
-bounded in bytes by the quanta of the ranges in it.
+Control comes first in every pass: ticks, votes, heartbeats and their answers, and the drives
+of ranges whose writes the log answered. Strict priority protects urgent work only when the
+urgent work is itself bounded (audit §13.3), and this work is: what a range's core queues while
+its writes are out is bounded by the core's own limits on pending messages and appends in
+flight, and a campaign supersedes the vote requests of the one before (replica.md §3). A pass
+spends at most one round of data work before it returns to control, and a round is bounded in
+bytes by the quanta of the ranges in it.
 
 The shard's fairness is among ranges, so one hot range cannot hold a core that other ranges'
 leaders need for their heartbeats. Fairness among tenants within a range is the range's own
@@ -465,7 +467,8 @@ duration times a margin derived from the split's measured cost.
 
 ### 2.4 Time
 
-focal-raft counts ticks and reads no clock (07 §5.1). A shard keeps a timer wheel of each
+The Raft core counts ticks and reads no clock on ticks (07 §5.1; hyper-raft `docs/durable.md`
+§8), which is how a range elects until its node carries the node-pair liveness stream. A shard keeps a timer wheel of each
 range's next tick, as slates' runtime keeps timers, whose cost is per event rather than per tick
 (08 §3.2), and ticks a range only when its tick is due.
 
@@ -1650,7 +1653,6 @@ range's workload (12 §6.6).
   whether dividing cores by measured demand does better is measured once phase A runs.
 - **Quiescing idle ranges**, and the protocol that wakes one without weakening its election or
   read rules (audit §15.1; 06 §A4.3).
-- **More than one `Ready` of a range in flight** (replica.md §7), which needs the core's help.
 - **The datagram plane against RFC 9221's datagrams on the QUIC connection.** The separate
   socket escapes bulk's congestion control and carries RFC 8085's obligations itself (§3.4);
   the network matrix decides whether the separation pays for itself.

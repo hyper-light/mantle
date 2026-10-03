@@ -17,7 +17,7 @@
 //! and says what to propose next. A proposal a leader drops, or one lost with a leader, is
 //! proposed again the next time, and one already applied is not.
 
-use focal_raft::proto::{
+use hyper_raft::proto::{
     ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState,
 };
 

@@ -5202,11 +5202,11 @@ mod tests {
 
     /// Every range's engine also holds the rows its replica keeps about itself: the group's
     /// configuration, which once began with the queue's marker and read as a corrupt queue
-    /// row, and the last snapshot installed.
+    /// row, and the term of the last entry applied.
     #[test]
     fn the_queue_reads_past_the_replicas_own_rows() {
         let mut r = Range::new();
-        let own: Vec<Write> = [key::marker::CONFIGURATION, key::marker::INSTALLED]
+        let own: Vec<Write> = [key::marker::CONFIGURATION, key::marker::TERM]
             .iter()
             .map(|&m| Write::Put(vec![key::LOCAL, m], vec![1, 2, 3]))
             .collect();

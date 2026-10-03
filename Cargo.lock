@@ -327,6 +327,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-durable"
+version = "0.1.0"
+dependencies = [
+ "hyper-block",
+ "hyper-liveness",
+ "hyper-log",
+ "hyper-raft",
+ "hyper-timing",
+ "thiserror",
+]
+
+[[package]]
+name = "hyper-liveness"
+version = "0.1.0"
+dependencies = [
+ "hyper-timing",
+]
+
+[[package]]
 name = "hyper-log"
 version = "0.1.0"
 dependencies = [
@@ -334,6 +353,14 @@ dependencies = [
  "getrandom 0.4.3",
  "hyper-block",
  "thiserror",
+]
+
+[[package]]
+name = "hyper-measure"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows-sys",
 ]
 
 [[package]]
@@ -484,9 +511,10 @@ name = "mantle-range"
 version = "0.1.0"
 dependencies = [
  "hyper-block",
+ "hyper-durable",
  "hyper-log",
+ "hyper-measure",
  "hyper-raft",
- "mantle-chunk",
  "mantle-codec",
  "mantle-crc",
  "mantle-meta",

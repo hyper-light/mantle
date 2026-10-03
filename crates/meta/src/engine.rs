@@ -28,6 +28,9 @@ pub enum EngineError {
     /// A write or flush failed; nothing more is applied until the range recovers.
     #[error("the engine is fenced after a failed write")]
     Fenced,
+    /// No memory for a batch: nothing was applied.
+    #[error("no memory for a batch")]
+    Memory,
 }
 
 /// Rows as a state machine reads and writes them.

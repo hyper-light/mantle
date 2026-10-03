@@ -47,9 +47,12 @@
     clippy::cast_possible_truncation
 )]
 
+#[path = "support/store.rs"]
+mod store;
 mod support;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::task::Waker;
 
 use hyper_block::block::BlockFile;
 use hyper_block::buf::{AlignedBuf, Alignment};
@@ -63,12 +66,30 @@ use mantle_meta::session::Rules;
 use mantle_meta::wire::{Answer, Command, Entry, Sessioned};
 use mantle_range::membership::{Next, Replacement};
 use mantle_range::{
-    ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState, Message,
-    Range, Replica, ReplicaError, Settings,
+    ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState, Driven,
+    Message, Range, Replica, ReplicaError, Settings,
 };
+use store::Synchronous;
 use support::linear::{self, Input, Operation, Output, Register, Verdict};
 
 const GROUP: u128 = 0x0072_616e_6765;
+
+/// An entry's commands' sessions, serials and answers, in order.
+type EntryAnswers = Vec<(u64, u64, Answer)>;
+
+/// One member's applied answers as its entries made them: each entry's index with its commands'
+/// answers. An entry's answers come together within one drive.
+fn by_entry(answers: Vec<mantle_range::Applied>) -> Vec<(u64, EntryAnswers)> {
+    let mut entries: Vec<(u64, EntryAnswers)> = Vec::new();
+    for a in answers {
+        match entries.last_mut() {
+            Some((index, each)) if *index == a.index => each.push((a.session, a.serial, a.answer)),
+            _ => entries.push((a.index, vec![(a.session, a.serial, a.answer)])),
+        }
+    }
+    entries
+}
+
 /// Members each run loses for good, one after another.
 const LOSSES: u64 = 2;
 
@@ -149,7 +170,49 @@ impl Rng {
     }
 }
 
-type Member = Replica<SimFile, Model>;
+type Member = Replica<Synchronous<SimFile>, Model>;
+
+/// What a member's drive gives out.
+type Out = mantle_range::Output;
+
+/// The simulation's step on the owner's clock, in nanoseconds: the shell reads the clock only to
+/// time its writes, which nothing on ticks decides by, so a step is its millisecond.
+const STEP_NS: u64 = 1_000_000;
+
+/// Opens member `id` of `range` over its group of `log`, through the store that makes each write
+/// durable as it is submitted (`support::store`).
+fn open(
+    id: u64,
+    log: &Log<SimFile>,
+    engine: Model,
+    range: &Range,
+    seed: u64,
+) -> Result<Member, ReplicaError> {
+    let store = Synchronous::new(mantle_range::claim(log, GROUP, range)?, None);
+    Replica::open(id, store, engine, range, seed)
+}
+
+/// Drives `r` once, appending what it gives out to `out`; with `settle`, again until no write is
+/// out and nothing more is due. Every write is answered as it is submitted (`support::store`), so
+/// what a drive gives out never hangs on the log's threads. A member settles within the rounds a
+/// group without faults takes to do anything (`PATIENT_ROUNDS`): reaching them is a failure.
+fn drive(r: &mut Member, now: u64, settle: bool, out: &mut Out) -> Result<Driven, ReplicaError> {
+    let mut driven = r.drive(now, Waker::noop(), out)?;
+    if settle {
+        let mut budget = PATIENT_ROUNDS;
+        while driven.more || r.in_flight() > 0 {
+            assert!(
+                budget > 0,
+                "member {} never settled: {}",
+                r.id(),
+                r.describe()
+            );
+            budget -= 1;
+            driven = r.drive(now, Waker::noop(), out)?;
+        }
+    }
+    Ok(driven)
+}
 
 struct Node {
     id: u64,
@@ -200,10 +263,9 @@ struct Damage {
     /// Members rebuilt under a new identity on their device, and devices replaced.
     rebuilt: u64,
     replaced: u64,
-    /// Restarts whose engine had applied entries the damaged log lost: kept in place, the
-    /// applied entry's term known, or rebuilt.
+    /// Restarts whose engine had applied entries the damaged log lost, kept in place: the
+    /// engine keeps the term of what it applied (docs/design/replica.md §4).
     ahead_kept: u64,
-    ahead_rebuilt: u64,
 }
 
 fn log_id(id: u64) -> u128 {
@@ -219,8 +281,7 @@ impl Node {
         )
         .unwrap();
         let log = Log::create(file, log_config(), log_id(id)).unwrap();
-        let replica =
-            Replica::open(id, GROUP, &log, first_range(), &range(members), seed ^ id).unwrap();
+        let replica = open(id, &log, first_range(), &range(members), seed ^ id).unwrap();
         Self {
             id,
             log_id: log_id(id),
@@ -307,19 +368,18 @@ impl Node {
             .view(GROUP)
             .unwrap()
             .is_some_and(|v| engine.applied() > v.last);
-        match Replica::open(
+        match open(
             self.id,
-            GROUP,
             log,
             engine,
             &range(self.members),
             seed ^ self.id ^ (self.lives << 40),
         ) {
-            Ok(mut replica) => {
+            Ok(replica) => {
                 damage.ahead_kept += u64::from(ahead);
                 // A mark lasts across restarts until the group repairs the member.
                 let before = self.uncertain;
-                self.uncertain = replica.is_uncertain().unwrap();
+                self.uncertain = replica.is_uncertain();
                 if self.uncertain && !before {
                     assert!(latent, "member {} marked with no damage", self.id);
                     damage.marked += 1;
@@ -330,10 +390,6 @@ impl Node {
                     damage.unmarked += 1;
                 }
                 self.replica = Some(replica);
-            }
-            Err(ReplicaError::Damaged) if latent && ahead => {
-                damage.ahead_rebuilt += 1;
-                self.found = Some(Found::Group);
             }
             Err(e) => panic!("member {} reopens: {e}", self.id),
         }
@@ -483,20 +539,20 @@ struct World {
     lose_at: u64,
     /// Replacements finished.
     replaced: u64,
-    /// Readies the log refused for want of room, each waited out by compacting.
+    /// Drives that found a write waiting for room, each followed by a compaction or the owner's
+    /// word that room may have been freed.
     stalls: u64,
-    /// Readies begun and left flushing past a step.
-    flushing: u64,
+    /// Steps at which a member's writes were left out past its drive, its readies taken ahead
+    /// of their answers.
+    ahead: u64,
     /// Steps at which two members were down at once, and messages sent twice.
     two_down: u64,
     duplicated: u64,
     /// Clocks stepped, forward or back.
     stepped: u64,
-    /// Messages and ticks a member held while its ready flushed, and messages it refused
-    /// for want of room to hold them.
-    held: u64,
-    held_ticks: u64,
-    refused: u64,
+    /// Messages and ticks the core took while the member's writes were out.
+    stepped_ahead: u64,
+    ticked_ahead: u64,
     damage: Damage,
 }
 
@@ -505,13 +561,12 @@ struct World {
 struct Ran {
     replaced: u64,
     stalls: u64,
-    flushing: u64,
+    ahead: u64,
     two_down: u64,
     duplicated: u64,
     stepped: u64,
-    held: u64,
-    held_ticks: u64,
-    refused: u64,
+    stepped_ahead: u64,
+    ticked_ahead: u64,
     damage: Damage,
     steps: u64,
     history: Vec<String>,
@@ -555,13 +610,12 @@ impl World {
             lose_at,
             replaced: 0,
             stalls: 0,
-            flushing: 0,
+            ahead: 0,
             two_down: 0,
             duplicated: 0,
             stepped: 0,
-            held: 0,
-            held_ticks: 0,
-            refused: 0,
+            stepped_ahead: 0,
+            ticked_ahead: 0,
             damage: Damage::default(),
         }
     }
@@ -592,8 +646,8 @@ impl World {
         }
         for n in &mut self.nodes {
             if let Some(r) = n.replica.as_mut() {
-                if r.persisting() {
-                    self.held_ticks += 1;
+                if r.in_flight() > 0 {
+                    self.ticked_ahead += 1;
                 }
                 r.tick().unwrap_or_else(|e| panic!("tick: {e}"));
             }
@@ -677,9 +731,9 @@ impl World {
             && let Some(r) = self.nodes[i].replica.as_mut()
         {
             let keep = self.rng.below(8);
-            match r.compact(keep) {
-                Ok(()) => {}
-                Err(ReplicaError::Fenced(_) | ReplicaError::Log(_)) => self.nodes[i].crash(),
+            match r.compact(keep, self.step * STEP_NS, Waker::noop()) {
+                Ok(_) => {}
+                Err(ReplicaError::Fenced(_)) => self.nodes[i].crash(),
                 Err(e) => self.fail(&format!("compact: {e}")),
             }
         }
@@ -714,16 +768,20 @@ impl World {
         let replacement = match self.nodes[i].found.take() {
             Some(Found::Group) => {
                 let log = self.nodes[i].log.as_ref().unwrap();
-                let (replica, replacement) = Replica::rebuild(
-                    failed,
-                    joining,
-                    GROUP,
-                    log,
-                    first_range(),
-                    &range(self.members),
-                    self.seed ^ joining,
-                )
-                .unwrap_or_else(|e| self.fail(&format!("rebuild {failed}: {e}")));
+                let rebuilt = mantle_range::remove(log, GROUP)
+                    .and_then(|()| mantle_range::claim(log, GROUP, &range(self.members)))
+                    .and_then(|store| {
+                        Replica::rebuild(
+                            failed,
+                            joining,
+                            Synchronous::new(store, None),
+                            first_range(),
+                            &range(self.members),
+                            self.seed ^ joining,
+                        )
+                    });
+                let (replica, replacement) =
+                    rebuilt.unwrap_or_else(|e| self.fail(&format!("rebuild {failed}: {e}")));
                 let n = &mut self.nodes[i];
                 n.id = joining;
                 n.replica = Some(replica);
@@ -788,23 +846,20 @@ impl World {
             let receiver = self.nodes.iter_mut().find(|n| n.id == to);
             let arrived = !dropped
                 && match receiver.and_then(|n| n.replica.as_mut()) {
-                    Some(r) => match (r.persisting(), r.step(m)) {
-                        // A member whose ready flushes holds the message until it is done.
-                        (true, Ok(())) => {
-                            self.held += 1;
-                            true
+                    Some(r) => {
+                        // The core takes a message while the member's writes are out.
+                        let ahead = r.in_flight() > 0;
+                        match r.step(m) {
+                            Ok(()) => {
+                                self.stepped_ahead += u64::from(ahead);
+                                true
+                            }
+                            Err(ReplicaError::Refused(_)) => true,
+                            // A member waiting for room in its log takes no message.
+                            Err(ReplicaError::Stalled) => false,
+                            Err(e) => panic!("step: {e}"),
                         }
-                        (_, Ok(()) | Err(ReplicaError::Refused(_))) => true,
-                        // Past its bound on held messages a member refuses one, as the network
-                        // may drop it.
-                        (_, Err(ReplicaError::MessagesHeld { .. })) => {
-                            self.refused += 1;
-                            false
-                        }
-                        // A member waiting for room in its log takes no message.
-                        (_, Err(ReplicaError::Stalled)) => false,
-                        (_, Err(e)) => panic!("step: {e}"),
-                    },
+                    }
                     None => false,
                 };
             // A snapshot's stream learns whether it arrived, and tells its sender.
@@ -829,25 +884,22 @@ impl World {
         let mut reads = Vec::new();
         let mut stopped = None;
         let mut waiting = Vec::new();
+        let now = self.step * STEP_NS;
         for n in &mut self.nodes {
             let Some(r) = n.replica.as_mut() else {
                 continue;
             };
-            // A member half the time takes its ready without waiting for its log and finishes
-            // it at a later step, holding the ticks and messages that come meanwhile, as a node
-            // overlapping its members' flushes does (audit §5.1). It does so after faults stop
-            // too, so a group whose messages come while its readies flush must still finish.
-            // The flush is waited for before the step ends, so what the next step finds does
-            // not hang on the log's thread: every run is its seed.
-            let out = if self.rng.chance(500) {
-                let out = r.begin();
-                r.wait_persisted();
-                out
-            } else {
-                r.drive()
-            };
-            let out = match out {
-                Ok(out) => out,
+            // A member half the time drives once and leaves its writes out past the step, its
+            // next readies taken ahead of their answers and the messages and ticks that come
+            // meanwhile taken by its core, as a node overlapping its members' flushes does
+            // (audit §5.1); and half the time drives until none is out. It does so after faults
+            // stop too. Every write is answered as it is submitted (`support::store`), so what a
+            // drive gives out never hangs on the log's threads: every run is its seed.
+            let settle = !self.rng.chance(500);
+            let mut out = Out::default();
+            let driven = drive(r, now, settle, &mut out);
+            let driven = match driven {
+                Ok(driven) => driven,
                 // A fenced member takes its node down; it restarts from what its device kept.
                 // A ready begun under faults can find its log fenced a step after they stop,
                 // and its node restarts at once, as the heal would have restarted it.
@@ -863,26 +915,27 @@ impl World {
                     break;
                 }
             };
-            if out.stalled.is_some() {
+            if driven.stalled.is_some() {
                 waiting.push(n.id);
             }
-            if out.persisting {
-                self.flushing += 1;
+            if r.in_flight() > 0 {
+                self.ahead += 1;
             }
             // A mark ends as the group repairs the member: its log holds the entries again.
-            if n.uncertain && !r.is_uncertain().unwrap() {
+            if n.uncertain && !r.is_uncertain() {
                 n.uncertain = false;
                 self.damage.unmarked += 1;
             }
             sent.extend(out.messages);
-            applied.extend(out.applied);
-            reads.extend(out.reads.into_iter().map(|(index, ctx)| (n.id, index, ctx)));
+            applied.extend(by_entry(out.answers));
+            reads.extend(out.reads.into_iter().map(|(ctx, index)| (n.id, index, ctx)));
         }
         if let Some(what) = stopped {
             self.fail(&what);
         }
-        // A ready waits for room in its member's log: the member compacts, and its next drive
-        // writes the ready.
+        // A write waits for room in its member's log: the member compacts, and once that is
+        // durable its next drive makes the refused writes again; with nothing to compact, the
+        // owner says room may have been freed, and the next drive tries again.
         for id in waiting {
             self.stalls += 1;
             let keep = self.rng.below(8);
@@ -892,9 +945,10 @@ impl World {
             let Some(r) = n.replica.as_mut() else {
                 continue;
             };
-            match r.compact(keep) {
-                Ok(()) => {}
-                Err(ReplicaError::Fenced(_) | ReplicaError::Log(_)) => {
+            match r.compact(keep, now, Waker::noop()) {
+                Ok(true) => {}
+                Ok(false) => r.resume(),
+                Err(ReplicaError::Fenced(_)) => {
                     n.crash();
                     if !self.faults {
                         n.restart(self.seed, &mut self.damage);
@@ -913,15 +967,15 @@ impl World {
             }
             self.wire.push((self.step + delay, m));
         }
-        for a in applied {
-            match self.by_index.get(&a.index) {
-                Some(first) if *first != a.answers => {
-                    self.fail(&format!("index {} applied two ways", a.index));
+        for (index, answers) in applied {
+            match self.by_index.get(&index) {
+                Some(first) if *first != answers => {
+                    self.fail(&format!("index {index} applied two ways"));
                 }
                 Some(_) => {}
                 None => {
-                    self.by_index.insert(a.index, a.answers.clone());
-                    self.hear(&a.answers);
+                    self.hear(&answers);
+                    self.by_index.insert(index, answers);
                 }
             }
         }
@@ -1287,16 +1341,15 @@ fn open_gate() -> Command {
     })))
 }
 
-/// Every row of an engine that its range replicates.
+/// Every row of an engine: every one is its range's, the configuration and the term of the last
+/// entry applied among them, which every member applying the same entries writes alike.
 fn rows(m: &Model) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut out = Vec::new();
     let mut at = Vec::new();
     while let Some((k, v)) = m.next(&at, &[0xFF]).unwrap() {
         at = k.clone();
         at.push(0);
-        if !mantle_range::member_local(&k) {
-            out.push((k, v));
-        }
+        out.push((k, v));
     }
     out
 }
@@ -1375,13 +1428,12 @@ fn run(seed: u64, members: u64) -> Ran {
     Ran {
         replaced: w.replaced,
         stalls: w.stalls,
-        flushing: w.flushing,
+        ahead: w.ahead,
         two_down: w.two_down,
         duplicated: w.duplicated,
         stepped: w.stepped,
-        held: w.held,
-        held_ticks: w.held_ticks,
-        refused: w.refused,
+        stepped_ahead: w.stepped_ahead,
+        ticked_ahead: w.ticked_ahead,
         damage: w.damage,
         steps: w.step,
         history: w
@@ -1394,16 +1446,18 @@ fn run(seed: u64, members: u64) -> Ran {
 
 #[test]
 fn a_group_under_faults_is_linearizable_and_applies_every_put_once() {
+    // By default the recorded seeds 1 to 48 (docs/design/replica.md §5), among which a restart
+    // finds each kind of damage: seed 42 is the first whose member opens marked.
     let seeds: u64 = std::env::var("MANTLE_SIM_SEEDS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(24);
+        .unwrap_or(48);
     let first: u64 = std::env::var("MANTLE_SIM_SEED")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
-    let (mut replaced, mut stalls, mut flushing, mut two_down, mut duplicated) = (0, 0, 0, 0, 0);
-    let (mut stepped, mut held, mut held_ticks, mut refused) = (0, 0, 0, 0);
+    let (mut replaced, mut stalls, mut ahead, mut two_down, mut duplicated) = (0, 0, 0, 0, 0);
+    let (mut stepped, mut stepped_ahead, mut ticked_ahead) = (0, 0, 0);
     let mut damage = Damage::default();
     for seed in first..first + seeds {
         // Odd seeds run a group of three, even ones of five.
@@ -1414,31 +1468,29 @@ fn a_group_under_faults_is_linearizable_and_applies_every_put_once() {
         assert!(ran.replaced >= 1, "seed {seed} replaced no member");
         replaced += ran.replaced;
         stalls += ran.stalls;
-        flushing += ran.flushing;
+        ahead += ran.ahead;
         two_down += ran.two_down;
         duplicated += ran.duplicated;
         stepped += ran.stepped;
-        held += ran.held;
-        held_ticks += ran.held_ticks;
-        refused += ran.refused;
+        stepped_ahead += ran.stepped_ahead;
+        ticked_ahead += ran.ticked_ahead;
         damage.injected += ran.damage.injected;
         damage.marked += ran.damage.marked;
         damage.unmarked += ran.damage.unmarked;
         damage.rebuilt += ran.damage.rebuilt;
         damage.replaced += ran.damage.replaced;
         damage.ahead_kept += ran.damage.ahead_kept;
-        damage.ahead_rebuilt += ran.damage.ahead_rebuilt;
     }
     // Leaders' clocks stepped back and forth, and every run stayed linearizable.
     assert!(stepped > 0, "no clock was stepped");
-    // Readies waited for room and the members went on: the path audit S04 found stranded.
-    assert!(stalls > 0, "no ready ever waited for room");
-    // Readies were left flushing across steps, their members holding the messages and ticks
-    // that came meanwhile.
-    assert!(flushing > 0, "no ready was begun and left flushing");
+    // Writes waited for room and the members went on: the path audit S04 found stranded.
+    assert!(stalls > 0, "no write ever waited for room");
+    // Writes were left out across steps, their members' readies taken ahead of the answers
+    // and the messages and ticks that came meanwhile taken by their cores.
+    assert!(ahead > 0, "no write was left out past a drive");
     assert!(
-        held > 0 && held_ticks > 0,
-        "{held} messages and {held_ticks} ticks held"
+        stepped_ahead > 0 && ticked_ahead > 0,
+        "{stepped_ahead} messages and {ticked_ahead} ticks taken while writes were out"
     );
     // Groups of five lost two members at once and went on, and messages arrived twice.
     assert!(
@@ -1454,11 +1506,11 @@ fn a_group_under_faults_is_linearizable_and_applies_every_put_once() {
     );
     eprintln!("{damage:?}");
     eprintln!(
-        "{seeds} runs replaced {replaced} members lost for good; {stalls} readies waited for \
-         room; {flushing} were left flushing across a step; two of five were down at {two_down} \
-         steps; {duplicated} messages were sent twice; {stepped} clocks were stepped; \
-         {held} messages and {held_ticks} ticks were held while a ready flushed, {refused} \
-         messages refused past the bound"
+        "{seeds} runs replaced {replaced} members lost for good; {stalls} drives found a write \
+         waiting for room; members' writes were left out past {ahead} drives; two of five were down at \
+         {two_down} steps; {duplicated} messages were sent twice; {stepped} clocks were \
+         stepped; {stepped_ahead} messages and {ticked_ahead} ticks were taken while writes \
+         were out"
     );
 }
 
@@ -1474,9 +1526,10 @@ fn a_seed_runs_the_same_every_time() {
     }
 }
 
-/// How a member takes its readies in a directed run: waiting for each write (`drive`), or
-/// leaving it flushing while the node does other work (`begin`, then `wait_persisted`), as a
-/// node overlapping its members' flushes does (audit §5.1).
+/// How the target takes its readies in a directed run: driving until none of its writes is out
+/// (`Waiting`), or once a round, its writes left out past the round and its next readies taken
+/// ahead of their answers, as a node overlapping its members' flushes does (`Overlapping`;
+/// audit §5.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Takes {
     Waiting,
@@ -1612,23 +1665,22 @@ impl Directed {
             }
         }
         let mut cut = None;
+        let now = u64::try_from(self.rounds).unwrap() * STEP_NS;
         for &id in &ids {
-            let overlap = id == case.target && takes == Takes::Overlapping;
+            let settle = !(id == case.target && takes == Takes::Overlapping);
             let Some(r) = self.replica(id) else {
                 continue;
             };
             if r.is_fenced() {
                 continue;
             }
-            let out = if overlap { r.begin() } else { r.drive() };
-            match out {
-                Ok(out) => {
+            let mut out = Out::default();
+            match drive(r, now, settle, &mut out) {
+                Ok(_) => {
                     self.wire.extend(out.messages);
-                    for a in out.applied {
-                        for (session, serial, answer) in a.answers {
-                            if session == 0 && matches!(answer, Answer::Registered { .. }) {
-                                self.registered.insert((id, serial));
-                            }
+                    for a in out.answers {
+                        if a.session == 0 && matches!(a.answer, Answer::Registered { .. }) {
+                            self.registered.insert((id, a.serial));
                         }
                     }
                 }
@@ -1639,15 +1691,12 @@ impl Directed {
                 Err(e) => panic!("drive on {id}: {e}"),
             }
             // The operator acts on what the members say, whenever it looks: here, while the
-            // target's write may still be flushing.
+            // target's writes may still be out.
             self.operate(case);
             // The moment a replacement is done is where its run cuts every member's power:
             // nothing more is driven or delivered.
             if self.done && case.replacing.is_some() {
                 return cut;
-            }
-            if overlap && let Some(r) = self.replica(id) {
-                r.wait_persisted();
             }
         }
         let sent = std::mem::take(&mut self.wire);
@@ -1657,10 +1706,7 @@ impl Directed {
                 match r.step(m) {
                     Ok(())
                     | Err(
-                        ReplicaError::Refused(_)
-                        | ReplicaError::Stalled
-                        | ReplicaError::MessagesHeld { .. }
-                        | ReplicaError::Fenced(_),
+                        ReplicaError::Refused(_) | ReplicaError::Stalled | ReplicaError::Fenced(_),
                     ) => {}
                     Err(e) => panic!("step on {to}: {e}"),
                 }
@@ -1783,7 +1829,7 @@ fn directed(case: &Case, takes: Takes, ops: Option<u64>, seed: u64) -> bool {
     let mut settled = false;
     for _ in 0..PATIENT_ROUNDS {
         let before = (r.applied(), r.configuration().clone());
-        r.drive().unwrap();
+        drive(r, 0, true, &mut Out::default()).unwrap();
         if (r.applied(), r.configuration().clone()) == before {
             settled = true;
             break;
@@ -2032,7 +2078,7 @@ fn replaced(target: u64, lost: u64, takes: Takes, ops: Option<u64>, seed: u64) -
         let mut settled = false;
         for _ in 0..PATIENT_ROUNDS {
             let before = (r.applied(), r.configuration().clone());
-            r.drive().unwrap();
+            drive(r, 0, true, &mut Out::default()).unwrap();
             if (r.applied(), r.configuration().clone()) == before {
                 settled = true;
                 break;

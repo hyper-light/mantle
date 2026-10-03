@@ -1,10 +1,11 @@
 //! A range's group as real processes on real disks (docs/design/replica.md §5): each member an OS
-//! process of its own, this test binary launched again with `MANTLE_RANGE_MEMBER` set, its log on a
-//! real file through the direct-I/O file layer and the platform's full flush, speaking to the
-//! supervisor over TCP on the loopback interface. The supervisor is the network. It runs the group
-//! in rounds, as the simulation's directed runs do (`tests/sim.rs`): each round every member takes
-//! what was sent to it the round before, ticks once and works until it has nothing left to do,
-//! its writes durable; and it kills members with `SIGKILL`.
+//! process of its own, this test binary launched again with `MANTLE_RANGE_MEMBER` set, its replica
+//! on hyper-log's group handle over a real file through the direct-I/O file layer and the
+//! platform's full flush, woken by its log's answers, speaking to the supervisor over TCP on the
+//! loopback interface. The supervisor is the network. It runs the group in rounds, as the
+//! simulation's directed runs do (`tests/sim.rs`): each round every member takes what was sent to
+//! it the round before, ticks once and works until it has nothing left to do, its writes durable;
+//! and it kills members with `SIGKILL`.
 //!
 //! D-1's first test (hyper-raft docs/durable.md §11) on real processes: a replacement of a lost
 //! member (`membership::Replacement`), one member killed inside the window between a change's
@@ -36,11 +37,14 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{Receiver, sync_channel};
+use std::task::Waker;
+use std::time::Instant;
 
-use focal_raft::wire::Record;
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_log::{Config as LogConfig, Log, Waits};
+use hyper_raft::wire::Record;
 use mantle_codec::{Reader, Writer};
 use mantle_meta::apply::Layer;
 use mantle_meta::engine::{Engine, Model};
@@ -48,7 +52,7 @@ use mantle_meta::name;
 use mantle_meta::session::Rules;
 use mantle_meta::wire::{Answer, Command as Op, Entry, Sessioned};
 use mantle_range::membership::{Next, Replacement};
-use mantle_range::{ConfState, Message, Range, Replica, ReplicaError, Settings};
+use mantle_range::{ConfState, GroupStore, Message, Range, Replica, ReplicaError, Settings};
 
 const GROUP: u128 = 0x0072_616e_6765;
 
@@ -153,7 +157,7 @@ struct Status {
     leads: bool,
     applied: u64,
     committed: u64,
-    logged: u64,
+    durable: u64,
     /// The replacement it ran as leader is done: every voter knows the final configuration.
     done: bool,
     voters: Vec<u64>,
@@ -181,7 +185,7 @@ impl Status {
             u64::from(self.leads),
             self.applied,
             self.committed,
-            self.logged,
+            self.durable,
             u64::from(self.done),
         ] {
             w.u64(v);
@@ -219,7 +223,7 @@ impl Status {
             leads: v[3] == 1,
             applied: v[4],
             committed: v[5],
-            logged: v[6],
+            durable: v[6],
             done: v[7] == 1,
             voters,
             outgoing,
@@ -278,9 +282,14 @@ fn take_messages(r: &mut Reader<'_>) -> Vec<Message> {
 
 /// The member's side of one process: its log, its replica, and what the supervisor asked of it.
 struct Member {
-    replica: Replica<DeviceFile, Model>,
+    replica: Replica<GroupStore<DeviceFile>, Model>,
     /// The log, which outlives the replica that holds its group's handle.
     log: Log<DeviceFile>,
+    /// Woken once for every write the log answers, its slot leaked once a process.
+    waker: Waker,
+    woken: Receiver<usize>,
+    /// The owner's clock, which the shell times its writes by.
+    epoch: Instant,
     replacing: Option<Replacement>,
     proposed_change_at: Option<u64>,
     done: bool,
@@ -316,10 +325,18 @@ impl Member {
         } else {
             Log::open(file, log_config(), u128::from(id)).unwrap().0
         };
-        let replica = Replica::open(id, GROUP, &log, first_range(), &range(), id).unwrap();
+        let store = mantle_range::claim(&log, GROUP, &range()).unwrap();
+        let replica = Replica::open(id, store, first_range(), &range(), id).unwrap();
+        // A wake a write answered, each taken before the member drives again: the channel holds
+        // what the log's bounded queue may answer at once.
+        let (tell, woken) = sync_channel(1 << 10);
+        let (waker, _) = hyper_measure::wake::waker(usize::try_from(id).unwrap(), tell);
         Self {
             replica,
             log,
+            waker,
+            woken,
+            epoch: Instant::now(),
             replacing: None,
             proposed_change_at: None,
             done: false,
@@ -343,7 +360,7 @@ impl Member {
             leads: r.is_leader(),
             applied: r.applied(),
             committed: r.committed(),
-            logged: r.logged_commit(),
+            durable: r.durable_commit(),
             done: self.done,
             voters: c.voters.clone(),
             outgoing: c.voters_outgoing.clone(),
@@ -353,20 +370,20 @@ impl Member {
     }
 
     /// Works until the replica has nothing left to do, its writes durable, or until it reaches
-    /// the window it was asked to stop at. A unit of work is one `Ready` taken or finished, and
-    /// every input gives at most two (one taken, one that its notice gives), so a round's work
-    /// is bounded by its inputs.
+    /// the window it was asked to stop at. A drive takes at most one `Ready`, and every input
+    /// gives at most two (one taken, one that its notice gives) and a page applied each; a wait
+    /// for the log's answer ends at the answer, which wakes the member once a write. So a
+    /// round's drives are bounded by its inputs.
     fn work(&mut self, inputs: usize, sent: &mut Vec<Message>, stream: &mut TcpStream) {
-        let budget = 2 * (inputs + 1) + 2;
+        let budget = 4 * (inputs + 1) + 4;
         for _ in 0..budget {
-            let out = self.replica.begin().unwrap();
-            let idle = out.messages.is_empty() && out.applied.is_empty() && !out.persisting;
+            let now = u64::try_from(self.epoch.elapsed().as_nanos()).unwrap();
+            let mut out = mantle_range::Output::default();
+            let driven = self.replica.drive(now, &self.waker, &mut out).unwrap();
             sent.extend(out.messages);
-            for a in out.applied {
-                for (session, serial, answer) in a.answers {
-                    if session == 0 && matches!(answer, Answer::Registered { .. }) {
-                        self.registered.insert(serial);
-                    }
+            for a in out.answers {
+                if a.session == 0 && matches!(a.answer, Answer::Registered { .. }) {
+                    self.registered.insert(a.serial);
                 }
             }
             let in_window = self.replica.change_unlogged().unwrap();
@@ -384,13 +401,15 @@ impl Member {
                     std::thread::park();
                 }
             }
-            if out.persisting {
-                self.replica.wait_persisted();
+            if driven.more {
                 continue;
             }
-            if idle {
-                return;
+            if self.replica.in_flight() > 0 {
+                // Nothing more without the log's answer, which wakes the member.
+                self.woken.recv().unwrap();
+                continue;
             }
+            return;
         }
         panic!(
             "member {} still had work after {budget} units",
@@ -404,12 +423,7 @@ impl Member {
         let inputs = deliveries.len() + orders.len() + 1;
         for m in deliveries {
             match self.replica.step(m) {
-                Ok(())
-                | Err(
-                    ReplicaError::Refused(_)
-                    | ReplicaError::Stalled
-                    | ReplicaError::MessagesHeld { .. },
-                ) => {}
+                Ok(()) | Err(ReplicaError::Refused(_) | ReplicaError::Stalled) => {}
                 Err(e) => panic!("step on {}: {e}", self.replica.id()),
             }
         }
@@ -665,7 +679,7 @@ impl Supervisor {
                 }
                 Some(WINDOW) => {
                     let at = Status::take(&mut r);
-                    assert!(at.committed > at.logged, "{at:?}");
+                    assert!(at.committed > at.durable, "{at:?}");
                     windows.push(id);
                     // Killed inside the window, and started again from its device.
                     self.kill(id);

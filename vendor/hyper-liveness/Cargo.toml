@@ -1,0 +1,28 @@
+[package]
+name = "hyper-liveness"
+description = "Node-pair liveness, sans-io: one heartbeat stream per pair of nodes sharing a consensus group, shared by every group they share, each heartbeat proving a recent durable flush, each pair judged by an NFD-E detector configured from measurement (docs/timing.md L-3)"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/hyper-light/hyper-raft"
+rust-version = "1.98"
+publish = false
+
+[dependencies]
+hyper-timing = { path = "../hyper-timing" }
+
+[dev-dependencies]
+# Left out of the snapshot, which does not vendor them (vendor/UPSTREAM.md):
+# `hyper-swim`, `hyper-datagram`, `hyper-tokio`, `hyper-sim`, which this crate's own tests use.
+hyper-measure = { path = "../hyper-measure" }
+# The baselines of the cost benchmark: the Raft core mantle and focal run their per-group
+# heartbeats on, and slates' detector.
+hyper-raft = { path = "../hyper-raft" }
+# The real-process test's members keep their run as an owner does, a record kept whole.
+hyper-block = { path = "../hyper-block" }
+tokio = { version = "1.48", default-features = false, features = ["net", "time", "rt"] }
+tempfile = "3.20"
+proptest = "1.11"
+
+# A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside any consumer workspace.
+[workspace]

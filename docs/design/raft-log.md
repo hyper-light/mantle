@@ -75,7 +75,7 @@ a drive whose unit is 16 or 64 KiB made the drive rewrite its unit once per fram
     reclamation (§5). They replace nothing past them.
   - `HardState { term, vote, commit }`. The latest wins.
   - `Start { index, term }`: the group's log now starts after `index`, whose term is
-    `term`, which the log keeps so that focal-raft can ask the term of the entry before
+    `term`, which the log keeps so that the Raft core can ask the term of the entry before
     its first. The replica's engine made the entries before it durable, or the replica
     installed a snapshot there; a snapshot that discards what follows it comes with
     `Entries` of none from `index + 1`.
@@ -497,11 +497,17 @@ rate. The writer's sweep reads the tail segment through the same window.
 
 ## 7. What a replica reads
 
-A replica wraps its group's view in focal-raft's `Storage` trait: `initial_state` from the
-hard state, the engine's configuration and the held proposals; `entries`, `term`,
-`first_index` and `last_index` from the group's slots; and `snapshot` from the engine
-(07 §1.2). The view also carries the group's uncertainty mark, if any (§6). The log serves the view, and the replica updates it through the log only after a
-submission is durable, since `Storage` is what is durable, as the core reads it.
+A replica's core reads its group through hyper-durable's group handle, `GroupStore`, which
+the shell serves as the core's `Storage` trait (hyper-raft `docs/durable.md` §8):
+`initial_state` from the hard state the log held when the member opened, the configuration the
+range's engine holds and the held proposals; `entries`, `term`, `first_index` and
+`last_index` from the group's slots; `any_entry` by walking the slots a segment's bytes at a
+time without taking the entries; and `snapshot` from the image the shell last prepared
+(07 §1.2). The handle's view also carries the group's uncertainty mark, if any (§6). The
+log moves the view only as it answers a write, since `Storage` is what is durable, as the
+core reads it. The handle writes entries as the replica's store did before it (an entry's
+kind, its context's length, its context and its data), so a log written before the shell
+opens under it.
 
 Entries no longer in memory are read from the file, a run of them whose blocks touch in one
 read, as an update's entries lie together in its frame; each is verified as its group's entry

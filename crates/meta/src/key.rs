@@ -26,13 +26,13 @@ pub mod marker {
     pub const LINEAGE: u8 = b'l';
     /// How many sessions the range holds.
     pub const SESSIONS: u8 = b'n';
-    /// The last snapshot a member installed.
-    pub const INSTALLED: u8 = b'p';
     /// The Name range's queue of released files.
     pub const RELEASED: u8 = b'q';
     /// The group's configuration.
     pub const CONFIGURATION: u8 = b'r';
     pub const SESSION: u8 = b's';
+    /// The term of the last entry the range applied, which its replica keeps beside the index.
+    pub const TERM: u8 = b't';
     /// The File range's files, and the Block range's blocks, whose handover the sweep has
     /// not yet settled.
     pub const UNSETTLED: u8 = b'u';
@@ -47,10 +47,10 @@ pub mod marker {
         LINEAGE,
         UNSETTLED,
         SESSIONS,
-        INSTALLED,
         RELEASED,
         CONFIGURATION,
         SESSION,
+        TERM,
     ];
 }
 /// The rows of the range's layer.

@@ -2,39 +2,12 @@
 //! that a restart tells the core the configuration of the state it opens at
 //! (docs/design/replica.md §4).
 
-use focal_raft::proto::ConfState;
+use hyper_raft::proto::ConfState;
 use mantle_codec::{Reader, Writer};
 use mantle_meta::key::{LOCAL, marker};
 
 /// The row that holds the configuration.
 pub const ROW: &[u8] = &[LOCAL, marker::CONFIGURATION];
-
-/// The row that holds the index and term of the last snapshot installed.
-pub const INSTALLED: &[u8] = &[LOCAL, marker::INSTALLED];
-
-/// A snapshot point's bytes: its index and term, and their CRC-32C.
-pub fn encode_point(index: u64, term: u64) -> Vec<u8> {
-    let mut w = Writer::default();
-    w.u64(index);
-    w.u64(term);
-    let crc = mantle_crc::crc32c(w.as_slice());
-    w.u32(crc);
-    w.into_vec()
-}
-
-pub fn decode_point(bytes: &[u8]) -> Option<(u64, u64)> {
-    let body_len = bytes.len().checked_sub(4)?;
-    let (body, crc) = bytes.split_at(body_len);
-    if mantle_crc::crc32c(body) != u32::from_le_bytes(crc.try_into().ok()?) {
-        return None;
-    }
-    let mut r = Reader::new(body);
-    let point = (r.u64()?, r.u64()?);
-    if r.remaining() != 0 {
-        return None;
-    }
-    Some(point)
-}
 
 const FORMAT: u8 = 1;
 

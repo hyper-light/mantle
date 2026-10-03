@@ -1,36 +1,40 @@
-//! One member of one range's Raft group (docs/design/replica.md): focal-raft's core, its
-//! group's view of the device's log, the range's engine and its layer's state machine.
+//! One member of one range's Raft group (docs/design/replica.md): hyper-raft's durable shell
+//! (`hyper_durable::Replica`, hyper-raft docs/durable.md) over the member's group of the device's
+//! log (`GroupStore`) and the range's engine and layer (`RangeMachine`).
+//!
+//! The shell keeps the order Raft's safety needs (docs/durable.md §3): a leader's appends leave
+//! before its own write, a follower's answers and every vote after the write that holds what they
+//! say, a change of configuration applies only once the member's durable commit covers it (the
+//! commit fence), and the member opens on what its log and engine hold durably. It takes the
+//! core's readies ahead of their persistence to the log's depth, steps messages and ticks while
+//! writes are out, repairs a marked member by its lost entries, and elects a marked member on its
+//! log where the others can be a quorum. The range elects on its owner's ticks (docs/durable.md
+//! §8) until its node carries the node-pair liveness stream.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::task::Waker;
+use std::time::Duration;
 
-use focal_raft::proto::{
-    self, ConfChangeV2, ConfState, Entry, EntryType, Message, MessageType, Snapshot,
-    SnapshotMetadata,
-};
-use focal_raft::wire::Record;
-use focal_raft::{RawNode, StateRole};
 use hyper_block::block::BlockFile;
-use hyper_log::{Entries, Log, LogError, Proposal, Start, Update};
-use mantle_meta::apply::{Layer, apply_entry};
-use mantle_meta::engine::{Engine, Write};
+use hyper_durable::{ClaimError, Driven, GroupStore, LogStore, OpenError, Unbounded};
+use hyper_log::Log;
+use hyper_raft::proto::{ConfChangeV2, ConfState, Entry, EntryType, Message};
+use hyper_raft::wire::Record;
+use hyper_raft::{Config, Elections};
+use mantle_meta::apply::Layer;
+use mantle_meta::engine::Engine;
 use mantle_meta::session::Rules;
-use mantle_meta::wire::{self, Answer};
+use mantle_meta::wire;
 
 use crate::error::ReplicaError;
+use crate::machine::{Applied, RangeMachine};
 use crate::membership::Replacement;
-use crate::store::{self, LogStore};
-use crate::{conf, image};
 
-/// Readies one call to [`Replica::drive`] handles at most: one, the largest unit of work a
-/// range's turn carries. The node shares its shards among ranges by deficit round robin, whose
-/// work is O(1) a turn and whose fairness holds within one unit when each turn's quantum is at
-/// least the largest unit, "if for all i, Quantum_i ≥ Max" (Shreedhar and Varghese, Theorem
-/// 4.5; docs/research/25 §7), and a `Ready` is bounded by `max_committed_size_per_ready` and
-/// one flow-control window (docs/design/node.md §2.3). The caller drives again for the rest.
-const DRIVE_BUDGET: usize = 1;
+/// What a drive gives out, in buffers the owner keeps and reuses: messages to send, the answers
+/// of the commands applied, and the reads confirmed and applied far enough to serve.
+pub type Output = hyper_durable::Output<Applied>;
 
-/// What every member of a range shares: its layer, the bounds of its sessions, the
-/// configuration it starts from, and how its core runs.
+/// What every member of a range shares: its layer, the bounds of its sessions, the configuration
+/// it starts from, and how its core runs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Range {
     pub layer: Layer,
@@ -53,212 +57,32 @@ pub struct Settings {
     pub max_inflight_msgs: usize,
     /// Bytes of proposals not yet committed a leader takes at most.
     pub max_uncommitted_size: u64,
-    /// Bytes of committed entries one ready gives to apply at most.
+    /// Bytes of committed entries one drive applies at most.
     pub max_committed_size_per_ready: u64,
     /// Bytes of one entry at most, the same on every member: every member's log holds such an
-    /// entry in one frame, so a ready of any size can be written in parts
-    /// ([`Log::parts`]), and the leader refuses a larger proposal.
+    /// entry in one frame, so a write of any size can be made in parts, and the leader refuses a
+    /// larger proposal.
     pub max_entry_bytes: u64,
 }
 
-/// What one call to [`Replica::drive`] produced.
-#[derive(Debug, Default)]
-pub struct Drive {
-    /// Messages to send, in order.
-    pub messages: Vec<Message>,
-    /// The normal entries applied.
-    pub applied: Vec<Applied>,
-    /// Reads a quorum confirmed: each read's context and the index the replica must have
-    /// applied before it answers from its rows (06 §A1).
-    pub reads: Vec<(u64, Vec<u8>)>,
-    /// Reads whose round no quorum confirmed within an election timeout, as when the leader
-    /// has lost its quorum or its leadership: each is answered by its caller, which may ask
-    /// again. Dropped without an answer, a read's caller waited for good.
-    pub unconfirmed: Vec<Vec<u8>>,
-    /// The log refused the ready being written for want of room, answering this: the ready
-    /// waits, whole, in the replica, which takes no call but `drive` and `compact` until the
-    /// node frees room and drives again (audit S04).
-    pub stalled: Option<LogError>,
-    /// From [`Replica::begin`]: a ready's update, or a write of the commit alone, is on its
-    /// way to being durable. The messages above may go now. Until the update is durable, which `drive` waits for, the
-    /// replica holds the messages and ticks it is given, to take once the ready is done, and
-    /// refuses proposals, reads and campaigns with `Stalled`.
-    pub persisting: bool,
-}
+/// The shell's period for a commit no write has stated (`hyper_durable::Settings::quiet`): none.
+/// The shell writes such a commit alone so that a member acting at its next start on applied
+/// state reopens with it (docs/durable.md §4.1); no entry of a range is acted on at start
+/// (`RangeMachine::acts_at_start`), the engine's durable index is part of the durable commit, and
+/// a restart learns the rest from its group and its log.
+const QUIET: Duration = Duration::MAX;
 
-/// A normal entry applied: its index, and each command's session, serial and answer, in
-/// order, so a gateway finds the answer to its command.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Applied {
-    pub index: u64,
-    pub answers: Vec<(u64, u64, Answer)>,
-}
-
-pub struct Replica<F: BlockFile + 'static, E: Engine> {
-    node: RawNode<LogStore<F>>,
-    engine: E,
-    layer: Layer,
-    rules: Rules,
-    applied: u64,
-    /// The configuration as of `applied`.
-    conf: ConfState,
-    /// An index at or past the entry that made `conf`: the entry itself once this member
-    /// applies a change, and before that the point it opened at or installed.
-    conf_index: u64,
-    max_entry_bytes: u64,
-    /// A ready the log has yet to take whole, which the core counts as out (07 §1.2), or a
-    /// write of the commit alone (`Replica::commit_write`).
-    staged: Option<Staged>,
-    /// The commit the member's log states durably: the greatest commit of its writes answered
-    /// durable, or what it opened with.
-    logged_commit: u64,
-    /// Committed entries held behind the commit fence (hyper-raft docs/durable.md §4.1, I5):
-    /// from the first change of configuration past `logged_commit`, in order. A configuration
-    /// takes effect as the member applies it, and a commit is volatile (Ongaro, thesis §3.8):
-    /// applied on a commit its log does not state, a change is undone by a crash while what
-    /// others did on the member's word stands, as when the operator stops a member the change
-    /// removed and the member reopens counting it (focal F17). So a change applies only once
-    /// the log states its commit, and what follows it waits behind it. The fence holds at most
-    /// one ready's committed entries and its light ready's, `2 · max_committed_size_per_ready`
-    /// bytes: while it holds any, the core is asked for no ready until a write states the
-    /// commit (`drive_ready`).
-    behind_fence: VecDeque<Entry>,
-    /// Messages and ticks that came while the ready's update flushed, taken in order once it
-    /// is done (`Held`).
-    held: Held,
-    /// The bytes of messages one other member may have held: a flow-control window of
-    /// appends (`Held`).
-    window_bytes: u64,
-    /// The most ticks held while a ready flushes: the longest election timeout the core may
-    /// draw, `2 · election_tick` (focal-consensus `set_randomized_election_timeout`), which
-    /// the heartbeat timeout is shorter than. The core acts on a timer at most once in that
-    /// many ticks, so more held ticks would replay as a burst of campaigns, each with its
-    /// messages, for one stall of the device.
-    max_held_ticks: u64,
-    /// The last entry this member acknowledged, when its log may lack it: a last frame no
-    /// longer read, whose term and vote recovery restored and whose entries it marked
-    /// (docs/design/raft-log.md §6). Until the log holds them again, or an entry of a later
-    /// term, the member judges a candidate against this entry rather than its shorter log,
-    /// as it would have with the entries, and does not campaign, since it cannot lead
-    /// without them.
-    uncertain: Option<Start>,
-    /// Reads asked of the group, confirmed a round at a time.
-    reads: Rounds,
-    /// Ticks a round of reads may be out before it is taken as lost: an election timeout.
-    round_ticks: u64,
-    /// Snapshots' fates reported while a ready was out, the latest for each member, taken
-    /// once it is done: replication to a member pauses until its snapshot's fate is known, so
-    /// a report is never refused, as a message or a proposal may be. At most one a member.
-    reports: BTreeMap<u64, bool>,
-    /// Why the replica is fenced: its log failed to make a write durable, or refused one for a
-    /// reason no retry clears. It then takes no call that could acknowledge anything
-    /// (`ReplicaError::Fenced`).
-    fenced: Option<String>,
-    /// The leader to ask for a snapshot reaching the uncertainty mark: its heartbeat named a
-    /// commit past this member's log, so it counts the member as holding entries the member
-    /// lost, and will never send them again (`Replica::repair`).
-    repair: Option<u64>,
-}
-
-/// Reads confirmed a round at a time (audit §5.5). One round is out at a time, and one quorum's
-/// confirmation serves every read it carries. A read asked while a round is out waits for the
-/// next: the round's index is the commit index when it began, which may predate a write the
-/// read must see (06 §A1.5), so a read never joins a round begun before it. A round whose
-/// confirmation never comes, its leader gone or its message lost, is dropped after an election
-/// timeout's ticks, its reads with it, as a lost message's are, and their callers ask again.
-#[derive(Debug, Default)]
-struct Rounds {
-    /// The round out: its number, the ticks it has been out, and the reads it carries.
-    out: Option<(u64, u64, Vec<Vec<u8>>)>,
-    /// Reads waiting for the next round, and their bytes.
-    waiting: Vec<Vec<u8>>,
-    waiting_bytes: u64,
-    /// The reads of a round given up on, until `drive` gives them back: one round's at most,
-    /// since a round starts only once the last is confirmed or given up.
-    given_up: Vec<Vec<u8>>,
-    next: u64,
-}
-
-/// The context a round of reads is asked under: its number, under a tag no other context of
-/// the replica's takes.
-fn round_context(number: u64) -> Vec<u8> {
-    let mut context = ROUND.to_vec();
-    context.extend_from_slice(&number.to_be_bytes());
-    context
-}
-
-fn round_of(context: &[u8]) -> Option<u64> {
-    let number = context.strip_prefix(ROUND)?;
-    Some(u64::from_be_bytes(number.try_into().ok()?))
-}
-
-const ROUND: &[u8] = b"mantle-read-round:";
-
-/// Messages and ticks that come while a ready's update flushes. focal-raft's core takes no
-/// call while a ready is out (07 §1.2, `RawNode::operate`), and focal's own durable shell
-/// leaves its host to retain what comes meanwhile (07 §2.3); etcd's node keeps stepping and
-/// ticking between a ready and its advance (docs/design/replica.md §3). Refused, every answer
-/// to a leader under steady load came during a flush and was lost, and nothing committed.
-///
-/// Each message keeps the ticks that came before it, so the core sees them in the order they
-/// came. Ticks are counted, never refused: a clock that stood still for every flush left a
-/// loaded leader without heartbeats. Messages hold at most, for each other member of the
-/// configuration, one flow-control window of appends: `max_inflight_msgs` of
-/// `max_size_per_msg` bytes and one entry past it, which the core admits alone. A member's
-/// heartbeats, votes and answers are small beside them. Past the bound a message is refused,
-/// as the network may drop it; Raft's retries cover a lost message (Ongaro and Ousterhout,
-/// ATC 2014, §5.1).
-#[derive(Debug, Default)]
-struct Held {
-    /// Each message with the ticks that came between it and the one before.
-    messages: VecDeque<(u64, Message)>,
-    /// What the messages take: their encoded bytes and their in-memory frame.
-    bytes: u64,
-    /// Ticks after the last message.
-    ticks: u64,
-    /// Ticks held in all, before messages and after, at most `Replica::max_held_ticks`.
-    all_ticks: u64,
-}
-
-/// What a held message is charged: its encoding and the frame that holds it. A charge past
-/// u64::MAX saturates, which passes every bound and is refused, as the true charge would be.
-fn held_bytes(message: &Message) -> u64 {
-    let frame = u64::try_from(std::mem::size_of::<Message>()).unwrap_or(u64::MAX);
-    u64::try_from(message.encoded_len())
-        .unwrap_or(u64::MAX)
-        .saturating_add(frame)
-}
-
-/// A ready being made durable, or `None` for a write of the commit alone: its update's parts
-/// not yet durable, in order, each fitting a frame, whether the first is out on the group's
-/// handle, and the log's answer once it has been waited for.
-struct Staged {
-    ready: Option<focal_raft::Ready>,
-    parts: VecDeque<Update>,
-    out: bool,
-    answered: Option<Result<(), LogError>>,
-}
-
-/// Where writing a ready's parts got to.
-enum Persisted {
-    Done(Option<focal_raft::Ready>),
-    /// A part is submitted and not yet durable: the ready waits for the log's flush.
-    Flushing(Staged),
-    /// The log refused a part for want of room: the ready waits with the parts left.
-    Waiting(Staged, LogError),
-}
-
-/// Whether a member's log can hold to the range's settings (audit S04). An entry of the
-/// range's largest must fit one frame, so a ready of any size can be written in parts. And a
-/// group compacted to its applied state retains at most one ready's entries: a leader's
-/// uncommitted proposals, or the appends a follower has in flight, and one entry past either
-/// bound, which the core admits alone. The group's bounds must hold such a ready, in bytes
-/// and in entries of the fewest bytes, or a ready refused for room could wait for good.
+/// Whether a member's log can hold to the range's settings (audit S04). An entry of the range's
+/// largest must fit one frame, so a write of any size can be made in parts. And a group compacted
+/// to its applied state retains at most one write's entries: a leader's uncommitted proposals, or
+/// the appends a follower has in flight, and one entry past either bound, which the core admits
+/// alone. The group's bounds must hold so much, in bytes and in entries of the fewest bytes, or a
+/// write refused for room could wait for good.
 fn check_settings<F: BlockFile + 'static>(
     settings: &Settings,
     log: &Log<F>,
 ) -> Result<(), ReplicaError> {
-    let overhead = u64::try_from(store::ENTRY_OVERHEAD).unwrap_or(u64::MAX);
+    let overhead = u64::try_from(hyper_durable::ENTRY_OVERHEAD).unwrap_or(u64::MAX);
     let largest = settings.max_entry_bytes.checked_add(overhead);
     let room = u64::try_from(log.entry_room()?).unwrap_or(u64::MAX);
     if largest.is_none_or(|b| b > room) {
@@ -286,131 +110,109 @@ fn check_settings<F: BlockFile + 'static>(
     Ok(())
 }
 
-/// Whether the log refused a write for want of room another write frees: the group's own
-/// retained entries, the log's segments, or its groups.
-fn waits_for_room(e: &LogError) -> bool {
-    matches!(
-        e,
-        LogError::Backlog(_) | LogError::Full | LogError::TooManyGroups(_) | LogError::Busy
-    )
+fn shell(e: hyper_durable::ReplicaError) -> ReplicaError {
+    match e {
+        hyper_durable::ReplicaError::Refused(e) => ReplicaError::Refused(e),
+        hyper_durable::ReplicaError::Stalled => ReplicaError::Stalled,
+        hyper_durable::ReplicaError::Marked => ReplicaError::Uncertain,
+        // The range's replicas run under no budget (`Unbounded`), which refuses nothing.
+        hyper_durable::ReplicaError::Budget(bytes) => {
+            ReplicaError::Stopped(format!("a budget refused {bytes} bytes"))
+        }
+        hyper_durable::ReplicaError::Fenced(cause) => ReplicaError::Fenced(cause.to_string()),
+    }
 }
 
-impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
-    /// Opens member `id` of `range` whose records the log keeps under `group`, at the state
-    /// `engine` holds durably (docs/design/replica.md §4). `seed` draws its election
-    /// timeouts.
+fn opened(e: OpenError) -> ReplicaError {
+    match e {
+        OpenError::Core(e) => e.into(),
+        other => ReplicaError::Stopped(other.to_string()),
+    }
+}
+
+/// The member's group of the device's log (hyper-log's group handle, `GroupStore`): claimed for
+/// it once the range's settings are checked against the log. From here the member writes and
+/// reads its group through it alone, and the log refuses the group's writes from anyone else. A
+/// group the log found damaged is served to no one but its removal ([`remove`]): the member is
+/// rebuilt under a new identity (docs/design/raft-log.md §6).
+pub fn claim<F: BlockFile + 'static>(
+    log: &Log<F>,
+    group: u128,
+    range: &Range,
+) -> Result<GroupStore<F>, ReplicaError> {
+    check_settings(&range.settings, log)?;
+    GroupStore::claim(log, group).map_err(|e| match e {
+        ClaimError::Damaged => ReplicaError::Damaged,
+        ClaimError::Log(e) => ReplicaError::Log(e),
+    })
+}
+
+/// Removes every record of a damaged group from `log`, before a member under a new identity opens
+/// in its place ([`Replica::rebuild`]).
+pub fn remove<F: BlockFile + 'static>(log: &Log<F>, group: u128) -> Result<(), ReplicaError> {
+    Ok(GroupStore::remove(log, group)?)
+}
+
+pub struct Replica<L: LogStore, E: Engine> {
+    shell: hyper_durable::Replica<L, RangeMachine<E>, Unbounded>,
+    max_entry_bytes: u64,
+}
+
+impl<L: LogStore, E: Engine> Replica<L, E> {
+    /// Opens member `id` of `range` over its group's store (a group of the device's log,
+    /// [`claim`]), at the state `engine` holds durably (docs/design/replica.md §4): the shell
+    /// finishes first what a crash left between the log and the engine. `seed` draws its
+    /// election timeouts.
     pub fn open(
         id: u64,
-        group: u128,
-        log: &Log<F>,
+        store: L,
         engine: E,
         range: &Range,
         seed: u64,
     ) -> Result<Self, ReplicaError> {
-        let (layer, rules, boot, settings) =
-            (range.layer, range.rules, &range.boot, &range.settings);
-        // A group the log found damaged is served to no one but its removal: the member is
-        // rebuilt under a new identity (docs/design/raft-log.md §6).
-        match log.view(group) {
-            Err(LogError::Damaged(_)) => return Err(ReplicaError::Damaged),
-            Err(e) => return Err(e.into()),
-            Ok(_) => {}
-        }
-        let conf = match engine.get(conf::ROW)? {
-            Some(bytes) => conf::decode(&bytes)
-                .ok_or_else(|| ReplicaError::Stopped("the configuration does not decode".into()))?,
-            None => boot.clone(),
+        let s = &range.settings;
+        let machine = RangeMachine::open(engine, range.layer, range.rules, &range.boot)?;
+        let settings = hyper_durable::Settings {
+            core: Config {
+                election_tick: s.election_tick,
+                heartbeat_tick: s.heartbeat_tick,
+                max_size_per_msg: s.max_size_per_msg,
+                max_inflight_msgs: s.max_inflight_msgs,
+                max_uncommitted_size: s.max_uncommitted_size,
+                max_committed_size_per_ready: s.max_committed_size_per_ready,
+                // Pre-vote and check-quorum together keep a partitioned member from deposing a
+                // healthy leader and a leader cut off from stepping down late (06 §A1).
+                check_quorum: true,
+                pre_vote: true,
+                seed,
+                ..Config::new(id)
+            },
+            elections: Elections::Ticks,
+            quiet: QUIET,
         };
-        check_settings(settings, log)?;
-        let applied = engine.applied();
-        complete_install(log, group, &engine)?;
-        commit_applied(log, group, applied)?;
-        let config = focal_raft::Config {
-            election_tick: settings.election_tick,
-            heartbeat_tick: settings.heartbeat_tick,
-            applied,
-            max_size_per_msg: settings.max_size_per_msg,
-            max_inflight_msgs: settings.max_inflight_msgs,
-            max_uncommitted_size: settings.max_uncommitted_size,
-            max_committed_size_per_ready: settings.max_committed_size_per_ready,
-            // Pre-vote and check-quorum together keep a partitioned member from deposing a
-            // healthy leader and a leader cut off from stepping down late (06 §A1).
-            check_quorum: true,
-            pre_vote: true,
-            seed,
-            ..focal_raft::Config::new(id)
-        };
-        // From here the member writes and reads its group through the group's handle alone.
-        let handle = log.group(group)?;
-        let store = LogStore::new(handle, log.config().segment_bytes, conf.clone());
-        let window_bytes = u64::try_from(settings.max_inflight_msgs)
-            .ok()
-            .and_then(|n| n.checked_mul(settings.max_size_per_msg))
-            .and_then(|b| b.checked_add(settings.max_entry_bytes))
-            .ok_or(ReplicaError::Config(
-                "a flow-control window of appends past u64 bytes",
-            ))?;
-        let max_held_ticks = u64::try_from(settings.election_tick)
-            .ok()
-            .and_then(|t| t.checked_mul(2))
-            .ok_or(ReplicaError::Config("an election timeout past u64 ticks"))?;
-        let uncertain = uncertain_mark(&store)?;
-        let logged_commit = store
-            .group
-            .view()?
-            .and_then(|v| v.hard_state)
-            .map_or(0, |h| h.commit);
-        let node = RawNode::new(&config, store)?;
-        let mut replica = Self {
-            node,
-            engine,
-            layer,
-            rules,
-            applied,
-            conf,
-            conf_index: applied,
-            max_entry_bytes: settings.max_entry_bytes,
-            staged: None,
-            logged_commit,
-            behind_fence: VecDeque::new(),
-            held: Held::default(),
-            window_bytes,
-            max_held_ticks,
-            uncertain,
-            reads: Rounds::default(),
-            round_ticks: u64::try_from(settings.election_tick).unwrap_or(u64::MAX),
-            reports: BTreeMap::new(),
-            fenced: None,
-            repair: None,
-        };
-        // A log compacted before the restart can serve a lagging member only by snapshot.
-        let compacted = replica.node.store().group.bounds()?.0.index > 0;
-        if compacted {
-            replica.prepare()?;
-        }
-        Ok(replica)
+        let shell =
+            hyper_durable::Replica::open(&settings, store, machine, Unbounded).map_err(opened)?;
+        Ok(Self {
+            shell,
+            max_entry_bytes: s.max_entry_bytes,
+        })
     }
 
-    /// Rebuilds a member whose open found it [`ReplicaError::Damaged`]: the group's records
-    /// on `log`, which the log serves to no one, are removed, and a member under the identity
-    /// `joining` opens in their place, from `engine`, a new member's, and catches up from its
-    /// peers. The group's leader runs the replacement returned, which adds `joining` as a
-    /// learner and swaps it for `failed` once it has caught up (docs/design/replica.md §6).
+    /// Rebuilds a member whose claim found it [`ReplicaError::Damaged`]: once the group's records,
+    /// which the log serves to no one, are removed ([`remove`]) and the group claimed again, a
+    /// member under the identity `joining` opens over `store` from `engine`, a new member's, and
+    /// catches up from its peers. The group's leader runs the replacement returned, which adds
+    /// `joining` as a learner and swaps it for `failed` once it has caught up
+    /// (docs/design/replica.md §6).
     ///
-    /// `failed` never opens again: it may have voted in terms its log no longer shows, and
-    /// opened afresh it would vote in them again. So the node records `joining` as the
-    /// group's member on this device before it calls this, and a restart after the removal,
-    /// finding the group empty, opens `joining` again by calling this again.
-    ///
-    /// `log` is borrowed as [`Replica::open`] borrows it: one log serves every range's member
-    /// on the device, and a member keeps only its group's handle on it (hyper-log
-    /// `GroupLog`), which reaches the log's owner thread by message. The handle answers
-    /// `Closed` once the log has stopped.
+    /// `failed` never opens again: it may have voted in terms its log no longer shows, and opened
+    /// afresh it would vote in them again. So the node records `joining` as the group's member on
+    /// this device before it removes the records, and a restart after the removal, finding the
+    /// group empty, opens `joining` again by calling this again.
     pub fn rebuild(
         failed: u64,
         joining: u64,
-        group: u128,
-        log: &Log<F>,
+        store: L,
         engine: E,
         range: &Range,
         seed: u64,
@@ -418,90 +220,95 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
         let replacement = Replacement::new(failed, joining).ok_or(ReplicaError::Config(
             "a rebuilt member takes an identity never used, not its own or zero",
         ))?;
-        log.write_waiting(
-            group,
-            Update {
-                remove: true,
-                ..Update::default()
-            },
-        )?;
-        let replica = Self::open(joining, group, log, engine, range, seed)?;
+        let replica = Self::open(joining, store, engine, range, seed)?;
         Ok((replica, replacement))
     }
 
     pub fn id(&self) -> u64 {
-        self.node.raft.id()
-    }
-
-    /// Whether the replica is fenced (`ReplicaError::Fenced`).
-    pub fn is_fenced(&self) -> bool {
-        self.fenced.is_some()
-    }
-
-    /// `Fenced` once the replica is: every call that could change what it acknowledges.
-    fn live(&self) -> Result<(), ReplicaError> {
-        match &self.fenced {
-            Some(cause) => Err(ReplicaError::Fenced(cause.clone())),
-            None => Ok(()),
-        }
-    }
-
-    /// Fences the replica after its log failed to make a write durable, or refused one for a
-    /// reason no retry clears. The ready being written, whose acknowledgements wait for that
-    /// write, is dropped with what was held for it, and every call after answers `Fenced`: a
-    /// failed flush leaves each sector it covered durable or not while reads return the new
-    /// bytes (Rebello et al., ATC 2020; docs/research/03 §6), so nothing this process holds says what
-    /// the device kept. The node reopens the log, which recovers what is durable, and opens
-    /// the member afresh from it.
-    fn fence(&mut self, e: &LogError) -> ReplicaError {
-        let cause = e.to_string();
-        self.staged = None;
-        self.behind_fence.clear();
-        self.held = Held::default();
-        self.reports.clear();
-        self.reads = Rounds::default();
-        self.fenced = Some(cause.clone());
-        ReplicaError::Fenced(cause)
+        self.shell.id()
     }
 
     pub fn is_leader(&self) -> bool {
-        self.node.raft.state() == StateRole::Leader
+        self.shell.is_leader()
     }
 
     /// The member this one believes leads, 0 for none.
     pub fn leader(&self) -> u64 {
-        self.node.raft.leader_id()
+        self.shell.leader()
     }
 
     pub fn term(&self) -> u64 {
-        self.node.raft.term()
+        self.shell.term()
     }
 
     /// The last entry applied.
     pub fn applied(&self) -> u64 {
-        self.applied
+        self.shell.applied().index
     }
 
     /// The last entry the member knows committed.
     pub fn committed(&self) -> u64 {
-        self.node.raft.log().committed()
+        self.shell.core().raft.log().committed()
     }
 
-    /// The commit the member's log states durably: what a restart opens knowing committed.
-    pub fn logged_commit(&self) -> u64 {
-        self.logged_commit
+    /// The commit the member's durable state states: its log's, or its engine's durable index,
+    /// whichever is greater. A restart opens knowing it committed.
+    pub fn durable_commit(&self) -> u64 {
+        self.shell.durable_commit()
     }
 
-    /// Whether the member knows a change of configuration committed whose commit its log does
-    /// not state yet: a crash now reopens it without the change applied, whatever it said before
-    /// (docs/design/replica.md §6). The window the real-process test kills a member in.
+    /// The group's configuration as of the last entry applied.
+    pub fn configuration(&self) -> &ConfState {
+        self.shell.configuration()
+    }
+
+    /// Whether this member leads and every voter of its configuration has said its durable
+    /// commit reaches the entry that made it (the core's answers carry the durable commit, R-6),
+    /// the leader counting its own. Configurations take effect as members apply them, and a
+    /// member applies a change only once its durable commit covers it, so until then a voter
+    /// still counts the members the change removed, after a restart as before, and losing the
+    /// leader could leave no quorum it can elect in; after, losing any one member leaves voters
+    /// that elect under this configuration (docs/design/replica.md §6).
+    pub fn configuration_known(&self) -> bool {
+        self.shell.configuration_known()
+    }
+
+    /// Whether this member leads and `member` has confirmed holding every entry it knows
+    /// committed: a member that could vote now without a quorum waiting on it to catch up.
+    pub fn caught_up(&self, member: u64) -> bool {
+        self.shell.caught_up(member)
+    }
+
+    /// Whether the member's log may lack entries it acknowledged (docs/design/replica.md §4).
+    pub fn is_uncertain(&self) -> bool {
+        self.shell.mark().is_some()
+    }
+
+    /// Whether the replica is fenced (`ReplicaError::Fenced`).
+    pub fn is_fenced(&self) -> bool {
+        self.shell.fenced().is_some()
+    }
+
+    /// Whether a write waits for room in the log (`ReplicaError::Stalled`).
+    pub fn is_stalled(&self) -> bool {
+        self.shell.is_stalled()
+    }
+
+    /// Writes out on the log, not yet answered.
+    pub fn in_flight(&self) -> usize {
+        self.shell.in_flight()
+    }
+
+    /// Whether the member knows a change of configuration committed whose commit its durable
+    /// state does not state yet: a crash now reopens it without the change applied, whatever it
+    /// said before (docs/design/replica.md §6). The window the real-process test kills a member in.
     pub fn change_unlogged(&self) -> Result<bool, ReplicaError> {
-        let log = self.node.raft.log();
-        let (logged, committed) = (self.logged_commit, log.committed());
-        if committed <= logged {
+        let log = self.shell.core().raft.log();
+        let (durable, committed) = (self.shell.durable_commit(), log.committed());
+        if committed <= durable {
             return Ok(false);
         }
-        let low = logged
+        let low = durable
             .checked_add(1)
             .ok_or_else(|| ReplicaError::Stopped("an index past u64".into()))?;
         let high = committed
@@ -515,438 +322,74 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
         })?)
     }
 
-    /// The group's configuration as of the last entry applied.
-    pub fn configuration(&self) -> &ConfState {
-        &self.conf
-    }
-
-    /// Whether this member leads and every voter of its configuration has said its log states
-    /// a commit through the entry that made it: a member's answers carry its durable commit,
-    /// not its commit (core step R-6). Configurations take effect as members apply them, and a
-    /// member applies a change only once its log states the commit (`Replica::behind_fence`),
-    /// so until then a voter still counts the members the change removed, after a restart as
-    /// before, and losing the leader could leave no quorum it can elect in; after, losing any
-    /// one member leaves voters that elect under this configuration
-    /// (docs/design/replica.md §6). The leader counts itself: it applied the configuration
-    /// only once its own log stated the commit.
-    pub fn configuration_known(&self) -> bool {
-        let tracker = self.node.raft.tracker();
-        let id = self.id();
-        self.is_leader()
-            && self.conf.voters.iter().all(|&voter| {
-                voter == id
-                    || tracker
-                        .get(voter)
-                        .is_some_and(|p| p.committed_index >= self.conf_index)
-            })
-    }
-
-    /// Whether this member leads and `member` has confirmed holding every entry it knows
-    /// committed: a member that could vote now without a quorum waiting on it to catch up
-    /// (docs/design/replica.md §6). The leader's record of what a member holds rises only on
-    /// the member's own answer.
-    pub fn caught_up(&self, member: u64) -> bool {
-        let committed = self.node.raft.log().committed();
-        self.is_leader()
-            && self
-                .node
-                .raft
-                .tracker()
-                .get(member)
-                .is_some_and(|p| p.matched >= committed)
-    }
-
-    /// A line on the member's state for diagnosis: its term, leader, applied and committed
-    /// indexes, log bounds and prepared snapshot, and its view of every member's progress.
+    /// A line on the member's state for diagnosis: its term, leader, applied, committed and
+    /// durable indexes, log bounds, writes out, and its view of every member's progress.
     pub fn describe(&self) -> String {
-        let view = self.node.store().group.view().ok().flatten();
-        let snap = self
-            .node
-            .store()
-            .snapshot
-            .as_ref()
-            .map(proto::snapshot_index);
-        let progress: Vec<String> = self
-            .node
+        let core = self.shell.core();
+        let progress: Vec<String> = core
             .raft
             .tracker()
             .iter()
             .map(|(id, p)| {
                 format!(
-                    "{id}:m{}n{}s{:?}ps{}",
-                    p.matched, p.next_index, p.state, p.pending_snapshot
+                    "{id}:m{}n{}c{}s{:?}",
+                    p.matched, p.next_index, p.committed_index, p.state
                 )
             })
             .collect();
         format!(
-            "id {} lead {} term {} applied {} commit {} log {:?} snap {:?} progress {:?}",
+            "id {} lead {} term {} applied {} commit {} durable {} out {} mark {:?} progress {:?}",
             self.id(),
             self.leader(),
             self.term(),
-            self.applied,
-            self.node.raft.log().committed(),
-            view.map(|v| (v.start.index, v.last)),
-            snap,
+            self.applied(),
+            self.committed(),
+            self.durable_commit(),
+            self.in_flight(),
+            self.shell.mark(),
             progress
         )
     }
 
     pub fn engine(&self) -> &E {
-        &self.engine
+        self.shell.machine().engine()
     }
 
     /// Takes back the engine, as a crash does with the process that held it.
     pub fn into_engine(self) -> E {
-        self.engine
+        self.shell.into_machine().into_engine()
     }
 
-    /// A tick of the group's clock. One that comes while a ready's update flushes is counted
-    /// and taken once the ready is done (`Held`). A replica waiting for room takes no part in
-    /// the group, and its timers resume when it does.
+    /// A tick of the group's clock (docs/durable.md §8): the core campaigns or beats as its
+    /// counts say. A replica waiting for room is not ticked, as it takes no part in the group,
+    /// and the ticks it missed are not given again.
     pub fn tick(&mut self) -> Result<(), ReplicaError> {
-        self.live()?;
-        match &self.staged {
-            None => self.tick_now(),
-            Some(staged) if staged.out => {
-                if self.held.all_ticks < self.max_held_ticks {
-                    self.held.ticks = self.held.ticks.saturating_add(1);
-                    self.held.all_ticks = self.held.all_ticks.saturating_add(1);
-                }
-                Ok(())
-            }
-            Some(_) => Ok(()),
-        }
+        self.shell.tick().map(drop).map_err(shell)
     }
 
-    fn tick_now(&mut self) -> Result<(), ReplicaError> {
-        self.node.tick()?;
-        if let Some((_, age, _)) = self.reads.out.as_mut() {
-            *age = age.saturating_add(1);
-            if *age >= self.round_ticks
-                && let Some((_, _, reads)) = self.reads.out.take()
-            {
-                self.reads.given_up.extend(reads);
-            }
-        }
-        self.next_round()
-    }
-
-    /// Takes a message. While the member's log may lack entries it acknowledged, it judges a
-    /// request for its vote against the last of them: a candidate behind it may lack an entry
-    /// this member helped commit, and has no answer. Nor does an order to campaign, since the
-    /// member cannot lead without the entries.
-    ///
-    /// A message that comes while a ready's update flushes is held, and taken once the ready
-    /// is done; past the bound on held messages it is refused with `MessagesHeld`, and while
-    /// the replica waits for room, with `Stalled` (`Held`).
+    /// Takes a message, bound to its sender by the transport. Taken while writes are out; a
+    /// replica waiting for room refuses it with `Stalled`, as the network may drop it.
     pub fn step(&mut self, message: Message) -> Result<(), ReplicaError> {
-        self.live()?;
-        match &self.staged {
-            None => self.step_now(message),
-            Some(staged) if staged.out => self.hold(message),
-            Some(_) => Err(ReplicaError::Stalled),
-        }
+        self.shell.step(message).map_err(shell)
     }
 
-    fn hold(&mut self, message: Message) -> Result<(), ReplicaError> {
-        let max = self.held_bound();
-        // A sum past u64::MAX saturates, and is refused as past the bound.
-        let bytes = self.held.bytes.saturating_add(held_bytes(&message));
-        if bytes > max {
-            return Err(ReplicaError::MessagesHeld { bytes, max });
-        }
-        let ticks = std::mem::take(&mut self.held.ticks);
-        self.held.messages.push_back((ticks, message));
-        self.held.bytes = bytes;
-        Ok(())
-    }
-
-    /// The bytes of messages held at most: a window of appends for each other member of the
-    /// configuration (`Held`). A product past u64::MAX saturates: no memory holds that many
-    /// bytes, so the bound it would state is no tighter.
-    fn held_bound(&self) -> u64 {
-        let c = &self.conf;
-        let members: std::collections::BTreeSet<u64> =
-            [&c.voters, &c.learners, &c.voters_outgoing, &c.learners_next]
-                .into_iter()
-                .flatten()
-                .copied()
-                .filter(|&m| m != self.id())
-                .collect();
-        u64::try_from(members.len())
-            .unwrap_or(u64::MAX)
-            .saturating_mul(self.window_bytes)
-    }
-
-    /// Takes what came while a ready was out, once it is done: snapshots' reports, then the
-    /// messages and ticks in the order they came. A message the core refuses changes nothing,
-    /// as when it is stepped at once.
-    fn take_held(&mut self) -> Result<(), ReplicaError> {
-        for (to, arrived) in std::mem::take(&mut self.reports) {
-            self.take_report(to, arrived)?;
-        }
-        let held = std::mem::take(&mut self.held);
-        for (ticks, message) in held.messages {
-            self.ticks(ticks)?;
-            match self.step_now(message) {
-                Ok(()) | Err(ReplicaError::Refused(_)) => {}
-                Err(e) => return Err(e),
-            }
-        }
-        self.ticks(held.ticks)
-    }
-
-    fn ticks(&mut self, count: u64) -> Result<(), ReplicaError> {
-        for _ in 0..count {
-            self.tick_now()?;
-        }
-        Ok(())
-    }
-
-    fn step_now(&mut self, message: Message) -> Result<(), ReplicaError> {
-        let kind = message.msg_type;
-        let requests_vote = matches!(
-            kind,
-            MessageType::MsgRequestVote | MessageType::MsgRequestPreVote
-        );
-        let transfers = kind == MessageType::MsgTimeoutNow;
-        if (requests_vote || transfers)
-            && let Some(mark) = self.uncertainty()?
-        {
-            let behind = message.log_term < mark.term
-                || (message.log_term == mark.term && message.index < mark.index);
-            if transfers || behind {
-                return Ok(());
-            }
-        }
-        if kind == MessageType::MsgHeartbeat
-            && self.uncertainty()?.is_some()
-            && message.commit > self.last_index()?
-        {
-            self.repair = Some(message.from);
-        }
-        self.node.step(message)?;
-        Ok(())
-    }
-
-    /// The last entry the member's log holds.
-    fn last_index(&self) -> Result<u64, ReplicaError> {
-        Ok(self.node.store().group.bounds()?.1)
-    }
-
-    /// Asks the leader to repair this member, whose log lacks entries it acknowledged, once
-    /// the leader's heartbeat shows it counts them held. A leader's record of what a member
-    /// holds only rises (focal-raft `Progress::maybe_decrease_to` never sends below it), so it
-    /// would never send them again, and the member would stay behind it for good; the
-    /// simulation found this. As in protocol-aware recovery, the member names what it lacks
-    /// (AGL+18 §3.4): it refuses the leader's appends through its mark and asks for a snapshot
-    /// reaching it, the refusal focal-raft ports from raft-rs's `request_snapshot`, which a
-    /// leader takes above its record. A leader whose heartbeat names a commit past the
-    /// member's log has recorded more than the log holds, which the member can see only
-    /// while marked: a member never loses what it acknowledged but by damage.
-    fn repair(&mut self, out: &mut Drive) -> Result<(), ReplicaError> {
-        let Some(leader) = self.repair.take() else {
-            return Ok(());
-        };
-        let Some(mark) = self.uncertainty()? else {
-            return Ok(());
-        };
-        if leader != self.leader() {
-            return Ok(());
-        }
-        out.messages.push(Message {
-            msg_type: MessageType::MsgAppendResponse,
-            to: leader,
-            from: self.id(),
-            term: self.term(),
-            reject: true,
-            index: mark.index,
-            reject_hint: self.last_index()?,
-            request_snapshot: mark.index,
-            // What the leader counts toward `configuration_known`: the commit this member
-            // states durably, which a restart keeps, as the core's own answers state it (R-6).
-            commit: self.node.durable_commit(),
-            ..Message::default()
-        });
-        Ok(())
-    }
-
-    /// Prepares the snapshot a member asked for, when the one prepared does not reach it and
-    /// this leader has applied as far (`Replica::repair`). One is prepared for each request
-    /// past the last, which a member makes only while marked.
-    fn serve_requests(&mut self) -> Result<(), ReplicaError> {
-        if !self.is_leader() {
-            return Ok(());
-        }
-        let prepared = self
-            .node
-            .store()
-            .snapshot
-            .as_ref()
-            .map_or(0, proto::snapshot_index);
-        let asked = self
-            .node
-            .raft
-            .tracker()
-            .iter()
-            .map(|(_, p)| p.pending_request_snapshot)
-            .max()
-            .unwrap_or(0);
-        if asked > prepared && asked <= self.applied {
-            self.prepare()?;
-        }
-        Ok(())
-    }
-
-    /// Whether the member's log may still lack entries it acknowledged.
-    pub fn is_uncertain(&mut self) -> Result<bool, ReplicaError> {
-        Ok(self.uncertainty()?.is_some())
-    }
-
-    /// The last entry the member acknowledged, while its log may lack it. The log ends the
-    /// mark once it holds the entries again or one of a later term, so it is read afresh
-    /// while it lasts.
-    fn uncertainty(&mut self) -> Result<Option<Start>, ReplicaError> {
-        if self.uncertain.is_some() {
-            self.uncertain = uncertain_mark(self.node.store())?;
-        }
-        Ok(self.uncertain)
-    }
-
-    /// `Stalled` while a ready is out: the core takes no call until it is done.
-    fn ready_for_calls(&self) -> Result<(), ReplicaError> {
-        self.live()?;
-        match self.staged {
-            Some(_) => Err(ReplicaError::Stalled),
-            None => Ok(()),
-        }
-    }
-
-    /// Asks the group to confirm a read: once a quorum has, `drive` gives back the read with
-    /// the index the rows must reach, and rows at or past it answer the read linearizably.
-    /// `context` names the read. Reads are confirmed a round at a time, and a read waits for
-    /// the round after any that is out (`Rounds`); the reads waiting hold at most an entry's
-    /// bytes of contexts, past which a read is refused, to be asked again.
-    pub fn read_index(&mut self, context: Vec<u8>) -> Result<(), ReplicaError> {
-        self.ready_for_calls()?;
-        let len = u64::try_from(context.len()).unwrap_or(u64::MAX);
-        let waiting = self.reads.waiting_bytes.saturating_add(len);
-        if waiting > self.max_entry_bytes {
-            return Err(ReplicaError::ReadsWaiting {
-                bytes: waiting,
-                max: self.max_entry_bytes,
-            });
-        }
-        self.reads.waiting.push(context);
-        self.reads.waiting_bytes = waiting;
-        self.next_round()
-    }
-
-    /// Asks for the next round of reads, carrying every read waiting, when none is out and the
-    /// replica takes calls.
-    fn next_round(&mut self) -> Result<(), ReplicaError> {
-        // No round starts while a given-up round's reads wait for `drive` to give them back,
-        // so at most one round's are held.
-        if self.reads.out.is_some()
-            || self.reads.waiting.is_empty()
-            || self.staged.is_some()
-            || !self.reads.given_up.is_empty()
-        {
-            return Ok(());
-        }
-        let number = self.reads.next;
-        match self.node.read_index(round_context(number)) {
-            Ok(()) => {}
-            // The core cannot ask now, having no leader to ask: the reads wait, and a later
-            // tick or drive asks.
-            Err(e) if !e.is_fatal() => return Ok(()),
-            Err(e) => return Err(e.into()),
-        }
-        self.reads.next = number.wrapping_add(1);
-        let reads = std::mem::take(&mut self.reads.waiting);
-        self.reads.waiting_bytes = 0;
-        self.reads.out = Some((number, 0, reads));
-        Ok(())
-    }
-
-    /// The reads a confirmation serves: every read of the round out that it names, each at the
-    /// round's index. A confirmation of a round already dropped serves none; its reads were
-    /// dropped with it.
-    fn confirmed(&mut self, index: u64, context: &[u8], out: &mut Drive) {
-        let Some(number) = round_of(context) else {
-            return;
-        };
-        if self
-            .reads
-            .out
-            .as_ref()
-            .is_some_and(|(n, _, _)| *n == number)
-            && let Some((_, _, reads)) = self.reads.out.take()
-        {
-            out.reads
-                .extend(reads.into_iter().map(|read| (index, read)));
-        }
-    }
-
-    /// Reports whether a snapshot this member sent to `to` arrived. Replication to a member
-    /// pauses while its snapshot is out, so the transport reports every snapshot's fate,
-    /// which a snapshot's own stream always learns (docs/design/replica.md §3). A report that
-    /// comes while a ready is out is kept and taken once the ready is done: refused, a lost
-    /// report would pause replication to `to` for good. One for a member not in the
-    /// configuration is dropped, as the core would drop it.
-    pub fn report_snapshot(&mut self, to: u64, arrived: bool) -> Result<(), ReplicaError> {
-        self.live()?;
-        if self.staged.is_some() {
-            if self.is_member(to) {
-                self.reports.insert(to, arrived);
-            }
-            return Ok(());
-        }
-        self.take_report(to, arrived)
-    }
-
-    fn take_report(&mut self, to: u64, arrived: bool) -> Result<(), ReplicaError> {
-        let status = if arrived {
-            focal_raft::SnapshotStatus::Finish
-        } else {
-            focal_raft::SnapshotStatus::Failure
-        };
-        self.node.report_snapshot(to, status)?;
-        Ok(())
-    }
-
-    /// Whether `id` is a voter or learner of the configuration, joint or not.
-    fn is_member(&self, id: u64) -> bool {
-        let c = &self.conf;
-        [&c.voters, &c.learners, &c.voters_outgoing, &c.learners_next]
-            .iter()
-            .any(|ids| ids.contains(&id))
-    }
-
+    /// Campaigns now; refused [`ReplicaError::Uncertain`] while its log may lack entries it
+    /// acknowledged and the others are no quorum without it (core step R-7).
     pub fn campaign(&mut self) -> Result<(), ReplicaError> {
-        self.ready_for_calls()?;
-        if self.is_uncertain()? {
-            return Err(ReplicaError::Uncertain);
-        }
-        self.node.campaign()?;
-        Ok(())
+        self.shell.campaign().map_err(shell)
     }
 
-    /// Proposes an entry of commands; only a leader takes it, and none larger than the
-    /// range's bound.
+    /// Proposes an entry of commands; only a leader takes it, and none larger than the range's
+    /// bound.
     pub fn propose(&mut self, entry: &wire::Entry) -> Result<(), ReplicaError> {
-        self.ready_for_calls()?;
         let data = entry.encode()?;
         self.bounded(data.len())?;
-        self.node.propose(Vec::new(), data)?;
-        Ok(())
+        self.shell.propose(Vec::new(), data).map_err(shell)
     }
 
     pub fn propose_change(&mut self, change: &ConfChangeV2) -> Result<(), ReplicaError> {
-        self.ready_for_calls()?;
         self.bounded(change.encoded_len())?;
-        self.node.propose_conf_change(Vec::new(), change)?;
-        Ok(())
+        self.shell.change(Vec::new(), change).map_err(shell)
     }
 
     fn bounded(&self, len: usize) -> Result<(), ReplicaError> {
@@ -959,664 +402,47 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
         Ok(())
     }
 
-    /// Handles what the core asks for, in the order Raft's safety needs
-    /// (docs/design/replica.md §3): the messages a leader may send at once, the log write,
-    /// the messages that wait for it, the committed entries, and the core's advance.
-    /// A ready the log refuses for want of room waits in the replica, whole, and the next
-    /// drive writes it first (audit S04).
-    pub fn drive(&mut self) -> Result<Drive, ReplicaError> {
-        self.drive_ready(true)
+    /// Asks the group to confirm a read: once a quorum has and the replica has applied through
+    /// the index it was confirmed at, a drive gives it back with that index, and rows at or past
+    /// it answer the read linearizably. `context` names the read. Refused past the core's bound
+    /// on reads waiting; a read whose round is lost is asked again by the leader's heartbeats,
+    /// and one a leader that steps down held is dropped, as a lost message is, for its caller to
+    /// ask again.
+    pub fn read_index(&mut self, context: Vec<u8>) -> Result<(), ReplicaError> {
+        self.shell.read(context).map_err(shell)
     }
 
-    /// Does what `drive` does without waiting on the log (docs/design/replica.md §3): takes
-    /// the core's ready, gives out the messages a leader may send before its own write,
-    /// submits the ready's update, and applies the entries already committed, then returns
-    /// with `persisting` set while the update is not yet durable. The caller sends those
-    /// messages while the log flushes, and the flush serves every group that submitted before
-    /// it; `drive` or `begin` again finishes the ready once the update is durable, giving out
-    /// the messages that waited for it, such as a follower's acknowledgement. One ready of a
-    /// group is outstanding at a time (audit §5.1).
-    pub fn begin(&mut self) -> Result<Drive, ReplicaError> {
-        self.drive_ready(false)
+    /// Reports whether a snapshot this member sent to `to` arrived. Replication to a member
+    /// pauses while its snapshot is out, so the transport reports every snapshot's fate; one
+    /// that comes while the replica waits for room is kept, the latest for each member.
+    pub fn report_snapshot(&mut self, to: u64, arrived: bool) -> Result<(), ReplicaError> {
+        self.shell.report_snapshot(to, arrived).map_err(shell)
     }
 
-    /// Whether a ready's update, or a write of the commit alone, is on its way to being
-    /// durable.
-    pub fn persisting(&self) -> bool {
-        self.staged.as_ref().is_some_and(|s| s.out)
-    }
-
-    /// Waits until the part of a ready's update now submitted is durable, or refused, and
-    /// keeps the answer for the next `begin` or `drive`, which finish the ready: a node that
-    /// has sent what `begin` gave out and has nothing else to do waits here for the flush.
-    pub fn wait_persisted(&mut self) {
-        if let Some(staged) = self.staged.as_mut()
-            && staged.answered.is_none()
-            && staged.out
-        {
-            let answer = self.node.store_mut().group.wait();
-            staged.answered = Some(answer.unwrap_or(Err(LogError::Closed)));
-        }
-    }
-
-    fn drive_ready(&mut self, wait: bool) -> Result<Drive, ReplicaError> {
-        self.live()?;
-        let mut out = Drive::default();
-        for _ in 0..DRIVE_BUDGET {
-            // Entries held behind the fence wait for a write stating their commit, which the
-            // core's next ready may never carry: its hard state names a commit only when it
-            // moved since the last, and a commit that moved in `advance_append` is never in one
-            // (a leader that commits alone). The core is asked for nothing more meanwhile.
-            let staged = match self.staged.take() {
-                Some(staged) => staged,
-                None if !self.behind_fence.is_empty() => self.commit_write()?,
-                None if self.node.has_ready() => self.take_ready(&mut out)?,
-                None => break,
-            };
-            match self.persist(staged, wait)? {
-                Persisted::Done(Some(ready)) => {
-                    self.finish(ready, &mut out)?;
-                    self.take_held()?;
-                }
-                Persisted::Done(None) => {
-                    // The write stated a commit beyond any `Ready`'s hard state, which the
-                    // core learns of only from its owner (`RawNode::commit_durable`, core step
-                    // R-6): its answers state no commit past what it knows durable.
-                    self.tell_durable_commit(self.logged_commit)?;
-                    self.apply(Vec::new(), &mut out)?;
-                    self.node.advance_apply_to(self.applied)?;
-                    self.take_held()?;
-                }
-                Persisted::Flushing(mut staged) => {
-                    // As while the log refuses room: what is committed is durable already,
-                    // and applies while the update flushes, but for a change of
-                    // configuration, which waits for the commit to be durable too.
-                    if let Some(ready) = staged.ready.as_mut() {
-                        let committed = ready.take_committed_entries();
-                        self.apply(committed, &mut out)?;
-                    }
-                    self.staged = Some(staged);
-                    out.persisting = true;
-                    break;
-                }
-                Persisted::Waiting(mut staged, refusal) => {
-                    // The core gives out only entries committed and durable, so these apply
-                    // now, and the group can compact past them while the ready waits.
-                    if let Some(ready) = staged.ready.as_mut() {
-                        let committed = ready.take_committed_entries();
-                        self.apply(committed, &mut out)?;
-                    }
-                    self.staged = Some(staged);
-                    out.stalled = Some(refusal);
-                    break;
-                }
-            }
-        }
-        // Reads of a round given up go back to their callers, and those waiting on a round
-        // now confirmed or given up go in the next.
-        out.unconfirmed = std::mem::take(&mut self.reads.given_up);
-        self.next_round()?;
-        // A member whose log may lack entries it acknowledged cannot lead: its election
-        // timer still runs, which keeps it from holding a lease on a leader that is gone,
-        // but its campaigns ask no one.
-        if self.uncertainty()?.is_some() {
-            out.messages.retain(|m| !campaigns(m));
-        }
-        self.repair(&mut out)?;
-        self.serve_requests()?;
-        Ok(out)
-    }
-
-    /// Takes the core's next ready: installs its snapshot, gives out the messages a leader
-    /// may send before its own write and the reads confirmed, and lays out its update.
-    fn take_ready(&mut self, out: &mut Drive) -> Result<Staged, ReplicaError> {
-        let mut ready = self.node.ready()?;
-        let installed = match ready.snapshot() {
-            Some(s) if !proto::snapshot_is_empty(s) => Some(self.install(s.clone())?),
-            _ => None,
-        };
-        out.messages.extend(ready.take_messages());
-        for read in ready.take_read_states() {
-            self.confirmed(read.index, &read.request_ctx, out);
-        }
-        let parts = match update_of(&ready, installed)? {
-            Some(update) => match self.node.store().group.parts(update) {
-                Ok(parts) => parts.into(),
-                Err(LogError::TooLarge(len)) => {
-                    return Err(ReplicaError::Stopped(format!(
-                        "a ready holds a record of {len} bytes, more than a frame of this log"
-                    )));
-                }
-                Err(e) => return Err(e.into()),
-            },
-            None => VecDeque::new(),
-        };
-        Ok(Staged {
-            ready: Some(ready),
-            parts,
-            out: false,
-            answered: None,
-        })
-    }
-
-    /// Writes a ready's parts in order, each submitted once the one before it is durable;
-    /// the ready back once every part is, staged while one flushes and `wait` is false, or
-    /// staged when the log refuses one for want of room. Without `wait`, a part submitted
-    /// here is left flushing rather than looked at at once: a flush is not done microseconds
-    /// after its submission, and whether it happened to be would make what `begin` gives
-    /// out hang on the log's thread rather than on what the caller did. With `wait`, each
-    /// part is written and waited for at once, so the log may give its frame's write and
-    /// flush to this thread, which waits for them anyway (hyper-log `GroupLog::write`).
-    /// A part refused is kept: the log takes an update whole or not at all.
-    fn persist(&mut self, mut staged: Staged, wait: bool) -> Result<Persisted, ReplicaError> {
-        let mut submitted = false;
-        loop {
-            if staged.out {
-                let group = &mut self.node.store_mut().group;
-                let answer = match staged.answered.take() {
-                    Some(answer) => Some(answer),
-                    None if wait => Some(group.wait().unwrap_or(Err(LogError::Closed))),
-                    None if submitted => None,
-                    None => group.poll(),
-                };
-                let Some(answer) = answer else {
-                    return Ok(Persisted::Flushing(staged));
-                };
-                staged.out = false;
-                match answer {
-                    Ok(()) => self.durable_part(&mut staged),
-                    Err(e) if waits_for_room(&e) => return Ok(Persisted::Waiting(staged, e)),
-                    Err(e) => return Err(self.fence(&e)),
-                }
-            }
-            let Some(part) = staged.parts.front() else {
-                return Ok(Persisted::Done(staged.ready));
-            };
-            let group = &mut self.node.store_mut().group;
-            if wait {
-                match group.write(part.clone()) {
-                    Ok(()) => self.durable_part(&mut staged),
-                    Err(e) if waits_for_room(&e) => return Ok(Persisted::Waiting(staged, e)),
-                    Err(e) => return Err(self.fence(&e)),
-                }
-                continue;
-            }
-            match group.submit(part.clone()) {
-                Ok(()) => {
-                    staged.out = true;
-                    submitted = true;
-                }
-                Err(e) if waits_for_room(&e) => return Ok(Persisted::Waiting(staged, e)),
-                Err(e) => return Err(self.fence(&e)),
-            }
-        }
-    }
-
-    /// Tells the core a commit the member made durable outside a `Ready`'s hard state: the
-    /// commit-only write of the fence, or the engine's durable index, which a restart writes
-    /// into the log as its commit (`commit_applied`). The core's answers to appends and
-    /// heartbeats state at most what it knows durable (core step R-6, hyper-raft
-    /// docs/durable.md §4.4), and a leader counts those toward `configuration_known`. A
-    /// `Ready`'s own hard state needs no word: the core reads it from the `Ready`.
-    fn tell_durable_commit(&mut self, commit: u64) -> Result<(), ReplicaError> {
-        if commit > self.node.durable_commit() {
-            self.node.commit_durable(commit)?;
-        }
-        Ok(())
-    }
-
-    /// The first of `staged`'s parts is durable: the commit it states is the log's.
-    fn durable_part(&mut self, staged: &mut Staged) {
-        if let Some(hard) = staged.parts.pop_front().and_then(|part| part.hard_state) {
-            self.logged_commit = self.logged_commit.max(hard.commit);
-        }
-    }
-
-    /// A write of the commit alone, through the last entry held behind the fence, with the
-    /// term and vote the log holds: no ready is out, so the log's group state is every write
-    /// answered, and a later ready writes a newer term or vote in its turn. Every entry held
-    /// was given to apply, so it is committed and the log holds it (I7). One such write is
-    /// one flush for each change of configuration, which are rare (docs/durable.md §4.1;
-    /// focal 27 §9).
-    fn commit_write(&mut self) -> Result<Staged, ReplicaError> {
-        let held = self.behind_fence.back().map_or(0, |e| e.index);
-        let hard = self
-            .node
-            .store()
-            .group
-            .view()?
-            .and_then(|v| v.hard_state)
-            .unwrap_or_default();
-        let update = Update {
-            hard_state: Some(hyper_log::HardState {
-                commit: hard.commit.max(held),
-                ..hard
-            }),
-            ..Update::default()
-        };
-        Ok(Staged {
-            ready: None,
-            parts: VecDeque::from([update]),
-            out: false,
-            answered: None,
-        })
-    }
-
-    /// Finishes a durable ready: the messages that waited for the write, the committed
-    /// entries, and the core's advance.
-    fn finish(
+    /// Does what there is to do (docs/design/replica.md §3): takes the log's answers, applies
+    /// what the commit fence allows, one page at most, and takes at most one `Ready`, whose write
+    /// goes out with `waker`, woken when the log answers it. `now` is the owner's monotonic clock
+    /// in nanoseconds. Appends to `out`, which the owner empties and reuses. `Driven::more` says
+    /// driving again now would do more without an answer from the log.
+    pub fn drive(
         &mut self,
-        mut ready: focal_raft::Ready,
-        out: &mut Drive,
-    ) -> Result<(), ReplicaError> {
-        out.messages.extend(ready.take_persisted_messages());
-        let committed = ready.take_committed_entries();
-        self.apply(committed, out)?;
-        let mut light = self.node.advance_append(ready)?;
-        out.messages.extend(light.take_messages());
-        let committed = light.take_committed_entries();
-        self.apply(committed, out)?;
-        self.node.advance_apply_to(self.applied)?;
-        Ok(())
+        now: u64,
+        waker: &Waker,
+        out: &mut Output,
+    ) -> Result<Driven, ReplicaError> {
+        self.shell.drive(now, waker, out).map_err(shell)
     }
 
-    /// Applies committed entries in order, those held behind the fence first, up to the first
-    /// change of configuration the log's durable commit does not cover, which waits with what
-    /// follows it (`Replica::behind_fence`). The engine's durable index never covers such a
-    /// change, which it has not applied, so the log's commit is the whole of the member's
-    /// durable commit here (docs/durable.md §4.1).
-    fn apply(&mut self, entries: Vec<Entry>, out: &mut Drive) -> Result<(), ReplicaError> {
-        self.behind_fence.extend(entries);
-        while let Some(entry) = self.behind_fence.front() {
-            let change = matches!(
-                entry.entry_type,
-                EntryType::EntryConfChange | EntryType::EntryConfChangeV2
-            );
-            if change && entry.index > self.logged_commit {
-                break;
-            }
-            let Some(entry) = self.behind_fence.pop_front() else {
-                break;
-            };
-            self.apply_one(entry, out)?;
-        }
-        Ok(())
+    /// The owner freed room in the log (another group compacted or left): a replica waiting for
+    /// room makes its refused writes again at its next drive.
+    pub fn resume(&mut self) {
+        self.shell.resume();
     }
 
-    fn apply_one(&mut self, entry: Entry, out: &mut Drive) -> Result<(), ReplicaError> {
-        let index = entry.index;
-        let mut changed = false;
-        match entry.entry_type {
-            // A new leader's empty entry changes no row.
-            EntryType::EntryNormal if entry.data.is_empty() => {
-                self.engine.apply(index, &[])?;
-            }
-            EntryType::EntryNormal => {
-                let batch = wire::Entry::decode(&entry.data).map_err(|_| {
-                    ReplicaError::Stopped(format!("committed entry {index} does not decode"))
-                })?;
-                let answers =
-                    apply_entry(&mut self.engine, index, &batch, self.layer, &self.rules)?;
-                let answers = batch
-                    .commands
-                    .iter()
-                    .zip(answers)
-                    .map(|(c, a)| (c.session, c.serial, a))
-                    .collect();
-                out.applied.push(Applied { index, answers });
-            }
-            // A change in either encoding, read as hyper-raft states it (`change_of`): a
-            // change entry with no data is the empty change.
-            EntryType::EntryConfChange | EntryType::EntryConfChangeV2 => {
-                let change = proto::change_of(&entry).ok().flatten().ok_or_else(|| {
-                    ReplicaError::Stopped(format!("committed change {index} does not decode"))
-                })?;
-                let outcome = self.node.apply_conf_change(&change);
-                self.changed(index, outcome)?;
-                changed = true;
-            }
-        }
-        self.applied = index;
-        if changed && self.snapshot_misses_a_member() {
-            self.prepare()?;
-        }
-        Ok(())
+    /// Makes the engine's applied state durable and lets the log free the entries before it,
+    /// keeping `keep` entries behind for followers that lag (docs/design/replica.md §4); true
+    /// when a compaction's start went out, with `waker`.
+    pub fn compact(&mut self, keep: u64, now: u64, waker: &Waker) -> Result<bool, ReplicaError> {
+        self.shell.compact(keep, now, waker).map_err(shell)
     }
-
-    /// Whether the snapshot prepared for lagging members leaves out a member of the
-    /// configuration. A member refuses a snapshot that does not name it, so a member added
-    /// after the snapshot was prepared could never be caught up by it; the snapshot is then
-    /// prepared again, at the change that added the member (docs/design/replica.md §6).
-    fn snapshot_misses_a_member(&self) -> bool {
-        let Some(named) = self
-            .node
-            .store()
-            .snapshot
-            .as_ref()
-            .and_then(|s| s.metadata.as_ref())
-            .and_then(|m| m.conf_state.as_ref())
-        else {
-            return false;
-        };
-        let names = |c: &ConfState, id: &u64| {
-            c.voters.contains(id)
-                || c.learners.contains(id)
-                || c.voters_outgoing.contains(id)
-                || c.learners_next.contains(id)
-        };
-        let conf = &self.conf;
-        conf.voters
-            .iter()
-            .chain(&conf.learners)
-            .chain(&conf.voters_outgoing)
-            .chain(&conf.learners_next)
-            .any(|id| !names(named, id))
-    }
-
-    /// Records the configuration a committed change made, in the batch of its entry. A change
-    /// the core refused is refused alike by every member, and its entry changes no row.
-    fn changed(
-        &mut self,
-        index: u64,
-        changed: focal_raft::Result<ConfState>,
-    ) -> Result<(), ReplicaError> {
-        match changed {
-            Ok(conf) => {
-                let bytes = conf::encode(&conf).ok_or_else(|| {
-                    ReplicaError::Stopped("a configuration past u32 members".into())
-                })?;
-                self.engine
-                    .apply(index, &[Write::Put(conf::ROW.to_vec(), bytes)])?;
-                self.conf = conf;
-                self.conf_index = index;
-            }
-            Err(e) if !e.is_fatal() => self.engine.apply(index, &[])?,
-            Err(e) => return Err(e.into()),
-        }
-        Ok(())
-    }
-
-    /// Makes the engine's applied state durable and lets the log free the entries before
-    /// it, keeping `keep` entries behind for followers that lag (docs/design/replica.md §4).
-    pub fn compact(&mut self, keep: u64) -> Result<(), ReplicaError> {
-        self.live()?;
-        self.engine.persist()?;
-        // What the engine made durable a restart opens with, its log's commit raised to it
-        // (`commit_applied`): a durable commit the core states in its answers from now on.
-        self.tell_durable_commit(self.engine.durable())?;
-        // Keeping more entries than the engine has made durable keeps them all.
-        let index = self.engine.durable().saturating_sub(keep);
-        // A part of a ready out on the group's handle is answered first: the handle answers
-        // its writes in the order they were submitted, and its reads as of those answered.
-        self.wait_persisted();
-        let group = &mut self.node.store_mut().group;
-        let Some(view) = group.view()? else {
-            return Ok(());
-        };
-        if index <= view.start.index {
-            return Ok(());
-        }
-        let term = group.term(index)?;
-        let written = group.write(Update {
-            start: Some(Start { index, term }),
-            ..Update::default()
-        });
-        match written {
-            Ok(()) => {}
-            Err(e) if waits_for_room(&e) => return Err(e.into()),
-            Err(e) => return Err(self.fence(&e)),
-        }
-        self.prepare()
-    }
-
-    /// Prepares the snapshot the log store serves: every row as of `applied`, which is at
-    /// or past the log's start, with the configuration there.
-    fn prepare(&mut self) -> Result<(), ReplicaError> {
-        let index = self.applied;
-        let term = self.node.store().group.term(index)?;
-        let data = image::encode(&self.engine.image()?)
-            .ok_or_else(|| ReplicaError::Stopped("a snapshot past u32 bytes a row".into()))?;
-        let snapshot = Snapshot {
-            data,
-            metadata: Some(SnapshotMetadata {
-                conf_state: Some(self.conf.clone()),
-                index,
-                term,
-            }),
-        };
-        self.node.store_mut().snapshot = Some(snapshot);
-        Ok(())
-    }
-
-    /// Installs a snapshot the leader sent: the engine takes its rows and makes them durable
-    /// before the log records its new start, so the log never starts past what the engine
-    /// holds. Returns the start.
-    fn install(&mut self, snapshot: Snapshot) -> Result<Start, ReplicaError> {
-        let metadata = snapshot
-            .metadata
-            .clone()
-            .ok_or_else(|| ReplicaError::Stopped("a snapshot without metadata".into()))?;
-        let mut rows = image::decode(&snapshot.data)
-            .ok_or_else(|| ReplicaError::Stopped("a snapshot's rows do not decode".into()))?;
-        // The engine keeps the snapshot's point beside its rows, so a restart can finish an
-        // install whose log write failed after the engine took it.
-        rows.retain(|(k, _)| k.as_slice() != conf::INSTALLED);
-        rows.push((
-            conf::INSTALLED.to_vec(),
-            conf::encode_point(metadata.index, metadata.term),
-        ));
-        rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        self.engine.install(metadata.index, rows)?;
-        self.engine.persist()?;
-        self.applied = metadata.index;
-        if let Some(conf) = metadata.conf_state {
-            self.conf = conf.clone();
-            self.conf_index = metadata.index;
-            self.node.store_mut().conf = conf;
-        }
-        self.node.store_mut().snapshot = Some(snapshot);
-        Ok(Start {
-            index: metadata.index,
-            term: metadata.term,
-        })
-    }
-}
-
-/// Finishes an install the log never recorded. The engine takes a snapshot and makes it
-/// durable before the log records the snapshot's point; if that log write failed, the engine
-/// stands at the snapshot while the log ends before it. The snapshot is committed state, and
-/// nothing was acknowledged for the failed write, so the log is brought to it: it starts at
-/// the snapshot's point, holds nothing past it, and knows it committed.
-fn complete_install<F: BlockFile + 'static, E: Engine>(
-    log: &Log<F>,
-    group: u128,
-    engine: &E,
-) -> Result<(), ReplicaError> {
-    let Some(bytes) = engine.get(conf::INSTALLED)? else {
-        return Ok(());
-    };
-    let (index, term) = conf::decode_point(&bytes)
-        .ok_or_else(|| ReplicaError::Stopped("the snapshot point does not decode".into()))?;
-    let view = log.view(group)?;
-    let recorded = match log.term(group, index) {
-        Ok(t) => t == term,
-        Err(hyper_log::LogError::Compacted { .. }) => true,
-        Err(_) => false,
-    };
-    if recorded {
-        return Ok(());
-    }
-    let hard = view.and_then(|v| v.hard_state).unwrap_or_default();
-    let first = index
-        .checked_add(1)
-        .ok_or_else(|| ReplicaError::Stopped("an index past u64".into()))?;
-    log.write_waiting(
-        group,
-        Update {
-            start: Some(Start { index, term }),
-            entries: Some(Entries {
-                first,
-                entries: Vec::new(),
-            }),
-            hard_state: Some(hyper_log::HardState {
-                commit: hard.commit.max(index),
-                ..hard
-            }),
-            proposals: Vec::new(),
-            remove: false,
-        },
-    )?;
-    Ok(())
-}
-
-/// The uncertainty mark the group's log carries (`Replica::uncertain`).
-fn uncertain_mark<F: BlockFile + 'static>(
-    store: &LogStore<F>,
-) -> Result<Option<Start>, ReplicaError> {
-    Ok(store.uncertain()?)
-}
-
-/// Whether `message` asks for votes for its sender's campaign.
-fn campaigns(message: &Message) -> bool {
-    matches!(
-        message.msg_type,
-        MessageType::MsgRequestVote | MessageType::MsgRequestPreVote
-    )
-}
-
-/// Brings the log's durable commit up to the entries the engine applied. A member learns of
-/// commits the core reports after its entries are durable, and applies them without writing
-/// the commit to the log, so an engine that made its rows durable (at compaction, or on its
-/// own) can open ahead of the commit the log kept, which the core refuses. Every entry the
-/// engine applied was committed, and the log holds it, so its index is committed state the
-/// log is told of, as for an install the log never recorded.
-///
-/// A log that recovery cut back past what the engine applied, its last frame lost and marked
-/// (docs/design/raft-log.md §6), no longer holds entries the engine's rows reflect. They were
-/// committed, so the member keeps its identity and its hard state, and the log starts at the
-/// engine's index, as after an install, once that entry's term is known: the core checks a
-/// leader's appends against it. Terms never fall along a log, so every entry between the
-/// last the log holds and the mark is of a term between theirs, and the mark's own entry is
-/// of the mark's term (Ongaro and Ousterhout, ATC 2014, §5.3). The entry's term is then
-/// known when the engine's index is the mark's, or when the last entry held is of the mark's
-/// term. Otherwise the member is `Damaged` and rebuilt. The mark stays until the log reaches
-/// it again, so the member keeps out of elections as before (docs/design/replica.md §4).
-fn commit_applied<F: BlockFile + 'static>(
-    log: &Log<F>,
-    group: u128,
-    applied: u64,
-) -> Result<(), ReplicaError> {
-    let Some(view) = log.view(group)? else {
-        return Ok(());
-    };
-    let hard = view.hard_state.unwrap_or_default();
-    if applied <= hard.commit {
-        return Ok(());
-    }
-    if applied <= view.last {
-        log.write_waiting(
-            group,
-            Update {
-                hard_state: Some(hyper_log::HardState {
-                    commit: applied,
-                    ..hard
-                }),
-                ..Update::default()
-            },
-        )?;
-        return Ok(());
-    }
-    let Some(mark) = view.uncertain.filter(|m| applied <= m.index) else {
-        return Err(ReplicaError::Stopped(format!(
-            "the engine applied {applied}, past the log's last entry {} and any mark",
-            view.last
-        )));
-    };
-    let term = if applied == mark.index || log.term(group, view.last)? == mark.term {
-        mark.term
-    } else {
-        return Err(ReplicaError::Damaged);
-    };
-    let first = applied
-        .checked_add(1)
-        .ok_or_else(|| ReplicaError::Stopped("an index past u64".into()))?;
-    log.write_waiting(
-        group,
-        Update {
-            start: Some(Start {
-                index: applied,
-                term,
-            }),
-            entries: Some(Entries {
-                first,
-                entries: Vec::new(),
-            }),
-            hard_state: Some(hyper_log::HardState {
-                commit: applied,
-                ..hard
-            }),
-            proposals: Vec::new(),
-            remove: false,
-        },
-    )?;
-    Ok(())
-}
-
-/// What a ready asks to be made durable, as one update of the log: after a snapshot
-/// installed at `installed`, the log starts there and holds nothing past it but the ready's
-/// entries.
-fn update_of(
-    ready: &focal_raft::Ready,
-    installed: Option<Start>,
-) -> Result<Option<Update>, ReplicaError> {
-    let encode = |e: &Entry| {
-        store::encode_entry(e)
-            .ok_or_else(|| ReplicaError::Stopped(format!("entry {} does not encode", e.index)))
-    };
-    let entries = match ready.entries() {
-        [] => match installed {
-            None => None,
-            Some(start) => Some(Entries {
-                first: start
-                    .index
-                    .checked_add(1)
-                    .ok_or_else(|| ReplicaError::Stopped("an index past u64".into()))?,
-                entries: Vec::new(),
-            }),
-        },
-        all @ [first, ..] => Some(Entries {
-            first: first.index,
-            entries: all
-                .iter()
-                .map(|e| {
-                    Ok(hyper_log::Entry {
-                        term: e.term,
-                        bytes: encode(e)?,
-                    })
-                })
-                .collect::<Result<_, ReplicaError>>()?,
-        }),
-    };
-    let proposals = ready
-        .proposals()
-        .iter()
-        .map(|p| {
-            Ok(Proposal {
-                index: p.index,
-                term: p.term,
-                bytes: encode(p)?,
-            })
-        })
-        .collect::<Result<Vec<_>, ReplicaError>>()?;
-    let hard_state = ready.hard_state().map(store::hard_from_proto);
-    if installed.is_none() && entries.is_none() && hard_state.is_none() && proposals.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(Update {
-        start: installed,
-        entries,
-        hard_state,
-        proposals,
-        remove: false,
-    }))
 }

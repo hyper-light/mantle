@@ -163,7 +163,6 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/meta/src/key.rs` `GATE` | format | Marker byte `g` after `LOCAL` for gate rows. |
 | `crates/meta/src/key.rs` `HEADER` | format | File-layer row tag 1 for a file's header. |
 | `crates/meta/src/key.rs` `NAMED` | format | File-layer row tag 4 for the row saying a file names a block, after the extents' tag so a scan of extents stops before it. |
-| `crates/meta/src/key.rs` `INSTALLED` | format | Marker byte `p` after `LOCAL` for the last installed snapshot. |
 | `crates/meta/src/key.rs` `LINEAGE` | format | Marker byte `l` after `LOCAL` for the Name range's lineage row. |
 | `crates/meta/src/key.rs` `LOCAL` | format | Key-space prefix byte 0x00 for a range's own rows (docs/design/metadata.md §1). |
 | `crates/meta/src/key.rs` `MARK` | format | Component tag 1 after a routing key in the marks space; below 0xFF so it is not read as an escaped 0x00 (FDB tuple-layer byte string). |
@@ -175,6 +174,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/meta/src/key.rs` `REVERSE` | format | Key-space prefix byte 0x02 for reverse-index rows. |
 | `crates/meta/src/key.rs` `SESSION` | format | Marker byte `s` after `LOCAL` for session rows. |
 | `crates/meta/src/key.rs` `SESSIONS` | format | Marker byte `n` after `LOCAL` for the session count row. |
+| `crates/meta/src/key.rs` `TERM` | format | Marker byte `t` after `LOCAL` for the term of the last entry the range applied, which its replica keeps beside the index (docs/design/replica.md §4). |
 | `crates/meta/src/key.rs` `UNSETTLED` | format | Marker byte `u` after `LOCAL` for files and blocks whose handover is unsettled. |
 | `crates/meta/src/key.rs` `UPLOAD` | format | Name-row tag 3: upload rows, sorting after versions. |
 | `crates/meta/src/key.rs` `VERSION` | format | Name-row tag 2: version rows, sorting after the null pointer. |
@@ -193,8 +193,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/meta/src/wire.rs` `MAX_COMMANDS` | bound | 2^16 command places per entry, so a session ID is index × 2^16 + place (session.rs `register`); the audit (§12.6) keeps it as a versioned encoding bound with byte and work budgets beside it. |
 | `crates/range/src/conf.rs` `FORMAT` | format | Version byte of the encoded configuration row. |
 | `crates/range/src/image.rs` `FORMAT` | format | Version byte of the encoded snapshot image. |
-| `crates/range/src/replica.rs` `DRIVE_BUDGET` | cited | 1 `Ready` a `drive`: the node shares its shards among ranges by deficit round robin, whose O(1) work and fairness within one unit hold when "Quantum_i ≥ Max" (Shreedhar and Varghese, Theorem 4.5; research 25 §7), and a turn's largest unit is one `Ready` (node.md §2.3). |
-| `crates/range/src/store.rs` `ENTRY_OVERHEAD` | format | An entry encoding's kind byte plus u32 context length (1 + 4), per `encode_entry`. |
+| `crates/range/src/replica.rs` `QUIET` | derived | `Duration::MAX`, no quiet write: the durable shell writes a commit no write stated after its owner's period so that a member acting on applied state at its next start reopens with it (hyper-raft docs/durable.md §4.1); no entry of a range is acted on at start (`RangeMachine::acts_at_start`), and the engine's durable index is part of the durable commit, so the write is never due. |
 | `crates/s3/src/acl.rs` `MAX_GRANTS` | external | AWS S3 API reference via docs/research/13 §6.8: "An ACL can have up to 100 grants". |
 | `crates/s3/src/body.rs` `ACL_LIMIT` | derived | (prolog + owner fields escaped + MAX_GRANTS × GRANT); s3-protocol.md §2 gives 662,054 bytes. |
 | `crates/s3/src/body.rs` `BUCKET_TAGGING_LIMIT` | derived | (TAGGING + 50 bucket tags × TAG). |

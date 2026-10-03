@@ -276,56 +276,63 @@ frame's and its confirmation's, where none follows at once
 `crates/log` until hyper-raft took it with its history (research/32 §5.2, L-1) and gave its
 state to one owner thread that answers every call by ticket, waking only its caller (L-2);
 mantle runs on that crate since 2026-10-01 and `crates/log` is gone (§5.3). The range
-simulation's recorded seeds 1 to 48 replay to the same histories, step for step, on it as on
-`crates/log`. A replica writes and reads its group through the group's handle on the log
-(hyper-log `GroupLog`, at hyper-raft `687244f`), which answers the core's reads and cuts its
-updates into frames on the replica's thread, from what the replica's own answered writes
-left; a blocking write does its own frame's I/O on the writer's thread, and the member holds
-no handle on the log itself. A committed entry of a three-member group, driven in one
-process, allocates 127.2 times and reallocates 4.0 against `crates/log`'s 262.2 and 25.0, and
-takes a median 143 µs against 151 µs at a load average of 34–35, faster in 27 of 31 paired
+simulation's recorded seeds 1 to 48 replayed to the same histories, step for step, on it as on
+`crates/log`, before the replica moved onto the shell. A replica writes and reads its group through the shell's handle on the group
+(hyper-durable's `GroupStore` over hyper-log's `GroupLog`, at hyper-raft `df5f8ad`), which
+answers the core's reads from what the replica's own answered writes left and submits each
+write without waiting, the log's answer waking the replica's owner; the member holds no handle
+on the log itself. Before the shell, a committed entry of a three-member group, driven in one
+process, allocated 127.2 times and reallocated 4.0 against `crates/log`'s 262.2 and 25.0, and
+took a median 143 µs against 151 µs at a load average of 34–35, faster in 27 of 31 paired
 rounds; on the move to hyper-log before the handle it took 0.83 ms
 ([measurements](measurements/2026-10-01-group-log.md),
 [before](measurements/2026-10-01-shared-log.md)). `mantle bench log` matches `crates/log`
 with one replica and runs more appends a second at 256 replicas: 29.3K against 27.1K at
 128 B, in 12 of 12 paired rounds, and 23.1K against 21.1K at 16 KiB, in 11 of 12.
 
-Range replicas (`mantle-range`, [design](design/replica.md)) run hyper-raft's core (vendored at
-`687244f`, named `focal-raft` in the crate) over the log and an engine: an entry carries a batch of gateway commands applied as one engine batch,
-client sessions make each command take effect once however often it is retried, a write
-delivered again in a new session is recognised by its file, or for a write with no file by
-the ID the gateway drew for its request, and answered as its first delivery was, and members
-that lag are caught up by snapshot, and reads are confirmed by ReadIndex. A member lost for
-good is replaced by one under a new identity: added as a learner, caught up, swapped in by
-one joint change, and done once every voter knows the new configuration committed. While a
-`Ready` flushes, a replica holds the messages and ticks it is given, within a window of
-appends per member and one election timeout, and takes them in order after; refusing them
-left a leader under steady load committing nothing. A change of configuration applies only
-once the member's log states its commit (hyper-raft's commit fence, focal's F17): applied on a
-volatile commit, a founder that removed its only peer and lost power while the commit's write
-flushed reopened counting the stopped peer and never elected again, which directed power cuts
-at every write and flush of a change now check for a leader, a follower, a sole voter and a
-group shrinking to one. A member's answers state its durable commit, not its commit (the
-core's step R-6), and the replica tells the core each commit it makes durable outside a
-`Ready`'s hard state, the fence's commit-only write and the engine's durable index, so a
-replacement ends only on commits every voter's restart keeps. The core's other steps since
-the last snapshot (readies ahead of their persistence, repair by entries, a marked member's
-election, elections by suspicion) wait for the replica's move onto hyper-raft's durable shell:
-the replica keeps one `Ready` out, its own marks and repair, and elections on ticks. A
-replacement's leader, a follower and the joining member, each killed inside the window between
-a change's commit and the commit its log states (at every write and flush in the simulation,
-and at every window as real processes with `SIGKILL`), leave a group whose members reopen in
-the final configuration once the leader says every voter knows it, and which elects with any
-one of them lost; the runs pass before R-6 and after, and fail when the leader counts a voter
-that only holds the change. A
-deterministic simulation of three members and three concurrent gateways, under crashes,
-failed writes and flushes, partitions, dropped and reordered messages, compaction, and one
-or two members lost for good in every run, checks after every run that each index was
-applied the same everywhere, that every operation completes once faults stop, that every
-put exists exactly once, that the members agree, that each key's history is linearizable,
-and that every member's configuration names the live members. A soak of 20,000 seeds passed, holding 4.4 million messages and 3.3 million ticks
-through flushes and replacing 39,898 members lost for good, and the simulation catches stale reads and repeated
-commands applied twice when either is introduced on purpose.
+Range replicas (`mantle-range`, [design](design/replica.md)) are hyper-raft's durable shell
+over the log and an engine since 2026-10-03 (`hyper-durable`, vendored with the core at hyper-raft
+`df5f8ad`; D-1): the range's engine and layer are the shell's state machine, an entry carries a
+batch of gateway commands applied as one engine batch, client sessions make each command take
+effect once however often it is retried, a write delivered again in a new session is recognised
+by its file, or for a write with no file by the ID the gateway drew for its request, and answered
+as its first delivery was, members that lag are caught up by snapshot, and reads are confirmed by
+ReadIndex. A member lost for good is replaced by one under a new identity: added as a learner,
+caught up, swapped in by one joint change, and done once every voter's durable commit covers the
+new configuration. The shell takes the core's readies ahead of their writes' answers to the log's
+three pipeline frames, taking messages and ticks while writes are out; applies a change of
+configuration only once the member's durable commit covers it (the commit fence, focal's F17),
+the larger of its log's commit and its engine's durable index, whose term the engine keeps beside
+it; states that durable commit in the member's answers (core step R-6), so a replacement ends only
+on commits every voter's restart keeps; repairs a member whose log lost a last frame by its lost
+entries (R-5) and elects it on its log where the others can be a quorum (R-7); and fences a
+member whose log failed a write. Ranges elect on their owner's ticks with focal's counts until the
+node carries the node-pair liveness stream. The move found two faults in the core, fixed there: a
+member whose writes stayed out through a hundred election timeouts sent 234 vote requests at once
+when its device went on, where a campaign now supersedes the requests still waiting; and a
+follower's queue of messages grew from four slots again whenever its writes held more queues
+than the one spare it kept, where it now keeps one for each write that may be out. Directed power
+cuts at every write and flush of a change check for a leader, a follower, a sole voter and a
+group shrinking to one; a replacement's leader, a follower and the joining member, each killed
+inside the window between a change's commit and the commit its durable state states (at every
+write and flush in the simulation, and at every window as real processes with `SIGKILL`), leave
+a group whose members reopen in the final configuration once the leader says every voter knows
+it, and which elects with any one of them lost; counting a voter that only holds the change fails
+them, on mantle's shell before the move and on the durable one. A deterministic simulation of
+three or five members and three concurrent gateways, under crashes, failed writes and flushes,
+partitions, dropped, duplicated and reordered messages, clock steps, compaction, damage at rest,
+and one or two members lost for good in every run, checks after every run that each index was
+applied the same everywhere, that every operation completes once faults stop, that every put
+exists exactly once, that the members agree, that each key's history is linearizable, and that
+every member's configuration names the live members. A soak of 6,000 seeds passed on the shell,
+replacing 14,670 members lost for good and repairing all 232 members its damage marked, and the
+simulation catches stale reads when they are introduced on purpose.
+Against mantle's own shell at `1c179e8` on its workload (hyper-raft's `hyper-durable-compare`,
+four sides in one process, the order rotated each round, load 3.7–20.5), a range group of three
+or five on real files commits at a median 39–44% lower and 35–67% more entries a second, with
+30–43% fewer allocations an entry and the same reallocations; with one member its latency is
+even, an entry's latency its write's on either shell, with 21–31% fewer allocations
+([measurements](measurements/2026-10-03-range-on-the-shell.md)).
 
 Remaining before it is done:
 

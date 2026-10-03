@@ -206,6 +206,7 @@ fn answer(r: Result<(), LogError>) -> &'static str {
         Err(LogError::Foreign(_)) => "foreign",
         Err(LogError::Config(_)) => "config",
         Err(LogError::Claimed(_)) => "claimed",
+        Err(LogError::Behind(_)) => "behind",
         Err(LogError::Disk(_)) => "disk",
     }
 }
@@ -441,6 +442,10 @@ fn save(dir: &std::path::Path, seed: u64, transcript: &str, image: &[u8]) {
 }
 
 #[test]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "an opt-in directory for the transcripts, named by the environment"
+)]
 fn every_seed_leaves_mantle_logs_bytes_and_answers() {
     let dir = std::env::var_os("HYPER_LOG_EQUIVALENCE_OUT").map(std::path::PathBuf::from);
     let mut got = Vec::new();

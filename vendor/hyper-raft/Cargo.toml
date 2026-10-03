@@ -6,9 +6,12 @@ edition = "2024"
 rust-version = "1.98"
 license = "MIT"
 repository = "https://github.com/hyper-light/hyper-raft"
+publish = false
 
 [dependencies]
 crc32c = "0.6"
+# The election law's draw (`election_delay`); a crate of this repository with no dependencies.
+hyper-timing = { path = "../hyper-timing" }
 thiserror = "2.0"
 
 [dev-dependencies]
@@ -17,8 +20,6 @@ thiserror = "2.0"
 raft = { version = "0.7.0", git = "https://github.com/tikv/raft-rs", rev = "8e4cef172421bf77b2ae1c26628a9531b0be41f0", default-features = false, features = ["prost-codec"] }
 raft-proto = { version = "0.7.0", git = "https://github.com/tikv/raft-rs", rev = "8e4cef172421bf77b2ae1c26628a9531b0be41f0", default-features = false, features = ["prost-codec"] }
 slog = "2.7"
-
-
 
 # A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside any consumer workspace.
 [workspace]

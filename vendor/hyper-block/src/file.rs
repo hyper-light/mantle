@@ -235,9 +235,11 @@ impl DeviceFile {
     }
 
     /// Direct transfers move straight between the device and the buffer, so its address
-    /// must be aligned as well (open(2) NOTES; Windows "File Buffering").
+    /// must be aligned as well (open(2) NOTES; Windows "File Buffering"). A transfer of no
+    /// bytes moves none and reaches no system call: an empty buffer, which allocates nothing,
+    /// has no first byte to align, and its address is the empty slice's, one.
     fn check_address(&self, addr: usize, offset: u64, len: usize) -> Result<(), DiskError> {
-        if self.align.is_aligned(addr) {
+        if len == 0 || self.align.is_aligned(addr) {
             return Ok(());
         }
         Err(DiskError::Misaligned {
@@ -362,6 +364,28 @@ mod zones {
     }
 }
 
+/// The size the operating system reports as the one to write `file` in, opened at `path`:
+/// `st_blksize` on Unix (stat(2), "the preferred block size for efficient filesystem I/O"), and on
+/// Windows the physical sector size the file's volume performs best at
+/// (`GetFileInformationByHandleEx`'s `FILE_STORAGE_INFO::PhysicalBytesPerSectorForPerformance`).
+/// A write of it, at an offset it divides, is one the device takes whole, never read, merged and
+/// written back. A size of zero is refused as corrupt.
+pub fn preferred_block(file: &File, path: &Path) -> Result<usize, DiskError> {
+    let wrap = |source| DiskError::Io {
+        op: "preferred_block",
+        path: path.to_path_buf(),
+        source,
+    };
+    let bytes = sys::preferred_block(file).map_err(wrap)?;
+    if bytes == 0 {
+        return Err(DiskError::Corrupt {
+            path: path.to_path_buf(),
+            what: "a file whose preferred block size the system gives as zero",
+        });
+    }
+    Ok(bytes)
+}
+
 /// Flushes a directory so entries created or renamed in it survive a crash (Pillai et al.,
 /// OSDI 2014: a new file's directory entry is durable only after its directory is synced).
 pub fn sync_dir(dir: &Path) -> Result<(), DiskError> {
@@ -395,6 +419,11 @@ mod sys {
 
     pub(super) fn sync_dir(dir: &Path) -> io::Result<()> {
         File::open(dir)?.sync_all()
+    }
+
+    pub(super) fn preferred_block(file: &File) -> io::Result<usize> {
+        use std::os::unix::fs::MetadataExt;
+        usize::try_from(file.metadata()?.blksize()).map_err(|_| io::ErrorKind::InvalidData.into())
     }
 
     pub(super) fn preallocate(file: &File, len: u64) -> io::Result<()> {
@@ -479,6 +508,11 @@ mod sys {
             .sync_all()
     }
 
+    pub(super) fn preferred_block(file: &File) -> io::Result<usize> {
+        let sector = crate::node::storage_info(file)?.PhysicalBytesPerSectorForPerformance;
+        usize::try_from(sector).map_err(|_| io::ErrorKind::InvalidData.into())
+    }
+
     #[expect(
         clippy::disallowed_methods,
         reason = "the device layer sizes the files it owns; preallocation is its job"
@@ -507,6 +541,43 @@ mod tests {
 
     fn align() -> Alignment {
         Alignment::new(4096).unwrap()
+    }
+
+    /// A transfer of no bytes from an empty buffer, whose address is the empty slice's, is no
+    /// misaligned transfer: it moves nothing at every alignment. proptest drew a capacity of
+    /// zero only now and then, and windows-2025 found the address check refusing it.
+    #[test]
+    fn an_empty_buffer_transfers_nothing_at_every_alignment() {
+        let dir = tempfile::tempdir().unwrap();
+        // Direct where the file system takes it (a buffered file is aligned to a byte).
+        let file = DeviceFile::open(
+            &dir.path().join("empty"),
+            true,
+            CachingRequest::PreferDirect,
+            align(),
+        )
+        .unwrap();
+        for shift in 0..=crate::buf::MAX_ALIGNMENT.trailing_zeros() {
+            let mut empty = AlignedBuf::zeroed(0, Alignment::new(1 << shift).unwrap()).unwrap();
+            file.write_all_at(empty.as_slice(), 0).unwrap();
+            file.read_exact_at(empty.as_mut_capacity(), 0).unwrap();
+            assert_eq!(file.read_at(empty.as_mut_capacity(), 0).unwrap(), 0);
+        }
+    }
+
+    /// The size the system reports for a file is a power of two no smaller than the smallest
+    /// sector any device has (512 bytes, the logical sector of every ATA and SCSI disk), and a
+    /// write and flush of it at the start of the file goes through.
+    #[test]
+    fn a_file_is_written_in_the_block_its_system_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("block");
+        let file = options(true).open(&path).unwrap();
+        let block = preferred_block(&file, &path).unwrap();
+        assert!(block.is_power_of_two() && block >= 512, "{block}");
+        sys::write_at(&file, &vec![0xa5; block], 0).unwrap();
+        file.sync_data().unwrap();
+        assert_eq!(file.metadata().unwrap().len(), block as u64);
     }
 
     /// A host-managed device node and a zonefs file are refused; a file on a file system

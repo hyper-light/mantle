@@ -29,6 +29,7 @@ pub mod file;
 pub mod image;
 pub mod issuer;
 mod node;
+pub mod record;
 pub mod scratch;
 #[cfg(any(test, feature = "sim"))]
 pub mod sim;
@@ -94,5 +95,14 @@ pub enum DiskError {
         path: PathBuf,
         /// Why.
         reason: &'static str,
+    },
+    /// A record that does not hold what was written: its checksum fails, or it is longer than its
+    /// reader's bound (`record`).
+    #[error("{}: {what}", path.display())]
+    Corrupt {
+        /// The record.
+        path: PathBuf,
+        /// What does not hold.
+        what: &'static str,
     },
 }

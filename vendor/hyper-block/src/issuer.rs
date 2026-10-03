@@ -149,6 +149,10 @@ impl Issuer {
     /// Starts the issuer of the device at `path` with `depth` workers, or fewer when the
     /// process's thread budget has fewer left; [`DiskError::Threads`] when it has none for one
     /// worker and the issuer's own thread. Every thread starts here, before any is used.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the issuer's bounded device workers: hyper-block runs its device's I/O (clippy.toml's file rule names it)"
+    )]
     pub fn start(path: &Path, depth: usize) -> Result<Self, DiskError> {
         if depth == 0 {
             return Err(invalid(path, "an issuer needs a depth of one at least"));

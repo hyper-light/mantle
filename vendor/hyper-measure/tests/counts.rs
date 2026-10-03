@@ -88,3 +88,22 @@ fn work_set_aside_is_in_the_total_and_apart() {
     let core = total.less(&aside);
     assert_eq!((core.allocations, core.bytes), (1, 16));
 }
+
+/// The Mach counts are read only when the kernel wrote exactly the words `task_events_info` is
+/// declared with: on macOS they must come back, so the declaration matches the running kernel,
+/// and touching fresh pages must raise the fault count.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn the_task_events_layout_is_the_kernels() {
+    let before = hyper_measure::faults::read().unwrap();
+    let task = before
+        .task
+        .expect("the kernel's TASK_EVENTS_INFO_COUNT matches the declaration");
+    let pages: Vec<u8> = std::hint::black_box(vec![1u8; 64 << 20]);
+    let after = hyper_measure::faults::read().unwrap();
+    let later = after
+        .task
+        .expect("the kernel's TASK_EVENTS_INFO_COUNT matches the declaration");
+    drop(pages);
+    assert!(later.faults > task.faults, "{task:?} then {later:?}");
+}

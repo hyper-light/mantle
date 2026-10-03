@@ -26,6 +26,7 @@ use crate::{
     },
     read::{ReadOnly, ReadState},
     storage::Storage,
+    watch::{Arm, TRANSFER_ROUNDS, Timing, Watch, nanos},
 };
 
 /// What grows only to a bound.
@@ -53,6 +54,12 @@ pub struct Limits {
     pub fast_window: u64,
     /// The bytes of what a leader was told the voters hold.
     pub vote_bytes: usize,
+    /// `Ready`s whose writes are out and not yet known durable
+    /// ([`crate::RawNode::advance_issued`]). One is an owner that finishes
+    /// each write before it takes the next. An owner over a pipelined store
+    /// sets the store's depth: hyper-durable sets `LogStore::depth`, which
+    /// for hyper-log is its pipeline frames (`docs/durable.md` §6).
+    pub readies_in_flight: usize,
 }
 /// focal's bounds, carried unchanged. They are literals, not derivations
 /// (mantle note 32 §2.10); `Limits::derive` replaces them in R-3
@@ -68,6 +75,7 @@ impl Default for Limits {
             proposal_bytes: 8 * 1024 * 1024 - 64 * 1024,
             fast_window: 256,
             vote_bytes: 64 * 1024 * 1024,
+            readies_in_flight: 1,
         }
     }
 }
@@ -86,7 +94,12 @@ pub enum Precedence {
     /// `raft-rs`. Two voters whose logs are equally long and end in
     /// different terms refuse each other, the one for priority and the
     /// other for the log, and with the third away the group elects no one.
-    /// Kept to compare the two cores under one rule.
+    /// With a marked member (core step R-7) no member need be away: the
+    /// voter of the longest log, of an older term, refuses the candidate of
+    /// the later term for priority while the marked voter refuses it for its
+    /// mark, and neither of them can be elected. A marked member's election
+    /// is argued by [`Precedence::Log`] (`docs/durable.md` §5.2). Kept to
+    /// compare the two cores under one rule.
     Length,
 }
 
@@ -140,6 +153,27 @@ pub enum HeartbeatAnswers {
     Bare,
 }
 
+/// What starts a member's elections and ends a leader's term for want of
+/// a quorum.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Elections {
+    /// The owner's ticks, as `raft-rs` counts them: a follower campaigns
+    /// after a timeout drawn from `[election_tick, 2·election_tick)` ticks
+    /// without its leader, a leader heartbeats every `heartbeat_tick` and
+    /// checks its quorum every `election_tick`. Every group ticks, idle or
+    /// not, and each count is a number its owner picks. Kept so that the two
+    /// cores compare under one rule (`tests/differential.rs`).
+    #[default]
+    Ticks,
+    /// The owner's failure detectors (timing step L-2, `docs/timing.md`
+    /// §2.1–§2.3, [`crate::watch`]): a follower campaigns when it trusts no
+    /// leader, after a delay drawn over the span the owner measured; a leader
+    /// steps down when its detectors suspect a majority; a leader beats only
+    /// while its group has work in flight. The member takes no ticks. Needs
+    /// pre-vote and check-quorum.
+    Suspicion,
+}
+
 /// How a member runs. [`Config::new`] gives the settings `raft-rs` 0.7
 /// defaults to, so that the two cores compare under one setting.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -188,6 +222,23 @@ pub struct Config {
     pub fast: bool,
     /// A commit alone is not sent; it goes with the next message.
     pub skip_bcast_commit: bool,
+    /// A leader is given the entries of its own term to apply once they
+    /// are committed, whether or not its own write of them is durable yet
+    /// (core step R-6, `docs/durable.md` §4.2): a committed entry is durable
+    /// on a quorum, and waiting for this member's copy adds nothing to its
+    /// durability (TiKV RFC 0112; raft-rs's `max_apply_unpersisted_log_limit`,
+    /// PR #537, enabled on a leader only, PR #561). Entries of earlier terms
+    /// wait for their durability here, since a write still out may replace
+    /// them (the ABA case of `docs/durable.md` §2.1). The entries it covers
+    /// are the leader's unstable entries, bounded by
+    /// [`Limits::unstable_entries`]. Off, as raft-rs's default (a limit of
+    /// zero), so the two cores compare under one setting.
+    pub apply_unpersisted: bool,
+    /// What starts elections ([`Elections`]).
+    pub elections: Elections,
+    /// What storage found the log to lack when the member opened ([`Lost`]); none for a whole
+    /// log. The member keeps it until its durable log holds what it marks.
+    pub lost: Option<Lost>,
     /// What the election timeouts are drawn from.
     pub seed: u64,
     /// The bounds of what grows.
@@ -216,6 +267,9 @@ impl Config {
             heartbeat_answers: HeartbeatAnswers::Position,
             fast: false,
             skip_bcast_commit: false,
+            apply_unpersisted: false,
+            elections: Elections::Ticks,
+            lost: None,
             seed: id,
             limits: Limits::default(),
         }
@@ -256,8 +310,18 @@ impl Config {
             || self.limits.proposal_bytes == 0
             || self.limits.fast_window == 0
             || self.limits.vote_bytes == 0
+            || self.limits.readies_in_flight == 0
         {
             return Err(Error::Settings("a bound that admits nothing"));
+        }
+        if self.elections == Elections::Suspicion && !(self.pre_vote && self.check_quorum) {
+            // A member that opens knowing no leader campaigns: without
+            // pre-vote, one that restarted in an idle group would spend a
+            // term on it and depose a leader that was never gone; and the
+            // lease that refuses its vote request is check-quorum's.
+            return Err(Error::Settings(
+                "elections by suspicion need pre-vote and check-quorum",
+            ));
         }
         if self.limits.entries_per_message > self.limits.unstable_entries {
             return Err(Error::Settings(
@@ -283,6 +347,31 @@ pub struct FastStats {
     pub committed: u64,
     /// Entries this member took at its election from what the voters held.
     pub recovered: u64,
+}
+
+/// What a member's log may lack: entries it acknowledged and lost at rest, through `index`, of
+/// terms up to `term` (`docs/durable.md` §5). It is what its store found when it opened:
+/// hyper-log's uncertainty mark, a lost last frame whose persist record survived (Protocol-Aware
+/// Recovery's faulty entry, Alagappan et al., FAST 2018, §3.3.3). While it lasts the member is
+/// held by what it acknowledged, not by its shorter log: it judges votes by the mark, and tells a
+/// leader that counts the entries that it lost them (core step R-5).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Lost {
+    /// The highest index the log may lack.
+    pub index: u64,
+    /// The highest term an entry it lacks may be of.
+    pub term: u64,
+}
+impl Lost {
+    /// Whether a durable log whose last entry is `index`, of `term`, holds again what the mark
+    /// says it may lack: past the mark's index it holds those entries, received again; with an
+    /// entry of a later term, from a leader, it matches that leader's log through that entry,
+    /// and that leader's log holds every entry committed in the mark's terms (Leader
+    /// Completeness), all before it since terms never fall along a log. hyper-log's rule
+    /// (`resolves`, mantle `docs/design/raft-log.md` §6).
+    pub fn resolved_by(self, index: u64, term: u64) -> bool {
+        index >= self.index || term > self.term
+    }
 }
 
 /// What a member is in its group.
@@ -372,6 +461,13 @@ pub struct Raft<S> {
     /// has a term.
     priority_in_force: i64,
     pub(crate) promotable: bool,
+    /// The commit this member's storage states durably, as its owner said
+    /// (`docs/durable.md` §4.1's `C_d`): what a member that restarts reopens
+    /// with. Its answers state no more when they leave
+    /// (`RawNode::durable_commit`).
+    pub(crate) durable_commit: u64,
+    /// What this member's durable log may lack of what it acknowledged ([`Lost`]).
+    lost: Option<Lost>,
     /// The leader told this member to campaign, and it could not yet: a
     /// change it has committed is not applied. It campaigns once it is,
     /// unless it has heard of a leader or a term since.
@@ -386,6 +482,9 @@ pub struct Raft<S> {
     /// below are no proposals of its own.
     leader_tail: u64,
     random: u64,
+    /// What a member keeps that elects by suspicion ([`Elections::Suspicion`]);
+    /// none on ticks, where it would be eight bytes and a branch.
+    pub(crate) watch: Option<Box<Watch>>,
     pub(crate) config: Config,
 }
 
@@ -401,6 +500,9 @@ pub struct Raft<S> {
 pub struct Outgoing {
     msgs: Vec<Message>,
     payload: usize,
+    /// An emptied queue an owner gave back ([`Outgoing::recycle`]), which
+    /// the next [`Outgoing::take`] leaves in place of the one it gives.
+    spare: Vec<Message>,
 }
 impl Outgoing {
     /// The fewest slots a queue is given: what a tick of a three-member
@@ -427,10 +529,12 @@ impl Outgoing {
     pub fn payload(&self) -> usize {
         self.payload
     }
-    /// The bytes held, by capacity: the slots and what the messages hold.
+    /// The bytes held, by capacity: the slots, the spare queue's, and what
+    /// the messages hold.
     pub fn resident_bytes(&self) -> usize {
         self.msgs
             .capacity()
+            .saturating_add(self.spare.capacity())
             .saturating_mul(std::mem::size_of::<Message>())
             .saturating_add(self.payload)
     }
@@ -457,11 +561,32 @@ impl Outgoing {
         self.msgs.push(message);
         Ok(())
     }
-    /// Everything queued, given up: the queue that remains holds nothing
-    /// and keeps no room.
+    /// Everything queued, given up: the queue that remains holds nothing,
+    /// with the room of the spare an owner gave back, if any.
     pub fn take(&mut self) -> Vec<Message> {
         self.payload = 0;
-        std::mem::take(&mut self.msgs)
+        let spare = std::mem::take(&mut self.spare);
+        std::mem::replace(&mut self.msgs, spare)
+    }
+    /// An owner gives back a queue it has emptied, so the room a burst grew
+    /// stays with the member rather than being grown again from
+    /// [`Outgoing::SMALLEST`]: it is the queue now if nothing waits, else the
+    /// next [`Outgoing::take`]'s. It is kept only where it has more room than
+    /// what it would replace, and no more than `most` slots, the most that
+    /// may wait ([`Limits::pending_messages`]); otherwise it is dropped.
+    pub(crate) fn recycle(&mut self, mut emptied: Vec<Message>, most: usize) {
+        emptied.clear();
+        let room = emptied.capacity();
+        if room > most {
+            return;
+        }
+        if self.msgs.is_empty() {
+            if room > self.msgs.capacity() {
+                self.msgs = emptied;
+            }
+        } else if room > self.spare.capacity() {
+            self.spare = emptied;
+        }
     }
     /// Whether the counter says what a walk of the messages says.
     pub(crate) fn check(&self) -> Result<()> {
@@ -774,6 +899,8 @@ impl<S: Storage> Raft<S> {
             priority: config.priority,
             priority_in_force: 0,
             promotable: false,
+            durable_commit: 0,
+            lost: config.lost,
             told_to_campaign: false,
             log,
             tracker,
@@ -783,12 +910,20 @@ impl<S: Storage> Raft<S> {
             uncommitted_bytes: 0,
             leader_tail: 0,
             random: config.seed,
+            watch: match config.elections {
+                Elections::Ticks => None,
+                // It knows no leader yet (`become_follower` below arms it).
+                Elections::Suspicion => Some(Box::default()),
+            },
             config: config.clone(),
         };
         raft.promotable = raft.tracker.configuration().votes(raft.id);
         if initial.hard_state != HardState::default() {
             raft.load_state(&initial.hard_state)?;
         }
+        // What storage states is durable: the commit of its hard state, or
+        // the snapshot it begins after.
+        raft.durable_commit = raft.log.committed();
         if config.applied > 0 {
             // What was applied may be ahead of the commit that was durable.
             raft.log.applied_to_unchecked(config.applied);
@@ -799,8 +934,23 @@ impl<S: Storage> Raft<S> {
                 raft.held.hold(held, true, false)?;
             }
         }
+        raft.settle_lost()?;
         let term = raft.term;
         raft.become_follower(term, 0)?;
+        if let Some(watch) = raft.watch.as_mut() {
+            // Opened, it has seen no election: like followers whose detectors
+            // suspected their leader together, those opened together draw
+            // over the span from now.
+            watch.campaign = Arm::Unset { round: false };
+            // A member that voted for itself in its term may have led it, and
+            // its followers may trust it still: it campaigns, or hands over,
+            // until its term moves or it follows another leader of it. Its
+            // followers' detectors see it start again, but what it sent
+            // before may still arrive.
+            if raft.vote == raft.id && raft.term != 0 {
+                watch.led = raft.term;
+            }
+        }
         raft.settle_priority();
         Ok(raft)
     }
@@ -891,6 +1041,65 @@ impl<S: Storage> Raft<S> {
     /// drawn from `[election_tick, 2 election_tick)` by [`Config::seed`].
     pub fn randomized_election_timeout(&self) -> usize {
         self.randomized_election_timeout
+    }
+    /// The commit this member's storage states durably, as its owner said:
+    /// the commit of the last durable write's hard state, or a later one
+    /// the owner made durable ([`crate::RawNode::commit_durable`]).
+    pub fn durable_commit(&self) -> u64 {
+        self.durable_commit
+    }
+    /// What this member's durable log may lack of what it acknowledged; none once it holds it.
+    pub fn lost(&self) -> Option<Lost> {
+        self.lost
+    }
+    /// The mark ends once the durable log holds what it marks ([`Lost::resolved_by`]): read
+    /// at open and at every notice, from storage, which holds what is durable.
+    #[inline]
+    pub(crate) fn settle_lost(&mut self) -> Result<()> {
+        match self.lost {
+            None => Ok(()),
+            Some(lost) => self.end_lost(lost),
+        }
+    }
+    fn end_lost(&mut self, lost: Lost) -> Result<()> {
+        let store = self.log.store();
+        let last = store.last_index()?;
+        if lost.resolved_by(last, store.term(last)?) {
+            self.lost = None;
+        }
+        Ok(())
+    }
+    /// Whether this member may campaign as far as what it lost goes (core
+    /// step R-7, `docs/durable.md` §5.2). One whose log may lack what it
+    /// acknowledged campaigns on its log, and its own vote is not counted:
+    /// elected, a quorum of the others answered for no more than its log
+    /// holds, so every entry ever committed is in its log (every commit's
+    /// quorum meets that one in a member that held the entry, or holds it
+    /// under its mark, and answered for it). So only where the others can
+    /// be a quorum of each half of its configuration, and not in a fast
+    /// group, whose held proposals the argument does not cover. A sole
+    /// voter, or one of two, that lost what it acknowledged waits.
+    fn may_campaign(&self) -> bool {
+        if self.lost.is_none() {
+            return true;
+        }
+        let id = self.id;
+        !self.config.fast && self.tracker.quorum_of(|member| member != id)
+    }
+    /// The last entry this member answers for in an election, `(index, term)`: its log's last,
+    /// or what it marks lost, which is later (`docs/durable.md` §5). It may have acknowledged
+    /// through the mark, and been counted toward a commit there, so it votes for no log behind
+    /// it.
+    fn claim(&self) -> Result<(u64, u64)> {
+        match self.lost {
+            Some(lost) => Ok((lost.index, lost.term)),
+            None => Ok((self.log.last_index()?, self.log.last_term()?)),
+        }
+    }
+    /// A write stating `commit` is durable. The durable commit never goes
+    /// back.
+    pub(crate) fn commit_durable(&mut self, commit: u64) {
+        self.durable_commit = self.durable_commit.max(commit);
     }
     pub(crate) fn committed_bytes_per_ready(&self) -> u64 {
         self.config.max_committed_size_per_ready
@@ -1034,6 +1243,11 @@ impl<S: Storage> Raft<S> {
             )
             .saturating_add(self.tracker.resident_bytes())
             .saturating_add(self.log.unstable().resident_bytes())
+            .saturating_add(
+                self.watch
+                    .as_ref()
+                    .map_or(0, |watch| watch.resident_bytes()),
+            )
     }
     /// Whether every counter that [`Raft::resident_bytes`] trusts says what
     /// a walk of what it counts says: the queue, what is not yet durable,
@@ -1053,7 +1267,8 @@ impl<S: Storage> Raft<S> {
     /// with that tick. Asked before the tick, so that its owner knows what
     /// the tick may send.
     pub fn campaigns_on_next_tick(&self) -> bool {
-        self.state != StateRole::Leader
+        self.watch.is_none()
+            && self.state != StateRole::Leader
             && self.promotable
             && self.election_elapsed.saturating_add(1)
                 >= self
@@ -1063,7 +1278,8 @@ impl<S: Storage> Raft<S> {
     /// Whether the next tick makes this leader send its heartbeats, or ask
     /// itself whether it still has a quorum.
     pub fn beats_on_next_tick(&self) -> bool {
-        self.state == StateRole::Leader
+        self.watch.is_none()
+            && self.state == StateRole::Leader
             && (self.heartbeat_elapsed.saturating_add(1) >= self.config.heartbeat_tick
                 || self.election_elapsed.saturating_add(1) >= self.config.election_tick)
     }
@@ -1192,8 +1408,15 @@ impl<S: Storage> Raft<S> {
         if self.told_to_campaign {
             // It is told again by itself if another change waits.
             self.told_to_campaign = false;
-            if self.state == StateRole::Follower && self.promotable {
-                self.hup(true)?;
+            if self.state == StateRole::Follower
+                && self.promotable
+                && let Err(error) = self.hup(true)
+                && error.is_fatal()
+            {
+                // A campaign it may no longer make (its log may lack what it
+                // acknowledged, and the change left the others no quorum
+                // without it) is refused, and changes nothing.
+                return Err(error);
             }
         }
         // A joint configuration that leaves by itself does so once the
@@ -1231,6 +1454,16 @@ impl<S: Storage> Raft<S> {
         self.reset_randomized_election_timeout();
         self.election_elapsed = 0;
         self.heartbeat_elapsed = 0;
+        if let Some(watch) = self.watch.as_mut() {
+            // A new role or term: the member trusts no leader until it hears
+            // one, and a leader's timers start again. Whatever moved it, an
+            // election is under way or just lost: it gives that a round
+            // before it competes, as a reset gives a whole election timeout
+            // on ticks (Raft Figure 2).
+            watch.campaign = Arm::Unset { round: true };
+            watch.beat = Arm::Off;
+            watch.transfer = Arm::Off;
+        }
         self.lead_transferee = None;
         self.told_to_campaign = false;
         self.votes.clear();
@@ -1239,6 +1472,8 @@ impl<S: Storage> Raft<S> {
         self.pending_conf_index = 0;
         self.read_only.clear();
         self.pending_request_snapshot = 0;
+        // Only a leader applies before its own write is durable.
+        self.log.unpersisted_after = u64::MAX;
         let next = self.log.last_index()?.saturating_add(1);
         let (committed, persisted, id) = (self.log.committed(), self.log.persisted(), self.id);
         for (member, progress) in self.tracker.iter_mut() {
@@ -1374,6 +1609,9 @@ impl<S: Storage> Raft<S> {
     /// One tick of the owner's clock. True when there may be something to
     /// take.
     pub fn tick(&mut self) -> Result<bool> {
+        if self.watch.is_some() {
+            return Err(Error::Settings("elections by suspicion take no ticks"));
+        }
         match self.state {
             StateRole::Leader => self.tick_heartbeat(),
             _ => self.tick_election(),
@@ -1424,6 +1662,412 @@ impl<S: Storage> Raft<S> {
             self.local(MessageType::MsgBeat)?;
         }
         Ok(ready)
+    }
+
+    // Elections by suspicion (`crate::watch`, `docs/timing.md` §2.3).
+
+    /// Whether the owner's detectors suspect `member`; never on ticks.
+    pub fn suspects(&self, member: NodeId) -> bool {
+        self.watch
+            .as_ref()
+            .is_some_and(|watch| watch.suspects(member))
+    }
+    /// The members the owner's detectors suspect, in order; none on ticks.
+    pub fn suspected(&self) -> &[NodeId] {
+        self.watch.as_ref().map_or(&[], |watch| watch.suspected())
+    }
+    fn watch_mut(&mut self) -> Result<&mut Watch> {
+        self.watch
+            .as_deref_mut()
+            .ok_or(Error::Settings("elections run on ticks"))
+    }
+    /// The owner's detectors suspect `member`'s node. A follower that knows
+    /// it for its leader campaigns after its delay; a leader whose
+    /// detectors leave it no quorum steps down, and a transfer to it is
+    /// given up. A member never suspects itself.
+    pub fn suspect(&mut self, member: NodeId) -> Result<()> {
+        let (id, leader, state) = (self.id, self.leader_id, self.state);
+        let watch = self.watch_mut()?;
+        if member == id || !watch.suspect(member)? {
+            return Ok(());
+        }
+        if state != StateRole::Leader {
+            if member == leader && watch.campaign == Arm::Off {
+                watch.campaign = Arm::Unset { round: false };
+            }
+            return Ok(());
+        }
+        if self.lead_transferee == Some(member) {
+            self.lead_transferee = None;
+            self.watch_mut()?.transfer = Arm::Off;
+        }
+        if !self.trusted_quorum() {
+            self.step_down()?;
+        }
+        Ok(())
+    }
+    /// Check-quorum, from the detectors (Raft §6.2): a leader they leave no
+    /// quorum steps down, and hands over.
+    fn step_down(&mut self) -> Result<()> {
+        self.hand_over()?;
+        let term = self.term;
+        self.become_follower(term, 0)
+    }
+    /// A leader that stops leading in its term tells the voter it trusts
+    /// that holds the most of its log to campaign at once (a transfer's
+    /// order, Raft dissertation §3.10). Its followers trust its node, which
+    /// lives, and by suspicion nothing else would make them campaign: the
+    /// heir's campaign moves them to its term, where they know no leader.
+    /// An heir that cannot win leaves them so all the same, and they elect
+    /// among themselves.
+    ///
+    /// Among heirs that hold as much, it takes them in turn, one a hand-over
+    /// (`Watch::handovers`): one that restarted knows nothing of what its
+    /// followers hold, and the heir it names first may be one that cannot
+    /// campaign (a learner by its own configuration) or cannot win, while
+    /// its followers keep their lease on it. A schedule found that with a
+    /// leader that restarted marked (R-7, seed 75 of the faults at rest by
+    /// suspicion): it named the same heir for good.
+    fn hand_over(&mut self) -> Result<()> {
+        let configuration = self.tracker.configuration();
+        let heirs = || {
+            self.tracker.iter().filter(|(member, _)| {
+                *member != self.id && configuration.votes(*member) && !self.suspects(*member)
+            })
+        };
+        let Some(most) = heirs().map(|(_, progress)| progress.matched).max() else {
+            return Ok(());
+        };
+        let tied = || heirs().filter(|(_, progress)| progress.matched == most);
+        let turn = self
+            .watch
+            .as_ref()
+            .map_or(0, |watch| usize::try_from(watch.handovers).unwrap_or(0))
+            .checked_rem(tied().count())
+            .unwrap_or(0);
+        let Some(heir) = tied().map(|(member, _)| member).nth(turn) else {
+            return Ok(());
+        };
+        if let Some(watch) = self.watch.as_deref_mut() {
+            watch.handovers = watch.handovers.wrapping_add(1);
+        }
+        self.send(proto::message(heir, MessageType::MsgTimeoutNow))
+    }
+    /// The owner's detectors saw `member`'s node start again: it is
+    /// trusted, and leads nothing it led before it stopped. A follower that
+    /// knew it for its leader knows no leader now, and campaigns after its
+    /// delay unless one is elected or the restarted member's own campaign
+    /// reaches it first; a leader tells it who leads.
+    pub fn restarted(&mut self, member: NodeId) -> Result<()> {
+        self.watch_mut()?.trust(member);
+        if member == self.id {
+            return Ok(());
+        }
+        if self.state == StateRole::Leader {
+            // What was in flight to it went with the incarnation that
+            // stopped: its window is empty, and it is probed from what it
+            // is known to hold, not waited on.
+            if let Some(progress) = self.tracker.get_mut(member) {
+                progress.become_probe();
+            }
+            return self.probe(member);
+        }
+        if self.leader_id == member {
+            self.leader_id = 0;
+        }
+        Ok(())
+    }
+    /// The owner's detectors trust `member`'s node again. A follower that
+    /// knows it for its leader no longer campaigns for it; a leader tells
+    /// it who leads, so a member cut off while the group was idle catches
+    /// up.
+    pub fn trust(&mut self, member: NodeId) -> Result<()> {
+        if !self.watch_mut()?.trust(member) {
+            return Ok(());
+        }
+        if self.state == StateRole::Leader && member != self.id {
+            self.probe(member)?;
+        }
+        Ok(())
+    }
+    /// What the owner's measurements give this group's elections
+    /// ([`Timing`]). A member that has none draws no delay and beats on no
+    /// round: a sole voter campaigns without it, and the others wait for
+    /// it, as hyper-timing's law chooses no span before a quorum's paths
+    /// are measured (`docs/timing.md` §2.3).
+    pub fn set_timing(&mut self, timing: Timing) -> Result<()> {
+        self.watch_mut()?.timing = Some((nanos(timing.span), nanos(timing.round)));
+        Ok(())
+    }
+    /// The timing the owner last gave, if any.
+    pub fn timing(&self) -> Option<Timing> {
+        let (span, round) = self.watch.as_ref()?.timing?;
+        Some(Timing {
+            span: std::time::Duration::from_nanos(span),
+            round: std::time::Duration::from_nanos(round),
+        })
+    }
+    /// The owner holds this member's campaigns, or lets them go: it is
+    /// stalled for room (`docs/durable.md` §8). A log that may lack what it
+    /// acknowledged is the core's to judge since R-7 (`may_campaign`, §5.2):
+    /// held for it, a marked member could not be elected where the rule
+    /// admits it. Everything else goes on: it trusts and suspects, votes,
+    /// and steps down as a leader.
+    pub fn hold_campaigns(&mut self, held: bool) -> Result<()> {
+        self.watch_mut()?.held = held;
+        Ok(())
+    }
+    /// A heartbeat to `member` alone: it learns who leads, and answers
+    /// where its log ends.
+    fn probe(&mut self, member: NodeId) -> Result<()> {
+        let (mut outbox, tracker) = self.outbox();
+        if let Some(progress) = tracker.get_mut(member) {
+            outbox.heartbeat(member, progress, None)?;
+        }
+        Ok(())
+    }
+    /// Whether this member and those it trusts are a quorum of each half of
+    /// its configuration; always on ticks.
+    fn trusted_quorum(&self) -> bool {
+        let Some(watch) = self.watch.as_ref() else {
+            return true;
+        };
+        let (id, whole) = (self.id, self.lost.is_none());
+        // A member whose log may lack what it acknowledged is no part of
+        // its own quorum (R-7).
+        self.tracker.quorum_of(|member| {
+            if member == id {
+                whole
+            } else {
+                !watch.suspects(member)
+            }
+        })
+    }
+    /// Whether a leader's group has work in flight, which its beats
+    /// recover if a message of it is lost: a transfer, a read, or a member
+    /// it trusts that is behind it, has not said it holds the commit, is
+    /// probed, sent a snapshot or has messages out. A member it suspects is
+    /// left out, as CockroachDB quiesces a range whose behind replicas are
+    /// on dead nodes; it is told again once trusted.
+    fn active(&self) -> Result<bool> {
+        if self.lead_transferee.is_some() || !self.read_only.is_empty() {
+            return Ok(true);
+        }
+        let Some(watch) = self.watch.as_ref() else {
+            return Ok(true);
+        };
+        let (last, committed, id) = (self.log.last_index()?, self.log.committed(), self.id);
+        Ok(self.tracker.iter().any(|(member, progress)| {
+            member != id
+                && !watch.suspects(member)
+                && (progress.matched < last
+                    || progress.committed_index < committed
+                    || progress.state != ProgressState::Replicate
+                    || progress.inflights.count() > 0
+                    || progress.pending_request_snapshot != 0)
+        }))
+    }
+    /// A leader's beat by suspicion: a round of heartbeats, each member's
+    /// wait counted as a tick's was.
+    fn beat(&mut self) -> Result<()> {
+        let id = self.id;
+        for (member, progress) in self.tracker.iter_mut() {
+            if member != id {
+                progress.tick();
+            }
+        }
+        self.local(MessageType::MsgBeat)
+    }
+    /// When the member is next to be woken ([`Raft::wake`]), on the owner's
+    /// clock: a campaign, a leader's beat or a transfer's end. None when
+    /// nothing is timed: a follower that trusts its leader, a leader with
+    /// nothing in flight, a member whose campaigns are held or whose
+    /// detectors leave it no quorum, or on ticks.
+    pub fn deadline(&self) -> Option<u64> {
+        let watch = self.watch.as_ref()?;
+        let campaigns =
+            self.promotable && !watch.held && self.may_campaign() && self.trusted_quorum();
+        let campaign = if campaigns || (watch.led == self.term && self.term != 0) {
+            Watch::due(watch.campaign)
+        } else {
+            None
+        };
+        [campaign, Watch::due(watch.beat), Watch::due(watch.transfer)]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+    /// The owner's clock reads `now`, nanoseconds: what was armed since
+    /// the last wake is timed from it, and what is due is done. True when
+    /// the member acted: it campaigned, stepped down, beat or gave up a
+    /// transfer. Nothing on ticks.
+    pub fn wake(&mut self, now: u64) -> Result<bool> {
+        if self.watch.is_none() {
+            return Ok(false);
+        }
+        let mut acted = false;
+        if self.state == StateRole::Leader {
+            if self.trusted_quorum() {
+                return self.wake_leader(now);
+            }
+            self.step_down()?;
+            acted = true;
+        }
+        Ok(self.wake_follower(now)? || acted)
+    }
+    fn wake_leader(&mut self, now: u64) -> Result<bool> {
+        let active = self.active()?;
+        let watch = self.watch_mut()?;
+        let (round, beat, transfer) = (watch.round(), watch.beat, watch.transfer);
+        watch.campaign = Arm::Off;
+        let mut acted = false;
+        let transfer = match (self.lead_transferee, transfer, round) {
+            (None, ..) => Arm::Off,
+            (Some(_), Arm::At(at), _) if now >= at => {
+                // Not finished within its rounds: given up (§3.10).
+                self.lead_transferee = None;
+                acted = true;
+                Arm::Off
+            }
+            (Some(_), Arm::At(at), _) => Arm::At(at),
+            (Some(_), _, Some(round)) => {
+                Arm::At(now.saturating_add(round.saturating_mul(TRANSFER_ROUNDS)))
+            }
+            (Some(_), _, None) => Arm::Unset { round: false },
+        };
+        let beat = match (active, beat, round) {
+            (false, ..) => Arm::Off,
+            (true, _, None) => Arm::Unset { round: false },
+            (true, Arm::At(at), Some(round)) if now >= at => {
+                self.beat()?;
+                acted = true;
+                Arm::At(now.saturating_add(round))
+            }
+            (true, Arm::At(at), Some(_)) => Arm::At(at),
+            (true, _, Some(round)) => Arm::At(now.saturating_add(round)),
+        };
+        // A beat may have stepped the member down (a heartbeat's answer of
+        // a later term arrives later, never within it); its timers stand
+        // as a leader's only while it leads.
+        if self.state == StateRole::Leader {
+            let watch = self.watch_mut()?;
+            watch.beat = beat;
+            watch.transfer = transfer;
+        }
+        Ok(acted)
+    }
+    /// The low and high bounds of the committed entries not yet applied,
+    /// and whether a change of the configuration is among them: a member
+    /// does not campaign on a configuration it has not applied. A snapshot
+    /// not yet durable states its own.
+    fn change_unapplied(&self) -> Result<bool> {
+        let low = match self.log.unstable().snapshot() {
+            Some(snapshot) => proto::snapshot_index(snapshot).saturating_add(1),
+            None => self.log.applied().saturating_add(1),
+        };
+        let high = self.log.committed().saturating_add(1);
+        self.has_unapplied_conf_changes(low, high)
+    }
+    /// It follows `leader` in its term: if it thought it might have led
+    /// this term, it did not, for a term has one leader.
+    fn followed(&mut self, leader: NodeId) {
+        let (id, term) = (self.id, self.term);
+        if let Some(watch) = self.watch.as_mut()
+            && watch.led == term
+            && leader != id
+        {
+            watch.led = 0;
+        }
+    }
+    /// Whether this member trusts a leader: it knows one, its detectors do
+    /// not suspect it, and the configuration it applied names it a voter (a
+    /// leader that is none steps down once it applies that, and a member
+    /// that applied it knows the change was committed).
+    fn trusts_leader(&self, watch: &Watch) -> bool {
+        self.leader_id != 0
+            && !watch.suspects(self.leader_id)
+            && self.tracker.configuration().votes(self.leader_id)
+    }
+    fn wake_follower(&mut self, now: u64) -> Result<bool> {
+        let (promotable, local, term) = (self.promotable, self.config.seed, self.term);
+        let may = self.may_campaign();
+        let alone = self.tracker.is_singleton() && self.tracker.configuration().votes(self.id);
+        let quorum = self.trusted_quorum();
+        let trusts = self
+            .watch
+            .as_deref()
+            .is_some_and(|watch| self.trusts_leader(watch));
+        let watch = self.watch_mut()?;
+        watch.beat = Arm::Off;
+        watch.transfer = Arm::Off;
+        // It led this term and leads no more: until another leader or a
+        // later term reaches it, its followers may trust it still.
+        let led = watch.led == term && term != 0;
+        if trusts || !(promotable || led) {
+            watch.campaign = Arm::Off;
+            return Ok(false);
+        }
+        let armed = match watch.campaign {
+            // Its leader stopped leading (it asked for votes, or started
+            // again): a round for its campaign.
+            Arm::Off => Arm::Unset { round: true },
+            armed => armed,
+        };
+        watch.campaign = match armed {
+            Arm::Unset { round } => match (watch.round(), watch.draw(local)) {
+                (Some(tail), Some(delay)) => Arm::At(
+                    now.saturating_add(if round { tail } else { 0 })
+                        .saturating_add(delay),
+                ),
+                _ => armed,
+            },
+            armed => armed,
+        };
+        // A sole voter has no one to split a vote with, nor a leader to
+        // suspect: it campaigns at once, timed or not.
+        let due = (alone && promotable)
+            || match watch.campaign {
+                Arm::At(at) => now >= at,
+                Arm::Apply => true,
+                Arm::Off | Arm::Unset { .. } => false,
+            };
+        if !due {
+            return Ok(false);
+        }
+        let campaigns = promotable && quorum && may && !watch.held;
+        if !campaigns {
+            if !led {
+                return Ok(false);
+            }
+            // It cannot campaign, and its followers trust it: it hands over
+            // again, a round and a draw after the last, as a candidate asks
+            // again, for the order may have been lost.
+            watch.campaign = match (watch.round(), watch.draw(local)) {
+                (Some(tail), Some(delay)) => {
+                    Arm::At(now.saturating_add(tail).saturating_add(delay))
+                }
+                _ => Arm::Unset { round: true },
+            };
+            self.hand_over()?;
+            return Ok(true);
+        }
+        if self.change_unapplied()? {
+            self.watch_mut()?.campaign = Arm::Apply;
+            return Ok(false);
+        }
+        self.watch_mut()?.campaign = Arm::Off;
+        self.hup(false)?;
+        if self.state != StateRole::Leader {
+            // Unresolved within a round, it draws again.
+            let watch = self.watch_mut()?;
+            watch.campaign = match (watch.round(), watch.draw(local)) {
+                (Some(tail), Some(delay)) => {
+                    Arm::At(now.saturating_add(tail).saturating_add(delay))
+                }
+                _ => Arm::Unset { round: true },
+            };
+        }
+        Ok(true)
     }
 
     pub(crate) fn become_follower(&mut self, term: u64, leader: NodeId) -> Result<()> {
@@ -1477,14 +2121,24 @@ impl<S: Storage> Raft<S> {
         self.reset(term)?;
         self.leader_id = self.id;
         self.state = StateRole::Leader;
-        let last = self.log.last_index()?;
-        // A candidate's log is durable before it asks for votes and does
-        // not change while it asks.
-        if last != self.log.persisted() {
-            return Err(Error::Invariant("a leader whose log is not durable"));
+        // Elected without its own vote by a quorum that answered for no more
+        // than its log holds (R-7): what it lost was committed by no one, and
+        // its first entry, of a later term, will hold what the mark marks.
+        self.lost = None;
+        if let Some(watch) = self.watch.as_mut() {
+            watch.led = term;
         }
+        // Its log need not be durable yet: a member that is the one voter
+        // is elected before its writes are (`docs/durable.md` §2.1). It
+        // counts itself by what is durable (`reset`), and that moves only as
+        // its writes become durable (I3, `Raft::on_persist_entries`).
+        let last = self.log.last_index()?;
         self.uncommitted_bytes = 0;
         self.leader_tail = last;
+        if self.config.apply_unpersisted {
+            // Every entry after `last` is of this term (`append_entries`).
+            self.log.unpersisted_after = last;
+        }
         if let Some(progress) = self.tracker.get_mut(self.id) {
             progress.become_replicate();
         }
@@ -1510,7 +2164,9 @@ impl<S: Storage> Raft<S> {
             self.become_candidate()?;
             (MessageType::MsgRequestVote, self.term)
         };
-        if self.poll(self.id, true)? == Tally::Won {
+        // A member whose log may lack what it acknowledged does not count
+        // its own vote (R-7): it is no witness for its own log.
+        if self.poll(self.id, self.lost.is_none())? == Tally::Won {
             // The one voter there is.
             return Ok(());
         }
@@ -1574,14 +2230,15 @@ impl<S: Storage> Raft<S> {
         if !self.promotable {
             return Err(Error::NotPromotable);
         }
+        if !self.may_campaign() {
+            // Its leader is gone, or it would not be asked: it holds no
+            // lease on one.
+            self.leader_id = 0;
+            return Err(Error::Lost);
+        }
         // A member does not campaign on a configuration it has not
-        // applied. A snapshot not yet durable states its own.
-        let low = match self.log.unstable().snapshot() {
-            Some(snapshot) => proto::snapshot_index(snapshot).saturating_add(1),
-            None => self.log.applied().saturating_add(1),
-        };
-        let high = self.log.committed().saturating_add(1);
-        if self.has_unapplied_conf_changes(low, high)? {
+        // applied.
+        if self.change_unapplied()? {
             // One that was told to campaign does once the change is
             // applied: the leader that told it may have left for it.
             self.told_to_campaign = transfer;
@@ -1655,13 +2312,55 @@ impl<S: Storage> Raft<S> {
             MessageType::MsgRequestVote | MessageType::MsgRequestPreVote
         ) {
             let force = message.context.as_slice() == CAMPAIGN_TRANSFER;
-            let in_lease = self.config.check_quorum
-                && self.leader_id != 0
-                && self.election_elapsed < self.config.election_tick;
+            let in_lease = match self.watch.as_ref() {
+                None => {
+                    self.config.check_quorum
+                        && self.leader_id != 0
+                        && self.election_elapsed < self.config.election_tick
+                }
+                // While it leads, or trusts the leader it knows (Ongaro
+                // §9.6) and the request is not that leader's own. A member
+                // asks for votes only while it does not lead, and terms
+                // only rise at it: a request for a later term from the
+                // leader of this one says it leads no more (it stepped down
+                // for want of a quorum, or restarted), which its node's
+                // detector, trusting a node that lives, cannot say.
+                // Nor when the asker was already in a later term than this
+                // member when it asked (a request names the term it asks
+                // for, one past its own): with pre-vote a term moves only
+                // by a campaign a majority let through, and the leader of
+                // this member's term is deposed once it and the asker
+                // speak. On ticks the lease would have run out; by
+                // suspicion only its leader's detector could end it, and it
+                // trusts a node that lives.
+                Some(watch) => {
+                    self.state == StateRole::Leader
+                        || (self.leader_id != message.from
+                            && message.term <= self.term.saturating_add(1)
+                            && self.trusts_leader(watch))
+                }
+            };
+            if self.watch.is_some()
+                && self.state != StateRole::Leader
+                && self.leader_id == message.from
+            {
+                // Its leader leads no more: the member trusts no leader, and
+                // campaigns itself after its delay if no one else is
+                // elected first. Its log or its priority may be the one the
+                // group needs.
+                self.leader_id = 0;
+            }
             if !force && in_lease {
                 // One that heard its leader within an election timeout
                 // neither moves its term nor votes: a member removed
                 // from the group cannot disturb it.
+                if self.watch.is_some()
+                    && self.state == StateRole::Leader
+                    && self.tracker.get(message.from).is_some()
+                {
+                    // It asks because it knows no leader: tell it.
+                    self.probe(message.from)?;
+                }
                 return Ok(TermChecked::Done);
             }
         }
@@ -1682,8 +2381,12 @@ impl<S: Storage> Raft<S> {
 
     /// A message of a term older than this member's.
     fn step_older_term(&mut self, kind: MessageType, message: &Message) -> Result<()> {
+        // By suspicion, an order to campaign too: a member that stopped
+        // leading hands over until its term moves (`Raft::wake`), and this
+        // answer is how it learns that it has.
+        let handed = kind == MessageType::MsgTimeoutNow && self.watch.is_some();
         if (self.config.check_quorum || self.config.pre_vote)
-            && matches!(kind, MessageType::MsgHeartbeat | MessageType::MsgAppend)
+            && (matches!(kind, MessageType::MsgHeartbeat | MessageType::MsgAppend) || handed)
         {
             // A leader of an older term: this member moved its term
             // while it was cut off. Its answer tells that leader, which
@@ -1717,7 +2420,8 @@ impl<S: Storage> Raft<S> {
         // judges a transfer, which is a decision that a member shall lead.
         let transfer =
             kind == MessageType::MsgRequestVote && message.context.as_slice() == CAMPAIGN_TRANSFER;
-        let (last_index, last_term) = (self.log.last_index()?, self.log.last_term()?);
+        // Judged against what this member answers for: its log, or what it marks lost.
+        let (last_index, last_term) = self.claim()?;
         let ahead = match self.config.precedence {
             Precedence::Log => {
                 message.log_term > last_term
@@ -1725,8 +2429,21 @@ impl<S: Storage> Raft<S> {
             }
             Precedence::Length => message.index > last_index,
         };
-        let ranked = transfer || ahead || self.priority_in_force <= priority_of(message);
-        if can_vote && ranked && self.log.is_up_to_date(message.index, message.log_term)? {
+        // A member whose log may lack what it acknowledged refuses no one
+        // for priority: a voter that refuses for priority must be one the
+        // group could elect instead (`Precedence::Log`), and a marked member
+        // may not be (a schedule, seed 560, found one of the highest
+        // priority refusing every candidate it was not behind). Judged
+        // here, where votes are, and not settled on every operation.
+        let priority = if self.lost.is_some() {
+            0
+        } else {
+            self.priority_in_force
+        };
+        let ranked = transfer || ahead || priority <= priority_of(message);
+        let current = message.log_term > last_term
+            || (message.log_term == last_term && message.index >= last_index);
+        if can_vote && ranked && current {
             // With the asker's term: the member's own is behind it when
             // it is asked about a term to come, and the asker drops what
             // is behind.
@@ -1742,6 +2459,11 @@ impl<S: Storage> Raft<S> {
             if kind == MessageType::MsgRequestVote {
                 self.election_elapsed = 0;
                 self.vote = message.from;
+                if let Some(watch) = self.watch.as_mut() {
+                    // Granting a vote starts the wait again (Raft Figure 2),
+                    // a round for the candidate to win and be heard.
+                    watch.campaign = Arm::Unset { round: true };
+                }
             }
             return Ok(());
         }
@@ -1948,17 +2670,55 @@ impl<S: Storage> Raft<S> {
         }
         Ok(())
     }
+    /// A member says it lost entries it acknowledged (core step R-5): if
+    /// this leader counts them, its progress goes back to the last entry
+    /// the member holds and the entries after it are sent again, not a
+    /// snapshot. True when it did. Lowering a member's match revokes no
+    /// commit (the commit never goes back, and the entries are this
+    /// leader's), so a word that is false costs resends and nothing else.
+    fn take_lost(&mut self, message: &Message) -> Result<bool> {
+        let held = message.reject_hint;
+
+        if self
+            .tracker
+            .get(message.from)
+            .is_none_or(|progress| progress.matched <= held)
+        {
+            return Ok(false);
+        }
+        // What it holds is a prefix of what it acknowledged, which was this
+        // leader's log, and a leader never cuts its own: the same entry,
+        // where this log still holds it (or its snapshot's point).
+        let kept = held.saturating_add(1) >= self.log.first_index()?;
+        if kept && self.log.term(held)? != message.log_term {
+            return Err(Error::Violation(
+                "a member that lost entries holds another log than it acknowledged",
+            ));
+        }
+        if let Some(progress) = self.tracker.get_mut(message.from) {
+            progress.lost(held, message.commit);
+        }
+        self.send_append(message.from)?;
+        Ok(true)
+    }
     fn handle_append_response(&mut self, message: &Message) -> Result<()> {
         let mut next_probe = message.reject_hint;
-        if message.reject && message.log_term > 0 {
-            // The member holds `log_term` at its hint. No index of this
-            // log at or below the hint with a higher term can match it,
-            // for terms only rise along a log: probe at the last one that
-            // may.
-            next_probe = self
-                .log
-                .find_conflict_by_term(message.reject_hint, message.log_term)?
-                .0;
+        if message.reject {
+            // Asked for on a refusal only: an acknowledgement checks nothing
+            // more than before.
+            if message.lost && self.take_lost(message)? {
+                return Ok(());
+            }
+            if message.log_term > 0 {
+                // The member holds `log_term` at its hint. No index of this
+                // log at or below the hint with a higher term can match it,
+                // for terms only rise along a log: probe at the last one
+                // that may.
+                next_probe = self
+                    .log
+                    .find_conflict_by_term(message.reject_hint, message.log_term)?
+                    .0;
+            }
         }
         let last = self.log.last_index()?;
         let Some(progress) = self.tracker.get_mut(message.from) else {
@@ -2035,7 +2795,12 @@ impl<S: Storage> Raft<S> {
         }
         // A beat of the leader's ticks: what was sent a beat ago has had
         // the time, on a path the ticks are stretched by, to be answered.
-        let beat = self.config.heartbeat_tick.max(1);
+        // By suspicion a beat is a round tail, time for an answer.
+        let beat = if self.watch.is_some() {
+            1
+        } else {
+            self.config.heartbeat_tick.max(1)
+        };
         let (mut outbox, tracker) = self.outbox();
         let Some(progress) = tracker.get_mut(message.from) else {
             return Ok(());
@@ -2087,6 +2852,9 @@ impl<S: Storage> Raft<S> {
         }
         // A transfer finishes within an election timeout or is given up.
         self.election_elapsed = 0;
+        if let Some(watch) = self.watch.as_mut() {
+            watch.transfer = Arm::Unset { round: false };
+        }
         self.lead_transferee = Some(target);
         let last = self.log.last_index()?;
         if self
@@ -2163,6 +2931,7 @@ impl<S: Storage> Raft<S> {
                 self.election_elapsed = 0;
                 self.leader_id = message.from;
                 self.told_to_campaign = false;
+                self.followed(message.from);
                 self.handle_append_entries(message)?;
                 self.heard_leader()
             }
@@ -2170,6 +2939,7 @@ impl<S: Storage> Raft<S> {
                 self.election_elapsed = 0;
                 self.leader_id = message.from;
                 self.told_to_campaign = false;
+                self.followed(message.from);
                 self.handle_heartbeat(message)?;
                 self.heard_leader()
             }
@@ -2177,6 +2947,7 @@ impl<S: Storage> Raft<S> {
                 self.election_elapsed = 0;
                 self.leader_id = message.from;
                 self.told_to_campaign = false;
+                self.followed(message.from);
                 self.handle_snapshot(message)?;
                 self.heard_leader()
             }
@@ -2272,6 +3043,11 @@ impl<S: Storage> Raft<S> {
                 let held = self.log.last_index()?;
                 self.release_proposals(held)?;
             }
+            None if self.lost.is_some() && message.index > self.log.last_index()? => {
+                // What it refuses follows entries it may have acknowledged
+                // and lost: it says so.
+                return self.send_lost(message.from, message.index);
+            }
             None => {
                 // The leader's log before its index has terms at most the
                 // one it names: the last index here of such a term is
@@ -2288,7 +3064,29 @@ impl<S: Storage> Raft<S> {
         answer.commit = self.log.committed();
         self.send(answer)
     }
+    /// A member whose log lost entries it acknowledged refuses `index`
+    /// and says it lost them, naming the last entry it holds: a leader
+    /// that counts them takes its progress back there and resends them
+    /// (core step R-5, CTRL's follower repair, Alagappan et al. §3.4). It
+    /// is an ordinary refusal besides, for a leader that counts none of
+    /// them.
+    fn send_lost(&mut self, to: NodeId, index: u64) -> Result<()> {
+        let mut answer = proto::message(to, MessageType::MsgAppendResponse);
+        answer.index = index;
+        answer.reject = true;
+        answer.lost = true;
+        answer.reject_hint = self.log.last_index()?;
+        answer.log_term = self.log.last_term()?;
+        answer.commit = self.log.committed();
+        self.send(answer)
+    }
     fn handle_heartbeat(&mut self, mut message: Message) -> Result<()> {
+        if let Some(lost) = self.lost
+            && message.commit > self.log.last_index()?
+        {
+            // The leader counts entries this member lost: it says so.
+            return self.send_lost(message.from, lost.index);
+        }
         self.log.commit_to(message.commit)?;
         if self.pending_request_snapshot != 0 {
             return self.send_request_snapshot();
@@ -2366,9 +3164,23 @@ impl<S: Storage> Raft<S> {
         Ok(true)
     }
 
+    /// What the detectors said of a member goes when the configuration stops naming it. Kept, a
+    /// suspicion outlived the member's removal, and once it was added again nothing told this
+    /// member otherwise: the owner tells a replica only of the peers it shares a group with, and
+    /// the stream's pair had nothing new to say. A leader then counted a live member out of its
+    /// quorum (`a_member_removed_while_suspected_is_believed_anew_when_added_again`). The owner
+    /// tells it what its detectors believe of a member it is given again (hyper-durable's
+    /// `Owner::pairs`).
+    fn forget_unnamed(&mut self) {
+        if let Some(watch) = self.watch.as_deref_mut() {
+            let configuration = self.tracker.configuration();
+            watch.forget_unnamed(|member| configuration.contains(member));
+        }
+    }
     /// The configuration changed: what follows from it.
     fn post_conf_change(&mut self) -> Result<ConfState> {
         let stated = self.tracker.configuration().to_conf_state()?;
+        self.forget_unnamed();
         let votes = self.tracker.configuration().votes(self.id);
         self.promotable = votes;
         if self.state != StateRole::Leader {
@@ -2389,8 +3201,12 @@ impl<S: Storage> Raft<S> {
                 })
                 .map(|(member, _)| member)
                 .next();
-            if let Some(heir) = heir {
-                self.send(proto::message(heir, MessageType::MsgTimeoutNow))?;
+            match heir {
+                Some(heir) => self.send(proto::message(heir, MessageType::MsgTimeoutNow))?,
+                // By suspicion its followers trust its node, which lives: none
+                // would campaign. The voter that holds the most is told to.
+                None if self.watch.is_some() => self.hand_over()?,
+                None => {}
             }
             let term = self.term;
             self.become_follower(term, 0)?;

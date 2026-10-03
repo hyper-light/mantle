@@ -70,8 +70,46 @@ pub struct Disk {
     pub boot: ConfState,
     pub snapshot: Snapshot,
     pub entries: Vec<Entry>,
+    /// Each entry's checksum as it was written, beside it, as a log keeps
+    /// one with every record (`docs/durable.md` §5): what a fault at rest
+    /// changes no longer matches it.
+    pub sums: Vec<u64>,
+    /// What the log found it lacks of what it acknowledged, as a log that
+    /// tells crashes from damage records it (hyper-log's uncertainty mark):
+    /// the member opens with it ([`hyper_raft::Lost`]).
+    pub lost: Option<hyper_raft::Lost>,
     /// What the member approved by itself.
     pub proposals: Vec<Entry>,
+}
+
+/// An entry's checksum: FNV-1a over everything it states.
+pub fn sum(entry: &Entry) -> u64 {
+    let mut digest = 0xcbf2_9ce4_8422_2325u64;
+    for byte in entry
+        .index
+        .to_le_bytes()
+        .iter()
+        .chain(&entry.term.to_le_bytes())
+        .chain(&[entry.entry_type as u8])
+        .chain(&entry.data)
+        .chain(&entry.context)
+    {
+        digest = (digest ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    digest
+}
+
+/// What a fault at rest does to a member's disk (Ganesan et al., FAST 2017;
+/// `docs/durable.md` §5, §12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fault {
+    /// A bit of the entry at this index flips: the last write's or an
+    /// earlier one's.
+    Flip(u64),
+    /// The last entries, this many, are gone though they were written and
+    /// acknowledged: a lost write, or a misdirected one that wrote them
+    /// elsewhere.
+    Lose(u64),
 }
 impl Disk {
     pub fn snapshot_index(&self) -> u64 {
@@ -106,9 +144,11 @@ impl Disk {
                 entry.index <= self.last_index() + 1,
                 "a gap in what is persisted"
             );
-            self.entries
-                .truncate((entry.index - self.first_index()) as usize);
+            let at = (entry.index - self.first_index()) as usize;
+            self.entries.truncate(at);
+            self.sums.truncate(at);
             self.entries.push(entry.clone());
+            self.sums.push(sum(entry));
         }
         let last = self.last_index();
         self.proposals.retain(|held| held.index > last);
@@ -123,8 +163,10 @@ impl Disk {
             first.index >= self.first_index() && first.index <= self.last_index() + 1,
             "a gap in what is kept"
         );
-        self.entries
-            .truncate((first.index - self.first_index()) as usize);
+        let at = (first.index - self.first_index()) as usize;
+        self.entries.truncate(at);
+        self.sums.truncate(at);
+        self.sums.extend(entries.iter().map(sum));
         self.entries.extend(entries);
         self.trim_proposals();
     }
@@ -142,6 +184,7 @@ impl Disk {
         self.conf = sorted(metadata.conf_state.unwrap_or_default());
         self.hard_state.commit = self.hard_state.commit.max(metadata.index);
         self.entries.clear();
+        self.sums.clear();
         self.snapshot = snapshot;
         self.proposals.retain(|held| held.index > metadata.index);
     }
@@ -150,6 +193,7 @@ impl Disk {
         let term = self.term(index).expect("the compacted index is held");
         let keep = (index + 1 - self.first_index()) as usize;
         self.entries.drain(..keep);
+        self.sums.drain(..keep);
         self.snapshot = Snapshot {
             data,
             metadata: Some(SnapshotMetadata {
@@ -159,9 +203,84 @@ impl Disk {
             }),
         };
     }
+    /// The mark the log keeps, while its entries do not yet hold what it
+    /// marks (`Lost::resolved_by`, hyper-log's rule).
+    pub fn mark(&self) -> Option<hyper_raft::Lost> {
+        let last = self.last_index();
+        self.lost
+            .filter(|lost| !lost.resolved_by(last, self.term(last).unwrap_or(0)))
+    }
+    /// A fault at rest, while the member is stopped: the bytes change, or
+    /// the last entries are gone, and nothing else is told.
+    pub fn suffer(&mut self, fault: Fault) {
+        match fault {
+            Fault::Flip(index) => {
+                let at = (index - self.first_index()) as usize;
+                let entry = &mut self.entries[at];
+                // Its data, or for one that states nothing its kind: never its
+                // term or index, which the persist record holds apart.
+                match entry.data.first_mut() {
+                    Some(byte) => *byte ^= 1,
+                    None => {
+                        entry.entry_type = match entry.entry_type {
+                            EntryType::EntryNormal => EntryType::EntryConfChange,
+                            _ => EntryType::EntryNormal,
+                        }
+                    }
+                }
+            }
+            Fault::Lose(count) => {
+                // Its persist record survived, apart from it (PAR §3.3.4): the log
+                // knows what it acknowledged.
+                let marked = self.lost_through();
+                let keep = self.entries.len() - count as usize;
+                self.entries.truncate(keep);
+                self.sums.truncate(keep);
+                self.lost = Some(marked);
+                self.hard_state.commit = self.hard_state.commit.min(self.last_index());
+            }
+        }
+    }
+    /// The mark that covers everything the log holds now and what it marked.
+    fn lost_through(&self) -> hyper_raft::Lost {
+        let last = self.last_index();
+        let now = hyper_raft::Lost {
+            index: last,
+            term: self.term(last).unwrap_or(0),
+        };
+        match self.mark() {
+            Some(lost) => hyper_raft::Lost {
+                index: lost.index.max(now.index),
+                term: lost.term.max(now.term),
+            },
+            None => now,
+        }
+    }
+    /// What the log does when it opens: every entry is read against its
+    /// checksum, and from the first that does not match nothing is kept,
+    /// marked through what it held (PAR §3.3.3: a mismatch with later
+    /// records is a corruption, never a crash, and what was acknowledged
+    /// is marked, not forgotten). The commit stated past what is kept is
+    /// cut back to it; the leader tells it again.
+    pub fn verify(&mut self) {
+        let Some(bad) = self
+            .entries
+            .iter()
+            .zip(&self.sums)
+            .position(|(entry, written)| sum(entry) != *written)
+        else {
+            return;
+        };
+        let marked = self.lost_through();
+        self.entries.truncate(bad);
+        self.sums.truncate(bad);
+        self.lost = Some(marked);
+        self.hard_state.commit = self.hard_state.commit.min(self.last_index());
+    }
     /// What a member that opens finds applied: the snapshot's
     /// configuration, or the one the group began with.
     pub fn reopen(&mut self) {
+        self.verify();
         self.conf = match self.snapshot.metadata.as_ref() {
             Some(metadata) if metadata.index > 0 => {
                 sorted(metadata.conf_state.clone().unwrap_or_default())
@@ -337,6 +456,30 @@ impl hyper_raft::Storage for Store {
     }
 }
 
+/// What a leader decided: the entry at its commit, and the entry through
+/// which it counts itself as holding its log.
+#[derive(Clone, Debug)]
+pub struct Led {
+    pub term: u64,
+    pub committed: Option<Entry>,
+    pub own: Option<Entry>,
+}
+
+/// A member's persistence, one step at a time ([`Lagged`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// The member takes a `Ready`, sends what may leave at once, and
+    /// issues its write.
+    Take,
+    /// The oldest write out is durable on the member's disk.
+    Durable,
+    /// The member's owner hears of the writes durable since it last did:
+    /// it sends what waited for them and tells the core.
+    Notify,
+    /// Every step until nothing is left to take, write or hear.
+    Flush,
+}
+
 /// What the application is: a digest of what it applied, in order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct App {
@@ -379,7 +522,7 @@ impl App {
 }
 
 pub type Said = (u64, u64, EntryType, Vec<u8>);
-fn said(entry: &Entry) -> Said {
+pub fn said(entry: &Entry) -> Said {
     (
         entry.index,
         entry.term,
@@ -423,6 +566,8 @@ pub struct View {
     pub applied: u64,
     pub timeout: usize,
     pub elapsed: usize,
+    /// Ticks the member waits past its election timeout ([`hyper_raft::Raft::patience`]).
+    pub patience: usize,
     pub pending_conf: u64,
     pub transferee: Option<u64>,
     pub promotable: bool,
@@ -459,6 +604,39 @@ pub struct Settings {
     /// persisting their entries and applying what is committed where they
     /// are, rather than by `RawNode::ready`'s copies.
     pub in_place: bool,
+    /// `Ready`s a member driven ahead of its persistence ([`Lagged`]) has
+    /// out at once (`Limits::readies_in_flight`); the others have one.
+    pub depth: usize,
+    /// Whether a leader applies its own entries before its write of them
+    /// is durable (`Config::apply_unpersisted`); `raft-rs`'s default does
+    /// not.
+    pub apply_unpersisted: bool,
+    /// Whether this core's members elect by suspicion
+    /// (`Elections::Suspicion`, timing step L-2): a tick advances the
+    /// schedule's clock by [`TICK_NS`] and wakes the member, and the
+    /// schedule's detectors suspect and trust. `raft-rs` has only ticks.
+    pub suspicion: bool,
+}
+
+/// A member's clock, in the schedule's nanoseconds, by suspicion: the span a
+/// suspicion's delay is drawn over, the round tail, and a tick's advance of
+/// the member's clock. Each member's clock moves only at its own ticks, as
+/// its ticks do on ticks, so a round is two of its ticks and the span ten,
+/// as `Settings::shell`'s beat (two) and the range its timeouts are drawn
+/// over (ten): measured in the schedule's steps, a member's wait is as long
+/// on either. What they are is the schedule's, not a member's.
+pub const SPAN_NS: u64 = 5_000;
+/// The round tail ([`SPAN_NS`]).
+pub const ROUND_NS: u64 = 5_000;
+/// A tick's advance of the clock ([`SPAN_NS`]).
+pub const TICK_NS: u64 = 500;
+
+/// The timing the schedule gives each member that elects by suspicion.
+pub fn timing() -> hyper_raft::Timing {
+    hyper_raft::Timing {
+        span: std::time::Duration::from_nanos(SPAN_NS),
+        round: std::time::Duration::from_nanos(ROUND_NS),
+    }
 }
 impl Settings {
     /// As focal's shell sets a group.
@@ -478,6 +656,16 @@ impl Settings {
             bare_answers: true,
             fast: false,
             in_place: false,
+            depth: 1,
+            apply_unpersisted: false,
+            suspicion: false,
+        }
+    }
+    /// The same, electing by suspicion.
+    pub fn by_suspicion(self) -> Self {
+        Self {
+            suspicion: true,
+            ..self
         }
     }
     /// As focal runs this core.
@@ -502,6 +690,10 @@ impl Settings {
 }
 
 pub trait Replica: Sized {
+    /// Whether the member takes its `Ready`s ahead of their persistence,
+    /// as the schedule's persistence steps say ([`Lagged`]); the others
+    /// persist each `Ready` as they take it.
+    const LAGGED: bool = false;
     fn open(id: u64, store: Store, settings: &Settings, seed: u64) -> Self;
     fn id(&self) -> u64;
     fn store(&self) -> &Store;
@@ -524,8 +716,40 @@ pub trait Replica: Sized {
     /// What the path to `member` carries before it answers. `raft-rs` has
     /// no such bound and does nothing.
     fn set_window(&mut self, _member: u64, _bytes: u64) {}
+    /// The member's detectors suspect `member` (by suspicion only).
+    fn suspect(&mut self, _member: u64) {}
+    /// The member's detectors trust `member` again (by suspicion only).
+    fn trust(&mut self, _member: u64) {}
+    /// The member's detectors saw `member` start again (by suspicion only).
+    fn restarted(&mut self, _member: u64) {}
+    /// The clock reads `now` (by suspicion only); true when it acted.
+    fn wake(&mut self, _now: u64) -> bool {
+        false
+    }
+    /// When the member is next to be woken (by suspicion only).
+    fn deadline(&self) -> Option<u64> {
+        None
+    }
     fn set_timeout(&mut self, ticks: usize);
     fn drain(&mut self) -> Output;
+    /// A persistence step ([`Step`]); true when it did something.
+    fn persist(&mut self, _step: Step) -> bool {
+        false
+    }
+    /// Whether a persistence step has something to do.
+    fn busy(&self) -> bool {
+        false
+    }
+    /// What the member's persistence steps reached; the writes out count
+    /// as lost, for they are when it stops.
+    fn coverage(&self) -> Coverage {
+        Coverage::default()
+    }
+    /// What a member that leads decided, for the durability oracle
+    /// (`Cluster::check_durable`); none for one that does not lead.
+    fn led(&self) -> Option<Led> {
+        None
+    }
     fn view(&self) -> View;
     fn app(&self) -> App;
     /// Everything applied becomes the snapshot. False when there is
@@ -839,6 +1063,8 @@ impl Replica for Old {
             applied: raft.raft_log.applied,
             timeout: raft.randomized_election_timeout(),
             elapsed: raft.election_elapsed,
+            // raft-rs waits no longer than its timeout.
+            patience: 0,
             pending_conf: raft.pending_conf_index,
             transferee: raft.lead_transferee,
             promotable: raft.promotable(),
@@ -897,32 +1123,77 @@ pub struct New {
 }
 impl New {
     fn apply(&mut self, entries: Vec<Entry>, output: &mut Output) {
-        for entry in entries {
-            output.committed.push(said(&entry));
-            self.app.apply(&entry);
-            let Some(change) = change_of(&entry) else {
-                continue;
-            };
-            let led = self.raw.raft.state() == hyper_raft::StateRole::Leader;
-            let applied = match change {
-                Ok(change) => self.raw.apply_conf_change(&change),
-                Err(change) => self.raw.apply_conf_change_v1(&change),
-            };
-            match applied {
-                Ok(conf) => {
-                    if led && !votes(&conf, self.raw.raft.id()) {
-                        output.leader_left = true;
-                    }
-                    self.raw.store_mut().0.conf = conf.clone();
-                    output.confs.push(conf);
+        apply_to(&mut self.raw, &mut self.app, entries, output);
+    }
+}
+/// What this core gave to apply is applied: the application takes each
+/// entry, and the core each change.
+fn apply_to(
+    raw: &mut hyper_raft::RawNode<Store>,
+    app: &mut App,
+    entries: Vec<Entry>,
+    output: &mut Output,
+) {
+    for entry in entries {
+        output.committed.push(said(&entry));
+        app.apply(&entry);
+        let Some(change) = change_of(&entry) else {
+            continue;
+        };
+        let led = raw.raft.state() == hyper_raft::StateRole::Leader;
+        let applied = match change {
+            Ok(change) => raw.apply_conf_change(&change),
+            Err(change) => raw.apply_conf_change_v1(&change),
+        };
+        match applied {
+            Ok(conf) => {
+                if led && !votes(&conf, raw.raft.id()) {
+                    output.leader_left = true;
                 }
-                Err(error) => {
-                    assert!(!error.is_fatal(), "applying a change: {error}");
-                    output.refused.push(entry.index);
-                }
+                raw.store_mut().0.conf = conf.clone();
+                output.confs.push(conf);
+            }
+            Err(error) => {
+                assert!(!error.is_fatal(), "applying a change: {error}");
+                output.refused.push(entry.index);
             }
         }
     }
+}
+/// What a `Ready` gives to apply: its copies, or, given in place, the range
+/// read from storage.
+fn committed_of(
+    raw: &hyper_raft::RawNode<Store>,
+    in_place: bool,
+    copies: Vec<Entry>,
+    range: Option<(u64, u64)>,
+) -> Vec<Entry> {
+    let Some((first, last)) = range else {
+        return copies;
+    };
+    assert!(
+        copies.is_empty(),
+        "a ready in place copied what it gives to apply"
+    );
+    assert!(in_place, "a range given to apply by a ready that copies");
+    let disk = &raw.store().0;
+    let log = raw.raft.log();
+    (first..=last)
+        .map(|index| {
+            // A leader's own entries given to apply before they are durable here
+            // (`Config::apply_unpersisted`) are read where the log holds them.
+            if index
+                >= log
+                    .unstable()
+                    .entries()
+                    .first()
+                    .map_or(u64::MAX, |e| e.index)
+            {
+                return log.slice(index, index + 1, u64::MAX).unwrap().remove(0);
+            }
+            disk.entries[(index - disk.first_index()) as usize].clone()
+        })
+        .collect()
 }
 fn heard<T>(outcome: hyper_raft::Result<T>) -> Option<T> {
     match outcome {
@@ -937,21 +1208,7 @@ impl New {
     /// What a `Ready` gives to apply: its copies, or, given in place, the
     /// range read from storage.
     fn committed(&self, copies: Vec<Entry>, range: Option<(u64, u64)>) -> Vec<Entry> {
-        let Some((first, last)) = range else {
-            return copies;
-        };
-        assert!(
-            copies.is_empty(),
-            "a ready in place copied what it gives to apply"
-        );
-        assert!(
-            self.in_place,
-            "a range given to apply by a ready that copies"
-        );
-        let disk = &self.raw.store().0;
-        (first..=last)
-            .map(|index| disk.entries[(index - disk.first_index()) as usize].clone())
-            .collect()
+        committed_of(&self.raw, self.in_place, copies, range)
     }
     pub fn fast_stats(&self) -> hyper_raft::FastStats {
         self.raw.raft.fast_stats()
@@ -1001,10 +1258,24 @@ impl Replica for New {
                 hyper_raft::HeartbeatAnswers::Position
             },
             fast: settings.fast,
+            apply_unpersisted: settings.apply_unpersisted,
+            elections: if settings.suspicion {
+                hyper_raft::Elections::Suspicion
+            } else {
+                hyper_raft::Elections::Ticks
+            },
             seed,
+            limits: hyper_raft::Limits {
+                readies_in_flight: settings.depth,
+                ..hyper_raft::Limits::default()
+            },
+            lost: store.0.mark(),
             ..hyper_raft::Config::new(id)
         };
-        let raw = hyper_raft::RawNode::new(&config, store).expect("hyper-raft opens");
+        let mut raw = hyper_raft::RawNode::new(&config, store).expect("hyper-raft opens");
+        if settings.suspicion {
+            raw.set_timing(timing()).expect("by suspicion");
+        }
         Self {
             raw,
             app,
@@ -1063,6 +1334,21 @@ impl Replica for New {
     }
     fn set_window(&mut self, member: u64, bytes: u64) {
         self.raw.set_inflight_bytes(member, bytes);
+    }
+    fn suspect(&mut self, member: u64) {
+        heard(self.raw.suspect(member));
+    }
+    fn trust(&mut self, member: u64) {
+        heard(self.raw.trust(member));
+    }
+    fn restarted(&mut self, member: u64) {
+        heard(self.raw.restarted(member));
+    }
+    fn wake(&mut self, now: u64) -> bool {
+        heard(self.raw.wake(now)).unwrap_or(false)
+    }
+    fn deadline(&self) -> Option<u64> {
+        self.raw.deadline()
     }
     fn set_timeout(&mut self, ticks: usize) {
         self.raw
@@ -1152,6 +1438,10 @@ impl Replica for New {
                 output
                     .hard_states
                     .push((disk.hard_state.term, disk.hard_state.vote, commit));
+                // Written, and durable at once: the member's answers state it from here on.
+                self.raw
+                    .commit_durable(commit)
+                    .expect("a commit the log holds");
             }
             messages.extend(light.take_messages());
             let committed = self.committed(light.take_committed_entries(), light.committed_range());
@@ -1162,60 +1452,65 @@ impl Replica for New {
         output
     }
     fn view(&self) -> View {
-        // What the member counts is what it holds, after every operation.
-        self.raw
-            .check_accounting()
-            .expect("the member's accounting adds up");
-        let raft = &self.raw.raft;
-        let members = raft
-            .tracker()
-            .iter()
-            .map(|(member, progress)| {
-                (
-                    member,
-                    progress.matched,
-                    progress.next_index,
-                    match progress.state {
-                        hyper_raft::progress::ProgressState::Probe => 0,
-                        hyper_raft::progress::ProgressState::Replicate => 1,
-                        hyper_raft::progress::ProgressState::Snapshot => 2,
-                    },
-                    progress.paused,
-                    progress.pending_snapshot,
-                    progress.pending_request_snapshot,
-                    progress.recent_active,
-                    progress.inflights.count(),
-                    progress.committed_index,
-                )
-            })
-            .collect();
-        View {
-            term: raft.term(),
-            vote: raft.vote(),
-            commit: raft.log().committed(),
-            leader: raft.leader_id(),
-            role: role(match raft.state() {
-                hyper_raft::StateRole::Follower => 0,
-                hyper_raft::StateRole::Candidate => 1,
-                hyper_raft::StateRole::Leader => 2,
-                hyper_raft::StateRole::PreCandidate => 3,
-            }),
-            last_index: raft.log().last_index().expect("a last index"),
-            persisted: raft.log().persisted(),
-            applied: raft.log().applied(),
-            timeout: raft.randomized_election_timeout(),
-            elapsed: raft.election_elapsed(),
-            pending_conf: raft.pending_conf_index(),
-            transferee: raft.lead_transferee(),
-            promotable: raft.promotable(),
-            uncommitted: raft.uncommitted_bytes(),
-            pending_reads: raft.pending_read_count(),
-            app: self.app,
-            members,
-        }
+        view_of(&self.raw, self.app)
     }
     fn app(&self) -> App {
         self.app
+    }
+}
+
+/// What a member of this core is.
+fn view_of(raw: &hyper_raft::RawNode<Store>, app: App) -> View {
+    // What the member counts is what it holds, after every operation.
+    raw.check_accounting()
+        .expect("the member's accounting adds up");
+    let raft = &raw.raft;
+    let members = raft
+        .tracker()
+        .iter()
+        .map(|(member, progress)| {
+            (
+                member,
+                progress.matched,
+                progress.next_index,
+                match progress.state {
+                    hyper_raft::progress::ProgressState::Probe => 0,
+                    hyper_raft::progress::ProgressState::Replicate => 1,
+                    hyper_raft::progress::ProgressState::Snapshot => 2,
+                },
+                progress.paused,
+                progress.pending_snapshot,
+                progress.pending_request_snapshot,
+                progress.recent_active,
+                progress.inflights.count(),
+                progress.committed_index,
+            )
+        })
+        .collect();
+    View {
+        term: raft.term(),
+        vote: raft.vote(),
+        commit: raft.log().committed(),
+        leader: raft.leader_id(),
+        role: role(match raft.state() {
+            hyper_raft::StateRole::Follower => 0,
+            hyper_raft::StateRole::Candidate => 1,
+            hyper_raft::StateRole::Leader => 2,
+            hyper_raft::StateRole::PreCandidate => 3,
+        }),
+        last_index: raft.log().last_index().expect("a last index"),
+        persisted: raft.log().persisted(),
+        applied: raft.log().applied(),
+        timeout: raft.randomized_election_timeout(),
+        elapsed: raft.election_elapsed(),
+        patience: raft.patience(),
+        pending_conf: raft.pending_conf_index(),
+        transferee: raft.lead_transferee(),
+        promotable: raft.promotable(),
+        uncommitted: raft.uncommitted_bytes(),
+        pending_reads: raft.pending_read_count(),
+        app,
+        members,
     }
 }
 
@@ -1309,5 +1604,8 @@ impl Replica for Either {
 }
 
 pub mod cluster;
+pub mod lagged;
 #[allow(unused_imports)]
 pub use cluster::{Cluster, Mix, Op, Report};
+#[allow(unused_imports)]
+pub use lagged::{Coverage, Lagged};

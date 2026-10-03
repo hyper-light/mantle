@@ -21,7 +21,7 @@ mod windows;
 #[cfg(target_vendor = "apple")]
 pub(crate) use macos::{len, sync};
 #[cfg(windows)]
-pub(crate) use windows::len;
+pub(crate) use windows::{len, storage_info};
 
 /// Whether `file`, opened at `path`, is a device node rather than a regular file.
 #[cfg(unix)]

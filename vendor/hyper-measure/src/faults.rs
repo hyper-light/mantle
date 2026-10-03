@@ -199,6 +199,11 @@ mod os {
         if code != libc::KERN_SUCCESS {
             return None;
         }
+        // The kernel says how many words it wrote: anything but this structure's size means the
+        // declaration above disagrees with the running kernel's, and its fields are not read.
+        if usize::try_from(count).ok()? != words {
+            return None;
+        }
         // The kernel's counts are 32-bit and wrap; they are kept as the
         // unsigned words they are, so that `Faults::since` takes the
         // difference at that width.
@@ -219,40 +224,18 @@ mod os {
         Err(FaultsError::Unsupported)
     }
 
-    /// Win32 `PROCESS_MEMORY_COUNTERS` (psapi.h).
-    #[repr(C)]
-    /// The fields keep Win32's order; their names are this crate's.
-    #[derive(Default)]
-    struct ProcessMemoryCounters {
-        size: u32,
-        page_faults: u32,
-        peak_working_set: usize,
-        working_set: usize,
-        quota_peak_paged_pool: usize,
-        quota_paged_pool: usize,
-        quota_peak_non_paged_pool: usize,
-        quota_non_paged_pool: usize,
-        pagefile: usize,
-        peak_pagefile: usize,
-    }
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetCurrentProcess() -> *mut core::ffi::c_void;
-        fn K32GetProcessMemoryInfo(
-            process: *mut core::ffi::c_void,
-            counters: *mut ProcessMemoryCounters,
-            size: u32,
-        ) -> i32;
-    }
+    use windows_sys::Win32::System::{
+        ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
+        Threading::GetCurrentProcess,
+    };
 
     pub(super) fn read() -> Result<Faults, FaultsError> {
-        let size = u32::try_from(std::mem::size_of::<ProcessMemoryCounters>())
+        let size = u32::try_from(std::mem::size_of::<PROCESS_MEMORY_COUNTERS>())
             .map_err(|_| FaultsError::Range)?;
-        let mut counters = ProcessMemoryCounters {
-            size,
-            ..ProcessMemoryCounters::default()
-        };
+        // SAFETY: PROCESS_MEMORY_COUNTERS is plain integers, for which all zeroes is a valid
+        // value; `cb` is then set to its size as the call requires.
+        let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+        counters.cb = size;
         // SAFETY: `GetCurrentProcess` returns this process's pseudo-handle
         // and has no precondition; `counters` is a writable
         // `PROCESS_MEMORY_COUNTERS` that lives across the call and `size` is
@@ -264,7 +247,7 @@ mod os {
             )));
         }
         Ok(Faults {
-            minor: u64::from(counters.page_faults),
+            minor: u64::from(counters.PageFaultCount),
             major: None,
             task: None,
         })

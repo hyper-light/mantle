@@ -641,7 +641,8 @@ impl<S: Storage> Raft<S> {
     pub(crate) fn take_displaced(&mut self) -> Vec<Entry> {
         std::mem::take(&mut self.displaced)
     }
-    pub(crate) fn unstable_proposals(&self, into: &mut Vec<Entry>) -> Result<()> {
-        copy_entries_of(self.held.unstable(), into)
+    /// What this member approved by itself that no write was issued for.
+    pub(crate) fn unissued_proposals(&self, into: &mut Vec<Entry>) -> Result<()> {
+        copy_entries_of(self.held.unissued(), into)
     }
 }

@@ -426,6 +426,10 @@ impl<F: BlockFile> Device<F> {
 
     /// A frame, its record and one flush; the frame before answered; this one confirmed and
     /// answered unless another frame follows.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "hyper-log owns its device and times its flushes (CLAUDE.md §1, sans-io's one exception)"
+    )]
     fn frame(&mut self, mut f: Frame, answers: &mut Vec<Answering>) -> Completion {
         let started = Instant::now();
         let result = guarded(|| {

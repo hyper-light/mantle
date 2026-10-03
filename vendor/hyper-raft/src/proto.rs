@@ -147,6 +147,10 @@ pub struct Message {
     pub request_snapshot: u64,
     /// Whether the request is refused.
     pub reject: bool,
+    /// On a refused append's answer: the member's log lacks entries it acknowledged, lost at
+    /// rest (core step R-5, `docs/durable.md` §5). `reject_hint` and `log_term` name the last
+    /// entry it holds; its leader takes the member's progress back to it and resends from there.
+    pub lost: bool,
     /// Where a refused append may resume.
     pub reject_hint: u64,
     /// What the sender attached.

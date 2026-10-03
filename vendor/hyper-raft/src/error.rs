@@ -49,6 +49,11 @@ pub enum Error {
     /// A refusal: a member that is no voter was asked to campaign.
     #[error("only a voter campaigns")]
     NotPromotable,
+    /// A refusal: this member's log may lack entries it acknowledged
+    /// ([`crate::raft::Lost`]), and the others are no quorum without it (or
+    /// the group has the fast track), so it may not campaign.
+    #[error("the log may lack what this member acknowledged")]
+    Lost,
     /// A refusal: the proposal is empty, this member does not lead or is
     /// handing over leadership, or the log did not take it.
     #[error("the proposal is dropped")]

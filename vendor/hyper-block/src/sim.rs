@@ -180,9 +180,10 @@ impl SimFile {
     /// Refuses what a direct-I/O file would refuse: misaligned offsets, lengths and buffer
     /// addresses, so tests catch an engine that would fail on a real `O_DIRECT` file.
     fn check(&self, addr: usize, offset: u64, len: usize) -> Result<u64, DiskError> {
+        // A transfer of no bytes has no first byte to align (`DeviceFile::check_address`).
         if !self.align.is_aligned_u64(offset)
             || !self.align.is_aligned(len)
-            || !self.align.is_aligned(addr)
+            || (len != 0 && !self.align.is_aligned(addr))
         {
             return Err(DiskError::Misaligned {
                 offset,
@@ -469,6 +470,19 @@ mod tests {
             torn |= got.chunks(512).any(|s| s[0] == 1) && got.chunks(512).any(|s| s[0] == 2);
         }
         assert!(torn, "no seed produced a torn write");
+    }
+
+    /// The simulated file takes a transfer of no bytes as the real one does: an empty buffer
+    /// moves nothing at every alignment (`file`'s `an_empty_buffer_transfers_nothing_at_every_alignment`).
+    #[test]
+    fn an_empty_buffer_transfers_nothing() {
+        let f = file(0);
+        for shift in 0..=crate::buf::MAX_ALIGNMENT.trailing_zeros() {
+            let align = Alignment::new(1 << shift).unwrap();
+            let mut empty = crate::buf::AlignedBuf::zeroed(0, align).unwrap();
+            f.write_all_at(empty.as_slice(), 0).unwrap();
+            f.read_exact_at(empty.as_mut_capacity(), 0).unwrap();
+        }
     }
 
     #[test]

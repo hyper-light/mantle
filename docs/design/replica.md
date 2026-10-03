@@ -214,6 +214,14 @@ durable commit here. Mantle's layers have no entry a member acts on at its next 
 its group tells it, the fence's other case (`acts_at_start` in `docs/durable.md`), so changes
 of configuration are all it holds.
 
+The core reads the commit a `Ready`'s write states from the `Ready`'s own hard state, which the
+replica writes as given; a commit the replica makes durable otherwise it tells the core
+(`RawNode::commit_durable`, hyper-raft core step R-6): the commit of the fence's write of the
+hard state alone, once durable, and the engine's durable index after a compaction persists the
+engine, which a restart writes into the log as its commit (§4). The core's answers to appends
+and heartbeats state no commit beyond what it knows durable, so a leader counts a follower's
+commit toward `configuration_known` (§6) only where the follower's restart keeps it.
+
 **What comes while a `Ready` flushes.** focal-raft's core takes no call while a `Ready` is
 out: every mutation returns `Invariant("an operation while a ready is out")`, and
 `advance_append` refuses a term or vote that moved meanwhile (07 §1.2; focal-raft
@@ -383,8 +391,11 @@ only where it lost its own promises, which no peer holds:
   its record. The leader prepares a snapshot that reaches the request once it has applied
   that far, one for each request past the last, and the member installs it, which ends the
   mark. CTRL sends the faulty entries alone, kilobytes against a snapshot's image
-  (AGL+18-F9); the core offers no way to send below the record, and a range's image is
-  bounded by its split size, so the snapshot is the repair until the core has one.
+  (AGL+18-F9); a range's image is bounded by its split size, and the snapshot stays this
+  replica's repair until it moves onto hyper-raft's durable shell (hyper-raft `docs/durable.md`
+  §11, D-1): the core repairs by the lost entries since its step R-5, a refusal flagged lost
+  that takes the leader's record back (`docs/durable.md` §5.1), and the replica leaves the
+  core's mark unset (`Config::lost`), keeping its own rules meanwhile.
   `Replica::repair`, `serve_requests`.
 - *The engine applied entries the log lost.* A member that made its rows durable past what
   the damaged log kept holds committed state, and its hard state is whole. It keeps its
@@ -521,16 +532,18 @@ loses with its leadership, is proposed again, and one already applied never is:
    reach it: learners count toward no quorum, the swap is joint, and focal-raft proposes no
    change until a new leader has applied its whole log, which first commits an entry of its
    own term (06 §A1.7).
-3. The replacement ends once every voter of the final configuration has said it committed the
-   entry that made it (`Replica::configuration_known`, from the commit index each follower
-   reports). A member applies a configuration when it applies its entry, and until then still
-   counts the members the change removed. The leader counts itself without a report: it
-   applies the change only once its own log states the commit (§3). A follower's report
-   leaves after the write that states it, since a follower's messages wait for its `Ready`'s
-   write; the one exception is a member that committed alone as leader, in `advance_append`,
-   and stepped down in the same term, whose answers carry a commit no write stated until its
-   next one. Closing that needs the core to carry the durable commit in answers
-   (hyper-raft `docs/durable.md` R-6). The simulation showed the cost of ending sooner. A
+3. The replacement ends once every voter of the final configuration has said its log states a
+   commit through the entry that made it (`Replica::configuration_known`, from the commit each
+   follower reports). A member applies a configuration when it applies its entry, and until then
+   still counts the members the change removed. The leader counts itself without a report: it
+   applies the change only once its own log states the commit (§3). A member's answers carry its
+   durable commit, not its commit (hyper-raft core step R-6, `docs/durable.md` §4.4): the core
+   holds an answer to the commit the write it waits for states, and the replica tells the core
+   each commit it makes durable outside a `Ready`'s hard state (§3). Before R-6 a follower's
+   report left after the write that stated it, since a follower's messages wait for its
+   `Ready`'s write, and a member that committed alone as leader, in `advance_append`, and
+   stepped down in the same term answered next in a later term, with that term's write. The
+   simulation showed the cost of ending sooner. A
    leader applied the change that left the joint configuration and was lost before the others
    learned it had committed. The two survivors still applied the joint configuration, whose
    old half had lost two of its three members, so they could elect no one. Once every voter
@@ -566,10 +579,12 @@ change. Membership changes are rare, so this costs one image each.
   record confirms its flush (raft-log.md §6), so a range that waits on each ready before
   taking the next waits two flushes an update, and closed-loop appends run at half the rate
   they did (measurements/2026-09-29-log-confirmation.md). With the next ready's frame
-  behind the last, its record would confirm the last at no flush of its own. focal-raft's
-  `Node::ready` refuses a ready while one is out, so this needs the core to hand out readies
-  ahead of their persistence, as raft-rs's asynchronous ready does. Advancing a ready at its
-  flush and holding back only its acknowledgements is not safe: a leader would count toward
+  behind the last, its record would confirm the last at no flush of its own. The core hands
+  out readies ahead of their persistence since hyper-raft's step R-4, as raft-rs's asynchronous
+  ready does, up to `Limits::readies_in_flight`, which this replica leaves at one; hyper-raft's
+  durable shell takes them to the log's depth, and the replica moves onto it (D-1). Advancing
+  a ready at its flush and holding back only its acknowledgements is not safe: a leader would
+  count toward
   commitment a frame recovery may still take for a torn tail. The core also takes no
   message or tick while a ready is out, so the replica holds them until it is done (§3);
   with readies in flight ahead of their persistence the core would step them directly, as
@@ -590,8 +605,8 @@ change. Membership changes are rare, so this costs one image each.
   `a_ready_refused_for_a_full_log_waits_until_another_group_compacts` uses entries of a
   quarter of a frame until it does.
 - The repair of a member its leader counts past its log ships a snapshot, where CTRL ships the
-  faulty entries (§4). Sending below a member's record needs the core to take a refusal that
-  names a regression, which focal-raft does not.
+  faulty entries (§4). The core takes a refusal that names a regression since hyper-raft's step
+  R-5; this replica takes it with the durable shell (D-1).
 - Proposals, reads and campaigns are refused with `Stalled` while a ready is out, and their
   callers retry. A node whose ranges are always flushing under load needs them held as
   messages are, or a scheduler that gives each range a moment between readies (§3).

@@ -186,7 +186,11 @@ pub struct Progress {
     pub recent_active: bool,
     /// The messages sent and not answered.
     pub inflights: Inflights,
-    /// The member's commit as it last said.
+    /// The commit the member last said its storage states durably: a
+    /// member's answers carry its durable commit, not its commit (core step
+    /// R-6, `docs/durable.md` §4.1), so a member that restarts reopens with
+    /// at least this. For the leader itself, its commit; its own durable
+    /// commit is `RawNode::durable_commit`.
     pub committed_index: u64,
     /// The leader's ticks since something sent to the member was out and
     /// none of it was answered for: a full window, or a probe
@@ -272,6 +276,16 @@ impl Progress {
         }
         self.next_index = self.next_index.max(index.saturating_add(1));
         news
+    }
+    /// The member lost what it acknowledged after `held`, and states
+    /// `committed` durable now (core step R-5): it is probed again from
+    /// past `held`, and what it said of its commit before is forgotten.
+    pub fn lost(&mut self, held: u64, committed: u64) {
+        self.matched = held;
+        self.committed_index = committed;
+        self.pending_request_snapshot = 0;
+        self.reset_state(ProgressState::Probe);
+        self.next_index = held.saturating_add(1);
     }
     /// The member says it committed `committed`; the highest said is kept.
     pub fn update_committed(&mut self, committed: u64) {
@@ -569,6 +583,11 @@ impl Tracker {
             && quorum::tally(self.configuration.voters(), Quorum::Fast, |member| {
                 members.binary_search(&member).ok().map(|_| true)
             }) == Tally::Won
+    }
+    /// Whether the members for which `holds` is true hold the quorum of
+    /// both halves.
+    pub fn quorum_of(&self, holds: impl Fn(NodeId) -> bool + Copy) -> bool {
+        self.decided(|member| holds(member).then_some(true)) == Tally::Won
     }
     /// Whether `members`, in order, hold the quorum of both halves.
     pub fn has_quorum(&self, members: &[NodeId]) -> bool {

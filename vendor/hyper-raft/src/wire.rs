@@ -30,6 +30,9 @@ pub const MESSAGE_FIXED_BYTES: usize = 1 + 1 + 9 * 8 + 8 + 4 + 4;
 const REJECT: u8 = 1;
 /// Flag bit of a message: a snapshot follows the entries.
 const HAS_SNAPSHOT: u8 = 1 << 1;
+/// Flag bit of a message: a refused append's answer from a member whose log lost entries it
+/// acknowledged (core step R-5).
+const LOST: u8 = 1 << 2;
 /// Presence bit of a snapshot: its metadata follows.
 const HAS_METADATA: u8 = 1;
 /// Presence bit of a snapshot: the metadata's configuration follows its index and term.
@@ -486,6 +489,9 @@ impl Record for Message {
         if self.snapshot.is_some() {
             flags |= HAS_SNAPSHOT;
         }
+        if self.lost {
+            flags |= LOST;
+        }
         out.push(flags);
         for field in [
             self.to,
@@ -514,7 +520,7 @@ impl Record for Message {
     fn take_body(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
         let msg_type = take_message_kind(reader.byte()?)?;
         let flags = reader.byte()?;
-        if flags & !(REJECT | HAS_SNAPSHOT) != 0 {
+        if flags & !(REJECT | HAS_SNAPSHOT | LOST) != 0 {
             return Err(DecodeError::Unknown {
                 what: "message flags",
                 value: flags,
@@ -567,6 +573,7 @@ impl Record for Message {
             snapshot,
             request_snapshot,
             reject: flags & REJECT != 0,
+            lost: flags & LOST != 0,
             reject_hint,
             context,
             priority,
@@ -629,6 +636,94 @@ impl Record for ConfChangeV2 {
     }
 }
 
+/// The changes the record of a change of configuration states, read in place: each change's
+/// kind and member, in order, with nothing allocated, for an owner that counts what a committed
+/// change will add before the core applies it. A change of one member states one change; an
+/// entry with no data states none (the empty change, [`crate::proto::change_of`]), as does one
+/// that is no change. The record is checked whole before the first change is given (its version,
+/// kind and checksum, each change's kind, the context's length, no bytes left over), so what
+/// [`Record::decode`] refuses this refuses too.
+pub fn changes_stated(entry: &Entry) -> Result<ChangesStated<'_>, DecodeError> {
+    let kind = match entry.entry_type {
+        EntryType::EntryNormal => return Ok(ChangesStated::NONE),
+        EntryType::EntryConfChange => ConfChange::KIND,
+        EntryType::EntryConfChangeV2 => ConfChangeV2::KIND,
+    };
+    if entry.data.is_empty() {
+        return Ok(ChangesStated::NONE);
+    }
+    let (covered, crc) = entry
+        .data
+        .split_last_chunk::<CHECKSUM_BYTES>()
+        .ok_or(DecodeError::Truncated)?;
+    let mut reader = Reader { bytes: covered };
+    let version = reader.byte()?;
+    if version != VERSION {
+        return Err(DecodeError::Version(version));
+    }
+    let found = reader.byte()?;
+    if found != kind {
+        return Err(DecodeError::Kind(found));
+    }
+    if crc32c::crc32c(covered) != u32::from_le_bytes(*crc) {
+        return Err(DecodeError::Corrupt);
+    }
+    let count = if kind == ConfChange::KIND {
+        1
+    } else {
+        take_transition(reader.byte()?)?;
+        reader.count(1 + 8)?
+    };
+    let changes = Reader {
+        bytes: reader.bytes,
+    };
+    for _ in 0..count {
+        take_change_kind(reader.byte()?)?;
+        reader.u64()?;
+    }
+    let context = reader.length()?;
+    reader.take(context)?;
+    if !reader.bytes.is_empty() {
+        return Err(DecodeError::Trailing);
+    }
+    Ok(ChangesStated {
+        changes,
+        left: count,
+    })
+}
+
+/// The changes a record states, each read as it is asked for ([`changes_stated`]).
+#[derive(Debug)]
+pub struct ChangesStated<'a> {
+    changes: Reader<'a>,
+    left: usize,
+}
+
+impl ChangesStated<'_> {
+    /// No changes, read from no bytes: what an entry that states none gives.
+    const NONE: Self = Self {
+        changes: Reader { bytes: &[] },
+        left: 0,
+    };
+}
+
+impl Iterator for ChangesStated<'_> {
+    type Item = ConfChangeSingle;
+    fn next(&mut self) -> Option<ConfChangeSingle> {
+        self.left = self.left.checked_sub(1)?;
+        // Every change was read once before the first was given, so none fails here.
+        let change_type = take_change_kind(self.changes.byte().ok()?).ok()?;
+        let node_id = self.changes.u64().ok()?;
+        Some(ConfChangeSingle {
+            change_type,
+            node_id,
+        })
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left, Some(self.left))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -682,9 +777,27 @@ mod tests {
             snapshot: Some(Box::new(snapshot())),
             request_snapshot: 9,
             reject: true,
+            lost: false,
             reject_hint: 39,
             context: b"read".to_vec(),
             priority: -5,
+        }
+    }
+
+    /// A member's word that its log lost entries it acknowledged (core step R-5).
+    fn lost() -> Message {
+        Message {
+            msg_type: MessageType::MsgAppendResponse,
+            to: 1,
+            from: 3,
+            term: 7,
+            log_term: 6,
+            index: 44,
+            commit: 38,
+            reject: true,
+            lost: true,
+            reject_hint: 40,
+            ..Message::default()
         }
     }
 
@@ -752,6 +865,16 @@ mod tests {
         let encoded = message().encode_to_vec();
         assert_eq!(encoded, sealed(1, &body));
         assert_eq!(encoded.len(), message().encoded_len());
+
+        // The lost refusal: the answer's kind, the reject and lost flags, the words.
+        let mut body = vec![4, REJECT | LOST];
+        for field in [1u64, 3, 7, 6, 44, 38, 0, 0, 40] {
+            body.extend_from_slice(&field.to_le_bytes());
+        }
+        body.extend_from_slice(&0i64.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(lost().encode_to_vec(), sealed(1, &body));
     }
 
     /// A record and whether bytes read back to its value.
@@ -763,6 +886,7 @@ mod tests {
         }
         vec![
             (message().encode_to_vec(), |b| round(b, &message())),
+            (lost().encode_to_vec(), |b| round(b, &lost())),
             (entry().encode_to_vec(), |b| round(b, &entry())),
             (snapshot().encode_to_vec(), |b| round(b, &snapshot())),
             (change().encode_to_vec(), |b| round(b, &change())),
@@ -868,7 +992,7 @@ mod tests {
             Message::decode(&sealed(1, &body)),
             Err(DecodeError::Unknown { .. })
         ));
-        let mut body = vec![3, 1 << 7];
+        let mut body = vec![3, 1 << 3];
         body.extend_from_slice(&[0; 9 * 8 + 8 + 8]);
         assert!(matches!(
             Message::decode(&sealed(1, &body)),
@@ -904,7 +1028,146 @@ mod tests {
                 let _ = Snapshot::decode(&record);
                 let _ = ConfChange::decode(&record);
                 let _ = ConfChangeV2::decode(&record);
+                for entry_type in [EntryType::EntryConfChange, EntryType::EntryConfChangeV2] {
+                    let entry = Entry {
+                        entry_type,
+                        data: record.clone(),
+                        ..Entry::default()
+                    };
+                    // What the read in place accepts, the decoder accepts, and the two agree.
+                    if let Ok(stated) = changes_stated(&entry) {
+                        let stated: Vec<ConfChangeSingle> = stated.collect();
+                        let decoded = crate::proto::change_of(&entry).unwrap().unwrap();
+                        assert_eq!(stated, decoded.changes);
+                    }
+                }
             }
         }
+    }
+
+    fn changes(entry_type: EntryType, data: Vec<u8>) -> Result<Vec<ConfChangeSingle>, DecodeError> {
+        changes_stated(&Entry {
+            entry_type,
+            data,
+            ..Entry::default()
+        })
+        .map(Iterator::collect)
+    }
+
+    /// The changes read in place are the changes the record decodes to, for a change of one
+    /// member and of many; no data, and an entry that is no change, state none.
+    #[test]
+    fn changes_read_in_place_are_the_changes_decoded() {
+        let single = ConfChange {
+            change_type: ConfChangeType::AddLearnerNode,
+            node_id: 9,
+            context: b"ctx".to_vec(),
+        };
+        assert_eq!(
+            changes(EntryType::EntryConfChange, single.encode_to_vec()),
+            Ok(vec![ConfChangeSingle {
+                change_type: ConfChangeType::AddLearnerNode,
+                node_id: 9,
+            }])
+        );
+        for count in [0, 1, 2, 7, 64] {
+            let many = ConfChangeV2 {
+                transition: ConfChangeTransition::Explicit,
+                changes: (1..=count)
+                    .map(|node_id| ConfChangeSingle {
+                        change_type: if node_id % 2 == 0 {
+                            ConfChangeType::RemoveNode
+                        } else {
+                            ConfChangeType::AddNode
+                        },
+                        node_id,
+                    })
+                    .collect(),
+                context: vec![7; usize::try_from(count).unwrap()],
+            };
+            let entry = Entry {
+                entry_type: EntryType::EntryConfChangeV2,
+                data: many.encode_to_vec(),
+                ..Entry::default()
+            };
+            let stated = changes_stated(&entry).unwrap();
+            assert_eq!(
+                stated.size_hint(),
+                (many.changes.len(), Some(many.changes.len()))
+            );
+            assert_eq!(stated.collect::<Vec<_>>(), many.changes);
+        }
+        assert_eq!(
+            changes(EntryType::EntryConfChangeV2, Vec::new()),
+            Ok(Vec::new())
+        );
+        assert_eq!(
+            changes(EntryType::EntryConfChange, Vec::new()),
+            Ok(Vec::new())
+        );
+        assert_eq!(
+            changes(EntryType::EntryNormal, b"data".to_vec()),
+            Ok(Vec::new())
+        );
+    }
+
+    /// What the decoder refuses, the read in place refuses: a flipped bit, a record of the other
+    /// change's kind, bytes cut short or left over, a change of no kind, a transition of none.
+    #[test]
+    fn changes_read_in_place_refuse_what_decoding_refuses() {
+        let many = ConfChangeV2 {
+            transition: ConfChangeTransition::Implicit,
+            changes: vec![ConfChangeSingle {
+                change_type: ConfChangeType::AddNode,
+                node_id: 4,
+            }],
+            context: b"x".to_vec(),
+        };
+        let record = many.encode_to_vec();
+        let mut flipped = record.clone();
+        flipped[3] ^= 1;
+        assert_eq!(
+            changes(EntryType::EntryConfChangeV2, flipped),
+            Err(DecodeError::Corrupt)
+        );
+        assert_eq!(
+            changes(EntryType::EntryConfChange, record.clone()),
+            Err(DecodeError::Kind(ConfChangeV2::KIND))
+        );
+        // No bytes at all are the empty change; any other cut is refused.
+        for cut in 1..record.len() {
+            assert!(changes(EntryType::EntryConfChangeV2, record[..cut].to_vec()).is_err());
+        }
+        let body_end = record.len() - CHECKSUM_BYTES;
+        let mut longer = record[HEADER_BYTES..body_end].to_vec();
+        longer.push(0);
+        assert_eq!(
+            changes(
+                EntryType::EntryConfChangeV2,
+                sealed(ConfChangeV2::KIND, &longer)
+            ),
+            Err(DecodeError::Trailing)
+        );
+        let mut no_kind = record[HEADER_BYTES..body_end].to_vec();
+        no_kind[5] = 9;
+        assert_eq!(
+            changes(
+                EntryType::EntryConfChangeV2,
+                sealed(ConfChangeV2::KIND, &no_kind)
+            ),
+            Err(DecodeError::Unknown {
+                what: "change kind",
+                value: 9
+            })
+        );
+        let mut no_transition = record[HEADER_BYTES..body_end].to_vec();
+        no_transition[0] = 9;
+        assert!(matches!(
+            changes(
+                EntryType::EntryConfChangeV2,
+                sealed(ConfChangeV2::KIND, &no_transition)
+            ),
+            Err(DecodeError::Unknown { value: 9, .. })
+        ));
     }
 }

@@ -232,3 +232,17 @@ equivalence passed pinned to one core 200 times and unpinned 50.
   its own I/O on its second thread until then.
 - Entries read from the file wait behind a frame's write and flush: one I/O at a time.
 - mantle's replica shell on this crate (D-1), and mantle and focal consuming it (F-1).
+
+## For the durable shell (hyper-durable D-1)
+
+- **A write sent behind a refused one is refused** (`LogError::Behind`). A group's handle keeps an
+  epoch it moves each time it takes a refusal, and every write it sends carries it; the owner
+  records the epoch of a handle's refused write and refuses the group's writes of that epoch or an
+  earlier one, until one of a later epoch is laid. A group's writes are laid one a frame, in the
+  order sent, so the record is cleared only once every write sent before it was refused. Before,
+  a write of the hard state alone sent behind entries refused for the group's bound was written,
+  and the group stated a commit past what it held (`tests/log.rs`,
+  `a_write_sent_behind_a_refused_one_is_refused_too`, fails without the owner's check). The
+  equivalence transcripts are unchanged: no write of theirs follows a refusal of its group.
+- `GroupLog::depth`, the log's `PIPELINE_FRAMES`: the writes a replica keeps out at once; and
+  `GroupLog::has_room`, the handle's own bound, before which a write is never refused `Busy`.

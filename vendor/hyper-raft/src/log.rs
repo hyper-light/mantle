@@ -2,20 +2,35 @@
 //! not yet durable.
 //!
 //! `applied <= committed`, and nothing is given to apply that is not both
-//! committed and durable here. `persisted` is the highest index known
-//! durable; an entry that replaces a durable one lowers it.
+//! committed and durable here, but for a leader's own entries where it
+//! applies them before its own write is durable ([`Log::unpersisted_after`],
+//! core step R-6). `persisted` is the highest index known durable; an entry
+//! that replaces a durable one lowers it.
+//!
+//! What is not durable stays in [`Unstable`] until it is, whatever writes
+//! of it were issued (etcd's rule for asynchronous storage writes: the
+//! unstable log "should hold entries until they are stable", etcd-io/raft
+//! PR #8; `docs/durable.md` §2.1). A mark says how far writes were issued,
+//! so that each `Ready` gives only what no earlier one gave.
 use crate::{
     error::{Error, Result, StorageError},
     proto::{self, Entry, Snapshot},
     storage::Storage,
 };
 
-/// Entries and a snapshot that storage does not hold yet. The entry at
-/// position `i` has the index `offset + i`. `offset` may be at or below
-/// what storage holds: the next write truncates storage there.
+/// Entries and a snapshot that storage does not hold durably yet. The
+/// entry at position `i` has the index `offset + i`. `offset` may be at or
+/// below what storage holds: the next write truncates storage there.
+///
+/// `issued` is the first index no write was issued for, `offset <= issued
+/// <= end`: the entries before it were given by a `Ready` whose write is
+/// out, and stay here until it is durable. A replacement below it moves it
+/// back, so the next `Ready` gives what replaced them.
 #[derive(Debug, Default)]
 pub struct Unstable {
     pub(crate) snapshot: Option<Snapshot>,
+    /// Whether a write of the snapshot was issued.
+    pub(crate) snapshot_issued: bool,
     pub(crate) entries: Vec<Entry>,
     /// About the bytes the entries state (`proto::approximate_bytes`).
     pub(crate) bytes: usize,
@@ -23,6 +38,7 @@ pub struct Unstable {
     /// resident, kept as they come and go so that asking costs nothing.
     pub(crate) payload: usize,
     pub(crate) offset: u64,
+    pub(crate) issued: u64,
 }
 
 fn position(index: u64, offset: u64) -> Option<usize> {
@@ -230,6 +246,9 @@ impl Unstable {
         if after <= self.offset && after != self.end() {
             self.offset = after;
         }
+        // What replaces an issued entry is issued by the next `Ready`; what
+        // follows the end leaves the mark where it is.
+        self.issued = self.issued.min(after).max(self.offset);
         for entry in self.entries.drain(kept..) {
             self.bytes = self.bytes.saturating_sub(proto::approximate_bytes(&entry));
             self.payload = self.payload.saturating_sub(payload_of(&entry));
@@ -238,7 +257,11 @@ impl Unstable {
             self.bytes = self.bytes.saturating_add(proto::approximate_bytes(entry));
             self.payload = self.payload.saturating_add(payload_of(entry));
         }
-        if kept == 0 {
+        // Nothing kept: the incoming vector is taken as it is, unless the
+        // log's own, emptied above, already has the room. Keeping that room
+        // is what lets a proposal appended while a write is out (core step
+        // R-4) land without growing the vector again.
+        if kept == 0 && self.entries.capacity() < entries.len() {
             self.entries = entries;
         } else {
             self.entries.append(&mut entries);
@@ -259,7 +282,31 @@ impl Unstable {
         self.bytes = 0;
         self.payload = 0;
         self.offset = proto::snapshot_index(&snapshot).saturating_add(1);
+        self.issued = self.offset;
         self.snapshot = Some(snapshot);
+        self.snapshot_issued = false;
+    }
+    /// The entries no write was issued for yet, in order of index.
+    pub fn unissued(&self) -> &[Entry] {
+        let from = position(self.issued, self.offset).unwrap_or(0);
+        self.entries.get(from..).unwrap_or(&[])
+    }
+    /// Whether an entry is held that no write was issued for.
+    pub fn has_unissued(&self) -> bool {
+        self.issued < self.end()
+    }
+    /// The snapshot, when no write of it was issued yet.
+    pub fn unissued_snapshot(&self) -> Option<&Snapshot> {
+        self.snapshot.as_ref().filter(|_| !self.snapshot_issued)
+    }
+    /// A write of everything held was issued.
+    pub(crate) fn issue(&mut self) {
+        self.issued = self.end();
+        self.snapshot_issued = self.snapshot.is_some();
+    }
+    /// The first index no write was issued for.
+    pub fn issued(&self) -> u64 {
+        self.issued
     }
     /// The entries storage does not hold yet, in order of index.
     pub fn entries(&self) -> &[Entry] {
@@ -311,6 +358,11 @@ impl Unstable {
                 "what is not yet durable is not what its counters say",
             ));
         }
+        if self.issued < self.offset || self.issued > self.end() {
+            return Err(Error::Invariant(
+                "the issue mark outside what is not yet durable",
+            ));
+        }
         Ok(())
     }
 }
@@ -347,6 +399,16 @@ pub struct Log<S> {
     pub(crate) committed: u64,
     pub(crate) persisted: u64,
     pub(crate) applied: u64,
+    /// A leader that applies its own entries before its write of them is
+    /// durable (`Config::apply_unpersisted`): the last index before its
+    /// term's entries. What is committed after it is given to apply once
+    /// everything through it is durable here; the entries through it are of
+    /// earlier terms, which a write still out may replace. `u64::MAX` for a
+    /// member that does not lead, or does not apply so: no index reaches it.
+    /// A plain index rather than an `Option`, so `Log` grows by 8 bytes, not
+    /// 16: the 16 left the leadership-transfer and failover loops 2-5 %
+    /// slower than at `b73e18b` (`docs/benchmarks.md`, R-6).
+    pub(crate) unpersisted_after: u64,
     /// The most entries held that are not yet durable.
     max_unstable: usize,
 }
@@ -367,8 +429,10 @@ impl<S: Storage> Log<S> {
             applied: first.saturating_sub(1),
             unstable: Unstable {
                 offset: last.saturating_add(1),
+                issued: last.saturating_add(1),
                 ..Unstable::default()
             },
+            unpersisted_after: u64::MAX,
             max_unstable,
         })
     }
@@ -598,51 +662,90 @@ impl<S: Storage> Log<S> {
     pub(crate) fn applied_to_unchecked(&mut self, index: u64) {
         self.applied = index;
     }
-    /// The entries through `(index, term)` are handed to storage.
-    pub fn stable_entries(&mut self, index: u64, term: u64) -> Result<()> {
-        self.take_stable_entries(index, term).map(drop)
+    /// A write that held the entries through `(index, term)` is durable, and
+    /// storage holds them: they leave what is not yet durable. False, and
+    /// nothing changes, when they are not what is held there now (a later
+    /// append replaced them while the write was out), when they are durable
+    /// already, or when a snapshot before them is not.
+    pub fn stable_to(&mut self, index: u64, term: u64) -> Result<bool> {
+        self.take_stable_to(index, term, None)
     }
-    /// As [`Log::stable_entries`], giving the entries up to the caller: the
-    /// log holds them no more, and storage, which holds them now, may keep
-    /// these very ones.
-    pub fn take_stable_entries(&mut self, index: u64, term: u64) -> Result<Vec<Entry>> {
-        if self.unstable.snapshot.is_some() {
-            return Err(Error::Invariant(
-                "entries made durable before their snapshot",
-            ));
+    /// As [`Log::stable_to`], giving the entries up to `into`, after what it
+    /// holds: storage, which holds them now, may keep these very ones. When
+    /// they are all that is held and `into` is empty, the log's own vector
+    /// is given, copied nowhere. With no `into` they are dropped in place,
+    /// and the log keeps its vector's room for what is appended next: with
+    /// readies taken ahead (core step R-4) the next proposal arrives while a
+    /// write is out, and a vector given away is grown again for it.
+    #[inline]
+    pub(crate) fn take_stable_to(
+        &mut self,
+        index: u64,
+        term: u64,
+        into: Option<&mut Vec<Entry>>,
+    ) -> Result<bool> {
+        let unstable = &mut self.unstable;
+        // Entries are never durable before the snapshot they follow.
+        if unstable.snapshot.is_some() {
+            return Ok(false);
         }
-        let last = self
-            .unstable
+        let Some(at) = position(index, unstable.offset) else {
+            return Ok(false);
+        };
+        if unstable
             .entries
-            .last()
-            .ok_or(Error::Invariant("nothing to make durable"))?;
-        if last.index != index || last.term != term {
-            return Err(Error::Invariant(
-                "what was made durable is not what was given",
-            ));
+            .get(at)
+            .is_none_or(|held| held.term != term)
+        {
+            return Ok(false);
         }
-        self.unstable.offset = index.saturating_add(1);
-        // Given up, and not emptied: a member that rests holds what it
-        // held before it was written to.
-        self.unstable.bytes = 0;
-        self.unstable.payload = 0;
-        Ok(std::mem::take(&mut self.unstable.entries))
-    }
-    /// The snapshot at `index` is handed to storage.
-    pub fn stable_snapshot(&mut self, index: u64) -> Result<()> {
-        self.take_stable_snapshot(index).map(drop)
-    }
-    /// As [`Log::stable_snapshot`], giving the snapshot up to the caller.
-    pub fn take_stable_snapshot(&mut self, index: u64) -> Result<Snapshot> {
-        match self.unstable.snapshot.take() {
-            Some(snapshot) if proto::snapshot_index(&snapshot) == index => Ok(snapshot),
-            held => {
-                self.unstable.snapshot = held;
-                Err(Error::Invariant(
-                    "the snapshot made durable is not the one given",
-                ))
+        let count = at.saturating_add(1);
+        if count == unstable.entries.len() {
+            // Given up, and not emptied: a member that rests holds what it
+            // held before it was written to.
+            match into {
+                None => unstable.entries.clear(),
+                Some(into) if into.is_empty() => {
+                    *into = std::mem::take(&mut unstable.entries);
+                }
+                Some(into) => {
+                    into.try_reserve(count).map_err(|_| Error::Memory)?;
+                    into.append(&mut unstable.entries);
+                }
+            }
+            unstable.bytes = 0;
+            unstable.payload = 0;
+        } else if let Some(into) = into {
+            into.try_reserve(count).map_err(|_| Error::Memory)?;
+            for entry in unstable.entries.drain(..count) {
+                unstable.bytes = unstable
+                    .bytes
+                    .saturating_sub(proto::approximate_bytes(&entry));
+                unstable.payload = unstable.payload.saturating_sub(payload_of(&entry));
+                into.push(entry);
+            }
+        } else {
+            for entry in unstable.entries.drain(..count) {
+                unstable.bytes = unstable
+                    .bytes
+                    .saturating_sub(proto::approximate_bytes(&entry));
+                unstable.payload = unstable.payload.saturating_sub(payload_of(&entry));
             }
         }
+        unstable.offset = index.saturating_add(1);
+        unstable.issued = unstable.issued.max(unstable.offset);
+        Ok(true)
+    }
+    /// A write that held the snapshot at `index` is durable: it leaves what
+    /// is not yet durable, and is given to the caller. None, and nothing
+    /// changes, when the snapshot held is another.
+    pub(crate) fn take_stable_snapshot(&mut self, index: u64) -> Option<Snapshot> {
+        let held = self.unstable.snapshot.as_ref()?;
+        if proto::snapshot_index(held) != index {
+            return None;
+        }
+        self.unstable.snapshot_issued = false;
+        self.unstable.snapshot.take()
     }
     /// Appends a copy of `entries` after what is committed, replacing what
     /// follows.
@@ -693,8 +796,16 @@ impl<S: Storage> Log<S> {
         let held = self.last_term()?;
         Ok(term > held || (term == held && last_index >= self.last_index()?))
     }
+    /// The last index that may be given to apply: committed, and durable
+    /// here, or of a leader's own term once all before it is durable
+    /// ([`Log::unpersisted_after`]).
+    #[inline]
     fn apply_bound(&self) -> u64 {
-        self.committed.min(self.persisted)
+        if self.persisted >= self.unpersisted_after {
+            self.committed
+        } else {
+            self.committed.min(self.persisted)
+        }
     }
     /// Whether entries after `since` are committed and durable.
     pub fn has_next_entries_since(&self, since: u64) -> Result<bool> {
@@ -720,7 +831,10 @@ impl<S: Storage> Log<S> {
     ///
     /// Entries committed and durable are always in storage: `persisted` is
     /// below the first entry not yet durable whatever replaced what, so what
-    /// is given to apply is read where storage holds it.
+    /// is given to apply is read where storage holds it. A leader's own
+    /// entries given to apply before they are durable here
+    /// ([`Log::unpersisted_after`]) are not in storage yet: the range's tail
+    /// past [`Unstable::entries`]' offset is read where the log holds it.
     pub fn next_range_since(
         &self,
         since: u64,
@@ -732,13 +846,13 @@ impl<S: Storage> Log<S> {
         if high <= offset {
             return Ok(None);
         }
-        if high > self.unstable.offset {
+        if high > self.unstable.offset && self.unpersisted_after == u64::MAX {
             return Err(Error::Invariant("committed entries not yet durable"));
         }
         let mut taken = 0u64;
         let mut bytes = 0u64;
         let mut data_above = 0usize;
-        self.store.any_entry(offset, high, &mut |entry| {
+        let mut page = |entry: &Entry| {
             let next = bytes.saturating_add(proto::encoded_bytes(entry));
             if taken > 0 && max_bytes != u64::MAX && next > max_bytes {
                 return true;
@@ -749,7 +863,17 @@ impl<S: Storage> Log<S> {
                 data_above = data_above.saturating_add(entry.data.len());
             }
             false
-        })?;
+        };
+        // Storage is walked from this one call, not through `Log::any_entry`
+        // as well: a second call site put an in-memory store's walk out of
+        // line behind a `dyn` call an entry, which cost the in-place `Ready`
+        // up to 7 % (`docs/benchmarks.md`, R-6).
+        let stored = high.min(self.unstable.offset);
+        let full = offset < stored && self.store.any_entry(offset, stored, &mut page)?;
+        if !full && high > self.unstable.offset {
+            let from = offset.max(self.unstable.offset);
+            self.unstable.slice(from, high)?.iter().any(page);
+        }
         let last = offset
             .checked_add(taken)
             .and_then(|end| end.checked_sub(1))
@@ -1365,7 +1489,7 @@ pub(crate) mod tests {
         assert!(!log.has_next_entries_since(3).unwrap());
         assert!(log.next_entries_since(3, u64::MAX).unwrap().is_empty());
         log.store.append(&[entry(4, 1), entry(5, 1), entry(6, 1)]);
-        log.stable_entries(6, 1).unwrap();
+        assert!(log.stable_to(6, 1).unwrap());
         assert!(log.maybe_persist(6, 1));
         assert!(log.has_next_entries_since(3).unwrap());
         assert_eq!(
@@ -1400,13 +1524,14 @@ pub(crate) mod tests {
         assert!(!log.maybe_persist(4, 1));
         assert_eq!(log.persisted, 2);
         log.store.append(&[entry(3, 2), entry(4, 2)]);
-        log.stable_entries(4, 2).unwrap();
+        assert!(log.stable_to(4, 2).unwrap());
         assert!(log.maybe_persist(4, 2));
         assert!(!log.maybe_persist(4, 2));
         // Replacing a durable entry lowers what is durable.
         log.maybe_append(3, 2, 2, &[entry(4, 3)]).unwrap();
         assert_eq!(log.persisted, 3);
-        assert!(log.stable_entries(4, 2).is_err());
+        // What a write of the replaced entries says moves nothing.
+        assert!(!log.stable_to(4, 2).unwrap());
     }
     #[test]
     fn terms_are_read_across_the_snapshot_storage_and_what_is_not_durable() {
@@ -1450,9 +1575,11 @@ pub(crate) mod tests {
         assert_eq!(log.term(9).unwrap(), 5);
         assert_eq!(log.term(8).unwrap(), 0);
         assert!(log.restore(snapshot(8, 5, &[1])).is_err());
-        assert!(log.stable_entries(9, 5).is_err());
-        assert!(log.stable_snapshot(8).is_err());
-        log.stable_snapshot(9).unwrap();
+        // Nothing is durable before its snapshot, and a write of another
+        // snapshot moves nothing.
+        assert!(!log.stable_to(9, 5).unwrap());
+        assert!(log.take_stable_snapshot(8).is_none());
+        assert!(log.take_stable_snapshot(9).is_some());
         assert!(log.maybe_persist_snapshot(9).is_ok_and(|_| true));
     }
     #[test]
@@ -1727,7 +1854,7 @@ pub(crate) mod tests {
             Err(Error::Capacity("entries not yet durable"))
         );
         log.store.append(log.unstable.entries());
-        log.stable_entries(3, 2).unwrap();
+        assert!(log.stable_to(3, 2).unwrap());
         assert_eq!(log.unstable.bytes, 0);
         assert_eq!(log.unstable.payload, 0);
         log.append(std::slice::from_ref(&fourth)).unwrap();

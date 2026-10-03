@@ -232,6 +232,10 @@ pub(crate) struct Owner<F> {
     watching: bool,
     /// Groups written through their handles: at most `max_groups`.
     claimed: HashSet<u128>,
+    /// For each claimed group whose handle had a write refused, the epoch that write was sent
+    /// in: the group's writes sent in it or before are refused [`LogError::Behind`]
+    /// (`Owner::behind`). At most one entry a claimed group, gone with the claim.
+    refused: HashMap<u128, u64>,
 }
 
 impl<F: BlockFile + 'static> Owner<F> {
@@ -284,6 +288,7 @@ impl<F: BlockFile + 'static> Owner<F> {
             closing: false,
             watching: false,
             claimed: HashSet::new(),
+            refused: HashMap::new(),
         }
     }
 
@@ -408,6 +413,10 @@ impl<F: BlockFile + 'static> Owner<F> {
 
     /// The next message, or `None` once the writer's wait for returning submitters is over;
     /// an error once the inbox has closed.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "hyper-log's owner waits on its own deadline (CLAUDE.md §1, sans-io's one exception)"
+    )]
     fn next(&self, inbox: &Receiver<Message<F>>) -> Result<Option<Message<F>>, RecvTimeoutError> {
         let Some(deadline) = self.gather.as_ref().map(|g| g.deadline) else {
             return inbox
@@ -473,6 +482,7 @@ impl<F: BlockFile + 'static> Owner<F> {
             Message::Claim(group, ticket) => self.claim(group, ticket),
             Message::Release(group) => {
                 self.claimed.remove(&group);
+                self.refused.remove(&group);
             }
             Message::Close => self.closing = true,
         }
@@ -528,7 +538,10 @@ impl<F: BlockFile + 'static> Owner<F> {
             Ok(Take::Waiting(seq)) => {
                 self.waiting.insert(seq, s);
             }
-            Err(e) => s.ticket.answer(Err(e)),
+            Err(e) => {
+                self.note_refusal(&s);
+                s.ticket.answer(Err(e));
+            }
         }
         self.let_in(&mut admitted);
         self.buffers.admitted = admitted;
@@ -550,6 +563,9 @@ impl<F: BlockFile + 'static> Owner<F> {
 
     /// Answers a submission, and gives back its room in the queue to the waiters it fits.
     fn answer(&mut self, mut s: Submission, result: Result<(), LogError>) {
+        if result.is_err() {
+            self.note_refusal(&s);
+        }
         let back = match &result {
             Ok(()) if s.handle => crate::group::given_back(&mut s.update),
             _ => Vec::new(),
@@ -559,6 +575,31 @@ impl<F: BlockFile + 'static> Owner<F> {
         self.room.release(s.group, s.bytes, &mut admitted);
         self.let_in(&mut admitted);
         self.buffers.admitted = admitted;
+    }
+
+    /// A handle's write was refused: every write its handle sent in the same epoch or before is
+    /// refused after it (`Owner::behind`).
+    fn note_refusal(&mut self, s: &Submission) {
+        if s.handle && self.claimed.contains(&s.group) {
+            let epoch = self.refused.entry(s.group).or_insert(s.epoch);
+            *epoch = (*epoch).max(s.epoch);
+        }
+    }
+
+    /// Whether `s` was sent by its handle before the handle heard of a refusal of an earlier
+    /// write: then it is refused too. A write of a later epoch ends the refusal.
+    pub(super) fn behind(&mut self, s: &Submission) -> bool {
+        if !s.handle {
+            return false;
+        }
+        match self.refused.get(&s.group) {
+            Some(&epoch) if s.epoch <= epoch => true,
+            Some(_) => {
+                self.refused.remove(&s.group);
+                false
+            }
+            None => false,
+        }
     }
 
     /// Hands out `group`'s handle: its state as the log holds it, with the bytes of the entries

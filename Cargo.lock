@@ -319,6 +319,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 name = "hyper-block"
 version = "0.1.0"
 dependencies = [
+ "crc32c",
  "getrandom 0.4.3",
  "rustix",
  "thiserror",
@@ -340,8 +341,13 @@ name = "hyper-raft"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "hyper-timing",
  "thiserror",
 ]
+
+[[package]]
+name = "hyper-timing"
+version = "0.1.0"
 
 [[package]]
 name = "is_terminal_polyfill"

@@ -1,0 +1,16 @@
+[package]
+name = "hyper-timing"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+publish = false
+
+[dev-dependencies]
+# Left out of the snapshot, which does not vendor them (vendor/UPSTREAM.md):
+# `hyper-sim`, which this crate's own tests use.
+hyper-measure = { path = "../hyper-measure" }
+proptest = "1.11"
+
+# A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside any consumer workspace.
+[workspace]

@@ -290,12 +290,15 @@ pub fn message_from(message: old::Message) -> Message {
             .map(|snapshot| Box::new(snapshot_from(snapshot))),
         request_snapshot: message.request_snapshot,
         reject: message.reject,
+        // raft-rs has no member whose log lost what it acknowledged.
+        lost: false,
         reject_hint: message.reject_hint,
         context: message.context,
         priority,
     }
 }
 pub fn message_to(message: &Message) -> old::Message {
+    assert!(!message.lost, "raft-rs has no lost refusal (core step R-5)");
     old::Message {
         msg_type: kind_to(message.msg_type),
         to: message.to,

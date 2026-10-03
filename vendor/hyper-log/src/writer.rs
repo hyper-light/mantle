@@ -57,6 +57,10 @@ pub(crate) struct Submission {
     /// Whether its caller waits on its ticket from the moment it sends it until its answer, so
     /// that its frame's I/O may be given to it to do (`owner::Owner::start`).
     pub(crate) waits: bool,
+    /// For a handle's write, how many of the handle's writes had been refused when it was sent
+    /// (`GroupLog`): a write sent before its handle heard of a refusal is refused
+    /// [`LogError::Behind`], so the group's writes stay in the order submitted. Zero otherwise.
+    pub(crate) epoch: u64,
 }
 
 /// Where the writer's fair queue placed a submission (mantle docs/design/raft-log.md §3).

@@ -54,6 +54,9 @@ struct Held {
     entry: Entry,
     /// Storage holds it: it may be voted with.
     durable: bool,
+    /// A write of it was issued and is not yet known durable: no later
+    /// `Ready` gives it again.
+    issued: bool,
     /// Proposed here: its proposer is told what became of it.
     own: bool,
 }
@@ -121,21 +124,28 @@ impl Proposals {
             Held {
                 entry,
                 durable,
+                issued: durable,
                 own,
             },
         );
         Ok(true)
     }
-    /// What storage does not hold yet.
-    pub fn unstable(&self) -> impl Iterator<Item = &Entry> + Clone {
+    /// What storage does not hold yet and no write was issued for.
+    pub fn unissued(&self) -> impl Iterator<Item = &Entry> + Clone {
         self.held
             .iter()
-            .filter(|held| !held.durable)
+            .filter(|held| !held.issued)
             .map(|held| &held.entry)
     }
-    /// Whether anything held is not durable yet.
-    pub fn has_unstable(&self) -> bool {
-        self.held.iter().any(|held| !held.durable)
+    /// Whether anything held is neither durable nor issued.
+    pub fn has_unissued(&self) -> bool {
+        self.held.iter().any(|held| !held.issued)
+    }
+    /// A write of everything held was issued.
+    pub(crate) fn issue(&mut self) {
+        for held in &mut self.held {
+            held.issued = true;
+        }
     }
     /// Storage holds what is held at `index`, if it is `entry`. True when
     /// it became durable by this.
@@ -553,9 +563,13 @@ mod tests {
             vec![5, 7, 9]
         );
         assert_eq!(
-            held.unstable().map(|entry| entry.index).collect::<Vec<_>>(),
+            held.unissued().map(|entry| entry.index).collect::<Vec<_>>(),
             vec![7, 9]
         );
+        // A write of them is out: no later `Ready` gives them again, and
+        // they are durable only once it is.
+        held.issue();
+        assert!(!held.has_unissued());
         // Storage holds what was given, and only that.
         assert!(!held.persisted(&entry(7, b"b")));
         assert!(held.persisted(&entry(7, b"a")));
@@ -576,7 +590,7 @@ mod tests {
         held.release(9, |_| false, &mut displaced).unwrap();
         assert_eq!(displaced.len(), 1);
         assert_eq!(displaced[0].data, b"d");
-        assert!(held.is_empty() && !held.has_unstable());
+        assert!(held.is_empty() && !held.has_unissued());
         // By its bytes as well.
         let mut held = Proposals::new(8, 2 * bytes_of(64));
         assert!(held.hold(entry(1, &[0; 64]), false, false).unwrap());

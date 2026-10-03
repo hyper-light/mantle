@@ -3779,3 +3779,50 @@ fn room_is_given_back_before_the_answer() {
     }
     assert_eq!(log.view(1).unwrap().unwrap().last, 100);
 }
+
+/// A handle's writes apply in the order sent, refusals included: a write sent before the handle
+/// took the refusal of an earlier one is refused too, `Behind`, changing nothing; once the
+/// handle has taken the refusals, what it sends is written. Without the rule, a hard state sent
+/// behind entries refused for the group's bound was written: the group then stated a commit
+/// past the entries it held (hyper-raft docs/durable.md §2.4, I7).
+#[test]
+fn a_write_sent_behind_a_refused_one_is_refused_too() {
+    let mut small = config(16, 8);
+    small.group_entries = 2;
+    let log = Log::create(sim(44), small, ID).unwrap();
+    let mut group = log.group(1).unwrap();
+    group
+        .write(Update {
+            entries: Some(entries(1, &[1])),
+            ..Update::default()
+        })
+        .unwrap();
+    // Past the group's bound of two entries: refused for room.
+    group
+        .submit(Update {
+            entries: Some(entries(2, &[1, 1])),
+            ..Update::default()
+        })
+        .unwrap();
+    // Sent before the refusal is taken, with a commit that names the refused entries.
+    group
+        .submit(Update {
+            hard_state: Some(hard(1, 3)),
+            ..Update::default()
+        })
+        .unwrap();
+    assert!(matches!(group.wait(), Some(Err(LogError::Backlog(1)))));
+    assert!(matches!(group.wait(), Some(Err(LogError::Behind(1)))));
+    let view = group.view().unwrap().unwrap();
+    assert_eq!((view.last, view.hard_state), (1, None));
+    // Sent after both refusals were taken: written.
+    group
+        .write(Update {
+            entries: Some(entries(2, &[1])),
+            hard_state: Some(hard(1, 2)),
+            ..Update::default()
+        })
+        .unwrap();
+    let view = log.view(1).unwrap().unwrap();
+    assert_eq!((view.last, view.hard_state), (2, Some(hard(1, 2))));
+}

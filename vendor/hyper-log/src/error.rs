@@ -67,6 +67,12 @@ pub enum LogError {
     /// The file holds no log, another log, or another geometry.
     #[error("the file is not this log: {0}")]
     Foreign(&'static str),
+    /// The group's handle sent this write before it heard that an earlier one was refused: it
+    /// is refused too, changing nothing, so a group's writes never apply out of the order they
+    /// were sent (a later write taken after an earlier one refused would leave the group with
+    /// the later and without the earlier). The handle sends what it still needs again.
+    #[error("group {0:032x}: a write sent behind a refused one")]
+    Behind(u128),
     /// The group has a handle (`Log::group`), through which alone it is written.
     #[error("group {0:032x} is written through its handle")]
     Claimed(u128),

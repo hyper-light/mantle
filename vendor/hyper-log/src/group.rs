@@ -270,6 +270,9 @@ pub struct GroupLog<F: BlockFile + 'static> {
     stale: bool,
     /// Reads the handle could not answer and asked the log's owner for.
     asked: std::cell::Cell<u64>,
+    /// Refusals the handle has taken: each write carries it, and the log refuses a write sent
+    /// before the handle took the refusal of an earlier one (`LogError::Behind`).
+    epoch: u64,
 }
 
 impl<F: BlockFile + 'static> std::fmt::Debug for GroupLog<F> {
@@ -297,6 +300,7 @@ impl<F: BlockFile + 'static> GroupLog<F> {
             out: VecDeque::new(),
             stale: false,
             asked: std::cell::Cell::new(0),
+            epoch: 0,
         }
     }
 
@@ -309,6 +313,22 @@ impl<F: BlockFile + 'static> GroupLog<F> {
     /// The group.
     pub fn group(&self) -> u128 {
         self.group
+    }
+
+    /// The writes the group usefully keeps out at once, one in each of the log's pipeline frames
+    /// (`PIPELINE_FRAMES`): a fourth could not be written before the third flush from now, and
+    /// would add only waiting (hyper-raft docs/durable.md §6). A replica takes readies ahead of
+    /// their persistence up to this many. The log admits a group's writes
+    /// `GROUP_SUBMISSIONS` at a time; one past them waits in the log for its group's room, never
+    /// refused, within the handle's own bound (`OUT`), which holds this many and a compaction's.
+    pub fn depth(&self) -> usize {
+        crate::PIPELINE_FRAMES
+    }
+
+    /// Whether the handle sends another write now: fewer than its bound are out (`OUT`), past
+    /// which a submission is refused `Busy`.
+    pub fn has_room(&self) -> bool {
+        self.out.len() < OUT
     }
 
     /// Writes out and not yet taken back by [`GroupLog::wait`] or [`GroupLog::poll`].
@@ -390,6 +410,7 @@ impl<F: BlockFile + 'static> GroupLog<F> {
             handle: true,
             lens: (0, 0),
             waits,
+            epoch: self.epoch,
         };
         self.inbox
             .send(Message::Submit {
@@ -418,7 +439,11 @@ impl<F: BlockFile + 'static> GroupLog<F> {
                 Err(LogError::Closed)
             }
             Err(e) => {
-                if !refuses_whole(&e) {
+                if refuses_whole(&e) {
+                    // Writes sent from here on are of a new epoch: the log takes them, while it
+                    // refuses those sent before this answer was taken.
+                    self.epoch = self.epoch.saturating_add(1);
+                } else {
                     self.stale = true;
                 }
                 Err(e)
@@ -588,6 +613,7 @@ fn refuses_whole(e: &LogError) -> bool {
             | LogError::Invalid { .. }
             | LogError::Damaged(_)
             | LogError::Claimed(_)
+            | LogError::Behind(_)
     )
 }
 

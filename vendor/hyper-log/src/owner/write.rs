@@ -235,6 +235,10 @@ impl<F: BlockFile + 'static> Owner<F> {
     /// Waits for the submitters the last confirmation answered while waiting is expected to
     /// lower total latency, then commits. The first `before` submissions in the batch were
     /// sent before the answers.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "hyper-log's owner times its own writes (CLAUDE.md §1, sans-io's one exception)"
+    )]
     fn gather_then_commit(
         &mut self,
         batch: VecDeque<Submission>,
@@ -442,6 +446,11 @@ impl<F: BlockFile + 'static> Owner<F> {
         new_groups: usize,
         batch: &mut VecDeque<Submission>,
     ) -> Result<Option<bool>, LogError> {
+        if self.behind(&s) {
+            let group = s.group;
+            self.answer(s, Err(LogError::Behind(group)));
+            return Ok(None);
+        }
         let (new, len) = match self.fits(&s, new_groups) {
             Ok(checked) => checked,
             Err(e) => {
@@ -1031,6 +1040,10 @@ fn returned(g: &Gather) -> u64 {
         .saturating_sub(g.before)
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "hyper-log's owner times its own writes (CLAUDE.md §1, sans-io's one exception)"
+)]
 fn deadline(step: Duration) -> Instant {
     let now = Instant::now();
     now.checked_add(step).unwrap_or(now)

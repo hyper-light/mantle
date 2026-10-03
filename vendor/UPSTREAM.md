@@ -87,22 +87,29 @@ command on the six targets.
 ## hyper-raft (shared crates)
 
 The crates mantle shares with focal and slates come from github.com/hyper-light/hyper-raft:
-- each is a snapshot of one crate, its manifest made self-contained, with its source revision in
-  `SNAPSHOT`;
+- each is a snapshot of one crate taken from a commit's objects (`git archive`), its manifest made
+  self-contained: the workspace's package fields and dependency specs written in, its benches and
+  `[[bench]]` tables and its `[lints]` left out, `publish = false` added, and an empty
+  `[workspace]` appended; its source revision is in `SNAPSHOT`;
 - each is a workspace root of its own, excluded from this workspace;
 - hyper-raft's CI runs their suites on all six targets, and mantle's own suites run against the
   snapshot;
-- a change is made in hyper-raft and taken here by a new snapshot, never edited in place.
+- a change is made in hyper-raft and taken here by a new snapshot, never edited in place;
 - snapshots that depend on each other by path sit side by side here, as they do under
-  hyper-raft's `crates/`, so those paths resolve: `hyper-log` on `hyper-block`, and on
-  `hyper-measure` for its own tests and benchmarks, which cargo reads but mantle does not build.
+  hyper-raft's `crates/`, so those paths resolve: `hyper-raft` on `hyper-timing`, and `hyper-log`
+  on `hyper-block` and, for its own tests, `hyper-measure`. A build resolves no dev-dependency of
+  a crate outside the workspace, but `cargo fmt --all` loads the manifest of every path
+  dependency, dev-dependencies included, so a snapshot's manifest leaves out a path
+  dev-dependency on a crate not vendored here, with a comment naming it: `hyper-timing`'s on
+  `hyper-sim`, whose tests hyper-raft's CI runs and mantle does not.
 
 | Snapshot | Revision | Used by |
 |---|---|---|
-| `hyper-raft` | `SNAPSHOT` (`dce1daa`: R-2, its own message types and wire format, hyper-raft `docs/raft.md` §3.1) | `crates/range`, as `focal-raft` (Cargo rename) |
-| `hyper-log` | `SNAPSHOT` (`63cb65d`: mantle's `crates/log` at `147f035` with its history, L-1; one owner thread answering by ticket, L-2; a group's handle, `GroupLog`, answering its replica's reads and cutting its updates into parts on the replica's thread, a blocking writer flushing its own frame, and a waking submitter that does not wait for its admission; hyper-log `ORIGIN.md`) | `crates/range` (the replica's log, through its group's `GroupLog`), `crates/mantle` (`mantle bench log`) |
-| `hyper-block` | `SNAPSHOT` (`63cb65d`, unchanged since `50a711d`: mantle-disk's block, buf, commit, file, issuer, thread budget, scratch and simulated device at `147f035`, each with one owner, L-2; hyper-block `ORIGIN.md`) | `hyper-log`, `crates/chunk`, `crates/disk` (measurement and calibration through its files, buffers and thread budget), `crates/range`, `crates/mantle` |
-| `hyper-measure` | `SNAPSHOT` (`63cb65d`, unchanged since `8fe3f23`) | `hyper-log`'s tests and benchmarks only; no mantle crate |
+| `hyper-raft` | `SNAPSHOT` (`687244f`: since `dce1daa`, readies taken ahead of their persistence, R-4; repair by the lost entries, R-5; the durable commit in a member's answers and the apply pause, R-6; a marked member's election, R-7; elections by suspicion beside the tick path, L-2; the `Ready` read in place; a new draw at every arming of the election timer; a change's record read in place, `wire::changes_stated`; hyper-raft `docs/raft.md` §3, `ORIGIN.md`) | `crates/range`, as `focal-raft` (Cargo rename) |
+| `hyper-timing` | `SNAPSHOT` (`687244f`: the election law's draw, which the core's timer takes since L-2, and the detectors' estimator and configurator; hyper-raft `docs/timing.md`) | `hyper-raft` |
+| `hyper-log` | `SNAPSHOT` (`687244f`: mantle's `crates/log` at `147f035` with its history, L-1; one owner thread answering by ticket, L-2; a group's handle, `GroupLog`, answering its replica's reads and cutting its updates into parts on the replica's thread, a blocking writer flushing its own frame, and a waking submitter that does not wait for its admission; since `63cb65d`, a write its handle sent behind a refused one refused too, `LogError::Behind`, and the handle's depth, `GroupLog::depth` and `has_room`; hyper-log `ORIGIN.md`) | `crates/range` (the replica's log, through its group's `GroupLog`), `crates/mantle` (`mantle bench log`) |
+| `hyper-block` | `SNAPSHOT` (`687244f`: mantle-disk's block, buf, commit, file, issuer, thread budget, scratch and simulated device at `147f035`, each with one owner, L-2; since `63cb65d`, a record kept whole, the block size a file's system reports, and a transfer of no bytes taken as none; hyper-block `ORIGIN.md`) | `hyper-log`, `crates/chunk`, `crates/disk` (measurement and calibration through its files, buffers and thread budget), `crates/range`, `crates/mantle` |
+| `hyper-measure` | `SNAPSHOT` (`687244f`: Windows through windows-sys since `63cb65d`) | `hyper-log`'s tests and benchmarks only; no mantle crate |
 
 mantle's `crates/log` and the parts of `crates/disk` that hyper-block took were deleted when
 mantle moved onto these (research/32 §5.3); identification, calibration, measurement and the

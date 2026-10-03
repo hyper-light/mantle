@@ -347,3 +347,309 @@ production; the format is `docs/raft.md` §3.1, written and read by `src/wire.rs
   round-tripped, every truncation, one-byte extension and single-bit flip of every record refused,
   counts past the bytes refused with a valid checksum, and 140,000 arbitrary bodies under valid
   checksums decoded without a panic.
+
+## R-4: readies ahead of their persistence
+
+Not a port: this repository's change, the first of the core steps the durable shell needs
+(`docs/durable.md` §2.1, which states the design as built; `docs/raft.md` §3).
+
+- **The calls** (`src/node.rs`): `RawNode::advance_issued`, `on_persist`, `on_persist_keeping` and
+  `in_flight`; `Limits::readies_in_flight` (one by default) bounds the writes out, and a `Ready`
+  beyond it is refused `Capacity`. `advance_append` and `advance_append_keeping` are the two at once
+  and take a path of their own that passes through no queue. `outstanding` says a `Ready` is taken or
+  a write is out.
+- **The log** (`src/log.rs`): the unstable part keeps its entries until a notice says they are
+  durable, with an issue mark (`Unstable::issued`, `snapshot_issued`, `unissued`,
+  `unissued_snapshot`, `has_unissued`); `Log::take_stable_to` and `take_stable_snapshot` replace
+  `take_stable_entries`, `stable_entries` and `stable_snapshot`, and refuse nothing: what a notice
+  names that is no longer held is not made durable.
+- **The fast track** (`src/fast.rs`): what a member approved by itself is given to one write
+  (`Proposals::issue`, `unissued`, `has_unissued` in place of `unstable` and `has_unstable`).
+- **A leader** (`src/raft.rs`): `Raft::become_leader` no longer refuses a log that is not durable,
+  for a sole voter is elected while its writes are out; it counts itself by what is durable, as
+  before.
+- **What leaves when**: a leader's messages leave at once only while its term and vote are durable
+  (before, a leader's always did; the raft-rs differential merges the two lists, and the case is a
+  sole voter elected with learners); what a notice makes leaves with it only when nothing is out or
+  unwritten.
+- **Tests**: the unit tests of the calls, the ABA schedule (fails with the term guard taken out), the
+  answers held for the write that holds what they say, a sole voter's term held before it sends;
+  `tests/pipeline.rs` over `tests/support/lagged.rs` (a member whose persistence is three steps of
+  the schedule) and the durability oracle of `Cluster::check_durable`. Recorded on 2026-10-02:
+  1,000 schedules of 4,000 steps at each of three settings (three writes out, focal's at two in
+  place, focal's at three with a window of two and one-entry messages) and twice 1,000 fast-track
+  schedules: 72,670, 73,180 and 62,069 entries committed, 97,483, 64,903 and 158,208 `Ready`s taken
+  behind another, 36,864, 31,263 and 72,679 notices of several writes, 8,305, 6,301 and 7,899 writes
+  lost at crashes; 1,690 crashes, one at each persistence step of 40 schedules in turn. The harness's
+  `Cluster::settles` drives a lagged member's writes and changes nothing a synchronous member does
+  (the recorded-seed equivalence).
+- **Equivalence of the synchronous path**: `HYPER_RAFT_SEEDS=300 HYPER_RAFT_SEED=1000 cargo test -p
+  hyper-raft --release --test differential --test group --test fast -- --nocapture` prints the same
+  coverage on `main` and here, every campaign and count, but one line: the group of both cores
+  (`a_group_of_both_cores_is_safe_and_settles`) differs between two runs of `main` itself, since
+  raft-rs draws its election timeouts from the thread.
+- **Measured**: allocations identical on every workload, time within the noise
+  (`docs/benchmarks.md`, "Readies in flight").
+
+## R-6: the durable commit, the apply pause, applying before durability
+
+Not a port: this repository's change (`docs/durable.md` §4.4, which states the design as built;
+`docs/raft.md` §3).
+
+- **The durable commit** (`src/node.rs`, `src/raft.rs`): `RawNode::durable_commit` and
+  `commit_durable`; the issue mark keeps the commit each `Ready`'s hard state states, and its notice
+  makes it durable; `Raft::durable_commit` opens at what storage states.
+- **Answers** (`src/node.rs`, `state_durable_commit`): `MsgAppendResponse` and
+  `MsgHeartbeatResponse` are made as before and held, where they leave, to the durable commit: at
+  the `Ready` that takes them, with its own hard state's commit; at a notice, for a member that does
+  not lead. Nothing is walked where the durable commit covers the commit, nor for a leader.
+- **The apply pause**: `RawNode::pause_apply`, `resume_apply`, `apply_paused`.
+- **Applying before durability**: `Config::apply_unpersisted` (off by default), `Log::unpersisted_after`,
+  the apply bound and `Log::next_range_since` reading a range's tail where the log holds it.
+- `RawNode::operate` is `#[inline]`: `sample` found it out of line on the proposal path once the
+  member grew.
+- **Tests**: four directed unit tests (`an_answer_states_no_commit_that_no_durable_write_stated`,
+  mantle's case; `an_answer_a_notice_releases_states_the_durable_commit`, which fails on R-4;
+  `an_owner_that_pauses_apply_is_given_nothing_more`, with a snapshot given while paused;
+  `a_leader_applies_its_own_committed_entries_before_its_write_is_durable`). In `tests/support/lagged.rs`
+  the oracle holds every answer's commit to the disk's when it leaves (`check_commit`), and the
+  owner keeps the commit fence as a shell does: it states a commit only as `Ready`s give one, holds a
+  change and every entry after it behind the fence with the core paused, writes the hard state
+  alone to state the commit once no write is out, drops what it holds when a snapshot replaces it,
+  and compacts only what its disk states committed. With the old answer rule in, the oracle fails
+  at once ("member 1: MsgAppendResponse said commit 1 with 0 durable"). `tests/pipeline.rs` gains a
+  fourth setting, a leader applying before its write in place with its disk the slowest
+  (`Mix::leader_durable`), and the crash enumeration runs with and without it. A schedule draws
+  exactly as before wherever a leader's disk is not slow.
+- **Recorded on 2026-10-02** (`HYPER_RAFT_SEEDS=1000 HYPER_RAFT_STEPS=4000 HYPER_RAFT_CRASH_SEEDS=40`):
+  1,000 schedules of 4,000 steps at each of four settings, 73,634, 72,589, 60,657 and 62,565 entries
+  committed; answers held to the disk 308,533, 237,150, 293,537 and 222,532; changes held behind the
+  fence 1,813, 905, 1,003 and 1,471; commits stated by a write of the hard state alone 7,781, 7,126,
+  2,604 and 4,598; entries a leader applied before its write was durable 303 in the fourth. Twice
+  1,000 fast-track schedules, 21,352 entries committed each. The crash at every persistence step of
+  40 schedules: 1,689 crashes (1,656 writes lost) and, with a leader applying before its write,
+  1,642 (2,030 lost, 58 entries applied ahead). Seed 730 of the narrow setting found the harness
+  applying a held change over the snapshot that replaced it; the owner now drops it.
+- **Equivalence of the synchronous path**: `HYPER_RAFT_SEEDS=300 HYPER_RAFT_SEED=1000` over the
+  differential, group and fast suites prints what `main` prints but for the one line that differs
+  between two runs of `main` itself. The differential needs no translation: where the owner writes
+  every commit it is given, answers state what raft-rs's do.
+- **Measured**: allocations identical on every workload; time in `docs/benchmarks.md`, "The durable
+  commit and the apply pause (R-6)".
+
+
+## L-2: elections by suspicion
+
+Not a port: timing step L-2 (`docs/timing.md` §2.9, which states the design as built and the
+source of each rule; `docs/raft.md` §3).
+
+- **The mode** (`src/raft.rs`): `Config::elections`, `Elections::Ticks` (raft-rs's rule, the
+  default, every existing suite and the differential) or `Elections::Suspicion`, which
+  `Config::validate` refuses without pre-vote and check-quorum. On ticks nothing changes; the member
+  carries `watch: Option<Box<Watch>>`, none on ticks, eight bytes.
+- **What a member keeps by suspicion** (`src/watch.rs`, `Watch`): the members suspected (at most
+  `MAX_MEMBERS`, refused past it), the timing (`Timing { span, round }`, `Timing::of` from
+  hyper-timing's ballot and span), three timers on the owner's clock (a campaign, a leader's beat, a
+  transfer's end: `Arm`), the campaign count the draw takes, the term it last led, and whether its
+  owner holds its campaigns. `TRANSFER_ROUNDS` is two, a protocol fact.
+- **The calls** (`src/node.rs`, `src/raft.rs`): `suspect`, `trust`, `restarted`, `set_timing`,
+  `hold_campaigns`, `wake(now)`, `deadline()`; `tick` is refused. `Tracker::quorum_of` counts a
+  quorum of each half by a predicate, for the trusted quorum.
+- **Where the rules sit**: the lease (`step_newer_term`): while leading, or trusting a leader the
+  request is not from, and the asker no later than this member's term; a leader asked for a vote
+  answers with a heartbeat (`probe`). Granting a vote and every `reset` arm a campaign a round out;
+  opening arms one from now, and a member that voted for itself in its term opens as one that led it
+  (`led`), cleared when it follows another leader of the term (`followed`). Check-quorum and
+  hand-over (`step_down`, `hand_over`; `post_conf_change` hands over where no voter holds the whole
+  log). An older-term `MsgTimeoutNow` is answered as an older leader's heartbeat is
+  (`step_older_term`), by suspicion only. A heartbeat's answer counts a beat as one tick by
+  suspicion. hyper-timing gains `election_delay`, the draw `ElectionTiming::delay` makes, for a
+  core given the span alone; hyper-raft depends on hyper-timing for it (a crate of this repository
+  with no dependencies).
+- **Tests**: `tests/suspicion.rs`, 15 directed tests in time (§2.9's list). The schedules' harness
+  (`tests/support`) gains `Settings::suspicion` and each member's own clock (a tick moves it by
+  `TICK_NS` and wakes the member), the detectors' words (`Op::Suspect`, `Op::Trust`; right nine in
+  ten about a member down or cut off, wrong one in ten about one that is not) and the others told of
+  a restart; it settles with every detector trusting every member. Its round tail and span are ten
+  of a member's ticks, as `Settings::shell`'s election waits ten ticks and draws over ten more:
+  measured on 24 five-voter fast-track schedules of 2,000 steps, a round of two ticks (the beat)
+  held a leader in 7 % of their steps, of five 10 %, of ten 18 %, against 17 % on ticks (5 % at two
+  before a reset waited a round). `tests/pipeline.rs` runs its
+  three schedule tests by suspicion as well; the crash enumeration's default rises from three seeds
+  to four, the fewest from zero at which every variant holds a change behind the fence.
+- **Found by the schedules, each fixed in the core before the counts below**: a leader that stepped
+  down kept its followers' trust (seed 1, `random_interleavings_by_suspicion`: its own campaign now
+  ends their lease and makes them forget it); a leader that removed itself with no voter holding its
+  whole log left followers trusting it (seed 7: hand-over); campaigns drawn from now after every
+  reset overlapped in five-voter groups (a round first); a restarted leader whose old heartbeat
+  arrived after its restart was trusted again (seed 1,322: `led` at open, and the older-term order
+  answered); a voter with an empty log trusting a leader of an older term refused the one candidate
+  that could win (seed 2,313: the asker's later term ends the lease).
+- **Recorded on 2026-10-02**: on ticks, `HYPER_RAFT_SEEDS=1000 HYPER_RAFT_STEPS=4000` prints R-6's
+  counts exactly (73,634, 72,589, 60,657 and 62,565 entries committed at the four settings), and
+  `HYPER_RAFT_SEEDS=300 HYPER_RAFT_SEED=1000` over the differential, group and fast suites prints
+  what `main` prints but for the mixed group's line, which differs between two runs of `main`
+  itself (raft-rs draws its timeouts from its thread). By suspicion: 1,000 schedules of 4,000 steps
+  at the four settings committed 75,539, 76,083, 67,930 and 66,354 entries in 4,561, 4,666, 4,482 and
+  4,635 terms led, with 1,791, 793, 902 and 1,593 changes held behind the fence; 10,000 more from
+  seed 1,000 committed 733,867, 746,577, 679,846 and 667,082. The fast track, twice 2,000 schedules
+  of five voters, 39,691 entries each (42,064 on ticks). The crash at every persistence step of 20
+  schedules: 943 crashes (1,078 writes lost) and, with a leader applying before its write, 904
+  (1,178). The split rate over 1,000 crashes of a five-voter leader: 135 first rounds split
+  against 110.8 expected.
+- **Measured** (`docs/benchmarks.md`, "Elections by suspicion (L-2)"): allocations identical on all
+  22 cells of the comparison; time and cycles within `main`'s intervals or below them, instructions
+  0.1–0.4 % above; `benches/pipeline.rs`'s simulated figures identical. `benches/idle.rs`: an idle
+  group costs its owner 542.5 ns and two messages a tick on ticks, 25 ns a scan and no message by
+  suspicion, nothing with a timer queue.
+
+## R-5: repair by entries
+
+Not a port: this repository's change (`docs/durable.md` §5.1, which states the design as built and
+its sources; `docs/raft.md` §3).
+
+- **The mark** (`src/raft.rs`): `Lost { index, term }`, `Config::lost`, `Raft::lost`,
+  `Raft::settle_lost` (at open and at every notice, from storage: `Lost::resolved_by`, hyper-log's
+  rule), `Raft::claim` (what a member answers for in an election). mantle's rules for a marked
+  member, until now the shell's, are the core's: `step_vote` judges by the claim (the vote and
+  `Precedence`), `hup` refuses (`Error::Lost`) and forgets the leader that asked it to campaign by
+  its silence, `deadline` and `wake_follower` arm no campaign, and `step_vote` refuses no one for
+  priority while marked.
+- **The word** (`src/proto.rs`, `src/wire.rs`): `Message::lost`, flag bit 2 of the message body; an
+  older reader refuses it as an unknown flag. `Raft::send_lost` answers a heartbeat whose commit
+  passes the log, or an append after a point past it, while marked.
+- **The repair** (`src/raft.rs`, `src/progress.rs`): `Raft::take_lost` and `Progress::lost`; the
+  named entry checked against the leader's log where it still holds it (a schedule found the
+  leader's compacted log reading term zero there, read as a mismatch, before the check asked
+  first whether it holds the entry); `RawNode`'s notice settles the mark (`src/node.rs`).
+- **Tests**: `tests/repair.rs` (four directed); `src/wire.rs` pins the lost refusal's layout and
+  round-trips it. The schedules' harness (`tests/support`): a checksum beside every entry of the
+  disk (`Disk::sums`), verified when a member opens (`Disk::verify`, cut at the first mismatch and
+  marked through what it held); `Fault::Flip` and `Fault::Lose`, `Op::Corrupt` and
+  `Mix::corrupt`, one marked member at a time; the oracle counts a mark for what its member
+  acknowledged (`check_durable`); `Cluster::check_kept` after every settled schedule;
+  `Cluster::electable`, which a group that does not settle must leave empty (a group whose marks
+  the rule must wait on is counted, not failed). `tests/pipeline.rs`:
+  `faults_at_rest_lose_nothing_acknowledged` (the four settings on ticks) and the crash at every
+  persistence step with faults (two variants on ticks: by suspicion a marked member that led cannot
+  end its followers' lease on its node until R-7 lets it campaign). A schedule without faults draws
+  as before: no draw is taken where `Mix::corrupt` is zero.
+- **Found by the schedules, fixed before the counts below**: the leader's term check of the named
+  entry where its log was compacted (seed 1); a marked member of the highest priority refusing
+  every candidate it was not behind, which no one else could then be elected past (seed 560, the
+  shell setting).
+- **Recorded on 2026-10-02** (`HYPER_RAFT_SEEDS=1000 HYPER_RAFT_STEPS=4000 HYPER_RAFT_CRASH_SEEDS=40`,
+  load 27–33): every schedule without faults prints R-6's and L-2's counts exactly (on ticks 73,634,
+  72,589, 60,657 and 62,565 entries committed; by suspicion 75,539, 76,083, 67,930 and 66,354; the
+  crash enumeration 1,689 crashes and 1,656 writes lost, and 1,642 and 2,030, on ticks; 1,867 and
+  1,889, 1,764 and 2,049 by suspicion). With faults at rest, 1,000 schedules of 4,000 steps at each
+  setting: 61,806, 53,933, 43,583 and 50,087 entries committed through 2,815, 2,878, 2,979 and 2,880
+  faults; 1,953, 1,880, 2,132 and 1,999 marks ended, after 967, 952, 890 and 968 steps on average;
+  134, 192, 116 and 128 groups left waiting on a mark the rule could elect past no one (§14.5's
+  measure, before R-7). The crash at every persistence step of 40 schedules that suffered a fault:
+  1,878 crashes (2,374 writes lost, 1,277 faults) and, with a leader applying before its write, 1,769
+  (2,478, 1,067). `HYPER_RAFT_SEEDS=300 HYPER_RAFT_SEED=1000` over the differential, group and fast
+  suites prints what `main` prints but for the mixed group's line, which differs between two runs of
+  `main` itself.
+- **Measured** (`docs/benchmarks.md`, "Repair by entries (R-5)"): one lost entry of 30,000
+  repaired in 1.8 KB and 32 µs in process against a snapshot's 30.7 MB and 8.9 ms; allocations,
+  reallocations and bytes identical on all 32 cells of the comparison; instructions 0.2 % above
+  `main` an op after three hot-path costs found and removed (the first build was 1.2 % above); no
+  interval of time above 1; `benches/pipeline.rs`'s simulated figures identical.
+
+## R-7: a marked member's election
+
+Not a port: this repository's change (`docs/durable.md` §5.2, which states the rule, the safety
+argument, the configurations and marks it covers, and CTRL mapped onto it; `docs/raft.md` §3).
+
+- **The rule** (`src/raft.rs`): `Raft::may_campaign` lets a marked member campaign where the others
+  can be a quorum of each half of its configuration (`Tracker::quorum_of`) and the group has no
+  fast track; `Raft::campaign` polls its own vote as a refusal while marked; `trusted_quorum` counts
+  a marked member out of its own quorum; `Raft::become_leader` ends the mark; `commit_apply` takes a
+  campaign a change made impossible as the refusal it is (a schedule found `advance_apply_to`
+  returning `Error::Lost` where a marked member had been told to campaign once a change applied).
+- **Two rules of L-2 found wanting by the schedules with faults, by suspicion** (`docs/timing.md`
+  §2.9 states both): a leader that restarted and cannot campaign hands over to each heir that holds
+  as much in turn (`hand_over`, by `Watch::attempt`), where it named the lowest for good (seed 75: a
+  member that was a learner by its own configuration, while the followers kept their lease on the
+  leader's node); and a leader told a member started again probes it with its window emptied
+  (`restarted`), where it waited on ten messages that went with the old incarnation, freeing one a
+  beat (seed 478, a window of one byte, `HeartbeatAnswers::Bare`). Each has its directed test in
+  `tests/suspicion.rs`, which fails without it.
+- **Tests**: `tests/repair.rs` gains three: PAR's Figure 4(b) in suffix form (fails on R-5: "no one
+  was elected"), a marked log that may lack a committed entry never elected (fails with the
+  candidate's own vote counted, and with the voters judging by their logs: "committed another entry
+  at 5"), and a marked member of one or two voters asking no one. The schedules' harness:
+  `Cluster::electable` holds the rule (a marked candidate counted out of its own quorum, none in a
+  fast group), `Mix::marks` the most members marked at once; `tests/pipeline.rs` runs the faults at
+  rest by suspicion too, and with two of three voters marked at once
+  (`faults_at_rest_on_two_members_at_once_lose_nothing_acknowledged`); the crash enumeration with
+  faults runs by suspicion too. Mutated, the schedules fail at once: the candidate's own vote counted
+  (seed 26: "member 2 committed another entry at 9"), the voters judging by their logs (seed 4).
+- **Recorded on 2026-10-02** (`HYPER_RAFT_SEEDS=1000 HYPER_RAFT_STEPS=4000 HYPER_RAFT_CRASH_SEEDS=40`,
+  load 44–48): on ticks every schedule without faults prints R-6's counts exactly; by suspicion the
+  two L-2 changes move them (74,181, 77,062, 68,754 and 66,719 entries committed at the four
+  settings, against L-2's 75,539, 76,083, 67,930 and 66,354), and the fast track's 19,826 (19,252).
+  With faults at rest, one marked member at a time, on ticks: 58,963, 51,879, 42,891 and 48,102
+  entries committed through 2,774, 2,736, 2,907 and 2,818 faults, 148, 186, 97 and 132 groups left
+  waiting on a mark; by suspicion 60,246, 56,054, 45,361 and 51,424 through 2,782, 2,829, 2,892 and
+  2,875, 137, 181, 121 and 132 waiting. Two marked at once, on ticks: 413, 452, 334 and 428 groups
+  waiting through 4,370, 4,165, 4,282 and 4,216 faults, where R-5's rule, the same harness and seeds,
+  left 422, 523, 516 and 489 (1,627 against 1,950); by suspicion 384, 453, 356 and 412. The crash at
+  every persistence step of 40 schedules with faults: 1,880 crashes (1,279 faults) and 1,772
+  (1,070) on ticks, 1,953 (1,437) and 1,789 (1,023) by suspicion. `HYPER_RAFT_SEEDS=300
+  HYPER_RAFT_SEED=1000` over the differential, group and fast suites prints what `main` prints but
+  for the mixed group's line.
+- **Where the groups wait.** Of 11 waits in 200 schedules inspected, every one was a group whose
+  configuration (or a half of a joint one) held two voters or one, with the marked member among
+  them, or whose committed entries were held only by a member a change had removed: the rule's
+  bound (`docs/durable.md` §5.2), not a defect. R-7's gain is where the only current logs are marked
+  in a group of three or more, which two marks at once make common and one rarely.
+- **Measured** (`docs/benchmarks.md`, "A marked member's election (R-7)"): allocations identical
+  on all 32 cells; instructions within 0.3 % of `main`'s an op; at load 42–57 no interval of time or
+  cycles above 1 in a second pass of the cells the first pass leaned on, where `main` with 48 inert
+  bytes moved one by 3.4 %; `benches/pipeline.rs`'s simulated figures identical.
+
+
+## A draw at every arming
+
+Not a port: found when `tests/suspicion.rs`'s split test was made exact (the owner's rule,
+2026-10-03: no test passes or fails on a statistical level).
+
+- **The test.** It predicts each crash's first round from the four delays the members armed before
+  the crash runs: the law's event (Ongaro, dissertation §9.2), three of the four starting within the
+  one-way latency of the first, splits it, with pre-vote as well (the first starter's vote requests
+  land three latencies after its draw; a member that started within one latency of it is a
+  candidate two latencies after its own, before they land, and refuses). Every one of 1,000 crashes
+  came out as predicted, before and after the change below; the 99.9 % interval on the count it
+  replaced is gone. The delay test checks the law's draw exactly; its ten bins, judged within five
+  standard deviations, are gone (how the draws spread is the law's to show).
+- **The defect.** The draw's index was the member's campaign count (`Watch::attempt`), so a member
+  that did not campaign kept its delay from one election to the next. The members whose delays fired
+  drew again and the others kept theirs, so the delays an election ran on leaned long: 135 first
+  rounds of the 1,000 split, against the law's 110.8 for independent draws. Raft's randomized
+  timeout is drawn anew at every reset (§5.2, §9.3), and the law's split probability takes the draws
+  as independent.
+- **The rule** (`src/watch.rs`, `src/raft.rs`): every arming draws anew (`Watch::draw`, the index
+  `Watch::draws`); a campaign, a hand-over and an unresolved round each arm, and so draw, once. The
+  hand-over's turn among heirs that hold as much has its own count (`Watch::handovers`), taken in
+  `hand_over` itself, one a hand-over. `every_arming_draws_anew` (a member opens, follows a leader,
+  and twice suspects it and trusts it again: each delay is the law's draw at the next index) fails
+  on the kept draw ("suspicion 1": the opening's draw again) and passes. 99 first rounds of the 1,000
+  split.
+- **What it costs where the detectors are often wrong.** The schedules' detectors are wrong one time
+  in ten about a member that is up, and the kept draw had made campaigns on those suspicions rarer:
+  the long delays it kept outlasted short wrong suspicions. A member that campaigns knows no leader
+  until one answers it (raft-rs's and etcd's pre-candidate, `Raft::become_pre_candidate`), so a
+  proposal made to it is not forwarded, and it casts no fast-track vote (`Raft::hold` votes only as
+  a follower that knows its leader). Counted over the fast-track schedules by suspicion, 2,400 of
+  2,000 steps, with the draw kept and with it drawn anew: pre-vote requests 295,051 and 302,452,
+  proposals forwarded 6,170 and 5,665, fast-track votes 47,443 and 43,389, entries committed 25,732
+  and 24,309, terms led 4,608 and 4,534 (on ticks 26,384 in 4,628 for both; with the hand-over's turn
+  counted as before, 24,302). No message was lost to the schedules' network bound in either. The
+  kept draw bought those entries by electing later and splitting more on a real failure, which is
+  what the delay is for.
+- **The schedules' coverage checks** (`tests/pipeline.rs`) ask that each mechanism was reached, not
+  that it was reached a picked number of times: 24 fast-track schedules by suspicion committed 185
+  entries, under the eight a schedule the check had asked since R-4. "Every schedule suffered faults
+  at rest" was never what it checked, nor true: seed 11 of the shell's three writes out draws none.

@@ -390,8 +390,10 @@ pub(crate) fn frame_room(config: &Config, align: Alignment) -> Result<usize, Log
 /// record does, and the frame gathering while that flush runs (mantle docs/design/raft-log.md
 /// §3). With less, the next frame could gather only once a flush ended and would go out short;
 /// bytes past a third frame cannot be written before the third flush from now, so by Little's
-/// law they add only waiting [research/11 §4, §5.2].
-const PIPELINE_FRAMES: u64 = 3;
+/// law they add only waiting [research/11 §4, §5.2]. A group's writes are useful in each of the
+/// three frames alike, so it is also the most writes a group's handle keeps out at once
+/// ([`GroupLog::depth`]; hyper-raft docs/durable.md §6).
+pub(crate) const PIPELINE_FRAMES: usize = 3;
 
 /// What starting a log needs besides its file and its state.
 struct Prepared {
@@ -512,7 +514,7 @@ impl<F: BlockFile + 'static> Log<F> {
     ) -> Result<Prepared, LogError> {
         let room_bytes = frame_room(&config, align)?;
         let queue_bytes = writer::charge(room_bytes)
-            .and_then(|largest| largest.checked_mul(PIPELINE_FRAMES))
+            .and_then(|largest| largest.checked_mul(u64::try_from(PIPELINE_FRAMES).ok()?))
             .ok_or(LogError::Config("a queue of three frames past u64"))?;
         let p = Params {
             id,
@@ -559,6 +561,7 @@ impl<F: BlockFile + 'static> Log<F> {
                 handle: false,
                 lens: (0, 0),
                 waits: false,
+                epoch: 0,
             });
         }
         Ok(Prepared {
@@ -571,6 +574,10 @@ impl<F: BlockFile + 'static> Log<F> {
 
     /// Starts the log's two threads, then hands the owner, with the device and its file, to the
     /// owner's thread: a thread the OS refuses leaves the file with the caller.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "hyper-log owns its owner's and its device's threads (CLAUDE.md §1, sans-io's one exception)"
+    )]
     fn spawn(
         file: F,
         p: Params,
@@ -753,6 +760,7 @@ impl<F: BlockFile + 'static> Log<F> {
             handle: false,
             lens: (0, 0),
             waits: hears == Hears::Waits,
+            epoch: 0,
         };
         let message = Message::Submit { submission, wait };
         let sent = if wait {

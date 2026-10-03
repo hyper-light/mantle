@@ -535,7 +535,11 @@ mod tests {
             prop_assert!(align.is_aligned(buf.capacity()));
             let region = buf.as_mut_capacity();
             prop_assert_eq!(region.len() % align.get(), 0);
-            prop_assert_eq!(region.as_ptr().addr() % align.get(), 0);
+            // The first byte is aligned; an empty buffer has none, and its address is the
+            // empty slice's (`file::tests::an_empty_buffer_transfers_nothing_at_every_alignment`).
+            if !region.is_empty() {
+                prop_assert_eq!(region.as_ptr().addr() % align.get(), 0);
+            }
         }
     }
 }

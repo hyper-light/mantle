@@ -487,13 +487,15 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
         &self.conf
     }
 
-    /// Whether this member leads and every voter of its configuration has said it committed
-    /// the entry that made it. Configurations take effect as members apply them, so until
-    /// then a voter that did not learn of the commit still counts the members the change
-    /// removed, and losing the leader could leave no quorum it can elect in; after, losing
-    /// any one member leaves voters that elect under this configuration
+    /// Whether this member leads and every voter of its configuration has said its log states
+    /// a commit through the entry that made it: a member's answers carry its durable commit,
+    /// not its commit (core step R-6). Configurations take effect as members apply them, and a
+    /// member applies a change only once its log states the commit (`Replica::behind_fence`),
+    /// so until then a voter still counts the members the change removed, after a restart as
+    /// before, and losing the leader could leave no quorum it can elect in; after, losing any
+    /// one member leaves voters that elect under this configuration
     /// (docs/design/replica.md §6). The leader counts itself: it applied the configuration
-    /// only once its own log stated the commit (`Replica::behind_fence`).
+    /// only once its own log stated the commit.
     pub fn configuration_known(&self) -> bool {
         let tracker = self.node.raft.tracker();
         let id = self.id();
@@ -728,9 +730,9 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
             index: mark.index,
             reject_hint: self.last_index()?,
             request_snapshot: mark.index,
-            // What the leader counts toward `configuration_known`: the commit this member's
-            // log states, which a restart keeps.
-            commit: self.logged_commit,
+            // What the leader counts toward `configuration_known`: the commit this member
+            // states durably, which a restart keeps, as the core's own answers state it (R-6).
+            commit: self.node.durable_commit(),
             ..Message::default()
         });
         Ok(())
@@ -984,6 +986,10 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
                     self.take_held()?;
                 }
                 Persisted::Done(None) => {
+                    // The write stated a commit beyond any `Ready`'s hard state, which the
+                    // core learns of only from its owner (`RawNode::commit_durable`, core step
+                    // R-6): its answers state no commit past what it knows durable.
+                    self.tell_durable_commit(self.logged_commit)?;
                     self.apply(Vec::new(), &mut out)?;
                     self.node.advance_apply_to(self.applied)?;
                     self.take_held()?;
@@ -1111,6 +1117,19 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
                 Err(e) => return Err(self.fence(&e)),
             }
         }
+    }
+
+    /// Tells the core a commit the member made durable outside a `Ready`'s hard state: the
+    /// commit-only write of the fence, or the engine's durable index, which a restart writes
+    /// into the log as its commit (`commit_applied`). The core's answers to appends and
+    /// heartbeats state at most what it knows durable (core step R-6, hyper-raft
+    /// docs/durable.md §4.4), and a leader counts those toward `configuration_known`. A
+    /// `Ready`'s own hard state needs no word: the core reads it from the `Ready`.
+    fn tell_durable_commit(&mut self, commit: u64) -> Result<(), ReplicaError> {
+        if commit > self.node.durable_commit() {
+            self.node.commit_durable(commit)?;
+        }
+        Ok(())
     }
 
     /// The first of `staged`'s parts is durable: the commit it states is the log's.
@@ -1289,6 +1308,9 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
     pub fn compact(&mut self, keep: u64) -> Result<(), ReplicaError> {
         self.live()?;
         self.engine.persist()?;
+        // What the engine made durable a restart opens with, its log's commit raised to it
+        // (`commit_applied`): a durable commit the core states in its answers from now on.
+        self.tell_durable_commit(self.engine.durable())?;
         // Keeping more entries than the engine has made durable keeps them all.
         let index = self.engine.durable().saturating_sub(keep);
         // A part of a ready out on the group's handle is answered first: the handle answers

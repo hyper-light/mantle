@@ -278,7 +278,7 @@ state to one owner thread that answers every call by ticket, waking only its cal
 mantle runs on that crate since 2026-10-01 and `crates/log` is gone (§5.3). The range
 simulation's recorded seeds 1 to 48 replay to the same histories, step for step, on it as on
 `crates/log`. A replica writes and reads its group through the group's handle on the log
-(hyper-log `GroupLog`, at hyper-raft `63cb65d`), which answers the core's reads and cuts its
+(hyper-log `GroupLog`, at hyper-raft `687244f`), which answers the core's reads and cuts its
 updates into frames on the replica's thread, from what the replica's own answered writes
 left; a blocking write does its own frame's I/O on the writer's thread, and the member holds
 no handle on the log itself. A committed entry of a three-member group, driven in one
@@ -290,8 +290,8 @@ rounds; on the move to hyper-log before the handle it took 0.83 ms
 with one replica and runs more appends a second at 256 replicas: 29.3K against 27.1K at
 128 B, in 12 of 12 paired rounds, and 23.1K against 21.1K at 16 KiB, in 11 of 12.
 
-Range replicas (`mantle-range`, [design](design/replica.md)) run hyper-raft's core (vendored,
-named `focal-raft` in the crate) over the log and an engine: an entry carries a batch of gateway commands applied as one engine batch,
+Range replicas (`mantle-range`, [design](design/replica.md)) run hyper-raft's core (vendored at
+`687244f`, named `focal-raft` in the crate) over the log and an engine: an entry carries a batch of gateway commands applied as one engine batch,
 client sessions make each command take effect once however often it is retried, a write
 delivered again in a new session is recognised by its file, or for a write with no file by
 the ID the gateway drew for its request, and answered as its first delivery was, and members
@@ -305,7 +305,13 @@ once the member's log states its commit (hyper-raft's commit fence, focal's F17)
 volatile commit, a founder that removed its only peer and lost power while the commit's write
 flushed reopened counting the stopped peer and never elected again, which directed power cuts
 at every write and flush of a change now check for a leader, a follower, a sole voter and a
-group shrinking to one. A
+group shrinking to one. A member's answers state its durable commit, not its commit (the
+core's step R-6), and the replica tells the core each commit it makes durable outside a
+`Ready`'s hard state, the fence's commit-only write and the engine's durable index, so a
+replacement ends only on commits every voter's restart keeps. The core's other steps since
+the last snapshot (readies ahead of their persistence, repair by entries, a marked member's
+election, elections by suspicion) wait for the replica's move onto hyper-raft's durable shell:
+the replica keeps one `Ready` out, its own marks and repair, and elections on ticks. A
 deterministic simulation of three members and three concurrent gateways, under crashes,
 failed writes and flushes, partitions, dropped and reordered messages, compaction, and one
 or two members lost for good in every run, checks after every run that each index was

@@ -482,6 +482,39 @@ impl<F: BlockFile + 'static, E: Engine> Replica<F, E> {
         self.applied
     }
 
+    /// The last entry the member knows committed.
+    pub fn committed(&self) -> u64 {
+        self.node.raft.log().committed()
+    }
+
+    /// The commit the member's log states durably: what a restart opens knowing committed.
+    pub fn logged_commit(&self) -> u64 {
+        self.logged_commit
+    }
+
+    /// Whether the member knows a change of configuration committed whose commit its log does
+    /// not state yet: a crash now reopens it without the change applied, whatever it said before
+    /// (docs/design/replica.md §6). The window the real-process test kills a member in.
+    pub fn change_unlogged(&self) -> Result<bool, ReplicaError> {
+        let log = self.node.raft.log();
+        let (logged, committed) = (self.logged_commit, log.committed());
+        if committed <= logged {
+            return Ok(false);
+        }
+        let low = logged
+            .checked_add(1)
+            .ok_or_else(|| ReplicaError::Stopped("an index past u64".into()))?;
+        let high = committed
+            .checked_add(1)
+            .ok_or_else(|| ReplicaError::Stopped("an index past u64".into()))?;
+        Ok(log.any_entry(low, high, |entry: &Entry| {
+            matches!(
+                entry.entry_type,
+                EntryType::EntryConfChange | EntryType::EntryConfChangeV2
+            )
+        })?)
+    }
+
     /// The group's configuration as of the last entry applied.
     pub fn configuration(&self) -> &ConfState {
         &self.conf

@@ -26,6 +26,7 @@ thiserror.workspace = true
 mantle-chunk = { path = "../chunk" }
 hyper-block = { path = "../../vendor/hyper-block", features = ["sim"] }
 proptest.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

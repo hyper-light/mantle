@@ -495,6 +495,35 @@ flushes, and never elected again, counting its stopped peer; the leader and the 
 reopened counting the member they had removed; the sole voter, killed after the change was
 made, reopened without the learner it had added, its commit never logged.
 
+Directed replacements put the power cut inside the window between a replacement's change
+committing and the commit a member's log states (hyper-raft `docs/durable.md` §11, D-1's first
+test). Member 3 of a group of three is lost for good, member 4 joins, and the leader runs
+`membership::Replacement` until it says every voter knows the final configuration. The leader,
+a follower that stays a voter, and the joining member in turn lose power at each of their
+device's writes and flushes from member 4's joining, 30 to 40 operations each and every window
+among them, both ways of taking readies. Then every member loses power at the moment the leader
+says the replacement is done, keeping only what its device made durable, and each, driven
+alone, must reopen in the final configuration; one member of it is lost for good, each of the
+three in turn, and the other two must elect a leader and commit an entry. The runs pass on the
+replica and core before R-6 (origin/dev `1c179e8`) and after it: a follower's answer left after
+the write that stated its commit, so no word the leader counted was volatile, and §6's one
+exception answers next in a later term. Counting a voter that holds the change's entry rather
+than one whose log states its commit (`matched` for `committed_index` in `configuration_known`)
+fails all three at once: members reopen in the joint configuration, whose old half has lost two
+of its three, and the two left elect no one.
+
+`tests/processes.rs` runs the same replacement as real processes: each member a process of its
+own on a real file through the direct-I/O file layer and the platform's full flush, the
+supervisor the network over TCP on the loopback interface, running rounds as the directed runs
+do. The member to be killed names the window as it reaches it, a follower with its write
+stating the commit out, the leader with the change held behind its fence, and waits there for
+`SIGKILL`; it is started again from its file. Each is killed at each of its three windows in
+turn: the learner's addition, the swap, and the end of the joint configuration. Then every
+member is killed the moment the leader says the replacement is done, each must reopen from its
+file in the final configuration, and with one lost for good the other two must elect and commit.
+The engine keeps nothing across a process's death, so a restarted member applies again what its
+log states committed. The mutation above fails it the same way.
+
 With the fence, seeds 1 to 48 give the same counts and gateway histories as before but for
 23, 26 and 39. The fence holds a change on every seed, from 4 to 25 times a run; on those three
 a member taking a `Ready` by `begin` held a replacement's change for one flush, the

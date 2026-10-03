@@ -33,7 +33,10 @@
 //! and flushes in turn while its group changes configuration, for a leader, a follower, a sole
 //! voter and a founder removing its only peer, and check the commit fence
 //! (docs/design/replica.md §3, §5): the member reopens with any configuration it applied, and
-//! the group goes on.
+//! the group goes on. Directed replacements cut a replacement's leader, a follower and its
+//! joining member the same way, every member's power at the moment the leader says the
+//! replacement is done, and one member of the final configuration is then lost for good: each
+//! reopens in the final configuration, and the other two elect (docs/design/replica.md §6).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -1493,6 +1496,9 @@ struct Case {
     /// every voter knows the change committed (`Replica::configuration_known`), as a
     /// replacement ends (`mantle_range::membership`).
     removes: Option<u64>,
+    /// A replacement the leader runs instead of one change (`membership::Replacement`): each
+    /// change it asks for is proposed, again after a patience without effect, until it is done.
+    replacing: Option<Replacement>,
 }
 
 /// Rounds a directed run waits for what a group with a quorum and no faults does within a few
@@ -1509,6 +1515,11 @@ struct Directed {
     damage: Damage,
     /// The registrations each member applied: (member, nonce).
     registered: HashSet<(u64, u64)>,
+    /// Rounds run, and the round the replacement's last change was proposed in.
+    rounds: usize,
+    proposed_at: Option<usize>,
+    /// The leader said the replacement is done: the round stopped at that moment.
+    done: bool,
 }
 
 impl Directed {
@@ -1521,6 +1532,9 @@ impl Directed {
             wire: VecDeque::new(),
             damage: Damage::default(),
             registered: HashSet::new(),
+            rounds: 0,
+            proposed_at: None,
+            done: false,
         }
     }
 
@@ -1539,8 +1553,40 @@ impl Directed {
     }
 
     /// The operator: stops the member the change removed for good once the leader has applied
-    /// the change and says every voter knows it committed.
+    /// the change and says every voter knows it committed; or runs the replacement through
+    /// whichever member leads, noting the moment it is done.
     fn operate(&mut self, case: &Case) {
+        if let Some(replacement) = case.replacing {
+            let (round, proposed_at) = (self.rounds, self.proposed_at);
+            let Some(leader) = self.leader() else {
+                return;
+            };
+            match replacement.next(
+                leader.configuration(),
+                leader.caught_up(replacement.joining()),
+                leader.configuration_known(),
+            ) {
+                Next::Done => self.done = true,
+                Next::Wait => {}
+                Next::Propose(change) => {
+                    if proposed_at.is_none_or(|at| round - at >= PATIENCE as usize) {
+                        // A leader whose power was cut on a write still out is fenced: its
+                        // next drive says so, and the run restarts it.
+                        match leader.propose_change(&change) {
+                            Ok(())
+                            | Err(
+                                ReplicaError::Refused(_)
+                                | ReplicaError::Stalled
+                                | ReplicaError::Fenced(_),
+                            ) => {}
+                            Err(e) => panic!("propose a change: {e}"),
+                        }
+                        self.proposed_at = Some(round);
+                    }
+                }
+            }
+            return;
+        }
         let Some(removed) = case.removes else {
             return;
         };
@@ -1556,6 +1602,7 @@ impl Directed {
     /// the messages sent arrive. The target's configuration as it stood when its device's power
     /// was cut, once the member learns it: its log fenced.
     fn round(&mut self, case: &Case, takes: Takes) -> Option<ConfState> {
+        self.rounds += 1;
         let ids: Vec<u64> = self.nodes.iter().map(|n| n.id).collect();
         for &id in &ids {
             if let Some(r) = self.replica(id)
@@ -1594,6 +1641,11 @@ impl Directed {
             // The operator acts on what the members say, whenever it looks: here, while the
             // target's write may still be flushing.
             self.operate(case);
+            // The moment a replacement is done is where its run cuts every member's power:
+            // nothing more is driven or delivered.
+            if self.done && case.replacing.is_some() {
+                return cut;
+            }
             if overlap && let Some(r) = self.replica(id) {
                 r.wait_persisted();
             }
@@ -1828,6 +1880,7 @@ fn a_founder_that_removes_its_only_peer_elects_itself_after_a_cut_anywhere() {
             ..ConfState::default()
         },
         removes: Some(2),
+        replacing: None,
     });
 }
 
@@ -1843,6 +1896,7 @@ fn a_leader_cut_inside_a_change_reopens_with_what_it_applied() {
             ..ConfState::default()
         },
         removes: Some(3),
+        replacing: None,
     });
 }
 
@@ -1859,6 +1913,7 @@ fn a_follower_cut_inside_a_change_reopens_with_what_it_applied() {
             ..ConfState::default()
         },
         removes: Some(3),
+        replacing: None,
     });
 }
 
@@ -1876,5 +1931,205 @@ fn a_sole_voter_cut_inside_a_change_reopens_with_what_it_applied() {
             ..ConfState::default()
         },
         removes: None,
+        replacing: None,
     });
+}
+
+/// The final configuration of a replacement of member 3 by member 4 in a group of three.
+fn replaced_configuration() -> ConfState {
+    ConfState {
+        voters: vec![1, 2, 4],
+        ..ConfState::default()
+    }
+}
+
+/// One directed run of a replacement under member 1's lead (docs/design/replica.md §6): member 3
+/// of a group of three is lost for good, member 4 joins, and the leader runs
+/// `membership::Replacement` until it says the replacement is done. The target's device cuts the
+/// power at its `ops`-th write or flush from when member 4 joins, or nowhere for `None`; the
+/// target restarts from what its device kept, and the replacement must still finish. Among the
+/// cuts are those inside the window between each change's commit and the commit the target's
+/// log states.
+///
+/// Then the guarantee `Replica::configuration_known` gives, at the moment the leader says it:
+/// every member loses power at once, keeping only what its device made durable, and each,
+/// driven alone, must reopen in the final configuration; and once one member of it is lost for
+/// good (`lost`), the other two must elect a leader and commit an entry. A voter whose word the
+/// leader counted for a commit its log did not state would reopen in the joint configuration,
+/// whose old half has lost two of its three members, and the two left could not elect
+/// (hyper-raft docs/durable.md §1, §11: D-1's first test). Returns whether the power was cut;
+/// `false` for `Some(ops)` past the last operation the run makes.
+fn replaced(target: u64, lost: u64, takes: Takes, ops: Option<u64>, seed: u64) -> bool {
+    let case = Case {
+        members: 3,
+        target,
+        change: ConfChangeV2::default(),
+        made: replaced_configuration(),
+        removes: None,
+        replacing: Replacement::new(3, 4),
+    };
+    let mut d = Directed::new(&case, seed);
+    d.replica(1).unwrap().campaign().unwrap();
+    let mut elected = false;
+    for _ in 0..PATIENT_ROUNDS {
+        assert!(d.round(&case, Takes::Waiting).is_none());
+        if d.replica(1).is_some_and(|r| r.is_leader()) {
+            elected = true;
+            break;
+        }
+    }
+    assert!(elected, "member 1 is never elected");
+    // Member 3 is lost for good, its device and all; member 4 joins on a new one.
+    d.nodes.retain(|n| n.id != 3);
+    d.nodes.push(Node::new(4, seed, case.members));
+    if let Some(ops) = ops {
+        let node = d.nodes.iter().find(|n| n.id == target).unwrap();
+        node.with_file(move |f| f.inject(Fault::PowerCut { ops }))
+            .unwrap();
+    }
+    // A replacement takes a few changes, each committed within a few election timeouts.
+    let mut cut = false;
+    for _ in 0..4 * PATIENT_ROUNDS {
+        if d.round(&case, takes).is_some() {
+            assert!(!cut, "a second cut");
+            cut = true;
+            let seed = d.seed;
+            let mut damage = std::mem::take(&mut d.damage);
+            let node = d.nodes.iter_mut().find(|n| n.id == target).unwrap();
+            node.crash_losing(Crash::LoseAll);
+            node.restart(seed, &mut damage);
+            d.damage = damage;
+        }
+        if d.done {
+            break;
+        }
+    }
+    let states = |d: &Directed| -> Vec<String> {
+        d.nodes
+            .iter()
+            .filter_map(|n| n.replica.as_ref())
+            .map(|r| format!("{} conf {:?}", r.describe(), r.configuration()))
+            .collect()
+    };
+    assert!(
+        d.done,
+        "target {target}, {takes:?}, cut at {ops:?}: the replacement never finished: {:?}",
+        states(&d)
+    );
+    if ops.is_some() && !cut {
+        return false;
+    }
+    // Every member loses power at the moment the leader says every voter knows: what each
+    // reopens with is what its device made durable.
+    d.wire.clear();
+    let seed = d.seed;
+    let mut damage = std::mem::take(&mut d.damage);
+    let mut found = Vec::new();
+    for node in &mut d.nodes {
+        node.crash_losing(Crash::LoseAll);
+        node.restart(seed, &mut damage);
+        let r = node.replica.as_mut().expect("a member reopens");
+        let mut settled = false;
+        for _ in 0..PATIENT_ROUNDS {
+            let before = (r.applied(), r.configuration().clone());
+            r.drive().unwrap();
+            if (r.applied(), r.configuration().clone()) == before {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "member {} alone never stops applying", node.id);
+        if !same_configuration(r.configuration(), &case.made) {
+            found.push(format!(
+                "member {} reopens in {:?} after the leader said every voter knew {:?}",
+                node.id,
+                r.configuration(),
+                case.made
+            ));
+        }
+    }
+    d.damage = damage;
+    // One member of the final configuration is lost for good; the other two go on.
+    d.nodes.retain(|n| n.id != lost);
+    let after = Case {
+        replacing: None,
+        ..case
+    };
+    let nonce = 0x4e55;
+    let mut proposed = false;
+    let mut live = false;
+    for _ in 0..PATIENT_ROUNDS {
+        assert!(d.round(&after, takes).is_none(), "a second cut");
+        if !proposed && let Some(leader) = d.leader() {
+            proposed = leader.propose(&registration(nonce)).is_ok();
+        }
+        if proposed
+            && d.nodes
+                .iter()
+                .all(|n| d.registered.contains(&(n.id, nonce)))
+        {
+            live = true;
+            break;
+        }
+    }
+    if !live {
+        found.push(format!(
+            "with member {lost} lost, the other two never elected a leader that committed an \
+             entry on both: {:?}",
+            states(&d)
+        ));
+    }
+    assert!(
+        found.is_empty(),
+        "target {target}, {takes:?}, power cut at operation {ops:?} from member 4's joining, \
+         member {lost} lost after: {found:#?}"
+    );
+    true
+}
+
+/// Runs a replacement with the target's power cut at each of its device operations from member
+/// 4's joining in turn, and once without a cut, both ways of taking readies. The member lost
+/// for good after the replacement turns with the cut: each of the final configuration's three.
+fn every_replacement_cut(target: u64) {
+    // A replacement makes a few dozen writes and flushes (30 to 40 for these three targets);
+    // this bounds the enumeration far past them.
+    const MAX_OPS: u64 = 1 << 12;
+    let seed = 0x52;
+    let lost_after = [1, 2, 4];
+    for takes in [Takes::Waiting, Takes::Overlapping] {
+        let mut ops = 0;
+        while replaced(
+            target,
+            lost_after[(ops % 3) as usize],
+            takes,
+            Some(ops),
+            seed,
+        ) {
+            ops += 1;
+            assert!(ops < MAX_OPS, "target {target} never ran out of operations");
+        }
+        assert!(ops > 0, "target {target} {takes:?} cut the power nowhere");
+        for lost in lost_after {
+            replaced(target, lost, takes, None, seed);
+        }
+    }
+}
+
+/// The leader running a replacement loses power anywhere in it, the window between each
+/// change's commit and the commit its log states among the cuts (D-1's first test).
+#[test]
+fn a_replacements_leader_cut_anywhere_in_it_leaves_a_group_that_elects() {
+    every_replacement_cut(1);
+}
+
+/// A follower that stays a voter through a replacement loses power anywhere in it.
+#[test]
+fn a_replacements_follower_cut_anywhere_in_it_leaves_a_group_that_elects() {
+    every_replacement_cut(2);
+}
+
+/// The joining member loses power anywhere in the replacement that makes it a voter.
+#[test]
+fn a_replacements_joining_member_cut_anywhere_in_it_leaves_a_group_that_elects() {
+    every_replacement_cut(4);
 }

@@ -312,6 +312,12 @@ replacement ends only on commits every voter's restart keeps. The core's other s
 the last snapshot (readies ahead of their persistence, repair by entries, a marked member's
 election, elections by suspicion) wait for the replica's move onto hyper-raft's durable shell:
 the replica keeps one `Ready` out, its own marks and repair, and elections on ticks. A
+replacement's leader, a follower and the joining member, each killed inside the window between
+a change's commit and the commit its log states (at every write and flush in the simulation,
+and at every window as real processes with `SIGKILL`), leave a group whose members reopen in
+the final configuration once the leader says every voter knows it, and which elects with any
+one of them lost; the runs pass before R-6 and after, and fail when the leader counts a voter
+that only holds the change. A
 deterministic simulation of three members and three concurrent gateways, under crashes,
 failed writes and flushes, partitions, dropped and reordered messages, compaction, and one
 or two members lost for good in every run, checks after every run that each index was

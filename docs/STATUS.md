@@ -336,6 +336,12 @@ even, an entry's latency its write's on either shell, with 21–31% fewer alloca
 
 Remaining before it is done:
 
+- Elections by suspicion on hyper-raft's node-pair liveness stream (`hyper-liveness`, L-3), which
+  the range's shell takes where its owner gives it the stream's word: the node lacks the owner
+  that holds its replicas, the datagram plane with kernel receive stamps, placement's map of
+  members to nodes, a durable run, liveness writes on its log devices, shard timers that measure
+  their own lateness, and the cell's history for the detectors' prior
+  ([design](design/node.md) §2.4). Ranges elect on ticks until then.
 - Chunks a stopped gateway wrote for a block it never recorded, reconciled per volume once
   storage nodes run, and the collector's pacing against foreground latency (design §2, §6;
   docs/research/22 §10).

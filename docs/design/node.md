@@ -468,9 +468,9 @@ duration times a margin derived from the split's measured cost.
 ### 2.4 Time
 
 The Raft core counts ticks and reads no clock on ticks (07 §5.1; hyper-raft `docs/durable.md`
-§8), which is how a range elects until its node carries the node-pair liveness stream. A shard keeps a timer wheel of each
-range's next tick, as slates' runtime keeps timers, whose cost is per event rather than per tick
-(08 §3.2), and ticks a range only when its tick is due.
+§8), which is how a range elects until its node carries the node-pair liveness stream (below). A
+shard keeps a timer wheel of each range's next tick, as slates' runtime keeps timers, whose cost
+is per event rather than per tick (08 §3.2), and ticks a range only when its tick is due.
 
 The tick period is derived, as focal-timing derives it: `election_tick × period ≥ 10 × tail`,
 where the tail is the slowest voter path's (07 §5.1). The counts of ticks are focal's, an
@@ -491,6 +491,53 @@ A range's time for its entries is its leader's clock, stamped on each entry and 
 back (metadata.md; `mantle_meta::clock`). The offset between nodes' clocks bounds the grace that
 handover deadlines and collection need (metadata.md §6); the node estimates it from its probes'
 timestamps, each estimate's error bounded by the probe's round trip.
+
+**Elections by suspicion, once the node carries the stream.** hyper-raft's core elects by its
+owner's failure detectors instead of ticks where its owner gives it their word (core step L-2),
+and the detectors are one heartbeat stream for each pair of nodes that share a group, each
+heartbeat proving a recent durable flush on its sender's log and each pair judged by an NFD-E
+detector configured from what the pair measured (`hyper-liveness`, L-3; hyper-raft
+`docs/timing.md` §2.8–§2.9). One stream a pair costs the same however many groups the pair
+shares, where a heartbeat per group grows with them (hyper-raft `docs/benchmarks.md`,
+"hyper-liveness"). A range moves onto it only once the node can carry the stream, which takes
+seven things the node does not have (§10, phases A and C):
+
+1. **An owner that holds its replicas.** The shards of §2.1, each holding its ranges' replicas
+   by handle, driving them as §2.2 says, and fanning each node's suspicion, trust and restart
+   out to the groups with a member on that node (hyper-durable's `Owner::believe`). Today a
+   range's replica is driven by its tests alone; the `mantle` binary runs no node.
+2. **The plane.** The sealed datagram plane of §3.4 on a socket that stamps each datagram's
+   arrival in the kernel (hyper-tokio's `PlaneSocket`: Linux `SO_TIMESTAMPNS`, macOS
+   `SO_TIMESTAMP_MONOTONIC`; Windows stamps at the read), under the stream's contract: every
+   datagram stamped before a time is fed before the stream is polled at that time, the clock
+   read before the socket (timing.md §2.8). The node has no transport yet (§3).
+3. **Which node each member is on.** Placement's map of each range's members to nodes, so the
+   node keeps one pair for each node it shares a group with, within placement's bound on pairs
+   (`Settings::max_peers`), and charges each pair the election span of the groups it shares
+   (`Liveness::set_election`) (§6.5, §7).
+4. **The node's run** (`Settings::run`). A count raised at every start and kept as a record of
+   the node, written whole before the run is used (a temporary name, the platform's full flush, a rename, the
+   directory's flush, a CRC-32C checked on read: hyper-block's `record`), so a restarted
+   node's heartbeats are numbered on from its last run's and its peers count one restart, not
+   two (timing.md §2.8). The node keeps no records of its own yet (§1.5–§1.6); its random
+   incarnation has no order and cannot be the run.
+5. **Flush evidence.** Every durable completion on the node's metadata logs reported to the
+   stream (`Liveness::on_durable`; a range's drive gives its latest as `Driven::flushed`), and
+   a liveness write made on a log device when the stream asks for one because none came in
+   time (`Output::flush`), one out at a time. A node whose ranges write makes none; an idle one
+   makes one per shortest interval among its pairs.
+6. **Timers and their lateness.** The stream's heartbeat deadlines and each core's
+   (`deadline`, `wake`) on the shards' timer wheels, and each wait for the stream's wake
+   reported with the time it ended (`Liveness::on_wait`), from which the stream measures the
+   owner's lateness `G`, the owner's own stalls included (timing.md §2.9).
+7. **The cell's history.** The restarts and abandoned suspicions of the cell's nodes, the
+   detectors' prior evidence on the time between failures (`Settings::history`), kept with the
+   cell's membership in the root range (§3.5, §7).
+
+Until then a range elects on ticks with focal's counts, as above (replica.md §3), and the stream
+is vendored only as the shell's dependency (vendor/UPSTREAM.md). SWIM's place (§3.5) does not
+change with it: SWIM's word stays a hint for routing and repair, and the stream's is what a
+group's elections take.
 
 ### 2.5 One admission authority per bottleneck
 

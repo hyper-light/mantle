@@ -10,7 +10,7 @@ use super::fse::{
 };
 
 /// Literals length codes 0 to 35 (§3.1.1.3.2.1.1, Table 16): baseline and extra bits.
-const LITERALS_LENGTH_CODES: [(u32, u8); 36] = [
+pub(super) const LITERALS_LENGTH_CODES: [(u32, u8); 36] = [
     (0, 0),
     (1, 0),
     (2, 0),
@@ -49,7 +49,7 @@ const LITERALS_LENGTH_CODES: [(u32, u8); 36] = [
     (65536, 16),
 ];
 /// Match length codes 0 to 52 (§3.1.1.3.2.1.1, Table 17): baseline and extra bits.
-const MATCH_LENGTH_CODES: [(u32, u8); 53] = [
+pub(super) const MATCH_LENGTH_CODES: [(u32, u8); 53] = [
     (3, 0),
     (4, 0),
     (5, 0),
@@ -107,9 +107,9 @@ const MATCH_LENGTH_CODES: [(u32, u8); 53] = [
 /// The largest offset code the decoder supports, the reference decoder's N (§3.1.1.3.2.1.1).
 const MAX_OFFSET_CODE: usize = 31;
 /// The largest accuracy logs a sequences table may state (§3.1.1.3.2.1, FSE_Compressed_Mode).
-const LITERALS_LENGTH_MAX_LOG: u32 = 9;
-const MATCH_LENGTH_MAX_LOG: u32 = 9;
-const OFFSET_MAX_LOG: u32 = 8;
+pub(super) const LITERALS_LENGTH_MAX_LOG: u32 = 9;
+pub(super) const MATCH_LENGTH_MAX_LOG: u32 = 9;
+pub(super) const OFFSET_MAX_LOG: u32 = 8;
 
 /// One sequence: literals to copy, then a match (§3.1.1.4). `offset_value` is the raw value,
 /// 1 to 3 naming repeat offsets (§3.1.1.5).

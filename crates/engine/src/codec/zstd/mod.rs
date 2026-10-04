@@ -8,11 +8,13 @@
 
 mod bits;
 mod decoder;
+mod encoder;
 mod fse;
 mod huffman;
 mod sequences;
 
 pub use decoder::{Decoder, Dictionary, Progress};
+pub use encoder::{Encoder, Level, Written, compress};
 
 use crate::error::{Error, Malformed};
 

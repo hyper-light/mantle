@@ -15,7 +15,7 @@
 
 use std::io::Write as _;
 
-use mantle_engine::codec::zstd::{Decoder, Dictionary};
+use mantle_engine::codec::zstd::{Decoder, Dictionary, Level, compress};
 use mantle_engine::util::xxhash::{Xxh64, xxh64};
 
 /// The window bound the decoder is given: the reference's default decoding limit, 2^27 bytes
@@ -305,4 +305,37 @@ fn streamed_xxh64_matches_one_shot() {
         }
         assert_eq!(h.digest(), xxh64(&data, 0), "step {step}");
     }
+}
+
+/// The port's frames decode to their input through the port's decoder and the reference's, at
+/// every level, with and without checksums; their sizes beside the reference's at the same level
+/// are printed (the ratio is measured, not asserted: the encoder is judged against the reference
+/// by the benchmark, under the tails rule).
+#[test]
+fn the_ports_frames_decode_everywhere() {
+    let corpus = corpus();
+    let mut ours_total = 0usize;
+    let mut theirs_total = 0usize;
+    for level in [1, 3, 9] {
+        for data in &corpus {
+            for checksum in [true, false] {
+                let frame = compress(data, Level::new(level), checksum).unwrap();
+                let back = decode(&frame, None, frame.len().max(1), 1 << 17).unwrap();
+                assert!(back == *data, "port→port level {level} len {}", data.len());
+                let reference = zstd::stream::decode_all(&frame[..]).unwrap();
+                assert!(
+                    reference == *data,
+                    "port→reference level {level} len {}",
+                    data.len()
+                );
+                if checksum {
+                    ours_total += frame.len();
+                    theirs_total += zstd::bulk::compress(data, level).unwrap().len();
+                }
+            }
+        }
+    }
+    eprintln!(
+        "bytes over the corpus at levels 1, 3, 9: port {ours_total}, reference {theirs_total}"
+    );
 }

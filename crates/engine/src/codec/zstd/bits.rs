@@ -139,3 +139,51 @@ impl<'a> Backward<'a> {
         self.pos < 0
     }
 }
+
+/// A writer of a little-endian bit string, each value's least significant bit first: the
+/// encoder's side of [`Forward`] and [`Backward`]. A stream for the backward reader ends with
+/// [`Writer::close`]'s 1 bit and zero padding (§3.1.1.3.2.1.2, §4.2.2).
+#[derive(Debug, Default)]
+pub(super) struct Writer {
+    bytes: Vec<u8>,
+    /// Bits not yet a whole byte, the oldest lowest.
+    acc: u64,
+    held: u32,
+}
+
+impl Writer {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Appends the low `bits` (at most 32) of `value`.
+    pub(super) fn add(&mut self, value: u64, bits: u32) {
+        if bits == 0 {
+            return;
+        }
+        let mask = u64::MAX
+            .checked_shr(64u32.saturating_sub(bits))
+            .unwrap_or(0);
+        self.acc |= (value & mask).checked_shl(self.held).unwrap_or(0);
+        self.held = self.held.saturating_add(bits);
+        while self.held >= 8 {
+            self.bytes.push((self.acc & 0xFF) as u8);
+            self.acc >>= 8;
+            self.held = self.held.saturating_sub(8);
+        }
+    }
+
+    /// Ends a stream for the backward reader: a 1 bit, then zeros to the byte.
+    pub(super) fn close(mut self) -> Vec<u8> {
+        self.add(1, 1);
+        self.finish()
+    }
+
+    /// Ends a forward stream (a table description), its last byte padded with zeros.
+    pub(super) fn finish(mut self) -> Vec<u8> {
+        if self.held > 0 {
+            self.bytes.push((self.acc & 0xFF) as u8);
+        }
+        self.bytes
+    }
+}

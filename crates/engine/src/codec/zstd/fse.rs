@@ -3,7 +3,7 @@
 //! (§3.1.1.3.2.2).
 
 use super::Corrupt;
-use super::bits::{Backward, Forward};
+use super::bits::{Backward, Forward, Writer};
 
 /// The smallest accuracy log a description states: its low 4 bits plus 5 (§4.1.1).
 const MIN_ACCURACY_LOG: u32 = 5;
@@ -246,3 +246,270 @@ pub(super) const OFFSET_DEFAULT: [i16; 29] = [
     1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1,
 ];
 pub(super) const OFFSET_DEFAULT_LOG: u32 = 5;
+
+/// The accuracy log for `total` symbols drawn from `max_symbol + 1` values, at most `max_log`:
+/// large enough to give every present symbol a cell and resolve the distribution, small enough
+/// that the description does not outweigh what it saves; the reference's choice
+/// (`FSE_optimalTableLog`: the source's bit length less 2, raised to the symbols' bit length
+/// plus 2, within 5 and `max_log`).
+pub(super) fn table_log(total: usize, max_symbol: usize, max_log: u32) -> u32 {
+    let bits = |x: usize| usize::BITS.saturating_sub(x.leading_zeros());
+    let from_source = bits(total.saturating_sub(1)).saturating_sub(2);
+    let floor = bits(total)
+        .saturating_add(1)
+        .min(bits(max_symbol).saturating_add(2));
+    from_source
+        .min(max_log)
+        .max(floor)
+        .clamp(MIN_ACCURACY_LOG, max_log)
+}
+
+/// Scales `counts` (each symbol's occurrences, `total` in all) to a distribution summing to
+/// `1 << log` in which every present symbol keeps at least one cell: each its rounded share,
+/// the rounding's error then taken from or given to the largest. Symbols too rare for a full
+/// cell keep one (the format's "less than 1", -1, is an encoding choice this does not make).
+pub(super) fn normalize(counts: &[u32], total: u32, log: u32) -> Result<Vec<i16>, Corrupt> {
+    let size = 1i64.checked_shl(log).ok_or(Corrupt::Distribution)?;
+    let total = i64::from(total);
+    if total == 0 {
+        return Err(Corrupt::Distribution);
+    }
+    let mut norm = Vec::with_capacity(counts.len());
+    let mut sum = 0i64;
+    let mut largest = 0usize;
+    for (s, &c) in counts.iter().enumerate() {
+        let c = i64::from(c);
+        let share = if c == 0 {
+            0
+        } else {
+            // Rounded, never below one cell.
+            (c.saturating_mul(size).saturating_add(total / 2))
+                .checked_div(total)
+                .unwrap_or(0)
+                .max(1)
+        };
+        if c > i64::from(*counts.get(largest).unwrap_or(&0)) {
+            largest = s;
+        }
+        sum = sum.saturating_add(share);
+        norm.push(share);
+    }
+    let fix = size.saturating_sub(sum);
+    let slot = norm.get_mut(largest).ok_or(Corrupt::Distribution)?;
+    *slot = slot.saturating_add(fix);
+    if *slot < 1 {
+        // The present symbols need more cells than the table has: the caller's log is too small.
+        return Err(Corrupt::Distribution);
+    }
+    norm.into_iter()
+        .map(|v| i16::try_from(v).map_err(|_| Corrupt::Distribution))
+        .collect()
+}
+
+/// Writes a distribution's table description (§4.1.1), the inverse of [`read_distribution`]:
+/// the accuracy log less 5 in 4 bits, then each symbol's probability plus one in the reader's
+/// variable width, zero runs after a zero as 2-bit repeat flags.
+pub(super) fn write_distribution(norm: &[i16], log: u32) -> Result<Vec<u8>, Corrupt> {
+    let mut w = Writer::new();
+    w.add(
+        u64::from(
+            log.checked_sub(MIN_ACCURACY_LOG)
+                .ok_or(Corrupt::Distribution)?,
+        ),
+        4,
+    );
+    let size = 1i32.checked_shl(log).ok_or(Corrupt::Distribution)?;
+    let mut remaining = size.checked_add(1).ok_or(Corrupt::Distribution)?;
+    let mut threshold = size;
+    let mut width = log.checked_add(1).ok_or(Corrupt::Distribution)?;
+    let mut s = 0usize;
+    let mut previous_zero = false;
+    while remaining > 1 && s < norm.len() {
+        if previous_zero {
+            let start = s;
+            while norm.get(s) == Some(&0) {
+                s = s.saturating_add(1);
+            }
+            let mut run = s.saturating_sub(start);
+            while run >= 3 {
+                w.add(3, 2);
+                run = run.saturating_sub(3);
+            }
+            w.add(u64::try_from(run).unwrap_or(0), 2);
+        }
+        let count = i32::from(*norm.get(s).ok_or(Corrupt::Distribution)?);
+        s = s.saturating_add(1);
+        let max = threshold
+            .checked_mul(2)
+            .and_then(|t| t.checked_sub(1))
+            .and_then(|t| t.checked_sub(remaining))
+            .ok_or(Corrupt::Distribution)?;
+        remaining = remaining
+            .checked_sub(count.abs())
+            .ok_or(Corrupt::Distribution)?;
+        // The value read is the probability plus one; values at or above the threshold are the
+        // ones Table 20 moves up by `max`.
+        let mut value = count.checked_add(1).ok_or(Corrupt::Distribution)?;
+        if value >= threshold {
+            value = value.checked_add(max).ok_or(Corrupt::Distribution)?;
+        }
+        let bits = if value < max {
+            width.saturating_sub(1)
+        } else {
+            width
+        };
+        w.add(
+            u64::try_from(value).map_err(|_| Corrupt::Distribution)?,
+            bits,
+        );
+        previous_zero = count == 0;
+        if remaining < 1 {
+            return Err(Corrupt::Distribution);
+        }
+        while remaining < threshold {
+            width = width.checked_sub(1).ok_or(Corrupt::Distribution)?;
+            threshold >>= 1;
+        }
+    }
+    if remaining != 1 {
+        return Err(Corrupt::Distribution);
+    }
+    Ok(w.finish())
+}
+
+/// How one symbol is encoded from any state: the reference's `symbolTT`, the bits a state of it
+/// emits found from `delta_bits`, the next state from `delta_state` (`FSE_buildCTable`).
+#[derive(Clone, Copy, Debug, Default)]
+struct SymbolTransform {
+    delta_bits: u32,
+    delta_state: i32,
+}
+
+/// An encoding table, the decoder's [`Table`] run backwards.
+#[derive(Clone, Debug)]
+pub(super) struct EncodeTable {
+    pub(super) accuracy_log: u32,
+    /// The next state, indexed by a symbol's range of states.
+    states: Vec<u16>,
+    symbols: Vec<SymbolTransform>,
+}
+
+impl EncodeTable {
+    /// The encoding table of `norm` at `log`, its cells spread exactly as the decoder's
+    /// (`FSE_buildCTable`).
+    pub(super) fn new(norm: &[i16], log: u32) -> Result<Self, Corrupt> {
+        let size = 1usize.checked_shl(log).ok_or(Corrupt::Distribution)?;
+        let decode = Table::from_distribution(norm, log)?;
+        // Each symbol's states, in the order the spread placed them, numbered from the table size.
+        let mut cumul = Vec::with_capacity(norm.len().saturating_add(1));
+        let mut running = 0usize;
+        for &n in norm {
+            cumul.push(running);
+            running = running.saturating_add(if n == -1 {
+                1
+            } else {
+                usize::try_from(n.max(0)).unwrap_or(0)
+            });
+        }
+        let mut states = vec![0u16; size];
+        let mut next = cumul.clone();
+        for (u, cell) in decode.cells.iter().enumerate() {
+            let at = next
+                .get_mut(usize::from(cell.symbol))
+                .ok_or(Corrupt::Distribution)?;
+            *states.get_mut(*at).ok_or(Corrupt::Distribution)? =
+                u16::try_from(size.saturating_add(u)).map_err(|_| Corrupt::Distribution)?;
+            *at = at.saturating_add(1);
+        }
+        let mut symbols = vec![SymbolTransform::default(); norm.len()];
+        let mut total = 0i32;
+        for (t, &n) in symbols.iter_mut().zip(norm) {
+            let size32 = i64::try_from(size).unwrap_or(0);
+            match n {
+                0 => {
+                    // Never encoded; the reference's value keeps its maths defined.
+                    t.delta_bits = u32::try_from(
+                        (i64::from(log).saturating_add(1) << 16).saturating_sub(size32),
+                    )
+                    .unwrap_or(0);
+                }
+                -1 | 1 => {
+                    t.delta_bits =
+                        u32::try_from((i64::from(log) << 16).saturating_sub(size32)).unwrap_or(0);
+                    t.delta_state = total.saturating_sub(1);
+                    total = total.saturating_add(1);
+                }
+                _ => {
+                    let n32 = u32::try_from(n).map_err(|_| Corrupt::Distribution)?;
+                    let high = u32::BITS
+                        .saturating_sub(1)
+                        .saturating_sub((n32.saturating_sub(1)).leading_zeros());
+                    let max_bits_out = log.saturating_sub(high);
+                    let min_state_plus = i64::from(n32) << max_bits_out;
+                    t.delta_bits = u32::try_from(
+                        (i64::from(max_bits_out) << 16).saturating_sub(min_state_plus),
+                    )
+                    .unwrap_or(0);
+                    t.delta_state = total.saturating_sub(i32::from(n));
+                    total = total.saturating_add(i32::from(n));
+                }
+            }
+        }
+        Ok(Self {
+            accuracy_log: log,
+            states,
+            symbols,
+        })
+    }
+
+    fn transform(&self, symbol: u8) -> Result<SymbolTransform, Corrupt> {
+        self.symbols
+            .get(usize::from(symbol))
+            .copied()
+            .ok_or(Corrupt::Distribution)
+    }
+
+    fn state_at(&self, index: i64) -> Result<u32, Corrupt> {
+        let i = usize::try_from(index).map_err(|_| Corrupt::Distribution)?;
+        Ok(u32::from(*self.states.get(i).ok_or(Corrupt::Distribution)?))
+    }
+}
+
+/// An encoder's state over one table (`FSE_CState_t`): its value in `[size, 2·size)`.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct EncodeState {
+    value: u32,
+}
+
+impl EncodeState {
+    /// The state after the stream's last symbol, written first (`FSE_initCState2`).
+    pub(super) fn init(table: &EncodeTable, symbol: u8) -> Result<Self, Corrupt> {
+        let t = table.transform(symbol)?;
+        let bits_out = t.delta_bits.saturating_add(1 << 15) >> 16;
+        let value = (i64::from(bits_out) << 16).saturating_sub(i64::from(t.delta_bits));
+        let index = (value >> bits_out).saturating_add(i64::from(t.delta_state));
+        Ok(Self {
+            value: table.state_at(index)?,
+        })
+    }
+
+    /// Encodes `symbol`, writing the bits the decoder reads to return here (`FSE_encodeSymbol`).
+    pub(super) fn encode(
+        &mut self,
+        table: &EncodeTable,
+        symbol: u8,
+        w: &mut Writer,
+    ) -> Result<(), Corrupt> {
+        let t = table.transform(symbol)?;
+        let bits_out = self.value.saturating_add(t.delta_bits) >> 16;
+        w.add(u64::from(self.value), bits_out);
+        let index = i64::from(self.value >> bits_out).saturating_add(i64::from(t.delta_state));
+        self.value = table.state_at(index)?;
+        Ok(())
+    }
+
+    /// Writes the final state, which the decoder reads first (`FSE_flushCState`).
+    pub(super) fn flush(self, table: &EncodeTable, w: &mut Writer) {
+        w.add(u64::from(self.value), table.accuracy_log);
+    }
+}

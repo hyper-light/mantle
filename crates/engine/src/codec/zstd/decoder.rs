@@ -14,7 +14,7 @@ use crate::error::Error;
 use crate::util::xxhash::Xxh64;
 
 /// A Zstandard frame's magic number (§3.1.1).
-const FRAME_MAGIC: u32 = 0xFD2F_B528;
+pub(super) const FRAME_MAGIC: u32 = 0xFD2F_B528;
 /// The skippable frames' magic numbers, `0x184D2A50` to `0x184D2A5F` (§3.1.2).
 const SKIPPABLE_MAGIC: u32 = 0x184D_2A50;
 const SKIPPABLE_MASK: u32 = 0xFFFF_FFF0;
@@ -22,7 +22,7 @@ const SKIPPABLE_MASK: u32 = 0xFFFF_FFF0;
 const DICTIONARY_MAGIC: u32 = 0xEC30_A437;
 /// The largest block, decoded or compressed (§3.1.1.2.4: the smaller of `Window_Size` and
 /// 128 KB).
-const BLOCK_MAX: usize = 128 * 1024;
+pub(super) const BLOCK_MAX: usize = 128 * 1024;
 /// A block header's length (§3.1.1.2).
 const BLOCK_HEADER: usize = 3;
 /// The smallest raw-content dictionary (§5: "they must be at least 8 bytes").

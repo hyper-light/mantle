@@ -14,8 +14,19 @@ mantle-crc = { path = "../crc" }
 thiserror.workspace = true
 twox-hash.workspace = true
 
+# The OS interface of port/mmap.rs: anonymous mappings for the memtable arena's blocks.
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
 [dev-dependencies]
 proptest.workspace = true
+
+[[bench]]
+name = "memtable"
+harness = false
 
 [lints]
 workspace = true

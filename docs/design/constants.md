@@ -141,6 +141,64 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/engine/src/util/xxph3.rs` `SECRET_SIZE_MIN` | format | 136, `XXPH3_SECRET_SIZE_MIN`, the base of the mid-size path's last offset [R util/xxph3.h:283]. |
 | `crates/engine/src/util/xxph3.rs` `STRIPES_PER_BLOCK` | derived | `(SECRET_DEFAULT_SIZE - STRIPE_LEN) / SECRET_CONSUME_RATE` = 16 stripes per block [R util/xxph3.h:1519]. |
 | `crates/engine/src/util/xxph3.rs` `STRIPE_LEN` | format | 64 bytes hashed per accumulation [R util/xxph3.h:1145]. |
+| `crates/engine/src/db/dbformat.rs` `DISABLE_GLOBAL_SEQUENCE_NUMBER` | format | `kDisableGlobalSequenceNumber`, u64::MAX: an ingested file with no global sequence number [R db/dbformat.h:131-132]. |
+| `crates/engine/src/db/dbformat.rs` `MAX_SEQUENCE_NUMBER` | format | `kMaxSequenceNumber`, 2^56 − 1: the trailer's 56 bits above the type byte [R db/dbformat.h:129]. |
+| `crates/engine/src/db/dbformat.rs` `NUM_INTERNAL_BYTES` | format | `kNumInternalBytes`, 8: the internal key's trailer [R db/dbformat.h:134]. |
+| `crates/engine/src/db/dbformat.rs` `RANGE_TOMBSTONE_SENTINEL` | format | `kRangeTombstoneSentinel`: `Pack(kMaxSequenceNumber, kTypeRangeDeletion)` [R db/dbformat.h:201-202]. |
+| `crates/engine/src/db/dbformat.rs` `TYPE_BITS` | format | 8: the type's width in the packed trailer [R db/dbformat.h:129]. |
+| `crates/engine/src/db/memtable.rs` `ARENA_BLOCK_ALIGN` | cited | 4 KiB, the alignment `SanitizeOptions` rounds a derived arena block up to [R db/column_family.cc:245-248]. |
+| `crates/engine/src/db/memtable.rs` `DEFAULT_WRITE_BUFFER_SIZE` | cited | 64 MiB, `write_buffer_size`'s default [R include/rocksdb/options.h:191]. |
+| `crates/engine/src/db/memtable.rs` `HEADER` | format | 8: the header word before a memtable entry's internal key (the port's node layout, memtable/inlineskiplist.rs). |
+| `crates/engine/src/db/memtable.rs` `MAX_DERIVED_ARENA_BLOCK_SIZE` | cited | 1 MiB, the largest arena block `SanitizeOptions` derives from the write buffer size [R db/column_family.cc:241-243]. |
+| `crates/engine/src/db/memtable.rs` `OVER_ALLOCATION_DENOMINATOR` | cited | 5: `kAllowOverAllocationRatio` = 0.6 as 3/5 [R db/memtable.cc:316], so the flush test is integer arithmetic. |
+| `crates/engine/src/db/memtable.rs` `OVER_ALLOCATION_NUMERATOR` | cited | 3: as `OVER_ALLOCATION_DENOMINATOR`. |
+| `crates/engine/src/db/memtable.rs` `PACKED_WRITE_TIME` | format | 8: the fixed64 write time ending a `kTypeValuePreferredSeqno` value [R db/seqno_to_time_mapping.cc:567-570]. |
+| `crates/engine/src/db/wide/wide_column_serialization.rs` `VERSION1` | format | `kVersion1`: inline values only [R db/wide/wide_column_serialization.h:124]. |
+| `crates/engine/src/db/wide/wide_column_serialization.rs` `VERSION2` | format | `kVersion2`: columns may be blob references [R db/wide/wide_column_serialization.h:125]. |
+| `crates/engine/src/db/write_batch.rs` `COUNT_OFFSET` | format | 8: the count follows the header's fixed64 sequence number [R db/write_batch_internal.h:81]. |
+| `crates/engine/src/db/write_batch.rs` `DEFERRED` | format | `ContentFlags::DEFERRED` [R db/write_batch.cc:80-95]. |
+| `crates/engine/src/db/write_batch.rs` `HAS_BEGIN_PREPARE` | format | `ContentFlags::HAS_BEGIN_PREPARE` [R db/write_batch.cc:80-95]. |
+| `crates/engine/src/db/write_batch.rs` `HAS_BEGIN_UNPREPARE` | format | `ContentFlags::HAS_BEGIN_UNPREPARE` [R db/write_batch.cc:80-95]. |
+| `crates/engine/src/db/write_batch.rs` `HAS_BLOB_INDEX` | format | `ContentFlags::HAS_BLOB_INDEX` [R db/write_batch.cc:80-95]. |
+| `crates/engine/src/db/write_batch.rs` `HAS_COMMIT` | format | `ContentFlags::HAS_COMMIT` [R db/write_batch.cc:80-95]. |
+| `crates/engine/src/db/write_batch.rs` `HAS_DELETE` | format | `ContentFlags::HAS_DELETE` [R db/write_batch.cc:80-95]. |
+| `crates/engine/src/db/write_batch.rs` `HAS_DELETE_RANGE` | format | `ContentFlags::HAS_DELETE_RANGE` [R db/write_batch.cc:80-95]. |
+| `crates/engine/src/db/write_batch.rs` `HAS_END_PREPARE` | format | `ContentFlags::HAS_END_PREPARE` [R db/write_batch.cc:80-95]. |
+| `crates/engine/src/db/write_batch.rs` `HAS_MERGE` | format | `ContentFlags::HAS_MERGE` [R db/write_batch.cc:80-95]. |
+| `crates/engine/src/db/write_batch.rs` `HAS_PUT` | format | `ContentFlags::HAS_PUT` [R db/write_batch.cc:80-95]. |
+| `crates/engine/src/db/write_batch.rs` `HAS_PUT_ENTITY` | format | `ContentFlags::HAS_PUT_ENTITY` [R db/write_batch.cc:80-95]. |
+| `crates/engine/src/db/write_batch.rs` `HAS_ROLLBACK` | format | `ContentFlags::HAS_ROLLBACK` [R db/write_batch.cc:80-95]. |
+| `crates/engine/src/db/write_batch.rs` `HAS_SINGLE_DELETE` | format | `ContentFlags::HAS_SINGLE_DELETE` [R db/write_batch.cc:80-95]. |
+| `crates/engine/src/db/write_batch.rs` `HAS_TIMED_PUT` | format | `ContentFlags::HAS_TIMED_PUT` [R db/write_batch.cc:80-95]. |
+| `crates/engine/src/db/write_batch.rs` `HEADER` | format | 12: `WriteBatchInternal::kHeader`, the fixed64 sequence and fixed32 count [R db/write_batch_internal.h:81]. |
+| `crates/engine/src/db/write_batch.rs` `MAX_KEY_SIZE` | format | `kMaxWriteBatchKeySize`: u32::MAX less the 8-byte trailer, so a memtable entry's varint32 length holds key and trailer [R db/write_batch.cc:99-100]. |
+| `crates/engine/src/db/write_batch.rs` `MAX_SAVE_POINTS` | bound | 2^16 save points at once (1.5 MiB of offsets): RocksDB's stack is unbounded; mantle's writes set none, and the bound passes any nesting a caller builds; past it `set_save_point` refuses (CLAUDE.md §2). |
+| `crates/engine/src/db/write_batch.rs` `MAX_VALUE_SIZE` | format | u32::MAX: a value, operand, entity or end key's length is a varint32 [R db/write_batch.cc:863-865]. |
+| `crates/engine/src/memory/arena.rs` `ALIGN_UNIT` | derived | `WORD`: `allocate_aligned` aligns to one storage word. |
+| `crates/engine/src/memory/arena.rs` `DIRECTORY_SEGMENTS` | derived | 29: 64 − `OFFSET_BITS` + 1, a segment of 2^s slots for each bit of the largest block number an address carries, and one for block 0, so the directory holds exactly the blocks an address names. |
+| `crates/engine/src/memory/arena.rs` `INLINE_SIZE` | cited | 2 KiB, `Arena::kInlineSize` [R memory/arena.h:31]. |
+| `crates/engine/src/memory/arena.rs` `MAX_BLOCK_SIZE` | cited | 2 GiB, `Arena::kMaxBlockSize` [R memory/arena.h:33]. |
+| `crates/engine/src/memory/arena.rs` `MIN_BLOCK_SIZE` | cited | 4 KiB, `Arena::kMinBlockSize` [R memory/arena.h:32]. |
+| `crates/engine/src/memory/arena.rs` `OFFSET_BITS` | derived | 36: a 64 GiB offset, above the largest allocation the memtable makes (a key and a value each under 4 GiB, with their headers; docs/research/24 §1.4). |
+| `crates/engine/src/memory/arena.rs` `SLOT_BYTES` | derived | The size of a directory slot, the bytes RocksDB counts per block as `sizeof(char*)`. |
+| `crates/engine/src/memory/arena.rs` `WORD` | derived | 8: the size of the `AtomicU64` a block stores. |
+| `crates/engine/src/memtable/inlineskiplist.rs` `DEFAULT_BRANCHING_FACTOR` | cited | 4: the default `branching_factor` [R memtable/inlineskiplist.h:76-78], Pugh's recommended p = 1/4 (CACM 1990, §4). |
+| `crates/engine/src/memtable/inlineskiplist.rs` `DEFAULT_MAX_HEIGHT` | cited | 12: the default `max_height` [R memtable/inlineskiplist.h:76-78]. |
+| `crates/engine/src/memtable/inlineskiplist.rs` `GOLDEN_GAMMA` | external | SplitMix64's increment (Steele, Lea and Flood, OOPSLA 2014). |
+| `crates/engine/src/memtable/inlineskiplist.rs` `HEAD` | format | u64::MAX − 1: the head's node number, outside every arena address. |
+| `crates/engine/src/memtable/inlineskiplist.rs` `HEIGHT_BITS` | format | 8: the header word's bits below the key length that hold the height. |
+| `crates/engine/src/memtable/inlineskiplist.rs` `HEIGHT_MASK` | derived | 0xFF: the low `HEIGHT_BITS` of the header word. |
+| `crates/engine/src/memtable/inlineskiplist.rs` `MAX_POSSIBLE_HEIGHT` | cited | 32, `kMaxPossibleHeight` [R memtable/inlineskiplist.h:70]. |
+| `crates/engine/src/memtable/inlineskiplist.rs` `MIX_1` | external | SplitMix64's first finalizer multiplier (Steele, Lea and Flood, OOPSLA 2014). |
+| `crates/engine/src/memtable/inlineskiplist.rs` `MIX_2` | external | SplitMix64's second finalizer multiplier (Steele, Lea and Flood, OOPSLA 2014). |
+| `crates/engine/src/memtable/inlineskiplist.rs` `NIL` | format | u64::MAX: no node, the end of a level. |
+| `crates/engine/src/memtable/inlineskiplist.rs` `WORD` | derived | 8: the arena's storage word. |
+| `crates/engine/src/port/mmap.rs` `WORD` | derived | The size of `AtomicU64`, the unit a mapping is counted in. |
+| `crates/engine/src/version.rs` `PLACE` | format | 1000: the decimal places each of the minor and patch numbers takes in `ROCKSDB_VERSION_INT` [R include/rocksdb/version.h:24-25]. |
+| `crates/engine/src/version.rs` `ROCKSDB_MAJOR` | format | 11 [R include/rocksdb/version.h:14]: the release the port converts. |
+| `crates/engine/src/version.rs` `ROCKSDB_MINOR` | format | 8 [R include/rocksdb/version.h:15]. |
+| `crates/engine/src/version.rs` `ROCKSDB_PATCH` | format | 1 [R include/rocksdb/version.h:16]. |
+| `crates/engine/src/version.rs` `ROCKSDB_VERSION_INT` | derived | `ROCKSDB_VERSION_INT`: major·10^6 + minor·10^3 + patch [R include/rocksdb/version.h:24-25]. |
 | `crates/gateway/src/layout.rs` `CHUNK` | cited | Tectonic's "typically 8 MiB" chunk (docs/research/01 §1.14). docs/design/gateway.md says measured transfer sizing will replace it, and audit §12.6/§16.2 requires per-upload sizing. |
 | `crates/gateway/src/layout.rs` `SEALED` | derived | `seal::SEGMENT + seal::TAG`: a 64 KiB plaintext segment plus its 16-byte AEAD tag (docs/design/gateway.md §1). |
 | `crates/gateway/src/put.rs` `RENEWALS` | cited | Quarter-lease renewal from Centrifuge's 15 s renewals of 60 s leases (docs/research/09 §7.2.2). Audit §12.6 requires deriving it from control-delay and outage distributions. |

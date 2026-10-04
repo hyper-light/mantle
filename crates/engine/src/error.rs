@@ -21,6 +21,15 @@ pub enum Error {
     /// a C++ precondition RocksDB leaves unchecked.
     #[error("invalid argument: {what}")]
     InvalidArgument { what: &'static str },
+    /// A bounded resource would pass its bound (CLAUDE.md §2): RocksDB's `Status::MemoryLimit`,
+    /// or a bound the port adds where RocksDB has none. Nothing was changed.
+    #[error("{what} would exceed its bound of {limit}")]
+    LimitExceeded { what: &'static str, limit: u64 },
+    /// An entry with the same internal key (user key, sequence and type) is already in the
+    /// memtable: RocksDB's `Status::TryAgain("key+seq exists")`, which the write path handles
+    /// and never returns to a caller (docs/research/24 §2.3, §4.1).
+    #[error("an entry with this key and sequence number exists")]
+    Duplicate,
 }
 
 /// How stored bytes fail to decode.
@@ -35,6 +44,24 @@ pub enum Malformed {
     VarintOverflow,
     /// A prefix varint whose first byte names a length its type does not have.
     PrefixVarintFirstByte,
+    /// A tag, type or kind byte the format does not define: a WriteBatch record tag, a value
+    /// type, a wide-column type, a blob-index type.
+    UnknownTag(u8),
+    /// A format version the format does not define.
+    UnknownVersion(u64),
+    /// A count or size stored in the bytes that disagrees with what they hold.
+    CountMismatch,
+    /// Bytes after the end of a value that must end where its input does.
+    TrailingBytes,
+    /// Entries a format stores in strictly ascending order that are not.
+    OutOfOrder,
+    /// A length larger than the format allows.
+    TooLarge,
+    /// A stored checksum that does not match the bytes it covers.
+    ChecksumMismatch,
+    /// A reference to data the reader has no way to fetch: a blob-backed value read where no
+    /// blob reader is given (RocksDB's null `BlobFetcher`).
+    Unresolvable,
 }
 
 impl fmt::Display for Malformed {
@@ -44,6 +71,14 @@ impl fmt::Display for Malformed {
             Self::VarintTooLong => "varint longer than its type allows",
             Self::VarintOverflow => "varint carries bits above its type's width",
             Self::PrefixVarintFirstByte => "prefix varint's first byte names no valid length",
+            Self::UnknownTag(tag) => return write!(f, "unknown tag {tag:#04x}"),
+            Self::UnknownVersion(v) => return write!(f, "unknown version {v}"),
+            Self::CountMismatch => "stored count disagrees with the entries present",
+            Self::TrailingBytes => "bytes follow the end of the value",
+            Self::OutOfOrder => "entries not in strictly ascending order",
+            Self::TooLarge => "length larger than the format allows",
+            Self::ChecksumMismatch => "checksum mismatch",
+            Self::Unresolvable => "refers to data this reader cannot fetch",
         })
     }
 }
@@ -54,5 +89,9 @@ impl Error {
             what,
             why: Malformed::Truncated,
         }
+    }
+
+    pub(crate) const fn corruption(what: &'static str, why: Malformed) -> Self {
+        Self::Corruption { what, why }
     }
 }

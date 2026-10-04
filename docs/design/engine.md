@@ -1,6 +1,6 @@
 # The metadata engine: RocksDB 11.8.1, converted to Rust
 
-Status: design, 2026-09-30; phase P1 done. Sources: docs/research/24 (the port's contract,
+Status: design, 2026-09-30; phases P1 and P2 done (P2 2026-10-04). Sources: docs/research/24 (the port's contract,
 cited as "24 §x"), docs/research/12 (RocksDB and ZippyDB, cited as "12 §x"), docs/research/23
 (Meta's RocksDB enhancements); RocksDB at tag `v11.8.1`, commit `abeebd963`, cited as
 `[R path:line]`.
@@ -140,30 +140,32 @@ its RocksDB tests (24 §3.1's counts of test definitions):
 | P24 | The `Customizable`/`ObjectRegistry` string-configuration framework | customizable_test.cc: 49; configurable_test.cc: 25 |
 | P25 | Persistent statistics history | stats_history_test.cc: 10 |
 | P26 | Tracing: query, I/O and block-cache traces | block_cache_tracer_test.cc: 7; io_tracer_test.cc: 5 |
+| P27 | Concurrent memtable writes: `InsertConcurrently` and `allow_concurrent_memtable_write`, several writers inserting by compare-and-swap (24 §4.1 dropped them for one writer per memtable; the P2 audit found no phase held them) | inlineskiplist_test.cc: `ConcurrentInsertWithoutThreads`, `ConcurrentInsert1`–`3`, `ConcurrentInsertWithHint1`–`3` |
 
-P17–P26 are independent of each other and may be reordered; each is checked against the oracle
+P17–P27 are independent of each other and may be reordered; each is checked against the oracle
 as P1–P15 are. mantle's own use does not need them (a range's Raft log serializes its writes and
 replaces the WAL archive; snapshots and moves are checkpoints plus mantle's transfer, 12 §6.3),
 so none blocks the engine's use by the metadata layer after P14.
 
 ## 5. Dependencies
 
-| Need | Crate | Why |
-|---|---|---|
-| CRC-32C, masking's CRC, combination, extension | `mantle-crc` (`crc-fast`) | mantle's own CRC; `crc32c_extend` was added to it for RocksDB's `crc32c::Extend` |
-| XXH32, XXH64, XXH3-64, XXH3-128 | `twox-hash` (feature `xxhash32` enabled for P1) | the released algorithms RocksDB vendors as xxHash 0.8.1 (24 §1.2) |
-| XXPH3 (the XXH3 preview) | none: ported from util/xxph3.h | no crate implements the preview (24 §5 R1) |
-| Snappy, LZ4 block, zlib raw deflate | `snap`, `lz4_flex`, `miniz_oxide` (pure Rust), from P4 | 24 §2.4 |
-| ZSTD with dictionaries, training and streaming | `zstd` / `zstd-sys`, from P3 | see below |
+Every codec and helper the engine runs is mantle's own (the owner, 2026-10-04: build, not pull).
+The outside implementations are differential oracles in the engine's tests, never in its
+production code:
 
-**ZSTD.** No pure-Rust ZSTD encoder has dictionary training, and RocksDB's ZSTD-compressed
-tables and WALs need it on the write side (24 §5 R9). The engine uses the `zstd` crate, which
-builds the reference C library (BSD-3-Clause, allowed by `deny.toml`). mantle already builds and
-cross-lints vendored C for AWS-LC (crypto.md; `scripts/check-targets.sh` cross-builds
-aws-lc-sys's C and assembly for every target), so a C codec is a build of the same class, not a
-new one; unlike the RocksDB binding it needs no C++ and no libclang. The codec is called behind
-an unwind boundary (CLAUDE.md §1), and its inputs are bounded by the block and frame sizes the
-engine already checks.
+| Need | Production | Oracle in tests |
+|---|---|---|
+| CRC-32C, masking, combination, extension | `mantle-crc` (`crc-fast`), mantle's CRC crate; `crc32c_extend` was added to it for RocksDB's `crc32c::Extend` | RocksDB's util/crc32c.cc (golden vectors) |
+| XXH32, XXH64, XXH3-64, XXH3-128 | to be ported from xxHash 0.8.1 as RocksDB vendors it (24 §1.2); `twox-hash`, which P1 shipped with, leaves production then | `twox-hash`; RocksDB's util/xxhash.h (golden vectors) |
+| XXPH3 (the XXH3 preview) | ported from util/xxph3.h (24 §5 R1) | golden vectors |
+| ZSTD with dictionaries, training and streaming, from P3 | to be written to RFC 8878 (the Zstandard format) and the reference implementation's dictionary builder, RocksDB's framing around it (24 §5 R9) | the reference C library, built only for tests |
+| Snappy, LZ4 block, raw deflate, from P4 | to be written to their format descriptions (Snappy's format_description.txt, LZ4's block format, RFC 1951) | `snap`, `lz4_flex`, `miniz_oxide`, in tests only |
+| Lazily zeroed memory for the memtable's arena | `port/mmap.rs`, RocksDB's port/mmap.cc converted: `mmap` on Unix, a page-file section on Windows (an OS interface, `scripts/check-contracts.py`) | arena_test.cc's `AllocateLazyZeroed` and `UnmappedAllocation`, by the resident set |
+
+The 2026-09-30 form of this table took `zstd`, `snap`, `lz4_flex`, `miniz_oxide` and `zerocopy`
+into production; none of them is, now. Each codec is its own step before the phase that first
+needs it, with its format's test vectors and a differential run against its oracle over
+generated and adversarial inputs.
 
 ## 6. P1: coding and checksums (done)
 
@@ -217,3 +219,48 @@ result; and the 9-byte prefix varint's marker byte.
 do, not behind an unwind boundary: their one-shot paths index only within lengths they derive
 from the input. The golden vectors were generated on aarch64 macOS; the x86_64 run of the same
 program (the SSE 4.2 CRC kernel) is for the corpus work before P4.
+
+## 7. P2: internal keys, write batches and the memtable (done)
+
+Ported from the paused work of 2026-09-30, audited and completed 2026-10-04.
+
+**Modules** (`crates/engine/src`): `db/dbformat.rs` (internal keys, the packed trailer, value
+types, the internal comparator); `db/write_batch.rs` (WriteBatch's format, content flags, save
+points, iteration, `MemTableInserter`); `db/wide/` (wide-column serialization, versions 1 and 2,
+blob references); `db/blob/` (the blob index's decode); `db/memtable.rs` and
+`db/memtable_list.rs`; `memtable/inlineskiplist.rs` (one writer, many readers by acquire and
+release, without `unsafe`); `memory/arena.rs` (RocksDB's accounting over blocks of `AtomicU64`
+words); `port/mmap.rs`; `util/comparator.rs`; `version.rs`.
+
+**Ported tests** (`crates/engine/tests`): memory/arena_test.cc 6 of 6;
+memtable/inlineskiplist_test.cc 19 of 26 (the other 7 are concurrent writers, P27);
+memtable/skiplist_test.cc 8 of 8; db/memtable_list_test.cc 6 of 8 (the other 2 are user-defined
+timestamps, P16); db/dbformat_test.cc 12 of 12; db/write_batch_test.cc 28 of 31 run and 2 more
+ported and ignored for RocksDB's reason, more than 18 GB of memory (the other 3 are
+WriteBatchWithIndex, P17, and timestamps, P16); db/wide/wide_column_serialization_test.cc 29 of
+29; db/wide/wide_columns_helper_test.cc 2 of 2. Property tests cover dbformat, write batches and
+wide columns. In all, 187 tests pass and 2 are ignored.
+
+**Golden vectors.** `tests/golden/p2_dbformat_gen.cc`, `p2_batch_gen.cc` and `p2_wide_gen.cc` are
+compiled against the unmodified RocksDB sources and print internal-key, write-batch and
+wide-column encodings; `tests/dbformat_golden.rs`, `write_batch_golden.rs` and
+`wide_column_golden.rs` recompute them and match.
+
+**What the audit changed.**
+- The arena's blocks: from a page up, mapped lazily zeroed by `port/mmap.rs`, RocksDB's own
+  mechanism, instead of `zerocopy`'s zeroed allocation; below a page, heap words zeroed as they
+  are allocated. `AllocateLazyZeroed` and `UnmappedAllocation` pass on the mapped blocks.
+- The block directory: segment `s` holds `2^s` slots and there is one segment per bit of the
+  block number an address carries (`DIRECTORY_SEGMENTS`, derived), where a chosen base of 8 had
+  nothing establishing it.
+- The tests read no environment: `TEST_RANDOM_SEED` and `ROCKSDB_BIGMEM_TESTS` are not read; the
+  seed is RocksDB's default, 301, and the big-memory tests run by the host's memory alone.
+- Every numeric constant has its row in docs/design/constants.md.
+
+**Open.** The memtable benchmark against RocksDB (`benches/memtable.rs` beside
+`benches/p2_memtable_bench.cc`) is to be run under hyper-raft's tails rule: open-loop, p50 to
+p99.99 with intervals, the load recorded, and CPU, instructions, allocations, energy and
+footprint per insert and per lookup. P3 (the WAL) was written against mantle-disk's block layer,
+which hyper-block has since replaced; it is held aside and re-ported onto hyper-block next, with
+its own ZSTD codec.
+

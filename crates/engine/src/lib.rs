@@ -19,8 +19,13 @@
     )
 )]
 
+pub mod db;
 pub mod error;
+pub mod memory;
+pub mod memtable;
+pub mod port;
 pub mod table;
 pub mod util;
+pub mod version;
 
 pub use error::{Error, Malformed};

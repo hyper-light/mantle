@@ -107,6 +107,8 @@ impl World {
                         run: 1,
                         max_peers: nodes,
                         history: Exposure::new(),
+                        // The simulation's stamps are whole nanoseconds.
+                        resolution: Duration::from_nanos(1),
                     })
                     .unwrap();
                     for peer in (1..=nodes as u64).filter(|p| *p != id) {

@@ -290,8 +290,10 @@ pub fn message_from(message: old::Message) -> Message {
             .map(|snapshot| Box::new(snapshot_from(snapshot))),
         request_snapshot: message.request_snapshot,
         reject: message.reject,
-        // raft-rs has no member whose log lost what it acknowledged.
+        // raft-rs has no member whose log lost what it acknowledged, and keeps nothing that
+        // arrives ahead of a hole.
         lost: false,
+        kept: false,
         reject_hint: message.reject_hint,
         context: message.context,
         priority,

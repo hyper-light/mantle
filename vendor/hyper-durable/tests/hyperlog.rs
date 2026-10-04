@@ -132,6 +132,44 @@ fn a_refusal_for_the_groups_bound_stalls_until_a_compaction_frees_it() {
     assert_eq!(view.last, r.applied().index);
 }
 
+/// An owner with nothing else to do for its group waits for the log's answer to the oldest write
+/// out, whole, however many parts it went in (`GroupStore::wait`), and its next drive takes it,
+/// though the write's waker wakes no one; with nothing out there is nothing to wait for.
+#[test]
+fn an_owner_waits_for_its_oldest_write_whole_and_the_next_drive_takes_it() {
+    let log = Log::create(sim_file(23), config(16, 1 << 12), 1).unwrap();
+    let (mut r, waker, woken) = sole(&log);
+    settle(&mut r, &waker, &woken);
+    assert!(!r.log_mut().wait(), "nothing out");
+    let room = log.frame_room().unwrap();
+    let entry = 4096;
+    let count = 2 * room / entry + 1;
+    for i in 0..count {
+        r.propose(Vec::new(), vec![i as u8; entry]).unwrap();
+    }
+    let mut out = Output::default();
+    r.drive(now(), Waker::noop(), &mut out).unwrap();
+    assert_eq!(r.in_flight(), 1);
+    let before = log.flushed().0;
+    assert!(r.log_mut().wait());
+    assert!(log.flushed().0 - before >= 2, "the write went in parts");
+    out.clear();
+    r.drive(now(), Waker::noop(), &mut out).unwrap();
+    let last = count as u64 + 1;
+    assert_eq!(r.logged_commit(), last, "the drive took the write's answer");
+    // What it committed is applied a page a drive, each drive one entry at least.
+    for _ in 0..count {
+        if r.applied().index == last {
+            break;
+        }
+        out.clear();
+        r.drive(now(), Waker::noop(), &mut out).unwrap();
+    }
+    assert_eq!(r.machine().now.entries.len(), count + 1);
+    let view = r.core().store().log().view().unwrap();
+    assert_eq!(view.hard_state.commit, last);
+}
+
 /// The owner's clock in nanoseconds, simulated: each reading a nanosecond after the one before, so
 /// time only moves forward, as an owner's monotonic clock does, and every run reads the same times.
 /// No test here waits on elapsed time; those that judge time state it outright.

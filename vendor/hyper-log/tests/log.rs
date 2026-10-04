@@ -17,8 +17,8 @@ use hyper_block::block::BlockFile;
 use hyper_block::buf::{AlignedBuf, Alignment};
 use hyper_block::sim::{Crash, Fault, SimFile};
 use hyper_log::{
-    Class, Config, Entries, Entry, HardState, Log, LogError, Proposal, Refused, Start, Update,
-    View, Waits,
+    Class, Config, Entries, Entry, HardState, Log, LogError, LogStats, Proposal, Refused, Start,
+    Update, View, Waits,
 };
 use proptest::prelude::*;
 
@@ -531,6 +531,97 @@ fn reclaiming_segments_keeps_every_live_record() {
     // The file never grew past its quota.
     let len = hyper_block::block::BlockFile::len(&closed(log)).unwrap();
     assert!(len <= cfg.segment_bytes * u64::from(cfg.max_segments));
+}
+
+/// The statistics count every frame, flush, byte and wait the log made (`docs/durable.md`
+/// §13.1), against the file's own counts: writes one at a time, each a frame of one small update,
+/// its persist record and its confirmation, a block each, and two flushes.
+#[test]
+fn the_statistics_count_each_frame_flush_byte_and_wait() {
+    let log = Log::create(sim(46), config(16, 8), ID).unwrap();
+    let counts = |log: &Log<SimFile>| {
+        log.with_file(|f| {
+            let s = f.stats().unwrap();
+            (s.writes, s.syncs)
+        })
+        .unwrap()
+    };
+    let before = log.stats(None).unwrap();
+    let (writes, syncs) = counts(&log);
+    let n = 5;
+    for index in 1..=n {
+        log.write(
+            1,
+            Update {
+                entries: Some(entries(index, &[1])),
+                ..Update::default()
+            },
+        )
+        .unwrap();
+    }
+    let after = log.stats(None).unwrap();
+    let (writes_after, syncs_after) = counts(&log);
+    assert_eq!(after.frames - before.frames, n);
+    assert_eq!(after.updates - before.updates, n);
+    assert_eq!(after.flushes - before.flushes, syncs_after - syncs);
+    assert_eq!(after.flushes - before.flushes, 2 * n);
+    assert_eq!(
+        after.bytes - before.bytes,
+        (writes_after - writes) * BLOCK as u64
+    );
+    assert_eq!(after.flush.count() - before.flush.count(), 2 * n);
+    assert_eq!(after.write.count() - before.write.count(), n);
+    assert_eq!(after.commit_wait.count() - before.commit_wait.count(), n);
+    // Each wait runs from its submission past its frame's writes and flush and its
+    // confirmation's flush, one write at a time, so the waits hold every write and flush timed.
+    let waited = after.commit_wait.sum_ns() - before.commit_wait.sum_ns();
+    let worked = (after.write.sum_ns() - before.write.sum_ns())
+        + (after.flush.sum_ns() - before.flush.sum_ns());
+    assert!(
+        waited >= worked,
+        "{waited} ns waited, {worked} ns written and flushed"
+    );
+    assert_eq!(after.flushing_since, None);
+    assert!(after.at >= before.at);
+}
+
+/// A flush that stalls delays no answer of the statistics, which show it in progress: the owner
+/// answers them as they come, never waiting on I/O (`docs/durable.md` §13.1). A box handed back is
+/// filled again.
+#[test]
+fn a_held_flush_shows_in_the_statistics_without_delaying_them() {
+    let (device, gated) = held(sim(47));
+    let log = Log::create(device, config(16, 8), ID).unwrap();
+    let before = log.stats(None).unwrap();
+    gated.hold();
+    let shut = gated.released();
+    let pending = log
+        .submit(
+            1,
+            Update {
+                entries: Some(entries(1, &[1])),
+                ..Update::default()
+            },
+        )
+        .unwrap();
+    gated.held();
+    let during = log.stats(None).unwrap();
+    let since = during
+        .flushing_since
+        .expect("the frame's flush is in progress");
+    assert!(before.at <= since && since <= during.at);
+    assert_eq!(during.frames, before.frames, "the frame is not flushed yet");
+    assert_eq!(during.flush.count(), before.flush.count());
+    gated.release();
+    pending.wait().unwrap();
+    let kept: *const LogStats = &*during;
+    let after = log.stats(Some(during)).unwrap();
+    assert!(std::ptr::eq(kept, &*after), "the box handed back is filled");
+    assert_eq!(after.flushing_since, None);
+    assert_eq!(after.frames, before.frames + 1);
+    assert_eq!(after.flushes, before.flushes + 2);
+    assert_eq!(after.commit_wait.count(), before.commit_wait.count() + 1);
+    drop(shut);
 }
 
 #[test]

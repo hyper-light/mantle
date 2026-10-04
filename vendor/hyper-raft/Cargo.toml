@@ -8,6 +8,11 @@ license = "MIT"
 repository = "https://github.com/hyper-light/hyper-raft"
 publish = false
 
+[features]
+# The planted defects of `src/mutant.rs`, for tests that show the oracles catch them
+# (docs/sim.md §4.6). No consumer enables it.
+mutants = []
+
 [dependencies]
 crc32c = "0.6"
 # The election law's draw (`election_delay`); a crate of this repository with no dependencies.
@@ -20,6 +25,11 @@ thiserror = "2.0"
 raft = { version = "0.7.0", git = "https://github.com/tikv/raft-rs", rev = "8e4cef172421bf77b2ae1c26628a9531b0be41f0", default-features = false, features = ["prost-codec"] }
 raft-proto = { version = "0.7.0", git = "https://github.com/tikv/raft-rs", rev = "8e4cef172421bf77b2ae1c26628a9531b0be41f0", default-features = false, features = ["prost-codec"] }
 slog = "2.7"
+# The counting allocator: what a proposal allocates at any backlog (`tests/backlog.rs`).
+hyper-measure = { path = "../hyper-measure" }
+# hyper-raft's tests also take `hyper-check` (the oracles and linearizability checkers its
+# schedules are judged by) and this crate with `features = ["mutants"]`; hyper-check is not
+# vendored here, so they are left out: hyper-raft's CI runs those tests.
 
 # A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside any consumer workspace.
 [workspace]

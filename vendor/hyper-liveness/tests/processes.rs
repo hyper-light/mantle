@@ -244,6 +244,7 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
         run,
         max_peers: nodes as usize,
         history: Exposure::new(),
+        resolution: clock.resolution(),
     })
     .unwrap();
     let peers: Vec<u64> = (1..=nodes).filter(|peer| *peer != me).collect();

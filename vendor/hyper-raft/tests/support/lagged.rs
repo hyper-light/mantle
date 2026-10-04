@@ -59,6 +59,9 @@ pub struct Coverage {
     pub fenced: u64,
     /// Writes of the hard state alone that the fence asked for.
     pub stated: u64,
+    /// Entries a member took into its log from what it kept ahead of a
+    /// hole (`Ahead::Kept`, R17), acknowledged with the write that held them.
+    pub ahead: u64,
 }
 impl Coverage {
     pub fn add(&mut self, other: Self) {
@@ -74,6 +77,7 @@ impl Coverage {
         self.unpersisted += other.unpersisted;
         self.fenced += other.fenced;
         self.stated += other.stated;
+        self.ahead += other.ahead;
     }
 }
 
@@ -108,6 +112,9 @@ pub struct Lagged {
     /// entry after it.
     held: Vec<Entry>,
     apply_unpersisted: bool,
+    /// Whether hyper-check's oracles judge the member's outputs in place of the checks here
+    /// (`Settings::judged`).
+    judged: bool,
 }
 
 /// R-6: an answer says of its commit only what the disk states, so a
@@ -221,7 +228,7 @@ impl Lagged {
         };
         let id = raw.raft.id();
         let disk = &raw.store().0;
-        for message in ready.messages() {
+        for message in ready.messages().iter().filter(|_| !self.judged) {
             // I1: a leader's own messages leave at once only with its term
             // and vote durable.
             assert_eq!(
@@ -290,8 +297,10 @@ impl Lagged {
         for entry in &committed {
             let durable = holds(&raw.store().0, entry);
             assert!(
-                entry.index <= raft.log().committed()
-                    && (durable || (self.apply_unpersisted && leads && entry.term == raft.term())),
+                self.judged
+                    || entry.index <= raft.log().committed()
+                        && (durable
+                            || (self.apply_unpersisted && leads && entry.term == raft.term())),
                 "member {}: {} given to apply before it was committed and durable",
                 raft.id(),
                 entry.index
@@ -406,7 +415,7 @@ impl Lagged {
                 );
             }
         }
-        for message in &write.messages {
+        for message in write.messages.iter().filter(|_| !self.judged) {
             self.coverage.answers += u64::from(check_message(disk, message, id));
         }
         self.durable.push_back(write);
@@ -461,7 +470,7 @@ impl Lagged {
         if messages.is_empty() && !raw.raft.messages().is_empty() {
             self.coverage.held_back += 1;
         }
-        for message in &messages {
+        for message in messages.iter().filter(|_| !self.judged) {
             if leads {
                 self.coverage.answers += u64::from(check_commit(&raw.store().0, message, id));
                 // A pre-vote's answer names the term asked about, which no
@@ -498,9 +507,9 @@ impl Lagged {
 
 impl Replica for Lagged {
     const LAGGED: bool = true;
-    fn open(id: u64, store: Store, settings: &Settings, seed: u64) -> Self {
+    fn open(id: u64, store: Store, settings: &Settings, seed: u64, members: usize) -> Self {
         Self {
-            node: New::open(id, store, settings, seed),
+            node: New::open(id, store, settings, seed, members),
             depth: settings.depth,
             out: VecDeque::new(),
             durable: VecDeque::new(),
@@ -508,6 +517,7 @@ impl Replica for Lagged {
             coverage: Coverage::default(),
             held: Vec::new(),
             apply_unpersisted: settings.apply_unpersisted,
+            judged: settings.judged,
         }
     }
     fn id(&self) -> u64 {
@@ -523,7 +533,10 @@ impl Replica for Lagged {
         self.node.tick()
     }
     fn step(&mut self, message: Message) -> bool {
-        self.node.step(message)
+        let before = self.node.raw.raft.taken_ahead();
+        let stepped = self.node.step(message);
+        self.coverage.ahead += self.node.raw.raft.taken_ahead() - before;
+        stepped
     }
     fn propose(&mut self, data: Vec<u8>) -> bool {
         self.node.propose(data)
@@ -572,6 +585,9 @@ impl Replica for Lagged {
     }
     fn deadline(&self) -> Option<u64> {
         self.node.deadline()
+    }
+    fn plant(&mut self, mutant: Option<hyper_raft::Mutant>) {
+        self.node.raw.plant(mutant);
     }
     fn set_timeout(&mut self, ticks: usize) {
         self.node.set_timeout(ticks);

@@ -246,6 +246,15 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
         Ok((self.applied, self.configuration.clone()))
     }
 
+    /// The bytes `image` would write now. Asked once, when a member opens on a log never compacted
+    /// (`hyper_durable::Compaction`); an engine that cannot give its rows then, or rows past what
+    /// the image counts, gives none, so the log is not weighed against an image until its first
+    /// compaction makes one.
+    fn image_bytes(&self) -> Option<u64> {
+        let rows = self.engine.image().ok()?;
+        image::encoded_len(&rows)
+    }
+
     /// The engine takes the image's rows, with the configuration and the term of its point, and
     /// makes them durable before the log's start moves to it (I8).
     fn install(&mut self, image: &[u8], at: Point, configuration: &ConfState) -> Result<(), Fatal> {

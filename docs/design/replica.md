@@ -250,6 +250,19 @@ follower, and one entry past either bound, which the core admits alone; a member
 bounds a group below that, in bytes or in entries of the fewest bytes, refuses to open, since a
 write refused for room there could wait for good.
 
+**The core's bounds.** The core bounds every queue it keeps by what its owner states
+(`hyper_raft::Limits::derive`), and a range states each from its own settings, so no bound is
+chosen apart from them:
+- **Largest message.** It is an append. The core takes entries while their encoding fits
+  `max_size_per_msg` and always at least one, so an append carries that or one entry of
+  `max_entry_bytes` with its fixed bytes. A range's entries carry no context.
+- **Members.** A configuration names at most the boot configuration's members and the one learner
+  a replacement adds, the only change a range's membership makes (§6).
+- **Queue memory.** Each queue holds one write's worth: the bytes above, counted as the most
+  entries they carry at an entry's bytes in memory each. So a member always holds a leader's
+  message whole.
+- **Writes out.** One write is out at a time, which the shell raises to the store's depth.
+
 **What the core reads of the log.** The core reads the group's durable state through the
 shell's store, hyper-log's group handle (`GroupStore` over `GroupLog`, claimed when the member
 opens), through which the member makes every write of its group and which the log refuses to

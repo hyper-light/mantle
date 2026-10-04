@@ -54,7 +54,8 @@ fn a_heartbeat_a_poll_and_a_configuration_allocate_nothing() {
         seq += 1;
     }
     link.configure(&costs, granularity, granularity).unwrap();
-    let mut late = Lateness::new();
+    // The test's stamps are whole nanoseconds.
+    let mut late = Lateness::new(Duration::from_nanos(1));
     let mut flushes = Flushes::new();
     let mut fleet = Exposure::new();
     alloc::begin();
@@ -108,15 +109,21 @@ fn the_election_law_allocates_nothing_once_its_paths_are_built() {
     };
     let mut timer = ElectionTimer::new();
     let g = granularity.as_nanos() as u64;
-    // Every path answered once: a five-voter ballot needs two.
+    // Every path answered once: a five-voter ballot needs two. Each path is probed in turn, every
+    // `interval`, so its answers are a few probes apart, inside its span.
+    let probe = interval.as_nanos() as u64;
     for path in &mut paths {
-        path.on_sample(40 * MS);
+        path.on_sample(40 * MS, 0, 0);
     }
     alloc::begin();
     let mut derived = 0u32;
     for index in 0..20_000u64 {
         let path = &mut paths[(index % 4) as usize];
-        path.on_sample(40 * MS + (index * 7_919) % (18 * MS));
+        path.on_sample(
+            40 * MS + (index * 7_919) % (18 * MS),
+            (index / 4 + 1) * probe,
+            0,
+        );
         let ballot = Ballot::measure(&paths, 5, Duration::from_millis(4), granularity).unwrap();
         let span = ballot.span(granularity).unwrap();
         let timing = ElectionTiming::derive(interval, &detector, &span, &ballot);

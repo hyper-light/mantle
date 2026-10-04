@@ -31,6 +31,7 @@ mod support;
 
 use std::collections::VecDeque;
 
+use hyper_raft::StateRole;
 use hyper_raft::proto::MessageType;
 use support::{Cluster, Mix, New, Old, Op, Replica, Report, Seeded, Settings};
 
@@ -50,6 +51,8 @@ fn count(name: &str, default: u64) -> u64 {
 struct Reached {
     /// Members told to campaign while they asked whether they could.
     told_while_asking: u64,
+    /// Reads that would have reached a leader before its term's first commit, lost for both.
+    held_reads: u64,
     terms: u64,
     committed: u64,
     changes: u64,
@@ -122,6 +125,27 @@ fn tells_one_that_asks(group: &Cluster<New>, op: &Op) -> bool {
             let view = member.view();
             view.role == 3 && view.term == message.term
         })
+}
+
+/// Whether `op` asks a read of a leader that has not committed an entry of its term, or delivers
+/// to one a read a follower forwarded: this core holds the read until that commit (the thesis's
+/// §6.4 step 1), raft-rs drops it, and the comparison loses it for both (`docs/raft.md` §3.3).
+fn reads_before_first_commit(group: &Cluster<New>, op: &Op) -> bool {
+    let holds = |id: u64| {
+        group.peek(id).is_some_and(|member| {
+            member.raw.raft.state() == StateRole::Leader
+                && !member.raw.raft.commit_to_current_term()
+        })
+    };
+    match op {
+        Op::Read(id, _) | Op::Reads(id, _) => holds(*id),
+        Op::Deliver {
+            at, lose: false, ..
+        } => group.net.get(*at).is_some_and(|message| {
+            message.msg_type == MessageType::MsgReadIndex && holds(message.to)
+        }),
+        _ => false,
+    }
 }
 
 fn brief(message: &hyper_raft::proto::Message) -> String {
@@ -278,6 +302,21 @@ fn run(seed: u64, steps: u64, settings: Settings, mix: Mix, reached: &mut Reache
                     keep,
                     lose: true,
                 }
+            }
+            Op::Deliver { at, keep, .. } if reads_before_first_commit(&new, &op) => {
+                reached.held_reads += 1;
+                Op::Deliver {
+                    at,
+                    keep,
+                    lose: true,
+                }
+            }
+            Op::Read(..) | Op::Reads(..) if reads_before_first_commit(&new, &op) => {
+                reached.held_reads += 1;
+                if let Some(last) = trace.back_mut() {
+                    last.push_str(" (lost for both: a read before the term's first commit)");
+                }
+                continue;
             }
             op => op,
         };

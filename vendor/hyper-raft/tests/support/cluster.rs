@@ -4,6 +4,8 @@
 //! so two groups that are alike are scheduled alike.
 use std::collections::BTreeMap;
 
+use hyper_check::liveness::{Laws, Position, Progress, Quiet};
+
 use hyper_raft::proto::{
     ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState, Message,
     MessageType,
@@ -133,6 +135,17 @@ impl Mix {
     }
 }
 
+/// What watches a group's operations: hyper-check's judge (`tests/check.rs`).
+pub trait Observer<R> {
+    /// Before `op` acts.
+    fn before(&mut self, _group: &Cluster<R>, _op: &Op) {}
+    /// After `op` acted, with what each member did.
+    fn after(&mut self, _group: &Cluster<R>, _op: &Op, _reports: &[Report]) {}
+}
+
+/// No observer.
+impl<R> Observer<R> for () {}
+
 /// A member: running, and owning its disk, or stopped, and the cluster
 /// holds the disk until it opens again.
 pub enum Member<R> {
@@ -142,6 +155,9 @@ pub enum Member<R> {
 
 pub struct Cluster<R> {
     members: Vec<Member<R>>,
+    /// The members the group has, in and out of its configuration: what each states as the
+    /// most a configuration names.
+    size: usize,
     pub net: Vec<Message>,
     pub blocked: Vec<(u64, u64)>,
     pub settings: Settings,
@@ -158,6 +174,10 @@ pub struct Cluster<R> {
     /// is not: the comparison ends there.
     pub stop_who_left: bool,
     reads: u64,
+    /// The defect planted in every member as it opens (`hyper_raft::Mutant`).
+    pub mutant: Option<hyper_raft::Mutant>,
+    /// How often each member was opened: a member opened again forgot what its owner held.
+    pub incarnations: BTreeMap<u64, u64>,
     /// For each read that waits, the highest index any member had
     /// committed when it was asked: what it is answered with is no less.
     asked: BTreeMap<Vec<u8>, u64>,
@@ -198,6 +218,7 @@ impl<R: Replica> Cluster<R> {
         };
         let mut cluster = Self {
             members: Vec::new(),
+            size: count as usize,
             net: Vec::new(),
             blocked: Vec::new(),
             settings,
@@ -207,6 +228,8 @@ impl<R: Replica> Cluster<R> {
             deposed: 0,
             stop_who_left: false,
             reads: 0,
+            mutant: None,
+            incarnations: BTreeMap::new(),
             asked: BTreeMap::new(),
             answered: 0,
             opened: 0,
@@ -229,14 +252,27 @@ impl<R: Replica> Cluster<R> {
     }
     fn open(&mut self, id: u64, store: Store) -> R {
         self.opened += 1;
-        R::open(
+        *self.incarnations.entry(id).or_insert(0) += 1;
+        let mut node = R::open(
             id,
             store,
             &self.settings,
             self.seed
                 .wrapping_mul(1_000_003)
                 .wrapping_add(id * 7919 + self.opened),
-        )
+            self.size,
+        );
+        node.plant(self.mutant);
+        node
+    }
+    /// Plants `mutant` in every member, and in each it opens from now on.
+    pub fn plant(&mut self, mutant: Option<hyper_raft::Mutant>) {
+        self.mutant = mutant;
+        for member in &mut self.members {
+            if let Member::Up(node) = member {
+                node.plant(mutant);
+            }
+        }
     }
     pub fn node(&mut self, id: u64) -> Option<&mut R> {
         match self.members.get_mut((id - 1) as usize)? {
@@ -329,13 +365,14 @@ impl<R: Replica> Cluster<R> {
             // it again at its election each gave it its own.
             let stated = |said: &Said| (said.0, said.2, said.3.clone());
             match self.chosen.get(&committed.0) {
-                Some(chosen) => assert_eq!(
+                Some(chosen) if !self.settings.judged => assert_eq!(
                     stated(chosen),
                     stated(committed),
                     "seed {}: member {member} committed another entry at {}",
                     self.seed,
                     committed.0
                 ),
+                Some(_) => {}
                 None => {
                     self.chosen.insert(committed.0, committed.clone());
                 }
@@ -347,7 +384,7 @@ impl<R: Replica> Cluster<R> {
             // meanwhile answers nothing.
             if let Some(floor) = self.asked.remove(context) {
                 assert!(
-                    *index >= floor,
+                    self.settings.judged || *index >= floor,
                     "seed {}: member {member} answered a read at {index}, asked when {floor} was committed",
                     self.seed
                 );
@@ -356,10 +393,11 @@ impl<R: Replica> Cluster<R> {
         }
         if view.role == 2 {
             let leader = *self.leaders.entry(view.term).or_insert(member);
-            assert_eq!(
-                leader, member,
+            assert!(
+                self.settings.judged || leader == member,
                 "seed {}: two leaders of term {}",
-                self.seed, view.term
+                self.seed,
+                view.term
             );
         }
         for message in &output.messages {
@@ -381,6 +419,14 @@ impl<R: Replica> Cluster<R> {
             output,
             view,
         }
+    }
+
+    /// `op` acted, `observer` told before and after.
+    pub fn act_observed(&mut self, observer: &mut impl Observer<R>, op: &Op) -> Vec<Report> {
+        observer.before(self, op);
+        let reports = self.act(op);
+        observer.after(self, op, &reports);
+        reports
     }
 
     pub fn act(&mut self, op: &Op) -> Vec<Report> {
@@ -536,7 +582,7 @@ impl<R: Replica> Cluster<R> {
                 reports.extend(self.act(&Op::Restart(*id)));
             }
         }
-        if R::LAGGED {
+        if R::LAGGED && !self.settings.judged {
             self.check_durable();
         }
         self.steps += 1;
@@ -849,10 +895,15 @@ impl<R: Replica> Cluster<R> {
     /// later. A round is a tick of each member, its messages delivered within
     /// it.
     pub fn settles(&mut self) -> bool {
+        self.settles_observed(&mut ())
+    }
+
+    /// [`Cluster::settles`], with `observer` told of each operation it acts.
+    pub fn settles_observed(&mut self, observer: &mut impl Observer<R>) -> bool {
         self.blocked.clear();
         for id in self.ids() {
             if self.peek(id).is_none() {
-                self.act(&Op::Restart(id));
+                self.act_observed(observer, &Op::Restart(id));
             }
         }
         if self.settings.suspicion {
@@ -861,7 +912,7 @@ impl<R: Replica> Cluster<R> {
             for id in self.ids() {
                 for peer in self.ids() {
                     if peer != id {
-                        self.act(&Op::Trust(id, peer));
+                        self.act_observed(observer, &Op::Trust(id, peer));
                     }
                 }
             }
@@ -869,8 +920,17 @@ impl<R: Replica> Cluster<R> {
         // The index the proposal took, and the term of the leader that
         // took it.
         let mut proposed: Option<(u64, u64)> = None;
+        // hyper-check's rule (docs/sim.md §4.2): by suspicion, the span the members draw from,
+        // three vote rounds and a replication round, with no detector delay, for the schedule
+        // says what each detector suspects; on ticks, the longest timeout a member draws.
         let quiet = if self.settings.suspicion {
-            (SPAN_NS + 4 * ROUND_NS).div_ceil(TICK_NS) as usize
+            let laws = Laws {
+                detection_ns: 0,
+                span_ns: SPAN_NS,
+                vote_rounds_ns: 3 * ROUND_NS,
+                replication_ns: ROUND_NS,
+            };
+            Quiet::in_rounds(&laws, TICK_NS)
         } else {
             let patience = self
                 .up()
@@ -878,19 +938,22 @@ impl<R: Replica> Cluster<R> {
                 .filter_map(|id| self.peek(id).map(|node| node.view().patience))
                 .max()
                 .unwrap_or(0);
-            2 * (2 * self.settings.election_tick - 1 + patience) + 1
-        };
-        let mut seen: BTreeMap<u64, (u64, u64, u64, u64)> = BTreeMap::new();
-        let mut moved = 0usize;
-        for round in 0.. {
+            Quiet::ticks(self.settings.election_tick as u64, patience as u64)
+        }
+        .expect("a quiet period within u64");
+        let mut progress = Progress::new(quiet, 0);
+        for round in 0u64.. {
             for id in self.up() {
                 let view = self.peek(id).map(|node| node.view()).expect("up");
-                let at = (view.term, view.commit, view.applied, view.last_index);
-                if seen.insert(id, at) != Some(at) {
-                    moved = round;
-                }
+                let at = Position {
+                    term: view.term,
+                    commit: view.commit,
+                    applied: view.applied,
+                    last: view.last_index,
+                };
+                progress.observe(round, id, at);
             }
-            if round > moved + quiet {
+            if progress.stuck(round) {
                 break;
             }
             // A member that joined after the leader's snapshot was taken is
@@ -898,21 +961,24 @@ impl<R: Replica> Cluster<R> {
             // taken since, which is the owner's to take.
             if round % 16 == 15 {
                 for leader in self.leaders_now() {
-                    self.act(&Op::Compact(leader));
+                    self.act_observed(observer, &Op::Compact(leader));
                 }
             }
 
             while !self.net.is_empty() {
-                self.act(&Op::Deliver {
-                    at: 0,
-                    keep: false,
-                    lose: false,
-                });
+                self.act_observed(
+                    observer,
+                    &Op::Deliver {
+                        at: 0,
+                        keep: false,
+                        lose: false,
+                    },
+                );
                 if R::LAGGED && self.net.is_empty() {
                     // What the members took is persisted and heard of, and
                     // what that sends is delivered in turn.
                     for id in self.up() {
-                        self.act(&Op::Persist(id, Step::Flush));
+                        self.act_observed(observer, &Op::Persist(id, Step::Flush));
                     }
                 }
             }
@@ -946,7 +1012,8 @@ impl<R: Replica> Cluster<R> {
                 .into_iter()
                 .max_by_key(|id| self.peek(*id).map_or(0, |node| node.view().term))
             {
-                let reports = self.act(&Op::Propose(leader, b"settled".to_vec()));
+                let reports =
+                    self.act_observed(observer, &Op::Propose(leader, b"settled".to_vec()));
                 if reports.iter().any(|report| report.accepted == Some(true)) {
                     proposed = self.peek(leader).map(|node| {
                         let view = node.view();
@@ -955,9 +1022,9 @@ impl<R: Replica> Cluster<R> {
                 }
             }
             for id in self.ids() {
-                self.act(&Op::Tick(id));
+                self.act_observed(observer, &Op::Tick(id));
                 if R::LAGGED {
-                    self.act(&Op::Persist(id, Step::Flush));
+                    self.act_observed(observer, &Op::Persist(id, Step::Flush));
                 }
             }
         }

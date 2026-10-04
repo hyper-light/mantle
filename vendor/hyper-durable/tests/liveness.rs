@@ -32,6 +32,7 @@ mod support;
 
 use std::collections::BTreeMap;
 use std::task::Waker;
+use std::time::Duration;
 
 use hyper_durable::{Output, Owner, Replica, Unbounded};
 use hyper_liveness::{
@@ -51,6 +52,8 @@ const JITTER_NS: u64 = 100_000;
 const FLUSH_NS: u64 = 2_000_000;
 /// How late a node wakes past what it asked: up to 60 µs, seeded.
 const LATE_NS: u64 = 60_000;
+/// The simulated clock's resolution: its readings are whole nanoseconds.
+const RESOLUTION: Duration = Duration::from_nanos(1);
 /// The store's depth.
 const DEPTH: usize = 3;
 
@@ -136,6 +139,7 @@ impl World {
                     run: 1,
                     max_peers: 3,
                     history: Exposure::new(),
+                    resolution: RESOLUTION,
                 })
                 .unwrap();
                 owner.pairs(handle, &mut liveness, false).unwrap();
@@ -190,6 +194,7 @@ impl World {
             run,
             max_peers: 3,
             history: Exposure::new(),
+            resolution: RESOLUTION,
         })
         .unwrap();
         owner.pairs(handle, &mut liveness, false).unwrap();

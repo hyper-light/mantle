@@ -69,6 +69,7 @@ fn timing_for(voters: u32) -> (Timing, hyper_timing::Span) {
         Timing {
             span: span.span,
             round,
+            election: span.election,
         },
         span,
     )
@@ -103,6 +104,7 @@ impl Sim {
                     Store::new(boot.clone()),
                     &settings,
                     seed.wrapping_mul(1_000_003).wrapping_add(id),
+                    count as usize,
                 );
                 node.raw.set_timing(timing).unwrap();
                 Some(node)
@@ -187,19 +189,22 @@ impl Sim {
             (Some(_), None) => unreachable!("matched above"),
         }
     }
-    /// How long a run may go with no member's term, role, commit or last index moving before it
+    /// How long a run may go with no member's term, commit, applied index or last index moving before it
     /// is stuck (`docs/sim.md` §4.2): the longest draw of the span, the election's three rounds and
     /// a replication round, from the members' own timing. The test suspects explicitly, so no
     /// detection time is added.
     fn quiet(&self) -> u64 {
         (self.timing.span + self.timing.round * 4).as_nanos() as u64
     }
-    fn progress(&self) -> Vec<(u64, u64, u8, u64, u64)> {
+    /// What moves, as `docs/sim.md` §4.2 counts it: each member's term, commit, applied index and
+    /// last index. A role is not: a pre-candidate that asks and falls back moves none of them, and
+    /// a group whose members only do that is stuck.
+    fn progress(&self) -> Vec<(u64, u64, u64, u64, u64)> {
         self.up()
             .into_iter()
             .map(|id| {
                 let view = self.peek(id).view();
-                (id, view.term, view.role, view.commit, view.last_index)
+                (id, view.term, view.commit, view.applied, view.last_index)
             })
             .collect()
     }
@@ -228,6 +233,18 @@ impl Sim {
                 return false;
             }
         }
+    }
+    /// Runs until `done` holds, or until the clock passes `until`: a directed test that counts what
+    /// members do while nothing moves (a wrong suspicion's asks), bounded by the time those take on
+    /// the members' own timing rather than by the quiet period, which such a run is meant to pass.
+    /// False when `until` passes, or nothing is left to run, before `done` holds.
+    fn run_until_time(&mut self, until: u64, mut done: impl FnMut(&Self) -> bool) -> bool {
+        while !done(self) {
+            if self.now > until || !self.next() {
+                return done(self);
+            }
+        }
+        true
     }
     /// The clock moves on by `by` with nothing delivered: a member woken now finds what fell due.
     fn pass(&mut self, by: u64) {
@@ -352,7 +369,7 @@ fn the_delay_is_the_laws_draw() {
     for seed in first..first + count("HYPER_RAFT_SEEDS", 1_000) {
         let settings = Settings::focal().by_suspicion();
         let local = seed.wrapping_mul(0x2545_f491_4f6c_dd1d);
-        let mut node = New::open(2, Store::new(Sim::voters(&[1, 2, 3])), &settings, local);
+        let mut node = New::open(2, Store::new(Sim::voters(&[1, 2, 3])), &settings, local, 3);
         node.raw.set_timing(timing).unwrap();
         let opened = 7_000_000_000;
         node.wake(opened);
@@ -376,7 +393,7 @@ fn every_arming_draws_anew() {
     let settings = Settings::focal().by_suspicion();
     let local = 0x2545_f491_4f6c_dd1d;
     let draw = |index| hyper_timing::election_delay(timing.span, local, index).as_nanos() as u64;
-    let mut node = New::open(2, Store::new(Sim::voters(&[1, 2, 3])), &settings, local);
+    let mut node = New::open(2, Store::new(Sim::voters(&[1, 2, 3])), &settings, local, 3);
     node.raw.set_timing(timing).unwrap();
     let mut now = 7_000_000_000;
     node.wake(now);
@@ -516,9 +533,13 @@ fn a_member_that_trusts_its_leader_refuses_a_pre_vote() {
     let from = sim.sent.len();
     let term = sim.term(1);
     sim.suspect(3, 1);
-    // While its detector is wrong it asks again, a round and a draw after each ask.
+    // While its detector is wrong it asks again, a round and a draw after each ask: three asks, two
+    // requests each. The first comes a draw over the span after the suspicion, each next one a
+    // round and a draw after the last, so all three by three rounds and spans; its leader's answers
+    // move no term, so the run waits on that time and not on the quiet period.
     let asked = |sim: &Sim| sim.count_sent(from, MessageType::MsgRequestPreVote) >= 6;
-    assert!(sim.run_until(asked));
+    let asks = (timing.round + timing.span).as_nanos() as u64 * 3;
+    assert!(sim.run_until_time(sim.now + asks, asked));
     sim.trust(3, 1);
     assert!(
         sim.run(),
@@ -538,6 +559,29 @@ fn a_member_that_trusts_its_leader_refuses_a_pre_vote() {
     }
     // The leader told it who leads.
     assert_eq!(sim.peek(3).view().leader, 1);
+}
+
+/// A leader both followers suspect is deposed though it is up and answers. Each follower that asks
+/// for pre-votes hears the leader's answer, a heartbeat of the leader's term, before the other
+/// follower's grant: the leader is asked first. A pre-candidate keeps the leader's term, so that
+/// heartbeat would make it a follower again and its asking would end, ask after ask (the kill test's
+/// `stall-leader` on windows-2025, diagnostic run 37209985474: no campaign won in a second). A
+/// pre-candidate drops what a leader it suspects sends it in that leader's term, as a lost message.
+#[test]
+fn a_suspected_leader_that_answers_a_pre_vote_is_deposed() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 5);
+    sim.found(1);
+    let term = sim.term(1);
+    sim.suspect(2, 1);
+    sim.suspect(3, 1);
+    assert!(
+        sim.run_until(|sim| sim.leader().is_some_and(|leader| leader != 1)),
+        "no follower was elected: {:?}",
+        sim.progress()
+    );
+    let leader = sim.leader().unwrap();
+    assert!(sim.term(leader) > term, "{:?}", sim.progress());
 }
 
 /// A leader steps down once its detectors suspect so many voters that it and those it trusts
@@ -667,7 +711,7 @@ fn a_restarted_leader_held_from_campaigning_hands_over() {
     let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 10);
     sim.found(1);
     let store = std::mem::take(sim.node(1).store_mut());
-    let mut node = New::open(1, store, &Settings::focal().by_suspicion(), 99);
+    let mut node = New::open(1, store, &Settings::focal().by_suspicion(), 99, 3);
     node.raw.set_timing(timing).unwrap();
     node.raw.hold_campaigns(true).unwrap();
     sim.nodes[0] = Some(node);
@@ -693,7 +737,7 @@ fn a_restarted_leader_hands_over_to_each_heir_in_turn() {
     sim.found(1);
     sim.cut.push(2);
     let store = std::mem::take(sim.node(1).store_mut());
-    let mut node = New::open(1, store, &Settings::focal().by_suspicion(), 99);
+    let mut node = New::open(1, store, &Settings::focal().by_suspicion(), 99, 3);
     node.raw.set_timing(timing).unwrap();
     node.raw.hold_campaigns(true).unwrap();
     sim.nodes[0] = Some(node);
@@ -823,7 +867,7 @@ fn a_leader_beats_while_work_is_in_flight_and_then_sleeps() {
 #[test]
 fn a_sole_voter_elects_itself_without_timing() {
     let settings = Settings::focal().by_suspicion();
-    let mut node = New::open(1, Store::new(Sim::voters(&[1])), &settings, 1);
+    let mut node = New::open(1, Store::new(Sim::voters(&[1])), &settings, 1, 1);
     node.wake(0);
     node.drain();
     assert_eq!(node.view().role, 2);
@@ -834,7 +878,7 @@ fn a_sole_voter_elects_itself_without_timing() {
 #[test]
 fn ticks_and_suspicion_do_not_mix() {
     let settings = Settings::focal().by_suspicion();
-    let mut node = New::open(1, Store::new(Sim::voters(&[1, 2, 3])), &settings, 1);
+    let mut node = New::open(1, Store::new(Sim::voters(&[1, 2, 3])), &settings, 1, 3);
     assert!(matches!(
         node.raw.tick(),
         Err(hyper_raft::Error::Settings(_))
@@ -844,6 +888,7 @@ fn ticks_and_suspicion_do_not_mix() {
         Store::new(Sim::voters(&[1, 2, 3])),
         &Settings::focal(),
         1,
+        3,
     );
     assert!(matches!(
         ticking.raw.suspect(2),
@@ -854,7 +899,7 @@ fn ticks_and_suspicion_do_not_mix() {
     // Without pre-vote and check-quorum, elections by suspicion are refused at open.
     let config = hyper_raft::Config {
         elections: hyper_raft::Elections::Suspicion,
-        ..hyper_raft::Config::new(1)
+        ..hyper_raft::Config::new(1, support::limits(1, 1))
     };
     assert!(matches!(
         config.validate(),

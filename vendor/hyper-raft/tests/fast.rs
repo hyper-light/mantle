@@ -404,7 +404,8 @@ fn what_may_not_go_by_the_fast_track_is_refused() {
         assert!(group.peek(2).unwrap().held().is_empty());
     }
     // Below the log, and beyond the window above what is committed.
-    for index in [1, 2 + 256] {
+    let window = group.peek(2).unwrap().raw.raft.config().limits.fast_window;
+    for index in [1, 2 + window] {
         group.net.push(proposal(Entry {
             index,
             data: vec![1],
@@ -486,8 +487,8 @@ fn fast_schedule(
 
 /// The schedule that found an election committing a second entry at an
 /// index that held a committed one (seed 9843 of 40,000 from seed 3,000,
-/// on the core before focal's F43, F41 and F42, whose rules it keeps
-/// here so that it runs as it was found). A leader of term 3 committed
+/// on the core before focal's F43, F41 and F42 and R-3's R17, whose rules
+/// it keeps here so that it runs as it was found). A leader of term 3 committed
 /// index 32 by the fast quorum of members 1, 2 and 4, of which 2 and 4
 /// held the entry beside their logs and had told the leader nothing of
 /// their logs; member 3, whose log held an entry of an older term at 32,
@@ -500,6 +501,7 @@ fn an_election_never_commits_a_second_entry_at_a_committed_index() {
         round_each: true,
         max_inflight_bytes: u64::MAX,
         bare_answers: true,
+        refuse_ahead: true,
         ..Settings::fast()
     };
     let mix = Mix {

@@ -19,7 +19,8 @@ use hyper_durable::{ClaimError, Driven, GroupStore, LogStore, OpenError, Unbound
 use hyper_log::Log;
 use hyper_raft::proto::{ConfChangeV2, ConfState, Entry, EntryType, Message};
 use hyper_raft::wire::Record;
-use hyper_raft::{Config, Elections};
+use hyper_raft::wire::{ENTRY_FIXED_BYTES, MESSAGE_RECORD_FIXED_BYTES};
+use hyper_raft::{Config, Elections, Limits, Stated};
 use mantle_meta::apply::Layer;
 use mantle_meta::engine::Engine;
 use mantle_meta::session::Rules;
@@ -90,12 +91,7 @@ fn check_settings<F: BlockFile + 'static>(
             "an entry of the range's largest does not fit one frame of this log",
         ));
     }
-    let inflight = u64::try_from(settings.max_inflight_msgs)
-        .ok()
-        .and_then(|n| n.checked_mul(settings.max_size_per_msg));
-    let ready = inflight
-        .map(|f| f.max(settings.max_uncommitted_size))
-        .and_then(|b| b.checked_add(settings.max_entry_bytes));
+    let ready = one_ready(settings);
     let config = log.config();
     let fits = ready.is_some_and(|b| {
         b <= config.group_bytes
@@ -108,6 +104,62 @@ fn check_settings<F: BlockFile + 'static>(
         ));
     }
     Ok(())
+}
+
+/// The bytes one ready of the range's settings holds: a leader's uncommitted proposals or the
+/// appends a follower has in flight, and one entry past either bound, which the core admits alone.
+fn one_ready(settings: &Settings) -> Option<u64> {
+    let inflight = u64::try_from(settings.max_inflight_msgs)
+        .ok()
+        .and_then(|n| n.checked_mul(settings.max_size_per_msg));
+    inflight
+        .map(|f| f.max(settings.max_uncommitted_size))
+        .and_then(|b| b.checked_add(settings.max_entry_bytes))
+}
+
+/// What the range states of its members to the core (`hyper_raft::Limits::derive`), each from the
+/// range's own settings, so that no bound is chosen apart from them:
+/// - the largest message is an append. The core takes entries while their encoding fits
+///   `max_size_per_msg`, and one at least, so it carries either that or one entry of the range's
+///   largest with its fixed bytes (a range's entries carry no context), inside the record's
+///   fixed bytes;
+/// - the most members a configuration names are the boot configuration's and the one learner a
+///   replacement adds, the only change a range's membership makes ([`Replacement`]);
+/// - each queue holds what one ready of the range's settings holds (the bound the log is held to,
+///   [`check_settings`]), counted resident: the most entries a ready carries, each at least its
+///   fixed bytes on the wire, at an entry's bytes in memory each, so that a member holds a
+///   leader's message whole;
+/// - one write is out, which the shell raises to the store's depth.
+fn limits(range: &Range) -> Result<Limits, ReplicaError> {
+    let s = &range.settings;
+    let unfit = || ReplicaError::Config("the range's settings exceed what this machine addresses");
+    let entry = usize::try_from(s.max_entry_bytes)
+        .ok()
+        .and_then(|bytes| bytes.checked_add(ENTRY_FIXED_BYTES))
+        .ok_or_else(unfit)?;
+    let page = usize::try_from(s.max_size_per_msg).map_err(|_| unfit())?;
+    let message = page
+        .max(entry)
+        .checked_add(MESSAGE_RECORD_FIXED_BYTES)
+        .ok_or_else(unfit)?;
+    let members = range
+        .boot
+        .voters
+        .len()
+        .checked_add(range.boot.learners.len())
+        .and_then(|n| n.checked_add(1))
+        .ok_or_else(unfit)?;
+    let memory = one_ready(s)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .and_then(|bytes| bytes.checked_div(ENTRY_FIXED_BYTES))
+        .and_then(|entries| entries.checked_mul(std::mem::size_of::<Entry>()))
+        .ok_or_else(unfit)?;
+    Ok(Limits::derive(Stated {
+        message,
+        members,
+        memory,
+        depth: 1,
+    })?)
 }
 
 fn shell(e: hyper_durable::ReplicaError) -> ReplicaError {
@@ -185,7 +237,7 @@ impl<L: LogStore, E: Engine> Replica<L, E> {
                 check_quorum: true,
                 pre_vote: true,
                 seed,
-                ..Config::new(id)
+                ..Config::new(id, limits(range)?)
             },
             elections: Elections::Ticks,
             quiet: QUIET,

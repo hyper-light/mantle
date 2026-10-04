@@ -1,6 +1,8 @@
-//! Node pairs under a deterministic simulation: one clock, and a world as a host's heartbeat traces
-//! measured it (`support/worlds.rs`): one-way delays, a disk per node and its flushes, owners whose
-//! timers fire late, and hosts that freeze. The owners run the crate as a real one does (poll at
+//! Node pairs under a deterministic simulation on hyper-sim's world and network (`docs/sim.md`
+//! §13): one clock, and a host as its heartbeat traces measured it (`support/worlds.rs`): one-way
+//! delays on the network's measured path, a disk per node and its flushes, owners whose timers
+//! fire late, and hosts that freeze, every draw from a stream of the world and every arrival,
+//! completion, freeze and timer an event the world orders. The owners run the crate as a real one does (poll at
 //! its wake, feed what arrives and what becomes durable, make the liveness write it asks for) and
 //! compute the election cost from the library's own law over the round trips the streams measure;
 //! the tests assert what the crate promises and derive no bound of their own.
@@ -19,19 +21,32 @@
     missing_docs
 )]
 
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use hyper_liveness::{
     Change, Heartbeat, Liveness, MAX_BYTES, Output, PeerId, Refusal, Settings, Suspicion, Write,
 };
 use hyper_sim::Seeded;
+use hyper_sim::net::{Measured, Net, NetLimits, Path, Ticket};
 use hyper_sim::rng::stream_seed;
+use hyper_sim::{Clock, Discipline, Fifo, Limits, NodeId, PPM, Source, Step, StreamId};
 use hyper_timing::{Ballot, Exposure, Trust, WINDOW_LIMIT};
 
 const MS: u64 = 1_000_000;
 const US: u64 = 1_000;
+/// The simulated clock's resolution: its readings are whole nanoseconds.
+const RESOLUTION: Duration = Duration::from_nanos(1);
+/// The bounds of a run (`docs/sim.md` §7), each four times the most any run took over 80 seeds of
+/// every test (3,840 runs, measured 2026-10-04 on the port to hyper-sim's world): a soak that
+/// passes one has stopped converging, or has found a longer tail to measure the bound on again.
+/// The events pending at once (heartbeats in flight, writes, each node's freeze or thaw): 13.
+const EVENTS: usize = 4 * 13;
+/// The steps of a run: 38,725.
+const STEPS: u64 = 4 * 38_725;
+/// The decisions the trace holds (a delay for each heartbeat a poll sends, a lateness for each
+/// timer set, a flush for each write submitted): 39,383.
+const TRACE_WORDS: usize = 4 * 39_383;
 
 /// The seeds a test runs: its default count of them, or `HYPER_LIVENESS_SEEDS` where a soak sets
 /// it, from the `HYPER_LIVENESS_SEED`-th on where that is set (a seed a failure printed is its low
@@ -54,39 +69,26 @@ fn from_environment(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// The world's draws: hyper-sim's SplitMix64 with its unbiased `below` (`hyper_sim::rng`), a
-/// stream a source, named for it (`stream_seed`): each node's timer, disk, groups' writes and host,
-/// each directed link, and a test's own. A source's draws depend on the seed and its name alone,
-/// so a change that makes one node send or wake differently moves no other source's.
-struct Draws {
-    seed: u64,
-    streams: BTreeMap<(&'static str, u64, u64), Seeded>,
+/// The streams of the world the simulation draws from, one a source, named for it: each node's
+/// timer, disk and host. A source's draws depend on the seed and its name alone, so a change that
+/// makes one node send or wake differently moves no other source's.
+struct Streams {
+    named: BTreeMap<(&'static str, u64), StreamId>,
 }
 
-impl Draws {
-    fn new(seed: u64) -> Self {
-        Self {
-            seed,
-            streams: BTreeMap::new(),
-        }
+impl Streams {
+    /// `label`'s stream for `node`, named at its first draw.
+    fn of(&mut self, world: &mut hyper_sim::World<Ev>, label: &'static str, node: u64) -> StreamId {
+        *self
+            .named
+            .entry((label, node))
+            .or_insert_with(|| world.stream(label, &[node]).unwrap())
     }
 
-    fn stream(&mut self, label: &'static str, a: u64, b: u64) -> &mut Seeded {
-        let seed = self.seed;
-        self.streams
-            .entry((label, a, b))
-            .or_insert_with(|| Seeded::new(stream_seed(seed, label, &[a, b])))
-    }
-
-    /// Uniform in `[0, 1)`: 53 bits.
-    fn unit(&mut self, label: &'static str, a: u64, b: u64) -> f64 {
-        (self.stream(label, a, b).next_u64() >> 11) as f64 / (1u64 << 53) as f64
-    }
-
-    /// A value of `table` at a probability drawn from the stream.
-    fn draw(&mut self, label: &'static str, a: u64, b: u64, table: &Table) -> u64 {
-        let u = self.unit(label, a, b);
-        quantile(table, u)
+    /// A probability in parts per million, below a million, from `label`'s stream for `node`.
+    fn unit(&mut self, world: &mut hyper_sim::World<Ev>, label: &'static str, node: u64) -> u32 {
+        let stream = self.of(world, label, node);
+        u32::try_from(world.below(stream, u64::from(PPM)).unwrap()).unwrap()
     }
 }
 
@@ -94,25 +96,32 @@ impl Draws {
 mod worlds;
 use worlds::{Freezes, GRID, Table};
 
+/// [`GRID`] in parts per million: every hundredth, then the tail. Its finest point, 0.99999, is a
+/// whole part per million, so the inverse transform is exact in integers (`Measured`).
+const GRID_PPM: [u32; 107] = {
+    let mut grid = [0u32; 107];
+    let mut i = 0;
+    while i < 100 {
+        grid[i] = i as u32 * 10_000;
+        i += 1;
+    }
+    let tail = [995_000, 999_000, 999_500, 999_900, 999_950, 999_990, PPM];
+    let mut j = 0;
+    while j < tail.len() {
+        grid[100 + j] = tail[j];
+        j += 1;
+    }
+    grid
+};
+
 #[path = "support/record.rs"]
 mod record;
 use record::{Beat, Record, Traced};
 
-/// A quantity's value at probability `u`, from its table by the inverse transform, linear between
-/// the neighbouring points of the grid (`hyper-timing-trace`'s, `worlds::GRID`).
-fn quantile(table: &Table, u: f64) -> u64 {
-    let at = GRID
-        .partition_point(|point| *point <= u)
-        .saturating_sub(1)
-        .min(GRID.len() - 2);
-    let (low, high) = (GRID[at], GRID[at + 1]);
-    let share = if high > low {
-        (u - low) / (high - low)
-    } else {
-        0.0
-    };
-    let (from, to) = (table[at] as f64, table[at + 1] as f64);
-    (from + share * (to - from)).round().max(0.0) as u64
+/// A quantity's value at probability `u` parts per million, from its table by the inverse
+/// transform, linear between the neighbouring points of the grid (hyper-sim's `Measured`).
+fn quantile(table: &'static Table, u: u32) -> u64 {
+    Measured::new(&GRID_PPM, table).unwrap().at(u)
 }
 
 /// How late an owner's timer fires past the deadline it was set to, as its host's measured waits
@@ -133,18 +142,23 @@ enum Timer {
 }
 
 impl Timer {
-    /// The lateness of a wait of `asked` at probability `u`.
-    fn late(&self, asked: u64, u: f64) -> u64 {
+    /// The lateness of a wait of `asked` at probability `u` parts per million.
+    fn late(&self, asked: u64, u: u32) -> u64 {
         match *self {
-            Self::Tick(period) => (u * period as f64) as u64,
+            Self::Tick(period) => period * u64::from(u) / u64::from(PPM),
             Self::Sweep(rows) => {
                 let above = rows.partition_point(|(wait, _)| *wait <= asked);
                 match (above.checked_sub(1).map(|at| &rows[at]), rows.get(above)) {
                     (None, Some((_, first))) => quantile(first, u),
                     (Some((low, below)), Some((high, upper))) => {
-                        let (from, to) = (quantile(below, u) as f64, quantile(upper, u) as f64);
-                        let share = (asked - low) as f64 / (high - low) as f64;
-                        (from + share * (to - from)).round() as u64
+                        // Linear in the wait between the two rows, rounded half up.
+                        let (from, to) = (quantile(below, u), quantile(upper, u));
+                        let (share, span) = (asked - low, high - low);
+                        if to >= from {
+                            from + ((to - from) * share + span / 2) / span
+                        } else {
+                            from - ((from - to) * share + span / 2) / span
+                        }
                     }
                     (Some((_, longest)), None) => quantile(longest, u),
                     (None, None) => 0,
@@ -154,8 +168,8 @@ impl Timer {
     }
 }
 
-/// How the simulated world behaves: each quantity drawn from a host's measured distribution
-/// (`worlds`, the heartbeat traces of `docs/benchmarks.md`, "The simulation's worlds").
+/// How the simulated host behaves: each quantity drawn from its measured distribution (`worlds`,
+/// the heartbeat traces of `docs/benchmarks.md`, "The simulation's worlds").
 #[derive(Clone, Copy, Debug)]
 struct World {
     name: &'static str,
@@ -221,6 +235,25 @@ const WINDOWS: World = World {
     busy: false,
 };
 
+/// What the world schedules: a message's arrival on the network, a write made durable, a host's
+/// freeze and its thaw. A node's timer is the world's own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ev {
+    Arrive(Ticket),
+    Durable {
+        node: usize,
+        write: Write,
+        started: u64,
+    },
+    Freeze {
+        node: usize,
+    },
+    Thaw {
+        node: usize,
+    },
+}
+
+/// An event as a node takes it, or holds it while its host is frozen.
 enum Event {
     /// A message reaches `to`, received by its kernel at `stamp`.
     Arrive {
@@ -301,11 +334,14 @@ struct Node {
 struct Sim {
     now: u64,
     world: World,
-    draws: Draws,
+    /// hyper-sim's world: the clock, the pending events, the nodes' timers, the streams.
+    sim: hyper_sim::World<Ev>,
+    /// The network the heartbeats travel: the host's measured one-way delay on every pair.
+    net: Net<Vec<u8>>,
+    streams: Streams,
+    /// Writes submitted and not yet durable.
+    writing: usize,
     nodes: Vec<Node>,
-    queue: BinaryHeap<Reverse<(u64, u64)>>,
-    events: BTreeMap<u64, Event>,
-    next_event: u64,
     /// When each node first held each pair configured: `(node, peer)` to the time.
     configured_at: BTreeMap<(usize, PeerId), u64>,
     /// The latest any timer was set to fire past its deadline, and the longest any host froze:
@@ -316,6 +352,12 @@ struct Sim {
 
 impl Sim {
     fn new(count: usize, world: World, seed: u64) -> Self {
+        Self::of(count, world, Source::Seed(seed))
+    }
+
+    /// The simulation of `count` nodes on `world`, its decisions drawn from `source`: a seed, or a
+    /// trace to replay.
+    fn of(count: usize, world: World, source: Source) -> Self {
         let nodes = (0..count)
             .map(|i| {
                 let id = i as u64 + 1;
@@ -325,6 +367,7 @@ impl Sim {
                     run: 1,
                     max_peers: count,
                     history: Exposure::new(),
+                    resolution: RESOLUTION,
                 })
                 .unwrap();
                 for peer in 1..=count as u64 {
@@ -362,14 +405,40 @@ impl Sim {
                 }
             })
             .collect();
+        let limits = Limits {
+            events: EVENTS,
+            nodes: count,
+            streams: 4 * count * count,
+            steps: STEPS,
+            trace_words: TRACE_WORDS,
+        };
+        let mut sim = hyper_sim::World::new(source, Discipline::Ordered, limits).unwrap();
+        // The nodes' clocks are the world's: one clock, the owners' timers late as the host's
+        // sweep measured, drawn by the owner (`arm`), so the world's own lateness is none.
+        for _ in 0..count {
+            sim.node(Clock::default()).unwrap();
+        }
+        let mut net = Net::new(NetLimits {
+            flows: count * count,
+            links: 0,
+            nats: 0,
+            link_messages: 0,
+            messages: EVENTS,
+            bytes: EVENTS * MAX_BYTES,
+        });
+        net.set_path(Path::measured(
+            Measured::new(&GRID_PPM, world.delay).unwrap(),
+        ));
         let mut sim = Self {
             now: 0,
             world,
-            draws: Draws::new(seed),
+            sim,
+            net,
+            streams: Streams {
+                named: BTreeMap::new(),
+            },
+            writing: 0,
             nodes,
-            queue: BinaryHeap::new(),
-            events: BTreeMap::new(),
-            next_event: 0,
             configured_at: BTreeMap::new(),
             latest_late: 0,
             longest_freeze: 0,
@@ -379,9 +448,9 @@ impl Sim {
                 sim.submit(node, Write::Log);
             }
             if let Some(freezes) = world.freezes {
-                // A uniform point of the trace: 53 bits of the node's own stream.
-                let u = sim.draws.unit("freeze", node as u64, 0);
-                sim.nodes[node].phase = (u * freezes.span as f64) as u64;
+                // A uniform point of the trace, from the node's own stream.
+                let stream = sim.streams.of(&mut sim.sim, "freeze", node as u64);
+                sim.nodes[node].phase = sim.sim.below(stream, freezes.span).unwrap();
                 sim.schedule_freeze(node);
             }
         }
@@ -405,15 +474,13 @@ impl Sim {
 
     fn schedule_freeze(&mut self, node: usize) {
         if let Some((at, _)) = self.next_freeze(node) {
-            self.schedule(at, Event::Freeze { node });
+            self.schedule(at, node, Ev::Freeze { node });
         }
     }
 
-    fn schedule(&mut self, at: u64, event: Event) {
-        let key = self.next_event;
-        self.next_event += 1;
-        self.queue.push(Reverse((at, key)));
-        self.events.insert(key, event);
+    /// `event` for `node`, due at `at`.
+    fn schedule(&mut self, at: u64, node: usize, event: Ev) {
+        self.sim.schedule(at, NodeId(node as u32), event).unwrap();
     }
 
     /// A write submitted on `node`'s disk now, durable after its flush.
@@ -422,12 +489,15 @@ impl Sim {
             return;
         }
         let start = self.now.max(self.nodes[node].disk_busy_until);
-        let done = start + self.draws.draw("disk", node as u64, 0, self.world.flush);
+        let u = self.streams.unit(&mut self.sim, "disk", node as u64);
+        let done = start + quantile(self.world.flush, u);
         self.nodes[node].disk_busy_until = done;
         let started = self.now;
+        self.writing += 1;
         self.schedule(
             done,
-            Event::Durable {
+            node,
+            Ev::Durable {
                 node,
                 write,
                 started,
@@ -490,16 +560,12 @@ impl Sim {
             let beat = Heartbeat::decode(&bytes).unwrap();
             self.nodes[node].log.push((self.now, peer, beat));
             self.nodes[node].record.sent(peer, beat.run, beat.seq);
-            let delay = self.draws.draw("link", node as u64, peer, self.world.delay);
-            self.schedule(
-                self.now + delay,
-                Event::Arrive {
-                    to: peer as usize - 1,
-                    from: node,
-                    bytes,
-                    stamp: self.now + delay,
-                },
-            );
+            // No host loses a message (`World::delay`): every heartbeat departs.
+            let length = bytes.len();
+            let pair = (NodeId(node as u32), NodeId(peer as u32 - 1));
+            self.net
+                .send(&mut self.sim, pair, bytes, length, Ev::Arrive)
+                .unwrap();
         }
         if std::mem::take(&mut self.nodes[node].owner.flush) {
             self.submit(node, Write::Liveness);
@@ -643,7 +709,7 @@ impl Sim {
             return;
         }
         let fires = asked.map(|deadline| {
-            let u = self.draws.unit("timer", node as u64, 0);
+            let u = self.streams.unit(&mut self.sim, "timer", node as u64);
             let late = self.world.timer.late(deadline.saturating_sub(self.now), u);
             self.latest_late = self.latest_late.max(late);
             // A wait begins before its deadline only if the owner was not past it when it set
@@ -655,54 +721,45 @@ impl Sim {
             )
         });
         self.nodes[node].timer = fires;
+        self.set_timer(node);
     }
 
-    /// The earliest timer of a live node, held while its host is frozen: the thaw polls.
-    fn next_wake(&self) -> Option<(u64, usize)> {
-        self.nodes
-            .iter()
-            .enumerate()
-            .filter(|(_, node)| node.alive)
-            .filter_map(|(i, node)| {
-                node.timer
-                    .map(|(_, fires, _)| (fires.max(node.frozen_until), i))
-            })
-            .min()
+    /// The world's timer for `node`: when its owner's fires, held to the thaw while its host is
+    /// frozen, none while it has none or the node is dead.
+    fn set_timer(&mut self, node: usize) {
+        let n = &self.nodes[node];
+        let at = n
+            .timer
+            .filter(|_| n.alive)
+            .map(|(_, fires, _)| fires.max(n.frozen_until));
+        self.sim.wake(NodeId(node as u32), at).unwrap();
     }
 
     /// Runs while `keep` holds of the world, an event or a wake at a time, polling every node
-    /// first; never past `until`, where one is given.
+    /// first; never past `until`, where one is given. The world takes what is due earliest, events
+    /// before timers and each in the order made (`Fifo`).
     fn run_while(&mut self, keep: impl Fn(&Self) -> bool, until: Option<u64>) {
         for node in 0..self.nodes.len() {
             self.poll(node);
         }
         while keep(self) {
-            let event_at = self.queue.peek().map(|Reverse((at, _))| *at);
-            let wake = self.next_wake();
-            let (at, is_event) = match (event_at, wake) {
-                (Some(e), Some((w, _))) if e <= w => (e, true),
-                (Some(e), None) => (e, true),
-                (_, Some((w, _))) => (w, false),
-                (None, None) => break,
+            let Some(at) = self.sim.earliest() else {
+                break;
             };
             if let Some(until) = until
                 && at > until
             {
+                self.sim.advance(until).unwrap();
                 self.now = until;
                 break;
             }
-            self.now = at;
-            if is_event {
-                let Reverse((_, key)) = self.queue.pop().unwrap();
-                let event = self.events.remove(&key).unwrap();
-                self.handle(event);
-            } else if let Some((_, node)) = wake {
-                // The timer fired: its wait, begun before its deadline, is reported, and the
-                // timer is set again after the poll.
-                if let Some((deadline, _, true)) = self.nodes[node].timer.take() {
-                    self.nodes[node].liveness.on_wait(deadline, at);
-                }
-                self.poll(node);
+            let step = self.sim.next(&mut Fifo).unwrap();
+            self.now = self.sim.now();
+            match step {
+                Step::Event { event, .. } => self.take(event),
+                Step::Wake { node } => self.wake(node.0 as usize),
+                Step::Idle => break,
+                Step::Spent => panic!("the run took its {STEPS} steps"),
             }
             self.elect();
             self.note_configured();
@@ -710,6 +767,55 @@ impl Sim {
             self.counted();
         }
         self.traced();
+    }
+
+    /// An event of the world, as the node it is for takes it.
+    fn take(&mut self, event: Ev) {
+        match event {
+            Ev::Arrive(ticket) => {
+                if let Some(delivery) = self.net.deliver(&mut self.sim, ticket, Ev::Arrive).unwrap()
+                {
+                    self.handle(Event::Arrive {
+                        to: delivery.to.0 as usize,
+                        from: delivery.from.0 as usize,
+                        bytes: delivery.payload,
+                        stamp: self.now,
+                    });
+                }
+            }
+            Ev::Durable {
+                node,
+                write,
+                started,
+            } => {
+                self.writing -= 1;
+                self.handle(Event::Durable {
+                    node,
+                    write,
+                    started,
+                });
+            }
+            Ev::Freeze { node } => self.handle(Event::Freeze { node }),
+            Ev::Thaw { node } => self.handle(Event::Thaw { node }),
+        }
+    }
+
+    /// `node`'s timer fired: its wait, begun before its deadline, is reported, and the timer is set
+    /// again after the poll. One that fires while the host is frozen is held to the thaw, which
+    /// takes it.
+    fn wake(&mut self, node: usize) {
+        if !self.nodes[node].alive {
+            return;
+        }
+        if self.nodes[node].frozen_until > self.now {
+            self.set_timer(node);
+            return;
+        }
+        if let Some((deadline, _, true)) = self.nodes[node].timer.take() {
+            self.nodes[node].liveness.on_wait(deadline, self.now);
+        }
+        self.set_timer(node);
+        self.poll(node);
     }
 
     /// Notes the pairs each live node has newly configured.
@@ -779,7 +885,7 @@ impl Sim {
                 n.frozen_until = n.frozen_until.max(self.now + length);
                 n.replayed += 1;
                 let thaw = n.frozen_until;
-                self.schedule(thaw, Event::Thaw { node });
+                self.schedule(thaw, node, Ev::Thaw { node });
                 self.schedule_freeze(node);
             }
             Event::Thaw { node } => self.thaw(node),
@@ -879,9 +985,8 @@ impl Sim {
     /// Whether nothing is left to happen but the hosts' freezes: no message or write in flight or
     /// held, and no timer set.
     fn quiet(&self) -> bool {
-        self.events
-            .values()
-            .all(|event| matches!(event, Event::Freeze { .. } | Event::Thaw { .. }))
+        self.net.in_flight().0 == 0
+            && self.writing == 0
             && self
                 .nodes
                 .iter()
@@ -936,6 +1041,11 @@ impl Sim {
         );
     }
 
+    /// The run's record: its digest and trace, for the run-twice check.
+    fn finish(self) -> hyper_sim::Record {
+        self.sim.finish()
+    }
+
     /// Runs until every live pair is configured; a pair that takes more heartbeats than any window
     /// holds unconfigured fails it (`unresolved`).
     fn run_until_configured(&mut self) {
@@ -947,6 +1057,29 @@ impl Sim {
             },
             None,
         );
+    }
+}
+
+/// The run-twice check (docs/sim.md §3.9): live peers configure and double their heartbeats, to one
+/// digest from the first seed twice and from that run's trace once.
+#[test]
+fn a_run_replays_from_its_seed_and_from_its_trace() {
+    let seed = seeds(10, 1).next().unwrap();
+    let record = hyper_sim::twice(seed, |source| {
+        let mut sim = Sim::of(3, MACOS, source);
+        sim.run_until_configured();
+        sim.run_until_doubled();
+        Ok::<_, hyper_sim::SimError>(sim.finish())
+    })
+    .unwrap();
+    assert!(!record.trace.is_empty());
+}
+
+/// The grid in parts per million is the trace tool's, point for point.
+#[test]
+fn the_grid_in_parts_per_million_is_the_grid() {
+    for (ppm, point) in GRID_PPM.iter().zip(GRID) {
+        assert_eq!(f64::from(*ppm), (point * 1e6).round(), "{point}");
     }
 }
 
@@ -1216,6 +1349,7 @@ fn a_restarted_peer(seed: u64) {
         run: 2,
         max_peers: 3,
         history: Exposure::new(),
+        resolution: RESOLUTION,
     })
     .unwrap();
     liveness.attach(1).unwrap();
@@ -1277,6 +1411,7 @@ fn a_superseded_runs_heartbeat_is_stale_and_its_restart_counts_once() {
         run: 1,
         max_peers: 1,
         history: Exposure::new(),
+        resolution: RESOLUTION,
     })
     .unwrap();
     node.attach(2).unwrap();
@@ -1347,6 +1482,7 @@ fn heartbeats_without_their_proof_are_refused() {
         run: 1,
         max_peers: 1,
         history: Exposure::new(),
+        resolution: RESOLUTION,
     })
     .unwrap();
     node.attach(2).unwrap();
@@ -1670,6 +1806,7 @@ fn a_sender_that_skips_slots_is_late_not_lost() {
         run: 1,
         max_peers: 1,
         history: Exposure::new(),
+        resolution: RESOLUTION,
     })
     .unwrap();
     node.attach(2).unwrap();
@@ -1760,6 +1897,7 @@ fn an_owner_held_in_its_own_write_is_no_lateness_of_its_timer() {
         run: 1,
         max_peers: 1,
         history: Exposure::new(),
+        resolution: RESOLUTION,
     })
     .unwrap();
     node.attach(2).unwrap();
@@ -1822,6 +1960,7 @@ fn a_wait_a_message_ends_past_its_wake_measures_the_wake() {
             run: 1,
             max_peers: 1,
             history: Exposure::new(),
+            resolution: RESOLUTION,
         })
         .unwrap();
         node.attach(2).unwrap();

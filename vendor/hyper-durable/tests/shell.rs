@@ -20,13 +20,13 @@ mod support;
 use std::task::Waker;
 
 use hyper_durable::{
-    Budget, Bytes, Cause, EntryRef, Fatal, Fault, LogStore, OpenError, Output, Owner, Point,
-    RamStore, Replica, ReplicaError, Settings, StateMachine, StoreView, Unbounded, Write,
+    Budget, Bytes, Cause, Compaction, EntryRef, Fatal, Fault, LogStore, OpenError, Output, Owner,
+    Point, RamStore, Replica, ReplicaError, Settings, StateMachine, StoreView, Unbounded, Write,
 };
 use hyper_raft::StorageError;
 use hyper_raft::proto::{
     ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState, Entry,
-    EntryType, HardState, Message, MessageType,
+    EntryType, HardState, Message, MessageType, Snapshot, SnapshotMetadata,
 };
 use support::cluster::settings;
 use support::{Kv, SimStore};
@@ -419,6 +419,9 @@ impl StateMachine for Boom {
     fn image(&mut self, into: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal> {
         self.0.image(into)
     }
+    fn image_bytes(&self) -> Option<u64> {
+        self.0.image_bytes()
+    }
     fn install(&mut self, image: &[u8], at: Point, c: &ConfState) -> Result<(), Fatal> {
         self.0.install(image, at, c)
     }
@@ -660,6 +663,7 @@ fn a_marked_member_of_two_takes_no_part_in_elections() {
     r.set_timing(hyper_raft::Timing {
         span: std::time::Duration::from_millis(1),
         round: std::time::Duration::from_millis(1),
+        election: std::time::Duration::from_millis(2),
     })
     .unwrap();
     r.suspect(1).unwrap();
@@ -837,6 +841,73 @@ fn a_leader_applies_its_own_term_before_its_write_is_durable() {
         pump(&mut r);
         assert!(r.machine().now.entries.iter().any(|(_, _, d)| d == b"fast"));
     }
+}
+
+/// The owner's policy reaches the core through the replica: the member's election priority, in
+/// force once it has a term, and a member's window, refused for a member the configuration does
+/// not name; and the owner reads its budget there, holding what the replica charged.
+#[test]
+fn the_owners_priority_and_windows_reach_the_core_and_its_budget_reads_what_is_charged() {
+    let mut r = led(2, false);
+    r.set_priority(7);
+    assert_eq!(r.core().raft.priority_in_force(), 7);
+    assert!(r.set_inflight_bytes(2, 4096));
+    let progress = r.core().raft.tracker().get(2).unwrap();
+    assert_eq!(progress.inflights.byte_cap(), 4096);
+    assert!(
+        !r.set_inflight_bytes(9, 4096),
+        "a member the configuration does not name"
+    );
+    let mut b = sole(1, Bytes::new(1 << 20), |_| {});
+    let used = b.budget_mut().used();
+    assert_eq!(used, b.charged());
+}
+
+/// A read a quorum confirmed at an index the member has not applied waits in the replica, counted
+/// by `reads_held`, and is given out by the drive that applies through its index: a leader whose
+/// followers hold its entry before its own disk does confirms the read at the commit its own write
+/// has not reached (`Config::apply_unpersisted` off).
+#[test]
+fn a_read_confirmed_ahead_of_the_apply_is_held_until_the_apply_reaches_it() {
+    let mut r = led(3, false);
+    r.propose(Vec::new(), b"x".to_vec()).unwrap();
+    let mut out = Output::default();
+    r.drive(now(), waker(), &mut out).unwrap();
+    acknowledge(&mut r, 2);
+    acknowledge(&mut r, 3);
+    let commit = r.core().raft.log().committed();
+    assert!(
+        commit > r.applied().index,
+        "the leader's own write is not durable"
+    );
+    r.read(b"r".to_vec()).unwrap();
+    out.clear();
+    r.drive(now(), waker(), &mut out).unwrap();
+    let rounds: Vec<Message> = out
+        .messages
+        .iter()
+        .filter(|m| m.msg_type == MessageType::MsgHeartbeat)
+        .cloned()
+        .collect();
+    assert!(!rounds.is_empty(), "the read's round of heartbeats left");
+    for m in rounds {
+        r.step(Message {
+            msg_type: MessageType::MsgHeartbeatResponse,
+            from: m.to,
+            to: 1,
+            term: m.term,
+            context: m.context.clone(),
+            ..Message::default()
+        })
+        .unwrap();
+    }
+    out.clear();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert!(out.reads.is_empty());
+    assert_eq!(r.reads_held(), 1);
+    let out = pump(&mut r);
+    assert_eq!(out.reads, vec![(b"r".to_vec(), commit)]);
+    assert_eq!(r.reads_held(), 0);
 }
 
 /// The owner's clock in nanoseconds, simulated: each reading a nanosecond after the one before, so
@@ -1120,6 +1191,7 @@ fn a_replica_on_ticks_elects_by_its_owners_ticks_and_hears_no_detector() {
         r.set_timing(hyper_raft::Timing {
             span: std::time::Duration::from_millis(100),
             round: std::time::Duration::from_millis(10),
+            election: std::time::Duration::from_millis(110),
         }),
         Err(ReplicaError::Refused(_))
     ));
@@ -1410,4 +1482,720 @@ fn a_drive_applies_one_page_and_the_next_drive_the_next() {
         r.machine().now.entries.last().unwrap().2.len(),
         3 * page as usize
     );
+}
+
+/// A write refused for room is made again from what the core holds, but never with a snapshot no
+/// `Ready` gave: the state machine has not installed it, and the log would start past it (I8), so
+/// that a member stopped before that `Ready` would not open. A member whose append was out when
+/// its log refused it, and that took a leader's snapshot meanwhile, makes again only its hard
+/// state; the snapshot's own `Ready` installs it, then writes it. Found by the simulation at seed
+/// 600 of five voters at depth one, once R-3's out-of-order acknowledgement (R17) changed its
+/// schedules.
+#[test]
+fn a_write_made_again_never_starts_the_log_past_the_state_machine() {
+    let configuration = voters(&[1, 2, 3]);
+    let mut r: Sim = Replica::open(
+        &settings(2, 7),
+        SimStore::new(1),
+        Kv::new(configuration.clone(), false),
+        Unbounded,
+    )
+    .unwrap();
+    let entries = (1..=3)
+        .map(|index| Entry {
+            index,
+            term: 1,
+            data: vec![7; 8],
+            ..Entry::default()
+        })
+        .collect();
+    r.step(Message {
+        msg_type: MessageType::MsgAppend,
+        from: 1,
+        to: 2,
+        term: 1,
+        entries,
+        ..Message::default()
+    })
+    .unwrap();
+    let mut out = Output::default();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert_eq!(r.log_mut().pending(), 1, "the append's write is out");
+    // The log will refuse it; meanwhile the leader's image of eight entries arrives.
+    r.log_mut().refuse = Some(Fault::Room("the group's retained bound"));
+    let mut leader = Kv::new(configuration.clone(), false);
+    for index in 1..=8u64 {
+        leader.now.entries.push((index, 1, vec![index as u8; 8]));
+    }
+    leader.now.applied = Point { index: 8, term: 1 };
+    let mut data = Vec::new();
+    leader.image(&mut data).unwrap();
+    r.step(Message {
+        msg_type: MessageType::MsgSnapshot,
+        from: 1,
+        to: 2,
+        term: 1,
+        snapshot: Some(Box::new(Snapshot {
+            data,
+            metadata: Some(SnapshotMetadata {
+                conf_state: Some(configuration),
+                index: 8,
+                term: 1,
+            }),
+        })),
+        ..Message::default()
+    })
+    .unwrap();
+    assert!(r.log_mut().make_durable(), "refused");
+    out.clear();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert!(r.is_stalled());
+    r.resume();
+    for _ in 0..16 {
+        out.clear();
+        r.drive(now(), waker(), &mut out).unwrap();
+        while r.log_mut().make_durable() {
+            let start = r.log_mut().disk.start.index;
+            let machine = r.machine().durable.applied.index;
+            assert!(
+                start <= machine,
+                "the log starts at {start}, past the state machine's {machine} (I8)"
+            );
+        }
+    }
+    assert_eq!(r.log_mut().disk.start.index, 8, "the snapshot's own write");
+    assert_eq!(r.machine().durable.applied.index, 8);
+}
+
+/// The window a leader keeps in flight to a member is twice what the transport says the path to it
+/// carries in a round trip (mantle note 32 R16, `hyper_timing::inflight_window`): set as the owner
+/// says it, for a member of the group only.
+#[test]
+fn the_window_to_a_member_is_twice_what_its_path_carries() {
+    let mut s = settings(1, 7);
+    s.core.max_inflight_msgs = usize::MAX;
+    s.core.max_inflight_bytes = 4_096;
+    let mut r = Replica::open(
+        &s,
+        SimStore::new(1),
+        Kv::new(voters(&[1, 2, 3]), false),
+        Unbounded,
+    )
+    .unwrap();
+    elect_by_hand(&mut r);
+    let window = |r: &Sim| r.core().raft.tracker().get(2).unwrap().inflights.byte_cap();
+    assert_eq!(
+        window(&r),
+        4_096,
+        "the settings' bound, until the path is measured"
+    );
+    assert!(r.set_carriage(2, 125_000).unwrap());
+    assert_eq!(window(&r), 250_000);
+    assert!(!r.set_carriage(9, 125_000).unwrap(), "no member 9");
+}
+
+/// The shell says where catching up a learner stands, as the core judges it (thesis §4.2.1, mantle
+/// note 32 R13): a voter is ready, a stranger is no member, a member that does not lead is told so,
+/// and a learner the leader just added is staged.
+#[test]
+fn the_shell_says_where_catching_up_a_learner_stands() {
+    let mut r = led(1, false);
+    acknowledge(&mut r, 2);
+    acknowledge(&mut r, 3);
+    pump(&mut r);
+    assert_eq!(r.catch_up(2).unwrap(), hyper_raft::CatchUp::Ready);
+    assert_eq!(r.catch_up(9).unwrap(), hyper_raft::CatchUp::NotMember);
+    r.change(Vec::new(), &change(ConfChangeType::AddLearnerNode, 4))
+        .unwrap();
+    pump(&mut r);
+    acknowledge(&mut r, 2);
+    pump(&mut r);
+    assert!(r.configuration().learners.contains(&4));
+    assert_eq!(r.catch_up(4).unwrap(), hyper_raft::CatchUp::Pending);
+    let mut follower: Sim = Replica::open(
+        &settings(2, 7),
+        SimStore::new(1),
+        Kv::new(voters(&[1, 2, 3]), false),
+        Unbounded,
+    )
+    .unwrap();
+    assert_eq!(
+        follower.catch_up(4).unwrap(),
+        hyper_raft::CatchUp::NotLeader
+    );
+}
+
+// The thesis's compaction rule as the shell's policy (mantle note 32 R22; Ongaro's thesis §5.1.2;
+// slates `fold.rs`; `docs/durable.md` §6.1).
+
+/// The bytes the core counts for an entry of `data` bytes and no context.
+fn entry_of(data: usize) -> u64 {
+    (hyper_raft::wire::ENTRY_FIXED_BYTES + data) as u64
+}
+
+/// The bytes of the image the state machine makes now: the shell's own after a compaction that
+/// nothing was applied since.
+fn image_of(r: &mut Sim) -> u64 {
+    let mut image = Vec::new();
+    r.machine_mut().image(&mut image).unwrap();
+    image.len() as u64
+}
+
+/// Proposes entries of eight bytes to a sole voter whose log holds `held` bytes applied until it is
+/// due by `rule`, checked after each: not an entry before what it holds exceeds `threshold`.
+fn grow_until_due(r: &mut Sim, rule: Compaction, mut held: u64, threshold: u64) {
+    for _ in 0..100_000 {
+        r.propose(Vec::new(), vec![7; 8]).unwrap();
+        pump(r);
+        held += entry_of(8);
+        let due = r.compaction_due(rule);
+        assert_eq!(
+            due,
+            held > threshold,
+            "{held} bytes held against {threshold}"
+        );
+        if due {
+            return;
+        }
+    }
+    panic!("never due");
+}
+
+/// The thesis's rule (§5.1.2): a log is due once the applied entries it holds exceed the image it
+/// was last compacted to times the owner's expansion, and not an entry before; compacted, it holds
+/// none, and the threshold is the new image's.
+#[test]
+fn a_log_is_due_once_its_applied_entries_outgrow_the_image_by_the_expansion() {
+    let rule = Compaction { expansion: 2 };
+    let mut r = sole(1, Unbounded, |_| {});
+    for i in 0..4u8 {
+        r.propose(Vec::new(), vec![i; 8]).unwrap();
+    }
+    pump(&mut r);
+    assert!(r.compact(0, now(), waker()).unwrap());
+    pump(&mut r);
+    assert!(
+        !r.compaction_due(rule),
+        "compacted, it holds nothing applied"
+    );
+    let image = image_of(&mut r);
+    grow_until_due(&mut r, rule, 0, 2 * image);
+    assert!(r.compact(0, now(), waker()).unwrap());
+    pump(&mut r);
+    assert!(!r.compaction_due(rule), "compacted again");
+    let grown = image_of(&mut r);
+    assert!(grown > image, "the new image holds what was applied since");
+    grow_until_due(&mut r, rule, 0, 2 * grown);
+}
+
+/// Before its log is first compacted, a member's log is weighed against the image of what it
+/// opened with, as its machine states it: a group formed holding state, as a range split from
+/// another is, is not due at its first entries, as one formed empty is.
+#[test]
+fn a_log_never_compacted_is_weighed_against_the_state_it_opened_with() {
+    let rule = Compaction { expansion: 1 };
+    let empty = sole(1, Unbounded, |_| {});
+    assert!(
+        empty.compaction_due(rule),
+        "the leader's first entry outgrows an empty machine's image"
+    );
+    let mut kv = Kv::new(voters(&[1]), false);
+    for i in 0..64u8 {
+        kv.now.entries.push((0, 0, vec![i; 32]));
+    }
+    kv.durable = kv.now.clone();
+    let image = kv.image_bytes().unwrap();
+    let mut r = Replica::open(&settings(1, 7), SimStore::new(1), kv, Unbounded).unwrap();
+    r.campaign().unwrap();
+    pump(&mut r);
+    assert!(r.is_leader());
+    // The leader's first entry is held, applied.
+    grow_until_due(&mut r, rule, entry_of(0), image);
+}
+
+/// A member that reopens counts the applied entries its log holds, against the image of what it
+/// opened with: a restart forgets nothing the log holds.
+#[test]
+fn a_member_that_reopens_counts_what_its_log_holds() {
+    let rule = Compaction { expansion: 2 };
+    let mut r = sole(1, Unbounded, |_| {});
+    for i in 0..4u8 {
+        r.propose(Vec::new(), vec![i; 8]).unwrap();
+    }
+    pump(&mut r);
+    assert!(r.compact(0, now(), waker()).unwrap());
+    pump(&mut r);
+    let image = image_of(&mut r);
+    let mut held = 0;
+    while held + entry_of(8) <= image {
+        r.propose(Vec::new(), vec![7; 8]).unwrap();
+        pump(&mut r);
+        held += entry_of(8);
+    }
+    assert!(!r.compaction_due(rule));
+    r.machine_mut().persist().unwrap();
+    let disk = r.log_mut().disk.clone();
+    let machine = r.into_machine();
+    let mut r = Replica::open(
+        &settings(1, 7),
+        SimStore::from_disk(disk, 1),
+        machine,
+        Unbounded,
+    )
+    .unwrap();
+    // Its log compacted, the member made an image at open, of everything applied.
+    let image = image_of(&mut r);
+    r.campaign().unwrap();
+    pump(&mut r);
+    assert!(r.is_leader());
+    // What the log held, and the leader's first entry of its new term.
+    grow_until_due(&mut r, rule, held + entry_of(0), 2 * image);
+}
+
+/// A compaction counts what the log goes on holding past its new start once the start is durable,
+/// the entries a leader applied before its own write of them is durable among them (§4.2), which
+/// the store does not hold yet; while the start is out, the log is not due, for a compaction waits
+/// for it.
+#[test]
+fn a_compaction_counts_what_a_leader_applied_before_its_write_is_durable() {
+    let rule = Compaction { expansion: 0 };
+    let mut r = led(3, true);
+    acknowledge(&mut r, 2);
+    acknowledge(&mut r, 3);
+    pump(&mut r);
+    assert!(r.compact(0, now(), waker()).unwrap());
+    pump(&mut r);
+    assert!(
+        !r.compaction_due(rule),
+        "compacted, it holds nothing applied"
+    );
+    for i in 0..4u8 {
+        r.propose(Vec::new(), vec![i; 8]).unwrap();
+    }
+    pump(&mut r);
+    acknowledge(&mut r, 2);
+    acknowledge(&mut r, 3);
+    pump(&mut r);
+    assert_eq!(r.compactable_bytes(), 4 * entry_of(8));
+    assert!(r.compact(0, now(), waker()).unwrap());
+    assert!(!r.compaction_due(rule), "a start out");
+    // Three more, applied on the followers' word while the leader's write of them is out.
+    for i in 0..3u8 {
+        r.propose(Vec::new(), vec![i; 8]).unwrap();
+    }
+    let mut out = Output::default();
+    r.drive(now(), waker(), &mut out).unwrap();
+    acknowledge(&mut r, 2);
+    acknowledge(&mut r, 3);
+    out.clear();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert_eq!(
+        r.compactable_bytes(),
+        7 * entry_of(8),
+        "the start not yet durable"
+    );
+    // The start durable, and the write of the three still out.
+    assert!(r.log_mut().make_durable());
+    out.clear();
+    r.drive(now(), waker(), &mut out).unwrap();
+    let disk = r.log_mut().disk.last();
+    assert_eq!(r.applied().index, disk + 3, "three applied past the disk");
+    assert_eq!(r.compactable_bytes(), 3 * entry_of(8));
+    assert!(
+        r.compaction_due(rule),
+        "the three applied past the new start are held"
+    );
+}
+
+/// A compaction whose start the log refuses changes nothing the rule counts: the log is still
+/// due, and the owner asks again, as a refused compaction is its to ask (§2.4).
+#[test]
+fn a_compaction_the_log_refused_leaves_the_log_due() {
+    let rule = Compaction { expansion: 0 };
+    let mut r = sole(1, Unbounded, |_| {});
+    for i in 0..4u8 {
+        r.propose(Vec::new(), vec![i; 8]).unwrap();
+    }
+    pump(&mut r);
+    let held = r.compactable_bytes();
+    assert_eq!(held, entry_of(0) + 4 * entry_of(8));
+    assert!(r.compaction_due(rule));
+    r.log_mut().refuse = Some(Fault::Room("the group's retained bound"));
+    assert!(r.compact(0, now(), waker()).unwrap());
+    pump(&mut r);
+    assert!(r.is_stalled());
+    assert_eq!(
+        r.compactable_bytes(),
+        held,
+        "the refused start moved nothing"
+    );
+    assert!(r.compaction_due(rule), "still due");
+    assert!(r.compact(0, now(), waker()).unwrap());
+    pump(&mut r);
+    assert_eq!(r.compactable_bytes(), 0);
+    assert!(!r.compaction_due(rule));
+}
+
+/// A leader waits for a member that lacks what it applied while its log holds no more than twice
+/// the threshold, so that the member is sent entries, not an image; past twice the threshold the
+/// log is due with the member still behind, and with the member holding everything, at the
+/// threshold.
+#[test]
+fn a_leader_waits_for_a_member_behind_while_its_log_holds_less_than_twice_the_threshold() {
+    let rule = Compaction { expansion: 1 };
+    let mut r = led(1, false);
+    acknowledge(&mut r, 2);
+    acknowledge(&mut r, 3);
+    pump(&mut r);
+    assert!(r.compact(0, now(), waker()).unwrap());
+    pump(&mut r);
+    let image = image_of(&mut r);
+    // Member 2 holds every entry; member 3 answers nothing until it is told to.
+    let propose = |r: &mut Sim| {
+        r.propose(Vec::new(), vec![1; 8]).unwrap();
+        pump(r);
+        acknowledge(r, 2);
+        pump(r);
+    };
+    let mut held = 0;
+    while held + entry_of(8) <= 2 * image {
+        propose(&mut r);
+        held += entry_of(8);
+        assert!(
+            !r.compaction_due(rule),
+            "{held} bytes held, the image {image}, member 3 behind"
+        );
+    }
+    propose(&mut r);
+    assert!(
+        r.compaction_due(rule),
+        "past twice the threshold, member 3 behind"
+    );
+    acknowledge(&mut r, 3);
+    pump(&mut r);
+    assert!(r.compact(0, now(), waker()).unwrap());
+    pump(&mut r);
+    let image = image_of(&mut r);
+    let mut held = 0;
+    while held <= image {
+        propose(&mut r);
+        held += entry_of(8);
+        assert!(
+            !r.compaction_due(rule),
+            "{held} bytes held, member 3 behind"
+        );
+    }
+    acknowledge(&mut r, 3);
+    pump(&mut r);
+    assert!(r.compaction_due(rule), "member 3 holds it all");
+}
+
+/// Member `member` answers what the leader sends it until it is sent nothing more: each append by
+/// the last entry it carries, each image, once its arrival is reported, by the image's point. The
+/// images it was sent.
+fn take_all(r: &mut Sim, mut out: Output<(u64, Vec<u8>)>, member: u64) -> usize {
+    let mut images = 0;
+    for _ in 0..1_000 {
+        let mut last = None;
+        for m in out.messages.iter().filter(|m| m.to == member) {
+            match m.msg_type {
+                MessageType::MsgAppend => {
+                    last = last.max(Some(m.index + m.entries.len() as u64));
+                }
+                MessageType::MsgSnapshot => {
+                    images += 1;
+                    let point = hyper_raft::proto::snapshot_index(m.snapshot.as_ref().unwrap());
+                    r.report_snapshot(member, true).unwrap();
+                    last = last.max(Some(point));
+                }
+                _ => {}
+            }
+        }
+        let Some(index) = last else {
+            return images;
+        };
+        let term = r.term();
+        r.step(Message {
+            msg_type: MessageType::MsgAppendResponse,
+            from: member,
+            to: 1,
+            term,
+            index,
+            ..Message::default()
+        })
+        .unwrap();
+        out = pump(r);
+    }
+    panic!("member {member} was sent appends without end");
+}
+
+/// slates' measurement (`fold.rs`, 2026-09-28) on this shell: a leader of three whose third voter
+/// takes each round a round behind the majority, as a member on a slower path does, its window
+/// (eight appends) less than a round. By the rule, the leader waits for the third while the log
+/// holds less than twice the threshold, and its compactions send the third entries, never an image;
+/// compacting at the same rounds the moment the majority holds them, slates' first design, sends
+/// the third an image at every compaction in place of the rest of the round it lacks.
+#[test]
+fn a_leader_that_waits_for_its_followers_sends_them_entries_not_images() {
+    const ROUNDS: usize = 12;
+    const BATCH: usize = 16;
+    let rule = Compaction { expansion: 1 };
+    let mut by_rule = Vec::new();
+    for waits in [true, false] {
+        let mut r = led(1, false);
+        for i in 0..BATCH as u8 {
+            r.propose(Vec::new(), vec![i; 8]).unwrap();
+        }
+        pump(&mut r);
+        acknowledge(&mut r, 2);
+        acknowledge(&mut r, 3);
+        pump(&mut r);
+        assert!(r.compact(0, now(), waker()).unwrap());
+        pump(&mut r);
+        let mut compactions = Vec::new();
+        let mut images = 0;
+        for round in 0..ROUNDS {
+            for _ in 0..BATCH {
+                r.propose(Vec::new(), vec![round as u8; 8]).unwrap();
+            }
+            let mut out = pump(&mut r);
+            // The majority holds the round: committed and applied.
+            acknowledge(&mut r, 2);
+            out.messages.append(&mut pump(&mut r).messages);
+            if waits {
+                assert!(
+                    !r.compaction_due(rule),
+                    "round {round}: member 3 lacks it, the log within twice the threshold"
+                );
+            } else if by_rule.contains(&round) {
+                assert!(r.compact(0, now(), waker()).unwrap());
+                compactions.push(round);
+                out.messages.append(&mut pump(&mut r).messages);
+            }
+            // The third takes the round, a round behind the majority.
+            images += take_all(&mut r, out, 3);
+            if waits && r.compaction_due(rule) {
+                assert!(r.compact(0, now(), waker()).unwrap());
+                compactions.push(round);
+                pump(&mut r);
+            }
+        }
+        if waits {
+            // The image grows with what is applied (the test machine keeps every entry), so each
+            // compaction comes later than the one before.
+            assert_eq!(compactions, [1, 4, 10]);
+            assert_eq!(images, 0, "by the rule");
+            by_rule = compactions;
+        } else {
+            assert_eq!(compactions, by_rule);
+            assert_eq!(images, by_rule.len(), "an image at every compaction");
+        }
+    }
+}
+
+/// A member that installs its leader's image weighs its log against that image: it holds nothing
+/// applied past the image's point, whatever it applied before, and is due once the entries it
+/// applies after the image outgrow it.
+#[test]
+fn a_member_that_installs_an_image_weighs_its_log_against_it() {
+    let rule = Compaction { expansion: 1 };
+    let configuration = voters(&[1, 2, 3]);
+    let mut r: Sim = Replica::open(
+        &settings(2, 7),
+        SimStore::new(1),
+        Kv::new(configuration.clone(), false),
+        Unbounded,
+    )
+    .unwrap();
+    let append = |r: &mut Sim, index: u64, count: u64| {
+        let entries = (1..=count)
+            .map(|i| Entry {
+                index: index + i,
+                term: 1,
+                data: vec![7; 8],
+                ..Entry::default()
+            })
+            .collect();
+        r.step(Message {
+            msg_type: MessageType::MsgAppend,
+            from: 1,
+            to: 2,
+            term: 1,
+            log_term: u64::from(index > 0),
+            index,
+            entries,
+            commit: index + count,
+            ..Message::default()
+        })
+        .unwrap();
+        pump(r);
+    };
+    append(&mut r, 0, 4);
+    assert_eq!(r.applied().index, 4);
+    // The leader's image of 64 entries of 32 bytes, at index 64 of term 1.
+    let mut leader = Kv::new(configuration.clone(), false);
+    for i in 1..=64u64 {
+        leader.now.entries.push((i, 1, vec![i as u8; 32]));
+    }
+    leader.now.applied = Point { index: 64, term: 1 };
+    let mut data = Vec::new();
+    leader.image(&mut data).unwrap();
+    let image = data.len() as u64;
+    r.step(Message {
+        msg_type: MessageType::MsgSnapshot,
+        from: 1,
+        to: 2,
+        term: 1,
+        snapshot: Some(Box::new(Snapshot {
+            data,
+            metadata: Some(SnapshotMetadata {
+                conf_state: Some(configuration),
+                index: 64,
+                term: 1,
+            }),
+        })),
+        ..Message::default()
+    })
+    .unwrap();
+    pump(&mut r);
+    assert_eq!(r.applied().index, 64);
+    let mut held = 0;
+    for index in 64..10_000 {
+        assert_eq!(
+            r.compaction_due(rule),
+            held > image,
+            "{held} bytes held against the image's {image}"
+        );
+        if held > image {
+            return;
+        }
+        append(&mut r, index, 1);
+        held += entry_of(8);
+    }
+    panic!("never due");
+}
+
+/// A compaction made durable while an install the log refused waits to be made again counts from
+/// the install's point, where the log will start: the store holds nothing past what the install
+/// replaces, and the count reads none of it. Found by the simulation's check of the count at seed
+/// 943 of five voters at depth one, where the walk asked the store for entries the image holds.
+#[test]
+fn a_compaction_behind_an_install_made_again_counts_from_the_image() {
+    let configuration = voters(&[1, 2, 3]);
+    let mut r: Sim = Replica::open(
+        &settings(2, 7),
+        SimStore::new(1),
+        Kv::new(configuration.clone(), false),
+        Unbounded,
+    )
+    .unwrap();
+    r.step(Message {
+        msg_type: MessageType::MsgAppend,
+        from: 1,
+        to: 2,
+        term: 1,
+        entries: vec![Entry {
+            index: 1,
+            term: 1,
+            data: vec![7; 8],
+            ..Entry::default()
+        }],
+        commit: 1,
+        ..Message::default()
+    })
+    .unwrap();
+    pump(&mut r);
+    assert_eq!(r.applied().index, 1);
+    assert_eq!(r.compactable_bytes(), entry_of(8));
+    // The leader's image of twelve entries, whose install the log refuses.
+    let mut leader = Kv::new(configuration.clone(), false);
+    for index in 1..=12u64 {
+        leader.now.entries.push((index, 1, vec![index as u8; 8]));
+    }
+    leader.now.applied = Point { index: 12, term: 1 };
+    let mut data = Vec::new();
+    leader.image(&mut data).unwrap();
+    r.step(Message {
+        msg_type: MessageType::MsgSnapshot,
+        from: 1,
+        to: 2,
+        term: 1,
+        snapshot: Some(Box::new(Snapshot {
+            data,
+            metadata: Some(SnapshotMetadata {
+                conf_state: Some(configuration),
+                index: 12,
+                term: 1,
+            }),
+        })),
+        ..Message::default()
+    })
+    .unwrap();
+    let mut out = Output::default();
+    r.drive(now(), waker(), &mut out).unwrap();
+    r.log_mut().refuse = Some(Fault::Room("the group's retained bound"));
+    assert!(r.log_mut().make_durable(), "the install refused");
+    out.clear();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert!(r.is_stalled());
+    assert_eq!(r.applied().index, 12, "installed in the state machine");
+    // A compaction while stalled, of what the log holds before the image.
+    assert!(r.compact(2, now(), waker()).unwrap());
+    assert!(r.log_mut().make_durable());
+    out.clear();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert_eq!(r.log_mut().disk.start.index, 1);
+    assert_eq!(
+        r.compactable_bytes(),
+        0,
+        "the log will start at the image's point"
+    );
+    r.resume();
+    pump(&mut r);
+    assert_eq!(r.log_mut().disk.start.index, 12, "the install made again");
+    assert_eq!(r.compactable_bytes(), 0);
+}
+
+/// slates' long history (`measure_a_long_council_history`, 2026-09-28) on this shell: a sole voter
+/// proposes one entry at a time and compacts whenever the rule says it is due, and its log never
+/// holds more than the expansion times the image it was compacted to and the entry that took it
+/// past; without compaction it holds every entry. Its state either keeps every entry, so that its
+/// image grows with the log, or one value, so that it does not. The table is
+/// `docs/benchmarks.md`'s, "When a log is compacted (R22)".
+#[test]
+fn a_sole_voter_that_compacts_when_due_holds_its_log_within_the_rule() {
+    for (register, expansion) in [(false, 1), (false, 4), (true, 1), (true, 4)] {
+        let rule = Compaction { expansion };
+        for proposals in [250u64, 1_000, 4_000] {
+            let mut r = sole(1, Unbounded, |_| {});
+            r.machine_mut().register = register;
+            let mut image = r.machine().image_bytes().unwrap();
+            let mut images = 0;
+            let mut compactions = 0;
+            for i in 0..proposals {
+                r.propose(Vec::new(), i.to_le_bytes().to_vec()).unwrap();
+                pump(&mut r);
+                assert!(
+                    r.compactable_bytes() <= expansion * image + entry_of(8),
+                    "{} bytes held against the image's {image}",
+                    r.compactable_bytes()
+                );
+                if r.compaction_due(rule) {
+                    assert!(r.compact(0, now(), waker()).unwrap());
+                    pump(&mut r);
+                    image = image_of(&mut r);
+                    images += image;
+                    compactions += 1;
+                }
+            }
+            println!(
+                "register {register}, expansion {expansion}, {proposals} proposals: {} entries \
+                 and {} bytes held, the image {image} bytes, {compactions} compactions, {images} \
+                 bytes of images written against {} of entries",
+                r.log_mut().disk.entries.len(),
+                r.compactable_bytes(),
+                (proposals + 1) * entry_of(8)
+            );
+        }
+    }
 }

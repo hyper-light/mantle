@@ -22,6 +22,18 @@ pub fn encode(rows: &[Row]) -> Option<Vec<u8>> {
     Some(w.into_vec())
 }
 
+/// The bytes [`encode`] writes for `rows`, without writing them: the format byte, the count, each
+/// row's two lengths and its key and value, and the checksum.
+pub fn encoded_len(rows: &[Row]) -> Option<u64> {
+    rows.iter().try_fold(1u64 + 8 + 4, |bytes, (k, v)| {
+        let row = u64::try_from(k.len())
+            .ok()?
+            .checked_add(u64::try_from(v.len()).ok()?)?
+            .checked_add(4 + 4)?;
+        bytes.checked_add(row)
+    })
+}
+
 pub fn decode(bytes: &[u8]) -> Option<Vec<Row>> {
     let body_len = bytes.len().checked_sub(4)?;
     let (body, crc) = bytes.split_at(body_len);
@@ -63,5 +75,17 @@ mod tests {
         bad[9] ^= 1;
         assert_eq!(decode(&bad), None);
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
+    }
+
+    /// `encoded_len` counts what `encode` writes, for no rows, empty rows and rows of every
+    /// length a byte's worth apart.
+    #[test]
+    fn the_encoded_length_is_what_encode_writes() {
+        let mut rows = Vec::new();
+        for n in 0..40usize {
+            let len = encode(&rows).unwrap().len() as u64;
+            assert_eq!(encoded_len(&rows), Some(len), "{n} rows");
+            rows.push((vec![7u8; n % 5], vec![9u8; n * 13]));
+        }
     }
 }

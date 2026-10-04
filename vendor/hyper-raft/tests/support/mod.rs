@@ -598,6 +598,9 @@ pub struct Settings {
     /// Whether a heartbeat's answer says nothing of the member's log and
     /// frees a full window's first message, as in `raft-rs`.
     pub bare_answers: bool,
+    /// Whether a member keeps nothing of an append that arrives ahead of a
+    /// hole in its log, as in `raft-rs` (`Ahead::Refused`).
+    pub refuse_ahead: bool,
     /// Whether the group has the fast track.
     pub fast: bool,
     /// Whether this core's members are driven by `RawNode::ready_in_place`,
@@ -616,6 +619,10 @@ pub struct Settings {
     /// schedule's clock by [`TICK_NS`] and wakes the member, and the
     /// schedule's detectors suspect and trust. `raft-rs` has only ticks.
     pub suspicion: bool,
+    /// Whether hyper-check's oracles judge the schedule in place of the checks the harness makes
+    /// as it goes (`Cluster::report`, `Cluster::check_durable`, `Lagged`'s): a run with a planted
+    /// defect is judged by the oracles alone, so that what catches the defect is theirs.
+    pub judged: bool,
 }
 
 /// A member's clock, in the schedule's nanoseconds, by suspicion: the span a
@@ -631,11 +638,32 @@ pub const ROUND_NS: u64 = 5_000;
 /// A tick's advance of the clock ([`SPAN_NS`]).
 pub const TICK_NS: u64 = 500;
 
+/// The largest message the harness states its network carries: eight MiB, twice the largest
+/// append [`Settings::shell`] sends (four MiB and a KiB of entries).
+pub const MESSAGE: usize = 8 << 20;
+/// The bytes the harness states each of a member's queues may hold: four of its messages, room
+/// for the entries of one many times over, as `Limits::derive` asks.
+pub const MEMORY: usize = 4 * MESSAGE;
+
+/// What the harness states of a member of a group of `members` with `depth` writes out at once
+/// (`hyper_raft::Limits::derive`).
+pub fn limits(members: usize, depth: usize) -> hyper_raft::Limits {
+    hyper_raft::Limits::derive(hyper_raft::Stated {
+        message: MESSAGE,
+        members,
+        memory: MEMORY,
+        depth,
+    })
+    .expect("the harness's statement gives its bounds")
+}
+
 /// The timing the schedule gives each member that elects by suspicion.
 pub fn timing() -> hyper_raft::Timing {
     hyper_raft::Timing {
         span: std::time::Duration::from_nanos(SPAN_NS),
         round: std::time::Duration::from_nanos(ROUND_NS),
+        // A delay within the span and one vote round.
+        election: std::time::Duration::from_nanos(SPAN_NS + ROUND_NS),
     }
 }
 impl Settings {
@@ -654,11 +682,13 @@ impl Settings {
             by_length: true,
             round_each: true,
             bare_answers: true,
+            refuse_ahead: true,
             fast: false,
             in_place: false,
             depth: 1,
             apply_unpersisted: false,
             suspicion: false,
+            judged: false,
         }
     }
     /// The same, electing by suspicion.
@@ -674,6 +704,7 @@ impl Settings {
             by_length: false,
             round_each: false,
             bare_answers: false,
+            refuse_ahead: false,
             // A few of a schedule's entries: the window fills by its
             // bytes long before it fills by its places.
             max_inflight_bytes: 256,
@@ -694,7 +725,8 @@ pub trait Replica: Sized {
     /// as the schedule's persistence steps say ([`Lagged`]); the others
     /// persist each `Ready` as they take it.
     const LAGGED: bool = false;
-    fn open(id: u64, store: Store, settings: &Settings, seed: u64) -> Self;
+    /// The member `id` of a group of `members`, opened on `store`.
+    fn open(id: u64, store: Store, settings: &Settings, seed: u64, members: usize) -> Self;
     fn id(&self) -> u64;
     fn store(&self) -> &Store;
     fn store_mut(&mut self) -> &mut Store;
@@ -731,6 +763,8 @@ pub trait Replica: Sized {
         None
     }
     fn set_timeout(&mut self, ticks: usize);
+    /// Plants `mutant` in the member (`hyper_raft::Mutant`); raft-rs has none.
+    fn plant(&mut self, _mutant: Option<hyper_raft::Mutant>) {}
     fn drain(&mut self) -> Output;
     /// A persistence step ([`Step`]); true when it did something.
     fn persist(&mut self, _step: Step) -> bool {
@@ -856,7 +890,7 @@ impl Old {
     }
 }
 impl Replica for Old {
-    fn open(id: u64, mut store: Store, settings: &Settings, _seed: u64) -> Self {
+    fn open(id: u64, mut store: Store, settings: &Settings, _seed: u64, _members: usize) -> Self {
         store.0.reopen();
         let applied = store.0.snapshot_index();
         let app = if applied == 0 {
@@ -1223,7 +1257,7 @@ impl New {
     }
 }
 impl Replica for New {
-    fn open(id: u64, mut store: Store, settings: &Settings, seed: u64) -> Self {
+    fn open(id: u64, mut store: Store, settings: &Settings, seed: u64, members: usize) -> Self {
         store.0.reopen();
         let applied = store.0.snapshot_index();
         let app = if applied == 0 {
@@ -1257,6 +1291,11 @@ impl Replica for New {
             } else {
                 hyper_raft::HeartbeatAnswers::Position
             },
+            ahead: if settings.refuse_ahead {
+                hyper_raft::Ahead::Refused
+            } else {
+                hyper_raft::Ahead::Kept
+            },
             fast: settings.fast,
             apply_unpersisted: settings.apply_unpersisted,
             elections: if settings.suspicion {
@@ -1265,12 +1304,8 @@ impl Replica for New {
                 hyper_raft::Elections::Ticks
             },
             seed,
-            limits: hyper_raft::Limits {
-                readies_in_flight: settings.depth,
-                ..hyper_raft::Limits::default()
-            },
             lost: store.0.mark(),
-            ..hyper_raft::Config::new(id)
+            ..hyper_raft::Config::new(id, limits(members, settings.depth))
         };
         let mut raw = hyper_raft::RawNode::new(&config, store).expect("hyper-raft opens");
         if settings.suspicion {
@@ -1349,6 +1384,9 @@ impl Replica for New {
     }
     fn deadline(&self) -> Option<u64> {
         self.raw.deadline()
+    }
+    fn plant(&mut self, mutant: Option<hyper_raft::Mutant>) {
+        self.raw.plant(mutant);
     }
     fn set_timeout(&mut self, ticks: usize) {
         self.raw
@@ -1529,16 +1567,16 @@ macro_rules! either {
     };
 }
 impl Replica for Either {
-    fn open(id: u64, store: Store, settings: &Settings, seed: u64) -> Self {
+    fn open(id: u64, store: Store, settings: &Settings, seed: u64, members: usize) -> Self {
         if id % 2 == 1 {
-            let mut old = Old::open(id, store, settings, seed);
+            let mut old = Old::open(id, store, settings, seed, members);
             // `raft-rs` draws its timeouts from the thread; a run is its
             // seed.
             let span = settings.election_tick as u64;
             old.set_timeout(settings.election_tick + Seeded(seed).below(span) as usize);
             Self::Old(Box::new(old))
         } else {
-            Self::New(Box::new(New::open(id, store, settings, seed)))
+            Self::New(Box::new(New::open(id, store, settings, seed, members)))
         }
     }
     fn id(&self) -> u64 {
@@ -1603,8 +1641,10 @@ impl Replica for Either {
     }
 }
 
+pub mod backlog;
 pub mod cluster;
 pub mod lagged;
+pub mod timed;
 #[allow(unused_imports)]
 pub use cluster::{Cluster, Mix, Op, Report};
 #[allow(unused_imports)]

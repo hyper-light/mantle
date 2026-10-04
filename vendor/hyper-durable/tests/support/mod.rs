@@ -193,6 +193,16 @@ impl SimStore {
     pub fn unanswered(&self) -> usize {
         self.done.len()
     }
+    /// What the answered writes left: what the replica reads.
+    pub fn answered(&self) -> &Disk {
+        &self.answered
+    }
+    /// Whether a write that moves the log's start is out: submitted, or durable and unanswered.
+    pub fn start_out(&self) -> bool {
+        let pending = self.pending.iter().map(|(_, write)| write);
+        let done = self.done.iter().map(|(write, _)| write);
+        pending.chain(done).any(|write| write.start.is_some())
+    }
     /// Makes the oldest pending write durable, or refuses it and every one behind it; false
     /// when none is pending.
     pub fn make_durable(&mut self) -> bool {
@@ -370,6 +380,9 @@ pub struct Kv {
     pub control: bool,
     /// Images what it persisted, not everything applied: an owner's checkpoint, focal's case.
     pub checkpoints: bool,
+    /// Keeps only the last entry it applied: a state of one value, whose image does not grow
+    /// with the log, as a register's group's does not.
+    pub register: bool,
     /// Entries applied that a member acts on at its next start, and changes, since the harness
     /// last looked: what I5 holds against the durable commit.
     pub fenced_applied: Vec<u64>,
@@ -394,6 +407,7 @@ impl Kv {
             volatile,
             control: false,
             checkpoints: false,
+            register: false,
             fenced_applied: Vec::new(),
             acted: Vec::new(),
             changes: Vec::new(),
@@ -407,6 +421,7 @@ impl Kv {
             volatile: self.volatile,
             control: self.control,
             checkpoints: self.checkpoints,
+            register: self.register,
             fenced_applied: Vec::new(),
             acted: Vec::new(),
             changes: Vec::new(),
@@ -446,6 +461,9 @@ impl StateMachine for Kv {
         if self.acts_at_start(entry) {
             self.fenced_applied.push(entry.index);
             self.acted.push(entry.index);
+        }
+        if self.register {
+            self.now.entries.clear();
         }
         self.now
             .entries
@@ -495,6 +513,16 @@ impl StateMachine for Kv {
             into.extend_from_slice(data);
         }
         Ok((state.applied, state.configuration.clone()))
+    }
+    fn image_bytes(&self) -> Option<u64> {
+        // As `image` writes it: the count, then each entry's index, term and length, and its data.
+        let state = if self.checkpoints {
+            &self.durable
+        } else {
+            &self.now
+        };
+        let entries = state.entries.iter();
+        Some(entries.fold(8, |bytes, (_, _, data)| bytes + 24 + data.len() as u64))
     }
     fn install(&mut self, image: &[u8], at: Point, configuration: &ConfState) -> Result<(), Fatal> {
         let mut bytes = image;

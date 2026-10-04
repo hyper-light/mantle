@@ -188,7 +188,7 @@ fn xxh64_core<'a>(
     total: usize,
     seed: u64,
 ) -> u64 {
-    let mut hash = if total >= STRIPE64 {
+    let hash = if total >= STRIPE64 {
         let mut v = [
             seed.wrapping_add(PRIME64_1).wrapping_add(PRIME64_2),
             seed.wrapping_add(PRIME64_2),
@@ -213,7 +213,12 @@ fn xxh64_core<'a>(
     } else {
         seed.wrapping_add(PRIME64_5)
     };
-    hash = hash.wrapping_add(len64(total));
+    finalize64(hash.wrapping_add(len64(total)), rest)
+}
+
+/// `XXH64_finalize` [R util/xxhash.h:2810-2850]: the bytes after the last whole stripe, then the
+/// avalanche.
+fn finalize64(mut hash: u64, rest: &[u8]) -> u64 {
     let (words, after) = rest.as_chunks::<8>();
     for word in words {
         hash ^= round64(0, u64::from_le_bytes(*word));
@@ -254,6 +259,98 @@ pub fn xxh64_with_last_byte(data: &[u8], last_byte: u8, seed: u64) -> u64 {
         xxh64_core(stripes.iter().chain([&tail]), &[], total, seed)
     } else {
         xxh64_core(stripes.iter().chain([]), filled, total, seed)
+    }
+}
+
+/// XXH64 over input given in pieces: `XXH64_reset`, `XXH64_update` and `XXH64_digest`
+/// [R util/xxhash.h:2931-3012], the stripes taken as whole ones arrive and the last partial one
+/// held, so the digest equals [`xxh64`] over the pieces joined.
+#[derive(Clone, Debug)]
+pub struct Xxh64 {
+    seed: u64,
+    acc: [u64; 4],
+    /// Whole stripes taken so far.
+    stripes: u64,
+    partial: [u8; STRIPE64],
+    held: usize,
+    total: u64,
+}
+
+impl Xxh64 {
+    /// A state for `seed`.
+    pub fn new(seed: u64) -> Self {
+        Self {
+            seed,
+            acc: [
+                seed.wrapping_add(PRIME64_1).wrapping_add(PRIME64_2),
+                seed.wrapping_add(PRIME64_2),
+                seed,
+                seed.wrapping_sub(PRIME64_1),
+            ],
+            stripes: 0,
+            partial: [0; STRIPE64],
+            held: 0,
+            total: 0,
+        }
+    }
+
+    fn stripe(&mut self, stripe: &[u8; STRIPE64]) {
+        for (acc, lane) in self.acc.iter_mut().zip(stripe.as_chunks::<8>().0) {
+            *acc = round64(*acc, u64::from_le_bytes(*lane));
+        }
+        self.stripes = self.stripes.wrapping_add(1);
+    }
+
+    /// Takes `data`.
+    pub fn update(&mut self, mut data: &[u8]) {
+        self.total = self.total.wrapping_add(len64(data.len()));
+        if self.held > 0 {
+            let need = STRIPE64.saturating_sub(self.held);
+            let take = need.min(data.len());
+            let (head, rest) = data.split_at(take);
+            if let Some(dst) = self
+                .partial
+                .get_mut(self.held..self.held.saturating_add(take))
+            {
+                dst.copy_from_slice(head);
+            }
+            self.held = self.held.saturating_add(take);
+            data = rest;
+            if self.held < STRIPE64 {
+                return;
+            }
+            let full = self.partial;
+            self.stripe(&full);
+            self.held = 0;
+        }
+        let (stripes, rest) = data.as_chunks::<STRIPE64>();
+        for stripe in stripes {
+            self.stripe(stripe);
+        }
+        if let Some(dst) = self.partial.get_mut(..rest.len()) {
+            dst.copy_from_slice(rest);
+        }
+        self.held = rest.len();
+    }
+
+    /// The hash of everything taken.
+    pub fn digest(&self) -> u64 {
+        let mut hash = if self.stripes > 0 {
+            let [v1, v2, v3, v4] = self.acc;
+            let mut h = v1
+                .rotate_left(1)
+                .wrapping_add(v2.rotate_left(7))
+                .wrapping_add(v3.rotate_left(12))
+                .wrapping_add(v4.rotate_left(18));
+            for lane in self.acc {
+                h = merge_round64(h, lane);
+            }
+            h
+        } else {
+            self.seed.wrapping_add(PRIME64_5)
+        };
+        hash = hash.wrapping_add(self.total);
+        finalize64(hash, self.partial.get(..self.held).unwrap_or(&[]))
     }
 }
 

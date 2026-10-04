@@ -62,6 +62,9 @@ pub enum Malformed {
     /// A reference to data the reader has no way to fetch: a blob-backed value read where no
     /// blob reader is given (RocksDB's null `BlobFetcher`).
     Unresolvable,
+    /// Compressed bytes that do not decode under their format; the structure is named beside it
+    /// (`codec::zstd`).
+    Undecodable,
 }
 
 impl fmt::Display for Malformed {
@@ -79,6 +82,7 @@ impl fmt::Display for Malformed {
             Self::TooLarge => "length larger than the format allows",
             Self::ChecksumMismatch => "checksum mismatch",
             Self::Unresolvable => "refers to data this reader cannot fetch",
+            Self::Undecodable => "compressed bytes that do not decode under their format",
         })
     }
 }

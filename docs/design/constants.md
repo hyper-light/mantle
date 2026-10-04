@@ -223,6 +223,28 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/engine/src/version.rs` `ROCKSDB_MINOR` | format | 8 [R include/rocksdb/version.h:15]. |
 | `crates/engine/src/version.rs` `ROCKSDB_PATCH` | format | 1 [R include/rocksdb/version.h:16]. |
 | `crates/engine/src/version.rs` `ROCKSDB_VERSION_INT` | derived | `ROCKSDB_VERSION_INT`: major·10^6 + minor·10^3 + patch [R include/rocksdb/version.h:24-25]. |
+| `crates/engine/src/codec/zstd/decoder.rs` `BLOCK_HEADER` | format | 3 bytes, a block header (RFC 8878 §3.1.1.2, Table 8). |
+| `crates/engine/src/codec/zstd/decoder.rs` `BLOCK_MAX` | format | 128 KB, the largest block decoded or compressed: Block_Maximum_Size is the smaller of Window_Size and 128 KB (RFC 8878 §3.1.1.2.4). |
+| `crates/engine/src/codec/zstd/decoder.rs` `DICTIONARY_MAGIC` | format | 0xEC30A437, a formatted dictionary's magic number (RFC 8878 §5). |
+| `crates/engine/src/codec/zstd/decoder.rs` `FRAME_MAGIC` | format | 0xFD2FB528, a Zstandard frame's magic number (RFC 8878 §3.1.1). |
+| `crates/engine/src/codec/zstd/decoder.rs` `RAW_DICTIONARY_MIN` | format | 8 bytes, the smallest raw-content dictionary (RFC 8878 §5). |
+| `crates/engine/src/codec/zstd/decoder.rs` `SKIPPABLE_MAGIC` | format | 0x184D2A50, the first of the 16 skippable frames' magic numbers 0x184D2A50 to 0x184D2A5F (RFC 8878 §3.1.2). |
+| `crates/engine/src/codec/zstd/decoder.rs` `SKIPPABLE_MASK` | format | 0xFFFFFFF0, the bits the 16 skippable magic numbers share (RFC 8878 §3.1.2). |
+| `crates/engine/src/codec/zstd/decoder.rs` `WINDOW_LOG_BASE` | format | 10: windowLog = 10 + Exponent (RFC 8878 §3.1.1.1.2). |
+| `crates/engine/src/codec/zstd/fse.rs` `LITERALS_LENGTH_DEFAULT_LOG` | format | 6, the accuracy log of the predefined literals length distribution (RFC 8878 §3.1.1.3.2.2.1). |
+| `crates/engine/src/codec/zstd/fse.rs` `MATCH_LENGTH_DEFAULT_LOG` | format | 6, the accuracy log of the predefined match length distribution (RFC 8878 §3.1.1.3.2.2.2). |
+| `crates/engine/src/codec/zstd/fse.rs` `MIN_ACCURACY_LOG` | format | 5: Accuracy_Log = low4bits + 5 (RFC 8878 §4.1.1). |
+| `crates/engine/src/codec/zstd/fse.rs` `OFFSET_DEFAULT_LOG` | format | 5, the accuracy log of the predefined offset distribution (RFC 8878 §3.1.1.3.2.2.3). |
+| `crates/engine/src/codec/zstd/huffman.rs` `DIRECT` | format | 128: a Huffman tree header byte at or above it writes the weights directly (RFC 8878 §4.2.1.1). |
+| `crates/engine/src/codec/zstd/huffman.rs` `JUMP_TABLE` | format | 6 bytes, the jump table before four Huffman streams (RFC 8878 §3.1.1.3.1.6). |
+| `crates/engine/src/codec/zstd/huffman.rs` `MAX_BITS` | format | 11, the longest Huffman prefix code (RFC 8878 §4.2.1). |
+| `crates/engine/src/codec/zstd/huffman.rs` `MAX_WEIGHTS` | derived | 255: weights for literals 0 to 254, the last literal's deduced (RFC 8878 §4.2.1.2). |
+| `crates/engine/src/codec/zstd/huffman.rs` `WEIGHTS_MAX_LOG` | format | 6, the largest accuracy log of the Huffman weights' FSE table (RFC 8878 §4.2.1.2). |
+| `crates/engine/src/codec/zstd/huffman.rs` `WEIGHT_SYMBOLS` | derived | `MAX_BITS` + 1 = 12: the weights 0 to 11 an FSE description of them can name. |
+| `crates/engine/src/codec/zstd/sequences.rs` `LITERALS_LENGTH_MAX_LOG` | format | 9, the largest accuracy log of a literals length table (RFC 8878 §3.1.1.3.2.1, FSE_Compressed_Mode). |
+| `crates/engine/src/codec/zstd/sequences.rs` `MATCH_LENGTH_MAX_LOG` | format | 9, the largest accuracy log of a match length table (RFC 8878 §3.1.1.3.2.1). |
+| `crates/engine/src/codec/zstd/sequences.rs` `MAX_OFFSET_CODE` | external | 31, the reference decoder's largest offset code N; a decoder may limit N, at least 22 recommended (RFC 8878 §3.1.1.3.2.1.1). |
+| `crates/engine/src/codec/zstd/sequences.rs` `OFFSET_MAX_LOG` | format | 8, the largest accuracy log of an offset table (RFC 8878 §3.1.1.3.2.1). |
 | `crates/gateway/src/layout.rs` `CHUNK` | cited | Tectonic's "typically 8 MiB" chunk (docs/research/01 §1.14). docs/design/gateway.md says measured transfer sizing will replace it, and audit §12.6/§16.2 requires per-upload sizing. |
 | `crates/gateway/src/layout.rs` `SEALED` | derived | `seal::SEGMENT + seal::TAG`: a 64 KiB plaintext segment plus its 16-byte AEAD tag (docs/design/gateway.md §1). |
 | `crates/gateway/src/put.rs` `RENEWALS` | cited | Quarter-lease renewal from Centrifuge's 15 s renewals of 60 s leases (docs/research/09 §7.2.2). Audit §12.6 requires deriving it from control-delay and outage distributions. |

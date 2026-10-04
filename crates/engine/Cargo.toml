@@ -24,6 +24,8 @@ windows-sys.workspace = true
 proptest.workspace = true
 # The oracle of the engine's own xxHash (util/xxhash.rs, tests/xxhash_test.rs).
 twox-hash.workspace = true
+# The oracle of the engine's own Zstandard (codec/zstd, tests/zstd_test.rs).
+zstd.workspace = true
 
 [[bench]]
 name = "memtable"

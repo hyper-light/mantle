@@ -141,6 +141,30 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/engine/src/util/xxph3.rs` `SECRET_SIZE_MIN` | format | 136, `XXPH3_SECRET_SIZE_MIN`, the base of the mid-size path's last offset [R util/xxph3.h:283]. |
 | `crates/engine/src/util/xxph3.rs` `STRIPES_PER_BLOCK` | derived | `(SECRET_DEFAULT_SIZE - STRIPE_LEN) / SECRET_CONSUME_RATE` = 16 stripes per block [R util/xxph3.h:1519]. |
 | `crates/engine/src/util/xxph3.rs` `STRIPE_LEN` | format | 64 bytes hashed per accumulation [R util/xxph3.h:1145]. |
+| `crates/engine/src/util/xxhash.rs` `BLOCK_LEN` | derived | `STRIPE_LEN × STRIPES_PER_BLOCK` = 1024 bytes between scrambles [R util/xxhash.h:5136-5137]. |
+| `crates/engine/src/util/xxhash.rs` `MIDSIZE_LASTOFFSET` | format | 17, the secret offset back from `SECRET_SIZE_MIN` for the mid-size path's last 16 bytes [R util/xxhash.h:4098]. |
+| `crates/engine/src/util/xxhash.rs` `MIDSIZE_MAX` | format | 240, the longest input on XXH3's mid-size path [R util/xxhash.h:4087]. |
+| `crates/engine/src/util/xxhash.rs` `MIDSIZE_STARTOFFSET` | format | 3, the secret offset of the mid-size path's rounds after the eighth [R util/xxhash.h:4097]. |
+| `crates/engine/src/util/xxhash.rs` `PRIME32_1` | format | 0x9E3779B1, xxHash's PRIME32_1 [R util/xxhash.h:2219]. |
+| `crates/engine/src/util/xxhash.rs` `PRIME32_2` | format | 0x85EBCA77, xxHash's PRIME32_2 [R util/xxhash.h:2220]. |
+| `crates/engine/src/util/xxhash.rs` `PRIME32_3` | format | 0xC2B2AE3D, xxHash's PRIME32_3 [R util/xxhash.h:2221]. |
+| `crates/engine/src/util/xxhash.rs` `PRIME32_4` | format | 0x27D4EB2F, xxHash's PRIME32_4 [R util/xxhash.h:2222]. |
+| `crates/engine/src/util/xxhash.rs` `PRIME32_5` | format | 0x165667B1, xxHash's PRIME32_5 [R util/xxhash.h:2223]. |
+| `crates/engine/src/util/xxhash.rs` `PRIME64_1` | format | 0x9E3779B185EBCA87, xxHash's PRIME64_1 [R util/xxhash.h:2749]. |
+| `crates/engine/src/util/xxhash.rs` `PRIME64_2` | format | 0xC2B2AE3D27D4EB4F, xxHash's PRIME64_2 [R util/xxhash.h:2750]. |
+| `crates/engine/src/util/xxhash.rs` `PRIME64_3` | format | 0x165667B19E3779F9, xxHash's PRIME64_3 [R util/xxhash.h:2751]. |
+| `crates/engine/src/util/xxhash.rs` `PRIME64_4` | format | 0x85EBCA77C2B2AE63, xxHash's PRIME64_4 [R util/xxhash.h:2752]. |
+| `crates/engine/src/util/xxhash.rs` `PRIME64_5` | format | 0x27D4EB2F165667C5, xxHash's PRIME64_5 [R util/xxhash.h:2753]. |
+| `crates/engine/src/util/xxhash.rs` `PRIME_MX1` | format | 0x165667919E3779F9, `XXH3_avalanche`'s multiplier [R util/xxhash.h:3870]. |
+| `crates/engine/src/util/xxhash.rs` `PRIME_MX2` | format | 0x9FB21C651E98DF25, `XXH3_rrmxmx`'s multiplier [R util/xxhash.h:3884], also `XXH3_len_4to8_128b`'s [R util/xxhash.h:5786]. |
+| `crates/engine/src/util/xxhash.rs` `SECRET_CONSUME_RATE` | format | 8 secret bytes consumed per stripe [R util/xxhash.h:4152]. |
+| `crates/engine/src/util/xxhash.rs` `SECRET_LASTACC_START` | format | 7, the secret offset of the long path's last stripe [R util/xxhash.h:5157]. |
+| `crates/engine/src/util/xxhash.rs` `SECRET_MERGEACCS_START` | format | 11, the secret offset of the accumulators' merge [R util/xxhash.h:5213]. |
+| `crates/engine/src/util/xxhash.rs` `SECRET_SIZE_MIN` | format | 136, `XXH3_SECRET_SIZE_MIN`, the base of the mid-size path's last offset [R util/xxhash.h:968]. |
+| `crates/engine/src/util/xxhash.rs` `STRIPE32` | format | 16 bytes, XXH32's four 4-byte lanes [R util/xxhash.h:2415-2445]. |
+| `crates/engine/src/util/xxhash.rs` `STRIPE64` | format | 32 bytes, XXH64's four 8-byte lanes [R util/xxhash.h:2854-2885]. |
+| `crates/engine/src/util/xxhash.rs` `STRIPES_PER_BLOCK` | derived | `(SECRET_DEFAULT_SIZE - STRIPE_LEN) / SECRET_CONSUME_RATE` = 16 stripes per block [R util/xxhash.h:5136]. |
+| `crates/engine/src/util/xxhash.rs` `STRIPE_LEN` | format | 64 bytes hashed per accumulation [R util/xxhash.h:4151]. |
 | `crates/engine/src/db/dbformat.rs` `DISABLE_GLOBAL_SEQUENCE_NUMBER` | format | `kDisableGlobalSequenceNumber`, u64::MAX: an ingested file with no global sequence number [R db/dbformat.h:131-132]. |
 | `crates/engine/src/db/dbformat.rs` `MAX_SEQUENCE_NUMBER` | format | `kMaxSequenceNumber`, 2^56 − 1: the trailer's 56 bits above the type byte [R db/dbformat.h:129]. |
 | `crates/engine/src/db/dbformat.rs` `NUM_INTERNAL_BYTES` | format | `kNumInternalBytes`, 8: the internal key's trailer [R db/dbformat.h:134]. |

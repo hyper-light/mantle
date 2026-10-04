@@ -156,7 +156,7 @@ production code:
 | Need | Production | Oracle in tests |
 |---|---|---|
 | CRC-32C, masking, combination, extension | `mantle-crc` (`crc-fast`), mantle's CRC crate; `crc32c_extend` was added to it for RocksDB's `crc32c::Extend` | RocksDB's util/crc32c.cc (golden vectors) |
-| XXH32, XXH64, XXH3-64, XXH3-128 | to be ported from xxHash 0.8.1 as RocksDB vendors it (24 §1.2); `twox-hash`, which P1 shipped with, leaves production then | `twox-hash`; RocksDB's util/xxhash.h (golden vectors) |
+| XXH32, XXH64, XXH3-64, XXH3-128 | `util/xxhash.rs`, ported from xxHash 0.8.1 as RocksDB vendors it (24 §1.2), 2026-10-04 | `twox-hash` over every length to 4,200 and six seeds (`tests/xxhash_test.rs`); RocksDB's util/xxhash.h (golden vectors) |
 | XXPH3 (the XXH3 preview) | ported from util/xxph3.h (24 §5 R1) | golden vectors |
 | ZSTD with dictionaries, training and streaming, from P3 | to be written to RFC 8878 (the Zstandard format) and the reference implementation's dictionary builder, RocksDB's framing around it (24 §5 R9) | the reference C library, built only for tests |
 | Snappy, LZ4 block, raw deflate, from P4 | to be written to their format descriptions (Snappy's format_description.txt, LZ4's block format, RFC 1951) | `snap`, `lz4_flex`, `miniz_oxide`, in tests only |
@@ -176,7 +176,7 @@ generated and adversarial inputs.
 | `util/coding.rs` | util/coding_lean.h, util/coding.h, util/coding.cc: fixed and varint coding, signed varints, length-prefixed slices, every Put/Get/Encode/Decode form |
 | `util/prefix_varint.rs` | util/prefix_varint.h (defined and tested by RocksDB 11.8.1, not yet used by a file format) |
 | `util/crc32c.rs` | util/crc32c.h, util/crc32c.cc: `Value`, `Extend`, `Crc32cCombine`, `Mask`, `Unmask` |
-| `util/xxhash.rs` | util/xxhash.h through `twox-hash`, with the streamed last-byte forms |
+| `util/xxhash.rs` | util/xxhash.h: XXH32, XXH64, XXH3-64 and XXH3-128 from the header's scalar code, with the streamed last-byte forms (ported 2026-10-04; P1 shipped them through `twox-hash`) |
 | `util/xxph3.rs` | util/xxph3.h: `XXPH3_64bits` and `XXPH3_64bits_withSeed`, the only entry points RocksDB calls |
 | `util/hash.rs` | util/hash.h, util/hash.cc, util/hash128.h: `Hash` with its sign-extended tail, `Hash64`, `NPHash64`, `Hash128`, `Hash2x64`, `BijectiveHash2x64` and its inverse, `Lower32of64`/`Upper32of64` |
 | `util/fastrange.rs` | util/fastrange.h |
@@ -215,9 +215,9 @@ the context modifier without the offset's upper half; the CRC mask's rotation; a
 varint32 overflow; the bijective hash's length term; the file checksum's byte order; FastRange64's
 result; and the 9-byte prefix varint's marker byte.
 
-**Open.** `twox-hash` and `crc-fast` are called directly, as mantle-s3 and mantle-crc already
-do, not behind an unwind boundary: their one-shot paths index only within lengths they derive
-from the input. The golden vectors were generated on aarch64 macOS; the x86_64 run of the same
+**Open.** `crc-fast` is called directly, as mantle-crc already does, not behind an unwind
+boundary: its one-shot path indexes only within lengths it derives from the input. (xxHash was
+called the same way through `twox-hash` until the engine's own port replaced it.) The golden vectors were generated on aarch64 macOS; the x86_64 run of the same
 program (the SSE 4.2 CRC kernel) is for the corpus work before P4.
 
 ## 7. P2: internal keys, write batches and the memtable (done)

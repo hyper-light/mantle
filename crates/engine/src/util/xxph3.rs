@@ -18,8 +18,9 @@
 
 use crate::util::math128::{lower64of128, multiply64to128, upper64of128};
 
-/// The 192-byte default secret [R util/xxph3.h:920-935].
-const SECRET: [u8; SECRET_DEFAULT_SIZE] = [
+/// The 192-byte default secret [R util/xxph3.h:920-935], the released XXH3's too
+/// [R util/xxhash.h:3651-3664] (`util::xxhash`).
+pub(crate) const SECRET: [u8; SECRET_DEFAULT_SIZE] = [
     0xb8, 0xfe, 0x6c, 0x39, 0x23, 0xa4, 0x4b, 0xbe, 0x7c, 0x01, 0x81, 0x2c, 0xf7, 0x21, 0xad, 0x1c,
     0xde, 0xd4, 0x6d, 0xe9, 0x83, 0x90, 0x97, 0xdb, 0x72, 0x40, 0xa4, 0xa4, 0xb7, 0xb3, 0x67, 0x1f,
     0xcb, 0x79, 0xe6, 0x4e, 0xcc, 0xc0, 0xe5, 0x78, 0x82, 0x5a, 0xd0, 0x7d, 0xcc, 0xff, 0x72, 0x21,
@@ -35,7 +36,7 @@ const SECRET: [u8; SECRET_DEFAULT_SIZE] = [
 ];
 
 /// The default secret's length [R util/xxph3.h:914].
-const SECRET_DEFAULT_SIZE: usize = 192;
+pub(crate) const SECRET_DEFAULT_SIZE: usize = 192;
 /// The smallest secret the algorithm accepts; the mid-size tail reads relative to it
 /// [R util/xxph3.h:283].
 const SECRET_SIZE_MIN: usize = 136;
@@ -70,7 +71,7 @@ const STRIPES_PER_BLOCK: usize = (SECRET_DEFAULT_SIZE - STRIPE_LEN) / SECRET_CON
 const BLOCK_LEN: usize = STRIPE_LEN * STRIPES_PER_BLOCK;
 
 /// `XXPH_readLE64` at `at`.
-fn read64(bytes: &[u8], at: usize) -> u64 {
+pub(crate) fn read64(bytes: &[u8], at: usize) -> u64 {
     bytes
         .get(at..)
         .and_then(<[u8]>::first_chunk::<8>)
@@ -78,7 +79,7 @@ fn read64(bytes: &[u8], at: usize) -> u64 {
 }
 
 /// `XXPH_readLE32` at `at`.
-fn read32(bytes: &[u8], at: usize) -> u32 {
+pub(crate) fn read32(bytes: &[u8], at: usize) -> u32 {
     bytes
         .get(at..)
         .and_then(<[u8]>::first_chunk::<4>)
@@ -91,7 +92,7 @@ fn len64(input: &[u8]) -> u64 {
 }
 
 /// `XXPH3_mul128_fold64` [R util/xxph3.h:1061-1066].
-fn mul128_fold64(lhs: u64, rhs: u64) -> u64 {
+pub(crate) fn mul128_fold64(lhs: u64, rhs: u64) -> u64 {
     let product = multiply64to128(lhs, rhs);
     lower64of128(product) ^ upper64of128(product)
 }

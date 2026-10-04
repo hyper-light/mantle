@@ -25,6 +25,11 @@ pub enum Error {
     /// or a bound the port adds where RocksDB has none. Nothing was changed.
     #[error("{what} would exceed its bound of {limit}")]
     LimitExceeded { what: &'static str, limit: u64 },
+    /// A file operation failed: RocksDB's `IOStatus::IOError`. After a failed write or flush
+    /// the durability of what was written is unknown (hyper-block's `BlockFile::sync_data`), so
+    /// the file that returned it takes no more writes (docs/research/24 §2.3).
+    #[error("I/O error in {op}: {detail}")]
+    Io { op: &'static str, detail: String },
     /// An entry with the same internal key (user key, sequence and type) is already in the
     /// memtable: RocksDB's `Status::TryAgain("key+seq exists")`, which the write path handles
     /// and never returns to a caller (docs/research/24 §2.3, §4.1).

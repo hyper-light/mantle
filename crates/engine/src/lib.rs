@@ -22,6 +22,7 @@
 pub mod codec;
 pub mod db;
 pub mod error;
+pub mod file;
 pub mod memory;
 pub mod memtable;
 pub mod port;

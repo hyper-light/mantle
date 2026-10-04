@@ -474,9 +474,11 @@ dependencies = [
 name = "mantle-engine"
 version = "0.1.0"
 dependencies = [
+ "hyper-block",
  "mantle-crc",
  "proptest",
  "rustix",
+ "tempfile",
  "thiserror",
  "twox-hash",
  "windows-sys",

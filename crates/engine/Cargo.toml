@@ -10,6 +10,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+hyper-block = { path = "../../vendor/hyper-block" }
 mantle-crc = { path = "../crc" }
 thiserror.workspace = true
 
@@ -26,6 +27,7 @@ proptest.workspace = true
 twox-hash.workspace = true
 # The oracle of the engine's own Zstandard (codec/zstd, tests/zstd_test.rs).
 zstd.workspace = true
+tempfile.workspace = true
 
 [[bench]]
 name = "memtable"

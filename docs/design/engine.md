@@ -238,7 +238,8 @@ blob references); `db/blob/` (the blob index's decode); `db/memtable.rs` and
 release, without `unsafe`); `memory/arena.rs` (RocksDB's accounting over blocks of `AtomicU64`
 words); `port/mmap.rs`; `util/comparator.rs`; `version.rs`.
 
-**Ported tests** (`crates/engine/tests`): memory/arena_test.cc 6 of 6;
+**Ported tests** (`crates/engine/tests`): memory/arena_test.cc 6 of 6 (the two that measure the resident set run alone in
+tests/arena_resident_test.rs, so no lock orders them);
 memtable/inlineskiplist_test.cc 19 of 26 (the other 7 are concurrent writers, P27);
 memtable/skiplist_test.cc 8 of 8; db/memtable_list_test.cc 6 of 8 (the other 2 are user-defined
 timestamps, P16); db/dbformat_test.cc 12 of 12; db/write_batch_test.cc 28 of 31 run and 2 more
@@ -266,7 +267,50 @@ wide-column encodings; `tests/dbformat_golden.rs`, `write_batch_golden.rs` and
 **Open.** The memtable benchmark against RocksDB (`benches/memtable.rs` beside
 `benches/p2_memtable_bench.cc`) is to be run under hyper-raft's tails rule: open-loop, p50 to
 p99.99 with intervals, the load recorded, and CPU, instructions, allocations, energy and
-footprint per insert and per lookup. P3 (the WAL) was written against mantle-disk's block layer,
-which hyper-block has since replaced; it is held aside and re-ported onto hyper-block next, with
-its own ZSTD codec.
+footprint per insert and per lookup.
 
+## 8. P3: the WAL (done)
+
+Re-ported onto hyper-block and the engine's own ZSTD codec, 2026-10-04.
+
+**Modules** (`crates/engine/src`): `db/log_format.rs` (record types, the legacy and recyclable
+headers, predecessor-WAL and timestamp-size records); `db/log_writer.rs`; `db/log_reader.rs`
+(`Reader` and `FragmentBufferedReader`, the four recovery modes, predecessor-WAL verification);
+`file/` (`WritableFileWriter` over hyper-block's `BlockWritableFile`, `SequentialFileReader`);
+`util/compression.rs` (the WAL's streaming compression over `codec::zstd`, at RocksDB's level 3
+and window bound 2^27).
+
+**Ported tests.** db/log_test.cc 47 of 47 (`LogTest` 36, `RetriableLogTest` 3,
+`CompressionLogTest` 7, `StreamingCompressionTest` 1), each over its C++ parameter sets, plus one
+of the port's own (a changed timestamp size is refused). The harness's sink and source own their
+bytes; the fixture hands flushed bytes across before each read or edit, so nothing is shared.
+`tests/write_batch_oracle_wal.rs` reads WALs RocksDB's own `ldb` wrote (`tests/golden/p3_wal/`,
+by `p3_wal_gen.sh`) and matches `ldb dump_wal`'s transcripts of them.
+
+**The differential** (`tests/p3_differential.rs`, fixtures from `tests/golden/p3/p3_gen.py`). The
+oracle is RocksDB's unmodified db/log_writer.cc and db/log_reader.cc (`p3_oracle.cc`, built by
+`build.sh` outside the repository). Eight WALs are covered: legacy, recycled, predecessor-tracked
+with and without recycling, a log number above 2^32, ZSTD with and without recycling, and a
+recycled file overwritten by a shorter log. The port writes every uncompressed one byte for byte.
+Each WAL and each of its mutations (cuts at and around every block boundary, 16 bit flips,
+zeroed headers) is read in all four recovery modes by both readers, with matched, mismatched and
+missing predecessors. Every transcript of the 19,102 fixture lines matches.
+
+**Where the port differs from RocksDB, and why.**
+- A recycled log's record names its log by the low 32 bits, which is all the writer stores
+  (db/log_writer.cc:337). Both RocksDB readers compare them with the whole 64-bit number
+  (log_reader.cc:604-605, 999-1000), so a recycled log numbered 2^32 or more loses every record on
+  recovery. The port compares the low 32 bits. The differential asks the oracle with the number it
+  can match.
+- `FragmentBufferedReader` meeting another log's record in a recycled file returns without
+  consuming it (log_reader.cc:999-1002), and its `ReadRecord` loop asks for the same fragment
+  forever (:870). The port's returns false there, to retry once the writer has overwritten it. The
+  fixtures name these reads `hang`. The oracle detects the fixed point exactly, through a shim over
+  `DecodeFixed32` (`tests/golden/p3/shim/util/coding_lean.h`), and no clock decides it.
+- A column family's timestamp size changing within one log is an `assert` in RocksDB
+  (log_writer.cc:279-282), compiled out of release builds. The port returns `InvalidArgument`.
+- The reader does not return the record checksum RocksDB can compute on read (db/log_reader.rs).
+
+**Open.** The WAL benchmark against RocksDB (group commit p50 to p99.99, open loop, under load,
+with CPU, energy and device bytes per committed byte) under hyper-raft's tails rule; and the two
+upstream defects above to report to RocksDB, with the owner's approval.

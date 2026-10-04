@@ -2,6 +2,7 @@
 
 pub mod coding;
 pub mod comparator;
+pub mod compression;
 pub mod crc32c;
 pub mod fastrange;
 pub mod file_checksum_helper;

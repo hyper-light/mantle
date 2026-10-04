@@ -248,6 +248,28 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/engine/src/codec/zstd/encoder.rs` `HASHED` | derived | 4: the bytes the match finder hashes, a u32 read; a level's shorter minimum match (`L` of 3) is raised to it. |
 | `crates/engine/src/codec/zstd/encoder.rs` `NONE` | format | u32::MAX: no position, the hash table's and chains' empty value (positions are below the 128 KB-block frame's length, far under it). |
 | `crates/engine/src/codec/zstd/encoder.rs` `OFFSET_DEFAULT_MAX_CODE` | format | 28, the highest offset code the predefined offset table holds (RFC 8878 §3.1.1.3.2.2.3: N = 28). |
+| `crates/engine/src/db/log_format.rs` `BLOCK_SIZE` | format | 32768, `kBlockSize`, the WAL's block [R db/log_format.h:54]. |
+| `crates/engine/src/db/log_format.rs` `FIRST_TYPE` | format | 2, `kFirstType` [R db/log_format.h:28]. |
+| `crates/engine/src/db/log_format.rs` `FULL_TYPE` | format | 1, `kFullType` [R db/log_format.h:25]. |
+| `crates/engine/src/db/log_format.rs` `HEADER_SIZE` | format | 7, `kHeaderSize`: checksum (4), length (2), type (1) [R db/log_format.h:57]. |
+| `crates/engine/src/db/log_format.rs` `LAST_TYPE` | format | 4, `kLastType` [R db/log_format.h:30]. |
+| `crates/engine/src/db/log_format.rs` `MIDDLE_TYPE` | format | 3, `kMiddleType` [R db/log_format.h:29]. |
+| `crates/engine/src/db/log_format.rs` `PREDECESSOR_WAL_INFO_TYPE` | format | 130, `kPredecessorWALInfoType` [R db/log_format.h:47]. |
+| `crates/engine/src/db/log_format.rs` `RECORD_TYPE_SAFE_IGNORE_MASK` | format | 0x80, `kRecordTypeSafeIgnoreMask`: an unknown type with it set is skipped [R db/log_format.h:51]. |
+| `crates/engine/src/db/log_format.rs` `RECYCLABLE_FIRST_TYPE` | format | 6, `kRecyclableFirstType` [R db/log_format.h:34]. |
+| `crates/engine/src/db/log_format.rs` `RECYCLABLE_FULL_TYPE` | format | 5, `kRecyclableFullType` [R db/log_format.h:33]. |
+| `crates/engine/src/db/log_format.rs` `RECYCLABLE_HEADER_SIZE` | format | 11, `kRecyclableHeaderSize`: the legacy header and a 4-byte log number [R db/log_format.h:61]. |
+| `crates/engine/src/db/log_format.rs` `RECYCLABLE_LAST_TYPE` | format | 8, `kRecyclableLastType` [R db/log_format.h:36]. |
+| `crates/engine/src/db/log_format.rs` `RECYCLABLE_MIDDLE_TYPE` | format | 7, `kRecyclableMiddleType` [R db/log_format.h:35]. |
+| `crates/engine/src/db/log_format.rs` `RECYCLABLE_USER_DEFINED_TIMESTAMP_SIZE_TYPE` | format | 11, `kRecyclableUserDefinedTimestampSizeType` [R db/log_format.h:44]. |
+| `crates/engine/src/db/log_format.rs` `RECYCLE_PREDECESSOR_WAL_INFO_TYPE` | format | 131, `kRecyclePredecessorWALInfoType` [R db/log_format.h:48]. |
+| `crates/engine/src/db/log_format.rs` `SET_COMPRESSION_TYPE` | format | 9, `kSetCompressionType` [R db/log_format.h:39]. |
+| `crates/engine/src/db/log_format.rs` `TIMESTAMP_SIZE_ENTRY_SIZE` | format | 6: a fixed32 column family id and a fixed16 timestamp size, `kSizePerColumnFamily` [R util/udt_util.h:80]. |
+| `crates/engine/src/db/log_format.rs` `USER_DEFINED_TIMESTAMP_SIZE_TYPE` | format | 10, `kUserDefinedTimestampSizeType` [R db/log_format.h:43]. |
+| `crates/engine/src/db/log_format.rs` `ZERO_TYPE` | format | 0, `kZeroType`, preallocated space [R db/log_format.h:24]. |
+| `crates/engine/src/file/writable_file_writer.rs` `MAX_BUFFER_SIZE` | cited | 1 MiB, `writable_file_max_buffer_size`'s default [R include/rocksdb/options.h:1292]: the most the writer holds before writing. |
+| `crates/engine/src/util/compression.rs` `WAL_LEVEL` | cited | 3, `ZSTD_CLEVEL_DEFAULT` (zstd 1.5.7 lib/zstd.h:134), the level of the context RocksDB's WAL compressor creates. |
+| `crates/engine/src/util/compression.rs` `WAL_WINDOW_MAX` | cited | 2^27 bytes, `ZSTD_WINDOWLOG_LIMIT_DEFAULT` (zstd 1.5.7 lib/zstd.h:1287), the reference decoder's default window bound, which RocksDB keeps. |
 | `crates/gateway/src/layout.rs` `CHUNK` | cited | Tectonic's "typically 8 MiB" chunk (docs/research/01 §1.14). docs/design/gateway.md says measured transfer sizing will replace it, and audit §12.6/§16.2 requires per-upload sizing. |
 | `crates/gateway/src/layout.rs` `SEALED` | derived | `seal::SEGMENT + seal::TAG`: a 64 KiB plaintext segment plus its 16-byte AEAD tag (docs/design/gateway.md §1). |
 | `crates/gateway/src/put.rs` `RENEWALS` | cited | Quarter-lease renewal from Centrifuge's 15 s renewals of 60 s leases (docs/research/09 §7.2.2). Audit §12.6 requires deriving it from control-delay and outage distributions. |

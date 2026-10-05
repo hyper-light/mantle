@@ -245,6 +245,17 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/engine/src/codec/zstd/sequences.rs` `MATCH_LENGTH_MAX_LOG` | format | 9, the largest accuracy log of a match length table (RFC 8878 §3.1.1.3.2.1). |
 | `crates/engine/src/codec/zstd/sequences.rs` `MAX_OFFSET_CODE` | external | 31, the reference decoder's largest offset code N; a decoder may limit N, at least 22 recommended (RFC 8878 §3.1.1.3.2.1.1). |
 | `crates/engine/src/codec/zstd/sequences.rs` `OFFSET_MAX_LOG` | format | 8, the largest accuracy log of an offset table (RFC 8878 §3.1.1.3.2.1). |
+| `crates/engine/src/codec/deflate.rs` `DIST_SYMBOLS` | format | 32, the fixed code's distance symbols (RFC 1951 §3.2.6; 30 and 31 never occur). |
+| `crates/engine/src/codec/deflate.rs` `DYNAMIC_DIST` | format | 30, the most distance symbols a dynamic block describes (RFC 1951 §3.2.7, HDIST + 1). |
+| `crates/engine/src/codec/deflate.rs` `DYNAMIC_LITLEN` | format | 286, the most literal/length symbols a dynamic block describes (RFC 1951 §3.2.7, HLIT + 257). |
+| `crates/engine/src/codec/deflate.rs` `END_OF_BLOCK` | format | 256, the end-of-block symbol (RFC 1951 §3.2.5). |
+| `crates/engine/src/codec/deflate.rs` `HASH_BITS` | cited | 15, zlib's hash size at its default memLevel 8 (`hash_bits = memLevel + 7`, deflate.c), the level RocksDB calls deflateInit2 with. |
+| `crates/engine/src/codec/deflate.rs` `HASH_SHIFT` | derived | 32 − `HASH_BITS`: the shift that keeps a hash's top `HASH_BITS` bits. |
+| `crates/engine/src/codec/deflate.rs` `LITLEN_SYMBOLS` | format | 288, the fixed code's literal/length symbols (RFC 1951 §3.2.6). |
+| `crates/engine/src/codec/deflate.rs` `MAX_BITS` | format | 15, the longest Huffman code (RFC 1951 §3.2.2). |
+| `crates/engine/src/codec/deflate.rs` `MAX_MATCH` | format | 258, the longest match (RFC 1951 §3.2.5). |
+| `crates/engine/src/codec/deflate.rs` `MIN_MATCH` | format | 3, the shortest match (RFC 1951 §3.2.5). |
+| `crates/engine/src/codec/deflate.rs` `WINDOW_MAX` | format | 2^15, the largest window (RFC 1951 §2). |
 | `crates/engine/src/codec/lz4.rs` `DISTANCE_MAX` | format | 65,535, lz4's `LZ4_DISTANCE_MAX`: the farthest a two-byte offset reaches (lz4_Block_format.md). |
 | `crates/engine/src/codec/lz4.rs` `HASH_LOG` | cited | 12, lz4's table at its default `LZ4_MEMORY_USAGE` 14 (lz4.h): 2^12 four-byte positions. |
 | `crates/engine/src/codec/lz4.rs` `HASH_MUL` | cited | 2654435761, the multiplier of lz4's `LZ4_hash4` (lz4.c), Knuth's multiplicative hash. |

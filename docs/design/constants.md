@@ -245,6 +245,14 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/engine/src/codec/zstd/sequences.rs` `MATCH_LENGTH_MAX_LOG` | format | 9, the largest accuracy log of a match length table (RFC 8878 §3.1.1.3.2.1). |
 | `crates/engine/src/codec/zstd/sequences.rs` `MAX_OFFSET_CODE` | external | 31, the reference decoder's largest offset code N; a decoder may limit N, at least 22 recommended (RFC 8878 §3.1.1.3.2.1.1). |
 | `crates/engine/src/codec/zstd/sequences.rs` `OFFSET_MAX_LOG` | format | 8, the largest accuracy log of an offset table (RFC 8878 §3.1.1.3.2.1). |
+| `crates/engine/src/codec/lz4.rs` `DISTANCE_MAX` | format | 65,535, lz4's `LZ4_DISTANCE_MAX`: the farthest a two-byte offset reaches (lz4_Block_format.md). |
+| `crates/engine/src/codec/lz4.rs` `HASH_LOG` | cited | 12, lz4's table at its default `LZ4_MEMORY_USAGE` 14 (lz4.h): 2^12 four-byte positions. |
+| `crates/engine/src/codec/lz4.rs` `HASH_MUL` | cited | 2654435761, the multiplier of lz4's `LZ4_hash4` (lz4.c), Knuth's multiplicative hash. |
+| `crates/engine/src/codec/lz4.rs` `HASH_SHIFT` | derived | 32 − `HASH_LOG`: the shift that keeps a hash's top `HASH_LOG` bits. |
+| `crates/engine/src/codec/lz4.rs` `LAST_LITERALS` | format | 5, lz4's `LASTLITERALS`: a block's last five bytes are literals (lz4_Block_format.md). |
+| `crates/engine/src/codec/lz4.rs` `MATCH_LIMIT` | format | 12, lz4's `MFLIMIT`: no match begins within a block's last twelve bytes (lz4_Block_format.md). |
+| `crates/engine/src/codec/lz4.rs` `MIN_MATCH` | format | 4, lz4's `MINMATCH`: a match's least length (lz4_Block_format.md). |
+| `crates/engine/src/codec/lz4.rs` `SKIP_TRIGGER` | cited | 6, lz4's `LZ4_skipTrigger` (lz4.c): misses before the fast compressor's step grows by one. |
 | `crates/engine/src/codec/snappy.rs` `FRAGMENT` | cited | 2^16, snappy's `kBlockSize` (snappy-internal.h): the encoder matches within 64 KiB, so an offset fits the two-byte copy. |
 | `crates/engine/src/codec/snappy.rs` `HASH_MUL` | cited | 0x1e35a7bd, the multiplier of snappy's `HashBytes` (snappy.cc), the encoder's hash of four bytes. |
 | `crates/engine/src/codec/snappy.rs` `TABLE_MAX` | cited | 2^14, snappy's `kMaxHashTableSize` (snappy.cc): the most positions the encoder's table holds. |

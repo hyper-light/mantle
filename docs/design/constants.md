@@ -245,6 +245,10 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/engine/src/codec/zstd/sequences.rs` `MATCH_LENGTH_MAX_LOG` | format | 9, the largest accuracy log of a match length table (RFC 8878 §3.1.1.3.2.1). |
 | `crates/engine/src/codec/zstd/sequences.rs` `MAX_OFFSET_CODE` | external | 31, the reference decoder's largest offset code N; a decoder may limit N, at least 22 recommended (RFC 8878 §3.1.1.3.2.1.1). |
 | `crates/engine/src/codec/zstd/sequences.rs` `OFFSET_MAX_LOG` | format | 8, the largest accuracy log of an offset table (RFC 8878 §3.1.1.3.2.1). |
+| `crates/engine/src/codec/snappy.rs` `FRAGMENT` | cited | 2^16, snappy's `kBlockSize` (snappy-internal.h): the encoder matches within 64 KiB, so an offset fits the two-byte copy. |
+| `crates/engine/src/codec/snappy.rs` `HASH_MUL` | cited | 0x1e35a7bd, the multiplier of snappy's `HashBytes` (snappy.cc), the encoder's hash of four bytes. |
+| `crates/engine/src/codec/snappy.rs` `TABLE_MAX` | cited | 2^14, snappy's `kMaxHashTableSize` (snappy.cc): the most positions the encoder's table holds. |
+| `crates/engine/src/codec/snappy.rs` `TABLE_MIN` | cited | 2^8, snappy's `kMinHashTableSize` (snappy.cc): the least. |
 | `crates/engine/src/codec/zstd/encoder.rs` `HASHED` | derived | 4: the bytes the match finder hashes, a u32 read; a level's shorter minimum match (`L` of 3) is raised to it. |
 | `crates/engine/src/codec/zstd/encoder.rs` `NONE` | format | u32::MAX: no position, the hash table's and chains' empty value (positions are below the 128 KB-block frame's length, far under it). |
 | `crates/engine/src/codec/zstd/encoder.rs` `OFFSET_DEFAULT_MAX_CODE` | format | 28, the highest offset code the predefined offset table holds (RFC 8878 §3.1.1.3.2.2.3: N = 28). |

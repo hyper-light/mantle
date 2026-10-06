@@ -355,6 +355,12 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/engine/src/store/page.rs` `HEADER` | format | 20 bytes: a store page's CRC-32C (4), kind (1), format (1), two zero bytes, payload length (4) and generation (8) (docs/design/engine-structure.md §8, E1). |
 | `crates/engine/src/store/superblock.rs` `FIXED` | format | 52 bytes, the superblock payload's fixed fields before its map extents (docs/design/engine-structure.md §8, E1). |
 | `crates/engine/src/store/superblock.rs` `MAGIC` | format | "mantleSB" in ASCII, little-endian: the store superblock's magic number. |
+| `crates/engine/src/branch/mod.rs` `HEAD` | format | 5 bytes, a branch page payload's fixed head: kind (1), entries (2), prefix length (2) (`branch` module doc). |
+| `crates/engine/src/branch/mod.rs` `INDEX` | format | 2, the kind byte of a branch's index page. |
+| `crates/engine/src/branch/mod.rs` `INDEX_FIXED` | format | 18 bytes, an index entry's fixed fields: suffix length (2), child page (8), entries under the child (8). |
+| `crates/engine/src/branch/mod.rs` `LEAF` | format | 1, the kind byte of a branch's leaf page. |
+| `crates/engine/src/branch/mod.rs` `LEAF_FIXED` | format | 5 bytes, a leaf entry's fixed fields: suffix length (2), operation (1), value length (2). |
+| `crates/engine/src/branch/mod.rs` `OFFSET` | format | 2 bytes, an entry's offset in its page: 16 bits reach every byte of a page up to 64 KiB, the largest the builder takes. |
 | `crates/gateway/src/layout.rs` `CHUNK` | cited | Tectonic's "typically 8 MiB" chunk (docs/research/01 §1.14). docs/design/gateway.md says measured transfer sizing will replace it, and audit §12.6/§16.2 requires per-upload sizing. |
 | `crates/gateway/src/layout.rs` `SEALED` | derived | `seal::SEGMENT + seal::TAG`: a 64 KiB plaintext segment plus its 16-byte AEAD tag (docs/design/gateway.md §1). |
 | `crates/gateway/src/put.rs` `RENEWALS` | cited | Quarter-lease renewal from Centrifuge's 15 s renewals of 60 s leases (docs/research/09 §7.2.2). Audit §12.6 requires deriving it from control-delay and outage distributions. |

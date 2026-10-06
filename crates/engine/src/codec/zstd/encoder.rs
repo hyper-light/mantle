@@ -27,42 +27,132 @@ use crate::util::xxhash::xxh64;
 /// The bytes the match finder hashes: a match it finds is at least this long, whatever shorter
 /// one a level allows (the format codes matches from 3, §3.1.1.3.2.1.1).
 const HASHED: usize = 4;
+/// `ZSTD_HASHLOG_MIN` (zstd 1.5.7, lib/zstd.h:1268): the smallest window and hash logs the
+/// reference fits parameters to.
+const HASH_LOG_MIN: u32 = 6;
 /// The highest offset code the predefined offset table holds (§3.1.1.3.2.2.3: N = 28).
 const OFFSET_DEFAULT_MAX_CODE: u8 = 28;
 
-/// The reference's parameters for inputs above 256 KB, by level 0 (the base of the negative
-/// levels) to 22 (zstd 1.5.7, lib/compress/clevels.h:28-50): the hash table's log `H`, the search
-/// log `S` (2^S chain positions tried), the shortest match `L`, and whether the strategy is lazy
-/// (`ZSTD_lazy` and beyond) or greedy and faster (`ZSTD_fast`, `ZSTD_dfast`, `ZSTD_greedy`).
-const LEVELS: [(u32, u32, usize, bool); 23] = [
-    (13, 1, 6, false),
-    (14, 1, 7, false),
-    (16, 1, 6, false),
-    (17, 1, 5, false),
-    (18, 1, 5, false),
-    (19, 3, 5, false),
-    (19, 3, 5, true),
-    (20, 4, 5, true),
-    (20, 4, 5, true),
-    (21, 4, 5, true),
-    (22, 5, 5, true),
-    (22, 6, 5, true),
-    (23, 6, 5, true),
-    (22, 4, 5, true),
-    (23, 5, 5, true),
-    (23, 6, 5, true),
-    (22, 5, 5, true),
-    (22, 5, 4, true),
-    (22, 6, 3, true),
-    (22, 7, 3, true),
-    (23, 7, 3, true),
-    (24, 7, 3, true),
-    (25, 9, 3, true),
+/// The reference's parameters by input size and by level 0 (the base of the negative levels) to
+/// 22 (zstd 1.5.7, lib/compress/clevels.h:25-129, `ZSTD_defaultCParameters`): for each, the
+/// window's log `W`, the hash table's log `H`, the search log `S` (2^S chain positions tried),
+/// the shortest match `L`, and whether the strategy is lazy (`ZSTD_lazy` and beyond) or greedy
+/// and faster (`ZSTD_fast`, `ZSTD_dfast`, `ZSTD_greedy`). Tables 0 to 3 are for inputs above
+/// 256 KB, of at most 256 KB, 128 KB and 16 KB, as `ZSTD_getCParams` chooses them.
+/// A row of [`LEVELS`]: `(W, H, S, L, lazy)`.
+type Params = (u32, u32, u32, usize, bool);
+
+const LEVELS: [[Params; 23]; 4] = [
+    // inputs above 256 KB
+    [
+        (19, 13, 1, 6, false),
+        (19, 14, 1, 7, false),
+        (20, 16, 1, 6, false),
+        (21, 17, 1, 5, false),
+        (21, 18, 1, 5, false),
+        (21, 19, 3, 5, false),
+        (21, 19, 3, 5, true),
+        (21, 20, 4, 5, true),
+        (21, 20, 4, 5, true),
+        (22, 21, 4, 5, true),
+        (22, 22, 5, 5, true),
+        (22, 22, 6, 5, true),
+        (22, 23, 6, 5, true),
+        (22, 22, 4, 5, true),
+        (22, 23, 5, 5, true),
+        (22, 23, 6, 5, true),
+        (22, 22, 5, 5, true),
+        (23, 22, 5, 4, true),
+        (23, 22, 6, 3, true),
+        (23, 22, 7, 3, true),
+        (25, 23, 7, 3, true),
+        (26, 24, 7, 3, true),
+        (27, 25, 9, 3, true),
+    ],
+    // inputs of at most 256 KB
+    [
+        (18, 13, 1, 5, false),
+        (18, 14, 1, 6, false),
+        (18, 14, 1, 5, false),
+        (18, 16, 1, 4, false),
+        (18, 17, 3, 5, false),
+        (18, 18, 5, 5, false),
+        (18, 19, 3, 5, true),
+        (18, 19, 4, 4, true),
+        (18, 19, 4, 4, true),
+        (18, 19, 5, 4, true),
+        (18, 19, 6, 4, true),
+        (18, 19, 5, 4, true),
+        (18, 19, 7, 4, true),
+        (18, 19, 4, 4, true),
+        (18, 19, 4, 3, true),
+        (18, 19, 6, 3, true),
+        (18, 19, 6, 3, true),
+        (18, 19, 8, 3, true),
+        (18, 19, 6, 3, true),
+        (18, 19, 8, 3, true),
+        (18, 19, 10, 3, true),
+        (18, 19, 12, 3, true),
+        (18, 19, 13, 3, true),
+    ],
+    // inputs of at most 128 KB
+    [
+        (17, 12, 1, 5, false),
+        (17, 13, 1, 6, false),
+        (17, 15, 1, 5, false),
+        (17, 16, 2, 5, false),
+        (17, 17, 2, 4, false),
+        (17, 17, 3, 4, false),
+        (17, 17, 3, 4, true),
+        (17, 17, 3, 4, true),
+        (17, 17, 4, 4, true),
+        (17, 17, 5, 4, true),
+        (17, 17, 6, 4, true),
+        (17, 17, 5, 4, true),
+        (17, 17, 7, 4, true),
+        (17, 17, 3, 4, true),
+        (17, 17, 4, 3, true),
+        (17, 17, 6, 3, true),
+        (17, 17, 6, 3, true),
+        (17, 17, 8, 3, true),
+        (17, 17, 10, 3, true),
+        (17, 17, 5, 3, true),
+        (17, 17, 7, 3, true),
+        (17, 17, 9, 3, true),
+        (17, 17, 11, 3, true),
+    ],
+    // inputs of at most 16 KB
+    [
+        (14, 13, 1, 5, false),
+        (14, 15, 1, 5, false),
+        (14, 15, 1, 4, false),
+        (14, 15, 2, 4, false),
+        (14, 14, 4, 4, false),
+        (14, 14, 3, 4, true),
+        (14, 14, 4, 4, true),
+        (14, 14, 6, 4, true),
+        (14, 14, 8, 4, true),
+        (14, 14, 5, 4, true),
+        (14, 14, 9, 4, true),
+        (14, 14, 3, 4, true),
+        (14, 14, 4, 3, true),
+        (14, 14, 5, 3, true),
+        (14, 15, 6, 3, true),
+        (14, 15, 7, 3, true),
+        (14, 15, 5, 3, true),
+        (14, 15, 6, 3, true),
+        (14, 15, 7, 3, true),
+        (14, 15, 8, 3, true),
+        (14, 15, 8, 3, true),
+        (14, 15, 9, 3, true),
+        (14, 15, 10, 3, true),
+    ],
 ];
 
 /// How hard the encoder looks for matches, a level's row of [`LEVELS`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Level {
+    level: i32,
     hash_log: u32,
     chain: u32,
     min_match: usize,
@@ -71,17 +161,50 @@ pub struct Level {
 
 impl Level {
     /// A level by number, as RocksDB passes one: 1 to 22, the negative levels taking the
-    /// reference's base row (0), above 22 the 22nd.
+    /// reference's base row (0), above 22 the 22nd. Its parameters are those for inputs above
+    /// 256 KB until [`Level::fit`] fits them to an input.
     pub fn new(level: i32) -> Self {
+        Self::from_table(level, 0, None)
+    }
+
+    fn from_table(level: i32, table: usize, src_len: Option<usize>) -> Self {
         let row = usize::try_from(level.clamp(0, 22)).unwrap_or(0);
-        let (hash_log, search_log, min_match, lazy) =
-            LEVELS.get(row).copied().unwrap_or((13, 1, 6, false));
+        let (window_log, hash_log, search_log, min_match, lazy) = LEVELS
+            .get(table)
+            .and_then(|t| t.get(row))
+            .copied()
+            .unwrap_or((19, 13, 1, 6, false));
+        // `ZSTD_adjustCParams_internal` (zstd 1.5.7, lib/compress/zstd_compress.c:1551-1565): a
+        // known input shrinks the window to its size, at least 2^6 (`ZSTD_HASHLOG_MIN`), and the
+        // hash table to twice the window.
+        let hash_log = match src_len {
+            Some(len) => {
+                let src_log = if len < 1 << HASH_LOG_MIN {
+                    HASH_LOG_MIN
+                } else {
+                    usize::BITS.saturating_sub(len.saturating_sub(1).leading_zeros())
+                };
+                hash_log.min(window_log.min(src_log).saturating_add(1))
+            }
+            None => hash_log,
+        };
         Self {
+            level,
             hash_log,
             chain: 1u32 << search_log,
             min_match: min_match.max(HASHED),
             lazy,
         }
+    }
+
+    /// The parameters the reference uses for an input of `len` bytes: `ZSTD_getCParams`'s table
+    /// by size (lib/compress/zstd_compress.c:7759-7762), then its adjustment to the size.
+    pub fn fit(self, len: usize) -> Self {
+        let table = [256usize << 10, 128 << 10, 16 << 10]
+            .iter()
+            .filter(|&&bound| len <= bound)
+            .count();
+        Self::from_table(self.level, table, Some(len))
     }
 }
 
@@ -91,6 +214,7 @@ pub fn compress(input: &[u8], level: Level, checksum: bool) -> Result<Vec<u8>, E
 }
 
 fn encode_frame(input: &[u8], level: Level, checksum: bool) -> Result<Vec<u8>, Corrupt> {
+    let level = level.fit(input.len());
     let mut out = Vec::with_capacity((input.len() / 2).saturating_add(32));
     out.extend_from_slice(&FRAME_MAGIC.to_le_bytes());
     frame_header(&mut out, input.len(), checksum);
@@ -258,11 +382,27 @@ impl<'a> Matcher<'a> {
     }
 
     /// The length the input matches itself at `a` and `b` (`b` later), up to `limit`.
+    #[inline]
     fn common(&self, a: usize, b: usize, limit: usize) -> usize {
         let (Some(x), Some(y)) = (self.input.get(a..), self.input.get(b..limit)) else {
             return 0;
         };
-        x.iter().zip(y).take_while(|(p, q)| p == q).count()
+        // Eight bytes at a time, as `ZSTD_count` (zstd 1.5.7, lib/compress/zstd_compress_internal.h)
+        // counts: the lowest set bit of two little-endian words' difference lies in their first
+        // differing byte.
+        let (mut x, mut y, mut n) = (x, y, 0usize);
+        while let (Some((xw, xr)), Some((yw, yr))) =
+            (x.split_first_chunk::<8>(), y.split_first_chunk::<8>())
+        {
+            let d = u64::from_le_bytes(*xw) ^ u64::from_le_bytes(*yw);
+            if d != 0 {
+                return n.saturating_add((d.trailing_zeros() / 8) as usize);
+            }
+            n = n.saturating_add(8);
+            x = xr;
+            y = yr;
+        }
+        n.saturating_add(x.iter().zip(y).take_while(|(p, q)| p == q).count())
     }
 
     /// The longest match at `at` within the block's end `end`, trying the last offset and then the

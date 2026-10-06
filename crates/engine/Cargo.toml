@@ -39,5 +39,9 @@ harness = false
 name = "block_read"
 harness = false
 
+[[bench]]
+name = "codec"
+harness = false
+
 [lints]
 workspace = true

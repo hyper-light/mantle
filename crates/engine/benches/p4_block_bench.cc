@@ -18,6 +18,8 @@
 //         as BlockBasedTable::Get reads a data block
 // `key` is the user key's length (16 by default; db_bench's), which with its 8-byte trailer is
 // within IterKey's 39-byte inline buffer at 16 and past it at 48.
+// Then each workload's tails, "workload_lat index key N p50 p99 p999 max" in nanoseconds
+// per operation (per block for the scan).
 // Output: "workload index key N ns_per_op allocations reallocations minor_faults checksum" for one
 // run; the counts are for the whole workload, and the checksum keeps the reads live. The
 // iterators of `seek` and `get` are made before either is timed, as a table reader keeps one.
@@ -29,6 +31,7 @@
 //   ./p4_block_bench N index key [passes [scan]]
 #include <sys/resource.h>
 
+#include <algorithm>
 #include <chrono>
 #include <new>
 #include <cstdio>
@@ -199,5 +202,54 @@ int main(int argc, char** argv) {
   a1 = g_allocs;
   f1 = Faults();
   printf("get %d %zu %zu %.2f %zu 0 %ld %llu\n", hash, kKey, n, (t1 - t0) / (n * passes), a1 - a0, f1 - f0, static_cast<unsigned long long>(sum));
+  // Tails: every seek and get timed alone, and every block's scan, into a buffer allocated
+  // before; p50, p99, p99.9 and the most, in nanoseconds.
+  std::vector<uint64_t> lat;
+  lat.reserve(std::max(n, blocks.size()));
+  auto report = [&](const char* name) {
+    std::sort(lat.begin(), lat.end());
+    auto at = [&](double q) {
+      return lat[std::min(lat.size() - 1, static_cast<size_t>(lat.size() * q))];
+    };
+    printf("%s %d %zu %zu %llu %llu %llu %llu\n", name, hash, kKey, n,
+           static_cast<unsigned long long>(at(0.5)), static_cast<unsigned long long>(at(0.99)),
+           static_cast<unsigned long long>(at(0.999)),
+           static_cast<unsigned long long>(lat.back()));
+    lat.clear();
+  };
+  auto ns_since = [](std::chrono::steady_clock::time_point t) {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - t)
+                                     .count());
+  };
+  for (auto& blk : blocks) {
+    auto t = std::chrono::steady_clock::now();
+    DataBlockIter* it =
+        blk->NewDataIterator(BytewiseComparator(), kDisableGlobalSequenceNumber, &reused);
+    for (it->SeekToFirst(); it->Valid(); it->Next()) {
+      sum += static_cast<uint8_t>(it->key()[kKey - 1]) + static_cast<uint8_t>(it->value()[0]);
+    }
+    lat.push_back(ns_since(t));
+  }
+  report("scan_block_lat");
+  for (size_t i : order) {
+    auto t = std::chrono::steady_clock::now();
+    DataBlockIter* it = blocks[where[i]]->NewDataIterator(
+        BytewiseComparator(), kDisableGlobalSequenceNumber, &reused);
+    it->Seek(keys[i]);
+    sum += static_cast<uint8_t>(it->value()[0]);
+    lat.push_back(ns_since(t));
+  }
+  report("seek_lat");
+  for (size_t i : order) {
+    auto t = std::chrono::steady_clock::now();
+    DataBlockIter fresh;
+    DataBlockIter* it = blocks[where[i]]->NewDataIterator(
+        BytewiseComparator(), kDisableGlobalSequenceNumber, &fresh);
+    sum += it->SeekForGet(keys[i]) ? static_cast<uint8_t>(it->value()[0]) : 0;
+    lat.push_back(ns_since(t));
+  }
+  report("get_lat");
+  if (sum == 1) printf("\n");
   return 0;
 }

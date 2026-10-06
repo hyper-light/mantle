@@ -5,7 +5,9 @@
 //! `seek` (every key, in a SplitMix64 permutation, in the block that holds it) and `get` (the
 //! same through `seek_for_get`), each handing one iterator's buffers to the next as the port's
 //! table reader will. It prints `workload index key N ns_per_op allocations reallocations
-//! minor_faults checksum` as the C++ does.
+//! minor_faults checksum` as the C++ does, then each workload's
+//! tails, `workload_lat index key N p50 p99 p999 max` in nanoseconds per operation (per block
+//! for the scan).
 //! docs/measurements/2026-10-06-engine-block-read.md records the runs.
 #![allow(
     clippy::unwrap_used,
@@ -190,4 +192,66 @@ fn main() {
         u8::from(hash),
         ns / (n * passes) as f64
     );
+
+    // Tails: every seek and get timed alone, and every block's scan, into a buffer allocated
+    // before; p50, p99, p99.9 and the most, in nanoseconds.
+    let mut lat: Vec<u64> = Vec::with_capacity(n.max(blocks.len()));
+    let report = |name: &str, lat: &mut Vec<u64>| {
+        lat.sort_unstable();
+        let at = |per_mille: usize| lat[(lat.len() * per_mille / 1000).min(lat.len() - 1)];
+        println!(
+            "{name} {} {key_len} {n} {} {} {} {}",
+            u8::from(hash),
+            at(500),
+            at(990),
+            at(999),
+            lat[lat.len() - 1]
+        );
+    };
+    for blk in &blocks {
+        let t = Instant::now();
+        let mut it = blk.new_data_iterator_in(
+            Comparator::Bytewise,
+            DISABLE_GLOBAL_SEQUENCE_NUMBER,
+            buffers,
+        );
+        it.seek_to_first();
+        while it.valid() {
+            sum += u64::from(it.key()[key_len - 1]) + u64::from(it.value()[0]);
+            it.next();
+        }
+        buffers = it.into_buffers();
+        lat.push(t.elapsed().as_nanos() as u64);
+    }
+    report("scan_block_lat", &mut lat);
+    lat.clear();
+    for &i in &order {
+        let t = Instant::now();
+        let mut it = blocks[where_[i] as usize].new_data_iterator_in(
+            Comparator::Bytewise,
+            DISABLE_GLOBAL_SEQUENCE_NUMBER,
+            buffers,
+        );
+        it.seek(&keys[i]);
+        sum += u64::from(it.value()[0]);
+        buffers = it.into_buffers();
+        lat.push(t.elapsed().as_nanos() as u64);
+    }
+    report("seek_lat", &mut lat);
+    lat.clear();
+    for &i in &order {
+        let t = Instant::now();
+        let mut it = blocks[where_[i] as usize].new_data_iterator_in(
+            Comparator::Bytewise,
+            DISABLE_GLOBAL_SEQUENCE_NUMBER,
+            buffers,
+        );
+        if it.seek_for_get(&keys[i]) {
+            sum += u64::from(it.value()[0]);
+        }
+        buffers = it.into_buffers();
+        lat.push(t.elapsed().as_nanos() as u64);
+    }
+    report("get_lat", &mut lat);
+    std::hint::black_box(sum);
 }

@@ -381,6 +381,10 @@ does with bad or unusual ones is not.
 - *A compressed block's stated size.* RocksDB allocates whatever size the prefix states, up to
   `SIZE_MAX` (format.cc:718, `AllocateBlock`), so one corrupt varint asks for exabytes. The port
   refuses a size above the caller's bound before allocating.
+- *Index entries.* RocksDB asserts that a delta-encoded index handle starts where the previous
+  block's trailer ends, and in a release build writes a wrong delta otherwise. It also asserts
+  that a hash-search key is in its prefix extractor's domain, and otherwise reads past the key. The
+  port returns `InvalidArgument` for both.
 - *A protection width RocksDB never writes* (anything but 1, 2, 4 or 8) is `Unsupported`, not
   undefined behaviour in `Encode`.
 - *A seek target too short to be an internal key*, where interpolation search reads its trailer,
@@ -390,11 +394,26 @@ does with bad or unusual ones is not.
   The interpolation guess is computed in 128-bit integers on every target, where RocksDB falls
   back to `double` without them.
 
+- `table/block_based/index_builder.rs`, `flush_block_policy.rs` and `util/slice_transform.rs`:
+  the shortened, hash-search and two-level index builders, the size-based flush policy that cuts
+  index partitions, and the three built-in prefix extractors. RocksDB's index builders indexed 240
+  tables (`tests/golden/p4_index_gen.cc`):
+  - all four index types, both comparators, format_version 2 to 7, every shortening mode;
+  - restart intervals of 1, 2 and 16, partition sizes of 64 to 4096 bytes;
+  - key sets that do and do not force internal-key separators.
+
+  The port returns the same separator, size estimate and partition cut for every block, and the
+  same index blocks, partitions and prefix blocks byte for byte (`tests/index_builder_golden.rs`).
+  Changing the format_version rule, the size estimate, the prefix run count or the top level's
+  value delta each fails it. RocksDB builds the top level of a two-level index without the
+  uniformity threshold, so it is never marked uniform. The port does the same, which the golden
+  caught.
+
 **Open in compression.** Writing LZ4HC, and zlib or ZSTD with a dictionary, is refused as
 unsupported until the codecs have them; reading them already works, except zlib with a dictionary.
 BZip2 and XPRESS are refused both ways, as in a RocksDB build without them.
 
-**Next in P4.** The index builders and the hash-search prefix index; the
+**Next in P4.** The hash-search prefix index the reader builds from those blocks; the
 meta-index and properties blocks; the table builder and reader; `SstFileWriter` and
 `SstFileReader`; the `sst_dump` differential; and the block-read benchmark against RocksDB
 (P15's harness).

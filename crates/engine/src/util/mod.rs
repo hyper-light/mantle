@@ -11,6 +11,7 @@ pub mod hash;
 pub mod math;
 pub mod math128;
 pub mod prefix_varint;
+pub mod slice_transform;
 pub mod string_util;
 pub mod xxhash;
 pub mod xxph3;

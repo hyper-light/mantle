@@ -119,7 +119,26 @@ fn decode(
     out_step: usize,
 ) -> Result<Vec<u8>, String> {
     let mut d = Decoder::new(MAX_WINDOW, dict.cloned());
-    decode_with(&mut d, frame, in_step, out_step)
+    let streamed = decode_with(&mut d, frame, in_step, out_step);
+    // Whatever the stream decodes, the one-shot path decodes the same, with the same decoder.
+    if let Ok(content) = &streamed {
+        assert_eq!(
+            decode_all(&mut d, frame).as_ref(),
+            Ok(content),
+            "one-shot decode differs"
+        );
+    }
+    streamed
+}
+
+/// Decodes `frame`, whole, with [`Decoder::decompress_all`] onto a buffer holding bytes before.
+fn decode_all(decoder: &mut Decoder, frame: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = b"before".to_vec();
+    decoder
+        .decompress_all(frame, &mut out, 1 << 30)
+        .map_err(|e| e.to_string())?;
+    assert_eq!(&out[..6], b"before");
+    Ok(out.split_off(6))
 }
 
 fn reference(data: &[u8], level: i32, checksum: bool, size: bool) -> Vec<u8> {
@@ -261,12 +280,23 @@ fn corrupt_frames_fail_typed_and_never_panic() {
                     "byte {at} bit {bit} decoded to different content"
                 );
             }
+            if let Ok(out) = decode_all(&mut Decoder::new(MAX_WINDOW, None), &f) {
+                assert!(
+                    out == small,
+                    "byte {at} bit {bit} decoded whole to different content"
+                );
+            }
         }
     }
     for cut in 0..frame.len() {
         let mut d = Decoder::new(MAX_WINDOW, None);
         let mut buf = vec![0u8; 4096];
         let _ = d.decompress(&frame[..cut], &mut buf);
+        // No input is no frames; any other cut ends inside the frame.
+        assert!(
+            cut == 0 || decode_all(&mut d, &frame[..cut]).is_err(),
+            "a frame cut at {cut} decoded whole"
+        );
     }
     for data in corpus()
         .iter()
@@ -288,6 +318,12 @@ fn corrupt_frames_fail_typed_and_never_panic() {
                 assert!(
                     out == *data,
                     "a corrupted frame decoded to different content"
+                );
+            }
+            if let Ok(out) = decode_all(&mut Decoder::new(MAX_WINDOW, None), &f) {
+                assert!(
+                    out == *data,
+                    "a corrupted frame decoded whole to different content"
                 );
             }
         }

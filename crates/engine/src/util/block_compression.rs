@@ -336,48 +336,30 @@ fn zstd_decompress(
 ) -> Result<(), Error> {
     let mut own;
     let decoder = if dict.is_empty() {
-        let d = workspace
+        workspace
             .zstd
-            .get_or_insert_with(|| Decoder::new(ZSTD_WINDOW_MAX, None));
-        d.reset();
-        d
+            .get_or_insert_with(|| Decoder::new(ZSTD_WINDOW_MAX, None))
     } else {
         own = Decoder::new(ZSTD_WINDOW_MAX, Some(Dictionary::new(dict)?));
         &mut own
     };
     out.clear();
-    out.try_reserve_exact(len)
+    // The decoder's copies may run past the block's end by its slack, then let it go.
+    out.try_reserve_exact(len.saturating_add(zstd::SLACK))
         .map_err(|_| Error::LimitExceeded {
             what: "a ZSTD block's output",
             limit: u64::try_from(len).unwrap_or(u64::MAX),
         })?;
-    out.resize(len, 0);
-    let (mut consumed, mut produced) = (0usize, 0usize);
     let bad = |why| Error::corruption("ZSTD block", why);
-    loop {
-        let progress = decoder.decompress(
-            body.get(consumed..).unwrap_or_default(),
-            out.get_mut(produced..).unwrap_or_default(),
-        )?;
-        consumed = consumed
-            .checked_add(progress.consumed)
-            .ok_or(bad(Malformed::TooLarge))?;
-        produced = produced
-            .checked_add(progress.produced)
-            .ok_or(bad(Malformed::TooLarge))?;
-        if consumed == body.len() && progress.frame_done {
-            break;
-        }
-        if progress.consumed == 0 && progress.produced == 0 {
-            // No progress: the input ended inside a frame, or the frame holds more than `len`.
-            return Err(bad(if produced == len {
-                Malformed::TooLarge
-            } else {
-                Malformed::Truncated
-            }));
-        }
-    }
-    if produced != len {
+    // The block is whole in memory: every frame is decoded straight into `out`. Frames that hold
+    // more than the block states are corrupt, not a limit reached.
+    decoder
+        .decompress_all(body, out, len)
+        .map_err(|e| match e {
+            Error::LimitExceeded { .. } => bad(Malformed::TooLarge),
+            e => e,
+        })?;
+    if out.len() != len {
         return Err(bad(Malformed::CountMismatch));
     }
     Ok(())

@@ -5,11 +5,12 @@
 //! into a buffer that never holds more than one block (§3.1.1.2.4: at most 128 KiB); a block is
 //! decoded into the window, which keeps the frame's `Window_Size` of history for matches and the
 //! bytes not yet handed out. A frame whose window passes the decoder's bound is refused before
-//! anything is allocated for it.
+//! anything is allocated for it. Input that holds its frames whole, as a table's block does, is
+//! decoded by [`Decoder::decompress_all`] straight into the caller's buffer instead.
 
 use super::Corrupt;
 use super::huffman::Huffman;
-use super::sequences::{self, Sequence, Tables};
+use super::sequences::{self, Predefined, Sequence, Tables};
 use crate::error::Error;
 use crate::util::xxhash::Xxh64;
 
@@ -29,6 +30,12 @@ const BLOCK_HEADER: usize = 3;
 const RAW_DICTIONARY_MIN: usize = 8;
 /// The repeat offsets a frame starts with when no dictionary gives them (§3.1.1.5).
 const START_OFFSETS: [u32; 3] = [1, 4, 8];
+/// Bytes past a block's end its execution may write and then let go: literals and matches are
+/// copied [`WILD_COPY`] bytes at a time, the last copy running past the end (the reference's
+/// `WILDCOPY_OVERLENGTH`, zstd 1.5.7 `lib/common/zstd_internal.h`, is 32 for its 32-byte copies).
+pub const SLACK: usize = 2 * WILD_COPY;
+/// The bytes one wild copy moves.
+const WILD_COPY: usize = 16;
 /// The window's smallest exponent base (§3.1.1.1.2: `windowLog = 10 + Exponent`).
 const WINDOW_LOG_BASE: u32 = 10;
 
@@ -38,7 +45,7 @@ const WINDOW_LOG_BASE: u32 = 10;
 pub struct Dictionary {
     id: u32,
     content: Vec<u8>,
-    huffman: Option<Huffman>,
+    huffman: Huffman,
     tables: Tables,
     offsets: [u32; 3],
 }
@@ -58,7 +65,7 @@ impl Dictionary {
             return Ok(Self {
                 id: 0,
                 content: bytes.to_vec(),
-                huffman: None,
+                huffman: Huffman::default(),
                 tables: Tables::default(),
                 offsets: START_OFFSETS,
             });
@@ -68,7 +75,8 @@ impl Dictionary {
             return Err(Corrupt::Dictionary);
         }
         let mut at = 8usize;
-        let (huffman, used) = Huffman::read(bytes.get(at..).ok_or(Corrupt::Dictionary)?)?;
+        let mut huffman = Huffman::default();
+        let used = huffman.read(bytes.get(at..).ok_or(Corrupt::Dictionary)?)?;
         at = at.checked_add(used).ok_or(Corrupt::Dictionary)?;
         // Offsets, match lengths, literals lengths, in that order (§5), each a description.
         let mut tables = Tables::default();
@@ -87,7 +95,7 @@ impl Dictionary {
         Ok(Self {
             id,
             content,
-            huffman: Some(huffman),
+            huffman,
             tables,
             offsets,
         })
@@ -155,11 +163,14 @@ pub struct Decoder {
     /// Bytes this frame has decoded, in blocks before the current one.
     decoded: u64,
     hasher: Xxh64,
-    huffman: Option<Huffman>,
+    huffman: Huffman,
     tables: Tables,
+    /// The predefined sequence tables, built at the first block that uses them.
+    predefined: Option<Predefined>,
     offsets: [u32; 3],
+    /// The block's literals, then [`SLACK`] bytes a wild copy may read.
     literals: Vec<u8>,
-    sequences: Vec<Sequence>,
+    literals_len: usize,
 }
 
 impl Decoder {
@@ -177,11 +188,12 @@ impl Decoder {
             frame_start: 0,
             decoded: 0,
             hasher: Xxh64::new(0),
-            huffman: None,
+            huffman: Huffman::default(),
             tables: Tables::default(),
+            predefined: None,
             offsets: START_OFFSETS,
             literals: Vec::new(),
-            sequences: Vec::new(),
+            literals_len: 0,
         }
     }
 
@@ -193,6 +205,88 @@ impl Decoder {
         self.window.clear();
         self.emitted = 0;
         self.frame_start = 0;
+    }
+
+    /// Decodes every frame of `input`, which holds them whole, onto the end of `out`, refusing
+    /// more than `limit` bytes of output; `out` is the window, so its bytes are written once and
+    /// never copied. Ends any frame in progress first and after.
+    pub fn decompress_all(
+        &mut self,
+        input: &[u8],
+        out: &mut Vec<u8>,
+        limit: usize,
+    ) -> Result<(), Error> {
+        self.reset();
+        std::mem::swap(&mut self.window, out);
+        let decoded = self.frames(input, limit);
+        std::mem::swap(&mut self.window, out);
+        self.reset();
+        decoded
+    }
+
+    /// [`Self::decompress_all`]'s frames, decoded onto the window.
+    fn frames(&mut self, input: &[u8], limit: usize) -> Result<(), Error> {
+        let start = self.window.len();
+        let mut at = 0usize;
+        let take = |at: &mut usize, len: usize| -> Result<&[u8], Corrupt> {
+            let end = at.checked_add(len).ok_or(Corrupt::Truncated)?;
+            let bytes = input.get(*at..end).ok_or(Corrupt::Truncated)?;
+            *at = end;
+            Ok(bytes)
+        };
+        while at < input.len() {
+            let magic = read_u32(take(&mut at, 4)?, 0).ok_or(Corrupt::Truncated)?;
+            if magic & SKIPPABLE_MASK == SKIPPABLE_MAGIC {
+                let size = read_u32(take(&mut at, 4)?, 0).ok_or(Corrupt::Truncated)?;
+                take(
+                    &mut at,
+                    usize::try_from(size).map_err(|_| Corrupt::Truncated)?,
+                )?;
+                continue;
+            }
+            if magic != FRAME_MAGIC {
+                return Err(Corrupt::Magic.into());
+            }
+            let descriptor = *input.get(at).ok_or(Corrupt::Truncated)?;
+            let header = take(&mut at, header_length(descriptor))?;
+            self.begin_frame(header)?;
+            loop {
+                let raw = read_le(take(&mut at, BLOCK_HEADER)?, 0, BLOCK_HEADER)
+                    .ok_or(Corrupt::Truncated)?;
+                let last = raw & 1 == 1;
+                let kind = u8::try_from((raw >> 1) & 0b11).map_err(|_| Corrupt::Block)?;
+                let size = usize::try_from(raw >> 3).map_err(|_| Corrupt::Block)?;
+                let frame = self.frame.ok_or(Corrupt::Block)?;
+                if kind == 3 || size > frame.block_max {
+                    return Err(Corrupt::Block.into());
+                }
+                // An RLE block's content is its one byte (§3.1.1.2.2).
+                let content = take(&mut at, if kind == 1 { 1 } else { size })?;
+                self.block(kind, size, content)?;
+                if self.window.len().saturating_sub(start) > limit {
+                    return Err(Error::LimitExceeded {
+                        what: "ZSTD output",
+                        limit: u64::try_from(limit).unwrap_or(u64::MAX),
+                    });
+                }
+                if last {
+                    break;
+                }
+            }
+            let frame = self.frame.ok_or(Corrupt::Block)?;
+            if frame.content_size.is_some_and(|size| size != self.decoded) {
+                return Err(Corrupt::ContentSize.into());
+            }
+            if frame.checksum {
+                let stored = read_u32(take(&mut at, 4)?, 0).ok_or(Corrupt::Truncated)?;
+                // The low 4 bytes of XXH64 of the content, seed 0 (§3.1.1).
+                if u64::from(stored) != self.hasher.digest() & 0xFFFF_FFFF {
+                    return Err(Corrupt::Checksum.into());
+                }
+            }
+            self.end_frame();
+        }
+        Ok(())
     }
 
     /// Takes what it can of `input` and writes what it can into `output`.
@@ -307,7 +401,12 @@ impl Decoder {
                 };
             }
             Stage::Skip { .. } => {}
-            Stage::Header => self.begin_frame()?,
+            Stage::Header => {
+                let unit = std::mem::take(&mut self.unit);
+                let begun = self.begin_frame(&unit);
+                self.unit = unit;
+                begun?;
+            }
             Stage::BlockHeader => {
                 let raw = u32::from(*self.unit.first().ok_or(Corrupt::Truncated)?)
                     | u32::from(*self.unit.get(1).ok_or(Corrupt::Truncated)?) << 8
@@ -327,31 +426,10 @@ impl Decoder {
                 }
             }
             Stage::Block { last, kind, size } => {
-                let start = self.window.len();
-                match kind {
-                    0 => self.window.extend_from_slice(&self.unit),
-                    1 => {
-                        let byte = *self.unit.first().ok_or(Corrupt::Truncated)?;
-                        self.window
-                            .resize(start.checked_add(size).ok_or(Corrupt::Block)?, byte);
-                    }
-                    _ => {
-                        let unit = std::mem::take(&mut self.unit);
-                        let decoded = self.compressed_block(&unit);
-                        self.unit = unit;
-                        decoded?;
-                    }
-                }
-                let block = self.window.get(start..).unwrap_or_default();
-                let frame = self.frame.ok_or(Corrupt::Block)?;
-                if block.len() > frame.block_max {
-                    return Err(Corrupt::Block.into());
-                }
-                self.hasher.update(block);
-                self.decoded = self
-                    .decoded
-                    .checked_add(u64::try_from(block.len()).unwrap_or(u64::MAX))
-                    .ok_or(Corrupt::ContentSize)?;
+                let unit = std::mem::take(&mut self.unit);
+                let decoded = self.block(kind, size, &unit);
+                self.unit = unit;
+                let frame = decoded?;
                 if last {
                     self.end_blocks(frame)?;
                 } else {
@@ -370,9 +448,37 @@ impl Decoder {
         Ok(())
     }
 
-    /// Parses the frame header in `unit` and readies the frame's state.
-    fn begin_frame(&mut self) -> Result<(), Error> {
-        let header = &self.unit;
+    /// Decodes one block's `content` (a raw block's bytes, an RLE block's one byte, or a
+    /// compressed block) of `kind` and stated `size` onto the window, and returns its frame.
+    fn block(&mut self, kind: u8, size: usize, content: &[u8]) -> Result<Frame, Error> {
+        let start = self.window.len();
+        match kind {
+            0 => self.window.extend_from_slice(content),
+            1 => {
+                let byte = *content.first().ok_or(Corrupt::Truncated)?;
+                self.window
+                    .resize(start.checked_add(size).ok_or(Corrupt::Block)?, byte);
+            }
+            _ => self.compressed_block(content)?,
+        }
+        let block = self.window.get(start..).unwrap_or_default();
+        let frame = self.frame.ok_or(Corrupt::Block)?;
+        if block.len() > frame.block_max {
+            return Err(Corrupt::Block.into());
+        }
+        // Only a frame that carries the checksum needs its content hashed.
+        if frame.checksum {
+            self.hasher.update(block);
+        }
+        self.decoded = self
+            .decoded
+            .checked_add(u64::try_from(block.len()).unwrap_or(u64::MAX))
+            .ok_or(Corrupt::ContentSize)?;
+        Ok(frame)
+    }
+
+    /// Parses the frame header `header` and readies the frame's state.
+    fn begin_frame(&mut self, header: &[u8]) -> Result<(), Error> {
         let descriptor = *header.first().ok_or(Corrupt::Truncated)?;
         if descriptor & 0b0000_1000 != 0 {
             return Err(Corrupt::Header.into());
@@ -441,13 +547,13 @@ impl Decoder {
         self.hasher = Xxh64::new(0);
         match &self.dictionary {
             Some(d) => {
-                self.huffman = d.huffman.clone();
-                self.tables = d.tables.clone();
+                self.huffman.clone_from(&d.huffman);
+                self.tables.clone_from(&d.tables);
                 self.offsets = d.offsets;
             }
             None => {
-                self.huffman = None;
-                self.tables = Tables::default();
+                self.huffman.unset();
+                self.tables.unset();
                 self.offsets = START_OFFSETS;
             }
         }
@@ -476,9 +582,40 @@ impl Decoder {
     /// Decodes a compressed block (§3.1.1.3) onto the window.
     fn compressed_block(&mut self, block: &[u8]) -> Result<(), Error> {
         let used = self.literals_section(block)?;
+        self.literals_len = self.literals.len();
+        self.literals.resize(
+            self.literals_len
+                .checked_add(SLACK)
+                .ok_or(Corrupt::Literals)?,
+            0,
+        );
         let section = block.get(used..).ok_or(Corrupt::Literals)?;
-        sequences::decode(section, &mut self.tables, &mut self.sequences)?;
-        self.execute()?;
+        if self.predefined.is_none() {
+            self.predefined = Some(Predefined::new()?);
+        }
+        let predefined = self.predefined.as_ref().ok_or(Corrupt::Sequences)?;
+        let frame = self.frame.ok_or(Corrupt::Execution)?;
+        let block_start = self.window.len();
+        let block_end = grow(&mut self.window, frame.block_max)?;
+        let mut exec = Execution {
+            window: &mut self.window,
+            at: block_start,
+            block_start,
+            block_end,
+            literals: &self.literals,
+            literals_len: self.literals_len,
+            lit: 0,
+            offsets: &mut self.offsets,
+            dictionary: self.dictionary.as_ref().map(|d| d.content.as_slice()),
+            frame_start: self.frame_start,
+            frame,
+            decoded: self.decoded,
+        };
+        let applied =
+            sequences::decode(section, &mut self.tables, predefined, |seq| exec.apply(seq));
+        let finished = applied.and_then(|()| exec.finish());
+        exec.close();
+        finished?;
         Ok(())
     }
 
@@ -541,56 +678,204 @@ impl Decoder {
         let end = header.checked_add(compressed).ok_or(Corrupt::Literals)?;
         let mut body = block.get(header..end).ok_or(Corrupt::Literals)?;
         if kind == 2 {
-            let (tree, used) = Huffman::read(body)?;
-            self.huffman = Some(tree);
+            let used = self.huffman.read(body)?;
             body = body.get(used..).ok_or(Corrupt::Literals)?;
         }
-        let tree = self.huffman.as_ref().ok_or(Corrupt::Literals)?;
+        if !self.huffman.is_set() {
+            return Err(Corrupt::Literals);
+        }
         self.literals.resize(regenerated, 0);
-        tree.literals(body, four, &mut self.literals)?;
+        self.huffman.literals(body, four, &mut self.literals)?;
         Ok(end)
     }
+}
 
-    /// Executes the block's sequences onto the window, then appends the literals left
-    /// (§3.1.1.4, §3.1.1.5).
-    fn execute(&mut self) -> Result<(), Corrupt> {
-        let frame = self.frame.ok_or(Corrupt::Execution)?;
-        let block_start = self.window.len();
-        let mut lit = 0usize;
-        for seq in &self.sequences {
-            let ll = usize::try_from(seq.literals).map_err(|_| Corrupt::Execution)?;
-            let lit_end = lit.checked_add(ll).ok_or(Corrupt::Execution)?;
-            self.window
-                .extend_from_slice(self.literals.get(lit..lit_end).ok_or(Corrupt::Execution)?);
-            lit = lit_end;
-            let offset = resolve_offset(&mut self.offsets, seq.offset_value, seq.literals)?;
-            let offset = usize::try_from(offset).map_err(|_| Corrupt::Execution)?;
-            let length = usize::try_from(seq.match_length).map_err(|_| Corrupt::Execution)?;
-            // This frame's bytes so far, earlier blocks' and this one's (§5's "decoded from this
-            // frame").
-            let so_far = self
-                .decoded
-                .checked_add(
-                    u64::try_from(self.window.len().saturating_sub(block_start))
-                        .unwrap_or(u64::MAX),
-                )
+/// Grows `window` by the most a block of `block_max` bytes may add, plus [`SLACK`], and returns
+/// where the block may end.
+fn grow(window: &mut Vec<u8>, block_max: usize) -> Result<usize, Corrupt> {
+    let block_end = window
+        .len()
+        .checked_add(block_max)
+        .ok_or(Corrupt::Execution)?;
+    let grown = block_end.checked_add(SLACK).ok_or(Corrupt::Execution)?;
+    window
+        .try_reserve(grown.saturating_sub(window.len()))
+        .map_err(|_| Corrupt::Execution)?;
+    window.resize(grown, 0);
+    Ok(block_end)
+}
+
+/// One block's execution (§3.1.1.4, §3.1.1.5) onto the window: each sequence's literals, then
+/// its match, as the sequences are decoded, and the literals left at the end.
+///
+/// The window is grown by the most a block may add, plus [`SLACK`], before the first sequence
+/// ([`grow`]),
+/// so a copy moves [`WILD_COPY`]-byte pieces and may run past its end into bytes a later copy
+/// writes (the reference's `ZSTD_wildcopy`); [`Execution::close`] cuts the window back to the
+/// bytes decoded.
+struct Execution<'a> {
+    window: &'a mut Vec<u8>,
+    /// Where the next byte goes.
+    at: usize,
+    block_start: usize,
+    /// The block's last byte may go no further than this.
+    block_end: usize,
+    /// The literals, followed by at least [`SLACK`] bytes a wild copy may read.
+    literals: &'a [u8],
+    literals_len: usize,
+    lit: usize,
+    offsets: &'a mut [u32; 3],
+    dictionary: Option<&'a [u8]>,
+    frame_start: usize,
+    frame: Frame,
+    /// The frame's bytes in blocks before this one.
+    decoded: u64,
+}
+
+impl Execution<'_> {
+    /// Copies `len` literals to the window, refusing to pass the block's end.
+    #[inline(always)]
+    fn literals(&mut self, len: usize) -> Result<(), Corrupt> {
+        let lit_end = self.lit.checked_add(len).ok_or(Corrupt::Execution)?;
+        let end = self.at.checked_add(len).ok_or(Corrupt::Execution)?;
+        if lit_end > self.literals_len || end > self.block_end {
+            return Err(Corrupt::Execution);
+        }
+        if len <= WILD_COPY {
+            // One piece: both have SLACK bytes past these ends, the literals' buffer and the
+            // grown window, and it runs at most WILD_COPY - 1 bytes past.
+            let src = self
+                .literals
+                .get(self.lit..self.lit.wrapping_add(WILD_COPY))
                 .ok_or(Corrupt::Execution)?;
-            copy_match(
-                &mut self.window,
-                self.frame_start,
-                self.dictionary.as_ref().map(|d| d.content.as_slice()),
-                frame.window,
-                so_far,
-                offset,
-                length,
-            )?;
-            if self.window.len().saturating_sub(block_start) > frame.block_max {
-                return Err(Corrupt::Execution);
+            self.window
+                .get_mut(self.at..self.at.wrapping_add(WILD_COPY))
+                .ok_or(Corrupt::Execution)?
+                .copy_from_slice(src);
+        } else {
+            let src = self
+                .literals
+                .get(self.lit..lit_end)
+                .ok_or(Corrupt::Execution)?;
+            self.window
+                .get_mut(self.at..end)
+                .ok_or(Corrupt::Execution)?
+                .copy_from_slice(src);
+        }
+        self.lit = lit_end;
+        self.at = end;
+        Ok(())
+    }
+
+    /// Copies a match of `length` bytes from `offset` back. Bytes before the frame's first come
+    /// from the dictionary's content, allowed while the frame has decoded no more than its
+    /// window (§5); a match may overlap the bytes it writes.
+    #[inline(always)]
+    fn copy_match(&mut self, offset: usize, length: usize) -> Result<(), Corrupt> {
+        let end = self.at.checked_add(length).ok_or(Corrupt::Execution)?;
+        if offset == 0 || end > self.block_end {
+            return Err(Corrupt::Execution);
+        }
+        let frame_bytes = self.at.saturating_sub(self.frame_start);
+        if offset > frame_bytes {
+            return self.copy_from_dictionary(offset, length);
+        }
+        // `offset <= frame_bytes <= at`.
+        let src = self.at.wrapping_sub(offset);
+        // Every range below is under `end + WILD_COPY`, inside the grown window.
+        if end.wrapping_add(WILD_COPY) > self.window.len() {
+            return Err(Corrupt::Execution);
+        }
+        if length <= offset {
+            if length <= WILD_COPY && offset >= WILD_COPY {
+                // One piece, its source wholly before its destination; it may run past `end`.
+                let mut piece = [0u8; WILD_COPY];
+                piece.copy_from_slice(
+                    self.window
+                        .get(src..src.wrapping_add(WILD_COPY))
+                        .ok_or(Corrupt::Execution)?,
+                );
+                self.window
+                    .get_mut(self.at..self.at.wrapping_add(WILD_COPY))
+                    .ok_or(Corrupt::Execution)?
+                    .copy_from_slice(&piece);
+            } else {
+                // The source ends at or before the destination begins.
+                self.window
+                    .copy_within(src..src.wrapping_add(length), self.at);
+            }
+        } else {
+            // Overlapping: the bytes from `src` repeat with period `offset`, so each pass copies
+            // every byte already there from `src` on and the run doubles; byte for byte it is
+            // the forward copy the format defines.
+            let mut to = self.at;
+            while to < end {
+                let run = to.wrapping_sub(src).min(end.wrapping_sub(to));
+                self.window.copy_within(src..src.wrapping_add(run), to);
+                to = to.wrapping_add(run);
             }
         }
-        self.window
-            .extend_from_slice(self.literals.get(lit..).ok_or(Corrupt::Execution)?);
+        self.at = end;
         Ok(())
+    }
+
+    /// A match reaching back past the frame's first byte into the dictionary's content.
+    #[cold]
+    fn copy_from_dictionary(&mut self, offset: usize, length: usize) -> Result<(), Corrupt> {
+        let frame_bytes = self.at.saturating_sub(self.frame_start);
+        // This frame's bytes so far, earlier blocks' and this one's (§5's "decoded from this
+        // frame"): the window must hold every one, and they must be within the frame's window.
+        let so_far = self
+            .decoded
+            .checked_add(
+                u64::try_from(self.at.saturating_sub(self.block_start)).unwrap_or(u64::MAX),
+            )
+            .ok_or(Corrupt::Execution)?;
+        let whole = u64::try_from(frame_bytes).unwrap_or(u64::MAX) == so_far;
+        if !whole || so_far > u64::try_from(self.frame.window).unwrap_or(u64::MAX) {
+            return Err(Corrupt::Execution);
+        }
+        let dict = self.dictionary.ok_or(Corrupt::Execution)?;
+        // Into the dictionary: `offset - frame_bytes` bytes back from its end.
+        let back = offset.saturating_sub(frame_bytes);
+        let start = dict.len().checked_sub(back).ok_or(Corrupt::Execution)?;
+        let from_dict = back.min(length);
+        let src = dict
+            .get(start..start.checked_add(from_dict).ok_or(Corrupt::Execution)?)
+            .ok_or(Corrupt::Execution)?;
+        let to = self.at.checked_add(from_dict).ok_or(Corrupt::Execution)?;
+        self.window
+            .get_mut(self.at..to)
+            .ok_or(Corrupt::Execution)?
+            .copy_from_slice(src);
+        self.at = to;
+        let rest = length.saturating_sub(from_dict);
+        if rest == 0 {
+            return Ok(());
+        }
+        // The rest continues from the frame's first byte, `offset` back from the new end.
+        self.copy_match(offset, rest)
+    }
+
+    /// One sequence: its literals, then its match.
+    #[inline(always)]
+    fn apply(&mut self, seq: Sequence) -> Result<(), Corrupt> {
+        let ll = usize::try_from(seq.literals).map_err(|_| Corrupt::Execution)?;
+        self.literals(ll)?;
+        let offset = resolve_offset(self.offsets, seq.offset_value, seq.literals)?;
+        let offset = usize::try_from(offset).map_err(|_| Corrupt::Execution)?;
+        let length = usize::try_from(seq.match_length).map_err(|_| Corrupt::Execution)?;
+        self.copy_match(offset, length)
+    }
+
+    /// The literals left after the last sequence.
+    fn finish(&mut self) -> Result<(), Corrupt> {
+        self.literals(self.literals_len.saturating_sub(self.lit))
+    }
+
+    /// Cuts the window back to the bytes decoded.
+    fn close(self) {
+        self.window.truncate(self.at);
     }
 }
 
@@ -664,63 +949,6 @@ fn resolve_offset(offsets: &mut [u32; 3], value: u32, literals: u32) -> Result<u
         }
     };
     Ok(offset)
-}
-
-/// Copies a match of `length` bytes from `offset` back onto `window`, whose frame bytes begin at
-/// `frame_start`. Bytes before the frame's first come from the dictionary's content, allowed
-/// while the frame has decoded (`so_far`) no more than its window (§5); a match may overlap the
-/// bytes it writes.
-fn copy_match(
-    window: &mut Vec<u8>,
-    frame_start: usize,
-    dictionary: Option<&[u8]>,
-    window_size: usize,
-    so_far: u64,
-    offset: usize,
-    length: usize,
-) -> Result<(), Corrupt> {
-    if offset == 0 {
-        return Err(Corrupt::Execution);
-    }
-    // The frame's bytes the window holds.
-    let frame_bytes = window.len().saturating_sub(frame_start);
-    let mut remaining = length;
-    if offset > frame_bytes {
-        // Only the dictionary lies further back, and only while the frame is within its window
-        // and holds every byte it decoded.
-        let whole = u64::try_from(frame_bytes).unwrap_or(u64::MAX) == so_far;
-        if !whole || so_far > u64::try_from(window_size).unwrap_or(u64::MAX) {
-            return Err(Corrupt::Execution);
-        }
-        // Into the dictionary: `offset - frame_bytes` bytes back from its end.
-        let dict = dictionary.ok_or(Corrupt::Execution)?;
-        let back = offset.saturating_sub(frame_bytes);
-        let start = dict.len().checked_sub(back).ok_or(Corrupt::Execution)?;
-        let from_dict = back.min(remaining);
-        window.extend_from_slice(
-            dict.get(start..start.checked_add(from_dict).ok_or(Corrupt::Execution)?)
-                .ok_or(Corrupt::Execution)?,
-        );
-        remaining = remaining.saturating_sub(from_dict);
-        if remaining == 0 {
-            return Ok(());
-        }
-        // The rest continues from the frame's first byte, `offset` back from the new end.
-    }
-    let start = window.len().checked_sub(offset).ok_or(Corrupt::Execution)?;
-    if offset >= remaining {
-        let end = start.checked_add(remaining).ok_or(Corrupt::Execution)?;
-        window.extend_from_within(start..end);
-    } else {
-        // Overlapping: each byte may be one this copy wrote.
-        for i in 0..remaining {
-            let byte = *window
-                .get(start.checked_add(i).ok_or(Corrupt::Execution)?)
-                .ok_or(Corrupt::Execution)?;
-            window.push(byte);
-        }
-    }
-    Ok(())
 }
 
 /// A little-endian u32 at `at`.

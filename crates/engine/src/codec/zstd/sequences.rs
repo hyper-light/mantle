@@ -6,7 +6,8 @@ use super::Corrupt;
 use super::bits::Backward;
 use super::fse::{
     LITERALS_LENGTH_DEFAULT, LITERALS_LENGTH_DEFAULT_LOG, MATCH_LENGTH_DEFAULT,
-    MATCH_LENGTH_DEFAULT_LOG, OFFSET_DEFAULT, OFFSET_DEFAULT_LOG, State, Table, read_distribution,
+    MATCH_LENGTH_DEFAULT_LOG, OFFSET_DEFAULT, OFFSET_DEFAULT_LOG, SYMBOLS_MAX, Spread,
+    read_distribution,
 };
 
 /// Literals length codes 0 to 35 (§3.1.1.3.2.1.1, Table 16): baseline and extra bits.
@@ -120,12 +121,201 @@ pub(super) struct Sequence {
     pub(super) match_length: u32,
 }
 
+/// One cell of a sequence code's decoding table: the code's baseline and extra bits beside the
+/// state's next baseline and bits, as the reference's `ZSTD_seqSymbol` holds them (zstd 1.5.7
+/// `lib/decompress/zstd_decompress_internal.h`), so a sequence takes one lookup per code.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SeqCell {
+    base: u32,
+    extra: u8,
+    bits: u8,
+    next: u16,
+}
+
+/// A sequence code's decoding table of `1 << log` cells.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SeqTable {
+    log: u32,
+    cells: Vec<SeqCell>,
+}
+
+impl Clone for SeqTable {
+    fn clone(&self) -> Self {
+        Self {
+            log: self.log,
+            cells: self.cells.clone(),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.log = source.log;
+        self.cells.clone_from(&source.cells);
+    }
+}
+
+impl SeqTable {
+    /// Makes this the table of a normalized distribution, its cells with `kind`'s baselines
+    /// and extra bits: spread and finished in one pass, as `ZSTD_buildFSETable` builds it. Every
+    /// cell is written, so a table of the same size is not cleared first.
+    fn build(&mut self, norm: &[i16], log: u32, kind: Kind) -> Result<(), Corrupt> {
+        if norm.len() > kind.max_symbols() {
+            return Err(Corrupt::Sequences);
+        }
+        let mut spread = Spread::new();
+        let size = spread.spread(norm, log)?;
+        self.log = log;
+        if self.cells.len() != size {
+            self.cells.resize(size, SeqCell::default());
+        }
+        let symbols = spread.symbols;
+        for (cell, &symbol) in self.cells.iter_mut().zip(&symbols) {
+            let (bits, next) = spread.transition(symbol)?;
+            let (base, extra) = kind.code(symbol)?;
+            *cell = SeqCell {
+                base,
+                extra,
+                bits,
+                next,
+            };
+        }
+        Ok(())
+    }
+
+    /// Makes this the one-cell table of RLE_Mode (§3.1.1.3.2.1): every state decodes `symbol`
+    /// and stays.
+    fn rle(&mut self, symbol: u8, kind: Kind) -> Result<(), Corrupt> {
+        let (base, extra) = kind.code(symbol)?;
+        self.log = 0;
+        self.cells.clear();
+        self.cells.push(SeqCell {
+            base,
+            extra,
+            bits: 0,
+            next: 0,
+        });
+        Ok(())
+    }
+
+    /// The cell of `state`: every state is below the table's size (`fse::Table::at`), and the
+    /// mask keeps the lookup in the table all the same.
+    #[inline(always)]
+    fn at(&self, state: u32) -> SeqCell {
+        let mask = self.cells.len().wrapping_sub(1);
+        let index = usize::try_from(state).unwrap_or(usize::MAX) & mask;
+        self.cells.get(index).copied().unwrap_or_default()
+    }
+}
+
+/// Where a symbol type's table comes from, kept for Repeat_Mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Source {
+    /// None yet: Repeat_Mode is refused.
+    #[default]
+    Unset,
+    /// The predefined distribution's table (§3.1.1.3.2.2).
+    Predefined,
+    /// The slot's own table, from an RLE symbol or a description.
+    Own,
+}
+
+/// One symbol type's table: the predefined one, or one the stream gave, rebuilt in place.
+#[derive(Debug, Default)]
+pub(super) struct Slot {
+    source: Source,
+    own: SeqTable,
+}
+
+impl Clone for Slot {
+    fn clone(&self) -> Self {
+        Self {
+            source: self.source,
+            own: self.own.clone(),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.source = source.source;
+        self.own.clone_from(&source.own);
+    }
+}
+
+impl Slot {
+    /// Forgets the table, keeping its cells' allocation.
+    pub(super) fn unset(&mut self) {
+        self.source = Source::Unset;
+    }
+
+    fn table<'a>(&'a self, predefined: &'a SeqTable) -> Result<&'a SeqTable, Corrupt> {
+        match self.source {
+            Source::Unset => Err(Corrupt::Sequences),
+            Source::Predefined => Ok(predefined),
+            Source::Own => Ok(&self.own),
+        }
+    }
+}
+
 /// The three tables a block's sequences are decoded with, kept for Repeat_Mode.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub(super) struct Tables {
-    pub(super) literals_length: Option<Table>,
-    pub(super) offset: Option<Table>,
-    pub(super) match_length: Option<Table>,
+    literals_length: Slot,
+    offset: Slot,
+    match_length: Slot,
+}
+
+impl Clone for Tables {
+    fn clone(&self) -> Self {
+        Self {
+            literals_length: self.literals_length.clone(),
+            offset: self.offset.clone(),
+            match_length: self.match_length.clone(),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.literals_length.clone_from(&source.literals_length);
+        self.offset.clone_from(&source.offset);
+        self.match_length.clone_from(&source.match_length);
+    }
+}
+
+impl Tables {
+    /// Forgets every table, keeping the allocations, as a frame without a dictionary starts.
+    pub(super) fn unset(&mut self) {
+        self.literals_length.unset();
+        self.offset.unset();
+        self.match_length.unset();
+    }
+}
+
+/// The predefined distributions' tables (§3.1.1.3.2.2), built once for a decoder's life.
+#[derive(Debug)]
+pub(super) struct Predefined {
+    literals_length: SeqTable,
+    offset: SeqTable,
+    match_length: SeqTable,
+}
+
+impl Predefined {
+    pub(super) fn new() -> Result<Self, Corrupt> {
+        let table = |norm: &[i16], log: u32, kind: Kind| -> Result<SeqTable, Corrupt> {
+            let mut seq = SeqTable::default();
+            seq.build(norm, log, kind)?;
+            Ok(seq)
+        };
+        Ok(Self {
+            literals_length: table(
+                &LITERALS_LENGTH_DEFAULT,
+                LITERALS_LENGTH_DEFAULT_LOG,
+                Kind::LiteralsLength,
+            )?,
+            offset: table(&OFFSET_DEFAULT, OFFSET_DEFAULT_LOG, Kind::Offset)?,
+            match_length: table(
+                &MATCH_LENGTH_DEFAULT,
+                MATCH_LENGTH_DEFAULT_LOG,
+                Kind::MatchLength,
+            )?,
+        })
+    }
 }
 
 /// Which symbol type a table is for.
@@ -145,6 +335,28 @@ impl Kind {
         }
     }
 
+    /// Code `symbol`'s baseline and extra bits (§3.1.1.3.2.1.1).
+    #[inline(always)]
+    fn code(self, symbol: u8) -> Result<(u32, u8), Corrupt> {
+        match self {
+            Self::LiteralsLength => LITERALS_LENGTH_CODES
+                .get(usize::from(symbol))
+                .copied()
+                .ok_or(Corrupt::Sequences),
+            Self::MatchLength => MATCH_LENGTH_CODES
+                .get(usize::from(symbol))
+                .copied()
+                .ok_or(Corrupt::Sequences),
+            // Offset code N: 2^N plus N extra bits.
+            Self::Offset => {
+                if usize::from(symbol) > MAX_OFFSET_CODE {
+                    return Err(Corrupt::Sequences);
+                }
+                Ok((1u32 << symbol, symbol))
+            }
+        }
+    }
+
     fn max_log(self) -> u32 {
         match self {
             Self::LiteralsLength => LITERALS_LENGTH_MAX_LOG,
@@ -152,53 +364,52 @@ impl Kind {
             Self::MatchLength => MATCH_LENGTH_MAX_LOG,
         }
     }
-
-    fn predefined(self) -> Result<Table, Corrupt> {
-        match self {
-            Self::LiteralsLength => {
-                Table::from_distribution(&LITERALS_LENGTH_DEFAULT, LITERALS_LENGTH_DEFAULT_LOG)
-            }
-            Self::Offset => Table::from_distribution(&OFFSET_DEFAULT, OFFSET_DEFAULT_LOG),
-            Self::MatchLength => {
-                Table::from_distribution(&MATCH_LENGTH_DEFAULT, MATCH_LENGTH_DEFAULT_LOG)
-            }
-        }
-    }
 }
 
-/// The table one mode gives (§3.1.1.3.2.1, Table 15), reading its description from `bytes`;
-/// returns the table and the bytes it took.
-fn table_for(
-    kind: Kind,
-    mode: u8,
-    bytes: &[u8],
-    previous: Option<&Table>,
-) -> Result<(Table, usize), Corrupt> {
+/// Sets `slot` to the table one mode gives (§3.1.1.3.2.1, Table 15), reading its description
+/// from `bytes`; returns the bytes it took. Repeat_Mode keeps the slot's table.
+fn table_for(kind: Kind, mode: u8, bytes: &[u8], slot: &mut Slot) -> Result<usize, Corrupt> {
     match mode {
-        0 => Ok((kind.predefined()?, 0)),
+        0 => {
+            slot.source = Source::Predefined;
+            Ok(0)
+        }
         1 => {
             let symbol = *bytes.first().ok_or(Corrupt::Sequences)?;
             if usize::from(symbol) >= kind.max_symbols() {
                 return Err(Corrupt::Sequences);
             }
-            Ok((Table::rle(symbol), 1))
+            slot.own.rle(symbol, kind)?;
+            slot.source = Source::Own;
+            Ok(1)
         }
         2 => {
-            let (norm, log, used) = read_distribution(bytes, kind.max_symbols(), kind.max_log())?;
-            Ok((Table::from_distribution(&norm, log)?, used))
+            let mut norm = [0i16; SYMBOLS_MAX];
+            let (symbols, log, used) =
+                read_distribution(bytes, kind.max_symbols(), kind.max_log(), &mut norm)?;
+            slot.own
+                .build(norm.get(..symbols).ok_or(Corrupt::Sequences)?, log, kind)?;
+            slot.source = Source::Own;
+            Ok(used)
         }
-        _ => Ok((previous.cloned().ok_or(Corrupt::Sequences)?, 0)),
+        _ => {
+            if slot.source == Source::Unset {
+                return Err(Corrupt::Sequences);
+            }
+            Ok(0)
+        }
     }
 }
 
-/// Reads the sequences section `section` into `out` (cleared first), updating `tables` for the
-/// next block. A section with no sequences leaves the tables as they were (§3.1.1.3.2.1).
+/// Reads the sequences section `section`, handing each sequence to `apply` as it is decoded,
+/// and updates `tables` for the next block. A section with no sequences leaves the tables as they were (§3.1.1.3.2.1); a
+/// corrupt one may leave them changed, and the frame is abandoned with it.
 pub(super) fn decode(
     section: &[u8],
     tables: &mut Tables,
-    out: &mut Vec<Sequence>,
+    predefined: &Predefined,
+    mut apply: impl FnMut(Sequence) -> Result<(), Corrupt>,
 ) -> Result<(), Corrupt> {
-    out.clear();
     let byte0 = *section.first().ok_or(Corrupt::Sequences)?;
     let (count, mut at) = match byte0 {
         0 => {
@@ -229,73 +440,74 @@ pub(super) fn decode(
     if modes & 0b11 != 0 {
         return Err(Corrupt::Sequences);
     }
-    let mut next = |kind: Kind, mode: u8, previous: Option<&Table>| -> Result<Table, Corrupt> {
-        let (table, used) = table_for(
+    for (kind, mode, slot) in [
+        (
+            Kind::LiteralsLength,
+            modes >> 6,
+            &mut tables.literals_length,
+        ),
+        (Kind::Offset, (modes >> 4) & 0b11, &mut tables.offset),
+        (
+            Kind::MatchLength,
+            (modes >> 2) & 0b11,
+            &mut tables.match_length,
+        ),
+    ] {
+        let used = table_for(
             kind,
             mode,
             section.get(at..).ok_or(Corrupt::Sequences)?,
-            previous,
+            slot,
         )?;
         at = at.checked_add(used).ok_or(Corrupt::Sequences)?;
-        Ok(table)
-    };
-    let ll = next(
-        Kind::LiteralsLength,
-        modes >> 6,
-        tables.literals_length.as_ref(),
-    )?;
-    let of = next(Kind::Offset, (modes >> 4) & 0b11, tables.offset.as_ref())?;
-    let ml = next(
-        Kind::MatchLength,
-        (modes >> 2) & 0b11,
-        tables.match_length.as_ref(),
-    )?;
+    }
+    let ll = tables.literals_length.table(&predefined.literals_length)?;
+    let of = tables.offset.table(&predefined.offset)?;
+    let ml = tables.match_length.table(&predefined.match_length)?;
     let stream = section.get(at..).ok_or(Corrupt::Sequences)?;
     let mut bits = Backward::new(stream)?;
-    let mut ll_state = State::init(&ll, &mut bits);
-    let mut of_state = State::init(&of, &mut bits);
-    let mut ml_state = State::init(&ml, &mut bits);
-    out.reserve_exact(count);
+    let mut ll_state = bits.read(ll.log);
+    let mut of_state = bits.read(of.log);
+    let mut ml_state = bits.read(ml.log);
     for i in 0..count {
-        let of_code = usize::from(of_state.symbol(&of)?);
-        let ml_code = usize::from(ml_state.symbol(&ml)?);
-        let ll_code = usize::from(ll_state.symbol(&ll)?);
-        if of_code > MAX_OFFSET_CODE {
-            return Err(Corrupt::Sequences);
-        }
-        // Offset bits first, then match length, then literals length (§3.1.1.3.2.1.2).
-        let of_code32 = u32::try_from(of_code).map_err(|_| Corrupt::Sequences)?;
-        let offset_value = (1u32 << of_code32)
-            .checked_add(bits.read(of_code32))
-            .ok_or(Corrupt::Sequences)?;
-        let (ml_base, ml_bits) = *MATCH_LENGTH_CODES.get(ml_code).ok_or(Corrupt::Sequences)?;
-        let match_length = ml_base
-            .checked_add(bits.read(u32::from(ml_bits)))
-            .ok_or(Corrupt::Sequences)?;
-        let (ll_base, ll_bits) = *LITERALS_LENGTH_CODES
-            .get(ll_code)
-            .ok_or(Corrupt::Sequences)?;
-        let literals = ll_base
-            .checked_add(bits.read(u32::from(ll_bits)))
-            .ok_or(Corrupt::Sequences)?;
-        out.push(Sequence {
+        let of_cell = of.at(of_state);
+        let ml_cell = ml.at(ml_state);
+        let ll_cell = ll.at(ll_state);
+        // Offset bits first, then match length, then literals length (§3.1.1.3.2.1.2). A
+        // baseline with its extra bits read stays within u32: at most 2^31 + 2^31 - 1 for an
+        // offset, 65539 + 2^16 - 1 for a length. Offset bits (at most 31) and match length bits
+        // (at most 16) under one refill.
+        bits.ensure(47);
+        let offset_value = of_cell
+            .base
+            .wrapping_add(bits.read_ensured(u32::from(of_cell.extra)));
+        let match_length = ml_cell
+            .base
+            .wrapping_add(bits.read_ensured(u32::from(ml_cell.extra)));
+        // Literals length bits (at most 16) and the states' (at most 9 + 9 + 8) under one.
+        bits.ensure(42);
+        let literals = ll_cell
+            .base
+            .wrapping_add(bits.read_ensured(u32::from(ll_cell.extra)));
+        apply(Sequence {
             literals,
             offset_value,
             match_length,
-        });
+        })?;
         // States update for every sequence but the last: literals length, match length, offset.
+        // A next state is below its table's size (`fse::Table::at`).
         if i.saturating_add(1) < count {
-            ll_state.update(&ll, &mut bits)?;
-            ml_state.update(&ml, &mut bits)?;
-            of_state.update(&of, &mut bits)?;
+            ll_state =
+                u32::from(ll_cell.next).wrapping_add(bits.read_ensured(u32::from(ll_cell.bits)));
+            ml_state =
+                u32::from(ml_cell.next).wrapping_add(bits.read_ensured(u32::from(ml_cell.bits)));
+            of_state =
+                u32::from(of_cell.next).wrapping_add(bits.read_ensured(u32::from(of_cell.bits)));
         }
     }
     if !bits.finished() {
         return Err(Corrupt::Sequences);
     }
-    tables.literals_length = Some(ll);
-    tables.offset = Some(of);
-    tables.match_length = Some(ml);
     Ok(())
 }
 
@@ -307,18 +519,21 @@ pub(super) fn dictionary_tables(
     tables: &mut Tables,
 ) -> Result<usize, Corrupt> {
     let mut at = at;
-    for kind in [Kind::Offset, Kind::MatchLength, Kind::LiteralsLength] {
-        let (norm, log, used) = read_distribution(
+    for (kind, slot) in [
+        (Kind::Offset, &mut tables.offset),
+        (Kind::MatchLength, &mut tables.match_length),
+        (Kind::LiteralsLength, &mut tables.literals_length),
+    ] {
+        let mut norm = [0i16; SYMBOLS_MAX];
+        let (symbols, log, used) = read_distribution(
             bytes.get(at..).ok_or(Corrupt::Dictionary)?,
             kind.max_symbols(),
             kind.max_log(),
+            &mut norm,
         )?;
-        let table = Table::from_distribution(&norm, log)?;
-        match kind {
-            Kind::Offset => tables.offset = Some(table),
-            Kind::MatchLength => tables.match_length = Some(table),
-            Kind::LiteralsLength => tables.literals_length = Some(table),
-        }
+        slot.own
+            .build(norm.get(..symbols).ok_or(Corrupt::Dictionary)?, log, kind)?;
+        slot.source = Source::Own;
         at = at.checked_add(used).ok_or(Corrupt::Dictionary)?;
     }
     Ok(at)

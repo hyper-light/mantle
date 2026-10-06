@@ -5,7 +5,7 @@
 use super::Corrupt;
 use super::bits::{Backward, Writer};
 use super::fse::{
-    EncodeState, EncodeTable, State, Table, normalize, read_distribution, table_log,
+    EncodeState, EncodeTable, SYMBOLS_MAX, State, Table, normalize, read_distribution, table_log,
     write_distribution,
 };
 
@@ -30,29 +30,67 @@ struct Entry {
     bits: u8,
 }
 
-/// A decoding table indexed by the stream's next `max_bits` bits.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A decoding table indexed by the stream's next `max_bits` bits; empty until a description is
+/// read. Reading one reuses the table's allocation, as cloning into one does.
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct Huffman {
     max_bits: u32,
     entries: Vec<Entry>,
+    /// The weights' FSE table, kept for its allocation.
+    weights: Table,
+}
+
+impl Clone for Huffman {
+    fn clone(&self) -> Self {
+        Self {
+            max_bits: self.max_bits,
+            entries: self.entries.clone(),
+            weights: Table::default(),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.max_bits = source.max_bits;
+        self.entries.clone_from(&source.entries);
+    }
 }
 
 impl Huffman {
-    /// Reads a tree description from the front of `bytes`, returning the table and the bytes it
-    /// took.
-    pub(super) fn read(bytes: &[u8]) -> Result<(Self, usize), Corrupt> {
-        let header = *bytes.first().ok_or(Corrupt::Huffman)?;
-        let (weights, used) = if header >= DIRECT {
-            direct_weights(bytes, header)?
-        } else {
-            fse_weights(bytes, header)?
-        };
-        Ok((Self::from_weights(&weights)?, used))
+    /// Forgets the table, keeping its allocation.
+    pub(super) fn unset(&mut self) {
+        self.entries.clear();
     }
 
-    /// The table of a series of weights, the last literal's weight deduced by completing to a
-    /// power of two (§4.2.1).
-    fn from_weights(weights: &[u8]) -> Result<Self, Corrupt> {
+    /// Whether a description was read: treeless literals need one (§3.1.1.3.1.1).
+    pub(super) fn is_set(&self) -> bool {
+        !self.entries.is_empty()
+    }
+
+    /// Reads a tree description from the front of `bytes` into this table, returning the bytes
+    /// it took. A description that fails leaves the table empty.
+    pub(super) fn read(&mut self, bytes: &[u8]) -> Result<usize, Corrupt> {
+        let read = self.read_description(bytes);
+        if read.is_err() {
+            self.unset();
+        }
+        read
+    }
+
+    fn read_description(&mut self, bytes: &[u8]) -> Result<usize, Corrupt> {
+        let header = *bytes.first().ok_or(Corrupt::Huffman)?;
+        let mut weights = [0u8; MAX_WEIGHTS];
+        let (count, used) = if header >= DIRECT {
+            direct_weights(bytes, header, &mut weights)?
+        } else {
+            fse_weights(bytes, header, &mut self.weights, &mut weights)?
+        };
+        self.set_weights(weights.get(..count).ok_or(Corrupt::Huffman)?)?;
+        Ok(used)
+    }
+
+    /// Makes this the table of a series of weights, the last literal's weight deduced by
+    /// completing to a power of two (§4.2.1).
+    fn set_weights(&mut self, weights: &[u8]) -> Result<(), Corrupt> {
         let mut total = 0u32;
         for &w in weights {
             if u32::from(w) > MAX_BITS {
@@ -82,18 +120,20 @@ impl Huffman {
         }
         let last = u8::try_from(u32::BITS.saturating_sub(rest.leading_zeros()))
             .map_err(|_| Corrupt::Huffman)?;
-        let mut all = Vec::with_capacity(weights.len().saturating_add(1));
-        all.extend_from_slice(weights);
-        all.push(last);
-        if all.len() > 256 {
+        if weights.len() >= 256 {
             return Err(Corrupt::Huffman);
         }
         // Codes are handed out by weight, lowest first, and by literal within a weight
         // (§4.2.1.3): each weight's run of the table starts where the lower weights' end.
+        let mut counts = [0usize; MAX_BITS as usize + 2];
+        for &w in weights.iter().chain(std::iter::once(&last)) {
+            let c = counts.get_mut(usize::from(w)).ok_or(Corrupt::Huffman)?;
+            *c = c.checked_add(1).ok_or(Corrupt::Huffman)?;
+        }
         let mut start = [0usize; MAX_BITS as usize + 2];
         let mut next = 0usize;
         for w in 1..=usize::try_from(max_bits).map_err(|_| Corrupt::Huffman)? {
-            let count = all.iter().filter(|&&x| usize::from(x) == w).count();
+            let count = *counts.get(w).ok_or(Corrupt::Huffman)?;
             if let Some(s) = start.get_mut(w) {
                 *s = next;
             }
@@ -109,32 +149,37 @@ impl Huffman {
         if next != size {
             return Err(Corrupt::Huffman);
         }
-        let mut entries = vec![Entry::default(); size];
-        for (symbol, &w) in all.iter().enumerate() {
-            if w == 0 {
-                continue;
-            }
-            let w = usize::from(w);
-            let span = 1usize
-                .checked_shl(u32::try_from(w.saturating_sub(1)).map_err(|_| Corrupt::Huffman)?)
-                .ok_or(Corrupt::Huffman)?;
-            let at = *start.get(w).ok_or(Corrupt::Huffman)?;
-            // Number_of_Bits = Max_Number_of_Bits + 1 - Weight (§4.2.1).
-            let bits = max_bits
-                .checked_add(1)
-                .and_then(|b| b.checked_sub(u32::try_from(w).ok()?))
-                .and_then(|b| u8::try_from(b).ok())
-                .ok_or(Corrupt::Huffman)?;
-            let end = at.checked_add(span).ok_or(Corrupt::Huffman)?;
-            let symbol = u8::try_from(symbol).map_err(|_| Corrupt::Huffman)?;
-            for e in entries.get_mut(at..end).ok_or(Corrupt::Huffman)? {
-                *e = Entry { symbol, bits };
-            }
-            if let Some(s) = start.get_mut(w) {
-                *s = end;
-            }
+        // Every entry is written below (the runs sum to the size), so a table of the same size
+        // is not cleared first.
+        if self.entries.len() != size {
+            self.entries.resize(size, Entry::default());
         }
-        Ok(Self { max_bits, entries })
+        let mut symbol = 0u8;
+        for &w in weights.iter().chain(std::iter::once(&last)) {
+            if w > 0 {
+                let w = usize::from(w);
+                let span = 1usize << w.saturating_sub(1);
+                let at = start.get_mut(w).ok_or(Corrupt::Huffman)?;
+                let end = at.checked_add(span).ok_or(Corrupt::Huffman)?;
+                // Number_of_Bits = Max_Number_of_Bits + 1 - Weight (§4.2.1); weights are at
+                // most max_bits, as the total's power of two bounds each.
+                let bits = u8::try_from(
+                    max_bits
+                        .checked_add(1)
+                        .and_then(|b| b.checked_sub(u32::try_from(w).ok()?))
+                        .ok_or(Corrupt::Huffman)?,
+                )
+                .map_err(|_| Corrupt::Huffman)?;
+                self.entries
+                    .get_mut(*at..end)
+                    .ok_or(Corrupt::Huffman)?
+                    .fill(Entry { symbol, bits });
+                *at = end;
+            }
+            symbol = symbol.wrapping_add(1);
+        }
+        self.max_bits = max_bits;
+        Ok(())
     }
 
     /// Decodes one stream into `out`, which it fills exactly; the stream must be consumed
@@ -211,54 +256,72 @@ impl Huffman {
     }
 }
 
-/// Weights written directly, 4 bits each, two to a byte, high nibble first (§4.2.1.1).
-fn direct_weights(bytes: &[u8], header: u8) -> Result<(Vec<u8>, usize), Corrupt> {
-    // Number_of_Symbols = headerByte - 127 (§4.2.1.1); `header` is at least `DIRECT`.
+/// Weights written directly, 4 bits each, two to a byte, high nibble first (§4.2.1.1), into
+/// `out`; returns how many and the bytes taken.
+fn direct_weights(
+    bytes: &[u8],
+    header: u8,
+    out: &mut [u8; MAX_WEIGHTS],
+) -> Result<(usize, usize), Corrupt> {
+    // Number_of_Symbols = headerByte - 127 (§4.2.1.1); `header` is at least `DIRECT`, so at most
+    // 128 symbols.
     let count = usize::from(header.saturating_sub(DIRECT - 1));
     let len = count.div_ceil(2);
     let end = len.checked_add(1).ok_or(Corrupt::Huffman)?;
     let packed = bytes.get(1..end).ok_or(Corrupt::Huffman)?;
-    let weights = packed
+    for (w, slot) in packed
         .iter()
         .flat_map(|b| [b >> 4, b & 0xF])
         .take(count)
-        .collect();
-    Ok((weights, end))
+        .zip(out.iter_mut())
+    {
+        *slot = w;
+    }
+    Ok((count, end))
 }
 
 /// Weights compressed by FSE, two interleaved states over one table, until a state's update
-/// reads past the stream's start (§4.2.1.2).
-fn fse_weights(bytes: &[u8], header: u8) -> Result<(Vec<u8>, usize), Corrupt> {
+/// reads past the stream's start (§4.2.1.2), into `out` with `table` rebuilt for them; returns
+/// how many and the bytes taken.
+fn fse_weights(
+    bytes: &[u8],
+    header: u8,
+    table: &mut Table,
+    out: &mut [u8; MAX_WEIGHTS],
+) -> Result<(usize, usize), Corrupt> {
     // The FSE-compressed series is `headerByte` bytes long (§4.2.1.1).
     let end = usize::from(header).checked_add(1).ok_or(Corrupt::Huffman)?;
     let body = bytes.get(1..end).ok_or(Corrupt::Huffman)?;
-    let (norm, log, used) = read_distribution(body, WEIGHT_SYMBOLS, WEIGHTS_MAX_LOG)?;
-    let table = Table::from_distribution(&norm, log)?;
+    let mut norm = [0i16; SYMBOLS_MAX];
+    let (symbols, log, used) = read_distribution(body, WEIGHT_SYMBOLS, WEIGHTS_MAX_LOG, &mut norm)?;
+    table.set_distribution(norm.get(..symbols).ok_or(Corrupt::Huffman)?, log)?;
     let stream = body.get(used..).ok_or(Corrupt::Huffman)?;
     let mut bits = Backward::new(stream)?;
-    let mut states = [
-        State::init(&table, &mut bits),
-        State::init(&table, &mut bits),
-    ];
-    let mut weights = Vec::with_capacity(MAX_WEIGHTS);
+    let mut states = [State::init(table, &mut bits), State::init(table, &mut bits)];
+    let mut count = 0usize;
+    let mut push = |count: &mut usize, w: u8| -> Result<(), Corrupt> {
+        *out.get_mut(*count).ok_or(Corrupt::Huffman)? = w;
+        *count = count.checked_add(1).ok_or(Corrupt::Huffman)?;
+        Ok(())
+    };
     'decode: loop {
         for i in 0..2 {
             // One weight short of the most, so the other state's last symbol still fits.
-            if weights.len() >= MAX_WEIGHTS.saturating_sub(1) {
+            if count >= MAX_WEIGHTS.saturating_sub(1) {
                 return Err(Corrupt::Huffman);
             }
             let state = states.get_mut(i).ok_or(Corrupt::Huffman)?;
-            weights.push(state.symbol(&table)?);
-            state.update(&table, &mut bits)?;
+            push(&mut count, state.symbol(table))?;
+            state.update(table, &mut bits);
             if bits.overflowed() {
                 // The other state's symbol is the last.
                 let other = states.get(i ^ 1).ok_or(Corrupt::Huffman)?;
-                weights.push(other.symbol(&table)?);
+                push(&mut count, other.symbol(table))?;
                 break 'decode;
             }
         }
     }
-    Ok((weights, end))
+    Ok((count, end))
 }
 
 /// Optimal code lengths of at most `limit` bits for `counts` (one per literal, 0 for absent):

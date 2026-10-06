@@ -17,42 +17,116 @@ pub(super) struct Cell {
     pub(super) baseline: u16,
 }
 
-/// A decoding table of `1 << accuracy_log` cells.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The most symbols a distribution describes: the match length codes' 53 (§3.1.1.3.2.1.1).
+pub(super) const SYMBOLS_MAX: usize = 64;
+
+/// A decoding table of `1 << accuracy_log` cells. Rebuilding one reuses its cells' allocation,
+/// as cloning into one does.
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct Table {
     pub(super) accuracy_log: u32,
     pub(super) cells: Vec<Cell>,
 }
 
-impl Table {
-    /// The one-symbol table of RLE_Mode (§3.1.1.3.2.1): every state decodes `symbol` and stays.
-    pub(super) fn rle(symbol: u8) -> Self {
+impl Clone for Table {
+    fn clone(&self) -> Self {
         Self {
-            accuracy_log: 0,
-            cells: vec![Cell {
-                symbol,
-                bits: 0,
-                baseline: 0,
-            }],
+            accuracy_log: self.accuracy_log,
+            cells: self.cells.clone(),
         }
     }
 
-    /// The decoding table of a normalized distribution (§4.1.1): "less than 1" symbols take one
-    /// cell each from the end, the rest are spread by the fixed step, and each symbol's states,
-    /// in natural order, get their bits and baselines.
+    fn clone_from(&mut self, source: &Self) {
+        self.accuracy_log = source.accuracy_log;
+        self.cells.clone_from(&source.cells);
+    }
+}
+
+impl Table {
+    /// The decoding table of a normalized distribution.
     pub(super) fn from_distribution(norm: &[i16], accuracy_log: u32) -> Result<Self, Corrupt> {
-        let size = 1usize
-            .checked_shl(accuracy_log)
-            .ok_or(Corrupt::Distribution)?;
-        let mut cells = vec![Cell::default(); size];
-        // The next state value each symbol hands out, starting at its count.
-        let mut next = vec![0u32; norm.len()];
+        let mut table = Self::default();
+        table.set_distribution(norm, accuracy_log)?;
+        Ok(table)
+    }
+
+    /// Makes this the decoding table of a normalized distribution (§4.1.1); every cell is
+    /// written, so a table of the same size is not cleared first.
+    pub(super) fn set_distribution(
+        &mut self,
+        norm: &[i16],
+        accuracy_log: u32,
+    ) -> Result<(), Corrupt> {
+        let mut spread = Spread::new();
+        let size = spread.spread(norm, accuracy_log)?;
+        self.accuracy_log = accuracy_log;
+        if self.cells.len() != size {
+            self.cells.resize(size, Cell::default());
+        }
+        let symbols = spread.symbols;
+        for (cell, &symbol) in self.cells.iter_mut().zip(&symbols) {
+            let (bits, baseline) = spread.transition(symbol)?;
+            *cell = Cell {
+                symbol,
+                bits,
+                baseline,
+            };
+        }
+        Ok(())
+    }
+
+    /// The cell of `state`. Every state a [`State`] holds is below the table's size: the first
+    /// is `accuracy_log` bits, and each next one, `baseline + read(bits)`, is below
+    /// `((state + 1) << bits) - size`, at most `size - 1` as `state << bits < 2 * size` (§4.1).
+    /// The mask keeps the lookup in the table for a table of any size all the same.
+    #[inline(always)]
+    fn at(&self, state: u32) -> Cell {
+        let mask = self.cells.len().wrapping_sub(1);
+        let index = usize::try_from(state).unwrap_or(usize::MAX) & mask;
+        self.cells.get(index).copied().unwrap_or_default()
+    }
+}
+
+/// The most cells a decoding table has: 2^9, the sequence codes' largest accuracy log
+/// (§3.1.1.3.2.1); Huffman weights' tables are 2^6 at most (§4.2.1.2).
+pub(super) const CELLS_MAX: usize = 1 << 9;
+
+/// A distribution spread over its table's cells (§4.1.1), as `ZSTD_buildFSETable` spreads it
+/// (zstd 1.5.7 `lib/decompress/zstd_decompress_block.c`): each cell's symbol, and each symbol's
+/// next state, which [`Spread::transition`] hands out in cell order.
+pub(super) struct Spread {
+    pub(super) symbols: [u8; CELLS_MAX],
+    next: [u32; SYMBOLS_MAX],
+    log: u32,
+    size: u32,
+}
+
+impl Spread {
+    pub(super) fn new() -> Self {
+        Self {
+            symbols: [0; CELLS_MAX],
+            next: [0; SYMBOLS_MAX],
+            log: 0,
+            size: 0,
+        }
+    }
+
+    /// Spreads `norm` over `1 << log` cells and returns their count: "less than 1" symbols take
+    /// one cell each from the end, the rest are spread by the fixed step. Without "less than 1"
+    /// symbols the step never lands on a taken cell, so the symbols are laid out in order and
+    /// placed by the step with no skipping, as the reference's fast path does.
+    pub(super) fn spread(&mut self, norm: &[i16], log: u32) -> Result<usize, Corrupt> {
+        let size = 1usize.checked_shl(log).ok_or(Corrupt::Distribution)?;
+        if size > CELLS_MAX || norm.len() > SYMBOLS_MAX {
+            return Err(Corrupt::Distribution);
+        }
+        self.log = log;
+        self.size = u32::try_from(size).map_err(|_| Corrupt::Distribution)?;
         let mut high = size.checked_sub(1).ok_or(Corrupt::Distribution)?;
-        for (s, (&count, n)) in norm.iter().zip(next.iter_mut()).enumerate() {
-            let symbol = u8::try_from(s).map_err(|_| Corrupt::Distribution)?;
+        for (s, (&count, n)) in norm.iter().zip(self.next.iter_mut()).enumerate() {
             if count == -1 {
-                let cell = cells.get_mut(high).ok_or(Corrupt::Distribution)?;
-                cell.symbol = symbol;
+                *self.symbols.get_mut(high).ok_or(Corrupt::Distribution)? =
+                    u8::try_from(s).map_err(|_| Corrupt::Distribution)?;
                 high = high.checked_sub(1).ok_or(Corrupt::Distribution)?;
                 *n = 1;
             } else {
@@ -64,15 +138,41 @@ impl Table {
         let step = (size >> 1).wrapping_add(size >> 3).wrapping_add(3);
         let mask = size.wrapping_sub(1);
         let mut position = 0usize;
-        for (s, &count) in norm.iter().enumerate() {
-            let symbol = u8::try_from(s).map_err(|_| Corrupt::Distribution)?;
-            for _ in 0..count.max(0) {
-                let cell = cells.get_mut(position).ok_or(Corrupt::Distribution)?;
-                cell.symbol = symbol;
+        if high == mask {
+            let mut laid = [0u8; CELLS_MAX];
+            let mut at = 0usize;
+            for (s, &count) in norm.iter().enumerate() {
+                let n = usize::try_from(count.max(0)).map_err(|_| Corrupt::Distribution)?;
+                let end = at.checked_add(n).ok_or(Corrupt::Distribution)?;
+                laid.get_mut(at..end)
+                    .ok_or(Corrupt::Distribution)?
+                    .fill(u8::try_from(s).map_err(|_| Corrupt::Distribution)?);
+                at = end;
+            }
+            // The counts must fill the table exactly (§4.1.1's reader checks that).
+            if at != size {
+                return Err(Corrupt::Distribution);
+            }
+            for &symbol in laid.get(..size).ok_or(Corrupt::Distribution)? {
+                *self
+                    .symbols
+                    .get_mut(position)
+                    .ok_or(Corrupt::Distribution)? = symbol;
                 position = position.wrapping_add(step) & mask;
-                // Skip the cells the "less than 1" symbols hold.
-                while position > high {
+            }
+        } else {
+            for (s, &count) in norm.iter().enumerate() {
+                let symbol = u8::try_from(s).map_err(|_| Corrupt::Distribution)?;
+                for _ in 0..count.max(0) {
+                    *self
+                        .symbols
+                        .get_mut(position)
+                        .ok_or(Corrupt::Distribution)? = symbol;
                     position = position.wrapping_add(step) & mask;
+                    // Skip the cells the "less than 1" symbols hold.
+                    while position > high {
+                        position = position.wrapping_add(step) & mask;
+                    }
                 }
             }
         }
@@ -81,38 +181,35 @@ impl Table {
         if position != 0 {
             return Err(Corrupt::Distribution);
         }
-        for cell in &mut cells {
-            let n = next
-                .get_mut(usize::from(cell.symbol))
-                .ok_or(Corrupt::Distribution)?;
-            let state = *n;
-            *n = state.checked_add(1).ok_or(Corrupt::Distribution)?;
-            // Bits to reach the next power of two from this state, so lower states read one more.
-            let bits = accuracy_log
-                .checked_sub(
-                    31u32
-                        .checked_sub(state.leading_zeros())
-                        .ok_or(Corrupt::Distribution)?,
-                )
-                .ok_or(Corrupt::Distribution)?;
-            let baseline = (state << bits)
-                .checked_sub(u32::try_from(size).map_err(|_| Corrupt::Distribution)?)
-                .ok_or(Corrupt::Distribution)?;
-            cell.bits = u8::try_from(bits).map_err(|_| Corrupt::Distribution)?;
-            cell.baseline = u16::try_from(baseline).map_err(|_| Corrupt::Distribution)?;
-        }
-        Ok(Self {
-            accuracy_log,
-            cells,
-        })
+        Ok(size)
     }
 
-    /// The cell of `state`.
-    pub(super) fn cell(&self, state: u32) -> Result<Cell, Corrupt> {
-        self.cells
-            .get(usize::try_from(state).map_err(|_| Corrupt::Bitstream)?)
-            .copied()
-            .ok_or(Corrupt::Bitstream)
+    /// The next cell of `symbol`'s: its state's bits and baseline, the next state being
+    /// `baseline + read(bits)`. Lower states read one more bit, to reach the next power of two.
+    #[inline(always)]
+    pub(super) fn transition(&mut self, symbol: u8) -> Result<(u8, u16), Corrupt> {
+        let n = self
+            .next
+            .get_mut(usize::from(symbol))
+            .ok_or(Corrupt::Distribution)?;
+        let state = *n;
+        *n = state.checked_add(1).ok_or(Corrupt::Distribution)?;
+        let bits = self
+            .log
+            .checked_sub(
+                31u32
+                    .checked_sub(state.leading_zeros())
+                    .ok_or(Corrupt::Distribution)?,
+            )
+            .ok_or(Corrupt::Distribution)?;
+        let baseline = state
+            .checked_shl(bits)
+            .and_then(|v| v.checked_sub(self.size))
+            .ok_or(Corrupt::Distribution)?;
+        Ok((
+            u8::try_from(bits).map_err(|_| Corrupt::Distribution)?,
+            u16::try_from(baseline).map_err(|_| Corrupt::Distribution)?,
+        ))
     }
 }
 
@@ -124,32 +221,36 @@ pub(super) struct State {
 }
 
 impl State {
+    #[inline(always)]
     pub(super) fn init(table: &Table, bits: &mut Backward<'_>) -> Self {
         Self {
             value: bits.read(table.accuracy_log),
         }
     }
 
-    pub(super) fn symbol(self, table: &Table) -> Result<u8, Corrupt> {
-        Ok(table.cell(self.value)?.symbol)
+    #[inline(always)]
+    pub(super) fn symbol(self, table: &Table) -> u8 {
+        table.at(self.value).symbol
     }
 
-    pub(super) fn update(&mut self, table: &Table, bits: &mut Backward<'_>) -> Result<(), Corrupt> {
-        let cell = table.cell(self.value)?;
-        self.value = u32::from(cell.baseline)
-            .checked_add(bits.read(u32::from(cell.bits)))
-            .ok_or(Corrupt::Bitstream)?;
-        Ok(())
+    #[inline(always)]
+    pub(super) fn update(&mut self, table: &Table, bits: &mut Backward<'_>) {
+        let cell = table.at(self.value);
+        // A baseline is below 2^9 and the bits read below 2^9 (§4.1).
+        self.value = u32::from(cell.baseline).wrapping_add(bits.read(u32::from(cell.bits)));
     }
 }
 
 /// Reads a table description (§4.1.1) of at most `max_symbols` symbols and accuracy log
-/// `max_log`, returning the normalized distribution, its accuracy log and the bytes it took.
+/// `max_log` into `norm`, returning the symbols it described, its accuracy log and the bytes it
+/// took.
 pub(super) fn read_distribution(
     bytes: &[u8],
     max_symbols: usize,
     max_log: u32,
-) -> Result<(Vec<i16>, u32, usize), Corrupt> {
+    out: &mut [i16; SYMBOLS_MAX],
+) -> Result<(usize, u32, usize), Corrupt> {
+    let max_symbols = max_symbols.min(SYMBOLS_MAX);
     let mut bits = Forward::new(bytes);
     let accuracy_log = bits
         .peek(4)
@@ -164,27 +265,35 @@ pub(super) fn read_distribution(
     let mut remaining = size.checked_add(1).ok_or(Corrupt::Distribution)?;
     let mut threshold = size;
     let mut width = accuracy_log.checked_add(1).ok_or(Corrupt::Distribution)?;
-    let mut norm: Vec<i16> = Vec::with_capacity(max_symbols);
+    let mut len = 0usize;
+    // Whether the last probability read was 0, which a repeat flag follows.
+    let mut last_zero = false;
+    // Appends one probability; `len` stays below `max_symbols`, checked before each.
+    let mut push = |len: &mut usize, p: i16| -> Result<(), Corrupt> {
+        *out.get_mut(*len).ok_or(Corrupt::Distribution)? = p;
+        *len = len.checked_add(1).ok_or(Corrupt::Distribution)?;
+        Ok(())
+    };
     while remaining > 1 {
-        if norm.len() >= max_symbols {
+        if len >= max_symbols {
             return Err(Corrupt::Distribution);
         }
         // Each 2-bit flag after a zero repeats that many more zeros; 3 continues.
-        if norm.last() == Some(&0) {
+        if last_zero {
             loop {
                 let repeat = bits.peek(2);
                 bits.skip(2)?;
                 for _ in 0..repeat {
-                    if norm.len() >= max_symbols {
+                    if len >= max_symbols {
                         return Err(Corrupt::Distribution);
                     }
-                    norm.push(0);
+                    push(&mut len, 0)?;
                 }
                 if repeat != 3 {
                     break;
                 }
             }
-            if norm.len() >= max_symbols {
+            if len >= max_symbols {
                 return Err(Corrupt::Distribution);
             }
         }
@@ -213,7 +322,11 @@ pub(super) fn read_distribution(
         remaining = remaining
             .checked_sub(probability.abs())
             .ok_or(Corrupt::Distribution)?;
-        norm.push(i16::try_from(probability).map_err(|_| Corrupt::Distribution)?);
+        push(
+            &mut len,
+            i16::try_from(probability).map_err(|_| Corrupt::Distribution)?,
+        )?;
+        last_zero = probability == 0;
         while remaining < threshold {
             width = width.checked_sub(1).ok_or(Corrupt::Distribution)?;
             threshold >>= 1;
@@ -223,10 +336,11 @@ pub(super) fn read_distribution(
         return Err(Corrupt::Distribution);
     }
     // At least two symbols carry probability (§4.1.1).
-    if norm.iter().filter(|&&p| p != 0).count() < 2 {
+    let described = out.get(..len).ok_or(Corrupt::Distribution)?;
+    if described.iter().filter(|&&p| p != 0).count() < 2 {
         return Err(Corrupt::Distribution);
     }
-    Ok((norm, accuracy_log, bits.bytes_used()))
+    Ok((len, accuracy_log, bits.bytes_used()))
 }
 
 /// The predefined distribution of literals length codes, accuracy log 6 (§3.1.1.3.2.2.1).

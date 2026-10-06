@@ -73,11 +73,26 @@ impl<'a> Forward<'a> {
 }
 
 /// A backward reader over one stream (§3.1.1.3.2.1.2, §4.2.2).
+///
+/// It holds eight of the stream's bytes as one little-endian word, as the reference's
+/// `BIT_DStream_t` holds its container (zstd 1.5.7 `lib/common/bitstream.h`), with the count of
+/// the word's bits still unread below the position. Once fewer than 32 remain and lower bytes
+/// exist, it steps the word back by the whole bytes read, so a read of up to 32 bits is a shift
+/// and a mask.
 pub(super) struct Backward<'a> {
     bytes: &'a [u8],
-    /// Bits not yet read, below the padding; negative once a read went past the start.
-    pos: i64,
+    /// The first of the eight bytes `word` holds; `word` reads zero past the stream's end.
+    start: usize,
+    word: u64,
+    /// Bits of `word` not yet read: 0 to 64 while `start > 0` (at least 32 after a checked
+    /// read, at least what [`Self::ensure`] asked for before ensured reads); once `start` is 0,
+    /// the bits left in the stream, negative once a read went past its start.
+    within: i64,
 }
+
+/// The fewest bits the word holds below the position unless it starts at the stream's first
+/// byte: the most one read takes.
+const READ_MAX: i64 = 32;
 
 impl<'a> Backward<'a> {
     /// A reader positioned below the stream's final 1 bit. A stream that is empty or whose last
@@ -87,57 +102,155 @@ impl<'a> Backward<'a> {
         if last == 0 {
             return Err(Corrupt::Bitstream);
         }
-        let len = i64::try_from(bytes.len()).map_err(|_| Corrupt::Bitstream)?;
-        // The highest set bit of the last byte is the end marker.
+        // The highest set bit of the last byte is the end marker; the word's last byte is the
+        // stream's, so the bits below it are those of the bytes before it and the marker's.
         let marker = i64::from(7u32.saturating_sub(last.leading_zeros()));
-        let pos = len
+        let start = bytes.len().saturating_sub(8);
+        let held =
+            i64::try_from(bytes.len().saturating_sub(start)).map_err(|_| Corrupt::Bitstream)?;
+        let within = held
             .checked_sub(1)
             .and_then(|b| b.checked_mul(8))
             .and_then(|b| b.checked_add(marker))
             .ok_or(Corrupt::Bitstream)?;
-        Ok(Self { bytes, pos })
+        let mut reader = Self {
+            bytes,
+            start,
+            word: 0,
+            within,
+        };
+        reader.fetch();
+        if reader.start > 0 && reader.within < READ_MAX {
+            reader.load();
+        }
+        Ok(reader)
+    }
+
+    /// Reads the word at `start`.
+    #[inline(always)]
+    fn fetch(&mut self) {
+        if let Some(word) = self
+            .bytes
+            .get(self.start..)
+            .and_then(<[u8]>::first_chunk::<8>)
+        {
+            self.word = u64::from_le_bytes(*word);
+            return;
+        }
+        self.fetch_tail();
+    }
+
+    /// [`Self::fetch`] for a stream shorter than eight bytes: those past its end read as zero.
+    #[cold]
+    fn fetch_tail(&mut self) {
+        let mut word = [0u8; 8];
+        if let Some(src) = self.bytes.get(self.start..) {
+            let n = src.len().min(8);
+            if let (Some(dst), Some(src)) = (word.get_mut(..n), src.get(..n)) {
+                dst.copy_from_slice(src);
+            }
+        }
+        self.word = u64::from_le_bytes(word);
+    }
+
+    /// Steps the word back by the whole bytes read from it, as far as the stream's first byte.
+    #[inline(always)]
+    fn load(&mut self) {
+        // `within` is 0 to 64 here, so the bytes read are 0 to 8.
+        let read = usize::try_from(64i64.wrapping_sub(self.within) >> 3).unwrap_or(0);
+        let back = read.min(self.start);
+        self.start = self.start.wrapping_sub(back);
+        // `back` is at most 8.
+        self.within = self
+            .within
+            .wrapping_add(i64::try_from(back).unwrap_or(0).wrapping_mul(8));
+        self.fetch();
     }
 
     /// The `bits` (at most 32) below the position without consuming them; bits below the start
     /// read as zero.
+    #[inline(always)]
     pub(super) fn peek(&self, bits: u32) -> u32 {
-        if bits == 0 {
-            return 0;
+        let n = i64::from(bits);
+        if self.within >= n {
+            // 0 <= within - n <= 64, and only a 0-bit read reaches 64, which the mask of 0 bits
+            // reads as 0 whatever the shift: masked to 6 bits the shift needs no branch, nor
+            // does a 0-bit read (the sequence codes' extra bits are 0 as often as not). Both
+            // masks put the conversions in range.
+            let shift = u32::try_from(self.within.wrapping_sub(n) & 63).unwrap_or(0);
+            let value = (self.word >> shift) & low_mask(bits) & u64::from(u32::MAX);
+            return u32::try_from(value).unwrap_or(0);
         }
-        let start = self.pos.saturating_sub(i64::from(bits));
-        let value = if start >= 0 {
-            bits_at(self.bytes, start.unsigned_abs(), bits)
+        self.peek_short(bits)
+    }
+
+    /// [`Self::peek`] where fewer than `bits` remain: the word starts at the stream's first byte,
+    /// and the missing low bits are zero.
+    #[cold]
+    fn peek_short(&self, bits: u32) -> u32 {
+        let value = if self.within > 0 {
+            let have = u32::try_from(self.within).unwrap_or(0);
+            (self.word & low_mask(have)) << bits.wrapping_sub(have)
         } else {
-            // Fewer than `bits` remain: the missing low bits are zero.
-            let have = u32::try_from(self.pos.max(0)).unwrap_or(0);
-            let missing = bits.saturating_sub(have);
-            bits_at(self.bytes, 0, have) << missing
+            0
         };
-        u32::try_from(value).unwrap_or(u32::MAX)
+        u32::try_from(value & low_mask(bits)).unwrap_or(u32::MAX)
     }
 
     /// Reads and consumes `bits` (at most 32).
+    #[inline(always)]
     pub(super) fn read(&mut self, bits: u32) -> u32 {
         let value = self.peek(bits);
-        self.pos = self.pos.saturating_sub(i64::from(bits));
+        self.skip(bits);
         value
     }
 
-    /// Consumes `bits` already peeked.
+    /// Consumes `bits` (at most 32) already peeked.
+    #[inline(always)]
     pub(super) fn skip(&mut self, bits: u32) {
-        self.pos = self.pos.saturating_sub(i64::from(bits));
+        // `within` stays above -2^32 - 64: it goes negative only once `start` is 0, and a stream
+        // read past its start is done.
+        self.within = self.within.wrapping_sub(i64::from(bits));
+        if self.within < READ_MAX && self.start > 0 {
+            self.load();
+        }
+    }
+
+    /// Makes at least `bits` (at most 57) readable without a refill: refills the word unless
+    /// that many remain or it starts at the stream's first byte, where reads past the start
+    /// read zero. A refill leaves at least 57 (64 less a partly read byte).
+    #[inline(always)]
+    pub(super) fn ensure(&mut self, bits: u32) {
+        if self.within < i64::from(bits) && self.start > 0 {
+            self.load();
+        }
+    }
+
+    /// Reads and consumes `bits`, which an [`Self::ensure`] since the last refill covers with
+    /// the reads after it: no refill is checked for.
+    #[inline(always)]
+    pub(super) fn read_ensured(&mut self, bits: u32) -> u32 {
+        let value = self.peek(bits);
+        self.within = self.within.wrapping_sub(i64::from(bits));
+        value
     }
 
     /// Whether every bit was read and none past the start: a stream must be consumed exactly
     /// (§3.1.1.3.2.1.2, §4.2.2).
     pub(super) fn finished(&self) -> bool {
-        self.pos == 0
+        self.start == 0 && self.within == 0
     }
 
     /// Whether a read went past the start (§4.2.1.2's end condition).
     pub(super) fn overflowed(&self) -> bool {
-        self.pos < 0
+        self.within < 0
     }
+}
+
+/// The low `bits` (at most 63) set.
+#[inline(always)]
+fn low_mask(bits: u32) -> u64 {
+    (1u64 << (bits & 63)).wrapping_sub(1)
 }
 
 /// A writer of a little-endian bit string, each value's least significant bit first: the

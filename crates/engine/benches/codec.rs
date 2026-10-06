@@ -10,6 +10,8 @@
 //! called as the table code calls it (`util::block_compression`). Both decoders read the
 //! reference's frames; each encoder's output size is printed beside its time. It prints
 //! `side op block_size round ns_per_block allocations output_bytes` per round.
+//! `-- rounds [port]` runs that many rounds instead, and `port` only the port's side, to profile
+//! it over a run long enough to sample.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -36,7 +38,7 @@ use mantle_engine::util::block_compression::{
 #[global_allocator]
 static ALLOCATOR: alloc::Counting = alloc::Counting;
 
-/// Rounds a size (Wilks: the extremes of 59 bound the 95th percentile at 95%).
+/// Rounds a size by default (Wilks: the extremes of 59 bound the 95th percentile at 95%).
 const ROUNDS: usize = 59;
 
 /// Blocks of `size` bytes cut from the corpus's text inputs, in order.
@@ -50,6 +52,9 @@ fn blocks(size: usize) -> Vec<Vec<u8>> {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().filter(|a| !a.starts_with('-')).collect();
+    let rounds: usize = args.get(1).map_or(ROUNDS, |a| a.parse().unwrap());
+    let port_only = args.get(2).is_some_and(|a| a == "port");
     let opts = CompressionOptions::default();
     for size in [4096usize, 16384] {
         let input = blocks(size);
@@ -88,9 +93,12 @@ fn main() {
         let ours_bytes: usize = ours.iter().map(Vec::len).sum();
         let theirs_bytes: usize = theirs.iter().map(Vec::len).sum();
         let n = input.len() as f64;
-        for round in 0..ROUNDS {
+        for round in 0..rounds {
             let reference_first = round % 2 == 0;
             for side in if reference_first { [0, 1] } else { [1, 0] } {
+                if port_only && side == 0 {
+                    continue;
+                }
                 if side == 0 {
                     alloc::begin();
                     let t = Instant::now();

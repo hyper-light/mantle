@@ -353,6 +353,27 @@ upstream defects above to report to RocksDB, with the owner's approval.
   `tests/block_compression_test.rs` decodes the reference codecs' blocks of the 61-input corpus,
   framed as RocksDB frames them, and ZSTD frames from the reference library with and without a
   dictionary. The reference decodes the port's ZSTD frames.
+- ZSTD decompression of a block (`codec/zstd`). A block is whole in memory, so
+  `Decoder::decompress_all` decodes its frames straight into the caller's buffer, which is the
+  window: no input is gathered into a unit and no output is drained through one. The rest follows
+  the reference decoder's design (zstd 1.5.7 `lib/decompress/`), each piece measured against it:
+  - Each sequence executes as it is decoded, with no list of sequences between the two.
+  - Literals and matches move in 16-byte pieces into `SLACK` bytes past the block
+    (`ZSTD_wildcopy`). A match no longer than its offset is one copy; an overlapping one doubles
+    its run each pass.
+  - The bit reader keeps a 64-bit word and its unread bit count, refills by whole bytes, and the
+    sequence loop refills twice a sequence, before reads whose widths it bounds
+    (`BIT_DStream_t`, `BIT_reloadDStream`). A read of 0 bits takes no branch.
+  - A sequence table's cell holds its code's baseline and extra bits (`ZSTD_seqSymbol`), and is
+    built in one pass from the spread; without "less than 1" symbols the spread skips nothing
+    (`ZSTD_buildFSETable`). The predefined tables are built once a decoder.
+  - Tables, the Huffman table and the literals are rebuilt in their own allocations: a reader
+    that keeps its `Workspace` decompresses with no allocation at all, where the first form
+    allocated about four times a block.
+
+  Every path is checked: a table, copy or read that would leave its bounds is a typed
+  corruption, never a panic. `tests/zstd_test.rs` decodes every frame both ways, streamed and
+  whole, including every corrupted frame of its sweep.
 
 **Where the reader differs from RocksDB, and why.** The bytes read are the same; what the reader
 does with bad or unusual ones is not.
@@ -442,6 +463,9 @@ does with bad or unusual ones is not.
 unsupported until the codecs have them; reading them already works, except zlib with a dictionary.
 BZip2 and XPRESS are refused both ways, as in a RocksDB build without them.
 
-**Next in P4.** The table builder and reader; `SstFileWriter` and
-`SstFileReader`; the `sst_dump` differential; and the block-read benchmark against RocksDB
-(P15's harness).
+**Measured.** Blocks build and read faster than RocksDB's in every workload, with a third
+of its allocations or none (docs/measurements/2026-10-06-engine-block-read.md).
+
+**Next in P4.** ZSTD at the reference's speed both ways (decompression is 1.7 to 1.9 times its
+time per block, compression about 7); the table builder and reader; `SstFileWriter` and
+`SstFileReader`; and the `sst_dump` differential.

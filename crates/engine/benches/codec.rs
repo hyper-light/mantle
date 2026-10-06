@@ -29,7 +29,8 @@ use std::time::Instant;
 
 use hyper_measure::alloc;
 use mantle_engine::util::block_compression::{
-    Compressed, CompressionOptions, CompressionType, compress_block, decompress_block,
+    Compressed, CompressionOptions, CompressionType, Workspace, compress_block,
+    decompress_block_into,
 };
 
 #[global_allocator]
@@ -56,6 +57,9 @@ fn main() {
         let mut dctx = zstd::bulk::Decompressor::new().unwrap();
         let mut out = Vec::with_capacity(zstd::zstd_safe::compress_bound(size) + 8);
         let mut plain = vec![0u8; size];
+        // The port's working area and output buffer, kept across blocks as the reference's are.
+        let mut workspace = Workspace::default();
+        let mut port_out = Vec::with_capacity(size);
         // The port's frames, framed as a table stores them, for its decompression.
         let ours: Vec<Vec<u8>> = input
             .iter()
@@ -128,9 +132,15 @@ fn main() {
                     alloc::begin();
                     let t = Instant::now();
                     for c in &theirs_framed {
-                        std::hint::black_box(
-                            decompress_block(CompressionType::Zstd, c, &[], size).unwrap(),
-                        );
+                        decompress_block_into(
+                            CompressionType::Zstd,
+                            c,
+                            &[],
+                            size,
+                            &mut workspace,
+                            &mut port_out,
+                        )
+                        .unwrap();
                     }
                     let ns = t.elapsed().as_nanos() as f64 / n;
                     let a = alloc::end();

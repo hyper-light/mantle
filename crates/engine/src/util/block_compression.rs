@@ -244,6 +244,14 @@ pub fn uncompressed_size(kind: CompressionType, data: &[u8]) -> Result<(u64, &[u
     }
 }
 
+/// What decompressing blocks keeps from one block to the next: RocksDB's
+/// `Decompressor::ManagedWorkingArea`, a ZSTD context reused across blocks. A table reader
+/// keeps one per reading thread; it holds no block's bytes.
+#[derive(Debug, Default)]
+pub struct Workspace {
+    zstd: Option<Decoder>,
+}
+
 /// `DecompressBlockData` [R table/format.cc:684-744] with the built-in decompressor
 /// [R util/compression.cc:1273-1556]: `data`, a block compressed with `kind` after `dict` (empty
 /// for none), decompressed to exactly the size it states. A stated size above `max_len` is
@@ -254,6 +262,28 @@ pub fn decompress_block(
     dict: &[u8],
     max_len: usize,
 ) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::new();
+    decompress_block_into(
+        kind,
+        data,
+        dict,
+        max_len,
+        &mut Workspace::default(),
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+/// [`decompress_block`] into `out`, whose capacity is kept, with `workspace` reused: a block
+/// read by a table reader that keeps both allocates nothing once they have grown.
+pub fn decompress_block_into(
+    kind: CompressionType,
+    data: &[u8],
+    dict: &[u8],
+    max_len: usize,
+    workspace: &mut Workspace,
+    out: &mut Vec<u8>,
+) -> Result<(), Error> {
     let (stated, body) = uncompressed_size(kind, data)?;
     let len = usize::try_from(stated)
         .ok()
@@ -262,8 +292,11 @@ pub fn decompress_block(
             what: "a compressed block's stated size",
             limit: u64::try_from(max_len).unwrap_or(u64::MAX),
         })?;
-    let out = match kind {
-        CompressionType::Snappy => snappy::decompress(body, len)?,
+    match kind {
+        CompressionType::Zstd => {
+            zstd_decompress(body, dict, len, workspace, out)?;
+        }
+        CompressionType::Snappy => *out = snappy::decompress(body, len)?,
         CompressionType::Zlib => {
             if !dict.is_empty() {
                 return Err(Error::Unsupported {
@@ -272,36 +305,47 @@ pub fn decompress_block(
                 });
             }
             // RocksDB inflates every block with windowBits −14 [R util/compression.cc:1293].
-            deflate::decompress(body, 14, len)?
+            *out = deflate::decompress(body, 14, len)?;
         }
-        CompressionType::Lz4 | CompressionType::Lz4hc => lz4::decompress(body, dict, len)?,
-        CompressionType::Zstd => zstd_decompress(body, dict, len)?,
+        CompressionType::Lz4 | CompressionType::Lz4hc => *out = lz4::decompress(body, dict, len)?,
         _ => {
             return Err(Error::Unsupported {
                 feature: "reading blocks with compression type",
                 value: u64::from(kind.as_u8()),
             });
         }
-    };
+    }
     if out.len() != len {
         return Err(Error::corruption(
             "decompressed block's size",
             Malformed::CountMismatch,
         ));
     }
-    Ok(out)
+    Ok(())
 }
 
-/// `ZSTD_decompressDCtx` or `ZSTD_decompress_usingDict` into exactly `len` bytes: every frame of
-/// `body` decoded, and its output exactly `len`.
-fn zstd_decompress(body: &[u8], dict: &[u8], len: usize) -> Result<Vec<u8>, Error> {
-    let dictionary = if dict.is_empty() {
-        None
+/// `ZSTD_decompressDCtx` or `ZSTD_decompress_usingDict` into exactly `len` bytes of `out`: every
+/// frame of `body` decoded, and its output exactly `len`. Without a dictionary the workspace's
+/// decoder is reset and reused; a dictionary's decoder is made for the block.
+fn zstd_decompress(
+    body: &[u8],
+    dict: &[u8],
+    len: usize,
+    workspace: &mut Workspace,
+    out: &mut Vec<u8>,
+) -> Result<(), Error> {
+    let mut own;
+    let decoder = if dict.is_empty() {
+        let d = workspace
+            .zstd
+            .get_or_insert_with(|| Decoder::new(ZSTD_WINDOW_MAX, None));
+        d.reset();
+        d
     } else {
-        Some(Dictionary::new(dict)?)
+        own = Decoder::new(ZSTD_WINDOW_MAX, Some(Dictionary::new(dict)?));
+        &mut own
     };
-    let mut decoder = Decoder::new(ZSTD_WINDOW_MAX, dictionary);
-    let mut out = Vec::new();
+    out.clear();
     out.try_reserve_exact(len)
         .map_err(|_| Error::LimitExceeded {
             what: "a ZSTD block's output",
@@ -336,5 +380,5 @@ fn zstd_decompress(body: &[u8], dict: &[u8], len: usize) -> Result<Vec<u8>, Erro
     if produced != len {
         return Err(bad(Malformed::CountMismatch));
     }
-    Ok(out)
+    Ok(())
 }

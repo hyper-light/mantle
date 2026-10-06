@@ -111,3 +111,39 @@ pub fn compact<F: BlockFile>(
         Ok(None)
     }
 }
+
+/// [`compact`] into branches of at most `per` entries each: each with its first key, in key
+/// order, for a leaf's split. Empty when nothing is left.
+pub fn compact_split<F: BlockFile>(
+    store: &mut Store<F>,
+    branches: &[Branch],
+    from: &[u8],
+    end: Option<&[u8]>,
+    drop_tombstones: bool,
+    per: u64,
+) -> Result<Vec<(Vec<u8>, Branch)>, Error> {
+    let mut merge = Merge::new(store, branches, from, end)?;
+    let mut out = Vec::new();
+    let mut builder: Option<(Vec<u8>, Builder, u64)> = None;
+    while let Some((key, op, value)) = merge.entry() {
+        if !(drop_tombstones && op == Op::Delete) {
+            let (key, value) = (key.to_vec(), value.to_vec());
+            if builder.as_ref().is_some_and(|(_, _, n)| *n >= per)
+                && let Some((first, b, _)) = builder.take()
+            {
+                out.push((first, b.finish(store)?));
+            }
+            let (_, b, n) = match builder.as_mut() {
+                Some(b) => b,
+                None => builder.insert((key.clone(), Builder::new(store.page_capacity())?, 0)),
+            };
+            b.add(store, &key, op, &value)?;
+            *n = n.saturating_add(1);
+        }
+        merge.next(store)?;
+    }
+    if let Some((first, b, _)) = builder {
+        out.push((first, b.finish(store)?));
+    }
+    Ok(out)
+}

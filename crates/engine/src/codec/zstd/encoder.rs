@@ -471,6 +471,14 @@ struct Found {
     length: u32,
 }
 
+/// A hash table's entry for a search position: where it points in the frame (the frame's first
+/// byte when it is not this frame's), and whether it is this frame's.
+#[derive(Clone, Copy, Debug)]
+struct Candidate {
+    at: usize,
+    valid: bool,
+}
+
 /// Hash chains over the frame's input: `head` the latest position of each 4-byte hash, `chain`
 /// each position's previous one of the same hash.
 struct Matcher<'a> {
@@ -692,16 +700,39 @@ impl<'a> Matcher<'a> {
         self.short_slot(self.read64(at))
     }
 
-    /// The long table's position at `slot`, if this frame's.
+    /// The long table's candidate at `slot`: its position and whether it is this frame's.
     #[inline(always)]
-    fn long_at(&self, slot: usize) -> Option<usize> {
-        self.head.get(slot).and_then(|&e| self.position(e))
+    fn long_at(&self, slot: usize) -> Candidate {
+        self.candidate(self.head.get(slot).copied().unwrap_or(0))
     }
 
-    /// The short table's position at `slot`, if this frame's.
+    /// The short table's candidate at `slot`.
     #[inline(always)]
-    fn short_at(&self, slot: usize) -> Option<usize> {
-        self.chain.get(slot).and_then(|&e| self.position(e))
+    fn short_at(&self, slot: usize) -> Candidate {
+        self.candidate(self.chain.get(slot).copied().unwrap_or(0))
+    }
+
+    /// Zero exactly when `c` is this frame's and its bytes under `mask` equal `v`'s: the
+    /// difference of the words with the candidate's invalidity or-ed in, so the compiler has no
+    /// separate validity test to branch on (see [`Self::candidate`]).
+    #[inline(always)]
+    fn differs(&self, c: Candidate, v: u64, mask: u64) -> u64 {
+        ((self.read64(c.at) ^ v) & mask) | u64::from(!c.valid)
+    }
+
+    /// An entry as a candidate: an earlier frame's (below `base`) is not this frame's, and its
+    /// position is the frame's first byte, so it is read like any other and only `valid` keeps
+    /// it from matching. Validity then joins the data comparison in one branch ([`Self::differs`]), as the tables
+    /// are never cleared and early in a frame its entries and older ones alternate past
+    /// prediction: tested apart, that branch was the search's most mispredicted.
+    #[inline(always)]
+    fn candidate(&self, entry: u32) -> Candidate {
+        let valid = entry >= self.base;
+        let at = usize::try_from(entry.wrapping_sub(self.base)).unwrap_or(0);
+        Candidate {
+            at: if valid { at } else { 0 },
+            valid,
+        }
     }
 
     /// Sets the long table's `slot` to `at`.
@@ -782,9 +813,8 @@ impl<'a> Matcher<'a> {
                 }
                 let v1 = self.read64(ip1);
                 let hl1 = self.long_slot(v1);
-                if let Some(m) = idxl0
-                    && self.read64(m) == v0
-                {
+                if self.differs(idxl0, v0, u64::MAX) == 0 {
+                    let m = idxl0.at;
                     let length = self
                         .common(m.saturating_add(8), ip.saturating_add(8), end)
                         .saturating_add(8);
@@ -792,9 +822,8 @@ impl<'a> Matcher<'a> {
                     break (at, at.saturating_sub(m), length, curr, (hl1, ip1, step));
                 }
                 let idxl1 = self.long_at(hl1);
-                if let Some(m) = idxs0
-                    && self.read64(m) & LOW_4 == v0 & LOW_4
-                {
+                if self.differs(idxs0, v0, LOW_4) == 0 {
+                    let m = idxs0.at;
                     // A short match: a long one one position ahead replaces it if longer.
                     let mut found = (
                         ip,
@@ -802,9 +831,8 @@ impl<'a> Matcher<'a> {
                         self.common(m.saturating_add(4), ip.saturating_add(4), end)
                             .saturating_add(4),
                     );
-                    if let Some(m1) = idxl1
-                        && self.read64(m1) == v1
-                    {
+                    if self.differs(idxl1, v1, u64::MAX) == 0 {
+                        let m1 = idxl1.at;
                         let l1 = self
                             .common(m1.saturating_add(8), ip1.saturating_add(8), end)
                             .saturating_add(8);

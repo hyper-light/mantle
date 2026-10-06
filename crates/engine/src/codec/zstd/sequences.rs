@@ -167,9 +167,8 @@ impl SeqTable {
         if self.cells.len() != size {
             self.cells.resize(size, SeqCell::default());
         }
-        let symbols = spread.symbols;
-        for (cell, &symbol) in self.cells.iter_mut().zip(&symbols) {
-            let (bits, next) = spread.transition(symbol)?;
+        for (cell, made) in self.cells.iter_mut().zip(spread.cells()) {
+            let (symbol, bits, next) = made?;
             let (base, extra) = kind.code(symbol)?;
             *cell = SeqCell {
                 base,

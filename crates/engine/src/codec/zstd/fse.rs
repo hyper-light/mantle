@@ -56,9 +56,8 @@ impl Table {
         if self.cells.len() != size {
             self.cells.resize(size, Cell::default());
         }
-        let symbols = spread.symbols;
-        for (cell, &symbol) in self.cells.iter_mut().zip(&symbols) {
-            let (bits, baseline) = spread.transition(symbol)?;
+        for (cell, made) in self.cells.iter_mut().zip(spread.cells()) {
+            let (symbol, bits, baseline) = made?;
             *cell = Cell {
                 symbol,
                 bits,
@@ -86,7 +85,7 @@ pub(super) const CELLS_MAX: usize = 1 << 9;
 
 /// A distribution spread over its table's cells (§4.1.1), as `ZSTD_buildFSETable` spreads it
 /// (zstd 1.5.7 `lib/decompress/zstd_decompress_block.c`): each cell's symbol, and each symbol's
-/// next state, which [`Spread::transition`] hands out in cell order.
+/// next state, which [`Spread::cells`] hands out in cell order.
 pub(super) struct Spread {
     pub(super) symbols: [u8; CELLS_MAX],
     next: [u32; SYMBOLS_MAX],
@@ -177,33 +176,55 @@ impl Spread {
         Ok(size)
     }
 
-    /// The next cell of `symbol`'s: its state's bits and baseline, the next state being
-    /// `baseline + read(bits)`. Lower states read one more bit, to reach the next power of two.
-    #[inline(always)]
-    pub(super) fn transition(&mut self, symbol: u8) -> Result<(u8, u16), Corrupt> {
-        let n = self
-            .next
-            .get_mut(usize::from(symbol))
-            .ok_or(Corrupt::Distribution)?;
-        let state = *n;
-        *n = state.checked_add(1).ok_or(Corrupt::Distribution)?;
-        let bits = self
-            .log
-            .checked_sub(
-                31u32
-                    .checked_sub(state.leading_zeros())
-                    .ok_or(Corrupt::Distribution)?,
-            )
-            .ok_or(Corrupt::Distribution)?;
-        let baseline = state
-            .checked_shl(bits)
-            .and_then(|v| v.checked_sub(self.size))
-            .ok_or(Corrupt::Distribution)?;
-        Ok((
-            u8::try_from(bits).map_err(|_| Corrupt::Distribution)?,
-            u16::try_from(baseline).map_err(|_| Corrupt::Distribution)?,
-        ))
+    /// The cells in order, each with its symbol and its state's bits and baseline (the next
+    /// state being `baseline + read(bits)`), borrowed from the spread rather than copied out.
+    pub(super) fn cells(&mut self) -> impl Iterator<Item = Result<(u8, u8, u16), Corrupt>> + '_ {
+        let Self {
+            symbols,
+            next,
+            log,
+            size,
+        } = self;
+        let (log, size) = (*log, *size);
+        symbols
+            .iter()
+            .take(usize::try_from(size).unwrap_or(0))
+            .map(move |&symbol| {
+                let (bits, baseline) = transition(next, log, size, symbol)?;
+                Ok((symbol, bits, baseline))
+            })
     }
+}
+
+/// The next cell of `symbol`'s, from its next state: the state's bits and baseline. Lower states
+/// read one more bit, to reach the next power of two.
+#[inline(always)]
+fn transition(
+    next: &mut [u32; SYMBOLS_MAX],
+    log: u32,
+    size: u32,
+    symbol: u8,
+) -> Result<(u8, u16), Corrupt> {
+    let n = next
+        .get_mut(usize::from(symbol))
+        .ok_or(Corrupt::Distribution)?;
+    let state = *n;
+    *n = state.checked_add(1).ok_or(Corrupt::Distribution)?;
+    let bits = log
+        .checked_sub(
+            31u32
+                .checked_sub(state.leading_zeros())
+                .ok_or(Corrupt::Distribution)?,
+        )
+        .ok_or(Corrupt::Distribution)?;
+    let baseline = state
+        .checked_shl(bits)
+        .and_then(|v| v.checked_sub(size))
+        .ok_or(Corrupt::Distribution)?;
+    Ok((
+        u8::try_from(bits).map_err(|_| Corrupt::Distribution)?,
+        u16::try_from(baseline).map_err(|_| Corrupt::Distribution)?,
+    ))
 }
 
 /// A decoder's state over one table: its first value read, and each next one from the cell's

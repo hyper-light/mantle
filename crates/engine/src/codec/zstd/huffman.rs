@@ -91,17 +91,37 @@ impl Huffman {
     /// Makes this the table of a series of weights, the last literal's weight deduced by
     /// completing to a power of two (§4.2.1).
     fn set_weights(&mut self, weights: &[u8]) -> Result<(), Corrupt> {
-        let mut total = 0u32;
+        if weights.len() >= 256 {
+            return Err(Corrupt::Huffman);
+        }
+        // One pass counts the literals of each weight and finds the largest. Indexes are masked
+        // to the counts' sixteen slots, so the pass has no bounds test and no branch; a weight
+        // past `MAX_BITS` is refused after it, before any count is used.
+        let mut counts = [0usize; 16];
+        let mut largest = 0u8;
         for &w in weights {
-            if u32::from(w) > MAX_BITS {
-                return Err(Corrupt::Huffman);
+            largest = largest.max(w);
+            if let Some(c) = counts.get_mut(usize::from(w & 15)) {
+                *c = c.wrapping_add(1);
             }
-            if w > 0 {
-                let share = 1u32
-                    .checked_shl(u32::from(w).checked_sub(1).ok_or(Corrupt::Huffman)?)
-                    .ok_or(Corrupt::Huffman)?;
-                total = total.checked_add(share).ok_or(Corrupt::Huffman)?;
-            }
+        }
+        if u32::from(largest) > MAX_BITS {
+            return Err(Corrupt::Huffman);
+        }
+        // A literal of weight `w` takes `2^(w-1)` of the total (§4.2.1): at most 255 literals of
+        // at most 2^10 each, so neither the shift nor the sum overflows.
+        let mut total = 0u32;
+        for (w, &c) in counts
+            .iter()
+            .enumerate()
+            .take(MAX_BITS as usize + 1)
+            .skip(1)
+        {
+            let c = u32::try_from(c).map_err(|_| Corrupt::Huffman)?;
+            let shift = u32::try_from(w.saturating_sub(1)).map_err(|_| Corrupt::Huffman)?;
+            total = total
+                .checked_add(c.checked_shl(shift).ok_or(Corrupt::Huffman)?)
+                .ok_or(Corrupt::Huffman)?;
         }
         if total == 0 {
             return Err(Corrupt::Huffman);
@@ -120,16 +140,10 @@ impl Huffman {
         }
         let last = u8::try_from(u32::BITS.saturating_sub(rest.leading_zeros()))
             .map_err(|_| Corrupt::Huffman)?;
-        if weights.len() >= 256 {
-            return Err(Corrupt::Huffman);
-        }
         // Codes are handed out by weight, lowest first, and by literal within a weight
         // (§4.2.1.3): each weight's run of the table starts where the lower weights' end.
-        let mut counts = [0usize; MAX_BITS as usize + 2];
-        for &w in weights.iter().chain(std::iter::once(&last)) {
-            let c = counts.get_mut(usize::from(w)).ok_or(Corrupt::Huffman)?;
-            *c = c.checked_add(1).ok_or(Corrupt::Huffman)?;
-        }
+        let c = counts.get_mut(usize::from(last)).ok_or(Corrupt::Huffman)?;
+        *c = c.checked_add(1).ok_or(Corrupt::Huffman)?;
         let mut start = [0usize; MAX_BITS as usize + 2];
         let mut next = 0usize;
         for w in 1..=usize::try_from(max_bits).map_err(|_| Corrupt::Huffman)? {
@@ -170,16 +184,21 @@ impl Huffman {
         // sorts by weight the same way), not by a choice per literal. Absent literals (weight
         // 0) sort into a region of their own ahead of the rest, so placing one takes no branch.
         let mut sorted = [0u8; 256];
-        let mut place = [0usize; MAX_BITS as usize + 2];
+        let mut place = [0usize; 16];
         let mut first = 0usize;
         for (p, &c) in place.iter_mut().zip(&counts) {
             *p = first;
             first = first.checked_add(c).ok_or(Corrupt::Huffman)?;
         }
+        // Masked as the counting was: every weight is now at most `MAX_BITS`, and the places
+        // stay below the 256 literals counted.
         for (symbol, &w) in (0u8..=255).zip(weights.iter().chain(std::iter::once(&last))) {
-            let p = place.get_mut(usize::from(w)).ok_or(Corrupt::Huffman)?;
-            *sorted.get_mut(*p).ok_or(Corrupt::Huffman)? = symbol;
-            *p = p.checked_add(1).ok_or(Corrupt::Huffman)?;
+            if let Some(p) = place.get_mut(usize::from(w & 15)) {
+                if let Some(slot) = sorted.get_mut(*p & 255) {
+                    *slot = symbol;
+                }
+                *p = p.wrapping_add(1);
+            }
         }
         let mut from = *counts.first().ok_or(Corrupt::Huffman)?;
         for w in 1..=usize::try_from(max_bits).map_err(|_| Corrupt::Huffman)? {

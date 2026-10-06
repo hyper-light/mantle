@@ -392,6 +392,12 @@ does with bad or unusual ones is not.
   iterator's contract allows (block.h:972-977). RocksDB signals an absent prefix as
   `Status::NotFound` on the iterator. The port keeps the status clean and answers
   `prefix_absent()`, so a missing prefix is never taken for an error.
+- *Properties.* Where a stored number does not decode, RocksDB logs it, leaves the field at
+  its default and goes on. The port does the same and names the property in
+  `TableProperties::malformed`, so a reader can see it. RocksDB returns OK when its iterator
+  stops on corruption after the first entry (meta_blocks.cc:362-368 checks the status only
+  inside the loop). The port returns the corruption. A meta block or property added twice is
+  refused, where RocksDB keeps the first and asserts in debug builds.
 - *A protection width RocksDB never writes* (anything but 1, 2, 4 or 8) is `Unsupported`, not
   undefined behaviour in `Encode`.
 - *A seek target too short to be an internal key*, where interpolation search reads its trailer,
@@ -424,10 +430,18 @@ does with bad or unusual ones is not.
   fails it. Two changes pass, and both are equivalent: merging adjacent runs only saves memory,
   and the first-of-run test only saves a comparison.
 
+- `table/meta_blocks.rs` and `table/table_properties.rs`: the meta-index and properties blocks,
+  their parse, and the lookup of a meta block by name. On 128 property sets
+  (`tests/golden/p4_meta_gen.cc`), the port's properties blocks equal RocksDB's byte for byte. The
+  sets have every optional field set and unset, strings that are not UTF-8, user-collected
+  properties, and the external file's global sequence number. The port parses every RocksDB block,
+  16 with a malformed number, to the properties RocksDB parsed. Its 64 meta-index blocks equal
+  RocksDB's and answer every lookup as RocksDB's do (`tests/meta_blocks_golden.rs`).
+
 **Open in compression.** Writing LZ4HC, and zlib or ZSTD with a dictionary, is refused as
 unsupported until the codecs have them; reading them already works, except zlib with a dictionary.
 BZip2 and XPRESS are refused both ways, as in a RocksDB build without them.
 
-**Next in P4.** The meta-index and properties blocks; the table builder and reader; `SstFileWriter` and
+**Next in P4.** The table builder and reader; `SstFileWriter` and
 `SstFileReader`; the `sst_dump` differential; and the block-read benchmark against RocksDB
 (P15's harness).

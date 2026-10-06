@@ -1113,6 +1113,11 @@ impl<'a> BlockIter<'a> {
         slice(self.core.data, self.core.value.0, self.core.value.1)
     }
 
+    /// `ValueOffset` [R block.h:445-447]: where the current value starts in the block.
+    pub fn value_offset(&self) -> u32 {
+        self.core.value.0
+    }
+
     /// `raw_value` [R block.h:960-963].
     pub fn raw_value(&self) -> &[u8] {
         self.value()

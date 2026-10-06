@@ -304,6 +304,15 @@ impl<'a> Writer<'a> {
         self.held = self.held.wrapping_add(bits);
     }
 
+    /// Appends `value`, already below `2^bits`, with no test of the word's room and no mask: for
+    /// a caller whose flushes keep the bits held, these included, within the word, as the
+    /// reference's `HUF_addBits` relies on its unrolled flushes.
+    #[inline(always)]
+    pub(super) fn push(&mut self, value: u64, bits: u32) {
+        self.acc |= value << (self.held & 63);
+        self.held = self.held.wrapping_add(bits);
+    }
+
     /// Appends the low `bits` (at most 32) of `value`, storing whole bytes once 32 bits are held.
     #[inline(always)]
     pub(super) fn add(&mut self, value: u64, bits: u32) {

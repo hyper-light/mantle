@@ -1045,25 +1045,30 @@ impl HuffmanEncoder {
     pub(super) fn stream(&self, literals: &[u8], out: &mut Vec<u8>) -> Result<(), Corrupt> {
         let mut w = Writer::new(out, literals.len().saturating_mul(MAX_BITS as usize));
         // Four codes of at most 11 bits between flushes: with the 7 a flush leaves, within the
-        // writer's 64 (`HUF_compress1X_usingCTable`'s unrolled flushes).
+        // writer's 64 (`HUF_compress1X_usingCTable`'s unrolled flushes), so each is pushed
+        // with no test of the word's room. A literal with no code would push nothing: the
+        // shortest length seen is kept, branch-free, and the stream refused once at the end if
+        // it is 0, where a test a literal would sit in the loop.
         let (head, fours) = literals.as_rchunks::<4>();
-        let code_of = |b: u8, w: &mut Writer<'_>| -> Result<(), Corrupt> {
-            let &(code, len) = self.codes.get(usize::from(b)).ok_or(Corrupt::Huffman)?;
-            if len == 0 {
-                return Err(Corrupt::Huffman);
-            }
-            w.add_held(u64::from(code), u32::from(len));
-            Ok(())
+        let mut shortest = u8::MAX;
+        let mut code_of = |b: u8, w: &mut Writer<'_>| {
+            let (code, len) = self.codes.get(usize::from(b)).copied().unwrap_or((0, 0));
+            shortest = shortest.min(len);
+            w.push(u64::from(code), u32::from(len));
         };
         for &[a, b, c, d] in fours.iter().rev() {
-            code_of(d, &mut w)?;
-            code_of(c, &mut w)?;
-            code_of(b, &mut w)?;
-            code_of(a, &mut w)?;
+            code_of(d, &mut w);
+            code_of(c, &mut w);
+            code_of(b, &mut w);
+            code_of(a, &mut w);
             w.flush();
         }
         for &b in head.iter().rev() {
-            code_of(b, &mut w)?;
+            code_of(b, &mut w);
+            w.flush();
+        }
+        if shortest == 0 {
+            return Err(Corrupt::Huffman);
         }
         w.close();
         Ok(())

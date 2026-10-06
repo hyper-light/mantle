@@ -1,5 +1,10 @@
 # The metadata engine: RocksDB 11.8.1, converted to Rust
 
+**Superseded in structure, 2026-10-06.** The owner chose a new structure and the engine's own
+format on docs/research/33: see engine-structure.md. What this document built stays as the import
+and export path and the differential oracle (engine-structure.md §9), and its codecs and blocks
+are reused.
+
 Status: design, 2026-09-30; phases P1 and P2 done (P2 2026-10-04). Sources: docs/research/24 (the port's contract,
 cited as "24 §x"), docs/research/12 (RocksDB and ZippyDB, cited as "12 §x"), docs/research/23
 (Meta's RocksDB enhancements); RocksDB at tag `v11.8.1`, commit `abeebd963`, cited as

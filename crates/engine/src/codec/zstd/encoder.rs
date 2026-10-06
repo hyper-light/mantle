@@ -1486,7 +1486,9 @@ fn sequences_section(work: &mut Work<'_>) -> Result<(), Corrupt> {
         (ll_t.mode << 6) | (of_t.mode << 4) | (ml_t.mode << 2);
     // The bitstream, the reference's ZSTD_encodeSequences: the last sequence's states and bits
     // first, then each earlier one, then the states flushed, read back in the decoder's order.
-    let mut w = Writer::new(out);
+    // Each sequence's bits at most: three states of at most 9, 9 and 8 bits, then extra bits of
+    // at most 16, 16 and 31.
+    let mut w = Writer::new(out, n.saturating_mul(26 + 16 + 16 + 31));
     let [l_ll, l_ml, l_of] = *codes.last().ok_or(Corrupt::Sequences)?;
     let mut s_ml = Coder::init(&ml_t, l_ml.0)?;
     let mut s_of = Coder::init(&of_t, l_of.0)?;
@@ -1494,13 +1496,28 @@ fn sequences_section(work: &mut Work<'_>) -> Result<(), Corrupt> {
     w.add(u64::from(l_ll.1), u32::from(l_ll.2));
     w.add(u64::from(l_ml.1), u32::from(l_ml.2));
     w.add(u64::from(l_of.1), u32::from(l_of.2));
+    w.flush();
+    // `ZSTD_encodeSequences`' flushes for a 64-bit word: at most 7 bits held after a flush, 26
+    // more for the states, a flush before the extra bits unless all three fit with them, another
+    // before the offset's unless the lengths' and offset's fit after the states.
     for &[c_ll, c_ml, c_of] in codes.iter().rev().skip(1) {
         s_of.encode(c_of.0, &mut w)?;
         s_ml.encode(c_ml.0, &mut w)?;
         s_ll.encode(c_ll.0, &mut w)?;
-        w.add(u64::from(c_ll.1), u32::from(c_ll.2));
-        w.add(u64::from(c_ml.1), u32::from(c_ml.2));
-        w.add(u64::from(c_of.1), u32::from(c_of.2));
+        // Each at most 31, so the sum is far below u32's range.
+        let extra = u32::from(c_ll.2)
+            .wrapping_add(u32::from(c_ml.2))
+            .wrapping_add(u32::from(c_of.2));
+        if extra >= 64 - 7 - 26 {
+            w.flush();
+        }
+        w.add_held(u64::from(c_ll.1), u32::from(c_ll.2));
+        w.add_held(u64::from(c_ml.1), u32::from(c_ml.2));
+        if extra > 56 {
+            w.flush();
+        }
+        w.add_held(u64::from(c_of.1), u32::from(c_of.2));
+        w.flush();
     }
     s_ml.flush(&mut w);
     s_of.flush(&mut w);

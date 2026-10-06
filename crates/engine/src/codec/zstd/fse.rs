@@ -420,7 +420,7 @@ pub(super) fn normalize<'a>(
 /// the accuracy log less 5 in 4 bits, then each symbol's probability plus one in the reader's
 /// variable width, zero runs after a zero as 2-bit repeat flags; appended to `out`.
 pub(super) fn write_distribution(norm: &[i16], log: u32, out: &mut Vec<u8>) -> Result<(), Corrupt> {
-    let mut w = Writer::new(out);
+    let mut w = Writer::new(out, norm.len().saturating_mul(16).saturating_add(4));
     w.add(
         u64::from(
             log.checked_sub(MIN_ACCURACY_LOG)
@@ -626,7 +626,8 @@ impl EncodeState {
     ) -> Result<(), Corrupt> {
         let t = table.transform(symbol)?;
         let bits_out = self.value.saturating_add(t.delta_bits) >> 16;
-        w.add(u64::from(self.value), bits_out);
+        // At most the table's accuracy log, 9: the caller flushes (`FSE_encodeSymbol`).
+        w.add_held(u64::from(self.value), bits_out);
         let index = i64::from(self.value >> bits_out).saturating_add(i64::from(t.delta_state));
         self.value = table.state_at(index)?;
         Ok(())

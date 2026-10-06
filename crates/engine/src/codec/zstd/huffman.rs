@@ -554,13 +554,27 @@ impl HuffmanEncoder {
     /// One stream of `literals` onto `out`, written last literal first so the decoder, reading
     /// backward, meets them in order (§4.2.2).
     pub(super) fn stream(&self, literals: &[u8], out: &mut Vec<u8>) -> Result<(), Corrupt> {
-        let mut w = Writer::new(out);
-        for &b in literals.iter().rev() {
+        let mut w = Writer::new(out, literals.len().saturating_mul(MAX_BITS as usize));
+        // Four codes of at most 11 bits between flushes: with the 7 a flush leaves, within the
+        // writer's 64 (`HUF_compress1X_usingCTable`'s unrolled flushes).
+        let (head, fours) = literals.as_rchunks::<4>();
+        let code_of = |b: u8, w: &mut Writer<'_>| -> Result<(), Corrupt> {
             let &(code, len) = self.codes.get(usize::from(b)).ok_or(Corrupt::Huffman)?;
             if len == 0 {
                 return Err(Corrupt::Huffman);
             }
-            w.add(u64::from(code), u32::from(len));
+            w.add_held(u64::from(code), u32::from(len));
+            Ok(())
+        };
+        for &[a, b, c, d] in fours.iter().rev() {
+            code_of(d, &mut w)?;
+            code_of(c, &mut w)?;
+            code_of(b, &mut w)?;
+            code_of(a, &mut w)?;
+            w.flush();
+        }
+        for &b in head.iter().rev() {
+            code_of(b, &mut w)?;
         }
         w.close();
         Ok(())
@@ -632,7 +646,7 @@ fn compress_weights(weights: &[u8], out: &mut Vec<u8>) -> Result<(), Corrupt> {
     let header = out.len();
     out.push(0);
     write_distribution(norm, log, out)?;
-    let mut w = Writer::new(out);
+    let mut w = Writer::new(out, weights.len().saturating_mul(WEIGHTS_MAX_LOG as usize));
     // From the end: the symbols at even indices are the first state's, odd the second's; the
     // first state is flushed last, so the decoder reads it first.
     let n = weights.len();
@@ -651,9 +665,11 @@ fn compress_weights(weights: &[u8], out: &mut Vec<u8>) -> Result<(), Corrupt> {
         s1 = EncodeState::init(&table, back(2)?)?;
         i = n.saturating_sub(2);
     }
+    w.flush();
     while i > 0 {
         s2.encode(&table, at(i.saturating_sub(1))?, &mut w)?;
         s1.encode(&table, at(i.saturating_sub(2))?, &mut w)?;
+        w.flush();
         i = i.saturating_sub(2);
     }
     s2.flush(&table, &mut w);

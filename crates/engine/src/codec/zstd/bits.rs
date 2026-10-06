@@ -255,55 +255,146 @@ fn low_mask(bits: u32) -> u64 {
 
 /// A writer of a little-endian bit string onto the end of a buffer, each value's least
 /// significant bit first: the encoder's side of [`Forward`] and [`Backward`]. Bits gather in a
-/// word that goes out four bytes at a time, as the reference's `BIT_CStream_t` flushes its
-/// container. A stream for the backward reader ends with [`Writer::close`]'s 1 bit and zero
-/// padding (§3.1.1.3.2.1.2, §4.2.2).
+/// 64-bit word that [`Writer::flush`] stores whole, advancing by the bytes it completed, as the
+/// reference's `BIT_CStream_t` does (zstd 1.5.7 lib/common/bitstream.h): the buffer is grown
+/// ahead of the bytes written and cut back when the stream ends. A stream for the backward
+/// reader ends with [`Writer::close`]'s 1 bit and zero padding (§3.1.1.3.2.1.2, §4.2.2).
 #[derive(Debug)]
 pub(super) struct Writer<'a> {
     bytes: &'a mut Vec<u8>,
-    /// Bits not yet written, the oldest lowest: fewer than 32 between adds.
+    /// Where the next whole byte goes; `bytes` holds at least 8 bytes from here.
+    at: usize,
+    /// Bits not yet stored as whole bytes, the oldest lowest.
     acc: u64,
     held: u32,
 }
 
 impl<'a> Writer<'a> {
-    /// A writer appending to `bytes`.
-    pub(super) fn new(bytes: &'a mut Vec<u8>) -> Self {
+    /// A writer appending to `bytes`, with room ahead for `bits` bits.
+    pub(super) fn new(bytes: &'a mut Vec<u8>, bits: usize) -> Self {
+        let at = bytes.len();
+        bytes.resize(at.saturating_add(bits.div_ceil(8)).saturating_add(8), 0);
         Self {
             bytes,
+            at,
             acc: 0,
             held: 0,
         }
     }
 
-    /// Appends the low `bits` (at most 32) of `value`.
+    /// Appends the low `bits` (at most 32) of `value`, storing only if the word would overflow:
+    /// a caller that flushes as the reference's `BIT_addBits` asks never takes that branch, and
+    /// one that does not still loses no bit.
     #[inline(always)]
-    pub(super) fn add(&mut self, value: u64, bits: u32) {
-        // `held` is below 32 and `bits` at most 32, so the bits fit the word.
+    pub(super) fn add_held(&mut self, value: u64, bits: u32) {
+        if self.held.wrapping_add(bits) > 64 {
+            self.flush_unasked();
+        }
+        // `held` is below 64 here unless `bits` is 0, when the masked value is 0.
         self.acc |= (value & low_mask(bits)) << (self.held & 63);
         self.held = self.held.wrapping_add(bits);
+    }
+
+    /// Appends the low `bits` (at most 32) of `value`, storing whole bytes once 32 bits are held.
+    #[inline(always)]
+    pub(super) fn add(&mut self, value: u64, bits: u32) {
+        self.add_held(value, bits);
         if self.held >= 32 {
-            let word = self.acc.to_le_bytes();
-            if let Some(low) = word.first_chunk::<4>() {
-                self.bytes.extend_from_slice(low);
-            }
-            self.acc >>= 32;
-            self.held = self.held.wrapping_sub(32);
+            self.flush();
         }
+    }
+
+    /// Stores the whole bytes held: the word is written at once and the position advanced past
+    /// the complete ones (`BIT_flushBits`).
+    #[inline(always)]
+    pub(super) fn flush(&mut self) {
+        let end = self.at.saturating_add(8);
+        if self.bytes.len() < end {
+            self.grow(end);
+        }
+        if let Some(dst) = self.bytes.get_mut(self.at..end) {
+            dst.copy_from_slice(&self.acc.to_le_bytes());
+        }
+        let whole = self.held >> 3;
+        self.at = self.at.saturating_add(usize::try_from(whole).unwrap_or(0));
+        self.acc = self.acc.checked_shr(whole << 3).unwrap_or(0);
+        self.held &= 7;
+    }
+
+    /// The flush the word's overflow forces when the caller's flushes did not come in time.
+    #[cold]
+    #[inline(never)]
+    fn flush_unasked(&mut self) {
+        self.flush();
+    }
+
+    /// Room for a flush past the bound the writer was made with; the buffer's own doubling
+    /// keeps repeated growth linear.
+    #[cold]
+    fn grow(&mut self, end: usize) {
+        self.bytes.resize(end, 0);
     }
 
     /// Ends a stream for the backward reader: a 1 bit, then zeros to the byte.
     pub(super) fn close(mut self) {
-        self.add(1, 1);
+        self.add_held(1, 1);
         self.finish();
     }
 
-    /// Ends a forward stream (a table description), its last byte padded with zeros.
-    pub(super) fn finish(self) {
-        let whole = usize::try_from(self.held.div_ceil(8)).unwrap_or(0);
-        let word = self.acc.to_le_bytes();
-        if let Some(rest) = word.get(..whole) {
-            self.bytes.extend_from_slice(rest);
+    /// Ends a forward stream (a table description), its last byte padded with zeros, and cuts
+    /// the buffer back to the bytes written.
+    pub(super) fn finish(mut self) {
+        let partial = usize::from(self.held & 7 != 0);
+        self.flush();
+        let end = self.at.saturating_add(partial);
+        self.bytes.truncate(end);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// The writer, with no room ahead so every flush grows the buffer, against the bits
+        /// written one at a time; the bytes before the stream stay. Flushes come when the
+        /// caller's contract asks, at random points besides, or never (`flush_every` past the
+        /// values' count), when the writer stores on its own.
+        #[test]
+        fn the_writer_writes_each_bit_in_order(
+            values in proptest::collection::vec((any::<u64>(), 0u32..=32), 0..200),
+            flush_every in 1usize..400,
+        ) {
+            let mut bytes = vec![0xAB];
+            let mut w = Writer::new(&mut bytes, 0);
+            let mut expected_bits = Vec::new();
+            // The caller's part of the contract: no more than 57 bits added between flushes
+            // (64 less the 7 a flush may leave).
+            let mut since_flush = 0u32;
+            let contract = flush_every < 4;
+            for (i, &(v, n)) in values.iter().enumerate() {
+                if contract && since_flush + n > 57 {
+                    w.flush();
+                    since_flush = 0;
+                }
+                w.add_held(v, n);
+                since_flush += n;
+                expected_bits.extend((0..n).map(|b| (v >> b) & 1 == 1));
+                if i % flush_every == 0 {
+                    w.flush();
+                    since_flush = 0;
+                }
+            }
+            w.close();
+            expected_bits.push(true);
+            let mut expected = vec![0xAB];
+            for chunk in expected_bits.chunks(8) {
+                expected.push(
+                    chunk.iter().enumerate().fold(0u8, |b, (i, &bit)| b | (u8::from(bit) << i)),
+                );
+            }
+            prop_assert_eq!(bytes, expected);
         }
     }
 }

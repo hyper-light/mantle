@@ -47,3 +47,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "shard_db"
+harness = false

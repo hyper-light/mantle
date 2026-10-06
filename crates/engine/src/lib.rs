@@ -27,6 +27,7 @@ pub mod file;
 pub mod memory;
 pub mod memtable;
 pub mod port;
+pub mod shard_db;
 pub mod store;
 pub mod table;
 pub mod trunk;

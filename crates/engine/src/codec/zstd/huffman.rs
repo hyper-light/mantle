@@ -324,86 +324,138 @@ fn fse_weights(
     Ok((count, end))
 }
 
-/// Optimal code lengths of at most `limit` bits for `counts` (one per literal, 0 for absent):
-/// the package-merge algorithm (Larmore and Hirschberg, "A fast algorithm for optimal
-/// length-limited Huffman codes", JACM 37(3), 1990). Absent literals get 0; a single present
-/// literal gets 1.
-pub(super) fn code_lengths(counts: &[u32], limit: u32) -> Vec<u8> {
-    let mut lengths = vec![0u8; counts.len()];
-    let mut present: Vec<(u64, usize)> = counts
-        .iter()
-        .enumerate()
-        .filter(|&(_, &c)| c > 0)
-        .map(|(s, &c)| (u64::from(c), s))
-        .collect();
-    if present.len() == 1 {
-        if let Some(&(_, s)) = present.first()
-            && let Some(l) = lengths.get_mut(s)
+/// The literals a Huffman table codes: every byte value (§4.2.1).
+pub(super) const LITERALS: usize = 256;
+/// Items a package-merge row holds at most: every leaf and a package of each pair before.
+const ROW_MAX: usize = 2 * LITERALS;
+
+/// Optimal code lengths of at most `limit` bits (at most [`MAX_BITS`]) for `counts` (one per
+/// literal, 0 for absent), into `lengths`: the package-merge algorithm (Larmore and Hirschberg,
+/// "A fast algorithm for optimal length-limited Huffman codes", JACM 37(3), 1990). Absent
+/// literals get 0; a single present literal gets 1.
+///
+/// No row's items are kept as lists of the leaves they package. Each row keeps only its merged
+/// order, an item a leaf's literal or a package; the items chosen in a row are always a prefix of
+/// it, its packages choosing twice as many of the row before. So each leaf's length is the
+/// number of rows whose chosen prefix holds it, counted from the last row back.
+pub(super) fn code_lengths(counts: &[u32], limit: u32, lengths: &mut [u8; LITERALS]) {
+    lengths.fill(0);
+    // The present literals by count, then by literal, as the rows merge them.
+    let mut leaves = [(0u64, 0u16); LITERALS];
+    let mut n = 0usize;
+    for (s, &c) in counts.iter().enumerate().take(LITERALS) {
+        if c > 0
+            && let Some(leaf) = leaves.get_mut(n)
         {
+            *leaf = (u64::from(c), u16::try_from(s).unwrap_or(0));
+            n = n.saturating_add(1);
+        }
+    }
+    let Some(leaves) = leaves.get_mut(..n) else {
+        return;
+    };
+    if let [(_, only)] = leaves {
+        if let Some(l) = lengths.get_mut(usize::from(*only)) {
             *l = 1;
         }
-        return lengths;
+        return;
     }
-    present.sort_unstable();
-    // Each item: its weight and the leaves (symbols) it packages, as counts per leaf index.
-    let leaves: Vec<(u64, Vec<usize>)> = present.iter().map(|&(w, s)| (w, vec![s])).collect();
-    let mut row: Vec<(u64, Vec<usize>)> = leaves.clone();
-    for _ in 1..limit {
-        // Package pairs of the previous row, then merge with the leaves by weight.
-        let mut packages: Vec<(u64, Vec<usize>)> = Vec::with_capacity(row.len() / 2);
-        for [(wa, a), (wb, b)] in row.as_chunks::<2>().0 {
-            {
-                let mut both = a.clone();
-                both.extend_from_slice(b);
-                packages.push((wa.saturating_add(*wb), both));
-            }
+    leaves.sort_unstable();
+    let leaves = &*leaves;
+    /// A row item that is a package, not a leaf.
+    const PACKAGE: u16 = u16::MAX;
+    let rows = usize::try_from(limit.clamp(1, MAX_BITS)).unwrap_or(1);
+    let mut order = [[0u16; ROW_MAX]; MAX_BITS as usize];
+    let mut sizes = [0usize; MAX_BITS as usize];
+    // Each row's weights, in two buffers that take turns as the row and the one before.
+    let mut weights = [[0u64; ROW_MAX]; 2];
+    // The first row: the leaves.
+    if let (Some(first), Some(w0)) = (order.first_mut(), weights.first_mut()) {
+        for ((o, slot), &(w, s)) in first.iter_mut().zip(w0.iter_mut()).zip(leaves) {
+            *o = s;
+            *slot = w;
         }
-        let mut merged = Vec::with_capacity(leaves.len().saturating_add(packages.len()));
-        let (mut i, mut j) = (0, 0);
-        while i < leaves.len() || j < packages.len() {
-            let take_leaf = match (leaves.get(i), packages.get(j)) {
-                (Some(l), Some(p)) => l.0 <= p.0,
-                (Some(_), None) => true,
-                _ => false,
+    }
+    if let Some(first) = sizes.first_mut() {
+        *first = n;
+    }
+    for r in 1..rows {
+        let previous = sizes.get(r.wrapping_sub(1)).copied().unwrap_or(0);
+        let [even, odd] = &mut weights;
+        let (before, current) = if r % 2 == 1 {
+            (&*even, odd)
+        } else {
+            (&*odd, even)
+        };
+        let Some(row) = order.get_mut(r) else {
+            break;
+        };
+        // Package pairs of the previous row, then merge them with the leaves by weight, a leaf
+        // before a package of equal weight.
+        let packages = previous >> 1;
+        let (mut i, mut j, mut k) = (0usize, 0usize, 0usize);
+        loop {
+            let package = (j < packages)
+                .then(|| {
+                    let at = j.wrapping_mul(2);
+                    before
+                        .get(at)
+                        .zip(before.get(at.wrapping_add(1)))
+                        .map(|(a, b)| a.saturating_add(*b))
+                })
+                .flatten();
+            let (w, item) = match (leaves.get(i), package) {
+                (Some(&(lw, _)), Some(pw)) if lw > pw => (pw, PACKAGE),
+                (Some(&(lw, ls)), _) => (lw, ls),
+                (None, Some(pw)) => (pw, PACKAGE),
+                (None, None) => break,
             };
-            if take_leaf {
-                if let Some(l) = leaves.get(i) {
-                    merged.push(l.clone());
-                }
-                i = i.saturating_add(1);
+            if item == PACKAGE {
+                j = j.wrapping_add(1);
             } else {
-                if let Some(p) = packages.get(j) {
-                    merged.push(p.clone());
-                }
-                j = j.saturating_add(1);
+                i = i.wrapping_add(1);
             }
+            if let (Some(o), Some(slot)) = (row.get_mut(k), current.get_mut(k)) {
+                *o = item;
+                *slot = w;
+            }
+            k = k.wrapping_add(1);
         }
-        row = merged;
+        if let Some(size) = sizes.get_mut(r) {
+            *size = k;
+        }
     }
-    // The first 2n − 2 items of the last row: each leaf's length is how many hold it.
-    let take = present.len().saturating_mul(2).saturating_sub(2);
-    for (_, symbols) in row.iter().take(take) {
-        for &s in symbols {
-            if let Some(l) = lengths.get_mut(s) {
+    // The first 2n − 2 items of the last row are chosen; back through the rows, each leaf chosen
+    // gains a bit and each package chosen chooses two items of the row before.
+    let mut chosen = n.saturating_mul(2).saturating_sub(2);
+    for r in (0..rows).rev() {
+        let row = order.get(r).map_or(&[][..], <[u16; ROW_MAX]>::as_slice);
+        let mut packages = 0usize;
+        for &item in row.iter().take(chosen) {
+            if item == PACKAGE {
+                packages = packages.saturating_add(1);
+            } else if let Some(l) = lengths.get_mut(usize::from(item)) {
                 *l = l.saturating_add(1);
             }
         }
+        chosen = packages.saturating_mul(2);
     }
-    lengths
 }
 
 /// An encoding table: each literal's code and its length.
 #[derive(Clone, Debug)]
 pub(super) struct HuffmanEncoder {
-    codes: Vec<(u32, u8)>,
-    /// The weights written in the tree description, the last present literal's left out.
-    weights: Vec<u8>,
+    codes: [(u32, u8); LITERALS],
+    /// The weights written in the tree description, the last present literal's left out: the
+    /// first `weights_len`.
+    weights: [u8; LITERALS],
+    weights_len: usize,
 }
 
 impl HuffmanEncoder {
     /// The table of `lengths` (each at most [`MAX_BITS`], at least two present): weights from the
     /// lengths (§4.2.1), codes handed out as the decoder's table lays them (§4.2.1.3).
-    pub(super) fn new(lengths: &[u8]) -> Result<Self, Corrupt> {
+    pub(super) fn new(lengths: &[u8; LITERALS]) -> Result<Self, Corrupt> {
         let max_bits = u32::from(lengths.iter().copied().max().unwrap_or(0));
         if max_bits == 0 || max_bits > MAX_BITS {
             return Err(Corrupt::Huffman);
@@ -419,30 +471,37 @@ impl HuffmanEncoder {
             .iter()
             .rposition(|&l| l > 0)
             .ok_or(Corrupt::Huffman)?;
-        let weights: Vec<u8> = lengths
-            .get(..last)
-            .ok_or(Corrupt::Huffman)?
-            .iter()
-            .map(|&l| weight(l))
-            .collect();
+        let mut weights = [0u8; LITERALS];
+        let mut per_weight = [0u32; MAX_BITS as usize + 2];
+        for (i, &l) in lengths.iter().enumerate() {
+            let w = weight(l);
+            if i < last
+                && let Some(slot) = weights.get_mut(i)
+            {
+                *slot = w;
+            }
+            if l > 0
+                && let Some(c) = per_weight.get_mut(usize::from(w))
+            {
+                *c = c.saturating_add(1);
+            }
+        }
         // The decoder's table: weight w's literals in order, each 2^(w−1) entries, the lowest
         // weight's first; a code is its first entry's index shifted down by the bits it skips.
         let mut start = [0u32; MAX_BITS as usize + 2];
         let mut next = 0u32;
         for w in 1..=max_bits {
-            let count = lengths
-                .iter()
-                .filter(|&&l| l > 0 && u32::from(weight(l)) == w)
-                .count();
-            if let Some(s) = start.get_mut(usize::try_from(w).unwrap_or(0)) {
+            let wi = usize::try_from(w).unwrap_or(0);
+            let count = per_weight.get(wi).copied().unwrap_or(0);
+            if let Some(s) = start.get_mut(wi) {
                 *s = next;
             }
-            next = next.saturating_add(u32::try_from(count).unwrap_or(0) << w.saturating_sub(1));
+            next = next.saturating_add(count << w.saturating_sub(1));
         }
         if next != 1 << max_bits {
             return Err(Corrupt::Huffman);
         }
-        let mut codes = vec![(0u32, 0u8); lengths.len()];
+        let mut codes = [(0u32, 0u8); LITERALS];
         for (&len, code) in lengths.iter().zip(codes.iter_mut()) {
             if len == 0 {
                 continue;
@@ -454,39 +513,48 @@ impl HuffmanEncoder {
                 *s = at.saturating_add(1 << w.saturating_sub(1));
             }
         }
-        Ok(Self { codes, weights })
+        Ok(Self {
+            codes,
+            weights,
+            weights_len: last,
+        })
     }
 
-    /// The tree description (§4.2.1.1): the weights FSE-compressed when that is shorter, written
-    /// directly otherwise (possible for at most 128 weights).
-    pub(super) fn description(&self) -> Result<Vec<u8>, Corrupt> {
-        let direct = if self.weights.len() <= 128 {
-            let mut out = vec![
-                u8::try_from(self.weights.len().saturating_add(127))
-                    .map_err(|_| Corrupt::Huffman)?,
-            ];
-            for pair in self.weights.chunks(2) {
-                let hi = pair.first().copied().unwrap_or(0);
-                let lo = pair.get(1).copied().unwrap_or(0);
-                out.push((hi << 4) | lo);
-            }
-            Some(out)
+    /// The tree description (§4.2.1.1) onto `out`: the weights FSE-compressed when that is
+    /// shorter, written directly otherwise (possible for at most 128 weights).
+    pub(super) fn description(&self, out: &mut Vec<u8>) -> Result<(), Corrupt> {
+        let weights = self
+            .weights
+            .get(..self.weights_len)
+            .ok_or(Corrupt::Huffman)?;
+        let start = out.len();
+        let direct_len = if weights.len() <= 128 {
+            Some(weights.len().div_ceil(2).saturating_add(1))
         } else {
             None
         };
-        let compressed = compress_weights(&self.weights).ok();
-        match (direct, compressed) {
-            (Some(d), Some(c)) => Ok(if c.len() < d.len() { c } else { d }),
-            (Some(d), None) => Ok(d),
-            (None, Some(c)) => Ok(c),
-            (None, None) => Err(Corrupt::Huffman),
+        if compress_weights(weights, out).is_ok()
+            && direct_len.is_none_or(|d| out.len().saturating_sub(start) < d)
+        {
+            return Ok(());
         }
+        out.truncate(start);
+        if direct_len.is_none() {
+            return Err(Corrupt::Huffman);
+        }
+        out.push(u8::try_from(weights.len().saturating_add(127)).map_err(|_| Corrupt::Huffman)?);
+        for pair in weights.chunks(2) {
+            let hi = pair.first().copied().unwrap_or(0);
+            let lo = pair.get(1).copied().unwrap_or(0);
+            out.push((hi << 4) | lo);
+        }
+        Ok(())
     }
 
-    /// One stream of `literals`, written last literal first so the decoder, reading backward,
-    /// meets them in order (§4.2.2).
-    pub(super) fn stream(&self, literals: &[u8]) -> Result<Vec<u8>, Corrupt> {
-        let mut w = Writer::new();
+    /// One stream of `literals` onto `out`, written last literal first so the decoder, reading
+    /// backward, meets them in order (§4.2.2).
+    pub(super) fn stream(&self, literals: &[u8], out: &mut Vec<u8>) -> Result<(), Corrupt> {
+        let mut w = Writer::new(out);
         for &b in literals.iter().rev() {
             let &(code, len) = self.codes.get(usize::from(b)).ok_or(Corrupt::Huffman)?;
             if len == 0 {
@@ -494,16 +562,24 @@ impl HuffmanEncoder {
             }
             w.add(u64::from(code), u32::from(len));
         }
-        Ok(w.close())
+        w.close();
+        Ok(())
     }
 
-    /// The streams of `literals`: one, or four behind their jump table (§3.1.1.3.1.6).
-    pub(super) fn streams(&self, literals: &[u8], four: bool) -> Result<Vec<u8>, Corrupt> {
+    /// The streams of `literals` onto `out`: one, or four behind their jump table
+    /// (§3.1.1.3.1.6).
+    pub(super) fn streams(
+        &self,
+        literals: &[u8],
+        four: bool,
+        out: &mut Vec<u8>,
+    ) -> Result<(), Corrupt> {
         if !four {
-            return self.stream(literals);
+            return self.stream(literals, out);
         }
         let segment = literals.len().div_ceil(4);
-        let mut parts = Vec::with_capacity(4);
+        let jump = out.len();
+        out.extend_from_slice(&[0; JUMP_TABLE]);
         for i in 0..4usize {
             let from = segment.saturating_mul(i).min(literals.len());
             let to = if i == 3 {
@@ -513,23 +589,25 @@ impl HuffmanEncoder {
                     .saturating_mul(i.saturating_add(1))
                     .min(literals.len())
             };
-            parts.push(self.stream(literals.get(from..to).ok_or(Corrupt::Huffman)?)?);
+            let begin = out.len();
+            self.stream(literals.get(from..to).ok_or(Corrupt::Huffman)?, out)?;
+            if i < 3 {
+                let size =
+                    u16::try_from(out.len().saturating_sub(begin)).map_err(|_| Corrupt::Huffman)?;
+                let at = jump.saturating_add(i.saturating_mul(2));
+                out.get_mut(at..at.saturating_add(2))
+                    .ok_or(Corrupt::Huffman)?
+                    .copy_from_slice(&size.to_le_bytes());
+            }
         }
-        let mut out = Vec::with_capacity(literals.len());
-        for part in parts.iter().take(3) {
-            let size = u16::try_from(part.len()).map_err(|_| Corrupt::Huffman)?;
-            out.extend_from_slice(&size.to_le_bytes());
-        }
-        for part in &parts {
-            out.extend_from_slice(part);
-        }
-        Ok(out)
+        Ok(())
     }
 }
 
-/// The weights compressed by FSE with two interleaved states (§4.2.1.2), the header byte its
-/// length: the inverse of [`fse_weights`] (the reference's `FSE_compress_usingCTable`).
-fn compress_weights(weights: &[u8]) -> Result<Vec<u8>, Corrupt> {
+/// The weights compressed by FSE with two interleaved states (§4.2.1.2) onto `out`, the header
+/// byte its length: the inverse of [`fse_weights`] (the reference's
+/// `FSE_compress_usingCTable`). On an error `out` may hold a partial description.
+fn compress_weights(weights: &[u8], out: &mut Vec<u8>) -> Result<(), Corrupt> {
     if weights.len() < 2 {
         return Err(Corrupt::Huffman);
     }
@@ -548,9 +626,13 @@ fn compress_weights(weights: &[u8]) -> Result<Vec<u8>, Corrupt> {
     }
     let total = u32::try_from(weights.len()).map_err(|_| Corrupt::Huffman)?;
     let log = table_log(weights.len(), max_symbol, WEIGHTS_MAX_LOG);
-    let norm = normalize(counts, total, log)?;
-    let table = EncodeTable::new(&norm, log)?;
-    let mut w = Writer::new();
+    let mut norm = [0i16; SYMBOLS_MAX];
+    let norm = normalize(counts, total, log, &mut norm)?;
+    let table = EncodeTable::new(norm, log)?;
+    let header = out.len();
+    out.push(0);
+    write_distribution(norm, log, out)?;
+    let mut w = Writer::new(out);
     // From the end: the symbols at even indices are the first state's, odd the second's; the
     // first state is flushed last, so the decoder reads it first.
     let n = weights.len();
@@ -576,13 +658,79 @@ fn compress_weights(weights: &[u8]) -> Result<Vec<u8>, Corrupt> {
     }
     s2.flush(&table, &mut w);
     s1.flush(&table, &mut w);
-    let mut out = vec![0u8];
-    out.extend_from_slice(&write_distribution(&norm, log)?);
-    out.extend_from_slice(&w.close());
-    let len = out.len().saturating_sub(1);
-    *out.first_mut().ok_or(Corrupt::Huffman)? = u8::try_from(len)
+    w.close();
+    let len = out.len().saturating_sub(header).saturating_sub(1);
+    *out.get_mut(header).ok_or(Corrupt::Huffman)? = u8::try_from(len)
         .ok()
         .filter(|&l| l < DIRECT)
         .ok_or(Corrupt::Huffman)?;
-    Ok(out)
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Package-merge kept as the algorithm states it, each item the list of the leaves it
+    /// packages: the oracle the array form must equal.
+    fn by_lists(counts: &[u32], limit: u32) -> Vec<u8> {
+        let mut lengths = vec![0u8; counts.len()];
+        let mut present: Vec<(u64, usize)> = counts
+            .iter()
+            .enumerate()
+            .filter(|&(_, &c)| c > 0)
+            .map(|(s, &c)| (u64::from(c), s))
+            .collect();
+        if present.len() == 1 {
+            lengths[present[0].1] = 1;
+            return lengths;
+        }
+        present.sort_unstable();
+        let leaves: Vec<(u64, Vec<usize>)> = present.iter().map(|&(w, s)| (w, vec![s])).collect();
+        let mut row = leaves.clone();
+        for _ in 1..limit {
+            let packages: Vec<(u64, Vec<usize>)> = row
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|[a, b]| (a.0 + b.0, [a.1.clone(), b.1.clone()].concat()))
+                .collect();
+            let mut merged = Vec::new();
+            let (mut i, mut j) = (0, 0);
+            while i < leaves.len() || j < packages.len() {
+                if j == packages.len() || (i < leaves.len() && leaves[i].0 <= packages[j].0) {
+                    merged.push(leaves[i].clone());
+                    i += 1;
+                } else {
+                    merged.push(packages[j].clone());
+                    j += 1;
+                }
+            }
+            row = merged;
+        }
+        for (_, symbols) in row.iter().take(2 * present.len() - 2) {
+            for &s in symbols {
+                lengths[s] += 1;
+            }
+        }
+        lengths
+    }
+
+    proptest! {
+        #[test]
+        fn the_array_form_equals_the_lists(
+            counts in proptest::collection::vec(prop_oneof![Just(0u32), 1u32..4, 1u32..100_000], 1..=256),
+            limit in 1u32..=MAX_BITS,
+        ) {
+            let present = counts.iter().filter(|&&c| c > 0).count();
+            // A code of `limit` bits holds at most 2^limit literals.
+            prop_assume!(present > 0 && present <= 1 << limit);
+            let mut lengths = [0u8; LITERALS];
+            code_lengths(&counts, limit, &mut lengths);
+            let oracle = by_lists(&counts, limit);
+            prop_assert_eq!(&lengths[..counts.len()], &oracle[..]);
+            prop_assert!(lengths[counts.len()..].iter().all(|&l| l == 0));
+        }
+    }
 }

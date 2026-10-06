@@ -43,13 +43,6 @@ impl Clone for Table {
 }
 
 impl Table {
-    /// The decoding table of a normalized distribution.
-    pub(super) fn from_distribution(norm: &[i16], accuracy_log: u32) -> Result<Self, Corrupt> {
-        let mut table = Self::default();
-        table.set_distribution(norm, accuracy_log)?;
-        Ok(table)
-    }
-
     /// Makes this the decoding table of a normalized distribution (§4.1.1); every cell is
     /// written, so a table of the same size is not cleared first.
     pub(super) fn set_distribution(
@@ -382,16 +375,20 @@ pub(super) fn table_log(total: usize, max_symbol: usize, max_log: u32) -> u32 {
 /// `1 << log` in which every present symbol keeps at least one cell: each its rounded share,
 /// the rounding's error then taken from or given to the largest. Symbols too rare for a full
 /// cell keep one (the format's "less than 1", -1, is an encoding choice this does not make).
-pub(super) fn normalize(counts: &[u32], total: u32, log: u32) -> Result<Vec<i16>, Corrupt> {
+pub(super) fn normalize<'a>(
+    counts: &[u32],
+    total: u32,
+    log: u32,
+    out: &'a mut [i16; SYMBOLS_MAX],
+) -> Result<&'a [i16], Corrupt> {
     let size = 1i64.checked_shl(log).ok_or(Corrupt::Distribution)?;
     let total = i64::from(total);
-    if total == 0 {
+    if total == 0 || counts.len() > SYMBOLS_MAX {
         return Err(Corrupt::Distribution);
     }
-    let mut norm = Vec::with_capacity(counts.len());
     let mut sum = 0i64;
     let mut largest = 0usize;
-    for (s, &c) in counts.iter().enumerate() {
+    for (s, (&c, slot)) in counts.iter().zip(out.iter_mut()).enumerate() {
         let c = i64::from(c);
         let share = if c == 0 {
             0
@@ -406,25 +403,24 @@ pub(super) fn normalize(counts: &[u32], total: u32, log: u32) -> Result<Vec<i16>
             largest = s;
         }
         sum = sum.saturating_add(share);
-        norm.push(share);
+        *slot = i16::try_from(share).map_err(|_| Corrupt::Distribution)?;
     }
     let fix = size.saturating_sub(sum);
-    let slot = norm.get_mut(largest).ok_or(Corrupt::Distribution)?;
-    *slot = slot.saturating_add(fix);
-    if *slot < 1 {
+    let slot = out.get_mut(largest).ok_or(Corrupt::Distribution)?;
+    let fixed = i64::from(*slot).saturating_add(fix);
+    if fixed < 1 {
         // The present symbols need more cells than the table has: the caller's log is too small.
         return Err(Corrupt::Distribution);
     }
-    norm.into_iter()
-        .map(|v| i16::try_from(v).map_err(|_| Corrupt::Distribution))
-        .collect()
+    *slot = i16::try_from(fixed).map_err(|_| Corrupt::Distribution)?;
+    out.get(..counts.len()).ok_or(Corrupt::Distribution)
 }
 
 /// Writes a distribution's table description (§4.1.1), the inverse of [`read_distribution`]:
 /// the accuracy log less 5 in 4 bits, then each symbol's probability plus one in the reader's
-/// variable width, zero runs after a zero as 2-bit repeat flags.
-pub(super) fn write_distribution(norm: &[i16], log: u32) -> Result<Vec<u8>, Corrupt> {
-    let mut w = Writer::new();
+/// variable width, zero runs after a zero as 2-bit repeat flags; appended to `out`.
+pub(super) fn write_distribution(norm: &[i16], log: u32, out: &mut Vec<u8>) -> Result<(), Corrupt> {
+    let mut w = Writer::new(out);
     w.add(
         u64::from(
             log.checked_sub(MIN_ACCURACY_LOG)
@@ -488,7 +484,8 @@ pub(super) fn write_distribution(norm: &[i16], log: u32) -> Result<Vec<u8>, Corr
     if remaining != 1 {
         return Err(Corrupt::Distribution);
     }
-    Ok(w.finish())
+    w.finish();
+    Ok(())
 }
 
 /// How one symbol is encoded from any state: the reference's `symbolTT`, the bits a state of it
@@ -499,8 +496,9 @@ struct SymbolTransform {
     delta_state: i32,
 }
 
-/// An encoding table, the decoder's [`Table`] run backwards.
-#[derive(Clone, Debug)]
+/// An encoding table, the decoder's [`Table`] run backwards. Rebuilding one reuses its
+/// allocations.
+#[derive(Clone, Debug, Default)]
 pub(super) struct EncodeTable {
     pub(super) accuracy_log: u32,
     /// The next state, indexed by a symbol's range of states.
@@ -509,36 +507,51 @@ pub(super) struct EncodeTable {
 }
 
 impl EncodeTable {
-    /// The encoding table of `norm` at `log`, its cells spread exactly as the decoder's
-    /// (`FSE_buildCTable`).
+    /// The encoding table of `norm` at `log`.
     pub(super) fn new(norm: &[i16], log: u32) -> Result<Self, Corrupt> {
-        let size = 1usize.checked_shl(log).ok_or(Corrupt::Distribution)?;
-        let decode = Table::from_distribution(norm, log)?;
-        // Each symbol's states, in the order the spread placed them, numbered from the table size.
-        let mut cumul = Vec::with_capacity(norm.len().saturating_add(1));
+        let mut table = Self::default();
+        table.set(norm, log)?;
+        Ok(table)
+    }
+
+    /// Makes this the encoding table of `norm` at `log`, its cells spread exactly as the
+    /// decoder's (`FSE_buildCTable`).
+    pub(super) fn set(&mut self, norm: &[i16], log: u32) -> Result<(), Corrupt> {
+        let mut spread = Spread::new();
+        let size = spread.spread(norm, log)?;
+        // Each symbol's states, in the order the spread placed them, numbered from the table size:
+        // a symbol's run starts where the runs of the symbols before it end.
+        let mut next = [0usize; SYMBOLS_MAX];
         let mut running = 0usize;
-        for &n in norm {
-            cumul.push(running);
+        for (&n, slot) in norm.iter().zip(next.iter_mut()) {
+            *slot = running;
             running = running.saturating_add(if n == -1 {
                 1
             } else {
                 usize::try_from(n.max(0)).unwrap_or(0)
             });
         }
-        let mut states = vec![0u16; size];
-        let mut next = cumul.clone();
-        for (u, cell) in decode.cells.iter().enumerate() {
+        self.states.clear();
+        self.states.resize(size, 0);
+        for (u, &symbol) in spread
+            .symbols
+            .get(..size)
+            .ok_or(Corrupt::Distribution)?
+            .iter()
+            .enumerate()
+        {
             let at = next
-                .get_mut(usize::from(cell.symbol))
+                .get_mut(usize::from(symbol))
                 .ok_or(Corrupt::Distribution)?;
-            *states.get_mut(*at).ok_or(Corrupt::Distribution)? =
+            *self.states.get_mut(*at).ok_or(Corrupt::Distribution)? =
                 u16::try_from(size.saturating_add(u)).map_err(|_| Corrupt::Distribution)?;
             *at = at.saturating_add(1);
         }
-        let mut symbols = vec![SymbolTransform::default(); norm.len()];
+        self.symbols.clear();
+        self.symbols.resize(norm.len(), SymbolTransform::default());
         let mut total = 0i32;
-        for (t, &n) in symbols.iter_mut().zip(norm) {
-            let size32 = i64::try_from(size).unwrap_or(0);
+        let size32 = i64::try_from(size).unwrap_or(0);
+        for (t, &n) in self.symbols.iter_mut().zip(norm) {
             match n {
                 0 => {
                     // Never encoded; the reference's value keeps its maths defined.
@@ -569,11 +582,8 @@ impl EncodeTable {
                 }
             }
         }
-        Ok(Self {
-            accuracy_log: log,
-            states,
-            symbols,
-        })
+        self.accuracy_log = log;
+        Ok(())
     }
 
     fn transform(&self, symbol: u8) -> Result<SymbolTransform, Corrupt> {
@@ -612,7 +622,7 @@ impl EncodeState {
         &mut self,
         table: &EncodeTable,
         symbol: u8,
-        w: &mut Writer,
+        w: &mut Writer<'_>,
     ) -> Result<(), Corrupt> {
         let t = table.transform(symbol)?;
         let bits_out = self.value.saturating_add(t.delta_bits) >> 16;
@@ -623,7 +633,7 @@ impl EncodeState {
     }
 
     /// Writes the final state, which the decoder reads first (`FSE_flushCState`).
-    pub(super) fn flush(self, table: &EncodeTable, w: &mut Writer) {
+    pub(super) fn flush(self, table: &EncodeTable, w: &mut Writer<'_>) {
         w.add(u64::from(self.value), table.accuracy_log);
     }
 }

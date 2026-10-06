@@ -12,11 +12,11 @@ use super::Corrupt;
 use super::bits::Writer;
 use super::decoder::{BLOCK_MAX, FRAME_MAGIC};
 use super::fse::{
-    EncodeState, EncodeTable, LITERALS_LENGTH_DEFAULT, LITERALS_LENGTH_DEFAULT_LOG,
-    MATCH_LENGTH_DEFAULT, MATCH_LENGTH_DEFAULT_LOG, OFFSET_DEFAULT, OFFSET_DEFAULT_LOG, normalize,
-    table_log, write_distribution,
+    CELLS_MAX, EncodeState, EncodeTable, LITERALS_LENGTH_DEFAULT, LITERALS_LENGTH_DEFAULT_LOG,
+    MATCH_LENGTH_DEFAULT, MATCH_LENGTH_DEFAULT_LOG, OFFSET_DEFAULT, OFFSET_DEFAULT_LOG,
+    SYMBOLS_MAX, normalize, table_log, write_distribution,
 };
-use super::huffman::{HuffmanEncoder, MAX_BITS, code_lengths};
+use super::huffman::{HuffmanEncoder, LITERALS, MAX_BITS, code_lengths};
 use super::sequences::{
     LITERALS_LENGTH_CODES, LITERALS_LENGTH_MAX_LOG, MATCH_LENGTH_CODES, MATCH_LENGTH_MAX_LOG,
     OFFSET_MAX_LOG,
@@ -210,46 +210,141 @@ impl Level {
 
 /// Compresses `input` as one frame, with the content checksum when `checksum`.
 pub fn compress(input: &[u8], level: Level, checksum: bool) -> Result<Vec<u8>, Error> {
-    Ok(encode_frame(input, level, checksum)?)
-}
-
-fn encode_frame(input: &[u8], level: Level, checksum: bool) -> Result<Vec<u8>, Corrupt> {
-    let level = level.fit(input.len());
-    let mut out = Vec::with_capacity((input.len() / 2).saturating_add(32));
-    out.extend_from_slice(&FRAME_MAGIC.to_le_bytes());
-    frame_header(&mut out, input.len(), checksum);
-    let mut matcher = Matcher::new(input, level);
-    let mut offsets = [1u32, 4, 8];
-    let mut start = 0usize;
-    loop {
-        let end = start.saturating_add(BLOCK_MAX).min(input.len());
-        let last = end == input.len();
-        let block = input.get(start..end).ok_or(Corrupt::Block)?;
-        encode_block(
-            &mut out,
-            input,
-            start,
-            end,
-            block,
-            last,
-            &mut matcher,
-            &mut offsets,
-        )?;
-        start = end;
-        if last {
-            break;
-        }
-    }
-    if checksum {
-        let digest = xxh64(input, 0);
-        out.extend_from_slice(
-            &u32::try_from(digest & 0xFFFF_FFFF)
-                .unwrap_or(0)
-                .to_le_bytes(),
-        );
-    }
+    let mut out = Vec::new();
+    Compressor::new()?.compress_into(input, level, checksum, &mut out)?;
     Ok(out)
 }
+
+/// The predefined distributions' encoding tables (§3.1.1.3.2.2), built once a compressor.
+#[derive(Debug)]
+struct Predefined {
+    literals_length: EncodeTable,
+    offset: EncodeTable,
+    match_length: EncodeTable,
+}
+
+/// What compressing keeps from one frame to the next: the reference's `ZSTD_CCtx` working area,
+/// which RocksDB keeps a thread's. The match finder's tables, the block's sequences and
+/// literals, the predefined tables and the cost table are allocated once and reused.
+#[derive(Debug)]
+pub struct Compressor {
+    head: Vec<u32>,
+    chain: Vec<u32>,
+    found: Vec<Found>,
+    literals: Vec<u8>,
+    block: Vec<u8>,
+    codes: Vec<Codes>,
+    /// The block's own encoding tables, rebuilt in place: literals length, offset, match length.
+    own: [EncodeTable; 3],
+    predefined: Predefined,
+    /// `256·log2(n)` of a symbol's cells `n`, 0 to the largest table's size.
+    log2: Vec<u16>,
+}
+
+impl Compressor {
+    /// A compressor with its fixed tables built.
+    pub fn new() -> Result<Self, Error> {
+        let log2 = (0..=CELLS_MAX)
+            .map(|n| u16::try_from(log2_256(u64::try_from(n).unwrap_or(0))).unwrap_or(u16::MAX))
+            .collect();
+        Ok(Self {
+            head: Vec::new(),
+            chain: Vec::new(),
+            found: Vec::new(),
+            literals: Vec::new(),
+            block: Vec::new(),
+            codes: Vec::new(),
+            own: Default::default(),
+            predefined: Predefined {
+                literals_length: EncodeTable::new(
+                    &LITERALS_LENGTH_DEFAULT,
+                    LITERALS_LENGTH_DEFAULT_LOG,
+                )?,
+                offset: EncodeTable::new(&OFFSET_DEFAULT, OFFSET_DEFAULT_LOG)?,
+                match_length: EncodeTable::new(&MATCH_LENGTH_DEFAULT, MATCH_LENGTH_DEFAULT_LOG)?,
+            },
+            log2,
+        })
+    }
+
+    /// Compresses `input` as one frame onto the end of `out`, with the content checksum when
+    /// `checksum`.
+    pub fn compress_into(
+        &mut self,
+        input: &[u8],
+        level: Level,
+        checksum: bool,
+        out: &mut Vec<u8>,
+    ) -> Result<(), Error> {
+        Ok(self.encode_frame(input, level, checksum, out)?)
+    }
+
+    fn encode_frame(
+        &mut self,
+        input: &[u8],
+        level: Level,
+        checksum: bool,
+        out: &mut Vec<u8>,
+    ) -> Result<(), Corrupt> {
+        let level = level.fit(input.len());
+        out.reserve((input.len() / 2).saturating_add(32));
+        out.extend_from_slice(&FRAME_MAGIC.to_le_bytes());
+        frame_header(out, input.len(), checksum);
+        let mut matcher = Matcher::new(input, level, &mut self.head, &mut self.chain);
+        let mut offsets = [1u32, 4, 8];
+        let mut start = 0usize;
+        loop {
+            let end = start.saturating_add(BLOCK_MAX).min(input.len());
+            let last = end == input.len();
+            let mut work = Work {
+                found: &mut self.found,
+                literals: &mut self.literals,
+                block: &mut self.block,
+                codes: &mut self.codes,
+                own: &mut self.own,
+                predefined: &self.predefined,
+                log2: &self.log2,
+            };
+            encode_block(
+                out,
+                input,
+                start..end,
+                last,
+                &mut matcher,
+                &mut offsets,
+                &mut work,
+            )?;
+            start = end;
+            if last {
+                break;
+            }
+        }
+        if checksum {
+            let digest = xxh64(input, 0);
+            out.extend_from_slice(
+                &u32::try_from(digest & 0xFFFF_FFFF)
+                    .unwrap_or(0)
+                    .to_le_bytes(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// A block's working buffers and the fixed tables, lent by the [`Compressor`].
+struct Work<'a> {
+    found: &'a mut Vec<Found>,
+    literals: &'a mut Vec<u8>,
+    block: &'a mut Vec<u8>,
+    codes: &'a mut Vec<Codes>,
+    own: &'a mut [EncodeTable; 3],
+    predefined: &'a Predefined,
+    log2: &'a [u16],
+}
+
+/// A sequence's three codes, each with its extra bits' value and count: literals length, match
+/// length, offset.
+type Codes = [(u8, u32, u8); 3];
 
 /// A single-segment frame header with the content size (§3.1.1.1).
 fn frame_header(out: &mut Vec<u8>, size: usize, checksum: bool) {
@@ -275,18 +370,19 @@ fn frame_header(out: &mut Vec<u8>, size: usize, checksum: bool) {
     out.extend_from_slice(&bytes);
 }
 
-/// One block: compressed if that is smaller than raw, RLE when every byte is one.
-#[allow(clippy::too_many_arguments)]
+/// One block, `range` of `input`: compressed if that is smaller than raw, RLE when every byte is
+/// one.
 fn encode_block(
     out: &mut Vec<u8>,
     input: &[u8],
-    start: usize,
-    end: usize,
-    block: &[u8],
+    range: std::ops::Range<usize>,
     last: bool,
     matcher: &mut Matcher<'_>,
     offsets: &mut [u32; 3],
+    work: &mut Work<'_>,
 ) -> Result<(), Corrupt> {
+    let (start, end) = (range.start, range.end);
+    let block = input.get(start..end).ok_or(Corrupt::Block)?;
     let header = |kind: u32, size: usize| -> Result<[u8; 3], Corrupt> {
         let size = u32::try_from(size).map_err(|_| Corrupt::Block)?;
         let raw = u32::from(last) | (kind << 1) | (size << 3);
@@ -304,11 +400,11 @@ fn encode_block(
         return Ok(());
     }
     let saved = *offsets;
-    let sequences = matcher.sequences(start, end, offsets);
-    let compressed = compress_block(input, start, end, &sequences)?;
-    if compressed.len() < block.len() {
-        out.extend_from_slice(&header(2, compressed.len())?);
-        out.extend_from_slice(&compressed);
+    matcher.sequences(start, end, offsets, work.found);
+    compress_block(input, start, end, work)?;
+    if work.block.len() < block.len() {
+        out.extend_from_slice(&header(2, work.block.len())?);
+        out.extend_from_slice(work.block);
     } else {
         // Raw: a raw block does not move the repeat offsets (§3.1.1.5).
         *offsets = saved;
@@ -332,8 +428,8 @@ struct Found {
 struct Matcher<'a> {
     input: &'a [u8],
     level: Level,
-    head: Vec<u32>,
-    chain: Vec<u32>,
+    head: &'a mut [u32],
+    chain: &'a mut [u32],
     /// Positions inserted so far.
     next: usize,
 }
@@ -342,12 +438,17 @@ struct Matcher<'a> {
 const NONE: u32 = u32::MAX;
 
 impl<'a> Matcher<'a> {
-    fn new(input: &'a [u8], level: Level) -> Self {
+    /// A matcher over `input` in `head` and `chain`, emptied and sized for it.
+    fn new(input: &'a [u8], level: Level, head: &'a mut Vec<u32>, chain: &'a mut Vec<u32>) -> Self {
+        head.clear();
+        head.resize(1usize << level.hash_log, NONE);
+        chain.clear();
+        chain.resize(input.len(), NONE);
         Self {
             input,
             level,
-            head: vec![NONE; 1usize << level.hash_log],
-            chain: vec![NONE; input.len()],
+            head,
+            chain,
             next: 0,
         }
     }
@@ -443,8 +544,14 @@ impl<'a> Matcher<'a> {
 
     /// The block's matches, greedy or one position lazy, the repeat offsets updated as the
     /// decoder will update them.
-    fn sequences(&mut self, start: usize, end: usize, offsets: &mut [u32; 3]) -> Vec<Found> {
-        let mut out = Vec::new();
+    fn sequences(
+        &mut self,
+        start: usize,
+        end: usize,
+        offsets: &mut [u32; 3],
+        out: &mut Vec<Found>,
+    ) {
+        out.clear();
         let mut at = start;
         let mut anchor = start;
         while at.saturating_add(self.level.min_match) <= end {
@@ -475,7 +582,6 @@ impl<'a> Matcher<'a> {
         self.insert_to(end);
         // The literals after the last match are the block's tail; the count is implied.
         let _ = anchor;
-        out
     }
 }
 
@@ -524,12 +630,12 @@ fn match_length_code(len: u32) -> (u8, u32, u8) {
 }
 
 /// The largest code whose baseline is at most `value`: the code, the extra bits' value, their
-/// count.
+/// count. The baselines ascend, so a binary search finds it.
+#[inline]
 fn code_for(value: u32, table: &[(u32, u8)]) -> (u8, u32, u8) {
     let code = table
-        .iter()
-        .rposition(|&(base, _)| base <= value)
-        .unwrap_or(0);
+        .partition_point(|&(base, _)| base <= value)
+        .saturating_sub(1);
     let (base, bits) = table.get(code).copied().unwrap_or((0, 0));
     (
         u8::try_from(code).unwrap_or(0),
@@ -549,110 +655,131 @@ fn offset_code(value: u32) -> (u8, u32, u8) {
     (c, value.saturating_sub(base), c)
 }
 
-/// A compressed block's content: the literals section, then the sequences section (§3.1.1.3).
+/// A compressed block's content into `work.block`: the literals section, then the sequences
+/// section (§3.1.1.3).
 fn compress_block(
     input: &[u8],
     start: usize,
     end: usize,
-    found: &[Found],
-) -> Result<Vec<u8>, Corrupt> {
-    let mut literals = Vec::with_capacity(end.saturating_sub(start));
+    work: &mut Work<'_>,
+) -> Result<(), Corrupt> {
+    let literals = &mut *work.literals;
+    literals.clear();
     let mut at = start;
-    for f in found {
+    for f in work.found.iter() {
         let to = at.saturating_add(usize::try_from(f.literals).unwrap_or(0));
         literals.extend_from_slice(input.get(at..to).ok_or(Corrupt::Block)?);
         at = to.saturating_add(usize::try_from(f.length).unwrap_or(0));
     }
     literals.extend_from_slice(input.get(at..end).ok_or(Corrupt::Block)?);
-    let mut out = literals_section(&literals)?;
-    out.extend_from_slice(&sequences_section(found)?);
-    Ok(out)
+    work.block.clear();
+    literals_section(literals, work.block)?;
+    sequences_section(work)?;
+    Ok(())
 }
 
-/// The literals section (§3.1.1.3.1): RLE when every literal is one, Huffman-coded when that
-/// saves bytes, raw otherwise.
-fn literals_section(literals: &[u8]) -> Result<Vec<u8>, Corrupt> {
+/// The literals section (§3.1.1.3.1) onto `out`: RLE when every literal is one, Huffman-coded
+/// when that saves bytes, raw otherwise.
+fn literals_section(literals: &[u8], out: &mut Vec<u8>) -> Result<(), Corrupt> {
     let n = literals.len();
     if let Some(&first) = literals.first()
         && n > 1
         && literals.iter().all(|&b| b == first)
     {
-        let mut out = raw_or_rle_header(1, n)?;
+        raw_or_rle_header(1, n, out)?;
         out.push(first);
-        return Ok(out);
+        return Ok(());
     }
-    let mut raw = raw_or_rle_header(0, n)?;
-    raw.extend_from_slice(literals);
-    if let Ok(coded) = huffman_literals(literals)
-        && coded.len() < raw.len()
-    {
-        return Ok(coded);
+    let start = out.len();
+    let raw = raw_header_len(n).saturating_add(n);
+    if huffman_literals(literals, out).is_ok() && out.len().saturating_sub(start) < raw {
+        return Ok(());
     }
-    Ok(raw)
+    out.truncate(start);
+    raw_or_rle_header(0, n, out)?;
+    out.extend_from_slice(literals);
+    Ok(())
 }
 
-/// A raw or RLE literals header of the shortest size format (§3.1.1.3.1.1).
-fn raw_or_rle_header(kind: u8, size: usize) -> Result<Vec<u8>, Corrupt> {
+/// The length of a raw or RLE literals header for `size` literals (§3.1.1.3.1.1).
+fn raw_header_len(size: usize) -> usize {
+    if size < 32 {
+        1
+    } else if size < 4096 {
+        2
+    } else {
+        3
+    }
+}
+
+/// A raw or RLE literals header of the shortest size format onto `out` (§3.1.1.3.1.1).
+fn raw_or_rle_header(kind: u8, size: usize, out: &mut Vec<u8>) -> Result<(), Corrupt> {
     let s = u32::try_from(size).map_err(|_| Corrupt::Literals)?;
     let kind = u32::from(kind);
-    Ok(if s < 32 {
-        vec![u8::try_from(kind | (s << 3)).map_err(|_| Corrupt::Literals)?]
-    } else if s < 4096 {
-        let v = kind | (1 << 2) | (s << 4);
-        v.to_le_bytes().get(..2).ok_or(Corrupt::Literals)?.to_vec()
-    } else {
-        let v = kind | (3 << 2) | (s << 4);
-        v.to_le_bytes().get(..3).ok_or(Corrupt::Literals)?.to_vec()
-    })
+    let (v, len) = match raw_header_len(size) {
+        1 => (kind | (s << 3), 1),
+        2 => (kind | (1 << 2) | (s << 4), 2),
+        _ => (kind | (3 << 2) | (s << 4), 3),
+    };
+    out.extend_from_slice(v.to_le_bytes().get(..len).ok_or(Corrupt::Literals)?);
+    Ok(())
 }
 
-/// Huffman-coded literals with their tree (§3.1.1.3.1.4): one stream below 256 literals, four
-/// above, as the reference chooses.
-fn huffman_literals(literals: &[u8]) -> Result<Vec<u8>, Corrupt> {
-    let mut counts = [0u32; 256];
+/// Huffman-coded literals with their tree (§3.1.1.3.1.4) onto `out`: one stream below 256
+/// literals, four above, as the reference chooses. The header's size format follows from the
+/// literals' count alone, as the reference's `ZSTD_compressLiterals` sets it: a coded section
+/// no shorter than the literals is not kept, so its size fits wherever theirs does. On an error
+/// `out` may hold a partial section.
+fn huffman_literals(literals: &[u8], out: &mut Vec<u8>) -> Result<(), Corrupt> {
+    let mut counts = [0u32; LITERALS];
     for &b in literals {
         let c = counts.get_mut(usize::from(b)).ok_or(Corrupt::Huffman)?;
         *c = c.saturating_add(1);
     }
-    let lengths = code_lengths(&counts, MAX_BITS);
+    let mut lengths = [0u8; LITERALS];
+    code_lengths(&counts, MAX_BITS, &mut lengths);
     let table = HuffmanEncoder::new(&lengths)?;
-    let description = table.description()?;
+    let r = u32::try_from(literals.len()).map_err(|_| Corrupt::Literals)?;
     let four = literals.len() >= 256;
-    let streams = table.streams(literals, four)?;
-    let compressed = description.len().saturating_add(streams.len());
-    let regenerated = literals.len();
-    let r = u32::try_from(regenerated).map_err(|_| Corrupt::Literals)?;
-    let c = u32::try_from(compressed).map_err(|_| Corrupt::Literals)?;
-    // Size_Format by the larger of the two sizes (§3.1.1.3.1.1); one stream only with 10 bits.
-    let mut out = if !four && r < 1024 && c < 1024 {
-        let v = 2u32 | (r << 4) | (c << 14);
-        v.to_le_bytes().get(..3).ok_or(Corrupt::Literals)?.to_vec()
-    } else if !four {
-        return Err(Corrupt::Literals);
-    } else if r < 1024 && c < 1024 {
-        let v = 2u32 | (1 << 2) | (r << 4) | (c << 14);
-        v.to_le_bytes().get(..3).ok_or(Corrupt::Literals)?.to_vec()
-    } else if r < 16_384 && c < 16_384 {
-        let v = 2u32 | (2 << 2) | (r << 4) | (c << 18);
-        v.to_le_bytes().get(..4).ok_or(Corrupt::Literals)?.to_vec()
-    } else if r < 262_144 && c < 262_144 {
-        let v = 2u64 | (3 << 2) | (u64::from(r) << 4) | (u64::from(c) << 22);
-        v.to_le_bytes().get(..5).ok_or(Corrupt::Literals)?.to_vec()
+    // Size_Format (§3.1.1.3.1.1): one stream only with 10-bit sizes.
+    let (format, header): (u64, usize) = if !four {
+        (0, 3)
+    } else if r < 1024 {
+        (1, 3)
+    } else if r < 16_384 {
+        (2, 4)
+    } else if r < 262_144 {
+        (3, 5)
     } else {
         return Err(Corrupt::Literals);
     };
-    out.extend_from_slice(&description);
-    out.extend_from_slice(&streams);
-    Ok(out)
+    let start = out.len();
+    out.extend_from_slice([0; 5].get(..header).ok_or(Corrupt::Literals)?);
+    table.description(out)?;
+    table.streams(literals, four, out)?;
+    let c = u64::try_from(out.len().saturating_sub(start).saturating_sub(header))
+        .map_err(|_| Corrupt::Literals)?;
+    // Each size's bits, and where the compressed size starts after the 4 header bits.
+    let (width, at) = match format {
+        0 | 1 => (10, 14),
+        2 => (14, 18),
+        _ => (18, 22),
+    };
+    if c >= 1 << width {
+        return Err(Corrupt::Literals);
+    }
+    let v = 2u64 | (format << 2) | (u64::from(r) << 4) | (c << at);
+    out.get_mut(start..start.saturating_add(header))
+        .ok_or(Corrupt::Literals)?
+        .copy_from_slice(v.to_le_bytes().get(..header).ok_or(Corrupt::Literals)?);
+    Ok(())
 }
 
-/// One symbol type's table for the block: its mode (§3.1.1.3.2.1, Table 15), its description, and
-/// the encoding table.
-struct Chosen {
+/// One symbol type's table for the block: its mode (§3.1.1.3.2.1, Table 15) and its encoding
+/// table, none in RLE mode, where its one state takes no bits to start, step or flush.
+struct Chosen<'t> {
     mode: u8,
-    description: Vec<u8>,
-    /// None in RLE mode: its one state takes no bits to start, step or flush.
-    table: Option<EncodeTable>,
+    table: Option<&'t EncodeTable>,
 }
 
 /// A state over a chosen table; none in RLE mode, where nothing is written.
@@ -662,62 +789,64 @@ struct Coder<'t> {
 }
 
 impl<'t> Coder<'t> {
-    fn init(chosen: &'t Chosen, symbol: u8) -> Result<Self, Corrupt> {
-        let table = chosen.table.as_ref();
+    fn init(chosen: &Chosen<'t>, symbol: u8) -> Result<Self, Corrupt> {
+        let table = chosen.table;
         let state = table.map(|t| EncodeState::init(t, symbol)).transpose()?;
         Ok(Self { table, state })
     }
 
-    fn encode(&mut self, symbol: u8, w: &mut Writer) -> Result<(), Corrupt> {
+    #[inline]
+    fn encode(&mut self, symbol: u8, w: &mut Writer<'_>) -> Result<(), Corrupt> {
         if let (Some(t), Some(s)) = (self.table, self.state.as_mut()) {
             s.encode(t, symbol, w)?;
         }
         Ok(())
     }
 
-    fn flush(self, w: &mut Writer) {
+    fn flush(self, w: &mut Writer<'_>) {
         if let (Some(t), Some(s)) = (self.table, self.state) {
             s.flush(t, w);
         }
     }
 }
 
-/// The cheapest of predefined, RLE and the block's own FSE table for `codes` (each below
-/// `symbols`), by the bits each spends.
-fn choose(
-    codes: &[u8],
-    symbols: usize,
+/// The cheapest of predefined, RLE and the block's own FSE table for a code's `counts` (one per
+/// code, `total` in all), by the bits each spends; its description, if any, goes onto `out`.
+/// `default` is the predefined distribution and `predefined` its encoding table, `own` the table
+/// rebuilt for the block's own, and `log2` the cost table.
+fn choose<'t>(
+    counts: &[u32],
+    total: usize,
     max_log: u32,
-    default: &[i16],
-    default_log: u32,
-) -> Result<Chosen, Corrupt> {
-    let mut counts = vec![0u32; symbols];
-    for &c in codes {
-        let slot = counts.get_mut(usize::from(c)).ok_or(Corrupt::Sequences)?;
-        *slot = slot.saturating_add(1);
-    }
+    (default, default_log, predefined): (&[i16], u32, &'t EncodeTable),
+    own: &'t mut EncodeTable,
+    log2: &[u16],
+    out: &mut Vec<u8>,
+) -> Result<Chosen<'t>, Corrupt> {
     let max_symbol = counts
         .iter()
         .rposition(|&c| c > 0)
         .ok_or(Corrupt::Sequences)?;
     let present = counts.iter().filter(|&&c| c > 0).count();
     if present == 1 {
-        let symbol = u8::try_from(max_symbol).map_err(|_| Corrupt::Sequences)?;
         // One symbol: RLE (FSE_Compressed_Mode needs two, §3.1.1.3.2.1).
+        out.push(u8::try_from(max_symbol).map_err(|_| Corrupt::Sequences)?);
         return Ok(Chosen {
             mode: 1,
-            description: vec![symbol],
             table: None,
         });
     }
-    let total = u32::try_from(codes.len()).map_err(|_| Corrupt::Sequences)?;
-    let log = table_log(codes.len(), max_symbol, max_log);
+    let total32 = u32::try_from(total).map_err(|_| Corrupt::Sequences)?;
+    let log = table_log(total, max_symbol, max_log);
     let counts = counts.get(..=max_symbol).ok_or(Corrupt::Sequences)?;
-    let norm = normalize(counts, total, log)?;
-    let description = write_distribution(&norm, log)?;
+    let mut norm = [0i16; SYMBOLS_MAX];
+    let norm = normalize(counts, total32, log, &mut norm)?;
+    let start = out.len();
+    write_distribution(norm, log, out)?;
+    let description = out.len().saturating_sub(start);
     // The table's own bits and its description's, both in 256ths of a bit.
-    let own_bits = cost(counts, &norm, log).saturating_add(
-        u64::try_from(description.len())
+    let own_bits = cost(counts, norm, log, log2).saturating_add(
+        u64::try_from(description)
             .unwrap_or(0)
             .saturating_mul(8 * 256),
     );
@@ -726,17 +855,17 @@ fn choose(
         .iter()
         .enumerate()
         .all(|(s, &c)| c == 0 || default.get(s).is_some_and(|&p| p != 0));
-    if default_fits && cost(counts, default, default_log) <= own_bits {
+    if default_fits && cost(counts, default, default_log, log2) <= own_bits {
+        out.truncate(start);
         return Ok(Chosen {
             mode: 0,
-            description: Vec::new(),
-            table: Some(EncodeTable::new(default, default_log)?),
+            table: Some(predefined),
         });
     }
+    own.set(norm, log)?;
     Ok(Chosen {
         mode: 2,
-        table: Some(EncodeTable::new(&norm, log)?),
-        description,
+        table: Some(own),
     })
 }
 
@@ -765,8 +894,8 @@ fn log2_256(x: u64) -> u64 {
 
 /// The bits `counts` take under `norm` at `log`, in 256ths of a bit: each symbol
 /// `log − log2(p)` bits a time, `p` its cells (a "less than 1" symbol one), absent from `norm` the
-/// most a cost can be.
-fn cost(counts: &[u32], norm: &[i16], log: u32) -> u64 {
+/// most a cost can be. `log2` holds `256·log2(p)` for every count of cells a table has.
+fn cost(counts: &[u32], norm: &[i16], log: u32, log2: &[u16]) -> u64 {
     let mut total = 0u64;
     for (s, &c) in counts.iter().enumerate() {
         if c == 0 {
@@ -777,21 +906,24 @@ fn cost(counts: &[u32], norm: &[i16], log: u32) -> u64 {
             Some(&n) if n > 0 => u64::from(n.unsigned_abs()),
             _ => return u64::MAX,
         };
-        let each = (u64::from(log) << 8).saturating_sub(log2_256(cells));
+        let cells = usize::try_from(cells).unwrap_or(usize::MAX);
+        let each = (u64::from(log) << 8)
+            .saturating_sub(u64::from(log2.get(cells).copied().unwrap_or(u16::MAX)));
         total = total.saturating_add(u64::from(c).saturating_mul(each));
     }
     total
 }
 
-/// The sequences section (§3.1.1.3.2): the count, the modes, the descriptions, and the
-/// interleaved bitstream, written last sequence first.
-fn sequences_section(found: &[Found]) -> Result<Vec<u8>, Corrupt> {
+/// The sequences section (§3.1.1.3.2) onto the block: the count, the modes, the
+/// descriptions, and the interleaved bitstream, written last sequence first.
+fn sequences_section(work: &mut Work<'_>) -> Result<(), Corrupt> {
+    let found = &*work.found;
+    let out = &mut *work.block;
     let n = found.len();
-    let mut out = Vec::new();
     match n {
         0 => {
             out.push(0);
-            return Ok(out);
+            return Ok(());
         }
         1..=127 => out.push(u8::try_from(n).map_err(|_| Corrupt::Sequences)?),
         128..=0x7EFF => {
@@ -805,66 +937,88 @@ fn sequences_section(found: &[Found]) -> Result<Vec<u8>, Corrupt> {
             out.push(u8::try_from(rest >> 8).map_err(|_| Corrupt::Sequences)?);
         }
     }
-    let ll: Vec<(u8, u32, u8)> = found
-        .iter()
-        .map(|f| literals_length_code(f.literals))
-        .collect();
-    let ml: Vec<(u8, u32, u8)> = found.iter().map(|f| match_length_code(f.length)).collect();
-    let of: Vec<(u8, u32, u8)> = found.iter().map(|f| offset_code(f.offset_value)).collect();
-    let ll_codes: Vec<u8> = ll.iter().map(|c| c.0).collect();
-    let ml_codes: Vec<u8> = ml.iter().map(|c| c.0).collect();
-    let of_codes: Vec<u8> = of.iter().map(|c| c.0).collect();
+    // Each sequence's codes, and each code's count, in one pass.
+    let codes = &mut *work.codes;
+    codes.clear();
+    let mut ll_counts = [0u32; LITERALS_LENGTH_CODES.len()];
+    let mut ml_counts = [0u32; MATCH_LENGTH_CODES.len()];
+    let mut of_counts = [0u32; 32];
+    for f in found {
+        let c = [
+            literals_length_code(f.literals),
+            match_length_code(f.length),
+            offset_code(f.offset_value),
+        ];
+        for (counts, &(code, _, _)) in [&mut ll_counts[..], &mut ml_counts[..], &mut of_counts[..]]
+            .into_iter()
+            .zip(&c)
+        {
+            let slot = counts
+                .get_mut(usize::from(code))
+                .ok_or(Corrupt::Sequences)?;
+            *slot = slot.saturating_add(1);
+        }
+        codes.push(c);
+    }
+    let modes_at = out.len();
+    out.push(0);
+    let [ll_own, of_own, ml_own] = &mut *work.own;
+    let predefined = work.predefined;
     let ll_t = choose(
-        &ll_codes,
-        LITERALS_LENGTH_CODES.len(),
+        &ll_counts,
+        n,
         LITERALS_LENGTH_MAX_LOG,
-        &LITERALS_LENGTH_DEFAULT,
-        LITERALS_LENGTH_DEFAULT_LOG,
+        (
+            &LITERALS_LENGTH_DEFAULT,
+            LITERALS_LENGTH_DEFAULT_LOG,
+            &predefined.literals_length,
+        ),
+        ll_own,
+        work.log2,
+        out,
     )?;
     // Offset codes above the predefined table's N cannot use it; `choose` sees that as no cell.
-    let of_max = of_codes.iter().copied().max().unwrap_or(0);
-    let of_t = if of_max > OFFSET_DEFAULT_MAX_CODE {
-        choose(
-            &of_codes,
-            usize::from(of_max) + 1,
-            OFFSET_MAX_LOG,
-            &[],
-            OFFSET_DEFAULT_LOG,
-        )?
+    let of_max = of_counts.iter().rposition(|&c| c > 0).unwrap_or(0);
+    let of_default: &[i16] = if of_max > usize::from(OFFSET_DEFAULT_MAX_CODE) {
+        &[]
     } else {
-        choose(
-            &of_codes,
-            32,
-            OFFSET_MAX_LOG,
-            &OFFSET_DEFAULT,
-            OFFSET_DEFAULT_LOG,
-        )?
+        &OFFSET_DEFAULT
     };
-    let ml_t = choose(
-        &ml_codes,
-        MATCH_LENGTH_CODES.len(),
-        MATCH_LENGTH_MAX_LOG,
-        &MATCH_LENGTH_DEFAULT,
-        MATCH_LENGTH_DEFAULT_LOG,
+    let of_t = choose(
+        &of_counts,
+        n,
+        OFFSET_MAX_LOG,
+        (of_default, OFFSET_DEFAULT_LOG, &predefined.offset),
+        of_own,
+        work.log2,
+        out,
     )?;
-    out.push((ll_t.mode << 6) | (of_t.mode << 4) | (ml_t.mode << 2));
-    out.extend_from_slice(&ll_t.description);
-    out.extend_from_slice(&of_t.description);
-    out.extend_from_slice(&ml_t.description);
+    let ml_t = choose(
+        &ml_counts,
+        n,
+        MATCH_LENGTH_MAX_LOG,
+        (
+            &MATCH_LENGTH_DEFAULT,
+            MATCH_LENGTH_DEFAULT_LOG,
+            &predefined.match_length,
+        ),
+        ml_own,
+        work.log2,
+        out,
+    )?;
+    *out.get_mut(modes_at).ok_or(Corrupt::Sequences)? =
+        (ll_t.mode << 6) | (of_t.mode << 4) | (ml_t.mode << 2);
     // The bitstream, the reference's ZSTD_encodeSequences: the last sequence's states and bits
     // first, then each earlier one, then the states flushed, read back in the decoder's order.
-    let mut w = Writer::new();
-    let last = n.saturating_sub(1);
-    let get = |v: &[(u8, u32, u8)], i: usize| v.get(i).copied().ok_or(Corrupt::Sequences);
-    let (l_ll, l_ml, l_of) = (get(&ll, last)?, get(&ml, last)?, get(&of, last)?);
+    let mut w = Writer::new(out);
+    let [l_ll, l_ml, l_of] = *codes.last().ok_or(Corrupt::Sequences)?;
     let mut s_ml = Coder::init(&ml_t, l_ml.0)?;
     let mut s_of = Coder::init(&of_t, l_of.0)?;
     let mut s_ll = Coder::init(&ll_t, l_ll.0)?;
     w.add(u64::from(l_ll.1), u32::from(l_ll.2));
     w.add(u64::from(l_ml.1), u32::from(l_ml.2));
     w.add(u64::from(l_of.1), u32::from(l_of.2));
-    for i in (0..last).rev() {
-        let (c_ll, c_ml, c_of) = (get(&ll, i)?, get(&ml, i)?, get(&of, i)?);
+    for &[c_ll, c_ml, c_of] in codes.iter().rev().skip(1) {
         s_of.encode(c_of.0, &mut w)?;
         s_ml.encode(c_ml.0, &mut w)?;
         s_ll.encode(c_ll.0, &mut w)?;
@@ -875,8 +1029,8 @@ fn sequences_section(found: &[Found]) -> Result<Vec<u8>, Corrupt> {
     s_ml.flush(&mut w);
     s_of.flush(&mut w);
     s_ll.flush(&mut w);
-    out.extend_from_slice(&w.close());
-    Ok(out)
+    w.close();
+    Ok(())
 }
 
 /// What one [`Encoder::compress`] call wrote.
@@ -895,6 +1049,7 @@ pub struct Written {
 pub struct Encoder {
     level: Level,
     checksum: bool,
+    compressor: Option<Compressor>,
     frame: Vec<u8>,
     /// Bytes of `frame` handed out.
     at: usize,
@@ -908,6 +1063,7 @@ impl Encoder {
         Self {
             level,
             checksum,
+            compressor: None,
             frame: Vec::new(),
             at: 0,
             active: false,
@@ -924,7 +1080,12 @@ impl Encoder {
             });
         }
         if !self.active {
-            self.frame = encode_frame(input, self.level, self.checksum)?;
+            let compressor = match &mut self.compressor {
+                Some(c) => c,
+                None => self.compressor.insert(Compressor::new()?),
+            };
+            self.frame.clear();
+            compressor.compress_into(input, self.level, self.checksum, &mut self.frame)?;
             self.at = 0;
             self.active = true;
         }

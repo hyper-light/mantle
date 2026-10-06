@@ -13,7 +13,7 @@
 //! RocksDB allocates whatever size a block's prefix states (up to `SIZE_MAX`), the reader here
 //! refuses a size above the caller's bound before allocating anything (CLAUDE.md §2).
 
-use crate::codec::zstd::{Decoder, Dictionary, Level};
+use crate::codec::zstd::{Compressor, Decoder, Dictionary, Level};
 use crate::codec::{deflate, lz4, snappy, zstd};
 use crate::error::{Error, Malformed};
 use crate::util::coding::{get_varint64, put_varint32};
@@ -135,7 +135,8 @@ fn size_prefix(raw: &[u8], bound: usize) -> Option<Vec<u8>> {
     if bound <= 5 {
         return None;
     }
-    let mut out = Vec::new();
+    // Room for every block the caller keeps: a longer one is rejected.
+    let mut out = Vec::with_capacity(bound);
     put_varint32(&mut out, len);
     Some(out)
 }
@@ -154,6 +155,18 @@ pub fn compress_block(
     raw: &[u8],
     dict: &[u8],
     opts: &CompressionOptions,
+) -> Result<Compressed, Error> {
+    compress_block_with(kind, raw, dict, opts, &mut Workspace::default())
+}
+
+/// [`compress_block`] with `workspace` reused: a table builder that keeps one compresses each
+/// block with the working areas the last one left, as RocksDB's `CompressionContext` does.
+pub fn compress_block_with(
+    kind: CompressionType,
+    raw: &[u8],
+    dict: &[u8],
+    opts: &CompressionOptions,
+    workspace: &mut Workspace,
 ) -> Result<Compressed, Error> {
     if kind == CompressionType::NoCompression || raw.len() >= COMPRESSION_SIZE_LIMIT {
         return Ok(Compressed::Bypassed);
@@ -197,7 +210,13 @@ pub fn compress_block(
                         Some(0) => -1,
                         Some(level) => level,
                     };
-                    zstd::compress(raw, Level::new(level), opts.checksum)?
+                    let compressor = match &mut workspace.zstd_compressor {
+                        Some(c) => c,
+                        None => workspace.zstd_compressor.insert(Compressor::new()?),
+                    };
+                    // The frame goes straight after the size prefix.
+                    compressor.compress_into(raw, Level::new(level), opts.checksum, &mut out)?;
+                    return Ok(keep(kind, out, bound));
                 }
             };
             out.extend_from_slice(&body);
@@ -211,10 +230,15 @@ pub fn compress_block(
             return Err(unsupported("writing blocks with compression type"));
         }
     };
+    Ok(keep(kind, out, bound))
+}
+
+/// The block kept if it is within `bound`, rejected otherwise.
+fn keep(kind: CompressionType, out: Vec<u8>, bound: usize) -> Compressed {
     if out.is_empty() || out.len() > bound {
-        return Ok(Compressed::Rejected);
+        return Compressed::Rejected;
     }
-    Ok(Compressed::Kept(kind, out))
+    Compressed::Kept(kind, out)
 }
 
 /// `ExtractUncompressedSize` [R util/compression.cc:386-404, :1490-1524]: the size a compressed
@@ -244,12 +268,13 @@ pub fn uncompressed_size(kind: CompressionType, data: &[u8]) -> Result<(u64, &[u
     }
 }
 
-/// What decompressing blocks keeps from one block to the next: RocksDB's
-/// `Decompressor::ManagedWorkingArea`, a ZSTD context reused across blocks. A table reader
-/// keeps one per reading thread; it holds no block's bytes.
+/// What compressing or decompressing blocks keeps from one block to the next: RocksDB's
+/// `CompressionContext` and `Decompressor::ManagedWorkingArea`, ZSTD contexts reused across
+/// blocks. A table builder or reader keeps one per thread; it holds no block's bytes.
 #[derive(Debug, Default)]
 pub struct Workspace {
     zstd: Option<Decoder>,
+    zstd_compressor: Option<Compressor>,
 }
 
 /// `DecompressBlockData` [R table/format.cc:684-744] with the built-in decompressor

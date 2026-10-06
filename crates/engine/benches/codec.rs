@@ -6,8 +6,9 @@
 //! `block_size`) and 16 KiB from the corpus's text (`tests/support/corpus.rs`), and for each
 //! size runs 59 rounds (Wilks 95/95), the two sides alternating which goes first. A round
 //! compresses then decompresses every block. The reference reuses one compression context, one
-//! decompression context and one output buffer, as RocksDB's working areas do. The port is
-//! called as the table code calls it (`util::block_compression`). Both decoders read the
+//! decompression context and one output buffer, as RocksDB's working areas do; the port reuses
+//! one `Workspace` for both, called as the table code calls it (`util::block_compression`), and
+//! returns each compressed block in a buffer of its own, as a table builder takes it. Both decoders read the
 //! reference's frames; each encoder's output size is printed beside its time. It prints
 //! `side op block_size round ns_per_block allocations output_bytes` per round.
 //! `-- rounds [port]` runs that many rounds instead, and `port` only the port's side, to profile
@@ -32,7 +33,7 @@ use std::time::Instant;
 use hyper_measure::alloc;
 use mantle_engine::util::block_compression::{
     Compressed, CompressionOptions, CompressionType, Workspace, compress_block,
-    decompress_block_into,
+    compress_block_with, decompress_block_into,
 };
 
 #[global_allocator]
@@ -128,7 +129,14 @@ fn main() {
                     let t = Instant::now();
                     for b in &input {
                         std::hint::black_box(
-                            compress_block(CompressionType::Zstd, b, &[], &opts).unwrap(),
+                            compress_block_with(
+                                CompressionType::Zstd,
+                                b,
+                                &[],
+                                &opts,
+                                &mut workspace,
+                            )
+                            .unwrap(),
                         );
                     }
                     let ns = t.elapsed().as_nanos() as f64 / n;

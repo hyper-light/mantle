@@ -253,50 +253,57 @@ fn low_mask(bits: u32) -> u64 {
     (1u64 << (bits & 63)).wrapping_sub(1)
 }
 
-/// A writer of a little-endian bit string, each value's least significant bit first: the
-/// encoder's side of [`Forward`] and [`Backward`]. A stream for the backward reader ends with
-/// [`Writer::close`]'s 1 bit and zero padding (§3.1.1.3.2.1.2, §4.2.2).
-#[derive(Debug, Default)]
-pub(super) struct Writer {
-    bytes: Vec<u8>,
-    /// Bits not yet a whole byte, the oldest lowest.
+/// A writer of a little-endian bit string onto the end of a buffer, each value's least
+/// significant bit first: the encoder's side of [`Forward`] and [`Backward`]. Bits gather in a
+/// word that goes out four bytes at a time, as the reference's `BIT_CStream_t` flushes its
+/// container. A stream for the backward reader ends with [`Writer::close`]'s 1 bit and zero
+/// padding (§3.1.1.3.2.1.2, §4.2.2).
+#[derive(Debug)]
+pub(super) struct Writer<'a> {
+    bytes: &'a mut Vec<u8>,
+    /// Bits not yet written, the oldest lowest: fewer than 32 between adds.
     acc: u64,
     held: u32,
 }
 
-impl Writer {
-    pub(super) fn new() -> Self {
-        Self::default()
+impl<'a> Writer<'a> {
+    /// A writer appending to `bytes`.
+    pub(super) fn new(bytes: &'a mut Vec<u8>) -> Self {
+        Self {
+            bytes,
+            acc: 0,
+            held: 0,
+        }
     }
 
     /// Appends the low `bits` (at most 32) of `value`.
+    #[inline(always)]
     pub(super) fn add(&mut self, value: u64, bits: u32) {
-        if bits == 0 {
-            return;
-        }
-        let mask = u64::MAX
-            .checked_shr(64u32.saturating_sub(bits))
-            .unwrap_or(0);
-        self.acc |= (value & mask).checked_shl(self.held).unwrap_or(0);
-        self.held = self.held.saturating_add(bits);
-        while self.held >= 8 {
-            self.bytes.push((self.acc & 0xFF) as u8);
-            self.acc >>= 8;
-            self.held = self.held.saturating_sub(8);
+        // `held` is below 32 and `bits` at most 32, so the bits fit the word.
+        self.acc |= (value & low_mask(bits)) << (self.held & 63);
+        self.held = self.held.wrapping_add(bits);
+        if self.held >= 32 {
+            let word = self.acc.to_le_bytes();
+            if let Some(low) = word.first_chunk::<4>() {
+                self.bytes.extend_from_slice(low);
+            }
+            self.acc >>= 32;
+            self.held = self.held.wrapping_sub(32);
         }
     }
 
     /// Ends a stream for the backward reader: a 1 bit, then zeros to the byte.
-    pub(super) fn close(mut self) -> Vec<u8> {
+    pub(super) fn close(mut self) {
         self.add(1, 1);
-        self.finish()
+        self.finish();
     }
 
     /// Ends a forward stream (a table description), its last byte padded with zeros.
-    pub(super) fn finish(mut self) -> Vec<u8> {
-        if self.held > 0 {
-            self.bytes.push((self.acc & 0xFF) as u8);
+    pub(super) fn finish(self) {
+        let whole = usize::try_from(self.held.div_ceil(8)).unwrap_or(0);
+        let word = self.acc.to_le_bytes();
+        if let Some(rest) = word.get(..whole) {
+            self.bytes.extend_from_slice(rest);
         }
-        self.bytes
     }
 }

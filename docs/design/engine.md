@@ -374,6 +374,15 @@ upstream defects above to report to RocksDB, with the owner's approval.
   Every path is checked: a table, copy or read that would leave its bounds is a typed
   corruption, never a panic. `tests/zstd_test.rs` decodes every frame both ways, streamed and
   whole, including every corrupted frame of its sweep.
+- ZSTD compression of a block. A `Compressor`, the reference's `ZSTD_CCtx`, is kept in the
+  block `Workspace` across blocks, as RocksDB's `CompressionContext` is: the match finder's
+  tables, the sequences, literals and codes, the block's own encoding tables, the predefined
+  tables and a table of `256·log2` for the cost estimates are allocated once. Every section is
+  written straight into the block, the Huffman header after its streams. The Huffman code
+  lengths stay optimal under the 11-bit limit (package-merge), each row kept as its merged
+  order in an array rather than as lists of leaves, which a test checks against the list form.
+  A block compresses with one allocation, the buffer the caller keeps, where the first form
+  made 262.
 
 **Where the reader differs from RocksDB, and why.** The bytes read are the same; what the reader
 does with bad or unusual ones is not.

@@ -15,7 +15,7 @@
 
 use std::io::Write as _;
 
-use mantle_engine::codec::zstd::{Decoder, Dictionary, Level, compress};
+use mantle_engine::codec::zstd::{Compressor, Decoder, Dictionary, Level, compress};
 use mantle_engine::util::xxhash::{Xxh64, xxh64};
 
 /// The window bound the decoder is given: the reference's default decoding limit, 2^27 bytes
@@ -374,4 +374,34 @@ fn the_ports_frames_decode_everywhere() {
     eprintln!(
         "bytes over the corpus at levels 1, 3, 9: port {ours_total}, reference {theirs_total}"
     );
+}
+
+/// One compressor reused frame after frame, as a table builder keeps one: its tables hold the
+/// earlier frames' positions, which no later frame may match. Every frame must be the one a new
+/// compressor writes, and decode, by the port and by the reference, to its own input.
+#[test]
+fn a_reused_compressor_writes_every_frame_alone() {
+    let corpus = corpus();
+    let mut compressor = Compressor::new().unwrap();
+    for level in [1, 3, 5, 9] {
+        for data in corpus.iter().chain(corpus.iter().rev()) {
+            let mut frame = Vec::new();
+            compressor
+                .compress_into(data, Level::new(level), false, &mut frame)
+                .unwrap();
+            assert!(
+                frame == compress(data, Level::new(level), false).unwrap(),
+                "history changed a frame: level {level} len {}",
+                data.len()
+            );
+            let back = decode(&frame, None, frame.len().max(1), 1 << 17).unwrap();
+            assert!(back == *data, "port level {level} len {}", data.len());
+            let reference = zstd::stream::decode_all(&frame[..]).unwrap();
+            assert!(
+                reference == *data,
+                "reference level {level} len {}",
+                data.len()
+            );
+        }
+    }
 }

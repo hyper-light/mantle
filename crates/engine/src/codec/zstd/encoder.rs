@@ -33,130 +33,146 @@ const HASH_LOG_MIN: u32 = 6;
 /// The highest offset code the predefined offset table holds (§3.1.1.3.2.2.3: N = 28).
 const OFFSET_DEFAULT_MAX_CODE: u8 = 28;
 
+/// The reference's strategies (zstd 1.5.7, lib/zstd.h, `ZSTD_strategy`), in its order: each
+/// searches harder than the one before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Strategy {
+    Fast,
+    DFast,
+    Greedy,
+    Lazy,
+    Lazy2,
+    BtLazy2,
+    BtOpt,
+    BtUltra,
+    BtUltra2,
+}
+
 /// The reference's parameters by input size and by level 0 (the base of the negative levels) to
-/// 22 (zstd 1.5.7, lib/compress/clevels.h:25-129, `ZSTD_defaultCParameters`): for each, the
-/// window's log `W`, the hash table's log `H`, the search log `S` (2^S chain positions tried),
-/// the shortest match `L`, and whether the strategy is lazy (`ZSTD_lazy` and beyond) or greedy
-/// and faster (`ZSTD_fast`, `ZSTD_dfast`, `ZSTD_greedy`). Tables 0 to 3 are for inputs above
-/// 256 KB, of at most 256 KB, 128 KB and 16 KB, as `ZSTD_getCParams` chooses them.
-/// A row of [`LEVELS`]: `(W, H, S, L, lazy)`.
-type Params = (u32, u32, u32, usize, bool);
+/// 22 (zstd 1.5.7, lib/compress/clevels.h, `ZSTD_defaultCParameters`, generated from it): for
+/// each, the window's log `W`, the chain table's log `C`, the hash table's log `H`, the search
+/// log `S`, the shortest match `L`, the target length `T`, and the strategy. Tables 0 to 3 are
+/// for inputs above 256 KB, of at most 256 KB, 128 KB and 16 KB, as `ZSTD_getCParams` chooses
+/// them.
+type Params = (u32, u32, u32, u32, usize, u32, Strategy);
 
 const LEVELS: [[Params; 23]; 4] = [
-    // inputs above 256 KB
+    // "default" - for any srcSize > 256 KB
     [
-        (19, 13, 1, 6, false),
-        (19, 14, 1, 7, false),
-        (20, 16, 1, 6, false),
-        (21, 17, 1, 5, false),
-        (21, 18, 1, 5, false),
-        (21, 19, 3, 5, false),
-        (21, 19, 3, 5, true),
-        (21, 20, 4, 5, true),
-        (21, 20, 4, 5, true),
-        (22, 21, 4, 5, true),
-        (22, 22, 5, 5, true),
-        (22, 22, 6, 5, true),
-        (22, 23, 6, 5, true),
-        (22, 22, 4, 5, true),
-        (22, 23, 5, 5, true),
-        (22, 23, 6, 5, true),
-        (22, 22, 5, 5, true),
-        (23, 22, 5, 4, true),
-        (23, 22, 6, 3, true),
-        (23, 22, 7, 3, true),
-        (25, 23, 7, 3, true),
-        (26, 24, 7, 3, true),
-        (27, 25, 9, 3, true),
+        (19, 12, 13, 1, 6, 1, Strategy::Fast),
+        (19, 13, 14, 1, 7, 0, Strategy::Fast),
+        (20, 15, 16, 1, 6, 0, Strategy::Fast),
+        (21, 16, 17, 1, 5, 0, Strategy::DFast),
+        (21, 18, 18, 1, 5, 0, Strategy::DFast),
+        (21, 18, 19, 3, 5, 2, Strategy::Greedy),
+        (21, 18, 19, 3, 5, 4, Strategy::Lazy),
+        (21, 19, 20, 4, 5, 8, Strategy::Lazy),
+        (21, 19, 20, 4, 5, 16, Strategy::Lazy2),
+        (22, 20, 21, 4, 5, 16, Strategy::Lazy2),
+        (22, 21, 22, 5, 5, 16, Strategy::Lazy2),
+        (22, 21, 22, 6, 5, 16, Strategy::Lazy2),
+        (22, 22, 23, 6, 5, 32, Strategy::Lazy2),
+        (22, 22, 22, 4, 5, 32, Strategy::BtLazy2),
+        (22, 22, 23, 5, 5, 32, Strategy::BtLazy2),
+        (22, 23, 23, 6, 5, 32, Strategy::BtLazy2),
+        (22, 22, 22, 5, 5, 48, Strategy::BtOpt),
+        (23, 23, 22, 5, 4, 64, Strategy::BtOpt),
+        (23, 23, 22, 6, 3, 64, Strategy::BtUltra),
+        (23, 24, 22, 7, 3, 256, Strategy::BtUltra2),
+        (25, 25, 23, 7, 3, 256, Strategy::BtUltra2),
+        (26, 26, 24, 7, 3, 512, Strategy::BtUltra2),
+        (27, 27, 25, 9, 3, 999, Strategy::BtUltra2),
     ],
-    // inputs of at most 256 KB
+    // for srcSize <= 256 KB
     [
-        (18, 13, 1, 5, false),
-        (18, 14, 1, 6, false),
-        (18, 14, 1, 5, false),
-        (18, 16, 1, 4, false),
-        (18, 17, 3, 5, false),
-        (18, 18, 5, 5, false),
-        (18, 19, 3, 5, true),
-        (18, 19, 4, 4, true),
-        (18, 19, 4, 4, true),
-        (18, 19, 5, 4, true),
-        (18, 19, 6, 4, true),
-        (18, 19, 5, 4, true),
-        (18, 19, 7, 4, true),
-        (18, 19, 4, 4, true),
-        (18, 19, 4, 3, true),
-        (18, 19, 6, 3, true),
-        (18, 19, 6, 3, true),
-        (18, 19, 8, 3, true),
-        (18, 19, 6, 3, true),
-        (18, 19, 8, 3, true),
-        (18, 19, 10, 3, true),
-        (18, 19, 12, 3, true),
-        (18, 19, 13, 3, true),
+        (18, 12, 13, 1, 5, 1, Strategy::Fast),
+        (18, 13, 14, 1, 6, 0, Strategy::Fast),
+        (18, 14, 14, 1, 5, 0, Strategy::DFast),
+        (18, 16, 16, 1, 4, 0, Strategy::DFast),
+        (18, 16, 17, 3, 5, 2, Strategy::Greedy),
+        (18, 17, 18, 5, 5, 2, Strategy::Greedy),
+        (18, 18, 19, 3, 5, 4, Strategy::Lazy),
+        (18, 18, 19, 4, 4, 4, Strategy::Lazy),
+        (18, 18, 19, 4, 4, 8, Strategy::Lazy2),
+        (18, 18, 19, 5, 4, 8, Strategy::Lazy2),
+        (18, 18, 19, 6, 4, 8, Strategy::Lazy2),
+        (18, 18, 19, 5, 4, 12, Strategy::BtLazy2),
+        (18, 19, 19, 7, 4, 12, Strategy::BtLazy2),
+        (18, 18, 19, 4, 4, 16, Strategy::BtOpt),
+        (18, 18, 19, 4, 3, 32, Strategy::BtOpt),
+        (18, 18, 19, 6, 3, 128, Strategy::BtOpt),
+        (18, 19, 19, 6, 3, 128, Strategy::BtUltra),
+        (18, 19, 19, 8, 3, 256, Strategy::BtUltra),
+        (18, 19, 19, 6, 3, 128, Strategy::BtUltra2),
+        (18, 19, 19, 8, 3, 256, Strategy::BtUltra2),
+        (18, 19, 19, 10, 3, 512, Strategy::BtUltra2),
+        (18, 19, 19, 12, 3, 512, Strategy::BtUltra2),
+        (18, 19, 19, 13, 3, 999, Strategy::BtUltra2),
     ],
-    // inputs of at most 128 KB
+    // for srcSize <= 128 KB
     [
-        (17, 12, 1, 5, false),
-        (17, 13, 1, 6, false),
-        (17, 15, 1, 5, false),
-        (17, 16, 2, 5, false),
-        (17, 17, 2, 4, false),
-        (17, 17, 3, 4, false),
-        (17, 17, 3, 4, true),
-        (17, 17, 3, 4, true),
-        (17, 17, 4, 4, true),
-        (17, 17, 5, 4, true),
-        (17, 17, 6, 4, true),
-        (17, 17, 5, 4, true),
-        (17, 17, 7, 4, true),
-        (17, 17, 3, 4, true),
-        (17, 17, 4, 3, true),
-        (17, 17, 6, 3, true),
-        (17, 17, 6, 3, true),
-        (17, 17, 8, 3, true),
-        (17, 17, 10, 3, true),
-        (17, 17, 5, 3, true),
-        (17, 17, 7, 3, true),
-        (17, 17, 9, 3, true),
-        (17, 17, 11, 3, true),
+        (17, 12, 12, 1, 5, 1, Strategy::Fast),
+        (17, 12, 13, 1, 6, 0, Strategy::Fast),
+        (17, 13, 15, 1, 5, 0, Strategy::Fast),
+        (17, 15, 16, 2, 5, 0, Strategy::DFast),
+        (17, 17, 17, 2, 4, 0, Strategy::DFast),
+        (17, 16, 17, 3, 4, 2, Strategy::Greedy),
+        (17, 16, 17, 3, 4, 4, Strategy::Lazy),
+        (17, 16, 17, 3, 4, 8, Strategy::Lazy2),
+        (17, 16, 17, 4, 4, 8, Strategy::Lazy2),
+        (17, 16, 17, 5, 4, 8, Strategy::Lazy2),
+        (17, 16, 17, 6, 4, 8, Strategy::Lazy2),
+        (17, 17, 17, 5, 4, 8, Strategy::BtLazy2),
+        (17, 18, 17, 7, 4, 12, Strategy::BtLazy2),
+        (17, 18, 17, 3, 4, 12, Strategy::BtOpt),
+        (17, 18, 17, 4, 3, 32, Strategy::BtOpt),
+        (17, 18, 17, 6, 3, 256, Strategy::BtOpt),
+        (17, 18, 17, 6, 3, 128, Strategy::BtUltra),
+        (17, 18, 17, 8, 3, 256, Strategy::BtUltra),
+        (17, 18, 17, 10, 3, 512, Strategy::BtUltra),
+        (17, 18, 17, 5, 3, 256, Strategy::BtUltra2),
+        (17, 18, 17, 7, 3, 512, Strategy::BtUltra2),
+        (17, 18, 17, 9, 3, 512, Strategy::BtUltra2),
+        (17, 18, 17, 11, 3, 999, Strategy::BtUltra2),
     ],
-    // inputs of at most 16 KB
+    // for srcSize <= 16 KB
     [
-        (14, 13, 1, 5, false),
-        (14, 15, 1, 5, false),
-        (14, 15, 1, 4, false),
-        (14, 15, 2, 4, false),
-        (14, 14, 4, 4, false),
-        (14, 14, 3, 4, true),
-        (14, 14, 4, 4, true),
-        (14, 14, 6, 4, true),
-        (14, 14, 8, 4, true),
-        (14, 14, 5, 4, true),
-        (14, 14, 9, 4, true),
-        (14, 14, 3, 4, true),
-        (14, 14, 4, 3, true),
-        (14, 14, 5, 3, true),
-        (14, 15, 6, 3, true),
-        (14, 15, 7, 3, true),
-        (14, 15, 5, 3, true),
-        (14, 15, 6, 3, true),
-        (14, 15, 7, 3, true),
-        (14, 15, 8, 3, true),
-        (14, 15, 8, 3, true),
-        (14, 15, 9, 3, true),
-        (14, 15, 10, 3, true),
+        (14, 12, 13, 1, 5, 1, Strategy::Fast),
+        (14, 14, 15, 1, 5, 0, Strategy::Fast),
+        (14, 14, 15, 1, 4, 0, Strategy::Fast),
+        (14, 14, 15, 2, 4, 0, Strategy::DFast),
+        (14, 14, 14, 4, 4, 2, Strategy::Greedy),
+        (14, 14, 14, 3, 4, 4, Strategy::Lazy),
+        (14, 14, 14, 4, 4, 8, Strategy::Lazy2),
+        (14, 14, 14, 6, 4, 8, Strategy::Lazy2),
+        (14, 14, 14, 8, 4, 8, Strategy::Lazy2),
+        (14, 15, 14, 5, 4, 8, Strategy::BtLazy2),
+        (14, 15, 14, 9, 4, 8, Strategy::BtLazy2),
+        (14, 15, 14, 3, 4, 12, Strategy::BtOpt),
+        (14, 15, 14, 4, 3, 24, Strategy::BtOpt),
+        (14, 15, 14, 5, 3, 32, Strategy::BtUltra),
+        (14, 15, 15, 6, 3, 64, Strategy::BtUltra),
+        (14, 15, 15, 7, 3, 256, Strategy::BtUltra),
+        (14, 15, 15, 5, 3, 48, Strategy::BtUltra2),
+        (14, 15, 15, 6, 3, 128, Strategy::BtUltra2),
+        (14, 15, 15, 7, 3, 256, Strategy::BtUltra2),
+        (14, 15, 15, 8, 3, 256, Strategy::BtUltra2),
+        (14, 15, 15, 8, 3, 512, Strategy::BtUltra2),
+        (14, 15, 15, 9, 3, 512, Strategy::BtUltra2),
+        (14, 15, 15, 10, 3, 999, Strategy::BtUltra2),
     ],
 ];
 
-/// How hard the encoder looks for matches, a level's row of [`LEVELS`].
+/// How hard the encoder looks for matches, a level's row of [`LEVELS`] fitted to the input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Level {
     level: i32,
     hash_log: u32,
+    chain_log: u32,
+    /// Positions a chain search tries: `2^S`.
     chain: u32,
     min_match: usize,
-    lazy: bool,
+    strategy: Strategy,
 }
 
 impl Level {
@@ -169,31 +185,36 @@ impl Level {
 
     fn from_table(level: i32, table: usize, src_len: Option<usize>) -> Self {
         let row = usize::try_from(level.clamp(0, 22)).unwrap_or(0);
-        let (window_log, hash_log, search_log, min_match, lazy) = LEVELS
-            .get(table)
-            .and_then(|t| t.get(row))
-            .copied()
-            .unwrap_or((19, 13, 1, 6, false));
-        // `ZSTD_adjustCParams_internal` (zstd 1.5.7, lib/compress/zstd_compress.c:1551-1565): a
-        // known input shrinks the window to its size, at least 2^6 (`ZSTD_HASHLOG_MIN`), and the
-        // hash table to twice the window.
-        let hash_log = match src_len {
-            Some(len) => {
-                let src_log = if len < 1 << HASH_LOG_MIN {
-                    HASH_LOG_MIN
-                } else {
-                    usize::BITS.saturating_sub(len.saturating_sub(1).leading_zeros())
-                };
-                hash_log.min(window_log.min(src_log).saturating_add(1))
+        let (mut window_log, mut chain_log, mut hash_log, search_log, min_match, _, strategy) =
+            LEVELS
+                .get(table)
+                .and_then(|t| t.get(row))
+                .copied()
+                .unwrap_or((19, 12, 13, 1, 6, 1, Strategy::Fast));
+        // `ZSTD_adjustCParams_internal` (zstd 1.5.7, lib/compress/zstd_compress.c): a known
+        // input shrinks the window to its size, at least 2^6 (`ZSTD_HASHLOG_MIN`); the hash table
+        // to twice the window; and the chain table's cycle (one log less for the binary-tree
+        // strategies, `ZSTD_cycleLog`) to the window.
+        if let Some(len) = src_len {
+            let src_log = if len < 1 << HASH_LOG_MIN {
+                HASH_LOG_MIN
+            } else {
+                usize::BITS.saturating_sub(len.saturating_sub(1).leading_zeros())
+            };
+            window_log = window_log.min(src_log);
+            hash_log = hash_log.min(window_log.saturating_add(1));
+            let cycle_log = chain_log.saturating_sub(u32::from(strategy >= Strategy::BtLazy2));
+            if cycle_log > window_log {
+                chain_log = chain_log.saturating_sub(cycle_log.saturating_sub(window_log));
             }
-            None => hash_log,
-        };
+        }
         Self {
             level,
             hash_log,
+            chain_log,
             chain: 1u32 << search_log,
             min_match: min_match.max(HASHED),
-            lazy,
+            strategy,
         }
     }
 
@@ -205,6 +226,11 @@ impl Level {
             .filter(|&&bound| len <= bound)
             .count();
         Self::from_table(self.level, table, Some(len))
+    }
+
+    /// Whether the chain search looks one position ahead before taking a match.
+    fn lazy(self) -> bool {
+        self.strategy >= Strategy::Lazy
     }
 }
 
@@ -230,6 +256,11 @@ struct Predefined {
 pub struct Compressor {
     head: Vec<u32>,
     chain: Vec<u32>,
+    /// What the next frame's first position is stored as in `head` and `chain`: entries below it
+    /// are earlier frames', so the tables are never cleared between frames, as the reference
+    /// continues its window's indices (`ZSTD_window_clear`, zstd 1.5.7
+    /// lib/compress/zstd_compress_internal.h). 0 is an empty entry.
+    base: u32,
     found: Vec<Found>,
     literals: Vec<u8>,
     block: Vec<u8>,
@@ -239,6 +270,7 @@ pub struct Compressor {
     predefined: Predefined,
     /// `256·log2(n)` of a symbol's cells `n`, 0 to the largest table's size.
     log2: Vec<u16>,
+    lengths: LengthCodes,
 }
 
 impl Compressor {
@@ -250,6 +282,7 @@ impl Compressor {
         Ok(Self {
             head: Vec::new(),
             chain: Vec::new(),
+            base: 1,
             found: Vec::new(),
             literals: Vec::new(),
             block: Vec::new(),
@@ -264,6 +297,7 @@ impl Compressor {
                 match_length: EncodeTable::new(&MATCH_LENGTH_DEFAULT, MATCH_LENGTH_DEFAULT_LOG)?,
             },
             log2,
+            lengths: LengthCodes::new(),
         })
     }
 
@@ -290,7 +324,19 @@ impl Compressor {
         out.reserve((input.len() / 2).saturating_add(32));
         out.extend_from_slice(&FRAME_MAGIC.to_le_bytes());
         frame_header(out, input.len(), checksum);
-        let mut matcher = Matcher::new(input, level, &mut self.head, &mut self.chain);
+        // A frame whose positions would pass u32 from the base starts the tables over.
+        let len = u32::try_from(input.len()).unwrap_or(u32::MAX);
+        let next_base = match self.base.checked_add(len) {
+            Some(next) => next,
+            None => {
+                self.head.fill(0);
+                self.chain.fill(0);
+                self.base = 1;
+                1u32.saturating_add(len)
+            }
+        };
+        let mut matcher = Matcher::new(input, level, &mut self.head, &mut self.chain, self.base);
+        self.base = next_base;
         let mut offsets = [1u32, 4, 8];
         let mut start = 0usize;
         loop {
@@ -304,6 +350,7 @@ impl Compressor {
                 own: &mut self.own,
                 predefined: &self.predefined,
                 log2: &self.log2,
+                lengths: &self.lengths,
             };
             encode_block(
                 out,
@@ -340,6 +387,7 @@ struct Work<'a> {
     own: &'a mut [EncodeTable; 3],
     predefined: &'a Predefined,
     log2: &'a [u16],
+    lengths: &'a LengthCodes,
 }
 
 /// A sequence's three codes, each with its extra bits' value and count: literals length, match
@@ -430,27 +478,76 @@ struct Matcher<'a> {
     level: Level,
     head: &'a mut [u32],
     chain: &'a mut [u32],
+    /// What the frame's first position is stored as; lower entries are earlier frames'.
+    base: u32,
     /// Positions inserted so far.
     next: usize,
 }
 
-/// No position: the hash table's and chains' empty value.
-const NONE: u32 = u32::MAX;
+/// The bytes the double-fast search reads at a position (`HASH_READ_SIZE`, zstd 1.5.7
+/// lib/compress/zstd_compress_internal.h).
+const HASH_READ: usize = 8;
+/// Positions searched without a match before the step between them grows by one:
+/// `1 << kSearchStrength`, `kSearchStrength` 8 (zstd 1.5.7 lib/compress/zstd_compress_internal.h).
+const STEP_AFTER: usize = 1 << 8;
+/// The reference's multiplicative hash constants (zstd 1.5.7
+/// lib/compress/zstd_compress_internal.h, `prime4bytes` to `prime8bytes`).
+const PRIME_4: u32 = 2_654_435_761;
+const PRIME_5: u64 = 889_523_592_379;
+const PRIME_6: u64 = 227_718_039_650_203;
+const PRIME_7: u64 = 58_295_818_150_454_627;
+const PRIME_8: u64 = 0xCF1B_BCDC_B7A5_6463;
+/// A word's low 4 bytes.
+const LOW_4: u64 = 0xFFFF_FFFF;
 
 impl<'a> Matcher<'a> {
-    /// A matcher over `input` in `head` and `chain`, emptied and sized for it.
-    fn new(input: &'a [u8], level: Level, head: &'a mut Vec<u32>, chain: &'a mut Vec<u32>) -> Self {
-        head.clear();
-        head.resize(1usize << level.hash_log, NONE);
-        chain.clear();
-        chain.resize(input.len(), NONE);
+    /// A matcher over `input` in `head` and `chain`, sized for it, the frame's positions stored
+    /// from `base`: for the double-fast search, the long and short hash tables; for the chain
+    /// search, the hash table and a link a position. Entries of earlier frames stay, below
+    /// `base`, so nothing is cleared.
+    fn new(
+        input: &'a [u8],
+        level: Level,
+        head: &'a mut Vec<u32>,
+        chain: &'a mut Vec<u32>,
+        base: u32,
+    ) -> Self {
+        let grow = |table: &mut Vec<u32>, len: usize| {
+            if table.len() < len {
+                table.resize(len, 0);
+            }
+        };
+        grow(head, 1usize << level.hash_log);
+        if level.strategy == Strategy::DFast {
+            grow(chain, 1usize << level.chain_log);
+        } else {
+            grow(chain, input.len());
+        }
         Self {
             input,
             level,
             head,
             chain,
+            base,
             next: 0,
         }
+    }
+
+    /// A frame position as the tables store it.
+    #[inline(always)]
+    fn stored(&self, at: usize) -> u32 {
+        u32::try_from(at)
+            .ok()
+            .and_then(|at| self.base.checked_add(at))
+            .unwrap_or(0)
+    }
+
+    /// The frame position a stored entry names, if it is this frame's.
+    #[inline(always)]
+    fn position(&self, entry: u32) -> Option<usize> {
+        entry
+            .checked_sub(self.base)
+            .and_then(|at| usize::try_from(at).ok())
     }
 
     fn hash(&self, at: usize) -> Option<usize> {
@@ -467,12 +564,13 @@ impl<'a> Matcher<'a> {
     /// Inserts every position before `to`.
     fn insert_to(&mut self, to: usize) {
         while self.next < to {
+            let stored = self.stored(self.next);
             if let Some(h) = self.hash(self.next)
                 && let (Some(slot), Some(link)) =
                     (self.head.get_mut(h), self.chain.get_mut(self.next))
             {
                 *link = *slot;
-                *slot = u32::try_from(self.next).unwrap_or(NONE);
+                *slot = stored;
             }
             self.next = self.next.saturating_add(1);
         }
@@ -521,10 +619,11 @@ impl<'a> Matcher<'a> {
         let Some(h) = self.hash(at) else {
             return best;
         };
-        let mut candidate = self.head.get(h).copied().unwrap_or(NONE);
+        let mut candidate = self.head.get(h).and_then(|&e| self.position(e));
         let mut tries = self.level.chain;
-        while candidate != NONE && tries > 0 {
-            let c = usize::try_from(candidate).unwrap_or(0);
+        while let Some(c) = candidate
+            && tries > 0
+        {
             let len = self.common(c, at, end);
             if len > best.0 {
                 best = (len, at.saturating_sub(c));
@@ -532,7 +631,7 @@ impl<'a> Matcher<'a> {
                     break;
                 }
             }
-            candidate = self.chain.get(c).copied().unwrap_or(NONE);
+            candidate = self.chain.get(c).and_then(|&e| self.position(e));
             tries = tries.saturating_sub(1);
         }
         if best.0 < self.level.min_match {
@@ -540,6 +639,293 @@ impl<'a> Matcher<'a> {
         } else {
             best
         }
+    }
+
+    /// The little-endian word of the 8 bytes at `at`; 0 where the input does not hold them,
+    /// which the search's limit keeps from happening at any position it reads.
+    #[inline(always)]
+    fn read64(&self, at: usize) -> u64 {
+        self.input
+            .get(at..)
+            .and_then(<[u8]>::first_chunk::<8>)
+            .map_or(0, |b| u64::from_le_bytes(*b))
+    }
+
+    /// The long hash table's slot for a position's word: its 8 bytes' hash (`ZSTD_hash8`).
+    #[inline(always)]
+    fn long_slot(&self, v: u64) -> usize {
+        let shift = 64u32.saturating_sub(self.level.hash_log);
+        usize::try_from(v.wrapping_mul(PRIME_8).checked_shr(shift).unwrap_or(0)).unwrap_or(0)
+    }
+
+    /// The short hash table's slot for a position's word: the hash of its shortest match's bytes,
+    /// 4 to 7 (`ZSTD_hashPtr`; a minimum of 8 hashes 4, as the double-fast search's template
+    /// does).
+    #[inline(always)]
+    fn short_slot(&self, v: u64) -> usize {
+        let h = self.level.chain_log;
+        let hashed = match self.level.min_match {
+            5 => (v << 24)
+                .wrapping_mul(PRIME_5)
+                .checked_shr(64u32.saturating_sub(h)),
+            6 => (v << 16)
+                .wrapping_mul(PRIME_6)
+                .checked_shr(64u32.saturating_sub(h)),
+            7 => (v << 8)
+                .wrapping_mul(PRIME_7)
+                .checked_shr(64u32.saturating_sub(h)),
+            _ => u64::from(u32::try_from(v & LOW_4).unwrap_or(0).wrapping_mul(PRIME_4))
+                .checked_shr(32u32.saturating_sub(h)),
+        };
+        usize::try_from(hashed.unwrap_or(0)).unwrap_or(0)
+    }
+
+    /// The long hash table's slot for `at`.
+    #[inline(always)]
+    fn hash_long(&self, at: usize) -> usize {
+        self.long_slot(self.read64(at))
+    }
+
+    /// The short hash table's slot for `at`.
+    #[inline(always)]
+    fn hash_short(&self, at: usize) -> usize {
+        self.short_slot(self.read64(at))
+    }
+
+    /// The long table's position at `slot`, if this frame's.
+    #[inline(always)]
+    fn long_at(&self, slot: usize) -> Option<usize> {
+        self.head.get(slot).and_then(|&e| self.position(e))
+    }
+
+    /// The short table's position at `slot`, if this frame's.
+    #[inline(always)]
+    fn short_at(&self, slot: usize) -> Option<usize> {
+        self.chain.get(slot).and_then(|&e| self.position(e))
+    }
+
+    /// Sets the long table's `slot` to `at`.
+    #[inline(always)]
+    fn put_long(&mut self, slot: usize, at: usize) {
+        let stored = self.stored(at);
+        if let Some(e) = self.head.get_mut(slot) {
+            *e = stored;
+        }
+    }
+
+    /// Sets the short table's `slot` to `at`.
+    #[inline(always)]
+    fn put_short(&mut self, slot: usize, at: usize) {
+        let stored = self.stored(at);
+        if let Some(e) = self.chain.get_mut(slot) {
+            *e = stored;
+        }
+    }
+
+    /// The block's matches by the reference's double-fast search
+    /// (`ZSTD_compressBlock_doubleFast_noDict_generic`, zstd 1.5.7
+    /// lib/compress/zstd_double_fast.c): at each position a repeat of the last offset one ahead,
+    /// then the long table's 8-byte match, then the short table's, extended by the long match
+    /// one ahead when that is longer; the step between positions grows by one every 2^8
+    /// positions without a match, and after a match the repeats of the second offset are taken
+    /// at once. Only the positions searched and a few around each match enter the tables.
+    fn double_fast(
+        &mut self,
+        start: usize,
+        end: usize,
+        offsets: &mut [u32; 3],
+        out: &mut Vec<Found>,
+    ) {
+        // The last position whose 8 bytes the block holds: every read is within the block.
+        let Some(limit) = end.checked_sub(HASH_READ) else {
+            return;
+        };
+        let mut anchor = start;
+        // The frame's first byte starts no search, as the reference's window begins after it.
+        let mut ip = start.saturating_add(usize::from(start == 0));
+        'outer: loop {
+            let mut step = 1usize;
+            let mut next_step = ip.saturating_add(STEP_AFTER);
+            let mut ip1 = ip.saturating_add(step);
+            if ip1 > limit {
+                break;
+            }
+            // Each position's 8 bytes are read once: both hashes and every comparison at it use
+            // them, and the next position's carry over when the search steps.
+            let mut v0 = self.read64(ip);
+            let mut hl0 = self.long_slot(v0);
+            let mut idxl0 = self.long_at(hl0);
+            // One search position at a time until a match: its start, offset and length, the
+            // position searched, and the long slot and position one ahead with the step.
+            let (at, offset, length, curr, (hl1, ip1, step)) = loop {
+                let hs0 = self.short_slot(v0);
+                let idxs0 = self.short_at(hs0);
+                let curr = ip;
+                self.put_long(hl0, curr);
+                self.put_short(hs0, curr);
+                // The last offset, one position ahead: bytes 1 to 4 of the word.
+                let rep1 = usize::try_from(offsets[0]).unwrap_or(0);
+                if rep1 > 0 && rep1 <= ip {
+                    let (from, to) = (
+                        ip.saturating_add(1).saturating_sub(rep1),
+                        ip.saturating_add(1),
+                    );
+                    if self.read64(from) & LOW_4 == (v0 >> 8) & LOW_4 {
+                        let length = self
+                            .common(from.saturating_add(4), to.saturating_add(4), end)
+                            .saturating_add(4);
+                        self.store(out, offsets, anchor, to, rep1, length);
+                        (ip, anchor) =
+                            self.after(out, offsets, to.saturating_add(length), curr, end);
+                        continue 'outer;
+                    }
+                }
+                let v1 = self.read64(ip1);
+                let hl1 = self.long_slot(v1);
+                if let Some(m) = idxl0
+                    && self.read64(m) == v0
+                {
+                    let length = self
+                        .common(m.saturating_add(8), ip.saturating_add(8), end)
+                        .saturating_add(8);
+                    let (at, m, length) = self.catch_up(ip, m, length, anchor);
+                    break (at, at.saturating_sub(m), length, curr, (hl1, ip1, step));
+                }
+                let idxl1 = self.long_at(hl1);
+                if let Some(m) = idxs0
+                    && self.read64(m) & LOW_4 == v0 & LOW_4
+                {
+                    // A short match: a long one one position ahead replaces it if longer.
+                    let mut found = (
+                        ip,
+                        m,
+                        self.common(m.saturating_add(4), ip.saturating_add(4), end)
+                            .saturating_add(4),
+                    );
+                    if let Some(m1) = idxl1
+                        && self.read64(m1) == v1
+                    {
+                        let l1 = self
+                            .common(m1.saturating_add(8), ip1.saturating_add(8), end)
+                            .saturating_add(8);
+                        if l1 > found.2 {
+                            found = (ip1, m1, l1);
+                        }
+                    }
+                    let (at, m, length) = self.catch_up(found.0, found.1, found.2, anchor);
+                    break (at, at.saturating_sub(m), length, curr, (hl1, ip1, step));
+                }
+                if ip1 >= next_step {
+                    step = step.saturating_add(1);
+                    next_step = next_step.saturating_add(STEP_AFTER);
+                }
+                ip = ip1;
+                ip1 = ip1.saturating_add(step);
+                v0 = v1;
+                hl0 = hl1;
+                idxl0 = idxl1;
+                if ip1 > limit {
+                    break 'outer;
+                }
+            };
+            // The long slot one ahead takes that position while it is surely before the match's
+            // end: a match is at least 4 bytes, so with a step below 4 it is.
+            if step < 4 {
+                self.put_long(hl1, ip1);
+            }
+            self.store(out, offsets, anchor, at, offset, length);
+            (ip, anchor) = self.after(out, offsets, at.saturating_add(length), curr, end);
+        }
+    }
+
+    /// Extends a match at `at` from `m` backward over the bytes before both that agree, down to
+    /// the anchor and the frame's second byte.
+    #[inline(always)]
+    fn catch_up(
+        &self,
+        mut at: usize,
+        mut m: usize,
+        mut length: usize,
+        anchor: usize,
+    ) -> (usize, usize, usize) {
+        while at > anchor
+            && m > 0
+            && self.input.get(at.wrapping_sub(1)) == self.input.get(m.wrapping_sub(1))
+        {
+            at = at.wrapping_sub(1);
+            m = m.wrapping_sub(1);
+            length = length.saturating_add(1);
+        }
+        (at, m, length)
+    }
+
+    /// Records a match of `length` at `at` from `offset` back, after the literals from
+    /// `anchor`.
+    #[inline(always)]
+    fn store(
+        &self,
+        out: &mut Vec<Found>,
+        offsets: &mut [u32; 3],
+        anchor: usize,
+        at: usize,
+        offset: usize,
+        length: usize,
+    ) {
+        let literals = u32::try_from(at.saturating_sub(anchor)).unwrap_or(0);
+        let offset_value = code_offset(offsets, u32::try_from(offset).unwrap_or(0), literals);
+        out.push(Found {
+            literals,
+            offset_value,
+            length: u32::try_from(length).unwrap_or(0),
+        });
+    }
+
+    /// After a match ending at `ip`, found searching `curr`, in a block ending at `end`: the
+    /// positions two past `curr` and just before the match's end enter both tables, then every
+    /// immediate repeat of the second offset is taken. Returns the next position and the anchor.
+    fn after(
+        &mut self,
+        out: &mut Vec<Found>,
+        offsets: &mut [u32; 3],
+        mut ip: usize,
+        curr: usize,
+        end: usize,
+    ) -> (usize, usize) {
+        let limit = end.saturating_sub(HASH_READ);
+        if ip > limit {
+            return (ip, ip);
+        }
+        let two = curr.saturating_add(2);
+        let (h, s) = (self.hash_long(two), self.hash_short(two));
+        self.put_long(h, two);
+        self.put_short(s, two);
+        let (before_end, last) = (ip.saturating_sub(2), ip.saturating_sub(1));
+        let h = self.hash_long(before_end);
+        self.put_long(h, before_end);
+        let s = self.hash_short(last);
+        self.put_short(s, last);
+        while ip <= limit {
+            let rep2 = usize::try_from(offsets[1]).unwrap_or(0);
+            if rep2 == 0
+                || rep2 > ip
+                || self.read64(ip.saturating_sub(rep2)) & LOW_4 != self.read64(ip) & LOW_4
+            {
+                break;
+            }
+            let length = self
+                .common(
+                    ip.saturating_sub(rep2).saturating_add(4),
+                    ip.saturating_add(4),
+                    end,
+                )
+                .saturating_add(4);
+            let (h, s) = (self.hash_long(ip), self.hash_short(ip));
+            self.put_short(s, ip);
+            self.put_long(h, ip);
+            self.store(out, offsets, ip, ip, rep2, length);
+            ip = ip.saturating_add(length);
+        }
+        (ip, ip)
     }
 
     /// The block's matches, greedy or one position lazy, the repeat offsets updated as the
@@ -552,6 +938,10 @@ impl<'a> Matcher<'a> {
         out: &mut Vec<Found>,
     ) {
         out.clear();
+        if self.level.strategy == Strategy::DFast {
+            self.double_fast(start, end, offsets, out);
+            return;
+        }
         let mut at = start;
         let mut anchor = start;
         while at.saturating_add(self.level.min_match) <= end {
@@ -560,7 +950,8 @@ impl<'a> Matcher<'a> {
                 at = at.saturating_add(1);
                 continue;
             }
-            if self.level.lazy && at.saturating_add(1).saturating_add(self.level.min_match) <= end {
+            if self.level.lazy() && at.saturating_add(1).saturating_add(self.level.min_match) <= end
+            {
                 let (len2, off2) = self.best(at.saturating_add(1), end, offsets[0]);
                 if len2 > len.saturating_add(1) {
                     at = at.saturating_add(1);
@@ -642,6 +1033,91 @@ fn code_for(value: u32, table: &[(u32, u8)]) -> (u8, u32, u8) {
         value.saturating_sub(base),
         bits,
     )
+}
+
+/// Literals below which, and match lengths less 3 below which, a length's code is read from a
+/// table; above, each code covers a power of two (§3.1.1.3.2.1.1, Tables 16 and 17), as the
+/// reference's `ZSTD_LLcode` and `ZSTD_MLcode` find them.
+const LITERALS_DIRECT: usize = 64;
+const MATCHES_DIRECT: usize = 128;
+/// The last literals length and match length codes, as the search's tables end.
+const LITERALS_LAST: u8 = 35;
+const MATCHES_LAST: u8 = 52;
+
+/// The lengths' codes found without a search: tables for the short lengths, and above them the
+/// highest bit plus a delta, each taken from the code tables when built.
+#[derive(Debug)]
+struct LengthCodes {
+    literals: [u8; LITERALS_DIRECT],
+    matches: [u8; MATCHES_DIRECT],
+    literals_delta: u8,
+    matches_delta: u8,
+}
+
+impl LengthCodes {
+    fn new() -> Self {
+        let mut literals = [0u8; LITERALS_DIRECT];
+        for (v, code) in literals.iter_mut().enumerate() {
+            *code = literals_length_code(u32::try_from(v).unwrap_or(0)).0;
+        }
+        let mut matches = [0u8; MATCHES_DIRECT];
+        for (v, code) in matches.iter_mut().enumerate() {
+            *code = match_length_code(u32::try_from(v).unwrap_or(0).saturating_add(3)).0;
+        }
+        // The code of the first length past each table, less its highest bit.
+        let delta = |code: u8, value: usize| {
+            code.saturating_sub(u8::try_from(value.trailing_zeros()).unwrap_or(0))
+        };
+        Self {
+            literals,
+            matches,
+            literals_delta: delta(
+                literals_length_code(u32::try_from(LITERALS_DIRECT).unwrap_or(0)).0,
+                LITERALS_DIRECT,
+            ),
+            matches_delta: delta(
+                match_length_code(u32::try_from(MATCHES_DIRECT).unwrap_or(0).saturating_add(3)).0,
+                MATCHES_DIRECT,
+            ),
+        }
+    }
+
+    /// A literals length's code, its extra bits' value and their count.
+    #[inline(always)]
+    fn literals(&self, len: u32) -> (u8, u32, u8) {
+        let code = usize::try_from(len)
+            .ok()
+            .and_then(|l| self.literals.get(l).copied())
+            .unwrap_or_else(|| high_bit(len).saturating_add(self.literals_delta))
+            .min(LITERALS_LAST);
+        let (base, bits) = LITERALS_LENGTH_CODES
+            .get(usize::from(code))
+            .copied()
+            .unwrap_or((0, 0));
+        (code, len.saturating_sub(base), bits)
+    }
+
+    /// A match length's code, its extra bits' value and their count.
+    #[inline(always)]
+    fn matches(&self, len: u32) -> (u8, u32, u8) {
+        let v = len.saturating_sub(3);
+        let code = usize::try_from(v)
+            .ok()
+            .and_then(|l| self.matches.get(l).copied())
+            .unwrap_or_else(|| high_bit(v).saturating_add(self.matches_delta))
+            .min(MATCHES_LAST);
+        let (base, bits) = MATCH_LENGTH_CODES
+            .get(usize::from(code))
+            .copied()
+            .unwrap_or((0, 0));
+        (code, len.saturating_sub(base), bits)
+    }
+}
+
+/// The index of `v`'s highest set bit (0 for 0 and 1).
+#[inline(always)]
+fn high_bit(v: u32) -> u8 {
+    u8::try_from(31u32.saturating_sub(v.leading_zeros())).unwrap_or(0)
 }
 
 /// The offset code of an offset value: its highest bit, the rest its extra bits
@@ -945,8 +1421,8 @@ fn sequences_section(work: &mut Work<'_>) -> Result<(), Corrupt> {
     let mut of_counts = [0u32; 32];
     for f in found {
         let c = [
-            literals_length_code(f.literals),
-            match_length_code(f.length),
+            work.lengths.literals(f.literals),
+            work.lengths.matches(f.length),
             offset_code(f.offset_value),
         ];
         for (counts, &(code, _, _)) in [&mut ll_counts[..], &mut ml_counts[..], &mut of_counts[..]]
@@ -1110,5 +1586,42 @@ impl Encoder {
         self.active = false;
         self.at = 0;
         self.frame.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A frame whose positions would pass u32 from the base starts the tables over, and still
+    /// matches only within itself.
+    #[test]
+    fn the_tables_start_over_before_positions_pass_u32() {
+        let mut c = Compressor::new().unwrap();
+        let input: Vec<u8> = b"abcdefgh-abcdefgh-abcdefgh-0123456789-0123456789".repeat(40);
+        let mut first = Vec::new();
+        c.compress_into(&input, Level::new(3), false, &mut first)
+            .unwrap();
+        c.base = u32::MAX - 100;
+        let mut second = Vec::new();
+        c.compress_into(&input, Level::new(3), false, &mut second)
+            .unwrap();
+        assert_eq!(c.base, 1 + u32::try_from(input.len()).unwrap());
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn length_codes_without_a_search_equal_the_search() {
+        let codes = LengthCodes::new();
+        for len in 0..=(1u32 << 17) {
+            assert_eq!(
+                codes.literals(len),
+                literals_length_code(len),
+                "literals {len}"
+            );
+        }
+        for len in 3..=(1u32 << 17) {
+            assert_eq!(codes.matches(len), match_length_code(len), "match {len}");
+        }
     }
 }

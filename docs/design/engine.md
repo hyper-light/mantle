@@ -384,6 +384,16 @@ upstream defects above to report to RocksDB, with the owner's approval.
   A block compresses with one allocation, the buffer the caller keeps, where the first form
   made 262.
 
+  The parameters are the reference's whole table (`ZSTD_defaultCParameters`, generated from
+  clevels.h), fitted to the input as `ZSTD_adjustCParams_internal` fits them. The `dfast` levels,
+  RocksDB's default 3 among them, use the reference's double-fast search
+  (`ZSTD_compressBlock_doubleFast`): a long 8-byte and a short table, the step growing past
+  unmatched bytes, immediate repeats taken. Each position's word is read once. The tables are
+  not cleared between frames: entries are stored from a base that each frame advances, and
+  older ones are below it, as the reference continues its window's indices. A reused context
+  writes the frame a new one does (`tests/zstd_test.rs`). Repeat offsets are coded wherever an
+  offset equals one, where the reference's fast searches code only the first.
+
 **Where the reader differs from RocksDB, and why.** The bytes read are the same; what the reader
 does with bad or unusual ones is not.
 - *`SeekForGet` on a block with separated keys and values.* RocksDB decides it has run off the

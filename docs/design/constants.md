@@ -269,7 +269,6 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/engine/src/codec/snappy.rs` `TABLE_MAX` | cited | 2^14, snappy's `kMaxHashTableSize` (snappy.cc): the most positions the encoder's table holds. |
 | `crates/engine/src/codec/snappy.rs` `TABLE_MIN` | cited | 2^8, snappy's `kMinHashTableSize` (snappy.cc): the least. |
 | `crates/engine/src/codec/zstd/encoder.rs` `HASHED` | derived | 4: the bytes the match finder hashes, a u32 read; a level's shorter minimum match (`L` of 3) is raised to it. |
-| `crates/engine/src/codec/zstd/encoder.rs` `NONE` | format | u32::MAX: no position, the hash table's and chains' empty value (positions are below the 128 KB-block frame's length, far under it). |
 | `crates/engine/src/codec/zstd/encoder.rs` `OFFSET_DEFAULT_MAX_CODE` | format | 28, the highest offset code the predefined offset table holds (RFC 8878 §3.1.1.3.2.2.3: N = 28). |
 | `crates/engine/src/db/log_format.rs` `BLOCK_SIZE` | format | 32768, `kBlockSize`, the WAL's block [R db/log_format.h:54]. |
 | `crates/engine/src/db/log_format.rs` `FIRST_TYPE` | format | 2, `kFirstType` [R db/log_format.h:28]. |
@@ -330,6 +329,18 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/engine/src/util/block_compression.rs` `ZSTD_DEFAULT_LEVEL` | external | 3, zstd's `ZSTD_CLEVEL_DEFAULT` (zstd 1.5.7 lib/zstd.h:134), what RocksDB's default level means for ZSTD [R util/compression.h:65-75]. |
 | `crates/engine/src/util/block_compression.rs` `ZSTD_WINDOW_MAX` | bound | 2^27 bytes: the largest window a block's ZSTD frame may ask of the decoder, the reference decoder's default limit (`ZSTD_WINDOWLOG_LIMIT_DEFAULT`, zstd 1.5.7 lib/zstd.h:1287), under which RocksDB's `ZSTD_decompressDCtx` reads. |
 | `crates/engine/src/codec/zstd/encoder.rs` `HASH_LOG_MIN` | external | 6, `ZSTD_HASHLOG_MIN` (zstd 1.5.7 lib/zstd.h:1268): the smallest window and hash logs the reference fits a small input's parameters to (`ZSTD_adjustCParams_internal`). |
+| `crates/engine/src/codec/zstd/encoder.rs` `HASH_READ` | external | 8: the bytes the double-fast search reads at a position, `HASH_READ_SIZE` (zstd 1.5.7 lib/compress/zstd_compress_internal.h); the search stops 8 bytes before a block's end so every read is inside it. |
+| `crates/engine/src/codec/zstd/encoder.rs` `STEP_AFTER` | external | 2^8: positions searched without a match before the double-fast search's step grows by one, `1 << kSearchStrength` with `kSearchStrength` 8 (zstd 1.5.7 lib/compress/zstd_compress_internal.h). |
+| `crates/engine/src/codec/zstd/encoder.rs` `PRIME_4` | external | 2654435761, the reference's `prime4bytes` (zstd 1.5.7 lib/compress/zstd_compress_internal.h): Knuth's golden-ratio multiplier for the 4-byte hash (TAOCP 3, §6.4). |
+| `crates/engine/src/codec/zstd/encoder.rs` `PRIME_5` | external | 889523592379, the reference's `prime5bytes` for the 5-byte hash (zstd 1.5.7 lib/compress/zstd_compress_internal.h). |
+| `crates/engine/src/codec/zstd/encoder.rs` `PRIME_6` | external | 227718039650203, the reference's `prime6bytes` for the 6-byte hash (same file). |
+| `crates/engine/src/codec/zstd/encoder.rs` `PRIME_7` | external | 58295818150454627, the reference's `prime7bytes` for the 7-byte hash (same file). |
+| `crates/engine/src/codec/zstd/encoder.rs` `PRIME_8` | external | 0xCF1BBCDCB7A56463, the reference's `prime8bytes` for the 8-byte hash (same file). |
+| `crates/engine/src/codec/zstd/encoder.rs` `LOW_4` | format | 0xFFFFFFFF: a 64-bit word's low 4 bytes, the bytes a 4-byte match compares. |
+| `crates/engine/src/codec/zstd/encoder.rs` `LITERALS_DIRECT` | external | 64: literals lengths below it take their code from a table, above it the highest bit plus a delta, as `ZSTD_LLcode` does (zstd 1.5.7 lib/compress/zstd_compress_internal.h); from 64 each literals length code covers a power of two (RFC 8878 Table 16). |
+| `crates/engine/src/codec/zstd/encoder.rs` `MATCHES_DIRECT` | external | 128: match lengths less 3 below it take their code from a table, as `ZSTD_MLcode` does (same file); from 128 each match length code covers a power of two (RFC 8878 Table 17). |
+| `crates/engine/src/codec/zstd/encoder.rs` `LITERALS_LAST` | format | 35: the last literals length code (RFC 8878 Table 16); a unit test checks it against the code table's length. |
+| `crates/engine/src/codec/zstd/encoder.rs` `MATCHES_LAST` | format | 52: the last match length code (RFC 8878 Table 17); a unit test checks it against the code table's length. |
 | `crates/engine/src/codec/zstd/bits.rs` `READ_MAX` | format | 32 bits: the widest single read of a ZSTD bitstream (an offset's at most 31 extra bits, §3.1.1.3.2.1.1), so the reader refills its 64-bit word once fewer remain. |
 | `crates/engine/src/codec/zstd/decoder.rs` `SLACK` | derived | `2 * WILD_COPY`: the bytes past a block's end the decoder's piece-wise copies may write, as the reference's `WILDCOPY_OVERLENGTH` is twice its 16-byte copy (zstd 1.5.7 lib/common/zstd_internal.h). |
 | `crates/engine/src/codec/zstd/decoder.rs` `WILD_COPY` | external | 16 bytes, the reference's `COPY16` piece (zstd 1.5.7 lib/common/zstd_internal.h, `ZSTD_wildcopy`): one 128-bit register on both targets' vector units (NEON, SSE2). |

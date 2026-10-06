@@ -182,21 +182,95 @@ impl Huffman {
         Ok(())
     }
 
+    /// The symbol the stream's next code names, its bits consumed: the stream must hold
+    /// `max_bits` readable since its last refill. The table has `2^max_bits` entries, so the
+    /// masked index is in it.
+    #[inline(always)]
+    fn decode(&self, bits: &mut Backward<'_>) -> u8 {
+        let mask = self.entries.len().wrapping_sub(1);
+        let index = usize::try_from(bits.peek(self.max_bits)).unwrap_or(0) & mask;
+        let entry = self.entries.get(index).copied().unwrap_or_default();
+        bits.skip_ensured(u32::from(entry.bits));
+        entry.symbol
+    }
+
+    /// Decodes the rest of one stream into `out`, a symbol a refill.
+    #[inline(always)]
+    fn rest(&self, bits: &mut Backward<'_>, out: &mut [u8]) {
+        for byte in out {
+            bits.ensure(self.max_bits);
+            *byte = self.decode(bits);
+        }
+    }
+
     /// Decodes one stream into `out`, which it fills exactly; the stream must be consumed
     /// exactly (§4.2.2).
     fn stream(&self, stream: &[u8], out: &mut [u8]) -> Result<(), Corrupt> {
         let mut bits = Backward::new(stream)?;
-        for byte in out.iter_mut() {
-            let index = bits.peek(self.max_bits);
-            let entry = self
-                .entries
-                .get(usize::try_from(index).map_err(|_| Corrupt::Huffman)?)
-                .ok_or(Corrupt::Huffman)?;
-            *byte = entry.symbol;
-            bits.skip(u32::from(entry.bits));
+        // Four codes of at most 11 bits under one refill (`HUF_decodeStreamX1`'s unrolling).
+        let quad = self.max_bits.saturating_mul(4);
+        let (fours, tail) = out.as_chunks_mut::<4>();
+        for four in fours {
+            bits.ensure(quad);
+            four[0] = self.decode(&mut bits);
+            four[1] = self.decode(&mut bits);
+            four[2] = self.decode(&mut bits);
+            four[3] = self.decode(&mut bits);
         }
+        self.rest(&mut bits, tail);
         if !bits.finished() {
             return Err(Corrupt::Huffman);
+        }
+        Ok(())
+    }
+
+    /// Decodes four streams into their segments, interleaved: each round takes four codes of
+    /// every stream, the four streams' chains independent so their table reads overlap
+    /// (`HUF_decompress4X1_usingDTable_internal_fast`'s loop). The rounds stop where the
+    /// shortest segment, the fourth, runs out of whole groups of four; each stream then finishes
+    /// alone, and each must be consumed exactly (§4.2.2).
+    fn four_streams(&self, streams: [&[u8]; 4], outs: [&mut [u8]; 4]) -> Result<(), Corrupt> {
+        let [i1, i2, i3, i4] = streams;
+        let [o1, o2, o3, o4] = outs;
+        let (mut b1, mut b2, mut b3, mut b4) = (
+            Backward::new(i1)?,
+            Backward::new(i2)?,
+            Backward::new(i3)?,
+            Backward::new(i4)?,
+        );
+        let quad = self.max_bits.saturating_mul(4);
+        let (q1, t1) = o1.as_chunks_mut::<4>();
+        let (q2, t2) = o2.as_chunks_mut::<4>();
+        let (q3, t3) = o3.as_chunks_mut::<4>();
+        let (q4, t4) = o4.as_chunks_mut::<4>();
+        let rounds = q4.len();
+        let (q1, r1) = q1.split_at_mut(rounds.min(q1.len()));
+        let (q2, r2) = q2.split_at_mut(rounds.min(q2.len()));
+        let (q3, r3) = q3.split_at_mut(rounds.min(q3.len()));
+        for (((a, b), c), d) in q1.iter_mut().zip(q2.iter_mut()).zip(q3.iter_mut()).zip(q4) {
+            b1.ensure(quad);
+            b2.ensure(quad);
+            b3.ensure(quad);
+            b4.ensure(quad);
+            for (((w, x), y), z) in a.iter_mut().zip(b.iter_mut()).zip(c.iter_mut()).zip(d) {
+                *w = self.decode(&mut b1);
+                *x = self.decode(&mut b2);
+                *y = self.decode(&mut b3);
+                *z = self.decode(&mut b4);
+            }
+        }
+        // What each segment has left: its whole groups past the rounds, then its tail.
+        for (bits, groups, tail) in [
+            (&mut b1, r1, t1),
+            (&mut b2, r2, t2),
+            (&mut b3, r3, t3),
+            (&mut b4, &mut [][..], t4),
+        ] {
+            self.rest(bits, groups.as_flattened_mut());
+            self.rest(bits, tail);
+            if !bits.finished() {
+                return Err(Corrupt::Huffman);
+            }
         }
         Ok(())
     }
@@ -235,23 +309,13 @@ impl Huffman {
         if segment.checked_mul(3).is_none_or(|three| three > out.len()) {
             return Err(Corrupt::Huffman);
         }
-        let mut input = rest;
-        let mut output = &mut *out;
-        for len in [Some(s1), Some(s2), Some(s3), None] {
-            let (stream, tail) = match len {
-                Some(n) => input.split_at_checked(n).ok_or(Corrupt::Huffman)?,
-                None => (input, &[][..]),
-            };
-            let take = if len.is_some() {
-                segment.min(output.len())
-            } else {
-                output.len()
-            };
-            let (part, after) = output.split_at_mut(take);
-            self.stream(stream, part)?;
-            input = tail;
-            output = after;
-        }
+        let (in1, rest) = rest.split_at_checked(s1).ok_or(Corrupt::Huffman)?;
+        let (in2, rest) = rest.split_at_checked(s2).ok_or(Corrupt::Huffman)?;
+        let (in3, in4) = rest.split_at_checked(s3).ok_or(Corrupt::Huffman)?;
+        let (out1, rest) = out.split_at_mut_checked(segment).ok_or(Corrupt::Huffman)?;
+        let (out2, rest) = rest.split_at_mut_checked(segment).ok_or(Corrupt::Huffman)?;
+        let (out3, out4) = rest.split_at_mut_checked(segment).ok_or(Corrupt::Huffman)?;
+        self.four_streams([in1, in2, in3, in4], [out1, out2, out3, out4])?;
         Ok(())
     }
 }

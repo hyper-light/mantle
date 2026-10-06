@@ -394,7 +394,8 @@ pub(super) fn table_log(total: usize, max_symbol: usize, max_log: u32) -> u32 {
 
 /// Scales `counts` (each symbol's occurrences, `total` in all) to a distribution summing to
 /// `1 << log` in which every present symbol keeps at least one cell: each its rounded share,
-/// the rounding's error then taken from or given to the largest. Symbols too rare for a full
+/// the rounding's error then taken from or given to the largest, or past half of the largest's
+/// share spread by [`by_remainders`]. Symbols too rare for a full
 /// cell keep one (the format's "less than 1", -1, is an encoding choice this does not make).
 pub(super) fn normalize<'a>(
     counts: &[u32],
@@ -428,12 +429,98 @@ pub(super) fn normalize<'a>(
     }
     let fix = size.saturating_sub(sum);
     let slot = out.get_mut(largest).ok_or(Corrupt::Distribution)?;
-    let fixed = i64::from(*slot).saturating_add(fix);
-    if fixed < 1 {
-        // The present symbols need more cells than the table has: the caller's log is too small.
+    let share = i64::from(*slot);
+    // The largest absorbs the rounding unless the cells to give back reach half its share: many
+    // rare symbols each kept at one cell can ask more than it holds. The reference then turns to
+    // a second method (`FSE_normalizeCount`'s test, `-correction >= normalizedCounter[largest] >> 1`,
+    // falling to `FSE_normalizeM2`); here that is the largest remainders' distribution.
+    if fix >= 0 || fix.saturating_neg() < share >> 1 {
+        *slot = i16::try_from(share.saturating_add(fix)).map_err(|_| Corrupt::Distribution)?;
+        return out.get(..counts.len()).ok_or(Corrupt::Distribution);
+    }
+    by_remainders(counts, total, size, out)
+}
+
+/// [`normalize`]'s second method: each present symbol its share rounded down, at least one cell;
+/// the cells left over go one each to the symbols whose shares lost the most to the rounding, and
+/// cells owed are taken one each from those that lost the least and hold more than one, until the
+/// distribution sums to `size`. Exact in integers, so every host normalizes alike; refused only
+/// when the present symbols outnumber the cells.
+fn by_remainders<'a>(
+    counts: &[u32],
+    total: i64,
+    size: i64,
+    out: &'a mut [i16; SYMBOLS_MAX],
+) -> Result<&'a [i16], Corrupt> {
+    let mut remainder = [0i64; SYMBOLS_MAX];
+    let mut order = [0u8; SYMBOLS_MAX];
+    let mut present = 0usize;
+    let mut sum = 0i64;
+    for (s, ((&c, slot), r)) in counts
+        .iter()
+        .zip(out.iter_mut())
+        .zip(remainder.iter_mut())
+        .enumerate()
+    {
+        *slot = 0;
+        if c == 0 {
+            continue;
+        }
+        let scaled = i64::from(c).saturating_mul(size);
+        let share = scaled
+            .checked_div(total)
+            .ok_or(Corrupt::Distribution)?
+            .max(1);
+        *r = scaled.checked_rem(total).ok_or(Corrupt::Distribution)?;
+        *slot = i16::try_from(share).map_err(|_| Corrupt::Distribution)?;
+        sum = sum.saturating_add(share);
+        *order.get_mut(present).ok_or(Corrupt::Distribution)? =
+            u8::try_from(s).map_err(|_| Corrupt::Distribution)?;
+        present = present.saturating_add(1);
+    }
+    if i64::try_from(present).map_err(|_| Corrupt::Distribution)? > size {
         return Err(Corrupt::Distribution);
     }
-    *slot = i16::try_from(fixed).map_err(|_| Corrupt::Distribution)?;
+    let order = order.get_mut(..present).ok_or(Corrupt::Distribution)?;
+    // Largest remainder first, the larger count on a tie, then the lower symbol.
+    let key = |s: u8| {
+        let i = usize::from(s);
+        (
+            std::cmp::Reverse(remainder.get(i).copied().unwrap_or(0)),
+            std::cmp::Reverse(counts.get(i).copied().unwrap_or(0)),
+            s,
+        )
+    };
+    order.sort_unstable_by_key(|&s| key(s));
+    // Each floor loses less than a cell, so one pass gives what is left over.
+    for &s in order.iter() {
+        if sum >= size {
+            break;
+        }
+        let slot = out.get_mut(usize::from(s)).ok_or(Corrupt::Distribution)?;
+        *slot = slot.checked_add(1).ok_or(Corrupt::Distribution)?;
+        sum = sum.saturating_add(1);
+    }
+    // Cells owed (the one-cell minimums) come from the symbols that lost the least, a cell a
+    // pass while any holds more than one; the present symbols fit the table, so each pass takes
+    // at least one and at most `size` passes run.
+    let mut passes = size;
+    while sum > size && passes > 0 {
+        passes = passes.saturating_sub(1);
+        for &s in order.iter().rev() {
+            if sum <= size {
+                break;
+            }
+            let slot = out.get_mut(usize::from(s)).ok_or(Corrupt::Distribution)?;
+            if *slot > 1 {
+                *slot = slot.saturating_sub(1);
+                sum = sum.saturating_sub(1);
+            }
+        }
+    }
+    if sum != size {
+        return Err(Corrupt::Distribution);
+    }
     out.get(..counts.len()).ok_or(Corrupt::Distribution)
 }
 
@@ -657,5 +744,45 @@ impl EncodeState {
     /// Writes the final state, which the decoder reads first (`FSE_flushCState`).
     pub(super) fn flush(self, table: &EncodeTable, w: &mut Writer<'_>) {
         w.add(u64::from(self.value), table.accuracy_log);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    proptest::proptest! {
+        /// Any counts normalize, at the log `table_log` picks, to a distribution summing to the
+        /// table's size with a cell or more for every present symbol and none for an absent one:
+        /// flat counts over many symbols included, where the largest alone cannot absorb the
+        /// rounding.
+        #[test]
+        fn every_distribution_normalizes_completely(
+            counts in proptest::collection::vec(
+                proptest::prop_oneof![proptest::strategy::Just(0u32), 1u32..4, 1u32..100_000],
+                2..=SYMBOLS_MAX,
+            ),
+            max_log in MIN_ACCURACY_LOG..=9u32,
+        ) {
+            let total: u32 = counts.iter().sum();
+            let Some(max_symbol) = counts.iter().rposition(|&c| c > 0) else {
+                return Ok(());
+            };
+            let present = counts.iter().filter(|&&c| c > 0).count();
+            let log = table_log(total as usize, max_symbol, max_log);
+            let counts = &counts[..=max_symbol];
+            let mut out = [0i16; SYMBOLS_MAX];
+            let normalized = normalize(counts, total, log, &mut out);
+            if present > 1 << log {
+                proptest::prop_assert!(normalized.is_err());
+                return Ok(());
+            }
+            let norm = normalized.unwrap();
+            proptest::prop_assert_eq!(norm.iter().map(|&n| i64::from(n)).sum::<i64>(), 1i64 << log);
+            for (&c, &n) in counts.iter().zip(norm) {
+                proptest::prop_assert_eq!(c == 0, n == 0);
+                proptest::prop_assert!(n >= 0);
+            }
+        }
     }
 }

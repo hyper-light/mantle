@@ -8,8 +8,8 @@
 // of 16 and delta encoding, as FlushBlockBySizePolicy cuts them (deviation 10). Keys are
 // 16-byte user keys in order with an 8-byte trailer, values 100 bytes: db_bench's defaults.
 // `index` 0 is binary search (RocksDB's default), 1 adds the data block hash index.
-// Workloads, after building every block (not timed), each reading blocks as RocksDB's table
-// reader does:
+// Workloads: `build`, every entry added and every block cut as a flush adds them, then each
+// read of the blocks as RocksDB's table reader does:
 //   scan: SeekToFirst then Next over every entry of every block, one iterator object reused
 //         from block to block (BlockBasedTableIterator's block_iter_)
 //   seek: Seek to every key, in a SplitMix64 permutation, in the block that holds it, the same
@@ -119,11 +119,15 @@ int main(int argc, char** argv) {
   std::vector<uint32_t> where(n);
   std::vector<std::string> storage;
   storage.reserve(n / 8 + 1);
+  blocks.reserve(n / 8 + 1);
   {
     BlockBuilder b(kRestart, true, false,
                    hash ? BlockBasedTableOptions::kDataBlockBinaryAndHash
                         : BlockBasedTableOptions::kDataBlockBinarySearch);
     const size_t limit = (kBlockSize * (100 - kDeviation) + 99) / 100;
+    size_t ba0 = g_allocs;
+    long bf0 = Faults();
+    double bt0 = Now();
     auto cut = [&]() {
       storage.push_back(b.Finish().ToString());
       blocks.push_back(std::make_unique<Block>(BlockContents(Slice(storage.back())), 0,
@@ -143,6 +147,9 @@ int main(int argc, char** argv) {
       where[i] = static_cast<uint32_t>(blocks.size());
     }
     cut();
+    double bt1 = Now();
+    printf("build %d %zu %zu %.2f %zu 0 %ld %zu\n", hash, kKey, n, (bt1 - bt0) / n, g_allocs - ba0,
+           Faults() - bf0, blocks.size());
   }
   std::vector<size_t> order(n);
   for (size_t i = 0; i < n; ++i) order[i] = i;

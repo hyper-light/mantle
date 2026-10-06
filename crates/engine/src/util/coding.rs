@@ -156,6 +156,31 @@ pub fn put_varint32(dst: &mut Vec<u8>, value: u32) {
     dst.extend_from_slice(encode_varint32(value).as_bytes());
 }
 
+/// `PutVarint32Varint32Varint32` [R util/coding.h:163-172], for up to four values: encoded on the
+/// stack and appended at once, one byte each when every value is below 128.
+#[inline]
+pub fn put_varint32s(dst: &mut Vec<u8>, values: &[u32]) {
+    if values.iter().all(|&v| v <= u32::from(PAYLOAD)) {
+        let mut small = [0u8; 4];
+        for (slot, &v) in small.iter_mut().zip(values) {
+            *slot = low_byte(u64::from(v));
+        }
+        dst.extend_from_slice(small.get(..values.len()).unwrap_or_default());
+        return;
+    }
+    let mut bytes = [0u8; 4 * MAX_VARINT32_LENGTH];
+    let mut len = 0usize;
+    for &v in values {
+        let encoded = encode_varint32(v);
+        let e = encoded.as_bytes();
+        if let Some(slot) = bytes.get_mut(len..len.saturating_add(e.len())) {
+            slot.copy_from_slice(e);
+            len = len.saturating_add(e.len());
+        }
+    }
+    dst.extend_from_slice(bytes.get(..len).unwrap_or_default());
+}
+
 /// `PutVarint64` [R util/coding.h:174-178].
 pub fn put_varint64(dst: &mut Vec<u8>, value: u64) {
     dst.extend_from_slice(encode_varint64(value).as_bytes());

@@ -2,7 +2,7 @@
 //!
 //! `cargo bench -p mantle-engine --bench block_read -- N index key` builds the blocks the C++ side
 //! builds, byte for byte, and runs its workloads once each: `scan` (every entry of every block),
-//! `seek` (every key, in a SplitMix64 permutation, in the block that holds it) and `get` (the
+//! after `build` (every entry added and every block cut, as a flush adds them), `seek` (every key, in a SplitMix64 permutation, in the block that holds it) and `get` (the
 //! same through `seek_for_get`), each handing one iterator's buffers to the next as the port's
 //! table reader will. It prints `workload index key N ns_per_op allocations reallocations
 //! minor_faults checksum` as the C++ does, then each workload's
@@ -82,7 +82,8 @@ fn main() {
     let mut rng = SplitMix64(0x62_6c6f_636b);
     let keys: Vec<Vec<u8>> = (0..n as u64).map(|i| key(i * 7, key_len)).collect();
     let mut value = vec![0u8; VALUE];
-    let mut blocks = Vec::new();
+    // As many blocks as the C++ side reserves room for, so neither counts its list's growth.
+    let mut blocks = Vec::with_capacity(n / 8 + 1);
     let mut where_ = vec![0u32; n];
     let options = BlockBuilderOptions {
         restart_interval: RESTART,
@@ -95,6 +96,8 @@ fn main() {
     };
     let mut b = BlockBuilder::new(options).unwrap();
     let limit = (BLOCK_SIZE * (100 - DEVIATION)).div_ceil(100);
+    let build = mark();
+    let t0 = Instant::now();
     let cut = |b: &mut BlockBuilder, blocks: &mut Vec<Block>| {
         blocks.push(Block::new(b.finish().unwrap().to_vec(), RESTART));
         b.reset();
@@ -115,6 +118,14 @@ fn main() {
         where_[i] = blocks.len() as u32;
     }
     cut(&mut b, &mut blocks);
+    let ns = t0.elapsed().as_nanos() as f64;
+    let c = counts(&build);
+    println!(
+        "build {} {key_len} {n} {:.2} {c} {}",
+        u8::from(hash),
+        ns / n as f64,
+        blocks.len()
+    );
     let mut order: Vec<usize> = (0..n).collect();
     for i in (2..=n).rev() {
         order.swap(i - 1, (rng.next() % i as u64) as usize);

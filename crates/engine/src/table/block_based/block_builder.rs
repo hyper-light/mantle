@@ -22,7 +22,7 @@ use crate::table::block_based::data_block_footer::{DataBlockFooter, DataBlockInd
 use crate::table::block_based::data_block_hash_index::{
     DataBlockHashIndexBuilder, MAX_BLOCK_SIZE_SUPPORTED_BY_HASH_INDEX,
 };
-use crate::util::coding::{put_fixed32, put_varint32, varint_length};
+use crate::util::coding::{put_fixed32, put_varint32s, varint_length};
 
 /// How a block is built: RocksDB's constructor arguments [R block_builder.h:26-33].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -121,8 +121,23 @@ fn size32(n: usize, what: &'static str) -> Result<u32, Error> {
 }
 
 /// `Slice::difference_offset`: the bytes `a` and `b` share at their start.
+#[inline]
 fn difference_offset(a: &[u8], b: &[u8]) -> usize {
-    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+    // Eight bytes at a time: read little-endian, the lowest set bit of the words' difference
+    // lies in the first byte that differs.
+    let (mut x, mut y, mut at) = (a, b, 0usize);
+    while let (Some((xw, xr)), Some((yw, yr))) =
+        (x.split_first_chunk::<8>(), y.split_first_chunk::<8>())
+    {
+        let d = u64::from_le_bytes(*xw) ^ u64::from_le_bytes(*yw);
+        if d != 0 {
+            return at.saturating_add((d.trailing_zeros() / 8) as usize);
+        }
+        at = at.saturating_add(8);
+        x = xr;
+        y = yr;
+    }
+    at.saturating_add(x.iter().zip(y).take_while(|(p, q)| p == q).count())
 }
 
 impl BlockBuilder {
@@ -243,14 +258,15 @@ impl BlockBuilder {
         delta_value: Option<&[u8]>,
         skip_delta_encoding: bool,
     ) -> Result<(), Error> {
-        let last_key = std::mem::take(&mut self.last_key);
+        // The previous key's buffer is lent to `add_impl` and then holds this key, its capacity
+        // kept, as RocksDB's `last_key_.assign` keeps it.
+        let mut last_key = std::mem::take(&mut self.last_key);
         let added = self.add_impl(key, value, &last_key, delta_value, skip_delta_encoding);
         if self.options.use_delta_encoding {
-            self.last_key.clear();
-            self.last_key.extend_from_slice(key);
-        } else {
-            self.last_key = last_key;
+            last_key.clear();
+            last_key.extend_from_slice(key);
         }
+        self.last_key = last_key;
         added
     }
 
@@ -307,14 +323,21 @@ impl BlockBuilder {
         let non_shared = key_len.saturating_sub(shared);
         let restart = self.counter == 0;
         let separated = self.options.use_separated_kv_storage;
-        put_varint32(&mut self.buffer, shared);
-        put_varint32(&mut self.buffer, non_shared);
-        if !self.options.use_value_delta_encoding {
-            put_varint32(&mut self.buffer, value_len);
+        // The header in one append, as RocksDB's `PutVarint32Varint32Varint32` writes it.
+        let mut header = [0u32; 4];
+        let mut fields = 0usize;
+        for (value, present) in [
+            (shared, true),
+            (non_shared, true),
+            (value_len, !self.options.use_value_delta_encoding),
+            (prev_values_size32, separated && restart),
+        ] {
+            if present && let Some(slot) = header.get_mut(fields) {
+                *slot = value;
+                fields = fields.saturating_add(1);
+            }
         }
-        if separated && restart {
-            put_varint32(&mut self.buffer, prev_values_size32);
-        }
+        put_varint32s(&mut self.buffer, header.get(..fields).unwrap_or_default());
         self.buffer
             .extend_from_slice(key.get(shared as usize..).unwrap_or_default());
         let stored_value = if shared != 0 && self.options.use_value_delta_encoding {

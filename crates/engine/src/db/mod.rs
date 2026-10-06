@@ -2,6 +2,7 @@
 
 pub mod blob;
 pub mod dbformat;
+pub mod kv_checksum;
 pub mod log_format;
 pub mod log_reader;
 pub mod log_writer;

@@ -316,3 +316,70 @@ missing predecessors. Every transcript of the 19,102 fixture lines matches.
 **Open.** The WAL benchmark against RocksDB (group commit p50 to p99.99, open loop, under load,
 with CPU, energy and device bytes per committed byte) under hyper-raft's tails rule; and the two
 upstream defects above to report to RocksDB, with the owner's approval.
+
+## 9. P4: blocks and the block-based table (in progress)
+
+**Done so far.**
+- `table/format.rs`: block handles, index values and footers for format_version 2–7. All 512
+  footers RocksDB wrote (`tests/golden/p4_footer.txt`) decode identically. The only difference is
+  that the port names a varint's overflow.
+- `table/block_based/`: the block builder, the data block hash index and footer, and the block
+  reader `block.rs` (`Block`, with one `BlockIter` for data, index and meta blocks).
+  `db/kv_checksum.rs` adds per-entry protection.
+- The builder writes all 256 golden blocks byte for byte (`tests/block_builder_golden.rs`).
+- The reader replays RocksDB's own iterators. `tests/golden/p4_iter_gen.cc` drives RocksDB's
+  `DataBlockIter`, `IndexBlockIter` and `MetaBlockIter` over 192 blocks RocksDB wrote: 64 data, 64
+  index and 64 meta. The blocks cover:
+  - both comparators, separated keys and values, hash indexes, and every protection width;
+  - global sequence numbers, value-delta indexes with and without first keys;
+  - binary, interpolation and uniform-chosen search.
+
+  On each block the port matches RocksDB's checksums and all 64 moves, keys, values and statuses
+  (`tests/block_iter_golden.rs`). Changing the reader's global-sequence or `Prev`-cache handling
+  fails the test.
+- `tests/block_test.rs` ports block_test.cc's reader tests:
+  - `SimpleTest`, `SimpleIndexHash`, `IndexHashWithSharedPrefix`;
+  - `IndexValueEncodingTest` (all 2,304 parameter sets less user timestamps);
+  - both interpolation prefix-boundary tests;
+  - the per-entry checksum tests, including global sequence numbers;
+  - the meta entry corruption tests and the separated-values offset test.
+- The value-corruption tests, which RocksDB drives through a sync point, are unit tests in
+  `block.rs`.
+
+**Where the reader differs from RocksDB, and why.** The bytes read are the same; what the reader
+does with bad or unusual ones is not.
+- *`SeekForGet` on a block with separated keys and values.* RocksDB decides it has run off the
+  block's end by comparing its position with the restart array (block.cc:302). With separated keys
+  and values the keys end at the values section, so that test never holds. RocksDB then compares
+  the last key it read with the target, and for a target past every key returns false. That says
+  the key is in neither this block nor the next, which breaks `SeekForGet`'s contract
+  (block.cc:215-239) and can lose a point lookup whose key opens the next block. The port tests
+  validity instead and returns true
+  (`seek_for_get_past_the_last_key_of_a_separated_block`). The differential leaves `SeekForGet`
+  out on these blocks. This is an upstream defect to report, with the owner's approval.
+- *Entries checked against the block.* RocksDB bounds a key and its inline value inside the block
+  only for meta blocks (`StrictCheck`, block.cc:556). `DecodeEntry` asserts its three header bytes
+  and no longer checks the key's length (block_util.h:28-63). So in a release build a corrupt data
+  or index block is read past its end. The port bounds every entry, key and value, in every block,
+  and ends the iterator with corruption.
+- *Index values.* RocksDB asserts that an index value decodes (block.cc:681, block.h:955). The port
+  ends the iterator with corruption, or returns it from `index_value`.
+- *A separated block with no restart interval.* RocksDB computes `cur_entry_idx_ %
+  block_restart_interval_`, and with no interval given that divides by zero (block.cc:546). The
+  port refuses the block as corrupt.
+- *A corrupt block keeps its error.* RocksDB marks one with size zero and re-decodes the footer
+  later to recover the reason, and it fails a debug check when the fault lay elsewhere
+  (block.cc:1288-1306). The port keeps the error it found.
+- *A protection width RocksDB never writes* (anything but 1, 2, 4 or 8) is `Unsupported`, not
+  undefined behaviour in `Encode`.
+- *A seek target too short to be an internal key*, where interpolation search reads its trailer,
+  is `InvalidArgument`, where RocksDB asserts.
+- *Copies.* As RocksDB pins them, a key stored whole in the block is borrowed from it. Only a key
+  rebuilt from a shared prefix is copied, and the `Prev` cache keeps rebuilt keys in one buffer.
+  The interpolation guess is computed in 128-bit integers on every target, where RocksDB falls
+  back to `double` without them.
+
+**Next in P4.** Compression framing; the index builders and the hash-search prefix index; the
+meta-index and properties blocks; the table builder and reader; `SstFileWriter` and
+`SstFileReader`; the `sst_dump` differential; and the block-read benchmark against RocksDB
+(P15's harness).

@@ -68,7 +68,7 @@ fn step<F: BlockFile>(
     let extent = store.allocate_extent()?;
     let pages = 1 + (step % 3) as u32;
     for p in 0..pages {
-        store.write_page(store.address(extent, p)?, &page_payload(step, p))?;
+        store.queue_page(store.address(extent, p)?, &page_payload(step, p))?;
     }
     let mut next = model.clone();
     next.data.push((extent, pages, step));
@@ -78,7 +78,7 @@ fn step<F: BlockFile>(
     }
     let root_extent = store.allocate_extent()?;
     let root = store.address(root_extent, 0)?;
-    store.write_page(root, &root_payload(&next))?;
+    store.queue_page(root, &root_payload(&next))?;
     if let Some(old_root) = model.root {
         store.release(old_root)?;
     }

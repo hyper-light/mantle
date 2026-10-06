@@ -343,7 +343,7 @@ impl Builder {
         let first = page.key(0).to_vec();
         let total = page.total;
         let address = self.page(store)?;
-        store.write_page(address, &payload)?;
+        store.queue_page(address, &payload)?;
         self.payload = payload;
         if let Some(page) = self.levels.get_mut(level) {
             page.clear();
@@ -373,6 +373,7 @@ impl Builder {
             let top = level.checked_add(1) == Some(self.levels.len());
             let lone = self.levels.get(level).is_some_and(|p| p.len() == 1) && level > 0;
             if top && lone {
+                store.flush_run()?;
                 // The level's single entry names the root: the page below it.
                 let page = self.levels.get(level).ok_or(corrupt(Malformed::TooLarge))?;
                 let root = page

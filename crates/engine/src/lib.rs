@@ -26,6 +26,7 @@ pub mod file;
 pub mod memory;
 pub mod memtable;
 pub mod port;
+pub mod store;
 pub mod table;
 pub mod util;
 pub mod version;

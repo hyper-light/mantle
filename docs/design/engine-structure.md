@@ -144,19 +144,53 @@ Each shard schedules its replicas' flushes and compactions against foreground I/
 
 ## 8. Order of work
 
-Each step is gated, measured against its RocksDB counterpart and landed before the next:
+The structure is research/33 §5's seven parts, each a step below with the evidence it is held to:
+1. shared-nothing key-range shards, a worker each, requests batched per shard (p²KVS);
+2. a log with several group commits in flight (SpanDB), and the log as level 0 (TRIAD);
+3. SplinterDB's size-tiered Bε-tree with maplets, compacted by its shard, the compaction's
+   granularity aligned to the last level (Spooky);
+4. a REMIX view and SuRF range filters for listings;
+5. an F2-style in-place hot region and read cache, S3-FIFO for the caches;
+6. SILK-style scheduling of flush and compaction;
+7. FDP or ZNS lifetime hints where the device has them.
 
-| Step | What | Expected (research/33 §3) |
-|---|---|---|
-| E0 | hyper-log: several group-commit batches in flight, with the stop-at-the-first-hole rule; measured at fdatasync / F_FULLFSYNC | durable put throughput 5–9× on fast devices |
-| E1 | Pages, extents, checksums, superblock and allocator, with crash simulation | correctness base |
-| E2 | Memtable (concurrent B-tree) and branch packing | flush cost |
-| E3 | Trunk, flush-then-compact, bundle compaction on shard tasks | inserts 6–10×, write amplification 2× lower |
-| E4 | Maplets | queries up to 1.8×, space overhead 15–61% (abstract-level evidence) |
-| E5 | REMIX views and a range filter for listings | seeks 1.4–9× |
-| E6 | Scheduling | p99 10–100× under compaction |
-| E7 | Hot region and S3-FIFO cache | hot gets up to about 10× |
-| E8 | Import and export of RocksDB files (§9); range split, snapshot and move | parity with what note 12 required of RocksDB |
+Each step is gated, measured against its RocksDB counterpart under load with durable commit on
+both sides, and landed before the next:
+
+| Step | What | Part | Expected (research/33 §3) |
+|---|---|---|---|
+| E0 | hyper-log: several group-commit frames in flight, the stop-at-the-first-hole rule; measured at fdatasync / F_FULLFSYNC per device class | 2 | durable put throughput 5–9× on devices whose writes complete durably in parallel; none on a flush-bound device (measured on Apple's SSD, research/log-pipeline.md §5) |
+| E1 | Pages, extents, checksums, the double superblock and the persisted allocator, with crash simulation (§3, §7; `crates/engine/src/store`) | 3 | correctness base |
+| E2 | Shards: a range replica's engine on one hyper-rt shard, its requests batched, no state shared across shards | 1 | writes up to 4.6×, reads up to 5.4× (p²KVS, asynchronous log there; measured here with the durable one) |
+| E3 | Memtable (concurrent B-tree) and branch packing | 3 | flush cost |
+| E4 | Trunk, flush-then-compact, bundle compaction on the shard's tasks, granularity aligned to the last level | 3 | inserts 6–10×, write amplification 2× lower (SplinterDB); total write amplification with the device's GC about 2.5× lower (Spooky) |
+| E5 | Maplets | 3 | queries up to 1.8×, space overhead 15–61% (abstract-level evidence) |
+| E6 | REMIX views and SuRF range filters for listings | 4 | seeks 1.4–9×, closed seeks up to 5× |
+| E7 | SILK scheduling | 6 | p99 10–100× under compaction |
+| E8 | Hot region and S3-FIFO caches | 5 | hot gets up to about 10× |
+| E9 | The log as level 0, if the Raft log's ownership of entries allows it (§10) | 2 | throughput up to 2.9×, write amplification up to 4× lower (TRIAD) |
+| E10 | FDP placement hints, ZNS zones, where the device reports them (CLAUDE.md §5) | 7 | device write amplification about 1 (FDP); p99.9 reads 2–4× lower (ZNS) |
+| E11 | Import and export of RocksDB files (§9); range split, snapshot and move | — | parity with what note 12 required of RocksDB |
+
+### E1 as built
+
+- **Page** (`store/page.rs`): a 20-byte header (CRC-32C, kind, format, payload length, the
+  checkpoint generation), then the payload, zeros to the page's end. The CRC covers bytes 4 on
+  and then the page's address, so a misdirected read fails as corruption does.
+- **Superblock** (`store/superblock.rs`): copies at pages 0 and 1, generation `g` at `g mod 2`;
+  the payload names the page and extent size, generation, applied index, root, the extents the
+  file holds and the extents of the allocator map. Open takes the newest copy that verifies and
+  whose slot matches its generation.
+- **Allocator** (`store/alloc.rs`): a reference count an extent, persisted copy-on-write with
+  each checkpoint. An extent whose count reaches zero is reused only once a checkpoint that does
+  not name it is durable; the old map is released before the new counts are written, so the
+  counts persisted never hold it.
+- **Proof** (`tests/store_crash.rs`): power is cut after every write and flush of a workload of
+  checkpoints, each crash losing all, none, or a random half of the unflushed sectors. Recovery
+  always lands on the last acknowledged checkpoint or the one in flight, every page it names
+  reads back exactly, the allocator holds exactly what it names, and the store goes on from it.
+  Removing the deferred free, the flush before the superblock, or the old map's early release
+  each makes the test fail.
 
 ## 9. RocksDB's format
 
@@ -174,6 +208,6 @@ longer read them, and that was the owner's trade.
 - `F`, `m`, the maplet width, the page and extent sizes.
 - The hot region's size and admission rule.
 - Whether the log serves as level 0 (TRIAD, research/33 row 6), given the Raft log's ownership of
-  entries.
+  entries: step E9 decides it.
 - Range split and move over a copy-on-write trunk: by references, exported as branches.
 - The space-amplification bound, which no source gives (research/34 §1).

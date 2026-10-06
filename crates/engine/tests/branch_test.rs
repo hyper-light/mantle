@@ -162,3 +162,97 @@ fn a_large_branch_is_a_shallow_tree_of_dense_pages() {
     );
     assert!(branch.height <= 4);
 }
+
+mod cursor_and_merge {
+    use super::*;
+    use mantle_engine::branch::merge::{Merge, compact};
+
+    fn scan(s: &mut Store<SimFile>, branch: &Branch, from: &[u8]) -> Vec<(Vec<u8>, Op, Vec<u8>)> {
+        let mut c = branch.seek(s, from).unwrap();
+        let mut out = Vec::new();
+        while c.valid() {
+            out.push((c.key().to_vec(), c.op(), c.value().to_vec()));
+            c.next(s).unwrap();
+        }
+        out
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
+
+        /// A seek from any key and the walk after it give exactly the entries at or after it.
+        #[test]
+        fn a_cursor_gives_every_entry_from_its_key_in_order(
+            keys in proptest::collection::btree_set(object_key(), 1..2500),
+            from in object_key(),
+            seed in any::<u64>(),
+        ) {
+            let entries: BTreeMap<Vec<u8>, (Op, Vec<u8>)> = keys
+                .iter()
+                .enumerate()
+                .map(|(i, k)| (k.clone(), (Op::Put, vec![(i % 251) as u8; i % 40])))
+                .collect();
+            let mut s = store(seed);
+            let branch = build(&mut s, &entries);
+            let expected: Vec<_> = entries
+                .range(from.clone()..)
+                .map(|(k, (op, v))| (k.clone(), *op, v.clone()))
+                .collect();
+            prop_assert_eq!(scan(&mut s, &branch, &from), expected);
+            let all: Vec<_> = entries.iter().map(|(k, (op, v))| (k.clone(), *op, v.clone())).collect();
+            prop_assert_eq!(scan(&mut s, &branch, b""), all);
+        }
+
+        /// Overlapping branches of puts and tombstones merge to the newest entry of each key over
+        /// any range, and a compaction keeps exactly that, tombstones dropped only when asked.
+        #[test]
+        fn merged_branches_give_the_newest_entry_of_each_key(
+            layers in proptest::collection::vec(
+                proptest::collection::btree_map(0u16..600, (any::<bool>(), 0u8..255), 1..300),
+                1..6,
+            ),
+            lo in 0u16..600,
+            span in 1u16..600,
+            seed in any::<u64>(),
+        ) {
+            let key = |k: u16| format!("bucket/key-{k:05}").into_bytes();
+            let mut s = store(seed);
+            // Layers oldest first; branches handed to the merge newest first.
+            let mut branches = Vec::new();
+            let mut oracle: BTreeMap<Vec<u8>, (Op, Vec<u8>)> = BTreeMap::new();
+            for layer in &layers {
+                let entries: BTreeMap<Vec<u8>, (Op, Vec<u8>)> = layer
+                    .iter()
+                    .map(|(&k, &(put, v))| {
+                        let op = if put { Op::Put } else { Op::Delete };
+                        (key(k), (op, if put { vec![v; 5] } else { Vec::new() }))
+                    })
+                    .collect();
+                for (k, e) in &entries {
+                    oracle.insert(k.clone(), e.clone());
+                }
+                branches.push(build(&mut s, &entries));
+            }
+            branches.reverse();
+            let (from, end) = (key(lo), key(lo.saturating_add(span)));
+            let expected: Vec<(Vec<u8>, Op, Vec<u8>)> = oracle
+                .range(from.clone()..end.clone())
+                .map(|(k, (op, v))| (k.clone(), *op, v.clone()))
+                .collect();
+            let mut merge = Merge::new(&mut s, &branches, &from, Some(&end)).unwrap();
+            let mut got = Vec::new();
+            while let Some((k, op, v)) = merge.entry() {
+                got.push((k.to_vec(), op, v.to_vec()));
+                merge.next(&mut s).unwrap();
+            }
+            prop_assert_eq!(&got, &expected);
+            for drop in [false, true] {
+                let kept: Vec<_> = expected.iter().filter(|e| !(drop && e.1 == Op::Delete)).cloned().collect();
+                match compact(&mut s, &branches, &from, Some(&end), drop).unwrap() {
+                    None => prop_assert!(kept.is_empty()),
+                    Some(b) => prop_assert_eq!(scan(&mut s, &b, b""), kept),
+                }
+            }
+        }
+    }
+}

@@ -20,6 +20,8 @@
 //! one the page's first and last keys share, which, the keys being sorted, every key between them
 //! shares: object-store keys are paths, and their shared prefixes are most of each key.
 
+pub mod merge;
+
 use crate::error::{Error, Malformed};
 use crate::store::Store;
 use hyper_block::block::BlockFile;
@@ -535,5 +537,154 @@ impl Branch {
             return Ok(Some(op));
         }
         Err(corrupt(Malformed::CountMismatch))
+    }
+}
+
+/// A forward cursor over a branch's entries in key order, from a start key: the pages from the
+/// root to the current leaf and the entry it is at in each, at most the branch's height of
+/// pages held.
+#[derive(Debug)]
+pub struct Cursor {
+    path: Vec<(Vec<u8>, usize)>,
+    key: Vec<u8>,
+    value: Vec<u8>,
+    op: Op,
+    valid: bool,
+}
+
+fn child_of(rest: &[u8]) -> Result<u64, Error> {
+    rest.first_chunk::<8>()
+        .map(|b| u64::from_le_bytes(*b))
+        .ok_or(corrupt(Malformed::Truncated))
+}
+
+impl Branch {
+    /// A cursor at the first entry whose key is at least `from`.
+    pub fn seek<F: BlockFile>(&self, store: &mut Store<F>, from: &[u8]) -> Result<Cursor, Error> {
+        let mut cursor = Cursor {
+            path: Vec::with_capacity(usize::from(self.height).saturating_add(1)),
+            key: Vec::new(),
+            value: Vec::new(),
+            op: Op::Put,
+            valid: false,
+        };
+        let mut address = self.root;
+        for _ in 0..=self.height {
+            let mut page = Vec::new();
+            store.read_page(address, &mut page)?;
+            let view = View::new(&page)?;
+            let floor = view.floor(from)?;
+            if view.kind == INDEX {
+                let i = floor.unwrap_or(0);
+                address = child_of(view.entry(i)?.1)?;
+                cursor.path.push((page, i));
+                continue;
+            }
+            // The first entry at least `from`: the floor if it equals it, else the one after.
+            let i = match floor {
+                Some(i) if view.compare(from, i)? == Ordering::Equal => i,
+                Some(i) => i.saturating_add(1),
+                None => 0,
+            };
+            let past = i >= view.n;
+            cursor.path.push((page, i));
+            if past {
+                cursor.advance_leaf(store)?;
+            } else {
+                cursor.load()?;
+            }
+            return Ok(cursor);
+        }
+        Err(corrupt(Malformed::CountMismatch))
+    }
+}
+
+impl Cursor {
+    /// Whether the cursor is at an entry.
+    pub fn valid(&self) -> bool {
+        self.valid
+    }
+
+    /// The entry's key.
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    /// The entry's operation.
+    pub fn op(&self) -> Op {
+        self.op
+    }
+
+    /// The entry's value.
+    pub fn value(&self) -> &[u8] {
+        &self.value
+    }
+
+    /// Loads the entry the leaf at the path's end is at.
+    fn load(&mut self) -> Result<(), Error> {
+        let (page, i) = self.path.last().ok_or(corrupt(Malformed::Truncated))?;
+        let view = View::new(page)?;
+        let (suffix, rest) = view.entry(*i)?;
+        self.key.clear();
+        self.key.extend_from_slice(view.prefix);
+        self.key.extend_from_slice(suffix);
+        self.op =
+            rest.first()
+                .and_then(|&b| Op::from_byte(b))
+                .ok_or(corrupt(Malformed::UnknownTag(
+                    rest.first().copied().unwrap_or(0),
+                )))?;
+        self.value.clear();
+        self.value
+            .extend_from_slice(rest.get(3..).ok_or(corrupt(Malformed::Truncated))?);
+        self.valid = true;
+        Ok(())
+    }
+
+    /// Moves to the next entry.
+    pub fn next<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
+        if !self.valid {
+            return Ok(());
+        }
+        let (page, i) = self.path.last_mut().ok_or(corrupt(Malformed::Truncated))?;
+        *i = i.saturating_add(1);
+        if *i < View::new(page)?.n {
+            return self.load();
+        }
+        self.advance_leaf(store)
+    }
+
+    /// The leaf at the path's end is used up: up to the nearest index page with an entry left,
+    /// then down its next child's leftmost path. The end of the branch leaves the cursor
+    /// invalid.
+    fn advance_leaf<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
+        self.path.pop();
+        loop {
+            let Some((page, i)) = self.path.last_mut() else {
+                self.valid = false;
+                return Ok(());
+            };
+            *i = i.saturating_add(1);
+            let view = View::new(page)?;
+            if *i >= view.n {
+                self.path.pop();
+                continue;
+            }
+            let mut address = child_of(view.entry(*i)?.1)?;
+            // Down the leftmost path to a leaf.
+            loop {
+                let mut page = Vec::new();
+                store.read_page(address, &mut page)?;
+                let view = View::new(&page)?;
+                let kind = view.kind;
+                if kind == INDEX {
+                    address = child_of(view.entry(0)?.1)?;
+                }
+                self.path.push((page, 0));
+                if kind == LEAF {
+                    return self.load();
+                }
+            }
+        }
     }
 }

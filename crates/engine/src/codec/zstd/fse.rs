@@ -247,11 +247,13 @@ impl State {
         table.at(self.value).symbol
     }
 
+    /// Steps to the next state, its bits read without a refill: a [`Backward::reload`] or
+    /// [`Backward::ensure`] since must cover them.
     #[inline(always)]
-    pub(super) fn update(&mut self, table: &Table, bits: &mut Backward<'_>) {
+    pub(super) fn update_ensured(&mut self, table: &Table, bits: &mut Backward<'_>) {
         let cell = table.at(self.value);
         // A baseline is below 2^9 and the bits read below 2^9 (§4.1).
-        self.value = u32::from(cell.baseline).wrapping_add(bits.read(u32::from(cell.bits)));
+        self.value = u32::from(cell.baseline).wrapping_add(bits.read_ensured(u32::from(cell.bits)));
     }
 }
 

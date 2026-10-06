@@ -97,12 +97,29 @@ impl Huffman {
         // One pass counts the literals of each weight and finds the largest. Indexes are masked
         // to the counts' sixteen slots, so the pass has no bounds test and no branch; a weight
         // past `MAX_BITS` is refused after it, before any count is used.
-        let mut counts = [0usize; 16];
+        // Four count tables, a weight to each in turn, so a run of equal weights is not one chain
+        // of increments through one slot (`HIST_count_parallel_wksp`'s four tables), summed after.
+        let mut lanes = [[0usize; 16]; 4];
         let mut largest = 0u8;
-        for &w in weights {
+        let (fours, rest) = weights.as_chunks::<4>();
+        for four in fours {
+            for (lane, &w) in lanes.iter_mut().zip(four) {
+                largest = largest.max(w);
+                if let Some(c) = lane.get_mut(usize::from(w & 15)) {
+                    *c = c.wrapping_add(1);
+                }
+            }
+        }
+        for (lane, &w) in lanes.iter_mut().zip(rest) {
             largest = largest.max(w);
-            if let Some(c) = counts.get_mut(usize::from(w & 15)) {
+            if let Some(c) = lane.get_mut(usize::from(w & 15)) {
                 *c = c.wrapping_add(1);
+            }
+        }
+        let mut counts = [0usize; 16];
+        for lane in &lanes {
+            for (c, &l) in counts.iter_mut().zip(lane) {
+                *c = c.wrapping_add(l);
             }
         }
         if u32::from(largest) > MAX_BITS {
@@ -565,6 +582,10 @@ fn fse_weights(
         Ok(())
     };
     'decode: loop {
+        // A pair of weights reads at most 2 × 6 bits, and a reload leaves at least 57 unless the
+        // word starts at the stream's first byte, where reads past it still count down to the
+        // overflow that ends the loop: one reload a pair, no test a weight.
+        bits.reload();
         for i in 0..2 {
             // One weight short of the most, so the other state's last symbol still fits.
             if count >= MAX_WEIGHTS.saturating_sub(1) {
@@ -572,7 +593,7 @@ fn fse_weights(
             }
             let state = states.get_mut(i).ok_or(Corrupt::Huffman)?;
             push(&mut count, state.symbol(table))?;
-            state.update(table, &mut bits);
+            state.update_ensured(table, &mut bits);
             if bits.overflowed() {
                 // The other state's symbol is the last.
                 let other = states.get(i ^ 1).ok_or(Corrupt::Huffman)?;

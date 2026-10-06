@@ -75,6 +75,8 @@ fn main() {
     let key_len: usize = args.get(3).map_or(16, |a| a.parse().unwrap());
     // Passes over each workload, for profiling one long enough to sample; times are per pass.
     let passes: usize = args.get(4).map_or(1, |a| a.parse().unwrap());
+    // `scan` stops after the scan, to profile or compare it alone.
+    let scan_only = args.get(5).is_some_and(|a| a == "scan");
     let mut rng = SplitMix64(0x62_6c6f_636b);
     let keys: Vec<Vec<u8>> = (0..n as u64).map(|i| key(i * 7, key_len)).collect();
     let mut value = vec![0u8; VALUE];
@@ -144,6 +146,9 @@ fn main() {
     );
 
     sum = 0;
+    if scan_only {
+        return;
+    }
     let m = mark();
     let t0 = Instant::now();
     for &i in std::iter::repeat_n(&order, passes).flatten() {

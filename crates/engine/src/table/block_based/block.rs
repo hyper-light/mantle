@@ -202,6 +202,8 @@ impl Block {
             kv_checksum: &self.kv_checksum,
             protection_bytes_per_key: self.protection_bytes_per_key,
             live: true,
+            plain: global_seqno == DISABLE_GLOBAL_SEQUENCE_NUMBER
+                && self.protection_bytes_per_key == 0,
         }
     }
 
@@ -519,6 +521,7 @@ impl RawKey {
         self.owned.clear();
     }
 
+    #[inline]
     fn get<'d>(&'d self, data: &'d [u8]) -> &'d [u8] {
         match self.borrowed {
             Some((start, len)) => slice(data, start, len),
@@ -526,11 +529,13 @@ impl RawKey {
         }
     }
 
+    #[inline]
     fn set_borrowed(&mut self, start: u32, len: u32) {
         self.borrowed = Some((start, len));
     }
 
     /// `TrimAppend`: the first `shared` bytes of the current key and then `non_shared`.
+    #[inline]
     fn trim_append(&mut self, data: &[u8], shared: usize, non_shared: &[u8]) -> bool {
         if let Some((start, len)) = self.borrowed.take() {
             // Only the shared bytes of a key in the block are copied, as `TrimAppend` does.
@@ -572,6 +577,7 @@ fn tail(key: &[u8], shared: usize) -> &[u8] {
 }
 
 /// `data[start..start + len]`, or nothing where that does not lie in `data`.
+#[inline]
 fn slice(data: &[u8], start: u32, len: u32) -> &[u8] {
     let start = start as usize;
     start
@@ -612,13 +618,17 @@ struct Core<'a> {
     protection_bytes_per_key: u8,
     /// False for an iterator made ended (RocksDB's null `data_`).
     live: bool,
+    /// No global sequence number to put in place and no per-entry checksums to verify.
+    plain: bool,
 }
 
 impl Core<'_> {
+    #[inline]
     fn valid(&self) -> bool {
         self.current < self.keys_end
     }
 
+    #[inline]
     fn next_entry_offset(&self) -> u32 {
         self.entry.0.saturating_add(self.entry.1)
     }
@@ -657,6 +667,7 @@ impl Core<'_> {
     /// entries that store their value's length, `strict` for meta blocks, whose entries RocksDB
     /// checks against the block. Returns whether an entry was read, and whether its key shares
     /// bytes with the previous one.
+    #[inline]
     fn parse_next_key<const WITH_LENGTH: bool, const STRICT: bool>(&mut self) -> Option<bool> {
         self.current = self.next_entry_offset();
         self.cur_entry_idx = self.cur_entry_idx.saturating_add(1);
@@ -757,6 +768,7 @@ impl Core<'_> {
         Some(is_shared)
     }
 
+    #[inline]
     fn raw_key(&self) -> &[u8] {
         self.raw_key.get(self.data)
     }
@@ -1029,7 +1041,13 @@ impl Core<'_> {
 
     /// `UpdateKey` [R block.h:635-666]: the key callers see, with the global sequence number in
     /// place, and the entry's checksum verified.
+    #[inline]
     fn update_key(&mut self) {
+        // With no global sequence number and no per-entry checksums, the key read is the key
+        // returned, and nothing is checked: decided once, when the iterator is made.
+        if self.plain {
+            return;
+        }
         self.key_buf.clear();
         self.key_from_buf = false;
         if !self.valid() {
@@ -1066,6 +1084,7 @@ impl Core<'_> {
         }
     }
 
+    #[inline]
     fn key(&self) -> &[u8] {
         if self.key_from_buf {
             &self.key_buf
@@ -1181,6 +1200,7 @@ impl<'a> BlockIter<'a> {
     }
 
     /// `key`: the current key, with the global sequence number in place.
+    #[inline]
     pub fn key(&self) -> &[u8] {
         self.core.key()
     }
@@ -1197,6 +1217,7 @@ impl<'a> BlockIter<'a> {
     }
 
     /// `value`: the current value; for an index block, the value as stored.
+    #[inline]
     pub fn value(&self) -> &[u8] {
         slice(self.core.data, self.core.value.0, self.core.value.1)
     }
@@ -1263,6 +1284,7 @@ impl<'a> BlockIter<'a> {
     }
 
     /// `Next`.
+    #[inline]
     pub fn next(&mut self) {
         let _ = self.next_impl();
         self.core.update_key();
@@ -1377,6 +1399,7 @@ impl<'a> BlockIter<'a> {
         true
     }
 
+    #[inline]
     fn parse_next_data_key(&mut self) -> Option<bool> {
         self.core.parse_next_key::<true, false>()
     }
@@ -1450,6 +1473,7 @@ impl<'a> BlockIter<'a> {
     }
 
     /// `NextImpl`: whether an entry was read.
+    #[inline]
     fn next_impl(&mut self) -> bool {
         match self.kind {
             Kind::Data(_) => self.parse_next_data_key().is_some(),

@@ -7,6 +7,30 @@
 
 use std::cmp::Ordering;
 
+/// `memcmp` then length: the order of `[u8]`, compared eight bytes at a time as big-endian
+/// words, whose order is the bytes' order, so that a key compare is a few loads inline rather
+/// than a call to the platform's `memcmp`.
+#[inline]
+pub fn bytewise(a: &[u8], b: &[u8]) -> Ordering {
+    let (mut x, mut y) = (a, b);
+    while let (Some((xw, xr)), Some((yw, yr))) =
+        (x.split_first_chunk::<8>(), y.split_first_chunk::<8>())
+    {
+        let (u, v) = (u64::from_be_bytes(*xw), u64::from_be_bytes(*yw));
+        if u != v {
+            return u.cmp(&v);
+        }
+        x = xr;
+        y = yr;
+    }
+    for (p, q) in x.iter().zip(y) {
+        if p != q {
+            return p.cmp(q);
+        }
+    }
+    x.len().cmp(&y.len())
+}
+
 /// A user-key order, by the name RocksDB records in the MANIFEST and OPTIONS files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Comparator {
@@ -38,8 +62,8 @@ impl Comparator {
     #[inline]
     pub fn compare(self, a: &[u8], b: &[u8]) -> Ordering {
         match self {
-            Self::Bytewise => a.cmp(b),
-            Self::ReverseBytewise => b.cmp(a),
+            Self::Bytewise => bytewise(a, b),
+            Self::ReverseBytewise => bytewise(b, a),
         }
     }
 

@@ -26,7 +26,7 @@
 //   clang++ -std=c++20 -O2 -DNDEBUG -march=armv8-a+crc+crypto -I$R -I$R/include \
 //     -DROCKSDB_PLATFORM_POSIX -DROCKSDB_LIB_IO_POSIX -DOS_MACOSX p4_block_bench.cc \
 //     $L/librocksdb.a -o p4_block_bench
-//   ./p4_block_bench N index key [passes]
+//   ./p4_block_bench N index key [passes [scan]]
 #include <sys/resource.h>
 
 #include <chrono>
@@ -105,6 +105,8 @@ int main(int argc, char** argv) {
   if (argc > 3) kKey = std::strtoull(argv[3], nullptr, 10);
   // Passes over each workload, for profiling one long enough to sample; times are per pass.
   size_t passes = argc > 4 ? std::strtoull(argv[4], nullptr, 10) : 1;
+  // `scan` stops after the scan, to profile or compare it alone.
+  bool scan_only = argc > 5 && std::string(argv[5]) == "scan";
   SplitMix64 rng{0x626c6f636b};  // "block"
   std::vector<std::string> keys;
   for (size_t i = 0; i < n; ++i) keys.push_back(Key(i * 7));
@@ -164,6 +166,7 @@ int main(int argc, char** argv) {
   printf("scan %d %zu %zu %.2f %zu 0 %ld %llu\n", hash, kKey, n, (t1 - t0) / entries, a1 - a0, f1 - f0,
          static_cast<unsigned long long>(sum));
 
+  if (scan_only) return 0;
   sum = 0;
   a0 = g_allocs;
   f0 = Faults();

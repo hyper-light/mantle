@@ -345,6 +345,14 @@ upstream defects above to report to RocksDB, with the owner's approval.
   - the meta entry corruption tests and the separated-values offset test.
 - The value-corruption tests, which RocksDB drives through a sync point, are unit tests in
   `block.rs`.
+- `util/block_compression.rs`: blocks' compression framing. It has the varint32 size prefix of
+  `compress_format_version` 2 (Snappy states its own size) and the table builder's keep, reject or
+  bypass rule at `max_compressed_bytes_per_kb`. Reading covers Snappy, zlib (raw, window 2^14), LZ4
+  and LZ4HC, and ZSTD with or without a dictionary. Writing covers Snappy, zlib, LZ4 with or
+  without a dictionary, and ZSTD at any level, with or without its checksum.
+  `tests/block_compression_test.rs` decodes the reference codecs' blocks of the 61-input corpus,
+  framed as RocksDB frames them, and ZSTD frames from the reference library with and without a
+  dictionary. The reference decodes the port's ZSTD frames.
 
 **Where the reader differs from RocksDB, and why.** The bytes read are the same; what the reader
 does with bad or unusual ones is not.
@@ -370,6 +378,9 @@ does with bad or unusual ones is not.
 - *A corrupt block keeps its error.* RocksDB marks one with size zero and re-decodes the footer
   later to recover the reason, and it fails a debug check when the fault lay elsewhere
   (block.cc:1288-1306). The port keeps the error it found.
+- *A compressed block's stated size.* RocksDB allocates whatever size the prefix states, up to
+  `SIZE_MAX` (format.cc:718, `AllocateBlock`), so one corrupt varint asks for exabytes. The port
+  refuses a size above the caller's bound before allocating.
 - *A protection width RocksDB never writes* (anything but 1, 2, 4 or 8) is `Unsupported`, not
   undefined behaviour in `Encode`.
 - *A seek target too short to be an internal key*, where interpolation search reads its trailer,
@@ -379,7 +390,11 @@ does with bad or unusual ones is not.
   The interpolation guess is computed in 128-bit integers on every target, where RocksDB falls
   back to `double` without them.
 
-**Next in P4.** Compression framing; the index builders and the hash-search prefix index; the
+**Open in compression.** Writing LZ4HC, and zlib or ZSTD with a dictionary, is refused as
+unsupported until the codecs have them; reading them already works, except zlib with a dictionary.
+BZip2 and XPRESS are refused both ways, as in a RocksDB build without them.
+
+**Next in P4.** The index builders and the hash-search prefix index; the
 meta-index and properties blocks; the table builder and reader; `SstFileWriter` and
 `SstFileReader`; the `sst_dump` differential; and the block-read benchmark against RocksDB
 (P15's harness).

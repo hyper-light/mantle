@@ -1,5 +1,6 @@
 //! RocksDB's `util/` directory: coding, checksums, hashes and bit arithmetic.
 
+pub mod block_compression;
 pub mod coding;
 pub mod comparator;
 pub mod compression;

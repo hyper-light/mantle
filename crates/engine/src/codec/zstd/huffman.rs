@@ -165,33 +165,63 @@ impl Huffman {
             )
             .unwrap_or(0);
         }
-        let mut symbol = 0u8;
-        for &w in weights.iter().chain(std::iter::once(&last)) {
-            if w > 0 {
-                let w = usize::from(w);
-                let at = start.get_mut(w).ok_or(Corrupt::Huffman)?;
-                let span = 1usize << w.saturating_sub(1);
-                let end = at.checked_add(span).ok_or(Corrupt::Huffman)?;
-                let entry = Entry {
-                    symbol,
-                    bits: *bits_of.get(w).ok_or(Corrupt::Huffman)?,
-                };
-                let run = self.entries.get_mut(*at..end).ok_or(Corrupt::Huffman)?;
-                // A run is a power of two long: written in pieces of a fixed size, each a
-                // store or two (`HUF_DEltX1_set4`'s switch on the run's length).
-                match run {
-                    [one] => *one = entry,
-                    [a, b] => (*a, *b) = (entry, entry),
-                    [_, _, _, _] => run.copy_from_slice(&[entry; 4]),
-                    _ => {
-                        for piece in run.as_chunks_mut::<8>().0 {
-                            *piece = [entry; 8];
+        // The literals sorted by weight, by literal within a weight: each weight's run of the
+        // table is then filled by one loop whose piece size is fixed (`HUF_readDTableX1_wksp`
+        // sorts by weight the same way), not by a choice per literal. Absent literals (weight
+        // 0) sort into a region of their own ahead of the rest, so placing one takes no branch.
+        let mut sorted = [0u8; 256];
+        let mut place = [0usize; MAX_BITS as usize + 2];
+        let mut first = 0usize;
+        for (p, &c) in place.iter_mut().zip(&counts) {
+            *p = first;
+            first = first.checked_add(c).ok_or(Corrupt::Huffman)?;
+        }
+        for (symbol, &w) in (0u8..=255).zip(weights.iter().chain(std::iter::once(&last))) {
+            let p = place.get_mut(usize::from(w)).ok_or(Corrupt::Huffman)?;
+            *sorted.get_mut(*p).ok_or(Corrupt::Huffman)? = symbol;
+            *p = p.checked_add(1).ok_or(Corrupt::Huffman)?;
+        }
+        let mut from = *counts.first().ok_or(Corrupt::Huffman)?;
+        for w in 1..=usize::try_from(max_bits).map_err(|_| Corrupt::Huffman)? {
+            let count = *counts.get(w).ok_or(Corrupt::Huffman)?;
+            let to = from.checked_add(count).ok_or(Corrupt::Huffman)?;
+            let symbols = sorted.get(from..to).ok_or(Corrupt::Huffman)?;
+            from = to;
+            let span = 1usize << w.saturating_sub(1);
+            let at = *start.get(w).ok_or(Corrupt::Huffman)?;
+            let end = count
+                .checked_mul(span)
+                .and_then(|n| n.checked_add(at))
+                .ok_or(Corrupt::Huffman)?;
+            let bits = *bits_of.get(w).ok_or(Corrupt::Huffman)?;
+            let run = self.entries.get_mut(at..end).ok_or(Corrupt::Huffman)?;
+            let entry = |symbol| Entry { symbol, bits };
+            // A run is a power of two long: written in pieces of a fixed size, each a store or
+            // two (`HUF_DEltX1_set4`'s switch on the run's length, here once a weight).
+            match span {
+                1 => {
+                    for (e, &s) in run.iter_mut().zip(symbols) {
+                        *e = entry(s);
+                    }
+                }
+                2 => {
+                    for (e, &s) in run.as_chunks_mut::<2>().0.iter_mut().zip(symbols) {
+                        *e = [entry(s); 2];
+                    }
+                }
+                4 => {
+                    for (e, &s) in run.as_chunks_mut::<4>().0.iter_mut().zip(symbols) {
+                        *e = [entry(s); 4];
+                    }
+                }
+                _ => {
+                    for (e, &s) in run.chunks_exact_mut(span).zip(symbols) {
+                        for piece in e.as_chunks_mut::<8>().0 {
+                            *piece = [entry(s); 8];
                         }
                     }
                 }
-                *at = end;
             }
-            symbol = symbol.wrapping_add(1);
         }
         self.max_bits = max_bits;
         Ok(())
@@ -251,7 +281,6 @@ impl Huffman {
             Lane::new(i3)?,
             Lane::new(i4)?,
         );
-        let quad = self.max_bits.saturating_mul(4);
         let (q1, t1) = o1.as_chunks_mut::<4>();
         let (q2, t2) = o2.as_chunks_mut::<4>();
         let (q3, t3) = o3.as_chunks_mut::<4>();
@@ -261,10 +290,10 @@ impl Huffman {
         let (q2, r2) = q2.split_at_mut(rounds.min(q2.len()));
         let (q3, r3) = q3.split_at_mut(rounds.min(q3.len()));
         for (((a, b), c), d) in q1.iter_mut().zip(q2.iter_mut()).zip(q3.iter_mut()).zip(q4) {
-            b1.refill(quad);
-            b2.refill(quad);
-            b3.refill(quad);
-            b4.refill(quad);
+            b1.reload();
+            b2.reload();
+            b3.reload();
+            b4.reload();
             for (((w, x), y), z) in a.iter_mut().zip(b.iter_mut()).zip(c.iter_mut()).zip(d) {
                 *w = self.decode(&mut b1);
                 *x = self.decode(&mut b2);
@@ -422,6 +451,20 @@ impl<'a> Lane<'a> {
             .unwrap_or(0);
         self.avail = i64::from(have);
         self.base = base;
+    }
+
+    /// Loads the word at the lane's position whether or not it still holds enough: the
+    /// interleaved rounds take this over [`Self::refill`], whose test on each lane is a branch
+    /// the four lanes' differing code lengths make unpredictable, where a load is a few
+    /// instructions (`HUF_decompress4X1_usingDTable_internal_fast_c_loop` reloads every lane
+    /// every round). A round reads at most 44 bits, and a load leaves at least 57 unless the
+    /// stream's start is nearer.
+    #[inline(always)]
+    fn reload(&mut self) {
+        let pos = i64::try_from(self.base)
+            .unwrap_or(0)
+            .wrapping_add(self.avail);
+        self.load(pos);
     }
 
     /// Makes `bits` readable (at most 57) unless the word already reaches the stream's start.

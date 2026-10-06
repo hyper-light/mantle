@@ -277,6 +277,11 @@ impl<F: BlockFile> Store<F> {
             .ok_or(corrupt(Malformed::TooLarge))
     }
 
+    /// The pages an extent holds.
+    pub fn extent_pages(&self) -> u32 {
+        self.config.extent_pages
+    }
+
     /// The page size.
     pub fn page_size(&self) -> usize {
         self.config.page_size

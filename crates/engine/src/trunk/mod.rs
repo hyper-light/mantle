@@ -61,7 +61,16 @@ pub struct Trunk {
     nodes: Vec<Node>,
     root: usize,
     config: TrunkConfig,
+    /// The extents of the last saved image, released when the next one is saved.
+    saved: Vec<u64>,
 }
+
+/// The saved image's format version.
+const IMAGE_FORMAT: u8 = 1;
+/// The saved image header's magic: "mantleTK" in ASCII, little-endian.
+const IMAGE_MAGIC: u64 = u64::from_le_bytes(*b"mantleTK");
+/// None, in a child or an end key's place.
+const ABSENT: u32 = u32::MAX;
 
 fn corrupt() -> Error {
     Error::Corruption {
@@ -99,6 +108,7 @@ impl Trunk {
             }],
             root: 0,
             config,
+            saved: Vec::new(),
         })
     }
 
@@ -189,6 +199,231 @@ impl Trunk {
             self.root = self.nodes.len().saturating_sub(1);
         }
         Ok(())
+    }
+
+    /// Writes the trunk's image for a checkpoint and returns its header page, which the
+    /// superblock names as the root: the nodes, each pivot's key, child and branches, serialized
+    /// into pages of fresh extents. The previous image's extents are released now and freed once
+    /// the checkpoint naming this one is durable (the store's deferred free). Every node's
+    /// in-flight list is empty between incorporations, which the image relies on.
+    pub fn save<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<u64, Error> {
+        let mut blob = Vec::new();
+        blob.push(IMAGE_FORMAT);
+        let put32 = |v: &mut Vec<u8>, n: usize| -> Result<(), Error> {
+            v.extend_from_slice(&u32::try_from(n).map_err(|_| corrupt())?.to_le_bytes());
+            Ok(())
+        };
+        put32(&mut blob, self.root)?;
+        put32(&mut blob, self.config.fanout)?;
+        blob.extend_from_slice(&self.config.leaf_entries.to_le_bytes());
+        put32(&mut blob, self.nodes.len())?;
+        for node in &self.nodes {
+            if !node.inflight.is_empty() {
+                return Err(corrupt());
+            }
+            blob.push(u8::from(node.leaf));
+            match &node.end {
+                Some(end) => {
+                    put32(&mut blob, end.len())?;
+                    blob.extend_from_slice(end);
+                }
+                None => blob.extend_from_slice(&ABSENT.to_le_bytes()),
+            }
+            put32(&mut blob, node.pivots.len())?;
+            for p in &node.pivots {
+                put32(&mut blob, p.key.len())?;
+                blob.extend_from_slice(&p.key);
+                match p.child {
+                    Some(c) => put32(&mut blob, c)?,
+                    None => blob.extend_from_slice(&ABSENT.to_le_bytes()),
+                }
+                put32(&mut blob, p.bundle.len())?;
+                for b in &p.bundle {
+                    b.encode(&mut blob)?;
+                }
+            }
+        }
+        // The header page, then the blob's pages, in fresh extents.
+        let capacity = store.page_capacity();
+        let per = usize::try_from(store.extent_pages()).map_err(|_| corrupt())?;
+        let pages = blob.len().div_ceil(capacity).saturating_add(1);
+        let extents = pages.div_ceil(per);
+        let header_room = capacity.saturating_sub(20) / 8;
+        if extents > header_room {
+            return Err(Error::LimitExceeded {
+                what: "extents a trunk image's header names",
+                limit: u64::try_from(header_room).unwrap_or(u64::MAX),
+            });
+        }
+        let mut fresh = Vec::with_capacity(extents);
+        for _ in 0..extents {
+            fresh.push(store.allocate_extent()?);
+        }
+        let address_of = |store: &Store<F>, i: usize| -> Result<u64, Error> {
+            let extent = *fresh
+                .get(i.checked_div(per).ok_or(corrupt())?)
+                .ok_or(corrupt())?;
+            store.address(
+                extent,
+                u32::try_from(i.checked_rem(per).ok_or(corrupt())?).map_err(|_| corrupt())?,
+            )
+        };
+        let mut header = Vec::with_capacity(extents.saturating_mul(8).saturating_add(20));
+        header.extend_from_slice(&IMAGE_MAGIC.to_le_bytes());
+        header.extend_from_slice(
+            &u64::try_from(blob.len())
+                .map_err(|_| corrupt())?
+                .to_le_bytes(),
+        );
+        put32(&mut header, extents)?;
+        for e in &fresh {
+            header.extend_from_slice(&e.to_le_bytes());
+        }
+        let head = address_of(store, 0)?;
+        store.queue_page(head, &header)?;
+        for (i, chunk) in blob.chunks(capacity).enumerate() {
+            let address = address_of(store, i.saturating_add(1))?;
+            store.queue_page(address, chunk)?;
+        }
+        store.flush_run()?;
+        for e in std::mem::replace(&mut self.saved, fresh) {
+            store.release(e)?;
+        }
+        Ok(head)
+    }
+
+    /// The trunk a checkpoint's image at `head` holds, its branches' filters read back.
+    pub fn load<F: BlockFile>(store: &mut Store<F>, head: u64) -> Result<Self, Error> {
+        let mut header = Vec::new();
+        store.read_page(head, &mut header)?;
+        let u64_at = |b: &[u8], at: usize| {
+            b.get(at..)
+                .and_then(<[u8]>::first_chunk::<8>)
+                .map(|x| u64::from_le_bytes(*x))
+                .ok_or(corrupt())
+        };
+        let u32_at = |b: &[u8], at: usize| {
+            b.get(at..)
+                .and_then(<[u8]>::first_chunk::<4>)
+                .map(|x| u32::from_le_bytes(*x))
+                .ok_or(corrupt())
+        };
+        if u64_at(&header, 0)? != IMAGE_MAGIC {
+            return Err(Error::Corruption {
+                what: "a trunk image",
+                why: Malformed::BadMagic,
+            });
+        }
+        let len = usize::try_from(u64_at(&header, 8)?).map_err(|_| corrupt())?;
+        let extents = usize::try_from(u32_at(&header, 16)?).map_err(|_| corrupt())?;
+        let mut saved = Vec::with_capacity(extents.min(header.len() / 8));
+        for i in 0..extents {
+            saved.push(u64_at(
+                &header,
+                20usize.saturating_add(i.saturating_mul(8)),
+            )?);
+        }
+        let per = usize::try_from(store.extent_pages()).map_err(|_| corrupt())?;
+        let capacity = store.page_capacity();
+        let mut blob = Vec::with_capacity(len);
+        let pages = len.div_ceil(capacity);
+        for i in 1..=pages {
+            let extent = *saved
+                .get(i.checked_div(per).ok_or(corrupt())?)
+                .ok_or(corrupt())?;
+            let address = store.address(
+                extent,
+                u32::try_from(i.checked_rem(per).ok_or(corrupt())?).map_err(|_| corrupt())?,
+            )?;
+            store.read_page(address, &mut blob)?;
+        }
+        if blob.len() != len {
+            return Err(corrupt());
+        }
+        let mut r = Reader {
+            bytes: &blob,
+            at: 0,
+        };
+        let format = *r.take(1)?.first().ok_or(corrupt())?;
+        if format != IMAGE_FORMAT {
+            return Err(Error::Corruption {
+                what: "a trunk image",
+                why: Malformed::UnknownVersion(u64::from(format)),
+            });
+        }
+        let u32_of = |s: &[u8]| {
+            s.first_chunk::<4>()
+                .map(|b| u32::from_le_bytes(*b))
+                .ok_or(corrupt())
+        };
+        let usize_of = |s: &[u8]| -> Result<usize, Error> {
+            usize::try_from(u32_of(s)?).map_err(|_| corrupt())
+        };
+        let root = usize_of(r.take(4)?)?;
+        let fanout = usize_of(r.take(4)?)?;
+        let leaf_entries = r
+            .take(8)?
+            .first_chunk::<8>()
+            .map(|b| u64::from_le_bytes(*b))
+            .ok_or(corrupt())?;
+        let count = usize_of(r.take(4)?)?;
+        let mut nodes = Vec::with_capacity(count.min(len));
+        for _ in 0..count {
+            let leaf = *r.take(1)?.first().ok_or(corrupt())? == 1;
+            let end_len = u32_of(r.take(4)?)?;
+            let end = if end_len == ABSENT {
+                None
+            } else {
+                Some(
+                    r.take(usize::try_from(end_len).map_err(|_| corrupt())?)?
+                        .to_vec(),
+                )
+            };
+            let pivot_count = usize_of(r.take(4)?)?;
+            let mut pivots = Vec::with_capacity(pivot_count.min(len));
+            for _ in 0..pivot_count {
+                let key_len = usize_of(r.take(4)?)?;
+                let key = r.take(key_len)?.to_vec();
+                let child = u32_of(r.take(4)?)?;
+                let child = if child == ABSENT {
+                    None
+                } else {
+                    Some(usize::try_from(child).map_err(|_| corrupt())?)
+                };
+                let bundle_len = usize_of(r.take(4)?)?;
+                let mut bundle = Vec::with_capacity(bundle_len.min(len));
+                for _ in 0..bundle_len {
+                    let rest = r.bytes.get(r.at..).ok_or(corrupt())?;
+                    let (branch, used) = Branch::decode(store, rest)?;
+                    r.at = r.at.checked_add(used).ok_or(corrupt())?;
+                    bundle.push(branch);
+                }
+                pivots.push(Pivot {
+                    key,
+                    child,
+                    bundle,
+                    start: 0,
+                });
+            }
+            nodes.push(Node {
+                leaf,
+                pivots,
+                inflight: Vec::new(),
+                end,
+            });
+        }
+        if root >= nodes.len() {
+            return Err(corrupt());
+        }
+        Ok(Self {
+            nodes,
+            root,
+            config: TrunkConfig {
+                fanout,
+                leaf_entries,
+            },
+            saved,
+        })
     }
 
     /// Compacts, flushes and splits node `n`; returns the nodes now covering its range, each with
@@ -415,6 +650,11 @@ impl Trunk {
         Ok((height, self.nodes.len(), leaves))
     }
 
+    /// The extents of the trunk's saved image.
+    pub fn image_extents(&self) -> &[u64] {
+        &self.saved
+    }
+
     /// The trunk's branches, for checks: every branch a node names, each naming once.
     pub fn branches(&self) -> Vec<Branch> {
         let mut out = Vec::new();
@@ -427,5 +667,21 @@ impl Trunk {
             }
         }
         out
+    }
+}
+
+/// A position in an image's bytes.
+struct Reader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Reader<'a> {
+    /// The next `n` bytes.
+    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
+        let end = self.at.checked_add(n).ok_or(corrupt())?;
+        let s = self.bytes.get(self.at..end).ok_or(corrupt())?;
+        self.at = end;
+        Ok(s)
     }
 }

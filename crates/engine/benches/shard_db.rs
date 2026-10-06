@@ -23,7 +23,7 @@ use std::time::Instant;
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use mantle_engine::shard_db::ShardDb;
-use mantle_engine::store::{Config, Store};
+use mantle_engine::store::Config;
 use mantle_engine::trunk::TrunkConfig;
 
 struct Rng(u64);
@@ -61,12 +61,12 @@ fn main() {
         extent_pages: 32,
         max_extents: 1 << 24,
     };
-    let store = Store::create(file, config).unwrap();
     let mem = 64 << 20;
     // A leaf of about a memtable's entries, as SplinterDB sizes leaves by the memtable.
     let leaf_entries = (mem / (16 + 100 + 3)) as u64;
-    let mut db = ShardDb::new(
-        store,
+    let mut db = ShardDb::create(
+        file,
+        config,
         mem,
         TrunkConfig {
             fanout,

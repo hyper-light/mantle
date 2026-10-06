@@ -79,6 +79,11 @@ pub struct Branch {
     pub extents: Vec<u64>,
     /// Its keys' filter.
     pub filter: filter::Filter,
+    /// Where the filter's pages start in the branch's pages (counted in extent order), how
+    /// many there are, and the filter's bytes: what reading it back takes.
+    pub filter_start: u64,
+    pub filter_pages: u32,
+    pub filter_bytes: u64,
 }
 
 fn corrupt(why: Malformed) -> Error {
@@ -227,6 +232,8 @@ pub struct Builder {
     capacity: usize,
     /// Every key's filter hash, for the filter [`Self::finish`] builds.
     hashes: Vec<u64>,
+    /// Pages issued so far, in extent order.
+    issued: u64,
 }
 
 impl Builder {
@@ -247,6 +254,7 @@ impl Builder {
             payload: Vec::with_capacity(capacity),
             capacity,
             hashes: Vec::new(),
+            issued: 0,
         })
     }
 
@@ -274,6 +282,7 @@ impl Builder {
             }
         };
         self.extent = Some((extent, next.saturating_add(1)));
+        self.issued = self.issued.saturating_add(1);
         store.address(extent, next)
     }
 
@@ -373,7 +382,6 @@ impl Builder {
             let top = level.checked_add(1) == Some(self.levels.len());
             let lone = self.levels.get(level).is_some_and(|p| p.len() == 1) && level > 0;
             if top && lone {
-                store.flush_run()?;
                 // The level's single entry names the root: the page below it.
                 let page = self.levels.get(level).ok_or(corrupt(Malformed::TooLarge))?;
                 let root = page
@@ -381,12 +389,27 @@ impl Builder {
                     .first_chunk::<8>()
                     .map(|b| u64::from_le_bytes(*b))
                     .ok_or(corrupt(Malformed::Truncated))?;
+                // The filter's pages follow the tree's in the branch's own extents.
+                let filter = filter::Filter::build(&self.hashes);
+                let bytes = filter.to_bytes();
+                let filter_start = self.issued;
+                let mut pages = 0u32;
+                for chunk in bytes.chunks(self.capacity) {
+                    let address = self.page(store)?;
+                    store.queue_page(address, chunk)?;
+                    pages = pages.saturating_add(1);
+                }
+                store.flush_run()?;
                 return Ok(Branch {
                     root,
                     height: u8::try_from(level).map_err(|_| corrupt(Malformed::TooLarge))?,
                     count: self.count,
                     extents: self.extents,
-                    filter: filter::Filter::build(&self.hashes),
+                    filter,
+                    filter_start,
+                    filter_pages: pages,
+                    filter_bytes: u64::try_from(bytes.len())
+                        .map_err(|_| corrupt(Malformed::TooLarge))?,
                 });
             }
             if self.levels.get(level).is_some_and(|p| p.len() > 0) {
@@ -710,5 +733,96 @@ impl Cursor {
                 }
             }
         }
+    }
+}
+
+impl Branch {
+    /// The branch's descriptor, as a trunk page stores it: root, height, count, the filter's
+    /// place and size, then the extents.
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        out.extend_from_slice(&self.root.to_le_bytes());
+        out.push(self.height);
+        out.extend_from_slice(&self.count.to_le_bytes());
+        out.extend_from_slice(&self.filter_start.to_le_bytes());
+        out.extend_from_slice(&self.filter_pages.to_le_bytes());
+        out.extend_from_slice(&self.filter_bytes.to_le_bytes());
+        let n = u32::try_from(self.extents.len()).map_err(|_| corrupt(Malformed::TooLarge))?;
+        out.extend_from_slice(&n.to_le_bytes());
+        for e in &self.extents {
+            out.extend_from_slice(&e.to_le_bytes());
+        }
+        Ok(())
+    }
+
+    /// A descriptor from the front of `bytes`, its filter read back from `store`; with the
+    /// bytes it took.
+    pub fn decode<F: BlockFile>(
+        store: &mut Store<F>,
+        bytes: &[u8],
+    ) -> Result<(Self, usize), Error> {
+        let mut at = 0usize;
+        let mut take = |n: usize| -> Result<&[u8], Error> {
+            let end = at.checked_add(n).ok_or(corrupt(Malformed::TooLarge))?;
+            let s = bytes.get(at..end).ok_or(corrupt(Malformed::Truncated))?;
+            at = end;
+            Ok(s)
+        };
+        let u64_of = |s: &[u8]| {
+            s.first_chunk::<8>()
+                .map(|b| u64::from_le_bytes(*b))
+                .ok_or(corrupt(Malformed::Truncated))
+        };
+        let u32_of = |s: &[u8]| {
+            s.first_chunk::<4>()
+                .map(|b| u32::from_le_bytes(*b))
+                .ok_or(corrupt(Malformed::Truncated))
+        };
+        let root = u64_of(take(8)?)?;
+        let height = *take(1)?.first().ok_or(corrupt(Malformed::Truncated))?;
+        let count = u64_of(take(8)?)?;
+        let filter_start = u64_of(take(8)?)?;
+        let filter_pages = u32_of(take(4)?)?;
+        let filter_bytes = u64_of(take(8)?)?;
+        let n = usize::try_from(u32_of(take(4)?)?).map_err(|_| corrupt(Malformed::TooLarge))?;
+        let mut extents = Vec::with_capacity(n.min(bytes.len() / 8));
+        for _ in 0..n {
+            extents.push(u64_of(take(8)?)?);
+        }
+        // The filter's pages: its place in the branch's pages, counted in extent order.
+        let per = u64::from(store.extent_pages());
+        let mut filter = Vec::with_capacity(usize::try_from(filter_bytes).unwrap_or(0));
+        for i in 0..u64::from(filter_pages) {
+            let index = filter_start
+                .checked_add(i)
+                .ok_or(corrupt(Malformed::TooLarge))?;
+            let extent = *extents
+                .get(
+                    usize::try_from(index.checked_div(per).ok_or(corrupt(Malformed::TooLarge))?)
+                        .map_err(|_| corrupt(Malformed::TooLarge))?,
+                )
+                .ok_or(corrupt(Malformed::OutOfRange))?;
+            let page = u32::try_from(index.checked_rem(per).ok_or(corrupt(Malformed::TooLarge))?)
+                .map_err(|_| corrupt(Malformed::TooLarge))?;
+            let address = store.address(extent, page)?;
+            store.read_page(address, &mut filter)?;
+        }
+        if u64::try_from(filter.len()).ok() != Some(filter_bytes) {
+            return Err(corrupt(Malformed::CountMismatch));
+        }
+        let filter =
+            filter::Filter::from_bytes(&filter).ok_or(corrupt(Malformed::CountMismatch))?;
+        Ok((
+            Self {
+                root,
+                height,
+                count,
+                extents,
+                filter,
+                filter_start,
+                filter_pages,
+                filter_bytes,
+            },
+            at,
+        ))
     }
 }

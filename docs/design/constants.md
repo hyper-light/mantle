@@ -368,6 +368,9 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/engine/src/branch/filter.rs` `BITS_PER_KEY` | cited | 10 bits a key in a branch's Bloom filter: a false-positive rate of about 0.6185^b, 0.8% at 10 (Broder and Mitzenmacher, Internet Mathematics 1(4), 2004, §2.1); RocksDB's default `bits_per_key`. |
 | `crates/engine/src/branch/filter.rs` `BLOCK_WORDS` | derived | 8 words of 64 bits: a filter block of 512 bits, one 64-byte cache line, so a key's probes cost one cache miss (Putze, Sanders and Singler, WEA 2007). |
 | `crates/engine/src/branch/filter.rs` `PROBES` | derived | 7, `round(BITS_PER_KEY · ln 2)`: the probe count minimizing a Bloom filter's false-positive rate at 10 bits a key. |
+| `crates/engine/src/trunk/mod.rs` `ABSENT` | format | `u32::MAX`, a trunk image's marker for no child and no end key: above every node index and key length the image holds. |
+| `crates/engine/src/trunk/mod.rs` `IMAGE_FORMAT` | format | 1, the trunk image format this engine writes and reads (docs/design/engine-structure.md §8, E4c). |
+| `crates/engine/src/trunk/mod.rs` `IMAGE_MAGIC` | format | "mantleTK" in ASCII, little-endian: the trunk image header's magic number. |
 | `crates/gateway/src/layout.rs` `CHUNK` | cited | Tectonic's "typically 8 MiB" chunk (docs/research/01 §1.14). docs/design/gateway.md says measured transfer sizing will replace it, and audit §12.6/§16.2 requires per-upload sizing. |
 | `crates/gateway/src/layout.rs` `SEALED` | derived | `seal::SEGMENT + seal::TAG`: a 64 KiB plaintext segment plus its 16-byte AEAD tag (docs/design/gateway.md §1). |
 | `crates/gateway/src/put.rs` `RENEWALS` | cited | Quarter-lease renewal from Centrifuge's 15 s renewals of 60 s leases (docs/research/09 §7.2.2). Audit §12.6 requires deriving it from control-delay and outage distributions. |

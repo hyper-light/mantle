@@ -74,6 +74,33 @@ impl Filter {
         probes(h).all(|(word, mask)| block.get(word).is_some_and(|w| w & mask != 0))
     }
 
+    /// The filter as bytes: each block's words, little-endian.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.blocks
+            .iter()
+            .flat_map(|b| b.iter().flat_map(|w| w.to_le_bytes()))
+            .collect()
+    }
+
+    /// A filter from [`Self::to_bytes`]'s bytes: whole blocks, at least one.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let block = BLOCK_WORDS.checked_mul(8)?;
+        if bytes.is_empty() || !bytes.len().is_multiple_of(block) {
+            return None;
+        }
+        let blocks = bytes
+            .chunks_exact(block)
+            .map(|chunk| {
+                let mut b = [0u64; BLOCK_WORDS];
+                for (w, c) in b.iter_mut().zip(chunk.as_chunks::<8>().0) {
+                    *w = u64::from_le_bytes(*c);
+                }
+                b
+            })
+            .collect();
+        Some(Self { blocks })
+    }
+
     /// The filter's bytes in memory.
     pub fn bytes(&self) -> usize {
         self.blocks

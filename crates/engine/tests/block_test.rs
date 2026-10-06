@@ -407,6 +407,7 @@ fn index_value_case(
         key_includes_seq,
         value_is_full: !value_delta,
         search,
+        prefix_index: None,
     };
     let expect = |it: &BlockIter<'_>, index: usize| {
         let sep = &entries.separators[index];
@@ -470,12 +471,13 @@ fn prefix_boundary_block(keys: &[Vec<u8>], is_user_key: bool) -> Block {
     Block::new(b.finish().unwrap().to_vec(), 0)
 }
 
-fn interpolating(key_includes_seq: bool) -> IndexIterOptions {
+fn interpolating(key_includes_seq: bool) -> IndexIterOptions<'static> {
     IndexIterOptions {
         have_first_key: false,
         key_includes_seq,
         value_is_full: false,
         search: BlockSearchType::Interpolation,
+        prefix_index: None,
     }
 }
 
@@ -599,6 +601,7 @@ fn initialize_protection_info_on_a_corrupt_block() {
         key_includes_seq: true,
         value_is_full: true,
         search: BlockSearchType::Binary,
+        prefix_index: None,
     };
     assert!(is_corruption(
         index
@@ -870,6 +873,7 @@ fn index_checksum_case(
         key_includes_seq: true,
         value_is_full: !value_delta,
         search: BlockSearchType::Binary,
+        prefix_index: None,
     };
     check_protected(
         &block,

@@ -23,6 +23,7 @@ use crate::db::dbformat::{
 };
 use crate::db::kv_checksum;
 use crate::error::{Error, Malformed};
+use crate::table::block_based::block_prefix_index::BlockPrefixIndex;
 use crate::table::block_based::block_util::{decode_entry, read_be64_from_key};
 use crate::table::block_based::data_block_footer::{DataBlockFooter, DataBlockIndexType};
 use crate::table::block_based::data_block_hash_index::{COLLISION, DataBlockHashIndex, NO_ENTRY};
@@ -196,7 +197,7 @@ impl Block {
     }
 
     /// An iterator that is already at its end, with `status`.
-    fn ended(&self, kind: Kind, status: Option<Error>) -> BlockIter<'_> {
+    fn ended<'s>(&'s self, kind: Kind<'s>, status: Option<Error>) -> BlockIter<'s> {
         let mut core = self.core(
             InternalKeyComparator::default(),
             DISABLE_GLOBAL_SEQUENCE_NUMBER,
@@ -249,12 +250,12 @@ impl Block {
     }
 
     /// `NewIndexIterator` [R block.cc:1561-1605], without a prefix index.
-    pub fn new_index_iterator(
-        &self,
+    pub fn new_index_iterator<'s>(
+        &'s self,
         user_comparator: Comparator,
         global_seqno: SequenceNumber,
-        options: IndexIterOptions,
-    ) -> BlockIter<'_> {
+        options: IndexIterOptions<'s>,
+    ) -> BlockIter<'s> {
         let search = match options.search {
             BlockSearchType::Auto if self.is_uniform && user_comparator == Comparator::Bytewise => {
                 BlockSearchType::Interpolation
@@ -272,6 +273,8 @@ impl Block {
             decoded: DecodedIndexValue::default(),
             global_seqno,
             seqno_first_key,
+            prefix_index: options.prefix_index,
+            prefix_absent: false,
         });
         if let Some(e) = self.unreadable() {
             return self.ended(kind, Some(e));
@@ -381,6 +384,7 @@ impl Block {
                 key_includes_seq: false,
                 value_is_full,
                 search: BlockSearchType::Binary,
+                prefix_index: None,
             },
         );
         let sums = Self::checksums(iter, width, self.block_restart_interval, true);
@@ -410,7 +414,7 @@ impl Block {
 
 /// How an index block's iterator reads it: RocksDB's `NewIndexIterator` arguments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IndexIterOptions {
+pub struct IndexIterOptions<'a> {
     /// The values carry their block's first internal key.
     pub have_first_key: bool,
     /// The keys are internal keys.
@@ -418,6 +422,8 @@ pub struct IndexIterOptions {
     /// No value is delta encoded.
     pub value_is_full: bool,
     pub search: BlockSearchType,
+    /// The prefix index a hash-search index seeks through; `None` for a total-order seek.
+    pub prefix_index: Option<&'a BlockPrefixIndex>,
 }
 
 /// The current key: a range of the block when stored whole there, or rebuilt from a shared
@@ -938,6 +944,23 @@ impl Core<'_> {
         self.value = (0, 0);
     }
 
+    /// `CompareBlockKey` [R block.cc:1151-1163]: the restart key at `index` against `target`;
+    /// `None` when it cannot be read, the iterator then ended with corruption.
+    fn compare_block_key(
+        &mut self,
+        index: u32,
+        target: &[u8],
+        with_length: bool,
+    ) -> Option<Ordering> {
+        if index >= self.num_restarts {
+            self.corruption("prefix index entry past the index", Malformed::OutOfRange);
+            return None;
+        }
+        let (start, len) = self.restart_key(index, with_length)?;
+        self.raw_key.set_borrowed(start, len);
+        Some(self.compare_current_key(target))
+    }
+
     /// `UpdateKey` [R block.h:635-666]: the key callers see, with the global sequence number in
     /// place, and the entry's checksum verified.
     fn update_key(&mut self) {
@@ -1020,7 +1043,7 @@ struct DecodedIndexValue {
 }
 
 #[derive(Debug)]
-struct IndexState {
+struct IndexState<'a> {
     value_delta_encoded: bool,
     have_first_key: bool,
     search: BlockSearchType,
@@ -1028,12 +1051,15 @@ struct IndexState {
     global_seqno: SequenceNumber,
     /// The first key with the global sequence number in place: RocksDB's `GlobalSeqnoState`.
     seqno_first_key: Option<Vec<u8>>,
+    prefix_index: Option<&'a BlockPrefixIndex>,
+    /// The last seek's prefix is in no block: RocksDB's `Status::NotFound` on the iterator.
+    prefix_absent: bool,
 }
 
 #[derive(Debug)]
-enum Kind {
+enum Kind<'a> {
     Data(DataState),
-    Index(IndexState),
+    Index(IndexState<'a>),
     Meta,
 }
 
@@ -1042,13 +1068,20 @@ enum Kind {
 #[derive(Debug)]
 pub struct BlockIter<'a> {
     core: Core<'a>,
-    kind: Kind,
+    kind: Kind<'a>,
 }
 
 impl<'a> BlockIter<'a> {
     /// `Valid`.
     pub fn valid(&self) -> bool {
         self.core.valid()
+    }
+
+    /// Whether the last seek of a hash-search index found its prefix in no block: RocksDB's
+    /// `Status::NotFound` on an index iterator, which tells a missing prefix from a key past the
+    /// last; the iterator is then not valid.
+    pub fn prefix_absent(&self) -> bool {
+        matches!(&self.kind, Kind::Index(state) if state.prefix_absent)
     }
 
     /// `status`: the error the iterator ended with, if any.
@@ -1336,8 +1369,9 @@ impl<'a> BlockIter<'a> {
         if !self.core.live {
             return;
         }
-        if matches!(self.kind, Kind::Index(_)) {
+        if let Kind::Index(state) = &mut self.kind {
             self.core.status = None;
+            state.prefix_absent = false;
         }
         if self.core.seek_to_restart_point(0) {
             let _ = self.next_impl();
@@ -1348,8 +1382,9 @@ impl<'a> BlockIter<'a> {
         if !self.core.live {
             return;
         }
-        if matches!(self.kind, Kind::Index(_)) {
+        if let Kind::Index(state) = &mut self.kind {
             self.core.status = None;
+            state.prefix_absent = false;
         }
         if !self
             .core
@@ -1392,9 +1427,10 @@ impl<'a> BlockIter<'a> {
             return;
         }
         let with_length = self.with_length();
-        let (seek_key, search): (&[u8], BlockSearchType) = match &self.kind {
+        let (seek_key, search, prefix_index): (&[u8], BlockSearchType, _) = match &mut self.kind {
             Kind::Index(state) => {
                 self.core.status = None;
+                state.prefix_absent = false;
                 let key = if self.core.raw_key.is_user_key {
                     target
                         .get(..target.len().saturating_sub(NUM_INTERNAL_BYTES))
@@ -1402,10 +1438,24 @@ impl<'a> BlockIter<'a> {
                 } else {
                     target
                 };
-                (key, state.search)
+                (key, state.search, state.prefix_index)
             }
-            _ => (target, BlockSearchType::Binary),
+            _ => (target, BlockSearchType::Binary, None),
         };
+        if let Some(prefix_index) = prefix_index {
+            match prefix_index.get_blocks(target) {
+                Err(e) => {
+                    self.core.refuse(e);
+                    return;
+                }
+                Ok(Some(blocks)) => {
+                    self.prefix_seek(seek_key, blocks, with_length);
+                    return;
+                }
+                // Outside the prefix extractor's domain: a total-order seek answers.
+                Ok(None) => {}
+            }
+        }
         let found = if search == BlockSearchType::Interpolation {
             self.core.interpolation_seek(seek_key, with_length)
         } else {
@@ -1414,6 +1464,85 @@ impl<'a> BlockIter<'a> {
         if let Some((index, skip)) = found {
             self.find_key_after_binary_seek(seek_key, index, skip);
         }
+    }
+
+    /// `PrefixSeek` [R block.cc:1249-1271]: the seek through the index entries `blocks` whose
+    /// blocks may hold the target's prefix; with none, the prefix is absent.
+    fn prefix_seek(&mut self, seek_key: &[u8], blocks: &[u32], with_length: bool) {
+        if blocks.is_empty() {
+            self.mark_prefix_absent();
+            return;
+        }
+        match self.binary_block_index_seek(seek_key, blocks, with_length) {
+            Some(index) => self.find_key_after_binary_seek(seek_key, index, true),
+            None => {
+                if self.core.status.is_none() {
+                    self.core.current = self.core.keys_end;
+                }
+            }
+        }
+    }
+
+    /// Ends a seek whose prefix no block holds.
+    fn mark_prefix_absent(&mut self) {
+        if let Kind::Index(state) = &mut self.kind {
+            state.prefix_absent = true;
+        }
+        self.core.current = self.core.keys_end;
+    }
+
+    /// `BinaryBlockIndexSeek` [R block.cc:1165-1247]: the first of `blocks` whose restart key is
+    /// at or after `target`, or the entry after the last of them when that one is; `None` when
+    /// the target's prefix cannot be in the index, which marks it absent.
+    fn binary_block_index_seek(
+        &mut self,
+        target: &[u8],
+        blocks: &[u32],
+        with_length: bool,
+    ) -> Option<u32> {
+        let block = |i: usize| blocks.get(i).copied();
+        let (mut left, mut right) = (0usize, blocks.len().saturating_sub(1));
+        let mut converged = false;
+        while left <= right {
+            let mid = left.saturating_add(right) / 2;
+            let cmp = self
+                .core
+                .compare_block_key(block(mid)?, target, with_length)?;
+            if cmp == Ordering::Less {
+                left = mid.saturating_add(1);
+            } else {
+                if left == right {
+                    converged = true;
+                    break;
+                }
+                right = mid;
+            }
+        }
+        if converged {
+            let id = block(left)?;
+            let first_of_run = left == 0 || block(left.saturating_sub(1)) != id.checked_sub(1);
+            if id > 0
+                && first_of_run
+                && self
+                    .core
+                    .compare_block_key(id.saturating_sub(1), target, with_length)?
+                    == Ordering::Greater
+            {
+                self.mark_prefix_absent();
+                return None;
+            }
+            return Some(id);
+        }
+        let next = block(right)?.checked_add(1)?;
+        if next < self.core.num_restarts {
+            if self.core.compare_block_key(next, target, with_length)? != Ordering::Less {
+                return Some(next);
+            }
+            self.mark_prefix_absent();
+            return None;
+        }
+        self.core.current = self.core.keys_end;
+        None
     }
 
     fn seek_for_prev_impl(&mut self, target: &[u8]) {
@@ -1841,6 +1970,7 @@ mod tests {
                                 key_includes_seq: true,
                                 value_is_full: !value_delta,
                                 search: BlockSearchType::Binary,
+                                prefix_index: None,
                             };
                             check(
                                 build,

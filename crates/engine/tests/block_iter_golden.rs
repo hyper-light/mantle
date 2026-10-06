@@ -108,6 +108,7 @@ fn block_reads_match_rocksdb_move_for_move() {
                     key_includes_seq,
                     value_is_full,
                     search,
+                    prefix_index: None,
                 },
             ),
             _ => block.new_meta_iterator(),

@@ -385,6 +385,13 @@ does with bad or unusual ones is not.
   block's trailer ends, and in a release build writes a wrong delta otherwise. It also asserts
   that a hash-search key is in its prefix extractor's domain, and otherwise reads past the key. The
   port returns `InvalidArgument` for both.
+- *Hash-search reads.* RocksDB trusts the prefix metadata: a run of no blocks underflows its end,
+  and an entry past the index is read as a restart point. The port refuses both as corruption.
+  For a seek target outside the prefix extractor's domain, RocksDB's `Transform` reads past the
+  key (util/slice.cc:55-58). The port answers with a total-order seek, an answer the index
+  iterator's contract allows (block.h:972-977). RocksDB signals an absent prefix as
+  `Status::NotFound` on the iterator. The port keeps the status clean and answers
+  `prefix_absent()`, so a missing prefix is never taken for an error.
 - *A protection width RocksDB never writes* (anything but 1, 2, 4 or 8) is `Unsupported`, not
   undefined behaviour in `Encode`.
 - *A seek target too short to be an internal key*, where interpolation search reads its trailer,
@@ -409,11 +416,18 @@ does with bad or unusual ones is not.
   uniformity threshold, so it is never marked uniform. The port does the same, which the golden
   caught.
 
+- `table/block_based/block_prefix_index.rs` and the prefix seek in `block.rs`: the hash from
+  prefixes to index entries that a hash-search index is read through. On 160 indexes RocksDB
+  wrote (`tests/golden/p4_prefix_gen.cc`), the port reads RocksDB's prefix blocks into the same
+  hash. Every one of 13,068 seeks and steps lands where RocksDB's `IndexBlockIter` does
+  (`tests/block_prefix_golden.rs`), the 2,019 absent prefixes included. Changing the bucket hash
+  fails it. Two changes pass, and both are equivalent: merging adjacent runs only saves memory,
+  and the first-of-run test only saves a comparison.
+
 **Open in compression.** Writing LZ4HC, and zlib or ZSTD with a dictionary, is refused as
 unsupported until the codecs have them; reading them already works, except zlib with a dictionary.
 BZip2 and XPRESS are refused both ways, as in a RocksDB build without them.
 
-**Next in P4.** The hash-search prefix index the reader builds from those blocks; the
-meta-index and properties blocks; the table builder and reader; `SstFileWriter` and
+**Next in P4.** The meta-index and properties blocks; the table builder and reader; `SstFileWriter` and
 `SstFileReader`; the `sst_dump` differential; and the block-read benchmark against RocksDB
 (P15's harness).

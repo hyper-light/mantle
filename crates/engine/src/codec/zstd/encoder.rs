@@ -263,7 +263,6 @@ pub struct Compressor {
     base: u32,
     found: Vec<Found>,
     literals: Vec<u8>,
-    block: Vec<u8>,
     codes: Vec<Codes>,
     /// The block's own encoding tables, rebuilt in place: literals length, offset, match length.
     own: [EncodeTable; 3],
@@ -285,7 +284,6 @@ impl Compressor {
             base: 1,
             found: Vec::new(),
             literals: Vec::new(),
-            block: Vec::new(),
             codes: Vec::new(),
             own: Default::default(),
             predefined: Predefined {
@@ -345,7 +343,7 @@ impl Compressor {
             let mut work = Work {
                 found: &mut self.found,
                 literals: &mut self.literals,
-                block: &mut self.block,
+                block: &mut *out,
                 codes: &mut self.codes,
                 own: &mut self.own,
                 predefined: &self.predefined,
@@ -353,7 +351,6 @@ impl Compressor {
                 lengths: &self.lengths,
             };
             encode_block(
-                out,
                 input,
                 start..end,
                 last,
@@ -382,6 +379,7 @@ impl Compressor {
 struct Work<'a> {
     found: &'a mut Vec<Found>,
     literals: &'a mut Vec<u8>,
+    /// The frame being written: each block's header and content go straight onto its end.
     block: &'a mut Vec<u8>,
     codes: &'a mut Vec<Codes>,
     own: &'a mut [EncodeTable; 3],
@@ -421,7 +419,6 @@ fn frame_header(out: &mut Vec<u8>, size: usize, checksum: bool) {
 /// One block, `range` of `input`: compressed if that is smaller than raw, RLE when every byte is
 /// one.
 fn encode_block(
-    out: &mut Vec<u8>,
     input: &[u8],
     range: std::ops::Range<usize>,
     last: bool,
@@ -437,6 +434,7 @@ fn encode_block(
         let b = raw.to_le_bytes();
         Ok([b[0], b[1], b[2]])
     };
+    let out = &mut *work.block;
     if let Some(&first) = block.first()
         && block.len() > 1
         && block.iter().all(|&b| b == first)
@@ -449,18 +447,32 @@ fn encode_block(
     }
     let saved = *offsets;
     matcher.sequences(start, end, offsets, work.found);
+    // The content is written after a header's room, straight into the frame, and the header
+    // filled in once its size is known; content no smaller than the block is cut back for the
+    // raw block, so a block's bytes are never copied from a buffer of their own.
+    let at = work.block.len();
+    work.block.extend_from_slice(&[0; 3]);
     compress_block(input, start, end, matcher.level.strategy, work)?;
-    if work.block.len() < block.len() {
-        out.extend_from_slice(&header(2, work.block.len())?);
-        out.extend_from_slice(work.block);
+    let out = &mut *work.block;
+    let content = out.len().saturating_sub(at).saturating_sub(3);
+    if content < block.len() {
+        out.get_mut(at..at.saturating_add(3))
+            .ok_or(Corrupt::Block)?
+            .copy_from_slice(&header(2, content)?);
     } else {
         // Raw: a raw block does not move the repeat offsets (§3.1.1.5).
         *offsets = saved;
+        out.truncate(at);
         out.extend_from_slice(&header(0, block.len())?);
         out.extend_from_slice(block);
     }
     Ok(())
 }
+
+/// The bytes one literal copy moves (`ZSTD_safecopyLiterals`'s `WILDCOPY_OVERLENGTH`-bounded
+/// pieces are 16 bytes, zstd 1.5.7 lib/compress/zstd_compress_internal.h): a run this long or
+/// shorter is one fixed-size copy.
+const LITERAL_PIECE: usize = 16;
 
 /// A match the finder chose: `literals` bytes before it, then `length` bytes from `offset_value`
 /// (the coded value, 1 to 3 a repeat offset, §3.1.1.5).
@@ -1159,8 +1171,8 @@ fn offset_code(value: u32) -> (u8, u32, u8) {
     (c, value.saturating_sub(base), c)
 }
 
-/// A compressed block's content into `work.block`: the literals section, then the sequences
-/// section (§3.1.1.3).
+/// A compressed block's content onto the end of `work.block`: the literals section, then the
+/// sequences section (§3.1.1.3).
 fn compress_block(
     input: &[u8],
     start: usize,
@@ -1168,16 +1180,51 @@ fn compress_block(
     strategy: Strategy,
     work: &mut Work<'_>,
 ) -> Result<(), Corrupt> {
+    // The literals gathered into a buffer kept at the longest length a block needed plus a
+    // piece (at most `BLOCK_MAX + LITERAL_PIECE`): a run of up to a piece is one fixed-size copy
+    // that may run past it into bytes the next run overwrites (`ZSTD_safecopyLiterals`'s wild
+    // copy), where a call per run cost the gathering most of its time.
     let literals = &mut *work.literals;
-    literals.clear();
-    let mut at = start;
-    for f in work.found.iter() {
-        let to = at.saturating_add(usize::try_from(f.literals).unwrap_or(0));
-        literals.extend_from_slice(input.get(at..to).ok_or(Corrupt::Block)?);
-        at = to.saturating_add(usize::try_from(f.length).unwrap_or(0));
+    let room = end.saturating_sub(start).saturating_add(LITERAL_PIECE);
+    if literals.len() < room {
+        literals.resize(room, 0);
     }
-    literals.extend_from_slice(input.get(at..end).ok_or(Corrupt::Block)?);
-    work.block.clear();
+    let mut n = 0usize;
+    let mut at = start;
+    let mut take = |at: usize, len: usize, n: usize| -> Result<(), Corrupt> {
+        let piece = input
+            .get(at..)
+            .and_then(<[u8]>::first_chunk::<LITERAL_PIECE>);
+        match piece {
+            Some(piece) if len <= LITERAL_PIECE => {
+                *literals
+                    .get_mut(n..)
+                    .and_then(<[u8]>::first_chunk_mut::<LITERAL_PIECE>)
+                    .ok_or(Corrupt::Block)? = *piece;
+            }
+            _ => literals
+                .get_mut(n..n.saturating_add(len))
+                .ok_or(Corrupt::Block)?
+                .copy_from_slice(
+                    input
+                        .get(at..at.saturating_add(len))
+                        .ok_or(Corrupt::Block)?,
+                ),
+        }
+        Ok(())
+    };
+    for f in work.found.iter() {
+        let len = usize::try_from(f.literals).map_err(|_| Corrupt::Block)?;
+        take(at, len, n)?;
+        n = n.saturating_add(len);
+        at = at
+            .saturating_add(len)
+            .saturating_add(usize::try_from(f.length).map_err(|_| Corrupt::Block)?);
+    }
+    let rest = end.checked_sub(at).ok_or(Corrupt::Block)?;
+    take(at, rest, n)?;
+    n = n.saturating_add(rest);
+    let literals = work.literals.get(..n).ok_or(Corrupt::Block)?;
     literals_section(literals, strategy, work.block)?;
     sequences_section(work)?;
     Ok(())
@@ -1748,11 +1795,11 @@ mod tests {
                     match_length: f.length,
                 })
                 .collect();
-            c.block.clear();
+            let mut section = Vec::new();
             let mut work = Work {
                 found: &mut c.found,
                 literals: &mut c.literals,
-                block: &mut c.block,
+                block: &mut section,
                 codes: &mut c.codes,
                 own: &mut c.own,
                 predefined: &c.predefined,
@@ -1763,7 +1810,7 @@ mod tests {
             let mut tables = sequences::Tables::default();
             let predefined = sequences::Predefined::new().unwrap();
             let mut got = Vec::new();
-            sequences::decode(&c.block, &mut tables, &predefined, |seq| {
+            sequences::decode(&section, &mut tables, &predefined, |seq| {
                 got.push(seq);
                 Ok(())
             })

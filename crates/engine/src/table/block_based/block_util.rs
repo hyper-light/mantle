@@ -31,7 +31,7 @@ fn varint(p: &[u8], at: &mut usize) -> Result<u32, Error> {
 /// [R block_util.h:78-126] (without, as format_version 4 index blocks write it): the header at
 /// the start of `p`, and how many bytes it takes. `with_value_offset` reads the value offset a
 /// restart entry carries when keys and values are separated.
-#[inline]
+#[inline(always)]
 pub fn decode_entry(
     p: &[u8],
     with_value_length: bool,

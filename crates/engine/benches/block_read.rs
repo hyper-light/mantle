@@ -87,6 +87,7 @@ fn main() {
     let mut where_ = vec![0u32; n];
     let options = BlockBuilderOptions {
         restart_interval: RESTART,
+        capacity: BLOCK_SIZE,
         index_type: if hash {
             DataBlockIndexType::BinaryAndHash
         } else {

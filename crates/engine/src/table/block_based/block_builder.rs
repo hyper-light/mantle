@@ -44,6 +44,10 @@ pub struct BlockBuilderOptions {
     /// Below this coefficient of variation of the restart keys' gaps the block is marked
     /// uniform; `None` never marks it.
     pub uniform_cv_threshold: Option<f64>,
+    /// Bytes to reserve for a block's buffer when the builder is made: the table's block size,
+    /// at which blocks are cut. The buffer keeps its capacity across `reset`, so it grows only
+    /// for a block larger than any before it. 0 reserves nothing.
+    pub capacity: usize,
 }
 
 impl Default for BlockBuilderOptions {
@@ -58,6 +62,7 @@ impl Default for BlockBuilderOptions {
             is_user_key: false,
             use_separated_kv_storage: false,
             uniform_cv_threshold: None,
+            capacity: 0,
         }
     }
 }
@@ -165,7 +170,7 @@ impl BlockBuilder {
         Ok(Self {
             estimate: Self::empty_estimate(&options),
             options,
-            buffer: Vec::new(),
+            buffer: Vec::with_capacity(options.capacity),
             restarts: vec![0],
             counter: 0,
             finished: false,

@@ -41,6 +41,7 @@ fn blocks_match_rocksdb_byte_for_byte() {
             use_separated_kv_storage: flag(5),
             uniform_cv_threshold: Some(f[6].parse().unwrap()),
             is_user_key: flag(7),
+            capacity: 0,
         };
         let with_last_key = flag(8);
         let count: usize = f[9].parse().unwrap();

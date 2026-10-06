@@ -36,6 +36,11 @@ const START_OFFSETS: [u32; 3] = [1, 4, 8];
 pub const SLACK: usize = 2 * WILD_COPY;
 /// The bytes one wild copy moves.
 const WILD_COPY: usize = 16;
+/// Measured: the longest copy moved in WILD_COPY-byte pieces; a longer one is one `memcpy`.
+/// The codec bench on an Apple M5 Max, 2026-10-06, decompress medians of three alternating runs
+/// (port / zstd): assoc 16 KiB blocks 1.86 at 32, 1.77 at 64, 1.79 at 128; objstore and assoc
+/// 4 KiB alike within a run's spread from 64 up. 64 is the smallest on that plateau.
+const WILD_MAX: usize = 64;
 /// The window's smallest exponent base (§3.1.1.1.2: `windowLog = 10 + Exponent`).
 const WINDOW_LOG_BASE: u32 = 10;
 
@@ -741,18 +746,25 @@ impl Execution<'_> {
         if lit_end > self.literals_len || end > self.block_end {
             return Err(Corrupt::Execution);
         }
+        // Pieces of WILD_COPY bytes, the last running at most WILD_COPY - 1 past both ends:
+        // the literals' buffer and the grown window each hold SLACK bytes past them
+        // (`ZSTD_wildcopy`, which copies a sequence's literals whatever their length).
         if len <= WILD_COPY {
-            // One piece: both have SLACK bytes past these ends, the literals' buffer and the
-            // grown window, and it runs at most WILD_COPY - 1 bytes past.
-            let src = self
+            let piece = *self
                 .literals
-                .get(self.lit..self.lit.wrapping_add(WILD_COPY))
+                .get(self.lit..)
+                .and_then(<[u8]>::first_chunk::<WILD_COPY>)
                 .ok_or(Corrupt::Execution)?;
-            self.window
-                .get_mut(self.at..self.at.wrapping_add(WILD_COPY))
-                .ok_or(Corrupt::Execution)?
-                .copy_from_slice(src);
-        } else {
+            *self
+                .window
+                .get_mut(self.at..)
+                .and_then(<[u8]>::first_chunk_mut::<WILD_COPY>)
+                .ok_or(Corrupt::Execution)? = piece;
+            self.lit = lit_end;
+            self.at = end;
+            return Ok(());
+        }
+        if len > WILD_MAX {
             let src = self
                 .literals
                 .get(self.lit..lit_end)
@@ -761,6 +773,23 @@ impl Execution<'_> {
                 .get_mut(self.at..end)
                 .ok_or(Corrupt::Execution)?
                 .copy_from_slice(src);
+            self.lit = lit_end;
+            self.at = end;
+            return Ok(());
+        }
+        let mut k = 0;
+        while k < len {
+            let piece = *self
+                .literals
+                .get(self.lit.wrapping_add(k)..)
+                .and_then(<[u8]>::first_chunk::<WILD_COPY>)
+                .ok_or(Corrupt::Execution)?;
+            *self
+                .window
+                .get_mut(self.at.wrapping_add(k)..)
+                .and_then(<[u8]>::first_chunk_mut::<WILD_COPY>)
+                .ok_or(Corrupt::Execution)? = piece;
+            k = k.wrapping_add(WILD_COPY);
         }
         self.lit = lit_end;
         self.at = end;
@@ -786,24 +815,40 @@ impl Execution<'_> {
         if end.wrapping_add(WILD_COPY) > self.window.len() {
             return Err(Corrupt::Execution);
         }
-        if length <= offset {
-            if length <= WILD_COPY && offset >= WILD_COPY {
-                // One piece, its source wholly before its destination; it may run past `end`.
-                let mut piece = [0u8; WILD_COPY];
-                piece.copy_from_slice(
-                    self.window
-                        .get(src..src.wrapping_add(WILD_COPY))
-                        .ok_or(Corrupt::Execution)?,
-                );
-                self.window
-                    .get_mut(self.at..self.at.wrapping_add(WILD_COPY))
-                    .ok_or(Corrupt::Execution)?
-                    .copy_from_slice(&piece);
-            } else {
-                // The source ends at or before the destination begins.
-                self.window
-                    .copy_within(src..src.wrapping_add(length), self.at);
+        if offset >= WILD_COPY && length <= WILD_COPY {
+            let piece = *self
+                .window
+                .get(src..)
+                .and_then(<[u8]>::first_chunk::<WILD_COPY>)
+                .ok_or(Corrupt::Execution)?;
+            *self
+                .window
+                .get_mut(self.at..)
+                .and_then(<[u8]>::first_chunk_mut::<WILD_COPY>)
+                .ok_or(Corrupt::Execution)? = piece;
+        } else if offset >= WILD_COPY && length <= WILD_MAX {
+            // Pieces of WILD_COPY bytes, the last running at most WILD_COPY - 1 past `end`. Each
+            // piece's source ends at or before its destination begins, so it reads only bytes
+            // already written, overlapping match or not: byte for byte the forward copy the
+            // format defines (`ZSTD_wildcopy` for an offset of at least its piece).
+            let mut k = 0;
+            while k < length {
+                let piece = *self
+                    .window
+                    .get(src.wrapping_add(k)..)
+                    .and_then(<[u8]>::first_chunk::<WILD_COPY>)
+                    .ok_or(Corrupt::Execution)?;
+                *self
+                    .window
+                    .get_mut(self.at.wrapping_add(k)..)
+                    .and_then(<[u8]>::first_chunk_mut::<WILD_COPY>)
+                    .ok_or(Corrupt::Execution)? = piece;
+                k = k.wrapping_add(WILD_COPY);
             }
+        } else if length <= offset {
+            // The source ends at or before the destination begins.
+            self.window
+                .copy_within(src..src.wrapping_add(length), self.at);
         } else {
             // Overlapping: the bytes from `src` repeat with period `offset`, so each pass copies
             // every byte already there from `src` on and the run doubles; byte for byte it is

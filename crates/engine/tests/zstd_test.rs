@@ -190,6 +190,24 @@ fn a_sequence_with_more_than_31_extra_bits_decodes() {
     }
 }
 
+/// A match longer than its offset repeats the bytes it is still writing. Random patterns of
+/// periods on each side of the decoder's copy sizes (its 16-byte pieces, and the 64 bytes past
+/// which a copy is one `memcpy`) repeated, so the matches overlap at every offset that crosses
+/// those boundaries.
+#[test]
+fn overlapping_matches_of_every_period_decode() {
+    let mut rng = Rng(13);
+    for period in [1usize, 2, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100] {
+        let pattern: Vec<u8> = (0..period).map(|_| rng.next() as u8).collect();
+        let data: Vec<u8> = pattern.iter().copied().cycle().take(5_000).collect();
+        for level in [1, 3, 19] {
+            let frame = reference(&data, level, true, true);
+            let got = decode(&frame, None, frame.len(), 1 << 17).unwrap();
+            assert!(got == data, "period {period} level {level}");
+        }
+    }
+}
+
 #[test]
 fn decodes_in_pieces_of_every_size() {
     let corpus = corpus();

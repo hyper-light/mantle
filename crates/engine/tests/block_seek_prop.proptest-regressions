@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b50091300ab02011736ffa35d91009a536d6ccd3db61a17b7f6b24d9b73c4695 # shrinks to users = [([97], 0), ([99], 0), ([98], 0)], targets = [([98, 97], 0)], interval = 3, hash = false
+cc 7aadf0bf9056230aa358de1fa41efbbbe93aa85cb0349cac79d35e0ac6a6743c # shrinks to users = [([], 0), ([], 1), ([0], 0), ([0], 1), ([], 2), ([], 3), ([0], 2), ([], 23), ([], 4), ([0], 3), ([0], 4), ([0], 5), ([0], 6), ([], 5), ([], 6), ([], 7), ([97, 97], 0), ([0], 7), ([], 8), ([0], 8), ([], 9), ([], 10), ([0], 9), ([], 11), ([0], 10), ([], 12), ([], 13), ([97, 97, 1], 0), ([0], 11), ([], 14), ([0], 12), ([0], 13), ([], 15)], targets = [([], 0)], interval = 3, hash = false

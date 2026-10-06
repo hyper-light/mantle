@@ -16,14 +16,17 @@
 
 use crate::branch::Op;
 use crate::error::{Error, Malformed};
+use crate::util::coding::{get_varint32_ptr, put_varint32};
 use std::cmp::Ordering;
 
 /// Measured: the tree's minimum degree, the smallest at which put and get latency stop improving
 /// (benches/memtable.rs; docs/design/constants.md records the runs at 8, 16 and 32).
 pub const DEGREE: usize = 16;
 const MAX_KEYS: usize = 2 * DEGREE - 1;
-/// An entry's fixed bytes in the arena: key length (2), value length (4), operation (1).
-const ENTRY_FIXED: usize = 7;
+/// The most bytes an entry's head takes in the arena: the operation (1), then the key's and the
+/// value's lengths as varints of at most 3 and 5 bytes (a key is below 64 KiB, a value below
+/// 4 GiB). Object-store metadata's keys and values are mostly under 128 bytes, a byte each.
+const ENTRY_HEAD_MAX: usize = 9;
 /// No node.
 const NONE: u32 = u32::MAX;
 
@@ -33,7 +36,7 @@ struct Node {
     leaf: bool,
     entries: [u32; MAX_KEYS],
     /// Each entry's key head ([`head`]), so most comparisons read the node and not the arena.
-    heads: [u64; MAX_KEYS],
+    heads: [u32; MAX_KEYS],
     children: [u32; MAX_KEYS + 1],
 }
 
@@ -64,16 +67,16 @@ pub struct BTreeMem {
     right: u32,
 }
 
-/// A key's head: its first 8 bytes, big-endian, zero-padded. Heads that differ order their keys
+/// A key's head: its first 4 bytes, big-endian, zero-padded. Heads that differ order their keys
 /// as the keys order: at the first byte they differ, either both keys have bytes there, or the
 /// shorter has ended (its pad, 0, below the other's byte, a key ending first being the
 /// smaller). Equal heads say nothing, and the keys are compared whole.
-fn head(key: &[u8]) -> u64 {
-    let mut b = [0u8; 8];
+fn head(key: &[u8]) -> u32 {
+    let mut b = [0u8; 4];
     for (d, s) in b.iter_mut().zip(key) {
         *d = *s;
     }
-    u64::from_be_bytes(b)
+    u32::from_be_bytes(b)
 }
 
 fn corrupt() -> Error {
@@ -128,42 +131,41 @@ impl BTreeMem {
         self.arena.len()
     }
 
+    /// An entry's operation byte, key and value lengths, and where its key starts.
+    fn parse(&self, entry: u32) -> Option<(u8, usize, usize, usize)> {
+        let at = usize::try_from(entry).ok()?;
+        let op = *self.arena.get(at)?;
+        let mut pos = at.checked_add(1)?;
+        let (klen, used) = get_varint32_ptr(self.arena.get(pos..)?).ok()?;
+        pos = pos.checked_add(used)?;
+        let (vlen, used) = get_varint32_ptr(self.arena.get(pos..)?).ok()?;
+        pos = pos.checked_add(used)?;
+        Some((
+            op,
+            usize::try_from(klen).ok()?,
+            usize::try_from(vlen).ok()?,
+            pos,
+        ))
+    }
+
     fn key(&self, entry: u32) -> &[u8] {
-        let at = usize::try_from(entry).unwrap_or(usize::MAX);
-        let klen = self
-            .arena
-            .get(at..)
-            .and_then(<[u8]>::first_chunk::<2>)
-            .map_or(0, |b| usize::from(u16::from_le_bytes(*b)));
-        let start = at.saturating_add(ENTRY_FIXED);
-        self.arena
-            .get(start..start.saturating_add(klen))
+        self.parse(entry)
+            .and_then(|(_, klen, _, start)| self.arena.get(start..start.checked_add(klen)?))
             .unwrap_or(&[])
     }
 
     /// An entry's operation and value.
     fn value(&self, entry: u32) -> Result<(Op, &[u8]), Error> {
-        let at = usize::try_from(entry).map_err(|_| corrupt())?;
-        let head = self
-            .arena
-            .get(at..)
-            .and_then(<[u8]>::first_chunk::<ENTRY_FIXED>)
-            .ok_or(corrupt())?;
-        let [k0, k1, v0, v1, v2, v3, op] = *head;
-        let klen = usize::from(u16::from_le_bytes([k0, k1]));
-        let vlen = usize::try_from(u32::from_le_bytes([v0, v1, v2, v3])).map_err(|_| corrupt())?;
+        let (op, klen, vlen, start) = self.parse(entry).ok_or(corrupt())?;
         let op = match op {
             1 => Op::Put,
             2 => Op::Delete,
             _ => return Err(corrupt()),
         };
-        let start = at
-            .checked_add(ENTRY_FIXED)
-            .and_then(|s| s.checked_add(klen))
-            .ok_or(corrupt())?;
+        let from = start.checked_add(klen).ok_or(corrupt())?;
         let value = self
             .arena
-            .get(start..start.checked_add(vlen).ok_or(corrupt())?)
+            .get(from..from.checked_add(vlen).ok_or(corrupt())?)
             .ok_or(corrupt())?;
         Ok((op, value))
     }
@@ -182,7 +184,7 @@ impl BTreeMem {
 
     /// Where `key`, of head `kh`, is in node `n`: `Ok(i)` at entry `i`, `Err(i)` below child
     /// `i`.
-    fn search(&self, n: &Node, key: &[u8], kh: u64) -> Result<usize, usize> {
+    fn search(&self, n: &Node, key: &[u8], kh: u32) -> Result<usize, usize> {
         let (mut lo, mut hi) = (0usize, n.len);
         while lo < hi {
             let mid = lo.saturating_add(hi.saturating_sub(lo) / 2);
@@ -229,7 +231,7 @@ impl BTreeMem {
         let vlen = u32::try_from(value.len()).map_err(|_| Error::InvalidArgument {
             what: "a value past 4 GiB",
         })?;
-        let size = ENTRY_FIXED
+        let size = ENTRY_HEAD_MAX
             .checked_add(key.len())
             .and_then(|s| s.checked_add(value.len()))
             .ok_or(Error::InvalidArgument {
@@ -247,12 +249,12 @@ impl BTreeMem {
             });
         }
         let entry = u32::try_from(self.arena.len()).map_err(|_| corrupt())?;
-        self.arena.extend_from_slice(&klen.to_le_bytes());
-        self.arena.extend_from_slice(&vlen.to_le_bytes());
         self.arena.push(match op {
             Op::Put => 1,
             Op::Delete => 2,
         });
+        put_varint32(&mut self.arena, u32::from(klen));
+        put_varint32(&mut self.arena, vlen);
         self.arena.extend_from_slice(key);
         self.arena.extend_from_slice(value);
         let kh = head(key);
@@ -272,7 +274,7 @@ impl BTreeMem {
                 return Ok(());
             }
         }
-        let replaced = self.descend(key, kh, entry)?;
+        let replaced = self.descend(key, kh, entry, above)?;
         if above || (replaced && self.last.is_some_and(|l| self.key(l) == key)) {
             self.last = Some(entry);
         }
@@ -290,15 +292,16 @@ impl BTreeMem {
     }
 
     /// Inserts `entry` for `key` by a descent from the root, splitting full nodes on the way;
-    /// true when the key was there and its slot took the entry.
-    fn descend(&mut self, key: &[u8], kh: u64, entry: u32) -> Result<bool, Error> {
+    /// true when the key was there and its slot took the entry. A key `above` every other splits
+    /// the full nodes on its path lopsided ([`Self::split`]).
+    fn descend(&mut self, key: &[u8], kh: u32, entry: u32, above: bool) -> Result<bool, Error> {
         // A full root splits first: the tree grows at the top.
         if self.node(self.root)?.len == MAX_KEYS {
             let old = self.root;
             let mut root = Node::new(false);
             root.children[0] = old;
             self.root = self.push(root)?;
-            self.split(self.root, 0)?;
+            self.split(self.root, 0, above)?;
         }
         let mut at = self.root;
         loop {
@@ -324,7 +327,7 @@ impl BTreeMem {
                 Err(i) => {
                     let mut child = *n.children.get(i).ok_or(corrupt())?;
                     if self.node(child)?.len == MAX_KEYS {
-                        self.split(at, i)?;
+                        self.split(at, i, above)?;
                         // The median rose into slot `i`: the key goes right of it if larger, and
                         // is the median itself if equal.
                         let n = self.node(at)?;
@@ -354,22 +357,42 @@ impl BTreeMem {
         Ok(i)
     }
 
-    /// Splits `parent`'s full child `i` around its median, which rises into `parent` at `i`.
-    fn split(&mut self, parent: u32, i: usize) -> Result<(), Error> {
+    /// Splits `parent`'s full child `i` around a median that rises into `parent` at `i`. An
+    /// even split leaves `DEGREE - 1` entries on each side (Cormen et al., §18.2). A split for a
+    /// key above every other, `lopsided`, keeps all but the last entry on the left and starts the
+    /// right empty: keys arriving in order then fill every node, where even splits leave each
+    /// left half full for good (the bulk-loading split of B+-trees). A node's entry count is then
+    /// below `DEGREE - 1` only on the rightmost path, which no search depends on.
+    fn split(&mut self, parent: u32, i: usize, lopsided: bool) -> Result<(), Error> {
         let child = *self.node(parent)?.children.get(i).ok_or(corrupt())?;
         let full = self.node(child)?.clone();
+        let keep = if lopsided { MAX_KEYS - 1 } else { DEGREE - 1 };
+        let moved = MAX_KEYS.saturating_sub(keep).saturating_sub(1);
         let mut right = Node::new(full.leaf);
-        right.len = DEGREE - 1;
-        right.entries[..DEGREE - 1].copy_from_slice(&full.entries[DEGREE..]);
-        right.heads[..DEGREE - 1].copy_from_slice(&full.heads[DEGREE..]);
+        right.len = moved;
+        let from = keep.saturating_add(1);
+        right
+            .entries
+            .get_mut(..moved)
+            .ok_or(corrupt())?
+            .copy_from_slice(full.entries.get(from..).ok_or(corrupt())?);
+        right
+            .heads
+            .get_mut(..moved)
+            .ok_or(corrupt())?
+            .copy_from_slice(full.heads.get(from..).ok_or(corrupt())?);
         if !full.leaf {
-            right.children[..DEGREE].copy_from_slice(&full.children[DEGREE..]);
+            right
+                .children
+                .get_mut(..moved.saturating_add(1))
+                .ok_or(corrupt())?
+                .copy_from_slice(full.children.get(from..).ok_or(corrupt())?);
         }
-        let median = full.entries[DEGREE - 1];
-        let median_head = full.heads[DEGREE - 1];
+        let median = *full.entries.get(keep).ok_or(corrupt())?;
+        let median_head = *full.heads.get(keep).ok_or(corrupt())?;
         let right = self.push(right)?;
         let left = self.node_mut(child)?;
-        left.len = DEGREE - 1;
+        left.len = keep;
         let p = self.node_mut(parent)?;
         let len = p.len;
         p.entries.copy_within(i..len, i.saturating_add(1));

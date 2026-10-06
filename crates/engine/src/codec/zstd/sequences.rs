@@ -474,17 +474,23 @@ pub(super) fn decode(
         let ll_cell = ll.at(ll_state);
         // Offset bits first, then match length, then literals length (§3.1.1.3.2.1.2). A
         // baseline with its extra bits read stays within u32: at most 2^31 + 2^31 - 1 for an
-        // offset, 65539 + 2^16 - 1 for a length. Offset bits (at most 31) and match length bits
-        // (at most 16) under one refill.
-        bits.ensure(47);
+        // offset, 65539 + 2^16 - 1 for a length. A reload leaves at least 57 bits: the offset's
+        // and match length's extra bits (at most 31 + 16), then the literals length's and the
+        // three states' (at most 9 + 9 + 8) while the extra bits total 31 or fewer, as they
+        // nearly always do; past that a second refill is tested for.
+        bits.reload();
         let offset_value = of_cell
             .base
             .wrapping_add(bits.read_ensured(u32::from(of_cell.extra)));
         let match_length = ml_cell
             .base
             .wrapping_add(bits.read_ensured(u32::from(ml_cell.extra)));
-        // Literals length bits (at most 16) and the states' (at most 9 + 9 + 8) under one.
-        bits.ensure(42);
+        let extra = u32::from(of_cell.extra)
+            .wrapping_add(u32::from(ml_cell.extra))
+            .wrapping_add(u32::from(ll_cell.extra));
+        if extra > 31 {
+            bits.ensure(42);
+        }
         let literals = ll_cell
             .base
             .wrapping_add(bits.read_ensured(u32::from(ll_cell.extra)));

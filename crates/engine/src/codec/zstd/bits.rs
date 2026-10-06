@@ -216,6 +216,15 @@ impl<'a> Backward<'a> {
         }
     }
 
+    /// Steps the word back by the whole bytes read, whether or not enough remain: at least 57
+    /// bits are then readable unless the word starts at the stream's first byte. A loop whose
+    /// reads vary in length takes this once an iteration over [`Self::ensure`], whose test it
+    /// would mispredict (`ZSTD_decodeSequence` reloads once a sequence).
+    #[inline(always)]
+    pub(super) fn reload(&mut self) {
+        self.load();
+    }
+
     /// Makes at least `bits` (at most 57) readable without a refill: refills the word unless
     /// that many remain or it starts at the stream's first byte, where reads past the start
     /// read zero. A refill leaves at least 57 (64 less a partly read byte).

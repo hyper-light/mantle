@@ -167,6 +167,29 @@ fn decodes_every_level_of_the_reference() {
     }
 }
 
+/// A sequence whose extra bits pass 31 takes the sequence decoder's second refill, which the
+/// three states read after it need when their tables are large. Twelve blocks of random bytes
+/// come first; the next block opens with 70,000 of them again (an offset of about 2^20.6, 20
+/// extra bits, and a match past 65,539, 16), and 2,000 short sequences follow it in the same
+/// block, so the block's tables are its own, not the predefined ones.
+#[test]
+fn a_sequence_with_more_than_31_extra_bits_decodes() {
+    let mut rng = Rng(11);
+    let first: Vec<u8> = (0..12 * 131_072).map(|_| rng.next() as u8).collect();
+    let mut data = first.clone();
+    data.extend_from_slice(&first[..70_000]);
+    for k in 0..2_000u64 {
+        data.extend((0..1 + rng.below(4)).map(|_| rng.next() as u8));
+        let at = rng.below(first.len() as u64 - 64) as usize;
+        data.extend_from_slice(&first[at..at + 6 + (k % 13) as usize]);
+    }
+    for level in [3, 9] {
+        let frame = reference(&data, level, true, true);
+        let got = decode(&frame, None, frame.len(), 1 << 17).unwrap();
+        assert!(got == data, "level {level}");
+    }
+}
+
 #[test]
 fn decodes_in_pieces_of_every_size() {
     let corpus = corpus();

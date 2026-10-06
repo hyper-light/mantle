@@ -1608,6 +1608,7 @@ impl Encoder {
 
 #[cfg(test)]
 mod tests {
+    use super::super::sequences::{self, Sequence};
     use super::*;
 
     /// A frame whose positions would pass u32 from the base starts the tables over, and still
@@ -1625,6 +1626,58 @@ mod tests {
             .unwrap();
         assert_eq!(c.base, 1 + u32::try_from(input.len()).unwrap());
         assert_eq!(first, second);
+    }
+
+    proptest::proptest! {
+        /// Sequences written by the encoder's section read back as written, the extra bits of
+        /// one sequence reaching 31 + 16 + 16: offsets of every code and lengths past 2^16, so
+        /// the decoder's reads past one refill are exercised (§3.1.1.3.2.1).
+        #[test]
+        fn sequences_read_back_as_written(
+            sequences in proptest::collection::vec(
+                (0u32..=131_071, 3u32..=131_074, 0u32..=31, proptest::prelude::any::<u32>()),
+                1..300,
+            ),
+        ) {
+            let mut c = Compressor::new().unwrap();
+            c.found.clear();
+            c.found.extend(sequences.iter().map(|&(literals, length, bits, raw)| {
+                // An offset value of code `bits`: its top bit and `bits` extra bits below it;
+                // code 0 is the value 1, a repeat offset.
+                let offset_value = (1u32 << bits) | (raw & ((1u32 << bits) - 1));
+                Found { literals, offset_value, length }
+            }));
+            let expected: Vec<Sequence> = c
+                .found
+                .iter()
+                .map(|f| Sequence {
+                    literals: f.literals,
+                    offset_value: f.offset_value,
+                    match_length: f.length,
+                })
+                .collect();
+            c.block.clear();
+            let mut work = Work {
+                found: &mut c.found,
+                literals: &mut c.literals,
+                block: &mut c.block,
+                codes: &mut c.codes,
+                own: &mut c.own,
+                predefined: &c.predefined,
+                log2: &c.log2,
+                lengths: &c.lengths,
+            };
+            sequences_section(&mut work).unwrap();
+            let mut tables = sequences::Tables::default();
+            let predefined = sequences::Predefined::new().unwrap();
+            let mut got = Vec::new();
+            sequences::decode(&c.block, &mut tables, &predefined, |seq| {
+                got.push(seq);
+                Ok(())
+            })
+            .unwrap();
+            proptest::prop_assert_eq!(got, expected);
+        }
     }
 
     #[test]

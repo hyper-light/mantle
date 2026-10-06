@@ -560,6 +560,18 @@ pub(super) fn code_lengths(counts: &[u32], limit: u32, lengths: &mut [u8; LITERA
     }
     leaves.sort_unstable();
     let leaves = &*leaves;
+    // An unlimited Huffman code is optimal under the limit whenever it keeps to it, so it is
+    // computed first, in place in time linear after the sort; package-merge runs only for the
+    // distributions whose Huffman code is longer than the limit.
+    if !huffman_within(leaves, limit, lengths) {
+        package_merge(leaves, limit, lengths);
+    }
+}
+
+/// Optimal code lengths of at most `limit` bits for `leaves` (sorted by count, then literal; at
+/// least two) into `lengths`, by package-merge, its rows kept as described at [`code_lengths`].
+fn package_merge(leaves: &[(u64, u16)], limit: u32, lengths: &mut [u8; LITERALS]) {
+    let n = leaves.len();
     /// A row item that is a package, not a leaf.
     const PACKAGE: u16 = u16::MAX;
     let rows = usize::try_from(limit.clamp(1, MAX_BITS)).unwrap_or(1);
@@ -638,6 +650,108 @@ pub(super) fn code_lengths(counts: &[u32], limit: u32, lengths: &mut [u8; LITERA
         }
         chosen = packages.saturating_mul(2);
     }
+}
+
+/// Minimum-redundancy code lengths for `leaves` (sorted by count, at least two), computed in
+/// place (Moffat and Katajainen, "In-place calculation of minimum-redundancy codes", WADS 1995):
+/// the tree's internal weights, then each node's depth, then each leaf's. Writes them into
+/// `lengths` and returns true when none exceeds `limit`; writes nothing and returns false
+/// otherwise.
+fn huffman_within(leaves: &[(u64, u16)], limit: u32, lengths: &mut [u8; LITERALS]) -> bool {
+    let n = leaves.len();
+    if !(2..=LITERALS).contains(&n) {
+        return false;
+    }
+    let mut a = [0u64; LITERALS];
+    for (slot, &(w, _)) in a.iter_mut().zip(leaves) {
+        *slot = w;
+    }
+    let Some(a) = a.get_mut(..n) else {
+        return false;
+    };
+    let last = n.wrapping_sub(1);
+    // Every index below is under `n`: `root < next < n` and `leaf` is checked against `n`.
+    let at = |a: &[u64], i: usize| a.get(i).copied().unwrap_or(u64::MAX);
+    // Phase 1: each internal node's weight, a parent's index stored in each child's place.
+    let (mut root, mut leaf) = (0usize, 2usize);
+    let second = at(a, 1);
+    if let Some(y) = a.first_mut() {
+        *y = y.saturating_add(second);
+    }
+    for next in 1..last {
+        let first = if leaf >= n || at(a, root) < at(a, leaf) {
+            let w = at(a, root);
+            if let Some(r) = a.get_mut(root) {
+                *r = u64::try_from(next).unwrap_or(u64::MAX);
+            }
+            root = root.wrapping_add(1);
+            w
+        } else {
+            let w = at(a, leaf);
+            leaf = leaf.wrapping_add(1);
+            w
+        };
+        let second = if leaf >= n || (root < next && at(a, root) < at(a, leaf)) {
+            let w = at(a, root);
+            if let Some(r) = a.get_mut(root) {
+                *r = u64::try_from(next).unwrap_or(u64::MAX);
+            }
+            root = root.wrapping_add(1);
+            w
+        } else {
+            let w = at(a, leaf);
+            leaf = leaf.wrapping_add(1);
+            w
+        };
+        if let Some(slot) = a.get_mut(next) {
+            *slot = first.saturating_add(second);
+        }
+    }
+    // Phase 2: each internal node's depth, from its parent's.
+    if let Some(r) = a.get_mut(n.wrapping_sub(2)) {
+        *r = 0;
+    }
+    for next in (0..n.saturating_sub(2)).rev() {
+        let parent = usize::try_from(at(a, next)).unwrap_or(usize::MAX);
+        let depth = at(a, parent).saturating_add(1);
+        if let Some(slot) = a.get_mut(next) {
+            *slot = depth;
+        }
+    }
+    // Phase 3: the leaves' depths, deepest for the smallest counts.
+    let (mut avail, mut used, mut depth) = (1usize, 0usize, 0u64);
+    let mut root = n.checked_sub(2);
+    let mut next = Some(last);
+    while avail > 0 {
+        while let Some(r) = root
+            && at(a, r) == depth
+        {
+            used = used.wrapping_add(1);
+            root = r.checked_sub(1);
+        }
+        while avail > used {
+            let Some(i) = next else {
+                return false;
+            };
+            if let Some(slot) = a.get_mut(i) {
+                *slot = depth;
+            }
+            next = i.checked_sub(1);
+            avail = avail.wrapping_sub(1);
+        }
+        avail = used.wrapping_mul(2);
+        depth = depth.wrapping_add(1);
+        used = 0;
+    }
+    if a.iter().any(|&d| d > u64::from(limit) || d == 0) {
+        return false;
+    }
+    for (&d, &(_, symbol)) in a.iter().zip(leaves) {
+        if let Some(l) = lengths.get_mut(usize::from(symbol)) {
+            *l = u8::try_from(d).unwrap_or(0);
+        }
+    }
+    true
 }
 
 /// An encoding table: each literal's code and its length.
@@ -932,6 +1046,32 @@ mod tests {
     }
 
     proptest! {
+        /// Whatever path `code_lengths` takes, its lengths cost what the optimal length-limited
+        /// lengths (package-merge as the algorithm states it) cost, form a complete code, and
+        /// keep to the limit.
+        #[test]
+        fn the_lengths_are_optimal_and_complete(
+            counts in proptest::collection::vec(prop_oneof![Just(0u32), 1u32..4, 1u32..100_000], 2..=256),
+            limit in 1u32..=MAX_BITS,
+        ) {
+            let present = counts.iter().filter(|&&c| c > 0).count();
+            prop_assume!(present >= 2 && present <= 1 << limit);
+            let mut lengths = [0u8; LITERALS];
+            code_lengths(&counts, limit, &mut lengths);
+            let oracle = by_lists(&counts, limit);
+            let cost = |ls: &[u8]| -> u64 {
+                counts.iter().zip(ls).map(|(&c, &l)| u64::from(c) * u64::from(l)).sum()
+            };
+            prop_assert_eq!(cost(&lengths[..counts.len()]), cost(&oracle));
+            prop_assert!(lengths.iter().all(|&l| u32::from(l) <= limit));
+            let kraft: u64 = lengths
+                .iter()
+                .filter(|&&l| l > 0)
+                .map(|&l| 1u64 << (MAX_BITS - u32::from(l)))
+                .sum();
+            prop_assert_eq!(kraft, 1u64 << MAX_BITS);
+        }
+
         #[test]
         fn the_array_form_equals_the_lists(
             counts in proptest::collection::vec(prop_oneof![Just(0u32), 1u32..4, 1u32..100_000], 1..=256),
@@ -940,8 +1080,19 @@ mod tests {
             let present = counts.iter().filter(|&&c| c > 0).count();
             // A code of `limit` bits holds at most 2^limit literals.
             prop_assume!(present > 0 && present <= 1 << limit);
+            let mut leaves: Vec<(u64, u16)> = counts
+                .iter()
+                .enumerate()
+                .filter(|&(_, &c)| c > 0)
+                .map(|(s, &c)| (u64::from(c), u16::try_from(s).unwrap()))
+                .collect();
+            leaves.sort_unstable();
             let mut lengths = [0u8; LITERALS];
-            code_lengths(&counts, limit, &mut lengths);
+            if leaves.len() == 1 {
+                lengths[usize::from(leaves[0].1)] = 1;
+            } else {
+                package_merge(&leaves, limit, &mut lengths);
+            }
             let oracle = by_lists(&counts, limit);
             prop_assert_eq!(&lengths[..counts.len()], &oracle[..]);
             prop_assert!(lengths[counts.len()..].iter().all(|&l| l == 0));

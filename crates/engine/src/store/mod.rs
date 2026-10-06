@@ -52,6 +52,27 @@ pub struct Recovered {
     pub root: Option<u64>,
 }
 
+/// The store's I/O since it was opened: what its callers' work cost the device.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IoStats {
+    /// Read calls, each one page.
+    pub reads: u64,
+    /// Write calls: one a page written directly, one a run.
+    pub writes: u64,
+    /// Pages written, directly or in runs.
+    pub pages_written: u64,
+    /// Full flushes.
+    pub syncs: u64,
+    /// Nanoseconds inside the file's write calls, and its read calls: time the device, or the OS
+    /// in front of it, held the caller.
+    pub write_ns: u64,
+    pub read_ns: u64,
+}
+
+fn elapsed_ns(since: std::time::Instant) -> u64 {
+    u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
 /// A store over one file, owned by one thread (as every `BlockFile` is).
 #[derive(Debug)]
 pub struct Store<F: BlockFile> {
@@ -69,6 +90,7 @@ pub struct Store<F: BlockFile> {
     run_pages: u32,
     /// A write or flush failed: the store takes no more.
     fenced: bool,
+    io: IoStats,
 }
 
 fn io(op: &'static str, e: impl std::fmt::Display) -> Error {
@@ -155,6 +177,7 @@ impl<F: BlockFile> Store<F> {
             run_first: 0,
             run_pages: 0,
             fenced: false,
+            io: IoStats::default(),
         };
         store.checkpoint(None, 0)?;
         Ok(store)
@@ -201,6 +224,7 @@ impl<F: BlockFile> Store<F> {
                 run_first: 0,
                 run_pages: 0,
                 fenced: false,
+                io: IoStats::default(),
             },
             recovered,
         ))
@@ -275,6 +299,11 @@ impl<F: BlockFile> Store<F> {
         address
             .checked_mul(u64::try_from(config.page_size).map_err(|_| corrupt(Malformed::TooLarge))?)
             .ok_or(corrupt(Malformed::TooLarge))
+    }
+
+    /// The store's I/O since it was opened.
+    pub fn io_stats(&self) -> IoStats {
+        self.io
     }
 
     /// The pages an extent holds.
@@ -368,14 +397,19 @@ impl<F: BlockFile> Store<F> {
             .copy_from_slice(payload);
         page::seal(buf, address, kind, generation, payload.len())?;
         let offset = Self::offset_in(self.config, address)?;
+        self.io.writes = self.io.writes.saturating_add(1);
+        self.io.pages_written = self.io.pages_written.saturating_add(1);
+        let started = std::time::Instant::now();
         let written = self
             .file
             .write_all_at(self.buf.as_slice(), offset)
             .map_err(|e| io("write a store page", e));
+        self.io.write_ns = self.io.write_ns.saturating_add(elapsed_ns(started));
         self.fence(written)
     }
 
     fn sync(&mut self) -> Result<(), Error> {
+        self.io.syncs = self.io.syncs.saturating_add(1);
         let synced = self.file.sync_data().map_err(|e| io("flush a store", e));
         self.fence(synced)
     }
@@ -448,7 +482,13 @@ impl<F: BlockFile> Store<F> {
             .and_then(|p| p.checked_mul(self.config.page_size))
             .ok_or(corrupt(Malformed::TooLarge))?;
         let offset = Self::offset_in(self.config, self.run_first)?;
+        self.io.writes = self.io.writes.saturating_add(1);
+        self.io.pages_written = self
+            .io
+            .pages_written
+            .saturating_add(u64::from(self.run_pages));
         self.run_pages = 0;
+        let started = std::time::Instant::now();
         let written = self
             .run
             .as_slice()
@@ -459,6 +499,7 @@ impl<F: BlockFile> Store<F> {
                     .write_all_at(run, offset)
                     .map_err(|e| io("write a store page run", e))
             });
+        self.io.write_ns = self.io.write_ns.saturating_add(elapsed_ns(started));
         self.fence(written)
     }
 
@@ -485,9 +526,14 @@ impl<F: BlockFile> Store<F> {
             self.flush_run()?;
         }
         let offset = Self::offset_in(self.config, address)?;
-        self.file
+        self.io.reads = self.io.reads.saturating_add(1);
+        let started = std::time::Instant::now();
+        let read = self
+            .file
             .read_exact_at(self.buf.as_mut_slice(), offset)
-            .map_err(|e| io("read a store page", e))?;
+            .map_err(|e| io("read a store page", e));
+        self.io.read_ns = self.io.read_ns.saturating_add(elapsed_ns(started));
+        read?;
         let header = page::verify(self.buf.as_slice(), address)?;
         if header.kind != Kind::Node {
             return Err(corrupt(Malformed::UnknownTag(0)));

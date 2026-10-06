@@ -55,6 +55,21 @@ struct Node {
     end: Option<Vec<u8>>,
 }
 
+/// What the trunk's maintenance has done since it was made or loaded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrunkStats {
+    /// Pivots whose in-flight bundles were compacted into one branch.
+    pub pivot_compactions: u64,
+    /// Leaves compacted whole.
+    pub leaf_compactions: u64,
+    /// Pivot bundles flushed to a child.
+    pub flushes: u64,
+    /// Nodes made by splits, leaves and index nodes.
+    pub splits: u64,
+    /// Entries written into branches by compactions.
+    pub entries_written: u64,
+}
+
 /// One shard's trunk.
 #[derive(Debug)]
 pub struct Trunk {
@@ -63,6 +78,7 @@ pub struct Trunk {
     config: TrunkConfig,
     /// The extents of the last saved image, released when the next one is saved.
     saved: Vec<u64>,
+    stats: TrunkStats,
 }
 
 /// The saved image's format version.
@@ -109,6 +125,7 @@ impl Trunk {
             root: 0,
             config,
             saved: Vec::new(),
+            stats: TrunkStats::default(),
         })
     }
 
@@ -423,6 +440,7 @@ impl Trunk {
                 leaf_entries,
             },
             saved,
+            stats: TrunkStats::default(),
         })
     }
 
@@ -450,6 +468,7 @@ impl Trunk {
             let bundle =
                 std::mem::take(&mut self.node_mut(n)?.pivots.get_mut(i).ok_or(corrupt())?.bundle);
             // Oldest first into the child's in-flight list: the bundle is newest first.
+            self.stats.flushes = self.stats.flushes.saturating_add(1);
             for b in bundle.into_iter().rev() {
                 self.node_mut(child)?.inflight.push(vec![b]);
             }
@@ -495,6 +514,10 @@ impl Trunk {
             let (from, end) = (pivot.key.clone(), Self::pivot_end(node, i));
             let inflight = node.inflight.len();
             let merged = compact(store, &branches, &from, end.as_deref(), false)?;
+            self.stats.pivot_compactions = self.stats.pivot_compactions.saturating_add(1);
+            if let Some(b) = &merged {
+                self.stats.entries_written = self.stats.entries_written.saturating_add(b.count);
+            }
             let pivot = self.node_mut(n)?.pivots.get_mut(i).ok_or(corrupt())?;
             pivot.start = inflight;
             if let Some(b) = merged {
@@ -539,6 +562,14 @@ impl Trunk {
             true,
             self.config.leaf_entries.div_ceil(2).max(1),
         )?;
+        self.stats.leaf_compactions = self.stats.leaf_compactions.saturating_add(1);
+        self.stats.splits = self
+            .stats
+            .splits
+            .saturating_add(u64::try_from(parts.len().saturating_sub(1)).unwrap_or(0));
+        for (_, b) in &parts {
+            self.stats.entries_written = self.stats.entries_written.saturating_add(b.count);
+        }
         for b in &branches {
             release(store, b)?;
         }
@@ -632,6 +663,10 @@ impl Trunk {
             let idx = out.get(j).ok_or(corrupt())?.1;
             self.node_mut(idx)?.end = end_key;
         }
+        self.stats.splits = self
+            .stats
+            .splits
+            .saturating_add(u64::try_from(out.len().saturating_sub(1)).unwrap_or(0));
         Ok(out)
     }
 
@@ -648,6 +683,11 @@ impl Trunk {
         }
         let leaves = self.nodes.iter().filter(|n| n.leaf).count();
         Ok((height, self.nodes.len(), leaves))
+    }
+
+    /// What the trunk's maintenance has done.
+    pub fn stats(&self) -> TrunkStats {
+        self.stats
     }
 
     /// The extents of the trunk's saved image.

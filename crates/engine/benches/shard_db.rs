@@ -3,7 +3,7 @@
 //! `[0, num)` as db_bench draws them, a 64 MiB memtable (db_bench's `write_buffer_size`), no
 //! compression, no write-ahead log (the Raft log is the engine's, docs/design/engine-structure.md
 //! §2; `--disable_wal=1` on RocksDB's side), buffered reads through the OS page cache on both.
-//! `cargo bench -p mantle-engine --bench shard_db -- DIR [NUM] [FANOUT]` prints
+//! `cargo bench -p mantle-engine --bench shard_db -- DIR [NUM] [FANOUT] [buffered|direct]` prints
 //! `workload num ops_per_s micros_per_op`, and the trunk's shape.
 #![allow(
     clippy::unwrap_used,
@@ -13,6 +13,7 @@
     clippy::arithmetic_side_effects,
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
     clippy::disallowed_macros,
     clippy::disallowed_methods
 )]
@@ -55,7 +56,13 @@ fn main() {
     let path = dir.join("shard_db.store");
     let _ = std::fs::remove_file(&path);
     let align = Alignment::new(4096).unwrap();
-    let file = DeviceFile::open(&path, true, CachingRequest::Buffered, align).unwrap();
+    // `direct` as the fourth argument: transfers bypass the OS page cache (F_NOCACHE on macOS,
+    // O_DIRECT on Linux); buffered by default, as db_bench reads.
+    let caching = match args.get(3).map(String::as_str) {
+        Some("direct") => CachingRequest::PreferDirect,
+        _ => CachingRequest::Buffered,
+    };
+    let file = DeviceFile::open(&path, true, caching, align).unwrap();
     let config = Config {
         page_size: 4096,
         extent_pages: 32,
@@ -76,11 +83,48 @@ fn main() {
     .unwrap();
     let value = [b'v'; 100];
     let mut rng = Rng(301);
+    // Each operation timed, into a vector sized before the run: percentiles from the sorted
+    // samples, as db_bench's --histogram=1 times each of its operations.
+    let mut lat: Vec<u64> = Vec::with_capacity(num as usize);
     let t = Instant::now();
     for _ in 0..num {
-        db.put(&key(rng.next() % num), &value).unwrap();
+        let k = key(rng.next() % num);
+        let o = Instant::now();
+        db.put(&k, &value).unwrap();
+        lat.push(o.elapsed().as_nanos() as u64);
     }
     let s = t.elapsed().as_secs_f64();
+    report("fillrandom", &mut lat);
+    let (f, t, io) = db.stats();
+    let user = num * (16 + 100);
+    println!(
+        "fill flushes {} pack {:.2}s (max {:.0}ms) incorporate {:.2}s (max {:.0}ms)",
+        f.flushes,
+        f.pack_ns as f64 / 1e9,
+        f.pack_max_ns as f64 / 1e6,
+        f.incorporate_ns as f64 / 1e9,
+        f.incorporate_max_ns as f64 / 1e6
+    );
+    println!(
+        "fill trunk pivot_compactions {} leaf_compactions {} flushes {} splits {} entries_written {} ({:.2}x the puts)",
+        t.pivot_compactions,
+        t.leaf_compactions,
+        t.flushes,
+        t.splits,
+        t.entries_written,
+        t.entries_written as f64 / num as f64
+    );
+    println!(
+        "fill io reads {} ({:.2}s) writes {} ({:.2}s) pages_written {} ({:.2} GB, write amplification {:.2}) syncs {}",
+        io.reads,
+        io.read_ns as f64 / 1e9,
+        io.writes,
+        io.write_ns as f64 / 1e9,
+        io.pages_written,
+        io.pages_written as f64 * 4096.0 / 1e9,
+        io.pages_written as f64 * 4096.0 / user as f64,
+        io.syncs
+    );
     println!(
         "fillrandom {num} {:.0} {:.3}",
         num as f64 / s,
@@ -88,13 +132,18 @@ fn main() {
     );
     let mut out = Vec::new();
     let mut found = 0u64;
+    lat.clear();
     let t = Instant::now();
     for _ in 0..num {
-        if db.get(&key(rng.next() % num), &mut out).unwrap() {
+        let k = key(rng.next() % num);
+        let o = Instant::now();
+        if db.get(&k, &mut out).unwrap() {
             found += 1;
         }
+        lat.push(o.elapsed().as_nanos() as u64);
     }
     let s = t.elapsed().as_secs_f64();
+    report("readrandom", &mut lat);
     println!(
         "readrandom {num} {:.0} {:.3} found {found}",
         num as f64 / s,
@@ -104,4 +153,19 @@ fn main() {
     println!("shape height {h} nodes {n} leaves {l}");
     drop(db);
     std::fs::remove_file(&path).unwrap();
+}
+
+/// Prints a workload's latency percentiles in microseconds: p50, p99, p99.9, p99.99, max.
+fn report(name: &str, lat: &mut [u64]) {
+    lat.sort_unstable();
+    let at =
+        |q: f64| lat[((lat.len() as f64 * q).max(0.0) as usize).min(lat.len() - 1)] as f64 / 1000.0;
+    println!(
+        "{name} latency_us p50 {:.2} p99 {:.2} p99.9 {:.2} p99.99 {:.2} max {:.2}",
+        at(0.50),
+        at(0.99),
+        at(0.999),
+        at(0.9999),
+        lat[lat.len() - 1] as f64 / 1000.0
+    );
 }

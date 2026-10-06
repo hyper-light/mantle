@@ -14,12 +14,28 @@ use crate::store::{Config, Store};
 use crate::trunk::{Trunk, TrunkConfig};
 use hyper_block::block::BlockFile;
 
+/// The time the engine's flushes took on the put path: packing the memtable into a branch, and
+/// incorporating it into the trunk (the compactions, flushes and splits it set off), in total and
+/// at the most for one flush.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FlushStats {
+    /// Memtables flushed.
+    pub flushes: u64,
+    /// Nanoseconds packing, in all and at the most.
+    pub pack_ns: u64,
+    pub pack_max_ns: u64,
+    /// Nanoseconds incorporating, in all and at the most.
+    pub incorporate_ns: u64,
+    pub incorporate_max_ns: u64,
+}
+
 /// A shard's engine over a store.
 #[derive(Debug)]
 pub struct ShardDb<F: BlockFile> {
     store: Store<F>,
     mem: BTreeMem,
     trunk: Trunk,
+    flush_stats: FlushStats,
 }
 
 impl<F: BlockFile> ShardDb<F> {
@@ -35,6 +51,7 @@ impl<F: BlockFile> ShardDb<F> {
             store: Store::create(file, store)?,
             mem: BTreeMem::new(mem_limit)?,
             trunk: Trunk::new(trunk)?,
+            flush_stats: FlushStats::default(),
         })
     }
 
@@ -57,6 +74,7 @@ impl<F: BlockFile> ShardDb<F> {
                 store,
                 mem: BTreeMem::new(mem_limit)?,
                 trunk,
+                flush_stats: FlushStats::default(),
             },
             recovered.applied,
         ))
@@ -166,14 +184,29 @@ impl<F: BlockFile> ShardDb<F> {
         if self.mem.is_empty() {
             return Ok(());
         }
+        let started = std::time::Instant::now();
         let mut builder = Builder::new(self.store.page_capacity())?;
         let store = &mut self.store;
         self.mem
             .walk(|key, op, value| builder.add(store, key, op, value))?;
         let branch = builder.finish(&mut self.store)?;
+        let packed = std::time::Instant::now();
         self.trunk.incorporate(&mut self.store, branch)?;
         self.mem.clear();
+        let ns = |d: std::time::Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        let (pack, inc) = (ns(packed.duration_since(started)), ns(packed.elapsed()));
+        let f = &mut self.flush_stats;
+        f.flushes = f.flushes.saturating_add(1);
+        f.pack_ns = f.pack_ns.saturating_add(pack);
+        f.pack_max_ns = f.pack_max_ns.max(pack);
+        f.incorporate_ns = f.incorporate_ns.saturating_add(inc);
+        f.incorporate_max_ns = f.incorporate_max_ns.max(inc);
         Ok(())
+    }
+
+    /// The flushes' time, the trunk's maintenance, and the store's I/O since the engine started.
+    pub fn stats(&self) -> (FlushStats, crate::trunk::TrunkStats, crate::store::IoStats) {
+        (self.flush_stats, self.trunk.stats(), self.store.io_stats())
     }
 
     /// The trunk's shape: height, nodes, leaves.

@@ -14,7 +14,7 @@ use super::decoder::{BLOCK_MAX, FRAME_MAGIC};
 use super::fse::{
     CELLS_MAX, EncodeState, EncodeTable, LITERALS_LENGTH_DEFAULT, LITERALS_LENGTH_DEFAULT_LOG,
     MATCH_LENGTH_DEFAULT, MATCH_LENGTH_DEFAULT_LOG, OFFSET_DEFAULT, OFFSET_DEFAULT_LOG,
-    SYMBOLS_MAX, normalize, table_log, write_distribution,
+    SYMBOLS_MAX, normalize, optimal_log, table_log, write_distribution,
 };
 use super::huffman::{HuffmanEncoder, LITERALS, MAX_BITS, code_lengths};
 use super::sequences::{
@@ -449,7 +449,7 @@ fn encode_block(
     }
     let saved = *offsets;
     matcher.sequences(start, end, offsets, work.found);
-    compress_block(input, start, end, work)?;
+    compress_block(input, start, end, matcher.level.strategy, work)?;
     if work.block.len() < block.len() {
         out.extend_from_slice(&header(2, work.block.len())?);
         out.extend_from_slice(work.block);
@@ -1165,6 +1165,7 @@ fn compress_block(
     input: &[u8],
     start: usize,
     end: usize,
+    strategy: Strategy,
     work: &mut Work<'_>,
 ) -> Result<(), Corrupt> {
     let literals = &mut *work.literals;
@@ -1177,14 +1178,14 @@ fn compress_block(
     }
     literals.extend_from_slice(input.get(at..end).ok_or(Corrupt::Block)?);
     work.block.clear();
-    literals_section(literals, work.block)?;
+    literals_section(literals, strategy, work.block)?;
     sequences_section(work)?;
     Ok(())
 }
 
 /// The literals section (§3.1.1.3.1) onto `out`: RLE when every literal is one, Huffman-coded
 /// when that saves bytes, raw otherwise.
-fn literals_section(literals: &[u8], out: &mut Vec<u8>) -> Result<(), Corrupt> {
+fn literals_section(literals: &[u8], strategy: Strategy, out: &mut Vec<u8>) -> Result<(), Corrupt> {
     let n = literals.len();
     if let Some(&first) = literals.first()
         && n > 1
@@ -1195,14 +1196,50 @@ fn literals_section(literals: &[u8], out: &mut Vec<u8>) -> Result<(), Corrupt> {
         return Ok(());
     }
     let start = out.len();
-    let raw = raw_header_len(n).saturating_add(n);
-    if huffman_literals(literals, out).is_ok() && out.len().saturating_sub(start) < raw {
+    if n >= min_literals(strategy) && matches!(huffman_literals(literals, strategy, out), Ok(true))
+    {
         return Ok(());
     }
     out.truncate(start);
     raw_or_rle_header(0, n, out)?;
     out.extend_from_slice(literals);
     Ok(())
+}
+
+/// The reference's number of a strategy, `ZSTD_fast` 1 to `ZSTD_btultra2` 9.
+fn strategy_number(strategy: Strategy) -> usize {
+    match strategy {
+        Strategy::Fast => 1,
+        Strategy::DFast => 2,
+        Strategy::Greedy => 3,
+        Strategy::Lazy => 4,
+        Strategy::Lazy2 => 5,
+        Strategy::BtLazy2 => 6,
+        Strategy::BtOpt => 7,
+        Strategy::BtUltra => 8,
+        Strategy::BtUltra2 => 9,
+    }
+}
+
+/// Fewer literals than this are stored raw without a Huffman attempt
+/// (`ZSTD_minLiteralsToCompress`, zstd 1.5.7 lib/compress/zstd_compress_literals.c, without a
+/// previous table to repeat, which a block of RocksDB's never has): 8 bytes at `btultra2`,
+/// twice as many for each strategy below it, at most 64.
+fn min_literals(strategy: Strategy) -> usize {
+    8usize << 9usize.saturating_sub(strategy_number(strategy)).min(3)
+}
+
+/// The least a coded literals section must save over raw to be kept (`ZSTD_minGain`, zstd
+/// 1.5.7 lib/compress/zstd_compress_internal.h): `n >> 6` plus 2, the shift the strategy's
+/// number less one from `btultra` (8) up.
+fn min_gain(n: usize, strategy: Strategy) -> usize {
+    let number = strategy_number(strategy);
+    let shift = if number >= 8 {
+        number.saturating_sub(1)
+    } else {
+        6
+    };
+    (n >> shift).saturating_add(2)
 }
 
 /// The length of a raw or RLE literals header for `size` literals (§3.1.1.3.1.1).
@@ -1234,14 +1271,31 @@ fn raw_or_rle_header(kind: u8, size: usize, out: &mut Vec<u8>) -> Result<(), Cor
 /// literals' count alone, as the reference's `ZSTD_compressLiterals` sets it: a coded section
 /// no shorter than the literals is not kept, so its size fits wherever theirs does. On an error
 /// `out` may hold a partial section.
-fn huffman_literals(literals: &[u8], out: &mut Vec<u8>) -> Result<(), Corrupt> {
+fn huffman_literals(
+    literals: &[u8],
+    strategy: Strategy,
+    out: &mut Vec<u8>,
+) -> Result<bool, Corrupt> {
+    let n = literals.len();
     let mut counts = [0u32; LITERALS];
     for &b in literals {
         let c = counts.get_mut(usize::from(b)).ok_or(Corrupt::Huffman)?;
         *c = c.saturating_add(1);
     }
+    // `HUF_compress_internal`'s heuristic: no byte value more frequent than `n / 128 + 4`
+    // means the literals are near uniform, and a table would cost about what it saves.
+    let largest = counts.iter().copied().max().unwrap_or(0);
+    let largest = usize::try_from(largest).map_err(|_| Corrupt::Huffman)?;
+    if largest <= (n >> 7).saturating_add(4) {
+        return Ok(false);
+    }
+    let max_symbol = counts.iter().rposition(|&c| c > 0).unwrap_or(0);
     let mut lengths = [0u8; LITERALS];
-    code_lengths(&counts, MAX_BITS, &mut lengths);
+    code_lengths(
+        &counts,
+        optimal_log(n, max_symbol, MAX_BITS, 1),
+        &mut lengths,
+    );
     let table = HuffmanEncoder::new(&lengths)?;
     let r = u32::try_from(literals.len()).map_err(|_| Corrupt::Literals)?;
     let four = literals.len() >= 256;
@@ -1259,7 +1313,12 @@ fn huffman_literals(literals: &[u8], out: &mut Vec<u8>) -> Result<(), Corrupt> {
     };
     let start = out.len();
     out.extend_from_slice([0; 5].get(..header).ok_or(Corrupt::Literals)?);
+    let described = out.len();
     table.description(out)?;
+    // A table whose description leaves under 12 bytes to save is not used (`HUF_compress_internal`).
+    if out.len().saturating_sub(described).saturating_add(12) >= n {
+        return Ok(false);
+    }
     table.streams(literals, four, out)?;
     let c = u64::try_from(out.len().saturating_sub(start).saturating_sub(header))
         .map_err(|_| Corrupt::Literals)?;
@@ -1272,11 +1331,16 @@ fn huffman_literals(literals: &[u8], out: &mut Vec<u8>) -> Result<(), Corrupt> {
     if c >= 1 << width {
         return Err(Corrupt::Literals);
     }
+    // Kept only if it saves the strategy's least gain (`ZSTD_compressLiterals`).
+    let kept_below = n.saturating_sub(min_gain(n, strategy));
+    if usize::try_from(c).map_err(|_| Corrupt::Literals)? >= kept_below {
+        return Ok(false);
+    }
     let v = 2u64 | (format << 2) | (u64::from(r) << 4) | (c << at);
     out.get_mut(start..start.saturating_add(header))
         .ok_or(Corrupt::Literals)?
         .copy_from_slice(v.to_le_bytes().get(..header).ok_or(Corrupt::Literals)?);
-    Ok(())
+    Ok(true)
 }
 
 /// One symbol type's table for the block: its mode (§3.1.1.3.2.1, Table 15) and its encoding

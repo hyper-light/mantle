@@ -607,18 +607,19 @@ fn fse_weights(
 
 /// The literals a Huffman table codes: every byte value (§4.2.1).
 pub(super) const LITERALS: usize = 256;
-/// Items a package-merge row holds at most: every leaf and a package of each pair before.
-const ROW_MAX: usize = 2 * LITERALS;
 
-/// Optimal code lengths of at most `limit` bits (at most [`MAX_BITS`]) for `counts` (one per
-/// literal, 0 for absent), into `lengths`: the package-merge algorithm (Larmore and Hirschberg,
-/// "A fast algorithm for optimal length-limited Huffman codes", JACM 37(3), 1990). Absent
-/// literals get 0; a single present literal gets 1.
+/// Code lengths of at most `limit` bits (at most [`MAX_BITS`]) for `counts` (one per literal, 0
+/// for absent), into `lengths`, as the reference makes them (zstd 1.5.7
+/// lib/compress/huf_compress.c, `HUF_buildCTable_wksp`): a minimum-redundancy code, and where
+/// it is deeper than `limit`, that code repaired to the limit by `HUF_setMaxHeight`
+/// ([`set_max_height`]). Absent literals get 0; a single present literal gets 1.
 ///
-/// No row's items are kept as lists of the leaves they package. Each row keeps only its merged
-/// order, an item a leaf's literal or a package; the items chosen in a row are always a prefix of
-/// it, its packages choosing twice as many of the row before. So each leaf's length is the
-/// number of rows whose chosen prefix holds it, counted from the last row back.
+/// The repair is not the optimal length-limited code (package-merge's), and is kept over it on
+/// measurement: on RocksDB-format blocks of object-store and association metadata, at the
+/// reference's depth for the literals' count, package-merge's lengths took about a quarter of
+/// compression's time at 4 KiB blocks, and the sections they gave were no smaller once the
+/// table's description is counted (smaller on one corpus by 0.1%, larger on the other). The
+/// optimal code minimizes the coded bits alone; the description follows the lengths.
 pub(super) fn code_lengths(counts: &[u32], limit: u32, lengths: &mut [u8; LITERALS]) {
     lengths.fill(0);
     // The present literals by count, then by literal, as the rows merge them.
@@ -643,95 +644,188 @@ pub(super) fn code_lengths(counts: &[u32], limit: u32, lengths: &mut [u8; LITERA
     }
     leaves.sort_unstable();
     let leaves = &*leaves;
-    // An unlimited Huffman code is optimal under the limit whenever it keeps to it, so it is
-    // computed first, in place in time linear after the sort; package-merge runs only for the
-    // distributions whose Huffman code is longer than the limit.
-    if !huffman_within(leaves, limit, lengths) {
-        package_merge(leaves, limit, lengths);
+    // The minimum-redundancy code in place, in time linear after the sort; past the limit it
+    // is repaired. A code of `n` lengths needs `2^limit >= n`: the reference's depth for the
+    // literals always leaves more (`optimal_log` takes at least `highbit(max_symbol) + 2`), and
+    // with exactly `n` every length is the limit.
+    if huffman_within(leaves, u32::from(u8::MAX), lengths) {
+        set_max_height(leaves, limit, lengths);
     }
 }
 
-/// Optimal code lengths of at most `limit` bits for `leaves` (sorted by count, then literal; at
-/// least two) into `lengths`, by package-merge, its rows kept as described at [`code_lengths`].
-fn package_merge(leaves: &[(u64, u16)], limit: u32, lengths: &mut [u8; LITERALS]) {
+/// Repairs `lengths`, a minimum-redundancy code for `leaves` (sorted by count, then literal; at
+/// least two), to at most `target` bits, as the reference does (zstd 1.5.7
+/// lib/compress/huf_compress.c, `HUF_setMaxHeight`, its nodes the leaves by count descending).
+/// Every length past `target` is cut to it, which overspends the code space; the overspend is
+/// repaid by lengthening the cheapest shorter codes, a rank at a time, and any overshoot is
+/// given back to the longest. The code stays complete. With `2^target` equal to the leaves'
+/// count, the only complete code is every length `target`.
+fn set_max_height(leaves: &[(u64, u16)], target: u32, lengths: &mut [u8; LITERALS]) {
     let n = leaves.len();
-    /// A row item that is a package, not a leaf.
-    const PACKAGE: u16 = u16::MAX;
-    let rows = usize::try_from(limit.clamp(1, MAX_BITS)).unwrap_or(1);
-    let mut order = [[0u16; ROW_MAX]; MAX_BITS as usize];
-    let mut sizes = [0usize; MAX_BITS as usize];
-    // Each row's weights, in two buffers that take turns as the row and the one before.
-    let mut weights = [[0u64; ROW_MAX]; 2];
-    // The first row: the leaves.
-    if let (Some(first), Some(w0)) = (order.first_mut(), weights.first_mut()) {
-        for ((o, slot), &(w, s)) in first.iter_mut().zip(w0.iter_mut()).zip(leaves) {
-            *o = s;
-            *slot = w;
+    let Some(last) = n.checked_sub(1) else {
+        return;
+    };
+    // Node `i`, the `i`-th heaviest leaf: its count and literal.
+    let node = |i: usize| last.checked_sub(i).and_then(|j| leaves.get(j)).copied();
+    let count = |i: usize| node(i).map_or(0, |(c, _)| c);
+    let mut bits = [0u32; LITERALS];
+    for (i, b) in bits.iter_mut().enumerate().take(n) {
+        *b = node(i)
+            .and_then(|(_, s)| lengths.get(usize::from(s)))
+            .map_or(0, |&l| u32::from(l));
+    }
+    let at = |bits: &[u32; LITERALS], i: usize| bits.get(i).copied().unwrap_or(0);
+    let largest = at(&bits, last);
+    if largest <= target {
+        return;
+    }
+    if 1usize.checked_shl(target) == Some(n) {
+        for b in bits.iter_mut().take(n) {
+            *b = target;
+        }
+    } else {
+        repay(&mut bits, last, target, largest, count);
+    }
+    for (i, &b) in bits.iter().enumerate().take(n) {
+        if let Some((_, s)) = node(i)
+            && let Some(l) = lengths.get_mut(usize::from(s))
+        {
+            *l = u8::try_from(b).unwrap_or(u8::MAX);
         }
     }
-    if let Some(first) = sizes.first_mut() {
-        *first = n;
-    }
-    for r in 1..rows {
-        let previous = sizes.get(r.wrapping_sub(1)).copied().unwrap_or(0);
-        let [even, odd] = &mut weights;
-        let (before, current) = if r % 2 == 1 {
-            (&*even, odd)
-        } else {
-            (&*odd, even)
-        };
-        let Some(row) = order.get_mut(r) else {
+}
+
+/// [`set_max_height`]'s cut and repayment over `bits`, the nodes' lengths heaviest first, the
+/// deepest `largest` at `last`. Kraft sums are counted in units of `2^-largest`, then of
+/// `2^-target`, as the reference counts them.
+fn repay(
+    bits: &mut [u32; LITERALS],
+    last: usize,
+    target: u32,
+    largest: u32,
+    count: impl Fn(usize) -> u64,
+) {
+    let get = |bits: &[u32; LITERALS], i: usize| bits.get(i).copied().unwrap_or(0);
+    let shift = largest.saturating_sub(target);
+    let unit = |b: u32| 1i64.checked_shl(largest.saturating_sub(b)).unwrap_or(0);
+    // Cut every length past the target, totting up what that overspends.
+    let mut total = 0i64;
+    let mut k = last;
+    while get(bits, k) > target {
+        total = total
+            .saturating_add(unit(target))
+            .saturating_sub(unit(get(bits, k)));
+        if let Some(b) = bits.get_mut(k) {
+            *b = target;
+        }
+        let Some(next) = k.checked_sub(1) else {
             break;
         };
-        // Package pairs of the previous row, then merge them with the leaves by weight, a leaf
-        // before a package of equal weight.
-        let packages = previous >> 1;
-        let (mut i, mut j, mut k) = (0usize, 0usize, 0usize);
-        loop {
-            let package = (j < packages)
-                .then(|| {
-                    let at = j.wrapping_mul(2);
-                    before
-                        .get(at)
-                        .zip(before.get(at.wrapping_add(1)))
-                        .map(|(a, b)| a.saturating_add(*b))
-                })
-                .flatten();
-            let (w, item) = match (leaves.get(i), package) {
-                (Some(&(lw, _)), Some(pw)) if lw > pw => (pw, PACKAGE),
-                (Some(&(lw, ls)), _) => (lw, ls),
-                (None, Some(pw)) => (pw, PACKAGE),
-                (None, None) => break,
-            };
-            if item == PACKAGE {
-                j = j.wrapping_add(1);
-            } else {
-                i = i.wrapping_add(1);
+        k = next;
+    }
+    // `k`: the lightest node shorter than the target.
+    while get(bits, k) == target {
+        let Some(next) = k.checked_sub(1) else {
+            break;
+        };
+        k = next;
+    }
+    total >>= shift;
+    // The lightest node of each length `target - r`, by `r`.
+    const RANKS: usize = MAX_BITS as usize + 3;
+    let mut rank_last: [Option<usize>; RANKS] = [None; RANKS];
+    let mut current = target;
+    for pos in (0..=k).rev() {
+        let b = get(bits, pos);
+        if b < current {
+            current = b;
+            if let Some(r) = usize::try_from(target.saturating_sub(b))
+                .ok()
+                .and_then(|r| rank_last.get_mut(r))
+            {
+                *r = Some(pos);
             }
-            if let (Some(o), Some(slot)) = (row.get_mut(k), current.get_mut(k)) {
-                *o = item;
-                *slot = w;
-            }
-            k = k.wrapping_add(1);
-        }
-        if let Some(size) = sizes.get_mut(r) {
-            *size = k;
         }
     }
-    // The first 2n − 2 items of the last row are chosen; back through the rows, each leaf chosen
-    // gains a bit and each package chosen chooses two items of the row before.
-    let mut chosen = n.saturating_mul(2).saturating_sub(2);
-    for r in (0..rows).rev() {
-        let row = order.get(r).map_or(&[][..], <[u16; ROW_MAX]>::as_slice);
-        let mut packages = 0usize;
-        for &item in row.iter().take(chosen) {
-            if item == PACKAGE {
-                packages = packages.saturating_add(1);
-            } else if let Some(l) = lengths.get_mut(usize::from(item)) {
-                *l = l.saturating_add(1);
+    let rank = |rank_last: &[Option<usize>; RANKS], r: usize| rank_last.get(r).copied().flatten();
+    // Repay: lengthen the node whose rank's cost is the next power of two above what is owed,
+    // unless two of the rank below cost less (each lengthening a node of rank `r` repays
+    // `2^(r-1)`). Each pass repays at least one unit, so at most `total` passes run.
+    while total > 0 {
+        let owed = u64::try_from(total).unwrap_or(0);
+        let mut r = usize::try_from(u64::BITS.saturating_sub(owed.leading_zeros())).unwrap_or(0);
+        while r > 1 {
+            match (rank(&rank_last, r), rank(&rank_last, r.saturating_sub(1))) {
+                (None, _) => r = r.saturating_sub(1),
+                (Some(_), None) => break,
+                (Some(high), Some(low)) => {
+                    if count(high) <= count(low).saturating_mul(2) {
+                        break;
+                    }
+                    r = r.saturating_sub(1);
+                }
             }
         }
-        chosen = packages.saturating_mul(2);
+        while r < RANKS.saturating_sub(1) && rank(&rank_last, r).is_none() {
+            r = r.saturating_add(1);
+        }
+        let Some(p) = rank(&rank_last, r) else {
+            break;
+        };
+        let paid = u32::try_from(r.saturating_sub(1)).unwrap_or(0);
+        total = total.saturating_sub(1i64.checked_shl(paid).unwrap_or(0));
+        if let Some(b) = bits.get_mut(p) {
+            *b = b.saturating_add(1);
+        }
+        // The lengthened node is the new lightest of the rank below if that was empty, and
+        // leaves its own rank to the node before it if that one shares the rank.
+        let below = r.saturating_sub(1);
+        if rank(&rank_last, below).is_none()
+            && let Some(slot) = rank_last.get_mut(below)
+        {
+            *slot = Some(p);
+        }
+        let rank_bits = usize::try_from(target)
+            .ok()
+            .and_then(|t| t.checked_sub(r))
+            .and_then(|b| u32::try_from(b).ok());
+        let previous = p
+            .checked_sub(1)
+            .filter(|&q| Some(get(bits, q)) == rank_bits);
+        if let Some(slot) = rank_last.get_mut(r) {
+            *slot = previous;
+        }
+    }
+    // An overshoot is given back to the longest codes: each step shortens a node of rank 0
+    // (`target` bits) to rank 1, so at most `-total` steps run.
+    while total < 0 {
+        match rank(&rank_last, 1) {
+            None => {
+                while get(bits, k) == target {
+                    let Some(next) = k.checked_sub(1) else {
+                        break;
+                    };
+                    k = next;
+                }
+                let first = k.saturating_add(1);
+                if let Some(b) = bits.get_mut(first) {
+                    *b = b.saturating_sub(1);
+                }
+                if let Some(slot) = rank_last.get_mut(1) {
+                    *slot = Some(first);
+                }
+            }
+            Some(r1) => {
+                let next = r1.saturating_add(1);
+                if let Some(b) = bits.get_mut(next) {
+                    *b = b.saturating_sub(1);
+                }
+                if let Some(slot) = rank_last.get_mut(1) {
+                    *slot = Some(next);
+                }
+            }
+        }
+        total = total.saturating_add(1);
     }
 }
 
@@ -1129,11 +1223,13 @@ mod tests {
     }
 
     proptest! {
-        /// Whatever path `code_lengths` takes, its lengths cost what the optimal length-limited
-        /// lengths (package-merge as the algorithm states it) cost, form a complete code, and
-        /// keep to the limit.
+        /// For any counts and any limit with room for the literals present, the lengths form a
+        /// complete prefix code (Kraft's sum exactly one), keep to the limit, and name exactly
+        /// the literals present; and where the minimum-redundancy code keeps to the limit, they
+        /// cost what the optimal length-limited code (package-merge as the algorithm states it)
+        /// costs, since then no repair runs.
         #[test]
-        fn the_lengths_are_optimal_and_complete(
+        fn the_lengths_are_complete_within_the_limit_and_optimal_when_they_fit(
             counts in proptest::collection::vec(prop_oneof![Just(0u32), 1u32..4, 1u32..100_000], 2..=256),
             limit in 1u32..=MAX_BITS,
         ) {
@@ -1141,44 +1237,25 @@ mod tests {
             prop_assume!(present >= 2 && present <= 1 << limit);
             let mut lengths = [0u8; LITERALS];
             code_lengths(&counts, limit, &mut lengths);
-            let oracle = by_lists(&counts, limit);
-            let cost = |ls: &[u8]| -> u64 {
-                counts.iter().zip(ls).map(|(&c, &l)| u64::from(c) * u64::from(l)).sum()
-            };
-            prop_assert_eq!(cost(&lengths[..counts.len()]), cost(&oracle));
             prop_assert!(lengths.iter().all(|&l| u32::from(l) <= limit));
+            for (s, &c) in counts.iter().enumerate() {
+                prop_assert_eq!(c > 0, lengths[s] > 0);
+            }
             let kraft: u64 = lengths
                 .iter()
                 .filter(|&&l| l > 0)
                 .map(|&l| 1u64 << (MAX_BITS - u32::from(l)))
                 .sum();
             prop_assert_eq!(kraft, 1u64 << MAX_BITS);
-        }
-
-        #[test]
-        fn the_array_form_equals_the_lists(
-            counts in proptest::collection::vec(prop_oneof![Just(0u32), 1u32..4, 1u32..100_000], 1..=256),
-            limit in 1u32..=MAX_BITS,
-        ) {
-            let present = counts.iter().filter(|&&c| c > 0).count();
-            // A code of `limit` bits holds at most 2^limit literals.
-            prop_assume!(present > 0 && present <= 1 << limit);
-            let mut leaves: Vec<(u64, u16)> = counts
-                .iter()
-                .enumerate()
-                .filter(|&(_, &c)| c > 0)
-                .map(|(s, &c)| (u64::from(c), u16::try_from(s).unwrap()))
-                .collect();
-            leaves.sort_unstable();
-            let mut lengths = [0u8; LITERALS];
-            if leaves.len() == 1 {
-                lengths[usize::from(leaves[0].1)] = 1;
-            } else {
-                package_merge(&leaves, limit, &mut lengths);
+            let mut unlimited = [0u8; LITERALS];
+            code_lengths(&counts, u32::from(u8::MAX), &mut unlimited);
+            let deepest = unlimited.iter().copied().max().unwrap_or(0);
+            if u32::from(deepest) <= limit {
+                let cost = |ls: &[u8]| -> u64 {
+                    counts.iter().zip(ls).map(|(&c, &l)| u64::from(c) * u64::from(l)).sum()
+                };
+                prop_assert_eq!(cost(&lengths[..counts.len()]), cost(&by_lists(&counts, limit)));
             }
-            let oracle = by_lists(&counts, limit);
-            prop_assert_eq!(&lengths[..counts.len()], &oracle[..]);
-            prop_assert!(lengths[counts.len()..].iter().all(|&l| l == 0));
         }
     }
 }

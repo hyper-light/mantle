@@ -377,21 +377,29 @@ pub(super) const OFFSET_DEFAULT: [i16; 29] = [
 ];
 pub(super) const OFFSET_DEFAULT_LOG: u32 = 5;
 
-/// The accuracy log for `total` symbols drawn from `max_symbol + 1` values, at most `max_log`:
-/// large enough to give every present symbol a cell and resolve the distribution, small enough
-/// that the description does not outweigh what it saves; the reference's choice
-/// (`FSE_optimalTableLog`: the source's bit length less 2, raised to the symbols' bit length
-/// plus 2, within 5 and `max_log`).
+/// The accuracy log of an FSE table for `total` symbols whose largest is `max_symbol`, at most
+/// `max_log`: the reference's `FSE_optimalTableLog` (zstd 1.5.7 lib/compress/fse_compress.c),
+/// which [`optimal_log`] computes with its `minus` of 2.
 pub(super) fn table_log(total: usize, max_symbol: usize, max_log: u32) -> u32 {
-    let bits = |x: usize| usize::BITS.saturating_sub(x.leading_zeros());
-    let from_source = bits(total.saturating_sub(1)).saturating_sub(2);
-    let floor = bits(total)
+    optimal_log(total, max_symbol, max_log, 2)
+}
+
+/// `FSE_optimalTableLog_internal` (zstd 1.5.7 lib/compress/fse_compress.c): `max_log`, lowered
+/// to `highbit(total − 1) − minus` (a difference below zero, unsigned there, lowers nothing),
+/// raised to the fewest bits the symbols need (`FSE_minTableLog`: the smaller of
+/// `highbit(total) + 1` and `highbit(max_symbol) + 2`), and kept from 5 (`FSE_MIN_TABLELOG`) to
+/// `max_log`. The Huffman code's depth is this with a `minus` of 1 (`HUF_optimalTableLog`'s
+/// evaluation without the depth search, which the reference uses below `btultra`).
+pub(super) fn optimal_log(total: usize, max_symbol: usize, max_log: u32, minus: u32) -> u32 {
+    let high = |x: usize| (usize::BITS - 1).saturating_sub(x.leading_zeros());
+    let mut log = max_log;
+    if let Some(from_source) = high(total.saturating_sub(1)).checked_sub(minus) {
+        log = log.min(from_source);
+    }
+    let fewest = high(total)
         .saturating_add(1)
-        .min(bits(max_symbol).saturating_add(2));
-    from_source
-        .min(max_log)
-        .max(floor)
-        .clamp(MIN_ACCURACY_LOG, max_log)
+        .min(high(max_symbol).saturating_add(2));
+    log.max(fewest).clamp(MIN_ACCURACY_LOG, max_log)
 }
 
 /// Scales `counts` (each symbol's occurrences, `total` in all) to a distribution summing to

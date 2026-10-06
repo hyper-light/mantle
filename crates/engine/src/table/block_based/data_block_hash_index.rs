@@ -29,6 +29,9 @@ pub struct DataBlockHashIndexBuilder {
     /// Whether every restart index added fits a bucket; RocksDB's `valid_`.
     valid: bool,
     hash_and_restart_pairs: Vec<(u32, u8)>,
+    /// The whole part of `estimated_num_buckets`, at most 65,535: kept as the estimate grows,
+    /// so the size estimate a flush policy asks for on every entry reads it, not a conversion.
+    whole: u16,
 }
 
 impl DataBlockHashIndexBuilder {
@@ -53,18 +56,29 @@ impl DataBlockHashIndexBuilder {
     /// saturates, so the block's size estimate passes the 64 KiB a hash index supports and no
     /// index is written.
     fn num_buckets(&self) -> u16 {
-        // The estimate rounded toward zero, as C++'s conversion does: the largest 16-bit value at
-        // most its whole part, found bit by bit so no rounding enters; at or past 2^16 it
-        // saturates.
+        self.whole | 1
+    }
+
+    /// Advances `whole` to the largest 16-bit value at most the estimate's whole part, as C++'s
+    /// conversion rounds toward zero, compared in `f64` so no rounding enters; at 2^16 it
+    /// saturates. A step of the usual size (a ratio of 0.3 to 1 adds 1 to 3.4 buckets a key) is
+    /// a few increments; a jump of more than 64 is found bit by bit, in 16 compares.
+    fn catch_up(&mut self) {
         let whole = self.estimated_num_buckets.trunc();
-        let mut n = 0u16;
-        for bit in (0..16).rev() {
-            let candidate = n | (1 << bit);
-            if f64::from(candidate) <= whole {
-                n = candidate;
+        if f64::from(self.whole) + 64.0 < whole {
+            let mut n = 0u16;
+            for bit in (0..16).rev() {
+                let candidate = n | (1 << bit);
+                if f64::from(candidate) <= whole {
+                    n = candidate;
+                }
             }
+            self.whole = n;
+            return;
         }
-        n | 1
+        while self.whole < u16::MAX && f64::from(self.whole.saturating_add(1)) <= whole {
+            self.whole = self.whole.saturating_add(1);
+        }
     }
 
     /// `EstimateSize` [R data_block_hash_index.h:86-92]: the buckets and their count.
@@ -86,12 +100,16 @@ impl DataBlockHashIndexBuilder {
         self.hash_and_restart_pairs
             .push((get_slice_hash(user_key), index));
         self.estimated_num_buckets += self.bucket_per_key;
+        self.catch_up();
     }
 
     /// `Finish` [R data_block_hash_index.cc:27-62]: appends the buckets and their count.
     pub fn finish(&self, buffer: &mut Vec<u8>) {
         let num_buckets = self.num_buckets();
-        let mut buckets = vec![NO_ENTRY; usize::from(num_buckets)];
+        // The buckets are written in place at the buffer's end: no array of their own.
+        let start = buffer.len();
+        buffer.resize(start.saturating_add(usize::from(num_buckets)), NO_ENTRY);
+        let buckets = buffer.get_mut(start..).unwrap_or_default();
         for &(hash, restart_index) in &self.hash_and_restart_pairs {
             // `num_buckets` is odd, never zero.
             let at = hash
@@ -106,13 +124,13 @@ impl DataBlockHashIndexBuilder {
                 }
             }
         }
-        buffer.extend_from_slice(&buckets);
         put_fixed16(buffer, num_buckets);
     }
 
     /// `Reset` [R data_block_hash_index.cc:64-68].
     pub fn reset(&mut self) {
         self.estimated_num_buckets = 0.0;
+        self.whole = 0;
         self.valid = true;
         self.hash_and_restart_pairs.clear();
     }

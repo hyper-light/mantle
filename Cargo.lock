@@ -476,6 +476,7 @@ name = "mantle-engine"
 version = "0.1.0"
 dependencies = [
  "hyper-block",
+ "hyper-measure",
  "mantle-crc",
  "proptest",
  "rustix",

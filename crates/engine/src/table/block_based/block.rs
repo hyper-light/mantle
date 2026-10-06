@@ -170,7 +170,12 @@ impl Block {
             .then(|| Error::corruption("bad block contents", Malformed::Truncated))
     }
 
-    fn core(&self, icmp: InternalKeyComparator, global_seqno: SequenceNumber) -> Core<'_> {
+    fn core(
+        &self,
+        icmp: InternalKeyComparator,
+        global_seqno: SequenceNumber,
+        buffers: &mut IterBuffers,
+    ) -> Core<'_> {
         let keys_end = self.values_section.unwrap_or(self.restart_offset);
         Core {
             data: &self.contents,
@@ -183,8 +188,12 @@ impl Block {
             current: keys_end,
             restart_index: self.num_restarts,
             entry: (0, 0),
-            raw_key: RawKey::default(),
-            key_buf: Vec::new(),
+            raw_key: RawKey {
+                borrowed: None,
+                owned: emptied(&mut buffers.key),
+                is_user_key: false,
+            },
+            key_buf: emptied(&mut buffers.seqno_key),
             key_from_buf: false,
             value: (0, 0),
             status: None,
@@ -197,10 +206,16 @@ impl Block {
     }
 
     /// An iterator that is already at its end, with `status`.
-    fn ended<'s>(&'s self, kind: Kind<'s>, status: Option<Error>) -> BlockIter<'s> {
+    fn ended<'s>(
+        &'s self,
+        kind: Kind<'s>,
+        status: Option<Error>,
+        buffers: &mut IterBuffers,
+    ) -> BlockIter<'s> {
         let mut core = self.core(
             InternalKeyComparator::default(),
             DISABLE_GLOBAL_SEQUENCE_NUMBER,
+            buffers,
         );
         core.live = false;
         core.keys_end = 0;
@@ -215,32 +230,54 @@ impl Block {
         user_comparator: Comparator,
         global_seqno: SequenceNumber,
     ) -> BlockIter<'_> {
+        self.new_data_iterator_in(user_comparator, global_seqno, IterBuffers::default())
+    }
+
+    /// [`Block::new_data_iterator`] with the buffers of an iterator done with, so that reading
+    /// block after block allocates nothing once the buffers have grown: RocksDB's
+    /// `NewDataIterator(.., iter)`, which reuses an iterator object.
+    pub fn new_data_iterator_in(
+        &self,
+        user_comparator: Comparator,
+        global_seqno: SequenceNumber,
+        mut buffers: IterBuffers,
+    ) -> BlockIter<'_> {
         let kind = Kind::Data(DataState {
             hash_index: self.hash_index,
-            prev: PrevCache::default(),
+            prev: PrevCache {
+                entries: emptied(&mut buffers.prev_entries),
+                keys: emptied(&mut buffers.prev_keys),
+                idx: 0,
+            },
         });
         if let Some(e) = self.unreadable() {
-            return self.ended(kind, Some(e));
+            return self.ended(kind, Some(e), &mut buffers);
         }
         if self.num_restarts == 0 {
-            return self.ended(kind, None);
+            return self.ended(kind, None, &mut buffers);
         }
-        let mut core = self.core(InternalKeyComparator::new(user_comparator), global_seqno);
+        let mut core = self.core(
+            InternalKeyComparator::new(user_comparator),
+            global_seqno,
+            &mut buffers,
+        );
         core.raw_key.is_user_key = false;
         BlockIter { core, kind }
     }
 
     /// `NewMetaIterator` [R block.cc:1506-1520]: user keys, bytewise.
     pub fn new_meta_iterator(&self) -> BlockIter<'_> {
+        let mut buffers = IterBuffers::default();
         if let Some(e) = self.unreadable() {
-            return self.ended(Kind::Meta, Some(e));
+            return self.ended(Kind::Meta, Some(e), &mut buffers);
         }
         if self.num_restarts == 0 {
-            return self.ended(Kind::Meta, None);
+            return self.ended(Kind::Meta, None, &mut buffers);
         }
         let mut core = self.core(
             InternalKeyComparator::new(Comparator::Bytewise),
             DISABLE_GLOBAL_SEQUENCE_NUMBER,
+            &mut buffers,
         );
         core.raw_key.is_user_key = true;
         BlockIter {
@@ -256,6 +293,22 @@ impl Block {
         global_seqno: SequenceNumber,
         options: IndexIterOptions<'s>,
     ) -> BlockIter<'s> {
+        self.new_index_iterator_in(
+            user_comparator,
+            global_seqno,
+            options,
+            IterBuffers::default(),
+        )
+    }
+
+    /// [`Block::new_index_iterator`] with the buffers of an iterator done with.
+    pub fn new_index_iterator_in<'s>(
+        &'s self,
+        user_comparator: Comparator,
+        global_seqno: SequenceNumber,
+        options: IndexIterOptions<'s>,
+        mut buffers: IterBuffers,
+    ) -> BlockIter<'s> {
         let search = match options.search {
             BlockSearchType::Auto if self.is_uniform && user_comparator == Comparator::Bytewise => {
                 BlockSearchType::Interpolation
@@ -263,9 +316,12 @@ impl Block {
             BlockSearchType::Auto => BlockSearchType::Binary,
             other => other,
         };
-        let seqno_first_key = (options.have_first_key
-            && global_seqno != DISABLE_GLOBAL_SEQUENCE_NUMBER)
-            .then(Vec::new);
+        let seqno_first_key =
+            if options.have_first_key && global_seqno != DISABLE_GLOBAL_SEQUENCE_NUMBER {
+                Some(emptied(&mut buffers.first_key))
+            } else {
+                None
+            };
         let kind = Kind::Index(IndexState {
             value_delta_encoded: !options.value_is_full,
             have_first_key: options.have_first_key,
@@ -277,16 +333,17 @@ impl Block {
             prefix_absent: false,
         });
         if let Some(e) = self.unreadable() {
-            return self.ended(kind, Some(e));
+            return self.ended(kind, Some(e), &mut buffers);
         }
         if self.num_restarts == 0 {
-            return self.ended(kind, None);
+            return self.ended(kind, None, &mut buffers);
         }
         // An index block's own keys never take the global sequence number; its values' first
         // keys do (`DecodeCurrentValue`).
         let mut core = self.core(
             InternalKeyComparator::new(user_comparator),
             DISABLE_GLOBAL_SEQUENCE_NUMBER,
+            &mut buffers,
         );
         core.raw_key.is_user_key = !options.key_includes_seq;
         BlockIter { core, kind }
@@ -412,6 +469,26 @@ impl Block {
     }
 }
 
+/// The buffers an iterator writes keys into, handed from an iterator done with to the next
+/// (`BlockIter::into_buffers`, `Block::new_data_iterator_in`) so their capacity is kept: a key
+/// rebuilt from a shared prefix, a key with the global sequence number in place, the entries
+/// `Prev` caches, and an index value's first key.
+#[derive(Debug, Default)]
+pub struct IterBuffers {
+    key: Vec<u8>,
+    seqno_key: Vec<u8>,
+    prev_entries: Vec<PrevEntry>,
+    prev_keys: Vec<u8>,
+    first_key: Vec<u8>,
+}
+
+/// The buffer in `slot`, emptied, its capacity kept.
+fn emptied<T>(slot: &mut Vec<T>) -> Vec<T> {
+    let mut v = std::mem::take(slot);
+    v.clear();
+    v
+}
+
 /// How an index block's iterator reads it: RocksDB's `NewIndexIterator` arguments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexIterOptions<'a> {
@@ -442,13 +519,6 @@ impl RawKey {
         self.owned.clear();
     }
 
-    fn size(&self) -> usize {
-        match self.borrowed {
-            Some((_, len)) => len as usize,
-            None => self.owned.len(),
-        }
-    }
-
     fn get<'d>(&'d self, data: &'d [u8]) -> &'d [u8] {
         match self.borrowed {
             Some((start, len)) => slice(data, start, len),
@@ -463,13 +533,17 @@ impl RawKey {
     /// `TrimAppend`: the first `shared` bytes of the current key and then `non_shared`.
     fn trim_append(&mut self, data: &[u8], shared: usize, non_shared: &[u8]) -> bool {
         if let Some((start, len)) = self.borrowed.take() {
+            // Only the shared bytes of a key in the block are copied, as `TrimAppend` does.
+            let Some(prefix) = slice(data, start, len).get(..shared) else {
+                return false;
+            };
             self.owned.clear();
-            self.owned.extend_from_slice(slice(data, start, len));
-        }
-        if shared > self.owned.len() {
+            self.owned.extend_from_slice(prefix);
+        } else if shared > self.owned.len() {
             return false;
+        } else {
+            self.owned.truncate(shared);
         }
-        self.owned.truncate(shared);
         self.owned.extend_from_slice(non_shared);
         true
     }
@@ -583,7 +657,7 @@ impl Core<'_> {
     /// entries that store their value's length, `strict` for meta blocks, whose entries RocksDB
     /// checks against the block. Returns whether an entry was read, and whether its key shares
     /// bytes with the previous one.
-    fn parse_next_key(&mut self, with_length: bool, strict: bool) -> Option<bool> {
+    fn parse_next_key<const WITH_LENGTH: bool, const STRICT: bool>(&mut self) -> Option<bool> {
         self.current = self.next_entry_offset();
         self.cur_entry_idx = self.cur_entry_idx.saturating_add(1);
         if self.current >= self.keys_end {
@@ -592,6 +666,7 @@ impl Core<'_> {
             return None;
         }
         let value_offset_encoded = match self.values_section {
+            None => false,
             Some(_) if self.block_restart_interval == 0 => {
                 self.corruption(
                     "separated block without its restart interval",
@@ -604,45 +679,44 @@ impl Core<'_> {
                     .checked_rem(i64::from(self.block_restart_interval))
                     == Some(0)
             }
-            None => false,
         };
-        let key_limit = slice(
-            self.data,
-            self.current,
-            self.keys_end.saturating_sub(self.current),
-        );
-        let Ok((header, header_len)) = decode_entry(key_limit, with_length, value_offset_encoded)
-        else {
+        // The rest of the keys section, checked once: the header, the key bytes and (strict)
+        // an inline value must all lie in it. RocksDB bounds the key only for meta blocks; the
+        // port always does, as reading past the block is what it would otherwise do.
+        let Some(rest) = self.data.get(self.current as usize..self.keys_end as usize) else {
             self.corruption("bad entry in block", Malformed::Truncated);
             return None;
         };
-        if self.raw_key.size() < header.shared as usize {
-            self.corruption("bad entry in block", Malformed::OutOfRange);
+        let Ok((header, header_len)) = decode_entry(rest, WITH_LENGTH, value_offset_encoded) else {
+            self.corruption("bad entry in block", Malformed::Truncated);
             return None;
-        }
-        let header_len = u32::try_from(header_len).unwrap_or(u32::MAX);
-        let key_at = self.current.saturating_add(header_len);
-        let room = self.keys_end.saturating_sub(key_at);
-        let inline_value = if self.values_section.is_none() {
-            header.value_length
+        };
+        let key_end = header_len.checked_add(header.non_shared as usize);
+        let inline_value = if STRICT && self.values_section.is_none() {
+            header.value_length as usize
         } else {
             0
         };
-        // RocksDB checks this only for meta blocks; the port always does, as reading past the
-        // block is what it would otherwise do.
-        let wanted = u64::from(header.non_shared).saturating_add(if strict {
-            u64::from(inline_value)
-        } else {
-            0
-        });
-        if u64::from(room) < wanted || room < header.non_shared {
+        let (Some(key_end), true) = (
+            key_end,
+            key_end
+                .and_then(|e| e.checked_add(inline_value))
+                .is_some_and(|e| e <= rest.len()),
+        ) else {
             self.corruption("bad entry in block", Malformed::TooLarge);
             return None;
-        }
-        self.entry = (self.current, header_len.saturating_add(header.non_shared));
+        };
+        // Both lie in the block, whose offsets fit 32 bits as its restart points do.
+        let (Ok(header_len32), Ok(key_end32)) = (u32::try_from(header_len), u32::try_from(key_end))
+        else {
+            self.corruption("bad entry in block", Malformed::TooLarge);
+            return None;
+        };
+        let key_at = self.current.wrapping_add(header_len32);
+        self.entry = (self.current, key_end32);
         let is_shared = header.shared != 0;
         if is_shared {
-            let bytes = slice(self.data, key_at, header.non_shared);
+            let bytes = rest.get(header_len..key_end).unwrap_or_default();
             if !self
                 .raw_key
                 .trim_append(self.data, header.shared as usize, bytes)
@@ -661,31 +735,23 @@ impl Core<'_> {
                 }
             }
         }
-        match self.values_section {
-            Some(section) => {
-                let start = if value_offset_encoded {
-                    section.saturating_add(header.value_offset.unwrap_or(0))
-                } else {
-                    self.value.0.saturating_add(self.value.1)
-                };
+        let start = match self.values_section {
+            Some(section) if value_offset_encoded => {
+                section.checked_add(header.value_offset.unwrap_or(0))
+            }
+            Some(_) => self.value.0.checked_add(self.value.1),
+            None => self.entry.0.checked_add(self.entry.1),
+        };
+        match start.and_then(|s| s.checked_add(header.value_length).map(|e| (s, e))) {
+            Some((start, end)) if end <= self.restarts => {
                 self.value = (start, header.value_length);
-                if u64::from(start).saturating_add(u64::from(header.value_length))
-                    > u64::from(self.restarts)
-                {
-                    self.corruption("bad entry in block", Malformed::TooLarge);
-                    return None;
+                if self.values_section.is_none() {
+                    self.entry.1 = self.entry.1.wrapping_add(header.value_length);
                 }
             }
-            None => {
-                let start = self.entry.0.saturating_add(self.entry.1);
-                self.value = (start, header.value_length);
-                if u64::from(start).saturating_add(u64::from(header.value_length))
-                    > u64::from(self.restarts)
-                {
-                    self.corruption("bad entry in block", Malformed::TooLarge);
-                    return None;
-                }
-                self.entry.1 = self.entry.1.saturating_add(header.value_length);
+            _ => {
+                self.corruption("bad entry in block", Malformed::TooLarge);
+                return None;
             }
         }
         Some(is_shared)
@@ -1077,6 +1143,28 @@ impl<'a> BlockIter<'a> {
         self.core.valid()
     }
 
+    /// The iterator's buffers, for the next iterator to write into.
+    pub fn into_buffers(self) -> IterBuffers {
+        let mut buffers = IterBuffers {
+            key: self.core.raw_key.owned,
+            seqno_key: self.core.key_buf,
+            ..IterBuffers::default()
+        };
+        match self.kind {
+            Kind::Data(state) => {
+                buffers.prev_entries = state.prev.entries;
+                buffers.prev_keys = state.prev.keys;
+            }
+            Kind::Index(state) => {
+                if let Some(first) = state.seqno_first_key {
+                    buffers.first_key = first;
+                }
+            }
+            Kind::Meta => {}
+        }
+        buffers
+    }
+
     /// Whether the last seek of a hash-search index found its prefix in no block: RocksDB's
     /// `Status::NotFound` on an index iterator, which tells a missing prefix from a key past the
     /// last; the iterator is then not valid.
@@ -1290,7 +1378,7 @@ impl<'a> BlockIter<'a> {
     }
 
     fn parse_next_data_key(&mut self) -> Option<bool> {
-        self.core.parse_next_key(true, false)
+        self.core.parse_next_key::<true, false>()
     }
 
     /// `IndexBlockIter::ParseNextIndexKey` [R block.cc:650-661].
@@ -1300,7 +1388,11 @@ impl<'a> BlockIter<'a> {
         };
         let decode = state.value_delta_encoded || state.seqno_first_key.is_some();
         let with_length = !state.value_delta_encoded;
-        let is_shared = self.core.parse_next_key(with_length, false)?;
+        let is_shared = if with_length {
+            self.core.parse_next_key::<true, false>()?
+        } else {
+            self.core.parse_next_key::<false, false>()?
+        };
         if decode && !self.decode_current_value(is_shared) {
             return None;
         }
@@ -1361,7 +1453,7 @@ impl<'a> BlockIter<'a> {
     fn next_impl(&mut self) -> bool {
         match self.kind {
             Kind::Data(_) => self.parse_next_data_key().is_some(),
-            Kind::Meta => self.core.parse_next_key(true, true).is_some(),
+            Kind::Meta => self.core.parse_next_key::<true, true>().is_some(),
             Kind::Index(_) => self.parse_next_index_key().is_some(),
         }
     }

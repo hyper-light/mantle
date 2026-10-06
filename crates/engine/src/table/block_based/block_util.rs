@@ -31,6 +31,7 @@ fn varint(p: &[u8], at: &mut usize) -> Result<u32, Error> {
 /// [R block_util.h:78-126] (without, as format_version 4 index blocks write it): the header at
 /// the start of `p`, and how many bytes it takes. `with_value_offset` reads the value offset a
 /// restart entry carries when keys and values are separated.
+#[inline]
 pub fn decode_entry(
     p: &[u8],
     with_value_length: bool,
@@ -40,6 +41,27 @@ pub fn decode_entry(
     // for the value or its delta must follow [R block_util.h:84-89].
     if !with_value_length && p.len() < 3 {
         return Err(Error::truncated("block entry"));
+    }
+    // RocksDB's fast path [R block_util.h:39-44]: each field below 128 takes one byte, which is
+    // how nearly every entry of a block of small keys and values is written.
+    if !with_value_offset && let Some(&[a, b, c]) = p.first_chunk::<3>() {
+        let fields = if with_value_length { a | b | c } else { a | b };
+        if fields < 0x80 {
+            let (value_length, used) = if with_value_length {
+                (u32::from(c), 3)
+            } else {
+                (0, 2)
+            };
+            return Ok((
+                EntryHeader {
+                    shared: u32::from(a),
+                    non_shared: u32::from(b),
+                    value_length,
+                    value_offset: None,
+                },
+                used,
+            ));
+        }
     }
     let mut at = 0usize;
     let shared = varint(p, &mut at)?;

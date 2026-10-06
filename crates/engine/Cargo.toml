@@ -28,9 +28,15 @@ twox-hash.workspace = true
 # The oracle of the engine's own Zstandard (codec/zstd, tests/zstd_test.rs).
 zstd.workspace = true
 tempfile.workspace = true
+# Allocation and page-fault counts of the benchmarks against RocksDB.
+hyper-measure = { path = "../../vendor/hyper-measure" }
 
 [[bench]]
 name = "memtable"
+harness = false
+
+[[bench]]
+name = "block_read"
 harness = false
 
 [lints]

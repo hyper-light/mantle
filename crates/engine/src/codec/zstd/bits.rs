@@ -235,12 +235,6 @@ impl<'a> Backward<'a> {
         value
     }
 
-    /// Consumes `bits` already peeked, which an [`Self::ensure`] since the last refill covers.
-    #[inline(always)]
-    pub(super) fn skip_ensured(&mut self, bits: u32) {
-        self.within = self.within.wrapping_sub(i64::from(bits));
-    }
-
     /// Whether every bit was read and none past the start: a stream must be consumed exactly
     /// (§3.1.1.3.2.1.2, §4.2.2).
     pub(super) fn finished(&self) -> bool {

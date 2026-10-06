@@ -154,26 +154,41 @@ impl Huffman {
         if self.entries.len() != size {
             self.entries.resize(size, Entry::default());
         }
+        // Number_of_Bits = Max_Number_of_Bits + 1 - Weight (§4.2.1), by weight; every weight is
+        // at most max_bits, as the total's power of two bounds each.
+        let mut bits_of = [0u8; MAX_BITS as usize + 2];
+        for (w, b) in bits_of.iter_mut().enumerate().skip(1) {
+            *b = u8::try_from(
+                max_bits
+                    .saturating_add(1)
+                    .saturating_sub(u32::try_from(w).unwrap_or(0)),
+            )
+            .unwrap_or(0);
+        }
         let mut symbol = 0u8;
         for &w in weights.iter().chain(std::iter::once(&last)) {
             if w > 0 {
                 let w = usize::from(w);
-                let span = 1usize << w.saturating_sub(1);
                 let at = start.get_mut(w).ok_or(Corrupt::Huffman)?;
+                let span = 1usize << w.saturating_sub(1);
                 let end = at.checked_add(span).ok_or(Corrupt::Huffman)?;
-                // Number_of_Bits = Max_Number_of_Bits + 1 - Weight (§4.2.1); weights are at
-                // most max_bits, as the total's power of two bounds each.
-                let bits = u8::try_from(
-                    max_bits
-                        .checked_add(1)
-                        .and_then(|b| b.checked_sub(u32::try_from(w).ok()?))
-                        .ok_or(Corrupt::Huffman)?,
-                )
-                .map_err(|_| Corrupt::Huffman)?;
-                self.entries
-                    .get_mut(*at..end)
-                    .ok_or(Corrupt::Huffman)?
-                    .fill(Entry { symbol, bits });
+                let entry = Entry {
+                    symbol,
+                    bits: *bits_of.get(w).ok_or(Corrupt::Huffman)?,
+                };
+                let run = self.entries.get_mut(*at..end).ok_or(Corrupt::Huffman)?;
+                // A run is a power of two long: written in pieces of a fixed size, each a
+                // store or two (`HUF_DEltX1_set4`'s switch on the run's length).
+                match run {
+                    [one] => *one = entry,
+                    [a, b] => (*a, *b) = (entry, entry),
+                    [_, _, _, _] => run.copy_from_slice(&[entry; 4]),
+                    _ => {
+                        for piece in run.as_chunks_mut::<8>().0 {
+                            *piece = [entry; 8];
+                        }
+                    }
+                }
                 *at = end;
             }
             symbol = symbol.wrapping_add(1);
@@ -182,43 +197,41 @@ impl Huffman {
         Ok(())
     }
 
-    /// The symbol the stream's next code names, its bits consumed: the stream must hold
-    /// `max_bits` readable since its last refill. The table has `2^max_bits` entries, so the
-    /// masked index is in it.
+    /// The symbol the lane's next code names, its bits consumed: the lane must hold `max_bits`
+    /// since its last refill. The table has `2^max_bits` entries, so the masked index is in it.
     #[inline(always)]
-    fn decode(&self, bits: &mut Backward<'_>) -> u8 {
+    fn decode(&self, lane: &mut Lane<'_>) -> u8 {
         let mask = self.entries.len().wrapping_sub(1);
-        let index = usize::try_from(bits.peek(self.max_bits)).unwrap_or(0) & mask;
+        let index = lane.top(self.max_bits) & mask;
         let entry = self.entries.get(index).copied().unwrap_or_default();
-        bits.skip_ensured(u32::from(entry.bits));
+        lane.consume(u32::from(entry.bits));
         entry.symbol
     }
 
-    /// Decodes the rest of one stream into `out`, a symbol a refill.
+    /// Decodes the rest of one lane into `out`, a symbol a refill.
     #[inline(always)]
-    fn rest(&self, bits: &mut Backward<'_>, out: &mut [u8]) {
+    fn rest(&self, lane: &mut Lane<'_>, out: &mut [u8]) {
         for byte in out {
-            bits.ensure(self.max_bits);
-            *byte = self.decode(bits);
+            lane.refill(self.max_bits);
+            *byte = self.decode(lane);
         }
     }
 
     /// Decodes one stream into `out`, which it fills exactly; the stream must be consumed
     /// exactly (§4.2.2).
     fn stream(&self, stream: &[u8], out: &mut [u8]) -> Result<(), Corrupt> {
-        let mut bits = Backward::new(stream)?;
+        let mut lane = Lane::new(stream)?;
         // Four codes of at most 11 bits under one refill (`HUF_decodeStreamX1`'s unrolling).
         let quad = self.max_bits.saturating_mul(4);
         let (fours, tail) = out.as_chunks_mut::<4>();
         for four in fours {
-            bits.ensure(quad);
-            four[0] = self.decode(&mut bits);
-            four[1] = self.decode(&mut bits);
-            four[2] = self.decode(&mut bits);
-            four[3] = self.decode(&mut bits);
+            lane.refill(quad);
+            for byte in four {
+                *byte = self.decode(&mut lane);
+            }
         }
-        self.rest(&mut bits, tail);
-        if !bits.finished() {
+        self.rest(&mut lane, tail);
+        if !lane.finished() {
             return Err(Corrupt::Huffman);
         }
         Ok(())
@@ -233,10 +246,10 @@ impl Huffman {
         let [i1, i2, i3, i4] = streams;
         let [o1, o2, o3, o4] = outs;
         let (mut b1, mut b2, mut b3, mut b4) = (
-            Backward::new(i1)?,
-            Backward::new(i2)?,
-            Backward::new(i3)?,
-            Backward::new(i4)?,
+            Lane::new(i1)?,
+            Lane::new(i2)?,
+            Lane::new(i3)?,
+            Lane::new(i4)?,
         );
         let quad = self.max_bits.saturating_mul(4);
         let (q1, t1) = o1.as_chunks_mut::<4>();
@@ -248,10 +261,10 @@ impl Huffman {
         let (q2, r2) = q2.split_at_mut(rounds.min(q2.len()));
         let (q3, r3) = q3.split_at_mut(rounds.min(q3.len()));
         for (((a, b), c), d) in q1.iter_mut().zip(q2.iter_mut()).zip(q3.iter_mut()).zip(q4) {
-            b1.ensure(quad);
-            b2.ensure(quad);
-            b3.ensure(quad);
-            b4.ensure(quad);
+            b1.refill(quad);
+            b2.refill(quad);
+            b3.refill(quad);
+            b4.refill(quad);
             for (((w, x), y), z) in a.iter_mut().zip(b.iter_mut()).zip(c.iter_mut()).zip(d) {
                 *w = self.decode(&mut b1);
                 *x = self.decode(&mut b2);
@@ -317,6 +330,127 @@ impl Huffman {
         let (out3, out4) = rest.split_at_mut_checked(segment).ok_or(Corrupt::Huffman)?;
         self.four_streams([in1, in2, in3, in4], [out1, out2, out3, out4])?;
         Ok(())
+    }
+}
+
+/// One Huffman stream read from its end (§4.2.2), its next bits held at the top of a word, as
+/// the reference's fast loop holds them (zstd 1.5.7 `huf_decompress.c`,
+/// `HUF_decompress4X1_usingDTable_internal_fast_c_loop`): a code's table index is the word's top
+/// bits, and taking the code shifts the word. Bits below the stream's start read as zero, and a
+/// lane read past its start can never finish, so corrupt input fails when the stream ends.
+struct Lane<'a> {
+    bytes: &'a [u8],
+    /// The stream's bits below the word's lowest, a whole number of bytes.
+    base: usize,
+    /// The next bits, highest first.
+    word: u64,
+    /// The word's bits still to read; negative once a read went past the stream's start.
+    avail: i64,
+}
+
+impl<'a> Lane<'a> {
+    /// A lane positioned below the stream's final 1 bit. A stream that is empty or whose last
+    /// byte is zero has no such bit and is corrupt.
+    fn new(bytes: &'a [u8]) -> Result<Self, Corrupt> {
+        let last = *bytes.last().ok_or(Corrupt::Huffman)?;
+        if last == 0 {
+            return Err(Corrupt::Huffman);
+        }
+        let marker = i64::from(7u32.saturating_sub(last.leading_zeros()));
+        let pos = i64::try_from(bytes.len())
+            .map_err(|_| Corrupt::Huffman)?
+            .checked_sub(1)
+            .and_then(|b| b.checked_mul(8))
+            .and_then(|b| b.checked_add(marker))
+            .ok_or(Corrupt::Huffman)?;
+        let mut lane = Self {
+            bytes,
+            base: 0,
+            word: 0,
+            avail: 0,
+        };
+        lane.load(pos);
+        Ok(lane)
+    }
+
+    /// Loads the word with the `pos` bits below the position: as many as eight bytes hold,
+    /// left-aligned. The stream's last eight bytes and a position past its start take the cold
+    /// path.
+    #[inline(always)]
+    fn load(&mut self, pos: i64) {
+        if let Ok(pos) = usize::try_from(pos) {
+            // The lowest byte whose word still reaches `pos`: the word then holds 57 to 64 of
+            // them, or all there are.
+            let byte = pos.saturating_sub(57) / 8;
+            if let Some(w) = self.bytes.get(byte..).and_then(<[u8]>::first_chunk::<8>) {
+                let base = byte.wrapping_mul(8);
+                // `pos - base` is 1 to 64.
+                let have = u32::try_from(pos.wrapping_sub(base)).unwrap_or(0);
+                self.word = u64::from_le_bytes(*w)
+                    .checked_shl(64u32.wrapping_sub(have))
+                    .unwrap_or(0);
+                self.avail = i64::from(have);
+                self.base = base;
+                return;
+            }
+        }
+        self.load_rare(pos);
+    }
+
+    /// [`Self::load`] where fewer than eight bytes are left or the position is past the start.
+    #[cold]
+    #[inline(never)]
+    fn load_rare(&mut self, pos: i64) {
+        let Ok(pos) = usize::try_from(pos) else {
+            // Past the start: nothing left to load.
+            self.word = 0;
+            self.avail = pos;
+            self.base = 0;
+            return;
+        };
+        let byte = pos.saturating_sub(57) / 8;
+        let mut w = [0u8; 8];
+        if let Some(src) = self.bytes.get(byte..) {
+            for (d, s) in w.iter_mut().zip(src) {
+                *d = *s;
+            }
+        }
+        let base = byte.wrapping_mul(8);
+        let have = u32::try_from(pos.wrapping_sub(base)).unwrap_or(0);
+        self.word = u64::from_le_bytes(w)
+            .checked_shl(64u32.wrapping_sub(have))
+            .unwrap_or(0);
+        self.avail = i64::from(have);
+        self.base = base;
+    }
+
+    /// Makes `bits` readable (at most 57) unless the word already reaches the stream's start.
+    #[inline(always)]
+    fn refill(&mut self, bits: u32) {
+        if self.avail < i64::from(bits) && self.base > 0 {
+            let pos = i64::try_from(self.base)
+                .unwrap_or(0)
+                .wrapping_add(self.avail);
+            self.load(pos);
+        }
+    }
+
+    /// The word's top `bits` (1 to 11), as a table index.
+    #[inline(always)]
+    fn top(&self, bits: u32) -> usize {
+        usize::try_from(self.word.checked_shr(64u32.wrapping_sub(bits)).unwrap_or(0)).unwrap_or(0)
+    }
+
+    /// Consumes `bits` (at most 11).
+    #[inline(always)]
+    fn consume(&mut self, bits: u32) {
+        self.word = self.word.checked_shl(bits).unwrap_or(0);
+        self.avail = self.avail.wrapping_sub(i64::from(bits));
+    }
+
+    /// Whether every bit was read and none past the start (§4.2.2).
+    fn finished(&self) -> bool {
+        self.base == 0 && self.avail == 0
     }
 }
 

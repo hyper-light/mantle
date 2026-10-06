@@ -361,6 +361,10 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/engine/src/branch/mod.rs` `LEAF` | format | 1, the kind byte of a branch's leaf page. |
 | `crates/engine/src/branch/mod.rs` `LEAF_FIXED` | format | 5 bytes, a leaf entry's fixed fields: suffix length (2), operation (1), value length (2). |
 | `crates/engine/src/branch/mod.rs` `OFFSET` | format | 2 bytes, an entry's offset in its page: 16 bits reach every byte of a page up to 64 KiB, the largest the builder takes. |
+| `crates/engine/src/memtable/btree.rs` `DEGREE` | measured | 16, the shard memtable B-tree's minimum degree: benches/memtable.rs, one million 16-byte keys and 100-byte values, Apple M5 Max, 2026-10-06, medians of three alternating runs of five: random put 256 ns at 8, 243 at 16, 241 at 32; random get 376, 344, 352; sequential put 34, 28, 25; bytes an entry 148, 147, 147. 16 is the smallest on the plateau. |
+| `crates/engine/src/memtable/btree.rs` `ENTRY_FIXED` | format | 7 bytes, a memtable arena entry's fixed fields: key length (2), value length (4), operation (1). |
+| `crates/engine/src/memtable/btree.rs` `MAX_KEYS` | derived | `2 * DEGREE - 1`: the most entries a B-tree node of minimum degree `DEGREE` holds (Cormen et al., §18.1). |
+| `crates/engine/src/memtable/btree.rs` `NONE` | format | `u32::MAX`, the node index of no child: above every node index the arena's 32-bit offsets allow. |
 | `crates/gateway/src/layout.rs` `CHUNK` | cited | Tectonic's "typically 8 MiB" chunk (docs/research/01 §1.14). docs/design/gateway.md says measured transfer sizing will replace it, and audit §12.6/§16.2 requires per-upload sizing. |
 | `crates/gateway/src/layout.rs` `SEALED` | derived | `seal::SEGMENT + seal::TAG`: a 64 KiB plaintext segment plus its 16-byte AEAD tag (docs/design/gateway.md §1). |
 | `crates/gateway/src/put.rs` `RENEWALS` | cited | Quarter-lease renewal from Centrifuge's 15 s renewals of 60 s leases (docs/research/09 §7.2.2). Audit §12.6 requires deriving it from control-delay and outage distributions. |

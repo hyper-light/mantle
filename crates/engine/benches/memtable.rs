@@ -19,10 +19,12 @@
 
 use std::time::Instant;
 
+use mantle_engine::branch::Op;
 use mantle_engine::db::dbformat::{
     InternalKeyComparator, LookupKey, MAX_SEQUENCE_NUMBER, ValueType,
 };
 use mantle_engine::db::memtable::{Found, MemTable, MemTableOptions, MergeContext};
+use mantle_engine::memtable::btree::BTreeMem;
 use mantle_engine::util::comparator::Comparator;
 
 const KEY: usize = 16;
@@ -133,6 +135,38 @@ fn main() {
             let ns = t0.elapsed().as_nanos() as f64 / n as f64;
             let bytes = mem.approximate_memory_usage() as f64 / n as f64;
             println!("fill_seq {n} {run} {ns:.1} {bytes:.1}");
+            drop(mem);
+
+            // The shard's B-tree memtable (step E3) on the same keys and values.
+            let value = [b'v'; VALUE];
+            let mut bt = BTreeMem::new(1 << 30).unwrap();
+            let t0 = Instant::now();
+            for k in &rkeys {
+                bt.insert(k, Op::Put, &value).unwrap();
+            }
+            let ns = t0.elapsed().as_nanos() as f64 / n as f64;
+            let bytes = bt.memory() as f64 / n as f64;
+            println!("btree_fill_random {n} {run} {ns:.1} {bytes:.1}");
+            let mut out = Vec::with_capacity(VALUE);
+            let mut found = 0usize;
+            let t1 = Instant::now();
+            for &i in &perm {
+                if bt.get(&rkeys[i], &mut out).unwrap() == Some(Op::Put) {
+                    found += 1;
+                }
+            }
+            let gns = t1.elapsed().as_nanos() as f64 / n as f64;
+            assert_eq!(found, n);
+            println!("btree_get_random {n} {run} {gns:.1} {bytes:.1}");
+            drop(bt);
+            let mut bt = BTreeMem::new(1 << 30).unwrap();
+            let t0 = Instant::now();
+            for k in &skeys {
+                bt.insert(k, Op::Put, &value).unwrap();
+            }
+            let ns = t0.elapsed().as_nanos() as f64 / n as f64;
+            let bytes = bt.memory() as f64 / n as f64;
+            println!("btree_fill_seq {n} {run} {ns:.1} {bytes:.1}");
         }
     }
 }

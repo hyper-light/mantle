@@ -70,6 +70,15 @@ pub enum Malformed {
     /// Compressed bytes that do not decode under their format; the structure is named beside it
     /// (`codec::zstd`).
     Undecodable,
+    /// A magic number that is not the one the structure must carry: a table's, or a footer's
+    /// extended magic.
+    BadMagic,
+    /// A field holding a value its format forbids, such as a footer's base context checksum
+    /// that disables the context it must enable.
+    Forbidden,
+    /// Two stored values that must agree arithmetically and cannot: an offset that would lie
+    /// before the file's start, or a delta-encoded size below zero.
+    OutOfRange,
 }
 
 impl fmt::Display for Malformed {
@@ -88,6 +97,9 @@ impl fmt::Display for Malformed {
             Self::ChecksumMismatch => "checksum mismatch",
             Self::Unresolvable => "refers to data this reader cannot fetch",
             Self::Undecodable => "compressed bytes that do not decode under their format",
+            Self::BadMagic => "magic number not the one expected",
+            Self::Forbidden => "field holds a value the format forbids",
+            Self::OutOfRange => "stored values that cannot both hold",
         })
     }
 }

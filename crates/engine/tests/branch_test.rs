@@ -167,6 +167,31 @@ mod cursor_and_merge {
     use super::*;
     use mantle_engine::branch::merge::{Merge, compact};
 
+    #[test]
+    fn a_scan_reads_its_branch_an_extent_a_call() {
+        let mut s = store(9);
+        let entries: BTreeMap<Vec<u8>, (Op, Vec<u8>)> = (0..100_000u32)
+            .map(|i| {
+                (
+                    format!("key-{i:010}").into_bytes(),
+                    (Op::Put, vec![3u8; 100]),
+                )
+            })
+            .collect();
+        let branch = build(&mut s, &entries);
+        let before = s.io_stats();
+        let got = scan(&mut s, &branch, b"");
+        assert_eq!(got.len(), entries.len());
+        let after = s.io_stats();
+        // A forward scan reads each extent's leaves in one call and each index page alone. An
+        // index page here names more children than an extent holds pages (15-byte keys, 4 KiB
+        // pages), so the branch has fewer index pages than extents.
+        let extents = branch.extents.len() as u64;
+        let reads = after.reads - before.reads;
+        assert!(reads <= 2 * extents, "{reads} reads for {extents} extents");
+        assert!(after.pages_read - before.pages_read >= extents);
+    }
+
     fn scan(s: &mut Store<SimFile>, branch: &Branch, from: &[u8]) -> Vec<(Vec<u8>, Op, Vec<u8>)> {
         let mut c = branch.seek(s, from).unwrap();
         let mut out = Vec::new();

@@ -24,7 +24,7 @@ pub mod filter;
 pub mod merge;
 
 use crate::error::{Error, Malformed};
-use crate::store::Store;
+use crate::store::{Span, Store};
 use hyper_block::block::BlockFile;
 use std::cmp::Ordering;
 
@@ -590,9 +590,17 @@ impl Branch {
 /// A forward cursor over a branch's entries in key order, from a start key: the pages from the
 /// root to the current leaf and the entry it is at in each, at most the branch's height of
 /// pages held.
+///
+/// The builder writes a branch's leaves in key order at rising addresses, each index page after
+/// the leaves under it, so the cursor reads leaves ahead an extent at a time ([`Span`]) and index
+/// pages alone: reading an index page ahead would skip the leaves before it.
 #[derive(Debug)]
 pub struct Cursor {
     path: Vec<(Vec<u8>, usize)>,
+    /// The depth of the branch's leaves on the path: its height less one, as the root is the
+    /// page below the builder's top level.
+    leaf_depth: usize,
+    span: Span,
     key: Vec<u8>,
     value: Vec<u8>,
     op: Op,
@@ -608,17 +616,22 @@ fn child_of(rest: &[u8]) -> Result<u64, Error> {
 impl Branch {
     /// A cursor at the first entry whose key is at least `from`.
     pub fn seek<F: BlockFile>(&self, store: &mut Store<F>, from: &[u8]) -> Result<Cursor, Error> {
+        let height = usize::from(self.height);
         let mut cursor = Cursor {
-            path: Vec::with_capacity(usize::from(self.height).saturating_add(1)),
+            path: Vec::with_capacity(height.saturating_add(1)),
+            leaf_depth: height
+                .checked_sub(1)
+                .ok_or(corrupt(Malformed::CountMismatch))?,
+            span: store.span()?,
             key: Vec::new(),
             value: Vec::new(),
             op: Op::Put,
             valid: false,
         };
         let mut address = self.root;
-        for _ in 0..=self.height {
+        for depth in 0..=height {
             let mut page = Vec::new();
-            store.read_page(address, &mut page)?;
+            cursor.read(store, depth, address, &mut page)?;
             let view = View::new(&page)?;
             let floor = view.floor(from)?;
             if view.kind == INDEX {
@@ -665,6 +678,21 @@ impl Cursor {
     /// The entry's value.
     pub fn value(&self) -> &[u8] {
         &self.value
+    }
+
+    /// Reads the page at `address`, at `depth` of the path: a leaf through the span.
+    fn read<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        depth: usize,
+        address: u64,
+        page: &mut Vec<u8>,
+    ) -> Result<(), Error> {
+        if depth == self.leaf_depth {
+            store.read_page_ahead(&mut self.span, address, page)
+        } else {
+            store.read_page(address, page)
+        }
     }
 
     /// Loads the entry the leaf at the path's end is at.
@@ -721,7 +749,7 @@ impl Cursor {
             // Down the leftmost path to a leaf.
             loop {
                 let mut page = Vec::new();
-                store.read_page(address, &mut page)?;
+                self.read(store, self.path.len(), address, &mut page)?;
                 let view = View::new(&page)?;
                 let kind = view.kind;
                 if kind == INDEX {

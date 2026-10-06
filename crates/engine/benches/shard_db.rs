@@ -53,6 +53,8 @@ fn main() {
     let dir = PathBuf::from(args.first().expect("DIR"));
     let num: u64 = args.get(1).map_or(1_000_000, |s| s.parse().unwrap());
     let fanout: usize = args.get(2).map_or(8, |s| s.parse().unwrap());
+    // The reads after the fill, `num` by default; 0 measures the fill alone.
+    let reads: u64 = args.get(4).map_or(num, |s| s.parse().unwrap());
     let path = dir.join("shard_db.store");
     let _ = std::fs::remove_file(&path);
     let align = Alignment::new(4096).unwrap();
@@ -115,8 +117,9 @@ fn main() {
         t.entries_written as f64 / num as f64
     );
     println!(
-        "fill io reads {} ({:.2}s) writes {} ({:.2}s) pages_written {} ({:.2} GB, write amplification {:.2}) syncs {}",
+        "fill io reads {} pages_read {} ({:.2}s) writes {} ({:.2}s) pages_written {} ({:.2} GB, write amplification {:.2}) syncs {}",
         io.reads,
+        io.pages_read,
         io.read_ns as f64 / 1e9,
         io.writes,
         io.write_ns as f64 / 1e9,
@@ -134,7 +137,7 @@ fn main() {
     let mut found = 0u64;
     lat.clear();
     let t = Instant::now();
-    for _ in 0..num {
+    for _ in 0..reads {
         let k = key(rng.next() % num);
         let o = Instant::now();
         if db.get(&k, &mut out).unwrap() {
@@ -143,12 +146,14 @@ fn main() {
         lat.push(o.elapsed().as_nanos() as u64);
     }
     let s = t.elapsed().as_secs_f64();
-    report("readrandom", &mut lat);
-    println!(
-        "readrandom {num} {:.0} {:.3} found {found}",
-        num as f64 / s,
-        s * 1e6 / num as f64
-    );
+    if reads > 0 {
+        report("readrandom", &mut lat);
+        println!(
+            "readrandom {reads} {:.0} {:.3} found {found}",
+            reads as f64 / s,
+            s * 1e6 / reads as f64
+        );
+    }
     let (h, n, l) = db.shape().unwrap();
     println!("shape height {h} nodes {n} leaves {l}");
     drop(db);

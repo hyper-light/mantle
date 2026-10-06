@@ -55,8 +55,10 @@ pub struct Recovered {
 /// The store's I/O since it was opened: what its callers' work cost the device.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IoStats {
-    /// Read calls, each one page.
+    /// Read calls: one a page read alone, one a span ([`Store::read_page_ahead`]).
     pub reads: u64,
+    /// Pages read, alone or in spans.
+    pub pages_read: u64,
     /// Write calls: one a page written directly, one a run.
     pub writes: u64,
     /// Pages written, directly or in runs.
@@ -90,7 +92,19 @@ pub struct Store<F: BlockFile> {
     run_pages: u32,
     /// A write or flush failed: the store takes no more.
     fenced: bool,
+    /// The file's end in bytes: past every page written, the furthest a span reads.
+    end: u64,
     io: IoStats,
+}
+
+/// Pages a scan reads ahead ([`Store::read_page_ahead`]): an extent's buffer, the first page it
+/// holds, and the pages it holds. A scan reads one finished branch's pages, which no write
+/// changes while the branch is held, so the pages a span holds stay the file's.
+#[derive(Debug)]
+pub struct Span {
+    buf: AlignedBuf,
+    first: u64,
+    pages: u32,
 }
 
 fn io(op: &'static str, e: impl std::fmt::Display) -> Error {
@@ -105,6 +119,16 @@ fn corrupt(why: Malformed) -> Error {
         what: "a store",
         why,
     }
+}
+
+/// Appends the payload of the node page `page` read from `address` to `out`, once it verifies.
+fn node_payload(page: &[u8], address: u64, out: &mut Vec<u8>) -> Result<(), Error> {
+    let header = page::verify(page, address)?;
+    if header.kind != Kind::Node {
+        return Err(corrupt(Malformed::UnknownTag(0)));
+    }
+    out.extend_from_slice(page::payload(page, header)?);
+    Ok(())
 }
 
 impl<F: BlockFile> Store<F> {
@@ -177,6 +201,7 @@ impl<F: BlockFile> Store<F> {
             run_first: 0,
             run_pages: 0,
             fenced: false,
+            end: 0,
             io: IoStats::default(),
         };
         store.checkpoint(None, 0)?;
@@ -208,6 +233,7 @@ impl<F: BlockFile> Store<F> {
         let refs = Self::read_map(&file, config, &mut buf, &sb)?;
         let run = Self::run_buf(&file, config)?;
         let alloc = Allocator::from_refs(refs, config.max_extents)?;
+        let end = file.len().map_err(|e| io("stat a store", e))?;
         let recovered = Recovered {
             generation: sb.generation,
             applied: sb.applied,
@@ -224,6 +250,7 @@ impl<F: BlockFile> Store<F> {
                 run_first: 0,
                 run_pages: 0,
                 fenced: false,
+                end,
                 io: IoStats::default(),
             },
             recovered,
@@ -397,6 +424,7 @@ impl<F: BlockFile> Store<F> {
             .copy_from_slice(payload);
         page::seal(buf, address, kind, generation, payload.len())?;
         let offset = Self::offset_in(self.config, address)?;
+        let past = Self::past(offset, self.buf.as_slice().len())?;
         self.io.writes = self.io.writes.saturating_add(1);
         self.io.pages_written = self.io.pages_written.saturating_add(1);
         let started = std::time::Instant::now();
@@ -405,7 +433,17 @@ impl<F: BlockFile> Store<F> {
             .write_all_at(self.buf.as_slice(), offset)
             .map_err(|e| io("write a store page", e));
         self.io.write_ns = self.io.write_ns.saturating_add(elapsed_ns(started));
-        self.fence(written)
+        self.fence(written)?;
+        self.end = self.end.max(past);
+        Ok(())
+    }
+
+    /// The byte past `len` bytes at `offset`.
+    fn past(offset: u64, len: usize) -> Result<u64, Error> {
+        u64::try_from(len)
+            .ok()
+            .and_then(|l| offset.checked_add(l))
+            .ok_or(corrupt(Malformed::TooLarge))
     }
 
     fn sync(&mut self) -> Result<(), Error> {
@@ -482,6 +520,7 @@ impl<F: BlockFile> Store<F> {
             .and_then(|p| p.checked_mul(self.config.page_size))
             .ok_or(corrupt(Malformed::TooLarge))?;
         let offset = Self::offset_in(self.config, self.run_first)?;
+        let past = Self::past(offset, bytes)?;
         self.io.writes = self.io.writes.saturating_add(1);
         self.io.pages_written = self
             .io
@@ -500,7 +539,9 @@ impl<F: BlockFile> Store<F> {
                     .map_err(|e| io("write a store page run", e))
             });
         self.io.write_ns = self.io.write_ns.saturating_add(elapsed_ns(started));
-        self.fence(written)
+        self.fence(written)?;
+        self.end = self.end.max(past);
+        Ok(())
     }
 
     /// Writes a node page at `address`, in a held extent past the superblocks', for the next
@@ -527,6 +568,7 @@ impl<F: BlockFile> Store<F> {
         }
         let offset = Self::offset_in(self.config, address)?;
         self.io.reads = self.io.reads.saturating_add(1);
+        self.io.pages_read = self.io.pages_read.saturating_add(1);
         let started = std::time::Instant::now();
         let read = self
             .file
@@ -534,11 +576,100 @@ impl<F: BlockFile> Store<F> {
             .map_err(|e| io("read a store page", e));
         self.io.read_ns = self.io.read_ns.saturating_add(elapsed_ns(started));
         read?;
-        let header = page::verify(self.buf.as_slice(), address)?;
-        if header.kind != Kind::Node {
-            return Err(corrupt(Malformed::UnknownTag(0)));
+        node_payload(self.buf.as_slice(), address, out)
+    }
+
+    /// A span for a scan: an extent's buffer, holding no pages yet.
+    pub fn span(&self) -> Result<Span, Error> {
+        Ok(Span {
+            buf: Self::run_buf(&self.file, self.config)?,
+            first: 0,
+            pages: 0,
+        })
+    }
+
+    /// [`Self::read_page`] for a scan, which reads pages in address order: a page `span` holds
+    /// is taken from it, and any other is read with the rest of its extent, up to the file's
+    /// end, in one call. A scan of a branch then reads an extent a call where it read a page,
+    /// and every page is still verified as it is taken.
+    pub fn read_page_ahead(
+        &mut self,
+        span: &mut Span,
+        address: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<(), Error> {
+        let held = address
+            .checked_sub(span.first)
+            .filter(|&i| i < u64::from(span.pages));
+        let index = match held {
+            Some(i) => i,
+            None => {
+                self.fill(span, address)?;
+                0
+            }
+        };
+        let size = self.config.page_size;
+        let at = usize::try_from(index)
+            .ok()
+            .and_then(|i| i.checked_mul(size))
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        let page = span
+            .buf
+            .as_slice()
+            .get(at..at.checked_add(size).ok_or(corrupt(Malformed::TooLarge))?)
+            .ok_or(corrupt(Malformed::Truncated))?;
+        node_payload(page, address, out)
+    }
+
+    /// Reads `address` and the pages after it in its extent, up to the file's end, into `span`.
+    fn fill(&mut self, span: &mut Span, address: u64) -> Result<(), Error> {
+        let extent_pages = u64::from(self.config.extent_pages);
+        let extent_end = self
+            .extent_of(address)
+            .checked_add(1)
+            .and_then(|e| e.checked_mul(extent_pages))
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        // A queued page in the extent's rest is written first, as `read_page` writes it, and the
+        // file's end taken after.
+        let run_end = self.run_first.saturating_add(u64::from(self.run_pages));
+        if self.run_pages > 0 && self.run_first < extent_end && address < run_end {
+            self.flush_run()?;
         }
-        out.extend_from_slice(page::payload(self.buf.as_slice(), header)?);
+        let size =
+            u64::try_from(self.config.page_size).map_err(|_| corrupt(Malformed::TooLarge))?;
+        let file_end = self
+            .end
+            .checked_div(size)
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        let last = extent_end.min(file_end);
+        if last <= address {
+            return Err(corrupt(Malformed::Truncated));
+        }
+        let pages = u32::try_from(last.saturating_sub(address))
+            .map_err(|_| corrupt(Malformed::TooLarge))?;
+        let bytes = usize::try_from(pages)
+            .ok()
+            .and_then(|p| p.checked_mul(self.config.page_size))
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        let offset = Self::offset_in(self.config, address)?;
+        span.pages = 0;
+        self.io.reads = self.io.reads.saturating_add(1);
+        self.io.pages_read = self.io.pages_read.saturating_add(u64::from(pages));
+        let started = std::time::Instant::now();
+        let read = span
+            .buf
+            .as_mut_slice()
+            .get_mut(..bytes)
+            .ok_or(corrupt(Malformed::TooLarge))
+            .and_then(|b| {
+                self.file
+                    .read_exact_at(b, offset)
+                    .map_err(|e| io("read a store page span", e))
+            });
+        self.io.read_ns = self.io.read_ns.saturating_add(elapsed_ns(started));
+        read?;
+        span.first = address;
+        span.pages = pages;
         Ok(())
     }
 

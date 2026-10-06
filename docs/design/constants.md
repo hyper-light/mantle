@@ -365,6 +365,9 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/engine/src/memtable/btree.rs` `ENTRY_HEAD_MAX` | derived | 9 bytes, the most a memtable entry's head takes: the operation (1) and the key's and value's lengths as varints of at most 3 bytes (a key below 2^16) and 5 bytes (a value below 2^32). |
 | `crates/engine/src/memtable/btree.rs` `MAX_KEYS` | derived | `2 * DEGREE - 1`: the most entries a B-tree node of minimum degree `DEGREE` holds (Cormen et al., §18.1). |
 | `crates/engine/src/memtable/btree.rs` `NONE` | format | `u32::MAX`, the node index of no child: above every node index the arena's 32-bit offsets allow. |
+| `crates/engine/src/branch/filter.rs` `BITS_PER_KEY` | cited | 10 bits a key in a branch's Bloom filter: a false-positive rate of about 0.6185^b, 0.8% at 10 (Broder and Mitzenmacher, Internet Mathematics 1(4), 2004, §2.1); RocksDB's default `bits_per_key`. |
+| `crates/engine/src/branch/filter.rs` `BLOCK_WORDS` | derived | 8 words of 64 bits: a filter block of 512 bits, one 64-byte cache line, so a key's probes cost one cache miss (Putze, Sanders and Singler, WEA 2007). |
+| `crates/engine/src/branch/filter.rs` `PROBES` | derived | 7, `round(BITS_PER_KEY · ln 2)`: the probe count minimizing a Bloom filter's false-positive rate at 10 bits a key. |
 | `crates/gateway/src/layout.rs` `CHUNK` | cited | Tectonic's "typically 8 MiB" chunk (docs/research/01 §1.14). docs/design/gateway.md says measured transfer sizing will replace it, and audit §12.6/§16.2 requires per-upload sizing. |
 | `crates/gateway/src/layout.rs` `SEALED` | derived | `seal::SEGMENT + seal::TAG`: a 64 KiB plaintext segment plus its 16-byte AEAD tag (docs/design/gateway.md §1). |
 | `crates/gateway/src/put.rs` `RENEWALS` | cited | Quarter-lease renewal from Centrifuge's 15 s renewals of 60 s leases (docs/research/09 §7.2.2). Audit §12.6 requires deriving it from control-delay and outage distributions. |

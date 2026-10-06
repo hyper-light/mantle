@@ -20,6 +20,7 @@
 //! one the page's first and last keys share, which, the keys being sorted, every key between them
 //! shares: object-store keys are paths, and their shared prefixes are most of each key.
 
+pub mod filter;
 pub mod merge;
 
 use crate::error::{Error, Malformed};
@@ -76,6 +77,8 @@ pub struct Branch {
     pub count: u64,
     /// The extents holding its pages.
     pub extents: Vec<u64>,
+    /// Its keys' filter.
+    pub filter: filter::Filter,
 }
 
 fn corrupt(why: Malformed) -> Error {
@@ -222,6 +225,8 @@ pub struct Builder {
     count: u64,
     payload: Vec<u8>,
     capacity: usize,
+    /// Every key's filter hash, for the filter [`Self::finish`] builds.
+    hashes: Vec<u64>,
 }
 
 impl Builder {
@@ -241,6 +246,7 @@ impl Builder {
             count: 0,
             payload: Vec::with_capacity(capacity),
             capacity,
+            hashes: Vec::new(),
         })
     }
 
@@ -296,6 +302,7 @@ impl Builder {
         self.last.clear();
         self.last.extend_from_slice(key);
         self.count = self.count.saturating_add(1);
+        self.hashes.push(filter::hash(key));
         Ok(())
     }
 
@@ -378,6 +385,7 @@ impl Builder {
                     height: u8::try_from(level).map_err(|_| corrupt(Malformed::TooLarge))?,
                     count: self.count,
                     extents: self.extents,
+                    filter: filter::Filter::build(&self.hashes),
                 });
             }
             if self.levels.get(level).is_some_and(|p| p.len() > 0) {
@@ -509,6 +517,21 @@ impl Branch {
         key: &[u8],
         value: &mut Vec<u8>,
     ) -> Result<Option<Op>, Error> {
+        self.get_hashed(store, key, filter::hash(key), value)
+    }
+
+    /// [`Self::get`] with the key's filter hash already taken: a branch the filter rules out is
+    /// answered without a page read.
+    pub fn get_hashed<F: BlockFile>(
+        &self,
+        store: &mut Store<F>,
+        key: &[u8],
+        hash: u64,
+        value: &mut Vec<u8>,
+    ) -> Result<Option<Op>, Error> {
+        if !self.filter.may_contain(hash) {
+            return Ok(None);
+        }
         let mut address = self.root;
         let mut buf = Vec::new();
         for _ in 0..=self.height {

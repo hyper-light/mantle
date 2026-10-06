@@ -132,6 +132,7 @@ impl Trunk {
         key: &[u8],
         value: &mut Vec<u8>,
     ) -> Result<Option<Op>, Error> {
+        let hash = crate::branch::filter::hash(key);
         let mut at = self.root;
         // Every level down is a node's child: at most the trunk's node count of steps.
         for _ in 0..self.nodes.len() {
@@ -140,13 +141,13 @@ impl Trunk {
             let pivot = node.pivots.get(p).ok_or(corrupt())?;
             for bundle in node.inflight.get(pivot.start..).unwrap_or(&[]).iter().rev() {
                 for b in bundle {
-                    if let Some(op) = b.get(store, key, value)? {
+                    if let Some(op) = b.get_hashed(store, key, hash, value)? {
                         return Ok(Some(op));
                     }
                 }
             }
             for b in &pivot.bundle {
-                if let Some(op) = b.get(store, key, value)? {
+                if let Some(op) = b.get_hashed(store, key, hash, value)? {
                     return Ok(Some(op));
                 }
             }

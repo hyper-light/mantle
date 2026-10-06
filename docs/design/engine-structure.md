@@ -164,7 +164,7 @@ both sides, and landed before the next:
 | E2 | Shards: a range replica's engine on one hyper-rt shard, its requests batched, no state shared across shards | 1 | writes up to 4.6×, reads up to 5.4× (p²KVS, asynchronous log there; measured here with the durable one) |
 | E3 | Memtable (concurrent B-tree) and branch packing | 3 | flush cost |
 | E4 | Trunk, flush-then-compact, bundle compaction on the shard's tasks, granularity aligned to the last level | 3 | inserts 6–10×, write amplification 2× lower (SplinterDB); total write amplification with the device's GC about 2.5× lower (Spooky) |
-| E5 | Maplets | 3 | queries up to 1.8×, space overhead 15–61% (abstract-level evidence) |
+| E5 | Per-branch blocked Bloom filters (landed first: a read probes only branches that may hold its key), then maplets routing a key to its pivot's branches with one lookup in less space | 3 | queries up to 1.8×, space overhead 15–61% (maplets, abstract-level evidence); measured with filters: reads 1.2–1.7× RocksDB at 10 M (benches/shard_db.rs) |
 | E6 | REMIX views and SuRF range filters for listings | 4 | seeks 1.4–9×, closed seeks up to 5× |
 | E7 | SILK scheduling | 6 | p99 10–100× under compaction |
 | E8 | Hot region and S3-FIFO caches | 5 | hot gets up to about 10× |

@@ -17,7 +17,6 @@ use hyper_block::block::BlockFile;
 pub struct ShardDb<F: BlockFile> {
     store: Store<F>,
     mem: BTreeMem,
-    mem_limit: usize,
     trunk: Trunk,
 }
 
@@ -27,7 +26,6 @@ impl<F: BlockFile> ShardDb<F> {
         Ok(Self {
             store,
             mem: BTreeMem::new(mem_limit)?,
-            mem_limit,
             trunk: Trunk::new(trunk)?,
         })
     }
@@ -72,7 +70,7 @@ impl<F: BlockFile> ShardDb<F> {
             .walk(|key, op, value| builder.add(store, key, op, value))?;
         let branch = builder.finish(&mut self.store)?;
         self.trunk.incorporate(&mut self.store, branch)?;
-        self.mem = BTreeMem::new(self.mem_limit)?;
+        self.mem.clear();
         Ok(())
     }
 

@@ -485,6 +485,7 @@ BZip2 and XPRESS are refused both ways, as in a RocksDB build without them.
 **Measured.** Blocks build and read faster than RocksDB's in every workload, with a third
 of its allocations or none (docs/measurements/2026-10-06-engine-block-read.md).
 
-**Next in P4.** ZSTD at the reference's speed both ways (decompression is 1.7 to 1.9 times its
-time per block, compression about 7); the table builder and reader; `SstFileWriter` and
+**Next in P4.** ZSTD at the reference's speed both ways: a block decompresses in 1.6 times its
+time and compresses in 1.5 to 1.6, with no allocation but the block returned and frames no larger
+(docs/measurements/2026-10-06-engine-zstd.md); the table builder and reader; `SstFileWriter` and
 `SstFileReader`; and the `sst_dump` differential.

@@ -737,6 +737,16 @@ impl<'a> View<'a> {
 
     /// Entry `i`'s suffix and the bytes before it (operation and value, or child and count).
     fn entry(&self, i: usize) -> Result<(&'a [u8], &'a [u8]), Error> {
+        let (suffix, rest) = self.ranges(i)?;
+        Ok((
+            self.page.get(suffix).ok_or(corrupt(Malformed::Truncated))?,
+            self.page.get(rest).ok_or(corrupt(Malformed::Truncated))?,
+        ))
+    }
+
+    /// Where entry `i`'s suffix and its rest (operation and value, or child and count) lie in
+    /// the page.
+    fn ranges(&self, i: usize) -> Result<(std::ops::Range<usize>, std::ops::Range<usize>), Error> {
         let slot = self
             .table
             .checked_add(i.checked_mul(OFFSET).ok_or(corrupt(Malformed::TooLarge))?)
@@ -770,20 +780,13 @@ impl<'a> View<'a> {
         let suffix_at = body
             .checked_add(fixed)
             .ok_or(corrupt(Malformed::TooLarge))?;
-        let rest = self
-            .page
-            .get(body..suffix_at)
-            .ok_or(corrupt(Malformed::Truncated))?;
-        let suffix = self
-            .page
-            .get(
-                suffix_at
-                    ..suffix_at
-                        .checked_add(len)
-                        .ok_or(corrupt(Malformed::TooLarge))?,
-            )
-            .ok_or(corrupt(Malformed::Truncated))?;
-        Ok((suffix, rest))
+        let suffix_end = suffix_at
+            .checked_add(len)
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        if suffix_end > self.page.len() {
+            return Err(corrupt(Malformed::Truncated));
+        }
+        Ok((suffix_at..suffix_end, body..suffix_at))
     }
 
     /// `key` against the page's key `i`: the prefix first, then the suffix.
@@ -1024,7 +1027,9 @@ pub struct RunCursor {
     page: Vec<u8>,
     span: Span,
     key: Vec<u8>,
-    value: Vec<u8>,
+    /// Where the entry's value lies in the page: read in place, not copied out, since the page
+    /// stays until the cursor moves to another.
+    value: std::ops::Range<usize>,
     op: Op,
     valid: bool,
 }
@@ -1206,7 +1211,7 @@ impl RunCursor {
             span,
             // An entry fits a page, so buffers of a page from the pool never grow.
             key: store.take_page(),
-            value: store.take_page(),
+            value: 0..0,
             op: Op::Put,
             valid: false,
         }
@@ -1216,7 +1221,6 @@ impl RunCursor {
     pub fn give_back<F: BlockFile>(self, store: &mut Store<F>) {
         store.give_page(self.page);
         store.give_page(self.key);
-        store.give_page(self.value);
         store.give_span(self.span);
     }
 
@@ -1235,7 +1239,7 @@ impl RunCursor {
     }
 
     pub fn value(&self) -> &[u8] {
-        &self.value
+        self.page.get(self.value.clone()).unwrap_or(&[])
     }
 
     /// In the leaf held: the index of its first entry at least `key` (its entries when none
@@ -1350,19 +1354,22 @@ impl RunCursor {
 
     fn load(&mut self) -> Result<(), Error> {
         let view = View::new(&self.page)?;
-        let (suffix, rest) = view.entry(self.index)?;
+        let (suffix, rest) = view.ranges(self.index)?;
+        let tag = self.page.get(rest.start).copied().unwrap_or(0);
+        self.op = Op::from_byte(tag).ok_or(corrupt(Malformed::UnknownTag(tag)))?;
         self.key.clear();
         self.key.extend_from_slice(view.prefix);
-        self.key.extend_from_slice(suffix);
-        self.op =
-            rest.first()
-                .and_then(|&b| Op::from_byte(b))
-                .ok_or(corrupt(Malformed::UnknownTag(
-                    rest.first().copied().unwrap_or(0),
-                )))?;
-        self.value.clear();
-        self.value
-            .extend_from_slice(rest.get(3..).ok_or(corrupt(Malformed::Truncated))?);
+        self.key
+            .extend_from_slice(self.page.get(suffix).ok_or(corrupt(Malformed::Truncated))?);
+        // The value follows the operation and its 2-byte length.
+        let from = rest
+            .start
+            .checked_add(3)
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        if from > rest.end {
+            return Err(corrupt(Malformed::Truncated));
+        }
+        self.value = from..rest.end;
         self.valid = true;
         Ok(())
     }

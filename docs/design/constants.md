@@ -105,13 +105,14 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/engine/src/fst/trie.rs` `SPARSE_BLOCK` | cited | 512-bit rank blocks for LOUDS-Sparse: a block in a cache line, 6.25% over the bits (SuRF §2.6; research/35 §1). |
 | `crates/engine/src/fst/trie.rs` `SPARSE_LABEL_BITS` | format | 10: a LOUDS-Sparse label's byte and its has-child and node-start bits. |
 | `crates/engine/src/records.rs` `LIVE` | format | 1: a cached record's flag, set while it is the key's current replica. |
-| `crates/engine/src/records.rs` `READ` | format | 2: a cached record's flag, set when it is read after being appended; it earns one move to the tail before eviction (F2's second chance, Kanellis et al. PVLDB 2025 §7; research/37). |
+| `crates/engine/src/records.rs` `READ` | format | 2: a cached record's flag, set when it is read after being appended; it is carried to the tail once when its page is evicted (F2's second chance, Kanellis et al. PVLDB 2025 §7; research/37). |
 | `crates/engine/src/records.rs` `RECORD_HEAD` | format | 15: a cached record's fixed bytes, key length (2), value length (4), flags (1), key hash (8). |
-| `crates/engine/src/records.rs` `SKIP` | format | `u16::MAX`: a key length no record has, marking the ring empty from it to its end. |
+| `crates/engine/src/records.rs` `SKIP` | format | `u16::MAX`: a key length no record has, marking a page empty from it to its end. |
 | `crates/engine/src/remix.rs` `OLD` | format | 0x80, a selector's bit for a version a newer run shadows (Zhong et al., REMIX, FAST 2021 §4.1; research/34 §4). |
 | `crates/engine/src/remix.rs` `RUN` | format | 0x3f, a selector's run bits: runs 0 to 62, 0x3f the paper's placeholder (REMIX §4.1). |
 | `crates/engine/src/remix.rs` `SEGMENT` | cited | 32 entries a segment as the paper evaluates it: 2.9 B a key for 48-byte keys and 8 runs, 3.16% of the data (REMIX Table 1; research/34 §4); wider for more runs, so a key's versions fit one. |
 | `crates/engine/src/remix.rs` `TOMBSTONE` | format | 0x40, a selector's bit for a deletion (REMIX §4.1). |
+| `crates/engine/src/shard_db.rs` `TUNE_SAMPLES` | cited | 3: the Newton step fits the slope of the gains' difference to the last three allocations between a pair of regions (Luo & Carey, PVLDB 2021 §5.4, K = 3; research/36 §1). |
 | `crates/engine/src/table/format.rs` `CONTEXT_CHECKSUM_FORMAT_VERSION` | format | The first block-based table format_version whose block and footer checksums carry the context modifier [R table/format.h:218-220] (docs/research/24 §1.2). |
 | `crates/engine/src/table/format.rs` `LAST_BYTE_PRIME` | format | `kRandomPrime` 0x6b9083d9 of `ModifyChecksumForLastByte`, folding a block's compression-type byte into its XXH3 checksum [R table/format.cc:606-612] (docs/research/24 §1.2). |
 | `crates/engine/src/trunk/mod.rs` `MAX_VIEW_RUNS` | format | 63: the runs a view names, a selector's six run bits less the placeholder (REMIX §4.1). |

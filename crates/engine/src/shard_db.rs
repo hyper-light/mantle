@@ -182,6 +182,8 @@ pub struct ShardDb<F: BlockFile> {
     record_ghost_hits: u64,
     write_share: usize,
     tuned: crate::store::IoStats,
+    /// The tuner's past steps, for its Newton step.
+    newton: Newton,
     /// The key a scan is at, and the bounds of the trunk segment it reads: buffers kept
     /// between scans.
     scan_key: Vec<u8>,
@@ -206,6 +208,53 @@ pub struct ShardDb<F: BlockFile> {
 const TUNE_STEP_PERCENT: usize = 5;
 const TUNE_DONOR_PERCENT: usize = 10;
 
+/// Cited (Luo & Carey, PVLDB 2021 §5.4): the Newton step fits the cost's slope to the last
+/// three allocations.
+const TUNE_SAMPLES: usize = 3;
+
+/// The last allocations between one pair of regions and how much more a byte the first saved
+/// than the second at each, for the Newton step: research/36, the paper's `K` of them.
+#[derive(Debug, Default)]
+struct Newton {
+    pair: (usize, usize),
+    samples: std::collections::VecDeque<(i128, i128)>,
+}
+
+impl Newton {
+    /// Records that at `x` bytes in the pair's first region it saved `d` ns a MiB more than the
+    /// second, and returns the bytes to move into the first region (negative: out of it) that
+    /// bring `d` to zero on the line fitted to the samples, when the fit has returns
+    /// diminishing (a negative slope); none otherwise, for the fixed step.
+    fn step(&mut self, pair: (usize, usize), x: usize, d: i128) -> Option<i128> {
+        if pair != self.pair {
+            self.samples.clear();
+            self.pair = pair;
+        }
+        if self.samples.len() >= TUNE_SAMPLES {
+            self.samples.pop_front();
+        }
+        self.samples.push_back((i128::try_from(x).ok()?, d));
+        let n = i128::try_from(self.samples.len()).ok()?;
+        if n < 2 {
+            return None;
+        }
+        // Least squares, scaled by n² so it stays in integers: slope = sxd / sxx.
+        let (mut sx, mut sd, mut sxx, mut sxd) = (0i128, 0i128, 0i128, 0i128);
+        for &(x, d) in &self.samples {
+            sx = sx.checked_add(x)?;
+            sd = sd.checked_add(d)?;
+            sxx = sxx.checked_add(x.checked_mul(x)?)?;
+            sxd = sxd.checked_add(x.checked_mul(d)?)?;
+        }
+        let sxx = n.checked_mul(sxx)?.checked_sub(sx.checked_mul(sx)?)?;
+        let sxd = n.checked_mul(sxd)?.checked_sub(sx.checked_mul(sd)?)?;
+        if sxx <= 0 || sxd >= 0 {
+            return None;
+        }
+        d.checked_mul(sxx)?.checked_div(sxd)?.checked_neg()
+    }
+}
+
 /// What a region of memory saved in a cycle, in nanoseconds, against the bytes it stands for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Gain {
@@ -214,7 +263,7 @@ struct Gain {
 }
 
 /// Write memory's next share of `memory` against the page cache alone ([`tune3`] with no record
-/// cache).
+/// cache and no past steps).
 #[cfg(test)]
 fn tune(memory: usize, share: usize, written: usize, read: Gain, write: Gain) -> usize {
     let none = Gain {
@@ -222,16 +271,30 @@ fn tune(memory: usize, share: usize, written: usize, read: Gain, write: Gain) ->
         bytes: 0,
     };
     let shares = [memory.saturating_sub(share), share, 0];
-    tune3(memory, shares, written, [read, write, none])[1]
+    tune3(
+        memory,
+        shares,
+        written,
+        [read, write, none],
+        &mut Newton::default(),
+    )[1]
 }
 
 /// The shard's memory divided again among the page cache, write memory and the record cache
 /// (`shares`, in that order): a step moves toward the region whose bytes saved the most a byte,
 /// from the region with memory that saved the least, the gains compared exactly by cross
-/// products without dividing. Write memory never passes the last cycle's writes, `written`,
-/// since a queue past a cycle's writes spares no wait; the page cache takes the rest. Equal
-/// gains, or nothing saved, change nothing.
-fn tune3(memory: usize, shares: [usize; 3], written: usize, gains: [Gain; 3]) -> [usize; 3] {
+/// products without dividing. The step is the Newton step on the pair's past steps (`newton`)
+/// when their fit shows returns diminishing, the paper's fixed step otherwise, and takes at
+/// most the donor bound either way. Write memory never passes the last cycle's writes,
+/// `written`, since a queue past a cycle's writes spares no wait; the page cache takes the
+/// rest. Equal gains, or nothing saved, change nothing.
+fn tune3(
+    memory: usize,
+    shares: [usize; 3],
+    written: usize,
+    gains: [Gain; 3],
+    newton: &mut Newton,
+) -> [usize; 3] {
     let step = memory.saturating_mul(TUNE_STEP_PERCENT) / 100;
     let rate = |i: usize| {
         gains.get(i).copied().unwrap_or(Gain {
@@ -267,7 +330,27 @@ fn tune3(memory: usize, shares: [usize; 3], written: usize, gains: [Gain; 3]) ->
         && more(rate(to), rate(f))
     {
         let donor = shares.get(f).copied().unwrap_or(0);
-        let give = step.min(donor.saturating_mul(TUNE_DONOR_PERCENT) / 100);
+        // ns a MiB the region saved, signed differences of which the Newton step fits.
+        let per_mib = |i: usize| {
+            let g = rate(i);
+            i128::from(g.saved_ns)
+                .saturating_mul(1 << 20)
+                .checked_div(i128::try_from(g.bytes.max(1)).unwrap_or(i128::MAX))
+                .unwrap_or(0)
+        };
+        let (lo, hi) = (to.min(f), to.max(f));
+        let toward = newton
+            .step(
+                (lo, hi),
+                shares.get(lo).copied().unwrap_or(0),
+                per_mib(lo).saturating_sub(per_mib(hi)),
+            )
+            .map(|m| if to == lo { m } else { m.saturating_neg() })
+            .and_then(|m| usize::try_from(m).ok())
+            .filter(|&m| m > 0);
+        let give = toward
+            .unwrap_or(step)
+            .min(donor.saturating_mul(TUNE_DONOR_PERCENT) / 100);
         if let Some(d) = next.get_mut(f) {
             *d = d.saturating_sub(give);
         }
@@ -339,6 +422,7 @@ impl<F: BlockFile> ShardDb<F> {
             record_ghost_hits: 0,
             write_share: 0,
             tuned: crate::store::IoStats::default(),
+            newton: Newton::default(),
             scan_key: Vec::new(),
             scan_from: Vec::new(),
             scan_active: MemCursor::empty(),
@@ -493,7 +577,10 @@ impl<F: BlockFile> ShardDb<F> {
         // The record cache starts at one tuning step, so its ghost gathers the evidence that
         // prices it; the page cache has the rest.
         self.records_share = bytes.saturating_mul(TUNE_STEP_PERCENT) / 100;
-        self.records = Some(crate::records::RecordCache::new(self.records_share));
+        self.records = Some(crate::records::RecordCache::new(
+            self.records_share,
+            self.store.page_size(),
+        ));
         let cache = bytes.saturating_sub(self.records_share);
         self.store
             .resize_cache(cache.checked_div(self.store.page_size()).unwrap_or(0));
@@ -604,6 +691,7 @@ impl<F: BlockFile> ShardDb<F> {
             [cache, self.write_share, self.records_share],
             written,
             [read, write, records],
+            &mut self.newton,
         );
         // The record cache keeps one step: with none, its ghost would gather no evidence that
         // it should grow.
@@ -631,7 +719,8 @@ impl<F: BlockFile> ShardDb<F> {
     /// Gives point reads a cache of `bytes` of hot records (`records::RecordCache`), replacing
     /// any it had; none at 0.
     pub fn set_record_cache(&mut self, bytes: usize) {
-        self.records = (bytes > 0).then(|| crate::records::RecordCache::new(bytes));
+        self.records =
+            (bytes > 0).then(|| crate::records::RecordCache::new(bytes, self.store.page_size()));
     }
 
     /// Gives point reads a page cache of `pages` pages (`Store::set_cache`).
@@ -1171,7 +1260,8 @@ mod tune_tests {
                 m,
                 [70 * MIB, 20 * MIB, 10 * MIB],
                 m,
-                [gain(5, 1), gain(1, 1), gain(9, 1)]
+                [gain(5, 1), gain(1, 1), gain(9, 1)],
+                &mut super::Newton::default()
             ),
             [70 * MIB, 18 * MIB, 12 * MIB]
         );
@@ -1181,7 +1271,8 @@ mod tune_tests {
                 m,
                 [90 * MIB, 0, 10 * MIB],
                 m,
-                [gain(1, 1), gain(0, 1), gain(9, 1)]
+                [gain(1, 1), gain(0, 1), gain(9, 1)],
+                &mut super::Newton::default()
             ),
             [85 * MIB, 0, 15 * MIB]
         );
@@ -1191,7 +1282,8 @@ mod tune_tests {
                 m,
                 [50 * MIB, 25 * MIB, 25 * MIB],
                 m,
-                [gain(1, 1), gain(1, 1), gain(1, 1)]
+                [gain(1, 1), gain(1, 1), gain(1, 1)],
+                &mut super::Newton::default()
             ),
             [50 * MIB, 25 * MIB, 25 * MIB]
         );
@@ -1201,10 +1293,67 @@ mod tune_tests {
                 m,
                 [50 * MIB, 30 * MIB, 20 * MIB],
                 10 * MIB,
-                [gain(1, 1), gain(1, 1), gain(1, 1)]
+                [gain(1, 1), gain(1, 1), gain(1, 1)],
+                &mut super::Newton::default()
             ),
             [70 * MIB, 10 * MIB, 20 * MIB]
         );
+    }
+
+    #[test]
+    fn the_newton_step_moves_to_where_the_fitted_gains_meet() {
+        // The first region saved 90 ns a MiB more at 10 MiB, 80 more at 20 MiB: on that line
+        // the gains meet at 100 MiB, 80 MiB on from 20.
+        let mut n = super::Newton::default();
+        assert_eq!(n.step((0, 2), 10 * MIB, 90), None);
+        assert_eq!(n.step((0, 2), 20 * MIB, 80), Some(80 * 1_048_576));
+        // Another pair starts over.
+        assert_eq!(n.step((1, 2), 20 * MIB, 80), None);
+        // Returns that grow with memory give no Newton step: the fixed step is taken.
+        assert_eq!(n.step((1, 2), 30 * MIB, 90), None);
+        // A third sample keeps the last three; the fourth drops the first.
+        let mut n = super::Newton::default();
+        for (x, d) in [(1, 0), (10, 90), (20, 80), (30, 70)] {
+            n.step((0, 1), x * MIB, d);
+        }
+        assert_eq!(n.samples.len(), super::TUNE_SAMPLES);
+        assert_eq!(n.step((0, 1), 40 * MIB, 60), Some(60 * 1_048_576));
+    }
+
+    #[test]
+    fn the_tuner_takes_the_newton_step_within_the_donor_bound() {
+        let m = 1000 * MIB;
+        let mut n = super::Newton::default();
+        // Records at 10 MiB saved 2 ns a byte, the page cache 1: the fixed step, 5% of 1000.
+        let first = super::tune3(
+            m,
+            [990 * MIB, 0, 10 * MIB],
+            m,
+            [gain(990, 990), gain(0, 1), gain(20, 10)],
+            &mut n,
+        );
+        assert_eq!(first, [940 * MIB, 0, 60 * MIB]);
+        // At 60 MiB records saved 1.5 a byte: the line meets the cache's 1 at 110 MiB, 50 on.
+        let second = super::tune3(
+            m,
+            first,
+            m,
+            [gain(940, 940), gain(0, 1), gain(90, 60)],
+            &mut n,
+        );
+        assert_eq!(second, [890 * MIB, 0, 110 * MIB]);
+        // The page cache saved 1001 ns a MiB more at 99 MiB and 1000 more at 100: the line
+        // meets at 1100 MiB, past the records' 10%, so the step is 90 MiB.
+        let mut n = super::Newton::default();
+        n.step((0, 2), 99 * MIB, 1001);
+        let next = super::tune3(
+            m,
+            [100 * MIB, 0, 900 * MIB],
+            m,
+            [gain(1000, MIB), gain(0, 1), gain(0, MIB)],
+            &mut n,
+        );
+        assert_eq!(next, [190 * MIB, 0, 810 * MIB]);
     }
 
     #[test]

@@ -34,9 +34,14 @@ FASTER to F2: Evolving Concurrent Key-Value Store Designs for Large Skewed Workl
 - **The paper's invariant, exactly.** A put or delete drops its key's cached record before it
   returns. The memtable is read first, so a newer write wins while it is there; once flushed,
   the newer version lives in the trunk, and the dropped record cannot hide it.
-- **The paper's structure.** A byte log of records, appended at the tail and evicted at the
-  head, a record read again moved to the tail before eviction (second chance), indexed by a
-  fixed open-addressing table of key hashes: a get or put allocates nothing.
+- **The paper's structure.** A log of records in pages, appended at the tail and evicted at the
+  head a page at a time, a record read since it was appended carried to the tail when its page
+  is evicted (second chance), indexed by a table of key hashes. The evicted page is the next
+  tail page: eviction allocates nothing.
+- **Pages make resizing cheap.** The memory tuner resizes the cache while gets run. A single
+  ring had to be rebuilt to resize, a copy of every record: 19–73 ms stalls on a 170 MiB cache
+  (10M keys, 2026-10-07). With pages, growing raises the page limit and shrinking evicts head
+  pages, the work eviction does anyway.
 - **Write-hot records** stay in the memtable, a B-tree updated in place (§8 E3): mantle's
   analogue of the hot log's mutable region.
 - **Sizing.** The cache's bytes are a third region of the shard's memory budget, divided by the

@@ -49,3 +49,11 @@ memory its owner spares between its memtables, its page cache and its write runs
   10 M fill's p99.9 puts waited on (docs/design/engine-structure.md §6).
 - The paper's constants (32 MB `sim`, 5% and 10% steps, 32 MB and 0.1% stops, 10-minute cycle)
   are its choices on its hardware: mantle measures its own (CLAUDE.md §4–5).
+- The step is the paper's: Newton on the difference of two regions' gains a MiB, fitted by least
+  squares to the last `K = 3` allocations between the pair, in exact integers; the fixed 5% step
+  when there are fewer samples or the fit does not diminish, and the 10% donor bound always.
+  With three regions the pair is the one each step moves between, and a new pair starts its
+  samples over.
+- A region's ghost must outlive its resizes: the record cache first rebuilt its ghost with its
+  ring, so each step's next cycle saw ten times fewer ghost hits (16.9M ns saved, then 0.17M)
+  and the tuner reversed. Measured 2026-10-07, 10M keys, skewed reads.

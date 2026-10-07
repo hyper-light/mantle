@@ -80,8 +80,11 @@ pub struct TrunkStats {
     pub finish_ns: u64,
 }
 
-fn ns_since(t: std::time::Instant) -> u64 {
-    u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
+/// Nanoseconds since `t`, none when timing is off (`Trunk::set_timed`).
+fn ns_since(t: Option<std::time::Instant>) -> u64 {
+    t.map_or(0, |t| {
+        u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    })
 }
 
 /// One shard's trunk.
@@ -100,6 +103,8 @@ pub struct Trunk {
     cascade: Vec<Frame>,
     /// A finished frame's nodes now covering its range, for the frame above it.
     returned: Option<Vec<(Vec<u8>, usize)>>,
+    /// Whether compactions' planning and finishing are timed ([`Trunk::set_timed`]).
+    timed: bool,
 }
 
 /// One node's flush-then-compact in progress: the recursion the module describes, held as an
@@ -171,6 +176,7 @@ impl Trunk {
             pending: Vec::new(),
             cascade: Vec::new(),
             returned: None,
+            timed: false,
         })
     }
 
@@ -305,6 +311,11 @@ impl Trunk {
         self.run(store, u64::MAX, false).map(|_| ())
     }
 
+    /// Times compactions' planning and finishing into [`TrunkStats`]: off by default.
+    pub fn set_timed(&mut self, on: bool) {
+        self.timed = on;
+    }
+
     /// The trunk's fanout.
     pub fn fanout(&self) -> usize {
         self.config.fanout
@@ -386,7 +397,7 @@ impl Trunk {
             } => {
                 let used = c.step(store, budget)?;
                 if c.is_done() {
-                    let t = std::time::Instant::now();
+                    let t = self.timed.then(std::time::Instant::now);
                     self.apply_pivot(store, n, i, c, covered)?;
                     self.stats.finish_ns = self.stats.finish_ns.saturating_add(ns_since(t));
                     (
@@ -407,7 +418,7 @@ impl Trunk {
                 }
             }
             Phase::Pivots { i, job: None } => {
-                let t = std::time::Instant::now();
+                let t = self.timed.then(std::time::Instant::now);
                 let phase = self.plan_pivot(store, n, i)?;
                 self.stats.plan_ns = self.stats.plan_ns.saturating_add(ns_since(t));
                 (Some(phase), 0)
@@ -417,7 +428,7 @@ impl Trunk {
             } => {
                 let used = c.step(store, budget)?;
                 if c.is_done() {
-                    let t = std::time::Instant::now();
+                    let t = self.timed.then(std::time::Instant::now);
                     let parts = c.finish(store)?;
                     self.returned = Some(self.apply_settle(store, n, parts, &extents)?);
                     self.stats.finish_ns = self.stats.finish_ns.saturating_add(ns_since(t));
@@ -432,7 +443,7 @@ impl Trunk {
                 }
             }
             Phase::Settle { job: None } => {
-                let t = std::time::Instant::now();
+                let t = self.timed.then(std::time::Instant::now);
                 let phase = self.plan_settle(store, n)?;
                 self.stats.plan_ns = self.stats.plan_ns.saturating_add(ns_since(t));
                 (phase, 0)
@@ -680,6 +691,7 @@ impl Trunk {
             pending: Vec::new(),
             cascade: Vec::new(),
             returned: None,
+            timed: false,
         })
     }
 

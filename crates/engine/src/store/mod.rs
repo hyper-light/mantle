@@ -90,8 +90,11 @@ pub struct IoStats {
     pub buffers_fresh: u64,
 }
 
-fn elapsed_ns(since: std::time::Instant) -> u64 {
-    u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX)
+/// Nanoseconds since `since`, none when timing is off (`Store::set_timed`).
+fn elapsed_ns(since: Option<std::time::Instant>) -> u64 {
+    since.map_or(0, |t| {
+        u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    })
 }
 
 /// A store over one file, owned by one thread (as every `BlockFile` is).
@@ -119,6 +122,8 @@ pub struct Store<F: BlockFile> {
     pool: Vec<AlignedBuf>,
     lent: usize,
     most_lent: usize,
+    /// Whether its I/O is timed ([`Store::set_timed`]): a clock read a call, for diagnosis.
+    timed: bool,
     /// Freed extents whose pages the cache still holds, forgotten a share at a time
     /// ([`Store::forget_some`]): at most the extents freed.
     forgetting: VecDeque<u64>,
@@ -252,6 +257,7 @@ impl<F: BlockFile> Store<F> {
             lent: 0,
             most_lent: 0,
             forgetting: VecDeque::new(),
+            timed: false,
         };
         store.checkpoint(None, 0)?;
         Ok(store)
@@ -303,6 +309,7 @@ impl<F: BlockFile> Store<F> {
                 lent: 0,
                 most_lent: 0,
                 forgetting: VecDeque::new(),
+                timed: false,
             },
             recovered,
         ))
@@ -538,7 +545,7 @@ impl<F: BlockFile> Store<F> {
         let past = Self::past(offset, self.buf.as_slice().len())?;
         self.io.writes = self.io.writes.saturating_add(1);
         self.io.pages_written = self.io.pages_written.saturating_add(1);
-        let started = std::time::Instant::now();
+        let started = self.timed.then(std::time::Instant::now);
         let written = self
             .file
             .write_all_at(self.buf.as_slice(), offset)
@@ -571,6 +578,12 @@ impl<F: BlockFile> Store<F> {
         self.io.syncs = self.io.syncs.saturating_add(1);
         let synced = self.file.sync_data().map_err(|e| io("flush a store", e));
         self.fence(synced)
+    }
+
+    /// Times the store's write and read calls into [`IoStats`]: off by default, as a clock read
+    /// each call costs the put and get paths.
+    pub fn set_timed(&mut self, on: bool) {
+        self.timed = on;
     }
 
     /// An extent buffer from the pool, or a fresh one.
@@ -699,7 +712,7 @@ impl<F: BlockFile> Store<F> {
         if self.writer.is_some() {
             return self.submit(run, first, pages, bytes, offset, past);
         }
-        let started = std::time::Instant::now();
+        let started = self.timed.then(std::time::Instant::now);
         let written = run
             .buf
             .as_slice()
@@ -736,7 +749,7 @@ impl<F: BlockFile> Store<F> {
             .as_ref()
             .is_some_and(|w| w.attached.out() >= w.attached.batches());
         if full {
-            let t = std::time::Instant::now();
+            let t = self.timed.then(std::time::Instant::now);
             self.answer(true)?;
             self.io.write_waits = self.io.write_waits.saturating_add(1);
             self.io.write_wait_ns = self.io.write_wait_ns.saturating_add(elapsed_ns(t));
@@ -745,7 +758,7 @@ impl<F: BlockFile> Store<F> {
         let mut buf = std::mem::replace(&mut run.buf, fresh);
         buf.set_len(bytes)
             .map_err(|e| io("cut a run to its pages", e))?;
-        let started = std::time::Instant::now();
+        let started = self.timed.then(std::time::Instant::now);
         let Some(w) = self.writer.as_mut() else {
             return Err(io("submit a store page run", "no issuer attached"));
         };
@@ -869,7 +882,7 @@ impl<F: BlockFile> Store<F> {
         let offset = Self::offset_in(self.config, address)?;
         self.io.reads = self.io.reads.saturating_add(1);
         self.io.pages_read = self.io.pages_read.saturating_add(1);
-        let started = std::time::Instant::now();
+        let started = self.timed.then(std::time::Instant::now);
         let read = self
             .file
             .read_exact_at(self.buf.as_mut_slice(), offset)
@@ -974,7 +987,7 @@ impl<F: BlockFile> Store<F> {
         span.pages = 0;
         self.io.reads = self.io.reads.saturating_add(1);
         self.io.pages_read = self.io.pages_read.saturating_add(u64::from(pages));
-        let started = std::time::Instant::now();
+        let started = self.timed.then(std::time::Instant::now);
         let read = span
             .buf
             .as_mut_slice()

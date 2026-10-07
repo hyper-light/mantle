@@ -78,10 +78,15 @@ pub struct ShardDb<F: BlockFile> {
     trunk_carry: u128,
     forget_carry: u128,
     flush_stats: FlushStats,
+    /// Whether maintenance is timed ([`ShardDb::set_timed`]).
+    timed: bool,
 }
 
-fn ns_since(t: std::time::Instant) -> u64 {
-    u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
+/// Nanoseconds since `t`, none when timing is off (`ShardDb::set_timed`).
+fn ns_since(t: Option<std::time::Instant>) -> u64 {
+    t.map_or(0, |t| {
+        u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    })
 }
 
 /// A put's share of `debt`: `debt · bytes / room`, the remainder carried to the next put; the
@@ -117,6 +122,7 @@ impl<F: BlockFile> ShardDb<F> {
             trunk_carry: 0,
             forget_carry: 0,
             flush_stats: FlushStats::default(),
+            timed: false,
         })
     }
 
@@ -213,6 +219,14 @@ impl<F: BlockFile> ShardDb<F> {
         Ok(())
     }
 
+    /// Times maintenance, its phases and the store's I/O into [`FlushStats`], `TrunkStats` and
+    /// `IoStats`: off by default, as a clock read each slice costs every put.
+    pub fn set_timed(&mut self, on: bool) {
+        self.timed = on;
+        self.trunk.set_timed(on);
+        self.store.set_timed(on);
+    }
+
     /// Gives point reads a page cache of `pages` pages (`Store::set_cache`).
     pub fn set_cache(&mut self, pages: usize) {
         self.store.set_cache(pages);
@@ -290,7 +304,7 @@ impl<F: BlockFile> ShardDb<F> {
             let w = share(left, bytes, room, &mut self.pack_carry);
             self.flush_stats.pack_share_most = self.flush_stats.pack_share_most.max(w);
             if w > 0 {
-                let t = std::time::Instant::now();
+                let t = self.timed.then(std::time::Instant::now);
                 let Packing {
                     mem,
                     walk,
@@ -335,7 +349,7 @@ impl<F: BlockFile> ShardDb<F> {
             let w = share(debt, bytes, room, &mut self.trunk_carry);
             self.flush_stats.trunk_share_most = self.flush_stats.trunk_share_most.max(w);
             if w > 0 {
-                let t = std::time::Instant::now();
+                let t = self.timed.then(std::time::Instant::now);
                 self.trunk.step(&mut self.store, w)?;
                 self.note_trunk(ns_since(t));
             }
@@ -367,7 +381,7 @@ impl<F: BlockFile> ShardDb<F> {
         else {
             return Ok(());
         };
-        let t = std::time::Instant::now();
+        let t = self.timed.then(std::time::Instant::now);
         let store = &mut self.store;
         mem.walk_some(&mut walk, usize::MAX, |k, op, v| {
             builder.add(store, k, op, v)
@@ -388,7 +402,7 @@ impl<F: BlockFile> ShardDb<F> {
     /// still owed is paid first, whole, and counted a stall: the packing memtable's, and the
     /// trunk's cascade when `fanout` packed memtables wait on it.
     fn rotate(&mut self) -> Result<(), Error> {
-        let t = std::time::Instant::now();
+        let t = self.timed.then(std::time::Instant::now);
         let mut stalled = false;
         if self.packing.is_some() {
             self.finish_packing()?;
@@ -427,7 +441,7 @@ impl<F: BlockFile> ShardDb<F> {
     /// once nothing is owed.
     pub fn maintain(&mut self, budget: u64) -> Result<u64, Error> {
         self.finish_packing()?;
-        let t = std::time::Instant::now();
+        let t = self.timed.then(std::time::Instant::now);
         let used = self.trunk.step(&mut self.store, budget)?;
         self.note_trunk(ns_since(t));
         Ok(used)
@@ -453,7 +467,7 @@ impl<F: BlockFile> ShardDb<F> {
             });
             self.finish_packing()?;
         }
-        let t = std::time::Instant::now();
+        let t = self.timed.then(std::time::Instant::now);
         self.trunk.drain(&mut self.store)?;
         self.note_trunk(ns_since(t));
         self.trunk_carry = 0;

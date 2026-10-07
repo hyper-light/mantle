@@ -160,12 +160,22 @@ struct Finished {
 impl Issuer {
     /// Starts the issuer of the device at `path` with `depth` workers, or fewer when the
     /// process's thread budget has fewer left; [`DiskError::Threads`] when it has none for one
-    /// worker and the issuer's own thread. Every thread starts here, before any is used.
+    /// worker and the issuer's own thread. Every thread starts here, before any is used. Its
+    /// submitters may have `depth` batches out together without waiting to hand one over
+    /// ([`Self::start_for`]).
+    pub fn start(path: &Path, depth: usize) -> Result<Self, DiskError> {
+        Self::start_for(path, depth, depth)
+    }
+
+    /// [`Self::start`] for submitters that together keep up to `batches` out
+    /// ([`Self::attach_deep`]): the issuer's inbox holds every worker's report and every such
+    /// batch at once, so within that budget a submission is handed over without waiting, even
+    /// while the issuer's thread is not running. Past it, a submission waits for room.
     #[allow(
         clippy::disallowed_methods,
         reason = "the issuer's bounded device workers: hyper-block runs its device's I/O (clippy.toml's file rule names it)"
     )]
-    pub fn start(path: &Path, depth: usize) -> Result<Self, DiskError> {
+    pub fn start_for(path: &Path, depth: usize, batches: usize) -> Result<Self, DiskError> {
         if depth == 0 {
             return Err(invalid(path, "an issuer needs a depth of one at least"));
         }
@@ -181,9 +191,9 @@ impl Issuer {
             });
         }
         let budget = threads::reserve(threads, path)?;
-        // Room for every worker's report at once, so a worker never waits to report while the
-        // issuer drains what arrives; a submitter waits for room behind them.
-        let (events, inbox) = sync_channel(workers);
+        // Room for every worker's report and every batch the submitters may have out, so a worker
+        // never waits to report and a submission within the budget is never held behind them.
+        let (events, inbox) = sync_channel(workers.saturating_add(batches));
         let (ready, started) = sync_channel(1);
         let completions = events.clone();
         let device = path.to_path_buf();

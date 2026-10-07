@@ -44,6 +44,9 @@ pub struct FlushStats {
     pub incorporate_max_ns: u64,
     /// Nanoseconds finishing packed memtables: the walk's rest, the last pages and the filter.
     pub pack_finish_ns: u64,
+    /// The largest share of each debt one put was given: entries to pack, keys to merge.
+    pub pack_share_most: u64,
+    pub trunk_share_most: u64,
     /// Stalls, and their nanoseconds in all and at the most.
     pub stalls: u64,
     pub stall_ns: u64,
@@ -275,6 +278,7 @@ impl<F: BlockFile> ShardDb<F> {
         if let Some(p) = &mut self.packing {
             let left = u64::try_from(p.mem.len().saturating_sub(p.packed)).unwrap_or(u64::MAX);
             let w = share(left, bytes, room, &mut self.pack_carry);
+            self.flush_stats.pack_share_most = self.flush_stats.pack_share_most.max(w);
             if w > 0 {
                 let t = std::time::Instant::now();
                 let Packing {
@@ -300,6 +304,7 @@ impl<F: BlockFile> ShardDb<F> {
             let waiting = self.trunk.fanout().saturating_sub(self.trunk.pending());
             let room = room.saturating_add(waiting.saturating_mul(self.mem_limit));
             let w = share(debt, bytes, room, &mut self.trunk_carry);
+            self.flush_stats.trunk_share_most = self.flush_stats.trunk_share_most.max(w);
             if w > 0 {
                 let t = std::time::Instant::now();
                 self.trunk.step(&mut self.store, w)?;

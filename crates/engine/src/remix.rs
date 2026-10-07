@@ -390,27 +390,50 @@ impl Walk {
             return Ok(w);
         }
         let selectors = view.selectors_of(w.segment).ok_or(corrupt())?;
-        let mut probe = RunCursor::new(store)?;
-        let found = w.search(view, store, runs, selectors, from, &mut probe);
-        probe.give_back(store);
-        w.at = found?;
-        for (r, b) in w.behind.iter_mut().enumerate() {
-            *b = occurrences(selectors, w.at, r);
+        let found = w.search(view, store, runs, selectors, from);
+        let found = match found {
+            Ok(at) => at,
+            Err(e) => {
+                w.give_back(store);
+                return Err(e);
+            }
+        };
+        w.at = found;
+        // A run the search probed is placed where the walk consumes it, its page kept when it
+        // is the one held; a run it did not is placed when a selector names it.
+        for r in 0..view.runs {
+            let k = occurrences(selectors, w.at, r);
+            let slot = w.cursors.get_mut(r).ok_or(corrupt())?;
+            let behind = w.behind.get_mut(r).ok_or(corrupt())?;
+            *behind = k;
+            let Some(c) = slot.as_mut() else { continue };
+            let b = runs.get(r).ok_or(corrupt())?;
+            match b.position_after(view.offset(w.segment, r)?, k)? {
+                Some(at) => {
+                    c.place(b, store, at)?;
+                    *behind = 0;
+                }
+                None => {
+                    if let Some(c) = slot.take() {
+                        c.give_back(store);
+                    }
+                }
+            }
         }
         w.settle(view, store, runs)?;
         Ok(w)
     }
 
     /// The first entry of `selectors` (the segment's) whose key is at least `from`, by halving:
-    /// its length when every key is less.
+    /// its length when every key is less. Each probe reads its key through its run's own cursor,
+    /// so a page a probe reads is the page the run is then placed on when the walk starts there.
     fn search<F: BlockFile>(
-        &self,
+        &mut self,
         view: &View,
         store: &mut Store<F>,
         runs: &[Branch],
         selectors: &[u8],
         from: &[u8],
-        probe: &mut RunCursor,
     ) -> Result<usize, Error> {
         let (mut lo, mut hi) = (0usize, selectors.len());
         while lo < hi {
@@ -421,8 +444,13 @@ impl Walk {
             let at = b
                 .position_after(offset, occurrences(selectors, mid, r))?
                 .ok_or(corrupt())?;
-            probe.place(b, store, at)?;
-            if probe.key() < from {
+            let slot = self.cursors.get_mut(r).ok_or(corrupt())?;
+            if slot.is_none() {
+                *slot = Some(RunCursor::new(store)?);
+            }
+            let c = slot.as_mut().ok_or(corrupt())?;
+            c.place(b, store, at)?;
+            if c.key() < from {
                 lo = mid.saturating_add(1);
             } else {
                 hi = mid;

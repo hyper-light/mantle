@@ -141,6 +141,11 @@ impl BTreeMem {
         ))
     }
 
+    /// Arena bytes left before the bound.
+    pub fn room(&self) -> usize {
+        self.limit.saturating_sub(self.arena.len())
+    }
+
     /// Arena bytes used: what the bound is against.
     pub fn bytes(&self) -> usize {
         self.arena.len()
@@ -423,22 +428,48 @@ impl BTreeMem {
         Ok(())
     }
 
-    /// Every entry in key order: `each(key, op, value)`. The walk's stack is bounded by the
-    /// tree's height.
+    /// Every entry in key order: `each(key, op, value)`.
     pub fn walk(
         &self,
-        mut each: impl FnMut(&[u8], Op, &[u8]) -> Result<(), Error>,
+        each: impl FnMut(&[u8], Op, &[u8]) -> Result<(), Error>,
     ) -> Result<(), Error> {
-        // (node, next index): an inner node's index alternates child, entry.
-        let mut stack: Vec<(u32, usize)> = vec![(self.root, 0)];
-        while let Some(&mut (at, ref mut i)) = stack.last_mut() {
+        let mut walk = self.walk_start();
+        self.walk_some(&mut walk, usize::MAX, each).map(|_| ())
+    }
+
+    /// A walk at the first entry, for [`Self::walk_some`].
+    pub fn walk_start(&self) -> Walk {
+        Walk {
+            stack: vec![(self.root, 0)],
+        }
+    }
+
+    /// The next `limit` entries of `walk` in key order, `each(key, op, value)`; the entries
+    /// visited, fewer than `limit` only at the end. A walk is resumed only over the memtable it
+    /// started on, unchanged since: an immutable memtable packed a slice at a time.
+    pub fn walk_some(
+        &self,
+        walk: &mut Walk,
+        limit: usize,
+        mut each: impl FnMut(&[u8], Op, &[u8]) -> Result<(), Error>,
+    ) -> Result<usize, Error> {
+        let mut visited = 0usize;
+        // (node, next index): a leaf's index is its next entry; an inner node's alternates
+        // child, entry.
+        while visited < limit {
+            let Some(&mut (at, ref mut i)) = walk.stack.last_mut() else {
+                break;
+            };
             let n = self.node(at)?;
             if n.leaf {
-                for &e in n.entries.get(..n.len).unwrap_or(&[]) {
-                    let (op, v) = self.value(e)?;
-                    each(self.key(e), op, v)?;
-                }
-                stack.pop();
+                let Some(&e) = n.entries.get(..n.len).and_then(|es| es.get(*i)) else {
+                    walk.stack.pop();
+                    continue;
+                };
+                *i = i.saturating_add(1);
+                let (op, v) = self.value(e)?;
+                each(self.key(e), op, v)?;
+                visited = visited.saturating_add(1);
                 continue;
             }
             // Step 2j visits child j, step 2j + 1 entry j.
@@ -447,19 +478,27 @@ impl BTreeMem {
             let j = step / 2;
             if step % 2 == 0 {
                 if j > n.len {
-                    stack.pop();
+                    walk.stack.pop();
                     continue;
                 }
                 let child = *n.children.get(j).ok_or(corrupt())?;
-                stack.push((child, 0));
+                walk.stack.push((child, 0));
             } else if j < n.len {
                 let e = *n.entries.get(j).ok_or(corrupt())?;
                 let (op, v) = self.value(e)?;
                 each(self.key(e), op, v)?;
+                visited = visited.saturating_add(1);
             }
         }
-        Ok(())
+        Ok(visited)
     }
+}
+
+/// A walk's place in a memtable ([`BTreeMem::walk_some`]): the nodes from the root to the next
+/// entry and the step each is at, bounded by the tree's height.
+#[derive(Debug)]
+pub struct Walk {
+    stack: Vec<(u32, usize)>,
 }
 
 #[cfg(test)]
@@ -494,7 +533,24 @@ mod tests {
             let mut walked = Vec::new();
             m.walk(|k, op, v| { walked.push((k.to_vec(), (op, v.to_vec()))); Ok(()) }).unwrap();
             let expected: Vec<_> = oracle.into_iter().collect();
-            proptest::prop_assert_eq!(walked, expected);
+            proptest::prop_assert_eq!(&walked, &expected);
+            // The same walk in slices of every size from 1 up: each visits its limit until the
+            // end, and together they visit every entry once, in order.
+            for limit in 1..8usize {
+                let mut walk = m.walk_start();
+                let mut sliced = Vec::new();
+                loop {
+                    let n = m.walk_some(&mut walk, limit, |k, op, v| {
+                        sliced.push((k.to_vec(), (op, v.to_vec())));
+                        Ok(())
+                    }).unwrap();
+                    if n < limit {
+                        break;
+                    }
+                }
+                proptest::prop_assert_eq!(&sliced, &expected);
+                proptest::prop_assert_eq!(m.walk_some(&mut walk, limit, |_, _, _| Ok(())).unwrap(), 0);
+            }
         }
     }
 

@@ -85,16 +85,23 @@ pub struct Store<F: BlockFile> {
     durable: Superblock,
     /// One page's aligned buffer, reused by every read and write.
     buf: AlignedBuf,
-    /// Node pages queued in address order within one extent, sealed and written in one call
-    /// ([`Store::queue_page`]): an extent's bytes, its first page, and the pages queued.
-    run: AlignedBuf,
-    run_first: u64,
-    run_pages: u32,
     /// A write or flush failed: the store takes no more.
     fenced: bool,
     /// The file's end in bytes: past every page written, the furthest a span reads.
     end: u64,
     io: IoStats,
+}
+
+/// Node pages one writer queues at consecutive addresses within an extent, sealed into an
+/// extent's buffer and written in one call ([`Store::queue_page`]): the buffer, its first page,
+/// and the pages queued. Each writer (a branch's builder, the trunk's image) holds its own, so
+/// writers that take turns do not write each other's runs out a page at a time. A run's pages
+/// are read only once it is written: a branch is read once it is built, an image once saved.
+#[derive(Debug)]
+pub struct Run {
+    buf: AlignedBuf,
+    first: u64,
+    pages: u32,
 }
 
 /// Pages a scan reads ahead ([`Store::read_page_ahead`]): an extent's buffer, the first page it
@@ -179,7 +186,6 @@ impl<F: BlockFile> Store<F> {
             });
         }
         let buf = Self::page_buf(&file, config)?;
-        let run = Self::run_buf(&file, config)?;
         let page_size = u32::try_from(config.page_size).map_err(|_| Error::InvalidArgument {
             what: "a page size past 4 GiB",
         })?;
@@ -197,9 +203,6 @@ impl<F: BlockFile> Store<F> {
                 map: Vec::new(),
             },
             buf,
-            run,
-            run_first: 0,
-            run_pages: 0,
             fenced: false,
             end: 0,
             io: IoStats::default(),
@@ -231,7 +234,6 @@ impl<F: BlockFile> Store<F> {
             });
         }
         let refs = Self::read_map(&file, config, &mut buf, &sb)?;
-        let run = Self::run_buf(&file, config)?;
         let alloc = Allocator::from_refs(refs, config.max_extents)?;
         let end = file.len().map_err(|e| io("stat a store", e))?;
         let recovered = Recovered {
@@ -246,9 +248,6 @@ impl<F: BlockFile> Store<F> {
                 alloc,
                 durable: sb,
                 buf,
-                run,
-                run_first: 0,
-                run_pages: 0,
                 fenced: false,
                 end,
                 io: IoStats::default(),
@@ -452,32 +451,41 @@ impl<F: BlockFile> Store<F> {
         self.fence(synced)
     }
 
-    /// Queues a node page at `address` for the next checkpoint, as [`Self::write_page`] writes
-    /// one: pages queued at consecutive addresses within one extent are sealed into one buffer
-    /// and written in one call, an extent's pages a system call where a page each was. A page
-    /// not continuing the run, a full extent, a read of a queued page, a direct write and a
-    /// checkpoint write the run out first ([`Self::flush_run`]).
-    pub fn queue_page(&mut self, address: u64, payload: &[u8]) -> Result<(), Error> {
+    /// An empty run for a writer.
+    pub fn run(&self) -> Result<Run, Error> {
+        Ok(Run {
+            buf: Self::run_buf(&self.file, self.config)?,
+            first: 0,
+            pages: 0,
+        })
+    }
+
+    /// Queues a node page at `address` in `run` for the next checkpoint, as
+    /// [`Self::write_page`] writes one: pages queued at consecutive addresses within one extent
+    /// are written in one call, an extent's pages a system call where a page each was. A page
+    /// not continuing the run writes the run out first ([`Self::write_run`]), and a full extent
+    /// writes it.
+    pub fn queue_page(&mut self, run: &mut Run, address: u64, payload: &[u8]) -> Result<(), Error> {
         let extent = self.extent_of(address);
         if extent == 0 || !self.alloc.is_held(extent) {
             return Err(Error::InvalidArgument {
                 what: "a page written outside a held extent",
             });
         }
-        let continues = self.run_pages > 0
-            && self.run_first.checked_add(u64::from(self.run_pages)) == Some(address)
-            && self.extent_of(self.run_first) == extent;
+        let continues = run.pages > 0
+            && run.first.checked_add(u64::from(run.pages)) == Some(address)
+            && self.extent_of(run.first) == extent;
         if !continues {
-            self.flush_run()?;
-            self.run_first = address;
+            self.write_run(run)?;
+            run.first = address;
         }
         let size = self.config.page_size;
-        let at = usize::try_from(self.run_pages)
+        let at = usize::try_from(run.pages)
             .ok()
             .and_then(|p| p.checked_mul(size))
             .ok_or(corrupt(Malformed::TooLarge))?;
-        let page = self
-            .run
+        let page = run
+            .buf
             .as_mut_slice()
             .get_mut(at..at.checked_add(size).ok_or(corrupt(Malformed::TooLarge))?)
             .ok_or(corrupt(Malformed::TooLarge))?;
@@ -488,13 +496,13 @@ impl<F: BlockFile> Store<F> {
             .copy_from_slice(payload);
         let generation = self.durable.generation.saturating_add(1);
         page::seal(page, address, Kind::Node, generation, payload.len())?;
-        self.run_pages = self.run_pages.saturating_add(1);
+        run.pages = run.pages.saturating_add(1);
         // The run ends with its extent.
         if self
             .address_in_extent(address)
             .is_some_and(|i| i.saturating_add(1) == self.config.extent_pages)
         {
-            self.flush_run()?;
+            self.write_run(run)?;
         }
         Ok(())
     }
@@ -504,9 +512,9 @@ impl<F: BlockFile> Store<F> {
         u32::try_from(address.checked_rem(u64::from(self.config.extent_pages))?).ok()
     }
 
-    /// Writes the queued run out.
-    pub fn flush_run(&mut self) -> Result<(), Error> {
-        if self.run_pages == 0 {
+    /// Writes `run`'s queued pages out.
+    pub fn write_run(&mut self, run: &mut Run) -> Result<(), Error> {
+        if run.pages == 0 {
             return Ok(());
         }
         if self.fenced {
@@ -515,27 +523,24 @@ impl<F: BlockFile> Store<F> {
                 "the store was fenced by a failed write or flush",
             ));
         }
-        let bytes = usize::try_from(self.run_pages)
+        let bytes = usize::try_from(run.pages)
             .ok()
             .and_then(|p| p.checked_mul(self.config.page_size))
             .ok_or(corrupt(Malformed::TooLarge))?;
-        let offset = Self::offset_in(self.config, self.run_first)?;
+        let offset = Self::offset_in(self.config, run.first)?;
         let past = Self::past(offset, bytes)?;
         self.io.writes = self.io.writes.saturating_add(1);
-        self.io.pages_written = self
-            .io
-            .pages_written
-            .saturating_add(u64::from(self.run_pages));
-        self.run_pages = 0;
+        self.io.pages_written = self.io.pages_written.saturating_add(u64::from(run.pages));
+        run.pages = 0;
         let started = std::time::Instant::now();
-        let written = self
-            .run
+        let written = run
+            .buf
             .as_slice()
             .get(..bytes)
             .ok_or(corrupt(Malformed::TooLarge))
-            .and_then(|run| {
+            .and_then(|b| {
                 self.file
-                    .write_all_at(run, offset)
+                    .write_all_at(b, offset)
                     .map_err(|e| io("write a store page run", e))
             });
         self.io.write_ns = self.io.write_ns.saturating_add(elapsed_ns(started));
@@ -547,7 +552,6 @@ impl<F: BlockFile> Store<F> {
     /// Writes a node page at `address`, in a held extent past the superblocks', for the next
     /// checkpoint. It is durable once that checkpoint is.
     pub fn write_page(&mut self, address: u64, payload: &[u8]) -> Result<(), Error> {
-        self.flush_run()?;
         let extent = self.extent_of(address);
         if extent == 0 || !self.alloc.is_held(extent) {
             return Err(Error::InvalidArgument {
@@ -560,12 +564,6 @@ impl<F: BlockFile> Store<F> {
 
     /// Reads the node page at `address` and appends its payload to `out`.
     pub fn read_page(&mut self, address: u64, out: &mut Vec<u8>) -> Result<(), Error> {
-        let queued = self.run_pages > 0
-            && address >= self.run_first
-            && address < self.run_first.saturating_add(u64::from(self.run_pages));
-        if queued {
-            self.flush_run()?;
-        }
         let offset = Self::offset_in(self.config, address)?;
         self.io.reads = self.io.reads.saturating_add(1);
         self.io.pages_read = self.io.pages_read.saturating_add(1);
@@ -629,12 +627,6 @@ impl<F: BlockFile> Store<F> {
             .checked_add(1)
             .and_then(|e| e.checked_mul(extent_pages))
             .ok_or(corrupt(Malformed::TooLarge))?;
-        // A queued page in the extent's rest is written first, as `read_page` writes it, and the
-        // file's end taken after.
-        let run_end = self.run_first.saturating_add(u64::from(self.run_pages));
-        if self.run_pages > 0 && self.run_first < extent_end && address < run_end {
-            self.flush_run()?;
-        }
         let size =
             u64::try_from(self.config.page_size).map_err(|_| corrupt(Malformed::TooLarge))?;
         let file_end = self
@@ -676,7 +668,6 @@ impl<F: BlockFile> Store<F> {
     /// Makes a checkpoint naming `root` with state through Raft index `applied`, durable when
     /// this returns, in the order the module describes.
     pub fn checkpoint(&mut self, root: Option<u64>, applied: u64) -> Result<(), Error> {
-        self.flush_run()?;
         let generation = self
             .durable
             .generation

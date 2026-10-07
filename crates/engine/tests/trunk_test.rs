@@ -15,6 +15,7 @@
 
 use hyper_block::buf::Alignment;
 use hyper_block::sim::SimFile;
+use mantle_engine::branch::filter::Keys;
 use mantle_engine::branch::{Builder, Op};
 use mantle_engine::store::{Config, Store};
 use mantle_engine::trunk::{Trunk, TrunkConfig};
@@ -74,7 +75,7 @@ proptest! {
                 let e = if kind < 2 { (Op::Delete, Vec::new()) } else { (Op::Put, vec![v; 1 + (k % 50) as usize]) };
                 mem.insert(key(k), e);
             }
-            let mut b = Builder::new(store.page_capacity()).unwrap();
+            let mut b = Builder::new(&store, Keys::Exactly(mem.len() as u64)).unwrap();
             for (k, (op, v)) in &mem {
                 b.add(&mut store, k, *op, v).unwrap();
             }
@@ -98,6 +99,73 @@ proptest! {
         for k in 3000..3050 {
             prop_assert_eq!(trunk.get(&mut store, &key(k), &mut value).unwrap(), None);
         }
+    }
+}
+
+fn check_reads(
+    store: &mut Store<SimFile>,
+    trunk: &Trunk,
+    oracle: &BTreeMap<Vec<u8>, (Op, Vec<u8>)>,
+) -> Result<(), TestCaseError> {
+    let mut value = Vec::new();
+    for (k, (op, v)) in oracle {
+        let got = trunk.get(store, k, &mut value).unwrap();
+        match op {
+            Op::Put => {
+                prop_assert_eq!(got, Some(Op::Put), "key {:?}", String::from_utf8_lossy(k));
+                prop_assert_eq!(&value, v);
+            }
+            Op::Delete => prop_assert!(got != Some(Op::Put), "deleted key reads a put"),
+        }
+    }
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 24, ..ProptestConfig::default() })]
+
+    /// Maintenance a slice at a time: each batch is added as pending, then a few steps of a
+    /// small budget run, a cascade left part done between them, and every key reads its newest
+    /// entry after every step. Drained at the end, the trunk holds exactly its branches'
+    /// extents.
+    #[test]
+    fn reads_are_exact_between_any_maintenance_steps(
+        batches in proptest::collection::vec(
+            (proptest::collection::vec((0u32..2000, 0u8..10, any::<u8>()), 1..300), 1u64..40, 0usize..4),
+            1..30,
+        ),
+        seed in any::<u64>(),
+    ) {
+        let align = Alignment::new(4096).unwrap();
+        let file = SimFile::new(align, Alignment::new(512).unwrap(), seed).unwrap();
+        let mut store = Store::create(file, CONFIG).unwrap();
+        let mut trunk = Trunk::new(TrunkConfig { fanout: 3, leaf_entries: 64 }).unwrap();
+        let mut oracle: BTreeMap<Vec<u8>, (Op, Vec<u8>)> = BTreeMap::new();
+        for (batch, budget, steps) in &batches {
+            let mut mem: BTreeMap<Vec<u8>, (Op, Vec<u8>)> = BTreeMap::new();
+            for &(k, kind, v) in batch {
+                let e = if kind < 2 { (Op::Delete, Vec::new()) } else { (Op::Put, vec![v; 1 + (k % 50) as usize]) };
+                mem.insert(key(k), e);
+            }
+            let mut b = Builder::new(&store, Keys::Exactly(mem.len() as u64)).unwrap();
+            for (k, (op, v)) in &mem {
+                b.add(&mut store, k, *op, v).unwrap();
+            }
+            trunk.add(b.finish(&mut store).unwrap());
+            oracle.extend(mem);
+            check_reads(&mut store, &trunk, &oracle)?;
+            for _ in 0..*steps {
+                let used = trunk.step(&mut store, *budget).unwrap();
+                // A step merges its whole budget unless the maintenance ran out.
+                prop_assert!(used == *budget || trunk.is_idle(), "{} of {}", used, budget);
+                check_reads(&mut store, &trunk, &oracle)?;
+            }
+        }
+        trunk.drain(&mut store).unwrap();
+        prop_assert!(trunk.is_idle());
+        prop_assert_eq!(trunk.debt(), 0);
+        check_refs(&store, &trunk);
+        check_reads(&mut store, &trunk, &oracle)?;
     }
 }
 
@@ -125,7 +193,7 @@ fn a_growing_trunk_splits_deepens_and_reads_after_every_batch() {
             let k = (x % 20_000) as u32;
             mem.insert(key(k), format!("v{batch}-{k}").into_bytes());
         }
-        let mut b = Builder::new(store.page_capacity()).unwrap();
+        let mut b = Builder::new(&store, Keys::Exactly(mem.len() as u64)).unwrap();
         for (k, v) in &mem {
             b.add(&mut store, k, Op::Put, v).unwrap();
         }

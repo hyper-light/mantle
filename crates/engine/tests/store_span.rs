@@ -1,6 +1,6 @@
 //! The store's spans (`Store::read_page_ahead`) on hyper-block's simulated device: a scan reads
-//! an extent a call, takes each page exactly as `read_page` gives it, writes queued pages before
-//! reading over them, stops at the file's end, and finds a page corrupted on the medium.
+//! an extent a call, takes each page exactly as `read_page` gives it, stops at the file's end,
+//! and finds a page corrupted on the medium.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -37,14 +37,16 @@ fn payload(address: u64) -> Vec<u8> {
 fn written() -> (Store<SimFile>, Vec<u64>) {
     let mut store = Store::create(sim(), CONFIG).unwrap();
     let mut addresses = Vec::new();
+    let mut run = store.run().unwrap();
     for _ in 0..2 {
         let extent = store.allocate_extent().unwrap();
         for n in 0..CONFIG.extent_pages {
             let a = store.address(extent, n).unwrap();
-            store.queue_page(a, &payload(a)).unwrap();
+            store.queue_page(&mut run, a, &payload(a)).unwrap();
             addresses.push(a);
         }
     }
+    store.write_run(&mut run).unwrap();
     store.checkpoint(None, 1).unwrap();
     (store, addresses)
 }
@@ -78,10 +80,10 @@ fn a_scan_reads_an_extent_a_call_and_every_page_as_read_page_gives_it() {
 }
 
 #[test]
-fn a_span_over_queued_pages_writes_them_first_and_stops_at_the_files_end() {
+fn a_span_stops_at_the_files_end() {
     let (mut store, addresses) = written();
     // A new extent past every page the file holds (the allocator reuses freed extents first, so
-    // it takes extents until one lies past every extent written), two of its four pages queued.
+    // it takes extents until one lies past every extent written), two of its four pages written.
     let highest = addresses
         .iter()
         .map(|&a| a / u64::from(CONFIG.extent_pages))
@@ -95,9 +97,11 @@ fn a_span_over_queued_pages_writes_them_first_and_stops_at_the_files_end() {
         }
     };
     let pages: Vec<u64> = (0..2).map(|n| store.address(extent, n).unwrap()).collect();
+    let mut run = store.run().unwrap();
     for &a in &pages {
-        store.queue_page(a, &payload(a)).unwrap();
+        store.queue_page(&mut run, a, &payload(a)).unwrap();
     }
+    store.write_run(&mut run).unwrap();
     let mut span = store.span().unwrap();
     let before = store.io_stats();
     let mut out = Vec::new();
@@ -106,7 +110,6 @@ fn a_span_over_queued_pages_writes_them_first_and_stops_at_the_files_end() {
     }
     assert_eq!(out, [payload(pages[0]), payload(pages[1])].concat());
     let after = store.io_stats();
-    assert_eq!(after.writes - before.writes, 1);
     assert_eq!(after.reads - before.reads, 1);
     assert_eq!(after.pages_read - before.pages_read, 2);
     // The page past the file's end is refused, typed.

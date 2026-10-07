@@ -4,7 +4,13 @@
 //! - A **node** has pivots, each a lower bound of the keys under it, with a child (none at a
 //!   leaf) and a **pivot bundle** of branches, newest first; and **in-flight bundles** the node
 //!   received, shared by its pivots, each pivot reading those from its own start on.
-//! - A packed memtable enters the root as an in-flight bundle (**incorporation**).
+//! - A packed memtable waits as **pending**, read before the tree; the next **cascade** takes
+//!   every pending branch into the root, each an in-flight bundle (**incorporation**), and runs
+//!   the root's flush-then-compact and every child's it sets off.
+//! - A cascade runs a slice at a time ([`Trunk::step`]): an explicit stack of the nodes in
+//!   progress, a compaction merging a budget of keys a step and changing its node only once it
+//!   is done. Nothing else changes a node while a cascade runs (new branches wait as pending),
+//!   so every read between steps sees the trunk whole.
 //! - **Compaction**: a pivot with in-flight bundles merges them, clipped to its range, into one
 //!   branch at the front of its pivot bundle; each entry is rewritten once a level.
 //! - **Flush**: a pivot bundle of more than `fanout` branches moves to the child as in-flight
@@ -20,7 +26,7 @@
 //! one) and holds the one reference its extents were allocated with; the node that drops it
 //! releases them, so an extent is freed exactly when no node names it.
 
-use crate::branch::merge::compact;
+use crate::branch::merge::Compaction;
 use crate::branch::{Branch, Op};
 use crate::error::{Error, Malformed};
 use crate::store::Store;
@@ -79,6 +85,36 @@ pub struct Trunk {
     /// The extents of the last saved image, released when the next one is saved.
     saved: Vec<u64>,
     stats: TrunkStats,
+    /// Packed memtables not yet in the tree, oldest first: read before it, and taken into the
+    /// root together when the next cascade starts.
+    pending: Vec<Branch>,
+    /// The cascade in progress, a frame a node from the root down ([`Trunk::step`]).
+    cascade: Vec<Frame>,
+    /// A finished frame's nodes now covering its range, for the frame above it.
+    returned: Option<Vec<(Vec<u8>, usize)>>,
+}
+
+/// One node's flush-then-compact in progress: the recursion the module describes, held as an
+/// explicit stack so it runs a slice at a time between the shard's other work.
+#[derive(Debug)]
+struct Frame {
+    n: usize,
+    phase: Phase,
+}
+
+#[derive(Debug)]
+enum Phase {
+    /// Compacting pivot `i`'s live in-flight bundles: the job and the in-flight count it covers.
+    Pivots {
+        i: usize,
+        job: Option<(Compaction, usize)>,
+    },
+    /// The leaf's whole compaction, and the branches it replaces.
+    Settle {
+        job: Option<(Compaction, Vec<Branch>)>,
+    },
+    /// Flushing the pivots from `i` on; `waiting` while the child's frame runs.
+    Flush { i: usize, waiting: bool },
 }
 
 /// The saved image's format version.
@@ -126,6 +162,9 @@ impl Trunk {
             config,
             saved: Vec::new(),
             stats: TrunkStats::default(),
+            pending: Vec::new(),
+            cascade: Vec::new(),
+            returned: None,
         })
     }
 
@@ -160,6 +199,11 @@ impl Trunk {
         value: &mut Vec<u8>,
     ) -> Result<Option<Op>, Error> {
         let hash = crate::branch::filter::hash(key);
+        for b in self.pending.iter().rev() {
+            if let Some(op) = b.get_hashed(store, key, hash, value)? {
+                return Ok(Some(op));
+            }
+        }
         let mut at = self.root;
         // Every level down is a node's child: at most the trunk's node count of steps.
         for _ in 0..self.nodes.len() {
@@ -186,36 +230,198 @@ impl Trunk {
         Err(corrupt())
     }
 
-    /// Takes a packed memtable into the root as an in-flight bundle, then flushes and compacts
-    /// down the tree as the module describes. The branch's references are the trunk's from here.
+    /// Takes a packed memtable into the trunk and runs every cascade it sets off to the end.
+    /// The branch's references are the trunk's from here.
     pub fn incorporate<F: BlockFile>(
         &mut self,
         store: &mut Store<F>,
         branch: Branch,
     ) -> Result<(), Error> {
-        let root = self.root;
-        self.node_mut(root)?.inflight.push(vec![branch]);
-        let split = self.flush_then_compact(store, root)?;
-        if split.len() > 1 {
-            // The root split: a new root over the parts.
-            let pivots = split
-                .into_iter()
-                .map(|(key, child)| Pivot {
-                    key,
-                    child: Some(child),
-                    bundle: Vec::new(),
-                    start: 0,
-                })
-                .collect();
-            self.nodes.push(Node {
-                leaf: false,
-                pivots,
-                inflight: Vec::new(),
-                end: None,
-            });
-            self.root = self.nodes.len().saturating_sub(1);
+        self.add(branch);
+        self.drain(store)
+    }
+
+    /// Takes a packed memtable as pending: read before the tree, taken into the root when the
+    /// next cascade starts ([`Self::step`]). Its references are the trunk's from here.
+    pub fn add(&mut self, branch: Branch) {
+        self.pending.push(branch);
+    }
+
+    /// Packed memtables pending.
+    pub fn pending(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Whether no cascade runs and none is pending.
+    pub fn is_idle(&self) -> bool {
+        self.cascade.is_empty() && self.pending.is_empty()
+    }
+
+    /// The maintenance owed, in input entries, at most: the pending branches' and what the
+    /// running compactions have left. A cascade's later compactions are not yet known; each is
+    /// owed once it is planned.
+    pub fn debt(&self) -> u64 {
+        let pending = self
+            .pending
+            .iter()
+            .map(|b| b.count)
+            .fold(0, u64::saturating_add);
+        self.cascade
+            .iter()
+            .map(|f| match &f.phase {
+                Phase::Pivots {
+                    job: Some((c, _)), ..
+                }
+                | Phase::Settle { job: Some((c, _)) } => c.remaining(),
+                _ => 0,
+            })
+            .fold(pending, u64::saturating_add)
+    }
+
+    /// Runs every cascade to the end.
+    pub fn drain<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
+        while !self.is_idle() {
+            self.step(store, u64::MAX)?;
         }
         Ok(())
+    }
+
+    /// Runs maintenance for up to `budget` merged keys: the cascade in progress, or a new one
+    /// over every pending branch. A step between merges (planning, a flush by reference, a
+    /// split) costs no budget, and each is taken once, so a step ends. Returns the keys merged.
+    pub fn step<F: BlockFile>(&mut self, store: &mut Store<F>, budget: u64) -> Result<u64, Error> {
+        self.run(store, budget, true)
+    }
+
+    /// Runs the cascade in progress to its end, starting none: the pending branches then enter
+    /// the root at the next step.
+    pub fn finish_cascade<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
+        self.run(store, u64::MAX, false).map(|_| ())
+    }
+
+    /// The trunk's fanout.
+    pub fn fanout(&self) -> usize {
+        self.config.fanout
+    }
+
+    fn run<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        budget: u64,
+        start: bool,
+    ) -> Result<u64, Error> {
+        let mut used = 0u64;
+        while used < budget {
+            let Some(frame) = self.cascade.pop() else {
+                if !start || self.pending.is_empty() {
+                    break;
+                }
+                // A new cascade: the pending branches enter the root, oldest first.
+                let root = self.root;
+                for b in std::mem::take(&mut self.pending) {
+                    self.node_mut(root)?.inflight.push(vec![b]);
+                }
+                self.cascade.push(Frame {
+                    n: root,
+                    phase: Phase::Pivots { i: 0, job: None },
+                });
+                continue;
+            };
+            used = used.saturating_add(self.advance(store, frame, budget.saturating_sub(used))?);
+            if self.cascade.is_empty()
+                && let Some(parts) = self.returned.take()
+            {
+                self.grow_root(parts);
+            }
+        }
+        Ok(used)
+    }
+
+    /// The root's frame returned `parts`: more than one is a split, and a new root over them.
+    fn grow_root(&mut self, parts: Vec<(Vec<u8>, usize)>) {
+        if parts.len() <= 1 {
+            return;
+        }
+        let pivots = parts
+            .into_iter()
+            .map(|(key, child)| Pivot {
+                key,
+                child: Some(child),
+                bundle: Vec::new(),
+                start: 0,
+            })
+            .collect();
+        self.nodes.push(Node {
+            leaf: false,
+            pivots,
+            inflight: Vec::new(),
+            end: None,
+        });
+        self.root = self.nodes.len().saturating_sub(1);
+    }
+
+    /// Advances `frame` by one move, merging up to `budget` keys; pushes it back unless it
+    /// finished, in which case its result is in `returned`. Returns the keys merged.
+    fn advance<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        frame: Frame,
+        budget: u64,
+    ) -> Result<u64, Error> {
+        let n = frame.n;
+        let (phase, used) = match frame.phase {
+            Phase::Pivots {
+                i,
+                job: Some((mut c, covered)),
+            } => {
+                let used = c.step(store, budget)?;
+                if c.is_done() {
+                    self.apply_pivot(store, n, i, c, covered)?;
+                    (
+                        Some(Phase::Pivots {
+                            i: i.saturating_add(1),
+                            job: None,
+                        }),
+                        used,
+                    )
+                } else {
+                    (
+                        Some(Phase::Pivots {
+                            i,
+                            job: Some((c, covered)),
+                        }),
+                        used,
+                    )
+                }
+            }
+            Phase::Pivots { i, job: None } => (Some(self.plan_pivot(store, n, i)?), 0),
+            Phase::Settle {
+                job: Some((mut c, branches)),
+            } => {
+                let used = c.step(store, budget)?;
+                if c.is_done() {
+                    let parts = c.finish(store)?;
+                    self.returned = Some(self.apply_settle(store, n, parts, &branches)?);
+                    (None, used)
+                } else {
+                    (
+                        Some(Phase::Settle {
+                            job: Some((c, branches)),
+                        }),
+                        used,
+                    )
+                }
+            }
+            Phase::Settle { job: None } => (self.plan_settle(store, n)?, 0),
+            Phase::Flush { i, waiting } => {
+                let i = if waiting { self.take_child(n, i)? } else { i };
+                (self.flush_from(n, i)?, 0)
+            }
+        };
+        if let Some(phase) = phase {
+            self.cascade.push(Frame { n, phase });
+        }
+        Ok(used)
     }
 
     /// Writes the trunk's image for a checkpoint and returns its header page, which the
@@ -224,6 +430,11 @@ impl Trunk {
     /// the checkpoint naming this one is durable (the store's deferred free). Every node's
     /// in-flight list is empty between incorporations, which the image relies on.
     pub fn save<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<u64, Error> {
+        if !self.is_idle() {
+            return Err(Error::InvalidArgument {
+                what: "a trunk saved with maintenance pending",
+            });
+        }
         let mut blob = Vec::new();
         blob.push(IMAGE_FORMAT);
         let put32 = |v: &mut Vec<u8>, n: usize| -> Result<(), Error> {
@@ -297,12 +508,13 @@ impl Trunk {
             header.extend_from_slice(&e.to_le_bytes());
         }
         let head = address_of(store, 0)?;
-        store.queue_page(head, &header)?;
+        let mut run = store.run()?;
+        store.queue_page(&mut run, head, &header)?;
         for (i, chunk) in blob.chunks(capacity).enumerate() {
             let address = address_of(store, i.saturating_add(1))?;
-            store.queue_page(address, chunk)?;
+            store.queue_page(&mut run, address, chunk)?;
         }
-        store.flush_run()?;
+        store.write_run(&mut run)?;
         for e in std::mem::replace(&mut self.saved, fresh) {
             store.release(e)?;
         }
@@ -441,90 +653,76 @@ impl Trunk {
             },
             saved,
             stats: TrunkStats::default(),
+            pending: Vec::new(),
+            cascade: Vec::new(),
+            returned: None,
         })
     }
 
-    /// Compacts, flushes and splits node `n`; returns the nodes now covering its range, each with
-    /// its first key (one unless it split).
-    fn flush_then_compact<F: BlockFile>(
+    /// The next pivot from `i` on with live in-flight bundles gets a compaction planned; with
+    /// none left, the in-flight bundles no pivot reads go, and the node settles (a leaf) or
+    /// flushes.
+    fn plan_pivot<F: BlockFile>(
         &mut self,
         store: &mut Store<F>,
         n: usize,
-    ) -> Result<Vec<(Vec<u8>, usize)>, Error> {
-        self.compact_pivots(store, n)?;
+        i: usize,
+    ) -> Result<Phase, Error> {
         let node = self.node(n)?;
-        if node.leaf {
-            return self.settle_leaf(store, n);
-        }
-        // Flush each pivot whose bundle passed the fanout, then take its child's split.
-        let mut i = 0usize;
-        while i < self.node(n)?.pivots.len() {
-            let pivot = self.node(n)?.pivots.get(i).ok_or(corrupt())?;
-            if pivot.bundle.len() <= self.config.fanout {
-                i = i.saturating_add(1);
-                continue;
-            }
-            let child = pivot.child.ok_or(corrupt())?;
-            let bundle =
-                std::mem::take(&mut self.node_mut(n)?.pivots.get_mut(i).ok_or(corrupt())?.bundle);
-            // Oldest first into the child's in-flight list: the bundle is newest first.
-            self.stats.flushes = self.stats.flushes.saturating_add(1);
-            for b in bundle.into_iter().rev() {
-                self.node_mut(child)?.inflight.push(vec![b]);
-            }
-            let parts = self.flush_then_compact(store, child)?;
-            let node = self.node_mut(n)?;
-            let first = node.pivots.get(i).ok_or(corrupt())?.key.clone();
-            let mut replacement: Vec<Pivot> = parts
-                .into_iter()
-                .map(|(key, child)| Pivot {
-                    key,
-                    child: Some(child),
-                    bundle: Vec::new(),
-                    start: node.inflight.len(),
-                })
-                .collect();
-            if let Some(p) = replacement.first_mut() {
-                p.key = first;
-            }
-            let added = replacement.len();
-            node.pivots.splice(i..=i, replacement);
-            i = i.saturating_add(added);
-        }
-        self.split_node(n)
+        let next = (i..node.pivots.len()).find(|&j| {
+            node.pivots
+                .get(j)
+                .is_some_and(|p| node.inflight.len() > p.start)
+        });
+        let Some(j) = next else {
+            self.drop_dead(store, n)?;
+            return Ok(if self.node(n)?.leaf {
+                Phase::Settle { job: None }
+            } else {
+                Phase::Flush {
+                    i: 0,
+                    waiting: false,
+                }
+            });
+        };
+        let pivot = node.pivots.get(j).ok_or(corrupt())?;
+        let live = node.inflight.get(pivot.start..).unwrap_or(&[]);
+        // Newest first, the order a merge takes.
+        let branches: Vec<Branch> = live.iter().rev().flatten().cloned().collect();
+        let (from, end) = (pivot.key.clone(), Self::pivot_end(node, j));
+        let covered = node.inflight.len();
+        let job = Compaction::new(store, &branches, &from, end.as_deref(), false, u64::MAX)?;
+        Ok(Phase::Pivots {
+            i: j,
+            job: Some((job, covered)),
+        })
     }
 
-    /// Folds each pivot's live in-flight bundles, clipped to its range, into one branch at the
-    /// front of its bundle, and drops the in-flight bundles no pivot reads any more.
-    fn compact_pivots<F: BlockFile>(
+    /// Pivot `i`'s compaction is done: its branch goes to the front of the pivot's bundle, and
+    /// the pivot reads in-flight bundles from `covered` on.
+    fn apply_pivot<F: BlockFile>(
         &mut self,
         store: &mut Store<F>,
         n: usize,
+        i: usize,
+        job: Compaction,
+        covered: usize,
     ) -> Result<(), Error> {
-        let pivots = self.node(n)?.pivots.len();
-        for i in 0..pivots {
-            let node = self.node(n)?;
-            let pivot = node.pivots.get(i).ok_or(corrupt())?;
-            let live = node.inflight.get(pivot.start..).unwrap_or(&[]);
-            if live.is_empty() {
-                continue;
-            }
-            // Newest first, the order a merge takes.
-            let branches: Vec<Branch> = live.iter().rev().flatten().cloned().collect();
-            let (from, end) = (pivot.key.clone(), Self::pivot_end(node, i));
-            let inflight = node.inflight.len();
-            let merged = compact(store, &branches, &from, end.as_deref(), false)?;
-            self.stats.pivot_compactions = self.stats.pivot_compactions.saturating_add(1);
-            if let Some(b) = &merged {
-                self.stats.entries_written = self.stats.entries_written.saturating_add(b.count);
-            }
-            let pivot = self.node_mut(n)?.pivots.get_mut(i).ok_or(corrupt())?;
-            pivot.start = inflight;
-            if let Some(b) = merged {
-                pivot.bundle.insert(0, b);
-            }
+        let merged = job.finish(store)?.into_iter().next().map(|(_, b)| b);
+        self.stats.pivot_compactions = self.stats.pivot_compactions.saturating_add(1);
+        if let Some(b) = &merged {
+            self.stats.entries_written = self.stats.entries_written.saturating_add(b.count);
         }
-        // In-flight bundles before every pivot's start are read by none: their references go.
+        let pivot = self.node_mut(n)?.pivots.get_mut(i).ok_or(corrupt())?;
+        pivot.start = covered;
+        if let Some(b) = merged {
+            pivot.bundle.insert(0, b);
+        }
+        Ok(())
+    }
+
+    /// In-flight bundles before every pivot's start are read by none: their references go.
+    fn drop_dead<F: BlockFile>(&mut self, store: &mut Store<F>, n: usize) -> Result<(), Error> {
         let node = self.node_mut(n)?;
         let dead = node.pivots.iter().map(|p| p.start).min().unwrap_or(0);
         let gone: Vec<Vec<Branch>> = node.inflight.drain(..dead).collect();
@@ -539,22 +737,24 @@ impl Trunk {
         Ok(())
     }
 
-    /// A leaf over `fanout` branches is compacted whole, tombstones dropped, into branches of at
-    /// most `leaf_entries` entries; each beyond the first becomes a leaf of its own.
-    fn settle_leaf<F: BlockFile>(
+    /// A leaf over `fanout` branches or `leaf_entries` entries gets its whole compaction
+    /// planned, tombstones dropped, into branches of at most half `leaf_entries`; any other
+    /// leaf's frame finishes as it is.
+    fn plan_settle<F: BlockFile>(
         &mut self,
         store: &mut Store<F>,
         n: usize,
-    ) -> Result<Vec<(Vec<u8>, usize)>, Error> {
+    ) -> Result<Option<Phase>, Error> {
         let node = self.node(n)?;
         let pivot = node.pivots.first().ok_or(corrupt())?;
         let entries: u64 = pivot.bundle.iter().map(|b| b.count).sum();
         if pivot.bundle.len() <= self.config.fanout && entries <= self.config.leaf_entries {
-            return Ok(vec![(pivot.key.clone(), n)]);
+            self.returned = Some(vec![(pivot.key.clone(), n)]);
+            return Ok(None);
         }
         let (from, end) = (pivot.key.clone(), node.end.clone());
         let branches = pivot.bundle.clone();
-        let parts = crate::branch::merge::compact_split(
+        let job = Compaction::new(
             store,
             &branches,
             &from,
@@ -562,6 +762,23 @@ impl Trunk {
             true,
             self.config.leaf_entries.div_ceil(2).max(1),
         )?;
+        Ok(Some(Phase::Settle {
+            job: Some((job, branches)),
+        }))
+    }
+
+    /// A leaf's compaction is done: `parts` replace `branches`, each beyond the first a leaf of
+    /// its own. Returns the leaves now covering the range, each with its first key.
+    fn apply_settle<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        n: usize,
+        parts: Vec<(Vec<u8>, Branch)>,
+        branches: &[Branch],
+    ) -> Result<Vec<(Vec<u8>, usize)>, Error> {
+        let node = self.node(n)?;
+        let pivot = node.pivots.first().ok_or(corrupt())?;
+        let (from, end) = (pivot.key.clone(), node.end.clone());
         self.stats.leaf_compactions = self.stats.leaf_compactions.saturating_add(1);
         self.stats.splits = self
             .stats
@@ -570,7 +787,7 @@ impl Trunk {
         for (_, b) in &parts {
             self.stats.entries_written = self.stats.entries_written.saturating_add(b.count);
         }
-        for b in &branches {
+        for b in branches {
             release(store, b)?;
         }
         // Every compacted part's references are the leaf's that takes it.
@@ -618,6 +835,63 @@ impl Trunk {
             self.node_mut(idx)?.end = end_key;
         }
         Ok(out)
+    }
+
+    /// Flushes the first pivot from `i` on whose bundle passed the fanout: its branches go to
+    /// the child's in-flight list by reference and the child's frame runs next. With none left,
+    /// the node splits if it must and its frame finishes.
+    fn flush_from(&mut self, n: usize, i: usize) -> Result<Option<Phase>, Error> {
+        let fanout = self.config.fanout;
+        let node = self.node(n)?;
+        let next = (i..node.pivots.len())
+            .find(|&j| node.pivots.get(j).is_some_and(|p| p.bundle.len() > fanout));
+        let Some(j) = next else {
+            self.returned = Some(self.split_node(n)?);
+            return Ok(None);
+        };
+        let pivot = self.node_mut(n)?.pivots.get_mut(j).ok_or(corrupt())?;
+        let child = pivot.child.ok_or(corrupt())?;
+        let bundle = std::mem::take(&mut pivot.bundle);
+        self.stats.flushes = self.stats.flushes.saturating_add(1);
+        // Oldest first into the child's in-flight list: the bundle is newest first.
+        for b in bundle.into_iter().rev() {
+            self.node_mut(child)?.inflight.push(vec![b]);
+        }
+        self.cascade.push(Frame {
+            n,
+            phase: Phase::Flush {
+                i: j,
+                waiting: true,
+            },
+        });
+        self.cascade.push(Frame {
+            n: child,
+            phase: Phase::Pivots { i: 0, job: None },
+        });
+        Ok(None)
+    }
+
+    /// The child of pivot `i` finished: the nodes now covering its range replace the pivot.
+    /// Returns the pivot to flush from next.
+    fn take_child(&mut self, n: usize, i: usize) -> Result<usize, Error> {
+        let parts = self.returned.take().ok_or(corrupt())?;
+        let node = self.node_mut(n)?;
+        let first = node.pivots.get(i).ok_or(corrupt())?.key.clone();
+        let mut replacement: Vec<Pivot> = parts
+            .into_iter()
+            .map(|(key, child)| Pivot {
+                key,
+                child: Some(child),
+                bundle: Vec::new(),
+                start: node.inflight.len(),
+            })
+            .collect();
+        if let Some(p) = replacement.first_mut() {
+            p.key = first;
+        }
+        let added = replacement.len();
+        node.pivots.splice(i..=i, replacement);
+        Ok(i.saturating_add(added))
     }
 
     /// An index node over `fanout` pivots splits into nodes of at most `fanout` pivots. Its
@@ -697,7 +971,7 @@ impl Trunk {
 
     /// The trunk's branches, for checks: every branch a node names, each naming once.
     pub fn branches(&self) -> Vec<Branch> {
-        let mut out = Vec::new();
+        let mut out = self.pending.clone();
         for node in &self.nodes {
             for bundle in &node.inflight {
                 out.extend(bundle.iter().cloned());

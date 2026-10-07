@@ -24,7 +24,7 @@ pub mod filter;
 pub mod merge;
 
 use crate::error::{Error, Malformed};
-use crate::store::{Span, Store};
+use crate::store::{Run, Span, Store};
 use hyper_block::block::BlockFile;
 use std::cmp::Ordering;
 
@@ -230,16 +230,19 @@ pub struct Builder {
     count: u64,
     payload: Vec<u8>,
     capacity: usize,
-    /// Every key's filter hash, for the filter [`Self::finish`] builds.
-    hashes: Vec<u64>,
+    /// The branch's filter, each key added as it is.
+    filter: filter::Filter,
+    /// The pages written in runs of an extent ([`Store::queue_page`]).
+    run: Run,
     /// Pages issued so far, in extent order.
     issued: u64,
 }
 
 impl Builder {
-    /// A builder for pages of `capacity` payload bytes (`Store::page_capacity`), which offsets of
-    /// 16 bits must reach.
-    pub fn new(capacity: usize) -> Result<Self, Error> {
+    /// A builder in `store`, for `keys` entries: pages of the store's payload capacity, which
+    /// offsets of 16 bits must reach.
+    pub fn new<F: BlockFile>(store: &Store<F>, keys: filter::Keys) -> Result<Self, Error> {
+        let capacity = store.page_capacity();
         if capacity > usize::from(u16::MAX) {
             return Err(Error::InvalidArgument {
                 what: "a branch page past 64 KiB",
@@ -253,7 +256,8 @@ impl Builder {
             count: 0,
             payload: Vec::with_capacity(capacity),
             capacity,
-            hashes: Vec::new(),
+            filter: filter::Filter::new(keys),
+            run: store.run()?,
             issued: 0,
         })
     }
@@ -311,7 +315,7 @@ impl Builder {
         self.last.clear();
         self.last.extend_from_slice(key);
         self.count = self.count.saturating_add(1);
-        self.hashes.push(filter::hash(key));
+        self.filter.insert(filter::hash(key));
         Ok(())
     }
 
@@ -352,7 +356,7 @@ impl Builder {
         let first = page.key(0).to_vec();
         let total = page.total;
         let address = self.page(store)?;
-        store.queue_page(address, &payload)?;
+        store.queue_page(&mut self.run, address, &payload)?;
         self.payload = payload;
         if let Some(page) = self.levels.get_mut(level) {
             page.clear();
@@ -390,16 +394,20 @@ impl Builder {
                     .map(|b| u64::from_le_bytes(*b))
                     .ok_or(corrupt(Malformed::Truncated))?;
                 // The filter's pages follow the tree's in the branch's own extents.
-                let filter = filter::Filter::build(&self.hashes);
+                let mut filter = std::mem::replace(
+                    &mut self.filter,
+                    filter::Filter::new(filter::Keys::Exactly(0)),
+                );
+                filter.fit(self.count);
                 let bytes = filter.to_bytes();
                 let filter_start = self.issued;
                 let mut pages = 0u32;
                 for chunk in bytes.chunks(self.capacity) {
                     let address = self.page(store)?;
-                    store.queue_page(address, chunk)?;
+                    store.queue_page(&mut self.run, address, chunk)?;
                     pages = pages.saturating_add(1);
                 }
-                store.flush_run()?;
+                store.write_run(&mut self.run)?;
                 return Ok(Branch {
                     root,
                     height: u8::try_from(level).map_err(|_| corrupt(Malformed::TooLarge))?,

@@ -125,6 +125,59 @@ Each shard schedules its replicas' flushes and compactions against foreground I/
 - SILK's unstated constants (`ε`, the flush minimum, the pause granularity) are measured, not
   chosen.
 
+### Paced maintenance, as built (step E7's first part)
+
+A shard's flush and compaction ran inline on the put that filled the memtable: at 10 M puts one
+put waited up to 6.0 s (uncached) or 2.9 s (buffered) while every compaction the flush set off
+ran. The shard now does that work a slice at a time on its own worker
+(`crates/engine/src/shard_db.rs`, `trunk/mod.rs`):
+- **Two memtables.** A full one becomes the packing one, still read, and a cleared one takes
+  the puts (RocksDB's `max_write_buffer_number` of 2 by default).
+- **Pending branches.** A packed memtable waits as pending, read before the tree. The next
+  cascade takes every pending branch into the root together, so `k` waiting memtables are
+  merged in one compaction instead of `k`.
+- **Cascades in steps.** The flush-then-compact recursion is an explicit stack of frames. A
+  compaction (`branch/merge.rs` `Compaction`) merges a budget of keys a step and changes its
+  node only when done. Nothing else changes a node while a cascade runs, so every read between
+  steps sees the trunk whole (`tests/trunk_test.rs`, `tests/shard_db_paced.rs`, each failing
+  when reads skip pending branches or the packing memtable).
+- **Pacing, derived.** A put of `b` bytes pays `debt · b / room` of each debt: the packing
+  memtable's entries over the arena bytes the new memtable has left, and the trunk's known
+  compaction work over that room plus a memtable for each of the `fanout` pending slots still
+  free. Paid at that rate, a debt is paid when its room runs out. A compaction is owed only once
+  planned, so a put whose memtable fills with debt left pays it whole and the engine counts a
+  stall; 10 M puts at fanout 8 counted none. `ShardDb::maintain` pays debt in the worker's idle
+  time.
+- **Writer runs.** Each branch builder queues its pages in its own extent buffer
+  (`store::Run`). With one buffer in the store, the packing builder and a compaction's builder
+  taking turns wrote each other's runs a page at a time: 352,084 write calls a fill against
+  15,829.
+- **Filters as keys arrive.** A builder adds each key to its filter as it adds the entry, so
+  finishing a branch no longer builds a filter over millions of keys in one slice. A
+  compaction's count is only bounded, so its filter starts at a power of two of blocks for the
+  bound and halves exactly once the count is known (`branch/filter.rs` `fit`).
+
+At 10 M puts (`benches/shard_db.rs`, fanout 8, this Mac, 2026-10-06). The paced rows are six
+runs, four fill-only and two alternated with RocksDB 11.8.1's `db_bench` (same keys, values,
+64 MiB write buffer, no WAL, no compression, `--histogram=1`):
+
+| put latency | p50 | p99 | p99.9 | p99.99 | max | fill |
+|---|---|---|---|---|---|---|
+| inline, buffered (before) | 0.50 µs | 1.08 µs | 1.58 µs | 9.79 µs | 2.9 s | 12.9–45.6 s |
+| paced, buffered | 0.83–1.17 µs | 1.62–2.67 µs | 12.5–19.1 µs | 44.6–2,996 µs | 5.1–160.6 ms | 9.5–18.0 s |
+| paced, uncached | 1.00–1.21 µs | 2.46–2.96 µs | 106–138 µs | 238–3,073 µs | 6.2–6.9 ms | 16.9–20.6 s |
+| RocksDB (alternated) | 0.62–0.76 µs | 2.64–3.00 µs | 3.99–7.74 µs | 18.9–132 µs | | 10.6–15.5 s |
+
+Reads after the fill's owed maintenance is paid (`maintain`, 0.53–1.25 s): p50 3.33–3.62 µs and
+p99 5.67–6.50 µs, against RocksDB's 4.29–4.30 µs and 10.0–14.0 µs. The buffered run's 160.6 ms
+and 2,996 µs came with 6.59 s inside write calls, the OS's dirty-page throttle again.
+
+The median rises by the work each put now carries: about two merged keys a put, which the inline
+design paid all at once on one put. The uncached tail past p99.9 is the extent writes and span
+reads a put still issues synchronously, one call in about 600 puts. Submitting them to the
+device's issuer and going on, once hyper-block's issuer takes submissions without waiting, is the
+next part of E7.
+
 ## 7. Crash and recovery
 
 - **Order of a checkpoint.**
@@ -166,7 +219,7 @@ both sides, and landed before the next:
 | E4 | Trunk, flush-then-compact, bundle compaction on the shard's tasks, granularity aligned to the last level | 3 | inserts 6–10×, write amplification 2× lower (SplinterDB); total write amplification with the device's GC about 2.5× lower (Spooky) |
 | E5 | Per-branch blocked Bloom filters (landed first: a read probes only branches that may hold its key), then maplets routing a key to its pivot's branches with one lookup in less space | 3 | queries up to 1.8×, space overhead 15–61% (maplets, abstract-level evidence); measured with filters: reads 1.2–1.7× RocksDB at 10 M (benches/shard_db.rs) |
 | E6 | REMIX views and SuRF range filters for listings | 4 | seeks 1.4–9×, closed seeks up to 5× |
-| E7 | SILK scheduling | 6 | p99 10–100× under compaction |
+| E7 | SILK scheduling: paced maintenance on the shard's worker (landed, §6 as built), then I/O submitted without waiting | 6 | p99 10–100× under compaction; measured so far: the longest put at 10 M from 2.9 s to 5.1–49.5 ms |
 | E8 | Hot region and S3-FIFO caches | 5 | hot gets up to about 10× |
 | E9 | The log as level 0, if the Raft log's ownership of entries allows it (§10) | 2 | throughput up to 2.9×, write amplification up to 4× lower (TRIAD) |
 | E10 | FDP placement hints, ZNS zones, where the device reports them (CLAUDE.md §5) | 7 | device write amplification about 1 (FDP); p99.9 reads 2–4× lower (ZNS) |

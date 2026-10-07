@@ -100,12 +100,15 @@ fn main() {
     let (f, t, io) = db.stats();
     let user = num * (16 + 100);
     println!(
-        "fill flushes {} pack {:.2}s (max {:.0}ms) incorporate {:.2}s (max {:.0}ms)",
+        "fill flushes {} pack {:.2}s (max slice {:.2}ms) trunk {:.2}s (max slice {:.2}ms) stalls {} ({:.2}s, max {:.2}ms)",
         f.flushes,
         f.pack_ns as f64 / 1e9,
         f.pack_max_ns as f64 / 1e6,
         f.incorporate_ns as f64 / 1e9,
-        f.incorporate_max_ns as f64 / 1e6
+        f.incorporate_max_ns as f64 / 1e6,
+        f.stalls,
+        f.stall_ns as f64 / 1e9,
+        f.stall_max_ns as f64 / 1e6
     );
     println!(
         "fill trunk pivot_compactions {} leaf_compactions {} flushes {} splits {} entries_written {} ({:.2}x the puts)",
@@ -133,6 +136,10 @@ fn main() {
         num as f64 / s,
         s * 1e6 / num as f64
     );
+    // The maintenance the fill left owed, paid as a shard pays it in idle time, before reads.
+    let t = Instant::now();
+    db.maintain(u64::MAX).unwrap();
+    println!("maintain {:.2}s", t.elapsed().as_secs_f64());
     let mut out = Vec::new();
     let mut found = 0u64;
     lat.clear();

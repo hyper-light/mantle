@@ -30,6 +30,23 @@ pub struct Filter {
     blocks: Vec<[u64; BLOCK_WORDS]>,
 }
 
+/// The keys a filter is made for, before they are added: known exactly (a memtable packed), or
+/// at most (a compaction, whose duplicates merge).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Keys {
+    Exactly(u64),
+    AtMost(u64),
+}
+
+/// Blocks for `keys` keys at [`BITS_PER_KEY`] bits each, at least one.
+fn blocks_for(keys: u64) -> usize {
+    usize::try_from(keys)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(BITS_PER_KEY)
+        .div_ceil(BLOCK_WORDS.saturating_mul(64))
+        .max(1)
+}
+
 /// The block for a hash: its high 32 bits scaled into the block count (Lemire, "Fast random
 /// integer generation in an interval", ACM TOMACS 29(1), 2019).
 fn block_of(h: u64, blocks: usize) -> usize {
@@ -49,21 +66,63 @@ fn probes(h: u64) -> impl Iterator<Item = (usize, u64)> {
 }
 
 impl Filter {
-    /// A filter over keys of `hashes`, at [`BITS_PER_KEY`] bits each, at least one block.
-    pub fn build(hashes: &[u64]) -> Self {
-        let bits = hashes.len().saturating_mul(BITS_PER_KEY);
-        let count = bits.div_ceil(BLOCK_WORDS.saturating_mul(64)).max(1);
-        let mut blocks = vec![[0u64; BLOCK_WORDS]; count];
-        for &h in hashes {
-            if let Some(block) = blocks.get_mut(block_of(h, count)) {
-                for (word, mask) in probes(h) {
-                    if let Some(w) = block.get_mut(word) {
-                        *w |= mask;
-                    }
+    /// An empty filter for `keys`: sized for them when known exactly; when only bounded, a
+    /// power of two of blocks for the bound, which [`Self::fit`] halves once the count is known.
+    pub fn new(keys: Keys) -> Self {
+        let count = match keys {
+            Keys::Exactly(n) => blocks_for(n),
+            Keys::AtMost(n) => blocks_for(n).checked_next_power_of_two().unwrap_or(1),
+        };
+        Self {
+            blocks: vec![[0u64; BLOCK_WORDS]; count],
+        }
+    }
+
+    /// Adds a key of hash `h`.
+    pub fn insert(&mut self, h: u64) {
+        let count = self.blocks.len();
+        if let Some(block) = self.blocks.get_mut(block_of(h, count)) {
+            for (word, mask) in probes(h) {
+                if let Some(w) = block.get_mut(word) {
+                    *w |= mask;
                 }
             }
         }
-        Self { blocks }
+    }
+
+    /// Halves the filter while half its blocks still give `keys` keys [`BITS_PER_KEY`] bits
+    /// each: block pairs `2i, 2i + 1` OR into block `i`. A key's block at `n / 2` blocks is its
+    /// block at `n` halved (`⌊⌊h·n / 2^32⌋ / 2⌋ = ⌊h·(n/2) / 2^32⌋`) and its probes within a
+    /// block do not depend on `n`, so every key added is still found.
+    pub fn fit(&mut self, keys: u64) {
+        let need = blocks_for(keys);
+        while self.blocks.len().is_multiple_of(2) && self.blocks.len() / 2 >= need {
+            let half: Vec<[u64; BLOCK_WORDS]> = self
+                .blocks
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|[lo, hi]| {
+                    let mut b = *lo;
+                    for (w, h) in b.iter_mut().zip(hi) {
+                        *w |= h;
+                    }
+                    b
+                })
+                .collect();
+            self.blocks = half;
+        }
+    }
+
+    /// A filter over keys of `hashes`, at [`BITS_PER_KEY`] bits each, at least one block.
+    pub fn build(hashes: &[u64]) -> Self {
+        let mut f = Self::new(Keys::Exactly(
+            u64::try_from(hashes.len()).unwrap_or(u64::MAX),
+        ));
+        for &h in hashes {
+            f.insert(h);
+        }
+        f
     }
 
     /// Whether a key of hash `h` may be in the branch: false only when it is not.
@@ -131,5 +190,31 @@ mod tests {
             f.bytes(),
             100_000usize.saturating_mul(10).div_ceil(512) * 64
         );
+    }
+
+    #[test]
+    fn a_bounded_filter_fitted_to_its_keys_finds_every_one_at_no_fewer_bits() {
+        // Bounded at 400,000 keys: 7,813 blocks, rounded up to 8,192. The 30,000 keys added
+        // need 586, so it halves three times, to 1,024: 512 would not hold them.
+        let mut f = Filter::new(Keys::AtMost(400_000));
+        assert_eq!(f.bytes(), 8_192 * 64);
+        let hashes: Vec<u64> = (0..30_000u32)
+            .map(|i| hash(format!("key-{i}").as_bytes()))
+            .collect();
+        for &h in &hashes {
+            f.insert(h);
+        }
+        f.fit(30_000);
+        assert_eq!(f.bytes(), 1_024 * 64);
+        assert!(hashes.iter().all(|&h| f.may_contain(h)));
+        let false_positives = (0..100_000u32)
+            .filter(|i| f.may_contain(hash(format!("other-{i}").as_bytes())))
+            .count();
+        // 17 bits a key here, against 10 in the first test's bound of 2,000.
+        assert!(false_positives < 2_000, "{false_positives}");
+        // Fitted to more keys than half holds, it stays.
+        let mut g = Filter::new(Keys::AtMost(1_000));
+        g.fit(1_000);
+        assert_eq!(g.bytes(), 32 * 64);
     }
 }

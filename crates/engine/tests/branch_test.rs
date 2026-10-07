@@ -13,6 +13,7 @@
 
 use hyper_block::buf::Alignment;
 use hyper_block::sim::SimFile;
+use mantle_engine::branch::filter::Keys;
 use mantle_engine::branch::{Branch, Builder, Op};
 use mantle_engine::store::{Config, Store};
 use proptest::prelude::*;
@@ -34,7 +35,7 @@ fn store(seed: u64) -> Store<SimFile> {
 }
 
 fn build(store: &mut Store<SimFile>, entries: &BTreeMap<Vec<u8>, (Op, Vec<u8>)>) -> Branch {
-    let mut b = Builder::new(store.page_capacity()).unwrap();
+    let mut b = Builder::new(&*store, Keys::Exactly(entries.len() as u64)).unwrap();
     for (k, (op, v)) in entries {
         b.add(store, k, *op, v).unwrap();
     }
@@ -128,13 +129,13 @@ proptest! {
 #[test]
 fn keys_out_of_order_and_oversized_entries_are_refused() {
     let mut s = store(1);
-    let mut b = Builder::new(s.page_capacity()).unwrap();
+    let mut b = Builder::new(&s, Keys::Exactly(1)).unwrap();
     b.add(&mut s, b"b", Op::Put, b"1").unwrap();
     assert!(b.add(&mut s, b"b", Op::Put, b"2").is_err());
     assert!(b.add(&mut s, b"a", Op::Put, b"3").is_err());
     assert!(b.add(&mut s, b"c", Op::Put, &vec![0u8; 5000]).is_err());
     assert!(
-        Builder::new(s.page_capacity())
+        Builder::new(&s, Keys::Exactly(1))
             .unwrap()
             .finish(&mut s)
             .is_err()
@@ -165,7 +166,7 @@ fn a_large_branch_is_a_shallow_tree_of_dense_pages() {
 
 mod cursor_and_merge {
     use super::*;
-    use mantle_engine::branch::merge::{Merge, compact};
+    use mantle_engine::branch::merge::{Compaction, Merge, compact};
 
     #[test]
     fn a_scan_reads_its_branch_an_extent_a_call() {
@@ -277,6 +278,22 @@ mod cursor_and_merge {
                     None => prop_assert!(kept.is_empty()),
                     Some(b) => prop_assert_eq!(scan(&mut s, &b, b""), kept),
                 }
+            }
+            // Stepped a few keys at a time and split every 7 entries: the same entries, each
+            // part at most 7 and named by its first key.
+            let kept: Vec<_> = expected.iter().filter(|e| e.1 != Op::Delete).cloned().collect();
+            for budget in [1u64, 3] {
+                let mut c = Compaction::new(&mut s, &branches, &from, Some(&end), true, 7).unwrap();
+                while c.step(&mut s, budget).unwrap() == budget {}
+                prop_assert!(c.is_done());
+                let mut joined = Vec::new();
+                for (first, b) in c.finish(&mut s).unwrap() {
+                    let part = scan(&mut s, &b, b"");
+                    prop_assert!(!part.is_empty() && part.len() <= 7);
+                    prop_assert_eq!(&part[0].0, &first);
+                    joined.extend(part);
+                }
+                prop_assert_eq!(&joined, &kept);
             }
         }
     }

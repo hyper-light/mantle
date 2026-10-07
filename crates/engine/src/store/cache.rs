@@ -66,6 +66,8 @@ pub struct Cache {
     free: Vec<usize>,
     hits: u64,
     misses: u64,
+    /// The most queue steps one eviction took.
+    evict_steps_most: u64,
 }
 
 impl Cache {
@@ -96,6 +98,7 @@ impl Cache {
             free: (0..pages).rev().collect(),
             hits: 0,
             misses: 0,
+            evict_steps_most: 0,
         }
     }
 
@@ -242,8 +245,10 @@ impl Cache {
         // at most once and goes round main at most `MAX_FREQ` times before it is freed: a slot
         // is freed within that many steps a page.
         let bound = self.slots.len().saturating_mul(usize::from(MAX_FREQ) + 2);
-        for _ in 0..bound {
+        for step in 0..bound {
             if !self.free.is_empty() {
+                let step = u64::try_from(step).unwrap_or(u64::MAX);
+                self.evict_steps_most = self.evict_steps_most.max(step);
                 return;
             }
             if self.small_live >= self.small_cap() || self.main_live == 0 {
@@ -316,6 +321,11 @@ impl Cache {
     /// Reads served, and reads missed.
     pub fn stats(&self) -> (u64, u64) {
         (self.hits, self.misses)
+    }
+
+    /// The most queue steps one eviction took.
+    pub fn evict_steps_most(&self) -> u64 {
+        self.evict_steps_most
     }
 
     /// The cache's bytes in memory: its slots.

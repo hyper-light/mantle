@@ -151,7 +151,8 @@ fn main() {
         t.entries_written as f64 / num as f64
     );
     println!(
-        "fill io submitted {} write_waits {} ({:.2}s) span_cache_hits {} reads {} pages_read {} ({:.2}s) writes {} ({:.2}s) pages_written {} ({:.2} GB, write amplification {:.2}) syncs {}",
+        "fill io evict_steps_most {} submitted {} write_waits {} ({:.2}s) span_cache_hits {} reads {} pages_read {} ({:.2}s) writes {} ({:.2}s) pages_written {} ({:.2} GB, write amplification {:.2}) syncs {}",
+        io.cache_evict_steps_most,
         io.submitted,
         io.write_waits,
         io.write_wait_ns as f64 / 1e9,

@@ -11,7 +11,8 @@
 //! | 1..3 | entries, `n` |
 //! | 3..5 | the prefix every key of the page shares, its length `p` |
 //! | 5..5+p | the prefix |
-//! | then `2n` | each entry's offset in the payload, in key order, for binary search |
+//! | then `2n` | each entry's offset in the payload, in key order |
+//! | then `4n` | each entry's head: its suffix's first 4 bytes, big-endian, zero-padded |
 //! | then | the entries |
 //!
 //! A leaf entry is the key's suffix length (2 bytes), the operation (1), the value's length (2),
@@ -19,6 +20,10 @@
 //! entries under the child (8) and the suffix of the child's first key. The prefix is the longest
 //! one the page's first and last keys share, which, the keys being sorted, every key between them
 //! shares: object-store keys are paths, and their shared prefixes are most of each key.
+//!
+//! A search runs over the heads, two cache lines for a page's entries, and reads an entry only
+//! where its head ties the key's: the entries themselves lie across the page, a cache miss each,
+//! as the memtable's nodes keep heads past their prefixes (memtable/btree.rs).
 
 pub mod filter;
 pub mod merge;
@@ -66,6 +71,20 @@ const LEAF_FIXED: usize = 5;
 const INDEX_FIXED: usize = 18;
 /// An entry's offset in the payload.
 const OFFSET: usize = 2;
+/// An entry's head: its suffix's first 4 bytes.
+const KEY_HEAD: usize = 4;
+/// The table bytes an entry takes: its offset and its head.
+const SLOT: usize = OFFSET + KEY_HEAD;
+
+/// A suffix's head: its first 4 bytes, big-endian, zero-padded. Heads that differ order their
+/// suffixes as the suffixes order; equal heads say nothing, and the suffixes are compared.
+fn key_head(suffix: &[u8]) -> u32 {
+    let mut b = [0u8; KEY_HEAD];
+    for (d, s) in b.iter_mut().zip(suffix) {
+        *d = *s;
+    }
+    u32::from_be_bytes(b)
+}
 
 /// A built branch: its root page, its height (1 for a lone leaf), its entries, and the extents
 /// holding its pages, each held once by the branch.
@@ -139,7 +158,7 @@ impl Page {
     /// filling it never grows a buffer: keys and rests within the payload, and an entry for each
     /// offset and suffix length the payload has room for.
     fn with_capacity(capacity: usize) -> Self {
-        let entries = capacity.checked_div(OFFSET.saturating_add(2)).unwrap_or(0);
+        let entries = capacity.checked_div(SLOT.saturating_add(2)).unwrap_or(0);
         Self {
             keys: Vec::with_capacity(capacity),
             key_ends: Vec::with_capacity(entries),
@@ -181,7 +200,7 @@ impl Page {
         let keys = self.keys.len().checked_add(key)?;
         let suffixes = keys.checked_sub(n.checked_mul(prefix)?)?;
         HEAD.checked_add(prefix)?
-            .checked_add(n.checked_mul(OFFSET.checked_add(2)?)?)?
+            .checked_add(n.checked_mul(SLOT.checked_add(2)?)?)?
             .checked_add(suffixes)?
             .checked_add(self.rests.len())?
             .checked_add(rest)
@@ -220,11 +239,18 @@ impl Page {
         out.extend_from_slice(&u16_of(self.prefix)?);
         out.extend_from_slice(prefix);
         let table = out.len();
+        let heads = table
+            .checked_add(
+                self.len()
+                    .checked_mul(OFFSET)
+                    .ok_or(corrupt(Malformed::TooLarge))?,
+            )
+            .ok_or(corrupt(Malformed::TooLarge))?;
         out.resize(
-            table
+            heads
                 .checked_add(
                     self.len()
-                        .checked_mul(OFFSET)
+                        .checked_mul(KEY_HEAD)
                         .ok_or(corrupt(Malformed::TooLarge))?,
                 )
                 .ok_or(corrupt(Malformed::TooLarge))?,
@@ -242,6 +268,15 @@ impl Page {
                 .key(i)
                 .get(self.prefix..)
                 .ok_or(corrupt(Malformed::Truncated))?;
+            let head_at = heads
+                .checked_add(
+                    i.checked_mul(KEY_HEAD)
+                        .ok_or(corrupt(Malformed::TooLarge))?,
+                )
+                .ok_or(corrupt(Malformed::TooLarge))?;
+            out.get_mut(head_at..head_at.saturating_add(KEY_HEAD))
+                .ok_or(corrupt(Malformed::TooLarge))?
+                .copy_from_slice(&key_head(suffix).to_be_bytes());
             out.extend_from_slice(&u16_of(suffix.len())?);
             out.extend_from_slice(self.rest(i));
             out.extend_from_slice(suffix);
@@ -349,12 +384,12 @@ impl Builder {
     /// room for its key twice in an index page above, it fits an empty page.
     pub fn fits(&self, key: usize, value: usize) -> bool {
         let leaf = HEAD
-            .saturating_add(OFFSET)
+            .saturating_add(SLOT)
             .saturating_add(LEAF_FIXED)
             .saturating_add(key.saturating_mul(2))
             .saturating_add(value);
         let index = HEAD
-            .saturating_add(OFFSET.saturating_add(INDEX_FIXED).saturating_mul(2))
+            .saturating_add(SLOT.saturating_add(INDEX_FIXED).saturating_mul(2))
             .saturating_add(key.saturating_mul(3));
         leaf <= self.capacity && index <= self.capacity
     }
@@ -709,6 +744,8 @@ struct View<'a> {
     n: usize,
     prefix: &'a [u8],
     table: usize,
+    /// The entries' heads, `KEY_HEAD` bytes each.
+    heads: &'a [u8],
 }
 
 impl<'a> View<'a> {
@@ -726,12 +763,27 @@ impl<'a> View<'a> {
         if n == 0 {
             return Err(corrupt(Malformed::CountMismatch));
         }
+        let heads_at = table
+            .checked_add(n.checked_mul(OFFSET).ok_or(corrupt(Malformed::TooLarge))?)
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        let heads = page
+            .get(
+                heads_at
+                    ..heads_at
+                        .checked_add(
+                            n.checked_mul(KEY_HEAD)
+                                .ok_or(corrupt(Malformed::TooLarge))?,
+                        )
+                        .ok_or(corrupt(Malformed::TooLarge))?,
+            )
+            .ok_or(corrupt(Malformed::Truncated))?;
         Ok(Self {
             page,
             kind,
             n,
             prefix,
             table,
+            heads,
         })
     }
 
@@ -802,12 +854,38 @@ impl<'a> View<'a> {
         })
     }
 
-    /// The last entry whose key is at most `key`, if any.
+    /// Entry `i`'s head.
+    fn head(&self, i: usize) -> u32 {
+        let at = i.saturating_mul(KEY_HEAD);
+        self.heads
+            .get(at..at.saturating_add(KEY_HEAD))
+            .and_then(<[u8]>::first_chunk::<KEY_HEAD>)
+            .map_or(0, |b| u32::from_be_bytes(*b))
+    }
+
+    /// The last entry whose key is at most `key`, if any. The prefix is compared once: a key
+    /// below it is below every entry, one above it past every entry. Then a binary search over
+    /// the heads, reading an entry only where its head ties the key's.
     fn floor(&self, key: &[u8]) -> Result<Option<usize>, Error> {
+        let p = self.prefix.len();
+        let suffix = match key.get(..p.min(key.len())).unwrap_or(key).cmp(self.prefix) {
+            Ordering::Less => return Ok(None),
+            Ordering::Greater => return Ok(self.n.checked_sub(1)),
+            Ordering::Equal => match key.get(p..) {
+                Some(s) => s,
+                // The key is a proper prefix of the page's prefix: below every entry.
+                None => return Ok(None),
+            },
+        };
+        let kh = key_head(suffix);
         let (mut lo, mut hi) = (0usize, self.n);
         while lo < hi {
             let mid = lo.saturating_add(hi.saturating_sub(lo) / 2);
-            if self.compare(key, mid)? == Ordering::Less {
+            let order = match kh.cmp(&self.head(mid)) {
+                Ordering::Equal => suffix.cmp(self.entry(mid)?.0),
+                other => other,
+            };
+            if order == Ordering::Less {
                 hi = mid;
             } else {
                 lo = mid.saturating_add(1);

@@ -94,6 +94,8 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/ec/src/durability.rs` `MAX_TERMS` | bound | 170 series terms at Λτ ≤ ½: past it the tail bound 2·(½)^(K+1)/(K+1)! is below every positive double (170! is the largest factorial a double holds); research/15 §4.6. |
 | `crates/ec/src/durability.rs` `MOST_COPIES` | cited | Three copies, the replication of a block still being written; research/04 §R1.1. |
 | `crates/ec/src/durability.rs` `YEAR` | derived | Unit conversion: 365.25 days × 24 h = 8766 hours. |
+| `crates/engine/src/branch/mod.rs` `KEY_HEAD` | format | 4: the bytes of a page entry's head, its suffix's first 4 bytes, which a search compares before reading the entry. |
+| `crates/engine/src/branch/mod.rs` `SLOT` | format | 6: a page entry's table bytes, its offset (2) and its head (4). |
 | `crates/engine/src/fst/bits.rs` `SELECT_SAMPLE` | cited | 64: select samples every 64th set bit, 9–17% of a dense bit vector and 1–2% of the trie (Zhang et al., SuRF, SIGMOD 2018 §2.6; research/35 §1). |
 | `crates/engine/src/fst/packed.rs` `MAX_WIDTH` | format | 32: a trie value is a `u32` (a leaf's page number, a range filter's suffix bits). |
 | `crates/engine/src/fst/surf.rs` `SUFFIX_BYTES` | format | 4: the bytes a suffix of at most 32 bits (`MAX_WIDTH`) spans. |

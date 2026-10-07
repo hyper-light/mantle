@@ -391,7 +391,7 @@ enum Phase {
 /// The saved image's format version.
 /// Format 2: each pivot names its view's extents after its branches. Format 3: each branch's
 /// descriptor names its range filter's bytes after its leaf index's.
-const IMAGE_FORMAT: u8 = 3;
+const IMAGE_FORMAT: u8 = 4;
 /// The saved image header's magic: "mantleTK" in ASCII, little-endian.
 const IMAGE_MAGIC: u64 = u64::from_le_bytes(*b"mantleTK");
 /// None, in a child or an end key's place.

@@ -13,6 +13,8 @@
 //! label leads to node `1 + (branches going on before it)`. Values are held in node order, the
 //! dense levels' first: a node's own key's value, then its labels' that end a key.
 
+use std::ops::ControlFlow;
+
 use super::bits::Bits;
 use crate::error::{Error, Malformed};
 
@@ -524,6 +526,193 @@ impl Trie {
         None
     }
 
+    /// The value of the least key at least `key`, the key itself written to `out`.
+    pub fn ceil(&self, key: &[u8], out: &mut Vec<u8>) -> Option<u32> {
+        match self.seek(key, out, |_, _| ControlFlow::Continue(())) {
+            ControlFlow::Continue(v) => v,
+            ControlFlow::Break(()) => None,
+        }
+    }
+
+    /// One descent along `key`: `prefix` is given each stored key that is a proper prefix of
+    /// `key`, shortest first, as its length and value, and may stop the descent; then the value
+    /// of the least key at least `key`, the key written to `out`. The prefixes are what a range
+    /// filter of truncated keys cannot order against `key` by the trie alone (research/35 §2).
+    pub fn seek<F>(
+        &self,
+        key: &[u8],
+        out: &mut Vec<u8>,
+        mut prefix: F,
+    ) -> ControlFlow<(), Option<u32>>
+    where
+        F: FnMut(usize, u32) -> ControlFlow<()>,
+    {
+        out.clear();
+        let mut node = 0usize;
+        // The nearest branch passed whose label is greater than the key's byte: the least key
+        // beneath it is the least greater than `key` that the descent leaves behind.
+        let mut greater: Option<(Fallback, usize)> = None;
+        for (d, &b) in key.iter().enumerate() {
+            let n = self.node(node);
+            if self.is_key(n)
+                && let Some(v) = self.value_of(n)
+            {
+                prefix(d, v)?;
+            }
+            let last = d.saturating_add(1) == key.len();
+            match n {
+                Node::Dense(n) => {
+                    let Some(pos) = n
+                        .checked_mul(256)
+                        .and_then(|s| s.checked_add(usize::from(b)))
+                    else {
+                        break;
+                    };
+                    if let Some(q) = self.dense_above(n, pos) {
+                        greater = Some((Fallback::Dense(q), d));
+                    }
+                    if !self.dense.labels.get(pos) {
+                        break;
+                    }
+                    if !self.dense.has_child.get(pos) {
+                        let v = self.dense_value_at(pos);
+                        if last {
+                            out.extend_from_slice(key);
+                            return ControlFlow::Continue(v);
+                        }
+                        if let Some(v) = v {
+                            prefix(d.saturating_add(1), v)?;
+                        }
+                        break;
+                    }
+                    node = self.dense_child(pos);
+                }
+                Node::Sparse(n) => {
+                    let (start, end) = self.node_range(n);
+                    let labels = self.sparse.labels.get(start..end).unwrap_or(&[]);
+                    let (found, i) = match labels.binary_search(&b) {
+                        Ok(i) => (true, i),
+                        Err(i) => (false, i),
+                    };
+                    let above = if found { i.saturating_add(1) } else { i };
+                    if above < labels.len() {
+                        greater = Some((Fallback::Sparse(start.saturating_add(above)), d));
+                    }
+                    if !found {
+                        break;
+                    }
+                    let p = start.saturating_add(i);
+                    if !self.sparse.has_child.get(p) {
+                        let v = self.value_at_label(p);
+                        if last {
+                            out.extend_from_slice(key);
+                            return ControlFlow::Continue(v);
+                        }
+                        if let Some(v) = v {
+                            prefix(d.saturating_add(1), v)?;
+                        }
+                        break;
+                    }
+                    node = self.child(p);
+                }
+            }
+            if last {
+                // `key` ends at the node the branch leads to: its own key is `key`, and every
+                // other key beneath it is greater, the least its first label's.
+                out.extend_from_slice(key);
+                let n = self.node(node);
+                if self.is_key(n) {
+                    return ControlFlow::Continue(self.value_of(n));
+                }
+                let first = self.first_label(n);
+                return ControlFlow::Continue(first.and_then(|f| self.leftmost(f, out)));
+            }
+        }
+        if key.is_empty() {
+            let n = self.node(0);
+            if self.is_key(n) {
+                return ControlFlow::Continue(self.value_of(n));
+            }
+            return ControlFlow::Continue(self.first_label(n).and_then(|f| self.leftmost(f, out)));
+        }
+        ControlFlow::Continue(greater.and_then(|(at, d)| {
+            out.extend_from_slice(key.get(..d)?);
+            self.leftmost(at, out)
+        }))
+    }
+
+    /// The least label of dense node `n` above `pos` (exclusive), as a position.
+    fn dense_above(&self, n: usize, pos: usize) -> Option<usize> {
+        let q = self
+            .dense
+            .labels
+            .select1(self.dense.labels.rank1(pos).checked_add(1)?)?;
+        if q < n.checked_add(1)?.checked_mul(256)? {
+            Some(q)
+        } else {
+            None
+        }
+    }
+
+    /// Node `n`'s least label.
+    fn first_label(&self, n: Node) -> Option<Fallback> {
+        match n {
+            Node::Dense(n) => {
+                let start = n.checked_mul(256)?;
+                let q = self
+                    .dense
+                    .labels
+                    .select1(before(&self.dense.labels, start).checked_add(1)?)?;
+                if q < start.checked_add(256)? {
+                    Some(Fallback::Dense(q))
+                } else {
+                    None
+                }
+            }
+            Node::Sparse(n) => {
+                let (start, end) = self.node_range(n);
+                if start < end {
+                    Some(Fallback::Sparse(start))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// The value of the least key at or under the label at `from`, its labels appended to `out`.
+    fn leftmost(&self, from: Fallback, out: &mut Vec<u8>) -> Option<u32> {
+        let mut at = from;
+        // Down the first branch of each node: at most a node a step.
+        for _ in 0..=self.dense.nodes.saturating_add(self.sparse.labels.len()) {
+            let next = match at {
+                Fallback::Node(n) => return self.value_of(n),
+                Fallback::Dense(pos) => {
+                    out.push(u8::try_from(pos % 256).ok()?);
+                    if !self.dense.has_child.get(pos) {
+                        return self.dense_value_at(pos);
+                    }
+                    self.dense_child(pos)
+                }
+                Fallback::Sparse(p) => {
+                    out.push(*self.sparse.labels.get(p)?);
+                    if !self.sparse.has_child.get(p) {
+                        return self.value_at_label(p);
+                    }
+                    self.child(p)
+                }
+            };
+            // A node's own key is the least beneath it.
+            let n = self.node(next);
+            at = if self.is_key(n) {
+                Fallback::Node(n)
+            } else {
+                self.first_label(n)?
+            };
+        }
+        None
+    }
+
     /// Appends the trie to `out`: the dense part's three bit vectors and counts, the sparse
     /// part's labels and three bit vectors, and the values.
     pub fn encode(&self, out: &mut Vec<u8>) {
@@ -713,6 +902,52 @@ mod tests {
                     );
                     let want = map.range(..=q.clone()).next_back().map(|(_, v)| *v);
                     assert_eq!(t.floor(q), want, "case {case} cut {cutoff} floor {q:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ceilings_and_prefixes_agree_with_an_ordered_map() {
+        let mut x = 0x5851_f42d_4c95_7f2du64;
+        for case in 0..400 {
+            let n = (rng(&mut x) % 300) as usize;
+            let map: BTreeMap<Vec<u8>, u32> = (0..n)
+                .map(|i| (key(&mut x), u32::try_from(i).unwrap()))
+                .collect();
+            let keys: Vec<&[u8]> = map.keys().map(Vec::as_slice).collect();
+            let values: Vec<u32> = map.values().copied().collect();
+            let mut queries: Vec<Vec<u8>> = (0..300).map(|_| key(&mut x)).collect();
+            queries.extend(map.keys().cloned());
+            for cutoff in 0..=8 {
+                let t = Trie::build_at(&keys, &values, Some(cutoff)).unwrap();
+                let mut out = Vec::new();
+                for q in &queries {
+                    let want = map.range(q.clone()..).next();
+                    let mut seen = Vec::new();
+                    let got = t.seek(q, &mut out, |len, v| {
+                        seen.push((len, v));
+                        ControlFlow::Continue(())
+                    });
+                    assert_eq!(
+                        got,
+                        ControlFlow::Continue(want.map(|(_, v)| *v)),
+                        "case {case} cut {cutoff} ceil {q:?}"
+                    );
+                    if let Some((k, _)) = want {
+                        assert_eq!(&out, k, "case {case} cut {cutoff} ceil key {q:?}");
+                    }
+                    let prefixes: Vec<(usize, u32)> = (0..q.len())
+                        .filter_map(|l| map.get(&q[..l]).map(|v| (l, *v)))
+                        .collect();
+                    assert_eq!(seen, prefixes, "case {case} cut {cutoff} prefixes {q:?}");
+                    // Stopped at the first prefix, the descent says so.
+                    if !prefixes.is_empty() {
+                        assert_eq!(
+                            t.seek(q, &mut out, |_, _| ControlFlow::Break(())),
+                            ControlFlow::Break(())
+                        );
+                    }
                 }
             }
         }

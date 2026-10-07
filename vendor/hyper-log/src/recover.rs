@@ -465,6 +465,7 @@ pub(crate) fn create<F: BlockFile>(
         next_incarnation: 2,
         durable: 0,
         durable_tail: 1,
+        ceiling: u32::MAX,
     })
 }
 
@@ -1139,6 +1140,7 @@ impl Opened {
                 .ok_or(LogError::Damaged("incarnations past u64"))?,
             durable: last.sequence,
             durable_tail: last.tail,
+            ceiling: u32::MAX,
         };
         let mut all: Vec<u128> = self
             .damaged

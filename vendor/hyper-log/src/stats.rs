@@ -38,6 +38,9 @@ pub struct LogStats {
     /// Each update's wait, from its submission to the end of the flush that let it be answered:
     /// the next frame's, whose record confirms its frame, or its frame's confirmation's.
     pub commit_wait: Histogram,
+    /// Times the owner refused the file a slot past its end (`crate::Growth`), each read as the
+    /// file's bound reached: the frame that needed it answered `Full`.
+    pub growth_refused: u64,
 }
 
 impl LogStats {
@@ -53,6 +56,7 @@ impl LogStats {
             flush: Histogram::new(),
             write: Histogram::new(),
             commit_wait: Histogram::new(),
+            growth_refused: 0,
         }
     }
 }

@@ -129,7 +129,7 @@ pub struct Store<F: BlockFile> {
     pages_most_lent: usize,
     /// A branch builder's working lists (its extents, its pages' entry counts), kept when given
     /// back so they grow once, not with every branch: at most as many as were ever out at once.
-    lists: Vec<(Vec<u64>, Vec<u16>)>,
+    lists: Vec<Lists>,
     lists_lent: usize,
     lists_most_lent: usize,
     /// Whether its I/O is timed ([`Store::set_timed`]): a clock read a call, for diagnosis.
@@ -157,6 +157,26 @@ pub struct Run {
     buf: AlignedBuf,
     first: u64,
     pages: u32,
+}
+
+/// A branch builder's working lists, kept by the store between builders so they grow once: the
+/// extents the branch holds, its tree pages' entry counts, and its index pages' payloads with
+/// each one's address, offset and length.
+#[derive(Debug, Default)]
+pub struct Lists {
+    pub extents: Vec<u64>,
+    pub counts: Vec<u16>,
+    pub interior: Vec<u8>,
+    pub interior_pages: Vec<(u64, u32, u32)>,
+}
+
+impl Lists {
+    fn clear(&mut self) {
+        self.extents.clear();
+        self.counts.clear();
+        self.interior.clear();
+        self.interior_pages.clear();
+    }
 }
 
 /// Pages a scan reads ahead ([`Store::read_page_ahead`]): an extent's buffer, the first page it
@@ -669,17 +689,16 @@ impl<F: BlockFile> Store<F> {
     }
 
     /// Empty working lists for a branch builder, from the pool or fresh.
-    pub fn take_lists(&mut self) -> (Vec<u64>, Vec<u16>) {
+    pub fn take_lists(&mut self) -> Lists {
         self.lists_lent = self.lists_lent.saturating_add(1);
         self.lists_most_lent = self.lists_most_lent.max(self.lists_lent);
-        let (mut extents, mut counts) = self.lists.pop().unwrap_or_default();
-        extents.clear();
-        counts.clear();
-        (extents, counts)
+        let mut lists = self.lists.pop().unwrap_or_default();
+        lists.clear();
+        lists
     }
 
     /// Takes back a builder's working lists.
-    pub fn give_lists(&mut self, lists: (Vec<u64>, Vec<u16>)) {
+    pub fn give_lists(&mut self, lists: Lists) {
         self.lists_lent = self.lists_lent.saturating_sub(1);
         if self.lists.len() < self.lists_most_lent {
             self.lists.push(lists);

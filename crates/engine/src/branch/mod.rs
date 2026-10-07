@@ -65,6 +65,44 @@ const INDEX_FIXED: usize = 18;
 /// An entry's offset in the payload.
 const OFFSET: usize = 2;
 
+/// A branch's index pages, held in memory: a descent from the root reads only the leaf it reaches
+/// from the device, as RocksDB keeps a table's index in the table reader's memory by default
+/// (`cache_index_and_filter_blocks` off) and as the design's reads count on (docs/design/
+/// engine-structure.md §5: "with the filters and branch interiors in memory, a cold get costs
+/// about one device read"). About an index entry a leaf page: under one percent of the data.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Interior {
+    bytes: Vec<u8>,
+    /// Each index page's address, and its payload's offset and length in `bytes`, by address.
+    pages: Vec<(u64, u32, u32)>,
+}
+
+impl Interior {
+    /// The payload of the index page at `address`; none for a page that is not one.
+    fn get(&self, address: u64) -> Option<&[u8]> {
+        let i = self.pages.binary_search_by_key(&address, |p| p.0).ok()?;
+        let &(_, at, len) = self.pages.get(i)?;
+        let at = usize::try_from(at).ok()?;
+        self.bytes
+            .get(at..at.checked_add(usize::try_from(len).ok()?)?)
+    }
+
+    /// The bytes held.
+    pub fn bytes(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Exactly sized copies of a builder's working payloads and their pages, ordered by address.
+    fn from_working(bytes: &[u8], pages: &[(u64, u32, u32)]) -> Self {
+        let mut pages = pages.to_vec();
+        pages.sort_unstable_by_key(|p| p.0);
+        Self {
+            bytes: bytes.to_vec(),
+            pages,
+        }
+    }
+}
+
 /// A built branch: its root page, its height (1 for a lone leaf), its entries, and the extents
 /// holding its pages, each held once by the branch.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,6 +127,8 @@ pub struct Branch {
     /// as RemixDB's metadata block; docs/design/engine-structure.md §5, E6). Written after the
     /// filter in its pages.
     pub counts: Vec<u16>,
+    /// Its index pages, in memory.
+    pub interior: Interior,
 }
 
 fn corrupt(why: Malformed) -> Error {
@@ -253,6 +293,10 @@ pub struct Builder {
     first: Vec<u8>,
     /// Each tree page's entries as it is written, 0 for an index page ([`Branch::counts`]).
     counts: Vec<u16>,
+    /// The index pages' payloads as they are written, and each one's address, offset and
+    /// length ([`Branch::interior`]).
+    interior: Vec<u8>,
+    interior_pages: Vec<(u64, u32, u32)>,
     count: u64,
     payload: Vec<u8>,
     capacity: usize,
@@ -284,7 +328,7 @@ impl Builder {
     /// A builder in `store`, for `keys` entries: pages of the store's payload capacity, which
     /// offsets of 16 bits must reach.
     pub fn new<F: BlockFile>(store: &mut Store<F>, keys: filter::Keys) -> Result<Self, Error> {
-        let (extents, counts) = store.take_lists();
+        let lists = store.take_lists();
         let capacity = store.page_capacity();
         if capacity > usize::from(u16::MAX) {
             return Err(Error::InvalidArgument {
@@ -294,11 +338,13 @@ impl Builder {
         Ok(Self {
             levels: vec![Page::with_capacity(capacity)],
             extent: None,
-            extents,
+            extents: lists.extents,
             last: Vec::new(),
             rest: Vec::new(),
             first: Vec::new(),
-            counts,
+            counts: lists.counts,
+            interior: lists.interior,
+            interior_pages: lists.interior_pages,
             count: 0,
             payload: Vec::with_capacity(capacity),
             capacity,
@@ -425,6 +471,13 @@ impl Builder {
         self.counts
             .push(u16::try_from(entries).map_err(|_| corrupt(Malformed::TooLarge))?);
         store.queue_page(&mut self.run, address, &payload)?;
+        if level > 0 {
+            let at =
+                u32::try_from(self.interior.len()).map_err(|_| corrupt(Malformed::TooLarge))?;
+            let len = u32::try_from(payload.len()).map_err(|_| corrupt(Malformed::TooLarge))?;
+            self.interior.extend_from_slice(&payload);
+            self.interior_pages.push((address, at, len));
+        }
         self.payload = payload;
         if let Some(page) = self.levels.get_mut(level) {
             page.clear();
@@ -586,8 +639,14 @@ impl Builder {
             filter_pages: s.pages,
             filter_bytes,
             counts: self.counts.as_slice().to_vec(),
+            interior: Interior::from_working(&self.interior, &self.interior_pages),
         });
-        store.give_lists((self.extents, self.counts));
+        store.give_lists(crate::store::Lists {
+            extents: self.extents,
+            counts: self.counts,
+            interior: self.interior,
+            interior_pages: self.interior_pages,
+        });
         branch
     }
 }
@@ -745,7 +804,7 @@ impl Branch {
         let mut address = self.root;
         for _ in 0..=self.height {
             buf.clear();
-            store.read_page(address, buf)?;
+            self.read_node(store, address, buf)?;
             let view = View::new(buf)?;
             let Some(i) = view.floor(key)? else {
                 return Ok(None);
@@ -837,7 +896,12 @@ impl Branch {
         let mut address = self.root;
         for depth in 0..=height {
             let mut page = store.take_page();
-            if let Err(e) = cursor.read(store, depth, address, &mut page) {
+            let read = if depth == cursor.leaf_depth {
+                cursor.read(store, depth, address, &mut page)
+            } else {
+                self.read_node(store, address, &mut page)
+            };
+            if let Err(e) = read {
                 store.give_page(page);
                 cursor.give_back(store);
                 return Err(e);
@@ -1074,6 +1138,41 @@ impl Branch {
             .collect();
         let filter =
             filter::Filter::from_bytes(filter_part).ok_or(corrupt(Malformed::CountMismatch))?;
+        // The index pages, read back into memory: the tree pages whose entry count is 0.
+        let mut bytes = Vec::new();
+        let mut pages = Vec::new();
+        for (page_no, &c) in counts.iter().enumerate() {
+            if c != 0 {
+                continue;
+            }
+            let page_no = u64::try_from(page_no).map_err(|_| corrupt(Malformed::TooLarge))?;
+            let extent = *extents
+                .get(
+                    usize::try_from(
+                        page_no
+                            .checked_div(per)
+                            .ok_or(corrupt(Malformed::TooLarge))?,
+                    )
+                    .map_err(|_| corrupt(Malformed::TooLarge))?,
+                )
+                .ok_or(corrupt(Malformed::OutOfRange))?;
+            let within = u32::try_from(
+                page_no
+                    .checked_rem(per)
+                    .ok_or(corrupt(Malformed::TooLarge))?,
+            )
+            .map_err(|_| corrupt(Malformed::TooLarge))?;
+            let address = store.address(extent, within)?;
+            let start = bytes.len();
+            store.read_page(address, &mut bytes)?;
+            pages.push((
+                address,
+                u32::try_from(start).map_err(|_| corrupt(Malformed::TooLarge))?,
+                u32::try_from(bytes.len().saturating_sub(start))
+                    .map_err(|_| corrupt(Malformed::TooLarge))?,
+            ));
+        }
+        let interior = Interior::from_working(&bytes, &pages);
         Ok((
             Self {
                 root,
@@ -1085,6 +1184,7 @@ impl Branch {
                 filter_pages,
                 filter_bytes,
                 counts,
+                interior,
             },
             at,
         ))
@@ -1113,6 +1213,22 @@ pub struct RunCursor {
 }
 
 impl Branch {
+    /// The page at `address` into `out`: an index page from memory, any other from the store.
+    fn read_node<F: BlockFile>(
+        &self,
+        store: &mut Store<F>,
+        address: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<(), Error> {
+        match self.interior.get(address) {
+            Some(payload) => {
+                out.extend_from_slice(payload);
+                Ok(())
+            }
+            None => store.read_page(address, out),
+        }
+    }
+
     /// The address of page `page_no`, counted through the branch's extents in order.
     pub fn page_address<F: BlockFile>(&self, store: &Store<F>, page_no: u64) -> Result<u64, Error> {
         let per = u64::from(store.extent_pages());
@@ -1195,7 +1311,7 @@ impl Branch {
         let mut address = self.root;
         for _ in 0..=self.height {
             c.page.clear();
-            if let Err(e) = store.read_page(address, &mut c.page) {
+            if let Err(e) = self.read_node(store, address, &mut c.page) {
                 c.give_back(store);
                 return Err(e);
             }

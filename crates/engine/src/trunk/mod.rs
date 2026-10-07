@@ -29,7 +29,7 @@
 use crate::branch::merge::Compaction;
 use crate::branch::{Branch, Op};
 use crate::error::{Error, Malformed};
-use crate::remix::{Build, View};
+use crate::remix::{Build, Rebuild, View};
 use crate::store::Store;
 use hyper_block::block::BlockFile;
 
@@ -69,6 +69,10 @@ const MAX_VIEW_RUNS: usize = 63;
 struct Bundle {
     branches: Vec<Branch>,
     view: Option<View>,
+    /// The view of the branches but the `added` newest, kept as flushes added them, for the
+    /// view's rebuild ([`Rebuild`]), a run merged in at a time.
+    basis: Option<View>,
+    added: usize,
 }
 
 impl Clone for Bundle {
@@ -76,6 +80,8 @@ impl Clone for Bundle {
         Self {
             branches: self.branches.clone(),
             view: None,
+            basis: None,
+            added: 0,
         }
     }
 }
@@ -85,6 +91,8 @@ impl From<Vec<Branch>> for Bundle {
         Self {
             branches,
             view: None,
+            basis: None,
+            added: 0,
         }
     }
 }
@@ -103,12 +111,28 @@ impl Bundle {
     /// The branches, to change: the view is dropped.
     fn branches_mut(&mut self) -> &mut Vec<Branch> {
         self.view = None;
+        self.basis = None;
+        self.added = 0;
         &mut self.branches
+    }
+
+    /// Adds `b` as the newest branch: the view, if built, becomes the basis of the next, and a
+    /// basis kept counts the runs added since.
+    fn push_newest(&mut self, b: Branch) {
+        if let Some(v) = self.view.take() {
+            self.basis = Some(v);
+            self.added = 1;
+        } else if self.basis.is_some() {
+            self.added = self.added.saturating_add(1);
+        }
+        self.branches.insert(0, b);
     }
 
     /// The branches taken out, the bundle left empty, its view dropped.
     fn take(&mut self) -> Vec<Branch> {
         self.view = None;
+        self.basis = None;
+        self.added = 0;
         std::mem::take(&mut self.branches)
     }
 }
@@ -143,6 +167,10 @@ pub struct TrunkStats {
     /// REMIX views of pivot bundles built, and builds dropped because their bundle changed.
     pub views_built: u64,
     pub views_dropped: u64,
+    /// Of the views built, those rebuilt from an older view, and the runs those rebuilds merged
+    /// in (more than the rebuilds when several runs were added before one).
+    pub views_rebuilt: u64,
+    pub views_merged: u64,
 }
 
 /// Nanoseconds since `t`, none when timing is off (`Trunk::set_timed`).
@@ -178,12 +206,94 @@ pub struct Trunk {
     view_at: usize,
 }
 
-/// A view being built for pivot `pivot` of node `node`.
+/// A view being built for pivot `pivot` of node `node`: from its runs, or rebuilt from the view
+/// of all but the newest.
 #[derive(Debug)]
 struct ViewJob {
     node: usize,
     pivot: usize,
-    build: Build,
+    build: Job,
+}
+
+#[derive(Debug)]
+enum Job {
+    Build(Build),
+    /// A rebuild of the view of `runs[left..]` from that of `runs[left + 1..]`, and the bundle's
+    /// roots: the runs still to merge in are `runs[..left]`, newest first.
+    Rebuild {
+        /// Boxed: a rebuild holds two views, the build a cursor a run.
+        job: Option<Box<Rebuild>>,
+        left: usize,
+        roots: Vec<u64>,
+        lo: Vec<u8>,
+        hi: Option<Vec<u8>>,
+    },
+}
+
+impl Job {
+    fn reads(&self, runs: &[Branch]) -> bool {
+        match self {
+            Job::Build(b) => b.reads(runs),
+            Job::Rebuild { roots, .. } => {
+                roots.len() == runs.len() && roots.iter().zip(runs).all(|(&r, b)| r == b.root)
+            }
+        }
+    }
+
+    /// Up to `budget` entries: the entries taken, and whether the view of every run is whole.
+    /// A rebuild whose run is merged starts the next, the next newer run merged into its view.
+    fn step<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        runs: &[Branch],
+        budget: u64,
+    ) -> Result<(u64, bool), Error> {
+        match self {
+            Job::Build(b) => b.step(store, runs, budget),
+            Job::Rebuild {
+                job, left, lo, hi, ..
+            } => {
+                let part = runs.get(*left..).ok_or(corrupt())?;
+                let (taken, done) = job.as_mut().ok_or(corrupt())?.step(store, part, budget)?;
+                if !done {
+                    return Ok((taken, false));
+                }
+                let Some(next) = left.checked_sub(1) else {
+                    return Ok((taken, true));
+                };
+                // The view of `runs[left..]` is whole: the next newer run is merged into it.
+                let part = runs.get(next..).ok_or(corrupt())?;
+                let finished = job.take().ok_or(corrupt())?.finish(store);
+                *job = Some(Box::new(Rebuild::new(
+                    store,
+                    finished,
+                    part,
+                    lo,
+                    hi.as_deref(),
+                )?));
+                *left = next;
+                Ok((taken, false))
+            }
+        }
+    }
+
+    fn finish<F: BlockFile>(self, store: &mut Store<F>) -> View {
+        match self {
+            Job::Build(b) => b.finish(store),
+            Job::Rebuild { job, .. } => job.map(|j| j.finish(store)).unwrap_or_default(),
+        }
+    }
+
+    fn abandon<F: BlockFile>(self, store: &mut Store<F>) {
+        match self {
+            Job::Build(b) => b.abandon(store),
+            Job::Rebuild { job, .. } => {
+                if let Some(j) = job {
+                    j.abandon(store);
+                }
+            }
+        }
+    }
 }
 
 /// One node's flush-then-compact in progress: the recursion the module describes, held as an
@@ -518,8 +628,46 @@ impl Trunk {
             if let Some(i) = wanting {
                 let lo = node.pivots.get(i).map(|p| p.key.clone()).ok_or(corrupt())?;
                 let hi = Self::pivot_end(node, i);
+                // The view of all but the newest run, when it describes them: rebuilt by merging
+                // the newest in; else built from the runs.
+                let (basis, added) = self
+                    .nodes
+                    .get_mut(n)
+                    .and_then(|node| node.pivots.get_mut(i))
+                    .map(|p| (p.bundle.basis.take(), std::mem::take(&mut p.bundle.added)))
+                    .unwrap_or((None, 0));
                 let runs = self.bundle_of(n, i).ok_or(corrupt())?;
-                let build = Build::new(store, runs, &lo, hi.as_deref())?;
+                let older = runs.get(added..).unwrap_or(&[]);
+                let build = match (basis, added.checked_sub(1)) {
+                    (Some(old), Some(left))
+                        if old.roots().len() == older.len()
+                            && old.roots().iter().zip(older).all(|(&r, b)| r == b.root) =>
+                    {
+                        // The oldest added run first: merged into the basis, then each newer.
+                        let part = runs.get(left..).ok_or(corrupt())?;
+                        Job::Rebuild {
+                            job: Some(Box::new(Rebuild::new(
+                                store,
+                                old,
+                                part,
+                                &lo,
+                                hi.as_deref(),
+                            )?)),
+                            left,
+                            roots: runs.iter().map(|b| b.root).collect(),
+                            lo: lo.clone(),
+                            hi: hi.clone(),
+                        }
+                    }
+                    _ => Job::Build(Build::new(store, runs, &lo, hi.as_deref())?),
+                };
+                if matches!(build, Job::Rebuild { .. }) {
+                    self.stats.views_rebuilt = self.stats.views_rebuilt.saturating_add(1);
+                    self.stats.views_merged = self
+                        .stats
+                        .views_merged
+                        .saturating_add(u64::try_from(added).unwrap_or(u64::MAX));
+                }
                 self.view_job = Some(ViewJob {
                     node: n,
                     pivot: i,
@@ -999,7 +1147,7 @@ impl Trunk {
         let pivot = self.node_mut(n)?.pivots.get_mut(i).ok_or(corrupt())?;
         pivot.start = covered;
         if let Some(b) = merged {
-            pivot.bundle.branches_mut().insert(0, b);
+            pivot.bundle.push_newest(b);
         }
         Ok(())
     }

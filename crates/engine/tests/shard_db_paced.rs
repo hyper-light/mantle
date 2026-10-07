@@ -275,10 +275,57 @@ fn run_on<F: BlockFile + 'static>(
         for k in 0..KEYS {
             check(&mut db, &oracle, k);
         }
-        // The leaves' REMIX views are built in idle time with the rest, and scans read leaves
-        // through them exactly.
+        // The bundles' REMIX views are built in idle time with the rest, and scans read
+        // bundles through them exactly.
         let (_, trunk, _) = db.stats();
         assert!(trunk.views_built > 0, "{trunk:?}");
+        for (a, b, limit) in [(0, KEYS - 1, 1), (3, KEYS / 2, 7), (KEYS / 3, KEYS - 1, 64)] {
+            check_scan(&mut db, &oracle, a, b, limit);
+        }
+        // More writes with every view built: flushes add runs to bundles that have views, and
+        // idle slices rebuild those views from the older ones; every read and scan stays exact.
+        let mut y = 0x6a09_e667_f3bc_c908u64;
+        for i in 0..OPS / 2 {
+            y ^= y << 13;
+            y ^= y >> 7;
+            y ^= y << 17;
+            let k = y % KEYS;
+            if y.is_multiple_of(7) {
+                db.delete(&key(k)).unwrap();
+                oracle.insert(k, None);
+            } else {
+                let v = format!("w{i}-{}", "y".repeat((y % 30) as usize)).into_bytes();
+                db.put(&key(k), &v).unwrap();
+                oracle.insert(k, Some(v));
+            }
+            check(&mut db, &oracle, k);
+            // Idle time now and then pays everything owed, views too: the next flush into a
+            // bundle with a view then has it rebuilt.
+            if i % 50 == 0 {
+                db.maintain(u64::MAX).unwrap();
+            }
+            if i % 97 == 0 {
+                let (a, b) = ((y >> 8) % KEYS, (y >> 32) % KEYS);
+                check_scan(
+                    &mut db,
+                    &oracle,
+                    a.min(b),
+                    a.max(b) + 1,
+                    1 + (y % 19) as usize,
+                );
+            }
+        }
+        let mut steps = 0u64;
+        while db.owed() {
+            assert!(db.idle_step(7).unwrap() > 0, "a debt owed and no work done");
+            steps += 1;
+            assert!(steps < 1_000_000, "idle slices never paid the debts");
+        }
+        let (_, trunk, _) = db.stats();
+        assert!(trunk.views_rebuilt > 0, "{trunk:?}");
+        for k in 0..KEYS {
+            check(&mut db, &oracle, k);
+        }
         for (a, b, limit) in [(0, KEYS - 1, 1), (3, KEYS / 2, 7), (KEYS / 3, KEYS - 1, 64)] {
             check_scan(&mut db, &oracle, a, b, limit);
         }
@@ -304,4 +351,56 @@ fn run_on<F: BlockFile + 'static>(
         io.buffers_taken
     );
     (db, oracle)
+}
+
+/// A wider trunk (fanout 6), maintenance paid in idle time every so many writes: flushes add
+/// several runs to a bundle with a view before the next idle time, so its rebuild merges them in a
+/// run at a time, each into the view of the last. Every read and scan stays exact.
+#[test]
+fn views_rebuilt_over_several_added_runs_read_exactly() {
+    let align = Alignment::new(4096).unwrap();
+    let file = SimFile::new(align, Alignment::new(512).unwrap(), 23).unwrap();
+    let trunk = TrunkConfig {
+        fanout: 6,
+        leaf_entries: 400,
+    };
+    let mut db = ShardDb::create(file, STORE, MEM, trunk).unwrap();
+    let mut oracle: BTreeMap<u64, Option<Vec<u8>>> = BTreeMap::new();
+    let mut x = 0x510e_527f_ade6_82d1u64;
+    for i in 0..OPS {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let k = x % KEYS;
+        if x.is_multiple_of(9) {
+            db.delete(&key(k)).unwrap();
+            oracle.insert(k, None);
+        } else {
+            let v = format!("c{i}-{}", "z".repeat((x % 35) as usize)).into_bytes();
+            db.put(&key(k), &v).unwrap();
+            oracle.insert(k, Some(v));
+        }
+        check(&mut db, &oracle, k);
+        if i % 400 == 0 {
+            db.maintain(u64::MAX).unwrap();
+        }
+        if i % 113 == 0 {
+            let (a, b) = ((x >> 8) % KEYS, (x >> 32) % KEYS);
+            check_scan(
+                &mut db,
+                &oracle,
+                a.min(b),
+                a.max(b) + 1,
+                1 + (x % 17) as usize,
+            );
+        }
+    }
+    db.maintain(u64::MAX).unwrap();
+    let (_, trunk, _) = db.stats();
+    assert!(trunk.views_rebuilt > 0, "{trunk:?}");
+    assert!(trunk.views_merged > trunk.views_rebuilt, "{trunk:?}");
+    for k in 0..KEYS {
+        check(&mut db, &oracle, k);
+    }
+    check_scan(&mut db, &oracle, 0, KEYS - 1, 11);
 }

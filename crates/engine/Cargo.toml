@@ -57,3 +57,7 @@ harness = false
 [[bench]]
 name = "ranges"
 harness = false
+
+[[bench]]
+name = "remix"
+harness = false

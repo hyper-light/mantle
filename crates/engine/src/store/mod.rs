@@ -167,6 +167,14 @@ pub struct Span {
     buf: AlignedBuf,
     first: u64,
     pages: u32,
+    /// Pages the next read takes, at most the extent's: a scan's reads start at `floor` and
+    /// double while they run on from the last (RocksDB's auto-readahead, which starts once
+    /// reads turn sequential and doubles to its bound), so a seek reads the page it wants and a
+    /// long scan reads extents a call.
+    ahead: u32,
+    /// The least a read takes: one page for a scan that may stop at once, the extent for a
+    /// compaction, which reads its inputs to their end.
+    floor: u32,
 }
 
 fn io(op: &'static str, e: impl std::fmt::Display) -> Error {
@@ -962,12 +970,28 @@ impl<F: BlockFile> Store<F> {
         Ok(())
     }
 
-    /// A span for a scan: an extent's buffer, holding no pages yet.
+    /// A span for a scan, which may stop after a page: its first read takes one page, and its
+    /// reads double while the scan runs on.
     pub fn span(&mut self) -> Result<Span, Error> {
         Ok(Span {
             buf: self.take_buf()?,
             first: 0,
             pages: 0,
+            ahead: 1,
+            floor: 1,
+        })
+    }
+
+    /// A span for a compaction, which reads its inputs to their end: every read takes the rest
+    /// of its extent.
+    pub fn span_sequential(&mut self) -> Result<Span, Error> {
+        let extent = self.config.extent_pages;
+        Ok(Span {
+            buf: self.take_buf()?,
+            first: 0,
+            pages: 0,
+            ahead: extent,
+            floor: extent,
         })
     }
 
@@ -1040,8 +1064,22 @@ impl<F: BlockFile> Store<F> {
         if last <= address {
             return Err(corrupt(Malformed::Truncated));
         }
+        // A read runs on from the last when it lands within what the next read, at double the
+        // size, would cover (a branch's index page between two leaves is passed over unread):
+        // it doubles, up to the extent. Any other starts again at the floor.
+        let held_end = span.first.saturating_add(u64::from(span.pages));
+        let runs_on = span.pages > 0
+            && address >= held_end
+            && address < held_end.saturating_add(u64::from(span.ahead).saturating_mul(2));
+        span.ahead = if runs_on {
+            span.ahead.saturating_mul(2)
+        } else {
+            span.floor
+        }
+        .clamp(1, self.config.extent_pages);
         let pages = u32::try_from(last.saturating_sub(address))
-            .map_err(|_| corrupt(Malformed::TooLarge))?;
+            .map_err(|_| corrupt(Malformed::TooLarge))?
+            .min(span.ahead);
         let bytes = usize::try_from(pages)
             .ok()
             .and_then(|p| p.checked_mul(self.config.page_size))

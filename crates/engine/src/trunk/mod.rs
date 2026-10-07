@@ -74,6 +74,14 @@ pub struct TrunkStats {
     pub splits: u64,
     /// Entries written into branches by compactions.
     pub entries_written: u64,
+    /// Nanoseconds planning compactions (their cursors' seeks), and finishing them (the last
+    /// pages and filters, and the trunk's change).
+    pub plan_ns: u64,
+    pub finish_ns: u64,
+}
+
+fn ns_since(t: std::time::Instant) -> u64 {
+    u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// One shard's trunk.
@@ -376,7 +384,9 @@ impl Trunk {
             } => {
                 let used = c.step(store, budget)?;
                 if c.is_done() {
+                    let t = std::time::Instant::now();
                     self.apply_pivot(store, n, i, c, covered)?;
+                    self.stats.finish_ns = self.stats.finish_ns.saturating_add(ns_since(t));
                     (
                         Some(Phase::Pivots {
                             i: i.saturating_add(1),
@@ -394,14 +404,21 @@ impl Trunk {
                     )
                 }
             }
-            Phase::Pivots { i, job: None } => (Some(self.plan_pivot(store, n, i)?), 0),
+            Phase::Pivots { i, job: None } => {
+                let t = std::time::Instant::now();
+                let phase = self.plan_pivot(store, n, i)?;
+                self.stats.plan_ns = self.stats.plan_ns.saturating_add(ns_since(t));
+                (Some(phase), 0)
+            }
             Phase::Settle {
                 job: Some((mut c, branches)),
             } => {
                 let used = c.step(store, budget)?;
                 if c.is_done() {
+                    let t = std::time::Instant::now();
                     let parts = c.finish(store)?;
                     self.returned = Some(self.apply_settle(store, n, parts, &branches)?);
+                    self.stats.finish_ns = self.stats.finish_ns.saturating_add(ns_since(t));
                     (None, used)
                 } else {
                     (
@@ -412,7 +429,12 @@ impl Trunk {
                     )
                 }
             }
-            Phase::Settle { job: None } => (self.plan_settle(store, n)?, 0),
+            Phase::Settle { job: None } => {
+                let t = std::time::Instant::now();
+                let phase = self.plan_settle(store, n)?;
+                self.stats.plan_ns = self.stats.plan_ns.saturating_add(ns_since(t));
+                (phase, 0)
+            }
             Phase::Flush { i, waiting } => {
                 let i = if waiting { self.take_child(n, i)? } else { i };
                 (self.flush_from(n, i)?, 0)

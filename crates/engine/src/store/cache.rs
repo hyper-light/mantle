@@ -14,7 +14,7 @@
 //! dropped from the cache (`forget`), so an address reused after its extent is freed never reads
 //! the page it held before.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 /// Cited: the small queue's share of the cache, in tenths (libCacheSim `S3FIFO.c`
 /// `small-size-ratio=0.10`).
@@ -61,8 +61,13 @@ pub struct Cache {
     /// The pages each queue holds: its entries less those skipped.
     small_live: usize,
     main_live: usize,
-    ghost: VecDeque<u64>,
-    ghosts: HashSet<u64>,
+    /// Evicted pages' addresses, newest at the front, each with the sequence it was remembered
+    /// at; `ghosts` names the live ones. A page read again leaves `ghosts` only, and its entry
+    /// is skipped when it reaches the back: removing it from the queue cost a scan of the whole
+    /// ghost (up to 90% of the slots) on the read.
+    ghost: VecDeque<(u64, u64)>,
+    ghosts: HashMap<u64, u64>,
+    ghost_seq: u64,
     free: Vec<usize>,
     hits: u64,
     misses: u64,
@@ -94,7 +99,8 @@ impl Cache {
             small_live: 0,
             main_live: 0,
             ghost: VecDeque::with_capacity(Self::ghost_cap(pages)),
-            ghosts: HashSet::with_capacity(Self::ghost_cap(pages)),
+            ghosts: HashMap::with_capacity(Self::ghost_cap(pages)),
+            ghost_seq: 0,
             free: (0..pages).rev().collect(),
             hits: 0,
             misses: 0,
@@ -169,10 +175,7 @@ impl Cache {
             self.free.push(i);
             return;
         }
-        let to_main = self.ghosts.remove(&address);
-        if to_main {
-            self.ghost.retain(|&a| a != address);
-        }
+        let to_main = self.forget_ghost(address);
         let queue = if to_main { Queue::Main } else { Queue::Small };
         if let Some(slot) = self.slots.get_mut(i) {
             *slot = Slot {
@@ -282,16 +285,42 @@ impl Cache {
         }
         self.map.remove(&slot.address);
         self.free.push(i);
+        self.remember_ghost(slot.address);
+    }
+
+    /// Remembers `address` in the ghost, its oldest live address forgotten first when the
+    /// ghost holds its share.
+    fn remember_ghost(&mut self, address: u64) {
         let cap = Self::ghost_cap(self.slots.len());
-        if cap > 0 {
-            if self.ghost.len() >= cap
-                && let Some(old) = self.ghost.pop_back()
-            {
+        if cap == 0 {
+            return;
+        }
+        // Stale entries passed on the way are dropped: at most the queue's length.
+        while self.ghosts.len() >= cap {
+            let Some((old, seq)) = self.ghost.pop_back() else {
+                break;
+            };
+            if self.ghosts.get(&old) == Some(&seq) {
                 self.ghosts.remove(&old);
             }
-            self.ghost.push_front(slot.address);
-            self.ghosts.insert(slot.address);
         }
+        self.ghost_seq = self.ghost_seq.wrapping_add(1);
+        self.ghost.push_front((address, self.ghost_seq));
+        self.ghosts.insert(address, self.ghost_seq);
+    }
+
+    /// Forgets `address` from the ghost; true if it was there. Its queue entry stays until it
+    /// leaves or the queue is compacted, which happens once stale entries are as many as live
+    /// ones: the queue stays within twice the ghost's share, at a constant cost a removal.
+    fn forget_ghost(&mut self, address: u64) -> bool {
+        if self.ghosts.remove(&address).is_none() {
+            return false;
+        }
+        if self.ghost.len() >= self.ghosts.len().saturating_mul(2).max(1) {
+            let ghosts = &self.ghosts;
+            self.ghost.retain(|(a, seq)| ghosts.get(a) == Some(seq));
+        }
+        true
     }
 
     /// Main's oldest page goes round again with one read fewer if it has any, else is freed.
@@ -382,7 +411,7 @@ mod tests {
         }
         // Bounded: never more pages than slots, nor ghosts past their share.
         assert!(c.map.len() <= 10);
-        assert!(c.ghost.len() <= 9 && c.ghosts.len() == c.ghost.len());
+        assert!(c.ghosts.len() <= 9 && c.ghost.len() <= 2 * 9 + 1);
     }
 
     #[test]
@@ -393,12 +422,49 @@ mod tests {
         for a in 0..15u64 {
             c.insert(a, &page(a));
         }
-        assert_eq!(c.ghost.len(), 5);
+        assert_eq!(c.ghosts.len(), 5);
         // Inserted again, page 0 enters main.
-        assert!(c.ghosts.contains(&0));
+        assert!(c.ghosts.contains_key(&0));
         c.insert(0, &page(0));
         let i = c.map[&0];
         assert_eq!(c.slots[i].queue, Queue::Main);
-        assert!(!c.ghosts.contains(&0));
+        assert!(!c.ghosts.contains_key(&0));
+    }
+
+    #[test]
+    fn the_lazy_ghost_forgets_as_an_eager_queue_does_and_stays_bounded() {
+        let mut c = Cache::new(40, 64);
+        let cap = Cache::ghost_cap(40);
+        // The eager queue the ghost was: newest at the front, a forgotten address removed where
+        // it stands, the oldest dropped at capacity.
+        let mut model: VecDeque<u64> = VecDeque::new();
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for step in 0..20_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let address = x % 64;
+            if x.is_multiple_of(3) {
+                let was = model.contains(&address);
+                model.retain(|&a| a != address);
+                assert_eq!(c.forget_ghost(address), was, "step {step}");
+            } else if !model.contains(&address) {
+                if model.len() >= cap {
+                    model.pop_back();
+                }
+                model.push_front(address);
+                c.remember_ghost(address);
+            }
+            let mut live: Vec<u64> = c.ghosts.keys().copied().collect();
+            live.sort_unstable();
+            let mut want: Vec<u64> = model.iter().copied().collect();
+            want.sort_unstable();
+            assert_eq!(live, want, "step {step}");
+            assert!(
+                c.ghost.len() <= 2 * cap + 1,
+                "step {step}: {}",
+                c.ghost.len()
+            );
+        }
     }
 }

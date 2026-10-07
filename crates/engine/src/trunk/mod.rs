@@ -73,6 +73,8 @@ struct Bundle {
     /// view's rebuild ([`Rebuild`]), a run merged in at a time.
     basis: Option<View>,
     added: usize,
+    /// The extents the view is written in, once a saved image names it.
+    stored: Option<Vec<u64>>,
 }
 
 impl Clone for Bundle {
@@ -82,6 +84,7 @@ impl Clone for Bundle {
             view: None,
             basis: None,
             added: 0,
+            stored: None,
         }
     }
 }
@@ -93,6 +96,7 @@ impl From<Vec<Branch>> for Bundle {
             view: None,
             basis: None,
             added: 0,
+            stored: None,
         }
     }
 }
@@ -113,12 +117,14 @@ impl Bundle {
         self.view = None;
         self.basis = None;
         self.added = 0;
+        self.stored = None;
         &mut self.branches
     }
 
     /// Adds `b` as the newest branch: the view, if built, becomes the basis of the next, and a
     /// basis kept counts the runs added since.
     fn push_newest(&mut self, b: Branch) {
+        self.stored = None;
         if let Some(v) = self.view.take() {
             self.basis = Some(v);
             self.added = 1;
@@ -133,6 +139,7 @@ impl Bundle {
         self.view = None;
         self.basis = None;
         self.added = 0;
+        self.stored = None;
         std::mem::take(&mut self.branches)
     }
 }
@@ -202,6 +209,9 @@ pub struct Trunk {
     view_job: Option<ViewJob>,
     view_costs: ViewCosts,
     view_choice: ViewChoice,
+    /// The extents the last saved image's views are written in, released by the next save as the
+    /// views that left them are no longer named.
+    view_extents: Vec<u64>,
     /// Nodes to check for a pivot bundle wanting a view since the trunk last changed, checked
     /// round from `view_at`: every node once after a change.
     views_unchecked: usize,
@@ -364,7 +374,8 @@ enum Phase {
 }
 
 /// The saved image's format version.
-const IMAGE_FORMAT: u8 = 1;
+/// Format 2: each pivot names its view's extents after its branches.
+const IMAGE_FORMAT: u8 = 2;
 /// The saved image header's magic: "mantleTK" in ASCII, little-endian.
 const IMAGE_MAGIC: u64 = u64::from_le_bytes(*b"mantleTK");
 /// None, in a child or an end key's place.
@@ -375,6 +386,69 @@ fn corrupt() -> Error {
         what: "a trunk",
         why: Malformed::OutOfRange,
     }
+}
+
+/// Writes `bytes` to fresh extents, its length first: the extents, in order.
+fn write_blob<F: BlockFile>(store: &mut Store<F>, bytes: &[u8]) -> Result<Vec<u64>, Error> {
+    let capacity = store.page_capacity();
+    let per = usize::try_from(store.extent_pages()).map_err(|_| corrupt())?;
+    let mut framed = Vec::with_capacity(bytes.len().saturating_add(8));
+    framed.extend_from_slice(
+        &u64::try_from(bytes.len())
+            .map_err(|_| corrupt())?
+            .to_le_bytes(),
+    );
+    framed.extend_from_slice(bytes);
+    let pages = framed.len().div_ceil(capacity.max(1));
+    let mut extents = Vec::with_capacity(pages.div_ceil(per.max(1)));
+    for _ in 0..pages.div_ceil(per.max(1)) {
+        extents.push(store.allocate_extent()?);
+    }
+    let mut run = store.run()?;
+    for (i, chunk) in framed.chunks(capacity.max(1)).enumerate() {
+        let extent = *extents
+            .get(i.checked_div(per).ok_or(corrupt())?)
+            .ok_or(corrupt())?;
+        let page = u32::try_from(i.checked_rem(per).ok_or(corrupt())?).map_err(|_| corrupt())?;
+        let address = store.address(extent, page)?;
+        store.queue_page(&mut run, address, chunk)?;
+    }
+    store.write_run(&mut run)?;
+    store.give_run(run);
+    Ok(extents)
+}
+
+/// The bytes [`write_blob`] wrote to `extents`.
+fn read_blob<F: BlockFile>(store: &mut Store<F>, extents: &[u64]) -> Result<Vec<u8>, Error> {
+    let per = store.extent_pages();
+    let mut framed = Vec::new();
+    let mut want: Option<usize> = None;
+    'extents: for &e in extents {
+        for page in 0..per {
+            if want.is_some_and(|w| framed.len() >= w) {
+                break 'extents;
+            }
+            let address = store.address(e, page)?;
+            store.read_page(address, &mut framed)?;
+            if want.is_none() {
+                let len = framed
+                    .first_chunk::<8>()
+                    .map(|b| u64::from_le_bytes(*b))
+                    .ok_or(corrupt())?;
+                want = Some(
+                    usize::try_from(len)
+                        .ok()
+                        .and_then(|l| l.checked_add(8))
+                        .ok_or(corrupt())?,
+                );
+            }
+        }
+    }
+    let want = want.ok_or(corrupt())?;
+    if framed.len() != want {
+        return Err(corrupt());
+    }
+    Ok(framed.split_off(8))
 }
 
 fn release<F: BlockFile>(store: &mut Store<F>, b: &Branch) -> Result<(), Error> {
@@ -415,6 +489,7 @@ impl Trunk {
             view_job: None,
             view_costs: ViewCosts::default(),
             view_choice: ViewChoice::Measured,
+            view_extents: Vec::new(),
             views_unchecked: 0,
             view_at: 0,
         })
@@ -670,6 +745,7 @@ impl Trunk {
                         .and_then(|n| n.pivots.get_mut(job.pivot))
                     {
                         p.bundle.view = Some(view);
+                        p.bundle.stored = None;
                         self.stats.views_built = self.stats.views_built.saturating_add(1);
                     }
                 } else {
@@ -951,6 +1027,16 @@ impl Trunk {
                 what: "a trunk saved with maintenance pending",
             });
         }
+        // Views not yet written go to fresh extents of their own, which the image then names.
+        for node in &mut self.nodes {
+            for p in &mut node.pivots {
+                if let (Some(v), None) = (&p.bundle.view, &p.bundle.stored) {
+                    let mut bytes = Vec::new();
+                    v.encode(&mut bytes)?;
+                    p.bundle.stored = Some(write_blob(store, &bytes)?);
+                }
+            }
+        }
         let mut blob = Vec::new();
         blob.push(IMAGE_FORMAT);
         let put32 = |v: &mut Vec<u8>, n: usize| -> Result<(), Error> {
@@ -984,6 +1070,12 @@ impl Trunk {
                 put32(&mut blob, p.bundle.branches().len())?;
                 for b in p.bundle.branches() {
                     b.encode(&mut blob)?;
+                }
+                // The view's extents, none when the bundle has no view.
+                let extents = p.bundle.stored.as_deref().unwrap_or(&[]);
+                put32(&mut blob, extents.len())?;
+                for e in extents {
+                    blob.extend_from_slice(&e.to_le_bytes());
                 }
             }
         }
@@ -1034,11 +1126,28 @@ impl Trunk {
         for e in std::mem::replace(&mut self.saved, fresh) {
             store.release(e)?;
         }
+        // The views' extents the new image names; those only the last named are released.
+        let mut named: Vec<u64> = self
+            .nodes
+            .iter()
+            .flat_map(|n| n.pivots.iter())
+            .filter_map(|p| p.bundle.stored.as_deref())
+            .flatten()
+            .copied()
+            .collect();
+        named.sort_unstable();
+        for &e in &self.view_extents {
+            if named.binary_search(&e).is_err() {
+                store.release(e)?;
+            }
+        }
+        self.view_extents = named;
         Ok(head)
     }
 
     /// The trunk a checkpoint's image at `head` holds, its branches' filters read back.
     pub fn load<F: BlockFile>(store: &mut Store<F>, head: u64) -> Result<Self, Error> {
+        let mut view_extents: Vec<u64> = Vec::new();
         let mut header = Vec::new();
         store.read_page(head, &mut header)?;
         let u64_at = |b: &[u8], at: usize| {
@@ -1143,10 +1252,34 @@ impl Trunk {
                     r.at = r.at.checked_add(used).ok_or(corrupt())?;
                     bundle.push(branch);
                 }
+                let view_len = usize_of(r.take(4)?)?;
+                let mut extents = Vec::with_capacity(view_len.min(len));
+                for _ in 0..view_len {
+                    let b = r.take(8)?.first_chunk::<8>().copied().ok_or(corrupt())?;
+                    extents.push(u64::from_le_bytes(b));
+                }
+                let mut bundle = Bundle::from(bundle);
+                if !extents.is_empty() {
+                    let bytes = read_blob(store, &extents)?;
+                    let (view, _) = View::decode(&bytes)?;
+                    // A view names the branches it describes: those of its bundle.
+                    if view.roots().len() != bundle.branches().len()
+                        || view
+                            .roots()
+                            .iter()
+                            .zip(bundle.branches())
+                            .any(|(&r, b)| r != b.root)
+                    {
+                        return Err(corrupt());
+                    }
+                    view_extents.extend_from_slice(&extents);
+                    bundle.view = Some(view);
+                    bundle.stored = Some(extents);
+                }
                 pivots.push(Pivot {
                     key,
                     child,
-                    bundle: Bundle::from(bundle),
+                    bundle,
                     start: 0,
                 });
             }
@@ -1161,6 +1294,7 @@ impl Trunk {
             return Err(corrupt());
         }
         let unchecked = nodes.len();
+        view_extents.sort_unstable();
         Ok(Self {
             nodes,
             root,
@@ -1177,6 +1311,7 @@ impl Trunk {
             view_job: None,
             view_costs: ViewCosts::default(),
             view_choice: ViewChoice::Measured,
+            view_extents,
             // Views are not saved: every node is checked for a bundle wanting one after a load.
             views_unchecked: unchecked,
             view_at: 0,
@@ -1478,6 +1613,20 @@ impl Trunk {
             .splits
             .saturating_add(u64::try_from(out.len().saturating_sub(1)).unwrap_or(0));
         Ok(out)
+    }
+
+    /// The pivot bundles that have a view now.
+    pub fn views(&self) -> usize {
+        self.nodes
+            .iter()
+            .flat_map(|n| n.pivots.iter())
+            .filter(|p| p.bundle.view().is_some())
+            .count()
+    }
+
+    /// The extents the last saved image's views are written in.
+    pub fn view_extents(&self) -> &[u64] {
+        &self.view_extents
     }
 
     /// The bytes its branches hold in memory: their filters, their leaf indexes, their pages'

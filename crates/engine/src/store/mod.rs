@@ -119,6 +119,9 @@ pub struct Store<F: BlockFile> {
     pool: Vec<AlignedBuf>,
     lent: usize,
     most_lent: usize,
+    /// Freed extents whose pages the cache still holds, forgotten a share at a time
+    /// ([`Store::forget_some`]): at most the extents freed.
+    forgetting: VecDeque<u64>,
 }
 
 /// Runs handed to the device's issuer and not yet answered: each batch's number, the page
@@ -248,6 +251,7 @@ impl<F: BlockFile> Store<F> {
             pool: Vec::new(),
             lent: 0,
             most_lent: 0,
+            forgetting: VecDeque::new(),
         };
         store.checkpoint(None, 0)?;
         Ok(store)
@@ -298,6 +302,7 @@ impl<F: BlockFile> Store<F> {
                 pool: Vec::new(),
                 lent: 0,
                 most_lent: 0,
+                forgetting: VecDeque::new(),
             },
             recovered,
         ))
@@ -445,18 +450,45 @@ impl<F: BlockFile> Store<F> {
     /// longer names it is durable.
     pub fn release(&mut self, extent: u64) -> Result<(), Error> {
         self.alloc.release(extent)?;
-        // An extent no node names any more is read by no one: its pages leave the cache now,
-        // so the cache holds live pages, not the inputs of compactions done.
-        if !self.alloc.is_held(extent)
-            && let Some(c) = self.cache.as_mut()
-        {
-            let pages = u64::from(self.config.extent_pages);
-            let first = extent.saturating_mul(pages);
-            for address in first..first.saturating_add(pages) {
-                c.forget(address);
-            }
+        // An extent no node names any more is read by no one: its pages leave the cache, so
+        // the cache holds live pages, not the inputs of compactions done. Forgetting a
+        // compaction's inputs at once cost milliseconds of one slice, so the extent waits its
+        // turn ([`Self::forget_some`]).
+        if !self.alloc.is_held(extent) && self.cache.is_some() {
+            self.forgetting.push_back(extent);
         }
         Ok(())
+    }
+
+    /// The pages of freed extents the cache has yet to forget.
+    pub fn forget_debt(&self) -> u64 {
+        u64::try_from(self.forgetting.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::from(self.config.extent_pages))
+    }
+
+    /// Forgets up to `pages` pages of freed extents, an extent at a time; returns the pages
+    /// forgotten. An extent held again by then is passed over: each page written there replaced
+    /// what the cache held, and its pages not written are read by no one.
+    pub fn forget_some(&mut self, pages: u64) -> u64 {
+        let per = u64::from(self.config.extent_pages);
+        let mut done = 0u64;
+        while done < pages {
+            let Some(extent) = self.forgetting.pop_front() else {
+                break;
+            };
+            done = done.saturating_add(per);
+            if self.alloc.is_held(extent) {
+                continue;
+            }
+            if let Some(c) = self.cache.as_mut() {
+                let first = extent.saturating_mul(per);
+                for address in first..first.saturating_add(per) {
+                    c.forget(address);
+                }
+            }
+        }
+        done
     }
 
     /// The extents holding the durable checkpoint's allocator map.

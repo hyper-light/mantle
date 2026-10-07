@@ -56,6 +56,50 @@ Every range replica's engine is its own instance with its own files: shared-noth
 construction (p²KVS, research/33 row 4). A process runs many under shared budgets (memory,
 device bandwidth) and runs them on hyper-rt's shards.
 
+### Shards on hyper-rt (step E2), as designed
+
+Measured first: with every replica's maintenance on the thread its puts run on, one engine
+reached RocksDB's put tail at moderate load and fell behind it at load average 21 (put p99.99
+358–489 µs against 42–107 µs, throughput 0.49–0.57 against 0.71–0.92 M/s, 2026-10-07, §6),
+because RocksDB spreads its flushes and compactions over background threads and our one thread
+was preempted mid-slice. The design's answer is not a shared compaction pool (§4 excludes one)
+but its own first part: the work spread over shards, one per core, each owning whole replicas
+(p²KVS, research/33 row 4), with SILK's scheduling inside each (§6).
+
+- **Runtime.** A node runs one hyper-rt runtime (hyper-raft `docs/runtime.md`): a shard is an
+  OS thread with its own task arena, run queue, timing wheel and completion driver; a task lives
+  on its shard for its life and is never stolen; values move between tasks and threads through
+  bounded channels, and no state is shared (runtime.md §3, §8). The shard count is the cores the
+  node is given (runtime.md §10), not chosen here.
+- **Ranges own engines.** A replica's engine (`ShardDb`, its store file, its page cache, its
+  device attachment) is created on the shard that will own it and never leaves it. Keys reach
+  it by range: a node's keyspace is cut into ranges (metadata.md §3), each placed on a shard. A
+  standalone engine (the bench, the laptop) cuts its keyspace into one range a shard, by key, as
+  p²KVS partitions an instance's keys across its workers.
+- **Requests batched per shard.** A caller (a connection's task on any shard, or a plain
+  thread) sends its operation to the owning shard's request channel, and the result comes back
+  on a one-value channel. The shard's range task drains every request waiting, up to its bound,
+  and applies them together: one wake and one channel round a batch, not an operation (p²KVS's
+  batching, research/33 row 4). The channel's bound is the shard's admission bound; past it the
+  caller is refused `Full` to retry or shed, never queued without limit.
+- **Maintenance as the shard's tasks, scheduled by SILK.** Each range's maintenance (packing,
+  cascades, filter pages, the cache's forgetting) runs on its own shard as work the range task
+  takes in the time requests leave: a batch served, then maintenance until requests wait again.
+  Packing and the root's compaction are never paused, since a full memtable stops puts; deeper
+  compactions run only in that idle time. The debt pacing of §6 stays as the backstop: when a
+  debt's room is running out, puts pay their share as now, so a saturated shard still cannot
+  fall behind. A shard never runs another shard's maintenance: its replicas' state never leaves
+  it.
+- **I/O.** Each range's store attaches to its device's issuer (hyper-block), shared by every
+  range on the device, so a device keeps its measured depth whatever the range count.
+- **Bounds.** Requests a channel holds; ranges a shard owns (its tasks bound,
+  `tasks_per_shard`); batches out at the issuer; the page cache by bytes. Each is a stated bound
+  with a typed refusal.
+
+What it is held to: puts and gets per second against RocksDB's `db_bench` at the same thread
+count (`--threads=N`, N shards against N threads), and every operation's p99, p99.9 and p99.99
+under load, at moderate load and saturated.
+
 ## 3. Pages, extents, checksums
 
 - **Units.** The engine's files are written in pages of the device's alignment (`B`, raft-log.md

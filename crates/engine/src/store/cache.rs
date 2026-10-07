@@ -347,6 +347,116 @@ impl Cache {
         self.free.push(i);
     }
 
+    /// Resizes the cache to `pages` slots, at least one, keeping what it can. Growing adds free
+    /// slots. Shrinking first frees pages by the cache's own rule (S3-FIFO's evictions) until
+    /// the pages held fit, then moves the pages held in the slots past the new count into free
+    /// slots below it, their queue entries renamed in place so each queue keeps its order.
+    /// The ghost keeps its share of the new count. A tuning step's cost: O(slots).
+    pub fn resize(&mut self, pages: usize) {
+        let pages = pages.max(1);
+        let old = self.slots.len();
+        if pages >= old {
+            self.bytes.resize(pages.saturating_mul(self.page), 0);
+            self.slots.resize(
+                pages,
+                Slot {
+                    address: 0,
+                    len: 0,
+                    freq: 0,
+                    queue: Queue::Small,
+                    live: false,
+                    generation: 0,
+                },
+            );
+            self.free.extend((old..pages).rev());
+            return;
+        }
+        // Free pages by the rule until those held fit: each pass frees a page or moves one
+        // between queues, a page at most `MAX_FREQ` + 2 times.
+        let bound = old.saturating_mul(usize::from(MAX_FREQ) + 2);
+        for _ in 0..bound {
+            if self.small_live.saturating_add(self.main_live) <= pages {
+                break;
+            }
+            if self.small_live >= self.small_cap() || self.main_live == 0 {
+                self.evict_small();
+            } else {
+                self.evict_main();
+            }
+        }
+        // Each page held past the new count moves to a free slot below it.
+        let mut low_free: Vec<usize> = self.free.iter().copied().filter(|&i| i < pages).collect();
+        let mut moved: HashMap<usize, (usize, u32)> = HashMap::new();
+        for i in pages..old {
+            let Some(slot) = self.slots.get(i).copied().filter(|s| s.live) else {
+                continue;
+            };
+            let Some(j) = low_free.pop() else {
+                break;
+            };
+            let (from, to) = (i.saturating_mul(self.page), j.saturating_mul(self.page));
+            self.bytes
+                .copy_within(from..from.saturating_add(slot.len), to);
+            let generation = self
+                .slots
+                .get(j)
+                .map_or(0, |s| s.generation)
+                .wrapping_add(1);
+            if let Some(dst) = self.slots.get_mut(j) {
+                *dst = Slot { generation, ..slot };
+            }
+            self.map.insert(slot.address, j);
+            moved.insert(i, (j, generation));
+        }
+        // A page past the new count that found no slot (the evictions did not make room, which
+        // their bound rules out) leaves the cache rather than be named past its end.
+        for i in pages..old {
+            if moved.contains_key(&i) {
+                continue;
+            }
+            if let Some(slot) = self.slots.get(i).copied().filter(|s| s.live) {
+                self.map.remove(&slot.address);
+                match slot.queue {
+                    Queue::Small => self.small_live = self.small_live.saturating_sub(1),
+                    Queue::Main => self.main_live = self.main_live.saturating_sub(1),
+                }
+            }
+        }
+        let slots = &self.slots;
+        let rename = |q: &mut VecDeque<(usize, u32)>, queue: Queue| {
+            q.retain_mut(|e| {
+                if let Some(&(j, g)) = moved.get(&e.0)
+                    && slots
+                        .get(e.0)
+                        .is_some_and(|s| s.live && s.generation == e.1 && s.queue == queue)
+                {
+                    *e = (j, g);
+                    return true;
+                }
+                e.0 < pages
+            });
+        };
+        rename(&mut self.small, Queue::Small);
+        rename(&mut self.main, Queue::Main);
+        self.free = low_free;
+        self.slots.truncate(pages);
+        self.bytes.truncate(pages.saturating_mul(self.page));
+        let cap = Self::ghost_cap(pages);
+        while self.ghosts.len() > cap {
+            let Some((a, seq)) = self.ghost.pop_back() else {
+                break;
+            };
+            if self.ghosts.get(&a) == Some(&seq) {
+                self.ghosts.remove(&a);
+            }
+        }
+    }
+
+    /// Slots the cache has.
+    pub fn pages(&self) -> usize {
+        self.slots.len()
+    }
+
     /// Reads served, and reads missed.
     pub fn stats(&self) -> (u64, u64) {
         (self.hits, self.misses)
@@ -465,6 +575,60 @@ mod tests {
                 "step {step}: {}",
                 c.ghost.len()
             );
+        }
+    }
+
+    #[test]
+    fn a_resized_cache_serves_only_what_it_was_given_and_keeps_its_bounds() {
+        let mut c = Cache::new(64, 32);
+        let mut latest: HashMap<u64, Vec<u8>> = HashMap::new();
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut out = Vec::new();
+        for step in 0..30_000u32 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let address = x % 200;
+            match x % 11 {
+                0..=4 => {
+                    let payload: Vec<u8> = (0..(1 + x % 32))
+                        .map(|b| ((b ^ address) & 0xff) as u8)
+                        .collect();
+                    c.insert(address, &payload);
+                    latest.insert(address, payload);
+                }
+                5..=8 => {
+                    out.clear();
+                    if c.get(address, &mut out) {
+                        assert_eq!(
+                            Some(&out),
+                            latest.get(&address),
+                            "step {step} read {address}"
+                        );
+                    }
+                }
+                9 => {
+                    c.forget(address);
+                    latest.remove(&address);
+                }
+                _ => c.resize(1 + usize::try_from((x >> 20) % 128).unwrap()),
+            }
+            // The map names live slots holding their own addresses; free and live slots are all
+            // the slots; the queues' live counts are the pages held; the ghost keeps its share.
+            let live = c.slots.iter().filter(|s| s.live).count();
+            assert_eq!(c.map.len(), live, "step {step}");
+            assert!(
+                c.map
+                    .iter()
+                    .all(|(&a, &i)| c.slots[i].live && c.slots[i].address == a)
+            );
+            assert_eq!(c.free.len() + live, c.slots.len(), "step {step}");
+            assert_eq!(c.small_live + c.main_live, live, "step {step}");
+            assert!(
+                c.ghosts.len() <= Cache::ghost_cap(c.slots.len()),
+                "step {step}"
+            );
+            assert_eq!(c.bytes.len(), c.slots.len() * 32, "step {step}");
         }
     }
 }

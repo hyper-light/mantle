@@ -278,7 +278,14 @@ impl<F: BlockFile> ShardDb<F> {
     fn pace(&mut self, bytes: usize) -> Result<(), Error> {
         let room = self.mem.room();
         if let Some(p) = &mut self.packing {
-            let left = u64::try_from(p.mem.len().saturating_sub(p.packed)).unwrap_or(u64::MAX);
+            // Entries to pack, then the branch's filter pages, each at its worth in keys.
+            let entries = u64::try_from(p.mem.len().saturating_sub(p.packed)).unwrap_or(u64::MAX);
+            let keys = p.builder.page_keys();
+            let left = p
+                .builder
+                .filter_pages_left()
+                .saturating_mul(keys)
+                .saturating_add(entries);
             let w = share(left, bytes, room, &mut self.pack_carry);
             self.flush_stats.pack_share_most = self.flush_stats.pack_share_most.max(w);
             if w > 0 {
@@ -290,13 +297,22 @@ impl<F: BlockFile> ShardDb<F> {
                     packed,
                 } = p;
                 let store = &mut self.store;
-                let limit = usize::try_from(w).unwrap_or(usize::MAX);
-                let visited =
-                    mem.walk_some(walk, limit, |k, op, v| builder.add(store, k, op, v))?;
-                *packed = packed.saturating_add(visited);
-                let done = *packed >= mem.len();
+                let walked = w.min(entries);
+                if walked > 0 {
+                    let limit = usize::try_from(walked).unwrap_or(usize::MAX);
+                    let visited =
+                        mem.walk_some(walk, limit, |k, op, v| builder.add(store, k, op, v))?;
+                    *packed = packed.saturating_add(visited);
+                }
+                let mut whole = false;
+                let over = w.saturating_sub(walked);
+                if *packed >= mem.len() && over > 0 {
+                    builder.seal(store)?;
+                    let pages = over.checked_div(keys).unwrap_or(1).max(1);
+                    whole = builder.write_filter(store, pages)?;
+                }
                 self.note_pack(ns_since(t));
-                if done {
+                if whole {
                     self.finish_packing()?;
                 }
             }

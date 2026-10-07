@@ -19,7 +19,7 @@ use hyper_block::buf::Alignment;
 use hyper_block::sim::SimFile;
 use mantle_engine::branch::filter::Keys;
 use mantle_engine::branch::{Branch, Builder, Op};
-use mantle_engine::remix::{Build, SEGMENT, View};
+use mantle_engine::remix::{Build, Rebuild, SEGMENT, View};
 use mantle_engine::rows::Rows;
 use mantle_engine::store::{Config, Store};
 use proptest::prelude::*;
@@ -75,7 +75,7 @@ fn run() -> impl Strategy<Value = Run> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(32))]
+    #![proptest_config(ProptestConfig::with_cases(128))]
 
     #[test]
     fn a_view_reads_each_keys_newest_live_version_in_order(
@@ -111,6 +111,18 @@ proptest! {
             prop_assert!(slices <= versions as u64 + 1, "a build that does not end");
         }
         prop_assert_eq!(&job.finish(&mut s), &view);
+        // Rebuilt from the view of the older runs with the newest merged in, a slice at a time,
+        // the view is the same again, field for field.
+        if branches.len() >= 2 {
+            let old = View::build(&mut s, &branches[1..], &lo, hi.as_deref()).unwrap();
+            let mut job = Rebuild::new(&mut s, old, &branches, &lo, hi.as_deref()).unwrap();
+            let mut slices = 0u64;
+            while !job.step(&mut s, &branches, 1 + (slices * 104_729) % 33).unwrap().1 {
+                slices += 1;
+                prop_assert!(slices <= versions as u64 + 1, "a rebuild that does not end");
+            }
+            prop_assert_eq!(&job.finish(&mut s), &view);
+        }
         prop_assert!(view.segments() * SEGMENT.max(runs.len()) >= versions);
 
         // Paged from `from`, the view reads the live keys at or past it.

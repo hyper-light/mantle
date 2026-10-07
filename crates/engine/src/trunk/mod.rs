@@ -29,6 +29,7 @@
 use crate::branch::merge::Compaction;
 use crate::branch::{Branch, Op};
 use crate::error::{Error, Malformed};
+use crate::remix::{Build, View};
 use crate::store::Store;
 use hyper_block::block::BlockFile;
 
@@ -45,10 +46,71 @@ pub struct TrunkConfig {
 struct Pivot {
     key: Vec<u8>,
     child: Option<usize>,
-    /// Newest first.
-    bundle: Vec<Branch>,
+    bundle: Bundle,
     /// The first of the node's in-flight bundles live for this pivot.
     start: usize,
+}
+
+/// A source a scan of a leaf segment reads ([`Trunk::segment_at`]): a branch, or a pivot bundle
+/// through its REMIX view with the branches it was built of.
+#[derive(Clone, Copy, Debug)]
+pub enum Source<'a> {
+    Branch(&'a Branch),
+    View(&'a View, &'a [Branch]),
+}
+
+/// Format: the most runs a REMIX view names (six bits of a selector, less the placeholder).
+const MAX_VIEW_RUNS: usize = 63;
+
+/// A pivot's bundle, newest first, and the REMIX view of it once one is built (two runs or more,
+/// docs/design/engine-structure.md §5, E6). Every change to the branches drops the view, so a view
+/// never describes branches other than those it was built of; a copy has none.
+#[derive(Debug, Default)]
+struct Bundle {
+    branches: Vec<Branch>,
+    view: Option<View>,
+}
+
+impl Clone for Bundle {
+    fn clone(&self) -> Self {
+        Self {
+            branches: self.branches.clone(),
+            view: None,
+        }
+    }
+}
+
+impl From<Vec<Branch>> for Bundle {
+    fn from(branches: Vec<Branch>) -> Self {
+        Self {
+            branches,
+            view: None,
+        }
+    }
+}
+
+impl Bundle {
+    /// The branches, newest first.
+    fn branches(&self) -> &[Branch] {
+        &self.branches
+    }
+
+    /// The REMIX view of the branches, once built.
+    fn view(&self) -> Option<&View> {
+        self.view.as_ref()
+    }
+
+    /// The branches, to change: the view is dropped.
+    fn branches_mut(&mut self) -> &mut Vec<Branch> {
+        self.view = None;
+        &mut self.branches
+    }
+
+    /// The branches taken out, the bundle left empty, its view dropped.
+    fn take(&mut self) -> Vec<Branch> {
+        self.view = None;
+        std::mem::take(&mut self.branches)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -78,6 +140,9 @@ pub struct TrunkStats {
     /// pages and filters, and the trunk's change).
     pub plan_ns: u64,
     pub finish_ns: u64,
+    /// REMIX views of pivot bundles built, and builds dropped because their bundle changed.
+    pub views_built: u64,
+    pub views_dropped: u64,
 }
 
 /// Nanoseconds since `t`, none when timing is off (`Trunk::set_timed`).
@@ -105,6 +170,20 @@ pub struct Trunk {
     returned: Option<Vec<(Vec<u8>, usize)>>,
     /// Whether compactions' planning and finishing are timed ([`Trunk::set_timed`]).
     timed: bool,
+    /// The REMIX view being built, for the pivot it names ([`Trunk::view_step`]).
+    view_job: Option<ViewJob>,
+    /// Nodes to check for a pivot bundle wanting a view since the trunk last changed, checked
+    /// round from `view_at`: every node once after a change.
+    views_unchecked: usize,
+    view_at: usize,
+}
+
+/// A view being built for pivot `pivot` of node `node`.
+#[derive(Debug)]
+struct ViewJob {
+    node: usize,
+    pivot: usize,
+    build: Build,
 }
 
 /// One node's flush-then-compact in progress: the recursion the module describes, held as an
@@ -163,7 +242,7 @@ impl Trunk {
                 pivots: vec![Pivot {
                     key: Vec::new(),
                     child: None,
-                    bundle: Vec::new(),
+                    bundle: Bundle::default(),
                     start: 0,
                 }],
                 inflight: Vec::new(),
@@ -177,6 +256,9 @@ impl Trunk {
             cascade: Vec::new(),
             returned: None,
             timed: false,
+            view_job: None,
+            views_unchecked: 0,
+            view_at: 0,
         })
     }
 
@@ -229,7 +311,7 @@ impl Trunk {
                     }
                 }
             }
-            for b in &pivot.bundle {
+            for b in pivot.bundle.branches() {
                 if let Some(op) = b.get_hashed(store, key, hash, value)? {
                     return Ok(Some(op));
                 }
@@ -250,12 +332,12 @@ impl Trunk {
     pub fn segment_at<'a>(
         &'a self,
         key: &[u8],
-        branches: &mut Vec<&'a Branch>,
+        sources: &mut Vec<Source<'a>>,
         end: &mut Vec<u8>,
     ) -> Result<bool, Error> {
-        branches.clear();
+        sources.clear();
         end.clear();
-        branches.extend(self.pending.iter().rev());
+        sources.extend(self.pending.iter().rev().map(Source::Branch));
         let mut bound: Option<&[u8]> = None;
         let mut at = self.root;
         // Every level down is a node's child: at most the trunk's node count of steps.
@@ -275,9 +357,13 @@ impl Trunk {
                 });
             }
             for bundle in node.inflight.get(pivot.start..).unwrap_or(&[]).iter().rev() {
-                branches.extend(bundle.iter());
+                sources.extend(bundle.iter().map(Source::Branch));
             }
-            branches.extend(pivot.bundle.iter());
+            // The pivot's bundle: through its view once built, else a branch a source.
+            match pivot.bundle.view() {
+                Some(v) => sources.push(Source::View(v, pivot.bundle.branches())),
+                None => sources.extend(pivot.bundle.branches().iter().map(Source::Branch)),
+            }
             match pivot.child {
                 Some(child) => at = child,
                 None => {
@@ -354,13 +440,104 @@ impl Trunk {
     /// over every pending branch. A step between merges (planning, a flush by reference, a
     /// split) costs no budget, and each is taken once, so a step ends. Returns the keys merged.
     pub fn step<F: BlockFile>(&mut self, store: &mut Store<F>, budget: u64) -> Result<u64, Error> {
+        self.views_unchecked = self.nodes.len();
         self.run(store, budget, true)
     }
 
     /// Runs the cascade in progress to its end, starting none: the pending branches then enter
     /// the root at the next step.
     pub fn finish_cascade<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
+        self.views_unchecked = self.nodes.len();
         self.run(store, u64::MAX, false).map(|_| ())
+    }
+
+    /// Whether a pivot bundle may want a view: one being built, or nodes not checked since the
+    /// trunk changed.
+    pub fn views_owed(&self) -> bool {
+        self.view_job.is_some() || self.views_unchecked > 0
+    }
+
+    /// Up to `budget` entries of view building, for the shard's idle time (SILK: deep work in the
+    /// time requests leave; docs/design/engine-structure.md §5, E6): the build in progress, if its
+    /// pivot's bundle is still the one it reads, else a check of up to `budget` nodes for a pivot
+    /// bundle of two runs or more with no view, whose build then starts. Returns the work done,
+    /// at least one while views are owed.
+    pub fn view_step<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        budget: u64,
+    ) -> Result<u64, Error> {
+        if let Some(job) = self.view_job.take() {
+            let done = {
+                let runs = self.bundle_of(job.node, job.pivot);
+                match runs {
+                    Some(runs) if job.build.reads(runs) => {
+                        let mut job = job;
+                        let (taken, done) = job.build.step(store, runs, budget)?;
+                        Some((job, taken, done))
+                    }
+                    _ => {
+                        job.build.abandon(store);
+                        self.stats.views_dropped = self.stats.views_dropped.saturating_add(1);
+                        None
+                    }
+                }
+            };
+            let mut work = 1u64;
+            if let Some((job, taken, done)) = done {
+                work = taken.max(1);
+                if done {
+                    let view = job.build.finish(store);
+                    if let Some(p) = self
+                        .nodes
+                        .get_mut(job.node)
+                        .and_then(|n| n.pivots.get_mut(job.pivot))
+                    {
+                        p.bundle.view = Some(view);
+                        self.stats.views_built = self.stats.views_built.saturating_add(1);
+                    }
+                } else {
+                    self.view_job = Some(job);
+                }
+            }
+            return Ok(work);
+        }
+        let mut checked = 0u64;
+        while self.views_unchecked > 0 && checked < budget.max(1) {
+            self.views_unchecked = self.views_unchecked.saturating_sub(1);
+            checked = checked.saturating_add(1);
+            let n = self.view_at.checked_rem(self.nodes.len()).unwrap_or(0);
+            self.view_at = n.saturating_add(1);
+            let Some(node) = self.nodes.get(n) else {
+                continue;
+            };
+            let wanting = node.pivots.iter().position(|p| {
+                let runs = p.bundle.branches().len();
+                (2..=MAX_VIEW_RUNS).contains(&runs) && p.bundle.view().is_none()
+            });
+            if let Some(i) = wanting {
+                let lo = node.pivots.get(i).map(|p| p.key.clone()).ok_or(corrupt())?;
+                let hi = Self::pivot_end(node, i);
+                let runs = self.bundle_of(n, i).ok_or(corrupt())?;
+                let build = Build::new(store, runs, &lo, hi.as_deref())?;
+                self.view_job = Some(ViewJob {
+                    node: n,
+                    pivot: i,
+                    build,
+                });
+                // The node again, for its other pivots.
+                self.view_at = n;
+                self.views_unchecked = self.views_unchecked.saturating_add(1);
+                break;
+            }
+        }
+        Ok(checked.max(1))
+    }
+
+    /// The branches of pivot `pivot` of node `node`, newest first; none when there is no such
+    /// pivot.
+    fn bundle_of(&self, node: usize, pivot: usize) -> Option<&[Branch]> {
+        Some(self.nodes.get(node)?.pivots.get(pivot)?.bundle.branches())
     }
 
     /// Times compactions' planning and finishing into [`TrunkStats`]: off by default.
@@ -420,7 +597,7 @@ impl Trunk {
             .map(|(key, child)| Pivot {
                 key,
                 child: Some(child),
-                bundle: Vec::new(),
+                bundle: Bundle::default(),
                 start: 0,
             })
             .collect();
@@ -552,8 +729,8 @@ impl Trunk {
                     Some(c) => put32(&mut blob, c)?,
                     None => blob.extend_from_slice(&ABSENT.to_le_bytes()),
                 }
-                put32(&mut blob, p.bundle.len())?;
-                for b in &p.bundle {
+                put32(&mut blob, p.bundle.branches().len())?;
+                for b in p.bundle.branches() {
                     b.encode(&mut blob)?;
                 }
             }
@@ -717,7 +894,7 @@ impl Trunk {
                 pivots.push(Pivot {
                     key,
                     child,
-                    bundle,
+                    bundle: Bundle::from(bundle),
                     start: 0,
                 });
             }
@@ -731,6 +908,7 @@ impl Trunk {
         if root >= nodes.len() {
             return Err(corrupt());
         }
+        let unchecked = nodes.len();
         Ok(Self {
             nodes,
             root,
@@ -744,6 +922,10 @@ impl Trunk {
             cascade: Vec::new(),
             returned: None,
             timed: false,
+            view_job: None,
+            // Views are not saved: every node is checked for a bundle wanting one after a load.
+            views_unchecked: unchecked,
+            view_at: 0,
         })
     }
 
@@ -804,7 +986,7 @@ impl Trunk {
         let pivot = self.node_mut(n)?.pivots.get_mut(i).ok_or(corrupt())?;
         pivot.start = covered;
         if let Some(b) = merged {
-            pivot.bundle.insert(0, b);
+            pivot.bundle.branches_mut().insert(0, b);
         }
         Ok(())
     }
@@ -835,8 +1017,10 @@ impl Trunk {
     ) -> Result<Option<Phase>, Error> {
         let node = self.node(n)?;
         let pivot = node.pivots.first().ok_or(corrupt())?;
-        let entries: u64 = pivot.bundle.iter().map(|b| b.count).sum();
-        if pivot.bundle.len() <= self.config.fanout && entries <= self.config.leaf_entries {
+        let entries: u64 = pivot.bundle.branches().iter().map(|b| b.count).sum();
+        if pivot.bundle.branches().len() <= self.config.fanout
+            && entries <= self.config.leaf_entries
+        {
             self.returned = Some(vec![(pivot.key.clone(), n)]);
             return Ok(None);
         }
@@ -844,12 +1028,13 @@ impl Trunk {
         // The extents the compaction's inputs hold, released once it replaces them.
         let extents: Vec<u64> = pivot
             .bundle
+            .branches()
             .iter()
             .flat_map(|b| b.extents.iter().copied())
             .collect();
         let job = Compaction::new(
             store,
-            &pivot.bundle,
+            pivot.bundle.branches(),
             &from,
             end.as_deref(),
             true,
@@ -890,6 +1075,7 @@ impl Trunk {
                 .first_mut()
                 .ok_or(corrupt())?
                 .bundle
+                .branches_mut()
                 .clear();
             return Ok(vec![(from, n)]);
         }
@@ -900,7 +1086,7 @@ impl Trunk {
             if j == 0 {
                 let node = self.node_mut(n)?;
                 let p = node.pivots.first_mut().ok_or(corrupt())?;
-                p.bundle = vec![branch];
+                p.bundle = Bundle::from(vec![branch]);
                 out.push((key, n));
             } else {
                 self.nodes.push(Node {
@@ -908,7 +1094,7 @@ impl Trunk {
                     pivots: vec![Pivot {
                         key: key.clone(),
                         child: None,
-                        bundle: vec![branch],
+                        bundle: Bundle::from(vec![branch]),
                         start: 0,
                     }],
                     inflight: Vec::new(),
@@ -936,15 +1122,18 @@ impl Trunk {
     fn flush_from(&mut self, n: usize, i: usize) -> Result<Option<Phase>, Error> {
         let fanout = self.config.fanout;
         let node = self.node(n)?;
-        let next = (i..node.pivots.len())
-            .find(|&j| node.pivots.get(j).is_some_and(|p| p.bundle.len() > fanout));
+        let next = (i..node.pivots.len()).find(|&j| {
+            node.pivots
+                .get(j)
+                .is_some_and(|p| p.bundle.branches().len() > fanout)
+        });
         let Some(j) = next else {
             self.returned = Some(self.split_node(n)?);
             return Ok(None);
         };
         let pivot = self.node_mut(n)?.pivots.get_mut(j).ok_or(corrupt())?;
         let child = pivot.child.ok_or(corrupt())?;
-        let bundle = std::mem::take(&mut pivot.bundle);
+        let bundle = pivot.bundle.take();
         self.stats.flushes = self.stats.flushes.saturating_add(1);
         // Oldest first into the child's in-flight list: the bundle is newest first.
         for b in bundle.into_iter().rev() {
@@ -975,7 +1164,7 @@ impl Trunk {
             .map(|(key, child)| Pivot {
                 key,
                 child: Some(child),
-                bundle: Vec::new(),
+                bundle: Bundle::default(),
                 start: node.inflight.len(),
             })
             .collect();
@@ -1070,7 +1259,7 @@ impl Trunk {
                 out.extend(bundle.iter().cloned());
             }
             for p in &node.pivots {
-                out.extend(p.bundle.iter().cloned());
+                out.extend(p.bundle.branches().iter().cloned());
             }
         }
         out

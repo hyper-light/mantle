@@ -96,7 +96,7 @@ fn main() {
         }
         let refs: Vec<&Branch> = branches.iter().collect();
         let t = Instant::now();
-        let view = View::build(&mut s, &refs, b"", None).unwrap();
+        let view = View::build(&mut s, &branches, b"", None).unwrap();
         let build_s = t.elapsed().as_secs_f64();
         let entries: u64 = branches.iter().map(|b| b.count).sum();
         let view_bytes = view.bytes();
@@ -111,7 +111,7 @@ fn main() {
             let from = key(rng.next() % space);
             rows.clear();
             let o = Instant::now();
-            view.scan(&mut s, &refs, &from, nexts, &mut rows, &mut next)
+            view.scan(&mut s, &branches, &from, nexts, &mut rows, &mut next)
                 .unwrap();
             lat.push(o.elapsed().as_nanos() as u64);
         }

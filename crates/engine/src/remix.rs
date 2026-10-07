@@ -58,7 +58,7 @@ impl View {
     /// [`Build`] run to its end.
     pub fn build<F: BlockFile>(
         store: &mut Store<F>,
-        runs: &[&Branch],
+        runs: &[Branch],
         lo: &[u8],
         hi: Option<&[u8]>,
     ) -> Result<Self, Error> {
@@ -67,8 +67,8 @@ impl View {
         let total: u64 = runs.iter().map(|b| b.count).sum();
         for _ in 0..=total {
             match job.step(store, runs, u64::MAX) {
-                Ok(true) => return Ok(job.finish(store)),
-                Ok(false) => {}
+                Ok((_, true)) => return Ok(job.finish(store)),
+                Ok((_, false)) => {}
                 Err(e) => {
                     job.abandon(store);
                     return Err(e);
@@ -152,7 +152,7 @@ impl View {
     pub fn scan<F: BlockFile>(
         &self,
         store: &mut Store<F>,
-        runs: &[&Branch],
+        runs: &[Branch],
         from: &[u8],
         limit: usize,
         out: &mut Rows,
@@ -199,7 +199,7 @@ impl Build {
     /// A build of the view of `runs` (newest first, at most 63) over `[lo, hi)`.
     pub fn new<F: BlockFile>(
         store: &mut Store<F>,
-        runs: &[&Branch],
+        runs: &[Branch],
         lo: &[u8],
         hi: Option<&[u8]>,
     ) -> Result<Self, Error> {
@@ -234,17 +234,19 @@ impl Build {
     }
 
     /// Whether `runs` are the runs this build reads: the same branches, in the same order.
-    pub fn reads(&self, runs: &[&Branch]) -> bool {
+    pub fn reads(&self, runs: &[Branch]) -> bool {
         self.roots.len() == runs.len() && self.roots.iter().zip(runs).all(|(&r, b)| r == b.root)
     }
 
-    /// Takes up to `budget` entries into the view; true once every entry in range is in it.
+    /// Takes up to `budget` entries into the view (a key's versions together, so a step may
+    /// pass it by fewer than the runs): the entries taken, and whether every entry in range is
+    /// now in it.
     pub fn step<F: BlockFile>(
         &mut self,
         store: &mut Store<F>,
-        runs: &[&Branch],
+        runs: &[Branch],
         budget: u64,
-    ) -> Result<bool, Error> {
+    ) -> Result<(u64, bool), Error> {
         if !self.reads(runs) {
             return Err(Error::InvalidArgument {
                 what: "a view build stepped over runs it was not started on",
@@ -266,7 +268,7 @@ impl Build {
                     self.view.selector_ends.push(self.view.selectors.len());
                     self.in_segment = 0;
                 }
-                return Ok(true);
+                return Ok((taken, true));
             };
             self.key.clear();
             self.key.extend_from_slice(least);
@@ -314,7 +316,7 @@ impl Build {
                 c.next(b, store)?;
             }
         }
-        Ok(false)
+        Ok((taken, false))
     }
 
     /// The view built, the cursors' pages and spans given back to `store`.
@@ -346,7 +348,8 @@ fn give_back<F: BlockFile>(store: &mut Store<F>, cursors: Vec<RunCursor>) {
     }
 }
 
-/// A walk of a view's keys in order: each key's newest version. One cursor a run, placed at its
+/// A walk of a view's keys in order: each key's newest version, deletions included. One cursor a
+/// run, placed at its
 /// segment's offset when a selector first names it and moved as the selectors name it; entries
 /// passed over (shadowed versions) are counted and skipped when the run is next read.
 #[derive(Debug)]
@@ -362,7 +365,8 @@ pub struct Walk {
 }
 
 impl Walk {
-    /// A walk at the first key at or past `from` whose newest version holds a value. The
+    /// A walk at the first key at or past `from`, at its newest version, a deletion too (a view
+    /// above older levels hides their versions with it). The
     /// segment is found by the anchors, then the entry by a binary search of the segment
     /// (Zhong et al. §3.2): the entry at `j` is in the run its selector names, at that run's
     /// offset moved on by the same selector's occurrences before `j`, so a probe reads one key.
@@ -371,7 +375,7 @@ impl Walk {
     pub fn seek<F: BlockFile>(
         view: &View,
         store: &mut Store<F>,
-        runs: &[&Branch],
+        runs: &[Branch],
         from: &[u8],
     ) -> Result<Self, Error> {
         let mut w = Self {
@@ -394,14 +398,7 @@ impl Walk {
             *b = occurrences(selectors, w.at, r);
         }
         w.settle(view, store, runs)?;
-        // Past a key whose newest version is a deletion: at most the view's entries.
-        for _ in 0..=view.entries() {
-            if !w.valid || w.op() == Op::Put {
-                return Ok(w);
-            }
-            w.step(view, store, runs)?;
-        }
-        Err(corrupt())
+        Ok(w)
     }
 
     /// The first entry of `selectors` (the segment's) whose key is at least `from`, by halving:
@@ -410,7 +407,7 @@ impl Walk {
         &self,
         view: &View,
         store: &mut Store<F>,
-        runs: &[&Branch],
+        runs: &[Branch],
         selectors: &[u8],
         from: &[u8],
         probe: &mut RunCursor,
@@ -463,7 +460,7 @@ impl Walk {
         &mut self,
         view: &View,
         store: &mut Store<F>,
-        runs: &[&Branch],
+        runs: &[Branch],
     ) -> Result<(), Error> {
         if !self.valid {
             return Ok(());
@@ -481,7 +478,7 @@ impl Walk {
         &mut self,
         view: &View,
         store: &mut Store<F>,
-        runs: &[&Branch],
+        runs: &[Branch],
     ) -> Result<(), Error> {
         for _ in 0..=view.entries() {
             let Some(selectors) = view.selectors_of(self.segment) else {
@@ -518,7 +515,7 @@ impl Walk {
         &mut self,
         view: &View,
         store: &mut Store<F>,
-        runs: &[&Branch],
+        runs: &[Branch],
     ) -> Result<(), Error> {
         let r = self.run;
         let b = runs.get(r).ok_or(corrupt())?;

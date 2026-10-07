@@ -541,7 +541,17 @@ impl Trunk {
         key: &[u8],
         value: &mut Vec<u8>,
     ) -> Result<Option<Op>, Error> {
-        let hash = crate::branch::filter::hash(key);
+        self.get_hashed(store, key, crate::branch::filter::hash(key), value)
+    }
+
+    /// [`Self::get`] of a key whose filter hash is `hash`.
+    pub fn get_hashed<F: BlockFile>(
+        &self,
+        store: &mut Store<F>,
+        key: &[u8],
+        hash: u64,
+        value: &mut Vec<u8>,
+    ) -> Result<Option<Op>, Error> {
         for b in self.pending.iter().rev() {
             if let Some(op) = b.get_hashed(store, key, hash, value)? {
                 return Ok(Some(op));

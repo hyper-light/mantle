@@ -15,6 +15,7 @@
 //! order, what a branch's builder takes.
 
 use crate::branch::Op;
+use crate::branch::filter::{Filter, Keys, hash};
 use crate::error::{Error, Malformed};
 use crate::util::coding::{get_varint32_ptr, put_varint32};
 use std::cmp::Ordering;
@@ -73,6 +74,11 @@ pub struct BTreeMem {
     /// remembered splice.
     last: Option<u32>,
     right: u32,
+    /// A filter of the keys inserted (RocksDB's `memtable_whole_key_filtering`): a get of a key
+    /// the memtable lacks, at 10 M keys about 95% of gets, answers by one probe instead of a
+    /// descent. Sized at each clear for the entries the last fill held, so a memtable's first
+    /// fill has none; a fill past that size only raises its false positives.
+    filter: Option<Filter>,
 }
 
 /// A key's head past its first `prefix` bytes ([`Node::prefix`]): the next 4 bytes, big-endian,
@@ -114,6 +120,7 @@ impl BTreeMem {
             len: 0,
             last: None,
             right: 0,
+            filter: None,
         })
     }
 
@@ -121,6 +128,11 @@ impl BTreeMem {
     /// shard reuses one memtable, where a new one each flush left the freed arenas dirty in the
     /// allocator (680 MB of them at 6 M entries, measured by vmmap on macOS).
     pub fn clear(&mut self) {
+        let keys = Keys::AtMost(u64::try_from(self.len).unwrap_or(u64::MAX).max(1));
+        match self.filter.as_mut() {
+            Some(f) => f.reset(keys),
+            None => self.filter = Some(Filter::new(keys)),
+        }
         self.arena.clear();
         self.nodes.clear();
         self.nodes.push(Node::new(true, 0));
@@ -232,6 +244,20 @@ impl BTreeMem {
         Err(lo)
     }
 
+    /// The newest entry for `key`, of filter hash `hash` ([`crate::branch::filter::hash`]): its
+    /// operation and value into `value`; none at once when the filter rules the key out.
+    pub fn get_hashed(
+        &self,
+        key: &[u8],
+        hash: u64,
+        value: &mut Vec<u8>,
+    ) -> Result<Option<Op>, Error> {
+        if self.filter.as_ref().is_some_and(|f| !f.may_contain(hash)) {
+            return Ok(None);
+        }
+        self.get(key, value)
+    }
+
     /// The newest entry for `key`: its operation and value into `value`.
     pub fn get(&self, key: &[u8], value: &mut Vec<u8>) -> Result<Option<Op>, Error> {
         let mut at = self.root;
@@ -286,6 +312,9 @@ impl BTreeMem {
         put_varint32(&mut self.arena, vlen);
         self.arena.extend_from_slice(key);
         self.arena.extend_from_slice(value);
+        if let Some(f) = self.filter.as_mut() {
+            f.insert(hash(key));
+        }
         let above = match self.last {
             None => true,
             Some(last) => key > self.key(last),
@@ -767,6 +796,36 @@ mod tests {
                 let mut first = None;
                 m.walk_some(&mut walk, 1, |k, _, _| { first = Some(k.to_vec()); Ok(()) }).unwrap();
                 proptest::prop_assert_eq!(first, oracle.range(past.clone()..).next().map(|(k, _)| k.clone()));
+            }
+        }
+    }
+
+    #[test]
+    fn a_filtered_get_answers_as_the_tree_does() {
+        use crate::branch::filter::hash;
+        let mut m = BTreeMem::new(1 << 22).unwrap();
+        // A first fill of 100 keys sizes the filter at the clear; the refill holds five times
+        // as many, past its size, so false positives rise but no key may be missed.
+        for n in 0..100u32 {
+            m.insert(&n.to_be_bytes(), Op::Put, b"v").unwrap();
+        }
+        m.clear();
+        let mut oracle = BTreeMap::new();
+        for n in (0..1_000u32).step_by(2) {
+            let v = n.to_le_bytes();
+            m.insert(&n.to_be_bytes(), Op::Put, &v).unwrap();
+            oracle.insert(n, v.to_vec());
+        }
+        let mut value = Vec::new();
+        for n in 0..1_000u32 {
+            let k = n.to_be_bytes();
+            let got = m.get_hashed(&k, hash(&k), &mut value).unwrap();
+            match oracle.get(&n) {
+                Some(v) => {
+                    assert_eq!(got, Some(Op::Put), "key {n}");
+                    assert_eq!(&value, v, "key {n}");
+                }
+                None => assert_eq!(got, None, "key {n}"),
             }
         }
     }

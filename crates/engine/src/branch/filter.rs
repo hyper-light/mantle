@@ -79,6 +79,16 @@ impl Filter {
         }
     }
 
+    /// Empties the filter for `keys`, as [`Self::new`] sizes it, keeping its allocation.
+    pub fn reset(&mut self, keys: Keys) {
+        let count = match keys {
+            Keys::Exactly(n) => blocks_for(n),
+            Keys::AtMost(n) => blocks_for(n).saturating_add(blocks_for(n) % 2),
+        };
+        self.blocks.clear();
+        self.blocks.resize(count, [0u64; BLOCK_WORDS]);
+    }
+
     /// Adds a key of hash `h`.
     pub fn insert(&mut self, h: u64) {
         let count = self.blocks.len();

@@ -535,14 +535,16 @@ impl<F: BlockFile> ShardDb<F> {
 
     /// The value `key` holds, into `value`; false when it holds none.
     pub fn get(&mut self, key: &[u8], value: &mut Vec<u8>) -> Result<bool, Error> {
-        let mut found = self.mem.get(key, value)?;
+        // The key's filter hash, once for the memtables and every branch on its path.
+        let hash = crate::branch::filter::hash(key);
+        let mut found = self.mem.get_hashed(key, hash, value)?;
         if found.is_none()
             && let Some(p) = &self.packing
         {
-            found = p.mem.get(key, value)?;
+            found = p.mem.get_hashed(key, hash, value)?;
         }
         if found.is_none() {
-            found = self.trunk.get(&mut self.store, key, value)?;
+            found = self.trunk.get_hashed(&mut self.store, key, hash, value)?;
         }
         Ok(found == Some(Op::Put))
     }

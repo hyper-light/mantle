@@ -1121,6 +1121,46 @@ impl Branch {
             .ok_or(corrupt(Malformed::TooLarge))
     }
 
+    /// The entries in tree page `page_no`, 0 for an index page.
+    fn count_of(&self, page_no: u64) -> Result<usize, Error> {
+        usize::try_from(page_no)
+            .ok()
+            .and_then(|p| self.counts.get(p))
+            .map(|&c| usize::from(c))
+            .ok_or(corrupt(Malformed::OutOfRange))
+    }
+
+    /// The position `k` entries past `(page_no, index)` in key order, by the tree pages' entry
+    /// counts alone, with no page read; none past the branch's last entry. Index pages, whose
+    /// count is 0, are passed over.
+    pub fn position_after(
+        &self,
+        (page_no, index): (u64, usize),
+        k: usize,
+    ) -> Result<Option<(u64, usize)>, Error> {
+        let (mut page, mut at, mut left) = (page_no, index, k);
+        // Each turn moves a page on: at most the tree's pages.
+        for _ in 0..=self.counts.len() {
+            let n = self.count_of(page)?;
+            if at.checked_add(left).is_some_and(|i| i < n) {
+                return Ok(Some((page, at.saturating_add(left))));
+            }
+            left = left.saturating_sub(n.saturating_sub(at));
+            at = 0;
+            // The next leaf: the next page with entries.
+            loop {
+                page = page.saturating_add(1);
+                if page >= self.filter_start {
+                    return Ok(None);
+                }
+                if self.count_of(page)? > 0 {
+                    break;
+                }
+            }
+        }
+        Err(corrupt(Malformed::CountMismatch))
+    }
+
     /// A run cursor at the first entry at or past `from`, found by one descent.
     pub fn run_at<F: BlockFile>(
         &self,
@@ -1241,29 +1281,69 @@ impl RunCursor {
         self.next_leaf(branch, store)
     }
 
-    /// The next leaf page after this one, before the branch's filter pages; none leaves the
-    /// cursor invalid. Index pages between leaves are passed over, at most the tree's pages.
+    /// Moves `k` entries on in `branch`, by its pages' entry counts: only the page the cursor
+    /// lands on is read, none it passes. Past the last entry the cursor is invalid.
+    pub fn advance<F: BlockFile>(
+        &mut self,
+        branch: &Branch,
+        store: &mut Store<F>,
+        k: usize,
+    ) -> Result<(), Error> {
+        if !self.valid || k == 0 {
+            return Ok(());
+        }
+        match branch.position_after((self.page_no, self.index), k)? {
+            Some((page, index)) => self.land(branch, store, page, index),
+            None => {
+                self.valid = false;
+                Ok(())
+            }
+        }
+    }
+
+    /// Reads leaf `page` unless it is the one held, and loads entry `index`.
+    fn land<F: BlockFile>(
+        &mut self,
+        branch: &Branch,
+        store: &mut Store<F>,
+        page: u64,
+        index: usize,
+    ) -> Result<(), Error> {
+        if page != self.page_no {
+            let address = branch.page_address(store, page)?;
+            self.page.clear();
+            store.read_page_ahead(&mut self.span, address, &mut self.page)?;
+            let view = View::new(&self.page)?;
+            if view.kind != LEAF {
+                return Err(corrupt(Malformed::CountMismatch));
+            }
+            self.page_no = page;
+            self.n = view.n;
+        }
+        self.index = index;
+        self.load()
+    }
+
+    /// The next leaf page after this one: the next page whose entry count is not 0, so index
+    /// pages are passed over unread; none before the filter's pages leaves the cursor invalid.
     fn next_leaf<F: BlockFile>(
         &mut self,
         branch: &Branch,
         store: &mut Store<F>,
     ) -> Result<(), Error> {
-        loop {
-            self.page_no = self.page_no.saturating_add(1);
-            if self.page_no >= branch.filter_start {
+        let mut page = self.page_no;
+        // At most the tree's pages.
+        for _ in 0..=branch.counts.len() {
+            page = page.saturating_add(1);
+            if page >= branch.filter_start {
                 self.valid = false;
                 return Ok(());
             }
-            let address = branch.page_address(store, self.page_no)?;
-            self.page.clear();
-            store.read_page_ahead(&mut self.span, address, &mut self.page)?;
-            let view = View::new(&self.page)?;
-            if view.kind == LEAF {
-                self.n = view.n;
-                self.index = 0;
-                return self.load();
+            if branch.count_of(page)? > 0 {
+                return self.land(branch, store, page, 0);
             }
         }
+        Err(corrupt(Malformed::CountMismatch))
     }
 
     fn load(&mut self) -> Result<(), Error> {

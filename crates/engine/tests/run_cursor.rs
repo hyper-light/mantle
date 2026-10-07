@@ -88,6 +88,7 @@ proptest! {
         e in entries(),
         from in prop::collection::vec(any::<u8>(), 0..40),
         pick in any::<prop::sample::Index>(),
+        k in 0usize..600,
     ) {
         let mut s = store(3);
         let b = build(&mut s, &e);
@@ -110,6 +111,20 @@ proptest! {
             }
             c.give_back(&mut s);
             prop_assert_eq!(&rest[..], &read[at..]);
+            // `k` entries on, by the counts alone and by a cursor's one move: where `k` steps land.
+            let want = got.get(at + k).map(|(_, p)| *p);
+            prop_assert_eq!(b.position_after((page_no, index), k).unwrap(), want);
+            let mut c = b.run_from(&mut s, page_no, index).unwrap();
+            c.advance(&b, &mut s, k).unwrap();
+            match got.get(at + k) {
+                Some((entry, p)) => {
+                    prop_assert!(c.valid());
+                    prop_assert_eq!(c.position(), *p);
+                    prop_assert_eq!(&(c.key().to_vec(), c.op(), c.value().to_vec()), entry);
+                }
+                None => prop_assert!(!c.valid()),
+            }
+            c.give_back(&mut s);
         }
     }
 }
@@ -127,4 +142,32 @@ fn a_branch_of_many_leaves_has_index_pages_between_them() {
     let got = walk(&mut s, &b, b"");
     assert_eq!(got.len(), e.len());
     assert!(got.iter().zip(e.keys()).all(|((g, _), k)| &g.0 == k));
+}
+
+#[test]
+fn position_arithmetic_lands_where_steps_do_from_every_position_by_every_count() {
+    // Every position of a branch of many leaves and index pages, every count up to past several
+    // leaves: each page's end is landed on exactly, from every entry before it.
+    let mut s = store(5);
+    let e: Entries = (0u32..20_000)
+        .map(|n| {
+            (
+                n.to_be_bytes().to_vec(),
+                (Op::Put, vec![9u8; 60 + (n % 50) as usize]),
+            )
+        })
+        .collect();
+    let b = build(&mut s, &e);
+    assert!(b.height >= 3, "height {}", b.height);
+    let positions: Vec<(u64, usize)> = walk(&mut s, &b, b"").into_iter().map(|(_, p)| p).collect();
+    assert_eq!(positions.len(), e.len());
+    for (j, &p) in positions.iter().enumerate() {
+        for k in 0..300 {
+            assert_eq!(
+                b.position_after(p, k).unwrap(),
+                positions.get(j + k).copied(),
+                "from {p:?} by {k}"
+            );
+        }
+    }
 }

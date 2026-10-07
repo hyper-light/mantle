@@ -410,3 +410,50 @@ fn views_rebuilt_over_several_added_runs_read_exactly() {
     }
     check_scan(&mut db, &oracle, 0, KEYS - 1, 11);
 }
+
+/// Views written with a checkpoint are read back with the store: the reopened shard holds as many,
+/// loaded, not rebuilt, and every read and scan through them is exact; the store holds exactly the
+/// extents the engine names, the views' among them.
+#[test]
+fn views_saved_with_a_checkpoint_are_loaded_on_reopen() {
+    let align = Alignment::new(4096).unwrap();
+    let file = SimFile::new(align, Alignment::new(512).unwrap(), 29).unwrap();
+    let (mut db, oracle) = run_on(file, 16, None, true);
+    db.maintain(u64::MAX).unwrap();
+    let views = db.views();
+    assert!(views > 0);
+    db.checkpoint(OPS).unwrap();
+    db.check_references().unwrap();
+    let (file, landed) = db.into_file();
+    landed.unwrap();
+    let (mut db, applied) = ShardDb::open(file, STORE, MEM, TRUNK).unwrap();
+    assert_eq!(applied, OPS);
+    assert_eq!(db.views(), views);
+    let (_, trunk, _) = db.stats();
+    assert_eq!(trunk.views_built, 0, "{trunk:?}");
+    db.check_references().unwrap();
+    for k in 0..KEYS {
+        check(&mut db, &oracle, k);
+    }
+    for (a, b, limit) in [(0, KEYS - 1, 1), (5, KEYS / 2, 9), (KEYS / 4, KEYS - 1, 50)] {
+        check_scan(&mut db, &oracle, a, b, limit);
+    }
+    // Written again with another checkpoint, the store still holds exactly what is named.
+    db.checkpoint(OPS + 1).unwrap();
+    db.check_references().unwrap();
+    // Writes that change the bundles drop their saved views; the next checkpoint releases the
+    // extents only the last image named, so the store again holds exactly what is named.
+    let mut oracle = oracle;
+    for i in 0..OPS / 2 {
+        let k = (i * 7919) % KEYS;
+        let v = format!("r{i}").into_bytes();
+        db.put(&key(k), &v).unwrap();
+        oracle.insert(k, Some(v));
+    }
+    db.maintain(u64::MAX).unwrap();
+    db.checkpoint(OPS + 2).unwrap();
+    db.check_references().unwrap();
+    for k in 0..KEYS {
+        check(&mut db, &oracle, k);
+    }
+}

@@ -261,6 +261,9 @@ impl<F: BlockFile> ShardDb<F> {
         for &e in self.trunk.image_extents() {
             once(e)?;
         }
+        for &e in self.trunk.view_extents() {
+            once(e)?;
+        }
         for b in self.trunk.branches() {
             for &e in &b.extents {
                 once(e)?;
@@ -735,6 +738,11 @@ impl<F: BlockFile> ShardDb<F> {
     /// The bytes the trunk's branches hold in memory: filters, leaf indexes, page counts.
     pub fn memory(&self) -> (usize, usize, usize) {
         self.trunk.memory()
+    }
+
+    /// The trunk's bundles that have a REMIX view now.
+    pub fn views(&self) -> usize {
+        self.trunk.views()
     }
 
     /// The trunk's shape: height, nodes, leaves.

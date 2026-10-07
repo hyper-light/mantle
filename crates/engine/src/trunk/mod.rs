@@ -317,7 +317,11 @@ impl Trunk {
         start: bool,
     ) -> Result<u64, Error> {
         let mut used = 0u64;
-        while used < budget {
+        // A finished frame's result is taken by the frame above it in the same step, at no
+        // cost to the budget: a settled or split node's new siblings are reachable only once
+        // its parent splices them in, and a step ending between the two left keys a read could
+        // not reach (found at fill pace by `tests/shard_db_paced.rs`).
+        while used < budget || self.returned.is_some() {
             let Some(frame) = self.cascade.pop() else {
                 if !start || self.pending.is_empty() {
                     break;

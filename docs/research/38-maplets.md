@@ -87,6 +87,70 @@ branches; false matches track `load · 2^−r` (775 against 781 expected at one 
 - What it wins: 18× fewer false passes (each a page read) and, once filters no longer fit the
   budget, one page a bundle where filters read one a branch.
 
-**Decision pending with the owner:** not on the read path at mantle's measured sizes; the
-filters, range filters and views (about 6 B/key, 600 MB at 100M keys) first counted in the
-memory budget; maplets revisited where a shard's filters exceed it.
+That first layout's cost was its own instructions, not the idea: §5–§6 rebuild it.
+
+## 5. The maplet that routes as fast as a filter: vector quotient blocks
+
+Source, read in full: **[VQF]** Pandey, Conway, Durie, Bender, Farach-Colton, Johnson, *Vector
+Quotient Filters: Overcoming the Time/Space Trade-Off in Filter Design*, SIGMOD '21, DOI
+10.1145/3448016.3452841, §3–§6 (the authors of the maplets work).
+
+- **Block** [VQF §3.2, §6.1]: a mini quotient filter in a cache line: `b` buckets, `s` slots of
+  `r`-bit fingerprints in bucket order, and `b + s` metadata bits giving each bucket's count in
+  unary. For 8-bit fingerprints `s = 48`, `b = 80` (128 metadata bits); for 16-bit, `s = 28`,
+  `b = 36`. Space is minimized at `s/b = ln 2` and flat near it (Fig. 3).
+- **Two choices** [VQF §3.1, Thm. 1, Berenbrink et al.]: an item hashes to blocks `b1`, `b2` and
+  goes to the emptier; with high probability no block exceeds `n/m + O(ln ln n)`, so blocks fill
+  to 93% (Fig. 4) with no kicking.
+- **Lookup** [VQF Alg. 2, §3.3]: select on the metadata gives the bucket's run, one vector
+  compare checks its slots; two cache lines, the second independent of the first.
+- **Rate and space** [VQF §5]: `ε ≤ 2 (s/b) 2^−r`; `S = (r + b/s + 1) / α` bits an item.
+
+What mantle takes, as a maplet:
+- **8-bit slots, the value inside**: a slot is the remainder and the branch's age, `r = 8 − v`.
+  One branch: `r = 8`, ε ≤ 0.47% (filters: 0.96% measured). Eight: `r = 5`, ε ≤ 3.75% (eight
+  filters: 4.76%). `S ≈ (8 + 1.67) / α` ≈ 10.4 bits at α = 0.93, about the filters' 10.
+- **Matching by words**: a slot's remainder matched against a byte pattern in `u64` words, as the
+  page cache's index matches tags (util/incmap.rs, hashbrown's portable group); the value read
+  from each matching byte.
+- **Built offline, both choices in one page**: bundles are immutable, so a maplet is built once,
+  greedily by two choices, its second block chosen within the first's page so a lookup reads one
+  page cold. A page that overflows rebuilds with more blocks: the build's outcome, not a chance.
+- **Merging needs the hashes**: a two-choice block keeps the remainder and the bucket but not
+  which choice placed the item, so a maplet is not rebuilt from itself at a new size. Each
+  branch keeps its keys' hashes, sorted, 4 bytes a key in its own pages (about 3% of its data),
+  and a bundle's maplet is built from its branches' lists by a sequential merge, never reading
+  their data — the decoupling maplets promise [SIGMOD abstract; arXiv §4].
+
+## 6. Built for the CPU: one block, one select, an index in memory (benches/maplet.rs)
+
+The two-choice VQF blocks (§5) measured about 330 instructions a route: two blocks, two selects
+over 128 bits of dense metadata each, and a select that looped in a byte (aarch64 has no PDEP).
+What brought it down, each step measured:
+- **Broadword select** (Vigna, WEA 2008; sux `select64`): byte counts summed by one
+  multiplication and the byte found by one comparison in every byte; the bit within the byte by
+  the same comparison over its bits spread a byte each (no table: the lints forbid its
+  indexing). The SuRF trie keeps its halving select: on its sparse words the early exits
+  measured faster (benches/surf.rs, 16-byte keys: point p50 84 ns against 125 with broadword).
+- **One block a key**: bundles are immutable, so a maplet is a static quotient filter, buckets
+  32 to a block in hash order; no second choice to read.
+- **One select a run**: the run's start is the highest one below its end, a leading-zero count.
+- **The block's place from memory**: an index word a block (page, header length, offset), about
+  a bit a key, so a lookup reads its index word and its block's line, not a chain through a page
+  table (that chain alone measured about 130 cycles in L2).
+
+Instructions and cycles a route, best of five, everything in memory (2026-10-07):
+
+| bundle | absent: filters / maplet | present: filters / maplet | absent passing | bytes/key |
+|---|---|---|---|---|
+| 8 × 580k | 189 ins 259 cyc / 183 ins **117 cyc** | 136 / 153 cyc vs 209 / 167 | 4.76% / **1.07%** | 1.25 / 1.38 |
+| 8 × 70k | 189 / 194 cyc vs 183 / **71** | 136 / 94 vs 208 / 120 | 4.72% / **1.05%** | 1.25 / 1.39 |
+| 3 × 580k | 107 / 82 vs 188 / 95 | 95 / 26 vs 210 / 121 | 1.93% / **0.86%** | 1.25 / 1.30 |
+| 1 × 580k | 73 / 37 vs 185 / 107 | 84 / 11 vs 200 / 114 | 0.96% / **0.22%** | 1.25 / 1.38 |
+
+(Each figure includes the bench loop's own 60–80 instructions.) A maplet routes an absent key
+through a bundle of eight 2.2–2.7× faster than its eight filters, a present one about as fast,
+with a quarter of their false passes. A single branch's Bloom probe is one line and a few
+instructions and stays ahead. So bundles of several branches take a maplet and single branches
+keep a blocked Bloom filter, both counted in the memory budget; the crossover near three
+branches is set by measuring gets once both are wired in.

@@ -16,8 +16,9 @@
 use std::hint::black_box;
 use std::time::Instant;
 
+use hyper_measure::usage;
 use mantle_engine::branch::filter::{Filter, Keys};
-use mantle_engine::maplet::{self, Plan, Shape, Writer};
+use mantle_engine::maplet::{self, Builder, Shape};
 
 const ROUNDS: usize = 5;
 const PAYLOAD: usize = 4076;
@@ -34,14 +35,38 @@ fn hashes(n: usize, seed: u64) -> Vec<u64> {
         .collect()
 }
 
-fn best(ops: usize, mut f: impl FnMut() -> u64) -> f64 {
-    let mut most = f64::MAX;
+/// The best of `ROUNDS` passes of `f`, as ns, instructions and cycles an operation: instructions
+/// retired do not grow with a busy machine as time does (hyper-measure's usage counters).
+fn best(ops: usize, mut f: impl FnMut() -> u64) -> (f64, f64, f64) {
+    let mut most = (f64::MAX, f64::MAX, f64::MAX);
     for _ in 0..ROUNDS {
+        let u0 = usage::this().ok();
         let t = Instant::now();
         black_box(f());
-        most = most.min(t.elapsed().as_nanos() as f64 / ops as f64);
+        let ns = t.elapsed().as_nanos() as f64 / ops as f64;
+        let u1 = usage::this().ok();
+        let per = |a: Option<u64>, b: Option<u64>| {
+            a.zip(b)
+                .map_or(f64::NAN, |(a, b)| b.saturating_sub(a) as f64 / ops as f64)
+        };
+        let ins = per(
+            u0.as_ref().and_then(|u| u.instructions),
+            u1.as_ref().and_then(|u| u.instructions),
+        );
+        let cyc = per(
+            u0.as_ref().and_then(|u| u.cycles),
+            u1.as_ref().and_then(|u| u.cycles),
+        );
+        most = (most.0.min(ns), most.1.min(ins), most.2.min(cyc));
     }
     most
+}
+
+fn show(name: &str, filters: (f64, f64, f64), maplet: (f64, f64, f64)) {
+    println!(
+        "{name}: filters {:.1} ns {:.0} ins {:.0} cyc | maplet {:.1} ns {:.0} ins {:.0} cyc",
+        filters.0, filters.1, filters.2, maplet.0, maplet.1, maplet.2
+    );
 }
 
 fn main() {
@@ -67,37 +92,28 @@ fn main() {
         })
         .collect();
     let filter_bytes: usize = filters.iter().map(Filter::bytes).sum();
-    // The bundle's maplet, its values the branches' ages, the store's width for a full bundle.
+    // The bundle's maplet, its values the branches' ages, built from its keys' 32-bit hashes.
     let total = (per * branches) as u64;
-    let hb = maplet::hash_bits(total);
     let vb = maplet::ceil_log2(branches as u64);
-    let bare = Plan::new(hb, vb, total).unwrap();
-    let _ = bare;
-    let fp_of = |h: u64| h >> (64 - hb);
-    let mut entries: Vec<(u64, u8)> = keys
+    let mut entries: Vec<(u32, u8)> = keys
         .iter()
         .enumerate()
         .flat_map(|(b, ks)| {
             ks.iter()
-                .map(move |&h| (fp_of(h), u8::try_from(b).unwrap()))
+                .map(move |&h| (maplet::hash32(h), u8::try_from(b).unwrap()))
         })
         .collect();
     entries.sort_unstable();
-    let mut plan = Plan::new(hb, vb, total).unwrap();
-    for &(fp, _) in &entries {
-        plan.count(fp).unwrap();
-    }
-    let shape: Shape = plan.shape(PAYLOAD).unwrap();
     let mut pages: Vec<Vec<u8>> = Vec::new();
     let mut emit = |p: &[u8]| {
         pages.push(p.to_vec());
         Ok(())
     };
-    let mut w = Writer::new(&plan, shape, PAYLOAD);
-    for &(fp, v) in &entries {
-        w.add(fp, v, &mut emit).unwrap();
+    let mut b = Builder::new(maplet::bucket_bits(total), vb, PAYLOAD).unwrap();
+    for &(h, v) in &entries {
+        b.add(h, v, &mut emit).unwrap();
     }
-    w.close(&mut emit).unwrap();
+    let shape: Shape = b.close(&mut emit).unwrap();
     drop(entries);
     let maplet_bytes = pages.len() * PAYLOAD;
     // Queries: half present (a random branch's key), half absent.
@@ -126,7 +142,10 @@ fn main() {
     };
     let probe_maplet = |hs: &[u64]| -> u64 {
         hs.iter()
-            .map(|&h| maplet::lookup(&pages[shape.page_of(h) as usize], &shape, h).unwrap())
+            .map(|&h| {
+                let p = shape.probe(h).unwrap();
+                maplet::lookup(&pages[p.page as usize], &shape, &p).unwrap()
+            })
             .fold(0, |a, m| a ^ m)
     };
     let fp_filters = absent
@@ -135,15 +154,14 @@ fn main() {
         .count();
     let fp_maplet = absent
         .iter()
-        .filter(|&&h| maplet::lookup(&pages[shape.page_of(h) as usize], &shape, h).unwrap() != 0)
+        .filter(|&&h| { let p = shape.probe(h).unwrap(); maplet::lookup(&pages[p.page as usize], &shape, &p).unwrap() } != 0)
         .count();
     println!(
-        "bundle of {branches} branches x {per} keys: shape hash {} buckets {} values {} pages {} ({} buckets a page)",
-        shape.hash_bits,
-        shape.bucket_bits,
+        "bundle of {branches} branches x {per} keys: values {} bits, buckets 2^{}, pages {}, load {:.3}",
         shape.value_bits,
+        shape.bucket_bits,
         shape.pages,
-        1u64 << shape.page_bucket_bits
+        total as f64 / (1u64 << shape.bucket_bits) as f64
     );
     println!(
         "bytes/key: filters {:.2}, maplet {:.2}",
@@ -155,14 +173,14 @@ fn main() {
         fp_filters as f64 * 100.0 / ops as f64,
         fp_maplet as f64 * 100.0 / ops as f64
     );
-    println!(
-        "present ns/route: filters {:.1}, maplet {:.1}",
+    show(
+        "present route",
         best(ops, || probe_filters(&present)),
-        best(ops, || probe_maplet(&present))
+        best(ops, || probe_maplet(&present)),
     );
-    println!(
-        "absent ns/route: filters {:.1}, maplet {:.1}",
+    show(
+        "absent route",
         best(ops, || probe_filters(&absent)),
-        best(ops, || probe_maplet(&absent))
+        best(ops, || probe_maplet(&absent)),
     );
 }

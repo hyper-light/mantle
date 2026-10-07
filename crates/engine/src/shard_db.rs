@@ -231,8 +231,9 @@ impl<F: BlockFile> ShardDb<F> {
         self.store.attach(issuer, batches)
     }
 
-    /// The store's file, the engine's work done.
-    pub fn into_file(self) -> F {
+    /// The store's file, the engine's work done, and whether every write handed to the device's
+    /// issuer landed (`Store::into_file`).
+    pub fn into_file(self) -> (F, Result<(), Error>) {
         self.store.into_file()
     }
 

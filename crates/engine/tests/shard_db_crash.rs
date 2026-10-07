@@ -98,12 +98,12 @@ fn run(
             None => db.delete(&key(k)),
         };
         if done.is_err() {
-            return (acked, Err(db.into_file()));
+            return (acked, Err(db.into_file().0));
         }
         let applied = i + 1;
         if applied.is_multiple_of(EVERY) {
             if db.checkpoint(applied).is_err() {
-                return (acked, Err(db.into_file()));
+                return (acked, Err(db.into_file().0));
             }
             acked = applied;
         }
@@ -134,7 +134,7 @@ fn every_crash_point_recovers_a_checkpoint_whose_state_reads_back() {
     let (acked, done) = run(db, 0, 0);
     let db = done.ok().unwrap();
     assert_eq!(acked, OPS - OPS % EVERY);
-    let file = db.into_file();
+    let file = db.into_file().0;
     let stats = file.stats().unwrap();
     let ops = stats.writes + stats.syncs;
     let (mut db, applied) = ShardDb::open(file, STORE, MEM, TRUNK).unwrap();

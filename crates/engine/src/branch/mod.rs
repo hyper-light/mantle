@@ -124,6 +124,10 @@ pub struct Branch {
     /// and never held in memory: what a bundle's maplet is merged from without reading the
     /// branch's entries (research/38 §5).
     pub hashes_bytes: u64,
+    /// Gets that asked its filter since it was built or loaded: its visits, which with its
+    /// entries set the false-positive rate its filter's memory is worth (research/39 §2).
+    /// Not part of its descriptor.
+    pub probes: u64,
 }
 
 fn corrupt(why: Malformed) -> Error {
@@ -746,6 +750,7 @@ impl Builder {
             range: self.range_filter.ok_or(corrupt(Malformed::CountMismatch))?,
             hashes_bytes: u64::try_from(self.hashes.len().saturating_mul(4))
                 .map_err(|_| corrupt(Malformed::TooLarge))?,
+            probes: 0,
         });
         store.give_lists(crate::store::Lists {
             extents: self.extents,
@@ -1114,6 +1119,7 @@ impl Branch {
                 range,
                 range_bytes,
                 hashes_bytes,
+                probes: 0,
             },
             at,
         ))

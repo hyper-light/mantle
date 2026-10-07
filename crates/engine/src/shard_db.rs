@@ -639,6 +639,12 @@ impl<F: BlockFile> ShardDb<F> {
         self.cycle_ops
     }
 
+    /// The trunk's filters as gets use them, against Monkey's allocation of the same bits
+    /// (research/39).
+    pub fn filter_plan(&self) -> crate::trunk::FilterPlan {
+        self.trunk.filter_plan()
+    }
+
     /// Whether a region is still being brought down to a smaller share (`trim`): until it is,
     /// the regions may hold more than the budget by what it has left to give back.
     pub fn trimming(&self) -> bool {

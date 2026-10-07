@@ -48,3 +48,18 @@ are RocksDB's default, not data-derived, and the filters sit outside the memory 
 2. Visits `v_j` counted per branch on gets; each branch's rate `p_j = λ·n_j/v_j`.
 3. The filters as a region of the memory tuner, `λ` set by its budget; filters resized from
    their hash lists in idle time.
+
+## 5. Measured (benches/shard_db.rs, 2026-10-07)
+
+Branches count the gets that ask their filters (`Branch::probes`); `Trunk::filter_plan` prices
+the live filters against Monkey's allocation of rates by entries over visits. 10M keys, settled,
+2.9M gets, uniform and skewed reads alike:
+
+| | today | Monkey, same bits | Monkey, same false positives |
+|---|---|---|---|
+| filter bits a key (in all) | 23.96 | 23.96 | 11.54 |
+| false positives a get | 0.0039 | under 10^−5 | 0.0039 |
+
+The filters take 24 bits a key, not 10: a compaction sizes its filter for the most entries it
+may write (`Keys::AtMost`), and `Filter::fit` only halves; and keys written at several levels
+count once a branch. Allocated by visits, today's false positives need 48% of today's bits.

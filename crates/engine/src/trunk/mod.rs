@@ -256,8 +256,23 @@ pub struct Trunk {
     maplet_job: Option<MapletJob>,
     maplets_unchecked: usize,
     maplet_at: usize,
-    /// Gets' filter routes through bundles of several branches ([`Tally`]).
+    /// Gets' filter routes through bundles of several branches ([`Tally`]), and gets.
     routes: Tally,
+    gets: u64,
+}
+
+/// The filters' false positives a get meets now, against those Monkey's allocation of the same
+/// bits gives (research/39 §2): rates in proportion to entries over visits. Both from the gets
+/// seen and the branches live.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FilterPlan {
+    pub gets: u64,
+    pub branches: usize,
+    pub bits: f64,
+    pub now: f64,
+    pub best: f64,
+    /// The bits Monkey's allocation needs for today's false positives a get.
+    pub bits_for_now: f64,
 }
 
 /// Gets' routes through bundles of several branches by their filters: the branches such bundles
@@ -585,6 +600,7 @@ impl Trunk {
             maplets_unchecked: 0,
             maplet_at: 0,
             routes: Tally::default(),
+            gets: 0,
         })
     }
 
@@ -635,16 +651,19 @@ impl Trunk {
         found
     }
 
-    /// [`Self::get_hashed`], tallying the filters it probes in bundles of several branches.
+    /// [`Self::get_hashed`], tallying the filters it probes in bundles of several branches and
+    /// counting each filter's probes on its branch ([`Branch::probes`]).
     fn find<F: BlockFile>(
-        &self,
+        &mut self,
         store: &mut Store<F>,
         key: &[u8],
         hash: u64,
         value: &mut Vec<u8>,
         tally: &mut Tally,
     ) -> Result<Option<Op>, Error> {
-        for b in self.pending.iter().rev() {
+        self.gets = self.gets.saturating_add(1);
+        for b in self.pending.iter_mut().rev() {
+            b.probes = b.probes.saturating_add(1);
             if let Some(op) = b.get_hashed(store, key, hash, value)? {
                 return Ok(Some(op));
             }
@@ -652,18 +671,29 @@ impl Trunk {
         let mut at = self.root;
         // Every level down is a node's child: at most the trunk's node count of steps.
         for _ in 0..self.nodes.len() {
-            let node = self.node(at)?;
+            let node = self.nodes.get_mut(at).ok_or(corrupt())?;
             let p = Self::pivot_of(node, key);
-            let pivot = node.pivots.get(p).ok_or(corrupt())?;
-            for bundle in node.inflight.get(pivot.start..).unwrap_or(&[]).iter().rev() {
-                for b in bundle {
+            let Node {
+                pivots, inflight, ..
+            } = node;
+            let pivot = pivots.get_mut(p).ok_or(corrupt())?;
+            for bundle in inflight
+                .get_mut(pivot.start..)
+                .unwrap_or_default()
+                .iter_mut()
+                .rev()
+            {
+                for b in bundle.iter_mut() {
+                    b.probes = b.probes.saturating_add(1);
                     if let Some(op) = b.get_hashed(store, key, hash, value)? {
                         return Ok(Some(op));
                     }
                 }
             }
-            let branches = pivot.bundle.branches();
-            match &pivot.bundle.maplet {
+            let Bundle {
+                branches, maplet, ..
+            } = &mut pivot.bundle;
+            match maplet {
                 // One lookup names the branches that may hold the key, by age (the oldest 0):
                 // those are read, newest first, without their filters.
                 Some(m) => {
@@ -687,10 +717,11 @@ impl Trunk {
                             .branches
                             .saturating_add(u64::try_from(branches.len()).unwrap_or(u64::MAX));
                     }
-                    for b in branches {
+                    for b in branches.iter_mut() {
                         if several {
                             tally.probes = tally.probes.saturating_add(1);
                         }
+                        b.probes = b.probes.saturating_add(1);
                         if let Some(op) = b.get_hashed(store, key, hash, value)? {
                             return Ok(Some(op));
                         }
@@ -703,6 +734,85 @@ impl Trunk {
             }
         }
         Err(corrupt())
+    }
+
+    /// The filters as gets have used them since the trunk was made or loaded, against Monkey's
+    /// allocation of the same bits ([`FilterPlan`]; research/39 §2).
+    pub fn filter_plan(&self) -> FilterPlan {
+        let gets = self.gets.max(1) as f64;
+        let ln2sq = std::f64::consts::LN_2 * std::f64::consts::LN_2;
+        // Each live branch once: (entries, filter bits, visits a get).
+        let mut live: Vec<(f64, f64, f64)> = Vec::new();
+        let mut add = |b: &Branch| {
+            let bits = u64::try_from(b.filter.bytes())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(8);
+            live.push((b.count.max(1) as f64, bits as f64, b.probes as f64 / gets));
+        };
+        self.pending.iter().for_each(&mut add);
+        for node in &self.nodes {
+            node.inflight.iter().flatten().for_each(&mut add);
+            node.pivots
+                .iter()
+                .flat_map(|p| p.bundle.branches())
+                .for_each(&mut add);
+        }
+        let bits: f64 = live.iter().map(|l| l.1).sum();
+        let now: f64 = live
+            .iter()
+            .map(|&(n, b, v)| v * (-(b / n) * ln2sq).exp())
+            .sum();
+        // The rate each branch gets for multiplier lambda: lambda · n / v, at most 1 (no filter),
+        // and the bits that takes.
+        let spend = |lambda: f64| -> (f64, f64) {
+            live.iter().fold((0.0, 0.0), |(fp, used), &(n, _, v)| {
+                let p = if v > 0.0 {
+                    (lambda * n / v).min(1.0)
+                } else {
+                    1.0
+                };
+                (fp + v * p, used + n * (-p.ln()).max(0.0) / ln2sq)
+            })
+        };
+        // The bits spent fall as lambda rises: bisect lambda's bit pattern (positive floats order
+        // as their bits do) for the largest lambda spending no more than today's bits: at most
+        // 64 halvings.
+        let (mut lo, mut hi) = (f64::MIN_POSITIVE.to_bits(), f64::MAX.to_bits());
+        for _ in 0..u64::BITS {
+            if lo >= hi {
+                break;
+            }
+            let mid = lo.saturating_add(hi.saturating_sub(lo) / 2);
+            if spend(f64::from_bits(mid)).1 > bits {
+                lo = mid.saturating_add(1);
+            } else {
+                hi = mid;
+            }
+        }
+        let best = spend(f64::from_bits(hi)).0;
+        // The false positives also fall as lambda falls: the largest lambda whose rates meet
+        // today's, and the bits it spends.
+        let (mut lo, mut hi) = (f64::MIN_POSITIVE.to_bits(), f64::MAX.to_bits());
+        for _ in 0..u64::BITS {
+            if lo >= hi {
+                break;
+            }
+            let mid = lo.saturating_add(hi.saturating_sub(lo) / 2);
+            if spend(f64::from_bits(mid)).0 <= now {
+                lo = mid.saturating_add(1);
+            } else {
+                hi = mid;
+            }
+        }
+        let bits_for_now = spend(f64::from_bits(lo.saturating_sub(1))).1;
+        FilterPlan {
+            gets: self.gets,
+            branches: live.len(),
+            bits,
+            now,
+            best,
+            bits_for_now,
+        }
     }
 
     /// The leaf segment holding `key`: the branches a read of a key in it probes, newest first,
@@ -1658,6 +1768,7 @@ impl Trunk {
             maplets_unchecked: unchecked,
             maplet_at: 0,
             routes: Tally::default(),
+            gets: 0,
         })
     }
 

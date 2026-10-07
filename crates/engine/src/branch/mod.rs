@@ -84,6 +84,11 @@ pub struct Branch {
     pub filter_start: u64,
     pub filter_pages: u32,
     pub filter_bytes: u64,
+    /// The entries in each of its tree pages, in page order, 0 for an index page: a run
+    /// cursor moves by entries with them, reading only the page it lands on (REMIX's runs,
+    /// as RemixDB's metadata block; docs/design/engine-structure.md §5, E6). Written after the
+    /// filter in its pages.
+    pub counts: Vec<u16>,
 }
 
 fn corrupt(why: Malformed) -> Error {
@@ -246,6 +251,8 @@ pub struct Builder {
     rest: Vec<u8>,
     /// A written page's first key, for its entry in the level above; the buffer reused.
     first: Vec<u8>,
+    /// Each tree page's entries as it is written, 0 for an index page ([`Branch::counts`]).
+    counts: Vec<u16>,
     count: u64,
     payload: Vec<u8>,
     capacity: usize,
@@ -277,6 +284,7 @@ impl Builder {
     /// A builder in `store`, for `keys` entries: pages of the store's payload capacity, which
     /// offsets of 16 bits must reach.
     pub fn new<F: BlockFile>(store: &mut Store<F>, keys: filter::Keys) -> Result<Self, Error> {
+        let (extents, counts) = store.take_lists();
         let capacity = store.page_capacity();
         if capacity > usize::from(u16::MAX) {
             return Err(Error::InvalidArgument {
@@ -286,10 +294,11 @@ impl Builder {
         Ok(Self {
             levels: vec![Page::with_capacity(capacity)],
             extent: None,
-            extents: Vec::new(),
+            extents,
             last: Vec::new(),
             rest: Vec::new(),
             first: Vec::new(),
+            counts,
             count: 0,
             payload: Vec::with_capacity(capacity),
             capacity,
@@ -407,7 +416,14 @@ impl Builder {
         first.clear();
         first.extend_from_slice(page.key(0));
         let total = page.total;
+        let entries = if level == 0 { page.len() } else { 0 };
         let address = self.page(store)?;
+        // The page just issued is the tree's next: its number is the counts so far.
+        if u64::try_from(self.counts.len()).ok() != self.issued.checked_sub(1) {
+            return Err(corrupt(Malformed::CountMismatch));
+        }
+        self.counts
+            .push(u16::try_from(entries).map_err(|_| corrupt(Malformed::TooLarge))?);
         store.queue_page(&mut self.run, address, &payload)?;
         self.payload = payload;
         if let Some(page) = self.levels.get_mut(level) {
@@ -466,7 +482,10 @@ impl Builder {
                     root,
                     height: u8::try_from(level).map_err(|_| corrupt(Malformed::TooLarge))?,
                     filter_start: self.issued,
-                    total: self.filter.bytes(),
+                    total: self
+                        .filter
+                        .bytes()
+                        .saturating_add(self.counts.len().saturating_mul(2)),
                     at: 0,
                     pages: 0,
                 });
@@ -513,7 +532,7 @@ impl Builder {
         while written < pages && s.at < s.total {
             chunk.clear();
             let end = s.at.saturating_add(self.capacity).min(s.total);
-            self.filter.copy_bytes(s.at..end, &mut chunk);
+            self.stream_bytes(s.at..end, &mut chunk);
             let address = self.page(store)?;
             store.queue_page(&mut self.run, address, &chunk)?;
             s.at = end;
@@ -531,6 +550,21 @@ impl Builder {
 
     /// The branch, its tree and filter written; refused before. The run's buffer goes back to
     /// the store's pool for the next writer.
+    /// Bytes `range` of what follows the tree in the branch's pages: the filter's bytes, then
+    /// each tree page's entry count, two bytes each.
+    fn stream_bytes(&self, range: std::ops::Range<usize>, out: &mut Vec<u8>) {
+        let fb = self.filter.bytes();
+        if range.start < fb {
+            self.filter.copy_bytes(range.start..range.end.min(fb), out);
+        }
+        let from = range.start.max(fb).saturating_sub(fb);
+        let to = range.end.saturating_sub(fb);
+        for at in from..to {
+            let count = self.counts.get(at / 2).copied().unwrap_or(0).to_le_bytes();
+            out.push(count.get(at % 2).copied().unwrap_or(0));
+        }
+    }
+
     pub fn into_branch<F: BlockFile>(self, store: &mut Store<F>) -> Result<Branch, Error> {
         let s = self
             .sealed
@@ -539,16 +573,22 @@ impl Builder {
                 what: "a branch taken before its filter was written",
             })?;
         store.give_run(self.run);
-        Ok(Branch {
+        let filter_bytes =
+            u64::try_from(self.filter.bytes()).map_err(|_| corrupt(Malformed::TooLarge))?;
+        let branch = Ok(Branch {
             root: s.root,
             height: s.height,
             count: self.count,
-            extents: self.extents,
+            // Exactly sized: the working lists go back to the store for the next builder.
+            extents: self.extents.as_slice().to_vec(),
             filter: self.filter,
             filter_start: s.filter_start,
             filter_pages: s.pages,
-            filter_bytes: u64::try_from(s.total).map_err(|_| corrupt(Malformed::TooLarge))?,
-        })
+            filter_bytes,
+            counts: self.counts.as_slice().to_vec(),
+        });
+        store.give_lists((self.extents, self.counts));
+        branch
     }
 }
 
@@ -998,11 +1038,21 @@ impl Branch {
             let address = store.address(extent, page)?;
             store.read_page(address, &mut filter)?;
         }
-        if u64::try_from(filter.len()).ok() != Some(filter_bytes) {
+        // The filter's bytes, then two bytes for each tree page's entry count.
+        let fb = usize::try_from(filter_bytes).map_err(|_| corrupt(Malformed::TooLarge))?;
+        let tree = usize::try_from(filter_start).map_err(|_| corrupt(Malformed::TooLarge))?;
+        if Some(filter.len()) != tree.checked_mul(2).and_then(|c| c.checked_add(fb)) {
             return Err(corrupt(Malformed::CountMismatch));
         }
+        let (filter_part, count_part) = filter.split_at(fb);
+        let counts: Vec<u16> = count_part
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .collect();
         let filter =
-            filter::Filter::from_bytes(&filter).ok_or(corrupt(Malformed::CountMismatch))?;
+            filter::Filter::from_bytes(filter_part).ok_or(corrupt(Malformed::CountMismatch))?;
         Ok((
             Self {
                 root,
@@ -1013,6 +1063,7 @@ impl Branch {
                 filter_start,
                 filter_pages,
                 filter_bytes,
+                counts,
             },
             at,
         ))

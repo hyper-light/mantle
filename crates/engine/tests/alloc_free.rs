@@ -65,10 +65,21 @@ fn build(s: &mut Store<DeviceFile>, first: u64, step: u64) -> Branch {
 fn a_builder_adds_entries_without_allocating_once_its_pages_have_grown() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = store(&dir);
-    // Extent buffers come from the store's pool: a first branch's written runs fill it.
-    build(&mut s, 0, 1);
-    let mut b = Builder::new(&mut s, Keys::Exactly(ENTRIES)).unwrap();
+    // A first branch of the same shape fills the store's pools: extent buffers from its written
+    // runs, and the builder's working lists grown to a branch this size.
     let value = [7u8; 40];
+    let mut warm = Builder::new(&mut s, Keys::Exactly(ENTRIES)).unwrap();
+    for n in 0..ENTRIES {
+        warm.add(&mut s, &key(n), Op::Put, &value).unwrap();
+    }
+    let warm = warm.finish(&mut s).unwrap();
+    // Its extents freed by a checkpoint, as a compaction's inputs are: the next branch reuses
+    // them, so the store's own tables do not grow (a store that grows its file grows them).
+    for &e in &warm.extents {
+        s.release(e).unwrap();
+    }
+    s.checkpoint(None, 1).unwrap();
+    let mut b = Builder::new(&mut s, Keys::Exactly(ENTRIES)).unwrap();
     for n in 0..ENTRIES / 2 {
         b.add(&mut s, &key(n), Op::Put, &value).unwrap();
     }
@@ -77,15 +88,17 @@ fn a_builder_adds_entries_without_allocating_once_its_pages_have_grown() {
         b.add(&mut s, &key(n), Op::Put, &value).unwrap();
     }
     let counts = alloc::end();
-    // No allocation at all. The one reallocation is the branch's own list of extents doubling
-    // as it reaches its fifth: the list is the branch's output, grown geometrically.
+    // No allocation and no reallocation: the builder's working lists (its extents, its pages'
+    // entry counts) come from the store's pool, grown by the first branch, and the branch is
+    // given exactly sized copies when it is sealed.
     assert_eq!(
         (counts.allocations, counts.reallocations),
-        (0, 1),
+        (0, 0),
         "{counts:?}"
     );
     let branch = b.finish(&mut s).unwrap();
     assert!(branch.extents.len() > 4, "{}", branch.extents.len());
+    assert!(branch.counts.len() > 32, "{}", branch.counts.len());
 }
 
 #[test]

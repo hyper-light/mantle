@@ -248,6 +248,7 @@ fn main() {
         let mut next = Vec::new();
         let mut keys_read = 0u64;
         lat.clear();
+        let (_, _, io_seek) = db.stats();
         let mark = begin();
         let t = Instant::now();
         for _ in 0..seeks {
@@ -261,6 +262,14 @@ fn main() {
         }
         let s = t.elapsed().as_secs_f64();
         costs("seekrandom", seeks, &mark);
+        let (_, _, io3) = db.stats();
+        println!(
+            "seekrandom io reads/seek {:.2} pages/seek {:.2} cache hits/seek {:.2} span cache hits/seek {:.2}",
+            (io3.reads - io_seek.reads) as f64 / seeks as f64,
+            (io3.pages_read - io_seek.pages_read) as f64 / seeks as f64,
+            (io3.cache_hits - io_seek.cache_hits) as f64 / seeks as f64,
+            (io3.span_cache_hits - io_seek.span_cache_hits) as f64 / seeks as f64
+        );
         report("seekrandom", &mut lat);
         println!(
             "seekrandom {seeks} {:.0} {:.3} nexts {seek_nexts} keys read {keys_read}",

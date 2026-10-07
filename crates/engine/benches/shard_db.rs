@@ -257,6 +257,25 @@ impl Slow {
 /// (inside pack or trunk work), in pack and trunk work besides their I/O, in stalls, and the
 /// rest (the memtable, a rotation); and how many made a write call, a read call, or neither.
 fn attribute_tail(lat: &[u64], slow: &mut [Slow]) {
+    // The five slowest puts, each with what it did.
+    slow.sort_unstable_by_key(|s| std::cmp::Reverse(s.ns));
+    for s in slow.iter().take(5) {
+        println!(
+            "worst put {:.2} us: writes {} ({:.2} us) reads {} ({:.2} us) pack {:.2} trunk {:.2} (plan {:.2} finish {:.2} pack finish {:.2}) stall {:.2} rotated {}",
+            s.ns as f64 / 1000.0,
+            s.writes,
+            s.write_ns as f64 / 1000.0,
+            s.reads,
+            s.read_ns as f64 / 1000.0,
+            s.pack_ns as f64 / 1000.0,
+            s.trunk_ns as f64 / 1000.0,
+            s.plan_ns as f64 / 1000.0,
+            s.finish_ns as f64 / 1000.0,
+            s.pack_finish_ns as f64 / 1000.0,
+            s.stall_ns as f64 / 1000.0,
+            s.rotated,
+        );
+    }
     let mut sorted = lat.to_vec();
     sorted.sort_unstable();
     for (name, q) in [("p99.9", 0.999), ("p99.99", 0.9999)] {

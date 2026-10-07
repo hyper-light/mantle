@@ -24,7 +24,8 @@ pub mod filter;
 pub mod merge;
 
 use crate::error::{Error, Malformed};
-use crate::fst::trie::Trie;
+use crate::fst::packed::MAX_WIDTH;
+use crate::fst::trie::{Trie, TrieBuilder};
 use crate::store::{Run, Span, Store};
 use hyper_block::block::BlockFile;
 use std::cmp::Ordering;
@@ -259,11 +260,9 @@ pub struct Builder {
     first: Vec<u8>,
     /// Each tree page's entries as it is written, 0 for an index page ([`Branch::counts`]).
     counts: Vec<u16>,
-    /// Each leaf's separator as it is written, its page number, and the index built of them at
-    /// the seal, encoded ([`Branch::index`]).
-    separators: Vec<u8>,
-    separator_ends: Vec<usize>,
-    leaf_pages: Vec<u32>,
+    /// Each leaf's separator to its page number, added as the leaf is written, and the index
+    /// built of them at the seal, encoded ([`Branch::index`]).
+    separators: TrieBuilder,
     index: Vec<u8>,
     index_trie: Option<Trie>,
     /// The last key of the last leaf written.
@@ -300,6 +299,8 @@ impl Builder {
     /// offsets of 16 bits must reach.
     pub fn new<F: BlockFile>(store: &mut Store<F>, keys: filter::Keys) -> Result<Self, Error> {
         let lists = store.take_lists();
+        let mut separators = lists.separators;
+        separators.reset(MAX_WIDTH)?;
         let capacity = store.page_capacity();
         if capacity > usize::from(u16::MAX) {
             return Err(Error::InvalidArgument {
@@ -314,9 +315,7 @@ impl Builder {
             rest: Vec::new(),
             first: Vec::new(),
             counts: lists.counts,
-            separators: lists.separators,
-            separator_ends: lists.separator_ends,
-            leaf_pages: lists.leaf_pages,
+            separators,
             index: lists.index,
             index_trie: None,
             prev_last: Vec::new(),
@@ -449,24 +448,24 @@ impl Builder {
         if level == 0 {
             // The leaf's separator: the shortest prefix of its first key above the last leaf's
             // last key, the empty key for the first leaf.
-            if !self.leaf_pages.is_empty() {
+            let mut cut = 0usize;
+            if !self.separators.is_empty() {
                 let lcp = self
                     .prev_last
                     .iter()
                     .zip(first.iter())
                     .take_while(|(a, b)| a == b)
                     .count();
-                let cut = lcp.saturating_add(1).min(first.len());
-                self.separators
-                    .extend_from_slice(first.get(..cut).ok_or(corrupt(Malformed::TooLarge))?);
+                cut = lcp.saturating_add(1).min(first.len());
             }
-            self.separator_ends.push(self.separators.len());
             let page_no = self
                 .issued
                 .checked_sub(1)
                 .ok_or(corrupt(Malformed::CountMismatch))?;
-            self.leaf_pages
-                .push(u32::try_from(page_no).map_err(|_| corrupt(Malformed::TooLarge))?);
+            self.separators.add(
+                first.get(..cut).ok_or(corrupt(Malformed::TooLarge))?,
+                u32::try_from(page_no).map_err(|_| corrupt(Malformed::TooLarge))?,
+            )?;
             if let Some(page) = self.levels.first() {
                 self.prev_last.clear();
                 self.prev_last
@@ -624,17 +623,7 @@ impl Builder {
 
     /// The index of the leaves' separators, built and encoded at the seal.
     fn build_index(&mut self) -> Result<(), Error> {
-        let mut keys = Vec::with_capacity(self.separator_ends.len());
-        let mut start = 0usize;
-        for &end in &self.separator_ends {
-            keys.push(
-                self.separators
-                    .get(start..end)
-                    .ok_or(corrupt(Malformed::TooLarge))?,
-            );
-            start = end;
-        }
-        let trie = Trie::build(&keys, &self.leaf_pages)?;
+        let trie = self.separators.finish()?;
         self.index.clear();
         trie.encode(&mut self.index);
         self.index_trie = Some(trie);
@@ -670,8 +659,6 @@ impl Builder {
             extents: self.extents,
             counts: self.counts,
             separators: self.separators,
-            separator_ends: self.separator_ends,
-            leaf_pages: self.leaf_pages,
             index: self.index,
         });
         branch

@@ -15,7 +15,8 @@
 
 use std::ops::ControlFlow;
 
-use super::bits::Bits;
+use super::bits::{Bits, Grow};
+use super::packed::{MAX_WIDTH, Packed, width_of};
 use crate::error::{Error, Malformed};
 
 fn corrupt() -> Error {
@@ -48,8 +49,9 @@ fn before(bits: &Bits, p: usize) -> usize {
 pub struct Trie {
     dense: Dense,
     sparse: Sparse,
-    /// The dense levels' values in node order, then the sparse levels'.
-    values: Vec<u32>,
+    /// The dense levels' values in node order, then the sparse levels', at the bits the
+    /// largest needs.
+    values: Packed,
 }
 
 /// The upper levels: a node is 256 bits of each bitmap.
@@ -83,100 +85,185 @@ enum Node {
 }
 
 /// One level of the trie as the builder fills it.
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 struct Level {
     labels: Vec<u8>,
-    has_child: Vec<bool>,
-    louds: Vec<bool>,
-    /// The key each label ends, if it ends one.
-    ends: Vec<Option<usize>>,
-    /// Each node's own key, if its path is one.
-    prefix: Vec<Option<usize>>,
+    has_child: Grow,
+    louds: Grow,
+    /// A bit a node: whether its path is itself a key.
+    prefix: Grow,
+    /// The level's values in node order: a node's own key's, then its labels' that end keys.
+    values: Packed,
 }
 
-impl Trie {
-    /// The trie of `keys` (strictly ascending) with `values`, one a key.
-    pub fn build(keys: &[&[u8]], values: &[u32]) -> Result<Self, Error> {
-        Self::build_at(keys, values, None)
+impl Level {
+    /// Empties the level, keeping its buffers, its values to be `width` bits.
+    fn reset(&mut self, width: u32) -> Result<(), Error> {
+        self.labels.clear();
+        self.has_child.clear();
+        self.louds.clear();
+        self.prefix.clear();
+        self.values.reset(width)
     }
 
-    /// [`Self::build`] with the dense part cut at `cutoff` levels, or where the ratio puts it.
-    fn build_at(keys: &[&[u8]], values: &[u32], cutoff: Option<usize>) -> Result<Self, Error> {
-        if keys.len() != values.len() || keys.windows(2).any(|w| matches!(w, [a, b] if a >= b)) {
+    /// Adds `key`'s label at depth `d`, the first of a new node when `first`, with `value` when
+    /// the label ends the key.
+    fn push(&mut self, key: &[u8], d: usize, first: bool, value: u32) -> Result<(), Error> {
+        let last = d.saturating_add(1) == key.len();
+        self.labels.push(key.get(d).copied().unwrap_or(0));
+        self.has_child.push(!last);
+        self.louds.push(first);
+        if last {
+            self.values.push(value)?;
+        }
+        Ok(())
+    }
+}
+
+/// Builds a trie of keys given in strictly ascending order, each with a value of at most a
+/// width of bits, one pass and no key held but the last. Its levels keep their buffers when it
+/// is reset, so a builder used again for a trie no larger allocates nothing as keys are added.
+#[derive(Clone, Debug, Default)]
+pub struct TrieBuilder {
+    levels: Vec<Level>,
+    /// Levels in use; those past it are kept for their buffers.
+    depth: usize,
+    width: u32,
+    prev: Vec<u8>,
+    keys: usize,
+    /// The largest value given: the trie's values take the bits it needs.
+    max: u32,
+}
+
+impl TrieBuilder {
+    /// A builder for values of at most `width` bits.
+    pub fn new(width: u32) -> Result<Self, Error> {
+        let mut b = Self::default();
+        b.reset(width)?;
+        Ok(b)
+    }
+
+    /// Empties the builder for another trie, its values to be `width` bits, its buffers kept.
+    pub fn reset(&mut self, width: u32) -> Result<(), Error> {
+        if width > MAX_WIDTH {
             return Err(Error::InvalidArgument {
-                what: "a trie's keys not strictly ascending, or not one value a key",
+                what: "trie values wider than 32 bits",
             });
         }
-        let mut levels: Vec<Level> = Vec::new();
-        let level = |levels: &mut Vec<Level>, d: usize| {
-            while levels.len() <= d {
-                levels.push(Level::default());
-            }
-        };
+        // Each level is emptied as it comes back into use.
+        self.width = width;
+        self.depth = 0;
+        self.prev.clear();
+        self.keys = 0;
+        self.max = 0;
         // The root: a node with no labels yet.
-        level(&mut levels, 0);
-        if let Some(l) = levels.get_mut(0) {
-            l.prefix.push(None);
+        self.level(0)?.prefix.push(false);
+        Ok(())
+    }
+
+    /// The keys added.
+    pub fn len(&self) -> usize {
+        self.keys
+    }
+
+    /// Whether no key has been added.
+    pub fn is_empty(&self) -> bool {
+        self.keys == 0
+    }
+
+    /// Level `d`, the levels down to it in use.
+    fn level(&mut self, d: usize) -> Result<&mut Level, Error> {
+        while self.depth <= d {
+            if self.levels.len() <= self.depth {
+                self.levels.push(Level::default());
+            }
+            let width = self.width;
+            self.levels
+                .get_mut(self.depth)
+                .ok_or(corrupt())?
+                .reset(width)?;
+            self.depth = self.depth.saturating_add(1);
         }
-        let mut prev: Option<&[u8]> = None;
-        for (i, &key) in keys.iter().enumerate() {
-            let lcp = prev.map_or(0, |p| p.iter().zip(key).take_while(|(a, b)| a == b).count());
-            let extends = prev.is_some_and(|p| lcp == p.len());
-            if key.is_empty() {
-                // The empty key sorts first: the root's own.
-                if let Some(slot) = levels.get_mut(0).and_then(|l| l.prefix.get_mut(0)) {
-                    *slot = Some(i);
-                }
-                prev = Some(key);
-                continue;
-            }
-            if extends
-                && let Some(p) = prev
-                && !p.is_empty()
-            {
-                // The previous key is a prefix of this one: its last label goes on, and the
-                // node it now leads to holds it as its own key.
-                let d = p.len().saturating_sub(1);
-                let l = levels.get_mut(d).ok_or(corrupt())?;
-                if let Some(h) = l.has_child.last_mut() {
-                    *h = true;
-                }
-                let ended = l.ends.last_mut().and_then(Option::take);
-                level(&mut levels, lcp);
-                let l = levels.get_mut(lcp).ok_or(corrupt())?;
-                l.prefix.push(ended);
-                Self::push(l, key, lcp, i, true);
-            } else if lcp == 0 && levels.first().is_some_and(|l| l.labels.is_empty()) {
-                // The root's first label.
-                let l = levels.get_mut(0).ok_or(corrupt())?;
-                Self::push(l, key, 0, i, true);
-            } else {
-                // A new label in the node the previous key's branch at this level is in.
-                level(&mut levels, lcp);
-                let l = levels.get_mut(lcp).ok_or(corrupt())?;
-                Self::push(l, key, lcp, i, false);
-            }
-            for d in lcp.saturating_add(1)..key.len() {
-                level(&mut levels, d);
-                let l = levels.get_mut(d).ok_or(corrupt())?;
-                l.prefix.push(None);
-                Self::push(l, key, d, i, true);
-            }
-            prev = Some(key);
+        self.levels.get_mut(d).ok_or(corrupt())
+    }
+
+    /// Adds `key`, greater than every key added, with `value`.
+    pub fn add(&mut self, key: &[u8], value: u32) -> Result<(), Error> {
+        if self.keys > 0 && key <= self.prev.as_slice() {
+            return Err(Error::InvalidArgument {
+                what: "a trie's keys not strictly ascending",
+            });
         }
-        let cutoff = cutoff.unwrap_or_else(|| Self::cutoff(&levels));
-        Self::assemble(&levels, values, cutoff)
+        if width_of(value) > self.width {
+            return Err(Error::InvalidArgument {
+                what: "a trie value wider than its width",
+            });
+        }
+        let first_key = self.keys == 0;
+        self.keys = self.keys.checked_add(1).ok_or(corrupt())?;
+        self.max = self.max.max(value);
+        if key.is_empty() {
+            // The empty key sorts first: the root's own.
+            let root = self.level(0)?;
+            root.prefix.set(0, true);
+            return root.values.push(value);
+        }
+        let lcp = if first_key {
+            0
+        } else {
+            self.prev
+                .iter()
+                .zip(key)
+                .take_while(|(a, b)| a == b)
+                .count()
+        };
+        if !first_key && lcp == self.prev.len() && !self.prev.is_empty() {
+            // The previous key is a prefix of this one: its last label goes on, and the node
+            // it now leads to holds it as its own key, its value the level's last.
+            let d = self.prev.len().saturating_sub(1);
+            let l = self.level(d)?;
+            l.has_child.set_last(true);
+            let ended = l.values.pop().ok_or(corrupt())?;
+            let l = self.level(lcp)?;
+            l.prefix.push(true);
+            l.values.push(ended)?;
+            l.push(key, lcp, true, value)?;
+        } else {
+            // A new label in the node the previous key's branch at this level is in, or the
+            // root's first.
+            let l = self.level(lcp)?;
+            let first = lcp == 0 && l.labels.is_empty();
+            l.push(key, lcp, first, value)?;
+        }
+        for d in lcp.saturating_add(1)..key.len() {
+            let l = self.level(d)?;
+            l.prefix.push(false);
+            l.push(key, d, true, value)?;
+        }
+        self.prev.clear();
+        self.prev.extend_from_slice(key);
+        Ok(())
+    }
+
+    /// The trie of the keys added, its dense part cut where the ratio puts it.
+    pub fn finish(&self) -> Result<Trie, Error> {
+        self.finish_at(self.cutoff())
+    }
+
+    /// The levels in use.
+    fn used(&self) -> &[Level] {
+        self.levels.get(..self.depth).unwrap_or(&[])
     }
 
     /// The deepest level the dense part may reach: the largest `l` whose levels above it, dense,
     /// take at most 1/64 of the sparse levels from it down (Zhang et al. §2.4).
-    fn cutoff(levels: &[Level]) -> usize {
+    fn cutoff(&self) -> usize {
         let dense = |l: &Level| l.prefix.len().saturating_mul(DENSE_NODE_BITS);
         let sparse = |l: &Level| l.labels.len().saturating_mul(SPARSE_LABEL_BITS);
-        let mut below: usize = levels.iter().map(sparse).sum();
+        let mut below: usize = self.used().iter().map(sparse).sum();
         let mut above = 0usize;
         let mut cut = 0usize;
-        for (l, level) in levels.iter().enumerate() {
+        for (l, level) in self.used().iter().enumerate() {
             above = above.saturating_add(dense(level));
             below = below.saturating_sub(sparse(level));
             if above.saturating_mul(DENSE_RATIO) <= below {
@@ -188,93 +275,98 @@ impl Trie {
         cut
     }
 
-    /// Adds `key`'s label at depth `d` to level `l`: the first of a new node when `first`.
-    fn push(l: &mut Level, key: &[u8], d: usize, i: usize, first: bool) {
-        let last = d.saturating_add(1) == key.len();
-        l.labels.push(key.get(d).copied().unwrap_or(0));
-        l.has_child.push(!last);
-        l.louds.push(first);
-        l.ends.push(if last { Some(i) } else { None });
-    }
-
-    /// Levels above `cutoff` dense, the rest sparse, each breadth first, and the values in node
-    /// order.
-    fn assemble(levels: &[Level], values: &[u32], cutoff: usize) -> Result<Self, Error> {
-        let mut d_labels = Vec::new();
-        let mut d_child = Vec::new();
-        let mut d_prefix = Vec::new();
+    /// Levels above `cutoff` dense, the rest sparse, each breadth first; the values, in node
+    /// order level by level, at the bits the largest needs.
+    fn finish_at(&self, cutoff: usize) -> Result<Trie, Error> {
+        let mut d_labels = Grow::default();
+        let mut d_child = Grow::default();
+        let mut d_prefix = Grow::default();
         let mut labels = Vec::new();
-        let mut has_child = Vec::new();
-        let mut louds = Vec::new();
-        let mut prefix = Vec::new();
-        let mut ordered = Vec::with_capacity(values.len());
+        let mut has_child = Grow::default();
+        let mut louds = Grow::default();
+        let mut prefix = Grow::default();
+        let mut values = Packed::new(width_of(self.max))?;
         let mut dense_children = 0usize;
         let mut dense_values = 0usize;
-        for (depth, l) in levels.iter().enumerate() {
-            let dense = depth < cutoff;
-            // Node by node: its own key's value, then its labels' that end keys.
-            let mut at = 0usize;
-            for node_key in &l.prefix {
-                let base = d_labels.len();
-                if dense {
-                    d_labels.resize(base.saturating_add(256), false);
-                    d_child.resize(base.saturating_add(256), false);
-                    d_prefix.push(node_key.is_some());
-                } else {
-                    prefix.push(node_key.is_some());
-                }
-                if let Some(k) = node_key {
-                    ordered.push(*values.get(*k).ok_or(corrupt())?);
-                }
-                let mut first = true;
-                while at < l.labels.len() && (first || !l.louds.get(at).copied().unwrap_or(true)) {
-                    let label = l.labels.get(at).copied().ok_or(corrupt())?;
-                    let goes_on = l.has_child.get(at).copied().ok_or(corrupt())?;
-                    if dense {
+        for (depth, l) in self.used().iter().enumerate() {
+            if depth < cutoff {
+                let mut at = 0usize;
+                for node in 0..l.prefix.len() {
+                    let base = d_labels.len();
+                    let next = base.checked_add(256).ok_or(corrupt())?;
+                    d_labels.grow_to(next);
+                    d_child.grow_to(next);
+                    d_prefix.push(l.prefix.get(node));
+                    // The node's labels: the first, then each not starting another node.
+                    let mut first = true;
+                    while at < l.labels.len() && (first || !l.louds.get(at)) {
+                        let label = l.labels.get(at).copied().ok_or(corrupt())?;
+                        let goes_on = l.has_child.get(at);
                         let pos = base.saturating_add(usize::from(label));
-                        if let Some(b) = d_labels.get_mut(pos) {
-                            *b = true;
-                        }
-                        if let Some(b) = d_child.get_mut(pos) {
-                            *b = goes_on;
-                        }
+                        d_labels.set(pos, true);
+                        d_child.set(pos, goes_on);
                         dense_children = dense_children.saturating_add(usize::from(goes_on));
-                    } else {
-                        labels.push(label);
-                        has_child.push(goes_on);
-                        louds.push(first);
+                        first = false;
+                        at = at.saturating_add(1);
                     }
-                    first = false;
-                    if let Some(Some(k)) = l.ends.get(at) {
-                        ordered.push(*values.get(*k).ok_or(corrupt())?);
-                    }
-                    at = at.saturating_add(1);
+                }
+            } else {
+                labels.extend_from_slice(&l.labels);
+                for i in 0..l.labels.len() {
+                    has_child.push(l.has_child.get(i));
+                    louds.push(l.louds.get(i));
+                }
+                for node in 0..l.prefix.len() {
+                    prefix.push(l.prefix.get(node));
                 }
             }
-            if dense {
-                dense_values = ordered.len();
+            for i in 0..l.values.len() {
+                values.push(l.values.get(i).ok_or(corrupt())?)?;
+            }
+            if depth < cutoff {
+                dense_values = values.len();
             }
         }
-        if ordered.len() != values.len() {
+        if values.len() != self.keys {
             return Err(corrupt());
         }
-        Ok(Self {
+        Ok(Trie {
             dense: Dense {
-                labels: Bits::new(&d_labels, DENSE_BLOCK)?,
-                has_child: Bits::new(&d_child, DENSE_BLOCK)?,
                 nodes: d_prefix.len(),
-                prefix: Bits::new(&d_prefix, DENSE_BLOCK)?,
+                labels: Bits::from_grow(d_labels, DENSE_BLOCK)?,
+                has_child: Bits::from_grow(d_child, DENSE_BLOCK)?,
+                prefix: Bits::from_grow(d_prefix, DENSE_BLOCK)?,
                 children: dense_children,
                 values: dense_values,
             },
             sparse: Sparse {
                 labels,
-                has_child: Bits::new(&has_child, SPARSE_BLOCK)?,
-                louds: Bits::new(&louds, SPARSE_BLOCK)?,
-                prefix: Bits::new(&prefix, SPARSE_BLOCK)?,
+                has_child: Bits::from_grow(has_child, SPARSE_BLOCK)?,
+                louds: Bits::from_grow(louds, SPARSE_BLOCK)?,
+                prefix: Bits::from_grow(prefix, SPARSE_BLOCK)?,
             },
-            values: ordered,
+            values,
         })
+    }
+}
+
+impl Trie {
+    /// The trie of `keys` (strictly ascending) with `values`, one a key.
+    pub fn build(keys: &[&[u8]], values: &[u32]) -> Result<Self, Error> {
+        Self::builder(keys, values)?.finish()
+    }
+
+    fn builder(keys: &[&[u8]], values: &[u32]) -> Result<TrieBuilder, Error> {
+        if keys.len() != values.len() {
+            return Err(Error::InvalidArgument {
+                what: "a trie's keys not one value a key",
+            });
+        }
+        let mut b = TrieBuilder::new(width_of(values.iter().copied().max().unwrap_or(0)))?;
+        for (k, v) in keys.iter().zip(values) {
+            b.add(k, *v)?;
+        }
+        Ok(b)
     }
 
     /// Node number `n` in its part.
@@ -292,9 +384,7 @@ impl Trie {
         let d = &self.dense;
         let ends_before = before(&d.labels, pos).saturating_sub(before(&d.has_child, pos));
         let prefixes = d.prefix.rank1(pos / 256);
-        self.values
-            .get(ends_before.saturating_add(prefixes))
-            .copied()
+        self.values.get(ends_before.saturating_add(prefixes))
     }
 
     /// The value of dense node `n`'s own key.
@@ -304,7 +394,6 @@ impl Trie {
         let ends_before = before(&d.labels, start).saturating_sub(before(&d.has_child, start));
         self.values
             .get(ends_before.saturating_add(before(&d.prefix, n)))
-            .copied()
     }
 
     /// The dense node the branch at `pos` goes on to.
@@ -356,28 +445,24 @@ impl Trie {
         let ends_before = p.saturating_sub(self.children_before(p));
         let n = s.louds.rank1(p).saturating_sub(1);
         let prefixes = s.prefix.rank1(n);
-        self.values
-            .get(
-                self.dense
-                    .values
-                    .saturating_add(ends_before)
-                    .saturating_add(prefixes),
-            )
-            .copied()
+        self.values.get(
+            self.dense
+                .values
+                .saturating_add(ends_before)
+                .saturating_add(prefixes),
+        )
     }
 
     /// The value of sparse node `n`'s own key.
     fn value_of_node(&self, n: usize) -> Option<u32> {
         let (start, _) = self.node_range(n);
         let ends_before = start.saturating_sub(self.children_before(start));
-        self.values
-            .get(
-                self.dense
-                    .values
-                    .saturating_add(ends_before)
-                    .saturating_add(before(&self.sparse.prefix, n)),
-            )
-            .copied()
+        self.values.get(
+            self.dense
+                .values
+                .saturating_add(ends_before)
+                .saturating_add(before(&self.sparse.prefix, n)),
+        )
     }
 
     // ------------------------------------------------------------------ both
@@ -714,7 +799,7 @@ impl Trie {
     }
 
     /// Appends the trie to `out`: the dense part's three bit vectors and counts, the sparse
-    /// part's labels and three bit vectors, and the values.
+    /// part's labels and three bit vectors, and the values packed.
     pub fn encode(&self, out: &mut Vec<u8>) {
         let put = |out: &mut Vec<u8>, n: usize| {
             out.extend_from_slice(&u64::try_from(n).unwrap_or(u64::MAX).to_le_bytes());
@@ -732,10 +817,7 @@ impl Trie {
         s.has_child.encode(out);
         s.louds.encode(out);
         s.prefix.encode(out);
-        put(out, self.values.len());
-        for v in &self.values {
-            out.extend_from_slice(&v.to_le_bytes());
-        }
+        self.values.encode(out);
     }
 
     /// A trie [`Self::encode`] wrote at the start of `bytes`, and the bytes it took.
@@ -773,17 +855,8 @@ impl Trie {
         let has_child = bits(&mut at)?;
         let louds = bits(&mut at)?;
         let prefix = bits(&mut at)?;
-        let count = num(&mut at)?;
-        let mut values = Vec::with_capacity(count.min(bytes.len() / 4));
-        for _ in 0..count {
-            let v = bytes
-                .get(at..)
-                .and_then(<[u8]>::first_chunk::<4>)
-                .map(|b| u32::from_le_bytes(*b))
-                .ok_or(corrupt())?;
-            values.push(v);
-            at = at.checked_add(4).ok_or(corrupt())?;
-        }
+        let (values, used) = Packed::decode(bytes.get(at..).ok_or(corrupt())?)?;
+        at = at.checked_add(used).ok_or(corrupt())?;
         // The parts agree: a dense node is 256 bits, the dense values and nodes are within the
         // whole, and the sparse part has a has-child and a node-start bit a label.
         if labels_d.len() != nodes.saturating_mul(256)
@@ -839,7 +912,7 @@ impl Trie {
             .saturating_add(s.has_child.bytes())
             .saturating_add(s.louds.bytes())
             .saturating_add(s.prefix.bytes())
-            .saturating_add(self.values.len().saturating_mul(4))
+            .saturating_add(self.values.bytes())
     }
 }
 
@@ -886,7 +959,10 @@ mod tests {
             let queries: Vec<Vec<u8>> = (0..300).map(|_| key(&mut x)).collect();
             // At every cut between the dense and sparse parts, all sparse to all dense.
             for cutoff in 0..=8 {
-                let t = Trie::build_at(&keys, &values, Some(cutoff)).unwrap();
+                let t = Trie::builder(&keys, &values)
+                    .unwrap()
+                    .finish_at(cutoff)
+                    .unwrap();
                 assert_eq!(t.len(), map.len());
                 let mut out = Vec::new();
                 t.encode(&mut out);
@@ -920,7 +996,10 @@ mod tests {
             let mut queries: Vec<Vec<u8>> = (0..300).map(|_| key(&mut x)).collect();
             queries.extend(map.keys().cloned());
             for cutoff in 0..=8 {
-                let t = Trie::build_at(&keys, &values, Some(cutoff)).unwrap();
+                let t = Trie::builder(&keys, &values)
+                    .unwrap()
+                    .finish_at(cutoff)
+                    .unwrap();
                 let mut out = Vec::new();
                 for q in &queries {
                     let want = map.range(q.clone()..).next();
@@ -950,6 +1029,29 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_builder_reset_builds_what_a_new_one_does() {
+        let mut x = 0x1234_5678_9abc_def1u64;
+        let mut reused = TrieBuilder::new(32).unwrap();
+        for case in 0..200 {
+            let n = (rng(&mut x) % 300) as usize;
+            let map: BTreeMap<Vec<u8>, u32> = (0..n)
+                .map(|_| (key(&mut x), (rng(&mut x) % 5_000) as u32))
+                .collect();
+            let keys: Vec<&[u8]> = map.keys().map(Vec::as_slice).collect();
+            let values: Vec<u32> = map.values().copied().collect();
+            let fresh = Trie::build(&keys, &values).unwrap();
+            reused.reset(32).unwrap();
+            for (k, v) in &map {
+                reused.add(k, *v).unwrap();
+            }
+            assert_eq!(reused.finish().unwrap(), fresh, "case {case}");
+            // Values packed at the bits the largest needs.
+            let most = values.iter().copied().max().unwrap_or(0);
+            assert_eq!(fresh.values.width(), width_of(most), "case {case}");
         }
     }
 

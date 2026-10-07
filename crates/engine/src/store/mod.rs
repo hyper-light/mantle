@@ -21,6 +21,7 @@ pub mod page;
 pub mod superblock;
 
 use crate::error::{Error, Malformed};
+use crate::fst::trie::TrieBuilder;
 use alloc::Allocator;
 use hyper_block::block::BlockFile;
 use hyper_block::buf::AlignedBuf;
@@ -166,11 +167,9 @@ pub struct Run {
 pub struct Lists {
     pub extents: Vec<u64>,
     pub counts: Vec<u16>,
-    /// Each leaf's separator back to back, where each ends, and each leaf's page number; and
-    /// the encoded index built of them.
-    pub separators: Vec<u8>,
-    pub separator_ends: Vec<usize>,
-    pub leaf_pages: Vec<u32>,
+    /// Each leaf's separator to its page number, a trie builder whose levels keep their
+    /// buffers; and the encoded index built of them.
+    pub separators: TrieBuilder,
     pub index: Vec<u8>,
 }
 
@@ -178,9 +177,6 @@ impl Lists {
     fn clear(&mut self) {
         self.extents.clear();
         self.counts.clear();
-        self.separators.clear();
-        self.separator_ends.clear();
-        self.leaf_pages.clear();
         self.index.clear();
     }
 }

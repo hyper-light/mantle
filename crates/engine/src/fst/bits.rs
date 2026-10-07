@@ -29,10 +29,97 @@ pub struct Bits {
     ones: usize,
 }
 
+/// A bit vector as a builder fills it: appended to, and set in place.
+#[derive(Clone, Debug, Default)]
+pub struct Grow {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl Grow {
+    /// Appends `b`.
+    pub fn push(&mut self, b: bool) {
+        if self.len.is_multiple_of(64) {
+            self.words.push(0);
+        }
+        let i = self.len;
+        self.len = self.len.saturating_add(1);
+        self.set(i, b);
+    }
+
+    /// Sets bit `i`, within the length, to `b`.
+    pub fn set(&mut self, i: usize, b: bool) {
+        if i >= self.len {
+            return;
+        }
+        if let Some(w) = self.words.get_mut(i / 64) {
+            if b {
+                *w |= 1u64 << (i % 64);
+            } else {
+                *w &= !(1u64 << (i % 64));
+            }
+        }
+    }
+
+    /// Bit `i`.
+    pub fn get(&self, i: usize) -> bool {
+        i < self.len
+            && self
+                .words
+                .get(i / 64)
+                .is_some_and(|w| w >> (i % 64) & 1 == 1)
+    }
+
+    /// The last bit, if any.
+    pub fn last(&self) -> Option<bool> {
+        self.len.checked_sub(1).map(|i| self.get(i))
+    }
+
+    /// Sets the last bit, if any, to `b`.
+    pub fn set_last(&mut self, b: bool) {
+        if let Some(i) = self.len.checked_sub(1) {
+            self.set(i, b);
+        }
+    }
+
+    /// Empties it, keeping its words' room.
+    pub fn clear(&mut self) {
+        self.words.clear();
+        self.len = 0;
+    }
+
+    /// Grows to `len` bits, the new ones clear.
+    pub fn grow_to(&mut self, len: usize) {
+        if len > self.len {
+            self.words.resize(len.div_ceil(64), 0);
+            self.len = len;
+        }
+    }
+
+    /// The bits.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether no bit is held.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 impl Bits {
     /// The vector of `bits`, with rank blocks of `block_bits` (a multiple of 64): 64 for LOUDS-
     /// Dense, 512 for LOUDS-Sparse.
     pub fn new(bits: &[bool], block_bits: usize) -> Result<Self, Error> {
+        let mut g = Grow::default();
+        for &b in bits {
+            g.push(b);
+        }
+        Self::from_grow(g, block_bits)
+    }
+
+    /// The vector a builder filled, its words taken as they are.
+    pub fn from_grow(bits: Grow, block_bits: usize) -> Result<Self, Error> {
         let block_words =
             block_bits
                 .checked_div(64)
@@ -40,15 +127,9 @@ impl Bits {
                 .ok_or(Error::InvalidArgument {
                     what: "a rank block that is not a whole number of words",
                 })?;
-        let mut words = vec![0u64; bits.len().div_ceil(64)];
-        for (i, _) in bits.iter().enumerate().filter(|(_, b)| **b) {
-            if let Some(w) = words.get_mut(i / 64) {
-                *w |= 1u64 << (i % 64);
-            }
-        }
         let mut v = Self {
-            words,
-            len: bits.len(),
+            words: bits.words,
+            len: bits.len,
             block_words,
             ranks: Vec::new(),
             selects: Vec::new(),

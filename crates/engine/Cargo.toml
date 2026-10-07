@@ -61,3 +61,7 @@ harness = false
 [[bench]]
 name = "remix"
 harness = false
+
+[[bench]]
+name = "surf"
+harness = false

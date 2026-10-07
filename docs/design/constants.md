@@ -96,6 +96,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/ec/src/durability.rs` `YEAR` | derived | Unit conversion: 365.25 days × 24 h = 8766 hours. |
 | `crates/engine/src/fst/bits.rs` `SELECT_SAMPLE` | cited | 64: select samples every 64th set bit, 9–17% of a dense bit vector and 1–2% of the trie (Zhang et al., SuRF, SIGMOD 2018 §2.6; research/35 §1). |
 | `crates/engine/src/fst/packed.rs` `MAX_WIDTH` | format | 32: a trie value is a `u32` (a leaf's page number, a range filter's suffix bits). |
+| `crates/engine/src/fst/surf.rs` `SUFFIX_BYTES` | format | 4: the bytes a suffix of at most 32 bits (`MAX_WIDTH`) spans. |
 | `crates/engine/src/fst/trie.rs` `DENSE_BLOCK` | cited | 64-bit rank blocks for LOUDS-Dense: a rank is one popcount, 50% over its small bitmaps (SuRF §2.6; research/35 §1). |
 | `crates/engine/src/fst/trie.rs` `DENSE_NODE_BITS` | format | 513: a LOUDS-Dense node's two 256-bit bitmaps (labels, branches going on) and its own-key bit. |
 | `crates/engine/src/fst/trie.rs` `DENSE_RATIO` | cited | R = 64: the dense levels at most 1/64 of the sparse levels below them (SuRF §2.4; research/35 §1). |

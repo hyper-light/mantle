@@ -5,4 +5,5 @@
 
 pub mod bits;
 pub mod packed;
+pub mod surf;
 pub mod trie;

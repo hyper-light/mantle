@@ -15,7 +15,7 @@
 
 use std::ops::ControlFlow;
 
-use super::bits::{Bits, Grow};
+use super::bits::{Bits, Grow, Select};
 use super::packed::{MAX_WIDTH, Packed, width_of};
 use crate::error::{Error, Malformed};
 
@@ -333,17 +333,17 @@ impl TrieBuilder {
         Ok(Trie {
             dense: Dense {
                 nodes: d_prefix.len(),
-                labels: Bits::from_grow(d_labels, DENSE_BLOCK)?,
-                has_child: Bits::from_grow(d_child, DENSE_BLOCK)?,
-                prefix: Bits::from_grow(d_prefix, DENSE_BLOCK)?,
+                labels: Bits::from_grow(d_labels, DENSE_BLOCK, Select::None)?,
+                has_child: Bits::from_grow(d_child, DENSE_BLOCK, Select::None)?,
+                prefix: Bits::from_grow(d_prefix, DENSE_BLOCK, Select::None)?,
                 children: dense_children,
                 values: dense_values,
             },
             sparse: Sparse {
                 labels,
-                has_child: Bits::from_grow(has_child, SPARSE_BLOCK)?,
-                louds: Bits::from_grow(louds, SPARSE_BLOCK)?,
-                prefix: Bits::from_grow(prefix, SPARSE_BLOCK)?,
+                has_child: Bits::from_grow(has_child, SPARSE_BLOCK, Select::None)?,
+                louds: Bits::from_grow(louds, SPARSE_BLOCK, Select::Sampled)?,
+                prefix: Bits::from_grow(prefix, SPARSE_BLOCK, Select::None)?,
             },
             values,
         })
@@ -403,11 +403,12 @@ impl Trie {
 
     /// The greatest label of dense node `n` below `pos` (exclusive), as a position.
     fn dense_below(&self, n: usize, pos: usize) -> Option<usize> {
-        let d = &self.dense;
-        let r = before(&d.labels, pos);
-        (r > before(&d.labels, n.checked_mul(256)?))
-            .then(|| d.labels.select1(r))
-            .flatten()
+        let q = self.dense.labels.prev_one(pos.checked_sub(1)?)?;
+        if q >= n.checked_mul(256)? {
+            Some(q)
+        } else {
+            None
+        }
     }
 
     // ------------------------------------------------------------------ sparse
@@ -424,9 +425,9 @@ impl Trie {
             .checked_add(1)
             .and_then(|k| s.louds.select1(k))
             .unwrap_or(s.labels.len());
-        let end = n
-            .checked_add(2)
-            .and_then(|k| s.louds.select1(k))
+        let end = start
+            .checked_add(1)
+            .and_then(|q| s.louds.next_one(q))
             .unwrap_or(s.labels.len());
         (start, end)
     }
@@ -728,10 +729,7 @@ impl Trie {
 
     /// The least label of dense node `n` above `pos` (exclusive), as a position.
     fn dense_above(&self, n: usize, pos: usize) -> Option<usize> {
-        let q = self
-            .dense
-            .labels
-            .select1(self.dense.labels.rank1(pos).checked_add(1)?)?;
+        let q = self.dense.labels.next_one(pos.checked_add(1)?)?;
         if q < n.checked_add(1)?.checked_mul(256)? {
             Some(q)
         } else {
@@ -744,10 +742,7 @@ impl Trie {
         match n {
             Node::Dense(n) => {
                 let start = n.checked_mul(256)?;
-                let q = self
-                    .dense
-                    .labels
-                    .select1(before(&self.dense.labels, start).checked_add(1)?)?;
+                let q = self.dense.labels.next_one(start)?;
                 if q < start.checked_add(256)? {
                     Some(Fallback::Dense(q))
                 } else {
@@ -825,7 +820,7 @@ impl Trie {
         let mut at = 0usize;
         let rest = |at: usize| bytes.get(at..).ok_or(corrupt());
         let bits = |at: &mut usize| -> Result<Bits, Error> {
-            let (b, used) = Bits::decode(rest(*at)?)?;
+            let (b, used) = Bits::decode(rest(*at)?, Select::None)?;
             *at = at.checked_add(used).ok_or(corrupt())?;
             Ok(b)
         };
@@ -847,14 +842,14 @@ impl Trie {
         let end = at.checked_add(n).ok_or(corrupt())?;
         let labels = bytes.get(at..end).ok_or(corrupt())?.to_vec();
         at = end;
-        let bits = |at: &mut usize| -> Result<Bits, Error> {
-            let (b, used) = Bits::decode(bytes.get(*at..).ok_or(corrupt())?)?;
+        let bits = |at: &mut usize, select: Select| -> Result<Bits, Error> {
+            let (b, used) = Bits::decode(bytes.get(*at..).ok_or(corrupt())?, select)?;
             *at = at.checked_add(used).ok_or(corrupt())?;
             Ok(b)
         };
-        let has_child = bits(&mut at)?;
-        let louds = bits(&mut at)?;
-        let prefix = bits(&mut at)?;
+        let has_child = bits(&mut at, Select::None)?;
+        let louds = bits(&mut at, Select::Sampled)?;
+        let prefix = bits(&mut at, Select::None)?;
         let (values, used) = Packed::decode(bytes.get(at..).ok_or(corrupt())?)?;
         at = at.checked_add(used).ok_or(corrupt())?;
         // The parts agree: a dense node is 256 bits, the dense values and nodes are within the

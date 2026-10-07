@@ -16,6 +16,33 @@ fn corrupt() -> Error {
 /// the trie (research/35 §1).
 pub const SELECT_SAMPLE: usize = 64;
 
+/// The position of set bit `k` (from 0) of `w`, which has more than `k`: halves of 32, 16 and 8
+/// bits passed by their popcounts, then the byte's bits, at most eight steps.
+fn select_in_word(w: u64, k: usize) -> usize {
+    let mut k = u32::try_from(k).unwrap_or(u32::MAX);
+    let mut shift = 0u32;
+    for (half, mask) in [(32u32, 0xffff_ffffu64), (16, 0xffff), (8, 0xff)] {
+        let low = ((w >> shift) & mask).count_ones();
+        if k >= low {
+            k = k.saturating_sub(low);
+            shift = shift.saturating_add(half);
+        }
+    }
+    let mut byte = (w >> shift) & 0xff;
+    for _ in 0..k {
+        byte &= byte.wrapping_sub(1);
+    }
+    shift.saturating_add(byte.trailing_zeros()) as usize
+}
+
+/// Whether a vector keeps select samples: only LOUDS-Sparse's node starts are selected
+/// (research/35 §1); every other vector is ranked and scanned by words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Select {
+    Sampled,
+    None,
+}
+
 /// A bit vector, its bits in 64-bit words, least significant first.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Bits {
@@ -115,11 +142,11 @@ impl Bits {
         for &b in bits {
             g.push(b);
         }
-        Self::from_grow(g, block_bits)
+        Self::from_grow(g, block_bits, Select::Sampled)
     }
 
     /// The vector a builder filled, its words taken as they are.
-    pub fn from_grow(bits: Grow, block_bits: usize) -> Result<Self, Error> {
+    pub fn from_grow(bits: Grow, block_bits: usize, select: Select) -> Result<Self, Error> {
         let block_words =
             block_bits
                 .checked_div(64)
@@ -135,11 +162,11 @@ impl Bits {
             selects: Vec::new(),
             ones: 0,
         };
-        v.index()?;
+        v.index(select)?;
         Ok(v)
     }
 
-    fn index(&mut self) -> Result<(), Error> {
+    fn index(&mut self, select: Select) -> Result<(), Error> {
         let mut ones = 0usize;
         for (i, w) in self.words.iter().enumerate() {
             if i.checked_rem(self.block_words) == Some(0) {
@@ -147,7 +174,7 @@ impl Bits {
             }
             let mut bits = *w;
             while bits != 0 {
-                if ones.is_multiple_of(SELECT_SAMPLE) {
+                if select == Select::Sampled && ones.is_multiple_of(SELECT_SAMPLE) {
                     let pos = i
                         .checked_mul(64)
                         .and_then(|p| p.checked_add(bits.trailing_zeros() as usize))
@@ -211,7 +238,45 @@ impl Bits {
         )
     }
 
-    /// The position of the `k`th set bit, counting from 1 as the paper does; none past the last.
+    /// The first set bit at or past `i`, by words: a node's end in LOUDS-Sparse is usually in
+    /// the word its start is.
+    pub fn next_one(&self, i: usize) -> Option<usize> {
+        if i >= self.len {
+            return None;
+        }
+        let mut word = i / 64;
+        let mut bits = self.words.get(word)? & (u64::MAX << (i % 64));
+        loop {
+            if bits != 0 {
+                let p = word
+                    .checked_mul(64)?
+                    .checked_add(bits.trailing_zeros() as usize)?;
+                return if p < self.len { Some(p) } else { None };
+            }
+            word = word.checked_add(1)?;
+            bits = *self.words.get(word)?;
+        }
+    }
+
+    /// The last set bit at or before `i`, by words.
+    pub fn prev_one(&self, i: usize) -> Option<usize> {
+        let i = i.min(self.len.checked_sub(1)?);
+        let mut word = i / 64;
+        let keep = 63usize.saturating_sub(i % 64);
+        let mut bits = self.words.get(word)? & (u64::MAX >> keep);
+        loop {
+            if bits != 0 {
+                return word
+                    .checked_mul(64)?
+                    .checked_add(63usize.saturating_sub(bits.leading_zeros() as usize));
+            }
+            word = word.checked_sub(1)?;
+            bits = *self.words.get(word)?;
+        }
+    }
+
+    /// The position of the `k`th set bit, counting from 1 as the paper does; none past the last,
+    /// and none in a vector built without select samples.
     pub fn select1(&self, k: usize) -> Option<usize> {
         if k == 0 || k > self.ones {
             return None;
@@ -227,12 +292,9 @@ impl Bits {
         for _ in 0..=self.words.len() {
             let n = bits.count_ones() as usize;
             if left < n {
-                for _ in 0..left {
-                    bits &= bits.wrapping_sub(1);
-                }
                 return word
                     .checked_mul(64)
-                    .and_then(|p| p.checked_add(bits.trailing_zeros() as usize));
+                    .and_then(|p| p.checked_add(select_in_word(bits, left)));
             }
             left = left.saturating_sub(n);
             word = word.checked_add(1)?;
@@ -256,7 +318,7 @@ impl Bits {
     }
 
     /// A vector [`Self::encode`] wrote at the start of `bytes`, and the bytes it took.
-    pub fn decode(bytes: &[u8]) -> Result<(Self, usize), Error> {
+    pub fn decode(bytes: &[u8], select: Select) -> Result<(Self, usize), Error> {
         let word = |at: usize| -> Result<u64, Error> {
             bytes
                 .get(at..)
@@ -294,7 +356,7 @@ impl Bits {
             selects: Vec::new(),
             ones: 0,
         };
-        v.index()?;
+        v.index(select)?;
         Ok((v, at))
     }
 
@@ -351,8 +413,22 @@ mod tests {
                             "len {len} block {block} i {i}"
                         );
                     }
+                    for i in 0..len {
+                        let back = (0..=i).rev().find(|&j| bits[j]);
+                        assert_eq!(v.prev_one(i), back, "len {len} prev from {i}");
+                        let want = (i..len).find(|&j| bits[j]);
+                        assert_eq!(v.next_one(i), want, "len {len} next from {i}");
+                    }
                     for k in 0..=v.ones() + 1 {
                         assert_eq!(v.select1(k), naive_select(&bits, k), "len {len} k {k}");
+                    }
+                    let mut g = Grow::default();
+                    for &b in &bits {
+                        g.push(b);
+                    }
+                    let unsampled = Bits::from_grow(g, block, Select::None).unwrap();
+                    for i in 0..len {
+                        assert_eq!(unsampled.rank1(i), naive_rank(&bits, i));
                     }
                 }
             }

@@ -644,7 +644,7 @@ impl<F: BlockFile + 'static> Log<F> {
         restores: Vec<recover::Restore>,
         sealer: Option<seal::Sealer>,
     ) -> Result<(Self, Vec<Pending>), Refused<F>> {
-        match Self::prepare(file.alignment(), config, id, restores, sealer.is_some()) {
+        match Self::prepare(file.layout_block(), config, id, restores, sealer.is_some()) {
             Ok(prepared) => {
                 let log = Self::spawn(
                     file,

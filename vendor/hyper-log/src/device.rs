@@ -574,7 +574,7 @@ impl<F: BlockFile> Device<F> {
     fn sweep(&self, segment: Segment, offset: u64, end: u64) -> Result<Vec<Swept>, LogError> {
         let mut reader = Reader::new(
             &self.file,
-            self.file.alignment(),
+            self.file.layout_block(),
             self.segment_bytes,
             self.mac.clone(),
         )?;

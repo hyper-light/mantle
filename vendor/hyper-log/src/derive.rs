@@ -6,9 +6,9 @@
 //! largest entry and the device's block, the file's segments from the disk budget, the groups from
 //! the node's admission bound, a group's retention and recent bytes, and the queue from the groups.
 //! The log's design is mantle's (`ORIGIN.md`), and the section of mantle's
-//! `docs/design/raft-log.md` each rule follows is named beside it below. Facts that cannot hold one frame, or a budget under the log's
-//! least file, are refused ([`Unfit`]), never clamped: a clamped configuration would run, and fail
-//! later at a write the facts promised.
+//! `docs/design/raft-log.md` each rule follows is named beside it below. Facts that cannot hold
+//! one frame, or a budget under the log's least file, are refused ([`Unfit`]), never clamped: a
+//! clamped configuration would run, and fail later at a write the facts promised.
 use hyper_block::buf::{Alignment, MAX_BUFFER};
 
 use crate::{Config, LogError, Waits, format, frame_room, recover, room};
@@ -16,7 +16,9 @@ use crate::{Config, LogError, Waits, format, frame_room, recover, room};
 /// What a node and its device state, from which [`Config::derive`] derives a log's configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Facts {
-    /// The device's block, its write unit (raft-log.md §2's `B`): every segment is a multiple of it.
+    /// The block the log's file is laid out in (raft-log.md §2's `B`): the file's
+    /// `BlockFile::layout_block`, its transfer alignment when direct and the device's write unit
+    /// when buffered. Every segment is a multiple of it.
     pub align: Alignment,
     /// Whether the log is sealed (`Log::create_sealed`): a sealed frame also holds its MAC and a
     /// key record, and each record its tag.

@@ -46,6 +46,8 @@ pub struct DeviceFile {
     path: PathBuf,
     caching: Caching,
     align: Alignment,
+    /// The block a writer lays the file out in ([`DeviceFile::layout_block`]).
+    layout: Alignment,
     /// A device node rather than a regular file.
     node: bool,
 }
@@ -84,11 +86,16 @@ impl DeviceFile {
         };
         let node = crate::node::is_node(&file, path).map_err(wrap("stat"))?;
         refuse_zones(path, &file, node)?;
+        let layout = match caching {
+            Caching::Direct => align,
+            Caching::Buffered => layout_of(&file, path, align)?,
+        };
         Ok(Self {
             file,
             path: path.to_path_buf(),
             caching,
             align,
+            layout,
             node,
         })
     }
@@ -112,6 +119,7 @@ impl DeviceFile {
             path: self.path.clone(),
             caching: self.caching,
             align: self.align,
+            layout: self.layout,
             node: self.node,
         })
     }
@@ -124,6 +132,14 @@ impl DeviceFile {
     /// The alignment every transfer's offset and length must meet (one byte when buffered).
     pub fn alignment(&self) -> Alignment {
         self.align
+    }
+
+    /// The block a writer lays the file out in: the transfer alignment when direct, which a
+    /// direct file's layout always was; when buffered, the device's write unit
+    /// ([`preferred_block`]), since a buffered file's alignment of one byte is no block a log can
+    /// lay out a header or a persist slot in. Taken once, at open.
+    pub fn layout_block(&self) -> Alignment {
+        self.layout
     }
 
     /// Writes all of `buf` at `offset`.
@@ -386,6 +402,22 @@ pub fn preferred_block(file: &File, path: &Path) -> Result<usize, DiskError> {
     Ok(bytes)
 }
 
+/// A buffered file's layout block: the device's write unit, and no less than `align`. A write unit
+/// that is no power of two within the alignment bound is no block to lay a file out in, and is
+/// refused rather than rounded: rounded, a block would no longer be a write the device takes whole.
+fn layout_of(file: &File, path: &Path, align: Alignment) -> Result<Alignment, DiskError> {
+    let unit = preferred_block(file, path)?;
+    let unit = Alignment::new(unit).map_err(|_| DiskError::Unsupported {
+        path: path.to_path_buf(),
+        reason: "a file whose device's write unit is no power of two within the alignment bound",
+    })?;
+    Ok(if unit.get() >= align.get() {
+        unit
+    } else {
+        align
+    })
+}
+
 /// Flushes a directory so entries created or renamed in it survive a crash (Pillai et al.,
 /// OSDI 2014: a new file's directory entry is durable only after its directory is synced).
 pub fn sync_dir(dir: &Path) -> Result<(), DiskError> {
@@ -562,6 +594,30 @@ mod tests {
             file.write_all_at(empty.as_slice(), 0).unwrap();
             file.read_exact_at(empty.as_mut_capacity(), 0).unwrap();
             assert_eq!(file.read_at(empty.as_mut_capacity(), 0).unwrap(), 0);
+        }
+    }
+
+    /// A buffered file is laid out in the device's write unit, its alignment of one byte being no
+    /// block; a direct one in its transfer alignment, as a direct file always was, so the layout of
+    /// a log already on it is unchanged.
+    #[test]
+    fn a_buffered_file_is_laid_out_in_the_write_unit_and_a_direct_one_in_its_alignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("buffered");
+        let buffered = DeviceFile::open(&path, true, CachingRequest::Buffered, align()).unwrap();
+        assert_eq!(buffered.alignment(), Alignment::BYTE);
+        let unit = preferred_block(buffered.std_file(), &path).unwrap();
+        assert_eq!(buffered.layout_block().get(), unit);
+        assert_eq!(buffered.try_clone().unwrap().layout_block().get(), unit);
+        let direct = DeviceFile::open(
+            &dir.path().join("direct"),
+            true,
+            CachingRequest::PreferDirect,
+            align(),
+        )
+        .unwrap();
+        if direct.caching() == Caching::Direct {
+            assert_eq!(direct.layout_block(), direct.alignment());
         }
     }
 

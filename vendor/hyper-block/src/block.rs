@@ -14,6 +14,13 @@ pub trait BlockFile: Send {
     /// The alignment every transfer's offset and length must meet.
     fn alignment(&self) -> Alignment;
 
+    /// The block a writer lays the file out in: what it pads records to and places them at, so
+    /// that each write is one the device takes whole. A multiple of [`BlockFile::alignment`], so
+    /// what is laid out at it is transferable; by default the alignment itself.
+    fn layout_block(&self) -> Alignment {
+        self.alignment()
+    }
+
     /// The file's length, or a device node's capacity.
     fn len(&self) -> Result<u64, DiskError>;
 
@@ -50,6 +57,10 @@ pub trait BlockFile: Send {
 impl BlockFile for DeviceFile {
     fn alignment(&self) -> Alignment {
         DeviceFile::alignment(self)
+    }
+
+    fn layout_block(&self) -> Alignment {
+        DeviceFile::layout_block(self)
     }
 
     fn len(&self) -> Result<u64, DiskError> {

@@ -19,7 +19,10 @@ use hyper_measure::alloc;
 use mantle_engine::branch::filter::Keys;
 use mantle_engine::branch::merge::Merge;
 use mantle_engine::branch::{Branch, Builder, Op};
+use mantle_engine::rows::Rows;
+use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::{Config, Store};
+use mantle_engine::trunk::{TrunkConfig, ViewChoice};
 
 #[global_allocator]
 static ALLOCATOR: alloc::Counting = alloc::Counting;
@@ -148,5 +151,86 @@ fn a_point_read_allocates_nothing_once_its_value_buffer_has_grown() {
         (counts.allocations, counts.reallocations),
         (0, 0),
         "{counts:?}"
+    );
+}
+
+#[test]
+fn a_shard_scans_without_allocating_once_its_buffers_have_grown() {
+    let dir = tempfile::tempdir().unwrap();
+    let align = Alignment::new(4096).unwrap();
+    let file = DeviceFile::open(
+        &dir.path().join("shard"),
+        true,
+        CachingRequest::Buffered,
+        align,
+    )
+    .unwrap();
+    let mut db = ShardDb::create(
+        file,
+        CONFIG,
+        4 * 1024,
+        TrunkConfig {
+            fanout: 3,
+            leaf_entries: 96,
+        },
+    )
+    .unwrap();
+    // Views built whenever they can be, not as measured costs choose: the test does not depend
+    // on timing.
+    db.set_view_choice(ViewChoice::Rebuild);
+    // Random keys over many memtables: the trunk has pivot bundles and in-flight branches, and
+    // a memtable is packing, so a scan merges both memtables and several trunk sources.
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    let mut next_key = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x % 20_000
+    };
+    for _ in 0..12_000 {
+        let n = next_key();
+        db.put(&key(n), &n.to_le_bytes()).unwrap();
+    }
+    let mut rows = Rows::new();
+    let mut next = Vec::new();
+    // The same scans twice, open and bounded: the first grows every buffer and pool the second
+    // needs, so the second allocates nothing.
+    let scans = |db: &mut ShardDb<DeviceFile>, rows: &mut Rows, next: &mut Vec<u8>| {
+        for i in 0..2_000u64 {
+            let from = key((i * 7_919) % 20_000);
+            let end = key((i * 7_919) % 20_000 + 40);
+            rows.clear();
+            let bound = if i % 2 == 0 { None } else { Some(&end[..]) };
+            db.scan(&from, bound, 10, rows, next).unwrap();
+        }
+    };
+    scans(&mut db, &mut rows, &mut next);
+    alloc::begin();
+    scans(&mut db, &mut rows, &mut next);
+    let counts = alloc::end();
+    assert_eq!(
+        (counts.allocations, counts.reallocations),
+        (0, 0),
+        "{counts:?}"
+    );
+    // The debts paid in idle slices, which build the bundles' REMIX views: scans then walk views,
+    // and allocate nothing either once their walks' buffers have grown.
+    while db.owed() {
+        db.idle_step(64).unwrap();
+    }
+    let (_, t, _) = db.stats();
+    assert!(
+        db.views() > 0,
+        "no view built: {t:?} shape {:?}",
+        db.shape()
+    );
+    scans(&mut db, &mut rows, &mut next);
+    alloc::begin();
+    scans(&mut db, &mut rows, &mut next);
+    let counts = alloc::end();
+    assert_eq!(
+        (counts.allocations, counts.reallocations),
+        (0, 0),
+        "through views: {counts:?}"
     );
 }

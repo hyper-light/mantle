@@ -518,7 +518,16 @@ impl BTreeMem {
     /// path is left at the step that visits its entry at or past `from` once the child below is
     /// walked, and the leaf at its first entry at or past `from`.
     pub fn walk_from(&self, from: &[u8]) -> Result<Walk, Error> {
-        let mut stack = Vec::new();
+        let mut walk = Walk::default();
+        self.walk_from_into(from, &mut walk)?;
+        Ok(walk)
+    }
+
+    /// [`Self::walk_from`] into `walk`, its stack's allocation kept: a seek allocates nothing
+    /// once the stack has grown to the tree's height.
+    pub fn walk_from_into(&self, from: &[u8], walk: &mut Walk) -> Result<(), Error> {
+        let stack = &mut walk.stack;
+        stack.clear();
         let mut at = self.root;
         // The walk descends one level a step: at most the tree's height.
         for _ in 0..=self.nodes.len() {
@@ -529,12 +538,12 @@ impl BTreeMem {
             };
             if n.leaf {
                 stack.push((at, pos));
-                return Ok(Walk { stack });
+                return Ok(());
             }
             if exact {
                 // Entry `pos` is the key itself: it is next, then child `pos + 1`.
                 stack.push((at, pos.saturating_mul(2).saturating_add(1)));
-                return Ok(Walk { stack });
+                return Ok(());
             }
             // Every key in child `pos` may be at or past `from`, and entry `pos` follows it.
             stack.push((at, pos.saturating_mul(2).saturating_add(1)));
@@ -595,7 +604,7 @@ impl BTreeMem {
 
 /// A walk's place in a memtable ([`BTreeMem::walk_some`]): the nodes from the root to the next
 /// entry and the step each is at, bounded by the tree's height.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Walk {
     stack: Vec<(u32, usize)>,
 }

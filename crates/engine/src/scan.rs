@@ -5,7 +5,7 @@
 
 use crate::branch::{Branch, Op, RunCursor};
 use crate::error::Error;
-use crate::remix::{View, Walk};
+use crate::remix::{View, Walk, WalkBufs};
 use crate::store::Store;
 use crate::trunk::Source;
 use hyper_block::block::BlockFile;
@@ -46,10 +46,14 @@ impl Head<'_> {
         }
     }
 
-    fn give_back<F: BlockFile>(self, store: &mut Store<F>) {
+    /// Gives the head's pages back to `store`; a walk's buffers come back for the next.
+    fn give_back<F: BlockFile>(self, store: &mut Store<F>) -> Option<WalkBufs> {
         match self {
-            Head::Branch(c, _) => c.give_back(store),
-            Head::View(w, ..) => w.give_back(store),
+            Head::Branch(c, _) => {
+                c.give_back(store);
+                None
+            }
+            Head::View(w, ..) => Some(w.give_back(store)),
         }
     }
 }
@@ -66,6 +70,8 @@ pub struct ScanMerge<'a> {
     past: Vec<u8>,
     /// A range filter check's buffer.
     scratch: Vec<u8>,
+    /// Walks' buffers given back, for the next views' walks.
+    walks: Vec<WalkBufs>,
     /// Sources passed over at open by their range filters, and sources opened.
     skipped: u64,
     opened: u64,
@@ -114,13 +120,31 @@ impl<'a> ScanMerge<'a> {
             let head = match *s {
                 Source::Branch(b) => Head::Branch(b.seek(store, from)?, b),
                 Source::View(view, runs) => {
-                    Head::View(Walk::seek(view, store, runs, from)?, view, runs)
+                    let bufs = self.walks.pop().unwrap_or_default();
+                    Head::View(Walk::seek_with(view, store, runs, from, bufs)?, view, runs)
                 }
             };
             self.heads.push(head);
         }
         self.pick();
         Ok(())
+    }
+
+    /// The merge, its heads given back to `store` first, with its buffers kept for sources of
+    /// another borrow and its counts reset: a shard keeps one merge between scans.
+    pub fn recycle<'b, F: BlockFile>(mut self, store: &mut Store<F>) -> ScanMerge<'b> {
+        self.close(store);
+        ScanMerge {
+            heads: crate::util::reuse(self.heads),
+            end: self.end,
+            bounded: false,
+            current: None,
+            past: self.past,
+            scratch: self.scratch,
+            walks: self.walks,
+            skipped: 0,
+            opened: 0,
+        }
     }
 
     /// Sources passed over by their range filters, and sources opened, since the merge was made.
@@ -131,7 +155,9 @@ impl<'a> ScanMerge<'a> {
     /// Gives every head's pages and span back to `store`.
     pub fn close<F: BlockFile>(&mut self, store: &mut Store<F>) {
         for h in self.heads.drain(..) {
-            h.give_back(store);
+            if let Some(bufs) = h.give_back(store) {
+                self.walks.push(bufs);
+            }
         }
         self.current = None;
     }

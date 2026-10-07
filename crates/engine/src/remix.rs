@@ -904,12 +904,32 @@ impl Walk {
         runs: &[Branch],
         from: &[u8],
     ) -> Result<Self, Error> {
+        Self::seek_with(view, store, runs, from, WalkBufs::default())
+    }
+
+    /// [`Self::seek`] in the buffers of a walk given back: a scan that keeps them seeks without
+    /// allocating once they have grown to its views' runs.
+    pub fn seek_with<F: BlockFile>(
+        view: &View,
+        store: &mut Store<F>,
+        runs: &[Branch],
+        from: &[u8],
+        bufs: WalkBufs,
+    ) -> Result<Self, Error> {
+        let WalkBufs {
+            mut cursors,
+            mut behind,
+        } = bufs;
+        cursors.clear();
+        cursors.resize_with(view.runs, || None);
+        behind.clear();
+        behind.resize(view.runs, 0);
         let mut w = Self {
             segment: view.segment_of(from),
             at: 0,
             run: 0,
-            cursors: (0..view.runs).map(|_| None).collect(),
-            behind: vec![0; view.runs],
+            cursors,
+            behind,
             valid: view.segments() > 0,
         };
         if !w.valid {
@@ -1127,9 +1147,23 @@ impl Walk {
     }
 
     /// Gives every placed cursor's page and span back to `store`.
-    pub fn give_back<F: BlockFile>(self, store: &mut Store<F>) {
-        for c in self.cursors.into_iter().flatten() {
+    /// Gives the runs' cursors back to `store`'s pools; the walk's own buffers come back, empty,
+    /// for the next [`Self::seek_with`].
+    pub fn give_back<F: BlockFile>(mut self, store: &mut Store<F>) -> WalkBufs {
+        for c in self.cursors.drain(..).flatten() {
             c.give_back(store);
         }
+        self.behind.clear();
+        WalkBufs {
+            cursors: self.cursors,
+            behind: self.behind,
+        }
     }
+}
+
+/// A walk's buffers, kept between walks ([`Walk::seek_with`]).
+#[derive(Debug, Default)]
+pub struct WalkBufs {
+    cursors: Vec<Option<RunCursor>>,
+    behind: Vec<usize>,
 }

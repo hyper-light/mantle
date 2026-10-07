@@ -26,8 +26,10 @@ use crate::branch::{Builder, Op};
 use crate::error::Error;
 use crate::memtable::btree::{BTreeMem, Walk};
 use crate::rows::Rows;
+use crate::scan::ScanMerge;
 use crate::store::{Config, Store};
-use crate::trunk::{Trunk, TrunkConfig};
+use crate::trunk::{Source, Trunk, TrunkConfig};
+use crate::util::reuse;
 use hyper_block::block::BlockFile;
 
 /// The time maintenance took on the put path: packing memtables into branches, the trunk's
@@ -56,6 +58,7 @@ pub struct FlushStats {
 
 /// A memtable read in key order from a seek, its next entry held in buffers it reuses: one
 /// source of a scan.
+#[derive(Debug)]
 struct MemCursor {
     walk: Walk,
     key: Vec<u8>,
@@ -65,16 +68,21 @@ struct MemCursor {
 }
 
 impl MemCursor {
-    fn new(mem: &BTreeMem, from: &[u8]) -> Result<Self, Error> {
-        let mut c = Self {
-            walk: mem.walk_from(from)?,
+    /// A cursor at no entry, allocating nothing.
+    fn empty() -> Self {
+        Self {
+            walk: Walk::default(),
             key: Vec::new(),
             op: Op::Put,
             value: Vec::new(),
             valid: false,
-        };
-        c.advance(mem)?;
-        Ok(c)
+        }
+    }
+
+    /// Moves to `mem`'s first entry at or past `from`, its buffers kept.
+    fn seek(&mut self, mem: &BTreeMem, from: &[u8]) -> Result<(), Error> {
+        mem.walk_from_into(from, &mut self.walk)?;
+        self.advance(mem)
     }
 
     fn key(&self) -> Option<&[u8]> {
@@ -149,6 +157,12 @@ pub struct ShardDb<F: BlockFile> {
     /// between scans.
     scan_key: Vec<u8>,
     scan_from: Vec<u8>,
+    /// A scan's memtable cursors, its segment's sources and its merge, kept between scans so a
+    /// scan allocates nothing once they have grown.
+    scan_active: MemCursor,
+    scan_packing: MemCursor,
+    scan_sources: Vec<Source<'static>>,
+    scan_merge: ScanMerge<'static>,
     /// Trunk sources scans passed over by their range filters, and sources they opened.
     scan_skipped: u64,
     scan_opened: u64,
@@ -199,6 +213,10 @@ impl<F: BlockFile> ShardDb<F> {
             flush_stats: FlushStats::default(),
             scan_key: Vec::new(),
             scan_from: Vec::new(),
+            scan_active: MemCursor::empty(),
+            scan_packing: MemCursor::empty(),
+            scan_sources: Vec::new(),
+            scan_merge: ScanMerge::new(),
             scan_skipped: 0,
             scan_opened: 0,
             scan_end: Vec::new(),
@@ -408,9 +426,14 @@ impl<F: BlockFile> ShardDb<F> {
             next.extend_from_slice(from);
             return Ok(true);
         }
-        let mut active = MemCursor::new(&self.mem, from)?;
+        let mut active = std::mem::replace(&mut self.scan_active, MemCursor::empty());
+        active.seek(&self.mem, from)?;
         let mut packing = match &self.packing {
-            Some(p) => Some(MemCursor::new(&p.mem, from)?),
+            Some(p) => {
+                let mut c = std::mem::replace(&mut self.scan_packing, MemCursor::empty());
+                c.seek(&p.mem, from)?;
+                Some(c)
+            }
             None => None,
         };
         let trunk = &self.trunk;
@@ -422,9 +445,9 @@ impl<F: BlockFile> ShardDb<F> {
         let seg_end = &mut self.scan_end;
         seg_from.clear();
         seg_from.extend_from_slice(from);
-        let mut sources = Vec::new();
+        let mut sources: Vec<Source<'_>> = reuse(std::mem::take(&mut self.scan_sources));
         let mut trunk_done = false;
-        let mut merge = crate::scan::ScanMerge::new();
+        let mut merge: ScanMerge<'_> = std::mem::take(&mut self.scan_merge).recycle(store);
         let before_end = |k: &[u8]| end.is_none_or(|e| k < e);
         let mut taken = 0usize;
         let more = loop {
@@ -502,10 +525,15 @@ impl<F: BlockFile> ShardDb<F> {
                 merge.next(store)?;
             }
         };
-        merge.close(store);
         let (skipped, opened) = merge.counts();
+        self.scan_merge = merge.recycle(store);
+        self.scan_sources = reuse(sources);
         self.scan_skipped = self.scan_skipped.saturating_add(skipped);
         self.scan_opened = self.scan_opened.saturating_add(opened);
+        self.scan_active = active;
+        if let Some(c) = packing {
+            self.scan_packing = c;
+        }
         Ok(more)
     }
 

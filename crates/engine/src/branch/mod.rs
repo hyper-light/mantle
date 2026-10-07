@@ -1199,16 +1199,19 @@ impl RunCursor {
             n: 0,
             page: store.take_page(),
             span,
-            key: Vec::new(),
-            value: Vec::new(),
+            // An entry fits a page, so buffers of a page from the pool never grow.
+            key: store.take_page(),
+            value: store.take_page(),
             op: Op::Put,
             valid: false,
         }
     }
 
-    /// Gives the cursor's page and span back to `store`'s pools.
+    /// Gives the cursor's page, key and value buffers and span back to `store`'s pools.
     pub fn give_back<F: BlockFile>(self, store: &mut Store<F>) {
         store.give_page(self.page);
+        store.give_page(self.key);
+        store.give_page(self.value);
         store.give_span(self.span);
     }
 

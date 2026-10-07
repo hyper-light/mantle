@@ -96,7 +96,8 @@ fn main() {
     )
     .unwrap();
     db.set_cache((cache_mib << 20) / 4096);
-    let issuer = (issuer_depth > 0).then(|| Issuer::start(&dir, issuer_depth).unwrap());
+    let issuer =
+        (issuer_depth > 0).then(|| Issuer::start_for(&dir, issuer_depth, batches.max(1)).unwrap());
     if let Some(issuer) = &issuer {
         db.attach(issuer, batches.max(1)).unwrap();
     }

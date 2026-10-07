@@ -259,8 +259,13 @@ bounded seek pass over a source with nothing in its range without reading it (cl
   trunk whose maintenance has caught up holds one branch a leaf and nothing above it, so a seek
   opens one source, and a range 10 keys wide almost always holds keys there. The check cost
   0.1–0.4 µs a bounded seek. The filter pays where several sources overlap a seek (bundles
-  above the leaf while writes flow) or where ranges are empty: the mixed-workload benchmark
-  measures it there.
+  above the leaf while writes flow) or where ranges are empty. Under writes (benches/shard_db.rs
+  mixgraph, 3 M fill then 4 M operations half puts half seeks, 2026-10-07):
+  - seeks bounded to 1 key passed over 0.68 of 1.77 sources each, at p50 2.42 µs against 3.88
+    open, 637 k operations a second against 445 k;
+  - seeks bounded to 10 keys passed over 0.10, and paid 0.1 µs for the checks.
+  A gate that checks a shard's sources only while their measured rule-out rate pays for the
+  check is the next step.
 
 Held to: seekrandom and short listings against RocksDB's `db_bench` at the same key count,
 under load, every percentile, with allocations, reallocations and page faults a seek.

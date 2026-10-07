@@ -16,6 +16,8 @@ pub struct Merge {
     end: Option<Vec<u8>>,
     /// The cursor whose entry is current, if any.
     current: Option<usize>,
+    /// The key `next` moves past, its buffer reused so a step allocates nothing.
+    past: Vec<u8>,
 }
 
 impl Merge {
@@ -34,6 +36,7 @@ impl Merge {
             cursors,
             end: end.map(<[u8]>::to_vec),
             current: None,
+            past: Vec::new(),
         };
         merge.pick();
         Ok(merge)
@@ -42,7 +45,7 @@ impl Merge {
     /// Gives every cursor's span back to `store`'s pool: the merge is done with them.
     pub fn give_back<F: BlockFile>(self, store: &mut Store<F>) {
         for c in self.cursors {
-            store.give_span(c.into_span());
+            c.give_back(store);
         }
     }
 
@@ -82,10 +85,11 @@ impl Merge {
         let Some(at) = self.current.and_then(|i| self.cursors.get(i)) else {
             return Ok(0);
         };
-        let key = at.key().to_vec();
+        self.past.clear();
+        self.past.extend_from_slice(at.key());
         let mut moved = 0u64;
         for c in &mut self.cursors {
-            if c.valid() && c.key() == key.as_slice() {
+            if c.valid() && c.key() == self.past.as_slice() {
                 c.next(store)?;
                 moved = moved.saturating_add(1);
             }
@@ -177,37 +181,42 @@ impl Compaction {
                 }
                 continue;
             }
-            let Some((key, op, value)) = self.merge.entry() else {
+            let Self {
+                merge,
+                building,
+                closing,
+                per,
+                remaining,
+                drop_tombstones,
+                ..
+            } = self;
+            let Some((key, op, value)) = merge.entry() else {
                 // The merge is done: the last part is sealed, or the compaction is.
-                match self.building.take() {
+                match building.take() {
                     Some((first, mut b, _)) => {
                         b.seal(store)?;
-                        self.closing.push_back((first, b));
+                        closing.push_back((first, b));
                         continue;
                     }
                     None => break,
                 }
             };
-            if !(self.drop_tombstones && op == Op::Delete) {
-                let (key, value) = (key.to_vec(), value.to_vec());
-                if self
-                    .building
-                    .as_ref()
-                    .is_some_and(|(_, _, n)| *n >= self.per)
-                    && let Some((first, mut b, _)) = self.building.take()
+            if !(*drop_tombstones && op == Op::Delete) {
+                if building.as_ref().is_some_and(|(_, _, n)| *n >= *per)
+                    && let Some((first, mut b, _)) = building.take()
                 {
                     b.seal(store)?;
-                    self.closing.push_back((first, b));
+                    closing.push_back((first, b));
                 }
-                let (_, b, n) = match self.building.as_mut() {
+                let (_, b, n) = match building.as_mut() {
                     Some(b) => b,
-                    None => self.building.insert((
-                        key.clone(),
-                        Builder::new(store, Keys::AtMost(self.remaining.min(self.per)))?,
+                    None => building.insert((
+                        key.to_vec(),
+                        Builder::new(store, Keys::AtMost((*remaining).min(*per)))?,
                         0,
                     )),
                 };
-                b.add(store, &key, op, &value)?;
+                b.add(store, key, op, value)?;
                 *n = n.saturating_add(1);
             }
             let consumed = self.merge.next(store)?;

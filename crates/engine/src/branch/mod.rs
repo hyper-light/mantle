@@ -118,6 +118,21 @@ struct Page {
 }
 
 impl Page {
+    /// A page with room reserved for the most a page of `capacity` payload bytes can hold, so
+    /// filling it never grows a buffer: keys and rests within the payload, and an entry for each
+    /// offset and suffix length the payload has room for.
+    fn with_capacity(capacity: usize) -> Self {
+        let entries = capacity.checked_div(OFFSET.saturating_add(2)).unwrap_or(0);
+        Self {
+            keys: Vec::with_capacity(capacity),
+            key_ends: Vec::with_capacity(entries),
+            rests: Vec::with_capacity(capacity),
+            rest_ends: Vec::with_capacity(entries),
+            prefix: 0,
+            total: 0,
+        }
+    }
+
     fn len(&self) -> usize {
         self.key_ends.len()
     }
@@ -227,6 +242,10 @@ pub struct Builder {
     extent: Option<(u64, u32)>,
     extents: Vec<u64>,
     last: Vec<u8>,
+    /// A leaf entry's bytes after its key, the buffer reused so an entry allocates nothing.
+    rest: Vec<u8>,
+    /// A written page's first key, for its entry in the level above; the buffer reused.
+    first: Vec<u8>,
     count: u64,
     payload: Vec<u8>,
     capacity: usize,
@@ -265,10 +284,12 @@ impl Builder {
             });
         }
         Ok(Self {
-            levels: vec![Page::default()],
+            levels: vec![Page::with_capacity(capacity)],
             extent: None,
             extents: Vec::new(),
             last: Vec::new(),
+            rest: Vec::new(),
+            first: Vec::new(),
             count: 0,
             payload: Vec::with_capacity(capacity),
             capacity,
@@ -330,11 +351,14 @@ impl Builder {
                 limit: u64::try_from(self.capacity).unwrap_or(u64::MAX),
             });
         }
-        let mut rest = Vec::with_capacity(LEAF_FIXED);
+        let mut rest = std::mem::take(&mut self.rest);
+        rest.clear();
         rest.push(op.byte());
         rest.extend_from_slice(&u16_of(value.len())?);
         rest.extend_from_slice(value);
-        self.insert(store, 0, key, &rest, 1)?;
+        let inserted = self.insert(store, 0, key, &rest, 1);
+        self.rest = rest;
+        inserted?;
         self.last.clear();
         self.last.extend_from_slice(key);
         self.count = self.count.saturating_add(1);
@@ -379,7 +403,9 @@ impl Builder {
         let mut payload = std::mem::take(&mut self.payload);
         let page = self.levels.get(level).ok_or(corrupt(Malformed::TooLarge))?;
         page.encode(kind, &mut payload)?;
-        let first = page.key(0).to_vec();
+        let mut first = std::mem::take(&mut self.first);
+        first.clear();
+        first.extend_from_slice(page.key(0));
         let total = page.total;
         let address = self.page(store)?;
         store.queue_page(&mut self.run, address, &payload)?;
@@ -391,12 +417,15 @@ impl Builder {
         if self.levels.len() <= above {
             // A level holds at most a page of entries before it writes; the height is bounded
             // by the entries' count, logarithmically.
-            self.levels.push(Page::default());
+            self.levels.push(Page::with_capacity(self.capacity));
         }
-        let mut rest = Vec::with_capacity(16);
-        rest.extend_from_slice(&address.to_le_bytes());
-        rest.extend_from_slice(&total.to_le_bytes());
-        self.insert(store, above, &first, &rest, total)?;
+        let mut rest = [0u8; 16];
+        let (child, under) = rest.split_at_mut(8);
+        child.copy_from_slice(&address.to_le_bytes());
+        under.copy_from_slice(&total.to_le_bytes());
+        let inserted = self.insert(store, above, &first, &rest, total);
+        self.first = first;
+        inserted?;
         Ok(address)
     }
 
@@ -659,12 +688,25 @@ impl Branch {
         if !self.filter.may_contain(hash) {
             return Ok(None);
         }
+        let mut buf = store.take_page();
+        let found = self.find(store, key, value, &mut buf);
+        store.give_page(buf);
+        found
+    }
+
+    /// The descent of [`Self::get_hashed`], reading each page into `buf`.
+    fn find<F: BlockFile>(
+        &self,
+        store: &mut Store<F>,
+        key: &[u8],
+        value: &mut Vec<u8>,
+        buf: &mut Vec<u8>,
+    ) -> Result<Option<Op>, Error> {
         let mut address = self.root;
-        let mut buf = Vec::new();
         for _ in 0..=self.height {
             buf.clear();
-            store.read_page(address, &mut buf)?;
-            let view = View::new(&buf)?;
+            store.read_page(address, buf)?;
+            let view = View::new(buf)?;
             let Some(i) = view.floor(key)? else {
                 return Ok(None);
             };
@@ -733,8 +775,12 @@ impl Branch {
         };
         let mut address = self.root;
         for depth in 0..=height {
-            let mut page = Vec::new();
-            cursor.read(store, depth, address, &mut page)?;
+            let mut page = store.take_page();
+            if let Err(e) = cursor.read(store, depth, address, &mut page) {
+                store.give_page(page);
+                cursor.give_back(store);
+                return Err(e);
+            }
             let view = View::new(&page)?;
             let floor = view.floor(from)?;
             if view.kind == INDEX {
@@ -763,9 +809,12 @@ impl Branch {
 }
 
 impl Cursor {
-    /// The cursor's span, for its store's pool once the scan is done.
-    pub fn into_span(self) -> Span {
-        self.span
+    /// Gives the cursor's span and page buffers back to `store`'s pools: the scan is done.
+    pub fn give_back<F: BlockFile>(self, store: &mut Store<F>) {
+        store.give_span(self.span);
+        for (page, _) in self.path {
+            store.give_page(page);
+        }
     }
 
     /// Whether the cursor is at an entry.
@@ -841,7 +890,9 @@ impl Cursor {
     /// then down its next child's leftmost path. The end of the branch leaves the cursor
     /// invalid.
     fn advance_leaf<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
-        self.path.pop();
+        if let Some((page, _)) = self.path.pop() {
+            store.give_page(page);
+        }
         loop {
             let Some((page, i)) = self.path.last_mut() else {
                 self.valid = false;
@@ -850,14 +901,19 @@ impl Cursor {
             *i = i.saturating_add(1);
             let view = View::new(page)?;
             if *i >= view.n {
-                self.path.pop();
+                if let Some((page, _)) = self.path.pop() {
+                    store.give_page(page);
+                }
                 continue;
             }
             let mut address = child_of(view.entry(*i)?.1)?;
             // Down the leftmost path to a leaf.
             loop {
-                let mut page = Vec::new();
-                self.read(store, self.path.len(), address, &mut page)?;
+                let mut page = store.take_page();
+                if let Err(e) = self.read(store, self.path.len(), address, &mut page) {
+                    store.give_page(page);
+                    return Err(e);
+                }
                 let view = View::new(&page)?;
                 let kind = view.kind;
                 if kind == INDEX {

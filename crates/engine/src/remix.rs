@@ -43,6 +43,8 @@ fn corrupt() -> Error {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct View {
     runs: usize,
+    /// The runs' roots, newest first: the branches the view describes.
+    roots: Vec<u64>,
     /// The anchors back to back, and where each ends.
     anchors: Vec<u8>,
     anchor_ends: Vec<usize>,
@@ -90,6 +92,11 @@ impl View {
             .saturating_add(self.offsets.len().saturating_mul(6))
             .saturating_add(self.selectors.len())
             .saturating_add(segments)
+    }
+
+    /// The roots of the runs the view describes, newest first.
+    pub fn roots(&self) -> &[u64] {
+        &self.roots
     }
 
     /// The segments.
@@ -226,6 +233,7 @@ impl Build {
             cursors,
             view: View {
                 runs: runs.len(),
+                roots: runs.iter().map(|b| b.root).collect(),
                 ..View::default()
             },
             in_segment: 0,
@@ -328,6 +336,362 @@ impl Build {
     /// Drops the build, the cursors' pages and spans given back to `store`.
     pub fn abandon<F: BlockFile>(self, store: &mut Store<F>) {
         give_back(store, self.cursors);
+    }
+}
+
+/// A view rebuilt for a bundle that gained a newest run (Zhong et al. FAST 2021 §4.3): the old
+/// view, one sorted run, merged with the new run by generalized binary merging (Hwang and Lin).
+/// For each of the new run's keys the merge point in the old view is found by the anchors and a
+/// binary search over the groups of one segment (a key read a halving); the old entries before it
+/// are copied without reading them, their runs moved up one, and the versions of a key the new
+/// run also holds marked shadowed. The old runs' offsets at each new segment follow from the old
+/// offsets and the pages' entry counts; a new segment's anchor is the old one where the segment
+/// starts where an old one did, else one key read. Segments are cut as [`Build`] cuts them, so
+/// the view is the one a build from scratch makes, field for field.
+#[derive(Debug)]
+pub struct Rebuild {
+    roots: Vec<u64>,
+    old: View,
+    hi: Option<Vec<u8>>,
+    width: usize,
+    /// The new run's cursor.
+    new: RunCursor,
+    /// The old stream's next entry: its segment and index there.
+    seg: usize,
+    at: usize,
+    /// Each old run's entries passed in the current old segment, and those left in the view.
+    in_seg: Vec<usize>,
+    left: Vec<usize>,
+    /// A cursor an old run to read a key where one is needed.
+    probes: Vec<Option<RunCursor>>,
+    /// The old stream's position the new run's next key goes before, and whether that old
+    /// group holds the same key; none until searched for the key.
+    point: Option<(usize, usize, bool)>,
+    out: View,
+    in_segment: usize,
+    key: Vec<u8>,
+}
+
+impl Rebuild {
+    /// A rebuild of `old` (the view of `runs[1..]`) for `runs`, the bundle with its newest run
+    /// first, over `[lo, hi)`.
+    pub fn new<F: BlockFile>(
+        store: &mut Store<F>,
+        old: View,
+        runs: &[Branch],
+        lo: &[u8],
+        hi: Option<&[u8]>,
+    ) -> Result<Self, Error> {
+        let (newest, older) = runs.split_first().ok_or(Error::InvalidArgument {
+            what: "a view rebuilt for no runs",
+        })?;
+        if runs.len() > usize::from(RUN)
+            || old.roots.len() != older.len()
+            || old.roots.iter().zip(older).any(|(&r, b)| r != b.root)
+        {
+            return Err(Error::InvalidArgument {
+                what: "a view rebuilt over runs its old view does not describe",
+            });
+        }
+        let new = newest.run_at(store, lo)?;
+        let mut left = vec![0usize; old.runs];
+        for &sel in &old.selectors {
+            if let Some(l) = left.get_mut(usize::from(sel & RUN)) {
+                *l = l.saturating_add(1);
+            }
+        }
+        let runs_n = runs.len();
+        Ok(Self {
+            roots: runs.iter().map(|b| b.root).collect(),
+            in_seg: vec![0; old.runs],
+            left,
+            probes: (0..old.runs).map(|_| None).collect(),
+            hi: hi.map(<[u8]>::to_vec),
+            width: SEGMENT.max(runs_n),
+            new,
+            seg: 0,
+            at: 0,
+            point: None,
+            out: View {
+                runs: runs_n,
+                roots: runs.iter().map(|b| b.root).collect(),
+                ..View::default()
+            },
+            in_segment: 0,
+            key: Vec::new(),
+            old,
+        })
+    }
+
+    /// Whether `runs` are the runs this rebuild reads: the same branches, in the same order.
+    pub fn reads(&self, runs: &[Branch]) -> bool {
+        self.roots.len() == runs.len() && self.roots.iter().zip(runs).all(|(&r, b)| r == b.root)
+    }
+
+    /// The old group at the stream's position: its entries.
+    fn group_len(&self) -> usize {
+        let sels = self.old.selectors_of(self.seg).unwrap_or(&[]);
+        let mut n = 0usize;
+        for (i, &sel) in sels.iter().enumerate().skip(self.at) {
+            if i > self.at && sel & OLD == 0 {
+                break;
+            }
+            n = n.saturating_add(1);
+        }
+        n
+    }
+
+    /// The key of the old group at `(seg, at)`, into `self.key`: the segment's anchor at its
+    /// start, else read through the group's run's probe cursor.
+    fn old_key<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        runs: &[Branch],
+        seg: usize,
+        at: usize,
+    ) -> Result<(), Error> {
+        self.key.clear();
+        if at == 0 {
+            self.key
+                .extend_from_slice(self.old.anchor(seg).ok_or(corrupt())?);
+            return Ok(());
+        }
+        let sels = self.old.selectors_of(seg).ok_or(corrupt())?;
+        let r = usize::from(sels.get(at).ok_or(corrupt())? & RUN);
+        let b = runs.get(r.saturating_add(1)).ok_or(corrupt())?;
+        let pos = b
+            .position_after(self.old.offset(seg, r)?, occurrences(sels, at, r))?
+            .ok_or(corrupt())?;
+        let slot = self.probes.get_mut(r).ok_or(corrupt())?;
+        if slot.is_none() {
+            *slot = Some(RunCursor::new(store)?);
+        }
+        let c = slot.as_mut().ok_or(corrupt())?;
+        c.place(b, store, pos)?;
+        self.key.extend_from_slice(c.key());
+        Ok(())
+    }
+
+    /// The merge point of `k` from the stream's position: the first old group whose key is at
+    /// least `k`, and whether it is `k`.
+    fn find_point<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        runs: &[Branch],
+        k: &[u8],
+    ) -> Result<(usize, usize, bool), Error> {
+        let segments = self.old.segments();
+        // The last segment from the current one whose anchor is below `k`: the point is in it
+        // or at the next one's start.
+        let (mut lo, mut hi) = (self.seg, segments);
+        while hi.saturating_sub(lo) > 1 {
+            let mid = lo.saturating_add(hi.saturating_sub(lo) / 2);
+            match self.old.anchor(mid) {
+                Some(a) if a < k => lo = mid,
+                _ => hi = mid,
+            }
+        }
+        let s = lo;
+        // The groups of segment `s` from the start (or the stream's position in its segment).
+        let sels = self.old.selectors_of(s).ok_or(corrupt())?;
+        let start = if s == self.seg { self.at } else { 0 };
+        let starts: Vec<usize> = sels
+            .iter()
+            .enumerate()
+            .skip(start)
+            .filter(|&(i, &sel)| i == start || sel & OLD == 0)
+            .map(|(i, _)| i)
+            .collect();
+        let (mut glo, mut ghi) = (0usize, starts.len());
+        let mut equal_at: Option<usize> = None;
+        while glo < ghi {
+            let mid = glo.saturating_add(ghi.saturating_sub(glo) / 2);
+            let at = *starts.get(mid).ok_or(corrupt())?;
+            self.old_key(store, runs, s, at)?;
+            match self.key.as_slice().cmp(k) {
+                std::cmp::Ordering::Less => glo = mid.saturating_add(1),
+                std::cmp::Ordering::Equal => {
+                    equal_at = Some(at);
+                    ghi = mid;
+                }
+                std::cmp::Ordering::Greater => ghi = mid,
+            }
+        }
+        if let Some(&at) = starts.get(glo) {
+            return Ok((s, at, equal_at == Some(at)));
+        }
+        // Past segment `s`: the next one's start, whose anchor says whether it is `k`.
+        let next = s.saturating_add(1);
+        let equal = self.old.anchor(next).is_some_and(|a| a == k);
+        Ok((next, 0, equal))
+    }
+
+    /// Opens a segment in the output for a group of `size` entries keyed `key`, the runs'
+    /// offsets taken where the streams stand, unless the group fits the one open.
+    fn open<F: BlockFile>(
+        &mut self,
+        runs: &[Branch],
+        size: usize,
+        key_from_old: bool,
+        store: &mut Store<F>,
+    ) -> Result<(), Error> {
+        if self.in_segment > 0 && self.in_segment.saturating_add(size) > self.width {
+            self.out.selector_ends.push(self.out.selectors.len());
+            self.in_segment = 0;
+        }
+        if self.in_segment > 0 {
+            return Ok(());
+        }
+        if key_from_old {
+            let (seg, at) = (self.seg, self.at);
+            self.old_key(store, runs, seg, at)?;
+        } else {
+            self.key.clear();
+            self.key.extend_from_slice(self.new.key());
+        }
+        self.out.anchors.extend_from_slice(&self.key);
+        self.out.anchor_ends.push(self.out.anchors.len());
+        let hi = self.hi.as_deref();
+        let new_in = self.new.valid() && hi.is_none_or(|h| self.new.key() < h);
+        self.out.offsets.push(if new_in {
+            let (page, index) = self.new.position();
+            (page, u16::try_from(index).map_err(|_| corrupt())?)
+        } else {
+            PAST
+        });
+        for r in 0..self.old.runs {
+            let left = self.left.get(r).copied().unwrap_or(0);
+            if left == 0 {
+                self.out.offsets.push(PAST);
+                continue;
+            }
+            let b = runs.get(r.saturating_add(1)).ok_or(corrupt())?;
+            let passed = self.in_seg.get(r).copied().unwrap_or(0);
+            let (page, index) = b
+                .position_after(self.old.offset(self.seg, r)?, passed)?
+                .ok_or(corrupt())?;
+            self.out
+                .offsets
+                .push((page, u16::try_from(index).map_err(|_| corrupt())?));
+        }
+        Ok(())
+    }
+
+    /// Copies the old group at the stream's position, its runs moved up one; shadowed whole
+    /// when `shadowed` (the new run holds its key).
+    fn copy_old(&mut self, shadowed: bool) -> Result<usize, Error> {
+        let n = self.group_len();
+        let sels = self.old.selectors_of(self.seg).ok_or(corrupt())?;
+        for &sel in sels
+            .get(self.at..self.at.saturating_add(n))
+            .ok_or(corrupt())?
+        {
+            let r = sel & RUN;
+            let mut out = r.checked_add(1).ok_or(corrupt())? | (sel & (OLD | TOMBSTONE));
+            if shadowed {
+                out |= OLD;
+            }
+            self.out.selectors.push(out);
+            if let Some(c) = self.in_seg.get_mut(usize::from(r)) {
+                *c = c.saturating_add(1);
+            }
+            if let Some(l) = self.left.get_mut(usize::from(r)) {
+                *l = l.saturating_sub(1);
+            }
+        }
+        self.in_segment = self.in_segment.saturating_add(n);
+        self.at = self.at.saturating_add(n);
+        if self.at >= sels.len() {
+            self.seg = self.seg.saturating_add(1);
+            self.at = 0;
+            self.in_seg.iter_mut().for_each(|c| *c = 0);
+        }
+        Ok(n)
+    }
+
+    /// Takes up to `budget` entries into the view: the entries taken, and whether the view is
+    /// whole.
+    pub fn step<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        runs: &[Branch],
+        budget: u64,
+    ) -> Result<(u64, bool), Error> {
+        if !self.reads(runs) {
+            return Err(Error::InvalidArgument {
+                what: "a view rebuild stepped over runs it was not started on",
+            });
+        }
+        let newest = runs.first().ok_or(corrupt())?;
+        let mut taken = 0u64;
+        while taken < budget {
+            let hi = self.hi.as_deref();
+            let new_in = self.new.valid() && hi.is_none_or(|h| self.new.key() < h);
+            let old_done = self.seg >= self.old.segments();
+            if !new_in && old_done {
+                if self.in_segment > 0 {
+                    self.out.selector_ends.push(self.out.selectors.len());
+                    self.in_segment = 0;
+                }
+                return Ok((taken, true));
+            }
+            if !new_in {
+                let size = self.group_len();
+                self.open(runs, size, true, store)?;
+                taken = taken.saturating_add(u64::try_from(self.copy_old(false)?).unwrap_or(0));
+                continue;
+            }
+            if self.point.is_none() {
+                let k = self.new.key().to_vec();
+                self.point = Some(if old_done {
+                    (self.seg, 0, false)
+                } else {
+                    self.find_point(store, runs, &k)?
+                });
+            }
+            let (ps, pa, equal) = self.point.ok_or(corrupt())?;
+            if !old_done && (self.seg, self.at) < (ps, pa) {
+                // An old group before the new key: copied unread.
+                let size = self.group_len();
+                self.open(runs, size, true, store)?;
+                taken = taken.saturating_add(u64::try_from(self.copy_old(false)?).unwrap_or(0));
+                continue;
+            }
+            // The new key: alone, or first of the old group it shadows.
+            let size = if equal && !old_done {
+                self.group_len().saturating_add(1)
+            } else {
+                1
+            };
+            self.open(runs, size, false, store)?;
+            let mut sel = 0u8;
+            if self.new.op() == Op::Delete {
+                sel |= TOMBSTONE;
+            }
+            self.out.selectors.push(sel);
+            self.in_segment = self.in_segment.saturating_add(1);
+            taken = taken.saturating_add(1);
+            if equal && !old_done {
+                taken = taken.saturating_add(u64::try_from(self.copy_old(true)?).unwrap_or(0));
+            }
+            self.new.next(newest, store)?;
+            self.point = None;
+        }
+        Ok((taken, false))
+    }
+
+    /// The view rebuilt, the cursors given back to `store`.
+    pub fn finish<F: BlockFile>(self, store: &mut Store<F>) -> View {
+        self.new.give_back(store);
+        for c in self.probes.into_iter().flatten() {
+            c.give_back(store);
+        }
+        self.out
+    }
+
+    /// Drops the rebuild, its cursors given back to `store`.
+    pub fn abandon<F: BlockFile>(self, store: &mut Store<F>) {
+        drop(self.finish(store));
     }
 }
 

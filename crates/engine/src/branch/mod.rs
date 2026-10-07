@@ -1018,3 +1018,219 @@ impl Branch {
         ))
     }
 }
+
+/// A cursor over a branch's entries that walks its leaves in page order: a run of a REMIX view
+/// (docs/design/engine-structure.md §5, E6). Placed at a page number and an entry, as a view's
+/// offsets name them, it needs no path from the root: a branch's tree pages precede its filter's
+/// in its extents, and each page names its kind, so the next leaf is the next leaf page.
+#[derive(Debug)]
+pub struct RunCursor {
+    /// The leaf's page number in the branch's pages, and the entry in it.
+    page_no: u64,
+    index: usize,
+    n: usize,
+    page: Vec<u8>,
+    span: Span,
+    key: Vec<u8>,
+    value: Vec<u8>,
+    op: Op,
+    valid: bool,
+}
+
+impl Branch {
+    /// The address of page `page_no`, counted through the branch's extents in order.
+    pub fn page_address<F: BlockFile>(&self, store: &Store<F>, page_no: u64) -> Result<u64, Error> {
+        let per = u64::from(store.extent_pages());
+        let extent = usize::try_from(
+            page_no
+                .checked_div(per)
+                .ok_or(corrupt(Malformed::TooLarge))?,
+        )
+        .ok()
+        .and_then(|i| self.extents.get(i))
+        .ok_or(corrupt(Malformed::OutOfRange))?;
+        let within = u32::try_from(page_no.checked_rem(per).unwrap_or(0))
+            .map_err(|_| corrupt(Malformed::TooLarge))?;
+        store.address(*extent, within)
+    }
+
+    /// The page number of `address` in the branch's pages.
+    fn page_no_of<F: BlockFile>(&self, store: &Store<F>, address: u64) -> Result<u64, Error> {
+        let per = u64::from(store.extent_pages());
+        let extent = store.extent_of(address);
+        let i = self
+            .extents
+            .iter()
+            .position(|&e| e == extent)
+            .ok_or(corrupt(Malformed::OutOfRange))?;
+        u64::try_from(i)
+            .ok()
+            .and_then(|i| i.checked_mul(per))
+            .and_then(|p| p.checked_add(address.checked_rem(per)?))
+            .ok_or(corrupt(Malformed::TooLarge))
+    }
+
+    /// A run cursor at the first entry at or past `from`, found by one descent.
+    pub fn run_at<F: BlockFile>(
+        &self,
+        store: &mut Store<F>,
+        from: &[u8],
+    ) -> Result<RunCursor, Error> {
+        let mut c = RunCursor::new(store)?;
+        let mut address = self.root;
+        for _ in 0..=self.height {
+            c.page.clear();
+            if let Err(e) = store.read_page(address, &mut c.page) {
+                c.give_back(store);
+                return Err(e);
+            }
+            let view = View::new(&c.page)?;
+            let floor = view.floor(from)?;
+            if view.kind == INDEX {
+                address = child_of(view.entry(floor.unwrap_or(0))?.1)?;
+                continue;
+            }
+            let i = match floor {
+                Some(i) if view.compare(from, i)? == Ordering::Equal => i,
+                Some(i) => i.saturating_add(1),
+                None => 0,
+            };
+            c.page_no = self.page_no_of(store, address)?;
+            c.n = view.n;
+            c.index = i;
+            if i >= c.n {
+                c.next_leaf(self, store)?;
+            } else {
+                c.load()?;
+            }
+            return Ok(c);
+        }
+        Err(corrupt(Malformed::CountMismatch))
+    }
+
+    /// A run cursor at entry `index` of the leaf at page `page_no`: a view's offset.
+    pub fn run_from<F: BlockFile>(
+        &self,
+        store: &mut Store<F>,
+        page_no: u64,
+        index: usize,
+    ) -> Result<RunCursor, Error> {
+        let mut c = RunCursor::new(store)?;
+        c.page_no = page_no;
+        let address = self.page_address(store, page_no)?;
+        store.read_page_ahead(&mut c.span, address, &mut c.page)?;
+        let view = View::new(&c.page)?;
+        if view.kind != LEAF || index >= view.n {
+            return Err(corrupt(Malformed::OutOfRange));
+        }
+        c.n = view.n;
+        c.index = index;
+        c.load()?;
+        Ok(c)
+    }
+}
+
+impl RunCursor {
+    fn new<F: BlockFile>(store: &mut Store<F>) -> Result<Self, Error> {
+        Ok(Self {
+            page_no: 0,
+            index: 0,
+            n: 0,
+            page: store.take_page(),
+            span: store.span()?,
+            key: Vec::new(),
+            value: Vec::new(),
+            op: Op::Put,
+            valid: false,
+        })
+    }
+
+    /// Gives the cursor's page and span back to `store`'s pools.
+    pub fn give_back<F: BlockFile>(self, store: &mut Store<F>) {
+        store.give_page(self.page);
+        store.give_span(self.span);
+    }
+
+    /// Whether the cursor is at an entry.
+    pub fn valid(&self) -> bool {
+        self.valid
+    }
+
+    /// The entry's key, operation and value.
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    pub fn op(&self) -> Op {
+        self.op
+    }
+
+    pub fn value(&self) -> &[u8] {
+        &self.value
+    }
+
+    /// Where the cursor is: the leaf's page number and the entry's index in it.
+    pub fn position(&self) -> (u64, usize) {
+        (self.page_no, self.index)
+    }
+
+    /// Moves to the next entry of `branch`, the one the cursor walks.
+    pub fn next<F: BlockFile>(
+        &mut self,
+        branch: &Branch,
+        store: &mut Store<F>,
+    ) -> Result<(), Error> {
+        if !self.valid {
+            return Ok(());
+        }
+        self.index = self.index.saturating_add(1);
+        if self.index < self.n {
+            return self.load();
+        }
+        self.next_leaf(branch, store)
+    }
+
+    /// The next leaf page after this one, before the branch's filter pages; none leaves the
+    /// cursor invalid. Index pages between leaves are passed over, at most the tree's pages.
+    fn next_leaf<F: BlockFile>(
+        &mut self,
+        branch: &Branch,
+        store: &mut Store<F>,
+    ) -> Result<(), Error> {
+        loop {
+            self.page_no = self.page_no.saturating_add(1);
+            if self.page_no >= branch.filter_start {
+                self.valid = false;
+                return Ok(());
+            }
+            let address = branch.page_address(store, self.page_no)?;
+            self.page.clear();
+            store.read_page_ahead(&mut self.span, address, &mut self.page)?;
+            let view = View::new(&self.page)?;
+            if view.kind == LEAF {
+                self.n = view.n;
+                self.index = 0;
+                return self.load();
+            }
+        }
+    }
+
+    fn load(&mut self) -> Result<(), Error> {
+        let view = View::new(&self.page)?;
+        let (suffix, rest) = view.entry(self.index)?;
+        self.key.clear();
+        self.key.extend_from_slice(view.prefix);
+        self.key.extend_from_slice(suffix);
+        self.op =
+            rest.first()
+                .and_then(|&b| Op::from_byte(b))
+                .ok_or(corrupt(Malformed::UnknownTag(
+                    rest.first().copied().unwrap_or(0),
+                )))?;
+        self.value.clear();
+        self.value
+            .extend_from_slice(rest.get(3..).ok_or(corrupt(Malformed::Truncated))?);
+        self.valid = true;
+        Ok(())
+    }
+}

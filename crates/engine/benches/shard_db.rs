@@ -320,6 +320,18 @@ fn main() {
         mib(u.as_ref().and_then(|u| u.peak_footprint)),
     );
     let (_, t2, io2) = db.stats();
+    let plan = db.filter_plan();
+    println!(
+        "filters: {} branches, {:.2} bits a key in all, false positives a get now {:.5}, with rates by entries over visits {:.5} ({:.1}x fewer), or today's rate in {:.2} bits a key ({:.0}% of today's), over {} gets",
+        plan.branches,
+        plan.bits / num as f64,
+        plan.now,
+        plan.best,
+        plan.now / plan.best.max(f64::MIN_POSITIVE),
+        plan.bits_for_now / num as f64,
+        100.0 * plan.bits_for_now / plan.bits.max(1.0),
+        plan.gets
+    );
     println!(
         "maplets built {} declined {} dropped {}",
         t2.maplets_built, t2.maplets_declined, t2.maplets_dropped

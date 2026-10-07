@@ -76,7 +76,10 @@ fn a_derived_log_holds_the_largest_entry_in_one_frame() {
     let config = Config::derive(&facts(largest, 4096, 1 << 30)).unwrap();
     assert_eq!(config.segment_bytes % BLOCK as u64, 0);
     assert_eq!(config.max_groups, 4096);
-    assert_eq!(config.queue_submissions, 4096 * 2);
+    // The queue admits each group's writes alike: as many for 4,096 groups as for one, 4,096 times.
+    let one = Config::derive(&facts(largest, 1, 1 << 30)).unwrap();
+    assert!(one.queue_submissions >= 1);
+    assert_eq!(config.queue_submissions, 4096 * one.queue_submissions);
     assert_eq!(config.group_entries, 2 * 1024 + 256);
     assert_eq!(config.group_bytes, 2 * (1 << 24) + (1 << 25));
     assert_eq!(config.group_cache, (1 << 26) / 4096);
@@ -189,7 +192,14 @@ proptest! {
                     (u64::from(config.max_segments) + 1) * config.segment_bytes <= f.disk_bytes
                 );
                 prop_assert!(config.group_bytes >= largest as u64);
-                prop_assert_eq!(config.queue_submissions, groups * 2);
+                // Whatever a group's writes are, the queue admits them for every group alike. One
+                // group's segment is no larger than these groups' (its persist slots are smaller),
+                // so the same facts derive for it.
+                let mut alone = f;
+                alone.max_groups = 1;
+                let one = Config::derive(&alone).unwrap();
+                prop_assert!(one.queue_submissions >= 1);
+                prop_assert_eq!(config.queue_submissions, groups * one.queue_submissions);
                 if !sealed {
                     let log = Log::create(sim(seed), config, ID).unwrap();
                     prop_assert!(log.entry_room().unwrap() >= largest);

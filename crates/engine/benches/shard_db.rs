@@ -319,7 +319,11 @@ fn main() {
         mib(u.as_ref().and_then(|u| u.footprint)),
         mib(u.as_ref().and_then(|u| u.peak_footprint)),
     );
-    let (_, _, io2) = db.stats();
+    let (_, t2, io2) = db.stats();
+    println!(
+        "maplets built {} declined {} dropped {}",
+        t2.maplets_built, t2.maplets_declined, t2.maplets_dropped
+    );
     println!(
         "read io reads {} ({:.2}s) cache hits {} misses {}",
         io2.reads - io.reads,

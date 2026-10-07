@@ -90,6 +90,12 @@ struct Bundle {
     added: usize,
     /// The extents the view is written in, once a saved image names it.
     stored: Option<Vec<u64>>,
+    /// The maplet routing a key to the branches that may hold it, values their ages (the
+    /// oldest 0), once built ([`Trunk::maplet_step`]; research/38).
+    maplet: Option<crate::maplet::Maplet>,
+    /// Whether a maplet built for these branches measured slower than their filters: none is
+    /// built again until the branches change.
+    declined: bool,
 }
 
 impl Clone for Bundle {
@@ -100,6 +106,8 @@ impl Clone for Bundle {
             basis: None,
             added: 0,
             stored: None,
+            maplet: None,
+            declined: false,
         }
     }
 }
@@ -112,6 +120,8 @@ impl From<Vec<Branch>> for Bundle {
             basis: None,
             added: 0,
             stored: None,
+            maplet: None,
+            declined: false,
         }
     }
 }
@@ -129,6 +139,8 @@ impl Bundle {
 
     /// The branches, to change: the view is dropped.
     fn branches_mut(&mut self) -> &mut Vec<Branch> {
+        self.maplet = None;
+        self.declined = false;
         self.view = None;
         self.basis = None;
         self.added = 0;
@@ -140,6 +152,8 @@ impl Bundle {
     /// basis kept counts the runs added since.
     fn push_newest(&mut self, b: Branch) {
         self.stored = None;
+        self.maplet = None;
+        self.declined = false;
         if let Some(v) = self.view.take() {
             self.basis = Some(v);
             self.added = 1;
@@ -151,6 +165,8 @@ impl Bundle {
 
     /// The branches taken out, the bundle left empty, its view dropped.
     fn take(&mut self) -> Vec<Branch> {
+        self.maplet = None;
+        self.declined = false;
         self.view = None;
         self.basis = None;
         self.added = 0;
@@ -193,6 +209,11 @@ pub struct TrunkStats {
     /// in (more than the rebuilds when several runs were added before one).
     pub views_rebuilt: u64,
     pub views_merged: u64,
+    /// Maplets of pivot bundles built, and builds dropped because their bundle changed.
+    pub maplets_built: u64,
+    pub maplets_dropped: u64,
+    /// Maplets measured slower than their bundles' filters, and not kept.
+    pub maplets_declined: u64,
 }
 
 /// Nanoseconds since `t`, none when timing is off (`Trunk::set_timed`).
@@ -231,6 +252,58 @@ pub struct Trunk {
     /// round from `view_at`: every node once after a change.
     views_unchecked: usize,
     view_at: usize,
+    /// The maplet being built, and the nodes to check for a pivot bundle wanting one, as views'.
+    maplet_job: Option<MapletJob>,
+    maplets_unchecked: usize,
+    maplet_at: usize,
+    /// Gets' filter routes through bundles of several branches ([`Tally`]).
+    routes: Tally,
+}
+
+/// Gets' routes through bundles of several branches by their filters: the branches such bundles
+/// held and the filters probed in them. Their ratio is the share of a bundle's filters a get
+/// probes, which the share of keys absent and where present keys are found set; it prices a
+/// bundle's filters against its maplet ([`Trunk::maplet_step`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Tally {
+    pub branches: u64,
+    pub probes: u64,
+}
+
+impl Tally {
+    fn add(self, other: Self) -> Self {
+        Self {
+            branches: self.branches.saturating_add(other.branches),
+            probes: self.probes.saturating_add(other.probes),
+        }
+    }
+}
+
+/// A maplet being built for pivot `pivot` of node `node` from its branches' hash lists, merged
+/// in hash order: a cursor and its next hash for each branch, newest first, and the build.
+#[derive(Debug)]
+struct MapletJob {
+    node: usize,
+    pivot: usize,
+    roots: Vec<u64>,
+    heads: Vec<(crate::branch::HashCursor, Option<u32>)>,
+    builder: crate::maplet::Builder,
+    pages: Vec<Vec<u8>>,
+    /// Once merged, the maplet being measured against the bundle's filters.
+    trial: Option<Trial>,
+}
+
+/// A built maplet timed against its bundle's filters on as many random hashes as it holds keys,
+/// a chunk a step: its routes' nanoseconds, the filters' probes' (every filter of the bundle
+/// for each hash), and the hashes timed so far; the hashes drawn from `x`.
+#[derive(Debug)]
+struct Trial {
+    maplet: crate::maplet::Maplet,
+    done: u64,
+    maplet_ns: u64,
+    filter_ns: u64,
+    x: u64,
+    hashes: Vec<u64>,
 }
 
 /// A view being built for pivot `pivot` of node `node`: from its runs, or rebuilt from the view
@@ -508,6 +581,10 @@ impl Trunk {
             view_extents: Vec::new(),
             views_unchecked: 0,
             view_at: 0,
+            maplet_job: None,
+            maplets_unchecked: 0,
+            maplet_at: 0,
+            routes: Tally::default(),
         })
     }
 
@@ -536,7 +613,7 @@ impl Trunk {
 
     /// The newest entry for `key` in the trunk: its operation and value into `value`.
     pub fn get<F: BlockFile>(
-        &self,
+        &mut self,
         store: &mut Store<F>,
         key: &[u8],
         value: &mut Vec<u8>,
@@ -546,11 +623,26 @@ impl Trunk {
 
     /// [`Self::get`] of a key whose filter hash is `hash`.
     pub fn get_hashed<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        key: &[u8],
+        hash: u64,
+        value: &mut Vec<u8>,
+    ) -> Result<Option<Op>, Error> {
+        let mut tally = Tally::default();
+        let found = self.find(store, key, hash, value, &mut tally);
+        self.routes = self.routes.add(tally);
+        found
+    }
+
+    /// [`Self::get_hashed`], tallying the filters it probes in bundles of several branches.
+    fn find<F: BlockFile>(
         &self,
         store: &mut Store<F>,
         key: &[u8],
         hash: u64,
         value: &mut Vec<u8>,
+        tally: &mut Tally,
     ) -> Result<Option<Op>, Error> {
         for b in self.pending.iter().rev() {
             if let Some(op) = b.get_hashed(store, key, hash, value)? {
@@ -570,9 +662,39 @@ impl Trunk {
                     }
                 }
             }
-            for b in pivot.bundle.branches() {
-                if let Some(op) = b.get_hashed(store, key, hash, value)? {
-                    return Ok(Some(op));
+            let branches = pivot.bundle.branches();
+            match &pivot.bundle.maplet {
+                // One lookup names the branches that may hold the key, by age (the oldest 0):
+                // those are read, newest first, without their filters.
+                Some(m) => {
+                    let mask = m.route(hash)?;
+                    let n = branches.len();
+                    for (i, b) in branches.iter().enumerate() {
+                        let age = n.saturating_sub(1).saturating_sub(i);
+                        let named = u32::try_from(age)
+                            .ok()
+                            .and_then(|a| 1u64.checked_shl(a))
+                            .is_some_and(|bit| mask & bit != 0);
+                        if named && let Some(op) = b.get_routed(store, key, value)? {
+                            return Ok(Some(op));
+                        }
+                    }
+                }
+                None => {
+                    let several = branches.len() >= 2;
+                    if several {
+                        tally.branches = tally
+                            .branches
+                            .saturating_add(u64::try_from(branches.len()).unwrap_or(u64::MAX));
+                    }
+                    for b in branches {
+                        if several {
+                            tally.probes = tally.probes.saturating_add(1);
+                        }
+                        if let Some(op) = b.get_hashed(store, key, hash, value)? {
+                            return Ok(Some(op));
+                        }
+                    }
                 }
             }
             match pivot.child {
@@ -700,6 +822,7 @@ impl Trunk {
     /// split) costs no budget, and each is taken once, so a step ends. Returns the keys merged.
     pub fn step<F: BlockFile>(&mut self, store: &mut Store<F>, budget: u64) -> Result<u64, Error> {
         self.views_unchecked = self.nodes.len();
+        self.maplets_unchecked = self.nodes.len();
         self.run(store, budget, true)
     }
 
@@ -707,12 +830,201 @@ impl Trunk {
     /// the root at the next step.
     pub fn finish_cascade<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
         self.views_unchecked = self.nodes.len();
+        self.maplets_unchecked = self.nodes.len();
         self.run(store, u64::MAX, false).map(|_| ())
     }
 
     /// How views are made when they can be rebuilt ([`ViewChoice`]).
     pub fn set_view_choice(&mut self, choice: ViewChoice) {
         self.view_choice = choice;
+    }
+
+    /// Whether a pivot bundle may want a maplet: one being built, or nodes not checked since the
+    /// trunk changed.
+    pub fn maplets_owed(&self) -> bool {
+        self.maplet_job.is_some() || self.maplets_unchecked > 0
+    }
+
+    /// Up to `budget` hashes of maplet building, for the shard's idle time, as [`Self::view_step`]
+    /// builds views: the build in progress, if its pivot's bundle is still the one it reads; else
+    /// a check of up to `budget` nodes for a pivot bundle of two branches or more with no maplet,
+    /// whose build then starts. A bundle's maplet is merged from its branches' hash lists in hash
+    /// order, its values their ages, without reading their entries (research/38 §5). Returns the
+    /// work done, at least one while maplets are owed.
+    pub fn maplet_step<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        budget: u64,
+    ) -> Result<u64, Error> {
+        if let Some(mut job) = self.maplet_job.take() {
+            let same = self
+                .bundle_of(job.node, job.pivot)
+                .is_some_and(|bs| bs.iter().map(|b| b.root).eq(job.roots.iter().copied()));
+            if !same {
+                self.stats.maplets_dropped = self.stats.maplets_dropped.saturating_add(1);
+                return Ok(1);
+            }
+            let branches = self.bundle_of(job.node, job.pivot).ok_or(corrupt())?;
+            if let Some(mut trial) = job.trial.take() {
+                let entries = trial.maplet.shape.entries.max(1);
+                let chunk = budget.max(1).min(entries.saturating_sub(trial.done));
+                trial.hashes.clear();
+                for _ in 0..chunk {
+                    trial.x ^= trial.x << 13;
+                    trial.x ^= trial.x >> 7;
+                    trial.x ^= trial.x << 17;
+                    trial.hashes.push(trial.x);
+                }
+                let mut sink = 0u64;
+                let t = std::time::Instant::now();
+                for &h in &trial.hashes {
+                    sink ^= trial.maplet.route(h)?;
+                }
+                let routed = t.elapsed();
+                let t = std::time::Instant::now();
+                for &h in &trial.hashes {
+                    for b in branches {
+                        sink ^= u64::from(b.filter.may_contain(h));
+                    }
+                }
+                let probed = t.elapsed();
+                std::hint::black_box(sink);
+                let ns = |d: std::time::Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+                trial.maplet_ns = trial.maplet_ns.saturating_add(ns(routed));
+                trial.filter_ns = trial.filter_ns.saturating_add(ns(probed));
+                trial.done = trial.done.saturating_add(chunk);
+                if trial.done < entries {
+                    job.trial = Some(trial);
+                    self.maplet_job = Some(job);
+                    return Ok(chunk.max(1));
+                }
+                // Kept when a route through it costs less than the filters' expected share: per
+                // route, maplet_ns / n against (filter_ns / (n k)) · k · probes / branches, the
+                // tally's share of a bundle's filters a get probes; with no tally yet, every
+                // filter (an absent key's route).
+                let routes = if self.routes.branches == 0 {
+                    Tally {
+                        branches: 1,
+                        probes: 1,
+                    }
+                } else {
+                    self.routes
+                };
+                let keep = u128::from(trial.maplet_ns).saturating_mul(u128::from(routes.branches))
+                    < u128::from(trial.filter_ns).saturating_mul(u128::from(routes.probes));
+                if let Some(p) = self
+                    .nodes
+                    .get_mut(job.node)
+                    .and_then(|nd| nd.pivots.get_mut(job.pivot))
+                {
+                    if keep {
+                        p.bundle.maplet = Some(trial.maplet);
+                        self.stats.maplets_built = self.stats.maplets_built.saturating_add(1);
+                    } else {
+                        p.bundle.declined = true;
+                        self.stats.maplets_declined = self.stats.maplets_declined.saturating_add(1);
+                    }
+                }
+                return Ok(chunk.max(1));
+            }
+            let n = branches.len();
+            let mut work = 0u64;
+            let MapletJob {
+                heads,
+                builder,
+                pages,
+                ..
+            } = &mut job;
+            let mut emit = |p: &[u8]| {
+                pages.push(p.to_vec());
+                Ok(())
+            };
+            // Each round adds a hash: at most the budget.
+            while work < budget.max(1) {
+                // The least next hash among the branches' (a bundle has at most its fanout and one).
+                let next = heads
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, (_, h))| h.map(|h| (h, i)))
+                    .min();
+                let Some((h, i)) = next else { break };
+                let age = n.saturating_sub(1).saturating_sub(i);
+                builder.add(h, u8::try_from(age).map_err(|_| corrupt())?, &mut emit)?;
+                if let (Some((cursor, head)), Some(b)) = (heads.get_mut(i), branches.get(i)) {
+                    *head = cursor.next(store, b)?;
+                }
+                work = work.saturating_add(1);
+            }
+            if heads.iter().any(|(_, h)| h.is_some()) {
+                self.maplet_job = Some(job);
+                return Ok(work.max(1));
+            }
+            let builder = std::mem::replace(
+                &mut job.builder,
+                crate::maplet::Builder::new(crate::maplet::BUCKETS.trailing_zeros(), 0, 1)?,
+            );
+            let mut pages = std::mem::take(&mut job.pages);
+            let shape = builder.close(&mut |p: &[u8]| {
+                pages.push(p.to_vec());
+                Ok(())
+            })?;
+            job.trial = Some(Trial {
+                maplet: crate::maplet::Maplet { shape, pages },
+                done: 0,
+                maplet_ns: 0,
+                filter_ns: 0,
+                x: job.roots.first().copied().unwrap_or(1) | 1,
+                hashes: Vec::new(),
+            });
+            self.maplet_job = Some(job);
+            return Ok(work.max(1));
+        }
+        let mut checked = 0u64;
+        while self.maplets_unchecked > 0 && checked < budget.max(1) {
+            self.maplets_unchecked = self.maplets_unchecked.saturating_sub(1);
+            checked = checked.saturating_add(1);
+            let n = self.maplet_at.checked_rem(self.nodes.len()).unwrap_or(0);
+            self.maplet_at = n.saturating_add(1);
+            let Some(node) = self.nodes.get(n) else {
+                continue;
+            };
+            let wanting = node.pivots.iter().position(|p| {
+                p.bundle.branches().len() >= 2 && p.bundle.maplet.is_none() && !p.bundle.declined
+            });
+            let Some(i) = wanting else { continue };
+            let branches = self.bundle_of(n, i).ok_or(corrupt())?;
+            let entries = branches
+                .iter()
+                .map(|b| b.count)
+                .fold(0u64, u64::saturating_add);
+            let value_bits =
+                crate::maplet::ceil_log2(u64::try_from(branches.len()).unwrap_or(u64::MAX));
+            let builder = crate::maplet::Builder::new(
+                crate::maplet::bucket_bits(entries),
+                value_bits,
+                store.page_capacity(),
+            )?;
+            let mut heads = Vec::with_capacity(branches.len());
+            for b in branches {
+                let mut cursor = b.hashes(store)?;
+                let head = cursor.next(store, b)?;
+                heads.push((cursor, head));
+            }
+            self.maplet_job = Some(MapletJob {
+                node: n,
+                pivot: i,
+                roots: branches.iter().map(|b| b.root).collect(),
+                heads,
+                builder,
+                pages: Vec::new(),
+                trial: None,
+            });
+            // The node again, for its other pivots.
+            self.maplet_at = n;
+            self.maplets_unchecked = self.maplets_unchecked.saturating_add(1);
+            break;
+        }
+        Ok(checked.max(1))
     }
 
     /// Whether a pivot bundle may want a view: one being built, or nodes not checked since the
@@ -1341,6 +1653,11 @@ impl Trunk {
             // Views are not saved: every node is checked for a bundle wanting one after a load.
             views_unchecked: unchecked,
             view_at: 0,
+            // Maplets are not saved either: rebuilt from the branches' hash lists after a load.
+            maplet_job: None,
+            maplets_unchecked: unchecked,
+            maplet_at: 0,
+            routes: Tally::default(),
         })
     }
 

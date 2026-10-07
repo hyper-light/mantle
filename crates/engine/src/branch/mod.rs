@@ -942,6 +942,16 @@ impl Branch {
         if !self.filter.may_contain(hash) {
             return Ok(None);
         }
+        self.get_routed(store, key, value)
+    }
+
+    /// [`Self::get`] for a key its bundle's maplet routed here: its filter not asked again.
+    pub fn get_routed<F: BlockFile>(
+        &self,
+        store: &mut Store<F>,
+        key: &[u8],
+        value: &mut Vec<u8>,
+    ) -> Result<Option<Op>, Error> {
         // The leaf by the index, from memory: the one page read, parsed where the store holds
         // it, only the value copied out.
         let page_no = self.leaf_of(key)?;

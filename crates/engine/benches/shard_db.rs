@@ -64,6 +64,9 @@ fn main() {
     // The device issuer's depth as the eighth argument, none by default: the store's runs are
     // then handed to it, that many out at once, and puts go on while the device writes.
     let issuer_depth: usize = args.get(7).map_or(0, |s| s.parse().unwrap());
+    // The runs the store may have out at once as the ninth argument, the issuer's depth by
+    // default: extent buffers spared so puts go on while a contended device lags.
+    let batches: usize = args.get(8).map_or(issuer_depth, |s| s.parse().unwrap());
     let path = dir.join("shard_db.store");
     let _ = std::fs::remove_file(&path);
     let align = Alignment::new(4096).unwrap();
@@ -95,7 +98,7 @@ fn main() {
     db.set_cache((cache_mib << 20) / 4096);
     let issuer = (issuer_depth > 0).then(|| Issuer::start(&dir, issuer_depth).unwrap());
     if let Some(issuer) = &issuer {
-        db.attach(issuer, issuer.depth()).unwrap();
+        db.attach(issuer, batches.max(1)).unwrap();
     }
     let value = [b'v'; 100];
     let mut rng = Rng(301);

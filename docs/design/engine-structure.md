@@ -264,8 +264,15 @@ bounded seek pass over a source with nothing in its range without reading it (cl
   - seeks bounded to 1 key passed over 0.68 of 1.77 sources each, at p50 2.42 µs against 3.88
     open, 637 k operations a second against 445 k;
   - seeks bounded to 10 keys passed over 0.10, and paid 0.1 µs for the checks.
-  A gate that checks a shard's sources only while their measured rule-out rate pays for the
-  check is the next step.
+  A check costs about 0.12 µs and a source passed over saves about 2.1 µs, so checks pay
+  once about 6% of sources are ruled out; ten-key bounds sit at that break-even, and a gate
+  would win at most about 3% there, so checks stay on for every bounded scan.
+- **Seek maxima** (2026-10-07): under the mixed workload, a seek now and then takes 3 to 165 ms
+  where p99.99 is 32–40 µs (RocksDB's: 59–81 µs). Each slow seek was attributed to its page
+  reads (`pread`), and the maxima stay at 19–29 ms with direct I/O, where the OS cache's
+  writeback is out of the path: they are the device's read stalls on a busy machine, not the
+  engine's work. They are answered by caching, and above the engine by reads hedged across
+  replicas.
 
 Held to: seekrandom and short listings against RocksDB's `db_bench` at the same key count,
 under load, every percentile, with allocations, reallocations and page faults a seek.

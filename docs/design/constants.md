@@ -94,8 +94,19 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/ec/src/durability.rs` `MAX_TERMS` | bound | 170 series terms at Λτ ≤ ½: past it the tail bound 2·(½)^(K+1)/(K+1)! is below every positive double (170! is the largest factorial a double holds); research/15 §4.6. |
 | `crates/ec/src/durability.rs` `MOST_COPIES` | cited | Three copies, the replication of a block still being written; research/04 §R1.1. |
 | `crates/ec/src/durability.rs` `YEAR` | derived | Unit conversion: 365.25 days × 24 h = 8766 hours. |
+| `crates/engine/src/fst/bits.rs` `SELECT_SAMPLE` | cited | 64: select samples every 64th set bit, 9–17% of a dense bit vector and 1–2% of the trie (Zhang et al., SuRF, SIGMOD 2018 §2.6; research/35 §1). |
+| `crates/engine/src/fst/trie.rs` `DENSE_BLOCK` | cited | 64-bit rank blocks for LOUDS-Dense: a rank is one popcount, 50% over its small bitmaps (SuRF §2.6; research/35 §1). |
+| `crates/engine/src/fst/trie.rs` `DENSE_NODE_BITS` | format | 513: a LOUDS-Dense node's two 256-bit bitmaps (labels, branches going on) and its own-key bit. |
+| `crates/engine/src/fst/trie.rs` `DENSE_RATIO` | cited | R = 64: the dense levels at most 1/64 of the sparse levels below them (SuRF §2.4; research/35 §1). |
+| `crates/engine/src/fst/trie.rs` `SPARSE_BLOCK` | cited | 512-bit rank blocks for LOUDS-Sparse: a block in a cache line, 6.25% over the bits (SuRF §2.6; research/35 §1). |
+| `crates/engine/src/fst/trie.rs` `SPARSE_LABEL_BITS` | format | 10: a LOUDS-Sparse label's byte and its has-child and node-start bits. |
+| `crates/engine/src/remix.rs` `OLD` | format | 0x80, a selector's bit for a version a newer run shadows (Zhong et al., REMIX, FAST 2021 §4.1; research/34 §4). |
+| `crates/engine/src/remix.rs` `RUN` | format | 0x3f, a selector's run bits: runs 0 to 62, 0x3f the paper's placeholder (REMIX §4.1). |
+| `crates/engine/src/remix.rs` `SEGMENT` | cited | 32 entries a segment as the paper evaluates it: 2.9 B a key for 48-byte keys and 8 runs, 3.16% of the data (REMIX Table 1; research/34 §4); wider for more runs, so a key's versions fit one. |
+| `crates/engine/src/remix.rs` `TOMBSTONE` | format | 0x40, a selector's bit for a deletion (REMIX §4.1). |
 | `crates/engine/src/table/format.rs` `CONTEXT_CHECKSUM_FORMAT_VERSION` | format | The first block-based table format_version whose block and footer checksums carry the context modifier [R table/format.h:218-220] (docs/research/24 §1.2). |
 | `crates/engine/src/table/format.rs` `LAST_BYTE_PRIME` | format | `kRandomPrime` 0x6b9083d9 of `ModifyChecksumForLastByte`, folding a block's compression-type byte into its XXH3 checksum [R table/format.cc:606-612] (docs/research/24 §1.2). |
+| `crates/engine/src/trunk/mod.rs` `MAX_VIEW_RUNS` | format | 63: the runs a view names, a selector's six run bits less the placeholder (REMIX §4.1). |
 | `crates/engine/src/util/coding.rs` `CONTINUATION` | format | 0x80, the LEB128 varint's continuation bit [R util/coding.cc:27] (docs/research/24 §1.1). |
 | `crates/engine/src/util/coding.rs` `MAX_VARINT32_LENGTH` | format | 5 bytes, the longest varint32: 32 bits at 7 per byte [R util/coding.h:156] (docs/research/24 §1.1). |
 | `crates/engine/src/util/coding.rs` `MAX_VARINT64_LENGTH` | format | 10 bytes, `kMaxVarint64Length` [R util/coding.h:36] (docs/research/24 §1.1). |

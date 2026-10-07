@@ -452,6 +452,17 @@ impl Cache {
         }
     }
 
+    /// Whether `address` was evicted recently enough that the ghost still names it: a miss on
+    /// it is a read a larger cache would have saved.
+    pub fn in_ghost(&self, address: u64) -> bool {
+        self.ghosts.contains_key(&address)
+    }
+
+    /// Addresses the ghost may hold: the pages a miss on a ghost stands for.
+    pub fn ghost_pages(&self) -> usize {
+        Self::ghost_cap(self.slots.len())
+    }
+
     /// Slots the cache has.
     pub fn pages(&self) -> usize {
         self.slots.len()

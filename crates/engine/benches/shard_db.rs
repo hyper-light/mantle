@@ -112,6 +112,10 @@ fn main() {
     // Write memory for runs waiting for the issuer, in MiB, as the sixteenth argument, none by
     // default (`ShardDb::set_write_budget`).
     let write_budget_mib: usize = args.get(15).map_or(0, |s| s.parse().unwrap());
+    // A memory budget for the cache and write memory together, in MiB, as the seventeenth
+    // argument, divided by the shard's tuner (`ShardDb::set_memory`) in place of the fixed
+    // cache and write budget; none by default.
+    let memory_mib: usize = args.get(16).map_or(0, |s| s.parse().unwrap());
     let path = dir.join("shard_db.store");
     let _ = std::fs::remove_file(&path);
     let align = Alignment::new(4096).unwrap();
@@ -149,6 +153,9 @@ fn main() {
         db.attach(issuer, batches.max(1)).unwrap();
     }
     db.set_write_budget(write_budget_mib << 20);
+    if memory_mib > 0 {
+        db.set_memory(memory_mib << 20);
+    }
     let value = [b'v'; 100];
     let mut rng = Rng(301);
     // Each operation timed, into a vector sized before the run: percentiles from the sorted
@@ -381,6 +388,12 @@ fn main() {
             s * 1e6 / mix as f64
         );
     }
+    let (cache_bytes, write_bytes) = db.memory_split();
+    println!(
+        "memory split cache {:.1} MiB write {:.1} MiB",
+        cache_bytes as f64 / (1 << 20) as f64,
+        write_bytes as f64 / (1 << 20) as f64
+    );
     let (h, n, l) = db.shape().unwrap();
     let (_, trunk, _) = db.stats();
     println!(

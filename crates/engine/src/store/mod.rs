@@ -102,6 +102,15 @@ pub struct IoStats {
     pub runs_queued_most: u64,
     /// Pages read from runs still queued, without waiting for the device.
     pub queued_reads: u64,
+    /// Measured always, for the memory tuner ([`crate::shard_db::ShardDb::set_memory`]):
+    /// - point reads the cache missed whose page its ghost named (reads a larger cache would
+    ///   have saved);
+    /// - point reads the device served, and their nanoseconds;
+    /// - nanoseconds writers waited because the write budget was spent.
+    pub ghost_misses: u64,
+    pub device_reads: u64,
+    pub device_read_ns: u64,
+    pub budget_wait_ns: u64,
 }
 
 /// Nanoseconds since `since`, none when timing is off (`Store::set_timed`).
@@ -524,6 +533,22 @@ impl<F: BlockFile> Store<F> {
         self.cache = (pages > 0).then(|| cache::Cache::new(pages, self.config.page_size));
     }
 
+    /// Resizes the page cache to `pages` in place, keeping what it holds (`Cache::resize`); a
+    /// store without one is given one.
+    pub fn resize_cache(&mut self, pages: usize) {
+        match self.cache.as_mut() {
+            Some(c) if pages > 0 => c.resize(pages),
+            _ => self.set_cache(pages),
+        }
+    }
+
+    /// The page cache's slots and its ghost's, none without a cache.
+    pub fn cache_pages(&self) -> (usize, usize) {
+        self.cache
+            .as_ref()
+            .map_or((0, 0), |c| (c.pages(), c.ghost_pages()))
+    }
+
     /// The pages an extent holds.
     pub fn extent_pages(&self) -> u32 {
         self.config.extent_pages
@@ -939,18 +964,22 @@ impl<F: BlockFile> Store<F> {
         if full || !w.queued.is_empty() {
             // Runs go out in the order they were written: this one after those queued.
             w.queued.push_back(queued);
-            let t = self.timed.then(std::time::Instant::now);
+            let mut t = None;
             while self
                 .writer
                 .as_ref()
                 .is_some_and(|w| w.queued.len() > w.queue_most)
             {
                 if !self.pump()? {
+                    // Timed always, only when it waits: what the tuner prices write memory at.
+                    t = t.or_else(|| Some(std::time::Instant::now()));
                     self.answer(true)?;
                     self.io.write_waits = self.io.write_waits.saturating_add(1);
                 }
             }
-            self.io.write_wait_ns = self.io.write_wait_ns.saturating_add(elapsed_ns(t));
+            let ns = elapsed_ns(t);
+            self.io.write_wait_ns = self.io.write_wait_ns.saturating_add(ns);
+            self.io.budget_wait_ns = self.io.budget_wait_ns.saturating_add(ns);
             self.pump()?;
             return Ok(());
         }
@@ -1068,6 +1097,13 @@ impl<F: BlockFile> Store<F> {
     /// Spares the store `bytes` of write memory for runs waiting for the device's issuer
     /// ([`Writer::queued`]): runs of a whole extent each. None by default, so a writer waits as
     /// soon as every batch is out.
+    /// The bytes a run takes: an extent's pages.
+    pub fn run_bytes(&self) -> usize {
+        self.config
+            .page_size
+            .saturating_mul(usize::try_from(self.config.extent_pages).unwrap_or(usize::MAX))
+    }
+
     /// The write memory spared now, in bytes: whole runs.
     pub fn write_budget(&self) -> usize {
         self.write_budget_runs.saturating_mul(
@@ -1136,16 +1172,23 @@ impl<F: BlockFile> Store<F> {
         if self.queued_page(address, out)? {
             return Ok(());
         }
+        if self.cache.as_ref().is_some_and(|c| c.in_ghost(address)) {
+            self.io.ghost_misses = self.io.ghost_misses.saturating_add(1);
+        }
         self.settle(address, address.saturating_add(1))?;
         let offset = Self::offset_in(self.config, address)?;
         self.io.reads = self.io.reads.saturating_add(1);
         self.io.pages_read = self.io.pages_read.saturating_add(1);
-        let started = self.timed.then(std::time::Instant::now);
+        // Timed always: a clock read beside a device read, what the tuner prices a miss at.
+        let started = Some(std::time::Instant::now());
         let read = self
             .file
             .read_exact_at(self.buf.as_mut_slice(), offset)
             .map_err(|e| io("read a store page", e));
-        self.io.read_ns = self.io.read_ns.saturating_add(elapsed_ns(started));
+        let ns = elapsed_ns(started);
+        self.io.read_ns = self.io.read_ns.saturating_add(ns);
+        self.io.device_reads = self.io.device_reads.saturating_add(1);
+        self.io.device_read_ns = self.io.device_read_ns.saturating_add(ns);
         read?;
         let from = out.len();
         node_payload(self.buf.as_slice(), address, out)?;

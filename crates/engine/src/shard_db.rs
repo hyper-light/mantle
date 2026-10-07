@@ -164,6 +164,11 @@ pub struct ShardDb<F: BlockFile> {
     /// began ([`ShardDb::set_write_budget`]).
     write_cap: usize,
     cycle_pages: u64,
+    /// The memory budget for the cache and write memory together, write memory's share of it,
+    /// and the store's counters when it was last divided ([`ShardDb::set_memory`]).
+    memory: Option<usize>,
+    write_share: usize,
+    tuned: crate::store::IoStats,
     /// The key a scan is at, and the bounds of the trunk segment it reads: buffers kept
     /// between scans.
     scan_key: Vec<u8>,
@@ -180,6 +185,41 @@ pub struct ShardDb<F: BlockFile> {
     scan_end: Vec<u8>,
     /// Whether maintenance is timed ([`ShardDb::set_timed`]).
     timed: bool,
+}
+
+/// Cited (Luo & Carey, PVLDB 2021 §5.4): a tuning step moves 5% of the memory budget toward
+/// the region whose memory saves more, and takes at most 10% of the region giving it up, since
+/// both regions' returns diminish.
+const TUNE_STEP_PERCENT: usize = 5;
+const TUNE_DONOR_PERCENT: usize = 10;
+
+/// What a region of memory saved in a cycle, in nanoseconds, against the bytes it stands for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Gain {
+    saved_ns: u64,
+    bytes: usize,
+}
+
+/// Write memory's next share of `memory`: a step toward the region whose bytes saved more,
+/// compared exactly as `saved / bytes` without dividing, and no more than the last cycle
+/// wrote, `written`, since a queue past a cycle's writes spares no wait. The cache has the
+/// rest. Nothing saved on either side changes nothing.
+fn tune(memory: usize, share: usize, written: usize, read: Gain, write: Gain) -> usize {
+    let step = memory.saturating_mul(TUNE_STEP_PERCENT) / 100;
+    let per = |g: Gain, other: Gain| {
+        u128::from(g.saved_ns)
+            .saturating_mul(u128::try_from(other.bytes.max(1)).unwrap_or(u128::MAX))
+    };
+    let (w, r) = (per(write, read), per(read, write));
+    let share = if w > r {
+        let cache = memory.saturating_sub(share);
+        share.saturating_add(step.min(cache.saturating_mul(TUNE_DONOR_PERCENT) / 100))
+    } else if r > w {
+        share.saturating_sub(step.min(share.saturating_mul(TUNE_DONOR_PERCENT) / 100))
+    } else {
+        share
+    };
+    share.min(written).min(memory)
 }
 
 /// Nanoseconds since `t`, none when timing is off (`ShardDb::set_timed`).
@@ -224,6 +264,9 @@ impl<F: BlockFile> ShardDb<F> {
             flush_stats: FlushStats::default(),
             write_cap: 0,
             cycle_pages: 0,
+            memory: None,
+            write_share: 0,
+            tuned: crate::store::IoStats::default(),
             scan_key: Vec::new(),
             scan_from: Vec::new(),
             scan_active: MemCursor::empty(),
@@ -367,15 +410,69 @@ impl<F: BlockFile> ShardDb<F> {
         self.store.write_budget()
     }
 
-    /// At a rotation: the store's write budget from the cycle just ended.
+    /// Gives the shard `bytes` of memory for its page cache and its write memory together,
+    /// divided between them at each memtable's rotation by their measured marginal gains
+    /// ([`tune`]; Luo & Carey, PVLDB 2021 §5; research/36): all of it the cache's at first.
+    pub fn set_memory(&mut self, bytes: usize) {
+        self.memory = Some(bytes);
+        self.write_share = 0;
+        self.write_cap = bytes;
+        self.store.set_write_budget(0);
+        self.store
+            .resize_cache(bytes.checked_div(self.store.page_size()).unwrap_or(0));
+        self.tuned = self.store.io_stats();
+    }
+
+    /// The memory the cache and write memory have now, in bytes.
+    pub fn memory_split(&self) -> (usize, usize) {
+        let (pages, _) = self.store.cache_pages();
+        (
+            pages.saturating_mul(self.store.page_size()),
+            self.store.write_budget(),
+        )
+    }
+
+    /// At a rotation: the store's write budget from the cycle just ended, and with a memory
+    /// budget, the cache and write memory divided again by what each saved per byte in it.
     fn rebudget(&mut self) {
         let io = self.store.io_stats();
         let pages = io.pages_written.saturating_sub(self.cycle_pages);
         self.cycle_pages = io.pages_written;
+        let page = self.store.page_size();
         let written = usize::try_from(pages)
             .unwrap_or(usize::MAX)
-            .saturating_mul(self.store.page_size());
-        self.store.set_write_budget(written.min(self.write_cap));
+            .saturating_mul(page);
+        let Some(memory) = self.memory else {
+            self.store.set_write_budget(written.min(self.write_cap));
+            return;
+        };
+        let last = std::mem::replace(&mut self.tuned, io);
+        let reads = io.device_reads.saturating_sub(last.device_reads);
+        let miss_ns = io
+            .device_read_ns
+            .saturating_sub(last.device_read_ns)
+            .checked_div(reads)
+            .unwrap_or(0);
+        let (_, ghost_pages) = self.store.cache_pages();
+        let read = Gain {
+            saved_ns: io
+                .ghost_misses
+                .saturating_sub(last.ghost_misses)
+                .saturating_mul(miss_ns),
+            bytes: ghost_pages.saturating_mul(page),
+        };
+        let write = Gain {
+            saved_ns: io.budget_wait_ns.saturating_sub(last.budget_wait_ns),
+            bytes: self.write_share.max(self.store.run_bytes()),
+        };
+        self.write_share = tune(memory, self.write_share, written, read, write);
+        self.store.set_write_budget(self.write_share);
+        self.store.resize_cache(
+            memory
+                .saturating_sub(self.write_share)
+                .checked_div(page)
+                .unwrap_or(0),
+        );
     }
 
     /// Gives point reads a page cache of `pages` pages (`Store::set_cache`).
@@ -845,5 +942,66 @@ impl<F: BlockFile> ShardDb<F> {
     /// The trunk's shape: height, nodes, leaves.
     pub fn shape(&self) -> Result<(usize, usize, usize), Error> {
         self.trunk.shape()
+    }
+}
+
+#[cfg(test)]
+mod tune_tests {
+    use super::{Gain, tune};
+
+    const MIB: usize = 1 << 20;
+
+    fn gain(saved_ns: u64, bytes: usize) -> Gain {
+        Gain { saved_ns, bytes }
+    }
+
+    #[test]
+    fn memory_moves_toward_the_region_whose_bytes_saved_more() {
+        let m = 100 * MIB;
+        // Write memory saved 10 ns a byte where the cache saved 1: write takes a step, 5% of
+        // the budget, the cache giving no more than 10% of its own.
+        assert_eq!(
+            tune(m, 0, m, gain(1_000, 1_000), gain(10_000, 1_000)),
+            5 * MIB
+        );
+        // The cache saved more: write gives back at most 10% of its share.
+        assert_eq!(
+            tune(m, 20 * MIB, m, gain(10_000, 1_000), gain(1_000, 1_000)),
+            18 * MIB
+        );
+        // Equal gains, or nothing saved: no change.
+        assert_eq!(tune(m, 20 * MIB, m, gain(5, 10), gain(10, 20)), 20 * MIB);
+        assert_eq!(tune(m, 20 * MIB, m, gain(0, 10), gain(0, 20)), 20 * MIB);
+        // A small cache gives at most 10% of itself: 98 MiB of write leaves 2 MiB of cache,
+        // which gives up 0.2 MiB.
+        assert_eq!(
+            tune(m, 98 * MIB, m, gain(0, 1), gain(1, 1)),
+            98 * MIB + 2 * MIB / 10
+        );
+    }
+
+    #[test]
+    fn write_memory_never_passes_a_cycles_writes() {
+        let m = 100 * MIB;
+        // Write wins, but the last cycle wrote 3 MiB: a longer queue spares no wait.
+        assert_eq!(tune(m, 0, 3 * MIB, gain(0, 1), gain(1, 1)), 3 * MIB);
+        // A cycle that wrote less than the share brings it down at once.
+        assert_eq!(tune(m, 50 * MIB, 8 * MIB, gain(0, 1), gain(0, 1)), 8 * MIB);
+    }
+
+    #[test]
+    fn gains_compare_exactly_at_the_extremes() {
+        let m = 1 << 40;
+        // u64::MAX ns over two bytes against u64::MAX - 1 over one: products past u64 compared
+        // in u128, never divided or overflowed; write saved slightly less a byte.
+        assert_eq!(
+            tune(m, m / 2, m, gain(u64::MAX - 1, 1), gain(u64::MAX, 2)),
+            m / 2 - m / 20
+        );
+        // And exactly equal a byte across the extremes: no change.
+        assert_eq!(
+            tune(m, m / 2, m, gain(1, 1), gain(u64::MAX, usize::MAX)),
+            m / 2
+        );
     }
 }

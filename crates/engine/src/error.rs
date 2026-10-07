@@ -35,6 +35,10 @@ pub enum Error {
     /// and never returns to a caller (docs/research/24 §2.3, §4.1).
     #[error("an entry with this key and sequence number exists")]
     Duplicate,
+    /// The shard that owns a range is gone (stopped, or its task ended on an error), so the
+    /// request was not applied, or its answer cannot arrive.
+    #[error("{what} is gone")]
+    Gone { what: &'static str },
 }
 
 /// How stored bytes fail to decode.

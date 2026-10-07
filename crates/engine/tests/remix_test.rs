@@ -19,7 +19,7 @@ use hyper_block::buf::Alignment;
 use hyper_block::sim::SimFile;
 use mantle_engine::branch::filter::Keys;
 use mantle_engine::branch::{Branch, Builder, Op};
-use mantle_engine::remix::{SEGMENT, View};
+use mantle_engine::remix::{Build, SEGMENT, View};
 use mantle_engine::rows::Rows;
 use mantle_engine::store::{Config, Store};
 use proptest::prelude::*;
@@ -104,6 +104,14 @@ proptest! {
             }
         }
         prop_assert_eq!(view.entries(), versions);
+        // Built a slice at a time, as maintenance builds it, the view is the same, field for field.
+        let mut job = Build::new(&mut s, &refs, &lo, hi.as_deref()).unwrap();
+        let mut slices = 0u64;
+        while !job.step(&mut s, &refs, 1 + (slices * 7919) % 40).unwrap() {
+            slices += 1;
+            prop_assert!(slices <= versions as u64 + 1, "a build that does not end");
+        }
+        prop_assert_eq!(&job.finish(&mut s), &view);
         prop_assert!(view.segments() * SEGMENT.max(runs.len()) >= versions);
 
         // Paged from `from`, the view reads the live keys at or past it.

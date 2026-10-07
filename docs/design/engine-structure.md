@@ -220,6 +220,34 @@ reads a put still issues synchronously, one call in about 600 puts. Submitting t
 device's issuer and going on, once hyper-block's issuer takes submissions without waiting, is the
 next part of E7.
 
+### Writes handed to the device's issuer (E7's second part)
+
+The tail left after pacing was the extent write a put issued synchronously: attributed by
+`benches/shard_db.rs` `attribute`, 9,874 of the 10,011 puts past p99.9 made one. The store now
+hands each full run to the device's issuer (`Store::attach`, hyper-block `Attached::submit`)
+with a stated number out at once, and goes on; a read or span over pages in flight waits for
+their run, a flush answers every run first, the file's end moves only when a run is answered,
+and a failed answer fences the store (`tests/store_issuer.rs`, `tests/shard_db_paced.rs`).
+
+On a quiet device, uncached, two out: put p99.9 43.8–48.9 µs → 5.6–6.7 µs, p99.99 72.4–73.8 →
+17.5–20.6 µs. On a contended one (this Mac minutes after boot, load average 7–12, the disk
+busy with other processes), uncached writes leave the device to absorb every byte at fill
+time: two out waited 3,709–8,367 times a fill, and even 256 out waited 8,653 times, since a
+bounded queue cannot hide a sustained deficit. Buffered writes through the issuer let the OS
+absorb bursts in memory while its throttling falls on the issuer's workers, never a put; with
+the page cache serving compaction's reads, alternated with RocksDB 11.8.1's `db_bench` in that
+load (10 M puts, 16 out, 1.5 GiB cache, 2026-10-07):
+
+| put latency | p50 | p99 | p99.9 | p99.99 | max | fill |
+|---|---|---|---|---|---|---|
+| buffered, issuer, cache | 1.00–1.04 µs | 2.58–2.79 µs | 5.12–6.00 µs | 17.6–20.8 µs | 3.5–4.5 ms | 0.88–0.91 M/s |
+| uncached, issuer, cache | 1.08–1.17 µs | 3.29–3.62 µs | 10.3–11.9 µs | 25.9–1,696 µs | 12–22 ms | 0.60–0.80 M/s |
+| RocksDB | 0.60–0.69 µs | 2.54–2.98 µs | 4.19–9.64 µs | 18.3–30.6 µs | 1.4–3.5 ms | 0.83–1.01 M/s |
+
+The batches out at once are the owner's to state: the extent buffers it spares. How they and
+the caching mode derive from the device's measured latency and the node's memory is the next
+part.
+
 ## 7. Crash and recovery
 
 - **Order of a checkpoint.**

@@ -444,6 +444,36 @@ impl BTreeMem {
         }
     }
 
+    /// A walk at the first entry whose key is at least `from`: a seek. Each inner node on the
+    /// path is left at the step that visits its entry at or past `from` once the child below is
+    /// walked, and the leaf at its first entry at or past `from`.
+    pub fn walk_from(&self, from: &[u8]) -> Result<Walk, Error> {
+        let kh = head(from);
+        let mut stack = Vec::new();
+        let mut at = self.root;
+        // The walk descends one level a step: at most the tree's height.
+        for _ in 0..=self.nodes.len() {
+            let n = self.node(at)?;
+            let (pos, exact) = match self.search(n, from, kh) {
+                Ok(i) => (i, true),
+                Err(i) => (i, false),
+            };
+            if n.leaf {
+                stack.push((at, pos));
+                return Ok(Walk { stack });
+            }
+            if exact {
+                // Entry `pos` is the key itself: it is next, then child `pos + 1`.
+                stack.push((at, pos.saturating_mul(2).saturating_add(1)));
+                return Ok(Walk { stack });
+            }
+            // Every key in child `pos` may be at or past `from`, and entry `pos` follows it.
+            stack.push((at, pos.saturating_mul(2).saturating_add(1)));
+            at = *n.children.get(pos).ok_or(corrupt())?;
+        }
+        Err(corrupt())
+    }
+
     /// The next `limit` entries of `walk` in key order, `each(key, op, value)`; the entries
     /// visited, fewer than `limit` only at the end. A walk is resumed only over the memtable it
     /// started on, unchanged since: an immutable memtable packed a slice at a time.
@@ -536,6 +566,26 @@ mod tests {
             proptest::prop_assert_eq!(&walked, &expected);
             // The same walk in slices of every size from 1 up: each visits its limit until the
             // end, and together they visit every entry once, in order.
+            // A seek from every key and from between keys reads exactly the oracle's range.
+            let probes: Vec<Vec<u8>> = expected
+                .iter()
+                .flat_map(|(k, _)| {
+                    let mut past = k.clone();
+                    past.push(0);
+                    [k.clone(), past]
+                })
+                .chain([Vec::new(), vec![0xFF; 7]])
+                .collect();
+            for from in &probes {
+                let mut walk = m.walk_from(from).unwrap();
+                let mut got = Vec::new();
+                m.walk_some(&mut walk, usize::MAX, |k, op, v| {
+                    got.push((k.to_vec(), (op, v.to_vec())));
+                    Ok(())
+                }).unwrap();
+                let want: Vec<_> = expected.iter().filter(|(k, _)| k >= from).cloned().collect();
+                proptest::prop_assert_eq!(&got, &want, "from {:?}", from);
+            }
             for limit in 1..8usize {
                 let mut walk = m.walk_start();
                 let mut sliced = Vec::new();

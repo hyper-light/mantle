@@ -1193,6 +1193,18 @@ impl RunCursor {
         &self.value
     }
 
+    /// In the leaf held: the index of its first entry at least `key` (its entries when none
+    /// is), and its entries.
+    pub fn page_lower_bound(&self, key: &[u8]) -> Result<(usize, usize), Error> {
+        let view = View::new(&self.page)?;
+        let i = match view.floor(key)? {
+            Some(i) if view.compare(key, i)? == Ordering::Equal => i,
+            Some(i) => i.saturating_add(1),
+            None => 0,
+        };
+        Ok((i, view.n))
+    }
+
     /// Where the cursor is: the leaf's page number and the entry's index in it.
     pub fn position(&self) -> (u64, usize) {
         (self.page_no, self.index)

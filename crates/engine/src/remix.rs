@@ -342,6 +342,16 @@ fn occurrences(selectors: &[u8], j: usize, r: usize) -> usize {
         .count()
 }
 
+/// The position in `selectors` of run `r`'s `m`th entry (from 0); none past its last.
+fn nth_of(selectors: &[u8], r: usize, m: usize) -> Option<usize> {
+    selectors
+        .iter()
+        .enumerate()
+        .filter(|&(_, &sel)| usize::from(sel & RUN) == r)
+        .nth(m)
+        .map(|(i, _)| i)
+}
+
 fn give_back<F: BlockFile>(store: &mut Store<F>, cursors: Vec<RunCursor>) {
     for c in cursors {
         c.give_back(store);
@@ -427,6 +437,10 @@ impl Walk {
     /// The first entry of `selectors` (the segment's) whose key is at least `from`, by halving:
     /// its length when every key is less. Each probe reads its key through its run's own cursor,
     /// so a page a probe reads is the page the run is then placed on when the walk starts there.
+    /// A probe's page then narrows the search by every key on it (Zhong et al. §3.2, the I/O
+    /// optimization): the run's entries in the segment that sort before `from` are counted on
+    /// the page, which puts the answer after the last of them and at or before the next, so a
+    /// run is probed about once.
     fn search<F: BlockFile>(
         &mut self,
         view: &View,
@@ -441,19 +455,52 @@ impl Walk {
             let r = usize::from(selectors.get(mid).ok_or(corrupt())? & RUN);
             let b = runs.get(r).ok_or(corrupt())?;
             let offset = view.offset(self.segment, r)?;
-            let at = b
-                .position_after(offset, occurrences(selectors, mid, r))?
-                .ok_or(corrupt())?;
+            let k = occurrences(selectors, mid, r);
+            let at = b.position_after(offset, k)?.ok_or(corrupt())?;
             let slot = self.cursors.get_mut(r).ok_or(corrupt())?;
             if slot.is_none() {
                 *slot = Some(RunCursor::new(store)?);
             }
             let c = slot.as_mut().ok_or(corrupt())?;
             c.place(b, store, at)?;
+            // The run's occurrences in the segment: those before `from` are counted on the page.
+            let (_, index) = c.position();
+            let (first_at_least, n) = c.page_lower_bound(from)?;
+            let total = occurrences(selectors, selectors.len(), r);
+            // The occurrence the page's entry `i` is: `k` at the cursor's entry.
+            let occurrence_of = |i: usize| k.checked_add(i)?.checked_sub(index);
+            if first_at_least < n {
+                // The page's first entry at least `from`: the run's entries from it on are at
+                // least `from`; those on the page before it are less (none is known less when
+                // it is the page's first, as entries before the page may be at least `from`).
+                if let Some(before) = occurrence_of(first_at_least) {
+                    if first_at_least > 0
+                        && let Some(p) = before.checked_sub(1).and_then(|o| nth_of(selectors, r, o))
+                    {
+                        lo = lo.max(p.saturating_add(1));
+                    }
+                    if before < total
+                        && let Some(p) = nth_of(selectors, r, before)
+                    {
+                        hi = hi.min(p);
+                    }
+                } else {
+                    // Even the segment's first of the run is at least `from`.
+                    if let Some(p) = nth_of(selectors, r, 0) {
+                        hi = hi.min(p);
+                    }
+                }
+            } else if let Some(last) = occurrence_of(n.saturating_sub(1)) {
+                // Every entry on the page is less than `from`: so is the run up to its last.
+                if let Some(p) = nth_of(selectors, r, last.min(total.saturating_sub(1))) {
+                    lo = lo.max(p.saturating_add(1));
+                }
+            }
+            // The probe itself decides `mid`, whatever the page could say.
             if c.key() < from {
-                lo = mid.saturating_add(1);
+                lo = lo.max(mid.saturating_add(1));
             } else {
-                hi = mid;
+                hi = hi.min(mid);
             }
         }
         Ok(lo)

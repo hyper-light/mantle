@@ -138,3 +138,64 @@ proptest! {
         prop_assert_eq!(got, want);
     }
 }
+
+#[test]
+fn a_view_seeks_exactly_from_every_key_and_just_past_each() {
+    // Eight overlapping runs, versions and deletions among them; every stored key, and each with
+    // a byte after it, as a seek's start: each page boundary and segment edge is met.
+    let mut s = store();
+    let mut x = 0x9e37_79b9_7f4a_7c15u64;
+    let mut runs: Vec<Run> = Vec::new();
+    for _ in 0..8 {
+        let mut r = Run::new();
+        for _ in 0..600 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let k = ((x % 900) as u16).to_be_bytes().to_vec();
+            let op = if x.is_multiple_of(5) {
+                Op::Delete
+            } else {
+                Op::Put
+            };
+            let v = if op == Op::Delete {
+                Vec::new()
+            } else {
+                vec![(x >> 8) as u8; (x % 90) as usize]
+            };
+            r.insert(k, (op, v));
+        }
+        runs.push(r);
+    }
+    let branches: Vec<Branch> = runs.iter().map(|r| build(&mut s, r)).collect();
+    let view = View::build(&mut s, &branches, b"", None).unwrap();
+    let mut newest: BTreeMap<Vec<u8>, (Op, Vec<u8>)> = BTreeMap::new();
+    for r in &runs {
+        for (k, e) in r {
+            newest.entry(k.clone()).or_insert_with(|| e.clone());
+        }
+    }
+    let mut starts: Vec<Vec<u8>> = newest.keys().cloned().collect();
+    starts.extend(newest.keys().map(|k| {
+        let mut k = k.clone();
+        k.push(0);
+        k
+    }));
+    starts.push(Vec::new());
+    let mut page = Rows::new();
+    let mut next = Vec::new();
+    for from in &starts {
+        page.clear();
+        view.scan(&mut s, &branches, from, 3, &mut page, &mut next)
+            .unwrap();
+        let got: Vec<(Vec<u8>, Vec<u8>)> =
+            page.iter().map(|(k, v)| (k.to_vec(), v.to_vec())).collect();
+        let want: Vec<(Vec<u8>, Vec<u8>)> = newest
+            .range(from.clone()..)
+            .filter(|(_, (op, _))| *op == Op::Put)
+            .take(3)
+            .map(|(k, (_, v))| (k.clone(), v.clone()))
+            .collect();
+        assert_eq!(got, want, "from {from:?}");
+    }
+}

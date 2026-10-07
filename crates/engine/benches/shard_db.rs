@@ -163,7 +163,9 @@ fn main() {
     if memory_mib > 0 {
         db.set_memory(memory_mib << 20);
     }
-    db.set_record_cache(record_mib << 20);
+    if record_mib > 0 {
+        db.set_record_cache(record_mib << 20);
+    }
     let value = [b'v'; 100];
     let mut rng = Rng(301);
     // Each operation timed, into a vector sized before the run: percentiles from the sorted
@@ -396,11 +398,12 @@ fn main() {
             s * 1e6 / mix as f64
         );
     }
-    let (cache_bytes, write_bytes) = db.memory_split();
+    let (cache_bytes, write_bytes, record_bytes) = db.memory_split();
     println!(
-        "memory split cache {:.1} MiB write {:.1} MiB",
+        "memory split cache {:.1} MiB write {:.1} MiB records {:.1} MiB",
         cache_bytes as f64 / (1 << 20) as f64,
-        write_bytes as f64 / (1 << 20) as f64
+        write_bytes as f64 / (1 << 20) as f64,
+        record_bytes as f64 / (1 << 20) as f64
     );
     let (h, n, l) = db.shape().unwrap();
     let (_, trunk, _) = db.stats();

@@ -167,8 +167,19 @@ pub struct ShardDb<F: BlockFile> {
     /// The memory budget for the cache and write memory together, write memory's share of it,
     /// and the store's counters when it was last divided ([`ShardDb::set_memory`]).
     memory: Option<usize>,
-    /// The cache of hot records point reads consult before the trunk, if the owner gave one.
+    /// The cache of hot records point reads consult before the trunk, if the owner gave one,
+    /// its share of the memory budget, and the gets it missed with their trunk lookups'
+    /// nanoseconds (what a record-cache hit saves), since the last division.
     records: Option<crate::records::RecordCache>,
+    records_share: usize,
+    /// The tuning cycle: the last write cycle's bytes written, its length in operations (a
+    /// memtable's entries), and the gets counted since it began.
+    cycle_written: usize,
+    cycle_ops: u64,
+    ops_since: u64,
+    record_misses: u64,
+    record_miss_ns: u64,
+    record_ghost_hits: u64,
     write_share: usize,
     tuned: crate::store::IoStats,
     /// The key a scan is at, and the bounds of the trunk segment it reads: buffers kept
@@ -202,26 +213,77 @@ struct Gain {
     bytes: usize,
 }
 
-/// Write memory's next share of `memory`: a step toward the region whose bytes saved more,
-/// compared exactly as `saved / bytes` without dividing, and no more than the last cycle
-/// wrote, `written`, since a queue past a cycle's writes spares no wait. The cache has the
-/// rest. Nothing saved on either side changes nothing.
+/// Write memory's next share of `memory` against the page cache alone ([`tune3`] with no record
+/// cache).
+#[cfg(test)]
 fn tune(memory: usize, share: usize, written: usize, read: Gain, write: Gain) -> usize {
+    let none = Gain {
+        saved_ns: 0,
+        bytes: 0,
+    };
+    let shares = [memory.saturating_sub(share), share, 0];
+    tune3(memory, shares, written, [read, write, none])[1]
+}
+
+/// The shard's memory divided again among the page cache, write memory and the record cache
+/// (`shares`, in that order): a step moves toward the region whose bytes saved the most a byte,
+/// from the region with memory that saved the least, the gains compared exactly by cross
+/// products without dividing. Write memory never passes the last cycle's writes, `written`,
+/// since a queue past a cycle's writes spares no wait; the page cache takes the rest. Equal
+/// gains, or nothing saved, change nothing.
+fn tune3(memory: usize, shares: [usize; 3], written: usize, gains: [Gain; 3]) -> [usize; 3] {
     let step = memory.saturating_mul(TUNE_STEP_PERCENT) / 100;
-    let per = |g: Gain, other: Gain| {
-        u128::from(g.saved_ns)
-            .saturating_mul(u128::try_from(other.bytes.max(1)).unwrap_or(u128::MAX))
+    let rate = |i: usize| {
+        gains.get(i).copied().unwrap_or(Gain {
+            saved_ns: 0,
+            bytes: 0,
+        })
     };
-    let (w, r) = (per(write, read), per(read, write));
-    let share = if w > r {
-        let cache = memory.saturating_sub(share);
-        share.saturating_add(step.min(cache.saturating_mul(TUNE_DONOR_PERCENT) / 100))
-    } else if r > w {
-        share.saturating_sub(step.min(share.saturating_mul(TUNE_DONOR_PERCENT) / 100))
-    } else {
-        share
+    // `a` saved more a byte than `b`: a.saved / a.bytes > b.saved / b.bytes.
+    let more = |a: Gain, b: Gain| {
+        let per = |g: Gain, other: Gain| {
+            u128::from(g.saved_ns)
+                .saturating_mul(u128::try_from(other.bytes.max(1)).unwrap_or(u128::MAX))
+        };
+        per(a, b) > per(b, a)
     };
-    share.min(written).min(memory)
+    let mut to = 0usize;
+    for i in 1..3 {
+        if more(rate(i), rate(to)) {
+            to = i;
+        }
+    }
+    let mut from: Option<usize> = None;
+    for i in 0..3 {
+        if i == to || shares.get(i).copied().unwrap_or(0) == 0 {
+            continue;
+        }
+        if from.is_none_or(|f| more(rate(f), rate(i))) {
+            from = Some(i);
+        }
+    }
+    let mut next = shares;
+    if let Some(f) = from
+        && more(rate(to), rate(f))
+    {
+        let donor = shares.get(f).copied().unwrap_or(0);
+        let give = step.min(donor.saturating_mul(TUNE_DONOR_PERCENT) / 100);
+        if let Some(d) = next.get_mut(f) {
+            *d = d.saturating_sub(give);
+        }
+        if let Some(r) = next.get_mut(to) {
+            *r = r.saturating_add(give);
+        }
+    }
+    // Write memory within a cycle's writes and the budget; the page cache has the rest.
+    let [_, write, records] = next;
+    let write = write.min(written).min(memory);
+    let records = records.min(memory.saturating_sub(write));
+    [
+        memory.saturating_sub(write).saturating_sub(records),
+        write,
+        records,
+    ]
 }
 
 /// Nanoseconds since `t`, none when timing is off (`ShardDb::set_timed`).
@@ -268,6 +330,13 @@ impl<F: BlockFile> ShardDb<F> {
             cycle_pages: 0,
             memory: None,
             records: None,
+            records_share: 0,
+            cycle_written: 0,
+            cycle_ops: u64::MAX,
+            ops_since: 0,
+            record_misses: 0,
+            record_miss_ns: 0,
+            record_ghost_hits: 0,
             write_share: 0,
             tuned: crate::store::IoStats::default(),
             scan_key: Vec::new(),
@@ -421,17 +490,30 @@ impl<F: BlockFile> ShardDb<F> {
         self.write_share = 0;
         self.write_cap = bytes;
         self.store.set_write_budget(0);
+        // The record cache starts at one tuning step, so its ghost gathers the evidence that
+        // prices it; the page cache has the rest.
+        self.records_share = bytes.saturating_mul(TUNE_STEP_PERCENT) / 100;
+        self.records = Some(crate::records::RecordCache::new(self.records_share));
+        let cache = bytes.saturating_sub(self.records_share);
         self.store
-            .resize_cache(bytes.checked_div(self.store.page_size()).unwrap_or(0));
+            .resize_cache(cache.checked_div(self.store.page_size()).unwrap_or(0));
         self.tuned = self.store.io_stats();
+        (
+            self.record_misses,
+            self.record_miss_ns,
+            self.record_ghost_hits,
+        ) = (0, 0, 0);
     }
 
-    /// The memory the cache and write memory have now, in bytes.
-    pub fn memory_split(&self) -> (usize, usize) {
+    /// The memory the page cache, write memory and record cache have now, in bytes.
+    pub fn memory_split(&self) -> (usize, usize, usize) {
         let (pages, _) = self.store.cache_pages();
         (
             pages.saturating_mul(self.store.page_size()),
             self.store.write_budget(),
+            self.records
+                .as_ref()
+                .map_or(0, crate::records::RecordCache::bytes),
         )
     }
 
@@ -445,10 +527,37 @@ impl<F: BlockFile> ShardDb<F> {
         let written = usize::try_from(pages)
             .unwrap_or(usize::MAX)
             .saturating_mul(page);
-        let Some(memory) = self.memory else {
+        self.cycle_written = written;
+        // A cycle is a memtable's worth of operations, puts or gets: a phase of reads alone
+        // is divided again as often as one of writes.
+        self.cycle_ops = u64::try_from(self.mem.len()).unwrap_or(u64::MAX).max(1);
+        self.ops_since = 0;
+        if self.memory.is_none() {
             self.store.set_write_budget(written.min(self.write_cap));
             return;
-        };
+        }
+        self.retune();
+    }
+
+    /// Counts a get toward the tuning cycle, and divides the memory again at its end.
+    fn count_get(&mut self) {
+        if self.memory.is_none() {
+            return;
+        }
+        self.ops_since = self.ops_since.saturating_add(1);
+        if self.ops_since >= self.cycle_ops {
+            self.ops_since = 0;
+            self.retune();
+        }
+    }
+
+    /// Divides the memory budget again by what each region saved a byte since the last
+    /// division (research/36), write memory held within the last write cycle's writes.
+    fn retune(&mut self) {
+        let Some(memory) = self.memory else { return };
+        let io = self.store.io_stats();
+        let page = self.store.page_size();
+        let written = self.cycle_written;
         let last = std::mem::replace(&mut self.tuned, io);
         let reads = io.device_reads.saturating_sub(last.device_reads);
         let miss_ns = io
@@ -468,14 +577,55 @@ impl<F: BlockFile> ShardDb<F> {
             saved_ns: io.budget_wait_ns.saturating_sub(last.budget_wait_ns),
             bytes: self.write_share.max(self.store.run_bytes()),
         };
-        self.write_share = tune(memory, self.write_share, written, read, write);
-        self.store.set_write_budget(self.write_share);
-        self.store.resize_cache(
-            memory
-                .saturating_sub(self.write_share)
-                .checked_div(page)
-                .unwrap_or(0),
+        // A record-cache ghost hit saves a trunk lookup, at the mean the cycle measured.
+        let ghost_hits = self
+            .records
+            .as_ref()
+            .map_or(0, crate::records::RecordCache::ghost_hits);
+        let record_ghost = ghost_hits.saturating_sub(self.record_ghost_hits);
+        self.record_ghost_hits = ghost_hits;
+        let lookup_ns = self
+            .record_miss_ns
+            .checked_div(self.record_misses)
+            .unwrap_or(0);
+        (self.record_misses, self.record_miss_ns) = (0, 0);
+        let records = Gain {
+            saved_ns: record_ghost.saturating_mul(lookup_ns),
+            bytes: self.records_share,
+        };
+        // Write memory the cycle did not use goes back at once: a share above the most queued
+        // spared no wait, and the queue takes buffers only as runs wait.
+        self.write_share = self.write_share.min(self.store.take_queue_peak());
+        let cache = memory
+            .saturating_sub(self.write_share)
+            .saturating_sub(self.records_share);
+        let [cache, write_share, records_share] = tune3(
+            memory,
+            [cache, self.write_share, self.records_share],
+            written,
+            [read, write, records],
         );
+        // The record cache keeps one step: with none, its ghost would gather no evidence that
+        // it should grow.
+        let floor = memory.saturating_mul(TUNE_STEP_PERCENT) / 100;
+        let (cache, records_share) = if records_share < floor {
+            (
+                cache.saturating_sub(floor.saturating_sub(records_share)),
+                floor,
+            )
+        } else {
+            (cache, records_share)
+        };
+        self.write_share = write_share;
+        self.store.set_write_budget(write_share);
+        self.store
+            .resize_cache(cache.checked_div(page).unwrap_or(0));
+        if records_share != self.records_share {
+            self.records_share = records_share;
+            if let Some(r) = self.records.as_mut() {
+                r.resize(records_share);
+            }
+        }
     }
 
     /// Gives point reads a cache of `bytes` of hot records (`records::RecordCache`), replacing
@@ -548,6 +698,7 @@ impl<F: BlockFile> ShardDb<F> {
 
     /// The value `key` holds, into `value`; false when it holds none.
     pub fn get(&mut self, key: &[u8], value: &mut Vec<u8>) -> Result<bool, Error> {
+        self.count_get();
         // The key's filter hash, once for the memtables and every branch on its path.
         let hash = crate::branch::filter::hash(key);
         let mut found = self.mem.get_hashed(key, hash, value)?;
@@ -564,11 +715,15 @@ impl<F: BlockFile> ShardDb<F> {
             return Ok(true);
         }
         if found.is_none() {
+            // A get the record cache missed is timed: its trunk lookup is what a hit saves.
+            let t = self.records.as_ref().map(|_| std::time::Instant::now());
             found = self.trunk.get_hashed(&mut self.store, key, hash, value)?;
-            if found == Some(Op::Put)
-                && let Some(r) = self.records.as_mut()
-            {
-                r.insert(key, hash, value);
+            if let Some(r) = self.records.as_mut() {
+                self.record_misses = self.record_misses.saturating_add(1);
+                self.record_miss_ns = self.record_miss_ns.saturating_add(ns_since(t));
+                if found == Some(Op::Put) {
+                    r.insert(key, hash, value);
+                }
             }
         }
         Ok(found == Some(Op::Put))
@@ -1004,6 +1159,51 @@ mod tune_tests {
         assert_eq!(
             tune(m, 98 * MIB, m, gain(0, 1), gain(1, 1)),
             98 * MIB + 2 * MIB / 10
+        );
+    }
+
+    #[test]
+    fn three_regions_move_memory_from_the_least_to_the_most_saved() {
+        let m = 100 * MIB;
+        // Records saved most, write least: write gives, at most 10% of its 20 MiB.
+        assert_eq!(
+            super::tune3(
+                m,
+                [70 * MIB, 20 * MIB, 10 * MIB],
+                m,
+                [gain(5, 1), gain(1, 1), gain(9, 1)]
+            ),
+            [70 * MIB, 18 * MIB, 12 * MIB]
+        );
+        // The least saving region holds nothing: the donor is the least among the rest.
+        assert_eq!(
+            super::tune3(
+                m,
+                [90 * MIB, 0, 10 * MIB],
+                m,
+                [gain(1, 1), gain(0, 1), gain(9, 1)]
+            ),
+            [85 * MIB, 0, 15 * MIB]
+        );
+        // All equal: nothing moves.
+        assert_eq!(
+            super::tune3(
+                m,
+                [50 * MIB, 25 * MIB, 25 * MIB],
+                m,
+                [gain(1, 1), gain(1, 1), gain(1, 1)]
+            ),
+            [50 * MIB, 25 * MIB, 25 * MIB]
+        );
+        // Write past the cycle's writes: the excess goes to the page cache.
+        assert_eq!(
+            super::tune3(
+                m,
+                [50 * MIB, 30 * MIB, 20 * MIB],
+                10 * MIB,
+                [gain(1, 1), gain(1, 1), gain(1, 1)]
+            ),
+            [70 * MIB, 10 * MIB, 20 * MIB]
         );
     }
 

@@ -147,8 +147,10 @@ pub struct Store<F: BlockFile> {
     range_filter_bits: u32,
     /// The device's issuer, when the owner attaches the store to one ([`Store::attach`]).
     writer: Option<Writer>,
-    /// Runs of write memory the owner spares for runs waiting for the issuer.
+    /// Runs of write memory the owner spares for runs waiting for the issuer, and the most
+    /// queued at once since the tuner last asked ([`Store::take_queue_peak`]).
     write_budget_runs: usize,
+    queue_peak: usize,
     /// Extent buffers given back by spans, runs and answered writes, for the next to need one:
     /// a fresh one costs a page fault for each of its pages, milliseconds a compaction's
     /// cursors on a busy machine. It holds no more than were ever out at once.
@@ -351,6 +353,7 @@ impl<F: BlockFile> Store<F> {
             range_filter_bits: RANGE_FILTER_BITS,
             writer: None,
             write_budget_runs: 0,
+            queue_peak: 0,
             pool: Vec::new(),
             lent: 0,
             point: Vec::new(),
@@ -412,6 +415,7 @@ impl<F: BlockFile> Store<F> {
                 range_filter_bits: RANGE_FILTER_BITS,
                 writer: None,
                 write_budget_runs: 0,
+                queue_peak: 0,
                 pool: Vec::new(),
                 lent: 0,
                 point: Vec::new(),
@@ -963,6 +967,9 @@ impl<F: BlockFile> Store<F> {
             let n = u64::try_from(w.queued.len()).unwrap_or(u64::MAX);
             self.io.runs_queued = self.io.runs_queued.saturating_add(1);
             self.io.runs_queued_most = self.io.runs_queued_most.max(n);
+            self.queue_peak = self
+                .queue_peak
+                .max(usize::try_from(n).unwrap_or(usize::MAX));
             return Ok(());
         }
         if full || !w.queued.is_empty() {
@@ -1101,6 +1108,14 @@ impl<F: BlockFile> Store<F> {
     /// Spares the store `bytes` of write memory for runs waiting for the device's issuer
     /// ([`Writer::queued`]): runs of a whole extent each. None by default, so a writer waits as
     /// soon as every batch is out.
+    /// The most bytes queued in write memory at once since the last call: the write memory the
+    /// cycle used, which the tuner never leaves write memory above.
+    pub fn take_queue_peak(&mut self) -> usize {
+        let now = self.writer.as_ref().map_or(0, |w| w.queued.len());
+        let peak = std::mem::replace(&mut self.queue_peak, now).max(now);
+        peak.saturating_mul(self.run_bytes())
+    }
+
     /// The bytes a run takes: an extent's pages.
     pub fn run_bytes(&self) -> usize {
         self.config

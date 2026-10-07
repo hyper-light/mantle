@@ -13,7 +13,7 @@
 //! A record: key length (2), value length (4), flags (1), the key's hash (8), the key, the value.
 //! A record that would cross the ring's end leaves a skip marker and starts at its beginning.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 
 /// A record's fixed bytes: key length, value length, flags, hash.
@@ -53,6 +53,16 @@ pub struct RecordCache {
     table: HashMap<u64, u64, BuildHasherDefault<Identity>>,
     hits: u64,
     misses: u64,
+    /// The hashes of records evicted unread, newest at the front, each with the sequence it was
+    /// remembered at, as many as the ring holds records; `ghosts` names the live ones. A miss on
+    /// one is a get a larger cache would have served: what the memory tuner prices the cache's
+    /// bytes at (research/36). Removal is lazy, as the page cache's ghost's is.
+    ghost: VecDeque<(u64, u64)>,
+    ghosts: HashMap<u64, u64, BuildHasherDefault<Identity>>,
+    ghost_seq: u64,
+    ghost_hits: u64,
+    /// Records held, for the ghost's length.
+    live: usize,
 }
 
 impl std::fmt::Debug for Identity {
@@ -80,7 +90,82 @@ impl RecordCache {
             table: HashMap::default(),
             hits: 0,
             misses: 0,
+            ghost: VecDeque::new(),
+            ghosts: HashMap::default(),
+            ghost_seq: 0,
+            ghost_hits: 0,
+            live: 0,
         }
+    }
+
+    /// Misses on keys the ghost named: gets a larger cache would have served.
+    pub fn ghost_hits(&self) -> u64 {
+        self.ghost_hits
+    }
+
+    /// Remembers an evicted record's hash, the ghost as long as the records held.
+    fn remember(&mut self, hash: u64) {
+        while self.ghosts.len() >= self.live.max(1) {
+            let Some((h, seq)) = self.ghost.pop_back() else {
+                break;
+            };
+            if self.ghosts.get(&h) == Some(&seq) {
+                self.ghosts.remove(&h);
+            }
+        }
+        self.ghost_seq = self.ghost_seq.wrapping_add(1);
+        self.ghost.push_front((hash, self.ghost_seq));
+        self.ghosts.insert(hash, self.ghost_seq);
+        // Stale entries as many as live ones: compacted, the queue within twice the ghost.
+        if self.ghost.len() > self.ghosts.len().saturating_mul(2).max(1) {
+            let ghosts = &self.ghosts;
+            self.ghost.retain(|(h, seq)| ghosts.get(h) == Some(seq));
+        }
+    }
+
+    /// Rebuilds the cache in `bytes`, keeping the newest records that fit, in their order.
+    /// A tuning step's cost: a pass over the ring.
+    pub fn resize(&mut self, bytes: usize) {
+        let mut old = std::mem::replace(self, Self::new(bytes));
+        (self.hits, self.misses, self.ghost_hits) = (old.hits, old.misses, old.ghost_hits);
+        let mut offset = old.head;
+        // Each step passes a record or a skip marker: at most the ring's bytes of steps.
+        for _ in 0..=old.ring.len() {
+            if offset >= old.tail {
+                break;
+            }
+            let pos = old.at(offset);
+            let to_end = old
+                .cap()
+                .saturating_sub(u64::try_from(pos).unwrap_or(u64::MAX));
+            let skipped = to_end < 2
+                || old
+                    .ring
+                    .get(pos..pos.saturating_add(2))
+                    .and_then(<[u8]>::first_chunk::<2>)
+                    .is_some_and(|b| u16::from_le_bytes(*b) == SKIP);
+            if skipped {
+                offset = offset.saturating_add(to_end);
+                continue;
+            }
+            let Some(h) = old.head_at(pos) else { break };
+            let Some(size) = usize::try_from(h.vlen)
+                .ok()
+                .and_then(|v| Self::size(usize::from(h.klen), v))
+            else {
+                break;
+            };
+            if h.flags & LIVE != 0 && old.table.get(&h.hash) == Some(&offset) {
+                let kstart = pos.saturating_add(RECORD_HEAD);
+                let kend = kstart.saturating_add(usize::from(h.klen));
+                let vend = kend.saturating_add(usize::try_from(h.vlen).unwrap_or(0));
+                if let (Some(k), Some(v)) = (old.ring.get(kstart..kend), old.ring.get(kend..vend)) {
+                    self.insert(k, h.hash, v);
+                }
+            }
+            offset = offset.saturating_add(size);
+        }
+        old.ring = Vec::new();
     }
 
     /// The ring's bytes.
@@ -128,6 +213,9 @@ impl RecordCache {
     pub fn get(&mut self, key: &[u8], hash: u64) -> Option<&[u8]> {
         let Some(&offset) = self.table.get(&hash) else {
             self.misses = self.misses.saturating_add(1);
+            if self.ghosts.contains_key(&hash) {
+                self.ghost_hits = self.ghost_hits.saturating_add(1);
+            }
             return None;
         };
         let pos = self.at(offset);
@@ -159,6 +247,7 @@ impl RecordCache {
         if same {
             self.set_flags(pos, h.flags & !LIVE);
             self.table.remove(&hash);
+            self.live = self.live.saturating_sub(1);
         }
     }
 
@@ -184,6 +273,8 @@ impl RecordCache {
             && let Some(offset) = self.tail.checked_sub(size)
         {
             self.table.insert(hash, offset);
+            self.live = self.live.saturating_add(1);
+            self.ghosts.remove(&hash);
         }
     }
 
@@ -284,6 +375,8 @@ impl RecordCache {
         }
         if h.flags & READ == 0 || size > self.tail_to_end() || size > self.free() {
             self.table.remove(&h.hash);
+            self.live = self.live.saturating_sub(1);
+            self.remember(h.hash);
             return Some(());
         }
         // Moved within the ring: its old bytes lie in what was just freed, and copy_within
@@ -330,6 +423,10 @@ mod tests {
                     4 => {
                         c.invalidate(&key, h);
                         latest.insert(n, None);
+                    }
+                    5 if step % 97 == 0 => {
+                        // Resized, the newest records kept: what stays still answers exactly.
+                        c.resize(cap / 2 + (x >> 24) as usize % cap);
                     }
                     _ => {
                         if let Some(v) = c.get(&key, h) {

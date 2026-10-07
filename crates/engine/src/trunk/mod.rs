@@ -1239,6 +1239,26 @@ impl Trunk {
         Ok(out)
     }
 
+    /// The bytes its branches hold in memory: their filters, their leaf indexes, their pages'
+    /// entry counts.
+    pub fn memory(&self) -> (usize, usize, usize) {
+        let mut m = (0usize, 0usize, 0usize);
+        let mut add = |b: &Branch| {
+            m.0 = m.0.saturating_add(b.filter.bytes());
+            m.1 = m.1.saturating_add(b.index.bytes());
+            m.2 = m.2.saturating_add(b.counts.len().saturating_mul(2));
+        };
+        self.pending.iter().for_each(&mut add);
+        for n in &self.nodes {
+            n.inflight.iter().flatten().for_each(&mut add);
+            n.pivots
+                .iter()
+                .flat_map(|p| p.bundle.branches())
+                .for_each(&mut add);
+        }
+        m
+    }
+
     /// The trunk's shape: its height (1 for a lone leaf), its nodes, and its leaves.
     pub fn shape(&self) -> Result<(usize, usize, usize), Error> {
         let mut height = 1usize;

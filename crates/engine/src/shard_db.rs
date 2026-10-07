@@ -76,6 +76,7 @@ pub struct ShardDb<F: BlockFile> {
     /// share.
     pack_carry: u128,
     trunk_carry: u128,
+    forget_carry: u128,
     flush_stats: FlushStats,
 }
 
@@ -114,6 +115,7 @@ impl<F: BlockFile> ShardDb<F> {
             trunk,
             pack_carry: 0,
             trunk_carry: 0,
+            forget_carry: 0,
             flush_stats: FlushStats::default(),
         })
     }
@@ -299,10 +301,20 @@ impl<F: BlockFile> ShardDb<F> {
                 }
             }
         }
+        let waiting = self.trunk.fanout().saturating_sub(self.trunk.pending());
+        let trunk_room = room.saturating_add(waiting.saturating_mul(self.mem_limit));
+        // The cache's freed pages, forgotten over the same room as the trunk's work that freed
+        // them.
+        let forget = self.store.forget_debt();
+        if forget > 0 {
+            let w = share(forget, bytes, trunk_room, &mut self.forget_carry);
+            if w > 0 {
+                self.store.forget_some(w);
+            }
+        }
         let debt = self.trunk.debt();
         if debt > 0 {
-            let waiting = self.trunk.fanout().saturating_sub(self.trunk.pending());
-            let room = room.saturating_add(waiting.saturating_mul(self.mem_limit));
+            let room = trunk_room;
             let w = share(debt, bytes, room, &mut self.trunk_carry);
             self.flush_stats.trunk_share_most = self.flush_stats.trunk_share_most.max(w);
             if w > 0 {

@@ -224,9 +224,39 @@ yields a key's newest version even when it is a deletion; the scan's merge decid
 - **Gets** keep the filters (and later the maplets): a REMIX get is a seek, which a filter that
   rules a branch out beats.
 
-**SuRF range filters** (Zhang et al., SIGMOD 2018; research/33 row 8) then let a bounded seek
-skip a branch above the leaf with nothing in the range without reading it (closed seeks up to
-5× in RocksDB).
+**SuRF range filters** (Zhang et al., SIGMOD 2018; research/33 row 8, research/35 §2) let a
+bounded seek pass over a source with nothing in its range without reading it (closed seeks up to
+5× in RocksDB). As built (2026-10-07):
+- **Per branch, deletions included.** Each branch keeps a filter of its keys, built as the keys
+  are added (`fst::surf::SurfBuilder`, its buffers from the store's pool, so a warm builder adds a
+  key without allocating) and written after the leaf index in the branch's filter stream. A
+  deletion must stay visible to a scan, since it hides older versions, so it is filtered like a
+  put.
+- **SuRF-Real, exact about intervals.** A key is cut one byte past what it shares with either
+  neighbour, and keeps the next `n` bits as the trie's value (`RANGE_FILTER_BITS = 8`, measured).
+  Where the paper answers with a false-positive flag, an entry is treated here as the interval of
+  keys it can stand for: from the prefix followed by the suffix bits, to before the prefix
+  followed by the next suffix. `may_hold(from, end)` checks the stored prefixes of `from` (one
+  descent reports them) and the ceiling against `[from, end)`. No range holding a key is ruled
+  out.
+- **The trie under it.** The trie is built in one streaming pass with packed values. Only
+  S-LOUDS keeps select samples, as the paper says; dense labels are found by word scans.
+- **Consulted on bounded scans.** At a segment's open, a lone branch is passed over when its
+  filter rules out `[from, min(end, segment end))`, and a view when all its runs' filters do. An
+  open scan does not check, since a leaf's end alone almost never rules out a branch above it.
+- **Measured** (benches/surf.rs, 1 M keys): 16-byte random-number keys at 18.8 bits a key let
+  0.03% of empty ranges through, checked in 84–167 ns. 42-byte object names at 21.9 bits let
+  3.6–4.4% through, checked in about 0.63 µs. That descent goes through about 25 sparse levels and
+  is bound by memory latency (`select1` is 36% of samples). Interleaving each label's byte and
+  bits, and compressing single-child chains, are the measured next steps.
+- **End to end** (benches/shard_db.rs against db_bench 11.8.1's `--max_scan_distance`, 3 M keys,
+  300 k seeks reading 10, 2026-10-07): seeks bounded to 10 and 100 keys ran at p50 2.62–3.00 µs
+  against RocksDB's 7.66–7.85, and open ones at 2.54 against 7.77–7.94. No source was skipped. A
+  trunk whose maintenance has caught up holds one branch a leaf and nothing above it, so a seek
+  opens one source, and a range 10 keys wide almost always holds keys there. The check cost
+  0.1–0.4 µs a bounded seek. The filter pays where several sources overlap a seek (bundles
+  above the leaf while writes flow) or where ranges are empty: the mixed-workload benchmark
+  measures it there.
 
 Held to: seekrandom and short listings against RocksDB's `db_bench` at the same key count,
 under load, every percentile, with allocations, reallocations and page faults a seek.

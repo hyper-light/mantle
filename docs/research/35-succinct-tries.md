@@ -53,4 +53,12 @@ the range filters of its bundles.
   previous leaf's last key), the value each leaf's page number: the index held in memory at
   a few bytes a leaf (10 bits a trie node), where page interiors hold a full key and a child
   entry a leaf.
-- The same trie, built over a bundle's keys with suffix bits, is that bundle's range filter.
+- The same trie, built over each branch's keys with real suffix bits (SuRF-Real), is the
+  branch's range filter. A scan passes over a branch it rules out, and a view when every run's
+  filter does (docs/design/engine-structure.md §5, E6).
+- Where mantle departs from the paper:
+  - An entry is treated as the interval of keys it stands for, so a range is checked exactly
+    against the intervals of the query's stored prefixes and its ceiling, with no
+    false-positive flag.
+  - Trie values are packed at the width the largest needs.
+  - Select samples are kept only on S-LOUDS; dense labels are found by word scans.

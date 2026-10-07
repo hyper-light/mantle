@@ -106,6 +106,9 @@ pub struct Compaction {
     per: u64,
     /// The branch being built: its first key, its builder, its entries.
     building: Option<(Vec<u8>, Builder, u64)>,
+    /// Branches sealed whose filter pages are still to write, oldest first: at most the parts
+    /// the compaction makes.
+    closing: std::collections::VecDeque<(Vec<u8>, Builder)>,
     out: Vec<(Vec<u8>, Branch)>,
     /// Input entries not yet merged, at most: the inputs' counts less those consumed (a range
     /// narrower than a branch leaves some never reached).
@@ -134,6 +137,7 @@ impl Compaction {
             drop_tombstones,
             per: per.max(1),
             building: None,
+            closing: std::collections::VecDeque::new(),
             out: Vec::new(),
             remaining,
         })
@@ -141,16 +145,48 @@ impl Compaction {
 
     /// Input entries left to merge, at most.
     pub fn remaining(&self) -> u64 {
-        self.remaining
+        // The filter pages left to write, each at its worth in keys.
+        let filters = |b: &Builder| b.filter_pages_left().saturating_mul(b.page_keys());
+        self.closing
+            .iter()
+            .map(|(_, b)| filters(b))
+            .chain(self.building.iter().map(|(_, b, _)| filters(b)))
+            .fold(self.remaining, u64::saturating_add)
     }
 
-    /// Merges up to `budget` keys; the keys merged, fewer than `budget` only once the merge is
-    /// done.
+    /// Works for up to `budget`: the filter pages of branches already sealed first, each at its
+    /// worth in keys ([`Builder::page_keys`]), then keys merged; a part that reaches its size, or
+    /// the last once the merge is done, is sealed and its filter's pages wait their turn. Returns
+    /// the budget used, less than `budget` only once the compaction is done.
     pub fn step<F: BlockFile>(&mut self, store: &mut Store<F>, budget: u64) -> Result<u64, Error> {
         let mut done = 0u64;
         while done < budget {
+            if let Some((_, b)) = self.closing.front_mut() {
+                let keys = b.page_keys();
+                let pages = budget
+                    .saturating_sub(done)
+                    .checked_div(keys)
+                    .unwrap_or(1)
+                    .max(1);
+                let before = b.filter_pages_left();
+                let finished = b.write_filter(store, pages)?;
+                let written = before.saturating_sub(b.filter_pages_left());
+                done = done.saturating_add(written.saturating_mul(keys));
+                if finished && let Some((first, b)) = self.closing.pop_front() {
+                    self.out.push((first, b.into_branch(store)?));
+                }
+                continue;
+            }
             let Some((key, op, value)) = self.merge.entry() else {
-                break;
+                // The merge is done: the last part is sealed, or the compaction is.
+                match self.building.take() {
+                    Some((first, mut b, _)) => {
+                        b.seal(store)?;
+                        self.closing.push_back((first, b));
+                        continue;
+                    }
+                    None => break,
+                }
             };
             if !(self.drop_tombstones && op == Op::Delete) {
                 let (key, value) = (key.to_vec(), value.to_vec());
@@ -158,9 +194,10 @@ impl Compaction {
                     .building
                     .as_ref()
                     .is_some_and(|(_, _, n)| *n >= self.per)
-                    && let Some((first, b, _)) = self.building.take()
+                    && let Some((first, mut b, _)) = self.building.take()
                 {
-                    self.out.push((first, b.finish(store)?));
+                    b.seal(store)?;
+                    self.closing.push_back((first, b));
                 }
                 let (_, b, n) = match self.building.as_mut() {
                     Some(b) => b,
@@ -177,26 +214,23 @@ impl Compaction {
             self.remaining = self.remaining.saturating_sub(consumed);
             done = done.saturating_add(1);
         }
-        Ok(done)
+        Ok(done.min(budget))
     }
 
-    /// Whether every key is merged.
+    /// Whether every key is merged and every branch made is whole, its filter written.
     pub fn is_done(&self) -> bool {
-        self.merge.entry().is_none()
+        self.merge.entry().is_none() && self.building.is_none() && self.closing.is_empty()
     }
 
     /// The branches made, each with its first key, in key order; the merge must be done.
     pub fn finish<F: BlockFile>(
-        mut self,
+        self,
         store: &mut Store<F>,
     ) -> Result<Vec<(Vec<u8>, Branch)>, Error> {
         if !self.is_done() {
             return Err(Error::InvalidArgument {
                 what: "a compaction finished before its merge",
             });
-        }
-        if let Some((first, b, _)) = self.building.take() {
-            self.out.push((first, b.finish(store)?));
         }
         self.merge.give_back(store);
         Ok(self.out)

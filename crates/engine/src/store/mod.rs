@@ -168,6 +168,12 @@ pub struct Lists {
     pub counts: Vec<u16>,
     pub interior: Vec<u8>,
     pub interior_pages: Vec<(u64, u32, u32)>,
+    /// Each leaf's separator back to back, where each ends, and each leaf's page number; and
+    /// the encoded index built of them.
+    pub separators: Vec<u8>,
+    pub separator_ends: Vec<usize>,
+    pub leaf_pages: Vec<u32>,
+    pub index: Vec<u8>,
 }
 
 impl Lists {
@@ -176,6 +182,10 @@ impl Lists {
         self.counts.clear();
         self.interior.clear();
         self.interior_pages.clear();
+        self.separators.clear();
+        self.separator_ends.clear();
+        self.leaf_pages.clear();
+        self.index.clear();
     }
 }
 

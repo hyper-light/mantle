@@ -24,6 +24,7 @@ pub mod filter;
 pub mod merge;
 
 use crate::error::{Error, Malformed};
+use crate::fst::trie::Trie;
 use crate::store::{Run, Span, Store};
 use hyper_block::block::BlockFile;
 use std::cmp::Ordering;
@@ -129,6 +130,11 @@ pub struct Branch {
     pub counts: Vec<u16>,
     /// Its index pages, in memory.
     pub interior: Interior,
+    /// Its leaves' separators in a succinct trie, each to its leaf's page number: the leaf a key
+    /// falls in by one `floor` (docs/design/engine-structure.md §5; research/35). Written after
+    /// its pages' entry counts in its pages.
+    pub index: Trie,
+    pub index_bytes: u64,
 }
 
 fn corrupt(why: Malformed) -> Error {
@@ -297,6 +303,15 @@ pub struct Builder {
     /// length ([`Branch::interior`]).
     interior: Vec<u8>,
     interior_pages: Vec<(u64, u32, u32)>,
+    /// Each leaf's separator as it is written, its page number, and the index built of them at
+    /// the seal, encoded ([`Branch::index`]).
+    separators: Vec<u8>,
+    separator_ends: Vec<usize>,
+    leaf_pages: Vec<u32>,
+    index: Vec<u8>,
+    index_trie: Option<Trie>,
+    /// The last key of the last leaf written.
+    prev_last: Vec<u8>,
     count: u64,
     payload: Vec<u8>,
     capacity: usize,
@@ -345,6 +360,12 @@ impl Builder {
             counts: lists.counts,
             interior: lists.interior,
             interior_pages: lists.interior_pages,
+            separators: lists.separators,
+            separator_ends: lists.separator_ends,
+            leaf_pages: lists.leaf_pages,
+            index: lists.index,
+            index_trie: None,
+            prev_last: Vec::new(),
             count: 0,
             payload: Vec::with_capacity(capacity),
             capacity,
@@ -471,6 +492,33 @@ impl Builder {
         self.counts
             .push(u16::try_from(entries).map_err(|_| corrupt(Malformed::TooLarge))?);
         store.queue_page(&mut self.run, address, &payload)?;
+        if level == 0 {
+            // The leaf's separator: the shortest prefix of its first key above the last leaf's
+            // last key, the empty key for the first leaf.
+            if !self.leaf_pages.is_empty() {
+                let lcp = self
+                    .prev_last
+                    .iter()
+                    .zip(first.iter())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                let cut = lcp.saturating_add(1).min(first.len());
+                self.separators
+                    .extend_from_slice(first.get(..cut).ok_or(corrupt(Malformed::TooLarge))?);
+            }
+            self.separator_ends.push(self.separators.len());
+            let page_no = self
+                .issued
+                .checked_sub(1)
+                .ok_or(corrupt(Malformed::CountMismatch))?;
+            self.leaf_pages
+                .push(u32::try_from(page_no).map_err(|_| corrupt(Malformed::TooLarge))?);
+            if let Some(page) = self.levels.first() {
+                self.prev_last.clear();
+                self.prev_last
+                    .extend_from_slice(page.key(page.len().saturating_sub(1)));
+            }
+        }
         if level > 0 {
             let at =
                 u32::try_from(self.interior.len()).map_err(|_| corrupt(Malformed::TooLarge))?;
@@ -530,6 +578,7 @@ impl Builder {
                     .map(|b| u64::from_le_bytes(*b))
                     .ok_or(corrupt(Malformed::Truncated))?;
                 self.filter.fit(self.count);
+                self.build_index()?;
                 // The filter's pages follow the tree's in the branch's own extents.
                 self.sealed = Some(Sealed {
                     root,
@@ -538,7 +587,8 @@ impl Builder {
                     total: self
                         .filter
                         .bytes()
-                        .saturating_add(self.counts.len().saturating_mul(2)),
+                        .saturating_add(self.counts.len().saturating_mul(2))
+                        .saturating_add(self.index.len()),
                     at: 0,
                     pages: 0,
                 });
@@ -607,15 +657,41 @@ impl Builder {
     /// each tree page's entry count, two bytes each.
     fn stream_bytes(&self, range: std::ops::Range<usize>, out: &mut Vec<u8>) {
         let fb = self.filter.bytes();
+        let cb = self.counts.len().saturating_mul(2);
         if range.start < fb {
             self.filter.copy_bytes(range.start..range.end.min(fb), out);
         }
         let from = range.start.max(fb).saturating_sub(fb);
-        let to = range.end.saturating_sub(fb);
+        let to = range.end.saturating_sub(fb).min(cb);
         for at in from..to {
             let count = self.counts.get(at / 2).copied().unwrap_or(0).to_le_bytes();
             out.push(count.get(at % 2).copied().unwrap_or(0));
         }
+        let base = fb.saturating_add(cb);
+        let from = range.start.max(base).saturating_sub(base);
+        let to = range.end.saturating_sub(base);
+        if from < to {
+            out.extend_from_slice(self.index.get(from..to).unwrap_or(&[]));
+        }
+    }
+
+    /// The index of the leaves' separators, built and encoded at the seal.
+    fn build_index(&mut self) -> Result<(), Error> {
+        let mut keys = Vec::with_capacity(self.separator_ends.len());
+        let mut start = 0usize;
+        for &end in &self.separator_ends {
+            keys.push(
+                self.separators
+                    .get(start..end)
+                    .ok_or(corrupt(Malformed::TooLarge))?,
+            );
+            start = end;
+        }
+        let trie = Trie::build(&keys, &self.leaf_pages)?;
+        self.index.clear();
+        trie.encode(&mut self.index);
+        self.index_trie = Some(trie);
+        Ok(())
     }
 
     pub fn into_branch<F: BlockFile>(self, store: &mut Store<F>) -> Result<Branch, Error> {
@@ -640,12 +716,19 @@ impl Builder {
             filter_bytes,
             counts: self.counts.as_slice().to_vec(),
             interior: Interior::from_working(&self.interior, &self.interior_pages),
+            index_bytes: u64::try_from(self.index.len())
+                .map_err(|_| corrupt(Malformed::TooLarge))?,
+            index: self.index_trie.ok_or(corrupt(Malformed::CountMismatch))?,
         });
         store.give_lists(crate::store::Lists {
             extents: self.extents,
             counts: self.counts,
             interior: self.interior,
             interior_pages: self.interior_pages,
+            separators: self.separators,
+            separator_ends: self.separator_ends,
+            leaf_pages: self.leaf_pages,
+            index: self.index,
         });
         branch
     }
@@ -1063,6 +1146,7 @@ impl Branch {
         out.extend_from_slice(&self.filter_start.to_le_bytes());
         out.extend_from_slice(&self.filter_pages.to_le_bytes());
         out.extend_from_slice(&self.filter_bytes.to_le_bytes());
+        out.extend_from_slice(&self.index_bytes.to_le_bytes());
         let n = u32::try_from(self.extents.len()).map_err(|_| corrupt(Malformed::TooLarge))?;
         out.extend_from_slice(&n.to_le_bytes());
         for e in &self.extents {
@@ -1100,6 +1184,7 @@ impl Branch {
         let filter_start = u64_of(take(8)?)?;
         let filter_pages = u32_of(take(4)?)?;
         let filter_bytes = u64_of(take(8)?)?;
+        let index_bytes = u64_of(take(8)?)?;
         let n = usize::try_from(u32_of(take(4)?)?).map_err(|_| corrupt(Malformed::TooLarge))?;
         let mut extents = Vec::with_capacity(n.min(bytes.len() / 8));
         for _ in 0..n {
@@ -1126,10 +1211,17 @@ impl Branch {
         // The filter's bytes, then two bytes for each tree page's entry count.
         let fb = usize::try_from(filter_bytes).map_err(|_| corrupt(Malformed::TooLarge))?;
         let tree = usize::try_from(filter_start).map_err(|_| corrupt(Malformed::TooLarge))?;
-        if Some(filter.len()) != tree.checked_mul(2).and_then(|c| c.checked_add(fb)) {
+        let ib = usize::try_from(index_bytes).map_err(|_| corrupt(Malformed::TooLarge))?;
+        let cb = tree.checked_mul(2).ok_or(corrupt(Malformed::TooLarge))?;
+        if Some(filter.len()) != cb.checked_add(fb).and_then(|n| n.checked_add(ib)) {
             return Err(corrupt(Malformed::CountMismatch));
         }
-        let (filter_part, count_part) = filter.split_at(fb);
+        let (filter_part, rest) = filter.split_at(fb);
+        let (count_part, index_part) = rest.split_at(cb);
+        let (index, used) = Trie::decode(index_part)?;
+        if used != ib {
+            return Err(corrupt(Malformed::CountMismatch));
+        }
         let counts: Vec<u16> = count_part
             .as_chunks::<2>()
             .0
@@ -1185,6 +1277,8 @@ impl Branch {
                 filter_bytes,
                 counts,
                 interior,
+                index,
+                index_bytes,
             },
             at,
         ))

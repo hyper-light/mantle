@@ -20,13 +20,13 @@ pub struct Merge {
 
 impl Merge {
     /// A merge of `branches`, newest first, over `[from, end)`.
-    pub fn new<F: BlockFile>(
+    pub fn new<'a, F: BlockFile>(
         store: &mut Store<F>,
-        branches: &[Branch],
+        branches: impl IntoIterator<Item = &'a Branch>,
         from: &[u8],
         end: Option<&[u8]>,
     ) -> Result<Self, Error> {
-        let mut cursors = Vec::with_capacity(branches.len());
+        let mut cursors = Vec::new();
         for b in branches {
             cursors.push(b.seek(store, from)?);
         }
@@ -106,25 +106,29 @@ pub struct Compaction {
 }
 
 impl Compaction {
-    /// A compaction of `branches`, newest first, over `[from, end)`.
-    pub fn new<F: BlockFile>(
+    /// A compaction of `branches`, newest first, over `[from, end)`. The branches are taken by
+    /// reference: a branch's descriptor carries its filter, which a compaction never reads, and
+    /// planning cloned the descriptors, megabytes of filters a plan.
+    pub fn new<'a, F: BlockFile>(
         store: &mut Store<F>,
-        branches: &[Branch],
+        branches: impl IntoIterator<Item = &'a Branch>,
         from: &[u8],
         end: Option<&[u8]>,
         drop_tombstones: bool,
         per: u64,
     ) -> Result<Self, Error> {
+        let mut remaining = 0u64;
+        let counted = branches.into_iter().inspect(|b| {
+            remaining = remaining.saturating_add(b.count);
+        });
+        let merge = Merge::new(store, counted, from, end)?;
         Ok(Self {
-            merge: Merge::new(store, branches, from, end)?,
+            merge,
             drop_tombstones,
             per: per.max(1),
             building: None,
             out: Vec::new(),
-            remaining: branches
-                .iter()
-                .map(|b| b.count)
-                .fold(0, u64::saturating_add),
+            remaining,
         })
     }
 

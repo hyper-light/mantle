@@ -118,9 +118,7 @@ enum Phase {
         job: Option<(Compaction, usize)>,
     },
     /// The leaf's whole compaction, and the branches it replaces.
-    Settle {
-        job: Option<(Compaction, Vec<Branch>)>,
-    },
+    Settle { job: Option<(Compaction, Vec<u64>)> },
     /// Flushing the pivots from `i` on; `waiting` while the child's frame runs.
     Flush { i: usize, waiting: bool },
 }
@@ -411,19 +409,19 @@ impl Trunk {
                 (Some(phase), 0)
             }
             Phase::Settle {
-                job: Some((mut c, branches)),
+                job: Some((mut c, extents)),
             } => {
                 let used = c.step(store, budget)?;
                 if c.is_done() {
                     let t = std::time::Instant::now();
                     let parts = c.finish(store)?;
-                    self.returned = Some(self.apply_settle(store, n, parts, &branches)?);
+                    self.returned = Some(self.apply_settle(store, n, parts, &extents)?);
                     self.stats.finish_ns = self.stats.finish_ns.saturating_add(ns_since(t));
                     (None, used)
                 } else {
                     (
                         Some(Phase::Settle {
-                            job: Some((c, branches)),
+                            job: Some((c, extents)),
                         }),
                         used,
                     )
@@ -709,11 +707,11 @@ impl Trunk {
         };
         let pivot = node.pivots.get(j).ok_or(corrupt())?;
         let live = node.inflight.get(pivot.start..).unwrap_or(&[]);
-        // Newest first, the order a merge takes.
-        let branches: Vec<Branch> = live.iter().rev().flatten().cloned().collect();
         let (from, end) = (pivot.key.clone(), Self::pivot_end(node, j));
         let covered = node.inflight.len();
-        let job = Compaction::new(store, &branches, &from, end.as_deref(), false, u64::MAX)?;
+        // Newest first, the order a merge takes.
+        let branches = live.iter().rev().flatten();
+        let job = Compaction::new(store, branches, &from, end.as_deref(), false, u64::MAX)?;
         Ok(Phase::Pivots {
             i: j,
             job: Some((job, covered)),
@@ -775,28 +773,33 @@ impl Trunk {
             return Ok(None);
         }
         let (from, end) = (pivot.key.clone(), node.end.clone());
-        let branches = pivot.bundle.clone();
+        // The extents the compaction's inputs hold, released once it replaces them.
+        let extents: Vec<u64> = pivot
+            .bundle
+            .iter()
+            .flat_map(|b| b.extents.iter().copied())
+            .collect();
         let job = Compaction::new(
             store,
-            &branches,
+            &pivot.bundle,
             &from,
             end.as_deref(),
             true,
             self.config.leaf_entries.div_ceil(2).max(1),
         )?;
         Ok(Some(Phase::Settle {
-            job: Some((job, branches)),
+            job: Some((job, extents)),
         }))
     }
 
-    /// A leaf's compaction is done: `parts` replace `branches`, each beyond the first a leaf of
-    /// its own. Returns the leaves now covering the range, each with its first key.
+    /// A leaf's compaction is done: `parts` replace the branches whose `extents` it releases,
+    /// each part beyond the first a leaf of its own. Returns the leaves now covering the range, each with its first key.
     fn apply_settle<F: BlockFile>(
         &mut self,
         store: &mut Store<F>,
         n: usize,
         parts: Vec<(Vec<u8>, Branch)>,
-        branches: &[Branch],
+        extents: &[u64],
     ) -> Result<Vec<(Vec<u8>, usize)>, Error> {
         let node = self.node(n)?;
         let pivot = node.pivots.first().ok_or(corrupt())?;
@@ -809,8 +812,8 @@ impl Trunk {
         for (_, b) in &parts {
             self.stats.entries_written = self.stats.entries_written.saturating_add(b.count);
         }
-        for b in branches {
-            release(store, b)?;
+        for &e in extents {
+            store.release(e)?;
         }
         // Every compacted part's references are the leaf's that takes it.
         if parts.is_empty() {

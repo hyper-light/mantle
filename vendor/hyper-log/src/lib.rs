@@ -918,6 +918,11 @@ impl<F: BlockFile + 'static> Log<F> {
         ask(&self.inbox, query)
     }
 
+    /// The log's id: what it was created with, and what its file must name to open.
+    pub fn id(&self) -> u128 {
+        self.p.id
+    }
+
     /// The parameters the log runs with.
     pub fn config(&self) -> Config {
         self.p.config
@@ -1299,6 +1304,11 @@ impl<F: BlockFile + 'static> LogOpener<F> {
     /// The groups the log holds.
     pub fn groups(&self) -> Result<Vec<u128>, LogError> {
         groups(&self.inbox)
+    }
+
+    /// The log's id: what it was created with, and what its file must name to open.
+    pub fn id(&self) -> u128 {
+        self.p.id
     }
 
     /// The parameters the log runs with.

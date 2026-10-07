@@ -413,7 +413,10 @@ fn an_opener_claims_as_the_log_does_from_any_thread() {
 fn an_opener_after_its_log_closed_answers_closed() {
     let log = Log::create(sim(4), config(1 << 20), ID).unwrap();
     let opener = log.opener();
+    // Both name the log they were made with, before it closes and after.
+    assert_eq!((log.id(), opener.id()), (ID, ID));
     drop(log.close().unwrap());
+    assert_eq!(opener.id(), ID);
     assert!(matches!(opener.group(1), Err(LogError::Closed)));
     assert!(matches!(opener.groups(), Err(LogError::Closed)));
 }

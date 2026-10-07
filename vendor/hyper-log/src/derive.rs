@@ -2,10 +2,11 @@
 //! caller copies the log's own constants (the per-group submissions a handle keeps out, a frame's
 //! headers) into a number of its own, which would go stale silently when they change.
 //!
-//! Each field follows from the facts by mantle docs/design/raft-log.md: the segment from the
-//! largest entry and the device's block (§2, §3), the file's segments from the disk budget (§2,
-//! §5), the groups from the node's admission bound, a group's retention and recent bytes (§4), and
-//! the queue from the groups (§3). Facts that cannot hold one frame, or a budget under the log's
+//! Each field follows from the facts as `docs/durable.md` §6 states it: the segment from the
+//! largest entry and the device's block, the file's segments from the disk budget, the groups from
+//! the node's admission bound, a group's retention and recent bytes, and the queue from the groups.
+//! The log's design is mantle's (`ORIGIN.md`), and the section of mantle's
+//! `docs/design/raft-log.md` each rule follows is named beside it below. Facts that cannot hold one frame, or a budget under the log's
 //! least file, are refused ([`Unfit`]), never clamped: a clamped configuration would run, and fail
 //! later at a write the facts promised.
 use hyper_block::buf::{Alignment, MAX_BUFFER};
@@ -122,7 +123,8 @@ fn positive(value: u64, name: &'static str) -> Result<u64, Unfit> {
 }
 
 impl Config {
-    /// The configuration `facts` give (mantle docs/design/raft-log.md §2–§5):
+    /// The configuration `facts` give (`docs/durable.md` §6; the sections named are mantle's
+    /// `docs/design/raft-log.md`, which the log's design comes from):
     ///
     /// - `segment_bytes`: the least multiple of the block whose frame holds the largest entry in
     ///   a record of its own (§2, §3: an update past one frame is split, and one entry is never

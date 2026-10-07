@@ -293,6 +293,11 @@ impl<F: BlockFile> ShardDb<F> {
         self.store.attach(issuer, batches)
     }
 
+    /// Waits for every write handed to the device's issuer to land (`Store::drain`).
+    pub fn land(&mut self) -> Result<(), Error> {
+        self.store.drain()
+    }
+
     /// The store's file, the engine's work done, and whether every write handed to the device's
     /// issuer landed (`Store::into_file`).
     pub fn into_file(self) -> (F, Result<(), Error>) {

@@ -99,11 +99,8 @@ fn check_scan<F: BlockFile>(
     // The whole keyspace in pages of `limit`.
     let mut all = Vec::new();
     let mut from = Vec::new();
-    loop {
-        match db.scan(&from, None, limit.max(1), &mut all).unwrap() {
-            Some(k) => from = k,
-            None => break,
-        }
+    while let Some(k) = db.scan(&from, None, limit.max(1), &mut all).unwrap() {
+        from = k;
     }
     let every: Vec<_> = live.into_iter().collect();
     assert_eq!(all, every, "the keyspace page by page");

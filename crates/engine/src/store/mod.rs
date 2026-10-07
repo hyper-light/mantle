@@ -828,8 +828,9 @@ impl<F: BlockFile> Store<F> {
         Ok(())
     }
 
-    /// Waits for every run in flight.
-    fn drain(&mut self) -> Result<(), Error> {
+    /// Waits for every run in flight: each has landed, or the store is fenced and the failure
+    /// returned.
+    pub fn drain(&mut self) -> Result<(), Error> {
         while self.writer.as_ref().is_some_and(|w| w.attached.out() > 0) {
             self.answer(true)?;
         }

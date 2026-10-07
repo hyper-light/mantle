@@ -56,6 +56,8 @@ pub struct FlushStats {
     pub stall_max_ns: u64,
     /// Nanoseconds in memtable inserts, in rotations (a full memtable handed to packing, its
     /// stall included), and in forgetting freed pages: in all, timed only as the rest are.
+    /// Memtables rotated: filled, and handed to packing.
+    pub rotations: u64,
     pub insert_ns: u64,
     pub rotate_ns: u64,
     pub forget_ns: u64,
@@ -158,6 +160,10 @@ pub struct ShardDb<F: BlockFile> {
     trunk_carry: u128,
     forget_carry: u128,
     flush_stats: FlushStats,
+    /// The write memory the owner spares at most, and the pages written when the last cycle
+    /// began ([`ShardDb::set_write_budget`]).
+    write_cap: usize,
+    cycle_pages: u64,
     /// The key a scan is at, and the bounds of the trunk segment it reads: buffers kept
     /// between scans.
     scan_key: Vec<u8>,
@@ -216,6 +222,8 @@ impl<F: BlockFile> ShardDb<F> {
             trunk_carry: 0,
             forget_carry: 0,
             flush_stats: FlushStats::default(),
+            write_cap: 0,
+            cycle_pages: 0,
             scan_key: Vec::new(),
             scan_from: Vec::new(),
             scan_active: MemCursor::empty(),
@@ -344,10 +352,30 @@ impl<F: BlockFile> ShardDb<F> {
         self.store.set_range_filter(suffix_bits)
     }
 
-    /// Spares the store `bytes` of write memory for runs waiting for the device's issuer
-    /// (`Store::set_write_budget`).
+    /// Spares the shard at most `bytes` of write memory for runs waiting for the device's
+    /// issuer (`Store::set_write_budget`). The store is given, from each memtable on, the
+    /// lesser of that and the bytes the last memtable's cycle wrote: paced maintenance pays a
+    /// cycle's debt before the next memtable rotates, so a queue longer than a cycle's writes
+    /// could not spare a put a wait, only hold memory while the device is short.
     pub fn set_write_budget(&mut self, bytes: usize) {
+        self.write_cap = bytes;
         self.store.set_write_budget(bytes);
+    }
+
+    /// The write memory the store has now ([`Self::set_write_budget`]).
+    pub fn write_budget(&self) -> usize {
+        self.store.write_budget()
+    }
+
+    /// At a rotation: the store's write budget from the cycle just ended.
+    fn rebudget(&mut self) {
+        let io = self.store.io_stats();
+        let pages = io.pages_written.saturating_sub(self.cycle_pages);
+        self.cycle_pages = io.pages_written;
+        let written = usize::try_from(pages)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(self.store.page_size());
+        self.store.set_write_budget(written.min(self.write_cap));
     }
 
     /// Gives point reads a page cache of `pages` pages (`Store::set_cache`).
@@ -707,6 +735,8 @@ impl<F: BlockFile> ShardDb<F> {
     /// still owed is paid first, whole, and counted a stall: the packing memtable's, and the
     /// trunk's cascade when `fanout` packed memtables wait on it.
     fn rotate(&mut self) -> Result<(), Error> {
+        self.rebudget();
+        self.flush_stats.rotations = self.flush_stats.rotations.saturating_add(1);
         let t = self.timed.then(std::time::Instant::now);
         let mut stalled = false;
         if self.packing.is_some() {

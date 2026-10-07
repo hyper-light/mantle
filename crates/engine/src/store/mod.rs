@@ -1066,6 +1066,15 @@ impl<F: BlockFile> Store<F> {
     /// Spares the store `bytes` of write memory for runs waiting for the device's issuer
     /// ([`Writer::queued`]): runs of a whole extent each. None by default, so a writer waits as
     /// soon as every batch is out.
+    /// The write memory spared now, in bytes: whole runs.
+    pub fn write_budget(&self) -> usize {
+        self.write_budget_runs.saturating_mul(
+            self.config
+                .page_size
+                .saturating_mul(usize::try_from(self.config.extent_pages).unwrap_or(usize::MAX)),
+        )
+    }
+
     pub fn set_write_budget(&mut self, bytes: usize) {
         let run = self
             .config

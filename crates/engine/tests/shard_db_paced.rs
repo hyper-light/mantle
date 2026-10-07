@@ -487,3 +487,43 @@ fn views_saved_with_a_checkpoint_are_loaded_on_reopen() {
         check(&mut db, &oracle, k);
     }
 }
+
+#[test]
+fn the_write_budget_is_the_last_cycles_writes_within_the_owners_cap() {
+    let align = Alignment::new(4096).unwrap();
+    let file = SimFile::new(align, Alignment::new(512).unwrap(), 29).unwrap();
+    let mut db = ShardDb::create(file, STORE, MEM, TRUNK).unwrap();
+    let run = STORE.page_size * STORE.extent_pages as usize;
+    for cap in [1_000 * run, 3 * run] {
+        db.set_write_budget(cap);
+        let mut rotations = 0;
+        let mut rotated = db.stats().0.rotations;
+        let mut cycle_start = db.stats().2.pages_written;
+        let mut x = 0x1234_5678_9abc_def0u64;
+        while rotations < 6 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let before = db.stats().2.pages_written;
+            db.put(&key(x % KEYS), b"value").unwrap();
+            let r = db.stats().0.rotations;
+            if r != rotated {
+                // A rotation set the budget from the cycle that ended as this put began.
+                let written = usize::try_from(before - cycle_start).unwrap() * STORE.page_size;
+                let budget = db.write_budget();
+                assert!(budget <= cap, "cap {cap}: budget {budget}");
+                assert!(
+                    budget <= written,
+                    "cap {cap}: budget {budget} past {written} written"
+                );
+                assert!(
+                    budget + run > written.min(cap),
+                    "cap {cap}: budget {budget} for {written}"
+                );
+                cycle_start = before;
+                rotated = r;
+                rotations += 1;
+            }
+        }
+    }
+}

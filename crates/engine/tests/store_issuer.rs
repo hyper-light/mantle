@@ -207,8 +207,9 @@ fn runs_past_the_batches_wait_in_write_memory_and_read_back_whole() {
     store.give_span(span);
     assert_eq!(store.io_stats().queued_reads, 2 * queued_pages as u64);
 
-    // A scan of all four, the last queued first, the gate opened beside it: a page still queued
-    // is read once its run has gone out and landed, exactly as written.
+    // A scan of all four, the gate opened beside it: a queued page is read from write memory,
+    // one in flight once its run has landed, each exactly as written. Then every run is drained
+    // before the gate shuts again, so none is left held at it while the store waits for room.
     std::thread::scope(|s| {
         s.spawn(|| gate.open.store(true, Ordering::SeqCst));
         let mut span = store.span().unwrap();
@@ -217,6 +218,8 @@ fn runs_past_the_batches_wait_in_write_memory_and_read_back_whole() {
             store.read_page_ahead(&mut span, a, &mut out).unwrap();
             assert_eq!(out, payload(a), "page {a}");
         }
+        store.give_span(span);
+        store.drain().unwrap();
     });
     assert_eq!(store.io_stats().submitted, 4);
 

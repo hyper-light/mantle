@@ -559,8 +559,15 @@ impl<F: BlockFile> Store<F> {
 
     fn sync(&mut self) -> Result<(), Error> {
         // A flush makes durable only the writes completed when it is issued: every run in
-        // flight is answered first.
+        // flight is answered first, and a batch still out here is refused, not flushed past (a
+        // batch counts as out until its answer is taken, so the check is exact).
         self.drain()?;
+        if self.writer.as_ref().is_some_and(|w| w.attached.out() > 0) {
+            return Err(io(
+                "flush a store",
+                "a run handed to the issuer is still out",
+            ));
+        }
         self.io.syncs = self.io.syncs.saturating_add(1);
         let synced = self.file.sync_data().map_err(|e| io("flush a store", e));
         self.fence(synced)

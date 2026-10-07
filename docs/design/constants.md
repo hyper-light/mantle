@@ -108,6 +108,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/engine/src/records.rs` `READ` | format | 2: a cached record's flag, set when it is read after being appended; it is carried to the tail once when its page is evicted (F2's second chance, Kanellis et al. PVLDB 2025 §7; research/37). |
 | `crates/engine/src/records.rs` `RECORD_HEAD` | format | 15: a cached record's fixed bytes, key length (2), value length (4), flags (1), key hash (8). |
 | `crates/engine/src/records.rs` `SKIP` | format | `u16::MAX`: a key length no record has, marking a page empty from it to its end. |
+| `crates/engine/src/records.rs` `SWEEP` | derived | 16: ghost buckets swept each eviction; stale entries are then at most `2 B / 16` of the map's `B` buckets, so the map grows only with its window and stays within a few times it (research/37; the derivation in the constant's comment). |
 | `crates/engine/src/remix.rs` `OLD` | format | 0x80, a selector's bit for a version a newer run shadows (Zhong et al., REMIX, FAST 2021 §4.1; research/34 §4). |
 | `crates/engine/src/remix.rs` `RUN` | format | 0x3f, a selector's run bits: runs 0 to 62, 0x3f the paper's placeholder (REMIX §4.1). |
 | `crates/engine/src/remix.rs` `SEGMENT` | cited | 32 entries a segment as the paper evaluates it: 2.9 B a key for 48-byte keys and 8 runs, 3.16% of the data (REMIX Table 1; research/34 §4); wider for more runs, so a key's versions fit one. |
@@ -140,6 +141,11 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/engine/src/util/hash.rs` `PRIME64_2` | format | 0xC2B2AE3D27D4EB4F, XXH3's PRIME64_2 [R util/hash.cc:161]. |
 | `crates/engine/src/util/hash.rs` `PRIME64_2_INVERSE` | derived | 0xba79078168d4baf, the inverse of `PRIME64_2` modulo 2^64 [R util/hash.cc:175]. |
 | `crates/engine/src/util/hash.rs` `SLICE_HASH_SEED` | format | 397, `GetSliceHash`'s seed, keying the data-block hash index [R util/hash.h:121-123] (docs/research/24 §1.2, §5 R2). |
+| `crates/engine/src/util/incmap.rs` `EMPTY` | format | 0: a bucket never used since its table was built; a probe stops there. |
+| `crates/engine/src/util/incmap.rs` `FIB` | cited | `0x9E37_79B9_7F4A_7C15`, 2^64 over the golden ratio: Fibonacci hashing's multiplier for a key's home bucket (Knuth, TAOCP vol. 3, §6.4). |
+| `crates/engine/src/util/incmap.rs` `FULL` | format | 1: a bucket holding an entry. |
+| `crates/engine/src/util/incmap.rs` `MOVE` | derived | 8: old buckets moved each write during a migration; the smallest power of two for which a new table of `8/7 (len + 1 + C / 4)` buckets ends the migration before it is crowded (`len + 2 C / MOVE < 7/8` of it), so no operation rehashes more (Redis `dict.c` `_dictRehashStep` for the step a write). |
+| `crates/engine/src/util/incmap.rs` `TOMB` | format | 2: a bucket whose entry was removed; probes pass it, inserts reuse it, rebuilds drop it. |
 | `crates/engine/src/util/prefix_varint.rs` `MAX_PREFIX_VARINT32_LENGTH` | format | 5 bytes, `kMaxPrefixVarint32Length` [R util/prefix_varint.h:58]. |
 | `crates/engine/src/util/prefix_varint.rs` `MAX_PREFIX_VARINT64_LENGTH` | format | 9 bytes, `kMaxPrefixVarint64Length`: a zero byte and a fixed64 [R util/prefix_varint.h:65]. |
 | `crates/engine/src/util/xxph3.rs` `BLOCK_LEN` | derived | `STRIPE_LEN × STRIPES_PER_BLOCK` = 1024 bytes between scrambles [R util/xxph3.h:1520]. |

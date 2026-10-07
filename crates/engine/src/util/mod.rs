@@ -8,6 +8,7 @@ pub mod crc32c;
 pub mod fastrange;
 pub mod file_checksum_helper;
 pub mod hash;
+pub mod incmap;
 pub mod math;
 pub mod math128;
 pub mod prefix_varint;

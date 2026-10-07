@@ -250,15 +250,53 @@ fn main() {
     lat.clear();
     let mark = begin();
     let t = Instant::now();
+    // With `attribute`, each slow get recorded with what the engine did inside it, and the
+    // page faults and context switches the process was charged meanwhile.
+    let mut slow_gets: Vec<(Slow, u64, u64)> = Vec::new();
     for _ in 0..reads {
         let k = key(skewed(rng.next(), num, read_exp_range));
+        let before = attribute.then(|| {
+            (
+                db.stats(),
+                faults::read().unwrap(),
+                faults::switches().unwrap(),
+            )
+        });
         let o = Instant::now();
         if db.get(&k, &mut out).unwrap() {
             found += 1;
         }
-        lat.push(o.elapsed().as_nanos() as u64);
+        let ns = o.elapsed().as_nanos() as u64;
+        lat.push(ns);
+        if let Some((b, f, w)) = before
+            && ns >= SLOW_NS
+        {
+            let f = faults::read().unwrap().since(&f).total();
+            let w = faults::switches().unwrap() - w;
+            slow_gets.push((Slow::of(ns, b, db.stats()), f, w));
+        }
     }
     let s = t.elapsed().as_secs_f64();
+    if attribute {
+        slow_gets.sort_unstable_by_key(|s| std::cmp::Reverse(s.0.ns));
+        for (g, f, w) in slow_gets.iter().take(8) {
+            println!(
+                "worst get {:.2} us: reads {} ({:.2} us) rest {:.2} us faults {f} switches {w}",
+                g.ns as f64 / 1000.0,
+                g.reads,
+                g.read_ns as f64 / 1000.0,
+                g.ns.saturating_sub(g.read_ns) as f64 / 1000.0,
+            );
+        }
+        let n = slow_gets.len();
+        let switched = slow_gets.iter().filter(|s| s.2 > 0).count();
+        let faulted = slow_gets.iter().filter(|s| s.1 > 0).count();
+        let read = slow_gets.iter().filter(|s| s.0.reads > 0).count();
+        println!(
+            "slow gets (>= {} us) {n}: with a context switch {switched}, a page fault {faulted}, a read call {read}",
+            SLOW_NS / 1000
+        );
+    }
     costs("readrandom", reads.max(1), &mark);
     if reads > 0 {
         report("readrandom", &mut lat);

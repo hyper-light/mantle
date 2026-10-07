@@ -16,8 +16,17 @@
 //! A record: key length (2), value length (4), flags (1), the key's hash (8), the key, the value.
 //! A record that would cross a page's end leaves a skip marker and starts the next page.
 
-use std::collections::{HashMap, VecDeque};
-use std::hash::{BuildHasherDefault, Hasher};
+use std::collections::VecDeque;
+
+use crate::util::incmap::IncMap;
+
+/// Ghost buckets swept each eviction. Derived: an entry goes stale after `live_most` newer
+/// evictions, and a sweep pass over the map's `B` buckets takes `B / SWEEP` evictions, each adding
+/// at most one entry, so stale entries are at most `2 B / SWEEP = B / 8` (two passes). The map
+/// grows only when entries and tombstones pass `7/8` of `B`; with stale entries within `B / 8`,
+/// that needs the window's live entries near `3/4` of `B`. So the map stays within a few times
+/// its window, `live_most`: the records the cache holds.
+const SWEEP: usize = 16;
 
 /// A record's fixed bytes: key length, value length, flags, hash.
 const RECORD_HEAD: usize = 2 + 4 + 1 + 8;
@@ -26,26 +35,6 @@ const SKIP: u16 = u16::MAX;
 /// Flags: the record is current, and it was read since it was appended.
 const LIVE: u8 = 1;
 const READ: u8 = 2;
-
-/// The table's hasher: the key's hash is already xxh3, so it is used as it is.
-#[derive(Default)]
-struct Identity(u64);
-
-impl Hasher for Identity {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = self.0.rotate_left(8) ^ u64::from(b);
-        }
-    }
-
-    fn write_u64(&mut self, n: u64) {
-        self.0 = n;
-    }
-}
 
 /// The cache: its pages, the log's tail as an offset that only grows, the offset of the first
 /// page's start (a multiple of the page size), and the table.
@@ -57,31 +46,25 @@ pub struct RecordCache {
     most: usize,
     first: u64,
     tail: u64,
-    table: HashMap<u64, u64, BuildHasherDefault<Identity>>,
+    table: IncMap,
     /// Read records carried from an evicted page to the tail: at most a page of them.
     carry: Vec<u8>,
     /// The last evicted page, the next one appended: eviction allocates nothing.
     spare: Option<Box<[u8]>>,
     hits: u64,
     misses: u64,
-    /// The hashes of records evicted unread, newest at the front, each with the sequence it was
-    /// remembered at, as many as the cache holds records; `ghosts` names the live ones. A miss
-    /// on one is a get a larger cache would have served: what the memory tuner prices the
-    /// cache's bytes at (research/36). Removal is lazy, as the page cache's ghost's is.
-    ghost: VecDeque<(u64, u64)>,
-    ghosts: HashMap<u64, u64, BuildHasherDefault<Identity>>,
+    /// The hashes of records evicted unread, each with the sequence it was remembered at; one
+    /// remembered within the last `live_most` is in the ghost, as many as the cache holds
+    /// records. A miss on one is a get a larger cache would have served: what the memory tuner
+    /// prices the cache's bytes at (research/36). Older entries are swept a few buckets an
+    /// eviction (`SWEEP`), so no operation pays for the ghost at once.
+    ghosts: IncMap,
     ghost_seq: u64,
     ghost_hits: u64,
-    /// Records held, and the most held since the last resize: the ghost's length, which a page
-    /// evicted at once would otherwise shorten as it fills it.
+    /// Records held, and the most held since the cache last shrank: the ghost's length, which a
+    /// page evicted at once would otherwise shorten as it fills it.
     live: usize,
     live_most: usize,
-}
-
-impl std::fmt::Debug for Identity {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Identity")
-    }
 }
 
 /// A record's head, read at a page position.
@@ -123,13 +106,12 @@ impl RecordCache {
             most: bytes.checked_div(page).unwrap_or(0),
             first: 0,
             tail: 0,
-            table: HashMap::default(),
+            table: IncMap::new(),
             carry: Vec::new(),
             spare: None,
             hits: 0,
             misses: 0,
-            ghost: VecDeque::new(),
-            ghosts: HashMap::default(),
+            ghosts: IncMap::new(),
             ghost_seq: 0,
             ghost_hits: 0,
             live: 0,
@@ -144,27 +126,30 @@ impl RecordCache {
 
     /// Remembers an evicted record's hash, the ghost as long as the records held.
     fn remember(&mut self, hash: u64) {
-        while self.ghosts.len() >= self.live_most.max(1) {
-            let Some((h, seq)) = self.ghost.pop_back() else {
-                break;
-            };
-            if self.ghosts.get(&h) == Some(&seq) {
-                self.ghosts.remove(&h);
-            }
-        }
         self.ghost_seq = self.ghost_seq.wrapping_add(1);
-        self.ghost.push_front((hash, self.ghost_seq));
         self.ghosts.insert(hash, self.ghost_seq);
-        // Stale entries as many as live ones: compacted, the queue within twice the ghost.
-        if self.ghost.len() > self.ghosts.len().saturating_mul(2).max(1) {
-            let ghosts = &self.ghosts;
-            self.ghost.retain(|(h, seq)| ghosts.get(h) == Some(seq));
-        }
+        let (now, window) = (self.ghost_seq, self.window());
+        self.ghosts
+            .sweep(SWEEP, |_, seq| now.wrapping_sub(seq) < window);
+    }
+
+    /// The ghost's length in evictions.
+    fn window(&self) -> u64 {
+        u64::try_from(self.live_most.max(1)).unwrap_or(u64::MAX)
+    }
+
+    /// Whether `hash` was evicted within the ghost's window.
+    fn in_ghost(&self, hash: u64) -> bool {
+        self.ghosts
+            .get(hash)
+            .is_some_and(|seq| self.ghost_seq.wrapping_sub(seq) < self.window())
     }
 
     /// Holds the cache to `bytes`: growing raises the page limit, shrinking evicts head pages.
     pub fn resize(&mut self, bytes: usize) {
-        self.most = bytes.checked_div(self.page).unwrap_or(0);
+        let most = bytes.checked_div(self.page).unwrap_or(0);
+        let shrinking = most < self.most;
+        self.most = most;
         // Each round drops a page.
         for _ in 0..self.pages.len() {
             if self.pages.len() <= self.most {
@@ -174,7 +159,11 @@ impl RecordCache {
                 break;
             }
         }
-        self.live_most = self.live;
+        // A smaller cache holds fewer records, so its ghost covers fewer; a larger one keeps the
+        // window it had until it fills.
+        if shrinking {
+            self.live_most = self.live;
+        }
     }
 
     /// The cache's bytes: its page limit.
@@ -235,9 +224,9 @@ impl RecordCache {
     /// The value cached for `key` of hash `hash`, if its record is current; counted as read, so
     /// it has a second chance at the head.
     pub fn get(&mut self, key: &[u8], hash: u64) -> Option<&[u8]> {
-        let Some(&offset) = self.table.get(&hash) else {
+        let Some(offset) = self.table.get(hash) else {
             self.misses = self.misses.saturating_add(1);
-            if self.ghosts.contains_key(&hash) {
+            if self.in_ghost(hash) {
                 self.ghost_hits = self.ghost_hits.saturating_add(1);
             }
             return None;
@@ -255,12 +244,12 @@ impl RecordCache {
 
     /// Drops `key`'s record, if cached: a write to the key makes it stale.
     pub fn invalidate(&mut self, key: &[u8], hash: u64) {
-        let Some(&offset) = self.table.get(&hash) else {
+        let Some(offset) = self.table.get(hash) else {
             return;
         };
         if let Some((h, _)) = self.current(offset, key) {
             self.set_flags(offset, h.flags & !LIVE);
-            self.table.remove(&hash);
+            self.table.remove(hash);
             self.live = self.live.saturating_sub(1);
         }
     }
@@ -281,7 +270,7 @@ impl RecordCache {
             self.table.insert(hash, offset);
             self.live = self.live.saturating_add(1);
             self.live_most = self.live_most.max(self.live);
-            self.ghosts.remove(&hash);
+            self.ghosts.remove(hash);
         }
     }
 
@@ -442,8 +431,8 @@ impl RecordCache {
             let Some(h) = Head::read(b) else { break };
             let Some(size) = h.size() else { break };
             let offset = start.checked_add(u64::try_from(pos).ok()?)?;
-            if h.flags & LIVE != 0 && self.table.get(&h.hash) == Some(&offset) {
-                self.table.remove(&h.hash);
+            if h.flags & LIVE != 0 && self.table.get(h.hash) == Some(offset) {
+                self.table.remove(h.hash);
                 if carry && h.flags & READ != 0 {
                     self.carry.extend_from_slice(b.get(..size)?);
                 } else {
@@ -464,6 +453,7 @@ impl RecordCache {
 mod tests {
     use super::*;
     use crate::branch::filter::hash;
+    use std::collections::HashMap;
 
     #[test]
     #[allow(clippy::cast_possible_truncation)]
@@ -514,7 +504,7 @@ mod tests {
                     c.tail - c.first <= (c.pages.len() * page) as u64,
                     "cap {cap} step {step}"
                 );
-                for (&h, &offset) in &c.table {
+                for (h, offset) in c.table.entries() {
                     let rec = Head::read(c.bytes_at(offset).unwrap()).unwrap();
                     assert!(
                         rec.flags & LIVE != 0 && rec.hash == h,
@@ -526,6 +516,13 @@ mod tests {
                     );
                 }
                 assert_eq!(c.live, c.table.len(), "cap {cap} step {step}");
+                // The ghost stays within a few times its window (see `SWEEP`).
+                assert!(
+                    c.ghosts.len() <= 4 * c.live_most.max(16),
+                    "cap {cap} step {step}: ghost {} window {}",
+                    c.ghosts.len(),
+                    c.live_most
+                );
             }
             if cap >= 512 {
                 assert!(hits > 0, "cap {cap}: the cache served nothing");

@@ -398,28 +398,26 @@ impl<F: BlockFile> ShardDb<F> {
         let store = &mut self.store;
         let key = &mut self.scan_key;
         // The trunk's leaf segments, found one at a time from the seek's key: a segment's
-        // branches, and where the next one starts.
+        // sources (branches, and pivot bundles through their views), and where the next starts.
         let seg_from = &mut self.scan_from;
         let seg_end = &mut self.scan_end;
         seg_from.clear();
         seg_from.extend_from_slice(from);
-        let mut branches = Vec::new();
+        let mut sources = Vec::new();
         let mut trunk_done = false;
-        let mut merge: Option<crate::branch::merge::Merge> = None;
+        let mut merge = crate::scan::ScanMerge::new();
         let before_end = |k: &[u8]| end.is_none_or(|e| k < e);
         let mut taken = 0usize;
         let more = loop {
             // The trunk's next key: from the segment open, or the next segment's first.
-            while merge.as_ref().is_none_or(|m| m.entry().is_none()) {
-                if let Some(m) = merge.take() {
-                    m.give_back(store);
-                }
+            while merge.entry().is_none() {
                 if trunk_done || !before_end(seg_from) {
                     break;
                 }
-                let bounded = trunk.segment_at(seg_from, &mut branches, seg_end)?;
+                let bounded = trunk.segment_at(seg_from, &mut sources, seg_end)?;
                 // Each segment ends past its start, so the walk moves a leaf a step and ends.
                 if bounded && seg_end.as_slice() <= seg_from.as_slice() {
+                    merge.close(store);
                     return Err(Error::Corruption {
                         what: "a trunk segment's bounds",
                         why: crate::error::Malformed::OutOfOrder,
@@ -430,12 +428,7 @@ impl<F: BlockFile> ShardDb<F> {
                     (true, _) => Some(seg_end.as_slice()),
                     (false, e) => e,
                 };
-                merge = Some(crate::branch::merge::Merge::new(
-                    store,
-                    branches.iter().copied(),
-                    seg_from,
-                    hi,
-                )?);
+                merge.open(store, &sources, seg_from, hi)?;
                 if bounded {
                     std::mem::swap(seg_from, seg_end);
                 } else {
@@ -443,7 +436,7 @@ impl<F: BlockFile> ShardDb<F> {
                 }
             }
             // The smallest key any source holds next, copied so the sources can move.
-            let tree = merge.as_ref().and_then(|m| m.entry()).map(|(k, _, _)| k);
+            let tree = merge.entry().map(|(k, _, _)| k);
             let mem_a = active.key().filter(|k| before_end(k));
             let mem_p = packing
                 .as_ref()
@@ -480,20 +473,17 @@ impl<F: BlockFile> ShardDb<F> {
                 }
                 c.advance(&p.mem)?;
             }
-            if let Some(m) = merge.as_mut()
-                && let Some((k, op, v)) = m.entry()
+            if let Some((k, op, v)) = merge.entry()
                 && k == key.as_slice()
             {
                 if !decided && op == Op::Put {
                     out.push(key, v);
                     taken = taken.saturating_add(1);
                 }
-                m.next(store)?;
+                merge.next(store)?;
             }
         };
-        if let Some(m) = merge.take() {
-            m.give_back(store);
-        }
+        merge.close(store);
         Ok(more)
     }
 
@@ -569,15 +559,19 @@ impl<F: BlockFile> ShardDb<F> {
         Ok(())
     }
 
-    /// Whether maintenance is owed: a memtable packing, the trunk's work, or freed pages the
-    /// cache has yet to forget.
+    /// Whether maintenance is owed: a memtable packing, the trunk's work, a leaf's REMIX view to
+    /// build, or freed pages the cache has yet to forget.
     pub fn owed(&self) -> bool {
-        self.packing.is_some() || self.trunk.debt() > 0 || self.store.forget_debt() > 0
+        self.packing.is_some()
+            || self.trunk.debt() > 0
+            || self.trunk.views_owed()
+            || self.store.forget_debt() > 0
     }
 
     /// Pays up to `keys` keys' worth of maintenance owed, for the shard's idle time (SILK: the
     /// flush first, since a full memtable stops puts; then the trunk's work; then the cache's
-    /// forgetting). Returns the work done, 0 once nothing is owed.
+    /// views of leaves' bundles; then the cache's forgetting). Returns the work done, 0 once
+    /// nothing is owed.
     pub fn idle_step(&mut self, keys: u64) -> Result<u64, Error> {
         if let Some(p) = &self.packing {
             // At least one: a memtable packed whole with no filter page left still has its
@@ -591,6 +585,9 @@ impl<F: BlockFile> ShardDb<F> {
             let used = self.trunk.step(&mut self.store, keys)?;
             self.note_trunk(ns_since(t));
             return Ok(used);
+        }
+        if self.trunk.views_owed() {
+            return self.trunk.view_step(&mut self.store, keys);
         }
         Ok(self.store.forget_some(keys))
     }
@@ -675,13 +672,26 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     /// Pays maintenance owed, for the shard's idle time: the packing memtable's whole, then up
-    /// to `budget` keys of the trunk's. Returns the trunk's keys merged, fewer than `budget` only
-    /// once nothing is owed.
+    /// to `budget` keys of the trunk's, then REMIX views of its bundles and the cache's freed
+    /// pages with the budget left.
+    /// Returns the work done, less than `budget` only once nothing is owed.
     pub fn maintain(&mut self, budget: u64) -> Result<u64, Error> {
         self.finish_packing()?;
         let t = self.timed.then(std::time::Instant::now);
-        let used = self.trunk.step(&mut self.store, budget)?;
+        let mut used = self.trunk.step(&mut self.store, budget)?;
         self.note_trunk(ns_since(t));
+        // Each view step does at least one unit of work while views are owed: the budget left
+        // bounds the steps.
+        while used < budget && self.trunk.views_owed() {
+            let done = self
+                .trunk
+                .view_step(&mut self.store, budget.saturating_sub(used))?;
+            used = used.saturating_add(done.max(1));
+        }
+        // Then the cache's freed pages, at most the budget left.
+        if used < budget && self.store.forget_debt() > 0 {
+            used = used.saturating_add(self.store.forget_some(budget.saturating_sub(used)));
+        }
         Ok(used)
     }
 

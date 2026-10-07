@@ -30,6 +30,7 @@ pub mod port;
 pub mod ranges;
 pub mod remix;
 pub mod rows;
+pub mod scan;
 pub mod shard_db;
 pub mod store;
 pub mod table;

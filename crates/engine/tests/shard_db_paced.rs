@@ -275,11 +275,23 @@ fn run_on<F: BlockFile + 'static>(
         for k in 0..KEYS {
             check(&mut db, &oracle, k);
         }
+        // The leaves' REMIX views are built in idle time with the rest, and scans read leaves
+        // through them exactly.
+        let (_, trunk, _) = db.stats();
+        assert!(trunk.views_built > 0, "{trunk:?}");
+        for (a, b, limit) in [(0, KEYS - 1, 1), (3, KEYS / 2, 7), (KEYS / 3, KEYS - 1, 64)] {
+            check_scan(&mut db, &oracle, a, b, limit);
+        }
     }
     db.flush().unwrap();
+    // One unbounded idle call pays everything left, the views of every bundle of two runs or
+    // more among it.
+    db.maintain(u64::MAX).unwrap();
+    assert!(!db.owed());
     for k in 0..KEYS {
         check(&mut db, &oracle, k);
     }
+    check_scan(&mut db, &oracle, 0, KEYS - 1, 13);
     db.check_references().unwrap();
     check_scan(&mut db, &oracle, 0, KEYS, 1_000);
     // Extent buffers come back to the store's pool and are taken again: a fresh allocation is

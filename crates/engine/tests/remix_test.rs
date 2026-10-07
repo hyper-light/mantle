@@ -90,8 +90,7 @@ proptest! {
         prop_assume!(!runs.is_empty());
         let mut s = store();
         let branches: Vec<Branch> = runs.iter().map(|r| build(&mut s, r)).collect();
-        let refs: Vec<&Branch> = branches.iter().collect();
-        let view = View::build(&mut s, &refs, &lo, hi.as_deref()).unwrap();
+        let view = View::build(&mut s, &branches, &lo, hi.as_deref()).unwrap();
 
         let in_range = |k: &Vec<u8>| k >= &lo && hi.as_ref().is_none_or(|h| k < h);
         // The newest version of each key in range, runs newest first.
@@ -105,9 +104,9 @@ proptest! {
         }
         prop_assert_eq!(view.entries(), versions);
         // Built a slice at a time, as maintenance builds it, the view is the same, field for field.
-        let mut job = Build::new(&mut s, &refs, &lo, hi.as_deref()).unwrap();
+        let mut job = Build::new(&mut s, &branches, &lo, hi.as_deref()).unwrap();
         let mut slices = 0u64;
-        while !job.step(&mut s, &refs, 1 + (slices * 7919) % 40).unwrap() {
+        while !job.step(&mut s, &branches, 1 + (slices * 7919) % 40).unwrap().1 {
             slices += 1;
             prop_assert!(slices <= versions as u64 + 1, "a build that does not end");
         }
@@ -127,7 +126,7 @@ proptest! {
         for pages in 0.. {
             prop_assert!(pages <= want.len() + 1, "a scan that does not end");
             page.clear();
-            let more = view.scan(&mut s, &refs, &at, limit, &mut page, &mut next).unwrap();
+            let more = view.scan(&mut s, &branches, &at, limit, &mut page, &mut next).unwrap();
             prop_assert!(page.len() <= limit);
             got.extend(page.iter().map(|(k, v)| (k.to_vec(), v.to_vec())));
             if !more {

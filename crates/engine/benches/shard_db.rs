@@ -102,6 +102,13 @@ fn main() {
     // Each seek bounded to the twelfth argument's count of keys past its start, unbounded at 0
     // (the default): db_bench's --max_scan_distance, which sets the iterator's upper bound.
     let seek_distance: u64 = args.get(11).map_or(0, |s| s.parse().unwrap());
+    // A mixed phase last, as db_bench's mixgraph runs one thread (uniform keys, 100-byte values,
+    // scans of the eleventh argument's keys): the thirteenth argument's operations, none by
+    // default, the fourteenth's percent of them puts and the fifteenth's seeks, the rest gets.
+    // Nothing is paid between them but what each put pays, so seeks meet bundles in flight.
+    let mix: u64 = args.get(12).map_or(0, |s| s.parse().unwrap());
+    let mix_put_pct: u64 = args.get(13).map_or(50, |s| s.parse().unwrap());
+    let mix_seek_pct: u64 = args.get(14).map_or(50, |s| s.parse().unwrap());
     let path = dir.join("shard_db.store");
     let _ = std::fs::remove_file(&path);
     let align = Alignment::new(4096).unwrap();
@@ -288,6 +295,63 @@ fn main() {
             "seekrandom {seeks} {:.0} {:.3} nexts {seek_nexts} keys read {keys_read}",
             seeks as f64 / s,
             s * 1e6 / seeks as f64
+        );
+    }
+    if mix > 0 {
+        let mut page = mantle_engine::rows::Rows::new();
+        let mut next = Vec::new();
+        let mut out = Vec::new();
+        let (mut puts, mut gets, mut seeks_done) = (Vec::new(), Vec::new(), Vec::new());
+        let (skipped_before, opened_before) = db.scan_filtered();
+        let mark = begin();
+        let t = Instant::now();
+        for _ in 0..mix {
+            let n = rng.next();
+            let start = n % num;
+            let k = key(start);
+            let kind = (n >> 32) % 100;
+            let o = Instant::now();
+            if kind < mix_put_pct {
+                db.put(&k, &value).unwrap();
+                puts.push(o.elapsed().as_nanos() as u64);
+            } else if kind < mix_put_pct + mix_seek_pct {
+                let end = key(start.saturating_add(seek_distance));
+                let bound = (seek_distance > 0).then_some(&end[..]);
+                page.clear();
+                db.scan(&k, bound, seek_nexts, &mut page, &mut next)
+                    .unwrap();
+                seeks_done.push(o.elapsed().as_nanos() as u64);
+            } else {
+                db.get(&k, &mut out).unwrap();
+                gets.push(o.elapsed().as_nanos() as u64);
+            }
+        }
+        let s = t.elapsed().as_secs_f64();
+        costs("mixgraph", mix, &mark);
+        let (skipped, opened) = db.scan_filtered();
+        let n_seeks = seeks_done.len().max(1) as f64;
+        println!(
+            "mixgraph puts {} gets {} seeks {} distance {seek_distance} sources/seek skipped {:.2} opened {:.2} views {}",
+            puts.len(),
+            gets.len(),
+            seeks_done.len(),
+            (skipped - skipped_before) as f64 / n_seeks,
+            (opened - opened_before) as f64 / n_seeks,
+            db.views()
+        );
+        for (name, lat) in [
+            ("mixgraph put", &mut puts),
+            ("mixgraph get", &mut gets),
+            ("mixgraph seek", &mut seeks_done),
+        ] {
+            if !lat.is_empty() {
+                report(name, lat);
+            }
+        }
+        println!(
+            "mixgraph {mix} {:.0} {:.3}",
+            mix as f64 / s,
+            s * 1e6 / mix as f64
         );
     }
     let (h, n, l) = db.shape().unwrap();

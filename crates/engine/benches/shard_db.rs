@@ -109,6 +109,9 @@ fn main() {
     let mix: u64 = args.get(12).map_or(0, |s| s.parse().unwrap());
     let mix_put_pct: u64 = args.get(13).map_or(50, |s| s.parse().unwrap());
     let mix_seek_pct: u64 = args.get(14).map_or(50, |s| s.parse().unwrap());
+    // Write memory for runs waiting for the issuer, in MiB, as the sixteenth argument, none by
+    // default (`ShardDb::set_write_budget`).
+    let write_budget_mib: usize = args.get(15).map_or(0, |s| s.parse().unwrap());
     let path = dir.join("shard_db.store");
     let _ = std::fs::remove_file(&path);
     let align = Alignment::new(4096).unwrap();
@@ -145,6 +148,7 @@ fn main() {
     if let Some(issuer) = &issuer {
         db.attach(issuer, batches.max(1)).unwrap();
     }
+    db.set_write_budget(write_budget_mib << 20);
     let value = [b'v'; 100];
     let mut rng = Rng(301);
     // Each operation timed, into a vector sized before the run: percentiles from the sorted
@@ -197,9 +201,11 @@ fn main() {
         t.entries_written as f64 / num as f64
     );
     println!(
-        "fill io evict_steps_most {} submitted {} write_waits {} ({:.2}s) span_cache_hits {} reads {} pages_read {} ({:.2}s) writes {} ({:.2}s) pages_written {} ({:.2} GB, write amplification {:.2}) syncs {}",
+        "fill io evict_steps_most {} submitted {} queued {} (most {}) write_waits {} ({:.2}s) span_cache_hits {} reads {} pages_read {} ({:.2}s) writes {} ({:.2}s) pages_written {} ({:.2} GB, write amplification {:.2}) syncs {}",
         io.cache_evict_steps_most,
         io.submitted,
+        io.runs_queued,
+        io.runs_queued_most,
         io.write_waits,
         io.write_wait_ns as f64 / 1e9,
         io.span_cache_hits,

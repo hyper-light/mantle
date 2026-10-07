@@ -148,3 +148,85 @@ fn a_submitted_run_is_read_once_it_lands() {
     store.read_page(a, &mut out).unwrap();
     assert_eq!(out, payload(a));
 }
+
+#[test]
+fn runs_past_the_batches_wait_in_write_memory_and_read_back_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate: &'static Gate = Box::leak(Box::default());
+    gate.open.store(true, Ordering::SeqCst);
+    let file = Gated {
+        file: DeviceFile::open(
+            &dir.path().join("store"),
+            true,
+            CachingRequest::Buffered,
+            Alignment::new(4096).unwrap(),
+        )
+        .unwrap(),
+        gate,
+    };
+    let mut store = Store::create(file, CONFIG).unwrap();
+    let issuer = Issuer::start(dir.path(), 2).unwrap();
+    store.attach(&issuer, 2).unwrap();
+    // Write memory for two runs past the two batches out.
+    let run_bytes = CONFIG.page_size * CONFIG.extent_pages as usize;
+    store.set_write_budget(2 * run_bytes);
+    gate.open.store(false, Ordering::SeqCst);
+
+    // Four extents' runs while the device holds every write: two go out, two wait in write
+    // memory, and each write returns at once. Had one waited for the device, the gate being
+    // shut, the test would not get past this loop.
+    let mut run = store.run().unwrap();
+    let mut addresses = Vec::new();
+    for _ in 0..4 {
+        let extent = store.allocate_extent().unwrap();
+        for n in 0..CONFIG.extent_pages {
+            let a = store.address(extent, n).unwrap();
+            store.queue_page(&mut run, a, &payload(a)).unwrap();
+            addresses.push(a);
+        }
+    }
+    let io = store.io_stats();
+    assert_eq!(
+        (io.submitted, io.runs_queued, io.write_waits),
+        (2, 2, 0),
+        "{io:?}"
+    );
+
+    // A scan of all four, the last queued first, the gate opened beside it: a page still queued
+    // is read once its run has gone out and landed, exactly as written.
+    std::thread::scope(|s| {
+        s.spawn(|| gate.open.store(true, Ordering::SeqCst));
+        let mut span = store.span().unwrap();
+        for &a in addresses.iter().rev() {
+            let mut out = Vec::new();
+            store.read_page_ahead(&mut span, a, &mut out).unwrap();
+            assert_eq!(out, payload(a), "page {a}");
+        }
+    });
+    assert_eq!(store.io_stats().submitted, 4);
+
+    // Queued again, then a checkpoint, which drains the queue before its flush, and a reopen.
+    gate.open.store(false, Ordering::SeqCst);
+    let mut later = Vec::new();
+    for _ in 0..3 {
+        let extent = store.allocate_extent().unwrap();
+        for n in 0..CONFIG.extent_pages {
+            let a = store.address(extent, n).unwrap();
+            store.queue_page(&mut run, a, &payload(a)).unwrap();
+            later.push(a);
+        }
+    }
+    std::thread::scope(|s| {
+        s.spawn(|| gate.open.store(true, Ordering::SeqCst));
+        store.checkpoint(later.first().copied(), 9).unwrap();
+    });
+    let (file, landed) = store.into_file();
+    landed.unwrap();
+    let (mut store, recovered) = Store::open(file, CONFIG).unwrap();
+    assert_eq!(recovered.applied, 9);
+    for &a in addresses.iter().chain(&later) {
+        let mut out = Vec::new();
+        store.read_page(a, &mut out).unwrap();
+        assert_eq!(out, payload(a), "page {a} after reopening");
+    }
+}

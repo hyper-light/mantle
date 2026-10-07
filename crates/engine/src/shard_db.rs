@@ -344,6 +344,12 @@ impl<F: BlockFile> ShardDb<F> {
         self.store.set_range_filter(suffix_bits)
     }
 
+    /// Spares the store `bytes` of write memory for runs waiting for the device's issuer
+    /// (`Store::set_write_budget`).
+    pub fn set_write_budget(&mut self, bytes: usize) {
+        self.store.set_write_budget(bytes);
+    }
+
     /// Gives point reads a page cache of `pages` pages (`Store::set_cache`).
     pub fn set_cache(&mut self, pages: usize) {
         self.store.set_cache(pages);

@@ -96,6 +96,10 @@ pub struct IoStats {
     /// when the store is ([`Store::set_timed`]).
     pub queue_ns: u64,
     pub ahead_ns: u64,
+    /// Runs queued in write memory because every batch was out, where the writer would have
+    /// waited, and the most queued at once.
+    pub runs_queued: u64,
+    pub runs_queued_most: u64,
 }
 
 /// Nanoseconds since `since`, none when timing is off (`Store::set_timed`).
@@ -132,6 +136,8 @@ pub struct Store<F: BlockFile> {
     range_filter_bits: u32,
     /// The device's issuer, when the owner attaches the store to one ([`Store::attach`]).
     writer: Option<Writer>,
+    /// Runs of write memory the owner spares for runs waiting for the issuer.
+    write_budget_runs: usize,
     /// Extent buffers given back by spans, runs and answered writes, for the next to need one:
     /// a fresh one costs a page fault for each of its pages, milliseconds a compaction's
     /// cursors on a busy machine. It holds no more than were ever out at once.
@@ -161,6 +167,24 @@ pub struct Store<F: BlockFile> {
 struct Writer {
     attached: Attached,
     in_flight: VecDeque<(u64, u64, u64, u64)>,
+    /// Full runs waiting for the issuer, oldest first, when every batch it may have out is
+    /// out: a writer goes on instead of waiting for the device, up to `queue_most` runs, the
+    /// write memory the owner spares the store ([`Store::set_write_budget`]). A put then waits
+    /// for the device only once that memory is spent, as RocksDB's writes wait only once its
+    /// memtables and level 0 have lagged their bound.
+    queued: VecDeque<Queued>,
+    queue_most: usize,
+}
+
+/// A full run waiting for the issuer: its buffer cut to its pages, its offset, its pages and
+/// the file's end past it.
+#[derive(Debug)]
+struct Queued {
+    buf: AlignedBuf,
+    offset: u64,
+    first: u64,
+    end: u64,
+    past: u64,
 }
 
 /// Node pages one writer queues at consecutive addresses within an extent, sealed into an
@@ -313,6 +337,7 @@ impl<F: BlockFile> Store<F> {
             cache: None,
             range_filter_bits: RANGE_FILTER_BITS,
             writer: None,
+            write_budget_runs: 0,
             pool: Vec::new(),
             lent: 0,
             most_lent: 0,
@@ -372,6 +397,7 @@ impl<F: BlockFile> Store<F> {
                 cache: None,
                 range_filter_bits: RANGE_FILTER_BITS,
                 writer: None,
+                write_budget_runs: 0,
                 pool: Vec::new(),
                 lent: 0,
                 most_lent: 0,
@@ -872,9 +898,10 @@ impl<F: BlockFile> Store<F> {
 
     /// Hands `run`'s `bytes` at `offset` to the device's issuer and gives the run a spare
     /// buffer: the caller goes on while the device writes. With every batch it may have out
-    /// already out, it first waits for one to be answered, the bound on what is in flight. The
-    /// buffer is cut to the run's pages: runs complete in any order, and an extent's later run
-    /// must not be overwritten by an earlier one's unused tail.
+    /// already out, the run waits in write memory if the budget has room, else the caller waits
+    /// for an answer, the bound on what is in flight and queued. The buffer is cut to the run's
+    /// pages: runs complete in any order, and an extent's later run must not be overwritten by
+    /// an earlier one's unused tail.
     fn submit(
         &mut self,
         run: &mut Run,
@@ -885,38 +912,87 @@ impl<F: BlockFile> Store<F> {
         past: u64,
     ) -> Result<(), Error> {
         self.reap()?;
-        let full = self
-            .writer
-            .as_ref()
-            .is_some_and(|w| w.attached.out() >= w.attached.batches());
-        if full {
-            let t = self.timed.then(std::time::Instant::now);
-            self.answer(true)?;
-            self.io.write_waits = self.io.write_waits.saturating_add(1);
-            self.io.write_wait_ns = self.io.write_wait_ns.saturating_add(elapsed_ns(t));
-        }
         let fresh = self.take_buf()?;
         let mut buf = std::mem::replace(&mut run.buf, fresh);
         buf.set_len(bytes)
             .map_err(|e| io("cut a run to its pages", e))?;
+        let queued = Queued {
+            buf,
+            offset,
+            first,
+            end: first.saturating_add(pages),
+            past,
+        };
+        let Some(w) = self.writer.as_mut() else {
+            return Err(io("submit a store page run", "no issuer attached"));
+        };
+        let full = w.attached.out() >= w.attached.batches();
+        if full && w.queued.len() < w.queue_most {
+            w.queued.push_back(queued);
+            let n = u64::try_from(w.queued.len()).unwrap_or(u64::MAX);
+            self.io.runs_queued = self.io.runs_queued.saturating_add(1);
+            self.io.runs_queued_most = self.io.runs_queued_most.max(n);
+            return Ok(());
+        }
+        if full || !w.queued.is_empty() {
+            // Runs go out in the order they were written: this one after those queued.
+            w.queued.push_back(queued);
+            let t = self.timed.then(std::time::Instant::now);
+            while self
+                .writer
+                .as_ref()
+                .is_some_and(|w| w.queued.len() > w.queue_most)
+            {
+                if !self.pump()? {
+                    self.answer(true)?;
+                    self.io.write_waits = self.io.write_waits.saturating_add(1);
+                }
+            }
+            self.io.write_wait_ns = self.io.write_wait_ns.saturating_add(elapsed_ns(t));
+            self.pump()?;
+            return Ok(());
+        }
+        self.issue(queued)
+    }
+
+    /// Hands one run to the issuer, which must have room for it.
+    fn issue(&mut self, run: Queued) -> Result<(), Error> {
         let started = self.timed.then(std::time::Instant::now);
         let Some(w) = self.writer.as_mut() else {
             return Err(io("submit a store page run", "no issuer attached"));
         };
         let submitted = w
             .attached
-            .submit(vec![(buf, offset)], false)
+            .submit(vec![(run.buf, run.offset)], false)
             .map_err(|e| io("submit a store page run", e));
         self.io.write_ns = self.io.write_ns.saturating_add(elapsed_ns(started));
         let number = self.fence(submitted)?;
         if let Some(w) = self.writer.as_mut() {
             w.in_flight
-                .push_back((number, first, first.saturating_add(pages), past));
+                .push_back((number, run.first, run.end, run.past));
         }
         // The file's end moves when the run is answered: until then its bytes may not be there,
         // and a span reads no further than bytes written.
         self.io.submitted = self.io.submitted.saturating_add(1);
         Ok(())
+    }
+
+    /// Hands queued runs to the issuer while it has room; true if it handed any.
+    fn pump(&mut self) -> Result<bool, Error> {
+        let mut any = false;
+        loop {
+            let Some(w) = self.writer.as_mut() else {
+                return Ok(any);
+            };
+            if w.attached.out() >= w.attached.batches() {
+                return Ok(any);
+            }
+            let Some(run) = w.queued.pop_front() else {
+                return Ok(any);
+            };
+            self.issue(run)?;
+            any = true;
+        }
     }
 
     /// Takes one answer from the issuer, waiting for it when `wait`: its batch leaves the
@@ -949,9 +1025,10 @@ impl<F: BlockFile> Store<F> {
         Ok(true)
     }
 
-    /// Takes every answer that has come.
+    /// Takes every answer that has come, and hands queued runs on into the room they leave.
     fn reap(&mut self) -> Result<(), Error> {
         while self.answer(false)? {}
+        self.pump()?;
         Ok(())
     }
 
@@ -959,12 +1036,14 @@ impl<F: BlockFile> Store<F> {
     /// reads what was written.
     fn settle(&mut self, first: u64, end: u64) -> Result<(), Error> {
         self.reap()?;
-        while self
-            .writer
-            .as_ref()
-            .is_some_and(|w| w.in_flight.iter().any(|&(_, a, b, _)| a < end && first < b))
-        {
+        // A run queued counts as in flight: its pages are not in the file yet. Each answer
+        // frees room the queue's oldest takes, so the loop ends within the queue and the batches.
+        while self.writer.as_ref().is_some_and(|w| {
+            w.in_flight.iter().any(|&(_, a, b, _)| a < end && first < b)
+                || w.queued.iter().any(|q| q.first < end && first < q.end)
+        }) {
             self.answer(true)?;
+            self.pump()?;
         }
         Ok(())
     }
@@ -972,10 +1051,31 @@ impl<F: BlockFile> Store<F> {
     /// Waits for every run in flight: each has landed, or the store is fenced and the failure
     /// returned.
     pub fn drain(&mut self) -> Result<(), Error> {
-        while self.writer.as_ref().is_some_and(|w| w.attached.out() > 0) {
+        self.pump()?;
+        while self
+            .writer
+            .as_ref()
+            .is_some_and(|w| w.attached.out() > 0 || !w.queued.is_empty())
+        {
             self.answer(true)?;
+            self.pump()?;
         }
         Ok(())
+    }
+
+    /// Spares the store `bytes` of write memory for runs waiting for the device's issuer
+    /// ([`Writer::queued`]): runs of a whole extent each. None by default, so a writer waits as
+    /// soon as every batch is out.
+    pub fn set_write_budget(&mut self, bytes: usize) {
+        let run = self
+            .config
+            .page_size
+            .saturating_mul(usize::try_from(self.config.extent_pages).unwrap_or(usize::MAX))
+            .max(1);
+        self.write_budget_runs = bytes.checked_div(run).unwrap_or(0);
+        if let Some(w) = self.writer.as_mut() {
+            w.queue_most = self.write_budget_runs;
+        }
     }
 
     /// Hands the store's runs to `issuer`, the device's, with up to `batches` out at once: a
@@ -992,6 +1092,8 @@ impl<F: BlockFile> Store<F> {
         self.writer = Some(Writer {
             attached,
             in_flight: VecDeque::with_capacity(batches),
+            queued: VecDeque::new(),
+            queue_most: self.write_budget_runs,
         });
         Ok(())
     }

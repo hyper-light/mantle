@@ -316,6 +316,11 @@ impl Builder {
         op: Op,
         value: &[u8],
     ) -> Result<(), Error> {
+        if self.sealed.is_some() {
+            return Err(Error::InvalidArgument {
+                what: "an entry added to a sealed branch",
+            });
+        }
         if self.count > 0 && key.cmp(&self.last) != Ordering::Greater {
             return Err(corrupt(Malformed::OutOfOrder));
         }

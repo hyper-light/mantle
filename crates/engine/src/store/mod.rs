@@ -1048,11 +1048,12 @@ impl<F: BlockFile> Store<F> {
         Ok(())
     }
 
-    /// Gives back the file, the store's work done.
-    pub fn into_file(mut self) -> F {
-        // Every run in flight lands first; one that failed has fenced the store already.
-        let _ = self.drain();
+    /// The store's file, its work done, and whether every run handed to the device's issuer
+    /// landed: the file comes back either way, as a crash's recovery reopens it, and a run that
+    /// failed is reported here, not lost (it fenced the store already).
+    pub fn into_file(mut self) -> (F, Result<(), Error>) {
+        let drained = self.drain();
         self.writer = None;
-        self.file
+        (self.file, drained)
     }
 }

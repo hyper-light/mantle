@@ -86,7 +86,9 @@ fn runs_submitted_to_the_issuer_read_back_and_reopen_whole() {
     let (_, _, io) = db.stats();
     assert!(io.submitted > 0 && io.reads > 0, "{io:?}");
     db.checkpoint(OPS).unwrap();
-    drop(db.into_file());
+    let (file, landed) = db.into_file();
+    landed.unwrap();
+    drop(file);
     let file = DeviceFile::open(&path, false, CachingRequest::Buffered, align).unwrap();
     let (mut db, applied) = ShardDb::open(file, STORE, MEM, TRUNK).unwrap();
     assert_eq!(applied, OPS);

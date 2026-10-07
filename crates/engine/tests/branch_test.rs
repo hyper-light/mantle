@@ -104,7 +104,7 @@ proptest! {
             prop_assert!(s.refs()[e as usize] == 1);
         }
         s.checkpoint(Some(branch.root), 1).unwrap();
-        let (mut s, recovered) = Store::open(s.into_file(), CONFIG).unwrap();
+        let (mut s, recovered) = Store::open(s.into_file().0, CONFIG).unwrap();
         prop_assert_eq!(recovered.root, Some(branch.root));
         check(&mut s, &branch, &entries);
     }

@@ -140,7 +140,8 @@ fn a_submitted_run_is_read_once_it_lands() {
     store.queue_page(&mut run, a, &payload(a)).unwrap();
     store.write_run(&mut run).unwrap();
     store.checkpoint(Some(a), 7).unwrap();
-    let file = store.into_file();
+    let (file, landed) = store.into_file();
+    landed.unwrap();
     let (mut store, recovered) = Store::open(file, CONFIG).unwrap();
     assert_eq!(recovered.applied, 7);
     let mut out = Vec::new();

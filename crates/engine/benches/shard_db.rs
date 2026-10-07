@@ -116,6 +116,13 @@ fn main() {
     // argument, divided by the shard's tuner (`ShardDb::set_memory`) in place of the fixed
     // cache and write budget; none by default.
     let memory_mib: usize = args.get(16).map_or(0, |s| s.parse().unwrap());
+    // Reads skewed as db_bench's --read_random_exp_range draws them, as the eighteenth
+    // argument, uniform at 0 (the default): a key's rank is exponential, then scattered by a
+    // large prime so hot keys are not neighbours.
+    let read_exp_range: f64 = args.get(17).map_or(0.0, |s| s.parse().unwrap());
+    // A cache of hot records for point reads, in MiB, as the nineteenth argument, none by default
+    // (`ShardDb::set_record_cache`).
+    let record_mib: usize = args.get(18).map_or(0, |s| s.parse().unwrap());
     let path = dir.join("shard_db.store");
     let _ = std::fs::remove_file(&path);
     let align = Alignment::new(4096).unwrap();
@@ -156,6 +163,7 @@ fn main() {
     if memory_mib > 0 {
         db.set_memory(memory_mib << 20);
     }
+    db.set_record_cache(record_mib << 20);
     let value = [b'v'; 100];
     let mut rng = Rng(301);
     // Each operation timed, into a vector sized before the run: percentiles from the sorted
@@ -241,7 +249,7 @@ fn main() {
     let mark = begin();
     let t = Instant::now();
     for _ in 0..reads {
-        let k = key(rng.next() % num);
+        let k = key(skewed(rng.next(), num, read_exp_range));
         let o = Instant::now();
         if db.get(&k, &mut out).unwrap() {
             found += 1;
@@ -551,6 +559,18 @@ fn attribute_tail(lat: &[u64], slow: &mut [Slow]) {
             mean(&|s| (s.pack_ns + s.trunk_ns).saturating_sub(s.queue_ns + s.ahead_ns)),
         );
     }
+}
+
+/// db_bench's GetRandomKey: uniform at range 0, else `num · e^(−u·range)` for `u` uniform in
+/// [0, 1), scattered by its prime 0x5bd1e995 modulo `num` (tools/db_bench_tool.cc).
+fn skewed(r: u64, num: u64, range: f64) -> u64 {
+    if range == 0.0 {
+        return r % num;
+    }
+    const BIG: u64 = 1 << 62;
+    let order = -((r % BIG) as f64) / BIG as f64 * range;
+    let rank = (order.exp() * num as f64) as u64;
+    rank.wrapping_mul(0x5bd1_e995) % num
 }
 
 /// Prints a workload's latency percentiles in microseconds: p50, p99, p99.9, p99.99, max.

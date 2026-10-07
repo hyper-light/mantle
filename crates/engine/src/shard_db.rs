@@ -167,6 +167,8 @@ pub struct ShardDb<F: BlockFile> {
     /// The memory budget for the cache and write memory together, write memory's share of it,
     /// and the store's counters when it was last divided ([`ShardDb::set_memory`]).
     memory: Option<usize>,
+    /// The cache of hot records point reads consult before the trunk, if the owner gave one.
+    records: Option<crate::records::RecordCache>,
     write_share: usize,
     tuned: crate::store::IoStats,
     /// The key a scan is at, and the bounds of the trunk segment it reads: buffers kept
@@ -265,6 +267,7 @@ impl<F: BlockFile> ShardDb<F> {
             write_cap: 0,
             cycle_pages: 0,
             memory: None,
+            records: None,
             write_share: 0,
             tuned: crate::store::IoStats::default(),
             scan_key: Vec::new(),
@@ -475,6 +478,12 @@ impl<F: BlockFile> ShardDb<F> {
         );
     }
 
+    /// Gives point reads a cache of `bytes` of hot records (`records::RecordCache`), replacing
+    /// any it had; none at 0.
+    pub fn set_record_cache(&mut self, bytes: usize) {
+        self.records = (bytes > 0).then(|| crate::records::RecordCache::new(bytes));
+    }
+
     /// Gives point reads a page cache of `pages` pages (`Store::set_cache`).
     pub fn set_cache(&mut self, pages: usize) {
         self.store.set_cache(pages);
@@ -505,6 +514,10 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     fn apply(&mut self, key: &[u8], op: Op, value: &[u8]) -> Result<(), Error> {
+        // A write makes the key's cached record stale: it goes before the write is answered.
+        if let Some(r) = self.records.as_mut() {
+            r.invalidate(key, crate::branch::filter::hash(key));
+        }
         let mut before = self.mem.bytes();
         let t = self.timed.then(std::time::Instant::now);
         match self.mem.insert(key, op, value) {
@@ -543,8 +556,20 @@ impl<F: BlockFile> ShardDb<F> {
         {
             found = p.mem.get_hashed(key, hash, value)?;
         }
+        if found.is_none()
+            && let Some(cached) = self.records.as_mut().and_then(|r| r.get(key, hash))
+        {
+            value.clear();
+            value.extend_from_slice(cached);
+            return Ok(true);
+        }
         if found.is_none() {
             found = self.trunk.get_hashed(&mut self.store, key, hash, value)?;
+            if found == Some(Op::Put)
+                && let Some(r) = self.records.as_mut()
+            {
+                r.insert(key, hash, value);
+            }
         }
         Ok(found == Some(Op::Put))
     }

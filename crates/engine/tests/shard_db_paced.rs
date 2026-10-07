@@ -202,6 +202,46 @@ fn runs_submitted_to_the_issuer_read_back_and_reopen_whole() {
 /// 50 keys (`ShardDb::idle_step`): every key still reads its newest value, and idle slices alone
 /// pay every debt to the end.
 #[test]
+fn a_record_cache_never_answers_with_a_version_older_than_one_written() {
+    // Every key read between every two operations, puts and deletes among them, flushes and
+    // compactions moving the originals: the cache's replicas must never be read once stale. A
+    // cache of 4 KiB holds a few dozen records, so evictions and second chances run throughout.
+    let align = Alignment::new(4096).unwrap();
+    let file = SimFile::new(align, Alignment::new(512).unwrap(), 31).unwrap();
+    run_with(file, 0, None, false, 4 * 1024);
+}
+
+#[test]
+fn a_record_read_then_rewritten_and_flushed_reads_its_new_version() {
+    // The sequence that would expose a stale replica: a key read from the trunk (and cached),
+    // rewritten, and flushed, so the memtable no longer answers and the trunk holds the new
+    // version; and deleted the same way.
+    let align = Alignment::new(4096).unwrap();
+    let file = SimFile::new(align, Alignment::new(512).unwrap(), 37).unwrap();
+    let mut db = ShardDb::create(file, STORE, MEM, TRUNK).unwrap();
+    db.set_record_cache(64 * 1024);
+    let k = key(7);
+    let mut out = Vec::new();
+    db.put(&k, b"first").unwrap();
+    db.checkpoint(1).unwrap();
+    assert!(db.get(&k, &mut out).unwrap());
+    assert_eq!(out, b"first");
+    db.put(&k, b"second").unwrap();
+    db.checkpoint(2).unwrap();
+    assert!(db.get(&k, &mut out).unwrap());
+    assert_eq!(
+        out, b"second",
+        "a cached version older than the one written"
+    );
+    db.delete(&k).unwrap();
+    db.checkpoint(3).unwrap();
+    assert!(
+        !db.get(&k, &mut out).unwrap(),
+        "a cached version of a deleted key"
+    );
+}
+
+#[test]
 fn idle_slices_between_operations_keep_every_read_exact_and_pay_every_debt() {
     let align = Alignment::new(4096).unwrap();
     let file = SimFile::new(align, Alignment::new(512).unwrap(), 17).unwrap();
@@ -234,8 +274,20 @@ fn run_on<F: BlockFile + 'static>(
     issuer: Option<&Issuer>,
     idle: bool,
 ) -> (ShardDb<F>, BTreeMap<u64, Option<Vec<u8>>>) {
+    run_with(file, cache, issuer, idle, 0)
+}
+
+/// [`run_on`] with a cache of `records` bytes of hot records.
+fn run_with<F: BlockFile + 'static>(
+    file: F,
+    cache: usize,
+    issuer: Option<&Issuer>,
+    idle: bool,
+    records: usize,
+) -> (ShardDb<F>, BTreeMap<u64, Option<Vec<u8>>>) {
     let mut db = ShardDb::create(file, STORE, MEM, TRUNK).unwrap();
     db.set_cache(cache);
+    db.set_record_cache(records);
     // The idle variant asserts views are rebuilt: rebuilt whenever they can be, not as measured
     // costs choose, so the test does not depend on timing.
     if idle {

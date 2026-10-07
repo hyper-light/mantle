@@ -269,7 +269,11 @@ fn main() {
         );
     }
     let (h, n, l) = db.shape().unwrap();
-    println!("shape height {h} nodes {n} leaves {l}");
+    let (_, trunk, _) = db.stats();
+    println!(
+        "shape height {h} nodes {n} leaves {l} views built {} dropped {}",
+        trunk.views_built, trunk.views_dropped
+    );
     drop(db);
     std::fs::remove_file(&path).unwrap();
 }

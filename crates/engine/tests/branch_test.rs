@@ -35,7 +35,7 @@ fn store(seed: u64) -> Store<SimFile> {
 }
 
 fn build(store: &mut Store<SimFile>, entries: &BTreeMap<Vec<u8>, (Op, Vec<u8>)>) -> Branch {
-    let mut b = Builder::new(&*store, Keys::Exactly(entries.len() as u64)).unwrap();
+    let mut b = Builder::new(store, Keys::Exactly(entries.len() as u64)).unwrap();
     for (k, (op, v)) in entries {
         b.add(store, k, *op, v).unwrap();
     }
@@ -129,13 +129,13 @@ proptest! {
 #[test]
 fn keys_out_of_order_and_oversized_entries_are_refused() {
     let mut s = store(1);
-    let mut b = Builder::new(&s, Keys::Exactly(1)).unwrap();
+    let mut b = Builder::new(&mut s, Keys::Exactly(1)).unwrap();
     b.add(&mut s, b"b", Op::Put, b"1").unwrap();
     assert!(b.add(&mut s, b"b", Op::Put, b"2").is_err());
     assert!(b.add(&mut s, b"a", Op::Put, b"3").is_err());
     assert!(b.add(&mut s, b"c", Op::Put, &vec![0u8; 5000]).is_err());
     assert!(
-        Builder::new(&s, Keys::Exactly(1))
+        Builder::new(&mut s, Keys::Exactly(1))
             .unwrap()
             .finish(&mut s)
             .is_err()

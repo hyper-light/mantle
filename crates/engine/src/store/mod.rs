@@ -84,6 +84,10 @@ pub struct IoStats {
     pub span_cache_hits: u64,
     /// The most queue steps one cache eviction took.
     pub cache_evict_steps_most: u64,
+    /// Extent buffers taken for spans, runs and submissions, and those of them allocated fresh
+    /// because the pool had none.
+    pub buffers_taken: u64,
+    pub buffers_fresh: u64,
 }
 
 fn elapsed_ns(since: std::time::Instant) -> u64 {
@@ -109,17 +113,20 @@ pub struct Store<F: BlockFile> {
     cache: Option<cache::Cache>,
     /// The device's issuer, when the owner attaches the store to one ([`Store::attach`]).
     writer: Option<Writer>,
+    /// Extent buffers given back by spans, runs and answered writes, for the next to need one:
+    /// a fresh one costs a page fault for each of its pages, milliseconds a compaction's
+    /// cursors on a busy machine. It holds no more than were ever out at once.
+    pool: Vec<AlignedBuf>,
+    lent: usize,
+    most_lent: usize,
 }
 
 /// Runs handed to the device's issuer and not yet answered: each batch's number, the page
-/// addresses it writes and the byte past them, and the extent buffers answers gave back, kept
-/// for the next runs. The buffers in flight are at most the batches attached for, so the spare
-/// ones are too.
+/// addresses it writes and the byte past them.
 #[derive(Debug)]
 struct Writer {
     attached: Attached,
     in_flight: VecDeque<(u64, u64, u64, u64)>,
-    spare: Vec<AlignedBuf>,
 }
 
 /// Node pages one writer queues at consecutive addresses within an extent, sealed into an
@@ -238,6 +245,9 @@ impl<F: BlockFile> Store<F> {
             io: IoStats::default(),
             cache: None,
             writer: None,
+            pool: Vec::new(),
+            lent: 0,
+            most_lent: 0,
         };
         store.checkpoint(None, 0)?;
         Ok(store)
@@ -285,6 +295,9 @@ impl<F: BlockFile> Store<F> {
                 io: IoStats::default(),
                 cache: None,
                 writer: None,
+                pool: Vec::new(),
+                lent: 0,
+                most_lent: 0,
             },
             recovered,
         ))
@@ -521,13 +534,48 @@ impl<F: BlockFile> Store<F> {
         self.fence(synced)
     }
 
+    /// An extent buffer from the pool, or a fresh one.
+    fn take_buf(&mut self) -> Result<AlignedBuf, Error> {
+        let buf = match self.pool.pop() {
+            Some(b) => b,
+            None => {
+                self.io.buffers_fresh = self.io.buffers_fresh.saturating_add(1);
+                Self::run_buf(&self.file, self.config)?
+            }
+        };
+        self.io.buffers_taken = self.io.buffers_taken.saturating_add(1);
+        self.lent = self.lent.saturating_add(1);
+        self.most_lent = self.most_lent.max(self.lent);
+        Ok(buf)
+    }
+
+    /// Gives an extent buffer back to the pool, its length the extent's again.
+    fn give_buf(&mut self, mut buf: AlignedBuf) {
+        self.lent = self.lent.saturating_sub(1);
+        let capacity = self
+            .config
+            .page_size
+            .saturating_mul(usize::try_from(self.config.extent_pages).unwrap_or(usize::MAX));
+        if buf.capacity() >= capacity
+            && buf.set_len(capacity).is_ok()
+            && self.pool.len() < self.most_lent
+        {
+            self.pool.push(buf);
+        }
+    }
+
     /// An empty run for a writer.
-    pub fn run(&self) -> Result<Run, Error> {
+    pub fn run(&mut self) -> Result<Run, Error> {
         Ok(Run {
-            buf: Self::run_buf(&self.file, self.config)?,
+            buf: self.take_buf()?,
             first: 0,
             pages: 0,
         })
+    }
+
+    /// Takes back a run its writer is done with: its pages written, its buffer for the next.
+    pub fn give_run(&mut self, run: Run) {
+        self.give_buf(run.buf);
     }
 
     /// Queues a node page at `address` in `run` for the next checkpoint, as
@@ -654,10 +702,7 @@ impl<F: BlockFile> Store<F> {
             self.io.write_waits = self.io.write_waits.saturating_add(1);
             self.io.write_wait_ns = self.io.write_wait_ns.saturating_add(elapsed_ns(t));
         }
-        let fresh = match self.writer.as_mut().and_then(|w| w.spare.pop()) {
-            Some(b) => b,
-            None => Self::run_buf(&self.file, self.config)?,
-        };
+        let fresh = self.take_buf()?;
         let mut buf = std::mem::replace(&mut run.buf, fresh);
         buf.set_len(bytes)
             .map_err(|e| io("cut a run to its pages", e))?;
@@ -705,17 +750,8 @@ impl<F: BlockFile> Store<F> {
         if let Some(past) = past {
             self.end = self.end.max(past);
         }
-        let capacity = self
-            .config
-            .page_size
-            .saturating_mul(usize::try_from(self.config.extent_pages).unwrap_or(usize::MAX));
-        for mut b in buffers {
-            if b.set_len(capacity).is_ok()
-                && let Some(w) = self.writer.as_mut()
-                && w.spare.len() < w.attached.batches()
-            {
-                w.spare.push(b);
-            }
+        for b in buffers {
+            self.give_buf(b);
         }
         Ok(true)
     }
@@ -762,7 +798,6 @@ impl<F: BlockFile> Store<F> {
         self.writer = Some(Writer {
             attached,
             in_flight: VecDeque::with_capacity(batches),
-            spare: Vec::with_capacity(batches),
         });
         Ok(())
     }
@@ -813,12 +848,17 @@ impl<F: BlockFile> Store<F> {
     }
 
     /// A span for a scan: an extent's buffer, holding no pages yet.
-    pub fn span(&self) -> Result<Span, Error> {
+    pub fn span(&mut self) -> Result<Span, Error> {
         Ok(Span {
-            buf: Self::run_buf(&self.file, self.config)?,
+            buf: self.take_buf()?,
             first: 0,
             pages: 0,
         })
+    }
+
+    /// Takes back a span its scan is done with.
+    pub fn give_span(&mut self, span: Span) {
+        self.give_buf(span.buf);
     }
 
     /// [`Self::read_page`] for a scan, which reads pages in address order: a page `span` holds

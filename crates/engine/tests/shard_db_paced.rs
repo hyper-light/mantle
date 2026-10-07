@@ -164,5 +164,14 @@ fn run_on<F: BlockFile + 'static>(
         check(&mut db, &oracle, k);
     }
     db.check_references().unwrap();
+    // Extent buffers come back to the store's pool and are taken again: a fresh allocation is
+    // a page fault for each of its pages.
+    let (_, _, io) = db.stats();
+    assert!(
+        io.buffers_fresh * 10 < io.buffers_taken,
+        "{} fresh of {} taken",
+        io.buffers_fresh,
+        io.buffers_taken
+    );
     (db, oracle)
 }

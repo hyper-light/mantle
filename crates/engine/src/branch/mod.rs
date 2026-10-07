@@ -241,7 +241,7 @@ pub struct Builder {
 impl Builder {
     /// A builder in `store`, for `keys` entries: pages of the store's payload capacity, which
     /// offsets of 16 bits must reach.
-    pub fn new<F: BlockFile>(store: &Store<F>, keys: filter::Keys) -> Result<Self, Error> {
+    pub fn new<F: BlockFile>(store: &mut Store<F>, keys: filter::Keys) -> Result<Self, Error> {
         let capacity = store.page_capacity();
         if capacity > usize::from(u16::MAX) {
             return Err(Error::InvalidArgument {
@@ -416,6 +416,8 @@ impl Builder {
                 }
                 self.payload = chunk;
                 store.write_run(&mut self.run)?;
+                // The run's buffer goes back to the store's pool for the next writer.
+                store.give_run(self.run);
                 return Ok(Branch {
                     root,
                     height: u8::try_from(level).map_err(|_| corrupt(Malformed::TooLarge))?,
@@ -675,6 +677,11 @@ impl Branch {
 }
 
 impl Cursor {
+    /// The cursor's span, for its store's pool once the scan is done.
+    pub fn into_span(self) -> Span {
+        self.span
+    }
+
     /// Whether the cursor is at an entry.
     pub fn valid(&self) -> bool {
         self.valid

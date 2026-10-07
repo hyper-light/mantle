@@ -40,7 +40,7 @@ fn corrupt() -> Error {
 }
 
 /// A view of runs over a key range.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct View {
     runs: usize,
     /// The anchors back to back, and where each ends.
@@ -54,106 +54,28 @@ pub struct View {
 }
 
 impl View {
-    /// The view of `runs` (newest first) over `[lo, hi)`, at most 63 runs.
+    /// The view of `runs` (newest first) over `[lo, hi)`, at most 63 runs, built at once: a
+    /// [`Build`] run to its end.
     pub fn build<F: BlockFile>(
         store: &mut Store<F>,
         runs: &[&Branch],
         lo: &[u8],
         hi: Option<&[u8]>,
     ) -> Result<Self, Error> {
-        if runs.len() > usize::from(RUN) {
-            return Err(Error::LimitExceeded {
-                what: "the runs of a REMIX view",
-                limit: u64::from(RUN),
-            });
-        }
-        let width = SEGMENT.max(runs.len());
-        let mut cursors = Vec::with_capacity(runs.len());
-        for b in runs {
-            match b.run_at(store, lo) {
-                Ok(c) => cursors.push(c),
+        let mut job = Build::new(store, runs, lo, hi)?;
+        // Every entry of every run is taken once: the runs' entries bound the steps.
+        let total: u64 = runs.iter().map(|b| b.count).sum();
+        for _ in 0..=total {
+            match job.step(store, runs, u64::MAX) {
+                Ok(true) => return Ok(job.finish(store)),
+                Ok(false) => {}
                 Err(e) => {
-                    give_back(store, cursors);
+                    job.abandon(store);
                     return Err(e);
                 }
             }
         }
-        let built = Self::fill(store, runs, &mut cursors, hi, width);
-        give_back(store, cursors);
-        built
-    }
-
-    fn fill<F: BlockFile>(
-        store: &mut Store<F>,
-        runs: &[&Branch],
-        cursors: &mut [RunCursor],
-        hi: Option<&[u8]>,
-        width: usize,
-    ) -> Result<Self, Error> {
-        let mut view = Self {
-            runs: runs.len(),
-            ..Self::default()
-        };
-        let in_range = |c: &RunCursor| c.valid() && hi.is_none_or(|h| c.key() < h);
-        let mut key = Vec::new();
-        let mut in_segment = 0usize;
-        // Every entry of every run is taken once: the runs' entries bound the steps.
-        let total: u64 = runs.iter().map(|b| b.count).sum();
-        for _ in 0..=total {
-            // The least key any run holds next.
-            let Some(least) = cursors
-                .iter()
-                .filter(|c| in_range(c))
-                .map(RunCursor::key)
-                .min()
-            else {
-                if in_segment > 0 {
-                    view.selector_ends.push(view.selectors.len());
-                }
-                return Ok(view);
-            };
-            key.clear();
-            key.extend_from_slice(least);
-            let versions = cursors
-                .iter()
-                .filter(|c| in_range(c) && c.key() == key.as_slice())
-                .count();
-            if in_segment > 0 && in_segment.saturating_add(versions) > width {
-                view.selector_ends.push(view.selectors.len());
-                in_segment = 0;
-            }
-            if in_segment == 0 {
-                view.anchors.extend_from_slice(&key);
-                view.anchor_ends.push(view.anchors.len());
-                for c in cursors.iter() {
-                    view.offsets.push(if in_range(c) {
-                        let (page, index) = c.position();
-                        (page, u16::try_from(index).map_err(|_| corrupt())?)
-                    } else {
-                        PAST
-                    });
-                }
-            }
-            // The key's versions, newest run first.
-            let mut newest = true;
-            for (r, c) in cursors.iter_mut().enumerate() {
-                if !(in_range(c) && c.key() == key.as_slice()) {
-                    continue;
-                }
-                let mut sel = u8::try_from(r).map_err(|_| corrupt())?;
-                if !newest {
-                    sel |= OLD;
-                }
-                if c.op() == Op::Delete {
-                    sel |= TOMBSTONE;
-                }
-                newest = false;
-                view.selectors.push(sel);
-                in_segment = in_segment.saturating_add(1);
-                let b = runs.get(r).ok_or(corrupt())?;
-                c.next(b, store)?;
-            }
-        }
+        job.abandon(store);
         Err(corrupt())
     }
 
@@ -255,6 +177,155 @@ impl View {
         };
         walk.give_back(store);
         Ok(more)
+    }
+}
+
+/// A view built a slice at a time, as maintenance (docs/design/engine-structure.md §5, E6): a
+/// cursor a run, merged in key order, each key's versions newest first; a segment closes where the
+/// next key's versions would pass its width. The runs it reads are named by their roots, so the
+/// owner checks before each step that the bundle has not changed under it ([`Build::reads`]).
+#[derive(Debug)]
+pub struct Build {
+    roots: Vec<u64>,
+    hi: Option<Vec<u8>>,
+    width: usize,
+    cursors: Vec<RunCursor>,
+    view: View,
+    in_segment: usize,
+    key: Vec<u8>,
+}
+
+impl Build {
+    /// A build of the view of `runs` (newest first, at most 63) over `[lo, hi)`.
+    pub fn new<F: BlockFile>(
+        store: &mut Store<F>,
+        runs: &[&Branch],
+        lo: &[u8],
+        hi: Option<&[u8]>,
+    ) -> Result<Self, Error> {
+        if runs.len() > usize::from(RUN) {
+            return Err(Error::LimitExceeded {
+                what: "the runs of a REMIX view",
+                limit: u64::from(RUN),
+            });
+        }
+        let mut cursors = Vec::with_capacity(runs.len());
+        for b in runs {
+            match b.run_at(store, lo) {
+                Ok(c) => cursors.push(c),
+                Err(e) => {
+                    give_back(store, cursors);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(Self {
+            roots: runs.iter().map(|b| b.root).collect(),
+            hi: hi.map(<[u8]>::to_vec),
+            width: SEGMENT.max(runs.len()),
+            cursors,
+            view: View {
+                runs: runs.len(),
+                ..View::default()
+            },
+            in_segment: 0,
+            key: Vec::new(),
+        })
+    }
+
+    /// Whether `runs` are the runs this build reads: the same branches, in the same order.
+    pub fn reads(&self, runs: &[&Branch]) -> bool {
+        self.roots.len() == runs.len() && self.roots.iter().zip(runs).all(|(&r, b)| r == b.root)
+    }
+
+    /// Takes up to `budget` entries into the view; true once every entry in range is in it.
+    pub fn step<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        runs: &[&Branch],
+        budget: u64,
+    ) -> Result<bool, Error> {
+        if !self.reads(runs) {
+            return Err(Error::InvalidArgument {
+                what: "a view build stepped over runs it was not started on",
+            });
+        }
+        let hi = self.hi.as_deref();
+        let in_range = |c: &RunCursor| c.valid() && hi.is_none_or(|h| c.key() < h);
+        let mut taken = 0u64;
+        while taken < budget {
+            // The least key any run holds next.
+            let Some(least) = self
+                .cursors
+                .iter()
+                .filter(|c| in_range(c))
+                .map(RunCursor::key)
+                .min()
+            else {
+                if self.in_segment > 0 {
+                    self.view.selector_ends.push(self.view.selectors.len());
+                    self.in_segment = 0;
+                }
+                return Ok(true);
+            };
+            self.key.clear();
+            self.key.extend_from_slice(least);
+            let key = self.key.as_slice();
+            let versions = self
+                .cursors
+                .iter()
+                .filter(|c| in_range(c) && c.key() == key)
+                .count();
+            let view = &mut self.view;
+            if self.in_segment > 0 && self.in_segment.saturating_add(versions) > self.width {
+                view.selector_ends.push(view.selectors.len());
+                self.in_segment = 0;
+            }
+            if self.in_segment == 0 {
+                view.anchors.extend_from_slice(key);
+                view.anchor_ends.push(view.anchors.len());
+                for c in &self.cursors {
+                    view.offsets.push(if in_range(c) {
+                        let (page, index) = c.position();
+                        (page, u16::try_from(index).map_err(|_| corrupt())?)
+                    } else {
+                        PAST
+                    });
+                }
+            }
+            // The key's versions, newest run first.
+            let mut newest = true;
+            for (r, c) in self.cursors.iter_mut().enumerate() {
+                if !(in_range(c) && c.key() == key) {
+                    continue;
+                }
+                let mut sel = u8::try_from(r).map_err(|_| corrupt())?;
+                if !newest {
+                    sel |= OLD;
+                }
+                if c.op() == Op::Delete {
+                    sel |= TOMBSTONE;
+                }
+                newest = false;
+                view.selectors.push(sel);
+                self.in_segment = self.in_segment.saturating_add(1);
+                taken = taken.saturating_add(1);
+                let b = runs.get(r).ok_or(corrupt())?;
+                c.next(b, store)?;
+            }
+        }
+        Ok(false)
+    }
+
+    /// The view built, the cursors' pages and spans given back to `store`.
+    pub fn finish<F: BlockFile>(self, store: &mut Store<F>) -> View {
+        give_back(store, self.cursors);
+        self.view
+    }
+
+    /// Drops the build, the cursors' pages and spans given back to `store`.
+    pub fn abandon<F: BlockFile>(self, store: &mut Store<F>) {
+        give_back(store, self.cursors);
     }
 }
 

@@ -26,6 +26,7 @@
 //! one) and holds the one reference its extents were allocated with; the node that drops it
 //! releases them, so an extent is freed exactly when no node names it.
 
+use crate::remix::View;
 use crate::branch::merge::Compaction;
 use crate::branch::{Branch, Op};
 use crate::error::{Error, Malformed};
@@ -45,10 +46,55 @@ pub struct TrunkConfig {
 struct Pivot {
     key: Vec<u8>,
     child: Option<usize>,
-    /// Newest first.
-    bundle: Vec<Branch>,
+    bundle: Bundle,
     /// The first of the node's in-flight bundles live for this pivot.
     start: usize,
+}
+
+/// A pivot's bundle, newest first, and the REMIX view of it once one is built (a leaf's,
+/// docs/design/engine-structure.md §5, E6). Every change to the branches drops the view, so a view
+/// never describes branches other than those it was built of; a copy has none.
+#[derive(Debug, Default)]
+struct Bundle {
+    branches: Vec<Branch>,
+    view: Option<View>,
+}
+
+impl Clone for Bundle {
+    fn clone(&self) -> Self {
+        Self {
+            branches: self.branches.clone(),
+            view: None,
+        }
+    }
+}
+
+impl From<Vec<Branch>> for Bundle {
+    fn from(branches: Vec<Branch>) -> Self {
+        Self {
+            branches,
+            view: None,
+        }
+    }
+}
+
+impl Bundle {
+    /// The branches, newest first.
+    fn branches(&self) -> &[Branch] {
+        &self.branches
+    }
+
+    /// The branches, to change: the view is dropped.
+    fn branches_mut(&mut self) -> &mut Vec<Branch> {
+        self.view = None;
+        &mut self.branches
+    }
+
+    /// The branches taken out, the bundle left empty, its view dropped.
+    fn take(&mut self) -> Vec<Branch> {
+        self.view = None;
+        std::mem::take(&mut self.branches)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -163,7 +209,7 @@ impl Trunk {
                 pivots: vec![Pivot {
                     key: Vec::new(),
                     child: None,
-                    bundle: Vec::new(),
+                    bundle: Bundle::default(),
                     start: 0,
                 }],
                 inflight: Vec::new(),
@@ -229,7 +275,7 @@ impl Trunk {
                     }
                 }
             }
-            for b in &pivot.bundle {
+            for b in pivot.bundle.branches() {
                 if let Some(op) = b.get_hashed(store, key, hash, value)? {
                     return Ok(Some(op));
                 }
@@ -277,7 +323,7 @@ impl Trunk {
             for bundle in node.inflight.get(pivot.start..).unwrap_or(&[]).iter().rev() {
                 branches.extend(bundle.iter());
             }
-            branches.extend(pivot.bundle.iter());
+            branches.extend(pivot.bundle.branches().iter());
             match pivot.child {
                 Some(child) => at = child,
                 None => {
@@ -420,7 +466,7 @@ impl Trunk {
             .map(|(key, child)| Pivot {
                 key,
                 child: Some(child),
-                bundle: Vec::new(),
+                bundle: Bundle::default(),
                 start: 0,
             })
             .collect();
@@ -552,8 +598,8 @@ impl Trunk {
                     Some(c) => put32(&mut blob, c)?,
                     None => blob.extend_from_slice(&ABSENT.to_le_bytes()),
                 }
-                put32(&mut blob, p.bundle.len())?;
-                for b in &p.bundle {
+                put32(&mut blob, p.bundle.branches().len())?;
+                for b in p.bundle.branches() {
                     b.encode(&mut blob)?;
                 }
             }
@@ -717,7 +763,7 @@ impl Trunk {
                 pivots.push(Pivot {
                     key,
                     child,
-                    bundle,
+                    bundle: Bundle::from(bundle),
                     start: 0,
                 });
             }
@@ -804,7 +850,7 @@ impl Trunk {
         let pivot = self.node_mut(n)?.pivots.get_mut(i).ok_or(corrupt())?;
         pivot.start = covered;
         if let Some(b) = merged {
-            pivot.bundle.insert(0, b);
+            pivot.bundle.branches_mut().insert(0, b);
         }
         Ok(())
     }
@@ -835,8 +881,8 @@ impl Trunk {
     ) -> Result<Option<Phase>, Error> {
         let node = self.node(n)?;
         let pivot = node.pivots.first().ok_or(corrupt())?;
-        let entries: u64 = pivot.bundle.iter().map(|b| b.count).sum();
-        if pivot.bundle.len() <= self.config.fanout && entries <= self.config.leaf_entries {
+        let entries: u64 = pivot.bundle.branches().iter().map(|b| b.count).sum();
+        if pivot.bundle.branches().len() <= self.config.fanout && entries <= self.config.leaf_entries {
             self.returned = Some(vec![(pivot.key.clone(), n)]);
             return Ok(None);
         }
@@ -844,12 +890,13 @@ impl Trunk {
         // The extents the compaction's inputs hold, released once it replaces them.
         let extents: Vec<u64> = pivot
             .bundle
+            .branches()
             .iter()
             .flat_map(|b| b.extents.iter().copied())
             .collect();
         let job = Compaction::new(
             store,
-            &pivot.bundle,
+            pivot.bundle.branches(),
             &from,
             end.as_deref(),
             true,
@@ -890,6 +937,7 @@ impl Trunk {
                 .first_mut()
                 .ok_or(corrupt())?
                 .bundle
+                .branches_mut()
                 .clear();
             return Ok(vec![(from, n)]);
         }
@@ -900,7 +948,7 @@ impl Trunk {
             if j == 0 {
                 let node = self.node_mut(n)?;
                 let p = node.pivots.first_mut().ok_or(corrupt())?;
-                p.bundle = vec![branch];
+                p.bundle = Bundle::from(vec![branch]);
                 out.push((key, n));
             } else {
                 self.nodes.push(Node {
@@ -908,7 +956,7 @@ impl Trunk {
                     pivots: vec![Pivot {
                         key: key.clone(),
                         child: None,
-                        bundle: vec![branch],
+                        bundle: Bundle::from(vec![branch]),
                         start: 0,
                     }],
                     inflight: Vec::new(),
@@ -937,14 +985,14 @@ impl Trunk {
         let fanout = self.config.fanout;
         let node = self.node(n)?;
         let next = (i..node.pivots.len())
-            .find(|&j| node.pivots.get(j).is_some_and(|p| p.bundle.len() > fanout));
+            .find(|&j| node.pivots.get(j).is_some_and(|p| p.bundle.branches().len() > fanout));
         let Some(j) = next else {
             self.returned = Some(self.split_node(n)?);
             return Ok(None);
         };
         let pivot = self.node_mut(n)?.pivots.get_mut(j).ok_or(corrupt())?;
         let child = pivot.child.ok_or(corrupt())?;
-        let bundle = std::mem::take(&mut pivot.bundle);
+        let bundle = pivot.bundle.take();
         self.stats.flushes = self.stats.flushes.saturating_add(1);
         // Oldest first into the child's in-flight list: the bundle is newest first.
         for b in bundle.into_iter().rev() {
@@ -975,7 +1023,7 @@ impl Trunk {
             .map(|(key, child)| Pivot {
                 key,
                 child: Some(child),
-                bundle: Vec::new(),
+                bundle: Bundle::default(),
                 start: node.inflight.len(),
             })
             .collect();
@@ -1070,7 +1118,7 @@ impl Trunk {
                 out.extend(bundle.iter().cloned());
             }
             for p in &node.pivots {
-                out.extend(p.bundle.iter().cloned());
+                out.extend(p.bundle.branches().iter().cloned());
             }
         }
         out

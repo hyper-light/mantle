@@ -104,6 +104,9 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/engine/src/fst/trie.rs` `DENSE_RATIO` | cited | R = 64: the dense levels at most 1/64 of the sparse levels below them (SuRF §2.4; research/35 §1). |
 | `crates/engine/src/fst/trie.rs` `SPARSE_BLOCK` | cited | 512-bit rank blocks for LOUDS-Sparse: a block in a cache line, 6.25% over the bits (SuRF §2.6; research/35 §1). |
 | `crates/engine/src/fst/trie.rs` `SPARSE_LABEL_BITS` | format | 10: a LOUDS-Sparse label's byte and its has-child and node-start bits. |
+| `crates/engine/src/maplet.rs` `BLOCK_BUCKETS` | derived | 64: buckets a block holds; at a load of one their headers and 10-bit entries take about a cache line, and a lookup scans the block's headers in about two words (research/38). |
+| `crates/engine/src/maplet.rs` `REMAINDER_BITS` | cited | 7: remainder bits at the largest bundle; a lookup's false-positive rate is about `load · 2^-7`, at most 0.78%, the Bloom filters' 0.8% a probe (research/38 §3; Broder and Mitzenmacher 2004 §2.1). |
+| `crates/engine/src/maplet.rs` `TABLE_BYTES` | format | 4: a block's table entry, its byte offset and its entry count, u16 each. |
 | `crates/engine/src/records.rs` `LIVE` | format | 1: a cached record's flag, set while it is the key's current replica. |
 | `crates/engine/src/records.rs` `READ` | format | 2: a cached record's flag, set when it is read after being appended; it is carried to the tail once when its page is evicted (F2's second chance, Kanellis et al. PVLDB 2025 §7; research/37). |
 | `crates/engine/src/records.rs` `RECORD_HEAD` | format | 15: a cached record's fixed bytes, key length (2), value length (4), flags (1), key hash (8). |

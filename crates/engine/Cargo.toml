@@ -59,6 +59,10 @@ name = "incmap"
 harness = false
 
 [[bench]]
+name = "maplet"
+harness = false
+
+[[bench]]
 name = "ranges"
 harness = false
 

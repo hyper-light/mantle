@@ -18,7 +18,7 @@ pub const SELECT_SAMPLE: usize = 64;
 
 /// The position of set bit `k` (from 0) of `w`, which has more than `k`: halves of 32, 16 and 8
 /// bits passed by their popcounts, then the byte's bits, at most eight steps.
-fn select_in_word(w: u64, k: usize) -> usize {
+pub(crate) fn select_in_word(w: u64, k: usize) -> usize {
     let mut k = u32::try_from(k).unwrap_or(u32::MAX);
     let mut shift = 0u32;
     for (half, mask) in [(32u32, 0xffff_ffffu64), (16, 0xffff), (8, 0xff)] {

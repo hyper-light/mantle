@@ -24,9 +24,37 @@ use std::time::Instant;
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::issuer::Issuer;
+use hyper_measure::{alloc, faults};
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::Config;
 use mantle_engine::trunk::TrunkConfig;
+
+#[global_allocator]
+static ALLOCATOR: alloc::Counting = alloc::Counting;
+
+/// Starts a phase's count of every thread's allocations (the issuer's too) and of the
+/// process's page faults.
+fn begin() -> faults::Faults {
+    alloc::begin_process();
+    faults::read().unwrap()
+}
+
+/// A phase's allocations, reallocations and page faults, each per operation.
+fn costs(name: &str, ops: u64, from: &faults::Faults) {
+    let a = alloc::end_process();
+    let f = faults::read().unwrap().since(from);
+    let line = format!(
+        "{name} allocs/op {:.3} reallocs/op {:.3} bytes/op {:.1} faults/op {:.4} (allocs {} reallocs {} faults {})",
+        a.allocations as f64 / ops as f64,
+        a.reallocations as f64 / ops as f64,
+        a.bytes as f64 / ops as f64,
+        f.total() as f64 / ops as f64,
+        a.allocations,
+        a.reallocations,
+        f.total()
+    );
+    println!("{line}");
+}
 
 struct Rng(u64);
 impl Rng {
@@ -113,6 +141,7 @@ fn main() {
     // samples, as db_bench's --histogram=1 times each of its operations.
     let mut lat: Vec<u64> = Vec::with_capacity(num as usize);
     let mut slow: Vec<Slow> = Vec::new();
+    let mark = begin();
     let t = Instant::now();
     for _ in 0..num {
         let k = key(rng.next() % num);
@@ -128,6 +157,7 @@ fn main() {
         }
     }
     let s = t.elapsed().as_secs_f64();
+    costs("fillrandom", num, &mark);
     if attribute {
         attribute_tail(&lat, &mut slow);
     }
@@ -185,6 +215,7 @@ fn main() {
     let mut out = Vec::new();
     let mut found = 0u64;
     lat.clear();
+    let mark = begin();
     let t = Instant::now();
     for _ in 0..reads {
         let k = key(rng.next() % num);
@@ -195,6 +226,7 @@ fn main() {
         lat.push(o.elapsed().as_nanos() as u64);
     }
     let s = t.elapsed().as_secs_f64();
+    costs("readrandom", reads.max(1), &mark);
     if reads > 0 {
         report("readrandom", &mut lat);
         println!(
@@ -215,6 +247,7 @@ fn main() {
         let mut page = Vec::with_capacity(seek_nexts);
         let mut keys_read = 0u64;
         lat.clear();
+        let mark = begin();
         let t = Instant::now();
         for _ in 0..seeks {
             let from = key(rng.next() % num);
@@ -225,6 +258,7 @@ fn main() {
             keys_read += page.len() as u64;
         }
         let s = t.elapsed().as_secs_f64();
+        costs("seekrandom", seeks, &mark);
         report("seekrandom", &mut lat);
         println!(
             "seekrandom {seeks} {:.0} {:.3} nexts {seek_nexts} keys read {keys_read}",

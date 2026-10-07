@@ -2347,3 +2347,17 @@ fn three_voters_write_once_per_entry_committed_one_at_a_time() {
         );
     }
 }
+
+/// The owner's quorum patience reaches the core through the replica (`docs/raft.md` §3.6), and a
+/// patience past what a tick counts is refused with the one in force kept.
+#[test]
+fn the_quorum_patience_reaches_the_core_and_an_overflow_is_refused() {
+    let mut r = sole(4, Unbounded, |_| {});
+    r.set_quorum_patience(9).unwrap();
+    assert_eq!(r.core().raft.quorum_patience(), 9);
+    assert!(matches!(
+        r.set_quorum_patience(usize::MAX),
+        Err(ReplicaError::Refused(hyper_raft::Error::Settings(_)))
+    ));
+    assert_eq!(r.core().raft.quorum_patience(), 9);
+}

@@ -502,8 +502,39 @@ impl Rebuild {
             .filter(|&(i, &sel)| i == start || sel & OLD == 0)
             .map(|(i, _)| i)
             .collect();
-        let (mut glo, mut ghi) = (0usize, starts.len());
+        // Galloping from the stream's position (Hwang and Lin's generalized binary merging): the
+        // group 1, 2, 4, ... ahead is read until one is at least `k`, then the last gap halved.
+        // A key costs about twice the log of the groups it passes, so a new run much smaller
+        // than the view reads little of it, and one as large reads about a key a group.
         let mut equal_at: Option<usize> = None;
+        let mut passed = 0usize;
+        let mut step = 1usize;
+        let mut bound = starts.len();
+        while passed < starts.len() {
+            let probe = passed
+                .saturating_add(step)
+                .saturating_sub(1)
+                .min(starts.len().saturating_sub(1));
+            let at = *starts.get(probe).ok_or(corrupt())?;
+            self.old_key(store, runs, s, at)?;
+            match self.key.as_slice().cmp(k) {
+                std::cmp::Ordering::Less => {
+                    passed = probe.saturating_add(1);
+                    step = step.saturating_mul(2);
+                }
+                std::cmp::Ordering::Equal => {
+                    equal_at = Some(at);
+                    bound = probe;
+                    break;
+                }
+                std::cmp::Ordering::Greater => {
+                    bound = probe;
+                    break;
+                }
+            }
+        }
+        // The first group at least `k` lies in `[passed, bound]`.
+        let (mut glo, mut ghi) = (passed, bound);
         while glo < ghi {
             let mid = glo.saturating_add(ghi.saturating_sub(glo) / 2);
             let at = *starts.get(mid).ok_or(corrupt())?;

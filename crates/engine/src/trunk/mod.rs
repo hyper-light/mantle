@@ -200,6 +200,8 @@ pub struct Trunk {
     timed: bool,
     /// The REMIX view being built, for the pivot it names ([`Trunk::view_step`]).
     view_job: Option<ViewJob>,
+    view_costs: ViewCosts,
+    view_choice: ViewChoice,
     /// Nodes to check for a pivot bundle wanting a view since the trunk last changed, checked
     /// round from `view_at`: every node once after a change.
     views_unchecked: usize,
@@ -213,6 +215,50 @@ struct ViewJob {
     node: usize,
     pivot: usize,
     build: Job,
+    /// The work the job was predicted at, in its kind's units, and the nanoseconds it has taken.
+    units: u64,
+    ns: u64,
+}
+
+/// How a bundle's view is made when it can be rebuilt: by the rates measured (the default), or
+/// always one way, for a test that must know which ran.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ViewChoice {
+    #[default]
+    Measured,
+    Build,
+    Rebuild,
+}
+
+/// What view builds and rebuilds have cost on this machine: nanoseconds and units of work, a
+/// build's unit an entry read, a rebuild's a key probe. A job is chosen by the rates measured so
+/// far (CLAUDE.md §4: measured on the running hardware); both start at a nanosecond a unit.
+#[derive(Clone, Copy, Debug, Default)]
+struct ViewCosts {
+    build_ns: u128,
+    build_units: u128,
+    rebuild_ns: u128,
+    rebuild_units: u128,
+}
+
+impl ViewCosts {
+    /// Whether a rebuild of `rebuild` units is predicted cheaper than a build of `build`.
+    fn rebuild_cheaper(&self, rebuild: u64, build: u64) -> bool {
+        // Rates as fractions ns/units, a unit a nanosecond until measured; compared by
+        // cross-multiplying, no division.
+        let (bn, bu) = if self.build_units == 0 {
+            (1, 1)
+        } else {
+            (self.build_ns, self.build_units)
+        };
+        let (rn, ru) = if self.rebuild_units == 0 {
+            (1, 1)
+        } else {
+            (self.rebuild_ns, self.rebuild_units)
+        };
+        u128::from(rebuild).saturating_mul(rn).saturating_mul(bu)
+            < u128::from(build).saturating_mul(bn).saturating_mul(ru)
+    }
 }
 
 #[derive(Debug)]
@@ -367,6 +413,8 @@ impl Trunk {
             returned: None,
             timed: false,
             view_job: None,
+            view_costs: ViewCosts::default(),
+            view_choice: ViewChoice::Measured,
             views_unchecked: 0,
             view_at: 0,
         })
@@ -561,6 +609,11 @@ impl Trunk {
         self.run(store, u64::MAX, false).map(|_| ())
     }
 
+    /// How views are made when they can be rebuilt ([`ViewChoice`]).
+    pub fn set_view_choice(&mut self, choice: ViewChoice) {
+        self.view_choice = choice;
+    }
+
     /// Whether a pivot bundle may want a view: one being built, or nodes not checked since the
     /// trunk changed.
     pub fn views_owed(&self) -> bool {
@@ -583,7 +636,11 @@ impl Trunk {
                 match runs {
                     Some(runs) if job.build.reads(runs) => {
                         let mut job = job;
+                        let t = std::time::Instant::now();
                         let (taken, done) = job.build.step(store, runs, budget)?;
+                        job.ns = job.ns.saturating_add(
+                            u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                        );
                         Some((job, taken, done))
                     }
                     _ => {
@@ -597,6 +654,15 @@ impl Trunk {
             if let Some((job, taken, done)) = done {
                 work = taken.max(1);
                 if done {
+                    let c = &mut self.view_costs;
+                    let (ns, units) = (u128::from(job.ns), u128::from(job.units));
+                    if matches!(job.build, Job::Rebuild { .. }) {
+                        c.rebuild_ns = c.rebuild_ns.saturating_add(ns);
+                        c.rebuild_units = c.rebuild_units.saturating_add(units);
+                    } else {
+                        c.build_ns = c.build_ns.saturating_add(ns);
+                        c.build_units = c.build_units.saturating_add(units);
+                    }
                     let view = job.build.finish(store);
                     if let Some(p) = self
                         .nodes
@@ -638,9 +704,27 @@ impl Trunk {
                     .unwrap_or((None, 0));
                 let runs = self.bundle_of(n, i).ok_or(corrupt())?;
                 let older = runs.get(added..).unwrap_or(&[]);
+                // The predicted work of each: a build reads every entry; a rebuild gallops each
+                // new key over the old entries, about twice the log of the old a new key passes.
+                let entries =
+                    |bs: &[Branch]| bs.iter().map(|b| b.count).fold(0u64, u64::saturating_add);
+                let new = entries(runs.get(..added).unwrap_or(&[]));
+                let old_n = entries(older);
+                let gap = old_n.checked_div(new.max(1)).unwrap_or(0).saturating_add(1);
+                let log = u64::from(u64::BITS.saturating_sub(gap.leading_zeros()));
+                let rebuild_units = new.saturating_mul(log.saturating_mul(2)).max(1);
+                let build_units = entries(runs).max(1);
+                let cheaper = match self.view_choice {
+                    ViewChoice::Measured => {
+                        self.view_costs.rebuild_cheaper(rebuild_units, build_units)
+                    }
+                    ViewChoice::Build => false,
+                    ViewChoice::Rebuild => true,
+                };
                 let build = match (basis, added.checked_sub(1)) {
                     (Some(old), Some(left))
-                        if old.roots().len() == older.len()
+                        if cheaper
+                            && old.roots().len() == older.len()
                             && old.roots().iter().zip(older).all(|(&r, b)| r == b.root) =>
                     {
                         // The oldest added run first: merged into the basis, then each newer.
@@ -668,10 +752,17 @@ impl Trunk {
                         .views_merged
                         .saturating_add(u64::try_from(added).unwrap_or(u64::MAX));
                 }
+                let units = if matches!(build, Job::Rebuild { .. }) {
+                    rebuild_units
+                } else {
+                    build_units
+                };
                 self.view_job = Some(ViewJob {
                     node: n,
                     pivot: i,
                     build,
+                    units,
+                    ns: 0,
                 });
                 // The node again, for its other pivots.
                 self.view_at = n;
@@ -1084,6 +1175,8 @@ impl Trunk {
             returned: None,
             timed: false,
             view_job: None,
+            view_costs: ViewCosts::default(),
+            view_choice: ViewChoice::Measured,
             // Views are not saved: every node is checked for a bundle wanting one after a load.
             views_unchecked: unchecked,
             view_at: 0,
@@ -1460,5 +1553,28 @@ impl<'a> Reader<'a> {
         let s = self.bytes.get(self.at..end).ok_or(corrupt())?;
         self.at = end;
         Ok(s)
+    }
+}
+
+#[cfg(test)]
+mod view_cost_tests {
+    use super::ViewCosts;
+
+    #[test]
+    fn the_cheaper_job_follows_the_measured_rates() {
+        // Unmeasured, a unit of either costs the same: fewer units wins.
+        let c = ViewCosts::default();
+        assert!(c.rebuild_cheaper(99, 100));
+        assert!(!c.rebuild_cheaper(100, 100));
+        // A probe measured at three times an entry: 30 probes cost more than 80 entries, 26
+        // fewer.
+        let c = ViewCosts {
+            build_ns: 1_000,
+            build_units: 1_000,
+            rebuild_ns: 3_000,
+            rebuild_units: 1_000,
+        };
+        assert!(!c.rebuild_cheaper(30, 80));
+        assert!(c.rebuild_cheaper(26, 80));
     }
 }

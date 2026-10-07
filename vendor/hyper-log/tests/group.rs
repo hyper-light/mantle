@@ -372,3 +372,48 @@ fn a_handles_write_wakes_only_its_writer() {
     }
     assert!(woken.try_recv().is_err(), "a wake with no answer");
 }
+
+/// An opener claims as the log does (focal 27 §15.8): from another thread its handle writes and
+/// reads the group; two openers, or an opener and the log, cannot both hold one group, and once
+/// the handle is dropped the group is anyone's again.
+#[test]
+fn an_opener_claims_as_the_log_does_from_any_thread() {
+    fn shareable<T: Clone + Send + Sync + 'static>() {}
+    shareable::<hyper_log::LogOpener<SimFile>>();
+    let log = Log::create(sim(3), config(1 << 20), ID).unwrap();
+    let (first, second) = (log.opener(), log.opener());
+    assert_eq!(first.entry_room().unwrap(), log.entry_room().unwrap());
+    assert_eq!(first.frame_room().unwrap(), log.frame_room().unwrap());
+    let h = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let mut h = first.group(1).unwrap();
+                h.write(Update {
+                    entries: Some(entries(1, 2, 1, 8)),
+                    ..Update::default()
+                })
+                .unwrap();
+                h
+            })
+            .join()
+            .unwrap()
+    });
+    assert_eq!(h.bounds().unwrap(), (Start::default(), 2));
+    assert!(matches!(second.group(1), Err(LogError::Claimed(1))));
+    assert!(matches!(log.group(1), Err(LogError::Claimed(1))));
+    assert_eq!(second.groups().unwrap(), vec![1]);
+    drop(h);
+    let h = second.group(1).unwrap();
+    assert_eq!(h.bounds().unwrap(), (Start::default(), 2));
+    assert!(matches!(first.group(1), Err(LogError::Claimed(1))));
+}
+
+/// An opener outliving its log claims nothing: every call after the log closed answers `Closed`.
+#[test]
+fn an_opener_after_its_log_closed_answers_closed() {
+    let log = Log::create(sim(4), config(1 << 20), ID).unwrap();
+    let opener = log.opener();
+    drop(log.close().unwrap());
+    assert!(matches!(opener.group(1), Err(LogError::Closed)));
+    assert!(matches!(opener.groups(), Err(LogError::Closed)));
+}

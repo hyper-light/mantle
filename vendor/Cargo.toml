@@ -11,6 +11,8 @@ exclude = [
   "hyper-log",
   "hyper-measure",
   "hyper-raft",
+  "hyper-rt",
+  "hyper-seal",
   "hyper-timing",
 ]
 resolver = "2"

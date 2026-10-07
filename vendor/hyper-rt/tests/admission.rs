@@ -1,0 +1,298 @@
+//! Admission receipts (§4.3 "admission"): a task submitted from another thread reports whether the
+//! shard admitted it, refused it, or terminated it unadmitted, so a submitter never mistakes a
+//! submission for an admission; a submission pinned to a slot's holder is refused once the slot is
+//! reused; and a shutdown lands although its message first meets a full control channel.
+
+// Test harness code: a panic here is a failed test (CLAUDE.md §1).
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::cognitive_complexity,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::string_slice,
+    clippy::unwrap_in_result,
+    clippy::panic_in_result_fn,
+    clippy::missing_panics_doc
+)]
+// Test harness code: an unwrap here is a failed test, which is what it should be.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, channel};
+use std::time::{Duration, Instant};
+
+use hyper_rt::control::Control;
+use hyper_rt::futures::{now_ns, sleep};
+use hyper_rt::runtime::{Runtime, RuntimeConfig, submit_to_holder};
+use hyper_rt::{Admission, AdmissionReceipt, RtError, ShardId, registry};
+
+/// Shape: the arena of these tests — small, so a full arena is a handful of parked tasks.
+const ARENA: usize = 4;
+/// Shape: how long a receipt or a reply is waited for before the test calls it lost: far past a
+/// shard's step and a held shard's spin, so a slow box does not fail a correct runtime.
+const WAIT: Duration = Duration::from_secs(10);
+/// Shape: a parked filler's hop between checks of its release flag, nanoseconds.
+const HOP_NS: u64 = 1_000_000;
+
+fn config(tasks_per_shard: usize) -> RuntimeConfig {
+    RuntimeConfig {
+        shards: 1,
+        tasks_per_shard,
+        timers_per_shard: 64,
+        interests_per_shard: 64,
+        ring_entries: 64,
+        step_budget_ns: 1_000_000_000,
+        timer_tick_ns: 100_000,
+        batch: 64,
+        pin: false,
+        cores: Vec::new(),
+        page_bytes: 4096,
+        spin_ns: 0,
+        wake_tracking: None,
+    }
+}
+
+/// Holds `shard` inside one poll until the test calls [`Release::release`] on the handle returned —
+/// a task that spins on that hold's own flag, so holds of tests running in parallel never free or
+/// reset each other — and returns once the shard has admitted it, so everything submitted before the release
+/// queues behind the hold whatever the machine's load. It held for a fixed 300 ms before, and a
+/// test thread preempted past that queued its request after the shard had drained the shutdown and
+/// exited: the request was dropped unprocessed, its receipt `Terminated` by its drop and counted by
+/// no shard (ubuntu-24.04, hyper-raft run 37569511180). The spin ends at [`WAIT`] at most, so a
+/// test that never releases fails rather than hangs.
+fn hold(rt: &Runtime, shard: ShardId) -> Release {
+    // Leaked: the spinning task and the test share it, and the task may outlive the test's frame.
+    let released: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+    let receipt = rt
+        .spawn_on_with_receipt(shard, async move {
+            let bound = u64::try_from(WAIT.as_nanos()).unwrap_or(u64::MAX);
+            let end = now_ns().saturating_add(bound);
+            while !released.load(Ordering::Acquire) && now_ns() < end {
+                std::hint::spin_loop();
+            }
+        })
+        .unwrap();
+    assert!(
+        matches!(receipt.wait(WAIT), Some(Admission::Admitted(_))),
+        "the hold is admitted"
+    );
+    Release(released)
+}
+
+/// One hold's release: lets the held shard go on, once what the test queues behind it is queued.
+struct Release(&'static AtomicBool);
+
+impl Release {
+    fn release(self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// Submits a task that reports on a channel when it runs; the receipt and the report's receiver.
+fn submit_reporter(rt: &Runtime, shard: ShardId) -> (AdmissionReceipt, Receiver<()>) {
+    let (tx, rx) = channel();
+    let receipt = rt
+        .spawn_on_with_receipt(shard, async move {
+            let _ = tx.send(());
+        })
+        .unwrap();
+    (receipt, rx)
+}
+
+/// A receipt names the admitted task on the shard it was submitted to, and that task runs.
+#[test]
+fn a_receipt_names_the_admitted_task_and_the_task_runs() {
+    let rt = Runtime::start(&config(ARENA)).unwrap();
+    let shard = rt.shard_ids()[0];
+    let (receipt, ran) = submit_reporter(&rt, shard);
+    let admission = receipt.wait(WAIT).expect("the shard drains the request");
+    assert!(
+        matches!(admission, Admission::Admitted(task) if task.0.shard() == shard.0),
+        "admitted on the shard submitted to: {admission:?}"
+    );
+    ran.recv_timeout(WAIT)
+        .expect("the admitted task ran and reported");
+    rt.shutdown().unwrap();
+}
+
+/// Whether the fillers may end (the arena test's release flag).
+static RELEASE: AtomicBool = AtomicBool::new(false);
+
+/// Fills `shard`'s arena with tasks parked on [`RELEASE`]: submits until a receipt is refused, and
+/// returns how many were admitted and the capacity the refusal named.
+fn fill_arena(rt: &Runtime, shard: ShardId) -> (usize, usize) {
+    let mut admitted = 0;
+    for _ in 0..ARENA * 2 {
+        let receipt = rt
+            .spawn_on_with_receipt(shard, async {
+                while !RELEASE.load(Ordering::Acquire) {
+                    sleep(HOP_NS).await.unwrap();
+                }
+            })
+            .unwrap();
+        match receipt.wait(WAIT) {
+            Some(Admission::Admitted(_)) => admitted += 1,
+            Some(Admission::Refused(RtError::TooManyTasks { capacity })) => {
+                return (admitted, capacity);
+            }
+            other => panic!("a filler met {other:?}"),
+        }
+    }
+    panic!(
+        "{} fillers were admitted into an arena of {ARENA}",
+        ARENA * 2
+    );
+}
+
+/// A receptive control channel and a full arena: the request is submitted, and the receipt reports
+/// the admission refused with the arena's capacity; the refused task never runs. Once a filler ends,
+/// the same submission is admitted and runs.
+#[test]
+fn a_full_arena_refuses_on_the_receipt_and_admits_once_a_task_ends() {
+    let rt = Runtime::start(&config(ARENA)).unwrap();
+    let shard = rt.shard_ids()[0];
+    let (admitted, capacity) = fill_arena(&rt, shard);
+    assert_eq!(admitted, capacity, "every slot of the arena was filled");
+    let (receipt, ran) = submit_reporter(&rt, shard);
+    assert_eq!(
+        receipt.wait(WAIT),
+        Some(Admission::Refused(RtError::TooManyTasks { capacity })),
+        "submitted (the channel is receptive), refused at admission (the arena is full)"
+    );
+    assert!(
+        ran.recv().is_err(),
+        "a refused task never runs: its future, and the sender in it, is dropped unrun"
+    );
+    RELEASE.store(true, Ordering::Release);
+    let began = Instant::now();
+    loop {
+        let (receipt, ran) = submit_reporter(&rt, shard);
+        match receipt.wait(WAIT) {
+            Some(Admission::Admitted(_)) => {
+                ran.recv_timeout(WAIT).expect("the admitted task ran");
+                break;
+            }
+            Some(Admission::Refused(RtError::TooManyTasks { .. })) if began.elapsed() < WAIT => {
+                std::thread::yield_now();
+            }
+            other => panic!("after the release the submission met {other:?}"),
+        }
+    }
+    rt.shutdown().unwrap();
+}
+
+/// A request the shard drains after its shutdown began is terminated unadmitted: the receipt says
+/// so, and the task never runs.
+#[test]
+fn a_request_drained_during_shutdown_is_terminated_on_its_receipt() {
+    let rt = Runtime::start(&config(ARENA)).unwrap();
+    let shard = rt.shard_ids()[0];
+    let held = hold(&rt, shard);
+    // Queued behind the hold, in this order: the shutdown, then the request.
+    registry::send_control(shard.0, Control::Shutdown).unwrap();
+    let (receipt, ran) = submit_reporter(&rt, shard);
+    held.release();
+    let counters = rt.shutdown().unwrap();
+    assert_eq!(receipt.wait(WAIT), Some(Admission::Terminated));
+    assert!(
+        ran.recv().is_err(),
+        "a terminated task never runs: its future, and the sender in it, is dropped unrun"
+    );
+    assert_eq!(
+        counters[0].refused_at_shutdown, 1,
+        "the refusal is counted on the shard"
+    );
+}
+
+/// A submission pinned to a slot's holder is refused as gone once that runtime has shut down, and
+/// stays refused when a later runtime holds the slot — while a submission to the new holder is
+/// admitted. When the slot was in fact reused, a message addressed by id alone reaches the stranger,
+/// which is what the pin prevents.
+#[test]
+fn a_submission_pinned_to_a_holder_is_refused_once_its_slot_is_reused() {
+    let first = Runtime::start(&config(ARENA)).unwrap();
+    let shard = first.shard_ids()[0];
+    let holder = first.holder_of(shard).unwrap();
+    first.shutdown().unwrap();
+    assert!(
+        matches!(
+            submit_to_holder(holder, async {}),
+            Err(RtError::ShardGone { .. })
+        ),
+        "a free slot refuses its old holder's submission"
+    );
+    let second = Runtime::start(&config(ARENA)).unwrap();
+    let taken = second.shard_ids()[0];
+    assert!(
+        matches!(
+            submit_to_holder(holder, async {}),
+            Err(RtError::ShardGone { .. })
+        ),
+        "a slot held by a later registration refuses the old holder's submission"
+    );
+    let fresh = second.holder_of(taken).unwrap();
+    assert_ne!(fresh, holder, "a later registration is a different holder");
+    let (tx, rx) = channel();
+    let receipt = submit_to_holder(fresh, async move {
+        let _ = tx.send(());
+    })
+    .unwrap();
+    assert!(matches!(receipt.wait(WAIT), Some(Admission::Admitted(_))));
+    rx.recv_timeout(WAIT).expect("the new holder ran the task");
+    if taken == shard {
+        let (tx, rx) = channel();
+        second
+            .spawn_on(shard, async move {
+                let _ = tx.send(());
+            })
+            .unwrap();
+        rx.recv_timeout(WAIT)
+            .expect("by id alone, the reused slot's new holder ran a task meant for the old one");
+    }
+    second.shutdown().unwrap();
+}
+
+/// docs/runtime.md §15 item 9 (mantle's review): stopping never waits for room in the control channel.
+/// Do: hold the shard inside one poll until it sees its stop requested, fill its control channel
+/// behind the hold, and shut the runtime down. Expect: the stop is requested while the channel is still
+/// full (the held shard drains nothing), the hold ends on it, and the shutdown completes. A stop that
+/// needed a channel slot never got one here: the hold waits for the stop, the slot for the hold.
+/// Before 2026-09-17 a refused Shutdown was dropped and the join never returned; until 2026-10-06 the
+/// send was retried with `yield_now`, unbounded.
+#[test]
+fn a_shutdown_lands_against_a_full_control_channel() {
+    let rt = Runtime::start(&config(ARENA)).unwrap();
+    let shard = rt.shard_ids()[0];
+    let receipt = rt
+        .spawn_on_with_receipt(shard, async move {
+            let stopping = || {
+                registry::with_entry(shard.0, |entry| entry.stop.load(Ordering::Acquire))
+                    .unwrap_or(true)
+            };
+            while !stopping() {
+                std::hint::spin_loop();
+            }
+        })
+        .unwrap();
+    assert!(
+        matches!(receipt.wait(WAIT), Some(Admission::Admitted(_))),
+        "the hold is admitted"
+    );
+    let mut queued = 0;
+    loop {
+        match rt.spawn_on(shard, async {}) {
+            Ok(()) => queued += 1,
+            Err(RtError::ControlFull { .. }) => break,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert!(queued >= 1, "the channel filled behind the hold");
+    rt.shutdown()
+        .expect("the shutdown completed although the control channel was full when it was asked");
+}

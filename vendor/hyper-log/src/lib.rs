@@ -897,55 +897,23 @@ impl<F: BlockFile + 'static> Log<F> {
         waker: Option<Waker>,
         hears: Hears,
     ) -> Result<Pending, LogError> {
-        // Refused before it holds any room: no frame could take it, and every admitted
-        // submission fits the byte bound alone, so none waits for a queue that cannot hold it.
-        let len = writer::submission_len(group, &update, Marks::default(), self.p.tag)
-            .ok_or(LogError::TooLarge(usize::MAX))?;
-        if len > self.p.frame_room {
-            return Err(LogError::TooLarge(len));
-        }
-        let bytes = writer::charge(len).ok_or(LogError::TooLarge(len))?;
-        let (reply, answer) = ticket::port();
-        let waiting = Waiting::new(answer);
-        let submission = Submission {
+        send(
+            &self.inbox,
+            &self.p,
             group,
             update,
-            marks: Marks::default(),
-            bytes,
-            class,
-            tags: writer::Tags::default(),
-            ticket: Ticket::new(reply, waker),
-            admit: hears == Hears::Admission,
-            handle: false,
-            lens: (0, 0),
-            waits: hears == Hears::Waits,
-            epoch: 0,
-            submitted: stats::now(),
-        };
-        let message = Message::Submit { submission, wait };
-        let sent = if wait {
-            self.inbox.send(message).map_err(|_| LogError::Closed)
-        } else {
-            self.inbox.try_send(message).map_err(|e| match e {
-                TrySendError::Full(_) => LogError::Busy,
-                TrySendError::Disconnected(_) => LogError::Closed,
-            })
-        };
-        sent?;
-        if hears == Hears::Admission {
-            waiting.admitted()?;
-        }
-        Ok(Pending(waiting))
+            Sending {
+                class,
+                wait,
+                waker,
+                hears,
+            },
+        )
     }
 
     /// Asks the owner and waits for its answer.
     fn ask(&self, query: Query) -> Result<Answer, LogError> {
-        let (reply, answer) = ticket::port();
-        let waiting = Waiting::new(answer);
-        self.inbox
-            .send(Message::Query(query, Ticket::new(reply, None)))
-            .map_err(|_| LogError::Closed)?;
-        waiting.wait()
+        ask(&self.inbox, query)
     }
 
     /// The parameters the log runs with.
@@ -968,18 +936,15 @@ impl<F: BlockFile + 'static> Log<F> {
 
     /// The most bytes one entry may hold and still fit a frame alone.
     pub fn entry_room(&self) -> Result<usize, LogError> {
-        let one = format::encoded_len(
-            &format::Record::Entries {
-                group: 0,
-                first: 0,
-                entries: &[(0, &[])],
-            },
-            self.p.tag,
-        )
-        .ok_or(LogError::Config("an entry's record"))?;
-        self.frame_room()?
-            .checked_sub(one)
-            .ok_or(LogError::Config("a frame holds no entry"))
+        entry_room(&self.p)
+    }
+
+    /// A handle that claims this log's groups from any thread ([`LogOpener`]).
+    pub fn opener(&self) -> LogOpener<F> {
+        LogOpener {
+            inbox: self.inbox.clone(),
+            p: self.p,
+        }
     }
 
     /// `update` for `group` in parts that each fit one frame, in the order they apply: its
@@ -1013,25 +978,12 @@ impl<F: BlockFile + 'static> Log<F> {
     /// is dropped. Refused `Claimed` while another handle holds it, `Damaged` for a group whose
     /// records are damaged, and `TooManyGroups` past the log's bound on groups.
     pub fn group(&self, group: u128) -> Result<GroupLog<F>, LogError> {
-        let (reply, answer) = ticket::port();
-        let waiting = Waiting::new(answer);
-        self.inbox
-            .send(Message::Claim(group, Ticket::new(reply, None)))
-            .map_err(|_| LogError::Closed)?;
-        match waiting.wait()? {
-            Answer::Claimed(mirror) => {
-                Ok(GroupLog::new(self.inbox.clone(), self.p, group, *mirror))
-            }
-            _ => Err(LogError::Closed),
-        }
+        claim(&self.inbox, self.p, group)
     }
 
     /// The groups the log holds.
     pub fn groups(&self) -> Result<Vec<u128>, LogError> {
-        match self.ask(Query::Groups)? {
-            Answer::Groups(groups) => Ok(groups),
-            _ => Err(LogError::Closed),
-        }
+        groups(&self.inbox)
     }
 
     /// A group's durable state; `None` for a group the log holds nothing of.
@@ -1188,5 +1140,195 @@ impl<F: BlockFile + 'static> Drop for Log<F> {
     fn drop(&mut self) {
         // The owner answers what it took, then the log's threads end.
         let _ = self.stop();
+    }
+}
+
+/// Submits `update` for `group` to the log's owner (`Log::send`).
+/// How a submission is sent: its class, whether the sender waits for room in the queue, the waker
+/// its answer wakes, and what the sender hears.
+struct Sending {
+    class: Class,
+    wait: bool,
+    waker: Option<Waker>,
+    hears: Hears,
+}
+
+fn send<F: BlockFile + 'static>(
+    inbox: &SyncSender<Message<F>>,
+    p: &Params,
+    group: u128,
+    update: Update,
+    how: Sending,
+) -> Result<Pending, LogError> {
+    let Sending {
+        class,
+        wait,
+        waker,
+        hears,
+    } = how;
+    // Refused before it holds any room: no frame could take it, and every admitted
+    // submission fits the byte bound alone, so none waits for a queue that cannot hold it.
+    let len = writer::submission_len(group, &update, Marks::default(), p.tag)
+        .ok_or(LogError::TooLarge(usize::MAX))?;
+    if len > p.frame_room {
+        return Err(LogError::TooLarge(len));
+    }
+    let bytes = writer::charge(len).ok_or(LogError::TooLarge(len))?;
+    let (reply, answer) = ticket::port();
+    let waiting = Waiting::new(answer);
+    let submission = Submission {
+        group,
+        update,
+        marks: Marks::default(),
+        bytes,
+        class,
+        tags: writer::Tags::default(),
+        ticket: Ticket::new(reply, waker),
+        admit: hears == Hears::Admission,
+        handle: false,
+        lens: (0, 0),
+        waits: hears == Hears::Waits,
+        epoch: 0,
+        submitted: stats::now(),
+    };
+    let message = Message::Submit { submission, wait };
+    let sent = if wait {
+        inbox.send(message).map_err(|_| LogError::Closed)
+    } else {
+        inbox.try_send(message).map_err(|e| match e {
+            TrySendError::Full(_) => LogError::Busy,
+            TrySendError::Disconnected(_) => LogError::Closed,
+        })
+    };
+    sent?;
+    if hears == Hears::Admission {
+        waiting.admitted()?;
+    }
+    Ok(Pending(waiting))
+}
+
+/// Asks the log's owner `query` and waits for its answer.
+fn ask<F: BlockFile + 'static>(
+    inbox: &SyncSender<Message<F>>,
+    query: Query,
+) -> Result<Answer, LogError> {
+    let (reply, answer) = ticket::port();
+    let waiting = Waiting::new(answer);
+    inbox
+        .send(Message::Query(query, Ticket::new(reply, None)))
+        .map_err(|_| LogError::Closed)?;
+    waiting.wait()
+}
+
+/// Claims `group` from the log's owner: the handle its writes and reads go through.
+fn claim<F: BlockFile + 'static>(
+    inbox: &SyncSender<Message<F>>,
+    p: Params,
+    group: u128,
+) -> Result<GroupLog<F>, LogError> {
+    let (reply, answer) = ticket::port();
+    let waiting = Waiting::new(answer);
+    inbox
+        .send(Message::Claim(group, Ticket::new(reply, None)))
+        .map_err(|_| LogError::Closed)?;
+    match waiting.wait()? {
+        Answer::Claimed(mirror) => Ok(GroupLog::new(inbox.clone(), p, group, *mirror)),
+        _ => Err(LogError::Closed),
+    }
+}
+
+/// The groups the log holds.
+fn groups<F: BlockFile + 'static>(inbox: &SyncSender<Message<F>>) -> Result<Vec<u128>, LogError> {
+    match ask(inbox, Query::Groups)? {
+        Answer::Groups(groups) => Ok(groups),
+        _ => Err(LogError::Closed),
+    }
+}
+
+/// The most bytes one entry may hold and still fit a frame alone.
+fn entry_room(p: &Params) -> Result<usize, LogError> {
+    let one = format::encoded_len(
+        &format::Record::Entries {
+            group: 0,
+            first: 0,
+            entries: &[(0, &[])],
+        },
+        p.tag,
+    )
+    .ok_or(LogError::Config("an entry's record"))?;
+    p.frame_room
+        .checked_sub(one)
+        .ok_or(LogError::Config("a frame holds no entry"))
+}
+
+/// A handle that claims a log's groups from any thread (focal 27 §15.8): the log's inbox and its
+/// parameters, cloned, without the log's threads, which the [`Log`] alone owns and joins when it
+/// closes. An owner that places groups at runtime holds one, as a [`GroupLog`] holds the inbox.
+/// Once the log has closed, every call answers [`LogError::Closed`]; a claim through an opener is
+/// the log's claim, refused [`LogError::Claimed`] while another handle holds the group.
+pub struct LogOpener<F: BlockFile + 'static> {
+    inbox: SyncSender<Message<F>>,
+    p: Params,
+}
+
+impl<F: BlockFile + 'static> Clone for LogOpener<F> {
+    fn clone(&self) -> Self {
+        Self {
+            inbox: self.inbox.clone(),
+            p: self.p,
+        }
+    }
+}
+
+impl<F: BlockFile + 'static> std::fmt::Debug for LogOpener<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogOpener")
+            .field("log", &self.p.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<F: BlockFile + 'static> LogOpener<F> {
+    /// The handle through which `group` is written and read from here on: as [`Log::group`].
+    pub fn group(&self, group: u128) -> Result<GroupLog<F>, LogError> {
+        claim(&self.inbox, self.p, group)
+    }
+
+    /// The groups the log holds.
+    pub fn groups(&self) -> Result<Vec<u128>, LogError> {
+        groups(&self.inbox)
+    }
+
+    /// The parameters the log runs with.
+    pub fn config(&self) -> Config {
+        self.p.config
+    }
+
+    /// Submits `update` for `group` and waits until it is durable, waiting for room in the queue:
+    /// as [`Log::write_waiting`].
+    pub fn write_waiting(&self, group: u128, update: Update) -> Result<(), LogError> {
+        send(
+            &self.inbox,
+            &self.p,
+            group,
+            update,
+            Sending {
+                class: Class::Normal,
+                wait: true,
+                waker: None,
+                hears: Hears::Waits,
+            },
+        )?
+        .wait()
+    }
+
+    /// Payload bytes one frame holds: as [`Log::frame_room`].
+    pub fn frame_room(&self) -> Result<usize, LogError> {
+        Ok(self.p.frame_room)
+    }
+
+    /// The most bytes one entry may hold and still fit a frame alone: as [`Log::entry_room`].
+    pub fn entry_room(&self) -> Result<usize, LogError> {
+        entry_room(&self.p)
     }
 }

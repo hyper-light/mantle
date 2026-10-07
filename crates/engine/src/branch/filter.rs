@@ -120,10 +120,13 @@ impl Filter {
     /// Appends the bytes `range` of [`Self::to_bytes`]'s stream to `out`, from the blocks as they
     /// are: a page of the filter written without the stream copied first.
     pub fn copy_bytes(&self, range: std::ops::Range<usize>, out: &mut Vec<u8>) {
-        let words = self.blocks.iter().flat_map(|b| b.iter());
+        // The words from the range's first, found by index: skipping through the blocks cost
+        // every block before it for each page written, 100 µs and more a page of a compaction's
+        // filter, on the put that paid for it.
         let first = range.start / 8;
-        for (i, w) in words.enumerate().skip(first) {
-            let at = i.saturating_mul(8);
+        let words = self.blocks.as_flattened().get(first..).unwrap_or(&[]);
+        for (k, w) in words.iter().enumerate() {
+            let at = first.saturating_add(k).saturating_mul(8);
             if at >= range.end {
                 break;
             }

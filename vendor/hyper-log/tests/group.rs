@@ -402,6 +402,10 @@ fn an_opener_claims_as_the_log_does_from_any_thread() {
     assert!(matches!(second.group(1), Err(LogError::Claimed(1))));
     assert!(matches!(log.group(1), Err(LogError::Claimed(1))));
     assert_eq!(second.groups().unwrap(), vec![1]);
+    // The log's counts, read through an opener as through the log.
+    let (seen, own) = (second.stats(None).unwrap(), log.stats(None).unwrap());
+    assert_eq!((seen.frames, seen.updates), (own.frames, own.updates));
+    assert!(seen.frames >= 1);
     drop(h);
     let h = second.group(1).unwrap();
     assert_eq!(h.bounds().unwrap(), (Start::default(), 2));
@@ -419,4 +423,5 @@ fn an_opener_after_its_log_closed_answers_closed() {
     assert_eq!(opener.id(), ID);
     assert!(matches!(opener.group(1), Err(LogError::Closed)));
     assert!(matches!(opener.groups(), Err(LogError::Closed)));
+    assert!(matches!(opener.stats(None), Err(LogError::Closed)));
 }

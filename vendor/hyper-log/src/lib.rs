@@ -1392,6 +1392,15 @@ impl<F: BlockFile + 'static> LogOpener<F> {
         groups(&self.inbox)
     }
 
+    /// What the log has measured: as [`Log::stats`], for an owner that holds only an opener and
+    /// exports the log's counts.
+    pub fn stats(&self, into: Option<Box<LogStats>>) -> Result<Box<LogStats>, LogError> {
+        match ask(&self.inbox, Query::Stats(into))? {
+            Answer::Stats(stats) => Ok(stats),
+            _ => Err(LogError::Closed),
+        }
+    }
+
     /// The log's id: what it was created with, and what its file must name to open.
     pub fn id(&self) -> u128 {
         self.p.id

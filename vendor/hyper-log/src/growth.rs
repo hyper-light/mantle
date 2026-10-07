@@ -9,7 +9,9 @@
 //! the slot is answered `Full`, groups compact, sweeps run, and nothing is fenced.
 //!
 //! Reservations are whole segments: a slot admitted is one the file will fill, so a frame that
-//! fills it later meets no volume it was not admitted on. The file never shrinks and freed slots
+//! fills it later meets no volume it was not admitted on. A slot written whole with zeros before its
+//! frames (`docs/durable.md` §6.3, `BlockFile::fills_new_space`) takes exactly the segment admitted
+//! for it: the zeros commit no disk the gate did not admit. The file never shrinks and freed slots
 //! are reused, so nothing is released when a slot is freed by compaction: a reservation ends only
 //! when its slot is durable (committed) or when it will never be (released).
 //!

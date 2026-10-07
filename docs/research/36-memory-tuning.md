@@ -57,3 +57,8 @@ memory its owner spares between its memtables, its page cache and its write runs
 - A region's ghost must outlive its resizes: the record cache first rebuilt its ghost with its
   ring, so each step's next cycle saw ten times fewer ghost hits (16.9M ns saved, then 0.17M)
   and the tuner reversed. Measured 2026-10-07, 10M keys, skewed reads.
+- Memory a step takes from a region must leave it. The page cache kept one slab and shrank it by
+  moving pages down and truncating, which keeps the allocation: peak RSS 913 MiB where slots
+  owning their buffers, dropped on a shrink, give 802 MiB at the same split (10M keys, 10M skewed
+  reads, 320 MiB budget, 2026-10-07). Shrinking also no longer copies pages: the longest page
+  cache resize fell from 3.3 ms to 0.84 ms.

@@ -302,6 +302,11 @@ impl<F: BlockFile> ShardDb<F> {
         self.store.set_timed(on);
     }
 
+    /// How the trunk makes a bundle's view when it can rebuild it (`Trunk::set_view_choice`).
+    pub fn set_view_choice(&mut self, choice: crate::trunk::ViewChoice) {
+        self.trunk.set_view_choice(choice);
+    }
+
     /// Gives point reads a page cache of `pages` pages (`Store::set_cache`).
     pub fn set_cache(&mut self, pages: usize) {
         self.store.set_cache(pages);

@@ -22,7 +22,7 @@ use hyper_block::sim::SimFile;
 use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::Config;
-use mantle_engine::trunk::TrunkConfig;
+use mantle_engine::trunk::{TrunkConfig, ViewChoice};
 use std::collections::BTreeMap;
 
 const STORE: Config = Config {
@@ -217,6 +217,11 @@ fn run_on<F: BlockFile + 'static>(
 ) -> (ShardDb<F>, BTreeMap<u64, Option<Vec<u8>>>) {
     let mut db = ShardDb::create(file, STORE, MEM, TRUNK).unwrap();
     db.set_cache(cache);
+    // The idle variant asserts views are rebuilt: rebuilt whenever they can be, not as measured
+    // costs choose, so the test does not depend on timing.
+    if idle {
+        db.set_view_choice(ViewChoice::Rebuild);
+    }
     if let Some(issuer) = issuer {
         db.attach(issuer, 2).unwrap();
     }
@@ -365,6 +370,7 @@ fn views_rebuilt_over_several_added_runs_read_exactly() {
         leaf_entries: 400,
     };
     let mut db = ShardDb::create(file, STORE, MEM, trunk).unwrap();
+    db.set_view_choice(ViewChoice::Rebuild);
     let mut oracle: BTreeMap<u64, Option<Vec<u8>>> = BTreeMap::new();
     let mut x = 0x510e_527f_ade6_82d1u64;
     for i in 0..OPS {

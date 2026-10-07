@@ -27,7 +27,7 @@ use hyper_measure::alloc;
 use mantle_engine::branch::filter::Keys;
 use mantle_engine::branch::merge::Merge;
 use mantle_engine::branch::{Branch, Builder, Op};
-use mantle_engine::remix::View;
+use mantle_engine::remix::{Rebuild, View};
 use mantle_engine::rows::Rows;
 use mantle_engine::store::{Config, Store};
 
@@ -98,6 +98,44 @@ fn main() {
         let t = Instant::now();
         let view = View::build(&mut s, &branches, b"", None).unwrap();
         let build_s = t.elapsed().as_secs_f64();
+        // A newest run 1x, 1/10 and 1/100 of a run's keys added to the bundle: the view built
+        // from scratch against the view of the rest rebuilt with it merged in.
+        let older = View::build(&mut s, &branches, b"", None).unwrap();
+        for ratio in [1u64, 10, 100] {
+            let mut ks: Vec<u64> = (0..per_run / ratio).map(|_| rng.next() % space).collect();
+            ks.sort_unstable();
+            ks.dedup();
+            let mut b = Builder::new(&mut s, Keys::Exactly(ks.len() as u64)).unwrap();
+            for k in ks {
+                b.add(&mut s, &key(k), Op::Put, &[b'n'; 100]).unwrap();
+            }
+            let mut all = vec![b.finish(&mut s).unwrap()];
+            all.extend(branches.iter().cloned());
+            let before = s.io_stats();
+            let t = Instant::now();
+            let full = View::build(&mut s, &all, b"", None).unwrap();
+            let full_s = t.elapsed().as_secs_f64();
+            let mid = s.io_stats();
+            let old = View::build(&mut s, &branches, b"", None).unwrap();
+            let start = s.io_stats();
+            let t = Instant::now();
+            let mut job = Rebuild::new(&mut s, old, &all, b"", None).unwrap();
+            while !job.step(&mut s, &all, u64::MAX).unwrap().1 {}
+            let rebuilt = job.finish(&mut s);
+            let rebuild_s = t.elapsed().as_secs_f64();
+            let after = s.io_stats();
+            assert_eq!(rebuilt, full);
+            println!(
+                "runs {runs}+1 newest 1/{ratio}: build {:.1} ms reads {} pages {} | rebuild {:.1} ms reads {} pages {}",
+                full_s * 1e3,
+                mid.reads - before.reads,
+                mid.pages_read - before.pages_read,
+                rebuild_s * 1e3,
+                after.reads - start.reads,
+                after.pages_read - start.pages_read
+            );
+        }
+        drop(older);
         let entries: u64 = branches.iter().map(|b| b.count).sum();
         let view_bytes = view.bytes();
 

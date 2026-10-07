@@ -236,6 +236,22 @@ pub struct Builder {
     run: Run,
     /// Pages issued so far, in extent order.
     issued: u64,
+    /// Key and value bytes added: a filter page's worth in a compaction's budget.
+    entry_bytes: u64,
+    /// The tree written, once [`Self::seal`] has run: what is left is its filter's pages.
+    sealed: Option<Sealed>,
+}
+
+/// A sealed builder's fixed root and height, and its filter's pages: the first, the bytes in
+/// all, the bytes written, and the pages written.
+#[derive(Debug, Clone, Copy)]
+struct Sealed {
+    root: u64,
+    height: u8,
+    filter_start: u64,
+    total: usize,
+    at: usize,
+    pages: u32,
 }
 
 impl Builder {
@@ -259,6 +275,8 @@ impl Builder {
             filter: filter::Filter::new(keys),
             run: store.run()?,
             issued: 0,
+            entry_bytes: 0,
+            sealed: None,
         })
     }
 
@@ -316,6 +334,9 @@ impl Builder {
         self.last.extend_from_slice(key);
         self.count = self.count.saturating_add(1);
         self.filter.insert(filter::hash(key));
+        self.entry_bytes = self.entry_bytes.saturating_add(
+            u64::try_from(key.len().saturating_add(value.len())).unwrap_or(u64::MAX),
+        );
         Ok(())
     }
 
@@ -376,6 +397,18 @@ impl Builder {
 
     /// Writes every page left and returns the branch; a builder given no entry is refused.
     pub fn finish<F: BlockFile>(mut self, store: &mut Store<F>) -> Result<Branch, Error> {
+        self.seal(store)?;
+        self.write_filter(store, u64::MAX)?;
+        self.into_branch(store)
+    }
+
+    /// Writes the tree's last pages: from here its root and height are fixed, and only its
+    /// filter's pages are left to write ([`Self::write_filter`]). A builder given no entry is
+    /// refused.
+    pub fn seal<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
+        if self.sealed.is_some() {
+            return Ok(());
+        }
         if self.count == 0 {
             return Err(Error::InvalidArgument {
                 what: "a branch with no entries",
@@ -393,47 +426,95 @@ impl Builder {
                     .first_chunk::<8>()
                     .map(|b| u64::from_le_bytes(*b))
                     .ok_or(corrupt(Malformed::Truncated))?;
+                self.filter.fit(self.count);
                 // The filter's pages follow the tree's in the branch's own extents.
-                let mut filter = std::mem::replace(
-                    &mut self.filter,
-                    filter::Filter::new(filter::Keys::Exactly(0)),
-                );
-                filter.fit(self.count);
-                // Each page's bytes copied from the filter's blocks, the stream never built whole.
-                let total = filter.bytes();
-                let filter_start = self.issued;
-                let mut pages = 0u32;
-                let mut chunk = std::mem::take(&mut self.payload);
-                for start in (0..total).step_by(self.capacity.max(1)) {
-                    chunk.clear();
-                    filter.copy_bytes(
-                        start..start.saturating_add(self.capacity).min(total),
-                        &mut chunk,
-                    );
-                    let address = self.page(store)?;
-                    store.queue_page(&mut self.run, address, &chunk)?;
-                    pages = pages.saturating_add(1);
-                }
-                self.payload = chunk;
-                store.write_run(&mut self.run)?;
-                // The run's buffer goes back to the store's pool for the next writer.
-                store.give_run(self.run);
-                return Ok(Branch {
+                self.sealed = Some(Sealed {
                     root,
                     height: u8::try_from(level).map_err(|_| corrupt(Malformed::TooLarge))?,
-                    count: self.count,
-                    extents: self.extents,
-                    filter,
-                    filter_start,
-                    filter_pages: pages,
-                    filter_bytes: u64::try_from(total).map_err(|_| corrupt(Malformed::TooLarge))?,
+                    filter_start: self.issued,
+                    total: self.filter.bytes(),
+                    at: 0,
+                    pages: 0,
                 });
+                return Ok(());
             }
             if self.levels.get(level).is_some_and(|p| p.len() > 0) {
                 self.write(store, level)?;
             }
             level = level.checked_add(1).ok_or(corrupt(Malformed::TooLarge))?;
         }
+    }
+
+    /// The filter pages left to write: every one before [`Self::seal`], as the filter stands.
+    pub fn filter_pages_left(&self) -> u64 {
+        let (total, at) = self
+            .sealed
+            .map_or((self.filter.bytes(), 0), |s| (s.total, s.at));
+        u64::try_from(total.saturating_sub(at).div_ceil(self.capacity.max(1))).unwrap_or(u64::MAX)
+    }
+
+    /// The keys a filter page is worth in a compaction's budget: as many bytes as a page, at
+    /// the branch's mean entry, at least one.
+    pub fn page_keys(&self) -> u64 {
+        let capacity = u64::try_from(self.capacity).unwrap_or(u64::MAX);
+        capacity
+            .saturating_mul(self.count)
+            .checked_div(self.entry_bytes.max(1))
+            .unwrap_or(1)
+            .max(1)
+    }
+
+    /// Writes up to `pages` of the sealed filter's pages, each copied from its blocks; true once
+    /// all are written, the run then written out.
+    pub fn write_filter<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        pages: u64,
+    ) -> Result<bool, Error> {
+        let mut s = self.sealed.ok_or(Error::InvalidArgument {
+            what: "a filter written before its branch was sealed",
+        })?;
+        let mut chunk = std::mem::take(&mut self.payload);
+        let mut written = 0u64;
+        while written < pages && s.at < s.total {
+            chunk.clear();
+            let end = s.at.saturating_add(self.capacity).min(s.total);
+            self.filter.copy_bytes(s.at..end, &mut chunk);
+            let address = self.page(store)?;
+            store.queue_page(&mut self.run, address, &chunk)?;
+            s.at = end;
+            s.pages = s.pages.saturating_add(1);
+            written = written.saturating_add(1);
+        }
+        self.payload = chunk;
+        self.sealed = Some(s);
+        if s.at < s.total {
+            return Ok(false);
+        }
+        store.write_run(&mut self.run)?;
+        Ok(true)
+    }
+
+    /// The branch, its tree and filter written; refused before. The run's buffer goes back to
+    /// the store's pool for the next writer.
+    pub fn into_branch<F: BlockFile>(self, store: &mut Store<F>) -> Result<Branch, Error> {
+        let s = self
+            .sealed
+            .filter(|s| s.at >= s.total)
+            .ok_or(Error::InvalidArgument {
+                what: "a branch taken before its filter was written",
+            })?;
+        store.give_run(self.run);
+        Ok(Branch {
+            root: s.root,
+            height: s.height,
+            count: self.count,
+            extents: self.extents,
+            filter: self.filter,
+            filter_start: s.filter_start,
+            filter_pages: s.pages,
+            filter_bytes: u64::try_from(s.total).map_err(|_| corrupt(Malformed::TooLarge))?,
+        })
     }
 }
 

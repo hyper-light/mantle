@@ -160,6 +160,63 @@ impl Bits {
         None
     }
 
+    /// Appends the vector to `out`: its length in bits, its rank block in words, its words. The
+    /// rank and select tables are rebuilt when it is read.
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&u64::try_from(self.len).unwrap_or(u64::MAX).to_le_bytes());
+        out.extend_from_slice(
+            &u64::try_from(self.block_words)
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        for w in &self.words {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+    }
+
+    /// A vector [`Self::encode`] wrote at the start of `bytes`, and the bytes it took.
+    pub fn decode(bytes: &[u8]) -> Result<(Self, usize), Error> {
+        let word = |at: usize| -> Result<u64, Error> {
+            bytes
+                .get(at..)
+                .and_then(<[u8]>::first_chunk::<8>)
+                .map(|b| u64::from_le_bytes(*b))
+                .ok_or(Error::Corruption {
+                    what: "a succinct trie's bit vector",
+                    why: Malformed::Truncated,
+                })
+        };
+        let len = usize::try_from(word(0)?).map_err(|_| corrupt())?;
+        let block_words = usize::try_from(word(8)?).map_err(|_| corrupt())?;
+        if block_words == 0 {
+            return Err(corrupt());
+        }
+        let n = len.div_ceil(64);
+        let mut words = Vec::with_capacity(n.min(bytes.len() / 8));
+        let mut at = 16usize;
+        for _ in 0..n {
+            words.push(word(at)?);
+            at = at.checked_add(8).ok_or(corrupt())?;
+        }
+        // Bits past the length are zero, as `new` leaves them.
+        if let (Some(last), r) = (words.last(), len % 64)
+            && r != 0
+            && last >> r != 0
+        {
+            return Err(corrupt());
+        }
+        let mut v = Self {
+            words,
+            len,
+            block_words,
+            ranks: Vec::new(),
+            selects: Vec::new(),
+            ones: 0,
+        };
+        v.index()?;
+        Ok((v, at))
+    }
+
     /// Bytes held, for the trie's memory accounting.
     pub fn bytes(&self) -> usize {
         self.words

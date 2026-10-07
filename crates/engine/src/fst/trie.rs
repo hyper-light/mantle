@@ -524,6 +524,110 @@ impl Trie {
         None
     }
 
+    /// Appends the trie to `out`: the dense part's three bit vectors and counts, the sparse
+    /// part's labels and three bit vectors, and the values.
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        let put = |out: &mut Vec<u8>, n: usize| {
+            out.extend_from_slice(&u64::try_from(n).unwrap_or(u64::MAX).to_le_bytes());
+        };
+        let d = &self.dense;
+        d.labels.encode(out);
+        d.has_child.encode(out);
+        d.prefix.encode(out);
+        put(out, d.nodes);
+        put(out, d.children);
+        put(out, d.values);
+        let s = &self.sparse;
+        put(out, s.labels.len());
+        out.extend_from_slice(&s.labels);
+        s.has_child.encode(out);
+        s.louds.encode(out);
+        s.prefix.encode(out);
+        put(out, self.values.len());
+        for v in &self.values {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+
+    /// A trie [`Self::encode`] wrote at the start of `bytes`, and the bytes it took.
+    pub fn decode(bytes: &[u8]) -> Result<(Self, usize), Error> {
+        let mut at = 0usize;
+        let rest = |at: usize| bytes.get(at..).ok_or(corrupt());
+        let bits = |at: &mut usize| -> Result<Bits, Error> {
+            let (b, used) = Bits::decode(rest(*at)?)?;
+            *at = at.checked_add(used).ok_or(corrupt())?;
+            Ok(b)
+        };
+        let labels_d = bits(&mut at)?;
+        let child_d = bits(&mut at)?;
+        let prefix_d = bits(&mut at)?;
+        let num = |at: &mut usize| -> Result<usize, Error> {
+            let v = rest(*at)?
+                .first_chunk::<8>()
+                .map(|b| u64::from_le_bytes(*b))
+                .ok_or(corrupt())?;
+            *at = at.checked_add(8).ok_or(corrupt())?;
+            usize::try_from(v).map_err(|_| corrupt())
+        };
+        let nodes = num(&mut at)?;
+        let children = num(&mut at)?;
+        let dense_values = num(&mut at)?;
+        let n = num(&mut at)?;
+        let end = at.checked_add(n).ok_or(corrupt())?;
+        let labels = bytes.get(at..end).ok_or(corrupt())?.to_vec();
+        at = end;
+        let bits = |at: &mut usize| -> Result<Bits, Error> {
+            let (b, used) = Bits::decode(bytes.get(*at..).ok_or(corrupt())?)?;
+            *at = at.checked_add(used).ok_or(corrupt())?;
+            Ok(b)
+        };
+        let has_child = bits(&mut at)?;
+        let louds = bits(&mut at)?;
+        let prefix = bits(&mut at)?;
+        let count = num(&mut at)?;
+        let mut values = Vec::with_capacity(count.min(bytes.len() / 4));
+        for _ in 0..count {
+            let v = bytes
+                .get(at..)
+                .and_then(<[u8]>::first_chunk::<4>)
+                .map(|b| u32::from_le_bytes(*b))
+                .ok_or(corrupt())?;
+            values.push(v);
+            at = at.checked_add(4).ok_or(corrupt())?;
+        }
+        // The parts agree: a dense node is 256 bits, the dense values and nodes are within the
+        // whole, and the sparse part has a has-child and a node-start bit a label.
+        if labels_d.len() != nodes.saturating_mul(256)
+            || child_d.len() != labels_d.len()
+            || prefix_d.len() != nodes
+            || dense_values > values.len()
+            || has_child.len() != labels.len()
+            || louds.len() != labels.len()
+        {
+            return Err(corrupt());
+        }
+        Ok((
+            Self {
+                dense: Dense {
+                    labels: labels_d,
+                    has_child: child_d,
+                    prefix: prefix_d,
+                    nodes,
+                    children,
+                    values: dense_values,
+                },
+                sparse: Sparse {
+                    labels,
+                    has_child,
+                    louds,
+                    prefix,
+                },
+                values,
+            },
+            at,
+        ))
+    }
+
     /// The keys held.
     pub fn len(&self) -> usize {
         self.values.len()
@@ -595,6 +699,9 @@ mod tests {
             for cutoff in 0..=8 {
                 let t = Trie::build_at(&keys, &values, Some(cutoff)).unwrap();
                 assert_eq!(t.len(), map.len());
+                let mut out = Vec::new();
+                t.encode(&mut out);
+                assert_eq!(Trie::decode(&out).unwrap(), (t.clone(), out.len()));
                 for (k, v) in &map {
                     assert_eq!(t.get(k), Some(*v), "case {case} cut {cutoff} get {k:?}");
                 }
@@ -608,6 +715,21 @@ mod tests {
                     assert_eq!(t.floor(q), want, "case {case} cut {cutoff} floor {q:?}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_truncated_trie_is_refused_typed() {
+        let keys: Vec<Vec<u8>> = (0u32..500)
+            .map(|n| format!("k{n:04}").into_bytes())
+            .collect();
+        let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+        let values: Vec<u32> = (0..500).collect();
+        let t = Trie::build(&refs, &values).unwrap();
+        let mut out = Vec::new();
+        t.encode(&mut out);
+        for cut in 0..out.len() {
+            assert!(Trie::decode(&out[..cut]).is_err(), "cut at {cut}");
         }
     }
 

@@ -244,7 +244,8 @@ fn main() {
         io2.cache_misses
     );
     if seeks > 0 {
-        let mut page = Vec::with_capacity(seek_nexts);
+        let mut page = mantle_engine::rows::Rows::new();
+        let mut next = Vec::new();
         let mut keys_read = 0u64;
         lat.clear();
         let mark = begin();
@@ -253,7 +254,8 @@ fn main() {
             let from = key(rng.next() % num);
             page.clear();
             let o = Instant::now();
-            db.scan(&from, None, seek_nexts, &mut page).unwrap();
+            db.scan(&from, None, seek_nexts, &mut page, &mut next)
+                .unwrap();
             lat.push(o.elapsed().as_nanos() as u64);
             keys_read += page.len() as u64;
         }

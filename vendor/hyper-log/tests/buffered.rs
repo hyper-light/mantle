@@ -70,6 +70,11 @@ fn a_log_on_a_buffered_file_is_written_closed_reopened_and_read_back() {
         .wait()
         .unwrap();
     }
+    // A buffered file has no durable write of its own: every confirmation is a write and a flush,
+    // and is counted as having fallen back.
+    let stats = log.stats(None).unwrap();
+    assert_eq!(stats.durable_writes, 0, "{stats:?}");
+    assert!(stats.durable_fallbacks > 0, "{stats:?}");
     drop(log.close().unwrap());
     let (log, _) = Log::open(buffered(&path), config, ID).unwrap();
     let read = log.entries(7, 1, 21, u64::MAX).unwrap();

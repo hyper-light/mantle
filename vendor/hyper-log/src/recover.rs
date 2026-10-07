@@ -443,6 +443,15 @@ pub(crate) fn create<F: BlockFile>(
         .map_err(|e| LogError::Disk(e.into()))?;
     let bytes = buf.padded().map_err(|e| LogError::Disk(e.into()))?;
     let written = u64::try_from(bytes.len()).map_err(|_| LogError::Config("frame"))?;
+    // The first slot is written whole with zeros before its header and frame, under the same flush,
+    // as every slot the file grows by is (`device::Frame::zero`): its later frames are overwrites.
+    if file.fills_new_space() {
+        let slot =
+            usize::try_from(config.segment_bytes).map_err(|_| LogError::Config("segment"))?;
+        let mut zeros = AlignedBuf::zeroed(slot, align).map_err(|e| LogError::Disk(e.into()))?;
+        zeros.set_len(slot).map_err(|e| LogError::Disk(e.into()))?;
+        file.write_all_at(zeros.as_slice(), at)?;
+    }
     file.write_all_at(bytes, at)?;
     file.sync_data()?;
     Ok(State {

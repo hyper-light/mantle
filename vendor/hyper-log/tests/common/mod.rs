@@ -161,6 +161,12 @@ impl BlockFile for Held {
         self.file.alignment()
     }
 
+    /// The file's own: whether its new space is written before use is how the file lays out, not
+    /// a flush the hold would see. A durable write stays the default, a write and a held flush.
+    fn fills_new_space(&self) -> bool {
+        self.file.fills_new_space()
+    }
+
     fn len(&self) -> Result<u64, DiskError> {
         self.file.len()
     }

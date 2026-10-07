@@ -659,10 +659,15 @@ impl<F: BlockFile + 'static> Owner<F> {
             } else {
                 target.offset
             };
-            Ok((frame, at, record, self.record_at(sequence)?, confirm))
+            // A slot past the file's last is written whole with zeros before its first frame
+            // (`device::Frame::zero`); a slot reused is written already.
+            let grows = usize::try_from(target.slot)
+                .is_ok_and(|slot| slot >= self.state.segments.incarnation.len());
+            let zero = (target.opens && grows).then_some((at, self.p.config.segment_bytes));
+            Ok((frame, at, record, self.record_at(sequence)?, confirm, zero))
         });
         match job {
-            Ok((frame, at, record, record_at, confirm)) => {
+            Ok((frame, at, record, record_at, confirm, zero)) => {
                 let Laid {
                     sweep, mut taken, ..
                 } = laid;
@@ -690,6 +695,7 @@ impl<F: BlockFile + 'static> Owner<F> {
                     Job::Frame(Frame {
                         frame,
                         at,
+                        zero,
                         record,
                         record_at,
                         sequence,

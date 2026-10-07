@@ -620,16 +620,21 @@ fn the_statistics_count_each_frame_flush_byte_and_wait() {
     assert_eq!(after.frames - before.frames, n);
     assert_eq!(after.updates - before.updates, n);
     assert_eq!(after.flushes - before.flushes, syncs_after - syncs);
-    assert_eq!(after.flushes - before.flushes, 2 * n);
+    // Each frame is flushed, and each, nothing following it, is confirmed by a write made durable
+    // on its own: one flush and one durable write a frame, no second flush.
+    assert_eq!(after.flushes - before.flushes, n);
+    assert_eq!(after.durable_writes - before.durable_writes, n);
+    assert_eq!(after.durable_fallbacks - before.durable_fallbacks, 0);
     assert_eq!(
         after.bytes - before.bytes,
         (writes_after - writes) * BLOCK as u64
     );
-    assert_eq!(after.flush.count() - before.flush.count(), 2 * n);
+    assert_eq!(after.flush.count() - before.flush.count(), n);
     assert_eq!(after.write.count() - before.write.count(), n);
     assert_eq!(after.commit_wait.count() - before.commit_wait.count(), n);
     // Each wait runs from its submission past its frame's writes and flush and its
-    // confirmation's flush, one write at a time, so the waits hold every write and flush timed.
+    // confirmation's durable write, one write at a time, so the waits hold every write and flush
+    // timed.
     let waited = after.commit_wait.sum_ns() - before.commit_wait.sum_ns();
     let worked = (after.write.sum_ns() - before.write.sum_ns())
         + (after.flush.sum_ns() - before.flush.sum_ns());
@@ -767,8 +772,17 @@ fn a_failed_flush_fences_the_log_and_loses_nothing_acknowledged() {
     file.clear_faults().unwrap();
     let (log, recovery) = Log::open(file, config(16, 8), ID).unwrap();
     // Whatever of the lost frame's persist record the failed flush left durable, the frame
-    // was never confirmed: it is the torn tail, and it held no term or vote to keep.
+    // was never confirmed: nothing of it is restored, and it held no term or vote to keep. A
+    // failed flush leaves its writes' durability unknown (Rebello et al., ATC 2020), so the frame
+    // is gone, or, where every sector of it happened to reach the medium inside the file, whole:
+    // what was acknowledged is there either way, and nothing is damaged. The file's length cut
+    // such a frame only while frames grew the file; a slot written whole before its frames
+    // (docs/durable.md §6.3), or one reused, holds it as any other frame.
     assert!(recovery.restored.is_empty());
+    assert!(recovery.damaged.is_empty());
+    if log.view(1).unwrap().unwrap().last == 3 {
+        apply(&mut models, 1, &lost);
+    }
     check(&log, &models);
 }
 
@@ -808,6 +822,70 @@ fn damage_to_an_acknowledged_frame_is_reported() {
 /// are cut and marked as possibly lacking, so the replica takes no part in elections until
 /// it holds them again; the restore is durable across reopening; and entries the leader
 /// sends again end the mark (audit S01, the last frame).
+/// A frame nothing follows is confirmed by a write made durable on its own (a FUA write on
+/// Linux), not a flush of the whole cache, and its durability rule is unchanged (mantle
+/// docs/design/raft-log.md §6, step 5): the confirmation is written after the frame's flush
+/// returned. Power is cut once the write is answered, with nothing unflushed surviving, and the
+/// frame is then damaged at rest: it was acknowledged, so it is restored from its persist record
+/// and marked uncertain, as a frame confirmed by a flush is.
+#[test]
+fn a_frame_confirmed_by_a_durable_write_is_restored_and_marked_after_a_power_cut() {
+    let file = sim(77);
+    let cfg = config(16, 8);
+    let log = Log::create(file, cfg, ID).unwrap();
+    for i in 1..=3u64 {
+        log.write(
+            1,
+            Update {
+                entries: Some(entries(i, &[1])),
+                hard_state: Some(HardState {
+                    term: 1,
+                    vote: 2,
+                    commit: i - 1,
+                }),
+                ..Update::default()
+            },
+        )
+        .unwrap();
+    }
+    let voted = HardState {
+        term: 2,
+        vote: 3,
+        commit: 3,
+    };
+    log.write(
+        1,
+        Update {
+            entries: Some(entries(4, &[2])),
+            hard_state: Some(voted),
+            ..Update::default()
+        },
+    )
+    .unwrap();
+    // Every frame here was alone: each confirmed by a durable write, none by a flush of its own.
+    let stats = log.stats(None).unwrap();
+    assert!(stats.durable_writes >= 4, "{stats:?}");
+    assert_eq!(stats.flushes, stats.frames, "{stats:?}");
+    log.with_file(|f| f.crash(Crash::LoseAll).unwrap()).unwrap();
+    let file = closed(log);
+    file.clear_faults().unwrap();
+    // The last frame, damaged at rest after it was acknowledged.
+    file.inject(Fault::BitFlip {
+        offset: AREA + 5 * BLOCK as u64 + 8,
+        bit: 2,
+        stored: true,
+    })
+    .unwrap();
+    let (log, recovery) = Log::open(file, cfg, ID).unwrap();
+    let view = log.view(1).unwrap().unwrap();
+    assert_eq!(view.hard_state, Some(voted));
+    assert_eq!(view.last, 3);
+    assert_eq!(view.uncertain, Some(Start { index: 4, term: 2 }));
+    assert_eq!(recovery.restored, vec![1]);
+    assert_eq!(recovery.damaged, Vec::<u128>::new());
+    drop(closed(log));
+}
+
 #[test]
 fn damage_to_the_last_acknowledged_frame_is_restored_from_its_persist_record() {
     for field in [0u64, 8, 40, 64, 70, 120] {

@@ -4,3 +4,4 @@
 //! E6).
 
 pub mod bits;
+pub mod trie;

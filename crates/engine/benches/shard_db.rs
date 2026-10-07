@@ -23,6 +23,7 @@ use std::time::Instant;
 
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
+use hyper_block::issuer::Issuer;
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::Config;
 use mantle_engine::trunk::TrunkConfig;
@@ -60,6 +61,9 @@ fn main() {
     // `attribute` as the seventh argument: each put slower than `SLOW_NS` is recorded with what
     // the engine did inside it, and the puts at or past p99.9 and p99.99 are broken down by cause.
     let attribute = args.get(6).map(String::as_str) == Some("attribute");
+    // The device issuer's depth as the eighth argument, none by default: the store's runs are
+    // then handed to it, that many out at once, and puts go on while the device writes.
+    let issuer_depth: usize = args.get(7).map_or(0, |s| s.parse().unwrap());
     let path = dir.join("shard_db.store");
     let _ = std::fs::remove_file(&path);
     let align = Alignment::new(4096).unwrap();
@@ -89,6 +93,10 @@ fn main() {
     )
     .unwrap();
     db.set_cache((cache_mib << 20) / 4096);
+    let issuer = (issuer_depth > 0).then(|| Issuer::start(&dir, issuer_depth).unwrap());
+    if let Some(issuer) = &issuer {
+        db.attach(issuer, issuer.depth()).unwrap();
+    }
     let value = [b'v'; 100];
     let mut rng = Rng(301);
     // Each operation timed, into a vector sized before the run: percentiles from the sorted
@@ -137,7 +145,10 @@ fn main() {
         t.entries_written as f64 / num as f64
     );
     println!(
-        "fill io span_cache_hits {} reads {} pages_read {} ({:.2}s) writes {} ({:.2}s) pages_written {} ({:.2} GB, write amplification {:.2}) syncs {}",
+        "fill io submitted {} write_waits {} ({:.2}s) span_cache_hits {} reads {} pages_read {} ({:.2}s) writes {} ({:.2}s) pages_written {} ({:.2} GB, write amplification {:.2}) syncs {}",
+        io.submitted,
+        io.write_waits,
+        io.write_wait_ns as f64 / 1e9,
         io.span_cache_hits,
         io.reads,
         io.pages_read,

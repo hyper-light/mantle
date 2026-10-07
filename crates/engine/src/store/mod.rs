@@ -127,6 +127,11 @@ pub struct Store<F: BlockFile> {
     pages: Vec<Vec<u8>>,
     pages_lent: usize,
     pages_most_lent: usize,
+    /// A branch builder's working lists (its extents, its pages' entry counts), kept when given
+    /// back so they grow once, not with every branch: at most as many as were ever out at once.
+    lists: Vec<(Vec<u64>, Vec<u16>)>,
+    lists_lent: usize,
+    lists_most_lent: usize,
     /// Whether its I/O is timed ([`Store::set_timed`]): a clock read a call, for diagnosis.
     timed: bool,
     /// Freed extents whose pages the cache still holds, forgotten a share at a time
@@ -264,6 +269,9 @@ impl<F: BlockFile> Store<F> {
             pages: Vec::new(),
             pages_lent: 0,
             pages_most_lent: 0,
+            lists: Vec::new(),
+            lists_lent: 0,
+            lists_most_lent: 0,
             forgetting: VecDeque::new(),
             timed: false,
         };
@@ -319,6 +327,9 @@ impl<F: BlockFile> Store<F> {
                 pages: Vec::new(),
                 pages_lent: 0,
                 pages_most_lent: 0,
+                lists: Vec::new(),
+                lists_lent: 0,
+                lists_most_lent: 0,
                 forgetting: VecDeque::new(),
                 timed: false,
             },
@@ -646,6 +657,24 @@ impl<F: BlockFile> Store<F> {
         self.pages_lent = self.pages_lent.saturating_sub(1);
         if self.pages.len() < self.pages_most_lent {
             self.pages.push(page);
+        }
+    }
+
+    /// Empty working lists for a branch builder, from the pool or fresh.
+    pub fn take_lists(&mut self) -> (Vec<u64>, Vec<u16>) {
+        self.lists_lent = self.lists_lent.saturating_add(1);
+        self.lists_most_lent = self.lists_most_lent.max(self.lists_lent);
+        let (mut extents, mut counts) = self.lists.pop().unwrap_or_default();
+        extents.clear();
+        counts.clear();
+        (extents, counts)
+    }
+
+    /// Takes back a builder's working lists.
+    pub fn give_lists(&mut self, lists: (Vec<u64>, Vec<u16>)) {
+        self.lists_lent = self.lists_lent.saturating_sub(1);
+        if self.lists.len() < self.lists_most_lent {
+            self.lists.push(lists);
         }
     }
 

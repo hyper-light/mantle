@@ -666,6 +666,7 @@ impl Cluster {
         for m in &out.messages {
             check_promises(id, disk, m);
             check_acknowledgement(id, disk, replica, m);
+            check_stated_commit(id, disk, replica, m);
         }
         self.check_leader_commit(id, before, led);
     }
@@ -978,6 +979,29 @@ fn check_acknowledgement(id: u64, disk: &Disk, _replica: &Member, m: &Message) {
         m.index,
         m.term,
         disk.last()
+    );
+}
+
+/// An answer states no commit beyond what the member holds durable (`RawNode::durable_commit`):
+/// what its log's hard state states, or what its state machine holds durably. A leader takes a
+/// follower's stated commit as that follower's durable commit (`configuration_known`), so a commit
+/// stated ahead of every durable write would let it count a change as known that a restart forgets.
+fn check_stated_commit(id: u64, disk: &Disk, replica: &Member, m: &Message) {
+    if !matches!(
+        m.msg_type,
+        MessageType::MsgAppendResponse | MessageType::MsgHeartbeatResponse
+    ) {
+        return;
+    }
+    let durable = disk
+        .hard
+        .commit
+        .max(replica.machine().durable.applied.index);
+    assert!(
+        m.commit <= durable,
+        "member {id}: {:?} said commit {} with {durable} durable",
+        m.msg_type,
+        m.commit
     );
 }
 

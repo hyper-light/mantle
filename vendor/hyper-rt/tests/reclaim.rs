@@ -1,0 +1,343 @@
+//! The runtime registry reclaims a shard's slot when its runtime shuts down (§4.3; banned item 8:
+//! every structure has a derived bound *and* reclamation). Before this, every shard leaked its
+//! registry entry, its kick descriptor and its context for the process lifetime, so a process that
+//! started runtimes repeatedly (the fleet test suite: ~35 tests × 2–5 daemons × 1–5 shards) filled
+//! the 1024-slot table and leaked a descriptor per shard — the accumulated suite state that made
+//! late tests fail under oversubscription (`docs/wip/fleet-under-load.md`).
+
+// Test harness code: a panic here is a failed test (CLAUDE.md §1).
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::cognitive_complexity,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::string_slice,
+    clippy::unwrap_in_result,
+    clippy::panic_in_result_fn,
+    clippy::missing_panics_doc
+)]
+// Test harness code: an unwrap here is a failed test, which is what it should be.
+
+use hyper_rt::registry::MAX_SHARDS;
+use hyper_rt::runtime::{Runtime, RuntimeConfig};
+
+/// The tests of this binary measure process-global state — the registry's slots, the descriptor table —
+/// so they run one at a time (a test harness lock, D-8's stated exception): under parallel threads another
+/// test's runtime takes the freed slot the stale-waker test expects to see reused, or moves the
+/// descriptor count the leak test compares (3 of 10 parallel runs failed that way on 2026-09-14).
+#[allow(clippy::disallowed_types)] // a test harness lock (D-8's stated exception), poison recovered
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn config(shards: u16) -> RuntimeConfig {
+    RuntimeConfig {
+        shards,
+        tasks_per_shard: 16,
+        timers_per_shard: 16,
+        interests_per_shard: 64,
+        ring_entries: 16,
+        step_budget_ns: 1_000_000,
+        timer_tick_ns: 100_000,
+        batch: 16,
+        pin: false,
+        cores: Vec::new(),
+        page_bytes: 4096,
+        spin_ns: 0,
+        wake_tracking: None,
+    }
+}
+
+/// The process's open descriptor count (Unix), through the descriptor table's own listing — a
+/// read of `/dev/fd` (macOS, Linux via the symlink), never a write.
+#[cfg(unix)]
+fn open_descriptors() -> usize {
+    std::fs::read_dir("/dev/fd").map_or(0, |dir| dir.count())
+}
+
+#[cfg(target_os = "linux")]
+fn bind_abstract_listener(address: &rustix::net::SocketAddrUnix) -> std::os::fd::OwnedFd {
+    use rustix::net::{AddressFamily, SocketFlags, SocketType};
+
+    let socket = rustix::net::socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+        None,
+    )
+    .unwrap();
+    rustix::net::bind(&socket, address).unwrap();
+    // The fixture admits no connections; a one-connection backlog suffices for listening.
+    rustix::net::listen(&socket, 1).unwrap();
+    socket
+}
+
+/// Do: start and shut down one more runtime than the registry has slots, one shard each. Expect:
+/// every start succeeds — a shut-down runtime's slot is reclaimed, so the bound is on *live*
+/// shards, not on shards ever created. Before the fix the 1025th start refused `TooManyShards`.
+#[test]
+fn a_shut_down_runtimes_slot_is_reclaimed_so_more_runtimes_than_slots_may_run_in_turn() {
+    let _serial = serial();
+    for round in 0..=MAX_SHARDS {
+        let runtime = Runtime::start(&config(1)).unwrap_or_else(|e| {
+            panic!("runtime {round} refused after {round} shut-down runtimes: {e:?}")
+        });
+        assert_eq!(runtime.shard_ids().len(), 1);
+        runtime.shutdown().unwrap();
+    }
+}
+
+/// Do: measure the open descriptors, run 64 start/shutdown cycles of a two-shard runtime, measure
+/// again. Expect: the count returns to its baseline (the kick and driver descriptors are closed
+/// with the shard). Before the fix each shard leaked its kqueue/eventfd: +2 per cycle.
+#[cfg(unix)]
+#[test]
+fn a_shut_down_runtime_closes_every_descriptor_it_opened() {
+    let _serial = serial();
+    // One warm-up cycle so lazily-opened process-wide descriptors (the thread-local storage of the
+    // first shard thread, the allocator's) are in the baseline.
+    Runtime::start(&config(2)).unwrap().shutdown().unwrap();
+    let baseline = open_descriptors();
+    for _ in 0..64 {
+        Runtime::start(&config(2)).unwrap().shutdown().unwrap();
+    }
+    let after = open_descriptors();
+    assert!(
+        after <= baseline,
+        "descriptors leaked across 64 two-shard cycles: {baseline} before, {after} after"
+    );
+}
+
+/// AC-0.6 / T-2.14, §4.3: shut down with a listener awaiting readiness, then bind its
+/// abstract address immediately. Joining the shard must release the kernel's references too;
+/// counting open descriptors alone cannot detect a pending poll retaining the old listener.
+#[cfg(target_os = "linux")]
+#[test]
+fn shutdown_releases_a_listener_with_an_armed_readiness_wait() {
+    use std::future::{Future, poll_fn};
+    use std::os::fd::AsRawFd;
+    use std::task::Poll;
+
+    use rustix::net::SocketAddrUnix;
+
+    let _serial = serial();
+    let name = format!("slates-shutdown-readiness-{}", std::process::id());
+    let address = SocketAddrUnix::new_abstract_name(name.as_bytes()).unwrap();
+    let listener = bind_abstract_listener(&address);
+    let runtime = Runtime::start(&config(1)).unwrap();
+    let (armed, received) = std::sync::mpsc::sync_channel(1);
+    runtime
+        .spawn_on(runtime.shard_ids()[0], async move {
+            let mut readiness = std::pin::pin!(hyper_rt::readiness::readable(listener.as_raw_fd()));
+            let mut armed = Some(armed);
+            poll_fn(|context| {
+                let result = readiness.as_mut().poll(context);
+                if result.is_pending()
+                    && let Some(armed) = armed.take()
+                {
+                    armed.send(()).unwrap();
+                }
+                assert!(matches!(result, Poll::Pending), "no client connects");
+                result
+            })
+            .await
+            .unwrap();
+        })
+        .unwrap();
+    let observed = received.recv_timeout(std::time::Duration::from_secs(5));
+    let counters = runtime.shutdown().unwrap();
+    observed.expect("the listener's readiness wait was armed before shutdown");
+    assert_eq!(counters[0].cancelled, 1, "shutdown cancelled the listener");
+    drop(bind_abstract_listener(&address));
+}
+
+/// AC-0.6 / T-2.14, §4.3: retire a local runtime with more armed listener waits than one `epoll_wait`
+/// batch returns. No shard-thread exit may hide asynchronous cleanup: every address must rebind on this
+/// thread without a delay or retry.
+#[cfg(target_os = "linux")]
+#[test]
+fn dropping_a_local_runtime_releases_a_polled_listener_before_returning() {
+    use rustix::net::SocketAddrUnix;
+    use std::os::fd::AsRawFd;
+
+    let _serial = serial();
+    let config = RuntimeConfig {
+        tasks_per_shard: 64,
+        ..config(1)
+    };
+    let addresses: Vec<_> = (0..config.batch * 2 + 1)
+        .map(|listener| {
+            let name = format!("slates-local-readiness-{}-{listener}", std::process::id());
+            SocketAddrUnix::new_abstract_name(name.as_bytes()).unwrap()
+        })
+        .collect();
+    let listeners: Vec<_> = addresses.iter().map(bind_abstract_listener).collect();
+    let mut runtime = hyper_rt::runtime::LocalRuntime::new(&config).unwrap();
+    for listener in &listeners {
+        let raw = listener.as_raw_fd();
+        runtime
+            .spawn(async move {
+                let _ = hyper_rt::readiness::readable(raw).await;
+            })
+            .unwrap();
+    }
+    // One step polls every task, each arms its listener's readability, and the loop applies the
+    // registrations to the driver before the step ends.
+    runtime.step();
+    assert_eq!(runtime.live_tasks(), listeners.len(), "every wait is armed");
+    drop(listeners);
+    drop(runtime);
+    for address in addresses {
+        drop(bind_abstract_listener(&address));
+    }
+}
+
+/// Do: spawn a task on a runtime and keep its wake word; shut the runtime down; start a new runtime
+/// that reuses the same registry slot; fire the stale wake. Expect: the new runtime's shard is not
+/// disturbed — the stale word names a task generation the new arena has not issued (its generations
+/// continue from the old shard's high-water mark), so the wake is refused by the arena — and the
+/// new runtime still runs its own task to completion. Non-vacuous: the new runtime provably reused
+/// the same shard id, and the stale wake was delivered to it (the registry's stale-wake counter did
+/// not move: the slot was live), so the arena's generation check is what refused it.
+#[test]
+fn a_wake_minted_for_a_dead_shard_is_refused_by_the_slots_new_holder() {
+    let _serial = serial();
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::task::{Context, Poll};
+    static POLLS: AtomicU64 = AtomicU64::new(0);
+
+    // A future that records every poll and captures its waker on the first.
+    struct Capture(std::sync::mpsc::Sender<std::task::Waker>);
+    impl std::future::Future for Capture {
+        type Output = ();
+        fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            let _ = self.0.send(cx.waker().clone());
+            Poll::Ready(())
+        }
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let first = Runtime::start(&config(1)).unwrap();
+    let id = first.shard_ids()[0];
+    first.spawn_on(id, Capture(tx)).unwrap();
+    let waker = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    first.shutdown().unwrap();
+
+    let second = Runtime::start(&config(1)).unwrap();
+    assert_eq!(
+        second.shard_ids()[0],
+        id,
+        "the second runtime reused the freed slot"
+    );
+    // A live task on the new holder, polled once by its own spawn.
+    struct Counted(std::sync::mpsc::Sender<()>);
+    impl std::future::Future for Counted {
+        type Output = ();
+        fn poll(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            POLLS.fetch_add(1, Ordering::Relaxed);
+            let _ = self.0.send(());
+            Poll::Ready(())
+        }
+    }
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    second.spawn_on(id, Counted(done_tx)).unwrap();
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the new holder polled its own task");
+    let before = hyper_rt::registry::stale_wakes(id.0);
+    waker.wake_by_ref();
+    let counters = second.shutdown().unwrap();
+    let after = hyper_rt::registry::stale_wakes(id.0);
+    assert_eq!(
+        after, before,
+        "the stale wake reached a live slot (it was the arena that refused it)"
+    );
+    assert_eq!(
+        counters[0].completed, 1,
+        "the new holder ran exactly its own task; the stale wake polled nothing extra"
+    );
+}
+
+/// AUD-29-11 at the wake word's boundary, without 2^24 iterations. Do: free a runtime's shard slot and
+/// prime it to the last generation a task arena issues (`Encoded::TASK_GENERATION_LIMIT`, what a predecessor
+/// that reused one task slot to the end would leave); start a runtime on it; run a task to completion and
+/// keep its waker; run a second task; fire the first waker; shut down; start a third runtime. Expect: the
+/// first task was issued the last generation and its slot retired (the second task took another slot);
+/// the stale waker is refused by the arena and polls nothing; and the slot, its generations spent, is not
+/// handed to the third runtime — where a 24-bit mask would have let the next holder alias it.
+#[test]
+fn a_shard_slot_whose_wake_generations_are_spent_retires_and_is_not_reissued() {
+    let _serial = serial();
+    use std::task::{Context, Poll};
+    struct Capture(std::sync::mpsc::Sender<std::task::Waker>);
+    impl std::future::Future for Capture {
+        type Output = ();
+        fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            let _ = self.0.send(cx.waker().clone());
+            Poll::Ready(())
+        }
+    }
+
+    let first = Runtime::start(&config(1)).unwrap();
+    let id = first.shard_ids()[0];
+    first.shutdown().unwrap();
+    hyper_rt::registry::note_arena_generation(id.0, hyper_rt::mem::Encoded::TASK_GENERATION_LIMIT);
+
+    let second = Runtime::start(&config(1)).unwrap();
+    assert_eq!(second.shard_ids()[0], id, "the primed slot was reused");
+    let wait = std::time::Duration::from_secs(5);
+    let admitted = |receipt: hyper_rt::task::AdmissionReceipt| match receipt.wait(wait) {
+        Some(hyper_rt::task::Admission::Admitted(task)) => task,
+        other => panic!("the task was not admitted: {other:?}"),
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let last = admitted(
+        second
+            .spawn_on_with_receipt(id, Capture(tx.clone()))
+            .unwrap(),
+    );
+    let stale = rx.recv_timeout(wait).unwrap();
+    assert_eq!(
+        last.0.generation(),
+        hyper_rt::mem::Encoded::TASK_GENERATION_LIMIT,
+        "the first task was issued the word's last generation"
+    );
+    let next = admitted(second.spawn_on_with_receipt(id, Capture(tx)).unwrap());
+    let _live = rx.recv_timeout(wait).unwrap();
+    assert_ne!(
+        next.0.slot(),
+        last.0.slot(),
+        "the slot that issued the last generation retired and was not reissued"
+    );
+    let before = hyper_rt::registry::stale_wakes(id.0);
+    stale.wake_by_ref();
+    let counters = second.shutdown().unwrap();
+    assert_eq!(
+        counters[0].completed, 2,
+        "the stale wake polled nothing extra"
+    );
+    assert_eq!(
+        hyper_rt::registry::stale_wakes(id.0),
+        before,
+        "the wake reached the live shard, whose retired slot holds no task to poll"
+    );
+
+    let third = Runtime::start(&config(1)).unwrap();
+    assert_ne!(
+        third.shard_ids()[0],
+        id,
+        "a slot whose wake generations are spent is never reissued"
+    );
+    third.shutdown().unwrap();
+}

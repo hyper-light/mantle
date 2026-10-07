@@ -375,6 +375,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-rt"
+version = "0.1.0"
+dependencies = [
+ "crc32c",
+ "libc",
+ "rustix",
+ "windows-sys",
+]
+
+[[package]]
 name = "hyper-seal"
 version = "0.1.0"
 dependencies = [
@@ -489,6 +499,7 @@ version = "0.1.0"
 dependencies = [
  "hyper-block",
  "hyper-measure",
+ "hyper-rt",
  "mantle-crc",
  "proptest",
  "rustix",

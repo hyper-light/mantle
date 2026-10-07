@@ -11,6 +11,8 @@ publish.workspace = true
 
 [dependencies]
 hyper-block = { path = "../../vendor/hyper-block" }
+# The shards a node runs its ranges on (docs/design/engine-structure.md §2, step E2).
+hyper-rt = { path = "../../vendor/hyper-rt" }
 mantle-crc = { path = "../crc" }
 thiserror.workspace = true
 

@@ -160,14 +160,12 @@ pub struct Run {
 }
 
 /// A branch builder's working lists, kept by the store between builders so they grow once: the
-/// extents the branch holds, its tree pages' entry counts, and its index pages' payloads with
-/// each one's address, offset and length.
+/// extents the branch holds, its tree pages' entry counts, and its leaves' separators with the
+/// index built of them.
 #[derive(Debug, Default)]
 pub struct Lists {
     pub extents: Vec<u64>,
     pub counts: Vec<u16>,
-    pub interior: Vec<u8>,
-    pub interior_pages: Vec<(u64, u32, u32)>,
     /// Each leaf's separator back to back, where each ends, and each leaf's page number; and
     /// the encoded index built of them.
     pub separators: Vec<u8>,
@@ -180,8 +178,6 @@ impl Lists {
     fn clear(&mut self) {
         self.extents.clear();
         self.counts.clear();
-        self.interior.clear();
-        self.interior_pages.clear();
         self.separators.clear();
         self.separator_ends.clear();
         self.leaf_pages.clear();

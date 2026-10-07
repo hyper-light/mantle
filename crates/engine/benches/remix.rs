@@ -143,7 +143,7 @@ fn main() {
                     rows.push(k, v);
                     taken += 1;
                 }
-                m.next(&mut s).unwrap();
+                m.next(&mut s, refs.iter().copied()).unwrap();
             }
             m.give_back(&mut s);
             lat.push(o.elapsed().as_nanos() as u64);

@@ -111,12 +111,12 @@ fn a_merge_steps_over_branches_without_allocating() {
     // Past several leaves of both branches: the store's page pool has grown to the most its
     // cursors hold at once.
     for _ in 0..1_000 {
-        m.next(&mut s).unwrap();
+        m.next(&mut s, [&newer, &older]).unwrap();
     }
     alloc::begin();
     let mut steps = 0u64;
     while m.entry().is_some() {
-        m.next(&mut s).unwrap();
+        m.next(&mut s, [&newer, &older]).unwrap();
         steps += 1;
     }
     let counts = alloc::end();

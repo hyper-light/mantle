@@ -624,7 +624,12 @@ impl Trunk {
                 i,
                 job: Some((mut c, covered)),
             } => {
-                let used = c.step(store, budget)?;
+                // The job's inputs, as planned: the pivot's live in-flight bundles up to those
+                // it covers, newest first.
+                let node = self.node(n)?;
+                let start = node.pivots.get(i).ok_or(corrupt())?.start;
+                let live = node.inflight.get(start..covered).ok_or(corrupt())?;
+                let used = c.step(store, live.iter().rev().flatten(), budget)?;
                 if c.is_done() {
                     let t = self.timed.then(std::time::Instant::now);
                     self.apply_pivot(store, n, i, c, covered)?;
@@ -655,7 +660,15 @@ impl Trunk {
             Phase::Settle {
                 job: Some((mut c, extents)),
             } => {
-                let used = c.step(store, budget)?;
+                // The job's inputs: the leaf's bundle.
+                let bundle = self
+                    .node(n)?
+                    .pivots
+                    .first()
+                    .ok_or(corrupt())?
+                    .bundle
+                    .branches();
+                let used = c.step(store, bundle, budget)?;
                 if c.is_done() {
                     let t = self.timed.then(std::time::Instant::now);
                     let parts = c.finish(store)?;

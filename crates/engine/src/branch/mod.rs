@@ -66,44 +66,6 @@ const INDEX_FIXED: usize = 18;
 /// An entry's offset in the payload.
 const OFFSET: usize = 2;
 
-/// A branch's index pages, held in memory: a descent from the root reads only the leaf it reaches
-/// from the device, as RocksDB keeps a table's index in the table reader's memory by default
-/// (`cache_index_and_filter_blocks` off) and as the design's reads count on (docs/design/
-/// engine-structure.md §5: "with the filters and branch interiors in memory, a cold get costs
-/// about one device read"). About an index entry a leaf page: under one percent of the data.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Interior {
-    bytes: Vec<u8>,
-    /// Each index page's address, and its payload's offset and length in `bytes`, by address.
-    pages: Vec<(u64, u32, u32)>,
-}
-
-impl Interior {
-    /// The payload of the index page at `address`; none for a page that is not one.
-    fn get(&self, address: u64) -> Option<&[u8]> {
-        let i = self.pages.binary_search_by_key(&address, |p| p.0).ok()?;
-        let &(_, at, len) = self.pages.get(i)?;
-        let at = usize::try_from(at).ok()?;
-        self.bytes
-            .get(at..at.checked_add(usize::try_from(len).ok()?)?)
-    }
-
-    /// The bytes held.
-    pub fn bytes(&self) -> usize {
-        self.bytes.len()
-    }
-
-    /// Exactly sized copies of a builder's working payloads and their pages, ordered by address.
-    fn from_working(bytes: &[u8], pages: &[(u64, u32, u32)]) -> Self {
-        let mut pages = pages.to_vec();
-        pages.sort_unstable_by_key(|p| p.0);
-        Self {
-            bytes: bytes.to_vec(),
-            pages,
-        }
-    }
-}
-
 /// A built branch: its root page, its height (1 for a lone leaf), its entries, and the extents
 /// holding its pages, each held once by the branch.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,8 +90,6 @@ pub struct Branch {
     /// as RemixDB's metadata block; docs/design/engine-structure.md §5, E6). Written after the
     /// filter in its pages.
     pub counts: Vec<u16>,
-    /// Its index pages, in memory.
-    pub interior: Interior,
     /// Its leaves' separators in a succinct trie, each to its leaf's page number: the leaf a key
     /// falls in by one `floor` (docs/design/engine-structure.md §5; research/35). Written after
     /// its pages' entry counts in its pages.
@@ -299,10 +259,6 @@ pub struct Builder {
     first: Vec<u8>,
     /// Each tree page's entries as it is written, 0 for an index page ([`Branch::counts`]).
     counts: Vec<u16>,
-    /// The index pages' payloads as they are written, and each one's address, offset and
-    /// length ([`Branch::interior`]).
-    interior: Vec<u8>,
-    interior_pages: Vec<(u64, u32, u32)>,
     /// Each leaf's separator as it is written, its page number, and the index built of them at
     /// the seal, encoded ([`Branch::index`]).
     separators: Vec<u8>,
@@ -358,8 +314,6 @@ impl Builder {
             rest: Vec::new(),
             first: Vec::new(),
             counts: lists.counts,
-            interior: lists.interior,
-            interior_pages: lists.interior_pages,
             separators: lists.separators,
             separator_ends: lists.separator_ends,
             leaf_pages: lists.leaf_pages,
@@ -518,13 +472,6 @@ impl Builder {
                 self.prev_last
                     .extend_from_slice(page.key(page.len().saturating_sub(1)));
             }
-        }
-        if level > 0 {
-            let at =
-                u32::try_from(self.interior.len()).map_err(|_| corrupt(Malformed::TooLarge))?;
-            let len = u32::try_from(payload.len()).map_err(|_| corrupt(Malformed::TooLarge))?;
-            self.interior.extend_from_slice(&payload);
-            self.interior_pages.push((address, at, len));
         }
         self.payload = payload;
         if let Some(page) = self.levels.get_mut(level) {
@@ -715,7 +662,6 @@ impl Builder {
             filter_pages: s.pages,
             filter_bytes,
             counts: self.counts.as_slice().to_vec(),
-            interior: Interior::from_working(&self.interior, &self.interior_pages),
             index_bytes: u64::try_from(self.index.len())
                 .map_err(|_| corrupt(Malformed::TooLarge))?,
             index: self.index_trie.ok_or(corrupt(Malformed::CountMismatch))?,
@@ -723,8 +669,6 @@ impl Builder {
         store.give_lists(crate::store::Lists {
             extents: self.extents,
             counts: self.counts,
-            interior: self.interior,
-            interior_pages: self.interior_pages,
             separators: self.separators,
             separator_ends: self.separator_ends,
             leaf_pages: self.leaf_pages,
@@ -884,255 +828,34 @@ impl Branch {
         value: &mut Vec<u8>,
         buf: &mut Vec<u8>,
     ) -> Result<Option<Op>, Error> {
-        let mut address = self.root;
-        for _ in 0..=self.height {
-            buf.clear();
-            self.read_node(store, address, buf)?;
-            let view = View::new(buf)?;
-            let Some(i) = view.floor(key)? else {
-                return Ok(None);
-            };
-            let (_, rest) = view.entry(i)?;
-            if view.kind == INDEX {
-                address = rest
-                    .first_chunk::<8>()
-                    .map(|b| u64::from_le_bytes(*b))
-                    .ok_or(corrupt(Malformed::Truncated))?;
-                continue;
-            }
-            if view.compare(key, i)? != Ordering::Equal {
-                return Ok(None);
-            }
-            let op = rest.first().and_then(|&b| Op::from_byte(b)).ok_or(corrupt(
-                Malformed::UnknownTag(rest.first().copied().unwrap_or(0)),
-            ))?;
-            value.clear();
-            value.extend_from_slice(rest.get(3..).ok_or(corrupt(Malformed::Truncated))?);
-            return Ok(Some(op));
+        // The leaf by the index, from memory: the one page read.
+        let page_no = self
+            .index
+            .floor(key)
+            .ok_or(corrupt(Malformed::CountMismatch))?;
+        let address = self.page_address(store, u64::from(page_no))?;
+        buf.clear();
+        store.read_page(address, buf)?;
+        let view = View::new(buf)?;
+        if view.kind != LEAF {
+            return Err(corrupt(Malformed::CountMismatch));
         }
-        Err(corrupt(Malformed::CountMismatch))
-    }
-}
-
-/// A forward cursor over a branch's entries in key order, from a start key: the pages from the
-/// root to the current leaf and the entry it is at in each, at most the branch's height of
-/// pages held.
-///
-/// The builder writes a branch's leaves in key order at rising addresses, each index page after
-/// the leaves under it, so the cursor reads leaves ahead an extent at a time ([`Span`]) and index
-/// pages alone: reading an index page ahead would skip the leaves before it.
-#[derive(Debug)]
-pub struct Cursor {
-    path: Vec<(Vec<u8>, usize)>,
-    /// The depth of the branch's leaves on the path: its height less one, as the root is the
-    /// page below the builder's top level.
-    leaf_depth: usize,
-    span: Span,
-    key: Vec<u8>,
-    value: Vec<u8>,
-    op: Op,
-    valid: bool,
-}
-
-fn child_of(rest: &[u8]) -> Result<u64, Error> {
-    rest.first_chunk::<8>()
-        .map(|b| u64::from_le_bytes(*b))
-        .ok_or(corrupt(Malformed::Truncated))
-}
-
-impl Branch {
-    /// A cursor at the first entry whose key is at least `from`.
-    pub fn seek<F: BlockFile>(&self, store: &mut Store<F>, from: &[u8]) -> Result<Cursor, Error> {
-        let span = store.span()?;
-        self.seek_with(store, from, span)
-    }
-
-    /// [`Self::seek`] for a compaction, which reads the branch to its end: its leaves are read
-    /// an extent a call from the first ([`Store::span_sequential`]).
-    pub fn seek_sequential<F: BlockFile>(
-        &self,
-        store: &mut Store<F>,
-        from: &[u8],
-    ) -> Result<Cursor, Error> {
-        let span = store.span_sequential()?;
-        self.seek_with(store, from, span)
-    }
-
-    fn seek_with<F: BlockFile>(
-        &self,
-        store: &mut Store<F>,
-        from: &[u8],
-        span: Span,
-    ) -> Result<Cursor, Error> {
-        let height = usize::from(self.height);
-        let mut cursor = Cursor {
-            path: Vec::with_capacity(height.saturating_add(1)),
-            leaf_depth: height
-                .checked_sub(1)
-                .ok_or(corrupt(Malformed::CountMismatch))?,
-            span,
-            key: Vec::new(),
-            value: Vec::new(),
-            op: Op::Put,
-            valid: false,
+        let Some(i) = view.floor(key)? else {
+            return Ok(None);
         };
-        let mut address = self.root;
-        for depth in 0..=height {
-            let mut page = store.take_page();
-            let read = if depth == cursor.leaf_depth {
-                cursor.read(store, depth, address, &mut page)
-            } else {
-                self.read_node(store, address, &mut page)
-            };
-            if let Err(e) = read {
-                store.give_page(page);
-                cursor.give_back(store);
-                return Err(e);
-            }
-            let view = View::new(&page)?;
-            let floor = view.floor(from)?;
-            if view.kind == INDEX {
-                let i = floor.unwrap_or(0);
-                address = child_of(view.entry(i)?.1)?;
-                cursor.path.push((page, i));
-                continue;
-            }
-            // The first entry at least `from`: the floor if it equals it, else the one after.
-            let i = match floor {
-                Some(i) if view.compare(from, i)? == Ordering::Equal => i,
-                Some(i) => i.saturating_add(1),
-                None => 0,
-            };
-            let past = i >= view.n;
-            cursor.path.push((page, i));
-            if past {
-                cursor.advance_leaf(store)?;
-            } else {
-                cursor.load()?;
-            }
-            return Ok(cursor);
+        if view.compare(key, i)? != Ordering::Equal {
+            return Ok(None);
         }
-        Err(corrupt(Malformed::CountMismatch))
-    }
-}
-
-impl Cursor {
-    /// Gives the cursor's span and page buffers back to `store`'s pools: the scan is done.
-    pub fn give_back<F: BlockFile>(self, store: &mut Store<F>) {
-        store.give_span(self.span);
-        for (page, _) in self.path {
-            store.give_page(page);
-        }
-    }
-
-    /// Whether the cursor is at an entry.
-    pub fn valid(&self) -> bool {
-        self.valid
-    }
-
-    /// The entry's key.
-    pub fn key(&self) -> &[u8] {
-        &self.key
-    }
-
-    /// The entry's operation.
-    pub fn op(&self) -> Op {
-        self.op
-    }
-
-    /// The entry's value.
-    pub fn value(&self) -> &[u8] {
-        &self.value
-    }
-
-    /// Reads the page at `address`, at `depth` of the path: a leaf through the span.
-    fn read<F: BlockFile>(
-        &mut self,
-        store: &mut Store<F>,
-        depth: usize,
-        address: u64,
-        page: &mut Vec<u8>,
-    ) -> Result<(), Error> {
-        if depth == self.leaf_depth {
-            store.read_page_ahead(&mut self.span, address, page)
-        } else {
-            store.read_page(address, page)
-        }
-    }
-
-    /// Loads the entry the leaf at the path's end is at.
-    fn load(&mut self) -> Result<(), Error> {
-        let (page, i) = self.path.last().ok_or(corrupt(Malformed::Truncated))?;
-        let view = View::new(page)?;
-        let (suffix, rest) = view.entry(*i)?;
-        self.key.clear();
-        self.key.extend_from_slice(view.prefix);
-        self.key.extend_from_slice(suffix);
-        self.op =
+        let (_, rest) = view.entry(i)?;
+        let op =
             rest.first()
                 .and_then(|&b| Op::from_byte(b))
                 .ok_or(corrupt(Malformed::UnknownTag(
                     rest.first().copied().unwrap_or(0),
                 )))?;
-        self.value.clear();
-        self.value
-            .extend_from_slice(rest.get(3..).ok_or(corrupt(Malformed::Truncated))?);
-        self.valid = true;
-        Ok(())
-    }
-
-    /// Moves to the next entry.
-    pub fn next<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
-        if !self.valid {
-            return Ok(());
-        }
-        let (page, i) = self.path.last_mut().ok_or(corrupt(Malformed::Truncated))?;
-        *i = i.saturating_add(1);
-        if *i < View::new(page)?.n {
-            return self.load();
-        }
-        self.advance_leaf(store)
-    }
-
-    /// The leaf at the path's end is used up: up to the nearest index page with an entry left,
-    /// then down its next child's leftmost path. The end of the branch leaves the cursor
-    /// invalid.
-    fn advance_leaf<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
-        if let Some((page, _)) = self.path.pop() {
-            store.give_page(page);
-        }
-        loop {
-            let Some((page, i)) = self.path.last_mut() else {
-                self.valid = false;
-                return Ok(());
-            };
-            *i = i.saturating_add(1);
-            let view = View::new(page)?;
-            if *i >= view.n {
-                if let Some((page, _)) = self.path.pop() {
-                    store.give_page(page);
-                }
-                continue;
-            }
-            let mut address = child_of(view.entry(*i)?.1)?;
-            // Down the leftmost path to a leaf.
-            loop {
-                let mut page = store.take_page();
-                if let Err(e) = self.read(store, self.path.len(), address, &mut page) {
-                    store.give_page(page);
-                    return Err(e);
-                }
-                let view = View::new(&page)?;
-                let kind = view.kind;
-                if kind == INDEX {
-                    address = child_of(view.entry(0)?.1)?;
-                }
-                self.path.push((page, 0));
-                if kind == LEAF {
-                    return self.load();
-                }
-            }
-        }
+        value.clear();
+        value.extend_from_slice(rest.get(3..).ok_or(corrupt(Malformed::Truncated))?);
+        Ok(Some(op))
     }
 }
 
@@ -1230,41 +953,6 @@ impl Branch {
             .collect();
         let filter =
             filter::Filter::from_bytes(filter_part).ok_or(corrupt(Malformed::CountMismatch))?;
-        // The index pages, read back into memory: the tree pages whose entry count is 0.
-        let mut bytes = Vec::new();
-        let mut pages = Vec::new();
-        for (page_no, &c) in counts.iter().enumerate() {
-            if c != 0 {
-                continue;
-            }
-            let page_no = u64::try_from(page_no).map_err(|_| corrupt(Malformed::TooLarge))?;
-            let extent = *extents
-                .get(
-                    usize::try_from(
-                        page_no
-                            .checked_div(per)
-                            .ok_or(corrupt(Malformed::TooLarge))?,
-                    )
-                    .map_err(|_| corrupt(Malformed::TooLarge))?,
-                )
-                .ok_or(corrupt(Malformed::OutOfRange))?;
-            let within = u32::try_from(
-                page_no
-                    .checked_rem(per)
-                    .ok_or(corrupt(Malformed::TooLarge))?,
-            )
-            .map_err(|_| corrupt(Malformed::TooLarge))?;
-            let address = store.address(extent, within)?;
-            let start = bytes.len();
-            store.read_page(address, &mut bytes)?;
-            pages.push((
-                address,
-                u32::try_from(start).map_err(|_| corrupt(Malformed::TooLarge))?,
-                u32::try_from(bytes.len().saturating_sub(start))
-                    .map_err(|_| corrupt(Malformed::TooLarge))?,
-            ));
-        }
-        let interior = Interior::from_working(&bytes, &pages);
         Ok((
             Self {
                 root,
@@ -1276,7 +964,6 @@ impl Branch {
                 filter_pages,
                 filter_bytes,
                 counts,
-                interior,
                 index,
                 index_bytes,
             },
@@ -1307,22 +994,6 @@ pub struct RunCursor {
 }
 
 impl Branch {
-    /// The page at `address` into `out`: an index page from memory, any other from the store.
-    fn read_node<F: BlockFile>(
-        &self,
-        store: &mut Store<F>,
-        address: u64,
-        out: &mut Vec<u8>,
-    ) -> Result<(), Error> {
-        match self.interior.get(address) {
-            Some(payload) => {
-                out.extend_from_slice(payload);
-                Ok(())
-            }
-            None => store.read_page(address, out),
-        }
-    }
-
     /// The address of page `page_no`, counted through the branch's extents in order.
     pub fn page_address<F: BlockFile>(&self, store: &Store<F>, page_no: u64) -> Result<u64, Error> {
         let per = u64::from(store.extent_pages());
@@ -1337,22 +1008,6 @@ impl Branch {
         let within = u32::try_from(page_no.checked_rem(per).unwrap_or(0))
             .map_err(|_| corrupt(Malformed::TooLarge))?;
         store.address(*extent, within)
-    }
-
-    /// The page number of `address` in the branch's pages.
-    fn page_no_of<F: BlockFile>(&self, store: &Store<F>, address: u64) -> Result<u64, Error> {
-        let per = u64::from(store.extent_pages());
-        let extent = store.extent_of(address);
-        let i = self
-            .extents
-            .iter()
-            .position(|&e| e == extent)
-            .ok_or(corrupt(Malformed::OutOfRange))?;
-        u64::try_from(i)
-            .ok()
-            .and_then(|i| i.checked_mul(per))
-            .and_then(|p| p.checked_add(address.checked_rem(per)?))
-            .ok_or(corrupt(Malformed::TooLarge))
     }
 
     /// The entries in tree page `page_no`, 0 for an index page.
@@ -1395,43 +1050,71 @@ impl Branch {
         Err(corrupt(Malformed::CountMismatch))
     }
 
-    /// A run cursor at the first entry at or past `from`, found by one descent.
+    /// A cursor at the first entry at or past `from`, for a scan, which may stop after a page:
+    /// its leaf by the index from memory, then the leaves in page order, read a page and then
+    /// more while the scan runs on.
+    pub fn seek<F: BlockFile>(
+        &self,
+        store: &mut Store<F>,
+        from: &[u8],
+    ) -> Result<RunCursor, Error> {
+        let c = RunCursor::new(store)?;
+        self.place_at(store, c, from)
+    }
+
+    /// [`Self::seek`] for a compaction, which reads the branch to its end: an extent a read.
+    pub fn seek_sequential<F: BlockFile>(
+        &self,
+        store: &mut Store<F>,
+        from: &[u8],
+    ) -> Result<RunCursor, Error> {
+        let c = RunCursor::new_sequential(store)?;
+        self.place_at(store, c, from)
+    }
+
+    /// The run cursor a REMIX view's build starts each run with: [`Self::seek`].
     pub fn run_at<F: BlockFile>(
         &self,
         store: &mut Store<F>,
         from: &[u8],
     ) -> Result<RunCursor, Error> {
-        let mut c = RunCursor::new(store)?;
-        let mut address = self.root;
-        for _ in 0..=self.height {
-            c.page.clear();
-            if let Err(e) = self.read_node(store, address, &mut c.page) {
-                c.give_back(store);
-                return Err(e);
-            }
+        self.seek(store, from)
+    }
+
+    /// Places `c` at the first entry at or past `from`.
+    fn place_at<F: BlockFile>(
+        &self,
+        store: &mut Store<F>,
+        mut c: RunCursor,
+        from: &[u8],
+    ) -> Result<RunCursor, Error> {
+        let placed = (|| {
+            let page_no = self
+                .index
+                .floor(from)
+                .ok_or(corrupt(Malformed::CountMismatch))?;
+            c.land(self, store, u64::from(page_no), 0)?;
             let view = View::new(&c.page)?;
-            let floor = view.floor(from)?;
-            if view.kind == INDEX {
-                address = child_of(view.entry(floor.unwrap_or(0))?.1)?;
-                continue;
-            }
-            let i = match floor {
+            // The first entry at least `from`: the floor if it equals it, else the one after.
+            let i = match view.floor(from)? {
                 Some(i) if view.compare(from, i)? == Ordering::Equal => i,
                 Some(i) => i.saturating_add(1),
                 None => 0,
             };
-            c.page_no = self.page_no_of(store, address)?;
-            c.loaded = Some(address);
-            c.n = view.n;
-            c.index = i;
-            if i >= c.n {
-                c.next_leaf(self, store)?;
+            if i >= view.n {
+                c.next_leaf(self, store)
             } else {
-                c.load()?;
+                c.index = i;
+                c.load()
             }
-            return Ok(c);
+        })();
+        match placed {
+            Ok(()) => Ok(c),
+            Err(e) => {
+                c.give_back(store);
+                Err(e)
+            }
         }
-        Err(corrupt(Malformed::CountMismatch))
     }
 
     /// A run cursor at entry `index` of the leaf at page `page_no`: a view's offset.
@@ -1458,21 +1141,32 @@ impl Branch {
 }
 
 impl RunCursor {
-    /// A cursor at no entry yet, its page and span from `store`'s pools: [`Self::place`] puts
-    /// it on one.
+    /// A cursor at no entry yet, its page and span from `store`'s pools, for a scan: [`Self::place`]
+    /// puts it on one.
     pub fn new<F: BlockFile>(store: &mut Store<F>) -> Result<Self, Error> {
-        Ok(Self {
+        let span = store.span()?;
+        Ok(Self::with_span(store, span))
+    }
+
+    /// [`Self::new`] for a compaction: its leaves read an extent a call.
+    pub fn new_sequential<F: BlockFile>(store: &mut Store<F>) -> Result<Self, Error> {
+        let span = store.span_sequential()?;
+        Ok(Self::with_span(store, span))
+    }
+
+    fn with_span<F: BlockFile>(store: &mut Store<F>, span: Span) -> Self {
+        Self {
             page_no: 0,
             loaded: None,
             index: 0,
             n: 0,
             page: store.take_page(),
-            span: store.span()?,
+            span,
             key: Vec::new(),
             value: Vec::new(),
             op: Op::Put,
             valid: false,
-        })
+        }
     }
 
     /// Gives the cursor's page and span back to `store`'s pools.

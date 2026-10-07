@@ -727,6 +727,11 @@ impl<F: BlockFile> ShardDb<F> {
         (self.flush_stats, self.trunk.stats(), self.store.io_stats())
     }
 
+    /// The bytes the trunk's branches hold in memory: filters, leaf indexes, page counts.
+    pub fn memory(&self) -> (usize, usize, usize) {
+        self.trunk.memory()
+    }
+
     /// The trunk's shape: height, nodes, leaves.
     pub fn shape(&self) -> Result<(usize, usize, usize), Error> {
         self.trunk.shape()

@@ -274,6 +274,12 @@ fn main() {
         "shape height {h} nodes {n} leaves {l} views built {} dropped {}",
         trunk.views_built, trunk.views_dropped
     );
+    let (filters, indexes, counts) = db.memory();
+    println!(
+        "memory filters {filters} B ({:.2} B/key) indexes {indexes} B ({:.3} B/key) counts {counts} B",
+        filters as f64 / num as f64,
+        indexes as f64 / num as f64
+    );
     drop(db);
     std::fs::remove_file(&path).unwrap();
 }

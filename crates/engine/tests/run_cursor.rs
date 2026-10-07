@@ -109,9 +109,9 @@ proptest! {
         let (back, _) = Branch::decode(&mut s, &descriptor).unwrap();
         prop_assert_eq!(&back.index, &b.index);
         for ((k, _, _), (page, _)) in &all {
-            prop_assert_eq!(b.index.floor(k), Some(*page as u32));
+            prop_assert_eq!(b.leaf_of(k).unwrap(), *page as u32);
         }
-        let leaf = u64::from(b.index.floor(&from).unwrap());
+        let leaf = u64::from(b.leaf_of(&from).unwrap());
         prop_assert!(all.iter().any(|(_, (p, _))| *p == leaf), "a leaf the branch has");
         for ((k, _, _), (p, _)) in &all {
             if *p < leaf {

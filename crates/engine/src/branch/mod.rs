@@ -464,7 +464,10 @@ impl Builder {
         if level == 0 {
             // The leaf's separator: the shortest prefix of its first key above the last leaf's
             // last key, the empty key for the first leaf.
-            let mut cut = 0usize;
+            // The first leaf's separator is its first key: it shares the prefix every key of the
+            // branch has, so the index keeps that prefix as bytes ([`Branch::leaf_of`] places a
+            // key below it in the first leaf).
+            let mut cut = first.len();
             if !self.separators.is_empty() {
                 let lcp = self
                     .prev_last
@@ -850,10 +853,7 @@ impl Branch {
         buf: &mut Vec<u8>,
     ) -> Result<Option<Op>, Error> {
         // The leaf by the index, from memory: the one page read.
-        let page_no = self
-            .index
-            .floor(key)
-            .ok_or(corrupt(Malformed::CountMismatch))?;
+        let page_no = self.leaf_of(key)?;
         let address = self.page_address(store, u64::from(page_no))?;
         buf.clear();
         store.read_page(address, buf)?;
@@ -1030,6 +1030,15 @@ pub struct RunCursor {
 }
 
 impl Branch {
+    /// The page number of the leaf `key` falls in: the greatest separator at most `key`, the
+    /// first leaf for a key below every separator.
+    pub fn leaf_of(&self, key: &[u8]) -> Result<u32, Error> {
+        self.index
+            .floor(key)
+            .or_else(|| self.index.least())
+            .ok_or(corrupt(Malformed::CountMismatch))
+    }
+
     /// The address of page `page_no`, counted through the branch's extents in order.
     pub fn page_address<F: BlockFile>(&self, store: &Store<F>, page_no: u64) -> Result<u64, Error> {
         let per = u64::from(store.extent_pages());
@@ -1125,10 +1134,7 @@ impl Branch {
         from: &[u8],
     ) -> Result<RunCursor, Error> {
         let placed = (|| {
-            let page_no = self
-                .index
-                .floor(from)
-                .ok_or(corrupt(Malformed::CountMismatch))?;
+            let page_no = self.leaf_of(from)?;
             c.land(self, store, u64::from(page_no), 0)?;
             let view = View::new(&c.page)?;
             // The first entry at least `from`: the floor if it equals it, else the one after.

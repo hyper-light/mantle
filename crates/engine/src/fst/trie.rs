@@ -53,6 +53,10 @@ fn before(bits: &Bits, p: usize) -> usize {
 /// A static trie of byte keys, each with a value.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Trie {
+    /// The bytes every key starts with, kept as bytes: the trie holds the rest of each key, so a
+    /// descent does not walk the shared prefix a level a byte (16-byte number keys share their
+    /// first five, object names their tenant). Prefix truncation, as the memtable's nodes do.
+    prefix: Vec<u8>,
     dense: Dense,
     /// The levels below the dense part, the first one's nodes the dense part's last branches.
     sparse: Vec<SparseLevel>,
@@ -280,15 +284,31 @@ impl TrieBuilder {
         self.levels.get(..self.depth).unwrap_or(&[])
     }
 
+    /// The leading levels every key passes through alone: one node, not itself a key, with one
+    /// label whose branch goes on. Their labels are the keys' shared prefix.
+    fn shared(&self) -> usize {
+        self.used()
+            .iter()
+            .take_while(|l| {
+                l.prefix.len() == 1 && !l.prefix.get(0) && l.labels.len() == 1 && l.has_child.get(0)
+            })
+            .count()
+    }
+
+    /// The levels below the shared prefix: the trie of the rest of each key.
+    fn kept(&self) -> &[Level] {
+        self.used().get(self.shared()..).unwrap_or(&[])
+    }
+
     /// The deepest level the dense part may reach: the largest `l` whose levels above it, dense,
     /// take at most 1/64 of the sparse levels from it down (Zhang et al. §2.4).
     fn cutoff(&self) -> usize {
         let dense = |l: &Level| l.prefix.len().saturating_mul(DENSE_NODE_BITS);
         let sparse = |l: &Level| l.labels.len().saturating_mul(SPARSE_LABEL_BITS);
-        let mut below: usize = self.used().iter().map(sparse).sum();
+        let mut below: usize = self.kept().iter().map(sparse).sum();
         let mut above = 0usize;
         let mut cut = 0usize;
-        for (l, level) in self.used().iter().enumerate() {
+        for (l, level) in self.kept().iter().enumerate() {
             above = above.saturating_add(dense(level));
             below = below.saturating_sub(sparse(level));
             if above.saturating_mul(DENSE_RATIO) <= below {
@@ -313,8 +333,8 @@ impl TrieBuilder {
         let mut d_prefix = Grow::default();
         let mut d_values = Packed::new(width)?;
         let mut dense_children = 0usize;
-        let mut sparse = Vec::with_capacity(self.used().len().saturating_sub(cutoff));
-        for (depth, l) in self.used().iter().enumerate() {
+        let mut sparse = Vec::with_capacity(self.kept().len().saturating_sub(cutoff));
+        for (depth, l) in self.kept().iter().enumerate() {
             let values = if l.values.width() == width {
                 l.values.clone()
             } else {
@@ -365,7 +385,14 @@ impl TrieBuilder {
         if held != self.keys {
             return Err(corrupt());
         }
+        let prefix = self
+            .used()
+            .iter()
+            .take(self.shared())
+            .filter_map(|l| l.labels.first().copied())
+            .collect();
         Ok(Trie {
+            prefix,
             dense: Dense {
                 nodes: d_prefix.len(),
                 labels: Bits::from_grow(d_labels, DENSE_BLOCK, Select::None)?,
@@ -553,8 +580,32 @@ impl Trie {
         }
     }
 
+    /// Where `key` stands against the shared prefix: below every key, past every key, or
+    /// starting with the prefix, with the rest of it.
+    fn against<'k>(&self, key: &'k [u8]) -> Against<'k> {
+        let p = self.prefix.len();
+        let n = key.len().min(p);
+        match key.get(..n).cmp(&self.prefix.get(..n)) {
+            std::cmp::Ordering::Less => Against::Below,
+            std::cmp::Ordering::Greater => Against::Above,
+            // A key that ends inside the prefix is below every key.
+            std::cmp::Ordering::Equal => match key.get(p..) {
+                Some(rest) => Against::Within(rest),
+                None => Against::Below,
+            },
+        }
+    }
+
     /// The value `key` holds.
     pub fn get(&self, key: &[u8]) -> Option<u32> {
+        match self.against(key) {
+            Against::Within(rest) => self.get_rest(rest),
+            Against::Below | Against::Above => None,
+        }
+    }
+
+    /// The value the rest of a key past the prefix holds.
+    fn get_rest(&self, key: &[u8]) -> Option<u32> {
         let mut node = self.root();
         for (d, &b) in key.iter().enumerate() {
             let last = d.saturating_add(1) == key.len();
@@ -589,6 +640,41 @@ impl Trie {
     /// the leaves' separators. One descent, remembering the nearest smaller branch passed; if
     /// the key's path ends above every key beneath it, the rightmost key under that branch.
     pub fn floor(&self, key: &[u8]) -> Option<u32> {
+        match self.against(key) {
+            Against::Within(rest) => self.floor_rest(rest),
+            Against::Below => None,
+            Against::Above => self.greatest(),
+        }
+    }
+
+    /// The value of the least key.
+    pub fn least(&self) -> Option<u32> {
+        let mut node = self.root();
+        // Down the first branch of each node: at most a level a step.
+        for _ in 0..=self.sparse.len().saturating_add(self.dense.nodes) {
+            if self.is_key(node) {
+                return self.value_of(node);
+            }
+            match self.step(self.first_label(node)?) {
+                Ok(child) => node = child,
+                Err(v) => return v,
+            }
+        }
+        None
+    }
+
+    /// The value of the greatest key.
+    fn greatest(&self) -> Option<u32> {
+        let root = self.root();
+        match self.last_label(root) {
+            Some(f) => self.rightmost(f),
+            None if self.is_key(root) => self.value_of(root),
+            None => None,
+        }
+    }
+
+    /// [`Self::floor`] of the rest of a key past the prefix.
+    fn floor_rest(&self, key: &[u8]) -> Option<u32> {
         let mut node = self.root();
         // The nearest point below which every key is less than `key`.
         let mut fallback: Option<Fallback> = None;
@@ -688,6 +774,31 @@ impl Trie {
         F: FnMut(usize, u32) -> ControlFlow<()>,
     {
         out.clear();
+        let p = self.prefix.len();
+        match self.against(key) {
+            Against::Above => ControlFlow::Continue(None),
+            // Every key is past `key`, and none is a prefix of it: the least is the answer.
+            Against::Below => {
+                out.extend_from_slice(&self.prefix);
+                self.seek_rest(&[], out, |_, _| ControlFlow::Continue(()))
+            }
+            Against::Within(rest) => {
+                out.extend_from_slice(&self.prefix);
+                self.seek_rest(rest, out, |len, v| prefix(len.saturating_add(p), v))
+            }
+        }
+    }
+
+    /// [`Self::seek`] of the rest of a key past the prefix, the key found appended to `out`.
+    fn seek_rest<F>(
+        &self,
+        key: &[u8],
+        out: &mut Vec<u8>,
+        mut prefix: F,
+    ) -> ControlFlow<(), Option<u32>>
+    where
+        F: FnMut(usize, u32) -> ControlFlow<()>,
+    {
         let mut node = self.root();
         // The nearest branch passed whose label is greater than the key's byte: the least key
         // beneath it is the least greater than `key` that the descent leaves behind.
@@ -819,12 +930,15 @@ impl Trie {
         None
     }
 
-    /// Appends the trie to `out`: the dense part's three bit vectors, counts and values, then
+    /// Appends the trie to `out`: the shared prefix, the dense part's three bit vectors, counts
+    /// and values, then
     /// the sparse levels', each its labels, three bit vectors and values.
     pub fn encode(&self, out: &mut Vec<u8>) {
         let put = |out: &mut Vec<u8>, n: usize| {
             out.extend_from_slice(&u64::try_from(n).unwrap_or(u64::MAX).to_le_bytes());
         };
+        put(out, self.prefix.len());
+        out.extend_from_slice(&self.prefix);
         let d = &self.dense;
         d.labels.encode(out);
         d.has_child.encode(out);
@@ -868,6 +982,10 @@ impl Trie {
             *at = at.checked_add(used).ok_or(corrupt())?;
             Ok(v)
         };
+        let p = num(&mut at)?;
+        let p_end = at.checked_add(p).ok_or(corrupt())?;
+        let prefix = bytes.get(at..p_end).ok_or(corrupt())?.to_vec();
+        at = p_end;
         let labels_d = bits(&mut at, Select::None)?;
         let child_d = bits(&mut at, Select::None)?;
         let prefix_d = bits(&mut at, Select::None)?;
@@ -928,6 +1046,7 @@ impl Trie {
         }
         Ok((
             Self {
+                prefix,
                 dense: Dense {
                     labels: labels_d,
                     has_child: child_d,
@@ -957,8 +1076,9 @@ impl Trie {
     pub fn bytes(&self) -> usize {
         let d = &self.dense;
         self.sparse.iter().fold(
-            d.labels
-                .bytes()
+            self.prefix
+                .len()
+                .saturating_add(d.labels.bytes())
                 .saturating_add(d.has_child.bytes())
                 .saturating_add(d.prefix.bytes())
                 .saturating_add(d.values.bytes()),
@@ -977,6 +1097,13 @@ impl Trie {
     fn value_width(&self) -> u32 {
         self.dense.values.width()
     }
+}
+
+/// A key against a trie's shared prefix ([`Trie::against`]).
+enum Against<'k> {
+    Below,
+    Above,
+    Within(&'k [u8]),
 }
 
 /// Where a descent falls back to: a dense label position, a sparse level's label, or a node
@@ -1115,6 +1242,73 @@ mod tests {
             // Values packed at the bits the largest needs.
             let most = values.iter().copied().max().unwrap_or(0);
             assert_eq!(fresh.value_width(), width_of(most), "case {case}");
+        }
+    }
+
+    #[test]
+    fn keys_under_a_shared_prefix_answer_as_an_ordered_map() {
+        let mut x = 0x0bad_5eed_1234_5678u64;
+        let shared: [&[u8]; 4] = [b"", b"\x00\x00\x00\x00\x00", b"t/0000/", b"\xff\xff"];
+        for case in 0..300 {
+            let p = shared[case % shared.len()];
+            let n = 1 + (rng(&mut x) % 200) as usize;
+            let map: BTreeMap<Vec<u8>, u32> = (0..n)
+                .map(|i| {
+                    let mut k = p.to_vec();
+                    k.extend(key(&mut x));
+                    (k, u32::try_from(i).unwrap())
+                })
+                .collect();
+            let keys: Vec<&[u8]> = map.keys().map(Vec::as_slice).collect();
+            let values: Vec<u32> = map.values().copied().collect();
+            // Queries under the prefix, outside it on either side, and cut inside it.
+            let mut queries: Vec<Vec<u8>> = (0..200)
+                .map(|i| {
+                    let mut q = match i % 4 {
+                        0 => p.to_vec(),
+                        1 => p.get(..p.len() / 2).unwrap_or(&[]).to_vec(),
+                        _ => Vec::new(),
+                    };
+                    q.extend(key(&mut x));
+                    q
+                })
+                .collect();
+            queries.extend(map.keys().cloned());
+            queries.push(p.to_vec());
+            for cutoff in 0..=4 {
+                let t = Trie::builder(&keys, &values)
+                    .unwrap()
+                    .finish_at(cutoff)
+                    .unwrap();
+                let mut bytes = Vec::new();
+                t.encode(&mut bytes);
+                assert_eq!(Trie::decode(&bytes).unwrap(), (t.clone(), bytes.len()));
+                assert_eq!(t.least(), map.values().next().copied(), "case {case} least");
+                let mut out = Vec::new();
+                for q in &queries {
+                    assert_eq!(t.get(q), map.get(q).copied(), "case {case} get {q:?}");
+                    let floor = map.range(..=q.clone()).next_back().map(|(_, v)| *v);
+                    assert_eq!(t.floor(q), floor, "case {case} floor {q:?}");
+                    let want = map.range(q.clone()..).next();
+                    let mut seen = Vec::new();
+                    let got = t.seek(q, &mut out, |len, v| {
+                        seen.push((len, v));
+                        ControlFlow::Continue(())
+                    });
+                    assert_eq!(
+                        got,
+                        ControlFlow::Continue(want.map(|(_, v)| *v)),
+                        "case {case} ceil {q:?}"
+                    );
+                    if let Some((k, _)) = want {
+                        assert_eq!(&out, k, "case {case} ceil key {q:?}");
+                    }
+                    let prefixes: Vec<(usize, u32)> = (0..q.len())
+                        .filter_map(|l| map.get(&q[..l]).map(|v| (l, *v)))
+                        .collect();
+                    assert_eq!(seen, prefixes, "case {case} prefixes {q:?}");
+                }
+            }
         }
     }
 

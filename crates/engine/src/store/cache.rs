@@ -135,6 +135,21 @@ impl Cache {
         true
     }
 
+    /// The payload cached for `address`, lent in place and counted as a read; none when it is
+    /// not cached. A point read parses the page where it lies and copies only what it returns.
+    pub fn get_ref(&mut self, address: u64) -> Option<&[u8]> {
+        let Some(&i) = self.map.get(&address) else {
+            self.misses = self.misses.saturating_add(1);
+            return None;
+        };
+        let slot = self.slots.get_mut(i)?;
+        slot.freq = slot.freq.saturating_add(1).min(MAX_FREQ);
+        let len = slot.len;
+        self.hits = self.hits.saturating_add(1);
+        let at = i.saturating_mul(self.page);
+        self.bytes.get(at..at.saturating_add(len))
+    }
+
     /// The payload cached for `address`, appended to `out`, without counting a read: a scan's
     /// look, which must not promote what it passes.
     pub fn peek(&self, address: u64, out: &mut Vec<u8>) -> bool {

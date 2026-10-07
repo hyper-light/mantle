@@ -841,45 +841,28 @@ impl Branch {
         if !self.filter.may_contain(hash) {
             return Ok(None);
         }
-        let mut buf = store.take_page();
-        let found = self.find(store, key, value, &mut buf);
-        store.give_page(buf);
-        found
-    }
-
-    /// The descent of [`Self::get_hashed`], reading each page into `buf`.
-    fn find<F: BlockFile>(
-        &self,
-        store: &mut Store<F>,
-        key: &[u8],
-        value: &mut Vec<u8>,
-        buf: &mut Vec<u8>,
-    ) -> Result<Option<Op>, Error> {
-        // The leaf by the index, from memory: the one page read.
+        // The leaf by the index, from memory: the one page read, parsed where the store holds
+        // it, only the value copied out.
         let page_no = self.leaf_of(key)?;
         let address = self.page_address(store, u64::from(page_no))?;
-        buf.clear();
-        store.read_page(address, buf)?;
-        let view = View::new(buf)?;
-        if view.kind != LEAF {
-            return Err(corrupt(Malformed::CountMismatch));
-        }
-        let Some(i) = view.floor(key)? else {
-            return Ok(None);
-        };
-        if view.compare(key, i)? != Ordering::Equal {
-            return Ok(None);
-        }
-        let (_, rest) = view.entry(i)?;
-        let op =
-            rest.first()
-                .and_then(|&b| Op::from_byte(b))
-                .ok_or(corrupt(Malformed::UnknownTag(
-                    rest.first().copied().unwrap_or(0),
-                )))?;
-        value.clear();
-        value.extend_from_slice(rest.get(3..).ok_or(corrupt(Malformed::Truncated))?);
-        Ok(Some(op))
+        store.with_page(address, |page| {
+            let view = View::new(page)?;
+            if view.kind != LEAF {
+                return Err(corrupt(Malformed::CountMismatch));
+            }
+            let Some(i) = view.floor(key)? else {
+                return Ok(None);
+            };
+            if view.compare(key, i)? != Ordering::Equal {
+                return Ok(None);
+            }
+            let (_, rest) = view.entry(i)?;
+            let tag = rest.first().copied().unwrap_or(0);
+            let op = Op::from_byte(tag).ok_or(corrupt(Malformed::UnknownTag(tag)))?;
+            value.clear();
+            value.extend_from_slice(rest.get(3..).ok_or(corrupt(Malformed::Truncated))?);
+            Ok(Some(op))
+        })
     }
 }
 

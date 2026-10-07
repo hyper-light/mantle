@@ -154,6 +154,8 @@ pub struct Store<F: BlockFile> {
     /// cursors on a busy machine. It holds no more than were ever out at once.
     pool: Vec<AlignedBuf>,
     lent: usize,
+    /// The buffer a point read's page is read into on a cache miss ([`Store::with_page`]).
+    point: Vec<u8>,
     most_lent: usize,
     /// Page buffers lent to readers (a cursor's path, a point read), kept when given back: at
     /// most as many as were ever out at once.
@@ -351,6 +353,7 @@ impl<F: BlockFile> Store<F> {
             write_budget_runs: 0,
             pool: Vec::new(),
             lent: 0,
+            point: Vec::new(),
             most_lent: 0,
             pages: Vec::new(),
             pages_lent: 0,
@@ -411,6 +414,7 @@ impl<F: BlockFile> Store<F> {
                 write_budget_runs: 0,
                 pool: Vec::new(),
                 lent: 0,
+                point: Vec::new(),
                 most_lent: 0,
                 pages: Vec::new(),
                 pages_lent: 0,
@@ -1169,6 +1173,12 @@ impl<F: BlockFile> Store<F> {
         {
             return Ok(());
         }
+        self.read_page_uncached(address, out)
+    }
+
+    /// [`Self::read_page`] once the cache has missed: from a queued run, or the device, and
+    /// cached.
+    fn read_page_uncached(&mut self, address: u64, out: &mut Vec<u8>) -> Result<(), Error> {
         if self.queued_page(address, out)? {
             return Ok(());
         }
@@ -1231,6 +1241,26 @@ impl<F: BlockFile> Store<F> {
                 .map(|q| q.first.max(address))
                 .min()
         })
+    }
+
+    /// Lends page `address`'s payload to `read`: in place from the cache when it holds the page,
+    /// else read as [`Self::read_page`] reads it (and cached), into a buffer the store keeps.
+    /// A point read copies only what it takes from the page, not the page.
+    pub fn with_page<R>(
+        &mut self,
+        address: u64,
+        read: impl FnOnce(&[u8]) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        if let Some(payload) = self.cache.as_mut().and_then(|c| c.get_ref(address)) {
+            return read(payload);
+        }
+        let mut page = std::mem::take(&mut self.point);
+        page.clear();
+        // The cache was just asked: `read_page` asks again only to count, so read past it.
+        let got = self.read_page_uncached(address, &mut page);
+        let result = got.and_then(|()| read(&page));
+        self.point = page;
+        result
     }
 
     /// A span for a scan, which may stop after a page: its first read takes one page, and its

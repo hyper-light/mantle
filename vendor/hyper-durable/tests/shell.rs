@@ -98,6 +98,7 @@ fn pump<B: Budget>(r: &mut Sim<B>) -> Output<(u64, Vec<u8>)> {
         all.messages.append(&mut out.messages);
         all.answers.append(&mut out.answers);
         all.reads.append(&mut out.reads);
+        all.displaced.append(&mut out.displaced);
         let mut made = false;
         while r.log_mut().make_durable() {
             made = true;
@@ -349,6 +350,63 @@ fn a_write_of_fast_proposals_refused_for_room_is_made_again_with_them() {
         "made again, the write holds the proposal"
     );
     assert_eq!(r.core().issued_proposals().count(), 0);
+}
+
+/// A fast proposal whose index another entry took is given back to its proposer
+/// (`Output::displaced`): the core says it in each `Ready` (`hyper_raft::Ready::displaced`), and a
+/// shell that let it go left the proposer waiting on an entry no member will apply.
+#[test]
+fn a_fast_proposal_another_entry_took_the_index_of_is_given_back() {
+    let mut s = settings(1, 7);
+    s.core.fast = true;
+    let mut r: Sim = Replica::open(
+        &s,
+        SimStore::new(3),
+        Kv::new(voters(&[1, 2, 3]), false),
+        Unbounded,
+    )
+    .unwrap();
+    r.step(Message {
+        msg_type: MessageType::MsgHeartbeat,
+        from: 2,
+        to: 1,
+        term: 1,
+        ..Message::default()
+    })
+    .unwrap();
+    pump(&mut r);
+    let last = r.core().raft.log().last_index().unwrap();
+    let log_term = r.core().raft.log().term(last).unwrap();
+    let index = r.propose_fast(Vec::new(), b"mine".to_vec()).unwrap();
+    assert_eq!(index, last + 1);
+    pump(&mut r);
+    // The leader took another entry at the index and a classic quorum committed it.
+    r.step(Message {
+        msg_type: MessageType::MsgAppend,
+        from: 2,
+        to: 1,
+        term: 1,
+        index: last,
+        log_term,
+        commit: index,
+        classic: Some(index),
+        entries: vec![Entry {
+            index,
+            term: 1,
+            data: b"theirs".to_vec(),
+            ..Entry::default()
+        }],
+        ..Message::default()
+    })
+    .unwrap();
+    let given = pump(&mut r).displaced;
+    assert_eq!(
+        given.len(),
+        1,
+        "the proposer hears its proposal was not taken"
+    );
+    assert_eq!(given[0].index, index);
+    assert_eq!(given[0].data, b"mine");
 }
 
 /// Reads past the core's bound are refused, counting those the replica holds for its apply.
@@ -1011,6 +1069,10 @@ impl LogStore for Holding {
 
     fn proposals(&self, into: &mut Vec<Entry>) -> Result<(), StorageError> {
         self.inner.proposals(into)
+    }
+
+    fn released(&self) -> Result<u64, StorageError> {
+        self.inner.released()
     }
 
     fn room(&self) -> bool {

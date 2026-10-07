@@ -151,10 +151,20 @@ fn a_proposal_is_committed_once_a_fast_quorum_holds_it() {
             .any(|message| message.msg_type == MessageType::MsgAppendResponse)
     );
     // The members learn of the commit from the leader, and hold the entry
-    // from it.
+    // from it. What each holds by itself it keeps until the leader's next
+    // message says a classic quorum holds the index: the leader learns that
+    // from their answers, and sends no round of its own to say it.
     quiet(&mut group);
     for member in 1..=5 {
         assert_eq!(applied(&group, member), 2);
+    }
+    assert!(group.peek(1).unwrap().held().is_empty());
+    for member in 2..=5 {
+        assert_eq!(group.peek(member).unwrap().held(), vec![(2, b"e".to_vec())]);
+    }
+    group.act(&Op::Ping(1));
+    quiet(&mut group);
+    for member in 1..=5 {
         assert!(group.peek(member).unwrap().held().is_empty());
     }
     assert_eq!(group.chosen[&2].3, b"e");
@@ -524,7 +534,10 @@ fn an_election_never_commits_a_second_entry_at_a_committed_index() {
 /// was elected by members 3 and 4, which held another entry at 11, and took
 /// theirs. A fast quorum now counts only where it is a fast quorum of every
 /// configuration a member that holds an entry of the term may count by
-/// (`docs/raft.md`).
+/// (`docs/raft.md`). A member now counts by the newest configuration its log
+/// holds (`docs/raft.md` §3.4), so one that counts by the five holds no entry
+/// of the change; the schedule is kept as it ran, and the rule's catch is
+/// `tests/check.rs`'s.
 #[test]
 fn a_member_that_counts_by_the_configuration_before_commits_no_second_entry() {
     let mix = Mix {
@@ -562,4 +575,191 @@ fn a_group_given_its_readies_in_place_decides_the_same() {
         ..Settings::fast()
     });
     assert_eq!(copied, in_place);
+}
+
+/// Delivers what `carried` admits among the members `among`, until nothing it admits is left;
+/// what any other member sends or is sent stays on the network, and is dropped at the end.
+fn among(group: &mut Cluster<New>, members: &[u64], carried: impl Fn(&Message) -> bool) {
+    carry(group, |message| {
+        members.contains(&message.from) && members.contains(&message.to) && carried(message)
+    });
+}
+
+fn held_at(group: &Cluster<New>, member: u64, index: u64) -> Option<Vec<u8>> {
+    group
+        .peek(member)?
+        .held()
+        .into_iter()
+        .find(|(at, _)| *at == index)
+        .map(|(_, data)| data)
+}
+
+/// The run hyper-check's swarm found at fast seed 41,345 (`docs/sim.md` §15.9), at the fewest
+/// members it takes in the core (`docs/models/FastTrackScenario.tla` has it at four in the model,
+/// where an election's tie may go either way; the core breaks a tie for the first voted, so a
+/// fifth member makes the lost value the most held). Before the fix a later leader lost an entry
+/// the fast track committed; with it the entry is kept (`docs/raft.md` §3.5).
+///
+/// Term 1: member 1 leads; member 3 proposes `a` and `b` for indexes 2 and 3 by the fast track,
+/// and members 1, 2, 3 and 5 hold them, a fast quorum of four of five; the leader's appends of 2
+/// and 3 reach member 2 alone, and the leader commits both by the fast quorum. Members 3, 4 and 5
+/// still end at index 1.
+///
+/// Term 2: member 3 is elected by 4 and 5 and recovers `a` and `b` at 2 and 3 under term 2;
+/// member 4 takes its log through index 2 only (one entry an append), and holds `c`, its own
+/// proposal, at 3.
+///
+/// Term 3: member 4 is elected by 1 and 2, whose logs end at index 3 in term 1, older than its
+/// own. What it recovers at 3 is the most held among them: before the fix, 1 held nothing (a
+/// leader did not hold what it took) and 2 had let `b` go once its log reached 3, so member 4
+/// took its own `c`; now 1 and 2 hold `b` until they know index 3 committed by a classic quorum,
+/// two reports to one, and member 4 takes `b`.
+#[test]
+fn an_entry_the_fast_track_committed_outlives_a_log_cut_short_of_it() {
+    // A campaign is its election (no pre-vote, no lease from check-quorum), and an append carries
+    // one entry.
+    let settings = Settings {
+        max_size_per_msg: 1,
+        pre_vote: false,
+        check_quorum: false,
+        ..Settings::fast()
+    };
+    let mut group: Cluster<New> = Cluster::new(5, &[1, 2, 3, 4, 5], settings, 17);
+    group.act(&Op::Campaign(1));
+    quiet(&mut group);
+    assert_eq!(group.leaders_now(), vec![1]);
+    assert_eq!(commit(&group, 1), 1);
+    // Term 1.
+    assert!(fast(&mut group, 3, b"a"));
+    assert!(fast(&mut group, 3, b"b"));
+    carry(&mut group, |message| {
+        message.msg_type == FAST_PROPOSE && [1, 2, 5].contains(&message.to)
+    });
+    group.net.retain(|message| message.msg_type != FAST_PROPOSE);
+    carry(&mut group, |message| {
+        message.msg_type == FAST_VOTE
+            || (message.msg_type == MessageType::MsgAppend && message.to == 2)
+            || (message.msg_type == MessageType::MsgAppendResponse && message.from == 2)
+    });
+    assert_eq!(commit(&group, 1), 3, "the fast quorum committed 2 and 3");
+    assert_eq!(group.chosen[&3].3, b"b");
+    for member in [3, 4, 5] {
+        assert_eq!(group.peek(member).unwrap().view().last_index, 1);
+    }
+    group.net.clear();
+    // Term 2.
+    group.act(&Op::Campaign(3));
+    among(&mut group, &[3, 4, 5], |message| {
+        !(message.to == 4
+            && message.msg_type == MessageType::MsgAppend
+            && message.entries.iter().any(|entry| entry.index >= 3))
+    });
+    assert_eq!(group.leaders_now(), vec![1, 3]);
+    let four = group.peek(4).unwrap().view();
+    assert_eq!((four.term, four.last_index), (2, 2));
+    group.net.clear();
+    assert!(fast(&mut group, 4, b"c"));
+    assert_eq!(held_at(&group, 4, 3), Some(b"c".to_vec()));
+    group.net.clear();
+    // Term 3.
+    group.act(&Op::Campaign(4));
+    among(&mut group, &[1, 2, 4], |_| true);
+    assert!(group.leaders_now().contains(&4));
+    let taken = group
+        .disk(4)
+        .entries
+        .iter()
+        .find(|entry| entry.index == 3)
+        .map(|entry| entry.data.clone());
+    assert_eq!(taken, Some(b"b".to_vec()), "what member 4 took at index 3");
+}
+
+/// A member holds what it holds by itself after its log reaches the index, until a leader says it
+/// knows the index committed by a classic quorum; one that says nothing of it (a member not yet
+/// upgraded, `Message::classic` of `None`) has it released by no one. Storage is told to release
+/// it in the same order, and a member that opens again knows what storage released.
+#[test]
+fn a_holding_outlives_its_log_reaching_it_until_a_classic_commit_is_known() {
+    let mut group = group(3);
+    assert!(fast(&mut group, 2, b"e"));
+    carry(&mut group, |message| message.msg_type == FAST_PROPOSE);
+    carry(&mut group, |message| message.msg_type == FAST_VOTE);
+    assert_eq!(commit(&group, 1), 2, "the fast quorum committed");
+    // The leader's appends reach the others saying nothing of the classic commit: their logs
+    // reach index 2, and they hold `e` there still.
+    for _ in 0..1_000 {
+        for message in &mut group.net {
+            message.classic = None;
+        }
+        let Some(at) = group.net.iter().position(|_| true) else {
+            break;
+        };
+        group.act(&Op::Deliver {
+            at,
+            keep: false,
+            lose: false,
+        });
+    }
+    for member in [2, 3] {
+        assert!(group.peek(member).unwrap().view().last_index >= 2);
+        assert_eq!(
+            held_at(&group, member, 2),
+            Some(b"e".to_vec()),
+            "member {member}"
+        );
+        // Index 1, the leader's first entry, it knew committed so before the proposal.
+        assert_eq!(group.disk(member).released, 1);
+    }
+    // The leader's next round says what it knows: index 2 is in a classic quorum's logs.
+    for _ in 0..30 {
+        group.act(&Op::Tick(1));
+    }
+    quiet(&mut group);
+    for member in 1..=3 {
+        assert_eq!(held_at(&group, member, 2), None, "member {member}");
+    }
+    // Storage is told with the next write each member makes anyway.
+    assert!(fast(&mut group, 2, b"f"));
+    quiet(&mut group);
+    for member in 1..=3 {
+        assert!(group.disk(member).released >= 2, "member {member}");
+        assert!(
+            group
+                .disk(member)
+                .proposals
+                .iter()
+                .all(|held| held.index > 2)
+        );
+    }
+    // Opened again, a member knows what it released, and holds nothing below it.
+    group.act(&Op::Restart(2));
+    assert_eq!(held_at(&group, 2, 2), None);
+}
+
+/// A fast quorum counts what members hold by themselves alone: a member whose log holds the
+/// leader's entry and that holds nothing at its index is not counted, the leader included.
+#[test]
+fn a_fast_quorum_counts_holdings_and_not_logs() {
+    let mut group = group(3);
+    assert!(fast(&mut group, 2, b"e"));
+    // Member 3 never hears of the proposal: it holds the entry only once the leader's append
+    // reaches it, and the fast quorum of three is not made by the other two.
+    carry(&mut group, |message| {
+        message.msg_type == FAST_PROPOSE && message.to == 1
+    });
+    group.net.retain(|message| message.msg_type != FAST_PROPOSE);
+    carry(&mut group, |message| {
+        message.msg_type == FAST_VOTE
+            || (message.msg_type == MessageType::MsgAppend && message.to == 3)
+    });
+    assert_eq!(
+        commit(&group, 1),
+        1,
+        "no fast quorum holds the entry by itself"
+    );
+    assert_eq!(held_at(&group, 3, 2), None);
+    // The classic quorum commits it once member 3's answer arrives.
+    quiet(&mut group);
+    assert_eq!(commit(&group, 1), 2);
+    assert_eq!(group.chosen[&2].3, b"e");
 }

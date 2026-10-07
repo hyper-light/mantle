@@ -94,6 +94,8 @@ struct Model {
     proposals: BTreeMap<u64, (u64, Vec<u8>)>,
     /// The mark a restore left: entries the log may lack (raft-log.md §6).
     uncertain: Option<Start>,
+    /// The greatest index an update released proposals through.
+    released: u64,
 }
 
 impl Model {
@@ -146,9 +148,12 @@ impl Model {
         if let Some(h) = u.hard_state {
             self.hard = Some(h);
         }
-        let last = self.last();
-        self.proposals.retain(|&i, _| i > last);
+        // A proposal outlives the log reaching it: only a release ends it.
         self.settle();
+        if let Some(through) = u.released {
+            self.proposals.retain(|&i, _| i > through);
+            self.released = self.released.max(through);
+        }
         for p in &u.proposals {
             self.proposals.insert(p.index, (p.term, p.bytes.to_vec()));
         }
@@ -186,8 +191,15 @@ fn holds<F: hyper_block::block::BlockFile>(
         view.hard_state,
         &proposals,
         view.uncertain,
-    ) != (m.start, m.last(), m.hard, &m.proposals, m.uncertain)
-    {
+        view.released,
+    ) != (
+        m.start,
+        m.last(),
+        m.hard,
+        &m.proposals,
+        m.uncertain,
+        m.released,
+    ) {
         return false;
     }
     if m.last() == m.start.index {
@@ -222,9 +234,17 @@ fn check<F: hyper_block::block::BlockFile>(log: &Log<F>, models: &Models) {
                 view.last,
                 view.hard_state,
                 &proposals,
-                view.uncertain
+                view.uncertain,
+                view.released
             ),
-            (m.start, m.last(), m.hard, &m.proposals, m.uncertain),
+            (
+                m.start,
+                m.last(),
+                m.hard,
+                &m.proposals,
+                m.uncertain,
+                m.released
+            ),
             "group {group}"
         );
         assert_eq!(log.term(group, m.start.index).unwrap(), m.start.term);
@@ -341,7 +361,7 @@ fn conflicts_replace_the_suffix_and_starts_drop_the_prefix() {
         },
     );
     check(&log, &models);
-    // The log reaching the proposal's index ends it.
+    // The log reaching the proposal's index leaves it: only a release ends it.
     run(
         &log,
         &mut models,
@@ -350,8 +370,8 @@ fn conflicts_replace_the_suffix_and_starts_drop_the_prefix() {
             ..Update::default()
         },
     );
-    assert!(log.view(7).unwrap().unwrap().proposals.is_empty());
-    // A snapshot past the last entry leaves none.
+    assert_eq!(log.view(7).unwrap().unwrap().proposals.len(), 1);
+    // Nor does a snapshot past the last entry.
     run(
         &log,
         &mut models,
@@ -360,6 +380,53 @@ fn conflicts_replace_the_suffix_and_starts_drop_the_prefix() {
             ..Update::default()
         },
     );
+    check(&log, &models);
+    assert_eq!(log.view(7).unwrap().unwrap().proposals.len(), 1);
+    // A release below it leaves it; one through it ends it, and the log keeps the greater.
+    run(
+        &log,
+        &mut models,
+        Update {
+            released: Some(9),
+            ..Update::default()
+        },
+    );
+    assert_eq!(log.view(7).unwrap().unwrap().proposals.len(), 1);
+    run(
+        &log,
+        &mut models,
+        Update {
+            released: Some(12),
+            ..Update::default()
+        },
+    );
+    run(
+        &log,
+        &mut models,
+        Update {
+            released: Some(11),
+            ..Update::default()
+        },
+    );
+    let view = log.view(7).unwrap().unwrap();
+    assert!(view.proposals.is_empty());
+    assert_eq!(view.released, 12);
+    // One update whose entries reach a proposal it carries keeps both: a voter's holding the
+    // leader's append covers in the same write is still its vote.
+    run(
+        &log,
+        &mut models,
+        Update {
+            entries: Some(entries(21, &[3])),
+            proposals: vec![Proposal {
+                index: 21,
+                term: 3,
+                bytes: Vec::from(&b"q"[..]),
+            }],
+            ..Update::default()
+        },
+    );
+    assert_eq!(log.view(7).unwrap().unwrap().proposals.len(), 1);
     check(&log, &models);
     let file = closed(log);
     let (log, _) = Log::open(file, config(16, 8), ID).unwrap();
@@ -385,17 +452,6 @@ fn invalid_updates_are_refused_and_change_nothing() {
     assert!(matches!(
         refused(Update {
             entries: Some(entries(4, &[1])),
-            ..Update::default()
-        }),
-        LogError::Invalid { .. }
-    ));
-    assert!(matches!(
-        refused(Update {
-            proposals: vec![Proposal {
-                index: 2,
-                term: 1,
-                bytes: Vec::from(&b"x"[..]),
-            }],
             ..Update::default()
         }),
         LogError::Invalid { .. }
@@ -1816,11 +1872,14 @@ fn the_queue_bounds_every_submission_not_yet_answered() {
 
 /// An update of one entry whose records take `len` payload bytes.
 fn sized(first: u64, len: usize) -> Update {
-    let header = hyper_log::format::encoded_len(&hyper_log::format::Record::Entries {
-        group: 0,
-        first,
-        entries: &[(1, &[])],
-    })
+    let header = hyper_log::format::encoded_len(
+        &hyper_log::format::Record::Entries {
+            group: 0,
+            first,
+            entries: &[(1, &[])],
+        },
+        0,
+    )
     .unwrap();
     Update {
         entries: Some(Entries {
@@ -1896,11 +1955,14 @@ fn empty_entries_are_charged_their_records() {
         }),
         ..Update::default()
     };
-    let len = hyper_log::format::encoded_len(&hyper_log::format::Record::Entries {
-        group: 0,
-        first: 1,
-        entries: &[(1, &[])],
-    })
+    let len = hyper_log::format::encoded_len(
+        &hyper_log::format::Record::Entries {
+            group: 0,
+            first: 1,
+            entries: &[(1, &[])],
+        },
+        0,
+    )
     .unwrap();
     let cost = charged(len);
     let nothing = charged(0);

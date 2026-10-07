@@ -297,6 +297,9 @@ pub fn message_from(message: old::Message) -> Message {
         reject_hint: message.reject_hint,
         context: message.context,
         priority,
+        // raft-rs says nothing of a classic commit, and has no fast track whose holdings it
+        // would release.
+        classic: None,
     }
 }
 pub fn message_to(message: &Message) -> old::Message {

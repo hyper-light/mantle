@@ -95,6 +95,10 @@ impl<F: BlockFile + 'static> LogStore for Synchronous<F> {
         self.inner.proposals(into)
     }
 
+    fn released(&self) -> Result<u64, StorageError> {
+        self.inner.released()
+    }
+
     fn room(&self) -> bool {
         self.inner.room()
     }

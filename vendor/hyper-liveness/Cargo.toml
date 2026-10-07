@@ -5,21 +5,30 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/hyper-light/hyper-raft"
-rust-version = "1.98"
 publish = false
+rust-version = "1.98"
 
 [dependencies]
 hyper-timing = { path = "../hyper-timing" }
 
 [dev-dependencies]
-# Left out of the snapshot, which does not vendor them (vendor/UPSTREAM.md):
-# `hyper-swim`, `hyper-datagram`, `hyper-tokio`, `hyper-sim`, which this crate's own tests use.
 hyper-measure = { path = "../hyper-measure" }
 # The baselines of the cost benchmark: the Raft core mantle and focal run their per-group
 # heartbeats on, and slates' detector.
 hyper-raft = { path = "../hyper-raft" }
+# Not vendored here; hyper-raft's CI runs the tests that take it.
+# hyper-swim = { path = "../hyper-swim" }
+# The real-process test drives the crate as mantle and focal do: the sealed plane on hyper-tokio's
+# socket, its kernel receive stamps and the host's clock, on a current-thread runtime.
+# Not vendored here; hyper-raft's CI runs the tests that take it.
+# hyper-datagram = { path = "../hyper-datagram" }
+# Not vendored here; hyper-raft's CI runs the tests that take it.
+# hyper-tokio = { path = "../hyper-tokio" }
 # The real-process test's members keep their run as an owner does, a record kept whole.
 hyper-block = { path = "../hyper-block" }
+# The simulation's draws: SplitMix64 with an unbiased `below`, a named stream a source.
+# Not vendored here; hyper-raft's CI runs the tests that take it.
+# hyper-sim = { path = "../hyper-sim" }
 tokio = { version = "1.48", default-features = false, features = ["net", "time", "rt"] }
 tempfile = "3.20"
 proptest = "1.11"

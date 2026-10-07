@@ -697,6 +697,32 @@ impl Cluster {
                 })
         };
         let after = leader.core().raft.configuration();
+        // The leader counts by the newest configuration its log states, from the entry on
+        // (`docs/raft.md` §3.4): it decided `commit` by the one its log stated through its last
+        // entry then, at or past `commit`. Those are folded from the configuration it applied,
+        // along the entries it has not applied (a leader's log is never cut short).
+        let raft = &leader.core().raft;
+        let mut stated = raft.applied_configuration().clone();
+        let mut decided_by = Vec::new();
+        let applied = log.applied();
+        let last = log.last_index().expect("the leader's last entry");
+        if applied >= commit {
+            decided_by.push(stated.clone());
+        }
+        let entries = log
+            .slice(applied + 1, last + 1, u64::MAX)
+            .expect("the leader's entries past its applied index");
+        for entry in &entries {
+            if let Some(plan) =
+                hyper_raft::proto::Plan::of_entry(entry).expect("a change that decodes")
+                && let Ok(changed) = plan.apply(&stated)
+            {
+                stated = changed.configuration;
+            }
+            if entry.index >= commit {
+                decided_by.push(stated.clone());
+            }
+        }
         let disks: Vec<String> = before
             .voters()
             .iter()
@@ -712,7 +738,7 @@ impl Cluster {
             })
             .collect();
         assert!(
-            held_by(before) || held_by(after),
+            held_by(before) || held_by(after) || decided_by.iter().any(held_by),
             "leader {id}: sent commit {commit} of term {term} not durable on a majority of {:?} or {:?} (I3): {disks:?}",
             before.voters(),
             after.voters()

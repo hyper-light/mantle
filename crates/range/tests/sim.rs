@@ -1446,12 +1446,12 @@ fn run(seed: u64, members: u64) -> Ran {
 
 #[test]
 fn a_group_under_faults_is_linearizable_and_applies_every_put_once() {
-    // By default the recorded seeds 1 to 48 (docs/design/replica.md §5), among which a restart
-    // finds each kind of damage: seed 42 is the first whose member opens marked.
+    // By default the recorded seeds 1 to 58 (docs/design/replica.md §5), among which a restart
+    // finds each kind of damage: seed 58 is the first whose member opens marked.
     let seeds: u64 = std::env::var("MANTLE_SIM_SEEDS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(48);
+        .unwrap_or(58);
     let first: u64 = std::env::var("MANTLE_SIM_SEED")
         .ok()
         .and_then(|s| s.parse().ok())

@@ -5,14 +5,22 @@
 //! member knows of the others; all of it is equal, or the run fails naming
 //! its seed and its step.
 //!
-//! The two differ by decision in two places a schedule reaches. A leader
-//! that applies a change which leaves it no voter steps down here and
-//! leads on there: a run that comes to it ends there, and what this core
-//! does from there on is tested by itself (`group.rs`). A member told by
+//! The two differ by decision in four places a schedule reaches. A change
+//! of the configuration counts here from the moment a log holds its entry,
+//! and there from the moment its owner applies it (`docs/raft.md` §3.4:
+//! raft-rs's rule elects two leaders of a term, `docs/models/Reconfig.tla`):
+//! a run that comes to a change entering a log ends there, and what this
+//! core does from there on is tested by itself (`group.rs`, `check.rs`,
+//! `pipeline.rs` and hyper-check's model of the rule). A member told by
 //! its leader to campaign while it asks whether it could be elected
 //! campaigns here and ignores it there, where the leader then waits an
 //! election timeout for nothing: the schedule loses that message for both,
-//! and the run goes on.
+//! and the run goes on. Without check-quorum and pre-vote, a member answers
+//! an append or a heartbeat of an older term here and drops it there: the
+//! schedule loses that message for both too. An answer to a read round sent
+//! before the read it names was asked again under the same context confirms
+//! nothing here and the read and every one before it there: the schedule
+//! loses that message for both as well.
 #![allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -32,7 +40,7 @@ mod support;
 use std::collections::VecDeque;
 
 use hyper_raft::StateRole;
-use hyper_raft::proto::MessageType;
+use hyper_raft::proto::{Message, MessageType};
 use support::{Cluster, Mix, New, Old, Op, Replica, Report, Seeded, Settings};
 
 #[allow(
@@ -51,12 +59,19 @@ fn count(name: &str, default: u64) -> u64 {
 struct Reached {
     /// Members told to campaign while they asked whether they could.
     told_while_asking: u64,
+    /// Appends and heartbeats of an older term than their recipients', without check-quorum or
+    /// pre-vote: this core answers them, raft-rs does not, and the comparison loses them for both.
+    stale_leaders: u64,
     /// Reads that would have reached a leader before its term's first commit, lost for both.
     held_reads: u64,
+    /// Answers to a round sent before the read they name was asked again, lost for both.
+    older_rounds: u64,
     terms: u64,
     committed: u64,
     changes: u64,
     refused_changes: u64,
+    /// Runs that came to a change entering a log, where the cores part by decision.
+    changes_written: u64,
     snapshots: u64,
     reads: u64,
     rejections: u64,
@@ -105,8 +120,9 @@ impl Reached {
 enum End {
     /// Every step of the schedule was taken and compared.
     Ran,
-    /// The run came to the place the two differ by decision.
-    LeaderLeft(u64),
+    /// A change of the configuration entered a log at this step: the cores count it differently
+    /// from here by decision.
+    Changed(u64),
 }
 
 /// Whether `op` tells a member to campaign that asks whether it could.
@@ -125,6 +141,58 @@ fn tells_one_that_asks(group: &Cluster<New>, op: &Op) -> bool {
             let view = member.view();
             view.role == 3 && view.term == message.term
         })
+}
+
+/// Whether `op` delivers an append or a heartbeat of an older term than its recipient's to a group
+/// without check-quorum or pre-vote: this core answers it, so that the leader of the older term
+/// learns the newer one (thesis Figure 3.1), and raft-rs leaves that to vote requests, which never
+/// reach a leader the newer term's configuration names no voter (`docs/sim.md` §15.9).
+fn stale_leader(group: &Cluster<New>, op: &Op) -> bool {
+    let Op::Deliver {
+        at, lose: false, ..
+    } = op
+    else {
+        return false;
+    };
+    let Some(message) = group.net.get(*at) else {
+        return false;
+    };
+    !group.settings.check_quorum
+        && !group.settings.pre_vote
+        && matches!(
+            message.msg_type,
+            MessageType::MsgAppend | MessageType::MsgHeartbeat
+        )
+        && group
+            .peek(message.to)
+            .is_some_and(|member| member.view().term > message.term)
+}
+
+/// Whether `op` delivers to a leader an answer to a round sent before the read it names was asked
+/// again under the same context: this core takes it to confirm nothing, as it says nothing of who
+/// led when the read was asked; raft-rs takes it to confirm the read and every one before it, and
+/// the comparison loses it for both (`docs/raft.md` §3.3).
+fn answers_an_older_round(group: &Cluster<New>, op: &Op) -> bool {
+    let Op::Deliver {
+        at, lose: false, ..
+    } = op
+    else {
+        return false;
+    };
+    let Some(message) = group.net.get(*at) else {
+        return false;
+    };
+    if message.msg_type != MessageType::MsgHeartbeatResponse {
+        return false;
+    }
+    let Some((context, round)) = hyper_raft::read::ReadOnly::of_round(&message.context) else {
+        return false;
+    };
+    group.peek(message.to).is_some_and(|leader| {
+        leader.raw.raft.state() == StateRole::Leader
+            && leader.raw.raft.term() == message.term
+            && leader.raw.raft.round_confirms(context, round) == Some(false)
+    })
 }
 
 /// Whether `op` asks a read of a leader that has not committed an entry of its term, or delivers
@@ -262,9 +330,42 @@ fn explain(old: &[Report], new: &[Report]) -> String {
     lines.join("\n")
 }
 
+/// This core's read rounds carry their number after the read's context (`ReadOnly::round_context`),
+/// raft-rs's the context alone: a decided difference the comparison takes out.
+fn roundless(reports: &mut [Report]) {
+    for report in reports {
+        roundless_messages(&mut report.output.messages);
+    }
+}
+fn roundless_messages(messages: &mut [hyper_raft::proto::Message]) {
+    for message in messages.iter_mut().filter(|message| {
+        matches!(
+            message.msg_type,
+            MessageType::MsgHeartbeat | MessageType::MsgHeartbeatResponse
+        )
+    }) {
+        if let Some((context, _)) = hyper_raft::read::ReadOnly::of_round(&message.context) {
+            message.context = context.to_vec();
+        }
+    }
+}
+
 fn timeless(reports: &mut [Report]) {
     for report in reports {
         report.view.timeout = 0;
+    }
+}
+
+/// This core's messages as raft-rs's say them: raft-rs states no classic commit
+/// (`Message::classic`), which only the fast track reads, and none of these schedules runs it.
+fn classless(reports: &mut [Report], net: &mut [Message]) {
+    for report in reports {
+        for message in &mut report.output.messages {
+            message.classic = None;
+        }
+    }
+    for message in net {
+        message.classic = None;
     }
 }
 
@@ -303,6 +404,22 @@ fn run(seed: u64, steps: u64, settings: Settings, mix: Mix, reached: &mut Reache
                     lose: true,
                 }
             }
+            Op::Deliver { at, keep, .. } if stale_leader(&new, &op) => {
+                reached.stale_leaders += 1;
+                Op::Deliver {
+                    at,
+                    keep,
+                    lose: true,
+                }
+            }
+            Op::Deliver { at, keep, .. } if answers_an_older_round(&new, &op) => {
+                reached.older_rounds += 1;
+                Op::Deliver {
+                    at,
+                    keep,
+                    lose: true,
+                }
+            }
             Op::Deliver { at, keep, .. } if reads_before_first_commit(&new, &op) => {
                 reached.held_reads += 1;
                 Op::Deliver {
@@ -324,11 +441,21 @@ fn run(seed: u64, steps: u64, settings: Settings, mix: Mix, reached: &mut Reache
         let mut said_new = new.act(&op);
         timeless(&mut said_old);
         timeless(&mut said_new);
-        if said_new.iter().any(|report| report.output.leader_left)
-            || said_old.iter().any(|report| report.output.leader_left)
-        {
-            return End::LeaderLeft(step);
+        classless(&mut said_new, &mut new.net);
+        let changes = |reports: &[Report]| {
+            reports.iter().any(|report| {
+                report
+                    .output
+                    .persisted
+                    .iter()
+                    .any(|said| said.2 != hyper_raft::proto::EntryType::EntryNormal)
+            })
+        };
+        if changes(&said_new) || changes(&said_old) {
+            reached.changes_written += 1;
+            return End::Changed(step);
         }
+        roundless(&mut said_new);
         if said_old != said_new {
             let steps: Vec<&String> = trace.iter().collect();
             panic!(
@@ -337,7 +464,12 @@ fn run(seed: u64, steps: u64, settings: Settings, mix: Mix, reached: &mut Reache
                 explain(&said_old, &said_new)
             );
         }
-        assert_eq!(old.net, new.net, "seed {seed}, step {step}: the networks");
+        let mut net = new.net.clone();
+        roundless_messages(&mut net);
+        assert!(
+            old.net.iter().eq(net.iter()),
+            "seed {seed}, step {step}: the networks"
+        );
         reached.note(&op, &said_new);
         agree(&mut old, &new);
     }
@@ -405,13 +537,19 @@ fn bounded(name: &str, settings: Settings, mix: Mix) -> Reached {
     reached
 }
 
+/// The cores compared over the seeds. The schedules change no configuration: from a change's
+/// entry on the cores differ by decision ([`parting`]).
 fn campaign(name: &str, settings: Settings, mix: Mix) -> Reached {
+    let mix = Mix {
+        changes: false,
+        ..mix
+    };
     let mut reached = Reached::default();
     let seeds = count("HYPER_RAFT_SEEDS", 96);
     let steps = count("HYPER_RAFT_STEPS", 4_000);
     let first = count("HYPER_RAFT_SEED", 0);
     let mut ran = 0u64;
-    let mut left = 0u64;
+    let mut changed = 0u64;
     let mut compared = 0u64;
     for seed in first..first + seeds {
         match run(seed, steps, settings, mix, &mut reached) {
@@ -419,23 +557,19 @@ fn campaign(name: &str, settings: Settings, mix: Mix) -> Reached {
                 ran += 1;
                 compared += steps;
             }
-            End::LeaderLeft(step) => {
-                left += 1;
+            End::Changed(step) => {
+                changed += 1;
                 compared += step;
             }
         }
     }
     println!(
         "{name}: {seeds} schedules, {compared} steps compared; {ran} ran to their end, \
-         {left} ended where the cores differ by decision"
+         {changed} ended where a change entered a log"
     );
-    // Schedules that all end where the cores differ by decision, or elect and
-    // commit nothing, compare nothing of the rest: each must be reached; how
-    // often is reported, not judged against a picked share.
-    assert!(
-        ran > 0,
-        "{name}: every schedule ends where the cores differ"
-    );
+    // Schedules that elect and commit nothing compare nothing: each must be reached; how often
+    // is reported, not judged against a picked share.
+    assert_eq!(changed, 0, "{name}: a schedule changed the configuration");
     println!("{name}: {reached:?}");
     assert!(
         reached.terms > 0 && reached.committed > 0,
@@ -452,6 +586,31 @@ fn campaign(name: &str, settings: Settings, mix: Mix) -> Reached {
     reached
 }
 
+/// The schedules with changes of the configuration: the cores agree on every step until a
+/// change's entry enters a log, where they part by decision (the module's note).
+fn parting(name: &str, settings: Settings) -> Reached {
+    let mut reached = Reached::default();
+    let seeds = count("HYPER_RAFT_SEEDS", 96);
+    let steps = count("HYPER_RAFT_STEPS", 4_000);
+    let first = count("HYPER_RAFT_SEED", 0);
+    let mut compared = 0u64;
+    for seed in first..first + seeds {
+        compared += match run(seed, steps, settings, Mix::everything(), &mut reached) {
+            End::Ran => steps,
+            End::Changed(step) => step,
+        };
+    }
+    println!("{name}: {seeds} schedules, {compared} steps compared before a change: {reached:?}");
+    assert!(reached.changes_written > 0, "{name}: {reached:?}");
+    reached
+}
+
+#[test]
+fn the_cores_agree_until_a_change_enters_a_log() {
+    let reached = parting("shell", Settings::shell());
+    assert!(reached.terms > 0 && reached.committed > 0, "{reached:?}");
+}
+
 /// Every campaign again with this core's members given their `Ready`s in
 /// place (`RawNode::ready_in_place`): what they persist and apply is read
 /// where it is, and every step still says what `raft-rs` says.
@@ -466,7 +625,7 @@ fn the_cores_agree_with_readies_given_in_place() {
         place(Settings::shell()),
         Mix::everything(),
     );
-    assert!(shell.changes > 0 && shell.snapshots > 0 && shell.restarts > 0);
+    assert!(shell.snapshots > 0 && shell.restarts > 0);
     for (name, settings, mix) in [
         (
             "plain in place",
@@ -534,10 +693,6 @@ fn the_cores_agree_with_readies_given_in_place() {
 fn the_cores_agree_as_the_shell_sets_them() {
     let reached = campaign("shell", Settings::shell(), Mix::everything());
     assert!(
-        reached.changes > 0 && reached.refused_changes > 0,
-        "{reached:?}"
-    );
-    assert!(
         reached.snapshots > 0 && reached.rejections > 0,
         "{reached:?}"
     );
@@ -553,6 +708,8 @@ fn the_cores_agree_without_pre_vote_and_check_quorum() {
     };
     let reached = campaign("plain", settings, Mix::everything());
     assert!(reached.committed > 0);
+    // The third decided difference is reached, or the comparison says nothing of it.
+    assert!(reached.stale_leaders > 0, "{reached:?}");
 }
 
 #[test]
@@ -565,6 +722,8 @@ fn the_cores_agree_with_a_window_of_two_and_a_message_of_one_entry() {
     };
     let reached = campaign("narrow", settings, Mix::everything());
     assert!(reached.committed > 0);
+    // The fourth decided difference is reached, or the comparison says nothing of it.
+    assert!(reached.older_rounds > 0, "{reached:?}");
 }
 
 /// Pages of a hundred bytes and a window of four: a lagging member is

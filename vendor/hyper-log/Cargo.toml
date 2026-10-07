@@ -12,6 +12,8 @@ publish = false
 crc32c = "0.6"
 getrandom = "0.4"
 hyper-block = { path = "../hyper-block" }
+# Sealing at rest: a sealed log's records, session keys and framing MACs (hyper-raft docs/seal.md §5).
+hyper-seal = { path = "../hyper-seal" }
 # The histograms the log's statistics keep (`LogStats`, docs/durable.md §13.1).
 hyper-timing = { path = "../hyper-timing" }
 thiserror = "2.0"

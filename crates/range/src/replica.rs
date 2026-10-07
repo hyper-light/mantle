@@ -316,11 +316,11 @@ impl<L: LogStore, E: Engine> Replica<L, E> {
 
     /// Whether this member leads and every voter of its configuration has said its durable
     /// commit reaches the entry that made it (the core's answers carry the durable commit, R-6),
-    /// the leader counting its own. Configurations take effect as members apply them, and a
-    /// member applies a change only once its durable commit covers it, so until then a voter
-    /// still counts the members the change removed, after a restart as before, and losing the
-    /// leader could leave no quorum it can elect in; after, losing any one member leaves voters
-    /// that elect under this configuration (docs/design/replica.md §6).
+    /// the leader counting its own. A member counts by the newest configuration its log states
+    /// (hyper-raft `docs/raft.md` §3.4), so a voter whose log lacks the change still counts the
+    /// members it removed, and losing the leader could leave no quorum it can elect in; once
+    /// every voter's durable commit reaches the change, its log holds it, and losing any one
+    /// member leaves voters that elect under this configuration (docs/design/replica.md §6).
     pub fn configuration_known(&self) -> bool {
         self.shell.configuration_known()
     }

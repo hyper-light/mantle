@@ -82,11 +82,13 @@ impl Coverage {
 }
 
 /// One write a member issued.
+#[derive(Clone)]
 struct Write {
     number: u64,
     snapshot: Option<Snapshot>,
     entries: Vec<Entry>,
     proposals: Vec<Entry>,
+    released: Option<u64>,
     hard_state: Option<HardState>,
     /// What waits for this write to be durable.
     messages: Vec<Message>,
@@ -98,6 +100,7 @@ struct Write {
     vote: (u64, u64),
 }
 
+#[derive(Clone)]
 pub struct Lagged {
     pub node: New,
     depth: usize,
@@ -251,6 +254,7 @@ impl Lagged {
             snapshot,
             entries,
             proposals: ready.proposals().to_vec(),
+            released: ready.released(),
             hard_state: ready.hard_state().copied(),
             messages: ready.take_persisted_messages(),
             from,
@@ -380,8 +384,7 @@ impl Lagged {
             disk.install(snapshot);
         }
         disk.append(&write.entries);
-        disk.proposals.extend(write.proposals.iter().cloned());
-        disk.trim_proposals();
+        disk.hold(&write.proposals, write.released);
         if let Some(hard) = write.hard_state {
             // The commit a store records never goes back: a compaction since
             // the `Ready` was taken recorded a later one (`Disk::compact`).
@@ -658,6 +661,7 @@ impl Replica for Lagged {
                 .tracker()
                 .get(raft.id())
                 .and_then(|own| entry_at(own.matched)),
+            counted_by: raft.configuration().to_conf_state().ok()?,
         })
     }
     /// Everything applied becomes the snapshot, once the disk states a
@@ -677,6 +681,9 @@ impl Replica for Lagged {
         let data = self.node.app().encode();
         self.node.store_mut().0.compact(index, data);
         true
+    }
+    fn counts_by(&self) -> Option<hyper_raft::proto::ConfState> {
+        self.node.counts_by()
     }
     fn view(&self) -> View {
         self.node.view()

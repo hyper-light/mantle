@@ -9,9 +9,9 @@
 //! member that has not caught up.
 //!
 //! A replacement ends only once every voter of the final configuration has learned that it
-//! committed ([`crate::Replica::configuration_known`]): members apply a configuration when they
-//! apply its entry, and one that has not still counts the member removed, so losing another
-//! member before then could leave no quorum to elect a leader.
+//! committed ([`crate::Replica::configuration_known`]): a member counts by the newest
+//! configuration its log states, and one whose log lacks the entry still counts the member
+//! removed, so losing another member before then could leave no quorum to elect a leader.
 //!
 //! A [`Replacement`] is stateless: each call reads the configuration the leader has applied
 //! and says what to propose next. A proposal a leader drops, or one lost with a leader, is

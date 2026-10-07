@@ -7,9 +7,11 @@ license = "MIT"
 publish = false
 
 [dev-dependencies]
-# Left out of the snapshot, which does not vendor them (vendor/UPSTREAM.md):
-# `hyper-sim`, which this crate's own tests use.
 hyper-measure = { path = "../hyper-measure" }
+# Tests that need an Instant epoch take it from simulated time's one anchor, not the host clock
+# (docs/sim.md §3.2, §12.6).
+# Not vendored here; hyper-raft's CI runs the tests that take it.
+# hyper-sim = { path = "../hyper-sim" }
 proptest = "1.11"
 
 # A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside any consumer workspace.

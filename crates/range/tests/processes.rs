@@ -566,6 +566,10 @@ struct Supervisor {
     /// Messages sent in the last round, by their destination.
     wire: BTreeMap<u64, Vec<Message>>,
     orders: BTreeMap<u64, Vec<Order>>,
+    /// The replacement the operator runs. It is told to every member, and told again to one
+    /// started again inside its window: the order lived in the process that was killed, and that
+    /// member may be elected again and must then run the replacement to its end.
+    replacing: Option<Order>,
     rounds: u64,
 }
 
@@ -577,6 +581,7 @@ impl Supervisor {
             members: BTreeMap::new(),
             wire: BTreeMap::new(),
             orders: BTreeMap::new(),
+            replacing: None,
             rounds: 0,
         }
     }
@@ -684,6 +689,9 @@ impl Supervisor {
                     // Killed inside the window, and started again from its device.
                     self.kill(id);
                     self.start(id, None);
+                    if let Some(order) = self.replacing {
+                        self.order(id, order);
+                    }
                 }
                 other => panic!("member {id} said {other:?}"),
             }
@@ -741,14 +749,13 @@ fn replacement_killed_inside_a_window(target: u64, window: u64, lost: u64) -> bo
         s.kill(target);
         s.start(target, Some(window));
     }
+    let replace = Order::Replace {
+        failed: 3,
+        joining: 4,
+    };
+    s.replacing = Some(replace);
     for id in [1, 2, 4] {
-        s.order(
-            id,
-            Order::Replace {
-                failed: 3,
-                joining: 4,
-            },
-        );
+        s.order(id, replace);
     }
     let mut done = false;
     for _ in 0..4 * PATIENT_ROUNDS {

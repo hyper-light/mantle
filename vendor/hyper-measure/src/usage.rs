@@ -561,9 +561,12 @@ mod tests {
         }
     }
 
-    /// The account's user time is in nanoseconds: the kernel's one counter, read between two
-    /// getrusage reads truncated to microseconds, falls between them. Left in Mach ticks it would
-    /// be off by the timebase's ratio (125/3 on Apple silicon).
+    /// The account's user time is in nanoseconds, not Mach ticks, which differ by the timebase's
+    /// ratio (125/3 on Apple silicon). `proc_pid_rusage` and getrusage(2) read two accountings of
+    /// the same user time, which skew by less than a microsecond (macos-15-intel, 2026-10-05: the
+    /// account 387,867,412 ns, a later getrusage 387,866 us), so neither is held strictly inside
+    /// the other's reads; the account is held within a factor of two of them, which the ratio
+    /// would put it far outside.
     #[cfg(target_os = "macos")]
     #[test]
     fn user_time_is_in_nanoseconds() {
@@ -587,12 +590,12 @@ mod tests {
         let read = super::this().unwrap();
         let after = user_us();
         assert!(
-            before * 1_000 <= read.user_ns,
+            before * 1_000 / 2 <= read.user_ns,
             "{before} us, {} ns",
             read.user_ns
         );
         assert!(
-            read.user_ns < (after + 1) * 1_000,
+            read.user_ns < (after + 1) * 1_000 * 2,
             "{after} us, {} ns",
             read.user_ns
         );

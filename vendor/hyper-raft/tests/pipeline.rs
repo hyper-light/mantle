@@ -48,7 +48,13 @@
 )]
 mod support;
 
+use hyper_measure::alloc::Counting;
+use hyper_measure::cost::{Costs, measure};
+use hyper_measure::usage;
 use support::{Cluster, Coverage, Lagged, Mix, Op, Seeded, Settings, Step};
+
+#[global_allocator]
+static ALLOCATOR: Counting = Counting;
 
 #[allow(
     clippy::disallowed_methods,
@@ -110,23 +116,36 @@ fn schedule(
     mix: &Mix,
     crash: Option<u64>,
 ) -> (Cluster<Lagged>, u64) {
-    let by_length = settings.by_length;
     let mut group: Cluster<Lagged> = Cluster::new(5, voters, settings, seed);
     group.stop_who_left = true;
     let mut rng = Seeded(seed);
     let mut persisted = 0u64;
     for _ in 0..steps {
-        let op = group.choose(&mut rng, mix);
-        let reports = group.act(&op);
-        if let Op::Persist(member, _) = op
-            && reports.iter().any(|report| report.accepted == Some(true))
-        {
+        if let Some(member) = persistence_step(&mut group, &mut rng, mix) {
             if crash == Some(persisted) {
                 group.act(&Op::Restart(member));
             }
             persisted += 1;
         }
     }
+    (settled(group, seed, crash), persisted)
+}
+
+/// One step of the schedule: the member whose persistence step it was, if it did something.
+fn persistence_step(group: &mut Cluster<Lagged>, rng: &mut Seeded, mix: &Mix) -> Option<u64> {
+    let op = group.choose(rng, mix);
+    let reports = group.act(&op);
+    match op {
+        Op::Persist(member, _) if reports.iter().any(|report| report.accepted == Some(true)) => {
+            Some(member)
+        }
+        _ => None,
+    }
+}
+
+/// The group through its liveness phase, and held to what every schedule's end is held to.
+fn settled(mut group: Cluster<Lagged>, seed: u64, crash: Option<u64>) -> Cluster<Lagged> {
+    let by_length = group.settings.by_length;
     if group.settles() {
         group.check_kept();
     } else {
@@ -135,7 +154,7 @@ fn schedule(
         // The rule's argument is by the log's precedence. By raft-rs's
         // precedence of length a voter of higher priority refuses a candidate
         // whose log is shorter however much more current, and may be one the
-        // group could not elect instead (`Precedence::Length`): with marks, a
+        // group could not elect instead (`Config::raft_rs_precedence`): with marks, a
         // group with every member up may then wait with a member the rule
         // admits. Seed 740 of 960: the voter of the longest log, of an older
         // term, refused the candidate of the later term for priority, the
@@ -155,7 +174,70 @@ fn schedule(
         group.deposed, 0,
         "seed {seed}: a member led a group it left"
     );
-    (group, persisted)
+    group
+}
+
+/// The schedule of `seed` run once, with a crash at each of its persistence steps that did
+/// something enumerated by fork (`hyper_check::strategy::fork`, `docs/sim.md` §3.7): at each, the
+/// group and its draws are cloned, the member crashed in the clone, and the clone run through the
+/// rest of the schedule and its liveness phase, one clone alive at a time. Gives each crash
+/// point's group, in order, and the trunk's steps.
+fn forked(
+    settings: Settings,
+    voters: &[u64],
+    seed: u64,
+    steps: u64,
+    mix: &Mix,
+    mut each: impl FnMut(u64, Cluster<Lagged>),
+) -> u64 {
+    let mut group: Cluster<Lagged> = Cluster::new(5, voters, settings, seed);
+    group.stop_who_left = true;
+    let mut world = (group, Seeded(seed), 0u64);
+    let mut point = 0u64;
+    let trunk = hyper_check::strategy::fork::each_point(
+        &mut world,
+        steps,
+        |(group, rng, taken)| {
+            *taken += 1;
+            Some(persistence_step(group, rng, mix))
+        },
+        |(mut group, mut rng, taken), member| {
+            group.act(&Op::Restart(member));
+            for _ in taken..steps {
+                persistence_step(&mut group, &mut rng, mix);
+            }
+            let crash = point;
+            point += 1;
+            each(crash, settled(group, seed, Some(crash)));
+        },
+    );
+    trunk.steps
+}
+
+/// What a crash point's run ended in, as the replay and the fork are compared: every member's
+/// disk and view, what was committed, the persistence steps' coverage, and the faults, waits and
+/// repairs counted.
+fn outcome(group: &Cluster<Lagged>) -> String {
+    let members: Vec<String> = group
+        .ids()
+        .into_iter()
+        .map(|id| {
+            format!(
+                "{:?} {:?}",
+                group.disk(id),
+                group.peek(id).map(support::Replica::view)
+            )
+        })
+        .collect();
+    format!(
+        "{members:?} {:?} {:?} {} {} {} {:?}",
+        group.chosen,
+        group.coverage(),
+        group.faults,
+        group.waits,
+        group.repaired,
+        group.incarnations
+    )
 }
 
 /// Of a hundred chances to make a leader's write durable, how many are
@@ -403,7 +485,9 @@ fn a_crash_at_every_persistence_step_with_faults_at_rest_loses_nothing_acknowled
     crashes_at_every_persistence_step(true);
 }
 
-fn crashes_at_every_persistence_step(faults_at_rest: bool) {
+/// The settings and mixes the crash enumerations run, and the seeds whose schedules they take:
+/// with faults at rest, the first seeds whose schedule suffers one.
+fn crash_campaigns(faults_at_rest: bool) -> Vec<(Settings, Mix, Vec<u64>)> {
     // Eleven: the fewest from seed zero at which every variant below, on ticks
     // and by suspicion, holds a change behind the fence at some crash
     // (measured 2026-10-04). It was four until a read asked of a new leader
@@ -416,6 +500,7 @@ fn crashes_at_every_persistence_step(faults_at_rest: bool) {
     // The second has a leader apply its own entries before its write of them
     // is durable: a crash between the two (`docs/durable.md` §12). Each on
     // ticks and by suspicion.
+    let mut campaigns = Vec::new();
     for (apply_unpersisted, suspicion) in
         [(false, false), (true, false), (false, true), (true, true)]
     {
@@ -429,44 +514,88 @@ fn crashes_at_every_persistence_step(faults_at_rest: bool) {
             corrupt,
             ..mix_for(&settings, 0)
         };
-        let mut crashes = 0u64;
-        let mut lost = 0u64;
-        let mut faults = 0u64;
-        let mut reached = Coverage::default();
         // With faults at rest, the first seeds whose schedule suffers one:
         // a fault finds a disk that holds entries only between compactions,
         // and one schedule in twenty did (measured, from seed zero), so the
         // search is bounded at sixty-four times as many.
-        let mut taken = 0;
+        let mut taken = Vec::new();
         for seed in 0..seeds * 64 {
-            if taken == seeds {
+            if taken.len() as u64 == seeds {
                 break;
             }
-            let (whole, events) = schedule(settings, &[1, 2, 3], seed, steps, &mix, None);
+            let (whole, _) = schedule(settings, &[1, 2, 3], seed, steps, &mix, None);
             if faults_at_rest && whole.faults == 0 {
                 continue;
             }
-            taken += 1;
-            for at in 0..events {
-                let (group, _) = schedule(settings, &[1, 2, 3], seed, steps, &mix, Some(at));
+            taken.push(seed);
+        }
+        assert_eq!(
+            taken.len() as u64,
+            seeds,
+            "seeds whose schedule suffered a fault at rest"
+        );
+        campaigns.push((settings, mix, taken));
+    }
+    campaigns
+}
+
+fn crashes_at_every_persistence_step(faults_at_rest: bool) {
+    let steps = count("HYPER_RAFT_CRASH_STEPS", 400);
+    for (settings, mix, seeds) in crash_campaigns(faults_at_rest) {
+        let mut crashes = 0u64;
+        let mut lost = 0u64;
+        let mut faults = 0u64;
+        let mut reached = Coverage::default();
+        for seed in seeds {
+            forked(settings, &[1, 2, 3], seed, steps, &mix, |_, group| {
                 crashes += 1;
                 faults += group.faults;
                 let coverage = group.coverage();
                 lost += coverage.lost;
                 reached.add(coverage);
-            }
+            });
         }
+        let (apply_unpersisted, suspicion) = (settings.apply_unpersisted, settings.suspicion);
         println!(
             "applying before durable {apply_unpersisted}, by suspicion {suspicion}: {crashes} crashes, one at each persistence step, lost {lost} writes out, {faults} faults at rest; {reached:?}"
-        );
-        assert_eq!(
-            taken, seeds,
-            "seeds whose schedule suffered a fault at rest"
         );
         assert!(!faults_at_rest || faults > 0, "{faults} {crashes}");
         assert!(crashes > 0 && lost > 0, "{crashes} {lost}");
         assert!(reached.answers > 0 && reached.fenced > 0, "{reached:?}");
         assert!(!apply_unpersisted || reached.unpersisted > 0, "{reached:?}");
+    }
+}
+
+/// The gate of crash enumeration by fork (`docs/sim.md` §9, S-5): every crash point of every
+/// schedule the enumerations above take ends, forked, exactly as the replay of its schedule with
+/// the crash at that point ends (every member's disk and view, what was committed, the coverage,
+/// the faults and waits), with and without faults at rest; and the fork takes the schedule's
+/// steps once where the replay took them once a crash point.
+#[test]
+fn a_crash_point_forked_ends_as_its_replay_ends() {
+    let steps = count("HYPER_RAFT_CRASH_STEPS", 400);
+    for faults_at_rest in [false, true] {
+        let mut points = 0u64;
+        let (mut replayed, mut trunk) = (0u64, 0u64);
+        for (settings, mix, seeds) in crash_campaigns(faults_at_rest) {
+            for seed in seeds {
+                trunk += forked(settings, &[1, 2, 3], seed, steps, &mix, |crash, group| {
+                    let (replay, _) =
+                        schedule(settings, &[1, 2, 3], seed, steps, &mix, Some(crash));
+                    replayed += steps;
+                    points += 1;
+                    assert_eq!(
+                        outcome(&group),
+                        outcome(&replay),
+                        "seed {seed}, crash {crash}: the fork and the replay part"
+                    );
+                });
+            }
+        }
+        println!(
+            "faults at rest {faults_at_rest}: {points} crash points, each forked as its replay ends; the forks' trunks took {trunk} steps, the replays' prefixes and rests {replayed}"
+        );
+        assert!(points > 0);
     }
 }
 
@@ -511,4 +640,36 @@ fn a_write_durable_and_never_heard_of_is_held_after_a_crash() {
     assert_eq!(disk.entries.last().unwrap().data, b"kept");
     assert_eq!(group.coverage().lost, 1);
     assert!(group.settles());
+}
+
+/// What enumerating a schedule's crash points costs, by fork and by replay, p50 / p99 / max over
+/// the schedules the enumerations take (each a seed of a variant, 44 in all), one test at a time:
+/// `docs/benchmarks.md`, "hyper-check's strategies (S-5)".
+#[test]
+#[ignore = "a measurement, in release, one test at a time"]
+fn crash_enumeration_costs() {
+    let steps = count("HYPER_RAFT_CRASH_STEPS", 400);
+    let (mut forks, mut replays) = (Costs::new(), Costs::new());
+    let mut points = 0u64;
+    for (settings, mix, seeds) in crash_campaigns(false) {
+        for seed in seeds {
+            let ((), cost) = measure(|| {
+                forked(settings, &[1, 2, 3], seed, steps, &mix, |_, _| points += 1);
+            });
+            forks.add(&cost);
+            let ((), cost) = measure(|| {
+                let (_, events) = schedule(settings, &[1, 2, 3], seed, steps, &mix, None);
+                for at in 0..events {
+                    schedule(settings, &[1, 2, 3], seed, steps, &mix, Some(at));
+                }
+            });
+            replays.add(&cost);
+        }
+    }
+    println!(
+        "{points} crash points; load {:.1}\nby fork, a schedule's enumeration:\n{}\nby replay:\n{}",
+        usage::load().unwrap_or(f64::NAN),
+        forks.report(),
+        replays.report()
+    );
 }

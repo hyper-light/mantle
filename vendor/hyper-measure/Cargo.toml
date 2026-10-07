@@ -16,20 +16,7 @@ libc = "0.2.189"
 [target.'cfg(windows)'.dependencies]
 # K32GetProcessMemoryInfo and PROCESS_MEMORY_COUNTERS (psapi.h), declared by Microsoft's metadata
 # rather than by hand.
-windows-sys = { version = "0.61", features = [
-  "Win32_Foundation",
-  "Win32_Networking_WinSock",
-  "Win32_Security",
-  "Win32_System_Diagnostics_ToolHelp",
-  "Win32_Storage_FileSystem",
-  "Win32_System_IO",
-  "Win32_System_Performance",
-  "Win32_System_Ioctl",
-  "Win32_System_ProcessStatus",
-  "Win32_System_SystemInformation",
-  "Win32_System_Threading",
-  "Win32_System_WindowsProgramming",
-] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Kernel", "Win32_System_Performance", "Win32_System_Ioctl", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
 
 # A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside any consumer workspace.
 [workspace]

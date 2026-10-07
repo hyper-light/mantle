@@ -23,19 +23,7 @@ thiserror = "2.0"
 rustix = { version = "1.1", features = ["fs", "system", "param", "process", "time"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = [
-  "Win32_Foundation",
-  "Win32_Security",
-  "Win32_System_Diagnostics_ToolHelp",
-  "Win32_Storage_FileSystem",
-  "Win32_System_IO",
-  "Win32_System_Performance",
-  "Win32_System_Ioctl",
-  "Win32_System_ProcessStatus",
-  "Win32_System_SystemInformation",
-  "Win32_System_Threading",
-  "Win32_System_WindowsProgramming",
-] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Kernel", "Win32_System_Performance", "Win32_System_Ioctl", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
 
 [dev-dependencies]
 proptest = "1.11"

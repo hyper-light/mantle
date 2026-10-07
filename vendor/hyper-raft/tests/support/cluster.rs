@@ -12,9 +12,28 @@ use hyper_raft::proto::{
 };
 
 use super::{
-    Coverage, Disk, Fault, Output, ROUND_NS, Replica, SPAN_NS, Said, Seeded, Settings, Step, Store,
+    Coverage, Disk, Draws, Fault, Output, ROUND_NS, Replica, SPAN_NS, Said, Settings, Step, Store,
     TICK_NS, View, members, votes,
 };
+
+/// [`Draws`] as an object, for the closures `choose` and `change` share draws through.
+trait DrawsDyn {
+    fn pick_u64(&mut self, from: &[u64]) -> Option<u64>;
+    fn chance_dyn(&mut self, percent: u64) -> bool;
+    fn below_dyn(&mut self, bound: u64) -> u64;
+}
+
+impl<D: Draws> DrawsDyn for D {
+    fn pick_u64(&mut self, from: &[u64]) -> Option<u64> {
+        self.pick(from)
+    }
+    fn chance_dyn(&mut self, percent: u64) -> bool {
+        self.chance(percent)
+    }
+    fn below_dyn(&mut self, bound: u64) -> u64 {
+        self.below(bound)
+    }
+}
 
 /// The most messages the network holds; the oldest is lost for a new one.
 const NETWORK: usize = 2048;
@@ -148,11 +167,13 @@ impl<R> Observer<R> for () {}
 
 /// A member: running, and owning its disk, or stopped, and the cluster
 /// holds the disk until it opens again.
+#[derive(Clone)]
 pub enum Member<R> {
     Up(R),
     Down(Box<Store>),
 }
 
+#[derive(Clone)]
 pub struct Cluster<R> {
     members: Vec<Member<R>>,
     /// The members the group has, in and out of its configuration: what each states as the
@@ -208,6 +229,13 @@ pub struct Cluster<R> {
     marked_since: BTreeMap<u64, u64>,
     /// Operations acted on.
     steps: u64,
+    /// Snapshots the network lost at its bound, by sender and recipient, whose senders are yet
+    /// to be told.
+    evicted: Vec<(u64, u64)>,
+    /// The most operations the liveness phase may act before the run is reported unconverged
+    /// (`docs/sim.md` §4.2: a group that keeps moving without converging is ended by the run's
+    /// budget, never passed); `None` for none, where a harness has not stated one.
+    pub liveness_bound: Option<u64>,
 }
 
 impl<R: Replica> Cluster<R> {
@@ -243,6 +271,8 @@ impl<R: Replica> Cluster<R> {
             marked_steps: 0,
             marked_since: BTreeMap::new(),
             steps: 0,
+            evicted: Vec::new(),
+            liveness_bound: None,
         };
         for id in 1..=count {
             let node = cluster.open(id, Store::new(boot.clone()));
@@ -402,14 +432,20 @@ impl<R: Replica> Cluster<R> {
         }
         for message in &output.messages {
             if self.net.len() >= NETWORK {
-                self.net.remove(0);
+                let lost = self.net.remove(0);
+                if lost.msg_type == MessageType::MsgSnapshot {
+                    // Its sender is told the transfer failed, as an owner whose transport
+                    // dropped it is: without the word, the leader waits on the snapshot for
+                    // ever (the swarm's fast seed 2,396, `docs/sim.md` §15.9).
+                    self.evicted.push((lost.from, lost.to));
+                }
             }
             self.net.push(message.clone());
         }
-        let conf = self.disk(member).conf.clone();
-        if self.stop_who_left && view.role == 2 && !votes(&conf, member) {
-            // It leads a group it is no voter of, and unwinds when it next
-            // commits. Its owner stops it, and it opens as what it is.
+        if self.stop_who_left && view.role == 2 && !view.promotable && view.applied >= view.commit {
+            // It leads a group that no longer needs it, and applied all it committed: the
+            // configuration it counts by names it no voter (hyper-raft's newest in its log, once
+            // committed; raft-rs's applied). Its owner stops it, and it opens as what it is.
             self.deposed += 1;
             self.restart(member);
         }
@@ -582,6 +618,17 @@ impl<R: Replica> Cluster<R> {
                 reports.extend(self.act(&Op::Restart(*id)));
             }
         }
+        // Each snapshot the network lost at its bound is reported failed to its sender, as a
+        // delivery that loses one is; a report may lose more, at most the network's bound of them.
+        for _ in 0..NETWORK {
+            let Some((from, to)) = self.evicted.pop() else {
+                break;
+            };
+            if let Some(node) = self.node(from) {
+                node.snapshot_status(to, false);
+                reports.push(self.report(from, None));
+            }
+        }
         if R::LAGGED && !self.settings.judged {
             self.check_durable();
         }
@@ -623,7 +670,7 @@ impl<R: Replica> Cluster<R> {
             let Some(committed) = &led.committed else {
                 continue;
             };
-            let conf = self.disk(id).conf.clone();
+            let conf = led.counted_by.clone();
             let before = self.counted_by.insert(id, conf.clone());
             let last = self.checked.insert(id, (led.term, committed.index));
             // What it knew committed when it was elected it did not decide,
@@ -656,7 +703,7 @@ impl<R: Replica> Cluster<R> {
         }
     }
 
-    fn change(&self, rng: &mut Seeded, leader: u64, mix: &Mix) -> ConfChangeV2 {
+    fn change(&self, rng: &mut impl Draws, leader: u64, mix: &Mix) -> ConfChangeV2 {
         let conf = self.disk(leader).conf.clone();
         let joint = !conf.voters_outgoing.is_empty();
         if joint && rng.chance(70) {
@@ -687,14 +734,14 @@ impl<R: Replica> Cluster<R> {
             .collect();
         let voters: Vec<u64> = conf.voters.iter().copied().filter(spared).collect();
         let inside: Vec<u64> = held.iter().copied().filter(spared).collect();
-        let one = |rng: &mut Seeded| -> Option<ConfChangeSingle> {
-            let (kind, member) = match rng.below(6) {
-                0 => (ConfChangeType::AddLearnerNode, rng.pick(&outside)?),
-                1 => (ConfChangeType::AddNode, rng.pick(&outside)?),
-                2 => (ConfChangeType::AddNode, rng.pick(&conf.learners)?),
-                3 => (ConfChangeType::RemoveNode, rng.pick(&inside)?),
-                4 => (ConfChangeType::AddLearnerNode, rng.pick(&voters)?),
-                _ => (ConfChangeType::RemoveNode, rng.pick(&conf.learners)?),
+        let one = |rng: &mut dyn DrawsDyn| -> Option<ConfChangeSingle> {
+            let (kind, member) = match rng.below_dyn(6) {
+                0 => (ConfChangeType::AddLearnerNode, rng.pick_u64(&outside)?),
+                1 => (ConfChangeType::AddNode, rng.pick_u64(&outside)?),
+                2 => (ConfChangeType::AddNode, rng.pick_u64(&conf.learners)?),
+                3 => (ConfChangeType::RemoveNode, rng.pick_u64(&inside)?),
+                4 => (ConfChangeType::AddLearnerNode, rng.pick_u64(&voters)?),
+                _ => (ConfChangeType::RemoveNode, rng.pick_u64(&conf.learners)?),
             };
             Some(ConfChangeSingle {
                 change_type: kind,
@@ -724,16 +771,16 @@ impl<R: Replica> Cluster<R> {
     }
 
     /// The next step of the schedule.
-    pub fn choose(&mut self, rng: &mut Seeded, mix: &Mix) -> Op {
+    pub fn choose(&mut self, rng: &mut impl Draws, mix: &Mix) -> Op {
         let up = self.up();
         let all = self.ids();
         let leaders = self.leaders_now();
-        let any = |rng: &mut Seeded| rng.pick(&up).unwrap_or(1);
+        let any = |rng: &mut dyn DrawsDyn| rng.pick_u64(&up).unwrap_or(1);
         // Where a leader is wanted and none is known, any member is asked:
         // what one that does not lead does with it is compared as well.
-        let leader = |rng: &mut Seeded| {
-            if rng.chance(90) {
-                rng.pick(&leaders).unwrap_or_else(|| any(rng))
+        let leader = |rng: &mut dyn DrawsDyn| {
+            if rng.chance_dyn(90) {
+                rng.pick_u64(&leaders).unwrap_or_else(|| any(rng))
             } else {
                 any(rng)
             }
@@ -942,7 +989,17 @@ impl<R: Replica> Cluster<R> {
         }
         .expect("a quiet period within u64");
         let mut progress = Progress::new(quiet, 0);
+        let began = self.steps;
+        let spent = |cluster: &Self| {
+            cluster
+                .liveness_bound
+                .is_some_and(|bound| cluster.steps - began > bound)
+        };
         for round in 0u64.. {
+            if spent(self) {
+                println!("the liveness phase passed its bound at round {round}: unconverged");
+                break;
+            }
             for id in self.up() {
                 let view = self.peek(id).map(|node| node.view()).expect("up");
                 let at = Position {
@@ -956,16 +1013,17 @@ impl<R: Replica> Cluster<R> {
             if progress.stuck(round) {
                 break;
             }
-            // A member that joined after the leader's snapshot was taken is
-            // not named by it and discards it: it is seeded by a snapshot
-            // taken since, which is the owner's to take.
+            // A member of raft-rs that joined after the leader's snapshot was
+            // taken is not named by it and discards it (this core takes it,
+            // `docs/raft.md` §3.4): it is seeded by a snapshot taken since,
+            // which is the owner's to take.
             if round % 16 == 15 {
                 for leader in self.leaders_now() {
                     self.act_observed(observer, &Op::Compact(leader));
                 }
             }
 
-            while !self.net.is_empty() {
+            while !self.net.is_empty() && !spent(self) {
                 self.act_observed(
                     observer,
                     &Op::Deliver {
@@ -1064,9 +1122,12 @@ impl<R: Replica> Cluster<R> {
             .into_iter()
             .filter(|candidate| {
                 let disk = self.disk(*candidate);
-                let conf = &disk.conf;
+                let node = self.peek(*candidate);
+                let counted = node.and_then(Replica::counts_by);
+                let conf = counted.as_ref().unwrap_or(&disk.conf);
+                let stands = node.map_or(votes(conf, *candidate), |node| node.view().promotable);
                 let marked = disk.mark().is_some();
-                if !votes(conf, *candidate) || (marked && self.settings.fast) {
+                if !stands || (marked && self.settings.fast) {
                     return false;
                 }
                 let last = disk.last_index();

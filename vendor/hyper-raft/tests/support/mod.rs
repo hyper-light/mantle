@@ -37,6 +37,32 @@ impl Seeded {
     }
 }
 
+/// Where a schedule's draws come from: a seed's SplitMix64 ([`Seeded`]), or a run's decision tape
+/// played back, mutated or shrunk (`hyper_check::strategy::tape`). Every draw is a word reduced to
+/// its bound by the high half of their product, so a tape's word is read as the seed's would be.
+pub trait Draws {
+    fn next(&mut self) -> u64;
+    fn below(&mut self, bound: u64) -> u64 {
+        ((u128::from(self.next()) * u128::from(bound)) >> 64) as u64
+    }
+    fn chance(&mut self, percent: u64) -> bool {
+        self.below(100) < percent
+    }
+    fn pick<T: Copy>(&mut self, from: &[T]) -> Option<T> {
+        if from.is_empty() {
+            None
+        } else {
+            Some(from[self.below(from.len() as u64) as usize])
+        }
+    }
+}
+
+impl Draws for Seeded {
+    fn next(&mut self) -> u64 {
+        Seeded::next(self)
+    }
+}
+
 pub fn sorted(mut state: ConfState) -> ConfState {
     state.voters.sort_unstable();
     state.learners.sort_unstable();
@@ -80,6 +106,8 @@ pub struct Disk {
     pub lost: Option<hyper_raft::Lost>,
     /// What the member approved by itself.
     pub proposals: Vec<Entry>,
+    /// The greatest index a `Ready` released what the member approved by itself through.
+    pub released: u64,
 }
 
 /// An entry's checksum: FNV-1a over everything it states.
@@ -150,8 +178,6 @@ impl Disk {
             self.entries.push(entry.clone());
             self.sums.push(sum(entry));
         }
-        let last = self.last_index();
-        self.proposals.retain(|held| held.index > last);
     }
     /// Keeps the entries a member gave up once durable, as they are: what
     /// they replace is cut first, as `append` cuts it.
@@ -168,12 +194,20 @@ impl Disk {
         self.sums.truncate(at);
         self.sums.extend(entries.iter().map(sum));
         self.entries.extend(entries);
-        self.trim_proposals();
     }
-    /// What the log reached is approved by itself no more.
-    pub fn trim_proposals(&mut self) {
-        let last = self.last_index();
-        self.proposals.retain(|held| held.index > last);
+    /// Takes what a `Ready` gave of what the member approved by itself: what
+    /// it released goes first ([`hyper_raft::Ready::released`]), then each
+    /// proposal given replaces the one held at its index. Nothing else drops
+    /// one: not the log reaching it, not a snapshot.
+    pub fn hold(&mut self, given: &[Entry], released: Option<u64>) {
+        if let Some(released) = released {
+            self.proposals.retain(|held| held.index > released);
+            self.released = self.released.max(released);
+        }
+        for entry in given {
+            self.proposals.retain(|held| held.index != entry.index);
+            self.proposals.push(entry.clone());
+        }
     }
     pub fn install(&mut self, snapshot: &Snapshot) {
         self.install_owned(snapshot.clone());
@@ -186,7 +220,6 @@ impl Disk {
         self.entries.clear();
         self.sums.clear();
         self.snapshot = snapshot;
-        self.proposals.retain(|held| held.index > metadata.index);
     }
     /// Everything through `index` becomes the snapshot.
     pub fn compact(&mut self, index: u64, data: Vec<u8>) {
@@ -391,6 +424,7 @@ impl hyper_raft::Storage for Store {
             hard_state: disk.hard_state,
             configuration: disk.conf.clone(),
             proposals: disk.proposals.clone(),
+            released: disk.released,
         })
     }
     fn entries(
@@ -463,6 +497,8 @@ pub struct Led {
     pub term: u64,
     pub committed: Option<Entry>,
     pub own: Option<Entry>,
+    /// The configuration the leader counts commitment by: the newest its log states.
+    pub counted_by: ConfState,
 }
 
 /// A member's persistence, one step at a time ([`Lagged`]).
@@ -546,9 +582,6 @@ pub struct Output {
     pub displaced: Vec<Said>,
     /// A change that could not be applied, by the index of its entry.
     pub refused: Vec<u64>,
-    /// A leader applied a change that leaves it no voter. The two cores
-    /// differ from here by decision: this one steps down.
-    pub leader_left: bool,
 }
 
 pub type Member = (u64, u64, u64, u8, bool, u64, u64, bool, usize, u64);
@@ -590,7 +623,8 @@ pub struct Settings {
     pub max_committed_size_per_ready: u64,
     pub check_quorum: bool,
     pub pre_vote: bool,
-    /// Whether priority yields to a longer log alone, as in `raft-rs`.
+    /// Whether priority yields to a longer log alone, as in `raft-rs`
+    /// (`Config::raft_rs_precedence`, the tests' build alone).
     pub by_length: bool,
     /// Whether a leader sends a round of heartbeats for each read as it is
     /// asked, as in `raft-rs`.
@@ -784,6 +818,11 @@ pub trait Replica: Sized {
     fn led(&self) -> Option<Led> {
         None
     }
+    /// The configuration the member counts elections and commitment by, where it is not the one
+    /// its disk states applied: hyper-raft's, the newest its log holds (`docs/raft.md` §3.4).
+    fn counts_by(&self) -> Option<ConfState> {
+        None
+    }
     fn view(&self) -> View;
     fn app(&self) -> App;
     /// Everything applied becomes the snapshot. False when there is
@@ -870,7 +909,6 @@ impl Old {
             let Some(change) = change_of(&entry) else {
                 continue;
             };
-            let led = self.raw.raft.state == raft::StateRole::Leader;
             let applied = match change {
                 Ok(change) => self.raw.apply_conf_change(&convert::change_to(&change)),
                 Err(change) => self.raw.apply_conf_change(&convert::single_to(&change)),
@@ -878,9 +916,6 @@ impl Old {
             match applied {
                 Ok(conf) => {
                     let conf = sorted(convert::conf_from(conf));
-                    if led && !votes(&conf, self.raw.raft.id) {
-                        output.leader_left = true;
-                    }
                     self.raw.mut_store().0.conf = conf.clone();
                     output.confs.push(conf);
                 }
@@ -1150,6 +1185,7 @@ impl Old {
 // ---------------------------------------------------------------------
 // hyper-raft.
 
+#[derive(Clone)]
 pub struct New {
     pub raw: hyper_raft::RawNode<Store>,
     app: App,
@@ -1174,16 +1210,12 @@ fn apply_to(
         let Some(change) = change_of(&entry) else {
             continue;
         };
-        let led = raw.raft.state() == hyper_raft::StateRole::Leader;
         let applied = match change {
             Ok(change) => raw.apply_conf_change(&change),
             Err(change) => raw.apply_conf_change_v1(&change),
         };
         match applied {
             Ok(conf) => {
-                if led && !votes(&conf, raw.raft.id()) {
-                    output.leader_left = true;
-                }
                 raw.store_mut().0.conf = conf.clone();
                 output.confs.push(conf);
             }
@@ -1276,11 +1308,7 @@ impl Replica for New {
             max_committed_size_per_ready: settings.max_committed_size_per_ready,
             check_quorum: settings.check_quorum,
             pre_vote: settings.pre_vote,
-            precedence: if settings.by_length {
-                hyper_raft::Precedence::Length
-            } else {
-                hyper_raft::Precedence::Log
-            },
+            raft_rs_precedence: settings.by_length,
             read_rounds: if settings.round_each {
                 hyper_raft::ReadRounds::Each
             } else {
@@ -1425,13 +1453,12 @@ impl Replica for New {
                 }
                 output.persisted.extend(persist.entries.iter().map(said));
                 let disk = &mut persist.store.0;
-                disk.proposals.extend(ready.proposals().iter().cloned());
-                disk.trim_proposals();
+                disk.hold(ready.proposals(), ready.released());
             } else {
                 output.persisted.extend(ready.entries().iter().map(said));
                 let disk = &mut self.raw.store_mut().0;
-                disk.proposals.extend(ready.proposals().iter().cloned());
                 disk.append(ready.entries());
+                disk.hold(ready.proposals(), ready.released());
             }
             output.displaced.extend(ready.displaced().iter().map(said));
             if let Some(hard) = ready.hard_state() {
@@ -1488,6 +1515,9 @@ impl Replica for New {
         }
         output.messages = canonical(messages);
         output
+    }
+    fn counts_by(&self) -> Option<ConfState> {
+        self.raw.raft.configuration().to_conf_state().ok()
     }
     fn view(&self) -> View {
         view_of(&self.raw, self.app)
@@ -1633,6 +1663,9 @@ impl Replica for Either {
     fn drain(&mut self) -> Output {
         either!(self, node => node.drain())
     }
+    fn counts_by(&self) -> Option<ConfState> {
+        either!(self, node => node.counts_by())
+    }
     fn view(&self) -> View {
         either!(self, node => node.view())
     }
@@ -1643,6 +1676,7 @@ impl Replica for Either {
 
 pub mod backlog;
 pub mod cluster;
+pub mod judge;
 pub mod lagged;
 pub mod timed;
 #[allow(unused_imports)]

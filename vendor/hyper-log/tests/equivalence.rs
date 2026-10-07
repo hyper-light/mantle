@@ -10,8 +10,15 @@
 //! with each nonce replaced by its segment's incarnation and the checksums over it recomputed
 //! (`canonical`); a checksum that did not hold before still does not.
 //!
-//! `EXPECTED` holds, per seed, the FNV-1a hash of mantle-log's transcript and of its canonical
-//! image, from the same harness run against mantle `147f035` (`docs/benchmarks.md`, "Equivalence").
+//! `EXPECTED` holds, per seed, the FNV-1a hash of the transcript and of the canonical image. They
+//! were mantle-log's at mantle `147f035` (`docs/benchmarks.md`, "Equivalence") until a proposal came
+//! to outlive the log reaching its index, ended only by a release (hyper-raft `docs/raft.md` §3.5,
+//! 2026-10-05). With it the views' counts of proposals differ from mantle-log's, and so do the
+//! pieces left live, the frames a crash leaves and where a flipped bit falls; every other answer
+//! of the 4,128 lines of the 24 transcripts is mantle-log's (compared line by line, those set
+//! aside). The hashes are this log's since. The canonical form now covers a crash image's last
+//! block where the image ends inside it: a frame torn there kept the operating system's nonce, and
+//! no seed's image before the change had one (its hashes were mantle-log's under either form).
 //! Set `HYPER_LOG_EQUIVALENCE_OUT` to a directory to write each seed's transcript and image there
 //! for a byte-for-byte comparison.
 #![allow(
@@ -46,30 +53,30 @@ const SEEDS: u64 = 24;
 
 /// Per seed: the FNV-1a hash of mantle-log's transcript and of its canonical device image.
 const EXPECTED: [(u64, u64); SEEDS as usize] = [
-    (0x12f05584153022fc, 0x759707004b2ce737),
-    (0x11d3590bb351107b, 0x9863d519ddb4dbf3),
-    (0x3a31c38249f29860, 0xc7a3b16b036a3ddb),
-    (0x54947c86e0c64242, 0x478622165a384376),
-    (0xc6b27861398a612b, 0x8b76098b50409bfb),
-    (0x579cadf12058c822, 0x5848b9a2afb932f4),
-    (0x28a0bbf44f29951e, 0x538e34e808983a1a),
-    (0xeaa030fd9e6eb748, 0xc90f973d44d74bae),
-    (0xd8007f06fe729490, 0xf163634f41ffc2ec),
-    (0x89d5b83a536939e3, 0x152f986e73091584),
-    (0xd07ab78d6a5d447e, 0xdcca445a21be49a7),
-    (0xeabd09731e5bdf72, 0x67c44bf6cfffb2d1),
-    (0x58051351877a5da0, 0x8fa5f1055597aaec),
-    (0x81645771868b2863, 0xebb0c41ff34f953f),
-    (0xce2bfbe3ce76f424, 0x13f7ddcc13b4d52f),
-    (0x460a8a8618443eae, 0x1c840d8edde9543f),
-    (0x3f6f27a1fd16c522, 0x9ae6fec0a8aa721b),
-    (0xa804737f7012498c, 0xdcee6709addd1040),
-    (0x5b8472099c706197, 0xaadc96c52dd39a68),
-    (0x606378acce93c30c, 0x927a2c3cd6bd9d07),
-    (0x521b0c25ee8cdf10, 0xd351328ebf23d82f),
-    (0xc2701645484f32dc, 0x78ddb7097a481f91),
-    (0x49ff14894efdb495, 0xb99d0b57f90af507),
-    (0x45a4f7e958215bfd, 0xa0f9d9e7a498928c),
+    (0x906a67331c9d09d2, 0xa59b28f5117c72e7),
+    (0x22ce32370ebbf2d9, 0x37c91059400167d1),
+    (0x26f9c847b470eb2d, 0x389b60b2ae74162e),
+    (0x84174f7347e6f2b4, 0x902b3bf80494cfb6),
+    (0x04fe729512f48912, 0x59712aabb9469dd4),
+    (0x5384ff27f0f3bfd4, 0x92779d1bdf003713),
+    (0xe929c0c797751a48, 0x2098d0e461d846a5),
+    (0x92108df4e1022385, 0x544e0599b8027b4e),
+    (0x459643ca5796cdb4, 0xb11b3d0c3c497157),
+    (0x9ba55172740d97a9, 0xfee4794dbc7d15a5),
+    (0x94843888647c9e0d, 0x6fcad7aebd3a87bc),
+    (0xea29d2b9ddd30824, 0xf6443323c924e499),
+    (0x7e66f75a1574d578, 0x3466cc969a23552f),
+    (0x4d4e35bc9ea74050, 0x2133a0c20d9ee3df),
+    (0xee7f00ab2b3b8635, 0xeea30aa46b18dab3),
+    (0x7a728c946f12ea3d, 0x241b70be1a02b5b2),
+    (0x940bed374324108d, 0x9d551184ece639ee),
+    (0x7fd71fe59ac03362, 0x93947d209a0827ed),
+    (0xfa68427f54f43ec5, 0x114b4320f2b27932),
+    (0x6a3bbec6851c64d3, 0xadd01214c8165833),
+    (0xe61f04b0a7624aad, 0x679009dafe29ce7b),
+    (0xbef9207ce5fe0fe7, 0x1b8169c4075d3eae),
+    (0x513fd96a9a5a8f77, 0x0cd03343310c3921),
+    (0xc539b6b55b9af87e, 0xb04ddb384550cdbe),
 ];
 
 fn config() -> Config {
@@ -208,6 +215,8 @@ fn answer(r: Result<(), LogError>) -> &'static str {
         Err(LogError::Claimed(_)) => "claimed",
         Err(LogError::Behind(_)) => "behind",
         Err(LogError::Disk(_)) => "disk",
+        Err(LogError::Tampered(_)) => "tampered",
+        Err(LogError::Seal(_)) => "seal",
     }
 }
 
@@ -319,15 +328,18 @@ fn faulty_round(log: &Log<common::Held>, rng: &mut Rng, n: u64, out: &mut String
 /// checksum over a nonce recomputed: kept valid where it held, kept failing where it did not.
 fn canonical(mut image: Vec<u8>) -> Vec<u8> {
     let mut at = SEGMENT as usize;
-    while at + BLOCK <= image.len() {
+    // Every block the image begins, the last one too when the image ends inside it (a crash's
+    // image ends where the last write it kept does): a frame torn there keeps its header, and its
+    // nonce is the operating system's as any other's.
+    while at < image.len() {
         let block = &image[at..];
-        if block.starts_with(b"MNLS") && block[4] == 3 {
+        if block.len() >= 68 && block.starts_with(b"MNLS") && block[4] == 3 {
             let valid = hyper_log::format::SegmentHeader::decode(block).is_some();
             let incarnation = u64::from_le_bytes(block[24..32].try_into().unwrap());
             image[at + 32..at + 40].copy_from_slice(&incarnation.to_le_bytes());
             let crc = crc32c::crc32c(&image[at..at + 48]) ^ (u32::from(!valid) * u32::MAX);
             image[at + 48..at + 52].copy_from_slice(&crc.to_le_bytes());
-        } else if block.starts_with(b"MNLF") && block[4] == 3 {
+        } else if block.len() >= 68 && block.starts_with(b"MNLF") && block[4] == 3 {
             let header = hyper_log::format::FrameHeader::decode(block).unwrap();
             let len = header.frame_len().unwrap();
             let end = (at + len).min(image.len());

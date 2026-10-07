@@ -39,11 +39,14 @@ fn config() -> Config {
 
 /// An update of one entry at `index` whose records take `len` payload bytes.
 fn sized(index: u64, len: usize) -> Update {
-    let header = hyper_log::format::encoded_len(&hyper_log::format::Record::Entries {
-        group: 0,
-        first: index,
-        entries: &[(1, &[])],
-    })
+    let header = hyper_log::format::encoded_len(
+        &hyper_log::format::Record::Entries {
+            group: 0,
+            first: index,
+            entries: &[(1, &[])],
+        },
+        0,
+    )
     .unwrap();
     Update {
         entries: Some(Entries {

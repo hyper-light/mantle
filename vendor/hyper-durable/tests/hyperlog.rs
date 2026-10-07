@@ -183,3 +183,153 @@ fn now() -> u64 {
         now
     })
 }
+
+/// Group commit above the log (focal's finding, 2026-10-05): N proposals made before one drive
+/// take one write, so one frame and one flush. The shell never waits on a flush per proposal: what
+/// the core holds not yet durable goes out as one write when the replica is driven.
+#[test]
+fn proposals_made_before_one_drive_take_one_frame() {
+    let log = Log::create(sim_file(24), config(16, 1 << 12), 1).unwrap();
+    let (mut r, waker, woken) = sole(&log);
+    settle(&mut r, &waker, &woken);
+    let n = 64;
+    for i in 0..n {
+        r.propose(Vec::new(), vec![i as u8; 64]).unwrap();
+    }
+    let (frames, updates) = log.flushed();
+    settle(&mut r, &waker, &woken);
+    let (frames_after, updates_after) = log.flushed();
+    assert_eq!(
+        frames_after - frames,
+        1,
+        "the proposals took more than one frame"
+    );
+    assert_eq!(
+        updates_after - updates,
+        1,
+        "the proposals took more than one write"
+    );
+    assert_eq!(r.machine().now.entries.len(), n + 1);
+}
+
+/// Two groups on one log, driven one after the other: neither drive waits on the log, so both
+/// writes are out before either is answered, for the log to take together. That they then share
+/// one frame is the log's own grouping (hyper-log's `many_submitters_share_flushes`); here the bound
+/// is exact: two groups' writes take at most two frames.
+#[test]
+fn two_groups_driven_in_turn_both_have_their_write_out_before_either_waits() {
+    let log = Log::create(sim_file(25), config(16, 1 << 12), 1).unwrap();
+    let mut members = Vec::new();
+    for group in [1u128, 2] {
+        let store = GroupStore::claim(&log, group).unwrap();
+        let kv = Kv::new(
+            ConfState {
+                voters: vec![1],
+                ..ConfState::default()
+            },
+            false,
+        );
+        let mut r = Replica::open(&settings(1, 3), store, kv, Unbounded).unwrap();
+        let (tell, woken) = sync_channel(1024);
+        let (waker, _) = hyper_measure::wake::waker(0, tell);
+        r.campaign().unwrap();
+        settle(&mut r, &waker, &woken);
+        members.push((r, waker, woken));
+    }
+    for (r, _, _) in &mut members {
+        for i in 0..16u8 {
+            r.propose(Vec::new(), vec![i; 64]).unwrap();
+        }
+    }
+    let (frames, _) = log.flushed();
+    let mut out = Output::default();
+    for (r, waker, _) in &mut members {
+        out.clear();
+        r.drive(now(), waker, &mut out).unwrap();
+    }
+    for (r, _, _) in &members {
+        assert_eq!(r.in_flight(), 1, "a drive waited on the log");
+    }
+    for (r, waker, woken) in &mut members {
+        settle(r, waker, woken);
+    }
+    let (frames_after, _) = log.flushed();
+    assert!(
+        frames_after - frames <= 2,
+        "two groups' writes took {} frames",
+        frames_after - frames
+    );
+}
+
+/// A voter holds a fast proposal above its log, and the leader's append reaches that index
+/// before the write goes out: the one write carries the entry and the holding at its index. The
+/// holding is the voter's vote, kept until a release (`docs/raft.md` §3.5), so the log takes it
+/// with the entry that reached it rather than refusing the write.
+#[test]
+fn a_holding_the_same_write_reaches_by_an_append_is_kept() {
+    use hyper_raft::proto::{Entry, Message, MessageType};
+    let log = Log::create(sim_file(23), config(16, 1 << 12), 1).unwrap();
+    let store = GroupStore::claim(&log, 1).unwrap();
+    let kv = Kv::new(
+        ConfState {
+            voters: vec![1, 2, 3],
+            ..ConfState::default()
+        },
+        false,
+    );
+    let mut s = settings(1, 3);
+    s.core.fast = true;
+    let mut r: Member = Replica::open(&s, store, kv, Unbounded).unwrap();
+    let (tell, woken) = sync_channel(1024);
+    let (waker, _) = hyper_measure::wake::waker(0, tell);
+    r.step(Message {
+        msg_type: MessageType::MsgHeartbeat,
+        from: 2,
+        to: 1,
+        term: 1,
+        ..Message::default()
+    })
+    .unwrap();
+    settle(&mut r, &waker, &woken);
+    let last = r.core().raft.log().last_index().unwrap();
+    let at = last + 1;
+    r.step(Message {
+        msg_type: hyper_raft::fast::FAST_PROPOSE,
+        from: 3,
+        to: 1,
+        term: 1,
+        entries: vec![Entry {
+            index: at,
+            term: 1,
+            data: b"held".to_vec(),
+            ..Entry::default()
+        }],
+        ..Message::default()
+    })
+    .unwrap();
+    let log_term = r.core().raft.log().term(last).unwrap();
+    r.step(Message {
+        msg_type: MessageType::MsgAppend,
+        from: 2,
+        to: 1,
+        term: 1,
+        index: last,
+        log_term,
+        entries: vec![Entry {
+            index: at,
+            term: 1,
+            data: b"appended".to_vec(),
+            ..Entry::default()
+        }],
+        ..Message::default()
+    })
+    .unwrap();
+    settle(&mut r, &waker, &woken);
+    let view = r.core().store().log().view().unwrap();
+    assert_eq!(view.last, at);
+    let initial = hyper_raft::Storage::initial_state(r.core().store()).unwrap();
+    assert!(
+        initial.proposals.iter().any(|p| p.index == at),
+        "the holding is kept beside the entry that reached it"
+    );
+}

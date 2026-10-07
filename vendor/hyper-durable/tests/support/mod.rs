@@ -58,6 +58,7 @@ pub struct Disk {
     pub entries: Vec<Entry>,
     pub hard: HardState,
     pub proposals: Vec<Entry>,
+    pub released: u64,
 }
 
 impl Disk {
@@ -102,10 +103,14 @@ impl Disk {
         if let Some(hard) = write.hard {
             self.hard = hard;
         }
-        let last = self.last();
-        self.proposals.retain(|p| p.index > last);
-        self.proposals
-            .extend(write.proposals.iter().filter(|p| p.index > last).cloned());
+        if let Some(through) = write.released {
+            self.proposals.retain(|p| p.index > through);
+            self.released = self.released.max(through);
+        }
+        for given in &write.proposals {
+            self.proposals.retain(|p| p.index != given.index);
+            self.proposals.push(given.clone());
+        }
         Ok(())
     }
 }
@@ -117,6 +122,7 @@ struct Owned {
     entries: Option<(u64, Vec<Entry>)>,
     hard: Option<HardState>,
     proposals: Vec<Entry>,
+    released: Option<u64>,
 }
 
 impl Owned {
@@ -126,6 +132,7 @@ impl Owned {
             entries: write.entries.map(|e| (e.first, e.entries.to_vec())),
             hard: write.hard_state,
             proposals: write.proposals.to_vec(),
+            released: write.released,
         }
     }
 }
@@ -331,6 +338,9 @@ impl LogStore for SimStore {
     fn proposals(&self, into: &mut Vec<Entry>) -> Result<(), StorageError> {
         into.extend(self.answered.proposals.iter().cloned());
         Ok(())
+    }
+    fn released(&self) -> Result<u64, StorageError> {
+        Ok(self.answered.released)
     }
     fn room(&self) -> bool {
         !self.full && self.pending.len() + self.done.len() < self.depth + 1

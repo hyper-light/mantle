@@ -190,12 +190,15 @@ replica the same way. `a_failed_flush_fences_the_member_and_the_group_goes_on_wi
 `a_write_refused_for_want_of_a_group_waits_until_one_leaves` (`crates/range/tests/group.rs`).
 
 **A change of configuration applies only on a commit the member's durable state holds.** A
-member's commit is volatile (Diss §3.8) and its configuration takes effect when it applies the
-change, as in etcd's core, not when the entry is appended as in the thesis (Diss §4.1;
-research/07 §2.11). A change applied on a commit its durable state does not hold reverts in a
-crash, while what others did on the member's word stands: the directed runs of §5 showed a
-founder of two that removed its only peer and lost power while the commit's write flushed
-reopening counting the stopped peer, never to elect again. The shell keeps the durable commit
+member's commit is volatile (Diss §3.8). The core counts elections and commitment by the newest
+configuration its log states, committed or not, as the thesis does (Diss §4.1; hyper-raft
+`docs/raft.md` §3.4, which left etcd's rule of the configuration applied after hyper-check's
+random walk elected two leaders of one term under it); the owner is told a configuration as it
+applies the change. A change applied on a commit its durable state does not hold reverts in a
+crash, while what others did on the member's word stands: under etcd's rule, which the core kept
+until hyper-raft `83f193a`, the directed runs of §5 showed a founder of two that removed its only
+peer and lost power while the commit's write flushed reopening counting the stopped peer, never
+to elect again. The shell keeps the durable commit
 `C_d`, the greater of the commit its durable writes stated and the engine's durable index, and
 applies a change only once `C_d` covers it, the entries after it waiting behind it with the
 core's apply paused (core step R-6, an apply pause like etcd's `applyingEntsPaused`); the next
@@ -425,13 +428,16 @@ must hold:
 
 A run settles only once every member marked by damage has been repaired, its log holding
 again what it acknowledged, and each run checks that every mark it made ended. With damage
-at rest in the faults, 6,000 seeds are linearizable and live on the shell: 4,867 frames
-damaged, 232 members marked and all 232 repaired by their lost entries, 117 of them with an
-engine past their log kept under their identity, 1,563 members rebuilt on their device and
-1,185 devices replaced; 14,670 members lost for good and replaced; members' writes left out
-past 922,402 drives, 1,289,864 messages and 1,014,495 ticks taken while writes were out, and
-15,125 drives that found a write waiting for room (`MANTLE_SIM_SEEDS=6000`, debug build,
-2026-10-03, this machine, 330 s at a load average of 7.7–9.8).
+at rest in the faults, 6,000 seeds are linearizable and live on the shell: 4,974 frames
+damaged, 208 members marked and all 208 repaired by their lost entries, 131 of them with an
+engine past their log kept under their identity, 1,655 members rebuilt on their device and
+1,235 devices replaced; 14,821 members lost for good and replaced; members' writes left out
+past 926,870 drives, 1,310,802 messages and 1,024,743 ticks taken while writes were out, and
+14,520 drives that found a write waiting for room (`MANTLE_SIM_SEEDS=6000`, debug build, the
+hyper-raft crates of the snapshot vendor/UPSTREAM.md names, 2026-10-06, this machine, 340 s at
+a one-minute load average of 6.7 at the start and 9.2 at the end). The recorded seeds a default
+run takes, 1 to 58, are the fewest from 1 in which a restart finds each kind of damage: seed 58
+is the first whose member opens marked on these crates (1 to 57 mark none).
 
 Soaks of mantle's own shell before the durable one found three faults whose rules the shell
 keeps (20,000 seeds, 2026-09-30): an install the log never recorded, which a restart now
@@ -483,7 +489,10 @@ own on a real file through the direct-I/O file layer and the platform's full flu
 supervisor the network over TCP on the loopback interface, running rounds as the directed runs
 do. The member to be killed names the window as it reaches it, a follower with its write
 stating the commit out, the leader with the change held behind its fence, and waits there for
-`SIGKILL`; it is started again from its file. Each is killed at each of its three windows in
+`SIGKILL`; it is started again from its file, and the supervisor gives it the replacement again,
+since the order lived in the process: the leader started again holds the change in its log,
+counts by it, and may be elected again, and then it is the one that must finish the
+replacement. Each is killed at each of its three windows in
 turn: the learner's addition, the swap, and the end of the joint configuration. Then every
 member is killed the moment the leader says the replacement is done, each must reopen from its
 file in the final configuration, and with one lost for good the other two must elect and commit.
@@ -520,8 +529,9 @@ loses with its leadership, is proposed again, and one already applied never is:
    own term (06 §A1.7).
 3. The replacement ends once every voter of the final configuration has said its log states a
    commit through the entry that made it (`Replica::configuration_known`, from the commit each
-   follower reports). A member applies a configuration when it applies its entry, and until then
-   still counts the members the change removed. The leader counts itself without a report: it
+   follower reports). A member counts by the newest configuration its log states (§3), so one
+   whose log lacks the entry still counts the members the change removed, and a voter whose
+   reported durable commit reaches the entry holds it. The leader counts itself without a report: it
    applies the change only once its own log states the commit (§3). A member's answers carry its
    durable commit, not its commit (hyper-raft core step R-6, `docs/durable.md` §4.4): the core
    holds an answer to the commit the write it waits for states, and the replica tells the core
@@ -529,7 +539,8 @@ loses with its leadership, is proposed again, and one already applied never is:
    report left after the write that stated it, since a follower's messages wait for its
    `Ready`'s write, and a member that committed alone as leader, in `advance_append`, and
    stepped down in the same term answered next in a later term, with that term's write. The
-   simulation showed the cost of ending sooner. A
+   simulation showed the cost of ending sooner, under etcd's rule of the configuration applied
+   that the core kept until hyper-raft `83f193a`. A
    leader applied the change that left the joint configuration and was lost before the others
    learned it had committed. The two survivors still applied the joint configuration, whose
    old half had lost two of its three members, so they could elect no one. Once every voter

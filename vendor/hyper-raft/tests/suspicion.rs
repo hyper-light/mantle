@@ -650,13 +650,15 @@ fn a_leader_that_steps_down_hands_over() {
     assert_eq!(sim.leader(), Some(2), "the one voter it still trusted");
 }
 
-/// A leader that removes itself, with no voter holding its whole log, hands over all the same.
+/// A leader that removes itself counts its commits by the configuration it wrote, which needs both
+/// of the voters it leaves: with one cut off, the removal waits, and the leader leads on (Ongaro's
+/// thesis §4.2.2). Once the removal is committed and applied, the leader hands the group to a
+/// voter that holds its whole log, and the group elects it.
 #[test]
-fn a_leader_that_removes_itself_hands_over_to_the_voter_that_holds_the_most() {
+fn a_leader_that_removes_itself_hands_over_once_the_voters_it_leaves_commit_it() {
     let (timing, _) = timing_for(3);
     let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 8);
     sim.found(1);
-    // Member 3 is cut off from what follows, and comes back behind.
     sim.cut.push(3);
     let change = ConfChangeV2 {
         transition: ConfChangeTransition::Auto,
@@ -668,16 +670,18 @@ fn a_leader_that_removes_itself_hands_over_to_the_voter_that_holds_the_most() {
     };
     sim.node(1).propose_change(&change);
     sim.settle(1);
+    let removal = sim.peek(1).view().last_index;
+    assert!(!sim.run_until(|sim| sim.peek(1).view().role != 2));
+    assert_eq!(sim.peek(1).view().role, 2);
+    assert!(sim.peek(1).view().commit < removal);
+    sim.cut.clear();
     assert!(sim.run_until(|sim| sim.peek(1).view().role != 2));
-    // No voter holds its whole log: the one that holds the most is told to campaign.
     assert!(
         sim.sent
             .iter()
-            .any(|m| m.msg_type == MessageType::MsgTimeoutNow && m.from == 1 && m.to == 2)
+            .any(|m| m.msg_type == MessageType::MsgTimeoutNow && m.from == 1)
     );
-    sim.cut.clear();
     assert!(sim.run_until(|sim| sim.leader().is_some_and(|l| l != 1)));
-    assert_eq!(sim.leader(), Some(2));
 }
 
 /// A member whose campaigns its owner holds (its log may lack what it acknowledged, or it is
@@ -772,15 +776,20 @@ fn a_member_removed_while_suspected_is_believed_anew_when_added_again() {
     sim.node(1)
         .propose_change(&change(ConfChangeType::RemoveNode, 3));
     sim.settle(1);
-    assert!(sim.run_until(|sim| !sim.peek(1).raw.raft.configuration().contains(3)));
+    // Counted by from the moment it is written; the next change waits for it to be applied.
+    let removal = sim.peek(1).view().last_index;
+    assert!(!sim.peek(1).raw.raft.configuration().contains(3));
     assert!(
         !sim.peek(1).raw.raft.suspects(3),
         "removed, it is believed of no more"
     );
+    assert!(sim.run_until(|sim| sim.peek(1).view().applied >= removal));
     sim.node(1)
         .propose_change(&change(ConfChangeType::AddNode, 3));
     sim.settle(1);
-    assert!(sim.run_until(|sim| sim.peek(1).raw.raft.configuration().votes(3)));
+    let addition = sim.peek(1).view().last_index;
+    assert!(sim.peek(1).raw.raft.configuration().votes(3));
+    assert!(sim.run_until(|sim| sim.peek(1).view().applied >= addition));
     sim.stop(2);
     sim.suspect(1, 2);
     sim.suspect(3, 2);

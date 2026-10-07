@@ -148,8 +148,11 @@ struct Range {
 }
 
 impl Range {
-    /// Applies `request` and sends its answer; true when it was the range's stop.
+    /// Applies `request` and sends its answer; true when it was the range's stop. The shard is
+    /// told a client was served, so it spins out its wake window before it parks and the
+    /// client's next request costs no kernel wake (hyper-rt `ShardContext::note_activity`).
     fn answer<F: BlockFile>(&mut self, db: &mut ShardDb<F>, mut request: Request) -> bool {
+        hyper_rt::registry::with_current(|ctx| ctx.note_activity());
         let stop = matches!(request.ask, Ask::Stop);
         request.result = match &self.fault {
             Some(fault) => Err(fault.clone()),
@@ -233,6 +236,20 @@ impl Slice {
     }
 }
 
+/// How a node's ranges are run, each number from the runtime's calibration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RangesConfig {
+    /// The clients at once, and so each range's channel.
+    pub clients: usize,
+    /// About how long a maintenance slice runs: the runtime's step budget, so a request waits
+    /// on one no longer than on a park.
+    pub slice_ns: u64,
+    /// How long a client spins for its answer before it parks: the runtime's spin window, the
+    /// measured cost of a wake (the 2-competitive spin-then-park rule; Karlin, Li, Manasse and
+    /// Owicki, SOSP 1991). An answer that comes within it costs the client no wake.
+    pub spin_ns: u64,
+}
+
 /// A node's ranges, each on a shard of a runtime, and the clients that reach them.
 #[derive(Debug)]
 pub struct Ranges {
@@ -242,20 +259,22 @@ pub struct Ranges {
     /// Clients live now, at most `clients`.
     live: AtomicUsize,
     clients: usize,
+    spin_ns: u64,
 }
 
 impl Ranges {
     /// Starts each range's engine on a shard of `runtime`, the ranges dealt to its shards in
-    /// order. `ranges` gives each range's lowest key, ascending, the first empty. `clients`
-    /// bounds the clients at once, and so each range's channel. A maintenance slice is given
-    /// about `slice_ns` (the runtime's step budget: a request waits on one no longer than on a
-    /// park).
+    /// order. `ranges` gives each range's lowest key, ascending, the first empty.
     pub fn start<F: BlockFile + Send + 'static>(
         runtime: &Runtime,
         ranges: Vec<(Vec<u8>, ShardDb<F>)>,
-        clients: usize,
-        slice_ns: u64,
+        config: RangesConfig,
     ) -> Result<Self, Error> {
+        let RangesConfig {
+            clients,
+            slice_ns,
+            spin_ns,
+        } = config;
         let ordered = ranges.first().is_some_and(|(k, _)| k.is_empty())
             && ranges.windows(2).all(|w| match w {
                 [a, b] => a.0 < b.0,
@@ -294,6 +313,7 @@ impl Ranges {
             senders,
             live: AtomicUsize::new(0),
             clients,
+            spin_ns,
         })
     }
 
@@ -375,6 +395,21 @@ impl Drop for Client<'_> {
 }
 
 impl Client<'_> {
+    /// The answer: spun for up to the spin window, then waited for parked; none when the range
+    /// dropped the request unanswered.
+    fn wait(&mut self) -> Option<Request> {
+        let t = std::time::Instant::now();
+        let window = u128::from(self.ranges.spin_ns);
+        while t.elapsed().as_nanos() < window {
+            match self.answers.try_recv() {
+                Ok(Some(answer)) => return Some(answer),
+                Ok(None) => std::hint::spin_loop(),
+                Err(_) => return None,
+            }
+        }
+        self.answers.blocking_recv().ok()
+    }
+
     /// Sends the request `fill` makes to `range` and waits for its answer.
     fn call(
         &mut self,
@@ -408,7 +443,7 @@ impl Client<'_> {
                 return Err(gone);
             }
         }
-        let answer = self.answers.blocking_recv().map_err(|_| gone)?;
+        let answer = self.wait().ok_or(gone)?;
         let request = self.request.insert(answer);
         request.result.clone()?;
         Ok(request)

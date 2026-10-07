@@ -98,6 +98,18 @@ struct Packing {
     packed: usize,
 }
 
+impl Packing {
+    /// The keys' worth of packing left: entries to pack, then the branch's filter pages, each at
+    /// its worth in keys.
+    fn left(&self) -> u64 {
+        let entries = u64::try_from(self.mem.len().saturating_sub(self.packed)).unwrap_or(u64::MAX);
+        self.builder
+            .filter_pages_left()
+            .saturating_mul(self.builder.page_keys())
+            .saturating_add(entries)
+    }
+}
+
 /// A shard's engine over a store.
 #[derive(Debug)]
 pub struct ShardDb<F: BlockFile> {
@@ -434,45 +446,10 @@ impl<F: BlockFile> ShardDb<F> {
     /// pacing).
     fn pace(&mut self, bytes: usize) -> Result<(), Error> {
         let room = self.mem.room();
-        if let Some(p) = &mut self.packing {
-            // Entries to pack, then the branch's filter pages, each at its worth in keys.
-            let entries = u64::try_from(p.mem.len().saturating_sub(p.packed)).unwrap_or(u64::MAX);
-            let keys = p.builder.page_keys();
-            let left = p
-                .builder
-                .filter_pages_left()
-                .saturating_mul(keys)
-                .saturating_add(entries);
-            let w = share(left, bytes, room, &mut self.pack_carry);
+        if let Some(p) = &self.packing {
+            let w = share(p.left(), bytes, room, &mut self.pack_carry);
             self.flush_stats.pack_share_most = self.flush_stats.pack_share_most.max(w);
-            if w > 0 {
-                let t = self.timed.then(std::time::Instant::now);
-                let Packing {
-                    mem,
-                    walk,
-                    builder,
-                    packed,
-                } = p;
-                let store = &mut self.store;
-                let walked = w.min(entries);
-                if walked > 0 {
-                    let limit = usize::try_from(walked).unwrap_or(usize::MAX);
-                    let visited =
-                        mem.walk_some(walk, limit, |k, op, v| builder.add(store, k, op, v))?;
-                    *packed = packed.saturating_add(visited);
-                }
-                let mut whole = false;
-                let over = w.saturating_sub(walked);
-                if *packed >= mem.len() && over > 0 {
-                    builder.seal(store)?;
-                    let pages = over.checked_div(keys).unwrap_or(1).max(1);
-                    whole = builder.write_filter(store, pages)?;
-                }
-                self.note_pack(ns_since(t));
-                if whole {
-                    self.finish_packing()?;
-                }
-            }
+            self.pack_some(w)?;
         }
         let waiting = self.trunk.fanout().saturating_sub(self.trunk.pending());
         let trunk_room = room.saturating_add(waiting.saturating_mul(self.mem_limit));
@@ -497,6 +474,70 @@ impl<F: BlockFile> ShardDb<F> {
             }
         }
         Ok(())
+    }
+
+    /// Packs `w` keys' worth of the packing memtable: entries, then its filter pages at their
+    /// worth in keys; the branch goes to the trunk once whole.
+    fn pack_some(&mut self, w: u64) -> Result<(), Error> {
+        let Some(p) = &mut self.packing else {
+            return Ok(());
+        };
+        if w == 0 {
+            return Ok(());
+        }
+        let t = self.timed.then(std::time::Instant::now);
+        let Packing {
+            mem,
+            walk,
+            builder,
+            packed,
+        } = p;
+        let store = &mut self.store;
+        let entries = u64::try_from(mem.len().saturating_sub(*packed)).unwrap_or(u64::MAX);
+        let walked = w.min(entries);
+        if walked > 0 {
+            let limit = usize::try_from(walked).unwrap_or(usize::MAX);
+            let visited = mem.walk_some(walk, limit, |k, op, v| builder.add(store, k, op, v))?;
+            *packed = packed.saturating_add(visited);
+        }
+        let mut whole = false;
+        let over = w.saturating_sub(walked);
+        if *packed >= mem.len() && over > 0 {
+            builder.seal(store)?;
+            let pages = over.checked_div(builder.page_keys()).unwrap_or(1).max(1);
+            whole = builder.write_filter(store, pages)?;
+        }
+        self.note_pack(ns_since(t));
+        if whole {
+            self.finish_packing()?;
+        }
+        Ok(())
+    }
+
+    /// Whether maintenance is owed: a memtable packing, the trunk's work, or freed pages the
+    /// cache has yet to forget.
+    pub fn owed(&self) -> bool {
+        self.packing.is_some() || self.trunk.debt() > 0 || self.store.forget_debt() > 0
+    }
+
+    /// Pays up to `keys` keys' worth of maintenance owed, for the shard's idle time (SILK: the
+    /// flush first, since a full memtable stops puts; then the trunk's work; then the cache's
+    /// forgetting). Returns the work done, 0 once nothing is owed.
+    pub fn idle_step(&mut self, keys: u64) -> Result<u64, Error> {
+        if let Some(p) = &self.packing {
+            // At least one: a memtable packed whole with no filter page left still has its
+            // branch to finish.
+            let w = keys.min(p.left()).max(1);
+            self.pack_some(w)?;
+            return Ok(w);
+        }
+        if self.trunk.debt() > 0 {
+            let t = self.timed.then(std::time::Instant::now);
+            let used = self.trunk.step(&mut self.store, keys)?;
+            self.note_trunk(ns_since(t));
+            return Ok(used);
+        }
+        Ok(self.store.forget_some(keys))
     }
 
     fn note_pack(&mut self, ns: u64) {

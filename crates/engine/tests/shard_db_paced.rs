@@ -150,7 +150,7 @@ fn runs_submitted_to_the_issuer_read_back_and_reopen_whole() {
     let align = Alignment::new(4096).unwrap();
     let file = DeviceFile::open(&path, true, CachingRequest::Buffered, align).unwrap();
     let issuer = Issuer::start(dir.path(), 2).unwrap();
-    let (mut db, oracle) = run_on(file, 0, Some(&issuer));
+    let (mut db, oracle) = run_on(file, 0, Some(&issuer), false);
     let (_, _, io) = db.stats();
     assert!(io.submitted > 0 && io.reads > 0, "{io:?}");
     db.checkpoint(OPS).unwrap();
@@ -166,10 +166,20 @@ fn runs_submitted_to_the_issuer_read_back_and_reopen_whole() {
     db.check_references().unwrap();
 }
 
+/// The same with the shard's idle time spent on maintenance between operations, slices of 1 to
+/// 50 keys (`ShardDb::idle_step`): every key still reads its newest value, and idle slices alone
+/// pay every debt to the end.
+#[test]
+fn idle_slices_between_operations_keep_every_read_exact_and_pay_every_debt() {
+    let align = Alignment::new(4096).unwrap();
+    let file = SimFile::new(align, Alignment::new(512).unwrap(), 17).unwrap();
+    run_on(file, 16, None, true);
+}
+
 fn run(cache: usize) {
     let align = Alignment::new(4096).unwrap();
     let file = SimFile::new(align, Alignment::new(512).unwrap(), 17).unwrap();
-    let (db, _) = run_on(file, cache, None);
+    let (db, _) = run_on(file, cache, None, false);
     let (_, _, io) = db.stats();
     // Every page enters the cache as it is written: a cache larger than the store serves every
     // read; a small one serves some and misses others.
@@ -190,6 +200,7 @@ fn run_on<F: BlockFile + 'static>(
     file: F,
     cache: usize,
     issuer: Option<&Issuer>,
+    idle: bool,
 ) -> (ShardDb<F>, BTreeMap<u64, Option<Vec<u8>>>) {
     let mut db = ShardDb::create(file, STORE, MEM, TRUNK).unwrap();
     db.set_cache(cache);
@@ -239,6 +250,19 @@ fn run_on<F: BlockFile + 'static>(
     // compactions and splits.
     assert!(flush.flushes > 100, "{}", flush.flushes);
     assert!(trunk.leaf_compactions > 0 && trunk.splits > 0, "{trunk:?}");
+    if idle {
+        // Idle slices alone pay every debt, each slice doing some work while one is owed.
+        assert!(db.owed());
+        let mut steps = 0u64;
+        while db.owed() {
+            assert!(db.idle_step(7).unwrap() > 0, "a debt owed and no work done");
+            steps += 1;
+            assert!(steps < 1_000_000, "idle slices never paid the debts");
+        }
+        for k in 0..KEYS {
+            check(&mut db, &oracle, k);
+        }
+    }
     db.flush().unwrap();
     for k in 0..KEYS {
         check(&mut db, &oracle, k);

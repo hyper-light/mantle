@@ -28,9 +28,34 @@ impl Merge {
         from: &[u8],
         end: Option<&[u8]>,
     ) -> Result<Self, Error> {
+        Self::with(store, branches, from, end, false)
+    }
+
+    /// [`Self::new`] for a compaction, which reads its inputs to their end: an extent a read
+    /// from the first.
+    pub fn sequential<'a, F: BlockFile>(
+        store: &mut Store<F>,
+        branches: impl IntoIterator<Item = &'a Branch>,
+        from: &[u8],
+        end: Option<&[u8]>,
+    ) -> Result<Self, Error> {
+        Self::with(store, branches, from, end, true)
+    }
+
+    fn with<'a, F: BlockFile>(
+        store: &mut Store<F>,
+        branches: impl IntoIterator<Item = &'a Branch>,
+        from: &[u8],
+        end: Option<&[u8]>,
+        sequential: bool,
+    ) -> Result<Self, Error> {
         let mut cursors = Vec::new();
         for b in branches {
-            cursors.push(b.seek(store, from)?);
+            cursors.push(if sequential {
+                b.seek_sequential(store, from)?
+            } else {
+                b.seek(store, from)?
+            });
         }
         let mut merge = Self {
             cursors,
@@ -135,7 +160,7 @@ impl Compaction {
         let counted = branches.into_iter().inspect(|b| {
             remaining = remaining.saturating_add(b.count);
         });
-        let merge = Merge::new(store, counted, from, end)?;
+        let merge = Merge::sequential(store, counted, from, end)?;
         Ok(Self {
             merge,
             drop_tombstones,

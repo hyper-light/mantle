@@ -157,6 +157,19 @@ impl View {
         Err(corrupt())
     }
 
+    /// The bytes the view's segments take in its pages: each anchor with a two-byte length, six
+    /// bytes a run's offset (a four-byte page number, a two-byte entry), and each segment's
+    /// selectors with a one-byte count.
+    pub fn bytes(&self) -> usize {
+        let segments = self.segments();
+        self.anchors
+            .len()
+            .saturating_add(segments.saturating_mul(2))
+            .saturating_add(self.offsets.len().saturating_mul(6))
+            .saturating_add(self.selectors.len())
+            .saturating_add(segments)
+    }
+
     /// The segments.
     pub fn segments(&self) -> usize {
         self.anchor_ends.len()

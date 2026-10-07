@@ -801,13 +801,34 @@ fn child_of(rest: &[u8]) -> Result<u64, Error> {
 impl Branch {
     /// A cursor at the first entry whose key is at least `from`.
     pub fn seek<F: BlockFile>(&self, store: &mut Store<F>, from: &[u8]) -> Result<Cursor, Error> {
+        let span = store.span()?;
+        self.seek_with(store, from, span)
+    }
+
+    /// [`Self::seek`] for a compaction, which reads the branch to its end: its leaves are read
+    /// an extent a call from the first ([`Store::span_sequential`]).
+    pub fn seek_sequential<F: BlockFile>(
+        &self,
+        store: &mut Store<F>,
+        from: &[u8],
+    ) -> Result<Cursor, Error> {
+        let span = store.span_sequential()?;
+        self.seek_with(store, from, span)
+    }
+
+    fn seek_with<F: BlockFile>(
+        &self,
+        store: &mut Store<F>,
+        from: &[u8],
+        span: Span,
+    ) -> Result<Cursor, Error> {
         let height = usize::from(self.height);
         let mut cursor = Cursor {
             path: Vec::with_capacity(height.saturating_add(1)),
             leaf_depth: height
                 .checked_sub(1)
                 .ok_or(corrupt(Malformed::CountMismatch))?,
-            span: store.span()?,
+            span,
             key: Vec::new(),
             value: Vec::new(),
             op: Op::Put,

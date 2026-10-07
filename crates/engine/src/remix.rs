@@ -40,7 +40,7 @@ fn corrupt() -> Error {
 }
 
 /// A view of runs over a key range.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct View {
     runs: usize,
     /// The runs' roots, newest first: the branches the view describes.
@@ -92,6 +92,102 @@ impl View {
             .saturating_add(self.offsets.len().saturating_mul(6))
             .saturating_add(self.selectors.len())
             .saturating_add(segments)
+    }
+
+    /// Appends the view to `out`: its runs and their roots, its anchors, offsets and selectors,
+    /// each list with its length.
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        let n32 = |n: usize| {
+            u32::try_from(n)
+                .map(u32::to_le_bytes)
+                .map_err(|_| corrupt())
+        };
+        out.extend_from_slice(&n32(self.runs)?);
+        for r in &self.roots {
+            out.extend_from_slice(&r.to_le_bytes());
+        }
+        out.extend_from_slice(&n32(self.anchors.len())?);
+        out.extend_from_slice(&self.anchors);
+        out.extend_from_slice(&n32(self.anchor_ends.len())?);
+        for &e in &self.anchor_ends {
+            out.extend_from_slice(&n32(e)?);
+        }
+        out.extend_from_slice(&n32(self.offsets.len())?);
+        for &(page, index) in &self.offsets {
+            out.extend_from_slice(&page.to_le_bytes());
+            out.extend_from_slice(&index.to_le_bytes());
+        }
+        out.extend_from_slice(&n32(self.selectors.len())?);
+        out.extend_from_slice(&self.selectors);
+        out.extend_from_slice(&n32(self.selector_ends.len())?);
+        for &e in &self.selector_ends {
+            out.extend_from_slice(&n32(e)?);
+        }
+        Ok(())
+    }
+
+    /// A view [`Self::encode`] wrote at the start of `bytes`, and the bytes it took. Its parts
+    /// must agree: a segment an anchor and a selector end, `runs` offsets a segment, ends that
+    /// rise within their lists, every selector naming a run the view has.
+    pub fn decode(bytes: &[u8]) -> Result<(Self, usize), Error> {
+        let mut r = Reader { bytes, at: 0 };
+        let runs = r.n32()?;
+        if runs > usize::from(RUN) {
+            return Err(corrupt());
+        }
+        let mut roots = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            roots.push(r.u64()?);
+        }
+        let n = r.n32()?;
+        let anchors = r.take(n)?.to_vec();
+        let n = r.n32()?;
+        let mut anchor_ends = Vec::with_capacity(n.min(bytes.len()));
+        for _ in 0..n {
+            anchor_ends.push(r.n32()?);
+        }
+        let n = r.n32()?;
+        let mut offsets = Vec::with_capacity(n.min(bytes.len()));
+        for _ in 0..n {
+            let page = r.u64()?;
+            let index =
+                u16::from_le_bytes(r.take(2)?.first_chunk::<2>().copied().ok_or(corrupt())?);
+            offsets.push((page, index));
+        }
+        let n = r.n32()?;
+        let selectors = r.take(n)?.to_vec();
+        let n = r.n32()?;
+        let mut selector_ends = Vec::with_capacity(n.min(bytes.len()));
+        for _ in 0..n {
+            selector_ends.push(r.n32()?);
+        }
+        let at = r.at;
+        let rising = |ends: &[usize], len: usize| {
+            ends.windows(2).all(|w| matches!(w, [a, b] if a < b))
+                && ends.last().is_none_or(|&e| e == len)
+                && ends.first().is_none_or(|&e| e > 0)
+        };
+        let segments = anchor_ends.len();
+        if selector_ends.len() != segments
+            || offsets.len() != segments.saturating_mul(runs)
+            || !rising(&anchor_ends, anchors.len())
+            || !rising(&selector_ends, selectors.len())
+            || selectors.iter().any(|&s| usize::from(s & RUN) >= runs)
+        {
+            return Err(corrupt());
+        }
+        Ok((
+            Self {
+                runs,
+                roots,
+                anchors,
+                anchor_ends,
+                offsets,
+                selectors,
+                selector_ends,
+            },
+            at,
+        ))
     }
 
     /// The roots of the runs the view describes, newest first.
@@ -745,6 +841,31 @@ fn nth_of(selectors: &[u8], r: usize, m: usize) -> Option<usize> {
         .filter(|&(_, &sel)| usize::from(sel & RUN) == r)
         .nth(m)
         .map(|(i, _)| i)
+}
+
+/// Bytes read from the front, each read refused past the end.
+struct Reader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl Reader<'_> {
+    fn take(&mut self, n: usize) -> Result<&[u8], Error> {
+        let end = self.at.checked_add(n).ok_or(corrupt())?;
+        let s = self.bytes.get(self.at..end).ok_or(corrupt())?;
+        self.at = end;
+        Ok(s)
+    }
+
+    fn n32(&mut self) -> Result<usize, Error> {
+        let b = self.take(4)?.first_chunk::<4>().copied().ok_or(corrupt())?;
+        usize::try_from(u32::from_le_bytes(b)).map_err(|_| corrupt())
+    }
+
+    fn u64(&mut self) -> Result<u64, Error> {
+        let b = self.take(8)?.first_chunk::<8>().copied().ok_or(corrupt())?;
+        Ok(u64::from_le_bytes(b))
+    }
 }
 
 fn give_back<F: BlockFile>(store: &mut Store<F>, cursors: Vec<RunCursor>) {

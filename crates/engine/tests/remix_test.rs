@@ -103,6 +103,13 @@ proptest! {
             }
         }
         prop_assert_eq!(view.entries(), versions);
+        // Encoded and read back, the view is the same; cut short anywhere, it is refused.
+        let mut bytes = Vec::new();
+        view.encode(&mut bytes).unwrap();
+        prop_assert_eq!(View::decode(&bytes).unwrap(), (view.clone(), bytes.len()));
+        for cut in (0..bytes.len()).step_by(1 + bytes.len() / 50) {
+            prop_assert!(View::decode(&bytes[..cut]).is_err());
+        }
         // Built a slice at a time, as maintenance builds it, the view is the same, field for field.
         let mut job = Build::new(&mut s, &branches, &lo, hi.as_deref()).unwrap();
         let mut slices = 0u64;

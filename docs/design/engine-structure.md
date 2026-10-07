@@ -240,7 +240,11 @@ bounded seek pass over a source with nothing in its range without reading it (cl
   descent reports them) and the ceiling against `[from, end)`. No range holding a key is ruled
   out.
 - **The trie under it.** The trie is built in one streaming pass with packed values. Only
-  S-LOUDS keeps select samples, as the paper says; dense labels are found by word scans.
+  S-LOUDS keeps select samples, as the paper says; dense labels are found by word scans. The
+  sparse part is kept a level at a time, as the builder lays it out, not assembled into one
+  sequence as the paper does. A level's nodes are the branches going on above it, so rank and
+  select run within the level. Finishing copies words, not labels: 0.17 ms for 500 k keys
+  against 3.3 ms assembled, which was the put latency maximum once a flush.
 - **Consulted on bounded scans.** At a segment's open, a lone branch is passed over when its
   filter rules out `[from, min(end, segment end))`, and a view when all its runs' filters do. An
   open scan does not check, since a leaf's end alone almost never rules out a branch above it.

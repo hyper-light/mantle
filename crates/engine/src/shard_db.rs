@@ -145,8 +145,11 @@ pub struct ShardDb<F: BlockFile> {
     trunk_carry: u128,
     forget_carry: u128,
     flush_stats: FlushStats,
-    /// The key a scan is at, its buffer kept between scans.
+    /// The key a scan is at, and the bounds of the trunk segment it reads: buffers kept
+    /// between scans.
     scan_key: Vec<u8>,
+    scan_from: Vec<u8>,
+    scan_end: Vec<u8>,
     /// Whether maintenance is timed ([`ShardDb::set_timed`]).
     timed: bool,
 }
@@ -192,6 +195,8 @@ impl<F: BlockFile> ShardDb<F> {
             forget_carry: 0,
             flush_stats: FlushStats::default(),
             scan_key: Vec::new(),
+            scan_from: Vec::new(),
+            scan_end: Vec::new(),
             timed: false,
         })
     }
@@ -392,8 +397,14 @@ impl<F: BlockFile> ShardDb<F> {
         let trunk = &self.trunk;
         let store = &mut self.store;
         let key = &mut self.scan_key;
-        let segments = trunk.segments(from, end)?;
-        let mut segments = segments.into_iter();
+        // The trunk's leaf segments, found one at a time from the seek's key: a segment's
+        // branches, and where the next one starts.
+        let seg_from = &mut self.scan_from;
+        let seg_end = &mut self.scan_end;
+        seg_from.clear();
+        seg_from.extend_from_slice(from);
+        let mut branches = Vec::new();
+        let mut trunk_done = false;
         let mut merge: Option<crate::branch::merge::Merge> = None;
         let before_end = |k: &[u8]| end.is_none_or(|e| k < e);
         let mut taken = 0usize;
@@ -403,16 +414,32 @@ impl<F: BlockFile> ShardDb<F> {
                 if let Some(m) = merge.take() {
                     m.give_back(store);
                 }
-                match segments.next() {
-                    Some(seg) => {
-                        merge = Some(crate::branch::merge::Merge::new(
-                            store,
-                            seg.branches.iter().copied(),
-                            &seg.from,
-                            seg.end.as_deref(),
-                        )?);
-                    }
-                    None => break,
+                if trunk_done || !before_end(seg_from) {
+                    break;
+                }
+                let bounded = trunk.segment_at(seg_from, &mut branches, seg_end)?;
+                // Each segment ends past its start, so the walk moves a leaf a step and ends.
+                if bounded && seg_end.as_slice() <= seg_from.as_slice() {
+                    return Err(Error::Corruption {
+                        what: "a trunk segment's bounds",
+                        why: crate::error::Malformed::OutOfOrder,
+                    });
+                }
+                let hi = match (bounded, end) {
+                    (true, Some(e)) if e < seg_end.as_slice() => Some(e),
+                    (true, _) => Some(seg_end.as_slice()),
+                    (false, e) => e,
+                };
+                merge = Some(crate::branch::merge::Merge::new(
+                    store,
+                    branches.iter().copied(),
+                    seg_from,
+                    hi,
+                )?);
+                if bounded {
+                    std::mem::swap(seg_from, seg_end);
+                } else {
+                    trunk_done = true;
                 }
             }
             // The smallest key any source holds next, copied so the sources can move.

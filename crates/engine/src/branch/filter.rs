@@ -66,12 +66,13 @@ fn probes(h: u64) -> impl Iterator<Item = (usize, u64)> {
 }
 
 impl Filter {
-    /// An empty filter for `keys`: sized for them when known exactly; when only bounded, a
-    /// power of two of blocks for the bound, which [`Self::fit`] halves once the count is known.
+    /// An empty filter for `keys`: sized for them when known exactly; when only bounded, for
+    /// the bound, an even count of blocks, which [`Self::fit`] halves once the count is known if
+    /// half still holds it.
     pub fn new(keys: Keys) -> Self {
         let count = match keys {
             Keys::Exactly(n) => blocks_for(n),
-            Keys::AtMost(n) => blocks_for(n).checked_next_power_of_two().unwrap_or(1),
+            Keys::AtMost(n) => blocks_for(n).saturating_add(blocks_for(n) % 2),
         };
         Self {
             blocks: vec![[0u64; BLOCK_WORDS]; count],
@@ -91,26 +92,45 @@ impl Filter {
     }
 
     /// Halves the filter while half its blocks still give `keys` keys [`BITS_PER_KEY`] bits
-    /// each: block pairs `2i, 2i + 1` OR into block `i`. A key's block at `n / 2` blocks is its
-    /// block at `n` halved (`⌊⌊h·n / 2^32⌋ / 2⌋ = ⌊h·(n/2) / 2^32⌋`) and its probes within a
-    /// block do not depend on `n`, so every key added is still found.
+    /// each: block pairs `2i, 2i + 1` OR into block `i`, in place. A key's block at `n / 2`
+    /// blocks is its block at `n` halved (`⌊⌊h·n / 2^32⌋ / 2⌋ = ⌊h·(n/2) / 2^32⌋`, for any `n`)
+    /// and its probes within a block do not depend on `n`, so every key added is still found.
     pub fn fit(&mut self, keys: u64) {
         let need = blocks_for(keys);
         while self.blocks.len().is_multiple_of(2) && self.blocks.len() / 2 >= need {
-            let half: Vec<[u64; BLOCK_WORDS]> = self
-                .blocks
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|[lo, hi]| {
-                    let mut b = *lo;
-                    for (w, h) in b.iter_mut().zip(hi) {
-                        *w |= h;
+            let half = self.blocks.len() / 2;
+            for i in 0..half {
+                let pair = (
+                    self.blocks.get(i.saturating_mul(2)).copied(),
+                    self.blocks
+                        .get(i.saturating_mul(2).saturating_add(1))
+                        .copied(),
+                );
+                if let ((Some(lo), Some(hi)), Some(dst)) = (pair, self.blocks.get_mut(i)) {
+                    for ((d, l), h) in dst.iter_mut().zip(lo).zip(hi) {
+                        *d = l | h;
                     }
-                    b
-                })
-                .collect();
-            self.blocks = half;
+                }
+            }
+            self.blocks.truncate(half);
+        }
+        self.blocks.shrink_to_fit();
+    }
+
+    /// Appends the bytes `range` of [`Self::to_bytes`]'s stream to `out`, from the blocks as they
+    /// are: a page of the filter written without the stream copied first.
+    pub fn copy_bytes(&self, range: std::ops::Range<usize>, out: &mut Vec<u8>) {
+        let words = self.blocks.iter().flat_map(|b| b.iter());
+        let first = range.start / 8;
+        for (i, w) in words.enumerate().skip(first) {
+            let at = i.saturating_mul(8);
+            if at >= range.end {
+                break;
+            }
+            let bytes = w.to_le_bytes();
+            let lo = range.start.saturating_sub(at).min(8);
+            let hi = range.end.saturating_sub(at).min(8);
+            out.extend_from_slice(bytes.get(lo..hi).unwrap_or(&[]));
         }
     }
 
@@ -194,10 +214,10 @@ mod tests {
 
     #[test]
     fn a_bounded_filter_fitted_to_its_keys_finds_every_one_at_no_fewer_bits() {
-        // Bounded at 400,000 keys: 7,813 blocks, rounded up to 8,192. The 30,000 keys added
-        // need 586, so it halves three times, to 1,024: 512 would not hold them.
+        // Bounded at 400,000 keys: 7,813 blocks, made even, 7,814. The 30,000 keys added need
+        // 586: it halves to 3,907, odd, and stops there.
         let mut f = Filter::new(Keys::AtMost(400_000));
-        assert_eq!(f.bytes(), 8_192 * 64);
+        assert_eq!(f.bytes(), 7_814 * 64);
         let hashes: Vec<u64> = (0..30_000u32)
             .map(|i| hash(format!("key-{i}").as_bytes()))
             .collect();
@@ -205,16 +225,41 @@ mod tests {
             f.insert(h);
         }
         f.fit(30_000);
-        assert_eq!(f.bytes(), 1_024 * 64);
+        assert_eq!(f.bytes(), 3_907 * 64);
         assert!(hashes.iter().all(|&h| f.may_contain(h)));
         let false_positives = (0..100_000u32)
             .filter(|i| f.may_contain(hash(format!("other-{i}").as_bytes())))
             .count();
-        // 17 bits a key here, against 10 in the first test's bound of 2,000.
+        // 66 bits a key here, against 10 in the first test's bound of 2,000.
         assert!(false_positives < 2_000, "{false_positives}");
         // Fitted to more keys than half holds, it stays.
         let mut g = Filter::new(Keys::AtMost(1_000));
         g.fit(1_000);
-        assert_eq!(g.bytes(), 32 * 64);
+        assert_eq!(g.bytes(), 20 * 64);
+        // A filter bounded at twice its keys halves once, to exactly what they need.
+        let mut h = Filter::new(Keys::AtMost(2_048));
+        for i in 0..1_024u32 {
+            h.insert(hash(&i.to_le_bytes()));
+        }
+        h.fit(1_024);
+        assert_eq!(h.bytes(), 20 * 64);
+        assert!((0..1_024u32).all(|i| h.may_contain(hash(&i.to_le_bytes()))));
+    }
+
+    #[test]
+    fn copied_ranges_are_the_byte_stream() {
+        let mut f = Filter::new(Keys::Exactly(5_000));
+        for i in 0..5_000u32 {
+            f.insert(hash(&i.to_le_bytes()));
+        }
+        let stream = f.to_bytes();
+        // Ranges cut at a page's capacity, which falls inside a word and inside a block.
+        for cap in [4_076usize, 4_096, 7, 64, 63] {
+            let mut joined = Vec::new();
+            for start in (0..stream.len()).step_by(cap) {
+                f.copy_bytes(start..(start + cap).min(stream.len()), &mut joined);
+            }
+            assert_eq!(joined, stream, "capacity {cap}");
+        }
     }
 }

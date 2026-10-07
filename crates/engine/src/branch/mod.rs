@@ -399,14 +399,22 @@ impl Builder {
                     filter::Filter::new(filter::Keys::Exactly(0)),
                 );
                 filter.fit(self.count);
-                let bytes = filter.to_bytes();
+                // Each page's bytes copied from the filter's blocks, the stream never built whole.
+                let total = filter.bytes();
                 let filter_start = self.issued;
                 let mut pages = 0u32;
-                for chunk in bytes.chunks(self.capacity) {
+                let mut chunk = std::mem::take(&mut self.payload);
+                for start in (0..total).step_by(self.capacity.max(1)) {
+                    chunk.clear();
+                    filter.copy_bytes(
+                        start..start.saturating_add(self.capacity).min(total),
+                        &mut chunk,
+                    );
                     let address = self.page(store)?;
-                    store.queue_page(&mut self.run, address, chunk)?;
+                    store.queue_page(&mut self.run, address, &chunk)?;
                     pages = pages.saturating_add(1);
                 }
+                self.payload = chunk;
                 store.write_run(&mut self.run)?;
                 return Ok(Branch {
                     root,
@@ -416,8 +424,7 @@ impl Builder {
                     filter,
                     filter_start,
                     filter_pages: pages,
-                    filter_bytes: u64::try_from(bytes.len())
-                        .map_err(|_| corrupt(Malformed::TooLarge))?,
+                    filter_bytes: u64::try_from(total).map_err(|_| corrupt(Malformed::TooLarge))?,
                 });
             }
             if self.levels.get(level).is_some_and(|p| p.len() > 0) {

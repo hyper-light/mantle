@@ -1078,6 +1078,9 @@ impl Branch {
 pub struct RunCursor {
     /// The leaf's page number in the branch's pages, and the entry in it.
     page_no: u64,
+    /// The store address of the page held, none before the first: a page number names a page
+    /// only within its branch, so a cursor placed in another branch reads its page.
+    loaded: Option<u64>,
     index: usize,
     n: usize,
     page: Vec<u8>,
@@ -1187,6 +1190,7 @@ impl Branch {
                 None => 0,
             };
             c.page_no = self.page_no_of(store, address)?;
+            c.loaded = Some(address);
             c.n = view.n;
             c.index = i;
             if i >= c.n {
@@ -1210,6 +1214,7 @@ impl Branch {
         c.page_no = page_no;
         let address = self.page_address(store, page_no)?;
         store.read_page_ahead(&mut c.span, address, &mut c.page)?;
+        c.loaded = Some(address);
         let view = View::new(&c.page)?;
         if view.kind != LEAF || index >= view.n {
             return Err(corrupt(Malformed::OutOfRange));
@@ -1222,9 +1227,12 @@ impl Branch {
 }
 
 impl RunCursor {
-    fn new<F: BlockFile>(store: &mut Store<F>) -> Result<Self, Error> {
+    /// A cursor at no entry yet, its page and span from `store`'s pools: [`Self::place`] puts
+    /// it on one.
+    pub fn new<F: BlockFile>(store: &mut Store<F>) -> Result<Self, Error> {
         Ok(Self {
             page_no: 0,
+            loaded: None,
             index: 0,
             n: 0,
             page: store.take_page(),
@@ -1301,6 +1309,17 @@ impl RunCursor {
         }
     }
 
+    /// Places the cursor at `position` (a leaf's page number and an entry in it), forward or
+    /// back: the leaf is read unless it is the one held.
+    pub fn place<F: BlockFile>(
+        &mut self,
+        branch: &Branch,
+        store: &mut Store<F>,
+        (page, index): (u64, usize),
+    ) -> Result<(), Error> {
+        self.land(branch, store, page, index)
+    }
+
     /// Reads leaf `page` unless it is the one held, and loads entry `index`.
     fn land<F: BlockFile>(
         &mut self,
@@ -1309,17 +1328,18 @@ impl RunCursor {
         page: u64,
         index: usize,
     ) -> Result<(), Error> {
-        if page != self.page_no {
-            let address = branch.page_address(store, page)?;
+        let address = branch.page_address(store, page)?;
+        if self.loaded != Some(address) {
             self.page.clear();
             store.read_page_ahead(&mut self.span, address, &mut self.page)?;
             let view = View::new(&self.page)?;
             if view.kind != LEAF {
                 return Err(corrupt(Malformed::CountMismatch));
             }
-            self.page_no = page;
             self.n = view.n;
+            self.loaded = Some(address);
         }
+        self.page_no = page;
         self.index = index;
         self.load()
     }

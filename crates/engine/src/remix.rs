@@ -183,6 +183,19 @@ impl View {
         self.selectors.get(start..*self.selector_ends.get(s)?)
     }
 
+    /// Run `r`'s offset at segment `s`, as a position; a run with no entry there is refused.
+    fn offset(&self, s: usize, r: usize) -> Result<(u64, usize), Error> {
+        let i = s
+            .checked_mul(self.runs)
+            .and_then(|i| i.checked_add(r))
+            .ok_or(corrupt())?;
+        let (page, index) = *self.offsets.get(i).ok_or(corrupt())?;
+        if (page, index) == PAST {
+            return Err(corrupt());
+        }
+        Ok((page, usize::from(index)))
+    }
+
     /// The segment whose entries a seek of `key` starts in: the last whose anchor is at most
     /// `key`, the first when `key` is before every anchor.
     fn segment_of(&self, key: &[u8]) -> usize {
@@ -232,6 +245,17 @@ impl View {
     }
 }
 
+/// The entries of run `r` among `selectors` before position `j`: every version counts, as each is
+/// an entry of its run.
+fn occurrences(selectors: &[u8], j: usize, r: usize) -> usize {
+    selectors
+        .get(..j)
+        .unwrap_or(selectors)
+        .iter()
+        .filter(|&&sel| usize::from(sel & RUN) == r)
+        .count()
+}
+
 fn give_back<F: BlockFile>(store: &mut Store<F>, cursors: Vec<RunCursor>) {
     for c in cursors {
         c.give_back(store);
@@ -254,7 +278,12 @@ pub struct Walk {
 }
 
 impl Walk {
-    /// A walk at the first key at or past `from` whose newest version holds a value.
+    /// A walk at the first key at or past `from` whose newest version holds a value. The
+    /// segment is found by the anchors, then the entry by a binary search of the segment
+    /// (Zhong et al. §3.2): the entry at `j` is in the run its selector names, at that run's
+    /// offset moved on by the same selector's occurrences before `j`, so a probe reads one key.
+    /// The runs are then left behind by their occurrences before the entry found, and each is
+    /// placed when a selector first names it.
     pub fn seek<F: BlockFile>(
         view: &View,
         store: &mut Store<F>,
@@ -269,17 +298,56 @@ impl Walk {
             behind: vec![0; view.runs],
             valid: view.segments() > 0,
         };
-        if w.valid {
-            w.settle(view, store, runs)?;
+        if !w.valid {
+            return Ok(w);
         }
-        // Forward to the first key at or past `from`: within the segment, at most its entries.
+        let selectors = view.selectors_of(w.segment).ok_or(corrupt())?;
+        let mut probe = RunCursor::new(store)?;
+        let found = w.search(view, store, runs, selectors, from, &mut probe);
+        probe.give_back(store);
+        w.at = found?;
+        for (r, b) in w.behind.iter_mut().enumerate() {
+            *b = occurrences(selectors, w.at, r);
+        }
+        w.settle(view, store, runs)?;
+        // Past a key whose newest version is a deletion: at most the view's entries.
         for _ in 0..=view.entries() {
-            if !w.valid || (w.key() >= from && w.op() == Op::Put) {
+            if !w.valid || w.op() == Op::Put {
                 return Ok(w);
             }
             w.step(view, store, runs)?;
         }
         Err(corrupt())
+    }
+
+    /// The first entry of `selectors` (the segment's) whose key is at least `from`, by halving:
+    /// its length when every key is less.
+    fn search<F: BlockFile>(
+        &self,
+        view: &View,
+        store: &mut Store<F>,
+        runs: &[&Branch],
+        selectors: &[u8],
+        from: &[u8],
+        probe: &mut RunCursor,
+    ) -> Result<usize, Error> {
+        let (mut lo, mut hi) = (0usize, selectors.len());
+        while lo < hi {
+            let mid = lo.saturating_add(hi.saturating_sub(lo) / 2);
+            let r = usize::from(selectors.get(mid).ok_or(corrupt())? & RUN);
+            let b = runs.get(r).ok_or(corrupt())?;
+            let offset = view.offset(self.segment, r)?;
+            let at = b
+                .position_after(offset, occurrences(selectors, mid, r))?
+                .ok_or(corrupt())?;
+            probe.place(b, store, at)?;
+            if probe.key() < from {
+                lo = mid.saturating_add(1);
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(lo)
     }
 
     /// Whether the walk is at an entry.
@@ -372,16 +440,8 @@ impl Walk {
         let b = runs.get(r).ok_or(corrupt())?;
         let slot = self.cursors.get_mut(r).ok_or(corrupt())?;
         if slot.is_none() {
-            let i = self
-                .segment
-                .checked_mul(view.runs)
-                .and_then(|i| i.checked_add(r))
-                .ok_or(corrupt())?;
-            let (page, index) = *view.offsets.get(i).ok_or(corrupt())?;
-            if (page, index) == PAST {
-                return Err(corrupt());
-            }
-            *slot = Some(b.run_from(store, page, usize::from(index))?);
+            let (page, index) = view.offset(self.segment, r)?;
+            *slot = Some(b.run_from(store, page, index)?);
         }
         let behind = self.behind.get_mut(r).ok_or(corrupt())?;
         if let Some(c) = slot.as_mut() {

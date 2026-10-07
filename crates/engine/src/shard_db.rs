@@ -42,6 +42,8 @@ pub struct FlushStats {
     /// Nanoseconds in the trunk's steps, in all and at the most a slice.
     pub incorporate_ns: u64,
     pub incorporate_max_ns: u64,
+    /// Nanoseconds finishing packed memtables: the walk's rest, the last pages and the filter.
+    pub pack_finish_ns: u64,
     /// Stalls, and their nanoseconds in all and at the most.
     pub stalls: u64,
     pub stall_ns: u64,
@@ -337,7 +339,9 @@ impl<F: BlockFile> ShardDb<F> {
             builder.add(store, k, op, v)
         })?;
         let branch = builder.finish(&mut self.store)?;
-        self.note_pack(ns_since(t));
+        let ns = ns_since(t);
+        self.note_pack(ns);
+        self.flush_stats.pack_finish_ns = self.flush_stats.pack_finish_ns.saturating_add(ns);
         self.trunk.add(branch);
         mem.clear();
         self.spare = Some(mem);

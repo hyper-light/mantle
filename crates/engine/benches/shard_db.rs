@@ -214,11 +214,14 @@ struct Slow {
     pack_ns: u64,
     trunk_ns: u64,
     stall_ns: u64,
+    plan_ns: u64,
+    finish_ns: u64,
+    pack_finish_ns: u64,
     rotated: bool,
 }
 
 impl Slow {
-    fn of(ns: u64, (f0, _, i0): Stats, (f1, _, i1): Stats) -> Self {
+    fn of(ns: u64, (f0, t0, i0): Stats, (f1, t1, i1): Stats) -> Self {
         Self {
             ns,
             write_ns: i1.write_ns - i0.write_ns,
@@ -228,6 +231,9 @@ impl Slow {
             pack_ns: f1.pack_ns - f0.pack_ns,
             trunk_ns: f1.incorporate_ns - f0.incorporate_ns,
             stall_ns: f1.stall_ns - f0.stall_ns,
+            plan_ns: t1.plan_ns - t0.plan_ns,
+            finish_ns: t1.finish_ns - t0.finish_ns,
+            pack_finish_ns: f1.pack_finish_ns - f0.pack_finish_ns,
             rotated: f1.flushes != f0.flushes || f1.stalls != f0.stalls,
         }
     }
@@ -263,6 +269,18 @@ fn attribute_tail(lat: &[u64], slow: &mut [Slow]) {
                 .filter(|s| s.writes == 0 && s.reads == 0)
                 .count(),
             tail.iter().filter(|s| s.rotated).count(),
+        );
+        println!(
+            "tail {name} work: planning compactions {:.2} us, finishing them {:.2} us, finishing packed memtables {:.2} us, merging and packing the rest {:.2} us; puts that planned {}, finished {}, finished a pack {}",
+            mean(&|s| s.plan_ns),
+            mean(&|s| s.finish_ns),
+            mean(&|s| s.pack_finish_ns),
+            mean(&|s| (s.pack_ns + s.trunk_ns).saturating_sub(
+                s.plan_ns + s.finish_ns + s.pack_finish_ns + s.write_ns + s.read_ns
+            )),
+            tail.iter().filter(|s| s.plan_ns > 0).count(),
+            tail.iter().filter(|s| s.finish_ns > 0).count(),
+            tail.iter().filter(|s| s.pack_finish_ns > 0).count(),
         );
     }
 }

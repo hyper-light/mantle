@@ -3,7 +3,7 @@
 //! to a compaction (research/34 §1).
 
 use super::filter::Keys;
-use super::{Branch, Builder, Cursor, Op};
+use super::{Branch, Builder, Op, RunCursor};
 use crate::error::Error;
 use crate::store::Store;
 use hyper_block::block::BlockFile;
@@ -12,7 +12,7 @@ use hyper_block::block::BlockFile;
 /// for the end of the branches).
 #[derive(Debug)]
 pub struct Merge {
-    cursors: Vec<Cursor>,
+    cursors: Vec<RunCursor>,
     end: Option<Vec<u8>>,
     /// The cursor whose entry is current, if any.
     current: Option<usize>,
@@ -105,17 +105,22 @@ impl Merge {
     }
 
     /// Moves past the current key in every cursor that holds it; the cursors moved, each an
-    /// input entry consumed.
-    pub fn next<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<u64, Error> {
+    /// input entry consumed. `branches` are the merge's, in the order it was opened on: a
+    /// cursor moving to its next leaf reads it by its branch's page counts.
+    pub fn next<'a, F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        branches: impl IntoIterator<Item = &'a Branch>,
+    ) -> Result<u64, Error> {
         let Some(at) = self.current.and_then(|i| self.cursors.get(i)) else {
             return Ok(0);
         };
         self.past.clear();
         self.past.extend_from_slice(at.key());
         let mut moved = 0u64;
-        for c in &mut self.cursors {
+        for (c, b) in self.cursors.iter_mut().zip(branches) {
             if c.valid() && c.key() == self.past.as_slice() {
-                c.next(store)?;
+                c.next(b, store)?;
                 moved = moved.saturating_add(1);
             }
         }
@@ -131,6 +136,8 @@ impl Merge {
 #[derive(Debug)]
 pub struct Compaction {
     merge: Merge,
+    /// The inputs' roots, newest first: each step is given the inputs again and checks them.
+    roots: Vec<u64>,
     drop_tombstones: bool,
     per: u64,
     /// The branch being built: its first key, its builder, its entries.
@@ -157,12 +164,15 @@ impl Compaction {
         per: u64,
     ) -> Result<Self, Error> {
         let mut remaining = 0u64;
+        let mut roots = Vec::new();
         let counted = branches.into_iter().inspect(|b| {
             remaining = remaining.saturating_add(b.count);
+            roots.push(b.root);
         });
         let merge = Merge::sequential(store, counted, from, end)?;
         Ok(Self {
             merge,
+            roots,
             drop_tombstones,
             per: per.max(1),
             building: None,
@@ -187,7 +197,30 @@ impl Compaction {
     /// worth in keys ([`Builder::page_keys`]), then keys merged; a part that reaches its size, or
     /// the last once the merge is done, is sealed and its filter's pages wait their turn. Returns
     /// the budget used, less than `budget` only once the compaction is done.
-    pub fn step<F: BlockFile>(&mut self, store: &mut Store<F>, budget: u64) -> Result<u64, Error> {
+    pub fn step<'a, F: BlockFile, I>(
+        &mut self,
+        store: &mut Store<F>,
+        inputs: I,
+        budget: u64,
+    ) -> Result<u64, Error>
+    where
+        I: IntoIterator<Item = &'a Branch> + Clone,
+    {
+        // The inputs are the ones the compaction was opened on, in its order.
+        let mut n = 0usize;
+        for b in inputs.clone() {
+            if self.roots.get(n) != Some(&b.root) {
+                return Err(Error::InvalidArgument {
+                    what: "a compaction stepped over inputs it was not opened on",
+                });
+            }
+            n = n.saturating_add(1);
+        }
+        if n != self.roots.len() {
+            return Err(Error::InvalidArgument {
+                what: "a compaction stepped over inputs it was not opened on",
+            });
+        }
         let mut done = 0u64;
         while done < budget {
             if let Some((_, b)) = self.closing.front_mut() {
@@ -244,7 +277,7 @@ impl Compaction {
                 b.add(store, key, op, value)?;
                 *n = n.saturating_add(1);
             }
-            let consumed = self.merge.next(store)?;
+            let consumed = self.merge.next(store, inputs.clone())?;
             self.remaining = self.remaining.saturating_sub(consumed);
             done = done.saturating_add(1);
         }
@@ -282,7 +315,7 @@ pub fn compact<F: BlockFile>(
     drop_tombstones: bool,
 ) -> Result<Option<Branch>, Error> {
     let mut c = Compaction::new(store, branches, from, end, drop_tombstones, u64::MAX)?;
-    c.step(store, u64::MAX)?;
+    c.step(store, branches, u64::MAX)?;
     Ok(c.finish(store)?.into_iter().next().map(|(_, b)| b))
 }
 
@@ -297,6 +330,6 @@ pub fn compact_split<F: BlockFile>(
     per: u64,
 ) -> Result<Vec<(Vec<u8>, Branch)>, Error> {
     let mut c = Compaction::new(store, branches, from, end, drop_tombstones, per)?;
-    c.step(store, u64::MAX)?;
+    c.step(store, branches, u64::MAX)?;
     c.finish(store)
 }

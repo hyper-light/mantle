@@ -99,9 +99,10 @@ proptest! {
         let got = walk(&mut s, &b, &from);
         let read: Vec<_> = got.iter().map(|(entry, _)| entry.clone()).collect();
         prop_assert_eq!(&read, &want);
-        // The leaf index routes every key to the leaf holding it, and a query to the leaf of the
-        // last key at or before it (the first leaf when there is none); so does the index read
-        // back from the branch's pages.
+        // The leaf index routes every key to the leaf holding it, and a query to the leaf whose
+        // keys before it are all less and after it all greater (a seek's first key at or past
+        // it is there or in the next leaf's start); so does the index read back from the
+        // branch's pages.
         let all = walk(&mut s, &b, b"");
         let mut descriptor = Vec::new();
         b.encode(&mut descriptor).unwrap();
@@ -110,13 +111,16 @@ proptest! {
         for ((k, _, _), (page, _)) in &all {
             prop_assert_eq!(b.index.floor(k), Some(*page as u32));
         }
-        let first_page = all.first().map(|(_, (p, _))| *p as u32);
-        let at_or_before = all
-            .iter()
-            .rev()
-            .find(|((k, _, _), _)| k.as_slice() <= from.as_slice())
-            .map(|(_, (p, _))| *p as u32);
-        prop_assert_eq!(b.index.floor(&from), at_or_before.or(first_page));
+        let leaf = u64::from(b.index.floor(&from).unwrap());
+        prop_assert!(all.iter().any(|(_, (p, _))| *p == leaf), "a leaf the branch has");
+        for ((k, _, _), (p, _)) in &all {
+            if *p < leaf {
+                prop_assert!(k.as_slice() < from.as_slice(), "a key before the leaf at or past the query");
+            }
+            if *p > leaf {
+                prop_assert!(k.as_slice() > from.as_slice(), "a key after the leaf at or before the query");
+            }
+        }
         // Placed at a recorded position, the cursor reads the same rest.
         if !got.is_empty() {
             let at = pick.index(got.len());

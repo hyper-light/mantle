@@ -198,8 +198,9 @@ mod cursor_and_merge {
         let mut out = Vec::new();
         while c.valid() {
             out.push((c.key().to_vec(), c.op(), c.value().to_vec()));
-            c.next(s).unwrap();
+            c.next(branch, s).unwrap();
         }
+        c.give_back(s);
         out
     }
 
@@ -269,7 +270,7 @@ mod cursor_and_merge {
             let mut got = Vec::new();
             while let Some((k, op, v)) = merge.entry() {
                 got.push((k.to_vec(), op, v.to_vec()));
-                merge.next(&mut s).unwrap();
+                merge.next(&mut s, &branches).unwrap();
             }
             prop_assert_eq!(&got, &expected);
             for drop in [false, true] {
@@ -284,7 +285,7 @@ mod cursor_and_merge {
             let kept: Vec<_> = expected.iter().filter(|e| e.1 != Op::Delete).cloned().collect();
             for budget in [1u64, 3] {
                 let mut c = Compaction::new(&mut s, &branches, &from, Some(&end), true, 7).unwrap();
-                while c.step(&mut s, budget).unwrap() == budget {}
+                while c.step(&mut s, &branches, budget).unwrap() == budget {}
                 prop_assert!(c.is_done());
                 let mut joined = Vec::new();
                 for (first, b) in c.finish(&mut s).unwrap() {

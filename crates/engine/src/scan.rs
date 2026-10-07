@@ -3,7 +3,7 @@
 //! newest first as `Trunk::segment_at` lists them. Each key reads from the newest source holding
 //! it, a deletion too, and every source holding it moves past it.
 
-use crate::branch::{Branch, Cursor, Op};
+use crate::branch::{Branch, Op, RunCursor};
 use crate::error::Error;
 use crate::remix::{View, Walk};
 use crate::store::Store;
@@ -13,42 +13,42 @@ use hyper_block::block::BlockFile;
 /// One source's head: a branch's cursor, or a bundle's walk through its view.
 #[derive(Debug)]
 enum Head<'a> {
-    Branch(Cursor),
+    Branch(RunCursor, &'a Branch),
     View(Walk, &'a View, &'a [Branch]),
 }
 
 impl Head<'_> {
     fn key(&self) -> Option<&[u8]> {
         match self {
-            Head::Branch(c) => c.valid().then(|| c.key()),
+            Head::Branch(c, _) => c.valid().then(|| c.key()),
             Head::View(w, ..) => w.valid().then(|| w.key()),
         }
     }
 
     fn op(&self) -> Op {
         match self {
-            Head::Branch(c) => c.op(),
+            Head::Branch(c, _) => c.op(),
             Head::View(w, ..) => w.op(),
         }
     }
 
     fn value(&self) -> &[u8] {
         match self {
-            Head::Branch(c) => c.value(),
+            Head::Branch(c, _) => c.value(),
             Head::View(w, ..) => w.value(),
         }
     }
 
     fn next<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
         match self {
-            Head::Branch(c) => c.next(store),
+            Head::Branch(c, b) => c.next(b, store),
             Head::View(w, view, runs) => w.step(view, store, runs),
         }
     }
 
     fn give_back<F: BlockFile>(self, store: &mut Store<F>) {
         match self {
-            Head::Branch(c) => c.give_back(store),
+            Head::Branch(c, _) => c.give_back(store),
             Head::View(w, ..) => w.give_back(store),
         }
     }
@@ -89,7 +89,7 @@ impl<'a> ScanMerge<'a> {
         }
         for s in sources {
             let head = match *s {
-                Source::Branch(b) => Head::Branch(b.seek(store, from)?),
+                Source::Branch(b) => Head::Branch(b.seek(store, from)?, b),
                 Source::View(view, runs) => {
                     Head::View(Walk::seek(view, store, runs, from)?, view, runs)
                 }

@@ -228,6 +228,8 @@ pub struct Lists {
     pub keys: SurfBuilder,
     pub range: Vec<u8>,
     pub index: Vec<u8>,
+    /// Each key's 32-bit maplet hash, sorted at the seal ([`crate::maplet`]).
+    pub hashes: Vec<u32>,
 }
 
 impl Lists {
@@ -236,6 +238,7 @@ impl Lists {
         self.counts.clear();
         self.index.clear();
         self.range.clear();
+        self.hashes.clear();
     }
 }
 

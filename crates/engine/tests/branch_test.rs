@@ -299,3 +299,32 @@ mod cursor_and_merge {
         }
     }
 }
+
+#[test]
+fn a_branch_keeps_its_keys_sorted_maplet_hashes_after_its_range_filter() {
+    // Enough keys that the hashes start mid-page and cross several page ends.
+    let mut s = store(91);
+    let entries: BTreeMap<Vec<u8>, (Op, Vec<u8>)> = (0..20_000u32)
+        .map(|i| (format!("key{i:08}").into_bytes(), (Op::Put, vec![7; 20])))
+        .collect();
+    let branch = build(&mut s, &entries);
+    let mut want: Vec<u32> = entries
+        .keys()
+        .map(|k| mantle_engine::maplet::hash32(mantle_engine::branch::filter::hash(k)))
+        .collect();
+    want.sort_unstable();
+    assert_eq!(branch.hashes_bytes, want.len() as u64 * 4);
+    let mut cursor = branch.hashes(&s).unwrap();
+    let mut got = Vec::new();
+    while let Some(h) = cursor.next(&mut s, &branch).unwrap() {
+        got.push(h);
+    }
+    assert_eq!(got, want);
+    // The descriptor round-trips, the hashes left on the device.
+    let mut desc = Vec::new();
+    branch.encode(&mut desc).unwrap();
+    let (back, used) = Branch::decode(&mut s, &desc).unwrap();
+    assert_eq!(used, desc.len());
+    assert_eq!(back, branch);
+    check(&mut s, &back, &entries);
+}

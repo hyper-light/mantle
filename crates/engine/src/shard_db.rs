@@ -384,7 +384,7 @@ impl<F: BlockFile> ShardDb<F> {
         self.packing = Some(Packing {
             walk: full.walk_start(),
             builder: Builder::new(
-                &self.store,
+                &mut self.store,
                 Keys::Exactly(u64::try_from(full.len()).unwrap_or(u64::MAX)),
             )?,
             mem: full,
@@ -416,7 +416,7 @@ impl<F: BlockFile> ShardDb<F> {
             self.packing = Some(Packing {
                 walk: full.walk_start(),
                 builder: Builder::new(
-                    &self.store,
+                    &mut self.store,
                     Keys::Exactly(u64::try_from(full.len()).unwrap_or(u64::MAX)),
                 )?,
                 mem: full,

@@ -39,6 +39,13 @@ impl Merge {
         Ok(merge)
     }
 
+    /// Gives every cursor's span back to `store`'s pool: the merge is done with them.
+    pub fn give_back<F: BlockFile>(self, store: &mut Store<F>) {
+        for c in self.cursors {
+            store.give_span(c.into_span());
+        }
+    }
+
     /// The cursor at the smallest key, the newest of those tied; none past the end.
     fn pick(&mut self) {
         let mut best: Option<usize> = None;
@@ -191,6 +198,7 @@ impl Compaction {
         if let Some((first, b, _)) = self.building.take() {
             self.out.push((first, b.finish(store)?));
         }
+        self.merge.give_back(store);
         Ok(self.out)
     }
 }

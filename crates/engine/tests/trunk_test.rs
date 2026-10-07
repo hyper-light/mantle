@@ -75,7 +75,7 @@ proptest! {
                 let e = if kind < 2 { (Op::Delete, Vec::new()) } else { (Op::Put, vec![v; 1 + (k % 50) as usize]) };
                 mem.insert(key(k), e);
             }
-            let mut b = Builder::new(&store, Keys::Exactly(mem.len() as u64)).unwrap();
+            let mut b = Builder::new(&mut store, Keys::Exactly(mem.len() as u64)).unwrap();
             for (k, (op, v)) in &mem {
                 b.add(&mut store, k, *op, v).unwrap();
             }
@@ -147,7 +147,7 @@ proptest! {
                 let e = if kind < 2 { (Op::Delete, Vec::new()) } else { (Op::Put, vec![v; 1 + (k % 50) as usize]) };
                 mem.insert(key(k), e);
             }
-            let mut b = Builder::new(&store, Keys::Exactly(mem.len() as u64)).unwrap();
+            let mut b = Builder::new(&mut store, Keys::Exactly(mem.len() as u64)).unwrap();
             for (k, (op, v)) in &mem {
                 b.add(&mut store, k, *op, v).unwrap();
             }
@@ -193,7 +193,7 @@ fn a_growing_trunk_splits_deepens_and_reads_after_every_batch() {
             let k = (x % 20_000) as u32;
             mem.insert(key(k), format!("v{batch}-{k}").into_bytes());
         }
-        let mut b = Builder::new(&store, Keys::Exactly(mem.len() as u64)).unwrap();
+        let mut b = Builder::new(&mut store, Keys::Exactly(mem.len() as u64)).unwrap();
         for (k, v) in &mem {
             b.add(&mut store, k, Op::Put, v).unwrap();
         }

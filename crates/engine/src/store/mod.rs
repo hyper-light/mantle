@@ -24,7 +24,9 @@ use crate::error::{Error, Malformed};
 use alloc::Allocator;
 use hyper_block::block::BlockFile;
 use hyper_block::buf::AlignedBuf;
+use hyper_block::issuer::{Attached, Issuer};
 use page::{HEADER, Kind};
+use std::collections::VecDeque;
 use superblock::Superblock;
 
 /// The smallest page: 4 KiB, the largest logical block common devices use and the page every
@@ -70,6 +72,11 @@ pub struct IoStats {
     /// in front of it, held the caller.
     pub write_ns: u64,
     pub read_ns: u64,
+    /// Runs handed to the device's issuer, and the times a write waited for a batch to be
+    /// answered because all it may have out were out, with the nanoseconds waited.
+    pub submitted: u64,
+    pub write_waits: u64,
+    pub write_wait_ns: u64,
     /// Point reads the page cache served, and those it did not.
     pub cache_hits: u64,
     pub cache_misses: u64,
@@ -98,6 +105,19 @@ pub struct Store<F: BlockFile> {
     io: IoStats,
     /// The page cache for point reads, when the owner gives one ([`Store::set_cache`]).
     cache: Option<cache::Cache>,
+    /// The device's issuer, when the owner attaches the store to one ([`Store::attach`]).
+    writer: Option<Writer>,
+}
+
+/// Runs handed to the device's issuer and not yet answered: each batch's number, the page
+/// addresses it writes and the byte past them, and the extent buffers answers gave back, kept
+/// for the next runs. The buffers in flight are at most the batches attached for, so the spare
+/// ones are too.
+#[derive(Debug)]
+struct Writer {
+    attached: Attached,
+    in_flight: VecDeque<(u64, u64, u64, u64)>,
+    spare: Vec<AlignedBuf>,
 }
 
 /// Node pages one writer queues at consecutive addresses within an extent, sealed into an
@@ -215,6 +235,7 @@ impl<F: BlockFile> Store<F> {
             end: 0,
             io: IoStats::default(),
             cache: None,
+            writer: None,
         };
         store.checkpoint(None, 0)?;
         Ok(store)
@@ -261,6 +282,7 @@ impl<F: BlockFile> Store<F> {
                 end,
                 io: IoStats::default(),
                 cache: None,
+                writer: None,
             },
             recovered,
         ))
@@ -485,6 +507,9 @@ impl<F: BlockFile> Store<F> {
     }
 
     fn sync(&mut self) -> Result<(), Error> {
+        // A flush makes durable only the writes completed when it is issued: every run in
+        // flight is answered first.
+        self.drain()?;
         self.io.syncs = self.io.syncs.saturating_add(1);
         let synced = self.file.sync_data().map_err(|e| io("flush a store", e));
         self.fence(synced)
@@ -576,7 +601,11 @@ impl<F: BlockFile> Store<F> {
         let past = Self::past(offset, bytes)?;
         self.io.writes = self.io.writes.saturating_add(1);
         self.io.pages_written = self.io.pages_written.saturating_add(u64::from(run.pages));
+        let (first, pages) = (run.first, u64::from(run.pages));
         run.pages = 0;
+        if self.writer.is_some() {
+            return self.submit(run, first, pages, bytes, offset, past);
+        }
         let started = std::time::Instant::now();
         let written = run
             .buf
@@ -591,6 +620,144 @@ impl<F: BlockFile> Store<F> {
         self.io.write_ns = self.io.write_ns.saturating_add(elapsed_ns(started));
         self.fence(written)?;
         self.end = self.end.max(past);
+        Ok(())
+    }
+
+    /// Hands `run`'s `bytes` at `offset` to the device's issuer and gives the run a spare
+    /// buffer: the caller goes on while the device writes. With every batch it may have out
+    /// already out, it first waits for one to be answered, the bound on what is in flight. The
+    /// buffer is cut to the run's pages: runs complete in any order, and an extent's later run
+    /// must not be overwritten by an earlier one's unused tail.
+    fn submit(
+        &mut self,
+        run: &mut Run,
+        first: u64,
+        pages: u64,
+        bytes: usize,
+        offset: u64,
+        past: u64,
+    ) -> Result<(), Error> {
+        self.reap()?;
+        let full = self
+            .writer
+            .as_ref()
+            .is_some_and(|w| w.attached.out() >= w.attached.batches());
+        if full {
+            let t = std::time::Instant::now();
+            self.answer(true)?;
+            self.io.write_waits = self.io.write_waits.saturating_add(1);
+            self.io.write_wait_ns = self.io.write_wait_ns.saturating_add(elapsed_ns(t));
+        }
+        let fresh = match self.writer.as_mut().and_then(|w| w.spare.pop()) {
+            Some(b) => b,
+            None => Self::run_buf(&self.file, self.config)?,
+        };
+        let mut buf = std::mem::replace(&mut run.buf, fresh);
+        buf.set_len(bytes)
+            .map_err(|e| io("cut a run to its pages", e))?;
+        let started = std::time::Instant::now();
+        let Some(w) = self.writer.as_mut() else {
+            return Err(io("submit a store page run", "no issuer attached"));
+        };
+        let submitted = w
+            .attached
+            .submit(vec![(buf, offset)], false)
+            .map_err(|e| io("submit a store page run", e));
+        self.io.write_ns = self.io.write_ns.saturating_add(elapsed_ns(started));
+        let number = self.fence(submitted)?;
+        if let Some(w) = self.writer.as_mut() {
+            w.in_flight
+                .push_back((number, first, first.saturating_add(pages), past));
+        }
+        // The file's end moves when the run is answered: until then its bytes may not be there,
+        // and a span reads no further than bytes written.
+        self.io.submitted = self.io.submitted.saturating_add(1);
+        Ok(())
+    }
+
+    /// Takes one answer from the issuer, waiting for it when `wait`: its batch leaves the
+    /// pages in flight, the file's end moves past it, and its buffer is kept for a run. A
+    /// failed write fences the store. Returns whether an answer was taken.
+    fn answer(&mut self, wait: bool) -> Result<bool, Error> {
+        let Some(w) = self.writer.as_mut() else {
+            return Ok(false);
+        };
+        let answered = if wait {
+            w.attached.answer().map(Some)
+        } else {
+            w.attached.try_answer()
+        };
+        let answered = answered.map_err(|e| io("take a store page run's answer", e));
+        let Some((number, answer)) = self.fence(answered)? else {
+            return Ok(false);
+        };
+        let past = self.writer.as_mut().and_then(|w| {
+            let at = w.in_flight.iter().position(|&(n, ..)| n == number)?;
+            w.in_flight.remove(at).map(|(.., past)| past)
+        });
+        let buffers = self.fence(answer.map_err(|e| io("write a store page run", e)))?;
+        if let Some(past) = past {
+            self.end = self.end.max(past);
+        }
+        let capacity = self
+            .config
+            .page_size
+            .saturating_mul(usize::try_from(self.config.extent_pages).unwrap_or(usize::MAX));
+        for mut b in buffers {
+            if b.set_len(capacity).is_ok()
+                && let Some(w) = self.writer.as_mut()
+                && w.spare.len() < w.attached.batches()
+            {
+                w.spare.push(b);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Takes every answer that has come.
+    fn reap(&mut self) -> Result<(), Error> {
+        while self.answer(false)? {}
+        Ok(())
+    }
+
+    /// Waits until no run in flight writes a page in `[first, end)`: a read of those pages then
+    /// reads what was written.
+    fn settle(&mut self, first: u64, end: u64) -> Result<(), Error> {
+        self.reap()?;
+        while self
+            .writer
+            .as_ref()
+            .is_some_and(|w| w.in_flight.iter().any(|&(_, a, b, _)| a < end && first < b))
+        {
+            self.answer(true)?;
+        }
+        Ok(())
+    }
+
+    /// Waits for every run in flight.
+    fn drain(&mut self) -> Result<(), Error> {
+        while self.writer.as_ref().is_some_and(|w| w.attached.out() > 0) {
+            self.answer(true)?;
+        }
+        Ok(())
+    }
+
+    /// Hands the store's runs to `issuer`, the device's, with up to `batches` out at once: a
+    /// run is then written while its writer goes on, as the device's other volumes' writes are
+    /// ([`Issuer::attach_deep`]). Its bound is the extent buffers the owner spares for them.
+    pub fn attach(&mut self, issuer: &Issuer, batches: usize) -> Result<(), Error>
+    where
+        F: 'static,
+    {
+        self.drain()?;
+        let attached = issuer
+            .attach_deep(&self.file, batches)
+            .map_err(|e| io("attach a store to its device's issuer", e))?;
+        self.writer = Some(Writer {
+            attached,
+            in_flight: VecDeque::with_capacity(batches),
+            spare: Vec::with_capacity(batches),
+        });
         Ok(())
     }
 
@@ -618,6 +785,7 @@ impl<F: BlockFile> Store<F> {
         {
             return Ok(());
         }
+        self.settle(address, address.saturating_add(1))?;
         let offset = Self::offset_in(self.config, address)?;
         self.io.reads = self.io.reads.saturating_add(1);
         self.io.pages_read = self.io.pages_read.saturating_add(1);
@@ -699,6 +867,8 @@ impl<F: BlockFile> Store<F> {
             .checked_add(1)
             .and_then(|e| e.checked_mul(extent_pages))
             .ok_or(corrupt(Malformed::TooLarge))?;
+        // Pages a run in flight writes are read once it is answered.
+        self.settle(address, extent_end)?;
         let size =
             u64::try_from(self.config.page_size).map_err(|_| corrupt(Malformed::TooLarge))?;
         let file_end = self
@@ -801,7 +971,10 @@ impl<F: BlockFile> Store<F> {
     }
 
     /// Gives back the file, the store's work done.
-    pub fn into_file(self) -> F {
+    pub fn into_file(mut self) -> F {
+        // Every run in flight lands first; one that failed has fenced the store already.
+        let _ = self.drain();
+        self.writer = None;
         self.file
     }
 }

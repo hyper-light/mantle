@@ -128,6 +128,25 @@ enum Phase {
     Flush { i: usize, waiting: bool },
 }
 
+/// A part of a scanned range under one leaf ([`Trunk::segments`]): its bounds and the branches a
+/// read of a key in it probes, newest first.
+#[derive(Debug)]
+pub struct Segment<'a> {
+    pub from: Vec<u8>,
+    pub end: Option<Vec<u8>>,
+    pub branches: Vec<&'a Branch>,
+}
+
+/// A node under a scanned range: the node, the range's part under it, and the branches above it,
+/// newest first.
+type Under<'a> = (usize, Vec<u8>, Option<Vec<u8>>, Vec<&'a Branch>);
+
+/// A pivot under a scanned range: a child node to descend, or a leaf's segment.
+enum Part<'a> {
+    Node(usize, Vec<u8>, Option<Vec<u8>>, Vec<&'a Branch>),
+    Leaf(Segment<'a>),
+}
+
 /// The saved image's format version.
 const IMAGE_FORMAT: u8 = 1;
 /// The saved image header's magic: "mantleTK" in ASCII, little-endian.
@@ -240,6 +259,75 @@ impl Trunk {
             }
         }
         Err(corrupt())
+    }
+
+    /// The range `[from, end)` (to the trunk's end with no `end`) cut at its leaves, in key order:
+    /// each segment's bounds and the branches a read of a key in it probes, newest first, in the
+    /// order [`Self::get`] probes them (pending branches, then each node's live in-flight
+    /// bundles and pivot bundle on the path, the leaf's last). One segment a leaf the range
+    /// touches; the walk's stack holds at most a node's pivots a level.
+    pub fn segments<'a>(
+        &'a self,
+        from: &[u8],
+        end: Option<&[u8]>,
+    ) -> Result<Vec<Segment<'a>>, Error> {
+        let pending: Vec<&Branch> = self.pending.iter().rev().collect();
+        let mut out = Vec::new();
+        let mut stack: Vec<Under<'a>> =
+            vec![(self.root, from.to_vec(), end.map(<[u8]>::to_vec), pending)];
+        // Every node is visited at most once: a node's count of steps.
+        let mut budget = self.nodes.len().saturating_add(1);
+        while let Some((n, lo, hi, above)) = stack.pop() {
+            budget = budget.checked_sub(1).ok_or(corrupt())?;
+            let node = self.node(n)?;
+            // The pivots under the range, pushed in reverse so the first is taken next.
+            let mut parts = Vec::new();
+            for (i, pivot) in node.pivots.iter().enumerate() {
+                let pend = Self::pivot_end(node, i);
+                let plo = if pivot.key.as_slice() > lo.as_slice() {
+                    pivot.key.clone()
+                } else {
+                    lo.clone()
+                };
+                let phi = match (&pend, &hi) {
+                    (Some(a), Some(b)) => Some(if a < b { a.clone() } else { b.clone() }),
+                    (Some(a), None) => Some(a.clone()),
+                    (None, b) => b.clone(),
+                };
+                if phi.as_ref().is_some_and(|h| plo >= *h) {
+                    continue;
+                }
+                let mut sources = above.clone();
+                for bundle in node.inflight.get(pivot.start..).unwrap_or(&[]).iter().rev() {
+                    sources.extend(bundle.iter());
+                }
+                sources.extend(pivot.bundle.iter());
+                match pivot.child {
+                    Some(child) => parts.push(Part::Node(child, plo, phi, sources)),
+                    None => parts.push(Part::Leaf(Segment {
+                        from: plo,
+                        end: phi,
+                        branches: sources,
+                    })),
+                }
+            }
+            // Leaves are emitted in order: a leaf's pivots are its own segments.
+            let mut deeper = Vec::new();
+            for part in parts {
+                match part {
+                    Part::Leaf(seg) => {
+                        // A leaf has no children, so its segments come before any node pushed
+                        // after; leaves and nodes never share a node's pivots.
+                        out.push(seg);
+                    }
+                    Part::Node(child, plo, phi, sources) => deeper.push((child, plo, phi, sources)),
+                }
+            }
+            for d in deeper.into_iter().rev() {
+                stack.push(d);
+            }
+        }
+        Ok(out)
     }
 
     /// Takes a packed memtable into the trunk and runs every cascade it sets off to the end.

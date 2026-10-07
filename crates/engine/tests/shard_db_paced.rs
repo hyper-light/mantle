@@ -41,6 +41,74 @@ fn key(k: u64) -> Vec<u8> {
     format!("bucket-{}/obj-{k:06}", k % 5).into_bytes()
 }
 
+/// A scan of `[key(a), key(b))` with `limit` reads exactly the oracle's live keys there, in order,
+/// and continues from the right key; and the whole keyspace, page by page, reads every live key.
+fn check_scan<F: BlockFile>(
+    db: &mut ShardDb<F>,
+    oracle: &BTreeMap<u64, Option<Vec<u8>>>,
+    a: u64,
+    b: u64,
+    limit: usize,
+) {
+    let live: BTreeMap<Vec<u8>, Vec<u8>> = oracle
+        .iter()
+        .filter_map(|(k, v)| v.as_ref().map(|v| (key(*k), v.clone())))
+        .collect();
+    // Keys order by their bytes, not their numbers.
+    let (ka, kb) = (key(a), key(b));
+    let (lo, hi) = if ka <= kb { (ka, kb) } else { (kb, ka) };
+    let want: Vec<(Vec<u8>, Vec<u8>)> = live
+        .range(lo.clone()..hi.clone())
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let mut got = Vec::new();
+    let next = db.scan(&lo, Some(&hi), limit, &mut got).unwrap();
+    let page: Vec<_> = want.iter().take(limit).cloned().collect();
+    assert_eq!(got, page, "scan [{a}, {b}) limit {limit}");
+    // The continuation lies past the page's last key and no further than the next live key: a key
+    // whose newest entry is a deletion may be where the next page starts, and reads nothing.
+    match want.get(limit) {
+        Some((k, _)) => {
+            let c = next.expect("a page that filled continues");
+            assert!(
+                c.as_slice() <= k.as_slice(),
+                "continuation past the next live key"
+            );
+            if let Some((last, _)) = got.last() {
+                assert!(
+                    c.as_slice() > last.as_slice(),
+                    "continuation at or before the page's end"
+                );
+            }
+        }
+        None => {
+            if let Some(c) = next {
+                // A deleted key left in range: the next page reads nothing.
+                let mut rest = Vec::new();
+                assert_eq!(
+                    db.scan(&c, Some(&hi), limit.max(1), &mut rest).unwrap(),
+                    None
+                );
+                assert!(
+                    rest.is_empty(),
+                    "a page past the range's live keys read {rest:?}"
+                );
+            }
+        }
+    }
+    // The whole keyspace in pages of `limit`.
+    let mut all = Vec::new();
+    let mut from = Vec::new();
+    loop {
+        match db.scan(&from, None, limit.max(1), &mut all).unwrap() {
+            Some(k) => from = k,
+            None => break,
+        }
+    }
+    let every: Vec<_> = live.into_iter().collect();
+    assert_eq!(all, every, "the keyspace page by page");
+}
+
 fn check<F: BlockFile>(db: &mut ShardDb<F>, oracle: &BTreeMap<u64, Option<Vec<u8>>>, k: u64) {
     let mut value = Vec::new();
     let found = db.get(&key(k), &mut value).unwrap();
@@ -149,6 +217,16 @@ fn run_on<F: BlockFile + 'static>(
             db.checkpoint(i).unwrap();
         }
         check(&mut db, &oracle, k);
+        // A scan now and then, wherever the keys then live.
+        if i % 37 == 0 {
+            check_scan(
+                &mut db,
+                &oracle,
+                x % KEYS,
+                (x >> 20) % KEYS,
+                (x % 97) as usize,
+            );
+        }
         // A sweep of 1/50 of the keys each op: every key read every 50 ops, while each memtable
         // (about 60 entries) is packed and queued.
         for j in (i % 50..KEYS).step_by(50) {
@@ -166,6 +244,7 @@ fn run_on<F: BlockFile + 'static>(
         check(&mut db, &oracle, k);
     }
     db.check_references().unwrap();
+    check_scan(&mut db, &oracle, 0, KEYS, 1_000);
     // Extent buffers come back to the store's pool and are taken again: a fresh allocation is
     // a page fault for each of its pages.
     let (_, _, io) = db.stats();

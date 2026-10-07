@@ -53,6 +53,42 @@ pub struct FlushStats {
     pub stall_max_ns: u64,
 }
 
+/// A memtable read in key order from a seek, its next entry held: one source of a scan.
+struct MemCursor {
+    walk: Walk,
+    head: Option<(Vec<u8>, Op, Vec<u8>)>,
+}
+
+impl MemCursor {
+    fn new(mem: &BTreeMem, from: &[u8]) -> Result<Self, Error> {
+        let mut c = Self {
+            walk: mem.walk_from(from)?,
+            head: None,
+        };
+        c.advance(mem)?;
+        Ok(c)
+    }
+
+    fn key(&self) -> Option<&[u8]> {
+        self.head.as_ref().map(|(k, _, _)| k.as_slice())
+    }
+
+    fn entry(&self) -> Option<(Op, &[u8])> {
+        self.head.as_ref().map(|(_, op, v)| (*op, v.as_slice()))
+    }
+
+    /// Moves to the next entry, none past the last.
+    fn advance(&mut self, mem: &BTreeMem) -> Result<(), Error> {
+        let mut next = None;
+        mem.walk_some(&mut self.walk, 1, |k, op, v| {
+            next = Some((k.to_vec(), op, v.to_vec()));
+            Ok(())
+        })?;
+        self.head = next;
+        Ok(())
+    }
+}
+
 /// A full memtable packed into a branch a slice at a time, read until it is packed.
 #[derive(Debug)]
 struct Packing {
@@ -286,6 +322,112 @@ impl<F: BlockFile> ShardDb<F> {
             found = self.trunk.get(&mut self.store, key, value)?;
         }
         Ok(found == Some(Op::Put))
+    }
+
+    /// A page of the range `[from, end)` (to the end with no `end`): up to `limit` keys that
+    /// hold values, in key order, appended to `out` as (key, value); and the key to continue
+    /// from when the page filled, none when the range is done. The continuation is the next key
+    /// any source holds, which may be one a deletion hides: the next page then starts there and
+    /// reads it as absent. As S3's listings page, so no scan
+    /// state lives across writes. Each key reads its newest entry: the memtable, the one being
+    /// packed, then the trunk leaf by leaf (`Trunk::segments`); a deletion hides the key.
+    pub fn scan(
+        &mut self,
+        from: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+        out: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        if limit == 0 {
+            return Ok(Some(from.to_vec()));
+        }
+        let mut active = MemCursor::new(&self.mem, from)?;
+        let mut packing = match &self.packing {
+            Some(p) => Some(MemCursor::new(&p.mem, from)?),
+            None => None,
+        };
+        let trunk = &self.trunk;
+        let store = &mut self.store;
+        let segments = trunk.segments(from, end)?;
+        let mut segments = segments.into_iter();
+        let mut merge: Option<crate::branch::merge::Merge> = None;
+        let past_end = |k: &[u8]| end.is_some_and(|e| k >= e);
+        let mut taken = 0usize;
+        loop {
+            // The trunk's next key: from the segment open, or the next segment's first.
+            while merge.as_ref().is_none_or(|m| m.entry().is_none()) {
+                if let Some(m) = merge.take() {
+                    m.give_back(store);
+                }
+                match segments.next() {
+                    Some(seg) => {
+                        merge = Some(crate::branch::merge::Merge::new(
+                            store,
+                            seg.branches.iter().copied(),
+                            &seg.from,
+                            seg.end.as_deref(),
+                        )?);
+                    }
+                    None => break,
+                }
+            }
+            let tree = merge
+                .as_ref()
+                .and_then(|m| m.entry())
+                .map(|(k, _, _)| k.to_vec());
+            let mem_a = active.key().filter(|k| !past_end(k)).map(<[u8]>::to_vec);
+            let mem_p = packing
+                .as_ref()
+                .and_then(MemCursor::key)
+                .filter(|k| !past_end(k))
+                .map(<[u8]>::to_vec);
+            // The smallest key any source holds next.
+            let Some(key) = [&mem_a, &mem_p, &tree].into_iter().flatten().min().cloned() else {
+                break;
+            };
+            if taken == limit {
+                if let Some(m) = merge.take() {
+                    m.give_back(store);
+                }
+                return Ok(Some(key));
+            }
+            // The newest source holding the key decides; every source holding it moves past it.
+            let mut found: Option<(Op, Vec<u8>)> = None;
+            if mem_a.as_deref() == Some(key.as_slice()) {
+                if let Some((op, v)) = active.entry() {
+                    found = Some((op, v.to_vec()));
+                }
+                active.advance(&self.mem)?;
+            }
+            if mem_p.as_deref() == Some(key.as_slice())
+                && let (Some(c), Some(p)) = (packing.as_mut(), self.packing.as_ref())
+            {
+                if found.is_none()
+                    && let Some((op, v)) = c.entry()
+                {
+                    found = Some((op, v.to_vec()));
+                }
+                c.advance(&p.mem)?;
+            }
+            if tree.as_deref() == Some(key.as_slice())
+                && let Some(m) = merge.as_mut()
+            {
+                if found.is_none()
+                    && let Some((_, op, v)) = m.entry()
+                {
+                    found = Some((op, v.to_vec()));
+                }
+                m.next(store)?;
+            }
+            if let Some((Op::Put, value)) = found {
+                out.push((key, value));
+                taken = taken.saturating_add(1);
+            }
+        }
+        if let Some(m) = merge.take() {
+            m.give_back(store);
+        }
+        Ok(None)
     }
 
     /// A put that took `bytes` of the memtable does its share of each debt (the module's

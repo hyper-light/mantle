@@ -175,28 +175,46 @@ are the branches of a leaf pivot's bundle, newest first: they change only when a
 the leaf or the leaf compacts, while the branches above the leaf (pending, the path's bundles)
 change with every memtable and stay merge sources, a few beside one view.
 
-- **Segments.** The bundle's entries in key order, every version, cut into segments of at most
-  `D` entries, a key's versions never split. Each segment holds its anchor (its first key), one
+- **Segments.** The bundle's entries in key order, every version, newest first within a key,
+  cut into segments of exactly `D` selectors. Each segment holds its anchor (its first key), one
   offset per run (the run's first entry at or past the anchor, as the page number in the
-  branch's pages and the entry's index in the page), and one selector byte per entry: the run's
-  number (at most 63 runs), 0x80 for a version a newer run shadows, 0x40 for a deletion.
-  `D = 32` as the paper evaluates it: 2.9 B a key for 48-byte keys and 8 runs, 3.16% of the data
-  (research/34 §4); `D` is at least the runs, so a key's versions fit one segment.
+  branch's pages and the entry's index in the page), and `D` selector bytes: the run's number
+  (at most 63 runs), 0x80 for a version a newer run shadows, 0x40 for a deletion, and 0x3f a
+  placeholder. A key's versions never split: where they would, the segment is closed with
+  placeholders and they open the next (the paper's §4.1). `D = 32` as the paper evaluates it:
+  2.9 B a key for 48-byte keys and 8 runs, 3.16% of the data (research/34 §4); `D` is at least
+  the runs.
+- **Entry counts a page.** RemixDB keeps an entry count for each 4 KB block of a table in memory
+  (§4.1, the metadata block), so a run's cursor moves by any number of entries with arithmetic and
+  reads only the page it lands on. Each branch here keeps the same: one 16-bit count for each of
+  its tree pages, 0 for an index page, written after its filter in the same page stream and held
+  in memory with the filter (2 bytes a 4 KiB page, 0.05%).
 - **Pages.** A view's segments are written to its own extents as pages, sealed and verified as
   every page, read through the page cache; the anchors form an index of pages as a branch's keys
   do. The trunk image names each pivot's view with its bundle.
-- **Seek.** Binary search of the anchors, then of the segment's entries by reading only the keys
-  the search lands on: `log2(H·N)` comparisons where the merge takes `H·log2 N`. A run's page is
-  read only when a selector first names it.
+- **Seek.** Binary search of the anchors (no I/O while they are in memory), then a binary search
+  of the segment's entries (§3.2): the entry at position `j` is in the run its selector names, at
+  that run's offset advanced by the occurrences of the same selector before `j`, so each probe
+  reads one key; `log2(H·N)` comparisons where the merge takes `H·log2 N`. The cursors are left at
+  the counts of their runs' selectors before the found entry. A run's page is read only when a
+  selector names it.
 - **Next.** The next selector names the run whose cursor moves: no comparison. Shadowed versions
-  are skipped by their bit without reading them; a deletion hides its key without reading a value.
-  A run's next leaf is the next leaf page in its page order (a branch's tree pages precede its
-  filter's, and each page names its kind), so a view's cursor needs no path from the root.
-- **Built as maintenance.** A view is built when its leaf's bundle changes, as SILK-scheduled
-  work of the leaf's shard, a slice at a time like a compaction (§6). Until it is built a scan
-  merges the bundle's cursors as before, so correctness never waits on it. The first build
-  merges the bundle's runs; the paper's incremental build (the old view merged with the new run,
-  merge points from the anchors) follows, measured against it.
+  and placeholders are passed by their bits; a run's cursor catches up by its counts, reading only
+  the page it lands on. A deletion hides its key without reading a value, and since the bundle is
+  the oldest source in its leaf, a key whose newest version is a deletion is passed over.
+- **Rebuilt, not rebuilt from scratch** (§4.3). A flush that reaches a leaf adds one run, the
+  newest, to its bundle. The old view is one sorted run; the new view is its merge with the new
+  run by generalized binary merging (Hwang and Lin): for each next key of the new run, its merge
+  point in the old view is found by the anchors and a binary search in one segment (at most
+  `log2 D` key reads); the old selectors between merge points are copied with their run numbers
+  moved up one, versions of a key the new run holds are marked shadowed, and the old runs'
+  offsets at each new segment follow from the old offsets and the entry counts, without I/O. A
+  new segment's anchor is its first key: one key read a new segment. A leaf compaction leaves one
+  run, which needs no view; a split's new bundles are built by merging their runs.
+- **Built as maintenance.** A rebuild is SILK-scheduled work of the leaf's shard, a slice at a time
+  like a compaction (§6). A bundle that changes while its view is being built drops the build.
+  Until a view is built, a scan merges the bundle's cursors as before, so correctness never waits
+  on it.
 - **Gets** keep the filters (and later the maplets): a REMIX get is a seek, which a filter that
   rules a branch out beats.
 

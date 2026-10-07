@@ -170,10 +170,16 @@ throughput at 3 M keys (benches/shard_db.rs, 2026-10-07: 151–165 k seeks a sec
 against 84–94 k at p50 9.5–11.2 µs). What remains is the merge: a seek descends every branch of
 the leaf's bundle, and every `next` compares the heads of all of them.
 
-**A REMIX view per leaf bundle** (Zhong et al., FAST 2021; research/34 §4) removes both. The runs
-are the branches of a leaf pivot's bundle, newest first: they change only when a flush reaches
-the leaf or the leaf compacts, while the branches above the leaf (pending, the path's bundles)
-change with every memtable and stay merge sources, a few beside one view.
+**A REMIX view per pivot bundle** (Zhong et al., FAST 2021; research/34 §4) removes both. The
+paper keeps a view per partition because RemixDB's runs pile up in its leaf partitions. Ours do
+not: a leaf compacts or splits as soon as its bundle passes the fanout or a leaf's entries, so a
+leaf holds one branch, and the runs a seek merges sit in the pivot bundles on its path (traced on
+the paced test's trunk, 2026-10-07: every leaf one branch, every interior pivot three, its
+fanout). So a view is kept for each pivot bundle of two runs or more, at any level, its runs that
+bundle's branches, newest first: a bundle changes only when a flush or a compaction reaches it.
+A seek merges one source a level, each a view or a lone branch, with the pending branches and the
+in-flight bundles, newest first. A view above the leaf has older levels below it, so its walk
+yields a key's newest version even when it is a deletion; the scan's merge decides.
 
 - **Segments.** The bundle's entries in key order, every version, newest first within a key,
   cut into segments of exactly `D` selectors. Each segment holds its anchor (its first key), one

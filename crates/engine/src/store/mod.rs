@@ -21,6 +21,8 @@ pub mod page;
 pub mod superblock;
 
 use crate::error::{Error, Malformed};
+use crate::fst::packed::MAX_WIDTH;
+use crate::fst::surf::SurfBuilder;
 use crate::fst::trie::TrieBuilder;
 use alloc::Allocator;
 use hyper_block::block::BlockFile;
@@ -98,6 +100,12 @@ fn elapsed_ns(since: Option<std::time::Instant>) -> u64 {
     })
 }
 
+/// Suffix bits a branch's range filter keeps a key unless set otherwise: measured, 1 M keys
+/// (benches/surf.rs, 2026-10-07): 16-byte keys of random numbers let 0.03% of empty ranges
+/// through at 8 bits (5.6% at none) for 18.8 bits a key; object names 3.6-4.4% at 8 bits
+/// (38-44% at none, 0.2-0.6% at 16).
+pub const RANGE_FILTER_BITS: u32 = 8;
+
 /// A store over one file, owned by one thread (as every `BlockFile` is).
 #[derive(Debug)]
 pub struct Store<F: BlockFile> {
@@ -115,6 +123,8 @@ pub struct Store<F: BlockFile> {
     io: IoStats,
     /// The page cache for point reads, when the owner gives one ([`Store::set_cache`]).
     cache: Option<cache::Cache>,
+    /// Suffix bits a branch's range filter keeps a key ([`Self::set_range_filter`]).
+    range_filter_bits: u32,
     /// The device's issuer, when the owner attaches the store to one ([`Store::attach`]).
     writer: Option<Writer>,
     /// Extent buffers given back by spans, runs and answered writes, for the next to need one:
@@ -170,6 +180,9 @@ pub struct Lists {
     /// Each leaf's separator to its page number, a trie builder whose levels keep their
     /// buffers; and the encoded index built of them.
     pub separators: TrieBuilder,
+    /// Each key, for the branch's range filter, and the filter encoded.
+    pub keys: SurfBuilder,
+    pub range: Vec<u8>,
     pub index: Vec<u8>,
 }
 
@@ -178,6 +191,7 @@ impl Lists {
         self.extents.clear();
         self.counts.clear();
         self.index.clear();
+        self.range.clear();
     }
 }
 
@@ -292,6 +306,7 @@ impl<F: BlockFile> Store<F> {
             end: 0,
             io: IoStats::default(),
             cache: None,
+            range_filter_bits: RANGE_FILTER_BITS,
             writer: None,
             pool: Vec::new(),
             lent: 0,
@@ -350,6 +365,7 @@ impl<F: BlockFile> Store<F> {
                 end,
                 io: IoStats::default(),
                 cache: None,
+                range_filter_bits: RANGE_FILTER_BITS,
                 writer: None,
                 pool: Vec::new(),
                 lent: 0,
@@ -450,6 +466,23 @@ impl<F: BlockFile> Store<F> {
                 .map_or(0, cache::Cache::evict_steps_most),
             ..self.io
         }
+    }
+
+    /// Has the branches built from here keep `suffix_bits` of each key past its cut in their
+    /// range filters (research/35 §2): more bits rule out more empty ranges, at a bit a key each.
+    pub fn set_range_filter(&mut self, suffix_bits: u32) -> Result<(), Error> {
+        if suffix_bits > MAX_WIDTH {
+            return Err(Error::InvalidArgument {
+                what: "a range filter suffix past 32 bits",
+            });
+        }
+        self.range_filter_bits = suffix_bits;
+        Ok(())
+    }
+
+    /// Suffix bits the branches built from here keep a key in their range filters.
+    pub fn range_filter_bits(&self) -> u32 {
+        self.range_filter_bits
     }
 
     /// Gives point reads a page cache of `pages` pages (none at 0), replacing any it had. Its

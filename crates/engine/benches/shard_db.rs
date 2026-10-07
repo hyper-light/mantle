@@ -3,7 +3,7 @@
 //! `[0, num)` as db_bench draws them, a 64 MiB memtable (db_bench's `write_buffer_size`), no
 //! compression, no write-ahead log (the Raft log is the engine's, docs/design/engine-structure.md
 //! §2; `--disable_wal=1` on RocksDB's side), buffered reads through the OS page cache on both.
-//! `cargo bench -p mantle-engine --bench shard_db -- DIR [NUM] [FANOUT] [buffered|direct]` prints
+//! `cargo bench -p mantle-engine --bench shard_db -- DIR [NUM] [FANOUT] [buffered|direct] ...` prints
 //! `workload num ops_per_s micros_per_op`, and the trunk's shape.
 #![allow(
     clippy::unwrap_used,
@@ -99,6 +99,9 @@ fn main() {
     // count of keys from a random start: db_bench's seekrandom with --seek_nexts.
     let seeks: u64 = args.get(9).map_or(0, |s| s.parse().unwrap());
     let seek_nexts: usize = args.get(10).map_or(10, |s| s.parse().unwrap());
+    // Each seek bounded to the twelfth argument's count of keys past its start, unbounded at 0
+    // (the default): db_bench's --max_scan_distance, which sets the iterator's upper bound.
+    let seek_distance: u64 = args.get(11).map_or(0, |s| s.parse().unwrap());
     let path = dir.join("shard_db.store");
     let _ = std::fs::remove_file(&path);
     let align = Alignment::new(4096).unwrap();
@@ -251,11 +254,15 @@ fn main() {
         let (_, _, io_seek) = db.stats();
         let mark = begin();
         let t = Instant::now();
+        let (skipped_before, opened_before) = db.scan_filtered();
         for _ in 0..seeks {
-            let from = key(rng.next() % num);
+            let start = rng.next() % num;
+            let from = key(start);
+            let end = key(start.saturating_add(seek_distance));
+            let bound = (seek_distance > 0).then_some(&end[..]);
             page.clear();
             let o = Instant::now();
-            db.scan(&from, None, seek_nexts, &mut page, &mut next)
+            db.scan(&from, bound, seek_nexts, &mut page, &mut next)
                 .unwrap();
             lat.push(o.elapsed().as_nanos() as u64);
             keys_read += page.len() as u64;
@@ -270,6 +277,12 @@ fn main() {
             (io3.cache_hits - io_seek.cache_hits) as f64 / seeks as f64,
             (io3.span_cache_hits - io_seek.span_cache_hits) as f64 / seeks as f64
         );
+        let (skipped, opened) = db.scan_filtered();
+        println!(
+            "seekrandom distance {seek_distance} sources/seek skipped {:.2} opened {:.2}",
+            (skipped - skipped_before) as f64 / seeks as f64,
+            (opened - opened_before) as f64 / seeks as f64
+        );
         report("seekrandom", &mut lat);
         println!(
             "seekrandom {seeks} {:.0} {:.3} nexts {seek_nexts} keys read {keys_read}",
@@ -283,11 +296,18 @@ fn main() {
         "shape height {h} nodes {n} leaves {l} views built {} dropped {}",
         trunk.views_built, trunk.views_dropped
     );
-    let (filters, indexes, counts) = db.memory();
+    let m = db.memory();
     println!(
-        "memory filters {filters} B ({:.2} B/key) indexes {indexes} B ({:.3} B/key) counts {counts} B",
-        filters as f64 / num as f64,
-        indexes as f64 / num as f64
+        "memory filters {} B ({:.2} B/key) indexes {} B ({:.3} B/key) counts {} B ranges {} B ({:.2} B/key) views {} B ({:.2} B/key)",
+        m.filters,
+        m.filters as f64 / num as f64,
+        m.indexes,
+        m.indexes as f64 / num as f64,
+        m.counts,
+        m.ranges,
+        m.ranges as f64 / num as f64,
+        m.views,
+        m.views as f64 / num as f64
     );
     drop(db);
     std::fs::remove_file(&path).unwrap();

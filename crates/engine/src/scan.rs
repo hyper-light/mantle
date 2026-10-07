@@ -64,6 +64,11 @@ pub struct ScanMerge<'a> {
     current: Option<usize>,
     /// The key `next` moves past.
     past: Vec<u8>,
+    /// A range filter check's buffer.
+    scratch: Vec<u8>,
+    /// Sources passed over at open by their range filters, and sources opened.
+    skipped: u64,
+    opened: u64,
 }
 
 impl<'a> ScanMerge<'a> {
@@ -73,13 +78,17 @@ impl<'a> ScanMerge<'a> {
     }
 
     /// Opens `sources` (newest first) over `[from, end)`, the heads of a merge open before given
-    /// back first.
+    /// back first. With `filter`, a source whose range filters rule `[from, end)` out is passed
+    /// over unread: a branch by its own, a view when every run's does. A scan the caller bounds
+    /// asks for it; a leaf's end alone almost never rules a branch above it out, so an open scan
+    /// does not pay the checks.
     pub fn open<F: BlockFile>(
         &mut self,
         store: &mut Store<F>,
         sources: &[Source<'a>],
         from: &[u8],
         end: Option<&[u8]>,
+        filter: bool,
     ) -> Result<(), Error> {
         self.close(store);
         self.end.clear();
@@ -88,6 +97,20 @@ impl<'a> ScanMerge<'a> {
             self.end.extend_from_slice(e);
         }
         for s in sources {
+            if filter && end.is_some() {
+                let scratch = &mut self.scratch;
+                let held = match *s {
+                    Source::Branch(b) => b.range.may_hold(from, end, scratch),
+                    Source::View(_, runs) => {
+                        runs.iter().any(|b| b.range.may_hold(from, end, scratch))
+                    }
+                };
+                if !held {
+                    self.skipped = self.skipped.saturating_add(1);
+                    continue;
+                }
+            }
+            self.opened = self.opened.saturating_add(1);
             let head = match *s {
                 Source::Branch(b) => Head::Branch(b.seek(store, from)?, b),
                 Source::View(view, runs) => {
@@ -98,6 +121,11 @@ impl<'a> ScanMerge<'a> {
         }
         self.pick();
         Ok(())
+    }
+
+    /// Sources passed over by their range filters, and sources opened, since the merge was made.
+    pub fn counts(&self) -> (u64, u64) {
+        (self.skipped, self.opened)
     }
 
     /// Gives every head's pages and span back to `store`.

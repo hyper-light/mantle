@@ -363,6 +363,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/engine/src/codec/zstd/fse.rs` `SYMBOLS_MAX` | format | 64: the most symbols a distribution describes rounded up to a power of two, above the match length codes' 53 (RFC 8878 §3.1.1.3.2.1.1). |
 | `crates/engine/src/codec/zstd/huffman.rs` `LITERALS` | format | 256: every byte value is a literal a Huffman table codes (RFC 8878 §4.2.1). |
 | `crates/engine/src/codec/zstd/huffman.rs` `RANKS` | derived | `MAX_BITS + 3`: the ranks `HUF_setMaxHeight` keeps a lightest node for, the reference's `HUF_TABLELOG_MAX + 2` slots for its 12-bit limit, here for the 11 bits of RFC 8878 §4.2.1 with the same room above the deepest rank searched (zstd 1.5.7 lib/compress/huf_compress.c). |
+| `crates/engine/src/store/mod.rs` `RANGE_FILTER_BITS` | measured | 8 suffix bits a key in a branch's range filter: 1 M keys (benches/surf.rs, 2026-10-07), 16-byte random-number keys let 0.03% of empty ranges through (5.6% at 0 bits) at 18.8 bits a key; object names 3.6–4.4% (38–44% at 0, 0.2–0.6% at 16). |
 | `crates/engine/src/store/mod.rs` `MIN_PAGE` | external | 4096 bytes, the smallest store page: the largest logical block common devices use and the page every supported file system maps (docs/design/raft-log.md §2's `B`; a larger device alignment raises it). |
 | `crates/engine/src/store/page.rs` `FORMAT` | format | 1, the store page format this engine writes and reads (docs/design/engine-structure.md §8, E1). |
 | `crates/engine/src/store/page.rs` `HEADER` | format | 20 bytes: a store page's CRC-32C (4), kind (1), format (1), two zero bytes, payload length (4) and generation (8) (docs/design/engine-structure.md §8, E1). |
@@ -386,7 +387,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/engine/src/store/cache.rs` `PROMOTE` | cited | 2: reads in the small queue that move a page to main (libCacheSim `S3FIFO.c` default `move-to-main-threshold=2`). |
 | `crates/engine/src/store/cache.rs` `MAX_FREQ` | cited | 3: a cached page's read count's cap, the two-bit counter of S3-FIFO (libCacheSim `S3FIFO.c`, `MIN(freq, 3)`). |
 | `crates/engine/src/trunk/mod.rs` `ABSENT` | format | `u32::MAX`, a trunk image's marker for no child and no end key: above every node index and key length the image holds. |
-| `crates/engine/src/trunk/mod.rs` `IMAGE_FORMAT` | format | 1, the trunk image format this engine writes and reads (docs/design/engine-structure.md §8, E4c). |
+| `crates/engine/src/trunk/mod.rs` `IMAGE_FORMAT` | format | 3, the trunk image format this engine writes and reads: 2 named each pivot's view, 3 each branch's range filter (docs/design/engine-structure.md §8, E4c). |
 | `crates/engine/src/trunk/mod.rs` `IMAGE_MAGIC` | format | "mantleTK" in ASCII, little-endian: the trunk image header's magic number. |
 | `crates/gateway/src/layout.rs` `CHUNK` | cited | Tectonic's "typically 8 MiB" chunk (docs/research/01 §1.14). docs/design/gateway.md says measured transfer sizing will replace it, and audit §12.6/§16.2 requires per-upload sizing. |
 | `crates/gateway/src/layout.rs` `SEALED` | derived | `seal::SEGMENT + seal::TAG`: a 64 KiB plaintext segment plus its 16-byte AEAD tag (docs/design/gateway.md §1). |

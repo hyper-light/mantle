@@ -122,6 +122,25 @@ fn check_scan<F: BlockFile>(
     assert_eq!(all, every, "the keyspace page by page");
 }
 
+/// A narrow scan, `[key(k), key(k + 5))` (key `k` and nothing else of its bucket), reads exactly
+/// the oracle's live keys there: most of the trunk's sources hold nothing in it, and their range
+/// filters pass them over unread.
+fn check_narrow<F: BlockFile>(
+    db: &mut ShardDb<F>,
+    oracle: &BTreeMap<u64, Option<Vec<u8>>>,
+    k: u64,
+) {
+    let (lo, hi) = (key(k), key(k + 5));
+    let want: Vec<(Vec<u8>, Vec<u8>)> = oracle
+        .iter()
+        .filter_map(|(n, v)| v.as_ref().map(|v| (key(*n), v.clone())))
+        .filter(|(kk, _)| kk.as_slice() >= lo.as_slice() && kk.as_slice() < hi.as_slice())
+        .collect();
+    let mut got = Vec::new();
+    assert_eq!(scan_page(db, &lo, Some(&hi), 16, &mut got).unwrap(), None);
+    assert_eq!(got, want, "narrow scan at {k}");
+}
+
 fn check<F: BlockFile>(db: &mut ShardDb<F>, oracle: &BTreeMap<u64, Option<Vec<u8>>>, k: u64) {
     let mut value = Vec::new();
     let found = db.get(&key(k), &mut value).unwrap();
@@ -262,8 +281,19 @@ fn run_on<F: BlockFile + 'static>(
             check(&mut db, &oracle, j);
         }
     }
+    // Narrow scans over the trunk as the workload left it: every row exact, and sources passed
+    // over by their range filters.
+    let (skipped_before, _) = db.scan_filtered();
+    for k in 0..KEYS {
+        check_narrow(&mut db, &oracle, k);
+    }
+    let (skipped, opened) = db.scan_filtered();
+    assert!(
+        skipped > skipped_before,
+        "no source ruled out: skipped {skipped} opened {opened}"
+    );
     let (flush, trunk, _) = db.stats();
-    eprintln!("{flush:?}\n{trunk:?}");
+    eprintln!("{flush:?}\n{trunk:?}\nscan sources skipped {skipped} opened {opened}");
     // The workload did what it is for: many memtables packed in slices, cascades with leaf
     // compactions and splits.
     assert!(flush.flushes > 100, "{}", flush.flushes);

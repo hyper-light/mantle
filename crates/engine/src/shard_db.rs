@@ -149,6 +149,9 @@ pub struct ShardDb<F: BlockFile> {
     /// between scans.
     scan_key: Vec<u8>,
     scan_from: Vec<u8>,
+    /// Trunk sources scans passed over by their range filters, and sources they opened.
+    scan_skipped: u64,
+    scan_opened: u64,
     scan_end: Vec<u8>,
     /// Whether maintenance is timed ([`ShardDb::set_timed`]).
     timed: bool,
@@ -196,6 +199,8 @@ impl<F: BlockFile> ShardDb<F> {
             flush_stats: FlushStats::default(),
             scan_key: Vec::new(),
             scan_from: Vec::new(),
+            scan_skipped: 0,
+            scan_opened: 0,
             scan_end: Vec::new(),
             timed: false,
         })
@@ -308,6 +313,12 @@ impl<F: BlockFile> ShardDb<F> {
     /// How the trunk makes a bundle's view when it can rebuild it (`Trunk::set_view_choice`).
     pub fn set_view_choice(&mut self, choice: crate::trunk::ViewChoice) {
         self.trunk.set_view_choice(choice);
+    }
+
+    /// Has branches built from here keep `suffix_bits` a key in their range filters
+    /// (`Store::set_range_filter`).
+    pub fn set_range_filter(&mut self, suffix_bits: u32) -> Result<(), Error> {
+        self.store.set_range_filter(suffix_bits)
     }
 
     /// Gives point reads a page cache of `pages` pages (`Store::set_cache`).
@@ -436,7 +447,7 @@ impl<F: BlockFile> ShardDb<F> {
                     (true, _) => Some(seg_end.as_slice()),
                     (false, e) => e,
                 };
-                merge.open(store, &sources, seg_from, hi)?;
+                merge.open(store, &sources, seg_from, hi, end.is_some())?;
                 if bounded {
                     std::mem::swap(seg_from, seg_end);
                 } else {
@@ -492,6 +503,9 @@ impl<F: BlockFile> ShardDb<F> {
             }
         };
         merge.close(store);
+        let (skipped, opened) = merge.counts();
+        self.scan_skipped = self.scan_skipped.saturating_add(skipped);
+        self.scan_opened = self.scan_opened.saturating_add(opened);
         Ok(more)
     }
 
@@ -735,9 +749,14 @@ impl<F: BlockFile> ShardDb<F> {
         (self.flush_stats, self.trunk.stats(), self.store.io_stats())
     }
 
-    /// The bytes the trunk's branches hold in memory: filters, leaf indexes, page counts.
-    pub fn memory(&self) -> (usize, usize, usize) {
+    /// The bytes the trunk's branches and views hold in memory.
+    pub fn memory(&self) -> crate::trunk::Memory {
         self.trunk.memory()
+    }
+
+    /// Trunk sources scans have passed over by their range filters, and those they opened.
+    pub fn scan_filtered(&self) -> (u64, u64) {
+        (self.scan_skipped, self.scan_opened)
     }
 
     /// The trunk's bundles that have a REMIX view now.

@@ -33,6 +33,21 @@ use crate::remix::{Build, Rebuild, View};
 use crate::store::Store;
 use hyper_block::block::BlockFile;
 
+/// The bytes a trunk's branches and views hold in memory ([`Trunk::memory`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Memory {
+    /// Point filters.
+    pub filters: usize,
+    /// Leaf indexes.
+    pub indexes: usize,
+    /// Tree pages' entry counts.
+    pub counts: usize,
+    /// Range filters.
+    pub ranges: usize,
+    /// REMIX views.
+    pub views: usize,
+}
+
 /// The trunk's shape: from measurement, given at creation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrunkConfig {
@@ -374,8 +389,9 @@ enum Phase {
 }
 
 /// The saved image's format version.
-/// Format 2: each pivot names its view's extents after its branches.
-const IMAGE_FORMAT: u8 = 2;
+/// Format 2: each pivot names its view's extents after its branches. Format 3: each branch's
+/// descriptor names its range filter's bytes after its leaf index's.
+const IMAGE_FORMAT: u8 = 3;
 /// The saved image header's magic: "mantleTK" in ASCII, little-endian.
 const IMAGE_MAGIC: u64 = u64::from_le_bytes(*b"mantleTK");
 /// None, in a child or an end key's place.
@@ -1629,22 +1645,24 @@ impl Trunk {
         &self.view_extents
     }
 
-    /// The bytes its branches hold in memory: their filters, their leaf indexes, their pages'
-    /// entry counts.
-    pub fn memory(&self) -> (usize, usize, usize) {
-        let mut m = (0usize, 0usize, 0usize);
+    /// The bytes its branches and views hold in memory.
+    pub fn memory(&self) -> Memory {
+        let mut m = Memory::default();
         let mut add = |b: &Branch| {
-            m.0 = m.0.saturating_add(b.filter.bytes());
-            m.1 = m.1.saturating_add(b.index.bytes());
-            m.2 = m.2.saturating_add(b.counts.len().saturating_mul(2));
+            m.filters = m.filters.saturating_add(b.filter.bytes());
+            m.indexes = m.indexes.saturating_add(b.index.bytes());
+            m.counts = m.counts.saturating_add(b.counts.len().saturating_mul(2));
+            m.ranges = m.ranges.saturating_add(b.range.bytes());
         };
         self.pending.iter().for_each(&mut add);
         for n in &self.nodes {
             n.inflight.iter().flatten().for_each(&mut add);
-            n.pivots
-                .iter()
-                .flat_map(|p| p.bundle.branches())
-                .for_each(&mut add);
+            for p in &n.pivots {
+                p.bundle.branches().iter().for_each(&mut add);
+                if let Some(v) = p.bundle.view() {
+                    m.views = m.views.saturating_add(v.bytes());
+                }
+            }
         }
         m
     }

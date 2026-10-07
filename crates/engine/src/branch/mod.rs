@@ -25,6 +25,7 @@ pub mod merge;
 
 use crate::error::{Error, Malformed};
 use crate::fst::packed::MAX_WIDTH;
+use crate::fst::surf::{Surf, SurfBuilder};
 use crate::fst::trie::{Trie, TrieBuilder};
 use crate::store::{Run, Span, Store};
 use hyper_block::block::BlockFile;
@@ -96,6 +97,11 @@ pub struct Branch {
     /// its pages' entry counts in its pages.
     pub index: Trie,
     pub index_bytes: u64,
+    /// Its keys' range filter, deletions with them: a scan passes over a branch it rules out
+    /// without reading it (SuRF; docs/design/engine-structure.md §5, E6; research/35 §2).
+    /// Written after its leaf index in its pages.
+    pub range: Surf,
+    pub range_bytes: u64,
 }
 
 fn corrupt(why: Malformed) -> Error {
@@ -265,6 +271,11 @@ pub struct Builder {
     separators: TrieBuilder,
     index: Vec<u8>,
     index_trie: Option<Trie>,
+    /// Each key added, deletions too, and the range filter built of them at the seal, encoded
+    /// ([`Branch::range`]).
+    keys: SurfBuilder,
+    range: Vec<u8>,
+    range_filter: Option<Surf>,
     /// The last key of the last leaf written.
     prev_last: Vec<u8>,
     count: u64,
@@ -301,6 +312,8 @@ impl Builder {
         let lists = store.take_lists();
         let mut separators = lists.separators;
         separators.reset(MAX_WIDTH)?;
+        let mut keys_filter = lists.keys;
+        keys_filter.reset(store.range_filter_bits())?;
         let capacity = store.page_capacity();
         if capacity > usize::from(u16::MAX) {
             return Err(Error::InvalidArgument {
@@ -318,6 +331,9 @@ impl Builder {
             separators,
             index: lists.index,
             index_trie: None,
+            keys: keys_filter,
+            range: lists.range,
+            range_filter: None,
             prev_last: Vec::new(),
             count: 0,
             payload: Vec::with_capacity(capacity),
@@ -392,6 +408,7 @@ impl Builder {
         self.last.extend_from_slice(key);
         self.count = self.count.saturating_add(1);
         self.filter.insert(filter::hash(key));
+        self.keys.add(key)?;
         self.entry_bytes = self.entry_bytes.saturating_add(
             u64::try_from(key.len().saturating_add(value.len())).unwrap_or(u64::MAX),
         );
@@ -534,7 +551,8 @@ impl Builder {
                         .filter
                         .bytes()
                         .saturating_add(self.counts.len().saturating_mul(2))
-                        .saturating_add(self.index.len()),
+                        .saturating_add(self.index.len())
+                        .saturating_add(self.range.len()),
                     at: 0,
                     pages: 0,
                 });
@@ -599,8 +617,8 @@ impl Builder {
 
     /// The branch, its tree and filter written; refused before. The run's buffer goes back to
     /// the store's pool for the next writer.
-    /// Bytes `range` of what follows the tree in the branch's pages: the filter's bytes, then
-    /// each tree page's entry count, two bytes each.
+    /// Bytes `range` of what follows the tree in the branch's pages: the filter's bytes, each
+    /// tree page's entry count (two bytes each), the leaf index, then the range filter.
     fn stream_bytes(&self, range: std::ops::Range<usize>, out: &mut Vec<u8>) {
         let fb = self.filter.bytes();
         let cb = self.counts.len().saturating_mul(2);
@@ -614,19 +632,31 @@ impl Builder {
             out.push(count.get(at % 2).copied().unwrap_or(0));
         }
         let base = fb.saturating_add(cb);
+        let ib = self.index.len();
         let from = range.start.max(base).saturating_sub(base);
-        let to = range.end.saturating_sub(base);
+        let to = range.end.saturating_sub(base).min(ib);
         if from < to {
             out.extend_from_slice(self.index.get(from..to).unwrap_or(&[]));
         }
+        let base = base.saturating_add(ib);
+        let from = range.start.max(base).saturating_sub(base);
+        let to = range.end.saturating_sub(base);
+        if from < to {
+            out.extend_from_slice(self.range.get(from..to).unwrap_or(&[]));
+        }
     }
 
-    /// The index of the leaves' separators, built and encoded at the seal.
+    /// The index of the leaves' separators and the keys' range filter, built and encoded at the
+    /// seal.
     fn build_index(&mut self) -> Result<(), Error> {
         let trie = self.separators.finish()?;
         self.index.clear();
         trie.encode(&mut self.index);
         self.index_trie = Some(trie);
+        let range = self.keys.finish()?;
+        self.range.clear();
+        range.encode(&mut self.range);
+        self.range_filter = Some(range);
         Ok(())
     }
 
@@ -654,11 +684,16 @@ impl Builder {
             index_bytes: u64::try_from(self.index.len())
                 .map_err(|_| corrupt(Malformed::TooLarge))?,
             index: self.index_trie.ok_or(corrupt(Malformed::CountMismatch))?,
+            range_bytes: u64::try_from(self.range.len())
+                .map_err(|_| corrupt(Malformed::TooLarge))?,
+            range: self.range_filter.ok_or(corrupt(Malformed::CountMismatch))?,
         });
         store.give_lists(crate::store::Lists {
             extents: self.extents,
             counts: self.counts,
             separators: self.separators,
+            keys: self.keys,
+            range: self.range,
             index: self.index,
         });
         branch
@@ -848,7 +883,7 @@ impl Branch {
 
 impl Branch {
     /// The branch's descriptor, as a trunk page stores it: root, height, count, the filter's
-    /// place and size, then the extents.
+    /// place and size, the leaf index's and range filter's sizes, then the extents.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         out.extend_from_slice(&self.root.to_le_bytes());
         out.push(self.height);
@@ -857,6 +892,7 @@ impl Branch {
         out.extend_from_slice(&self.filter_pages.to_le_bytes());
         out.extend_from_slice(&self.filter_bytes.to_le_bytes());
         out.extend_from_slice(&self.index_bytes.to_le_bytes());
+        out.extend_from_slice(&self.range_bytes.to_le_bytes());
         let n = u32::try_from(self.extents.len()).map_err(|_| corrupt(Malformed::TooLarge))?;
         out.extend_from_slice(&n.to_le_bytes());
         for e in &self.extents {
@@ -895,6 +931,7 @@ impl Branch {
         let filter_pages = u32_of(take(4)?)?;
         let filter_bytes = u64_of(take(8)?)?;
         let index_bytes = u64_of(take(8)?)?;
+        let range_bytes = u64_of(take(8)?)?;
         let n = usize::try_from(u32_of(take(4)?)?).map_err(|_| corrupt(Malformed::TooLarge))?;
         let mut extents = Vec::with_capacity(n.min(bytes.len() / 8));
         for _ in 0..n {
@@ -922,14 +959,25 @@ impl Branch {
         let fb = usize::try_from(filter_bytes).map_err(|_| corrupt(Malformed::TooLarge))?;
         let tree = usize::try_from(filter_start).map_err(|_| corrupt(Malformed::TooLarge))?;
         let ib = usize::try_from(index_bytes).map_err(|_| corrupt(Malformed::TooLarge))?;
+        let rb = usize::try_from(range_bytes).map_err(|_| corrupt(Malformed::TooLarge))?;
         let cb = tree.checked_mul(2).ok_or(corrupt(Malformed::TooLarge))?;
-        if Some(filter.len()) != cb.checked_add(fb).and_then(|n| n.checked_add(ib)) {
+        if Some(filter.len())
+            != cb
+                .checked_add(fb)
+                .and_then(|n| n.checked_add(ib))
+                .and_then(|n| n.checked_add(rb))
+        {
             return Err(corrupt(Malformed::CountMismatch));
         }
         let (filter_part, rest) = filter.split_at(fb);
-        let (count_part, index_part) = rest.split_at(cb);
+        let (count_part, rest) = rest.split_at(cb);
+        let (index_part, range_part) = rest.split_at(ib);
         let (index, used) = Trie::decode(index_part)?;
         if used != ib {
+            return Err(corrupt(Malformed::CountMismatch));
+        }
+        let (range, used) = Surf::decode(range_part)?;
+        if used != rb || range.len() != usize::try_from(count).unwrap_or(usize::MAX) {
             return Err(corrupt(Malformed::CountMismatch));
         }
         let counts: Vec<u16> = count_part
@@ -953,6 +1001,8 @@ impl Branch {
                 counts,
                 index,
                 index_bytes,
+                range,
+                range_bytes,
             },
             at,
         ))

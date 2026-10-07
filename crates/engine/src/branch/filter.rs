@@ -54,10 +54,12 @@ fn block_of(h: u64, blocks: usize) -> usize {
     usize::try_from(((h >> 32).wrapping_mul(n)) >> 32).unwrap_or(0)
 }
 
-/// The probes' bit positions within a block, from the hash's low 32 bits remixed by the golden
-/// ratio each probe, its top 9 bits a position (RocksDB's FastLocalBloom derives its probes so).
+/// The probes' bit positions within a block, from the hash's high 32 bits remixed by the golden
+/// ratio each probe, its top 9 bits a position (RocksDB's FastLocalBloom derives its probes so,
+/// from the low 32). The high 32 are what a branch keeps of each key ([`crate::maplet::hash32`]),
+/// so a filter can be rebuilt at any size from them without reading the keys (research/39 §3).
 fn probes(h: u64) -> impl Iterator<Item = (usize, u64)> {
-    let mut x = u32::try_from(h & 0xFFFF_FFFF).unwrap_or(0);
+    let mut x = u32::try_from(h >> 32).unwrap_or(0);
     (0..PROBES).map(move |_| {
         x = x.wrapping_mul(0x9E37_79B9);
         let bit = x >> 23;
@@ -218,6 +220,7 @@ mod tests {
             .count();
         // The bound for 10 bits a key is 0.8% unblocked; blocking costs a little. Over 100,000
         // absent keys, 2% is far past any rate a working filter gives.
+        println!("false positives {false_positives} of 100000");
         assert!(false_positives < 2_000, "{false_positives}");
         assert_eq!(
             f.bytes(),
@@ -244,6 +247,7 @@ mod tests {
             .filter(|i| f.may_contain(hash(format!("other-{i}").as_bytes())))
             .count();
         // 66 bits a key here, against 10 in the first test's bound of 2,000.
+        println!("false positives {false_positives} of 100000");
         assert!(false_positives < 2_000, "{false_positives}");
         // Fitted to more keys than half holds, it stays.
         let mut g = Filter::new(Keys::AtMost(1_000));
@@ -257,6 +261,20 @@ mod tests {
         h.fit(1_024);
         assert_eq!(h.bytes(), 20 * 64);
         assert!((0..1_024u32).all(|i| h.may_contain(hash(&i.to_le_bytes()))));
+    }
+
+    #[test]
+    fn a_filter_rebuilt_from_the_keys_32_bit_hashes_is_the_one_built_from_the_keys() {
+        // What a branch keeps of each key (crate::maplet::hash32) rebuilds its filter exactly,
+        // at this size or any other, without the keys (research/39 §3).
+        let hashes: Vec<u64> = (0..50_000u32)
+            .map(|i| hash(format!("k{i}").as_bytes()))
+            .collect();
+        let kept: Vec<u64> = hashes
+            .iter()
+            .map(|&h| u64::from(crate::maplet::hash32(h)) << 32)
+            .collect();
+        assert_eq!(Filter::build(&hashes), Filter::build(&kept));
     }
 
     #[test]

@@ -20,6 +20,7 @@ use hyper_block::sim::SimFile;
 use hyper_rt::{Runtime, RuntimeConfig};
 use mantle_engine::Error;
 use mantle_engine::ranges::{Client, Ranges, RangesConfig};
+use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::Config;
 use mantle_engine::trunk::TrunkConfig;
@@ -95,22 +96,25 @@ fn check_scan(
     limit: usize,
 ) {
     let (from_key, end_key) = (key(from, 0), key(end, 0));
-    let mut rows = Vec::new();
+    let mut page = Rows::new();
+    let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut at = from_key.clone();
+    let mut next = Vec::new();
     let mut pages = 0;
     loop {
-        let before = rows.len();
-        let next = client.scan(&at, Some(&end_key), limit, &mut rows).unwrap();
-        assert!(rows.len() - before <= limit);
+        page.clear();
+        let more = client
+            .scan(&at, Some(&end_key), limit, &mut page, &mut next)
+            .unwrap();
+        assert!(page.len() <= limit);
+        rows.extend(page.iter().map(|(k, v)| (k.to_vec(), v.to_vec())));
         pages += 1;
         assert!(pages < 100_000, "a scan that never ends");
-        match next {
-            Some(n) => {
-                assert!(n > at || rows.len() > before, "a page that does not move");
-                at = n;
-            }
-            None => break,
+        if !more {
+            break;
         }
+        assert!(next > at || !page.is_empty(), "a page that does not move");
+        at.clone_from(&next);
     }
     for w in rows.windows(2) {
         assert!(w[0].0 < w[1].0, "rows out of order");

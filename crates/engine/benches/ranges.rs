@@ -31,6 +31,7 @@ use hyper_block::issuer::Issuer;
 use hyper_rt::machine::calibration::{Calibration, Policy};
 use hyper_rt::{Runtime, RuntimeConfig};
 use mantle_engine::ranges::{Client, Ranges, RangesConfig};
+use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::Config;
 use mantle_engine::trunk::TrunkConfig;
@@ -213,9 +214,18 @@ fn main() {
     }
     if seeks > 0 {
         phase("seekrandom", &ranges, threads, seeks, |c, rng, _| {
-            let mut page = Vec::with_capacity(seek_nexts);
-            c.scan(&key(rng.next() % num), None, seek_nexts, &mut page)
-                .unwrap();
+            // Each operation's buffers are its own here; a client that keeps them allocates
+            // nothing per seek.
+            let mut page = Rows::new();
+            let mut next = Vec::new();
+            c.scan(
+                &key(rng.next() % num),
+                None,
+                seek_nexts,
+                &mut page,
+                &mut next,
+            )
+            .unwrap();
             !page.is_empty()
         });
     }

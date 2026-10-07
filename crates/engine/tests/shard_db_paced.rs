@@ -19,6 +19,7 @@ use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::issuer::Issuer;
 use hyper_block::sim::SimFile;
+use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::Config;
 use mantle_engine::trunk::TrunkConfig;
@@ -36,6 +37,21 @@ const TRUNK: TrunkConfig = TrunkConfig {
 };
 const KEYS: u64 = 1500;
 const OPS: u64 = 12_000;
+
+/// A page of `ShardDb::scan` as owned rows, and its continuation.
+fn scan_page<F: BlockFile>(
+    db: &mut ShardDb<F>,
+    from: &[u8],
+    end: Option<&[u8]>,
+    limit: usize,
+    out: &mut Vec<(Vec<u8>, Vec<u8>)>,
+) -> Result<Option<Vec<u8>>, mantle_engine::Error> {
+    let mut rows = Rows::new();
+    let mut next = Vec::new();
+    let more = db.scan(from, end, limit, &mut rows, &mut next)?;
+    out.extend(rows.iter().map(|(k, v)| (k.to_vec(), v.to_vec())));
+    Ok(if more { Some(next) } else { None })
+}
 
 fn key(k: u64) -> Vec<u8> {
     format!("bucket-{}/obj-{k:06}", k % 5).into_bytes()
@@ -62,7 +78,7 @@ fn check_scan<F: BlockFile>(
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     let mut got = Vec::new();
-    let next = db.scan(&lo, Some(&hi), limit, &mut got).unwrap();
+    let next = scan_page(db, &lo, Some(&hi), limit, &mut got).unwrap();
     let page: Vec<_> = want.iter().take(limit).cloned().collect();
     assert_eq!(got, page, "scan [{a}, {b}) limit {limit}");
     // The continuation lies past the page's last key and no further than the next live key: a key
@@ -86,7 +102,7 @@ fn check_scan<F: BlockFile>(
                 // A deleted key left in range: the next page reads nothing.
                 let mut rest = Vec::new();
                 assert_eq!(
-                    db.scan(&c, Some(&hi), limit.max(1), &mut rest).unwrap(),
+                    scan_page(db, &c, Some(&hi), limit.max(1), &mut rest).unwrap(),
                     None
                 );
                 assert!(
@@ -99,7 +115,7 @@ fn check_scan<F: BlockFile>(
     // The whole keyspace in pages of `limit`.
     let mut all = Vec::new();
     let mut from = Vec::new();
-    while let Some(k) = db.scan(&from, None, limit.max(1), &mut all).unwrap() {
+    while let Some(k) = scan_page(db, &from, None, limit.max(1), &mut all).unwrap() {
         from = k;
     }
     let every: Vec<_> = live.into_iter().collect();

@@ -19,6 +19,7 @@ use hyper_rt::Runtime;
 use hyper_rt::sync::{ChannelReceiver, Sender, SyncError, channel, channel_with};
 
 use crate::error::Error;
+use crate::rows::Rows;
 use crate::shard_db::{FlushStats, ShardDb};
 use crate::store::IoStats;
 use crate::trunk::TrunkStats;
@@ -29,9 +30,9 @@ enum Ask {
     Put,
     Delete,
     Get,
-    /// A page of `[key, end)`, at most `limit` rows.
+    /// A page of `[key, end)` (to the range's end when not `bounded`), at most `limit` rows.
     Scan {
-        end: Option<Vec<u8>>,
+        bounded: bool,
         limit: usize,
     },
     Checkpoint(u64),
@@ -51,10 +52,13 @@ struct Request {
     key: Vec<u8>,
     /// A put's value; a get's answer.
     value: Vec<u8>,
+    /// A scan's end, when bounded.
+    end: Vec<u8>,
     /// A scan's rows.
-    rows: Vec<(Vec<u8>, Vec<u8>)>,
-    /// A scan's continuation.
-    next: Option<Vec<u8>>,
+    rows: Rows,
+    /// A scan's continuation, when `more`.
+    next: Vec<u8>,
+    more: bool,
     /// A get's: whether the key holds a value.
     found: bool,
     stats: Option<RangeStats>,
@@ -70,8 +74,10 @@ impl Request {
             ask: Ask::Flush,
             key: Vec::new(),
             value: Vec::new(),
-            rows: Vec::new(),
-            next: None,
+            end: Vec::new(),
+            rows: Rows::new(),
+            next: Vec::new(),
+            more: false,
             found: false,
             stats: None,
             result: Ok(()),
@@ -189,9 +195,20 @@ fn apply<F: BlockFile>(db: &mut ShardDb<F>, request: &mut Request) -> Result<(),
             request.found = db.get(&request.key, &mut request.value)?;
             Ok(())
         }
-        Ask::Scan { end, limit } => {
+        Ask::Scan { bounded, limit } => {
             request.rows.clear();
-            request.next = db.scan(&request.key, end.as_deref(), *limit, &mut request.rows)?;
+            let end = if *bounded {
+                Some(request.end.as_slice())
+            } else {
+                None
+            };
+            request.more = db.scan(
+                &request.key,
+                end,
+                *limit,
+                &mut request.rows,
+                &mut request.next,
+            )?;
             Ok(())
         }
         Ask::Checkpoint(applied) => db.checkpoint(*applied),
@@ -487,50 +504,62 @@ impl Client<'_> {
     }
 
     /// A page of `[from, end)` as `ShardDb::scan` gives one, across ranges: up to `limit` rows
-    /// appended to `out` in key order, and the key to continue from, none when the range is
-    /// done.
+    /// appended to `out` in key order; true when the page filled first, with the key to continue
+    /// from in `next`. Nothing is allocated once the client's buffers, `out` and `next` have
+    /// grown.
     pub fn scan(
         &mut self,
         from: &[u8],
         end: Option<&[u8]>,
         limit: usize,
-        out: &mut Vec<(Vec<u8>, Vec<u8>)>,
-    ) -> Result<Option<Vec<u8>>, Error> {
-        let mut range = self.ranges.range_of(from);
-        let mut at = from.to_vec();
+        out: &mut Rows,
+        next: &mut Vec<u8>,
+    ) -> Result<bool, Error> {
+        let ranges = self.ranges;
+        let mut range = ranges.range_of(from);
         let mut left = limit;
+        if let Some(r) = self.request.as_mut() {
+            r.key.clear();
+            r.key.extend_from_slice(from);
+        }
         loop {
             // The range's own end, or the scan's when it comes first; the last range asked is
             // the one whose end the scan's reaches.
-            let (stop, last) = match (self.ranges.starts.get(range.saturating_add(1)), end) {
-                (None, e) => (e.map(<[u8]>::to_vec), true),
-                (Some(b), Some(e)) if e <= b.as_slice() => (Some(e.to_vec()), true),
-                (Some(b), _) => (Some(b.clone()), false),
+            let bound = ranges.starts.get(range.saturating_add(1));
+            let (stop, last): (Option<&[u8]>, bool) = match (bound, end) {
+                (None, e) => (e, true),
+                (Some(b), Some(e)) if e <= b.as_slice() => (Some(e), true),
+                (Some(b), _) => (Some(b.as_slice()), false),
             };
             let r = self.call(range, |r| {
-                r.key.clear();
-                r.key.extend_from_slice(&at);
+                r.end.clear();
+                if let Some(stop) = stop {
+                    r.end.extend_from_slice(stop);
+                }
                 r.ask = Ask::Scan {
-                    end: stop,
+                    bounded: stop.is_some(),
                     limit: left,
                 };
             })?;
             left = left.saturating_sub(r.rows.len());
             out.append(&mut r.rows);
-            if let Some(next) = r.next.take() {
-                return Ok(Some(next));
+            if r.more {
+                next.clear();
+                next.extend_from_slice(&r.next);
+                return Ok(true);
             }
             if last {
-                return Ok(None);
+                return Ok(false);
             }
             range = range.saturating_add(1);
-            at.clear();
-            if let Some(s) = self.ranges.starts.get(range) {
-                at.extend_from_slice(s);
-            }
+            let start = ranges.starts.get(range).map_or(&[][..], Vec::as_slice);
             if left == 0 {
-                return Ok(Some(at));
+                next.clear();
+                next.extend_from_slice(start);
+                return Ok(true);
             }
+            r.key.clear();
+            r.key.extend_from_slice(start);
         }
     }
 

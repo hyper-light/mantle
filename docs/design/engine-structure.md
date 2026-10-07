@@ -410,6 +410,24 @@ The batches out at once are the owner's to state: the extent buffers it spares. 
 the caching mode derive from the device's measured latency and the node's memory is the next
 part.
 
+Measured again after the memtable, scan and trie work (10 M puts, 16 out, 1.5 GiB cache, this
+Mac under load, 2026-10-07; benches/shard_db.rs `attribute`):
+- put p50 0.54 µs (RocksDB 0.52), p99 1.8–1.9 µs (1.74–1.79), p99.9 4.0–4.3 µs (2.83–3.05),
+  p99.99 12–14 µs (9.8–10.1);
+- 1.4–1.6 M puts a second against RocksDB's 1.40–1.46 M;
+- reads 5.6–5.9× RocksDB's and seeks 1.4–1.6×, both afterwards.
+- Past p99.9, a put is the device's backpressure: those past p99.9 averaged 646 µs, 629 of it
+  waiting for one of the 16 runs to be answered. Merging and building in the same puts took
+  9–15 µs.
+- RocksDB lets compaction lag behind a memtable and its level-0 files, hundreds of MiB, before
+  it slows writes. A shard buffers its maintenance's output in its runs alone, 2 MiB, so its
+  puts feel the OS's dirty-page throttle sooner.
+- More runs out did not stop the waits: 64 out still waited 691–974 times a fill. A put that
+  deferred its share while every run was out bunched the shares (1,116 entries in one put, 5
+  stalls) and raised p99.9 to 5.3–5.8 µs.
+- So the remedy is the part named above: runs out sized from the device's measured write
+  latency and the memory the node spares the shard, not a larger constant.
+
 ## 7. Crash and recovery
 
 - **Order of a checkpoint.**

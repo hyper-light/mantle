@@ -91,6 +91,11 @@ pub struct IoStats {
     /// because the pool had none.
     pub buffers_taken: u64,
     pub buffers_fresh: u64,
+    /// Nanoseconds queueing written pages (sealing, caching and handing runs on, waits
+    /// included), and reading pages ahead for scans (from the cache or the file), timed only
+    /// when the store is ([`Store::set_timed`]).
+    pub queue_ns: u64,
+    pub ahead_ns: u64,
 }
 
 /// Nanoseconds since `since`, none when timing is off (`Store::set_timed`).
@@ -760,6 +765,18 @@ impl<F: BlockFile> Store<F> {
     /// not continuing the run writes the run out first ([`Self::write_run`]), and a full extent
     /// writes it.
     pub fn queue_page(&mut self, run: &mut Run, address: u64, payload: &[u8]) -> Result<(), Error> {
+        let started = self.timed.then(std::time::Instant::now);
+        let queued = self.queue_page_timed(run, address, payload);
+        self.io.queue_ns = self.io.queue_ns.saturating_add(elapsed_ns(started));
+        queued
+    }
+
+    fn queue_page_timed(
+        &mut self,
+        run: &mut Run,
+        address: u64,
+        payload: &[u8],
+    ) -> Result<(), Error> {
         let extent = self.extent_of(address);
         if extent == 0 || !self.alloc.is_held(extent) {
             return Err(Error::InvalidArgument {
@@ -1059,6 +1076,18 @@ impl<F: BlockFile> Store<F> {
     /// end, in one call. A scan of a branch then reads an extent a call where it read a page,
     /// and every page is still verified as it is taken.
     pub fn read_page_ahead(
+        &mut self,
+        span: &mut Span,
+        address: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<(), Error> {
+        let started = self.timed.then(std::time::Instant::now);
+        let read = self.read_page_ahead_timed(span, address, out);
+        self.io.ahead_ns = self.io.ahead_ns.saturating_add(elapsed_ns(started));
+        read
+    }
+
+    fn read_page_ahead_timed(
         &mut self,
         span: &mut Span,
         address: u64,

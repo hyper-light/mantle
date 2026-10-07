@@ -425,6 +425,9 @@ struct Slow {
     insert_ns: u64,
     rotate_ns: u64,
     forget_ns: u64,
+    wait_ns: u64,
+    queue_ns: u64,
+    ahead_ns: u64,
     rotated: bool,
 }
 
@@ -445,6 +448,9 @@ impl Slow {
             insert_ns: f1.insert_ns - f0.insert_ns,
             rotate_ns: f1.rotate_ns - f0.rotate_ns,
             forget_ns: f1.forget_ns - f0.forget_ns,
+            wait_ns: i1.write_wait_ns - i0.write_wait_ns,
+            queue_ns: i1.queue_ns - i0.queue_ns,
+            ahead_ns: i1.ahead_ns - i0.ahead_ns,
             rotated: f1.flushes != f0.flushes || f1.stalls != f0.stalls,
         }
     }
@@ -458,7 +464,7 @@ fn attribute_tail(lat: &[u64], slow: &mut [Slow]) {
     slow.sort_unstable_by_key(|s| std::cmp::Reverse(s.ns));
     for s in slow.iter().take(5) {
         println!(
-            "worst put {:.2} us: writes {} ({:.2} us) reads {} ({:.2} us) pack {:.2} trunk {:.2} (plan {:.2} finish {:.2} pack finish {:.2}) stall {:.2} insert {:.2} (rotate {:.2}) forget {:.2} rotated {}",
+            "worst put {:.2} us: writes {} ({:.2} us) reads {} ({:.2} us) pack {:.2} trunk {:.2} (plan {:.2} finish {:.2} pack finish {:.2}) stall {:.2} insert {:.2} (rotate {:.2}) forget {:.2} | queueing pages {:.2} (waiting for a run {:.2}) reading ahead {:.2} rotated {}",
             s.ns as f64 / 1000.0,
             s.writes,
             s.write_ns as f64 / 1000.0,
@@ -473,6 +479,9 @@ fn attribute_tail(lat: &[u64], slow: &mut [Slow]) {
             s.insert_ns as f64 / 1000.0,
             s.rotate_ns as f64 / 1000.0,
             s.forget_ns as f64 / 1000.0,
+            s.queue_ns as f64 / 1000.0,
+            s.wait_ns as f64 / 1000.0,
+            s.ahead_ns as f64 / 1000.0,
             s.rotated,
         );
     }
@@ -514,6 +523,13 @@ fn attribute_tail(lat: &[u64], slow: &mut [Slow]) {
             tail.iter().filter(|s| s.plan_ns > 0).count(),
             tail.iter().filter(|s| s.finish_ns > 0).count(),
             tail.iter().filter(|s| s.pack_finish_ns > 0).count(),
+        );
+        println!(
+            "tail {name} pages: queueing written pages {:.2} us (waiting for a run {:.2}), reading pages ahead {:.2} us, the rest of the work (merging, building) {:.2} us",
+            mean(&|s| s.queue_ns),
+            mean(&|s| s.wait_ns),
+            mean(&|s| s.ahead_ns),
+            mean(&|s| (s.pack_ns + s.trunk_ns).saturating_sub(s.queue_ns + s.ahead_ns)),
         );
     }
 }

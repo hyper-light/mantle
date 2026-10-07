@@ -67,6 +67,10 @@ fn main() {
     // The runs the store may have out at once as the ninth argument, the issuer's depth by
     // default: extent buffers spared so puts go on while a contended device lags.
     let batches: usize = args.get(8).map_or(issuer_depth, |s| s.parse().unwrap());
+    // Seeks after the reads as the tenth argument, none by default, each reading the eleventh's
+    // count of keys from a random start: db_bench's seekrandom with --seek_nexts.
+    let seeks: u64 = args.get(9).map_or(0, |s| s.parse().unwrap());
+    let seek_nexts: usize = args.get(10).map_or(10, |s| s.parse().unwrap());
     let path = dir.join("shard_db.store");
     let _ = std::fs::remove_file(&path);
     let align = Alignment::new(4096).unwrap();
@@ -207,6 +211,27 @@ fn main() {
         io2.cache_hits,
         io2.cache_misses
     );
+    if seeks > 0 {
+        let mut page = Vec::with_capacity(seek_nexts);
+        let mut keys_read = 0u64;
+        lat.clear();
+        let t = Instant::now();
+        for _ in 0..seeks {
+            let from = key(rng.next() % num);
+            page.clear();
+            let o = Instant::now();
+            db.scan(&from, None, seek_nexts, &mut page).unwrap();
+            lat.push(o.elapsed().as_nanos() as u64);
+            keys_read += page.len() as u64;
+        }
+        let s = t.elapsed().as_secs_f64();
+        report("seekrandom", &mut lat);
+        println!(
+            "seekrandom {seeks} {:.0} {:.3} nexts {seek_nexts} keys read {keys_read}",
+            seeks as f64 / s,
+            s * 1e6 / seeks as f64
+        );
+    }
     let (h, n, l) = db.shape().unwrap();
     println!("shape height {h} nodes {n} leaves {l}");
     drop(db);

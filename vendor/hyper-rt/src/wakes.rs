@@ -2,9 +2,10 @@
 //! with a summary bit per word and one pending flag above them, the two-level shape of the Linux block
 //! layer's scalable bitmap of tags (`lib/sbitmap.c`).
 //!
-//! A wake is a `fetch_or` on the slot's bit, then — only when that word went from empty to non-empty, as
-//! `sbitmap` does — on its word's summary bit, then a swap of the pending flag; so most wakes touch one cache
-//! line, not the summary word every waker of 4,096 slots shares (slates-dc's review, 2026-10-06). The shard
+//! A wake is a `fetch_or` on the slot's bit, then a `fetch_or` on its word's summary bit when that word went
+//! from empty to non-empty (as `sbitmap` does) or the summary bit reads clear, then a swap of the pending flag;
+//! so most wakes write one cache line, not the summary word every waker of 4,096 slots shares (slates-dc's
+//! review, 2026-10-06), and no wake waits on another waker to mark the summary for it. The shard
 //! drains by swapping the flag, then each marked summary word, then each marked word, to zero: summary
 //! before word, so a wake landing between them either is in the word the drain takes or marks the summary
 //! again for the next drain (loom-modelled below). A drain starts where the last one stopped and wraps, so
@@ -62,10 +63,17 @@ impl WakeBitmap {
         else {
             return false;
         };
-        // The waker that took the word from empty marks the summary; a later one finds it marked, or finds the
-        // word drained after this waker's `fetch_or`, in which case its own `fetch_or` saw zero and marks it.
-        if target.fetch_or(1u64 << bit, Ordering::AcqRel) == 0 {
-            summary.fetch_or(1u64 << (word % BITS), Ordering::AcqRel);
+        // The waker that took the word from empty marks the summary. A later one marks it too unless it reads it
+        // marked: the first waker may not have reached its summary yet, and a drain that runs meanwhile clears
+        // no summary bit for the word, so it would miss this waker's bit until the first waker's mark. A wake
+        // must not wait on another waker's progress (hyper-rt's registry_contention test found the own wake
+        // unseen by the drain right after it, 7 runs in 1,000, 2026-10-07). The read costs no write to the
+        // summary's line while it is marked, which keeps most wakes to one line.
+        let mark = 1u64 << (word % BITS);
+        if target.fetch_or(1u64 << bit, Ordering::AcqRel) == 0
+            || summary.load(Ordering::Acquire) & mark == 0
+        {
+            summary.fetch_or(mark, Ordering::AcqRel);
         }
         // A read-modify-write, not a plain store: every wake already pays two, and with a plain `Release` store
         // loom 0.7.2 explored an execution in which this thread's own later load read the flag's earlier value,
@@ -256,6 +264,23 @@ mod loom_tests {
             }
             bitmap.drain(|slot| seen[usize::try_from(slot).unwrap()] = true);
             assert_eq!(seen, [true, true], "every wake handed over");
+        });
+    }
+
+    /// The registry's contention test (2026-10-07): a waker that sets its bit and then drains as the shard
+    /// sees it at once, though another waker of the same word took the word from empty and has not yet
+    /// marked the summary. Before the summary was also marked by a waker that reads it clear, the drain
+    /// found no summary bit and handed nothing over until the other waker's mark.
+    #[test]
+    fn a_wake_is_seen_by_the_next_drain_whatever_another_waker_has_done() {
+        loom_bounds::explore("wakes: own wake then drain, beside another waker", || {
+            let bitmap: &'static WakeBitmap = Box::leak(Box::new(WakeBitmap::new(2)));
+            let other = loom::thread::spawn(move || assert!(bitmap.set(1)));
+            assert!(bitmap.set(0));
+            let mut own = false;
+            bitmap.drain(|slot| own |= slot == 0);
+            other.join().unwrap();
+            assert!(own, "the drain after the wake handed it over");
         });
     }
 }

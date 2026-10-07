@@ -211,6 +211,19 @@ impl<F: BlockFile> ShardDb<F> {
         self.store.set_cache(pages);
     }
 
+    /// Hands the store's writes to `issuer`, the device's, with up to `batches` out at once
+    /// (`Store::attach`): a put that fills an extent goes on while the device writes it.
+    pub fn attach(
+        &mut self,
+        issuer: &hyper_block::issuer::Issuer,
+        batches: usize,
+    ) -> Result<(), Error>
+    where
+        F: 'static,
+    {
+        self.store.attach(issuer, batches)
+    }
+
     /// The store's file, the engine's work done.
     pub fn into_file(self) -> F {
         self.store.into_file()

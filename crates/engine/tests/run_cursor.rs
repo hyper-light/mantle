@@ -28,6 +28,8 @@ const CONFIG: Config = Config {
 };
 
 type Entries = BTreeMap<Vec<u8>, (Op, Vec<u8>)>;
+/// An entry read, and the position the cursor read it at.
+type Read = ((Vec<u8>, Op, Vec<u8>), (u64, usize));
 
 fn store(seed: u64) -> Store<SimFile> {
     let align = Alignment::new(4096).unwrap();
@@ -47,11 +49,7 @@ fn build(s: &mut Store<SimFile>, entries: &Entries) -> Branch {
 }
 
 /// Every entry from `from` on, as the run cursor reads them, with each one's position.
-fn walk(
-    s: &mut Store<SimFile>,
-    b: &Branch,
-    from: &[u8],
-) -> Vec<((Vec<u8>, Op, Vec<u8>), (u64, usize))> {
+fn walk(s: &mut Store<SimFile>, b: &Branch, from: &[u8]) -> Vec<Read> {
     let mut c = b.run_at(s, from).unwrap();
     let mut out = Vec::new();
     while c.valid() {

@@ -19,7 +19,7 @@ use hyper_block::buf::Alignment;
 use hyper_block::sim::SimFile;
 use hyper_rt::{Runtime, RuntimeConfig};
 use mantle_engine::Error;
-use mantle_engine::ranges::{Client, Ranges};
+use mantle_engine::ranges::{Client, Ranges, RangesConfig};
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::Config;
 use mantle_engine::trunk::TrunkConfig;
@@ -55,6 +55,14 @@ fn config(shards: u16) -> RuntimeConfig {
         page_bytes: 4096,
         spin_ns: 0,
         wake_tracking: None,
+    }
+}
+
+fn ranges_config(clients: usize) -> RangesConfig {
+    RangesConfig {
+        clients,
+        slice_ns: SLICE_NS,
+        spin_ns: SLICE_NS,
     }
 }
 
@@ -158,7 +166,12 @@ fn worker(ranges: &Ranges, t: u64) -> BTreeMap<u64, Option<Vec<u8>>> {
 fn clients_on_many_threads_read_their_own_writes_across_ranges_and_shards() {
     let runtime = Runtime::start(&config(2)).unwrap();
     let starts = ["", "k00500", "k01000", "k01500"];
-    let ranges = Ranges::start(&runtime, engines(&starts), THREADS as usize + 1, SLICE_NS).unwrap();
+    let ranges = Ranges::start(
+        &runtime,
+        engines(&starts),
+        ranges_config(THREADS as usize + 1),
+    )
+    .unwrap();
     let oracles: Vec<_> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..THREADS)
             .map(|t| {
@@ -197,7 +210,7 @@ fn clients_on_many_threads_read_their_own_writes_across_ranges_and_shards() {
 #[test]
 fn clients_past_the_bound_are_refused_and_admitted_once_one_goes() {
     let runtime = Runtime::start(&config(1)).unwrap();
-    let ranges = Ranges::start(&runtime, engines(&[""]), 2, SLICE_NS).unwrap();
+    let ranges = Ranges::start(&runtime, engines(&[""]), ranges_config(2)).unwrap();
     let a = ranges.client().unwrap();
     let mut b = ranges.client().unwrap();
     assert!(matches!(
@@ -218,7 +231,7 @@ fn clients_past_the_bound_are_refused_and_admitted_once_one_goes() {
 #[test]
 fn a_range_whose_shard_is_gone_is_reported_gone() {
     let runtime = Runtime::start(&config(1)).unwrap();
-    let ranges = Ranges::start(&runtime, engines(&["", "m"]), 1, SLICE_NS).unwrap();
+    let ranges = Ranges::start(&runtime, engines(&["", "m"]), ranges_config(1)).unwrap();
     let mut client = ranges.client().unwrap();
     client.put(b"a", b"1").unwrap();
     runtime.shutdown().unwrap();
@@ -235,7 +248,7 @@ fn ranges_must_ascend_from_the_empty_key() {
     let runtime = Runtime::start(&config(1)).unwrap();
     for starts in [&["a"][..], &["", "m", "c"], &["", "m", "m"]] {
         assert!(matches!(
-            Ranges::start(&runtime, engines(starts), 1, SLICE_NS),
+            Ranges::start(&runtime, engines(starts), ranges_config(1)),
             Err(Error::InvalidArgument { .. })
         ));
     }

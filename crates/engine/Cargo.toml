@@ -53,3 +53,7 @@ workspace = true
 [[bench]]
 name = "shard_db"
 harness = false
+
+[[bench]]
+name = "ranges"
+harness = false

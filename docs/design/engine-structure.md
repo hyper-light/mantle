@@ -159,6 +159,54 @@ What mantle changes, and why:
    the old view with the new branch. A SuRF-style range filter answers "nothing in this prefix"
    without reading (research/33 row 8).
 
+### Seeks and listings (step E6), as designed
+
+Scans as built (2026-10-07) merge, at each leaf a scan reaches, a cursor per branch a key there
+probes: the pending branches, the in-flight and pivot bundles on the path, and the leaf's own
+bundle. A scan finds its leaf in one descent (`Trunk::segment_at`) and the next only when that
+one runs dry, so a seek's cost does not grow with the data. It allocates nothing per row and
+about ten times a seek (the merge's cursors), and runs at 1.6–2.0× RocksDB's seekrandom
+throughput at 3 M keys (benches/shard_db.rs, 2026-10-07: 151–165 k seeks a second, p50 5.9–6.4 µs,
+against 84–94 k at p50 9.5–11.2 µs). What remains is the merge: a seek descends every branch of
+the leaf's bundle, and every `next` compares the heads of all of them.
+
+**A REMIX view per leaf bundle** (Zhong et al., FAST 2021; research/34 §4) removes both. The runs
+are the branches of a leaf pivot's bundle, newest first: they change only when a flush reaches
+the leaf or the leaf compacts, while the branches above the leaf (pending, the path's bundles)
+change with every memtable and stay merge sources, a few beside one view.
+
+- **Segments.** The bundle's entries in key order, every version, cut into segments of at most
+  `D` entries, a key's versions never split. Each segment holds its anchor (its first key), one
+  offset per run (the run's first entry at or past the anchor, as the page number in the
+  branch's pages and the entry's index in the page), and one selector byte per entry: the run's
+  number (at most 63 runs), 0x80 for a version a newer run shadows, 0x40 for a deletion.
+  `D = 32` as the paper evaluates it: 2.9 B a key for 48-byte keys and 8 runs, 3.16% of the data
+  (research/34 §4); `D` is at least the runs, so a key's versions fit one segment.
+- **Pages.** A view's segments are written to its own extents as pages, sealed and verified as
+  every page, read through the page cache; the anchors form an index of pages as a branch's keys
+  do. The trunk image names each pivot's view with its bundle.
+- **Seek.** Binary search of the anchors, then of the segment's entries by reading only the keys
+  the search lands on: `log2(H·N)` comparisons where the merge takes `H·log2 N`. A run's page is
+  read only when a selector first names it.
+- **Next.** The next selector names the run whose cursor moves: no comparison. Shadowed versions
+  are skipped by their bit without reading them; a deletion hides its key without reading a value.
+  A run's next leaf is the next leaf page in its page order (a branch's tree pages precede its
+  filter's, and each page names its kind), so a view's cursor needs no path from the root.
+- **Built as maintenance.** A view is built when its leaf's bundle changes, as SILK-scheduled
+  work of the leaf's shard, a slice at a time like a compaction (§6). Until it is built a scan
+  merges the bundle's cursors as before, so correctness never waits on it. The first build
+  merges the bundle's runs; the paper's incremental build (the old view merged with the new run,
+  merge points from the anchors) follows, measured against it.
+- **Gets** keep the filters (and later the maplets): a REMIX get is a seek, which a filter that
+  rules a branch out beats.
+
+**SuRF range filters** (Zhang et al., SIGMOD 2018; research/33 row 8) then let a bounded seek
+skip a branch above the leaf with nothing in the range without reading it (closed seeks up to
+5× in RocksDB).
+
+Held to: seekrandom and short listings against RocksDB's `db_bench` at the same key count,
+under load, every percentile, with allocations, reallocations and page faults a seek.
+
 ### The page cache, as built (step E8's first part)
 
 With uncached I/O, which keeps the OS's dirty-page throttle off the put path (§6), the device

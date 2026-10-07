@@ -190,6 +190,33 @@ pub fn lookup(page: &[u8], shape: &Shape, probe: &Probe) -> Result<u64, Error> {
     Ok(mask)
 }
 
+/// A built maplet held in memory: its shape and its pages.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Maplet {
+    pub shape: Shape,
+    pub pages: Vec<Vec<u8>>,
+}
+
+impl Maplet {
+    /// The values under which the key of xxh3 hash `hash` may be held, as a mask.
+    pub fn route(&self, hash: u64) -> Result<u64, Error> {
+        let probe = self.shape.probe(hash)?;
+        let page = usize::try_from(probe.page)
+            .ok()
+            .and_then(|p| self.pages.get(p))
+            .ok_or_else(corrupt)?;
+        lookup(page, &self.shape, &probe)
+    }
+
+    /// The bytes of memory it takes: its pages and its index.
+    pub fn bytes(&self) -> usize {
+        self.pages
+            .iter()
+            .map(Vec::len)
+            .fold(self.shape.index_bytes(), usize::saturating_add)
+    }
+}
+
 /// The bucket bits for `entries` keys: at most one key a bucket on average, a block at least.
 pub fn bucket_bits(entries: u64) -> u32 {
     ceil_log2(entries).clamp(BUCKETS.trailing_zeros(), 32)

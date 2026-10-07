@@ -1137,6 +1137,7 @@ impl<F: BlockFile> ShardDb<F> {
         self.packing.is_some()
             || self.trunk.debt() > 0
             || self.trunk.views_owed()
+            || self.trunk.maplets_owed()
             || self.store.forget_debt() > 0
     }
 
@@ -1160,6 +1161,9 @@ impl<F: BlockFile> ShardDb<F> {
         }
         if self.trunk.views_owed() {
             return self.trunk.view_step(&mut self.store, keys);
+        }
+        if self.trunk.maplets_owed() {
+            return self.trunk.maplet_step(&mut self.store, keys);
         }
         Ok(self.store.forget_some(keys))
     }
@@ -1260,6 +1264,13 @@ impl<F: BlockFile> ShardDb<F> {
             let done = self
                 .trunk
                 .view_step(&mut self.store, budget.saturating_sub(used))?;
+            used = used.saturating_add(done.max(1));
+        }
+        // Then bundles' maplets, each step at least one unit while owed.
+        while used < budget && self.trunk.maplets_owed() {
+            let done = self
+                .trunk
+                .maplet_step(&mut self.store, budget.saturating_sub(used))?;
             used = used.saturating_add(done.max(1));
         }
         // Then the cache's freed pages, at most the budget left.

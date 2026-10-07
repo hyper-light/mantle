@@ -424,9 +424,15 @@ fn run_with<F: BlockFile + 'static>(
             check(&mut db, &oracle, k);
         }
         // The bundles' REMIX views are built in idle time with the rest, and scans read
-        // bundles through them exactly.
+        // bundles through them exactly; so are their maplets, kept where they measured cheaper
+        // than their filters, and the gets above read every key exactly either way.
         let (_, trunk, _) = db.stats();
         assert!(trunk.views_built > 0, "{trunk:?}");
+        // Each bundle's maplet kept or declined by measured cost, never both nor neither.
+        assert!(
+            trunk.maplets_built + trunk.maplets_declined > 0,
+            "{trunk:?}"
+        );
         for (a, b, limit) in [(0, KEYS - 1, 1), (3, KEYS / 2, 7), (KEYS / 3, KEYS - 1, 64)] {
             check_scan(&mut db, &oracle, a, b, limit);
         }

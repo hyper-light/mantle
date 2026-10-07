@@ -192,6 +192,21 @@ fn runs_past_the_batches_wait_in_write_memory_and_read_back_whole() {
         "{io:?}"
     );
 
+    // The queued extents' pages read with the gate still shut: from write memory, exactly as
+    // written, without waiting for the device (a wait here would never end).
+    let queued_pages = 2 * CONFIG.extent_pages as usize;
+    let mut span = store.span().unwrap();
+    for &a in addresses.iter().rev().take(queued_pages) {
+        let mut out = Vec::new();
+        store.read_page_ahead(&mut span, a, &mut out).unwrap();
+        assert_eq!(out, payload(a), "queued page {a}");
+        let mut point = Vec::new();
+        store.read_page(a, &mut point).unwrap();
+        assert_eq!(point, payload(a), "queued page {a} read alone");
+    }
+    store.give_span(span);
+    assert_eq!(store.io_stats().queued_reads, 2 * queued_pages as u64);
+
     // A scan of all four, the last queued first, the gate opened beside it: a page still queued
     // is read once its run has gone out and landed, exactly as written.
     std::thread::scope(|s| {

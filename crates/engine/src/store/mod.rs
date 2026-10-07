@@ -100,6 +100,8 @@ pub struct IoStats {
     /// waited, and the most queued at once.
     pub runs_queued: u64,
     pub runs_queued_most: u64,
+    /// Pages read from runs still queued, without waiting for the device.
+    pub queued_reads: u64,
 }
 
 /// Nanoseconds since `since`, none when timing is off (`Store::set_timed`).
@@ -1131,6 +1133,9 @@ impl<F: BlockFile> Store<F> {
         {
             return Ok(());
         }
+        if self.queued_page(address, out)? {
+            return Ok(());
+        }
         self.settle(address, address.saturating_add(1))?;
         let offset = Self::offset_in(self.config, address)?;
         self.io.reads = self.io.reads.saturating_add(1);
@@ -1150,6 +1155,39 @@ impl<F: BlockFile> Store<F> {
             c.insert(address, payload);
         }
         Ok(())
+    }
+
+    /// Decodes page `address` into `out` from a run still queued in write memory, if one holds
+    /// it: its bytes are there, sealed, and waiting for the device would hold the read behind
+    /// every run queued before it.
+    fn queued_page(&mut self, address: u64, out: &mut Vec<u8>) -> Result<bool, Error> {
+        let size = self.config.page_size;
+        let Some(page) = self.writer.as_ref().and_then(|w| {
+            let q = w
+                .queued
+                .iter()
+                .find(|q| q.first <= address && address < q.end)?;
+            let at = usize::try_from(address.checked_sub(q.first)?)
+                .ok()?
+                .checked_mul(size)?;
+            q.buf.as_slice().get(at..at.checked_add(size)?)
+        }) else {
+            return Ok(false);
+        };
+        node_payload(page, address, out)?;
+        self.io.queued_reads = self.io.queued_reads.saturating_add(1);
+        Ok(true)
+    }
+
+    /// The first page at or past `address`, before `end`, that a queued run holds.
+    fn first_queued(&self, address: u64, end: u64) -> Option<u64> {
+        self.writer.as_ref().and_then(|w| {
+            w.queued
+                .iter()
+                .filter(|q| q.first < end && address < q.end)
+                .map(|q| q.first.max(address))
+                .min()
+        })
     }
 
     /// A span for a scan, which may stop after a page: its first read takes one page, and its
@@ -1218,6 +1256,9 @@ impl<F: BlockFile> Store<F> {
             self.io.span_cache_hits = self.io.span_cache_hits.saturating_add(1);
             return Ok(());
         }
+        if held.is_none() && self.queued_page(address, out)? {
+            return Ok(());
+        }
         let index = match held {
             Some(i) => i,
             None => {
@@ -1246,7 +1287,9 @@ impl<F: BlockFile> Store<F> {
             .checked_add(1)
             .and_then(|e| e.checked_mul(extent_pages))
             .ok_or(corrupt(Malformed::TooLarge))?;
-        // Pages a run in flight writes are read once it is answered.
+        // The read stops before the first page a queued run holds, which is read from the
+        // queue when reached; pages a run in flight writes are read once it is answered.
+        let extent_end = self.first_queued(address, extent_end).unwrap_or(extent_end);
         self.settle(address, extent_end)?;
         let size =
             u64::try_from(self.config.page_size).map_err(|_| corrupt(Malformed::TooLarge))?;

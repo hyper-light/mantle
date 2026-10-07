@@ -14,7 +14,10 @@
     clippy::disallowed_macros
 )]
 
+use hyper_block::block::BlockFile;
 use hyper_block::buf::Alignment;
+use hyper_block::file::{CachingRequest, DeviceFile};
+use hyper_block::issuer::Issuer;
 use hyper_block::sim::SimFile;
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::Config;
@@ -38,7 +41,7 @@ fn key(k: u64) -> Vec<u8> {
     format!("bucket-{}/obj-{k:06}", k % 5).into_bytes()
 }
 
-fn check(db: &mut ShardDb<SimFile>, oracle: &BTreeMap<u64, Option<Vec<u8>>>, k: u64) {
+fn check<F: BlockFile>(db: &mut ShardDb<F>, oracle: &BTreeMap<u64, Option<Vec<u8>>>, k: u64) {
     let mut value = Vec::new();
     let found = db.get(&key(k), &mut value).unwrap();
     match oracle.get(&k) {
@@ -69,11 +72,60 @@ fn a_cache_never_serves_a_page_its_address_no_longer_holds() {
     run(4_096);
 }
 
+/// The same on a real file whose runs go to a two-worker issuer, two out at once, with no cache:
+/// a read of a page whose run is in flight waits for it, a checkpoint waits for every run, and
+/// the store reopened from the file reads every key the last checkpoint holds.
+#[test]
+fn runs_submitted_to_the_issuer_read_back_and_reopen_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let align = Alignment::new(4096).unwrap();
+    let file = DeviceFile::open(&path, true, CachingRequest::Buffered, align).unwrap();
+    let issuer = Issuer::start(dir.path(), 2).unwrap();
+    let (mut db, oracle) = run_on(file, 0, Some(&issuer));
+    let (_, _, io) = db.stats();
+    assert!(io.submitted > 0 && io.reads > 0, "{io:?}");
+    db.checkpoint(OPS).unwrap();
+    drop(db.into_file());
+    let file = DeviceFile::open(&path, false, CachingRequest::Buffered, align).unwrap();
+    let (mut db, applied) = ShardDb::open(file, STORE, MEM, TRUNK).unwrap();
+    assert_eq!(applied, OPS);
+    for k in 0..KEYS {
+        check(&mut db, &oracle, k);
+    }
+    db.check_references().unwrap();
+}
+
 fn run(cache: usize) {
     let align = Alignment::new(4096).unwrap();
     let file = SimFile::new(align, Alignment::new(512).unwrap(), 17).unwrap();
+    let (db, _) = run_on(file, cache, None);
+    let (_, _, io) = db.stats();
+    // Every page enters the cache as it is written: a cache larger than the store serves every
+    // read; a small one serves some and misses others.
+    match cache {
+        0 => assert_eq!((io.cache_hits, io.cache_misses), (0, 0)),
+        // Compaction's scans take their pages from the cache too: no read reaches the device.
+        4_096 => assert!(
+            io.cache_hits > 0 && io.cache_misses == 0 && io.span_cache_hits > 0 && io.reads == 0,
+            "{io:?}"
+        ),
+        _ => assert!(io.cache_hits > 0 && io.cache_misses > 0, "{io:?}"),
+    }
+}
+
+/// The workload on `file`, its runs given to `issuer` when there is one; the engine flushed
+/// and checked at the end, and the oracle of what every key holds.
+fn run_on<F: BlockFile + 'static>(
+    file: F,
+    cache: usize,
+    issuer: Option<&Issuer>,
+) -> (ShardDb<F>, BTreeMap<u64, Option<Vec<u8>>>) {
     let mut db = ShardDb::create(file, STORE, MEM, TRUNK).unwrap();
     db.set_cache(cache);
+    if let Some(issuer) = issuer {
+        db.attach(issuer, 2).unwrap();
+    }
     let mut oracle: BTreeMap<u64, Option<Vec<u8>>> = BTreeMap::new();
     let mut x = 0x2545_f491_4f6c_dd1du64;
     for i in 0..OPS {
@@ -112,16 +164,5 @@ fn run(cache: usize) {
         check(&mut db, &oracle, k);
     }
     db.check_references().unwrap();
-    let (_, _, io) = db.stats();
-    // Every page enters the cache as it is written: a cache larger than the store serves every
-    // read; a small one serves some and misses others.
-    match cache {
-        0 => assert_eq!((io.cache_hits, io.cache_misses), (0, 0)),
-        // Compaction's scans take their pages from the cache too: no read reaches the device.
-        4_096 => assert!(
-            io.cache_hits > 0 && io.cache_misses == 0 && io.span_cache_hits > 0 && io.reads == 0,
-            "{io:?}"
-        ),
-        _ => assert!(io.cache_hits > 0 && io.cache_misses > 0, "{io:?}"),
-    }
+    (db, oracle)
 }

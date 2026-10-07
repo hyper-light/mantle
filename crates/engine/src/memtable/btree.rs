@@ -34,17 +34,25 @@ const NONE: u32 = u32::MAX;
 struct Node {
     len: usize,
     leaf: bool,
+    /// The bytes every key the node may hold shares: the common prefix of the separators around
+    /// it in its parent, 0 where a side is open (prefix truncation by fence keys; Graefe, *Modern
+    /// B-Tree Techniques*, Foundations and Trends in Databases 3(4), 2011, §3.5). A search reaches
+    /// a node only with a key between its fences, so the key shares the prefix too.
+    prefix: usize,
     entries: [u32; MAX_KEYS],
-    /// Each entry's key head ([`head`]), so most comparisons read the node and not the arena.
+    /// Each entry's key head past the prefix ([`head`]), so most comparisons read the node and not
+    /// the arena: heads from the key's start were all equal for keys that share their first bytes
+    /// (16-byte keys of numbers below 2^32, object names under one tenant).
     heads: [u32; MAX_KEYS],
     children: [u32; MAX_KEYS + 1],
 }
 
 impl Node {
-    fn new(leaf: bool) -> Self {
+    fn new(leaf: bool, prefix: usize) -> Self {
         Self {
             len: 0,
             leaf,
+            prefix,
             entries: [0; MAX_KEYS],
             heads: [0; MAX_KEYS],
             children: [NONE; MAX_KEYS + 1],
@@ -67,13 +75,14 @@ pub struct BTreeMem {
     right: u32,
 }
 
-/// A key's head: its first 4 bytes, big-endian, zero-padded. Heads that differ order their keys
+/// A key's head past its first `prefix` bytes ([`Node::prefix`]): the next 4 bytes, big-endian,
+/// zero-padded. Heads that differ order their keys
 /// as the keys order: at the first byte they differ, either both keys have bytes there, or the
 /// shorter has ended (its pad, 0, below the other's byte, a key ending first being the
 /// smaller). Equal heads say nothing, and the keys are compared whole.
-fn head(key: &[u8]) -> u32 {
+fn head(key: &[u8], prefix: usize) -> u32 {
     let mut b = [0u8; 4];
-    for (d, s) in b.iter_mut().zip(key) {
+    for (d, s) in b.iter_mut().zip(key.get(prefix..).unwrap_or(&[])) {
         *d = *s;
     }
     u32::from_be_bytes(b)
@@ -100,7 +109,7 @@ impl BTreeMem {
         Ok(Self {
             arena: Vec::with_capacity(limit),
             limit,
-            nodes: vec![Node::new(true)],
+            nodes: vec![Node::new(true, 0)],
             root: 0,
             len: 0,
             last: None,
@@ -114,7 +123,7 @@ impl BTreeMem {
     pub fn clear(&mut self) {
         self.arena.clear();
         self.nodes.clear();
-        self.nodes.push(Node::new(true));
+        self.nodes.push(Node::new(true, 0));
         self.root = 0;
         self.len = 0;
         self.last = None;
@@ -202,9 +211,10 @@ impl BTreeMem {
             .ok_or(corrupt())
     }
 
-    /// Where `key`, of head `kh`, is in node `n`: `Ok(i)` at entry `i`, `Err(i)` below child
-    /// `i`.
-    fn search(&self, n: &Node, key: &[u8], kh: u32) -> Result<usize, usize> {
+    /// Where `key`, between `n`'s fences, is in node `n`: `Ok(i)` at entry `i`, `Err(i)` below
+    /// child `i`.
+    fn search(&self, n: &Node, key: &[u8]) -> Result<usize, usize> {
+        let kh = head(key, n.prefix);
         let (mut lo, mut hi) = (0usize, n.len);
         while lo < hi {
             let mid = lo.saturating_add(hi.saturating_sub(lo) / 2);
@@ -224,11 +234,10 @@ impl BTreeMem {
 
     /// The newest entry for `key`: its operation and value into `value`.
     pub fn get(&self, key: &[u8], value: &mut Vec<u8>) -> Result<Option<Op>, Error> {
-        let kh = head(key);
         let mut at = self.root;
         loop {
             let n = self.node(at)?;
-            match self.search(n, key, kh) {
+            match self.search(n, key) {
                 Ok(i) => {
                     let entry = *n.entries.get(i).ok_or(corrupt())?;
                     let (op, v) = self.value(entry)?;
@@ -277,7 +286,6 @@ impl BTreeMem {
         put_varint32(&mut self.arena, vlen);
         self.arena.extend_from_slice(key);
         self.arena.extend_from_slice(value);
-        let kh = head(key);
         let above = match self.last {
             None => true,
             Some(last) => key > self.key(last),
@@ -286,6 +294,7 @@ impl BTreeMem {
             let leaf = self.node_mut(self.right)?;
             if leaf.len < MAX_KEYS {
                 let at = leaf.len;
+                let kh = head(key, leaf.prefix);
                 *leaf.entries.get_mut(at).ok_or(corrupt())? = entry;
                 *leaf.heads.get_mut(at).ok_or(corrupt())? = kh;
                 leaf.len = at.saturating_add(1);
@@ -294,7 +303,7 @@ impl BTreeMem {
                 return Ok(());
             }
         }
-        let replaced = self.descend(key, kh, entry, above)?;
+        let replaced = self.descend(key, entry, above)?;
         if above || (replaced && self.last.is_some_and(|l| self.key(l) == key)) {
             self.last = Some(entry);
         }
@@ -313,20 +322,23 @@ impl BTreeMem {
 
     /// Inserts `entry` for `key` by a descent from the root, splitting full nodes on the way;
     /// true when the key was there and its slot took the entry. A key `above` every other splits
-    /// the full nodes on its path lopsided ([`Self::split`]).
-    fn descend(&mut self, key: &[u8], kh: u32, entry: u32, above: bool) -> Result<bool, Error> {
-        // A full root splits first: the tree grows at the top.
+    /// the full nodes on its path lopsided ([`Self::split`]). The descent carries each node's
+    /// fences, the separators around it, from which a split's halves take their prefixes.
+    fn descend(&mut self, key: &[u8], entry: u32, above: bool) -> Result<bool, Error> {
+        // A full root splits first: the tree grows at the top, its fences open.
         if self.node(self.root)?.len == MAX_KEYS {
             let old = self.root;
-            let mut root = Node::new(false);
+            let mut root = Node::new(false, 0);
             root.children[0] = old;
             self.root = self.push(root)?;
-            self.split(self.root, 0, above)?;
+            self.split(self.root, 0, above, (None, None))?;
         }
         let mut at = self.root;
-        loop {
+        let mut fences: (Option<u32>, Option<u32>) = (None, None);
+        // One level a step: at most the tree's height, bounded by its nodes.
+        for _ in 0..=self.nodes.len() {
             let n = self.node(at)?;
-            match self.search(n, key, kh) {
+            match self.search(n, key) {
                 Ok(i) => {
                     // The key is here: its slot takes the new entry (the head is the same).
                     let slot = self.node_mut(at)?.entries.get_mut(i).ok_or(corrupt())?;
@@ -335,6 +347,7 @@ impl BTreeMem {
                 }
                 Err(i) if n.leaf => {
                     let len = n.len;
+                    let kh = head(key, n.prefix);
                     let node = self.node_mut(at)?;
                     node.entries.copy_within(i..len, i.saturating_add(1));
                     node.heads.copy_within(i..len, i.saturating_add(1));
@@ -346,8 +359,18 @@ impl BTreeMem {
                 }
                 Err(i) => {
                     let mut child = *n.children.get(i).ok_or(corrupt())?;
+                    let mut lo = if i > 0 {
+                        n.entries.get(i.saturating_sub(1)).copied()
+                    } else {
+                        fences.0
+                    };
+                    let mut hi = if i < n.len {
+                        n.entries.get(i).copied()
+                    } else {
+                        fences.1
+                    };
                     if self.node(child)?.len == MAX_KEYS {
-                        self.split(at, i, above)?;
+                        self.split(at, i, above, (lo, hi))?;
                         // The median rose into slot `i`: the key goes right of it if larger, and
                         // is the median itself if equal.
                         let n = self.node(at)?;
@@ -359,16 +382,51 @@ impl BTreeMem {
                             }
                             Ordering::Greater => {
                                 child = *n.children.get(i.saturating_add(1)).ok_or(corrupt())?;
+                                lo = Some(median);
                             }
                             Ordering::Less => {
                                 child = *n.children.get(i).ok_or(corrupt())?;
+                                hi = Some(median);
                             }
                         }
                     }
+                    fences = (lo, hi);
                     at = child;
                 }
             }
         }
+        Err(corrupt())
+    }
+
+    /// The prefix the keys between fences `lo` and `hi` share: their common prefix, none where a
+    /// side is open.
+    fn fence_prefix(&self, lo: Option<u32>, hi: Option<u32>) -> usize {
+        match (lo, hi) {
+            (Some(a), Some(b)) => {
+                let (a, b) = (self.key(a), self.key(b));
+                a.iter().zip(b).take_while(|(x, y)| x == y).count()
+            }
+            _ => 0,
+        }
+    }
+
+    /// Node `at`'s heads taken again at `prefix`, now its prefix.
+    fn reprefix(&mut self, at: u32, prefix: usize) -> Result<(), Error> {
+        let n = self.node(at)?;
+        if n.prefix == prefix {
+            return Ok(());
+        }
+        let mut heads = [0u32; MAX_KEYS];
+        for (h, &e) in heads
+            .iter_mut()
+            .zip(n.entries.get(..n.len).ok_or(corrupt())?)
+        {
+            *h = head(self.key(e), prefix);
+        }
+        let n = self.node_mut(at)?;
+        n.heads = heads;
+        n.prefix = prefix;
+        Ok(())
     }
 
     fn push(&mut self, node: Node) -> Result<u32, Error> {
@@ -383,12 +441,20 @@ impl BTreeMem {
     /// right empty: keys arriving in order then fill every node, where even splits leave each
     /// left half full for good (the bulk-loading split of B+-trees). A node's entry count is then
     /// below `DEGREE - 1` only on the rightmost path, which no search depends on.
-    fn split(&mut self, parent: u32, i: usize, lopsided: bool) -> Result<(), Error> {
+    /// The child's fences are `fences`: the halves' prefixes are those of their own fences, the
+    /// median on one side of each, and their heads are taken again at them.
+    fn split(
+        &mut self,
+        parent: u32,
+        i: usize,
+        lopsided: bool,
+        fences: (Option<u32>, Option<u32>),
+    ) -> Result<(), Error> {
         let child = *self.node(parent)?.children.get(i).ok_or(corrupt())?;
         let full = self.node(child)?.clone();
         let keep = if lopsided { MAX_KEYS - 1 } else { DEGREE - 1 };
         let moved = MAX_KEYS.saturating_sub(keep).saturating_sub(1);
-        let mut right = Node::new(full.leaf);
+        let mut right = Node::new(full.leaf, full.prefix);
         right.len = moved;
         let from = keep.saturating_add(1);
         right
@@ -409,10 +475,14 @@ impl BTreeMem {
                 .copy_from_slice(full.children.get(from..).ok_or(corrupt())?);
         }
         let median = *full.entries.get(keep).ok_or(corrupt())?;
-        let median_head = *full.heads.get(keep).ok_or(corrupt())?;
         let right = self.push(right)?;
         let left = self.node_mut(child)?;
         left.len = keep;
+        let left_prefix = self.fence_prefix(fences.0, Some(median));
+        let right_prefix = self.fence_prefix(Some(median), fences.1);
+        self.reprefix(child, left_prefix)?;
+        self.reprefix(right, right_prefix)?;
+        let median_head = head(self.key(median), self.node(parent)?.prefix);
         let p = self.node_mut(parent)?;
         let len = p.len;
         p.entries.copy_within(i..len, i.saturating_add(1));
@@ -448,13 +518,12 @@ impl BTreeMem {
     /// path is left at the step that visits its entry at or past `from` once the child below is
     /// walked, and the leaf at its first entry at or past `from`.
     pub fn walk_from(&self, from: &[u8]) -> Result<Walk, Error> {
-        let kh = head(from);
         let mut stack = Vec::new();
         let mut at = self.root;
         // The walk descends one level a step: at most the tree's height.
         for _ in 0..=self.nodes.len() {
             let n = self.node(at)?;
-            let (pos, exact) = match self.search(n, from, kh) {
+            let (pos, exact) = match self.search(n, from) {
                 Ok(i) => (i, true),
                 Err(i) => (i, false),
             };
@@ -630,6 +699,65 @@ mod tests {
             for (k, val) in &oracle {
                 proptest::prop_assert_eq!(m.get(k, &mut v).unwrap(), Some(Op::Put));
                 proptest::prop_assert_eq!(&v, val);
+            }
+        }
+    }
+
+    /// Every node from `at` down, between `lo` and `hi`: its prefix is its fences' common prefix,
+    /// each head is its key's past that prefix, and each key lies between the fences.
+    fn check_prefixes(m: &BTreeMem, at: u32, lo: Option<u32>, hi: Option<u32>) {
+        let n = m.node(at).unwrap();
+        assert_eq!(n.prefix, m.fence_prefix(lo, hi), "node {at}");
+        for i in 0..n.len {
+            let k = m.key(n.entries[i]);
+            assert_eq!(n.heads[i], head(k, n.prefix), "node {at} entry {i}");
+            assert!(lo.is_none_or(|l| m.key(l) < k) && hi.is_none_or(|h| k < m.key(h)));
+        }
+        if !n.leaf {
+            for c in 0..=n.len {
+                let clo = if c > 0 { Some(n.entries[c - 1]) } else { lo };
+                let chi = if c < n.len { Some(n.entries[c]) } else { hi };
+                check_prefixes(m, n.children[c], clo, chi);
+            }
+        }
+    }
+
+    proptest::proptest! {
+        /// Keys in any order under nested shared prefixes, some keys prefixes of others: every
+        /// node's heads are taken past its fences' common prefix, and gets, misses and seeks
+        /// agree with a `BTreeMap`.
+        #[test]
+        fn heads_past_fence_prefixes_keep_an_ordered_map(
+            keys in proptest::collection::vec(
+                (0usize..4, proptest::collection::vec(0u8..4, 0..5)),
+                1..3000,
+            ),
+        ) {
+            const PREFIXES: [&[u8]; 4] = [b"", b"t/", b"t/0000/", b"t/0000/agent-"];
+            let mut m = BTreeMem::new(1 << 24).unwrap();
+            let mut oracle: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+            for (i, (p, tail)) in keys.iter().enumerate() {
+                let mut k = PREFIXES[*p].to_vec();
+                k.extend(tail.iter().map(|b| b'0' + b));
+                let v = (i as u64).to_le_bytes().to_vec();
+                m.insert(&k, Op::Put, &v).unwrap();
+                oracle.insert(k, v);
+            }
+            check_prefixes(&m, m.root, None, None);
+            let mut v = Vec::new();
+            for (k, val) in &oracle {
+                proptest::prop_assert_eq!(m.get(k, &mut v).unwrap(), Some(Op::Put));
+                proptest::prop_assert_eq!(&v, val);
+                let mut past = k.clone();
+                past.push(b'9');
+                proptest::prop_assert_eq!(
+                    m.get(&past, &mut v).unwrap().is_some(),
+                    oracle.contains_key(&past)
+                );
+                let mut walk = m.walk_from(&past).unwrap();
+                let mut first = None;
+                m.walk_some(&mut walk, 1, |k, _, _| { first = Some(k.to_vec()); Ok(()) }).unwrap();
+                proptest::prop_assert_eq!(first, oracle.range(past.clone()..).next().map(|(k, _)| k.clone()));
             }
         }
     }

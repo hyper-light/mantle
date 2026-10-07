@@ -302,6 +302,8 @@ fn main() {
         let mut next = Vec::new();
         let mut out = Vec::new();
         let (mut puts, mut gets, mut seeks_done) = (Vec::new(), Vec::new(), Vec::new());
+        // With `attribute`, each slow put and seek recorded with what the engine did inside it.
+        let (mut slow_puts, mut slow_seeks) = (Vec::new(), Vec::new());
         let (skipped_before, opened_before) = db.scan_filtered();
         let mark = begin();
         let t = Instant::now();
@@ -310,17 +312,30 @@ fn main() {
             let start = n % num;
             let k = key(start);
             let kind = (n >> 32) % 100;
+            let before = attribute.then(|| db.stats());
             let o = Instant::now();
             if kind < mix_put_pct {
                 db.put(&k, &value).unwrap();
-                puts.push(o.elapsed().as_nanos() as u64);
+                let ns = o.elapsed().as_nanos() as u64;
+                puts.push(ns);
+                if let Some(b) = before
+                    && ns >= SLOW_NS
+                {
+                    slow_puts.push(Slow::of(ns, b, db.stats()));
+                }
             } else if kind < mix_put_pct + mix_seek_pct {
                 let end = key(start.saturating_add(seek_distance));
                 let bound = (seek_distance > 0).then_some(&end[..]);
                 page.clear();
                 db.scan(&k, bound, seek_nexts, &mut page, &mut next)
                     .unwrap();
-                seeks_done.push(o.elapsed().as_nanos() as u64);
+                let ns = o.elapsed().as_nanos() as u64;
+                seeks_done.push(ns);
+                if let Some(b) = before
+                    && ns >= SLOW_NS
+                {
+                    slow_seeks.push(Slow::of(ns, b, db.stats()));
+                }
             } else {
                 db.get(&k, &mut out).unwrap();
                 gets.push(o.elapsed().as_nanos() as u64);
@@ -339,6 +354,12 @@ fn main() {
             (opened - opened_before) as f64 / n_seeks,
             db.views()
         );
+        if attribute {
+            println!("mixgraph puts' tail:");
+            attribute_tail(&puts, &mut slow_puts);
+            println!("mixgraph seeks' tail:");
+            attribute_tail(&seeks_done, &mut slow_seeks);
+        }
         for (name, lat) in [
             ("mixgraph put", &mut puts),
             ("mixgraph get", &mut gets),

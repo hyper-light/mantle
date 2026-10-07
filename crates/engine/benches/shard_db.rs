@@ -57,6 +57,9 @@ fn main() {
     let reads: u64 = args.get(4).map_or(num, |s| s.parse().unwrap());
     // The page cache in MiB, none by default: with buffered I/O the OS's cache serves reads.
     let cache_mib: usize = args.get(5).map_or(0, |s| s.parse().unwrap());
+    // `attribute` as the seventh argument: each put slower than `SLOW_NS` is recorded with what
+    // the engine did inside it, and the puts at or past p99.9 and p99.99 are broken down by cause.
+    let attribute = args.get(6).map(String::as_str) == Some("attribute");
     let path = dir.join("shard_db.store");
     let _ = std::fs::remove_file(&path);
     let align = Alignment::new(4096).unwrap();
@@ -91,14 +94,25 @@ fn main() {
     // Each operation timed, into a vector sized before the run: percentiles from the sorted
     // samples, as db_bench's --histogram=1 times each of its operations.
     let mut lat: Vec<u64> = Vec::with_capacity(num as usize);
+    let mut slow: Vec<Slow> = Vec::new();
     let t = Instant::now();
     for _ in 0..num {
         let k = key(rng.next() % num);
+        let before = attribute.then(|| db.stats());
         let o = Instant::now();
         db.put(&k, &value).unwrap();
-        lat.push(o.elapsed().as_nanos() as u64);
+        let ns = o.elapsed().as_nanos() as u64;
+        lat.push(ns);
+        if let Some(b) = before
+            && ns >= SLOW_NS
+        {
+            slow.push(Slow::of(ns, b, db.stats()));
+        }
     }
     let s = t.elapsed().as_secs_f64();
+    if attribute {
+        attribute_tail(&lat, &mut slow);
+    }
     report("fillrandom", &mut lat);
     let (f, t, io) = db.stats();
     let user = num * (16 + 100);
@@ -123,7 +137,8 @@ fn main() {
         t.entries_written as f64 / num as f64
     );
     println!(
-        "fill io reads {} pages_read {} ({:.2}s) writes {} ({:.2}s) pages_written {} ({:.2} GB, write amplification {:.2}) syncs {}",
+        "fill io span_cache_hits {} reads {} pages_read {} ({:.2}s) writes {} ({:.2}s) pages_written {} ({:.2} GB, write amplification {:.2}) syncs {}",
+        io.span_cache_hits,
         io.reads,
         io.pages_read,
         io.read_ns as f64 / 1e9,
@@ -176,6 +191,80 @@ fn main() {
     println!("shape height {h} nodes {n} leaves {l}");
     drop(db);
     std::fs::remove_file(&path).unwrap();
+}
+
+/// Diagnostic: a put at least this slow is recorded with what the engine did inside it. Below
+/// the measured p99.9 (61-77 us uncached at 10 M) and above p99 (2-3 us), so every put of the
+/// p99.9 tail is recorded and few others.
+const SLOW_NS: u64 = 10_000;
+
+type Stats = (
+    mantle_engine::shard_db::FlushStats,
+    mantle_engine::trunk::TrunkStats,
+    mantle_engine::store::IoStats,
+);
+
+/// One slow put: its time, and the engine's work inside it.
+struct Slow {
+    ns: u64,
+    write_ns: u64,
+    writes: u64,
+    read_ns: u64,
+    reads: u64,
+    pack_ns: u64,
+    trunk_ns: u64,
+    stall_ns: u64,
+    rotated: bool,
+}
+
+impl Slow {
+    fn of(ns: u64, (f0, _, i0): Stats, (f1, _, i1): Stats) -> Self {
+        Self {
+            ns,
+            write_ns: i1.write_ns - i0.write_ns,
+            writes: i1.writes - i0.writes,
+            read_ns: i1.read_ns - i0.read_ns,
+            reads: i1.reads - i0.reads,
+            pack_ns: f1.pack_ns - f0.pack_ns,
+            trunk_ns: f1.incorporate_ns - f0.incorporate_ns,
+            stall_ns: f1.stall_ns - f0.stall_ns,
+            rotated: f1.flushes != f0.flushes || f1.stalls != f0.stalls,
+        }
+    }
+}
+
+/// The puts at or past p99.9 and p99.99, broken down: mean time in write calls and read calls
+/// (inside pack or trunk work), in pack and trunk work besides their I/O, in stalls, and the
+/// rest (the memtable, a rotation); and how many made a write call, a read call, or neither.
+fn attribute_tail(lat: &[u64], slow: &mut [Slow]) {
+    let mut sorted = lat.to_vec();
+    sorted.sort_unstable();
+    for (name, q) in [("p99.9", 0.999), ("p99.99", 0.9999)] {
+        let floor = sorted[((sorted.len() as f64 * q) as usize).min(sorted.len() - 1)];
+        let tail: Vec<&Slow> = slow.iter().filter(|s| s.ns >= floor).collect();
+        let n = tail.len().max(1) as f64;
+        let mean =
+            |f: &dyn Fn(&Slow) -> u64| tail.iter().map(|s| f(s)).sum::<u64>() as f64 / n / 1000.0;
+        let io = |s: &Slow| s.write_ns + s.read_ns;
+        let work = |s: &Slow| s.pack_ns + s.trunk_ns;
+        println!(
+            "tail {name} (>= {:.2} us, {} puts): mean {:.2} us = writes {:.2} + reads {:.2} + work besides I/O {:.2} + stalls {:.2} + rest {:.2}; with a write call {}, a read call {}, neither {}, a rotation {}",
+            floor as f64 / 1000.0,
+            tail.len(),
+            mean(&|s| s.ns),
+            mean(&|s| s.write_ns),
+            mean(&|s| s.read_ns),
+            mean(&|s| work(s).saturating_sub(io(s)).saturating_sub(s.stall_ns)),
+            mean(&|s| s.stall_ns),
+            mean(&|s| s.ns.saturating_sub(work(s).max(io(s)))),
+            tail.iter().filter(|s| s.writes > 0).count(),
+            tail.iter().filter(|s| s.reads > 0).count(),
+            tail.iter()
+                .filter(|s| s.writes == 0 && s.reads == 0)
+                .count(),
+            tail.iter().filter(|s| s.rotated).count(),
+        );
+    }
 }
 
 /// Prints a workload's latency percentiles in microseconds: p50, p99, p99.9, p99.99, max.

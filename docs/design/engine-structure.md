@@ -133,8 +133,15 @@ serves every read the engine does not. The store keeps its own cache of verified
   owner reopens, so a read never returns a page its address no longer holds
   (`tests/shard_db_paced.rs`: a cache larger than the store serves every read and none
   stale; it fails with the replacement on write removed).
-- **Scans bypass it.** A compaction's cursor reads through its span (§4), so a scan neither
-  fills the cache nor evicts from it.
+- **Scans look, never touch.** A compaction's cursor takes a page the cache holds without
+  counting a read or moving it (`Cache::peek`), and reads the rest through its span (§4), which
+  never enters the cache: a scan neither promotes, fills nor evicts. Attributing each put past
+  p99.9 to the work inside it (`benches/shard_db.rs` `attribute`) found 7,815 of 10,001 waiting
+  on a span reading from the device pages written moments before; with the look, no fill read
+  the device (248,163 scan pages from the cache), put p99.9 went from 52.7–53.3 µs to
+  33.1–34.3 µs, p99.99 from 221–226 µs to 51.5–53.8 µs, and the fill from 0.76–0.79 to 1.03–1.08
+  M puts a second (10 M, uncached, 1.5 GiB, this Mac). What now waits at p99.9 is the extent
+  write: 9,874 of 10,011 of those puts made one, about 40 µs each, synchronously (§6).
 
 10 M puts then 1 M reads, uncached I/O, fanout 8, this Mac, 2026-10-07:
 

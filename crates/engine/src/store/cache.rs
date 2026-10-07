@@ -126,6 +126,26 @@ impl Cache {
         true
     }
 
+    /// The payload cached for `address`, appended to `out`, without counting a read: a scan's
+    /// look, which must not promote what it passes.
+    pub fn peek(&self, address: u64, out: &mut Vec<u8>) -> bool {
+        let Some((&i, slot)) = self
+            .map
+            .get_key_value(&address)
+            .and_then(|(_, i)| self.slots.get(*i).map(|s| (i, s)))
+        else {
+            return false;
+        };
+        let at = i.saturating_mul(self.page);
+        match self.bytes.get(at..at.saturating_add(slot.len)) {
+            Some(payload) => {
+                out.extend_from_slice(payload);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Caches `payload` for `address`, evicting by the module's rule if the cache is full. A
     /// payload longer than a slot is not cached.
     pub fn insert(&mut self, address: u64, payload: &[u8]) {

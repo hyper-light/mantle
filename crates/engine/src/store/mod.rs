@@ -73,6 +73,8 @@ pub struct IoStats {
     /// Point reads the page cache served, and those it did not.
     pub cache_hits: u64,
     pub cache_misses: u64,
+    /// Scan pages the cache served, each a page a span did not read from the device.
+    pub span_cache_hits: u64,
 }
 
 fn elapsed_ns(since: std::time::Instant) -> u64 {
@@ -658,6 +660,17 @@ impl<F: BlockFile> Store<F> {
         let held = address
             .checked_sub(span.first)
             .filter(|&i| i < u64::from(span.pages));
+        // A page the cache holds is taken from it, not read again from the device: compaction
+        // reads pages written moments before, which the cache took as they were written. The
+        // look neither counts as a read nor moves the page, so a scan never promotes what it
+        // passes (S3-FIFO's scan resistance holds).
+        if held.is_none()
+            && let Some(c) = self.cache.as_mut()
+            && c.peek(address, out)
+        {
+            self.io.span_cache_hits = self.io.span_cache_hits.saturating_add(1);
+            return Ok(());
+        }
         let index = match held {
             Some(i) => i,
             None => {

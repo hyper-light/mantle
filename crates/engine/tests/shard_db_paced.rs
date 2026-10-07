@@ -117,7 +117,11 @@ fn run(cache: usize) {
     // read; a small one serves some and misses others.
     match cache {
         0 => assert_eq!((io.cache_hits, io.cache_misses), (0, 0)),
-        4_096 => assert!(io.cache_hits > 0 && io.cache_misses == 0, "{io:?}"),
+        // Compaction's scans take their pages from the cache too: no read reaches the device.
+        4_096 => assert!(
+            io.cache_hits > 0 && io.cache_misses == 0 && io.span_cache_hits > 0 && io.reads == 0,
+            "{io:?}"
+        ),
         _ => assert!(io.cache_hits > 0 && io.cache_misses > 0, "{io:?}"),
     }
 }

@@ -385,9 +385,7 @@ impl Walk {
         }
         let behind = self.behind.get_mut(r).ok_or(corrupt())?;
         if let Some(c) = slot.as_mut() {
-            for _ in 0..*behind {
-                c.next(b, store)?;
-            }
+            c.advance(b, store, *behind)?;
             if !c.valid() {
                 return Err(corrupt());
             }

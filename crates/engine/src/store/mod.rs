@@ -122,6 +122,11 @@ pub struct Store<F: BlockFile> {
     pool: Vec<AlignedBuf>,
     lent: usize,
     most_lent: usize,
+    /// Page buffers lent to readers (a cursor's path, a point read), kept when given back: at
+    /// most as many as were ever out at once.
+    pages: Vec<Vec<u8>>,
+    pages_lent: usize,
+    pages_most_lent: usize,
     /// Whether its I/O is timed ([`Store::set_timed`]): a clock read a call, for diagnosis.
     timed: bool,
     /// Freed extents whose pages the cache still holds, forgotten a share at a time
@@ -256,6 +261,9 @@ impl<F: BlockFile> Store<F> {
             pool: Vec::new(),
             lent: 0,
             most_lent: 0,
+            pages: Vec::new(),
+            pages_lent: 0,
+            pages_most_lent: 0,
             forgetting: VecDeque::new(),
             timed: false,
         };
@@ -308,6 +316,9 @@ impl<F: BlockFile> Store<F> {
                 pool: Vec::new(),
                 lent: 0,
                 most_lent: 0,
+                pages: Vec::new(),
+                pages_lent: 0,
+                pages_most_lent: 0,
                 forgetting: VecDeque::new(),
                 timed: false,
             },
@@ -613,6 +624,28 @@ impl<F: BlockFile> Store<F> {
             && self.pool.len() < self.most_lent
         {
             self.pool.push(buf);
+        }
+    }
+
+    /// An empty page buffer for a reader, from the pool or fresh: given back with
+    /// [`Store::give_page`], a read allocates nothing once the pool holds the most ever out.
+    pub fn take_page(&mut self) -> Vec<u8> {
+        self.pages_lent = self.pages_lent.saturating_add(1);
+        self.pages_most_lent = self.pages_most_lent.max(self.pages_lent);
+        match self.pages.pop() {
+            Some(mut p) => {
+                p.clear();
+                p
+            }
+            None => Vec::with_capacity(self.config.page_size),
+        }
+    }
+
+    /// Takes back a page buffer a reader is done with.
+    pub fn give_page(&mut self, page: Vec<u8>) {
+        self.pages_lent = self.pages_lent.saturating_sub(1);
+        if self.pages.len() < self.pages_most_lent {
+            self.pages.push(page);
         }
     }
 

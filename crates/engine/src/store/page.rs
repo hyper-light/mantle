@@ -102,14 +102,19 @@ pub fn seal(
     let head = page
         .get_mut(4..HEADER)
         .ok_or(corrupt(Malformed::Truncated))?;
-    head.copy_from_slice(
-        &[
-            &[kind.byte(), FORMAT, 0, 0][..],
-            &len32.to_le_bytes()[..],
-            &generation.to_le_bytes()[..],
-        ]
-        .concat(),
-    );
+    // Kind, format and two reserved bytes; the payload length; the generation: written in
+    // place, as a page is sealed for every page written.
+    let (tag, rest) = head
+        .split_first_chunk_mut::<4>()
+        .ok_or(corrupt(Malformed::Truncated))?;
+    *tag = [kind.byte(), FORMAT, 0, 0];
+    let (length, rest) = rest
+        .split_first_chunk_mut::<4>()
+        .ok_or(corrupt(Malformed::Truncated))?;
+    *length = len32.to_le_bytes();
+    rest.first_chunk_mut::<8>()
+        .ok_or(corrupt(Malformed::Truncated))?
+        .copy_from_slice(&generation.to_le_bytes());
     let crc = checksum(page, address)?;
     page.get_mut(..4)
         .ok_or(corrupt(Malformed::Truncated))?

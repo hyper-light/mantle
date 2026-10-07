@@ -208,6 +208,7 @@ fn a_change_waits_behind_the_fence_and_what_waits_is_bounded() {
     // the leader's own writes are out.
     r.change(Vec::new(), &change(ConfChangeType::AddLearnerNode, 4))
         .unwrap();
+    let changed_at = r.core().raft.log().last_index().unwrap();
     for i in 0..40u64 {
         r.propose(Vec::new(), vec![i as u8; 32]).unwrap();
         let mut out = Output::default();
@@ -237,6 +238,19 @@ fn a_change_waits_behind_the_fence_and_what_waits_is_bounded() {
     assert!(held.is_some(), "nothing waited behind the fence");
     pump(&mut r);
     assert_eq!(r.configuration().learners, vec![4]);
+    // The change applied only once a durable write stated its commit (§4.1); the ordinary
+    // entries after it applied on the volatile commit, which costs no write of its own.
+    assert!(r.durable_commit() >= changed_at);
+    // A whole quiet period on, the quiet write states what was applied.
+    let quiet = u64::try_from(settings(1, 9).quiet.as_nanos()).unwrap();
+    let later = now() + 1_000 * quiet;
+    for at in [later, later + quiet + 1, later + quiet + 2] {
+        let mut out = Output::default();
+        r.drive(at, waker(), &mut out).unwrap();
+        while r.log_mut().make_durable() {}
+    }
+    let mut out = Output::default();
+    r.drive(later + quiet + 3, waker(), &mut out).unwrap();
     assert!(r.durable_commit() >= r.applied().index);
 }
 
@@ -2259,5 +2273,77 @@ fn a_sole_voter_that_compacts_when_due_holds_its_log_within_the_rule() {
                 (proposals + 1) * entry_of(8)
             );
         }
+    }
+}
+
+/// Three voters, each a replica on its store, messages carried by hand until none is left.
+fn trio() -> Vec<Sim> {
+    (1..=3)
+        .map(|id| {
+            Replica::open(
+                &settings(id, 7),
+                SimStore::new(3),
+                Kv::new(voters(&[1, 2, 3]), false),
+                Unbounded,
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
+/// Drives every member and makes its writes durable, carrying what each sends, until a round
+/// moves nothing.
+fn carry(rs: &mut [Sim]) {
+    for _ in 0..10_000 {
+        let mut sent = Vec::new();
+        let mut busy = false;
+        for r in rs.iter_mut() {
+            let mut out = Output::default();
+            let driven = r.drive(now(), waker(), &mut out).unwrap();
+            sent.append(&mut out.messages);
+            while r.log_mut().make_durable() {
+                busy = true;
+            }
+            busy |= driven.more || driven.out > 0 || r.log_mut().unanswered() > 0;
+        }
+        if sent.is_empty() && !busy {
+            return;
+        }
+        for m in sent {
+            let to = usize::try_from(m.to).unwrap() - 1;
+            rs[to].step(m).unwrap();
+        }
+    }
+    panic!("the members never rested");
+}
+
+/// durable.md §4.1 (focal F17): a commit costs no write of its own. Do: three voters commit
+/// entries one at a time, each carried until the members rest. Expect: one write per entry on
+/// every member, the entry's: the leader's commit and each follower's commit learned from the
+/// leader's broadcast ride the next write, never a write alone (etcd's `MustSync`: a commit that
+/// moved alone needs no sync).
+#[test]
+fn three_voters_write_once_per_entry_committed_one_at_a_time() {
+    let mut rs = trio();
+    rs[0].campaign().unwrap();
+    carry(&mut rs);
+    assert!(rs[0].is_leader());
+    rs[0].propose(Vec::new(), b"warm".to_vec()).unwrap();
+    carry(&mut rs);
+    const ENTRIES: u64 = 16;
+    let before: Vec<u64> = rs.iter_mut().map(|r| r.log_mut().events.submits).collect();
+    for i in 0..ENTRIES {
+        rs[0].propose(Vec::new(), i.to_le_bytes().to_vec()).unwrap();
+        carry(&mut rs);
+    }
+    for (at, r) in rs.iter_mut().enumerate() {
+        assert!(r.machine().now.entries.len() as u64 >= ENTRIES);
+        let writes = r.log_mut().events.submits - before[at];
+        assert_eq!(
+            writes,
+            ENTRIES,
+            "member {}: writes for {ENTRIES} entries",
+            at + 1
+        );
     }
 }

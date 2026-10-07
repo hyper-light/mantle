@@ -325,7 +325,7 @@ and one or two members lost for good in every run, checks after every run that e
 applied the same everywhere, that every operation completes once faults stop, that every put
 exists exactly once, that the members agree, that each key's history is linearizable, and that
 every member's configuration names the live members. A soak of 6,000 seeds passed on the shell,
-replacing 14,821 members lost for good and repairing all 208 members its damage marked, and the
+replacing 14,864 members lost for good and repairing all 643 members its damage marked, and the
 simulation catches stale reads when they are introduced on purpose.
 Against mantle's own shell at `1c179e8` on its workload (hyper-raft's `hyper-durable-compare`,
 four sides in one process, the order rotated each round, load 3.7–20.5), a range group of three

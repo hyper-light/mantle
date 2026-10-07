@@ -212,6 +212,7 @@ fn answer(r: Result<(), LogError>) -> &'static str {
         Err(LogError::Damaged(_)) => "damaged",
         Err(LogError::Foreign(_)) => "foreign",
         Err(LogError::Config(_)) => "config",
+        Err(LogError::Unfit(_)) => "unfit",
         Err(LogError::Claimed(_)) => "claimed",
         Err(LogError::Behind(_)) => "behind",
         Err(LogError::Disk(_)) => "disk",

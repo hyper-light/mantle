@@ -428,16 +428,17 @@ must hold:
 
 A run settles only once every member marked by damage has been repaired, its log holding
 again what it acknowledged, and each run checks that every mark it made ended. With damage
-at rest in the faults, 6,000 seeds are linearizable and live on the shell: 4,974 frames
-damaged, 208 members marked and all 208 repaired by their lost entries, 131 of them with an
-engine past their log kept under their identity, 1,655 members rebuilt on their device and
-1,235 devices replaced; 14,821 members lost for good and replaced; members' writes left out
-past 926,870 drives, 1,310,802 messages and 1,024,743 ticks taken while writes were out, and
-14,520 drives that found a write waiting for room (`MANTLE_SIM_SEEDS=6000`, debug build, the
-hyper-raft crates of the snapshot vendor/UPSTREAM.md names, 2026-10-06, this machine, 340 s at
-a one-minute load average of 6.7 at the start and 9.2 at the end). The recorded seeds a default
-run takes, 1 to 58, are the fewest from 1 in which a restart finds each kind of damage: seed 58
-is the first whose member opens marked on these crates (1 to 57 mark none).
+at rest in the faults, 6,000 seeds are linearizable and live on the shell: 4,919 frames
+damaged, 643 members marked and all 643 repaired by their lost entries, 230 of them with an
+engine past their log kept under their identity, 1,622 members rebuilt on their device and
+1,315 devices replaced; 14,864 members lost for good and replaced; members' writes left out
+past 653,807 drives, 825,890 messages and 752,454 ticks taken while writes were out, and
+14,687 drives that found a write waiting for room (`MANTLE_SIM_SEEDS=6000`, debug build, the
+hyper-raft crates of the snapshot vendor/UPSTREAM.md names, whose commit rides the next write
+rather than one of its own, 2026-10-07, this machine, 288 s at a one-minute load average of 8.5
+at the start and 6.1 at the end). The recorded seeds a default run takes, 1 to 10, are the
+fewest from 1 in which a restart finds each kind of damage: seed 10 is the first whose member is
+rebuilt on these crates (1 to 9 rebuild none).
 
 Soaks of mantle's own shell before the durable one found three faults whose rules the shell
 keeps (20,000 seeds, 2026-09-30): an install the log never recorded, which a restart now

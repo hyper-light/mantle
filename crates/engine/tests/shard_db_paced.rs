@@ -2,8 +2,9 @@
 //! memtables of a few KiB and a fanout of 3, puts rotate memtables, pack them a slice at a time,
 //! queue packed branches and run the trunk's cascades a slice at a time, all interleaved. Every
 //! key reads its newest value between any two operations, wherever it then lives: the memtable,
-//! the one being packed, a pending branch, or a tree whose cascade is part done. Flushed at the
-//! end, the store holds exactly the extents the engine names.
+//! the one being packed, a pending branch, or a tree whose cascade is part done. Checkpoints
+//! along the way free extents for reuse. Flushed at the end, the store holds exactly the extents
+//! the engine names.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -51,9 +52,28 @@ fn check(db: &mut ShardDb<SimFile>, oracle: &BTreeMap<u64, Option<Vec<u8>>>, k: 
 
 #[test]
 fn every_key_reads_its_newest_value_between_any_two_operations() {
+    run(0);
+}
+
+/// The same with a page cache of 16 pages: pages cached and evicted all through the run.
+#[test]
+fn a_small_page_cache_evicting_all_the_time_reads_every_key_right() {
+    run(16);
+}
+
+/// The same with a cache larger than the store ever grows, so a page stays cached until its
+/// extent is freed and its address written again: a read never returns a page an address held
+/// before.
+#[test]
+fn a_cache_never_serves_a_page_its_address_no_longer_holds() {
+    run(4_096);
+}
+
+fn run(cache: usize) {
     let align = Alignment::new(4096).unwrap();
     let file = SimFile::new(align, Alignment::new(512).unwrap(), 17).unwrap();
     let mut db = ShardDb::create(file, STORE, MEM, TRUNK).unwrap();
+    db.set_cache(cache);
     let mut oracle: BTreeMap<u64, Option<Vec<u8>>> = BTreeMap::new();
     let mut x = 0x2545_f491_4f6c_dd1du64;
     for i in 0..OPS {
@@ -68,6 +88,11 @@ fn every_key_reads_its_newest_value_between_any_two_operations() {
             let v = format!("v{i}-{}", "x".repeat((x % 40) as usize)).into_bytes();
             db.put(&key(k), &v).unwrap();
             oracle.insert(k, Some(v));
+        }
+        // A checkpoint now and then: extents the trunk released are freed once it is durable,
+        // and reused by later writes at the addresses they held.
+        if (i + 1) % 1_500 == 0 {
+            db.checkpoint(i).unwrap();
         }
         check(&mut db, &oracle, k);
         // A sweep of 1/50 of the keys each op: every key read every 50 ops, while each memtable
@@ -87,4 +112,12 @@ fn every_key_reads_its_newest_value_between_any_two_operations() {
         check(&mut db, &oracle, k);
     }
     db.check_references().unwrap();
+    let (_, _, io) = db.stats();
+    // Every page enters the cache as it is written: a cache larger than the store serves every
+    // read; a small one serves some and misses others.
+    match cache {
+        0 => assert_eq!((io.cache_hits, io.cache_misses), (0, 0)),
+        4_096 => assert!(io.cache_hits > 0 && io.cache_misses == 0, "{io:?}"),
+        _ => assert!(io.cache_hits > 0 && io.cache_misses > 0, "{io:?}"),
+    }
 }

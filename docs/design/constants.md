@@ -368,6 +368,10 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/engine/src/branch/filter.rs` `BITS_PER_KEY` | cited | 10 bits a key in a branch's Bloom filter: a false-positive rate of about 0.6185^b, 0.8% at 10 (Broder and Mitzenmacher, Internet Mathematics 1(4), 2004, §2.1); RocksDB's default `bits_per_key`. A filter whose key count is only bounded while its branch is built (a compaction's, duplicates merging) is sized to a power of two of blocks and halved exactly once the count is known, leaving 10 to 20 bits a key. |
 | `crates/engine/src/branch/filter.rs` `BLOCK_WORDS` | derived | 8 words of 64 bits: a filter block of 512 bits, one 64-byte cache line, so a key's probes cost one cache miss (Putze, Sanders and Singler, WEA 2007). |
 | `crates/engine/src/branch/filter.rs` `PROBES` | derived | 7, `round(BITS_PER_KEY · ln 2)`: the probe count minimizing a Bloom filter's false-positive rate at 10 bits a key. |
+| `crates/engine/src/store/cache.rs` `SMALL_TENTHS` | cited | 1: the S3-FIFO small queue's share of the page cache, 10% (Yang et al., SOSP 2023; libCacheSim `S3FIFO.c` default `small-size-ratio=0.10`). |
+| `crates/engine/src/store/cache.rs` `GHOST_TENTHS` | cited | 9: the S3-FIFO ghost queue's length, 90% of the cache's pages (libCacheSim `S3FIFO.c` default `ghost-size-ratio=0.90`). |
+| `crates/engine/src/store/cache.rs` `PROMOTE` | cited | 2: reads in the small queue that move a page to main (libCacheSim `S3FIFO.c` default `move-to-main-threshold=2`). |
+| `crates/engine/src/store/cache.rs` `MAX_FREQ` | cited | 3: a cached page's read count's cap, the two-bit counter of S3-FIFO (libCacheSim `S3FIFO.c`, `MIN(freq, 3)`). |
 | `crates/engine/src/trunk/mod.rs` `ABSENT` | format | `u32::MAX`, a trunk image's marker for no child and no end key: above every node index and key length the image holds. |
 | `crates/engine/src/trunk/mod.rs` `IMAGE_FORMAT` | format | 1, the trunk image format this engine writes and reads (docs/design/engine-structure.md §8, E4c). |
 | `crates/engine/src/trunk/mod.rs` `IMAGE_MAGIC` | format | "mantleTK" in ASCII, little-endian: the trunk image header's magic number. |

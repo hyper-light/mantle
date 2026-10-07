@@ -115,6 +115,41 @@ What mantle changes, and why:
    the old view with the new branch. A SuRF-style range filter answers "nothing in this prefix"
    without reading (research/33 row 8).
 
+### The page cache, as built (step E8's first part)
+
+With uncached I/O, which keeps the OS's dirty-page throttle off the put path (§6), the device
+serves every read the engine does not. The store keeps its own cache of verified node pages
+(`crates/engine/src/store/cache.rs`, `Store::set_cache`), off unless the owner sizes it:
+- **S3-FIFO** (Yang et al., SOSP 2023), with the reference implementation's parameters: a small
+  queue of 10%, a ghost of 90%, promotion at two reads, a count capped at 3. A page read once
+  leaves through the small queue, so a burst of new pages does not flush the pages read again.
+- **Written through.** A node page enters the cache as it is queued or written, as SplinterDB
+  writes through its cache (research/34 §1) and as the OS's cache keeps a buffered write.
+  Without it, 1 M reads after a 10 M fill missed 223,975 times at 1 and 2 GiB alike: pages
+  compaction had just written, first touched.
+- **Live pages only.** An extent whose last reference is released has its pages dropped, so
+  the cache holds what nodes name, not the inputs of compactions done. A page written at an
+  address replaces what the cache held there, and a failed write drops the cache until the
+  owner reopens, so a read never returns a page its address no longer holds
+  (`tests/shard_db_paced.rs`: a cache larger than the store serves every read and none
+  stale; it fails with the replacement on write removed).
+- **Scans bypass it.** A compaction's cursor reads through its span (§4), so a scan neither
+  fills the cache nor evicts from it.
+
+10 M puts then 1 M reads, uncached I/O, fanout 8, this Mac, 2026-10-07:
+
+| cache | read p50 | read p99 | read p99.9 | misses | RSS |
+|---|---|---|---|---|---|
+| none (buffered I/O, the OS's cache) | 3.29 µs | 5.29 µs | 10.5 µs | — | 265 MB |
+| 1 GiB | 2.12 µs | 141 µs | 178 µs | 40,985 | 1.37 GB |
+| 1.5 GiB | 2.08 µs | 4.04 µs | 5.50 µs | 0 | 1.61 GB |
+| 2 GiB | 1.92 µs | 2.96 µs | 4.25 µs | 0 | 1.62 GB |
+
+The buffered row's memory is the OS's, outside the process and unbounded; the cache's is
+the owner's and bounded. The uncached fills' tail beside them stayed steady: p99.9 67–74 µs,
+p99.99 230–235 µs at 1.5 and 2 GiB, where buffered fills on this busy machine reached 2.4–5.3
+ms. How the cache is sized against a node's memory, and the F2 hot region, are E8's next part.
+
 ## 6. Scheduling flush and compaction
 
 Each shard schedules its replicas' flushes and compactions against foreground I/O, as SILK does

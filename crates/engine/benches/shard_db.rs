@@ -55,6 +55,8 @@ fn main() {
     let fanout: usize = args.get(2).map_or(8, |s| s.parse().unwrap());
     // The reads after the fill, `num` by default; 0 measures the fill alone.
     let reads: u64 = args.get(4).map_or(num, |s| s.parse().unwrap());
+    // The page cache in MiB, none by default: with buffered I/O the OS's cache serves reads.
+    let cache_mib: usize = args.get(5).map_or(0, |s| s.parse().unwrap());
     let path = dir.join("shard_db.store");
     let _ = std::fs::remove_file(&path);
     let align = Alignment::new(4096).unwrap();
@@ -83,6 +85,7 @@ fn main() {
         },
     )
     .unwrap();
+    db.set_cache((cache_mib << 20) / 4096);
     let value = [b'v'; 100];
     let mut rng = Rng(301);
     // Each operation timed, into a vector sized before the run: percentiles from the sorted
@@ -161,6 +164,14 @@ fn main() {
             s * 1e6 / reads as f64
         );
     }
+    let (_, _, io2) = db.stats();
+    println!(
+        "read io reads {} ({:.2}s) cache hits {} misses {}",
+        io2.reads - io.reads,
+        (io2.read_ns - io.read_ns) as f64 / 1e9,
+        io2.cache_hits,
+        io2.cache_misses
+    );
     let (h, n, l) = db.shape().unwrap();
     println!("shape height {h} nodes {n} leaves {l}");
     drop(db);

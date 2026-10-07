@@ -206,6 +206,11 @@ impl<F: BlockFile> ShardDb<F> {
         Ok(())
     }
 
+    /// Gives point reads a page cache of `pages` pages (`Store::set_cache`).
+    pub fn set_cache(&mut self, pages: usize) {
+        self.store.set_cache(pages);
+    }
+
     /// The store's file, the engine's work done.
     pub fn into_file(self) -> F {
         self.store.into_file()

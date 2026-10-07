@@ -16,6 +16,7 @@
 //! takes no more writes, and the caller reopens it from the file.
 
 pub mod alloc;
+pub mod cache;
 pub mod page;
 pub mod superblock;
 
@@ -69,6 +70,9 @@ pub struct IoStats {
     /// in front of it, held the caller.
     pub write_ns: u64,
     pub read_ns: u64,
+    /// Point reads the page cache served, and those it did not.
+    pub cache_hits: u64,
+    pub cache_misses: u64,
 }
 
 fn elapsed_ns(since: std::time::Instant) -> u64 {
@@ -90,6 +94,8 @@ pub struct Store<F: BlockFile> {
     /// The file's end in bytes: past every page written, the furthest a span reads.
     end: u64,
     io: IoStats,
+    /// The page cache for point reads, when the owner gives one ([`Store::set_cache`]).
+    cache: Option<cache::Cache>,
 }
 
 /// Node pages one writer queues at consecutive addresses within an extent, sealed into an
@@ -206,6 +212,7 @@ impl<F: BlockFile> Store<F> {
             fenced: false,
             end: 0,
             io: IoStats::default(),
+            cache: None,
         };
         store.checkpoint(None, 0)?;
         Ok(store)
@@ -251,6 +258,7 @@ impl<F: BlockFile> Store<F> {
                 fenced: false,
                 end,
                 io: IoStats::default(),
+                cache: None,
             },
             recovered,
         ))
@@ -329,7 +337,18 @@ impl<F: BlockFile> Store<F> {
 
     /// The store's I/O since it was opened.
     pub fn io_stats(&self) -> IoStats {
-        self.io
+        let (cache_hits, cache_misses) = self.cache.as_ref().map_or((0, 0), cache::Cache::stats);
+        IoStats {
+            cache_hits,
+            cache_misses,
+            ..self.io
+        }
+    }
+
+    /// Gives point reads a page cache of `pages` pages (none at 0), replacing any it had. Its
+    /// memory is `pages` times the page size, taken now.
+    pub fn set_cache(&mut self, pages: usize) {
+        self.cache = (pages > 0).then(|| cache::Cache::new(pages, self.config.page_size));
     }
 
     /// The pages an extent holds.
@@ -382,7 +401,19 @@ impl<F: BlockFile> Store<F> {
     /// One reference fewer; an extent left with none is reused once a checkpoint that no
     /// longer names it is durable.
     pub fn release(&mut self, extent: u64) -> Result<(), Error> {
-        self.alloc.release(extent)
+        self.alloc.release(extent)?;
+        // An extent no node names any more is read by no one: its pages leave the cache now,
+        // so the cache holds live pages, not the inputs of compactions done.
+        if !self.alloc.is_held(extent)
+            && let Some(c) = self.cache.as_mut()
+        {
+            let pages = u64::from(self.config.extent_pages);
+            let first = extent.saturating_mul(pages);
+            for address in first..first.saturating_add(pages) {
+                c.forget(address);
+            }
+        }
+        Ok(())
     }
 
     /// The extents holding the durable checkpoint's allocator map.
@@ -398,6 +429,9 @@ impl<F: BlockFile> Store<F> {
     fn fence<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
         if result.is_err() {
             self.fenced = true;
+            // The cache took pages as they were queued; one whose write failed is not the
+            // file's, so reads go to the file until the owner reopens it.
+            self.cache = None;
         }
         result
     }
@@ -414,6 +448,9 @@ impl<F: BlockFile> Store<F> {
                 "write a store page",
                 "the store was fenced by a failed write or flush",
             ));
+        }
+        if let Some(c) = self.cache.as_mut() {
+            c.forget(address);
         }
         let buf = self.buf.as_mut_slice();
         buf.get_mut(HEADER..HEADER.saturating_add(payload.len()))
@@ -471,6 +508,12 @@ impl<F: BlockFile> Store<F> {
             return Err(Error::InvalidArgument {
                 what: "a page written outside a held extent",
             });
+        }
+        // The page enters the cache as it is written, as SplinterDB writes through its cache
+        // (research/34 §1): a page just compacted is read without I/O, as the OS's cache serves
+        // a buffered write. A page never read again leaves first (S3-FIFO's small queue).
+        if let Some(c) = self.cache.as_mut() {
+            c.insert(address, payload);
         }
         let continues = run.pages > 0
             && run.first.checked_add(u64::from(run.pages)) == Some(address)
@@ -559,11 +602,20 @@ impl<F: BlockFile> Store<F> {
             });
         }
         let generation = self.durable.generation.saturating_add(1);
-        self.put(address, Kind::Node, generation, payload)
+        self.put(address, Kind::Node, generation, payload)?;
+        if let Some(c) = self.cache.as_mut() {
+            c.insert(address, payload);
+        }
+        Ok(())
     }
 
     /// Reads the node page at `address` and appends its payload to `out`.
     pub fn read_page(&mut self, address: u64, out: &mut Vec<u8>) -> Result<(), Error> {
+        if let Some(c) = self.cache.as_mut()
+            && c.get(address, out)
+        {
+            return Ok(());
+        }
         let offset = Self::offset_in(self.config, address)?;
         self.io.reads = self.io.reads.saturating_add(1);
         self.io.pages_read = self.io.pages_read.saturating_add(1);
@@ -574,7 +626,14 @@ impl<F: BlockFile> Store<F> {
             .map_err(|e| io("read a store page", e));
         self.io.read_ns = self.io.read_ns.saturating_add(elapsed_ns(started));
         read?;
-        node_payload(self.buf.as_slice(), address, out)
+        let from = out.len();
+        node_payload(self.buf.as_slice(), address, out)?;
+        if let Some(c) = self.cache.as_mut()
+            && let Some(payload) = out.get(from..)
+        {
+            c.insert(address, payload);
+        }
+        Ok(())
     }
 
     /// A span for a scan: an extent's buffer, holding no pages yet.

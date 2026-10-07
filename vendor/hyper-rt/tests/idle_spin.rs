@@ -134,3 +134,78 @@ fn a_shard_spins_only_inside_the_window_its_last_client_activity_opened() {
     );
     rt.shutdown().unwrap();
 }
+
+/// Opens a client-activity window on `shard` from one of its own tasks.
+fn note_activity(rt: &Runtime, shard: ShardId) {
+    rt.spawn_on(shard, async {
+        registry::with_current(|ctx| ctx.note_activity());
+    })
+    .unwrap();
+}
+
+/// mantle's E2 range bench found a shard with no readiness wait spending half its time in `kevent`: the
+/// spin polled the driver every turn and a busy loop every quantum, though nothing was armed. Do: open a
+/// window on a shard that holds no readiness wait and let it spin the window out. Expect: it spun, and
+/// polled the driver not once (`harvests` unmoved): with nothing armed the driver holds nothing to poll.
+#[test]
+fn a_spin_with_no_readiness_wait_polls_no_driver() {
+    let rt = Runtime::start(&config()).unwrap();
+    let shard = rt.shard_ids()[0];
+    let before = counters_of(&rt, shard);
+    note_activity(&rt, shard);
+    wait(Duration::from_nanos(WINDOW_NS).saturating_mul(2));
+    let after = counters_of(&rt, shard);
+    assert!(
+        spins(&after) > spins(&before),
+        "the window never spun: {after:?}"
+    );
+    assert_eq!(
+        after.harvests, before.harvests,
+        "the shard polled a driver with nothing armed: {after:?}"
+    );
+    rt.shutdown().unwrap();
+}
+
+/// Do: hold a read wait on a socket nobody sends to, open a window, and let the shard spin it out.
+/// Expect: the spin polled the driver (non-vacuity), and at most once a quantum: the quantum here (the
+/// configured step budget, with no wake tracking) is longer than the window, so each spin polls once, at
+/// its start, and the busy path at most once more in the stretch — never once a turn.
+#[test]
+fn a_spin_with_a_readiness_wait_polls_the_driver_once_a_quantum() {
+    use hyper_rt::udp::{Ipv4Addr, SocketAddr, UdpSocket};
+
+    let rt = Runtime::start(&config()).unwrap();
+    let shard = rt.shard_ids()[0];
+    let (armed, is_armed) = channel();
+    rt.spawn_on(shard, async move {
+        let idle = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let wait = idle.readable();
+        let mut wait = std::pin::pin!(wait);
+        // Polled once, the wait is registered; the task then holds it, unfired, for the test's span.
+        std::future::poll_fn(|cx| {
+            let _ = wait.as_mut().poll(cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+        armed.send(()).unwrap();
+        wait.await.unwrap();
+    })
+    .unwrap();
+    is_armed.recv_timeout(ANSWER).unwrap();
+    let before = counters_of(&rt, shard);
+    note_activity(&rt, shard);
+    wait(Duration::from_nanos(WINDOW_NS).saturating_mul(2));
+    let after = counters_of(&rt, shard);
+    let spun = spins(&after) - spins(&before);
+    let polled = after.harvests - before.harvests;
+    assert!(spun > 0, "the window never spun: {after:?}");
+    assert!(
+        polled > 0,
+        "a spin with a wait armed never polled the driver: {after:?}"
+    );
+    assert!(
+        polled <= spun + 1,
+        "{polled} driver polls in {spun} spins: the spin polls once a quantum, not once a turn"
+    );
+    rt.shutdown().unwrap();
+}

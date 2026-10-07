@@ -200,6 +200,12 @@ impl Interests {
         })
     }
 
+    /// Whether no task waits on any handle: then nothing is armed in the driver for this table, and the
+    /// driver has no readiness to report but a fire to no one (`remove`'s note).
+    pub(crate) fn is_empty(&self) -> bool {
+        self.nodes.len() == self.free.len()
+    }
+
     /// Waiters now.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {

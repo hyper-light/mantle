@@ -93,6 +93,9 @@ pub struct Counters {
     pub timer_waits: u64,
     /// Driver waits.
     pub waits: u64,
+    /// Non-blocking driver polls (`harvest_io`): each a system call, made only while a readiness wait is
+    /// registered.
+    pub harvests: u64,
     /// Driver completions delivered.
     pub completions: u64,
     /// Times the driver was lost.
@@ -675,8 +678,14 @@ impl Shard {
     }
 
     /// Harvests the driver's ready completions without blocking and queues their tasks; true when a
-    /// completion was queued.
+    /// completion was queued. With no readiness wait registered the driver holds nothing for a task (the
+    /// shard arms the driver only for its waits, `apply_interest` and `deliver`), so no system call is made:
+    /// a kick left behind returns the next park at once, as it would have.
     fn harvest_io(&mut self) -> bool {
+        if self.core.waiting.is_empty() {
+            return false;
+        }
+        self.core.counters.harvests = self.core.counters.harvests.saturating_add(1);
         let mut completions = std::mem::take(&mut self.core.completions);
         let result = self.core.driver.wait(Some(0), &mut completions);
         let harvested = !completions.is_empty();
@@ -713,13 +722,17 @@ impl Shard {
     }
 
     /// The spin: true when work arrived or `deadline_ns` fell due before `spin_end`. Each turn asks the
-    /// inboxes, the pollers and the driver (a socket's readiness is work as much as a wake).
+    /// inboxes and the pollers, which cost no system call; the driver (a socket's readiness is work as much
+    /// as a wake) is asked at the spin's start and then once a quantum, the calibrated wake's cost, so a
+    /// readiness waits no longer than a wake would have while the spin makes no system call a turn.
     fn spin_for_work(&mut self, spin_end: u64, deadline_ns: Option<u64>) -> bool {
+        let mut next_harvest_ns = self.now_ns();
         loop {
+            let harvest_due = self.now_ns() >= next_harvest_ns;
             if self.has_inbound()
                 || self.core.driver.has_pending()
                 || self.wake_ready_pollers()
-                || self.harvest_io()
+                || (harvest_due && self.harvest_io())
             {
                 self.core.counters.spin_hits = self.core.counters.spin_hits.saturating_add(1);
                 return true;
@@ -736,6 +749,9 @@ impl Shard {
             if now >= spin_end {
                 self.core.counters.spin_misses = self.core.counters.spin_misses.saturating_add(1);
                 return false;
+            }
+            if harvest_due {
+                next_harvest_ns = now.saturating_add(self.quantum_ns());
             }
             std::hint::spin_loop();
         }

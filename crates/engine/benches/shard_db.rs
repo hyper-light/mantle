@@ -24,7 +24,7 @@ use std::time::Instant;
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::issuer::Issuer;
-use hyper_measure::{alloc, faults};
+use hyper_measure::{alloc, faults, usage};
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::Config;
 use mantle_engine::trunk::TrunkConfig;
@@ -306,6 +306,19 @@ fn main() {
             s * 1e6 / reads as f64
         );
     }
+    let ((c, w, r), (ci, ri)) = (db.memory_held(), db.index_bytes());
+    let u = usage::this().ok();
+    let mib = |b: Option<u64>| b.map_or(f64::NAN, |b| b as f64 / 1048576.0);
+    println!(
+        "memory held cache {:.1} MiB write {:.1} MiB records {:.1} MiB; indexes cache {:.1} MiB records {:.1} MiB; process footprint {:.1} MiB (peak {:.1})",
+        c as f64 / 1048576.0,
+        w as f64 / 1048576.0,
+        r as f64 / 1048576.0,
+        ci as f64 / 1048576.0,
+        ri as f64 / 1048576.0,
+        mib(u.as_ref().and_then(|u| u.footprint)),
+        mib(u.as_ref().and_then(|u| u.peak_footprint)),
+    );
     let (_, _, io2) = db.stats();
     println!(
         "read io reads {} ({:.2}s) cache hits {} misses {}",

@@ -184,6 +184,15 @@ pub struct ShardDb<F: BlockFile> {
     tuned: crate::store::IoStats,
     /// The tuner's past steps, for its Newton step.
     newton: Newton,
+    /// Pages each operation trims from the page cache and the record cache while a tuning step
+    /// left them above their new size.
+    trim_cache: usize,
+    trim_records: usize,
+    /// The page cache's share in bytes, the record cache's being `records_share`.
+    cache_share: usize,
+    /// The page cache's and record cache's index and ghost bytes when last granted: what their
+    /// shares pay for besides data.
+    charged: (usize, usize),
     /// The key a scan is at, and the bounds of the trunk segment it reads: buffers kept
     /// between scans.
     scan_key: Vec<u8>,
@@ -423,6 +432,10 @@ impl<F: BlockFile> ShardDb<F> {
             write_share: 0,
             tuned: crate::store::IoStats::default(),
             newton: Newton::default(),
+            trim_cache: 0,
+            trim_records: 0,
+            cache_share: 0,
+            charged: (0, 0),
             scan_key: Vec::new(),
             scan_from: Vec::new(),
             scan_active: MemCursor::empty(),
@@ -582,6 +595,7 @@ impl<F: BlockFile> ShardDb<F> {
             self.store.page_size(),
         ));
         let cache = bytes.saturating_sub(self.records_share);
+        self.cache_share = cache;
         self.store
             .resize_cache(cache.checked_div(self.store.page_size()).unwrap_or(0));
         self.tuned = self.store.io_stats();
@@ -601,6 +615,43 @@ impl<F: BlockFile> ShardDb<F> {
             self.records
                 .as_ref()
                 .map_or(0, crate::records::RecordCache::bytes),
+        )
+    }
+
+    /// The memory the page cache and record cache hold now, with the index and ghost bytes
+    /// their shares were last charged, and write memory's share, in bytes: within the budget as
+    /// memory moves (`grant`). Indexes are charged at each grant, so a cache's data never takes
+    /// what its index needs; between grants its index's own size is `index_bytes`.
+    pub fn memory_held(&self) -> (usize, usize, usize) {
+        let (cache_index, records_index) = self.charged;
+        (
+            self.store.cache_bytes().saturating_add(cache_index),
+            self.write_share,
+            self.records
+                .as_ref()
+                .map_or(0, crate::records::RecordCache::held_bytes)
+                .saturating_add(records_index),
+        )
+    }
+
+    /// Operations in a tuning cycle: a memtable's worth.
+    pub fn cycle_ops(&self) -> u64 {
+        self.cycle_ops
+    }
+
+    /// Whether a region is still being brought down to a smaller share (`trim`): until it is,
+    /// the regions may hold more than the budget by what it has left to give back.
+    pub fn trimming(&self) -> bool {
+        self.trim_cache > 0 || self.trim_records > 0
+    }
+
+    /// The bytes the page cache's and record cache's indexes and ghosts take.
+    pub fn index_bytes(&self) -> (usize, usize) {
+        (
+            self.store.cache_index_bytes(),
+            self.records
+                .as_ref()
+                .map_or(0, crate::records::RecordCache::index_bytes),
         )
     }
 
@@ -631,6 +682,7 @@ impl<F: BlockFile> ShardDb<F> {
         if self.memory.is_none() {
             return;
         }
+        self.trim();
         self.ops_since = self.ops_since.saturating_add(1);
         if self.ops_since >= self.cycle_ops {
             self.ops_since = 0;
@@ -706,13 +758,66 @@ impl<F: BlockFile> ShardDb<F> {
         };
         self.write_share = write_share;
         self.store.set_write_budget(write_share);
+        self.cache_share = cache;
+        self.records_share = records_share;
+        self.grant();
+        // What a shrunk region holds above its size leaves a few pages an operation, over half
+        // a cycle, so no operation pays for the step and the memory moves within the cycle.
+        let half = usize::try_from(self.cycle_ops / 2)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        let per_op = |over: usize| over.div_ceil(half);
+        self.trim_cache = per_op(self.store.cache_over());
+        self.trim_records = per_op(
+            self.records
+                .as_ref()
+                .map_or(0, crate::records::RecordCache::over),
+        );
+    }
+
+    /// Sets the page cache's and the record cache's limits to their shares, each less the index
+    /// and ghost bytes it pays for, at the ratio of index to data measured now. A region whose
+    /// limit fell is brought down to it by `trim`, a few pages an operation, which outpaces a
+    /// growing region's filling (a page or a record a miss): memory moving between them never
+    /// holds more than it did when the step began.
+    fn grant(&mut self) {
+        if self.memory.is_none() {
+            return;
+        }
+        let page = self.store.page_size().max(1);
+        let net = |share: usize, data: usize, index: usize| -> usize {
+            let total = u128::try_from(data.saturating_add(index)).unwrap_or(u128::MAX);
+            if data == 0 || total == 0 {
+                return share.saturating_sub(index);
+            }
+            let share = u128::try_from(share).unwrap_or(u128::MAX);
+            let data = u128::try_from(data).unwrap_or(u128::MAX);
+            usize::try_from(share.saturating_mul(data).checked_div(total).unwrap_or(0))
+                .unwrap_or(usize::MAX)
+        };
+        let (cache_index, records_index) = self.index_bytes();
+        self.charged = (cache_index, records_index);
+        let cache = net(self.cache_share, self.store.cache_bytes(), cache_index);
         self.store
             .resize_cache(cache.checked_div(page).unwrap_or(0));
-        if records_share != self.records_share {
-            self.records_share = records_share;
-            if let Some(r) = self.records.as_mut() {
-                r.resize(records_share);
-            }
+        if let Some(r) = self.records.as_mut() {
+            let records = net(self.records_share, r.held_bytes(), records_index);
+            r.resize(records);
+        }
+    }
+
+    /// An operation's share of bringing shrunk regions down to their size.
+    fn trim(&mut self) {
+        if self.trim_cache > 0 && !self.store.trim_cache(self.trim_cache) {
+            self.trim_cache = 0;
+        }
+        if self.trim_records > 0
+            && !self
+                .records
+                .as_mut()
+                .is_some_and(|r| r.trim(self.trim_records))
+        {
+            self.trim_records = 0;
         }
     }
 
@@ -753,6 +858,7 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     fn apply(&mut self, key: &[u8], op: Op, value: &[u8]) -> Result<(), Error> {
+        self.trim();
         // A write makes the key's cached record stale: it goes before the write is answered.
         if let Some(r) = self.records.as_mut() {
             r.invalidate(key, crate::branch::filter::hash(key));

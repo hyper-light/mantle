@@ -7,8 +7,12 @@
 //! Redis's dict rehashes a step an operation (`dict.c`, `_dictRehashStep`), so no single
 //! operation pays for more than that.
 //!
-//! Open addressing with linear probing; a key's home bucket by Fibonacci hashing (Knuth, TAOCP
-//! vol. 3, §6.4). Removal leaves a tombstone, so a migration or a sweep never moves an entry it has
+//! Each table is a SwissTable (Abseil's design, `abseil.io/about/design/swisstables`): a control
+//! byte a bucket, holding 7 bits of the key's hash, read eight at a time as one word and matched
+//! with word arithmetic (hashbrown's portable group, `src/control/group/generic.rs`), so a lookup
+//! reads a group or two at a load up to 7/8 where linear probing reads tens of buckets. A key's
+//! hash by Fibonacci hashing (Knuth, TAOCP vol. 3, §6.4), its tag and its group from different
+//! high bits. Removal leaves a tombstone, so a migration or a sweep never moves an entry it has
 //! not reached; tombstones are dropped when the table is rebuilt, which they count toward.
 
 /// Buckets of the old table moved each write while a migration runs. Derived: a migration from
@@ -17,112 +21,166 @@
 /// `MOVE = 8`. Built with `N >= 8/7 (len + 1 + C / 4)` buckets, it stays under its rebuild
 /// threshold, `7/8` of `N`: a migration always ends before the next begins.
 const MOVE: usize = 8;
+/// Buckets a window's sweep looks at each time an entry is added (see `IncMap::sweep`).
+/// Derived: an entry leaves the window after `W` newer ones, and a pass over the map's `B` buckets
+/// takes `B / SWEEP` additions, each adding at most one entry, so expired entries number at most
+/// `2 B / SWEEP = B / 8` (two passes). The map grows only when entries and tombstones pass `7/8`
+/// of `B`; with expired entries within `B / 8`, that needs the window's entries near `3/4` of `B`.
+/// So a window's map stays within a few times `W`.
+pub const SWEEP: usize = 16;
 /// Fibonacci hashing's multiplier, 2^64 over the golden ratio (Knuth, TAOCP vol. 3, §6.4).
 const FIB: u64 = 0x9E37_79B9_7F4A_7C15;
 
-const EMPTY: u8 = 0;
-const FULL: u8 = 1;
-const TOMB: u8 = 2;
+/// Control bytes: a bucket never used since its table was built, a removed entry's, and a full
+/// bucket's holding its tag, below 0x80 (hashbrown's encoding).
+const EMPTY: u8 = 0xFF;
+const DELETED: u8 = 0x80;
+/// Buckets in a group: the control bytes in a word.
+const GROUP: usize = 8;
+/// A word of eight bytes each `b`.
+const fn repeat(b: u8) -> u64 {
+    u64::from_le_bytes([b; GROUP])
+}
+const LOW: u64 = repeat(0x01);
+const HIGH: u64 = repeat(0x80);
 
-/// One open-addressing table: a power-of-two count of buckets.
+/// One table: a power-of-two count of buckets, at least a group.
 #[derive(Debug, Default)]
 struct Table {
-    ctrl: Vec<u8>,
-    keys: Vec<u64>,
-    vals: Vec<u64>,
+    /// Each group's control bytes as one word, byte `b` of word `g` for bucket `8 g + b`.
+    ctrl: Vec<u64>,
+    /// Each bucket's key and value side by side: a hit reads the control word's line and the
+    /// entry's, as hashbrown's buckets are laid out.
+    slots: Vec<[u64; 2]>,
     full: usize,
     tombs: usize,
+    /// From a hash to its group: the bits below the tag's, `(m >> shift) & mask`.
     shift: u32,
+    mask: usize,
 }
 
 impl Table {
-    /// A table of `buckets` buckets, a power of two. Zeroed memory: its pages are touched as
-    /// entries land in them, not when it is made.
+    /// A table of `buckets` buckets, a power of two of at least a group. Keys and values are
+    /// zeroed memory, touched as entries land in them, not when it is made.
     fn new(buckets: usize) -> Self {
+        let groups = (buckets / GROUP).max(1);
         Self {
-            ctrl: vec![EMPTY; buckets],
-            keys: vec![0; buckets],
-            vals: vec![0; buckets],
+            ctrl: vec![repeat(EMPTY); groups],
+            slots: vec![[0; 2]; groups.saturating_mul(GROUP)],
             full: 0,
             tombs: 0,
-            shift: 64u32.saturating_sub(buckets.trailing_zeros()),
+            shift: 57u32.saturating_sub(groups.trailing_zeros()),
+            mask: groups.wrapping_sub(1),
         }
     }
 
     fn buckets(&self) -> usize {
-        self.ctrl.len()
+        self.slots.len()
     }
 
-    fn home(&self, key: u64) -> usize {
-        usize::try_from(key.wrapping_mul(FIB).checked_shr(self.shift).unwrap_or(0)).unwrap_or(0)
+    /// The key's tag, its hash's top 7 bits, and its first group, from the bits below them.
+    #[inline]
+    fn hash(&self, key: u64) -> (u8, usize) {
+        let m = key.wrapping_mul(FIB);
+        let tag = u8::try_from(m >> 57).unwrap_or(0);
+        let group = usize::try_from(m.wrapping_shr(self.shift)).unwrap_or(0) & self.mask;
+        (tag, group)
     }
 
-    fn next(&self, i: usize) -> usize {
-        i.wrapping_add(1) & self.buckets().wrapping_sub(1)
+    /// The bucket holding `key`, or else the first empty or deleted bucket its probe passed: a
+    /// plain loop over the probe's groups, as hashbrown's, which the iterator form of it ran
+    /// several times slower than (benches/incmap.rs).
+    #[inline]
+    fn seek(&self, key: u64, tag: u8, start: usize) -> Result<usize, Option<usize>> {
+        let pattern = repeat(tag);
+        let mut free = None;
+        let mut g = start;
+        // Each round reads a group; triangular steps visit each group once.
+        for stride in 1..=self.ctrl.len() {
+            let w = self.ctrl.get(g).copied().unwrap_or(0);
+            let at = g.wrapping_mul(GROUP);
+            // Bytes equal to the tag; a false positive is caught by the key's comparison.
+            let cmp = w ^ pattern;
+            let mut m = cmp.wrapping_sub(LOW) & !cmp & HIGH;
+            while m != 0 {
+                let i = at.wrapping_add(usize::try_from(m.trailing_zeros() / 8).unwrap_or(0));
+                if self.slots.get(i).is_some_and(|e| e[0] == key) {
+                    return Ok(i);
+                }
+                m &= m.wrapping_sub(1);
+            }
+            if free.is_none() && w & HIGH != 0 {
+                let b = usize::try_from((w & HIGH).trailing_zeros() / 8).unwrap_or(0);
+                free = Some(at.wrapping_add(b));
+            }
+            // An empty bucket ends the probe: the key would have been placed by then.
+            if w & (w << 1) & HIGH != 0 {
+                return Err(free);
+            }
+            g = g.wrapping_add(stride) & self.mask;
+        }
+        Err(free)
     }
 
-    /// The bucket holding `key`.
+    #[inline]
     fn find(&self, key: u64) -> Option<usize> {
-        let mut i = self.home(key);
-        // Each step passes a bucket: at most all of them.
-        for _ in 0..self.buckets() {
-            match self.ctrl.get(i).copied()? {
-                EMPTY => return None,
-                FULL if self.keys.get(i).copied()? == key => return Some(i),
-                _ => i = self.next(i),
-            }
-        }
-        None
+        let (tag, start) = self.hash(key);
+        self.seek(key, tag, start).ok()
     }
 
+    #[inline]
     fn get(&self, key: u64) -> Option<u64> {
-        self.find(key).and_then(|i| self.vals.get(i).copied())
+        self.find(key).and_then(|i| self.slots.get(i)).map(|e| e[1])
     }
 
-    /// Sets `key` to `val`; the value it replaced.
-    fn insert(&mut self, key: u64, val: u64) -> Option<u64> {
-        let mut i = self.home(key);
-        let mut slot = None;
-        // Each step passes a bucket: at most all of them.
-        for _ in 0..self.buckets() {
-            match self.ctrl.get(i).copied()? {
-                EMPTY => {
-                    slot.get_or_insert(i);
-                    break;
-                }
-                FULL if self.keys.get(i).copied()? == key => {
-                    let v = self.vals.get_mut(i)?;
-                    return Some(std::mem::replace(v, val));
-                }
-                TOMB => {
-                    slot.get_or_insert(i);
-                    i = self.next(i);
-                }
-                _ => i = self.next(i),
-            }
+    /// Bucket `i`'s control byte.
+    fn ctrl_at(&self, i: usize) -> u8 {
+        let shift = u32::try_from(i % GROUP).unwrap_or(0).wrapping_mul(8);
+        self.ctrl
+            .get(i / GROUP)
+            .and_then(|w| u8::try_from(w.wrapping_shr(shift) & 0xFF).ok())
+            .unwrap_or(EMPTY)
+    }
+
+    fn set_ctrl(&mut self, i: usize, c: u8) {
+        let shift = u32::try_from(i % GROUP).unwrap_or(0).wrapping_mul(8);
+        if let Some(w) = self.ctrl.get_mut(i / GROUP) {
+            *w = (*w & !0xFFu64.wrapping_shl(shift)) | u64::from(c).wrapping_shl(shift);
         }
-        let at = slot?;
-        let c = self.ctrl.get_mut(at)?;
-        if *c == TOMB {
+    }
+
+    /// Sets `key` to `val`; the value it replaced. One probe finds the key or the bucket for it.
+    fn insert(&mut self, key: u64, val: u64) -> Option<u64> {
+        let (tag, start) = self.hash(key);
+        let at = match self.seek(key, tag, start) {
+            Ok(i) => {
+                let e = self.slots.get_mut(i)?;
+                return Some(std::mem::replace(&mut e[1], val));
+            }
+            Err(free) => free?,
+        };
+        if self.ctrl_at(at) == DELETED {
             self.tombs = self.tombs.saturating_sub(1);
         }
-        *c = FULL;
-        *self.keys.get_mut(at)? = key;
-        *self.vals.get_mut(at)? = val;
+        self.set_ctrl(at, tag);
+        *self.slots.get_mut(at)? = [key, val];
         self.full = self.full.saturating_add(1);
         None
     }
 
+    fn is_full(&self, i: usize) -> bool {
+        self.ctrl_at(i) & 0x80 == 0
+    }
+
     /// Takes the entry at bucket `i`, leaving a tombstone.
     fn take(&mut self, i: usize) -> Option<(u64, u64)> {
-        let c = self.ctrl.get_mut(i)?;
-        if *c != FULL {
+        if !self.is_full(i) {
             return None;
         }
-        *c = TOMB;
+        self.set_ctrl(i, DELETED);
         self.full = self.full.saturating_sub(1);
         self.tombs = self.tombs.saturating_add(1);
-        Some((self.keys.get(i).copied()?, self.vals.get(i).copied()?))
+        self.slots.get(i).map(|e| (e[0], e[1]))
     }
 
     fn remove(&mut self, key: u64) -> Option<u64> {
@@ -163,10 +221,17 @@ impl IncMap {
             .saturating_add(self.old.as_ref().map_or(0, |o| o.full))
     }
 
+    /// The bytes its tables take, the old one's while a migration runs included.
+    pub fn bytes(&self) -> usize {
+        let of = |t: &Table| t.buckets().saturating_mul(17);
+        of(&self.table).saturating_add(self.old.as_ref().map_or(0, of))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    #[inline]
     pub fn get(&self, key: u64) -> Option<u64> {
         self.table
             .get(key)
@@ -197,7 +262,19 @@ impl IncMap {
     pub fn remove(&mut self, key: u64) -> Option<u64> {
         self.step();
         let old = self.old.as_mut().and_then(|o| o.remove(key));
-        self.table.remove(key).or(old)
+        let was = self.table.remove(key).or(old);
+        self.shrink();
+        was
+    }
+
+    /// Starts a migration to a smaller table once removals leave this one at most `1/8` full:
+    /// the mirror of growing at `7/8`, a table built at least a quarter full never shrinking
+    /// at once, so a map that emptied gives its memory back.
+    fn shrink(&mut self) {
+        let sparse = self.table.full.saturating_mul(8) <= self.table.buckets();
+        if self.old.is_none() && self.table.buckets() > GROUP && sparse {
+            self.rebuild();
+        }
     }
 
     /// Looks at the next `n` buckets of the table, from where the last sweep stopped, and removes
@@ -210,17 +287,27 @@ impl IncMap {
         for _ in 0..n.min(buckets) {
             let i = self.swept & buckets.wrapping_sub(1);
             self.swept = i.wrapping_add(1);
-            let refused = self.table.ctrl.get(i) == Some(&FULL)
-                && self
-                    .table
-                    .keys
-                    .get(i)
-                    .zip(self.table.vals.get(i))
-                    .is_some_and(|(&k, &v)| !keep(k, v));
+            let refused =
+                self.table.is_full(i) && self.table.slots.get(i).is_some_and(|e| !keep(e[0], e[1]));
             if refused {
                 self.table.take(i);
             }
         }
+        self.shrink();
+    }
+
+    /// A migration's step for a read: the caches' reads call it, so a phase of reads alone
+    /// finishes a migration that writes began, and lookups go back to probing one table.
+    #[inline]
+    pub fn settle(&mut self) {
+        if self.old.is_some() {
+            self.step();
+        }
+    }
+
+    /// Whether a migration is running.
+    pub fn migrating(&self) -> bool {
+        self.old.is_some()
     }
 
     /// Starts a migration to a new table sized for the entries held and the writes the
@@ -264,8 +351,8 @@ impl IncMap {
         let mut all = Vec::new();
         for t in std::iter::once(&self.table).chain(self.old.iter()) {
             for i in 0..t.buckets() {
-                if t.ctrl.get(i) == Some(&FULL) {
-                    all.push((t.keys[i], t.vals[i]));
+                if t.is_full(i) {
+                    all.push((t.slots[i][0], t.slots[i][1]));
                 }
             }
         }
@@ -332,7 +419,7 @@ mod tests {
     }
 
     #[test]
-    fn tombstones_crowding_a_table_rebuild_it_smaller() {
+    fn a_map_emptied_by_removals_rebuilds_smaller() {
         let mut m = IncMap::new();
         for k in 0..100_000u64 {
             m.insert(k, k);
@@ -341,8 +428,8 @@ mod tests {
             m.remove(k);
         }
         let big = m.table.buckets();
-        // A few keys churned: each new one lands on fresh buckets until tombstones crowd the
-        // table, which then rebuilds for what it holds.
+        // A few keys churned through a table built for 100,000: each removal that leaves it at
+        // most 1/8 full starts a smaller one, until it fits what it holds.
         for k in 100_000..400_000u64 {
             m.insert(k, k);
             m.remove(k.saturating_sub(4));

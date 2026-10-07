@@ -55,6 +55,10 @@ name = "shard_db"
 harness = false
 
 [[bench]]
+name = "incmap"
+harness = false
+
+[[bench]]
 name = "ranges"
 harness = false
 

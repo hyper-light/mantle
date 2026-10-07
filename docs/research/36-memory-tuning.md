@@ -58,7 +58,16 @@ memory its owner spares between its memtables, its page cache and its write runs
   ring, so each step's next cycle saw ten times fewer ghost hits (16.9M ns saved, then 0.17M)
   and the tuner reversed. Measured 2026-10-07, 10M keys, skewed reads.
 - Memory a step takes from a region must leave it. The page cache kept one slab and shrank it by
-  moving pages down and truncating, which keeps the allocation: peak RSS 913 MiB where slots
-  owning their buffers, dropped on a shrink, give 802 MiB at the same split (10M keys, 10M skewed
-  reads, 320 MiB budget, 2026-10-07). Shrinking also no longer copies pages: the longest page
-  cache resize fell from 3.3 ms to 0.84 ms.
+  moving pages down and truncating, which keeps the allocation; its slots now own their buffers,
+  dropped on a shrink. Measured as macOS's peak memory footprint (what the system charges the
+  process; resident-set figures taken first overstated the difference), 10M keys, 10M skewed
+  reads, 320 MiB tuned, 2026-10-07: 944 MiB before, 895 MiB with the work below.
+- No step stops an operation. A shrunk region keeps its old memory until it is trimmed, a few
+  pages an operation spread over half a cycle (`ShardDb::trim`), its evictions by its own rule;
+  inserts while above the limit evict one for each they add, so it only falls. Trims outpace a
+  growing region's filling (a page or a record a miss), so memory moving between regions never
+  holds more than when the step began (tests/shard_db_paced.rs). The page cache's resize had
+  taken 0.5 to 3.3 ms on the read path at each step.
+- A region's share pays for its index and ghost: each step charges them at the ratio of index
+  to data measured then (`ShardDb::grant`). A 64 MiB record cache's index and ghost had been 51
+  MiB outside any budget; with SwissTable groups (util/incmap.rs) 34 MiB, now inside it.

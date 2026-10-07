@@ -42,6 +42,13 @@ FASTER to F2: Evolving Concurrent Key-Value Store Designs for Large Skewed Workl
   ring had to be rebuilt to resize, a copy of every record: 19–73 ms stalls on a 170 MiB cache
   (10M keys, 2026-10-07). With pages, growing raises the page limit and shrinking evicts head
   pages, the work eviction does anyway.
+- **No operation grows the index whole.** The table and the ghost grew by rehashing all of
+  themselves inside the get whose insert filled them: 546 to 2178 page faults, 1.3 to 5.2 ms, in
+  single gets (attributed gets, benches/shard_db.rs). Both are now `util::incmap::IncMap`
+  (SwissTable groups, Redis's step-a-write migration), and a read moves a migration on too.
+- **The ghost is a window.** It names the records evicted within the last `live_most`
+  evictions, swept a few buckets an eviction; a FIFO compacted by `retain` had been an O(n)
+  pass on the read path.
 - **Write-hot records** stay in the memtable, a B-tree updated in place (§8 E3): mantle's
   analogue of the hot log's mutable region.
 - **Sizing.** The cache's bytes are a third region of the shard's memory budget, divided by the

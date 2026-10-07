@@ -18,15 +18,7 @@
 
 use std::collections::VecDeque;
 
-use crate::util::incmap::IncMap;
-
-/// Ghost buckets swept each eviction. Derived: an entry goes stale after `live_most` newer
-/// evictions, and a sweep pass over the map's `B` buckets takes `B / SWEEP` evictions, each adding
-/// at most one entry, so stale entries are at most `2 B / SWEEP = B / 8` (two passes). The map
-/// grows only when entries and tombstones pass `7/8` of `B`; with stale entries within `B / 8`,
-/// that needs the window's live entries near `3/4` of `B`. So the map stays within a few times
-/// its window, `live_most`: the records the cache holds.
-const SWEEP: usize = 16;
+use crate::util::incmap::{IncMap, SWEEP};
 
 /// A record's fixed bytes: key length, value length, flags, hash.
 const RECORD_HEAD: usize = 2 + 4 + 1 + 8;
@@ -57,7 +49,7 @@ pub struct RecordCache {
     /// remembered within the last `live_most` is in the ghost, as many as the cache holds
     /// records. A miss on one is a get a larger cache would have served: what the memory tuner
     /// prices the cache's bytes at (research/36). Older entries are swept a few buckets an
-    /// eviction (`SWEEP`), so no operation pays for the ghost at once.
+    /// eviction (`incmap::SWEEP`), so no operation pays for the ghost at once.
     ghosts: IncMap,
     ghost_seq: u64,
     ghost_hits: u64,
@@ -145,25 +137,43 @@ impl RecordCache {
             .is_some_and(|seq| self.ghost_seq.wrapping_sub(seq) < self.window())
     }
 
-    /// Holds the cache to `bytes`: growing raises the page limit, shrinking evicts head pages.
+    /// Sets the cache's page limit for `bytes`: growing takes effect at once, and a cache above a
+    /// lowered limit is brought down by `trim`.
     pub fn resize(&mut self, bytes: usize) {
-        let most = bytes.checked_div(self.page).unwrap_or(0);
-        let shrinking = most < self.most;
-        self.most = most;
-        // Each round drops a page.
-        for _ in 0..self.pages.len() {
-            if self.pages.len() <= self.most {
-                break;
-            }
-            if self.drop_head(false).is_none() {
+        self.most = bytes.checked_div(self.page).unwrap_or(0);
+    }
+
+    /// Up to `n` head pages dropped toward the page limit, their records leaving for the ghost.
+    /// True while the cache is still above it. Meanwhile an insert evicts a page for each it
+    /// adds, so the pages held only fall.
+    pub fn trim(&mut self, n: usize) -> bool {
+        let over = self.pages.len() > self.most;
+        for _ in 0..n {
+            if self.pages.len() <= self.most || self.drop_head(false).is_none() {
                 break;
             }
         }
         // A smaller cache holds fewer records, so its ghost covers fewer; a larger one keeps the
         // window it had until it fills.
-        if shrinking {
+        if over && self.pages.len() <= self.most {
             self.live_most = self.live;
         }
+        self.pages.len() > self.most
+    }
+
+    /// The bytes its index and ghost take.
+    pub fn index_bytes(&self) -> usize {
+        self.table.bytes().saturating_add(self.ghosts.bytes())
+    }
+
+    /// The bytes of the pages held.
+    pub fn held_bytes(&self) -> usize {
+        self.pages.len().saturating_mul(self.page)
+    }
+
+    /// Pages held above the page limit: what `trim` has left to do.
+    pub fn over(&self) -> usize {
+        self.pages.len().saturating_sub(self.most)
     }
 
     /// The cache's bytes: its page limit.
@@ -224,6 +234,8 @@ impl RecordCache {
     /// The value cached for `key` of hash `hash`, if its record is current; counted as read, so
     /// it has a second chance at the head.
     pub fn get(&mut self, key: &[u8], hash: u64) -> Option<&[u8]> {
+        // A phase of hits writes nothing: the read moves the index's migration on.
+        self.table.settle();
         let Some(offset) = self.table.get(hash) else {
             self.misses = self.misses.saturating_add(1);
             if self.in_ghost(hash) {
@@ -304,7 +316,9 @@ impl RecordCache {
             }
             self.tail = held;
         }
-        if self.pages.len() >= self.most {
+        // A page just evicted is appended in its place even above a lowered limit: the pages
+        // held never grow there, and `trim` brings them down.
+        if self.pages.len() >= self.most && self.spare.is_none() {
             return None;
         }
         let page = self
@@ -338,6 +352,11 @@ impl RecordCache {
             self.evict_head()?;
         }
         if !fits {
+            // The page this append evicted stays out: appended later, it would grow a cache at
+            // or above its limit.
+            if self.pages.len() >= self.most {
+                self.spare = None;
+            }
             return None;
         }
         self.write(klen, vlen, hash, key, value, flags)
@@ -466,6 +485,7 @@ mod tests {
             let mut latest: HashMap<u32, Option<Vec<u8>>> = HashMap::new();
             let mut x = 0x9e37_79b9_7f4a_7c15u64 ^ cap as u64;
             let mut hits = 0u64;
+            let mut pages = 0usize;
             for step in 0..40_000u32 {
                 x ^= x << 13;
                 x ^= x >> 7;
@@ -488,6 +508,9 @@ mod tests {
                         // Resized, the newest records kept: what stays still answers exactly.
                         c.resize(cap / 2 + (x >> 24) as usize % cap);
                     }
+                    6 if step % 7 == 0 => {
+                        c.trim(1 + (x >> 24) as usize % 4);
+                    }
                     _ => {
                         if let Some(v) = c.get(&key, h) {
                             hits += 1;
@@ -499,7 +522,9 @@ mod tests {
                         }
                     }
                 }
-                assert!(c.pages.len() <= c.most, "cap {cap} step {step}");
+                // Never above the limit by more than it was, nor growing while above it.
+                assert!(c.pages.len() <= c.most.max(pages), "cap {cap} step {step}");
+                pages = c.pages.len();
                 assert!(
                     c.tail - c.first <= (c.pages.len() * page) as u64,
                     "cap {cap} step {step}"
@@ -516,7 +541,7 @@ mod tests {
                     );
                 }
                 assert_eq!(c.live, c.table.len(), "cap {cap} step {step}");
-                // The ghost stays within a few times its window (see `SWEEP`).
+                // The ghost stays within a few times its window (see `incmap::SWEEP`).
                 assert!(
                     c.ghosts.len() <= 4 * c.live_most.max(16),
                     "cap {cap} step {step}: ghost {} window {}",
@@ -565,6 +590,7 @@ mod tests {
             c.insert(k, hash(k), &value);
         }
         c.resize(5 * 31);
+        assert!(!c.trim(usize::MAX));
         assert!(c.get(&keys[0], hash(&keys[0])).is_none());
         assert_eq!(c.ghost_hits(), 1);
     }

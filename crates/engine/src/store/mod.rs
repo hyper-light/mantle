@@ -550,6 +550,27 @@ impl<F: BlockFile> Store<F> {
         }
     }
 
+    /// Up to `n` steps bringing the page cache down to its limit (`Cache::trim`); true while it
+    /// is still above it.
+    pub fn trim_cache(&mut self, n: usize) -> bool {
+        self.cache.as_mut().is_some_and(|c| c.trim(n))
+    }
+
+    /// The page cache's bytes in memory: its pages and the buffers it keeps for more.
+    pub fn cache_bytes(&self) -> usize {
+        self.cache.as_ref().map_or(0, cache::Cache::bytes)
+    }
+
+    /// The bytes the page cache's index and ghost take.
+    pub fn cache_index_bytes(&self) -> usize {
+        self.cache.as_ref().map_or(0, cache::Cache::index_bytes)
+    }
+
+    /// Pages and freed buffers the page cache holds above its limit.
+    pub fn cache_over(&self) -> usize {
+        self.cache.as_ref().map_or(0, cache::Cache::over)
+    }
+
     /// The page cache's slots and its ghost's, none without a cache.
     pub fn cache_pages(&self) -> (usize, usize) {
         self.cache

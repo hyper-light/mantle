@@ -242,6 +242,67 @@ fn a_record_read_then_rewritten_and_flushed_reads_its_new_version() {
 }
 
 #[test]
+fn memory_moving_between_regions_never_holds_more_than_the_budget() {
+    // A shard under a memory budget, filled, then read with a skew that makes the tuner move
+    // memory from the page cache to the record cache and back as the phases change. The page
+    // cache's and record cache's memory with their indexes' charge and write memory's share is
+    // within the budget whenever no region is still giving memory back; while one is, it never
+    // rises past where it stood when that began; giving back ends within the cycle it was
+    // scheduled for; and the regions really moved.
+    let align = Alignment::new(4096).unwrap();
+    let file = SimFile::new(align, Alignment::new(512).unwrap(), 41).unwrap();
+    let mut db = ShardDb::create(file, STORE, MEM, TRUNK).unwrap();
+    let budget = 96 * 4096;
+    db.set_memory(budget);
+    let value = [5u8; 100];
+    let mut out = Vec::new();
+    let mut x = 0x9e37_79b9_7f4a_7c15u64;
+    let (mut records_most, mut records_least) = (0, usize::MAX);
+    // While giving back: the total when it began, the ops it has taken, and the cycle then.
+    let mut giving: Option<(usize, u64, u64)> = None;
+    for step in 0..60_000u64 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        if step < 8_000 || (30_000..34_000).contains(&step) {
+            db.put(&key(x % 4_000), &value).unwrap();
+        } else {
+            // Read hot: most reads on a few hundred keys.
+            let k = if x.is_multiple_of(8) {
+                x % 4_000
+            } else {
+                x % 300
+            };
+            db.get(&key(k), &mut out).unwrap();
+        }
+        let (cache, write, records) = db.memory_held();
+        let total = cache + write + records;
+        giving = match (db.trimming(), giving) {
+            (false, _) => None,
+            (true, None) => Some((total.max(budget), 0, db.cycle_ops())),
+            (true, Some((most, ops, cycle))) => {
+                assert!(total <= most, "step {step}: {total} rose past {most}");
+                assert!(ops < 2 * cycle, "step {step}: giving back for {ops} ops");
+                Some((most, ops + 1, cycle))
+            }
+        };
+        assert!(
+            db.trimming() || total <= budget,
+            "step {step}: cache {cache} write {write} records {records}; split {:?} indexes {:?}",
+            db.memory_split(),
+            db.index_bytes()
+        );
+        let (_, _, records) = db.memory_split();
+        records_most = records_most.max(records);
+        records_least = records_least.min(records);
+    }
+    assert!(
+        records_most > records_least,
+        "the record cache never moved: {records_least}..{records_most}"
+    );
+}
+
+#[test]
 fn idle_slices_between_operations_keep_every_read_exact_and_pay_every_debt() {
     let align = Alignment::new(4096).unwrap();
     let file = SimFile::new(align, Alignment::new(512).unwrap(), 17).unwrap();

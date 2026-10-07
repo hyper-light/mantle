@@ -82,6 +82,8 @@ pub struct IoStats {
     pub cache_misses: u64,
     /// Scan pages the cache served, each a page a span did not read from the device.
     pub span_cache_hits: u64,
+    /// The most queue steps one cache eviction took.
+    pub cache_evict_steps_most: u64,
 }
 
 fn elapsed_ns(since: std::time::Instant) -> u64 {
@@ -365,6 +367,10 @@ impl<F: BlockFile> Store<F> {
         IoStats {
             cache_hits,
             cache_misses,
+            cache_evict_steps_most: self
+                .cache
+                .as_ref()
+                .map_or(0, cache::Cache::evict_steps_most),
             ..self.io
         }
     }

@@ -145,6 +145,12 @@ impl Bits {
         Self::from_grow(g, block_bits, Select::Sampled)
     }
 
+    /// A copy of the vector a builder fills, its words copied whole: the builder keeps its
+    /// buffers for its next trie.
+    pub fn copy_of(bits: &Grow, block_bits: usize, select: Select) -> Result<Self, Error> {
+        Self::from_grow(bits.clone(), block_bits, select)
+    }
+
     /// The vector a builder filled, its words taken as they are.
     pub fn from_grow(bits: Grow, block_bits: usize, select: Select) -> Result<Self, Error> {
         let block_words =

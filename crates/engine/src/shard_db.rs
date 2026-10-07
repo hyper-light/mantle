@@ -54,6 +54,11 @@ pub struct FlushStats {
     pub stalls: u64,
     pub stall_ns: u64,
     pub stall_max_ns: u64,
+    /// Nanoseconds in memtable inserts, in rotations (a full memtable handed to packing, its
+    /// stall included), and in forgetting freed pages: in all, timed only as the rest are.
+    pub insert_ns: u64,
+    pub rotate_ns: u64,
+    pub forget_ns: u64,
 }
 
 /// A memtable read in key order from a seek, its next entry held in buffers it reuses: one
@@ -370,14 +375,20 @@ impl<F: BlockFile> ShardDb<F> {
 
     fn apply(&mut self, key: &[u8], op: Op, value: &[u8]) -> Result<(), Error> {
         let mut before = self.mem.bytes();
+        let t = self.timed.then(std::time::Instant::now);
         match self.mem.insert(key, op, value) {
             Err(Error::LimitExceeded { .. }) if !self.mem.is_empty() => {
+                let r = self.timed.then(std::time::Instant::now);
                 self.rotate()?;
+                let ns = ns_since(r);
+                self.flush_stats.rotate_ns = self.flush_stats.rotate_ns.saturating_add(ns);
                 before = self.mem.bytes();
                 self.mem.insert(key, op, value)?;
             }
             other => other?,
         }
+        let ns = ns_since(t);
+        self.flush_stats.insert_ns = self.flush_stats.insert_ns.saturating_add(ns);
         self.pace(self.mem.bytes().saturating_sub(before))
     }
 
@@ -554,7 +565,10 @@ impl<F: BlockFile> ShardDb<F> {
         if forget > 0 {
             let w = share(forget, bytes, trunk_room, &mut self.forget_carry);
             if w > 0 {
+                let t = self.timed.then(std::time::Instant::now);
                 self.store.forget_some(w);
+                let ns = ns_since(t);
+                self.flush_stats.forget_ns = self.flush_stats.forget_ns.saturating_add(ns);
             }
         }
         let debt = self.trunk.debt();

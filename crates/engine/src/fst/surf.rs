@@ -15,7 +15,7 @@ use std::cmp::Ordering;
 use std::ops::ControlFlow;
 
 use super::packed::MAX_WIDTH;
-use super::trie::{Trie, TrieBuilder};
+use super::trie::{Trie, TrieBuilder, Width};
 use crate::error::{Error, Malformed};
 
 /// Bytes a suffix of at most 32 bits spans.
@@ -170,7 +170,7 @@ impl SurfBuilder {
 
     /// Empties the builder for another run, keeping `suffix` bits a key, its buffers kept.
     pub fn reset(&mut self, suffix: u32) -> Result<(), Error> {
-        self.trie.reset(suffix)?;
+        self.trie.reset(Width::Bits(suffix))?;
         self.suffix = suffix;
         self.last.clear();
         self.shared_before = 0;

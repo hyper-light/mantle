@@ -9,9 +9,15 @@
 //! a third bitmap (dense), a bit a node marks it here at every level: a bit where the label took
 //! eight, and no rule needed to tell it from a real 0xFF byte.
 //!
-//! Nodes are numbered breadth first, the root 0, across both parts; the branch that goes on at a
-//! label leads to node `1 + (branches going on before it)`. Values are held in node order, the
-//! dense levels' first: a node's own key's value, then its labels' that end a key.
+//! The dense part's nodes are numbered breadth first, the root 0; the branch that goes on at a
+//! label leads to node `1 + (branches going on before it)`, or, past the dense nodes, to a node of
+//! the first sparse level. The sparse part is kept a level at a time, as the builder lays it out:
+//! the nodes of a level are the branches going on in the level above, in order, so the branch at
+//! label `p` leads to the next level's node `rank1(has_child, p) − 1`, and rank and select run
+//! within a level. The trie is finished without the paper's assembly of the levels into one
+//! sequence (one pass over every label, milliseconds at half a million keys, in one slice): each
+//! level's words are copied whole and indexed. Values are held a level at a time in node order: a
+//! node's own key's value, then its labels' that end a key.
 
 use std::ops::ControlFlow;
 
@@ -48,10 +54,10 @@ fn before(bits: &Bits, p: usize) -> usize {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Trie {
     dense: Dense,
-    sparse: Sparse,
-    /// The dense levels' values in node order, then the sparse levels', at the bits the
-    /// largest needs.
-    values: Packed,
+    /// The levels below the dense part, the first one's nodes the dense part's last branches.
+    sparse: Vec<SparseLevel>,
+    /// Keys held.
+    len: usize,
 }
 
 /// The upper levels: a node is 256 bits of each bitmap.
@@ -62,26 +68,28 @@ struct Dense {
     /// A bit a node: whether the node's path is itself a key.
     prefix: Bits,
     nodes: usize,
-    /// Branches going on, and values held, in the dense levels.
+    /// Branches going on in the dense levels.
     children: usize,
-    values: usize,
+    /// The dense levels' values in node order.
+    values: Packed,
 }
 
-/// The lower levels.
+/// One lower level.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct Sparse {
+struct SparseLevel {
     labels: Vec<u8>,
     has_child: Bits,
     louds: Bits,
-    /// A bit a node, numbered from the first sparse node.
+    /// A bit a node of the level.
     prefix: Bits,
+    values: Packed,
 }
 
-/// A node: dense, by its number; sparse, by its number less the dense nodes'.
+/// A node: dense, by its number; sparse, by its level in the sparse part and its index there.
 #[derive(Clone, Copy, Debug)]
 enum Node {
     Dense(usize),
-    Sparse(usize),
+    Sparse(usize, usize),
 }
 
 /// One level of the trie as the builder fills it.
@@ -131,26 +139,43 @@ pub struct TrieBuilder {
     width: u32,
     prev: Vec<u8>,
     keys: usize,
-    /// The largest value given: the trie's values take the bits it needs.
+    /// The largest value given, and whether the trie's values take only the bits it needs.
     max: u32,
+    fit: bool,
+}
+
+/// The bits a trie's values take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Width {
+    /// Exactly these: a range filter's suffix bits, which its queries read at that width.
+    Bits(u32),
+    /// The bits the largest value needs, up to 32: a leaf index's page numbers, whose largest
+    /// is known only at the end. The values are packed again to that width when the trie is
+    /// finished, which the index's few values make cheap.
+    Fit,
 }
 
 impl TrieBuilder {
-    /// A builder for values of at most `width` bits.
-    pub fn new(width: u32) -> Result<Self, Error> {
+    /// A builder for values of `width`.
+    pub fn new(width: Width) -> Result<Self, Error> {
         let mut b = Self::default();
         b.reset(width)?;
         Ok(b)
     }
 
-    /// Empties the builder for another trie, its values to be `width` bits, its buffers kept.
-    pub fn reset(&mut self, width: u32) -> Result<(), Error> {
+    /// Empties the builder for another trie, its values of `width`, its buffers kept.
+    pub fn reset(&mut self, width: Width) -> Result<(), Error> {
+        let (width, fit) = match width {
+            Width::Bits(w) => (w, false),
+            Width::Fit => (MAX_WIDTH, true),
+        };
         if width > MAX_WIDTH {
             return Err(Error::InvalidArgument {
                 what: "trie values wider than 32 bits",
             });
         }
         // Each level is emptied as it comes back into use.
+        self.fit = fit;
         self.width = width;
         self.depth = 0;
         self.prev.clear();
@@ -275,59 +300,69 @@ impl TrieBuilder {
         cut
     }
 
-    /// Levels above `cutoff` dense, the rest sparse, each breadth first; the values, in node
-    /// order level by level, at the bits the largest needs.
+    /// Levels above `cutoff` dense, the rest kept a level each as built: their words copied
+    /// whole and indexed, their values as they are when they take the bits the largest needs.
     fn finish_at(&self, cutoff: usize) -> Result<Trie, Error> {
+        let width = if self.fit {
+            width_of(self.max)
+        } else {
+            self.width
+        };
         let mut d_labels = Grow::default();
         let mut d_child = Grow::default();
         let mut d_prefix = Grow::default();
-        let mut labels = Vec::new();
-        let mut has_child = Grow::default();
-        let mut louds = Grow::default();
-        let mut prefix = Grow::default();
-        let mut values = Packed::new(width_of(self.max))?;
+        let mut d_values = Packed::new(width)?;
         let mut dense_children = 0usize;
-        let mut dense_values = 0usize;
+        let mut sparse = Vec::with_capacity(self.used().len().saturating_sub(cutoff));
         for (depth, l) in self.used().iter().enumerate() {
-            if depth < cutoff {
-                let mut at = 0usize;
-                for node in 0..l.prefix.len() {
-                    let base = d_labels.len();
-                    let next = base.checked_add(256).ok_or(corrupt())?;
-                    d_labels.grow_to(next);
-                    d_child.grow_to(next);
-                    d_prefix.push(l.prefix.get(node));
-                    // The node's labels: the first, then each not starting another node.
-                    let mut first = true;
-                    while at < l.labels.len() && (first || !l.louds.get(at)) {
-                        let label = l.labels.get(at).copied().ok_or(corrupt())?;
-                        let goes_on = l.has_child.get(at);
-                        let pos = base.saturating_add(usize::from(label));
-                        d_labels.set(pos, true);
-                        d_child.set(pos, goes_on);
-                        dense_children = dense_children.saturating_add(usize::from(goes_on));
-                        first = false;
-                        at = at.saturating_add(1);
-                    }
-                }
+            let values = if l.values.width() == width {
+                l.values.clone()
             } else {
-                labels.extend_from_slice(&l.labels);
-                for i in 0..l.labels.len() {
-                    has_child.push(l.has_child.get(i));
-                    louds.push(l.louds.get(i));
+                let mut v = Packed::new(width)?;
+                for i in 0..l.values.len() {
+                    v.push(l.values.get(i).ok_or(corrupt())?)?;
                 }
-                for node in 0..l.prefix.len() {
-                    prefix.push(l.prefix.get(node));
+                v
+            };
+            if depth >= cutoff {
+                sparse.push(SparseLevel {
+                    labels: l.labels.clone(),
+                    has_child: Bits::copy_of(&l.has_child, SPARSE_BLOCK, Select::None)?,
+                    louds: Bits::copy_of(&l.louds, SPARSE_BLOCK, Select::Sampled)?,
+                    prefix: Bits::copy_of(&l.prefix, SPARSE_BLOCK, Select::None)?,
+                    values,
+                });
+                continue;
+            }
+            let mut at = 0usize;
+            for node in 0..l.prefix.len() {
+                let base = d_labels.len();
+                let next = base.checked_add(256).ok_or(corrupt())?;
+                d_labels.grow_to(next);
+                d_child.grow_to(next);
+                d_prefix.push(l.prefix.get(node));
+                // The node's labels: the first, then each not starting another node.
+                let mut first = true;
+                while at < l.labels.len() && (first || !l.louds.get(at)) {
+                    let label = l.labels.get(at).copied().ok_or(corrupt())?;
+                    let goes_on = l.has_child.get(at);
+                    let pos = base.saturating_add(usize::from(label));
+                    d_labels.set(pos, true);
+                    d_child.set(pos, goes_on);
+                    dense_children = dense_children.saturating_add(usize::from(goes_on));
+                    first = false;
+                    at = at.saturating_add(1);
                 }
             }
-            for i in 0..l.values.len() {
-                values.push(l.values.get(i).ok_or(corrupt())?)?;
-            }
-            if depth < cutoff {
-                dense_values = values.len();
+            for i in 0..values.len() {
+                d_values.push(values.get(i).ok_or(corrupt())?)?;
             }
         }
-        if values.len() != self.keys {
+        let held = sparse
+            .iter()
+            .map(|l| l.values.len())
+            .fold(d_values.len(), usize::saturating_add);
+        if held != self.keys {
             return Err(corrupt());
         }
         Ok(Trie {
@@ -337,15 +372,10 @@ impl TrieBuilder {
                 has_child: Bits::from_grow(d_child, DENSE_BLOCK, Select::None)?,
                 prefix: Bits::from_grow(d_prefix, DENSE_BLOCK, Select::None)?,
                 children: dense_children,
-                values: dense_values,
+                values: d_values,
             },
-            sparse: Sparse {
-                labels,
-                has_child: Bits::from_grow(has_child, SPARSE_BLOCK, Select::None)?,
-                louds: Bits::from_grow(louds, SPARSE_BLOCK, Select::Sampled)?,
-                prefix: Bits::from_grow(prefix, SPARSE_BLOCK, Select::None)?,
-            },
-            values,
+            sparse,
+            len: self.keys,
         })
     }
 }
@@ -362,19 +392,26 @@ impl Trie {
                 what: "a trie's keys not one value a key",
             });
         }
-        let mut b = TrieBuilder::new(width_of(values.iter().copied().max().unwrap_or(0)))?;
+        let mut b = TrieBuilder::new(Width::Bits(width_of(
+            values.iter().copied().max().unwrap_or(0),
+        )))?;
         for (k, v) in keys.iter().zip(values) {
             b.add(k, *v)?;
         }
         Ok(b)
     }
 
-    /// Node number `n` in its part.
-    fn node(&self, n: usize) -> Node {
-        match n.checked_sub(self.dense.nodes) {
-            Some(local) => Node::Sparse(local),
-            None => Node::Dense(n),
+    /// The root.
+    fn root(&self) -> Node {
+        if self.dense.nodes > 0 {
+            Node::Dense(0)
+        } else {
+            Node::Sparse(0, 0)
         }
+    }
+
+    fn level(&self, l: usize) -> Option<&SparseLevel> {
+        self.sparse.get(l)
     }
 
     // ------------------------------------------------------------------ dense
@@ -384,7 +421,7 @@ impl Trie {
         let d = &self.dense;
         let ends_before = before(&d.labels, pos).saturating_sub(before(&d.has_child, pos));
         let prefixes = d.prefix.rank1(pos / 256);
-        self.values.get(ends_before.saturating_add(prefixes))
+        d.values.get(ends_before.saturating_add(prefixes))
     }
 
     /// The value of dense node `n`'s own key.
@@ -392,13 +429,17 @@ impl Trie {
         let d = &self.dense;
         let start = n.checked_mul(256)?;
         let ends_before = before(&d.labels, start).saturating_sub(before(&d.has_child, start));
-        self.values
+        d.values
             .get(ends_before.saturating_add(before(&d.prefix, n)))
     }
 
-    /// The dense node the branch at `pos` goes on to.
-    fn dense_child(&self, pos: usize) -> usize {
-        before(&self.dense.has_child, pos).saturating_add(1)
+    /// The node the dense branch at `pos` goes on to: dense, or the first sparse level's.
+    fn dense_child(&self, pos: usize) -> Node {
+        let g = before(&self.dense.has_child, pos).saturating_add(1);
+        match g.checked_sub(self.dense.nodes) {
+            Some(i) => Node::Sparse(0, i),
+            None => Node::Dense(g),
+        }
     }
 
     /// The greatest label of dense node `n` below `pos` (exclusive), as a position.
@@ -411,16 +452,23 @@ impl Trie {
         }
     }
 
-    // ------------------------------------------------------------------ sparse
-
-    /// Sparse branches going on before label position `p`.
-    fn children_before(&self, p: usize) -> usize {
-        before(&self.sparse.has_child, p)
+    /// The least label of dense node `n` above `pos` (exclusive), as a position.
+    fn dense_above(&self, n: usize, pos: usize) -> Option<usize> {
+        let q = self.dense.labels.next_one(pos.checked_add(1)?)?;
+        if q < n.checked_add(1)?.checked_mul(256)? {
+            Some(q)
+        } else {
+            None
+        }
     }
 
-    /// Sparse node `n`'s labels: its first position and the next node's.
-    fn node_range(&self, n: usize) -> (usize, usize) {
-        let s = &self.sparse;
+    // ------------------------------------------------------------------ sparse
+
+    /// Node `n` of level `l`: its first label's position and the next node's.
+    fn node_range(&self, l: usize, n: usize) -> (usize, usize) {
+        let Some(s) = self.level(l) else {
+            return (0, 0);
+        };
         let start = n
             .checked_add(1)
             .and_then(|k| s.louds.select1(k))
@@ -432,38 +480,38 @@ impl Trie {
         (start, end)
     }
 
-    /// The node (numbered across both parts) the sparse branch at `p` goes on to.
-    fn child(&self, p: usize) -> usize {
-        self.dense
-            .children
-            .saturating_add(self.children_before(p))
-            .saturating_add(1)
+    /// The node the branch at label `p` of level `l` goes on to.
+    fn child(&self, l: usize, p: usize) -> Node {
+        let i = self.level(l).map_or(0, |s| before(&s.has_child, p));
+        Node::Sparse(l.saturating_add(1), i)
     }
 
-    /// The value of the key the sparse branch at `p` ends.
-    fn value_at_label(&self, p: usize) -> Option<u32> {
-        let s = &self.sparse;
-        let ends_before = p.saturating_sub(self.children_before(p));
+    /// The value of the key the branch at label `p` of level `l` ends.
+    fn value_at_label(&self, l: usize, p: usize) -> Option<u32> {
+        let s = self.level(l)?;
+        let ends_before = p.saturating_sub(before(&s.has_child, p));
         let n = s.louds.rank1(p).saturating_sub(1);
         let prefixes = s.prefix.rank1(n);
-        self.values.get(
-            self.dense
-                .values
-                .saturating_add(ends_before)
-                .saturating_add(prefixes),
-        )
+        s.values.get(ends_before.saturating_add(prefixes))
     }
 
-    /// The value of sparse node `n`'s own key.
-    fn value_of_node(&self, n: usize) -> Option<u32> {
-        let (start, _) = self.node_range(n);
-        let ends_before = start.saturating_sub(self.children_before(start));
-        self.values.get(
-            self.dense
-                .values
-                .saturating_add(ends_before)
-                .saturating_add(before(&self.sparse.prefix, n)),
-        )
+    /// The value of node `n`'s own key, of level `l`.
+    fn value_of_node(&self, l: usize, n: usize) -> Option<u32> {
+        let (start, _) = self.node_range(l, n);
+        let s = self.level(l)?;
+        let ends_before = start.saturating_sub(before(&s.has_child, start));
+        s.values
+            .get(ends_before.saturating_add(before(&s.prefix, n)))
+    }
+
+    /// The label at `p` of level `l`.
+    fn label(&self, l: usize, p: usize) -> Option<u8> {
+        self.level(l)?.labels.get(p).copied()
+    }
+
+    /// Whether the branch at label `p` of level `l` goes on.
+    fn goes_on(&self, l: usize, p: usize) -> bool {
+        self.level(l).is_some_and(|s| s.has_child.get(p))
     }
 
     // ------------------------------------------------------------------ both
@@ -472,7 +520,7 @@ impl Trie {
     fn is_key(&self, n: Node) -> bool {
         match n {
             Node::Dense(n) => self.dense.prefix.get(n),
-            Node::Sparse(n) => self.sparse.prefix.get(n),
+            Node::Sparse(l, n) => self.level(l).is_some_and(|s| s.prefix.get(n)),
         }
     }
 
@@ -480,40 +528,58 @@ impl Trie {
     fn value_of(&self, n: Node) -> Option<u32> {
         match n {
             Node::Dense(n) => self.dense_value_of(n),
-            Node::Sparse(n) => self.value_of_node(n),
+            Node::Sparse(l, n) => self.value_of_node(l, n),
+        }
+    }
+
+    /// The node a fallback's branch goes on to, or the value of the key it ends.
+    fn step(&self, at: Fallback) -> Result<Node, Option<u32>> {
+        match at {
+            Fallback::Node(n) => Err(self.value_of(n)),
+            Fallback::Dense(pos) => {
+                if self.dense.has_child.get(pos) {
+                    Ok(self.dense_child(pos))
+                } else {
+                    Err(self.dense_value_at(pos))
+                }
+            }
+            Fallback::Sparse(l, p) => {
+                if self.goes_on(l, p) {
+                    Ok(self.child(l, p))
+                } else {
+                    Err(self.value_at_label(l, p))
+                }
+            }
         }
     }
 
     /// The value `key` holds.
     pub fn get(&self, key: &[u8]) -> Option<u32> {
-        let mut node = 0usize;
+        let mut node = self.root();
         for (d, &b) in key.iter().enumerate() {
             let last = d.saturating_add(1) == key.len();
-            match self.node(node) {
+            let at = match node {
                 Node::Dense(n) => {
                     let pos = n.checked_mul(256)?.checked_add(usize::from(b))?;
                     if !self.dense.labels.get(pos) {
                         return None;
                     }
-                    if !self.dense.has_child.get(pos) {
-                        return if last { self.dense_value_at(pos) } else { None };
-                    }
-                    node = self.dense_child(pos);
+                    Fallback::Dense(pos)
                 }
-                Node::Sparse(n) => {
-                    let (start, end) = self.node_range(n);
-                    let i = self.sparse.labels.get(start..end)?.binary_search(&b).ok()?;
-                    let p = start.checked_add(i)?;
-                    if !self.sparse.has_child.get(p) {
-                        return if last { self.value_at_label(p) } else { None };
-                    }
-                    node = self.child(p);
+                Node::Sparse(l, n) => {
+                    let (start, end) = self.node_range(l, n);
+                    let labels = self.level(l)?.labels.get(start..end)?;
+                    let i = labels.binary_search(&b).ok()?;
+                    Fallback::Sparse(l, start.checked_add(i)?)
                 }
+            };
+            match self.step(at) {
+                Ok(child) => node = child,
+                Err(v) => return if last { v } else { None },
             }
         }
-        let n = self.node(node);
-        if self.is_key(n) {
-            self.value_of(n)
+        if self.is_key(node) {
+            self.value_of(node)
         } else {
             None
         }
@@ -523,15 +589,14 @@ impl Trie {
     /// the leaves' separators. One descent, remembering the nearest smaller branch passed; if
     /// the key's path ends above every key beneath it, the rightmost key under that branch.
     pub fn floor(&self, key: &[u8]) -> Option<u32> {
-        let mut node = 0usize;
+        let mut node = self.root();
         // The nearest point below which every key is less than `key`.
         let mut fallback: Option<Fallback> = None;
         for &b in key {
-            let n = self.node(node);
-            if self.is_key(n) {
-                fallback = Some(Fallback::Node(n));
+            if self.is_key(node) {
+                fallback = Some(Fallback::Node(node));
             }
-            match n {
+            let at = match node {
                 Node::Dense(n) => {
                     let pos = n.checked_mul(256)?.checked_add(usize::from(b))?;
                     if let Some(q) = self.dense_below(n, pos) {
@@ -540,74 +605,63 @@ impl Trie {
                     if !self.dense.labels.get(pos) {
                         return self.rightmost(fallback?);
                     }
-                    if !self.dense.has_child.get(pos) {
-                        // A key ending here: `key` itself, or a prefix of it.
-                        return self.dense_value_at(pos);
-                    }
-                    node = self.dense_child(pos);
+                    Fallback::Dense(pos)
                 }
-                Node::Sparse(n) => {
-                    let (start, end) = self.node_range(n);
-                    let labels = self.sparse.labels.get(start..end).unwrap_or(&[]);
+                Node::Sparse(l, n) => {
+                    let (start, end) = self.node_range(l, n);
+                    let labels = self.level(l)?.labels.get(start..end).unwrap_or(&[]);
                     let (found, i) = match labels.binary_search(&b) {
                         Ok(i) => (true, i),
                         Err(i) => (false, i),
                     };
                     if let Some(smaller) = i.checked_sub(1) {
-                        fallback = Some(Fallback::Sparse(start.saturating_add(smaller)));
+                        fallback = Some(Fallback::Sparse(l, start.saturating_add(smaller)));
                     }
                     if !found {
                         return self.rightmost(fallback?);
                     }
-                    let p = start.saturating_add(i);
-                    if !self.sparse.has_child.get(p) {
-                        return self.value_at_label(p);
-                    }
-                    node = self.child(p);
+                    Fallback::Sparse(l, start.saturating_add(i))
                 }
+            };
+            match self.step(at) {
+                Ok(child) => node = child,
+                // A key ending here: `key` itself, or a prefix of it.
+                Err(v) => return v,
             }
         }
         // `key` ends at `node`: its own key, if any, is `key`; every other beneath is greater.
-        let n = self.node(node);
-        if self.is_key(n) {
-            return self.value_of(n);
+        if self.is_key(node) {
+            return self.value_of(node);
         }
         self.rightmost(fallback?)
+    }
+
+    /// Node `n`'s greatest label.
+    fn last_label(&self, n: Node) -> Option<Fallback> {
+        match n {
+            Node::Dense(n) => Some(Fallback::Dense(
+                self.dense_below(n, n.checked_add(1)?.checked_mul(256)?)?,
+            )),
+            Node::Sparse(l, n) => {
+                let (start, end) = self.node_range(l, n);
+                if end > start {
+                    Some(Fallback::Sparse(l, end.saturating_sub(1)))
+                } else {
+                    None
+                }
+            }
+        }
     }
 
     /// The value of the greatest key at or under `from`.
     fn rightmost(&self, from: Fallback) -> Option<u32> {
         let mut at = from;
-        // Down the last branch of each node: at most a node a step.
-        for _ in 0..=self.dense.nodes.saturating_add(self.sparse.labels.len()) {
-            let next = match at {
-                Fallback::Node(n) => return self.value_of(n),
-                Fallback::Dense(pos) => {
-                    if !self.dense.has_child.get(pos) {
-                        return self.dense_value_at(pos);
-                    }
-                    self.dense_child(pos)
-                }
-                Fallback::Sparse(p) => {
-                    if !self.sparse.has_child.get(p) {
-                        return self.value_at_label(p);
-                    }
-                    self.child(p)
-                }
-            };
-            // The child's last label.
-            at = match self.node(next) {
-                Node::Dense(n) => {
-                    Fallback::Dense(self.dense_below(n, n.checked_add(1)?.checked_mul(256)?)?)
-                }
-                Node::Sparse(n) => {
-                    let (start, end) = self.node_range(n);
-                    if end <= start {
-                        return None;
-                    }
-                    Fallback::Sparse(end.saturating_sub(1))
-                }
-            };
+        // Down the last branch of each node: at most a level a step.
+        for _ in 0..=self.sparse.len().saturating_add(self.dense.nodes) {
+            match self.step(at) {
+                Ok(child) => at = self.last_label(child)?,
+                Err(v) => return v,
+            }
         }
         None
     }
@@ -634,19 +688,18 @@ impl Trie {
         F: FnMut(usize, u32) -> ControlFlow<()>,
     {
         out.clear();
-        let mut node = 0usize;
+        let mut node = self.root();
         // The nearest branch passed whose label is greater than the key's byte: the least key
         // beneath it is the least greater than `key` that the descent leaves behind.
         let mut greater: Option<(Fallback, usize)> = None;
         for (d, &b) in key.iter().enumerate() {
-            let n = self.node(node);
-            if self.is_key(n)
-                && let Some(v) = self.value_of(n)
+            if self.is_key(node)
+                && let Some(v) = self.value_of(node)
             {
                 prefix(d, v)?;
             }
             let last = d.saturating_add(1) == key.len();
-            match n {
+            let found = match node {
                 Node::Dense(n) => {
                     let Some(pos) = n
                         .checked_mul(256)
@@ -660,62 +713,54 @@ impl Trie {
                     if !self.dense.labels.get(pos) {
                         break;
                     }
-                    if !self.dense.has_child.get(pos) {
-                        let v = self.dense_value_at(pos);
-                        if last {
-                            out.extend_from_slice(key);
-                            return ControlFlow::Continue(v);
-                        }
-                        if let Some(v) = v {
-                            prefix(d.saturating_add(1), v)?;
-                        }
-                        break;
-                    }
-                    node = self.dense_child(pos);
+                    Fallback::Dense(pos)
                 }
-                Node::Sparse(n) => {
-                    let (start, end) = self.node_range(n);
-                    let labels = self.sparse.labels.get(start..end).unwrap_or(&[]);
+                Node::Sparse(l, n) => {
+                    let (start, end) = self.node_range(l, n);
+                    let labels = self
+                        .level(l)
+                        .and_then(|s| s.labels.get(start..end))
+                        .unwrap_or(&[]);
                     let (found, i) = match labels.binary_search(&b) {
                         Ok(i) => (true, i),
                         Err(i) => (false, i),
                     };
                     let above = if found { i.saturating_add(1) } else { i };
                     if above < labels.len() {
-                        greater = Some((Fallback::Sparse(start.saturating_add(above)), d));
+                        greater = Some((Fallback::Sparse(l, start.saturating_add(above)), d));
                     }
                     if !found {
                         break;
                     }
-                    let p = start.saturating_add(i);
-                    if !self.sparse.has_child.get(p) {
-                        let v = self.value_at_label(p);
-                        if last {
-                            out.extend_from_slice(key);
-                            return ControlFlow::Continue(v);
-                        }
-                        if let Some(v) = v {
-                            prefix(d.saturating_add(1), v)?;
-                        }
-                        break;
-                    }
-                    node = self.child(p);
+                    Fallback::Sparse(l, start.saturating_add(i))
                 }
+            };
+            match self.step(found) {
+                Err(v) => {
+                    if last {
+                        out.extend_from_slice(key);
+                        return ControlFlow::Continue(v);
+                    }
+                    if let Some(v) = v {
+                        prefix(d.saturating_add(1), v)?;
+                    }
+                    break;
+                }
+                Ok(child) => node = child,
             }
             if last {
                 // `key` ends at the node the branch leads to: its own key is `key`, and every
                 // other key beneath it is greater, the least its first label's.
                 out.extend_from_slice(key);
-                let n = self.node(node);
-                if self.is_key(n) {
-                    return ControlFlow::Continue(self.value_of(n));
+                if self.is_key(node) {
+                    return ControlFlow::Continue(self.value_of(node));
                 }
-                let first = self.first_label(n);
+                let first = self.first_label(node);
                 return ControlFlow::Continue(first.and_then(|f| self.leftmost(f, out)));
             }
         }
         if key.is_empty() {
-            let n = self.node(0);
+            let n = self.root();
             if self.is_key(n) {
                 return ControlFlow::Continue(self.value_of(n));
             }
@@ -725,16 +770,6 @@ impl Trie {
             out.extend_from_slice(key.get(..d)?);
             self.leftmost(at, out)
         }))
-    }
-
-    /// The least label of dense node `n` above `pos` (exclusive), as a position.
-    fn dense_above(&self, n: usize, pos: usize) -> Option<usize> {
-        let q = self.dense.labels.next_one(pos.checked_add(1)?)?;
-        if q < n.checked_add(1)?.checked_mul(256)? {
-            Some(q)
-        } else {
-            None
-        }
     }
 
     /// Node `n`'s least label.
@@ -749,10 +784,10 @@ impl Trie {
                     None
                 }
             }
-            Node::Sparse(n) => {
-                let (start, end) = self.node_range(n);
+            Node::Sparse(l, n) => {
+                let (start, end) = self.node_range(l, n);
                 if start < end {
-                    Some(Fallback::Sparse(start))
+                    Some(Fallback::Sparse(l, start))
                 } else {
                     None
                 }
@@ -763,38 +798,29 @@ impl Trie {
     /// The value of the least key at or under the label at `from`, its labels appended to `out`.
     fn leftmost(&self, from: Fallback, out: &mut Vec<u8>) -> Option<u32> {
         let mut at = from;
-        // Down the first branch of each node: at most a node a step.
-        for _ in 0..=self.dense.nodes.saturating_add(self.sparse.labels.len()) {
-            let next = match at {
-                Fallback::Node(n) => return self.value_of(n),
-                Fallback::Dense(pos) => {
-                    out.push(u8::try_from(pos % 256).ok()?);
-                    if !self.dense.has_child.get(pos) {
-                        return self.dense_value_at(pos);
-                    }
-                    self.dense_child(pos)
-                }
-                Fallback::Sparse(p) => {
-                    out.push(*self.sparse.labels.get(p)?);
-                    if !self.sparse.has_child.get(p) {
-                        return self.value_at_label(p);
-                    }
-                    self.child(p)
-                }
+        // Down the first branch of each node: at most a level a step.
+        for _ in 0..=self.sparse.len().saturating_add(self.dense.nodes) {
+            match at {
+                Fallback::Dense(pos) => out.push(u8::try_from(pos % 256).ok()?),
+                Fallback::Sparse(l, p) => out.push(self.label(l, p)?),
+                Fallback::Node(_) => {}
+            }
+            let child = match self.step(at) {
+                Ok(child) => child,
+                Err(v) => return v,
             };
             // A node's own key is the least beneath it.
-            let n = self.node(next);
-            at = if self.is_key(n) {
-                Fallback::Node(n)
+            at = if self.is_key(child) {
+                Fallback::Node(child)
             } else {
-                self.first_label(n)?
+                self.first_label(child)?
             };
         }
         None
     }
 
-    /// Appends the trie to `out`: the dense part's three bit vectors and counts, the sparse
-    /// part's labels and three bit vectors, and the values packed.
+    /// Appends the trie to `out`: the dense part's three bit vectors, counts and values, then
+    /// the sparse levels', each its labels, three bit vectors and values.
     pub fn encode(&self, out: &mut Vec<u8>) {
         let put = |out: &mut Vec<u8>, n: usize| {
             out.extend_from_slice(&u64::try_from(n).unwrap_or(u64::MAX).to_le_bytes());
@@ -805,62 +831,99 @@ impl Trie {
         d.prefix.encode(out);
         put(out, d.nodes);
         put(out, d.children);
-        put(out, d.values);
-        let s = &self.sparse;
-        put(out, s.labels.len());
-        out.extend_from_slice(&s.labels);
-        s.has_child.encode(out);
-        s.louds.encode(out);
-        s.prefix.encode(out);
-        self.values.encode(out);
+        d.values.encode(out);
+        put(out, self.sparse.len());
+        for s in &self.sparse {
+            put(out, s.labels.len());
+            out.extend_from_slice(&s.labels);
+            s.has_child.encode(out);
+            s.louds.encode(out);
+            s.prefix.encode(out);
+            s.values.encode(out);
+        }
     }
 
-    /// A trie [`Self::encode`] wrote at the start of `bytes`, and the bytes it took.
+    /// A trie [`Self::encode`] wrote at the start of `bytes`, and the bytes it took. The parts
+    /// are checked to agree: a dense node is 256 bits; each level has a has-child and a
+    /// node-start bit a label and a prefix bit a node, its nodes the branches going on above it;
+    /// and its values are its keys, each a node's own or a label's that ends.
     pub fn decode(bytes: &[u8]) -> Result<(Self, usize), Error> {
         let mut at = 0usize;
-        let rest = |at: usize| bytes.get(at..).ok_or(corrupt());
-        let bits = |at: &mut usize| -> Result<Bits, Error> {
-            let (b, used) = Bits::decode(rest(*at)?, Select::None)?;
-            *at = at.checked_add(used).ok_or(corrupt())?;
-            Ok(b)
-        };
-        let labels_d = bits(&mut at)?;
-        let child_d = bits(&mut at)?;
-        let prefix_d = bits(&mut at)?;
-        let num = |at: &mut usize| -> Result<usize, Error> {
-            let v = rest(*at)?
-                .first_chunk::<8>()
-                .map(|b| u64::from_le_bytes(*b))
-                .ok_or(corrupt())?;
-            *at = at.checked_add(8).ok_or(corrupt())?;
-            usize::try_from(v).map_err(|_| corrupt())
-        };
-        let nodes = num(&mut at)?;
-        let children = num(&mut at)?;
-        let dense_values = num(&mut at)?;
-        let n = num(&mut at)?;
-        let end = at.checked_add(n).ok_or(corrupt())?;
-        let labels = bytes.get(at..end).ok_or(corrupt())?.to_vec();
-        at = end;
         let bits = |at: &mut usize, select: Select| -> Result<Bits, Error> {
             let (b, used) = Bits::decode(bytes.get(*at..).ok_or(corrupt())?, select)?;
             *at = at.checked_add(used).ok_or(corrupt())?;
             Ok(b)
         };
-        let has_child = bits(&mut at, Select::None)?;
-        let louds = bits(&mut at, Select::Sampled)?;
-        let prefix = bits(&mut at, Select::None)?;
-        let (values, used) = Packed::decode(bytes.get(at..).ok_or(corrupt())?)?;
-        at = at.checked_add(used).ok_or(corrupt())?;
-        // The parts agree: a dense node is 256 bits, the dense values and nodes are within the
-        // whole, and the sparse part has a has-child and a node-start bit a label.
+        let num = |at: &mut usize| -> Result<usize, Error> {
+            let v = bytes
+                .get(*at..)
+                .and_then(<[u8]>::first_chunk::<8>)
+                .map(|b| u64::from_le_bytes(*b))
+                .ok_or(corrupt())?;
+            *at = at.checked_add(8).ok_or(corrupt())?;
+            usize::try_from(v).map_err(|_| corrupt())
+        };
+        let packed = |at: &mut usize| -> Result<Packed, Error> {
+            let (v, used) = Packed::decode(bytes.get(*at..).ok_or(corrupt())?)?;
+            *at = at.checked_add(used).ok_or(corrupt())?;
+            Ok(v)
+        };
+        let labels_d = bits(&mut at, Select::None)?;
+        let child_d = bits(&mut at, Select::None)?;
+        let prefix_d = bits(&mut at, Select::None)?;
+        let nodes = num(&mut at)?;
+        let children = num(&mut at)?;
+        let values_d = packed(&mut at)?;
         if labels_d.len() != nodes.saturating_mul(256)
             || child_d.len() != labels_d.len()
             || prefix_d.len() != nodes
-            || dense_values > values.len()
-            || has_child.len() != labels.len()
-            || louds.len() != labels.len()
+            || child_d.ones() != children
+            || values_d.len()
+                != labels_d
+                    .ones()
+                    .saturating_sub(children)
+                    .saturating_add(prefix_d.ones())
         {
+            return Err(corrupt());
+        }
+        let levels = num(&mut at)?;
+        let mut sparse = Vec::with_capacity(levels.min(bytes.len()));
+        let mut len = values_d.len();
+        // The first sparse level's nodes: the dense part's branches past its own nodes, or the
+        // root alone.
+        let mut expect = children.saturating_add(1).saturating_sub(nodes);
+        for _ in 0..levels {
+            let n = num(&mut at)?;
+            let end = at.checked_add(n).ok_or(corrupt())?;
+            let labels = bytes.get(at..end).ok_or(corrupt())?.to_vec();
+            at = end;
+            let has_child = bits(&mut at, Select::None)?;
+            let louds = bits(&mut at, Select::Sampled)?;
+            let prefix = bits(&mut at, Select::None)?;
+            let values = packed(&mut at)?;
+            if has_child.len() != labels.len()
+                || louds.len() != labels.len()
+                || prefix.len() != expect
+                || louds.ones() > expect
+                || values.len()
+                    != labels
+                        .len()
+                        .saturating_sub(has_child.ones())
+                        .saturating_add(prefix.ones())
+            {
+                return Err(corrupt());
+            }
+            expect = has_child.ones();
+            len = len.checked_add(values.len()).ok_or(corrupt())?;
+            sparse.push(SparseLevel {
+                labels,
+                has_child,
+                louds,
+                prefix,
+                values,
+            });
+        }
+        if expect != 0 && !(levels == 0 && nodes == 0) {
             return Err(corrupt());
         }
         Ok((
@@ -871,15 +934,10 @@ impl Trie {
                     prefix: prefix_d,
                     nodes,
                     children,
-                    values: dense_values,
+                    values: values_d,
                 },
-                sparse: Sparse {
-                    labels,
-                    has_child,
-                    louds,
-                    prefix,
-                },
-                values,
+                sparse,
+                len,
             },
             at,
         ))
@@ -887,36 +945,46 @@ impl Trie {
 
     /// The keys held.
     pub fn len(&self) -> usize {
-        self.values.len()
+        self.len
     }
 
     /// Whether the trie holds no key.
     pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
+        self.len == 0
     }
 
     /// Bytes held.
     pub fn bytes(&self) -> usize {
         let d = &self.dense;
-        let s = &self.sparse;
-        d.labels
-            .bytes()
-            .saturating_add(d.has_child.bytes())
-            .saturating_add(d.prefix.bytes())
-            .saturating_add(s.labels.len())
-            .saturating_add(s.has_child.bytes())
-            .saturating_add(s.louds.bytes())
-            .saturating_add(s.prefix.bytes())
-            .saturating_add(self.values.bytes())
+        self.sparse.iter().fold(
+            d.labels
+                .bytes()
+                .saturating_add(d.has_child.bytes())
+                .saturating_add(d.prefix.bytes())
+                .saturating_add(d.values.bytes()),
+            |b, s| {
+                b.saturating_add(s.labels.len())
+                    .saturating_add(s.has_child.bytes())
+                    .saturating_add(s.louds.bytes())
+                    .saturating_add(s.prefix.bytes())
+                    .saturating_add(s.values.bytes())
+            },
+        )
+    }
+
+    /// The bits a value takes.
+    #[cfg(test)]
+    fn value_width(&self) -> u32 {
+        self.dense.values.width()
     }
 }
 
-/// Where a floor search falls back to: a dense label position, a sparse one, or a node whose
-/// own key it is.
+/// Where a descent falls back to: a dense label position, a sparse level's label, or a node
+/// whose own key it is.
 #[derive(Clone, Copy, Debug)]
 enum Fallback {
     Dense(usize),
-    Sparse(usize),
+    Sparse(usize, usize),
     Node(Node),
 }
 
@@ -1030,7 +1098,7 @@ mod tests {
     #[test]
     fn a_builder_reset_builds_what_a_new_one_does() {
         let mut x = 0x1234_5678_9abc_def1u64;
-        let mut reused = TrieBuilder::new(32).unwrap();
+        let mut reused = TrieBuilder::new(Width::Fit).unwrap();
         for case in 0..200 {
             let n = (rng(&mut x) % 300) as usize;
             let map: BTreeMap<Vec<u8>, u32> = (0..n)
@@ -1039,14 +1107,14 @@ mod tests {
             let keys: Vec<&[u8]> = map.keys().map(Vec::as_slice).collect();
             let values: Vec<u32> = map.values().copied().collect();
             let fresh = Trie::build(&keys, &values).unwrap();
-            reused.reset(32).unwrap();
+            reused.reset(Width::Fit).unwrap();
             for (k, v) in &map {
                 reused.add(k, *v).unwrap();
             }
             assert_eq!(reused.finish().unwrap(), fresh, "case {case}");
             // Values packed at the bits the largest needs.
             let most = values.iter().copied().max().unwrap_or(0);
-            assert_eq!(fresh.values.width(), width_of(most), "case {case}");
+            assert_eq!(fresh.value_width(), width_of(most), "case {case}");
         }
     }
 

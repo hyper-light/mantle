@@ -24,9 +24,8 @@ pub mod filter;
 pub mod merge;
 
 use crate::error::{Error, Malformed};
-use crate::fst::packed::MAX_WIDTH;
 use crate::fst::surf::{Surf, SurfBuilder};
-use crate::fst::trie::{Trie, TrieBuilder};
+use crate::fst::trie::{Trie, TrieBuilder, Width};
 use crate::store::{Run, Span, Store};
 use hyper_block::block::BlockFile;
 use std::cmp::Ordering;
@@ -311,7 +310,7 @@ impl Builder {
     pub fn new<F: BlockFile>(store: &mut Store<F>, keys: filter::Keys) -> Result<Self, Error> {
         let lists = store.take_lists();
         let mut separators = lists.separators;
-        separators.reset(MAX_WIDTH)?;
+        separators.reset(Width::Fit)?;
         let mut keys_filter = lists.keys;
         keys_filter.reset(store.range_filter_bits())?;
         let capacity = store.page_capacity();

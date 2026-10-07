@@ -422,6 +422,9 @@ struct Slow {
     plan_ns: u64,
     finish_ns: u64,
     pack_finish_ns: u64,
+    insert_ns: u64,
+    rotate_ns: u64,
+    forget_ns: u64,
     rotated: bool,
 }
 
@@ -439,6 +442,9 @@ impl Slow {
             plan_ns: t1.plan_ns - t0.plan_ns,
             finish_ns: t1.finish_ns - t0.finish_ns,
             pack_finish_ns: f1.pack_finish_ns - f0.pack_finish_ns,
+            insert_ns: f1.insert_ns - f0.insert_ns,
+            rotate_ns: f1.rotate_ns - f0.rotate_ns,
+            forget_ns: f1.forget_ns - f0.forget_ns,
             rotated: f1.flushes != f0.flushes || f1.stalls != f0.stalls,
         }
     }
@@ -452,7 +458,7 @@ fn attribute_tail(lat: &[u64], slow: &mut [Slow]) {
     slow.sort_unstable_by_key(|s| std::cmp::Reverse(s.ns));
     for s in slow.iter().take(5) {
         println!(
-            "worst put {:.2} us: writes {} ({:.2} us) reads {} ({:.2} us) pack {:.2} trunk {:.2} (plan {:.2} finish {:.2} pack finish {:.2}) stall {:.2} rotated {}",
+            "worst put {:.2} us: writes {} ({:.2} us) reads {} ({:.2} us) pack {:.2} trunk {:.2} (plan {:.2} finish {:.2} pack finish {:.2}) stall {:.2} insert {:.2} (rotate {:.2}) forget {:.2} rotated {}",
             s.ns as f64 / 1000.0,
             s.writes,
             s.write_ns as f64 / 1000.0,
@@ -464,6 +470,9 @@ fn attribute_tail(lat: &[u64], slow: &mut [Slow]) {
             s.finish_ns as f64 / 1000.0,
             s.pack_finish_ns as f64 / 1000.0,
             s.stall_ns as f64 / 1000.0,
+            s.insert_ns as f64 / 1000.0,
+            s.rotate_ns as f64 / 1000.0,
+            s.forget_ns as f64 / 1000.0,
             s.rotated,
         );
     }

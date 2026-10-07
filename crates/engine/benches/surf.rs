@@ -156,15 +156,19 @@ fn main() {
             for k in &set {
                 b.add(k).unwrap();
             }
+            let added = t.elapsed().as_secs_f64();
+            let t = Instant::now();
             let f = b.finish().unwrap();
-            let build = t.elapsed().as_secs_f64();
+            let finish = t.elapsed().as_secs_f64();
+            let build = added + finish;
             let mut scratch = Vec::with_capacity(64);
             let mut line = format!(
-                "{name} keys {} ({:.1} B) suffix {suffix:2}: {:.2} bits/key, build {:.0} ns/key |",
+                "{name} keys {} ({:.1} B) suffix {suffix:2}: {:.2} bits/key, build {:.0} ns/key (finish {:.2} ms) |",
                 set.len(),
                 key_bytes as f64 / set.len() as f64,
                 f.bytes() as f64 * 8.0 / set.len() as f64,
                 build * 1e9 / set.len() as f64,
+                finish * 1e3,
             );
             for (kind, ranges) in ["point", "gap", "prefix"].iter().zip(&kinds) {
                 let mut lat = Vec::with_capacity(ranges.len());

@@ -61,6 +61,11 @@ pub struct FlushStats {
     pub insert_ns: u64,
     pub rotate_ns: u64,
     pub forget_ns: u64,
+    /// Nanoseconds the active memtable's order work took inside puts (its paced sorts and
+    /// merges), and retiring a packed memtable for reuse (clearing it and its index): timed
+    /// only as the rest are.
+    pub order_ns: u64,
+    pub retire_ns: u64,
 }
 
 /// A memtable read in key order from a seek, its next entry held in buffers it reuses: one
@@ -1095,7 +1100,10 @@ impl<F: BlockFile> ShardDb<F> {
                 room / 2,
                 &mut self.order_carry,
             );
+            let t = self.timed.then(std::time::Instant::now);
             self.mem.pay(usize::try_from(w).unwrap_or(usize::MAX));
+            let ns = ns_since(t);
+            self.flush_stats.order_ns = self.flush_stats.order_ns.saturating_add(ns);
         }
         if let Some(p) = &self.packing {
             // The memtable rotates when a put no longer fits, before its room reaches nothing:
@@ -1269,7 +1277,10 @@ impl<F: BlockFile> ShardDb<F> {
         self.note_pack(ns);
         self.flush_stats.pack_finish_ns = self.flush_stats.pack_finish_ns.saturating_add(ns);
         self.trunk.add(branch);
+        let t = self.timed.then(std::time::Instant::now);
         mem.clear();
+        let ns = ns_since(t);
+        self.flush_stats.retire_ns = self.flush_stats.retire_ns.saturating_add(ns);
         self.spare = Some(mem);
         self.pack_carry = 0;
         self.flush_stats.flushes = self.flush_stats.flushes.saturating_add(1);

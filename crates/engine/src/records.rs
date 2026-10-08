@@ -28,6 +28,12 @@ const SKIP: u16 = u16::MAX;
 const LIVE: u8 = 1;
 const READ: u8 = 2;
 
+/// Pages an append may evict to make room: one whose records were all read again frees no room
+/// (they are carried to the tail, the page they fill as large), so a second, which the first's
+/// carrying left behind it, lets an append past one read-hot page; any more and one append could
+/// carry the whole cache round (7.7 ms at 16 MiB, review §4).
+const EVICT_PAGES: usize = 2;
+
 /// The cache: its pages, the log's tail as an offset that only grows, the offset of the first
 /// page's start (a multiple of the page size), and the table.
 #[derive(Debug)]
@@ -341,10 +347,13 @@ impl RecordCache {
         flags: u8,
     ) -> Option<u64> {
         let size = Self::size(key.len(), value.len())?;
-        // Each round evicts a page; a page's carried records fill at most the page they move
-        // to, so the limit's pages and one more always make room.
+        // Each round evicts a page, at most `EVICT_PAGES` an append: admission is optional (the
+        // caller has its record either way), and a cache read whole would otherwise carry every
+        // page round once before one freed room. A page whose records were all read again
+        // frees nothing but clears their second chance, so the head moves on across appends
+        // and later ones find room.
         let mut fits = false;
-        for _ in 0..=self.most.saturating_add(1) {
+        for _ in 0..=EVICT_PAGES {
             if self.room(size).is_some() {
                 fits = true;
                 break;
@@ -576,6 +585,42 @@ mod tests {
             "the unread record stayed"
         );
         assert!(c.get(&keys[4], hash(&keys[4])).is_some());
+    }
+
+    #[test]
+    fn an_append_into_a_cache_read_whole_carries_a_bounded_number_of_pages() {
+        // Sixty-four pages of four records, every one read again: making room would carry every
+        // page round once. An append carries at most `EVICT_PAGES` and, finding no room, is left
+        // out; every record read stays. Later appends find the pages carried past their second
+        // chance and are admitted.
+        let pages = 64u32;
+        let mut c = RecordCache::new(pages as usize * 4 * 31, 4 * 31);
+        let value = [7u8; 12];
+        let keys: Vec<[u8; 4]> = (0..pages * 4).map(u32::to_be_bytes).collect();
+        for k in &keys {
+            c.insert(k, hash(k), &value);
+        }
+        for k in &keys {
+            assert!(c.get(k, hash(k)).is_some());
+        }
+        let new = (pages * 4).to_be_bytes();
+        c.insert(&new, hash(&new), &value);
+        assert!(
+            c.get(&new, hash(&new)).is_none(),
+            "admitted past every page"
+        );
+        for k in &keys {
+            assert!(c.get(k, hash(k)).is_some(), "a record read again was lost");
+        }
+        let mut admitted = 0;
+        for i in pages * 4 + 1..pages * 16 {
+            let k = i.to_be_bytes();
+            c.insert(&k, hash(&k), &value);
+            if c.get(&k, hash(&k)).is_some() {
+                admitted += 1;
+            }
+        }
+        assert!(admitted > 0);
     }
 
     #[test]

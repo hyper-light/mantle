@@ -185,6 +185,14 @@ impl<'a> ScanMerge<'a> {
 
     /// Moves every head holding the current key past it.
     pub fn next<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
+        if self.current == Some(0)
+            && let [head] = self.heads.as_mut_slice()
+        {
+            // The only head needs no copied key to decide which sources move.
+            head.next(store)?;
+            self.pick();
+            return Ok(());
+        }
         let Some(key) = self
             .current
             .and_then(|i| self.heads.get(i))

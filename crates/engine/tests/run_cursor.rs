@@ -282,6 +282,10 @@ fn stepping_a_cursor_refuses_a_truncated_entry_in_a_valid_leaf_header() {
     // The page's final row loses its last byte, while its header and first row still decode.
     payload.pop().unwrap();
     s.write_page(address, &payload).unwrap();
+    assert!(matches!(
+        b.seek(&mut s, b"z"),
+        Err(Error::Corruption { .. })
+    ));
     let mut c = b.run_from(&mut s, page, 0).unwrap();
     assert_eq!(c.key(), b"a");
     assert_eq!(c.value(), b"first");
@@ -312,4 +316,13 @@ fn a_cursor_refuses_a_page_flipped_on_the_medium() {
         b.run_from(&mut s, page, 0),
         Err(Error::Corruption { .. })
     ));
+    assert!(matches!(
+        b.seek(&mut s, &250u32.to_be_bytes()),
+        Err(Error::Corruption { .. })
+    ));
+    let c = b.seek(&mut s, &0u32.to_be_bytes()).unwrap();
+    assert!(c.valid());
+    assert_eq!(c.key(), 0u32.to_be_bytes());
+    assert_eq!(c.value(), vec![3u8; 100]);
+    c.give_back(&mut s);
 }

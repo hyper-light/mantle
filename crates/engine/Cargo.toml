@@ -73,3 +73,7 @@ harness = false
 [[bench]]
 name = "surf"
 harness = false
+
+[[bench]]
+name = "seek_cursor"
+harness = false

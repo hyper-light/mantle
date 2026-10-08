@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 
 use hyper_block::buf::Alignment;
-use hyper_block::sim::SimFile;
+use hyper_block::sim::{Fault, SimFile};
 use mantle_engine::branch::filter::Keys;
 use mantle_engine::branch::{Branch, Builder, Op};
 use mantle_engine::remix::{Build, Rebuild, SEGMENT, View};
@@ -216,5 +216,140 @@ fn a_view_seeks_exactly_from_every_key_and_just_past_each() {
             .map(|(k, (_, v))| (k.clone(), v.clone()))
             .collect();
         assert_eq!(got, want, "from {from:?}");
+    }
+}
+
+#[test]
+fn a_short_seek_does_not_read_a_fully_shadowed_run() {
+    let mut s = store();
+    let newest: Run = (0u16..64)
+        .map(|n| (n.to_be_bytes().to_vec(), (Op::Put, b"new".to_vec())))
+        .collect();
+    let older: Run = newest
+        .keys()
+        .map(|k| (k.clone(), (Op::Put, b"old".to_vec())))
+        .collect();
+    let branches = vec![build(&mut s, &newest), build(&mut s, &older)];
+    let view = View::build(&mut s, &branches, b"", None).unwrap();
+    let from = 8u16.to_be_bytes();
+    let old_page = u64::from(branches[1].leaf_of(&from).unwrap());
+    let address = branches[1].page_address(&s, old_page).unwrap();
+    s.checkpoint(None, 1).unwrap();
+    let (file, finished) = s.into_file();
+    finished.unwrap();
+    file.inject(Fault::ReadError {
+        offset: address * CONFIG.page_size as u64,
+        len: CONFIG.page_size as u64,
+    })
+    .unwrap();
+    let (mut s, _) = Store::open(file, CONFIG).unwrap();
+    let mut page = Rows::new();
+    let mut next = Vec::new();
+    assert!(
+        view.scan(&mut s, &branches, &from, 3, &mut page, &mut next)
+            .unwrap()
+    );
+    let got: Vec<_> = page.iter().map(|(k, v)| (k.to_vec(), v.to_vec())).collect();
+    let want: Vec<_> = newest
+        .range(from.to_vec()..)
+        .take(3)
+        .map(|(k, (_, v))| (k.clone(), v.clone()))
+        .collect();
+    assert_eq!(got, want);
+    assert_eq!(next, 11u16.to_be_bytes());
+    // The medium failure remains armed: the old run still cannot be read directly.
+    assert!(branches[1].run_at(&mut s, &from).is_err());
+}
+
+#[test]
+fn a_reopened_view_pages_from_present_and_absent_keys_with_deletions() {
+    let mut s = store();
+    let runs: Vec<Run> = (0u16..8)
+        .map(|r| {
+            (0u16..128)
+                .filter(|n| !n.is_multiple_of(r + 2))
+                .map(|n| {
+                    let op = if n % 7 == r % 7 { Op::Delete } else { Op::Put };
+                    let value = if op == Op::Delete {
+                        Vec::new()
+                    } else {
+                        vec![r as u8; 3 + usize::from((n * 37 + r * 53) % 900)]
+                    };
+                    ((n * 2).to_be_bytes().to_vec(), (op, value))
+                })
+                .collect()
+        })
+        .collect();
+    let branches: Vec<_> = runs.iter().map(|r| build(&mut s, r)).collect();
+    let lo = 34u16.to_be_bytes();
+    let hi = 222u16.to_be_bytes();
+    let view = View::build(&mut s, &branches, &lo, Some(&hi)).unwrap();
+    let descriptors: Vec<_> = branches
+        .iter()
+        .map(|b| {
+            let mut bytes = Vec::new();
+            b.encode(&mut bytes).unwrap();
+            bytes
+        })
+        .collect();
+    let mut encoded_view = Vec::new();
+    view.encode(&mut encoded_view).unwrap();
+    s.checkpoint(None, 1).unwrap();
+    let (file, finished) = s.into_file();
+    finished.unwrap();
+    let (mut s, _) = Store::open(file, CONFIG).unwrap();
+    let branches: Vec<_> = descriptors
+        .iter()
+        .map(|bytes| {
+            let (branch, used) = Branch::decode(&mut s, bytes).unwrap();
+            assert_eq!(used, bytes.len());
+            branch
+        })
+        .collect();
+    let (view, used) = View::decode(&encoded_view).unwrap();
+    assert_eq!(used, encoded_view.len());
+    let mut newest = Run::new();
+    for run in &runs {
+        for (key, entry) in run {
+            newest.entry(key.clone()).or_insert_with(|| entry.clone());
+        }
+    }
+    let mut starts: Vec<_> = (0u16..=256).map(|n| n.to_be_bytes().to_vec()).collect();
+    starts.push(Vec::new());
+    let mut page = Rows::new();
+    let mut next = Vec::new();
+    for from in starts {
+        let want: Vec<_> = newest
+            .iter()
+            .filter(|(key, (op, _))| {
+                *op == Op::Put
+                    && key.as_slice() >= from.as_slice()
+                    && key.as_slice() >= lo.as_slice()
+                    && key.as_slice() < hi.as_slice()
+            })
+            .map(|(key, (_, value))| (key.clone(), value.clone()))
+            .collect();
+        for limit in [1, 3, 11] {
+            let mut at = from.clone();
+            let mut got = Vec::new();
+            for pages in 0.. {
+                assert!(pages <= want.len() + 1, "a scan that does not end");
+                page.clear();
+                let more = view
+                    .scan(&mut s, &branches, &at, limit, &mut page, &mut next)
+                    .unwrap();
+                assert!(page.len() <= limit);
+                got.extend(
+                    page.iter()
+                        .map(|(key, value)| (key.to_vec(), value.to_vec())),
+                );
+                if !more {
+                    break;
+                }
+                assert!(next > at);
+                at.clone_from(&next);
+            }
+            assert_eq!(got, want, "from {from:?}, limit {limit}");
+        }
     }
 }

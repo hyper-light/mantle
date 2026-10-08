@@ -843,6 +843,33 @@ fn nth_of(selectors: &[u8], r: usize, m: usize) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+/// The newest selector of the key's group containing `at`; the end stays the end. A group's
+/// versions are together and newest first, so an old selector orders the same key as its head.
+fn group_start(selectors: &[u8], mut at: usize) -> Result<usize, Error> {
+    if at == selectors.len() {
+        return Ok(at);
+    }
+    for _ in 0..=selectors.len() {
+        if selectors.get(at).ok_or(corrupt())? & OLD == 0 {
+            return Ok(at);
+        }
+        at = at.checked_sub(1).ok_or(corrupt())?;
+    }
+    Err(corrupt())
+}
+
+/// The boundary after the key's group containing `at`: all its shadowed versions passed too.
+fn group_end(selectors: &[u8], at: usize) -> Result<usize, Error> {
+    let mut end = at.checked_add(1).ok_or(corrupt())?;
+    for sel in selectors.get(end..).ok_or(corrupt())? {
+        if sel & OLD == 0 {
+            break;
+        }
+        end = end.checked_add(1).ok_or(corrupt())?;
+    }
+    Ok(end)
+}
+
 /// Bytes read from the front, each read refused past the end.
 struct Reader<'a> {
     bytes: &'a [u8],
@@ -983,8 +1010,8 @@ impl Walk {
         Ok(w)
     }
 
-    /// The first entry of `selectors` (the segment's) whose key is at least `from`, by halving:
-    /// its length when every key is less. Each probe reads its key through its run's own cursor,
+    /// The first key group of `selectors` (the segment's) at least `from`, by halving: its length
+    /// when every key is less. A probe reads the group's newest version through its run's cursor,
     /// so a page a probe reads is the page the run is then placed on when the walk starts there.
     /// A probe's page then narrows the search by every key on it (Zhong et al. §3.2, the I/O
     /// optimization): the run's entries in the segment that sort before `from` are counted on
@@ -1000,7 +1027,10 @@ impl Walk {
     ) -> Result<usize, Error> {
         let (mut lo, mut hi) = (0usize, selectors.len());
         while lo < hi {
-            let mid = lo.saturating_add(hi.saturating_sub(lo) / 2);
+            let mid = group_start(selectors, lo.saturating_add(hi.saturating_sub(lo) / 2))?;
+            if mid < lo {
+                return Err(corrupt());
+            }
             let r = usize::from(selectors.get(mid).ok_or(corrupt())? & RUN);
             let b = runs.get(r).ok_or(corrupt())?;
             let offset = view.offset(self.segment, r)?;
@@ -1026,28 +1056,29 @@ impl Walk {
                     if first_at_least > 0
                         && let Some(p) = before.checked_sub(1).and_then(|o| nth_of(selectors, r, o))
                     {
-                        lo = lo.max(p.saturating_add(1));
+                        lo = lo.max(group_end(selectors, p)?);
                     }
                     if before < total
                         && let Some(p) = nth_of(selectors, r, before)
                     {
-                        hi = hi.min(p);
+                        hi = hi.min(group_start(selectors, p)?);
                     }
                 } else {
                     // Even the segment's first of the run is at least `from`.
                     if let Some(p) = nth_of(selectors, r, 0) {
-                        hi = hi.min(p);
+                        hi = hi.min(group_start(selectors, p)?);
                     }
                 }
             } else if let Some(last) = occurrence_of(n.saturating_sub(1)) {
                 // Every entry on the page is less than `from`: so is the run up to its last.
                 if let Some(p) = nth_of(selectors, r, last.min(total.saturating_sub(1))) {
-                    lo = lo.max(p.saturating_add(1));
+                    lo = lo.max(group_end(selectors, p)?);
                 }
             }
-            // The probe itself decides `mid`, whatever the page could say.
+            // Every bound stays at a group boundary, even when a page's bound named an old
+            // version: its head has the same key. A group below `from` is passed whole.
             if c.key() < from {
-                lo = lo.max(mid.saturating_add(1));
+                lo = lo.max(group_end(selectors, mid)?);
             } else {
                 hi = hi.min(mid);
             }

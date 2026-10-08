@@ -1126,7 +1126,7 @@ impl<F: BlockFile> ShardDb<F> {
             self.flush_stats.trunk_share_most = self.flush_stats.trunk_share_most.max(w);
             if w > 0 {
                 let t = self.timed.then(std::time::Instant::now);
-                self.trunk.step(&mut self.store, w)?;
+                self.trunk.step_paced(&mut self.store, w)?;
                 self.note_trunk(ns_since(t));
             }
         }

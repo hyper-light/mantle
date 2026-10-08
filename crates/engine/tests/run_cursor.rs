@@ -15,9 +15,10 @@
 use std::collections::BTreeMap;
 
 use hyper_block::buf::Alignment;
-use hyper_block::sim::SimFile;
+use hyper_block::sim::{Fault, SimFile};
 use mantle_engine::branch::filter::Keys;
 use mantle_engine::branch::{Branch, Builder, Op};
+use mantle_engine::error::Error;
 use mantle_engine::store::{Config, Store};
 use proptest::prelude::*;
 
@@ -192,4 +193,123 @@ fn position_arithmetic_lands_where_steps_do_from_every_position_by_every_count()
             );
         }
     }
+}
+
+#[test]
+fn placing_a_cursor_again_reads_each_leafs_prefix_and_entry_ranges() {
+    let mut s = store(13);
+    s.set_cache(8);
+    let entries = |prefix: &[u8]| -> Entries {
+        (0u32..500)
+            .map(|n| {
+                let mut key = prefix.to_vec();
+                key.extend_from_slice(&n.to_be_bytes());
+                let op = if n % 5 == 0 { Op::Delete } else { Op::Put };
+                let value = if op == Op::Put {
+                    vec![(n % 256) as u8; (n % 120) as usize]
+                } else {
+                    Vec::new()
+                };
+                (key, (op, value))
+            })
+            .collect()
+    };
+    let first = build(&mut s, &entries(b"short/"));
+    let second = build(&mut s, &entries(b"a-longer-common-prefix/"));
+    let first_read = walk(&mut s, &first, b"");
+    let second_read = walk(&mut s, &second, b"");
+    let mut c = first.run_from(&mut s, first_read[0].1.0, 0).unwrap();
+    for (branch, read) in [
+        (&first, &first_read),
+        (&second, &second_read),
+        (&first, &first_read),
+    ] {
+        for at in [read.len() / 2, 0, read.len() - 1, 1] {
+            c.place(branch, &mut s, read[at].1).unwrap();
+            assert_eq!((c.key().to_vec(), c.op(), c.value().to_vec()), read[at].0);
+            c.next(branch, &mut s).unwrap();
+            match read.get(at + 1) {
+                Some((entry, _)) => {
+                    assert!(c.valid());
+                    assert_eq!(&(c.key().to_vec(), c.op(), c.value().to_vec()), entry);
+                }
+                None => assert!(!c.valid()),
+            }
+        }
+    }
+    c.give_back(&mut s);
+}
+
+#[test]
+fn a_cursor_refuses_a_corrupt_leaf_and_can_be_placed_on_a_valid_one_again() {
+    let mut s = store(17);
+    let entries: Entries = [(b"key".to_vec(), (Op::Put, b"value".to_vec()))]
+        .into_iter()
+        .collect();
+    let good = build(&mut s, &entries);
+    let broken = build(&mut s, &entries);
+    let mut c = good.run_at(&mut s, b"").unwrap();
+    let position = c.position();
+    let address = broken.page_address(&s, position.0).unwrap();
+    // A valid store-page checksum around an empty branch payload: corruption must also be
+    // refused by the branch's reader, before any entry can be read through the cursor.
+    s.write_page(address, b"").unwrap();
+    assert!(matches!(
+        c.place(&broken, &mut s, position),
+        Err(Error::Corruption { .. })
+    ));
+    c.place(&good, &mut s, position).unwrap();
+    assert!(c.valid());
+    assert_eq!(c.key(), b"key");
+    assert_eq!(c.value(), b"value");
+    c.give_back(&mut s);
+}
+
+#[test]
+fn stepping_a_cursor_refuses_a_truncated_entry_in_a_valid_leaf_header() {
+    let mut s = store(19);
+    let entries: Entries = [
+        (b"a".to_vec(), (Op::Put, b"first".to_vec())),
+        (b"z".to_vec(), (Op::Put, b"last".to_vec())),
+    ]
+    .into_iter()
+    .collect();
+    let b = build(&mut s, &entries);
+    let page = u64::from(b.leaf_of(b"a").unwrap());
+    let address = b.page_address(&s, page).unwrap();
+    let mut payload = Vec::new();
+    s.read_page(address, &mut payload).unwrap();
+    // The page's final row loses its last byte, while its header and first row still decode.
+    payload.pop().unwrap();
+    s.write_page(address, &payload).unwrap();
+    let mut c = b.run_from(&mut s, page, 0).unwrap();
+    assert_eq!(c.key(), b"a");
+    assert_eq!(c.value(), b"first");
+    assert!(matches!(c.next(&b, &mut s), Err(Error::Corruption { .. })));
+    c.give_back(&mut s);
+}
+
+#[test]
+fn a_cursor_refuses_a_page_flipped_on_the_medium() {
+    let mut s = store(23);
+    let entries: Entries = (0u32..500)
+        .map(|n| (n.to_be_bytes().to_vec(), (Op::Put, vec![3u8; 100])))
+        .collect();
+    let b = build(&mut s, &entries);
+    let page = u64::from(b.leaf_of(&250u32.to_be_bytes()).unwrap());
+    let address = b.page_address(&s, page).unwrap();
+    s.checkpoint(None, 1).unwrap();
+    let (file, finished) = s.into_file();
+    finished.unwrap();
+    file.inject(Fault::BitFlip {
+        offset: address * CONFIG.page_size as u64 + 100,
+        bit: 5,
+        stored: true,
+    })
+    .unwrap();
+    let (mut s, _) = Store::open(file, CONFIG).unwrap();
+    assert!(matches!(
+        b.run_from(&mut s, page, 0),
+        Err(Error::Corruption { .. })
+    ));
 }

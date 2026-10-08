@@ -96,6 +96,8 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/ec/src/durability.rs` `YEAR` | derived | Unit conversion: 365.25 days × 24 h = 8766 hours. |
 | `crates/engine/src/branch/mod.rs` `KEY_HEAD` | format | 4: the bytes of a page entry's head, its suffix's first 4 bytes, which a search compares before reading the entry. |
 | `crates/engine/src/branch/mod.rs` `SLOT` | format | 6: a page entry's table bytes, its offset (2) and its head (4). |
+| `crates/engine/src/fst/bits.rs` `MSBS_STEP_8` | cited | `0x8080…80`: every byte's high bit, broadword select's comparison flags (Vigna, WEA 2008; sux). |
+| `crates/engine/src/fst/bits.rs` `ONES_STEP_8` | cited | `0x0101…01`: one in every byte, broadword select's step (Vigna, WEA 2008; sux `support/common.hpp`). |
 | `crates/engine/src/fst/bits.rs` `SELECT_SAMPLE` | cited | 64: select samples every 64th set bit, 9–17% of a dense bit vector and 1–2% of the trie (Zhang et al., SuRF, SIGMOD 2018 §2.6; research/35 §1). |
 | `crates/engine/src/fst/packed.rs` `MAX_WIDTH` | format | 32: a trie value is a `u32` (a leaf's page number, a range filter's suffix bits). |
 | `crates/engine/src/fst/surf.rs` `SUFFIX_BYTES` | format | 4: the bytes a suffix of at most 32 bits (`MAX_WIDTH`) spans. |
@@ -104,6 +106,15 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/engine/src/fst/trie.rs` `DENSE_RATIO` | cited | R = 64: the dense levels at most 1/64 of the sparse levels below them (SuRF §2.4; research/35 §1). |
 | `crates/engine/src/fst/trie.rs` `SPARSE_BLOCK` | cited | 512-bit rank blocks for LOUDS-Sparse: a block in a cache line, 6.25% over the bits (SuRF §2.6; research/35 §1). |
 | `crates/engine/src/fst/trie.rs` `SPARSE_LABEL_BITS` | format | 10: a LOUDS-Sparse label's byte and its has-child and node-start bits. |
+| `crates/engine/src/store/cache.rs` `EVICT_STEPS` | derived | `MAX_FREQ + 2`: queue steps an insert may take to free a slot, S3-FIFO's amortized cost of an eviction (a page moves to main at most once and goes round main at most `MAX_FREQ` times; Yang et al., SOSP '23 §4). Past it the optional admission is left out and the queues keep their place; unbounded, one insert took 117,973 steps (344 us) at 32,768 pages (review §4). |
+| `crates/engine/src/records.rs` `EVICT_PAGES` | derived | 2: pages an append may evict for room; a page whose records were all read again frees none but clears their second chance, so a second lets an append past one read-hot page. Unbounded, one append carried a whole 16 MiB cache round, 7.7 ms (review §4). |
+| `crates/engine/src/memtable/hashed.rs` `ENTRY_HEAD_MAX` | format | 9: the most bytes an entry's head takes in the memtable arena, its operation (1) and the key and value lengths as varints of at most 3 and 5 bytes (a key below 64 KiB, a value below 4 GiB). |
+| `crates/engine/src/shard_db.rs` `ORDER_BOUND` | measured | 2048 entries, a default `ShardDb::set_order_bound` replaces: the active memtable leaves unsorted at most (`ShardDb::set_order_bound`): a scan after a burst of puts sorts at most two such chunks. The radix sort measured 20-30 ns an entry and seeks' p99.9 41-165 us on the Apple M-series dev machine (benches/shard_db.rs), so the inherited sort, about 50 us, stays within seeks' own tail; the first seek after a 10M-put burst measured 107 us (5 reads) against 3.15 ms unbounded (research/40). |
+| `crates/engine/src/maplet.rs` `BUCKETS` | derived | 32: buckets a block holds; its headers (buckets and slots in bits) fit one 128-bit word for up to 96 slots, which 32 buckets at a load of at most one key a bucket next to never exceed (research/38 §6). |
+| `crates/engine/src/maplet.rs` `HEADER_BITS` | format | 4: a block's header bytes less one, at most 16. |
+| `crates/engine/src/maplet.rs` `MOST_SLOTS` | derived | `128 − BUCKETS`: the most slots a block holds, its headers within a 128-bit word. |
+| `crates/engine/src/maplet.rs` `OFFSET_BITS` | format | 12: a block's offset in its page, a page being at most 4 KiB. |
+| `crates/engine/src/maplet.rs` `PAGE_SHIFT` | derived | `OFFSET_BITS + HEADER_BITS`: where a block's page starts in its index word. |
 | `crates/engine/src/records.rs` `LIVE` | format | 1: a cached record's flag, set while it is the key's current replica. |
 | `crates/engine/src/records.rs` `READ` | format | 2: a cached record's flag, set when it is read after being appended; it is carried to the tail once when its page is evicted (F2's second chance, Kanellis et al. PVLDB 2025 §7; research/37). |
 | `crates/engine/src/records.rs` `RECORD_HEAD` | format | 15: a cached record's fixed bytes, key length (2), value length (4), flags (1), key hash (8). |

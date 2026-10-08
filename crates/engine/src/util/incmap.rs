@@ -214,6 +214,17 @@ impl IncMap {
         Self::default()
     }
 
+    /// Empties the map, keeping its table: refilled to the size it last held, it neither grows
+    /// nor migrates again.
+    pub fn clear(&mut self) {
+        self.old = None;
+        self.moved = 0;
+        self.swept = 0;
+        self.table.ctrl.fill(repeat(EMPTY));
+        self.table.full = 0;
+        self.table.tombs = 0;
+    }
+
     /// Entries held.
     pub fn len(&self) -> usize {
         self.table
@@ -399,6 +410,27 @@ mod tests {
         let mut want: Vec<(u64, u64)> = model.into_iter().collect();
         want.sort_unstable();
         assert_eq!(all, want);
+    }
+
+    #[test]
+    fn a_cleared_map_is_empty_and_refills_without_growing() {
+        let mut m = IncMap::new();
+        for k in 0..10_000u64 {
+            m.insert(k.wrapping_mul(0x9e37_79b9_7f4a_7c15), k);
+        }
+        // Cleared mid-migration as well as settled: nothing is left in either table.
+        m.clear();
+        assert!(m.is_empty() && !m.migrating());
+        let buckets = m.table.buckets();
+        for k in 0..10_000u64 {
+            assert_eq!(m.get(k.wrapping_mul(0x9e37_79b9_7f4a_7c15)), None);
+            m.insert(k.wrapping_mul(0x9e37_79b9_7f4a_7c15), k + 1);
+        }
+        assert_eq!(m.table.buckets(), buckets);
+        assert!(!m.migrating());
+        for k in 0..10_000u64 {
+            assert_eq!(m.get(k.wrapping_mul(0x9e37_79b9_7f4a_7c15)), Some(k + 1));
+        }
     }
 
     #[test]

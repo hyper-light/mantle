@@ -120,6 +120,14 @@ pub struct Branch {
     /// Written after its leaf index in its pages.
     pub range: Surf,
     pub range_bytes: u64,
+    /// Its keys' 32-bit maplet hashes, ascending, written after its range filter in its pages
+    /// and never held in memory: what a bundle's maplet is merged from without reading the
+    /// branch's entries (research/38 §5).
+    pub hashes_bytes: u64,
+    /// Gets that asked its filter since it was built or loaded: its visits, which with its
+    /// entries set the false-positive rate its filter's memory is worth (research/39 §2).
+    /// Not part of its descriptor.
+    pub probes: u64,
 }
 
 fn corrupt(why: Malformed) -> Error {
@@ -310,6 +318,11 @@ pub struct Builder {
     keys: SurfBuilder,
     range: Vec<u8>,
     range_filter: Option<Surf>,
+    /// Each key's maplet hash, sorted after the seal and written after the range filter.
+    hashes: Vec<u32>,
+    hash_scratch: Vec<u32>,
+    /// The hashes' sort: how many hold each value of each byte, counted as keys are added.
+    hash_order: HashOrder,
     /// The last key of the last leaf written.
     prev_last: Vec<u8>,
     count: u64,
@@ -325,6 +338,74 @@ pub struct Builder {
     entry_bytes: u64,
     /// The tree written, once [`Self::seal`] has run: what is left is its filter's pages.
     sealed: Option<Sealed>,
+}
+
+/// A least-significant-byte radix sort of a builder's hashes, a byte with one value across them
+/// skipped: the bytes left to scatter by, the pass at `pass`, its position `at` and where each
+/// value goes next; the moves each filter page written before the hashes pays, so the sort ends
+/// as the first hash page is due ([`Builder::write_filter`]).
+#[derive(Debug)]
+struct HashOrder {
+    counts: [[u32; 256]; 4],
+    passes: [usize; 4],
+    npass: usize,
+    pass: usize,
+    at: usize,
+    next: [u32; 256],
+    per_page: usize,
+}
+
+impl Default for HashOrder {
+    fn default() -> Self {
+        Self {
+            counts: [[0; 256]; 4],
+            passes: [0; 4],
+            npass: 0,
+            pass: 0,
+            at: 0,
+            next: [0; 256],
+            per_page: 0,
+        }
+    }
+}
+
+impl HashOrder {
+    fn count(&mut self, h: u32) {
+        for (counts, &b) in self.counts.iter_mut().zip(h.to_le_bytes().iter()) {
+            if let Some(c) = counts.get_mut(usize::from(b)) {
+                *c = c.saturating_add(1);
+            }
+        }
+    }
+
+    /// Readies pass `pass`: each value of its byte starts after the hashes of smaller values.
+    fn start_pass(&mut self) {
+        let Some(counts) = self
+            .passes
+            .get(self.pass)
+            .filter(|_| self.pass < self.npass)
+            .and_then(|&byte| self.counts.get(byte))
+        else {
+            return;
+        };
+        let mut sum = 0u32;
+        for (next, &count) in self.next.iter_mut().zip(counts.iter()) {
+            *next = sum;
+            sum = sum.saturating_add(count);
+        }
+    }
+
+    fn done(&self) -> bool {
+        self.pass >= self.npass
+    }
+
+    /// Moves left: the passes left over every hash.
+    fn left(&self, n: usize) -> usize {
+        self.npass
+            .saturating_sub(self.pass)
+            .saturating_mul(n)
+            .saturating_sub(self.at)
+    }
 }
 
 /// A sealed builder's fixed root and height, and its filter's pages: the first, the bytes in
@@ -368,6 +449,9 @@ impl Builder {
             keys: keys_filter,
             range: lists.range,
             range_filter: None,
+            hashes: lists.hashes,
+            hash_scratch: lists.hash_scratch,
+            hash_order: HashOrder::default(),
             prev_last: Vec::new(),
             count: 0,
             payload: Vec::with_capacity(capacity),
@@ -441,7 +525,16 @@ impl Builder {
         self.last.clear();
         self.last.extend_from_slice(key);
         self.count = self.count.saturating_add(1);
-        self.filter.insert(filter::hash(key));
+        let h = filter::hash(key);
+        self.filter.insert(h);
+        let h32 = crate::maplet::hash32(h);
+        self.hashes.push(h32);
+        // Scatter scratch is initialized as keys arrive, one entry a key. A recycled
+        // buffer's old entries need no clearing, and the seal initializes none.
+        if self.hash_scratch.len() < self.hashes.len() {
+            self.hash_scratch.push(0);
+        }
+        self.hash_order.count(h32);
         self.keys.add(key)?;
         self.entry_bytes = self.entry_bytes.saturating_add(
             u64::try_from(key.len().saturating_add(value.len())).unwrap_or(u64::MAX),
@@ -565,6 +658,14 @@ impl Builder {
                 what: "a branch with no entries",
             });
         }
+        let t = store.clock();
+        let sealed = self.seal_tree(store);
+        store.note_seal(t);
+        sealed
+    }
+
+    /// [`Self::seal`]'s work: the tree's last pages written, the index and filters built.
+    fn seal_tree<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
         let mut level = 0usize;
         loop {
             let top = level.checked_add(1) == Some(self.levels.len());
@@ -589,10 +690,12 @@ impl Builder {
                         .bytes()
                         .saturating_add(self.counts.len().saturating_mul(2))
                         .saturating_add(self.index.len())
-                        .saturating_add(self.range.len()),
+                        .saturating_add(self.range.len())
+                        .saturating_add(self.hashes.len().saturating_mul(4)),
                     at: 0,
                     pages: 0,
                 });
+                self.start_hash_sort();
                 return Ok(());
             }
             if self.levels.get(level).is_some_and(|p| p.len() > 0) {
@@ -606,8 +709,17 @@ impl Builder {
     pub fn filter_pages_left(&self) -> u64 {
         let (total, at) = self
             .sealed
-            .map_or((self.filter.bytes(), 0), |s| (s.total, s.at));
+            .map_or((self.unsealed_bytes(), 0), |s| (s.total, s.at));
         u64::try_from(total.saturating_sub(at).div_ceil(self.capacity.max(1))).unwrap_or(u64::MAX)
+    }
+
+    /// What follows the tree before the seal, as far as known: the filter's bytes, each page's
+    /// count and each key's hash. The leaf index and range filter are sized only when built.
+    fn unsealed_bytes(&self) -> usize {
+        self.filter
+            .bytes()
+            .saturating_add(self.counts.len().saturating_mul(2))
+            .saturating_add(self.hashes.len().saturating_mul(4))
     }
 
     /// The keys a filter page is worth in a compaction's budget: as many bytes as a page, at
@@ -619,6 +731,65 @@ impl Builder {
             .checked_div(self.entry_bytes.max(1))
             .unwrap_or(1)
             .max(1)
+    }
+
+    /// Starts the hashes' sort at the seal: the bytes to scatter by, and the moves each page
+    /// written before the hashes pays so that it ends as the first hash page is due.
+    fn start_hash_sort(&mut self) {
+        let n = self.hashes.len();
+        let o = &mut self.hash_order;
+        let all = u32::try_from(n).unwrap_or(u32::MAX);
+        o.npass = 0;
+        for byte in 0..4 {
+            let varies = o
+                .counts
+                .get(byte)
+                .is_some_and(|c| c.iter().all(|&m| m != all));
+            if varies && let Some(p) = o.passes.get_mut(o.npass) {
+                *p = byte;
+                o.npass = o.npass.saturating_add(1);
+            }
+        }
+        o.pass = 0;
+        o.at = 0;
+        o.start_pass();
+        let before = self.sealed.map_or(0, |s| {
+            s.total
+                .saturating_sub(n.saturating_mul(4))
+                .div_ceil(self.capacity.max(1))
+        });
+        o.per_page = o.left(n).div_ceil(before.max(1));
+        self.hash_scratch.truncate(n);
+    }
+
+    /// Up to `budget` moves of the hashes' sort.
+    fn hash_sort_step(&mut self, budget: usize) {
+        let mut moved = 0usize;
+        while moved < budget && !self.hash_order.done() {
+            let o = &mut self.hash_order;
+            let Some(&byte) = o.passes.get(o.pass) else {
+                return;
+            };
+            let Some(&h) = self.hashes.get(o.at) else {
+                std::mem::swap(&mut self.hashes, &mut self.hash_scratch);
+                o.pass = o.pass.saturating_add(1);
+                o.at = 0;
+                o.start_pass();
+                continue;
+            };
+            let b = usize::from(h.to_le_bytes().get(byte).copied().unwrap_or(0));
+            if let Some(next) = o.next.get_mut(b) {
+                if let Some(d) = usize::try_from(*next)
+                    .ok()
+                    .and_then(|i| self.hash_scratch.get_mut(i))
+                {
+                    *d = h;
+                }
+                *next = next.saturating_add(1);
+            }
+            o.at = o.at.saturating_add(1);
+            moved = moved.saturating_add(1);
+        }
     }
 
     /// Writes up to `pages` of the sealed filter's pages, each copied from its blocks; true once
@@ -633,9 +804,17 @@ impl Builder {
         })?;
         let mut chunk = std::mem::take(&mut self.payload);
         let mut written = 0u64;
+        let hashes_at = s.total.saturating_sub(self.hashes.len().saturating_mul(4));
         while written < pages && s.at < s.total {
             chunk.clear();
             let end = s.at.saturating_add(self.capacity).min(s.total);
+            // Each page pays its share of the hashes' sort; a page holding hashes needs it done.
+            let share = if end > hashes_at {
+                usize::MAX
+            } else {
+                self.hash_order.per_page
+            };
+            self.hash_sort_step(share);
             self.stream_bytes(s.at..end, &mut chunk);
             let address = self.page(store)?;
             store.queue_page(&mut self.run, address, &chunk)?;
@@ -655,7 +834,8 @@ impl Builder {
     /// The branch, its tree and filter written; refused before. The run's buffer goes back to
     /// the store's pool for the next writer.
     /// Bytes `range` of what follows the tree in the branch's pages: the filter's bytes, each
-    /// tree page's entry count (two bytes each), the leaf index, then the range filter.
+    /// tree page's entry count (two bytes each), the leaf index, the range filter, then the
+    /// keys' maplet hashes (four bytes each, little-endian).
     fn stream_bytes(&self, range: std::ops::Range<usize>, out: &mut Vec<u8>) {
         let fb = self.filter.bytes();
         let cb = self.counts.len().saturating_mul(2);
@@ -676,10 +856,18 @@ impl Builder {
             out.extend_from_slice(self.index.get(from..to).unwrap_or(&[]));
         }
         let base = base.saturating_add(ib);
+        let rb = self.range.len();
         let from = range.start.max(base).saturating_sub(base);
-        let to = range.end.saturating_sub(base);
+        let to = range.end.saturating_sub(base).min(rb);
         if from < to {
             out.extend_from_slice(self.range.get(from..to).unwrap_or(&[]));
+        }
+        let base = base.saturating_add(rb);
+        let from = range.start.max(base).saturating_sub(base);
+        let to = range.end.saturating_sub(base);
+        for at in from..to {
+            let h = self.hashes.get(at / 4).copied().unwrap_or(0).to_le_bytes();
+            out.push(h.get(at % 4).copied().unwrap_or(0));
         }
     }
 
@@ -724,6 +912,9 @@ impl Builder {
             range_bytes: u64::try_from(self.range.len())
                 .map_err(|_| corrupt(Malformed::TooLarge))?,
             range: self.range_filter.ok_or(corrupt(Malformed::CountMismatch))?,
+            hashes_bytes: u64::try_from(self.hashes.len().saturating_mul(4))
+                .map_err(|_| corrupt(Malformed::TooLarge))?,
+            probes: 0,
         });
         store.give_lists(crate::store::Lists {
             extents: self.extents,
@@ -732,6 +923,8 @@ impl Builder {
             keys: self.keys,
             range: self.range,
             index: self.index,
+            hashes: self.hashes,
+            hash_scratch: self.hash_scratch,
         });
         branch
     }
@@ -799,46 +992,7 @@ impl<'a> View<'a> {
     /// Where entry `i`'s suffix and its rest (operation and value, or child and count) lie in
     /// the page.
     fn ranges(&self, i: usize) -> Result<(std::ops::Range<usize>, std::ops::Range<usize>), Error> {
-        let slot = self
-            .table
-            .checked_add(i.checked_mul(OFFSET).ok_or(corrupt(Malformed::TooLarge))?)
-            .ok_or(corrupt(Malformed::TooLarge))?;
-        let at = self
-            .page
-            .get(slot..)
-            .and_then(<[u8]>::first_chunk::<2>)
-            .map(|b| usize::from(u16::from_le_bytes(*b)))
-            .ok_or(corrupt(Malformed::Truncated))?;
-        let len = self
-            .page
-            .get(at..)
-            .and_then(<[u8]>::first_chunk::<2>)
-            .map(|b| usize::from(u16::from_le_bytes(*b)))
-            .ok_or(corrupt(Malformed::Truncated))?;
-        let body = at.checked_add(2).ok_or(corrupt(Malformed::TooLarge))?;
-        let fixed = if self.kind == LEAF {
-            let vlen = self
-                .page
-                .get(body.saturating_add(1)..)
-                .and_then(<[u8]>::first_chunk::<2>)
-                .map(|b| usize::from(u16::from_le_bytes(*b)))
-                .ok_or(corrupt(Malformed::Truncated))?;
-            3usize
-                .checked_add(vlen)
-                .ok_or(corrupt(Malformed::TooLarge))?
-        } else {
-            16
-        };
-        let suffix_at = body
-            .checked_add(fixed)
-            .ok_or(corrupt(Malformed::TooLarge))?;
-        let suffix_end = suffix_at
-            .checked_add(len)
-            .ok_or(corrupt(Malformed::TooLarge))?;
-        if suffix_end > self.page.len() {
-            return Err(corrupt(Malformed::Truncated));
-        }
-        Ok((suffix_at..suffix_end, body..suffix_at))
+        entry_ranges(self.page, self.kind, self.table, i)
     }
 
     /// `key` against the page's key `i`: the prefix first, then the suffix.
@@ -895,6 +1049,52 @@ impl<'a> View<'a> {
     }
 }
 
+/// An entry's ranges in a page whose header has been read: a cursor keeps its leaf's table
+/// offset while the page stays, so stepping decodes the entry alone.
+fn entry_ranges(
+    page: &[u8],
+    kind: u8,
+    table: usize,
+    i: usize,
+) -> Result<(std::ops::Range<usize>, std::ops::Range<usize>), Error> {
+    let slot = table
+        .checked_add(i.checked_mul(OFFSET).ok_or(corrupt(Malformed::TooLarge))?)
+        .ok_or(corrupt(Malformed::TooLarge))?;
+    let at = page
+        .get(slot..)
+        .and_then(<[u8]>::first_chunk::<2>)
+        .map(|b| usize::from(u16::from_le_bytes(*b)))
+        .ok_or(corrupt(Malformed::Truncated))?;
+    let len = page
+        .get(at..)
+        .and_then(<[u8]>::first_chunk::<2>)
+        .map(|b| usize::from(u16::from_le_bytes(*b)))
+        .ok_or(corrupt(Malformed::Truncated))?;
+    let body = at.checked_add(2).ok_or(corrupt(Malformed::TooLarge))?;
+    let fixed = if kind == LEAF {
+        let vlen = page
+            .get(body.saturating_add(1)..)
+            .and_then(<[u8]>::first_chunk::<2>)
+            .map(|b| usize::from(u16::from_le_bytes(*b)))
+            .ok_or(corrupt(Malformed::Truncated))?;
+        3usize
+            .checked_add(vlen)
+            .ok_or(corrupt(Malformed::TooLarge))?
+    } else {
+        16
+    };
+    let suffix_at = body
+        .checked_add(fixed)
+        .ok_or(corrupt(Malformed::TooLarge))?;
+    let suffix_end = suffix_at
+        .checked_add(len)
+        .ok_or(corrupt(Malformed::TooLarge))?;
+    if suffix_end > page.len() {
+        return Err(corrupt(Malformed::Truncated));
+    }
+    Ok((suffix_at..suffix_end, body..suffix_at))
+}
+
 impl Branch {
     /// The entry for `key`, if the branch has one: its operation, and its value into `value`.
     /// One page read a level.
@@ -919,6 +1119,16 @@ impl Branch {
         if !self.filter.may_contain(hash) {
             return Ok(None);
         }
+        self.get_routed(store, key, value)
+    }
+
+    /// [`Self::get`] for a key its bundle's maplet routed here: its filter not asked again.
+    pub fn get_routed<F: BlockFile>(
+        &self,
+        store: &mut Store<F>,
+        key: &[u8],
+        value: &mut Vec<u8>,
+    ) -> Result<Option<Op>, Error> {
         // The leaf by the index, from memory: the one page read, parsed where the store holds
         // it, only the value copied out.
         let page_no = self.leaf_of(key)?;
@@ -956,6 +1166,7 @@ impl Branch {
         out.extend_from_slice(&self.filter_bytes.to_le_bytes());
         out.extend_from_slice(&self.index_bytes.to_le_bytes());
         out.extend_from_slice(&self.range_bytes.to_le_bytes());
+        out.extend_from_slice(&self.hashes_bytes.to_le_bytes());
         let n = u32::try_from(self.extents.len()).map_err(|_| corrupt(Malformed::TooLarge))?;
         out.extend_from_slice(&n.to_le_bytes());
         for e in &self.extents {
@@ -995,15 +1206,30 @@ impl Branch {
         let filter_bytes = u64_of(take(8)?)?;
         let index_bytes = u64_of(take(8)?)?;
         let range_bytes = u64_of(take(8)?)?;
+        let hashes_bytes = u64_of(take(8)?)?;
         let n = usize::try_from(u32_of(take(4)?)?).map_err(|_| corrupt(Malformed::TooLarge))?;
         let mut extents = Vec::with_capacity(n.min(bytes.len() / 8));
         for _ in 0..n {
             extents.push(u64_of(take(8)?)?);
         }
-        // The filter's pages: its place in the branch's pages, counted in extent order.
+        // The filter's pages: its place in the branch's pages, counted in extent order; the
+        // pages up to the range filter's end, the maplet hashes after it left on the device.
         let per = u64::from(store.extent_pages());
-        let mut filter = Vec::with_capacity(usize::try_from(filter_bytes).unwrap_or(0));
-        for i in 0..u64::from(filter_pages) {
+        let held = filter_bytes
+            .checked_add(
+                filter_start
+                    .checked_mul(2)
+                    .ok_or(corrupt(Malformed::TooLarge))?,
+            )
+            .and_then(|n| n.checked_add(index_bytes))
+            .and_then(|n| n.checked_add(range_bytes))
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        let capacity = u64::try_from(store.page_capacity())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let pages_held = held.div_ceil(capacity).min(u64::from(filter_pages));
+        let mut filter = Vec::with_capacity(usize::try_from(held).unwrap_or(0));
+        for i in 0..pages_held {
             let index = filter_start
                 .checked_add(i)
                 .ok_or(corrupt(Malformed::TooLarge))?;
@@ -1024,14 +1250,12 @@ impl Branch {
         let ib = usize::try_from(index_bytes).map_err(|_| corrupt(Malformed::TooLarge))?;
         let rb = usize::try_from(range_bytes).map_err(|_| corrupt(Malformed::TooLarge))?;
         let cb = tree.checked_mul(2).ok_or(corrupt(Malformed::TooLarge))?;
-        if Some(filter.len())
-            != cb
-                .checked_add(fb)
-                .and_then(|n| n.checked_add(ib))
-                .and_then(|n| n.checked_add(rb))
-        {
+        // The last page read may run on into the hashes: what follows the range filter is cut.
+        let want = usize::try_from(held).map_err(|_| corrupt(Malformed::TooLarge))?;
+        if filter.len() < want {
             return Err(corrupt(Malformed::CountMismatch));
         }
+        filter.truncate(want);
         let (filter_part, rest) = filter.split_at(fb);
         let (count_part, rest) = rest.split_at(cb);
         let (index_part, range_part) = rest.split_at(ib);
@@ -1066,9 +1290,87 @@ impl Branch {
                 index_bytes,
                 range,
                 range_bytes,
+                hashes_bytes,
+                probes: 0,
             },
             at,
         ))
+    }
+}
+
+/// A branch's keys' maplet hashes in ascending order, read from its pages a page at a time: what
+/// a bundle's maplet is merged from without reading the branch's entries (research/38 §5).
+#[derive(Debug)]
+pub struct HashCursor {
+    /// The next page to read, in the branch's pages; the page read; where in it the next hash's
+    /// bytes start; the hashes left.
+    page_no: u64,
+    buf: Vec<u8>,
+    pos: usize,
+    left: u64,
+}
+
+impl Branch {
+    /// A cursor over the branch's maplet hashes.
+    pub fn hashes<F: BlockFile>(&self, store: &Store<F>) -> Result<HashCursor, Error> {
+        let held = self
+            .filter_bytes
+            .checked_add(
+                self.filter_start
+                    .checked_mul(2)
+                    .ok_or(corrupt(Malformed::TooLarge))?,
+            )
+            .and_then(|n| n.checked_add(self.index_bytes))
+            .and_then(|n| n.checked_add(self.range_bytes))
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        let capacity = u64::try_from(store.page_capacity())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        Ok(HashCursor {
+            page_no: self
+                .filter_start
+                .checked_add(held.checked_div(capacity).unwrap_or(0))
+                .ok_or(corrupt(Malformed::TooLarge))?,
+            buf: Vec::new(),
+            pos: usize::try_from(held.checked_rem(capacity).unwrap_or(0)).unwrap_or(0),
+            left: self.hashes_bytes / 4,
+        })
+    }
+}
+
+impl HashCursor {
+    /// The next hash, reading the branch's next page when its bytes run out; none after the last.
+    pub fn next<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        branch: &Branch,
+    ) -> Result<Option<u32>, Error> {
+        if self.left == 0 {
+            return Ok(None);
+        }
+        let mut b = [0u8; 4];
+        for byte in &mut b {
+            if self.pos >= self.buf.len() {
+                // The first read starts mid-page: `pos` already names the offset in it.
+                let skip = if self.buf.is_empty() { self.pos } else { 0 };
+                self.buf.clear();
+                let address = branch.page_address(store, self.page_no)?;
+                store.read_page(address, &mut self.buf)?;
+                self.page_no = self.page_no.saturating_add(1);
+                self.pos = skip;
+                if self.pos >= self.buf.len() {
+                    return Err(corrupt(Malformed::Truncated));
+                }
+            }
+            *byte = self
+                .buf
+                .get(self.pos)
+                .copied()
+                .ok_or(corrupt(Malformed::Truncated))?;
+            self.pos = self.pos.saturating_add(1);
+        }
+        self.left = self.left.saturating_sub(1);
+        Ok(Some(u32::from_le_bytes(b)))
     }
 }
 
@@ -1085,8 +1387,12 @@ pub struct RunCursor {
     loaded: Option<u64>,
     index: usize,
     n: usize,
+    /// The prefix's end and entry table's start, read once when the leaf lands.
+    table: usize,
     page: Vec<u8>,
     span: Span,
+    /// The payload in the span when it was read there; a cache hit uses `page` instead.
+    span_page: Option<std::ops::Range<usize>>,
     key: Vec<u8>,
     /// Where the entry's value lies in the page: read in place, not copied out, since the page
     /// stays until the cursor moves to another.
@@ -1202,7 +1508,7 @@ impl Branch {
         let placed = (|| {
             let page_no = self.leaf_of(from)?;
             c.land(self, store, u64::from(page_no), 0)?;
-            let view = View::new(&c.page)?;
+            let view = View::new(c.page_data()?)?;
             // The first entry at least `from`: the floor if it equals it, else the one after.
             let i = match view.floor(from)? {
                 Some(i) if view.compare(from, i)? == Ordering::Equal => i,
@@ -1235,13 +1541,15 @@ impl Branch {
         let mut c = RunCursor::new(store)?;
         c.page_no = page_no;
         let address = self.page_address(store, page_no)?;
-        store.read_page_ahead(&mut c.span, address, &mut c.page)?;
+        c.span_page = store.read_page_ahead_ref(&mut c.span, address, &mut c.page)?;
         c.loaded = Some(address);
-        let view = View::new(&c.page)?;
+        let view = View::new(c.page_data()?)?;
         if view.kind != LEAF || index >= view.n {
             return Err(corrupt(Malformed::OutOfRange));
         }
-        c.n = view.n;
+        let (n, table) = (view.n, view.table);
+        c.n = n;
+        c.table = table;
         c.index = index;
         c.load()?;
         Ok(c)
@@ -1268,8 +1576,10 @@ impl RunCursor {
             loaded: None,
             index: 0,
             n: 0,
+            table: 0,
             page: store.take_page(),
             span,
+            span_page: None,
             // An entry fits a page, so buffers of a page from the pool never grow.
             key: store.take_page(),
             value: 0..0,
@@ -1300,13 +1610,15 @@ impl RunCursor {
     }
 
     pub fn value(&self) -> &[u8] {
-        self.page.get(self.value.clone()).unwrap_or(&[])
+        self.page_bytes()
+            .and_then(|page| page.get(self.value.clone()))
+            .unwrap_or(&[])
     }
 
     /// In the leaf held: the index of its first entry at least `key` (its entries when none
     /// is), and its entries.
     pub fn page_lower_bound(&self, key: &[u8]) -> Result<(usize, usize), Error> {
-        let view = View::new(&self.page)?;
+        let view = View::new(self.page_data()?)?;
         let i = match view.floor(key)? {
             Some(i) if view.compare(key, i)? == Ordering::Equal => i,
             Some(i) => i.saturating_add(1),
@@ -1377,18 +1689,71 @@ impl RunCursor {
     ) -> Result<(), Error> {
         let address = branch.page_address(store, page)?;
         if self.loaded != Some(address) {
+            self.loaded = None;
+            self.valid = false;
+            self.span_page = None;
             self.page.clear();
-            store.read_page_ahead(&mut self.span, address, &mut self.page)?;
-            let view = View::new(&self.page)?;
+            self.span_page = store.read_page_ahead_ref(&mut self.span, address, &mut self.page)?;
+            let view = View::new(self.page_data()?)?;
             if view.kind != LEAF {
                 return Err(corrupt(Malformed::CountMismatch));
             }
-            self.n = view.n;
+            let (n, table) = (view.n, view.table);
+            self.n = n;
+            self.table = table;
             self.loaded = Some(address);
+            // A compaction's span reads the next extents ahead while this one is merged.
+            let per = u64::from(store.extent_pages());
+            let extent = page.checked_div(per).unwrap_or(0);
+            for k in 1..=u64::try_from(self.span.ahead_extents()).unwrap_or(1) {
+                let next = extent
+                    .checked_add(k)
+                    .and_then(|e| e.checked_mul(per))
+                    .filter(|&p| p < branch.filter_start);
+                let Some(next) = next else {
+                    break;
+                };
+                let ahead = branch.page_address(store, next)?;
+                store.prefetch(&mut self.span, ahead)?;
+            }
         }
         self.page_no = page;
         self.index = index;
         self.load()
+    }
+
+    /// Whether moving to the next entry of `branch` reads no page that has not landed
+    /// ([`Store::ready`]): the next entry is in the leaf held, there is none, or the next leaf
+    /// is held or read ahead.
+    pub fn next_ready<F: BlockFile>(
+        &mut self,
+        branch: &Branch,
+        store: &mut Store<F>,
+    ) -> Result<bool, Error> {
+        if !self.valid || self.index.saturating_add(1) < self.n {
+            return Ok(true);
+        }
+        let Some(page) = self.next_leaf_page(branch)? else {
+            return Ok(true);
+        };
+        let address = branch.page_address(store, page)?;
+        store.ready(&mut self.span, address)
+    }
+
+    /// The page number of the next leaf after the one held, none before the filter's pages.
+    fn next_leaf_page(&self, branch: &Branch) -> Result<Option<u64>, Error> {
+        let mut page = self.page_no;
+        // At most the tree's pages.
+        for _ in 0..=branch.counts.len() {
+            page = page.saturating_add(1);
+            if page >= branch.filter_start {
+                return Ok(None);
+            }
+            if branch.count_of(page)? > 0 {
+                return Ok(Some(page));
+            }
+        }
+        Err(corrupt(Malformed::CountMismatch))
     }
 
     /// The next leaf page after this one: the next page whose entry count is not 0, so index
@@ -1398,30 +1763,44 @@ impl RunCursor {
         branch: &Branch,
         store: &mut Store<F>,
     ) -> Result<(), Error> {
-        let mut page = self.page_no;
-        // At most the tree's pages.
-        for _ in 0..=branch.counts.len() {
-            page = page.saturating_add(1);
-            if page >= branch.filter_start {
+        match self.next_leaf_page(branch)? {
+            Some(page) => self.land(branch, store, page, 0),
+            None => {
                 self.valid = false;
-                return Ok(());
-            }
-            if branch.count_of(page)? > 0 {
-                return self.land(branch, store, page, 0);
+                Ok(())
             }
         }
-        Err(corrupt(Malformed::CountMismatch))
+    }
+
+    fn page_data(&self) -> Result<&[u8], Error> {
+        self.page_bytes().ok_or(corrupt(Malformed::Truncated))
+    }
+
+    fn page_bytes(&self) -> Option<&[u8]> {
+        match &self.span_page {
+            Some(range) => self.span.payload(range),
+            None => Some(&self.page),
+        }
     }
 
     fn load(&mut self) -> Result<(), Error> {
-        let view = View::new(&self.page)?;
-        let (suffix, rest) = view.ranges(self.index)?;
-        let tag = self.page.get(rest.start).copied().unwrap_or(0);
+        let page = match &self.span_page {
+            Some(range) => self
+                .span
+                .payload(range)
+                .ok_or(corrupt(Malformed::Truncated))?,
+            None => self.page.as_slice(),
+        };
+        let (suffix, rest) = entry_ranges(page, LEAF, self.table, self.index)?;
+        let tag = page.get(rest.start).copied().unwrap_or(0);
         self.op = Op::from_byte(tag).ok_or(corrupt(Malformed::UnknownTag(tag)))?;
         self.key.clear();
-        self.key.extend_from_slice(view.prefix);
+        self.key.extend_from_slice(
+            page.get(HEAD..self.table)
+                .ok_or(corrupt(Malformed::Truncated))?,
+        );
         self.key
-            .extend_from_slice(self.page.get(suffix).ok_or(corrupt(Malformed::Truncated))?);
+            .extend_from_slice(page.get(suffix).ok_or(corrupt(Malformed::Truncated))?);
         // The value follows the operation and its 2-byte length.
         let from = rest
             .start

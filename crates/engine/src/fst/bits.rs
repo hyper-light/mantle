@@ -18,7 +18,7 @@ pub const SELECT_SAMPLE: usize = 64;
 
 /// The position of set bit `k` (from 0) of `w`, which has more than `k`: halves of 32, 16 and 8
 /// bits passed by their popcounts, then the byte's bits, at most eight steps.
-fn select_in_word(w: u64, k: usize) -> usize {
+pub(crate) fn select_in_word(w: u64, k: usize) -> usize {
     let mut k = u32::try_from(k).unwrap_or(u32::MAX);
     let mut shift = 0u32;
     for (half, mask) in [(32u32, 0xffff_ffffu64), (16, 0xffff), (8, 0xff)] {
@@ -33,6 +33,45 @@ fn select_in_word(w: u64, k: usize) -> usize {
         byte &= byte.wrapping_sub(1);
     }
     shift.saturating_add(byte.trailing_zeros()) as usize
+}
+
+/// `0x01` in every byte.
+const ONES_STEP_8: u64 = 0x0101_0101_0101_0101;
+/// `0x80` in every byte.
+const MSBS_STEP_8: u64 = 0x80 * ONES_STEP_8;
+
+/// [`select_in_word`] for dense words, as a maplet's metadata is (about 60% ones): Vigna's broadword
+/// select ("Broadword Implementation of Rank/Select Queries", WEA 2008; sux `select64`), byte
+/// counts summed by one multiplication and the byte holding the bit found by one comparison in
+/// every byte at once; the bit within that byte by the same comparison over its bits spread a
+/// byte each, where Vigna reads a 2 KiB table: no branch and no table. A bit-clearing loop in the
+/// byte cost a maplet's dense metadata up to seven mispredicted steps (benches/maplet.rs). The
+/// trie's sparse words keep the halving select, whose early exits measured faster there
+/// (benches/surf.rs: 16-byte keys, point p50 84 ns against 125 with this one).
+pub(crate) fn select_broadword(w: u64, k: usize) -> usize {
+    let k = u64::try_from(k).unwrap_or(u64::MAX).min(63);
+    let nibble_a = 0xA * 0x1111_1111_1111_1111u64;
+    let nibble_3 = 0x3 * 0x1111_1111_1111_1111u64;
+    let mut s = w.wrapping_sub((w & nibble_a) >> 1);
+    s = (s & nibble_3).wrapping_add((s >> 2) & nibble_3);
+    s = s.wrapping_add(s >> 4) & (0xF * ONES_STEP_8);
+    let byte_sums = s.wrapping_mul(ONES_STEP_8);
+    let k_step_8 = k.wrapping_mul(ONES_STEP_8);
+    let geq = (k_step_8 | MSBS_STEP_8).wrapping_sub(byte_sums) & MSBS_STEP_8;
+    let place = geq.count_ones().saturating_mul(8).min(56);
+    let below = (byte_sums << 8).checked_shr(place).unwrap_or(0) & 0xFF;
+    let rank = k.saturating_sub(below).min(7);
+    let byte = w.checked_shr(place).unwrap_or(0) & 0xFF;
+    // The bit within the byte, by the same comparison: the byte's bits spread one to a byte
+    // (byte `i` holding bit `i`), summed by one multiplication, and the bytes whose running count
+    // is at most `rank` counted: that count is the bit's position.
+    let spread = byte.wrapping_mul(ONES_STEP_8) & 0x8040_2010_0804_0201;
+    let low7 = 0x7F * ONES_STEP_8;
+    let flags = ((spread.wrapping_add(low7) | spread) & MSBS_STEP_8) >> 7;
+    let running = flags.wrapping_mul(ONES_STEP_8);
+    let upto = (rank.wrapping_mul(ONES_STEP_8) | MSBS_STEP_8).wrapping_sub(running) & MSBS_STEP_8;
+    let bit = upto.count_ones();
+    usize::try_from(place.saturating_add(bit)).unwrap_or(0)
 }
 
 /// Whether a vector keeps select samples: only LOUDS-Sparse's node starts are selected
@@ -378,6 +417,34 @@ impl Bits {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn both_selects_find_every_set_bit() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut words = vec![
+            0u64,
+            1,
+            u64::MAX,
+            1 << 63,
+            0x8000_0000_0000_0001,
+            0x00FF_00FF_00FF_00FF,
+        ];
+        for _ in 0..2_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            words.push(x);
+            words.push(x & (x >> 3));
+        }
+        for &w in &words {
+            let ones: Vec<usize> = (0..64).filter(|&i| (w >> i) & 1 == 1).collect();
+            for (k, &want) in ones.iter().enumerate() {
+                assert_eq!(super::select_in_word(w, k), want, "{w:#x} k {k}");
+                assert_eq!(super::select_broadword(w, k), want, "{w:#x} k {k}");
+            }
+        }
+    }
+
     use super::*;
 
     fn naive_rank(bits: &[bool], i: usize) -> usize {

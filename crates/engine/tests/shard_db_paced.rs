@@ -182,15 +182,23 @@ fn runs_submitted_to_the_issuer_read_back_and_reopen_whole() {
     let align = Alignment::new(4096).unwrap();
     let file = DeviceFile::open(&path, true, CachingRequest::Buffered, align).unwrap();
     let issuer = Issuer::start(dir.path(), 2).unwrap();
-    let (mut db, oracle) = run_on(file, 0, Some(&issuer), false);
+    // Leaves of more entries than an extent's pages hold: compactions read branches across
+    // extents, the next read ahead through the issuer, and puts step them without waiting on
+    // the device. Every key read exactly between operations regardless.
+    let trunk = TrunkConfig {
+        leaf_entries: 2_048,
+        ..TRUNK
+    };
+    let (mut db, oracle) = run_trunk(file, 0, Some(&issuer), false, 0, trunk);
     let (_, _, io) = db.stats();
     assert!(io.submitted > 0 && io.reads > 0, "{io:?}");
+    assert!(io.prefetches > 0, "{io:?}");
     db.checkpoint(OPS).unwrap();
     let (file, landed) = db.into_file();
     landed.unwrap();
     drop(file);
     let file = DeviceFile::open(&path, false, CachingRequest::Buffered, align).unwrap();
-    let (mut db, applied) = ShardDb::open(file, STORE, MEM, TRUNK).unwrap();
+    let (mut db, applied) = ShardDb::open(file, STORE, MEM, trunk).unwrap();
     assert_eq!(applied, OPS);
     for k in 0..KEYS {
         check(&mut db, &oracle, k);
@@ -346,7 +354,19 @@ fn run_with<F: BlockFile + 'static>(
     idle: bool,
     records: usize,
 ) -> (ShardDb<F>, BTreeMap<u64, Option<Vec<u8>>>) {
-    let mut db = ShardDb::create(file, STORE, MEM, TRUNK).unwrap();
+    run_trunk(file, cache, issuer, idle, records, TRUNK)
+}
+
+/// [`run_with`] with the trunk shaped by `trunk`.
+fn run_trunk<F: BlockFile + 'static>(
+    file: F,
+    cache: usize,
+    issuer: Option<&Issuer>,
+    idle: bool,
+    records: usize,
+    trunk: TrunkConfig,
+) -> (ShardDb<F>, BTreeMap<u64, Option<Vec<u8>>>) {
+    let mut db = ShardDb::create(file, STORE, MEM, trunk).unwrap();
     db.set_cache(cache);
     db.set_record_cache(records);
     // The idle variant asserts views are rebuilt: rebuilt whenever they can be, not as measured
@@ -424,9 +444,15 @@ fn run_with<F: BlockFile + 'static>(
             check(&mut db, &oracle, k);
         }
         // The bundles' REMIX views are built in idle time with the rest, and scans read
-        // bundles through them exactly.
+        // bundles through them exactly; so are their maplets, kept where they measured cheaper
+        // than their filters, and the gets above read every key exactly either way.
         let (_, trunk, _) = db.stats();
         assert!(trunk.views_built > 0, "{trunk:?}");
+        // Each bundle's maplet kept or declined by measured cost, never both nor neither.
+        assert!(
+            trunk.maplets_built + trunk.maplets_declined > 0,
+            "{trunk:?}"
+        );
         for (a, b, limit) in [(0, KEYS - 1, 1), (3, KEYS / 2, 7), (KEYS / 3, KEYS - 1, 64)] {
             check_scan(&mut db, &oracle, a, b, limit);
         }

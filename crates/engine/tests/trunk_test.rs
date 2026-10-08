@@ -104,7 +104,7 @@ proptest! {
 
 fn check_reads(
     store: &mut Store<SimFile>,
-    trunk: &Trunk,
+    trunk: &mut Trunk,
     oracle: &BTreeMap<Vec<u8>, (Op, Vec<u8>)>,
 ) -> Result<(), TestCaseError> {
     let mut value = Vec::new();
@@ -153,19 +153,19 @@ proptest! {
             }
             trunk.add(b.finish(&mut store).unwrap());
             oracle.extend(mem);
-            check_reads(&mut store, &trunk, &oracle)?;
+            check_reads(&mut store, &mut trunk, &oracle)?;
             for _ in 0..*steps {
                 let used = trunk.step(&mut store, *budget).unwrap();
                 // A step merges its whole budget unless the maintenance ran out.
                 prop_assert!(used == *budget || trunk.is_idle(), "{} of {}", used, budget);
-                check_reads(&mut store, &trunk, &oracle)?;
+                check_reads(&mut store, &mut trunk, &oracle)?;
             }
         }
         trunk.drain(&mut store).unwrap();
         prop_assert!(trunk.is_idle());
         prop_assert_eq!(trunk.debt(), 0);
         check_refs(&store, &trunk);
-        check_reads(&mut store, &trunk, &oracle)?;
+        check_reads(&mut store, &mut trunk, &oracle)?;
     }
 }
 
@@ -201,7 +201,7 @@ fn reads_are_exact_after_every_single_key_step_through_splits() {
         oracle.extend(mem);
         while !trunk.is_idle() {
             trunk.step(&mut store, 1).unwrap();
-            check_reads(&mut store, &trunk, &oracle).unwrap();
+            check_reads(&mut store, &mut trunk, &oracle).unwrap();
         }
     }
     assert!(trunk.stats().splits > 4, "{:?}", trunk.stats());

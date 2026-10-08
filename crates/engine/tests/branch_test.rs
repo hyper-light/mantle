@@ -299,3 +299,81 @@ mod cursor_and_merge {
         }
     }
 }
+
+#[test]
+fn a_branch_keeps_its_keys_sorted_maplet_hashes_after_its_range_filter() {
+    // Enough keys that the hashes start mid-page and cross several page ends.
+    let mut s = store(91);
+    let entries: BTreeMap<Vec<u8>, (Op, Vec<u8>)> = (0..20_000u32)
+        .map(|i| (format!("key{i:08}").into_bytes(), (Op::Put, vec![7; 20])))
+        .collect();
+    let branch = build(&mut s, &entries);
+    let mut want: Vec<u32> = entries
+        .keys()
+        .map(|k| mantle_engine::maplet::hash32(mantle_engine::branch::filter::hash(k)))
+        .collect();
+    want.sort_unstable();
+    assert_eq!(branch.hashes_bytes, want.len() as u64 * 4);
+    let mut cursor = branch.hashes(&s).unwrap();
+    let mut got = Vec::new();
+    while let Some(h) = cursor.next(&mut s, &branch).unwrap() {
+        got.push(h);
+    }
+    assert_eq!(got, want);
+    // The descriptor round-trips, the hashes left on the device.
+    let mut desc = Vec::new();
+    branch.encode(&mut desc).unwrap();
+    let (back, used) = Branch::decode(&mut s, &desc).unwrap();
+    assert_eq!(used, desc.len());
+    assert_eq!(back, branch);
+    check(&mut s, &back, &entries);
+    // Written a page a call, the sort paced over the pages before the hashes: the same hashes.
+    let mut s = store(92);
+    let mut b = Builder::new(&mut s, Keys::Exactly(entries.len() as u64)).unwrap();
+    for (k, (op, v)) in &entries {
+        b.add(&mut s, k, *op, v).unwrap();
+    }
+    b.seal(&mut s).unwrap();
+    while !b.write_filter(&mut s, 1).unwrap() {}
+    let paced = b.into_branch(&mut s).unwrap();
+    let mut cursor = paced.hashes(&s).unwrap();
+    let mut got = Vec::new();
+    while let Some(h) = cursor.next(&mut s, &paced).unwrap() {
+        got.push(h);
+    }
+    assert_eq!(got, want);
+}
+
+#[test]
+fn successive_branches_of_different_sizes_keep_only_their_own_hashes() {
+    let mut s = store(93);
+    for n in [2048u32, 1, 4097, 17] {
+        let entries: BTreeMap<Vec<u8>, (Op, Vec<u8>)> = (0..n)
+            .map(|i| {
+                (
+                    format!("branch{n:08}/key{i:08}").into_bytes(),
+                    (Op::Put, vec![7; 20]),
+                )
+            })
+            .collect();
+        let mut builder = Builder::new(&mut s, Keys::Exactly(u64::from(n))).unwrap();
+        for (key, (op, value)) in &entries {
+            builder.add(&mut s, key, *op, value).unwrap();
+        }
+        builder.seal(&mut s).unwrap();
+        while !builder.write_filter(&mut s, 1).unwrap() {}
+        let branch = builder.into_branch(&mut s).unwrap();
+        let mut want: Vec<u32> = entries
+            .keys()
+            .map(|key| mantle_engine::maplet::hash32(mantle_engine::branch::filter::hash(key)))
+            .collect();
+        want.sort_unstable();
+        let mut cursor = branch.hashes(&s).unwrap();
+        let mut got = Vec::new();
+        while let Some(hash) = cursor.next(&mut s, &branch).unwrap() {
+            got.push(hash);
+        }
+        assert_eq!(got, want);
+        check(&mut s, &branch, &entries);
+    }
+}

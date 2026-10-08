@@ -97,6 +97,26 @@ impl Merge {
         });
     }
 
+    /// Whether moving past the current key reads no page that has not landed: every cursor
+    /// holding it either stays in its leaf or has its next leaf ready ([`RunCursor::next_ready`]).
+    pub fn ready<'a, F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        branches: impl IntoIterator<Item = &'a Branch>,
+    ) -> Result<bool, Error> {
+        let Some(at) = self.current.and_then(|i| self.cursors.get(i)) else {
+            return Ok(true);
+        };
+        self.past.clear();
+        self.past.extend_from_slice(at.key());
+        for (c, b) in self.cursors.iter_mut().zip(branches) {
+            if c.valid() && c.key() == self.past.as_slice() && !c.next_ready(b, store)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// The current entry: key, operation, value.
     pub fn entry(&self) -> Option<(&[u8], Op, &[u8])> {
         self.current
@@ -149,6 +169,10 @@ pub struct Compaction {
     /// Input entries not yet merged, at most: the inputs' counts less those consumed (a range
     /// narrower than a branch leaves some never reached).
     remaining: u64,
+    /// Whether a step stops when an input's next page has not landed ([`Self::set_yield`]),
+    /// and whether the last step did.
+    yield_io: bool,
+    waiting: bool,
 }
 
 impl Compaction {
@@ -179,7 +203,21 @@ impl Compaction {
             closing: std::collections::VecDeque::new(),
             out: Vec::new(),
             remaining,
+            yield_io: false,
+            waiting: false,
         })
+    }
+
+    /// Whether a step stops, rather than wait, when an input's next page has not landed from
+    /// the device ([`Store::ready`]): for a step a put paces, which the device's latency must
+    /// not hold. Steps of idle time and of a stall wait, and always finish their budget.
+    pub fn set_yield(&mut self, on: bool) {
+        self.yield_io = on;
+    }
+
+    /// Whether the last step stopped for a page still being read.
+    pub fn waiting(&self) -> bool {
+        self.waiting
     }
 
     /// Input entries left to merge, at most.
@@ -196,7 +234,8 @@ impl Compaction {
     /// Works for up to `budget`: the filter pages of branches already sealed first, each at its
     /// worth in keys ([`Builder::page_keys`]), then keys merged; a part that reaches its size, or
     /// the last once the merge is done, is sealed and its filter's pages wait their turn. Returns
-    /// the budget used, less than `budget` only once the compaction is done.
+    /// the budget used, less than `budget` only once the compaction is done or, when it yields
+    /// ([`Self::set_yield`]), stopped for a page still being read ([`Self::waiting`]).
     pub fn step<'a, F: BlockFile, I>(
         &mut self,
         store: &mut Store<F>,
@@ -222,6 +261,7 @@ impl Compaction {
             });
         }
         let mut done = 0u64;
+        self.waiting = false;
         while done < budget {
             if let Some((_, b)) = self.closing.front_mut() {
                 let keys = b.page_keys();
@@ -238,6 +278,10 @@ impl Compaction {
                     self.out.push((first, b.into_branch(store)?));
                 }
                 continue;
+            }
+            if self.yield_io && !self.merge.ready(store, inputs.clone())? {
+                self.waiting = true;
+                break;
             }
             let Self {
                 merge,

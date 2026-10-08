@@ -642,6 +642,75 @@ impl HashMem {
         self.start_sort();
     }
 
+    /// Whether a walk merges more than one run, or order work is open: what idle time tidies
+    /// ([`Self::tidy`]).
+    pub fn untidy(&self) -> bool {
+        self.runs.len() > 1
+            || !self.tail.is_empty()
+            || self.sort.is_some()
+            || !self.merges.is_empty()
+    }
+
+    /// Up to `budget` entries of idle order work: what is owed, then the tail sorted, then the
+    /// two smallest runs merged, until one run holds every entry and a seek searches one. Runs
+    /// of different levels are never merged as puts pay (the counter merges a level's two), so
+    /// a memtable filled alone holds a run a halving of its room; idle time merges them, the
+    /// smallest first, at no put's cost. Returns the work done, at least one while untidy.
+    pub fn tidy(&mut self, budget: usize) -> usize {
+        if self.sort.is_none() && self.merges.is_empty() {
+            if !self.tail.is_empty() {
+                self.start_sort();
+            } else if self.runs.len() > 1 {
+                self.merge_smallest();
+            } else {
+                return 0;
+            }
+        }
+        self.pay(budget).max(1)
+    }
+
+    /// Starts a merge of the two smallest runs, whatever their levels.
+    fn merge_smallest(&mut self) {
+        let mut order: [Option<(usize, usize)>; 2] = [None, None];
+        for (i, r) in self.runs.iter().enumerate() {
+            let n = r.keys.len();
+            match order {
+                [None, _] => order[0] = Some((i, n)),
+                [Some((_, a)), None] if n < a => order = [Some((i, n)), order[0]],
+                [Some(_), None] => order[1] = Some((i, n)),
+                [Some((_, a)), Some(_)] if n < a => order = [Some((i, n)), order[0]],
+                [Some(_), Some((_, b))] if n < b => order[1] = Some((i, n)),
+                _ => {}
+            }
+        }
+        let [Some((x, _)), Some((y, _))] = order else {
+            return;
+        };
+        let (lo, hi) = (x.min(y), x.max(y));
+        let b = self.runs.remove(hi);
+        let a = self.runs.remove(lo);
+        let need = a.keys.len().saturating_add(b.keys.len());
+        let mut keys = if self.spare.capacity() >= need {
+            std::mem::take(&mut self.spare)
+        } else {
+            Vec::with_capacity(need)
+        };
+        keys.clear();
+        let out = Run {
+            skip: a.skip.min(b.skip),
+            keys,
+        };
+        let level = level(a.keys.len().max(b.keys.len()));
+        self.merges.push(Merge {
+            a,
+            b,
+            i: 0,
+            j: 0,
+            out,
+            level,
+        });
+    }
+
     /// Whether a sort is in progress.
     pub fn sorting(&self) -> bool {
         self.sort.is_some()
@@ -1359,6 +1428,43 @@ mod tests {
                 m.sources().count()
             );
         }
+    }
+
+    #[test]
+    fn idle_tidying_leaves_one_run_holding_every_entry() {
+        // Runs of every size, as a memtable filled alone leaves them, and a tail: tidied in
+        // slices, one run is left, walked in order with the newest of each key.
+        let mut m = HashMem::new(1 << 22).unwrap();
+        let mut want: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        for round in 0..12u32 {
+            for _ in 0..(1u32 << round.min(9)) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % 5_000).to_be_bytes();
+                m.insert(&k, Op::Put, &round.to_le_bytes()).unwrap();
+                want.insert(k.to_vec(), round.to_le_bytes().to_vec());
+            }
+            m.seal();
+        }
+        m.insert(b"tail", Op::Put, b"t").unwrap();
+        want.insert(b"tail".to_vec(), b"t".to_vec());
+        assert!(m.untidy());
+        let mut slices = 0;
+        while m.untidy() {
+            assert!(m.tidy(5) >= 1);
+            slices += 1;
+            assert!(slices < 1_000_000);
+        }
+        assert_eq!(m.sources().count(), 1);
+        let mut walked = Vec::new();
+        m.walk(|k, _, v| {
+            walked.push((k.to_vec(), v.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(walked, want.into_iter().collect::<Vec<_>>());
     }
 
     #[test]

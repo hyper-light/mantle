@@ -1193,6 +1193,7 @@ impl<F: BlockFile> ShardDb<F> {
             || self.trunk.debt() > 0
             || self.trunk.views_owed()
             || self.trunk.maplets_owed()
+            || self.mem.untidy()
             || self.store.forget_debt() > 0
     }
 
@@ -1219,6 +1220,11 @@ impl<F: BlockFile> ShardDb<F> {
         }
         if self.trunk.maplets_owed() {
             return self.trunk.maplet_step(&mut self.store, keys);
+        }
+        if self.mem.untidy() {
+            // The active memtable's runs merged to one, so a seek searches one.
+            let budget = usize::try_from(keys).unwrap_or(usize::MAX);
+            return Ok(u64::try_from(self.mem.tidy(budget)).unwrap_or(u64::MAX));
         }
         Ok(self.store.forget_some(keys))
     }
@@ -1334,6 +1340,12 @@ impl<F: BlockFile> ShardDb<F> {
             let done = self
                 .trunk
                 .maplet_step(&mut self.store, budget.saturating_sub(used))?;
+            used = used.saturating_add(done.max(1));
+        }
+        // Then the active memtable's runs merged to one, each step at least one unit while owed.
+        while used < budget && self.mem.untidy() {
+            let left = usize::try_from(budget.saturating_sub(used)).unwrap_or(usize::MAX);
+            let done = u64::try_from(self.mem.tidy(left)).unwrap_or(u64::MAX);
             used = used.saturating_add(done.max(1));
         }
         // Then the cache's freed pages, at most the budget left.

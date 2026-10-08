@@ -180,15 +180,26 @@ fn main() {
     let t = Instant::now();
     for _ in 0..num {
         let k = key(rng.next() % num);
-        let before = attribute.then(|| db.stats());
+        // The page faults and context switches each put is charged, read beside it: two calls a
+        // put more, made only when attributing.
+        let before = attribute.then(|| {
+            (
+                db.stats(),
+                faults::read().unwrap(),
+                faults::switches().unwrap(),
+            )
+        });
         let o = Instant::now();
         db.put(&k, &value).unwrap();
         let ns = o.elapsed().as_nanos() as u64;
         lat.push(ns);
-        if let Some(b) = before
+        if let Some((b, f, w)) = before
             && slow.wants(ns)
         {
-            slow.push(Slow::of(ns, b, db.stats()));
+            let mut e = Slow::of(ns, b, db.stats());
+            e.faults = faults::read().unwrap().since(&f).total();
+            e.switches = faults::switches().unwrap() - w;
+            slow.push(e);
         }
     }
     let s = t.elapsed().as_secs_f64();
@@ -615,6 +626,9 @@ struct Slow {
     order_ns: u64,
     retire_ns: u64,
     rotated: bool,
+    /// The process's page faults and context switches meanwhile (puts in the fill only).
+    faults: u64,
+    switches: u64,
 }
 
 impl Slow {
@@ -640,6 +654,8 @@ impl Slow {
             order_ns: f1.order_ns - f0.order_ns,
             retire_ns: f1.retire_ns - f0.retire_ns,
             rotated: f1.rotations != f0.rotations,
+            faults: 0,
+            switches: 0,
         }
     }
 }
@@ -676,6 +692,21 @@ fn attribute_tail(lat: &[u64], rec: &mut Recorder<Slow>) {
             s.wait_ns as f64 / 1000.0,
             s.ahead_ns as f64 / 1000.0,
             s.rotated,
+        );
+    }
+    // The operations whose memtable order work took longest, with their whole time.
+    let mut by_order: Vec<&Slow> = slow.iter().filter(|s| s.order_ns > 0).collect();
+    by_order.sort_unstable_by_key(|s| std::cmp::Reverse(s.order_ns));
+    for s in by_order.iter().take(5) {
+        println!(
+            "most memtable order {:.2} us of {:.2} us (insert {:.2}, pack {:.2}, trunk {:.2}) faults {} switches {}",
+            s.order_ns as f64 / 1000.0,
+            s.ns as f64 / 1000.0,
+            s.insert_ns as f64 / 1000.0,
+            s.pack_ns as f64 / 1000.0,
+            s.trunk_ns as f64 / 1000.0,
+            s.faults,
+            s.switches,
         );
     }
     let mut sorted = lat.to_vec();
@@ -745,6 +776,13 @@ fn breakdown(name: &str, part: &str, set: &[&Slow], band_lo: u64, band_hi: u64) 
         set.iter().filter(|s| s.reads > 0).count(),
         set.iter().filter(|s| s.writes == 0 && s.reads == 0).count(),
         set.iter().filter(|s| s.rotated).count(),
+    );
+    println!(
+        "tail {name} {part} charged: a page fault {} (faults {}), a context switch {} (switches {})",
+        set.iter().filter(|s| s.faults > 0).count(),
+        set.iter().map(|s| s.faults).sum::<u64>(),
+        set.iter().filter(|s| s.switches > 0).count(),
+        set.iter().map(|s| s.switches).sum::<u64>(),
     );
     println!(
         "tail {name} {part} work: planning compactions {:.2} us, finishing them {:.2} us, finishing packed memtables {:.2} us, merging and packing the rest {:.2} us; queueing written pages {:.2} us (waiting for a run {:.2}), reading pages ahead {:.2} us",

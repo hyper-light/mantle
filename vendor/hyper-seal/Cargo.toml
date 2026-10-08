@@ -11,8 +11,10 @@ rust-version = "1.98"
 [dependencies]
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 getrandom = "0.4"
-# The device a sealed file is written and read through (`sealed_file`).
-hyper-block = { path = "../hyper-block" }
+# The device a sealed file is written and read through (`sealed_file`), only with the `files`
+# feature: hyper-block opens and writes files, and a consumer that confines file writes to one crate
+# (slates' land) takes hyper-seal's keys, log sealing and STREAM primitives without it.
+hyper-block = { path = "../hyper-block", optional = true }
 thiserror = "2.0"
 
 [target.'cfg(unix)'.dependencies]
@@ -27,6 +29,10 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Network
 hyper-block = { path = "../hyper-block", features = ["sim"] }
 hyper-measure = { path = "../hyper-measure" }
 tempfile = "3.20"
+
+[features]
+# A whole file sealed through a `hyper_block::block::BlockFile` (`sealed_file`).
+files = ["dep:hyper-block"]
 
 # A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside any consumer workspace.
 [workspace]

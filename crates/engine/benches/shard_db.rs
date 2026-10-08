@@ -211,7 +211,7 @@ fn main() {
     let (f, t, io) = db.stats();
     let user = num * (16 + 100);
     println!(
-        "fill flushes {} pack {:.2}s (max slice {:.2}ms, most entries a put {}) trunk {:.2}s (max slice {:.2}ms, most keys a put {}) stalls {} ({:.2}s, max {:.2}ms)",
+        "fill flushes {} pack {:.2}s (max slice {:.2}ms, most entries a put {}) trunk {:.2}s (max slice {:.2}ms, most keys a put {}) stalls {} ({:.2}s, max {:.2}ms) waited steps {}",
         f.flushes,
         f.pack_ns as f64 / 1e9,
         f.pack_max_ns as f64 / 1e6,
@@ -221,7 +221,8 @@ fn main() {
         f.trunk_share_most,
         f.stalls,
         f.stall_ns as f64 / 1e9,
-        f.stall_max_ns as f64 / 1e6
+        f.stall_max_ns as f64 / 1e6,
+        f.waited_steps
     );
     println!(
         "fill trunk pivot_compactions {} leaf_compactions {} flushes {} splits {} entries_written {} ({:.2}x the puts)",

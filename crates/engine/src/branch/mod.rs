@@ -214,11 +214,8 @@ impl Page {
             .checked_add(rest)
     }
 
-    fn push(&mut self, key: &[u8], rest: &[u8], under: u64) {
-        self.prefix = match self.key_ends.first() {
-            None => key.len(),
-            Some(_) => self.prefix.min(shared(self.key(0), key)),
-        };
+    fn push(&mut self, key: &[u8], rest: &[u8], under: u64, prefix: usize) {
+        self.prefix = prefix;
         self.keys.extend_from_slice(key);
         self.key_ends.push(self.keys.len());
         self.rests.extend_from_slice(rest);
@@ -500,6 +497,29 @@ impl Builder {
         op: Op,
         value: &[u8],
     ) -> Result<(), Error> {
+        self.add_inner(store, key, op, value, None)
+    }
+
+    /// A packed memtable's entry, whose filter hash was computed when it was written.
+    pub(crate) fn add_hashed<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        key: &[u8],
+        op: Op,
+        value: &[u8],
+        hash32: u32,
+    ) -> Result<(), Error> {
+        self.add_inner(store, key, op, value, Some(hash32))
+    }
+
+    fn add_inner<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        key: &[u8],
+        op: Op,
+        value: &[u8],
+        hash32: Option<u32>,
+    ) -> Result<(), Error> {
         if self.sealed.is_some() {
             return Err(Error::InvalidArgument {
                 what: "an entry added to a sealed branch",
@@ -525,9 +545,9 @@ impl Builder {
         self.last.clear();
         self.last.extend_from_slice(key);
         self.count = self.count.saturating_add(1);
-        let h = filter::hash(key);
-        self.filter.insert(h);
-        let h32 = crate::maplet::hash32(h);
+        let h32 = hash32.unwrap_or_else(|| crate::maplet::hash32(filter::hash(key)));
+        // The Bloom filter's block and probes, and the maplet hash, use these high bits alone.
+        self.filter.insert(u64::from(h32) << u32::BITS);
         self.hashes.push(h32);
         // Scatter scratch is initialized as keys arrive, one entry a key. A recycled
         // buffer's old entries need no clearing, and the seal initializes none.
@@ -552,7 +572,7 @@ impl Builder {
         under: u64,
     ) -> Result<(), Error> {
         let page = self.levels.get(level).ok_or(corrupt(Malformed::TooLarge))?;
-        let prefix = if page.len() == 0 {
+        let mut prefix = if page.len() == 0 {
             key.len()
         } else {
             page.prefix.min(shared(page.key(0), key))
@@ -562,11 +582,12 @@ impl Builder {
             .ok_or(corrupt(Malformed::TooLarge))?;
         if size > self.capacity && page.len() > 0 {
             self.write(store, level)?;
+            prefix = key.len();
         }
         self.levels
             .get_mut(level)
             .ok_or(corrupt(Malformed::TooLarge))?
-            .push(key, rest, under);
+            .push(key, rest, under, prefix);
         Ok(())
     }
 

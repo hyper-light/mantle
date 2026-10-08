@@ -48,11 +48,12 @@ fn corrupt() -> Error {
 }
 
 /// An entry as order work moves it: eight bytes of its key from its run's skip, beside its
-/// offset in the arena.
+/// offset in the arena and the high bits of its filter hash, for packing.
 #[derive(Clone, Copy, Debug, Default)]
 struct Keyed {
     prefix: u64,
     entry: u32,
+    hash32: u32,
 }
 
 /// Eight bytes of `key` from `skip`, big-endian, zero past its end. Of two keys that share their
@@ -539,6 +540,7 @@ impl HashMem {
         self.tail.push(Keyed {
             prefix: prefix(key, self.skip),
             entry,
+            hash32: crate::maplet::hash32(h),
         });
         Ok(())
     }
@@ -1097,6 +1099,16 @@ impl HashMem {
         limit: usize,
         mut each: impl FnMut(&[u8], Op, &[u8]) -> Result<(), Error>,
     ) -> Result<usize, Error> {
+        self.walk_some_hashed(walk, limit, |key, op, value, _| each(key, op, value))
+    }
+
+    /// The shard's packing walk, with the high bits of each entry's hash from its insert.
+    pub(crate) fn walk_some_hashed(
+        &self,
+        walk: &mut Walk,
+        limit: usize,
+        mut each: impl FnMut(&[u8], Op, &[u8], u32) -> Result<(), Error>,
+    ) -> Result<usize, Error> {
         let mut visited = 0usize;
         while visited < limit {
             // The least key among the runs' next entries, and its newest entry: every run's
@@ -1116,7 +1128,7 @@ impl HashMem {
                 self.advance(walk);
             }
             let (key, op, v) = self.read(e.entry)?;
-            each(key, op, v)?;
+            each(key, op, v, e.hash32)?;
             visited = visited.saturating_add(1);
         }
         Ok(visited)
@@ -1235,8 +1247,10 @@ fn sort_step(arena: &[u8], s: &mut Sort, budget: usize) -> (bool, usize) {
                 let last = s.kept.checked_sub(1).and_then(|l| s.src.get(l).copied());
                 match last {
                     Some(l) if cmp(arena, l, s.skip, e, s.skip) == Ordering::Equal => {
-                        if let Some(l) = s.kept.checked_sub(1).and_then(|l| s.src.get_mut(l)) {
-                            l.entry = l.entry.max(e.entry);
+                        if let Some(l) = s.kept.checked_sub(1).and_then(|l| s.src.get_mut(l))
+                            && e.entry > l.entry
+                        {
+                            *l = e;
                         }
                     }
                     _ => {

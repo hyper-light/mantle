@@ -250,6 +250,56 @@ fn a_record_read_then_rewritten_and_flushed_reads_its_new_version() {
 }
 
 #[test]
+fn rewritten_keys_of_different_prefixes_read_back_after_reopen() {
+    let align = Alignment::new(4096).unwrap();
+    let file = SimFile::new(align, Alignment::new(512).unwrap(), 41).unwrap();
+    let mut db = ShardDb::create(file, STORE, MEM, TRUNK).unwrap();
+    let mut keys: Vec<Vec<u8>> = (0..384u32)
+        .map(|i| {
+            let mut key = match i % 3 {
+                0 => b"bucket/a-long-shared-prefix/".to_vec(),
+                1 => b"b/".to_vec(),
+                _ => vec![0xff, 0, 0x80],
+            };
+            key.extend_from_slice(&i.to_be_bytes());
+            key
+        })
+        .collect();
+    keys.push(Vec::new());
+    let mut want = BTreeMap::new();
+    // More data than the memtable holds: rewrites meet sorting, rotation and compaction.
+    for version in 0..4u8 {
+        for (i, key) in keys.iter().enumerate() {
+            db.put(key, &[version; 96]).unwrap();
+            let value = vec![version + 1; 96];
+            db.put(key, &value).unwrap();
+            if version == 3 && i % 7 == 0 {
+                db.delete(key).unwrap();
+                want.remove(key);
+            } else {
+                want.insert(key.clone(), value);
+            }
+        }
+    }
+    db.checkpoint(4).unwrap();
+    let (file, landed) = db.into_file();
+    landed.unwrap();
+    let (mut db, applied) = ShardDb::open(file, STORE, MEM, TRUNK).unwrap();
+    assert_eq!(applied, 4);
+    let mut value = Vec::new();
+    for key in &keys {
+        let found = db.get(key, &mut value).unwrap();
+        match want.get(key) {
+            Some(expected) => {
+                assert!(found, "key {key:?}");
+                assert_eq!(&value, expected, "key {key:?}");
+            }
+            None => assert!(!found, "deleted key {key:?}"),
+        }
+    }
+}
+
+#[test]
 fn memory_moving_between_regions_never_holds_more_than_the_budget() {
     // A shard under a memory budget, filled, then read with a skew that makes the tuner move
     // memory from the page cache to the record cache and back as the phases change. The page

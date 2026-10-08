@@ -218,7 +218,7 @@ fn main() {
         t.entries_written as f64 / num as f64
     );
     println!(
-        "fill io evict_steps_most {} submitted {} queued {} (most {}) write_waits {} ({:.2}s) span_cache_hits {} reads {} pages_read {} ({:.2}s) writes {} ({:.2}s) pages_written {} ({:.2} GB, write amplification {:.2}) syncs {}",
+        "fill io evict_steps_most {} submitted {} queued {} (most {}) write_waits {} ({:.2}s) span_cache_hits {} reads {} pages_read {} ({:.2}s) writes {} ({:.2}s) pages_written {} ({:.2} GB, write amplification {:.2}) syncs {} prefetches {} prefetch_waits {}",
         io.cache_evict_steps_most,
         io.submitted,
         io.runs_queued,
@@ -234,7 +234,9 @@ fn main() {
         io.pages_written,
         io.pages_written as f64 * 4096.0 / 1e9,
         io.pages_written as f64 * 4096.0 / user as f64,
-        io.syncs
+        io.syncs,
+        io.prefetches,
+        io.prefetch_waits
     );
     println!(
         "fillrandom {num} {:.0} {:.3}",

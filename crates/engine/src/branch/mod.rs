@@ -1673,10 +1673,58 @@ impl RunCursor {
             }
             self.n = view.n;
             self.loaded = Some(address);
+            // A compaction's span reads the next extents ahead while this one is merged.
+            let per = u64::from(store.extent_pages());
+            let extent = page.checked_div(per).unwrap_or(0);
+            for k in 1..=u64::try_from(self.span.ahead_extents()).unwrap_or(1) {
+                let next = extent
+                    .checked_add(k)
+                    .and_then(|e| e.checked_mul(per))
+                    .filter(|&p| p < branch.filter_start);
+                let Some(next) = next else {
+                    break;
+                };
+                let ahead = branch.page_address(store, next)?;
+                store.prefetch(&mut self.span, ahead)?;
+            }
         }
         self.page_no = page;
         self.index = index;
         self.load()
+    }
+
+    /// Whether moving to the next entry of `branch` reads no page that has not landed
+    /// ([`Store::ready`]): the next entry is in the leaf held, there is none, or the next leaf
+    /// is held or read ahead.
+    pub fn next_ready<F: BlockFile>(
+        &mut self,
+        branch: &Branch,
+        store: &mut Store<F>,
+    ) -> Result<bool, Error> {
+        if !self.valid || self.index.saturating_add(1) < self.n {
+            return Ok(true);
+        }
+        let Some(page) = self.next_leaf_page(branch)? else {
+            return Ok(true);
+        };
+        let address = branch.page_address(store, page)?;
+        store.ready(&mut self.span, address)
+    }
+
+    /// The page number of the next leaf after the one held, none before the filter's pages.
+    fn next_leaf_page(&self, branch: &Branch) -> Result<Option<u64>, Error> {
+        let mut page = self.page_no;
+        // At most the tree's pages.
+        for _ in 0..=branch.counts.len() {
+            page = page.saturating_add(1);
+            if page >= branch.filter_start {
+                return Ok(None);
+            }
+            if branch.count_of(page)? > 0 {
+                return Ok(Some(page));
+            }
+        }
+        Err(corrupt(Malformed::CountMismatch))
     }
 
     /// The next leaf page after this one: the next page whose entry count is not 0, so index
@@ -1686,19 +1734,13 @@ impl RunCursor {
         branch: &Branch,
         store: &mut Store<F>,
     ) -> Result<(), Error> {
-        let mut page = self.page_no;
-        // At most the tree's pages.
-        for _ in 0..=branch.counts.len() {
-            page = page.saturating_add(1);
-            if page >= branch.filter_start {
+        match self.next_leaf_page(branch)? {
+            Some(page) => self.land(branch, store, page, 0),
+            None => {
                 self.valid = false;
-                return Ok(());
-            }
-            if branch.count_of(page)? > 0 {
-                return self.land(branch, store, page, 0);
+                Ok(())
             }
         }
-        Err(corrupt(Malformed::CountMismatch))
     }
 
     fn load(&mut self) -> Result<(), Error> {

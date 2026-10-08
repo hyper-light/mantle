@@ -241,6 +241,10 @@ pub struct Trunk {
     returned: Option<Vec<(Vec<u8>, usize)>>,
     /// Whether compactions' planning and finishing are timed ([`Trunk::set_timed`]).
     timed: bool,
+    /// Whether compactions stop for pages still being read ([`Self::step_paced`]), and whether
+    /// one did in the run in progress.
+    yield_io: bool,
+    io_waiting: bool,
     /// The REMIX view being built, for the pivot it names ([`Trunk::view_step`]).
     view_job: Option<ViewJob>,
     view_costs: ViewCosts,
@@ -590,6 +594,8 @@ impl Trunk {
             cascade: Vec::new(),
             returned: None,
             timed: false,
+            yield_io: false,
+            io_waiting: false,
             view_job: None,
             view_costs: ViewCosts::default(),
             view_choice: ViewChoice::Measured,
@@ -934,6 +940,21 @@ impl Trunk {
         self.views_unchecked = self.nodes.len();
         self.maplets_unchecked = self.nodes.len();
         self.run(store, budget, true)
+    }
+
+    /// [`Self::step`] for a put's share: a compaction whose next input page has not landed
+    /// stops rather than wait for the device, and the step ends there, its budget unspent and
+    /// still owed ([`Self::debt`]). The page was handed to the device's issuer, so a later step
+    /// finds it read; a stall's [`Self::finish_cascade`] and idle [`Self::step`]s wait.
+    pub fn step_paced<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        budget: u64,
+    ) -> Result<u64, Error> {
+        self.yield_io = true;
+        let used = self.step(store, budget);
+        self.yield_io = false;
+        used
     }
 
     /// Runs the cascade in progress to its end, starting none: the pending branches then enter
@@ -1320,6 +1341,7 @@ impl Trunk {
         start: bool,
     ) -> Result<u64, Error> {
         let mut used = 0u64;
+        self.io_waiting = false;
         // A finished frame's result is taken by the frame above it in the same step, at no
         // cost to the budget: a settled or split node's new siblings are reachable only once
         // its parent splices them in, and a step ending between the two left keys a read could
@@ -1341,6 +1363,9 @@ impl Trunk {
                 continue;
             };
             used = used.saturating_add(self.advance(store, frame, budget.saturating_sub(used))?);
+            if self.io_waiting {
+                break;
+            }
             if self.cascade.is_empty()
                 && let Some(parts) = self.returned.take()
             {
@@ -1392,7 +1417,9 @@ impl Trunk {
                 let node = self.node(n)?;
                 let start = node.pivots.get(i).ok_or(corrupt())?.start;
                 let live = node.inflight.get(start..covered).ok_or(corrupt())?;
+                c.set_yield(self.yield_io);
                 let used = c.step(store, live.iter().rev().flatten(), budget)?;
+                self.io_waiting |= c.waiting();
                 if c.is_done() {
                     let t = self.timed.then(std::time::Instant::now);
                     self.apply_pivot(store, n, i, c, covered)?;
@@ -1431,7 +1458,9 @@ impl Trunk {
                     .ok_or(corrupt())?
                     .bundle
                     .branches();
+                c.set_yield(self.yield_io);
                 let used = c.step(store, bundle, budget)?;
+                self.io_waiting |= c.waiting();
                 if c.is_done() {
                     let t = self.timed.then(std::time::Instant::now);
                     let parts = c.finish(store)?;
@@ -1756,6 +1785,8 @@ impl Trunk {
             cascade: Vec::new(),
             returned: None,
             timed: false,
+            yield_io: false,
+            io_waiting: false,
             view_job: None,
             view_costs: ViewCosts::default(),
             view_choice: ViewChoice::Measured,

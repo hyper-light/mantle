@@ -1042,14 +1042,24 @@ impl<'a> View<'a> {
     /// below it is below every entry, one above it past every entry. Then a binary search over
     /// the heads, reading an entry only where its head ties the key's.
     fn floor(&self, key: &[u8]) -> Result<Option<usize>, Error> {
+        Ok(self.bound(key, true)?.checked_sub(1))
+    }
+
+    /// The first entry at least `key`, or the page's entry count past its last.
+    fn lower_bound(&self, key: &[u8]) -> Result<usize, Error> {
+        self.bound(key, false)
+    }
+
+    /// A boundary by halving, passing entries equal to `key` only for an upper bound.
+    fn bound(&self, key: &[u8], upper: bool) -> Result<usize, Error> {
         let p = self.prefix.len();
         let suffix = match key.get(..p.min(key.len())).unwrap_or(key).cmp(self.prefix) {
-            Ordering::Less => return Ok(None),
-            Ordering::Greater => return Ok(self.n.checked_sub(1)),
+            Ordering::Less => return Ok(0),
+            Ordering::Greater => return Ok(self.n),
             Ordering::Equal => match key.get(p..) {
                 Some(s) => s,
                 // The key is a proper prefix of the page's prefix: below every entry.
-                None => return Ok(None),
+                None => return Ok(0),
             },
         };
         let kh = key_head(suffix);
@@ -1060,13 +1070,13 @@ impl<'a> View<'a> {
                 Ordering::Equal => suffix.cmp(self.entry(mid)?.0),
                 other => other,
             };
-            if order == Ordering::Less {
+            if order == Ordering::Less || (!upper && order == Ordering::Equal) {
                 hi = mid;
             } else {
                 lo = mid.saturating_add(1);
             }
         }
-        Ok(lo.checked_sub(1))
+        Ok(lo)
     }
 }
 
@@ -1530,12 +1540,7 @@ impl Branch {
             let page_no = self.leaf_of(from)?;
             c.land(self, store, u64::from(page_no), 0)?;
             let view = View::new(c.page_data()?)?;
-            // The first entry at least `from`: the floor if it equals it, else the one after.
-            let i = match view.floor(from)? {
-                Some(i) if view.compare(from, i)? == Ordering::Equal => i,
-                Some(i) => i.saturating_add(1),
-                None => 0,
-            };
+            let i = view.lower_bound(from)?;
             if i >= view.n {
                 c.next_leaf(self, store)
             } else {
@@ -1640,12 +1645,7 @@ impl RunCursor {
     /// is), and its entries.
     pub fn page_lower_bound(&self, key: &[u8]) -> Result<(usize, usize), Error> {
         let view = View::new(self.page_data()?)?;
-        let i = match view.floor(key)? {
-            Some(i) if view.compare(key, i)? == Ordering::Equal => i,
-            Some(i) => i.saturating_add(1),
-            None => 0,
-        };
-        Ok((i, view.n))
+        Ok((view.lower_bound(key)?, view.n))
     }
 
     /// Where the cursor is: the leaf's page number and the entry's index in it.

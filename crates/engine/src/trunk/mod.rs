@@ -470,12 +470,15 @@ struct Frame {
 #[derive(Debug)]
 enum Phase {
     /// Compacting pivot `i`'s live in-flight bundles: the job and the in-flight count it covers.
+    /// Jobs stay in place across slices, so moving a frame does not copy their builders.
     Pivots {
         i: usize,
-        job: Option<(Compaction, usize)>,
+        job: Option<(Box<Compaction>, usize)>,
     },
     /// The leaf's whole compaction, and the branches it replaces.
-    Settle { job: Option<(Compaction, Vec<u64>)> },
+    Settle {
+        job: Option<(Box<Compaction>, Vec<u64>)>,
+    },
     /// Flushing the pivots from `i` on; `waiting` while the child's frame runs.
     Flush { i: usize, waiting: bool },
 }
@@ -1422,7 +1425,7 @@ impl Trunk {
                 self.io_waiting |= c.waiting();
                 if c.is_done() {
                     let t = self.timed.then(std::time::Instant::now);
-                    self.apply_pivot(store, n, i, c, covered)?;
+                    self.apply_pivot(store, n, i, *c, covered)?;
                     self.stats.finish_ns = self.stats.finish_ns.saturating_add(ns_since(t));
                     (
                         Some(Phase::Pivots {
@@ -1463,7 +1466,7 @@ impl Trunk {
                 self.io_waiting |= c.waiting();
                 if c.is_done() {
                     let t = self.timed.then(std::time::Instant::now);
-                    let parts = c.finish(store)?;
+                    let parts = (*c).finish(store)?;
                     self.returned = Some(self.apply_settle(store, n, parts, &extents)?);
                     self.stats.finish_ns = self.stats.finish_ns.saturating_add(ns_since(t));
                     (None, used)
@@ -1838,7 +1841,7 @@ impl Trunk {
         let job = Compaction::new(store, branches, &from, end.as_deref(), false, u64::MAX)?;
         Ok(Phase::Pivots {
             i: j,
-            job: Some((job, covered)),
+            job: Some((Box::new(job), covered)),
         })
     }
 
@@ -1915,7 +1918,7 @@ impl Trunk {
             self.config.leaf_entries.div_ceil(2).max(1),
         )?;
         Ok(Some(Phase::Settle {
-            job: Some((job, extents)),
+            job: Some((Box::new(job), extents)),
         }))
     }
 

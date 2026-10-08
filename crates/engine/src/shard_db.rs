@@ -66,6 +66,9 @@ pub struct FlushStats {
     /// only as the rest are.
     pub order_ns: u64,
     pub retire_ns: u64,
+    /// Puts whose trunk share waited for its input reads: the last memtable before a rotation
+    /// would stall ([`ShardDb::put`]'s pacing).
+    pub waited_steps: u64,
 }
 
 /// A memtable read in key order from a seek, its next entry held in buffers it reuses: one
@@ -1134,7 +1137,19 @@ impl<F: BlockFile> ShardDb<F> {
             self.flush_stats.trunk_share_most = self.flush_stats.trunk_share_most.max(w);
             if w > 0 {
                 let t = self.timed.then(std::time::Instant::now);
-                self.trunk.step_paced(&mut self.store, w)?;
+                // A compaction may stop for an input read still in flight while a rotation can
+                // still pass without a stall: the work it leaves is paid by the puts of the
+                // memtables still to fill. Once the next rotation would stall (a packed
+                // memtable for every slot the trunk has), nothing is left to absorb it, and
+                // each put waits for its reads and pays its share, so a device that cannot
+                // keep up slows puts in step rather than leave the whole debt to one rotation.
+                let last = self.trunk.pending().saturating_add(1) >= self.trunk.fanout();
+                if last {
+                    self.trunk.step(&mut self.store, w)?;
+                    self.flush_stats.waited_steps = self.flush_stats.waited_steps.saturating_add(1);
+                } else {
+                    self.trunk.step_paced(&mut self.store, w)?;
+                }
                 self.note_trunk(ns_since(t));
             }
         }

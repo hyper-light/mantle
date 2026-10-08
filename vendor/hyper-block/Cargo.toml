@@ -17,6 +17,7 @@ sim = []
 # A kept record's checksum (`record`), the log's CRC-32C.
 crc32c = "0.6"
 getrandom = "0.4"
+hyper-rt = { path = "../hyper-rt" }
 thiserror = "2.0"
 
 [target.'cfg(unix)'.dependencies]

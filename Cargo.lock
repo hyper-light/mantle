@@ -321,6 +321,7 @@ version = "0.1.0"
 dependencies = [
  "crc32c",
  "getrandom 0.4.3",
+ "hyper-rt",
  "libc",
  "rustix",
  "thiserror",

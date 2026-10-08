@@ -1265,6 +1265,26 @@ impl<F: BlockFile> ShardDb<F> {
         Ok(self.store.forget_some(keys))
     }
 
+    /// [`Self::idle_step`] for a shard's task that waits on the device as a task: a compaction
+    /// whose next input page has not landed stops rather than wait on the shard's thread, and the
+    /// second value says so. The task then waits for the device's answer
+    /// ([`Self::wait_io`]) or its next request, whichever comes first.
+    pub fn idle_step_paced(&mut self, keys: u64) -> Result<(u64, bool), Error> {
+        if self.packing.is_none() && self.trunk.debt() > 0 {
+            let t = self.timed.then(std::time::Instant::now);
+            let used = self.trunk.step_paced(&mut self.store, keys)?;
+            self.note_trunk(ns_since(t));
+            return Ok((used, self.trunk.waiting_io()));
+        }
+        Ok((self.idle_step(keys)?, false))
+    }
+
+    /// Waits, as a task, for the device's next answer to the store: what a paced idle step that
+    /// stopped for a read waits on. False with nothing out.
+    pub async fn wait_io(&mut self) -> Result<bool, Error> {
+        self.store.wait_answer().await
+    }
+
     fn note_pack(&mut self, ns: u64) {
         let f = &mut self.flush_stats;
         f.pack_ns = f.pack_ns.saturating_add(ns);

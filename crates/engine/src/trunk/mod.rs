@@ -960,6 +960,11 @@ impl Trunk {
         used
     }
 
+    /// Whether the last step stopped for an input page still being read.
+    pub fn waiting_io(&self) -> bool {
+        self.io_waiting
+    }
+
     /// Runs the cascade in progress to its end, starting none: the pending branches then enter
     /// the root at the next step.
     pub fn finish_cascade<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {

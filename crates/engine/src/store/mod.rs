@@ -1157,9 +1157,40 @@ impl<F: BlockFile> Store<F> {
             w.attached.try_answer()
         };
         let answered = answered.map_err(|e| io("take a store page run's answer", e));
-        let Some((number, answer)) = self.fence(answered)? else {
+        let Some(numbered) = self.fence(answered)? else {
             return Ok(false);
         };
+        self.route(numbered)
+    }
+
+    /// Waits, as a hyper-rt task, for the device's next answer, takes it as [`Self::answer`]
+    /// does and hands queued runs on into the room it leaves: the shard's thread runs its other
+    /// tasks meanwhile. False with nothing out, nothing to wait for. Dropped before the answer
+    /// comes, it leaves the answer queued for the next wait or take.
+    pub async fn wait_answer(&mut self) -> Result<bool, Error> {
+        let Some(w) = self.writer.as_mut() else {
+            return Ok(false);
+        };
+        if w.attached.out() == 0 {
+            return Ok(false);
+        }
+        let answered = w
+            .attached
+            .answer_async()
+            .await
+            .map_err(|e| io("take a store page run's answer", e));
+        let numbered = self.fence(answered)?;
+        self.route(numbered)?;
+        self.pump()?;
+        Ok(true)
+    }
+
+    /// Routes one answer: a read's to its span (or its buffers to the pool when the span is
+    /// gone), a write's run out of flight and the file's end past it.
+    fn route(
+        &mut self,
+        (number, answer): (u64, Result<Vec<AlignedBuf>, hyper_block::DiskError>),
+    ) -> Result<bool, Error> {
         // A read's answer: kept for its span, or its buffers pooled when the span is gone. A
         // failed read fails only the read that asked for it.
         let read = self.writer.as_mut().and_then(|w| {

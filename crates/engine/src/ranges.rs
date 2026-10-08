@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hyper_block::block::BlockFile;
 use hyper_rt::Runtime;
+use hyper_rt::combine::{Either, race2};
 use hyper_rt::sync::{ChannelReceiver, Sender, SyncError, channel, channel_with};
 
 use crate::error::Error;
@@ -119,7 +120,36 @@ async fn serve<F: BlockFile>(
             continue;
         }
         if range.fault.is_none() && db.owed() {
-            range.maintain(&mut db);
+            if range.maintain(&mut db) {
+                // The maintenance waits on the device: the task parks until the read lands or a
+                // request comes, whichever first, and the shard's other tasks run meanwhile.
+                let next = {
+                    let waited = race2(requests.recv(), db.wait_io()).await;
+                    match waited {
+                        Either::First(request) => Some(request),
+                        Either::Second(Ok(true)) => None,
+                        // Nothing out to wait for: the shard's other tasks first.
+                        Either::Second(Ok(false)) => {
+                            hyper_rt::futures::yield_now().await;
+                            None
+                        }
+                        Either::Second(Err(e)) => {
+                            range.fault = Some(e);
+                            None
+                        }
+                    }
+                };
+                match next {
+                    Some(Ok(request)) => {
+                        if range.answer(&mut db, request) {
+                            return finish(db, &mut requests);
+                        }
+                    }
+                    Some(Err(_)) => return finish(db, &mut requests),
+                    None => {}
+                }
+                continue;
+            }
             hyper_rt::futures::yield_now().await;
             continue;
         }
@@ -172,16 +202,21 @@ impl Range {
         stop
     }
 
-    /// One slice of maintenance; a failure is kept as the range's fault.
-    fn maintain<F: BlockFile>(&mut self, db: &mut ShardDb<F>) {
+    /// One slice of maintenance; a failure is kept as the range's fault. True when it stopped
+    /// for a read still in flight, which the task then waits for as a task.
+    fn maintain<F: BlockFile>(&mut self, db: &mut ShardDb<F>) -> bool {
         let t = std::time::Instant::now();
         let keys = self.slice.keys();
-        match db.idle_step(keys) {
-            Ok(done) => {
+        match db.idle_step_paced(keys) {
+            Ok((done, waiting)) => {
                 let ns = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 self.slice.record(done, ns);
+                waiting
             }
-            Err(e) => self.fault = Some(e),
+            Err(e) => {
+                self.fault = Some(e);
+                false
+            }
         }
     }
 }

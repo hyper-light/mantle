@@ -86,7 +86,7 @@ fn main() {
     let reads: u64 = args.get(4).map_or(num, |s| s.parse().unwrap());
     // The page cache in MiB, none by default: with buffered I/O the OS's cache serves reads.
     let cache_mib: usize = args.get(5).map_or(0, |s| s.parse().unwrap());
-    // `attribute` as the seventh argument: each put slower than `SLOW_NS` is recorded with what
+    // `attribute` as the seventh argument: each put at or past the running p99.5 is recorded with what
     // the engine did inside it, and the puts at or past p99.9 and p99.99 are broken down by cause.
     let attribute = args.get(6).map(String::as_str) == Some("attribute");
     // The device issuer's depth as the eighth argument, none by default: the store's runs are
@@ -170,8 +170,12 @@ fn main() {
     let mut rng = Rng(301);
     // Each operation timed, into a vector sized before the run: percentiles from the sorted
     // samples, as db_bench's --histogram=1 times each of its operations.
-    let mut lat: Vec<u64> = Vec::with_capacity(num as usize);
-    let mut slow: Vec<Slow> = Vec::new();
+    // Touched before the run, a write a page (zeroed memory is mapped only once written), so a
+    // sample's push takes no page fault inside the timing.
+    let mut lat: Vec<u64> = vec![0; num as usize];
+    lat.iter_mut().step_by(512).for_each(|x| *x = 1);
+    lat.clear();
+    let mut slow: Recorder<Slow> = Recorder::new(if attribute { num } else { 0 });
     let mark = begin();
     let t = Instant::now();
     for _ in 0..num {
@@ -182,7 +186,7 @@ fn main() {
         let ns = o.elapsed().as_nanos() as u64;
         lat.push(ns);
         if let Some(b) = before
-            && ns >= SLOW_NS
+            && slow.wants(ns)
         {
             slow.push(Slow::of(ns, b, db.stats()));
         }
@@ -218,7 +222,7 @@ fn main() {
         t.entries_written as f64 / num as f64
     );
     println!(
-        "fill io evict_steps_most {} submitted {} queued {} (most {}) write_waits {} ({:.2}s) span_cache_hits {} reads {} pages_read {} ({:.2}s) writes {} ({:.2}s) pages_written {} ({:.2} GB, write amplification {:.2}) syncs {} prefetches {} prefetch_waits {}",
+        "fill io evict_steps_most {} submitted {} queued {} (most {}) write_waits {} ({:.2}s) span_cache_hits {} reads {} pages_read {} ({:.2}s) writes {} ({:.2}s) pages_written {} ({:.2} GB, write amplification {:.2}) syncs {} prefetches {} prefetch_waits {} seals {:.2}s (most {:.2}ms)",
         io.cache_evict_steps_most,
         io.submitted,
         io.runs_queued,
@@ -236,7 +240,9 @@ fn main() {
         io.pages_written as f64 * 4096.0 / user as f64,
         io.syncs,
         io.prefetches,
-        io.prefetch_waits
+        io.prefetch_waits,
+        io.seal_ns as f64 / 1e9,
+        io.seal_most_ns as f64 / 1e6
     );
     println!(
         "fillrandom {num} {:.0} {:.3}",
@@ -254,7 +260,8 @@ fn main() {
     let t = Instant::now();
     // With `attribute`, each slow get recorded with what the engine did inside it, and the
     // page faults and context switches the process was charged meanwhile.
-    let mut slow_gets: Vec<(Slow, u64, u64)> = Vec::new();
+    let mut slow_gets: Recorder<(Slow, u64, u64)> =
+        Recorder::new(if attribute { reads } else { 0 });
     for _ in 0..reads {
         let k = key(skewed(rng.next(), num, read_exp_range));
         let before = attribute.then(|| {
@@ -271,7 +278,7 @@ fn main() {
         let ns = o.elapsed().as_nanos() as u64;
         lat.push(ns);
         if let Some((b, f, w)) = before
-            && ns >= SLOW_NS
+            && slow_gets.wants(ns)
         {
             let f = faults::read().unwrap().since(&f).total();
             let w = faults::switches().unwrap() - w;
@@ -280,6 +287,9 @@ fn main() {
     }
     let s = t.elapsed().as_secs_f64();
     if attribute {
+        let floor = slow_gets.floor;
+        let dropped = slow_gets.dropped;
+        let mut slow_gets = std::mem::take(&mut slow_gets.events);
         slow_gets.sort_unstable_by_key(|s| std::cmp::Reverse(s.0.ns));
         for (g, f, w) in slow_gets.iter().take(8) {
             println!(
@@ -295,8 +305,8 @@ fn main() {
         let faulted = slow_gets.iter().filter(|s| s.1 > 0).count();
         let read = slow_gets.iter().filter(|s| s.0.reads > 0).count();
         println!(
-            "slow gets (>= {} us) {n}: with a context switch {switched}, a page fault {faulted}, a read call {read}",
-            SLOW_NS / 1000
+            "slow gets (>= {:.2} us at the end, the running p99.5) {n} (dropped {dropped}): with a context switch {switched}, a page fault {faulted}, a read call {read}",
+            floor as f64 / 1000.0
         );
     }
     costs("readrandom", reads.max(1), &mark);
@@ -395,7 +405,9 @@ fn main() {
         let mut out = Vec::new();
         let (mut puts, mut gets, mut seeks_done) = (Vec::new(), Vec::new(), Vec::new());
         // With `attribute`, each slow put and seek recorded with what the engine did inside it.
-        let (mut slow_puts, mut slow_seeks) = (Vec::new(), Vec::new());
+        let ops = if attribute { mix } else { 0 };
+        let (mut slow_puts, mut slow_seeks): (Recorder<Slow>, Recorder<Slow>) =
+            (Recorder::new(ops), Recorder::new(ops));
         let (skipped_before, opened_before) = db.scan_filtered();
         let mark = begin();
         let t = Instant::now();
@@ -411,7 +423,7 @@ fn main() {
                 let ns = o.elapsed().as_nanos() as u64;
                 puts.push(ns);
                 if let Some(b) = before
-                    && ns >= SLOW_NS
+                    && slow_puts.wants(ns)
                 {
                     slow_puts.push(Slow::of(ns, b, db.stats()));
                 }
@@ -424,7 +436,7 @@ fn main() {
                 let ns = o.elapsed().as_nanos() as u64;
                 seeks_done.push(ns);
                 if let Some(b) = before
-                    && ns >= SLOW_NS
+                    && slow_seeks.wants(ns)
                 {
                     slow_seeks.push(Slow::of(ns, b, db.stats()));
                 }
@@ -497,10 +509,82 @@ fn main() {
     std::fs::remove_file(&path).unwrap();
 }
 
-/// Diagnostic: a put at least this slow is recorded with what the engine did inside it. Below
-/// the measured p99.9 (61-77 us uncached at 10 M) and above p99 (2-3 us), so every put of the
-/// p99.9 tail is recorded and few others.
-const SLOW_NS: u64 = 10_000;
+/// Diagnostic: which operations are recorded with what the engine did inside them. A fixed
+/// threshold censored the tail it labelled once p99.9 fell below it, so the threshold is the
+/// p99.5 of the operations so far, read from a log-linear histogram of every one (sixteen
+/// buckets a power of two, so a bucket is within 1/16 of its values) every `REREAD` operations:
+/// p99.9 and p99.99 lie above it, and their tails are recorded whole. The events go to a buffer
+/// sized and touched before the run, a fiftieth of the operations (four times the half percent
+/// the threshold passes, room for the threshold lagging a run's phases), and what does not fit
+/// is counted, so coverage is reported rather than assumed.
+struct Recorder<T> {
+    buckets: Vec<u64>,
+    seen: u64,
+    floor: u64,
+    events: Vec<T>,
+    dropped: u64,
+}
+
+/// Operations between rereads of the recording threshold: frequent enough to follow a run's
+/// phases, rare enough that the histogram's scan costs nothing per operation.
+const REREAD: u64 = 4096;
+
+impl<T: Default> Recorder<T> {
+    fn new(ops: u64) -> Self {
+        let cap = (ops / 50 + REREAD) as usize;
+        let mut events = Vec::with_capacity(cap);
+        // Touched now, so no recorded event takes a page fault.
+        events.resize_with(cap, T::default);
+        events.clear();
+        Self {
+            buckets: vec![0; 64 * 16],
+            seen: 0,
+            floor: 0,
+            events,
+            dropped: 0,
+        }
+    }
+
+    fn bucket(ns: u64) -> usize {
+        let e = 63 - (ns | 1).leading_zeros() as usize;
+        let m = if e >= 4 {
+            ((ns >> (e - 4)) & 15) as usize
+        } else {
+            0
+        };
+        e * 16 + m
+    }
+
+    fn lower(b: usize) -> u64 {
+        let (e, m) = (b / 16, (b % 16) as u64);
+        if e >= 4 { (16 + m) << (e - 4) } else { 1 << e }
+    }
+
+    /// Counts an operation of `ns`; whether it is to be recorded.
+    fn wants(&mut self, ns: u64) -> bool {
+        self.buckets[Self::bucket(ns)] += 1;
+        self.seen += 1;
+        if self.seen.is_multiple_of(REREAD) {
+            let mut above = self.seen / 200;
+            for (b, &n) in self.buckets.iter().enumerate().rev() {
+                if n > above {
+                    self.floor = Self::lower(b);
+                    break;
+                }
+                above -= n;
+            }
+        }
+        ns >= self.floor
+    }
+
+    fn push(&mut self, e: T) {
+        if self.events.len() < self.events.capacity() {
+            self.events.push(e);
+        } else {
+            self.dropped += 1;
+        }
+    }
+}
 
 type Stats = (
     mantle_engine::shard_db::FlushStats,
@@ -509,6 +593,7 @@ type Stats = (
 );
 
 /// One slow put: its time, and the engine's work inside it.
+#[derive(Default)]
 struct Slow {
     ns: u64,
     write_ns: u64,
@@ -527,6 +612,8 @@ struct Slow {
     wait_ns: u64,
     queue_ns: u64,
     ahead_ns: u64,
+    order_ns: u64,
+    retire_ns: u64,
     rotated: bool,
 }
 
@@ -550,20 +637,25 @@ impl Slow {
             wait_ns: i1.write_wait_ns - i0.write_wait_ns,
             queue_ns: i1.queue_ns - i0.queue_ns,
             ahead_ns: i1.ahead_ns - i0.ahead_ns,
-            rotated: f1.flushes != f0.flushes || f1.stalls != f0.stalls,
+            order_ns: f1.order_ns - f0.order_ns,
+            retire_ns: f1.retire_ns - f0.retire_ns,
+            rotated: f1.rotations != f0.rotations,
         }
     }
 }
 
-/// The puts at or past p99.9 and p99.99, broken down: mean time in write calls and read calls
-/// (inside pack or trunk work), in pack and trunk work besides their I/O, in stalls, and the
-/// rest (the memtable, a rotation); and how many made a write call, a read call, or neither.
-fn attribute_tail(lat: &[u64], slow: &mut [Slow]) {
-    // The five slowest puts, each with what it did.
+/// The operations at or past p99.9 and p99.99, broken down: mean time in write calls and read
+/// calls (inside pack or trunk work), in pack and trunk work besides their I/O, in stalls, and
+/// the rest (the memtable, a rotation); and how many made a write call, a read call, or neither.
+/// Each is reported for the whole tail and for a band about the percentile (a few slow
+/// operations can set the tail's mean without setting the percentile), with the tail's
+/// operations counted and those recorded, so a tail the recorder missed shows.
+fn attribute_tail(lat: &[u64], rec: &mut Recorder<Slow>) {
+    let slow = &mut rec.events;
     slow.sort_unstable_by_key(|s| std::cmp::Reverse(s.ns));
     for s in slow.iter().take(5) {
         println!(
-            "worst put {:.2} us: writes {} ({:.2} us) reads {} ({:.2} us) pack {:.2} trunk {:.2} (plan {:.2} finish {:.2} pack finish {:.2}) stall {:.2} insert {:.2} (rotate {:.2}) forget {:.2} | queueing pages {:.2} (waiting for a run {:.2}) reading ahead {:.2} rotated {}",
+            "worst {:.2} us: writes {} ({:.2} us) reads {} ({:.2} us) pack {:.2} trunk {:.2} (plan {:.2} finish {:.2} pack finish {:.2}) stall {:.2} insert {:.2} (of it rotate {:.2}, retire {:.2}) order {:.2} forget {:.2} | queueing pages {:.2} (waiting for a run {:.2}) reading ahead {:.2} rotated {}",
             s.ns as f64 / 1000.0,
             s.writes,
             s.write_ns as f64 / 1000.0,
@@ -577,6 +669,8 @@ fn attribute_tail(lat: &[u64], slow: &mut [Slow]) {
             s.stall_ns as f64 / 1000.0,
             s.insert_ns as f64 / 1000.0,
             s.rotate_ns as f64 / 1000.0,
+            s.retire_ns as f64 / 1000.0,
+            s.order_ns as f64 / 1000.0,
             s.forget_ns as f64 / 1000.0,
             s.queue_ns as f64 / 1000.0,
             s.wait_ns as f64 / 1000.0,
@@ -586,51 +680,83 @@ fn attribute_tail(lat: &[u64], slow: &mut [Slow]) {
     }
     let mut sorted = lat.to_vec();
     sorted.sort_unstable();
+    let at = |q: f64| sorted[((sorted.len() as f64 * q) as usize).min(sorted.len() - 1)];
+    println!(
+        "recorded {} operations at or past the running p99.5 (last {:.2} us), {} dropped past the buffer",
+        slow.len(),
+        rec.floor as f64 / 1000.0,
+        rec.dropped
+    );
     for (name, q) in [("p99.9", 0.999), ("p99.99", 0.9999)] {
-        let floor = sorted[((sorted.len() as f64 * q) as usize).min(sorted.len() - 1)];
+        let floor = at(q);
+        let expected = sorted.iter().filter(|&&ns| ns >= floor).count();
         let tail: Vec<&Slow> = slow.iter().filter(|s| s.ns >= floor).collect();
-        let n = tail.len().max(1) as f64;
-        let mean =
-            |f: &dyn Fn(&Slow) -> u64| tail.iter().map(|s| f(s)).sum::<u64>() as f64 / n / 1000.0;
-        let io = |s: &Slow| s.write_ns + s.read_ns;
-        let work = |s: &Slow| s.pack_ns + s.trunk_ns;
+        // A band of half the tail's width either side of the percentile: p99.85 to p99.95 for p99.9.
+        let band_lo = at(1.0 - (1.0 - q) * 1.5);
+        let band_hi = at(1.0 - (1.0 - q) * 0.5);
+        let band: Vec<&Slow> = slow
+            .iter()
+            .filter(|s| s.ns >= band_lo && s.ns <= band_hi)
+            .collect();
         println!(
-            "tail {name} (>= {:.2} us, {} puts): mean {:.2} us = writes {:.2} + reads {:.2} + work besides I/O {:.2} + stalls {:.2} + rest {:.2}; with a write call {}, a read call {}, neither {}, a rotation {}",
+            "tail {name} >= {:.2} us: {expected} operations, {} recorded ({:.1}%)",
             floor as f64 / 1000.0,
             tail.len(),
-            mean(&|s| s.ns),
-            mean(&|s| s.write_ns),
-            mean(&|s| s.read_ns),
-            mean(&|s| work(s).saturating_sub(io(s)).saturating_sub(s.stall_ns)),
-            mean(&|s| s.stall_ns),
-            mean(&|s| s.ns.saturating_sub(work(s).max(io(s)))),
-            tail.iter().filter(|s| s.writes > 0).count(),
-            tail.iter().filter(|s| s.reads > 0).count(),
-            tail.iter()
-                .filter(|s| s.writes == 0 && s.reads == 0)
-                .count(),
-            tail.iter().filter(|s| s.rotated).count(),
+            100.0 * tail.len() as f64 / expected.max(1) as f64
         );
-        println!(
-            "tail {name} work: planning compactions {:.2} us, finishing them {:.2} us, finishing packed memtables {:.2} us, merging and packing the rest {:.2} us; puts that planned {}, finished {}, finished a pack {}",
-            mean(&|s| s.plan_ns),
-            mean(&|s| s.finish_ns),
-            mean(&|s| s.pack_finish_ns),
-            mean(&|s| (s.pack_ns + s.trunk_ns).saturating_sub(
-                s.plan_ns + s.finish_ns + s.pack_finish_ns + s.write_ns + s.read_ns
-            )),
-            tail.iter().filter(|s| s.plan_ns > 0).count(),
-            tail.iter().filter(|s| s.finish_ns > 0).count(),
-            tail.iter().filter(|s| s.pack_finish_ns > 0).count(),
-        );
-        println!(
-            "tail {name} pages: queueing written pages {:.2} us (waiting for a run {:.2}), reading pages ahead {:.2} us, the rest of the work (merging, building) {:.2} us",
-            mean(&|s| s.queue_ns),
-            mean(&|s| s.wait_ns),
-            mean(&|s| s.ahead_ns),
-            mean(&|s| (s.pack_ns + s.trunk_ns).saturating_sub(s.queue_ns + s.ahead_ns)),
-        );
+        for (part, set) in [("whole tail", &tail), ("band", &band)] {
+            breakdown(name, part, set, band_lo, band_hi);
+        }
     }
+}
+
+/// The mean breakdown of `set`, the `part` of the `name` tail.
+fn breakdown(name: &str, part: &str, set: &[&Slow], band_lo: u64, band_hi: u64) {
+    let n = set.len().max(1) as f64;
+    let mean = |f: &dyn Fn(&Slow) -> u64| set.iter().map(|s| f(s)).sum::<u64>() as f64 / n / 1000.0;
+    let io = |s: &Slow| s.write_ns + s.read_ns;
+    let work = |s: &Slow| s.pack_ns + s.trunk_ns;
+    let range = if part == "band" {
+        format!(
+            " [{:.2}, {:.2}] us",
+            band_lo as f64 / 1000.0,
+            band_hi as f64 / 1000.0
+        )
+    } else {
+        String::new()
+    };
+    println!(
+        "tail {name} {part}{range} ({} ops): mean {:.2} us = writes {:.2} + reads {:.2} + work besides I/O {:.2} + stalls {:.2} + memtable order {:.2} + rest {:.2} (insert {:.2}, of it rotating {:.2} and retiring {:.2}); with a write call {}, a read call {}, neither {}, a rotation {}",
+        set.len(),
+        mean(&|s| s.ns),
+        mean(&|s| s.write_ns),
+        mean(&|s| s.read_ns),
+        mean(&|s| work(s).saturating_sub(io(s)).saturating_sub(s.stall_ns)),
+        mean(&|s| s.stall_ns),
+        mean(&|s| s.order_ns),
+        mean(&|s| s
+            .ns
+            .saturating_sub(work(s).max(io(s)))
+            .saturating_sub(s.order_ns)),
+        mean(&|s| s.insert_ns),
+        mean(&|s| s.rotate_ns),
+        mean(&|s| s.retire_ns),
+        set.iter().filter(|s| s.writes > 0).count(),
+        set.iter().filter(|s| s.reads > 0).count(),
+        set.iter().filter(|s| s.writes == 0 && s.reads == 0).count(),
+        set.iter().filter(|s| s.rotated).count(),
+    );
+    println!(
+        "tail {name} {part} work: planning compactions {:.2} us, finishing them {:.2} us, finishing packed memtables {:.2} us, merging and packing the rest {:.2} us; queueing written pages {:.2} us (waiting for a run {:.2}), reading pages ahead {:.2} us",
+        mean(&|s| s.plan_ns),
+        mean(&|s| s.finish_ns),
+        mean(&|s| s.pack_finish_ns),
+        mean(&|s| (s.pack_ns + s.trunk_ns)
+            .saturating_sub(s.plan_ns + s.finish_ns + s.pack_finish_ns + s.write_ns + s.read_ns)),
+        mean(&|s| s.queue_ns),
+        mean(&|s| s.wait_ns),
+        mean(&|s| s.ahead_ns),
+    );
 }
 
 /// db_bench's GetRandomKey: uniform at range 0, else `num · e^(−u·range)` for `u` uniform in

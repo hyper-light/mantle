@@ -101,6 +101,11 @@ pub struct IoStats {
     /// when the store is ([`Store::set_timed`]).
     pub queue_ns: u64,
     pub ahead_ns: u64,
+    /// Nanoseconds builders spent sealing branches (their leaf index and range filter built
+    /// and encoded, [`crate::branch::Builder::seal`]), in all and at the most one seal: timed
+    /// only when the store is.
+    pub seal_ns: u64,
+    pub seal_most_ns: u64,
     /// Runs queued in write memory because every batch was out, where the writer would have
     /// waited, and the most queued at once.
     pub runs_queued: u64,
@@ -813,6 +818,18 @@ impl<F: BlockFile> Store<F> {
 
     /// Times the store's write and read calls into [`IoStats`]: off by default, as a clock read
     /// each call costs the put and get paths.
+    /// A clock read for a stage the store's owner times, when the store is timed.
+    pub fn clock(&self) -> Option<std::time::Instant> {
+        self.timed.then(std::time::Instant::now)
+    }
+
+    /// Counts a branch seal begun at `t` ([`Self::clock`]).
+    pub fn note_seal(&mut self, t: Option<std::time::Instant>) {
+        let ns = elapsed_ns(t);
+        self.io.seal_ns = self.io.seal_ns.saturating_add(ns);
+        self.io.seal_most_ns = self.io.seal_most_ns.max(ns);
+    }
+
     pub fn set_timed(&mut self, on: bool) {
         self.timed = on;
     }

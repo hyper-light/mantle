@@ -653,6 +653,14 @@ impl Builder {
                 what: "a branch with no entries",
             });
         }
+        let t = store.clock();
+        let sealed = self.seal_tree(store);
+        store.note_seal(t);
+        sealed
+    }
+
+    /// [`Self::seal`]'s work: the tree's last pages written, the index and filters built.
+    fn seal_tree<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
         let mut level = 0usize;
         loop {
             let top = level.checked_add(1) == Some(self.levels.len());

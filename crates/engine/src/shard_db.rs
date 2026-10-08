@@ -1199,7 +1199,9 @@ impl<F: BlockFile> ShardDb<F> {
             && let Some(walk) = walk.as_mut()
         {
             let limit = usize::try_from(walked).unwrap_or(usize::MAX);
-            let visited = mem.walk_some(walk, limit, |k, op, v| builder.add(store, k, op, v))?;
+            let visited = mem.walk_some_hashed(walk, limit, |k, op, v, h| {
+                builder.add_hashed(store, k, op, v, h)
+            })?;
             *packed = packed.saturating_add(visited);
         }
         let mut whole = false;
@@ -1295,8 +1297,8 @@ impl<F: BlockFile> ShardDb<F> {
             None => mem.walk_start(),
         };
         let store = &mut self.store;
-        mem.walk_some(&mut walk, usize::MAX, |k, op, v| {
-            builder.add(store, k, op, v)
+        mem.walk_some_hashed(&mut walk, usize::MAX, |k, op, v, h| {
+            builder.add_hashed(store, k, op, v, h)
         })?;
         let branch = builder.finish(&mut self.store)?;
         let ns = ns_since(t);

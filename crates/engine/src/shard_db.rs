@@ -174,10 +174,20 @@ pub struct ShardDb<F: BlockFile> {
     /// Entries the active memtable leaves unsorted at most before it sorts them
     /// ([`Self::set_order_bound`]).
     order_bound: usize,
-    /// Whether no write came since the last idle step: the active memtable's runs are merged
-    /// to one only then. Merging them while writes keep coming merges the large run with every
-    /// new small one, work a write's own chunk sorts and the level merges already bound.
-    quiet: bool,
+    /// Nanoseconds scans have spent on the active memtable's runs being many rather than one,
+    /// not yet spent back on merging them. Idle time merges them only once this covers the merge's
+    /// measured cost: the ski-rental rule, within twice the cost of the best choice made knowing
+    /// every scan to come (Karlin, Manasse, Rudolph and Sleator, Algorithmica 1988). A scan is
+    /// what makes the merge worth anything: with none, nothing is merged, and merging while
+    /// writes keep coming would merge the large run with every new small one.
+    tidy_rent_ns: u64,
+    /// The nanoseconds and comparisons of the active memtables' seeks measured so far, and of
+    /// idle merging and its entries moved: the prices the rule weighs, a merge's priced as a
+    /// seek's comparison until one is measured.
+    seek_ns: u64,
+    seek_cmps: u64,
+    tidy_ns: u64,
+    tidy_moves: u64,
     forget_carry: u128,
     flush_stats: FlushStats,
     /// The write memory the owner spares at most, and the pages written when the last cycle
@@ -443,7 +453,11 @@ impl<F: BlockFile> ShardDb<F> {
             pack_carry: 0,
             trunk_carry: 0,
             order_bound: ORDER_BOUND,
-            quiet: false,
+            tidy_rent_ns: 0,
+            seek_ns: 0,
+            seek_cmps: 0,
+            tidy_ns: 0,
+            tidy_moves: 0,
             forget_carry: 0,
             flush_stats: FlushStats::default(),
             write_cap: 0,
@@ -908,7 +922,6 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     fn apply(&mut self, key: &[u8], op: Op, value: &[u8]) -> Result<(), Error> {
-        self.quiet = false;
         self.trim();
         // A write makes the key's cached record stale: it goes before the write is answered.
         if let Some(r) = self.records.as_mut() {
@@ -1003,7 +1016,13 @@ impl<F: BlockFile> ShardDb<F> {
             p.mem.seal();
         }
         let mut active = std::mem::replace(&mut self.scan_active, MemCursor::empty());
+        // The seek is timed when the runs are many: the price of the comparisons they add.
+        let (many, one) = self.mem.seek_comparisons();
+        let step_extra = self.mem.step_comparisons();
+        let t = (many > one).then(std::time::Instant::now);
         active.seek(&self.mem, from)?;
+        let seek_ns = ns_since(t);
+        let mut stepped = 0u64;
         let mut packing = match &self.packing {
             Some(p) => {
                 let mut c = std::mem::replace(&mut self.scan_packing, MemCursor::empty());
@@ -1078,6 +1097,7 @@ impl<F: BlockFile> ShardDb<F> {
                     taken = taken.saturating_add(1);
                 }
                 active.advance(&self.mem)?;
+                stepped = stepped.saturating_add(1);
             }
             if let (Some(c), Some(p)) = (packing.as_mut(), self.packing.as_ref())
                 && c.key() == Some(key.as_slice())
@@ -1109,6 +1129,9 @@ impl<F: BlockFile> ShardDb<F> {
         self.scan_active = active;
         if let Some(c) = packing {
             self.scan_packing = c;
+        }
+        if t.is_some() {
+            self.charge_runs(seek_ns, many, one, stepped, step_extra);
         }
         Ok(more)
     }
@@ -1228,6 +1251,60 @@ impl<F: BlockFile> ShardDb<F> {
         Ok(())
     }
 
+    /// Charges a scan's seek of `seek_ns` over runs making `many` comparisons where one run would
+    /// make `one`, and its `stepped` steps each `step_extra` comparisons more than one run's, to
+    /// the rent the runs being many have cost: the seek's measured time a comparison, times the
+    /// comparisons they added.
+    fn charge_runs(
+        &mut self,
+        seek_ns: u64,
+        many: usize,
+        one: usize,
+        stepped: u64,
+        step_extra: usize,
+    ) {
+        let many64 = u64::try_from(many).unwrap_or(u64::MAX);
+        if many64 == 0 {
+            return;
+        }
+        self.seek_ns = self.seek_ns.saturating_add(seek_ns);
+        self.seek_cmps = self.seek_cmps.saturating_add(many64);
+        let extra = u128::from(u64::try_from(many.saturating_sub(one)).unwrap_or(u64::MAX))
+            .saturating_add(
+                u128::from(stepped)
+                    .saturating_mul(u128::from(u64::try_from(step_extra).unwrap_or(u64::MAX))),
+            );
+        let rent = u128::from(seek_ns)
+            .saturating_mul(extra)
+            .checked_div(u128::from(many64))
+            .unwrap_or(0);
+        self.tidy_rent_ns = self
+            .tidy_rent_ns
+            .saturating_add(u64::try_from(rent).unwrap_or(u64::MAX));
+    }
+
+    /// Whether scans have paid for merging the active memtable's runs to one: their rent covers
+    /// its moves at the measured price of one ([`Self::tidy_rent_ns`]).
+    fn tidy_paid(&self) -> bool {
+        if self.tidy_rent_ns == 0 || !self.mem.untidy() {
+            return false;
+        }
+        let Some(moves) = self.mem.collapse_moves() else {
+            return false;
+        };
+        let (ns, units) = if self.tidy_moves > 0 {
+            (self.tidy_ns, self.tidy_moves)
+        } else {
+            (self.seek_ns, self.seek_cmps)
+        };
+        if units == 0 {
+            return false;
+        }
+        let moves = u128::from(u64::try_from(moves).unwrap_or(u64::MAX));
+        u128::from(self.tidy_rent_ns).saturating_mul(u128::from(units))
+            >= moves.saturating_mul(u128::from(ns))
+    }
+
     /// Whether maintenance is owed: a memtable packing, the trunk's work, a leaf's REMIX view to
     /// build, or freed pages the cache has yet to forget.
     pub fn owed(&self) -> bool {
@@ -1235,7 +1312,7 @@ impl<F: BlockFile> ShardDb<F> {
             || self.trunk.debt() > 0
             || self.trunk.views_owed()
             || self.trunk.maplets_owed()
-            || self.mem.untidy()
+            || self.tidy_paid()
             || self.store.forget_debt() > 0
     }
 
@@ -1263,15 +1340,17 @@ impl<F: BlockFile> ShardDb<F> {
         if self.trunk.maplets_owed() {
             return self.trunk.maplet_step(&mut self.store, keys);
         }
-        if self.mem.untidy() {
-            // The active memtable's runs merged to one, so a seek searches one, once writes
-            // have stopped: the first idle step after a write only notes that none came since.
-            if !self.quiet {
-                self.quiet = true;
-                return Ok(1);
-            }
+        if self.tidy_paid() {
+            // The active memtable's runs merged to one, so a seek searches one, once the scans
+            // that searched them have paid for it; the time spent comes off what they paid.
             let budget = usize::try_from(keys).unwrap_or(usize::MAX);
-            return Ok(u64::try_from(self.mem.tidy(budget)).unwrap_or(u64::MAX));
+            let t = std::time::Instant::now();
+            let done = u64::try_from(self.mem.tidy(budget)).unwrap_or(u64::MAX);
+            let ns = ns_since(Some(t));
+            self.tidy_ns = self.tidy_ns.saturating_add(ns);
+            self.tidy_moves = self.tidy_moves.saturating_add(done);
+            self.tidy_rent_ns = self.tidy_rent_ns.saturating_sub(ns);
+            return Ok(done);
         }
         Ok(self.store.forget_some(keys))
     }
@@ -1374,6 +1453,8 @@ impl<F: BlockFile> ShardDb<F> {
             None => HashMem::new(self.mem_limit)?,
         };
         let mut full = std::mem::replace(&mut self.mem, fresh);
+        // Rent paid on one memtable's runs buys no merge of the next's.
+        self.tidy_rent_ns = 0;
         // Its order, a debt its packing pays a slice at a time.
         full.close();
         self.packing = Some(Packing {
@@ -1434,6 +1515,8 @@ impl<F: BlockFile> ShardDb<F> {
                 None => HashMem::new(self.mem_limit)?,
             };
             let mut full = std::mem::replace(&mut self.mem, fresh);
+            // Rent paid on one memtable's runs buys no merge of the next's.
+            self.tidy_rent_ns = 0;
             full.close();
             self.packing = Some(Packing {
                 walk: None,

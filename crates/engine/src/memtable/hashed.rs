@@ -106,6 +106,17 @@ fn level(len: usize) -> u32 {
     usize::BITS.saturating_sub(len.leading_zeros())
 }
 
+/// The entries a sort of `n` reads at most: a count, eight scatter passes, the tie scan and the
+/// dedupe, each reading every entry ([`Stage`]).
+fn sort_reads(n: usize) -> usize {
+    n.saturating_mul(11)
+}
+
+/// The runs a memtable holds at most, a merge's two inputs counted as its one output: the
+/// counter keeps two runs of a level at most and a level's merge of two more ([`HashMem::seal`]),
+/// over a level for each bit of a length.
+const MAX_RUNS: usize = 4 * usize::BITS as usize;
+
 /// Where a sort stands ([`Sort`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 enum Stage {
@@ -690,6 +701,86 @@ impl HashMem {
         self.pay(budget).max(1)
     }
 
+    /// The entries [`Self::tidy`] moves to leave one run: the order work owed, the tail's sort, then
+    /// the runs merged two smallest first, the order of fewest moves (Huffman, Proc. IRE 1952).
+    /// `None` past [`MAX_RUNS`] runs, which the counter never holds.
+    pub fn collapse_moves(&self) -> Option<usize> {
+        let mut sizes = [0usize; MAX_RUNS];
+        let mut k = 0usize;
+        let merging = self
+            .merges
+            .iter()
+            .map(|m| m.a.keys.len().saturating_add(m.b.keys.len()));
+        let tail = Some(self.tail.len()).filter(|&n| n > 0);
+        for n in self
+            .runs
+            .iter()
+            .map(|r| r.keys.len())
+            .chain(merging)
+            .chain(tail)
+        {
+            *sizes.get_mut(k)? = n;
+            k = k.saturating_add(1);
+        }
+        let mut moves = self.debt();
+        if !self.closed || self.sort.is_none() {
+            moves = moves.saturating_add(tail.map_or(0, sort_reads));
+        }
+        // Two queues: the sizes in order, and the merges' outputs, which come out in order too.
+        let sizes = sizes.get_mut(..k)?;
+        sizes.sort_unstable();
+        let mut merged = [0usize; MAX_RUNS];
+        let (mut i, mut j, mut m) = (0usize, 0usize, 0usize);
+        let take = |i: &mut usize, j: &mut usize, sizes: &[usize], merged: &[usize], m: usize| {
+            let a = sizes.get(*i).copied();
+            let b = merged.get(*j).copied().filter(|_| *j < m);
+            match (a, b) {
+                (Some(a), Some(b)) if b < a => {
+                    *j = j.saturating_add(1);
+                    b
+                }
+                (Some(a), _) => {
+                    *i = i.saturating_add(1);
+                    a
+                }
+                (None, Some(b)) => {
+                    *j = j.saturating_add(1);
+                    b
+                }
+                (None, None) => 0,
+            }
+        };
+        for _ in 1..k {
+            let a = take(&mut i, &mut j, sizes, &merged, m);
+            let b = take(&mut i, &mut j, sizes, &merged, m);
+            let out = a.saturating_add(b);
+            *merged.get_mut(m)? = out;
+            m = m.saturating_add(1);
+            moves = moves.saturating_add(out);
+        }
+        Some(moves)
+    }
+
+    /// The comparisons a seek makes in the runs a walk merges, a binary search of each, and those
+    /// it would make were they one run of all their entries.
+    pub fn seek_comparisons(&self) -> (usize, usize) {
+        let (mut many, mut all) = (0usize, 0usize);
+        for (_, run) in self.sources() {
+            many = many.saturating_add(usize::try_from(level(run.len())).unwrap_or(usize::MAX));
+            all = all.saturating_add(run.len());
+        }
+        (many, usize::try_from(level(all)).unwrap_or(usize::MAX))
+    }
+
+    /// The comparisons a walk's step spends on the runs being many: the heap's sift, two a level
+    /// of a heap over every run, none over one.
+    pub fn step_comparisons(&self) -> usize {
+        let runs = self.sources().count();
+        usize::try_from(runs.checked_ilog2().unwrap_or(0))
+            .unwrap_or(usize::MAX)
+            .saturating_mul(2)
+    }
+
     /// Starts a merge of the two smallest runs, whatever their levels.
     fn merge_smallest(&mut self) {
         let mut order: [Option<(usize, usize)>; 2] = [None, None];
@@ -844,10 +935,7 @@ impl HashMem {
         if let Some(s) = self.sort.as_mut() {
             let n = s.src.len();
             // The debt as [`Self::debt`] counts it, over the chunk's own entries.
-            let debt = n
-                .saturating_mul(11)
-                .saturating_add(s.stale)
-                .saturating_add(1);
+            let debt = sort_reads(n).saturating_add(s.stale).saturating_add(1);
             s.rate = debt.div_ceil(n.max(1));
         }
     }
@@ -913,7 +1001,7 @@ impl HashMem {
         // A closed memtable's tail is sorted once the sort in progress ends: a count, eight
         // passes at most, the tie scan and the dedupe, each reading every entry.
         let tail = if self.closed && self.sort.is_some() {
-            self.tail.len().saturating_mul(11)
+            sort_reads(self.tail.len())
         } else {
             0
         };
@@ -1598,12 +1686,19 @@ mod tests {
         m.insert(b"tail", Op::Put, b"t").unwrap();
         want.insert(b"tail".to_vec(), b"t".to_vec());
         assert!(m.untidy());
+        // What the rule that pays for tidying prices it at bounds the work tidying does.
+        let priced = m.collapse_moves().unwrap();
         let mut slices = 0;
+        let mut work = 0;
         while m.untidy() {
-            assert!(m.tidy(5) >= 1);
+            let done = m.tidy(5);
+            assert!(done >= 1);
+            work += done;
             slices += 1;
             assert!(slices < 1_000_000);
         }
+        assert!(work <= priced, "{work} > {priced}");
+        assert_eq!(m.collapse_moves(), Some(0));
         assert_eq!(m.sources().count(), 1);
         let mut walked = Vec::new();
         m.walk(|k, _, v| {

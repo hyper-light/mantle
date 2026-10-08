@@ -21,6 +21,9 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+#[path = "support/rocks_workload.rs"]
+mod rocks_workload;
+
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::issuer::Issuer;
@@ -32,17 +35,29 @@ use mantle_engine::trunk::TrunkConfig;
 #[global_allocator]
 static ALLOCATOR: alloc::Counting = alloc::Counting;
 
-/// Starts a phase's count of every thread's allocations (the issuer's too) and of the
-/// process's page faults.
-fn begin() -> faults::Faults {
-    alloc::begin_process();
-    faults::read().unwrap()
+struct Mark {
+    faults: faults::Faults,
+    usage: Option<usage::Usage>,
 }
 
-/// A phase's allocations, reallocations and page faults, each per operation.
-fn costs(name: &str, ops: u64, from: &faults::Faults) {
+/// Starts a phase's allocation, fault and CPU counts for the whole process, the issuer
+/// and device workers included. OS accounts are read only at the phase boundaries.
+fn begin() -> Mark {
+    alloc::begin_process();
+    Mark {
+        faults: faults::read().unwrap(),
+        usage: usage::this().ok(),
+    }
+}
+
+/// A phase's whole-process costs per operation; CPU includes overlapping device work.
+fn costs(name: &str, ops: u64, from: &Mark) {
+    let process = usage::this()
+        .ok()
+        .zip(from.usage.as_ref())
+        .map(|(now, before)| now.since(before));
     let a = alloc::end_process();
-    let f = faults::read().unwrap().since(from);
+    let f = faults::read().unwrap().since(&from.faults);
     let line = format!(
         "{name} allocs/op {:.3} reallocs/op {:.3} bytes/op {:.1} faults/op {:.4} (allocs {} reallocs {} faults {})",
         a.allocations as f64 / ops as f64,
@@ -54,31 +69,74 @@ fn costs(name: &str, ops: u64, from: &faults::Faults) {
         f.total()
     );
     println!("{line}");
+    let per_op = |count: Option<u64>| {
+        count.map_or_else(
+            || "unavailable".to_string(),
+            |count| format!("{:.3}", count as f64 / ops as f64),
+        )
+    };
+    println!(
+        "{name} process_cpu_ns/op {} user_ns/op {} system_ns/op {} instructions/op {} cycles/op {} scope whole-process-including-issuer-and-device-workers",
+        per_op(process.and_then(|p| p.user_ns.checked_add(p.system_ns))),
+        per_op(process.map(|p| p.user_ns)),
+        per_op(process.map(|p| p.system_ns)),
+        per_op(process.and_then(|p| p.instructions)),
+        per_op(process.and_then(|p| p.cycles)),
+    );
 }
 
-struct Rng(u64);
+struct Rng {
+    legacy: u64,
+    rocks: Option<rocks_workload::Rng>,
+}
 impl Rng {
+    fn new(seed: Option<u64>, phase: u64) -> Self {
+        Self {
+            legacy: 301,
+            rocks: seed.map(|seed| rocks_workload::Rng::new(seed, phase)),
+        }
+    }
+
     fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
+        if let Some(rng) = &mut self.rocks {
+            return rng.next();
+        }
+        self.legacy = self.legacy.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.legacy;
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^ (z >> 31)
     }
 }
 
-/// db_bench's key: the number big-endian in the first 8 bytes, zeros after.
+/// db_bench's key: the number big-endian in the first 8 bytes, ASCII '0' after.
 fn key(n: u64) -> [u8; 16] {
-    let mut k = [0u8; 16];
-    k[..8].copy_from_slice(&n.to_be_bytes());
-    k
+    rocks_workload::key(n)
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args()
-        .skip(1)
-        .filter(|a| a != "--bench")
-        .collect();
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut rocks_seed = None;
+    let mut drain = true;
+    let mut args = Vec::new();
+    for arg in std::env::args().skip(1) {
+        if let Some(seed) = arg.strip_prefix("--rocks-seed=") {
+            rocks_seed = Some(seed.parse::<u64>()?);
+        } else if let Some(mode) = arg.strip_prefix("--maintenance=") {
+            drain = match mode {
+                "drain" => true,
+                "deferred" => false,
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--maintenance=drain|deferred",
+                    )
+                    .into());
+                }
+            };
+        } else if arg != "--bench" {
+            args.push(arg);
+        }
+    }
     let dir = PathBuf::from(args.first().expect("DIR"));
     let num: u64 = args.get(1).map_or(1_000_000, |s| s.parse().unwrap());
     let fanout: usize = args.get(2).map_or(8, |s| s.parse().unwrap());
@@ -167,9 +225,25 @@ fn main() {
         db.set_record_cache(record_mib << 20);
     }
     let value = [b'v'; 100];
-    let mut rng = Rng(301);
+    let mut rng = Rng::new(rocks_seed, 1);
+    println!(
+        "workload generator {} seed {:?} key_padding ascii-0 values repeated-v timing api-only attribution {attribute} maintenance {} owner_threads 1 issuer_depth {issuer_depth} runs_in_flight {batches}",
+        if rocks_seed.is_some() {
+            "rocksdb-mt19937_64"
+        } else {
+            "splitmix64"
+        },
+        rocks_seed.or(Some(301)),
+        if drain { "drain" } else { "deferred" }
+    );
+    println!(
+        "workers owner 1 issuer {} device {} total {}",
+        usize::from(issuer.is_some()),
+        issuer.as_ref().map_or(0, Issuer::depth),
+        1 + usize::from(issuer.is_some()) + issuer.as_ref().map_or(0, Issuer::depth)
+    );
     // Each operation timed, into a vector sized before the run: percentiles from the sorted
-    // samples, as db_bench's --histogram=1 times each of its operations.
+    // samples. db_bench's histogram instead includes harness work between completions.
     // Touched before the run, a write a page (zeroed memory is mapped only once written), so a
     // sample's push takes no page fault inside the timing.
     let mut lat: Vec<u64> = vec![0; num as usize];
@@ -263,7 +337,7 @@ fn main() {
     );
     // The first seek after the burst of puts, before any idle time: it inherits the memtable's
     // order work the fill left (review §3), timed alone, then a second at once.
-    {
+    if rocks_seed.is_none() {
         let mut page = mantle_engine::rows::Rows::new();
         let mut next = Vec::new();
         for which in ["first", "second"] {
@@ -283,9 +357,21 @@ fn main() {
         }
     }
     // The maintenance the fill left owed, paid as a shard pays it in idle time, before reads.
-    let t = Instant::now();
-    db.maintain(u64::MAX).unwrap();
-    println!("maintain {:.2}s", t.elapsed().as_secs_f64());
+    if drain {
+        let mark = begin();
+        let t = Instant::now();
+        db.maintain(u64::MAX).unwrap();
+        db.land()?;
+        let seconds = t.elapsed().as_secs_f64();
+        // Maintenance is charged per input put, rather than per maintenance step.
+        costs("maintain", num, &mark);
+        println!("maintain {seconds:.6}s");
+    } else {
+        println!("maintain deferred until after reads and seeks");
+    }
+    if let Some(seed) = rocks_seed {
+        rng = Rng::new(Some(seed), 2);
+    }
     let mut out = Vec::new();
     let mut found = 0u64;
     lat.clear();
@@ -390,6 +476,9 @@ fn main() {
         io2.cache_misses
     );
     if seeks > 0 {
+        if let Some(seed) = rocks_seed {
+            rng = Rng::new(Some(seed), 3);
+        }
         let mut page = mantle_engine::rows::Rows::new();
         let mut next = Vec::new();
         let mut keys_read = 0u64;
@@ -432,6 +521,15 @@ fn main() {
             seeks as f64 / s,
             s * 1e6 / seeks as f64
         );
+    }
+    if !drain {
+        let mark = begin();
+        let t = Instant::now();
+        db.maintain(u64::MAX)?;
+        db.land()?;
+        let seconds = t.elapsed().as_secs_f64();
+        costs("maintain-after-read", num, &mark);
+        println!("maintain after-read {seconds:.6}s");
     }
     if mix > 0 {
         let mut page = mantle_engine::rows::Rows::new();
@@ -528,6 +626,11 @@ fn main() {
     );
     let m = db.memory();
     println!(
+        "filter budget {} bytes {:.2} bits/input-key (input keys {num}; includes filters across branches)",
+        m.filters,
+        m.filters as f64 * 8.0 / num as f64
+    );
+    println!(
         "memory filters {} B ({:.2} B/key) indexes {} B ({:.3} B/key) counts {} B ranges {} B ({:.2} B/key) views {} B ({:.2} B/key)",
         m.filters,
         m.filters as f64 / num as f64,
@@ -541,6 +644,7 @@ fn main() {
     );
     drop(db);
     std::fs::remove_file(&path).unwrap();
+    Ok(())
 }
 
 /// Diagnostic: which operations are recorded with what the engine did inside them. A fixed

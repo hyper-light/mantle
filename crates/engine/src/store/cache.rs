@@ -24,7 +24,7 @@
 //! dropped from the cache (`forget`), so an address reused after its extent is freed never reads
 //! the page it held before.
 
-use std::collections::VecDeque;
+use std::num::NonZeroUsize;
 
 use crate::util::incmap::{IncMap, SWEEP};
 
@@ -53,6 +53,23 @@ enum Queue {
     Main,
 }
 
+/// A slot's index plus one, so an absent queue link occupies no extra word.
+fn slot_link(i: usize) -> Option<NonZeroUsize> {
+    i.checked_add(1).and_then(NonZeroUsize::new)
+}
+
+fn slot_index(link: NonZeroUsize) -> Option<usize> {
+    link.get().checked_sub(1)
+}
+
+/// A queue's newest and oldest slots. Each live slot is linked once, so forgetting an address
+/// removes its entry without leaving a queue to compact on a later admission.
+#[derive(Debug, Default)]
+struct Fifo {
+    newest: Option<NonZeroUsize>,
+    oldest: Option<NonZeroUsize>,
+}
+
 /// One cached page's slot.
 #[derive(Clone, Copy, Debug)]
 struct Slot {
@@ -61,9 +78,8 @@ struct Slot {
     queue: Queue,
     /// Whether the slot holds a page.
     live: bool,
-    /// Raised each time the slot takes a page: a queue entry of an earlier one is skipped where
-    /// its queue reaches it.
-    generation: u32,
+    newer: Option<NonZeroUsize>,
+    older: Option<NonZeroUsize>,
 }
 
 /// A page cache of at most `limit` pages.
@@ -76,10 +92,9 @@ pub struct Cache {
     bufs: Vec<Vec<u8>>,
     slots: Vec<Slot>,
     map: IncMap,
-    /// Slots and the generation each was queued at, newest at the front.
-    small: VecDeque<(usize, u32)>,
-    main: VecDeque<(usize, u32)>,
-    /// The pages each queue holds: its entries less those skipped.
+    small: Fifo,
+    main: Fifo,
+    /// The pages each queue holds.
     small_live: usize,
     main_live: usize,
     /// Evicted pages' addresses, each with the eviction's sequence: in the ghost while within
@@ -108,8 +123,8 @@ impl Cache {
             bufs: Vec::with_capacity(pages),
             slots: Vec::with_capacity(pages),
             map: IncMap::new(),
-            small: VecDeque::with_capacity(pages),
-            main: VecDeque::with_capacity(pages),
+            small: Fifo::default(),
+            main: Fifo::default(),
             small_live: 0,
             main_live: 0,
             ghosts: IncMap::new(),
@@ -214,7 +229,8 @@ impl Cache {
                 freq: 0,
                 queue,
                 live: true,
-                generation: slot.generation.wrapping_add(1),
+                newer: None,
+                older: None,
             };
         }
         self.push(queue, i);
@@ -240,40 +256,82 @@ impl Cache {
             freq: 0,
             queue: Queue::Small,
             live: false,
-            generation: 0,
+            newer: None,
+            older: None,
         });
         self.bufs.push(Vec::new());
         Some(i)
     }
 
     fn push(&mut self, queue: Queue, i: usize) {
-        let generation = self.slots.get(i).map_or(0, |s| s.generation);
-        let pages = self.limit;
-        let slots = &self.slots;
-        let current = |&(j, g): &(usize, u32)| {
-            slots
-                .get(j)
-                .is_some_and(|s| s.live && s.generation == g && s.queue == queue)
+        let Some(link) = slot_link(i) else {
+            return;
         };
-        let (q, live) = match queue {
-            Queue::Small => (&mut self.small, &mut self.small_live),
-            Queue::Main => (&mut self.main, &mut self.main_live),
+        let q = match queue {
+            Queue::Small => &mut self.small,
+            Queue::Main => &mut self.main,
         };
-        // Entries of forgotten pages wait in their queue until reached; past the cache's page
-        // count of them, the queue keeps only its current entries.
-        if q.len() >= pages.saturating_mul(2) {
-            q.retain(current);
+        let older = q.newest;
+        q.newest = Some(link);
+        if q.oldest.is_none() {
+            q.oldest = Some(link);
         }
-        q.push_front((i, generation));
-        *live = live.saturating_add(1);
+        if let Some(slot) = self.slots.get_mut(i) {
+            slot.newer = None;
+            slot.older = older;
+        }
+        if let Some(slot) = older
+            .and_then(slot_index)
+            .and_then(|j| self.slots.get_mut(j))
+        {
+            slot.newer = Some(link);
+        }
+        match queue {
+            Queue::Small => self.small_live = self.small_live.saturating_add(1),
+            Queue::Main => self.main_live = self.main_live.saturating_add(1),
+        }
     }
 
-    /// The slot an entry names, when the entry is its current one in `queue`.
-    fn current(&self, (i, g): (usize, u32), queue: Queue) -> Option<Slot> {
-        self.slots
-            .get(i)
-            .copied()
-            .filter(|s| s.live && s.generation == g && s.queue == queue)
+    /// Unlinks live slot `i`, touching only its neighbours and the queue's ends.
+    fn unlink(&mut self, i: usize) {
+        let Some(slot) = self.slots.get(i).copied().filter(|s| s.live) else {
+            return;
+        };
+        let Some(link) = slot_link(i) else {
+            return;
+        };
+        let q = match slot.queue {
+            Queue::Small => &mut self.small,
+            Queue::Main => &mut self.main,
+        };
+        if q.newest == Some(link) {
+            q.newest = slot.older;
+        }
+        if q.oldest == Some(link) {
+            q.oldest = slot.newer;
+        }
+        if let Some(s) = slot
+            .newer
+            .and_then(slot_index)
+            .and_then(|j| self.slots.get_mut(j))
+        {
+            s.older = slot.older;
+        }
+        if let Some(s) = slot
+            .older
+            .and_then(slot_index)
+            .and_then(|j| self.slots.get_mut(j))
+        {
+            s.newer = slot.newer;
+        }
+        if let Some(s) = self.slots.get_mut(i) {
+            s.newer = None;
+            s.older = None;
+        }
+        match slot.queue {
+            Queue::Small => self.small_live = self.small_live.saturating_sub(1),
+            Queue::Main => self.main_live = self.main_live.saturating_sub(1),
+        }
     }
 
     /// Drops `address` from the cache: a page written there replaces what was cached.
@@ -287,16 +345,13 @@ impl Cache {
         }
     }
 
-    /// Frees slot `i`: its queue entry is skipped when reached.
+    /// Frees slot `i` and removes its queue entry.
     fn release(&mut self, i: usize) {
+        self.unlink(i);
         if let Some(slot) = self.slots.get_mut(i)
             && slot.live
         {
             slot.live = false;
-            match slot.queue {
-                Queue::Small => self.small_live = self.small_live.saturating_sub(1),
-                Queue::Main => self.main_live = self.main_live.saturating_sub(1),
-            }
             self.free.push(i);
         }
     }
@@ -310,14 +365,15 @@ impl Cache {
     /// share, else from main. Whether one was freed.
     fn evict(&mut self, steps: usize) -> bool {
         let held = self.held();
-        for step in 0..steps {
+        let mut taken = 0u64;
+        for _ in 0..steps {
             if self.held() < held {
-                let step = u64::try_from(step).unwrap_or(u64::MAX);
-                self.evict_steps_most = self.evict_steps_most.max(step);
-                return true;
+                break;
             }
             self.step();
+            taken = taken.saturating_add(1);
         }
+        self.evict_steps_most = self.evict_steps_most.max(taken);
         self.held() < held
     }
 
@@ -334,14 +390,13 @@ impl Cache {
     /// The small queue's oldest page moves to main if it was read `PROMOTE` times, else is
     /// freed and remembered in the ghost.
     fn evict_small(&mut self) {
-        let Some(entry) = self.small.pop_back() else {
+        let Some(i) = self.small.oldest.and_then(slot_index) else {
             return;
         };
-        let Some(slot) = self.current(entry, Queue::Small) else {
+        let Some(slot) = self.slots.get(i).copied() else {
             return;
         };
-        let i = entry.0;
-        self.small_live = self.small_live.saturating_sub(1);
+        self.unlink(i);
         if slot.freq >= PROMOTE {
             if let Some(s) = self.slots.get_mut(i) {
                 s.queue = Queue::Main;
@@ -386,21 +441,20 @@ impl Cache {
 
     /// Main's oldest page goes round again with one read fewer if it has any, else is freed.
     fn evict_main(&mut self) {
-        let Some(entry) = self.main.pop_back() else {
+        let Some(i) = self.main.oldest.and_then(slot_index) else {
             return;
         };
-        let Some(slot) = self.current(entry, Queue::Main) else {
+        let Some(slot) = self.slots.get(i).copied() else {
             return;
         };
-        let i = entry.0;
+        self.unlink(i);
         if slot.freq > 0 {
             if let Some(s) = self.slots.get_mut(i) {
                 s.freq = s.freq.saturating_sub(1);
             }
-            self.main.push_front(entry);
+            self.push(Queue::Main, i);
             return;
         }
-        self.main_live = self.main_live.saturating_sub(1);
         if let Some(s) = self.slots.get_mut(i) {
             s.live = false;
         }
@@ -495,6 +549,8 @@ impl Cache {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::*;
 
     fn page(a: u64) -> Vec<u8> {
@@ -516,6 +572,54 @@ mod tests {
         let mut out = Vec::new();
         assert!(c.get(7, &mut out));
         assert_eq!(out, b"new");
+    }
+
+    #[test]
+    fn repeated_rewrites_and_invalidations_keep_serving_current_pages() {
+        let mut c = Cache::new(64, 64);
+        for a in 0..64u64 {
+            c.insert(a, &page(a));
+        }
+        for _ in 0..3 {
+            for a in 0..6u64 {
+                assert!(c.get(a, &mut Vec::new()));
+            }
+        }
+        // Rewrite pages throughout a full queue, including its newest page. Every rewrite
+        // replaces a cached address, which used to leave another entry for later cleanup.
+        for round in 0..512u64 {
+            let a = 6 + round % 58;
+            let payload = format!("rewrite {round}");
+            c.insert(a, payload.as_bytes());
+            let mut out = Vec::new();
+            assert!(c.get(a, &mut out));
+            assert_eq!(out, payload.as_bytes());
+        }
+        // A stream still admits its newest pages and retains the pages read again.
+        let mut admitted = 0;
+        for a in 64..256u64 {
+            c.insert(a, &page(a));
+            let mut out = Vec::new();
+            if c.get(a, &mut out) {
+                admitted += 1;
+                assert_eq!(out, page(a));
+            }
+        }
+        assert!(admitted > 0);
+        for a in 0..6u64 {
+            let mut out = Vec::new();
+            assert!(c.get(a, &mut out));
+            assert_eq!(out, page(a));
+        }
+        // Remove pages from main and small; the freed slots must serve only their new values.
+        for a in [0, 3, 5, 250, 253, 255] {
+            c.forget(a);
+            assert!(!c.get(a, &mut Vec::new()));
+            c.insert(a, b"replacement");
+            let mut out = Vec::new();
+            assert!(c.get(a, &mut out));
+            assert_eq!(out, b"replacement");
+        }
     }
 
     #[test]

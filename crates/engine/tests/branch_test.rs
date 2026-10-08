@@ -343,3 +343,37 @@ fn a_branch_keeps_its_keys_sorted_maplet_hashes_after_its_range_filter() {
     }
     assert_eq!(got, want);
 }
+
+#[test]
+fn successive_branches_of_different_sizes_keep_only_their_own_hashes() {
+    let mut s = store(93);
+    for n in [2048u32, 1, 4097, 17] {
+        let entries: BTreeMap<Vec<u8>, (Op, Vec<u8>)> = (0..n)
+            .map(|i| {
+                (
+                    format!("branch{n:08}/key{i:08}").into_bytes(),
+                    (Op::Put, vec![7; 20]),
+                )
+            })
+            .collect();
+        let mut builder = Builder::new(&mut s, Keys::Exactly(u64::from(n))).unwrap();
+        for (key, (op, value)) in &entries {
+            builder.add(&mut s, key, *op, value).unwrap();
+        }
+        builder.seal(&mut s).unwrap();
+        while !builder.write_filter(&mut s, 1).unwrap() {}
+        let branch = builder.into_branch(&mut s).unwrap();
+        let mut want: Vec<u32> = entries
+            .keys()
+            .map(|key| mantle_engine::maplet::hash32(mantle_engine::branch::filter::hash(key)))
+            .collect();
+        want.sort_unstable();
+        let mut cursor = branch.hashes(&s).unwrap();
+        let mut got = Vec::new();
+        while let Some(hash) = cursor.next(&mut s, &branch).unwrap() {
+            got.push(hash);
+        }
+        assert_eq!(got, want);
+        check(&mut s, &branch, &entries);
+    }
+}

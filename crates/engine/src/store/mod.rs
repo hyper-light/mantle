@@ -265,6 +265,11 @@ impl Lists {
 }
 
 impl Span {
+    /// Bytes a page read verified in this span: a cursor borrows them until its next read.
+    pub(crate) fn payload(&self, range: &std::ops::Range<usize>) -> Option<&[u8]> {
+        self.buf.as_slice().get(range.clone())
+    }
+
     /// Whether the span holds page `address`.
     fn holds(&self, address: u64) -> bool {
         address
@@ -337,12 +342,16 @@ fn corrupt(why: Malformed) -> Error {
 
 /// Appends the payload of the node page `page` read from `address` to `out`, once it verifies.
 fn node_payload(page: &[u8], address: u64, out: &mut Vec<u8>) -> Result<(), Error> {
+    out.extend_from_slice(node_payload_ref(page, address)?);
+    Ok(())
+}
+
+fn node_payload_ref(page: &[u8], address: u64) -> Result<&[u8], Error> {
     let header = page::verify(page, address)?;
     if header.kind != Kind::Node {
         return Err(corrupt(Malformed::UnknownTag(0)));
     }
-    out.extend_from_slice(page::payload(page, header)?);
-    Ok(())
+    page::payload(page, header)
 }
 
 impl<F: BlockFile> Store<F> {
@@ -1592,6 +1601,30 @@ impl<F: BlockFile> Store<F> {
         out: &mut Vec<u8>,
     ) -> Result<(), Error> {
         let started = self.timed.then(std::time::Instant::now);
+        let read = self
+            .read_page_ahead_timed(span, address, out)
+            .and_then(|range| {
+                if let Some(range) = range {
+                    out.extend_from_slice(
+                        span.payload(&range).ok_or(corrupt(Malformed::Truncated))?,
+                    );
+                }
+                Ok(())
+            });
+        self.io.ahead_ns = self.io.ahead_ns.saturating_add(elapsed_ns(started));
+        read
+    }
+
+    /// Reads as [`Self::read_page_ahead`] reads, returning the verified payload's range in
+    /// `span` when it lies there. A cache or queued page is appended to `out` instead. The span
+    /// belongs to its cursor, so a disk read or a held page can be parsed without another copy.
+    pub(crate) fn read_page_ahead_ref(
+        &mut self,
+        span: &mut Span,
+        address: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<Option<std::ops::Range<usize>>, Error> {
+        let started = self.timed.then(std::time::Instant::now);
         let read = self.read_page_ahead_timed(span, address, out);
         self.io.ahead_ns = self.io.ahead_ns.saturating_add(elapsed_ns(started));
         read
@@ -1602,7 +1635,7 @@ impl<F: BlockFile> Store<F> {
         span: &mut Span,
         address: u64,
         out: &mut Vec<u8>,
-    ) -> Result<(), Error> {
+    ) -> Result<Option<std::ops::Range<usize>>, Error> {
         if let Some(i) = span.pending_for(address) {
             // Read ahead: its extent becomes the span's, and reads ahead of extents passed go.
             for _ in 0..i {
@@ -1646,13 +1679,13 @@ impl<F: BlockFile> Store<F> {
             })
         {
             self.io.span_cache_hits = self.io.span_cache_hits.saturating_add(1);
-            return Ok(());
+            return Ok(None);
         }
         if demand && self.cache.as_ref().is_some_and(|c| c.in_ghost(address)) {
             self.io.ghost_misses = self.io.ghost_misses.saturating_add(1);
         }
         if held.is_none() && self.queued_page(address, out)? {
-            return Ok(());
+            return Ok(None);
         }
         let index = match held {
             Some(i) => i,
@@ -1671,15 +1704,17 @@ impl<F: BlockFile> Store<F> {
             .as_slice()
             .get(at..at.checked_add(size).ok_or(corrupt(Malformed::TooLarge))?)
             .ok_or(corrupt(Malformed::Truncated))?;
-        let from = out.len();
-        node_payload(page, address, out)?;
-        if demand
-            && let Some(c) = self.cache.as_mut()
-            && let Some(payload) = out.get(from..)
-        {
+        let payload = node_payload_ref(page, address)?;
+        if demand && let Some(c) = self.cache.as_mut() {
             c.insert(address, payload);
         }
-        Ok(())
+        let from = at
+            .checked_add(page::HEADER)
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        let end = from
+            .checked_add(payload.len())
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        Ok(Some(from..end))
     }
 
     /// Reads `address` and the pages after it in its extent, up to the file's end, into `span`.

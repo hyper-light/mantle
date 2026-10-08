@@ -529,6 +529,11 @@ impl Builder {
         self.filter.insert(h);
         let h32 = crate::maplet::hash32(h);
         self.hashes.push(h32);
+        // Scatter scratch is initialized as keys arrive, one entry a key. A recycled
+        // buffer's old entries need no clearing, and the seal initializes none.
+        if self.hash_scratch.len() < self.hashes.len() {
+            self.hash_scratch.push(0);
+        }
         self.hash_order.count(h32);
         self.keys.add(key)?;
         self.entry_bytes = self.entry_bytes.saturating_add(
@@ -754,13 +759,7 @@ impl Builder {
                 .div_ceil(self.capacity.max(1))
         });
         o.per_page = o.left(n).div_ceil(before.max(1));
-        // Scratch the scatter writes in full before reading: only past a recycled buffer's
-        // length is it initialized.
-        if self.hash_scratch.len() >= n {
-            self.hash_scratch.truncate(n);
-        } else {
-            self.hash_scratch.resize(n, 0);
-        }
+        self.hash_scratch.truncate(n);
     }
 
     /// Up to `budget` moves of the hashes' sort.
@@ -993,46 +992,7 @@ impl<'a> View<'a> {
     /// Where entry `i`'s suffix and its rest (operation and value, or child and count) lie in
     /// the page.
     fn ranges(&self, i: usize) -> Result<(std::ops::Range<usize>, std::ops::Range<usize>), Error> {
-        let slot = self
-            .table
-            .checked_add(i.checked_mul(OFFSET).ok_or(corrupt(Malformed::TooLarge))?)
-            .ok_or(corrupt(Malformed::TooLarge))?;
-        let at = self
-            .page
-            .get(slot..)
-            .and_then(<[u8]>::first_chunk::<2>)
-            .map(|b| usize::from(u16::from_le_bytes(*b)))
-            .ok_or(corrupt(Malformed::Truncated))?;
-        let len = self
-            .page
-            .get(at..)
-            .and_then(<[u8]>::first_chunk::<2>)
-            .map(|b| usize::from(u16::from_le_bytes(*b)))
-            .ok_or(corrupt(Malformed::Truncated))?;
-        let body = at.checked_add(2).ok_or(corrupt(Malformed::TooLarge))?;
-        let fixed = if self.kind == LEAF {
-            let vlen = self
-                .page
-                .get(body.saturating_add(1)..)
-                .and_then(<[u8]>::first_chunk::<2>)
-                .map(|b| usize::from(u16::from_le_bytes(*b)))
-                .ok_or(corrupt(Malformed::Truncated))?;
-            3usize
-                .checked_add(vlen)
-                .ok_or(corrupt(Malformed::TooLarge))?
-        } else {
-            16
-        };
-        let suffix_at = body
-            .checked_add(fixed)
-            .ok_or(corrupt(Malformed::TooLarge))?;
-        let suffix_end = suffix_at
-            .checked_add(len)
-            .ok_or(corrupt(Malformed::TooLarge))?;
-        if suffix_end > self.page.len() {
-            return Err(corrupt(Malformed::Truncated));
-        }
-        Ok((suffix_at..suffix_end, body..suffix_at))
+        entry_ranges(self.page, self.kind, self.table, i)
     }
 
     /// `key` against the page's key `i`: the prefix first, then the suffix.
@@ -1087,6 +1047,52 @@ impl<'a> View<'a> {
         }
         Ok(lo.checked_sub(1))
     }
+}
+
+/// An entry's ranges in a page whose header has been read: a cursor keeps its leaf's table
+/// offset while the page stays, so stepping decodes the entry alone.
+fn entry_ranges(
+    page: &[u8],
+    kind: u8,
+    table: usize,
+    i: usize,
+) -> Result<(std::ops::Range<usize>, std::ops::Range<usize>), Error> {
+    let slot = table
+        .checked_add(i.checked_mul(OFFSET).ok_or(corrupt(Malformed::TooLarge))?)
+        .ok_or(corrupt(Malformed::TooLarge))?;
+    let at = page
+        .get(slot..)
+        .and_then(<[u8]>::first_chunk::<2>)
+        .map(|b| usize::from(u16::from_le_bytes(*b)))
+        .ok_or(corrupt(Malformed::Truncated))?;
+    let len = page
+        .get(at..)
+        .and_then(<[u8]>::first_chunk::<2>)
+        .map(|b| usize::from(u16::from_le_bytes(*b)))
+        .ok_or(corrupt(Malformed::Truncated))?;
+    let body = at.checked_add(2).ok_or(corrupt(Malformed::TooLarge))?;
+    let fixed = if kind == LEAF {
+        let vlen = page
+            .get(body.saturating_add(1)..)
+            .and_then(<[u8]>::first_chunk::<2>)
+            .map(|b| usize::from(u16::from_le_bytes(*b)))
+            .ok_or(corrupt(Malformed::Truncated))?;
+        3usize
+            .checked_add(vlen)
+            .ok_or(corrupt(Malformed::TooLarge))?
+    } else {
+        16
+    };
+    let suffix_at = body
+        .checked_add(fixed)
+        .ok_or(corrupt(Malformed::TooLarge))?;
+    let suffix_end = suffix_at
+        .checked_add(len)
+        .ok_or(corrupt(Malformed::TooLarge))?;
+    if suffix_end > page.len() {
+        return Err(corrupt(Malformed::Truncated));
+    }
+    Ok((suffix_at..suffix_end, body..suffix_at))
 }
 
 impl Branch {
@@ -1381,8 +1387,12 @@ pub struct RunCursor {
     loaded: Option<u64>,
     index: usize,
     n: usize,
+    /// The prefix's end and entry table's start, read once when the leaf lands.
+    table: usize,
     page: Vec<u8>,
     span: Span,
+    /// The payload in the span when it was read there; a cache hit uses `page` instead.
+    span_page: Option<std::ops::Range<usize>>,
     key: Vec<u8>,
     /// Where the entry's value lies in the page: read in place, not copied out, since the page
     /// stays until the cursor moves to another.
@@ -1498,7 +1508,7 @@ impl Branch {
         let placed = (|| {
             let page_no = self.leaf_of(from)?;
             c.land(self, store, u64::from(page_no), 0)?;
-            let view = View::new(&c.page)?;
+            let view = View::new(c.page_data()?)?;
             // The first entry at least `from`: the floor if it equals it, else the one after.
             let i = match view.floor(from)? {
                 Some(i) if view.compare(from, i)? == Ordering::Equal => i,
@@ -1531,13 +1541,15 @@ impl Branch {
         let mut c = RunCursor::new(store)?;
         c.page_no = page_no;
         let address = self.page_address(store, page_no)?;
-        store.read_page_ahead(&mut c.span, address, &mut c.page)?;
+        c.span_page = store.read_page_ahead_ref(&mut c.span, address, &mut c.page)?;
         c.loaded = Some(address);
-        let view = View::new(&c.page)?;
+        let view = View::new(c.page_data()?)?;
         if view.kind != LEAF || index >= view.n {
             return Err(corrupt(Malformed::OutOfRange));
         }
-        c.n = view.n;
+        let (n, table) = (view.n, view.table);
+        c.n = n;
+        c.table = table;
         c.index = index;
         c.load()?;
         Ok(c)
@@ -1564,8 +1576,10 @@ impl RunCursor {
             loaded: None,
             index: 0,
             n: 0,
+            table: 0,
             page: store.take_page(),
             span,
+            span_page: None,
             // An entry fits a page, so buffers of a page from the pool never grow.
             key: store.take_page(),
             value: 0..0,
@@ -1596,13 +1610,15 @@ impl RunCursor {
     }
 
     pub fn value(&self) -> &[u8] {
-        self.page.get(self.value.clone()).unwrap_or(&[])
+        self.page_bytes()
+            .and_then(|page| page.get(self.value.clone()))
+            .unwrap_or(&[])
     }
 
     /// In the leaf held: the index of its first entry at least `key` (its entries when none
     /// is), and its entries.
     pub fn page_lower_bound(&self, key: &[u8]) -> Result<(usize, usize), Error> {
-        let view = View::new(&self.page)?;
+        let view = View::new(self.page_data()?)?;
         let i = match view.floor(key)? {
             Some(i) if view.compare(key, i)? == Ordering::Equal => i,
             Some(i) => i.saturating_add(1),
@@ -1673,13 +1689,18 @@ impl RunCursor {
     ) -> Result<(), Error> {
         let address = branch.page_address(store, page)?;
         if self.loaded != Some(address) {
+            self.loaded = None;
+            self.valid = false;
+            self.span_page = None;
             self.page.clear();
-            store.read_page_ahead(&mut self.span, address, &mut self.page)?;
-            let view = View::new(&self.page)?;
+            self.span_page = store.read_page_ahead_ref(&mut self.span, address, &mut self.page)?;
+            let view = View::new(self.page_data()?)?;
             if view.kind != LEAF {
                 return Err(corrupt(Malformed::CountMismatch));
             }
-            self.n = view.n;
+            let (n, table) = (view.n, view.table);
+            self.n = n;
+            self.table = table;
             self.loaded = Some(address);
             // A compaction's span reads the next extents ahead while this one is merged.
             let per = u64::from(store.extent_pages());
@@ -1751,15 +1772,35 @@ impl RunCursor {
         }
     }
 
+    fn page_data(&self) -> Result<&[u8], Error> {
+        self.page_bytes().ok_or(corrupt(Malformed::Truncated))
+    }
+
+    fn page_bytes(&self) -> Option<&[u8]> {
+        match &self.span_page {
+            Some(range) => self.span.payload(range),
+            None => Some(&self.page),
+        }
+    }
+
     fn load(&mut self) -> Result<(), Error> {
-        let view = View::new(&self.page)?;
-        let (suffix, rest) = view.ranges(self.index)?;
-        let tag = self.page.get(rest.start).copied().unwrap_or(0);
+        let page = match &self.span_page {
+            Some(range) => self
+                .span
+                .payload(range)
+                .ok_or(corrupt(Malformed::Truncated))?,
+            None => self.page.as_slice(),
+        };
+        let (suffix, rest) = entry_ranges(page, LEAF, self.table, self.index)?;
+        let tag = page.get(rest.start).copied().unwrap_or(0);
         self.op = Op::from_byte(tag).ok_or(corrupt(Malformed::UnknownTag(tag)))?;
         self.key.clear();
-        self.key.extend_from_slice(view.prefix);
+        self.key.extend_from_slice(
+            page.get(HEAD..self.table)
+                .ok_or(corrupt(Malformed::Truncated))?,
+        );
         self.key
-            .extend_from_slice(self.page.get(suffix).ok_or(corrupt(Malformed::Truncated))?);
+            .extend_from_slice(page.get(suffix).ok_or(corrupt(Malformed::Truncated))?);
         // The value follows the operation and its 2-byte length.
         let from = rest
             .start

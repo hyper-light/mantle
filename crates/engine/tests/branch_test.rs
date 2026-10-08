@@ -327,4 +327,19 @@ fn a_branch_keeps_its_keys_sorted_maplet_hashes_after_its_range_filter() {
     assert_eq!(used, desc.len());
     assert_eq!(back, branch);
     check(&mut s, &back, &entries);
+    // Written a page a call, the sort paced over the pages before the hashes: the same hashes.
+    let mut s = store(92);
+    let mut b = Builder::new(&mut s, Keys::Exactly(entries.len() as u64)).unwrap();
+    for (k, (op, v)) in &entries {
+        b.add(&mut s, k, *op, v).unwrap();
+    }
+    b.seal(&mut s).unwrap();
+    while !b.write_filter(&mut s, 1).unwrap() {}
+    let paced = b.into_branch(&mut s).unwrap();
+    let mut cursor = paced.hashes(&s).unwrap();
+    let mut got = Vec::new();
+    while let Some(h) = cursor.next(&mut s, &paced).unwrap() {
+        got.push(h);
+    }
+    assert_eq!(got, want);
 }

@@ -228,8 +228,10 @@ pub struct Lists {
     pub keys: SurfBuilder,
     pub range: Vec<u8>,
     pub index: Vec<u8>,
-    /// Each key's 32-bit maplet hash, sorted at the seal ([`crate::maplet`]).
+    /// Each key's 32-bit maplet hash, sorted after the seal ([`crate::maplet`]), and the sort's
+    /// scratch.
     pub hashes: Vec<u32>,
+    pub hash_scratch: Vec<u32>,
 }
 
 impl Lists {
@@ -239,6 +241,17 @@ impl Lists {
         self.index.clear();
         self.range.clear();
         self.hashes.clear();
+    }
+}
+
+impl Span {
+    /// Whether a read of `address` runs on from the last: it lands within what the next read,
+    /// at double the size, would cover.
+    fn runs_on(&self, address: u64) -> bool {
+        let held_end = self.first.saturating_add(u64::from(self.pages));
+        self.pages > 0
+            && address >= held_end
+            && address < held_end.saturating_add(u64::from(self.ahead).saturating_mul(2))
     }
 }
 
@@ -1357,16 +1370,27 @@ impl<F: BlockFile> Store<F> {
         let held = address
             .checked_sub(span.first)
             .filter(|&i| i < u64::from(span.pages));
-        // A page the cache holds is taken from it, not read again from the device: compaction
-        // reads pages written moments before, which the cache took as they were written. The
-        // look neither counts as a read nor moves the page, so a scan never promotes what it
-        // passes (S3-FIFO's scan resistance holds).
+        // A foreground scan's page that does not run on from its last read is the page a seek
+        // asked for: demand, as a point read's is. Its look counts as an access and a miss
+        // admits it, so short seeks repeated over a working set are served from memory as
+        // RocksDB's block cache serves them. Pages read ahead, a run-on scan's pages and a
+        // compaction's are only looked at: the look neither counts nor moves the page, so a long
+        // scan admits one page a jump and promotes nothing it passes (S3-FIFO's scan resistance
+        // holds).
+        let demand = held.is_none() && span.floor == 1 && !span.runs_on(address);
         if held.is_none()
             && let Some(c) = self.cache.as_mut()
-            && c.peek(address, out)
+            && (if demand {
+                c.get(address, out)
+            } else {
+                c.peek(address, out)
+            })
         {
             self.io.span_cache_hits = self.io.span_cache_hits.saturating_add(1);
             return Ok(());
+        }
+        if demand && self.cache.as_ref().is_some_and(|c| c.in_ghost(address)) {
+            self.io.ghost_misses = self.io.ghost_misses.saturating_add(1);
         }
         if held.is_none() && self.queued_page(address, out)? {
             return Ok(());
@@ -1388,7 +1412,15 @@ impl<F: BlockFile> Store<F> {
             .as_slice()
             .get(at..at.checked_add(size).ok_or(corrupt(Malformed::TooLarge))?)
             .ok_or(corrupt(Malformed::Truncated))?;
-        node_payload(page, address, out)
+        let from = out.len();
+        node_payload(page, address, out)?;
+        if demand
+            && let Some(c) = self.cache.as_mut()
+            && let Some(payload) = out.get(from..)
+        {
+            c.insert(address, payload);
+        }
+        Ok(())
     }
 
     /// Reads `address` and the pages after it in its extent, up to the file's end, into `span`.
@@ -1416,10 +1448,7 @@ impl<F: BlockFile> Store<F> {
         // A read runs on from the last when it lands within what the next read, at double the
         // size, would cover (a branch's index page between two leaves is passed over unread):
         // it doubles, up to the extent. Any other starts again at the floor.
-        let held_end = span.first.saturating_add(u64::from(span.pages));
-        let runs_on = span.pages > 0
-            && address >= held_end
-            && address < held_end.saturating_add(u64::from(span.ahead).saturating_mul(2));
+        let runs_on = span.runs_on(address);
         span.ahead = if runs_on {
             span.ahead.saturating_mul(2)
         } else {

@@ -318,8 +318,11 @@ pub struct Builder {
     keys: SurfBuilder,
     range: Vec<u8>,
     range_filter: Option<Surf>,
-    /// Each key's maplet hash, sorted at the seal and written after the range filter.
+    /// Each key's maplet hash, sorted after the seal and written after the range filter.
     hashes: Vec<u32>,
+    hash_scratch: Vec<u32>,
+    /// The hashes' sort: how many hold each value of each byte, counted as keys are added.
+    hash_order: HashOrder,
     /// The last key of the last leaf written.
     prev_last: Vec<u8>,
     count: u64,
@@ -335,6 +338,74 @@ pub struct Builder {
     entry_bytes: u64,
     /// The tree written, once [`Self::seal`] has run: what is left is its filter's pages.
     sealed: Option<Sealed>,
+}
+
+/// A least-significant-byte radix sort of a builder's hashes, a byte with one value across them
+/// skipped: the bytes left to scatter by, the pass at `pass`, its position `at` and where each
+/// value goes next; the moves each filter page written before the hashes pays, so the sort ends
+/// as the first hash page is due ([`Builder::write_filter`]).
+#[derive(Debug)]
+struct HashOrder {
+    counts: [[u32; 256]; 4],
+    passes: [usize; 4],
+    npass: usize,
+    pass: usize,
+    at: usize,
+    next: [u32; 256],
+    per_page: usize,
+}
+
+impl Default for HashOrder {
+    fn default() -> Self {
+        Self {
+            counts: [[0; 256]; 4],
+            passes: [0; 4],
+            npass: 0,
+            pass: 0,
+            at: 0,
+            next: [0; 256],
+            per_page: 0,
+        }
+    }
+}
+
+impl HashOrder {
+    fn count(&mut self, h: u32) {
+        for (counts, &b) in self.counts.iter_mut().zip(h.to_le_bytes().iter()) {
+            if let Some(c) = counts.get_mut(usize::from(b)) {
+                *c = c.saturating_add(1);
+            }
+        }
+    }
+
+    /// Readies pass `pass`: each value of its byte starts after the hashes of smaller values.
+    fn start_pass(&mut self) {
+        let Some(counts) = self
+            .passes
+            .get(self.pass)
+            .filter(|_| self.pass < self.npass)
+            .and_then(|&byte| self.counts.get(byte))
+        else {
+            return;
+        };
+        let mut sum = 0u32;
+        for (next, &count) in self.next.iter_mut().zip(counts.iter()) {
+            *next = sum;
+            sum = sum.saturating_add(count);
+        }
+    }
+
+    fn done(&self) -> bool {
+        self.pass >= self.npass
+    }
+
+    /// Moves left: the passes left over every hash.
+    fn left(&self, n: usize) -> usize {
+        self.npass
+            .saturating_sub(self.pass)
+            .saturating_mul(n)
+            .saturating_sub(self.at)
+    }
 }
 
 /// A sealed builder's fixed root and height, and its filter's pages: the first, the bytes in
@@ -379,6 +450,8 @@ impl Builder {
             range: lists.range,
             range_filter: None,
             hashes: lists.hashes,
+            hash_scratch: lists.hash_scratch,
+            hash_order: HashOrder::default(),
             prev_last: Vec::new(),
             count: 0,
             payload: Vec::with_capacity(capacity),
@@ -454,7 +527,9 @@ impl Builder {
         self.count = self.count.saturating_add(1);
         let h = filter::hash(key);
         self.filter.insert(h);
-        self.hashes.push(crate::maplet::hash32(h));
+        let h32 = crate::maplet::hash32(h);
+        self.hashes.push(h32);
+        self.hash_order.count(h32);
         self.keys.add(key)?;
         self.entry_bytes = self.entry_bytes.saturating_add(
             u64::try_from(key.len().saturating_add(value.len())).unwrap_or(u64::MAX),
@@ -592,7 +667,6 @@ impl Builder {
                     .ok_or(corrupt(Malformed::Truncated))?;
                 self.filter.fit(self.count);
                 self.build_index()?;
-                self.hashes.sort_unstable();
                 // The filter's pages follow the tree's in the branch's own extents.
                 self.sealed = Some(Sealed {
                     root,
@@ -608,6 +682,7 @@ impl Builder {
                     at: 0,
                     pages: 0,
                 });
+                self.start_hash_sort();
                 return Ok(());
             }
             if self.levels.get(level).is_some_and(|p| p.len() > 0) {
@@ -621,8 +696,17 @@ impl Builder {
     pub fn filter_pages_left(&self) -> u64 {
         let (total, at) = self
             .sealed
-            .map_or((self.filter.bytes(), 0), |s| (s.total, s.at));
+            .map_or((self.unsealed_bytes(), 0), |s| (s.total, s.at));
         u64::try_from(total.saturating_sub(at).div_ceil(self.capacity.max(1))).unwrap_or(u64::MAX)
+    }
+
+    /// What follows the tree before the seal, as far as known: the filter's bytes, each page's
+    /// count and each key's hash. The leaf index and range filter are sized only when built.
+    fn unsealed_bytes(&self) -> usize {
+        self.filter
+            .bytes()
+            .saturating_add(self.counts.len().saturating_mul(2))
+            .saturating_add(self.hashes.len().saturating_mul(4))
     }
 
     /// The keys a filter page is worth in a compaction's budget: as many bytes as a page, at
@@ -634,6 +718,71 @@ impl Builder {
             .checked_div(self.entry_bytes.max(1))
             .unwrap_or(1)
             .max(1)
+    }
+
+    /// Starts the hashes' sort at the seal: the bytes to scatter by, and the moves each page
+    /// written before the hashes pays so that it ends as the first hash page is due.
+    fn start_hash_sort(&mut self) {
+        let n = self.hashes.len();
+        let o = &mut self.hash_order;
+        let all = u32::try_from(n).unwrap_or(u32::MAX);
+        o.npass = 0;
+        for byte in 0..4 {
+            let varies = o
+                .counts
+                .get(byte)
+                .is_some_and(|c| c.iter().all(|&m| m != all));
+            if varies && let Some(p) = o.passes.get_mut(o.npass) {
+                *p = byte;
+                o.npass = o.npass.saturating_add(1);
+            }
+        }
+        o.pass = 0;
+        o.at = 0;
+        o.start_pass();
+        let before = self.sealed.map_or(0, |s| {
+            s.total
+                .saturating_sub(n.saturating_mul(4))
+                .div_ceil(self.capacity.max(1))
+        });
+        o.per_page = o.left(n).div_ceil(before.max(1));
+        // Scratch the scatter writes in full before reading: only past a recycled buffer's
+        // length is it initialized.
+        if self.hash_scratch.len() >= n {
+            self.hash_scratch.truncate(n);
+        } else {
+            self.hash_scratch.resize(n, 0);
+        }
+    }
+
+    /// Up to `budget` moves of the hashes' sort.
+    fn hash_sort_step(&mut self, budget: usize) {
+        let mut moved = 0usize;
+        while moved < budget && !self.hash_order.done() {
+            let o = &mut self.hash_order;
+            let Some(&byte) = o.passes.get(o.pass) else {
+                return;
+            };
+            let Some(&h) = self.hashes.get(o.at) else {
+                std::mem::swap(&mut self.hashes, &mut self.hash_scratch);
+                o.pass = o.pass.saturating_add(1);
+                o.at = 0;
+                o.start_pass();
+                continue;
+            };
+            let b = usize::from(h.to_le_bytes().get(byte).copied().unwrap_or(0));
+            if let Some(next) = o.next.get_mut(b) {
+                if let Some(d) = usize::try_from(*next)
+                    .ok()
+                    .and_then(|i| self.hash_scratch.get_mut(i))
+                {
+                    *d = h;
+                }
+                *next = next.saturating_add(1);
+            }
+            o.at = o.at.saturating_add(1);
+            moved = moved.saturating_add(1);
+        }
     }
 
     /// Writes up to `pages` of the sealed filter's pages, each copied from its blocks; true once
@@ -648,9 +797,17 @@ impl Builder {
         })?;
         let mut chunk = std::mem::take(&mut self.payload);
         let mut written = 0u64;
+        let hashes_at = s.total.saturating_sub(self.hashes.len().saturating_mul(4));
         while written < pages && s.at < s.total {
             chunk.clear();
             let end = s.at.saturating_add(self.capacity).min(s.total);
+            // Each page pays its share of the hashes' sort; a page holding hashes needs it done.
+            let share = if end > hashes_at {
+                usize::MAX
+            } else {
+                self.hash_order.per_page
+            };
+            self.hash_sort_step(share);
             self.stream_bytes(s.at..end, &mut chunk);
             let address = self.page(store)?;
             store.queue_page(&mut self.run, address, &chunk)?;
@@ -760,6 +917,7 @@ impl Builder {
             range: self.range,
             index: self.index,
             hashes: self.hashes,
+            hash_scratch: self.hash_scratch,
         });
         branch
     }

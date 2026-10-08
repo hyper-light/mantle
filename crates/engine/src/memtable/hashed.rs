@@ -146,6 +146,9 @@ struct Sort {
     lo: usize,
     group: Option<Group>,
     kept: usize,
+    /// Moves a put's entry pays the sort while the memtable fills ([`HashMem::order_put`]):
+    /// its debt at the start over its own entries, so it ends as the next chunk is due.
+    rate: usize,
 }
 
 /// A bottom-up merge sort by key of entries `[lo, hi)` whose prefixes tie, through the same
@@ -248,6 +251,9 @@ pub struct HashMem {
     /// taken before `skip` last shrank.
     tail: Vec<Keyed>,
     tail_stale: usize,
+    /// Entries of the tail whose share of the merges was paid as they were written
+    /// ([`Self::order_put`]): a seal pays only the rest.
+    prepaid: usize,
     /// The merges in progress, at most one a level.
     merges: Vec<Merge>,
     sort: Option<Sort>,
@@ -282,6 +288,7 @@ impl HashMem {
             runs: Vec::new(),
             tail: Vec::new(),
             tail_stale: 0,
+            prepaid: 0,
             merges: Vec::new(),
             sort: None,
             spare: Vec::new(),
@@ -300,6 +307,7 @@ impl HashMem {
         self.first.clear();
         self.skip = 0;
         self.tail_stale = 0;
+        self.prepaid = 0;
         self.closed = false;
         let (mut first, mut second) = (
             std::mem::take(&mut self.tail),
@@ -532,7 +540,8 @@ impl HashMem {
     pub fn seal(&mut self) {
         // A sort in progress is finished here, then the tail since is sorted: the walk needs the
         // order now.
-        let sealed = self.tail.len();
+        // Entries whose share of the merges their writes paid are not charged again.
+        let sealed = self.tail.len().saturating_sub(self.prepaid);
         self.finish_sort();
         self.start_sort();
         self.finish_sort();
@@ -711,6 +720,57 @@ impl HashMem {
         });
     }
 
+    /// The order work `entries` entries just written pay, for a memtable written as it fills:
+    /// the tail is sorted in chunks of at most `bound` entries (or, nearer its bound, of the
+    /// arena bytes left, `room`, so little is left at rotation), each paid at its own rate over
+    /// as many entries as it holds, so it ends as the next is due; a sort still open when the
+    /// next chunk is due is finished first, so the tail never passes twice `bound`. Each merge
+    /// in progress moves twice the entries written, as [`Self::seal`] pays it. A scan's seal
+    /// then sorts at most two chunks, however long the burst before it. Returns the work done.
+    pub fn order_put(&mut self, entries: usize, bound: usize, room: usize) -> usize {
+        let mut done = 0usize;
+        let due = self.tail.len() >= bound.max(1) || self.tail_bytes() >= room;
+        if due && self.sort.is_some() {
+            done = done.saturating_add(self.finish_sort_counted());
+        }
+        if due && self.sort.is_none() {
+            self.start_sort();
+        }
+        if let Some(s) = self.sort.as_mut() {
+            let budget = s.rate.saturating_mul(entries);
+            let (finished, moved) = sort_step(&self.arena, s, budget);
+            done = done.saturating_add(moved);
+            if finished {
+                self.end_sort();
+            }
+        }
+        self.prepaid = self.prepaid.saturating_add(entries).min(self.tail.len());
+        let mut i = 0;
+        while let Some(m) = self.merges.get_mut(i) {
+            let (finished, moved) = merge_step(&self.arena, m, entries.saturating_mul(2));
+            done = done.saturating_add(moved);
+            if finished {
+                self.end_merge(i);
+            } else {
+                i = i.saturating_add(1);
+            }
+        }
+        self.schedule();
+        done
+    }
+
+    /// [`Self::finish_sort`], returning the work it did.
+    fn finish_sort_counted(&mut self) -> usize {
+        let Some(s) = self.sort.as_mut() else {
+            return 0;
+        };
+        let (finished, moved) = sort_step(&self.arena, s, usize::MAX);
+        if finished {
+            self.end_sort();
+        }
+        moved
+    }
+
     /// Whether a sort is in progress.
     pub fn sorting(&self) -> bool {
         self.sort.is_some()
@@ -733,6 +793,7 @@ impl HashMem {
             return;
         }
         let src = std::mem::take(&mut self.tail);
+        self.prepaid = 0;
         let n = src.len();
         // Scratch the scatter writes in full before reading: a recycled buffer's old entries need
         // no clearing, only the part past them initializing.
@@ -766,7 +827,17 @@ impl HashMem {
             lo: 0,
             group: None,
             kept: 0,
+            rate: 0,
         });
+        if let Some(s) = self.sort.as_mut() {
+            let n = s.src.len();
+            // The debt as [`Self::debt`] counts it, over the chunk's own entries.
+            let debt = n
+                .saturating_mul(11)
+                .saturating_add(s.stale)
+                .saturating_add(1);
+            s.rate = debt.div_ceil(n.max(1));
+        }
     }
 
     /// The order work owed, in entries moved: what is left of the merge and the sort in progress,
@@ -1334,6 +1405,7 @@ mod tests {
                     0 => m.seal(),
                     1 => m.start_sort(),
                     2..=5 => { m.pay(usize::from(*action)); }
+                    6..=9 => { m.order_put(1, usize::from(*action) - 5, usize::MAX); }
                     _ => {}
                 }
             }
@@ -1428,6 +1500,42 @@ mod tests {
                 m.sources().count()
             );
         }
+    }
+
+    #[test]
+    fn a_memtable_ordered_as_it_fills_leaves_a_scan_at_most_two_chunks() {
+        // Each put pays its order work: however many puts, the tail and the sort in progress
+        // each hold at most twice the bound, so a seal sorts at most that much.
+        let bound = 64;
+        let mut m = HashMem::new(1 << 24).unwrap();
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut want: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        for i in 0..50_000u32 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let k = (x % 20_000).to_be_bytes();
+            m.insert(&k, Op::Put, &i.to_le_bytes()).unwrap();
+            want.insert(k.to_vec(), i.to_le_bytes().to_vec());
+            m.order_put(1, bound, usize::MAX);
+            assert!(m.tail.len() <= 2 * bound, "tail {} at {i}", m.tail.len());
+            let open = m.sort.as_ref().map_or(0, |s| s.src.len());
+            assert!(open <= 2 * bound, "sort of {open} at {i}");
+            let levels = usize::try_from(usize::BITS - m.len().leading_zeros()).unwrap();
+            assert!(
+                m.sources().count() <= 4 * levels,
+                "{} runs at {i}",
+                m.sources().count()
+            );
+        }
+        m.seal();
+        let mut walked = Vec::new();
+        m.walk(|k, _, v| {
+            walked.push((k.to_vec(), v.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(walked, want.into_iter().collect::<Vec<_>>());
     }
 
     #[test]

@@ -261,6 +261,27 @@ fn main() {
         num as f64 / s,
         s * 1e6 / num as f64
     );
+    // The first seek after the burst of puts, before any idle time: it inherits the memtable's
+    // order work the fill left (review §3), timed alone, then a second at once.
+    {
+        let mut page = mantle_engine::rows::Rows::new();
+        let mut next = Vec::new();
+        for which in ["first", "second"] {
+            let k = key(rng.next() % num);
+            let before = db.stats();
+            let o = Instant::now();
+            db.scan(&k, None, seek_nexts, &mut page, &mut next).unwrap();
+            let ns = o.elapsed().as_nanos() as u64;
+            let e = Slow::of(ns, before, db.stats());
+            println!(
+                "{which} seek after the fill {:.2} us (reads {}, {:.2} us)",
+                ns as f64 / 1000.0,
+                e.reads,
+                e.read_ns as f64 / 1000.0
+            );
+            page.clear();
+        }
+    }
     // The maintenance the fill left owed, paid as a shard pays it in idle time, before reads.
     let t = Instant::now();
     db.maintain(u64::MAX).unwrap();

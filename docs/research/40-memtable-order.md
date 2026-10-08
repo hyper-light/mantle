@@ -38,11 +38,15 @@ key's newest entry, and order is built separately, where it costs least.
   seal, a level holds at most two runs and one merge's two inputs
   (`however_often_scans_seal_a_walk_merges_logarithmically_many_runs`; paying `t` let runs reach 25
   at 49 entries).
-- **Paced as it fills.** The active memtable starts a sort once the tail since the last takes as
-  many arena bytes as the room left, and pays it over half that room, so the next sort is due as
-  this one ends. The rotated memtable then holds sorted runs and a few entries, and its packing
-  owes the walk alone. Sorting at rotation instead crowded the walk into the room's last fraction:
-  up to 171 entries packed in one put, p99 4.1–4.6 µs.
+- **Paced as it fills, in bounded chunks.** The active memtable sorts its tail in chunks of at
+  most `ORDER_BOUND` entries (or, near its bound, of the room left), each paid at its own rate
+  by the puts that follow it, so it ends as the next is due; a sort still open when the next
+  chunk is due is finished first. Each merge in progress moves twice the entries written
+  [OvL]; a seal charges only entries whose writes did not. A scan after any burst of puts then
+  sorts at most two chunks. Sorting in chunks of half the room left, as first built, made the
+  first seek after a fill sort half a memtable: 3.15 ms at 10M puts, 11.8 ms at 1M; bounded,
+  107 us and 60 us. Sorting only at rotation crowded the walk into the room's last fraction (up
+  to 171 entries packed in one put, p99 4.1-4.6 us).
 - **Walk.** A heap of the runs by their next entry; equal keys across runs yield the newest.
 - **Buffers.** A finished sort's scratch and a merge's inputs are kept as the spare for the next
   output; a cleared memtable keeps its two largest buffers and its index's table

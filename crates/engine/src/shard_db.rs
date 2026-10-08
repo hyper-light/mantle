@@ -171,7 +171,9 @@ pub struct ShardDb<F: BlockFile> {
     pack_carry: u128,
     trunk_carry: u128,
     /// The active memtable's order debt's carry ([`share`]).
-    order_carry: u128,
+    /// Entries the active memtable leaves unsorted at most before it sorts them
+    /// ([`Self::set_order_bound`]).
+    order_bound: usize,
     forget_carry: u128,
     flush_stats: FlushStats,
     /// The write memory the owner spares at most, and the pages written when the last cycle
@@ -419,6 +421,12 @@ fn share(debt: u64, bytes: usize, room: usize, carry: &mut u128) -> u64 {
         .min(debt)
 }
 
+/// Entries the active memtable leaves unsorted at most by default, about 50 us of the radix
+/// sort a scan inherits: the sort measured 20-30 ns an entry on the Apple M-series dev machine
+/// (benches/shard_db.rs, research/40), seeks' p99.9 measured 41-165 us there, so a scan after a
+/// burst of puts is held no longer than seeks' own tail (docs/design/constants.md).
+pub const ORDER_BOUND: usize = 2048;
+
 impl<F: BlockFile> ShardDb<F> {
     fn with(store: Store<F>, mem_limit: usize, trunk: Trunk) -> Result<Self, Error> {
         Ok(Self {
@@ -430,7 +438,7 @@ impl<F: BlockFile> ShardDb<F> {
             trunk,
             pack_carry: 0,
             trunk_carry: 0,
-            order_carry: 0,
+            order_bound: ORDER_BOUND,
             forget_carry: 0,
             flush_stats: FlushStats::default(),
             write_cap: 0,
@@ -562,6 +570,12 @@ impl<F: BlockFile> ShardDb<F> {
 
     /// Times maintenance, its phases and the store's I/O into [`FlushStats`], `TrunkStats` and
     /// `IoStats`: off by default, as a clock read each slice costs every put.
+    /// Sets the entries the active memtable leaves unsorted at most: what a scan after a burst
+    /// of puts may sort before it reads, against the merge work more, smaller chunks cost puts.
+    pub fn set_order_bound(&mut self, entries: usize) {
+        self.order_bound = entries.max(1);
+    }
+
     pub fn set_timed(&mut self, on: bool) {
         self.timed = on;
         self.trunk.set_timed(on);
@@ -1087,27 +1101,14 @@ impl<F: BlockFile> ShardDb<F> {
     /// pacing).
     fn pace(&mut self, bytes: usize) -> Result<(), Error> {
         let room = self.mem.room();
-        // The active memtable sorts its own entries as it fills, so the one it rotates to is
-        // nearly in order and its packing owes the walk alone. A sort starts once the entries
-        // since the last take as much as the room left, and is paid over half that room: by the
-        // time the next is due, it is done. Sorts of half the room left at each start leave a
-        // few entries for the rotation.
-        if !self.mem.sorting() && self.mem.tail_bytes() >= room {
-            self.mem.start_sort();
-        }
-        let order = self.mem.debt();
-        if order > 0 {
-            let w = share(
-                u64::try_from(order).unwrap_or(u64::MAX),
-                bytes,
-                room / 2,
-                &mut self.order_carry,
-            );
-            let t = self.timed.then(std::time::Instant::now);
-            self.mem.pay(usize::try_from(w).unwrap_or(usize::MAX));
-            let ns = ns_since(t);
-            self.flush_stats.order_ns = self.flush_stats.order_ns.saturating_add(ns);
-        }
+        // The active memtable sorts its own entries as it fills, in chunks of at most
+        // `order_bound` entries paid by the puts that write them, so the one it rotates to is
+        // nearly in order and its packing owes the walk alone, and a scan after any burst of
+        // puts sorts at most two chunks (HashMem::order_put).
+        let t = self.timed.then(std::time::Instant::now);
+        self.mem.order_put(1, self.order_bound, room);
+        let ns = ns_since(t);
+        self.flush_stats.order_ns = self.flush_stats.order_ns.saturating_add(ns);
         if let Some(p) = &self.packing {
             // The memtable rotates when a put no longer fits, before its room reaches nothing:
             // packing is paced over the room a put of this size leaves, so it ends first.

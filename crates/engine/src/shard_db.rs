@@ -174,6 +174,10 @@ pub struct ShardDb<F: BlockFile> {
     /// Entries the active memtable leaves unsorted at most before it sorts them
     /// ([`Self::set_order_bound`]).
     order_bound: usize,
+    /// Whether no write came since the last idle step: the active memtable's runs are merged
+    /// to one only then. Merging them while writes keep coming merges the large run with every
+    /// new small one, work a write's own chunk sorts and the level merges already bound.
+    quiet: bool,
     forget_carry: u128,
     flush_stats: FlushStats,
     /// The write memory the owner spares at most, and the pages written when the last cycle
@@ -439,6 +443,7 @@ impl<F: BlockFile> ShardDb<F> {
             pack_carry: 0,
             trunk_carry: 0,
             order_bound: ORDER_BOUND,
+            quiet: false,
             forget_carry: 0,
             flush_stats: FlushStats::default(),
             write_cap: 0,
@@ -903,6 +908,7 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     fn apply(&mut self, key: &[u8], op: Op, value: &[u8]) -> Result<(), Error> {
+        self.quiet = false;
         self.trim();
         // A write makes the key's cached record stale: it goes before the write is answered.
         if let Some(r) = self.records.as_mut() {
@@ -1258,7 +1264,12 @@ impl<F: BlockFile> ShardDb<F> {
             return self.trunk.maplet_step(&mut self.store, keys);
         }
         if self.mem.untidy() {
-            // The active memtable's runs merged to one, so a seek searches one.
+            // The active memtable's runs merged to one, so a seek searches one, once writes
+            // have stopped: the first idle step after a write only notes that none came since.
+            if !self.quiet {
+                self.quiet = true;
+                return Ok(1);
+            }
             let budget = usize::try_from(keys).unwrap_or(usize::MAX);
             return Ok(u64::try_from(self.mem.tidy(budget)).unwrap_or(u64::MAX));
         }

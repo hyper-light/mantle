@@ -237,6 +237,8 @@ fn digit(prefix: u64, byte: usize) -> usize {
 pub struct HashMem {
     arena: Vec<u8>,
     limit: usize,
+    /// The most bytes the arena has held: its pages written so far, which a clear keeps.
+    touched: usize,
     index: IncMap,
     /// Newest entries of keys whose hash another key's newest entry holds in `index`: a 64-bit
     /// hash shared by two keys, which the index cannot tell apart.
@@ -280,6 +282,7 @@ impl HashMem {
         Ok(Self {
             arena: Vec::with_capacity(limit),
             limit,
+            touched: 0,
             index: IncMap::new(),
             clashes: Vec::new(),
             len: 0,
@@ -300,6 +303,7 @@ impl HashMem {
     /// Empties the memtable for its next fill, keeping its arena and the two largest of its
     /// entry buffers: the tail's for the next fill's entries, the spare for its sort.
     pub fn clear(&mut self) {
+        self.touched = self.touched.max(self.arena.len());
         self.arena.clear();
         self.index.clear();
         self.clashes.clear();
@@ -344,36 +348,42 @@ impl HashMem {
         self.len == 0
     }
 
-    /// The bytes the memtable occupies: the arena's used bytes rounded up to a 4 KiB page, its
-    /// index, and the entries its runs, tail and work in progress hold.
+    /// The bytes the memtable holds: the arena's pages as far as it was ever filled, its
+    /// index's table, its entry buffers and its sort's histogram, each at its capacity. A
+    /// cleared memtable keeps them all for its next fill (the arena reserved once and written
+    /// only so far, the buffers recycled), so what it holds is what it was given, not what it
+    /// now uses.
     pub fn memory(&self) -> usize {
         let page = |n: usize| n.div_ceil(4096).saturating_mul(4096);
-        let sort = self
-            .sort
-            .as_ref()
-            .map_or(0, |s| s.src.len().saturating_add(s.dst.len()));
         let counts = if self.sort.is_some() || self.counts.is_some() {
             size_of::<[[u32; 256]; 8]>()
         } else {
             0
         };
-        let merge = self.merges.iter().fold(self.spare.capacity(), |sum, m| {
-            sum.saturating_add(m.a.keys.len())
-                .saturating_add(m.b.keys.len())
+        let sort = self
+            .sort
+            .as_ref()
+            .map_or(0, |s| s.src.capacity().saturating_add(s.dst.capacity()));
+        let merge = self.merges.iter().fold(0usize, |sum, m| {
+            sum.saturating_add(m.a.keys.capacity())
+                .saturating_add(m.b.keys.capacity())
                 .saturating_add(m.out.keys.capacity())
         });
         let keyed = self
             .runs
             .iter()
-            .map(|r| r.keys.len())
-            .fold(self.tail.len(), usize::saturating_add)
+            .map(|r| r.keys.capacity())
+            .fold(self.tail.capacity(), usize::saturating_add)
+            .saturating_add(self.spare.capacity())
             .saturating_add(sort)
             .saturating_add(merge)
             .saturating_mul(size_of::<Keyed>());
-        page(self.arena.len())
+        page(self.touched.max(self.arena.len()))
             .saturating_add(self.index.bytes())
             .saturating_add(keyed)
             .saturating_add(counts)
+            .saturating_add(self.first.capacity())
+            .saturating_add(self.clashes.capacity().saturating_mul(size_of::<u32>()))
     }
 
     /// Arena bytes left before the bound.
@@ -1536,6 +1546,21 @@ mod tests {
         })
         .unwrap();
         assert_eq!(walked, want.into_iter().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_cleared_memtable_still_counts_what_it_holds() {
+        // Cleared for reuse, it keeps the arena's written pages, its index's table and its
+        // buffers: what it holds is not what it now uses.
+        let mut m = HashMem::new(1 << 22).unwrap();
+        for i in 0..20_000u32 {
+            m.insert(&i.to_be_bytes(), Op::Put, &[7; 100]).unwrap();
+        }
+        m.seal();
+        let filled = m.bytes();
+        m.clear();
+        assert_eq!(m.bytes(), 0);
+        assert!(m.memory() >= filled, "{} < {filled}", m.memory());
     }
 
     #[test]

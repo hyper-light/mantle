@@ -40,6 +40,13 @@ const PROMOTE: u8 = 2;
 /// Cited: a page's read count's cap (libCacheSim `S3FIFO.c`, `MIN(freq, 3)`).
 const MAX_FREQ: u8 = 3;
 
+/// Queue steps an insert may take to free a slot: S3-FIFO's amortized cost of an eviction. A
+/// page moves from small to main at most once and goes round main at most `MAX_FREQ` times
+/// before it is freed, each a step, so evictions take `MAX_FREQ + 2` steps a slot on average
+/// (Yang et al., SOSP '23, §4); a bound of that keeps up with inserts over time while no one
+/// insert sweeps the queues.
+const EVICT_STEPS: usize = MAX_FREQ as usize + 2;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Queue {
     Small,
@@ -86,6 +93,8 @@ pub struct Cache {
     misses: u64,
     /// The most queue steps one eviction took.
     evict_steps_most: u64,
+    /// Inserts left out because their bounded eviction freed no slot.
+    skipped: u64,
 }
 
 impl Cache {
@@ -110,6 +119,7 @@ impl Cache {
             hits: 0,
             misses: 0,
             evict_steps_most: 0,
+            skipped: 0,
         }
     }
 
@@ -177,8 +187,13 @@ impl Cache {
             return;
         }
         self.forget(address);
-        if self.held() >= self.limit {
-            self.evict();
+        // Admission is optional: the page is the caller's whether or not the cache keeps it. An
+        // eviction may cost a step for each page the queues cycle, so it is bounded at the
+        // policy's own amortized cost, and an insert whose bound frees no slot leaves the page
+        // out; the queues keep their place, so the next insert goes on from there.
+        if self.held() >= self.limit && !self.evict(EVICT_STEPS) {
+            self.skipped = self.skipped.saturating_add(1);
+            return;
         }
         let Some(i) = self.slot() else {
             return;
@@ -291,24 +306,28 @@ impl Cache {
         self.map.get(address).and_then(|i| usize::try_from(i).ok())
     }
 
-    /// Frees one slot: from the small queue while it holds its share, else from main.
-    fn evict(&mut self) {
+    /// Frees one slot within `steps` queue steps: from the small queue while it holds its
+    /// share, else from main. Whether one was freed.
+    fn evict(&mut self, steps: usize) -> bool {
         let held = self.held();
-        // Each pass frees a slot or moves one page between queues, and each page moves to main
-        // at most once and goes round main at most `MAX_FREQ` times before it is freed: a slot
-        // is freed within that many steps a page.
-        let bound = self.slots.len().saturating_mul(usize::from(MAX_FREQ) + 2);
-        for step in 0..bound {
+        for step in 0..steps {
             if self.held() < held {
                 let step = u64::try_from(step).unwrap_or(u64::MAX);
                 self.evict_steps_most = self.evict_steps_most.max(step);
-                return;
+                return true;
             }
-            if self.small_live >= self.small_cap() || self.main_live == 0 {
-                self.evict_small();
-            } else {
-                self.evict_main();
-            }
+            self.step();
+        }
+        self.held() < held
+    }
+
+    /// One queue step of eviction: the small queue's oldest page while that queue holds its
+    /// share, else main's.
+    fn step(&mut self) {
+        if self.small_live >= self.small_cap() || self.main_live == 0 {
+            self.evict_small();
+        } else {
+            self.evict_main();
         }
     }
 
@@ -396,14 +415,16 @@ impl Cache {
         self.limit = pages.max(1);
     }
 
-    /// Up to `n` steps toward the limit: pages freed by the cache's own rule (S3-FIFO's
-    /// evictions), then freed buffers dropped. True while the cache is still above it.
+    /// Up to `n` queue steps toward the limit: pages freed by the cache's own rule (S3-FIFO's
+    /// evictions), then up to `n` freed buffers dropped. True while the cache is still above it.
     pub fn trim(&mut self, n: usize) -> bool {
+        // `n` queue steps, not `n` evictions: an eviction may take a step for each page the
+        // queues cycle.
         for _ in 0..n {
             if self.held() <= self.limit {
                 break;
             }
-            self.evict();
+            self.step();
         }
         for _ in 0..n {
             if self.held().saturating_add(self.free.len()) <= self.limit {
@@ -459,6 +480,11 @@ impl Cache {
         self.evict_steps_most
     }
 
+    /// Inserts left out because their bounded eviction freed no slot.
+    pub fn skipped(&self) -> u64 {
+        self.skipped
+    }
+
     /// The cache's bytes in memory: its pages' buffers, held or freed.
     pub fn bytes(&self) -> usize {
         self.held()
@@ -490,6 +516,47 @@ mod tests {
         let mut out = Vec::new();
         assert!(c.get(7, &mut out));
         assert_eq!(out, b"new");
+    }
+
+    #[test]
+    fn an_insert_into_a_cache_read_hot_takes_a_bounded_step_count_and_still_admits() {
+        // Every page read to the most frequency: freeing a slot takes a step a page round
+        // main, which no one insert pays. Each takes at most the bound, the pages it does not
+        // admit are only left out, and the hand goes on, so new pages are admitted again.
+        let n = 2048u64;
+        let mut c = Cache::new(usize::try_from(n).unwrap(), 64);
+        for a in 0..n {
+            c.insert(a, &page(a));
+        }
+        for _ in 0..usize::from(MAX_FREQ) + 2 {
+            for a in 0..n {
+                assert!(c.get(a, &mut Vec::new()));
+            }
+        }
+        let mut admitted = 0u64;
+        for a in n..4 * n {
+            c.insert(a, &page(a));
+            if c.get(a, &mut Vec::new()) {
+                admitted += 1;
+            }
+        }
+        assert!(
+            c.evict_steps_most() <= EVICT_STEPS as u64,
+            "{}",
+            c.evict_steps_most()
+        );
+        assert!(
+            c.skipped() > 0 && admitted > 0,
+            "skipped {} admitted {admitted}",
+            c.skipped()
+        );
+        // Whatever it holds reads back exactly.
+        for a in 0..4 * n {
+            let mut out = Vec::new();
+            if c.get(a, &mut out) {
+                assert_eq!(out, page(a));
+            }
+        }
     }
 
     #[test]

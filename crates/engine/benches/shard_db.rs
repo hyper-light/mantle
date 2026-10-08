@@ -355,10 +355,11 @@ fn main() {
     let u = usage::this().ok();
     let mib = |b: Option<u64>| b.map_or(f64::NAN, |b| b as f64 / 1048576.0);
     println!(
-        "memory held cache {:.1} MiB write {:.1} MiB records {:.1} MiB; indexes cache {:.1} MiB records {:.1} MiB; process footprint {:.1} MiB (peak {:.1})",
+        "memory held cache {:.1} MiB write {:.1} MiB records {:.1} MiB memtables {:.1} MiB; indexes cache {:.1} MiB records {:.1} MiB; process footprint {:.1} MiB (peak {:.1})",
         c as f64 / 1048576.0,
         w as f64 / 1048576.0,
         r as f64 / 1048576.0,
+        db.memtable_bytes() as f64 / 1048576.0,
         ci as f64 / 1048576.0,
         ri as f64 / 1048576.0,
         mib(u.as_ref().and_then(|u| u.footprint)),

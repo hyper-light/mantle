@@ -635,6 +635,16 @@ impl<F: BlockFile> ShardDb<F> {
         ) = (0, 0, 0);
     }
 
+    /// The bytes the memtables hold: the active one, the one packing and the spare kept for
+    /// the next rotation, each as [`HashMem::memory`] counts it. They sit beside the budget
+    /// [`Self::set_memory`] divides, as RocksDB's write buffers sit beside its block cache.
+    pub fn memtable_bytes(&self) -> usize {
+        self.mem
+            .memory()
+            .saturating_add(self.packing.as_ref().map_or(0, |p| p.mem.memory()))
+            .saturating_add(self.spare.as_ref().map_or(0, HashMem::memory))
+    }
+
     /// The memory the page cache, write memory and record cache have now, in bytes.
     pub fn memory_split(&self) -> (usize, usize, usize) {
         let (pages, _) = self.store.cache_pages();

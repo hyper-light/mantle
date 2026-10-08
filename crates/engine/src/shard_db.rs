@@ -1016,13 +1016,13 @@ impl<F: BlockFile> ShardDb<F> {
             p.mem.seal();
         }
         let mut active = std::mem::replace(&mut self.scan_active, MemCursor::empty());
-        // The seek is timed when the runs are many: the price of the comparisons they add.
+        // A seek of the runs is timed when they are many: the price of the comparisons they add.
         let (many, one) = self.mem.seek_comparisons();
         let step_extra = self.mem.step_comparisons();
         let t = (many > one).then(std::time::Instant::now);
         active.seek(&self.mem, from)?;
         let seek_ns = ns_since(t);
-        let mut stepped = 0u64;
+        let seek_timed = t.is_some() && active.walk.run_work().0 > 0;
         let mut packing = match &self.packing {
             Some(p) => {
                 let mut c = std::mem::replace(&mut self.scan_packing, MemCursor::empty());
@@ -1097,7 +1097,6 @@ impl<F: BlockFile> ShardDb<F> {
                     taken = taken.saturating_add(1);
                 }
                 active.advance(&self.mem)?;
-                stepped = stepped.saturating_add(1);
             }
             if let (Some(c), Some(p)) = (packing.as_mut(), self.packing.as_ref())
                 && c.key() == Some(key.as_slice())
@@ -1130,8 +1129,15 @@ impl<F: BlockFile> ShardDb<F> {
         if let Some(c) = packing {
             self.scan_packing = c;
         }
-        if t.is_some() {
-            self.charge_runs(seek_ns, many, one, stepped, step_extra);
+        // What the walks merged from the runs stays merged for the next seek of that range.
+        let (run_seeks, run_steps) = self.scan_active.walk.run_work();
+        self.mem.adopt(&mut self.scan_active.walk);
+        if let Some(p) = self.packing.as_mut() {
+            p.mem.adopt(&mut self.scan_packing.walk);
+        }
+        if many > one {
+            let seek_ns = if seek_timed { Some(seek_ns) } else { None };
+            self.charge_runs(seek_ns, many, one, run_seeks, run_steps, step_extra);
         }
         Ok(more)
     }
@@ -1251,32 +1257,32 @@ impl<F: BlockFile> ShardDb<F> {
         Ok(())
     }
 
-    /// Charges a scan's seek of `seek_ns` over runs making `many` comparisons where one run would
-    /// make `one`, and its `stepped` steps each `step_extra` comparisons more than one run's, to
-    /// the rent the runs being many have cost: the seek's measured time a comparison, times the
-    /// comparisons they added.
+    /// Charges a scan's `run_seeks` seeks of the runs, each `many` comparisons where one run would
+    /// make `one`, and its `run_steps` heap steps, each `step_extra` comparisons more than one
+    /// run's, to the rent the runs being many have cost, at the measured price of a seek's
+    /// comparison; `seek_ns`, when its first seek was of the runs, measures it again.
     fn charge_runs(
         &mut self,
-        seek_ns: u64,
+        seek_ns: Option<u64>,
         many: usize,
         one: usize,
-        stepped: u64,
+        run_seeks: u64,
+        run_steps: u64,
         step_extra: usize,
     ) {
-        let many64 = u64::try_from(many).unwrap_or(u64::MAX);
-        if many64 == 0 {
-            return;
+        let wide = |n: usize| u128::from(u64::try_from(n).unwrap_or(u64::MAX));
+        if let Some(ns) = seek_ns {
+            self.seek_ns = self.seek_ns.saturating_add(ns);
+            self.seek_cmps = self
+                .seek_cmps
+                .saturating_add(u64::try_from(many).unwrap_or(u64::MAX));
         }
-        self.seek_ns = self.seek_ns.saturating_add(seek_ns);
-        self.seek_cmps = self.seek_cmps.saturating_add(many64);
-        let extra = u128::from(u64::try_from(many.saturating_sub(one)).unwrap_or(u64::MAX))
-            .saturating_add(
-                u128::from(stepped)
-                    .saturating_mul(u128::from(u64::try_from(step_extra).unwrap_or(u64::MAX))),
-            );
-        let rent = u128::from(seek_ns)
+        let extra = u128::from(run_seeks)
+            .saturating_mul(wide(many.saturating_sub(one)))
+            .saturating_add(u128::from(run_steps).saturating_mul(wide(step_extra)));
+        let rent = u128::from(self.seek_ns)
             .saturating_mul(extra)
-            .checked_div(u128::from(many64))
+            .checked_div(u128::from(self.seek_cmps))
             .unwrap_or(0);
         self.tidy_rent_ns = self
             .tidy_rent_ns

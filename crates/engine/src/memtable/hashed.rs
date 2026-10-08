@@ -278,6 +278,18 @@ pub struct HashMem {
     /// Closed to writes for packing: every entry is to be sorted, the tail as soon as the sort in
     /// progress ends.
     closed: bool,
+    /// Key ranges a scan's walk merged from the runs, in key order and disjoint, each holding the
+    /// newest entry of every key in it: a seek into one walks it alone (adaptive merging; Graefe
+    /// and Kuno, EDBT 2010). A write into one drops it. Disjoint, they hold each key once at most.
+    hot: Vec<Hot>,
+}
+
+/// A key range of a memtable merged by a scan's walk ([`HashMem::hot`]): the newest entry of
+/// each key from its first to its last, and whether the next range follows with no key between.
+#[derive(Debug)]
+struct Hot {
+    keys: Vec<Keyed>,
+    joins_next: bool,
 }
 
 impl HashMem {
@@ -309,6 +321,7 @@ impl HashMem {
             spare: Vec::new(),
             counts: None,
             closed: false,
+            hot: Vec::new(),
         })
     }
 
@@ -338,7 +351,8 @@ impl HashMem {
                     .drain(..)
                     .flat_map(|m| [m.a.keys, m.b.keys, m.out.keys]),
             )
-            .chain(self.sort.take().into_iter().flat_map(|s| [s.src, s.dst]));
+            .chain(self.sort.take().into_iter().flat_map(|s| [s.src, s.dst]))
+            .chain(self.hot.drain(..).map(|h| h.keys));
         for buf in freed {
             keep_largest(buf, &mut first, &mut second);
         }
@@ -389,6 +403,11 @@ impl HashMem {
             .saturating_add(self.spare.capacity())
             .saturating_add(sort)
             .saturating_add(merge)
+            .saturating_add(
+                self.hot
+                    .iter()
+                    .fold(0usize, |sum, h| sum.saturating_add(h.keys.capacity())),
+            )
             .saturating_mul(size_of::<Keyed>());
         page(self.touched.max(self.arena.len()))
             .saturating_add(self.index.bytes())
@@ -396,6 +415,7 @@ impl HashMem {
             .saturating_add(counts)
             .saturating_add(self.first.capacity())
             .saturating_add(self.clashes.capacity().saturating_mul(size_of::<u32>()))
+            .saturating_add(self.hot.capacity().saturating_mul(size_of::<Hot>()))
     }
 
     /// Arena bytes left before the bound.
@@ -516,6 +536,9 @@ impl HashMem {
                 self.skip = shared;
                 self.tail_stale = self.tail.len();
             }
+        }
+        if !self.hot.is_empty() {
+            self.unmerge(key);
         }
         self.arena.push(match op {
             Op::Put => 1,
@@ -698,7 +721,12 @@ impl HashMem {
                 return 0;
             }
         }
-        self.pay(budget).max(1)
+        let done = self.pay(budget).max(1);
+        if !self.untidy() {
+            // One run: a seek searches it alone, and the merged ranges save nothing.
+            self.drop_hot();
+        }
+        done
     }
 
     /// The entries [`Self::tidy`] moves to leave one run: the order work owed, the tail's sort, then
@@ -1080,14 +1108,149 @@ impl HashMem {
         Ok(walk)
     }
 
-    /// [`Self::walk_from`] into `walk`, its allocation kept.
+    /// [`Self::walk_from`] into `walk`, its allocation kept. Over more than one run, a seek into
+    /// a merged range walks it alone, and the walk records what it merges from the runs.
     pub fn walk_from_into(&self, from: &[u8], walk: &mut Walk) -> Result<(), Error> {
+        walk.hot = None;
+        walk.watch = None;
+        walk.record.clear();
+        walk.stretches.clear();
+        walk.run_seeks = 0;
+        walk.run_steps = 0;
+        walk.recording = self.sources().nth(1).is_some();
+        if walk.recording && !self.hot.is_empty() {
+            let p = self.hot.partition_point(|h| self.hot_lo(h) <= from);
+            if let Some(i) = p.checked_sub(1)
+                && let Some(h) = self.hot.get(i)
+            {
+                if self.hot_hi(h).is_some_and(|hi| from <= hi) {
+                    let at = h.keys.partition_point(|k| self.key(k.entry) < from);
+                    walk.hot = Some((i, at));
+                    return Ok(());
+                }
+                if h.joins_next && p < self.hot.len() {
+                    walk.hot = Some((p, 0));
+                    return Ok(());
+                }
+            }
+            walk.watch = Some(p).filter(|&p| p < self.hot.len());
+        }
         walk.at.clear();
         for (skip, run) in self.sources() {
             walk.at.push(self.seek_run(run, skip, from));
         }
         self.heapify(walk);
+        walk.run_seeks = 1;
+        walk.stretches.push(Stretch {
+            start: 0,
+            after: None,
+            joins: false,
+        });
         Ok(())
+    }
+
+    /// Moves `walk` onto the runs past `after`, the last key of merged range `i`: its record
+    /// continues that range.
+    fn walk_runs_after(&self, walk: &mut Walk, i: usize, after: &[u8]) {
+        walk.at.clear();
+        for (skip, run) in self.sources() {
+            let at = self.seek_run(run, skip, after);
+            // A run holds a key once: past it if this is it.
+            let past = run.get(at).is_some_and(|k| self.key(k.entry) == after);
+            walk.at.push(if past { at.saturating_add(1) } else { at });
+        }
+        self.heapify(walk);
+        walk.hot = None;
+        walk.watch = Some(i.saturating_add(1)).filter(|&w| w < self.hot.len());
+        walk.run_seeks = walk.run_seeks.saturating_add(1);
+        walk.stretches.push(Stretch {
+            start: walk.record.len(),
+            after: Some(i),
+            joins: false,
+        });
+    }
+
+    /// A merged range's first key.
+    fn hot_lo(&self, h: &Hot) -> &[u8] {
+        h.keys.first().map_or(&[], |k| self.key(k.entry))
+    }
+
+    /// A merged range's last key.
+    fn hot_hi(&self, h: &Hot) -> Option<&[u8]> {
+        h.keys.last().map(|k| self.key(k.entry))
+    }
+
+    /// A write of `key`: the merged range holding it no longer holds its newest entry and goes,
+    /// and the range before no longer joins the next with no key between.
+    fn unmerge(&mut self, key: &[u8]) {
+        let p = self.hot.partition_point(|h| self.hot_lo(h) <= key);
+        let Some(i) = p.checked_sub(1) else {
+            return;
+        };
+        let inside = self
+            .hot
+            .get(i)
+            .and_then(|h| self.hot_hi(h))
+            .is_some_and(|hi| key <= hi);
+        if inside {
+            let h = self.hot.remove(i);
+            self.recycle(h.keys);
+            if let Some(before) = i.checked_sub(1).and_then(|b| self.hot.get_mut(b)) {
+                before.joins_next = false;
+            }
+        } else if let Some(h) = self.hot.get_mut(i) {
+            h.joins_next = false;
+        }
+    }
+
+    /// Drops every merged range.
+    fn drop_hot(&mut self) {
+        while let Some(h) = self.hot.pop() {
+            self.recycle(h.keys);
+        }
+    }
+
+    /// Keeps what `walk`, a walk of this memtable unchanged since its seek, merged from the runs
+    /// as merged ranges: a stretch continuing a range extends it, any other becomes a range.
+    pub fn adopt(&mut self, walk: &mut Walk) {
+        if !walk.recording {
+            return;
+        }
+        if self.sources().nth(1).is_none() {
+            self.drop_hot();
+            return;
+        }
+        // Last first, so a range inserted moves no range a stretch before it continues.
+        let mut end = walk.record.len();
+        for s in walk.stretches.iter().rev() {
+            let keys = walk.record.get(s.start..end).unwrap_or(&[]);
+            end = s.start;
+            match s.after {
+                Some(i) => {
+                    if let Some(h) = self.hot.get_mut(i) {
+                        h.keys.extend_from_slice(keys);
+                        h.joins_next = s.joins;
+                    }
+                }
+                None => {
+                    let Some(first) = keys.first() else {
+                        continue;
+                    };
+                    let lo = self.key(first.entry);
+                    let p = self.hot.partition_point(|h| self.hot_lo(h) < lo);
+                    self.hot.insert(
+                        p,
+                        Hot {
+                            keys: keys.to_vec(),
+                            joins_next: s.joins,
+                        },
+                    );
+                }
+            }
+        }
+        walk.record.clear();
+        walk.stretches.clear();
+        walk.recording = false;
     }
 
     /// Source `i` of [`Self::sources`], indexed.
@@ -1199,12 +1362,48 @@ impl HashMem {
     ) -> Result<usize, Error> {
         let mut visited = 0usize;
         while visited < limit {
+            if let Some((i, at)) = walk.hot {
+                let Some(h) = self.hot.get(i) else {
+                    return Err(corrupt());
+                };
+                if let Some(&e) = h.keys.get(at) {
+                    walk.hot = Some((i, at.saturating_add(1)));
+                    let (key, op, v) = self.read(e.entry)?;
+                    each(key, op, v, e.hash32)?;
+                    visited = visited.saturating_add(1);
+                    continue;
+                }
+                let next = i.saturating_add(1);
+                if h.joins_next && next < self.hot.len() {
+                    walk.hot = Some((next, 0));
+                    continue;
+                }
+                let Some(last) = h.keys.last() else {
+                    return Err(corrupt());
+                };
+                let after = self.key(last.entry);
+                self.walk_runs_after(walk, i, after);
+                continue;
+            }
             // The least key among the runs' next entries, and its newest entry: every run's
             // entry of that key is passed.
             let Some((mut e, mut se)) = walk.heap.first().and_then(|&t| self.head(&walk.at, t))
             else {
                 break;
             };
+            // The walk reached a merged range: it walks the range, and the stretch recorded ends
+            // where the range starts.
+            if let Some(w) = walk.watch
+                && let Some(h) = self.hot.get(w)
+                && self.key(e.entry) >= self.hot_lo(h)
+            {
+                walk.hot = Some((w, 0));
+                walk.watch = None;
+                if let Some(s) = walk.stretches.last_mut() {
+                    s.joins = true;
+                }
+                continue;
+            }
             self.advance(walk);
             while let Some((k, sk)) = walk.heap.first().and_then(|&t| self.head(&walk.at, t)) {
                 if self.cmp(k, sk, e, se) != Ordering::Equal {
@@ -1215,6 +1414,10 @@ impl HashMem {
                 }
                 self.advance(walk);
             }
+            if walk.recording {
+                walk.record.push(e);
+            }
+            walk.run_steps = walk.run_steps.saturating_add(1);
             let (key, op, v) = self.read(e.entry)?;
             each(key, op, v, e.hash32)?;
             visited = visited.saturating_add(1);
@@ -1482,6 +1685,36 @@ fn merge_step(arena: &[u8], m: &mut Merge, budget: usize) -> (bool, usize) {
 pub struct Walk {
     at: Vec<usize>,
     heap: Vec<usize>,
+    /// In a merged range ([`HashMem::hot`]): which, and its next entry; else the runs' heap.
+    hot: Option<(usize, usize)>,
+    /// The merged range the walk over the runs reaches next, to walk it instead.
+    watch: Option<usize>,
+    /// Whether the walk records what it merges from the runs, for [`HashMem::adopt`]: a seek's
+    /// walk over more than one run.
+    recording: bool,
+    /// The newest entries walked from the runs, in key order, and the stretches they make
+    /// ([`Stretch`]).
+    record: Vec<Keyed>,
+    stretches: Vec<Stretch>,
+    /// Seeks of the runs and steps of their heap: what the runs being many cost the walk.
+    run_seeks: u64,
+    run_steps: u64,
+}
+
+/// A stretch of a walk's record: where it starts in the record, the merged range it continues
+/// with no key between, and whether it ends where the next merged range starts.
+#[derive(Clone, Copy, Debug)]
+struct Stretch {
+    start: usize,
+    after: Option<usize>,
+    joins: bool,
+}
+
+impl Walk {
+    /// Seeks and heap steps of the runs since the walk's seek ([`HashMem::walk_from_into`]).
+    pub fn run_work(&self) -> (u64, u64) {
+        (self.run_seeks, self.run_steps)
+    }
 }
 
 #[cfg(test)]
@@ -1663,6 +1896,62 @@ mod tests {
         m.clear();
         assert_eq!(m.bytes(), 0);
         assert!(m.memory() >= filled, "{} < {filled}", m.memory());
+    }
+
+    #[test]
+    fn walks_through_merged_ranges_see_exactly_what_the_runs_hold() {
+        // Writes, seals, idle tidying and seeks walked a while, each walk's merging then kept:
+        // every walk, through merged ranges, their joins and the runs between, gives the newest
+        // entry of each key in order, and some walks run in merged ranges alone.
+        let mut m = HashMem::new(1 << 22).unwrap();
+        let mut want: BTreeMap<Vec<u8>, (Op, Vec<u8>)> = BTreeMap::new();
+        let mut walk = Walk::default();
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let (mut walks, mut merged_only) = (0u32, 0u32);
+        for round in 0..20_000u32 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let k = (x % 2_000).to_be_bytes();
+            match x % 16 {
+                0..=7 => {
+                    m.insert(&k, Op::Put, &round.to_le_bytes()).unwrap();
+                    want.insert(k.to_vec(), (Op::Put, round.to_le_bytes().to_vec()));
+                }
+                8 => {
+                    m.insert(&k, Op::Delete, &[]).unwrap();
+                    want.insert(k.to_vec(), (Op::Delete, Vec::new()));
+                }
+                9 => m.seal(),
+                10 => {
+                    m.tidy(7);
+                }
+                _ => {
+                    m.seal();
+                    let from = ((x >> 20) % 2_100).to_be_bytes();
+                    let limit = 1 + ((x >> 40) % 300) as usize;
+                    m.walk_from_into(&from, &mut walk).unwrap();
+                    let mut got = Vec::new();
+                    m.walk_some(&mut walk, limit, |k, op, v| {
+                        got.push((k.to_vec(), op, v.to_vec()));
+                        Ok(())
+                    })
+                    .unwrap();
+                    let expect: Vec<_> = want
+                        .range(from.to_vec()..)
+                        .take(limit)
+                        .map(|(k, (op, v))| (k.clone(), *op, v.clone()))
+                        .collect();
+                    assert_eq!(got, expect, "round {round} from {from:?} limit {limit}");
+                    walks += 1;
+                    if walk.run_work() == (0, 0) {
+                        merged_only += 1;
+                    }
+                    m.adopt(&mut walk);
+                }
+            }
+        }
+        assert!(walks > 0 && merged_only > 0, "{walks} {merged_only}");
     }
 
     #[test]

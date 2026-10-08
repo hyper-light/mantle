@@ -887,6 +887,10 @@ pub struct Walk {
     /// Each run's cursor once placed, and the entries it must still pass to reach its next.
     cursors: Vec<Option<RunCursor>>,
     behind: Vec<usize>,
+    /// Where a run the seek's search probed is to be placed, off the page the probe left it
+    /// on: placed there when a selector first names the run, so a run the scan never reaches
+    /// costs no read. Its `behind` counts from there.
+    targets: Vec<Option<(u64, usize)>>,
     valid: bool,
 }
 
@@ -919,17 +923,21 @@ impl Walk {
         let WalkBufs {
             mut cursors,
             mut behind,
+            mut targets,
         } = bufs;
         cursors.clear();
         cursors.resize_with(view.runs, || None);
         behind.clear();
         behind.resize(view.runs, 0);
+        targets.clear();
+        targets.resize(view.runs, None);
         let mut w = Self {
             segment: view.segment_of(from),
             at: 0,
             run: 0,
             cursors,
             behind,
+            targets,
             valid: view.segments() > 0,
         };
         if !w.valid {
@@ -945,8 +953,9 @@ impl Walk {
             }
         };
         w.at = found;
-        // A run the search probed is placed where the walk consumes it, its page kept when it
-        // is the one held; a run it did not is placed when a selector names it.
+        // A run the search probed is placed where the walk consumes it when that is on the
+        // page it holds; off it, the place is kept and the page read only once a selector names
+        // the run. A run it did not probe is placed when a selector names it.
         for r in 0..view.runs {
             let k = occurrences(selectors, w.at, r);
             let slot = w.cursors.get_mut(r).ok_or(corrupt())?;
@@ -955,8 +964,12 @@ impl Walk {
             let Some(c) = slot.as_mut() else { continue };
             let b = runs.get(r).ok_or(corrupt())?;
             match b.position_after(view.offset(w.segment, r)?, k)? {
-                Some(at) => {
+                Some(at) if at.0 == c.position().0 => {
                     c.place(b, store, at)?;
+                    *behind = 0;
+                }
+                Some(at) => {
+                    *w.targets.get_mut(r).ok_or(corrupt())? = Some(at);
                     *behind = 0;
                 }
                 None => {
@@ -1131,15 +1144,27 @@ impl Walk {
         let r = self.run;
         let b = runs.get(r).ok_or(corrupt())?;
         let slot = self.cursors.get_mut(r).ok_or(corrupt())?;
-        if slot.is_none() {
-            let (page, index) = view.offset(self.segment, r)?;
-            *slot = Some(b.run_from(store, page, index)?);
-        }
         let behind = self.behind.get_mut(r).ok_or(corrupt())?;
-        if let Some(c) = slot.as_mut() {
-            c.advance(b, store, *behind)?;
-            if !c.valid() {
-                return Err(corrupt());
+        let target = self.targets.get_mut(r).ok_or(corrupt())?;
+        match slot.as_mut() {
+            None => {
+                // Opened where it is consumed, from the counts in memory: the segment's offset
+                // moved on by the entries passed, the one page there read.
+                let (page, index) = b
+                    .position_after(view.offset(self.segment, r)?, *behind)?
+                    .ok_or(corrupt())?;
+                *slot = Some(b.run_from(store, page, index)?);
+            }
+            Some(c) => {
+                let at = target.take();
+                match at.map(|at| b.position_after(at, *behind)).transpose()? {
+                    Some(Some(at)) => c.place(b, store, at)?,
+                    Some(None) => return Err(corrupt()),
+                    None => c.advance(b, store, *behind)?,
+                }
+                if !c.valid() {
+                    return Err(corrupt());
+                }
             }
         }
         *behind = 0;
@@ -1154,9 +1179,11 @@ impl Walk {
             c.give_back(store);
         }
         self.behind.clear();
+        self.targets.clear();
         WalkBufs {
             cursors: self.cursors,
             behind: self.behind,
+            targets: self.targets,
         }
     }
 }
@@ -1166,4 +1193,5 @@ impl Walk {
 pub struct WalkBufs {
     cursors: Vec<Option<RunCursor>>,
     behind: Vec<usize>,
+    targets: Vec<Option<(u64, usize)>>,
 }

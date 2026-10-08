@@ -24,7 +24,7 @@
 use crate::branch::filter::Keys;
 use crate::branch::{Builder, Op};
 use crate::error::Error;
-use crate::memtable::btree::{BTreeMem, Walk};
+use crate::memtable::hashed::{HashMem, Walk};
 use crate::rows::Rows;
 use crate::scan::ScanMerge;
 use crate::store::{Config, Store};
@@ -87,7 +87,7 @@ impl MemCursor {
     }
 
     /// Moves to `mem`'s first entry at or past `from`, its buffers kept.
-    fn seek(&mut self, mem: &BTreeMem, from: &[u8]) -> Result<(), Error> {
+    fn seek(&mut self, mem: &HashMem, from: &[u8]) -> Result<(), Error> {
         mem.walk_from_into(from, &mut self.walk)?;
         self.advance(mem)
     }
@@ -101,7 +101,7 @@ impl MemCursor {
     }
 
     /// Moves to the next entry, none past the last.
-    fn advance(&mut self, mem: &BTreeMem) -> Result<(), Error> {
+    fn advance(&mut self, mem: &HashMem) -> Result<(), Error> {
         let Self {
             walk,
             key,
@@ -126,8 +126,10 @@ impl MemCursor {
 /// A full memtable packed into a branch a slice at a time, read until it is packed.
 #[derive(Debug)]
 struct Packing {
-    mem: BTreeMem,
-    walk: Walk,
+    mem: HashMem,
+    /// The walk in key order, opened once the memtable's order work is paid: its runs do not
+    /// change after.
+    walk: Option<Walk>,
     builder: Builder,
     packed: usize,
 }
@@ -137,10 +139,12 @@ impl Packing {
     /// its worth in keys.
     fn left(&self) -> u64 {
         let entries = u64::try_from(self.mem.len().saturating_sub(self.packed)).unwrap_or(u64::MAX);
+        let order = u64::try_from(self.mem.debt()).unwrap_or(u64::MAX);
         self.builder
             .filter_pages_left()
             .saturating_mul(self.builder.page_keys())
             .saturating_add(entries)
+            .saturating_add(order)
     }
 }
 
@@ -148,16 +152,18 @@ impl Packing {
 #[derive(Debug)]
 pub struct ShardDb<F: BlockFile> {
     store: Store<F>,
-    mem: BTreeMem,
+    mem: HashMem,
     packing: Option<Packing>,
     /// A cleared memtable for the next fill, its arena kept.
-    spare: Option<BTreeMem>,
+    spare: Option<HashMem>,
     mem_limit: usize,
     trunk: Trunk,
     /// Work owed but not yet whole, in work·bytes over the room: the remainder of each debt's
     /// share.
     pack_carry: u128,
     trunk_carry: u128,
+    /// The active memtable's order debt's carry ([`share`]).
+    order_carry: u128,
     forget_carry: u128,
     flush_stats: FlushStats,
     /// The write memory the owner spares at most, and the pages written when the last cycle
@@ -409,13 +415,14 @@ impl<F: BlockFile> ShardDb<F> {
     fn with(store: Store<F>, mem_limit: usize, trunk: Trunk) -> Result<Self, Error> {
         Ok(Self {
             store,
-            mem: BTreeMem::new(mem_limit)?,
+            mem: HashMem::new(mem_limit)?,
             packing: None,
             spare: None,
             mem_limit,
             trunk,
             pack_carry: 0,
             trunk_carry: 0,
+            order_carry: 0,
             forget_carry: 0,
             flush_stats: FlushStats::default(),
             write_cap: 0,
@@ -951,6 +958,12 @@ impl<F: BlockFile> ShardDb<F> {
             next.extend_from_slice(from);
             return Ok(true);
         }
+        // A walk of a memtable sees its sorted runs: what arrived since the last scan is sorted
+        // into one first, and a packing memtable's sort, if unfinished, is finished.
+        self.mem.seal();
+        if let Some(p) = self.packing.as_mut() {
+            p.mem.seal();
+        }
         let mut active = std::mem::replace(&mut self.scan_active, MemCursor::empty());
         active.seek(&self.mem, from)?;
         let mut packing = match &self.packing {
@@ -1066,7 +1079,28 @@ impl<F: BlockFile> ShardDb<F> {
     /// pacing).
     fn pace(&mut self, bytes: usize) -> Result<(), Error> {
         let room = self.mem.room();
+        // The active memtable sorts its own entries as it fills, so the one it rotates to is
+        // nearly in order and its packing owes the walk alone. A sort starts once the entries
+        // since the last take as much as the room left, and is paid over half that room: by the
+        // time the next is due, it is done. Sorts of half the room left at each start leave a
+        // few entries for the rotation.
+        if !self.mem.sorting() && self.mem.tail_bytes() >= room {
+            self.mem.start_sort();
+        }
+        let order = self.mem.debt();
+        if order > 0 {
+            let w = share(
+                u64::try_from(order).unwrap_or(u64::MAX),
+                bytes,
+                room / 2,
+                &mut self.order_carry,
+            );
+            self.mem.pay(usize::try_from(w).unwrap_or(usize::MAX));
+        }
         if let Some(p) = &self.packing {
+            // The memtable rotates when a put no longer fits, before its room reaches nothing:
+            // packing is paced over the room a put of this size leaves, so it ends first.
+            let room = room.saturating_sub(bytes);
             let w = share(p.left(), bytes, room, &mut self.pack_carry);
             self.flush_stats.pack_share_most = self.flush_stats.pack_share_most.max(w);
             self.pack_some(w)?;
@@ -1116,15 +1150,30 @@ impl<F: BlockFile> ShardDb<F> {
             packed,
         } = p;
         let store = &mut self.store;
+        // The memtable's order first: its sort and merges, a slice of the budget.
+        let mut w = w;
+        if mem.debt() > 0 {
+            let paid = mem.pay(usize::try_from(w).unwrap_or(usize::MAX));
+            w = w.saturating_sub(u64::try_from(paid).unwrap_or(u64::MAX));
+        }
+        if mem.debt() == 0 && walk.is_none() {
+            *walk = Some(mem.walk_start());
+        }
         let entries = u64::try_from(mem.len().saturating_sub(*packed)).unwrap_or(u64::MAX);
-        let walked = w.min(entries);
-        if walked > 0 {
+        let walked = if walk.is_some() { w.min(entries) } else { 0 };
+        if walked > 0
+            && let Some(walk) = walk.as_mut()
+        {
             let limit = usize::try_from(walked).unwrap_or(usize::MAX);
             let visited = mem.walk_some(walk, limit, |k, op, v| builder.add(store, k, op, v))?;
             *packed = packed.saturating_add(visited);
         }
         let mut whole = false;
-        let over = w.saturating_sub(walked);
+        let over = if walk.is_some() {
+            w.saturating_sub(walked)
+        } else {
+            0
+        };
         if *packed >= mem.len() && over > 0 {
             builder.seal(store)?;
             let pages = over.checked_div(builder.page_keys()).unwrap_or(1).max(1);
@@ -1191,7 +1240,7 @@ impl<F: BlockFile> ShardDb<F> {
     fn finish_packing(&mut self) -> Result<(), Error> {
         let Some(Packing {
             mut mem,
-            mut walk,
+            walk,
             mut builder,
             ..
         }) = self.packing.take()
@@ -1199,6 +1248,12 @@ impl<F: BlockFile> ShardDb<F> {
             return Ok(());
         };
         let t = self.timed.then(std::time::Instant::now);
+        // The order work left, whole, then the walk from where packing left it.
+        mem.pay(usize::MAX);
+        let mut walk = match walk {
+            Some(w) => w,
+            None => mem.walk_start(),
+        };
         let store = &mut self.store;
         mem.walk_some(&mut walk, usize::MAX, |k, op, v| {
             builder.add(store, k, op, v)
@@ -1240,11 +1295,13 @@ impl<F: BlockFile> ShardDb<F> {
         }
         let fresh = match self.spare.take() {
             Some(m) => m,
-            None => BTreeMem::new(self.mem_limit)?,
+            None => HashMem::new(self.mem_limit)?,
         };
-        let full = std::mem::replace(&mut self.mem, fresh);
+        let mut full = std::mem::replace(&mut self.mem, fresh);
+        // Its order, a debt its packing pays a slice at a time.
+        full.close();
         self.packing = Some(Packing {
-            walk: full.walk_start(),
+            walk: None,
             builder: Builder::new(
                 &mut self.store,
                 Keys::Exactly(u64::try_from(full.len()).unwrap_or(u64::MAX)),
@@ -1292,11 +1349,12 @@ impl<F: BlockFile> ShardDb<F> {
         if !self.mem.is_empty() {
             let fresh = match self.spare.take() {
                 Some(m) => m,
-                None => BTreeMem::new(self.mem_limit)?,
+                None => HashMem::new(self.mem_limit)?,
             };
-            let full = std::mem::replace(&mut self.mem, fresh);
+            let mut full = std::mem::replace(&mut self.mem, fresh);
+            full.close();
             self.packing = Some(Packing {
-                walk: full.walk_start(),
+                walk: None,
                 builder: Builder::new(
                     &mut self.store,
                     Keys::Exactly(u64::try_from(full.len()).unwrap_or(u64::MAX)),

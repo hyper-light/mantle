@@ -189,12 +189,12 @@ fn a_sealed_log_opens_only_with_its_own_keys() {
         "{:?}",
         refused.error
     );
-    // No keys at all: an unsealed open finds no frame of its own kind.
+    // No keys at all: named as a sealed log opened without them, never as another node's log.
     let refused = Log::try_open(refused.file.unwrap(), config(16, 8), ID)
         .err()
         .unwrap();
     assert!(
-        matches!(refused.error, LogError::Foreign(_) | LogError::Damaged(_)),
+        matches!(refused.error, LogError::SealedWithoutKeys),
         "{:?}",
         refused.error
     );
@@ -220,10 +220,159 @@ fn an_unsealed_log_does_not_open_sealed() {
         .err()
         .unwrap();
     assert!(
+        matches!(refused.error, LogError::UnsealedWithKeys),
+        "{:?}",
+        refused.error
+    );
+    // The file comes back, and opens as it was made.
+    let (log, _) = Log::open(refused.file.unwrap(), config(16, 8), ID).unwrap();
+    log.close().unwrap();
+}
+
+/// A log of one write, sealed or not, closed.
+fn one_write(file: SimFile, sealing: Option<Sealing>) -> SimFile {
+    let log = match sealing {
+        Some(sealing) => Log::create_sealed(file, config(16, 8), ID, sealing).unwrap(),
+        None => Log::create(file, config(16, 8), ID).unwrap(),
+    };
+    log.write(
+        1,
+        Update {
+            entries: Some(entries(1, &[1])),
+            ..Update::default()
+        },
+    )
+    .unwrap();
+    log.close().unwrap()
+}
+
+/// A log is sealed or not from its creation: a segment header of the other kind beside its own
+/// is bytes someone changed, refused as tampering whichever way the log is opened.
+#[test]
+fn headers_of_both_kinds_in_one_log_are_tampering() {
+    let sealed = one_write(sim(11), Some(keys(1, 2)));
+    let plain = one_write(sim(12), None);
+    // The plain log's segment header, laid at the sealed log's second slot.
+    let block = &bytes_of(&plain)[AREA as usize..AREA as usize + BLOCK];
+    let mut write = AlignedBuf::zeroed(BLOCK, sealed.alignment()).unwrap();
+    write.set_len(BLOCK).unwrap();
+    write.as_mut_slice().copy_from_slice(block);
+    let slot1 = AREA + config(16, 8).segment_bytes;
+    sealed.write_all_at(write.as_slice(), slot1).unwrap();
+    let refused = Log::try_open_sealed(sealed, config(16, 8), ID, keys(1, 2))
+        .err()
+        .unwrap();
+    assert!(
         matches!(refused.error, LogError::Tampered(_)),
         "{:?}",
         refused.error
     );
+    let refused = Log::try_open(refused.file.unwrap(), config(16, 8), ID)
+        .err()
+        .unwrap();
+    assert!(
+        matches!(refused.error, LogError::Tampered(_)),
+        "{:?}",
+        refused.error
+    );
+}
+
+/// Another log's file, or one whose only header is damaged, is still foreign to both opens: the
+/// key mismatch is named only for this log's own headers.
+#[test]
+fn a_foreign_or_damaged_header_is_still_foreign() {
+    for sealed in [true, false] {
+        let file = one_write(sim(13), sealed.then(|| keys(1, 2)));
+        let other = ID + 1;
+        let refused = Log::try_open(file, config(16, 8), other).err().unwrap();
+        assert!(
+            matches!(refused.error, LogError::Foreign(_)),
+            "{:?}",
+            refused.error
+        );
+        let refused = Log::try_open_sealed(refused.file.unwrap(), config(16, 8), other, keys(1, 2))
+            .err()
+            .unwrap();
+        assert!(
+            matches!(refused.error, LogError::Foreign(_)),
+            "{:?}",
+            refused.error
+        );
+        // Its own ID, its header's checksum broken: no header of this log is read at all.
+        let file = refused.file.unwrap();
+        let mut header = AlignedBuf::zeroed(BLOCK, file.alignment()).unwrap();
+        header.set_len(BLOCK).unwrap();
+        file.read_exact_at(header.as_mut_slice(), AREA).unwrap();
+        header.as_mut_slice()[8] ^= 0xFF;
+        file.write_all_at(header.as_slice(), AREA).unwrap();
+        let refused = Log::try_open(file, config(16, 8), ID).err().unwrap();
+        assert!(
+            matches!(refused.error, LogError::Foreign(_) | LogError::Damaged(_)),
+            "{:?}",
+            refused.error
+        );
+        let refused = Log::try_open_sealed(refused.file.unwrap(), config(16, 8), ID, keys(1, 2))
+            .err()
+            .unwrap();
+        assert!(
+            matches!(refused.error, LogError::Foreign(_) | LogError::Damaged(_)),
+            "{:?}",
+            refused.error
+        );
+    }
+}
+
+/// Both directions on a real device file, each refusal giving the file back.
+#[test]
+fn a_key_mismatch_is_named_on_a_real_disk() {
+    use hyper_block::file::{CachingRequest, DeviceFile};
+    let dir = tempfile::tempdir().unwrap();
+    let open = |name: &str, create: bool| {
+        DeviceFile::open(
+            &dir.path().join(name),
+            create,
+            CachingRequest::PreferDirect,
+            Alignment::new(BLOCK).unwrap(),
+        )
+        .unwrap()
+    };
+    let write = |log: Log<DeviceFile>| {
+        log.write(
+            1,
+            Update {
+                entries: Some(entries(1, &[1])),
+                ..Update::default()
+            },
+        )
+        .unwrap();
+        log.close().unwrap()
+    };
+    drop(write(
+        Log::create_sealed(open("sealed", true), config(16, 8), ID, keys(1, 2)).unwrap(),
+    ));
+    drop(write(
+        Log::create(open("plain", true), config(16, 8), ID).unwrap(),
+    ));
+    let refused = Log::try_open(open("sealed", false), config(16, 8), ID)
+        .err()
+        .unwrap();
+    assert!(
+        matches!(refused.error, LogError::SealedWithoutKeys),
+        "{:?}",
+        refused.error
+    );
+    let (log, _) = Log::open_sealed(refused.file.unwrap(), config(16, 8), ID, keys(1, 2)).unwrap();
+    drop(log.close().unwrap());
+    let refused = Log::try_open_sealed(open("plain", false), config(16, 8), ID, keys(1, 2))
+        .err()
+        .unwrap();
+    assert!(
+        matches!(refused.error, LogError::UnsealedWithKeys),
+        "{:?}",
+        refused.error
+    );
+    let (log, _) = Log::open(refused.file.unwrap(), config(16, 8), ID).unwrap();
+    drop(log.close().unwrap());
 }
 
 /// The frame of the first write, its hard state changed and its CRC recomputed, as someone who can

@@ -215,6 +215,8 @@ fn answer(r: Result<(), LogError>) -> &'static str {
         Err(LogError::Corrupt { .. }) => "corrupt",
         Err(LogError::Damaged(_)) => "damaged",
         Err(LogError::Foreign(_)) => "foreign",
+        Err(LogError::SealedWithoutKeys) => "sealed_without_keys",
+        Err(LogError::UnsealedWithKeys) => "unsealed_with_keys",
         Err(LogError::Config(_)) => "config",
         Err(LogError::Unfit(_)) => "unfit",
         Err(LogError::Claimed(_)) => "claimed",

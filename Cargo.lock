@@ -390,6 +390,7 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "getrandom 0.4.3",
+ "hyper-block",
  "rustix",
  "thiserror",
  "windows-sys",

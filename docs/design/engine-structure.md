@@ -199,8 +199,9 @@ yields a key's newest version even when it is a deletion; the scan's merge decid
   every page, read through the page cache; the anchors form an index of pages as a branch's keys
   do. The trunk image names each pivot's view with its bundle.
 - **Seek.** Binary search of the anchors (no I/O while they are in memory), then a binary search
-  of the segment's entries (§3.2): the entry at position `j` is in the run its selector names, at
-  that run's offset advanced by the occurrences of the same selector before `j`, so each probe
+  of the segment's key groups (§3.2), probing each group's newest version. Page bounds round to
+  group boundaries, while cursor offsets still count every version. The selector at position
+  `j` names a run and its offset advances by that run's occurrences before `j`, so each probe
   reads one key; `log2(H·N)` comparisons where the merge takes `H·log2 N`. The cursors are left at
   the counts of their runs' selectors before the found entry. A run's page is read only when a
   selector names it.

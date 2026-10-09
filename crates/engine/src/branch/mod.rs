@@ -424,29 +424,41 @@ impl Builder {
     /// A builder in `store`, for `keys` entries: pages of the store's payload capacity, which
     /// offsets of 16 bits must reach.
     pub fn new<F: BlockFile>(store: &mut Store<F>, keys: filter::Keys) -> Result<Self, Error> {
-        let lists = store.take_lists();
-        let mut separators = lists.separators;
-        separators.reset(Width::Fit)?;
-        let mut keys_filter = lists.keys;
-        keys_filter.reset(store.range_filter_bits())?;
         let capacity = store.page_capacity();
         if capacity > usize::from(u16::MAX) {
             return Err(Error::InvalidArgument {
                 what: "a branch page past 64 KiB",
             });
         }
-        // The hashes grow to the keys the builder is made for at once, not by doublings; a
-        // recycled list that held as many already holds them. A bound the allocator refuses
-        // (a compaction's `AtMost` may name no real count) reserves nothing: the lists then grow
-        // as keys arrive, as they would unreserved.
         let (filter::Keys::Exactly(n) | filter::Keys::AtMost(n)) = keys;
-        let n = usize::try_from(n).unwrap_or(usize::MAX);
-        let mut hashes = lists.hashes;
-        let _refused = hashes.try_reserve(n.saturating_sub(hashes.len()));
+        let refused = || Error::LimitExceeded {
+            what: "a branch's hash buffers (the allocator refused them)",
+            limit: n,
+        };
+        let n = usize::try_from(n).map_err(|_| refused())?;
+        let mut lists = store.take_lists();
+        // The hashes grow to the keys the builder is made for at once, not by doublings; a
+        // recycled list that held as many already holds them.
         // The scratch keeps its old entries (none is read before it is written), so it is
         // reserved to `n` in all, not `n` past them.
-        let mut hash_scratch = lists.hash_scratch;
-        let _refused = hash_scratch.try_reserve(n.saturating_sub(hash_scratch.len()));
+        if lists
+            .hashes
+            .try_reserve(n.saturating_sub(lists.hashes.len()))
+            .is_err()
+            || lists
+                .hash_scratch
+                .try_reserve(n.saturating_sub(lists.hash_scratch.len()))
+                .is_err()
+        {
+            store.give_lists(lists);
+            return Err(refused());
+        }
+        let mut separators = lists.separators;
+        separators.reset(Width::Fit)?;
+        let mut keys_filter = lists.keys;
+        keys_filter.reset(store.range_filter_bits())?;
+        let hashes = lists.hashes;
+        let hash_scratch = lists.hash_scratch;
         let mut spare_pages = lists.pages;
         let mut levels = lists.levels;
         levels.push(

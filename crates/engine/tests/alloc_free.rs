@@ -137,6 +137,44 @@ fn a_new_builder_takes_every_working_buffer_from_the_pool() {
 }
 
 #[test]
+fn refused_key_hints_leave_the_warmed_builder_buffers_available() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = store(&dir);
+    let warm = build(&mut s, 0, 1);
+    for &e in &warm.extents {
+        s.release(e).unwrap();
+    }
+    s.checkpoint(None, 1).unwrap();
+    for hint in [Keys::Exactly(u64::MAX), Keys::AtMost(u64::MAX)] {
+        assert!(matches!(
+            Builder::new(&mut s, hint),
+            Err(mantle_engine::error::Error::LimitExceeded { .. })
+        ));
+    }
+    alloc::begin();
+    let mut b = Builder::new(&mut s, Keys::Exactly(ENTRIES)).unwrap();
+    for n in 0..ENTRIES {
+        b.add(&mut s, &key(n), Op::Put, &n.to_le_bytes()).unwrap();
+    }
+    let counts = alloc::end();
+    assert_eq!(
+        (counts.allocations, counts.reallocations),
+        (1, 0),
+        "{counts:?}"
+    );
+    let branch = b.finish(&mut s).unwrap();
+    let mut value = Vec::new();
+    for n in 0..ENTRIES {
+        value.clear();
+        assert_eq!(
+            branch.get(&mut s, &key(n), &mut value).unwrap(),
+            Some(Op::Put)
+        );
+        assert_eq!(value, n.to_le_bytes());
+    }
+}
+
+#[test]
 fn a_merge_steps_over_branches_without_allocating() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = store(&dir);

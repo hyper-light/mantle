@@ -2928,7 +2928,7 @@ mod frozen_tests {
         db.pack_ns = 999;
         assert_eq!(db.frozen_most(), 0, "no workers, none");
         let p = path.clone();
-        db.set_workers(move || Ok(plain(&p, false)));
+        db.set_workers(move || Ok(plain(&p, false))).unwrap();
         for (pack_ns, most) in [
             (0u64, 0usize),
             (1, 1),

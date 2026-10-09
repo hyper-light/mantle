@@ -485,7 +485,8 @@ impl ViewCosts {
 
 #[derive(Debug)]
 enum Job {
-    Build(Build),
+    /// Boxed: a build holds a cursor a run and its view as it grows.
+    Build(Box<Build>),
     /// A rebuild of the view of `runs[left..]` from that of `runs[left + 1..]`, and the bundle's
     /// roots: the runs still to merge in are `runs[..left]`, newest first.
     Rebuild {
@@ -1786,7 +1787,9 @@ impl Trunk {
                 let build = match (basis, added.checked_sub(1)) {
                     // A step that may not wait builds, reading its runs in order, a page ready
                     // ahead of each move.
-                    _ if yield_io => Job::Build(Build::prepared(runs, &lo, hi.as_deref())?),
+                    _ if yield_io => {
+                        Job::Build(Box::new(Build::prepared(runs, &lo, hi.as_deref())?))
+                    }
                     (Some(old), Some(left))
                         if cheaper
                             && old.roots().len() == older.len()
@@ -1808,7 +1811,7 @@ impl Trunk {
                             hi: hi.clone(),
                         }
                     }
-                    _ => Job::Build(Build::new(store, runs, &lo, hi.as_deref())?),
+                    _ => Job::Build(Box::new(Build::new(store, runs, &lo, hi.as_deref())?)),
                 };
                 if matches!(build, Job::Rebuild { .. }) {
                     self.stats.views_rebuilt = self.stats.views_rebuilt.saturating_add(1);

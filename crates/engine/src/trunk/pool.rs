@@ -29,7 +29,7 @@ use crate::branch::filter::Keys;
 use crate::branch::merge::Compaction;
 use crate::branch::{Branch, Builder, Op};
 use crate::error::Error;
-use crate::store::{Config, Refill, Store};
+use crate::store::{Config, Outbox, Refill, Store, decode_pages};
 use hyper_block::block::BlockFile;
 
 /// A compaction for a worker: `inputs` newest first, the descriptors a merge reads (no filters),
@@ -66,6 +66,10 @@ pub struct Stream {
 /// worker builds from the other (double buffering, the least that overlaps a producer with its
 /// consumer), each the bytes of a run, the store's unit of write (`Store::run_bytes`).
 pub const FEED_BUFFERS: usize = 2;
+
+/// The buffers a worker's written pages reach the shard's page cache in: two a worker, for the
+/// same reason, each a run's bytes ([`Outbox`]).
+pub const PAGE_BUFFERS: usize = 2;
 
 /// An entry's fixed bytes in a packing buffer: key length, value length, operation, hash.
 const ENTRY_FIXED: usize = 4 + 4 + 1 + 4;
@@ -180,20 +184,26 @@ enum Message {
         worker: usize,
         buf: Vec<u8>,
     },
+    Pages {
+        worker: usize,
+        buf: Vec<u8>,
+    },
     Done {
         worker: usize,
         result: Result<Output, Error>,
     },
 }
 
-/// A worker's ends of its channels: its jobs, its grants' top-ups, and the shard's one channel
-/// back, which holds at most a worker's packing buffers and one message more each (a worker
-/// waits for its answer after an ask, and sends its result last).
+/// A worker's ends of its channels: its jobs, its grants' top-ups, its write-through buffers
+/// given back, and the shard's one channel back, which holds at most a worker's packing and
+/// page buffers and one message more each (a worker waits for its answer after an ask, and
+/// sends its result last).
 #[derive(Debug)]
 pub struct Seat {
     pub id: usize,
     jobs: Receiver<Box<Job>>,
     more: Receiver<Result<Vec<u64>, Error>>,
+    pages: Receiver<Vec<u8>>,
     back: SyncSender<Message>,
 }
 
@@ -207,6 +217,7 @@ pub fn serve<F: BlockFile>(file: F, config: Config, seat: Seat) {
         id,
         jobs,
         more,
+        pages,
         back,
     } = seat;
     let mut store = match Store::worker(file, config) {
@@ -226,6 +237,25 @@ pub fn serve<F: BlockFile>(file: F, config: Config, seat: Seat) {
         more.recv()
             .map_err(|_| gone("take extents from the shard"))?
     })));
+    // Its pages go to the shard's cache as they are sealed, as the shard's own do: a full
+    // buffer sent, a spare taken in its place, or else one the shard gives back.
+    let sends = back.clone();
+    let mut spare: Vec<Vec<u8>> = Vec::new();
+    spare.resize_with(PAGE_BUFFERS.saturating_sub(1), Vec::new);
+    store.set_outbox(Outbox {
+        buf: Vec::new(),
+        send: Box::new(move |buf| {
+            sends
+                .send(Message::Pages { worker: id, buf })
+                .map_err(|_| gone("give the shard written pages"))?;
+            match spare.pop() {
+                Some(b) => Ok(b),
+                None => pages
+                    .recv()
+                    .map_err(|_| gone("take a write-through buffer back")),
+            }
+        }),
+    });
     while let Ok(job) = jobs.recv() {
         let t = Instant::now();
         // A job's time less its waits for a packing's entries: the work it did, which the pool
@@ -236,6 +266,9 @@ pub fn serve<F: BlockFile>(file: F, config: Config, seat: Seat) {
             end: store.end(),
             ns: ns(Instant::now().saturating_duration_since(t)).saturating_sub(waited),
         });
+        if result.is_err() {
+            store.discard_outbox();
+        }
         // A packing's channels close before the result is sent, so every buffer still held is
         // back on the shard's side when it takes the result.
         drop(job);
@@ -287,6 +320,8 @@ fn run<F: BlockFile>(
         }
     };
     store.drain()?;
+    // The job's last pages reach the shard before its result.
+    store.flush_outbox()?;
     Ok((parts, waited))
 }
 
@@ -303,6 +338,7 @@ fn gone(what: &'static str) -> Error {
 struct Worker {
     jobs: SyncSender<Box<Job>>,
     more: SyncSender<Result<Vec<u64>, Error>>,
+    pages: SyncSender<Vec<u8>>,
     thread: Option<JoinHandle<()>>,
     owner: Option<Owner>,
     topped: Vec<u64>,
@@ -345,7 +381,8 @@ impl Pool {
     /// A pool of up to `most` workers, each started by `spawn`; none until a job needs one.
     pub fn new(spawn: Spawn, most: usize) -> Self {
         let most = most.max(1);
-        let (back, messages) = sync_channel(most.saturating_mul(FEED_BUFFERS.saturating_add(1)));
+        let each = FEED_BUFFERS.saturating_add(PAGE_BUFFERS).saturating_add(1);
+        let (back, messages) = sync_channel(most.saturating_mul(each));
         Self {
             spawn,
             workers: Vec::new(),
@@ -462,17 +499,20 @@ impl Pool {
         // Each channel holds what one worker can have waiting: one job, one top-up.
         let (jobs, job_rx) = sync_channel(1);
         let (more, more_rx) = sync_channel(1);
+        let (pages, pages_rx) = sync_channel(PAGE_BUFFERS);
         let back = self.back.clone().ok_or(gone("start a worker"))?;
         let seat = Seat {
             id: at,
             jobs: job_rx,
             more: more_rx,
+            pages: pages_rx,
             back,
         };
         let thread = (self.spawn)(seat)?;
         let w = Worker {
             jobs,
             more,
+            pages,
             thread: Some(thread),
             owner: None,
             topped: Vec::new(),
@@ -573,6 +613,21 @@ impl Pool {
                 w.more
                     .send(more)
                     .map_err(|_| gone("give a worker extents"))?;
+            }
+            Message::Pages { worker, mut buf } => {
+                if store.caches() {
+                    decode_pages(&buf, |address, payload| {
+                        store.cache_written(address, payload);
+                    })?;
+                }
+                buf.clear();
+                let w = self
+                    .workers
+                    .get_mut(worker)
+                    .and_then(Option::as_mut)
+                    .ok_or(gone("give a worker its write-through buffer"))?;
+                // A worker holds at most its buffers, so the channel always has room.
+                drop(w.pages.try_send(buf));
             }
             Message::Spent { worker, buf } => {
                 let w = self

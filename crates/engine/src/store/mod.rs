@@ -186,11 +186,76 @@ pub struct Store<F: BlockFile> {
     forgetting: VecDeque<u64>,
     /// A worker's way to more extents once its grant is spent ([`Store::set_refill`]).
     refill: Option<Refill>,
+    /// A worker's write-through: the pages it seals, for the shard's cache ([`Store::set_outbox`]).
+    outbox: Option<Outbox>,
 }
 
 /// Asks the shard for `n` more extents and waits for them: a worker's, whose job outgrew its
 /// grant.
 pub struct Refill(pub Box<dyn FnMut(usize) -> Result<Vec<u64>, Error> + Send>);
+
+/// Hands a full write-through buffer to the shard and returns an emptied one.
+pub type SendPages = Box<dyn FnMut(Vec<u8>) -> Result<Vec<u8>, Error> + Send>;
+
+/// A worker's sealed pages on their way to the shard's page cache, as its own writes enter it
+/// (write-through, research/34 §1): appended to `buf` ([`encode_page`]), which `send` hands to
+/// the shard once it holds a run's bytes, getting an emptied buffer back.
+pub struct Outbox {
+    pub buf: Vec<u8>,
+    pub send: SendPages,
+}
+
+impl std::fmt::Debug for Outbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Outbox")
+            .field("bytes", &self.buf.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// A written page's fixed bytes in an outbox buffer: its address and its payload's length.
+const OUTBOX_FIXED: usize = 8 + 4;
+
+/// Appends a sealed page's address and payload to an outbox buffer.
+fn encode_page(buf: &mut Vec<u8>, address: u64, payload: &[u8]) -> Result<(), Error> {
+    let len = u32::try_from(payload.len()).map_err(|_| corrupt(Malformed::TooLarge))?;
+    buf.try_reserve(OUTBOX_FIXED.saturating_add(payload.len()))
+        .map_err(|_| Error::LimitExceeded {
+            what: "bytes of a worker's write-through buffer",
+            limit: u64::try_from(buf.len()).unwrap_or(u64::MAX),
+        })?;
+    buf.extend_from_slice(&address.to_le_bytes());
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(payload);
+    Ok(())
+}
+
+/// Each page of an outbox buffer: `each(address, payload)`. A buffer not made of whole pages is
+/// a typed corruption.
+pub fn decode_pages(buf: &[u8], mut each: impl FnMut(u64, &[u8])) -> Result<(), Error> {
+    let bad = || corrupt(Malformed::OutOfRange);
+    let mut at = 0usize;
+    while at < buf.len() {
+        let address: [u8; 8] = buf
+            .get(at..at.saturating_add(8))
+            .and_then(|b| b.try_into().ok())
+            .ok_or(bad())?;
+        let len: [u8; 4] = buf
+            .get(at.saturating_add(8)..at.saturating_add(OUTBOX_FIXED))
+            .and_then(|b| b.try_into().ok())
+            .ok_or(bad())?;
+        let start = at.saturating_add(OUTBOX_FIXED);
+        let end = start
+            .checked_add(usize::try_from(u32::from_le_bytes(len)).map_err(|_| bad())?)
+            .ok_or(bad())?;
+        each(
+            u64::from_le_bytes(address),
+            buf.get(start..end).ok_or(bad())?,
+        );
+        at = end;
+    }
+    Ok(())
+}
 
 impl std::fmt::Debug for Refill {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -477,6 +542,7 @@ impl<F: BlockFile> Store<F> {
             forgetting: VecDeque::new(),
             timed: false,
             refill: None,
+            outbox: None,
         };
         store.checkpoint(None, 0)?;
         Ok(store)
@@ -528,6 +594,7 @@ impl<F: BlockFile> Store<F> {
             forgetting: VecDeque::new(),
             timed: false,
             refill: None,
+            outbox: None,
         })
     }
 
@@ -538,6 +605,40 @@ impl<F: BlockFile> Store<F> {
         self.alloc.regrant(grant);
         self.end = end;
         self.durable.generation = generation;
+    }
+
+    /// Where a worker's sealed pages go: the shard's page cache, through `outbox`.
+    pub fn set_outbox(&mut self, outbox: Outbox) {
+        self.outbox = Some(outbox);
+    }
+
+    /// Hands the pages still in a worker's outbox to the shard: run once a job's writes are
+    /// done, before its result, so they arrive first.
+    pub fn flush_outbox(&mut self) -> Result<(), Error> {
+        if let Some(o) = self.outbox.as_mut().filter(|o| !o.buf.is_empty()) {
+            let full = std::mem::take(&mut o.buf);
+            o.buf = (o.send)(full)?;
+        }
+        Ok(())
+    }
+
+    /// Drops the pages in a worker's outbox: its job failed, and its outputs with it.
+    pub fn discard_outbox(&mut self) {
+        if let Some(o) = self.outbox.as_mut() {
+            o.buf.clear();
+        }
+    }
+
+    /// Admits a page a worker wrote to this store's cache, as one written here is admitted.
+    pub fn cache_written(&mut self, address: u64, payload: &[u8]) {
+        if let Some(c) = self.cache.as_mut() {
+            c.insert(address, payload);
+        }
+    }
+
+    /// Whether this store keeps a page cache.
+    pub fn caches(&self) -> bool {
+        self.cache.is_some()
     }
 
     /// How a worker gets more extents once its grant is spent.
@@ -609,6 +710,7 @@ impl<F: BlockFile> Store<F> {
                 forgetting: VecDeque::new(),
                 timed: false,
                 refill: None,
+                outbox: None,
             },
             recovered,
         ))
@@ -1172,9 +1274,19 @@ impl<F: BlockFile> Store<F> {
         let generation = self.durable.generation.saturating_add(1);
         page::seal(page, address, Kind::Node, generation, payload.len())?;
         // Only a validated, sealed page enters the write-through cache (research/34 §1).
-        // A page just compacted can be read from memory while its run waits for the device.
+        // A page just compacted can be read from memory while its run waits for the device. A
+        // worker's pages go to the shard's cache through its outbox, a run's bytes at a time.
         if let Some(c) = self.cache.as_mut() {
             c.insert(address, payload);
+        } else if self.outbox.is_some() {
+            let run_bytes = self.run_bytes();
+            if let Some(o) = self.outbox.as_mut() {
+                encode_page(&mut o.buf, address, payload)?;
+                if o.buf.len() >= run_bytes {
+                    let full = std::mem::take(&mut o.buf);
+                    o.buf = (o.send)(full)?;
+                }
+            }
         }
         run.pages = run.pages.saturating_add(1);
         // The run ends with its extent.

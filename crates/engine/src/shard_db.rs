@@ -217,8 +217,8 @@ impl Packing {
 
 /// Walks up to `w` of a frozen or packing memtable's entries into its feed's buffers, each
 /// sent to the worker once it holds a run's bytes (`run`); with every entry sent, the feed
-/// closes. Without a buffer to fill it stops, unless `wait`, when it waits for the worker to
-/// give one back. The entries walked.
+/// closes. Without a buffer to fill it stops: the wait for its worker to give one back is the
+/// caller's ([`ShardDb::feed_from`]). The entries walked.
 #[allow(clippy::too_many_arguments)]
 fn feed_one<F: BlockFile>(
     store: &mut Store<F>,
@@ -228,7 +228,6 @@ fn feed_one<F: BlockFile>(
     f: &mut Feed,
     packed: &mut usize,
     w: u64,
-    wait: bool,
     run: usize,
 ) -> Result<u64, Error> {
     // The mean entry's bytes in the arena: how many entries a buffer's room takes.
@@ -238,7 +237,7 @@ fn feed_one<F: BlockFile>(
         if f.filling.is_none() {
             f.filling = match f.spare.pop() {
                 Some(b) => Some(b),
-                None => pool.buffer(store, f.worker, wait)?,
+                None => pool.buffer(store, f.worker, false)?,
             };
         }
         let Some(buf) = f.filling.as_mut() else {
@@ -1473,7 +1472,7 @@ impl<F: BlockFile> ShardDb<F> {
         // The frozen memtables still feeding come first, oldest first.
         let mut w = w;
         if self.frozen.iter().any(|f| f.feed.is_some()) {
-            let used = self.feed_with(w, wait, false)?;
+            let used = self.feed_from(w, wait, false)?;
             w = w.saturating_sub(used);
             self.take_packs(false)?;
         }
@@ -1605,17 +1604,44 @@ impl<F: BlockFile> ShardDb<F> {
         Ok(())
     }
 
-    /// Feeds up to `w` entries: the frozen memtables still feeding, oldest first, then the
-    /// packing one. Without a buffer to fill a feed stops, unless `wait`, when it waits for its
-    /// worker to give one back. A frozen memtable fed whole gives its spare buffers back.
+    /// Feeds `w` entries of the frozen memtables still feeding and the packing one: see
+    /// [`Self::feed_from`].
     fn feed(&mut self, w: u64, wait: bool) -> Result<u64, Error> {
-        self.feed_with(w, wait, true)
+        self.feed_from(w, wait, true)
     }
 
-    /// [`Self::feed`], the packing memtable fed too only when `packing_too`: the entries fed.
-    fn feed_with(&mut self, w: u64, wait: bool, packing_too: bool) -> Result<u64, Error> {
+    /// Feeds up to `w` entries, the packing memtable too only when `packing_too`: the entries
+    /// fed. Every feed whose worker has a buffer free takes entries, the oldest first, so the
+    /// workers build at once; one starved never holds the newer back. With `wait`, it feeds
+    /// until `w` are fed or none is left to feed, waiting for any worker's message when no feed
+    /// can take more: each pass either feeds or takes a message, and a worker's result, a
+    /// failure's when it ends before its feed, closes that feed ([`Self::take_packs`]).
+    fn feed_from(&mut self, w: u64, wait: bool, packing_too: bool) -> Result<u64, Error> {
+        let mut fed = 0u64;
+        loop {
+            let (used, open) = self.feed_pass(w.saturating_sub(fed), packing_too)?;
+            fed = fed.saturating_add(used);
+            if !wait || !open || fed >= w {
+                return Ok(fed);
+            }
+            if used == 0 {
+                self.take_packs(false)?;
+                let Some(pool) = self.trunk.pool_mut() else {
+                    return Ok(fed);
+                };
+                if !pool.wait_any(&mut self.store)? {
+                    return Ok(fed);
+                }
+            }
+        }
+    }
+
+    /// One pass over the feeds, oldest first, none waited for: the entries fed, and whether a
+    /// feed is still open.
+    fn feed_pass(&mut self, w: u64, packing_too: bool) -> Result<(u64, bool), Error> {
         let run = self.store.run_bytes().max(1);
         let mut left = w;
+        let mut open = false;
         let Self {
             frozen,
             packing,
@@ -1629,22 +1655,12 @@ impl<F: BlockFile> ShardDb<F> {
         })?;
         for fz in frozen.iter_mut() {
             if left == 0 {
-                return Ok(w);
+                return Ok((w, true));
             }
             let (Some(walk), Some(f)) = (fz.walk.as_mut(), fz.feed.as_mut()) else {
                 continue;
             };
-            let used = feed_one(
-                store,
-                pool,
-                &fz.mem,
-                walk,
-                f,
-                &mut fz.packed,
-                left,
-                wait,
-                run,
-            )?;
+            let used = feed_one(store, pool, &fz.mem, walk, f, &mut fz.packed, left, run)?;
             left = left.saturating_sub(used);
             if f.full.is_none() {
                 // Fed whole: its spare buffers for the next packing; the worker gives back
@@ -1654,16 +1670,15 @@ impl<F: BlockFile> ShardDb<F> {
                 feed_buffers.truncate(FEED_BUFFERS);
                 fz.feed = None;
                 fz.walk = None;
-            } else if !wait {
-                // Its worker has no buffer back yet: the newer ones wait their turn.
-                return Ok(w.saturating_sub(left));
+            } else {
+                open = true;
             }
         }
         if left == 0 || !packing_too {
-            return Ok(w.saturating_sub(left));
+            return Ok((w.saturating_sub(left), open || left == 0));
         }
         let Some(p) = packing.as_mut() else {
-            return Ok(w.saturating_sub(left));
+            return Ok((w.saturating_sub(left), open));
         };
         let Packing {
             mem,
@@ -1673,10 +1688,13 @@ impl<F: BlockFile> ShardDb<F> {
             ..
         } = p;
         let (Some(walk), Some(f)) = (walk.as_mut(), feed.as_mut()) else {
-            return Ok(w.saturating_sub(left));
+            return Ok((w.saturating_sub(left), open));
         };
-        let used = feed_one(store, pool, mem, walk, f, packed, left, wait, run)?;
-        Ok(w.saturating_sub(left).saturating_add(used))
+        let used = feed_one(store, pool, mem, walk, f, packed, left, run)?;
+        Ok((
+            w.saturating_sub(left).saturating_add(used),
+            open || f.full.is_some(),
+        ))
     }
 
     /// The packing memtable, handed to its worker, becomes a frozen memtable: read until its
@@ -1896,20 +1914,23 @@ impl<F: BlockFile> ShardDb<F> {
             if self.frozen.is_empty() {
                 return Ok(());
             }
-            self.wait_oldest()?;
+            self.wait_oldest(self.frozen.len())?;
         }
     }
 
-    /// Waits for the oldest frozen memtable's branch, its entries fed first: its worker builds
-    /// only what it has been sent.
-    fn wait_oldest(&mut self) -> Result<(), Error> {
-        if self.frozen.front().is_some_and(|f| f.feed.is_some()) {
-            // Feeds the oldest first: every entry of it, waiting for its buffers.
-            let left = self
-                .frozen
-                .front()
-                .map_or(0, |f| f.mem.len().saturating_sub(f.packed));
-            self.feed(u64::try_from(left).unwrap_or(u64::MAX), true)?;
+    /// Waits for a frozen memtable's branch, the oldest `n`'s entries fed first, all at once:
+    /// a worker builds only what it has been sent, and fed together they build in parallel, so
+    /// the wait is the slowest packing's, not their sum.
+    fn wait_oldest(&mut self, n: usize) -> Result<(), Error> {
+        let left = self
+            .frozen
+            .iter()
+            .take(n)
+            .filter(|f| f.feed.is_some())
+            .map(|f| u64::try_from(f.mem.len().saturating_sub(f.packed)).unwrap_or(u64::MAX))
+            .fold(0u64, u64::saturating_add);
+        if left > 0 {
+            self.feed_from(left, true, false)?;
         }
         self.take_packs(true)
     }
@@ -2054,7 +2075,7 @@ impl<F: BlockFile> ShardDb<F> {
             if paced {
                 self.take_packs(false)?;
             } else {
-                self.wait_oldest()?;
+                self.wait_oldest(1)?;
             }
             return Ok(1);
         }
@@ -2237,7 +2258,9 @@ impl<F: BlockFile> ShardDb<F> {
         self.rebudget();
         self.flush_stats.rotations = self.flush_stats.rotations.saturating_add(1);
         let now = std::time::Instant::now();
-        if let Some(r) = self.rotated.replace(now) {
+        // The fill lasts from the last rotation's end: a stall there is not the fill's time,
+        // which would lower the measured overlap and make the next rotation wait for more.
+        if let Some(r) = self.rotated {
             self.fill_ns =
                 u64::try_from(now.saturating_duration_since(r).as_nanos()).unwrap_or(u64::MAX);
         }
@@ -2255,7 +2278,7 @@ impl<F: BlockFile> ShardDb<F> {
         // frozen than the measure says overlap: the oldest are waited for.
         let most = self.frozen_most();
         while self.frozen.len() > most {
-            self.wait_oldest()?;
+            self.wait_oldest(self.frozen.len().saturating_sub(most))?;
             stalled = true;
         }
         if self.trunk.pending() >= self.trunk.fanout() {
@@ -2279,6 +2302,7 @@ impl<F: BlockFile> ShardDb<F> {
         // Its order, a debt its packing pays a slice at a time.
         full.close();
         self.packing = Some(self.packing_of(full)?);
+        self.rotated = Some(std::time::Instant::now());
         Ok(())
     }
 
@@ -2641,7 +2665,8 @@ mod frozen_tests {
     }
 
     /// Opens every gate it names when dropped: a failed assertion while a worker is held must
-    /// not leave the pool's drop joining a worker that waits forever.
+    /// not leave the pool's drop joining a worker that waits forever. Declared after the shard,
+    /// it drops before the shard's pool does.
     struct Open(&'static [&'static AtomicBool]);
 
     impl Drop for Open {
@@ -2754,10 +2779,10 @@ mod frozen_tests {
 
     #[test]
     fn an_oldest_packing_held_lets_younger_ones_return_and_retires_in_order() {
-        let _open = Open(&GATES_A);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("store");
         let mut db = ShardDb::create(plain(&path, true), STORE, MEM, TRUNK).unwrap();
+        let _open = Open(&GATES_A);
         let p = path.clone();
         db.set_workers(move || {
             let first = OPENS_A.fetch_add(1, Ordering::SeqCst) == 0;
@@ -2817,7 +2842,6 @@ mod frozen_tests {
 
     #[test]
     fn a_failed_packing_is_repacked_here_or_kept_typed_and_read_exact() {
-        let _open = Open(&GATES_B);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("store");
         let shard = Held {
@@ -2828,6 +2852,7 @@ mod frozen_tests {
             waiting: None,
         };
         let mut db = ShardDb::create(shard, STORE, MEM, TRUNK).unwrap();
+        let _open = Open(&GATES_B);
         let p = path.clone();
         db.set_workers(move || {
             let first = OPENS_B.fetch_add(1, Ordering::SeqCst) == 0;
@@ -2879,6 +2904,103 @@ mod frozen_tests {
         let (mut db, applied) = ShardDb::open(plain(&path, false), STORE, MEM, TRUNK).unwrap();
         assert_eq!(applied, at);
         check(&mut db, &durable);
+        db.check_references().unwrap();
+    }
+
+    static HELD_C: AtomicBool = AtomicBool::new(false);
+    static WAITING_C: AtomicBool = AtomicBool::new(false);
+    static OPENS_C: AtomicUsize = AtomicUsize::new(0);
+    static GATES_C: [&AtomicBool; 1] = [&HELD_C];
+
+    /// A run two pages, the fewest an extent holds, so a memtable takes many of a feed's buffers and its feed starves while
+    /// its worker is held.
+    const STORE_RUN_PAGE: Config = Config {
+        page_size: 4096,
+        extent_pages: 2,
+        max_extents: 1 << 16,
+    };
+    const MEM_RUNS: usize = 128 * 1024;
+
+    #[test]
+    fn a_starved_oldest_feed_never_holds_a_younger_packing_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let mut db = ShardDb::create(plain(&path, true), STORE_RUN_PAGE, MEM_RUNS, TRUNK).unwrap();
+        let _open = Open(&GATES_C);
+        let p = path.clone();
+        db.set_workers(move || {
+            let first = OPENS_C.fetch_add(1, Ordering::SeqCst) == 0;
+            Ok(Held {
+                file: open(&p, false),
+                holds: if first { Some(&HELD_C) } else { None },
+                fails: None,
+                once: None,
+                waiting: if first { Some(&WAITING_C) } else { None },
+            })
+        });
+        HELD_C.store(true, Ordering::SeqCst);
+        let mut oracle = BTreeMap::new();
+        let mut i = 0u64;
+        // Puts until the oldest packing's worker is held mid-feed and a younger packing has a
+        // buffer in hand with entries left; no rotation may wait on the held one, so the frozen
+        // stay under the overlap pinned: the cores, once a fill is measured.
+        loop {
+            db.pack_ns = u64::MAX;
+            assert!(
+                db.frozen.len() < Pool::cores(),
+                "no younger packing was in hand before the overlap filled"
+            );
+            let k = format!("k{i:06}").into_bytes();
+            let v = format!("v{i}").into_bytes();
+            db.put(&k, &v).unwrap();
+            oracle.insert(k, v);
+            i += 1;
+            let starved = WAITING_C.load(Ordering::SeqCst)
+                && db.frozen.front().is_some_and(|f| f.feed.is_some());
+            let in_hand = db.packing.as_ref().is_some_and(|p| {
+                p.packed < p.mem.len() && p.feed.as_ref().is_some_and(|f| f.filling.is_some())
+            });
+            if starved && in_hand {
+                break;
+            }
+        }
+        // One pass, waiting for none: the younger packing takes entries though the oldest
+        // starves.
+        let before = db.packing.as_ref().map_or(0, |p| p.packed);
+        db.feed(u64::MAX, false).unwrap();
+        let after = db.packing.as_ref().map_or(0, |p| p.packed);
+        assert!(
+            after > before,
+            "the starved oldest held the younger feed back"
+        );
+        assert!(db.frozen.front().is_some_and(|f| !f.ready()));
+        // Released: every branch enters the trunk, oldest first, reads exact.
+        HELD_C.store(false, Ordering::SeqCst);
+        db.drain_frozen().unwrap();
+        db.maintain(u64::MAX).unwrap();
+        assert!(db.frozen.is_empty());
+        let mut v = Vec::new();
+        for (k, want) in &oracle {
+            assert!(db.get(k, &mut v).unwrap() && &v == want);
+        }
+        db.checkpoint(i).unwrap();
+        let (file, landed) = db.into_file();
+        landed.unwrap();
+        drop(file);
+        let (mut db, applied) =
+            ShardDb::open(plain(&path, false), STORE_RUN_PAGE, MEM_RUNS, TRUNK).unwrap();
+        assert_eq!(applied, i);
+        let mut rows = Rows::new();
+        let mut next = Vec::new();
+        assert!(
+            !db.scan(b"", None, usize::MAX, &mut rows, &mut next)
+                .unwrap()
+        );
+        let got: Vec<(Vec<u8>, Vec<u8>)> =
+            rows.iter().map(|(k, v)| (k.to_vec(), v.to_vec())).collect();
+        let want: Vec<(Vec<u8>, Vec<u8>)> =
+            oracle.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        assert_eq!(got, want);
         db.check_references().unwrap();
     }
 }

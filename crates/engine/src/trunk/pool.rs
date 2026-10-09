@@ -607,6 +607,15 @@ impl Pool {
         Ok(true)
     }
 
+    /// Waits for one message from the workers, answered or kept as [`Self::take`] does: false,
+    /// with nothing taken, when no worker has a job out to send one.
+    pub fn wait_any<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<bool, Error> {
+        if !self.workers.iter().flatten().any(|w| w.owner.is_some()) {
+            return Ok(false);
+        }
+        self.next(store, true)
+    }
+
     /// Whether a job of `owner`'s is out, or back and not yet taken.
     pub fn out_for(&self, owner: Owner) -> bool {
         self.workers

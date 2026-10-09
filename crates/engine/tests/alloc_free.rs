@@ -105,6 +105,38 @@ fn a_builder_adds_entries_without_allocating_once_its_pages_have_grown() {
 }
 
 #[test]
+fn a_new_builder_takes_every_working_buffer_from_the_pool() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = store(&dir);
+    // A first branch grows the pool: the working lists, the levels' pages, the key buffers and
+    // the payload, each to a branch this size.
+    let value = [7u8; 40];
+    let mut warm = Builder::new(&mut s, Keys::Exactly(ENTRIES)).unwrap();
+    for n in 0..ENTRIES {
+        warm.add(&mut s, &key(n), Op::Put, &value).unwrap();
+    }
+    let warm = warm.finish(&mut s).unwrap();
+    for &e in &warm.extents {
+        s.release(e).unwrap();
+    }
+    s.checkpoint(None, 1).unwrap();
+    // The next builder, from its start: one allocation, the filter the branch keeps, and no
+    // buffer grown, the hashes reserved for every key at once.
+    alloc::begin();
+    let mut b = Builder::new(&mut s, Keys::Exactly(ENTRIES)).unwrap();
+    for n in 0..ENTRIES {
+        b.add(&mut s, &key(n), Op::Put, &value).unwrap();
+    }
+    let counts = alloc::end();
+    assert_eq!(
+        (counts.allocations, counts.reallocations),
+        (1, 0),
+        "{counts:?}"
+    );
+    b.finish(&mut s).unwrap();
+}
+
+#[test]
 fn a_merge_steps_over_branches_without_allocating() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = store(&dir);

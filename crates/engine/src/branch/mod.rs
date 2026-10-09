@@ -149,7 +149,7 @@ fn u16_of(n: usize) -> Result<[u8; 2], Error> {
 
 /// One page being filled: its entries' keys and their encoded rest, until it is full.
 #[derive(Debug, Default)]
-struct Page {
+pub(crate) struct Page {
     /// Keys, back to back, and where each ends.
     keys: Vec<u8>,
     key_ends: Vec<usize>,
@@ -223,7 +223,7 @@ impl Page {
         self.total = self.total.saturating_add(under);
     }
 
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.keys.clear();
         self.key_ends.clear();
         self.rests.clear();
@@ -301,8 +301,11 @@ pub struct Builder {
     last: Vec<u8>,
     /// A leaf entry's bytes after its key, the buffer reused so an entry allocates nothing.
     rest: Vec<u8>,
-    /// A written page's first key, for its entry in the level above; the buffer reused.
-    first: Vec<u8>,
+    /// Each level's written page's first key, for its entry in the level above: a buffer a
+    /// level, since writing a page may write the level above's in turn.
+    firsts: Vec<Vec<u8>>,
+    /// Pages for levels the tree grows, kept from earlier builders ([`Store::take_lists`]).
+    spare_pages: Vec<Page>,
     /// Each tree page's entries as it is written, 0 for an index page ([`Branch::counts`]).
     counts: Vec<u16>,
     /// Each leaf's separator to its page number, added as the leaf is written, and the index
@@ -432,13 +435,33 @@ impl Builder {
                 what: "a branch page past 64 KiB",
             });
         }
+        // The hashes grow to the keys the builder is made for at once, not by doublings; a
+        // recycled list that held as many already holds them.
+        let (filter::Keys::Exactly(n) | filter::Keys::AtMost(n)) = keys;
+        let n = usize::try_from(n).unwrap_or(usize::MAX);
+        let mut hashes = lists.hashes;
+        hashes.reserve(n.saturating_sub(hashes.len()));
+        // The scratch keeps its old entries (none is read before it is written), so it is
+        // reserved to `n` in all, not `n` past them.
+        let mut hash_scratch = lists.hash_scratch;
+        hash_scratch.reserve(n.saturating_sub(hash_scratch.len()));
+        let mut spare_pages = lists.pages;
+        let mut levels = lists.levels;
+        levels.push(
+            spare_pages
+                .pop()
+                .unwrap_or_else(|| Page::with_capacity(capacity)),
+        );
+        let mut payload = lists.payload;
+        payload.reserve(capacity);
         Ok(Self {
-            levels: vec![Page::with_capacity(capacity)],
+            levels,
             extent: None,
             extents: lists.extents,
-            last: Vec::new(),
-            rest: Vec::new(),
-            first: Vec::new(),
+            last: lists.last,
+            rest: lists.rest,
+            firsts: lists.firsts,
+            spare_pages,
             counts: lists.counts,
             separators,
             index: lists.index,
@@ -446,12 +469,12 @@ impl Builder {
             keys: keys_filter,
             range: lists.range,
             range_filter: None,
-            hashes: lists.hashes,
-            hash_scratch: lists.hash_scratch,
+            hashes,
+            hash_scratch,
             hash_order: HashOrder::default(),
-            prev_last: Vec::new(),
+            prev_last: lists.prev_last,
             count: 0,
-            payload: Vec::with_capacity(capacity),
+            payload,
             capacity,
             filter: filter::Filter::new(keys),
             run: store.run()?,
@@ -597,7 +620,14 @@ impl Builder {
         let mut payload = std::mem::take(&mut self.payload);
         let page = self.levels.get(level).ok_or(corrupt(Malformed::TooLarge))?;
         page.encode(kind, &mut payload)?;
-        let mut first = std::mem::take(&mut self.first);
+        if self.firsts.len() <= level {
+            self.firsts.resize_with(level.saturating_add(1), Vec::new);
+        }
+        let mut first = std::mem::take(
+            self.firsts
+                .get_mut(level)
+                .ok_or(corrupt(Malformed::TooLarge))?,
+        );
         first.clear();
         first.extend_from_slice(page.key(0));
         let total = page.total;
@@ -648,14 +678,20 @@ impl Builder {
         if self.levels.len() <= above {
             // A level holds at most a page of entries before it writes; the height is bounded
             // by the entries' count, logarithmically.
-            self.levels.push(Page::with_capacity(self.capacity));
+            let page = self
+                .spare_pages
+                .pop()
+                .unwrap_or_else(|| Page::with_capacity(self.capacity));
+            self.levels.push(page);
         }
         let mut rest = [0u8; 16];
         let (child, under) = rest.split_at_mut(8);
         child.copy_from_slice(&address.to_le_bytes());
         under.copy_from_slice(&total.to_le_bytes());
         let inserted = self.insert(store, above, &first, &rest, total);
-        self.first = first;
+        if let Some(f) = self.firsts.get_mut(level) {
+            *f = first;
+        }
         inserted?;
         Ok(address)
     }
@@ -937,6 +973,10 @@ impl Builder {
                 .map_err(|_| corrupt(Malformed::TooLarge))?,
             probes: 0,
         });
+        // Every level's page back among the spares, for the next builder's levels.
+        let mut pages = self.spare_pages;
+        let mut levels = self.levels;
+        pages.append(&mut levels);
         store.give_lists(crate::store::Lists {
             extents: self.extents,
             counts: self.counts,
@@ -946,6 +986,13 @@ impl Builder {
             index: self.index,
             hashes: self.hashes,
             hash_scratch: self.hash_scratch,
+            levels,
+            pages,
+            firsts: self.firsts,
+            last: self.last,
+            rest: self.rest,
+            prev_last: self.prev_last,
+            payload: self.payload,
         });
         branch
     }

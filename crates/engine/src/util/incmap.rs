@@ -20,7 +20,7 @@
 /// tombstone to the new table, so the new table ends it holding at most `len + C / 4` for
 /// `MOVE = 8`. Built with `N >= 8/7 (len + 1 + C / 4)` buckets, it stays under its rebuild
 /// threshold, `7/8` of `N`: a migration always ends before the next begins.
-const MOVE: usize = 8;
+pub(crate) const MOVE: usize = 8;
 /// Buckets a window's sweep looks at each time an entry is added (see `IncMap::sweep`).
 /// Derived: an entry leaves the window after `W` newer ones, and a pass over the map's `B` buckets
 /// takes `B / SWEEP` additions, each adding at most one entry, so expired entries number at most
@@ -29,20 +29,20 @@ const MOVE: usize = 8;
 /// So a window's map stays within a few times `W`.
 pub const SWEEP: usize = 16;
 /// Fibonacci hashing's multiplier, 2^64 over the golden ratio (Knuth, TAOCP vol. 3, §6.4).
-const FIB: u64 = 0x9E37_79B9_7F4A_7C15;
+pub(crate) const FIB: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// Control bytes: a bucket never used since its table was built, a removed entry's, and a full
 /// bucket's holding its tag, below 0x80 (hashbrown's encoding).
-const EMPTY: u8 = 0xFF;
-const DELETED: u8 = 0x80;
+pub(crate) const EMPTY: u8 = 0xFF;
+pub(crate) const DELETED: u8 = 0x80;
 /// Buckets in a group: the control bytes in a word.
-const GROUP: usize = 8;
+pub(crate) const GROUP: usize = 8;
 /// A word of eight bytes each `b`.
-const fn repeat(b: u8) -> u64 {
+pub(crate) const fn repeat(b: u8) -> u64 {
     u64::from_le_bytes([b; GROUP])
 }
-const LOW: u64 = repeat(0x01);
-const HIGH: u64 = repeat(0x80);
+pub(crate) const LOW: u64 = repeat(0x01);
+pub(crate) const HIGH: u64 = repeat(0x80);
 
 /// One table: a power-of-two count of buckets, at least a group.
 #[derive(Debug, Default)]

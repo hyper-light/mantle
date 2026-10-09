@@ -31,8 +31,8 @@
 use crate::branch::Op;
 use crate::branch::filter::hash;
 use crate::error::{Error, Malformed};
+use crate::memtable::index::KeyIndex;
 use crate::util::coding::{get_varint32_ptr, put_varint32};
-use crate::util::incmap::IncMap;
 use std::cmp::Ordering;
 
 /// The most bytes an entry's head takes in the arena: the operation (1), then the key's and the
@@ -239,10 +239,9 @@ pub struct HashMem {
     limit: usize,
     /// The most bytes the arena has held: its pages written so far, which a clear keeps.
     touched: usize,
-    index: IncMap,
-    /// Newest entries of keys whose hash another key's newest entry holds in `index`: a 64-bit
-    /// hash shared by two keys, which the index cannot tell apart.
-    clashes: Vec<u32>,
+    /// Each key's newest entry, by the key's hash: keys of one hash are told apart by their
+    /// bytes ([`KeyIndex`]).
+    index: KeyIndex,
     len: usize,
     /// The first key written, and how many of its first bytes every key written since shares.
     first: Vec<u8>,
@@ -423,8 +422,7 @@ impl HashMem {
             arena: Vec::with_capacity(limit),
             limit,
             touched: 0,
-            index: IncMap::new(),
-            clashes: Vec::new(),
+            index: KeyIndex::default(),
             len: 0,
             first: Vec::new(),
             skip: 0,
@@ -455,7 +453,6 @@ impl HashMem {
         self.touched = self.touched.max(self.arena.len());
         self.arena.clear();
         self.index.clear();
-        self.clashes.clear();
         self.len = 0;
         self.first.clear();
         self.skip = 0;
@@ -580,7 +577,6 @@ impl HashMem {
             .saturating_add(keyed)
             .saturating_add(counts)
             .saturating_add(self.first.capacity())
-            .saturating_add(self.clashes.capacity().saturating_mul(size_of::<u32>()))
             .saturating_add(self.hot.capacity().saturating_mul(size_of::<Hot>()))
             .saturating_add(self.hot_free.capacity().saturating_mul(size_of::<u32>()))
     }
@@ -620,15 +616,8 @@ impl HashMem {
 
     /// The newest entry for `key`, of hash `hash`.
     fn newest(&self, key: &[u8], hash: u64) -> Option<u32> {
-        let e = u32::try_from(self.index.get(hash)?).ok()?;
-        if self.key(e) == key {
-            return Some(e);
-        }
-        self.clashes
-            .iter()
-            .rev()
-            .copied()
-            .find(|&c| self.key(c) == key)
+        let arena = &self.arena;
+        self.index.get(hash, |e| self::key(arena, e) == key)
     }
 
     /// The newest entry for `key`, of filter hash `hash` ([`crate::branch::filter::hash`]): its
@@ -715,28 +704,15 @@ impl HashMem {
         put_varint32(&mut self.arena, vlen);
         self.arena.extend_from_slice(key);
         self.arena.extend_from_slice(value);
-        match self.index.get(h).and_then(|e| u32::try_from(e).ok()) {
-            None => {
-                self.index.insert(h, u64::from(entry));
-                self.len = self.len.saturating_add(1);
-            }
-            Some(old) if self.key(old) == key => {
-                self.index.insert(h, u64::from(entry));
-            }
-            Some(_) => {
-                // Another key holds this hash: this key's newest entries are kept beside it.
-                match self.clashes.iter().position(|&c| self.key(c) == key) {
-                    Some(i) => {
-                        if let Some(c) = self.clashes.get_mut(i) {
-                            *c = entry;
-                        }
-                    }
-                    None => {
-                        self.clashes.push(entry);
-                        self.len = self.len.saturating_add(1);
-                    }
-                }
-            }
+        let arena = &self.arena;
+        let replaced = self.index.put(
+            h,
+            entry,
+            |e| self::key(arena, e) == key,
+            |e| hash(self::key(arena, e)),
+        );
+        if replaced.is_none() {
+            self.len = self.len.saturating_add(1);
         }
         self.tail.push(Keyed {
             prefix: prefix(key, self.skip),

@@ -2,4 +2,5 @@
 
 pub mod btree;
 pub mod hashed;
+pub mod index;
 pub mod inlineskiplist;

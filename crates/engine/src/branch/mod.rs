@@ -436,15 +436,17 @@ impl Builder {
             });
         }
         // The hashes grow to the keys the builder is made for at once, not by doublings; a
-        // recycled list that held as many already holds them.
+        // recycled list that held as many already holds them. A bound the allocator refuses
+        // (a compaction's `AtMost` may name no real count) reserves nothing: the lists then grow
+        // as keys arrive, as they would unreserved.
         let (filter::Keys::Exactly(n) | filter::Keys::AtMost(n)) = keys;
         let n = usize::try_from(n).unwrap_or(usize::MAX);
         let mut hashes = lists.hashes;
-        hashes.reserve(n.saturating_sub(hashes.len()));
+        let _refused = hashes.try_reserve(n.saturating_sub(hashes.len()));
         // The scratch keeps its old entries (none is read before it is written), so it is
         // reserved to `n` in all, not `n` past them.
         let mut hash_scratch = lists.hash_scratch;
-        hash_scratch.reserve(n.saturating_sub(hash_scratch.len()));
+        let _refused = hash_scratch.try_reserve(n.saturating_sub(hash_scratch.len()));
         let mut spare_pages = lists.pages;
         let mut levels = lists.levels;
         levels.push(

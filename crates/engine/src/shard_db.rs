@@ -739,8 +739,12 @@ impl<F: BlockFile> ShardDb<F> {
     /// shard's file that `open` gives (the file opened again as the shard's was): as many as
     /// the measured need asks, up to the cores the OS reports less this thread (`trunk::pool`).
     /// Puts then pay only for taking the workers' results, and wait on them only when a
-    /// rotation finds the trunk's cascade still out.
-    pub fn set_workers(&mut self, mut open: impl FnMut() -> Result<F, Error> + Send + 'static)
+    /// rotation finds the trunk's cascade still out. Refused when the workers' channel back
+    /// cannot be made (`Pool::new`).
+    pub fn set_workers(
+        &mut self,
+        mut open: impl FnMut() -> Result<F, Error> + Send + 'static,
+    ) -> Result<(), Error>
     where
         F: Send + 'static,
     {
@@ -755,7 +759,8 @@ impl<F: BlockFile> ShardDb<F> {
                     detail: e.to_string(),
                 })
         });
-        self.trunk.set_pool(Pool::new(spawn, Pool::cores()));
+        self.trunk.set_pool(Pool::new(spawn, Pool::cores())?);
+        Ok(())
     }
 
     /// The maintenance workers held and wanted, when the shard has any.
@@ -2793,7 +2798,8 @@ mod frozen_tests {
                 once: None,
                 waiting: if first { Some(&WAITING_A) } else { None },
             })
-        });
+        })
+        .unwrap();
         HELD_A.store(true, Ordering::SeqCst);
         let mut oracle = BTreeMap::new();
         let mut i = 0u64;
@@ -2863,7 +2869,8 @@ mod frozen_tests {
                 once: Some(true),
                 waiting: None,
             })
-        });
+        })
+        .unwrap();
         let mut oracle = BTreeMap::new();
         let mut i = 0u64;
 
@@ -2937,7 +2944,8 @@ mod frozen_tests {
                 once: None,
                 waiting: if first { Some(&WAITING_C) } else { None },
             })
-        });
+        })
+        .unwrap();
         HELD_C.store(true, Ordering::SeqCst);
         let mut oracle = BTreeMap::new();
         let mut i = 0u64;

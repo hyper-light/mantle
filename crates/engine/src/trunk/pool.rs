@@ -21,9 +21,11 @@
 //! once, and one above the measured need is stopped once free.
 
 use std::collections::VecDeque;
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
 use std::time::Instant;
+
+use hyper_rt::sync::{ChannelReceiver, Sender};
 
 use crate::branch::filter::Keys;
 use crate::branch::merge::Compaction;
@@ -196,7 +198,7 @@ pub struct Seat {
     pub id: usize,
     jobs: Receiver<Box<Job>>,
     more: Receiver<Result<Vec<u64>, Error>>,
-    back: SyncSender<Message>,
+    back: Sender<Message>,
 }
 
 /// Starts a worker's thread on its seat: the shard's way to open its own file again.
@@ -214,7 +216,7 @@ pub fn serve<F: BlockFile>(file: F, config: Config, seat: Seat) {
     let mut store = match Store::worker(file, config) {
         Ok(s) => s,
         Err(error) => {
-            drop(back.send(Message::Done {
+            drop(back.blocking_send(Message::Done {
                 worker: id,
                 result: Err(error),
             }));
@@ -223,7 +225,7 @@ pub fn serve<F: BlockFile>(file: F, config: Config, seat: Seat) {
     };
     let asks = back.clone();
     store.set_refill(Refill(Box::new(move |n| {
-        asks.send(Message::Need { worker: id, n })
+        asks.blocking_send(Message::Need { worker: id, n })
             .map_err(|_| gone("ask the shard for extents"))?;
         more.recv()
             .map_err(|_| gone("take extents from the shard"))?
@@ -249,7 +251,10 @@ pub fn serve<F: BlockFile>(file: F, config: Config, seat: Seat) {
         // A packing's channels close before the result is sent, so every buffer still held is
         // back on the shard's side when it takes the result.
         drop(job);
-        if back.send(Message::Done { worker: id, result }).is_err() {
+        if back
+            .blocking_send(Message::Done { worker: id, result })
+            .is_err()
+        {
             return;
         }
     }
@@ -262,7 +267,7 @@ type Parts = Vec<(Vec<u8>, Branch)>;
 fn run<F: BlockFile>(
     store: &mut Store<F>,
     job: &Job,
-    back: &SyncSender<Message>,
+    back: &Sender<Message>,
     id: usize,
 ) -> Result<(Parts, u64), Error> {
     store.begin_job(&job.grant, job.file_end, job.generation);
@@ -290,7 +295,7 @@ fn run<F: BlockFile>(
                 waited = waited.saturating_add(ns(Instant::now().saturating_duration_since(t)));
                 decode(&buf, |k, op, v, h| b.add_hashed(store, k, op, v, h))?;
                 buf.clear();
-                back.send(Message::Spent { worker: id, buf })
+                back.blocking_send(Message::Spent { worker: id, buf })
                     .map_err(|_| gone("give the shard a packing buffer back"))?;
             }
             vec![(Vec::new(), b.finish(store)?)]
@@ -324,9 +329,10 @@ pub struct Pool {
     spawn: Spawn,
     workers: Vec<Option<Worker>>,
     /// The workers' channel back, cloned into each seat; dropped last, so the channel ends once
-    /// every worker has.
-    back: Option<SyncSender<Message>>,
-    messages: Receiver<Message>,
+    /// every worker has. A runtime's channel, so that a shard owned by a runtime task can await
+    /// its workers' messages; plain threads send and take on it as on a std channel.
+    back: Option<Sender<Message>>,
+    messages: ChannelReceiver<Message>,
     /// Jobs back for an owner other than the one taking: at most a job a worker.
     undelivered: VecDeque<(Owner, Back)>,
     /// The cores the OS reports less the shard's own: the most workers.
@@ -352,10 +358,17 @@ impl std::fmt::Debug for Pool {
 
 impl Pool {
     /// A pool of up to `most` workers, each started by `spawn`; none until a job needs one.
-    pub fn new(spawn: Spawn, most: usize) -> Self {
+    /// Refused when the runtime has no synchronization cell left for its channel back.
+    pub fn new(spawn: Spawn, most: usize) -> Result<Self, Error> {
         let most = most.max(1);
-        let (back, messages) = sync_channel(most.saturating_mul(FEED_BUFFERS.saturating_add(1)));
-        Self {
+        let (back, messages) = hyper_rt::sync::channel(
+            most.saturating_mul(FEED_BUFFERS.saturating_add(1)),
+        )
+        .map_err(|error| Error::Io {
+            op: "make the maintenance workers' channel back",
+            detail: error.to_string(),
+        })?;
+        Ok(Self {
             spawn,
             workers: Vec::new(),
             back: Some(back),
@@ -366,7 +379,7 @@ impl Pool {
             busy_ns: 0,
             waited_ns: 0,
             since: None,
-        }
+        })
     }
 
     /// The cores the OS reports less the shard's own thread, at least one.
@@ -545,19 +558,19 @@ impl Pool {
     /// owner. Whether one was taken.
     fn next<F: BlockFile>(&mut self, store: &mut Store<F>, wait: bool) -> Result<bool, Error> {
         let message = match self.messages.try_recv() {
-            Ok(m) => m,
-            Err(TryRecvError::Empty) if wait => {
+            Ok(Some(m)) => m,
+            Ok(None) if wait => {
                 let t = Instant::now();
                 let m = self
                     .messages
-                    .recv()
+                    .blocking_recv()
                     .map_err(|_| gone("take a worker's message"))?;
                 let waited = ns(Instant::now().saturating_duration_since(t));
                 self.waited_ns = self.waited_ns.saturating_add(waited);
                 m
             }
-            Err(TryRecvError::Empty) => return Ok(false),
-            Err(TryRecvError::Disconnected) => return Err(gone("take a worker's message")),
+            Ok(None) => return Ok(false),
+            Err(_) => return Err(gone("take a worker's message")),
         };
         match message {
             Message::Need { worker, n } => {
@@ -644,7 +657,7 @@ impl Drop for Pool {
             .filter_map(|w| w.take().and_then(|mut w| w.thread.take()))
             .collect();
         self.back = None;
-        while self.messages.recv().is_ok() {}
+        while self.messages.blocking_recv().is_ok() {}
         for t in threads {
             drop(t.join());
         }

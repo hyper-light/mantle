@@ -66,7 +66,8 @@ fn workers(db: &mut ShardDb<DeviceFile>, path: &Path) {
             op: "open a worker's file",
             detail: e.to_string(),
         })
-    });
+    })
+    .unwrap();
 }
 
 fn check<F: BlockFile>(db: &mut ShardDb<F>, oracle: &BTreeMap<u64, Option<Vec<u8>>>, k: u64) {

@@ -112,7 +112,8 @@ fn workers(db: &mut ShardDb<DeviceFile>, path: &Path) {
             op: "open a worker's file",
             detail: e.to_string(),
         })
-    });
+    })
+    .unwrap();
 }
 
 fn apply(db: &mut ShardDb<DeviceFile>, i: u64) {

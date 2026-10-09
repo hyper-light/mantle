@@ -228,7 +228,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 op: "open a maintenance worker's file",
                 detail: e.to_string(),
             })
-        });
+        })
+        .unwrap();
     }
     db.set_write_budget(write_budget_mib << 20);
     if memory_mib > 0 {

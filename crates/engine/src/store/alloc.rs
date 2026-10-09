@@ -18,6 +18,9 @@ pub struct Allocator {
     free: Vec<u64>,
     pending: Vec<u64>,
     limit: u64,
+    /// A maintenance worker's: it holds its grant alone and never grows the file
+    /// ([`Allocator::granted`]).
+    granted: bool,
 }
 
 fn corrupt(why: Malformed) -> Error {
@@ -41,6 +44,7 @@ impl Allocator {
             free: Vec::new(),
             pending: Vec::new(),
             limit: limit.max(1),
+            granted: false,
         }
     }
 
@@ -67,7 +71,36 @@ impl Allocator {
             free,
             pending: Vec::new(),
             limit,
+            granted: false,
         })
+    }
+
+    /// A maintenance worker's allocator: the extents `grant`ed it by the shard's, and no other.
+    /// Its counts span the granted extents alone, a few kilobytes, and it never grows the file
+    /// past them: an extent past the grant is refused (`LimitExceeded`), so the shard sizes the
+    /// grant to the job ([`crate::store::Store::grant`]). Nothing it holds is ever persisted.
+    pub fn granted(grant: &[u64]) -> Result<Self, Error> {
+        let most = grant.iter().copied().max().unwrap_or(0);
+        let len = index(most)?.checked_add(1).ok_or(Error::InvalidArgument {
+            what: "an extent past the address space",
+        })?;
+        let mut free = grant.to_vec();
+        // Lowest first off the stack, as the shard's allocator reuses extents.
+        free.sort_unstable_by(|a, b| b.cmp(a));
+        Ok(Self {
+            refs: vec![0; len],
+            free,
+            pending: Vec::new(),
+            limit: u64::try_from(len).unwrap_or(u64::MAX),
+            granted: true,
+        })
+    }
+
+    /// A worker's granted extents it never wrote, or released again: given back to the shard.
+    pub fn unused(&mut self) -> Vec<u64> {
+        let mut out = std::mem::take(&mut self.free);
+        out.append(&mut self.pending);
+        out
     }
 
     /// An extent for new pages, its count 1: a free one, else one past the file's end. Refused
@@ -78,6 +111,13 @@ impl Allocator {
                 *count = 1;
             }
             return Ok(extent);
+        }
+        // A worker's allocator holds its grant alone: past it, refused rather than grown.
+        if self.granted {
+            return Err(Error::LimitExceeded {
+                what: "extents granted a maintenance worker",
+                limit: self.limit,
+            });
         }
         let extent = u64::try_from(self.refs.len()).map_err(|_| Error::LimitExceeded {
             what: "extents of a store",
@@ -127,6 +167,21 @@ impl Allocator {
         if *count == 0 {
             self.pending.push(extent);
         }
+        Ok(())
+    }
+
+    /// Takes back an extent allocated and never named by any checkpoint, held once: free again
+    /// at once, since no durable checkpoint can name it (a worker's grant it never wrote).
+    pub fn give_back(&mut self, extent: u64) -> Result<(), Error> {
+        let count = self
+            .refs
+            .get_mut(index(extent)?)
+            .filter(|c| **c == 1)
+            .ok_or(Error::InvalidArgument {
+                what: "an extent given back that is not held once",
+            })?;
+        *count = 0;
+        self.free.push(extent);
         Ok(())
     }
 

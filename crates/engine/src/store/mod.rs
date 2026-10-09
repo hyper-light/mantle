@@ -469,6 +469,61 @@ impl<F: BlockFile> Store<F> {
         Ok(store)
     }
 
+    /// A maintenance worker's store over its own handle on the shard's file: no superblock and no
+    /// cache, its allocator the extents `grant`ed it ([`Allocator::granted`]), and reads up to
+    /// `end`, the bytes the shard's store knew the file to hold when it granted the job. A
+    /// compaction or a branch's build runs on it as on the shard's own, writing in place through
+    /// the file, each write landed when it returns; the shard takes the result once every write
+    /// has.
+    pub fn worker(file: F, config: Config, grant: &[u64], end: u64) -> Result<Self, Error> {
+        Self::check(&file, config)?;
+        let buf = Self::page_buf(&file, config)?;
+        let page_size = u32::try_from(config.page_size).map_err(|_| Error::InvalidArgument {
+            what: "a page size past 4 GiB",
+        })?;
+        Ok(Self {
+            file,
+            config,
+            alloc: Allocator::granted(grant)?,
+            durable: Superblock {
+                page_size,
+                extent_pages: config.extent_pages,
+                generation: 0,
+                applied: 0,
+                root: None,
+                extents: 0,
+                map: Vec::new(),
+            },
+            buf,
+            fenced: false,
+            end,
+            io: IoStats::default(),
+            cache: None,
+            range_filter_bits: RANGE_FILTER_BITS,
+            writer: None,
+            write_budget_runs: 0,
+            queue_peak: 0,
+            pool: Vec::new(),
+            lent: 0,
+            point: Vec::new(),
+            most_lent: 0,
+            pages: Vec::new(),
+            pages_lent: 0,
+            pages_most_lent: 0,
+            lists: Vec::new(),
+            lists_lent: 0,
+            lists_most_lent: 0,
+            forgetting: VecDeque::new(),
+            timed: false,
+        })
+    }
+
+    /// A worker's granted extents it never wrote, for the shard to take back
+    /// ([`Self::grant_back`]).
+    pub fn unused_grant(&mut self) -> Vec<u64> {
+        self.alloc.unused()
+    }
+
     /// Opens the store in `file` at its newest durable checkpoint: the newer of the two
     /// superblock copies that verify, its map read back. A file whose copies both fail is corrupt.
     pub fn open(file: F, config: Config) -> Result<(Self, Recovered), Error> {
@@ -716,6 +771,49 @@ impl<F: BlockFile> Store<F> {
     /// An extent for new pages, held once.
     pub fn allocate_extent(&mut self) -> Result<u64, Error> {
         self.alloc.allocate()
+    }
+
+    /// `count` extents for a maintenance worker's job, each held once as the shard's own: the
+    /// worker writes them through its own store ([`Self::worker`]), whose writes this store's
+    /// cache never sees, so any page the cache still holds of them, from before they were freed,
+    /// is forgotten now rather than in its turn ([`Self::forget_some`] passes over extents held
+    /// again, since this store's own writes replace what it cached).
+    pub fn grant(&mut self, count: usize) -> Result<Vec<u64>, Error> {
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            out.push(self.alloc.allocate()?);
+        }
+        if let Some(c) = self.cache.as_mut() {
+            let per = u64::from(self.config.extent_pages);
+            for &extent in &out {
+                let first = extent
+                    .checked_mul(per)
+                    .ok_or(corrupt(Malformed::TooLarge))?;
+                for page in 0..per {
+                    c.forget(first.saturating_add(page));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Takes back extents granted a worker that it never wrote: free again at once, since no
+    /// checkpoint ever named them.
+    pub fn grant_back(&mut self, extents: &[u64]) -> Result<(), Error> {
+        for &extent in extents {
+            self.alloc.give_back(extent)?;
+        }
+        Ok(())
+    }
+
+    /// The bytes the file is known to hold: what a read may reach.
+    pub fn end(&self) -> u64 {
+        self.end
+    }
+
+    /// The file holds at least `end` bytes: a worker's writes, landed, reached it.
+    pub fn extend_end(&mut self, end: u64) {
+        self.end = self.end.max(end);
     }
 
     /// One more reference to a held extent (a new node naming an existing branch).

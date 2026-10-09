@@ -1152,8 +1152,9 @@ impl<F: BlockFile> ShardDb<F> {
             self.scan_packing = c;
         }
         // What the walks merged from the runs stays merged for the next seek of that range.
+        let mut owed_keys = 0u64;
         if !self.scan_charges.is_empty() {
-            self.trunk.charge(&self.scan_charges);
+            owed_keys = self.trunk.charge(&self.scan_charges);
         }
         let (run_seeks, run_steps) = self.scan_active.walk.run_work();
         self.mem.adopt(&mut self.scan_active.walk);
@@ -1163,6 +1164,20 @@ impl<F: BlockFile> ShardDb<F> {
         if many > one {
             let seek_ns = if seek_timed { Some(seek_ns) } else { None };
             self.charge_runs(seek_ns, many, one, run_seeks, run_steps, step_extra);
+        }
+        // The seek does the consolidation its rent paid for, as a put does its compaction
+        // share: no more work than the extra sources just cost it, so a shard read without
+        // pause still consolidates what its seeks pay for. Paced: a page still being read
+        // stops the slice rather than wait.
+        if owed_keys > 0
+            && self.packing.is_none()
+            && (self.trunk.consolidation_in_progress()
+                || (self.trunk.consolidation_owed()
+                    && self.trunk.debt() == 0
+                    && !self.trunk.cascading()))
+        {
+            self.trunk
+                .consolidate_step(&mut self.store, owed_keys, true)?;
         }
         Ok(more)
     }

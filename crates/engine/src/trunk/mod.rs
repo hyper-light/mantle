@@ -956,15 +956,18 @@ impl Trunk {
     /// nanoseconds a source of its segment took to open, measured) for the sources beyond one
     /// consolidated leaf branch they made the seek open: all of an index pivot's, all but one of the leaf's. A pivot whose rent then
     /// covers its consolidation, priced at the measured cost of a key's compaction, is paid.
-    pub fn charge(&mut self, path: &[(Passed, u64)]) {
+    /// Returns the keys of consolidation the rent charged pays for: what the seek then does
+    /// itself ([`Self::consolidate_step`]), as a put does its share of compaction.
+    pub fn charge(&mut self, path: &[(Passed, u64)]) -> u64 {
         let key_ns = match self.consolidation {
-            Consolidation::Never => return,
+            Consolidation::Never => return 0,
             Consolidation::Always => 0,
             Consolidation::Measured => match self.merge_ns.checked_div(self.merge_keys) {
                 Some(ns) => ns.max(1),
-                None => return,
+                None => return 0,
             },
         };
+        let mut charged = 0u64;
         for &(ref step, source_ns) in path {
             let extra = if step.leaf {
                 step.sources.saturating_sub(1)
@@ -975,6 +978,7 @@ impl Trunk {
                 continue;
             }
             let rent = source_ns.saturating_mul(u64::try_from(extra).unwrap_or(u64::MAX));
+            charged = charged.saturating_add(rent);
             let price = self.consolidation_entries(step).saturating_mul(key_ns);
             let Some(pivot) = self
                 .nodes
@@ -989,6 +993,12 @@ impl Trunk {
                 self.paid = self.paid.saturating_add(1);
             }
         }
+        charged.checked_div(key_ns).unwrap_or(charged)
+    }
+
+    /// Whether the cascade in progress is a consolidation's.
+    pub fn consolidation_in_progress(&self) -> bool {
+        self.consolidating && !self.cascade.is_empty()
     }
 
     /// The entries consolidating the pivot `step` names rewrites: a leaf's whole bundle; an index

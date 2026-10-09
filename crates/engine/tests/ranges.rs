@@ -265,11 +265,30 @@ fn ranges_must_ascend_from_the_empty_key() {
     runtime.shutdown().unwrap();
 }
 
+/// What a held read reports: admitted off the shard's thread, or attempted on it (a regression
+/// to a synchronous owner read).
+#[derive(Debug, PartialEq, Eq)]
+enum ReadEvent {
+    Entered,
+    OnShard,
+}
+
 #[derive(Default)]
 struct ReadGate {
     held: AtomicBool,
     entered: AtomicUsize,
     shard: Mutex<Option<std::thread::ThreadId>>,
+    /// Where held reads are reported: the first of each kind is all a test waits on, so a
+    /// report finding the channel full is dropped.
+    events: Mutex<Option<std::sync::mpsc::SyncSender<ReadEvent>>>,
+}
+
+impl ReadGate {
+    fn report(&self, event: ReadEvent) {
+        if let Some(tx) = self.events.lock().unwrap().as_ref() {
+            drop(tx.try_send(event));
+        }
+    }
 }
 
 struct Gated {
@@ -291,6 +310,7 @@ impl BlockFile for Gated {
             // A regression to a synchronous owner read must fail, rather than holding the
             // shard that needs to answer the probe request below.
             if *self.gate.shard.lock().unwrap() == Some(std::thread::current().id()) {
+                self.gate.report(ReadEvent::OnShard);
                 return Err(DiskError::Io {
                     op: "range read blocked its runtime shard",
                     path: std::path::PathBuf::new(),
@@ -298,6 +318,7 @@ impl BlockFile for Gated {
                 });
             }
             self.gate.entered.fetch_add(1, Ordering::SeqCst);
+            self.gate.report(ReadEvent::Entered);
             while self.gate.held.load(Ordering::SeqCst) {
                 std::thread::yield_now();
             }
@@ -378,6 +399,8 @@ fn a_held_maintenance_read_leaves_the_shard_available_for_range_requests() {
     *gate.shard.lock().unwrap() = Some(on_shard.recv().unwrap());
     // Open the device before Runtime/Issuer teardown if an oracle fails while it is held.
     let open = OpenOnDrop(Arc::clone(&gate));
+    let (report, events) = std::sync::mpsc::sync_channel(2);
+    *gate.events.lock().unwrap() = Some(report);
     gate.held.store(true, Ordering::SeqCst);
     let ranges = Ranges::start(
         &runtime,
@@ -386,19 +409,10 @@ fn a_held_maintenance_read_leaves_the_shard_available_for_range_requests() {
     )
     .unwrap();
     let mut client = ranges.client().unwrap();
-    // Every response is evidence that the shard runs while preparation advances. Each probe
-    // gives the range at least one idle slice (the client waits for each answer, so none is
-    // queued behind it), and each slice does at least one unit of the owed cascade or stops at
-    // a read still in flight, which is what this waits for. That cascade moves each of its
-    // inputs through at most one compaction a pivot it passes, at most one an input: the inputs
-    // squared bound the probes by the work owed, not by how fast slices run, and an absent cold
-    // read fails rather than waiting forever for it.
-    for _ in 0..oracle.len().saturating_mul(oracle.len()) {
-        client.stats().unwrap();
-        if gate.entered.load(Ordering::SeqCst) > 0 {
-            break;
-        }
-    }
+    // No request is sent while the cascade's first cold read is awaited: the range is idle, so
+    // it runs its owed maintenance until that read is admitted off its thread, the fact this
+    // waits on, or attempted on it, which fails at once.
+    assert_eq!(events.recv().unwrap(), ReadEvent::Entered);
     assert!(gate.entered.load(Ordering::SeqCst) > 0);
     client.stats().unwrap();
     client

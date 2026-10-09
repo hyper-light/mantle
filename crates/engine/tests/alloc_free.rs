@@ -234,3 +234,59 @@ fn a_shard_scans_without_allocating_once_its_buffers_have_grown() {
         "through views: {counts:?}"
     );
 }
+
+#[test]
+fn a_memtable_cycle_allocates_nothing_once_its_buffers_have_grown() {
+    use mantle_engine::memtable::hashed::{HashMem, Walk};
+    // A memtable's whole cycle: filled with seals between (sorts and merges), then scanned at
+    // random keys with writes between, so each walk's merging becomes a merged range, writes
+    // drop ranges and later walks make new ones from the freed nodes; then cleared for the next.
+    // Two cycles grow every buffer, the pool of them and the slab to their sizes; a third
+    // allocates and reallocates nothing.
+    let cycle = |m: &mut HashMem, walk: &mut Walk| {
+        m.clear();
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for i in 0..20_000u64 {
+            m.insert(&key(next() % 5_000), Op::Put, &i.to_le_bytes())
+                .unwrap();
+            if i % 1_000 == 999 {
+                m.seal();
+            }
+        }
+        m.seal();
+        let (mut walked, mut merged_only) = (0usize, 0usize);
+        for i in 0..4_000u64 {
+            m.walk_from_into(&key(next() % 5_000), walk).unwrap();
+            walked += m.walk_some(walk, 10, |_, _, _| Ok(())).unwrap();
+            if walk.run_work() == (0, 0) {
+                merged_only += 1;
+            }
+            m.adopt(walk);
+            if i % 3 == 0 {
+                m.insert(&key(next() % 5_000), Op::Put, b"w").unwrap();
+            }
+        }
+        (walked, merged_only)
+    };
+    let mut m = HashMem::new(1 << 22).unwrap();
+    let mut walk = Walk::default();
+    let warm = cycle(&mut m, &mut walk);
+    cycle(&mut m, &mut walk);
+    alloc::begin();
+    let measured = cycle(&mut m, &mut walk);
+    let counts = alloc::end();
+    // The same cycle each time, and some of its walks ran in merged ranges alone.
+    assert_eq!(warm, measured);
+    assert!(measured.1 > 0, "{measured:?}");
+    assert_eq!(
+        (counts.allocations, counts.reallocations),
+        (0, 0),
+        "{counts:?}"
+    );
+}

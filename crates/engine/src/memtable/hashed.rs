@@ -89,18 +89,6 @@ struct Merge {
     level: u32,
 }
 
-/// Keeps `buf` in `first` or `second` when it is larger than either, the larger in `first`.
-fn keep_largest(buf: Vec<Keyed>, first: &mut Vec<Keyed>, second: &mut Vec<Keyed>) {
-    if buf.capacity() > first.capacity() {
-        let old = std::mem::replace(first, buf);
-        if old.capacity() > second.capacity() {
-            *second = old;
-        }
-    } else if buf.capacity() > second.capacity() {
-        *second = buf;
-    }
-}
-
 /// The level of a run of `len` entries: runs of one level are within twice each other's size.
 fn level(len: usize) -> u32 {
     usize::BITS.saturating_sub(len.leading_zeros())
@@ -271,25 +259,153 @@ pub struct HashMem {
     /// The merges in progress, at most one a level.
     merges: Vec<Merge>,
     sort: Option<Sort>,
-    /// The largest buffer a finished merge or sort freed, for the next merge's or sort's output.
-    spare: Vec<Keyed>,
+    /// Entry buffers finished sorts, merges and fills freed, for the next: a buffer is taken
+    /// at the smallest capacity that holds what it is for, so a memtable's fills, sorts and
+    /// merges reuse what the last ones grew and allocate nothing once grown. At most
+    /// [`MAX_RUNS`] are kept, the smallest dropped past that: no more are ever in use at once.
+    bufs: Vec<Vec<Keyed>>,
+    /// The longest the tail has grown: what the next fill's tail is given room for.
+    tail_high: usize,
     /// A finished sort's histogram, for the next.
     counts: Option<Box<[[u32; 256]; 8]>>,
     /// Closed to writes for packing: every entry is to be sorted, the tail as soon as the sort in
     /// progress ends.
     closed: bool,
-    /// Key ranges a scan's walk merged from the runs, in key order and disjoint, each holding the
+    /// Segments of key ranges a scan's walk merged from the runs, disjoint, each holding the
     /// newest entry of every key in it: a seek into one walks it alone (adaptive merging; Graefe
-    /// and Kuno, EDBT 2010). A write into one drops it. Disjoint, they hold each key once at most.
+    /// and Kuno, EDBT 2010). A segment joins the next when no key lies between, so a range is a
+    /// chain of them. A write into one drops it. A slab: a dropped segment's node goes to the
+    /// next, and a clear keeps every node for the next fill.
     hot: Vec<Hot>,
+    /// The slab's free nodes, and the root of the treap ordering the rest by first key
+    /// (Seidel and Aragon, Algorithmica 1996): a segment found, added or dropped in expected
+    /// logarithmic steps, its links in its node, moving and allocating nothing.
+    hot_free: Vec<u32>,
+    hot_root: u32,
+    /// Every segment's entries, each a slice appended in turn, and how many of them live
+    /// segments hold. A dropped segment leaves a hole until the pool would pass twice the
+    /// memtable's entries; the live ones, at most one an entry since they are disjoint, are then
+    /// moved down in order, so each move frees at least half the pool and costs a constant an
+    /// entry recorded (the doubling argument; Tarjan, SIAM J. Algebraic Discrete Methods 1985).
+    /// A clear keeps the pool's buffer, so segments come and go without allocating once grown.
+    hot_pool: Vec<Keyed>,
+    hot_live: usize,
+    /// The live segments in the order their entries were appended, oldest first: the order the
+    /// pool is moved down in.
+    hot_oldest: u32,
+    hot_newest: u32,
 }
 
-/// A key range of a memtable merged by a scan's walk ([`HashMem::hot`]): the newest entry of
-/// each key from its first to its last, and whether the next range follows with no key between.
+/// No node of the merged ranges' treap ([`HashMem::hot_root`]).
+const NIL: u32 = u32::MAX;
+
+/// A segment of a key range a scan's walk merged ([`HashMem::hot`]): its entries in the pool,
+/// the newest of each key from its first to its last; whether the next segment follows with no
+/// key between; its links in the treap and in the pool's append order.
 #[derive(Debug)]
 struct Hot {
-    keys: Vec<Keyed>,
+    start: usize,
+    len: usize,
     joins_next: bool,
+    left: u32,
+    right: u32,
+    older: u32,
+    newer: u32,
+}
+
+impl Hot {
+    fn empty() -> Self {
+        Self {
+            start: 0,
+            len: 0,
+            joins_next: false,
+            left: NIL,
+            right: NIL,
+            older: NIL,
+            newer: NIL,
+        }
+    }
+}
+
+/// Segment `h`'s entries in `pool`.
+fn seg<'a>(pool: &'a [Keyed], h: &Hot) -> &'a [Keyed] {
+    pool.get(h.start..h.start.saturating_add(h.len))
+        .unwrap_or(&[])
+}
+
+/// Slab index of node `id`.
+fn ix(id: u32) -> usize {
+    usize::try_from(id).unwrap_or(usize::MAX)
+}
+
+/// Node `id`'s treap priority: a hash of its slab index, independent of the keys it orders.
+fn priority(id: u32) -> u64 {
+    hash(&id.to_le_bytes())
+}
+
+/// Segment `id`'s first key.
+fn hot_lo<'a>(arena: &'a [u8], pool: &[Keyed], hot: &[Hot], id: u32) -> &'a [u8] {
+    hot.get(ix(id))
+        .and_then(|h| seg(pool, h).first())
+        .map_or(&[], |k| key(arena, k.entry))
+}
+
+/// Splits treap `t` into the ranges whose first key is below `k` (or not above it, with
+/// `or_equal`) and the rest.
+fn split(
+    arena: &[u8],
+    pool: &[Keyed],
+    hot: &mut [Hot],
+    t: u32,
+    k: &[u8],
+    or_equal: bool,
+) -> (u32, u32) {
+    if t == NIL {
+        return (NIL, NIL);
+    }
+    let lo = hot_lo(arena, pool, hot, t);
+    let goes_left = lo < k || (or_equal && lo == k);
+    let Some(node) = hot.get(ix(t)) else {
+        return (NIL, NIL);
+    };
+    if goes_left {
+        let (a, b) = split(arena, pool, hot, node.right, k, or_equal);
+        if let Some(node) = hot.get_mut(ix(t)) {
+            node.right = a;
+        }
+        (t, b)
+    } else {
+        let (a, b) = split(arena, pool, hot, node.left, k, or_equal);
+        if let Some(node) = hot.get_mut(ix(t)) {
+            node.left = b;
+        }
+        (a, t)
+    }
+}
+
+/// Joins treaps `a` and `b`, every first key of `a` below every one of `b`.
+fn join(hot: &mut [Hot], a: u32, b: u32) -> u32 {
+    if a == NIL {
+        return b;
+    }
+    if b == NIL {
+        return a;
+    }
+    if priority(a) > priority(b) {
+        let r = hot.get(ix(a)).map_or(NIL, |n| n.right);
+        let joined = join(hot, r, b);
+        if let Some(n) = hot.get_mut(ix(a)) {
+            n.right = joined;
+        }
+        a
+    } else {
+        let l = hot.get(ix(b)).map_or(NIL, |n| n.left);
+        let joined = join(hot, a, l);
+        if let Some(n) = hot.get_mut(ix(b)) {
+            n.left = joined;
+        }
+        b
+    }
 }
 
 impl HashMem {
@@ -318,16 +434,24 @@ impl HashMem {
             prepaid: 0,
             merges: Vec::new(),
             sort: None,
-            spare: Vec::new(),
+            bufs: Vec::new(),
+            tail_high: 0,
             counts: None,
             closed: false,
             hot: Vec::new(),
+            hot_free: Vec::new(),
+            hot_root: NIL,
+            hot_pool: Vec::new(),
+            hot_live: 0,
+            hot_oldest: NIL,
+            hot_newest: NIL,
         })
     }
 
-    /// Empties the memtable for its next fill, keeping its arena and the two largest of its
-    /// entry buffers: the tail's for the next fill's entries, the spare for its sort.
+    /// Empties the memtable for its next fill, keeping its arena and every entry buffer, the
+    /// tail given room for as long as it has grown.
     pub fn clear(&mut self) {
+        self.drop_hot();
         self.touched = self.touched.max(self.arena.len());
         self.arena.clear();
         self.index.clear();
@@ -338,30 +462,72 @@ impl HashMem {
         self.tail_stale = 0;
         self.prepaid = 0;
         self.closed = false;
-        let (mut first, mut second) = (
-            std::mem::take(&mut self.tail),
-            std::mem::take(&mut self.spare),
-        );
-        let freed = self
-            .runs
-            .drain(..)
-            .map(|r| r.keys)
-            .chain(
-                self.merges
-                    .drain(..)
-                    .flat_map(|m| [m.a.keys, m.b.keys, m.out.keys]),
-            )
-            .chain(self.sort.take().into_iter().flat_map(|s| [s.src, s.dst]))
-            .chain(self.hot.drain(..).map(|h| h.keys));
-        for buf in freed {
-            keep_largest(buf, &mut first, &mut second);
+        self.tail_high = self.tail_high.max(self.tail.len());
+        let tail = std::mem::take(&mut self.tail);
+        self.give_buf(tail);
+        while let Some(r) = self.runs.pop() {
+            self.give_buf(r.keys);
         }
-        if first.capacity() < second.capacity() {
-            std::mem::swap(&mut first, &mut second);
+        while let Some(m) = self.merges.pop() {
+            self.give_buf(m.a.keys);
+            self.give_buf(m.b.keys);
+            self.give_buf(m.out.keys);
         }
-        first.clear();
-        self.tail = first;
-        self.spare = second;
+        if let Some(s) = self.sort.take() {
+            self.give_buf(s.src);
+            self.give_buf(s.dst);
+        }
+        self.tail = self.take_buf(self.tail_high);
+    }
+
+    /// An empty buffer for `need` entries: the free one of least capacity that holds them, else
+    /// the largest, grown.
+    fn take_buf(&mut self, need: usize) -> Vec<Keyed> {
+        let fits = self
+            .bufs
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.capacity() >= need)
+            .min_by_key(|(_, b)| b.capacity())
+            .map(|(i, _)| i);
+        let pick = fits.or_else(|| {
+            self.bufs
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, b)| b.capacity())
+                .map(|(i, _)| i)
+        });
+        let mut buf = match pick {
+            Some(i) if i < self.bufs.len() => self.bufs.swap_remove(i),
+            _ => Vec::new(),
+        };
+        buf.clear();
+        buf.reserve(need);
+        buf
+    }
+
+    /// Keeps `buf` for a later [`Self::take_buf`]: the smallest kept is dropped past
+    /// [`MAX_RUNS`] buffers.
+    fn give_buf(&mut self, mut buf: Vec<Keyed>) {
+        if buf.capacity() == 0 {
+            return;
+        }
+        buf.clear();
+        if self.bufs.len() >= MAX_RUNS {
+            let smallest = self
+                .bufs
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, b)| b.capacity())
+                .map(|(i, b)| (i, b.capacity()));
+            match smallest {
+                Some((i, cap)) if cap < buf.capacity() => {
+                    self.bufs.swap_remove(i);
+                }
+                _ => return,
+            }
+        }
+        self.bufs.push(buf);
     }
 
     /// Entries the memtable holds, each key once.
@@ -400,14 +566,14 @@ impl HashMem {
             .iter()
             .map(|r| r.keys.capacity())
             .fold(self.tail.capacity(), usize::saturating_add)
-            .saturating_add(self.spare.capacity())
+            .saturating_add(
+                self.bufs
+                    .iter()
+                    .fold(0usize, |sum, b| sum.saturating_add(b.capacity())),
+            )
             .saturating_add(sort)
             .saturating_add(merge)
-            .saturating_add(
-                self.hot
-                    .iter()
-                    .fold(0usize, |sum, h| sum.saturating_add(h.keys.capacity())),
-            )
+            .saturating_add(self.hot_pool.capacity())
             .saturating_mul(size_of::<Keyed>());
         page(self.touched.max(self.arena.len()))
             .saturating_add(self.index.bytes())
@@ -416,6 +582,7 @@ impl HashMem {
             .saturating_add(self.first.capacity())
             .saturating_add(self.clashes.capacity().saturating_mul(size_of::<u32>()))
             .saturating_add(self.hot.capacity().saturating_mul(size_of::<Hot>()))
+            .saturating_add(self.hot_free.capacity().saturating_mul(size_of::<u32>()))
     }
 
     /// Arena bytes left before the bound.
@@ -537,7 +704,7 @@ impl HashMem {
                 self.tail_stale = self.tail.len();
             }
         }
-        if !self.hot.is_empty() {
+        if self.hot_root != NIL {
             self.unmerge(key);
         }
         self.arena.push(match op {
@@ -615,14 +782,14 @@ impl HashMem {
         }
     }
 
-    /// Keeps the finished sort's run, and its scratch as the spare.
+    /// Keeps the finished sort's run, and its scratch for the next.
     fn end_sort(&mut self) {
         if let Some(mut s) = self.sort.take() {
             self.runs.push(Run {
                 skip: s.skip,
                 keys: std::mem::take(&mut s.src),
             });
-            self.recycle(s.dst);
+            self.give_buf(s.dst);
             self.counts = Some(s.counts);
             self.schedule();
             if self.closed {
@@ -631,13 +798,13 @@ impl HashMem {
         }
     }
 
-    /// Keeps finished merge `i`'s run, and the larger of its inputs as the spare.
+    /// Keeps finished merge `i`'s run, and its inputs' buffers for the next.
     fn end_merge(&mut self, i: usize) {
         if i < self.merges.len() {
             let mut m = self.merges.swap_remove(i);
             self.runs.push(std::mem::take(&mut m.out));
-            self.recycle(m.a.keys);
-            self.recycle(m.b.keys);
+            self.give_buf(m.a.keys);
+            self.give_buf(m.b.keys);
         }
     }
 
@@ -662,12 +829,7 @@ impl HashMem {
             let b = self.runs.remove(j);
             let a = self.runs.remove(i);
             let need = a.keys.len().saturating_add(b.keys.len());
-            let mut keys = if self.spare.capacity() >= need {
-                std::mem::take(&mut self.spare)
-            } else {
-                Vec::with_capacity(need)
-            };
-            keys.clear();
+            let keys = self.take_buf(need);
             let out = Run {
                 skip: a.skip.min(b.skip),
                 keys,
@@ -680,13 +842,6 @@ impl HashMem {
                 out,
                 level: l,
             });
-        }
-    }
-
-    /// Keeps `buf` as the spare when it is the larger.
-    fn recycle(&mut self, buf: Vec<Keyed>) {
-        if buf.capacity() > self.spare.capacity() {
-            self.spare = buf;
         }
     }
 
@@ -830,12 +985,7 @@ impl HashMem {
         let b = self.runs.remove(hi);
         let a = self.runs.remove(lo);
         let need = a.keys.len().saturating_add(b.keys.len());
-        let mut keys = if self.spare.capacity() >= need {
-            std::mem::take(&mut self.spare)
-        } else {
-            Vec::with_capacity(need)
-        };
-        keys.clear();
+        let keys = self.take_buf(need);
         let out = Run {
             skip: a.skip.min(b.skip),
             keys,
@@ -923,17 +1073,15 @@ impl HashMem {
         if self.sort.is_some() || self.tail.is_empty() {
             return;
         }
-        let src = std::mem::take(&mut self.tail);
+        let n = self.tail.len();
+        self.tail_high = self.tail_high.max(n);
+        // The tail's buffer becomes the sort's; the next tail gets room for as many again.
+        let next = self.take_buf(n);
+        let src = std::mem::replace(&mut self.tail, next);
         self.prepaid = 0;
-        let n = src.len();
-        // Scratch the scatter writes in full before reading: a recycled buffer's old entries need
-        // no clearing, only the part past them initializing.
-        let mut dst = std::mem::take(&mut self.spare);
-        if dst.len() >= n {
-            dst.truncate(n);
-        } else {
-            dst.resize(n, Keyed::default());
-        }
+        // The scatter's scratch, written in full before it is read.
+        let mut dst = self.take_buf(n);
+        dst.resize(n, Keyed::default());
         let counts = match self.counts.take() {
             Some(mut c) => {
                 for byte in c.iter_mut() {
@@ -1118,22 +1266,28 @@ impl HashMem {
         walk.run_seeks = 0;
         walk.run_steps = 0;
         walk.recording = self.sources().nth(1).is_some();
-        if walk.recording && !self.hot.is_empty() {
-            let p = self.hot.partition_point(|h| self.hot_lo(h) <= from);
-            if let Some(i) = p.checked_sub(1)
-                && let Some(h) = self.hot.get(i)
-            {
-                if self.hot_hi(h).is_some_and(|hi| from <= hi) {
-                    let at = h.keys.partition_point(|k| self.key(k.entry) < from);
-                    walk.hot = Some((i, at));
-                    return Ok(());
+        if walk.recording && self.hot_root != NIL {
+            match self.hot_floor(from) {
+                Some(i) => {
+                    let hi = self.hot_hi(i);
+                    if hi.is_some_and(|hi| from <= hi) {
+                        let at = self.hot.get(ix(i)).map_or(0, |h| {
+                            seg(&self.hot_pool, h).partition_point(|k| self.key(k.entry) < from)
+                        });
+                        walk.hot = Some((i, at));
+                        return Ok(());
+                    }
+                    let next = self.hot_next(i);
+                    if self.hot.get(ix(i)).is_some_and(|h| h.joins_next)
+                        && let Some(n) = next
+                    {
+                        walk.hot = Some((n, 0));
+                        return Ok(());
+                    }
+                    walk.watch = next;
                 }
-                if h.joins_next && p < self.hot.len() {
-                    walk.hot = Some((p, 0));
-                    return Ok(());
-                }
+                None => walk.watch = self.hot_first(),
             }
-            walk.watch = Some(p).filter(|&p| p < self.hot.len());
         }
         walk.at.clear();
         for (skip, run) in self.sources() {
@@ -1151,7 +1305,7 @@ impl HashMem {
 
     /// Moves `walk` onto the runs past `after`, the last key of merged range `i`: its record
     /// continues that range.
-    fn walk_runs_after(&self, walk: &mut Walk, i: usize, after: &[u8]) {
+    fn walk_runs_after(&self, walk: &mut Walk, i: u32, after: &[u8]) {
         walk.at.clear();
         for (skip, run) in self.sources() {
             let at = self.seek_run(run, skip, after);
@@ -1161,7 +1315,7 @@ impl HashMem {
         }
         self.heapify(walk);
         walk.hot = None;
-        walk.watch = Some(i.saturating_add(1)).filter(|&w| w < self.hot.len());
+        walk.watch = self.hot_next(i);
         walk.run_seeks = walk.run_seeks.saturating_add(1);
         walk.stretches.push(Stretch {
             start: walk.record.len(),
@@ -1170,48 +1324,208 @@ impl HashMem {
         });
     }
 
-    /// A merged range's first key.
-    fn hot_lo(&self, h: &Hot) -> &[u8] {
-        h.keys.first().map_or(&[], |k| self.key(k.entry))
+    /// Segment `i`'s last key.
+    fn hot_hi(&self, i: u32) -> Option<&[u8]> {
+        self.hot
+            .get(ix(i))
+            .and_then(|h| seg(&self.hot_pool, h).last())
+            .map(|k| self.key(k.entry))
     }
 
-    /// A merged range's last key.
-    fn hot_hi(&self, h: &Hot) -> Option<&[u8]> {
-        h.keys.last().map(|k| self.key(k.entry))
+    /// Segment `i`'s first key.
+    fn hot_first_key(&self, i: u32) -> &[u8] {
+        hot_lo(&self.arena, &self.hot_pool, &self.hot, i)
     }
 
-    /// A write of `key`: the merged range holding it no longer holds its newest entry and goes,
-    /// and the range before no longer joins the next with no key between.
+    /// The segment whose first key is the greatest not above `k`.
+    fn hot_floor(&self, k: &[u8]) -> Option<u32> {
+        let (mut t, mut best) = (self.hot_root, None);
+        while let Some(n) = self.hot.get(ix(t)) {
+            if self.hot_first_key(t) <= k {
+                best = Some(t);
+                t = n.right;
+            } else {
+                t = n.left;
+            }
+        }
+        best
+    }
+
+    /// The segment after segment `i`, by first key.
+    fn hot_next(&self, i: u32) -> Option<u32> {
+        let k = self.hot_first_key(i);
+        let (mut t, mut best) = (self.hot_root, None);
+        while let Some(n) = self.hot.get(ix(t)) {
+            if self.hot_first_key(t) > k {
+                best = Some(t);
+                t = n.left;
+            } else {
+                t = n.right;
+            }
+        }
+        best
+    }
+
+    /// The segment before segment `i`, by first key.
+    fn hot_prev(&self, i: u32) -> Option<u32> {
+        let k = self.hot_first_key(i);
+        let (mut t, mut best) = (self.hot_root, None);
+        while let Some(n) = self.hot.get(ix(t)) {
+            if self.hot_first_key(t) < k {
+                best = Some(t);
+                t = n.right;
+            } else {
+                t = n.left;
+            }
+        }
+        best
+    }
+
+    /// The first segment by first key.
+    fn hot_first(&self) -> Option<u32> {
+        let (mut t, mut best) = (self.hot_root, None);
+        while let Some(n) = self.hot.get(ix(t)) {
+            best = Some(t);
+            t = n.left;
+        }
+        best
+    }
+
+    /// A write of `key`: the segment holding it no longer holds its newest entry and goes, and
+    /// the segment before no longer joins the next with no key between.
     fn unmerge(&mut self, key: &[u8]) {
-        let p = self.hot.partition_point(|h| self.hot_lo(h) <= key);
-        let Some(i) = p.checked_sub(1) else {
+        let Some(i) = self.hot_floor(key) else {
             return;
         };
-        let inside = self
-            .hot
-            .get(i)
-            .and_then(|h| self.hot_hi(h))
-            .is_some_and(|hi| key <= hi);
-        if inside {
-            let h = self.hot.remove(i);
-            self.recycle(h.keys);
-            if let Some(before) = i.checked_sub(1).and_then(|b| self.hot.get_mut(b)) {
+        if self.hot_hi(i).is_some_and(|hi| key <= hi) {
+            if let Some(before) = self.hot_prev(i).and_then(|b| self.hot.get_mut(ix(b))) {
                 before.joins_next = false;
             }
-        } else if let Some(h) = self.hot.get_mut(i) {
+            self.hot_remove(i);
+        } else if let Some(h) = self.hot.get_mut(ix(i)) {
             h.joins_next = false;
         }
     }
 
-    /// Drops every merged range.
-    fn drop_hot(&mut self) {
-        while let Some(h) = self.hot.pop() {
-            self.recycle(h.keys);
+    /// Takes segment `i` out of the treap and the append order, its node to the free list.
+    fn hot_remove(&mut self, i: u32) {
+        let k = hot_lo(&self.arena, &self.hot_pool, &self.hot, i);
+        let (below, rest) = split(
+            &self.arena,
+            &self.hot_pool,
+            &mut self.hot,
+            self.hot_root,
+            k,
+            false,
+        );
+        let (_, above) = split(&self.arena, &self.hot_pool, &mut self.hot, rest, k, true);
+        self.hot_root = join(&mut self.hot, below, above);
+        let (older, newer, len) = self
+            .hot
+            .get(ix(i))
+            .map_or((NIL, NIL, 0), |h| (h.older, h.newer, h.len));
+        match self.hot.get_mut(ix(older)) {
+            Some(o) => o.newer = newer,
+            None => self.hot_oldest = newer,
         }
+        match self.hot.get_mut(ix(newer)) {
+            Some(n) => n.older = older,
+            None => self.hot_newest = older,
+        }
+        self.hot_live = self.hot_live.saturating_sub(len);
+        if let Some(h) = self.hot.get_mut(ix(i)) {
+            *h = Hot::empty();
+        }
+        self.hot_free.push(i);
+    }
+
+    /// Drops every segment, keeping the slab, the free list and the pool's buffers.
+    fn drop_hot(&mut self) {
+        if self.hot_root == NIL && self.hot_free.len() == self.hot.len() {
+            return;
+        }
+        self.hot_free.clear();
+        for (i, h) in self.hot.iter_mut().enumerate().rev() {
+            *h = Hot::empty();
+            self.hot_free.push(u32::try_from(i).unwrap_or(NIL));
+        }
+        self.hot_root = NIL;
+        self.hot_pool.clear();
+        self.hot_live = 0;
+        self.hot_oldest = NIL;
+        self.hot_newest = NIL;
+    }
+
+    /// Moves the live segments' entries down the pool in their append order, closing the holes
+    /// dropped segments left.
+    fn hot_compact(&mut self) {
+        let mut write = 0usize;
+        let mut t = self.hot_oldest;
+        while let Some(h) = self.hot.get_mut(ix(t)) {
+            if h.start != write {
+                let end = h.start.saturating_add(h.len);
+                self.hot_pool.copy_within(h.start..end, write);
+                h.start = write;
+            }
+            write = write.saturating_add(h.len);
+            t = h.newer;
+        }
+        self.hot_pool.truncate(write);
+    }
+
+    /// A new segment of `keys`, appended to the pool and ordered in the treap: `None`, adding
+    /// nothing, when the pool would pass twice the memtable's entries with every hole closed, or
+    /// the slab its index space.
+    fn hot_add(&mut self, keys: &[Keyed], joins_next: bool) -> Option<u32> {
+        let bound = self.len.saturating_mul(2);
+        if self.hot_pool.len().saturating_add(keys.len()) > bound {
+            self.hot_compact();
+            if self.hot_pool.len().saturating_add(keys.len()) > bound {
+                return None;
+            }
+        }
+        let id = match self.hot_free.pop() {
+            Some(id) => id,
+            None => {
+                let id = u32::try_from(self.hot.len()).ok().filter(|&id| id != NIL)?;
+                self.hot.push(Hot::empty());
+                id
+            }
+        };
+        let start = self.hot_pool.len();
+        self.hot_pool.extend_from_slice(keys);
+        self.hot_live = self.hot_live.saturating_add(keys.len());
+        let newest = self.hot_newest;
+        if let Some(h) = self.hot.get_mut(ix(id)) {
+            *h = Hot {
+                start,
+                len: keys.len(),
+                joins_next,
+                older: newest,
+                ..Hot::empty()
+            };
+        }
+        match self.hot.get_mut(ix(newest)) {
+            Some(n) => n.newer = id,
+            None => self.hot_oldest = id,
+        }
+        self.hot_newest = id;
+        let k = hot_lo(&self.arena, &self.hot_pool, &self.hot, id);
+        let (below, above) = split(
+            &self.arena,
+            &self.hot_pool,
+            &mut self.hot,
+            self.hot_root,
+            k,
+            false,
+        );
+        let left = join(&mut self.hot, below, id);
+        self.hot_root = join(&mut self.hot, left, above);
+        Some(id)
     }
 
     /// Keeps what `walk`, a walk of this memtable unchanged since its seek, merged from the runs
-    /// as merged ranges: a stretch continuing a range extends it, any other becomes a range.
+    /// as segments: a stretch continuing a segment joins it, any other starts a range.
     pub fn adopt(&mut self, walk: &mut Walk) {
         if !walk.recording {
             return;
@@ -1220,32 +1534,22 @@ impl HashMem {
             self.drop_hot();
             return;
         }
-        // Last first, so a range inserted moves no range a stretch before it continues.
         let mut end = walk.record.len();
         for s in walk.stretches.iter().rev() {
             let keys = walk.record.get(s.start..end).unwrap_or(&[]);
             end = s.start;
-            match s.after {
-                Some(i) => {
-                    if let Some(h) = self.hot.get_mut(i) {
-                        h.keys.extend_from_slice(keys);
-                        h.joins_next = s.joins;
-                    }
+            if keys.is_empty() {
+                // Nothing between the segment the walk left and the one it reached.
+                if let Some(h) = s.after.and_then(|i| self.hot.get_mut(ix(i))) {
+                    h.joins_next = s.joins;
                 }
-                None => {
-                    let Some(first) = keys.first() else {
-                        continue;
-                    };
-                    let lo = self.key(first.entry);
-                    let p = self.hot.partition_point(|h| self.hot_lo(h) < lo);
-                    self.hot.insert(
-                        p,
-                        Hot {
-                            keys: keys.to_vec(),
-                            joins_next: s.joins,
-                        },
-                    );
-                }
+                continue;
+            }
+            if self.hot_add(keys, s.joins).is_some()
+                && let Some(h) = s.after.and_then(|i| self.hot.get_mut(ix(i)))
+            {
+                // The walk left that segment for the key right after its last.
+                h.joins_next = true;
             }
         }
         walk.record.clear();
@@ -1363,22 +1667,23 @@ impl HashMem {
         let mut visited = 0usize;
         while visited < limit {
             if let Some((i, at)) = walk.hot {
-                let Some(h) = self.hot.get(i) else {
+                let Some(h) = self.hot.get(ix(i)) else {
                     return Err(corrupt());
                 };
-                if let Some(&e) = h.keys.get(at) {
+                if let Some(&e) = seg(&self.hot_pool, h).get(at) {
                     walk.hot = Some((i, at.saturating_add(1)));
                     let (key, op, v) = self.read(e.entry)?;
                     each(key, op, v, e.hash32)?;
                     visited = visited.saturating_add(1);
                     continue;
                 }
-                let next = i.saturating_add(1);
-                if h.joins_next && next < self.hot.len() {
+                if h.joins_next
+                    && let Some(next) = self.hot_next(i)
+                {
                     walk.hot = Some((next, 0));
                     continue;
                 }
-                let Some(last) = h.keys.last() else {
+                let Some(last) = seg(&self.hot_pool, h).last() else {
                     return Err(corrupt());
                 };
                 let after = self.key(last.entry);
@@ -1394,8 +1699,7 @@ impl HashMem {
             // The walk reached a merged range: it walks the range, and the stretch recorded ends
             // where the range starts.
             if let Some(w) = walk.watch
-                && let Some(h) = self.hot.get(w)
-                && self.key(e.entry) >= self.hot_lo(h)
+                && self.key(e.entry) >= self.hot_first_key(w)
             {
                 walk.hot = Some((w, 0));
                 walk.watch = None;
@@ -1686,9 +1990,9 @@ pub struct Walk {
     at: Vec<usize>,
     heap: Vec<usize>,
     /// In a merged range ([`HashMem::hot`]): which, and its next entry; else the runs' heap.
-    hot: Option<(usize, usize)>,
+    hot: Option<(u32, usize)>,
     /// The merged range the walk over the runs reaches next, to walk it instead.
-    watch: Option<usize>,
+    watch: Option<u32>,
     /// Whether the walk records what it merges from the runs, for [`HashMem::adopt`]: a seek's
     /// walk over more than one run.
     recording: bool,
@@ -1706,7 +2010,7 @@ pub struct Walk {
 #[derive(Clone, Copy, Debug)]
 struct Stretch {
     start: usize,
-    after: Option<usize>,
+    after: Option<u32>,
     joins: bool,
 }
 

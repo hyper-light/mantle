@@ -161,6 +161,9 @@ fn run(issuer: bool, idle: bool) {
     assert!(flush.flushes > 100, "{}", flush.flushes);
     // Most memtables packed on workers; one finds none free only when every worker is busy.
     assert!(flush.fed > 0, "{flush:?}");
+    // And memtables frozen whole, awaiting their branches while the next filled, read
+    // meanwhile by every check above.
+    assert!(flush.frozen_most >= 1, "{flush:?}");
     assert!(
         trunk.pivot_compactions > 0 && trunk.leaf_compactions > 0 && trunk.splits > 0,
         "{trunk:?}"

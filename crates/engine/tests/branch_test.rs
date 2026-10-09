@@ -12,7 +12,8 @@
 )]
 
 use hyper_block::buf::Alignment;
-use hyper_block::sim::SimFile;
+use hyper_block::sim::{Fault, SimFile};
+use mantle_engine::Error;
 use mantle_engine::branch::filter::Keys;
 use mantle_engine::branch::{Branch, Builder, Op};
 use mantle_engine::store::{Config, Store};
@@ -129,17 +130,58 @@ proptest! {
 #[test]
 fn keys_out_of_order_and_oversized_entries_are_refused() {
     let mut s = store(1);
-    let mut b = Builder::new(&mut s, Keys::Exactly(1)).unwrap();
+    let mut b = Builder::new(&mut s, Keys::Exactly(5)).unwrap();
     b.add(&mut s, b"b", Op::Put, b"1").unwrap();
-    assert!(b.add(&mut s, b"b", Op::Put, b"2").is_err());
-    assert!(b.add(&mut s, b"a", Op::Put, b"3").is_err());
-    assert!(b.add(&mut s, b"c", Op::Put, &vec![0u8; 5000]).is_err());
+    assert!(matches!(
+        b.add(&mut s, b"b", Op::Put, b"2"),
+        Err(Error::Corruption { .. })
+    ));
+    assert!(matches!(
+        b.add(&mut s, b"a", Op::Put, b"3"),
+        Err(Error::Corruption { .. })
+    ));
+    for op in [Op::Put, Op::Delete] {
+        assert!(matches!(
+            b.add(&mut s, b"c", op, &vec![0u8; 5000]),
+            Err(Error::LimitExceeded { .. })
+        ));
+    }
+    let too_long = vec![b'z'; s.page_capacity() + 1];
+    for op in [Op::Put, Op::Delete] {
+        assert!(matches!(
+            b.add(&mut s, &too_long, op, &[]),
+            Err(Error::LimitExceeded { .. })
+        ));
+    }
     assert!(
         Builder::new(&mut s, Keys::Exactly(1))
             .unwrap()
             .finish(&mut s)
             .is_err()
     );
+
+    // A refused entry leaves the builder usable; empty values and tombstones survive a
+    // page crossing and durable reopen with the larger accepted values.
+    let value = vec![0xff; s.page_capacity() / 2];
+    b.add(&mut s, b"c", Op::Put, &value).unwrap();
+    b.add(&mut s, b"d", Op::Put, &[]).unwrap();
+    b.add(&mut s, b"e", Op::Delete, &[]).unwrap();
+    b.add(&mut s, b"f", Op::Put, &value).unwrap();
+    let branch = b.finish(&mut s).unwrap();
+    let entries = BTreeMap::from([
+        (b"b".to_vec(), (Op::Put, b"1".to_vec())),
+        (b"c".to_vec(), (Op::Put, value.clone())),
+        (b"d".to_vec(), (Op::Put, Vec::new())),
+        (b"e".to_vec(), (Op::Delete, Vec::new())),
+        (b"f".to_vec(), (Op::Put, value)),
+    ]);
+    check(&mut s, &branch, &entries);
+    s.checkpoint(Some(branch.root), 1).unwrap();
+    let (file, finished) = s.into_file();
+    finished.unwrap();
+    let (mut s, recovered) = Store::open(file, CONFIG).unwrap();
+    assert_eq!(recovered.root, Some(branch.root));
+    check(&mut s, &branch, &entries);
 }
 
 #[test]
@@ -376,4 +418,77 @@ fn successive_branches_of_different_sizes_keep_only_their_own_hashes() {
         assert_eq!(got, want);
         check(&mut s, &branch, &entries);
     }
+}
+
+#[test]
+fn binary_entries_cross_index_levels_and_reopen_with_their_exact_values() {
+    let mut s = store(37);
+    let key = |n: u32| {
+        let mut key = vec![0, 255];
+        key.extend_from_slice(&n.to_be_bytes());
+        key.extend_from_slice(&[0, 255]);
+        key
+    };
+    let mut entries = BTreeMap::from([(Vec::new(), (Op::Put, Vec::new()))]);
+    // Half-page values require more leaves than one index page can name. Empty rows and
+    // binary tombstones between them exercise the same fixed header with different tails.
+    for n in 0u32..2048 {
+        let op = if n % 7 == 0 { Op::Delete } else { Op::Put };
+        let value = if n % 11 == 0 {
+            Vec::new()
+        } else if op == Op::Delete {
+            vec![0, 255]
+        } else {
+            let mut value = vec![(n % 256) as u8; s.page_capacity() / 2];
+            value[0] = 0;
+            value[1] = 255;
+            value
+        };
+        entries.insert(key(n), (op, value));
+    }
+    let branch = build(&mut s, &entries);
+    let mut descriptor = Vec::new();
+    branch.encode(&mut descriptor).unwrap();
+    s.checkpoint(Some(branch.root), 1).unwrap();
+    let (file, finished) = s.into_file();
+    finished.unwrap();
+    let (mut s, recovered) = Store::open(file, CONFIG).unwrap();
+    assert_eq!(recovered.root, Some(branch.root));
+    let (branch, used) = Branch::decode(&mut s, &descriptor).unwrap();
+    assert_eq!(used, descriptor.len());
+    check(&mut s, &branch, &entries);
+    let mut cursor = branch.seek(&mut s, b"").unwrap();
+    for (key, (op, value)) in &entries {
+        assert!(cursor.valid());
+        assert_eq!(cursor.key(), key);
+        assert_eq!(cursor.op(), *op);
+        assert_eq!(cursor.value(), value);
+        cursor.next(&branch, &mut s).unwrap();
+    }
+    assert!(!cursor.valid());
+    cursor.give_back(&mut s);
+
+    // The required medium read remains a typed failure after healthy reads reuse buffers.
+    let target = key(1024);
+    let page = u64::from(branch.leaf_of(&target).unwrap());
+    let address = branch.page_address(&s, page).unwrap();
+    let (file, finished) = s.into_file();
+    finished.unwrap();
+    file.inject(Fault::ReadError {
+        offset: address * CONFIG.page_size as u64,
+        len: CONFIG.page_size as u64,
+    })
+    .unwrap();
+    let (mut s, _) = Store::open(file, CONFIG).unwrap();
+    let mut value = Vec::new();
+    assert!(matches!(
+        branch.get(&mut s, &target, &mut value),
+        Err(Error::Io { .. })
+    ));
+    assert_eq!(branch.get(&mut s, b"", &mut value).unwrap(), Some(Op::Put));
+    assert!(value.is_empty());
+    assert!(matches!(
+        branch.get(&mut s, &target, &mut value),
+        Err(Error::Io { .. })
+    ));
 }

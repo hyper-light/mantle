@@ -214,11 +214,12 @@ impl Page {
             .checked_add(rest)
     }
 
-    fn push(&mut self, key: &[u8], rest: &[u8], under: u64, prefix: usize) {
+    fn push(&mut self, key: &[u8], head: &[u8], tail: &[u8], under: u64, prefix: usize) {
         self.prefix = prefix;
         self.keys.extend_from_slice(key);
         self.key_ends.push(self.keys.len());
-        self.rests.extend_from_slice(rest);
+        self.rests.extend_from_slice(head);
+        self.rests.extend_from_slice(tail);
         self.rest_ends.push(self.rests.len());
         self.total = self.total.saturating_add(under);
     }
@@ -299,8 +300,6 @@ pub struct Builder {
     extent: Option<(u64, u32)>,
     extents: Vec<u64>,
     last: Vec<u8>,
-    /// A leaf entry's bytes after its key, the buffer reused so an entry allocates nothing.
-    rest: Vec<u8>,
     /// Each level's written page's first key, for its entry in the level above: a buffer a
     /// level, since writing a page may write the level above's in turn.
     firsts: Vec<Vec<u8>>,
@@ -473,7 +472,6 @@ impl Builder {
             extent: None,
             extents: lists.extents,
             last: lists.last,
-            rest: lists.rest,
             firsts: lists.firsts,
             spare_pages,
             counts: lists.counts,
@@ -571,14 +569,10 @@ impl Builder {
                 limit: u64::try_from(self.capacity).unwrap_or(u64::MAX),
             });
         }
-        let mut rest = std::mem::take(&mut self.rest);
-        rest.clear();
-        rest.push(op.byte());
-        rest.extend_from_slice(&u16_of(value.len())?);
-        rest.extend_from_slice(value);
-        let inserted = self.insert(store, 0, key, &rest, 1);
-        self.rest = rest;
-        inserted?;
+        let [low, high] = u16_of(value.len())?;
+        let head = [op.byte(), low, high];
+        // Append the entry to its page directly, without staging the value in another buffer.
+        self.insert(store, 0, key, &head, value, 1)?;
         self.last.clear();
         self.last.extend_from_slice(key);
         self.count = self.count.saturating_add(1);
@@ -605,7 +599,8 @@ impl Builder {
         store: &mut Store<F>,
         level: usize,
         key: &[u8],
-        rest: &[u8],
+        head: &[u8],
+        tail: &[u8],
         under: u64,
     ) -> Result<(), Error> {
         let page = self.levels.get(level).ok_or(corrupt(Malformed::TooLarge))?;
@@ -614,8 +609,12 @@ impl Builder {
         } else {
             page.prefix.min(shared(page.key(0), key))
         };
+        let rest = head
+            .len()
+            .checked_add(tail.len())
+            .ok_or(corrupt(Malformed::TooLarge))?;
         let size = page
-            .size_with(prefix, key.len(), rest.len())
+            .size_with(prefix, key.len(), rest)
             .ok_or(corrupt(Malformed::TooLarge))?;
         if size > self.capacity && page.len() > 0 {
             self.write(store, level)?;
@@ -624,7 +623,7 @@ impl Builder {
         self.levels
             .get_mut(level)
             .ok_or(corrupt(Malformed::TooLarge))?
-            .push(key, rest, under, prefix);
+            .push(key, head, tail, under, prefix);
         Ok(())
     }
 
@@ -698,11 +697,11 @@ impl Builder {
                 .unwrap_or_else(|| Page::with_capacity(self.capacity));
             self.levels.push(page);
         }
-        let mut rest = [0u8; 16];
-        let (child, under) = rest.split_at_mut(8);
+        let mut head = [0u8; 16];
+        let (child, under) = head.split_at_mut(8);
         child.copy_from_slice(&address.to_le_bytes());
         under.copy_from_slice(&total.to_le_bytes());
-        let inserted = self.insert(store, above, &first, &rest, total);
+        let inserted = self.insert(store, above, &first, &head, &[], total);
         if let Some(f) = self.firsts.get_mut(level) {
             *f = first;
         }
@@ -1004,7 +1003,6 @@ impl Builder {
             pages,
             firsts: self.firsts,
             last: self.last,
-            rest: self.rest,
             prev_last: self.prev_last,
             payload: self.payload,
         });

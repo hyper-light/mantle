@@ -334,13 +334,12 @@ pub struct Lists {
     pub hashes: Vec<u32>,
     pub hash_scratch: Vec<u32>,
     /// The builder's levels (empty between builders) and its spare pages; each level's first-key
-    /// buffer; the last key, an entry's rest and the last leaf's last key; and the payload a page
+    /// buffer; the last key and the last leaf's last key; and the payload a page
     /// is encoded into.
     pub(crate) levels: Vec<crate::branch::Page>,
     pub(crate) pages: Vec<crate::branch::Page>,
     pub(crate) firsts: Vec<Vec<u8>>,
     pub(crate) last: Vec<u8>,
-    pub(crate) rest: Vec<u8>,
     pub(crate) prev_last: Vec<u8>,
     pub(crate) payload: Vec<u8>,
 }
@@ -357,7 +356,6 @@ impl Lists {
         }
         self.levels.clear();
         self.last.clear();
-        self.rest.clear();
         self.prev_last.clear();
         self.payload.clear();
     }

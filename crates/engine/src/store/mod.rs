@@ -96,6 +96,11 @@ pub struct IoStats {
     /// because the pool had none.
     pub buffers_taken: u64,
     pub buffers_fresh: u64,
+    /// Extent buffers lent now: runs being filled, out or queued, and spans. The pool keeps no
+    /// more than the most ever lent at once.
+    pub buffers_out: u64,
+    /// Runs whose answer the store has taken, landed or failed: `submitted` less these are out.
+    pub runs_answered: u64,
     /// Nanoseconds queueing written pages (sealing, caching and handing runs on, waits
     /// included), and reading pages ahead for scans (from the cache or the file), timed only
     /// when the store is ([`Store::set_timed`]).
@@ -698,6 +703,7 @@ impl<F: BlockFile> Store<F> {
                 .cache
                 .as_ref()
                 .map_or(0, cache::Cache::evict_steps_most),
+            buffers_out: u64::try_from(self.lent).unwrap_or(u64::MAX),
             ..self.io
         }
     }
@@ -1315,6 +1321,10 @@ impl<F: BlockFile> Store<F> {
             .submit(batch, false)
             .map_err(|e| io("submit a store page run", e));
         self.io.write_ns = self.io.write_ns.saturating_add(elapsed_ns(started));
+        if submitted.is_err() {
+            // A refused batch is dropped with the run's buffer in it: that loan ends here.
+            self.lent = self.lent.saturating_sub(1);
+        }
         let number = self.fence(submitted)?;
         if let Some(w) = self.writer.as_mut() {
             w.in_flight
@@ -1326,10 +1336,15 @@ impl<F: BlockFile> Store<F> {
         Ok(())
     }
 
-    /// Hands queued runs to the issuer while it has room; true if it handed any.
+    /// Hands queued runs to the issuer while it has room; true if it handed any. A store a
+    /// failed write fenced hands on none: it takes no more writes ([`Self::drain`] gives their
+    /// buffers back).
     fn pump(&mut self) -> Result<bool, Error> {
         let mut any = false;
         loop {
+            if self.fenced {
+                return Ok(any);
+            }
             let Some(w) = self.writer.as_mut() else {
                 return Ok(any);
             };
@@ -1447,6 +1462,12 @@ impl<F: BlockFile> Store<F> {
             let at = w.in_flight.iter().position(|&(n, ..)| n == number)?;
             w.in_flight.remove(at).map(|(.., past)| past)
         });
+        self.io.runs_answered = self.io.runs_answered.saturating_add(1);
+        if answer.is_err() {
+            // A write batch holds its run's one buffer ([`Self::issue`]), which the issuer drops
+            // with a failed batch: that loan ends here.
+            self.lent = self.lent.saturating_sub(1);
+        }
         let batch = self.fence(answer.map_err(|e| io("write a store page run", e)))?;
         if let Some(past) = past {
             self.end = self.end.max(past);
@@ -1517,17 +1538,38 @@ impl<F: BlockFile> Store<F> {
         Ok(())
     }
 
-    /// Waits for every run in flight: each has landed, or the store is fenced and the failure
-    /// returned.
+    /// Waits until nothing the store handed the device is out: every answer taken, each run
+    /// landed or failed, and the first failure returned. A run still queued once a write has
+    /// failed is never handed on, since a fenced store takes no more writes: its buffer goes back
+    /// to the pool. A maintenance worker's job ends here, and the shard may write the job's
+    /// extents again once it has the result, so nothing may still be in flight then.
     pub fn drain(&mut self) -> Result<(), Error> {
-        self.pump()?;
-        while self
-            .writer
-            .as_ref()
-            .is_some_and(|w| w.attached.out() > 0 || !w.queued.is_empty())
-        {
-            self.answer(true)?;
-            self.pump()?;
+        let mut first = None;
+        // Each pass takes one answer or ends: the runs out, and those queued before it, bound it.
+        loop {
+            if let Err(error) = self.pump() {
+                first.get_or_insert(error);
+            }
+            if self.fenced {
+                while let Some(run) = self.writer.as_mut().and_then(|w| w.queued.pop_front()) {
+                    self.give_buf(run.buf);
+                }
+            }
+            let out = self.writer.as_ref().map_or(0, |w| w.attached.out());
+            if out == 0 {
+                break;
+            }
+            if let Err(error) = self.answer(true) {
+                first.get_or_insert(error);
+                // An answer that cannot come, the issuer stopped, leaves its batch counted out;
+                // a stopped issuer joined its workers, so nothing of the store's is in flight.
+                if self.writer.as_ref().map_or(0, |w| w.attached.out()) == out {
+                    break;
+                }
+            }
+        }
+        if let Some(error) = first {
+            return Err(error);
         }
         if self.fenced {
             return Err(io(

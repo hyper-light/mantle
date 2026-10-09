@@ -12,6 +12,8 @@
 //! A job cannot be cancelled (the call is the OS's): dropping its receiver discards the result, and the
 //! job's share stays charged until it ends — its share's limit bounds that damage, stated. A job that
 //! panics ends the job, not its worker (an unwind boundary, CLAUDE.md §1), and its share is given back.
+//! A job's share is given back before its result is delivered or its sender dropped, so a task that sees
+//! the job end can submit again under the same share without a refusal.
 //!
 //! **One per process.** The pool's channels and shares are a process-wide static set once by [`start`];
 //! [`stop`] drains the queue and joins every thread, after which a second start is refused.
@@ -231,17 +233,20 @@ where
     })?;
     let wrapped: Job = Box::new(move || {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
-        match outcome {
-            // A dropped receiver discards the result.
-            Ok(value) => drop(sender.send(value)),
-            Err(_) => {
-                PANICKED.fetch_add(1, Ordering::Relaxed);
-            }
+        if outcome.is_err() {
+            PANICKED.fetch_add(1, Ordering::Relaxed);
         }
+        // The share is given back before the receiver can see anything: a task that awaited this job's
+        // result, or saw its sender gone, may submit at once and must find the slot free.
         if let Some(state) = POOL.get().and_then(|pool| pool.shares.get(index)) {
             state.held.fetch_sub(1, Ordering::AcqRel);
         }
         FINISHED.fetch_add(1, Ordering::Relaxed);
+        match outcome {
+            // A dropped receiver discards the result.
+            Ok(value) => drop(sender.send(value)),
+            Err(_) => drop(sender),
+        }
     });
     match pool.submit.try_send(Message::Job(wrapped)) {
         Ok(()) => {

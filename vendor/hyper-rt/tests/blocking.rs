@@ -15,11 +15,24 @@
     clippy::cognitive_complexity
 )]
 
-use std::sync::mpsc::sync_channel;
+use std::sync::mpsc::{SyncSender, sync_channel};
 
 use hyper_rt::blocking::{self, Config, Share};
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
 use hyper_rt::{RtError, dns};
+
+/// A job's result that, when dropped, submits a job under the share `order` and reports whether it was
+/// accepted.
+struct SubmitsOnDrop {
+    seen: SyncSender<bool>,
+}
+
+impl Drop for SubmitsOnDrop {
+    fn drop(&mut self) {
+        let accepted = blocking::run("order", || ()).is_ok();
+        self.seen.send(accepted).unwrap();
+    }
+}
 
 fn config() -> RuntimeConfig {
     RuntimeConfig {
@@ -51,6 +64,10 @@ fn the_pool_runs_refuses_survives_and_resolves() {
             },
             Share {
                 name: dns::SHARE,
+                limit: 1,
+            },
+            Share {
+                name: "order",
                 limit: 1,
             },
         ],
@@ -97,6 +114,23 @@ fn the_pool_runs_refuses_survives_and_resolves() {
         let panicked = blocking::run("work", || -> u8 { panic!("the job's own failure") }).unwrap();
         assert!(panicked.await.is_err(), "the receiver sees the sender gone");
         assert_eq!(blocking::run("work", || 1u8).unwrap().await.unwrap(), 1);
+
+        // The share is free before the result is: a result discarded because its receiver is gone is
+        // dropped on the worker, and its drop submits under the same full share. Were the slot given back
+        // after the result, the drop would be refused, every time.
+        let (release, hold) = sync_channel::<()>(1);
+        let (seen_tx, seen) = sync_channel::<bool>(1);
+        let job = blocking::run("order", move || {
+            hold.recv().unwrap();
+            SubmitsOnDrop { seen: seen_tx }
+        })
+        .unwrap();
+        drop(job);
+        release.send(()).unwrap();
+        assert!(
+            seen.recv().unwrap(),
+            "the result's drop found its share still held"
+        );
 
         // Resolution through the platform resolver, on the pool.
         let addrs = dns::resolve("localhost", 443, 8).await.unwrap();

@@ -42,6 +42,9 @@ enum Ask {
     Checkpoint(u64),
     Flush,
     Stats,
+    /// Answered once the range owes no maintenance, or has faulted (its fault the answer):
+    /// a client's wait on a fact, with nothing sent meanwhile to interrupt the range's work.
+    Settled,
     /// The range's last request: its writes landed, the engine dropped, the task ended.
     Stop,
 }
@@ -113,6 +116,7 @@ async fn serve<F: BlockFile>(
     let mut range = Range {
         fault: None,
         slice: Slice::new(slice_ns),
+        settling: Vec::new(),
     };
     loop {
         // Every request waiting, at most a batch: one wake serves them all.
@@ -155,6 +159,8 @@ async fn serve<F: BlockFile>(
             }
             continue;
         }
+        // Nothing owed, or a fault: whoever waits for that is answered before the task sleeps.
+        range.settle(&mut db);
         match requests.recv().await {
             Ok(request) => {
                 if range.answer(&mut db, request) {
@@ -183,6 +189,9 @@ struct Range {
     /// maintenance stops, so a failed range never acknowledges a write it may not keep.
     fault: Option<Error>,
     slice: Slice,
+    /// Settled requests waiting for the range to owe nothing: at most one a client, each
+    /// client having one request out at a time.
+    settling: Vec<Request>,
 }
 
 impl Range {
@@ -191,6 +200,11 @@ impl Range {
     /// client's next request costs no kernel wake (hyper-rt `ShardContext::note_activity`).
     fn answer<F: BlockFile>(&mut self, db: &mut ShardDb<F>, mut request: Request) -> bool {
         hyper_rt::registry::with_current(|ctx| ctx.note_activity());
+        if matches!(request.ask, Ask::Settled) && self.fault.is_none() && db.idle_owed() {
+            // Answered once nothing is owed ([`Self::settle`]).
+            self.settling.push(request);
+            return false;
+        }
         let stop = matches!(request.ask, Ask::Stop);
         request.result = match &self.fault {
             Some(fault) => Err(fault.clone()),
@@ -202,6 +216,17 @@ impl Range {
             drop(reply.try_send(request));
         }
         stop
+    }
+
+    /// Answers every settled request waiting, the range owing nothing or faulted: its fault, or
+    /// done.
+    fn settle<F: BlockFile>(&mut self, db: &mut ShardDb<F>) {
+        if self.settling.is_empty() || (self.fault.is_none() && db.idle_owed()) {
+            return;
+        }
+        for request in std::mem::take(&mut self.settling) {
+            self.answer(db, request);
+        }
     }
 
     /// One slice of maintenance; a failure is kept as the range's fault. A slice that stopped
@@ -250,6 +275,7 @@ fn apply<F: BlockFile>(db: &mut ShardDb<F>, request: &mut Request) -> Result<(),
             request.stats = Some(db.stats());
             Ok(())
         }
+        Ask::Settled => Ok(()),
         Ask::Stop => db.land(),
     }
 }
@@ -905,6 +931,16 @@ impl Client<'_> {
     pub fn flush(&mut self) -> Result<(), Error> {
         for range in 0..self.ranges.len() {
             self.call(range, |r| r.ask = Ask::Flush)?;
+        }
+        Ok(())
+    }
+
+    /// Waits until every range owes no maintenance, range by range: a range that faulted
+    /// answers with its fault. Nothing is sent to a range while it is awaited, so its
+    /// maintenance runs uninterrupted.
+    pub fn settled(&mut self) -> Result<(), Error> {
+        for range in 0..self.ranges.len() {
+            self.call(range, |r| r.ask = Ask::Settled)?;
         }
         Ok(())
     }

@@ -271,6 +271,8 @@ fn ranges_must_ascend_from_the_empty_key() {
 enum ReadEvent {
     Entered,
     OnShard,
+    /// The first range owed nothing more (or faulted, `false`) as a watching client saw it.
+    Settled(bool),
 }
 
 #[derive(Default)]
@@ -399,36 +401,51 @@ fn a_held_maintenance_read_leaves_the_shard_available_for_range_requests() {
     *gate.shard.lock().unwrap() = Some(on_shard.recv().unwrap());
     // Open the device before Runtime/Issuer teardown if an oracle fails while it is held.
     let open = OpenOnDrop(Arc::clone(&gate));
-    let (report, events) = std::sync::mpsc::sync_channel(2);
+    let (report, events) = std::sync::mpsc::sync_channel(3);
+    let settled = report.clone();
     *gate.events.lock().unwrap() = Some(report);
     gate.held.store(true, Ordering::SeqCst);
     let ranges = Ranges::start(
         &runtime,
         vec![(Vec::new(), first), (b"m".to_vec(), second)],
-        ranges_config(1),
+        ranges_config(2),
     )
     .unwrap();
-    let mut client = ranges.client().unwrap();
-    // No request is sent while the cascade's first cold read is awaited: the range is idle, so
-    // it runs its owed maintenance until that read is admitted off its thread, the fact this
-    // waits on, or attempted on it, which fails at once.
-    assert_eq!(events.recv().unwrap(), ReadEvent::Entered);
-    assert!(gate.entered.load(Ordering::SeqCst) > 0);
-    client.stats().unwrap();
-    client
-        .put(b"z-unrelated", b"progress while read is held")
-        .unwrap();
-    let mut out = Vec::new();
-    assert!(client.get(b"z-unrelated", &mut out).unwrap());
-    assert_eq!(out, b"progress while read is held");
-    gate.held.store(false, Ordering::SeqCst);
-    client.flush().unwrap();
-    client.checkpoint(1).unwrap();
-    for (key, expected) in &oracle {
-        assert!(client.get(key, &mut out).unwrap());
-        assert_eq!(&out, expected);
-    }
-    drop(client);
+    std::thread::scope(|scope| {
+        // The terminal witness: a second client waits until the ranges owe nothing (or fault),
+        // sending nothing meanwhile. It answers only once the held read is released, so arriving
+        // before the read is admitted means maintenance ended without the cold read the test needs.
+        let mut watcher = ranges.client().unwrap();
+        let witness = scope.spawn(move || {
+            let done = watcher.settled().is_ok();
+            drop(settled.try_send(ReadEvent::Settled(done)));
+            done
+        });
+        let mut client = ranges.client().unwrap();
+        // No request is sent while the cascade's first cold read is awaited: the range is idle, so
+        // it runs its owed maintenance until that read is admitted off its thread, the fact this
+        // waits on; a read attempted on the shard's thread, or the range settling or faulting
+        // first, fails at once.
+        assert_eq!(events.recv().unwrap(), ReadEvent::Entered);
+        assert!(gate.entered.load(Ordering::SeqCst) > 0);
+        client.stats().unwrap();
+        client
+            .put(b"z-unrelated", b"progress while read is held")
+            .unwrap();
+        let mut out = Vec::new();
+        assert!(client.get(b"z-unrelated", &mut out).unwrap());
+        assert_eq!(out, b"progress while read is held");
+        gate.held.store(false, Ordering::SeqCst);
+        client.flush().unwrap();
+        client.checkpoint(1).unwrap();
+        for (key, expected) in &oracle {
+            assert!(client.get(key, &mut out).unwrap());
+            assert_eq!(&out, expected);
+        }
+        drop(client);
+        // Released, the range settles: the witness's wait ends, done.
+        assert!(witness.join().unwrap());
+    });
     ranges.stop().unwrap();
     runtime.shutdown().unwrap();
     drop(open);
@@ -445,6 +462,7 @@ fn a_held_maintenance_read_leaves_the_shard_available_for_range_requests() {
     let (mut recovered, applied) = ShardDb::open(file, STORE, MEM, TRUNK).unwrap();
     assert_eq!(applied, 1);
     recovered.check_references().unwrap();
+    let mut out = Vec::new();
     for (key, expected) in &oracle {
         assert!(recovered.get(key, &mut out).unwrap());
         assert_eq!(&out, expected);

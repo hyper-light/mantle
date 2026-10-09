@@ -76,22 +76,49 @@ struct Pivot {
 /// here both sides are measured on the running machine.
 #[derive(Clone, Copy, Debug, Default)]
 struct SeekRent {
-    /// Nanoseconds seeks spent opening this pivot's extra sources, not yet spent back.
+    /// Nanoseconds seeks spent opening this pivot's extra sources, not yet spent back, since
+    /// its sources last took the shape `shape` names: a change voids the rent, which priced a
+    /// consolidation of sources no longer there.
     ns: u64,
+    shape: (usize, u64),
     /// The rent covers the price: the next consolidation flushes or settles this pivot.
     paid: bool,
     /// A paid pivot lies below: a consolidation descends through this one to reach it.
     below: bool,
 }
 
-/// A pivot a seek's descent passed ([`Trunk::segment_at`]): where it is, the sources it gave the
-/// seek, and whether it is a leaf's.
+/// A pivot a seek's descent passed ([`Trunk::segment_at`]): where it is; the sources it gave the
+/// seek, where they start in the segment's list, and the newest one's root page, which with
+/// their number names the shape seeks paid rent for; and whether it is a leaf's.
 #[derive(Clone, Copy, Debug)]
 pub struct Passed {
     node: usize,
     pivot: usize,
+    first: usize,
     sources: usize,
+    newest: u64,
     leaf: bool,
+}
+
+impl Passed {
+    /// The pivot's sources' place in the segment's list: from, and how many.
+    pub fn sources(&self) -> (usize, usize) {
+        (self.first, self.sources)
+    }
+
+    /// Whether the pivot is a leaf's.
+    pub fn leaf(&self) -> bool {
+        self.leaf
+    }
+}
+
+/// What a consolidation's pages cost on this device, measured by the store: nanoseconds a page
+/// read and a page written, and the pages an extent holds.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PageCosts {
+    pub read_ns: u64,
+    pub write_ns: u64,
+    pub extent_pages: u64,
 }
 
 /// A source a scan of a leaf segment reads ([`Trunk::segment_at`]): a branch, or a pivot bundle
@@ -617,6 +644,20 @@ fn read_blob<F: BlockFile>(store: &mut Store<F>, extents: &[u64]) -> Result<Vec<
     Ok(framed.split_off(8))
 }
 
+/// The entries and pages `branches` hold, a page counted for every page of their extents.
+fn size_of_branches<'b>(
+    branches: impl Iterator<Item = &'b Branch>,
+    extent_pages: u64,
+) -> (u64, u64) {
+    branches.fold((0u64, 0u64), |(e, p), b| {
+        let extents = u64::try_from(b.extents.len()).unwrap_or(u64::MAX);
+        (
+            e.saturating_add(b.count),
+            p.saturating_add(extents.saturating_mul(extent_pages)),
+        )
+    })
+}
+
 fn release<F: BlockFile>(store: &mut Store<F>, b: &Branch) -> Result<(), Error> {
     for &e in &b.extents {
         store.release(e)?;
@@ -930,10 +971,17 @@ impl Trunk {
                 Some(v) => sources.push(Source::View(v, pivot.bundle.branches())),
                 None => sources.extend(pivot.bundle.branches().iter().map(Source::Branch)),
             }
+            let newest = match sources.get(before) {
+                Some(Source::Branch(b)) => b.root,
+                Some(Source::View(_, runs)) => runs.first().map_or(0, |b| b.root),
+                None => 0,
+            };
             path.push(Passed {
                 node: at,
                 pivot: p,
+                first: before,
                 sources: sources.len().saturating_sub(before),
+                newest,
                 leaf: pivot.child.is_none(),
             });
             match pivot.child {
@@ -953,12 +1001,14 @@ impl Trunk {
     }
 
     /// Charges the pivots seeks passed (`path`, from [`Self::segment_at`], each with the
-    /// nanoseconds a source of its segment took to open, measured) for the sources beyond one
-    /// consolidated leaf branch they made the seek open: all of an index pivot's, all but one of the leaf's. A pivot whose rent then
-    /// covers its consolidation, priced at the measured cost of a key's compaction, is paid.
-    /// Returns the keys of consolidation the rent charged pays for: what the seek then does
-    /// itself ([`Self::consolidate_step`]), as a put does its share of compaction.
-    pub fn charge(&mut self, path: &[(Passed, u64)]) -> u64 {
+    /// nanoseconds its extra sources took that seek to open, measured) as rent for those sources:
+    /// all an index pivot gave, all but one of a leaf's. A pivot whose rent since its sources
+    /// took their present shape covers its consolidation is paid. The price is what the
+    /// consolidation rewrites, the bundles above it on the descent included: its entries at the
+    /// measured cost of a compacted key, and its pages at `pages`' measured cost to read and
+    /// write one. Returns the keys of consolidation the rent charged pays for: what the seek then
+    /// does itself ([`Self::consolidate_step`]), as a put does its share of compaction.
+    pub fn charge(&mut self, path: &[(Passed, u64)], pages: PageCosts) -> u64 {
         let key_ns = match self.consolidation {
             Consolidation::Never => return 0,
             Consolidation::Always => 0,
@@ -967,19 +1017,33 @@ impl Trunk {
                 None => return 0,
             },
         };
+        let page_ns = if self.consolidation == Consolidation::Always {
+            0
+        } else {
+            pages.read_ns.saturating_add(pages.write_ns)
+        };
         let mut charged = 0u64;
-        for &(ref step, source_ns) in path {
-            let extra = if step.leaf {
-                step.sources.saturating_sub(1)
-            } else {
-                step.sources
-            };
-            if extra == 0 {
-                continue;
+        // The entries and pages of the bundles above, from the descent's root down: each
+        // segment's path starts again at the root.
+        let (mut above_entries, mut above_pages) = (0u64, 0u64);
+        for &(ref step, rent) in path {
+            if step.node == self.root {
+                (above_entries, above_pages) = (0, 0);
             }
-            let rent = source_ns.saturating_mul(u64::try_from(extra).unwrap_or(u64::MAX));
-            charged = charged.saturating_add(rent);
-            let price = self.consolidation_entries(step).saturating_mul(key_ns);
+            let (entries, pages_own) = self.consolidation_size(step, pages.extent_pages);
+            let price = above_entries
+                .saturating_add(entries)
+                .saturating_mul(key_ns)
+                .saturating_add(
+                    above_pages
+                        .saturating_add(pages_own)
+                        .saturating_mul(page_ns),
+                );
+            if !step.leaf {
+                let (e, p) = self.bundle_size(step, pages.extent_pages);
+                above_entries = above_entries.saturating_add(e);
+                above_pages = above_pages.saturating_add(p);
+            }
             let Some(pivot) = self
                 .nodes
                 .get_mut(step.node)
@@ -987,6 +1051,21 @@ impl Trunk {
             else {
                 continue;
             };
+            let shape = (step.sources, step.newest);
+            if pivot.seek.shape != shape {
+                // The sources changed since the rent was paid: it priced another consolidation.
+                if pivot.seek.paid {
+                    self.paid = self.paid.saturating_sub(1);
+                }
+                pivot.seek = SeekRent {
+                    shape,
+                    ..SeekRent::default()
+                };
+            }
+            if rent == 0 {
+                continue;
+            }
+            charged = charged.saturating_add(rent);
             pivot.seek.ns = pivot.seek.ns.saturating_add(rent);
             if !pivot.seek.paid && pivot.seek.ns >= price {
                 pivot.seek.paid = true;
@@ -996,37 +1075,50 @@ impl Trunk {
         charged.checked_div(key_ns).unwrap_or(charged)
     }
 
-    /// Whether the cascade in progress is a consolidation's.
-    pub fn consolidation_in_progress(&self) -> bool {
-        self.consolidating && !self.cascade.is_empty()
-    }
-
-    /// The entries consolidating the pivot `step` names rewrites: a leaf's whole bundle; an index
-    /// pivot's bundle and in-flight branches, and the leaf below's too when its child is one,
-    /// since the settle that follows rewrites it.
-    fn consolidation_entries(&self, step: &Passed) -> u64 {
-        let count = |bs: &[Branch]| bs.iter().map(|b| b.count).fold(0u64, u64::saturating_add);
+    /// The entries and pages a pivot's own bundle and live in-flight branches hold.
+    fn bundle_size(&self, step: &Passed, extent_pages: u64) -> (u64, u64) {
         let Some(node) = self.nodes.get(step.node) else {
-            return u64::MAX;
+            return (u64::MAX, u64::MAX);
         };
         let Some(pivot) = node.pivots.get(step.pivot) else {
-            return u64::MAX;
+            return (u64::MAX, u64::MAX);
         };
-        let inflight = node
-            .inflight
-            .get(pivot.start..)
-            .unwrap_or(&[])
-            .iter()
-            .map(|b| count(b))
-            .fold(0u64, u64::saturating_add);
-        let own = count(pivot.bundle.branches()).saturating_add(inflight);
-        let below = pivot
-            .child
+        let inflight = node.inflight.get(pivot.start..).unwrap_or(&[]);
+        size_of_branches(
+            pivot
+                .bundle
+                .branches()
+                .iter()
+                .chain(inflight.iter().flatten()),
+            extent_pages,
+        )
+    }
+
+    /// The entries and pages consolidating the pivot `step` names rewrites, the bundles above
+    /// it aside: a leaf's whole bundle; an index pivot's own branches, and the leaf below's too
+    /// when its child is one, since the settle that follows rewrites it.
+    fn consolidation_size(&self, step: &Passed, extent_pages: u64) -> (u64, u64) {
+        let (entries, pages) = self.bundle_size(step, extent_pages);
+        let below = self
+            .nodes
+            .get(step.node)
+            .and_then(|n| n.pivots.get(step.pivot))
+            .and_then(|p| p.child)
             .and_then(|c| self.nodes.get(c))
             .filter(|c| c.leaf)
             .and_then(|c| c.pivots.first())
-            .map_or(0, |p| count(p.bundle.branches()));
-        own.saturating_add(below)
+            .map_or((0, 0), |p| {
+                size_of_branches(p.bundle.branches().iter(), extent_pages)
+            });
+        (
+            entries.saturating_add(below.0),
+            pages.saturating_add(below.1),
+        )
+    }
+
+    /// Whether the cascade in progress is a consolidation's.
+    pub fn consolidation_in_progress(&self) -> bool {
+        self.consolidating && !self.cascade.is_empty()
     }
 
     /// When seeks consolidate a pivot ([`Consolidation`]).

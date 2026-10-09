@@ -1079,15 +1079,22 @@ impl<F: BlockFile> ShardDb<F> {
                     (true, _) => Some(seg_end.as_slice()),
                     (false, e) => e,
                 };
-                // Opening the segment's sources, timed: a source's measured cost, the rent each
-                // pivot pays for the sources it adds.
-                let t = std::time::Instant::now();
                 merge.open(store, &sources, seg_from, hi, end.is_some())?;
-                let open_ns = ns_since(Some(t));
-                let n = u64::try_from(sources.len()).unwrap_or(u64::MAX);
-                if let Some(per) = open_ns.checked_div(n) {
-                    charges.extend(passed.iter().map(|&p| (p, per)));
-                }
+                // Each pivot's rent: the measured time its sources took to open, all an index
+                // pivot gave, all but the dearest of a leaf's, which stands for the one branch a
+                // consolidated leaf keeps.
+                let open_ns = merge.open_ns();
+                charges.extend(passed.iter().map(|&p| {
+                    let (first, n) = p.sources();
+                    let own = open_ns.get(first..first.saturating_add(n)).unwrap_or(&[]);
+                    let sum = own.iter().fold(0u64, |a, &b| a.saturating_add(b));
+                    let rent = if p.leaf() {
+                        sum.saturating_sub(own.iter().copied().max().unwrap_or(0))
+                    } else {
+                        sum
+                    };
+                    (p, rent)
+                }));
                 if bounded {
                     std::mem::swap(seg_from, seg_end);
                 } else {
@@ -1154,7 +1161,13 @@ impl<F: BlockFile> ShardDb<F> {
         // What the walks merged from the runs stays merged for the next seek of that range.
         let mut owed_keys = 0u64;
         if !self.scan_charges.is_empty() {
-            owed_keys = self.trunk.charge(&self.scan_charges);
+            let io = self.store.io_stats();
+            let pages = crate::trunk::PageCosts {
+                read_ns: io.read_ns.checked_div(io.pages_read).unwrap_or(0),
+                write_ns: io.write_ns.checked_div(io.pages_written).unwrap_or(0),
+                extent_pages: u64::from(self.store.extent_pages()),
+            };
+            owed_keys = self.trunk.charge(&self.scan_charges, pages);
         }
         let (run_seeks, run_steps) = self.scan_active.walk.run_work();
         self.mem.adopt(&mut self.scan_active.walk);

@@ -75,6 +75,9 @@ pub struct ScanMerge<'a> {
     /// Sources passed over at open by their range filters, and sources opened.
     skipped: u64,
     opened: u64,
+    /// The nanoseconds each source of the last open took to open, in the sources' order, none
+    /// for one passed over: what a seek's extra sources cost it, measured.
+    open_ns: Vec<u64>,
 }
 
 impl<'a> ScanMerge<'a> {
@@ -102,7 +105,9 @@ impl<'a> ScanMerge<'a> {
         if let Some(e) = end {
             self.end.extend_from_slice(e);
         }
+        self.open_ns.clear();
         for s in sources {
+            let t = std::time::Instant::now();
             if filter && end.is_some() {
                 let scratch = &mut self.scratch;
                 let held = match *s {
@@ -113,6 +118,7 @@ impl<'a> ScanMerge<'a> {
                 };
                 if !held {
                     self.skipped = self.skipped.saturating_add(1);
+                    self.open_ns.push(0);
                     continue;
                 }
             }
@@ -125,6 +131,8 @@ impl<'a> ScanMerge<'a> {
                 }
             };
             self.heads.push(head);
+            self.open_ns
+                .push(u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX));
         }
         self.pick();
         Ok(())
@@ -144,7 +152,13 @@ impl<'a> ScanMerge<'a> {
             walks: self.walks,
             skipped: 0,
             opened: 0,
+            open_ns: self.open_ns,
         }
+    }
+
+    /// The nanoseconds each source of the last [`Self::open`] took, in the sources' order.
+    pub fn open_ns(&self) -> &[u64] {
+        &self.open_ns
     }
 
     /// Sources passed over by their range filters, and sources opened, since the merge was made.

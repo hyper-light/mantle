@@ -76,8 +76,8 @@ fn main() {
                 (frame.take().unwrap(), frame_at),
             ];
             let mut back = attached.write(writes, true).unwrap();
-            frame = back.pop();
-            data = back.pop();
+            frame = back.pop().map(|(b, _)| b);
+            data = back.pop().map(|(b, _)| b);
         }
         took[pattern].push(started.elapsed().as_nanos() as u64);
         at = (at + data_len as u64) % span;

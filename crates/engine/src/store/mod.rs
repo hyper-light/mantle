@@ -27,7 +27,7 @@ use crate::fst::trie::TrieBuilder;
 use alloc::Allocator;
 use hyper_block::block::BlockFile;
 use hyper_block::buf::AlignedBuf;
-use hyper_block::issuer::{Answer, Attached, Issuer};
+use hyper_block::issuer::{Answer, Attached, Issuer, Transfers};
 use page::{HEADER, Kind};
 use std::collections::VecDeque;
 use superblock::Superblock;
@@ -203,8 +203,12 @@ struct Writer {
     /// with the writes' and are kept here until their span takes them; and reads whose span was
     /// given back first, whose buffers go back to the pool when they land.
     reads: Vec<u64>,
-    parked: Vec<(u64, Result<Vec<AlignedBuf>, Error>)>,
+    parked: Vec<(u64, Result<Transfers, Error>)>,
     orphans: Vec<u64>,
+    /// Batches' vectors back from the issuer with their answers, emptied, for the next batch:
+    /// at most the batches attached for, since no more are ever out, so a warm submission
+    /// allocates nothing.
+    transfers: Vec<Transfers>,
     /// A compaction found no batch free for its read: the next one freed is kept for it, not
     /// handed to a queued run, so a write queue that never empties cannot starve its reads.
     /// Writes keep every other batch, so with two or more the reserve never stops them.
@@ -1139,9 +1143,11 @@ impl<F: BlockFile> Store<F> {
         let Some(w) = self.writer.as_mut() else {
             return Err(io("submit a store page run", "no issuer attached"));
         };
+        let mut batch = w.transfers.pop().unwrap_or_default();
+        batch.push((run.buf, run.offset));
         let submitted = w
             .attached
-            .submit(vec![(run.buf, run.offset)], false)
+            .submit(batch, false)
             .map_err(|e| io("submit a store page run", e));
         self.io.write_ns = self.io.write_ns.saturating_add(elapsed_ns(started));
         let number = self.fence(submitted)?;
@@ -1237,10 +1243,7 @@ impl<F: BlockFile> Store<F> {
 
     /// Routes one answer: a read's to its span (or its buffers to the pool when the span is
     /// gone), a write's run out of flight and the file's end past it.
-    fn route(
-        &mut self,
-        (number, answer): (u64, Result<Vec<AlignedBuf>, hyper_block::DiskError>),
-    ) -> Result<bool, Error> {
+    fn route(&mut self, (number, answer): (u64, Answer)) -> Result<bool, Error> {
         // A read's answer: kept for its span, or its buffers pooled when the span is gone. A
         // failed read fails only the read that asked for it.
         let read = self.writer.as_mut().and_then(|w| {
@@ -1259,8 +1262,8 @@ impl<F: BlockFile> Store<F> {
         }
         match read {
             Some(true) => {
-                for b in answer.unwrap_or_default() {
-                    self.give_buf(b);
+                if let Ok(batch) = answer {
+                    self.give_transfers(batch);
                 }
                 return Ok(true);
             }
@@ -1279,14 +1282,25 @@ impl<F: BlockFile> Store<F> {
             let at = w.in_flight.iter().position(|&(n, ..)| n == number)?;
             w.in_flight.remove(at).map(|(.., past)| past)
         });
-        let buffers = self.fence(answer.map_err(|e| io("write a store page run", e)))?;
+        let batch = self.fence(answer.map_err(|e| io("write a store page run", e)))?;
         if let Some(past) = past {
             self.end = self.end.max(past);
         }
-        for b in buffers {
+        self.give_transfers(batch);
+        Ok(true)
+    }
+
+    /// Gives a batch's buffers back to the pool and keeps its emptied vector for the next
+    /// batch, at most one a batch attached for.
+    fn give_transfers(&mut self, mut batch: Transfers) {
+        for (b, _) in batch.drain(..) {
             self.give_buf(b);
         }
-        Ok(true)
+        if let Some(w) = self.writer.as_mut()
+            && w.transfers.len() < w.transfers.capacity()
+        {
+            w.transfers.push(batch);
+        }
     }
 
     /// Takes every answer that has come, and hands queued runs on into the room they leave.
@@ -1391,6 +1405,7 @@ impl<F: BlockFile> Store<F> {
             reads: Vec::with_capacity(batches),
             parked: Vec::with_capacity(batches),
             orphans: Vec::new(),
+            transfers: Vec::with_capacity(batches),
             read_wanted: false,
         });
         Ok(())
@@ -1560,10 +1575,8 @@ impl<F: BlockFile> Store<F> {
         };
         match w.parked.iter().position(|&(n, _)| n == number) {
             Some(i) => {
-                if let (_, Ok(buffers)) = w.parked.swap_remove(i) {
-                    for b in buffers {
-                        self.give_buf(b);
-                    }
+                if let (_, Ok(batch)) = w.parked.swap_remove(i) {
+                    self.give_transfers(batch);
                 }
             }
             None => w.orphans.push(number),
@@ -1624,7 +1637,9 @@ impl<F: BlockFile> Store<F> {
         let Some(w) = self.writer.as_mut() else {
             return Ok(());
         };
-        let number = match w.attached.submit_reads(vec![(buf, offset)]) {
+        let mut batch = w.transfers.pop().unwrap_or_default();
+        batch.push((buf, offset));
+        let number = match w.attached.submit_reads(batch) {
             Ok(number) => number,
             Err(error) => {
                 // Refusal drops the one consumed buffer before any read number is recorded.
@@ -1739,7 +1754,7 @@ impl<F: BlockFile> Store<F> {
     }
 
     /// The buffers of read `number`, waiting for its answer if it has not come.
-    fn claim(&mut self, number: u64) -> Result<Vec<AlignedBuf>, Error> {
+    fn claim(&mut self, number: u64) -> Result<Transfers, Error> {
         loop {
             let Some(w) = self.writer.as_mut() else {
                 return Err(io("claim a store page span read", "no issuer attached"));
@@ -1827,11 +1842,15 @@ impl<F: BlockFile> Store<F> {
                 .pending
                 .pop_front()
                 .ok_or(corrupt(Malformed::Truncated))?;
-            let mut buf = self
-                .claim(number)?
-                .into_iter()
-                .next()
-                .ok_or(corrupt(Malformed::Truncated))?;
+            // A read batch holds the one span; its emptied vector goes back for the next.
+            let mut batch = self.claim(number)?;
+            let taken = batch.pop();
+            if let Some(w) = self.writer.as_mut()
+                && w.transfers.len() < w.transfers.capacity()
+            {
+                w.transfers.push(batch);
+            }
+            let (mut buf, _) = taken.ok_or(corrupt(Malformed::Truncated))?;
             buf.set_len(buf.capacity())
                 .map_err(|e| io("size a store page span read", e))?;
             let old = std::mem::replace(&mut span.buf, buf);

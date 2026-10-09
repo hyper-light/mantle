@@ -1309,7 +1309,7 @@ impl<F: BlockFile> Writer<F> {
         }
         writes.extend(frames);
         let written = self.io.write(writes, true).map_err(ChunkError::Device)?;
-        for buf in written {
+        for (buf, _) in written {
             self.pool.give(buf);
         }
         let took = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -1343,7 +1343,7 @@ impl<F: BlockFile> Writer<F> {
         let placed = self.place_frame(kind, records, group)?;
         let (at, lsn) = (placed.at, placed.lsn);
         let writes = self.frame_writes(placed)?;
-        for buf in self.io.write(writes, flush).map_err(ChunkError::Device)? {
+        for (buf, _) in self.io.write(writes, flush).map_err(ChunkError::Device)? {
             self.pool.give(buf);
         }
         Ok((at, lsn))

@@ -826,6 +826,7 @@ fn prewrite(
             .write(vec![(buf, at)], false)
             .map_err(ChunkError::Device)?
             .pop()
+            .map(|(b, _)| b)
             .ok_or(ChunkError::Internal(
                 "a pre-write's buffer did not come back",
             ))?;

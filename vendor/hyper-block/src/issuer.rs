@@ -31,6 +31,12 @@
 //! a write that failed fails its batch, and its flush is never issued, because the caller then
 //! fences and recovers rather than trust what reached the device (Rebello et al., ATC 2020). The
 //! answer comes once, after the flush.
+//!
+//! A batch's transfers travel in the vector its submitter handed over, and that vector comes back
+//! with the answer, each buffer and offset where it was given and its allocation intact. While the
+//! batch is out the issuer keeps its slots there, a buffer on a worker leaving an empty one
+//! ([`AlignedBuf::empty`], no allocation) in its place, so a batch costs the issuer no allocation
+//! of its own, and a submitter that keeps its vectors in a pool submits and is answered with none.
 
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
@@ -41,6 +47,7 @@ use std::thread::{Builder, JoinHandle};
 use hyper_rt::sync::{self, ChannelReceiver, Sender, SyncError};
 
 use crate::DiskError;
+pub use crate::aio::Transfers;
 use crate::block::BlockFile;
 use crate::buf::AlignedBuf;
 use crate::threads::{self, Reservation};
@@ -73,9 +80,10 @@ pub struct Issuer {
     budget: Option<Reservation>,
 }
 
-/// What a batch's submitter is answered: the batch's buffers, in the order given, once every
-/// write and the flush asked for have completed.
-pub type Answer = Result<Vec<AlignedBuf>, DiskError>;
+/// What a batch's submitter is answered: the batch's own vector of transfers given back, each buffer
+/// and offset in the order given (a read's buffer filled), once every transfer and the flush asked
+/// for have completed; or the batch's first failure, the vector and its buffers then dropped.
+pub type Answer = Result<Transfers, DiskError>;
 
 /// An answer with the number of the batch it answers ([`Attached::submit`]).
 type Numbered = (u64, Answer);
@@ -101,7 +109,7 @@ enum Event {
         slot: usize,
         generation: u64,
         number: u64,
-        transfers: Vec<(AlignedBuf, u64)>,
+        transfers: Transfers,
         kind: Kind,
     },
     Done {
@@ -324,13 +332,9 @@ pub struct Attached {
 impl Attached {
     /// Issues every `(buffer, offset)` of `writes` at once, as deep as the device's workers go,
     /// and once all have completed, a flush when `flush` is set and every write succeeded.
-    /// Returns the buffers, in order, after the last of them; the first failure otherwise, once
-    /// none is in flight. Refused while batches submitted are out.
-    pub fn write(
-        &mut self,
-        writes: Vec<(AlignedBuf, u64)>,
-        flush: bool,
-    ) -> Result<Vec<AlignedBuf>, DiskError> {
+    /// Returns `writes` back, every buffer and offset in order, after the last of them; the first
+    /// failure otherwise, once none is in flight. Refused while batches submitted are out.
+    pub fn write(&mut self, writes: Transfers, flush: bool) -> Answer {
         if self.out > 0 {
             return Err(invalid(
                 &self.path,
@@ -338,7 +342,7 @@ impl Attached {
             ));
         }
         if writes.is_empty() && !flush {
-            return Ok(Vec::new());
+            return Ok(writes);
         }
         let number = self.submit(writes, flush)?;
         let (answered, answer) = self.answer()?;
@@ -357,11 +361,7 @@ impl Attached {
     /// without waiting: its answer is taken by [`Self::answer`] or [`Self::try_answer`]. Refused
     /// with the batches attached for already out, before anything is sent. Batches complete in
     /// any order, and a batch's flush covers only the writes completed when it is issued.
-    pub fn submit(
-        &mut self,
-        writes: Vec<(AlignedBuf, u64)>,
-        flush: bool,
-    ) -> Result<u64, DiskError> {
+    pub fn submit(&mut self, writes: Transfers, flush: bool) -> Result<u64, DiskError> {
         if self.out >= self.batches {
             return Err(invalid(
                 &self.path,
@@ -374,13 +374,13 @@ impl Attached {
     /// Hands a batch of reads to the issuer and returns its number without waiting, as
     /// [`Self::submit`] does a batch of writes: each `(buffer, offset)` is filled, the whole of the
     /// buffer's length, from its offset, as deep as the device's workers go. The answer
-    /// ([`Self::answer`], [`Self::try_answer`]) gives the buffers back filled, in the order given,
+    /// ([`Self::answer`], [`Self::try_answer`]) gives `reads` back, its buffers filled, in the order given,
     /// once every read has completed; or the first failure once none is in flight, a read that
     /// reaches the end of the file first among them (`BlockFile::read_exact_at`). Reads share the
     /// device's depth with writes and count among the batches the submitter attached for: refused
     /// with those already out, before anything is sent. A read's bytes are those of every write
     /// answered before it was submitted; a read of a range a write still out covers sees either.
-    pub fn submit_reads(&mut self, reads: Vec<(AlignedBuf, u64)>) -> Result<u64, DiskError> {
+    pub fn submit_reads(&mut self, reads: Transfers) -> Result<u64, DiskError> {
         if self.out >= self.batches {
             return Err(invalid(
                 &self.path,
@@ -391,7 +391,7 @@ impl Attached {
     }
 
     /// Sends a batch the submitter has room for, and counts it out.
-    fn send(&mut self, transfers: Vec<(AlignedBuf, u64)>, kind: Kind) -> Result<u64, DiskError> {
+    fn send(&mut self, transfers: Transfers, kind: Kind) -> Result<u64, DiskError> {
         let number = self.next;
         let gone = || stopped(&self.path, "the device's issuer has stopped");
         self.events
@@ -645,7 +645,9 @@ struct Batch {
     number: u64,
     /// Transfers issued or queued and not yet reported.
     outstanding: usize,
-    buffers: Vec<Option<AlignedBuf>>,
+    /// The submitter's vector: each transfer's offset, and its buffer once reported, an empty one
+    /// standing in while it is out.
+    transfers: Transfers,
     failed: Option<DiskError>,
     /// A flush is still to be issued once the writes have completed.
     flush: bool,
@@ -841,7 +843,7 @@ impl<'a> Dispatch<'a> {
         slot: usize,
         generation: u64,
         number: u64,
-        transfers: Vec<(AlignedBuf, u64)>,
+        mut transfers: Transfers,
         kind: Kind,
     ) {
         let flush = kind == Kind::Write { flush: true };
@@ -862,17 +864,9 @@ impl<'a> Dispatch<'a> {
         }
         let count = transfers.len();
         if count == 0 && !flush {
-            let _ = client.answers.try_send((number, Ok(Vec::new())));
+            let _ = client.answers.try_send((number, Ok(transfers)));
             return;
         }
-        let outstanding = if count == 0 { 1 } else { count };
-        client.batches.push_back(Batch {
-            number,
-            outstanding,
-            buffers: std::iter::repeat_with(|| None).take(count).collect(),
-            failed: None,
-            flush: flush && count > 0,
-        });
         if count == 0 {
             self.pending.push_back(Transfer {
                 slot,
@@ -881,7 +875,11 @@ impl<'a> Dispatch<'a> {
                 op: Op::Flush,
             });
         }
-        for (index, (buf, at)) in transfers.into_iter().enumerate() {
+        // Each buffer goes to its transfer; its slot keeps the offset and an empty buffer until
+        // the transfer reports.
+        for (index, (kept, at)) in transfers.iter_mut().enumerate() {
+            let buf = std::mem::replace(kept, AlignedBuf::empty());
+            let at = *at;
             let op = match kind {
                 Kind::Write { .. } => Op::Write { index, buf, at },
                 Kind::Read => Op::Read { index, buf, at },
@@ -891,6 +889,16 @@ impl<'a> Dispatch<'a> {
                 generation,
                 number,
                 op,
+            });
+        }
+        let outstanding = if count == 0 { 1 } else { count };
+        if let Some(client) = self.client(slot, generation) {
+            client.batches.push_back(Batch {
+                number,
+                outstanding,
+                transfers,
+                failed: None,
+                flush: flush && count > 0,
             });
         }
     }
@@ -921,8 +929,9 @@ impl<'a> Dispatch<'a> {
         let Some(batch) = client.batches.get_mut(at) else {
             return;
         };
-        if let Some((index, buf)) = write
-            && let Some(kept) = batch.buffers.get_mut(index)
+        // A buffer lost to a worker's unwind leaves its slot empty; its batch has failed.
+        if let Some((index, Some(buf))) = write
+            && let Some((kept, _)) = batch.transfers.get_mut(index)
         {
             *kept = buf;
         }
@@ -947,7 +956,7 @@ impl<'a> Dispatch<'a> {
         if let Some(batch) = client.batches.remove(at) {
             let answer = match batch.failed {
                 Some(e) => Err(e),
-                None => Ok(batch.buffers.into_iter().flatten().collect()),
+                None => Ok(batch.transfers),
             };
             let _ = client.answers.try_send((number, answer));
         }
@@ -1494,7 +1503,7 @@ mod tests {
             probe.open();
             let back = batch.join().unwrap().unwrap();
             assert_eq!(back.len(), 12);
-            for (i, buf) in back.iter().enumerate() {
+            for (i, (buf, _)) in back.iter().enumerate() {
                 assert_eq!(buf.as_slice()[0], fill(i));
             }
         });
@@ -1581,11 +1590,11 @@ mod tests {
         assert_eq!((n0, n1), (0, 1));
         let (a0, a1) = (a0.unwrap(), a1.unwrap());
         assert_eq!(
-            a0.iter().map(|b| b.as_slice()[0]).collect::<Vec<_>>(),
+            a0.iter().map(|(b, _)| b.as_slice()[0]).collect::<Vec<_>>(),
             [fill(0), fill(1)]
         );
         assert_eq!(
-            a1.iter().map(|b| b.as_slice()[0]).collect::<Vec<_>>(),
+            a1.iter().map(|(b, _)| b.as_slice()[0]).collect::<Vec<_>>(),
             [fill(2), fill(3)]
         );
         assert_eq!(attached.out(), 0);
@@ -1622,7 +1631,7 @@ mod tests {
         assert_eq!(answered, number);
         let bufs = bufs.unwrap();
         assert_eq!(bufs.len(), 4);
-        for (i, buf) in bufs.iter().enumerate() {
+        for (i, (buf, _)) in bufs.iter().enumerate() {
             assert!(
                 buf.as_slice().iter().all(|&b| b == fill(i)),
                 "page {i} read back other bytes"
@@ -1651,7 +1660,7 @@ mod tests {
         let (answered, bufs) = attached.answer().unwrap();
         assert_eq!(answered, read, "the held writes were answered first");
         assert_eq!(probe.counts.in_flight.load(Ordering::SeqCst), 4);
-        for (i, buf) in bufs.unwrap().iter().enumerate() {
+        for (i, (buf, _)) in bufs.unwrap().iter().enumerate() {
             assert!(buf.as_slice().iter().all(|&b| b == fill(i)));
         }
         probe.open();

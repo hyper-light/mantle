@@ -536,6 +536,11 @@ impl<F: BlockFile> Store<F> {
         self.alloc.regrant(grant);
         self.end = end;
         self.durable.generation = generation;
+        // A failed write fences a store, since what it holds durable is then unknown. A
+        // worker's store holds nothing durable across jobs: a failed job's outputs are dropped
+        // by the shard, which keeps its own fence. Each job starts unfenced, so one failure
+        // does not fail every later job on the worker.
+        self.fenced = false;
     }
 
     /// How a worker gets more extents once its grant is spent.

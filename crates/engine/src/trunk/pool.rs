@@ -159,13 +159,15 @@ pub enum Owner {
     Pack,
 }
 
-/// A job back from worker `worker`: its result, and the extents granted it beyond its job's
-/// grant (its top-ups), which are the owner's to release if it failed.
+/// A job back from worker `worker`: its result; the extents granted it beyond its job's grant
+/// (its top-ups), which are the owner's to release if it failed; and the packing buffers the
+/// job gave back, the job's own, since the worker sends every one before its result.
 #[derive(Debug)]
 pub struct Back {
     pub worker: usize,
     pub result: Result<Output, Error>,
     pub topped: Vec<u64>,
+    pub buffers: Vec<Vec<u8>>,
 }
 
 /// What a worker tells the shard: its grant is spent and it waits for `n` more extents, or its
@@ -531,15 +533,6 @@ impl Pool {
         }
     }
 
-    /// Every packing buffer worker `worker` gave back and no one took.
-    pub fn reclaim(&mut self, worker: usize) -> Vec<Vec<u8>> {
-        self.workers
-            .get_mut(worker)
-            .and_then(Option::as_mut)
-            .map(|w| std::mem::take(&mut w.spent))
-            .unwrap_or_default()
-    }
-
     /// Takes one message from the workers, waiting for one when `wait`: an ask for extents is
     /// answered from `store`, a buffer kept for its worker's packing, a result kept for its
     /// owner. Whether one was taken.
@@ -594,6 +587,9 @@ impl Pool {
                     what: "a maintenance worker's result for no job",
                 })?;
                 let topped = std::mem::take(&mut w.topped);
+                // The job's buffers, all back before its result on this channel: taken with it
+                // now, before the worker can start another job whose buffers would mix in.
+                let buffers = std::mem::take(&mut w.spent);
                 if let Ok(out) = &result {
                     self.busy_ns = self.busy_ns.saturating_add(out.ns);
                 }
@@ -603,6 +599,7 @@ impl Pool {
                         worker,
                         result,
                         topped,
+                        buffers,
                     },
                 ));
             }

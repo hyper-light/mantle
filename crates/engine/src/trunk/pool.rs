@@ -230,13 +230,21 @@ pub fn serve<F: BlockFile>(file: F, config: Config, seat: Seat) {
     })));
     while let Ok(job) = jobs.recv() {
         let t = Instant::now();
+        let ran = run(&mut store, &job, &back, id);
+        // Whatever the job's end, every run it handed the device is answered before its result
+        // goes back: the shard releases a failed job's extents once it has the result, and the
+        // next job starts the allocator over, so none of this job's writes may land after. The
+        // job's own failure is the one reported.
+        let drained = store.drain();
         // A job's time less its waits for a packing's entries: the work it did, which the pool
         // sizes itself by, not the shard's pace.
-        let result = run(&mut store, &job, &back, id).map(|(parts, waited)| Output {
-            parts,
-            unused: store.unused_grant(),
-            end: store.end(),
-            ns: ns(Instant::now().saturating_duration_since(t)).saturating_sub(waited),
+        let result = ran.and_then(|(parts, waited)| {
+            drained.map(|()| Output {
+                parts,
+                unused: store.unused_grant(),
+                end: store.end(),
+                ns: ns(Instant::now().saturating_duration_since(t)).saturating_sub(waited),
+            })
         });
         // A packing's channels close before the result is sent, so every buffer still held is
         // back on the shard's side when it takes the result.
@@ -288,7 +296,6 @@ fn run<F: BlockFile>(
             vec![(Vec::new(), b.finish(store)?)]
         }
     };
-    store.drain()?;
     Ok((parts, waited))
 }
 

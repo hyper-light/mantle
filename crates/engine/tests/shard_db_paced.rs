@@ -22,7 +22,7 @@ use hyper_block::sim::SimFile;
 use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::Config;
-use mantle_engine::trunk::{TrunkConfig, ViewChoice};
+use mantle_engine::trunk::{Consolidation, TrunkConfig, ViewChoice};
 use std::collections::BTreeMap;
 
 const STORE: Config = Config {
@@ -189,7 +189,15 @@ fn runs_submitted_to_the_issuer_read_back_and_reopen_whole() {
         leaf_entries: 2_048,
         ..TRUNK
     };
-    let (mut db, oracle) = run_trunk(file, 0, Some(&issuer), false, 0, trunk);
+    let (mut db, oracle) = run_trunk(
+        file,
+        0,
+        Some(&issuer),
+        false,
+        0,
+        trunk,
+        Consolidation::Never,
+    );
     let (_, _, io) = db.stats();
     assert!(io.submitted > 0 && io.reads > 0, "{io:?}");
     assert!(io.prefetches > 0, "{io:?}");
@@ -367,6 +375,16 @@ fn idle_slices_between_operations_keep_every_read_exact_and_pay_every_debt() {
     run_on(file, 16, None, true);
 }
 
+#[test]
+fn leaves_seeks_consolidate_in_idle_time_keep_every_read_exact() {
+    // The idle workload with every seek that opens a source to spare paying for its pivot's
+    // consolidation: idle time flushes those pivots early and settles their leaves to one
+    // branch, between puts, gets and scans the oracle checks.
+    let align = Alignment::new(4096).unwrap();
+    let file = SimFile::new(align, Alignment::new(512).unwrap(), 17).unwrap();
+    run_trunk(file, 16, None, true, 0, TRUNK, Consolidation::Always);
+}
+
 fn run(cache: usize) {
     let align = Alignment::new(4096).unwrap();
     let file = SimFile::new(align, Alignment::new(512).unwrap(), 17).unwrap();
@@ -404,7 +422,15 @@ fn run_with<F: BlockFile + 'static>(
     idle: bool,
     records: usize,
 ) -> (ShardDb<F>, BTreeMap<u64, Option<Vec<u8>>>) {
-    run_trunk(file, cache, issuer, idle, records, TRUNK)
+    run_trunk(
+        file,
+        cache,
+        issuer,
+        idle,
+        records,
+        TRUNK,
+        Consolidation::Never,
+    )
 }
 
 /// [`run_with`] with the trunk shaped by `trunk`.
@@ -415,10 +441,14 @@ fn run_trunk<F: BlockFile + 'static>(
     idle: bool,
     records: usize,
     trunk: TrunkConfig,
+    consolidation: Consolidation,
 ) -> (ShardDb<F>, BTreeMap<u64, Option<Vec<u8>>>) {
     let mut db = ShardDb::create(file, STORE, MEM, trunk).unwrap();
     db.set_cache(cache);
     db.set_record_cache(records);
+    // Consolidation chosen, not measured, so the trunk's shape does not depend on timing.
+    db.set_consolidation(consolidation);
+    let views = consolidation == Consolidation::Never;
     // The idle variant asserts views are rebuilt: rebuilt whenever they can be, not as measured
     // costs choose, so the test does not depend on timing.
     if idle {
@@ -497,12 +527,17 @@ fn run_trunk<F: BlockFile + 'static>(
         // bundles through them exactly; so are their maplets, kept where they measured cheaper
         // than their filters, and the gets above read every key exactly either way.
         let (_, trunk, _) = db.stats();
-        assert!(trunk.views_built > 0, "{trunk:?}");
-        // Each bundle's maplet kept or declined by measured cost, never both nor neither.
-        assert!(
-            trunk.maplets_built + trunk.maplets_declined > 0,
-            "{trunk:?}"
-        );
+        if views {
+            assert!(trunk.views_built > 0, "{trunk:?}");
+            // Each bundle's maplet kept or declined by measured cost, never both nor neither.
+            assert!(
+                trunk.maplets_built + trunk.maplets_declined > 0,
+                "{trunk:?}"
+            );
+        } else {
+            // The seeks' consolidations ran, and left no pivot paid.
+            assert!(trunk.consolidations > 0, "{trunk:?}");
+        }
         for (a, b, limit) in [(0, KEYS - 1, 1), (3, KEYS / 2, 7), (KEYS / 3, KEYS - 1, 64)] {
             check_scan(&mut db, &oracle, a, b, limit);
         }
@@ -546,7 +581,9 @@ fn run_trunk<F: BlockFile + 'static>(
             assert!(steps < 1_000_000, "idle slices never paid the debts");
         }
         let (_, trunk, _) = db.stats();
-        assert!(trunk.views_rebuilt > 0, "{trunk:?}");
+        if views {
+            assert!(trunk.views_rebuilt > 0, "{trunk:?}");
+        }
         for k in 0..KEYS {
             check(&mut db, &oracle, k);
         }
@@ -590,6 +627,8 @@ fn views_rebuilt_over_several_added_runs_read_exactly() {
     };
     let mut db = ShardDb::create(file, STORE, MEM, trunk).unwrap();
     db.set_view_choice(ViewChoice::Rebuild);
+    // Its bundles kept for their views: seeks consolidate none (`Consolidation`).
+    db.set_consolidation(Consolidation::Never);
     let mut oracle: BTreeMap<u64, Option<Vec<u8>>> = BTreeMap::new();
     let mut x = 0x510e_527f_ade6_82d1u64;
     for i in 0..OPS {

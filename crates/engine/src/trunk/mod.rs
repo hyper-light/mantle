@@ -64,6 +64,34 @@ struct Pivot {
     bundle: Bundle,
     /// The first of the node's in-flight bundles live for this pivot.
     start: usize,
+    /// What seeks have paid for this pivot's sources being several ([`Trunk::charge`]).
+    seek: SeekRent,
+}
+
+/// The rent seeks pay a pivot for opening more sources under it than one consolidated leaf
+/// branch, and whether it covers the consolidation's price: then idle time flushes the pivot's
+/// bundle down and settles the leaf below to one branch (the ski-rental rule; Karlin, Manasse,
+/// Rudolph and Sleator, Algorithmica 1988). LevelDB compacts a file once seeks through it pass a
+/// fixed allowance (`allowed_seeks`, a seek priced at 16 KiB of compaction; db/version_set.cc);
+/// here both sides are measured on the running machine.
+#[derive(Clone, Copy, Debug, Default)]
+struct SeekRent {
+    /// Nanoseconds seeks spent opening this pivot's extra sources, not yet spent back.
+    ns: u64,
+    /// The rent covers the price: the next consolidation flushes or settles this pivot.
+    paid: bool,
+    /// A paid pivot lies below: a consolidation descends through this one to reach it.
+    below: bool,
+}
+
+/// A pivot a seek's descent passed ([`Trunk::segment_at`]): where it is, the sources it gave the
+/// seek, and whether it is a leaf's.
+#[derive(Clone, Copy, Debug)]
+pub struct Passed {
+    node: usize,
+    pivot: usize,
+    sources: usize,
+    leaf: bool,
 }
 
 /// A source a scan of a leaf segment reads ([`Trunk::segment_at`]): a branch, or a pivot bundle
@@ -214,6 +242,8 @@ pub struct TrunkStats {
     pub maplets_dropped: u64,
     /// Maplets measured slower than their bundles' filters, and not kept.
     pub maplets_declined: u64,
+    /// Leaves settled to one branch because seeks paid for it ([`Consolidation`]).
+    pub consolidations: u64,
 }
 
 /// Nanoseconds since `t`, none when timing is off (`Trunk::set_timed`).
@@ -263,6 +293,20 @@ pub struct Trunk {
     /// Gets' filter routes through bundles of several branches ([`Tally`]), and gets.
     routes: Tally,
     gets: u64,
+    /// Nanoseconds the cascades' steps took and the keys they merged: the measured price of a
+    /// key's compaction, a consolidation's price per entry it rewrites.
+    merge_ns: u64,
+    merge_keys: u64,
+    /// Pivots whose seeks' rent covers their consolidation ([`SeekRent::paid`]).
+    paid: usize,
+    /// Whether the run in progress may start a consolidation: idle time's alone
+    /// ([`Self::consolidate_step`]), never a put's share; and whether the cascade in progress is
+    /// one, the only kind that flushes paid pivots early.
+    consolidate: bool,
+    consolidating: bool,
+    consolidation: Consolidation,
+    /// The pivots above paid ones, found before a consolidation marks them; kept for the next.
+    marks: Vec<(usize, usize)>,
 }
 
 /// The filters' false positives a get meets now, against those Monkey's allocation of the same
@@ -345,6 +389,17 @@ pub enum ViewChoice {
     Measured,
     Build,
     Rebuild,
+}
+
+/// When seeks consolidate a pivot: once their measured rent covers its measured price (the
+/// default), never, or at the first seek with a source to spare, for a test that must know which
+/// ran whatever the timings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Consolidation {
+    #[default]
+    Measured,
+    Never,
+    Always,
 }
 
 /// What view builds and rebuilds have cost on this machine: nanoseconds and units of work, a
@@ -585,6 +640,7 @@ impl Trunk {
                     child: None,
                     bundle: Bundle::default(),
                     start: 0,
+                    seek: SeekRent::default(),
                 }],
                 inflight: Vec::new(),
                 end: None,
@@ -610,6 +666,13 @@ impl Trunk {
             maplet_at: 0,
             routes: Tally::default(),
             gets: 0,
+            merge_ns: 0,
+            merge_keys: 0,
+            paid: 0,
+            consolidate: false,
+            consolidating: false,
+            consolidation: Consolidation::Measured,
+            marks: Vec::new(),
         })
     }
 
@@ -834,9 +897,11 @@ impl Trunk {
         key: &[u8],
         sources: &mut Vec<Source<'a>>,
         end: &mut Vec<u8>,
+        path: &mut Vec<Passed>,
     ) -> Result<bool, Error> {
         sources.clear();
         end.clear();
+        path.clear();
         sources.extend(self.pending.iter().rev().map(Source::Branch));
         let mut bound: Option<&[u8]> = None;
         let mut at = self.root;
@@ -856,6 +921,7 @@ impl Trunk {
                     _ => e,
                 });
             }
+            let before = sources.len();
             for bundle in node.inflight.get(pivot.start..).unwrap_or(&[]).iter().rev() {
                 sources.extend(bundle.iter().map(Source::Branch));
             }
@@ -864,6 +930,12 @@ impl Trunk {
                 Some(v) => sources.push(Source::View(v, pivot.bundle.branches())),
                 None => sources.extend(pivot.bundle.branches().iter().map(Source::Branch)),
             }
+            path.push(Passed {
+                node: at,
+                pivot: p,
+                sources: sources.len().saturating_sub(before),
+                leaf: pivot.child.is_none(),
+            });
             match pivot.child {
                 Some(child) => at = child,
                 None => {
@@ -878,6 +950,157 @@ impl Trunk {
             }
         }
         Err(corrupt())
+    }
+
+    /// Charges the pivots seeks passed (`path`, from [`Self::segment_at`], each with the
+    /// nanoseconds a source of its segment took to open, measured) for the sources beyond one
+    /// consolidated leaf branch they made the seek open: all of an index pivot's, all but one of the leaf's. A pivot whose rent then
+    /// covers its consolidation, priced at the measured cost of a key's compaction, is paid.
+    pub fn charge(&mut self, path: &[(Passed, u64)]) {
+        let key_ns = match self.consolidation {
+            Consolidation::Never => return,
+            Consolidation::Always => 0,
+            Consolidation::Measured => match self.merge_ns.checked_div(self.merge_keys) {
+                Some(ns) => ns.max(1),
+                None => return,
+            },
+        };
+        for &(ref step, source_ns) in path {
+            let extra = if step.leaf {
+                step.sources.saturating_sub(1)
+            } else {
+                step.sources
+            };
+            if extra == 0 {
+                continue;
+            }
+            let rent = source_ns.saturating_mul(u64::try_from(extra).unwrap_or(u64::MAX));
+            let price = self.consolidation_entries(step).saturating_mul(key_ns);
+            let Some(pivot) = self
+                .nodes
+                .get_mut(step.node)
+                .and_then(|n| n.pivots.get_mut(step.pivot))
+            else {
+                continue;
+            };
+            pivot.seek.ns = pivot.seek.ns.saturating_add(rent);
+            if !pivot.seek.paid && pivot.seek.ns >= price {
+                pivot.seek.paid = true;
+                self.paid = self.paid.saturating_add(1);
+            }
+        }
+    }
+
+    /// The entries consolidating the pivot `step` names rewrites: a leaf's whole bundle; an index
+    /// pivot's bundle and in-flight branches, and the leaf below's too when its child is one,
+    /// since the settle that follows rewrites it.
+    fn consolidation_entries(&self, step: &Passed) -> u64 {
+        let count = |bs: &[Branch]| bs.iter().map(|b| b.count).fold(0u64, u64::saturating_add);
+        let Some(node) = self.nodes.get(step.node) else {
+            return u64::MAX;
+        };
+        let Some(pivot) = node.pivots.get(step.pivot) else {
+            return u64::MAX;
+        };
+        let inflight = node
+            .inflight
+            .get(pivot.start..)
+            .unwrap_or(&[])
+            .iter()
+            .map(|b| count(b))
+            .fold(0u64, u64::saturating_add);
+        let own = count(pivot.bundle.branches()).saturating_add(inflight);
+        let below = pivot
+            .child
+            .and_then(|c| self.nodes.get(c))
+            .filter(|c| c.leaf)
+            .and_then(|c| c.pivots.first())
+            .map_or(0, |p| count(p.bundle.branches()));
+        own.saturating_add(below)
+    }
+
+    /// When seeks consolidate a pivot ([`Consolidation`]).
+    pub fn set_consolidation(&mut self, choice: Consolidation) {
+        self.consolidation = choice;
+    }
+
+    /// Whether seeks have paid for a consolidation not yet run.
+    pub fn consolidation_owed(&self) -> bool {
+        self.paid > 0
+    }
+
+    /// Marks every pivot above a paid one, so a consolidation's descent from the root reaches
+    /// each: the marks are set again from the keys, since splits since the charge may have
+    /// replaced the pivots above.
+    fn mark_paid_paths(&mut self) -> Result<(), Error> {
+        let mut marks = std::mem::take(&mut self.marks);
+        marks.clear();
+        for node in &self.nodes {
+            for p in node.pivots.iter().filter(|p| p.seek.paid) {
+                // Down from the root by the paid pivot's key, to it: at most the height.
+                let mut at = self.root;
+                for _ in 0..self.nodes.len() {
+                    let n = self.node(at)?;
+                    let i = Self::pivot_of(n, &p.key);
+                    let q = n.pivots.get(i).ok_or(corrupt())?;
+                    if q.seek.paid && q.key == p.key {
+                        break;
+                    }
+                    marks.push((at, i));
+                    match q.child {
+                        Some(c) => at = c,
+                        None => break,
+                    }
+                }
+            }
+        }
+        for node in &mut self.nodes {
+            for p in &mut node.pivots {
+                p.seek.below = false;
+            }
+        }
+        for &(n, i) in &marks {
+            if let Some(p) = self.node_mut(n)?.pivots.get_mut(i) {
+                p.seek.below = true;
+            }
+        }
+        self.marks = marks;
+        Ok(())
+    }
+
+    /// [`Self::step`] for idle time: with nothing else to do, a consolidation seeks paid for
+    /// ([`Self::consolidation_owed`]) starts.
+    pub fn consolidate_step<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        budget: u64,
+        paced: bool,
+    ) -> Result<u64, Error> {
+        self.consolidate = true;
+        let used = if paced {
+            self.step_paced(store, budget)
+        } else {
+            self.step(store, budget)
+        };
+        self.consolidate = false;
+        used
+    }
+
+    /// Whether a cascade is in progress: owed even between compactions, when [`Self::debt`]
+    /// counts nothing.
+    pub fn cascading(&self) -> bool {
+        !self.cascade.is_empty()
+    }
+
+    /// Clears pivot `i` of node `n`'s rent once its consolidation is done or planned.
+    fn spend(&mut self, n: usize, i: usize) -> Result<(), Error> {
+        let pivot = self.node_mut(n)?.pivots.get_mut(i).ok_or(corrupt())?;
+        let was = pivot.seek.paid;
+        pivot.seek = SeekRent::default();
+        if was {
+            self.paid = self.paid.saturating_sub(1);
+        }
+        Ok(())
     }
 
     /// Takes a packed memtable into the trunk and runs every cascade it sets off to the end.
@@ -1356,10 +1579,23 @@ impl Trunk {
         // not reach (found at fill pace by `tests/shard_db_paced.rs`).
         while used < budget || self.returned.is_some() {
             let Some(frame) = self.cascade.pop() else {
+                if start && self.consolidate && self.pending.is_empty() && self.paid > 0 {
+                    // Seeks paid for consolidations: a cascade from the root with nothing new,
+                    // descending only through paid pivots and those above them.
+                    self.mark_paid_paths()?;
+                    self.consolidating = true;
+                    let root = self.root;
+                    self.cascade.push(Frame {
+                        n: root,
+                        phase: Phase::Pivots { i: 0, job: None },
+                    });
+                    continue;
+                }
                 if !start || self.pending.is_empty() {
                     break;
                 }
                 // A new cascade: the pending branches enter the root, oldest first.
+                self.consolidating = false;
                 let root = self.root;
                 for b in std::mem::take(&mut self.pending) {
                     self.node_mut(root)?.inflight.push(vec![b]);
@@ -1370,7 +1606,13 @@ impl Trunk {
                 });
                 continue;
             };
-            used = used.saturating_add(self.advance(store, frame, budget.saturating_sub(used))?);
+            let t = std::time::Instant::now();
+            let merged = self.advance(store, frame, budget.saturating_sub(used))?;
+            if merged > 0 {
+                self.merge_ns = self.merge_ns.saturating_add(ns_since(Some(t)));
+                self.merge_keys = self.merge_keys.saturating_add(merged);
+            }
+            used = used.saturating_add(merged);
             if self.io_waiting {
                 break;
             }
@@ -1378,6 +1620,9 @@ impl Trunk {
                 && let Some(parts) = self.returned.take()
             {
                 self.grow_root(parts);
+            }
+            if self.cascade.is_empty() {
+                self.consolidating = false;
             }
         }
         Ok(used)
@@ -1395,6 +1640,7 @@ impl Trunk {
                 child: Some(child),
                 bundle: Bundle::default(),
                 start: 0,
+                seek: SeekRent::default(),
             })
             .collect();
         self.nodes.push(Node {
@@ -1766,6 +2012,7 @@ impl Trunk {
                     child,
                     bundle,
                     start: 0,
+                    seek: SeekRent::default(),
                 });
             }
             nodes.push(Node {
@@ -1808,6 +2055,13 @@ impl Trunk {
             maplet_at: 0,
             routes: Tally::default(),
             gets: 0,
+            merge_ns: 0,
+            merge_keys: 0,
+            paid: 0,
+            consolidate: false,
+            consolidating: false,
+            consolidation: Consolidation::Measured,
+            marks: Vec::new(),
         })
     }
 
@@ -1899,8 +2153,26 @@ impl Trunk {
     ) -> Result<Option<Phase>, Error> {
         let node = self.node(n)?;
         let pivot = node.pivots.first().ok_or(corrupt())?;
-        let entries: u64 = pivot.bundle.branches().iter().map(|b| b.count).sum();
-        if pivot.bundle.branches().len() <= self.config.fanout
+        let entries = pivot
+            .bundle
+            .branches()
+            .iter()
+            .map(|b| b.count)
+            .fold(0u64, u64::saturating_add);
+        // A leaf seeks paid to consolidate settles to one branch, within the ordinary bounds,
+        // in a consolidation's cascade.
+        let was_paid = self.consolidating && pivot.seek.paid;
+        let paid = was_paid && pivot.bundle.branches().len() > 1;
+        if was_paid {
+            self.spend(n, 0)?;
+        }
+        if paid {
+            self.stats.consolidations = self.stats.consolidations.saturating_add(1);
+        }
+        let node = self.node(n)?;
+        let pivot = node.pivots.first().ok_or(corrupt())?;
+        if !paid
+            && pivot.bundle.branches().len() <= self.config.fanout
             && entries <= self.config.leaf_entries
         {
             self.returned = Some(vec![(pivot.key.clone(), n)]);
@@ -1978,6 +2250,7 @@ impl Trunk {
                         child: None,
                         bundle: Bundle::from(vec![branch]),
                         start: 0,
+                        seek: SeekRent::default(),
                     }],
                     inflight: Vec::new(),
                     end: None,
@@ -2004,10 +2277,14 @@ impl Trunk {
     fn flush_from(&mut self, n: usize, i: usize) -> Result<Option<Phase>, Error> {
         let fanout = self.config.fanout;
         let node = self.node(n)?;
+        // A bundle past the fanout, or one seeks paid to consolidate, or one above such: the
+        // last two flush early, by reference, so the leaf below settles to one branch.
+        let consolidating = self.consolidating;
         let next = (i..node.pivots.len()).find(|&j| {
-            node.pivots
-                .get(j)
-                .is_some_and(|p| p.bundle.branches().len() > fanout)
+            node.pivots.get(j).is_some_and(|p| {
+                p.bundle.branches().len() > fanout
+                    || (consolidating && (p.seek.paid || p.seek.below))
+            })
         });
         let Some(j) = next else {
             self.returned = Some(self.split_node(n)?);
@@ -2015,8 +2292,23 @@ impl Trunk {
         };
         let pivot = self.node_mut(n)?.pivots.get_mut(j).ok_or(corrupt())?;
         let child = pivot.child.ok_or(corrupt())?;
+        let paid = consolidating && pivot.seek.paid;
+        // Descending takes the bundle down whatever marked the pivot: the child's nodes replace
+        // this pivot once its frame ends ([`Self::take_child`]), so a bundle kept here would be
+        // named by none of them. A pivot above a paid one so has its bundle consolidated too.
         let bundle = pivot.bundle.take();
-        self.stats.flushes = self.stats.flushes.saturating_add(1);
+        self.spend(n, j)?;
+        if !bundle.is_empty() {
+            self.stats.flushes = self.stats.flushes.saturating_add(1);
+        }
+        // A leaf a paid flush lands in settles to one branch: what the seeks paid for.
+        if paid && self.node(child)?.leaf {
+            let leaf = self.node_mut(child)?.pivots.first_mut().ok_or(corrupt())?;
+            if !leaf.seek.paid {
+                leaf.seek.paid = true;
+                self.paid = self.paid.saturating_add(1);
+            }
+        }
         // Oldest first into the child's in-flight list: the bundle is newest first.
         for b in bundle.into_iter().rev() {
             self.node_mut(child)?.inflight.push(vec![b]);
@@ -2048,6 +2340,7 @@ impl Trunk {
                 child: Some(child),
                 bundle: Bundle::default(),
                 start: node.inflight.len(),
+                seek: SeekRent::default(),
             })
             .collect();
         if let Some(p) = replacement.first_mut() {

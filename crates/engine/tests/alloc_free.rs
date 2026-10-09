@@ -22,7 +22,7 @@ use mantle_engine::branch::{Branch, Builder, Op};
 use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::{Config, Store};
-use mantle_engine::trunk::{TrunkConfig, ViewChoice};
+use mantle_engine::trunk::{Consolidation, TrunkConfig, ViewChoice};
 
 #[global_allocator]
 static ALLOCATOR: alloc::Counting = alloc::Counting;
@@ -178,6 +178,8 @@ fn a_shard_scans_without_allocating_once_its_buffers_have_grown() {
     // Views built whenever they can be, not as measured costs choose: the test does not depend
     // on timing.
     db.set_view_choice(ViewChoice::Rebuild);
+    // Its bundles kept for their views: seeks consolidate none (`Consolidation`).
+    db.set_consolidation(Consolidation::Never);
     // Random keys over many memtables: the trunk has pivot bundles and in-flight branches, and
     // a memtable is packing, so a scan merges both memtables and several trunk sources.
     let mut x = 0x2545_f491_4f6c_dd1du64;

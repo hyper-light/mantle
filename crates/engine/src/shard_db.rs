@@ -232,6 +232,10 @@ pub struct ShardDb<F: BlockFile> {
     scan_active: MemCursor,
     scan_packing: MemCursor,
     scan_sources: Vec<Source<'static>>,
+    /// The pivots a scan's segments passed, each with its segment's measured cost to open a
+    /// source: charged to the trunk once the scan ends ([`Trunk::charge`]).
+    scan_passed: Vec<crate::trunk::Passed>,
+    scan_charges: Vec<(crate::trunk::Passed, u64)>,
     scan_merge: ScanMerge<'static>,
     /// Trunk sources scans passed over by their range filters, and sources they opened.
     scan_skipped: u64,
@@ -483,6 +487,8 @@ impl<F: BlockFile> ShardDb<F> {
             scan_active: MemCursor::empty(),
             scan_packing: MemCursor::empty(),
             scan_sources: Vec::new(),
+            scan_passed: Vec::new(),
+            scan_charges: Vec::new(),
             scan_merge: ScanMerge::new(),
             scan_skipped: 0,
             scan_opened: 0,
@@ -599,6 +605,11 @@ impl<F: BlockFile> ShardDb<F> {
         self.timed = on;
         self.trunk.set_timed(on);
         self.store.set_timed(on);
+    }
+
+    /// When seeks consolidate the trunk's pivots (`Trunk::set_consolidation`).
+    pub fn set_consolidation(&mut self, choice: crate::trunk::Consolidation) {
+        self.trunk.set_consolidation(choice);
     }
 
     /// How the trunk makes a bundle's view when it can rebuild it (`Trunk::set_view_choice`).
@@ -1041,6 +1052,9 @@ impl<F: BlockFile> ShardDb<F> {
         seg_from.clear();
         seg_from.extend_from_slice(from);
         let mut sources: Vec<Source<'_>> = reuse(std::mem::take(&mut self.scan_sources));
+        let passed = &mut self.scan_passed;
+        let charges = &mut self.scan_charges;
+        charges.clear();
         let mut trunk_done = false;
         let mut merge: ScanMerge<'_> = std::mem::take(&mut self.scan_merge).recycle(store);
         let before_end = |k: &[u8]| end.is_none_or(|e| k < e);
@@ -1051,7 +1065,7 @@ impl<F: BlockFile> ShardDb<F> {
                 if trunk_done || !before_end(seg_from) {
                     break;
                 }
-                let bounded = trunk.segment_at(seg_from, &mut sources, seg_end)?;
+                let bounded = trunk.segment_at(seg_from, &mut sources, seg_end, passed)?;
                 // Each segment ends past its start, so the walk moves a leaf a step and ends.
                 if bounded && seg_end.as_slice() <= seg_from.as_slice() {
                     merge.close(store);
@@ -1065,7 +1079,15 @@ impl<F: BlockFile> ShardDb<F> {
                     (true, _) => Some(seg_end.as_slice()),
                     (false, e) => e,
                 };
+                // Opening the segment's sources, timed: a source's measured cost, the rent each
+                // pivot pays for the sources it adds.
+                let t = std::time::Instant::now();
                 merge.open(store, &sources, seg_from, hi, end.is_some())?;
+                let open_ns = ns_since(Some(t));
+                let n = u64::try_from(sources.len()).unwrap_or(u64::MAX);
+                if let Some(per) = open_ns.checked_div(n) {
+                    charges.extend(passed.iter().map(|&p| (p, per)));
+                }
                 if bounded {
                     std::mem::swap(seg_from, seg_end);
                 } else {
@@ -1130,6 +1152,9 @@ impl<F: BlockFile> ShardDb<F> {
             self.scan_packing = c;
         }
         // What the walks merged from the runs stays merged for the next seek of that range.
+        if !self.scan_charges.is_empty() {
+            self.trunk.charge(&self.scan_charges);
+        }
         let (run_seeks, run_steps) = self.scan_active.walk.run_work();
         self.mem.adopt(&mut self.scan_active.walk);
         if let Some(p) = self.packing.as_mut() {
@@ -1316,6 +1341,8 @@ impl<F: BlockFile> ShardDb<F> {
     pub fn owed(&self) -> bool {
         self.packing.is_some()
             || self.trunk.debt() > 0
+            || self.trunk.cascading()
+            || self.trunk.consolidation_owed()
             || self.trunk.views_owed()
             || self.trunk.maplets_owed()
             || self.tidy_paid()
@@ -1334,17 +1361,26 @@ impl<F: BlockFile> ShardDb<F> {
             self.pack_some(w)?;
             return Ok(w);
         }
-        if self.trunk.debt() > 0 {
+        if self.trunk.debt() > 0 || self.trunk.cascading() {
             let t = self.timed.then(std::time::Instant::now);
             let used = self.trunk.step(&mut self.store, keys)?;
             self.note_trunk(ns_since(t));
-            return Ok(used);
+            return Ok(used.max(1));
         }
         if self.trunk.views_owed() {
             return self.trunk.view_step(&mut self.store, keys);
         }
         if self.trunk.maplets_owed() {
             return self.trunk.maplet_step(&mut self.store, keys);
+        }
+        if self.trunk.consolidation_owed() {
+            // Seeks paid for consolidating leaves: a cascade that flushes and settles them.
+            // After views and maplets, which make a bundle one source without rewriting it:
+            // seeks pay rent only for the sources left with those built.
+            let t = self.timed.then(std::time::Instant::now);
+            let used = self.trunk.consolidate_step(&mut self.store, keys, false)?;
+            self.note_trunk(ns_since(t));
+            return Ok(used.max(1));
         }
         if self.tidy_paid() {
             // The active memtable's runs merged to one, so a seek searches one, once the scans
@@ -1366,11 +1402,21 @@ impl<F: BlockFile> ShardDb<F> {
     /// second value says so. The task then waits for the device's answer
     /// ([`Self::wait_io`]) or its next request, whichever comes first.
     pub fn idle_step_paced(&mut self, keys: u64) -> Result<(u64, bool), Error> {
-        if self.packing.is_none() && self.trunk.debt() > 0 {
+        if self.packing.is_none() && (self.trunk.debt() > 0 || self.trunk.cascading()) {
             let t = self.timed.then(std::time::Instant::now);
             let used = self.trunk.step_paced(&mut self.store, keys)?;
             self.note_trunk(ns_since(t));
-            return Ok((used, self.trunk.waiting_io()));
+            return Ok((used.max(1), self.trunk.waiting_io()));
+        }
+        if self.packing.is_none()
+            && !self.trunk.views_owed()
+            && !self.trunk.maplets_owed()
+            && self.trunk.consolidation_owed()
+        {
+            let t = self.timed.then(std::time::Instant::now);
+            let used = self.trunk.consolidate_step(&mut self.store, keys, true)?;
+            self.note_trunk(ns_since(t));
+            return Ok((used.max(1), self.trunk.waiting_io()));
         }
         Ok((self.idle_step(keys)?, false))
     }
@@ -1498,6 +1544,26 @@ impl<F: BlockFile> ShardDb<F> {
                 .trunk
                 .maplet_step(&mut self.store, budget.saturating_sub(used))?;
             used = used.saturating_add(done.max(1));
+        }
+        // Then the consolidations seeks paid for, each step at least one unit while owed: a
+        // consolidation's cascade, and the views and maplets the bundles it changed then want.
+        while used < budget && (self.trunk.consolidation_owed() || self.trunk.cascading()) {
+            let done =
+                self.trunk
+                    .consolidate_step(&mut self.store, budget.saturating_sub(used), false)?;
+            used = used.saturating_add(done.max(1));
+            while used < budget && self.trunk.views_owed() {
+                let done = self
+                    .trunk
+                    .view_step(&mut self.store, budget.saturating_sub(used))?;
+                used = used.saturating_add(done.max(1));
+            }
+            while used < budget && self.trunk.maplets_owed() {
+                let done = self
+                    .trunk
+                    .maplet_step(&mut self.store, budget.saturating_sub(used))?;
+                used = used.saturating_add(done.max(1));
+            }
         }
         // Then the active memtable's runs merged to one, each step at least one unit while owed.
         while used < budget && self.mem.untidy() {

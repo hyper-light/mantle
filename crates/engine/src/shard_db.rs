@@ -1585,8 +1585,13 @@ impl<F: BlockFile> ShardDb<F> {
     /// Pays maintenance owed, for the shard's idle time: the packing memtable's whole, then up
     /// to `budget` work units of the trunk's (initial leaf moves, merged keys and filter pages),
     /// then REMIX views of its bundles and the cache's freed pages with the budget left.
-    /// Returns the work done, less than `budget` only once nothing is owed.
+    /// Returns the work done, less than `budget` only once nothing is owed. A drain, a budget
+    /// without bound, packs the active memtable into the trunk as well: the layout it settles is
+    /// the trunk alone, so a seek searches no memtable and merges none into the trunk's source.
     pub fn maintain(&mut self, budget: u64) -> Result<u64, Error> {
+        if budget == u64::MAX && !self.mem.is_empty() {
+            self.pack_active()?;
+        }
         self.finish_packing()?;
         // Timed, one clock read a drain: a compacted key's cost, which consolidations are
         // priced at (`Trunk::note_merge`).
@@ -1651,6 +1656,17 @@ impl<F: BlockFile> ShardDb<F> {
 
     /// Packs every memtable into the trunk and runs its maintenance to the end.
     pub fn flush(&mut self) -> Result<(), Error> {
+        self.pack_active()?;
+        let t = self.timed.then(std::time::Instant::now);
+        self.trunk.drain(&mut self.store)?;
+        self.note_trunk(ns_since(t));
+        self.trunk_carry = 0;
+        Ok(())
+    }
+
+    /// Packs the active memtable, if it holds entries, into a branch pending in the trunk,
+    /// after any memtable already packing.
+    fn pack_active(&mut self) -> Result<(), Error> {
         self.finish_packing()?;
         if !self.mem.is_empty() {
             let fresh = match self.spare.take() {
@@ -1672,10 +1688,6 @@ impl<F: BlockFile> ShardDb<F> {
             });
             self.finish_packing()?;
         }
-        let t = self.timed.then(std::time::Instant::now);
-        self.trunk.drain(&mut self.store)?;
-        self.note_trunk(ns_since(t));
-        self.trunk_carry = 0;
         Ok(())
     }
 

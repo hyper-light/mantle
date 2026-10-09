@@ -386,9 +386,14 @@ fn a_held_maintenance_read_leaves_the_shard_available_for_range_requests() {
     )
     .unwrap();
     let mut client = ranges.client().unwrap();
-    // Every response is evidence that the shard runs while preparation advances. The input
-    // count bounds the probes; an absent cold read fails instead of waiting forever for it.
-    for _ in 0..oracle.len() {
+    // Every response is evidence that the shard runs while preparation advances. Each probe
+    // gives the range at least one idle slice (the client waits for each answer, so none is
+    // queued behind it), and each slice does at least one unit of the owed cascade or stops at
+    // a read still in flight, which is what this waits for. That cascade moves each of its
+    // inputs through at most one compaction a pivot it passes, at most one an input: the inputs
+    // squared bound the probes by the work owed, not by how fast slices run, and an absent cold
+    // read fails rather than waiting forever for it.
+    for _ in 0..oracle.len().saturating_mul(oracle.len()) {
         client.stats().unwrap();
         if gate.entered.load(Ordering::SeqCst) > 0 {
             break;

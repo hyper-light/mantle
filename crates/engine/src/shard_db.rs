@@ -1893,14 +1893,16 @@ impl<F: BlockFile> ShardDb<F> {
 
     /// The frozen memtables a rotation may leave in flight: the packings whose lifetimes reach
     /// past it. A packing lasts `pack_ns` from its rotation to its branch and a memtable fills
-    /// in `fill_ns`, so `floor(pack_ns / fill_ns)` older packings are still out at a rotation
-    /// on average (Little's law, L = λW: λ a memtable each `fill_ns`, W `pack_ns`); with no
-    /// measure yet, none. At most the cores the workers may use, each packing a worker's.
+    /// in `fill_ns` (Little's law, L = λW: λ a memtable each `fill_ns`, W `pack_ns`). A packing
+    /// that lasts any part of a fill reaches the rotation that freezes it, so the overlap is
+    /// rounded up, `ceil(pack_ns / fill_ns)`: rounded down, a packing a little shorter than its
+    /// last measure counted none, and every rotation it outlasted fed it whole and waited for it.
+    /// With no measure yet, none. At most the cores the workers may use, each packing a worker's.
     fn frozen_most(&self) -> usize {
         if !self.trunk.has_pool() {
             return 0;
         }
-        let overlap = self.pack_ns.checked_div(self.fill_ns).unwrap_or(0);
+        let overlap = crate::util::div_ceil(self.pack_ns, self.fill_ns).unwrap_or(0);
         usize::try_from(overlap)
             .unwrap_or(usize::MAX)
             .min(Pool::cores())
@@ -2905,6 +2907,39 @@ mod frozen_tests {
         assert_eq!(applied, at);
         check(&mut db, &durable);
         db.check_references().unwrap();
+    }
+
+    /// The cap rounds the measured overlap up: a packing that lasts any part of a fill reaches the
+    /// rotation that freezes it, so one a little shorter than a fill may still be out there; with
+    /// no workers, or no fill measured, none ([`ShardDb::frozen_most`]).
+    #[test]
+    fn the_frozen_cap_rounds_the_measured_overlap_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let mut db = ShardDb::create(plain(&path, true), STORE, MEM, TRUNK).unwrap();
+        db.fill_ns = 1_000;
+        db.pack_ns = 999;
+        assert_eq!(db.frozen_most(), 0, "no workers, none");
+        let p = path.clone();
+        db.set_workers(move || Ok(plain(&p, false)));
+        for (pack_ns, most) in [
+            (0u64, 0usize),
+            (1, 1),
+            (999, 1),
+            (1_000, 1),
+            (1_001, 2),
+            (2_500, 3),
+        ] {
+            db.pack_ns = pack_ns;
+            assert_eq!(
+                db.frozen_most(),
+                most.min(Pool::cores()),
+                "a packing of {pack_ns} ns against a fill of 1000 ns"
+            );
+        }
+        db.fill_ns = 0;
+        db.pack_ns = 5_000;
+        assert_eq!(db.frozen_most(), 0, "no fill measured, none");
     }
 
     static HELD_C: AtomicBool = AtomicBool::new(false);

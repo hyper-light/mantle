@@ -162,16 +162,19 @@ impl View {
             selector_ends.push(r.n32()?);
         }
         let at = r.at;
-        let rising = |ends: &[usize], len: usize| {
+        // Ends rise strictly to their list's length. Every segment has a selector, so a
+        // selector's first end is past 0; the first anchor may be the empty key, the least of
+        // all, so its end may be 0 (only the first: keys are distinct, so anchors rise).
+        let rising = |ends: &[usize], len: usize, first_empty: bool| {
             ends.windows(2).all(|w| matches!(w, [a, b] if a < b))
                 && ends.last().is_none_or(|&e| e == len)
-                && ends.first().is_none_or(|&e| e > 0)
+                && ends.first().is_none_or(|&e| first_empty || e > 0)
         };
         let segments = anchor_ends.len();
         if selector_ends.len() != segments
             || offsets.len() != segments.saturating_mul(runs)
-            || !rising(&anchor_ends, anchors.len())
-            || !rising(&selector_ends, selectors.len())
+            || !rising(&anchor_ends, anchors.len(), true)
+            || !rising(&selector_ends, selectors.len(), false)
             || selectors.iter().any(|&s| usize::from(s & RUN) >= runs)
         {
             return Err(corrupt());

@@ -353,3 +353,25 @@ fn a_reopened_view_pages_from_present_and_absent_keys_with_deletions() {
         }
     }
 }
+
+#[test]
+fn a_view_whose_least_key_is_the_empty_key_decodes_as_it_was_encoded() {
+    // The empty key is the least of all, so a view's first anchor may be it: its encoding,
+    // a first anchor of no bytes, decodes to the view it was (found as a checkpoint whose
+    // view could not be read back, in tests/ranges_active_order.rs).
+    let mut s = store();
+    let mut a = Run::new();
+    a.insert(Vec::new(), (Op::Put, b"empty".to_vec()));
+    a.insert(b"a".to_vec(), (Op::Put, b"1".to_vec()));
+    let mut b = Run::new();
+    for n in 0u8..40 {
+        b.insert(vec![b'b', n], (Op::Put, vec![n]));
+    }
+    let branches = vec![build(&mut s, &a), build(&mut s, &b)];
+    let view = View::build(&mut s, &branches, b"", None).unwrap();
+    let mut bytes = Vec::new();
+    view.encode(&mut bytes).unwrap();
+    let (decoded, used) = View::decode(&bytes).unwrap();
+    assert_eq!(used, bytes.len());
+    assert_eq!(decoded, view);
+}

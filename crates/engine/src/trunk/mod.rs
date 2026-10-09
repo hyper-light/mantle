@@ -326,6 +326,11 @@ pub struct Trunk {
     merge_keys: u64,
     /// Pivots whose seeks' rent covers their consolidation ([`SeekRent::paid`]).
     paid: usize,
+    /// Whether a drain asked for every pivot of several sources to be consolidated
+    /// ([`Self::consolidate_all`]), and whether the layout is so consolidated: no branch has
+    /// entered the root since the last such consolidation finished.
+    full: bool,
+    consolidated: bool,
     /// Whether the run in progress may start a consolidation: idle time's alone
     /// ([`Self::consolidate_step`]), never a put's share; and whether the cascade in progress is
     /// one, the only kind that flushes paid pivots early.
@@ -710,6 +715,8 @@ impl Trunk {
             merge_ns: 0,
             merge_keys: 0,
             paid: 0,
+            full: false,
+            consolidated: false,
             consolidate: false,
             consolidating: false,
             consolidation: Consolidation::Measured,
@@ -1006,15 +1013,15 @@ impl Trunk {
     /// took their present shape covers its consolidation is paid. The price is what the
     /// consolidation rewrites, the bundles above it on the descent included: its entries at the
     /// measured cost of a compacted key, and its pages at `pages`' measured cost to read and
-    /// write one. Returns the keys of consolidation the rent charged pays for: what the seek then
-    /// does itself ([`Self::consolidate_step`]), as a put does its share of compaction.
-    pub fn charge(&mut self, path: &[(Passed, u64)], pages: PageCosts) -> u64 {
+    /// write one. Idle time then runs the consolidations paid for, in bulk
+    /// ([`Self::consolidate_step`]); a seek does none itself, so its latency carries none.
+    pub fn charge(&mut self, path: &[(Passed, u64)], pages: PageCosts) {
         let key_ns = match self.consolidation {
-            Consolidation::Never => return 0,
+            Consolidation::Never => return,
             Consolidation::Always => 0,
             Consolidation::Measured => match self.merge_ns.checked_div(self.merge_keys) {
                 Some(ns) => ns.max(1),
-                None => return 0,
+                None => return,
             },
         };
         let page_ns = if self.consolidation == Consolidation::Always {
@@ -1022,7 +1029,6 @@ impl Trunk {
         } else {
             pages.read_ns.saturating_add(pages.write_ns)
         };
-        let mut charged = 0u64;
         // The entries and pages of the bundles above, from the descent's root down: each
         // segment's path starts again at the root.
         let (mut above_entries, mut above_pages) = (0u64, 0u64);
@@ -1065,14 +1071,12 @@ impl Trunk {
             if rent == 0 {
                 continue;
             }
-            charged = charged.saturating_add(rent);
             pivot.seek.ns = pivot.seek.ns.saturating_add(rent);
             if !pivot.seek.paid && pivot.seek.ns >= price {
                 pivot.seek.paid = true;
                 self.paid = self.paid.saturating_add(1);
             }
         }
-        charged.checked_div(key_ns).unwrap_or(charged)
     }
 
     /// The entries and pages a pivot's own bundle and live in-flight branches hold.
@@ -1116,25 +1120,42 @@ impl Trunk {
         )
     }
 
-    /// Whether the cascade in progress is a consolidation's.
-    pub fn consolidation_in_progress(&self) -> bool {
-        self.consolidating && !self.cascade.is_empty()
-    }
-
     /// When seeks consolidate a pivot ([`Consolidation`]).
     pub fn set_consolidation(&mut self, choice: Consolidation) {
         self.consolidation = choice;
     }
 
-    /// Whether seeks have paid for a consolidation not yet run.
+    /// Whether a consolidation is owed: seeks paid for one, or a drain asked for one of a
+    /// layout not consolidated since branches last entered the root.
     pub fn consolidation_owed(&self) -> bool {
-        self.paid > 0
+        self.paid > 0 || (self.full && !self.consolidated)
+    }
+
+    /// A drain's request: the next consolidation rewrites every pivot of several sources, seeks'
+    /// rent or not, so the layout it leaves serves every seek from one source. Nothing is owed
+    /// when the layout is consolidated already, or consolidation is off.
+    pub fn consolidate_all(&mut self) {
+        self.full = self.consolidation != Consolidation::Never && !self.consolidated;
     }
 
     /// Marks every pivot above a paid one, so a consolidation's descent from the root reaches
     /// each: the marks are set again from the keys, since splits since the charge may have
     /// replaced the pivots above.
     fn mark_paid_paths(&mut self) -> Result<(), Error> {
+        if self.full {
+            // A drain's: every pivot whose sources are several, an index pivot holding
+            // branches, a leaf more than one.
+            for node in &mut self.nodes {
+                let leaf = node.leaf;
+                for p in &mut node.pivots {
+                    let n = p.bundle.branches().len();
+                    if !p.seek.paid && (if leaf { n > 1 } else { n > 0 }) {
+                        p.seek.paid = true;
+                        self.paid = self.paid.saturating_add(1);
+                    }
+                }
+            }
+        }
         let mut marks = std::mem::take(&mut self.marks);
         marks.clear();
         for node in &self.nodes {
@@ -1681,7 +1702,8 @@ impl Trunk {
         // not reach (found at fill pace by `tests/shard_db_paced.rs`).
         while used < budget || self.returned.is_some() {
             let Some(frame) = self.cascade.pop() else {
-                if start && self.consolidate && self.pending.is_empty() && self.paid > 0 {
+                if start && self.consolidate && self.pending.is_empty() && self.consolidation_owed()
+                {
                     // Seeks paid for consolidations: a cascade from the root with nothing new,
                     // descending only through paid pivots and those above them.
                     self.mark_paid_paths()?;
@@ -1696,8 +1718,10 @@ impl Trunk {
                 if !start || self.pending.is_empty() {
                     break;
                 }
-                // A new cascade: the pending branches enter the root, oldest first.
+                // A new cascade: the pending branches enter the root, oldest first, and the
+                // layout is no longer consolidated.
                 self.consolidating = false;
+                self.consolidated = false;
                 let root = self.root;
                 for b in std::mem::take(&mut self.pending) {
                     self.node_mut(root)?.inflight.push(vec![b]);
@@ -1723,8 +1747,14 @@ impl Trunk {
             {
                 self.grow_root(parts);
             }
-            if self.cascade.is_empty() {
+            if self.cascade.is_empty() && self.consolidating {
+                // Every marked pivot is rewritten; a drain's leaves the layout consolidated until
+                // branches enter the root again.
                 self.consolidating = false;
+                if self.full {
+                    self.full = false;
+                    self.consolidated = true;
+                }
             }
         }
         Ok(used)
@@ -2160,6 +2190,8 @@ impl Trunk {
             merge_ns: 0,
             merge_keys: 0,
             paid: 0,
+            full: false,
+            consolidated: false,
             consolidate: false,
             consolidating: false,
             consolidation: Consolidation::Measured,

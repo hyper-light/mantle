@@ -1159,7 +1159,6 @@ impl<F: BlockFile> ShardDb<F> {
             self.scan_packing = c;
         }
         // What the walks merged from the runs stays merged for the next seek of that range.
-        let mut owed_keys = 0u64;
         if !self.scan_charges.is_empty() {
             let io = self.store.io_stats();
             let pages = crate::trunk::PageCosts {
@@ -1167,7 +1166,7 @@ impl<F: BlockFile> ShardDb<F> {
                 write_ns: io.write_ns.checked_div(io.pages_written).unwrap_or(0),
                 extent_pages: u64::from(self.store.extent_pages()),
             };
-            owed_keys = self.trunk.charge(&self.scan_charges, pages);
+            self.trunk.charge(&self.scan_charges, pages);
         }
         let (run_seeks, run_steps) = self.scan_active.walk.run_work();
         self.mem.adopt(&mut self.scan_active.walk);
@@ -1177,20 +1176,6 @@ impl<F: BlockFile> ShardDb<F> {
         if many > one {
             let seek_ns = if seek_timed { Some(seek_ns) } else { None };
             self.charge_runs(seek_ns, many, one, run_seeks, run_steps, step_extra);
-        }
-        // The seek does the consolidation its rent paid for, as a put does its compaction
-        // share: no more work than the extra sources just cost it, so a shard read without
-        // pause still consolidates what its seeks pay for. Paced: a page still being read
-        // stops the slice rather than wait.
-        if owed_keys > 0
-            && self.packing.is_none()
-            && (self.trunk.consolidation_in_progress()
-                || (self.trunk.consolidation_owed()
-                    && self.trunk.debt() == 0
-                    && !self.trunk.cascading()))
-        {
-            self.trunk
-                .consolidate_step(&mut self.store, owed_keys, true)?;
         }
         Ok(more)
     }
@@ -1573,8 +1558,12 @@ impl<F: BlockFile> ShardDb<F> {
                 .maplet_step(&mut self.store, budget.saturating_sub(used))?;
             used = used.saturating_add(done.max(1));
         }
-        // Then the consolidations seeks paid for, each step at least one unit while owed: a
-        // consolidation's cascade, and the views and maplets the bundles it changed then want.
+        // Then a consolidation of every pivot of several sources, each step at least one unit
+        // while owed: a drain settles the layout so each seek opens one source, as bulk
+        // preparation measured 3.6x the seeks of the layout it replaces (Codex's
+        // mantle-bounded-consolidation-experiment-20261008). Then the views and maplets of the
+        // bundles it changed.
+        self.trunk.consolidate_all();
         while used < budget && (self.trunk.consolidation_owed() || self.trunk.cascading()) {
             let done =
                 self.trunk

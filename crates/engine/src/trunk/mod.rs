@@ -515,9 +515,10 @@ impl Job {
         store: &mut Store<F>,
         runs: &[Branch],
         budget: u64,
+        yield_io: bool,
     ) -> Result<(u64, bool), Error> {
         match self {
-            Job::Build(b) => b.step(store, runs, budget),
+            Job::Build(b) => b.step_yielding(store, runs, budget, yield_io),
             Job::Rebuild {
                 job, left, lo, hi, ..
             } => {
@@ -543,6 +544,11 @@ impl Job {
                 Ok((taken, false))
             }
         }
+    }
+
+    /// Whether the last step stopped for a page still being read.
+    fn waiting(&self) -> bool {
+        matches!(self, Job::Build(b) if b.waiting())
     }
 
     fn finish<F: BlockFile>(self, store: &mut Store<F>) -> View {
@@ -1406,6 +1412,20 @@ impl Trunk {
         self.pool.as_mut()
     }
 
+    /// [`Self::view_step`] for a step that may not wait for the device, as
+    /// [`Self::step_paced`]: a build stops at a page still being read
+    /// ([`Self::waiting_for_io`]), and a later step finds it read.
+    pub(crate) fn view_step_paced<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        budget: u64,
+    ) -> Result<u64, Error> {
+        self.yield_io = true;
+        let used = self.view_step(store, budget);
+        self.yield_io = false;
+        used
+    }
+
     /// Whether the trunk has maintenance workers.
     pub fn has_pool(&self) -> bool {
         self.pool.is_some()
@@ -1665,14 +1685,20 @@ impl Trunk {
         store: &mut Store<F>,
         budget: u64,
     ) -> Result<u64, Error> {
+        let yield_io = self.yield_io;
         if let Some(job) = self.view_job.take() {
             let done = {
                 let runs = self.bundle_of(job.node, job.pivot);
+                // A rebuild reads where its merge points fall, which a step that may not wait
+                // cannot ready ahead: one begun by a step that could wait is dropped, and a build
+                // that yields takes its place.
+                let resumable = !yield_io || matches!(job.build, Job::Build(_));
                 match runs {
-                    Some(runs) if job.build.reads(runs) => {
+                    Some(runs) if resumable && job.build.reads(runs) => {
                         let mut job = job;
                         let t = std::time::Instant::now();
-                        let (taken, done) = job.build.step(store, runs, budget)?;
+                        let (taken, done) = job.build.step(store, runs, budget, yield_io)?;
+                        self.io_waiting |= job.build.waiting();
                         job.ns = job.ns.saturating_add(
                             u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX),
                         );
@@ -1758,6 +1784,9 @@ impl Trunk {
                     ViewChoice::Rebuild => true,
                 };
                 let build = match (basis, added.checked_sub(1)) {
+                    // A step that may not wait builds, reading its runs in order, a page ready
+                    // ahead of each move.
+                    _ if yield_io => Job::Build(Build::prepared(runs, &lo, hi.as_deref())?),
                     (Some(old), Some(left))
                         if cheaper
                             && old.roots().len() == older.len()

@@ -1700,7 +1700,11 @@ impl<F: BlockFile> ShardDb<F> {
             return Ok(used.max(1));
         }
         if self.trunk.views_owed() {
-            return self.trunk.view_step(&mut self.store, keys);
+            return if paced {
+                self.trunk.view_step_paced(&mut self.store, keys)
+            } else {
+                self.trunk.view_step(&mut self.store, keys)
+            };
         }
         if self.trunk.maplets_owed() {
             return self.trunk.maplet_step(&mut self.store, keys);

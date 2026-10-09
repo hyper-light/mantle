@@ -1669,7 +1669,7 @@ impl Branch {
 }
 
 /// One bounded move while positioning a private compaction cursor.
-pub(super) enum Initial {
+pub(crate) enum Initial {
     Waiting,
     More,
     Done,
@@ -1763,7 +1763,7 @@ impl RunCursor {
     }
 
     /// A compaction cursor with its first logical leaf selected, without reading it.
-    pub(super) fn prepare<F: BlockFile>(
+    pub(crate) fn prepare<F: BlockFile>(
         branch: &Branch,
         store: &mut Store<F>,
         from: &[u8],
@@ -1776,7 +1776,7 @@ impl RunCursor {
 
     /// Positions one leaf of a private opening cursor. A gap after its final key can require
     /// another leaf, which is checked for readiness on the next move too.
-    pub(super) fn begin<F: BlockFile>(
+    pub(crate) fn begin<F: BlockFile>(
         &mut self,
         branch: &Branch,
         store: &mut Store<F>,

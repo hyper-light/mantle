@@ -11,7 +11,7 @@
 //! branches and the path's bundles are newer), so a key whose newest version is a deletion has
 //! nothing older to hide: the view passes over it.
 
-use crate::branch::{Branch, Op, RunCursor};
+use crate::branch::{Branch, Initial, Op, RunCursor};
 use crate::error::{Error, Malformed};
 use crate::rows::Rows;
 use crate::store::Store;
@@ -293,43 +293,54 @@ impl View {
 #[derive(Debug)]
 pub struct Build {
     roots: Vec<u64>,
+    lo: Vec<u8>,
     hi: Option<Vec<u8>>,
     width: usize,
     cursors: Vec<RunCursor>,
+    /// The runs whose cursors are positioned at `lo`: the build opens them one a step, as a
+    /// compaction does, so a step that may not wait for the device stops at an unlanded page.
+    opened: usize,
+    /// Whether the last step stopped for a page still being read.
+    waiting: bool,
     view: View,
     in_segment: usize,
     key: Vec<u8>,
 }
 
 impl Build {
-    /// A build of the view of `runs` (newest first, at most 63) over `[lo, hi)`.
+    /// A build of the view of `runs` (newest first, at most 63) over `[lo, hi)`, every run
+    /// positioned now.
     pub fn new<F: BlockFile>(
         store: &mut Store<F>,
         runs: &[Branch],
         lo: &[u8],
         hi: Option<&[u8]>,
     ) -> Result<Self, Error> {
+        let mut b = Self::prepared(runs, lo, hi)?;
+        if let Err(e) = b.open(store, runs, false) {
+            give_back(store, std::mem::take(&mut b.cursors));
+            return Err(e);
+        }
+        Ok(b)
+    }
+
+    /// [`Self::new`] reading nothing yet: its steps position the runs, one page a step, and a
+    /// step that may not wait stops at a page still being read ([`Self::step_yielding`]).
+    pub fn prepared(runs: &[Branch], lo: &[u8], hi: Option<&[u8]>) -> Result<Self, Error> {
         if runs.len() > usize::from(RUN) {
             return Err(Error::LimitExceeded {
                 what: "the runs of a REMIX view",
                 limit: u64::from(RUN),
             });
         }
-        let mut cursors = Vec::with_capacity(runs.len());
-        for b in runs {
-            match b.run_at(store, lo) {
-                Ok(c) => cursors.push(c),
-                Err(e) => {
-                    give_back(store, cursors);
-                    return Err(e);
-                }
-            }
-        }
         Ok(Self {
             roots: runs.iter().map(|b| b.root).collect(),
+            lo: lo.to_vec(),
             hi: hi.map(<[u8]>::to_vec),
             width: SEGMENT.max(runs.len()),
-            cursors,
+            cursors: Vec::new(),
+            opened: 0,
+            waiting: false,
             view: View {
                 runs: runs.len(),
                 roots: runs.iter().map(|b| b.root).collect(),
@@ -338,6 +349,35 @@ impl Build {
             in_segment: 0,
             key: Vec::new(),
         })
+    }
+
+    /// Positions the runs not yet open at `lo`, a leaf a move: true once every one is, false
+    /// when `yield_io` and the next page has not landed (its read handed to the device).
+    fn open<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        runs: &[Branch],
+        yield_io: bool,
+    ) -> Result<bool, Error> {
+        // Each move positions a run or passes one of its leaves: at most the runs' pages.
+        while self.opened < runs.len() {
+            let b = runs.get(self.opened).ok_or(corrupt())?;
+            if self.cursors.len() == self.opened {
+                self.cursors.push(RunCursor::prepare(b, store, &self.lo)?);
+            }
+            let c = self.cursors.get_mut(self.opened).ok_or(corrupt())?;
+            match c.begin(b, store, &self.lo, yield_io)? {
+                Initial::Waiting => return Ok(false),
+                Initial::More => {}
+                Initial::Done => self.opened = self.opened.saturating_add(1),
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whether the last step stopped for a page still being read.
+    pub fn waiting(&self) -> bool {
+        self.waiting
     }
 
     /// Whether `runs` are the runs this build reads: the same branches, in the same order.
@@ -354,10 +394,28 @@ impl Build {
         runs: &[Branch],
         budget: u64,
     ) -> Result<(u64, bool), Error> {
+        self.step_yielding(store, runs, budget, false)
+    }
+
+    /// [`Self::step`] that, when `yield_io`, stops rather than wait for a page the device has
+    /// not delivered: before a key is taken, every run holding it has its next page landed, so
+    /// a stop never leaves a key's versions half in the view ([`Self::waiting`]).
+    pub fn step_yielding<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        runs: &[Branch],
+        budget: u64,
+        yield_io: bool,
+    ) -> Result<(u64, bool), Error> {
         if !self.reads(runs) {
             return Err(Error::InvalidArgument {
                 what: "a view build stepped over runs it was not started on",
             });
+        }
+        self.waiting = false;
+        if !self.open(store, runs, yield_io)? {
+            self.waiting = true;
+            return Ok((0, false));
         }
         let hi = self.hi.as_deref();
         let in_range = |c: &RunCursor| c.valid() && hi.is_none_or(|h| c.key() < h);
@@ -385,6 +443,17 @@ impl Build {
                 .iter()
                 .filter(|c| in_range(c) && c.key() == key)
                 .count();
+            if yield_io {
+                for (r, c) in self.cursors.iter_mut().enumerate() {
+                    if in_range(c) && c.key() == key {
+                        let b = runs.get(r).ok_or(corrupt())?;
+                        if !c.next_ready(b, store)? {
+                            self.waiting = true;
+                            return Ok((taken, false));
+                        }
+                    }
+                }
+            }
             let view = &mut self.view;
             if self.in_segment > 0 && self.in_segment.saturating_add(versions) > self.width {
                 view.selector_ends.push(view.selectors.len());

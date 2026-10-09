@@ -117,6 +117,7 @@ fn key(n: u64) -> [u8; 16] {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rocks_seed = None;
     let mut drain = true;
+    let mut workers = false;
     let mut args = Vec::new();
     for arg in std::env::args().skip(1) {
         if let Some(seed) = arg.strip_prefix("--rocks-seed=") {
@@ -133,6 +134,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .into());
                 }
             };
+        } else if arg == "--workers" {
+            // The trunk's compactions on maintenance workers (`ShardDb::set_workers`).
+            workers = true;
         } else if arg != "--bench" {
             args.push(arg);
         }
@@ -217,6 +221,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(issuer) = &issuer {
         db.attach(issuer, batches.max(1)).unwrap();
     }
+    if workers {
+        let path = path.clone();
+        db.set_workers(move || {
+            DeviceFile::open(&path, false, caching, align).map_err(|e| mantle_engine::Error::Io {
+                op: "open a maintenance worker's file",
+                detail: e.to_string(),
+            })
+        });
+    }
     db.set_write_budget(write_budget_mib << 20);
     if memory_mib > 0 {
         db.set_memory(memory_mib << 20);
@@ -285,8 +298,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (f, t, io) = db.stats();
     let user = num * (16 + 100);
     println!(
-        "fill flushes {} pack {:.2}s (max slice {:.2}ms, most entries a put {}) trunk {:.2}s (max slice {:.2}ms, most keys a put {}) stalls {} ({:.2}s, max {:.2}ms) waited steps {}",
+        "fill flushes {} (fed {}) pack {:.2}s (max slice {:.2}ms, most entries a put {}) trunk {:.2}s (max slice {:.2}ms, most keys a put {}) stalls {} ({:.2}s, max {:.2}ms) waited steps {}",
         f.flushes,
+        f.fed,
         f.pack_ns as f64 / 1e9,
         f.pack_max_ns as f64 / 1e6,
         f.pack_share_most,
@@ -366,6 +380,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Maintenance is charged per input put, rather than per maintenance step.
         costs("maintain", num, &mark);
         println!("maintain {seconds:.6}s");
+        let (_, t, _) = db.stats();
+        println!(
+            "maintain trunk pivot_compactions {} leaf_compactions {} flushes {} splits {} consolidations {} views built {} maplets built {} declined {} entries_written {}",
+            t.pivot_compactions,
+            t.leaf_compactions,
+            t.flushes,
+            t.splits,
+            t.consolidations,
+            t.views_built,
+            t.maplets_built,
+            t.maplets_declined,
+            t.entries_written
+        );
+        if let Some((held, want)) = db.workers() {
+            println!("maintenance workers held {held} wanted {want}");
+        }
     } else {
         println!("maintain deferred until after reads and seeks");
     }

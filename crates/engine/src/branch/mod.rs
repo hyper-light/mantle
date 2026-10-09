@@ -45,14 +45,14 @@ pub enum Op {
 }
 
 impl Op {
-    fn byte(self) -> u8 {
+    pub(crate) fn byte(self) -> u8 {
         match self {
             Self::Put => 1,
             Self::Delete => 2,
         }
     }
 
-    fn from_byte(b: u8) -> Option<Self> {
+    pub(crate) fn from_byte(b: u8) -> Option<Self> {
         match b {
             1 => Some(Self::Put),
             2 => Some(Self::Delete),
@@ -1185,6 +1185,31 @@ fn entry_ranges(
         return Err(corrupt(Malformed::Truncated));
     }
     Ok((suffix_at..suffix_end, body..suffix_at))
+}
+
+impl Branch {
+    /// The descriptor a merge of this branch reads, for a maintenance worker: where its pages
+    /// are and its leaf index, without its filters, which only point reads and scans ask and
+    /// which are most of a descriptor's memory.
+    pub fn for_merge(&self) -> Self {
+        Self {
+            root: self.root,
+            height: self.height,
+            count: self.count,
+            extents: self.extents.clone(),
+            filter: filter::Filter::none(),
+            filter_start: self.filter_start,
+            filter_pages: self.filter_pages,
+            filter_bytes: self.filter_bytes,
+            counts: self.counts.clone(),
+            index: self.index.clone(),
+            index_bytes: self.index_bytes,
+            range: Surf::default(),
+            range_bytes: self.range_bytes,
+            hashes_bytes: self.hashes_bytes,
+            probes: 0,
+        }
+    }
 }
 
 impl Branch {

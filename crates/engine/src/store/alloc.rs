@@ -21,6 +21,9 @@ pub struct Allocator {
     /// A maintenance worker's: it holds its grant alone and never grows the file
     /// ([`Allocator::granted`]).
     granted: bool,
+    /// A worker's extents written so far, ascending: its counts, which `refs` keeps for the
+    /// shard's whole file.
+    held: Vec<u64>,
 }
 
 fn corrupt(why: Malformed) -> Error {
@@ -45,6 +48,7 @@ impl Allocator {
             pending: Vec::new(),
             limit: limit.max(1),
             granted: false,
+            held: Vec::new(),
         }
     }
 
@@ -72,41 +76,64 @@ impl Allocator {
             pending: Vec::new(),
             limit,
             granted: false,
+            held: Vec::new(),
         })
     }
 
     /// A maintenance worker's allocator: the extents `grant`ed it by the shard's, and no other.
-    /// Its counts span the granted extents alone, a few kilobytes, and it never grows the file
-    /// past them: an extent past the grant is refused (`LimitExceeded`), so the shard sizes the
-    /// grant to the job ([`crate::store::Store::grant`]). Nothing it holds is ever persisted.
-    pub fn granted(grant: &[u64]) -> Result<Self, Error> {
-        let most = grant.iter().copied().max().unwrap_or(0);
-        let len = index(most)?.checked_add(1).ok_or(Error::InvalidArgument {
-            what: "an extent past the address space",
-        })?;
-        let mut free = grant.to_vec();
-        // Lowest first off the stack, as the shard's allocator reuses extents.
-        free.sort_unstable_by(|a, b| b.cmp(a));
-        Ok(Self {
-            refs: vec![0; len],
-            free,
+    /// It keeps no count for the rest of the file, only the extents it has written, and it never
+    /// grows the file: an extent past the grant is refused (`LimitExceeded`) until the shard
+    /// grants more ([`Self::grant_more`]). Nothing it holds is ever persisted.
+    pub fn granted() -> Self {
+        Self {
+            refs: Vec::new(),
+            free: Vec::new(),
             pending: Vec::new(),
-            limit: u64::try_from(len).unwrap_or(u64::MAX),
+            limit: 0,
             granted: true,
-        })
+            held: Vec::new(),
+        }
+    }
+
+    /// A worker's next job: `grant` alone, nothing held. Its lists keep their room.
+    pub fn regrant(&mut self, grant: &[u64]) {
+        self.held.clear();
+        self.free.clear();
+        self.grant_more(grant);
+    }
+
+    /// More extents granted a worker's job.
+    pub fn grant_more(&mut self, grant: &[u64]) {
+        self.free.extend_from_slice(grant);
+        // Lowest first off the stack, as the shard's allocator reuses extents.
+        self.free.sort_unstable_by(|a, b| b.cmp(a));
+        self.limit =
+            u64::try_from(self.free.len().saturating_add(self.held.len())).unwrap_or(u64::MAX);
+    }
+
+    /// The extents the file may hold; a worker's, those granted it.
+    pub fn limit(&self) -> u64 {
+        self.limit
     }
 
     /// A worker's granted extents it never wrote, or released again: given back to the shard.
     pub fn unused(&mut self) -> Vec<u64> {
-        let mut out = std::mem::take(&mut self.free);
-        out.append(&mut self.pending);
-        out
+        std::mem::take(&mut self.free)
     }
 
     /// An extent for new pages, its count 1: a free one, else one past the file's end. Refused
     /// once the file holds `limit` extents and none is free.
     pub fn allocate(&mut self) -> Result<u64, Error> {
         if let Some(extent) = self.free.pop() {
+            if self.granted {
+                // Taken lowest first, so pushed in order but after a top-up of lower extents.
+                let out_of_order = self.held.last().is_some_and(|&last| last > extent);
+                self.held.push(extent);
+                if out_of_order {
+                    self.held.sort_unstable();
+                }
+                return Ok(extent);
+            }
             if let Some(count) = self.refs.get_mut(index(extent)?) {
                 *count = 1;
             }
@@ -156,6 +183,18 @@ impl Allocator {
                 what: "a release of the superblocks' extent",
             });
         }
+        if self.granted {
+            // No checkpoint names a worker's extent: free again at once.
+            let before = self.held.len();
+            self.held.retain(|&e| e != extent);
+            if self.held.len() == before {
+                return Err(Error::InvalidArgument {
+                    what: "a release of an extent that is not held",
+                });
+            }
+            self.free.push(extent);
+            return Ok(());
+        }
         let count = self
             .refs
             .get_mut(index(extent)?)
@@ -192,6 +231,9 @@ impl Allocator {
 
     /// Whether `extent` is held.
     pub fn is_held(&self, extent: u64) -> bool {
+        if self.granted {
+            return self.held.binary_search(&extent).is_ok();
+        }
         index(extent)
             .ok()
             .and_then(|i| self.refs.get(i))

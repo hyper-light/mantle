@@ -184,6 +184,18 @@ pub struct Store<F: BlockFile> {
     /// Freed extents whose pages the cache still holds, forgotten a share at a time
     /// ([`Store::forget_some`]): at most the extents freed.
     forgetting: VecDeque<u64>,
+    /// A worker's way to more extents once its grant is spent ([`Store::set_refill`]).
+    refill: Option<Refill>,
+}
+
+/// Asks the shard for `n` more extents and waits for them: a worker's, whose job outgrew its
+/// grant.
+pub struct Refill(pub Box<dyn FnMut(usize) -> Result<Vec<u64>, Error> + Send>);
+
+impl std::fmt::Debug for Refill {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Refill")
+    }
 }
 
 /// Runs handed to the device's issuer and not yet answered: each batch's number, the page
@@ -464,18 +476,18 @@ impl<F: BlockFile> Store<F> {
             lists_most_lent: 0,
             forgetting: VecDeque::new(),
             timed: false,
+            refill: None,
         };
         store.checkpoint(None, 0)?;
         Ok(store)
     }
 
     /// A maintenance worker's store over its own handle on the shard's file: no superblock and no
-    /// cache, its allocator the extents `grant`ed it ([`Allocator::granted`]), and reads up to
-    /// `end`, the bytes the shard's store knew the file to hold when it granted the job. A
-    /// compaction or a branch's build runs on it as on the shard's own, writing in place through
-    /// the file, each write landed when it returns; the shard takes the result once every write
-    /// has.
-    pub fn worker(file: F, config: Config, grant: &[u64], end: u64) -> Result<Self, Error> {
+    /// cache, and no extent until a job grants some ([`Self::begin_job`]). A compaction or a
+    /// branch's build runs on it as on the shard's own, writing in place through the file, each
+    /// write landed when it returns; the shard takes the result once every write has. One store
+    /// serves a worker's every job, its buffers' pools kept warm.
+    pub fn worker(file: F, config: Config) -> Result<Self, Error> {
         Self::check(&file, config)?;
         let buf = Self::page_buf(&file, config)?;
         let page_size = u32::try_from(config.page_size).map_err(|_| Error::InvalidArgument {
@@ -484,7 +496,7 @@ impl<F: BlockFile> Store<F> {
         Ok(Self {
             file,
             config,
-            alloc: Allocator::granted(grant)?,
+            alloc: Allocator::granted(),
             durable: Superblock {
                 page_size,
                 extent_pages: config.extent_pages,
@@ -496,7 +508,7 @@ impl<F: BlockFile> Store<F> {
             },
             buf,
             fenced: false,
-            end,
+            end: 0,
             io: IoStats::default(),
             cache: None,
             range_filter_bits: RANGE_FILTER_BITS,
@@ -515,7 +527,22 @@ impl<F: BlockFile> Store<F> {
             lists_most_lent: 0,
             forgetting: VecDeque::new(),
             timed: false,
+            refill: None,
         })
+    }
+
+    /// A worker's next job: the extents `grant`ed it ([`Allocator::granted`]); reads up to `end`,
+    /// the bytes the shard's store knew the file to hold when it granted the job; and its pages
+    /// sealed as the shard's would be, for the checkpoint after `generation`.
+    pub fn begin_job(&mut self, grant: &[u64], end: u64, generation: u64) {
+        self.alloc.regrant(grant);
+        self.end = end;
+        self.durable.generation = generation;
+    }
+
+    /// How a worker gets more extents once its grant is spent.
+    pub fn set_refill(&mut self, refill: Refill) {
+        self.refill = Some(refill);
     }
 
     /// A worker's granted extents it never wrote, for the shard to take back
@@ -581,6 +608,7 @@ impl<F: BlockFile> Store<F> {
                 lists_most_lent: 0,
                 forgetting: VecDeque::new(),
                 timed: false,
+                refill: None,
             },
             recovered,
         ))
@@ -705,6 +733,16 @@ impl<F: BlockFile> Store<F> {
 
     /// Up to `n` steps bringing the page cache down to its limit (`Cache::trim`); true while it
     /// is still above it.
+    /// The page cache's slots still to reserve ([`cache::Cache::reserve`]).
+    pub fn cache_unreserved(&self) -> usize {
+        self.cache.as_ref().map_or(0, cache::Cache::unreserved)
+    }
+
+    /// Reserves up to `n` of the page cache's slots, in idle time: the pages made.
+    pub fn reserve_cache(&mut self, n: usize) -> usize {
+        self.cache.as_mut().map_or(0, |c| c.reserve(n))
+    }
+
     pub fn trim_cache(&mut self, n: usize) -> bool {
         self.cache.as_mut().is_some_and(|c| c.trim(n))
     }
@@ -763,6 +801,11 @@ impl<F: BlockFile> Store<F> {
             .unwrap_or(0)
     }
 
+    /// The store's shape: its page size, extent pages and most extents.
+    pub fn config(&self) -> Config {
+        self.config
+    }
+
     /// The durable checkpoint's generation.
     pub fn generation(&self) -> u64 {
         self.durable.generation
@@ -770,7 +813,23 @@ impl<F: BlockFile> Store<F> {
 
     /// An extent for new pages, held once.
     pub fn allocate_extent(&mut self) -> Result<u64, Error> {
-        self.alloc.allocate()
+        match self.alloc.allocate() {
+            Err(Error::LimitExceeded { .. }) if self.refill.is_some() => {
+                // A worker's grant is spent: as many again as it held, so the asks a job makes
+                // grow geometrically and number at most the logarithm of its need (the doubling
+                // of a dynamic table, Cormen et al., Introduction to Algorithms, 3rd ed., §17.4).
+                let n = usize::try_from(self.alloc.limit())
+                    .unwrap_or(usize::MAX)
+                    .max(1);
+                let more = match self.refill.as_mut() {
+                    Some(Refill(ask)) => ask(n)?,
+                    None => Vec::new(),
+                };
+                self.alloc.grant_more(&more);
+                self.alloc.allocate()
+            }
+            other => other,
+        }
     }
 
     /// `count` extents for a maintenance worker's job, each held once as the shard's own: the
@@ -779,7 +838,12 @@ impl<F: BlockFile> Store<F> {
     /// is forgotten now rather than in its turn ([`Self::forget_some`] passes over extents held
     /// again, since this store's own writes replace what it cached).
     pub fn grant(&mut self, count: usize) -> Result<Vec<u64>, Error> {
-        let mut out = Vec::with_capacity(count);
+        let mut out = Vec::new();
+        out.try_reserve_exact(count)
+            .map_err(|_| Error::LimitExceeded {
+                what: "extents granted a maintenance job",
+                limit: u64::try_from(count).unwrap_or(u64::MAX),
+            })?;
         for _ in 0..count {
             out.push(self.alloc.allocate()?);
         }
@@ -1405,6 +1469,32 @@ impl<F: BlockFile> Store<F> {
     fn reap(&mut self) -> Result<(), Error> {
         while self.answer(false)? {}
         self.pump()?;
+        Ok(())
+    }
+
+    /// Whether every write to `extents` has landed, taking the answers that have come and never
+    /// waiting: a maintenance worker reading them through its own handle then reads what was
+    /// written ([`Self::worker`]).
+    pub fn landed(&mut self, extents: &[u64]) -> Result<bool, Error> {
+        self.reap()?;
+        let per = u64::from(self.config.extent_pages);
+        Ok(self.writer.as_ref().is_none_or(|w| {
+            extents.iter().all(|&e| {
+                let first = e.saturating_mul(per);
+                let end = first.saturating_add(per);
+                !(w.in_flight.iter().any(|&(_, a, b, _)| a < end && first < b)
+                    || w.queued.iter().any(|q| q.first < end && first < q.end))
+            })
+        }))
+    }
+
+    /// [`Self::landed`], waiting for the answers it needs.
+    pub fn settle_extents(&mut self, extents: &[u64]) -> Result<(), Error> {
+        let per = u64::from(self.config.extent_pages);
+        for &e in extents {
+            let first = e.saturating_mul(per);
+            self.settle(first, first.saturating_add(per))?;
+        }
         Ok(())
     }
 

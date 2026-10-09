@@ -68,6 +68,12 @@ fn probes(h: u64) -> impl Iterator<Item = (usize, u64)> {
 }
 
 impl Filter {
+    /// No filter at all, no memory: a branch's descriptor sent to a merge, which never asks it
+    /// ([`super::Branch::for_merge`]).
+    pub fn none() -> Self {
+        Self { blocks: Vec::new() }
+    }
+
     /// An empty filter for `keys`: sized for them when known exactly; when only bounded, for
     /// the bound, an even count of blocks, which [`Self::fit`] halves once the count is known if
     /// half still holds it.

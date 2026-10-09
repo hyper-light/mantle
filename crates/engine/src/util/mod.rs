@@ -27,6 +27,20 @@ pub fn reuse<T, U>(mut v: Vec<T>) -> Vec<U> {
     v.into_iter().filter_map(|_| None).collect()
 }
 
+/// `a / b` rounded up; none when `b` is zero.
+pub(crate) fn div_ceil(a: u64, b: u64) -> Option<u64> {
+    let q = a.checked_div(b)?;
+    let r = a.checked_rem(b)?;
+    Some(if r == 0 { q } else { q.saturating_add(1) })
+}
+
+/// [`div_ceil`] over `usize`.
+pub(crate) fn div_ceil_usize(a: usize, b: usize) -> Option<usize> {
+    let q = a.checked_div(b)?;
+    let r = a.checked_rem(b)?;
+    Some(if r == 0 { q } else { q.saturating_add(1) })
+}
+
 #[cfg(test)]
 mod reuse_tests {
     use super::reuse;

@@ -500,6 +500,47 @@ impl Cache {
         self.over() > 0
     }
 
+    /// Slots the limit allows that have no buffer yet: what [`Self::reserve`] has left to make.
+    pub fn unreserved(&self) -> usize {
+        self.limit
+            .saturating_sub(self.held())
+            .saturating_sub(self.free.len())
+    }
+
+    /// Makes up to `n` of the slots the limit allows, each with its page's buffer allocated and
+    /// written once, so the OS maps its memory now: a read that misses later takes a ready
+    /// buffer, with no allocation and no first-touch page fault on its path. Run in idle time;
+    /// the pages made.
+    pub fn reserve(&mut self, n: usize) -> usize {
+        let mut made = 0usize;
+        while made < n && self.unreserved() > 0 {
+            let i = match self.empty.pop() {
+                Some(i) => i,
+                None => {
+                    let i = self.slots.len();
+                    self.slots.push(Slot {
+                        address: 0,
+                        freq: 0,
+                        queue: Queue::Small,
+                        live: false,
+                        newer: None,
+                        older: None,
+                    });
+                    self.bufs.push(Vec::new());
+                    i
+                }
+            };
+            if let Some(buf) = self.bufs.get_mut(i) {
+                // Written whole, then emptied: the capacity stays, mapped.
+                buf.resize(self.page, 0);
+                buf.clear();
+            }
+            self.free.push(i);
+            made = made.saturating_add(1);
+        }
+        made
+    }
+
     /// The bytes its index and ghost take.
     pub fn index_bytes(&self) -> usize {
         self.map.bytes().saturating_add(self.ghosts.bytes())

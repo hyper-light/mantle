@@ -32,6 +32,9 @@ use crate::error::{Error, Malformed};
 use crate::remix::{Build, Rebuild, View};
 use crate::store::Store;
 use hyper_block::block::BlockFile;
+use pool::{Output, Owner, Pool, Task, Work};
+
+pub mod pool;
 
 /// The bytes a trunk's branches and views hold in memory ([`Trunk::memory`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -339,6 +342,21 @@ pub struct Trunk {
     consolidation: Consolidation,
     /// The pivots above paid ones, found before a consolidation marks them; kept for the next.
     marks: Vec<(usize, usize)>,
+    /// The maintenance workers compactions run on, when the shard has any ([`Self::set_pool`]).
+    pool: Option<Pool>,
+    /// How long this step waits on the workers ([`Wait`]), and whether it stopped for them.
+    wait: Wait,
+    workers_waiting: bool,
+}
+
+/// How long a step waits on the maintenance workers: not at all (a put's share, a runtime's
+/// slice), for one message (an idle step, which has nothing else to do), or until the cascade
+/// in progress is done (a stall, a drain).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wait {
+    No,
+    One,
+    All,
 }
 
 /// The filters' false positives a get meets now, against those Monkey's allocation of the same
@@ -568,6 +586,33 @@ enum Phase {
     },
     /// Flushing the pivots from `i` on; `waiting` while the child's frame runs.
     Flush { i: usize, waiting: bool },
+    /// A node's compactions out on the maintenance workers: every pivot's with live in-flight
+    /// bundles at once, or the leaf's whole (`settle`). The node changes once every one is back.
+    Out { jobs: Vec<Remote>, settle: bool },
+}
+
+/// A compaction out on a worker: its pivot (a settle's, 0) and the in-flight bundles its
+/// inputs cover; for a settle, the extents its inputs hold, released once it replaces them; the
+/// extents granted it, top-ups included; and where it is.
+#[derive(Debug)]
+struct Remote {
+    pivot: usize,
+    covered: usize,
+    extents: Vec<u64>,
+    grant: Vec<u64>,
+    state: State,
+}
+
+#[derive(Debug)]
+enum State {
+    /// Waiting for its inputs to land and a worker to be free.
+    Ready(Box<Task>),
+    /// On worker `0`.
+    Out(usize),
+    Done(Output),
+    /// Back from a cascade abandoned for a job's failure, its output dropped; or, for a moment,
+    /// handed from ready to out.
+    Dropped,
 }
 
 /// The saved image's format version.
@@ -578,6 +623,12 @@ const IMAGE_FORMAT: u8 = 4;
 const IMAGE_MAGIC: u64 = u64::from_le_bytes(*b"mantleTK");
 /// None, in a child or an end key's place.
 const ABSENT: u32 = u32::MAX;
+
+fn no_pool() -> Error {
+    Error::InvalidArgument {
+        what: "a compaction out on workers the trunk no longer has",
+    }
+}
 
 fn corrupt() -> Error {
     Error::Corruption {
@@ -721,6 +772,9 @@ impl Trunk {
             consolidating: false,
             consolidation: Consolidation::Measured,
             marks: Vec::new(),
+            pool: None,
+            wait: Wait::No,
+            workers_waiting: false,
         })
     }
 
@@ -1296,10 +1350,75 @@ impl Trunk {
     /// or merged key, and filter pages at their worth in keys. Structural planning, a flush by
     /// reference and a split cost no budget; each is taken once, so a step ends. Returns the
     /// units spent, for the cascade in progress or a new one over every pending branch.
+    /// With maintenance workers ([`Self::set_pool`]), a step of the whole budget waits until
+    /// the cascade's compactions are back; any other step waits for none.
     pub fn step<F: BlockFile>(&mut self, store: &mut Store<F>, budget: u64) -> Result<u64, Error> {
+        let wait = if budget == u64::MAX {
+            Wait::All
+        } else {
+            Wait::No
+        };
+        self.step_with(store, budget, wait)
+    }
+
+    fn step_with<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        budget: u64,
+        wait: Wait,
+    ) -> Result<u64, Error> {
         self.views_unchecked = self.nodes.len();
         self.maplets_unchecked = self.nodes.len();
+        self.wait = wait;
         self.run(store, budget, true)
+    }
+
+    /// [`Self::step`] for an idle shard, which has nothing else to do: with compactions out on
+    /// the workers, it waits for one of their messages rather than return at once to be called
+    /// again.
+    pub fn idle_step<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        budget: u64,
+    ) -> Result<u64, Error> {
+        let wait = if budget == u64::MAX {
+            Wait::All
+        } else {
+            Wait::One
+        };
+        self.step_with(store, budget, wait)
+    }
+
+    /// Compactions the workers hold for the cascade in progress, which the shard's steps take
+    /// back ([`Self::step`]).
+    pub fn workers_out(&self) -> bool {
+        self.pool.as_ref().is_some_and(|p| p.out_for(Owner::Trunk))
+    }
+
+    /// Hands the trunk maintenance workers: from the next compaction planned on, compactions
+    /// run on them. A cascade in progress keeps the compactions it has.
+    pub fn set_pool(&mut self, pool: Pool) {
+        self.pool = Some(pool);
+    }
+
+    /// The maintenance workers, for the shard's packing.
+    pub fn pool_mut(&mut self) -> Option<&mut Pool> {
+        self.pool.as_mut()
+    }
+
+    /// Whether the trunk has maintenance workers.
+    pub fn has_pool(&self) -> bool {
+        self.pool.is_some()
+    }
+
+    /// Stops the workers, each job still out run to its end and dropped.
+    pub fn stop_workers(&mut self) {
+        self.pool = None;
+    }
+
+    /// The workers held and wanted, for diagnosis.
+    pub fn pool_workers(&self) -> Option<(usize, usize)> {
+        self.pool.as_ref().map(|p| (p.workers(), p.want()))
     }
 
     /// [`Self::step`] for a put's share: a compaction whose initial or next input page has not landed
@@ -1333,6 +1452,7 @@ impl Trunk {
     pub fn finish_cascade<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
         self.views_unchecked = self.nodes.len();
         self.maplets_unchecked = self.nodes.len();
+        self.wait = Wait::All;
         self.run(store, u64::MAX, false).map(|_| ())
     }
 
@@ -1713,6 +1833,7 @@ impl Trunk {
     ) -> Result<u64, Error> {
         let mut used = 0u64;
         self.io_waiting = false;
+        self.workers_waiting = false;
         // A finished frame's result is taken by the frame above it in the same step, at no
         // cost to the budget: a settled or split node's new siblings are reachable only once
         // its parent splices them in, and a step ending between the two left keys a read could
@@ -1725,6 +1846,9 @@ impl Trunk {
                     // descending only through paid pivots and those above them.
                     self.mark_paid_paths()?;
                     self.consolidating = true;
+                    if let Some(p) = self.pool.as_mut() {
+                        p.cascade_started();
+                    }
                     let root = self.root;
                     self.cascade.push(Frame {
                         n: root,
@@ -1739,6 +1863,9 @@ impl Trunk {
                 // layout is no longer consolidated.
                 self.consolidating = false;
                 self.consolidated = false;
+                if let Some(p) = self.pool.as_mut() {
+                    p.cascade_started();
+                }
                 let root = self.root;
                 for b in std::mem::take(&mut self.pending) {
                     self.node_mut(root)?.inflight.push(vec![b]);
@@ -1750,7 +1877,7 @@ impl Trunk {
                 continue;
             };
             used = used.saturating_add(self.advance(store, frame, budget.saturating_sub(used))?);
-            if self.io_waiting {
+            if self.io_waiting || self.workers_waiting {
                 break;
             }
             if self.cascade.is_empty()
@@ -1836,7 +1963,8 @@ impl Trunk {
                 self.io_waiting |= c.waiting();
                 if c.is_done() {
                     let t = self.timed.then(std::time::Instant::now);
-                    self.apply_pivot(store, n, i, *c, covered)?;
+                    let merged = (*c).finish(store)?.into_iter().next().map(|(_, b)| b);
+                    self.apply_pivot(n, i, merged, covered)?;
                     self.stats.finish_ns = self.stats.finish_ns.saturating_add(ns_since(t));
                     (
                         Some(Phase::Pivots {
@@ -1912,6 +2040,20 @@ impl Trunk {
             Phase::Flush { i, waiting } => {
                 let i = if waiting { self.take_child(n, i)? } else { i };
                 (self.flush_from(n, i)?, 0)
+            }
+            Phase::Out { mut jobs, settle } => {
+                if !self.tend(store, &mut jobs)? {
+                    self.workers_waiting = true;
+                    self.cascade.push(Frame {
+                        n,
+                        phase: Phase::Out { jobs, settle },
+                    });
+                    return Ok(0);
+                }
+                let t = self.timed.then(std::time::Instant::now);
+                let phase = self.apply_out(store, n, jobs, settle)?;
+                self.stats.finish_ns = self.stats.finish_ns.saturating_add(ns_since(t));
+                (phase, 0)
             }
         };
         if let Some(phase) = phase {
@@ -2237,6 +2379,9 @@ impl Trunk {
             consolidating: false,
             consolidation: Consolidation::Measured,
             marks: Vec::new(),
+            pool: None,
+            wait: Wait::No,
+            workers_waiting: false,
         })
     }
 
@@ -2266,6 +2411,9 @@ impl Trunk {
                 }
             });
         };
+        if self.pool.is_some() {
+            return self.plan_out_pivots(n, j);
+        }
         let pivot = node.pivots.get(j).ok_or(corrupt())?;
         let live = node.inflight.get(pivot.start..).unwrap_or(&[]);
         let (from, end) = (pivot.key.clone(), Self::pivot_end(node, j));
@@ -2281,15 +2429,13 @@ impl Trunk {
 
     /// Pivot `i`'s compaction is done: its branch goes to the front of the pivot's bundle, and
     /// the pivot reads in-flight bundles from `covered` on.
-    fn apply_pivot<F: BlockFile>(
+    fn apply_pivot(
         &mut self,
-        store: &mut Store<F>,
         n: usize,
         i: usize,
-        job: Compaction,
+        merged: Option<Branch>,
         covered: usize,
     ) -> Result<(), Error> {
-        let merged = job.finish(store)?.into_iter().next().map(|(_, b)| b);
         self.stats.pivot_compactions = self.stats.pivot_compactions.saturating_add(1);
         if let Some(b) = &merged {
             self.stats.entries_written = self.stats.entries_written.saturating_add(b.count);
@@ -2300,6 +2446,225 @@ impl Trunk {
             pivot.bundle.push_newest(b);
         }
         Ok(())
+    }
+
+    /// Every pivot's compaction from `j` on, those with live in-flight bundles, planned at once
+    /// for the workers: each reads only its own pivot's range of the node's bundles, which none
+    /// changes until every one is back.
+    fn plan_out_pivots(&mut self, n: usize, j: usize) -> Result<Phase, Error> {
+        let node = self.node(n)?;
+        let covered = node.inflight.len();
+        let mut jobs = Vec::new();
+        for (k, pivot) in node.pivots.iter().enumerate().skip(j) {
+            let Some(live) = node.inflight.get(pivot.start..).filter(|l| !l.is_empty()) else {
+                continue;
+            };
+            let job = Task {
+                // Newest first, the order a merge takes.
+                inputs: live.iter().rev().flatten().map(Branch::for_merge).collect(),
+                from: pivot.key.clone(),
+                end: Self::pivot_end(node, k),
+                drop_tombstones: false,
+                per: u64::MAX,
+            };
+            jobs.push(Remote {
+                pivot: k,
+                covered,
+                extents: Vec::new(),
+                grant: Vec::new(),
+                state: State::Ready(Box::new(job)),
+            });
+        }
+        Ok(Phase::Out {
+            jobs,
+            settle: false,
+        })
+    }
+
+    /// Hands out each job whose inputs have landed while a worker is free, and takes the
+    /// workers' results, for as long as [`Self::wait`] says: whether every job is back.
+    fn tend<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        jobs: &mut [Remote],
+    ) -> Result<bool, Error> {
+        let mut taken = 0usize;
+        loop {
+            self.dispatch(store, jobs)?;
+            if jobs.iter().all(|r| matches!(r.state, State::Done(_))) {
+                return Ok(true);
+            }
+            let wait = match self.wait {
+                Wait::No => false,
+                Wait::One => taken == 0,
+                Wait::All => true,
+            };
+            let pool = self.pool.as_mut().ok_or(no_pool())?;
+            let Some(back) = pool.take(store, Owner::Trunk, wait)? else {
+                if wait && !pool.out_for(Owner::Trunk) {
+                    // A wait with nothing out: no worker would take a job, which a pool that
+                    // wants at least one never refuses.
+                    return Err(Error::InvalidArgument {
+                        what: "a maintenance job no worker would take",
+                    });
+                }
+                return Ok(false);
+            };
+            taken = taken.saturating_add(1);
+            let r = jobs
+                .iter_mut()
+                .find(|r| matches!(r.state, State::Out(w) if w == back.worker))
+                .ok_or(Error::InvalidArgument {
+                    what: "a maintenance worker's result for no job of its",
+                });
+            match (r, back.result) {
+                (Ok(r), Ok(out)) => {
+                    r.grant.extend_from_slice(&back.topped);
+                    r.state = State::Done(out);
+                }
+                (r, result) => {
+                    if let Ok(r) = r {
+                        r.grant.extend_from_slice(&back.topped);
+                        r.state = State::Dropped;
+                    }
+                    self.abandon(store, jobs)?;
+                    return Err(match result {
+                        Err(error) => error,
+                        Ok(_) => Error::InvalidArgument {
+                            what: "a maintenance worker's result for no job of its",
+                        },
+                    });
+                }
+            }
+        }
+    }
+
+    /// Hands out the ready jobs whose inputs have landed (waited for when the step waits)
+    /// while a worker is free, each with a grant sized to its inputs: their extents and one more
+    /// a part it may make, the parts' partial last extents. A job that needs more asks for it,
+    /// and the pool answers from the store ([`Pool::take`]).
+    fn dispatch<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        jobs: &mut [Remote],
+    ) -> Result<(), Error> {
+        // A step that waits has nothing else to do: it waits for the inputs' writes too.
+        let wait = self.wait != Wait::No;
+        for r in jobs.iter_mut() {
+            let State::Ready(task) = &r.state else {
+                continue;
+            };
+            if !self.pool.as_ref().is_some_and(|p| p.can_take(wait)) {
+                return Ok(());
+            }
+            let mut landed = true;
+            for b in &task.inputs {
+                if wait {
+                    store.settle_extents(&b.extents)?;
+                } else if !store.landed(&b.extents)? {
+                    landed = false;
+                    break;
+                }
+            }
+            if !landed {
+                continue;
+            }
+            let extents = task
+                .inputs
+                .iter()
+                .map(|b| b.extents.len())
+                .fold(0usize, usize::saturating_add);
+            let entries = task
+                .inputs
+                .iter()
+                .map(|b| b.count)
+                .fold(0u64, u64::saturating_add);
+            let parts = crate::util::div_ceil(entries, task.per.max(1))
+                .unwrap_or(entries)
+                .saturating_add(1);
+            let parts = usize::try_from(parts).unwrap_or(usize::MAX);
+            let grant = store.grant(extents.saturating_add(parts))?;
+            let State::Ready(task) = std::mem::replace(&mut r.state, State::Dropped) else {
+                continue;
+            };
+            r.grant.clone_from(&grant);
+            let job = Box::new(pool::Job {
+                work: Work::Compact(*task),
+                grant,
+                file_end: store.end(),
+                generation: store.generation(),
+            });
+            let pool = self.pool.as_mut().ok_or(no_pool())?;
+            match pool.send(job, Owner::Trunk, wait)? {
+                Ok(worker) => r.state = State::Out(worker),
+                Err(job) => {
+                    store.grant_back(&job.grant)?;
+                    r.grant.clear();
+                    let Work::Compact(task) = job.work else {
+                        return Err(corrupt());
+                    };
+                    r.state = State::Ready(Box::new(task));
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A job failed: every other one out is waited for and every grant released, the outputs
+    /// made dropped unread (their extents are the grants'). The failure ends the cascade, as an
+    /// inline compaction's failure past its opening does.
+    fn abandon<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        jobs: &mut [Remote],
+    ) -> Result<(), Error> {
+        let pool = self.pool.as_mut().ok_or(no_pool())?;
+        while jobs.iter().any(|r| matches!(r.state, State::Out(_))) {
+            let Some(back) = pool.take(store, Owner::Trunk, true)? else {
+                break;
+            };
+            for r in jobs.iter_mut() {
+                if matches!(r.state, State::Out(w) if w == back.worker) {
+                    r.grant.extend_from_slice(&back.topped);
+                    r.state = State::Dropped;
+                }
+            }
+        }
+        for r in jobs.iter_mut() {
+            for e in std::mem::take(&mut r.grant) {
+                store.release(e)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every job of a node's frame is back: each output's unused extents go back to the store
+    /// and the file's end moves past its writes; then the pivots take their branches, or the
+    /// leaf its parts.
+    fn apply_out<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        n: usize,
+        jobs: Vec<Remote>,
+        settle: bool,
+    ) -> Result<Option<Phase>, Error> {
+        let mut next = 0usize;
+        for r in jobs {
+            let State::Done(out) = r.state else {
+                return Err(corrupt());
+            };
+            store.grant_back(&out.unused)?;
+            store.extend_end(out.end);
+            if settle {
+                self.returned = Some(self.apply_settle(store, n, out.parts, &r.extents)?);
+                return Ok(None);
+            }
+            let merged = out.parts.into_iter().next().map(|(_, b)| b);
+            self.apply_pivot(n, r.pivot, merged, r.covered)?;
+            next = next.max(r.pivot.saturating_add(1));
+        }
+        Ok(Some(Phase::Pivots { i: next, job: None }))
     }
 
     /// In-flight bundles before every pivot's start are read by none: their references go.
@@ -2319,8 +2684,11 @@ impl Trunk {
     }
 
     /// A leaf over `fanout` branches or `leaf_entries` entries gets its whole compaction
-    /// planned, tombstones dropped, into branches of at most half `leaf_entries`; any other
-    /// leaf's frame finishes as it is.
+    /// planned, tombstones dropped, into `ceil(entries / leaf_entries)` leaves of even size, at
+    /// least one. SplinterDB rewrites a leaf over `F` branches in place and splits one over its
+    /// size into even parts (trunk.c, research/34); the ceiling, where SplinterDB rounds,
+    /// keeps every part within `leaf_entries`, so a leaf never stays over the size that settles
+    /// it and is rewritten whole at every cascade. Any other leaf's frame finishes as it is.
     fn plan_settle(&mut self, n: usize) -> Result<Option<Phase>, Error> {
         let node = self.node(n)?;
         let pivot = node.pivots.first().ok_or(corrupt())?;
@@ -2357,13 +2725,38 @@ impl Trunk {
             .iter()
             .flat_map(|b| b.extents.iter().copied())
             .collect();
-        let job = Compaction::prepare(
-            pivot.bundle.branches(),
-            from,
-            end,
-            true,
-            self.config.leaf_entries.div_ceil(2).max(1),
-        );
+        // Its entries counted over every branch, an upper bound on its keys: the parts it asks
+        // for are at least as full as their target allows.
+        let target = self.config.leaf_entries.max(1);
+        let parts = crate::util::div_ceil(entries, target).unwrap_or(1).max(1);
+        let per = crate::util::div_ceil(entries, parts)
+            .unwrap_or(entries)
+            .max(1);
+        if self.pool.is_some() {
+            let job = Task {
+                inputs: pivot
+                    .bundle
+                    .branches()
+                    .iter()
+                    .map(Branch::for_merge)
+                    .collect(),
+                from,
+                end,
+                drop_tombstones: true,
+                per,
+            };
+            return Ok(Some(Phase::Out {
+                jobs: vec![Remote {
+                    pivot: 0,
+                    covered: 0,
+                    extents,
+                    grant: Vec::new(),
+                    state: State::Ready(Box::new(job)),
+                }],
+                settle: true,
+            }));
+        }
+        let job = Compaction::prepare(pivot.bundle.branches(), from, end, true, per);
         Ok(Some(Phase::Settle {
             job: Some((Box::new(job), extents)),
         }))
@@ -2471,13 +2864,20 @@ impl Trunk {
         if !bundle.is_empty() {
             self.stats.flushes = self.stats.flushes.saturating_add(1);
         }
-        // A leaf a paid flush lands in settles to one branch: what the seeks paid for.
-        if paid && self.node(child)?.leaf {
-            let leaf = self.node_mut(child)?.pivots.first_mut().ok_or(corrupt())?;
-            if !leaf.seek.paid {
-                leaf.seek.paid = true;
-                self.paid = self.paid.saturating_add(1);
+        // A paid flush pays for every pivot of the child it lands in: the bundle spans the
+        // child's whole range, so each of its pivots takes part of it, and each must carry its
+        // part down in turn until a leaf settles it to one branch. A child index node's pivots
+        // left unpaid would keep their part as one more source at that level, what the seeks
+        // paid to remove.
+        if paid {
+            let mut newly = 0usize;
+            for p in &mut self.node_mut(child)?.pivots {
+                if !p.seek.paid {
+                    p.seek.paid = true;
+                    newly = newly.saturating_add(1);
+                }
             }
+            self.paid = self.paid.saturating_add(newly);
         }
         // Oldest first into the child's in-flight list: the bundle is newest first.
         for b in bundle.into_iter().rev() {

@@ -3,7 +3,7 @@
 //! to a compaction (research/34 §1).
 
 use super::filter::Keys;
-use super::{Branch, Builder, Op, RunCursor};
+use super::{Branch, Builder, Initial, Op, RunCursor};
 use crate::error::Error;
 use crate::store::Store;
 use hyper_block::block::BlockFile;
@@ -18,6 +18,8 @@ pub struct Merge {
     current: Option<usize>,
     /// The key `next` moves past, its buffer reused so a step allocates nothing.
     past: Vec<u8>,
+    /// While opening, `current` is the next input and `past` holds its from-key.
+    opening: bool,
 }
 
 impl Merge {
@@ -51,20 +53,92 @@ impl Merge {
     ) -> Result<Self, Error> {
         let mut cursors = Vec::new();
         for b in branches {
-            cursors.push(if sequential {
-                b.seek_sequential(store, from)?
+            let cursor = if sequential {
+                b.seek_sequential(store, from)
             } else {
-                b.seek(store, from)?
-            });
+                b.seek(store, from)
+            };
+            match cursor {
+                Ok(cursor) => cursors.push(cursor),
+                Err(error) => {
+                    for cursor in cursors {
+                        cursor.give_back(store);
+                    }
+                    return Err(error);
+                }
+            }
         }
         let mut merge = Self {
             cursors,
             end: end.map(<[u8]>::to_vec),
             current: None,
             past: Vec::new(),
+            opening: false,
         };
         merge.pick();
         Ok(merge)
+    }
+
+    fn prepared(from: Vec<u8>, end: Option<Vec<u8>>) -> Self {
+        Self {
+            cursors: Vec::new(),
+            end,
+            current: Some(0),
+            past: from,
+            opening: true,
+        }
+    }
+
+    /// Opens one input leaf. Partial cursors retain only their existing span and page owners.
+    fn open<'a, F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        branches: impl IntoIterator<Item = &'a Branch>,
+        count: usize,
+        yield_io: bool,
+    ) -> Result<bool, Error> {
+        if !self.opening {
+            return Ok(true);
+        }
+        let at = self.current.ok_or(Error::InvalidArgument {
+            what: "a compaction opened over inconsistent inputs",
+        })?;
+        if count == 0 {
+            self.opening = false;
+            self.past.clear();
+            self.pick();
+            return Ok(true);
+        }
+        let branch = branches.into_iter().nth(at).ok_or(Error::InvalidArgument {
+            what: "a compaction opened over inconsistent inputs",
+        })?;
+        if self.cursors.len() == at {
+            self.cursors
+                .push(RunCursor::prepare(branch, store, &self.past)?);
+        }
+        let cursor = self.cursors.get_mut(at).ok_or(Error::InvalidArgument {
+            what: "a compaction opened over inconsistent inputs",
+        })?;
+        match cursor.begin(branch, store, &self.past, yield_io)? {
+            Initial::Waiting => return Ok(false),
+            Initial::More => return Ok(true),
+            Initial::Done => self.current = Some(at.saturating_add(1)),
+        }
+        if self.current == Some(count) {
+            self.opening = false;
+            self.past.clear();
+            self.pick();
+        }
+        Ok(true)
+    }
+
+    /// An opening failure returns every partial cursor, including unclaimed read buffers.
+    fn cancel_opening<F: BlockFile>(&mut self, store: &mut Store<F>) {
+        for cursor in self.cursors.drain(..) {
+            cursor.give_back(store);
+        }
+        self.current = Some(0);
+        self.opening = true;
     }
 
     /// Gives every cursor's span back to `store`'s pool: the merge is done with them.
@@ -119,6 +193,9 @@ impl Merge {
 
     /// The current entry: key, operation, value.
     pub fn entry(&self) -> Option<(&[u8], Op, &[u8])> {
+        if self.opening {
+            return None;
+        }
         self.current
             .and_then(|i| self.cursors.get(i))
             .map(|c| (c.key(), c.op(), c.value()))
@@ -208,11 +285,51 @@ impl Compaction {
         })
     }
 
-    /// Whether a step stops, rather than wait, when an input's next page has not landed from
+    /// The trunk's private plan: retain the existing from-key buffer and open input leaves in
+    /// budgeted steps, after yielding has been selected. Public constructors remain immediate.
+    pub(crate) fn prepare<'a>(
+        branches: impl IntoIterator<Item = &'a Branch>,
+        from: Vec<u8>,
+        end: Option<Vec<u8>>,
+        drop_tombstones: bool,
+        per: u64,
+    ) -> Self {
+        let mut remaining = 0u64;
+        let mut roots = Vec::new();
+        for branch in branches {
+            remaining = remaining.saturating_add(branch.count);
+            roots.push(branch.root);
+        }
+        let mut merge = Merge::prepared(from, end);
+        if roots.is_empty() {
+            merge.opening = false;
+            merge.current = None;
+            merge.past.clear();
+        }
+        Self {
+            merge,
+            roots,
+            drop_tombstones,
+            per: per.max(1),
+            building: None,
+            closing: std::collections::VecDeque::new(),
+            out: Vec::new(),
+            remaining,
+            yield_io: false,
+            waiting: false,
+        }
+    }
+
+    /// Whether a step stops, rather than wait, when an initial or next input page has not landed from
     /// the device ([`Store::ready`]): for a step a put paces, which the device's latency must
     /// not hold. Steps of idle time and of a stall wait, and always finish their budget.
     pub fn set_yield(&mut self, on: bool) {
         self.yield_io = on;
+    }
+
+    /// Only an unfinished private opening can restart after its owners have been returned.
+    pub(crate) fn opening(&self) -> bool {
+        self.merge.opening
     }
 
     /// Whether the last step stopped for a page still being read.
@@ -220,18 +337,31 @@ impl Compaction {
         self.waiting
     }
 
-    /// Input entries left to merge, at most.
+    /// The work estimate: input entries left, one unit per input still opening, and filter
+    /// pages at their worth in keys. A gap may take another leaf move; its opening stays owed
+    /// until the input is positioned.
     pub fn remaining(&self) -> u64 {
+        let opening = if self.merge.opening {
+            self.merge
+                .current
+                .map_or(self.roots.len(), |at| self.roots.len().saturating_sub(at))
+        } else {
+            0
+        };
+        let remaining = self
+            .remaining
+            .saturating_add(u64::try_from(opening).unwrap_or(u64::MAX));
         // The filter pages left to write, each at its worth in keys.
         let filters = |b: &Builder| b.filter_pages_left().saturating_mul(b.page_keys());
         self.closing
             .iter()
             .map(|(_, b)| filters(b))
             .chain(self.building.iter().map(|(_, b, _)| filters(b)))
-            .fold(self.remaining, u64::saturating_add)
+            .fold(remaining, u64::saturating_add)
     }
 
-    /// Works for up to `budget`: the filter pages of branches already sealed first, each at its
+    /// Works for up to `budget`: a private plan opens one input leaf per unit first, yielding
+    /// before an unlanded read; then the filter pages of branches already sealed, each at its
     /// worth in keys ([`Builder::page_keys`]), then keys merged; a part that reaches its size, or
     /// the last once the merge is done, is sealed and its filter's pages wait their turn. Returns
     /// the budget used, less than `budget` only once the compaction is done or, when it yields
@@ -249,6 +379,9 @@ impl Compaction {
         let mut n = 0usize;
         for b in inputs.clone() {
             if self.roots.get(n) != Some(&b.root) {
+                if self.merge.opening {
+                    self.merge.cancel_opening(store);
+                }
                 return Err(Error::InvalidArgument {
                     what: "a compaction stepped over inputs it was not opened on",
                 });
@@ -256,6 +389,9 @@ impl Compaction {
             n = n.saturating_add(1);
         }
         if n != self.roots.len() {
+            if self.merge.opening {
+                self.merge.cancel_opening(store);
+            }
             return Err(Error::InvalidArgument {
                 what: "a compaction stepped over inputs it was not opened on",
             });
@@ -263,6 +399,25 @@ impl Compaction {
         let mut done = 0u64;
         self.waiting = false;
         while done < budget {
+            if self.merge.opening {
+                match self
+                    .merge
+                    .open(store, inputs.clone(), self.roots.len(), self.yield_io)
+                {
+                    Ok(true) => {
+                        done = done.saturating_add(1);
+                        continue;
+                    }
+                    Ok(false) => {
+                        self.waiting = true;
+                        break;
+                    }
+                    Err(error) => {
+                        self.merge.cancel_opening(store);
+                        return Err(error);
+                    }
+                }
+            }
             if let Some((_, b)) = self.closing.front_mut() {
                 let keys = b.page_keys();
                 let pages = budget
@@ -330,7 +485,10 @@ impl Compaction {
 
     /// Whether every key is merged and every branch made is whole, its filter written.
     pub fn is_done(&self) -> bool {
-        self.merge.entry().is_none() && self.building.is_none() && self.closing.is_empty()
+        !self.merge.opening
+            && self.merge.entry().is_none()
+            && self.building.is_none()
+            && self.closing.is_empty()
     }
 
     /// The branches made, each with its first key, in key order; the merge must be done.

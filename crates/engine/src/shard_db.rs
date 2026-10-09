@@ -933,6 +933,12 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     fn apply(&mut self, key: &[u8], op: Op, value: &[u8]) -> Result<(), Error> {
+        if self.store.fenced() {
+            return Err(Error::Io {
+                op: "apply a shard entry",
+                detail: "the store was fenced by a failed write or flush".into(),
+            });
+        }
         self.trim();
         // A write makes the key's cached record stale: it goes before the write is answered.
         if let Some(r) = self.records.as_mut() {
@@ -1349,24 +1355,61 @@ impl<F: BlockFile> ShardDb<F> {
             >= moves.saturating_mul(u128::from(ns))
     }
 
-    /// Whether maintenance is owed: a memtable packing, the trunk's work, a leaf's REMIX view to
-    /// build, or freed pages the cache has yet to forget.
+    /// Whether maintenance is owed: a memtable packing, the trunk's work or a consolidation, a
+    /// leaf's REMIX view to build, the active memtable's runs to merge, or freed pages the cache
+    /// has yet to forget.
     pub fn owed(&self) -> bool {
+        self.owed_with(false)
+    }
+
+    /// A range's idle work: finish admitted order jobs without repeatedly rebuilding an
+    /// active memtable's larger run for each new partial tail; its runs are merged only once
+    /// scans have paid for it ([`Self::tidy_paid`]).
+    pub(crate) fn idle_owed(&self) -> bool {
+        self.owed_with(true)
+    }
+
+    fn owed_with(&self, paced: bool) -> bool {
         self.packing.is_some()
             || self.trunk.debt() > 0
-            || self.trunk.cascading()
+            || !self.trunk.is_idle()
             || self.trunk.consolidation_owed()
             || self.trunk.views_owed()
             || self.trunk.maplets_owed()
+            || (if paced {
+                self.mem.debt() > 0
+            } else {
+                self.mem.untidy()
+            })
             || self.tidy_paid()
             || self.store.forget_debt() > 0
     }
 
-    /// Pays up to `keys` keys' worth of maintenance owed, for the shard's idle time (SILK: the
+    /// Pays up to `keys` work units of maintenance owed, for the shard's idle time (SILK: the
     /// flush first, since a full memtable stops puts; then the trunk's work; then the cache's
-    /// views of leaves' bundles; then the cache's forgetting). Returns the work done, 0 once
-    /// nothing is owed.
+    /// views of leaves' bundles; then the consolidations seeks paid for; then the active
+    /// memtable's order; then the cache's forgetting). Returns the work done, 0 once nothing is
+    /// owed.
     pub fn idle_step(&mut self, keys: u64) -> Result<u64, Error> {
+        self.idle_step_with(keys, false)
+    }
+
+    /// A runtime task's idle slice: a required trunk read that has not landed leaves its
+    /// work owed, so the task can await an attachment completion or another request.
+    pub(crate) fn idle_paced_step(&mut self, keys: u64) -> Result<u64, Error> {
+        self.trunk.clear_io_wait();
+        self.idle_step_with(keys, true)
+    }
+
+    pub(crate) fn waiting_for_io(&self) -> bool {
+        self.packing.is_none() && self.trunk.waiting_for_io() && self.store.io_outstanding()
+    }
+
+    pub(crate) async fn wait_completion(&mut self) -> Result<bool, Error> {
+        self.store.wait_completion().await
+    }
+
+    fn idle_step_with(&mut self, keys: u64, paced: bool) -> Result<u64, Error> {
         if let Some(p) = &self.packing {
             // At least one: a memtable packed whole with no filter page left still has its
             // branch to finish.
@@ -1374,9 +1417,13 @@ impl<F: BlockFile> ShardDb<F> {
             self.pack_some(w)?;
             return Ok(w);
         }
-        if self.trunk.debt() > 0 || self.trunk.cascading() {
+        if self.trunk.debt() > 0 || !self.trunk.is_idle() {
             let t = self.timed.then(std::time::Instant::now);
-            let used = self.trunk.step(&mut self.store, keys)?;
+            let used = if paced {
+                self.trunk.step_paced(&mut self.store, keys)?
+            } else {
+                self.trunk.step(&mut self.store, keys)?
+            };
             self.note_trunk(ns_since(t));
             return Ok(used.max(1));
         }
@@ -1387,13 +1434,29 @@ impl<F: BlockFile> ShardDb<F> {
             return self.trunk.maplet_step(&mut self.store, keys);
         }
         if self.trunk.consolidation_owed() {
-            // Seeks paid for consolidating leaves: a cascade that flushes and settles them.
-            // After views and maplets, which make a bundle one source without rewriting it:
-            // seeks pay rent only for the sources left with those built.
+            // Seeks paid for consolidating leaves: one cascade, in bulk, flushes and settles
+            // them. After views and maplets, which make a bundle one source without rewriting
+            // it: seeks pay rent only for the sources left with those built.
             let t = self.timed.then(std::time::Instant::now);
-            let used = self.trunk.consolidate_step(&mut self.store, keys, false)?;
+            let used = self.trunk.consolidate_step(&mut self.store, keys, paced)?;
             self.note_trunk(ns_since(t));
             return Ok(used.max(1));
+        }
+        let ordering = if paced {
+            self.mem.debt() > 0
+        } else {
+            self.mem.untidy()
+        };
+        if ordering {
+            // Puts admit bounded sorts and same-level counter merges. Active idle finishes
+            // those jobs; explicit maintenance can still consolidate every run for seeks.
+            let budget = usize::try_from(keys).unwrap_or(usize::MAX);
+            let done = if paced {
+                self.mem.pay(budget)
+            } else {
+                self.mem.tidy(budget)
+            };
+            return Ok(u64::try_from(done).unwrap_or(u64::MAX));
         }
         if self.tidy_paid() {
             // The active memtable's runs merged to one, so a seek searches one, once the scans
@@ -1408,36 +1471,6 @@ impl<F: BlockFile> ShardDb<F> {
             return Ok(done);
         }
         Ok(self.store.forget_some(keys))
-    }
-
-    /// [`Self::idle_step`] for a shard's task that waits on the device as a task: a compaction
-    /// whose next input page has not landed stops rather than wait on the shard's thread, and the
-    /// second value says so. The task then waits for the device's answer
-    /// ([`Self::wait_io`]) or its next request, whichever comes first.
-    pub fn idle_step_paced(&mut self, keys: u64) -> Result<(u64, bool), Error> {
-        if self.packing.is_none() && (self.trunk.debt() > 0 || self.trunk.cascading()) {
-            let t = self.timed.then(std::time::Instant::now);
-            let used = self.trunk.step_paced(&mut self.store, keys)?;
-            self.note_trunk(ns_since(t));
-            return Ok((used.max(1), self.trunk.waiting_io()));
-        }
-        if self.packing.is_none()
-            && !self.trunk.views_owed()
-            && !self.trunk.maplets_owed()
-            && self.trunk.consolidation_owed()
-        {
-            let t = self.timed.then(std::time::Instant::now);
-            let used = self.trunk.consolidate_step(&mut self.store, keys, true)?;
-            self.note_trunk(ns_since(t));
-            return Ok((used.max(1), self.trunk.waiting_io()));
-        }
-        Ok((self.idle_step(keys)?, false))
-    }
-
-    /// Waits, as a task, for the device's next answer to the store: what a paced idle step that
-    /// stopped for a read waits on. False with nothing out.
-    pub async fn wait_io(&mut self) -> Result<bool, Error> {
-        self.store.wait_answer().await
     }
 
     fn note_pack(&mut self, ns: u64) {
@@ -1535,8 +1568,8 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     /// Pays maintenance owed, for the shard's idle time: the packing memtable's whole, then up
-    /// to `budget` keys of the trunk's, then REMIX views of its bundles and the cache's freed
-    /// pages with the budget left.
+    /// to `budget` work units of the trunk's (initial leaf moves, merged keys and filter pages),
+    /// then REMIX views of its bundles and the cache's freed pages with the budget left.
     /// Returns the work done, less than `budget` only once nothing is owed.
     pub fn maintain(&mut self, budget: u64) -> Result<u64, Error> {
         self.finish_packing()?;

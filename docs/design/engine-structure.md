@@ -92,9 +92,26 @@ but its own first part: the work spread over shards, one per core, each owning w
   it.
 - **I/O.** Each range's store attaches to its device's issuer (hyper-block), shared by every
   range on the device, so a device keeps its measured depth whatever the range count.
+- **Active memtable order.** A range's paced idle slices finish the sorts and counter merges
+  already admitted by puts (`HashMem::debt`, `pay`; research/40). They do not sort each new
+  partial tail and merge it with a larger run: that repeats the larger run's rebuild as writes
+  continue. Scans still seal their tail, and explicit maintenance, tidying and packing retain
+  their full ordering rules. With no admitted job, a partial tail does not keep the range awake.
 - **Bounds.** Requests a channel holds; ranges a shard owns (its tasks bound,
   `tasks_per_shard`); batches out at the issuer; the page cache by bytes. Each is a stated bound
   with a typed refusal.
+
+An idle range that reaches a required trunk read yields its work before opening or claiming
+that read. Its task then waits for either a request or an issuer answer through hyper-rt's
+existing bounded channel. The answer channel holds the attachment's admitted batch count,
+claimed once at attachment setup; waiting creates no new channel or per-I/O allocation.
+The channel's register-then-recheck receive and publish-then-wake send are the existing
+hyper-rt handoff protocol (`vendor/hyper-rt/src/sync/mod.rs`, `handoff.rs`; upstream runtime
+design §8). Canceling a borrowed receive consumes no answer, batch credit or buffer. Store
+accounts the numbered answer through the same path as its synchronous consumer, and a later
+consumer can take an interrupted wait's answer. The synchronous answer path remains available.
+Native held-I/O tests cover same-shard request progress, cancellation,
+failed reads and writes, and exact checkpoint recovery (`tests/ranges.rs`, `store_issuer.rs`).
 
 What it is held to: puts and gets per second against RocksDB's `db_bench` at the same thread
 count (`--threads=N`, N shards against N threads), and every operation's p99, p99.9 and p99.99

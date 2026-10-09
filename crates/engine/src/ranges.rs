@@ -12,7 +12,10 @@
 //! the channel full; a client past the bound is refused when it is made. A range's batch is at
 //! most its channel's capacity, and a maintenance slice lasts about the caller's slice budget.
 
+use std::future::Future;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Poll, Waker};
 
 use hyper_block::block::BlockFile;
 use hyper_rt::Runtime;
@@ -67,6 +70,17 @@ struct Request {
     /// Where the answer goes. The range sends it back inside the answer, so the client's
     /// channel closes when a range drops a request unanswered.
     reply: Option<Sender<Request>>,
+    /// Admission travels with the request, including after its client drops while waiting.
+    _lease: Option<Arc<ClientLease>>,
+}
+
+#[derive(Debug)]
+struct ClientLease(Arc<AtomicUsize>);
+
+impl Drop for ClientLease {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl Request {
@@ -83,6 +97,7 @@ impl Request {
             stats: None,
             result: Ok(()),
             reply: None,
+            _lease: None,
         }
     }
 }
@@ -119,38 +134,25 @@ async fn serve<F: BlockFile>(
             hyper_rt::futures::yield_now().await;
             continue;
         }
-        if range.fault.is_none() && db.owed() {
-            if range.maintain(&mut db) {
-                // The maintenance waits on the device: the task parks until the read lands or a
-                // request comes, whichever first, and the shard's other tasks run meanwhile.
-                let next = {
-                    let waited = race2(requests.recv(), db.wait_io()).await;
-                    match waited {
-                        Either::First(request) => Some(request),
-                        Either::Second(Ok(true)) => None,
-                        // Nothing out to wait for: the shard's other tasks first.
-                        Either::Second(Ok(false)) => {
-                            hyper_rt::futures::yield_now().await;
-                            None
-                        }
-                        Either::Second(Err(e)) => {
-                            range.fault = Some(e);
-                            None
-                        }
-                    }
-                };
-                match next {
-                    Some(Ok(request)) => {
+        if range.fault.is_none() && db.idle_owed() {
+            range.maintain(&mut db);
+            if range.fault.is_none() && db.waiting_for_io() {
+                // The same task owns both receivers. A request can interrupt this borrowed
+                // completion wait without consuming its answer or returning its buffer.
+                let ready = race2(requests.recv(), db.wait_completion()).await;
+                match ready {
+                    Either::First(Ok(request)) => {
                         if range.answer(&mut db, request) {
                             return finish(db, &mut requests);
                         }
                     }
-                    Some(Err(_)) => return finish(db, &mut requests),
-                    None => {}
+                    Either::First(Err(_)) => return finish(db, &mut requests),
+                    Either::Second(Ok(_)) => {}
+                    Either::Second(Err(error)) => range.fault = Some(error),
                 }
-                continue;
+            } else {
+                hyper_rt::futures::yield_now().await;
             }
-            hyper_rt::futures::yield_now().await;
             continue;
         }
         match requests.recv().await {
@@ -202,21 +204,17 @@ impl Range {
         stop
     }
 
-    /// One slice of maintenance; a failure is kept as the range's fault. True when it stopped
-    /// for a read still in flight, which the task then waits for as a task.
-    fn maintain<F: BlockFile>(&mut self, db: &mut ShardDb<F>) -> bool {
+    /// One slice of maintenance; a failure is kept as the range's fault. A slice that stopped
+    /// for a read still in flight leaves [`ShardDb::waiting_for_io`] set for the task to await.
+    fn maintain<F: BlockFile>(&mut self, db: &mut ShardDb<F>) {
         let t = std::time::Instant::now();
         let keys = self.slice.keys();
-        match db.idle_step_paced(keys) {
-            Ok((done, waiting)) => {
+        match db.idle_paced_step(keys) {
+            Ok(done) => {
                 let ns = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 self.slice.record(done, ns);
-                waiting
             }
-            Err(e) => {
-                self.fault = Some(e);
-                false
-            }
+            Err(e) => self.fault = Some(e),
         }
     }
 }
@@ -309,7 +307,7 @@ pub struct Ranges {
     starts: Vec<Vec<u8>>,
     senders: Vec<Sender<Request>>,
     /// Clients live now, at most `clients`.
-    live: AtomicUsize,
+    live: Arc<AtomicUsize>,
     clients: usize,
     spin_ns: u64,
 }
@@ -363,7 +361,7 @@ impl Ranges {
         Ok(Self {
             starts,
             senders,
-            live: AtomicUsize::new(0),
+            live: Arc::new(AtomicUsize::new(0)),
             clients,
             spin_ns,
         })
@@ -388,13 +386,17 @@ impl Ranges {
                 });
             }
         };
+        let lease = Arc::new(ClientLease(Arc::clone(&self.live)));
         Ok(Client {
             ranges: self,
             request: Some(Request {
                 reply: Some(reply),
+                _lease: Some(Arc::clone(&lease)),
                 ..Request::new()
             }),
             answers,
+            barrier: None,
+            _lease: lease,
         })
     }
 
@@ -429,20 +431,80 @@ impl Ranges {
         }
         first
     }
+
+    /// Stops every range from a hyper-rt task. A future owning these ranges closes their
+    /// request channels if dropped; borrowed client waits can instead be canceled and resumed.
+    pub async fn stop_async(self) -> Result<(), Error> {
+        let mut client = self.client()?;
+        client.barrier_async(BarrierAsk::Stop).await
+    }
 }
 
 /// A caller's handle on the ranges: one request out at a time, its buffers reused.
 #[derive(Debug)]
 pub struct Client<'a> {
     ranges: &'a Ranges,
-    /// The request and its buffers while none is out; none after a range was lost with it.
+    /// The request and its buffers while none is out; none while a range owns it, or after
+    /// that range dropped it unanswered. Canceling a borrowed async wait keeps it outstanding.
     request: Option<Request>,
     answers: ChannelReceiver<Request>,
+    barrier: Option<Barrier>,
+    /// The client and its orphaned request share admission until both have retired.
+    _lease: Arc<ClientLease>,
 }
 
-impl Drop for Client<'_> {
-    fn drop(&mut self) {
-        self.ranges.live.fetch_sub(1, Ordering::AcqRel);
+#[derive(Clone, Copy, Debug)]
+enum BarrierAsk {
+    Checkpoint(u64),
+    Flush,
+    Stop,
+}
+
+impl BarrierAsk {
+    fn ask(self) -> Ask {
+        match self {
+            Self::Checkpoint(applied) => Ask::Checkpoint(applied),
+            Self::Flush => Ask::Flush,
+            Self::Stop => Ask::Stop,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Barrier {
+    ask: BarrierAsk,
+    /// The next range to attempt; advances after send, including a stop send refusal,
+    /// before waiting for any published answer.
+    next: usize,
+    first: Option<Error>,
+}
+
+/// The public task waker constructor preserves slot-only encoding on 32-bit targets.
+/// No client affinity is stored: any current hyper-rt task may own the borrowed wait.
+fn client_task(waker: &Waker) -> bool {
+    hyper_rt::futures::current_task()
+        .is_some_and(|task| hyper_rt::waker::waker_for(task.0).will_wake(waker))
+}
+
+async fn async_context() -> Result<(), Error> {
+    std::future::poll_fn(|cx| {
+        Poll::Ready(if client_task(cx.waker()) {
+            Ok(())
+        } else {
+            Err(receive_error(SyncError::NotOnShardThread(())))
+        })
+    })
+    .await
+}
+
+fn receive_error(error: SyncError<()>) -> Error {
+    match error {
+        SyncError::Closed(()) => Error::Gone {
+            what: "a range's shard",
+        },
+        SyncError::Full(()) | SyncError::NotOnShardThread(()) => Error::InvalidArgument {
+            what: "an asynchronous range client outside its hyper-rt task",
+        },
     }
 }
 
@@ -462,16 +524,8 @@ impl Client<'_> {
         self.answers.blocking_recv().ok()
     }
 
-    /// Sends the request `fill` makes to `range` and waits for its answer.
-    fn call(
-        &mut self,
-        range: usize,
-        fill: impl FnOnce(&mut Request),
-    ) -> Result<&mut Request, Error> {
-        let gone = Error::Gone {
-            what: "a range's shard",
-        };
-        let mut request = self.request.take().ok_or(gone.clone())?;
+    /// Publishes one request; refusal returns its buffers and admission to the client.
+    fn send(&mut self, range: usize, fill: impl FnOnce(&mut Request)) -> Result<(), Error> {
         let sender = self
             .ranges
             .senders
@@ -479,26 +533,162 @@ impl Client<'_> {
             .ok_or(Error::InvalidArgument {
                 what: "a range the node does not have",
             })?;
+        let mut request = self.request.take().ok_or(Error::Gone {
+            what: "a range's shard",
+        })?;
         fill(&mut request);
         request.result = Ok(());
         match sender.try_send(request) {
-            Ok(()) => {}
+            Ok(()) => Ok(()),
             Err(SyncError::Full(request)) => {
                 self.request = Some(request);
-                return Err(Error::LimitExceeded {
+                Err(Error::LimitExceeded {
                     what: "a range's request channel",
                     limit: u64::try_from(self.ranges.clients).unwrap_or(u64::MAX),
-                });
+                })
             }
             Err(SyncError::Closed(request) | SyncError::NotOnShardThread(request)) => {
                 self.request = Some(request);
-                return Err(gone);
+                Err(Error::Gone {
+                    what: "a range's shard",
+                })
             }
         }
-        let answer = self.wait().ok_or(gone)?;
+    }
+
+    fn accept(&mut self, answer: Request) -> Result<&mut Request, Error> {
         let request = self.request.insert(answer);
         request.result.clone()?;
         Ok(request)
+    }
+
+    fn prepare(&mut self) -> Result<(), Error> {
+        if self.barrier.is_some() {
+            return Err(Error::InvalidArgument {
+                what: "an asynchronous range barrier still to finish",
+            });
+        }
+        if self.request.is_none() {
+            let answer = self.wait().ok_or(Error::Gone {
+                what: "a range's shard",
+            })?;
+            self.accept(answer)?;
+        }
+        Ok(())
+    }
+
+    /// Sends the request `fill` makes to `range` and waits for its answer.
+    fn call(
+        &mut self,
+        range: usize,
+        fill: impl FnOnce(&mut Request),
+    ) -> Result<&mut Request, Error> {
+        self.prepare()?;
+        self.send(range, fill)?;
+        let answer = self.wait().ok_or(Error::Gone {
+            what: "a range's shard",
+        })?;
+        self.accept(answer)
+    }
+
+    /// Context is checked before every receive poll, including a queued answer. A refusal
+    /// leaves ownership and barrier progress intact; it is distinct from a received error.
+    async fn answer_async(&mut self) -> Result<Result<(), Error>, SyncError<()>> {
+        let answer = {
+            let mut recv = std::pin::pin!(self.answers.recv());
+            std::future::poll_fn(|cx| {
+                if client_task(cx.waker()) {
+                    recv.as_mut().poll(cx)
+                } else {
+                    Poll::Ready(Err(SyncError::NotOnShardThread(())))
+                }
+            })
+            .await?
+        };
+        Ok(self.accept(answer).map(drop))
+    }
+
+    /// Finishes the one published request and any canceled barrier's undispatched ranges.
+    /// An unanswered request lost its buffers: it cannot be replaced or replayed.
+    async fn finish_async(&mut self) -> Result<(), Error> {
+        async_context().await?;
+        loop {
+            if self.request.is_none() {
+                let answered = match self.answer_async().await {
+                    Ok(result) => result,
+                    Err(error @ SyncError::Closed(())) => {
+                        self.barrier = None;
+                        return Err(receive_error(error));
+                    }
+                    Err(error) => return Err(receive_error(error)),
+                };
+                if let Err(error) = answered {
+                    if let Some(barrier) = self.barrier.as_mut()
+                        && matches!(barrier.ask, BarrierAsk::Stop)
+                    {
+                        barrier.first.get_or_insert(error);
+                        continue;
+                    }
+                    self.barrier = None;
+                    return Err(error);
+                }
+            }
+            let Some(barrier) = self.barrier.as_ref() else {
+                return Ok(());
+            };
+            if barrier.next == self.ranges.len() {
+                return self
+                    .barrier
+                    .take()
+                    .and_then(|barrier| barrier.first)
+                    .map_or(Ok(()), Err);
+            }
+            let range = barrier.next;
+            let ask = barrier.ask;
+            let next = range.checked_add(1).ok_or(Error::InvalidArgument {
+                what: "a range barrier beyond the node's ranges",
+            })?;
+            // A canceled wait may be resumed by another executor; check at each publication.
+            async_context().await?;
+            let sent = self.send(range, |request| request.ask = ask.ask());
+            if let Some(barrier) = self.barrier.as_mut() {
+                barrier.next = next;
+            }
+            if let Err(error) = sent {
+                if let Some(barrier) = self.barrier.as_mut()
+                    && matches!(barrier.ask, BarrierAsk::Stop)
+                {
+                    barrier.first.get_or_insert(error);
+                    continue;
+                }
+                self.barrier = None;
+                return Err(error);
+            }
+        }
+    }
+
+    async fn call_async(
+        &mut self,
+        range: usize,
+        fill: impl FnOnce(&mut Request),
+    ) -> Result<&mut Request, Error> {
+        self.finish_async().await?;
+        async_context().await?;
+        self.send(range, fill)?;
+        self.answer_async().await.map_err(receive_error)??;
+        self.request.as_mut().ok_or(Error::Gone {
+            what: "a range's shard",
+        })
+    }
+
+    async fn barrier_async(&mut self, ask: BarrierAsk) -> Result<(), Error> {
+        self.finish_async().await?;
+        self.barrier = Some(Barrier {
+            ask,
+            next: 0,
+            first: None,
+        });
+        self.finish_async().await
     }
 
     /// Records `key` holding `value`.
@@ -538,6 +728,48 @@ impl Client<'_> {
         Ok(r.found)
     }
 
+    /// Records a value from a hyper-rt task, yielding for the same bounded reply channel.
+    /// Canceling this borrowed wait leaves its request outstanding. The next async operation
+    /// recovers its answer and reports its error before publishing another request.
+    pub async fn put_async(&mut self, key: &[u8], value: &[u8]) -> Result<(), Error> {
+        let range = self.ranges.range_of(key);
+        self.call_async(range, |r| {
+            r.ask = Ask::Put;
+            r.key.clear();
+            r.key.extend_from_slice(key);
+            r.value.clear();
+            r.value.extend_from_slice(value);
+        })
+        .await
+        .map(drop)
+    }
+
+    /// Records a deletion from a hyper-rt task; cancellation never republishes it.
+    pub async fn delete_async(&mut self, key: &[u8]) -> Result<(), Error> {
+        let range = self.ranges.range_of(key);
+        self.call_async(range, |r| {
+            r.ask = Ask::Delete;
+            r.key.clear();
+            r.key.extend_from_slice(key);
+        })
+        .await
+        .map(drop)
+    }
+
+    /// A hyper-rt task's get, with the same swapped value buffer as `get`.
+    pub async fn get_async(&mut self, key: &[u8], value: &mut Vec<u8>) -> Result<bool, Error> {
+        let range = self.ranges.range_of(key);
+        let r = self
+            .call_async(range, |r| {
+                r.ask = Ask::Get;
+                r.key.clear();
+                r.key.extend_from_slice(key);
+            })
+            .await?;
+        std::mem::swap(value, &mut r.value);
+        Ok(r.found)
+    }
+
     /// A page of `[from, end)` as `ShardDb::scan` gives one, across ranges: up to `limit` rows
     /// appended to `out` in key order; true when the page filled first, with the key to continue
     /// from in `next`. Nothing is allocated once the client's buffers, `out` and `next` have
@@ -550,6 +782,7 @@ impl Client<'_> {
         out: &mut Rows,
         next: &mut Vec<u8>,
     ) -> Result<bool, Error> {
+        self.prepare()?;
         let ranges = self.ranges;
         let mut range = ranges.range_of(from);
         let mut left = limit;
@@ -598,6 +831,68 @@ impl Client<'_> {
         }
     }
 
+    /// The same cross-range page as `scan`, yielding on its bounded replies. Canceling may
+    /// leave a prefix appended to `out`; discard that incomplete page before another scan.
+    /// The next operation recovers the outstanding reply without replaying the abandoned scan.
+    pub async fn scan_async(
+        &mut self,
+        from: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+        out: &mut Rows,
+        next: &mut Vec<u8>,
+    ) -> Result<bool, Error> {
+        self.finish_async().await?;
+        let ranges = self.ranges;
+        let mut range = ranges.range_of(from);
+        let mut left = limit;
+        if let Some(r) = self.request.as_mut() {
+            r.key.clear();
+            r.key.extend_from_slice(from);
+        }
+        loop {
+            // The range's own end, or the scan's when it comes first; the last range asked is
+            // the one whose end the scan's reaches.
+            let bound = ranges.starts.get(range.saturating_add(1));
+            let (stop, last): (Option<&[u8]>, bool) = match (bound, end) {
+                (None, e) => (e, true),
+                (Some(b), Some(e)) if e <= b.as_slice() => (Some(e), true),
+                (Some(b), _) => (Some(b.as_slice()), false),
+            };
+            let r = self
+                .call_async(range, |r| {
+                    r.end.clear();
+                    if let Some(stop) = stop {
+                        r.end.extend_from_slice(stop);
+                    }
+                    r.ask = Ask::Scan {
+                        bounded: stop.is_some(),
+                        limit: left,
+                    };
+                })
+                .await?;
+            left = left.saturating_sub(r.rows.len());
+            out.append(&mut r.rows);
+            if r.more {
+                next.clear();
+                next.extend_from_slice(&r.next);
+                return Ok(true);
+            }
+            if last {
+                return Ok(false);
+            }
+            range = range.saturating_add(1);
+            let start = ranges.starts.get(range).map_or(&[][..], Vec::as_slice);
+            if left == 0 {
+                next.clear();
+                next.extend_from_slice(start);
+                return Ok(true);
+            }
+            r.key.clear();
+            r.key.extend_from_slice(start);
+        }
+    }
+
     /// Makes every range's state through `applied` durable (`ShardDb::checkpoint`).
     pub fn checkpoint(&mut self, applied: u64) -> Result<(), Error> {
         for range in 0..self.ranges.len() {
@@ -621,6 +916,30 @@ impl Client<'_> {
             let r = self.call(range, |r| r.ask = Ask::Stats)?;
             if let Some(s) = r.stats.take() {
                 all.push(s);
+            }
+        }
+        Ok(all)
+    }
+
+    /// Makes every range durable from a hyper-rt task. A canceled barrier finishes its
+    /// undispatched ranges before a later async operation; published requests are not replayed.
+    pub async fn checkpoint_async(&mut self, applied: u64) -> Result<(), Error> {
+        self.barrier_async(BarrierAsk::Checkpoint(applied)).await
+    }
+
+    /// Completes every range's full flush, with the same cancellation rule as checkpoint.
+    pub async fn flush_async(&mut self) -> Result<(), Error> {
+        self.barrier_async(BarrierAsk::Flush).await
+    }
+
+    /// Each range's counters from a hyper-rt task, in range order.
+    pub async fn stats_async(&mut self) -> Result<Vec<RangeStats>, Error> {
+        self.finish_async().await?;
+        let mut all = Vec::with_capacity(self.ranges.len());
+        for range in 0..self.ranges.len() {
+            let r = self.call_async(range, |r| r.ask = Ask::Stats).await?;
+            if let Some(stats) = r.stats.take() {
+                all.push(stats);
             }
         }
         Ok(all)

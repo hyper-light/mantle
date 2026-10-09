@@ -27,7 +27,7 @@ use crate::fst::trie::TrieBuilder;
 use alloc::Allocator;
 use hyper_block::block::BlockFile;
 use hyper_block::buf::AlignedBuf;
-use hyper_block::issuer::{Attached, Issuer};
+use hyper_block::issuer::{Answer, Attached, Issuer};
 use page::{HEADER, Kind};
 use std::collections::VecDeque;
 use superblock::Superblock;
@@ -280,7 +280,7 @@ impl Span {
     /// The read handed to the issuer for the span that covers `address`: its place in the
     /// span's reads.
     fn pending_for(&self, address: u64) -> Option<usize> {
-        self.pending.iter().position(|&(_, first, pages)| {
+        self.pending.iter().position(|&(_, first, pages, _)| {
             address
                 .checked_sub(first)
                 .is_some_and(|i| i < u64::from(pages))
@@ -319,11 +319,14 @@ pub struct Span {
     /// compaction, which reads its inputs to their end.
     floor: u32,
     /// Reads handed to the device's issuer for this span, in address order: each one's batch
-    /// number, first page and pages ([`Store::prefetch`]); and how many extents it reads ahead,
-    /// one more each time its compaction finds a page not yet landed, up to the batches: the
-    /// device's latency over the time the compaction takes through an extent, found as it runs.
-    pending: VecDeque<(u64, u64, u32)>,
+    /// number, first page, pages and whether its delay has widened the lookahead. Each late
+    /// read adds one extent, up to the batches; polling it again is not a new observation of
+    /// the device's latency over the time the compaction takes through an extent.
+    pending: VecDeque<(u64, u64, u32, bool)>,
     depth: usize,
+    /// The next memory-ready payload, held across a builder's intervening cache admission or
+    /// write submission. One pooled page; it does not replace the current leaf's bytes.
+    prepared: Option<(u64, Vec<u8>)>,
 }
 
 fn io(op: &'static str, e: impl std::fmt::Display) -> Error {
@@ -753,6 +756,11 @@ impl<F: BlockFile> Store<F> {
         self.alloc.refs()
     }
 
+    /// Whether a failed write or flush has stopped further writes until the file is reopened.
+    pub(crate) fn fenced(&self) -> bool {
+        self.fenced
+    }
+
     fn fence<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
         if result.is_err() {
             self.fenced = true;
@@ -950,11 +958,10 @@ impl<F: BlockFile> Store<F> {
                 what: "a page written outside a held extent",
             });
         }
-        // The page enters the cache as it is written, as SplinterDB writes through its cache
-        // (research/34 §1): a page just compacted is read without I/O, as the OS's cache serves
-        // a buffered write. A page never read again leaves first (S3-FIFO's small queue).
-        if let Some(c) = self.cache.as_mut() {
-            c.insert(address, payload);
+        if payload.len() > self.page_capacity() {
+            return Err(Error::InvalidArgument {
+                what: "a page payload longer than the page",
+            });
         }
         let continues = run.pages > 0
             && run.first.checked_add(u64::from(run.pages)) == Some(address)
@@ -980,6 +987,11 @@ impl<F: BlockFile> Store<F> {
             .copy_from_slice(payload);
         let generation = self.durable.generation.saturating_add(1);
         page::seal(page, address, Kind::Node, generation, payload.len())?;
+        // Only a validated, sealed page enters the write-through cache (research/34 §1).
+        // A page just compacted can be read from memory while its run waits for the device.
+        if let Some(c) = self.cache.as_mut() {
+            c.insert(address, payload);
+        }
         run.pages = run.pages.saturating_add(1);
         // The run ends with its extent.
         if self
@@ -1157,32 +1169,52 @@ impl<F: BlockFile> Store<F> {
             w.attached.try_answer()
         };
         let answered = answered.map_err(|e| io("take a store page run's answer", e));
+        self.accept_answer(answered)
+    }
+
+    /// Whether an issued read or write can still deliver an answer.
+    pub(crate) fn io_outstanding(&self) -> bool {
+        self.writer.as_ref().is_some_and(|w| w.attached.out() > 0)
+    }
+
+    /// Waits for one issued read or write through the attachment's reusable completion
+    /// channel. Canceling this borrowed wait leaves its number, buffer and credit owned by
+    /// the attachment; a later synchronous or asynchronous consumer takes the same answer.
+    /// Returns false when no transfer is out. A read error is kept for its span; a write
+    /// error fences the store, as with the synchronous answer path.
+    pub async fn wait_completion(&mut self) -> Result<bool, Error> {
+        let Some(w) = self.writer.as_mut().filter(|w| w.attached.out() > 0) else {
+            return Ok(false);
+        };
+        let answered = match w.attached.answer_async().await {
+            Ok(answered) => Ok(Some(answered)),
+            Err(error) => {
+                // A pending receive outside a runtime task was refused without consuming
+                // any transfer. It is caller misuse, rather than a failed device/channel.
+                let refused = matches!(
+                    &error,
+                    hyper_block::DiskError::Io { source, .. }
+                        if source.kind() == std::io::ErrorKind::InvalidInput
+                );
+                let error = io("take a store page run's answer", error);
+                if refused {
+                    return Err(error);
+                }
+                Err(error)
+            }
+        };
+        self.accept_answer(answered)
+    }
+
+    /// Accounts a numbered answer once, regardless of how its consumer waited for it.
+    fn accept_answer(
+        &mut self,
+        answered: Result<Option<(u64, Answer)>, Error>,
+    ) -> Result<bool, Error> {
         let Some(numbered) = self.fence(answered)? else {
             return Ok(false);
         };
         self.route(numbered)
-    }
-
-    /// Waits, as a hyper-rt task, for the device's next answer, takes it as [`Self::answer`]
-    /// does and hands queued runs on into the room it leaves: the shard's thread runs its other
-    /// tasks meanwhile. False with nothing out, nothing to wait for. Dropped before the answer
-    /// comes, it leaves the answer queued for the next wait or take.
-    pub async fn wait_answer(&mut self) -> Result<bool, Error> {
-        let Some(w) = self.writer.as_mut() else {
-            return Ok(false);
-        };
-        if w.attached.out() == 0 {
-            return Ok(false);
-        }
-        let answered = w
-            .attached
-            .answer_async()
-            .await
-            .map_err(|e| io("take a store page run's answer", e));
-        let numbered = self.fence(answered)?;
-        self.route(numbered)?;
-        self.pump()?;
-        Ok(true)
     }
 
     /// Routes one answer: a read's to its span (or its buffers to the pool when the span is
@@ -1202,6 +1234,11 @@ impl<F: BlockFile> Store<F> {
             }
             Some(orphan.is_some())
         });
+        if read.is_some() && answer.is_err() {
+            // Each prefetch lends one buffer. The issuer drops it on a failed batch, so no
+            // later claim or orphan release can return that loan to the pool.
+            self.lent = self.lent.saturating_sub(1);
+        }
         match read {
             Some(true) => {
                 for b in answer.unwrap_or_default() {
@@ -1268,6 +1305,12 @@ impl<F: BlockFile> Store<F> {
         {
             self.answer(true)?;
             self.pump()?;
+        }
+        if self.fenced {
+            return Err(io(
+                "drain store page runs",
+                "the store was fenced by a failed write or flush",
+            ));
         }
         Ok(())
     }
@@ -1460,6 +1503,7 @@ impl<F: BlockFile> Store<F> {
             floor: 1,
             pending: VecDeque::new(),
             depth: 1,
+            prepared: None,
         })
     }
 
@@ -1475,11 +1519,15 @@ impl<F: BlockFile> Store<F> {
             floor: extent,
             pending: VecDeque::new(),
             depth: 1,
+            prepared: None,
         })
     }
 
     /// Takes back a span its scan is done with.
     pub fn give_span(&mut self, mut span: Span) {
+        if let Some((_, page)) = span.prepared.take() {
+            self.give_page(page);
+        }
         while let Some((number, ..)) = span.pending.pop_front() {
             self.release_read(number);
         }
@@ -1515,6 +1563,8 @@ impl<F: BlockFile> Store<F> {
             || span.pending.len() >= span.depth
             || span.holds(address)
             || span.pending_for(address).is_some()
+            || (!self.fenced && span.prepared.as_ref().is_some_and(|(a, _)| *a == address))
+            || self.cache.as_ref().is_some_and(|c| c.contains(address))
         {
             return Ok(());
         }
@@ -1556,13 +1606,17 @@ impl<F: BlockFile> Store<F> {
         let Some(w) = self.writer.as_mut() else {
             return Ok(());
         };
-        let number = w
-            .attached
-            .submit_reads(vec![(buf, offset)])
-            .map_err(|e| io("hand a store page span read to the issuer", e))?;
+        let number = match w.attached.submit_reads(vec![(buf, offset)]) {
+            Ok(number) => number,
+            Err(error) => {
+                // Refusal drops the one consumed buffer before any read number is recorded.
+                self.lent = self.lent.saturating_sub(1);
+                return Err(io("hand a store page span read to the issuer", error));
+            }
+        };
         w.reads.push(number);
         w.read_wanted = false;
-        span.pending.push_back((number, address, pages));
+        span.pending.push_back((number, address, pages, false));
         self.io.prefetches = self.io.prefetches.saturating_add(1);
         self.io.reads = self.io.reads.saturating_add(1);
         self.io.pages_read = self.io.pages_read.saturating_add(u64::from(pages));
@@ -1570,7 +1624,8 @@ impl<F: BlockFile> Store<F> {
     }
 
     /// Whether a compaction's `span` can read `address` without waiting for the device: held,
-    /// or its read ahead landed. Otherwise the read is handed to the issuer if it is not yet
+    /// resident in memory with no pending target read, or its read ahead landed. Otherwise the
+    /// read is handed to the issuer if it is not yet
     /// ([`Self::prefetch`]) and the answer is no: the compaction stops for now and goes on
     /// once it has landed, rather than hold the put that paces it behind the device. A scan's
     /// span, or a store with no issuer, always reads at once.
@@ -1578,7 +1633,53 @@ impl<F: BlockFile> Store<F> {
         if span.floor <= 1 || self.writer.is_none() || span.holds(address) {
             return Ok(true);
         }
-        self.reap()?;
+        let reaped = self.reap();
+        if self.fenced
+            && let Some((_, page)) = span.prepared.take()
+        {
+            self.give_page(page);
+        }
+        reaped?;
+        // A pending target is claimed first. Otherwise keep a memory-ready payload: the
+        // builder may evict its cache slot or submit its queued run before the cursor reads it.
+        if span.pending_for(address).is_none() && !self.fenced {
+            if span.prepared.as_ref().is_some_and(|(a, _)| *a == address) {
+                return Ok(true);
+            }
+            if self.cache.as_ref().is_some_and(|c| c.contains(address))
+                || self
+                    .first_queued(address, address.saturating_add(1))
+                    .is_some()
+            {
+                let mut page = match span.prepared.take() {
+                    Some((_, mut page)) => {
+                        page.clear();
+                        page
+                    }
+                    None => self.take_page(),
+                };
+                let copied = if self
+                    .cache
+                    .as_ref()
+                    .is_some_and(|c| c.peek(address, &mut page))
+                {
+                    self.io.span_cache_hits = self.io.span_cache_hits.saturating_add(1);
+                    Ok(true)
+                } else {
+                    self.queued_page(address, &mut page)
+                };
+                match copied {
+                    Ok(true) => {
+                        span.prepared = Some((address, page));
+                        return Ok(true);
+                    }
+                    result => {
+                        self.give_page(page);
+                        result?;
+                    }
+                }
+            }
+        }
         if span.pending_for(address).is_none() {
             // Reads ahead of somewhere else were mispredicted: let them go, and read this.
             while let Some((number, ..)) = span.pending.pop_front() {
@@ -1596,11 +1697,25 @@ impl<F: BlockFile> Store<F> {
             });
         let size =
             u64::try_from(self.config.page_size).map_err(|_| corrupt(Malformed::TooLarge))?;
-        let past_end = address >= self.end.checked_div(size).unwrap_or(0);
+        // Past the answered file end can still be a valid page whose write has not landed.
+        // Without held memory, reading it would settle that write and block the paced step.
+        let writing = self.writer.as_ref().is_some_and(|w| {
+            w.in_flight
+                .iter()
+                .any(|&(_, first, end, _)| first <= address && address < end)
+        });
+        let past_end = address >= self.end.checked_div(size).unwrap_or(0) && !writing;
         if !landed && !past_end {
             self.io.prefetch_waits = self.io.prefetch_waits.saturating_add(1);
-            let most = self.writer.as_ref().map_or(1, |w| w.attached.batches());
-            span.depth = span.depth.saturating_add(1).min(most.max(1));
+            if let Some((_, _, _, late)) = span
+                .pending_for(address)
+                .and_then(|i| span.pending.get_mut(i))
+                && !*late
+            {
+                *late = true;
+                let most = self.writer.as_ref().map_or(1, |w| w.attached.batches());
+                span.depth = span.depth.saturating_add(1).min(most.max(1));
+            }
         }
         Ok(landed || past_end)
     }
@@ -1633,7 +1748,7 @@ impl<F: BlockFile> Store<F> {
     ) -> Result<(), Error> {
         let started = self.timed.then(std::time::Instant::now);
         let read = self
-            .read_page_ahead_timed(span, address, out)
+            .read_page_ahead_timed(span, address, out, false)
             .and_then(|range| {
                 if let Some(range) = range {
                     out.extend_from_slice(
@@ -1656,7 +1771,7 @@ impl<F: BlockFile> Store<F> {
         out: &mut Vec<u8>,
     ) -> Result<Option<std::ops::Range<usize>>, Error> {
         let started = self.timed.then(std::time::Instant::now);
-        let read = self.read_page_ahead_timed(span, address, out);
+        let read = self.read_page_ahead_timed(span, address, out, true);
         self.io.ahead_ns = self.io.ahead_ns.saturating_add(elapsed_ns(started));
         read
     }
@@ -1666,15 +1781,31 @@ impl<F: BlockFile> Store<F> {
         span: &mut Span,
         address: u64,
         out: &mut Vec<u8>,
+        transfer: bool,
     ) -> Result<Option<std::ops::Range<usize>>, Error> {
-        if let Some(i) = span.pending_for(address) {
+        let pending = span.pending_for(address);
+        if let Some((prepared, mut page)) = span.prepared.take() {
+            let copied = prepared == address && pending.is_none() && !self.fenced;
+            if copied {
+                if transfer && out.is_empty() {
+                    std::mem::swap(out, &mut page);
+                } else {
+                    out.extend_from_slice(&page);
+                }
+            }
+            self.give_page(page);
+            if copied {
+                return Ok(None);
+            }
+        }
+        if let Some(i) = pending {
             // Read ahead: its extent becomes the span's, and reads ahead of extents passed go.
             for _ in 0..i {
                 if let Some((number, ..)) = span.pending.pop_front() {
                     self.release_read(number);
                 }
             }
-            let (number, first, pages) = span
+            let (number, first, pages, _) = span
                 .pending
                 .pop_front()
                 .ok_or(corrupt(Malformed::Truncated))?;

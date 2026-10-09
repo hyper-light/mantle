@@ -77,3 +77,7 @@ harness = false
 [[bench]]
 name = "seek_cursor"
 harness = false
+
+[[bench]]
+name = "active_order"
+harness = false

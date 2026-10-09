@@ -14,8 +14,14 @@
 )]
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
+use hyper_block::DiskError;
+use hyper_block::block::BlockFile;
 use hyper_block::buf::Alignment;
+use hyper_block::file::{CachingRequest, DeviceFile};
+use hyper_block::issuer::Issuer;
 use hyper_block::sim::SimFile;
 use hyper_rt::{Runtime, RuntimeConfig};
 use mantle_engine::Error;
@@ -257,4 +263,171 @@ fn ranges_must_ascend_from_the_empty_key() {
         ));
     }
     runtime.shutdown().unwrap();
+}
+
+#[derive(Default)]
+struct ReadGate {
+    held: AtomicBool,
+    entered: AtomicUsize,
+    shard: Mutex<Option<std::thread::ThreadId>>,
+}
+
+struct Gated {
+    file: DeviceFile,
+    gate: Arc<ReadGate>,
+}
+
+impl BlockFile for Gated {
+    fn alignment(&self) -> Alignment {
+        self.file.alignment()
+    }
+
+    fn len(&self) -> Result<u64, DiskError> {
+        self.file.len()
+    }
+
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), DiskError> {
+        if self.gate.held.load(Ordering::SeqCst) {
+            // A regression to a synchronous owner read must fail, rather than holding the
+            // shard that needs to answer the probe request below.
+            if *self.gate.shard.lock().unwrap() == Some(std::thread::current().id()) {
+                return Err(DiskError::Io {
+                    op: "range read blocked its runtime shard",
+                    path: std::path::PathBuf::new(),
+                    source: std::io::Error::other("range read blocked its runtime shard"),
+                });
+            }
+            self.gate.entered.fetch_add(1, Ordering::SeqCst);
+            while self.gate.held.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+        }
+        self.file.read_exact_at(buf, offset)
+    }
+
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError> {
+        self.file.write_all_at(buf, offset)
+    }
+
+    fn sync_data(&self) -> Result<(), DiskError> {
+        self.file.sync_data()
+    }
+
+    fn try_clone(&self) -> Result<Self, DiskError> {
+        Ok(Self {
+            file: self.file.try_clone()?,
+            gate: Arc::clone(&self.gate),
+        })
+    }
+}
+
+struct OpenOnDrop(Arc<ReadGate>);
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        self.0.held.store(false, Ordering::SeqCst);
+    }
+}
+
+fn native_db(path: &std::path::Path, gate: Arc<ReadGate>) -> ShardDb<Gated> {
+    let file = Gated {
+        file: DeviceFile::open(
+            path,
+            true,
+            CachingRequest::Buffered,
+            Alignment::new(4096).unwrap(),
+        )
+        .unwrap(),
+        gate,
+    };
+    ShardDb::create(file, STORE, MEM, TRUNK).unwrap()
+}
+
+/// Both engines share one runtime thread. A required maintenance read on the first range
+/// leaves that thread available to answer the first range's stats request and another
+/// range's put/get. The completion then resumes exact values and a durable checkpoint.
+#[test]
+fn a_held_maintenance_read_leaves_the_shard_available_for_range_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Arc::new(ReadGate::default());
+    let first_path = dir.path().join("first");
+    let mut first = native_db(&first_path, Arc::clone(&gate));
+    let mut oracle = BTreeMap::new();
+    // Values span separate leaves. Several full memtables leave a cascade owed after puts,
+    // so idle preparation needs cold input pages rather than merely tidying the memtable.
+    for i in 0..TRUNK.leaf_entries {
+        let key = format!("a{i:04}").into_bytes();
+        let value = vec![i as u8; STORE.page_size / 2];
+        first.put(&key, &value).unwrap();
+        oracle.insert(key, value);
+    }
+    first.land().unwrap();
+    assert!(first.owed());
+    first.set_cache(0);
+    first.set_write_budget(STORE.page_size * STORE.extent_pages as usize);
+    let issuer = Issuer::start_for(dir.path(), 1, 1).unwrap();
+    first.attach(&issuer, 1).unwrap();
+    let second = native_db(&dir.path().join("second"), Arc::default());
+    let runtime = Runtime::start(&config(1)).unwrap();
+    let (thread, on_shard) = std::sync::mpsc::sync_channel(1);
+    runtime
+        .spawn_on(runtime.shard_ids()[0], async move {
+            thread.send(std::thread::current().id()).unwrap();
+        })
+        .unwrap();
+    *gate.shard.lock().unwrap() = Some(on_shard.recv().unwrap());
+    // Open the device before Runtime/Issuer teardown if an oracle fails while it is held.
+    let open = OpenOnDrop(Arc::clone(&gate));
+    gate.held.store(true, Ordering::SeqCst);
+    let ranges = Ranges::start(
+        &runtime,
+        vec![(Vec::new(), first), (b"m".to_vec(), second)],
+        ranges_config(1),
+    )
+    .unwrap();
+    let mut client = ranges.client().unwrap();
+    // Every response is evidence that the shard runs while preparation advances. The input
+    // count bounds the probes; an absent cold read fails instead of waiting forever for it.
+    for _ in 0..oracle.len() {
+        client.stats().unwrap();
+        if gate.entered.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+    }
+    assert!(gate.entered.load(Ordering::SeqCst) > 0);
+    client.stats().unwrap();
+    client
+        .put(b"z-unrelated", b"progress while read is held")
+        .unwrap();
+    let mut out = Vec::new();
+    assert!(client.get(b"z-unrelated", &mut out).unwrap());
+    assert_eq!(out, b"progress while read is held");
+    gate.held.store(false, Ordering::SeqCst);
+    client.flush().unwrap();
+    client.checkpoint(1).unwrap();
+    for (key, expected) in &oracle {
+        assert!(client.get(key, &mut out).unwrap());
+        assert_eq!(&out, expected);
+    }
+    drop(client);
+    ranges.stop().unwrap();
+    runtime.shutdown().unwrap();
+    drop(open);
+    let file = Gated {
+        file: DeviceFile::open(
+            &first_path,
+            false,
+            CachingRequest::Buffered,
+            Alignment::new(4096).unwrap(),
+        )
+        .unwrap(),
+        gate,
+    };
+    let (mut recovered, applied) = ShardDb::open(file, STORE, MEM, TRUNK).unwrap();
+    assert_eq!(applied, 1);
+    recovered.check_references().unwrap();
+    for (key, expected) in &oracle {
+        assert!(recovered.get(key, &mut out).unwrap());
+        assert_eq!(&out, expected);
+    }
 }

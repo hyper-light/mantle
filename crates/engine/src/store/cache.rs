@@ -195,6 +195,13 @@ impl Cache {
         }
     }
 
+    /// Whether the page can be read from memory, without counting or promoting the look.
+    pub fn contains(&self, address: u64) -> bool {
+        self.slot_of(address)
+            .and_then(|i| self.bufs.get(i))
+            .is_some()
+    }
+
     /// Caches `payload` for `address`, evicting by the module's rule if the cache is full. A
     /// payload longer than a slot is not cached.
     pub fn insert(&mut self, address: u64, payload: &[u8]) {

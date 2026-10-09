@@ -1582,6 +1582,13 @@ impl Branch {
     }
 }
 
+/// One bounded move while positioning a private compaction cursor.
+pub(super) enum Initial {
+    Waiting,
+    More,
+    Done,
+}
+
 impl RunCursor {
     /// A cursor at no entry yet, its page and span from `store`'s pools, for a scan: [`Self::place`]
     /// puts it on one.
@@ -1667,6 +1674,48 @@ impl RunCursor {
             return self.load();
         }
         self.next_leaf(branch, store)
+    }
+
+    /// A compaction cursor with its first logical leaf selected, without reading it.
+    pub(super) fn prepare<F: BlockFile>(
+        branch: &Branch,
+        store: &mut Store<F>,
+        from: &[u8],
+    ) -> Result<Self, Error> {
+        let page = branch.leaf_of(from)?;
+        let mut cursor = Self::new_sequential(store)?;
+        cursor.page_no = u64::from(page);
+        Ok(cursor)
+    }
+
+    /// Positions one leaf of a private opening cursor. A gap after its final key can require
+    /// another leaf, which is checked for readiness on the next move too.
+    pub(super) fn begin<F: BlockFile>(
+        &mut self,
+        branch: &Branch,
+        store: &mut Store<F>,
+        from: &[u8],
+        yield_io: bool,
+    ) -> Result<Initial, Error> {
+        let address = branch.page_address(store, self.page_no)?;
+        if yield_io && !store.ready(&mut self.span, address)? {
+            return Ok(Initial::Waiting);
+        }
+        self.land(branch, store, self.page_no, 0)?;
+        let (index, entries) = self.page_lower_bound(from)?;
+        if index < entries {
+            self.index = index;
+            self.load()?;
+            return Ok(Initial::Done);
+        }
+        self.valid = false;
+        match self.next_leaf_page(branch)? {
+            Some(page) => {
+                self.page_no = page;
+                Ok(Initial::More)
+            }
+            None => Ok(Initial::Done),
+        }
     }
 
     /// Moves `k` entries on in `branch`, by its pages' entry counts: only the page the cursor

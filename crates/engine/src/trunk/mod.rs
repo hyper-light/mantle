@@ -1253,9 +1253,9 @@ impl Trunk {
         self.cascade.is_empty() && self.pending.is_empty()
     }
 
-    /// The maintenance owed, in input entries, at most: the pending branches' and what the
-    /// running compactions have left. A cascade's later compactions are not yet known; each is
-    /// owed once it is planned.
+    /// The maintenance estimate, in work units: the pending branches' entries and what the
+    /// running compactions have left, including unfinished input openings and filter pages.
+    /// A cascade's later compactions are not yet known; each is owed once it is planned.
     pub fn debt(&self) -> u64 {
         let pending = self
             .pending
@@ -1282,19 +1282,21 @@ impl Trunk {
         Ok(())
     }
 
-    /// Runs maintenance for up to `budget` merged keys: the cascade in progress, or a new one
-    /// over every pending branch. A step between merges (planning, a flush by reference, a
-    /// split) costs no budget, and each is taken once, so a step ends. Returns the keys merged.
+    /// Runs maintenance for up to `budget` work units: one per initial leaf positioning move
+    /// or merged key, and filter pages at their worth in keys. Structural planning, a flush by
+    /// reference and a split cost no budget; each is taken once, so a step ends. Returns the
+    /// units spent, for the cascade in progress or a new one over every pending branch.
     pub fn step<F: BlockFile>(&mut self, store: &mut Store<F>, budget: u64) -> Result<u64, Error> {
         self.views_unchecked = self.nodes.len();
         self.maplets_unchecked = self.nodes.len();
         self.run(store, budget, true)
     }
 
-    /// [`Self::step`] for a put's share: a compaction whose next input page has not landed
+    /// [`Self::step`] for a put's share: a compaction whose initial or next input page has not landed
     /// stops rather than wait for the device, and the step ends there, its budget unspent and
-    /// still owed ([`Self::debt`]). The page was handed to the device's issuer, so a later step
-    /// finds it read; a stall's [`Self::finish_cascade`] and idle [`Self::step`]s wait.
+    /// still owed ([`Self::debt`]). The read is handed to the issuer once its input write has
+    /// landed and a batch is available; a later step finds it read. A stall's
+    /// [`Self::finish_cascade`] and idle [`Self::step`]s wait.
     pub fn step_paced<F: BlockFile>(
         &mut self,
         store: &mut Store<F>,
@@ -1306,9 +1308,14 @@ impl Trunk {
         used
     }
 
-    /// Whether the last step stopped for an input page still being read.
-    pub fn waiting_io(&self) -> bool {
+    /// The last paced step stopped for a required input page that had not landed.
+    pub(crate) fn waiting_for_io(&self) -> bool {
         self.io_waiting
+    }
+
+    /// A new idle slice reports only a wait encountered by that slice's trunk step.
+    pub(crate) fn clear_io_wait(&mut self) {
+        self.io_waiting = false;
     }
 
     /// Runs the cascade in progress to its end, starting none: the pending branches then enter
@@ -1784,8 +1791,8 @@ impl Trunk {
         self.root = self.nodes.len().saturating_sub(1);
     }
 
-    /// Advances `frame` by one move, merging up to `budget` keys; pushes it back unless it
-    /// finished, in which case its result is in `returned`. Returns the keys merged.
+    /// Advances `frame` by one move, spending up to `budget` work units; pushes it back unless
+    /// finished, in which case its result is in `returned`. Returns the units spent.
     fn advance<F: BlockFile>(
         &mut self,
         store: &mut Store<F>,
@@ -1804,7 +1811,24 @@ impl Trunk {
                 let start = node.pivots.get(i).ok_or(corrupt())?.start;
                 let live = node.inflight.get(start..covered).ok_or(corrupt())?;
                 c.set_yield(self.yield_io);
-                let used = c.step(store, live.iter().rev().flatten(), budget)?;
+                let used = match c.step(store, live.iter().rev().flatten(), budget) {
+                    Ok(used) => used,
+                    Err(error) => {
+                        // Opening was canceled before any output was built; keep its inputs
+                        // and frame so a caller can repair the read and resume. Later merge
+                        // errors may have consumed output and are not restartable here.
+                        if c.opening() {
+                            self.cascade.push(Frame {
+                                n,
+                                phase: Phase::Pivots {
+                                    i,
+                                    job: Some((c, covered)),
+                                },
+                            });
+                        }
+                        return Err(error);
+                    }
+                };
                 self.io_waiting |= c.waiting();
                 if c.is_done() {
                     let t = self.timed.then(std::time::Instant::now);
@@ -1845,7 +1869,20 @@ impl Trunk {
                     .bundle
                     .branches();
                 c.set_yield(self.yield_io);
-                let used = c.step(store, bundle, budget)?;
+                let used = match c.step(store, bundle, budget) {
+                    Ok(used) => used,
+                    Err(error) => {
+                        if c.opening() {
+                            self.cascade.push(Frame {
+                                n,
+                                phase: Phase::Settle {
+                                    job: Some((c, extents)),
+                                },
+                            });
+                        }
+                        return Err(error);
+                    }
+                };
                 self.io_waiting |= c.waiting();
                 if c.is_done() {
                     let t = self.timed.then(std::time::Instant::now);
@@ -1864,7 +1901,7 @@ impl Trunk {
             }
             Phase::Settle { job: None } => {
                 let t = self.timed.then(std::time::Instant::now);
-                let phase = self.plan_settle(store, n)?;
+                let phase = self.plan_settle(n)?;
                 self.stats.plan_ns = self.stats.plan_ns.saturating_add(ns_since(t));
                 (phase, 0)
             }
@@ -2231,7 +2268,7 @@ impl Trunk {
         let covered = node.inflight.len();
         // Newest first, the order a merge takes.
         let branches = live.iter().rev().flatten();
-        let job = Compaction::new(store, branches, &from, end.as_deref(), false, u64::MAX)?;
+        let job = Compaction::prepare(branches, from, end, false, u64::MAX);
         Ok(Phase::Pivots {
             i: j,
             job: Some((Box::new(job), covered)),
@@ -2280,11 +2317,7 @@ impl Trunk {
     /// A leaf over `fanout` branches or `leaf_entries` entries gets its whole compaction
     /// planned, tombstones dropped, into branches of at most half `leaf_entries`; any other
     /// leaf's frame finishes as it is.
-    fn plan_settle<F: BlockFile>(
-        &mut self,
-        store: &mut Store<F>,
-        n: usize,
-    ) -> Result<Option<Phase>, Error> {
+    fn plan_settle(&mut self, n: usize) -> Result<Option<Phase>, Error> {
         let node = self.node(n)?;
         let pivot = node.pivots.first().ok_or(corrupt())?;
         let entries = pivot
@@ -2320,14 +2353,13 @@ impl Trunk {
             .iter()
             .flat_map(|b| b.extents.iter().copied())
             .collect();
-        let job = Compaction::new(
-            store,
+        let job = Compaction::prepare(
             pivot.bundle.branches(),
-            &from,
-            end.as_deref(),
+            from,
+            end,
             true,
             self.config.leaf_entries.div_ceil(2).max(1),
-        )?;
+        );
         Ok(Some(Phase::Settle {
             job: Some((Box::new(job), extents)),
         }))

@@ -1120,6 +1120,16 @@ impl Trunk {
         )
     }
 
+    /// Counts an idle or drain slice of maintenance that took `ns` and merged `keys`: the measured
+    /// cost of a compacted key a consolidation is priced at. Timed by the shard's idle paths, a
+    /// clock read a slice, never by a put's share.
+    pub fn note_merge(&mut self, ns: u64, keys: u64) {
+        if keys > 0 {
+            self.merge_ns = self.merge_ns.saturating_add(ns);
+            self.merge_keys = self.merge_keys.saturating_add(keys);
+        }
+    }
+
     /// When seeks consolidate a pivot ([`Consolidation`]).
     pub fn set_consolidation(&mut self, choice: Consolidation) {
         self.consolidation = choice;
@@ -1739,13 +1749,7 @@ impl Trunk {
                 });
                 continue;
             };
-            let t = std::time::Instant::now();
-            let merged = self.advance(store, frame, budget.saturating_sub(used))?;
-            if merged > 0 {
-                self.merge_ns = self.merge_ns.saturating_add(ns_since(Some(t)));
-                self.merge_keys = self.merge_keys.saturating_add(merged);
-            }
-            used = used.saturating_add(merged);
+            used = used.saturating_add(self.advance(store, frame, budget.saturating_sub(used))?);
             if self.io_waiting {
                 break;
             }

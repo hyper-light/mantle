@@ -225,7 +225,7 @@ fn scan(
             (false, e) => e,
         };
         merge
-            .open(store, &sources, &from, hi, end.is_some())
+            .open(store, &sources, &from, hi, end.is_some(), false)
             .unwrap();
         while let Some((key, op, value)) = merge.entry() {
             if op == Op::Put {

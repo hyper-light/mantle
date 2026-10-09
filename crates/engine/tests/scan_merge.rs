@@ -95,7 +95,9 @@ fn reused_single_and_multiple_heads_keep_bounds_versions_and_deletions() {
                         })
                         .map(|(key, (op, value))| (key.clone(), *op, value.clone()))
                         .collect();
-                    merge.open(&mut store, &sources, from, end, false).unwrap();
+                    merge
+                        .open(&mut store, &sources, from, end, false, false)
+                        .unwrap();
                     let mut got = Vec::new();
                     while let Some((key, op, value)) = merge.entry() {
                         assert!(got.len() <= want.len(), "a merge that does not end");
@@ -143,7 +145,14 @@ fn a_failed_single_head_step_can_reopen_over_another_run() {
     let (mut store, _) = Store::open(file, config).unwrap();
     let mut merge = ScanMerge::new();
     merge
-        .open(&mut store, &[Source::Branch(&bad_branch)], b"", None, false)
+        .open(
+            &mut store,
+            &[Source::Branch(&bad_branch)],
+            b"",
+            None,
+            false,
+            false,
+        )
         .unwrap();
     let mut got = Vec::new();
     let mut failed = false;
@@ -172,6 +181,7 @@ fn a_failed_single_head_step_can_reopen_over_another_run() {
             &[Source::Branch(&good_branch)],
             b"",
             None,
+            false,
             false,
         )
         .unwrap();

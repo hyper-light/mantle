@@ -1085,7 +1085,12 @@ impl<F: BlockFile> ShardDb<F> {
                     (true, _) => Some(seg_end.as_slice()),
                     (false, e) => e,
                 };
-                merge.open(store, &sources, seg_from, hi, end.is_some())?;
+                // Sources are timed only when a pivot gave more than its one: what earns rent.
+                let spare = passed.iter().any(|p| {
+                    let (_, n) = p.sources();
+                    if p.leaf() { n > 1 } else { n > 0 }
+                });
+                merge.open(store, &sources, seg_from, hi, end.is_some(), spare)?;
                 // Each pivot's rent: the measured time its sources took to open, all an index
                 // pivot gave, all but the dearest of a leaf's, which stands for the one branch a
                 // consolidated leaf keeps.
@@ -1418,13 +1423,19 @@ impl<F: BlockFile> ShardDb<F> {
             return Ok(w);
         }
         if self.trunk.debt() > 0 || !self.trunk.is_idle() {
-            let t = self.timed.then(std::time::Instant::now);
+            // Idle slices are timed, a clock read a slice: the measured cost of a compacted
+            // key consolidations are priced at (`Trunk::note_merge`).
+            let t = Some(std::time::Instant::now());
             let used = if paced {
                 self.trunk.step_paced(&mut self.store, keys)?
             } else {
                 self.trunk.step(&mut self.store, keys)?
             };
-            self.note_trunk(ns_since(t));
+            let ns = ns_since(t);
+            self.trunk.note_merge(ns, used);
+            if self.timed {
+                self.note_trunk(ns);
+            }
             return Ok(used.max(1));
         }
         if self.trunk.views_owed() {
@@ -1437,9 +1448,13 @@ impl<F: BlockFile> ShardDb<F> {
             // Seeks paid for consolidating leaves: one cascade, in bulk, flushes and settles
             // them. After views and maplets, which make a bundle one source without rewriting
             // it: seeks pay rent only for the sources left with those built.
-            let t = self.timed.then(std::time::Instant::now);
+            let t = Some(std::time::Instant::now());
             let used = self.trunk.consolidate_step(&mut self.store, keys, paced)?;
-            self.note_trunk(ns_since(t));
+            let ns = ns_since(t);
+            self.trunk.note_merge(ns, used);
+            if self.timed {
+                self.note_trunk(ns);
+            }
             return Ok(used.max(1));
         }
         let ordering = if paced {
@@ -1573,9 +1588,15 @@ impl<F: BlockFile> ShardDb<F> {
     /// Returns the work done, less than `budget` only once nothing is owed.
     pub fn maintain(&mut self, budget: u64) -> Result<u64, Error> {
         self.finish_packing()?;
-        let t = self.timed.then(std::time::Instant::now);
+        // Timed, one clock read a drain: a compacted key's cost, which consolidations are
+        // priced at (`Trunk::note_merge`).
+        let t = Some(std::time::Instant::now());
         let mut used = self.trunk.step(&mut self.store, budget)?;
-        self.note_trunk(ns_since(t));
+        let ns = ns_since(t);
+        self.trunk.note_merge(ns, used);
+        if self.timed {
+            self.note_trunk(ns);
+        }
         // Each view step does at least one unit of work while views are owed: the budget left
         // bounds the steps.
         while used < budget && self.trunk.views_owed() {

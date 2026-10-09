@@ -51,7 +51,9 @@ fn run<'a>(
         let from = rocks_workload::key(rng.next() % (keys * 2));
         rows.clear();
         if use_merge {
-            merge.open(store, &sources, &from, None, false).unwrap();
+            merge
+                .open(store, &sources, &from, None, false, false)
+                .unwrap();
             for _ in 0..nexts {
                 let Some((key, _, value)) = merge.entry() else {
                     break;

@@ -98,6 +98,7 @@ impl<'a> ScanMerge<'a> {
         from: &[u8],
         end: Option<&[u8]>,
         filter: bool,
+        timed: bool,
     ) -> Result<(), Error> {
         self.close(store);
         self.end.clear();
@@ -107,7 +108,7 @@ impl<'a> ScanMerge<'a> {
         }
         self.open_ns.clear();
         for s in sources {
-            let t = std::time::Instant::now();
+            let t = timed.then(std::time::Instant::now);
             if filter && end.is_some() {
                 let scratch = &mut self.scratch;
                 let held = match *s {
@@ -131,8 +132,9 @@ impl<'a> ScanMerge<'a> {
                 }
             };
             self.heads.push(head);
-            self.open_ns
-                .push(u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX));
+            self.open_ns.push(t.map_or(0, |t| {
+                u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
+            }));
         }
         self.pick();
         Ok(())

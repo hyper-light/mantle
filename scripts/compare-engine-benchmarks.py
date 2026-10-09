@@ -224,6 +224,13 @@ def labelled(value):
     return label, pathlib.Path(name).resolve()
 
 
+def labelled_args(value):
+    label, separator, rest = value.partition("=")
+    if not separator or not re.fullmatch(r"[A-Za-z0-9_-]+", label):
+        raise argparse.ArgumentTypeError("expected LABEL=ARGS, with a simple label")
+    return label, shlex.split(rest)
+
+
 def positive(value):
     number = int(value)
     if number <= 0:
@@ -235,6 +242,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mantle-binary", type=labelled, action="append", required=True)
     parser.add_argument("--mantle-source", type=labelled, action="append", default=[])
+    parser.add_argument("--mantle-args", type=labelled_args, action="append", default=[],
+                        help="LABEL=ARGS: extra arguments for that label's runs (e.g. --workers), "
+                        "so one binary can run as several cases")
     parser.add_argument("--rocksdb-binary", type=pathlib.Path)
     parser.add_argument("--rocksdb-source", type=pathlib.Path)
     parser.add_argument("--output", type=pathlib.Path, required=True)
@@ -289,6 +299,10 @@ def main():
     binaries = output / "binaries"
     binaries.mkdir()
     configurations = []
+    extra = dict(args.mantle_args)
+    unknown = set(extra) - set(labels)
+    if unknown:
+        parser.error(f"--mantle-args names labels with no binary: {sorted(unknown)}")
     for label, original in args.mantle_binary:
         destination = binaries / label
         shutil.copy2(original, destination)
@@ -302,7 +316,9 @@ def main():
     (output / "metadata.json").write_text(json.dumps(metadata, indent=2, default=str) + "\n")
     results = []
     for round_number in range(1, args.rounds + 1):
-        order = configurations if round_number % 2 else list(reversed(configurations))
+        # Rotated, so every configuration runs in every position across rounds.
+        shift = (round_number - 1) % len(configurations)
+        order = configurations[shift:] + configurations[:shift]
         seed = args.seed + round_number - 1
         for label, engine, binary in order:
             directory = output / f"round-{round_number}-{label}"
@@ -315,7 +331,8 @@ def main():
                                str(args.issuer_depth), str(args.runs_in_flight),
                                str(args.reads), str(args.seek_nexts), "0", "0", "50", "50",
                                str(args.write_budget_mib), "0", "0", "0",
-                               f"--rocks-seed={seed}", f"--maintenance={args.maintenance}"]
+                               f"--rocks-seed={seed}", f"--maintenance={args.maintenance}",
+                               *extra.get(label, [])]
                 else:
                     drain = ",waitforcompaction"
                     phases = ("fillrandom" + drain + ",readrandom,seekrandom" if args.maintenance == "drain"

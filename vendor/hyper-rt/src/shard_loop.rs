@@ -174,9 +174,12 @@ impl ShardSeed {
         kick: registry::RegisterKick,
     ) -> Result<ShardSeed, RtError> {
         config.validate_shape()?;
+        // The control channel holds the admission limit: a request past it could not be admitted at the
+        // shard's next drain anyway (`crate::control`), and a burst the arena could admit is never refused
+        // for want of room, however long the shard takes to drain it (`tests/control_depth.rs`).
         let (holder, control) = registry::register_runtime_slot(
             config.tasks_per_shard,
-            config.ring_entries,
+            config.tasks_per_shard,
             config.interests_per_shard,
             kick,
         )?;

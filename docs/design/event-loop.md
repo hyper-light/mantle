@@ -124,3 +124,23 @@ removed, a grant kept that the sender did not see, a granted sender that does no
   ring's head and tail on separate lines.
 - The slot and word states (`FREE`, `WAITING`, `GRANTED`; `NO_WAITER`, `CLAIMED`, `THREAD`): format.
 
+
+## D5. A shard's control channel holds its admission limit
+
+**Decision.** The channel that carries spawns and cancels from other threads to a shard is bounded at the
+shard's admission limit, `tasks_per_shard`, as `control.rs` states, not at `ring_entries`. A send past it
+is refused `ControlFull`.
+
+**Why.** A request past the admission limit could not be admitted at the shard's next drain, so the limit
+refuses nothing the arena would have admitted, however long the shard takes to drain. `ring_entries` was
+derived from the wake probe (`next_pow2(wake p99 / syscall median)`): four in a one-CPU Linux container,
+where the shard's thread did not run while a benchmark's main thread sent nine spawns, and the fifth was
+refused (`benchmark-results/hyper-rt-vs-tokio-20261010/runs-linux/c1-quiet-bd7c0fd/fanin/r3-hyper.txt`).
+hyper-rt returned the typed refusal; the panic in that run was the benchmark's own `expect`.
+
+**Proof.** `tests/control_depth.rs` holds a shard inside one poll, sends it a burst of 64 spawns through a
+configuration whose `ring_entries` is 4, and is refused the 65th; every spawn of the burst then runs. With
+the channel bounded at `ring_entries` the fifth spawn was refused
+(`benchmark-results/hyper-rt-vs-tokio-20261010/tests/control-depth-red-bd7c0fd.txt`).
+
+**Constants.** None.

@@ -59,7 +59,9 @@ pub struct RuntimeConfig {
     /// Shards to run.
     pub shards: u16,
     /// The admission limit per shard (Little's law on the measured request rate and p99 service
-    /// time; see [`admission_limit`]).
+    /// time; see [`admission_limit`]), and the depth of its control channel: spawns and cancels from
+    /// other threads wait there for the shard's next drain, and a send past it is refused `ControlFull`
+    /// (a request past it could not be admitted at that drain anyway, [`crate::control`]).
     pub tasks_per_shard: usize,
     /// Timers a shard may hold at once.
     pub timers_per_shard: usize,
@@ -67,7 +69,8 @@ pub struct RuntimeConfig {
     /// waits its tasks start in one poll each (docs/runtime.md §3.4); past it a registration is refused
     /// `Capacity`.
     pub interests_per_shard: usize,
-    /// Entries in each inbound ring.
+    /// The completion buffer's initial entries, and the most polls a calibrated batch takes
+    /// ([`RuntimeConfig::calibrate_batch`]).
     pub ring_entries: usize,
     /// The step budget the watchdog counts against, in nanoseconds.
     pub step_budget_ns: u64,
@@ -114,8 +117,8 @@ pub fn interests_for(tasks: usize) -> usize {
     tasks.saturating_mul(2)
 }
 
-/// A shard's control-queue depth from the derived `control_entries` (Little's law at the overflow target), at
-/// least one: on a machine whose wake p99 is no longer than a syscall's median the law asks for one.
+/// A shard's inbound ring from the derived `control_entries` (Little's law at the overflow target), at least
+/// one: on a machine whose wake p99 is no longer than a syscall's median the law asks for one.
 fn control_depth(derived: u64) -> usize {
     usize::try_from(derived).unwrap_or(usize::MAX).max(1)
 }

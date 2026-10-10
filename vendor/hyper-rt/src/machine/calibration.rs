@@ -48,7 +48,7 @@ pub struct Constants {
     pub tick_ns: Derived<u64>,
     /// The latency budget the loop's batch is sized against.
     pub batch_budget_ns: Derived<u64>,
-    /// The control queue's depth.
+    /// The inbound ring's entries ([`crate::runtime::RuntimeConfig::ring_entries`]).
     pub control_entries: Derived<u64>,
     /// Where the shards run.
     pub placement: Placement,

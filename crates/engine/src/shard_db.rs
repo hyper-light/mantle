@@ -3243,6 +3243,27 @@ impl<F: BlockFile> ShardDb<F> {
         f.incorporate_max_ns = f.incorporate_max_ns.max(ns);
     }
 
+    /// The packing memtable no worker took during its fill, at the rotation that needs its
+    /// place: its order paid, a worker free now takes it, to be frozen as any packing a worker
+    /// has, the measured overlap deciding what the rotation waits for. Results already in are
+    /// taken first, freeing their workers. True when one took it; false with every worker busy,
+    /// or with none, when the shard must build it.
+    fn hand_off_packing(&mut self) -> Result<bool, Error> {
+        if self.packing.as_ref().is_none_or(|p| p.builder.is_some()) {
+            return Ok(false);
+        }
+        self.take_packs(false)?;
+        let Some(p) = self.packing.as_mut() else {
+            return Ok(false);
+        };
+        p.mem.pay(usize::MAX);
+        if p.walk.is_none() {
+            p.walk = Some(p.mem.walk_start());
+        }
+        self.start_packing(false)?;
+        Ok(self.packing.as_ref().is_some_and(|p| p.feed.is_some()))
+    }
+
     /// Packs the rest of the packing memtable and takes every frozen one's branch, all going to
     /// the trunk as pending in age order, and keeps a memtable, cleared, for the next fill.
     fn finish_packing(&mut self) -> Result<(), Error> {
@@ -3353,18 +3374,19 @@ impl<F: BlockFile> ShardDb<F> {
         }
         if self.rotation.as_ref().is_some_and(|r| r.finish_packing) {
             if self.packing.is_some() {
+                // No worker took it during its fill: its order paid a slice at a time, the first
+                // worker free takes it, and it freezes as any packing a worker has, later puts
+                // feeding what is left; the measured overlap below decides what else is waited
+                // for. Its own packing is not: a worker holds it. Results already in are taken
+                // first, freeing their workers.
+                self.take_packs(false)?;
                 self.pack_some(keys.max(1), false)?;
+                if self.packing.as_ref().is_some_and(|p| p.feed.is_some()) {
+                    self.freeze();
+                }
                 if self.packing.is_some() {
                     return Ok(false);
                 }
-            }
-            let left = self.pack_left();
-            if left > 0 {
-                self.feed_from(left.min(keys.max(1)), false, false)?;
-            }
-            self.take_packs(false)?;
-            if !self.frozen.is_empty() {
-                return Ok(false);
             }
             if let Some(r) = self.rotation.as_mut() {
                 r.finish_packing = false;
@@ -3494,13 +3516,15 @@ impl<F: BlockFile> ShardDb<F> {
         }
         let t = if self.timed { Some(now) } else { None };
         let mut stalled = false;
+        if self.packing.as_ref().is_some_and(|p| p.feed.is_none()) && !self.hand_off_packing()? {
+            // Every worker busy: the shard builds it, its branch after the older ones'.
+            self.finish_packing()?;
+            stalled = true;
+        }
         if self.packing.as_ref().is_some_and(|p| p.feed.is_some()) {
             // Handed to a worker: frozen as it is, later puts feeding what is left, while the
             // next memtable fills.
             self.freeze();
-        } else if self.packing.is_some() {
-            self.finish_packing()?;
-            stalled = true;
         }
         // Whatever froze them (this rotation, or a put's share that fed one whole), no more stay
         // frozen than the measure says overlap: the oldest are waited for.

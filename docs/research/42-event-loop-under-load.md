@@ -38,6 +38,10 @@ builds and tests run beside. This is its ordinary state and nothing here waited 
 | MAN-KQUEUE | macOS `kqueue(2)`, `EVFILT_TIMER` and its `NOTE_CRITICAL`, `NOTE_LEEWAY`. **primary** |
 | MS-QTCT | Microsoft Learn, "QueryThreadCycleTime" and "GetThreadTimes". **primary** (cited by hyper-rt's `thread_clock.rs`). |
 | WAKELAT | `benchmark-results/wake-latency-c-20261010/` (a C dispatch-semaphore ping, no mantle code). |
+| VYUKOV | Dmitry Vyukov, "Bounded MPMC queue", 1024cores.net: a slot per position with a sequence stamp, claims by compare-and-swap on the head and the tail. **primary** |
+| STDMPMC | Rust std as shipped with 1.94.1 and nightly 2026-09-04 (the same code; 1.98.0's toolchain here carries no source), `library/std/src/sync/mpmc/array.rs` (the array channel: lap-encoded positions, `SeqCst` fences in its full and empty checks, a spin on a slot another end has claimed) and `waker.rs` (`SyncWaker`: blocked senders and receivers register under a `Mutex`). **primary** |
+| LOOM | loom 0.7.2, `src/rt/execution.rs` (`schedule`: the reduction's dependency check), `src/rt/atomic.rs` (`last_dependent_access`: an object's last access only), `src/rt/thread.rs` (`set_unparked`: an unpark makes any blocked thread runnable). **primary** |
+| FILLPROF | `benchmark-results/mantle-boxed-request-ab-20261010/fill5m-sample.txt`: mantle's fill under `sample`, with `SyncWaker::notify` (`waker.rs:172–183`) and `semaphore_signal_trap` under it. |
 | PARKCOST | `benchmark-results/hyper-rt-vs-tokio-20261010/os-parkcost/` (`parkcost.c`, `parkcv.c`, `clockcost.c`, `clockcost2.c`). |
 | TIMERLAT | `benchmark-results/hyper-rt-vs-tokio-20261010/os-timer/` (`timerlat.c`). |
 | PANELS | `benchmark-results/hyper-rt-vs-tokio-20261010/runs/` (the harness `harness/src/main.rs`; each run's raw output and host load). |
@@ -169,6 +173,76 @@ The last row's base processes happened to calibrate short spins (5.3–14.2 µs)
 load, so its CPU matched; at load 48–63 the same base spent 31.3 µs (§2). The changed arm learned
 blocking's cost online at 2.0–13.2 µs across its processes, the shard's park and its sender's kick
 together.
+
+## 8. Channels without a lock
+
+hyper-rt's channel and one-shot carried their values through std's `sync_channel`, and a plain thread
+blocked in `blocking_recv` or `blocking_send` waited inside it. std's array channel registers a blocked
+end in `SyncWaker`, a waiter list behind a `Mutex`, and every send to a channel with a blocked receiver
+takes that mutex to notify it [STDMPMC `waker.rs`, `SyncWaker::notify`]; mantle's fill spent its samples
+there, in `SyncWaker::notify` and the `semaphore_signal_trap` it ends in [FILLPROF]. The async senders'
+queue of waiters for room was a second `sync_channel`, whose entries stayed until the receiver's grants
+walked past them, so a sender that stopped waiting still held a place. **primary**
+
+What replaced it, with no lock on any path:
+
+- **The values** go through Vyukov's bounded queue [VYUKOV], with positions a lap above an index as std
+  encodes them [STDMPMC `array.rs`], so the capacity is exact. Where std spins on a slot another end has
+  claimed and not finished, without bound [STDMPMC `array.rs`, `start_send`/`start_recv`], this one reports
+  the slot full or empty and lets the waiting protocol carry progress, so no end waits on a preempted peer.
+- **A waiting receiver**, task or thread, registers in its cell's waiter word, fences, and looks again; a
+  sender publishes, fences, and takes the word (`crate::handoff`, the parking protocol's store-buffering
+  argument, §3 and `parking.rs`). A thread registers its handle's address and parks; the publisher that
+  takes it marks the word claimed until it has read the handle, and the thread does not leave its wait
+  while the word reads claimed.
+- **Senders waiting for room** hold one of `waiters` places, freed in place when a sender stops waiting,
+  so the bound is the senders waiting now. Each take grants one waiting place, searching from where the
+  last grant stopped. The receiver fences after each take and reads one counter of waiting places.
+
+**The models.** loom checks the ring, the thread handoff and the room under the workspace's bounds, each
+with mutations that must fail it (`tests/loom-channel.txt`). Writing them found four things:
+
+1. A first ring popped a value with no consumer thread of its own: loom's reduction remembers an object's
+   last access only [LOOM `atomic.rs`], so a pop made on the main thread before the producers ran was never
+   reordered after a push, and no interleaving popped a published value. Every model now gives each side
+   its own thread.
+2. loom's `unpark` makes any blocked thread runnable [LOOM `thread.rs`], a thread blocked in a join
+   included, which loom's join then rejects; a spurious wake is modelled as a flag a third thread raises.
+3. A ring push that read a slot's stamp two laps old after reading the latest tail re-read the tail
+   forever: nothing bounds how long a plain load may return an old value. The ring reads the latest tail
+   or head once and then reports full or empty; the waiting protocols fence before their second look.
+4. A grant could reach the place of a sender that had just sent on room made earlier and not yet let its
+   place go; that sender kept the grant, and the other waiting sender slept with room free (deadlock at
+   interleaving 3,776 of the two-sender model). A sender now hands on any grant it did not see before it
+   sent.
+
+**MEASURED** (PANELS `chan-98efdf7-r1`, load 15–21, five rounds, arms interleaved; plain threads; `98efdf7`
+is the changed tree, `bfdf9c2` the tree before it; per value or round trip):
+
+| Case | hyper-rt before | hyper-rt now | std `sync_channel` | tokio `mpsc` |
+|---|---|---|---|---|
+| one producer, capacity 1,024: values a second (CPU) | 29.7 M (49.6 ns) | 144.4 M (13.4 ns) | 101.7 M (18.5 ns) | 8.0 M (199 ns) |
+| four producers, capacity 64 | 4.05 M (536 ns) | 5.33 M (389 ns) | 4.21 M (444 ns) | 4.07 M (961 ns) |
+| sixteen producers, capacity 64 (context switches a value) | 407 k (8.8 µs, 0.75) | 674 k (2.7 µs, 0.36) | 429 k (7.3 µs, 0.61) | 341 k (7.4 µs, 0.79) |
+| four producers, capacity 1 | 170 k (5.3 µs) | 179 k (5.1 µs) | 189 k (2.8 µs) | 154 k (5.9 µs) |
+| two threads ping-pong, round trips a second (p50) | 134 k (2.9 µs) | 135 k (3.0 µs) | 130 k (3.5 µs) | 109 k (4.7 µs) |
+
+Where a value waits for no one, the lock-free ring is the difference (the one-producer row); where sixteen
+producers contend, the mutex's waits are (a third of the CPU, half the context switches). Where every value
+blocks a thread (the last two rows), each value costs a park and an unpark, the same system calls whatever
+the queue. std's blocking `send` and `recv` park at once, with no spin before [STDMPMC `array.rs`, `send`
+and `recv` into `Context::wait_until`], but a send or receive that meets a slot the other end has claimed
+and not finished spins, then yields, until it is finished, with no bound [STDMPMC `array.rs`,
+`start_send`/`start_recv`: `spin_light`, then `spin_heavy`'s `yield_now`]. In the capacity-1 fan-in a
+sender meeting the receiver mid-take waits that out instead of parking, which is why std spends half the
+CPU there.
+
+**MEASURED** again at a far heavier load (PANELS `fence-cost-r1`, load 96–110 from other sessions' builds,
+seven rounds): one producer 46.8 M values a second against std's 20.7 M, sixteen producers 1.25 M against
+677 k, four producers 1.16 M against 1.23 M at 106 against 122 ns of CPU a value. The same panel ran two
+variants of the channel to price its fences: with both removed (`nofence`, no longer correct) and with
+sequentially consistent operations in their place (`seqcst`): neither moved the CPU a value outside the
+rounds' spread (106–111 ns, 12–14 ns), so the fences, which loom checks, stay.
 
 ## What remains unknown
 

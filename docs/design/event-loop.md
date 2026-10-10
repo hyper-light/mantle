@@ -89,3 +89,38 @@ rules on the new reading points.
 **Constants.**
 - `SCALE_BITS` (32): format, the fixed-point scale's fraction, chosen so the 64×64-bit product cannot
   overflow 128 bits and the rounding error stays under 10⁻¹¹ of a tick.
+
+## D4. Channels hand values over with no lock
+
+**Decision.** hyper-rt's bounded channel and one-shot carry their values through a lock-free bounded
+ring (`sync/ring.rs`), wake a waiting receiver through its cell's waiter word (`handoff.rs`), whether the
+receiver is a task or a plain thread parked with its handle registered there, and hold senders waiting for
+room in places of their own (`sync/room.rs`). No path takes a lock. Each take grants its room to one
+waiting sender; a sender that stops waiting frees its place at once, and one that leaves with a grant it
+did not see hands it on. The API is unchanged: `channel`, `channel_with`, `oneshot`, `Sender::{try_send,
+send, blocking_send}`, `ChannelReceiver::{try_recv, recv, blocking_recv}`, the one-shot's ends. One
+meaning is new: `channel_with`'s `waiters` bounds the senders, tasks and threads alike, waiting for room at
+once, and `blocking_send` past it is told `Full` (it used to wait inside std's channel, unbounded).
+
+**Why.** The values used to go through std's `sync_channel`, whose blocked ends register behind a mutex
+that every send to a blocked receiver takes; mantle's fill spent samples in it and in the semaphore signal
+under it, and the owner asked for the lockless design (note 42 §8). The queue of waiting senders kept a
+place for each sender that had stopped waiting until the receiver's grants walked past it, so live senders
+were refused. Measured with plain threads (note 42 §8): one producer moves 144 million values a second
+against 30 million before, and sixteen contending producers 674 thousand against 407 thousand, at a third
+of the CPU and half the context switches; where every value blocks a thread, the cost is the park and
+unpark either way.
+
+**Proof.** loom, under the workspace's bounds (`benchmark-results/hyper-rt-vs-tokio-20261010/tests/loom-channel.txt`):
+`sync::ring` two producers and a consumer through one slot (548 interleavings), `handoff` a thread waiter
+woken once and its handle never read after it leaves (6,289), `sync::room` one sender (50) and two senders
+(71,847) waiting for room, the two driving the same `Room::send_waiting` that `blocking_send` runs. Each
+model fails under the mutations recorded there (a value read before its stamp, either fence of a pair
+removed, a grant kept that the sender did not see, a granted sender that does not wait again).
+`tests/channel_threads.rs` runs real threads through the blocking calls.
+
+**Constants.**
+- `Padded`'s alignment (128 bytes): shape, the largest cache line targeted (Apple silicon), keeping the
+  ring's head and tail on separate lines.
+- The slot and word states (`FREE`, `WAITING`, `GRANTED`; `NO_WAITER`, `CLAIMED`, `THREAD`): format.
+

@@ -106,23 +106,40 @@ but its own first part: the work spread over shards, one per core, each owning w
   `tasks_per_shard`); batches out at the issuer; the page cache by bytes. Each is a stated bound
   with a typed refusal.
 
-**Same-shard clients (planned, not built).** Measured per operation over the same engine
+**Same-shard clients.** Measured per operation over the same engine
 (`benchmark-results/mantle-boxed-request-panel-20261010`, 1M fills, 100K gets and seeks): a put
-costs 2,995 instructions on the direct path and 9,340 through a range on the runtime; a get 4,833
+cost 2,995 instructions on the direct path and 9,340 through a range on the runtime; a get 4,833
 and 7,600 warm; a seek 14,822 and 21,160. The difference is the request's round trip, which a
 client on the range's own shard does not need: two channel hops, two wakes, three or four polls of
-two tasks (each reading the clock), the serve loop's bookkeeping and a timed maintenance slice. A
-client on the range's shard will run an operation inline when the range is idle and the operation
-completes without waiting, as an event loop runs a call made on its own thread at once (trantor's
-`EventLoop::runInLoop`, drogon's loop):
-- the engine moves into a shard-local slot whenever the range's task awaits, and back out when it
-  runs; a client takes it for one synchronous operation and returns it, so ownership moves and no
-  reference is shared (no Arc, no RefCell);
-- a put that `put_paced` cannot apply now, a get that needs a page the issuer must read, any
-  request while the range has pending mutations (their arrival order is kept), a fault, and
-  closing all take the request path unchanged;
-- an inline client yields when another task on its shard is ready, so a loop of inline
-  operations does not hold the shard (a hyper-rt signal owed for it).
+two tasks (each reading the clock), the serve loop's bookkeeping and a timed maintenance slice. So
+a client on its range's shard makes a put, deletion or get inline when the range is idle and the
+operation finishes without waiting, as an event loop runs a call made on its own thread at once
+(trantor's `EventLoop::runInLoop`):
+- the range's task lends its engine (`Lend`) at the awaits that borrow none of it: its idle wait
+  for a request and the yields between maintenance slices. The engine is boxed once and moves
+  into a slot on its shard's thread and back, so ownership moves and no reference is shared (no
+  Arc, no RefCell); a lend dropped mid-await (the task's future dropped) takes the engine back
+  and drops it there, as the task's local would have been;
+- a range lends only with no fault, no mutation waiting to be applied (their arrival order is
+  kept) and no request in hand; a put `put_paced` cannot apply now, a get whose page is neither
+  cached nor in the OS's memory (`ShardDb::get_now`: the store refuses a read that would wait,
+  `Store::begin_no_wait`), a scan, a barrier and every request from another shard take the
+  request path unchanged;
+- an inline operation runs to its end in the poll that starts it, or not at all: canceled
+  before, nothing of it happened; nothing of it is ever outstanding. `RangesConfig::inline` off
+  gives every client the request path's semantics alone (a canceled mutation published and kept),
+  which its tests use;
+- an inline operation never waits, so a client making them in a loop yields its shard after
+  about the shard's quantum of them, at the rate measured over its last turn (two clock reads a
+  turn), and the first operation to leave the range maintenance owed wakes the range's task once,
+  which runs when the client yields.
+
+Measured with one binary, inline against `--no-inline` (every operation through the range's
+channel), three interleaved rounds, 1M fills, 1M gets and 100K seeks of 10, seed 301
+(`benchmark-results/mantle-inline-final-ab-20261010`), medians: fill 1.32 to 1.98 million puts a
+second, 9.85 to 6.80 thousand instructions a put; gets 1.10 to 1.61 million a second, CPU 0.91 to
+0.61 us a get, p99 3.33 to 2.75 us. Seeks take the request path in both arms: 0.41 and 0.39
+million a second, within the rounds' spread.
 
 An idle range that reaches a required trunk read yields its work before opening or claiming
 that read. Its task then waits for either a request or an issuer answer through hyper-rt's

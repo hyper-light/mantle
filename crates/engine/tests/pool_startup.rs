@@ -271,6 +271,7 @@ fn a_worker_attachment_startup_error_refuses_range_placement_and_preserves_check
                 clients: 1,
                 slice_ns: 50_000,
                 spin_ns: 0,
+                inline: false,
             }
         ),
         Err(mantle_engine::ranges::StartError::Failed(Error::Io { .. }))

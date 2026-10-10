@@ -362,6 +362,7 @@ fn post_poll_client_prepare_refuses_before_request_publication() {
             clients: 1,
             slice_ns: 50_000,
             spin_ns: 0,
+            inline: false,
         },
     )
     .unwrap();

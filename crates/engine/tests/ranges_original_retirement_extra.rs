@@ -364,6 +364,7 @@ fn run(case: Case, slice_ns: u64) {
             clients: 1,
             slice_ns,
             spin_ns: 0,
+            inline: false,
         },
     )
     .unwrap();

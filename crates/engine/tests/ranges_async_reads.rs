@@ -244,6 +244,7 @@ fn ranges(runtime: &mut Runtime, first: ShardDb<Gated>, second: ShardDb<Gated>) 
                 clients: 3,
                 slice_ns: SLICE_NS,
                 spin_ns: 0,
+                inline: false,
             },
         )
         .unwrap(),

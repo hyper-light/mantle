@@ -241,6 +241,7 @@ fn stopping_a_range_yields_through_actual_worker_tls_retirement() {
             clients: 1,
             slice_ns: 50_000,
             spin_ns: 0,
+            inline: false,
         },
     )
     .unwrap();

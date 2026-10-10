@@ -525,6 +525,7 @@ fn a_held_worker_page_write_leaves_same_shard_unrelated_range_progress() {
                 clients: 2,
                 slice_ns: 50_000,
                 spin_ns: 0,
+                inline: false,
             },
         )
         .unwrap(),

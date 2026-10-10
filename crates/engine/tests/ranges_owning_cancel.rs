@@ -263,6 +263,7 @@ fn ranges(runtime: &mut Runtime, db: ShardDb<Native>, clients: usize) -> Arc<Ran
                 clients,
                 slice_ns: 50_000,
                 spin_ns: 0,
+                inline: false,
             },
         )
         .unwrap(),

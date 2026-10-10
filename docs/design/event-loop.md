@@ -250,3 +250,22 @@ yielder ran first, and the step polled it four times
 deferred ring.
 
 **Constants.** None.
+
+## D8. Attribution stops reading at the first step within its bound
+
+**Decision.** The long-step tracker (`attribution::Tracker`) disarms at the first step that polled and ran
+within its bound, as well as after a busy period between two waits that ran no long step.
+
+**Why.** An armed shard reads its thread's CPU account at every step's start — a system call or a Mach trap,
+107–161 ns (`attribution.rs`) — until its next wait. A shard that never waits, as one serving requests beside a
+task that slices long work, read it at every step for as long as it stayed busy: 12,356 to 23,937 reads in
+11,995 to 20,993 steps per run (`benchmark-results/hyper-rt-vs-tokio-20261010/runs/mac-a1-r1/rttbusy`,
+`r*-ad.txt`). A step within its bound shows the window its start opened was not needed.
+
+**Proof.** `tests/thread_account_reads.rs`: on a virtual clock, one long step and then a thousand short ones,
+the shard never waiting, read the account twice where the OS keeps a per-thread clock (the long step's own
+reading and the next step's start) and once elsewhere. RED before: 1,002 reads
+(`benchmark-results/hyper-rt-vs-tokio-20261010/tests/never-waiting-reads-RED.txt`). `attribution.rs`'s unit test
+holds the tracker's rule.
+
+**Constants.** None.

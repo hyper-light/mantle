@@ -192,8 +192,10 @@ pub(crate) fn attribute(window: &Window, quantum_ns: u64) -> Attribution {
 /// The shard's windows and when it reads. A window opens at the end reading of every long step, and —
 /// while armed — at each step's start and each wait's end. A wait closes the window, so a park's own
 /// block is never charged to a step. The shard arms when a long step found no window, or one that did not
-/// decide it; a busy period (from one wait to the next, having done work) that runs no long step disarms,
-/// so a healthy shard reads nothing.
+/// decide it; it disarms at the first step within its bound (the window that step's start opened was not
+/// needed) and after a busy period (from one wait to the next, having done work) that ran no long step, so a
+/// healthy shard reads nothing, and one that never waits reads once after each long step rather than at
+/// every step.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Tracker {
     /// The open window's start: the thread's account and the shard clock then.
@@ -223,6 +225,12 @@ impl Tracker {
     /// A step ended; `did_work` marks the busy period as one.
     pub(crate) fn step_ended(&mut self, did_work: bool) {
         self.period_worked |= did_work;
+    }
+
+    /// A step that polled ran within its bound: the window its start opened was not needed, so the shard
+    /// stops reading at step starts until a long step again finds no window or an undecided one.
+    pub(crate) fn step_within_bound(&mut self) {
+        self.armed = false;
     }
 
     /// A wait (a spin or a park) begins: the window closes, and a busy period that ran no long step disarms.
@@ -377,6 +385,21 @@ mod tests {
         tracker.wait_began();
         assert!(!tracker.armed());
         tracker.wait_ended(|| panic!("a disarmed shard reads nothing"));
+        tracker.step_began(|| panic!("a disarmed shard reads nothing"));
+    }
+
+    /// A shard that never waits: armed by an unattributed long step, it reads at the next step's start, and
+    /// that step running within its bound disarms it.
+    #[test]
+    fn a_step_within_its_bound_disarms_without_a_wait() {
+        let mut tracker = Tracker::default();
+        assert_eq!(
+            tracker.long_step(0, QUANTUM_NS * 3, account(100, Some(0)), QUANTUM_NS),
+            Attribution::NoWindow
+        );
+        tracker.step_began(|| at(QUANTUM_NS * 3, account(100, Some(0))));
+        tracker.step_within_bound();
+        assert!(!tracker.armed());
         tracker.step_began(|| panic!("a disarmed shard reads nothing"));
     }
 

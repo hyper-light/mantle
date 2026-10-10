@@ -1265,8 +1265,9 @@ impl Shard {
                 elapsed_ns,
             );
         }
-        if let Some(attributed) = self.attribute_step(started_ns, ended_ns) {
-            count_long_step(&mut self.core.counters, attributed);
+        match self.attribute_step(started_ns, ended_ns) {
+            Some(attributed) => count_long_step(&mut self.core.counters, attributed),
+            None => self.core.attribution.step_within_bound(),
         }
     }
 

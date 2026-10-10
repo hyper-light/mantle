@@ -1,0 +1,2 @@
+Sequence,Count,ByteSize,Physical Offset,Key(s) : value 
+2,1,17,0,DELETE_RANGE(0) : 0x61 0x6D 

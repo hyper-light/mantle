@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-09-29. A component is complete when its tests pass on all six CI targets
+Updated 2026-10-01. A component is complete when its tests pass on all six CI targets
 (Linux, macOS and Windows on x86_64 and arm64) and the evidence listed for it has been
 recorded.
 
@@ -18,8 +18,14 @@ directory and, with `--measure`, benchmarks the device. It is built on:
 - **Calibration**: reads, writes and flush latency measured through the file layer. Each
   point runs until the 95% confidence interval of its throughput is within 5% of its mean
   (three to six rounds), latency quantiles are reported only when enough transfers ran to
-  estimate them, and the read depth reported is the one of greatest power (Kleinrock). The
-  scratch file is removed whether the run succeeds or fails.
+  estimate them, and the random reads go on to deeper queues until throughput stops growing:
+  that depth is what a chunk volume holds at the device, and the depth of greatest power
+  (Kleinrock) is reported beside it ([measurements](measurements/2026-09-29-read-depth.md)).
+  The scratch file is removed whether the run succeeds or fails. Depth is kept by one pool of
+  blocking workers started once a calibration and reused across its points, growing only as
+  deep as its deepest step, no deeper than the device's reported queue (`nr_requests`,
+  `IOCommandPoolSize`, or SATA NCQ's 32 where the OS cannot say) and the process thread
+  budget; each point reports the depth it achieved beside the depth asked.
 - **Checksums**: CRC-32C for stored and transmitted data, and CRC-64/NVME for S3
   checksums, both verified against published test vectors.
 - **Cryptography** ([design](design/crypto.md)): AWS-LC through aws-lc-rs, vendored with the
@@ -55,7 +61,12 @@ verify every byte they return, checkpoints and log wrap-around, reuse of segment
 empty out, cleaning of partly dead segments chosen by cost-benefit (relocations batched
 into the cleaner's own stream, a reserve segment kept for it, and passes that stop when
 they cannot gain space), and crash recovery (replay, verification of the last batch,
-roll-forward, and a checkpoint that makes recovery's corrections durable). Its operating
+roll-forward, and a checkpoint that makes recovery's corrections durable). A delete, and a
+put in a segment its batch opened, are answered once a later frame confirms their batch's,
+since recovery finds neither without its frame, and an answer decided without writing waits
+for whatever unconfirmed request it rests on. Damage to any frame of the checkpoint the
+superblock names is refused, and a superblock read without its twin resumes past what the
+twin may have reserved. Its operating
 parameters are calculated from models and measurements rather than chosen
 (docs/research/11): checkpoints when the log needs the room, at most half its writes;
 a write queue of two batches that refuses with `Busy` beyond them; cleaning on a runway
@@ -76,9 +87,14 @@ continuous once damage is found. Damaged chunks, including those whose records c
 read at all, are listed for repair, and a volume with more than 4,096 is marked failing, to
 be drained whole.
 
+Reads are held at the device's measured depth: a volume keeps at most the shallowest depth at
+which calibration finds throughput stops growing (the depth of greatest power, which this
+section once named, is reported beside it and is not the bound; design §7), lets as many more
+wait in the order they came, and refuses the rest with `Busy`, where before every caller's
+thread read at the device unbounded.
+
 Remaining before it is done:
 
-- An I/O path that keeps the measured number of reads in flight.
 - `mantle bench chunk` measures puts and reads next to the same reads through the file
   layer, each point in ten to thirty rounds judged as the [measurement
   design](design/measurement.md) sets out: rounds ordered in time found by the lag-1
@@ -148,9 +164,9 @@ sealing and opening at rest on one core.
 
 Remaining before it is done:
 
-- Encryption at rest in the gateway's data path: each file's wrapped key in its header row,
-  the root key's file and its generations, and the pass that rewraps under a new one
-  (design/encryption.md).
+- Encryption at rest: the root key's file and its generations, and the pass that rewraps
+  files' keys under a new one (design/encryption.md). Each file's key is wrapped in its
+  header row, and the gateway seals every object and part under it.
 
 - The worker that takes lifecycle actions as they fall due, over the Name layer's versions
   and uploads, once the gateway and the metadata layer hold configurations (metadata.md §6).
@@ -189,47 +205,157 @@ sweep settles it, a Name range takes a file only by the deadline the file was wr
 and the sweep asks the file's Name range, which releases a file it never took once the
 deadline has passed at its own time, so no later handover can take it. Blocks a gateway made
 for a file it never wrote are found one layer down the same way, from the file itself. A
-simulation of 2,000 schedules, with gateways that stop at any stage or come late, sweeps that
-stop between any two steps, and leaders whose clocks run behind, finds no file both
-referenced and released, no named block taken apart, and nothing left unsettled or unnamed.
+gateway renews the blocks of a body still streaming in, and the sweep releases a block only
+at the deadline the File range judged, a released block renewing no more, so a renewal and a
+release are ordered by the Block range's log. A simulation of 2,000 schedules, with gateways
+that renew, stop at any stage or come late, sweeps that stop between any two steps, and
+leaders whose clocks run behind, finds no file both referenced and released, no named block
+taken apart, and nothing left unsettled or unnamed; with either of the release's two checks
+removed, it loses a named block's chunk.
 
-The Raft log (`mantle-log`, [design](design/raft-log.md)), which every range replica on a
-metadata device shares: group commit across ranges with one flush a batch, frames whose
-sequences tell a torn tail from damage to acknowledged state, segments reclaimed oldest
-first by sweeping their live records forward in one frame, and reads of entries no longer
-in memory verified by each entry's own checksum. A property test runs generated histories
-of appends, conflicts, compactions, snapshots, proposals and removals, cutting power at
-random points on the simulated device, and checks after every reopen that each
-acknowledged update survived and the one in flight landed whole or not at all; a soak of
-200,000 histories over segment sizes and quotas passed. `mantle bench log` measures
-appends against the device: one flush commits every replica's append, from 2 replicas to 256,
-at about one durable write of latency ([measurements](measurements/2026-09-28-raft-log-benchmark.md)).
+Name ranges split and merge ([design §3](design/metadata.md#3-ranges)), as the TLA+ model
+of splits and merges under a create and a delete lays out: each range records its span and a
+generation, the child takes the keys past the cut with their rows and marks, the gates of the
+buckets it can hold, the gate floor and the clock, and a command for a key outside the span,
+or a coordinator's step routed by another generation, is answered with where the span went
+and takes nothing. A merge freezes the higher range and lets the lower range decide once, in
+its own log, moving its generation on either way, then ends or thaws the frozen range; its
+driver (`mantle_meta::merge`) resumes from either range. The coordinator routes by
+descriptors and starts its phase again when a range has moved on. Both simulations split and
+merge ranges while buckets are created and deleted and files are handed over and swept, with
+writers and sweeps that learn of both late and merge drivers that stop, resume, give up and
+send late, and each rule removed on purpose fails one of them or a test of its own.
 
-Range replicas (`mantle-range`, [design](design/replica.md)) run focal-raft's core over the
-log and an engine: an entry carries a batch of gateway commands applied as one engine batch,
-client sessions make each command take effect once however often it is retried, and members
-that lag are caught up by snapshot, and reads are confirmed by ReadIndex. A member lost for
-good is replaced by one under a new identity: added as a learner, caught up, swapped in by
-one joint change, and done once every voter knows the new configuration committed. A
-deterministic simulation of three members and three concurrent gateways, under crashes,
-failed writes and flushes, partitions, dropped and reordered messages, compaction, and one
-or two members lost for good in every run, checks after every run that each index was
-applied the same everywhere, that every operation completes once faults stop, that every
-put exists exactly once, that the members agree, that each key's history is linearizable,
-and that every member's configuration names the live members. A soak of 20,000 seeds passed,
-replacing 39,948 members lost for good, and the simulation catches stale reads and repeated
-commands applied twice when either is introduced on purpose.
+**Gateway object path** (`mantle-gateway`, [design](design/gateway.md)). A PUT or an upload
+part as a state machine that names each request and does no I/O: the body sealed in 64 KiB
+segments as it streams, cut into blocks of whole segments sized to the scheme's 8 MiB chunks,
+each block coded as copies or Reed–Solomon and its chunks written at once to distinct volumes
+with their CRC-32C, a refused chunk sent to the next volume offered, the block recorded once
+every chunk is durable and renewed while the body streams on, the file written once every
+block is, and the version or part committed last. It holds the block filling and as many full
+blocks going down at once as its caller admits, the body waiting while that many go. A GET
+seeks by the byte it wants, reads only the chunk bytes that hold its range, reads another copy
+or decodes a block around a chunk that fails, reads an object of parts by its parts'
+plaintext, and holds as many blocks as its caller admits. Completing an upload derives the
+object's size, ETag and checksum, full-object or composite, from its parts' rows, and the Name
+range checks them against its own. An empty object is its version alone; an empty part has a
+file. Tested end to end against volumes and Block, File and Name ranges in memory: every object
+and part reads back through the GET, in any range and with chunks lost, coded blocks rebuild
+from any `data` chunks, the body is held to its length and digests, and generated schedules of
+bodies, client pace, windows and refusing volumes commit an object whole or nothing, which
+fails with renewals removed. `mantle bench gateway` measures both paths on one core and counts
+the round trips each waits through.
 
 Remaining before it is done:
 
+- The windows a gateway admits, from its memory and measured latency; the rates of the paths
+  measured on an idle machine.
+- The server around it: mantle's protocol over QUIC for its client and its nodes, the HTTP/1.1
+  listener for stock S3 clients, the transport to storage nodes and ranges, routing by
+  descriptors, placement across failure domains, and each request's memory admitted against
+  the gateway's.
+
+The Raft log (`hyper-log`, vendored from hyper-raft with the block layer under it,
+`hyper-block`; [design](design/raft-log.md), vendor/UPSTREAM.md), which every range replica on
+a metadata device shares: group commit across ranges with one flush a batch, frames whose
+sequences tell a torn tail from damage to acknowledged state, updates answered only once a
+later durable record confirms their frame's flush, segments reclaimed oldest first by
+sweeping their live records forward in one frame, and reads of entries no longer in memory
+verified by each entry's own checksum. A confirmation rewrites its frame's own record, a
+commit that fails answers every update it holds, an open restoring a lost frame keeps that
+frame's record until the restore is durable, and a live segment that yields no frame is
+reported as damage. A property test runs generated histories of appends,
+conflicts, compactions, snapshots, proposals and removals, cutting power at random points on
+the simulated device, and checks after every reopen that each acknowledged update survived
+and the one in flight landed whole or not at all; a soak of 200,000 histories over segment
+sizes and quotas passed. A second property test damages the last frame after power loss and
+checks every acknowledged group is kept or reported: 20,000 cases a run. `mantle bench log` measures appends against the device: one flush
+commits every replica's append, from 2 replicas to 256; an append waits for two flushes, its
+frame's and its confirmation's, where none follows at once
+([measurements](measurements/2026-09-29-log-confirmation.md)). The log was mantle's
+`crates/log` until hyper-raft took it with its history (research/32 §5.2, L-1) and gave its
+state to one owner thread that answers every call by ticket, waking only its caller (L-2);
+mantle runs on that crate since 2026-10-01 and `crates/log` is gone (§5.3). The range
+simulation's recorded seeds 1 to 48 replayed to the same histories, step for step, on it as on
+`crates/log`, before the replica moved onto the shell. A replica writes and reads its group through the shell's handle on the group
+(hyper-durable's `GroupStore` over hyper-log's `GroupLog`, at hyper-raft `df5f8ad`), which
+answers the core's reads from what the replica's own answered writes left and submits each
+write without waiting, the log's answer waking the replica's owner; the member holds no handle
+on the log itself. Before the shell, a committed entry of a three-member group, driven in one
+process, allocated 127.2 times and reallocated 4.0 against `crates/log`'s 262.2 and 25.0, and
+took a median 143 µs against 151 µs at a load average of 34–35, faster in 27 of 31 paired
+rounds; on the move to hyper-log before the handle it took 0.83 ms
+([measurements](measurements/2026-10-01-group-log.md),
+[before](measurements/2026-10-01-shared-log.md)). `mantle bench log` matches `crates/log`
+with one replica and runs more appends a second at 256 replicas: 29.3K against 27.1K at
+128 B, in 12 of 12 paired rounds, and 23.1K against 21.1K at 16 KiB, in 11 of 12.
+
+Range replicas (`mantle-range`, [design](design/replica.md)) are hyper-raft's durable shell
+over the log and an engine since 2026-10-03 (`hyper-durable`, vendored with the core at hyper-raft
+`df5f8ad`; D-1): the range's engine and layer are the shell's state machine, an entry carries a
+batch of gateway commands applied as one engine batch, client sessions make each command take
+effect once however often it is retried, a write delivered again in a new session is recognised
+by its file, or for a write with no file by the ID the gateway drew for its request, and answered
+as its first delivery was, members that lag are caught up by snapshot, and reads are confirmed by
+ReadIndex. A member lost for good is replaced by one under a new identity: added as a learner,
+caught up, swapped in by one joint change, and done once every voter's durable commit covers the
+new configuration. The shell takes the core's readies ahead of their writes' answers to the log's
+three pipeline frames, taking messages and ticks while writes are out; applies a change of
+configuration only once the member's durable commit covers it (the commit fence, focal's F17),
+the larger of its log's commit and its engine's durable index, whose term the engine keeps beside
+it; states that durable commit in the member's answers (core step R-6), so a replacement ends only
+on commits every voter's restart keeps; repairs a member whose log lost a last frame by its lost
+entries (R-5) and elects it on its log where the others can be a quorum (R-7); and fences a
+member whose log failed a write. Ranges elect on their owner's ticks with focal's counts until the
+node carries the node-pair liveness stream. The move found two faults in the core, fixed there: a
+member whose writes stayed out through a hundred election timeouts sent 234 vote requests at once
+when its device went on, where a campaign now supersedes the requests still waiting; and a
+follower's queue of messages grew from four slots again whenever its writes held more queues
+than the one spare it kept, where it now keeps one for each write that may be out. Directed power
+cuts at every write and flush of a change check for a leader, a follower, a sole voter and a
+group shrinking to one; a replacement's leader, a follower and the joining member, each killed
+inside the window between a change's commit and the commit its durable state states (at every
+write and flush in the simulation, and at every window as real processes with `SIGKILL`), leave
+a group whose members reopen in the final configuration once the leader says every voter knows
+it, and which elects with any one of them lost; counting a voter that only holds the change fails
+them, on mantle's shell before the move and on the durable one. A deterministic simulation of
+three or five members and three concurrent gateways, under crashes, failed writes and flushes,
+partitions, dropped, duplicated and reordered messages, clock steps, compaction, damage at rest,
+and one or two members lost for good in every run, checks after every run that each index was
+applied the same everywhere, that every operation completes once faults stop, that every put
+exists exactly once, that the members agree, that each key's history is linearizable, and that
+every member's configuration names the live members. A soak of 6,000 seeds passed on the shell,
+replacing 14,864 members lost for good and repairing all 643 members its damage marked, and the
+simulation catches stale reads when they are introduced on purpose.
+Against mantle's own shell at `1c179e8` on its workload (hyper-raft's `hyper-durable-compare`,
+four sides in one process, the order rotated each round, load 3.7–20.5), a range group of three
+or five on real files commits at a median 39–44% lower and 35–67% more entries a second, with
+30–43% fewer allocations an entry and the same reallocations; with one member its latency is
+even, an entry's latency its write's on either shell, with 21–31% fewer allocations
+([measurements](measurements/2026-10-03-range-on-the-shell.md)).
+
+Remaining before it is done:
+
+- Elections by suspicion on hyper-raft's node-pair liveness stream (`hyper-liveness`, L-3), which
+  the range's shell takes where its owner gives it the stream's word: the node lacks the owner
+  that holds its replicas, the datagram plane with kernel receive stamps, placement's map of
+  members to nodes, a durable run, liveness writes on its log devices, shard timers that measure
+  their own lateness, and the cell's history for the detectors' prior
+  ([design](design/node.md) §2.4). Ranges elect on ticks until then.
 - Chunks a stopped gateway wrote for a block it never recorded, reconciled per volume once
   storage nodes run, and the collector's pacing against foreground latency (design §2, §6;
   docs/research/22 §10).
 - The production engine, once its binding is chosen (design §4).
-- Splits, merges and the fast track under simulation, built to the TLA+ model of splits and
-  merges under a create and a delete (design §3, `docs/models/RangeSplit.tla`), and the
-  transport:
-  QUIC for bulk transfers and snapshots, and a UDP transport for consensus messages.
+- The replica side of splits and merges: the child's group made on the parent's replicas
+  from the parent's engine files as they stood at the split's entry, which carries the split
+  alone; a merge's replica sets aligned first, its decision proposed once every replica of
+  the frozen range has applied the freeze, and the ended range's group kept until every
+  replica of the lower range has taken its rows; the directory the ranges publish their
+  descriptors to; which ranges to split and merge, from measured size and load; and a read
+  by key answered only by the range whose span holds it, when the gateway's read path is
+  built.
+- The fast track under simulation, and the transport: QUIC for bulk transfers and
+  snapshots, and a UDP transport for consensus messages.
 - Linearizability checked with real processes on the production engine.
 - Done when a linearizability checker accepts histories recorded under network partitions,
   process crashes and disk faults, both in deterministic simulation and with real
@@ -237,19 +363,247 @@ Remaining before it is done:
 
 ## Planned, in order
 
-1. **S3 gateway.** Request signing (including presigned URLs and chunked uploads with
-   trailing checksums), buckets, PUT, GET with byte ranges, HEAD, DELETE and batch
-   delete, copy, ListObjects and ListObjectsV2, multipart uploads including resuming an
-   interrupted upload, versioning, conditional requests, checksums, tags, and ACLs as S3's
-   bucket owner enforced default answers them. Done when
-   end-to-end suites using the AWS CLI, boto3 and the AWS SDK for Rust pass against a
-   running mantle, and ceph's s3-tests pass for every supported feature.
-2. **Multi-machine operation.** Placement across racks and zones, repair ordered by
-   remaining redundancy, rebalancing, and retiring disks that start to fail. Done when
-   tests that fail disks, machines and racks during writes show that every acknowledged
-   write can still be read back.
-3. **Cells.** A replicated map of which cell owns each key range, routing from cached
-   copies of it with redirects after a range moves, moving a range between cells while it
-   is read and written, and adding and retiring cells. Done when ranges move between cells
-   under a mixed workload with no lost write and no stale read, and failing or upgrading
-   one cell leaves the requests of every other cell unaffected.
+The work the designs of 2026-09-30 create (research notes 26–31, folded into node.md,
+gateway.md, metadata.md, chunk-store.md, measurement.md, durability.md, raft-log.md,
+replica.md, engine.md, encryption.md, crypto.md, s3-protocol.md, architecture.md and the new
+storage-classes.md), in the audit's stage order (audit §17). Each item is done when its test
+passes on all six CI targets.
+
+### First: stop the demonstrated safety failures
+
+1. **No broadcast wakes.** The log's `room`, `workers.rs`'s latch and every `Barrier` or
+   `notify_all` over a pool or population replaced by per-waiter slots woken one to one in
+   arrival order, with a bounded waiting list, and a fence completing each slot once (node.md
+   §1.3; raft-log.md §3). Done when an instrumented test with `W` waiters and `K` completions
+   counts at most `K` plus the waiters admitted, a fence wakes each exactly once, and `bench log`
+   at thousands of logical replicas runs on macOS without a kernel spinlock timeout.
+   *Done on macOS (2026-09-30)*: the log's `Room` (now hyper-log's, held by its owner thread)
+   hands freed room to waiters in arrival order, each woken by its own `unpark`, its list bounded at `max_groups` times a group's two;
+   `room::tests::each_answer_wakes_only_the_waiter_it_admits_and_a_fence_wakes_each_once`
+   counts 16 wakes for 16 answers among 48 waiters and 48 in all after the fence;
+   `workers.rs` is gone. A submission can carry a `Waker`, woken exactly once
+   (`a_waker_is_woken_once_for_each_answer`). `bench log` ran 16,384 logical replicas on 20
+   threads on the development Mac. No production `notify_all` or `Barrier` remains; the tests'
+   simulated files keep theirs, waited on by a few test threads.
+2. **Depth without a thread per transfer.** Calibration's depth kept by io_uring on Linux, an
+   overlapped completion port on Windows, and a reusable pool of exactly `depth` workers with
+   per-worker slots on macOS and where io_uring is unusable, inside a process thread budget read
+   from `kern.wq_max_threads` on macOS, refused before any thread starts; achieved depth sampled
+   and reported (measurement.md §8). Done when a measurement at a device's full reported depth
+   never exceeds the pool bound in the OS's own thread count, a request past the budget starts
+   no thread, and the achieved depth reaches the depth asked or reports its shortfall.
+   *The portable pool is done on macOS (2026-09-30)*: the process thread budget (now
+   `hyper_block::threads`, which mantle-disk's measurement and the issuer both draw on) reads its
+   ceiling from `kern.wq_max_threads` on macOS, the smaller of `kernel.threads-max` and the soft
+   `RLIMIT_NPROC` on Linux, and Microsoft's stated 500 pool threads on Windows, and counts the
+   process's threads from the OS (`proc_pidinfo`, `/proc/self/status`, a ToolHelp snapshot);
+   `measure::Pool` draws from it before any thread starts and refuses with
+   `DiskError::Threads`. `tests/depth.rs` measured at the NVMe controller's 253: 2 threads
+   before, a peak of 256 (the pool and the test's sampler), a mean of 228.7 in flight and
+   253 at most; a depth past the budget started none. *Remaining*: io_uring on Linux and the
+   completion port on Windows, which the pool stands in for on every OS until they land; the
+   Linux and Windows thread counters have been type-checked for their targets but not yet run
+   there; macOS reads its queue from `IOCommandPoolSize`, Windows reports none yet.
+3. **Logical clients as records.** `bench log`, `bench` and `bench gateway` multiplex clients on
+   at most the granted cores' driver threads through `submit` and a `Waker`; the replica ladder
+   ends at the stated replica bound; generators report their CPU and lateness (measurement.md
+   §10). Done when the same benchmark at `R` and `10R` clients shows the same peak thread count.
+   *Done on macOS (2026-09-30)*: replicas and clients are records on at most
+   `available_parallelism` drivers, answered through `Log::submit_waking` and the chunk store's
+   new `Volume::put_waking`/`delete_waking`; `bench chunk --rate` and `bench gateway --clients
+   --rate` generate open loop from a Poisson process with latency from intended start. Rows
+   report the OS's thread count, the drivers' CPU and the generator's lateness.
+   `tests/clients.rs` ran `mantle bench log` at 18, 180 and 1,800 replicas on 20 threads each;
+   `bench::tests::clients_cost_no_threads` ran puts at 18 and 180 clients closed and 180 open
+   on 22 threads each. No ladder doubles until a spawn fails. *Remaining*: chunk reads still
+   block, so a read is a thread, as many as the store's measured read bound, until the
+   device's dispatcher (item 5) takes them; open loop needs a stated `--rate`; the replica
+   bound is the list the run states until node.md §11 derives the replicas a node hosts; the
+   resident memory per client (measurement.md §10) is not yet reported.
+
+### Second: make overload and retry behaviour dependable
+
+4. **One issuer per physical device**, running every volume's writer, cleaner and scrubber and the
+   device's log writer as state machines, `write_together` without threads per region, startup
+   rollback per issuer (node.md §1.2; chunk-store.md §4). Done when 100 volumes on one device run
+   on one issuer and its pool, the process thread count matches `3C + D + Σ p_i`, and the
+   chunk store's crash soak passes unchanged.
+   *Writes through the issuer done on macOS (2026-10-01)*: the issuer (now `hyper_block::issuer`) is one thread
+   and a pool of `min(device queue, measured depth, thread budget left)` blocking workers per
+   device, all started when the device opens (`issuer::depth`; one worker on a device
+   calibration has not measured). Every write and flush of every volume goes through it: a
+   batch's regions and frame together, its one flush only once all have completed and only if
+   all succeeded; index frames written alone, checkpoints, superblocks and the format's
+   pre-write likewise. `write_together` and its thread per region are gone. Files are
+   duplicated into an arena the issuer's thread owns and its scoped workers borrow; no `Arc`.
+   `tests/issuer.rs` ran batches of up to 21 writes on a depth-4 issuer at 9 threads idle and 9
+   while writing, at most 4 in flight; a failed region fails its batch with no flush;
+   `bench::tests::clients_cost_no_threads` ran 18 and 180 clients closed and 180 open at 27
+   threads each. Batch latency before and after: measurements/2026-10-01-device-issuer.md.
+   *Remaining*: each volume's writer, cleaner and scrubber are still threads of their own, not
+   state machines on the issuer's thread, so the count is `2V` or `3V` plus `D + Σ p_i`, not yet
+   `3C + D + Σ p_i`; the Raft log's writer does not go through the issuer; startup rollback is
+   still each volume's own; io_uring on Linux and the completion port on Windows are not built,
+   the pool runs there (node.md §1.2); the 100-volume test is not written; reads go through the
+   issuer with item 5.
+5. **The device dispatcher**: start-tag order across tenants and principals, in-flight budget
+   `D_b`, `D_n` and dispatch unit `u` from calibration, background shares, the log, engines and
+   chunks of a laptop's one device under one authority (node.md §2.7; chunk-store.md §4, §7).
+   Done when a small read's p99 beside a saturating large write stays within `(D_b + n·u)/C` and
+   throughput stays within measurement of the calibrated plateau.
+6. **Charges and fair queues**: dominant-share charging from calibrated per-device cost models,
+   hierarchical SFQ (tenant, principal, request) with state bounded by admitted work, contract
+   classes with mClock reservations and an Aequitas admit probability, a Space-Saving heavy-hitter
+   table, and per-range tenant SFQ with the range's admission level on answers (node.md §2.3,
+   §2.7). Done when the owner's scenario (node.md §9.1) holds at laptop scale: the large upload's
+   goodput during the spike within measurement of its weighted share, the small PUTs within the
+   §2.7 bound of their latency alone, recovery within one chain latency, and every table within
+   its bound under a new principal per request.
+7. **Overload as sojourn, shed by hashed principal**: the shared authority for both listeners,
+   CoDel's sojourn test, `503 SlowDown` before `100 Continue` on HTTP, retries shed first by the
+   attempt header, a deterministic subset of principals shed at the measured excess, the retry
+   ratio held below `C/λ − 1` (node.md §4.5). Done when steps to 1.5× and 10× capacity, open loop
+   and corrected for coordinated omission, leave overload once the trigger stops, with retries
+   shed before first attempts and completed multi-request steps per second reported.
+8. **Fair-share windows**: a PUT's window from the entitled rate, a GET's from the latency at the
+   hedge quantile (node.md §2.6; gateway.md §2–§3). Done when a lone upload's goodput reaches
+   `min(client rate, device plateau)` and its window shrinks and regrows across a spike.
+9. **Operation identity**: client-drawn identities, `amz-sdk-invocation-id` on the listener,
+   operation rows in the Name range with the first answer, the horizon capped by the operation
+   table's budget, removal by the collector, carried by splits (gateway.md §2.1; metadata.md §2).
+   Done when the orphan-sweep simulation extended with every attempt of every identity at any
+   step, across gateways, splits and lagging clocks, holds the five obligations, each broken
+   variant fails it, and a gateway killed between commit and answer in a versioned bucket leaves
+   one version after a retry through another gateway.
+10. **The device plan by class**: `B` from `minimum_io_size` or C3, batches padded to it, write
+    size from NOWS, depth caps for SATA, USB Bulk-Only and EBS, flush measured twice and batches
+    overlapped only where it is free, flush-unverified devices recorded (chunk-store.md §2.1, §4;
+    raft-log.md §2; measurement.md §9). Done when tests on reported and simulated geometries
+    take the right `B` and plan, and C1–C3 run on each OS's devices.
+11. **The derived scrub period** from the workload, bandwidth and durability bounds, per device,
+    with `mantle status` naming the binding bound (chunk-store.md §9.1; durability.md §5). Done
+    when a simulated 24 TB disk at 550 TB/yr scrubs no more often than its workload bound and the
+    durability model counts latent errors detected at the chosen period.
+
+### Third: establish a real laptop serving baseline
+
+12. **The native protocol and the client library and CLI**: S3's operations natively, credits,
+    typed refusals and the admission level, the server's upload plan, per-block GET streams with
+    CRC-64/NVME, migration on interface change, TLS session resumption without early data, the
+    TLS-over-TCP route, and the journal with its flush rules (node.md §3.9, §4.1; gateway.md §3,
+    §6). Done when the client killed and its storage cut at every journal write and protocol step
+    ends every operation answered, resumed or provably restarted, and a Wi-Fi to cellular switch
+    mid-upload continues or resumes with no committed run sent again.
+13. **Resumable native uploads** in server-cut runs with progress frames, the checkpoint interval
+    of gateway.md §2.1, MD5 and block-hash state carried across runs, and digest-state export
+    and import in the vendored aws-lc-rs (gateway.md §2.1; metadata.md §2; crypto.md §10). Done
+    when the six obligations hold under interruption at every frame, a changed source ends in
+    `BadDigest`, and the ETag equals S3's for objects at and above 5 GiB.
+14. **The HTTP/1.1 listener's resilience**: exact `ListParts`, `AbortIncompleteMultipartUpload`,
+    open-upload bytes reported, completion answered directly unless near clients' read
+    timeouts, pinned resumed downloads (gateway.md §2.1). Done when the AWS CLI's and boto3's
+    multipart uploads with the connection cut at every part and at completion finish or resume,
+    and s3-tests' multipart suite passes.
+15. **The gateway's caches**: sealed-block, File and Block row caches; Name rows and absences
+    validated by ReadIndex taken after arrival; coalesced fetches and next-round validations;
+    policy by scaled-down simulation and size by SHARDS curves within the node's division
+    (gateway.md §5; node.md §2.5; metadata.md §2). Done when the linearizability checker accepts
+    every history with every cache on and catches the four broken variants (node.md §9.1).
+16. **Integrity across the path**: per-segment plaintext CRCs and seals opened on another core,
+    the parity's random linear check, carried CRC tables to and from storage nodes, command CRCs
+    checked at apply, the engine's per-key-value protection, CRCs kept with cached rows, and
+    attribution per node and core (node.md §5.6; chunk-store.md §3.1; replica.md §2; engine.md
+    §3). Done when the flips and the faulty core of node.md §9.1 are caught at their boundaries
+    before acknowledgement or service, and the core is attributed; and CRC-64/NVME's Hamming
+    distances at 64 KiB and 8 MiB are computed by a program that reproduces Koopman's CRC-32C and
+    "Jones" figures (node.md §5.6).
+17. **Storage classes on one device**: the class stored, validated and answered on every
+    operation, archived reads refused, RestoreObject, lifecycle transitions, Intelligent-Tiering
+    with day-resolution tracking, Reduced Redundancy, directory buckets with `CreateSession`, the
+    class's writer rule and stream, and the achieved bound reported (storage-classes.md §2, §5,
+    §8; s3-protocol.md §4, §7). Done when S3's recorded answers replay, s3-tests'
+    `storage_class`, `lifecycle_transition` and `restore` markers pass, and the controlled-clock
+    restore and tiering tests pass.
+18. **Power, thermal state and background work**: the OS's inputs by notification, the battery
+    wait rule in the chunk store's and log's writers, background deferral by deadline, Apple's
+    thermal responses, background I/O priority, sleep reconciliation (node.md §1.8). Done when
+    toggled inputs on each OS defer exactly the work the table names, no acknowledgement precedes
+    durability across a switch, and energy per acknowledged byte on battery falls under the rule
+    by measurement.md §9's differential method with the `2S` latency bound holding.
+19. **Device probes and energy**: C1–C14 where each applies, idle-gap tagging of latency samples,
+    and calibration refused on battery unless forced (measurement.md §9; chunk-store.md §7).
+    Done when each probe's result is recorded for the development machines' devices with its
+    device cost.
+
+The S3 gateway profile listed before stays this stage's frame: request signing, buckets, PUT,
+GET with ranges, HEAD, DELETE and batch delete, copy, listings, multipart uploads with resume,
+versioning, conditional requests, checksums, tags and ACLs; done when end-to-end suites with the
+AWS CLI, boto3 and the AWS SDK for Rust, and the native client library, pass against a running
+mantle, and ceph's s3-tests pass for every supported feature.
+
+### Fourth: prove heterogeneous regional operation
+
+20. **The QUIC layer on a vendored quinn-proto**: the pacing quantum and operating packet size,
+    adaptive reordering, the PMTU raise rule, Copa with focal's half stride, idle timeout from
+    the probe timeout, keep-alive from the measured NAT lifetime, stream windows under the
+    2,048-frame ceiling, the connection credit reserve, key update before AES-GCM's limit (node.md
+    §3.3, §3.8–§3.9). Done when control-message p99 beside saturating bulk at 8, 16, 64 and 256
+    kbit/s beats stock quinn with goodput reported, a fuzzed alternate-frame loss at the window
+    ceiling never closes a connection, and the congestion qualification over the audit §13.6
+    matrix is recorded with its selection rule and rows.
+21. **Brownouts and reconnects**: the four clocks, equal-jitter backoff from the probe timeout,
+    replacement by certificate, election timing from durable-ack tails, the bulk queue bound
+    (node.md §3.8). Done when a 64 kbit/s upload with 5–120 s outages completes, returning its
+    memory within one run commit of each stall, and elections per hour during a rate collapse
+    with saturating bulk stay at the level of the run without bulk.
+22. **Cell-wide shares**: node credits on responses with dmClock counters, tenant contracts
+    divided among gateways by measured demand, hedged reads at the derived quantile and
+    reservation-hedged writes (node.md §3.3, §4.5, §5.4). Done when a tenant whose load lands on
+    few nodes keeps its cell-wide share, and its rate across gateways stays within its contract as
+    its load moves.
+23. **Placement by credits and budgets**: two random choices on credits, devices chosen by latest
+    projected budget exhaustion, device budgets for workload, cycles, hours and flash wear, early
+    drains, flush-unverified copies weighed (node.md §7; chunk-store.md §9.3; durability.md §5).
+    Done when per-device load spread and small-request p99 beat random and least-loaded placement
+    in the same run, and endurance accounting tracks the drives' own counters.
+24. **Media pools, moves and restores**: pools from measurement, class eligibility, copysets per
+    pool, cold pools with spin-down groups and start/stop budgets, staging writes for archived
+    classes, copy-switch-release moves spread under the background cap, bounded restore queues
+    per tier (storage-classes.md §3–§7). Done when crash tests at every step of a move leave each
+    object at one class with every block referenced once, a simulated day of billions of due
+    moves stays under the cap with no deadline missed, and restore completion times meet their
+    tiers' documented times under load.
+25. **Device-specific placement**: FDP handles per stream on provisioned drives with DLWA checked
+    from the Endurance Group log; disk volumes' index logs on flash; disk reads sorted; scrub and
+    cleaner reads in the writer's gaps on flash; head-load-aware background bursts; discard by
+    measured cost (chunk-store.md §2, §4, §7–§9). Done when DLWA, commit latency (C7) and
+    load/unload counts are recorded against their baselines on real drives.
+26. **Fleet-scale integrity**: replica digests compared at a leader-named index, core quarantine
+    and node fencing by comparison with the cell's background rate, correctable-memory counters
+    as health, repair that verifies every source and its rebuilt chunk (replica.md §2; node.md
+    §5.6). Done when an injected divergent member is found and rebuilt, an injected faulty core
+    is quarantined, a week without faults measures the false-positive rate that sets the
+    thresholds, and repair with one corrupt source and one lost chunk rebuilds from a verified
+    subset or refuses, never writing a chunk that fails the block's CRC.
+
+Multi-machine operation keeps its frame: placement across racks and zones, repair ordered by
+remaining redundancy, rebalancing, and retiring disks that start to fail; done when tests that
+fail disks, machines and racks during writes show every acknowledged write can still be read
+back.
+
+### Fifth: make fleet growth and geography safe
+
+27. **Regional and fleet shares**: contracts divided among cells and regions by demand on longer
+    intervals, principal limits across cells by count-min sketches merged by addition
+    (architecture §8). Done when simulation shows the regional share error and the sketches'
+    overestimate within their stated bounds against exact counts.
+28. **Zonal storage classes**: one-zone and multi-zone classes physically distinct with zone
+    exposure reported, directory buckets placed near compute, lifecycle due dates spread across
+    cells' budgets, restore rates per principal (storage-classes.md §9). Done when a zone's loss
+    in simulation loses no multi-zone object and reports one-zone exposure as computed.
+
+Cells keep their frame: a replicated map of which cell owns each key range, routing from cached
+copies with redirects after a range moves, moving a range between cells while it is read and
+written, and adding and retiring cells; done when ranges move between cells under a mixed
+workload with no lost write and no stale read, and failing or upgrading one cell leaves every
+other cell's requests unaffected.

@@ -26,4 +26,4 @@ jobs:
       - name: TLA+ models
         run: bash scripts/check-model.sh
       - name: The models' controls fail as they must
-        run: bash scripts/check-model.sh unfenced
+        run: bash scripts/check-model.sh controls

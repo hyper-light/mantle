@@ -6,14 +6,21 @@
 //! the range's clock's (clock.rs), so versions of a key never share an order. A write to a
 //! bucket's objects passes only through the bucket's open gate for the incarnation it names
 //! (docs/design/metadata.md §2).
+//!
+//! A range holds the object keys of one span, which its lineage records with a generation
+//! that every split and merge raises. A command for a key outside the span, or a
+//! coordinator's step routed by another generation, is not the range's: it answers with its
+//! lineage, takes nothing, and the sender routes the command again. A range frozen for a
+//! merge, or ended by one, takes nothing but the merge's own steps (docs/design/metadata.md
+//! §3).
 
 use crate::clock;
-use crate::engine::{Rows, Write};
-use crate::error::MetaError;
+use crate::engine::{Row, Rows, Write};
+use crate::error::{MetaError, reserved};
 use crate::key::{self, NULL_VERSION, NameRow};
 use crate::record::{
-    self, Checksum, DefaultRetention, Gate, GateState, Holder, Part, Retention, RetentionMode,
-    Upload, Version,
+    self, Checksum, DefaultRetention, Descriptor, Gate, GateState, Holder, How, LISTING, Lineage,
+    Mark, Part, Retention, RetentionMode, Standing, Taken, Upload, Version,
 };
 
 pub use crate::record::Verdict;
@@ -22,6 +29,12 @@ pub use crate::record::Versioning;
 
 /// "Part size: 5 MiB to 5 GiB. There is no minimum size limit on the last part" (05 §4.1).
 pub const MIN_PART: u64 = 5 << 20;
+
+/// The most a part holds, 5 GiB (05 §4.1), and the highest part number, 10,000 (05 §4.3). A
+/// gateway refuses more before it writes anything; the range refuses a part row past them
+/// too, since every replica applies what reaches the log.
+pub const MAX_PART: u64 = 5 << 30;
+pub const MAX_PART_NUMBER: u16 = 10_000;
 
 /// Entity tags a precondition names, bare of quotes, or `*`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,9 +81,46 @@ pub enum Command {
     Reclaim(Reclaim),
     Check(Check),
     Unmark(Unmark),
+    Disown(Disown),
+    Split(Split),
+    Freeze(Freeze),
+    /// Applied by [`merge`], which reads the frozen range's rows; [`apply`] refuses it.
+    Merge(Merge),
+    Abandon(Abandon),
+    End(End),
+    Thaw(Thaw),
+    Resolve(Resolve),
 }
 
 impl Command {
+    /// Whether a range whose descriptor is `now` must refuse the command as routed by a
+    /// descriptor it no longer matches: a write to an object key its span does not hold, the
+    /// sweep's for a file of such a key, or a step routed by another generation. The range's
+    /// own queue of released files goes with no key.
+    fn moved(&self, now: &Descriptor) -> bool {
+        let away = |bucket: &str, key: &str| !now.holds(&key::route(bucket, key));
+        match self {
+            Self::Put(c) => away(&c.bucket, &c.key),
+            Self::Delete(c) => away(&c.bucket, &c.key),
+            Self::CreateUpload(c) => away(&c.bucket, &c.key),
+            Self::PutPart(c) => away(&c.bucket, &c.key),
+            Self::Complete(c) => away(&c.bucket, &c.key),
+            Self::Abort(c) => away(&c.bucket, &c.key),
+            Self::Retain(c) => away(&c.bucket, &c.key),
+            Self::Hold(c) => away(&c.bucket, &c.key),
+            Self::Check(c) => c.files.iter().any(|f| away(&f.bucket, &f.key)),
+            Self::Unmark(u) => u.files.iter().any(|m| away(&m.bucket, &m.key)),
+            Self::Disown(d) => away(&d.bucket, &d.key),
+            Self::Gate(g) => g.generation != now.generation,
+            Self::Collect(c) => c.generation != now.generation,
+            Self::Split(s) => s.generation != now.generation,
+            Self::Freeze(f) => f.generation != now.generation,
+            Self::Merge(m) => m.generation != now.generation,
+            Self::Abandon(a) => a.generation != now.generation,
+            Self::Reclaim(_) | Self::Resolve(_) | Self::End(_) | Self::Thaw(_) => false,
+        }
+    }
+
     /// The bucket and incarnation a write to objects names; `None` for the gates' commands.
     fn write_to(&self) -> Option<(&str, u64)> {
         match self {
@@ -86,23 +136,47 @@ impl Command {
             | Self::Collect(_)
             | Self::Reclaim(_)
             | Self::Check(_)
-            | Self::Unmark(_) => None,
+            | Self::Unmark(_)
+            | Self::Disown(_)
+            | Self::Split(_)
+            | Self::Freeze(_)
+            | Self::Merge(_)
+            | Self::Abandon(_)
+            | Self::End(_)
+            | Self::Thaw(_)
+            | Self::Resolve(_) => None,
         }
     }
 
-    /// The file a write hands the range, which a version or part will reference if the write
-    /// goes ahead, with the key it is for, the time of the entry that carries it, and the
-    /// file's handover deadline.
+    /// What names a write that makes a version or a part: its file, which a version or part
+    /// will reference if the write goes ahead, or, for a write that carries none, the ID the
+    /// gateway drew for it; with the key it is for, the time of the entry that carries it, and
+    /// its handover deadline.
     fn carries(&self) -> Option<Carried<'_>> {
-        let (bucket, key, file, at_ns, deadline_ns) = match self {
-            Self::Put(c) => (&c.bucket, &c.key, c.version.file?, c.at_ns, c.deadline_ns),
-            Self::PutPart(c) => (&c.bucket, &c.key, c.part.file, c.at_ns, c.deadline_ns),
-            Self::Complete(c) => (&c.bucket, &c.key, c.file?, c.at_ns, c.deadline_ns),
+        let (bucket, key, file, id, at_ns, deadline_ns) = match self {
+            Self::Put(c) => (
+                &c.bucket,
+                &c.key,
+                c.version.file,
+                c.id,
+                c.at_ns,
+                c.deadline_ns,
+            ),
+            Self::PutPart(c) => (
+                &c.bucket,
+                &c.key,
+                Some(c.part.file),
+                c.part.file,
+                c.at_ns,
+                c.part.deadline_ns,
+            ),
+            Self::Complete(c) => (&c.bucket, &c.key, c.file, c.id, c.at_ns, c.deadline_ns),
             _ => return None,
         };
         Some(Carried {
             bucket,
             key,
+            id: file.unwrap_or(id),
             file,
             at_ns,
             deadline_ns,
@@ -110,11 +184,13 @@ impl Command {
     }
 }
 
-/// A file a write carries.
+/// A write that makes a version or a part: the ID its mark is under, and the file it carries,
+/// if any, whose ID that is.
 struct Carried<'a> {
     bucket: &'a str,
     key: &'a str,
-    file: u128,
+    id: u128,
+    file: Option<u128>,
     at_ns: u64,
     deadline_ns: u64,
 }
@@ -139,7 +215,14 @@ pub struct Put {
     /// The bucket's default retention, which a version whose request named no retention takes
     /// from its creation (18 §2.4).
     pub default: Option<DefaultRetention>,
-    /// The version's file's handover deadline, as the File range answered its write.
+    /// An ID the gateway drew for the request, as it draws a file's, which no other write
+    /// carries: a copy of the write carries it again. A write that carries a file is named by
+    /// the file; one that carries none, an empty object's, is marked under this, as a file is
+    /// (docs/design/metadata.md §2).
+    pub id: u128,
+    /// The write's handover deadline: its file's, as the File range answered its write, or for
+    /// a write with no file, the gateway's time at the request plus the handover it holds a
+    /// file for. A range whose time has passed it refuses the write.
     pub deadline_ns: u64,
 }
 
@@ -168,10 +251,9 @@ pub struct PutPart {
     pub key: String,
     pub upload: String,
     pub number: u16,
+    /// The part, with its file's handover deadline, as the File range answered its write.
     pub part: Part,
     pub at_ns: u64,
-    /// The part's file's handover deadline, as the File range answered its write.
-    pub deadline_ns: u64,
 }
 
 /// CompleteMultipartUpload (05 §4.4).
@@ -194,9 +276,17 @@ pub struct Complete {
     pub size: u64,
     pub checksum: Option<Checksum>,
     pub file: Option<u128>,
+    /// The SHA-256 of the parts the request lists, each its number and its ETag as sent, in
+    /// order (FIPS 180-4). The version keeps it, and a retry once the upload is gone, which
+    /// has no part rows to be checked against, is matched to the version by it, as strictly
+    /// as `parts` is checked against the rows.
+    pub listing: [u8; LISTING],
     /// The bucket's default retention, which the version takes when the upload named none.
     pub default: Option<DefaultRetention>,
-    /// The object file's handover deadline, as the File range answered its write.
+    /// As a PUT's: the ID that names a completion with no file, of parts all empty.
+    pub id: u128,
+    /// As a PUT's: the object file's handover deadline, or the gateway's for a completion
+    /// with no file.
     pub deadline_ns: u64,
 }
 
@@ -232,6 +322,8 @@ pub struct GateChange {
     pub from: Option<GateState>,
     /// Its next state; `None` removes the gate once the range holds no row of the bucket.
     pub to: Option<GateState>,
+    /// The generation of the descriptor the coordinator routed it by.
+    pub generation: u64,
 }
 
 /// Removes rows of a condemned bucket, its uploads and their parts, as the collector does
@@ -243,6 +335,101 @@ pub struct Collect {
     /// Rows this entry may remove, which bounds its size.
     pub budget: u32,
     pub at_ns: u64,
+    /// The generation of the descriptor the coordinator routed it by.
+    pub generation: u64,
+}
+
+/// Splits the range at `at` (docs/design/metadata.md §3): the range keeps the object keys
+/// before it, and a new range, `child`, takes the rest with their rows and marks, the gate of
+/// every bucket whose keys it can hold, the gate floor and the clock. Both take the next
+/// generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Split {
+    /// The generation of the descriptor the splitter read.
+    pub generation: u64,
+    /// The first routing key the child holds (`key::route`), inside the span and past its
+    /// first key.
+    pub at: Vec<u8>,
+    /// The child's ID, which no range has had.
+    pub child: u64,
+}
+
+/// A split's child as the parent makes it ([`child`]): its descriptor, the rows it starts
+/// with beside those it takes, and the key ranges whose rows it takes from the parent as they
+/// stand before the split.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Child {
+    pub descriptor: Descriptor,
+    /// Its lineage, and the parent's gate floor and clock.
+    pub rows: Vec<Row>,
+    /// Its keys' rows and marks, and its buckets' gates.
+    pub spans: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// Freezes the range for a merge into `into`, the range just below it, as the merge's driver
+/// read both (docs/design/metadata.md §3). The range takes no step but the merge's own until
+/// the merge ends it or it thaws, and its generation rises, so a step routed by what it was is
+/// refused after it thaws. A range holding a merge not yet resolved is not frozen: it could
+/// otherwise end with the merge unresolved, and a driver would read the merge as never taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Freeze {
+    /// The generation of the descriptor the driver read.
+    pub generation: u64,
+    /// The range just below, whose ID and generation name the merge.
+    pub into: Descriptor,
+}
+
+/// The lower range's decision on the merge its driver read it for at `generation`: it takes
+/// `from`, the frozen range as it froze, keeping its own gates, if it holds no merge not yet
+/// resolved, `from` begins where it ends, and `from` holds at most `max_rows` rows of at most
+/// `max_bytes` bytes; otherwise it refuses. Either way its generation moves on, so the merge is decided once, and a command
+/// for it that comes later, however late, is routed by a generation the range no longer has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Merge {
+    pub generation: u64,
+    pub from: Descriptor,
+    /// Rows the merge may take, and their bytes, keys and values: together they bound the
+    /// batch the merge writes, since a count bounds no row's size (audit §5.2).
+    pub max_rows: u64,
+    pub max_bytes: u64,
+}
+
+/// A driver abandons a merge not yet decided: the lower range, at the generation the merge
+/// names, moves its generation on, so the merge is never taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Abandon {
+    pub generation: u64,
+}
+
+/// The frozen range ends: the merge named by the range below and its `generation` was taken,
+/// and `into` is that range as the merge left it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct End {
+    pub generation: u64,
+    pub into: Descriptor,
+}
+
+/// The frozen range serves again: the merge named by the range below and its `generation`
+/// will never be taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Thaw {
+    pub generation: u64,
+}
+
+/// The lower range lets go of the merge it took of range `from` at `generation`, once `from`
+/// has ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolve {
+    pub from: u64,
+    pub generation: u64,
+}
+
+/// A coordinator's read, routed by the generation of the descriptor it holds: the answer, or
+/// the range's lineage once the range has moved past that generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Routed<T> {
+    Here(T),
+    Moved(Box<Lineage>),
 }
 
 /// The collector reclaimed a released file, its blocks and chunks: its row in the queue goes.
@@ -270,10 +457,28 @@ pub struct Checked {
     pub deadline_ns: u64,
 }
 
-/// These files are settled in their File range, or reclaimed: their marks go.
+/// These files are reclaimed: their marks go, each once the range's time has passed its
+/// deadline. Only the collector removes a mark, for a file it took apart, which nothing
+/// references again; a mark the sweep removed on settling a file would read, to a sweep
+/// delayed past it, as a file never handed over (audit B01). A mark removed before its
+/// deadline would let a copy of the write that carried the file take it as new, naming a
+/// file already taken apart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unmark {
     pub files: Vec<Marked>,
+    pub at_ns: u64,
+}
+
+/// The collector, reclaiming released composite file `owner`, gives back a part file it
+/// names: released here if `owner` adopted it when its completion committed, and left
+/// otherwise, since the upload or another composite holds it (audit B02).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Disown {
+    pub bucket: String,
+    pub key: String,
+    pub file: u128,
+    pub owner: u128,
+    pub at_ns: u64,
 }
 
 /// A file's mark: the key it is under.
@@ -307,6 +512,10 @@ pub struct Delete {
     /// `x-amz-bypass-governance-retention: true` from a requester allowed
     /// `s3:BypassGovernanceRetention` (18 §2.2).
     pub bypass: bool,
+    /// The canonical ID a delete marker this makes is owned by, as a version's owner is
+    /// the one its `Put` names: under bucket-owner-enforced ownership, the bucket's owner
+    /// (05 §5.1). Listings render it as the marker's `Owner`.
+    pub owner: String,
 }
 
 /// PutObjectRetention (18 §1.2): places, extends, shortens or removes a version's retention.
@@ -341,6 +550,13 @@ pub struct Hold {
 pub enum Outcome {
     /// A version was written; its ID.
     Put { version: String },
+    /// A retried completion found the version the completion made: its ID, and the size and
+    /// checksum the completion gave it.
+    Completed {
+        version: String,
+        size: u64,
+        checksum: Option<Checksum>,
+    },
     /// A delete was done: whether the version it made or removed is a delete marker, and
     /// that version's ID. An unversioned delete names none.
     Deleted {
@@ -368,6 +584,10 @@ pub enum Outcome {
     /// A listed part now holds another file than the gateway read: it read the parts again
     /// and retries, since the object it built would name the old part's bytes.
     Stale,
+    /// The object's size is not the sum of its listed parts', or its ETag does not name their
+    /// number: the gateway combined them wrong (`500 InternalError`). The upload is untouched,
+    /// and the file the write carried released, as any refused write's is.
+    Miscombined,
     /// `404 NoSuchBucket`: the range holds no open gate for the write's incarnation.
     NoSuchBucket,
     /// A gate moved, or a retry found it moved.
@@ -399,12 +619,65 @@ pub enum Outcome {
     Expired,
     /// The sweep's files, each with the range's verdict, in the order it asked.
     Checked(Vec<Verdict>),
-    /// The marks of settled files went.
+    /// The marks of reclaimed files went.
     Unmarked,
+    /// A mark stays, and the others went: a copy of the write that carried its file could
+    /// still be applied until the range's time passes `deadline_ns`, the latest of those
+    /// kept, and the collector asks again then.
+    Awaits { deadline_ns: u64 },
+    /// A part file given back: `released` if the composite adopted it and it is released now.
+    Disowned { released: bool },
+    /// The command was routed by a descriptor the range no longer matches: it took nothing,
+    /// and this is where its span went.
+    Moved(Box<Lineage>),
+    /// The range split: its lineage now, naming the child.
+    Split(Box<Lineage>),
+    /// The range froze for a merge: its lineage now.
+    Frozen(Box<Lineage>),
+    /// The range took the merge: its lineage now.
+    Merged(Box<Lineage>),
+    /// The range refused the merge, or abandoned it, and moved on: its lineage now.
+    Refused(Box<Lineage>),
+    /// The frozen range ended.
+    Ended,
+    /// The frozen range serves again: its lineage now.
+    Thawed(Box<Lineage>),
+    /// The range holds no merge from that range at that generation any more.
+    Resolved,
 }
 
 /// Applies `command` as log entry `index`. A refused command still advances the index.
 pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<Outcome, MetaError> {
+    let lineage = lineage(engine)?;
+    // A frozen or ended range takes only the merge's own steps. A command that is not the
+    // range's takes nothing, not even a file it carries, which its sender hands on to the
+    // range that holds the key.
+    let settled = match (lineage.standing, command) {
+        (Standing::Frozen, Command::Thaw(t)) => Some(thaw(&lineage, t)?),
+        (Standing::Frozen | Standing::Ended, Command::End(e)) => Some(end(&lineage, e)?),
+        (Standing::Serving, Command::Thaw(_) | Command::End(_)) => {
+            Some((Outcome::Conflict, Vec::new()))
+        }
+        (Standing::Serving, Command::Merge(_)) => Some((Outcome::Invalid, Vec::new())),
+        (Standing::Serving, _) if !command.moved(&lineage.now) => None,
+        _ => Some((Outcome::Moved(Box::new(lineage.clone())), Vec::new())),
+    };
+    if let Some((outcome, writes)) = settled {
+        engine.apply(index, &writes)?;
+        return Ok(outcome);
+    }
+    // A write carrying a file the range has marked, or a write with no file whose ID it has
+    // marked, is a copy of one it applied, delivered again after its session forgot it
+    // (docs/design/replica.md §1). Applied again it could make a second version, or be
+    // refused and release a file a version or a composite holds: it is answered as the first
+    // was, and takes and releases nothing.
+    if let Some(c) = command.carries()
+        && let Some(mark) = engine.get(&key::mark(c.bucket, c.key, c.id))?
+    {
+        let outcome = copy(command, Mark::decode(&mark)?);
+        engine.apply(index, &[])?;
+        return Ok(outcome);
+    }
     let admitted = match command.write_to() {
         Some((bucket, incarnation)) => admits(engine, bucket, incarnation)?,
         None => true,
@@ -424,56 +697,430 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
         Command::Abort(a) => abort(engine, a)?,
         Command::Retain(r) => retain(engine, r)?,
         Command::Hold(h) => hold(engine, h)?,
-        Command::Gate(g) => move_gate(engine, g)?,
+        Command::Gate(g) => move_gate(engine, &lineage.now, g)?,
         Command::Collect(c) => collect(engine, c)?,
         Command::Reclaim(r) => (
             Outcome::Reclaimed,
             vec![Write::Delete(key::released(r.released_ns, r.file))],
         ),
         Command::Check(c) => check(engine, c)?,
-        Command::Unmark(u) => (
-            Outcome::Unmarked,
-            u.files
-                .iter()
-                .map(|m| Write::Delete(key::mark(&m.bucket, &m.key, m.file)))
-                .collect(),
-        ),
+        Command::Unmark(u) => unmark(engine, u)?,
+        Command::Disown(d) => disown(engine, d)?,
+        Command::Split(s) => split(engine, s)?,
+        Command::Freeze(f) => freeze(&lineage, f)?,
+        Command::Abandon(_) => refuse(lineage.clone())?,
+        Command::Resolve(r) => resolve(&lineage, r)?,
+        // Settled above.
+        Command::Merge(_) | Command::End(_) | Command::Thaw(_) => (Outcome::Invalid, Vec::new()),
     };
-    // A file a write carries is referenced if the write goes ahead, and released if it is
-    // refused: the gateway wrote it for this write alone. Either way the range has taken it,
-    // and one that came within its deadline is marked for the sweep, which settles a file
-    // only once its deadline has passed, so it comes by after and removes the mark. One past
-    // its deadline may come after the sweep settled the file, and a mark would stay; if the
-    // sweep comes by after, it releases the file a second time, which the reclaimer finds
-    // gone (docs/design/metadata.md §2).
+    // A file a write carries is referenced if the write goes ahead, which marks it with the
+    // version or part that names it, and released if it is refused: the gateway wrote it for
+    // this write alone. One refused within its deadline is marked too, for the sweep and for
+    // a copy of the write. One past its deadline is not: it may come after the sweep settled
+    // the file, and a mark would stay; if the sweep comes by after, it releases the file a
+    // second time, which the reclaimer finds gone (docs/design/metadata.md §2). A refused
+    // write with no file changed nothing, so a copy of it is judged afresh, as the first was,
+    // and nothing marks it.
     let mut writes = writes;
-    if let Some(c) = command.carries() {
-        if !matches!(outcome, Outcome::Put { .. } | Outcome::PartWritten) {
-            let now = clock::now(engine, c.at_ns)?;
-            writes.extend(release(now, c.bucket, c.key, c.file)?);
-        }
+    if let Some(c) = command.carries()
+        && let Some(file) = c.file
+        && !matches!(outcome, Outcome::Put { .. } | Outcome::PartWritten)
+    {
+        let now = clock::now(engine, c.at_ns)?;
+        writes.push(release(now, c.bucket, c.key, file)?);
         if !expired {
-            let mark = key::mark(c.bucket, c.key, c.file);
-            writes.push(Write::Put(mark, Vec::new()));
+            let mark = Mark {
+                how: How::Refused,
+                deadline_ns: c.deadline_ns,
+            };
+            writes.push(Write::Put(key::mark(c.bucket, c.key, file), mark.encode()));
         }
     }
     engine.apply(index, &writes)?;
     Ok(outcome)
 }
 
-/// The rows that release `file`, held under `key`, at the range's time `now_ns`: nothing
-/// references it any more, and the collector reclaims it once the grace period has passed. A
-/// mark the sweep left behind, stopping between settling the file and unmarking it, goes with
-/// it (docs/design/metadata.md §2).
-fn release(now_ns: u64, bucket: &str, key: &str, file: u128) -> Result<[Write; 2], MetaError> {
+/// The range's lineage: its descriptor, and the child of its last split.
+const LINEAGE: &[u8] = &[key::LOCAL, key::marker::LINEAGE];
+
+/// The range's lineage. Every Name range has one from its making: the first by [`first`],
+/// every other by the split that made it.
+pub fn lineage<E: Rows>(engine: &E) -> Result<Lineage, MetaError> {
+    let bytes = engine.get(LINEAGE)?.ok_or(MetaError::Corrupt)?;
+    Ok(Lineage::decode(&bytes)?)
+}
+
+/// The rows of a cell's first Name range, `id`: every object key, at generation 1.
+pub fn first(id: u64) -> Result<Vec<Row>, MetaError> {
+    let lineage = serving(Descriptor {
+        id,
+        lo: Vec::new(),
+        hi: None,
+        generation: 1,
+    });
+    Ok(vec![(LINEAGE.to_vec(), lineage.encode()?)])
+}
+
+/// A serving range's lineage, new: no child, no merge.
+fn serving(now: Descriptor) -> Lineage {
+    Lineage {
+        now,
+        child: None,
+        standing: Standing::Serving,
+        into: None,
+        taken: None,
+    }
+}
+
+/// `lineage` a generation on.
+fn onward(mut lineage: Lineage) -> Result<Lineage, MetaError> {
+    lineage.now.generation = lineage
+        .now
+        .generation
+        .checked_add(1)
+        .ok_or(MetaError::Corrupt)?;
+    Ok(lineage)
+}
+
+fn freeze(lineage: &Lineage, f: &Freeze) -> Result<(Outcome, Vec<Write>), MetaError> {
+    if lineage.taken.is_some() {
+        return Ok((Outcome::Conflict, Vec::new()));
+    }
+    if f.into.hi.as_ref() != Some(&lineage.now.lo) || f.into.id == lineage.now.id {
+        return Ok((Outcome::Invalid, Vec::new()));
+    }
+    let mut frozen = onward(lineage.clone())?;
+    frozen.standing = Standing::Frozen;
+    frozen.into = Some(f.into.clone());
+    let row = Write::Put(LINEAGE.to_vec(), frozen.encode()?);
+    Ok((Outcome::Frozen(Box::new(frozen)), vec![row]))
+}
+
+/// The range refuses a merge, or abandons one, moving its generation on.
+fn refuse(lineage: Lineage) -> Result<(Outcome, Vec<Write>), MetaError> {
+    let refused = onward(lineage)?;
+    let row = Write::Put(LINEAGE.to_vec(), refused.encode()?);
+    Ok((Outcome::Refused(Box::new(refused)), vec![row]))
+}
+
+/// Whether a frozen range is frozen for the merge the range below names with `generation`.
+fn frozen_for(lineage: &Lineage, generation: u64) -> bool {
+    lineage.standing == Standing::Frozen
+        && lineage
+            .into
+            .as_ref()
+            .is_some_and(|d| d.generation == generation)
+}
+
+fn thaw(lineage: &Lineage, t: &Thaw) -> Result<(Outcome, Vec<Write>), MetaError> {
+    if !frozen_for(lineage, t.generation) {
+        return Ok((Outcome::Conflict, Vec::new()));
+    }
+    let mut thawed = onward(lineage.clone())?;
+    thawed.standing = Standing::Serving;
+    thawed.into = None;
+    let row = Write::Put(LINEAGE.to_vec(), thawed.encode()?);
+    Ok((Outcome::Thawed(Box::new(thawed)), vec![row]))
+}
+
+/// The frozen range ends; an end repeated once it has is answered the same. Its rows stay
+/// for the replicas of the range that took them, which each read their own copy, until the
+/// replica group ends.
+fn end(lineage: &Lineage, e: &End) -> Result<(Outcome, Vec<Write>), MetaError> {
+    let into = lineage.into.as_ref().map(|d| d.id);
+    match lineage.standing {
+        Standing::Ended if into == Some(e.into.id) => Ok((Outcome::Ended, Vec::new())),
+        Standing::Frozen if frozen_for(lineage, e.generation) && into == Some(e.into.id) => {
+            let ended = Lineage {
+                standing: Standing::Ended,
+                into: Some(e.into.clone()),
+                ..lineage.clone()
+            };
+            let row = Write::Put(LINEAGE.to_vec(), ended.encode()?);
+            Ok((Outcome::Ended, vec![row]))
+        }
+        _ => Ok((Outcome::Conflict, Vec::new())),
+    }
+}
+
+fn resolve(lineage: &Lineage, r: &Resolve) -> Result<(Outcome, Vec<Write>), MetaError> {
+    let held = Taken {
+        from: r.from,
+        generation: r.generation,
+    };
+    if lineage.taken != Some(held) {
+        return Ok((Outcome::Resolved, Vec::new()));
+    }
+    let resolved = Lineage {
+        taken: None,
+        ..lineage.clone()
+    };
+    let row = Write::Put(LINEAGE.to_vec(), resolved.encode()?);
+    Ok((Outcome::Resolved, vec![row]))
+}
+
+/// Applies merge `m`'s decision as log entry `index` of the lower range, reading `from`, this
+/// replica's copy of the frozen range (docs/design/metadata.md §3). Every replica of the
+/// frozen range applied its freeze before the merge was proposed, and a frozen range takes no
+/// step, so every replica of this range reads the same rows. The range takes the frozen
+/// range's rows and marks, its queue of released files, and the gates of the buckets it holds
+/// none of; the later of the two clocks and the higher of the two floors; and none of its
+/// sessions.
+pub fn merge<E: Rows, F: Rows>(
+    engine: &mut E,
+    index: u64,
+    m: &Merge,
+    from: &F,
+) -> Result<Outcome, MetaError> {
+    let lineage = lineage(engine)?;
+    if lineage.standing != Standing::Serving || lineage.now.generation != m.generation {
+        engine.apply(index, &[])?;
+        return Ok(Outcome::Moved(Box::new(lineage)));
+    }
+    let adjacent = lineage.now.hi.as_ref() == Some(&m.from.lo) && m.from.id != lineage.now.id;
+    let taken = if lineage.taken.is_none() && adjacent {
+        taking(engine, &lineage, m, from)?
+    } else {
+        None
+    };
+    let (outcome, writes) = match taken {
+        Some(taken) => taken,
+        None => refuse(lineage)?,
+    };
+    engine.apply(index, &writes)?;
+    Ok(outcome)
+}
+
+/// The rows by which the range takes the frozen range `from`; `None` if `from` holds more rows
+/// than the merge may take.
+fn taking<E: Rows, F: Rows>(
+    engine: &E,
+    lineage: &Lineage,
+    m: &Merge,
+    from: &F,
+) -> Result<Option<(Outcome, Vec<Write>)>, MetaError> {
+    let theirs = self::lineage(from)?;
+    let named = theirs
+        .into
+        .as_ref()
+        .is_some_and(|d| d.id == lineage.now.id && d.generation == m.generation);
+    if theirs.standing != Standing::Frozen || !named || theirs.now != m.from {
+        return Err(MetaError::Unfrozen);
+    }
+    let mut writes = Vec::new();
+    let mut spans = key::name_spans(&m.from.lo, m.from.hi.as_deref()).to_vec();
+    spans.push(key::released_all());
+    let (gates, gates_end) = (vec![key::LOCAL, key::marker::GATE], key::GATES_END.to_vec());
+    spans.push((gates, gates_end));
+    let (mut rows, mut bytes) = (0u64, 0u64);
+    for (mut at, to) in spans {
+        while let Some((k, v)) = from.next(&at, &to)? {
+            rows = rows.checked_add(1).ok_or(MetaError::Corrupt)?;
+            let row = u64::try_from(k.len().saturating_add(v.len())).unwrap_or(u64::MAX);
+            bytes = bytes.saturating_add(row);
+            if rows > m.max_rows || bytes > m.max_bytes {
+                return Ok(None);
+            }
+            at = after(&k);
+            // The range keeps its own gate of a bucket both hold keys of.
+            if key::decode_gate(&k).is_some() && engine.get(&k)?.is_some() {
+                continue;
+            }
+            writes.push(Write::Put(k, v));
+        }
+    }
+    for local in [FLOOR, clock::ROW] {
+        let ours = engine
+            .get(local)?
+            .map(|b| record::decode_number(&b, "local"))
+            .transpose()?;
+        let theirs = from
+            .get(local)?
+            .map(|b| record::decode_number(&b, "local"))
+            .transpose()?;
+        if let Some(later) = ours.max(theirs) {
+            writes.push(Write::Put(local.to_vec(), record::encode_number(later)));
+        }
+    }
+    let generation = lineage
+        .now
+        .generation
+        .max(m.from.generation)
+        .checked_add(1)
+        .ok_or(MetaError::Corrupt)?;
+    let merged = Lineage {
+        now: Descriptor {
+            id: lineage.now.id,
+            lo: lineage.now.lo.clone(),
+            hi: m.from.hi.clone(),
+            generation,
+        },
+        // A child the range takes back is no longer where any of its span went.
+        child: lineage.child.clone().filter(|c| c.id != m.from.id),
+        standing: Standing::Serving,
+        into: None,
+        taken: Some(Taken {
+            from: m.from.id,
+            generation: m.generation,
+        }),
+    };
+    writes.push(Write::Put(LINEAGE.to_vec(), merged.encode()?));
+    Ok(Some((Outcome::Merged(Box::new(merged)), writes)))
+}
+
+/// A split the range takes: its lineage after, the child's descriptor, and where the gates
+/// the child takes begin and those the range keeps end.
+struct Cut {
+    parent: Lineage,
+    child: Descriptor,
+    child_gates: Vec<u8>,
+    kept_gates_past: Vec<u8>,
+}
+
+/// The split `s` does, or the outcome that refuses it.
+fn cut<E: Rows>(engine: &E, s: &Split) -> Result<Result<Cut, Outcome>, MetaError> {
+    let lineage = lineage(engine)?;
+    let now = &lineage.now;
+    if lineage.standing != Standing::Serving || s.generation != now.generation {
+        return Ok(Err(Outcome::Moved(Box::new(lineage))));
+    }
+    let Some((bucket, key)) = key::decode_route(&s.at) else {
+        return Ok(Err(Outcome::Invalid));
+    };
+    if s.at <= now.lo || now.hi.as_ref().is_some_and(|hi| s.at >= *hi) || s.child == now.id {
+        return Ok(Err(Outcome::Invalid));
+    }
+    let generation = now.generation.checked_add(1).ok_or(MetaError::Corrupt)?;
+    let child = Descriptor {
+        id: s.child,
+        lo: s.at.clone(),
+        hi: now.hi.clone(),
+        generation,
+    };
+    let parent = Lineage {
+        now: Descriptor {
+            id: now.id,
+            lo: now.lo.clone(),
+            hi: Some(s.at.clone()),
+            generation,
+        },
+        child: Some(child.clone()),
+        ..lineage.clone()
+    };
+    // The child can hold keys of every bucket from the one `at` falls in; the range keeps the
+    // gates of those whose keys begin before `at`, the one `at` falls in unless `at` is its
+    // first routing key.
+    let child_gates = key::gate(&bucket);
+    let kept_gates_past = if key.is_empty() {
+        child_gates.clone()
+    } else {
+        after(&child_gates)
+    };
+    Ok(Ok(Cut {
+        parent,
+        child,
+        child_gates,
+        kept_gates_past,
+    }))
+}
+
+fn split<E: Rows>(engine: &E, s: &Split) -> Result<(Outcome, Vec<Write>), MetaError> {
+    let cut = match cut(engine, s)? {
+        Ok(cut) => cut,
+        Err(outcome) => return Ok((outcome, Vec::new())),
+    };
+    let mut writes = vec![Write::Put(LINEAGE.to_vec(), cut.parent.encode()?)];
+    for (from, to) in key::name_spans(&cut.child.lo, cut.child.hi.as_deref()) {
+        writes.push(Write::Clear(from, to));
+    }
+    writes.push(Write::Clear(cut.kept_gates_past, key::GATES_END.to_vec()));
+    Ok((Outcome::Split(Box::new(cut.parent)), writes))
+}
+
+/// The child split `s` makes, read from the range before it applies the split; `None` if the
+/// range would refuse it. The child starts with its lineage and the range's gate floor and
+/// clock, so no attempt the range refused may place a gate there and no time it gave repeats,
+/// and takes the rows of its keys, their marks and its buckets' gates as they stand. It holds
+/// no session and none of the range's queue of released files, which the range keeps.
+pub fn child<E: Rows>(engine: &E, s: &Split) -> Result<Option<Child>, MetaError> {
+    let Ok(cut) = cut(engine, s)? else {
+        return Ok(None);
+    };
+    let lineage = serving(cut.child.clone());
+    let mut rows = vec![(LINEAGE.to_vec(), lineage.encode()?)];
+    for local in [FLOOR, clock::ROW] {
+        if let Some(value) = engine.get(local)? {
+            rows.push((local.to_vec(), value));
+        }
+    }
+    let mut spans = key::name_spans(&cut.child.lo, cut.child.hi.as_deref()).to_vec();
+    spans.push((cut.child_gates, key::GATES_END.to_vec()));
+    Ok(Some(Child {
+        descriptor: cut.child,
+        rows,
+        spans,
+    }))
+}
+
+/// The row that releases `file`, held under `key`, at the range's time `now_ns`: nothing
+/// references it any more, and the collector reclaims it once the grace period has passed.
+/// The file's mark stays until the collector has reclaimed it, so a copy of the write that
+/// handed it over is still recognised (docs/design/metadata.md §2).
+fn release(now_ns: u64, bucket: &str, key: &str, file: u128) -> Result<Write, MetaError> {
+    queue(now_ns, bucket, key, file, true)
+}
+
+/// The row that puts `id`, held under `key`, in the queue of released files at `now_ns`:
+/// a file's ID, or the ID of a write that carried none, whose mark alone the collector
+/// removes.
+fn queue(now_ns: u64, bucket: &str, key: &str, id: u128, file: bool) -> Result<Write, MetaError> {
     let holder = Holder {
         bucket: bucket.to_owned(),
         key: key.to_owned(),
+        file,
     };
-    Ok([
-        Write::Put(key::released(now_ns, file), holder.encode()?),
-        Write::Delete(key::mark(bucket, key, file)),
-    ])
+    Ok(Write::Put(key::released(now_ns, id), holder.encode()?))
+}
+
+/// The answer to a copy of a write the range marked: what the write answered when the range
+/// took it. A write refused, or one that never came, released its file, and its copy is
+/// refused as a write past its deadline is, so the gateway writes the file again.
+fn copy(command: &Command, mark: Mark) -> Outcome {
+    match (command, mark.how) {
+        (Command::Put(_) | Command::Complete(_), How::Version { order, null }) => Outcome::Put {
+            version: id(null, order),
+        },
+        (Command::PutPart(_), How::Part | How::Adopted { .. }) => Outcome::PartWritten,
+        _ => Outcome::Expired,
+    }
+}
+
+/// Removes the marks of reclaimed files, each only once the range's time has passed its
+/// deadline: until then a copy of the write that carried the file is applied as new if it
+/// finds no mark, and would name a file the collector took apart. The time is recorded as a
+/// write's, as the sweep's check records it, so a copy that comes after, even from a leader
+/// whose clock runs behind, reads a time past the deadline and is refused.
+fn unmark<E: Rows>(engine: &E, u: &Unmark) -> Result<(Outcome, Vec<Write>), MetaError> {
+    let (now, clock) = clock::tick(engine, u.at_ns)?;
+    let mut writes = vec![clock];
+    let mut kept = None;
+    for m in &u.files {
+        let mark = key::mark(&m.bucket, &m.key, m.file);
+        let Some(value) = engine.get(&mark)? else {
+            continue;
+        };
+        let deadline_ns = Mark::decode(&value)?.deadline_ns;
+        if now > deadline_ns {
+            writes.push(Write::Delete(mark));
+        } else {
+            kept = kept.max(Some(deadline_ns));
+        }
+    }
+    let outcome = match kept {
+        None => Outcome::Unmarked,
+        Some(deadline_ns) => Outcome::Awaits { deadline_ns },
+    };
+    Ok((outcome, writes))
 }
 
 /// The range's verdict on each file the sweep asks about, releasing and marking every file
@@ -482,16 +1129,15 @@ fn release(now_ns: u64, bucket: &str, key: &str, file: u128) -> Result<[Write; 2
 /// with a slower clock proposed, and a handover that comes after finds the deadline passed.
 fn check<E: Rows>(engine: &E, c: &Check) -> Result<(Outcome, Vec<Write>), MetaError> {
     let (now, clock) = clock::tick(engine, c.at_ns)?;
-    let mut verdicts = Vec::with_capacity(c.files.len());
+    let mut verdicts = reserved(c.files.len())?;
     let mut writes = vec![clock];
     for f in &c.files {
         let mark = key::mark(&f.bucket, &f.key, f.file);
         verdicts.push(if engine.get(&mark)?.is_some() {
             Verdict::Held
         } else if now > f.deadline_ns {
-            let [queued, _] = release(now, &f.bucket, &f.key, f.file)?;
-            writes.push(queued);
-            writes.push(Write::Put(mark, Vec::new()));
+            writes.push(release(now, &f.bucket, &f.key, f.file)?);
+            writes.push(Write::Put(mark, Mark::SWEPT.encode()));
             Verdict::Released
         } else {
             Verdict::Young
@@ -535,8 +1181,18 @@ fn admits<E: Rows>(engine: &E, bucket: &str, incarnation: u64) -> Result<bool, M
         .is_some_and(|g| g.incarnation == incarnation && g.state == GateState::Open))
 }
 
-fn move_gate<E: Rows>(engine: &E, g: &GateChange) -> Result<(Outcome, Vec<Write>), MetaError> {
+fn move_gate<E: Rows>(
+    engine: &E,
+    now: &Descriptor,
+    g: &GateChange,
+) -> Result<(Outcome, Vec<Write>), MetaError> {
     use GateState::{Closed, Condemned, Open};
+    // A range keeps gates only for the buckets whose keys it can hold, which a split divides
+    // by its span.
+    let (first, past) = key::bucket_routes(&g.bucket);
+    if !now.meets(&first, &past) {
+        return Ok((Outcome::Invalid, Vec::new()));
+    }
     // The steps creating and deleting a bucket take. A delete that takes over from an
     // attempt left behind closes each gate again, and one that abandons an unfinished create
     // places closed gates where none was opened.
@@ -626,7 +1282,7 @@ fn collect<E: Rows>(engine: &E, c: &Collect) -> Result<(Outcome, Vec<Write>), Me
         match key::decode_name(&k) {
             Some((_, _, NameRow::Upload(_))) => {}
             Some((_, object, NameRow::Part(..))) => {
-                writes.extend(release(now, &c.bucket, &object, Part::decode(&v)?.file)?);
+                writes.push(release(now, &c.bucket, &object, Part::decode(&v)?.file)?);
             }
             // A version under a condemned gate: the delete never read this range (§2), and
             // the collector removes no object.
@@ -701,6 +1357,18 @@ fn put<E: Rows>(engine: &E, p: &Put) -> Result<(Outcome, Vec<Write>), MetaError>
         key::name(bucket, key, &NameRow::Version(order)),
         written.encode()?,
     ));
+    // The version's file is marked with it; a version with no file is marked under its
+    // write's ID, which the queue of released files holds for the collector to unmark once
+    // the deadline has passed, since no release of a file will.
+    let mark = Mark {
+        how: How::Version { order, null },
+        deadline_ns: p.deadline_ns,
+    };
+    let named = version.file.unwrap_or(p.id);
+    writes.push(Write::Put(key::mark(bucket, key, named), mark.encode()));
+    if version.file.is_none() {
+        writes.push(queue(time, bucket, key, p.id, false)?);
+    }
     Ok((
         Outcome::Put {
             version: id(null, order),
@@ -767,7 +1435,7 @@ fn delete<E: Rows>(engine: &E, d: &Delete) -> Result<(Outcome, Vec<Write>), Meta
                         writes.push(Write::Delete(key::name(bucket, key, &NameRow::Null)));
                     }
                     if let Some(file) = v.file {
-                        writes.extend(release(now, bucket, key, file)?);
+                        writes.push(release(now, bucket, key, file)?);
                     }
                     Some(v)
                 }
@@ -813,10 +1481,11 @@ fn delete<E: Rows>(engine: &E, d: &Delete) -> Result<(Outcome, Vec<Write>), Meta
                     size: 0,
                     checksum: None,
                     file: None,
-                    owner: String::new(),
+                    owner: d.owner.clone(),
                     headers: Vec::new(),
                     retention: None,
                     legal_hold: None,
+                    listing: None,
                 };
                 writes.push(Write::Put(
                     key::name(bucket, key, &NameRow::Version(order)),
@@ -857,6 +1526,9 @@ fn create_upload<E: Rows>(
 }
 
 fn put_part<E: Rows>(engine: &E, p: &PutPart) -> Result<(Outcome, Vec<Write>), MetaError> {
+    if !(1..=MAX_PART_NUMBER).contains(&p.number) || p.part.size > MAX_PART {
+        return Ok((Outcome::Invalid, Vec::new()));
+    }
     if upload(engine, &p.bucket, &p.key, &p.upload)?.is_none() {
         return Ok((Outcome::NoSuchUpload, Vec::new()));
     }
@@ -865,15 +1537,23 @@ fn put_part<E: Rows>(engine: &E, p: &PutPart) -> Result<(Outcome, Vec<Write>), M
         &p.key,
         &NameRow::Part(p.upload.clone().into_bytes(), p.number),
     );
-    let mut writes = Vec::with_capacity(2);
+    let mut writes = Vec::new();
     // A part uploaded again replaces the first (05 §4.3), whose file nothing then references.
     if let Some(replaced) = engine.get(&row)?.map(|b| Part::decode(&b)).transpose()?
         && replaced.file != p.part.file
     {
         let now = clock::now(engine, p.at_ns)?;
-        writes.extend(release(now, &p.bucket, &p.key, replaced.file)?);
+        writes.push(release(now, &p.bucket, &p.key, replaced.file)?);
     }
     writes.push(Write::Put(row, p.part.encode()?));
+    let mark = Mark {
+        how: How::Part,
+        deadline_ns: p.part.deadline_ns,
+    };
+    writes.push(Write::Put(
+        key::mark(&p.bucket, &p.key, p.part.file),
+        mark.encode(),
+    ));
     Ok((Outcome::PartWritten, writes))
 }
 
@@ -885,34 +1565,32 @@ fn complete<E: Rows>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), 
             None => None,
         };
         return Ok(match made {
-            Some((order, v)) if !v.marker && v.etag == c.etag => {
-                // A retry the gateway made a file for again: the version holds the first.
-                let mut writes = Vec::new();
-                if let Some(file) = c.file
-                    && v.file != c.file
-                {
-                    let now = clock::now(engine, c.at_ns)?;
-                    writes.extend(release(now, &c.bucket, &c.key, file)?);
-                }
-                (
-                    Outcome::Put {
-                        version: id(v.null, order),
-                    },
-                    writes,
-                )
-            }
+            // A retry that carries a file carries one made for it again, which `apply`
+            // releases: the version holds the first.
+            Some((order, v)) if !v.marker && v.etag == c.etag && v.listing == Some(c.listing) => (
+                Outcome::Completed {
+                    version: id(v.null, order),
+                    size: v.size,
+                    checksum: v.checksum,
+                },
+                Vec::new(),
+            ),
             _ => (Outcome::NoSuchUpload, Vec::new()),
         });
     };
     if c.parts.is_empty()
         || !c
             .parts
-            .windows(2)
-            .all(|w| matches!(w, [a, b] if a.number < b.number))
+            .array_windows::<2>()
+            .all(|[a, b]| a.number < b.number)
     {
         return Ok((Outcome::InvalidPartOrder, Vec::new()));
     }
     let last = c.parts.len().saturating_sub(1);
+    let mut total = 0u64;
+    let mut empty = Vec::new();
+    // Each listed part's deadline, from its row, for the mark adopting it keeps.
+    let mut deadlines = reserved(c.parts.len())?;
     for (i, listed) in c.parts.iter().enumerate() {
         let row = key::name(
             &c.bucket,
@@ -931,6 +1609,17 @@ fn complete<E: Rows>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), 
         if i < last && part.size < MIN_PART {
             return Ok((Outcome::EntityTooSmall, Vec::new()));
         }
+        total = total.checked_add(part.size).ok_or(MetaError::Corrupt)?;
+        if part.size == 0 {
+            empty.push(part.file);
+        }
+        deadlines.push(part.deadline_ns);
+    }
+    // The object is its parts: what the gateway combined from them is checked against the
+    // rows here (audit §16.5). The ETag's digest and the checksum need the protocol layer's
+    // hashes, which the gateway's driver derives from these same rows.
+    if c.size != total || !c.etag.ends_with(&format!("-{}", c.parts.len())) {
+        return Ok((Outcome::Miscombined, Vec::new()));
     }
     let (outcome, mut writes) = put(
         engine,
@@ -954,21 +1643,64 @@ fn complete<E: Rows>(engine: &E, c: &Complete) -> Result<(Outcome, Vec<Write>), 
                 headers: upload_row.headers,
                 retention: upload_row.retention,
                 legal_hold: upload_row.legal_hold,
+                listing: Some(c.listing),
             },
             default: c.default,
+            id: c.id,
             deadline_ns: c.deadline_ns,
         },
     )?;
     if matches!(outcome, Outcome::Put { .. }) {
         // Parts not listed are discarded with the upload (05 §4.4); those listed are now the
-        // object's file's extents.
+        // object's file's extents, adopted by it: their marks name it, so reclaiming it gives
+        // them back, and reclaiming any other composite of them does not (audit B02). With no
+        // file to adopt them, nothing references them.
         let listed: Vec<u16> = c.parts.iter().map(|p| p.number).collect();
         let now = clock::now(engine, c.at_ns)?;
         writes.extend(remove_upload(
             engine, &c.bucket, &c.key, &c.upload, &listed, now,
         )?);
+        // An empty part holds no byte of the object, and a file of parts names no empty
+        // extent, so it is given back with the upload rather than adopted. An adopted part
+        // keeps its write's deadline, which bounds when its mark may go; its row, read above,
+        // holds it, so no mark is read.
+        for (part, &deadline_ns) in c.parts.iter().zip(&deadlines) {
+            match c.file {
+                Some(by) if !empty.contains(&part.file) => {
+                    let adopted = Mark {
+                        how: How::Adopted { by },
+                        deadline_ns,
+                    };
+                    writes.push(Write::Put(
+                        key::mark(&c.bucket, &c.key, part.file),
+                        adopted.encode(),
+                    ));
+                }
+                _ => writes.push(release(now, &c.bucket, &c.key, part.file)?),
+            }
+        }
     }
     Ok((outcome, writes))
+}
+
+/// Releases part file `d.file` if composite `d.owner` adopted it: its mark names `d.owner`.
+/// Its mark goes back to a part's, so a second give-back releases it no more.
+fn disown<E: Rows>(engine: &E, d: &Disown) -> Result<(Outcome, Vec<Write>), MetaError> {
+    let mark = key::mark(&d.bucket, &d.key, d.file);
+    let held = match engine.get(&mark)? {
+        Some(value) => Mark::decode(&value)?,
+        None => return Ok((Outcome::Disowned { released: false }, Vec::new())),
+    };
+    if held.how != (How::Adopted { by: d.owner }) {
+        return Ok((Outcome::Disowned { released: false }, Vec::new()));
+    }
+    let (now, clock) = clock::tick(engine, d.at_ns)?;
+    let writes = vec![
+        clock,
+        release(now, &d.bucket, &d.key, d.file)?,
+        Write::Put(mark, held.with(How::Part).encode()),
+    ];
+    Ok((Outcome::Disowned { released: true }, writes))
 }
 
 fn retain<E: Rows>(engine: &E, r: &Retain) -> Result<(Outcome, Vec<Write>), MetaError> {
@@ -1102,8 +1834,10 @@ fn remove_upload<E: Rows>(
         let Some((_, _, NameRow::Part(_, number))) = key::decode_name(&k) else {
             return Err(MetaError::Corrupt);
         };
-        if !kept.contains(&number) {
-            writes.extend(release(now_ns, bucket, key, Part::decode(&v)?.file)?);
+        // `kept` is in ascending order, as a completion's parts must be: a search, not a
+        // scan, keeps a completion of 10,000 parts linear in them (audit P02).
+        if kept.binary_search(&number).is_err() {
+            writes.push(release(now_ns, bucket, key, Part::decode(&v)?.file)?);
         }
         from = after(&k);
         writes.push(Write::Delete(k));
@@ -1214,7 +1948,7 @@ fn remove_null<E: Rows>(
                 Write::Delete(key::name(bucket, key, &NameRow::Null)),
             ];
             if let Some(file) = v.file {
-                writes.extend(release(now_ns, bucket, key, file)?);
+                writes.push(release(now_ns, bucket, key, file)?);
             }
             Ok((Some(v), writes))
         }
@@ -1320,8 +2054,12 @@ impl Versioned {
 pub enum VersionFrom<'a> {
     /// The first version of the first key at or after these object-key bytes.
     Key(&'a [u8]),
-    /// The version after the one `version_id` names, `null` included (05 §7.1). An ID that
-    /// names no version of the key starts at the key's first, so no version is skipped.
+    /// The version after the one `version_id` names, `null` included (05 §7.1). An ID carries
+    /// its version's place in the key's order, so the scan resumes after that place even when
+    /// no version is there, as when it was deleted between pages: nothing is listed twice or
+    /// skipped (audit B07; what S3 answers such a marker is not recorded, 05 §6.4). A `null`
+    /// naming no version, or an ID that does not parse, carries no place and starts at the
+    /// key's first.
     After { key: &'a str, version_id: &'a str },
 }
 
@@ -1477,10 +2215,45 @@ pub enum Probe {
     Paused(Vec<u8>),
 }
 
-/// Whether the range holds a version or delete marker of `bucket`, reading at most `budget`
-/// rows from `from`, a paused read's key, or from the bucket's first row. A key's versions
-/// sort before its uploads, so one row answers for each key.
+/// The range's gate for `bucket`, read by a coordinator routed by `generation`.
+pub fn read_gate<E: Rows>(
+    engine: &E,
+    bucket: &str,
+    generation: u64,
+) -> Result<Routed<Option<Gate>>, MetaError> {
+    routed(engine, generation, || gate(engine, bucket))
+}
+
+/// Whether the range holds a version or delete marker of `bucket`, read by a coordinator
+/// routed by `generation`: at most `budget` rows from `from`, a paused read's key, or from the
+/// bucket's first row. A key's versions sort before its uploads, so one row answers for each
+/// key.
 pub fn probe<E: Rows>(
+    engine: &E,
+    bucket: &str,
+    generation: u64,
+    from: Option<&[u8]>,
+    budget: usize,
+) -> Result<Routed<Probe>, MetaError> {
+    routed(engine, generation, || {
+        probe_rows(engine, bucket, from, budget)
+    })
+}
+
+/// `read`'s answer if the range is at `generation`, or its lineage.
+fn routed<E: Rows, T>(
+    engine: &E,
+    generation: u64,
+    read: impl FnOnce() -> Result<T, MetaError>,
+) -> Result<Routed<T>, MetaError> {
+    let lineage = lineage(engine)?;
+    if lineage.standing != Standing::Serving || lineage.now.generation != generation {
+        return Ok(Routed::Moved(Box::new(lineage)));
+    }
+    Ok(Routed::Here(read()?))
+}
+
+fn probe_rows<E: Rows>(
     engine: &E,
     bucket: &str,
     from: Option<&[u8]>,
@@ -1525,19 +2298,36 @@ mod tests {
     use super::*;
     use crate::engine::{Engine, Model};
 
+    /// A cell's first Name range, holding every key.
+    fn seeded() -> Model {
+        let mut m = Model::default();
+        m.install(0, first(1).unwrap()).unwrap();
+        m.persist().unwrap();
+        m
+    }
+
     struct Range {
         engine: Model,
         index: u64,
         clock: u64,
+        /// The writes carrying a file sent through [`Range::sent`], to be sent again.
+        history: Vec<Command>,
+        /// The file the next PUT carries, and the next completion's composite: a gateway
+        /// makes one for each attempt.
+        file: u128,
+        composite: u128,
     }
 
     impl Range {
         /// A range holding bucket "b", incarnation 1, open.
         fn new() -> Self {
             let mut r = Self {
-                engine: Model::default(),
+                engine: seeded(),
                 index: 0,
                 clock: 1_000,
+                history: Vec::new(),
+                file: 1,
+                composite: 99,
             };
             assert_eq!(r.gate(None, Some(GateState::Open)), Outcome::GateMoved);
             r
@@ -1559,12 +2349,25 @@ mod tests {
                 attempt,
                 from,
                 to,
+                generation: 1,
             }))
         }
 
         fn run(&mut self, command: Command) -> Outcome {
             self.index += 1;
             apply(&mut self.engine, self.index, &command).unwrap()
+        }
+
+        /// Runs `command` and keeps it to be sent again.
+        fn sent(&mut self, command: Command) -> Outcome {
+            self.history.push(command.clone());
+            self.run(command)
+        }
+
+        /// A file no write has carried.
+        fn fresh(&mut self) -> u128 {
+            self.file += 1;
+            self.file - 1
         }
 
         fn put(&mut self, key: &str, etag: &str, versioning: Versioning) -> Outcome {
@@ -1579,7 +2382,8 @@ mod tests {
             p: Preconditions,
         ) -> Outcome {
             self.clock += 10;
-            self.run(Command::Put(Put {
+            let file = self.fresh();
+            self.sent(Command::Put(Put {
                 bucket: "b".into(),
                 incarnation: 1,
                 key: key.into(),
@@ -1587,8 +2391,12 @@ mod tests {
                 preconditions: p,
                 at_ns: self.clock,
                 ordered_ns: None,
-                version: object(etag),
+                version: Version {
+                    file: Some(file),
+                    ..object(etag)
+                },
                 default: None,
+                id: 0,
                 deadline_ns: u64::MAX,
             }))
         }
@@ -1604,6 +2412,23 @@ mod tests {
                 if_match: None,
                 at_ns: self.clock,
                 bypass: false,
+                owner: "o".into(),
+            }))
+        }
+
+        /// A delete of `key` by `owner`, stacking a marker in a versioned bucket.
+        fn delete_by(&mut self, key: &str, owner: &str) -> Outcome {
+            self.clock += 10;
+            self.run(Command::Delete(Delete {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: key.into(),
+                versioning: Versioning::Enabled,
+                named: None,
+                if_match: None,
+                at_ns: self.clock,
+                bypass: false,
+                owner: owner.into(),
             }))
         }
 
@@ -1624,6 +2449,7 @@ mod tests {
         }
     }
 
+    /// An object whose write carries no file; one that carries a file names one made for it.
     fn object(etag: &str) -> Version {
         Version {
             marker: false,
@@ -1632,11 +2458,12 @@ mod tests {
             etag: etag.into(),
             size: 1,
             checksum: None,
-            file: Some(1),
+            file: None,
             owner: "o".into(),
             headers: Vec::new(),
             retention: None,
             legal_hold: None,
+            listing: None,
         }
     }
 
@@ -1821,6 +2648,7 @@ mod tests {
                 ordered_ns: Some(early),
                 version: object("upload"),
                 default: None,
+                id: 0,
                 deadline_ns: u64::MAX,
             }),
         )
@@ -1939,6 +2767,17 @@ mod tests {
             .1,
             marker
         );
+        // A version deleted between pages still marks its place: the scan goes on after it.
+        let gone = seen[1].1.clone();
+        let order = key::parse_version_id(&gone).unwrap();
+        r.delete("a", Versioning::Enabled, Some(Named::Order(order)));
+        let mut budget = 10;
+        let after_gone = VersionFrom::After {
+            key: "a",
+            version_id: &gone,
+        };
+        let step = next_version(&r.engine, "b", after_gone, &end, &mut budget).unwrap();
+        assert_eq!(found(step).1, "null");
         r.delete("a", Versioning::Enabled, Some(Named::Null));
         let mut budget = 10;
         let after_null = VersionFrom::After {
@@ -2039,15 +2878,36 @@ mod tests {
                     checksum: None,
                     file,
                     modified_ns: 0,
+                    deadline_ns: u64::MAX,
                 },
                 at_ns: 0,
-                deadline_ns: u64::MAX,
             }))
         }
 
         fn complete(&mut self, key: &str, upload: &str, parts: &[(u16, &str, u128)]) -> Outcome {
+            // Combined as the gateway combines them: the size the listed parts' sum.
+            let held = super::parts(&self.engine, "b", key, upload, 0, 10_000).unwrap();
+            let size = parts
+                .iter()
+                .filter_map(|&(n, _, _)| held.iter().find(|(h, _)| *h == n))
+                .map(|(_, p)| p.size)
+                .sum();
+            let etag = format!("whole-{}", parts.len());
+            self.complete_as(key, upload, parts, size, &etag)
+        }
+
+        fn complete_as(
+            &mut self,
+            key: &str,
+            upload: &str,
+            parts: &[(u16, &str, u128)],
+            size: u64,
+            etag: &str,
+        ) -> Outcome {
             self.clock += 10;
-            self.run(Command::Complete(Complete {
+            let file = self.composite;
+            self.composite += 1;
+            self.sent(Command::Complete(Complete {
                 bucket: "b".into(),
                 incarnation: 1,
                 key: key.into(),
@@ -2063,14 +2923,63 @@ mod tests {
                         file,
                     })
                     .collect(),
-                etag: "whole-2".into(),
-                size: 11 << 20,
+                etag: etag.into(),
+                size,
                 checksum: None,
-                file: Some(99),
+                file: Some(file),
                 default: None,
+                id: 0,
                 deadline_ns: u64::MAX,
+                listing: listing(parts),
             }))
         }
+    }
+
+    /// A digest of the parts listed, their numbers and ETags, standing in for the gateway's
+    /// SHA-256: distinct for the lists these tests send.
+    fn listing(parts: &[(u16, &str, u128)]) -> [u8; crate::record::LISTING] {
+        let mut text = Vec::new();
+        for (number, etag, _) in parts {
+            text.extend_from_slice(&number.to_be_bytes());
+            text.extend_from_slice(etag.as_bytes());
+            text.push(0);
+        }
+        let mut digest = [0; crate::record::LISTING];
+        digest[..4].copy_from_slice(&mantle_crc::crc32c(&text).to_be_bytes());
+        digest
+    }
+
+    /// A delete marker is owned as its delete says, as a version is as its put says, so a
+    /// listing renders its owner rather than an empty one (audit §7.1).
+    #[test]
+    fn a_delete_marker_is_owned_as_its_delete_says() {
+        let mut r = Range::new();
+        r.put("k", "e1", Versioning::Enabled);
+        let Outcome::Deleted { marker: true, .. } = r.delete_by("k", "bucket-owner") else {
+            panic!("no marker")
+        };
+        let (_, marker) = current(&r.engine, "b", "k").unwrap().unwrap();
+        assert!(marker.marker);
+        assert_eq!(marker.owner, "bucket-owner");
+    }
+
+    /// A part numbered outside 1 to 10,000, or larger than 5 GiB, is refused and leaves no
+    /// row, whatever reached the log (audit §7.1).
+    #[test]
+    fn parts_outside_s3s_limits_are_refused() {
+        let mut r = Range::new();
+        let u = r.create("k");
+        assert_eq!(r.part("k", &u, 0, 1, 11), Outcome::Invalid);
+        assert_eq!(
+            r.part("k", &u, MAX_PART_NUMBER + 1, 1, 12),
+            Outcome::Invalid
+        );
+        assert_eq!(r.part("k", &u, 1, MAX_PART + 1, 13), Outcome::Invalid);
+        assert!(parts(&r.engine, "b", "k", &u, 0, 10).unwrap().is_empty());
+        assert_eq!(
+            r.part("k", &u, MAX_PART_NUMBER, MAX_PART, 14),
+            Outcome::PartWritten
+        );
     }
 
     #[test]
@@ -2109,11 +3018,23 @@ mod tests {
                 .is_empty()
         );
         assert!(upload(&r.engine, "b", "k", &second).unwrap().is_some());
-        // A retried complete answers as the first did (05 §4.4).
+        // A retried complete answers with the version the first made, its size and checksum
+        // (05 §4.4), and only for the parts the first listed, numbered as it numbered them.
         assert_eq!(
             r.complete("k", &first, &[(1, "e1", 11), (2, "e2", 22)]),
-            done
+            Outcome::Completed {
+                version,
+                size: v.size,
+                checksum: v.checksum.clone(),
+            }
         );
+        for other in [
+            &[(1, "e1", 11), (3, "e2", 22)][..],
+            &[(2, "e1", 11), (3, "e2", 22)],
+            &[(1, "E1", 11), (2, "e2", 22)],
+        ] {
+            assert_eq!(r.complete("k", &first, other), Outcome::NoSuchUpload);
+        }
         assert_eq!(r.part("k", &first, 4, 1, 14), Outcome::NoSuchUpload);
     }
 
@@ -2158,6 +3079,464 @@ mod tests {
             r.complete("k", "0000000000000", &[(1, "e1", 1)]),
             Outcome::NoSuchUpload
         );
+    }
+
+    /// What a completion combined from its parts is checked against them: a size that is not
+    /// the listed parts' sum, or an ETag that does not name their number, is refused and the
+    /// upload left as it was (audit §16.5). An empty last part is given back with the upload
+    /// rather than adopted by the object's file, which names no empty extent.
+    #[test]
+    fn a_complete_is_checked_against_its_parts() {
+        let mut r = Range::new();
+        let u = r.create("k");
+        r.part("k", &u, 1, MIN_PART, 21);
+        r.part("k", &u, 2, 0, 22);
+        let listed = [(1, "e1", 21), (2, "e2", 22)];
+        for (size, etag) in [
+            (MIN_PART + 1, "whole-2"),
+            (MIN_PART, "whole-3"),
+            (MIN_PART, "whole"),
+        ] {
+            assert_eq!(
+                r.complete_as("k", &u, &listed, size, etag),
+                Outcome::Miscombined,
+                "{size} {etag}"
+            );
+        }
+        assert!(upload(&r.engine, "b", "k", &u).unwrap().is_some());
+        assert!(matches!(
+            r.complete_as("k", &u, &listed, MIN_PART, "whole-2"),
+            Outcome::Put { .. }
+        ));
+        let released: Vec<u128> = released(&r.engine, u64::MAX, 10)
+            .unwrap()
+            .iter()
+            .map(|f| f.file)
+            .collect();
+        assert!(
+            released.contains(&22) && !released.contains(&21),
+            "{released:?}"
+        );
+        // Each attempt carried a file made for it; the fourth's composite adopted the part.
+        let adopted = r.engine.get(&key::mark("b", "k", 21)).unwrap().unwrap();
+        assert_eq!(
+            Mark::decode(&adopted).map(|m| m.how),
+            Ok(How::Adopted { by: 102 })
+        );
+    }
+
+    /// The files in the released queue, as the collector would take them.
+    fn queued(r: &Range) -> Vec<u128> {
+        released(&r.engine, u64::MAX, 100)
+            .unwrap()
+            .iter()
+            .map(|f| f.file)
+            .collect()
+    }
+
+    /// Every version of `key` that names `file`.
+    fn naming(r: &Range, key: &str, file: u128) -> usize {
+        let mut count = 0;
+        let mut from = key::name("b", key, &NameRow::Version(0));
+        let to = key::name("b", key, &NameRow::Upload(Vec::new()));
+        while let Some((k, v)) = r.engine.next(&from, &to).unwrap() {
+            count += usize::from(Version::decode(&v).unwrap().file == Some(file));
+            from = after(&k);
+        }
+        count
+    }
+
+    /// A part's write delivered again once its upload completed, as a gateway re-sends it
+    /// under a new session that cannot recognise it (docs/design/replica.md §1), within its
+    /// deadline and past it. The object's file holds the part as an extent, so neither copy
+    /// may release it: the copy answers as the write did, and the part stays adopted.
+    #[test]
+    fn a_part_sent_again_after_its_completion_releases_nothing() {
+        let mut r = Range::new();
+        let u = r.create("k");
+        let sent = |at_ns: u64, deadline_ns: u64| {
+            Command::PutPart(PutPart {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: "k".into(),
+                upload: u.clone(),
+                number: 1,
+                part: Part {
+                    etag: "e1".into(),
+                    size: MIN_PART,
+                    checksum: None,
+                    file: 21,
+                    modified_ns: 0,
+                    deadline_ns,
+                },
+                at_ns,
+            })
+        };
+        assert_eq!(r.run(sent(r.clock, r.clock + 100)), Outcome::PartWritten);
+        let Outcome::Put { version } = r.complete("k", &u, &[(1, "e1", 21)]) else {
+            panic!("not completed")
+        };
+        let again = r.run(sent(r.clock, r.clock + 100));
+        assert!(
+            !queued(&r).contains(&21),
+            "{again:?} released {:?}",
+            queued(&r)
+        );
+        r.clock += 1_000;
+        let late = r.run(sent(r.clock, 1));
+        assert!(
+            !queued(&r).contains(&21),
+            "{late:?} released {:?}",
+            queued(&r)
+        );
+        assert_eq!((again, late), (Outcome::PartWritten, Outcome::PartWritten));
+        // The object keeps its extent: reclaiming the object's file gives the part back.
+        let (_, v) = current(&r.engine, "b", "k").unwrap().unwrap();
+        assert_eq!(id(v.null, !key::parse_version_id(&u).unwrap()), version);
+        let give_back = Command::Disown(Disown {
+            bucket: "b".into(),
+            key: "k".into(),
+            file: 21,
+            owner: 99,
+            at_ns: r.clock,
+        });
+        assert_eq!(
+            r.run(give_back.clone()),
+            Outcome::Disowned { released: true }
+        );
+        // Given back, the part is released once, by a repeated give-back or a copy neither.
+        assert_eq!(r.run(give_back), Outcome::Disowned { released: false });
+        assert_eq!(r.run(sent(r.clock, 1)), Outcome::PartWritten);
+        assert_eq!(queued(&r), [21]);
+    }
+
+    /// A completion delivered again once it committed carries the file the version names:
+    /// the copy answers as the completion did and releases nothing. A retry with no file, as
+    /// the gateway sends once it finds the upload gone, finds the version as before.
+    #[test]
+    fn a_completion_sent_again_releases_nothing() {
+        let mut r = Range::new();
+        let u = r.create("k");
+        r.part("k", &u, 1, MIN_PART, 21);
+        let first = r.complete("k", &u, &[(1, "e1", 21)]);
+        assert!(matches!(first, Outcome::Put { .. }), "{first:?}");
+        let sent = r.history.last().unwrap().clone();
+        let again = r.run(sent);
+        assert!(queued(&r).is_empty(), "{again:?} released {:?}", queued(&r));
+        assert_eq!(naming(&r, "k", 99), 1);
+        assert_eq!(again, first);
+        let Command::Complete(mut retry) = r.history.last().unwrap().clone() else {
+            panic!("not a completion")
+        };
+        retry.file = None;
+        let Outcome::Completed { version, .. } = r.run(Command::Complete(retry)) else {
+            panic!("the retry found no version")
+        };
+        assert_eq!(Outcome::Put { version }, first);
+        // A retry that wrote its composite again finds the version, and the composite goes.
+        assert!(matches!(
+            r.complete("k", &u, &[(1, "e1", 21)]),
+            Outcome::Completed { .. }
+        ));
+        assert_eq!(queued(&r), [100]);
+    }
+
+    /// A PUT's version delivered again, under a new session: the copy makes no second version
+    /// naming the file, and a copy whose precondition the first version now fails does not
+    /// release the file that version names. Either answers as the write did, even once the
+    /// version is gone.
+    #[test]
+    fn a_put_sent_again_makes_no_second_version() {
+        let mut r = Range::new();
+        let sent = |key: &str, file: u128, none_match: bool, at_ns: u64| {
+            Command::Put(Put {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: key.into(),
+                versioning: Versioning::Enabled,
+                preconditions: Preconditions {
+                    if_match: None,
+                    if_none_match: if none_match { Some(Match::Any) } else { None },
+                },
+                at_ns,
+                ordered_ns: None,
+                version: Version {
+                    file: Some(file),
+                    ..object("e")
+                },
+                default: None,
+                id: 0,
+                deadline_ns: u64::MAX,
+            })
+        };
+        let plain = r.run(sent("k", 7, false, 10_000));
+        let guarded = r.run(sent("j", 8, true, 10_010));
+        let copies = [
+            r.run(sent("k", 7, false, 10_020)),
+            r.run(sent("j", 8, true, 10_030)),
+        ];
+        assert_eq!(
+            (naming(&r, "k", 7), naming(&r, "j", 8)),
+            (1, 1),
+            "{copies:?}"
+        );
+        assert!(
+            queued(&r).is_empty(),
+            "{copies:?} released {:?}",
+            queued(&r)
+        );
+        assert_eq!(copies, [plain.clone(), guarded]);
+        // Its version removed, the file is released once, and a copy takes it no more.
+        let order = key::parse_version_id(&put_id(&plain)).unwrap();
+        r.delete("k", Versioning::Enabled, Some(Named::Order(order)));
+        assert_eq!(r.run(sent("k", 7, false, 10_040)), plain);
+        assert_eq!(naming(&r, "k", 7), 0);
+        assert_eq!(queued(&r), [7]);
+    }
+
+    /// A write refused, and delivered again once what refused it has changed: its file was
+    /// released with the refusal, so the copy is refused as a file past its deadline is, and
+    /// no version names a file the collector will take apart.
+    #[test]
+    fn a_refused_write_sent_again_is_not_taken() {
+        let mut r = Range::new();
+        let guarded = Command::Put(Put {
+            bucket: "b".into(),
+            incarnation: 1,
+            key: "k".into(),
+            versioning: Versioning::Enabled,
+            preconditions: Preconditions {
+                if_match: None,
+                if_none_match: Some(Match::Any),
+            },
+            at_ns: 10_000,
+            ordered_ns: None,
+            version: Version {
+                file: Some(6),
+                ..object("e")
+            },
+            default: None,
+            id: 0,
+            deadline_ns: u64::MAX,
+        });
+        let first = put_id(&r.put("k", "a", Versioning::Enabled));
+        assert_eq!(r.run(guarded.clone()), Outcome::PreconditionFailed);
+        let order = key::parse_version_id(&first).unwrap();
+        r.delete("k", Versioning::Enabled, Some(Named::Order(order)));
+        let again = r.run(guarded);
+        assert_eq!(naming(&r, "k", 6), 0, "{again:?} took a released file");
+        assert_eq!(queued(&r).iter().filter(|f| **f == 6).count(), 1);
+        assert_eq!(again, Outcome::Expired);
+    }
+
+    /// The collector reclaims a released file whenever its grace has passed, and a write's
+    /// handover deadline is the gateway's to choose: nothing orders the two. A write refused
+    /// and its file released, then reclaimed before the write's deadline, keeps its mark until
+    /// the range's time has passed the deadline, so a copy of the write that comes before then,
+    /// once what refused it has changed, is still refused rather than taken as new naming a
+    /// file taken apart. After the deadline the mark goes, and a copy is past its deadline even
+    /// from a leader whose clock runs behind, since the removal recorded its time.
+    #[test]
+    fn a_mark_outlives_its_write_s_deadline() {
+        let mut r = Range::new();
+        let deadline_ns = r.clock + 1_000;
+        let guarded = |at_ns: u64| {
+            Command::Put(Put {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: "k".into(),
+                versioning: Versioning::Enabled,
+                preconditions: Preconditions {
+                    if_match: None,
+                    if_none_match: Some(Match::Any),
+                },
+                at_ns,
+                ordered_ns: None,
+                version: Version {
+                    file: Some(6),
+                    ..object("e")
+                },
+                default: None,
+                id: 0,
+                deadline_ns,
+            })
+        };
+        let first = put_id(&r.put("k", "a", Versioning::Enabled));
+        r.clock += 10;
+        assert_eq!(r.run(guarded(r.clock)), Outcome::PreconditionFailed);
+        assert_eq!(queued(&r), [6]);
+        let unmark = |at_ns: u64| {
+            Command::Unmark(Unmark {
+                files: vec![Marked {
+                    bucket: "b".into(),
+                    key: "k".into(),
+                    file: 6,
+                }],
+                at_ns,
+            })
+        };
+        // Reclaimed before the deadline: the mark stays.
+        r.clock += 10;
+        let kept = r.run(unmark(r.clock));
+        let order = key::parse_version_id(&first).unwrap();
+        r.delete("k", Versioning::Enabled, Some(Named::Order(order)));
+        r.clock += 10;
+        let again = r.run(guarded(r.clock));
+        assert_eq!(naming(&r, "k", 6), 0, "{again:?} took a reclaimed file");
+        assert_eq!(again, Outcome::Expired);
+        assert_eq!(kept, Outcome::Awaits { deadline_ns });
+        // Past the deadline the mark goes, and no copy is taken after, however its leader's
+        // clock runs.
+        assert_eq!(r.run(unmark(deadline_ns + 1)), Outcome::Unmarked);
+        assert!(r.engine.get(&key::mark("b", "k", 6)).unwrap().is_none());
+        assert_eq!(r.run(guarded(deadline_ns - 1)), Outcome::Expired);
+        assert_eq!(naming(&r, "k", 6), 0);
+        // A part keeps its write's deadline through adoption and give-back.
+        let u = r.create("p");
+        r.clock += 10;
+        let part_deadline = r.clock + 1_000;
+        let part = Command::PutPart(PutPart {
+            bucket: "b".into(),
+            incarnation: 1,
+            key: "p".into(),
+            upload: u.clone(),
+            number: 1,
+            part: Part {
+                etag: "e1".into(),
+                size: MIN_PART,
+                checksum: None,
+                file: 21,
+                modified_ns: 0,
+                deadline_ns: part_deadline,
+            },
+            at_ns: r.clock,
+        });
+        assert_eq!(r.run(part), Outcome::PartWritten);
+        let composite = r.composite;
+        assert!(matches!(
+            r.complete("p", &u, &[(1, "e1", 21)]),
+            Outcome::Put { .. }
+        ));
+        let give_back = Command::Disown(Disown {
+            bucket: "b".into(),
+            key: "p".into(),
+            file: 21,
+            owner: composite,
+            at_ns: r.clock,
+        });
+        assert_eq!(r.run(give_back), Outcome::Disowned { released: true });
+        let unmark_part = Command::Unmark(Unmark {
+            files: vec![Marked {
+                bucket: "b".into(),
+                key: "p".into(),
+                file: 21,
+            }],
+            at_ns: r.clock,
+        });
+        assert_eq!(
+            r.run(unmark_part),
+            Outcome::Awaits {
+                deadline_ns: part_deadline
+            }
+        );
+    }
+
+    /// An empty object's PUT carries no file: its write is named by the ID the gateway drew
+    /// for it, marked as a file is, so a copy is answered with the version the first made and
+    /// makes no second, as is a copy of a completion of empty parts. The queue holds the ID,
+    /// naming no file, for the collector to remove the mark once the deadline has passed. A
+    /// refused write with no file changed nothing, and is neither marked nor queued.
+    #[test]
+    fn an_empty_put_sent_again_makes_one_version() {
+        let mut r = Range::new();
+        let deadline_ns = r.clock + 1_000;
+        let empty = |id: u128, at_ns: u64, none_match: bool| {
+            Command::Put(Put {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: "k".into(),
+                versioning: Versioning::Enabled,
+                preconditions: Preconditions {
+                    if_match: None,
+                    if_none_match: if none_match { Some(Match::Any) } else { None },
+                },
+                at_ns,
+                ordered_ns: None,
+                version: Version {
+                    size: 0,
+                    ..object("empty")
+                },
+                default: None,
+                id,
+                deadline_ns,
+            })
+        };
+        r.clock += 10;
+        let first = r.run(empty(500, r.clock, false));
+        r.clock += 10;
+        let again = r.run(empty(500, r.clock, false));
+        assert_eq!(again, first);
+        assert_eq!(r.versions("k").len(), 1, "{again:?}");
+        // Another request, with an ID of its own, is another version.
+        r.clock += 10;
+        assert_ne!(r.run(empty(501, r.clock, false)), first);
+        assert_eq!(r.versions("k").len(), 2);
+        // Refused, a write with no file leaves no mark and no row.
+        r.clock += 10;
+        assert_eq!(
+            r.run(empty(502, r.clock, true)),
+            Outcome::PreconditionFailed
+        );
+        assert!(r.engine.get(&key::mark("b", "k", 502)).unwrap().is_none());
+        let rows = released(&r.engine, u64::MAX, 10).unwrap();
+        let ids: Vec<(u128, bool)> = rows.iter().map(|q| (q.file, q.holder.file)).collect();
+        assert_eq!(ids, [(500, false), (501, false)]);
+        // A completion of empty parts, which the gateway writes no file for.
+        let u = r.create("j");
+        r.part("j", &u, 1, 0, 31);
+        r.clock += 10;
+        let complete = Command::Complete(Complete {
+            bucket: "b".into(),
+            incarnation: 1,
+            key: "j".into(),
+            upload: u.clone(),
+            versioning: Versioning::Enabled,
+            preconditions: Preconditions::default(),
+            at_ns: r.clock,
+            parts: vec![Listed {
+                number: 1,
+                etag: "e1".into(),
+                file: 31,
+            }],
+            etag: "whole-1".into(),
+            size: 0,
+            checksum: None,
+            file: None,
+            default: None,
+            id: 600,
+            deadline_ns,
+            listing: listing(&[(1, "e1", 31)]),
+        });
+        let completed = r.run(complete.clone());
+        assert!(matches!(completed, Outcome::Put { .. }), "{completed:?}");
+        assert_eq!(r.run(complete), completed);
+        assert_eq!(r.versions("j").len(), 1);
+        // The collector removes the mark only once the deadline has passed, and a copy after
+        // is past its deadline too.
+        let unmark = |at_ns: u64| {
+            Command::Unmark(Unmark {
+                files: vec![Marked {
+                    bucket: "b".into(),
+                    key: "k".into(),
+                    file: 500,
+                }],
+                at_ns,
+            })
+        };
+        assert_eq!(r.run(unmark(r.clock)), Outcome::Awaits { deadline_ns });
+        assert_eq!(r.run(unmark(deadline_ns + 1)), Outcome::Unmarked);
+        assert_eq!(r.run(empty(500, deadline_ns - 1, false)), Outcome::Expired);
+        assert_eq!(r.versions("k").len(), 2);
     }
 
     #[test]
@@ -2209,6 +3588,7 @@ mod tests {
             attempt: 1,
             from: None,
             to: Some(GateState::Open),
+            generation: 1,
         });
         let commands: Vec<Command> = std::iter::once(open)
             .chain((0..20u64).map(|i| {
@@ -2223,6 +3603,7 @@ mod tests {
                         if_match: None,
                         at_ns: 100 + i,
                         bypass: false,
+                        owner: "o".into(),
                     })
                 } else {
                     Command::Put(Put {
@@ -2235,16 +3616,17 @@ mod tests {
                         ordered_ns: None,
                         version: object(&format!("e{i}")),
                         default: None,
+                        id: u128::from(i),
                         deadline_ns: u64::MAX,
                     })
                 }
             }))
             .collect();
-        let mut whole = Model::default();
+        let mut whole = seeded();
         for (i, c) in commands.iter().enumerate() {
             apply(&mut whole, i as u64 + 1, c).unwrap();
         }
-        let mut crashed = Model::default();
+        let mut crashed = seeded();
         for (i, c) in commands.iter().enumerate() {
             apply(&mut crashed, i as u64 + 1, c).unwrap();
             if i == 7 {
@@ -2283,6 +3665,7 @@ mod tests {
             ordered_ns: None,
             version: object("x"),
             default: None,
+            id: 0,
             deadline_ns: u64::MAX,
         };
         assert_eq!(r.run(Command::Put(stale.clone())), Outcome::NoSuchBucket);
@@ -2334,6 +3717,7 @@ mod tests {
             attempt: 9,
             from: Some(Closed),
             to: Some(Open),
+            generation: 1,
         });
         assert_eq!(r.run(other), Outcome::Conflict);
     }
@@ -2352,13 +3736,17 @@ mod tests {
         }
         r.create("m");
         assert_eq!(r.gate_at(4, Some(Open), Some(Closed)), Outcome::GateMoved);
-        assert_eq!(probe(&r.engine, "b", None, 10).unwrap(), Probe::Clear);
+        assert_eq!(
+            probe(&r.engine, "b", 1, None, 10).unwrap(),
+            Routed::Here(Probe::Clear)
+        );
         let collect = |budget| {
             Command::Collect(Collect {
                 bucket: "b".into(),
                 incarnation: 1,
                 budget,
                 at_ns: 0,
+                generation: 1,
             })
         };
         assert_eq!(r.run(collect(10)), Outcome::Conflict, "not yet condemned");
@@ -2410,6 +3798,7 @@ mod tests {
             incarnation: 1,
             budget: 10,
             at_ns: 0,
+            generation: 1,
         });
         assert_eq!(r.run(collect), Outcome::NotEmpty);
         assert_eq!(r.versions("k").len(), 1);
@@ -2424,19 +3813,31 @@ mod tests {
             let upload = r.create(key);
             r.part(key, &upload, 1, 1, 1);
         }
-        assert_eq!(probe(&r.engine, "b", None, 10).unwrap(), Probe::Clear);
+        assert_eq!(
+            probe(&r.engine, "b", 1, None, 10).unwrap(),
+            Routed::Here(Probe::Clear)
+        );
         r.delete("d", Versioning::Enabled, None);
-        let Probe::Paused(at) = probe(&r.engine, "b", None, 2).unwrap() else {
+        let Routed::Here(Probe::Paused(at)) = probe(&r.engine, "b", 1, None, 2).unwrap() else {
             panic!("the budget ran out")
         };
         assert_eq!(
-            probe(&r.engine, "b", Some(&at), 1).unwrap(),
-            Probe::Paused(beyond_rows("b", "c"))
+            probe(&r.engine, "b", 1, Some(&at), 1).unwrap(),
+            Routed::Here(Probe::Paused(beyond_rows("b", "c")))
         );
-        assert_eq!(probe(&r.engine, "b", Some(&at), 2).unwrap(), Probe::Found);
+        assert_eq!(
+            probe(&r.engine, "b", 1, Some(&at), 2).unwrap(),
+            Routed::Here(Probe::Found)
+        );
         // A position before the bucket starts at its first row.
-        assert_eq!(probe(&r.engine, "b", Some(&[]), 4).unwrap(), Probe::Found);
-        assert_eq!(probe(&r.engine, "c", None, 4).unwrap(), Probe::Clear);
+        assert_eq!(
+            probe(&r.engine, "b", 1, Some(&[]), 4).unwrap(),
+            Routed::Here(Probe::Found)
+        );
+        assert_eq!(
+            probe(&r.engine, "c", 1, None, 4).unwrap(),
+            Routed::Here(Probe::Clear)
+        );
     }
 
     const MS: u64 = 1_000_000;
@@ -2467,6 +3868,7 @@ mod tests {
             default: Option<DefaultRetention>,
         ) -> String {
             self.clock = at_ms * MS;
+            let id = self.fresh();
             put_id(&self.run(Command::Put(Put {
                 bucket: "b".into(),
                 incarnation: 1,
@@ -2481,6 +3883,7 @@ mod tests {
                     ..object("e")
                 },
                 default,
+                id,
                 deadline_ns: u64::MAX,
             })))
         }
@@ -2495,6 +3898,7 @@ mod tests {
                 if_match: None,
                 at_ns: at_ms * MS,
                 bypass,
+                owner: "o".into(),
             }))
         }
 
@@ -2732,6 +4136,19 @@ mod tests {
             key: u8,
             upload: u8,
         },
+        /// A write sent before, delivered again under a new session, as it was sent: within
+        /// its deadline or past it, as time has gone.
+        Resend {
+            pick: u8,
+        },
+        /// Time passes, half a handover.
+        Wait,
+        /// The collector reclaims a released file, or the mark of a write that carried none,
+        /// whatever its grace: its part files given back, its mark removed if the range lets
+        /// it, and then its queue row.
+        Reclaim {
+            pick: u8,
+        },
     }
 
     fn step() -> impl proptest::strategy::Strategy<Value = Step> {
@@ -2768,7 +4185,23 @@ mod tests {
                     stale
                 }),
             (0u8..3, 0u8..3).prop_map(|(key, upload)| Step::Abort { key, upload }),
+            any::<u8>().prop_map(|pick| Step::Resend { pick }),
+            Just(Step::Wait),
+            any::<u8>().prop_map(|pick| Step::Reclaim { pick }),
         ]
+    }
+
+    /// Every version row of bucket "b".
+    fn version_rows(engine: &Model) -> Vec<Vec<u8>> {
+        let mut rows = Vec::new();
+        let (mut from, to) = key::bucket_span("b");
+        while let Some((k, _)) = engine.next(&from, &to).unwrap() {
+            if let Some((_, _, NameRow::Version(_))) = key::decode_name(&k) {
+                rows.push(k.clone());
+            }
+            from = after(&k);
+        }
+        rows
     }
 
     /// Every file of a version or a part in the range, and every released one.
@@ -2794,27 +4227,37 @@ mod tests {
     proptest::proptest! {
         /// Every file a write hands the range is held in exactly one place after every step:
         /// by a version, by a part, as an extent of a completed object's file that is held or
-        /// released, or in the released queue. No removal loses a file, and none is released
-        /// while something still references it (docs/design/metadata.md §2).
+        /// released, or released, in the queue or reclaimed. No removal loses a file, none is
+        /// released while something still references it, and none is referenced once
+        /// reclaimed, however soon the collector comes after a release and however late a copy
+        /// of the write that carried it (docs/design/metadata.md §2). A copy of a write that
+        /// made a version, an empty object's included, makes none.
         #[test]
         fn every_file_is_referenced_or_released_exactly_once(
-            steps in proptest::collection::vec(step(), 1..60),
+            steps in proptest::collection::vec(step(), 1..80),
         ) {
             use std::collections::{BTreeMap, BTreeSet};
+            const HANDOVER: u64 = 200;
             let mut r = Range::new();
             let mut next_file = 1000u128;
             let mut carried: BTreeSet<u128> = BTreeSet::new();
-            // A completed object's file and the part files it took as extents.
+            let mut reclaimed: BTreeSet<u128> = BTreeSet::new();
+            // What each write in `r.history` answered when first sent.
+            let mut answered: Vec<Outcome> = Vec::new();
+            // A completed object's file and the part files it took as extents, until its
+            // reclaimer gives them back.
             let mut adopted: BTreeMap<u128, Vec<u128>> = BTreeMap::new();
             let mut uploads: BTreeMap<(u8, u8), String> = BTreeMap::new();
             let versionings = [Versioning::Enabled, Versioning::Suspended, Versioning::Unversioned];
             for s in steps {
                 r.clock += 10;
+                let deadline_ns = r.clock + HANDOVER;
                 match s {
                     Step::Put { key, versioning, empty } => {
-                        let file = (!empty).then(|| { next_file += 1; next_file });
+                        next_file += 1;
+                        let file = if empty { None } else { Some(next_file) };
                         carried.extend(file);
-                        r.run(Command::Put(Put {
+                        let outcome = r.sent(Command::Put(Put {
                             bucket: "b".into(),
                             incarnation: 1,
                             key: format!("k{key}"),
@@ -2824,8 +4267,10 @@ mod tests {
                             ordered_ns: None,
                             version: Version { file, ..object("e") },
                             default: None,
-                            deadline_ns: u64::MAX,
+                            id: next_file,
+                            deadline_ns,
                         }));
+                        answered.push(outcome);
                     }
                     Step::Delete { key, versioning, named } => {
                         let named = named.map(|n| match n {
@@ -2847,6 +4292,7 @@ mod tests {
                             if_match: None,
                             at_ns: r.clock,
                             bypass: false,
+                            owner: "o".into(),
                         }));
                     }
                     Step::Create { key } => {
@@ -2858,7 +4304,7 @@ mod tests {
                         let Some(id) = uploads.get(&(key, upload)).cloned() else { continue };
                         next_file += 1;
                         carried.insert(next_file);
-                        r.run(Command::PutPart(PutPart {
+                        let outcome = r.sent(Command::PutPart(PutPart {
                             bucket: "b".into(),
                             incarnation: 1,
                             key: format!("k{key}"),
@@ -2870,10 +4316,11 @@ mod tests {
                                 checksum: None,
                                 file: next_file,
                                 modified_ns: 0,
+                                deadline_ns,
                             },
                             at_ns: r.clock,
-                            deadline_ns: u64::MAX,
                         }));
+                        answered.push(outcome);
                     }
                     Step::Complete { key, upload, mut parts, stale } => {
                         let Some(id) = uploads.get(&(key, upload)).cloned() else { continue };
@@ -2894,7 +4341,7 @@ mod tests {
                         next_file += 1;
                         let file = next_file;
                         carried.insert(file);
-                        let outcome = r.run(Command::Complete(Complete {
+                        let outcome = r.sent(Command::Complete(Complete {
                             bucket: "b".into(),
                             incarnation: 1,
                             key: format!("k{key}"),
@@ -2903,18 +4350,25 @@ mod tests {
                             preconditions: Preconditions::default(),
                             at_ns: r.clock,
                             parts: listed.clone(),
-                            etag: "whole".into(),
-                            size: 1,
+                            etag: format!("whole-{}", listed.len()),
+                            size: parts
+                                .iter()
+                                .filter_map(|&n| held.iter().find(|(h, _)| *h == n))
+                                .map(|(_, p)| p.size)
+                                .sum(),
                             checksum: None,
                             file: Some(file),
                             default: None,
-                            deadline_ns: u64::MAX,
+                            id: file,
+                            deadline_ns,
+                            listing: [0; crate::record::LISTING],
                         }));
                         if matches!(outcome, Outcome::Put { .. })
                             && versions_hold(&r.engine, file)
                         {
                             adopted.insert(file, listed.iter().map(|l| l.file).collect());
                         }
+                        answered.push(outcome);
                     }
                     Step::Abort { key, upload } => {
                         let Some(id) = uploads.get(&(key, upload)).cloned() else { continue };
@@ -2926,6 +4380,58 @@ mod tests {
                             at_ns: r.clock,
                         }));
                     }
+                    Step::Resend { pick } => {
+                        let i = usize::from(pick) % r.history.len().max(1);
+                        let Some(mut command) = r.history.get(i).cloned() else { continue };
+                        match &mut command {
+                            Command::Put(c) => c.at_ns = r.clock,
+                            Command::PutPart(c) => c.at_ns = r.clock,
+                            Command::Complete(c) => c.at_ns = r.clock,
+                            _ => continue,
+                        }
+                        let before = version_rows(&r.engine);
+                        let outcome = r.run(command);
+                        // A copy of a write that made a version is answered with that version,
+                        // or refused once its mark has gone past its deadline, and makes none.
+                        if let Some(first @ Outcome::Put { .. }) = answered.get(i) {
+                            proptest::prop_assert!(
+                                outcome == *first || outcome == Outcome::Expired,
+                                "{:?} answered {:?}", first, outcome
+                            );
+                            proptest::prop_assert_eq!(&version_rows(&r.engine), &before);
+                        }
+                    }
+                    Step::Wait => r.clock += HANDOVER / 2,
+                    Step::Reclaim { pick } => {
+                        let queue = released(&r.engine, u64::MAX, usize::MAX).unwrap();
+                        let Some(row) = queue.get(usize::from(pick) % queue.len().max(1)).cloned() else { continue };
+                        for child in adopted.remove(&row.file).unwrap_or_default() {
+                            r.run(Command::Disown(Disown {
+                                bucket: row.holder.bucket.clone(),
+                                key: row.holder.key.clone(),
+                                file: child,
+                                owner: row.file,
+                                at_ns: r.clock,
+                            }));
+                        }
+                        let unmarked = r.run(Command::Unmark(Unmark {
+                            files: vec![Marked {
+                                bucket: row.holder.bucket.clone(),
+                                key: row.holder.key.clone(),
+                                file: row.file,
+                            }],
+                            at_ns: r.clock,
+                        }));
+                        if unmarked == Outcome::Unmarked {
+                            r.run(Command::Reclaim(Reclaim {
+                                released_ns: row.released_ns,
+                                file: row.file,
+                            }));
+                            if row.holder.file {
+                                reclaimed.insert(row.file);
+                            }
+                        }
+                    }
                 }
                 let (versions, part_files, released) = files_held(&r.engine);
                 let children: Vec<u128> = adopted
@@ -2934,11 +4440,15 @@ mod tests {
                     .flat_map(|(_, children)| children.iter().copied())
                     .collect();
                 for file in &carried {
-                    let places = [&versions, &part_files, &released, &children]
+                    let held = [&versions, &part_files, &children]
                         .iter()
                         .map(|held| held.iter().filter(|f| *f == file).count())
                         .sum::<usize>();
-                    proptest::prop_assert_eq!(places, 1, "file {} after {:?}", file, r.versions("k0"));
+                    let gone = usize::from(released.contains(file) || reclaimed.contains(file));
+                    proptest::prop_assert_eq!(
+                        held + gone, 1,
+                        "file {} after {:?}; reclaimed {}", file, r.versions("k0"), reclaimed.contains(file)
+                    );
                 }
             }
         }
@@ -2999,6 +4509,7 @@ mod tests {
                     ..object("e")
                 },
                 default: None,
+                id: 0,
                 deadline_ns,
             }))
         };
@@ -3054,8 +4565,8 @@ mod tests {
         );
         // A handover of 7 after its release finds its deadline passed.
         assert_eq!(put(&mut r, "c", 7, 0), Outcome::Expired);
-        // Once settled, the marks go; a mark left behind goes when its file is released.
-        let marks = |files: &[(&str, u128)]| {
+        // The collector removes the marks of the files it reclaimed.
+        let marks = |at_ns: u64, files: &[(&str, u128)]| {
             Command::Unmark(Unmark {
                 files: files
                     .iter()
@@ -3065,17 +4576,25 @@ mod tests {
                         file,
                     })
                     .collect(),
+                at_ns,
             })
         };
         assert_eq!(
-            r.run(marks(&[("b", 6), ("c", 7), ("d", 8)])),
+            r.run(marks(r.clock, &[("b", 6), ("c", 7), ("d", 8)])),
             Outcome::Unmarked
         );
         assert!(!marked(&r, "b", 6) && !marked(&r, "c", 7) && marked(&r, "a", 5));
+        // A file released keeps its mark until the collector has reclaimed it, so a copy of
+        // the write that took it is still recognised.
         assert!(matches!(
             r.delete("a", Versioning::Unversioned, None),
             Outcome::Deleted { .. }
         ));
+        assert!(marked(&r, "a", 5));
+        assert!(matches!(put(&mut r, "a", 5, in_time), Outcome::Put { .. }));
+        assert_eq!(queue(&r).iter().filter(|f| **f == 5).count(), 1);
+        assert!(r.versions("a").is_empty());
+        assert_eq!(r.run(marks(r.clock, &[("a", 5)])), Outcome::Unmarked);
         assert!(!marked(&r, "a", 5));
         // A sweep that released 9 and stopped before unmarking it: the reclaimer removes the
         // mark, routed by the key the queue row names, before the row.
@@ -3090,7 +4609,7 @@ mod tests {
             .find(|r| r.file == 9)
             .unwrap();
         assert_eq!(row.holder.key, "e");
-        assert_eq!(r.run(marks(&[("e", 9)])), Outcome::Unmarked);
+        assert_eq!(r.run(marks(r.clock, &[("e", 9)])), Outcome::Unmarked);
         assert!(!marked(&r, "e", 9));
     }
 
@@ -3126,19 +4645,568 @@ mod tests {
                 ..object("e")
             },
             default: None,
+            id: 0,
             deadline_ns,
         });
         assert_eq!(r.run(put), Outcome::Expired);
         assert_eq!(current(&r.engine, "b", "a").unwrap(), None);
     }
 
+    impl Range {
+        /// Splits the range at `at` into itself and a child with ID `id`, made as a replica
+        /// makes it: the rows `child` names, and the parent's rows in its spans as they stand.
+        fn split(&mut self, at: Vec<u8>, id: u64) -> (Outcome, Option<Range>) {
+            let generation = lineage(&self.engine).unwrap().now.generation;
+            let s = Split {
+                generation,
+                at,
+                child: id,
+            };
+            let made = child(&self.engine, &s).unwrap().map(|c| {
+                let mut rows = c.rows;
+                for (k, v) in self.engine.image().unwrap() {
+                    if c.spans.iter().any(|(from, to)| *from <= k && k < *to) {
+                        rows.push((k, v));
+                    }
+                }
+                let mut engine = Model::default();
+                engine.install(0, rows).unwrap();
+                Range {
+                    engine,
+                    index: 0,
+                    clock: self.clock,
+                    history: Vec::new(),
+                    file: self.file,
+                    composite: self.composite,
+                }
+            });
+            (self.run(Command::Split(s)), made)
+        }
+
+        fn rows(&self) -> Vec<Vec<u8>> {
+            self.engine
+                .image()
+                .unwrap()
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect()
+        }
+    }
+
+    fn descriptor(id: u64, lo: Option<&str>, hi: Option<&str>, generation: u64) -> Descriptor {
+        Descriptor {
+            id,
+            lo: lo.map(|k| key::route("b", k)).unwrap_or_default(),
+            hi: hi.map(|k| key::route("b", k)),
+            generation,
+        }
+    }
+
+    /// A split leaves the range the keys before its point and gives the child the rest, with
+    /// their rows and marks, the gates of the buckets it can hold, the floor and the clock.
+    /// Each side refuses what is the other's with its lineage, taking nothing.
+    #[test]
+    fn a_split_divides_the_keys_and_each_side_refuses_the_others() {
+        use GateState::{Closed, Condemned, Open};
+        let mut r = Range::new();
+        r.put("a", "1", Versioning::Enabled);
+        r.put("m", "2", Versioning::Enabled);
+        let upload = r.create("t");
+        r.part("t", &upload, 1, 1, 9);
+        // Bucket "c", after "b", comes and goes, raising the floor to its attempt.
+        let other = |from, to| {
+            Command::Gate(GateChange {
+                bucket: "c".into(),
+                incarnation: 5,
+                attempt: 5,
+                from,
+                to,
+                generation: 1,
+            })
+        };
+        for (from, to) in [
+            (None, Some(Open)),
+            (Some(Open), Some(Closed)),
+            (Some(Closed), Some(Condemned)),
+            (Some(Condemned), None),
+        ] {
+            assert_eq!(r.run(other(from, to)), Outcome::GateMoved);
+        }
+        let (outcome, made) = r.split(key::route("b", "m"), 2);
+        let parent = Lineage {
+            now: descriptor(1, None, Some("m"), 2),
+            child: Some(descriptor(2, Some("m"), None, 2)),
+            standing: Standing::Serving,
+            into: None,
+            taken: None,
+        };
+        assert_eq!(outcome, Outcome::Split(Box::new(parent.clone())));
+        let mut c = made.unwrap();
+        assert_eq!(lineage(&r.engine).unwrap(), parent);
+        assert_eq!(
+            lineage(&c.engine).unwrap(),
+            serving(descriptor(2, Some("m"), None, 2))
+        );
+        // Every row and mark of a key is on the side that holds the key; the bucket both hold
+        // keys of has its gate on both sides; the floor and the clock went with the child.
+        let routes = |r: &Range| -> Vec<(String, String)> {
+            r.rows()
+                .iter()
+                .filter_map(|k| {
+                    let (bucket, key, _) = key::decode_name(k)
+                        .or_else(|| key::decode_mark(k).map(|(b, k, _)| (b, k, NameRow::Null)))?;
+                    Some((bucket, key))
+                })
+                .collect()
+        };
+        assert!(routes(&r).iter().all(|(_, k)| k == "a"));
+        assert!(routes(&c).iter().any(|(_, k)| k == "m"));
+        assert!(routes(&c).iter().any(|(_, k)| k == "t"));
+        assert!(routes(&c).iter().all(|(_, k)| k != "a"));
+        assert!(r.engine.get(&key::mark("b", "a", 1)).unwrap().is_some());
+        assert!(c.engine.get(&key::mark("b", "m", 2)).unwrap().is_some());
+        assert_eq!(gate(&r.engine, "b").unwrap(), gate(&c.engine, "b").unwrap());
+        assert_eq!(floor(&c.engine).unwrap(), 5);
+        assert_eq!(
+            clock::now(&c.engine, 0).unwrap(),
+            clock::now(&r.engine, 0).unwrap()
+        );
+        // The queue of released files stays with the parent.
+        assert!(released(&c.engine, u64::MAX, 8).unwrap().is_empty());
+        // Refused, a write carrying a file takes nothing: no version, release or mark.
+        let queued = released(&r.engine, u64::MAX, 8).unwrap().len();
+        let moved = |r: &Range| Outcome::Moved(Box::new(lineage(&r.engine).unwrap()));
+        assert_eq!(r.put("t", "3", Versioning::Enabled), moved(&r));
+        assert_eq!(released(&r.engine, u64::MAX, 8).unwrap().len(), queued);
+        assert!(r.engine.get(&key::mark("b", "t", 1)).unwrap().is_none());
+        assert_eq!(c.put("a", "3", Versioning::Enabled), moved(&c));
+        assert!(matches!(
+            c.put("z", "3", Versioning::Enabled),
+            Outcome::Put { .. }
+        ));
+        // The sweep's commands name keys, and go where the keys are.
+        let check = Command::Check(Check {
+            files: vec![Checked {
+                bucket: "b".into(),
+                key: "t".into(),
+                file: 9,
+                deadline_ns: 0,
+            }],
+            at_ns: 0,
+        });
+        assert_eq!(r.run(check.clone()), moved(&r));
+        assert_eq!(c.run(check), Outcome::Checked(vec![Verdict::Held]));
+        // A coordinator's reads and steps routed by the old generation are told where the span
+        // went, and those routed by the new one are answered.
+        assert_eq!(
+            read_gate(&r.engine, "b", 1).unwrap(),
+            Routed::Moved(Box::new(parent))
+        );
+        assert!(matches!(
+            read_gate(&c.engine, "b", 2).unwrap(),
+            Routed::Here(Some(Gate { state: Open, .. }))
+        ));
+        assert!(matches!(
+            probe(&c.engine, "b", 1, None, 8).unwrap(),
+            Routed::Moved(_)
+        ));
+        assert_eq!(r.gate(Some(Open), Some(Closed)), moved(&r));
+        let collect = |generation| {
+            Command::Collect(Collect {
+                bucket: "b".into(),
+                incarnation: 1,
+                budget: 8,
+                at_ns: 0,
+                generation,
+            })
+        };
+        assert_eq!(c.run(collect(1)), moved(&c));
+        assert_eq!(c.run(collect(2)), Outcome::Conflict, "not condemned");
+    }
+
+    /// The clock goes with the child. A check that released a file never handed over recorded
+    /// its time; a handover a lagging leader proposes behind that time, reaching the child that
+    /// holds the key now, is refused as the parent would have refused it. A child starting its
+    /// clock afresh would take a file the collector is to reclaim.
+    #[test]
+    fn a_split_carries_the_time_a_check_recorded() {
+        let mut r = Range::new();
+        let deadline_ns = r.clock + 50;
+        let check = Command::Check(Check {
+            files: vec![Checked {
+                bucket: "b".into(),
+                key: "t".into(),
+                file: 4,
+                deadline_ns,
+            }],
+            at_ns: deadline_ns + 1,
+        });
+        assert_eq!(r.run(check), Outcome::Checked(vec![Verdict::Released]));
+        let (_, made) = r.split(key::route("b", "m"), 2);
+        let mut c = made.unwrap();
+        let put = Command::Put(Put {
+            bucket: "b".into(),
+            incarnation: 1,
+            key: "t".into(),
+            versioning: Versioning::Unversioned,
+            preconditions: Preconditions::default(),
+            at_ns: deadline_ns - 10,
+            ordered_ns: None,
+            version: Version {
+                file: Some(4),
+                ..object("e")
+            },
+            default: None,
+            id: 0,
+            deadline_ns,
+        });
+        assert_eq!(c.run(put), Outcome::Expired);
+        assert_eq!(current(&c.engine, "b", "t").unwrap(), None);
+    }
+
+    /// A merge across the two ranges' logs: the higher range freezes and takes nothing but the
+    /// merge's own steps; the lower range takes its rows, marks, queue and the gates it holds
+    /// none of, the later clock and the higher floor; the frozen range ends, pointing at the
+    /// lower; and the lower lets go of the merge.
+    #[test]
+    fn a_merge_joins_the_higher_range_to_the_lower() {
+        use GateState::Open;
+        let mut r = Range::new();
+        r.put("a", "1", Versioning::Enabled);
+        r.put("t", "2", Versioning::Enabled);
+        let (_, made) = r.split(key::route("b", "m"), 2);
+        let mut c = made.unwrap();
+        // The child alone holds bucket "c", and releases a file there.
+        c.run(Command::Gate(GateChange {
+            bucket: "c".into(),
+            incarnation: 3,
+            attempt: 3,
+            from: None,
+            to: Some(Open),
+            generation: 2,
+        }));
+        c.clock = r.clock + 1_000;
+        let put_c = |c: &mut Range, key: &str, file: u128| {
+            c.clock += 10;
+            c.run(Command::Put(Put {
+                bucket: "c".into(),
+                incarnation: 3,
+                key: key.into(),
+                versioning: Versioning::Unversioned,
+                preconditions: Preconditions::default(),
+                at_ns: c.clock,
+                ordered_ns: None,
+                version: Version {
+                    file: Some(file),
+                    ..object("e")
+                },
+                default: None,
+                id: 0,
+                deadline_ns: u64::MAX,
+            }))
+        };
+        put_c(&mut c, "k", 7);
+        put_c(&mut c, "k", 8);
+        assert_eq!(released(&c.engine, u64::MAX, 8).unwrap().len(), 1);
+        let lower = lineage(&r.engine).unwrap().now;
+        let upper = lineage(&c.engine).unwrap().now;
+        let freeze = Command::Freeze(Freeze {
+            generation: upper.generation,
+            into: lower.clone(),
+        });
+        let Outcome::Frozen(frozen) = c.run(freeze) else {
+            panic!("frozen");
+        };
+        // Frozen, it takes nothing: not a write, a coordinator's read, or a split.
+        let moved = |r: &Range| Outcome::Moved(Box::new(lineage(&r.engine).unwrap()));
+        assert_eq!(c.put("t", "3", Versioning::Enabled), moved(&c));
+        assert!(matches!(
+            read_gate(&c.engine, "b", frozen.now.generation).unwrap(),
+            Routed::Moved(_)
+        ));
+        assert_eq!(c.split(key::route("b", "x"), 9).0, moved(&c));
+        assert_eq!(
+            c.run(Command::Thaw(Thaw {
+                generation: lower.generation + 1
+            })),
+            Outcome::Conflict,
+            "a thaw for another merge"
+        );
+        let m = Merge {
+            generation: lower.generation,
+            from: frozen.now.clone(),
+            max_rows: 64,
+            max_bytes: u64::MAX,
+        };
+        // Only `merge`, with the frozen range's rows, takes it.
+        assert_eq!(r.run(Command::Merge(m.clone())), Outcome::Invalid);
+        r.index += 1;
+        let Outcome::Merged(merged) = merge(&mut r.engine, r.index, &m, &c.engine).unwrap() else {
+            panic!("merged");
+        };
+        assert_eq!(
+            (merged.now.lo.clone(), merged.now.hi.clone()),
+            (Vec::new(), None)
+        );
+        assert!(merged.now.generation > lower.generation.max(frozen.now.generation));
+        assert_eq!(
+            merged.taken,
+            Some(Taken {
+                from: 2,
+                generation: lower.generation
+            })
+        );
+        // Everything of the child is in the lower range now.
+        assert!(current(&r.engine, "b", "t").unwrap().is_some());
+        assert!(current(&r.engine, "c", "k").unwrap().is_some());
+        assert!(r.engine.get(&key::mark("b", "t", 2)).unwrap().is_some());
+        assert!(gate(&r.engine, "c").unwrap().is_some());
+        assert_eq!(released(&r.engine, u64::MAX, 8).unwrap().len(), 1);
+        assert!(clock::now(&r.engine, 0).unwrap() >= clock::now(&c.engine, 0).unwrap());
+        // A command for the merge that comes again is routed by a generation the range no
+        // longer has, and changes nothing.
+        r.index += 1;
+        assert_eq!(
+            merge(&mut r.engine, r.index, &m, &c.engine).unwrap(),
+            moved(&r)
+        );
+        // Holding the merge, the range may not be frozen for another.
+        let hold = Command::Freeze(Freeze {
+            generation: merged.now.generation,
+            into: descriptor(0, None, Some(""), 1),
+        });
+        assert_eq!(r.run(hold), Outcome::Conflict);
+        // The frozen range ends, and answers every request with where its span went; the end
+        // repeated is answered the same.
+        let end = Command::End(End {
+            generation: lower.generation,
+            into: merged.now.clone(),
+        });
+        assert_eq!(c.run(end.clone()), Outcome::Ended);
+        assert_eq!(c.run(end), Outcome::Ended);
+        let Outcome::Moved(gone) = c.put("t", "3", Versioning::Enabled) else {
+            panic!("moved");
+        };
+        assert_eq!(gone.standing, Standing::Ended);
+        assert_eq!(gone.into, Some(merged.now.clone()));
+        let resolve = Command::Resolve(Resolve {
+            from: 2,
+            generation: lower.generation,
+        });
+        assert_eq!(r.run(resolve.clone()), Outcome::Resolved);
+        assert_eq!(lineage(&r.engine).unwrap().taken, None);
+        assert_eq!(r.run(resolve), Outcome::Resolved);
+        assert!(matches!(
+            r.put("t", "3", Versioning::Enabled),
+            Outcome::Put { .. }
+        ));
+    }
+
+    /// A merge keeps the later clock. A check in the frozen range released a file never handed
+    /// over and recorded its time; the lower range's clock is behind it. A handover a lagging
+    /// leader proposes behind the check, reaching the range that took the key, is refused.
+    #[test]
+    fn a_merge_keeps_the_time_a_check_recorded() {
+        let mut r = Range::new();
+        let (_, made) = r.split(key::route("b", "m"), 2);
+        let mut c = made.unwrap();
+        let deadline_ns = r.clock + 50;
+        let check = Command::Check(Check {
+            files: vec![Checked {
+                bucket: "b".into(),
+                key: "t".into(),
+                file: 4,
+                deadline_ns,
+            }],
+            at_ns: deadline_ns + 1_000,
+        });
+        assert_eq!(c.run(check), Outcome::Checked(vec![Verdict::Released]));
+        let lower = lineage(&r.engine).unwrap().now;
+        let generation = lineage(&c.engine).unwrap().now.generation;
+        let Outcome::Frozen(frozen) = c.run(Command::Freeze(Freeze {
+            generation,
+            into: lower.clone(),
+        })) else {
+            panic!("frozen");
+        };
+        let m = Merge {
+            generation: lower.generation,
+            from: frozen.now,
+            max_rows: 64,
+            max_bytes: u64::MAX,
+        };
+        r.index += 1;
+        assert!(matches!(
+            merge(&mut r.engine, r.index, &m, &c.engine).unwrap(),
+            Outcome::Merged(_)
+        ));
+        let put = Command::Put(Put {
+            bucket: "b".into(),
+            incarnation: 1,
+            key: "t".into(),
+            versioning: Versioning::Unversioned,
+            preconditions: Preconditions::default(),
+            at_ns: deadline_ns - 10,
+            ordered_ns: None,
+            version: Version {
+                file: Some(4),
+                ..object("e")
+            },
+            default: None,
+            id: 0,
+            deadline_ns,
+        });
+        assert_eq!(r.run(put), Outcome::Expired);
+    }
+
+    /// The lower range decides a merge once. A refusal, or an abandon, moves its generation
+    /// on, so the frozen range may thaw: a command for the merge that comes after finds the
+    /// range at another generation and changes nothing.
+    #[test]
+    fn a_refused_merge_is_never_taken_after() {
+        let mut r = Range::new();
+        let (_, made) = r.split(key::route("b", "m"), 2);
+        let mut c = made.unwrap();
+        let lower = lineage(&r.engine).unwrap().now;
+        let freeze = |c: &mut Range, into: &Descriptor| {
+            let generation = lineage(&c.engine).unwrap().now.generation;
+            let Outcome::Frozen(frozen) = c.run(Command::Freeze(Freeze {
+                generation,
+                into: into.clone(),
+            })) else {
+                panic!("frozen");
+            };
+            frozen.now
+        };
+        let from = freeze(&mut c, &lower);
+        let abandon = Command::Abandon(Abandon {
+            generation: lower.generation,
+        });
+        let Outcome::Refused(refused) = r.run(abandon) else {
+            panic!("refused");
+        };
+        assert!(refused.now.generation > lower.generation && refused.taken.is_none());
+        let m = Merge {
+            generation: lower.generation,
+            from,
+            max_rows: 64,
+            max_bytes: u64::MAX,
+        };
+        let thaw = Command::Thaw(Thaw {
+            generation: lower.generation,
+        });
+        assert!(matches!(c.run(thaw), Outcome::Thawed(_)));
+        // The merge's decision, arriving late, finds the range moved on and takes nothing.
+        r.index += 1;
+        assert!(matches!(
+            merge(&mut r.engine, r.index, &m, &c.engine).unwrap(),
+            Outcome::Moved(_)
+        ));
+        assert_eq!(
+            lineage(&r.engine).unwrap().now.hi,
+            Some(key::route("b", "m"))
+        );
+        // A merge whose frozen range holds more rows than it may take is refused.
+        c.put("t", "1", Versioning::Enabled);
+        let lower = lineage(&r.engine).unwrap().now;
+        let from = freeze(&mut c, &lower);
+        let m = Merge {
+            generation: lower.generation,
+            from,
+            max_rows: 1,
+            max_bytes: u64::MAX,
+        };
+        r.index += 1;
+        assert!(matches!(
+            merge(&mut r.engine, r.index, &m, &c.engine).unwrap(),
+            Outcome::Refused(_)
+        ));
+        // As is one whose rows hold more bytes than it may take, however few they are
+        // (audit §5.2): the refused merge's range thaws and freezes again for it.
+        let thaw = Command::Thaw(Thaw {
+            generation: lower.generation,
+        });
+        assert!(matches!(c.run(thaw), Outcome::Thawed(_)));
+        let lower = lineage(&r.engine).unwrap().now;
+        let from = freeze(&mut c, &lower);
+        let m = Merge {
+            generation: lower.generation,
+            from,
+            max_rows: 64,
+            max_bytes: 1,
+        };
+        r.index += 1;
+        assert!(matches!(
+            merge(&mut r.engine, r.index, &m, &c.engine).unwrap(),
+            Outcome::Refused(_)
+        ));
+        // A replica whose copy of the frozen range is not frozen for the merge stops rather
+        // than take other rows than its peers.
+        let lower = lineage(&r.engine).unwrap().now;
+        let m = Merge {
+            generation: lower.generation,
+            from: lineage(&c.engine).unwrap().now,
+            max_rows: 64,
+            max_bytes: u64::MAX,
+        };
+        r.index += 1;
+        assert_eq!(
+            merge(&mut r.engine, r.index, &m, &c.engine),
+            Err(MetaError::Unfrozen)
+        );
+    }
+
+    /// A split at a bucket's first routing key leaves the range none of its keys, and the
+    /// range gives up the bucket's gate; a split the range cannot take is refused.
+    #[test]
+    fn a_split_at_a_buckets_start_moves_its_gate_whole() {
+        let mut r = Range::new();
+        let (outcome, made) = r.split(key::bucket_routes("b").0, 2);
+        assert!(matches!(outcome, Outcome::Split(_)));
+        let c = made.unwrap();
+        assert_eq!(gate(&r.engine, "b").unwrap(), None);
+        assert!(gate(&c.engine, "b").unwrap().is_some());
+        // A range may hold a gate only for a bucket whose keys its span can hold.
+        let open = Command::Gate(GateChange {
+            bucket: "b".into(),
+            incarnation: 1,
+            attempt: 1,
+            from: None,
+            to: Some(GateState::Open),
+            generation: 2,
+        });
+        assert_eq!(r.run(open), Outcome::Invalid);
+        let refused = |r: &mut Range, at: Vec<u8>, id: u64, generation: u64| {
+            let s = Split {
+                generation,
+                at,
+                child: id,
+            };
+            assert_eq!(child(&r.engine, &s).unwrap(), None);
+            r.run(Command::Split(s))
+        };
+        let lo = lineage(&r.engine).unwrap().now.hi.unwrap();
+        // At or past the span's end, at its start, not a key's route, or the range's own ID.
+        assert_eq!(refused(&mut r, lo.clone(), 3, 2), Outcome::Invalid);
+        assert_eq!(refused(&mut r, Vec::new(), 3, 2), Outcome::Invalid);
+        assert_eq!(refused(&mut r, vec![b'a'], 3, 2), Outcome::Invalid);
+        assert_eq!(
+            refused(&mut r, key::route("a", "k"), 1, 2),
+            Outcome::Invalid
+        );
+        assert!(matches!(
+            refused(&mut r, key::route("a", "k"), 3, 1),
+            Outcome::Moved(_)
+        ));
+    }
+
     /// Every range's engine also holds the rows its replica keeps about itself: the group's
     /// configuration, which once began with the queue's marker and read as a corrupt queue
-    /// row, and the last snapshot installed.
+    /// row, and the term of the last entry applied.
     #[test]
     fn the_queue_reads_past_the_replicas_own_rows() {
         let mut r = Range::new();
-        let own: Vec<Write> = [key::marker::CONFIGURATION, key::marker::INSTALLED]
+        let own: Vec<Write> = [key::marker::CONFIGURATION, key::marker::TERM]
             .iter()
             .map(|&m| Write::Put(vec![key::LOCAL, m], vec![1, 2, 3]))
             .collect();

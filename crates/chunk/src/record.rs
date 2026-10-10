@@ -7,7 +7,7 @@
 //! (Bairavasundaram et al., FAST 2008, §2.2); per-block checksums let a read verify only
 //! the blocks it returns (Ghemawat et al., SOSP 2003, §5.2).
 
-use mantle_disk::buf::AlignedBuf;
+use hyper_block::buf::AlignedBuf;
 
 use crate::key::ChunkKey;
 use mantle_codec::{Reader, Writer};

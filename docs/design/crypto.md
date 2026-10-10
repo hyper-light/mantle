@@ -1,6 +1,7 @@
 # Cryptography: AWS-LC, vendored
 
-Status: design, 2026-09-29. Sources: docs/research/14 (cited as "14 §x"); the measurements
+Status: design, 2026-09-29; digest state 2026-09-30. Sources: docs/research/14 (cited as
+"14 §x"), 30 (resilient transfer); the measurements
 docs/measurements/2026-09-28-aws-lc-first-random.md and 2026-09-28-aws-lc-crypto.md;
 vendor/UPSTREAM.md, which lists every local change.
 
@@ -161,3 +162,21 @@ a 192-bit key-encryption key. With what aws-lc-rs already had, every JWE algorit
 registers can be built on the vendored copy. Its tests reproduce RFC 7518 Appendix B, RFC 3394
 and RFC 5649's 192-bit vectors, and RFC 7516 A.3's JWE from its compact serialization. mantle
 itself has no use for JOSE, so it carries no JOSE layer.
+
+## 10. Digest state for resumed uploads
+
+A native upload that resumes keeps the MD5 its ETag needs, and any other block hash its request
+named, running across runs, and records each hash's state with every run's commit (gateway.md
+§2.1). A run ends on a 64 KiB boundary, where MD5's and SHA-1's and SHA-256's 64-byte block
+buffers and SHA-512's 128-byte one are empty, so a state is the chaining words and the length
+alone. AWS-LC keeps those states in its plain C contexts (`MD5_CTX`, `SHA_CTX`, `SHA256_CTX`,
+`SHA512_CTX`), but aws-lc-rs exposes no way to read one out or start from one (research/30 §3.5,
+§11). The vendored aws-lc-rs therefore gains, beside its fallible digest entry points (§3), an
+export of a context's state at a block boundary and an import that resumes from it, both refusing
+a context whose buffer is not empty and returning `CryptoError` rather than panicking; their test
+is that a digest exported and resumed at every block boundary of generated inputs equals the
+one-shot digest, and that a state taken mid-block is refused. The XXHash checksums S3 accepts are
+computed outside AWS-LC by `twox-hash`, whose streaming state, the accumulators and the bytes it
+holds back for its last stripe, is recorded whole, since XXH3 keeps its last stripe unprocessed
+even at a block boundary. CRCs need no
+such state: they combine from each run's value and length (`mantle-crc`).

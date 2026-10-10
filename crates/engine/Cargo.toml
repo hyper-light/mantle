@@ -1,0 +1,83 @@
+[package]
+name = "mantle-engine"
+description = "mantle's Rust conversion of RocksDB 11.8.1, byte-compatible with its files"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+hyper-block = { path = "../../vendor/hyper-block" }
+# The shards a node runs its ranges on (docs/design/engine-structure.md §2, step E2).
+hyper-rt = { path = "../../vendor/hyper-rt" }
+mantle-crc = { path = "../crc" }
+thiserror.workspace = true
+
+# The OS interface of port/mmap.rs: anonymous mappings for the memtable arena's blocks.
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[dev-dependencies]
+# The simulated device with power-loss semantics the store's crash tests run on.
+hyper-block = { path = "../../vendor/hyper-block", features = ["sim"] }
+proptest.workspace = true
+# The oracle of the engine's own xxHash (util/xxhash.rs, tests/xxhash_test.rs).
+twox-hash.workspace = true
+# The oracle of the engine's own Zstandard (codec/zstd, tests/zstd_test.rs).
+zstd.workspace = true
+tempfile.workspace = true
+# Allocation and page-fault counts of the benchmarks against RocksDB.
+hyper-measure = { path = "../../vendor/hyper-measure" }
+
+[[bench]]
+name = "memtable"
+harness = false
+
+[[bench]]
+name = "block_read"
+harness = false
+
+[[bench]]
+name = "codec"
+harness = false
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "shard_db"
+harness = false
+
+[[bench]]
+name = "incmap"
+harness = false
+
+[[bench]]
+name = "maplet"
+harness = false
+
+[[bench]]
+name = "ranges"
+harness = false
+
+[[bench]]
+name = "remix"
+harness = false
+
+[[bench]]
+name = "surf"
+harness = false
+
+[[bench]]
+name = "seek_cursor"
+harness = false
+
+[[bench]]
+name = "active_order"
+harness = false

@@ -409,7 +409,7 @@ pub fn continuation_token(next: &Resume) -> String {
         Resume::After(key) => (b'a', key),
         Resume::Past(key) => (b'p', key),
     };
-    let mut bytes = Vec::with_capacity(key.len().saturating_add(1));
+    let mut bytes = Vec::new();
     bytes.push(tag);
     bytes.extend_from_slice(key.as_bytes());
     URL_SAFE_NO_PAD.encode(bytes)

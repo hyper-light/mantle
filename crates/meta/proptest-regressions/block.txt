@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 6d2ff5aaa9c0aa0b3808aa394c460fca1317e7502e197fb9eefb72dfb2cf6020 # shrinks to commands = [Write { block: 2, header: BlockHeader { length: 3145728, data: 1, parity: 0, chunk_len: 1572864, crc32c: 1 }, chunks: [ChunkPlace { volume: 0, key: ChunkKey { block: 2, epoch: 0, index: 0 } }], file: 1, handover_ns: 15, at_ns: 0 }, Release { block: 2, deadline_ns: 16 }, Settle { blocks: [2] }]

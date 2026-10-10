@@ -1232,6 +1232,23 @@ mod tests {
                 r#"{"StringEquals": {"s3:prefix": []}}"#,
                 "Invalid policy syntax.",
             ),
+            // An object or array where a value belongs is read, at the parser's deepest
+            // level, and refused by the check (json::MAX_DEPTH).
+            (
+                "\"s3:ListBucket\"",
+                r#"{"StringEquals": {"s3:prefix": [{}]}}"#,
+                "Invalid policy syntax.",
+            ),
+            (
+                "\"s3:ListBucket\"",
+                r#"{"StringEquals": {"s3:prefix": [[]]}}"#,
+                "Invalid policy syntax.",
+            ),
+            (
+                "\"s3:ListBucket\"",
+                r#"{"StringEquals": {"s3:prefix": [[[]]]}}"#,
+                "This policy contains invalid Json",
+            ),
         ];
         for (action, condition, message) in refused {
             assert_eq!(

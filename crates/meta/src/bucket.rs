@@ -382,7 +382,7 @@ fn step<E: Rows>(
         return Ok((Outcome::Conflict, Vec::new()));
     }
     let owned = key::owned(&row.owner, bucket);
-    let mut writes = Vec::with_capacity(4);
+    let mut writes = Vec::new();
     match to {
         BucketState::Active => {
             let listed = Owned {

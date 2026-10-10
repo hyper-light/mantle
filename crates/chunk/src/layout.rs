@@ -1,15 +1,20 @@
 //! Volume geometry and configuration.
 
-use mantle_disk::buf::Alignment;
+use hyper_block::buf::{Alignment, MAX_BUFFER};
 
 use crate::error::ChunkError;
-use crate::frame::{FRAME_HEADER, PUT_LEN, SEGMENT_LEN};
+use crate::frame::{DELETE_LEN, FRAME_HEADER, PUT_LEN, SEGMENT_LEN};
 use crate::superblock::{OFFSET_B_COMPACT, OFFSET_B_STANDARD};
 
-/// The largest index frame: bounds the memory one frame takes to read or write.
+/// The largest index frame, and so the most memory reading or writing one frame takes. It is
+/// one bound for every frame (audit S13): recovery reads no larger frame, a checkpoint packs
+/// its records into frames within it, `Config::check` refuses limits whose largest batch
+/// frame would pass it, and the writer refuses to write a frame past it. A frame is padded
+/// to the volume's block, and every block divides it (`Geometry::plan`), so a frame whose
+/// header and records fit it stays within it once padded.
 pub const MAX_FRAME_BYTES: u64 = 4 << 20;
-/// Checkpoint records per frame, so a checkpoint frame stays under `MAX_FRAME_BYTES`.
-pub const CHECKPOINT_RECORDS_PER_FRAME: u64 = (MAX_FRAME_BYTES - 8192) / PUT_LEN as u64;
+/// Bytes of records one frame holds.
+pub const FRAME_PAYLOAD: u64 = MAX_FRAME_BYTES - FRAME_HEADER as u64;
 
 /// Limits on the writer's queue and batches. Each bounds memory, not throughput: a batch
 /// is everything that arrived while the previous flush ran, up to these limits.
@@ -50,10 +55,60 @@ impl Limits {
     }
 }
 
+/// How many client reads the volume holds at the device, and how many more may wait for a
+/// turn (docs/design/chunk-store.md §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reads {
+    /// Reads at the device at once: the depth where calibration finds throughput stops
+    /// growing (`mantle_disk::calibrate::Calibration::random_read_saturation`). Past it every
+    /// read added only waits, so holding the device there costs no throughput
+    /// (docs/measurements/2026-09-29-read-depth.md).
+    pub depth: usize,
+    /// Reads that may wait for a turn; a read past them is refused with `Busy`, and the caller
+    /// reads another copy.
+    pub waiting: usize,
+    /// Bytes the reads at the device may buffer at once: the bytes in flight where calibration
+    /// finds large sequential reads stop gaining throughput
+    /// (`mantle_disk::calibrate::Calibration::sequential_read_saturation`), past which bytes
+    /// added only wait, as reads added past `depth` do. A read that buffers more alone is taken
+    /// when no other read is at the device, as the writer's queue takes a payload larger than
+    /// its bound, so the reads' buffers never exceed this or one read's (audit S07).
+    pub bytes: u64,
+    /// Bytes of payload a read goes past rather than ask the device a second time: what the
+    /// device reads sequentially in the time one small random read takes
+    /// (`mantle_disk::calibrate::Calibration::read_gap`). A range that starts further into a
+    /// record's payload is read apart from the record's header and checksum table (audit P01).
+    pub gap: u64,
+}
+
+impl Reads {
+    /// The measured depth, bytes and gap, with as many reads let wait: by Little's law each
+    /// then waits about as long as a read takes at that depth, beyond which another copy
+    /// serves it sooner.
+    pub fn measured(depth: usize, bytes: u64, gap: u64) -> Self {
+        let depth = depth.max(1);
+        Self {
+            depth,
+            waiting: depth,
+            bytes,
+            gap,
+        }
+    }
+}
+
+impl Default for Reads {
+    /// A device not measured reads one at a time, each read alone: no device's depth of
+    /// greatest power is below one. It reads no payload it was not asked for.
+    fn default() -> Self {
+        Self::measured(1, 0, 0)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
-    /// Bytes per segment, fixed at format. 256 MiB matches host-managed SMR zones and is in
-    /// the range of ZNS zone capacities (docs/design/chunk-store.md §2).
+    /// Bytes per segment, fixed at format. 256 MiB is the zone size of host-managed SMR
+    /// drives and in the range of ZNS zone capacities, though the volume has no zone backend
+    /// and a host-managed device is refused (docs/design/chunk-store.md §2).
     pub segment_size: u64,
     /// log2 of the checksum block size of data records; 16 is 64 KiB (Ghemawat et al.,
     /// SOSP 2003, §5.2).
@@ -73,6 +128,40 @@ pub struct Config {
     /// (`mantle_disk::calibrate::Calibration::first_write_penalty`; docs/design/chunk-store.md
     /// §2).
     pub prewrite: bool,
+    pub reads: Reads,
+}
+
+impl Config {
+    /// Refuses settings no volume can run with, before any I/O or thread (audit S08): a
+    /// read gate of no depth admits no read and parks every one for good, and a batch, queue
+    /// or chunk of no room takes nothing.
+    pub fn check(&self) -> Result<(), ChunkError> {
+        let bad = |m: &str| Err(ChunkError::Config(m.to_owned()));
+        if self.reads.depth == 0 {
+            return bad("a read depth of none admits no read");
+        }
+        if self.limits.batch_requests == 0 || self.limits.batch_bytes == 0 {
+            return bad("a batch of no requests or no bytes takes nothing");
+        }
+        if self.limits.fragments_per_chunk == 0 {
+            return bad("a chunk of no fragments holds nothing");
+        }
+        if self.max_fragments == 0 {
+            return bad("a volume of no fragments indexes nothing");
+        }
+        if !(9..=24).contains(&self.checksum_shift) {
+            return bad("checksum block must be between 512 B and 16 MiB");
+        }
+        // A batch is one frame, which recovery must read back (audit S13). The cleaner moves
+        // as many fragments in one relocation as a batch takes requests (`Volume::start`).
+        let largest = batch_frame_payload(self.limits.batch_requests, self.limits.batch_requests);
+        if largest.is_none_or(|bytes| bytes > FRAME_PAYLOAD) {
+            return bad(
+                "a batch of this many requests could make an index frame larger than recovery reads",
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Default for Config {
@@ -85,6 +174,7 @@ impl Default for Config {
             scrub_period: Some(std::time::Duration::from_secs(7 * 24 * 3600)),
             limits: Limits::default(),
             prewrite: false,
+            reads: Reads::default(),
         }
     }
 }
@@ -121,6 +211,12 @@ impl Geometry {
         if config.segment_size > u64::from(u32::MAX) {
             return Err(bad("segment size must be below 4 GiB"));
         }
+        // A record may fill its segment, and is written and read in one buffer.
+        if config.segment_size > u64::try_from(MAX_BUFFER).unwrap_or(u64::MAX) {
+            return Err(bad(
+                "segment size must fit one I/O buffer (hyper_block::buf::MAX_BUFFER)",
+            ));
+        }
         if !(9..=24).contains(&config.checksum_shift) {
             return Err(bad("checksum block must be between 512 B and 16 MiB"));
         }
@@ -140,21 +236,11 @@ impl Geometry {
         if !offset_b.is_multiple_of(block) {
             return Err(bad("block too large for the superblock layout"));
         }
+        if block > MAX_FRAME_BYTES {
+            return Err(bad("block larger than an index frame"));
+        }
         let segments_upper = size.checked_div(config.segment_size).unwrap_or(0);
-        let checkpoint = checkpoint_bytes(config.max_fragments, segments_upper, block)
-            .ok_or_else(|| bad("fragment budget too large"))?;
-        // Three checkpoints of the full budget, one batch frame, and the wraps before two
-        // checkpoints: the one being written and the one before it, whose skipped tail stays
-        // in the live log until the next. With it, a full index leaves a checkpoint's worth of
-        // frames between checkpoints (docs/design/chunk-store.md §5).
-        let batch_frame = batch_frame_bytes(config.limits.batch_requests, block)
-            .ok_or_else(|| bad("batch limit too large"))?;
-        let largest = largest_frame(config, block)
-            .ok_or_else(|| bad("batch limit or fragment budget too large"))?;
-        let log_size = checkpoint
-            .checked_mul(3)
-            .and_then(|c| c.checked_add(batch_frame))
-            .and_then(|c| c.checked_add(largest.checked_mul(2)?))
+        let log_size = log_bytes(config, segments_upper, block)
             .map(|c| c.max(min_log))
             .and_then(|c| c.checked_next_multiple_of(block))
             .ok_or_else(|| bad("log too large"))?;
@@ -197,44 +283,103 @@ impl Geometry {
     pub fn block_usize(&self) -> usize {
         usize::try_from(self.block).unwrap_or(4096)
     }
+
+    /// Refuses, when a volume is opened, limits its log was not sized for at format (audit
+    /// S13): a batch or checkpoint larger than the log leaves room for would fill it with
+    /// nothing able to free it.
+    pub fn holds(&self, config: &Config) -> Result<(), ChunkError> {
+        let bad = |m: &str| Err(ChunkError::Config(m.to_owned()));
+        if self.block > MAX_FRAME_BYTES {
+            return bad("block larger than an index frame");
+        }
+        match log_bytes(config, u64::from(self.segments), self.block) {
+            Some(need) if need <= self.log_size => Ok(()),
+            _ => {
+                bad("the index log, sized at format, cannot hold a batch or checkpoint this large")
+            }
+        }
+    }
 }
 
-/// Bytes of the largest batch frame. Per request at most four records: its own Put or
-/// Delete, sealing a full segment and opening the next when the record does not fit, and one
-/// of the empty segments the batch frees (the writer frees at most one per request).
-pub fn batch_frame_bytes(requests: usize, block: u64) -> Option<u64> {
-    let records = u64::try_from(requests).ok()?.checked_mul(4)?;
-    let payload = records.checked_mul(PUT_LEN as u64)?;
+/// Bytes the log needs: three checkpoints of the full fragment budget, one batch frame, and
+/// the wraps before two checkpoints: the one being written and the one before it, whose
+/// skipped tail stays in the live log until the next. With it, a full index leaves a
+/// checkpoint's worth of frames between checkpoints (docs/design/chunk-store.md §5).
+pub fn log_bytes(config: &Config, segments: u64, block: u64) -> Option<u64> {
+    let checkpoint = checkpoint_bytes(config.max_fragments, segments, block)?;
+    let batch = batch_frame_bytes(
+        config.limits.batch_requests,
+        config.limits.batch_requests,
+        block,
+    )?;
+    let largest = largest_frame(config, segments, block)?;
+    checkpoint
+        .checked_mul(3)?
+        .checked_add(batch)?
+        .checked_add(largest.checked_mul(2)?)
+}
+
+/// Bytes of records the largest batch frame holds, whatever its requests. A request's worst
+/// is a record placed with a seal of the full segment before it and an open of the next, and
+/// one empty segment the batch frees (the writer frees at most one per request); a delete's
+/// record is shorter than a put's and places nothing. At most one request is a relocation,
+/// since one cleaning pass runs at a time and waits for each relocation it sends, and each
+/// of its `moves` is placed as a put is.
+pub fn batch_frame_payload(requests: usize, moves: usize) -> Option<u64> {
+    let placed = PUT_LEN
+        .max(DELETE_LEN)
+        .checked_add(SEGMENT_LEN.checked_mul(2)?)?;
+    let request = u64::try_from(placed.checked_add(SEGMENT_LEN)?).ok()?;
+    let requests = u64::try_from(requests.max(1)).ok()?;
+    let moves = u64::try_from(moves).ok()?;
+    requests
+        .checked_mul(request)?
+        .checked_add(moves.checked_mul(u64::try_from(placed).ok()?)?)
+}
+
+/// Bytes of the largest batch frame, padded to the block.
+pub fn batch_frame_bytes(requests: usize, moves: usize, block: u64) -> Option<u64> {
     (FRAME_HEADER as u64)
-        .checked_add(payload)?
+        .checked_add(batch_frame_payload(requests, moves)?)?
         .checked_next_multiple_of(block)
 }
 
 /// The largest frame the log holds, and so the most a wrap skips at the end of the log region:
 /// a wrap happens when the next frame does not fit in what remains.
-pub fn largest_frame(config: &Config, block: u64) -> Option<u64> {
-    let batch = batch_frame_bytes(config.limits.batch_requests, block)?;
-    let checkpoint = checkpoint_frame_bytes(config.max_fragments, block)?;
+pub fn largest_frame(config: &Config, segments: u64, block: u64) -> Option<u64> {
+    let batch = batch_frame_bytes(
+        config.limits.batch_requests,
+        config.limits.batch_requests,
+        block,
+    )?;
+    let checkpoint = checkpoint_frame_bytes(config.max_fragments, segments, block)?;
     Some(batch.max(checkpoint))
 }
 
-/// Bytes of the largest checkpoint frame.
-pub fn checkpoint_frame_bytes(fragments: u64, block: u64) -> Option<u64> {
-    let records = fragments.min(CHECKPOINT_RECORDS_PER_FRAME);
-    (FRAME_HEADER as u64)
-        .checked_add(records.checked_mul(PUT_LEN as u64)?)?
-        .checked_next_multiple_of(block)
+/// Bytes of the largest checkpoint frame: all the checkpoint's records, or a full frame.
+pub fn checkpoint_frame_bytes(fragments: u64, segments: u64, block: u64) -> Option<u64> {
+    let whole = (FRAME_HEADER as u64)
+        .checked_add(checkpoint_payload(fragments, segments)?)?
+        .checked_next_multiple_of(block)?;
+    Some(whole.min(MAX_FRAME_BYTES))
 }
 
-/// Bytes a checkpoint of `fragments` fragments and `segments` segments takes in the log.
-pub fn checkpoint_bytes(fragments: u64, segments: u64, block: u64) -> Option<u64> {
-    let records = fragments.checked_add(segments)?;
-    let frames = records
-        .div_ceil(CHECKPOINT_RECORDS_PER_FRAME)
-        .checked_add(2)?;
-    let payload = fragments
+/// Bytes of the records a checkpoint of `fragments` fragments and `segments` segments writes.
+fn checkpoint_payload(fragments: u64, segments: u64) -> Option<u64> {
+    fragments
         .checked_mul(PUT_LEN as u64)?
-        .checked_add(segments.checked_mul(SEGMENT_LEN as u64)?)?;
+        .checked_add(segments.checked_mul(SEGMENT_LEN as u64)?)
+}
+
+/// Bytes a checkpoint of `fragments` fragments and `segments` segments takes in the log. Its
+/// records are packed into frames in order, a frame closing only when the next record does
+/// not fit, so every frame but the last holds more than `FRAME_PAYLOAD - PUT_LEN` bytes of
+/// them; an end frame follows. Each frame adds its header and at most a block of padding.
+pub fn checkpoint_bytes(fragments: u64, segments: u64, block: u64) -> Option<u64> {
+    let payload = checkpoint_payload(fragments, segments)?;
+    let frames = payload
+        .div_ceil(FRAME_PAYLOAD.checked_sub(PUT_LEN as u64)?)
+        .checked_add(2)?;
     payload.checked_add(frames.checked_mul((FRAME_HEADER as u64).checked_add(block)?)?)
 }
 
@@ -272,5 +417,16 @@ mod tests {
             ..Config::default()
         };
         assert!(Geometry::plan(1 << 20, a, &c).is_err(), "too small");
+        // A segment one block past a buffer's bound, on a volume with room for many.
+        let c = Config {
+            segment_size: MAX_BUFFER as u64 + 4096,
+            ..Config::default()
+        };
+        assert!(Geometry::plan(1 << 40, a, &c).is_err(), "past one buffer");
+        let c = Config {
+            segment_size: MAX_BUFFER as u64,
+            ..Config::default()
+        };
+        assert!(Geometry::plan(1 << 40, a, &c).is_ok(), "one buffer");
     }
 }

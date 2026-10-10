@@ -493,6 +493,27 @@ shape mantle's design:
 | Per-group identity/decoder/fast records, `LogicalLogId` = 16-byte group id, ≤ 65,536 logical logs per WAL | Range ids fit; a split creates a new logical log (restore image path exists: `restore_on_wal_in`) |
 | No split/merge support in consensus | Range split/merge (new group bootstrap from parent state, key-span fencing) must be built in mantle |
 
+### 2.11 F17: a configuration applies only on a commit the log holds (added 2026-10-02)
+
+Read from hyper-raft `docs/research/durable.md` §1, §3 and §4 (2026-10-01), which read focal at
+`aa1f162` and etcd-io/raft at main; this revision of focal is later than §0's pin.
+
+- **focal F17** (`crates/focal-consensus/src/persistence.rs`: `fenced`, `after_advance`,
+  `commit_durable`). Found by SIGKILL inside the window between a commit known and a commit
+  logged: `cli_network`, "the founder removed its peer, both were stopped, and the founder did
+  not come back". focal now applies a change of configuration only once a write states the
+  commit covering it, and a control group applies nothing past its logged commit
+  (`apply_on_written_commit`, `cli_upgrade`).
+- **Why the window exists.** The commit index is volatile: it "can safely be reinitialized to
+  zero on a restart" (Diss §3.8; 06 §A1). In the thesis a configuration "takes effect on each
+  server as soon as it is added to that server's log" (Diss §4.1), so it is durable with its
+  entry; in etcd's core, which focal-raft and hyper-raft port, membership "takes effect when
+  its entry is applied, not when it is added to the log", which "introduces a problem when you
+  try to remove a member from a two-member cluster" (etcd-io/raft `doc.go`, implementation
+  notes). A configuration applied on a commit the log does not hold reverts with the commit.
+- **What mantle takes.** The rule as hyper-raft `docs/durable.md` §4.1 states it (I5), for
+  `Replica` (design/replica.md §3).
+
 ---
 
 ## 3. focal-log — the shared physical WAL

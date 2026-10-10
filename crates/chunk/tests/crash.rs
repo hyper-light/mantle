@@ -9,8 +9,11 @@
 //! - recovery succeeds: a torn tail is never mistaken for damage;
 //! - a chunk whose last acknowledged operation was a write reads back exactly what was
 //!   acknowledged, and one whose last acknowledged operation was a delete is absent, except
-//!   that each writer's single unacknowledged operation may or may not have taken effect;
-//! - every read either returns verified bytes or reports the chunk absent;
+//!   that each writer's single unacknowledged operation may or may not have taken effect, or
+//!   may be kept and reported damaged, since recovery cannot tell a torn write from damage
+//!   to an acknowledged one (audit S05);
+//! - every read either returns verified bytes, reports the chunk absent, or, for a chunk
+//!   recovery reported damaged, refuses bytes that do not verify;
 //! - the recovered volume accepts writes and survives a clean reopen.
 //!
 //! `MANTLE_CRASH_SEEDS` raises the number of runs for a soak.
@@ -27,11 +30,11 @@
 mod common;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
-use common::{SIZE, config, data, key, sim};
+use common::device::SimDevice;
+use common::{SIZE, config, data, issuer, key, sim};
+use hyper_block::sim::{Crash, Fault};
 use mantle_chunk::{ChunkError, ChunkKey, Volume};
-use mantle_disk::sim::{Crash, Fault, SimFile};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct State {
@@ -89,7 +92,7 @@ impl Rng {
 }
 
 /// Runs one writer's operations until one fails; returns its model.
-fn writer(v: &Volume<Arc<SimFile>>, id: u64, seed: u64, ops: usize) -> Model {
+fn writer(v: &Volume<SimDevice>, id: u64, seed: u64, ops: usize) -> Model {
     let mut rng = Rng(seed ^ (id << 48));
     let keys: Vec<ChunkKey> = (0..6).map(|i| key(id * 1000 + i)).collect();
     let mut model = Model {
@@ -166,26 +169,37 @@ fn writer(v: &Volume<Arc<SimFile>>, id: u64, seed: u64, ops: usize) -> Model {
     model
 }
 
-fn read_all(v: &Volume<Arc<SimFile>>, k: &ChunkKey, seed: u64) -> Option<State> {
-    let stat = v.stat(k).unwrap()?;
-    let bytes = v
-        .read(k, 0, stat.len)
-        .unwrap_or_else(|e| panic!("seed {seed}: read of {k} after recovery failed: {e}"));
-    Some(State {
+/// A chunk as read back: `Err` with the error when its bytes do not verify.
+fn read_all(v: &Volume<SimDevice>, k: &ChunkKey) -> Result<Option<State>, ChunkError> {
+    let Some(stat) = v.stat(k).unwrap() else {
+        return Ok(None);
+    };
+    let bytes = v.read(k, 0, stat.len)?;
+    Ok(Some(State {
         bytes,
         sealed: stat.sealed,
-    })
+    }))
 }
 
-fn check(v: &Volume<Arc<SimFile>>, models: &[Model], seed: u64) {
+fn check(v: &Volume<SimDevice>, models: &[Model], damaged: &[ChunkKey], seed: u64) {
     for model in models {
         for (k, acked) in &model.acked {
-            let got = read_all(v, k, seed);
             let allowed_uncertain = model
                 .uncertain
                 .as_ref()
                 .filter(|(uk, _)| uk == k)
                 .map(|(_, op)| apply(acked, op));
+            let got = match read_all(v, k) {
+                Ok(got) => got,
+                // Only the write in flight may be torn, and recovery reports it.
+                Err(e) => {
+                    assert!(
+                        allowed_uncertain.is_some() && damaged.contains(k),
+                        "seed {seed}: read of {k} after recovery failed: {e}"
+                    );
+                    continue;
+                }
+            };
             let ok = got == *acked || allowed_uncertain.as_ref().is_some_and(|u| got == *u);
             assert!(
                 ok,
@@ -200,7 +214,7 @@ fn check(v: &Volume<Arc<SimFile>>, models: &[Model], seed: u64) {
 
 fn run(seed: u64, writers: u64, crash: Crash) {
     let file = sim(seed);
-    let v = Volume::format(Arc::clone(&file), SIZE, config()).unwrap();
+    let v = Volume::format(issuer(), file.clone(), SIZE, config()).unwrap();
     let mut rng = Rng(seed);
     file.inject(Fault::PowerCut {
         ops: rng.below(400),
@@ -210,16 +224,23 @@ fn run(seed: u64, writers: u64, crash: Crash) {
         let handles: Vec<_> = (0..writers)
             .map(|id| {
                 let v = &v;
-                s.spawn(move || writer(v, id, seed, 80))
+                // Each writer runs until the cut fails its request, at most this many steps:
+                // far more than the most device operations a cut is drawn below.
+                s.spawn(move || writer(v, id, seed, 10_000))
             })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
+    // A cut that never came would test only a clean reopen.
+    assert!(
+        models.iter().any(|m| m.uncertain.is_some()),
+        "seed {seed}: the power cut never came"
+    );
     drop(v);
     file.crash(crash).unwrap();
     file.clear_faults().unwrap();
 
-    let (v, report) = Volume::open(Arc::clone(&file), config())
+    let (v, report) = Volume::open(issuer(), file.clone(), config())
         .unwrap_or_else(|e| panic!("seed {seed}: recovery refused the volume: {e}"));
     if std::env::var("MANTLE_CRASH_TRACE").is_ok() {
         eprintln!("recovery: {report:?}");
@@ -244,14 +265,25 @@ fn run(seed: u64, writers: u64, crash: Crash) {
             );
         }
     }
-    check(&v, &models, seed);
+    // Recovery reports only records of the last batch, each an operation in flight.
+    let in_flight: Vec<ChunkKey> = models
+        .iter()
+        .filter_map(|m| m.uncertain.as_ref().map(|(k, _)| *k))
+        .collect();
+    for k in &report.damaged {
+        assert!(
+            in_flight.contains(k),
+            "seed {seed}: {k} reported damaged, never in flight"
+        );
+    }
+    check(&v, &models, &report.damaged, seed);
 
     // The recovered volume keeps working, and a clean reopen changes nothing.
     let fresh = key(999_999);
     v.put(fresh, &data(seed, 5000)).unwrap();
     drop(v);
-    let (v, _) = Volume::open(Arc::clone(&file), config()).unwrap();
-    check(&v, &models, seed);
+    let (v, _) = Volume::open(issuer(), file.clone(), config()).unwrap();
+    check(&v, &models, &report.damaged, seed);
     assert_eq!(v.read(&fresh, 0, 5000).unwrap(), data(seed, 5000));
 }
 

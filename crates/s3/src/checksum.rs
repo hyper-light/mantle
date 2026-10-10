@@ -42,6 +42,28 @@ impl Algorithm {
         Self::Sha512,
     ];
 
+    /// The algorithm's number where a value is stored, its place in [`Self::ALL`]. Stored
+    /// numbers are never reused.
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Crc32 => 0,
+            Self::Crc32c => 1,
+            Self::Crc64Nvme => 2,
+            Self::Sha1 => 3,
+            Self::Sha256 => 4,
+            Self::Md5 => 5,
+            Self::XxHash64 => 6,
+            Self::XxHash3 => 7,
+            Self::XxHash128 => 8,
+            Self::Sha512 => 9,
+        }
+    }
+
+    /// The algorithm a stored number names.
+    pub fn from_code(code: u8) -> Option<Self> {
+        Self::ALL.get(usize::from(code)).copied()
+    }
+
     /// The name in `x-amz-checksum-algorithm` and `x-amz-sdk-checksum-algorithm`.
     pub fn name(self) -> &'static str {
         match self {
@@ -294,19 +316,21 @@ pub fn composite(parts: &[Checksum]) -> Result<Option<String>, CryptoError> {
     Ok(Some(format!("{}-{}", h.finish()?.to_base64(), parts.len())))
 }
 
-/// A single-part object's ETag: the MD5 of its bytes in lowercase hex, quoted (05 §5.1).
+/// A single-part object's ETag, bare of the quotes a response adds: the MD5 of its bytes in
+/// lowercase hex (05 §5.1).
 pub fn etag(md5: &[u8; 16]) -> String {
-    format!("\"{}\"", hex(md5))
+    hex(md5)
 }
 
-/// A multipart object's ETag: the MD5 of its parts' binary MD5s, then `-n`, quoted (05 §4.5).
+/// A multipart object's ETag, bare of quotes: the MD5 of its parts' binary MD5s, then `-n`
+/// (05 §4.5).
 pub fn multipart_etag(parts: &[[u8; 16]]) -> Result<String, CryptoError> {
     let mut h = crypto::Digest::new(&crypto::MD5)?;
     for part in parts {
         h.update(part)?;
     }
     let digest: [u8; 16] = h.finish_array()?;
-    Ok(format!("\"{}-{}\"", hex(&digest), parts.len()))
+    Ok(format!("{}-{}", hex(&digest), parts.len()))
 }
 
 /// A `Content-MD5` header's value: base64 of 16 bytes.
@@ -316,7 +340,7 @@ pub fn content_md5(text: &str) -> Option<[u8; 16]> {
 
 fn hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    let mut out = String::new();
     for &b in bytes {
         out.push(char::from(
             HEX.get(usize::from(b >> 4)).copied().unwrap_or(b'0'),
@@ -332,6 +356,15 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn algorithms_keep_their_numbers() {
+        for (code, a) in Algorithm::ALL.into_iter().enumerate() {
+            assert_eq!(usize::from(a.code()), code);
+            assert_eq!(Algorithm::from_code(a.code()), Some(a));
+        }
+        assert_eq!(Algorithm::from_code(10), None);
+    }
 
     fn b64(algorithm: Algorithm, text: &str) -> Checksum {
         Checksum::from_base64(algorithm, text).unwrap()
@@ -392,7 +425,7 @@ mod tests {
         let md5s: Vec<[u8; 16]> = parts.iter().map(|p| md5(p)).collect();
         assert_eq!(
             multipart_etag(&md5s).unwrap(),
-            "\"b2add96cc9702bbf4efb0ccdfc6b7747-3\""
+            "b2add96cc9702bbf4efb0ccdfc6b7747-3"
         );
         let one = [sum(Algorithm::Sha256, &[b'A'; 1024])];
         assert_eq!(
@@ -426,7 +459,7 @@ mod tests {
         );
         assert!(composite(&[]).unwrap().is_none());
         assert!(full_object(&[(sum(Algorithm::Sha256, b"x"), 1)]).is_none());
-        assert_eq!(etag(&md5(b"")), "\"d41d8cd98f00b204e9800998ecf8427e\"");
+        assert_eq!(etag(&md5(b"")), "d41d8cd98f00b204e9800998ecf8427e");
     }
 
     proptest! {

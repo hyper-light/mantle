@@ -19,10 +19,13 @@ use clap::{Parser, Subcommand};
 
 mod bench;
 mod bench_ec;
+mod bench_gateway;
 mod bench_hash;
 mod bench_log;
+mod bench_meta;
 mod disk;
 mod display;
+mod drive;
 mod durability;
 
 #[derive(Parser)]
@@ -93,9 +96,15 @@ enum BenchCommand {
         /// (powers of 1024): 4K,64K,1M,8M by default.
         #[arg(long, value_delimiter = ',', value_parser = parse_size)]
         sizes: Vec<usize>,
-        /// Requests in flight to measure, comma-separated: 1,4,16,64 by default.
+        /// Clients to measure, comma-separated: 1,4,16,64 by default. Closed loop, each has one
+        /// request in flight; open loop, at most one.
         #[arg(long, value_delimiter = ',')]
         workers: Vec<usize>,
+        /// Requests a second in all, arriving open loop from a Poisson process, with latency
+        /// from each request's intended start; without it, each client issues its next request
+        /// when its last is answered.
+        #[arg(long)]
+        rate: Option<f64>,
         /// Rounds each point runs at most, from ten to 120: thirty by default, enough for two
         /// states to each carry an interval when the smaller holds a fifth of the rounds.
         #[arg(long, default_value_t = mantle_disk::rounds::Policy::STANDARD.max)]
@@ -103,6 +112,11 @@ enum BenchCommand {
         /// Leave out the measurement of the device itself.
         #[arg(long)]
         skip_device: bool,
+        /// Bytes of each of the scratch volume's segments, with a K or M suffix: a volume's
+        /// 256 MiB by default. Smaller segments give the store as many to keep as a larger
+        /// device would have.
+        #[arg(long, value_parser = parse_size)]
+        segment_size: Option<usize>,
     },
     /// Measure the device under PATH, then the Raft log's appends across entry sizes and
     /// replicas appending at once, in scratch files (removed afterwards).
@@ -134,6 +148,26 @@ enum BenchCommand {
         #[arg(long, value_delimiter = ',', value_parser = parse_size)]
         sizes: Vec<usize>,
     },
+    /// Measure the object path's PUT and GET on one core against a cell in memory, with the
+    /// round trips each waits through: three copies and RS(6,3), across object sizes.
+    Gateway {
+        /// Seconds each measurement runs.
+        #[arg(long, default_value_t = 0.5)]
+        seconds: f64,
+        /// Object sizes, comma-separated, in bytes or with a K or M suffix: 64K,8M,64M by
+        /// default.
+        #[arg(long, value_delimiter = ',', value_parser = parse_size)]
+        sizes: Vec<usize>,
+        /// Clients PUTting at once on the one core, comma-separated, each a record rather than
+        /// a thread: a row for each count.
+        #[arg(long, value_delimiter = ',')]
+        clients: Vec<usize>,
+        /// PUTs a second in all, arriving open loop from a Poisson process, with latency from
+        /// each PUT's intended start; without it, each client starts its next PUT when its last
+        /// is stored.
+        #[arg(long)]
+        rate: Option<f64>,
+    },
     /// Measure the S3 gateway's cryptography and framing on one core: each checksum algorithm
     /// across buffer sizes, verifying a request's signature, decoding signed chunks and form
     /// bodies, checking a form's policy, and sealing data at rest.
@@ -145,6 +179,15 @@ enum BenchCommand {
         /// 8K,64K,1M,8M by default.
         #[arg(long, value_delimiter = ',', value_parser = parse_size)]
         sizes: Vec<usize>,
+    },
+    /// Measure what applying the metadata layers' heaviest commands costs on one core: a
+    /// multipart completion of up to 10,000 parts, an entry of many commands from one session,
+    /// a create or delete attempt learning up to 10,000 ranges, and the sweep's check of a
+    /// page of blocks against a large file.
+    Meta {
+        /// Seconds each measurement runs.
+        #[arg(long, default_value_t = 0.5)]
+        seconds: f64,
     },
 }
 
@@ -230,8 +273,10 @@ fn main() -> ExitCode {
                     seconds,
                     sizes,
                     workers,
+                    rate,
                     rounds,
                     skip_device,
+                    segment_size,
                 },
         } => match std::time::Duration::try_from_secs_f64(seconds) {
             Ok(step) => bench::chunk(
@@ -241,8 +286,10 @@ fn main() -> ExitCode {
                     step,
                     sizes,
                     workers,
+                    rate,
                     rounds,
                     skip_device,
+                    segment_size,
                 },
             )
             .map_err(|e| e.to_string()),
@@ -285,6 +332,33 @@ fn main() -> ExitCode {
             Err(_) => Err(format!("--seconds {seconds} is not a duration")),
         },
         Command::Bench {
+            command:
+                BenchCommand::Gateway {
+                    seconds,
+                    sizes,
+                    clients,
+                    rate,
+                },
+        } => match std::time::Duration::try_from_secs_f64(seconds) {
+            Ok(step) => {
+                let sizes = if sizes.is_empty() {
+                    vec![64 << 10, 8 << 20, 64 << 20]
+                } else {
+                    sizes
+                };
+                let loads: Vec<_> = clients
+                    .into_iter()
+                    .map(|clients| bench_gateway::Load { clients, rate })
+                    .collect();
+                bench_gateway::schemes()
+                    .and_then(|schemes| {
+                        bench_gateway::gateway(&mut out, &schemes, &sizes, &loads, step)
+                    })
+                    .map_err(|e| e.to_string())
+            }
+            Err(_) => Err(format!("--seconds {seconds} is not a duration")),
+        },
+        Command::Bench {
             command: BenchCommand::Hash { seconds, sizes },
         } => match std::time::Duration::try_from_secs_f64(seconds) {
             Ok(step) => {
@@ -295,6 +369,12 @@ fn main() -> ExitCode {
                 };
                 bench_hash::hash(&mut out, &sizes, step).map_err(|e| e.to_string())
             }
+            Err(_) => Err(format!("--seconds {seconds} is not a duration")),
+        },
+        Command::Bench {
+            command: BenchCommand::Meta { seconds },
+        } => match std::time::Duration::try_from_secs_f64(seconds) {
+            Ok(step) => bench_meta::meta(&mut out, step).map_err(|e| e.to_string()),
             Err(_) => Err(format!("--seconds {seconds} is not a duration")),
         },
         Command::Durability {

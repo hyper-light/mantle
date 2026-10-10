@@ -14,7 +14,7 @@
 //! flushes (docs/measurements/2026-09-28-chunk-store-benchmark.md, finding 5). The writer
 //! waits for them as long as waiting is expected to lower total latency, a wait derived from
 //! the measured service time and the learned share of submitters that return
-//! (`mantle_disk::commit`).
+//! (`hyper_block::commit`).
 //!
 //! Records go to one of two streams, each with its own open segment: new writes, and the
 //! cleaner's relocations. Keeping relocated data apart groups data by age, which is what
@@ -23,26 +23,28 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, RwLock};
 
-use mantle_disk::block::BlockFile;
-use mantle_disk::buf::{AlignedBuf, Pool};
-use mantle_disk::commit::Anticipation;
+use hyper_block::block::BlockFile;
+use hyper_block::buf::{AlignedBuf, Alignment, Pool};
+use hyper_block::commit::Anticipation;
+use hyper_block::issuer::Attached;
 
 use crate::error::ChunkError;
 use crate::frame::{
     self, DeleteRecord, KIND_BATCH, KIND_CHECKPOINT_BEGIN, KIND_CHECKPOINT_CHUNK,
     KIND_CHECKPOINT_END, KIND_WRAP, LogRecord, PutRecord, SegmentRecord, SegmentState,
 };
-use crate::index::{Fragment, Index, Inserted, SegmentInfo};
+use crate::index::{Fragment, Index, Inserted, SegmentInfo, Segments};
 use crate::key::ChunkKey;
 use crate::layout::{
-    CHECKPOINT_RECORDS_PER_FRAME, Config, Geometry, batch_frame_bytes, checkpoint_bytes,
+    Config, FRAME_PAYLOAD, Geometry, MAX_FRAME_BYTES, batch_frame_bytes, checkpoint_bytes,
     largest_frame,
 };
-use crate::log::{self, Cursor};
+use crate::log::Cursor;
 use crate::record::{self, FLAG_FINAL, Payload, RecordHeader, SegmentHeader, Sink};
+use crate::recover::{Identity, ReadPool, verify_at};
 use crate::superblock::Superblock;
 
 /// Free segments kept back from new writes so the cleaner can always relocate into one
@@ -84,6 +86,10 @@ pub(crate) enum Op {
     },
     /// Writes the whole index into the log after the batch it arrives in.
     Checkpoint,
+    /// Runs a batch that writes nothing of its own, so sealed segments left with nothing
+    /// live are freed in its frame; answered once that frame is durable. The cleaner sends
+    /// it after each victim.
+    Free,
 }
 
 /// One fragment the cleaner moves.
@@ -97,7 +103,7 @@ pub(crate) struct Move {
 
 pub(crate) struct Request {
     pub op: Op,
-    pub reply: SyncSender<Result<(), ChunkError>>,
+    pub reply: Reply,
     /// Payload bytes the request holds of the client queue's room (`Queue`); `None` for the
     /// cleaner's requests, which it sends one at a time outside that room.
     pub queued: Option<u64>,
@@ -129,6 +135,12 @@ impl Queue {
         self.requests = self.requests.saturating_sub(1);
         self.bytes = self.bytes.saturating_sub(bytes);
     }
+
+    /// Requests queued and not yet taken by the writer.
+    #[cfg(test)]
+    pub fn requests(&self) -> usize {
+        self.requests
+    }
 }
 
 /// What readers, the writer and the cleaner share.
@@ -137,8 +149,6 @@ pub(crate) struct Shared<F> {
     pub geometry: Geometry,
     pub volume: u128,
     pub checksum_shift: u8,
-    /// Buffers for reading records: reads, verification, cleaning and scrubbing.
-    pub pool: Pool,
     pub index: RwLock<Index>,
     pub fenced: std::sync::atomic::AtomicBool,
     /// Set when the volume closes: background threads stop at their next wake.
@@ -152,6 +162,11 @@ pub(crate) struct Shared<F> {
     pub futile_at: std::sync::atomic::AtomicU64,
     /// Requests submitted to the writer so far, counted just before each is sent.
     pub submitted: std::sync::atomic::AtomicU64,
+    /// Segments the cleaner's stream has opened since the volume opened: the free space
+    /// cleaning spends, which the cleaner weighs against the victims it frees. Client writes
+    /// spend free space during a pass too, so the free count alone does not say what the
+    /// pass gained.
+    pub clean_opened: std::sync::atomic::AtomicU64,
     /// Checkpoints written since the volume opened.
     pub checkpoints: std::sync::atomic::AtomicU64,
     /// The room client requests hold in the writer's queue.
@@ -167,7 +182,10 @@ pub(crate) struct Shared<F> {
     pub low_water: std::sync::atomic::AtomicUsize,
     /// Held through a cleaning pass: the background cleaner's or one asked for.
     pub cleaning: std::sync::Mutex<()>,
-    pub usage: RwLock<Vec<SegmentInfo>>,
+    /// The segment table as of the last durable batch.
+    pub usage: RwLock<Segments>,
+    /// Holds client reads at the device's measured depth.
+    pub reads: crate::read::Gate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,11 +199,9 @@ pub(crate) struct Writer<F: BlockFile> {
     pub shared: Arc<Shared<F>>,
     pub config: Config,
     pub rx: Receiver<Request>,
-    pub segments: Vec<SegmentInfo>,
+    pub segments: Segments,
     /// The open segment of each stream.
     pub opens: [Option<u32>; 2],
-    /// Segments recovery found open beyond one per stream; sealed by the first batch.
-    pub stale: Vec<u32>,
     pub incarnation: u64,
     pub sequence: u64,
     pub cursor: Cursor,
@@ -195,11 +211,21 @@ pub(crate) struct Writer<F: BlockFile> {
     pub poke: Option<SyncSender<()>>,
     /// Buffers for the batches the writer lays out, reused from batch to batch.
     pub pool: Pool,
+    /// The writer thread's own read buffers, for the stored copy a retry is compared with:
+    /// recovery's, handed on when the volume starts.
+    pub reads: ReadPool,
+    /// The device's issuer, which every write and flush of the volume goes through
+    /// (docs/design/chunk-store.md §4).
+    pub io: Attached,
     /// What the writer has learned of its batches' service time and of the submitters that
     /// return while it waits.
     pub anticipation: Anticipation,
     /// Requests received from the queue so far.
     pub received: u64,
+    /// Answers held until a later frame confirms the last batch's: its deletes and the puts
+    /// in segments it opened, and every answer that rests on them (`Writer::settle`). At most
+    /// one batch's requests and the next one's.
+    pub unconfirmed: Vec<Held>,
 }
 
 /// A chunk as the batch being validated sees it: the index plus earlier requests in the batch.
@@ -214,12 +240,22 @@ struct View {
     touched: bool,
 }
 
+/// How a durable fragment compares with a retry's bytes.
+enum Stored {
+    Same,
+    Differs,
+    /// It does not verify, or cannot be read.
+    Damaged,
+}
+
 enum Decision {
     /// Write a fragment whose payload has this CRC-32C.
     Write(u32),
     /// Relocate the moves at these positions; the others' chunks changed.
     Relocate(Vec<usize>),
     Delete,
+    /// Free what the batch can (`Op::Free`).
+    Free,
     /// Nothing to write: the request is already satisfied (a retry, a relocation of a chunk
     /// that changed, or deleting nothing).
     Done,
@@ -228,6 +264,18 @@ enum Decision {
 struct Accepted {
     request: Request,
     decision: Decision,
+}
+
+/// An answer held until what it rests on is durable and confirmed.
+pub(crate) type Held = (Reply, Result<(), ChunkError>);
+
+/// A request validation answered without writing, and what its answer rests on.
+struct Answered {
+    reply: Reply,
+    result: Result<(), ChunkError>,
+    /// The accepted request of this batch that last changed the chunk, when the answer was
+    /// decided on that change: the answer stands only if it is written.
+    leader: Option<usize>,
 }
 
 /// One contiguous run of one segment written by this batch: where it starts and ends, and
@@ -263,12 +311,18 @@ struct Layout {
     positions: HashMap<u32, u64>,
     /// Segments this batch opened, with their incarnations.
     opened: Vec<(u32, u64)>,
+    /// How many of them the cleaner's stream opened.
+    clean_opened: u64,
     sealed: Vec<(u32, u32)>,
     freed: Vec<u32>,
     opens: [Option<u32>; 2],
     incarnation: u64,
+    /// The free segments this batch may open, lowest last.
     free: Vec<u32>,
-    /// Incarnation and write position of each segment before this batch.
+    /// Free segments left, counting those `free` does not list.
+    free_left: usize,
+    /// Incarnation and write position before this batch of each segment it may seal or
+    /// free.
     before: HashMap<u32, (u64, u64)>,
 }
 
@@ -313,10 +367,11 @@ impl Layout {
         } else {
             0
         };
-        if self.free.len() <= reserve {
+        if self.free_left <= reserve {
             return None;
         }
         let next = self.free.pop()?;
+        self.free_left = self.free_left.saturating_sub(1);
         self.incarnation = self.incarnation.saturating_add(1);
         self.records.push(LogRecord::Segment(SegmentRecord {
             segment: next,
@@ -338,6 +393,9 @@ impl Layout {
         });
         self.positions.insert(next, block);
         self.opened.push((next, self.incarnation));
+        if stream == Stream::Clean {
+            self.clean_opened = self.clean_opened.saturating_add(1);
+        }
         if let Some(o) = self.opens.get_mut(slot) {
             *o = Some(next);
         }
@@ -375,19 +433,36 @@ fn now_ns() -> u64 {
         .unwrap_or(0)
 }
 
-type Reply = SyncSender<Result<(), ChunkError>>;
+/// Where a request's answer goes, and the waker told once it is there, so that a caller with
+/// many requests out learns of each answer as it comes (docs/design/node.md §1.3).
+pub(crate) struct Reply {
+    tx: SyncSender<Result<(), ChunkError>>,
+    waker: Option<std::task::Waker>,
+}
+
+impl Reply {
+    pub fn new(tx: SyncSender<Result<(), ChunkError>>, waker: Option<std::task::Waker>) -> Self {
+        Self { tx, waker }
+    }
+}
+
+impl Drop for Reply {
+    /// Wakes the submitter once: after its answer is sent, or when the request is dropped
+    /// unanswered, which its receiver then reads as closed.
+    fn drop(&mut self) {
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
+    }
+}
 
 fn answer(tx: Reply, result: Result<(), ChunkError>) {
     // The submitter may have given up waiting; its answer has nowhere to go.
-    let _ = tx.send(result);
+    let _ = tx.tx.send(result);
 }
 
 fn reply(request: Request, result: Result<(), ChunkError>) {
     answer(request.reply, result);
-}
-
-fn slot<T>(items: &mut [T], index: u32) -> Option<&mut T> {
-    items.get_mut(usize::try_from(index).ok()?)
 }
 
 impl<F: BlockFile> Writer<F> {
@@ -395,7 +470,24 @@ impl<F: BlockFile> Writer<F> {
         // Requests the previous batch answered, and requests already submitted when it did.
         let mut answered = 0u64;
         let mut backlog = 0u64;
-        while let Ok(first) = self.rx.recv() {
+        loop {
+            let first = match self.rx.try_recv() {
+                Ok(first) => first,
+                // No batch follows at once to confirm the last one's deletes: a frame of its
+                // own does, before the writer waits.
+                Err(TryRecvError::Empty) if !self.unconfirmed.is_empty() => {
+                    self.confirm();
+                    continue;
+                }
+                Err(TryRecvError::Empty) => match self.rx.recv() {
+                    Ok(first) => first,
+                    Err(_) => return,
+                },
+                Err(TryRecvError::Disconnected) => {
+                    self.confirm();
+                    return;
+                }
+            };
             self.dequeued(&first);
             let mut bytes = request_bytes(&first);
             let mut batch = vec![first];
@@ -416,8 +508,21 @@ impl<F: BlockFile> Writer<F> {
                     reply(request, Err(ChunkError::Fenced));
                 }
             } else {
+                let lsn = self.cursor.lsn;
                 self.process(batch);
+                // A batch that wrote no frame confirmed nothing: its requests may have been
+                // retries or deletes of nothing, and while such requests keep coming the
+                // queue is never empty. The held answers get their frame now, so none waits
+                // longer than one batch (audit S15).
+                if self.cursor.lsn == lsn {
+                    self.confirm();
+                }
                 self.poke_cleaner();
+            }
+            if self.shared.fenced.load(Ordering::Acquire) {
+                for (tx, _) in std::mem::take(&mut self.unconfirmed) {
+                    answer(tx, Err(ChunkError::Fenced));
+                }
             }
             // Requests submitted before these answers went out are queued ahead of any the
             // answered submitters send next.
@@ -475,6 +580,78 @@ impl<F: BlockFile> Writer<F> {
         self.shared.fenced.store(true, Ordering::Release);
     }
 
+    /// Confirms the last batch's frame with a later one, flushed, and answers its deletes: a
+    /// checkpoint when one is due, which the log's reserve holds room for, and otherwise an
+    /// empty frame, which the reserve for a batch's frame holds room for. A delete lives only
+    /// in its frame, where a put's record describes itself in its segment, so an answered
+    /// delete must be in a frame recovery never takes for a torn tail: one a later frame
+    /// follows (docs/design/chunk-store.md §6; audit S15).
+    fn confirm(&mut self) {
+        if self.unconfirmed.is_empty() {
+            return;
+        }
+        let result = if self.shared.fenced.load(Ordering::Acquire) {
+            Err(ChunkError::Fenced)
+        } else if self.checkpoint_due(0) {
+            self.checkpoint()
+        } else {
+            let group = self.cursor.lsn;
+            self.append_frame(KIND_BATCH, &[], group, true).map(|_| ())
+        };
+        let result = match result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.fence();
+                Err(e)
+            }
+        };
+        let mut first = result.err();
+        for (tx, held) in std::mem::take(&mut self.unconfirmed) {
+            match first.take() {
+                Some(e) => answer(tx, Err(e)),
+                None if self.shared.fenced.load(Ordering::Acquire) => {
+                    answer(tx, Err(ChunkError::Fenced));
+                }
+                None => answer(tx, held),
+            }
+        }
+    }
+
+    /// The last batch's frame has a later one, durable: the answers held for it go out.
+    fn confirmed(&mut self) {
+        for (tx, held) in std::mem::take(&mut self.unconfirmed) {
+            answer(tx, held);
+        }
+    }
+
+    /// Answers requests validation decided without writing whose answers had to wait for the
+    /// batch (`validate`). An answer decided on a change earlier in the batch stands only if
+    /// that change was written: otherwise nothing was, and the request is to be retried. Any
+    /// answer decided while changes are unconfirmed rests on them, as a delete of a chunk an
+    /// unconfirmed delete removed does, or a refusal of a put that differs from an
+    /// unconfirmed one, and is held with them.
+    fn settle(&mut self, answered: Vec<Answered>, written: &[bool]) {
+        for Answered {
+            reply,
+            result,
+            leader,
+        } in answered
+        {
+            let result = if self.shared.fenced.load(Ordering::Acquire) {
+                Err(ChunkError::Fenced)
+            } else if leader.is_some_and(|i| !written.get(i).copied().unwrap_or(false)) {
+                Err(ChunkError::Busy)
+            } else {
+                result
+            };
+            if self.unconfirmed.is_empty() || matches!(result, Err(ChunkError::Fenced)) {
+                answer(reply, result);
+            } else {
+                self.unconfirmed.push((reply, result));
+            }
+        }
+    }
+
     /// Whether cleaning may still free a segment: unless it was tried on exactly the data
     /// deleted so far and gained nothing. Only trying can tell, since how tightly relocated
     /// records pack is what decides.
@@ -484,10 +661,7 @@ impl<F: BlockFile> Writer<F> {
     }
 
     fn free_segments(&self) -> usize {
-        self.segments
-            .iter()
-            .filter(|s| s.state == SegmentState::Free)
-            .count()
+        self.segments.free_count()
     }
 
     fn poke_cleaner(&self) {
@@ -552,8 +726,9 @@ impl<F: BlockFile> Writer<F> {
                 u64::from(geometry.segments),
                 geometry.block,
             )?;
-            let batch = batch_frame_bytes(self.config.limits.batch_requests, geometry.block)?;
-            let wrap = largest_frame(&self.config, geometry.block)?;
+            let requests = self.config.limits.batch_requests;
+            let batch = batch_frame_bytes(requests, requests, geometry.block)?;
+            let wrap = largest_frame(&self.config, u64::from(geometry.segments), geometry.block)?;
             checkpoint
                 .checked_add(batch)?
                 .checked_add(wrap)?
@@ -564,20 +739,58 @@ impl<F: BlockFile> Writer<F> {
 
     /// Validates and commits the batch's writes, deletes and relocations.
     fn handle(&mut self, batch: Vec<Request>) {
-        let accepted = match self.validate(batch) {
-            Ok(accepted) => accepted,
+        let (accepted, answered) = match self.validate(batch) {
+            Ok(validated) => validated,
             Err(()) => return,
         };
-        let block = self.shared.geometry.block;
-        let reclaimable = self.segments.iter().any(|s| reclaimable(s, block));
-        if accepted.is_empty() && self.stale.is_empty() && !reclaimable {
-            return;
-        }
-        self.commit(accepted);
+        let reclaimable = self.segments.reclaimable().next().is_some();
+        let written = if accepted.is_empty() && !reclaimable {
+            Vec::new()
+        } else {
+            self.commit(accepted)
+        };
+        self.settle(answered, &written);
     }
 
-    /// Answers requests that need no write, refuses invalid ones, and returns the rest.
-    fn validate(&mut self, batch: Vec<Request>) -> Result<Vec<Accepted>, ()> {
+    /// Reads the durable fragment `f` of `key` and compares its bytes with `bytes`.
+    fn stored_bytes(
+        shared: &Shared<F>,
+        reads: &mut ReadPool,
+        key: &ChunkKey,
+        f: &Fragment,
+        bytes: &[u8],
+    ) -> Stored {
+        let identity = Identity {
+            volume: shared.volume,
+            checksum_shift: shared.checksum_shift,
+        };
+        let mut data = Vec::new();
+        let read = verify_at(
+            &shared.file,
+            reads,
+            &shared.geometry,
+            identity,
+            f.segment,
+            u64::from(f.offset),
+            Some(&mut data),
+        );
+        match read {
+            Ok(Some(v)) if v.is(key, f) => {
+                if data == bytes {
+                    Stored::Same
+                } else {
+                    Stored::Differs
+                }
+            }
+            _ => Stored::Damaged,
+        }
+    }
+
+    /// Answers requests that need no write, refuses invalid ones, and returns the rest, with
+    /// the answers that must wait for the batch: those decided on a change earlier in it, and
+    /// any decided while the last batch is unconfirmed (`settle`). The rest rest on the index
+    /// alone, durable and confirmed, and go out at once.
+    fn validate(&mut self, batch: Vec<Request>) -> Result<(Vec<Accepted>, Vec<Answered>), ()> {
         let index = match self.shared.index.read() {
             Ok(index) => index,
             Err(_) => {
@@ -593,6 +806,9 @@ impl<F: BlockFile> Writer<F> {
         let mut views: HashMap<ChunkKey, Option<View>> = HashMap::new();
         let mut added: u64 = 0;
         let mut accepted = Vec::with_capacity(batch.len());
+        let mut answered = Vec::new();
+        // The position in `accepted` of the last write or delete of each chunk.
+        let mut changed_by: HashMap<ChunkKey, usize> = HashMap::new();
         let view_of = |views: &mut HashMap<ChunkKey, Option<View>>, key: &ChunkKey| {
             views
                 .entry(*key)
@@ -608,6 +824,10 @@ impl<F: BlockFile> Writer<F> {
                 .clone()
         };
         for request in batch {
+            let key = match &request.op {
+                Op::Write { key, .. } | Op::Delete { key } => Some(*key),
+                Op::Relocate { .. } | Op::Checkpoint | Op::Free => None,
+            };
             let decision = match &request.op {
                 Op::Write {
                     key,
@@ -625,9 +845,8 @@ impl<F: BlockFile> Writer<F> {
                     let view = view_of(&mut views, key);
                     let len = u64::try_from(payload.data.len()).unwrap_or(u64::MAX);
                     let crc = payload.crc;
-                    let existing = index
-                        .get(key)
-                        .and_then(|e| e.fragment_at(*offset))
+                    let stored = index.get(key).and_then(|e| e.fragment_at(*offset)).copied();
+                    let existing = stored
                         .map(|f| (u64::from(f.payload_len), f.payload_crc))
                         .or_else(|| {
                             view.as_ref().and_then(|v| {
@@ -639,17 +858,51 @@ impl<F: BlockFile> Writer<F> {
                         });
                     match view {
                         Some(v) if *offset < v.len || (v.sealed && *offset == v.len) => {
-                            if existing == Some((len, crc)) && (!seal || v.sealed) {
-                                Ok(Decision::Done)
-                            } else if *offset == 0 && *seal {
-                                Err(ChunkError::Exists(*key))
+                            let refused = if *offset == 0 && *seal {
+                                ChunkError::Exists(*key)
                             } else if v.sealed {
-                                Err(ChunkError::Sealed(*key))
+                                ChunkError::Sealed(*key)
                             } else {
-                                Err(ChunkError::Conflict {
+                                ChunkError::Conflict {
                                     key: *key,
                                     offset: *offset,
-                                })
+                                }
+                            };
+                            if existing != Some((len, crc)) || (*seal && !v.sealed) {
+                                Err(refused)
+                            } else {
+                                // The same length and CRC-32C, which a different payload can
+                                // share: the bytes decide whether this is a retry (audit B05).
+                                match stored {
+                                    Some(f) => match Self::stored_bytes(
+                                        &self.shared,
+                                        &mut self.reads,
+                                        key,
+                                        &f,
+                                        &payload.data,
+                                    ) {
+                                        Stored::Same => Ok(Decision::Done),
+                                        Stored::Differs => Err(refused),
+                                        // The stored copy no longer verifies: the retry, the
+                                        // same length and CRC as the bytes acknowledged,
+                                        // writes it again (audit S05).
+                                        Stored::Damaged => Ok(Decision::Write(crc)),
+                                    },
+                                    None => {
+                                        let same = accepted.iter().rev().any(|a: &Accepted| {
+                                            matches!(
+                                                &a.request.op,
+                                                Op::Write { key: k, offset: o, payload: p, .. }
+                                                    if k == key && o == offset && p.data == payload.data
+                                            )
+                                        });
+                                        if same {
+                                            Ok(Decision::Done)
+                                        } else {
+                                            Err(refused)
+                                        }
+                                    }
+                                }
                             }
                         }
                         Some(v) if *offset > v.len => Err(ChunkError::Gap {
@@ -724,39 +977,51 @@ impl<F: BlockFile> Writer<F> {
                         Ok(Decision::Relocate(current))
                     }
                 }
+                Op::Free => Ok(Decision::Free),
                 // Taken out of the batch before validation (`process`).
                 Op::Checkpoint => Ok(Decision::Done),
             };
-            match decision {
-                Ok(Decision::Done) => reply(request, Ok(())),
-                Ok(decision) => accepted.push(Accepted { request, decision }),
-                Err(e) => reply(request, Err(e)),
+            let result = match decision {
+                Ok(Decision::Done) => Ok(()),
+                Ok(decision) => {
+                    if let (Some(key), Decision::Write(_) | Decision::Delete) = (key, &decision) {
+                        changed_by.insert(key, accepted.len());
+                    }
+                    accepted.push(Accepted { request, decision });
+                    continue;
+                }
+                Err(e) => Err(e),
+            };
+            let leader = key.and_then(|k| changed_by.get(&k).copied());
+            if leader.is_none() && self.unconfirmed.is_empty() {
+                reply(request, result);
+            } else {
+                answered.push(Answered {
+                    reply: request.reply,
+                    result,
+                    leader,
+                });
             }
         }
-        Ok(accepted)
+        Ok((accepted, answered))
     }
 
-    fn layout(&self, requests: usize) -> Layout {
+    /// Where a batch of `requests` requests placing at most `records` records can go.
+    fn layout(&self, requests: usize, records: usize) -> Layout {
+        // Sealed segments with nothing live are freed in this frame, so this batch may reuse
+        // them; at most one per request keeps the frame within its bound
+        // (layout::batch_frame_payload).
+        let freed: Vec<u32> = self.segments.reclaimable().take(requests.max(1)).collect();
+        // Incarnation and write position, before this batch, of each segment it may seal or
+        // free.
         let mut before = HashMap::new();
-        for (i, s) in self.segments.iter().enumerate() {
-            if s.state != SegmentState::Free
-                && let Ok(i) = u32::try_from(i)
+        for &segment in self.opens.iter().flatten().chain(&freed) {
+            if let Some(s) = self.segments.get(segment)
+                && s.state != SegmentState::Free
             {
-                before.insert(i, (s.incarnation, u64::from(s.write_pos)));
+                before.insert(segment, (s.incarnation, u64::from(s.write_pos)));
             }
         }
-        // Sealed segments with nothing live are freed in this frame, so this batch may reuse
-        // them; at most one per request keeps the frame within the log's headroom
-        // (layout::batch_frame_bytes).
-        let block = self.shared.geometry.block;
-        let freed: Vec<u32> = self
-            .segments
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| reclaimable(s, block))
-            .filter_map(|(i, _)| u32::try_from(i).ok())
-            .take(requests.max(1))
-            .collect();
         // A stream whose open segment is freed opens a new one when it next writes.
         let mut opens = self.opens;
         for open in &mut opens {
@@ -764,17 +1029,17 @@ impl<F: BlockFile> Writer<F> {
                 *open = None;
             }
         }
+        // Each record opens at most one segment (`Layout::place`), so the lowest `records`
+        // of the free segments and those freed in this frame are all the batch can take.
         let mut free: Vec<u32> = self
             .segments
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s.state == SegmentState::Free)
-            .filter_map(|(i, _)| u32::try_from(i).ok())
+            .free()
+            .take(records)
             .chain(freed.iter().copied())
             .collect();
         // Lowest segment first: popped from the end.
         free.sort_unstable_by(|a, b| b.cmp(a));
-        free.dedup();
+        let free_left = self.segments.free_count().saturating_add(freed.len());
         let mut records = Vec::new();
         for &segment in &freed {
             if let Some(&(incarnation, _)) = before.get(&segment) {
@@ -786,19 +1051,6 @@ impl<F: BlockFile> Writer<F> {
                 }));
             }
         }
-        let mut sealed = Vec::new();
-        for &segment in &self.stale {
-            if let Some(&(incarnation, pos)) = before.get(&segment) {
-                let pos = u32::try_from(pos).unwrap_or(u32::MAX);
-                records.push(LogRecord::Segment(SegmentRecord {
-                    segment,
-                    incarnation,
-                    state: SegmentState::Sealed,
-                    write_pos: pos,
-                }));
-                sealed.push((segment, pos));
-            }
-        }
         Layout {
             geometry: self.shared.geometry,
             volume: self.shared.volume,
@@ -807,23 +1059,45 @@ impl<F: BlockFile> Writer<F> {
             regions: Vec::new(),
             positions: HashMap::new(),
             opened: Vec::new(),
-            sealed,
+            clean_opened: 0,
+            sealed: Vec::new(),
             freed,
             opens,
             incarnation: self.incarnation,
             free,
+            free_left,
             before,
         }
     }
 
-    /// Lays out, writes, flushes, publishes and answers one batch.
-    fn commit(&mut self, accepted: Vec<Accepted>) {
-        let mut layout = self.layout(accepted.len());
+    /// Lays out, writes, flushes, publishes and answers one batch, and says which of the
+    /// accepted requests it wrote.
+    fn commit(&mut self, accepted: Vec<Accepted>) -> Vec<bool> {
+        let records = accepted
+            .iter()
+            .map(|a| match &a.decision {
+                Decision::Write(_) => 1,
+                Decision::Relocate(current) => current.len(),
+                _ => 0,
+            })
+            .fold(0usize, usize::saturating_add);
+        let mut layout = self.layout(accepted.len(), records);
         let mut sequence = self.sequence;
         let mut ok: Vec<Reply> = Vec::with_capacity(accepted.len());
+        // Answered once a later frame confirms this batch's (`confirm`): deletes, which live
+        // only in the frame, and puts in segments the batch opens, which recovery finds only
+        // through the frame's record of the opening, since it rolls forward through open
+        // segments alone.
+        let mut held: Vec<Reply> = Vec::new();
+        let mut written = vec![false; accepted.len()];
         let mut payloads: Vec<Payload> = Vec::with_capacity(accepted.len());
         let shift = self.shared.checksum_shift;
-        for Accepted { request, decision } in accepted {
+        for (i, Accepted { request, decision }) in accepted.into_iter().enumerate() {
+            let mut wrote = || {
+                if let Some(w) = written.get_mut(i) {
+                    *w = true;
+                }
+            };
             let Request { op, reply: tx, .. } = request;
             match (op, decision) {
                 (
@@ -849,8 +1123,14 @@ impl<F: BlockFile> Writer<F> {
                     let index = payloads.len().saturating_sub(1);
                     match place_record(&mut layout, Stream::Client, shift, &put, &payloads, index) {
                         Ok(record) => {
+                            let opened = layout.opened.iter().any(|&(s, _)| s == record.segment);
                             layout.records.push(LogRecord::Put(record));
-                            ok.push(tx);
+                            wrote();
+                            if opened {
+                                held.push(tx);
+                            } else {
+                                ok.push(tx);
+                            }
                         }
                         // No free segment for the client: while cleaning can free one, the
                         // put is to be retried, not refused for good.
@@ -892,7 +1172,10 @@ impl<F: BlockFile> Writer<F> {
                         }
                     }
                     match result {
-                        Ok(()) => ok.push(tx),
+                        Ok(()) => {
+                            wrote();
+                            ok.push(tx);
+                        }
                         Err(e) => answer(tx, Err(e)),
                     }
                 }
@@ -903,13 +1186,25 @@ impl<F: BlockFile> Writer<F> {
                         sequence,
                         time_ns: layout.now,
                     }));
-                    ok.push(tx);
+                    wrote();
+                    held.push(tx);
                 }
-                _ => answer(tx, Ok(())),
+                (Op::Free, Decision::Free) => ok.push(tx),
+                _ => {
+                    self.fence();
+                    answer(
+                        tx,
+                        Err(ChunkError::Internal("a request and its decision disagree")),
+                    );
+                }
             }
         }
-        if ok.is_empty() && layout.freed.is_empty() && layout.sealed.is_empty() {
-            return;
+        // Nothing placed, sealed or freed: no frame, and a free has nothing to wait for.
+        if layout.records.is_empty() {
+            for tx in ok {
+                answer(tx, Ok(()));
+            }
+            return written;
         }
 
         let result = self
@@ -920,17 +1215,24 @@ impl<F: BlockFile> Writer<F> {
             Err(e) => {
                 self.fence();
                 let mut first = Some(e);
-                for tx in ok {
+                for tx in ok.into_iter().chain(held) {
                     answer(tx, Err(first.take().unwrap_or(ChunkError::Fenced)));
                 }
+                vec![false; written.len()]
             }
             Ok(()) => {
                 self.incarnation = layout.incarnation;
                 self.sequence = sequence;
-                self.stale.clear();
+                self.shared
+                    .clean_opened
+                    .fetch_add(layout.clean_opened, Ordering::Relaxed);
                 for tx in ok {
                     answer(tx, Ok(()));
                 }
+                // This batch's frame, durable, confirms the last one's.
+                self.confirmed();
+                self.unconfirmed = held.into_iter().map(|tx| (tx, Ok(()))).collect();
+                written
             }
         }
     }
@@ -951,33 +1253,28 @@ impl<F: BlockFile> Writer<F> {
         superblock.incarnation_limit = superblock
             .incarnation_limit
             .max(incarnation.saturating_add(INCARNATION_RESERVE));
-        write_superblock(&self.shared.file, &superblock)?;
-        self.shared.file.sync_data().map_err(ChunkError::Device)?;
+        let align = self.shared.file.alignment();
+        write_superblocks(&mut self.io, align, &[&superblock])?;
         self.superblock = superblock;
         Ok(())
     }
 
     /// Encodes each region straight into an aligned buffer of its size and the batch's index
-    /// frame after them, writes them all at once, and flushes once. The flush makes every one
-    /// durable, and until it does they reach the device in any order however they are issued,
-    /// so issuing them together changes nothing recovery sees. The frame written after the
-    /// records made a 32 MiB batch 1.9 ms slower, and written beside them nothing
-    /// (docs/measurements/2026-09-29-frame-overlap.md).
+    /// frame after them, hands them all at once to the device's issuer, and flushes once when
+    /// every one has completed. The flush makes every one durable, and until it does they reach
+    /// the device in any order however they are issued, so issuing them together changes
+    /// nothing recovery sees. The frame written after the records made a 32 MiB batch 1.9 ms
+    /// slower, and written beside them nothing (docs/measurements/2026-09-29-frame-overlap.md).
+    /// The issuer's workers carry them, as deep as the device's measured depth; no thread
+    /// starts for a region.
     fn write_batch(&mut self, layout: &Layout, payloads: &[Payload]) -> Result<(), ChunkError> {
         let started = std::time::Instant::now();
         let geometry = self.shared.geometry;
         let block = geometry.block_usize();
-        let align = self.shared.file.alignment();
         let group = self.cursor.lsn;
-        let mut frames = Vec::with_capacity(2);
-        for (pos, encoded) in self.place_frame(KIND_BATCH, &layout.records, group)?.writes {
-            let mut buf = AlignedBuf::zeroed(encoded.len(), align)
-                .map_err(|e| ChunkError::Device(e.into()))?;
-            buf.extend_from_slice(&encoded)
-                .map_err(|e| ChunkError::Device(e.into()))?;
-            frames.push((geometry.log_offset.saturating_add(pos), buf));
-        }
-        let mut regions = Vec::with_capacity(layout.regions.len());
+        let placed = self.place_frame(KIND_BATCH, &layout.records, group)?;
+        let frames = self.frame_writes(placed)?;
+        let mut writes = Vec::with_capacity(layout.regions.len().saturating_add(frames.len()));
         for region in &layout.regions {
             let len = usize::try_from(region.end.saturating_sub(region.start))
                 .map_err(|_| ChunkError::Full)?;
@@ -990,10 +1287,10 @@ impl<F: BlockFile> Writer<F> {
                 .map_err(|e| ChunkError::Device(e.into()))?;
             for part in &region.parts {
                 let encoded = match part {
-                    Part::Segment(header) => (*buf).put(&header.encode(block)),
+                    Part::Segment(header) => buf.put(&header.encode(block)),
                     Part::Record { header, payload } => payloads
                         .get(*payload)
-                        .and_then(|p| record::encode(header, &p.table, &p.data, &mut *buf)),
+                        .and_then(|p| record::encode(header, &p.table, &p.data, &mut buf)),
                 };
                 encoded.ok_or(ChunkError::Internal("a record did not encode as placed"))?;
             }
@@ -1008,15 +1305,13 @@ impl<F: BlockFile> Writer<F> {
                 .segment_offset(region.segment)
                 .and_then(|o| o.checked_add(region.start))
                 .ok_or(ChunkError::Full)?;
-            regions.push((at, buf));
+            writes.push((buf, at));
         }
-        let writes: Vec<(&[u8], u64)> = regions
-            .iter()
-            .map(|(at, buf)| (buf.as_slice(), *at))
-            .chain(frames.iter().map(|(at, buf)| (buf.as_slice(), *at)))
-            .collect();
-        write_together(&self.shared.file, &writes)?;
-        self.shared.file.sync_data().map_err(ChunkError::Device)?;
+        writes.extend(frames);
+        let written = self.io.write(writes, true).map_err(ChunkError::Device)?;
+        for (buf, _) in written {
+            self.pool.give(buf);
+        }
         let took = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.anticipation.served(took);
         let laid: u64 = payloads
@@ -1035,22 +1330,43 @@ impl<F: BlockFile> Writer<F> {
         Ok(())
     }
 
-    /// Appends one frame to the log (preceded by a wrap frame when it must go around). `group`
-    /// is the LSN of the first frame written since the last completed flush.
+    /// Appends one frame to the log (preceded by a wrap frame when it must go around), and
+    /// flushes when `flush` is set. `group` is the LSN of the first frame written since the
+    /// last completed flush.
     fn append_frame(
         &mut self,
         kind: u16,
         records: &[LogRecord],
         group: u64,
+        flush: bool,
     ) -> Result<(u64, u64), ChunkError> {
-        let geometry = self.shared.geometry;
-        let align = self.shared.file.alignment();
         let placed = self.place_frame(kind, records, group)?;
-        for (pos, encoded) in &placed.writes {
-            log::write_frame(&self.shared.file, &geometry, *pos, encoded, align)
-                .map_err(ChunkError::Device)?;
+        let (at, lsn) = (placed.at, placed.lsn);
+        let writes = self.frame_writes(placed)?;
+        for (buf, _) in self.io.write(writes, flush).map_err(ChunkError::Device)? {
+            self.pool.give(buf);
         }
-        Ok((placed.at, placed.lsn))
+        Ok((at, lsn))
+    }
+
+    /// A placed frame's writes: each encoded frame in an aligned buffer from the writer's
+    /// pool, at its offset in the file. The buffers come back to the pool once written, as the
+    /// regions' do, so the pool holds frames' buffers for frames and never fills with them.
+    fn frame_writes(&mut self, placed: Placed) -> Result<Vec<(AlignedBuf, u64)>, ChunkError> {
+        let geometry = self.shared.geometry;
+        placed
+            .writes
+            .into_iter()
+            .map(|(pos, encoded)| {
+                let mut buf = self
+                    .pool
+                    .take(encoded.len())
+                    .map_err(|e| ChunkError::Device(e.into()))?;
+                buf.extend_from_slice(&encoded)
+                    .map_err(|e| ChunkError::Device(e.into()))?;
+                Ok((buf, geometry.log_offset.saturating_add(pos)))
+            })
+            .collect()
     }
 
     /// Places one frame in the log, preceded by a wrap frame when it must go around, and
@@ -1067,6 +1383,15 @@ impl<F: BlockFile> Writer<F> {
         let probe = frame::encode(kind, 0, 0, self.shared.volume, records, block)
             .ok_or(ChunkError::Full)?;
         let len = u64::try_from(probe.len()).map_err(|_| ChunkError::Full)?;
+        // Recovery reads no larger frame, and would take this one for the log's end, losing
+        // what it holds and everything after it (audit S13). The settings checked at format
+        // and open keep batches within it and checkpoints pack their records into it, so
+        // reaching this is a fault in that accounting: the batch fails, and nothing is lost.
+        if len > MAX_FRAME_BYTES {
+            return Err(ChunkError::Internal(
+                "an index frame larger than recovery reads",
+            ));
+        }
         let placement = self
             .cursor
             .place(len, geometry.block, geometry.log_size)
@@ -1096,12 +1421,11 @@ impl<F: BlockFile> Writer<F> {
         let block = self.shared.geometry.block;
         let mut index = self.shared.index.write().map_err(|_| ChunkError::Fenced)?;
         for &segment in &layout.freed {
-            if let Some(info) = slot(&mut self.segments, segment) {
-                *info = SegmentInfo::FREE;
-            }
+            self.segments
+                .update(segment, |info| *info = SegmentInfo::FREE);
         }
         for &(segment, incarnation) in &layout.opened {
-            if let Some(info) = slot(&mut self.segments, segment) {
+            self.segments.update(segment, |info| {
                 *info = SegmentInfo {
                     state: SegmentState::Open,
                     incarnation,
@@ -1109,7 +1433,7 @@ impl<F: BlockFile> Writer<F> {
                     live: 0,
                     youngest_ns: 0,
                 };
-            }
+            });
         }
         for record in &layout.records {
             match record {
@@ -1128,25 +1452,27 @@ impl<F: BlockFile> Writer<F> {
                         // A relocated copy: the old one dies as an equal one is born, so no
                         // space is freed that cleaning could gain.
                         Inserted::Replaced(old) => {
-                            if let Some(info) = slot(&mut self.segments, old.segment) {
+                            self.segments.update(old.segment, |info| {
                                 info.live = info.live.saturating_sub(u64::from(old.record_len));
-                            }
+                            });
                             true
                         }
                         Inserted::Unchanged => false,
                     };
-                    if credit && let Some(info) = slot(&mut self.segments, p.segment) {
-                        info.live = info.live.saturating_add(u64::from(p.record_len));
-                        info.youngest_ns = info.youngest_ns.max(p.time_ns);
+                    if credit {
+                        self.segments.update(p.segment, |info| {
+                            info.live = info.live.saturating_add(u64::from(p.record_len));
+                            info.youngest_ns = info.youngest_ns.max(p.time_ns);
+                        });
                     }
                 }
                 LogRecord::Delete(d) => {
                     if let Some(entry) = index.remove(&d.key) {
                         for f in &entry.fragments {
                             self.fragments = self.fragments.saturating_sub(1);
-                            if let Some(info) = slot(&mut self.segments, f.segment) {
+                            self.segments.update(f.segment, |info| {
                                 info.live = info.live.saturating_sub(u64::from(f.record_len));
-                            }
+                            });
                             self.shared
                                 .dead_bytes
                                 .fetch_add(u64::from(f.record_len), Ordering::Relaxed);
@@ -1158,80 +1484,90 @@ impl<F: BlockFile> Writer<F> {
         }
         drop(index);
         for region in &layout.regions {
-            if let Some(info) = slot(&mut self.segments, region.segment) {
-                let end = region
-                    .end
-                    .checked_next_multiple_of(block)
-                    .unwrap_or(region.end);
-                info.write_pos = u32::try_from(end).unwrap_or(u32::MAX).max(info.write_pos);
-            }
+            let end = region
+                .end
+                .checked_next_multiple_of(block)
+                .unwrap_or(region.end);
+            let end = u32::try_from(end).unwrap_or(u32::MAX);
+            self.segments.update(region.segment, |info| {
+                info.write_pos = info.write_pos.max(end);
+            });
         }
         for &(segment, pos) in &layout.sealed {
-            if let Some(info) = slot(&mut self.segments, segment) {
+            self.segments.update(segment, |info| {
                 info.state = SegmentState::Sealed;
                 info.write_pos = info.write_pos.max(pos);
-            }
+            });
         }
         self.opens = layout.opens;
+        // Readers get the segments this batch changed, not a copy of the table.
+        let changed = self.segments.take_changed();
         if let Ok(mut usage) = self.shared.usage.write() {
-            usage.clone_from(&self.segments);
+            usage.copy(&self.segments, &changed);
         }
         Ok(())
     }
 
     /// Writes the whole index into the log and points the superblock at it, freeing the log
-    /// before it (docs/design/chunk-store.md §5).
+    /// before it (docs/design/chunk-store.md §5). The records, each segment's state and then
+    /// each fragment, are packed into frames of at most `MAX_FRAME_BYTES`, the first a
+    /// checkpoint's beginning, the rest its chunks; recovery replays them as it replays any
+    /// frame, so a checkpoint of any size is read back whole (audit S13). The fragments are
+    /// read from the index as they are written, not gathered first.
     pub(crate) fn checkpoint(&mut self) -> Result<(), ChunkError> {
         let segment_records: Vec<LogRecord> = self
             .segments
             .iter()
-            .enumerate()
             .filter(|(_, s)| s.state != SegmentState::Free)
-            .filter_map(|(i, s)| {
-                Some(LogRecord::Segment(SegmentRecord {
-                    segment: u32::try_from(i).ok()?,
+            .map(|(segment, s)| {
+                LogRecord::Segment(SegmentRecord {
+                    segment,
                     incarnation: s.incarnation,
                     state: s.state,
                     write_pos: s.write_pos,
-                }))
+                })
             })
             .collect();
-        let puts: Vec<LogRecord> = {
-            let index = self.shared.index.read().map_err(|_| ChunkError::Fenced)?;
-            index
-                .iter()
-                .flat_map(|(key, entry)| {
-                    let last = entry.fragments.len().saturating_sub(1);
-                    entry.fragments.iter().enumerate().map(move |(i, f)| {
-                        let flags = if entry.sealed && i == last {
-                            FLAG_FINAL
-                        } else {
-                            0
-                        };
-                        put_of(*key, f, flags, entry.time_ns)
-                    })
-                })
-                .collect()
-        };
+        // Only this thread changes the index, so holding it to read while the frames are
+        // written keeps no writer waiting.
+        let shared = Arc::clone(&self.shared);
+        let index = shared.index.read().map_err(|_| ChunkError::Fenced)?;
+        let puts = index.iter().flat_map(|(key, entry)| {
+            let last = entry.fragments.len().saturating_sub(1);
+            entry.fragments.iter().enumerate().map(move |(i, f)| {
+                let flags = if entry.sealed && i == last {
+                    FLAG_FINAL
+                } else {
+                    0
+                };
+                put_of(*key, f, flags, entry.time_ns)
+            })
+        });
         // Every frame of the checkpoint shares one flush.
         let group = self.cursor.lsn;
+        let mut begin = None;
+        pack(segment_records.into_iter().chain(puts), |frame| {
+            let kind = if begin.is_none() {
+                KIND_CHECKPOINT_BEGIN
+            } else {
+                KIND_CHECKPOINT_CHUNK
+            };
+            let at = self.append_frame(kind, frame, group, false)?;
+            begin.get_or_insert(at);
+            Ok(())
+        })?;
+        drop(index);
         let (begin_pos, begin_lsn) =
-            self.append_frame(KIND_CHECKPOINT_BEGIN, &segment_records, group)?;
-        let per_frame = usize::try_from(CHECKPOINT_RECORDS_PER_FRAME)
-            .unwrap_or(1)
-            .max(1);
-        for chunk in puts.chunks(per_frame) {
-            self.append_frame(KIND_CHECKPOINT_CHUNK, chunk, group)?;
-        }
-        self.append_frame(KIND_CHECKPOINT_END, &[], group)?;
-        self.shared.file.sync_data().map_err(ChunkError::Device)?;
+            begin.ok_or(ChunkError::Internal("a checkpoint without its first frame"))?;
+        self.append_frame(KIND_CHECKPOINT_END, &[], group, true)?;
 
         let mut superblock = self.superblock.clone();
         superblock.sequence = superblock.sequence.saturating_add(1);
         superblock.start_lsn = begin_lsn;
         superblock.start_pos = begin_pos;
-        write_superblock(&self.shared.file, &superblock)?;
-        self.shared.file.sync_data().map_err(ChunkError::Device)?;
+        superblock.end_lsn = self.cursor.lsn;
+        let align = self.shared.file.alignment();
+        write_superblocks(&mut self.io, align, &[&superblock])?;
         self.superblock = superblock;
 
         // The log now starts at the checkpoint.
@@ -1239,6 +1575,8 @@ impl<F: BlockFile> Writer<F> {
         self.cursor.start_lsn = begin_lsn;
         self.cursor.used = distance(begin_pos, self.cursor.pos, self.shared.geometry.log_size);
         self.shared.checkpoints.fetch_add(1, Ordering::Relaxed);
+        // The checkpoint's frames, durable, follow the last batch's.
+        self.confirmed();
         Ok(())
     }
 }
@@ -1255,6 +1593,33 @@ pub(crate) fn max_payload(geometry: &Geometry, checksum_shift: u8) -> u64 {
         .saturating_sub(table)
         .saturating_sub(record::RECORD_ALIGN as u64)
         .min(u64::from(u32::MAX))
+}
+
+/// Packs `records`, in order, into frames whose records fill at most `FRAME_PAYLOAD` bytes,
+/// a frame closing only when the next record does not fit, and hands each to `write`. It
+/// writes at least one frame, empty when there are no records.
+fn pack<E>(
+    records: impl Iterator<Item = LogRecord>,
+    mut write: impl FnMut(&[LogRecord]) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut frame: Vec<LogRecord> = Vec::new();
+    let mut bytes = 0u64;
+    let mut written = false;
+    for record in records {
+        let len = record.encoded_len() as u64;
+        if !frame.is_empty() && bytes.saturating_add(len) > FRAME_PAYLOAD {
+            write(&frame)?;
+            written = true;
+            frame.clear();
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(len);
+        frame.push(record);
+    }
+    if !frame.is_empty() || !written {
+        write(&frame)?;
+    }
+    Ok(())
 }
 
 /// What a record says about the fragment it holds, apart from its placement.
@@ -1315,14 +1680,6 @@ fn place_record(
     })
 }
 
-/// A segment the writer can free without copying: written to, and nothing in it is live.
-/// That includes a stream's open segment once every chunk written into it is deleted.
-fn reclaimable(s: &SegmentInfo, block: u64) -> bool {
-    s.live == 0
-        && (s.state == SegmentState::Sealed
-            || (s.state == SegmentState::Open && u64::from(s.write_pos) > block))
-}
-
 /// Bytes from `from` forward to `to` in a circular region of `size` bytes.
 pub(crate) fn distance(from: u64, to: u64, size: u64) -> u64 {
     if to >= from {
@@ -1358,63 +1715,31 @@ struct Placed {
     lsn: u64,
 }
 
-/// Writes every `(bytes, offset)` at once: the first on this thread and each other on a thread
-/// of its own, or on this one when no thread can be had. Returns the first failure, after
-/// every write has ended.
-fn write_together<F: BlockFile>(file: &F, writes: &[(&[u8], u64)]) -> Result<(), ChunkError> {
-    let Some((&(bytes, at), rest)) = writes.split_first() else {
-        return Ok(());
-    };
-    let keep = |result: &mut Result<(), ChunkError>, next: Result<(), ChunkError>| {
-        if result.is_ok() {
-            *result = next;
-        }
-    };
-    std::thread::scope(|scope| {
-        let mut result = Ok(());
-        let mut pending = Vec::with_capacity(rest.len());
-        for &(bytes, at) in rest {
-            match std::thread::Builder::new()
-                .spawn_scoped(scope, move || file.write_all_at(bytes, at))
-            {
-                Ok(handle) => pending.push(handle),
-                Err(_) => keep(
-                    &mut result,
-                    file.write_all_at(bytes, at).map_err(ChunkError::Device),
-                ),
-            }
-        }
-        keep(
-            &mut result,
-            file.write_all_at(bytes, at).map_err(ChunkError::Device),
-        );
-        for handle in pending {
-            let joined = match handle.join() {
-                Ok(written) => written.map_err(ChunkError::Device),
-                Err(_) => Err(ChunkError::Internal("a write thread unwound")),
-            };
-            keep(&mut result, joined);
-        }
-        result
-    })
-}
-
-/// Writes a superblock to the copy its sequence selects.
-pub(crate) fn write_superblock<F: BlockFile>(file: &F, sb: &Superblock) -> Result<(), ChunkError> {
-    let bytes = sb.encode();
-    let mut buf = AlignedBuf::zeroed(bytes.len(), file.alignment())
-        .map_err(|e| ChunkError::Device(e.into()))?;
-    buf.extend_from_slice(&bytes)
-        .map_err(|e| ChunkError::Device(e.into()))?;
-    file.write_all_at(buf.as_slice(), sb.offset_of(sb.slot()))
-        .map_err(ChunkError::Device)
+/// Writes each superblock to the copy its sequence selects, through the device's issuer, then
+/// flushes.
+pub(crate) fn write_superblocks(
+    io: &mut Attached,
+    align: Alignment,
+    superblocks: &[&Superblock],
+) -> Result<(), ChunkError> {
+    let mut writes = Vec::with_capacity(superblocks.len());
+    for sb in superblocks {
+        let bytes = sb.encode();
+        let mut buf =
+            AlignedBuf::zeroed(bytes.len(), align).map_err(|e| ChunkError::Device(e.into()))?;
+        buf.extend_from_slice(&bytes)
+            .map_err(|e| ChunkError::Device(e.into()))?;
+        writes.push((buf, sb.offset_of(sb.slot())));
+    }
+    io.write(writes, true).map_err(ChunkError::Device)?;
+    Ok(())
 }
 
 fn request_bytes(request: &Request) -> usize {
     match &request.op {
         Op::Write { payload, .. } => payload.data.len(),
         Op::Relocate { moves } => moves.iter().map(|m| m.payload.data.len()).sum(),
-        Op::Delete { .. } | Op::Checkpoint => 0,
+        Op::Delete { .. } | Op::Checkpoint | Op::Free => 0,
     }
 }
 
@@ -1422,6 +1747,78 @@ fn request_bytes(request: &Request) -> usize {
 mod tests {
     use super::*;
     use crate::layout::Limits;
+
+    /// A checkpoint of any size packs into frames recovery reads (audit S13): 300,000
+    /// segments' states, more than one 4 MiB frame holds, then 60,000 fragments. Every frame
+    /// fits `MAX_FRAME_BYTES` once encoded, a frame closes only when the next record does not
+    /// fit, the records keep their order, the space they take is within what the log was
+    /// sized for, and an empty checkpoint still writes its first frame.
+    #[test]
+    fn a_checkpoint_of_any_size_packs_into_frames_recovery_reads() {
+        let (segments, fragments) = (300_000u32, 60_000u64);
+        let records = (0..segments)
+            .map(|segment| {
+                LogRecord::Segment(SegmentRecord {
+                    segment,
+                    incarnation: 1,
+                    state: SegmentState::Sealed,
+                    write_pos: 4096,
+                })
+            })
+            .chain((0..fragments).map(|n| {
+                LogRecord::Put(PutRecord {
+                    key: ChunkKey {
+                        block: u128::from(n),
+                        epoch: 1,
+                        index: 0,
+                    },
+                    segment: 0,
+                    incarnation: 1,
+                    offset: 4096,
+                    record_len: 4096,
+                    chunk_offset: 0,
+                    payload_len: 1,
+                    payload_crc: 0,
+                    sequence: n,
+                    time_ns: 0,
+                    flags: FLAG_FINAL,
+                })
+            }));
+        let mut frames: Vec<Vec<LogRecord>> = Vec::new();
+        pack(records, |frame| {
+            frames.push(frame.to_vec());
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        let block = 4096usize;
+        let mut space = 0u64;
+        for frame in &frames {
+            let encoded = frame::encode(KIND_CHECKPOINT_CHUNK, 1, 1, 7, frame, block).unwrap();
+            assert!(encoded.len() as u64 <= MAX_FRAME_BYTES);
+            space += encoded.len() as u64;
+        }
+        for pair in frames.windows(2) {
+            let used: u64 = pair[0].iter().map(|r| r.encoded_len() as u64).sum();
+            assert!(used + pair[1][0].encoded_len() as u64 > FRAME_PAYLOAD);
+        }
+        let flat: Vec<LogRecord> = frames.concat();
+        assert_eq!(flat.len(), segments as usize + fragments as usize);
+        assert!(
+            matches!(flat[segments as usize - 1], LogRecord::Segment(s) if s.segment == segments - 1)
+        );
+        assert!(matches!(flat[segments as usize], LogRecord::Put(p) if p.sequence == 0));
+        // The end frame is one block.
+        space += block as u64;
+        assert!(space <= checkpoint_bytes(fragments, u64::from(segments), block as u64).unwrap());
+        let mut empty = 0;
+        pack(std::iter::empty(), |frame| {
+            assert!(frame.is_empty());
+            empty += 1;
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        assert_eq!(empty, 1);
+    }
 
     fn limits() -> Limits {
         Limits {

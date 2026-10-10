@@ -7,13 +7,11 @@
 //! file names blocks made for it alone, which it must name by theirs, and the sweep of the
 //! Block ranges asks here whether it did (docs/design/metadata.md §2).
 
-use std::collections::BTreeSet;
-
 use crate::clock;
 use crate::engine::{Rows, Write};
-use crate::error::MetaError;
+use crate::error::{MetaError, reserved};
 use crate::key;
-use crate::record::{Extent, FileHeader, Referrer, Target, Verdict};
+use crate::record::{Extent, FileHeader, Referrer, Target, Verdict, WrappedKey};
 
 /// Extents one file may have: a completed upload's parts, at most 10,000 (05 §4.1). A file
 /// written by one PUT, at most 5 GB (05 §4.1), stays within it while its blocks hold at least
@@ -30,6 +28,8 @@ pub enum Command {
         file: u128,
         extents: Vec<Extent>,
         referrer: Referrer,
+        /// The file's data key, wrapped; `None` for a file of other files.
+        key: Option<WrappedKey>,
         handover_ns: u64,
         blocks_deadline_ns: u64,
         at_ns: u64,
@@ -88,12 +88,14 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
             file,
             extents,
             referrer,
+            key,
             handover_ns,
             blocks_deadline_ns,
             at_ns,
         } => {
             let intent = Intent {
                 referrer,
+                key: *key,
                 handover_ns: *handover_ns,
                 blocks_deadline_ns: *blocks_deadline_ns,
                 at_ns: *at_ns,
@@ -115,6 +117,7 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
 /// What a file is written for, beside its extents.
 struct Intent<'a> {
     referrer: &'a Referrer,
+    key: Option<WrappedKey>,
     handover_ns: u64,
     blocks_deadline_ns: u64,
     at_ns: u64,
@@ -131,7 +134,7 @@ fn write<E: Rows>(
     if extents.is_empty() || extents.len() > MAX_EXTENTS {
         return invalid;
     }
-    let mut writes = Vec::with_capacity(extents.len().saturating_add(3));
+    let mut writes = reserved(extents.len().saturating_mul(2).saturating_add(3))?;
     let mut end = 0u64;
     for extent in extents {
         match end.checked_add(extent.length) {
@@ -139,6 +142,10 @@ fn write<E: Rows>(
             _ => return invalid,
         }
         writes.push(Write::Put(key::file_extent(file, end), extent.encode()));
+        // The block sweep asks whether the file names a block (`check_blocks`).
+        if let Target::Block(block) = extent.target {
+            writes.push(Write::Put(key::file_named(file, block), Vec::new()));
+        }
     }
     let Ok(count) = u32::try_from(extents.len()) else {
         return invalid;
@@ -149,6 +156,7 @@ fn write<E: Rows>(
         let same = existing.length == end
             && existing.extents == count
             && existing.referrer == *referrer
+            && existing.key == intent.key
             && stored.iter().map(|(_, e)| e).eq(extents);
         let outcome = if same {
             Outcome::Written {
@@ -172,6 +180,7 @@ fn write<E: Rows>(
         made_ns,
         deadline_ns,
         referrer: referrer.clone(),
+        key: intent.key,
     };
     writes.push(Write::Put(key::file_header(file), header.encode()?));
     writes.push(Write::Put(
@@ -191,7 +200,8 @@ fn remove<E: Rows>(engine: &E, file: u128) -> Result<Vec<Write>, MetaError> {
     }
     let (mut from, to) = key::id_rows(file);
     while let Some((k, _)) = engine.next(&from, &to)? {
-        if writes.len() > MAX_EXTENTS.saturating_add(1) {
+        // A header, an extent and a named block's row for each extent, and the unsettled row.
+        if writes.len() > MAX_EXTENTS.saturating_mul(2).saturating_add(2) {
             return Err(MetaError::Corrupt);
         }
         from.clone_from(&k);
@@ -204,7 +214,7 @@ fn remove<E: Rows>(engine: &E, file: u128) -> Result<Vec<Write>, MetaError> {
 /// Writes that take `files` out of the unsettled queue; a file already out, or removed,
 /// needs none.
 fn settle<E: Rows>(engine: &E, files: &[u128]) -> Result<Vec<Write>, MetaError> {
-    let mut writes = Vec::with_capacity(files.len());
+    let mut writes = reserved(files.len())?;
     for &file in files {
         if let Some(h) = header(engine, file)? {
             writes.push(Write::Delete(key::unsettled(h.deadline_ns, file)));
@@ -224,30 +234,21 @@ fn check_blocks<E: Rows>(
     at_ns: u64,
 ) -> Result<(Outcome, Vec<Write>), MetaError> {
     let written = header(engine, file)?.is_some();
-    let named: BTreeSet<u128> = if written {
-        extents(engine, file, 0, MAX_EXTENTS)?
-            .into_iter()
-            .filter_map(|(_, e)| match e.target {
-                Target::Block(block) => Some(block),
-                Target::File(_) => None,
-            })
-            .collect()
-    } else {
-        BTreeSet::new()
-    };
     let (now, clock) = clock::tick(engine, at_ns)?;
-    let verdicts = blocks
-        .iter()
-        .map(|&(block, deadline_ns)| {
-            if named.contains(&block) {
-                Verdict::Held
-            } else if written || now > deadline_ns {
-                Verdict::Released
-            } else {
-                Verdict::Young
-            }
-        })
-        .collect();
+    // Each block is one read of the file's row for it: a scan of the file's extents for every
+    // check cost a page of blocks from distinct files one scan each, 60.8 ms for 512 blocks
+    // of files of 646 (docs/measurements/2026-09-30-review-fixes.md).
+    let mut verdicts = reserved(blocks.len())?;
+    for &(block, deadline_ns) in blocks {
+        let verdict = if written && engine.get(&key::file_named(file, block))?.is_some() {
+            Verdict::Held
+        } else if written || now > deadline_ns {
+            Verdict::Released
+        } else {
+            Verdict::Young
+        };
+        verdicts.push(verdict);
+    }
     Ok((Outcome::BlocksChecked(verdicts), vec![clock]))
 }
 
@@ -272,7 +273,7 @@ pub fn extents<E: Rows>(
         return Ok(Vec::new());
     };
     let mut from = key::file_extent(file, past);
-    let (_, to) = key::id_rows(file);
+    let to = key::file_extents_end(file);
     let mut out = Vec::new();
     while out.len() < max {
         let Some((k, v)) = engine.next(&from, &to)? else {
@@ -339,6 +340,7 @@ mod tests {
             file,
             extents,
             referrer: referrer("k"),
+            key: None,
             handover_ns: 100,
             at_ns,
             blocks_deadline_ns: u64::MAX,
@@ -444,6 +446,7 @@ mod tests {
             file: 2,
             extents: vec![extent(1, 1)],
             referrer: referrer("k"),
+            key: None,
             handover_ns: u64::MAX,
             at_ns: 10,
             blocks_deadline_ns: u64::MAX,

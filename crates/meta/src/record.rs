@@ -4,7 +4,7 @@
 use mantle_codec::{Reader, Writer};
 
 /// Values written by this code.
-const FORMAT: u8 = 1;
+const FORMAT: u8 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RecordError {
@@ -39,7 +39,13 @@ pub struct Version {
     /// Its legal hold: `None` if none was ever placed, which GetObjectLegalHold answers
     /// `NoSuchObjectLockConfiguration`, else on or off (18 §5).
     pub legal_hold: Option<bool>,
+    /// For a version a multipart upload made, the digest of the parts its completion listed
+    /// (`name::Complete::listing`), which a retry of the completion must list again.
+    pub listing: Option<[u8; LISTING]>,
 }
+
+/// Bytes of a completion's listing digest: a SHA-256 (FIPS 180-4).
+pub const LISTING: usize = 32;
 
 /// A retention's mode (18 §2.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +131,9 @@ pub struct Part {
     pub checksum: Option<Vec<u8>>,
     pub file: u128,
     pub modified_ns: u64,
+    /// The file's handover deadline, as the File range answered its write: the deadline the
+    /// file's mark keeps, adopted or not, which the completion adopting it reads here.
+    pub deadline_ns: u64,
 }
 
 /// A bucket's versioning state (05 §7.1).
@@ -214,7 +223,8 @@ pub struct Session {
     pub last_ns: u64,
     /// Serials below this were answered and are forgotten.
     pub low: u64,
-    /// The answers kept, in serial order, each encoded.
+    /// The answers kept, oldest first, each encoded: a command reordered on its way to the
+    /// log is answered after one with a later serial.
     pub answers: Vec<(u64, Vec<u8>)>,
 }
 
@@ -229,6 +239,55 @@ pub struct FileHeader {
     /// takes the file; past it the file is refused and released (docs/design/metadata.md §2).
     pub deadline_ns: u64,
     pub referrer: Referrer,
+    /// The data key the file's bytes are sealed under, wrapped; `None` for a file of other
+    /// files, whose bytes each open under their own file's key (docs/design/encryption.md §2).
+    pub key: Option<WrappedKey>,
+}
+
+/// A file's data key, wrapped with AES key wrap, and the key that wrapped it
+/// (docs/design/encryption.md §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WrappedKey {
+    pub by: Wrapper,
+    pub bytes: [u8; 40],
+}
+
+/// What wrapped a file's data key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wrapper {
+    /// The node's root key of this generation: SSE-S3.
+    Root(u32),
+    /// The key the customer sends with every request: SSE-C.
+    Customer,
+}
+
+impl WrappedKey {
+    pub(crate) fn put(key: Option<&Self>, w: &mut Writer) {
+        match key {
+            None => w.u8(0),
+            Some(k) => {
+                match k.by {
+                    Wrapper::Root(generation) => {
+                        w.u8(1);
+                        w.u32(generation);
+                    }
+                    Wrapper::Customer => w.u8(2),
+                }
+                w.bytes(&k.bytes);
+            }
+        }
+    }
+
+    pub(crate) fn take(r: &mut Reader<'_>) -> Option<Option<Self>> {
+        let by = match r.u8()? {
+            0 => return Some(None),
+            1 => Wrapper::Root(r.u32()?),
+            2 => Wrapper::Customer,
+            _ => return None,
+        };
+        let bytes = r.take(40)?.try_into().ok()?;
+        Some(Some(Self { by, bytes }))
+    }
 }
 
 /// The Name-range write a file was made for: the object key whose version or part it is to
@@ -269,6 +328,50 @@ pub struct BlockHeader {
     pub crc32c: u32,
 }
 
+/// A Name range's span and generation, as requests route by it (docs/design/metadata.md §3).
+/// The span runs from routing key `lo` (`key::route`), empty for the first range, up to `hi`,
+/// or to the end of the key space when `hi` is `None`. The generation rises with every split,
+/// so a request routed by an older descriptor is told where the span went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Descriptor {
+    pub id: u64,
+    pub lo: Vec<u8>,
+    pub hi: Option<Vec<u8>>,
+    pub generation: u64,
+}
+
+/// What a Name range knows of where its span went: its descriptor now, the child its last
+/// split made, as it was made, and the range it is merging or merged into. A range answers a
+/// request routed by a descriptor it no longer matches with its lineage, and never with data
+/// (docs/design/metadata.md §3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lineage {
+    pub now: Descriptor,
+    pub child: Option<Descriptor>,
+    pub standing: Standing,
+    /// While frozen, the range just below as the merge's driver read it, whose ID and
+    /// generation name the merge; once ended, that range as the merge left it.
+    pub into: Option<Descriptor>,
+    /// The merge this range took and has not yet let go of.
+    pub taken: Option<Taken>,
+}
+
+/// Whether a Name range takes steps: serving, frozen for a merge into the range just below
+/// it, or ended by one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    Serving,
+    Frozen,
+    Ended,
+}
+
+/// A merge a range took: the ID of the range it took, and its own generation the merge named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Taken {
+    pub from: u64,
+    pub generation: u64,
+}
+
 /// The object key a released file was held under: the version, part or handover that took
 /// it. It routes the removal of the file's mark to the range that holds the key, wherever
 /// splits and merges have moved it by then (docs/design/metadata.md §2).
@@ -276,16 +379,118 @@ pub struct BlockHeader {
 pub struct Holder {
     pub bucket: String,
     pub key: String,
+    /// Whether the row's ID names a file. A version made by a write that carried none, an
+    /// empty object's, is queued by its write's ID alone, so the collector removes its mark
+    /// and has no file to take apart.
+    pub file: bool,
 }
 
-/// Where a block came from: the file it was made for, which alone may name it, and the Block
-/// range's time it was written and by which that file's write must name it
-/// (docs/design/metadata.md §2).
+/// A write's mark: the Name range took the write's file, or the write itself when it carried
+/// none, and how, and until when a copy of the write could still be applied. A file ID, or a
+/// write's own ID, is used by one write alone, so a write carrying a marked ID is a copy of
+/// one the range already applied, delivered again after its session forgot it
+/// (docs/design/replica.md §1): it is answered as the first was, and neither takes the file
+/// again nor releases it. The mark stays until the collector reclaims the file, and never
+/// goes before the range's time has passed `deadline_ns`, after which a copy is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mark {
+    pub how: How,
+    /// The write's handover deadline, as it carried it. A copy of the write is applied as a
+    /// new write only while the range's time has not passed it.
+    pub deadline_ns: u64,
+}
+
+/// How the Name range took a write's file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum How {
+    /// No write took it: the one that carried it was refused, or none came by its deadline.
+    /// The range released it then.
+    Refused,
+    /// A PUT or a completion made version `order` of its key naming it.
+    Version { order: u64, null: bool },
+    /// An UploadPart's part row named it.
+    Part,
+    /// A part, adopted by composite file `by` when its completion committed: only `by`'s
+    /// reclaimer may give it back. A composite that lost its completion, or was written again
+    /// for a retry, never adopted the parts it names (audit B02).
+    Adopted { by: u128 },
+}
+
+impl Mark {
+    /// The mark the sweep writes for every file it releases, never handed over and past its
+    /// deadline at the range's time: it has no value, and reads as a deadline already passed.
+    pub const SWEPT: Self = Self {
+        how: How::Refused,
+        deadline_ns: 0,
+    };
+
+    pub fn encode(&self) -> Vec<u8> {
+        if *self == Self::SWEPT {
+            return Vec::new();
+        }
+        let mut w = start();
+        match self.how {
+            How::Version { order, null } => {
+                w.u8(0);
+                w.u64(order);
+                w.u8(u8::from(null));
+            }
+            How::Part => w.u8(1),
+            How::Adopted { by } => {
+                w.u8(2);
+                w.u128(by);
+            }
+            How::Refused => w.u8(3),
+        }
+        w.u64(self.deadline_ns);
+        finish(w)
+    }
+
+    pub fn decode(mark: &[u8]) -> Result<Self, RecordError> {
+        if mark.is_empty() {
+            return Ok(Self::SWEPT);
+        }
+        let mut r = open(mark, "mark")?;
+        let decoded_mark = (|| {
+            let how = match r.u8()? {
+                0 => How::Version {
+                    order: r.u64()?,
+                    null: match r.u8()? {
+                        0 => false,
+                        1 => true,
+                        _ => return None,
+                    },
+                },
+                1 => How::Part,
+                2 => How::Adopted { by: r.u128()? },
+                3 => How::Refused,
+                _ => return None,
+            };
+            Some(Self {
+                how,
+                deadline_ns: r.u64()?,
+            })
+        })();
+        decoded(decoded_mark, &r, "mark")
+    }
+
+    /// The same deadline, taken another way: a part adopted, or given back.
+    pub fn with(self, how: How) -> Self {
+        Self { how, ..self }
+    }
+}
+
+/// Where a block came from: the file it was made for, which alone may name it, the Block
+/// range's time it was written, and the time by which that file's write must name it, which
+/// the writer renews while its body streams in (docs/design/metadata.md §2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockOrigin {
     pub file: u128,
     pub made_ns: u64,
     pub deadline_ns: u64,
+    /// The sweep found that no file will name it: it is no longer renewed, and is being taken
+    /// apart.
+    pub released: bool,
 }
 
 /// What the range a file or block was handed to answers the sweep of it.
@@ -320,6 +525,7 @@ impl FileHeader {
         w.u64(self.made_ns);
         w.u64(self.deadline_ns);
         self.referrer.put(&mut w)?;
+        WrappedKey::put(self.key.as_ref(), &mut w);
         Ok(finish(w))
     }
 
@@ -332,6 +538,7 @@ impl FileHeader {
                 made_ns: r.u64()?,
                 deadline_ns: r.u64()?,
                 referrer: Referrer::take(&mut r)?,
+                key: WrappedKey::take(&mut r)?,
             })
         })();
         decoded(header, &r, "file")
@@ -424,11 +631,134 @@ impl BlockHeader {
     }
 }
 
+impl Descriptor {
+    /// Whether the span holds routing key `route`.
+    pub fn holds(&self, route: &[u8]) -> bool {
+        self.lo.as_slice() <= route && self.hi.as_deref().is_none_or(|hi| route < hi)
+    }
+
+    /// Whether the span holds any routing key in `[from, past)`: a bucket's, from
+    /// `key::bucket_routes`.
+    pub fn meets(&self, from: &[u8], past: &[u8]) -> bool {
+        self.lo.as_slice() < past && self.hi.as_deref().is_none_or(|hi| from < hi)
+    }
+}
+
+pub(crate) fn put_descriptor(w: &mut Writer, d: &Descriptor) -> Result<(), RecordError> {
+    w.u64(d.id);
+    put_bytes(w, &d.lo)?;
+    match &d.hi {
+        None => w.u8(0),
+        Some(hi) => {
+            w.u8(1);
+            put_bytes(w, hi)?;
+        }
+    }
+    w.u64(d.generation);
+    Ok(())
+}
+
+pub(crate) fn take_descriptor(r: &mut Reader<'_>) -> Option<Descriptor> {
+    let id = r.u64()?;
+    let lo = take_bytes(r)?;
+    let hi = match r.u8()? {
+        0 => None,
+        1 => Some(take_bytes(r)?),
+        _ => return None,
+    };
+    Some(Descriptor {
+        id,
+        lo,
+        hi,
+        generation: r.u64()?,
+    })
+}
+
+pub(crate) fn put_lineage(w: &mut Writer, l: &Lineage) -> Result<(), RecordError> {
+    put_descriptor(w, &l.now)?;
+    for d in [&l.child, &l.into] {
+        match d {
+            None => w.u8(0),
+            Some(d) => {
+                w.u8(1);
+                put_descriptor(w, d)?;
+            }
+        }
+    }
+    w.u8(match l.standing {
+        Standing::Serving => 0,
+        Standing::Frozen => 1,
+        Standing::Ended => 2,
+    });
+    match l.taken {
+        None => w.u8(0),
+        Some(t) => {
+            w.u8(1);
+            w.u64(t.from);
+            w.u64(t.generation);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn take_lineage(r: &mut Reader<'_>) -> Option<Lineage> {
+    let now = take_descriptor(r)?;
+    let mut descriptors = [None, None];
+    for d in &mut descriptors {
+        *d = match r.u8()? {
+            0 => None,
+            1 => Some(take_descriptor(r)?),
+            _ => return None,
+        };
+    }
+    let [child, into] = descriptors;
+    let standing = match r.u8()? {
+        0 => Standing::Serving,
+        1 => Standing::Frozen,
+        2 => Standing::Ended,
+        _ => return None,
+    };
+    let taken = match r.u8()? {
+        0 => None,
+        1 => Some(Taken {
+            from: r.u64()?,
+            generation: r.u64()?,
+        }),
+        _ => return None,
+    };
+    // A range heads somewhere exactly when it is frozen or has ended.
+    if into.is_some() != (standing != Standing::Serving) {
+        return None;
+    }
+    Some(Lineage {
+        now,
+        child,
+        standing,
+        into,
+        taken,
+    })
+}
+
+impl Lineage {
+    pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
+        let mut w = start();
+        put_lineage(&mut w, self)?;
+        Ok(finish(w))
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "lineage")?;
+        let lineage = take_lineage(&mut r);
+        decoded(lineage, &r, "lineage")
+    }
+}
+
 impl Holder {
     pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
         let mut w = start();
         put_str(&mut w, &self.bucket)?;
         put_str(&mut w, &self.key)?;
+        w.u8(u8::from(self.file));
         Ok(finish(w))
     }
 
@@ -438,6 +768,11 @@ impl Holder {
             Some(Self {
                 bucket: take_str(&mut r)?,
                 key: take_str(&mut r)?,
+                file: match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                },
             })
         })();
         decoded(holder, &r, "holder")
@@ -450,6 +785,7 @@ impl BlockOrigin {
         w.u128(self.file);
         w.u64(self.made_ns);
         w.u64(self.deadline_ns);
+        w.u8(u8::from(self.released));
         finish(w)
     }
 
@@ -460,6 +796,11 @@ impl BlockOrigin {
                 file: r.u128()?,
                 made_ns: r.u64()?,
                 deadline_ns: r.u64()?,
+                released: match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                },
             })
         })();
         decoded(origin, &r, "origin")
@@ -671,7 +1012,7 @@ impl Session {
             if count > r.remaining() / 12 {
                 return None;
             }
-            let mut answers = Vec::with_capacity(count);
+            let mut answers = reserved(count)?;
             for _ in 0..count {
                 answers.push((r.u64()?, take_bytes(&mut r)?));
             }
@@ -721,6 +1062,13 @@ impl Version {
         put_str(&mut w, &self.owner)?;
         put_pairs(&mut w, &self.headers)?;
         put_retention(&mut w, self.retention);
+        match &self.listing {
+            None => w.u8(0),
+            Some(listing) => {
+                w.u8(1);
+                w.bytes(listing);
+            }
+        }
         Ok(finish(w))
     }
 
@@ -750,6 +1098,11 @@ impl Version {
                     headers: take_pairs(&mut r)?,
                     retention: take_retention(&mut r, has_retention)?,
                     legal_hold,
+                    listing: match r.u8()? {
+                        0 => None,
+                        1 => Some(take_listing(&mut r)?),
+                        _ => return None,
+                    },
                 })
             })(),
             &r,
@@ -819,6 +1172,7 @@ impl Part {
         }
         w.u128(self.file);
         w.u64(self.modified_ns);
+        w.u64(self.deadline_ns);
         Ok(finish(w))
     }
 
@@ -836,6 +1190,7 @@ impl Part {
                     },
                     file: r.u128()?,
                     modified_ns: r.u64()?,
+                    deadline_ns: r.u64()?,
                 })
             })(),
             &r,
@@ -876,7 +1231,9 @@ fn open<'a>(bytes: &'a [u8], what: &'static str) -> Result<Reader<'a>, RecordErr
         .len()
         .checked_sub(4)
         .ok_or(RecordError::Corrupt(what))?;
-    let (body, crc) = bytes.split_at(body_len);
+    let (body, crc) = bytes
+        .split_at_checked(body_len)
+        .ok_or(RecordError::Corrupt(what))?;
     let crc = u32::from_le_bytes(crc.try_into().map_err(|_| RecordError::Corrupt(what))?);
     if mantle_crc::crc32c(body) != crc {
         return Err(RecordError::Corrupt(what));
@@ -930,6 +1287,20 @@ fn take_mode(r: &mut Reader<'_>) -> Option<RetentionMode> {
         1 => Some(RetentionMode::Compliance),
         _ => None,
     }
+}
+
+/// An empty vector with room for the `count` items a decoder has checked against the bytes
+/// left, or `None`, the decoder's refusal, when the room cannot be reserved:
+/// `Vec::with_capacity` panics on a capacity past `isize::MAX` bytes and aborts when the
+/// allocation fails.
+pub(crate) fn reserved<T>(count: usize) -> Option<Vec<T>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(count).ok()?;
+    Some(out)
+}
+
+pub(crate) fn take_listing(r: &mut Reader<'_>) -> Option<[u8; LISTING]> {
+    r.take(LISTING)?.try_into().ok()
 }
 
 pub(crate) fn put_retention(w: &mut Writer, retention: Option<Retention>) {
@@ -1031,7 +1402,7 @@ pub(crate) fn take_pairs(r: &mut Reader<'_>) -> Option<Vec<(String, String)>> {
     if count > r.remaining() / 8 {
         return None;
     }
-    let mut pairs = Vec::with_capacity(count);
+    let mut pairs = reserved(count)?;
     for _ in 0..count {
         pairs.push((take_str(r)?, take_str(r)?));
     }
@@ -1062,6 +1433,7 @@ mod tests {
             ],
             retention: None,
             legal_hold: None,
+            listing: None,
         }
     }
 
@@ -1077,6 +1449,11 @@ mod tests {
             ..version()
         };
         assert_eq!(Version::decode(&marker.encode().unwrap()), Ok(marker));
+        let completed = Version {
+            listing: Some([7; LISTING]),
+            ..version()
+        };
+        assert_eq!(Version::decode(&completed.encode().unwrap()), Ok(completed));
         let u = Upload {
             initiated_ns: 5,
             owner: "o".into(),
@@ -1092,6 +1469,7 @@ mod tests {
             checksum: None,
             file: 7,
             modified_ns: 9,
+            deadline_ns: 11,
         };
         assert_eq!(Part::decode(&p.encode().unwrap()), Ok(p));
     }
@@ -1195,6 +1573,42 @@ mod tests {
         );
     }
 
+    /// Every mark decodes as written with its deadline, the sweep's with no value, and a mark
+    /// whose kind or flag no writer makes is corrupt.
+    #[test]
+    fn marks_round_trip() {
+        for how in [
+            How::Refused,
+            How::Version {
+                order: 7,
+                null: true,
+            },
+            How::Part,
+            How::Adopted { by: 9 },
+        ] {
+            for deadline_ns in [0, 11, u64::MAX] {
+                let mark = Mark { how, deadline_ns };
+                assert_eq!(Mark::decode(&mark.encode()), Ok(mark));
+            }
+        }
+        assert!(Mark::SWEPT.encode().is_empty());
+        let refused = Mark {
+            how: How::Refused,
+            deadline_ns: 5,
+        };
+        assert!(!refused.encode().is_empty(), "a refusal's deadline is kept");
+        for body in [
+            &[4, 0, 0, 0, 0, 0, 0, 0, 0][..],
+            &[0, 7, 0, 0, 0, 0, 0, 0, 0, 2],
+        ] {
+            let mut w = start();
+            for b in body {
+                w.u8(*b);
+            }
+            assert_eq!(Mark::decode(&finish(w)), Err(RecordError::Corrupt("mark")));
+        }
+    }
+
     #[test]
     fn file_and_block_rows_round_trip() {
         let h = FileHeader {
@@ -1207,8 +1621,22 @@ mod tests {
                 incarnation: 3,
                 key: "a/\u{0}é".into(),
             },
+            key: Some(WrappedKey {
+                by: Wrapper::Root(u32::MAX),
+                bytes: [7; 40],
+            }),
         };
         assert_eq!(FileHeader::decode(&h.encode().unwrap()), Ok(h.clone()));
+        for key in [
+            None,
+            Some(WrappedKey {
+                by: Wrapper::Customer,
+                bytes: [0xA5; 40],
+            }),
+        ] {
+            let h = FileHeader { key, ..h.clone() };
+            assert_eq!(FileHeader::decode(&h.encode().unwrap()), Ok(h));
+        }
         assert_eq!(
             Referrer::decode(&h.referrer.encode().unwrap()),
             Ok(h.referrer)
@@ -1291,6 +1719,64 @@ mod tests {
         let crc = mantle_crc::crc32c(&bad[..body]);
         bad[body..].copy_from_slice(&crc.to_le_bytes());
         assert_eq!(Gate::decode(&bad), Err(RecordError::Corrupt("gate")));
+    }
+
+    #[test]
+    fn lineages_round_trip_and_spans_hold_their_keys() {
+        let parent = Descriptor {
+            id: 1,
+            lo: Vec::new(),
+            hi: Some(vec![b'm', 0, 0]),
+            generation: 2,
+        };
+        let child = Descriptor {
+            id: u64::MAX,
+            lo: vec![b'm', 0, 0],
+            hi: None,
+            generation: 2,
+        };
+        for l in [
+            Lineage {
+                now: parent.clone(),
+                child: Some(child.clone()),
+                standing: Standing::Serving,
+                into: None,
+                taken: Some(Taken {
+                    from: 9,
+                    generation: 4,
+                }),
+            },
+            Lineage {
+                now: child.clone(),
+                child: None,
+                standing: Standing::Frozen,
+                into: Some(parent.clone()),
+                taken: None,
+            },
+            Lineage {
+                now: child.clone(),
+                child: None,
+                standing: Standing::Ended,
+                into: Some(parent.clone()),
+                taken: None,
+            },
+        ] {
+            assert_eq!(Lineage::decode(&l.encode().unwrap()), Ok(l));
+        }
+        // A serving range heads nowhere.
+        let wrong = Lineage {
+            now: child.clone(),
+            child: None,
+            standing: Standing::Serving,
+            into: Some(parent.clone()),
+            taken: None,
+        };
+        assert!(Lineage::decode(&wrong.encode().unwrap()).is_err());
+        assert!(parent.holds(b"") && parent.holds(b"l") && !parent.holds(&[b'm', 0, 0]));
+        assert!(child.holds(&[b'm', 0, 0]) && child.holds(&[0xFE]));
+        // A bucket's routes meet the spans that hold any of them.
+        assert!(parent.meets(b"a", b"b") && !child.meets(b"a", b"b"));
+        assert!(parent.meets(&[b'm', 0], &[b'm', 0xFF]) && child.meets(&[b'm', 0], &[b'm', 0xFF]));
     }
 
     /// Every flipped bit and every truncation is refused, never misread.

@@ -13,6 +13,11 @@
 )]
 
 mod clean;
+// Test devices shared with the integration tests (tests/common), which use what these do not.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../tests/common/device.rs"]
+mod device;
 mod error;
 pub mod frame;
 pub mod index;
@@ -30,6 +35,7 @@ mod writer;
 pub use clean::CleanReport;
 pub use error::ChunkError;
 pub use key::ChunkKey;
-pub use layout::{Config, Limits};
+pub use layout::{Config, Limits, Reads};
+pub use read::ReadStats;
 pub use recover::RecoveryReport;
-pub use volume::{ChunkStat, Usage, Volume};
+pub use volume::{Answer, ChunkStat, ReadBuffers, Usage, Volume};

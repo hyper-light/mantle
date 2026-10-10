@@ -105,6 +105,13 @@ The "Label" column is the evidence label that applies to every fact drawn from t
 | **RAFTX** | D. Ongaro, J. Ousterhout. "In Search of an Understandable Consensus Algorithm (Extended Version)." https://raft.github.io/raft.pdf. The ATC '14 paper (pp. 305–319) defers snapshotting to this version. | **NON-PEER-REVIEWED** (extended version) | PDF, 18 pages |
 | **PERC10** | D. Peng, F. Dabek. "Large-scale Incremental Processing Using Distributed Transactions and Notifications." OSDI '10. | peer-reviewed | author/USENIX PDF (pages numbered 1–14) |
 
+### Reading
+
+| Key | Citation | Label | What was read |
+|---|---|---|---|
+| **GG97** | J. Gray, G. Graefe. "The Five-Minute Rule Ten Years Later, and Other Computer Storage Rules of Thumb." *SIGMOD Record* 26(4): 63–68, 1997. doi:10.1145/271074.271094 | peer-reviewed venue; the text read is Microsoft Research technical report MSR-TR-97-33, September 1997 (arXiv:cs/9809005), not compared with the SIGMOD Record printing; sections are the report's | report PDF |
+| **ARROW** | Apache Arrow C++, `cpp/src/arrow/io/caching.cc`, `CacheOptions::MakeFromNetworkMetrics`, main branch. Read 2026-09-29 from https://github.com/apache/arrow | **NON-PEER-REVIEWED** (source code) | source file |
+
 ### Scrubbing and idle time
 
 | Key | Citation | Label | What was read |
@@ -453,6 +460,28 @@ Checksum metadata costs `4/k` of the payload. At 4 KiB reads, 64 KiB blocks give
 
 Inputs: a histogram of read sizes per chunk class, kept by the read path. Uncertain: a chunk's future read pattern is not known when it is written. Classes, such as small objects against erasure-coded shards read whole, carry the prediction.
 
+### 8.4 The read gap (`Calibration::read_gap`)
+
+A range read needs the record's header and checksum table, at the front of the record, and the checksum blocks the range touches. When payload lies between them, the store reads through it or issues a second read.
+
+**Model.** GG97 prices a read in device time: "Reading a 2 KB page from a disk with a 10 ms average access time (seek and rotation) and 10 MB/s transfer rate uses 10.2 ms of disk device time", in general "IndexPageAccessCost = Disk Latency + PageSize / DiskTransferRate" [GG97 §2, eq. 6]. Reading through a gap of `g` bytes costs `g/B`; a second read costs one access `t_a`. The break-even is (DERIVED)
+
+```
+g* = t_a · B
+```
+
+For GG97's disk, 10 ms × 10 MB/s = 100 KB. ARROW (NON-PEER-REVIEWED) coalesces S3 byte ranges by the same rule: "hole_size_limit = TTFB * BW ... This is also called Bandwidth-Delay-Product (BDP). Two byte ranges that have a gap can still be mapped to the same read if the gap is less than the bandwidth-delay product [TTFB * TransferBandwidth], i.e. if the Time-To-First-Byte (or call setup latency of a new S3 request) is expected to be greater than just reading and discarding the extra bytes on an existing HTTP request" [ARROW, `CacheOptions::MakeFromNetworkMetrics`]. Its inputs are one connection's latency and bandwidth.
+
+**Which access and which rate (INFERENCE).** A device that serves many reads at once has two break-evens. Idle, a read costs its own latency, and ARROW's inputs apply: the latency of one read and the rate of one stream. Saturated, a read costs the device time other reads lose. A small random read of `s` bytes then takes `1/X_r` of the device, where `X_r` is the saturated small-read rate, and `s/B` of that moves its bytes at the saturated sequential rate `B`, so
+
+```
+t_a = 1/X_r − s/B        g* = B/X_r − s
+```
+
+The chunk store holds its reads at the depth where they saturate (§13.3; design `chunk-store.md` §7), so it prices a read at saturation. Where the two break-evens differ, reading apart at idle costs at most one access more than reading through, while reading through under load spends device time on bytes nobody asked for. On a device that serves one read at a time the two coincide. On this machine calibration gave `g*` = 51.2 kB, against about 1 MB for the idle break-even, and range reads under load ran up to 3.5 times faster with the saturated one ([measurements/2026-09-29-range-reads.md](../measurements/2026-09-29-range-reads.md)).
+
+**Inputs:** calibration's saturated random-read point and saturated sequential-read point, both already measured for the read depth. **Uncertain:** the cost of reading apart at idle, one access per range read, is paid in latency the formula does not weigh; a bounded cache of record headers would remove the first read for hot records, at a memory cost.
+
 ---
 
 ## 9. Index log size and checkpoint trigger
@@ -657,6 +686,8 @@ equivalently: N* = argmax_N X(N)²/N      (power X/R with R = N/X in a closed lo
 
 On this machine, 4 KiB reads at 15K/s at depth 1 (`R_min ≈ 66.7 µs`) and about 235K/s at depth 64 give `N* ≈ 15.7`, so 16. The 90% threshold should be replaced by this, with noise handled statistically: among ladder points, take the smallest depth whose throughput confidence interval overlaps the best one's (GBE07 §3.3, PDF p. 7).
 
+Measured (2026-09-29): as a bound on reads held at the device, `N*` is too shallow. This machine's 4 KiB reads still gained 30% from 16 in flight to 64, and fell from 64 to 256; a chunk volume held at 16 with the rest waiting lost more than half its throughput at 32 callers, while one held at 64, the smallest depth whose interval overlaps the best one's, matched the file layer ([measurements/2026-09-29-read-depth.md](../measurements/2026-09-29-read-depth.md)). The ideal device the formula assumes keeps its latency flat until its parallel units fill; a real one's latency climbs before that. Power is the right optimum only where reads past it are refused to another copy with room.
+
 ### 13.4 Inputs and calculation (Recommendation)
 
 - Ladders: geometric in depth, refined by bisection around the maximum of `X²/N`. Transfer size swept to find where IOPS × size reaches the bandwidth plateau, which becomes the large transfer instead of a fixed 1 MiB. `T(b)` measured for durable batches (§5).
@@ -782,6 +813,7 @@ Inputs: per-point `CV` from a dimensioning run, levels and costs (step, process,
 | `fragments_per_chunk` | 4,096 | read amplification `f·t_frag` bound (§6) | `t_frag` | — |
 | `segment_size` | 256 MiB | zone capacity; RO92 seek amortization; MRC97 (§7) | zone report, access time, plateau size | fixed at format |
 | Checksum block | 64 KiB | read amplification `1 + (k − a)/r` (§8) | read-size histogram per class | classes |
+| Read gap | none: every read spanned header to last block | device time `t_a·B` at saturation, `B/X_r − s` (GG97; ARROW) (§8.4) | saturated random and sequential read rates | — |
 | Log size | 3 × full checkpoint | space invariant; sets the checkpoint bandwidth share `x`: `L ≈ (2 + (1 − x)/x)·C_max` (§9) | `C_max` | `x` (policy); 3× gives `x = 1/2` |
 | Checkpoint trigger | log used, checkpoint included, > 1/3 (≈2.8 MB of new log at a full index) | frames since the checkpoint ≥ `C·(1 − x)/x`; min(space, `ρ·(T_budget − …)`); Young with replay (§9) | `ρ`, `ρ_c`, `T_s`, `w`, `C` | `T_budget`, `x` (policy) |
 | Cleaner start / stop | segs/16, segs/8 | runway `W_peak·(t_react + t_seg) + D_q`; throttle at `W > G` (§10) | `W`, `t_seg(u)`, `u`, burst quantile | — |

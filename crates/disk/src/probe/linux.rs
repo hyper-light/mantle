@@ -1,24 +1,44 @@
 //! Linux: the block device under a path, from sysfs.
 //!
 //! A path's file system reports its device number (stat(2) `st_dev`); sysfs exposes that
-//! device at `/sys/dev/block/MAJOR:MINOR` (Documentation/ABI/stable/sysfs-dev). A partition
+//! device at `/sys/dev/block/MAJOR:MINOR` (Documentation/ABI/stable/sysfs-dev). A block
+//! device node is the device itself: its own number is `st_rdev` (stat(2)), and the file
+//! system holding the node, devtmpfs, says nothing about the device. A partition
 //! has a `partition` attribute and lives under its disk's directory; a device-mapper or md
 //! device lists its members under `slaves/`. Queue attributes are those of
 //! Documentation/ABI/stable/sysfs-block. File system types are the statfs(2) `f_type` magic
 //! numbers of include/uapi/linux/magic.h.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+use rustix::fs::FileType;
 
 use crate::identity::{
     FileSystem, FileSystemKind, Identity, Interconnect, Medium, WriteCache, Zoned,
 };
 
-/// Composite devices nest (dm-crypt over LVM over md); the walk stops past this depth.
+/// Composite devices nest (dm-crypt over LVM over md, three deep); the walk, which recurses,
+/// stops past this depth and leaves the composite's medium unknown rather than guess it, so
+/// the device is measured and treated as rule 5 of CLAUDE.md treats an undescribed one.
 const MAX_DEPTH: usize = 8;
-/// Members described per composite device.
-const MAX_MEMBERS: usize = 64;
 
 pub fn identify(path: &Path) -> Identity {
+    let stat = rustix::fs::stat(path);
+    if let Ok(stat) = &stat {
+        match FileType::from_raw_mode(stat.st_mode) {
+            FileType::BlockDevice => return block_node(stat),
+            FileType::CharacterDevice => {
+                let mut identity = Identity::unknown(device());
+                identity.note(
+                    format!("stat {}", path.display()),
+                    "a character device, not a block device",
+                );
+                return identity;
+            }
+            _ => {}
+        }
+    }
     let file_system = file_system(path);
     let mut identity = Identity::unknown(file_system.clone());
     match &file_system.kind {
@@ -33,37 +53,65 @@ pub fn identify(path: &Path) -> Identity {
         }
         _ => {}
     }
-    let stat = match rustix::fs::stat(path) {
+    let stat = match stat {
         Ok(stat) => stat,
         Err(e) => {
             identity.note(format!("stat {}", path.display()), e.to_string());
             return identity;
         }
     };
-    let (major, minor) = (
-        rustix::fs::major(stat.st_dev),
-        rustix::fs::minor(stat.st_dev),
-    );
+    describe_number(stat.st_dev, &mut identity);
+    identity
+}
+
+/// A block device node: the device it names, and the size of what it addresses, a whole
+/// disk or one partition of it.
+fn block_node(stat: &rustix::fs::Stat) -> Identity {
+    let mut identity = Identity::unknown(device());
+    if let Some(partition) = describe_number(stat.st_rdev, &mut identity) {
+        identity.size_bytes = read_u64(&partition, "size", &mut identity)
+            .and_then(|sectors| sectors.checked_mul(512));
+    }
+    identity.file_system.total_bytes = identity.size_bytes;
+    identity
+}
+
+fn device() -> FileSystem {
+    FileSystem {
+        kind: FileSystemKind::Device,
+        block_size: None,
+        total_bytes: None,
+        available_bytes: None,
+    }
+}
+
+/// Describes the whole disk of device number `number`, and returns the partition's sysfs
+/// directory when the number names a partition.
+fn describe_number(number: rustix::fs::Dev, identity: &mut Identity) -> Option<PathBuf> {
+    let (major, minor) = (rustix::fs::major(number), rustix::fs::minor(number));
     let node = PathBuf::from(format!("/sys/dev/block/{major}:{minor}"));
     let dir = match std::fs::canonicalize(&node) {
         Ok(dir) => dir,
         Err(e) => {
             // Major 0 is an anonymous device: overlayfs, FUSE, btrfs subvolumes. No queue.
             identity.note(format!("resolve {}", node.display()), e.to_string());
-            return identity;
+            return None;
         }
     };
-    let disk = if dir.join("partition").exists() {
-        dir.parent().map(Path::to_path_buf).unwrap_or(dir)
-    } else {
-        dir
-    };
-    describe(&disk, &mut identity, 0);
-    identity
+    if !dir.join("partition").exists() {
+        describe(&dir, identity, 0, &mut HashSet::new());
+        return None;
+    }
+    let disk = dir.parent().map_or_else(|| dir.clone(), Path::to_path_buf);
+    describe(&disk, identity, 0, &mut HashSet::new());
+    Some(dir)
 }
 
-/// Fills `identity` from the sysfs directory of a whole block device.
-fn describe(disk: &Path, identity: &mut Identity, depth: usize) {
+/// Fills `identity` from the sysfs directory of a whole block device. `seen` holds the devices
+/// the walk has described, each once, so the walk does no more work than the system has
+/// block devices, however they share members.
+fn describe(disk: &Path, identity: &mut Identity, depth: usize, seen: &mut HashSet<PathBuf>) {
+    seen.insert(disk.to_path_buf());
     let name = disk
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -106,7 +154,7 @@ fn describe(disk: &Path, identity: &mut Identity, depth: usize) {
     identity.model = read_str(&disk.join("device"), "model", identity);
 
     if identity.interconnect == Interconnect::Composite {
-        members(disk, identity, depth);
+        members(disk, identity, depth, seen);
     }
 }
 
@@ -146,12 +194,13 @@ fn interconnect(name: &str, canonical: &str, disk: &Path, identity: &mut Identit
     Interconnect::Unknown
 }
 
-fn members(disk: &Path, identity: &mut Identity, depth: usize) {
+fn members(disk: &Path, identity: &mut Identity, depth: usize, seen: &mut HashSet<PathBuf>) {
     if depth >= MAX_DEPTH {
         identity.note(
             "slaves",
             format!("nesting deeper than {MAX_DEPTH}; not followed"),
         );
+        identity.medium = Medium::Unknown;
         return;
     }
     let slaves = disk.join("slaves");
@@ -162,7 +211,8 @@ fn members(disk: &Path, identity: &mut Identity, depth: usize) {
             return;
         }
     };
-    for entry in entries.flatten().take(MAX_MEMBERS) {
+    let mut shared = false;
+    for entry in entries.flatten() {
         let Ok(dir) = std::fs::canonicalize(entry.path()) else {
             continue;
         };
@@ -171,8 +221,18 @@ fn members(disk: &Path, identity: &mut Identity, depth: usize) {
         } else {
             dir
         };
+        // A device under two members of the stack is described once; the composite's medium
+        // then rests on a member not described here, and is left unknown.
+        if seen.contains(&whole) {
+            identity.note(
+                format!("slave {}", whole.display()),
+                "described under another member".to_owned(),
+            );
+            shared = true;
+            continue;
+        }
         let mut member = Identity::unknown(identity.file_system.clone());
-        describe(&whole, &mut member, depth.saturating_add(1));
+        describe(&whole, &mut member, depth.saturating_add(1), seen);
         identity.members.push(member);
     }
     // A composite device is as slow as its slowest member: rotational if any member is.
@@ -182,6 +242,8 @@ fn members(disk: &Path, identity: &mut Identity, depth: usize) {
         .any(|m| m.medium == Medium::Rotational)
     {
         identity.medium = Medium::Rotational;
+    } else if shared {
+        identity.medium = Medium::Unknown;
     }
 }
 
@@ -222,6 +284,7 @@ fn kind_of(f_type: i128) -> FileSystemKind {
         0xFF53_4D42 | 0xFE53_4D42 | 0x517B => FileSystemKind::Smb,
         0x6573_5546 => FileSystemKind::Fuse,
         0x00C3_6400 => FileSystemKind::Ceph,
+        0x5A4F_4653 => FileSystemKind::Zonefs,
         0x4D44 => FileSystemKind::Fat,
         0x2011_BAB0 => FileSystemKind::ExFat,
         0x7366_746E | 0x5346_544E => FileSystemKind::Ntfs,
@@ -268,7 +331,33 @@ mod tests {
         assert_eq!(kind_of(0xEF53), FileSystemKind::Ext4);
         assert_eq!(kind_of(0x0102_1994), FileSystemKind::Tmpfs);
         assert_eq!(kind_of(0x794C_7630), FileSystemKind::Overlay);
+        assert_eq!(kind_of(0x5A4F_4653), FileSystemKind::Zonefs);
         assert!(matches!(kind_of(0x1234), FileSystemKind::Other(_)));
+    }
+
+    /// A block device node is the device it names, not devtmpfs, which holds it (run with
+    /// `MANTLE_TEST_BLOCK_DEVICE` naming one, such as a loop device).
+    #[test]
+    #[ignore = "needs MANTLE_TEST_BLOCK_DEVICE, a block device"]
+    fn a_block_device_node_is_the_device_it_names() {
+        let device = std::env::var_os("MANTLE_TEST_BLOCK_DEVICE").unwrap();
+        let path = Path::new(&device);
+        let id = identify(path);
+        let name = std::fs::canonicalize(path).unwrap();
+        let name = name.file_name().unwrap().to_str().unwrap();
+        assert_eq!(id.file_system.kind, FileSystemKind::Device, "{id:#?}");
+        assert_eq!(id.device.as_deref(), Some(name), "{id:#?}");
+        let file = hyper_block::file::DeviceFile::open(
+            path,
+            false,
+            hyper_block::file::CachingRequest::Buffered,
+            hyper_block::buf::Alignment::BYTE,
+        )
+        .unwrap();
+        let size = file.len().unwrap();
+        assert!(size > 0);
+        assert_eq!(id.size_bytes, Some(size), "{id:#?}");
+        assert_ne!(id.medium, Medium::Memory, "{id:#?}");
     }
 
     #[test]

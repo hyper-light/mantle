@@ -84,6 +84,11 @@ pub enum FileSystemKind {
     Smb,
     Fuse,
     Ceph,
+    /// zonefs: each file is one zone of a zoned device, written only at its write pointer
+    /// (Linux Documentation/filesystems/zonefs.rst).
+    Zonefs,
+    /// No file system: the path is a device node, and whoever opens it writes the device.
+    Device,
     Other(String),
     Unknown,
 }

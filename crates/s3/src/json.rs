@@ -6,11 +6,13 @@
 //! bounded, so a deep text is refused rather than followed down the stack; the caller bounds
 //! the text's size.
 
-/// The deepest nesting read. A bucket policy nests six levels, a statement's condition values
-/// inside its operator inside its `Condition` inside the statement inside `Statement` inside
-/// the policy (17 §3.1); the bound leaves room for the grammar's other shapes, which a
-/// policy's checks refuse with S3's messages.
-pub const MAX_DEPTH: usize = 32;
+/// The deepest nesting read: one level past the deepest document read. A bucket policy nests
+/// six levels, a statement's condition values inside its operator inside its `Condition`
+/// inside the statement inside `Statement` inside the policy (17 §3.1), and a POST policy
+/// three, a condition's operands inside the condition inside `conditions` (19 §4.2). The
+/// seventh level lets a policy's checks find an object or array where a value belongs and
+/// refuse it with S3's message for it; a deeper one is refused as JSON too deep.
+pub const MAX_DEPTH: usize = 7;
 
 /// A JSON value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,10 +153,7 @@ impl Reader<'_> {
         // Names compare after escapes are replaced (RFC 8259 §8.3; RFC 7493 §2.3).
         let mut names: Vec<&str> = members.iter().map(|(name, _)| name.as_str()).collect();
         names.sort_unstable();
-        if names
-            .windows(2)
-            .any(|pair| matches!(pair, [a, b] if a == b))
-        {
+        if names.array_windows::<2>().any(|[a, b]| a == b) {
             return Err(JsonError::Duplicate);
         }
         Ok(Value::Object(members))
@@ -317,8 +316,9 @@ impl Reader<'_> {
         if !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(JsonError::Syntax("a \\u escape without four hex digits"));
         }
-        let unit = u32::from_str_radix(digits, 16)
-            .map_err(|_| JsonError::Syntax("a \\u escape without four hex digits"))?;
+        let unit = crate::sigv4::hex_value(digits.as_bytes())
+            .and_then(|unit| u32::try_from(unit).ok())
+            .ok_or(JsonError::Syntax("a \\u escape without four hex digits"))?;
         self.advance(4)?;
         Ok(unit)
     }

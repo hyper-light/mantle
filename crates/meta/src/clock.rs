@@ -9,7 +9,7 @@ use crate::key;
 use crate::record;
 
 /// The last time the range assigned, nanoseconds since the Unix epoch.
-const CLOCK: &[u8] = &[key::LOCAL, key::marker::CLOCK];
+pub(crate) const ROW: &[u8] = &[key::LOCAL, key::marker::CLOCK];
 
 /// The time a write proposed at `at_ns` takes, the later of that and just after the range's
 /// last, and the write that records it.
@@ -18,10 +18,7 @@ pub fn tick<E: Rows>(engine: &E, at_ns: u64) -> Result<(u64, Write), MetaError> 
         .checked_add(1)
         .ok_or(MetaError::ClockExhausted)?;
     let time = at_ns.max(next);
-    Ok((
-        time,
-        Write::Put(CLOCK.to_vec(), record::encode_number(time)),
-    ))
+    Ok((time, Write::Put(ROW.to_vec(), record::encode_number(time))))
 }
 
 /// The range's time at an entry proposed at `at_ns`, the later of that and the range's last,
@@ -31,7 +28,7 @@ pub fn now<E: Rows>(engine: &E, at_ns: u64) -> Result<u64, MetaError> {
 }
 
 fn last<E: Rows>(engine: &E) -> Result<u64, MetaError> {
-    match engine.get(CLOCK)? {
+    match engine.get(ROW)? {
         None => Ok(0),
         Some(bytes) => Ok(record::decode_number(&bytes, "clock")?),
     }

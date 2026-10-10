@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc bb651d9cea03ed07d8ccc72ecaf6814e0a28cb7de4a70603e15d873f326aec8a # shrinks to scheme = Copies(1), len = 1, piece = 1, step = 250, refusing = {}, seed = 0
+cc a41c1c262b15815afa8ff561a749787c5347d4b87684d05889de376b76c05eb0 # shrinks to scheme = Copies(1), len = 8323073, piece = 1, step = 501, refusing = {}, seed = 0
+cc 8491be7f7f4509f8d4fd600e4b5e0d06942facd06a28abc44c574d02b3b2f1d7 # shrinks to (scheme, len) = (Copies(1), 10800000), pieces = 31, wait = 190, step = 13, refusing = {}, seed = 0

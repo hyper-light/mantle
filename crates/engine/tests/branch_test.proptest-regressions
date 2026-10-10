@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 82ba1e7edbe682083f3a40318f974ba8068f4c1559622c1a6e5630cdf810ed42 # shrinks to layers = [{67: (true, 169), 70: (false, 61), 71: (false, 213), 134: (true, 164), 160: (false, 234), 176: (false, 57), 205: (true, 69), 227: (false, 59), 243: (true, 145), 308: (false, 11), 334: (true, 221), 354: (false, 34), 361: (false, 165), 371: (true, 127), 386: (false, 119), 433: (true, 100), 437: (true, 167), 457: (false, 233), 467: (true, 102), 491: (true, 148)}, {18: (true, 85), 37: (false, 238), 102: (true, 215), 104: (true, 109), 105: (false, 32), 149: (true, 89), 162: (false, 161), 186: (true, 226), 206: (false, 166), 229: (false, 125), 275: (false, 24), 394: (false, 68), 415: (true, 138), 437: (true, 138), 447: (true, 24), 476: (false, 62), 530: (false, 135), 536: (true, 159), 538: (true, 131), 595: (true, 169)}], lo = 227, span = 313, seed = 12286367247109759424

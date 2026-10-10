@@ -1,0 +1,18 @@
+[package]
+name = "hyper-timing"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+publish = false
+
+[dev-dependencies]
+hyper-measure = { path = "../hyper-measure" }
+# Tests that need an Instant epoch take it from simulated time's one anchor, not the host clock
+# (docs/sim.md §3.2, §12.6).
+# Not vendored here; hyper-raft's CI runs the tests that take it.
+# hyper-sim = { path = "../hyper-sim" }
+proptest = "1.11"
+
+# A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside any consumer workspace.
+[workspace]

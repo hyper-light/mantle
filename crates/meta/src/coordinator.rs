@@ -3,18 +3,30 @@
 //! Every transaction runs inside one range, so creating or deleting a bucket is a sequence of
 //! range steps, each guarded by what the one before it wrote. A [`Coordinator`] holds where one
 //! attempt is in that sequence and names its next [`Request`]: a command to the Bucket range,
-//! or a read or a command to one of the Name ranges the bucket's keys fall in, numbered in key
-//! order. It takes the [`Answer`] and moves on. It does no I/O itself: the gateway, or a
-//! simulation, sends each request and hands back what it answered.
+//! or a read or a command to one of the Name ranges the bucket's keys fall in, in key order.
+//! It takes the [`Answer`] and moves on. It does no I/O itself: the gateway, or a simulation,
+//! sends each request and hands back what it answered.
 //!
 //! Each gate step names the gate's state as the coordinator read it and the attempt the
 //! Bucket range issued, and a range refuses a step older than the attempt that last moved the
 //! gate. So an attempt that finds a later one has taken over stops, and leaves the rest to it,
 //! and a coordinator that stalls and resumes changes nothing a later attempt has done.
+//!
+//! Each step at a Name range is routed by a descriptor the attempt holds, and names its
+//! generation; a range that has split since refuses it with its lineage
+//! (docs/design/metadata.md §3). The attempt learns the descriptors and starts its phase
+//! again over the ranges it now knows, as docs/models/RangeSplit.tla's attempts do: a create
+//! opens every gate again, a delete closes and reads every range again, and a cleanup
+//! condemns every gate again. When what it knows no longer covers the bucket's keys, it
+//! reads the directory.
+
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
 use crate::bucket;
-use crate::name::{self, Collect, GateChange, Probe};
-use crate::record::{Bucket, BucketState, Gate, GateState};
+use crate::key;
+use crate::name::{self, Collect, GateChange, Probe, Routed};
+use crate::record::{Bucket, BucketState, Descriptor, Gate, GateState, Lineage, Standing};
 
 /// A coordinator's next request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,18 +36,21 @@ pub enum Request {
     /// A command to Name range `range`, boxed since a Name-range command is the largest
     /// request by far.
     Name {
-        range: usize,
+        range: u64,
         command: Box<name::Command>,
     },
-    /// A linearizable read of Name range `range`'s gate for the bucket ([`name::gate`]).
-    Gate { range: usize },
+    /// A linearizable read of Name range `range`'s gate for the bucket ([`name::read_gate`]).
+    Gate { range: u64, generation: u64 },
     /// A linearizable read of Name range `range` for a version or delete marker of the bucket,
     /// from `from` and passing at most `budget` rows ([`name::probe`]).
     Probe {
-        range: usize,
+        range: u64,
+        generation: u64,
         from: Option<Vec<u8>>,
         budget: usize,
     },
+    /// A read of the Name ranges' descriptors the directory holds.
+    Directory,
 }
 
 /// What a request answered.
@@ -43,8 +58,9 @@ pub enum Request {
 pub enum Answer {
     Bucket(bucket::Outcome),
     Name(name::Outcome),
-    Gate(Option<Gate>),
-    Probe(Probe),
+    Gate(Routed<Option<Gate>>),
+    Probe(Routed<Probe>),
+    Directory(Vec<Descriptor>),
 }
 
 /// What the request that started an attempt learns, once it can be told.
@@ -67,29 +83,61 @@ pub enum CoordinatorError {
     Mismatch,
     #[error("an answer the coordinator's step cannot have")]
     Unexpected,
-    #[error("a bucket whose keys fall in no Name range")]
+    #[error("descriptors that do not cover the bucket's keys")]
     NoRanges,
+    /// More ranges than the cell holds: a directory, or what an attempt learned since, past
+    /// the cell's bound (docs/design/architecture.md §3).
+    #[error("more ranges than the cell holds")]
+    TooManyRanges,
+}
+
+/// What bounds one attempt's work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bounds {
+    /// Rows one read or one collection may pass or remove, which bounds an entry's size.
+    pub budget: u32,
+    /// Ranges the cell holds at most (docs/design/architecture.md §3): the attempt keeps no
+    /// more descriptors than that.
+    pub ranges: usize,
+}
+
+/// A Name range a step goes to: its place among the ranges the attempt knows, and the
+/// descriptor it is routed by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct At {
+    index: usize,
+    range: Descriptor,
 }
 
 /// Where an attempt is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Phase {
     /// Reading a range's gate before opening it.
-    ReadOpen(usize),
-    Open(usize),
+    ReadOpen(At),
+    Open(At),
     Activate,
     /// Reading a range's gate before closing it.
-    ReadClose(usize),
-    Close(usize, Option<GateState>),
-    Probe(usize, Option<Vec<u8>>),
-    Reopen(usize),
+    ReadClose(At),
+    Close(At, Option<GateState>),
+    Probe(At, Option<Vec<u8>>),
+    Reopen(At),
     Restore,
     Finish,
-    Condemn(usize),
-    Sweep(usize),
-    Drop(usize),
+    Condemn(At),
+    Sweep(At),
+    Drop(At),
     Forget,
+    /// Reading the directory, then starting the phase again.
+    Directory(Restart),
     Done,
+}
+
+/// The phase an attempt starts again when a range has moved on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Restart {
+    Open,
+    Close,
+    Cleanup,
 }
 
 /// One attempt at creating or deleting a bucket.
@@ -98,36 +146,37 @@ pub struct Coordinator {
     bucket: String,
     incarnation: u64,
     attempt: u64,
-    /// Name ranges the bucket's keys fall in.
-    ranges: usize,
-    /// Rows one read or one collection may pass or remove, which bounds an entry's size.
-    budget: u32,
+    /// The descriptors of the Name ranges the bucket's keys fall in, as far as the attempt
+    /// knows, in key order: the newest of each range, at most `bounds.ranges`.
+    known: Vec<Descriptor>,
+    bounds: Bounds,
     phase: Phase,
     settled: Option<Settled>,
 }
 
 impl Coordinator {
     /// The attempt a Bucket-range command started: a create its `Create` answered with
-    /// `Creating`, or a delete its `BeginDelete` or `Abandon` answered with `Deleting`. `None`
-    /// for any other answer, which the request answers itself.
+    /// `Creating`, or a delete its `BeginDelete` or `Abandon` answered with `Deleting`, over
+    /// the Name ranges `directory` describes. `None` for any other answer, which the request
+    /// answers itself.
     pub fn start(
         bucket: &str,
         outcome: &bucket::Outcome,
-        ranges: usize,
-        budget: u32,
+        directory: &[Descriptor],
+        bounds: Bounds,
     ) -> Result<Option<Self>, CoordinatorError> {
-        let (incarnation, attempt, phase) = match *outcome {
+        let (incarnation, attempt, restart) = match *outcome {
             bucket::Outcome::Creating {
                 incarnation,
                 attempt,
-            } => (incarnation, attempt, Phase::ReadOpen(0)),
+            } => (incarnation, attempt, Restart::Open),
             bucket::Outcome::Deleting {
                 incarnation,
                 attempt,
-            } => (incarnation, attempt, Phase::ReadClose(0)),
+            } => (incarnation, attempt, Restart::Close),
             _ => return Ok(None),
         };
-        Self::new(bucket, incarnation, attempt, ranges, budget, phase).map(Some)
+        Self::new(bucket, incarnation, attempt, directory, bounds, restart).map(Some)
     }
 
     /// The collector's resumption of a deleted bucket's cleanup, from the Bucket range's row:
@@ -137,8 +186,8 @@ impl Coordinator {
     pub fn resume(
         bucket: &str,
         row: &Bucket,
-        ranges: usize,
-        budget: u32,
+        directory: &[Descriptor],
+        bounds: Bounds,
     ) -> Result<Option<Self>, CoordinatorError> {
         if row.state != BucketState::Deleted {
             return Ok(None);
@@ -147,9 +196,9 @@ impl Coordinator {
             bucket,
             row.created_ns,
             row.attempt,
-            ranges,
-            budget,
-            Phase::Condemn(0),
+            directory,
+            bounds,
+            Restart::Cleanup,
         )
         .map(Some)
     }
@@ -158,22 +207,24 @@ impl Coordinator {
         bucket: &str,
         incarnation: u64,
         attempt: u64,
-        ranges: usize,
-        budget: u32,
-        phase: Phase,
+        directory: &[Descriptor],
+        bounds: Bounds,
+        restart: Restart,
     ) -> Result<Self, CoordinatorError> {
-        if ranges == 0 {
-            return Err(CoordinatorError::NoRanges);
-        }
-        Ok(Self {
+        let mut c = Self {
             bucket: bucket.to_owned(),
             incarnation,
             attempt,
-            ranges,
-            budget: budget.max(1),
-            phase,
+            known: Vec::new(),
+            bounds: Bounds {
+                budget: bounds.budget.max(1),
+                ..bounds
+            },
+            phase: Phase::Done,
             settled: None,
-        })
+        };
+        c.phase = c.learn_directory(directory, restart)?;
+        Ok(c)
     }
 
     /// What the attempt's request learns, once the attempt has reached it.
@@ -201,19 +252,23 @@ impl Coordinator {
         use GateState::{Closed, Condemned, Open};
         let bucket = self.bucket.clone();
         Some(match &self.phase {
-            Phase::ReadOpen(range) | Phase::ReadClose(range) => Request::Gate { range: *range },
-            Phase::Open(range) => self.gate(*range, None, Some(Open)),
+            Phase::ReadOpen(at) | Phase::ReadClose(at) => Request::Gate {
+                range: at.range.id,
+                generation: at.range.generation,
+            },
+            Phase::Open(at) => self.gate(at, None, Some(Open)),
             Phase::Activate => Request::Bucket(bucket::Command::Activate {
                 bucket,
                 attempt: self.attempt,
             }),
-            Phase::Close(range, from) => self.gate(*range, *from, Some(Closed)),
-            Phase::Probe(range, from) => Request::Probe {
-                range: *range,
+            Phase::Close(at, from) => self.gate(at, *from, Some(Closed)),
+            Phase::Probe(at, from) => Request::Probe {
+                range: at.range.id,
+                generation: at.range.generation,
                 from: from.clone(),
-                budget: usize::try_from(self.budget).unwrap_or(usize::MAX),
+                budget: usize::try_from(self.bounds.budget).unwrap_or(usize::MAX),
             },
-            Phase::Reopen(range) => self.gate(*range, Some(Closed), Some(Open)),
+            Phase::Reopen(at) => self.gate(at, Some(Closed), Some(Open)),
             Phase::Restore => Request::Bucket(bucket::Command::Restore {
                 bucket,
                 attempt: self.attempt,
@@ -222,22 +277,24 @@ impl Coordinator {
                 bucket,
                 attempt: self.attempt,
             }),
-            Phase::Condemn(range) => self.gate(*range, Some(Closed), Some(Condemned)),
-            Phase::Sweep(range) => Request::Name {
-                range: *range,
+            Phase::Condemn(at) => self.gate(at, Some(Closed), Some(Condemned)),
+            Phase::Sweep(at) => Request::Name {
+                range: at.range.id,
                 command: Box::new(name::Command::Collect(Collect {
                     bucket,
                     incarnation: self.incarnation,
-                    budget: self.budget,
+                    budget: self.bounds.budget,
                     // The entry that carries it gives it its time (wire.rs).
                     at_ns: 0,
+                    generation: at.range.generation,
                 })),
             },
-            Phase::Drop(range) => self.gate(*range, Some(Condemned), None),
+            Phase::Drop(at) => self.gate(at, Some(Condemned), None),
             Phase::Forget => Request::Bucket(bucket::Command::Forget {
                 bucket,
                 attempt: self.attempt,
             }),
+            Phase::Directory(_) => Request::Directory,
             Phase::Done => return None,
         })
     }
@@ -251,19 +308,23 @@ impl Coordinator {
 
     /// The phase after `phase` is answered with `answer`.
     fn after(&mut self, phase: Phase, answer: Answer) -> Result<Phase, CoordinatorError> {
-        use name::Outcome::{Collected, Conflict, GateMoved};
+        use name::Outcome::{Collected, Conflict, GateMoved, Moved};
         Ok(match (phase, answer) {
-            (Phase::ReadOpen(range), Answer::Gate(gate)) => match gate {
-                None => Phase::Open(range),
+            (Phase::ReadOpen(at), Answer::Gate(Routed::Moved(lineage)))
+            | (Phase::Open(at), Answer::Name(Moved(lineage))) => {
+                self.relearn(&at, *lineage, Restart::Open)?
+            }
+            (Phase::ReadOpen(at), Answer::Gate(Routed::Here(gate))) => match gate {
+                None => Phase::Open(at),
                 // Opened by the attempt this one took over.
                 Some(g) if g.incarnation == self.incarnation && g.state == GateState::Open => {
-                    self.then(range, Phase::ReadOpen, Phase::Activate)
+                    self.then(at, Phase::ReadOpen, Phase::Activate)
                 }
                 Some(_) => self.superseded(),
             },
-            (Phase::Open(range), Answer::Name(outcome)) => {
+            (Phase::Open(at), Answer::Name(outcome)) => {
                 if outcome == GateMoved {
-                    self.then(range, Phase::ReadOpen, Phase::Activate)
+                    self.then(at, Phase::ReadOpen, Phase::Activate)
                 } else {
                     self.superseded()
                 }
@@ -275,28 +336,34 @@ impl Coordinator {
                     Settled::Superseded
                 })
             }
-            (Phase::ReadClose(range), Answer::Gate(gate)) => match gate {
-                None => Phase::Close(range, None),
+            (Phase::ReadClose(at), Answer::Gate(Routed::Moved(lineage)))
+            | (Phase::Close(at, _) | Phase::Reopen(at), Answer::Name(Moved(lineage)))
+            | (Phase::Probe(at, _), Answer::Probe(Routed::Moved(lineage))) => {
+                self.relearn(&at, *lineage, Restart::Close)?
+            }
+            (Phase::ReadClose(at), Answer::Gate(Routed::Here(gate))) => match gate {
+                None => Phase::Close(at, None),
                 Some(g) if g.incarnation == self.incarnation && g.state != GateState::Condemned => {
-                    Phase::Close(range, Some(g.state))
+                    Phase::Close(at, Some(g.state))
                 }
                 Some(_) => self.superseded(),
             },
-            (Phase::Close(range, _), Answer::Name(outcome)) => {
+            (Phase::Close(at, _), Answer::Name(outcome)) => {
                 if outcome == GateMoved {
-                    self.then(range, Phase::ReadClose, Phase::Probe(0, None))
+                    let probe = Phase::Probe(self.first()?, None);
+                    self.then(at, Phase::ReadClose, probe)
                 } else {
                     self.superseded()
                 }
             }
-            (Phase::Probe(range, _), Answer::Probe(probe)) => match probe {
-                Probe::Found => Phase::Reopen(0),
-                Probe::Clear => self.then(range, |r| Phase::Probe(r, None), Phase::Finish),
-                Probe::Paused(at) => Phase::Probe(range, Some(at)),
+            (Phase::Probe(at, _), Answer::Probe(Routed::Here(probe))) => match probe {
+                Probe::Found => Phase::Reopen(self.first()?),
+                Probe::Clear => self.then(at, |a| Phase::Probe(a, None), Phase::Finish),
+                Probe::Paused(from) => Phase::Probe(at, Some(from)),
             },
-            (Phase::Reopen(range), Answer::Name(outcome)) => {
+            (Phase::Reopen(at), Answer::Name(outcome)) => {
                 if outcome == GateMoved {
-                    self.then(range, Phase::Reopen, Phase::Restore)
+                    self.then(at, Phase::Reopen, Phase::Restore)
                 } else {
                     self.superseded()
                 }
@@ -311,43 +378,174 @@ impl Coordinator {
             (Phase::Finish, Answer::Bucket(outcome)) => {
                 if outcome == bucket::Outcome::Deleted {
                     self.settled = Some(Settled::Deleted);
-                    Phase::Condemn(0)
+                    Phase::Condemn(self.first()?)
                 } else {
                     self.superseded()
                 }
             }
-            (Phase::Condemn(range), Answer::Name(outcome)) => {
+            (
+                Phase::Condemn(at) | Phase::Sweep(at) | Phase::Drop(at),
+                Answer::Name(Moved(lineage)),
+            ) => self.relearn(&at, *lineage, Restart::Cleanup)?,
+            (Phase::Condemn(at), Answer::Name(outcome)) => {
                 if outcome == GateMoved {
-                    self.then(range, Phase::Condemn, Phase::Sweep(0))
+                    let sweep = Phase::Sweep(self.first()?);
+                    self.then(at, Phase::Condemn, sweep)
                 } else {
                     self.superseded()
                 }
             }
-            (Phase::Sweep(range), Answer::Name(outcome)) => match outcome {
-                Collected { done: false } => Phase::Sweep(range),
-                Collected { done: true } => self.then(range, Phase::Sweep, Phase::Drop(0)),
+            (Phase::Sweep(at), Answer::Name(outcome)) => match outcome {
+                Collected { done: false } => Phase::Sweep(at),
+                Collected { done: true } => {
+                    let drop = Phase::Drop(self.first()?);
+                    self.then(at, Phase::Sweep, drop)
+                }
                 // The gate is another incarnation's: the name was forgotten and taken again.
                 Conflict => self.superseded(),
                 _ => return Err(CoordinatorError::Unexpected),
             },
-            (Phase::Drop(range), Answer::Name(outcome)) => {
+            (Phase::Drop(at), Answer::Name(outcome)) => {
                 if outcome == GateMoved {
-                    self.then(range, Phase::Drop, Phase::Forget)
+                    self.then(at, Phase::Drop, Phase::Forget)
                 } else {
                     self.superseded()
                 }
             }
             (Phase::Forget, Answer::Bucket(_)) => Phase::Done,
+            (Phase::Directory(restart), Answer::Directory(directory)) => {
+                self.learn_directory(&directory, restart)?
+            }
             (Phase::Done, _) => return Err(CoordinatorError::Unexpected),
             _ => return Err(CoordinatorError::Mismatch),
         })
     }
 
     /// The same step at the next range, or `last` after the last range.
-    fn then(&self, range: usize, same: impl FnOnce(usize) -> Phase, last: Phase) -> Phase {
-        match range.checked_add(1) {
-            Some(next) if next < self.ranges => same(next),
-            _ => last,
+    fn then(&self, at: At, same: impl FnOnce(At) -> Phase, last: Phase) -> Phase {
+        let next = at.index.checked_add(1).and_then(|index| {
+            let range = self.known.get(index)?.clone();
+            Some(At { index, range })
+        });
+        match next {
+            Some(next) => same(next),
+            None => last,
+        }
+    }
+
+    /// The step at the first range the attempt knows.
+    fn first(&self) -> Result<At, CoordinatorError> {
+        let range = self
+            .known
+            .first()
+            .ok_or(CoordinatorError::NoRanges)?
+            .clone();
+        Ok(At { index: 0, range })
+    }
+
+    fn restart(&self, restart: Restart) -> Result<Phase, CoordinatorError> {
+        let first = self.first()?;
+        Ok(match restart {
+            Restart::Open => Phase::ReadOpen(first),
+            Restart::Close => Phase::ReadClose(first),
+            Restart::Cleanup => Phase::Condemn(first),
+        })
+    }
+
+    /// The range `at` names answered with its lineage: the attempt learns where its span went
+    /// and starts the phase again, reading the directory first if what it knows no longer
+    /// covers the bucket's keys.
+    fn relearn(
+        &mut self,
+        at: &At,
+        lineage: Lineage,
+        restart: Restart,
+    ) -> Result<Phase, CoordinatorError> {
+        self.known.retain(|d| d.id != at.range.id);
+        // An ended range holds nothing: only where its span went is learnt.
+        let own = if lineage.standing == Standing::Ended {
+            None
+        } else {
+            Some(lineage.now)
+        };
+        for d in [own, lineage.child, lineage.into].into_iter().flatten() {
+            self.learn(d);
+        }
+        self.known.sort_by(|a, b| a.lo.cmp(&b.lo));
+        // Past the cell's bound, what the attempt learned is stale: the directory says anew.
+        if self.known.len() <= self.bounds.ranges && self.covers() {
+            self.restart(restart)
+        } else {
+            Ok(Phase::Directory(restart))
+        }
+    }
+
+    /// Takes the directory's descriptors as all the attempt knows, and starts `restart`.
+    fn learn_directory(
+        &mut self,
+        directory: &[Descriptor],
+        restart: Restart,
+    ) -> Result<Phase, CoordinatorError> {
+        // The newest descriptor of each range whose span meets the bucket's keys, gathered
+        // once and ordered once, where each descriptor learned was looked up and the whole
+        // list sorted again (audit P03).
+        let (first, past) = key::bucket_routes(&self.bucket);
+        let mut newest: BTreeMap<u64, &Descriptor> = BTreeMap::new();
+        for d in directory.iter().filter(|d| d.meets(&first, &past)) {
+            let held = newest.entry(d.id).or_insert(d);
+            if held.generation < d.generation {
+                *held = d;
+            }
+        }
+        if newest.len() > self.bounds.ranges {
+            return Err(CoordinatorError::TooManyRanges);
+        }
+        self.known = newest.into_values().cloned().collect();
+        self.known.sort_by(|a, b| a.lo.cmp(&b.lo));
+        if !self.covers() {
+            return Err(CoordinatorError::NoRanges);
+        }
+        self.restart(restart)
+    }
+
+    /// Adds `d` to what the attempt knows if its span meets the bucket's keys and it is newer
+    /// than what the attempt holds for its range; the caller orders the list after.
+    fn learn(&mut self, d: Descriptor) {
+        let (first, past) = key::bucket_routes(&self.bucket);
+        if !d.meets(&first, &past) {
+            return;
+        }
+        match self.known.iter_mut().find(|k| k.id == d.id) {
+            Some(held) if held.generation >= d.generation => {}
+            Some(held) => *held = d,
+            None => self.known.push(d),
+        }
+    }
+
+    /// Whether the spans the attempt knows, in key order, cover every routing key of the
+    /// bucket. One walk: the spans that start at or before the point reached so far are taken
+    /// in order, the furthest end among those holding it is the next point, and a span passed
+    /// is never looked at again, since the point only moves on; before, each step looked at
+    /// every span (audit P03).
+    fn covers(&self) -> bool {
+        let (mut at, past) = key::bucket_routes(&self.bucket);
+        let mut spans = self.known.iter().peekable();
+        loop {
+            let mut reach: Option<Option<&[u8]>> = None;
+            while let Some(d) = spans.next_if(|d| d.lo.as_slice() <= at.as_slice()) {
+                if d.holds(&at) {
+                    let end = d.hi.as_deref();
+                    if reach.is_none_or(|r| end_order(end, r) == Ordering::Greater) {
+                        reach = Some(end);
+                    }
+                }
+            }
+            match reach {
+                None => return false,
+                Some(None) => return true,
+                Some(Some(hi)) if hi >= past.as_slice() => return true,
+                Some(Some(hi)) => at = hi.to_vec(),
+            }
         }
     }
 
@@ -363,17 +561,28 @@ impl Coordinator {
         Phase::Done
     }
 
-    fn gate(&self, range: usize, from: Option<GateState>, to: Option<GateState>) -> Request {
+    fn gate(&self, at: &At, from: Option<GateState>, to: Option<GateState>) -> Request {
         Request::Name {
-            range,
+            range: at.range.id,
             command: Box::new(name::Command::Gate(GateChange {
                 bucket: self.bucket.clone(),
                 incarnation: self.incarnation,
                 attempt: self.attempt,
                 from,
                 to,
+                generation: at.range.generation,
             })),
         }
+    }
+}
+
+/// Orders the ends of spans, `None` past every key.
+fn end_order(a: Option<&[u8]>, b: Option<&[u8]>) -> Ordering {
+    match (a, b) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(a), Some(b)) => a.cmp(b),
     }
 }
 
@@ -381,12 +590,160 @@ impl Coordinator {
 mod tests {
     use super::*;
 
-    fn gate(incarnation: u64, attempt: u64, state: GateState) -> Option<Gate> {
-        Some(Gate {
+    /// Bounds of `budget` rows, in a cell of 64 ranges at most.
+    fn bounds(budget: u32) -> Bounds {
+        Bounds { budget, ranges: 64 }
+    }
+
+    fn gate(incarnation: u64, attempt: u64, state: GateState) -> Routed<Option<Gate>> {
+        Routed::Here(Some(Gate {
             incarnation,
             attempt,
             state,
+        }))
+    }
+
+    fn range(id: u64, lo: Option<&str>, hi: Option<&str>, generation: u64) -> Descriptor {
+        Descriptor {
+            id,
+            lo: lo.map(|k| key::route("b", k)).unwrap_or_default(),
+            hi: hi.map(|k| key::route("b", k)),
+            generation,
+        }
+    }
+
+    fn whole() -> Vec<Descriptor> {
+        vec![range(1, None, None, 1)]
+    }
+
+    /// Coverage as it was decided before: each step looked at every span for the furthest
+    /// that holds the point reached.
+    fn covers_by_rescanning(known: &[Descriptor], bucket: &str) -> bool {
+        let (mut at, past) = key::bucket_routes(bucket);
+        for _ in 0..=known.len() {
+            let reach = known
+                .iter()
+                .filter(|d| d.holds(&at))
+                .map(|d| d.hi.as_deref())
+                .max_by(|a, b| end_order(*a, *b));
+            match reach {
+                None => return false,
+                Some(None) => return true,
+                Some(Some(hi)) if hi >= past.as_slice() => return true,
+                Some(Some(hi)) => at = hi.to_vec(),
+            }
+        }
+        false
+    }
+
+    /// One walk decides coverage as rescanning every span at every step did, over random sets
+    /// of spans of the bucket's keys: overlapping, nested, stale, with gaps and without
+    /// (audit P03).
+    #[test]
+    fn one_walk_decides_coverage_as_rescanning_did() {
+        let creating = bucket::Outcome::Creating {
+            incarnation: 7,
+            attempt: 7,
+        };
+        let mut c = Coordinator::start("b", &creating, &whole(), bounds(8))
+            .unwrap()
+            .unwrap();
+        let keys = ["a", "c", "e", "g", "i", "k", "m"];
+        let mut rng = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move |n: usize| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng % n as u64) as usize
+        };
+        let mut covered = 0;
+        for _ in 0..20_000 {
+            let mut known: Vec<Descriptor> = (0..1 + next(6))
+                .map(|id| {
+                    let lo = next(keys.len() + 1);
+                    let hi = lo + 1 + next(keys.len() + 1 - lo);
+                    range(
+                        id as u64,
+                        lo.checked_sub(1).map(|i| keys[i]),
+                        keys.get(hi - 1).copied().filter(|_| hi <= keys.len()),
+                        1,
+                    )
+                })
+                .collect();
+            known.sort_by(|a, b| a.lo.cmp(&b.lo));
+            c.known = known;
+            let want = covers_by_rescanning(&c.known, "b");
+            assert_eq!(c.covers(), want, "{:?}", c.known);
+            covered += usize::from(want);
+        }
+        // Both answers were exercised.
+        assert!((2_000..18_000).contains(&covered), "{covered} covered");
+    }
+
+    /// A directory of more ranges than the cell holds is refused, and an attempt that learns
+    /// past the bound reads the directory anew rather than keep what it learned; the newest
+    /// descriptor of a range is the one kept.
+    #[test]
+    fn what_an_attempt_knows_stays_within_the_cells_bound() {
+        let creating = bucket::Outcome::Creating {
+            incarnation: 7,
+            attempt: 7,
+        };
+        let three = [
+            range(1, None, Some("f"), 1),
+            range(2, Some("f"), Some("m"), 1),
+            range(3, Some("m"), None, 1),
+        ];
+        let within = |ranges| Bounds { budget: 8, ranges };
+        assert_eq!(
+            Coordinator::start("b", &creating, &three, within(2)).err(),
+            Some(CoordinatorError::TooManyRanges)
+        );
+        assert!(Coordinator::start("b", &creating, &three, within(3)).is_ok());
+        // Two descriptors of one range: the newer is kept.
+        let stale = [range(1, None, Some("m"), 1), range(1, None, None, 2)];
+        let c = Coordinator::start("b", &creating, &stale, within(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.known, [range(1, None, None, 2)]);
+        // A split learned from a range's answer would make two: past the bound of one.
+        let mut c = Coordinator::start("b", &creating, &whole(), within(1))
+            .unwrap()
+            .unwrap();
+        let lineage = moved(
+            range(1, None, Some("f"), 3),
+            Some(range(5, Some("f"), None, 3)),
+        );
+        c.answer(Answer::Gate(Routed::Moved(lineage))).unwrap();
+        assert_eq!(c.next(), Some(Request::Directory));
+    }
+
+    fn moved(now: Descriptor, child: Option<Descriptor>) -> Box<Lineage> {
+        Box::new(Lineage {
+            now,
+            child,
+            standing: crate::record::Standing::Serving,
+            into: None,
+            taken: None,
         })
+    }
+
+    /// The range and generation a request is routed by.
+    fn routed(request: Option<Request>) -> (u64, u64) {
+        match request {
+            Some(
+                Request::Gate { range, generation }
+                | Request::Probe {
+                    range, generation, ..
+                },
+            ) => (range, generation),
+            Some(Request::Name { range, command }) => match *command {
+                name::Command::Gate(g) => (range, g.generation),
+                name::Command::Collect(c) => (range, c.generation),
+                other => panic!("a gate change or a collection, not {other:?}"),
+            },
+            other => panic!("a Name-range request, not {other:?}"),
+        }
     }
 
     /// A create reads and opens each range's gate, then activates the bucket.
@@ -396,20 +753,30 @@ mod tests {
             incarnation: 7,
             attempt: 7,
         };
-        let mut c = Coordinator::start("b", &creating, 2, 8).unwrap().unwrap();
-        for range in 0..2 {
-            assert_eq!(c.next(), Some(Request::Gate { range }));
-            c.answer(Answer::Gate(None)).unwrap();
+        let directory = [range(2, Some("m"), None, 2), range(1, None, Some("m"), 2)];
+        let mut c = Coordinator::start("b", &creating, &directory, bounds(8))
+            .unwrap()
+            .unwrap();
+        for id in [1, 2] {
+            assert_eq!(
+                c.next(),
+                Some(Request::Gate {
+                    range: id,
+                    generation: 2
+                })
+            );
+            c.answer(Answer::Gate(Routed::Here(None))).unwrap();
             let Some(Request::Name { range: r, command }) = c.next() else {
                 panic!("a gate change");
             };
-            assert_eq!(r, range);
+            assert_eq!(r, id);
             assert!(matches!(
                 *command,
                 name::Command::Gate(GateChange {
                     from: None,
                     to: Some(GateState::Open),
                     attempt: 7,
+                    generation: 2,
                     ..
                 })
             ));
@@ -436,16 +803,20 @@ mod tests {
             incarnation: 7,
             attempt: 9,
         };
-        let mut c = Coordinator::start("b", &deleting, 1, 8).unwrap().unwrap();
+        let mut c = Coordinator::start("b", &deleting, &whole(), bounds(8))
+            .unwrap()
+            .unwrap();
         c.answer(Answer::Gate(gate(7, 7, GateState::Open))).unwrap();
         c.answer(Answer::Name(name::Outcome::GateMoved)).unwrap();
-        assert!(matches!(c.next(), Some(Request::Probe { range: 0, .. })));
-        c.answer(Answer::Probe(Probe::Found)).unwrap();
+        assert!(matches!(c.next(), Some(Request::Probe { range: 1, .. })));
+        c.answer(Answer::Probe(Routed::Here(Probe::Found))).unwrap();
         c.answer(Answer::Name(name::Outcome::GateMoved)).unwrap();
         c.answer(Answer::Bucket(bucket::Outcome::Restored)).unwrap();
         assert_eq!(c.settled(), Some(Settled::NotEmpty));
 
-        let mut late = Coordinator::start("b", &deleting, 1, 8).unwrap().unwrap();
+        let mut late = Coordinator::start("b", &deleting, &whole(), bounds(8))
+            .unwrap()
+            .unwrap();
         late.answer(Answer::Gate(gate(7, 9, GateState::Closed)))
             .unwrap();
         late.answer(Answer::Name(name::Outcome::Conflict)).unwrap();
@@ -461,15 +832,18 @@ mod tests {
             incarnation: 7,
             attempt: 9,
         };
-        let mut c = Coordinator::start("b", &deleting, 1, 1).unwrap().unwrap();
-        c.answer(Answer::Gate(None)).unwrap();
+        let mut c = Coordinator::start("b", &deleting, &whole(), bounds(1))
+            .unwrap()
+            .unwrap();
+        c.answer(Answer::Gate(Routed::Here(None))).unwrap();
         c.answer(Answer::Name(name::Outcome::GateMoved)).unwrap();
-        c.answer(Answer::Probe(Probe::Paused(vec![1]))).unwrap();
+        c.answer(Answer::Probe(Routed::Here(Probe::Paused(vec![1]))))
+            .unwrap();
         assert!(matches!(
             c.next(),
             Some(Request::Probe { from: Some(ref k), budget: 1, .. }) if k == &[1]
         ));
-        c.answer(Answer::Probe(Probe::Clear)).unwrap();
+        c.answer(Answer::Probe(Routed::Here(Probe::Clear))).unwrap();
         c.answer(Answer::Bucket(bucket::Outcome::Deleted)).unwrap();
         assert_eq!(c.settled(), Some(Settled::Deleted));
         c.answer(Answer::Name(name::Outcome::GateMoved)).unwrap(); // condemned
@@ -488,25 +862,156 @@ mod tests {
         assert_eq!(c.settled(), Some(Settled::Deleted));
     }
 
+    /// A range that split since the attempt read the directory refuses its step with its
+    /// lineage, and the attempt starts its phase again over both halves: a delete that had
+    /// closed and was reading closes again, since the child may hold what the read missed.
+    #[test]
+    fn a_step_refused_by_a_split_range_starts_the_phase_again_over_its_halves() {
+        let deleting = bucket::Outcome::Deleting {
+            incarnation: 7,
+            attempt: 9,
+        };
+        let mut c = Coordinator::start("b", &deleting, &whole(), bounds(8))
+            .unwrap()
+            .unwrap();
+        c.answer(Answer::Gate(gate(7, 7, GateState::Open))).unwrap();
+        c.answer(Answer::Name(name::Outcome::GateMoved)).unwrap();
+        assert_eq!(routed(c.next()), (1, 1));
+        let lineage = moved(
+            range(1, None, Some("m"), 2),
+            Some(range(4, Some("m"), None, 2)),
+        );
+        c.answer(Answer::Probe(Routed::Moved(lineage))).unwrap();
+        for id in [1, 4] {
+            assert_eq!(routed(c.next()), (id, 2), "reads the gate");
+            c.answer(Answer::Gate(gate(7, 9, GateState::Closed)))
+                .unwrap();
+            assert_eq!(routed(c.next()), (id, 2), "closes it");
+            c.answer(Answer::Name(name::Outcome::GateMoved)).unwrap();
+        }
+        for id in [1, 4] {
+            assert_eq!(routed(c.next()), (id, 2), "reads the range");
+            c.answer(Answer::Probe(Routed::Here(Probe::Clear))).unwrap();
+        }
+        assert!(matches!(
+            c.next(),
+            Some(Request::Bucket(bucket::Command::Delete { .. }))
+        ));
+        // A split during the cleanup starts it again from condemning.
+        c.answer(Answer::Bucket(bucket::Outcome::Deleted)).unwrap();
+        c.answer(Answer::Name(name::Outcome::GateMoved)).unwrap();
+        c.answer(Answer::Name(name::Outcome::GateMoved)).unwrap();
+        assert_eq!(routed(c.next()), (1, 2), "collects");
+        let lineage = moved(
+            range(1, None, Some("f"), 3),
+            Some(range(5, Some("f"), Some("m"), 3)),
+        );
+        c.answer(Answer::Name(name::Outcome::Moved(lineage)))
+            .unwrap();
+        let Some(Request::Name { range: 1, command }) = c.next() else {
+            panic!("condemns again");
+        };
+        assert!(matches!(
+            *command,
+            name::Command::Gate(GateChange {
+                from: Some(GateState::Closed),
+                to: Some(GateState::Condemned),
+                generation: 3,
+                ..
+            })
+        ));
+    }
+
+    /// A lineage that leaves part of the bucket's keys unaccounted for, since the range split
+    /// more than once, sends the attempt to the directory; a range whose span holds none of
+    /// the bucket's keys is left out.
+    #[test]
+    fn an_attempt_that_no_longer_covers_the_bucket_reads_the_directory() {
+        let creating = bucket::Outcome::Creating {
+            incarnation: 7,
+            attempt: 7,
+        };
+        let mut c = Coordinator::start("b", &creating, &whole(), bounds(8))
+            .unwrap()
+            .unwrap();
+        let lineage = moved(
+            range(1, None, Some("f"), 3),
+            Some(range(5, Some("f"), Some("m"), 3)),
+        );
+        c.answer(Answer::Gate(Routed::Moved(lineage))).unwrap();
+        assert_eq!(c.next(), Some(Request::Directory));
+        let below = Descriptor {
+            id: 8,
+            lo: Vec::new(),
+            hi: Some(key::bucket_routes("b").0),
+            generation: 4,
+        };
+        let directory = vec![
+            Descriptor {
+                lo: key::bucket_routes("b").0,
+                ..range(1, None, Some("f"), 4)
+            },
+            below,
+            range(5, Some("f"), Some("m"), 3),
+            range(4, Some("m"), None, 2),
+        ];
+        // An answer of another kind is refused, and the attempt still reads the directory.
+        assert_eq!(
+            c.answer(Answer::Gate(Routed::Here(None))),
+            Err(CoordinatorError::Mismatch)
+        );
+        c.answer(Answer::Directory(directory)).unwrap();
+        for (id, generation) in [(1, 4), (5, 3), (4, 2)] {
+            assert_eq!(routed(c.next()), (id, generation));
+            c.answer(Answer::Gate(Routed::Here(None))).unwrap();
+            c.answer(Answer::Name(name::Outcome::GateMoved)).unwrap();
+        }
+        assert!(matches!(
+            c.next(),
+            Some(Request::Bucket(bucket::Command::Activate { .. }))
+        ));
+        // A directory that leaves keys uncovered is refused.
+        let mut d = Coordinator::start("b", &creating, &whole(), bounds(8))
+            .unwrap()
+            .unwrap();
+        d.answer(Answer::Gate(Routed::Moved(moved(
+            range(1, None, Some("f"), 3),
+            None,
+        ))))
+        .unwrap();
+        assert_eq!(
+            d.answer(Answer::Directory(vec![range(1, None, Some("f"), 3)])),
+            Err(CoordinatorError::NoRanges)
+        );
+    }
+
     #[test]
     fn answers_that_do_not_fit_are_refused() {
         let creating = bucket::Outcome::Creating {
             incarnation: 1,
             attempt: 1,
         };
-        let mut c = Coordinator::start("b", &creating, 1, 8).unwrap().unwrap();
+        let mut c = Coordinator::start("b", &creating, &whole(), bounds(8))
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            c.answer(Answer::Probe(Probe::Clear)),
+            c.answer(Answer::Probe(Routed::Here(Probe::Clear))),
             Err(CoordinatorError::Mismatch)
         );
         // Refused, the coordinator is where it was.
-        assert_eq!(c.next(), Some(Request::Gate { range: 0 }));
         assert_eq!(
-            Coordinator::start("b", &creating, 0, 8).err(),
+            c.next(),
+            Some(Request::Gate {
+                range: 1,
+                generation: 1
+            })
+        );
+        assert_eq!(
+            Coordinator::start("b", &creating, &[], bounds(8)).err(),
             Some(CoordinatorError::NoRanges)
         );
         assert!(
-            Coordinator::start("b", &bucket::Outcome::AlreadyExists, 1, 8)
+            Coordinator::start("b", &bucket::Outcome::AlreadyExists, &whole(), bounds(8))
                 .unwrap()
                 .is_none()
         );

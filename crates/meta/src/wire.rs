@@ -12,7 +12,7 @@ use crate::record::{
 };
 use crate::{block, bucket, file, name};
 
-const FORMAT: u8 = 1;
+const FORMAT: u8 = 5;
 
 /// Commands one entry carries at most: a session is named by the index of the entry that
 /// registered it and the registration's place in that entry.
@@ -53,6 +53,11 @@ pub enum Answer {
     },
     /// The session is unknown or expired, and the command was not applied.
     SessionExpired,
+    /// No session was registered: the range holds as many as it may, each within its
+    /// lifetime, and one's ends at `until_ns` unless it is used again (`session::register`).
+    SessionsFull {
+        until_ns: u64,
+    },
     /// A serial the session answered and has since forgotten, as the gateway acknowledged
     /// it: a repeat, not applied again.
     Repeated,
@@ -102,7 +107,7 @@ impl Entry {
             if count > MAX_COMMANDS || count > r.remaining() / 25 {
                 return None;
             }
-            let mut commands = Vec::with_capacity(count);
+            let mut commands = crate::record::reserved(count)?;
             for _ in 0..count {
                 commands.push(Sessioned {
                     session: r.u64()?,
@@ -126,6 +131,10 @@ impl Answer {
                 w.u64(*session);
             }
             Answer::SessionExpired => w.u8(1),
+            Answer::SessionsFull { until_ns } => {
+                w.u8(8);
+                w.u64(*until_ns);
+            }
             Answer::WrongLayer => w.u8(2),
             Answer::Repeated => w.u8(7),
             Answer::Bucket(o) => {
@@ -167,6 +176,8 @@ impl Answer {
                     block::Outcome::Invalid => w.u8(4),
                     block::Outcome::NoSuchBlock => w.u8(5),
                     block::Outcome::Settled => w.u8(6),
+                    block::Outcome::Released => w.u8(7),
+                    block::Outcome::Expired => w.u8(8),
                 }
             }
         }
@@ -179,6 +190,7 @@ impl Answer {
             Some(match r.u8()? {
                 0 => Answer::Registered { session: r.u64()? },
                 1 => Answer::SessionExpired,
+                8 => Answer::SessionsFull { until_ns: r.u64()? },
                 2 => Answer::WrongLayer,
                 7 => Answer::Repeated,
                 3 => Answer::Bucket(take_bucket_outcome(&mut r)?),
@@ -205,6 +217,8 @@ impl Answer {
                     4 => block::Outcome::Invalid,
                     5 => block::Outcome::NoSuchBlock,
                     6 => block::Outcome::Settled,
+                    7 => block::Outcome::Released,
+                    8 => block::Outcome::Expired,
                     _ => return None,
                 }),
                 _ => return None,
@@ -234,6 +248,7 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
                     file,
                     extents,
                     referrer,
+                    key,
                     handover_ns,
                     blocks_deadline_ns,
                     ..
@@ -245,6 +260,7 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
                         record::put_bytes(w, &e.encode())?;
                     }
                     record::put_bytes(w, &referrer.encode()?)?;
+                    record::WrappedKey::put(key.as_ref(), w);
                     w.u64(*handover_ns);
                     w.u64(*blocks_deadline_ns);
                 }
@@ -308,6 +324,22 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
                         w.u128(b);
                     }
                 }
+                block::Command::Renew {
+                    block,
+                    file,
+                    handover_ns,
+                    ..
+                } => {
+                    w.u8(4);
+                    w.u128(*block);
+                    w.u128(*file);
+                    w.u64(*handover_ns);
+                }
+                block::Command::Release { block, deadline_ns } => {
+                    w.u8(5);
+                    w.u128(*block);
+                    w.u64(*deadline_ns);
+                }
             }
         }
     }
@@ -323,7 +355,7 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
             0 => {
                 let file = r.u128()?;
                 let count = bounded(r, 4)?;
-                let mut extents = Vec::with_capacity(count);
+                let mut extents = crate::record::reserved(count)?;
                 for _ in 0..count {
                     extents.push(Extent::decode(&record::take_bytes(r)?).ok()?);
                 }
@@ -331,6 +363,7 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
                     file,
                     extents,
                     referrer: Referrer::decode(&record::take_bytes(r)?).ok()?,
+                    key: record::WrappedKey::take(r)?,
                     handover_ns: r.u64()?,
                     blocks_deadline_ns: r.u64()?,
                     at_ns,
@@ -339,7 +372,7 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
             1 => file::Command::Delete { file: r.u128()? },
             2 => {
                 let count = bounded(r, 16)?;
-                let mut files = Vec::with_capacity(count);
+                let mut files = crate::record::reserved(count)?;
                 for _ in 0..count {
                     files.push(r.u128()?);
                 }
@@ -348,7 +381,7 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
             3 => {
                 let file = r.u128()?;
                 let count = bounded(r, 24)?;
-                let mut blocks = Vec::with_capacity(count);
+                let mut blocks = crate::record::reserved(count)?;
                 for _ in 0..count {
                     blocks.push((r.u128()?, r.u64()?));
                 }
@@ -365,7 +398,7 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
                 let block = r.u128()?;
                 let header = BlockHeader::decode(&record::take_bytes(r)?).ok()?;
                 let count = bounded(r, 4)?;
-                let mut chunks = Vec::with_capacity(count);
+                let mut chunks = crate::record::reserved(count)?;
                 for _ in 0..count {
                     chunks.push(ChunkPlace::decode(&record::take_bytes(r)?).ok()?);
                 }
@@ -386,12 +419,22 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
             2 => block::Command::Delete { block: r.u128()? },
             3 => {
                 let count = bounded(r, 16)?;
-                let mut blocks = Vec::with_capacity(count);
+                let mut blocks = crate::record::reserved(count)?;
                 for _ in 0..count {
                     blocks.push(r.u128()?);
                 }
                 block::Command::Settle { blocks }
             }
+            4 => block::Command::Renew {
+                block: r.u128()?,
+                file: r.u128()?,
+                handover_ns: r.u64()?,
+                at_ns,
+            },
+            5 => block::Command::Release {
+                block: r.u128()?,
+                deadline_ns: r.u64()?,
+            },
             _ => return None,
         }),
         _ => return None,
@@ -541,6 +584,7 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
             put_option(w, p.ordered_ns);
             record::put_bytes(w, &p.version.encode()?)?;
             put_default(w, p.default);
+            w.u128(p.id);
             w.u64(p.deadline_ns);
         }
         name::Command::Delete(d) => {
@@ -550,6 +594,7 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
             put_named(w, d.named);
             put_match(w, d.if_match.as_ref())?;
             w.u8(u8::from(d.bypass));
+            record::put_bytes(w, d.owner.as_bytes())?;
         }
         name::Command::CreateUpload(c) => {
             w.u8(2);
@@ -562,7 +607,6 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
             record::put_str(w, &p.upload)?;
             w.u16(p.number);
             record::put_bytes(w, &p.part.encode()?)?;
-            w.u64(p.deadline_ns);
         }
         name::Command::Complete(c) => {
             w.u8(4);
@@ -578,17 +622,11 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
             }
             record::put_str(w, &c.etag)?;
             w.u64(c.size);
-            match &c.checksum {
-                None => w.u8(0),
-                Some(sum) => {
-                    w.u8(1);
-                    w.u8(sum.algorithm);
-                    w.u16(sum.parts);
-                    record::put_bytes(w, &sum.value)?;
-                }
-            }
+            put_checksum(w, c.checksum.as_ref())?;
             record::put_file(w, c.file);
+            w.bytes(&c.listing);
             put_default(w, c.default);
+            w.u128(c.id);
             w.u64(c.deadline_ns);
         }
         name::Command::Abort(a) => {
@@ -622,12 +660,14 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
             w.u64(g.attempt);
             w.u8(gate_code(g.from));
             w.u8(gate_code(g.to));
+            w.u64(g.generation);
         }
         name::Command::Collect(c) => {
             w.u8(7);
             record::put_str(w, &c.bucket)?;
             w.u64(c.incarnation);
             w.u32(c.budget);
+            w.u64(c.generation);
         }
         name::Command::Reclaim(c) => {
             w.u8(10);
@@ -653,6 +693,49 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
                 w.u128(m.file);
             }
         }
+        name::Command::Disown(d) => {
+            w.u8(20);
+            record::put_str(w, &d.bucket)?;
+            record::put_str(w, &d.key)?;
+            w.u128(d.file);
+            w.u128(d.owner);
+        }
+        name::Command::Split(s) => {
+            w.u8(13);
+            w.u64(s.generation);
+            record::put_bytes(w, &s.at)?;
+            w.u64(s.child);
+        }
+        name::Command::Freeze(f) => {
+            w.u8(14);
+            w.u64(f.generation);
+            record::put_descriptor(w, &f.into)?;
+        }
+        name::Command::Merge(m) => {
+            w.u8(15);
+            w.u64(m.generation);
+            record::put_descriptor(w, &m.from)?;
+            w.u64(m.max_rows);
+            w.u64(m.max_bytes);
+        }
+        name::Command::Abandon(a) => {
+            w.u8(16);
+            w.u64(a.generation);
+        }
+        name::Command::End(e) => {
+            w.u8(17);
+            w.u64(e.generation);
+            record::put_descriptor(w, &e.into)?;
+        }
+        name::Command::Thaw(t) => {
+            w.u8(18);
+            w.u64(t.generation);
+        }
+        name::Command::Resolve(r) => {
+            w.u8(19);
+            w.u64(r.from);
+            w.u64(r.generation);
+        }
     }
     Ok(())
 }
@@ -671,6 +754,7 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
                 ordered_ns: take_option(r)?,
                 version: Version::decode(&record::take_bytes(r)?).ok()?,
                 default: take_default(r)?,
+                id: r.u128()?,
                 deadline_ns: r.u64()?,
             })
         }
@@ -687,6 +771,7 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
                 if_match: take_match(r)?,
                 at_ns,
                 bypass: take_bool(r)?,
+                owner: String::from_utf8(record::take_bytes(r)?).ok()?,
             })
         }
         2 => {
@@ -709,7 +794,6 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
                 number: r.u16()?,
                 part: Part::decode(&record::take_bytes(r)?).ok()?,
                 at_ns,
-                deadline_ns: r.u64()?,
             })
         }
         4 => {
@@ -719,7 +803,7 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
             let preconditions = take_preconditions(r)?;
             // A listed part takes 22 bytes at least.
             let count = bounded(r, 22)?;
-            let mut parts = Vec::with_capacity(count);
+            let mut parts = crate::record::reserved(count)?;
             for _ in 0..count {
                 parts.push(name::Listed {
                     number: r.u16()?,
@@ -729,15 +813,7 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
             }
             let etag = record::take_str(r)?;
             let size = r.u64()?;
-            let checksum = match r.u8()? {
-                0 => None,
-                1 => Some(Checksum {
-                    algorithm: r.u8()?,
-                    parts: r.u16()?,
-                    value: record::take_bytes(r)?,
-                }),
-                _ => return None,
-            };
+            let checksum = take_checksum(r)?;
             name::Command::Complete(name::Complete {
                 bucket,
                 incarnation,
@@ -751,7 +827,9 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
                 size,
                 checksum,
                 file: record::take_file(r)?,
+                listing: record::take_listing(r)?,
                 default: take_default(r)?,
+                id: r.u128()?,
                 deadline_ns: r.u64()?,
             })
         }
@@ -771,12 +849,43 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
             attempt: r.u64()?,
             from: gate_state(r.u8()?)?,
             to: gate_state(r.u8()?)?,
+            generation: r.u64()?,
         }),
         7 => name::Command::Collect(name::Collect {
             bucket: record::take_str(r)?,
             incarnation: r.u64()?,
             budget: r.u32()?,
             at_ns,
+            generation: r.u64()?,
+        }),
+        13 => name::Command::Split(name::Split {
+            generation: r.u64()?,
+            at: record::take_bytes(r)?,
+            child: r.u64()?,
+        }),
+        14 => name::Command::Freeze(name::Freeze {
+            generation: r.u64()?,
+            into: record::take_descriptor(r)?,
+        }),
+        15 => name::Command::Merge(name::Merge {
+            generation: r.u64()?,
+            from: record::take_descriptor(r)?,
+            max_rows: r.u64()?,
+            max_bytes: r.u64()?,
+        }),
+        16 => name::Command::Abandon(name::Abandon {
+            generation: r.u64()?,
+        }),
+        17 => name::Command::End(name::End {
+            generation: r.u64()?,
+            into: record::take_descriptor(r)?,
+        }),
+        18 => name::Command::Thaw(name::Thaw {
+            generation: r.u64()?,
+        }),
+        19 => name::Command::Resolve(name::Resolve {
+            from: r.u64()?,
+            generation: r.u64()?,
         }),
         10 => name::Command::Reclaim(name::Reclaim {
             released_ns: r.u64()?,
@@ -785,7 +894,7 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
         11 => {
             // Two strings' lengths, a file and a deadline at least.
             let count = bounded(r, 32)?;
-            let mut files = Vec::with_capacity(count);
+            let mut files = crate::record::reserved(count)?;
             for _ in 0..count {
                 files.push(name::Checked {
                     bucket: record::take_str(r)?,
@@ -798,7 +907,7 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
         }
         12 => {
             let count = bounded(r, 24)?;
-            let mut files = Vec::with_capacity(count);
+            let mut files = crate::record::reserved(count)?;
             for _ in 0..count {
                 files.push(name::Marked {
                     bucket: record::take_str(r)?,
@@ -806,8 +915,15 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
                     file: r.u128()?,
                 });
             }
-            name::Command::Unmark(name::Unmark { files })
+            name::Command::Unmark(name::Unmark { files, at_ns })
         }
+        20 => name::Command::Disown(name::Disown {
+            bucket: record::take_str(r)?,
+            key: record::take_str(r)?,
+            file: r.u128()?,
+            owner: r.u128()?,
+            at_ns,
+        }),
         8 => {
             let (bucket, incarnation, key) = take_target(r)?;
             let named = take_named(r)?;
@@ -940,7 +1056,7 @@ fn take_match(r: &mut Reader<'_>) -> Option<Option<name::Match>> {
         1 => Some(name::Match::Any),
         2 => {
             let count = bounded(r, 4)?;
-            let mut tags = Vec::with_capacity(count);
+            let mut tags = crate::record::reserved(count)?;
             for _ in 0..count {
                 tags.push(record::take_str(r)?);
             }
@@ -1054,6 +1170,16 @@ fn put_name_outcome(w: &mut Writer, o: &name::Outcome) -> Result<(), RecordError
             w.u8(0);
             record::put_str(w, version)?;
         }
+        O::Completed {
+            version,
+            size,
+            checksum,
+        } => {
+            w.u8(37);
+            record::put_str(w, version)?;
+            w.u64(*size);
+            put_checksum(w, checksum.as_ref())?;
+        }
         O::Deleted { marker, version } => {
             w.u8(1);
             w.u8(u8::from(*marker));
@@ -1099,8 +1225,68 @@ fn put_name_outcome(w: &mut Writer, o: &name::Outcome) -> Result<(), RecordError
             put_verdicts(w, verdicts)?;
         }
         O::Unmarked => w.u8(26),
+        O::Awaits { deadline_ns } => {
+            w.u8(38);
+            w.u64(*deadline_ns);
+        }
+        O::Disowned { released } => {
+            w.u8(35);
+            w.u8(u8::from(*released));
+        }
+        O::Moved(lineage) => {
+            w.u8(27);
+            record::put_lineage(w, lineage)?;
+        }
+        O::Split(lineage) => {
+            w.u8(28);
+            record::put_lineage(w, lineage)?;
+        }
+        O::Frozen(lineage) => {
+            w.u8(29);
+            record::put_lineage(w, lineage)?;
+        }
+        O::Merged(lineage) => {
+            w.u8(30);
+            record::put_lineage(w, lineage)?;
+        }
+        O::Refused(lineage) => {
+            w.u8(31);
+            record::put_lineage(w, lineage)?;
+        }
+        O::Ended => w.u8(32),
+        O::Thawed(lineage) => {
+            w.u8(33);
+            record::put_lineage(w, lineage)?;
+        }
+        O::Resolved => w.u8(34),
+        O::Miscombined => w.u8(36),
     }
     Ok(())
+}
+
+fn put_checksum(w: &mut Writer, checksum: Option<&Checksum>) -> Result<(), RecordError> {
+    match checksum {
+        None => w.u8(0),
+        Some(sum) => {
+            w.u8(1);
+            w.u8(sum.algorithm);
+            w.u16(sum.parts);
+            record::put_bytes(w, &sum.value)?;
+        }
+    }
+    Ok(())
+}
+
+fn take_checksum(r: &mut Reader<'_>) -> Option<Option<Checksum>> {
+    Some(match r.u8()? {
+        0 => None,
+        1 => Some(Checksum {
+            algorithm: r.u8()?,
+            parts: r.u16()?,
+            value: record::take_bytes(r)?,
+        }),
+        _ => return None,
+    })
 }
 
 fn put_verdicts(w: &mut Writer, verdicts: &[Verdict]) -> Result<(), RecordError> {
@@ -1117,7 +1303,7 @@ fn put_verdicts(w: &mut Writer, verdicts: &[Verdict]) -> Result<(), RecordError>
 
 fn take_verdicts(r: &mut Reader<'_>) -> Option<Vec<Verdict>> {
     let count = bounded(r, 1)?;
-    let mut verdicts = Vec::with_capacity(count);
+    let mut verdicts = crate::record::reserved(count)?;
     for _ in 0..count {
         verdicts.push(match r.u8()? {
             0 => Verdict::Held,
@@ -1134,6 +1320,11 @@ fn take_name_outcome(r: &mut Reader<'_>) -> Option<name::Outcome> {
     Some(match r.u8()? {
         0 => O::Put {
             version: record::take_str(r)?,
+        },
+        37 => O::Completed {
+            version: record::take_str(r)?,
+            size: r.u64()?,
+            checksum: take_checksum(r)?,
         },
         1 => {
             let marker = match r.u8()? {
@@ -1181,13 +1372,164 @@ fn take_name_outcome(r: &mut Reader<'_>) -> Option<name::Outcome> {
         24 => O::Expired,
         25 => O::Checked(take_verdicts(r)?),
         26 => O::Unmarked,
+        38 => O::Awaits {
+            deadline_ns: r.u64()?,
+        },
+        35 => O::Disowned {
+            released: match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            },
+        },
+        27 => O::Moved(Box::new(record::take_lineage(r)?)),
+        28 => O::Split(Box::new(record::take_lineage(r)?)),
+        29 => O::Frozen(Box::new(record::take_lineage(r)?)),
+        30 => O::Merged(Box::new(record::take_lineage(r)?)),
+        31 => O::Refused(Box::new(record::take_lineage(r)?)),
+        32 => O::Ended,
+        33 => O::Thawed(Box::new(record::take_lineage(r)?)),
+        34 => O::Resolved,
+        36 => O::Miscombined,
         _ => return None,
     })
+}
+
+/// Bytes of the largest entry a Name, File or Block range must take: one command, the largest
+/// a gateway sends, in the session wrapping it carries. A range whose `max_entry_bytes` or log
+/// frame is smaller refuses a request S3 allows (audit §16.5). The largest is a
+/// CompleteMultipartUpload of 10,000 parts, each with its 32-digit ETag, of the longest
+/// bucket and key, with the most preconditions a request's headers hold, or the file of parts
+/// it writes, of 10,000 extents; each is encoded here at its longest and the larger taken.
+pub fn largest_entry_bytes() -> Result<usize, RecordError> {
+    // S3's limits: a key of 1,024 bytes (05 §10.1), a request's headers within 8 KB (05
+    // §10.2), a bucket name of 63 (05 §10.3), and 10,000 parts (05 §4.1). An upload ID is one
+    // the Name range made, and a gateway sends no other.
+    const MAX_BUCKET: usize = 63;
+    const MAX_KEY: usize = 1024;
+    const MAX_HEADERS: usize = 8 << 10;
+    const MAX_PARTS: usize = 10_000;
+    const ETAG_HEX: usize = 32;
+    // The most tags an If-Match within the headers names: one character and a comma each.
+    let tags = || Some(name::Match::Tags(vec!["t".to_owned(); MAX_HEADERS / 2]));
+    let complete = name::Complete {
+        bucket: "b".repeat(MAX_BUCKET),
+        incarnation: u64::MAX,
+        key: "k".repeat(MAX_KEY),
+        upload: crate::key::version_id(u64::MAX),
+        versioning: Versioning::Enabled,
+        preconditions: name::Preconditions {
+            if_match: tags(),
+            if_none_match: None,
+        },
+        at_ns: u64::MAX,
+        parts: (1..=MAX_PARTS)
+            .map(|n| name::Listed {
+                number: u16::try_from(n).unwrap_or(u16::MAX),
+                etag: "e".repeat(ETAG_HEX),
+                file: u128::MAX,
+            })
+            .collect(),
+        etag: format!("{}-{MAX_PARTS}", "e".repeat(ETAG_HEX)),
+        size: u64::MAX,
+        checksum: Some(Checksum {
+            algorithm: u8::MAX,
+            parts: u16::MAX,
+            // SHA-512's, the longest value S3 takes.
+            value: vec![0; 64],
+        }),
+        file: Some(u128::MAX),
+        listing: [u8::MAX; record::LISTING],
+        default: Some(DefaultRetention {
+            mode: record::RetentionMode::Compliance,
+            period: record::Period::Years(u32::MAX),
+        }),
+        id: u128::MAX,
+        deadline_ns: u64::MAX,
+    };
+    let write = file::Command::Write {
+        file: u128::MAX,
+        extents: (0..MAX_PARTS)
+            .map(|_| Extent {
+                length: u64::MAX,
+                target: record::Target::File(u128::MAX),
+            })
+            .collect(),
+        referrer: Referrer {
+            bucket: "b".repeat(MAX_BUCKET),
+            incarnation: u64::MAX,
+            key: "k".repeat(MAX_KEY),
+        },
+        key: None,
+        handover_ns: u64::MAX,
+        blocks_deadline_ns: u64::MAX,
+        at_ns: u64::MAX,
+    };
+    let mut largest = 0usize;
+    for command in [
+        Command::Name(Box::new(name::Command::Complete(complete))),
+        Command::File(write),
+    ] {
+        let entry = Entry {
+            at_ns: u64::MAX,
+            commands: vec![Sessioned {
+                session: u64::MAX,
+                serial: u64::MAX,
+                unanswered: u64::MAX,
+                command,
+            }],
+        };
+        largest = largest.max(entry.encode()?.len());
+    }
+    Ok(largest)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bound covers a real completion of 10,000 parts, its session and entry around it,
+    /// and stays within a MiB, which a range's settings and log frame must admit.
+    #[test]
+    fn the_largest_entry_covers_a_completion_of_every_part() {
+        let largest = largest_entry_bytes().unwrap();
+        let complete = name::Complete {
+            bucket: "photos".into(),
+            incarnation: 3,
+            key: "a/key".into(),
+            upload: crate::key::version_id(7),
+            versioning: Versioning::Enabled,
+            preconditions: name::Preconditions::default(),
+            at_ns: 1,
+            parts: (1..=10_000u16)
+                .map(|number| name::Listed {
+                    number,
+                    etag: "0123456789abcdef0123456789abcdef".into(),
+                    file: u128::from(number),
+                })
+                .collect(),
+            etag: "0123456789abcdef0123456789abcdef-10000".into(),
+            size: 50 << 40,
+            checksum: None,
+            file: Some(9),
+            default: None,
+            id: 0,
+            deadline_ns: 2,
+            listing: [0; crate::record::LISTING],
+        };
+        let entry = Entry {
+            at_ns: 1,
+            commands: vec![Sessioned {
+                session: 1,
+                serial: 1,
+                unanswered: 1,
+                command: Command::Name(Box::new(name::Command::Complete(complete))),
+            }],
+        };
+        let real = entry.encode().unwrap().len();
+        assert!(real <= largest && largest < 1 << 20, "{real} {largest}");
+        eprintln!("largest entry: {largest} bytes; a completion of 10,000 parts: {real}");
+    }
     use crate::record::{Period, Retention, RetentionMode, Target, Upload};
     use mantle_chunk::ChunkKey;
     use proptest::prelude::*;
@@ -1212,6 +1554,7 @@ mod tests {
                 until_ms: 1_893_456_000_000,
             }),
             legal_hold: Some(false),
+            listing: None,
         }
     }
 
@@ -1221,6 +1564,12 @@ mod tests {
 
     /// One command of every kind, each with the time the entry gives it.
     fn commands(at_ns: u64) -> Vec<Command> {
+        let descriptor = crate::record::Descriptor {
+            id: 3,
+            lo: crate::key::route("b", "a"),
+            hi: None,
+            generation: 4,
+        };
         let preconditions = name::Preconditions {
             if_match: Some(name::Match::Tags(vec!["a".into(), "b".into()])),
             if_none_match: Some(name::Match::Any),
@@ -1328,6 +1677,7 @@ mod tests {
                     mode: RetentionMode::Governance,
                     period: Period::Days(30),
                 }),
+                id: 0,
                 deadline_ns: u64::MAX,
             })),
             named(name::Command::Delete(name::Delete {
@@ -1339,6 +1689,7 @@ mod tests {
                 if_match: None,
                 at_ns,
                 bypass: true,
+                owner: "o".into(),
             })),
             named(name::Command::CreateUpload(name::CreateUpload {
                 bucket: "b".into(),
@@ -1369,9 +1720,9 @@ mod tests {
                     checksum: None,
                     file: 4,
                     modified_ns: 0,
+                    deadline_ns: u64::MAX,
                 },
                 at_ns,
-                deadline_ns: u64::MAX,
             })),
             named(name::Command::Complete(name::Complete {
                 bucket: "b".into(),
@@ -1394,7 +1745,9 @@ mod tests {
                     mode: RetentionMode::Compliance,
                     period: Period::Days(1),
                 }),
+                id: 0,
                 deadline_ns: u64::MAX,
+                listing: [0; crate::record::LISTING],
             })),
             named(name::Command::Abort(name::Abort {
                 bucket: "b".into(),
@@ -1409,16 +1762,50 @@ mod tests {
                 attempt: 2,
                 from: Some(GateState::Closed),
                 to: None,
+                generation: u64::MAX,
             })),
             named(name::Command::Collect(name::Collect {
                 bucket: "b".into(),
                 incarnation: 1,
                 budget: 64,
                 at_ns,
+                generation: 3,
+            })),
+            named(name::Command::Split(name::Split {
+                generation: 4,
+                at: crate::key::route("b", "k\0"),
+                child: u64::MAX,
+            })),
+            named(name::Command::Freeze(name::Freeze {
+                generation: 5,
+                into: descriptor.clone(),
+            })),
+            named(name::Command::Merge(name::Merge {
+                generation: 6,
+                from: descriptor.clone(),
+                max_rows: 1 << 20,
+                max_bytes: u64::MAX,
+            })),
+            named(name::Command::Abandon(name::Abandon { generation: 7 })),
+            named(name::Command::End(name::End {
+                generation: 8,
+                into: descriptor.clone(),
+            })),
+            named(name::Command::Thaw(name::Thaw { generation: 9 })),
+            named(name::Command::Resolve(name::Resolve {
+                from: 2,
+                generation: u64::MAX,
             })),
             named(name::Command::Reclaim(name::Reclaim {
                 released_ns: 5,
                 file: u128::MAX,
+            })),
+            named(name::Command::Disown(name::Disown {
+                bucket: "b".into(),
+                key: "k".into(),
+                file: 7,
+                owner: u128::MAX,
+                at_ns,
             })),
             named(name::Command::Check(name::Check {
                 files: vec![
@@ -1443,6 +1830,7 @@ mod tests {
                     key: "k".into(),
                     file: u128::MAX,
                 }],
+                at_ns,
             })),
             Command::File(file::Command::Write {
                 file: 3,
@@ -1455,6 +1843,10 @@ mod tests {
                     incarnation: 2,
                     key: "k".into(),
                 },
+                key: Some(crate::record::WrappedKey {
+                    by: crate::record::Wrapper::Root(3),
+                    bytes: [9; 40],
+                }),
                 handover_ns: 60,
                 at_ns,
                 blocks_deadline_ns: u64::MAX,
@@ -1494,6 +1886,16 @@ mod tests {
                 to: 2,
             }),
             Command::Block(block::Command::Delete { block: 5 }),
+            Command::Block(block::Command::Renew {
+                block: u128::MAX,
+                file: 7,
+                handover_ns: 60,
+                at_ns,
+            }),
+            Command::Block(block::Command::Release {
+                block: 5,
+                deadline_ns: u64::MAX,
+            }),
         ]
     }
 
@@ -1523,11 +1925,37 @@ mod tests {
 
     #[test]
     fn every_answer_round_trips() {
+        let lineage = crate::record::Lineage {
+            now: crate::record::Descriptor {
+                id: 1,
+                lo: Vec::new(),
+                hi: Some(crate::key::route("b", "m")),
+                generation: 2,
+            },
+            child: Some(crate::record::Descriptor {
+                id: 2,
+                lo: crate::key::route("b", "m"),
+                hi: None,
+                generation: 2,
+            }),
+            standing: crate::record::Standing::Frozen,
+            into: Some(crate::record::Descriptor {
+                id: 0,
+                lo: Vec::new(),
+                hi: Some(Vec::new()),
+                generation: 9,
+            }),
+            taken: Some(crate::record::Taken {
+                from: 7,
+                generation: 8,
+            }),
+        };
         use bucket::Outcome as B;
         use name::Outcome as N;
         let mut answers = vec![
             Answer::Registered { session: 7 },
             Answer::SessionExpired,
+            Answer::SessionsFull { until_ns: 9 },
             Answer::WrongLayer,
             Answer::Repeated,
         ];
@@ -1564,6 +1992,20 @@ mod tests {
             [
                 N::Put {
                     version: "v".into(),
+                },
+                N::Completed {
+                    version: "v".into(),
+                    size: u64::MAX,
+                    checksum: None,
+                },
+                N::Completed {
+                    version: "v".into(),
+                    size: 5,
+                    checksum: Some(Checksum {
+                        algorithm: 2,
+                        parts: 0,
+                        value: vec![1; 8],
+                    }),
                 },
                 N::Deleted {
                     marker: true,
@@ -1603,6 +2045,18 @@ mod tests {
                 ]),
                 N::Checked(Vec::new()),
                 N::Unmarked,
+                N::Awaits { deadline_ns: 12 },
+                N::Disowned { released: true },
+                N::Disowned { released: false },
+                N::Moved(Box::new(lineage.clone())),
+                N::Split(Box::new(lineage.clone())),
+                N::Frozen(Box::new(lineage.clone())),
+                N::Merged(Box::new(lineage.clone())),
+                N::Refused(Box::new(lineage.clone())),
+                N::Ended,
+                N::Thawed(Box::new(lineage)),
+                N::Resolved,
+                N::Miscombined,
             ]
             .map(Answer::Name),
         );
@@ -1621,6 +2075,8 @@ mod tests {
         answers.extend(
             [
                 block::Outcome::Written { deadline_ns: 3 },
+                block::Outcome::Released,
+                block::Outcome::Expired,
                 block::Outcome::Settled,
                 block::Outcome::Moved,
                 block::Outcome::Deleted,

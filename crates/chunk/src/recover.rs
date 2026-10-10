@@ -2,23 +2,25 @@
 //!
 //! Recovery replays the index log from the checkpoint the superblock names, frame by frame
 //! in LSN order, to the first frame that is not there. It then decides whether that frame is
-//! the torn tail of a crash or damage to acknowledged state: if any valid frame with a later
-//! LSN exists anywhere in the log, the log was damaged, which a crash cannot cause, and the
-//! volume refuses to open (Alagappan et al., FAST 2018, §3.3.3). The records of the last
+//! the torn tail of a crash or damage to acknowledged state: if it lies within the checkpoint,
+//! whose end the superblock records, or any valid frame of a later flush group exists anywhere
+//! in the log, the log was damaged, which a crash cannot cause, and the volume refuses to open
+//! (Alagappan et al., FAST 2018, §3.3.3). The records of the last
 //! replayed batch are read back, because that batch's flush may not have completed and its
 //! frame can reach the disk before its data. Finally it rolls forward through each open
 //! segment past the last indexed record, adding every record that verifies (Rosenblum and
 //! Ousterhout, TOCS 1992, §4.2): a batch whose data reached the disk but whose frame did not.
 
-use mantle_disk::DiskError;
-use mantle_disk::block::BlockFile;
-use mantle_disk::buf::{Pool, PoolBuf};
+use hyper_block::DiskError;
+use hyper_block::block::BlockFile;
+use hyper_block::buf::{AlignedBuf, Pool};
 
 use crate::error::ChunkError;
 use crate::frame::{KIND_BATCH, KIND_WRAP, LogRecord, PutRecord, SegmentState};
 use crate::index::{Fragment, Index, Inserted, SegmentInfo};
+use crate::key::ChunkKey;
 use crate::layout::{Config, Geometry};
-use crate::log::{self, Cursor};
+use crate::log::{Cursor, Frames};
 use crate::record::{self, Prefix};
 use crate::superblock::Superblock;
 use crate::writer::distance;
@@ -28,9 +30,14 @@ use crate::writer::distance;
 pub struct RecoveryReport {
     /// Index frames replayed.
     pub frames: u64,
-    /// Records of the last batch dropped because their data did not verify: that batch's
-    /// flush had not completed, so none of them was acknowledged.
-    pub unflushed_dropped: u64,
+    /// Chunks whose record in the last batch did not verify. Its flush may never have
+    /// completed, or its data may have been damaged since it was acknowledged: the volume
+    /// cannot tell the two apart, so each is kept, reads of it answer that its bytes do not
+    /// verify, and repair or the reconciler decides (AGL+18 §3.3.3; audit S05).
+    pub damaged: Vec<ChunkKey>,
+    /// Relocations of the last batch whose new copy did not verify, put back to the copy they
+    /// moved, which is intact whether or not the batch was acknowledged.
+    pub restored: u64,
     /// Records found past the index log's end in open segments and indexed.
     pub rolled_forward: u64,
 }
@@ -43,14 +50,14 @@ pub(crate) struct Recovered {
     pub incarnation: u64,
     pub fragments: u64,
     /// Open segments, newest first: the first two continue the writer's two streams, the
-    /// rest are sealed by its first batch.
+    /// rest are sealed when the volume starts.
     pub open: Vec<u32>,
     pub report: RecoveryReport,
 }
 
 pub(crate) fn recover<F: BlockFile>(
     file: &F,
-    pool: &Pool,
+    pool: &mut ReadPool,
     sb: &Superblock,
     geometry: &Geometry,
     config: &Config,
@@ -75,13 +82,12 @@ pub(crate) fn recover<F: BlockFile>(
         .unwrap_or(0)
         .saturating_add(2);
     let mut frames = 0u64;
+    let mut log = Frames::new(file, geometry, sb.volume).map_err(ChunkError::Device)?;
     loop {
         if frames > max_frames {
             return Err(ChunkError::CorruptLog { lsn });
         }
-        let Some((header, records, len)) =
-            log::read_frame(file, geometry, sb.volume, pos).map_err(ChunkError::Device)?
-        else {
+        let Some((header, records, len)) = log.frame(pos).map_err(ChunkError::Device)? else {
             break;
         };
         if header.lsn != lsn {
@@ -147,12 +153,16 @@ pub(crate) fn recover<F: BlockFile>(
         }
     }
     report.frames = frames;
-    if later_frame_exists(file, geometry, sb.volume, lsn)? {
+    if lsn < sb.end_lsn || later_frame_exists(&mut log, geometry, lsn)? {
         return Err(ChunkError::CorruptLog { lsn });
     }
 
-    // The last batch's flush may not have completed: keep only records whose data verifies.
-    // They are the last fragments of their chunks, so they come off in reverse order.
+    // The last batch's flush may not have completed, and a record whose data does not
+    // verify may be torn. It may as well be an acknowledged record damaged since, or read
+    // wrong: nothing after the batch tells, as a later frame would for an earlier one. So a
+    // record is never dropped on that evidence (audit S05). A relocation whose new copy does
+    // not verify goes back to the copy it moved, which is intact either way: that segment is
+    // freed only after a relocation is durable. Any other record stays, reported damaged.
     for (put, displaced) in last_batch.iter().rev() {
         let at = u64::from(put.offset);
         let verified = verify_at(
@@ -168,16 +178,13 @@ pub(crate) fn recover<F: BlockFile>(
         if verified {
             continue;
         }
-        // A relocation whose new copy did not reach the disk goes back to the copy it moved:
-        // that segment is freed only after a relocation is durable, so the old copy is intact.
-        let undone = match displaced {
-            Some(old) => index.restore_fragment(&put.key, old),
-            None => index
-                .pop_fragment(&put.key, put.chunk_offset, put.sequence)
-                .is_some(),
-        };
-        if undone {
-            report.unflushed_dropped = report.unflushed_dropped.saturating_add(1);
+        match displaced {
+            Some(old) => {
+                if index.restore_fragment(&put.key, old) {
+                    report.restored = report.restored.saturating_add(1);
+                }
+            }
+            None => report.damaged.push(put.key),
         }
     }
 
@@ -248,18 +255,20 @@ pub(crate) fn recover<F: BlockFile>(
 /// previous group's flush completes, so such a frame proves the missing one was durable and
 /// has since been damaged. Frames of the same group (a wrap and its batch, the frames of a
 /// checkpoint) can survive a crash that tore an earlier one, and prove nothing.
+///
+/// Every block of the log is examined, through the reader's window; only a frame whose header
+/// names such a group is verified whole, since the header it is verified with is the same.
 fn later_frame_exists<F: BlockFile>(
-    file: &F,
+    log: &mut Frames<'_, F>,
     geometry: &Geometry,
-    volume: u128,
     lsn: u64,
 ) -> Result<bool, ChunkError> {
     let mut pos = 0u64;
     while pos < geometry.log_size {
-        if let Some((header, _, _)) =
-            log::read_frame(file, geometry, volume, pos).map_err(ChunkError::Device)?
+        if let Some((header, _)) = log.header(pos).map_err(ChunkError::Device)?
             && header.lsn >= lsn
             && header.group > lsn
+            && log.frame(pos).map_err(ChunkError::Device)?.is_some()
         {
             return Ok(true);
         }
@@ -276,6 +285,17 @@ pub(crate) struct Verified {
 }
 
 impl Verified {
+    /// Whether this is the record of `key` that fragment `f` names.
+    pub(crate) fn is(&self, key: &ChunkKey, f: &Fragment) -> bool {
+        let h = &self.prefix.header;
+        h.key == *key
+            && h.incarnation == f.incarnation
+            && h.sequence == f.sequence
+            && h.chunk_offset == f.chunk_offset
+            && h.payload_len == f.payload_len
+            && self.payload_crc == f.payload_crc
+    }
+
     fn matches(&self, put: &PutRecord) -> bool {
         let h = &self.prefix.header;
         h.key == put.key
@@ -325,7 +345,7 @@ impl Identity {
 /// intact record of this volume and segment is there.
 pub(crate) fn verify_at<F: BlockFile>(
     file: &F,
-    pool: &Pool,
+    pool: &mut ReadPool,
     geometry: &Geometry,
     identity: Identity,
     segment: u32,
@@ -347,62 +367,100 @@ pub(crate) fn verify_at<F: BlockFile>(
     else {
         return Ok(None);
     };
-    let Some(first) = record::peek_lengths(header_span.bytes()) else {
-        return Ok(None);
-    };
-    let Some(record_len) = record::record_len(first.payload_len, first.checksum_shift) else {
+    let record_len = record::peek_lengths(header_span.bytes())
+        .and_then(|first| record::record_len(first.payload_len, first.checksum_shift));
+    pool.give(header_span);
+    let Some(record_len) = record_len else {
         return Ok(None);
     };
     let record_len64 = u64::try_from(record_len).unwrap_or(u64::MAX);
     if offset.saturating_add(record_len64) > geometry.segment_size {
         return Ok(None);
     }
-    drop(header_span);
     let Some(span) = read_span(file, pool, geometry, base, offset, record_len64)? else {
         return Ok(None);
     };
-    let bytes = span.bytes();
-    let Some(prefix) = record::decode_prefix(bytes) else {
-        return Ok(None);
-    };
+    let verified = verify_record(span.bytes(), identity, segment, record_len, payload_out);
+    pool.give(span);
+    Ok(verified)
+}
+
+/// The record in `bytes`, if it is one of this volume and segment whose every checksum block
+/// verifies; its payload is appended to `payload_out` when given one.
+fn verify_record(
+    bytes: &[u8],
+    identity: Identity,
+    segment: u32,
+    record_len: usize,
+    payload_out: Option<&mut Vec<u8>>,
+) -> Option<Verified> {
+    let prefix = record::decode_prefix(bytes)?;
     let h = &prefix.header;
     if h.volume != identity.volume
         || h.segment != segment
         || h.checksum_shift != identity.checksum_shift
     {
-        return Ok(None);
+        return None;
     }
-    let Some(start) = h.prefix_len() else {
-        return Ok(None);
-    };
-    let Some(payload) =
-        bytes.get(start..start.saturating_add(usize::try_from(h.payload_len).unwrap_or(0)))
-    else {
-        return Ok(None);
-    };
+    let start = h.prefix_len()?;
+    let payload =
+        bytes.get(start..start.saturating_add(usize::try_from(h.payload_len).unwrap_or(0)))?;
     if !record::verify(&prefix, 0, payload) {
-        return Ok(None);
+        return None;
     }
     let payload_crc = mantle_crc::crc32c(payload);
     if let Some(out) = payload_out {
         out.extend_from_slice(payload);
     }
-    Ok(Some(Verified {
+    Some(Verified {
         prefix,
         payload_crc,
         record_len: u32::try_from(record_len).unwrap_or(u32::MAX),
-    }))
+    })
 }
 
-/// Bytes read from the device into a pooled buffer, which returns to its pool when the span
-/// is dropped.
-pub(crate) struct Span<'p> {
-    buf: PoolBuf<'p>,
+/// Buffers for reading records, each pool owned by the one thread that reads with it: the
+/// writer, the cleaner and the scrubber their own, recovery its own, and each caller of a read
+/// its own (`ReadBuffers`), as hyper-block's pool has one owner, the thread that issues the I/O
+/// its buffers carry (hyper-block buf.rs). Each buffer is lent for one read and given back
+/// once the span read into it has been looked at.
+pub(crate) struct ReadPool(Pool);
+
+impl ReadPool {
+    pub(crate) fn new(pool: Pool) -> Self {
+        Self(pool)
+    }
+
+    /// The pool each reader of a volume keeps: at most one batch's bytes free, in no buffer
+    /// larger than a batch, which holds the largest record the writer lays out. A reader keeps
+    /// what its own reads took, at most that.
+    pub(crate) fn of_batch(align: hyper_block::buf::Alignment, batch_bytes: usize) -> Self {
+        Self(Pool::new(align, batch_bytes, batch_bytes))
+    }
+
+    /// An empty buffer of at least `capacity` bytes, lent until its span is given back.
+    fn take(&mut self, capacity: usize) -> Result<AlignedBuf, ChunkError> {
+        self.0
+            .take(capacity)
+            .map_err(|e| ChunkError::Device(e.into()))
+    }
+
+    /// Takes back the buffer of a span read through this pool. A span dropped instead, on a
+    /// path that gives up on its read, frees its buffer.
+    pub(crate) fn give(&mut self, span: Span) {
+        self.0.give(span.buf);
+    }
+}
+
+/// Bytes read from the device into a buffer lent from a [`ReadPool`], given back with
+/// [`ReadPool::give`].
+pub(crate) struct Span {
+    buf: AlignedBuf,
     skip: usize,
     len: usize,
 }
 
-impl Span<'_> {
+impl Span {
     pub fn bytes(&self) -> &[u8] {
         self.buf
             .as_slice()
@@ -413,14 +471,14 @@ impl Span<'_> {
 
 /// Reads `len` bytes at `offset` within the segment at `base`, through an aligned buffer
 /// from `pool`. `None` if the span runs past the end of the file.
-pub(crate) fn read_span<'p, F: BlockFile>(
+pub(crate) fn read_span<F: BlockFile>(
     file: &F,
-    pool: &'p Pool,
+    pool: &mut ReadPool,
     geometry: &Geometry,
     base: u64,
     offset: u64,
     len: u64,
-) -> Result<Option<Span<'p>>, ChunkError> {
+) -> Result<Option<Span>, ChunkError> {
     let block = geometry.block;
     let start = base.checked_add(offset).ok_or(ChunkError::Full)?;
     let end = start.checked_add(len).ok_or(ChunkError::Full)?;
@@ -431,20 +489,31 @@ pub(crate) fn read_span<'p, F: BlockFile>(
     let aligned_end = end
         .checked_next_multiple_of(block)
         .ok_or(ChunkError::Full)?;
-    let span =
+    let span_len =
         usize::try_from(aligned_end.saturating_sub(aligned_start)).map_err(|_| ChunkError::Full)?;
-    let mut buf = pool.take(span).map_err(|e| ChunkError::Device(e.into()))?;
-    buf.set_len(span)
-        .map_err(|e| ChunkError::Device(e.into()))?;
-    match file.read_exact_at(buf.as_mut_slice(), aligned_start) {
-        Ok(()) => {}
-        Err(DiskError::ShortRead { .. }) => return Ok(None),
-        Err(e) => return Err(ChunkError::Device(e)),
-    }
+    let mut buf = pool.take(span_len)?;
+    let read = buf
+        .set_len(span_len)
+        .map_err(|e| ChunkError::Device(e.into()))
+        .and_then(
+            |()| match file.read_exact_at(buf.as_mut_slice(), aligned_start) {
+                Ok(()) => Ok(true),
+                Err(DiskError::ShortRead { .. }) => Ok(false),
+                Err(e) => Err(ChunkError::Device(e)),
+            },
+        );
     let skip = usize::try_from(start.saturating_sub(aligned_start)).unwrap_or(0);
     let len = usize::try_from(len).unwrap_or(0);
-    if skip.saturating_add(len) > span {
-        return Ok(None);
+    let span = Span { buf, skip, len };
+    match read {
+        Ok(true) if skip.saturating_add(len) <= span_len => Ok(Some(span)),
+        Ok(_) => {
+            pool.give(span);
+            Ok(None)
+        }
+        Err(e) => {
+            pool.give(span);
+            Err(e)
+        }
     }
-    Ok(Some(Span { buf, skip, len }))
 }

@@ -1,0 +1,26 @@
+[package]
+name = "mantle-gateway"
+description = "The gateway's object path: a PUT's body to sealed, coded chunks and metadata rows, and back"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+getrandom.workspace = true
+mantle-chunk = { path = "../chunk" }
+mantle-crc = { path = "../crc" }
+mantle-ec = { path = "../ec" }
+mantle-meta = { path = "../meta" }
+mantle-s3 = { path = "../s3" }
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,38 @@
+[package]
+name = "hyper-seal"
+description = "Sealing at rest for mantle, focal and slates: a hierarchy of random keys wrapped with AES-256-KW, files sealed by STREAM, the shared log sealed record by record under a key per writer session, keys to another machine by ML-KEM-1024, names keyed per tenant"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/hyper-light/hyper-raft"
+publish = false
+rust-version = "1.98"
+
+[dependencies]
+aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+getrandom = "0.4"
+# The device a sealed file is written and read through (`sealed_file`), only with the `files`
+# feature: hyper-block opens and writes files, and a consumer that confines file writes to one crate
+# (slates' land) takes hyper-seal's keys, log sealing and STREAM primitives without it.
+hyper-block = { path = "../hyper-block", optional = true }
+thiserror = "2.0"
+
+[target.'cfg(unix)'.dependencies]
+# mlock(2) and madvise(2) for the key region, and the page size.
+rustix = { version = "1.1", features = ["fs", "mm", "param", "process", "system", "time"] }
+
+[target.'cfg(windows)'.dependencies]
+# VirtualLock for the key region; GetSecurityInfo and the ACL walk for a key file's owner-only check.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Kernel", "Win32_System_Memory", "Win32_System_Performance", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
+
+[dev-dependencies]
+hyper-block = { path = "../hyper-block", features = ["sim"] }
+hyper-measure = { path = "../hyper-measure" }
+tempfile = "3.20"
+
+[features]
+# A whole file sealed through a `hyper_block::block::BlockFile` (`sealed_file`).
+files = ["dep:hyper-block"]
+
+# A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside any consumer workspace.
+[workspace]

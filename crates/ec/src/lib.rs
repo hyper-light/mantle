@@ -27,6 +27,7 @@
 
 pub mod durability;
 
+use std::ops::Range;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
@@ -95,35 +96,55 @@ impl Code {
     /// The length of each chunk of a block of `len` bytes: the block spread over the data
     /// chunks, rounded up to whole two-byte symbols, and at least one symbol.
     pub fn chunk_len(&self, len: usize) -> Result<usize, EcError> {
-        len.div_ceil(self.data)
-            .checked_next_multiple_of(2)
+        // `new` refuses zero data chunks, so the division is defined; checked all the same,
+        // since `div_ceil` panics on a zero divisor.
+        let whole = len.checked_div(self.data).ok_or(EcError::Unsupported {
+            data: self.data,
+            parity: self.parity,
+        })?;
+        let part = usize::from(len.checked_rem(self.data).is_some_and(|r| r > 0));
+        whole
+            .checked_add(part)
+            .and_then(|c| c.checked_next_multiple_of(2))
             .map(|c| c.max(2))
             .ok_or(EcError::TooLarge(len))
     }
 
-    /// All chunks of `block`, in index order: its data chunks, then the parity chunks.
-    pub fn encode(&self, block: &[u8]) -> Result<Vec<Vec<u8>>, EcError> {
-        let c = self.chunk_len(block.len())?;
-        let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(self.width());
-        for i in 0..self.data {
-            let start = i.saturating_mul(c).min(block.len());
-            let end = start.saturating_add(c).min(block.len());
-            let mut chunk = Vec::with_capacity(c);
-            chunk.extend_from_slice(block.get(start..end).unwrap_or_default());
-            chunk.resize(c, 0);
-            chunks.push(chunk);
+    /// The span of a block of `len` bytes that data chunk `i` holds: `[i·c, (i+1)·c)` clipped
+    /// to the block. The chunk is those bytes and then zeros to `c`, so a caller holding the
+    /// block takes every chunk the block fills as a slice of it, and copies only a last one it
+    /// does not fill.
+    pub fn data_span(&self, len: usize, i: usize) -> Result<Range<usize>, EcError> {
+        if i >= self.data {
+            return Err(EcError::ChunkIndex {
+                index: i,
+                width: self.width(),
+            });
         }
-        let parity = self.parity_of(&chunks, c)?;
-        chunks.extend(parity);
-        Ok(chunks)
+        let c = self.chunk_len(len)?;
+        let start = i.saturating_mul(c).min(len);
+        Ok(start..start.saturating_add(c).min(len))
     }
 
-    /// The parity chunks of `data`, which are the code's data chunks, each `c` bytes.
-    fn parity_of(&self, data: &[Vec<u8>], c: usize) -> Result<Vec<Vec<u8>>, EcError> {
+    /// The parity chunks of `block`, computed from its data chunks where they lie in it: only a
+    /// last chunk the block does not fill is copied, to pad it (audit P08).
+    pub fn parity_of(&self, block: &[u8]) -> Result<Vec<Vec<u8>>, EcError> {
+        let c = self.chunk_len(block.len())?;
         guarded(|| {
             let mut encoder = ReedSolomonEncoder::new(self.data, self.parity, c)?;
-            for chunk in data {
-                encoder.add_original_shard(chunk)?;
+            let mut padded = Vec::new();
+            for i in 0..self.data {
+                let bytes = block
+                    .get(self.data_span(block.len(), i)?)
+                    .unwrap_or_default();
+                if bytes.len() == c {
+                    encoder.add_original_shard(bytes)?;
+                } else {
+                    padded.clear();
+                    padded.extend_from_slice(bytes);
+                    padded.resize(c, 0);
+                    encoder.add_original_shard(&padded)?;
+                }
             }
             let result = encoder.encode()?;
             (0..self.parity)
@@ -137,35 +158,82 @@ impl Code {
         })
     }
 
+    /// All chunks of `block`, each its own copy, in index order: its data chunks, then the
+    /// parity chunks. A caller holding the block in a shared buffer takes the data chunks as
+    /// slices of it instead (`data_span`) and only the parity from here (`parity_of`).
+    pub fn encode(&self, block: &[u8]) -> Result<Vec<Vec<u8>>, EcError> {
+        let c = self.chunk_len(block.len())?;
+        // The reservations are fallible: a block too large to hold twice is refused rather
+        // than aborting the process.
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        chunks
+            .try_reserve_exact(self.width())
+            .map_err(|_| EcError::TooLarge(block.len()))?;
+        for i in 0..self.data {
+            let mut chunk = Vec::new();
+            chunk
+                .try_reserve_exact(c)
+                .map_err(|_| EcError::TooLarge(block.len()))?;
+            chunk.extend_from_slice(
+                block
+                    .get(self.data_span(block.len(), i)?)
+                    .unwrap_or_default(),
+            );
+            chunk.resize(c, 0);
+            chunks.push(chunk);
+        }
+        chunks.extend(self.parity_of(block)?);
+        Ok(chunks)
+    }
+
     /// The chunks at `wanted`, rebuilt from the chunks in `present`, given as (index, bytes).
+    /// A wanted data chunk is copied from where it is present or restored; the data chunks
+    /// are gathered to encode again only when a parity chunk is wanted (audit P08).
     pub fn rebuild(
         &self,
         present: &[(usize, &[u8])],
         wanted: &[usize],
     ) -> Result<Vec<Vec<u8>>, EcError> {
         let c = self.check(present)?;
-        let data = self.data_chunks(present, c)?;
-        let parity = if wanted.iter().any(|&w| w >= self.data) {
-            self.parity_of(&data, c)?
-        } else {
-            Vec::new()
-        };
-        wanted
-            .iter()
-            .map(|&w| {
-                let chunk = match w.checked_sub(self.data) {
-                    None => data.get(w),
-                    Some(p) => parity.get(p),
-                };
-                chunk.cloned().ok_or(EcError::ChunkIndex {
-                    index: w,
-                    width: self.width(),
-                })
-            })
-            .collect()
+        let width = self.width();
+        if let Some(&index) = wanted.iter().find(|&&w| w >= width) {
+            return Err(EcError::ChunkIndex { index, width });
+        }
+        let parity_wanted = wanted.iter().any(|&w| w >= self.data);
+        guarded(|| {
+            let mut out: Vec<Option<Vec<u8>>> = vec![None; wanted.len()];
+            let mut encoder = if parity_wanted {
+                Some(ReedSolomonEncoder::new(self.data, self.parity, c)?)
+            } else {
+                None
+            };
+            self.each_data(present, c, &mut |i, chunk| {
+                for (slot, _) in out.iter_mut().zip(wanted).filter(|(_, w)| **w == i) {
+                    *slot = Some(chunk.to_vec());
+                }
+                if let Some(encoder) = encoder.as_mut() {
+                    encoder.add_original_shard(chunk)?;
+                }
+                Ok(())
+            })?;
+            if let Some(mut encoder) = encoder {
+                let result = encoder.encode()?;
+                for (slot, &w) in out.iter_mut().zip(wanted) {
+                    if let Some(p) = w.checked_sub(self.data) {
+                        *slot = result.recovery(p).map(<[u8]>::to_vec);
+                    }
+                }
+            }
+            out.into_iter()
+                .zip(wanted)
+                .map(|(chunk, &index)| chunk.ok_or(EcError::ChunkIndex { index, width }))
+                .collect()
+        })
     }
 
-    /// The block of `len` bytes from any `data` of its chunks, given as (index, bytes).
+    /// The block of `len` bytes from any `data` of its chunks, given as (index, bytes). Each
+    /// byte of the block is copied once, from a chunk present or restored; before, the data
+    /// chunks were copied out and then into the block (audit P08).
     pub fn decode(&self, present: &[(usize, &[u8])], len: usize) -> Result<Vec<u8>, EcError> {
         let c = self.check(present)?;
         if self.chunk_len(len)? != c {
@@ -175,12 +243,17 @@ impl Code {
                 expected: self.chunk_len(len)?,
             });
         }
-        let data = self.data_chunks(present, c)?;
-        let mut block = Vec::with_capacity(len);
-        for chunk in &data {
+        // `len` is the caller's record of the block's length: a length too large to allocate
+        // is refused rather than aborting the process.
+        let mut block = Vec::new();
+        block
+            .try_reserve_exact(len)
+            .map_err(|_| EcError::TooLarge(len))?;
+        self.each_data(present, c, &mut |_, chunk| {
             let take = len.saturating_sub(block.len()).min(chunk.len());
             block.extend_from_slice(chunk.get(..take).unwrap_or_default());
-        }
+            Ok(())
+        })?;
         Ok(block)
     }
 
@@ -215,17 +288,25 @@ impl Code {
         Ok(expected)
     }
 
-    /// Every data chunk, from `present` where it is there and restored from the others where
-    /// it is not.
-    fn data_chunks(&self, present: &[(usize, &[u8])], c: usize) -> Result<Vec<Vec<u8>>, EcError> {
-        let mut data: Vec<Option<Vec<u8>>> = vec![None; self.data];
+    /// Calls `each` with every data chunk in index order: the one in `present` where it is
+    /// there, and the decoder's restoration where it is not, never a copy.
+    fn each_data(
+        &self,
+        present: &[(usize, &[u8])],
+        c: usize,
+        each: &mut Each<'_>,
+    ) -> Result<(), EcError> {
+        let mut data: Vec<Option<&[u8]>> = vec![None; self.data];
         for &(index, bytes) in present {
             if let Some(slot) = data.get_mut(index) {
-                *slot = Some(bytes.to_vec());
+                *slot = Some(bytes);
             }
         }
         if data.iter().all(Option::is_some) {
-            return Ok(data.into_iter().flatten().collect());
+            for (i, chunk) in data.iter().enumerate() {
+                each(i, chunk.unwrap_or_default())?;
+            }
+            return Ok(());
         }
         guarded(|| {
             let mut decoder = ReedSolomonDecoder::new(self.data, self.parity, c)?;
@@ -236,19 +317,22 @@ impl Code {
                 }
             }
             let result = decoder.decode()?;
-            data.iter()
-                .enumerate()
-                .map(|(i, chunk)| match chunk {
-                    Some(chunk) => Ok(chunk.clone()),
+            for (i, chunk) in data.iter().enumerate() {
+                let chunk = match chunk {
+                    Some(chunk) => chunk,
                     None => result
                         .restored_original(i)
-                        .map(<[u8]>::to_vec)
-                        .ok_or_else(|| EcError::Library(format!("data chunk {i} not restored"))),
-                })
-                .collect()
+                        .ok_or_else(|| EcError::Library(format!("data chunk {i} not restored")))?,
+                };
+                each(i, chunk)?;
+            }
+            Ok(())
         })
     }
 }
+
+/// What `each_data` calls with every data chunk: its index and bytes.
+type Each<'a> = dyn FnMut(usize, &[u8]) -> Result<(), EcError> + 'a;
 
 /// Runs `f`, turning a panic inside the library into an error.
 fn guarded<T>(f: impl FnOnce() -> Result<T, EcError>) -> Result<T, EcError> {
@@ -313,6 +397,38 @@ mod tests {
                     assert_eq!(code.decode(&present, len).unwrap(), original);
                 }
             }
+        }
+    }
+
+    /// A block's data chunks are its spans padded with zeros, and its parity what `encode`
+    /// gives, so a caller holding the block shares its bytes rather than copying them; a
+    /// chunk rebuilt from every data chunk present, and a parity chunk rebuilt from them, is
+    /// the chunk encoded.
+    #[test]
+    fn a_blocks_chunks_are_its_spans_and_its_parity() {
+        for (data, parity) in CODES {
+            let code = Code::new(data, parity).unwrap();
+            let c = code.chunk_len(1000).unwrap();
+            for len in [c * data, c * data - 3, 1, 0] {
+                let original = block(len, len as u64);
+                let chunks = code.encode(&original).unwrap();
+                let c = code.chunk_len(len).unwrap();
+                for (i, chunk) in chunks.iter().enumerate().take(data) {
+                    let span = &original[code.data_span(len, i).unwrap()];
+                    assert_eq!(&chunk[..span.len()], span);
+                    assert!(chunk[span.len()..].iter().all(|&b| b == 0));
+                    assert_eq!(chunk.len(), c);
+                }
+                assert_eq!(code.parity_of(&original).unwrap(), chunks[data..]);
+                let present: Vec<(usize, &[u8])> =
+                    (0..data).map(|i| (i, chunks[i].as_slice())).collect();
+                let wanted = [data + parity - 1, 0, data + parity - 1];
+                let rebuilt = code.rebuild(&present, &wanted).unwrap();
+                let want = [&chunks[wanted[0]], &chunks[0], &chunks[wanted[0]]];
+                assert!(rebuilt.iter().eq(want));
+            }
+            assert!(code.data_span(10, data).is_err());
+            assert!(code.rebuild(&[], &[data + parity]).is_err());
         }
     }
 

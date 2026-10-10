@@ -1,6 +1,6 @@
 [package]
 name = "mantle-range"
-description = "A range replica: focal-raft's core driven over the shared log and a state engine"
+description = "A range replica: hyper-raft's durable shell, its core inside, over the shared log and a state engine"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -10,18 +10,23 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-focal-raft = { git = "https://github.com/hyper-light/focal", rev = "1395e223c065e85158ec1611fdc72073d28fd8a0" }
+# The shared Raft core, its durable shell, the shared log and its block layer, vendored from
+# hyper-raft (vendor/*/SNAPSHOT, vendor/UPSTREAM.md).
+hyper-block = { path = "../../vendor/hyper-block" }
+hyper-durable = { path = "../../vendor/hyper-durable" }
+hyper-log = { path = "../../vendor/hyper-log" }
+hyper-raft = { path = "../../vendor/hyper-raft" }
 mantle-codec = { path = "../codec" }
 mantle-crc = { path = "../crc" }
-mantle-disk = { path = "../disk" }
-mantle-log = { path = "../log" }
 mantle-meta = { path = "../meta" }
 thiserror.workspace = true
 
 [dev-dependencies]
-mantle-chunk = { path = "../chunk" }
-mantle-disk = { path = "../disk", features = ["sim"] }
+hyper-block = { path = "../../vendor/hyper-block", features = ["sim"] }
+# A waker the log's answer wakes a test's member by, its slot leaked once a waker.
+hyper-measure = { path = "../../vendor/hyper-measure" }
 proptest.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

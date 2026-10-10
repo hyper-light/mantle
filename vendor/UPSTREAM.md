@@ -83,3 +83,94 @@ command on the six targets.
 3. Replace the test data from the new tag's source archive.
 4. Run the vendored suites and mantle's gates. Update the versions, checksums, commits and
    test count in this file.
+
+## hyper-raft (shared crates)
+
+**Development snapshot (branch `worker-stream` only, 2026-10-09).** `hyper-block` and `hyper-rt` are
+taken from hyper-raft's `mantle-dev-stream` at `8cd3604`, a development-only branch (never a PR) that
+carries work not yet on hyper-raft's `main`: #12 (the hardened runtime: readiness under busy and
+manual stepping, driver loss, representation bounds, and the blocking pool refusing a job once
+stopped, `48b7d81`), #13 (`Issuer::attacher`, an owned way for a maintenance worker to attach), #7
+(a batch's vector comes back with its answer) and the issuer's completion bridge
+(`Attached::answer_async`) that this vendor already held. That describes the historical base import. This isolated candidate additionally carries
+uncommitted cooperative-service cleanup and the per-attachment submission/retirement lanes
+recorded below; neither is claimed to exist in the base commit's objects. Both crates are re-vendored from `main` once these land, and this
+note goes with that commit. The rows below state the snapshot each crate held before.
+
+The crates mantle shares with focal and slates come from github.com/hyper-light/hyper-raft:
+- each is a snapshot of one crate taken from a commit's objects (`git archive`), its manifest made
+  self-contained: the workspace's package fields and dependency specs written in, its benches and
+  `[[bench]]` tables and its `[lints]` left out, `publish = false` added, and an empty
+  `[workspace]` appended; its source revision is in `SNAPSHOT`. A file under `benches/` that a
+  test includes by `#[path]` stays, since `cargo fmt --all` follows the include:
+  `hyper-liveness`'s `benches/support/world.rs`;
+- each is a workspace root of its own, excluded from this workspace;
+- hyper-raft's CI runs their suites on all six targets, and mantle's own suites run against the
+  snapshot;
+- a change is made in hyper-raft and taken here by a new snapshot, never edited in place;
+- snapshots that depend on each other by path sit side by side here, as they do under
+  hyper-raft's `crates/`, so those paths resolve: `hyper-raft` on `hyper-timing`; `hyper-log`
+  on `hyper-block`, `hyper-seal` and `hyper-timing`, and for its own tests `hyper-measure`;
+  `hyper-durable` on `hyper-raft`, `hyper-log`, `hyper-block`, `hyper-timing` and
+  `hyper-liveness`; `hyper-liveness` on `hyper-timing`; `hyper-seal` on aws-lc-rs (and `hyper-block` with its `files` feature), which
+  resolves to the copy vendored above through the root `Cargo.toml`'s patch, and for its own
+  tests `hyper-measure`; and `hyper-rt` on no other snapshot, and for its own tests
+  `hyper-measure`. A build resolves no dev-dependency of
+  a crate outside the workspace, but `cargo fmt --all` loads the manifest of every path
+  dependency, dev-dependencies included, so a snapshot's manifest leaves out a path
+  dev-dependency on a crate not vendored here, with a comment naming it: `hyper-timing`'s on
+  `hyper-sim`, and `hyper-liveness`'s on `hyper-swim`, `hyper-datagram`, `hyper-tokio` and
+  `hyper-sim`, whose tests hyper-raft's CI runs and mantle does not.
+
+The base snapshots came from `8cd36040c1a9cb51d7aed8981b4aa5539b47ef6c`, including
+the hardened-runtime revision `48b7d81213885b26f9572eefb1db279c49f5aa68`. The current
+candidate imports local uncommitted changes on producer HEAD `d9c5cf8e121fd009e82f56e0927ead1c94cc1197`. Its
+62 runtime Rust source files and 69 runtime Rust test files identify the prepared
+`hyper-rt-service-root` source, including cooperative service admission/cancellation,
+per-poll synchronization guards, checked channel slot/ticket layouts, TCP setup and
+accept-future RAII, and cold-owned bounded native retirement. Source census
+SHA256: `0ccee4e528191c94ef986b8ffec440c6e88b8151bd56fad2a7c888855b432b60`; test census SHA256:
+`417707fb8ee898a6bd20cbf82c52d769f835fb2f7cf36ecb5dcc4fb654c269f4`. The two TLS ownership tests use
+`Cell<Option<_>>`. The current overlay also pre-adopts original files into the existing
+native reaper and holds an independent attachment watch through physical retirement. Each census hashes UTF-8 lines
+`<file SHA256>  <relative path>\n` for every `*.rs` beneath that directory, ordered by the UTF-8 relative path. Its issuer source
+SHA256 is `a84ee65def48fedb8412e43b8ab2fe2bd2b2cdd9a7284fa3a8114896fc7eefb9`, including nonblocking
+entered-shard owning Drop, B+1 physical terminal receipts, guarded lifecycle errors,
+cold typed retirement, checked extreme channel/batch layouts, and bounded per-worker
+completion/exit lanes that wake the broker without polling
+(`hyper-block/ORIGIN.md` changes10–11). These are development source identities, not
+accepted producer revisions. They do not include the pending generic canceled-grant
+handoff proposal or establish repaired-C3 throughput. Producer and every consumer's
+exact final-tree gates, native six-platform CI and the measured replacement law remain
+required. After the producer lands, re-vendor from its exact accepted commit objects,
+conform manifests by the recipe above and update SNAPSHOT; the historical rows below
+are not current API identity.
+
+Mantle-local changes to `hyper-block` on `worker-stream`, made here by the owner's direction and
+owed upstream to hyper-raft: a read the OS holds in memory is made on the submitter's own thread
+(`resident`, `BlockFile::read_resident_at`, `BlockFile::reads_resident`,
+`Attached::read_resident_at`: `RWF_NOWAIT` on Linux, `mincore(2)` over a kept mapping on macOS;
+mantle `docs/research/41-resident-reads.md`). `libc` is a dependency on Apple targets too, for it;
+the lock files are unchanged. A lane that handed a one-transfer read straight to a worker was tried
+and removed: it chose a worker without the dispatcher's view of the work each holds, so a read or
+a write could wait behind a long transfer while other workers were idle.
+
+The AWS-LC workspace command above excludes these standalone shared-crate roots. It does
+not run their runtime, device or allocation tests. Their suites must also be run against
+the exact development sources, including `hyper-block/tests/issuer_allocs.rs`.
+
+| Snapshot | Revision | Used by |
+|---|---|---|
+| `hyper-raft` | `SNAPSHOT` (`5d68252`, unchanged since `f311ab6`: since `0c4a793`, a leader's quorum patience beyond its election timeout before it checks a quorum heard it (`Raft::set_quorum_patience`, hyper-raft `docs/raft.md` §3.6), zero by default; since `857a2ae`, an owner may defer a Ready's commit that moved alone, so the Ready vouches for no commit and its answers state only the durable one (`RawNode::defer_commit`); since `df54729`, elections and commitment counted by the newest configuration a member's log states, committed or not (Diss §4.1; hyper-raft `83f193a`, `docs/raft.md` §3.4), where a configuration took effect as it was applied before; the log's precedence the only election rule, raft-rs's kept for the differential tests behind a feature no consumer enables (`raft-rs-precedence`); a dropped proposal naming its cause; a member of a later term answering a leader of an earlier one whatever the settings; the rule for what arrives ahead of a hole changed on a running member (`set_ahead`); and the fast track's holdings kept until a classic commit covers them (`docs/raft.md` §3.5). Before, since `df5f8ad`, R-3, slates' enhancements: R6 and R7, a lease its member's own timer kept, the R4, R5, R20 and R21 tests; the window to a member one rule, what its path carries over a repair (R16); what arrives ahead of a hole kept and acknowledged with the write that holds it (R17), and a member that lost it probed after a beat (S-4); a learner caught up in rounds before it is promoted (R13); every bound derived from what the owner states (`Limits::derive`, which `crates/range` states from a range's settings); a read of a new leader waiting for the entry it began its term with (S-4); a pre-candidate deaf to a leader it suspects; and the planted defects of `mutants`, a feature no consumer enables. Since `df5f8ad` the tests take hyper-check, not vendored here; hyper-raft `docs/raft.md` §3, `docs/sim.md` §14, `ORIGIN.md`) | `hyper-durable`; `crates/range` (proto, `Config`, its errors) |
+| `hyper-timing` | `SNAPSHOT` (`5d68252`, unchanged since `df54729`: the election law's draw, which the core's timer takes since L-2, and the detectors' estimator and configurator; since `df5f8ad`, a path's samples fresh and of one endpoint, `G` never below the owner's clock resolution, and a histogram of nanoseconds; hyper-raft `docs/timing.md`) | `hyper-raft`, `hyper-durable`, `hyper-liveness` |
+| `hyper-log` | `SNAPSHOT` (`5d68252`, unchanged since `f311ab6`: mantle's `crates/log` at `147f035` with its history, L-1; one owner thread answering by ticket, L-2; a group's handle, `GroupLog`, answering its replica's reads and cutting its updates into parts on the replica's thread, a blocking writer flushing its own frame, and a waking submitter that does not wait for its admission; since `63cb65d`, a write its handle sent behind a refused one refused too, `LogError::Behind`, and the handle's depth, `GroupLog::depth` and `has_room`; since `df5f8ad`, the log's statistics, `LogStats`; since `df54729`, format 4 and a sealed log, every record sealed and every frame, header and persist record under a MAC (hyper-seal; hyper-raft `docs/seal.md` §5), and the fast track's proposals kept until an update releases them (the `Released` record); since `857a2ae`, a `LogOpener` that claims a log's groups from any thread without the log's threads (`Log::opener`), a submission's options sent as one value, and a configuration derived from a node's and device's facts, refused typed rather than clamped (`Config::derive`, `Facts`, `LogError::Unfit`); since `b483a13`, the log's id on the log and its opener (`Log::id`, `LogOpener::id`), and a log laid out in its file's layout block rather than its transfer alignment, so a file opened buffered (or on a file system that refuses direct I/O) holds a log; and the file growing only as its owner admits (`Growth`, `Log::create_with`, `Log::open_with`), a refusal answered `Full` as the bound reached, never a fence; since `bf12297`, a frame's confirmation as one durable write (a FUA write on Linux where the device has FUA, `BlockFile::write_durable_at`), a slot the file grows by written whole with zeros first where that takes the journal's flush off every later frame (`BlockFile::fills_new_space`; Linux direct files), and `LogOpener::stats`; hyper-raft `docs/benchmarks.md`, "hyper-log: the flushes an append costs"; since `51dd939`, an open whose keys do not match the log's named `SealedWithoutKeys` or `UnsealedWithKeys`, not `Foreign`; hyper-log `ORIGIN.md`) | `hyper-durable` (`GroupStore`), `crates/range` (the log a member's group is claimed on), `crates/mantle` (`mantle bench log`) |
+| `hyper-block` | `SNAPSHOT` (`5d68252`: mantle-disk's block, buf, commit, file, issuer, thread budget, scratch and simulated device at `147f035`, each with one owner, L-2; since `63cb65d`, a record kept whole, the block size a file's system reports, and a transfer of no bytes taken as none; since `df54729`, group commit learning exactly from batches of up to 2^29 − 1 submitters; since `857a2ae`, a submitter keeping several batches out, each numbered and its answer taken when the submitter needs it (`Issuer::attach_deep`, `Attached::submit`, `answer`, `try_answer`), and an issuer's inbox sized for every batch its submitters may have out (`Issuer::start_for`); since `b483a13`, batches of reads as well as writes, answered with their buffers filled (`Attached::submit_reads`), and a file's layout block, its transfer alignment when direct and the device's write unit when buffered (`BlockFile::layout_block`; hyper-raft `docs/benchmarks.md`, "hyper-block: a batch of reads through the issuer": a batch halves four device reads and costs sixteen times four cached ones); since `7755f43` and `5d68252`, a direct file's reads, writes and flush issued and reaped by the submitter itself through Linux's native AIO, with no thread between it and the device (`aio::AioFile`; refused, typed, over a buffered file and on every other OS; hyper-raft `docs/research/issuer-completions.md` §8 and `docs/benchmarks.md`, "hyper-block: a batch of reads through native AIO": four direct reads 3.0 times faster than one after another, four durable page writes 1.4 times faster than in place, no allocation); hyper-block `ORIGIN.md`) | `hyper-log`, `hyper-durable`, `crates/chunk`, `crates/disk` (measurement and calibration through its files, buffers and thread budget), `crates/range`, `crates/mantle` |
+| `hyper-measure` | `SNAPSHOT` (`5d68252`, unchanged since `857a2ae`: Windows through windows-sys since `63cb65d`; since `df5f8ad`, a process's account from its operating system, `usage`, and the costs of many pieces of work, `cost`; since `df54729`, the account's user time held to its unit) | `hyper-log`'s tests and benchmarks; `crates/range`'s tests (a waker over a channel) |
+| `hyper-durable` | `SNAPSHOT` (`5d68252`, unchanged since `f311ab6`: the durable shell, D-1, at hyper-raft `173437b`'s contract: `Replica` over a `LogStore` and a `StateMachine`, the commit fence on R-6, readies to the store's depth, one page applied a drive; since `df5f8ad`, priority and windows set through the replica, a write made again never starting the log past the state machine, compaction due by the thesis's rule (which asks a machine its image's bytes, `StateMachine::image_bytes`) and a leader waiting for a member behind; since `df54729`, what a member does with an append ahead of a hole set by the owner (`Replica::set_ahead`), and the fast track's proposals held beside the log until a write releases them (`LogStore::released`) with a displaced one given back to its proposer (`Output::displaced`); since `756bfaa`, the owner's quorum patience passed to its core (`Replica::set_quorum_patience`); since `857a2ae`, `GroupStore::claim` and `remove` taking a `Log` or a `LogOpener` (`LogGroups`), and a commit that moved alone written by no write of its own, riding the next write that carries something or the fence needs (hyper-raft `docs/durable.md` §4.1); hyper-raft `docs/durable.md`, `crates/hyper-durable/ORIGIN.md`) | `crates/range` (a range's replica since D-1) |
+| `hyper-liveness` | `SNAPSHOT` (`5d68252`, unchanged since `df54729`: the node-pair liveness stream, L-3; since `df5f8ad`, a heartbeat sent no earlier than the one it echoes came; hyper-raft `docs/timing.md` §2.8) | `hyper-durable` (its owner's stream for groups that elect by suspicion); no mantle crate, as a range elects on ticks until the node carries the stream, which takes what `docs/design/node.md` §2.4 lists |
+| `hyper-seal` | `SNAPSHOT` (`5d68252`, unchanged since `f311ab6`, first taken at `857a2ae`; since `51dd939`, a whole file sealed by STREAM through a `BlockFile` (`sealed_file::{SealedWriter, SealedReader}`, hyper-raft `docs/seal.md` §4.1), behind its `files` feature, the only one that links `hyper-block`, which mantle does not enable yet: sealing at rest, a hierarchy of random keys wrapped with AES-256-KW, files sealed by STREAM, the shared log sealed record by record under a key per writer session, keys to another machine by ML-KEM-1024 and names keyed per tenant, on aws-lc-rs; hyper-raft `docs/seal.md`) | `hyper-log` (a sealed log's records, session keys and framing MACs); no mantle crate seals yet |
+| `hyper-rt` | `SNAPSHOT` (`3794819`, first taken at `b483a13`; since `3794819` (hyper-raft #10), a blocking job gives its share back before its result is delivered, so a task that sees the job end can submit again under the same share and is never refused for a slot the pool is still about to free (hyper-raft `docs/runtime.md`); before that a wake that marks its word's summary itself when it reads it clear, so no wake waits on another waker's progress; with a shard that polls its driver only while a readiness wait is registered and spins with a driver poll once a quantum, so a thread's round trip to a task costs 0.54 µs at the median, not 12.3 (hyper-raft `docs/benchmarks.md`, "hyper-rt: a thread's round trip to a task"): the shared thread-per-core runtime, slates' runtime at slates `6b9ce5c` designed onward for the three consumers: shards with arena tasks and `Copy` wakers, a hierarchical timing wheel, a readiness driver per OS behind one seam (kqueue, epoll, IOCP with AFD), sockets, signals, stdio, synchronization without shared ownership, the machine's calibration, and a deterministic simulation driver; its loom dependency, which builds only under `--cfg loom` for hyper-raft's own interleaving runs, is left out, and the workspace's declaration of that cfg kept as the manifest's one lint; hyper-raft `docs/runtime.md`, `crates/hyper-rt/ORIGIN.md`) | `crates/engine` (a range replica's engine on one shard, step E2, docs/design/engine-structure.md §2) |
+
+mantle's `crates/log` and the parts of `crates/disk` that hyper-block took were deleted when
+mantle moved onto these (research/32 §5.3); identification, calibration, measurement and the
+benchmark rounds stay in `crates/disk`.

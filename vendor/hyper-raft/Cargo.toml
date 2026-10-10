@@ -1,0 +1,42 @@
+[package]
+name = "hyper-raft"
+description = "A Raft core with no clock, disk or network, shared by slates, focal and mantle."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+repository = "https://github.com/hyper-light/hyper-raft"
+publish = false
+
+[features]
+# The planted defects of `src/mutant.rs`, for tests that show the oracles catch them
+# (docs/sim.md §4.6). No consumer enables it.
+mutants = []
+# raft-rs's precedence of length in elections (`Config::raft_rs_precedence`), for the differential
+# tests that compare this core with raft-rs under one rule (docs/raft.md §3.3). It can leave a group
+# that could elect without a leader; no consumer enables it.
+raft-rs-precedence = []
+
+[dependencies]
+crc32c = "0.6"
+# The election law's draw (`election_delay`); a crate of this repository with no dependencies.
+hyper-timing = { path = "../hyper-timing" }
+thiserror = "2.0"
+
+[dev-dependencies]
+# The oracles, the liveness rule and the linearizability checkers its schedules are judged by
+# (docs/sim.md §4, `tests/check.rs`), and this crate with its planted defects for the runs that show
+# the oracles catch them (`src/mutant.rs`).
+# Not vendored here; hyper-raft's CI runs the tests that take it.
+# hyper-check = { path = "../hyper-check" }
+hyper-raft = { path = ".", features = ["mutants", "raft-rs-precedence"] }
+# The core focal ran on before this one: the differential tests run both on
+# one schedule and compare what they say.
+raft = { version = "0.7.0", git = "https://github.com/tikv/raft-rs", rev = "8e4cef172421bf77b2ae1c26628a9531b0be41f0", default-features = false, features = ["prost-codec"] }
+raft-proto = { version = "0.7.0", git = "https://github.com/tikv/raft-rs", rev = "8e4cef172421bf77b2ae1c26628a9531b0be41f0", default-features = false, features = ["prost-codec"] }
+slog = "2.7"
+# The counting allocator: what a proposal allocates at any backlog (`tests/backlog.rs`).
+hyper-measure = { path = "../hyper-measure" }
+
+# A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside any consumer workspace.
+[workspace]

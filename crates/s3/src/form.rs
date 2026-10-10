@@ -264,7 +264,7 @@ impl Decoder {
         let mut delimiter = b"\r\n--".to_vec();
         delimiter.extend_from_slice(boundary.as_bytes());
         let finder = Finder::new(&delimiter).into_owned();
-        let mut buf = Vec::with_capacity(LIMIT);
+        let mut buf = Vec::new();
         buf.extend_from_slice(CRLF);
         Ok(Self {
             delimiter,
@@ -307,9 +307,7 @@ impl Decoder {
         let buf = std::mem::take(&mut fields.buf);
         self.form.expand()?;
         self.phase = Phase::File(File {
-            state: State::Content {
-                held: Vec::with_capacity(self.delimiter.len()),
-            },
+            state: State::Content { held: Vec::new() },
             length: 0,
         });
         self.file(buf.get(start..).unwrap_or_default(), out)?;

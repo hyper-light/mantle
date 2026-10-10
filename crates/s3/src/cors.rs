@@ -143,7 +143,7 @@ pub fn check(given: Vec<Given>) -> Result<Vec<Rule>, CorsError> {
         return Err(CorsError::TooManyRules);
     }
     let mut ids = BTreeSet::new();
-    let mut rules = Vec::with_capacity(given.len());
+    let mut rules = Vec::new();
     for rule in given {
         if let Some(id) = &rule.id {
             if id.encode_utf16().count() > MAX_ID {

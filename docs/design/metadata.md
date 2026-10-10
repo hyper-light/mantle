@@ -1,9 +1,11 @@
 # Metadata: how mantle records buckets, objects and where their bytes live
 
-Status: design, 2026-09-28. Sources: docs/research/01 (Tectonic, cited as "01 §x" and
+Status: design, 2026-09-28; operation rows, resumable uploads, storage-class rows and validated
+reads 2026-09-30. Sources: docs/research/01 (Tectonic, cited as "01 §x" and
 [TEC]), 05 (S3 semantics), 06 (consensus and range-partitioned metadata), 07 (focal's
 consensus stack), 09 (cells), 12 (RocksDB and ZippyDB), 18 (Object Lock), 22 (garbage
-collection); docs/design/architecture.md.
+collection), 27 (upload scheduling), 28 (storage classes), 30 (resilient transfer), 31
+(caching); docs/design/architecture.md, gateway.md, storage-classes.md.
 
 The metadata service records what exists: buckets, the versions of every object, the
 multipart uploads in progress, which blocks hold an object's bytes, and which chunk stores
@@ -29,13 +31,24 @@ fits the Name layer to S3.
 | Name | (bucket, key, VERSION, order) | a version: object or delete marker | (bucket, key) |
 | Name | (bucket, key, UPLOAD, upload) | a multipart upload in progress | (bucket, key) |
 | Name | (bucket, key, UPLOAD, upload, part) | an uploaded part | (bucket, key) |
+| Name | (MARKS, bucket, key, file) | a file the range took, until the sweep settles it | (bucket, key) |
+| Name | (OPERATIONS, bucket, key, principal, identity) | what a client's operation made and the answer its first delivery got, until its horizon passes | (bucket, key) |
 | Name | (RELEASED, time, file), in each range | a file nothing references any more, for the collector | the range's |
+| Name | (LINEAGE), in each range | the range's descriptor, and the child of its last split | the range's |
 | File | (file, HEADER) | length, extent count | file |
 | File | (file, EXTENT, end) | a block, or another file, and its length | file |
 | Block | (block, HEADER) | length, code, chunk size, checksum | block |
 | Block | (block, CHUNK, index) | the chunk store volume and chunk key holding chunk `index` | block |
 | Block | (ON, volume, block) | reverse entry: which of the block's chunks `volume` holds | block |
 
+- **A version carries its storage class,** and with it the fields S3's API reports about it:
+  for INTELLIGENT_TIERING its access tier and the last day it was accessed, and for an
+  archived version its restore record, whether a restore is in progress, its request date, its
+  completion and its copy's expiry (storage-classes.md §2, §7). The class is the logical one
+  the API answers by; where its blocks are is the File and Block layers' and may lag it during a
+  move (storage-classes.md §1). An upload carries the class its creation named, and a native
+  resumable upload also its source's identity, its resume horizon, its checksum algorithms and
+  the running state of each block hash at its last run (gateway.md §2.1).
 - **Everything for one object key is contiguous.** Its null-version pointer, its versions,
   its uploads and their parts sort together under `(bucket, key)`, so a Name range splits
   only between object keys and every operation on one key stays in one range, as
@@ -138,20 +151,36 @@ layers removes them, as Tectonic's does [01 §1.6].
     write's file. A completed upload's listed parts are not released: they are the object's
     extents. So no file is forgotten by the step that stops referencing it, and none is
     released while something still names it. A property test runs random histories of puts,
-    deletes, part uploads, completions and aborts under every versioning state and checks
-    after each step that every file handed to the range is held in exactly one place;
-    removing any one release, or releasing a listed part, fails it.
+    empty ones among them, deletes, part uploads, completions and aborts under every
+    versioning state, with copies of earlier writes delivered again as time passes their
+    deadlines and the collector reclaiming any queued row at any time, and checks after each
+    step that every file handed to the range is held in exactly one place, reclaimed files
+    counting as released, and that no copy of a write that made a version makes another;
+    removing any one release, releasing a listed part, removing a mark before its deadline,
+    or leaving a write with no file unmarked fails it.
     - *Reclaiming.* The collector takes the queue oldest first, once a file has been released
     longer than the grace period, and removes what it holds bottom up: each block's chunks
-    from their volumes, then the block's rows, then an adopted part's file, then the file,
-    then any mark a stopped sweep left on it, at the Name range that holds its key by then,
-    and last the queue row. A reclaimer (`crates/meta/src/reclaim.rs`) names each read and
+    from their volumes, then the block's rows; each part file it names given back to the Name
+    range, which releases the part for reclaiming in its turn only if this file adopted it
+    (below); then the file, then its mark, at the Name range that holds its key by then, once
+    that range's time has passed the deadline of the write that carried the file ("No mark
+    goes", below), and last the queue row. A row naming no file, a write with no file, has
+    only its mark to remove. A reclaimer (`crates/meta/src/reclaim.rs`) names each read and
     command and moves on with its answer, doing no I/O, as the coordinator does. Every step
-    can be repeated, since a chunk or row already gone stays gone and a removed file reads as
-    one with no extents, so a collector that stops is resumed from the queue. A property test
-    stops reclaimers after random steps over random files of parts and blocks, resumes them
-    from the queue, and checks that every row, block and chunk of the file goes and nothing
-    else does; dropping the queue row first fails it.
+    can be repeated, since a chunk or row already gone stays gone, a part given back twice is
+    released once, and a removed file reads as one with no extents, so a collector that stops
+    is resumed from the queue. A property test stops reclaimers after random steps over
+    uploads of random parts and blocks, resumes them from the queue, and checks that every
+    row, block and chunk of the object and its parts goes and nothing else does; dropping the
+    queue row first fails it.
+    - *Adoption.* A composite file names part files it does not own until its completion
+      commits: a completion refused, by a precondition or a stale or invalid part, leaves the
+      parts with the upload, and a completion retried after it committed writes a composite
+      again, whose parts the first holds. So the Name range records adoption: a committed
+      completion writes each listed part's mark naming the composite, and only that
+      composite's reclaimer can give the part back. A composite that lost its completion is
+      reclaimed to its own rows alone. Reclaiming it recursively took apart parts an upload or
+      a committed object still held (audit B02).
   - *When.* The grace period is a recovery-point policy, not a safety bound: three days by
     default, as GFS keeps a deleted file (chunk-store §8; 22 §1.1, §10.4). A released file
     comes due a grace after its release, in the range's clock, and the collector waits on the
@@ -173,7 +202,47 @@ layers removes them, as Tectonic's does [01 §1.6].
       the deadline, and a Name range whose time has passed it refuses the write and releases
       the file, as Spanner fails reads older than its version window (22 §6).
     - *The mark.* A Name range that takes a file within its deadline, referencing it or
-      releasing it for a refused write, marks it. The mark is keyed by the object key the
+      releasing it for a refused write, marks it with how it took it, the version a PUT or
+      completion made (its order), a part, a part adopted by a composite, or refused, and
+      with the write's deadline. A write that carries a file already marked is a copy of one
+      the range applied, delivered again outside the session that would have filtered it
+      (replica.md §1): the range answers it as the first was answered and neither takes nor
+      releases the file, so no file gets a second referrer and no refusal releases a file
+      something holds. A copy comes past its deadline as often as not, so the mark is read
+      before the deadline is.
+    - *Writes with no file.* An empty object's PUT, and a completion of parts all empty,
+      carry no file, and a copy of one would make a second version the client never asked
+      for. Every PUT and completion carries an ID the gateway drew for the request, as it
+      draws a file's (gateway.md §2): a write with a file is named by the file, and one with
+      none by this ID, which the range marks exactly as it marks a file when the write makes
+      a version, as a Raft session answers a duplicate from the record of its first
+      execution rather than execute it again (06 §A1.8). Such a write has no File range to
+      give it a deadline, so the gateway sets one
+      a handover from its own time when it commits, the same bound a file's is held to, and
+      the range refuses it past that deadline as it refuses a late file. A write with no file
+      that the range refuses changed nothing and releases nothing, so it is not marked and a
+      copy of it is judged afresh. The version's mark has no file whose release would bring
+      the collector, so the range queues the write's ID in its queue of released files, as a
+      row naming no file, when it makes the version; the collector removes the mark and the
+      row, and nothing else.
+    - *No mark goes while a write carrying its file could still be applied.* A copy that
+      finds no mark is applied as a new write if the range's time has not passed its
+      deadline, so a mark removed before then would let a copy of a write whose file was
+      released and reclaimed take the file again, a version naming a file taken apart. The
+      grace period does not prevent this: it is a recovery-point policy chosen apart from
+      the handover time, and a file can be released a moment after it was taken, its write
+      refused or its version deleted. So the range removes a mark only once its time has
+      passed the deadline the mark records, judged by the time agreed through the log, as a
+      Raft session's expiry must be (06 §A1.8), and records that time as a write's, as the
+      sweep's check does, so a copy from a leader whose clock runs behind reads a time past
+      the deadline too. A reclaimer that asks sooner is answered with the deadline, keeps
+      the queue row, and asks again after it (`crates/meta/src/reclaim.rs`). A part carries
+      its write's deadline through adoption and give-back, and its row records it, so the
+      completion adopting it takes the deadline from the row it reads anyway rather than read
+      each part's mark, 10% of a completion of 10,000 parts
+      ([measurements/2026-09-30-review-fixes.md](../measurements/2026-09-30-review-fixes.md)); the sweep's mark, written only for
+      a file past its deadline, has no value and reads as passed.
+    - *Keyed by the object key.* The mark is keyed by the object key the
       file was made for, in a space of its own that listings never read, so a split cuts a
       range's marks at the same key as its rows and a file's mark stays with the rows that
       may reference it. A mark keyed by the file alone would stay behind in the old range, and
@@ -188,16 +257,30 @@ layers removes them, as Tectonic's does [01 §1.6].
       contend for one Paxos slot (22 §7.4). Judged at the entry's proposed time without
       recording it, a handover from a lagging leader could take a file the check had just
       released.
-      The sweep then settles the files in the File range and removes their marks, in that
-      order: a mark removed first would read, to a sweep resumed after a stop, as a file never
-      handed over. Like the reclaimer, the sweep names each read and command and does no I/O,
-      and every step can be repeated.
-    - *What it costs.* A file handed over past its deadline is released unmarked, since it may
-      come after the sweep settled the file, and a mark would stay behind; a file whose mark
-      went with its release before the sweep came by is released again. Either way the file is
-      in the queue twice, and the reclaimer's second pass finds it gone. A mark left by a sweep
-      that stopped between settling a file and unmarking it goes when the file is released or
-      reclaimed, so every mark is on a file a version or part references or on one released.
+      The sweep then settles the files in the File range and leaves their marks. A mark is
+      the range's record that it holds the file, and goes only with the file, when the
+      collector reclaims it: removed on settling, it would read, to another sweep that read
+      the same file before and asks after, as a file never handed over, and that sweep would
+      release a file a version references. Two sweeps overlap across a change of leader or a
+      sweep that stops while its request is in flight, so the order of steps alone cannot
+      prevent this (audit B01). Like the reclaimer, the sweep names each read and command and
+      does no I/O, and every step can be repeated.
+    - *What it costs.* A mark is a row of a few bytes, the deadline and the version, part or
+      adopting composite, or with no value for a file the sweep released, for every file the
+      range holds, every file it released and has not yet reclaimed, and every version made
+      by a write with no file until the collector comes by for it. A release leaves the
+      mark: the mark once went with the release, and a copy of the write that came after
+      found the file unmarked and took it again, a released file named by a new version. A
+      file handed over past its deadline, and not marked, is released unmarked, since it may
+      come after the sweep settled the file; the file is then in the queue twice, and the
+      reclaimer's second pass finds it gone. So every mark is on a file a version, a part or
+      a held composite names, on one released and waiting for the collector, or on a write
+      with no file whose ID waits in the queue, and each goes with its row in the queue,
+      once past its deadline. A copy that comes after its mark went is past its deadline and
+      refused, and the file it names, already reclaimed, is released a second time into a
+      queue where the reclaimer finds it gone; the gateway makes the request again as a new
+      attempt. The deadline the collector waits for is the handover time, which a file's rows
+      in the File range wait for already.
     - *The deadline's length* is the gateway's measured handover time: the per-step deadline
       times its retry budget, plus the clock offset between ranges, as Ceph's 120 s and HDFS's
       60 s bound the same window (22 §10.2). It bounds how long a leftover file waits, not
@@ -207,30 +290,88 @@ layers removes them, as Tectonic's does [01 §1.6].
       writing its file leaves a block no file names. A block is made for one file, which alone
       may name it, and records that file, its time and its deadline, and waits in the Block
       range's queue of unsettled blocks. A file's write names the soonest deadline of its
-      blocks, and a File range whose time has passed it refuses the write. The block sweep
-      (`BlockSweep`) asks the File range of each block's file, one file at a time, which
-      answers from the file itself: a file is written once, whole, so one written names what
-      it ever will, and one not written by a block's deadline never will. Nothing is marked.
-      A block named is settled; one never to be named is taken apart there and then, its
-      chunks first and its rows and place in the queue last, with no grace period, since no
-      reference ever reached it and there is no deletion by mistake to undo.
+      blocks, and a File range whose time has passed it refuses the write. A PUT's first block
+      is written while the rest of its body streams in, and its file only once the body ends,
+      so no fixed deadline serves a body that arrives slowly: the gateway renews each block
+      it wrote, a handover past the Block range's time, while its body streams, as an HDFS
+      writer renews its lease (22 §3.6). The block sweep (`BlockSweep`) asks the File range of
+      each block's file, one file at a time, which answers from the file itself: a file is
+      written once, whole, so one written names what it ever will, and one not written by a
+      block's deadline never will. A file keeps a row for each block it names, written with
+      it and removed with it, and answering reads that row for each block asked. Answering by
+      a scan of the file's extents cost a page of blocks from distinct files one scan each:
+      60.8 ms for one block of each of 512 files of 646 blocks, the most a PUT's file names
+      (audit B08), against 393 µs by the rows, and one such file over pages of 64, 983 µs
+      against 51 µs. The rows double a file write's, 1.70 ms to 2.95 ms for 10,000 extents,
+      paid once where checks come for every page of due blocks (audit P05;
+      [measurements](../measurements/2026-09-30-review-fixes.md)).
+      Nothing is marked. A block named is settled. One never to
+      be named is released in the Block range only if its deadline is still the one the File
+      range judged, and a released block renews no more, so a renewal and a release are
+      ordered by the Block range's log: a renewal first keeps the block, and after a release
+      the writer's file names a deadline the File range has passed and is refused. A
+      released block is taken apart there and then, its chunks first and its rows and place
+      in the queue last, with no grace period, since no reference ever reached it and there
+      is no deletion by mistake to undo.
     - *Checked.* `crates/meta/tests/orphan_sweep.rs` runs 2,000 generated schedules across a
-      Block range, a File range and two Name ranges. Gateways write a chunk and its block,
-      then the file, then hand it over, stopping at any stage or coming late to the next;
-      deletes release files; both sweeps stop between any two steps; and leaders whose clocks
-      run behind propose entries at earlier times than entries already applied. After every
-      step, no file a version references is released, every file is referenced, released or
-      unsettled, and every block a file names keeps its rows and chunk. Once the faults stop,
-      nothing is left unsettled in either layer, every file is referenced or released and not
-      both, and no block or chunk is left that nothing names. With the Name range's deadline
-      check removed, the File range's, or either check's recorded time, the simulation loses
-      a file or a block's chunk.
+      Block range, a File range and Name ranges that split and merge. Gateways write a chunk
+      and its block, renew it, then write the file, then hand it over, stopping at any stage
+      or coming late to the next; uploaders create uploads, write parts, complete them, have
+      completions refused, retry completions that committed with a composite made again, and
+      abort; deletes release files; two file sweeps run at once, every request of theirs
+      delivered at some later step, and a sweep that stops has its request arrive after it;
+      the block sweep stops between any two steps; a collector reclaims released files and
+      stops part way; and leaders whose clocks run behind propose entries at earlier times
+      than entries already applied. After every step, no file a version, a part or a held
+      composite names is released, every such file keeps its rows, its blocks' rows and their
+      chunks, and every file written is held, released, unsettled, reclaimed or being given
+      back by a composite's reclaimer. Once the faults stop, nothing is left unsettled or
+      released, every file is held or reclaimed and not both, and no block, chunk or stray
+      mark is left. With the Name range's deadline check removed, the File range's, either
+      check's recorded time, the release's deadline check, the refusal to renew a released
+      block, the adoption check, or adoption itself, the simulation loses a file or a block's
+      chunk, or leaks one; `a_delayed_sweep_never_releases_a_file_another_settled` replays
+      audit B01's schedule.
+- **Operations** (research/30 §3.4, D2; gateway.md §2.1). A version, part or completion whose
+  request carries an operation identity is committed in one transaction with an operation row,
+  keyed under its object key by the authenticated principal and the identity, naming what the
+  commit made (the version's order, or the part's number and file) and the answer the first
+  delivery got, its version ID, ETag and checksum. A later write carrying the same identity finds
+  the row, applies nothing, releases its own file as a refused write's is released, and is
+  answered from the row; so one identity has at most one effect, and an attempt that finds its
+  row never replaces what a later write made, which S3 does not promise. A refused first attempt
+  writes no row. The row lives for the horizon its client declared, capped by the server's
+  maximum, and the collector removes it once the range's time, the time agreed through the log
+  as marks are judged, passes its commit plus that horizon; an attempt after that is past the
+  horizon its own client stated and is refused `Expired` natively, and is a new write through
+  the HTTP listener, as in S3. The rows are bounded by the admitted mutation rate times the
+  horizon, which admission controls per principal, and the server's maximum is the bytes the
+  operator gives the operation rows over that rate: a budget, not a picked period. Keyed by the
+  object key, a row moves with the key's rows at a split, as marks do. Its proof is §2's
+  property test extended: every attempt of every identity delivered at any step, across
+  gateways, splits and clocks that run behind, with at most one effect, the same answer, no stale
+  replacement and each file released once; removing the row, its scope or its horizon check
+  fails it.
+- **Resumable native uploads** (research/30 §3.5, D3). A native upload is a multipart upload
+  whose parts, runs, are numbered by the range as the gateway hands them over, each committed
+  with the upload row's new durable offset and hash states in one transaction, so the offset
+  only rises and cannot drift from the runs. A run's commit is a part's: from it the run needs no
+  renewal. Abort, expiry and completion release or adopt each run exactly once by the existing
+  rules (below, "Adoption").
+- **Validated reads** (research/31 §3.6, D3; gateway.md §5). A gateway holding a key's row asks
+  the range, in a read confirmed by ReadIndex like any other, whether the key's first row is
+  still the version it holds; the range answers "unchanged" with no row, or with the current row,
+  a delete marker's or an absence's included. One read round confirms every validation asked
+  before it began, and one asked while a round is out waits for the next (replica.md §3).
 - **Multipart.** CreateMultipartUpload writes the upload row. UploadPart writes the part's
   chunks, blocks and file, then replaces the part row. CompleteMultipartUpload writes the
   object's file of part extents in its File range, then, in the Name range, checks the
   parts against the list sent (numbers ascending, ETags and checksums matching;
-  body.rs), commits the version, and removes the upload and its part rows. A retried
-  complete with the same parts finds the version it made and answers as before (05 §4.4).
+  body.rs), commits the version, removes the upload and its part rows, and marks each listed
+  part as adopted by the object's file (§2, "Adoption"). A retried complete with the same
+  parts finds the version it made and answers as before, releasing the composite it wrote
+  again (05 §4.4); a copy of the completion itself, carrying the composite the version names,
+  is answered from that file's mark and releases nothing (§2, "The mark").
 - **Creating and deleting a bucket** touch the Bucket range and every Name range the
   bucket's keys fall in. Each is a sequence of range transactions, each guarded by what the
   one before it wrote, with the collector finishing what a failure leaves, as Tectonic moves
@@ -281,7 +422,14 @@ layers removes them, as Tectonic's does [01 §1.6].
     itself. It names each read and command and the range it goes to, and moves on with the
     answer. It tells the request that started it what that request learns: created,
     deleted, not empty, or taken over by a later attempt. The simulation drives this
-    coordinator, stepping any attempt between any two of its reads and commands.
+    coordinator, stepping any attempt between any two of its reads and commands. It learns a
+    directory in one pass, keeping each range's newest descriptor and ordering them once, and
+    decides whether they cover the bucket in one walk of them in key order; it keeps no more
+    ranges than the cell holds (architecture §3), refusing a directory past that and reading
+    the directory anew when what it learns would pass it. Each descriptor learned was looked
+    up and the whole list sorted again, and each step of the coverage walk looked at every
+    range: an attempt learning 10,000 ranges took 436–453 ms and takes 590 µs (audit P03;
+    [measurements](../measurements/2026-09-29-metadata-apply.md)).
   - *Attempts left behind.* A gateway that stops leaves its attempt where it was. The Bucket
     range keeps an index of the buckets whose create or delete is in progress, and each
     bucket's row the range time its attempt last showed progress: when it began, and each
@@ -339,19 +487,28 @@ replica; its log is the node's shared write-ahead log.
   one Raft message (12 §6.3–§6.5). Splits, merges and moves between cells are modeled in
   TLA+ before they are built (architecture §6.1, §10).
 - **Splits and merges under a create and a delete.** `docs/models/RangeSplit.tla` models
-  Name ranges splitting and merging while a bucket is created, written and deleted. A split is one command in the
-  parent's log, and the new child takes the parent's gate. Writers route by cached
-  descriptors, and a range answers a stale one with its own descriptor and its children's.
+  Name ranges splitting and merging while a bucket is created, written and deleted. A split
+  is one command in the parent's log, and the new child takes the parent's gate. A merge
+  spans the two ranges' logs: the higher range freezes for a merge into the lower one at the
+  generation its driver read, and the lower range decides the merge once, at that
+  generation, moving its generation on whether it takes the frozen range or refuses; a taken
+  merge ends the frozen range and is then resolved, and one never to be taken thaws it.
+  Drivers stop and are replaced at any point, and their commands arrive late. Writers route
+  by cached descriptors, and a range answers a stale one with its own descriptor, unless it
+  has ended, and those of the child its last split made and of the range it is merging or
+  merged into; one whose descriptors then no longer cover the keys reads the directory.
   Each step of a create or delete attempt names the descriptor generation it read; a range
-  refuses another generation, and the attempt learns the answer and starts its phase again.
-  A merge is one command in the lower range's log: it takes the higher range's span and keys
-  at a generation past both and keeps its own gate, and the higher range ends, answering a
-  stale request with the lower's descriptor. The two gates need not agree: an attempt that
-  held either range's descriptor is refused at the new generation and starts its phase
-  again, so it moves the joined gate from wherever the lower one was. TLC checks
-  72,007,924 distinct states of three keys, two splits, a merge, a create and two delete
-  attempts (`scripts/check-model.sh`). In every one of them:
-  - the live ranges divide the keys between them;
+  refuses another generation, and the attempt learns the answer, keeping each range's
+  newest descriptor only, and starts its phase again. The merged range keeps its own gate:
+  an attempt that held either range's descriptor is refused at the new generation and starts
+  its phase again, so it moves the joined gate from wherever the lower one was. TLC checks
+  every state of four configurations of three keys (`scripts/check-model.sh`): two splits, a
+  create and two delete attempts (1,607,127 states); two splits, a merge, a create and a
+  delete (13,081,532); a split, a merge, a create and two deletes, one taking over from
+  the other (9,457,818); and two splits, two merges and a create (93,864,489). In
+  every one of them:
+  - the ranges that own their spans, every serving range and every frozen one whose merge
+    was not taken, divide the keys between them;
   - no acknowledged write is lost to a delete;
   - an active bucket's every range has its gate open.
 
@@ -359,8 +516,113 @@ replica; its log is the node's shared write-ahead log.
   directory has not yet learned of a split. A delete then closes and reads only the parent's
   half, and deletes the bucket while the child holds a version (eight steps). A create opens
   only the parent's gate and activates the bucket, and the child's gate never opens (five
-  steps). So before ranges split, the coordinator (§2) will carry each range's descriptor
-  and generation, where today it counts ranges.
+  steps). So the coordinator (§2) routes each step by a descriptor and names its
+  generation, and relearns as the model's attempts do. Two more controls justify the merge's
+  rules. A refusal that leaves the lower range's generation where it was, a driver thawing on
+  the answer, lets a late decision take a range that thawed and serves: two ranges own one
+  key (five steps). A range frozen while holding a merge it took can be taken and end, and a
+  driver reads the merge it held as never taken and thaws its frozen range: two ranges own
+  one key (eight steps).
+
+  Checking merges found two rules the attempts must keep. An attempt keeps each range's
+  newest descriptor only: an older one beside it can span keys the range no longer holds,
+  and once the newer one's step is done the attempt counts them as covered, activating a
+  bucket whose child range never opened its gate. And a range that ended answers with where
+  its span went, never with its own descriptor, which an attempt would take for a live
+  range and step forever.
+- **Splits, as built** (`crates/meta/src/name.rs`). A Name range's lineage records its
+  descriptor, an ID, a span and a generation, and the child its last split made. A span runs
+  between two routing keys (`key::route`): the bucket, then the key, each escaped and ended.
+  Every row of an object key, its versions and uploads and its marks alike, is its space's
+  byte, the key's routing key and a suffix whose first byte is below 0xFF, so a span bounds
+  its keys' rows by bytes in every space; a mark carries a byte of its own before the file
+  ID, which may begin with 0xFF and would otherwise read, after a key ending in an escaped
+  zero byte, as part of a later key.
+  - *The split* is one command in the parent's log, naming the generation the splitter read
+    and a routing key inside the span. The parent keeps the keys before it, its queue of
+    released files and its sessions. The child takes the keys from it with their rows and
+    marks, and the gate of every bucket whose keys it can hold: a bucket the cut falls
+    inside keeps its gate on both sides, and one wholly past the cut moves its gate. It
+    takes the gate floor, so an attempt the parent refused stays refused and a resumed
+    cleanup finds the gates it dropped, and the clock, so a time a check recorded carries
+    over: a handover a lagging leader proposes behind the check that released its file is
+    refused by the child as the parent would have refused it. Both take the next
+    generation, and the parent clears what the child took with one range delete a space
+    (§4). `name::child` reads the child's rows from the parent before the parent applies the
+    split, so the replicas can make the child on the parent's replicas from the parent's
+    rows as they stood.
+  - *Fences.* A command for an object key outside the range's span, a write or the sweep's
+    check or unmark of a file made for such a key, is not the range's, and neither is a
+    coordinator's step or read routed by another generation. The range answers with its
+    lineage and takes nothing, not even a file the command carries, which the sender hands
+    on to the range that holds the key. A range keeps one child, so its lineage is bounded;
+    a sender whose descriptors no longer cover the keys it needs reads the directory.
+  - *Checked.* `crates/meta/tests/bucket_lifecycle.rs` splits ranges at seven cuts,
+    among them the bucket's first routing key and the next bucket's, while its 2,000
+    schedules create and delete the bucket; writers route by descriptors they learn of
+    late, and the directory learns of splits when the schedule says. After every step it
+    checks the model's properties, that each range holds rows, marks and gates only of its
+    own keys and buckets, and that a forgotten bucket leaves no gate.
+    `crates/meta/tests/orphan_sweep.rs` splits ranges while gateways hand files over and the
+    sweep checks them by late descriptors. Each rule removed on purpose fails a
+    simulation: without the generation check, the delete of the model's eight-step schedule
+    loses its version and a create activates a bucket whose child never opened its gate;
+    without the span check, writes land outside the span; a child without its gates
+    leaves an active bucket's range closed; marks left behind, or checks answered outside
+    the span, release files that versions reference; a child without the floor leaves a
+    resumed cleanup unable to finish. A child without the clock passed 2,000 schedules,
+    which never reached the one interleaving that needs it, so a test of its own spells
+    that interleaving out.
+- **Merges, as built** (`crates/meta/src/name.rs`, `crates/meta/src/merge.rs`). A merge
+  joins a range to the range just below it across the two ranges' logs, in the steps the
+  model takes.
+  - *Freeze.* A driver reads both descriptors and freezes the higher range for a merge into
+    the lower one at the generation it read. The frozen range takes nothing but the merge's
+    own steps, and its generation rises, so a step routed by what it was is refused after it
+    thaws. A range holding a merge not yet resolved is not frozen: it could otherwise end
+    with the merge unresolved, and a driver would read the merge as never taken.
+  - *Decision.* Once every replica of the frozen range has applied the freeze, the lower
+    range decides, in its own log and only at the generation the merge names. It takes the
+    frozen range if it holds no merge not yet resolved, the frozen range begins where it
+    ends, and the frozen range holds no more rows than the merge may take, which bounds the
+    entry; otherwise it refuses. Either way its generation moves on, so the merge is decided
+    once, and a command for it that comes later, however late, is routed by a generation the
+    range no longer has. A driver abandons a merge not yet decided the same way, by moving
+    the lower range's generation on. The generation is the record of the decision: no merge
+    counter or watermark is kept.
+  - *What moves.* Each replica of the lower range reads its own copy of the frozen range,
+    which every replica holds frozen alike, and takes its rows and marks, its queue of
+    released files, and the gates of the buckets the lower range holds none of, keeping its
+    own gate of a bucket both hold keys of; the higher of the two floors and the later of the
+    two clocks, so a time a check recorded carries over as in a split; and none of its
+    sessions. A replica whose copy is not frozen for the merge stops rather than take other
+    rows than its peers.
+  - *Ending.* A taken merge ends the frozen range, which then answers every request with the
+    lower range as the merge left it and never with its own descriptor, and the lower range
+    lets go of the merge; a refused one thaws the frozen range a generation on. A driver
+    thaws only once the lower range shows the merge will never be taken: its generation past
+    the merge's and the merge not the one it holds, or the range ended. Once the lower range
+    has let go of a taken merge, a driver still judging it reads it as never taken, but the
+    frozen range has ended by then and its thaw is refused. A lower range read while frozen
+    for a merge of its own decides nothing until that merge ends it or thaws it a generation
+    on, and the merge waiting on it is then never taken. The driver asks whether the lower
+    range took the merge before whether it ended, so it judges an ended range right from its
+    lineage even without the rule against freezing a range that holds a merge; the rule
+    keeps the judgment from resting on that lineage staying readable.
+  - *Routing through a merge.* Until the merge is decided nothing serves the frozen span,
+    and writes to it wait, as architecture §6 accepts for a merge. Between the lower range
+    taking the merge and the frozen range ending, the frozen range names the lower range as
+    the driver read it; a sender asks that range next, which holds the span once the merge
+    is taken. A merge that takes back the lower range's child forgets the child, which no
+    longer holds any of its span.
+  - *Checked.* Both simulations merge ranges while buckets are created and deleted and files
+    are handed over and swept, with drivers that stop anywhere, resume from either range,
+    give up, and whose last command arrives late. Each rule removed on purpose fails one of
+    them or a test: marks or the queue left behind release files versions reference or lose
+    track of one; a refusal that leaves the generation where it was, with the replica's own
+    check of the frozen copy removed, lets two ranges own one key, and with the check the
+    replica stops first. A merge that keeps the lower range's clock passed the simulations,
+    so a test spells out the interleaving that needs the later clock.
 - **Transport:** QUIC for snapshots and other bulk transfers, and a separate UDP datagram
   plane for Raft's messages, including Fast Raft's, as the hecate specification lays out
   (07 §4.7). A fast-track proposal carries its entry, so an entry travels as datagrams only
@@ -408,6 +670,11 @@ cover the production engine, which the simulator cannot.
   once the gateway runs.
 - The bound on a cached bucket row's staleness, and how a versioning change reaches
   gateways within it.
+- Open uploads held by one principal: their rows are bounded per upload (10,000 parts), and their
+  bytes are reported per bucket and principal and removed by `AbortIncompleteMultipartUpload`
+  (gateway.md §2.1); S3 states no cap on uploads in progress (research/27 §11 item 7), so the
+  bound is the tenant's storage contract, which open uploads' bytes count against, once
+  contracts are stored.
 - Where a bucket's lifecycle and tag configurations live. A lifecycle configuration at its
   largest, 1,000 rules with the longest IDs, prefixes and tags, is about 13 MB unescaped
   (docs/design/s3-protocol.md §7). That is too large for the bucket's row, which every

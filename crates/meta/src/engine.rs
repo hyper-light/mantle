@@ -1,6 +1,6 @@
 //! The state engine a range keeps its rows in (docs/design/metadata.md §4): a batch applied
-//! atomically with the index of the log entry it applies, point reads, ordered scans, and
-//! the index a crash would return to. The Raft log is the only write-ahead log, so the log
+//! atomically with the index of the log entry it applies, point reads, ordered scans, key
+//! ranges removed whole, and the index a crash would return to. The Raft log is the only write-ahead log, so the log
 //! is truncated only below `durable()` (06 §C.b.2).
 
 use std::collections::BTreeMap;
@@ -14,6 +14,10 @@ pub type Row = (Vec<u8>, Vec<u8>);
 pub enum Write {
     Put(Vec<u8>, Vec<u8>),
     Delete(Vec<u8>),
+    /// Removes every row in `[from, to)`, as one change whatever it holds: what a split
+    /// leaves behind of the rows its child took, as RocksDB's `DeleteRange` writes one range
+    /// tombstone (docs/design/metadata.md §3).
+    Clear(Vec<u8>, Vec<u8>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -24,6 +28,9 @@ pub enum EngineError {
     /// A write or flush failed; nothing more is applied until the range recovers.
     #[error("the engine is fenced after a failed write")]
     Fenced,
+    /// No memory for a batch: nothing was applied.
+    #[error("no memory for a batch")]
+    Memory,
 }
 
 /// Rows as a state machine reads and writes them.
@@ -106,6 +113,13 @@ impl Rows for Model {
                 }
                 Write::Delete(k) => {
                     self.rows.remove(k);
+                }
+                Write::Clear(from, to) => {
+                    if from < to {
+                        let mut tail = self.rows.split_off(from.as_slice());
+                        let mut kept = tail.split_off(to.as_slice());
+                        self.rows.append(&mut kept);
+                    }
                 }
             }
         }

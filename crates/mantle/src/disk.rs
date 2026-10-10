@@ -4,9 +4,9 @@ use std::fmt;
 use std::io::Write;
 use std::path::Path;
 
-use mantle_disk::buf::Alignment;
+use hyper_block::buf::Alignment;
+use hyper_block::file::Caching;
 use mantle_disk::calibrate::{self, Calibration, Plan};
-use mantle_disk::file::Caching;
 use mantle_disk::identity::{FileSystemKind, Identity, Interconnect, Medium, WriteCache, Zoned};
 
 use crate::display;
@@ -14,7 +14,7 @@ use crate::display;
 #[derive(Debug)]
 pub enum Error {
     Output(std::io::Error),
-    Disk(mantle_disk::DiskError),
+    Disk(hyper_block::DiskError),
 }
 
 impl fmt::Display for Error {
@@ -38,12 +38,8 @@ pub fn probe(out: &mut impl Write, path: &Path, measure: bool, verbose: bool) ->
     field(out, "disk", &disk(&id))?;
     field(out, "file system", &file_system(&id))?;
     field(out, "write cache", write_cache(&id))?;
-    if matches!(id.zoned, Zoned::HostAware | Zoned::HostManaged) {
-        field(
-            out,
-            "zones",
-            "zoned drive; mantle writes each zone sequentially",
-        )?;
+    if let Some(zones) = zones(id.zoned, &id.file_system.kind) {
+        field(out, "zones", zones)?;
     }
     if verbose && !id.notes.is_empty() {
         writeln!(out, "  not reported by the OS:")?;
@@ -55,6 +51,26 @@ pub fn probe(out: &mut impl Write, path: &Path, measure: bool, verbose: bool) ->
         measured(out, path, &id)?;
     }
     Ok(())
+}
+
+/// What a zoned device means for mantle, which has no zone backend (audit B10): a
+/// host-managed device refuses writes out of each zone's order, so only a file system that
+/// writes it in that order can put mantle's files on it.
+fn zones(zoned: Zoned, file_system: &FileSystemKind) -> Option<&'static str> {
+    match (zoned, file_system) {
+        (Zoned::HostManaged, FileSystemKind::Device) => Some(
+            "host-managed zoned: takes writes only in each zone's order, which mantle does not \
+             keep, so it cannot hold a volume",
+        ),
+        (Zoned::HostManaged, _) => {
+            Some("host-managed zoned, under a file system that writes it in each zone's order")
+        }
+        (Zoned::HostAware, _) => Some(
+            "host-aware zoned: takes writes anywhere, but writes out of a zone's order cost \
+             it extra work, and mantle does not order its writes by zone",
+        ),
+        _ => None,
+    }
 }
 
 fn field(out: &mut impl Write, name: &str, value: &str) -> std::io::Result<()> {
@@ -112,6 +128,8 @@ fn file_system(id: &Identity) -> String {
         FileSystemKind::Smb => "SMB".to_owned(),
         FileSystemKind::Fuse => "FUSE".to_owned(),
         FileSystemKind::Ceph => "CephFS".to_owned(),
+        FileSystemKind::Zonefs => "zonefs (each file a zone: mantle cannot write one)".to_owned(),
+        FileSystemKind::Device => "none: a device node, written directly".to_owned(),
         FileSystemKind::Other(s) => s.clone(),
         FileSystemKind::Unknown => "not reported".to_owned(),
     };
@@ -140,7 +158,7 @@ fn measured(out: &mut impl Write, path: &Path, id: &Identity) -> Result<(), Erro
             Alignment::new(4096).unwrap_or(Alignment::BYTE),
             Alignment::max,
         );
-    let plan = Plan::standard(align);
+    let plan = Plan::standard(align, id.queue_depth);
     writeln!(
         out,
         "measuring with a scratch file of up to {} (removed afterwards)",
@@ -155,18 +173,33 @@ fn measured(out: &mut impl Write, path: &Path, id: &Identity) -> Result<(), Erro
 
 fn report(out: &mut impl Write, c: &Calibration) -> std::io::Result<()> {
     writeln!(out, "measured in {:.0} s:", c.elapsed.as_secs_f64())?;
-    if let Some(knee) = c.random_read_knee() {
+    if let (Some(knee), Some(saturation)) = (c.random_read_knee(), c.random_read_saturation()) {
         field(
             out,
             "reads",
             &format!(
-                "{} concurrent {} reads keep the device busiest for their wait; mantle uses up to {}",
-                knee.depth,
+                "throughput stops growing at {} concurrent {} reads, which mantle holds at the \
+                 device; {} get the most throughput for their wait",
+                saturation.depth,
                 display::size(c.small),
                 knee.depth
             ),
         )?;
     }
+    field(
+        out,
+        "depth",
+        &format!(
+            "{} measurement workers at the deepest step, within the device's queue and the \
+             process's thread budget; achieved {}",
+            c.workers,
+            c.random_read
+                .iter()
+                .map(|p| format!("{:.1} of {}", p.achieved, p.depth))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )?;
     let best = |points: &[calibrate::Point]| {
         points
             .iter()
@@ -235,6 +268,23 @@ pub(crate) fn first_writes(c: &Calibration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A zoned device is never reported as something mantle writes zone by zone: a
+    /// host-managed device node cannot hold a volume (audit B10).
+    #[test]
+    fn zoned_devices_are_reported_as_mantle_can_use_them() {
+        let managed_node = zones(Zoned::HostManaged, &FileSystemKind::Device).unwrap();
+        assert!(managed_node.contains("cannot hold a volume"));
+        let managed_file = zones(Zoned::HostManaged, &FileSystemKind::Btrfs).unwrap();
+        assert!(managed_file.contains("under a file system"));
+        let aware = zones(Zoned::HostAware, &FileSystemKind::Device).unwrap();
+        assert!(aware.contains("does not order its writes by zone"));
+        for text in [managed_node, managed_file, aware] {
+            assert!(!text.contains("sequentially"), "{text}");
+        }
+        assert_eq!(zones(Zoned::None, &FileSystemKind::Device), None);
+        assert_eq!(zones(Zoned::Unknown, &FileSystemKind::Apfs), None);
+    }
 
     #[test]
     fn probing_a_directory_prints_every_field() {

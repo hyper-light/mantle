@@ -376,6 +376,24 @@ Background facts: flash blocks are "typically hundreds of KBs (e.g., 128 KB), or
   - leader recovery using have / dontHave / haveFaulty, with a majority of dontHave required before discarding;
   - snapshots at the same index on every node, triggered by a snap marker in the log and recoverable by chunk;
   - a recovery timeout after which the leader steps down (AGL+18-F2–F7).
+- **R7.1a What mantle's log does (docs/design/raft-log.md §2, §6).** Persist records are
+  written in each frame's flush, a segment's length apart from every frame, and carry each
+  group's hard state, start and entry positions, so a damaged last frame is restored, not
+  cut. Two differences from CLSTORE, both measured against the replica simulation:
+  - *Confirmation.* An unordered persist record can land while its frame tears, and CLSTORE
+    then treats the entry as corrupt and asks its peers. In mantle's simulation, where
+    members are lost for good, that turned crashes into groups that could elect no one: a
+    member marked for an entry no one acknowledged, beside a lost member. So a record counts
+    as proof of acknowledgement only once confirmed, by the next frame's record or a
+    confirmation the writer flushes when the log falls idle or closes; an unconfirmed one
+    keeps only its term and vote. The window left is a crash within about one flush of an
+    acknowledgement followed by damage to that frame before the restart.
+  - *Hard state in the record.* CLSTORE's identifiers name entries; mantle's also carry the
+    hard state, so a damaged last frame never regresses a term or vote, confirmed or not.
+  - The replica judges vote requests against the last entry it acknowledged while its log
+    lacks it, rather than CLSTORE's per-entry have/dontHave exchange: once a leader's entry
+    of a later term arrives, Raft's log matching puts every committed entry the mark covers
+    in the log.
 - **R7.2 Chunk-store journal: same crash/corruption rule.** Apply the same disentanglement to the storage node's local journal. A bad tail with no persist record is a crash and is discarded. A bad record that has a persist record, or a valid record after it, is corruption and must be repaired. Never let a corrupted record trigger truncation of later records (AGL+18-F3; GAA17-F6). *Inference:* when a chunk-store record cannot be repaired locally, the metadata service decides the outcome: the chunk is re-replicated from peers, or the write is declared failed if it was never acknowledged.
 - **R7.3 Preallocate log segments at a fixed size.** This makes size changes after a crash detectable, and appends overwrite preallocated space instead of changing file metadata (AGL+18-F2; AWK+19-F6).
 - **R7.4 Never apply DeleteRebuild (wipe the data and restart) to a Raft node while it is a voter.** Wiping its data is unsafe (AGL+18-F1). Rebuild a replica only as a learner, or only after the protocol has confirmed commitment.

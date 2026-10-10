@@ -350,7 +350,7 @@ pub fn check(given: Vec<Given>) -> Result<Vec<Rule>, LifecycleError> {
         }
     }
     let v2 = given.first().is_some_and(|rule| rule.filter.is_some());
-    let mut rules = Vec::with_capacity(given.len());
+    let mut rules = Vec::new();
     for rule in &given {
         rules.push(checked(rule, v2)?);
     }
@@ -549,10 +549,7 @@ fn overlapping(given: &[Given]) -> Result<(), LifecycleError> {
             .filter_map(|rule| rule.prefix.as_deref())
             .collect();
         prefixes.sort_unstable();
-        if prefixes
-            .windows(2)
-            .any(|pair| matches!(pair, [a, b] if b.starts_with(a)))
-        {
+        if prefixes.array_windows::<2>().any(|[a, b]| b.starts_with(a)) {
             return Err(LifecycleError::Overlapping(kind));
         }
     }
@@ -669,7 +666,7 @@ fn check_tags(tags: &[Tag]) -> Result<(), LifecycleError> {
     }
     let mut keys: Vec<&str> = tags.iter().map(|tag| tag.key.as_str()).collect();
     keys.sort_unstable();
-    if keys.windows(2).any(|pair| matches!(pair, [a, b] if a == b)) {
+    if keys.array_windows::<2>().any(|[a, b]| a == b) {
         return Err(LifecycleError::DuplicateTagKey);
     }
     Ok(())

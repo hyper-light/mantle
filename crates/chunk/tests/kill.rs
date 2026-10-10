@@ -24,10 +24,10 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use common::{SIZE, config, data, key};
+use common::{SIZE, config, data, issuer, key};
+use hyper_block::buf::Alignment;
+use hyper_block::file::{CachingRequest, DeviceFile};
 use mantle_chunk::{ChunkKey, Volume};
-use mantle_disk::buf::Alignment;
-use mantle_disk::file::{CachingRequest, DeviceFile};
 
 const KEYS: u64 = 8;
 
@@ -126,7 +126,7 @@ fn kill_child_entry() {
     };
     let seed: u64 = std::env::var("MANTLE_KILL_SEED").unwrap().parse().unwrap();
     let path = Path::new(&dir).join("volume");
-    let v = Volume::format(open_file(&path, true), SIZE, config()).unwrap();
+    let v = Volume::format(issuer(), open_file(&path, true), SIZE, config()).unwrap();
     let mut state: HashMap<ChunkKey, Option<State>> = HashMap::new();
     let mut out = std::io::stdout().lock();
     writeln!(out, "ready").unwrap();
@@ -198,8 +198,12 @@ fn run(seed: u64, kill_after: u64) {
     }
     let (uncertain_key, uncertain_op) = op(seed, acked, &state);
 
-    let (v, _) = Volume::open(open_file(&dir.path().join("volume"), false), config())
-        .unwrap_or_else(|e| panic!("seed {seed}: reopening after kill failed: {e}"));
+    let (v, _) = Volume::open(
+        issuer(),
+        open_file(&dir.path().join("volume"), false),
+        config(),
+    )
+    .unwrap_or_else(|e| panic!("seed {seed}: reopening after kill failed: {e}"));
     for n in 0..KEYS {
         let k = key(n);
         let acked_state = state.get(&k).cloned().flatten();

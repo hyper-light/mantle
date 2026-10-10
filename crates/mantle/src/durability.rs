@@ -56,6 +56,7 @@ pub fn durability(out: &mut impl Write, options: &Options) -> Result<(), String>
     for scheme in &candidates {
         let fits = scheme.width() <= options.domains;
         let mean = durability::mean_time_to_loss(*scheme, &rates).map_err(|e| e.to_string())?;
+        let annual = durability::loss_within(*scheme, &rates, YEAR).map_err(|e| e.to_string())?;
         writeln!(
             out,
             "  {:<9} {:>6} {:>9.2} {:>22} {:>18}{}",
@@ -63,7 +64,7 @@ pub fn durability(out: &mut impl Write, options: &Options) -> Result<(), String>
             scheme.width(),
             overhead(scheme),
             format!("{:.3e}", mean / YEAR),
-            format!("{:.3e}", durability::loss_within(mean, YEAR)),
+            format!("{:.3e}", annual),
             if fits {
                 ""
             } else {

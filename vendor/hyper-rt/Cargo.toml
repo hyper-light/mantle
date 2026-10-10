@@ -1,0 +1,49 @@
+[package]
+name = "hyper-rt"
+description = "The shared thread-per-core runtime: shards with arena tasks and Copy wakers, a hierarchical timing wheel, readiness drivers per OS behind one seam, sockets, signals, stdio, synchronization without shared ownership, and a deterministic simulation driver (docs/runtime.md)"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+repository = "https://github.com/hyper-light/hyper-raft"
+publish = false
+
+[dependencies]
+# The calibration record's checksum (docs/runtime.md §10.2), the workspace's CRC-32C.
+crc32c = "0.6"
+
+[target.'cfg(unix)'.dependencies]
+# sysctl, mach and the per-thread CPU clocks that rustix does not cover (the OS-interface files of
+# scripts/check-contracts.py).
+libc = "0.2.189"
+rustix = { version = "1.1", features = ["event", "net", "pipe", "thread", "process", "param", "system", "time", "fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Networking_WinSock",
+  "Win32_Security",
+  "Win32_System_Console",
+  "Win32_System_IO",
+  "Win32_System_Memory",
+  "Win32_System_Power",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+  "Win32_System_WindowsProgramming",
+] }
+
+[dev-dependencies]
+hyper-measure = { path = "../hyper-measure" }
+
+# Not vendored here: loom, which hyper-raft's CI runs for the park and kick protocol's
+# interleavings under `RUSTFLAGS="--cfg loom"`.
+# [target.'cfg(loom)'.dependencies]
+# loom = "0.7"
+
+# hyper-raft's workspace declares the cfgs its interleaving and schedule tests select; the
+# snapshot keeps that declaration alone of the workspace's lints, so `cfg(loom)` is known here.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(shuttle)", "cfg(fuzzing)"] }
+
+# A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside any consumer workspace.
+[workspace]

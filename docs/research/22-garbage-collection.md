@@ -788,7 +788,7 @@ Each item below is **DERIVED** from the facts cited in it.
 | Bound | Covers | Enforced by | Value from |
 |---|---|---|---|
 | `D_f` | File-row commit to Name handover | Name range refuses, file released | measured: the gateway's retry budget for the step × a high quantile of one try's latency, plus `ε` |
-| `D_b` | Block-row commit to File-row commit | File range refuses | measured, as `D_f` |
+| `D_b` | Block-row commit or renewal to File-row commit | File range refuses; the writer renews while its body streams | measured, as `D_f` |
 | `D_c` | chunk write to Block-row commit | Block range refuses | measured; buffering a block before writing its chunks (note 01, D2) keeps this a storage-node write, not a client upload |
 | `ε` | offset between the clocks compared | clock monitoring | measured; note 06 §A4.3 records CockroachDB's 500 ms default maximum offset and self-termination |
 | `R` | longest read of chunks after the Name read that chose them | gateway deadline on GetObject and HeadObject | measured |
@@ -797,14 +797,23 @@ Each item below is **DERIVED** from the facts cited in it.
 | `Q` | released files eligible but not yet reclaimed | pacing floor (§10.3) | capacity headroom |
 | sweep page and period | the orphan sweep's scan | budget per page; period | leaked-bytes bound and the measured orphan rate |
 
-- Stamping at commit, after the object's data is durable, keeps each `D` to one or two range
-  commits, so no `D` grows with object size or client bandwidth. A multipart upload's lifetime is
-  bounded separately, by lifecycle rules, as in S3 (§7.5).
+- Stamping at commit, after the data below is durable, keeps `D_f` and `D_c` to one or two range
+  commits. `D_b` cannot be kept so: a PUT's first block is written while the rest of its body
+  streams in, and its file only once the body ends, so the window from the first Block-row commit
+  to the File-row commit grows with the object's size over the client's bandwidth. Buffering the
+  whole body first would close it at the cost of holding up to 5 GiB a PUT. A multipart upload's
+  lifetime is bounded separately, by lifecycle rules, as in S3 (§7.5).
 - Published values for comparable windows between a prepared step and its completion: Ceph's
   pending bucket-index entry, 120 s (§4.4); HDFS's soft limit, 60 s (§3.6). They show the order
   of magnitude others chose. mantle's values are measured on the running system.
-- The deadlines are absolute. A renewable lease would not bound a handover, since GFS's and HDFS's
-  leases can be extended indefinitely (§1.5, §3.6).
+- `D_f` and `D_c` are absolute. `D_b` is renewed: the writer renews its blocks' deadlines while
+  its body streams, as an HDFS writer renews its lease (§3.6). A renewal, like HDFS's and GFS's
+  (§1.5), can hold a live writer's blocks indefinitely, so it bounds no handover; what it bounds
+  is a stopped writer, whose blocks wait at most one `D_b` past its last renewal. The sweep's
+  release is fenced by the deadline it judged: the Block range releases a block only if its
+  deadline is still the one the File range judged, and renews no released block, so a renewal
+  and a release are ordered by the Block range's log and whichever commits first wins, as item 3
+  of §10.1 orders a check and a handover.
 - mantle's design already avoids the multipart race S3 documents (§7.5): an UploadPart for an
   aborted upload is refused at the Name range and its file released, so no part outlives an abort
   and no second abort is needed.

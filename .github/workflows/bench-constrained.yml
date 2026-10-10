@@ -1,0 +1,80 @@
+name: constrained-bench
+# A change's benchmarks on small, busy hosts, live: a branch under bench/ is measured at its tip
+# (B) against its tip's parent (A). Both are built with every CPU, then run on the CPUs named
+# alone, beside the busy loops named, in interleaved rounds, so drift on the runner falls on both
+# arms. std::thread::available_parallelism follows the affinity mask (sched_getaffinity(2)), so
+# the engine sizes its workers to that host. 10M fills: about twenty rotations of its 64 MiB of
+# memtables. Every run's output is kept as an artifact.
+on:
+  push:
+    branches: ["bench/**"]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  ab:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: x86_64-2cpu, runner: ubuntu-24.04, cpus: "0-1", hogs: 0 }
+          - { name: x86_64-2cpu-busy, runner: ubuntu-24.04, cpus: "0-1", hogs: 2 }
+          - { name: aarch64-1cpu, runner: ubuntu-24.04-arm, cpus: "0", hogs: 0 }
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 2
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.98.0 --profile minimal
+      - name: Build both arms' benches
+        run: |
+          mkdir -p ab/bin
+          build() {
+            cargo bench -p mantle-engine --bench ranges --bench shard_db --no-run --locked \
+              --message-format=json | python3 -c '
+          import json, sys
+          for line in sys.stdin:
+              m = json.loads(line)
+              if m.get("reason") == "compiler-artifact" and m.get("executable") and "bench" in m["target"]["kind"]:
+                  print(m["target"]["name"], m["executable"])' > ab/exes-$1
+            while read -r name exe; do cp "$exe" "ab/bin/$name-$1"; done < ab/exes-$1
+          }
+          build B
+          git checkout -q HEAD~1
+          build A
+          git checkout -q -
+          git log --format='%h %s' -2 > ab/revisions.txt
+          sha256sum ab/bin/* > ab/bin/SHA256
+      - name: Interleaved rounds on ${{ matrix.cpus }}, beside ${{ matrix.hogs }} busy loops
+        run: |
+          for _ in $(seq ${{ matrix.hogs }}); do taskset -c ${{ matrix.cpus }} sh -c 'while :; do :; done' & done
+          for r in 1 2 3; do
+            for arm in $( [ $((r % 2)) -eq 1 ] && echo "A B" || echo "B A" ); do
+              for bench in direct async; do
+                dir="ab/r$r-$bench-$arm"; mkdir -p "$dir"; db=$(mktemp -d)
+                echo "start $(date -u +%FT%TZ) $(uptime)" > "$dir/host.txt"
+                if [ "$bench" = direct ]; then
+                  taskset -c ${{ matrix.cpus }} ab/bin/shard_db-$arm "$db" 10000000 8 buffered 100000 256 none 4 4 10000 10 0 0 50 50 64 0 0 0 \
+                    --rocks-seed=301 --maintenance=drain --durable-recovery --workers > "$dir/raw.txt" 2>&1
+                else
+                  taskset -c ${{ matrix.cpus }} ab/bin/ranges-$arm "$db" 10000000 1 100000 256 4 10000 10 --rocks-seed=301 --shard-client > "$dir/raw.txt" 2>&1
+                fi
+                echo "exit $? end $(date -u +%FT%TZ) $(uptime)" >> "$dir/host.txt"
+                rm -rf "$db"
+              done
+            done
+          done
+          for d in ab/r*-*; do
+            printf "%-16s %s fill %s (%s instr/op) get %s seek %s %s %s\n" "$(basename "$d")" "$(grep -o 'exit [0-9]*' "$d/host.txt")" \
+              "$(awk '/^fillrandom [0-9]/{print $3}' "$d/raw.txt")" "$(awk '/^fillrandom process_cpu/{print $9}' "$d/raw.txt")" \
+              "$(awk '/^readrandom [0-9]/{print $3}' "$d/raw.txt")" "$(awk '/^seekrandom [0-9]/{print $3}' "$d/raw.txt")" \
+              "$(grep -m1 -oE 'flushes:? [0-9]+' "$d/raw.txt")" "$(grep -m1 -oE 'stalls:? [0-9]+' "$d/raw.txt")"
+          done | tee ab/SUMMARY.txt
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: constrained-bench-${{ matrix.name }}
+          path: ab/

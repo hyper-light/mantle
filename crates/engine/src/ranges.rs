@@ -73,7 +73,7 @@ struct Request {
     result: Result<(), Error>,
     /// Where the answer goes. The range sends it back inside the answer, so the client's
     /// channel closes when a range drops a request unanswered.
-    reply: Option<Sender<Request>>,
+    reply: Option<Sender<Box<Request>>>,
     /// Admission travels with the request, including after its client drops while waiting.
     _lease: Option<Arc<ClientLease>>,
 }
@@ -110,7 +110,7 @@ impl Request {
 /// sender is gone.
 async fn serve<F: BlockFile>(
     mut db: ShardDb<F>,
-    mut requests: ChannelReceiver<Request>,
+    mut requests: ChannelReceiver<Box<Request>>,
     batch: usize,
     mut range: Range,
 ) {
@@ -198,7 +198,7 @@ async fn serve<F: BlockFile>(
 /// must arrive and be retired on this same service task, or the producer closes it.
 async fn bootstrap<F: BlockFile>(
     mut offered: ChannelReceiver<ShardDb<F>>,
-    requests: ChannelReceiver<Request>,
+    requests: ChannelReceiver<Box<Request>>,
     batch: usize,
     range: Range,
 ) {
@@ -212,8 +212,8 @@ async fn bootstrap<F: BlockFile>(
 /// queued requests in one terminal step, rather than accepting an endless new drain.
 async fn finish<F: BlockFile>(
     mut db: ShardDb<F>,
-    requests: ChannelReceiver<Request>,
-    stop: Option<Request>,
+    requests: ChannelReceiver<Box<Request>>,
+    stop: Option<Box<Request>>,
     mut range: Range,
 ) {
     let fault = range.fault.take();
@@ -251,20 +251,24 @@ struct Range {
     slice: Slice,
     /// Settled requests waiting for the range to owe nothing: at most one a client, each
     /// client having one request out at a time.
-    settling: Vec<Request>,
+    #[expect(
+        clippy::vec_box,
+        reason = "a request arrives and is answered boxed: unboxed here, each would be copied out and boxed anew"
+    )]
+    settling: Vec<Box<Request>>,
     /// The unapplied mutation and later mutations/barriers, in arrival order. Each
     /// client owns at most one request, so this and `settling` together cannot exceed
     /// the node's existing client bound. Capacity is reserved before the task starts.
-    pending: VecDeque<Request>,
+    pending: VecDeque<Box<Request>>,
     clients: usize,
     /// Outside the borrowed query future: cancellation cannot drop its lease early.
-    active: Option<Request>,
+    active: Option<Box<Request>>,
 }
 
 enum Started {
-    Pending(Request),
+    Pending(Box<Request>),
     Replied,
-    Stop(Request),
+    Stop(Box<Request>),
 }
 
 impl Range {
@@ -290,7 +294,11 @@ impl Range {
     /// Applies `request` and sends its answer, or retains a stop for terminal cleanup. The shard is
     /// told a client was served, so it spins out its wake window before it parks and the
     /// client's next request costs no kernel wake (hyper-rt `ShardContext::note_activity`).
-    async fn answer<F: BlockFile>(&mut self, db: &mut ShardDb<F>, request: Request) -> Answered {
+    async fn answer<F: BlockFile>(
+        &mut self,
+        db: &mut ShardDb<F>,
+        request: Box<Request>,
+    ) -> Answered {
         hyper_rt::registry::with_current(|ctx| ctx.note_activity());
         if self.fault.is_none() && matches!(request.ask, Ask::Get | Ask::Scan { .. }) {
             self.active = Some(request);
@@ -357,7 +365,7 @@ impl Range {
         }
     }
 
-    fn defer(&mut self, mut request: Request) {
+    fn defer(&mut self, mut request: Box<Request>) {
         if self.pending.len() >= self.clients {
             request.result = Err(Error::LimitExceeded {
                 what: "a range's retained requests",
@@ -371,7 +379,7 @@ impl Range {
 
     /// Retries only the oldest unapplied entry. A completed entry is removed before
     /// another request runs, so cancellation of a client's receive never replays it.
-    fn resume<F: BlockFile>(&mut self, db: &mut ShardDb<F>) -> Option<Request> {
+    fn resume<F: BlockFile>(&mut self, db: &mut ShardDb<F>) -> Option<Box<Request>> {
         for _ in 0..self.pending.len() {
             let Some(request) = self.pending.pop_front() else {
                 break;
@@ -390,7 +398,7 @@ impl Range {
 
     /// An unapplied request keeps its buffers, answer channel and admission lease. A stop
     /// keeps the same ownership even after a fault, until its writes and workers retire.
-    fn start<F: BlockFile>(&mut self, db: &mut ShardDb<F>, mut request: Request) -> Started {
+    fn start<F: BlockFile>(&mut self, db: &mut ShardDb<F>, mut request: Box<Request>) -> Started {
         if matches!(request.ask, Ask::Stop) {
             return Started::Stop(request);
         }
@@ -426,7 +434,7 @@ impl Range {
         Started::Replied
     }
 
-    fn reply(mut request: Request) {
+    fn reply(mut request: Box<Request>) {
         if let Some(reply) = request.reply.take() {
             request.reply = Some(reply.clone());
             // A client gone has nobody to tell.
@@ -542,7 +550,7 @@ pub struct RangesConfig {
 pub struct Ranges {
     /// Each range's lowest key, ascending; the first is empty, so every key has a range.
     starts: Vec<Vec<u8>>,
-    senders: Vec<Sender<Request>>,
+    senders: Vec<Sender<Box<Request>>>,
     tasks: Vec<TaskId>,
     /// Clients live now, at most `clients`.
     live: Arc<AtomicUsize>,
@@ -749,11 +757,14 @@ impl Ranges {
         let lease = Arc::new(ClientLease(Arc::clone(&self.live)));
         Ok(Client {
             ranges: self,
-            request: Some(Request {
+            // One request a client, boxed once and reused: a request and its answer cross the
+            // range's channel as a pointer, not as the 808 bytes of their buffers' headers and
+            // counters (measured: moving them by value was a fifth of a get's time).
+            request: Some(Box::new(Request {
                 reply: Some(reply),
                 _lease: Some(Arc::clone(&lease)),
                 ..Request::new()
-            }),
+            })),
             answers,
             barrier: None,
             _lease: lease,
@@ -806,8 +817,8 @@ pub struct Client<'a> {
     ranges: &'a Ranges,
     /// The request and its buffers while none is out; none while a range owns it, or after
     /// that range dropped it unanswered. Canceling a borrowed async wait keeps it outstanding.
-    request: Option<Request>,
-    answers: ChannelReceiver<Request>,
+    request: Option<Box<Request>>,
+    answers: ChannelReceiver<Box<Request>>,
     barrier: Option<Barrier>,
     /// The client and its orphaned request share admission until both have retired.
     _lease: Arc<ClientLease>,
@@ -871,7 +882,7 @@ fn receive_error(error: SyncError<()>) -> Error {
 impl Client<'_> {
     /// The answer: spun for up to the spin window, then waited for parked; none when the range
     /// dropped the request unanswered.
-    fn wait(&mut self) -> Option<Request> {
+    fn wait(&mut self) -> Option<Box<Request>> {
         let t = std::time::Instant::now();
         let window = u128::from(self.ranges.spin_ns);
         while t.elapsed().as_nanos() < window {
@@ -916,7 +927,7 @@ impl Client<'_> {
         }
     }
 
-    fn accept(&mut self, answer: Request) -> Result<&mut Request, Error> {
+    fn accept(&mut self, answer: Box<Request>) -> Result<&mut Request, Error> {
         let request = self.request.insert(answer);
         request.result.clone()?;
         Ok(request)
@@ -1041,7 +1052,7 @@ impl Client<'_> {
         async_context().await?;
         self.send(range, fill)?;
         self.answer_async().await.map_err(receive_error)??;
-        self.request.as_mut().ok_or(Error::Gone {
+        self.request.as_deref_mut().ok_or(Error::Gone {
             what: "a range's shard",
         })
     }

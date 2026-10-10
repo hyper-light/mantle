@@ -106,14 +106,192 @@ impl Request {
     }
 }
 
+/// What a client on a range's own shard does with the range's engine while the range's task
+/// lends it ([`Lend`]): an operation that finishes without waiting, or nothing, and the client
+/// takes the request path.
+trait Inline {
+    /// Applies a put now (true), or leaves it unapplied when it would wait for room (false).
+    fn put(&mut self, key: &[u8], value: &[u8], keys: u64) -> Result<bool, Error>;
+    /// Applies a deletion now (true), or leaves it unapplied when it would wait (false).
+    fn delete(&mut self, key: &[u8], keys: u64) -> Result<bool, Error>;
+    /// A get answered now, or none when a page it needs is not in memory.
+    fn get(&mut self, key: &[u8], value: &mut Vec<u8>) -> Result<Option<bool>, Error>;
+    /// Whether the range owes maintenance: its task has work once it runs.
+    fn owed(&self) -> bool;
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any>;
+}
+
+impl<F: BlockFile + 'static> Inline for ShardDb<F> {
+    fn put(&mut self, key: &[u8], value: &[u8], keys: u64) -> Result<bool, Error> {
+        self.put_paced(key, value, keys)
+    }
+
+    fn delete(&mut self, key: &[u8], keys: u64) -> Result<bool, Error> {
+        self.delete_paced(key, keys)
+    }
+
+    fn get(&mut self, key: &[u8], value: &mut Vec<u8>) -> Result<Option<bool>, Error> {
+        self.get_now(key, value)
+    }
+
+    fn owed(&self) -> bool {
+        self.idle_owed()
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
+}
+
+/// A range's engine its task lends to its shard while it awaits with nothing of the engine
+/// borrowed, the slice budget its puts pace their paid work by, and whether a client left it
+/// maintenance owed: its task, woken when the client yields, takes the engine back to do it.
+struct Lending {
+    task: TaskId,
+    db: Box<dyn Inline>,
+    keys: u64,
+    owed: bool,
+}
+
+thread_local! {
+    /// The engines lent on this thread, at most one a range task its shard holds. The vector is
+    /// moved out of its cell for each use and back (`Cell`): no reference into it outlives a call.
+    static LENT: std::cell::Cell<Vec<Lending>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+/// A range's engine lent for one await of its task ([`Inline`]): an operation a client on the
+/// same shard makes inline, as an event loop runs a call made on its own thread at once (trantor's
+/// `EventLoop::runInLoop`), skips the request's round trip (docs/design/engine-structure.md,
+/// "Same-shard clients"). Dropped unreclaimed, when the task's future is dropped mid-await, it
+/// takes the engine back and drops it there, as the task's own local would have been.
+struct Lend<F: BlockFile + 'static> {
+    task: TaskId,
+    held: bool,
+    engine: std::marker::PhantomData<F>,
+}
+
+impl<F: BlockFile + 'static> Lend<F> {
+    /// Lends `db` for `task`'s await; the engine back when it cannot be lent.
+    fn new(task: TaskId, db: Box<ShardDb<F>>, keys: u64) -> Result<Self, Box<ShardDb<F>>> {
+        let mut db = Some(db);
+        // The engine leaves `db` only into the lending pushed beside it.
+        let _ = LENT.try_with(|cell| {
+            let mut lent = cell.take();
+            if lent.try_reserve(1).is_ok()
+                && let Some(db) = db.take()
+            {
+                lent.push(Lending {
+                    task,
+                    db,
+                    keys,
+                    owed: false,
+                });
+            }
+            cell.set(lent);
+        });
+        match db {
+            Some(db) => Err(db),
+            None => Ok(Self {
+                task,
+                held: true,
+                engine: std::marker::PhantomData,
+            }),
+        }
+    }
+
+    /// The engine back, and whether a client left it maintenance owed. None only if no lending
+    /// of `task` is found, which nothing but a reclaim removes.
+    fn reclaim(&mut self) -> Option<(Box<ShardDb<F>>, bool)> {
+        if !std::mem::take(&mut self.held) {
+            return None;
+        }
+        take_lent::<F>(self.task)
+    }
+}
+
+impl<F: BlockFile + 'static> Drop for Lend<F> {
+    fn drop(&mut self) {
+        if self.held {
+            drop(take_lent::<F>(self.task));
+        }
+    }
+}
+
+/// Removes `task`'s lending, its engine and whether it was left maintenance owed.
+fn take_lent<F: BlockFile + 'static>(task: TaskId) -> Option<(Box<ShardDb<F>>, bool)> {
+    let lending = LENT
+        .try_with(|cell| {
+            let mut lent = cell.take();
+            let found = lent
+                .iter()
+                .position(|l| l.task == task)
+                .map(|at| lent.swap_remove(at));
+            cell.set(lent);
+            found
+        })
+        .ok()
+        .flatten()?;
+    let owed = lending.owed;
+    lending
+        .db
+        .into_any()
+        .downcast::<ShardDb<F>>()
+        .ok()
+        .map(|db| (db, owed))
+}
+
+/// Whether `task`'s lent engine was left maintenance owed by a client.
+fn lent_owed(task: TaskId) -> bool {
+    LENT.try_with(|cell| {
+        let lent = cell.take();
+        let owed = lent.iter().any(|l| l.task == task && l.owed);
+        cell.set(lent);
+        owed
+    })
+    .unwrap_or(false)
+}
+
+/// Runs `op` on the engine `task` lends now, with its slice budget: none when it lends none.
+/// The first operation to leave the engine maintenance owed marks the lending and wakes its task,
+/// which runs once this client yields: one wake an episode of owed maintenance.
+fn with_lent<R>(task: TaskId, op: impl FnOnce(&mut dyn Inline, u64) -> R) -> Option<R> {
+    let (result, woke) = LENT
+        .try_with(|cell| {
+            let mut lent = cell.take();
+            let done = lent.iter_mut().find(|l| l.task == task).map(|l| {
+                let result = op(&mut *l.db, l.keys);
+                let woke = !l.owed && l.db.owed();
+                l.owed |= woke;
+                (result, woke)
+            });
+            cell.set(lent);
+            done
+        })
+        .ok()
+        .flatten()?;
+    if woke {
+        hyper_rt::registry::wake(task.0);
+    }
+    Some(result)
+}
+
+/// What woke a lending range: a request, or a client that left its engine maintenance owed.
+enum Woken {
+    Request(Result<Box<Request>, SyncError<()>>),
+    Owed,
+}
+
 /// A range's task: serves requests in batches, maintenance in between, until stopped or every
 /// sender is gone.
-async fn serve<F: BlockFile>(
-    mut db: ShardDb<F>,
+async fn serve<F: BlockFile + 'static>(
+    db: ShardDb<F>,
     mut requests: ChannelReceiver<Box<Request>>,
     batch: usize,
     mut range: Range,
 ) {
+    // Boxed once, so a lend moves a pointer.
+    let mut db = Box::new(db);
+    let task = hyper_rt::futures::current_task();
     // Cancellation is latched by leaving this loop. The terminal cleanup below is
     // never raced again against the permanently ready cancellation level.
     let stop = 'serving: loop {
@@ -175,28 +353,80 @@ async fn serve<F: BlockFile>(
                     Either::Second(Either::Second(Err(error))) => range.fault = Some(error),
                 }
             } else {
-                hyper_rt::futures::yield_now().await;
+                match task.filter(|_| range.lends()) {
+                    Some(task) => match Lend::new(task, db, range.slice.keys()) {
+                        Ok(mut lend) => {
+                            hyper_rt::futures::yield_now().await;
+                            let Some((back, _)) = lend.reclaim() else {
+                                return;
+                            };
+                            db = back;
+                        }
+                        Err(back) => {
+                            db = back;
+                            hyper_rt::futures::yield_now().await;
+                        }
+                    },
+                    None => hyper_rt::futures::yield_now().await,
+                }
             }
             continue;
         }
         range.settle(&mut db);
-        match race2(hyper_rt::futures::cancelled(), requests.recv()).await {
-            Either::First(_) => break None,
-            Either::Second(Ok(request)) => match range.answer(&mut db, request).await {
-                Answered::Continue => {}
-                Answered::Stop => break range.active.take(),
-                Answered::Cancelled => break None,
+        let woken = match task.filter(|_| range.lends()) {
+            Some(task) => match Lend::new(task, db, range.slice.keys()) {
+                Ok(mut lend) => {
+                    let ready = {
+                        let mut recv = std::pin::pin!(requests.recv());
+                        let woken = std::future::poll_fn(|cx| {
+                            if lent_owed(task) {
+                                return Poll::Ready(Woken::Owed);
+                            }
+                            recv.as_mut().poll(cx).map(Woken::Request)
+                        });
+                        race2(hyper_rt::futures::cancelled(), woken).await
+                    };
+                    let Some((back, _)) = lend.reclaim() else {
+                        return;
+                    };
+                    db = back;
+                    ready
+                }
+                Err(back) => {
+                    db = back;
+                    race2(hyper_rt::futures::cancelled(), async {
+                        Woken::Request(requests.recv().await)
+                    })
+                    .await
+                }
             },
-            Either::Second(Err(_)) => break None,
+            None => {
+                race2(hyper_rt::futures::cancelled(), async {
+                    Woken::Request(requests.recv().await)
+                })
+                .await
+            }
+        };
+        match woken {
+            Either::First(_) => break None,
+            Either::Second(Woken::Owed) => {}
+            Either::Second(Woken::Request(Ok(request))) => {
+                match range.answer(&mut db, request).await {
+                    Answered::Continue => {}
+                    Answered::Stop => break range.active.take(),
+                    Answered::Cancelled => break None,
+                }
+            }
+            Either::Second(Woken::Request(Err(_))) => break None,
         }
     };
-    finish(db, requests, stop, range).await;
+    finish(*db, requests, stop, range).await;
 }
 
 /// An admitted cold bootstrap owns no Db until the caller observes its actual
 /// admission. Cancellation does not drop the offer receiver: a late accepted Db
 /// must arrive and be retired on this same service task, or the producer closes it.
-async fn bootstrap<F: BlockFile>(
+async fn bootstrap<F: BlockFile + 'static>(
     mut offered: ChannelReceiver<ShardDb<F>>,
     requests: ChannelReceiver<Box<Request>>,
     batch: usize,
@@ -263,6 +493,8 @@ struct Range {
     clients: usize,
     /// Outside the borrowed query future: cancellation cannot drop its lease early.
     active: Option<Box<Request>>,
+    /// Whether it lends its engine to clients on its shard ([`RangesConfig::inline`]).
+    inline: bool,
 }
 
 enum Started {
@@ -272,7 +504,7 @@ enum Started {
 }
 
 impl Range {
-    fn new(clients: usize, slice_ns: u64) -> Result<Self, Error> {
+    fn new(clients: usize, slice_ns: u64, inline: bool) -> Result<Self, Error> {
         let refused = || Error::LimitExceeded {
             what: "a range's retained requests",
             limit: u64::try_from(clients).unwrap_or(u64::MAX),
@@ -288,6 +520,7 @@ impl Range {
             pending,
             clients,
             active: None,
+            inline,
         })
     }
 
@@ -457,6 +690,12 @@ impl Range {
         }
     }
 
+    /// Whether the range lends its engine while it awaits: no fault, no mutation waiting to be
+    /// applied (their order is kept), no request in hand.
+    fn lends(&self) -> bool {
+        self.inline && self.fault.is_none() && self.pending.is_empty() && self.active.is_none()
+    }
+
     /// One slice of maintenance; a failure is kept as the range's fault. A slice that stopped
     /// for a read still in flight leaves [`ShardDb::waiting_for_io`] set for the task to await.
     fn maintain<F: BlockFile>(&mut self, db: &mut ShardDb<F>) {
@@ -543,6 +782,11 @@ pub struct RangesConfig {
     /// measured cost of a wake (the 2-competitive spin-then-park rule; Karlin, Li, Manasse and
     /// Owicki, SOSP 1991). An answer that comes within it costs the client no wake.
     pub spin_ns: u64,
+    /// Whether a client on a range's own shard makes an operation inline on the range's lent
+    /// engine when it can finish without waiting (docs/design/engine-structure.md, "Same-shard
+    /// clients"). Off, every operation crosses the range's channel, as one from another shard
+    /// does: the request path's semantics alone, a canceled mutation published and kept.
+    pub inline: bool,
 }
 
 /// A node's ranges, each on a shard of a runtime, and the clients that reach them.
@@ -556,6 +800,8 @@ pub struct Ranges {
     live: Arc<AtomicUsize>,
     clients: usize,
     spin_ns: u64,
+    /// Whether clients on a range's shard make operations inline ([`RangesConfig::inline`]).
+    inline: bool,
 }
 
 /// Runtime preflight retains every engine. Later cold startup errors follow cold rollback.
@@ -608,6 +854,7 @@ impl Ranges {
             clients,
             slice_ns,
             spin_ns,
+            inline,
         } = config;
         let ordered = ranges.first().is_some_and(|(k, _)| k.is_empty())
             && ranges.windows(2).all(|w| match w {
@@ -678,7 +925,7 @@ impl Ranges {
                     what: "a range's request channel",
                     limit: u64::try_from(clients).unwrap_or(u64::MAX),
                 })?;
-            let range = Range::new(clients, slice_ns)?;
+            let range = Range::new(clients, slice_ns, inline)?;
             let (offer, offered) = channel(1).map_err(|_| Error::LimitExceeded {
                 what: "a range's single cold engine handoff",
                 limit: 1,
@@ -726,6 +973,7 @@ impl Ranges {
             live: Arc::new(AtomicUsize::new(0)),
             clients,
             spin_ns,
+            inline,
         })
     }
 
@@ -767,6 +1015,8 @@ impl Ranges {
             })),
             answers,
             barrier: None,
+            turn: Turn::default(),
+            inlined: 0,
             _lease: lease,
         })
     }
@@ -820,8 +1070,20 @@ pub struct Client<'a> {
     request: Option<Box<Request>>,
     answers: ChannelReceiver<Box<Request>>,
     barrier: Option<Barrier>,
+    /// Its turn on its shard for operations made inline ([`Self::turn`]), and those it made.
+    turn: Turn,
+    inlined: u64,
     /// The client and its orphaned request share admission until both have retired.
     _lease: Arc<ClientLease>,
+}
+
+/// A client's turn on its shard for operations made inline ([`Client::turn`]): those left in it,
+/// and those made in it and when it began (the shard's clock).
+#[derive(Debug, Default)]
+struct Turn {
+    left: u64,
+    done: u64,
+    began_ns: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1107,8 +1369,77 @@ impl Client<'_> {
     /// Records a value from a hyper-rt task, yielding for the same bounded reply channel.
     /// Canceling this borrowed wait leaves its request outstanding. The next async operation
     /// recovers its answer and reports its error before publishing another request.
+    /// The task of `range` when this client may make an operation on its engine inline: the client
+    /// runs on the range's shard, with no request or barrier of its own out.
+    fn inline_task(&self, range: usize) -> Option<TaskId> {
+        let task = *self.ranges.tasks.get(range)?;
+        if self.ranges.inline
+            && self.request.is_some()
+            && self.barrier.is_none()
+            && hyper_rt::registry::current_shard() == Some(task.shard().0)
+        {
+            Some(task)
+        } else {
+            None
+        }
+    }
+
+    /// Takes this client's turn before an operation made inline. An inline operation never waits,
+    /// so a client making them in a loop would hold its shard: after about the shard's quantum of
+    /// them, at the rate measured over the turn just ended (two reads of the shard's clock a turn),
+    /// it yields, and the shard's other tasks run, a range it left maintenance owed among them.
+    async fn turn(&mut self) {
+        if let Some(left) = self.turn.left.checked_sub(1) {
+            self.turn.left = left;
+            self.turn.done = self.turn.done.saturating_add(1);
+            return;
+        }
+        let (now, quantum) =
+            hyper_rt::registry::with_current(|ctx| (ctx.now_ns(), ctx.quantum_ns()))
+                .unwrap_or((0, 0));
+        let elapsed = now.saturating_sub(self.turn.began_ns);
+        let per = u128::from(quantum)
+            .saturating_mul(u128::from(self.turn.done))
+            .checked_div(u128::from(elapsed))
+            .unwrap_or(1);
+        let per = u64::try_from(per).unwrap_or(u64::MAX).max(1);
+        hyper_rt::futures::yield_now().await;
+        self.turn.left = per.saturating_sub(1);
+        self.turn.done = 1;
+        self.turn.began_ns = hyper_rt::registry::with_current(|ctx| ctx.now_ns()).unwrap_or(0);
+    }
+
+    /// Makes `op` on `range`'s engine inline when the range lends it now: its answer, or none for
+    /// the request path.
+    async fn inline<R>(
+        &mut self,
+        range: usize,
+        op: impl FnOnce(&mut dyn Inline, u64) -> R,
+    ) -> Option<R> {
+        let task = self.inline_task(range)?;
+        self.turn().await;
+        with_lent(task, op)
+    }
+
+    /// Operations this client completed inline on a range's lent engine, with no request.
+    pub fn inlined(&self) -> u64 {
+        self.inlined
+    }
+
+    fn completed_inline(&mut self) {
+        self.inlined = self.inlined.saturating_add(1);
+    }
+
     pub async fn put_async(&mut self, key: &[u8], value: &[u8]) -> Result<(), Error> {
         let range = self.ranges.range_of(key);
+        if let Some(applied) = self
+            .inline(range, |db, keys| db.put(key, value, keys))
+            .await
+            && applied?
+        {
+            self.completed_inline();
+            return Ok(());
+        }
         self.call_async(range, |r| {
             r.ask = Ask::Put;
             r.key.clear();
@@ -1123,6 +1454,12 @@ impl Client<'_> {
     /// Records a deletion from a hyper-rt task; cancellation never republishes it.
     pub async fn delete_async(&mut self, key: &[u8]) -> Result<(), Error> {
         let range = self.ranges.range_of(key);
+        if let Some(applied) = self.inline(range, |db, keys| db.delete(key, keys)).await
+            && applied?
+        {
+            self.completed_inline();
+            return Ok(());
+        }
         self.call_async(range, |r| {
             r.ask = Ask::Delete;
             r.key.clear();
@@ -1135,6 +1472,12 @@ impl Client<'_> {
     /// A hyper-rt task's get, with the same swapped value buffer as `get`.
     pub async fn get_async(&mut self, key: &[u8], value: &mut Vec<u8>) -> Result<bool, Error> {
         let range = self.ranges.range_of(key);
+        if let Some(found) = self.inline(range, |db, _| db.get(key, value)).await
+            && let Some(found) = found?
+        {
+            self.completed_inline();
+            return Ok(found);
+        }
         let r = self
             .call_async(range, |r| {
                 r.ask = Ask::Get;

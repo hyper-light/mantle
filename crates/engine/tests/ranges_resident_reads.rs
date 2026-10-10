@@ -162,6 +162,7 @@ fn an_async_range_reads_its_resident_pages_on_its_own_shard() {
             clients: 2,
             slice_ns: SLICE_NS,
             spin_ns: 0,
+            inline: false,
         },
     )
     .unwrap();

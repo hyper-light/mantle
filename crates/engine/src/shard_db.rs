@@ -1824,6 +1824,35 @@ impl<F: BlockFile> ShardDb<F> {
     /// The value `key` holds, into `value`; false when it holds none.
     pub fn get(&mut self, key: &[u8], value: &mut Vec<u8>) -> Result<bool, Error> {
         self.count_get();
+        self.lookup(key, value)
+    }
+
+    /// [`Self::get`] made only if it can finish without waiting for the device or for a write
+    /// still out over a page it needs: `Some` of its answer, or `None` when a page it needs is
+    /// not in memory now, with `value` left empty, for the caller to take the paced path
+    /// ([`Self::get_async`]), which counts the get.
+    pub(crate) fn get_now(
+        &mut self,
+        key: &[u8],
+        value: &mut Vec<u8>,
+    ) -> Result<Option<bool>, Error> {
+        self.store.begin_no_wait();
+        let found = self.lookup(key, value);
+        let refused = self.store.end_no_wait();
+        match found {
+            Ok(found) => {
+                self.count_get();
+                Ok(Some(found))
+            }
+            Err(_) if refused => {
+                value.clear();
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn lookup(&mut self, key: &[u8], value: &mut Vec<u8>) -> Result<bool, Error> {
         // The key's filter hash, once for the memtables and every branch on its path.
         let hash = crate::branch::filter::hash(key);
         let mut found = self.mem.get_hashed(key, hash, value)?;

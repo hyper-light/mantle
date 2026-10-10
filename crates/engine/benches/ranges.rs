@@ -510,12 +510,17 @@ fn runtime_config(
 
 fn main() -> Result<(), BenchError> {
     let mut shard_client = false;
+    // `--no-inline`: a client on its range's shard sends every operation through the range's
+    // channel, as one from another shard does (`RangesConfig::inline`), for an A/B of the two.
+    let mut no_inline = false;
     let mut seed = 301u64;
     let mut runtime_record = None;
     let mut args = Vec::new();
     for arg in std::env::args().skip(1) {
         if arg == "--shard-client" {
             shard_client = true;
+        } else if arg == "--no-inline" {
+            no_inline = true;
         } else if let Some(value) = arg.strip_prefix("--rocks-seed=") {
             seed = value.parse()?;
         } else if let Some(path) = arg.strip_prefix("--runtime-record=") {
@@ -696,6 +701,7 @@ fn main() -> Result<(), BenchError> {
             clients: threads as usize + 1,
             slice_ns: rt.step_budget_ns,
             spin_ns: rt.spin_ns,
+            inline: !no_inline,
         },
     )
     .map_err(|failure| match failure {

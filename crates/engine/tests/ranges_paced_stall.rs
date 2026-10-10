@@ -448,6 +448,7 @@ fn retention_case(fail: bool) {
                 clients: 4,
                 slice_ns: 50_000,
                 spin_ns: 0,
+                inline: false,
             },
         )
         .unwrap(),
@@ -844,6 +845,7 @@ fn terminal_case(stop: bool) {
                 clients: 1 + usize::from(stop),
                 slice_ns: 50_000,
                 spin_ns: 0,
+                inline: false,
             },
         )
         .unwrap(),
@@ -856,6 +858,7 @@ fn terminal_case(stop: bool) {
                 clients: 1,
                 slice_ns: 50_000,
                 spin_ns: 0,
+                inline: false,
             },
         )
         .unwrap(),

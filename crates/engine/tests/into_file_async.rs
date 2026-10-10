@@ -374,6 +374,7 @@ impl Drop for StartOnDrop {
                 clients: 1,
                 slice_ns: 50_000,
                 spin_ns: 0,
+                inline: false,
             },
         );
         self.returned.try_send((runtime, outcome)).unwrap();

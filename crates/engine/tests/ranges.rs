@@ -72,6 +72,7 @@ fn ranges_config(clients: usize) -> RangesConfig {
         clients,
         slice_ns: SLICE_NS,
         spin_ns: SLICE_NS,
+        inline: false,
     }
 }
 

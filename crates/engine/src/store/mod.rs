@@ -153,6 +153,11 @@ pub struct Store<F: BlockFile> {
     file: Option<F>,
     /// The existing native retirement owner holds the original file through physical close.
     original: Option<OriginalLease>,
+    /// A read that would wait is refused rather than made ([`Self::begin_no_wait`]): an inline
+    /// operation's, which must finish on its caller's thread without the device.
+    no_wait: bool,
+    /// A read was refused since the last [`Self::begin_no_wait`].
+    would_wait: bool,
     config: Config,
     alloc: Allocator,
     /// Accepted worker jobs; nonempty borrowed runs cannot cross this boundary.
@@ -613,6 +618,8 @@ impl<F: BlockFile> Store<F> {
         let mut store = Self {
             file: Some(file),
             original: None,
+            no_wait: false,
+            would_wait: false,
             config,
             alloc: Allocator::new(config.max_extents),
             durable: Superblock {
@@ -679,6 +686,8 @@ impl<F: BlockFile> Store<F> {
         Ok(Self {
             file: Some(file),
             original: None,
+            no_wait: false,
+            would_wait: false,
             config,
             alloc: Allocator::granted(),
             durable: Superblock {
@@ -808,6 +817,8 @@ impl<F: BlockFile> Store<F> {
             Self {
                 file: Some(file),
                 original: None,
+                no_wait: false,
+                would_wait: false,
                 config,
                 alloc,
                 durable: sb,
@@ -2434,6 +2445,9 @@ impl<F: BlockFile> Store<F> {
         if self.queued_page(address, out)? {
             return Ok(());
         }
+        if self.no_wait {
+            return self.read_page_now(address, out);
+        }
         blocking_allowed("a synchronous store page miss in a runtime task")?;
         if self.cache.as_ref().is_some_and(|c| c.in_ghost(address)) {
             self.io.ghost_misses = self.io.ghost_misses.saturating_add(1);
@@ -2657,6 +2671,70 @@ impl<F: BlockFile> Store<F> {
                 .map_err(|error| io("reserve a span's pending reads", error))?;
         }
         Ok(())
+    }
+
+    /// From here until [`Self::end_no_wait`], a page read that would wait for the device, or for
+    /// a write still out over the page, is refused with an error rather than made: what lets an
+    /// operation run on its caller's thread only when it can finish there.
+    pub(crate) fn begin_no_wait(&mut self) {
+        self.no_wait = true;
+        self.would_wait = false;
+    }
+
+    /// Ends [`Self::begin_no_wait`]: whether a read was refused meanwhile, so the error it was
+    /// refused with means "would wait", not a failure.
+    pub(crate) fn end_no_wait(&mut self) -> bool {
+        self.no_wait = false;
+        std::mem::take(&mut self.would_wait)
+    }
+
+    /// A page read made without waiting ([`Self::begin_no_wait`]): from the OS's memory when no
+    /// write is out or queued over it; refused otherwise.
+    fn read_page_now(&mut self, address: u64, out: &mut Vec<u8>) -> Result<(), Error> {
+        self.reap()?;
+        if self.writer.as_ref().is_some_and(|w| {
+            w.in_flight
+                .iter()
+                .any(|&(_, a, b, _)| a <= address && address < b)
+                || w.queued
+                    .iter()
+                    .any(|q| q.first <= address && address < q.end)
+        }) {
+            return Err(self.refuse_wait());
+        }
+        let offset = Self::offset_in(self.config, address)?;
+        if Self::past(offset, self.config.page_size)? > self.end {
+            return Err(corrupt(Malformed::Truncated));
+        }
+        let mut buf = self.take_buf()?;
+        if let Err(error) = buf.set_len(self.config.page_size) {
+            self.give_buf(buf);
+            return Err(io("size a page read without waiting", error));
+        }
+        let read = match self.read_resident(&mut buf, offset) {
+            Ok(true) => {
+                let from = out.len();
+                let landed = node_payload(buf.as_slice(), address, out);
+                if landed.is_ok()
+                    && let Some(c) = self.cache.as_mut()
+                    && let Some(payload) = out.get(from..)
+                {
+                    c.insert(address, payload);
+                }
+                landed
+            }
+            Ok(false) => Err(self.refuse_wait()),
+            Err(error) => Err(error),
+        };
+        self.give_buf(buf);
+        read
+    }
+
+    fn refuse_wait(&mut self) -> Error {
+        self.would_wait = true;
+        Error::Gone {
+            what: "a page only the device can supply now",
+        }
     }
 
     /// Reads `buf` from `offset` only if the OS holds all of it in memory now, on this thread:

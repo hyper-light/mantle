@@ -124,6 +124,7 @@ fn run(mem: usize, depth: usize) {
             clients: 1,
             slice_ns: 50_000,
             spin_ns: 0,
+            inline: false,
         },
     )
     .unwrap();

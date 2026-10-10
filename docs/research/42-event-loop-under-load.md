@@ -332,6 +332,20 @@ kevent therefore wakes later than one that woke at intermediate boundaries and p
 is what the wake-sized tick's multi-level wheel did by accident (§11's runs: 129 µs at the median against
 295 µs with the 50 µs tick, trantor 258 µs).
 
+## 13. A yield and the wakes that came in meanwhile
+
+With the allowance alone, the request above still waited about three slices (125 µs): the slicing task
+re-queued itself during its slice, before the next step drained the request's wake, so the FIFO ran the
+slicer's next slice first. tokio's `yield_now` does not wake the task at once: "Don't wake the task
+immediately, as that would push it right back onto the run queue and it could be polled again before other
+tasks or the IO/timer driver get a chance to run. Instead, hand the waker to the scheduler, which wakes
+deferred tasks only after it has run out of ready tasks and polled the driver" [TOKIO-YIELD]. **MEASURED**
+with a self-wake held apart until the ready tasks have run and no wake from another thread waits (PANELS
+`mac-a1-r1`): the one-client request at 52 µs and 8,261 a second; eight clients 92,797 a second at 72 µs
+against trantor's 95,659 at 72 µs. The price is a second ring a yield passes through: 16 tasks yielding in
+turn run 53.9 million polls a second against 77.2 million without it (trantor runs its queued closures at
+28.1 million).
+
 ## What remains unknown
 
 - **The cost of blocking on Windows.** Its per-thread times advance a scheduler tick at a time, and its

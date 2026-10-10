@@ -220,3 +220,33 @@ every arm fell).
 - `TIMER_SLACK_NS` (50,000 ns): cited, prctl(2) (note 42 §10).
 - The allowance's growth bound (twice the last): cited, slow start [JACOBSON88 §1].
 - `from_calibration`'s `batch` (the step budget in nanoseconds): bound, a poll costs at least a nanosecond.
+
+## D7. A yield goes behind what came in from other threads
+
+**Decision.** A task that wakes itself while it is polled — a yield — waits apart from the ready queue
+(`LocalQueue::push_deferred`) and rejoins it behind everything ready: when what was ready has run, unless
+another thread has left a wake or a control message meanwhile (two loads), in which case the step ends and
+the next step's drains queue that work ahead of the yielders; and at every step's start, after its drains.
+Wakes of one task by another keep their place in the step's FIFO, so a local request and its reply still
+run in one step.
+
+**Why.** A task that slices long work and yields between slices re-queued itself during its slice, before the
+step after it drained the wake that a request from another thread had left meanwhile, so the request waited
+for the yielder's next slice too: with 50 µs slices, about three slices at the median even with D6's allowance
+(125 µs, `benchmark-results/hyper-rt-vs-tokio-20261010/runs/mac-a1-r1`). tokio's `yield_now` hands its waker
+to the scheduler, "which wakes deferred tasks only after it has run out of ready tasks and polled the driver"
+[TOKIO-YIELD, note 42 §13]; trantor runs its one queue in order. Both answer in one slice; so does a yield
+here now: 52 µs at the median, 8,261 requests a second against 5,827; eight clients 92,797 a second at 72 µs
+against 34,362 at 135 µs, where trantor ran 95,659 at 72 µs (`runs/mac-a1-r1`, load 25–60). The price is a
+second ring a yield passes through: sixteen tasks yielding in turn run 53.9 million polls a second against
+77.2 million (trantor runs its queued closures at 28.1 million). The check of the inboxes replaces tokio's
+poll of the driver when the ready tasks run out: a driver poll is a system call, and I/O readiness already
+reaches a busy shard once a quantum (D6).
+
+**Proof.** `tests/yield_order.rs`: a task woken from another thread between two steps runs before a yielding
+task's next poll; and a wake that lands while a task yields ends the step after that poll. RED before: the
+yielder ran first, and the step polled it four times
+(`benchmark-results/hyper-rt-vs-tokio-20261010/tests/yield-order-RED.txt`). `queue.rs`'s unit test holds the
+deferred ring.
+
+**Constants.** None.

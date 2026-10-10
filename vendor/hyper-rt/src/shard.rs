@@ -1018,9 +1018,14 @@ impl ShardContext {
         Ok(())
     }
 
-    /// Wakes a task of this shard by its slot.
+    /// Wakes a task of this shard by its slot. A task waking itself while it is polled yields: it goes again
+    /// behind everything ready (`queue.rs`).
     pub(crate) fn wake_local(&self, slot: u32) {
-        self.local.push(slot);
+        if self.current_task.get() == Some(slot) {
+            self.local.push_deferred(slot);
+        } else {
+            self.local.push(slot);
+        }
     }
 
     // ------------------------------------------------------------------ helpers

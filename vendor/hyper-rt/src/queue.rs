@@ -6,10 +6,12 @@
 //! [`CellRing`] (docs/runtime.md §3.4), so nothing is borrowed and nothing is refused: slates' version
 //! kept its lists in `RefCell`s and counted the re-entrant accesses it refused.
 //!
-//! A step takes at most its configured poll budget, oldest first. Wakes that arrive while the phase
-//! runs join the same FIFO behind tasks already ready and may use its remaining budget. A task waking
-//! itself cannot extend that budget, so the phase never drains an unbounded ready set. `batch` can
-//! still capture the number ready now for callers that need a fixed snapshot.
+//! A step takes at most its poll budget, oldest first. Wakes that arrive while the phase runs join the
+//! same FIFO behind tasks already ready and may use its remaining budget. A task that wakes itself while it
+//! is polled — a yield — waits apart (`push_deferred`) and rejoins the FIFO behind everything ready, once
+//! what was ready has run or at the next step after the wakes from other threads (mantle
+//! `docs/design/event-loop.md` D7). A pending flag covers both rings, so a slot is in at most one, once.
+//! `batch` can still capture the number ready now for callers that need a fixed snapshot.
 
 use std::cell::Cell;
 
@@ -19,6 +21,8 @@ use crate::cells::CellRing;
 pub struct LocalQueue {
     pending: Box<[Cell<bool>]>,
     ready: CellRing<u32>,
+    /// Slots that woke themselves while polled, oldest first.
+    deferred: CellRing<u32>,
     overflow: Cell<u64>,
 }
 
@@ -27,6 +31,7 @@ impl std::fmt::Debug for LocalQueue {
         f.debug_struct("LocalQueue")
             .field("capacity", &self.pending.len())
             .field("ready", &self.ready.len())
+            .field("deferred", &self.deferred.len())
             .finish()
     }
 }
@@ -37,6 +42,7 @@ impl LocalQueue {
         Self {
             pending: (0..capacity).map(|_| Cell::new(false)).collect(),
             ready: CellRing::new(capacity),
+            deferred: CellRing::new(capacity),
             overflow: Cell::new(0),
         }
     }
@@ -44,6 +50,15 @@ impl LocalQueue {
     /// Marks a slot ready; a slot already pending is not listed twice. A slot beyond the arena is counted as
     /// overflow and ignored (a stale or foreign word).
     pub fn push(&self, slot: u32) {
+        self.push_to(&self.ready, slot);
+    }
+
+    /// Marks a slot that woke itself while polled ready behind everything else (see the module doc).
+    pub fn push_deferred(&self, slot: u32) {
+        self.push_to(&self.deferred, slot);
+    }
+
+    fn push_to(&self, ring: &CellRing<u32>, slot: u32) {
         let Some(flag) = self
             .pending
             .get(usize::try_from(slot).unwrap_or(usize::MAX))
@@ -54,12 +69,27 @@ impl LocalQueue {
         if flag.replace(true) {
             return;
         }
-        // A slot is in the ring at most once (its flag), and the ring holds one entry per slot, so it never
+        // A slot is in one ring at most once (its flag), and each ring holds one entry per slot, so it never
         // refuses; were it to, the flag is cleared so the next wake lists the slot again.
-        if self.ready.push(slot).is_err() {
+        if ring.push(slot).is_err() {
             flag.set(false);
             self.overflow.set(self.overflow.get().saturating_add(1));
         }
+    }
+
+    /// Moves every deferred slot behind the ready ones, oldest first; whether there was any. Bounded by the
+    /// arena: the deferred ring holds each slot at most once.
+    pub fn requeue_deferred(&self) -> bool {
+        let mut any = false;
+        while let Some(slot) = self.deferred.pop() {
+            any = true;
+            // Never refused: a slot pending in the deferred ring is in no other, so the two hold at most the
+            // arena between them.
+            if self.ready.push(slot).is_err() {
+                self.overflow.set(self.overflow.get().saturating_add(1));
+            }
+        }
+        any
     }
 
     /// How many slots the step about to run may take: at most `limit`, and only those ready now, so a wake
@@ -80,14 +110,14 @@ impl LocalQueue {
         Some(slot)
     }
 
-    /// Whether nothing is ready.
+    /// Whether nothing is ready, now or deferred.
     pub fn is_empty(&self) -> bool {
-        self.ready.is_empty()
+        self.ready.is_empty() && self.deferred.is_empty()
     }
 
-    /// Ready entries.
+    /// Ready entries, deferred ones included.
     pub fn len(&self) -> usize {
-        self.ready.len()
+        self.ready.len().saturating_add(self.deferred.len())
     }
 
     /// Wakes for slots beyond the arena, ignored.
@@ -136,6 +166,29 @@ mod tests {
         assert_eq!(q.pop(), Some(1));
         q.push(1);
         assert_eq!(take(&q, usize::MAX), vec![1]);
+    }
+
+    /// A slot that woke itself waits apart: it rejoins behind everything ready when requeued, keeps its one
+    /// entry against a later wake, and counts toward the queue not being empty.
+    #[test]
+    fn a_deferred_slot_rejoins_behind_the_ready_ones() {
+        let q = LocalQueue::new(4);
+        q.push(0);
+        q.push_deferred(1);
+        q.push(1);
+        q.push(2);
+        assert!(!q.is_empty());
+        assert_eq!(
+            take(&q, usize::MAX),
+            vec![0, 2],
+            "the deferred slot waits apart, listed once"
+        );
+        assert!(!q.is_empty(), "a deferred slot is still work");
+        q.push(3);
+        assert!(q.requeue_deferred());
+        assert_eq!(take(&q, usize::MAX), vec![3, 1]);
+        assert!(!q.requeue_deferred());
+        assert!(q.is_empty());
     }
 
     /// §4.3 bounded work: a drain hands out at most its batch, oldest first; the slots left behind keep

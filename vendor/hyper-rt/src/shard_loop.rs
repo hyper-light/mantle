@@ -927,11 +927,28 @@ impl Shard {
 
     /// Whether anything waits in the shard's inboxes (no system call).
     pub(crate) fn has_inbound(&self) -> bool {
-        !self.desk.local.is_empty()
-            || self
-                .desk
-                .entry
-                .is_some_and(|entry| entry.wakes.is_pending() || entry.control_pending.is_pending())
+        !self.desk.local.is_empty() || self.foreign_pending()
+    }
+
+    /// The next task this step polls: the oldest ready one. When what was ready has run, the tasks that
+    /// yielded meanwhile go again, unless work came in from another thread, which the next step's drains put
+    /// ahead of them (mantle `docs/design/event-loop.md` D7).
+    fn next_ready(&mut self) -> Option<u32> {
+        if let Some(slot) = self.desk.local.pop() {
+            return Some(slot);
+        }
+        if self.foreign_pending() || !self.desk.local.requeue_deferred() {
+            return None;
+        }
+        self.desk.local.pop()
+    }
+
+    /// Whether another thread left a wake or a control message for the next drain (two loads, no system
+    /// call).
+    fn foreign_pending(&self) -> bool {
+        self.desk
+            .entry
+            .is_some_and(|entry| entry.wakes.is_pending() || entry.control_pending.is_pending())
     }
 
     /// One loop iteration without blocking.
@@ -984,10 +1001,12 @@ impl Shard {
         } else {
             self.core.config.batch.max(1)
         };
+        // The tasks that yielded in the last step go behind everything this step's drains made ready.
+        self.desk.local.requeue_deferred();
         // No clock reading a poll: the step is timed whole, after its polls.
         let mut polls: usize = 0;
         for _ in 0..batch {
-            let Some(slot) = self.desk.local.pop() else {
+            let Some(slot) = self.next_ready() else {
                 break;
             };
             did_work = true;

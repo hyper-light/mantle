@@ -270,12 +270,12 @@ fn feed_one<F: BlockFile>(
     Ok(w.saturating_sub(budget))
 }
 
-/// The batches a device's issuer is started for (`Issuer::start_for`) to hold a shard that
-/// keeps `shard_batches` out and its maintenance workers, each with at most `FEED_BUFFERS` out
+/// The batches a device's issuer of `depth` is started for (`Issuer::start_for`) to hold a
+/// shard that keeps `shard_batches` out and its maintenance workers, each with `depth` out
 /// (`ShardDb::attach`), up to the cores they may use: within it a submission never waits for
 /// the issuer's inbox.
-pub fn issuer_batches(shard_batches: usize) -> usize {
-    shard_batches.saturating_add(Pool::cores().saturating_mul(FEED_BUFFERS))
+pub fn issuer_batches(shard_batches: usize, depth: usize) -> usize {
+    shard_batches.saturating_add(Pool::cores().saturating_mul(depth))
 }
 
 /// A shard's engine over a store.
@@ -1108,11 +1108,15 @@ impl<F: BlockFile> ShardDb<F> {
         F: 'static,
     {
         self.store.attach(issuer, batches)?;
-        // The maintenance workers' stores attach too, each on its own thread: two batches out
-        // each at most, as their feed's buffers are two (`FEED_BUFFERS`), the least that lets a
-        // worker build while its last run is written, and no more than the device's depth.
-        // An issuer's depth is one at least (`Issuer::start_for`), so a worker has a batch.
-        let worker = (issuer.attacher(), issuer.depth().min(FEED_BUFFERS));
+        // The maintenance workers' stores attach too, each on its own thread, with as many
+        // batches out as the device serves at once (`Issuer::depth`, from the queue the OS
+        // reports and the depth calibration measured throughput to stop growing at): fewer
+        // serialize a worker behind its slowest write, and under a loaded kernel's buffered
+        // writes two out held a worker long enough for a rotation to wait on its feed (stalls of
+        // 0.23-1.09 s against 5-51 ms with the depth, benchmark-results/
+        // mantle-depth-stall-repro-20261009); more cannot be in flight. A worker then holds at
+        // most that many runs in write memory. The depth is one at least (`Issuer::start_for`).
+        let worker = (issuer.attacher(), issuer.depth());
         if let Some(pool) = self.trunk.pool_mut() {
             pool.set_attach(worker.0.clone(), worker.1);
         }

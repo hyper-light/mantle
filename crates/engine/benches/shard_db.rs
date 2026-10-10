@@ -220,7 +220,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Issuer::start_for(
             &dir,
             issuer_depth,
-            mantle_engine::shard_db::issuer_batches(batches.max(1)),
+            mantle_engine::shard_db::issuer_batches(batches.max(1), issuer_depth),
         )
         .unwrap()
     });

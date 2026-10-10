@@ -3834,27 +3834,92 @@ mod tune_tests {
 
 #[cfg(test)]
 mod frozen_tests {
-    //! Frozen memtables out of order and through failure: the oldest packing's worker held,
-    //! younger packings back behind it and their workers reused, every read exact throughout;
-    //! the held one released, branches entering the trunk oldest first; a worker's failure
-    //! repacked on the shard; a failure of both kept, typed and fenced, never dropping what the
-    //! memtables hold; and the store reopened at its last checkpoint.
+    //! Frozen memtables out of order and through failure, live: the host's own workers and the
+    //! overlap the shard measures, a stall or a failure armed on the worker a packing went to.
+    //! The packing whose writes stall stays frozen and every read stays exact; a younger packing
+    //! another worker takes comes back behind it, and on a host whose one worker is the stalled
+    //! one it waits for that worker; a starved feed holds no younger one back; released, the
+    //! branches enter the trunk oldest first; a worker's failure is kept, typed and fenced,
+    //! never dropping what the memtables hold; and the store reopens at its last checkpoint.
     use super::*;
     use hyper_block::DiskError;
     use hyper_block::buf::Alignment;
     use hyper_block::file::{CachingRequest, DeviceFile};
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex, MutexGuard};
 
-    /// A file whose writes wait while `holds` is set and then fail while `fails` is: a test's
-    /// own statics, so tests running at once do not share them.
+    /// One test's gates, statics of its own so tests running at once share none: the worker
+    /// whose writes stall (`usize::MAX` names none), whether they stall and whether one waits
+    /// now, whether that worker's next write fails, and the workers opened so far, each
+    /// numbered as the pool seats it (seats fill in order, and none empties during a test).
+    struct Gates {
+        worker: AtomicUsize,
+        state: Mutex<Stall>,
+        changed: Condvar,
+        fail: AtomicBool,
+        opened: AtomicUsize,
+    }
+
+    struct Stall {
+        held: bool,
+        waiting: bool,
+    }
+
+    impl Gates {
+        const fn new() -> Self {
+            Self {
+                worker: AtomicUsize::new(usize::MAX),
+                state: Mutex::new(Stall {
+                    held: false,
+                    waiting: false,
+                }),
+                changed: Condvar::new(),
+                fail: AtomicBool::new(false),
+                opened: AtomicUsize::new(0),
+            }
+        }
+
+        fn state(&self) -> MutexGuard<'_, Stall> {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        /// Stalls worker `worker`'s writes, and fails the first after the stall when `fail`.
+        fn arm(&self, worker: usize, fail: bool) {
+            self.fail.store(fail, Ordering::SeqCst);
+            self.state().held = true;
+            self.worker.store(worker, Ordering::SeqCst);
+        }
+
+        /// Waits until the stalled worker waits in a write.
+        fn until_waiting(&self) {
+            let mut s = self.state();
+            while !s.waiting {
+                s = self
+                    .changed
+                    .wait(s)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+
+        fn waited(&self) -> bool {
+            self.state().waiting
+        }
+
+        fn release(&self) {
+            self.state().held = false;
+            self.changed.notify_all();
+        }
+    }
+
+    /// A file a worker writes through, numbered as the pool seats it, its writes gated by its
+    /// test's [`Gates`]; the shard's own file has none.
     struct Held {
         file: DeviceFile,
-        holds: Option<&'static AtomicBool>,
-        fails: Option<&'static AtomicBool>,
-        /// Whether a failure clears its flag: one failed write an arming.
-        once: Option<bool>,
-        waiting: Option<&'static AtomicBool>,
+        worker: usize,
+        gates: Option<&'static Gates>,
     }
 
     impl BlockFile for Held {
@@ -3868,28 +3933,28 @@ mod frozen_tests {
             self.file.read_exact_at(buf, offset)
         }
         fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError> {
-            if let Some(h) = self.holds {
-                while h.load(Ordering::SeqCst) {
-                    if let Some(w) = self.waiting {
-                        w.store(true, Ordering::SeqCst);
-                    }
-                    std::thread::yield_now();
+            if let Some(g) = self
+                .gates
+                .filter(|g| g.worker.load(Ordering::SeqCst) == self.worker)
+            {
+                let mut s = g.state();
+                while s.held {
+                    s.waiting = true;
+                    g.changed.notify_all();
+                    s = g
+                        .changed
+                        .wait(s)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
-            }
-            let failing = self.fails.is_some_and(|f| {
-                if self.once == Some(true) {
-                    // One failure an arming: taken and cleared at once.
-                    f.swap(false, Ordering::SeqCst)
-                } else {
-                    f.load(Ordering::SeqCst)
+                drop(s);
+                // One failure an arming: taken and cleared at once.
+                if g.fail.swap(false, Ordering::SeqCst) {
+                    return Err(DiskError::Io {
+                        op: "a test's failed write",
+                        path: std::path::PathBuf::new(),
+                        source: std::io::Error::other("a test's failed write"),
+                    });
                 }
-            });
-            if failing {
-                return Err(DiskError::Io {
-                    op: "a test's failed write",
-                    path: std::path::PathBuf::new(),
-                    source: std::io::Error::other("a test's failed write"),
-                });
             }
             self.file.write_all_at(buf, offset)
         }
@@ -3898,16 +3963,15 @@ mod frozen_tests {
         }
     }
 
-    /// Opens every gate it names when dropped: a failed assertion while a worker is held must
-    /// not leave the pool's drop joining a worker that waits forever. Declared after the shard,
-    /// it drops before the shard's pool does.
-    struct Open(&'static [&'static AtomicBool]);
+    /// Releases its gates when dropped: a failed assertion while a worker stalls must not leave
+    /// the pool's drop joining a worker that waits forever. Declared after the shard, it drops
+    /// before the shard's pool does.
+    struct Open(&'static Gates);
 
     impl Drop for Open {
         fn drop(&mut self) {
-            for g in self.0 {
-                g.store(false, Ordering::SeqCst);
-            }
+            self.0.fail.store(false, Ordering::SeqCst);
+            self.0.release();
         }
     }
 
@@ -3924,10 +3988,23 @@ mod frozen_tests {
     fn plain(path: &std::path::Path, create: bool) -> Held {
         Held {
             file: open(path, create),
-            holds: None,
-            fails: None,
-            once: None,
-            waiting: None,
+            worker: usize::MAX,
+            gates: None,
+        }
+    }
+
+    /// The workers' files, each numbered as the pool seats it and gated by `gates`.
+    fn gated(
+        path: &std::path::Path,
+        gates: &'static Gates,
+    ) -> impl FnMut() -> Result<Held, Error> + Send + 'static {
+        let path = path.to_path_buf();
+        move || {
+            Ok(Held {
+                file: open(&path, false),
+                worker: gates.opened.fetch_add(1, Ordering::SeqCst),
+                gates: Some(gates),
+            })
         }
     }
 
@@ -3956,6 +4033,10 @@ mod frozen_tests {
                 None => assert!(!found, "key {k} reads a value it does not hold"),
             }
         }
+        scan_exact(db, oracle);
+    }
+
+    fn scan_exact(db: &mut ShardDb<Held>, oracle: &BTreeMap<Vec<u8>, Vec<u8>>) {
         let mut rows = Rows::new();
         let mut next = Vec::new();
         assert!(
@@ -3981,83 +4062,135 @@ mod frozen_tests {
         }
     }
 
-    /// Puts, the measured overlap pinned so every packing may stay frozen, until the oldest is
-    /// held with a younger one's result in behind it and a worker reused: bounded by the cores a
-    /// pool may start, each new packing taking a free worker or a new one.
-    fn until_reused(db: &mut ShardDb<Held>, oracle: &mut BTreeMap<Vec<u8>, Vec<u8>>, i: &mut u64) {
-        loop {
-            db.pack_ns = u64::MAX;
-            put_or_delete(db, oracle, *i);
-            *i += 1;
-            // Results already in are taken: a younger one's shows behind the held oldest.
-            db.take_packs(false).unwrap();
-            let workers: Vec<usize> = db.frozen.iter().map(|f| f.worker).collect();
-            let mut seen = workers.clone();
-            seen.sort_unstable();
-            seen.dedup();
-            let held_first = db.frozen.front().is_some_and(|f| !f.ready());
-            if held_first && seen.len() < workers.len() {
-                return;
-            }
+    /// A put of a key no earlier put wrote, so a memtable fills with as many entries as it
+    /// holds.
+    fn put_new(db: &mut ShardDb<Held>, oracle: &mut BTreeMap<Vec<u8>, Vec<u8>>, i: u64) {
+        let k = format!("k{i:06}").into_bytes();
+        let v = format!("v{i}").into_bytes();
+        db.put(&k, &v).unwrap();
+        oracle.insert(k, v);
+    }
+
+    type Put = fn(&mut ShardDb<Held>, &mut BTreeMap<Vec<u8>, Vec<u8>>, u64);
+
+    /// Puts until the shard has measured a fill and a packing, so the overlap it lets stay
+    /// frozen is its own: by the second rotation, which, with no overlap measured yet, waits for
+    /// the first packing a worker took and so measures it.
+    fn warm(
+        db: &mut ShardDb<Held>,
+        oracle: &mut BTreeMap<Vec<u8>, Vec<u8>>,
+        i: &mut u64,
+        put: Put,
+    ) {
+        let rotations = db.flush_stats.rotations;
+        while db.pack_ns == 0 || db.fill_ns == 0 {
             assert!(
-                db.frozen.len() < Pool::cores(),
-                "no worker was reused before every core held a frozen memtable"
+                db.flush_stats.rotations < rotations + 2,
+                "a second rotation measured no packing"
             );
+            put(db, oracle, *i);
+            *i += 1;
         }
     }
 
-    static HELD_A: AtomicBool = AtomicBool::new(false);
-    static WAITING_A: AtomicBool = AtomicBool::new(false);
-    static OPENS_A: AtomicUsize = AtomicUsize::new(0);
-    static GATES_A: [&AtomicBool; 1] = [&HELD_A];
+    /// Puts until the packing memtable is out on a worker that has none of its entries yet (its
+    /// feed's buffers all still in hand), then stalls that worker's writes, failing the first
+    /// after the stall when `fail`; puts through the rotation that freezes it, feeds it what its
+    /// buffers take, and waits until its worker waits in a write. Returns that worker.
+    fn stall_oldest(
+        db: &mut ShardDb<Held>,
+        oracle: &mut BTreeMap<Vec<u8>, Vec<u8>>,
+        i: &mut u64,
+        put: Put,
+        gates: &'static Gates,
+        fail: bool,
+    ) -> usize {
+        let rotations = db.flush_stats.rotations;
+        let worker = loop {
+            if let Some(f) = db.packing.as_ref().and_then(|p| p.feed.as_ref()) {
+                assert_eq!(
+                    f.spare.len() + usize::from(f.filling.is_some()),
+                    FEED_BUFFERS,
+                    "a buffer reached the worker before its stall was armed"
+                );
+                break f.worker;
+            }
+            assert_eq!(
+                db.flush_stats.rotations, rotations,
+                "a fill passed with no worker taking its packing"
+            );
+            put(db, oracle, *i);
+            *i += 1;
+        };
+        gates.arm(worker, fail);
+        while db.flush_stats.rotations == rotations {
+            put(db, oracle, *i);
+            *i += 1;
+        }
+        db.feed_from(u64::MAX, false, false).unwrap();
+        gates.until_waiting();
+        assert!(
+            db.frozen
+                .front()
+                .is_some_and(|f| f.worker == worker && !f.ready()),
+            "the stalled packing is the oldest frozen"
+        );
+        worker
+    }
+
+    /// The younger packing's share, all of it, waited for: a free worker, when the host has
+    /// one, takes it and its result comes back behind the stalled one; on a host whose workers
+    /// are all busy, the stalled one's among them, it waits for a worker.
+    fn younger_beside(db: &mut ShardDb<Held>) {
+        db.pack_some(u64::MAX, true).unwrap();
+        match db.frozen.get(1) {
+            Some(younger) => assert!(
+                younger.back.is_some(),
+                "a younger packing's result did not come back behind the stalled one"
+            ),
+            None => {
+                assert!(
+                    db.packing.as_ref().is_some_and(|p| p.feed.is_none()),
+                    "a younger packing neither came back nor waits for a worker"
+                );
+                assert!(
+                    !db.trunk.pool_mut().unwrap().can_take(true),
+                    "a younger packing waits while a worker is free"
+                );
+            }
+        }
+    }
+
+    static GATES_A: Gates = Gates::new();
 
     #[test]
-    fn an_oldest_packing_held_lets_younger_ones_return_and_retires_in_order() {
+    fn a_stalled_packing_holds_no_younger_one_back_and_retires_in_order() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("store");
         let mut db = ShardDb::create(plain(&path, true), STORE, MEM, TRUNK).unwrap();
         let _open = Open(&GATES_A);
-        let p = path.clone();
-        db.set_workers(move || {
-            let first = OPENS_A.fetch_add(1, Ordering::SeqCst) == 0;
-            Ok(Held {
-                file: open(&p, false),
-                holds: if first { Some(&HELD_A) } else { None },
-                fails: None,
-                once: None,
-                waiting: if first { Some(&WAITING_A) } else { None },
-            })
-        })
-        .unwrap();
-        HELD_A.store(true, Ordering::SeqCst);
+        db.set_workers(gated(&path, &GATES_A)).unwrap();
         let mut oracle = BTreeMap::new();
         let mut i = 0u64;
-        until_reused(&mut db, &mut oracle, &mut i);
-        assert!(
-            WAITING_A.load(Ordering::SeqCst),
-            "the oldest packing's worker was held"
-        );
-        assert!(db.frozen.iter().skip(1).any(|f| f.back.is_some()));
+        warm(&mut db, &mut oracle, &mut i, put_or_delete);
         check(&mut db, &oracle);
-        // A newer packing keeps feeding meanwhile: more puts, reads exact.
-        for _ in 0..50 {
-            db.pack_ns = u64::MAX;
-            put_or_delete(&mut db, &mut oracle, i);
-            i += 1;
-        }
+        stall_oldest(&mut db, &mut oracle, &mut i, put_or_delete, &GATES_A, false);
+        younger_beside(&mut db);
         check(&mut db, &oracle);
         // Released: every frozen branch enters the trunk, oldest first.
-        HELD_A.store(false, Ordering::SeqCst);
+        GATES_A.release();
         db.drain_frozen().unwrap();
         assert!(db.frozen.is_empty());
+        assert!(GATES_A.waited());
         check(&mut db, &oracle);
-        // No overlap measured: a rotation leaves none frozen past its packing.
-        for _ in 0..200 {
-            db.pack_ns = 0;
+        // Puts on, through a cascade, at the overlap the shard measures.
+        let rotations = db.flush_stats.rotations;
+        let cascade = u64::try_from(TRUNK.fanout).unwrap();
+        while db.flush_stats.rotations < rotations + cascade {
             put_or_delete(&mut db, &mut oracle, i);
             i += 1;
-            assert!(db.frozen.len() <= 1);
         }
+        check(&mut db, &oracle);
         db.checkpoint(i).unwrap();
         check(&mut db, &oracle);
         let (file, landed) = crate::store::cold_file(db.into_file());
@@ -4069,49 +4202,26 @@ mod frozen_tests {
         db.check_references().unwrap();
     }
 
-    static HELD_B: AtomicBool = AtomicBool::new(false);
-    static FAIL_WORKER_B: AtomicBool = AtomicBool::new(false);
-    static FAIL_SHARD_B: AtomicBool = AtomicBool::new(false);
-    static OPENS_B: AtomicUsize = AtomicUsize::new(0);
-    static GATES_B: [&AtomicBool; 3] = [&HELD_B, &FAIL_WORKER_B, &FAIL_SHARD_B];
+    static GATES_B: Gates = Gates::new();
 
     #[test]
     fn a_failed_packing_keeps_entries_and_reports_the_worker_failure() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("store");
-        let shard = Held {
-            file: open(&path, true),
-            holds: None,
-            fails: Some(&FAIL_SHARD_B),
-            once: Some(false),
-            waiting: None,
-        };
-        let mut db = ShardDb::create(shard, STORE, MEM, TRUNK).unwrap();
+        let mut db = ShardDb::create(plain(&path, true), STORE, MEM, TRUNK).unwrap();
         let _open = Open(&GATES_B);
         let mut oracle = BTreeMap::new();
         db.put(b"durable", b"before worker failure").unwrap();
         oracle.insert(b"durable".to_vec(), b"before worker failure".to_vec());
         db.checkpoint(1).unwrap();
         let durable = oracle.clone();
-        let p = path.clone();
-        db.set_workers(move || {
-            let first = OPENS_B.fetch_add(1, Ordering::SeqCst) == 0;
-            Ok(Held {
-                file: open(&p, false),
-                holds: if first { Some(&HELD_B) } else { None },
-                fails: if first { Some(&FAIL_WORKER_B) } else { None },
-                once: Some(true),
-                waiting: None,
-            })
-        })
-        .unwrap();
+        db.set_workers(gated(&path, &GATES_B)).unwrap();
         let mut i = 0u64;
-
+        warm(&mut db, &mut oracle, &mut i, put_or_delete);
         // A real worker failure is retained, with no owner-thread repacking.
-        HELD_B.store(true, Ordering::SeqCst);
-        FAIL_WORKER_B.store(true, Ordering::SeqCst);
-        until_reused(&mut db, &mut oracle, &mut i);
-        HELD_B.store(false, Ordering::SeqCst);
+        stall_oldest(&mut db, &mut oracle, &mut i, put_or_delete, &GATES_B, true);
+        younger_beside(&mut db);
+        GATES_B.release();
         assert!(matches!(db.drain_frozen(), Err(Error::Io { .. })));
         assert!(matches!(db.drain_frozen(), Err(Error::Io { .. })));
         check(&mut db, &oracle);
@@ -4124,7 +4234,6 @@ mod frozen_tests {
         let (file, retired) = crate::store::cold_file(db.into_file());
         assert!(matches!(retired, Err(Error::Io { .. })));
         drop(file);
-        FAIL_WORKER_B.store(false, Ordering::SeqCst);
         let (mut db, applied) = ShardDb::open(plain(&path, false), STORE, MEM, TRUNK).unwrap();
         assert_eq!(applied, 1);
         check(&mut db, &durable);
@@ -4164,13 +4273,10 @@ mod frozen_tests {
         assert_eq!(db.frozen_most(), 0, "no fill measured, none");
     }
 
-    static HELD_C: AtomicBool = AtomicBool::new(false);
-    static WAITING_C: AtomicBool = AtomicBool::new(false);
-    static OPENS_C: AtomicUsize = AtomicUsize::new(0);
-    static GATES_C: [&AtomicBool; 1] = [&HELD_C];
+    static GATES_C: Gates = Gates::new();
 
-    /// A run two pages, the fewest an extent holds, so a memtable takes many of a feed's buffers and its feed starves while
-    /// its worker is held.
+    /// A run two pages, the fewest an extent holds, so a memtable takes many of a feed's buffers
+    /// and its feed starves while its worker stalls.
     const STORE_RUN_PAGE: Config = Config {
         page_size: 4096,
         extent_pages: 2,
@@ -4184,56 +4290,51 @@ mod frozen_tests {
         let path = dir.path().join("store");
         let mut db = ShardDb::create(plain(&path, true), STORE_RUN_PAGE, MEM_RUNS, TRUNK).unwrap();
         let _open = Open(&GATES_C);
-        let p = path.clone();
-        db.set_workers(move || {
-            let first = OPENS_C.fetch_add(1, Ordering::SeqCst) == 0;
-            Ok(Held {
-                file: open(&p, false),
-                holds: if first { Some(&HELD_C) } else { None },
-                fails: None,
-                once: None,
-                waiting: if first { Some(&WAITING_C) } else { None },
-            })
-        })
-        .unwrap();
-        HELD_C.store(true, Ordering::SeqCst);
+        db.set_workers(gated(&path, &GATES_C)).unwrap();
         let mut oracle = BTreeMap::new();
         let mut i = 0u64;
-        // Puts until the oldest packing's worker is held mid-feed and a younger packing has a
-        // buffer in hand with entries left; no rotation may wait on the held one, so the frozen
-        // stay under the overlap pinned: the cores, once a fill is measured.
-        loop {
-            db.pack_ns = u64::MAX;
-            assert!(
-                db.frozen.len() < Pool::cores(),
-                "no younger packing was in hand before the overlap filled"
-            );
-            let k = format!("k{i:06}").into_bytes();
-            let v = format!("v{i}").into_bytes();
-            db.put(&k, &v).unwrap();
-            oracle.insert(k, v);
-            i += 1;
-            let starved = WAITING_C.load(Ordering::SeqCst)
-                && db.frozen.front().is_some_and(|f| f.feed.is_some());
-            let in_hand = db.packing.as_ref().is_some_and(|p| {
-                p.packed < p.mem.len() && p.feed.as_ref().is_some_and(|f| f.filling.is_some())
-            });
-            if starved && in_hand {
-                break;
-            }
-        }
-        // One pass, waiting for none: the younger packing takes entries though the oldest
-        // starves.
-        let before = db.packing.as_ref().map_or(0, |p| p.packed);
-        db.feed(u64::MAX, false).unwrap();
-        let after = db.packing.as_ref().map_or(0, |p| p.packed);
+        warm(&mut db, &mut oracle, &mut i, put_new);
+        stall_oldest(&mut db, &mut oracle, &mut i, put_new, &GATES_C, false);
         assert!(
-            after > before,
-            "the starved oldest held the younger feed back"
+            db.frozen.front().is_some_and(|f| f.feed.is_some()),
+            "the stalled packing's feed did not starve"
         );
+        // Puts until the younger packing is out on another worker with a buffer in hand and
+        // entries left, or, on a host whose workers are all busy, the stalled one's among them,
+        // its order paid with no worker free to take it; within the fill, so no rotation waits
+        // on the stalled one.
+        let rotations = db.flush_stats.rotations;
+        let in_hand = loop {
+            let p = db.packing.as_ref().unwrap();
+            if p.packed < p.mem.len() && p.feed.as_ref().is_some_and(|f| f.filling.is_some()) {
+                break true;
+            }
+            if p.walk.is_some() && p.feed.is_none() && !db.trunk.pool_mut().unwrap().can_take(true)
+            {
+                break false;
+            }
+            assert_eq!(
+                db.flush_stats.rotations, rotations,
+                "a fill passed with the younger packing neither out nor waiting for a worker"
+            );
+            put_new(&mut db, &mut oracle, i);
+            i += 1;
+        };
+        if in_hand {
+            // One pass, waiting for none: the younger packing takes entries though the oldest
+            // starves.
+            let before = db.packing.as_ref().map_or(0, |p| p.packed);
+            db.feed(u64::MAX, false).unwrap();
+            let after = db.packing.as_ref().map_or(0, |p| p.packed);
+            assert!(
+                after > before,
+                "the starved oldest held the younger feed back"
+            );
+        }
         assert!(db.frozen.front().is_some_and(|f| !f.ready()));
+        scan_exact(&mut db, &oracle);
         // Released: every branch enters the trunk, oldest first, reads exact.
-        HELD_C.store(false, Ordering::SeqCst);
+        GATES_C.release();
         db.drain_frozen().unwrap();
         db.maintain(u64::MAX).unwrap();
         assert!(db.frozen.is_empty());
@@ -4248,17 +4349,7 @@ mod frozen_tests {
         let (mut db, applied) =
             ShardDb::open(plain(&path, false), STORE_RUN_PAGE, MEM_RUNS, TRUNK).unwrap();
         assert_eq!(applied, i);
-        let mut rows = Rows::new();
-        let mut next = Vec::new();
-        assert!(
-            !db.scan(b"", None, usize::MAX, &mut rows, &mut next)
-                .unwrap()
-        );
-        let got: Vec<(Vec<u8>, Vec<u8>)> =
-            rows.iter().map(|(k, v)| (k.to_vec(), v.to_vec())).collect();
-        let want: Vec<(Vec<u8>, Vec<u8>)> =
-            oracle.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        assert_eq!(got, want);
+        scan_exact(&mut db, &oracle);
         db.check_references().unwrap();
     }
 }

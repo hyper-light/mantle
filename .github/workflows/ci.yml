@@ -66,3 +66,37 @@ jobs:
         run: cargo test --manifest-path vendor/Cargo.toml --workspace --locked --target ${{ matrix.target }}
       - name: Release build
         run: cargo build --release --workspace --locked --target ${{ matrix.target }}
+
+  # The same suites on a small, busy host as on a large, idle one: built with every CPU, then
+  # run on the CPUs named alone, beside busy loops they did not start.
+  # std::thread::available_parallelism follows the affinity mask (sched_getaffinity(2)), so the
+  # engine's worker pools and the test harness size themselves to that host
+  # (scripts/linux-test.sh runs the same locally: CPUS, HOGS).
+  constrained:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64-2cpu-busy, runner: ubuntu-24.04, cpus: "0-1", hogs: 2 }
+          - { name: linux-aarch64-1cpu, runner: ubuntu-24.04-arm, cpus: "0", hogs: 0 }
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.98.0 --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+          workspaces: |
+            .
+            vendor
+      - name: Build the suites
+        run: |
+          cargo test --workspace --locked --no-run
+          cargo test --manifest-path vendor/Cargo.toml --workspace --locked --no-run
+      - name: Suites on ${{ matrix.cpus }}, beside ${{ matrix.hogs }} busy loops
+        run: |
+          for _ in $(seq ${{ matrix.hogs }}); do taskset -c ${{ matrix.cpus }} sh -c 'while :; do :; done' & done
+          taskset -c ${{ matrix.cpus }} cargo test --workspace --locked
+          taskset -c ${{ matrix.cpus }} cargo test --manifest-path vendor/Cargo.toml --workspace --locked

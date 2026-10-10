@@ -85,6 +85,13 @@ caller hands in the alignment, queue and measured depth it found.
    pass of five batches, 15 before. Mantle measured this round trip as about 88 % of its engine's
    steady-state allocations over a 3 M-put fill and drain. A failed batch still drops its vector
    and buffers, as before.
+9. **An owned way to attach** (`issuer.rs`, `Issuer::attacher`, `Attacher`): the issuer's inbox
+   and worker count, cloned out to a submitter that starts later on a thread of its own, which
+   attaches through it as through the issuer. mantle's maintenance workers start lazily from a
+   `'static` spawn and their shard only borrows the issuer; with no shared ownership allowed, they
+   could not attach, and wrote their branches' pages on their own threads. It keeps nothing alive:
+   an attach after the issuer stopped is refused, and the duplicates it made are dropped with the
+   refusal.
 
 ## Planned
 

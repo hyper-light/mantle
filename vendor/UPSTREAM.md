@@ -86,6 +86,17 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
+**Development snapshot (branch `worker-stream` only, 2026-10-09).** `hyper-block` and `hyper-rt` are
+taken from hyper-raft's `mantle-dev-stream` at `8cd3604`, a development-only branch (never a PR) that
+carries work not yet on hyper-raft's `main`: #12 (the hardened runtime: readiness under busy and
+manual stepping, driver loss, representation bounds, and the blocking pool refusing a job once
+stopped, `48b7d81`), #13 (`Issuer::attacher`, an owned way for a maintenance worker to attach), #7
+(a batch's vector comes back with its answer) and the issuer's completion bridge
+(`Attached::answer_async`) that this vendor already held. Against the vendor it replaces, the only
+changes are #12's and #13's; the bridge and #7 are byte-identical but for seven test asserts that read
+#7's `(AlignedBuf, u64)` answers. Both crates are re-vendored from `main` once these land, and this
+note goes with that commit. The rows below state the snapshot each crate held before.
+
 The crates mantle shares with focal and slates come from github.com/hyper-light/hyper-raft:
 - each is a snapshot of one crate taken from a commit's objects (`git archive`), its manifest made
   self-contained: the workspace's package fields and dependency specs written in, its benches and

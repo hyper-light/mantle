@@ -1,1 +1,1 @@
-hyper-raft 379481933ff375564f7f7703edf45cc94da253ac crates/hyper-rt
+hyper-raft 8cd36040c1a9cb51d7aed8981b4aa5539b47ef6c crates/hyper-rt (DEVELOPMENT SNAPSHOT of branch mantle-dev-stream: unmerged #12, #13, #7 and the issuer bridge; re-vendor from main once they land)

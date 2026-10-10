@@ -105,6 +105,37 @@ fn control_depth(derived: u64) -> usize {
 }
 
 impl RuntimeConfig {
+    /// Checks the representation bounds before a driver, queue or arena is acquired. Zero-sized
+    /// arenas keep their existing refusal behavior; indices must fit their actual encoded fields.
+    pub(crate) fn validate_shape(&self) -> Result<(), RtError> {
+        if self.tasks_per_shard.checked_sub(1).is_some_and(|last| {
+            u32::try_from(last).map_or(true, |last| last > crate::mem::Encoded::MAX_SLOT)
+        }) {
+            return Err(RtError::BadConfig {
+                what: "task capacity exceeds the encoded slot field",
+            });
+        }
+        for (count, what) in [
+            (
+                self.timers_per_shard,
+                "timer capacity exceeds its u32 index field",
+            ),
+            (
+                self.interests_per_shard,
+                "readiness capacity exceeds its u32 index field",
+            ),
+            (
+                self.ring_entries,
+                "driver ring capacity exceeds its u32 entry field",
+            ),
+        ] {
+            if u32::try_from(count).is_err() {
+                return Err(RtError::BadConfig { what });
+            }
+        }
+        Ok(())
+    }
+
     /// A configuration from the machine's calibration and the constants the consumer's policy derived from
     /// it ([`Calibration::constants`]): the shard count and their cores from the placement, the tick, step
     /// budget, spin window and control depth from the derived constants, and the batch bound against the
@@ -338,9 +369,14 @@ fn run_worker(
     }
     shard.run();
     let counters = shard.counters();
+    let lost = shard.driver_lost();
     drop(shard);
     registry::note_reclaimed();
-    Ok(counters)
+    if lost {
+        Err(RtError::DriverLost)
+    } else {
+        Ok(counters)
+    }
 }
 
 /// Stops every worker (a shutdown message, retried while the shard's control channel is full), joins them
@@ -415,7 +451,10 @@ fn register_seeds(
 impl Runtime {
     /// Starts `config.shards` shard threads on the OS drivers.
     pub fn start(config: &RuntimeConfig) -> Result<Runtime, RtError> {
-        let entries = u32::try_from(config.ring_entries).unwrap_or(u32::MAX);
+        config.validate_shape()?;
+        let entries = u32::try_from(config.ring_entries).map_err(|_| RtError::BadConfig {
+            what: "driver ring capacity exceeds its u32 entry field",
+        })?;
         Self::start_with(config, &mut || os_driver(entries))
     }
 
@@ -428,6 +467,7 @@ impl Runtime {
         config: &RuntimeConfig,
         prepare: &mut dyn FnMut() -> Result<Prepared, RtError>,
     ) -> Result<Runtime, RtError> {
+        config.validate_shape()?;
         let mut notes = Vec::new();
         let seeds = register_seeds(config, prepare, &mut notes)?;
         let ids: Vec<ShardId> = seeds.iter().map(|s| ShardId(s.id)).collect();
@@ -604,7 +644,11 @@ impl std::fmt::Debug for LocalRuntime {
 impl LocalRuntime {
     /// Builds the shard on the OS driver.
     pub fn new(config: &RuntimeConfig) -> Result<LocalRuntime, RtError> {
-        let prepared = os_driver(u32::try_from(config.ring_entries).unwrap_or(u32::MAX))?;
+        config.validate_shape()?;
+        let entries = u32::try_from(config.ring_entries).map_err(|_| RtError::BadConfig {
+            what: "driver ring capacity exceeds its u32 entry field",
+        })?;
+        let prepared = os_driver(entries)?;
         let seed = ShardSeed::register(config, prepared.seed, register_kick(prepared.kick_fd))?;
         let holder = seed.holder;
         let shard = Shard::build(seed).inspect_err(|_| registry::unregister(holder))?;
@@ -621,6 +665,7 @@ impl LocalRuntime {
         driver: DriverSeed,
         kick: Kick,
     ) -> Result<LocalRuntime, RtError> {
+        config.validate_shape()?;
         let seed = ShardSeed::register(config, driver, registry::RegisterKick::Kick(kick))?;
         let holder = seed.holder;
         let shard = Shard::build(seed).inspect_err(|_| registry::unregister(holder))?;
@@ -654,7 +699,7 @@ impl LocalRuntime {
         self.shard.keep(value)
     }
 
-    /// Runs until no task, timer or message is pending.
+    /// Runs available work and timers until idle. Pending external waits remain live for a later call.
     pub fn run_until_idle(&mut self) {
         self.shard.run_until_idle();
     }
@@ -667,14 +712,14 @@ impl LocalRuntime {
         &mut self,
         future: impl Future<Output = T> + 'static,
     ) -> Result<T, RtError> {
-        self.shard.spawn_local(crate::shard::boxed(async move {
+        let root = self.shard.spawn_local(crate::shard::boxed(async move {
             let output = future.await;
             let _ = registry::with_current(|desk| desk.put_root_output(Box::new(output)));
         }))?;
+        self.shard.context().detach(root)?;
         loop {
             if let Some(output) = self.shard.context().take_root_output() {
                 self.shard.cancel_everything();
-                self.shard.run_until_idle();
                 return output.downcast::<T>().map(|output| *output).map_err(|_| {
                     RtError::BadConfig {
                         what: "a root output of another type",
@@ -683,6 +728,7 @@ impl LocalRuntime {
             }
             let outcome = self.shard.step();
             if outcome.exit {
+                self.shard.discard_root_output();
                 return Err(RtError::ShardGone {
                     shard: self.slot.0.shard(),
                 });

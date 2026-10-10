@@ -1098,6 +1098,7 @@ impl SimRuntime {
 
     /// Builds the simulation with `sim` sizing its sockets.
     pub fn with(config: &RuntimeConfig, seed: u64, sim: SimConfig) -> Result<SimRuntime, RtError> {
+        config.validate_shape()?;
         let per_shard = sim.sockets_per_shard;
         let mut shards = Vec::new();
         for index in 0..config.shards {

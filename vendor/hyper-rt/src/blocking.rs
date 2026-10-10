@@ -147,7 +147,7 @@ pub fn start(config: Config) -> Result<(), RtError> {
         });
     }
     thread("hyper-rt-blocking-dispatch".to_owned(), move || {
-        dispatch(&jobs, &idle, slots, workers);
+        dispatch(jobs, &idle, slots, workers);
     })?;
     Ok(())
 }
@@ -166,10 +166,10 @@ fn work(index: usize, take: &Receiver<Job>, idle: &SyncSender<usize>) {
     }
 }
 
-/// The dispatcher: hands each job to an idle worker, waiting for one when all are busy; on `Stop` it hands
-/// out the jobs already queued, closes the slots and joins the workers.
+/// The dispatcher: hands each job to an idle worker, waiting for one when all are busy; on `Stop` it closes
+/// the queue, closes the slots and joins the workers, and only then answers the stop.
 fn dispatch(
-    jobs: &Receiver<Message>,
+    jobs: Receiver<Message>,
     idle: &Receiver<usize>,
     slots: Vec<SyncSender<Job>>,
     workers: Vec<JoinHandle<()>>,
@@ -188,8 +188,12 @@ fn dispatch(
                 }
             }
             Message::Stop(done) => {
-                // Jobs sent before the stop are queued ahead of it and already handed out; any sent after
-                // it was refused at `run`.
+                // Jobs sent before the stop are queued ahead of it and already handed out. The queue closes
+                // before the stop is answered, so a `run` once `stop` has returned is refused; it closed when
+                // the dispatcher's thread ended, after the answer, and such a `run` was taken for a job that
+                // never ran (CI, ubuntu-24.04, run 38003581811). A `run` that raced the stop is dropped unrun,
+                // its receiver seeing the sender gone.
+                drop(jobs);
                 drop(slots);
                 let mut clean = true;
                 for worker in workers {

@@ -304,6 +304,8 @@ pub struct ShardContext {
     free_waits: CellStack<u32>,
     /// The task being polled.
     pub(crate) current_task: Cell<Option<u32>>,
+    /// Admission is paused while owned futures are cancelled, and closed at shutdown.
+    pub(crate) accepting: Cell<bool>,
     /// The shard's clock at the start of the current poll (or step), published by the loop.
     pub(crate) now_ns: Cell<u64>,
     /// When the server last served a client's work here, opening the idle window (`note_activity`).
@@ -408,6 +410,7 @@ impl ShardContext {
                 .collect(),
             free_waits: CellStack::full_of(wait_ids.into_iter()),
             current_task: Cell::new(None),
+            accepting: Cell::new(true),
             now_ns: Cell::new(0),
             activity_ns: Cell::new(None),
             quantum_ns: Cell::new(1),
@@ -532,6 +535,15 @@ impl ShardContext {
 
     /// Claims a free slot for `incoming` and asks the loop to install it.
     pub(crate) fn claim(&self, incoming: Incoming) -> Result<TaskId, RtError> {
+        if !self.accepting.get()
+            || self.entry.is_some_and(|entry| {
+                !entry.accepting.load(std::sync::atomic::Ordering::Acquire)
+                    || entry.stop.load(std::sync::atomic::Ordering::Acquire)
+                    || entry.exited.load(std::sync::atomic::Ordering::Acquire)
+            })
+        {
+            return Err(RtError::ShardGone { shard: self.id });
+        }
         let capacity = self.tasks.len();
         let Some(slot) = self.free_tasks.pop() else {
             self.refused_spawns

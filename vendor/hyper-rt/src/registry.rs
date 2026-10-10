@@ -64,6 +64,8 @@ pub struct Entry {
     /// room (docs/runtime.md §15 item 9, closed 2026-10-06; it used to retry a full channel with
     /// `yield_now` and no bound).
     pub stop: AtomicBool,
+    /// Admission is closed during owned cancellation and after shutdown begins.
+    pub(crate) accepting: AtomicBool,
     /// The generational kick that wakes this registration's driver.
     pub kick: Kick,
     /// The kick descriptor, closed after the owning contexts and foreign borrows end (Unix).
@@ -426,6 +428,7 @@ pub(crate) fn register_slot(
             generation_base: slot.arena_generation.load(Ordering::Acquire),
             control_pending: crate::parking::ControlFlag::new(),
             stop: AtomicBool::new(false),
+            accepting: AtomicBool::new(true),
             kick: Kick::None,
             #[cfg(unix)]
             kick_fd: None,
@@ -723,6 +726,12 @@ pub(crate) fn request_stop(target: u16) -> Result<(), RtError> {
 
 /// The send itself, on a counted entry (see [`send_control`]).
 fn send_control_to(entry: &Entry, target: u16, message: Control) -> Result<(), RtError> {
+    if !entry.accepting.load(Ordering::Acquire)
+        || entry.stop.load(Ordering::Acquire)
+        || entry.exited.load(Ordering::Acquire)
+    {
+        return Err(RtError::ShardGone { shard: target });
+    }
     match entry.control.try_send(message) {
         Ok(()) => {
             entry.control_pending.publish();

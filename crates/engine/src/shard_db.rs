@@ -2563,12 +2563,15 @@ impl<F: BlockFile> ShardDb<F> {
     /// Feeds up to `w` entries, the packing memtable too only when `packing_too`: the entries
     /// fed. Every feed whose worker has a buffer free takes entries, the oldest first, so the
     /// workers build at once; one starved never holds the newer back. With `wait`, it feeds
-    /// until `w` are fed or none is left to feed, waiting for any worker's message when no feed
-    /// can take more: each pass either feeds or takes a message, and a worker's result, a
-    /// failure's when it ends before its feed, closes that feed ([`Self::take_packs`]).
+    /// until `w` are fed or none is left to feed, and waits for a worker's message only after a
+    /// pass that fed nothing with no message taken since it began: a message may bring back a
+    /// buffer of a feed the pass found starved, whose worker, waiting for its feed, sends
+    /// nothing more ([`Pool::wait_any`] refuses that wait). A worker's result, a failure's when
+    /// it ends before its feed, closes that feed ([`Self::take_packs`]).
     fn feed_from(&mut self, w: u64, wait: bool, packing_too: bool) -> Result<u64, Error> {
         let mut fed = 0u64;
         loop {
+            let seen = self.trunk.pool_mut().map(|p| p.accepted());
             let (used, open) = self.feed_pass(w.saturating_sub(fed), packing_too)?;
             fed = fed.saturating_add(used);
             if !wait || !open || fed >= w {
@@ -2576,10 +2579,34 @@ impl<F: BlockFile> ShardDb<F> {
             }
             if used == 0 {
                 self.take_packs(false)?;
-                let Some(pool) = self.trunk.pool_mut() else {
+                let Self {
+                    frozen,
+                    packing,
+                    trunk,
+                    store,
+                    ..
+                } = self;
+                let Some(pool) = trunk.pool_mut() else {
                     return Ok(fed);
                 };
-                if !pool.wait_any(&mut self.store)? {
+                // A message taken since the pass began, by the pass or by the take after it, may
+                // have brought a feed's buffer back after the pass found that feed starved: its
+                // worker, waiting for the feed, sends nothing more. So the wait is only for a pass
+                // that fed nothing with no message since: every open feed's buffers are then out
+                // with its worker, which sends one back, or its result, without the shard.
+                if Some(pool.accepted()) != seen {
+                    continue;
+                }
+                let open = frozen
+                    .iter()
+                    .filter_map(|f| f.feed.as_ref().map(|feed| feed.worker))
+                    .chain(
+                        packing
+                            .as_ref()
+                            .filter(|_| packing_too)
+                            .and_then(|p| p.feed.as_ref().map(|feed| feed.worker)),
+                    );
+                if !pool.wait_any(store, open)? {
                     return Ok(fed);
                 }
             }

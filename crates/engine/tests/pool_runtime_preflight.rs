@@ -239,7 +239,7 @@ fn run(call: Call) {
         let result = match call {
             Call::Take => ResultOf::Take(owned.pool.take(&mut owned.store, Owner::Pack, true)),
             Call::Buffer => ResultOf::Buffer(owned.pool.buffer(&mut owned.store, worker, true)),
-            Call::Any => ResultOf::Any(owned.pool.wait_any(&mut owned.store)),
+            Call::Any => ResultOf::Any(owned.pool.wait_any(&mut owned.store, std::iter::empty())),
         };
         let still_owned = owned.pool.out_for(Owner::Pack);
         back.try_send((owned, result, still_owned)).unwrap();

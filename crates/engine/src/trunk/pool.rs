@@ -465,6 +465,11 @@ pub struct Pool {
     attach: Option<(Attacher, usize)>,
     /// A nonblocking take found work out but no message yet: a task can await the receiver.
     waiting: bool,
+    /// Messages taken from the workers since the pool began. A feeding owner that takes one
+    /// after it last found every feed starved feeds again before it waits
+    /// ([`ShardDb::feed_from`](crate::shard_db::ShardDb)): the message may have brought a
+    /// starved feed's buffer back. Wrapping: only its change is read.
+    accepted: u64,
     /// Terminal jobs are abandoned, their refills refused, before the job channels close.
     closing: bool,
     /// Every worker dropped its store and return sender, including its device attachment.
@@ -524,6 +529,7 @@ impl Pool {
             since: None,
             attach: None,
             waiting: false,
+            accepted: 0,
             closing: false,
             closed: false,
             close_error: None,
@@ -1050,6 +1056,7 @@ impl Pool {
         message: Message,
     ) -> Result<bool, Error> {
         self.waiting = false;
+        self.accepted = self.accepted.wrapping_add(1);
         match message {
             Message::Ready { result, .. } => result?,
             Message::Retired { worker, result } => {
@@ -1144,13 +1151,43 @@ impl Pool {
     }
 
     /// Waits for one message from the workers, answered or kept as [`Self::take`] does: false,
-    /// with nothing taken, when no worker has a job out to send one.
-    pub fn wait_any<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<bool, Error> {
+    /// with nothing taken, when no worker has a job out to send one. `open` names the workers
+    /// whose packing feeds are still open. Refused while one of them has a buffer back in hand:
+    /// a packing worker sends nothing while it waits for its feed, so the wait could end only by
+    /// its caller feeding it with that buffer.
+    pub fn wait_any<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        open: impl IntoIterator<Item = usize>,
+    ) -> Result<bool, Error> {
         blocking_wait_allowed(true)?;
         if !self.workers.iter().flatten().any(|w| w.owner.is_some()) {
             return Ok(false);
         }
+        if open.into_iter().any(|worker| {
+            self.workers
+                .get(worker)
+                .and_then(Option::as_ref)
+                .is_some_and(|w| w.owner.is_some() && !w.spent.is_empty())
+        }) {
+            return Err(Error::InvalidArgument {
+                what: "a wait for a packing worker's message while its buffer is back in hand",
+            });
+        }
         self.next(store, true)
+    }
+
+    /// Messages taken from the workers since the pool began, wrapping: only its change is read.
+    pub fn accepted(&self) -> u64 {
+        self.accepted
+    }
+
+    /// The packing buffers worker `worker` gave back that are held here, not yet taken.
+    pub fn spent(&self, worker: usize) -> usize {
+        self.workers
+            .get(worker)
+            .and_then(Option::as_ref)
+            .map_or(0, |w| w.spent.len())
     }
 
     /// Whether a job of `owner`'s is out, or back and not yet taken.

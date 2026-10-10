@@ -127,6 +127,10 @@ pub struct IoStats {
     pub device_reads: u64,
     pub device_read_ns: u64,
     pub budget_wait_ns: u64,
+    /// Demand pages read from the OS's memory on the store's own thread, none handed to the
+    /// device's issuer ([`hyper_block::block::BlockFile::read_resident_at`]): counted among
+    /// `device_reads` too, and timed there, since a larger cache would have saved them.
+    pub resident_reads: u64,
 }
 
 /// Nanoseconds since `since`, none when timing is off (`Store::set_timed`).
@@ -2655,9 +2659,76 @@ impl<F: BlockFile> Store<F> {
         Ok(())
     }
 
-    /// A demand page through the issuer, even for a one-page foreground span. False
-    /// leaves `out` and the current span page unchanged; the owned read resumes after
-    /// its numbered answer. Memory hits and every new device page keep Node validation.
+    /// Reads `buf` from `offset` only if the OS holds all of it in memory now, on this thread:
+    /// handed to the device's issuer, a read the OS answers from memory in microseconds would cost
+    /// two wakes of parked threads instead, each the scheduler's to grant, tens of microseconds at
+    /// the median and milliseconds at the tail on a busy machine (docs/research/41-resident-reads.md).
+    /// Counted and timed as a device read, the price the memory tuner sets on a miss, as the
+    /// blocking path does ([`Self::read_page`]). False when the read would wait.
+    ///
+    /// Read through the issuer attachment's own duplicate when attached: an async store's original
+    /// file is its retirement owner's ([`Self::adopt_original`]), not the store's to read with.
+    fn read_resident(&mut self, buf: &mut AlignedBuf, offset: u64) -> Result<bool, Error> {
+        let started = Some(std::time::Instant::now());
+        let read = if let Some(writer) = self.writer.as_mut() {
+            writer.attached.read_resident_at(buf.as_mut_slice(), offset)
+        } else if let Some(file) = self.file.as_mut() {
+            file.read_resident_at(buf.as_mut_slice(), offset)
+        } else {
+            return Ok(false);
+        }
+        .map_err(|e| io("read a store page from memory", e))?;
+        if read {
+            let ns = elapsed_ns(started);
+            self.io.reads = self.io.reads.saturating_add(1);
+            self.io.pages_read = self.io.pages_read.saturating_add(1);
+            self.io.read_ns = self.io.read_ns.saturating_add(ns);
+            self.io.device_reads = self.io.device_reads.saturating_add(1);
+            self.io.device_read_ns = self.io.device_read_ns.saturating_add(ns);
+            self.io.resident_reads = self.io.resident_reads.saturating_add(1);
+        }
+        Ok(read)
+    }
+
+    /// Appends the page at `address` from the read `span` holds to `out`, once it verifies: false
+    /// when the span holds no read of it. A read that just landed fills the cache.
+    fn span_page(
+        &mut self,
+        span: &Span,
+        address: u64,
+        out: &mut Vec<u8>,
+        landed: bool,
+    ) -> Result<bool, Error> {
+        let Some(index) = address
+            .checked_sub(span.first)
+            .filter(|&index| index < u64::from(span.pages))
+        else {
+            return Ok(false);
+        };
+        let at = usize::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_mul(self.config.page_size))
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        let end = at
+            .checked_add(self.config.page_size)
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        let page = span
+            .buf
+            .as_slice()
+            .get(at..end)
+            .ok_or(corrupt(Malformed::Truncated))?;
+        let payload = node_payload_ref(page, address)?;
+        if landed && let Some(cache) = self.cache.as_mut() {
+            cache.insert(address, payload);
+        }
+        out.extend_from_slice(payload);
+        Ok(true)
+    }
+
+    /// A demand page from the OS's memory where it is there ([`Self::read_resident`]), otherwise
+    /// through the issuer, even for a one-page foreground span. False leaves `out` and the
+    /// current span page unchanged; the owned read resumes after its numbered answer. Memory hits
+    /// and every new device page keep Node validation.
     pub(crate) fn read_page_paced(
         &mut self,
         span: &mut Span,
@@ -2715,27 +2786,7 @@ impl<F: BlockFile> Store<F> {
             span.pages = pages;
             landed = true;
         }
-        if let Some(index) = address
-            .checked_sub(span.first)
-            .filter(|&index| index < u64::from(span.pages))
-        {
-            let at = usize::try_from(index)
-                .ok()
-                .and_then(|index| index.checked_mul(self.config.page_size))
-                .ok_or(corrupt(Malformed::TooLarge))?;
-            let end = at
-                .checked_add(self.config.page_size)
-                .ok_or(corrupt(Malformed::TooLarge))?;
-            let page = span
-                .buf
-                .as_slice()
-                .get(at..end)
-                .ok_or(corrupt(Malformed::Truncated))?;
-            let payload = node_payload_ref(page, address)?;
-            if landed && let Some(cache) = self.cache.as_mut() {
-                cache.insert(address, payload);
-            }
-            out.extend_from_slice(payload);
+        if self.span_page(span, address, out, landed)? {
             return Ok(true);
         }
         if let Some((prepared, page)) = span.prepared.take() {
@@ -2764,11 +2815,11 @@ impl<F: BlockFile> Store<F> {
             .writer
             .as_mut()
             .ok_or_else(|| io("read a paced demand page", "no issuer attached"))?;
+        // A write still out over the page: the file does not hold its bytes yet.
         if writer
             .in_flight
             .iter()
             .any(|&(_, first, end, _)| first <= address && address < end)
-            || writer.attached.out() >= writer.attached.batches()
         {
             writer.read_wanted = true;
             return Ok(false);
@@ -2781,6 +2832,35 @@ impl<F: BlockFile> Store<F> {
         if let Err(error) = buf.set_len(self.config.page_size) {
             self.give_buf(buf);
             return Err(io("size a paced demand page", error));
+        }
+        if self.read_resident(&mut buf, offset)? {
+            if let Err(error) = buf.set_len(buf.capacity()) {
+                self.give_buf(buf);
+                return Err(io("size a paced demand page", error));
+            }
+            let old = std::mem::replace(&mut span.buf, buf);
+            self.give_buf(old);
+            span.first = address;
+            span.pages = 1;
+            return if self.span_page(span, address, out, true)? {
+                Ok(true)
+            } else {
+                Err(corrupt(Malformed::Truncated))
+            };
+        }
+        let full = self.writer.as_mut().map(|writer| {
+            let full = writer.attached.out() >= writer.attached.batches();
+            if full {
+                writer.read_wanted = true;
+            }
+            full
+        });
+        if full != Some(false) {
+            self.give_buf(buf);
+            return match full {
+                Some(_) => Ok(false),
+                None => Err(io("read a paced demand page", "no issuer attached")),
+            };
         }
         let Some(writer) = self.writer.as_mut() else {
             self.give_buf(buf);

@@ -150,6 +150,12 @@ impl Handle {
         )
     }
 
+    fn read_resident_at(&mut self, bytes: &mut [u8], at: u64) -> Result<bool, DiskError> {
+        self.0
+            .as_mut()
+            .map_or(Ok(false), |file| file.read_resident_at(bytes, at))
+    }
+
     fn write_all_at(&self, bytes: &[u8], at: u64) -> Result<(), DiskError> {
         self.0.as_ref().map_or_else(
             || Err(stopped(Path::new(""), "a write after duplicate retirement")),
@@ -162,6 +168,12 @@ impl Handle {
             || Err(stopped(Path::new(""), "a flush after duplicate retirement")),
             |file| file.sync_data(),
         )
+    }
+}
+
+impl std::fmt::Debug for Handle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Handle").field(&self.0.is_some()).finish()
     }
 }
 
@@ -576,6 +588,13 @@ fn attach<F: BlockFile + 'static>(
     for _ in 0..workers {
         files.push(Handle(Some(Box::new(file.try_clone()?))));
     }
+    // The submitter's own duplicate, for what it reads from memory on its own thread
+    // (`Attached::read_resident_at`): kept only for a file that can tell what the OS holds.
+    let reader = if file.reads_resident() {
+        Some(Handle(Some(Box::new(file.try_clone()?))))
+    } else {
+        None
+    };
     // Each admitted batch has one numbered answer, plus one post-quiescence terminal fact.
     let (answers, answered) = sync::channel(answer_bound).map_err(|error| DiskError::Io {
         op: "attach completion channel",
@@ -630,6 +649,8 @@ fn attach<F: BlockFile + 'static>(
         next: 0,
         retirement: RetirementState::Live,
         watch_prepared: false,
+        reader,
+        reader_failure: None,
     })
 }
 
@@ -670,6 +691,15 @@ pub struct Attached {
     next: u64,
     retirement: RetirementState,
     watch_prepared: bool,
+    /// This submitter's own duplicate of the file, for the reads it makes from memory on its own
+    /// thread ([`Self::read_resident_at`]): none for a file that cannot tell what the OS holds,
+    /// and none once retirement began. It is closed before retirement is signalled, so the
+    /// original, which its owner keeps open until this attachment's retirement is answered
+    /// ([`RetirementWatch`]), is never the duplicate's to outlive: its close releases a
+    /// descriptor and is never the file's physical close.
+    reader: Option<Handle>,
+    /// That duplicate's Drop unwound: retirement reports it.
+    reader_failure: Option<LifecycleFailure>,
 }
 
 /// An independent physical fence for one registered attachment. Its receiver can
@@ -1007,6 +1037,7 @@ impl Attached {
             ));
         }
         if self.retirement == RetirementState::Live {
+            self.close_reader();
             let submitted = match self.submissions.as_ref() {
                 Some(sender) => sender.try_send(Submission::Retire),
                 None => Err(SyncError::Closed(Submission::Retire)),
@@ -1038,7 +1069,11 @@ impl Attached {
             Completion::Detached(result) => {
                 self.retirement = RetirementState::Retired;
                 self.out = 0;
-                result
+                result.and(
+                    self.reader_failure
+                        .take()
+                        .map_or(Ok(()), |failed| Err(failed.error(&self.path))),
+                )
             }
             Completion::Batch(_) => Err(stopped(
                 &self.path,
@@ -1102,6 +1137,28 @@ impl Attached {
     pub fn batches(&self) -> usize {
         self.batches
     }
+
+    /// Fills `buf` from `offset` only if the OS holds every byte of it in memory now: read through
+    /// this submitter's own duplicate, on its own thread, with no worker and no wake between it
+    /// and the bytes (`crate::resident`). False when the read would wait, the file cannot tell, or
+    /// retirement began: the read is then the issuer's to make ([`Self::submit_reads`]).
+    pub fn read_resident_at(&mut self, buf: &mut [u8], offset: u64) -> Result<bool, DiskError> {
+        if self.retirement != RetirementState::Live {
+            return Ok(false);
+        }
+        self.reader
+            .as_mut()
+            .map_or(Ok(false), |reader| reader.read_resident_at(buf, offset))
+    }
+
+    /// Closes the submitter's own duplicate, before retirement is signalled (see `reader`).
+    fn close_reader(&mut self) {
+        if let Some(mut reader) = self.reader.take()
+            && let Some(failed) = reader.retire()
+        {
+            self.reader_failure.get_or_insert(failed);
+        }
+    }
 }
 
 impl Drop for Attached {
@@ -1109,6 +1166,8 @@ impl Drop for Attached {
         if self.retirement == RetirementState::Retired {
             return;
         }
+        // Before any retirement is signalled: see `reader`.
+        self.close_reader();
         if hyper_rt::registry::current_shard().is_some() {
             // Closing the sole producer is the terminal command. The issuer drains its
             // queued lane and keeps accepted batches until their physical reports retire.
@@ -2773,6 +2832,10 @@ mod tests {
         completed: AtomicUsize,
         /// Duplicates alive.
         alive: AtomicUsize,
+        /// Whether the probe says it reads from memory (`BlockFile::reads_resident`), and the
+        /// reads it made there.
+        resident: AtomicBool,
+        resident_reads: AtomicUsize,
     }
 
     /// A file on disk that counts the transfers in flight, holds every write until the test
@@ -2822,6 +2885,16 @@ mod tests {
     impl BlockFile for Probe {
         fn alignment(&self) -> Alignment {
             Alignment::new(4096).unwrap()
+        }
+
+        fn reads_resident(&self) -> bool {
+            self.counts.resident.load(Ordering::SeqCst)
+        }
+
+        fn read_resident_at(&mut self, buf: &mut [u8], offset: u64) -> Result<bool, DiskError> {
+            self.file.read_exact_at(buf, offset)?;
+            self.counts.resident_reads.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
         }
 
         fn len(&self) -> Result<u64, DiskError> {
@@ -3769,6 +3842,55 @@ mod tests {
         drop(issuer);
         assert!(attached.submit_reads(reads(0, 1)).is_err() || attached.answer().is_err());
         drop(attached);
+        assert_eq!(probe.counts.alive.load(Ordering::SeqCst), 1);
+    }
+
+    /// Do: attach a file that reads from memory, read through the attachment, then retire it
+    /// while a cold thread waits on its retirement watch. Expect: the read is made on the
+    /// submitter's own duplicate with the file's bytes, none goes to a worker; when the watch is
+    /// answered only the original is left (the duplicate closed before retirement was signalled,
+    /// so the original's close is the file's last); a retired attachment reads nothing here.
+    #[test]
+    fn a_submitters_own_duplicate_reads_from_memory_and_closes_before_retirement() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 2).unwrap();
+        let probe = Probe::new(dir.path(), true, None);
+        probe.counts.resident.store(true, Ordering::SeqCst);
+        probe.file.write_all_at(&[7; 8192], 0).unwrap();
+        let mut attached = issuer.attach(&probe).unwrap();
+        // The original, a duplicate for each of the two workers, and the submitter's own.
+        assert_eq!(probe.counts.alive.load(Ordering::SeqCst), 4);
+        let mut buf = vec![0u8; 4096];
+        assert!(attached.read_resident_at(&mut buf, 4096).unwrap());
+        assert_eq!(buf, [7; 4096]);
+        assert_eq!(probe.counts.resident_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(attached.out(), 0);
+        let mut watch = attached.prepare_retirement_watch().unwrap();
+        let counts = probe.counts;
+        std::thread::scope(|scope| {
+            let watched = scope.spawn(move || {
+                watch.wait_blocking().unwrap();
+                counts.alive.load(Ordering::SeqCst)
+            });
+            attached.retire_blocking().unwrap();
+            assert_eq!(watched.join().unwrap(), 1);
+        });
+        assert!(!attached.read_resident_at(&mut buf, 0).unwrap());
+        assert_eq!(probe.counts.resident_reads.load(Ordering::SeqCst), 1);
+    }
+
+    /// Do: attach a file that cannot tell what the OS holds. Expect: no duplicate is kept for the
+    /// submitter, and it reads nothing from memory.
+    #[test]
+    fn a_file_that_cannot_tell_gets_no_submitter_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 2).unwrap();
+        let probe = Probe::new(dir.path(), true, None);
+        let mut attached = issuer.attach(&probe).unwrap();
+        assert_eq!(probe.counts.alive.load(Ordering::SeqCst), 3);
+        let mut buf = vec![0u8; 4096];
+        assert!(!attached.read_resident_at(&mut buf, 0).unwrap());
+        attached.retire_blocking().unwrap();
         assert_eq!(probe.counts.alive.load(Ordering::SeqCst), 1);
     }
 

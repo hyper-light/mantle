@@ -376,7 +376,7 @@ impl Workload {
 fn stats(name: &str, counters: &[RangeStats]) {
     for (range, (f, t, io)) in counters.iter().enumerate() {
         println!(
-            "{name} range {range} flushes {} stalls {} waited_steps {} pivot_compactions {} leaf_compactions {} splits {} entries_written {} views_built {} views_dropped {} maplets_built {} maplets_declined {} maplets_dropped {} io reads {} pages_read {} submitted {} pages_written {} syncs {} queued {} queued_most {} write_waits {} prefetches {} prefetch_waits {} cache_hits {} span_cache_hits {}",
+            "{name} range {range} flushes {} stalls {} waited_steps {} pivot_compactions {} leaf_compactions {} splits {} entries_written {} views_built {} views_dropped {} maplets_built {} maplets_declined {} maplets_dropped {} io reads {} pages_read {} submitted {} pages_written {} syncs {} queued {} queued_most {} write_waits {} prefetches {} prefetch_waits {} cache_hits {} span_cache_hits {} device_reads {} resident_reads {} device_read_ns {}",
             f.flushes,
             f.stalls,
             f.waited_steps,
@@ -400,7 +400,10 @@ fn stats(name: &str, counters: &[RangeStats]) {
             io.prefetches,
             io.prefetch_waits,
             io.cache_hits,
-            io.span_cache_hits
+            io.span_cache_hits,
+            io.device_reads,
+            io.resident_reads,
+            io.device_read_ns
         );
     }
 }

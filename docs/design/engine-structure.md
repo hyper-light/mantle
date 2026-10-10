@@ -91,7 +91,12 @@ but its own first part: the work spread over shards, one per core, each owning w
   fall behind. A shard never runs another shard's maintenance: its replicas' state never leaves
   it.
 - **I/O.** Each range's store attaches to its device's issuer (hyper-block), shared by every
-  range on the device, so a device keeps its measured depth whatever the range count.
+  range on the device, so a device keeps its measured depth whatever the range count. A demand
+  page the OS holds in memory is read on the range's own shard, through the attachment's own
+  duplicate of the file (`Attached::read_resident_at`: `RWF_NOWAIT` on Linux, `mincore` over a
+  kept mapping on macOS); only a read that would wait goes to the issuer, since each handoff to it
+  is a wake the scheduler grants, tens of microseconds at the median and milliseconds at the tail
+  on a busy machine (research/41).
 - **Active memtable order.** A range's paced idle slices finish the sorts and counter merges
   already admitted by puts (`HashMem::debt`, `pay`; research/40). They do not sort each new
   partial tail and merge it with a larger run: that repeats the larger run's rebuild as writes

@@ -146,6 +146,15 @@ required. After the producer lands, re-vendor from its exact accepted commit obj
 conform manifests by the recipe above and update SNAPSHOT; the historical rows below
 are not current API identity.
 
+Mantle-local changes to `hyper-block` on `worker-stream`, made here by the owner's direction and
+owed upstream to hyper-raft: the issuer hands a one-transfer read straight to a worker, which
+answers the submitter itself (`Attached::submit_reads`, two cross-thread handoffs where the broker
+path takes four); and a read the OS holds in memory is made on the submitter's own thread
+(`resident`, `BlockFile::read_resident_at`, `BlockFile::reads_resident`,
+`Attached::read_resident_at`: `RWF_NOWAIT` on Linux, `mincore(2)` over a kept mapping on macOS;
+mantle `docs/research/41-resident-reads.md`). `libc` is a dependency on Apple targets too, for the
+latter; the lock files are unchanged.
+
 The AWS-LC workspace command above excludes these standalone shared-crate roots. It does
 not run their runtime, device or allocation tests. Their suites must also be run against
 the exact development sources, including `hyper-block/tests/issuer_allocs.rs`.

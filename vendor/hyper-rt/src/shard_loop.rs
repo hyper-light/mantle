@@ -7,8 +7,9 @@
 //! spin out the idle window that client activity opened, and park in the driver until a kick, a completion
 //! or the next deadline. Cancellation guarantees a terminal completion: the future is dropped at the next
 //! poll boundary, the task's children are cancelled and joined, and whoever joins it sees `Cancelled`.
+//! A step's polls fill its step budget at the cost the shard measured its last step's polls (`next_batch`).
 //! The watchdog times each step that polled, from its start to its polls' end, and attributes a step past
-//! the step quantum to its tasks or to the host ([`crate::attribution`]).
+//! its budget and one quantum to its tasks or to the host ([`crate::attribution`]).
 //!
 //! **Ownership.** [`Shard`] owns everything here by value: its desk (boxed, so the address the thread's
 //! current-shard pointer names is stable) and its loop state. A step lends the desk to the tasks it polls
@@ -55,13 +56,14 @@ pub struct Counters {
     pub steps: u64,
     /// Task polls.
     pub polls: u64,
-    /// Steps past the step quantum that were their tasks' own: past it on the CPU, or waiting inside a call.
+    /// Steps past their bound (the step budget and one quantum) that were their tasks' own: past it on the
+    /// CPU, or waiting inside a call.
     pub long_steps: u64,
     /// Of `long_steps`, the steps that waited inside a call.
     pub blocked_steps: u64,
-    /// Steps past the quantum by the wall clock that the host held.
+    /// Steps past their bound by the wall clock that the host held.
     pub preempted_steps: u64,
-    /// Steps past the quantum by the wall clock that could not be attributed.
+    /// Steps past their bound by the wall clock that could not be attributed.
     pub unattributed_steps: u64,
     /// The longest step that polled, by the wall clock from its start to its polls' end, in nanoseconds.
     pub longest_step_ns: u64,
@@ -71,7 +73,7 @@ pub struct Counters {
     pub wake_stale: u64,
     /// Kicks that found the shard not yet asleep, so no wake was measured.
     pub wake_unslept: u64,
-    /// The online wake estimate, nanoseconds.
+    /// The online wake estimate, nanoseconds (0 for a shard that does not track its wake).
     pub wake_cost_ns: u64,
     /// The online cost of blocking: the CPU one park/wake cycle costs, the shard's park and its sender's
     /// kick, nanoseconds (`park_cost`); a tracking shard's idle spin lasts this long. 0 before the first
@@ -232,8 +234,9 @@ struct Core {
     /// The parking word's kick sums last folded into `kick_cost`.
     kicks_seen: (u64, u64),
     idle_ratio: u64,
-    fixed_quantum_ns: u64,
     fixed_spin_ns: u64,
+    /// The polls the next step may take (`next_batch`): one at first, nothing measured yet.
+    batch: usize,
     /// The published time of the last driver retrieval: busy native turns share one quantum.
     last_driver_ns: u64,
     /// Whether the driver's clock is real time (the simulation's is not).
@@ -357,8 +360,8 @@ impl Shard {
             idle_ratio: config
                 .wake_tracking
                 .map_or(1, |tracking| tracking.idle_ratio),
-            fixed_quantum_ns: config.step_budget_ns,
             fixed_spin_ns: config.spin_ns,
+            batch: 1,
             last_driver_ns: now_ns,
             real_time: !is_sim,
             attribution: Tracker::default(),
@@ -416,7 +419,7 @@ impl Shard {
             .saturating_add(self.desk.refused_spawns.get());
         c.timer_waits = c.timer_waits.saturating_add(self.desk.timer_waits.get());
         c.scheduler_overrun_ns = self.desk.scheduler_overrun_ns.get();
-        c.wake_cost_ns = self.quantum_ns();
+        c.wake_cost_ns = self.core.wake.map_or(0, |estimate| estimate.mean_ns());
         c.park_cost_ns = self.blocking_cost_ns().unwrap_or(0);
         c.park_samples = self.core.park_cost.samples();
         c
@@ -459,12 +462,9 @@ impl Shard {
         }
     }
 
-    /// The step quantum now: the online wake estimate while the shard tracks one, else the configured budget.
+    /// The step quantum: the configured step budget (mantle `docs/design/event-loop.md` D6).
     pub fn quantum_ns(&self) -> u64 {
-        self.core
-            .wake
-            .map_or(self.core.fixed_quantum_ns, |estimate| estimate.mean_ns())
-            .max(1)
+        self.core.config.step_budget_ns.max(1)
     }
 
     /// The idle spin window now: while the shard tracks its costs, what blocking costs it times the idle
@@ -978,19 +978,26 @@ impl Shard {
         // The configured poll budget bounds this phase, including wakes produced by
         // earlier polls. The FIFO keeps already-ready tasks ahead of those wakes;
         // a local request/reply handoff need not repeat the whole loop for each end.
-        let batch = self.core.config.batch.max(1);
+        // A shard with no real clock cannot time its steps, so it takes the configured batch every step.
+        let batch = if self.core.real_time {
+            self.core.batch
+        } else {
+            self.core.config.batch.max(1)
+        };
         // No clock reading a poll: the step is timed whole, after its polls.
-        let mut polled = false;
+        let mut polls: usize = 0;
         for _ in 0..batch {
             let Some(slot) = self.desk.local.pop() else {
                 break;
             };
             did_work = true;
-            polled |= self.poll_slot(slot);
+            if self.poll_slot(slot) {
+                polls = polls.saturating_add(1);
+            }
             self.apply();
         }
-        if polled {
-            self.time_step(started_ns);
+        if polls > 0 {
+            self.time_step(started_ns, polls);
         }
         // Running tasks, not occupied slots: a finished task that waits for a joiner holds its slot, and after
         // shutdown nobody joins it, so waiting on it would never end (found by `tcp::serve`'s handlers).
@@ -1171,7 +1178,6 @@ impl Shard {
         let mean = estimate.mean_ns();
         self.core.counters.wake_samples = self.core.counters.wake_samples.saturating_add(1);
         self.core.counters.wake_cost_ns = mean;
-        self.desk.quantum_ns.set(self.quantum_ns());
         entry.pulse.record_wake_cost(mean);
     }
 
@@ -1219,29 +1225,42 @@ impl Shard {
         }
     }
 
-    /// Times the step that began at `started_ns` and polled, with one reading of the clock after its polls:
-    /// the watchdog judges the step by it, and a client's idle window opens where it ended.
-    fn time_step(&mut self, started_ns: u64) {
+    /// Times the step that began at `started_ns` and ran `polls` polls, with one reading of the clock after
+    /// them: the watchdog judges the step by it, a client's idle window opens where it ended, and the next
+    /// step's allowance follows from what its polls cost.
+    fn time_step(&mut self, started_ns: u64, polls: usize) {
         let ended_ns = self.now_ns();
         // A request served in this step opens the idle window from where the step ended, not where it began:
         // the spin covers the moments after the shard goes idle, however long the serving took.
         if self.desk.activity_noted.replace(false) {
             self.desk.activity_ns.set(Some(ended_ns));
         }
-        self.core.counters.longest_step_ns = self
-            .core
-            .counters
-            .longest_step_ns
-            .max(ended_ns.saturating_sub(started_ns));
+        let elapsed_ns = ended_ns.saturating_sub(started_ns);
+        self.core.counters.longest_step_ns = self.core.counters.longest_step_ns.max(elapsed_ns);
+        if self.core.real_time {
+            self.core.batch = next_batch(
+                self.core.batch,
+                self.core.config.batch,
+                self.core.config.step_budget_ns,
+                polls,
+                elapsed_ns,
+            );
+        }
         if let Some(attributed) = self.attribute_step(started_ns, ended_ns) {
             count_long_step(&mut self.core.counters, attributed);
         }
     }
 
-    /// Attributes a step against the step quantum: within it by the wall clock it is within; past it, the
-    /// attribution windows decide whose it was ([`crate::attribution`]).
+    /// Attributes a step against its bound: a step's polls fill its budget, and the poll that crosses it may
+    /// run a quantum past (a cooperative task slices by the quantum), so within the budget and one quantum by
+    /// the wall clock it is within; past it, the attribution windows decide whose it was
+    /// ([`crate::attribution`]).
     fn attribute_step(&mut self, started_ns: u64, ended_ns: u64) -> Option<Attribution> {
-        let quantum = self.quantum_ns();
+        let quantum = self
+            .core
+            .config
+            .step_budget_ns
+            .saturating_add(self.quantum_ns());
         if ended_ns.saturating_sub(started_ns) <= quantum {
             return None;
         }
@@ -1781,7 +1800,25 @@ fn account_now(now_ns: u64) -> Option<(attribution::ThreadAccount, u64)> {
     attribution::thread_account().map(|account| (account, now_ns))
 }
 
-/// Counts a step past the step quantum by the wall clock under whoever held it.
+/// The polls the next step may take (mantle `docs/design/event-loop.md` D6): as many as fill `budget_ns` at
+/// the cost a poll measured in the step just ended (its length over its `polls`, its drains with them), at
+/// most twice the step's own `allowed` — a step too short for its clock to time, or whose reading is a tick
+/// or none, doubles rather than trusting it, as slow start opens a window whose fit it does not yet know
+/// [A: Jacobson, "Congestion Avoidance and Control", SIGCOMM 1988] — and within one and `cap`.
+fn next_batch(allowed: usize, cap: usize, budget_ns: u64, polls: usize, elapsed_ns: u64) -> usize {
+    let fits = u128::from(budget_ns)
+        .saturating_mul(u128::try_from(polls).unwrap_or(u128::MAX))
+        .checked_div(u128::from(elapsed_ns))
+        .unwrap_or(u128::MAX);
+    let doubled = u128::try_from(allowed)
+        .unwrap_or(u128::MAX)
+        .saturating_mul(2);
+    usize::try_from(fits.min(doubled))
+        .unwrap_or(usize::MAX)
+        .clamp(1, cap.max(1))
+}
+
+/// Counts a step past its bound by the wall clock under whoever held it.
 fn count_long_step(counters: &mut Counters, attributed: Attribution) {
     if attributed.is_tasks() {
         counters.long_steps = counters.long_steps.saturating_add(1);
@@ -1845,5 +1882,45 @@ fn unlink_child(tasks: &mut [TaskSlot], parent: u32, child: u32) {
         && let Some(nx) = slot_mut(tasks, next)
     {
         nx.prev_sibling = prev;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Shape: the step budget of these cases, fifty microseconds.
+    const BUDGET_NS: u64 = 50_000;
+    /// Shape: the configured cap of these cases.
+    const CAP: usize = 4_096;
+
+    /// A step whose polls ran past the budget takes, next, as many as fit it at the cost they measured.
+    #[test]
+    fn a_long_step_shrinks_to_the_polls_that_fit_the_budget() {
+        // 1,000 polls in 500 µs: 500 ns a poll, 100 to the budget.
+        assert_eq!(next_batch(1_000, CAP, BUDGET_NS, 1_000, 500_000), 100);
+        // One poll ten budgets long: one poll a step, never none.
+        assert_eq!(next_batch(100, CAP, BUDGET_NS, 1, 10 * BUDGET_NS), 1);
+    }
+
+    /// A step whose polls the clock read as no time, or as a tick, doubles; a measured short step grows only
+    /// as far as the budget allows, and never past the cap.
+    #[test]
+    fn a_short_step_grows_at_most_twofold_and_never_past_the_cap() {
+        assert_eq!(next_batch(8, CAP, BUDGET_NS, 8, 0), 16);
+        // Four polls inside one 41.67 ns tick read as 41 ns: "1,219 a budget" is not trusted past twofold.
+        assert_eq!(next_batch(4, CAP, BUDGET_NS, 4, 41), 8);
+        // 64 polls in 6.4 µs (100 ns each): 500 fit, but this step allowed 64, so 128.
+        assert_eq!(next_batch(64, CAP, BUDGET_NS, 64, 6_400), 128);
+        // 400 polls in 40 µs: 500 fit, and twice 400 is more.
+        assert_eq!(next_batch(400, CAP, BUDGET_NS, 400, 40_000), 500);
+        assert_eq!(next_batch(CAP, CAP, BUDGET_NS, CAP, 0), CAP);
+    }
+
+    /// A step whose queue ran dry before its allowance measured fewer polls: the polls it ran set the cost.
+    #[test]
+    fn a_step_that_ran_out_of_work_measures_the_polls_it_ran() {
+        // Allowed 1,000, ran 10 in 5 µs (500 ns each): 100 fit.
+        assert_eq!(next_batch(1_000, CAP, BUDGET_NS, 10, 5_000), 100);
     }
 }

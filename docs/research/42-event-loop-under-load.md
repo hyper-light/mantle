@@ -46,6 +46,9 @@ builds and tests run beside. This is its ordinary state and nothing here waited 
 | TIMERLAT | `benchmark-results/hyper-rt-vs-tokio-20261010/os-timer/` (`timerlat.c`). |
 | PANELS | `benchmark-results/hyper-rt-vs-tokio-20261010/runs/` (the harness `harness/src/main.rs`; each run's raw output and host load). |
 | GETPROF | `benchmark-results/mantle-resident-reads-smoke-20261010/reads3m-sample.txt` (a 5 s `sample` of mantle's resident get path). |
+| PRCTL | Linux man-pages, `prctl(2)`, `PR_SET_TIMERSLACK` (the page as Debian bookworm ships it, manpages.debian.org/bookworm/manpages-dev/prctl.2.en.html, read 2026-10-10). **primary** |
+| JACOBSON88 | V. Jacobson, M. J. Karels, "Congestion Avoidance and Control", revised November 1988 from the SIGCOMM '88 paper (ee.lbl.gov/papers/congavoid.pdf), §1 "Getting to Equilibrium: Slow-start", p. 4. |
+| TOKIO-YIELD | tokio at `09a57c27`, `tokio/src/task/yield_now.rs:48-55` (`yield_now` hands its waker to `context::defer`). **primary** |
 
 ## 1. What a wake costs: latency and CPU are different quantities
 
@@ -271,6 +274,63 @@ the watchdog asks whether the shard's other work was held back, which is a step'
 **MEASURED** on mantle's fill (`benchmark-results/rtloop-async-fill-bisect-20261010/b-step-r1`, eight
 interleaved rounds each, load 11.2–11.7): 1M random puts through the same-shard client at a median of
 2.96 M a second against 2.55 M (`bd7c0fd`'s runtime), gets 2.15 M against 2.12 M, seeks 536 k against 534 k.
+
+## 10. The timer slack: what the kernel grants a timed wait
+
+**primary** [PRCTL] `PR_SET_TIMERSLACK`: every thread has a current timer slack, and the kernel groups
+nearby timer expirations by it, so a timer "may be up to the specified number of nanoseconds late (but will
+never expire early)". "The timer slack values of init (PID 1), the ancestor of all processes, are 50,000
+nanoseconds (50 microseconds)", a new thread starts with its creator's value, real-time threads get none, and
+"the timer expirations affected by timer slack are those set by select(2), pselect(2), poll(2), ppoll(2),
+epoll_wait(2), epoll_pwait(2), clock_nanosleep(2), nanosleep(2), and futex(2)" and the library calls built on
+futexes.
+
+So on Linux a shard's timed park (`epoll_wait` with a timeout) may end up to 50 µs past its deadline by the
+kernel's choice alone, and so may every timed wait of every ordinary thread on the host. **INFERENCE**: a
+timing wheel whose tick is finer than that resolves deadlines the park does not honor more finely, and a busy
+shard that looks at its timers, inboxes and driver once in that span adds no more lateness than the kernel's
+own coalescing already allows. macOS and Windows coalesce timed waits under their own policies (MAN-KQUEUE's
+`NOTE_LEEWAY` is the caller's; the default leeway is not documented there), so the value is Linux's, the one
+a primary source states.
+
+The wake probe set the same constants before (tick, step budget, the poll batch's budget, the control
+channel's depth) and is the noisiest of the measurements here (§1): in a one-CPU Linux container its mean was
+565 ns, making a 565 ns tick and quantum, a poll batch of 4–8 and a control depth of 4
+(`benchmark-results/hyper-rt-vs-tokio-20261010/runs-linux/c1-quiet-bd7c0fd`).
+
+## 11. A step's allowance of polls: what fills the budget, opened by slow start
+
+A step polled a fixed count (`batch`): the latency budget over the cost of one trivial poll, measured once at
+start on a simulated shard. Real polls are not trivial. **MEASURED** (PANELS `mac-a1-r1`, case `rttbusy`,
+load 38–60, five rounds): a task computing in 50 µs slices and yielding between them beside a server, and a
+client's request through a channel to the server, closed loop. At hyper-rt `bd7c0fd` (a calibrated count of
+28) the request waited 803 µs at the median, 570 requests a second: the shard polled the slicing task up to
+28 times before it next drained its foreign wakes. With the allowance below, 125 µs and 5,827 a second;
+trantor answers in one slice, 52 µs and 11,416 a second (and tokio, PANELS `mac-ad-r1`, 55 µs).
+
+**primary** [JACOBSON88 §1, p. 4] slow-start: "When starting or restarting after a loss, set cwnd to one
+packet. On each ack for new data, increase cwnd by one packet", which "opens the window exponentially in
+time"; it "takes time R log₂W", and "guarantees that a connection will source data at a rate at most twice the
+maximum possible on the path". A step's allowance has the same unknown to find: how many polls fit the step
+budget, at a cost per poll that changes with the work. **INFERENCE**: start at one poll; after each step that
+polled, allow as many as would fill the budget at the cost the step measured a poll (its length over its
+polls, both from the step's own two clock readings, D3), but at most twice the last allowance, since a step
+too short for its clock to time (a tick or none on Apple silicon's 41.67 ns timebase) reads as costing
+nothing. A step that ran long (a long poll, or the host preempting the thread) shrinks the next allowance to
+what fits at once, as a loss restarts slow start.
+
+## 12. A timed park on macOS runs later the longer it is
+
+**MEASURED** (`benchmark-results/hyper-rt-vs-tokio-20261010/os-timer/leeway-r1`, TIMERLAT, 300 waits each,
+three rounds interleaved, load 58–61): kevent's timeout ran a median of 259–348 µs late for 1 ms, 135–250 µs
+for 500 µs, 68–166 µs for 250 µs, 58–85 µs for 125 µs and 18–30 µs for 62 µs; an `EVFILT_TIMER` one-shot
+with `NOTE_CRITICAL` for 1 ms, 35–64 µs; with `NOTE_LEEWAY` and a leeway of zero, 517–522 µs. **INFERENCE**:
+the lateness grows with the length of the wait, as a leeway proportional to the timeout would, and the
+critical timer opts out of it; §5's run at a similar load found every mechanism a median of 587–1,354 µs late,
+so the comparison wants more rounds before a design rests on it. A shard that sleeps a millisecond in one
+kevent therefore wakes later than one that woke at intermediate boundaries and parked the rest short, which
+is what the wake-sized tick's multi-level wheel did by accident (§11's runs: 129 µs at the median against
+295 µs with the 50 µs tick, trantor 258 µs).
 
 ## What remains unknown
 

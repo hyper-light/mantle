@@ -3,10 +3,11 @@
 //!
 //! The boot probe's mean wake converges slowly under a heavy tail, so a shard that tracks one refines it
 //! from the kicked parks it pays: a sender stamps the first kick of a park, and the shard folds the
-//! kick-to-running latency of a park that slept into its estimate, which its step quantum and idle spin
-//! follow. A shard whose configuration carries no measured prior keeps its fixed values. A step past the
-//! quantum by the wall clock is attributed in a window of the thread's account: its tasks' when it ran
-//! past the quantum on the CPU or blocked in a call, the host's when it was runnable and held off the
+//! kick-to-running latency of a park that slept into its estimate, which it reports
+//! (`Counters::wake_cost_ns`); its step quantum is its step budget whatever the wake. A shard whose
+//! configuration carries no measured prior learns nothing. A step past its bound (the step budget and one
+//! quantum) by the wall clock is attributed in a window of the thread's account: its tasks' when it ran
+//! past the bound on the CPU or blocked in a call, the host's when it was runnable and held off the
 //! CPU, unattributed where the platform cannot tell (the first long step opens the first window). Each
 //! held poll below is a step of its own (a batch of one), so a step's attribution is its poll's.
 
@@ -48,7 +49,8 @@ const SHIFT: u32 = 4;
 const KICKS: u64 = 24;
 /// Shape: the fixed quantum of the long-step test — a millisecond, far above a poll's own cost.
 const QUANTUM_NS: u64 = 1_000_000;
-/// Shape: how long a long poll holds its thread, three quanta: past the quantum by any clock.
+/// Shape: how long a long poll holds its thread, three quanta: past a step's bound (the budget and one
+/// quantum, two) by any clock.
 const HOLD: Duration = Duration::from_millis(3);
 /// Shape: polls each long-step history runs in one busy period.
 const LONG_POLLS: u64 = 3;
@@ -130,8 +132,8 @@ fn park_and_kick(rt: &mut LocalRuntime, wakers: &Receiver<Waker>) {
 /// §4.3, A-31: a tracking shard kicked while asleep learns the kick's wake — each such park is one sample
 /// (the non-vacuity count), and every kicked park is either a sample or counted unslept (a kick that found
 /// it awake) — and its estimate, seeded with a one-second prior, moves down to the wakes it measured; its
-/// step quantum is the estimate, and the registry pulse mirrors it for another thread. A shard with no
-/// measured prior learns nothing and keeps its fixed quantum.
+/// step quantum stays its step budget, and the registry pulse mirrors the estimate for another thread. A
+/// shard with no measured prior learns nothing.
 #[test]
 #[cfg_attr(miri, ignore)] // the OS driver opens a kqueue or an eventfd, which Miri does not model
 fn a_tracking_shard_learns_its_wake_from_the_parks_its_kicks_ended() {
@@ -171,7 +173,11 @@ fn a_tracking_shard_learns_its_wake_from_the_parks_its_kicks_ended() {
         counters.wake_cost_ns < PRIOR_NS / 2,
         "the estimate moved off its one-second prior toward the measured wakes: {counters:?}"
     );
-    assert_eq!(rt.context().quantum_ns(), counters.wake_cost_ns);
+    assert_eq!(
+        rt.context().quantum_ns(),
+        PRIOR_NS,
+        "the quantum is the step budget, whatever the wake"
+    );
     let mirrored =
         registry::with_entry(rt.shard_id().0, |entry| entry.pulse.wake_cost_ns()).unwrap();
     assert_eq!(mirrored, counters.wake_cost_ns);

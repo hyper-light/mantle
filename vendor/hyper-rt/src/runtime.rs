@@ -69,14 +69,17 @@ pub struct RuntimeConfig {
     /// waits its tasks start in one poll each (docs/runtime.md §3.4); past it a registration is refused
     /// `Capacity`.
     pub interests_per_shard: usize,
-    /// The completion buffer's initial entries, and the most polls a calibrated batch takes
-    /// ([`RuntimeConfig::calibrate_batch`]).
+    /// The completion buffer's initial entries: the most completions one driver wait hands over without
+    /// growing it.
     pub ring_entries: usize,
-    /// The step budget the watchdog counts against, in nanoseconds.
+    /// The step budget, in nanoseconds: how long a busy shard's polls run before it looks at its inboxes,
+    /// timers and driver again; the quantum a cooperative task slices its work by; and, with one quantum
+    /// more, what the watchdog judges a step's length against (mantle `docs/design/event-loop.md` D6).
     pub step_budget_ns: u64,
     /// The timing wheel's tick, in nanoseconds.
     pub timer_tick_ns: u64,
-    /// The bound on items processed per loop phase.
+    /// The most polls one step takes, and the most control messages one step drains. A shard on a real clock
+    /// takes fewer polls when the polls it measured would run its step past the step budget (D6).
     pub batch: usize,
     /// Whether to pin shard threads to cores.
     pub pin: bool,
@@ -117,12 +120,6 @@ pub fn interests_for(tasks: usize) -> usize {
     tasks.saturating_mul(2)
 }
 
-/// A shard's inbound ring from the derived `control_entries` (Little's law at the overflow target), at least
-/// one: on a machine whose wake p99 is no longer than a syscall's median the law asks for one.
-fn control_depth(derived: u64) -> usize {
-    usize::try_from(derived).unwrap_or(usize::MAX).max(1)
-}
-
 impl RuntimeConfig {
     /// Checks the representation bounds before a driver, queue or arena is acquired. Zero-sized
     /// arenas keep their existing refusal behavior; indices must fit their actual encoded fields.
@@ -157,31 +154,35 @@ impl RuntimeConfig {
 
     /// A configuration from the machine's calibration and the constants the consumer's policy derived from
     /// it ([`Calibration::constants`]): the shard count and their cores from the placement, the tick, step
-    /// budget, spin window and control depth from the derived constants, and the batch bound against the
-    /// derived budget (see [`RuntimeConfig::calibrate_batch`]). The task and timer limits come from the
-    /// caller's measurements (Little's law, [`admission_limit`]).
+    /// budget and spin window from the constants. The task and timer limits come from the caller's
+    /// measurements (Little's law, [`admission_limit`]); the readiness waits and the completion buffer follow
+    /// from the task limit. A step's polls are bounded by its budget at the cost each shard measures its own
+    /// polls (D6), so `batch` is only the bound where no clock times a step.
     pub fn from_calibration(
         calibration: &Calibration,
         constants: &Constants,
         tasks_per_shard: usize,
         timers_per_shard: usize,
     ) -> Self {
-        let ring_entries = control_depth(constants.control_entries.get());
+        let interests_per_shard = interests_for(tasks_per_shard);
+        let step_budget_ns = constants.step_ns.get();
         let cores = constants
             .placement
             .fixed
             .as_ref()
             .map(|fixed| fixed.shards.clone())
             .unwrap_or_default();
-        let mut config = Self {
+        Self {
             shards: constants.placement.shards.get(),
             tasks_per_shard,
             timers_per_shard,
-            interests_per_shard: interests_for(tasks_per_shard),
-            ring_entries,
-            step_budget_ns: constants.spin_ns.get(),
+            interests_per_shard,
+            // Every readiness wait the shard's tasks may hold, and the kick, complete in one wait.
+            ring_entries: interests_per_shard.saturating_add(1),
+            step_budget_ns,
             timer_tick_ns: constants.tick_ns.get(),
-            batch: ring_entries,
+            // A poll costs at least a nanosecond, so no step of the budget holds more polls.
+            batch: usize::try_from(step_budget_ns).unwrap_or(usize::MAX).max(1),
             // Fixed only to cores the process owns; none means the OS places the shards.
             pin: !cores.is_empty(),
             cores,
@@ -192,34 +193,7 @@ impl RuntimeConfig {
                 shift: calibration.wake.estimate_shift(),
                 idle_ratio: 1,
             }),
-        };
-        config.batch = config
-            .calibrate_batch(constants.batch_budget_ns.get())
-            .get();
-        config
-    }
-
-    /// The batch bound: the latency budget divided by the measured cost of one loop item (a task
-    /// poll of a trivial future through the whole loop), measured here and now on a simulated
-    /// shard, so the bound is never a guess (§4.3, "batch bound = latency budget / measured
-    /// per-item cost").
-    pub fn calibrate_batch(&self, latency_budget_ns: u64) -> Derived<usize> {
-        let per_item_ns = measured_item_cost_ns(self);
-        derived!(
-            usize::try_from(
-                latency_budget_ns
-                    .checked_div(per_item_ns.max(1))
-                    .unwrap_or(0)
-            )
-            .unwrap_or(usize::MAX)
-            .clamp(1, self.ring_entries.max(1)),
-            "latency budget / measured per-item loop cost, clamped to [1, ring entries]",
-            [
-                "rt.latency_budget_ns",
-                "rt.item_cost_ns (measured at start)",
-                "rt.ring_entries"
-            ]
-        )
+        }
     }
 
     /// Task slots per slab segment: one base page of slots.
@@ -244,31 +218,6 @@ impl RuntimeConfig {
 fn log_pin_refused(_shard: u16, _core: u32) {
     // A library reports through what it returns: the refusal is the shard's counter
     // (`Counters::pin_refused`), which the consumer reads and logs as it chooses.
-}
-
-/// Measures the cost of one loop item on a simulated shard: spawn a trivial task, run it to
-/// completion, reap it. The simulation driver has no OS resources, so this costs microseconds.
-fn measured_item_cost_ns(config: &RuntimeConfig) -> u64 {
-    let probe = RuntimeConfig {
-        shards: 1,
-        ..config.clone()
-    };
-    let Ok(mut sim) = crate::sim::SimRuntime::new(&probe, 0) else {
-        return 1;
-    };
-    let shard = sim.shard_ids().first().copied();
-    let Some(shard) = shard else { return 1 };
-    let started = crate::machine::clock::monotonic_ns();
-    /// Shape: enough items to amortize the clock reads (two per batch) below one percent.
-    const ITEMS: u64 = 4096;
-    for _ in 0..ITEMS {
-        let _ = sim.spawn_on(shard, async {});
-        sim.run_until_idle();
-    }
-    crate::machine::clock::monotonic_ns()
-        .saturating_sub(started)
-        .checked_div(ITEMS)
-        .unwrap_or(0)
 }
 
 /// Little's law: the tasks in flight at a measured request rate and p99 service time.

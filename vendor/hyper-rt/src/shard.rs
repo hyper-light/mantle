@@ -485,15 +485,16 @@ impl ShardContext {
         Encoded::pack(self.id, slot, generation).map(TaskId)
     }
 
-    /// The step quantum (docs/runtime.md §3.4): the online wake estimate while the shard tracks one, else its
-    /// configured step budget. A cooperative operation sizes its slices by it.
+    /// The step quantum (docs/runtime.md §3.4): the shard's step budget (mantle `docs/design/event-loop.md`
+    /// D6). A cooperative operation sizes its slices by it.
     pub fn quantum_ns(&self) -> u64 {
         self.quantum_ns.get()
     }
 
-    /// The online wake estimate, nanoseconds (the quantum).
+    /// The online wake estimate, nanoseconds, as of the current step's start; 0 for a shard that does not
+    /// track its wake.
     pub fn wake_cost_ns(&self) -> u64 {
-        self.quantum_ns()
+        self.counters.get().wake_cost_ns
     }
 
     /// The measured scheduler overrun, nanoseconds: how late the shard's steps have run after its waits.

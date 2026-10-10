@@ -25,6 +25,13 @@ pub struct Calibration {
     pub wake: WakeLatency,
 }
 
+/// Cited: the timer slack every thread on Linux inherits from init, unless it asks for another: the precision
+/// the kernel grants the timeouts a shard parks in. prctl(2), `PR_SET_TIMERSLACK`: "The timer slack values of
+/// init (PID 1), the ancestor of all processes, are 50,000 nanoseconds (50 microseconds)", and "the timer
+/// expirations affected by timer slack are those set by select(2), pselect(2), poll(2), ppoll(2),
+/// epoll_wait(2), epoll_pwait(2), clock_nanosleep(2), nanosleep(2), and futex(2)" (mantle note 42 §10).
+pub const TIMER_SLACK_NS: u64 = 50_000;
+
 /// What the consumer states that the machine cannot (docs/runtime.md §3.3, §3.6, §10.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Policy {
@@ -34,22 +41,21 @@ pub struct Policy {
     /// How late a timer may fire, nanoseconds; a machine whose `tick + wake p99` exceeds it is refused.
     /// `None` when the consumer has stated none (every lateness is accepted and reported).
     pub lateness_tolerance_ns: Option<u64>,
-    /// The consumer's latency objective for one loop step, nanoseconds, when tighter than the mean wake.
+    /// The consumer's latency objective for one loop step, nanoseconds, when tighter than the timer slack.
     pub latency_objective_ns: Option<u64>,
 }
 
 /// The runtime's constants, each with its formula (docs/runtime.md §10.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Constants {
-    /// How long an idle shard spins before parking, and the step quantum: the expected cost of parking, the
-    /// 2-competitive spin-then-park threshold [A: Karlin, Li, Manasse, Owicki, SOSP'91].
+    /// How long an idle shard spins before parking: the expected cost of parking, the 2-competitive
+    /// spin-then-park threshold [A: Karlin, Li, Manasse, Owicki, SOSP'91].
     pub spin_ns: Derived<u64>,
     /// The timing wheel's tick.
     pub tick_ns: Derived<u64>,
-    /// The latency budget the loop's batch is sized against.
-    pub batch_budget_ns: Derived<u64>,
-    /// The inbound ring's entries ([`crate::runtime::RuntimeConfig::ring_entries`]).
-    pub control_entries: Derived<u64>,
+    /// The step budget: how long a busy shard's polls run before it looks at its inboxes, timers and driver
+    /// again, and the quantum a cooperative task slices its work by.
+    pub step_ns: Derived<u64>,
     /// Where the shards run.
     pub placement: Placement,
 }
@@ -82,8 +88,7 @@ impl Calibration {
     pub fn constants(&self, policy: &Policy) -> Result<Constants, Unmet> {
         let wake_mean = self.wake.mean_ns.max(1);
         let wake_p99 = self.wake.p99_ns.max(1);
-        let syscall = self.syscall.median_ns().max(1);
-        let lateness_ns = wake_mean.saturating_add(wake_p99);
+        let lateness_ns = TIMER_SLACK_NS.saturating_add(wake_p99);
         if let Some(tolerance_ns) = policy.lateness_tolerance_ns
             && lateness_ns > tolerance_ns
         {
@@ -92,9 +97,9 @@ impl Calibration {
                 tolerance_ns,
             });
         }
-        let batch_budget = policy
+        let step = policy
             .latency_objective_ns
-            .map_or(wake_mean, |objective| objective.min(wake_mean));
+            .map_or(TIMER_SLACK_NS, |objective| objective.min(TIMER_SLACK_NS));
         Ok(Constants {
             spin_ns: derived!(
                 wake_mean,
@@ -102,23 +107,14 @@ impl Calibration {
                 ["wake.mean_ns"]
             ),
             tick_ns: derived!(
-                wake_mean,
-                "wake.mean (a parked shard cannot fire a timer sooner than it wakes; lateness = tick + wake.p99)",
-                ["wake.mean_ns"]
+                TIMER_SLACK_NS,
+                "the timer slack (the kernel fires the shard's own timed wait no sooner; lateness = tick + wake.p99)",
+                ["TIMER_SLACK_NS"]
             ),
-            batch_budget_ns: derived!(
-                batch_budget,
-                "min(wake.mean, the consumer's latency objective) (a batch delays a woken task no longer than a park would)",
-                ["wake.mean_ns", "policy.latency_objective_ns"]
-            ),
-            control_entries: derived!(
-                wake_p99
-                    .checked_div(syscall)
-                    .unwrap_or(1)
-                    .max(1)
-                    .next_power_of_two(),
-                "Little's law at the overflow target: one message per syscall.median for a wake at its p99, rounded up to a power of two",
-                ["wake.p99_ns", "syscall.median"]
+            step_ns: derived!(
+                step,
+                "min(timer slack, the consumer's latency objective) (a busy shard looks at its timers and inboxes as often as the kernel would fire a timer)",
+                ["TIMER_SLACK_NS", "policy.latency_objective_ns"]
             ),
             placement: Placement::of(
                 &self.facts.cores,
@@ -144,8 +140,11 @@ mod tests {
         assert!(calibration.syscall.median_ns() > 0);
     }
 
+    /// The tick and the step budget are the timer slack whatever the wake measured (the wake probe's mean
+    /// moved them by two orders of magnitude between runs on one host: mantle note 42 §1), a tighter
+    /// latency objective tightens the step, and a tolerance below `tick + wake p99` is refused.
     #[test]
-    fn the_constants_follow_the_wake_and_a_tolerance_below_the_lateness_is_refused() {
+    fn the_tick_and_step_are_the_timer_slack_and_a_tolerance_below_the_lateness_is_refused() {
         let calibration = quick();
         let open = Policy {
             reserved_cores: 1,
@@ -153,27 +152,23 @@ mod tests {
             latency_objective_ns: None,
         };
         let constants = calibration.constants(&open).unwrap();
-        assert_eq!(constants.tick_ns.get(), calibration.wake.mean_ns.max(1));
+        assert_eq!(constants.tick_ns.get(), TIMER_SLACK_NS);
+        assert_eq!(constants.step_ns.get(), TIMER_SLACK_NS);
         assert_eq!(constants.spin_ns.get(), calibration.wake.mean_ns.max(1));
-        assert!(constants.control_entries.get().is_power_of_two());
         let tight = Policy {
             lateness_tolerance_ns: Some(1),
             ..open
         };
         let unmet = calibration.constants(&tight).unwrap_err();
         assert_eq!(unmet.tolerance_ns, 1);
-        assert!(unmet.lateness_ns > 1);
+        assert_eq!(
+            unmet.lateness_ns,
+            TIMER_SLACK_NS.saturating_add(calibration.wake.p99_ns.max(1))
+        );
         let objective = Policy {
             latency_objective_ns: Some(1),
             ..open
         };
-        assert_eq!(
-            calibration
-                .constants(&objective)
-                .unwrap()
-                .batch_budget_ns
-                .get(),
-            1
-        );
+        assert_eq!(calibration.constants(&objective).unwrap().step_ns.get(), 1);
     }
 }

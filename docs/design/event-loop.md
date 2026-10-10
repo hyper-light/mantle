@@ -31,9 +31,9 @@ kicks it deadlocks at the first (`benchmark-results/hyper-rt-vs-tokio-20261010/t
 `RuntimeConfig::from_calibration`), its idle spin lasts the CPU one park/wake cycle costs: its own
 thread's CPU across each park it waits in, and its senders' CPU across the kick they claimed, each read
 on that thread's CPU clock. It spins not at all until its first park has been measured, and not at all
-where the OS keeps no fine per-thread clock (Windows). A request served in a poll opens the idle window
-from where that poll ended. A shard with no wake tracking keeps its configured `spin_ns`. The step
-quantum and the timer tick still follow the wake estimate.
+where the OS keeps no fine per-thread clock (Windows). A request served in a step opens the idle window
+from where that step ended (D3). A shard with no wake tracking keeps its configured `spin_ns`. The step
+quantum and the timer tick no longer follow the wake estimate (D6).
 
 **Why.** Spin-then-block is 2-competitive in processor time when the spin lasts as long as a context
 switch costs [KARLIN91, note 42 §2]. hyper-rt spun for the measured wake latency instead, which on this
@@ -155,3 +155,68 @@ the channel bounded at `ring_entries` the fifth spawn was refused
 (`benchmark-results/hyper-rt-vs-tokio-20261010/tests/control-depth-red-bd7c0fd.txt`).
 
 **Constants.** None.
+
+## D6. A step's budget is the timer slack, and a step takes the polls that fill it
+
+**Decision.**
+- `Calibration::constants` sets the timer tick and the step budget to the timer slack Linux gives every
+  ordinary thread, 50 µs (`TIMER_SLACK_NS`; a consumer's tighter latency objective tightens the step).
+  The quantum a cooperative task slices its work by (`ShardContext::quantum_ns`, `futures::step_budget_ns`)
+  is the step budget whatever the wake. `from_calibration` sizes `ring_entries`, now only the completion
+  buffer, from the readiness waits.
+- A shard on a real clock gives each step an allowance of polls: one at first; after each step that polled,
+  as many as fill the step budget at the cost that step measured a poll (its length over its polls, from
+  its two clock readings, D3), at most twice its own allowance, at least one, and never more than the
+  configured `batch`, now only the cap (`from_calibration` sets it to the budget in nanoseconds: no poll costs
+  less than a nanosecond). A shard with no clock (the simulation) takes the configured batch every step.
+- The watchdog judges a step against its budget and one quantum: a step's polls fill its budget, and the
+  poll that crosses it may run a quantum past.
+
+**Why.** The wake probe set these before: the tick and the quantum were its mean, the poll batch its mean
+over the measured cost of a trivial poll, and the control depth its p99 over a system call (D5). It is the
+noisiest measurement the runtime takes (note 42 §1): in a one-CPU Linux container it made a 565 ns tick
+and quantum and a batch of 4–8, and its attribution read the thread's CPU account 122,000 times in a
+million polls (`benchmark-results/hyper-rt-vs-tokio-20261010/runs-linux/c1-quiet-bd7c0fd`). The slack is the
+precision the kernel itself grants the timed wait a shard parks in (prctl(2), note 42 §10): a tick finer
+than it resolves no deadline sooner, and a busy shard that looks at its timers, inboxes and driver once in
+it adds no more lateness than the kernel's coalescing already allows.
+
+A count of polls bounds a step's time only for polls as cheap as the one it was measured on. A task that
+slices long work by the quantum and yields between slices held its shard for the whole count: with a 50 µs
+slice beside a server, a request from another thread waited 0.8–2.4 ms at the median (`bd7c0fd`, a
+calibrated count of 28; `runs/mac-a1-r1`, `runs/mac-ad-r1`) where trantor and tokio answer in one slice. The allowance follows the polls the step actually
+runs (note 42 §11). It opens as slow start opens a window [JACOBSON88]: from one, doubling, so a step the
+clock cannot time (a tick or none) is never trusted past twice the last, and a step that ran long restarts
+it at what fits.
+
+Measured on this Mac at load 25–60 (`benchmark-results/hyper-rt-vs-tokio-20261010/runs/mac-a1-r1`, five
+rounds, arms rotated; base `bd7c0fd`): with a task slicing in 50 µs beside one client's server, 5,827
+requests a second at a median of 125 µs, against 570 at 803 µs; with eight clients, 34,362 against 4,237;
+detached spawns 22.0 million a second against 17.1; yields 77.2 million against 38.5; eight clients without
+the slicing task 336 thousand against 258. A 1 ms sleep runs later: 295 µs at the median against 129 µs
+(trantor 258 µs). A wait for the next 50 µs tick parks once for the whole millisecond, where the wake-sized
+tick's wheel woke at its level boundaries and parked the last stretch short, and macOS stretches a longer
+kevent timeout further: at load 58, 1 ms waits ran a median of 259–348 µs late against 58–85 µs for 125 µs
+waits (`benchmark-results/hyper-rt-vs-tokio-20261010/os-timer/leeway-r1`). The timed park is the next
+item of work (note 42 §12).
+
+Mantle's fill through its same-shard client is unchanged: 1.96 million puts a second at the median of the
+five rounds at load 24–27 against 2.02 million at `bd7c0fd`, gets and seeks no lower
+(`benchmark-results/rtloop-async-fill-bisect-20261010/a-r1`; its last three rounds ran at load 35–50, where
+every arm fell).
+
+**Proof.**
+- `machine::calibration`'s test: the tick and the step are `TIMER_SLACK_NS` whatever the wake measured,
+  and a tolerance below `tick + wake p99` is refused. RED before: the tick was the wake mean, 5,527 ns
+  (`benchmark-results/hyper-rt-vs-tokio-20261010/tests/cited-constants-RED.txt`).
+- `shard_loop`'s `next_batch` tests: a long step shrinks the allowance to what fits, a step read as no time
+  or a tick doubles it at most, and a step that ran out of work measures the polls it ran.
+- `tests/step_budget.rs`, on a virtual clock its tasks move: a task yielding after every 500 ns poll gets
+  1, 2, 4, …, 64 polls a step, then the 100 that fill a 50 µs budget; after a poll ten budgets long the
+  allowance falls to what fits and doubles back to the cap. RED before: 2,000 polls every step
+  (`tests/step-budget-RED.txt`).
+
+**Constants.**
+- `TIMER_SLACK_NS` (50,000 ns): cited, prctl(2) (note 42 §10).
+- The allowance's growth bound (twice the last): cited, slow start [JACOBSON88 §1].
+- `from_calibration`'s `batch` (the step budget in nanoseconds): bound, a poll costs at least a nanosecond.

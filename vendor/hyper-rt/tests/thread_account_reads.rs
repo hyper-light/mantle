@@ -17,7 +17,10 @@ fn config() -> RuntimeConfig {
         // A quantum no yield-and-return poll can pass: no poll is long, so nothing arms.
         step_budget_ns: 1_000_000_000,
         timer_tick_ns: 100_000,
-        batch: 16,
+        // One poll a step, so each yield below is a step of its own: a step's poll budget also covers the
+        // wakes its own polls make (`queue.rs`), and at a larger batch the thousand yields ran in a few dozen
+        // steps, leaving this test's count of steps short of the thousand it names.
+        batch: 1,
         pin: false,
         cores: Vec::new(),
         page_bytes: 4096,

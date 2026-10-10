@@ -110,30 +110,41 @@ impl WakeLatency {
     /// A coefficient of variation of six (a virtual machine's) needs about 55,000 wakes; one and a half
     /// (Apple silicon) about 3,500.
     pub fn estimate_window(&self) -> u64 {
-        let half_width_permille = u128::from(CONVERGED_WIDTH_PERMILLE / 2).max(1);
-        let spread = u128::from(self.sd_ns).saturating_mul(Z_95_PERMILLE);
-        let scale = u128::from(self.mean_ns).saturating_mul(half_width_permille);
-        let floor = u64::try_from(MIN_SAMPLES).unwrap_or(u64::MAX);
-        if scale == 0 {
-            return floor;
-        }
-        let ratio = spread.div_ceil(scale);
-        u64::try_from(ratio.saturating_mul(ratio))
-            .unwrap_or(u64::MAX)
-            .max(floor)
+        sample_window(self.mean_ns, self.sd_ns)
     }
 
     /// The exponential-weighting shift of an online estimate over [`estimate_window`](Self::estimate_window)
-    /// wakes: `⌈log₂ N⌉`, capped so the fixed-point accumulator of [`WakeEstimate`] (a mean shifted left by
-    /// it) fits 128 bits.
+    /// wakes ([`window_shift`]).
     pub fn estimate_shift(&self) -> u32 {
-        let window = self.estimate_window();
-        let shift = window
-            .saturating_sub(1)
-            .checked_ilog2()
-            .map_or(0, |bits| bits.saturating_add(1));
-        shift.min(WakeEstimate::MAX_SHIFT)
+        window_shift(self.estimate_window())
     }
+}
+
+/// How many samples a mean of a quantity with this mean and standard deviation needs to reach the probe's own
+/// precision: `N = (z · sd / (h · mean))²`, with `z` the 95 % normal quantile and `h` half the stopping-rule
+/// width ([`CONVERGED_WIDTH_PERMILLE`]). At least [`MIN_SAMPLES`]; no spread (or no mean) asks no more.
+pub fn sample_window(mean_ns: u64, sd_ns: u64) -> u64 {
+    let half_width_permille = u128::from(CONVERGED_WIDTH_PERMILLE / 2).max(1);
+    let spread = u128::from(sd_ns).saturating_mul(Z_95_PERMILLE);
+    let scale = u128::from(mean_ns).saturating_mul(half_width_permille);
+    let floor = u64::try_from(MIN_SAMPLES).unwrap_or(u64::MAX);
+    if scale == 0 {
+        return floor;
+    }
+    let ratio = spread.div_ceil(scale);
+    u64::try_from(ratio.saturating_mul(ratio))
+        .unwrap_or(u64::MAX)
+        .max(floor)
+}
+
+/// The exponential-weighting shift of an online estimate over `window` samples: `⌈log₂ N⌉`, capped so the
+/// fixed-point accumulator of [`WakeEstimate`] (a mean shifted left by it) fits 128 bits.
+pub fn window_shift(window: u64) -> u32 {
+    let shift = window
+        .saturating_sub(1)
+        .checked_ilog2()
+        .map_or(0, |bits| bits.saturating_add(1));
+    shift.min(WakeEstimate::MAX_SHIFT)
 }
 
 /// An online estimate of the mean wake (§4.1, §4.3, §4.7): an exponentially weighted mean over about

@@ -317,6 +317,9 @@ pub struct ShardContext {
     pub(crate) now_ns: Cell<u64>,
     /// When the server last served a client's work here, opening the idle window (`note_activity`).
     pub(crate) activity_ns: Cell<Option<u64>>,
+    /// Whether the poll running now served a client's work: the loop then moves `activity_ns` to the
+    /// poll's end.
+    pub(crate) activity_noted: Cell<bool>,
     /// The step quantum now, published by the loop.
     pub(crate) quantum_ns: Cell<u64>,
     /// The measured scheduler overrun, published by the loop.
@@ -423,6 +426,7 @@ impl ShardContext {
             accepting: Cell::new(true),
             now_ns: Cell::new(0),
             activity_ns: Cell::new(None),
+            activity_noted: Cell::new(false),
             quantum_ns: Cell::new(1),
             scheduler_overrun_ns: Cell::new(0),
             refused_spawns: Cell::new(0),
@@ -508,10 +512,12 @@ impl ShardContext {
     }
 
     /// Notes that a client's request was just served here (slates §4.7): the shard spins out the idle window
-    /// from now before it parks, so the client's next request within it costs no kernel wake. Every path that
-    /// hands a request to a task marks it (docs/runtime.md §3.4).
+    /// before it parks, so the client's next request within it costs no kernel wake. Every path that hands a
+    /// request to a task marks it (docs/runtime.md §3.4). Marked during a poll, the window opens where that
+    /// poll ends; marked between polls, it opens at the time the loop last published.
     pub fn note_activity(&self) {
         self.activity_ns.set(Some(self.now_ns.get()));
+        self.activity_noted.set(true);
     }
 
     /// Marks one period of forward progress of an application loop on this shard, for an observer on any

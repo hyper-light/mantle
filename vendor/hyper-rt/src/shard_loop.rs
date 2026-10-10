@@ -106,6 +106,9 @@ pub struct Counters {
     /// Reads of the thread's CPU account (`attribution::thread_account`), each a system call: made only
     /// while poll attribution is armed, and at a poll past the step quantum.
     pub thread_accounts: u64,
+    /// Reads of the thread's CPU clock to learn what a park costs, each a system call: two for each park
+    /// the shard waits in while it learns ([`Counters::park_samples`]), and none otherwise.
+    pub park_cost_reads: u64,
     /// Driver completions delivered.
     pub completions: u64,
     /// Times the driver was lost.
@@ -1056,17 +1059,20 @@ impl Shard {
         let learns = self.core.real_time && self.core.wake.is_some();
         let mut switches_before_wait = None;
         let mut lost = false;
-        let cpu_before = if learns {
-            attribution::thread_cpu_now()
-        } else {
-            None
-        };
+        // The CPU clock is read (a system call) only by a learning shard, only around a wait it makes, and
+        // the second time only after a first. A tuple of the two readings read it after every park, learning
+        // or not: that doubled the cost of the loop item the runtime calibrates its poll batch by, which
+        // halved every shard's batch (`benchmark-results/rtloop-async-fill-bisect-20261010`).
+        let mut cpu_before = None;
         let pending = self.has_inbound();
         let parked = entry.parking.park_unless_pending(
             || pending || entry.wakes.is_pending() || entry.control_pending.is_pending(),
             || {
                 if learns {
                     switches_before_wait = attribution::voluntary_switches_now();
+                    cpu_before = attribution::thread_cpu_now();
+                    self.core.counters.park_cost_reads =
+                        self.core.counters.park_cost_reads.saturating_add(1);
                 }
                 lost = self.wait_in_driver(deadline_ns);
             },
@@ -1077,8 +1083,12 @@ impl Shard {
         if let Some(woken) = woken {
             self.note_wake(entry, woken, switches_before_wait);
         }
-        if let (Some(before), Some(after)) = (cpu_before, attribution::thread_cpu_now()) {
-            self.note_park_cost(entry, after.saturating_sub(before));
+        if let Some(before) = cpu_before {
+            self.core.counters.park_cost_reads =
+                self.core.counters.park_cost_reads.saturating_add(1);
+            if let Some(after) = attribution::thread_cpu_now() {
+                self.note_park_cost(entry, after.saturating_sub(before));
+            }
         }
         (true, lost)
     }

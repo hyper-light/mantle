@@ -11,6 +11,10 @@
     clippy::cast_possible_truncation
 )]
 
+#[path = "support/into_file.rs"]
+mod file_outcome;
+use file_outcome::finished_file;
+
 use hyper_block::buf::Alignment;
 use hyper_block::sim::{Fault, SimFile};
 use mantle_engine::Error;
@@ -105,7 +109,7 @@ proptest! {
             prop_assert!(s.refs()[e as usize] == 1);
         }
         s.checkpoint(Some(branch.root), 1).unwrap();
-        let (mut s, recovered) = Store::open(s.into_file().0, CONFIG).unwrap();
+        let (mut s, recovered) = Store::open(finished_file(s.into_file()).0, CONFIG).unwrap();
         prop_assert_eq!(recovered.root, Some(branch.root));
         check(&mut s, &branch, &entries);
     }
@@ -177,7 +181,7 @@ fn keys_out_of_order_and_oversized_entries_are_refused() {
     ]);
     check(&mut s, &branch, &entries);
     s.checkpoint(Some(branch.root), 1).unwrap();
-    let (file, finished) = s.into_file();
+    let (file, finished) = finished_file(s.into_file());
     finished.unwrap();
     let (mut s, recovered) = Store::open(file, CONFIG).unwrap();
     assert_eq!(recovered.root, Some(branch.root));
@@ -450,7 +454,7 @@ fn binary_entries_cross_index_levels_and_reopen_with_their_exact_values() {
     let mut descriptor = Vec::new();
     branch.encode(&mut descriptor).unwrap();
     s.checkpoint(Some(branch.root), 1).unwrap();
-    let (file, finished) = s.into_file();
+    let (file, finished) = finished_file(s.into_file());
     finished.unwrap();
     let (mut s, recovered) = Store::open(file, CONFIG).unwrap();
     assert_eq!(recovered.root, Some(branch.root));
@@ -472,7 +476,7 @@ fn binary_entries_cross_index_levels_and_reopen_with_their_exact_values() {
     let target = key(1024);
     let page = u64::from(branch.leaf_of(&target).unwrap());
     let address = branch.page_address(&s, page).unwrap();
-    let (file, finished) = s.into_file();
+    let (file, finished) = finished_file(s.into_file());
     finished.unwrap();
     file.inject(Fault::ReadError {
         offset: address * CONFIG.page_size as u64,

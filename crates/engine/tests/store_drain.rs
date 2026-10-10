@@ -14,6 +14,10 @@
     clippy::cast_possible_truncation
 )]
 
+#[path = "support/into_file.rs"]
+mod file_outcome;
+use file_outcome::finished_file;
+
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -169,7 +173,9 @@ fn worker_job(
     let mut owner = Store::create(open(path, true, gate), CONFIG).unwrap();
     let grant = owner.grant(extents).unwrap();
     let mut worker = Store::worker(open(path, false, gate), CONFIG).unwrap();
-    worker.begin_job(&grant, owner.end(), owner.generation());
+    worker
+        .begin_job(&grant, owner.end(), owner.generation())
+        .unwrap();
     (owner, worker, grant)
 }
 
@@ -228,7 +234,7 @@ fn a_drain_after_a_failure_answers_every_run_still_out_and_reports_the_first() {
     assert_eq!(worker.io_stats().buffers_out, 0);
 
     let end = worker.end();
-    let (file, landed) = worker.into_file();
+    let (file, landed) = finished_file(worker.into_file());
     assert!(landed.is_err(), "the store failed: its handoff says so");
     drop(file);
     drop(issuer);
@@ -274,7 +280,7 @@ fn a_failed_store_hands_no_queued_run_to_the_device() {
     assert_eq!(io.buffers_out, 1, "an extent buffer's loan is not back");
     worker.give_run(run);
     assert_eq!(worker.io_stats().buffers_out, 0);
-    let (file, landed) = worker.into_file();
+    let (file, landed) = finished_file(worker.into_file());
     assert!(landed.is_err());
     drop(file);
     drop(issuer);

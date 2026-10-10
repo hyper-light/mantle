@@ -14,6 +14,10 @@
     clippy::cast_possible_truncation
 )]
 
+#[path = "support/into_file.rs"]
+mod file_outcome;
+use file_outcome::finished_file;
+
 use hyper_block::block::BlockFile;
 use hyper_block::buf::Alignment;
 use hyper_block::sim::{Crash, Fault, SimFile};
@@ -144,7 +148,7 @@ fn run(file: SimFile) -> (Vec<Model>, Option<Store<SimFile>>, Option<SimFile>) {
     acked.push(model.clone());
     for s in 1..=STEPS {
         if step(&mut store, &mut model, s).is_err() {
-            return (acked, None, Some(store.into_file().0));
+            return (acked, None, Some(finished_file(store.into_file()).0));
         }
         acked.push(model.clone());
     }
@@ -156,7 +160,7 @@ fn every_crash_point_recovers_an_acknowledged_or_in_flight_checkpoint() {
     // The workload's writes and flushes, counted on a run without faults.
     let (acked, store, _) = run(sim(1));
     assert_eq!(acked.len() as u64, STEPS + 1);
-    let stats = store.unwrap().into_file().0.stats().unwrap();
+    let stats = finished_file(store.unwrap().into_file()).0.stats().unwrap();
     let ops = stats.writes + stats.syncs;
     assert!(ops > STEPS * 4);
     let mut cases = 0;
@@ -216,7 +220,7 @@ fn every_crash_point_recovers_an_acknowledged_or_in_flight_checkpoint() {
 #[test]
 fn a_store_reopens_at_its_last_checkpoint() {
     let (acked, store, _) = run(sim(3));
-    let file = store.unwrap().into_file().0;
+    let file = finished_file(store.unwrap().into_file()).0;
     let (mut store, recovered) = Store::open(file, CONFIG).unwrap();
     assert_eq!(recovered.applied, STEPS);
     check(&mut store, &acked[STEPS as usize], recovered.root);
@@ -225,7 +229,7 @@ fn a_store_reopens_at_its_last_checkpoint() {
 #[test]
 fn a_page_flipped_on_the_medium_is_a_typed_corruption() {
     let (acked, store, _) = run(sim(5));
-    let file = store.unwrap().into_file().0;
+    let file = finished_file(store.unwrap().into_file()).0;
     let model = acked[STEPS as usize].clone();
     let (extent, _, _) = model.data[0];
     let offset = extent * u64::from(CONFIG.extent_pages) * CONFIG.page_size as u64 + 100;

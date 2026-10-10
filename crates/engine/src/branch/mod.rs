@@ -27,6 +27,7 @@
 
 pub mod filter;
 pub mod merge;
+pub(crate) mod point;
 
 use crate::error::{Error, Malformed};
 use crate::fst::surf::{Surf, SurfBuilder};
@@ -1248,24 +1249,60 @@ impl Branch {
         // it, only the value copied out.
         let page_no = self.leaf_of(key)?;
         let address = self.page_address(store, u64::from(page_no))?;
-        store.with_page(address, |page| {
-            let view = View::new(page)?;
-            if view.kind != LEAF {
-                return Err(corrupt(Malformed::CountMismatch));
-            }
-            let Some(i) = view.floor(key)? else {
-                return Ok(None);
-            };
-            if view.compare(key, i)? != Ordering::Equal {
-                return Ok(None);
-            }
-            let (_, rest) = view.entry(i)?;
-            let tag = rest.first().copied().unwrap_or(0);
-            let op = Op::from_byte(tag).ok_or(corrupt(Malformed::UnknownTag(tag)))?;
-            value.clear();
-            value.extend_from_slice(rest.get(3..).ok_or(corrupt(Malformed::Truncated))?);
-            Ok(Some(op))
-        })
+        store.with_page(address, |page| point::read_value(page, key, value))
+    }
+
+    /// The attached owner's point lookup, retaining its one resolved leaf across each
+    /// completion wait. The borrowed cursor returns its owners if the future is canceled.
+    pub(crate) async fn get_hashed_async<F: BlockFile>(
+        &self,
+        store: &mut Store<F>,
+        key: &[u8],
+        hash: u64,
+        value: &mut Vec<u8>,
+    ) -> Result<Option<Op>, Error> {
+        let Some(read) = self.prepare_get(store, key, hash)? else {
+            return Ok(None);
+        };
+        let mut point = point::BorrowedPoint::new(read, store);
+        point.read(key, value).await
+    }
+
+    /// A maplet already routed this candidate, so its Bloom filter is not asked again.
+    pub(crate) async fn get_routed_async<F: BlockFile>(
+        &self,
+        store: &mut Store<F>,
+        key: &[u8],
+        value: &mut Vec<u8>,
+    ) -> Result<Option<Op>, Error> {
+        let read = self.prepare_get_routed(store, key)?;
+        let mut point = point::BorrowedPoint::new(read, store);
+        point.read(key, value).await
+    }
+
+    /// Starts one candidate branch's lookup. A rejected filter has no device work or cursor;
+    /// the caller retains its candidate/probe position rather than restarting the lookup.
+    pub(crate) fn prepare_get<F: BlockFile>(
+        &self,
+        store: &mut Store<F>,
+        key: &[u8],
+        hash: u64,
+    ) -> Result<Option<point::PointRead>, Error> {
+        if !self.filter.may_contain(hash) {
+            return Ok(None);
+        }
+        self.prepare_get_routed(store, key).map(Some)
+    }
+
+    /// A maplet already routed this candidate, so its Bloom filter is not asked again.
+    pub(crate) fn prepare_get_routed<F: BlockFile>(
+        &self,
+        store: &mut Store<F>,
+        key: &[u8],
+    ) -> Result<point::PointRead, Error> {
+        let page = self.leaf_of(key)?;
+        let address = self.page_address(store, u64::from(page))?;
+        Ok(point::PointRead::new(address))
     }
 }
 
@@ -1423,6 +1460,16 @@ pub struct HashCursor {
     buf: Vec<u8>,
     pos: usize,
     left: u64,
+    /// A format u32 can cross a page; bytes taken before a wait remain owned here.
+    hash: [u8; size_of::<u32>()],
+    assembled: usize,
+    span: Option<Span>,
+    pooled: bool,
+}
+
+pub(crate) enum HashStep {
+    Waiting,
+    Done(Option<u32>),
 }
 
 impl Branch {
@@ -1448,7 +1495,16 @@ impl Branch {
                 .ok_or(corrupt(Malformed::TooLarge))?,
             buf: Vec::new(),
             pos: usize::try_from(held.checked_rem(capacity).unwrap_or(0)).unwrap_or(0),
-            left: self.hashes_bytes / 4,
+            left: self
+                .hashes_bytes
+                .checked_div(
+                    u64::try_from(size_of::<u32>()).map_err(|_| corrupt(Malformed::TooLarge))?,
+                )
+                .ok_or(corrupt(Malformed::TooLarge))?,
+            hash: [0; size_of::<u32>()],
+            assembled: 0,
+            span: None,
+            pooled: false,
         })
     }
 }
@@ -1460,32 +1516,103 @@ impl HashCursor {
         store: &mut Store<F>,
         branch: &Branch,
     ) -> Result<Option<u32>, Error> {
-        if self.left == 0 {
-            return Ok(None);
+        match self.next_with(store, branch, false)? {
+            HashStep::Done(hash) => Ok(hash),
+            HashStep::Waiting => Err(Error::InvalidArgument {
+                what: "a synchronous hash cursor left waiting for a page",
+            }),
         }
-        let mut b = [0u8; 4];
-        for byte in &mut b {
+    }
+
+    /// Takes one hash through the attached demand path. A wait leaves its partial bytes,
+    /// page offset and remaining hash count unchanged until the same read resumes.
+    pub(crate) fn next_paced<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        branch: &Branch,
+    ) -> Result<HashStep, Error> {
+        self.next_with(store, branch, true)
+    }
+
+    fn next_with<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        branch: &Branch,
+        paced: bool,
+    ) -> Result<HashStep, Error> {
+        if self.left == 0 {
+            return Ok(HashStep::Done(None));
+        }
+        if paced && self.span.is_none() {
+            self.span = Some(store.span()?);
+            if !self.pooled {
+                let mut page = store.take_page();
+                page.extend_from_slice(&self.buf);
+                self.buf = page;
+                self.pooled = true;
+            }
+        }
+        // One format u32, so at most its four bytes are taken before completion or wait.
+        while self.assembled < self.hash.len() {
             if self.pos >= self.buf.len() {
-                // The first read starts mid-page: `pos` already names the offset in it.
                 let skip = if self.buf.is_empty() { self.pos } else { 0 };
+                // Save this page's offset before clearing the old bytes: a retry after a
+                // wait must not use the exhausted old page's length as its new offset.
+                self.pos = skip;
                 self.buf.clear();
                 let address = branch.page_address(store, self.page_no)?;
-                store.read_page(address, &mut self.buf)?;
-                self.page_no = self.page_no.saturating_add(1);
-                self.pos = skip;
+                if paced {
+                    let span = self.span.as_mut().ok_or(corrupt(Malformed::Truncated))?;
+                    if !store.read_page_paced(span, address, &mut self.buf)? {
+                        return Ok(HashStep::Waiting);
+                    }
+                } else if let Some(span) = self.span.as_mut() {
+                    store.read_page_ahead(span, address, &mut self.buf)?;
+                } else {
+                    store.read_page(address, &mut self.buf)?;
+                }
+                self.page_no = self
+                    .page_no
+                    .checked_add(1)
+                    .ok_or(corrupt(Malformed::TooLarge))?;
                 if self.pos >= self.buf.len() {
                     return Err(corrupt(Malformed::Truncated));
                 }
             }
-            *byte = self
+            let byte = self
                 .buf
                 .get(self.pos)
                 .copied()
                 .ok_or(corrupt(Malformed::Truncated))?;
-            self.pos = self.pos.saturating_add(1);
+            *self
+                .hash
+                .get_mut(self.assembled)
+                .ok_or(corrupt(Malformed::Truncated))? = byte;
+            self.assembled = self
+                .assembled
+                .checked_add(1)
+                .ok_or(corrupt(Malformed::TooLarge))?;
+            self.pos = self
+                .pos
+                .checked_add(1)
+                .ok_or(corrupt(Malformed::TooLarge))?;
         }
-        self.left = self.left.saturating_sub(1);
-        Ok(Some(u32::from_le_bytes(b)))
+        self.left = self
+            .left
+            .checked_sub(1)
+            .ok_or(corrupt(Malformed::CountMismatch))?;
+        self.assembled = 0;
+        Ok(HashStep::Done(Some(u32::from_le_bytes(self.hash))))
+    }
+
+    /// Returns a paced cursor's owners, including an unfinished numbered demand read.
+    pub(crate) fn give_back(mut self, store: &mut Store<impl BlockFile>) {
+        if let Some(span) = self.span.take() {
+            store.give_span(span);
+        }
+        if self.pooled {
+            store.give_page(std::mem::take(&mut self.buf));
+        }
     }
 }
 
@@ -1833,6 +1960,111 @@ impl RunCursor {
         self.land(branch, store, page, index)
     }
 
+    /// Positions an attached scan cursor through demand completion, keeping the selected
+    /// leaf in this future across a wait. Its owner returns the cursor on cancellation.
+    pub(crate) async fn seek_async<F: BlockFile>(
+        &mut self,
+        branch: &Branch,
+        store: &mut Store<F>,
+        from: &[u8],
+    ) -> Result<(), Error> {
+        let page = u64::from(branch.leaf_of(from)?);
+        self.land_async(branch, store, page, 0).await?;
+        let (index, entries) = self.page_lower_bound(from)?;
+        if index >= entries {
+            self.next_leaf_async(branch, store).await
+        } else {
+            self.index = index;
+            self.load()
+        }
+    }
+
+    pub(crate) async fn next_async<F: BlockFile>(
+        &mut self,
+        branch: &Branch,
+        store: &mut Store<F>,
+    ) -> Result<(), Error> {
+        if !self.valid {
+            return Ok(());
+        }
+        self.index = self.index.saturating_add(1);
+        if self.index < self.n {
+            return self.load();
+        }
+        self.next_leaf_async(branch, store).await
+    }
+
+    pub(crate) async fn advance_async<F: BlockFile>(
+        &mut self,
+        branch: &Branch,
+        store: &mut Store<F>,
+        k: usize,
+    ) -> Result<(), Error> {
+        if !self.valid || k == 0 {
+            return Ok(());
+        }
+        match branch.position_after((self.page_no, self.index), k)? {
+            Some((page, index)) => self.land_async(branch, store, page, index).await,
+            None => {
+                self.valid = false;
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) async fn place_async<F: BlockFile>(
+        &mut self,
+        branch: &Branch,
+        store: &mut Store<F>,
+        (page, index): (u64, usize),
+    ) -> Result<(), Error> {
+        self.land_async(branch, store, page, index).await
+    }
+
+    async fn land_async<F: BlockFile>(
+        &mut self,
+        branch: &Branch,
+        store: &mut Store<F>,
+        page: u64,
+        index: usize,
+    ) -> Result<(), Error> {
+        let address = branch.page_address(store, page)?;
+        if self.loaded != Some(address) {
+            self.loaded = None;
+            self.valid = false;
+            self.span_page = None;
+            self.page.clear();
+            store
+                .read_page_async(&mut self.span, address, &mut self.page)
+                .await?;
+            let view = View::new(self.page_data()?)?;
+            if view.kind != LEAF {
+                return Err(corrupt(Malformed::CountMismatch));
+            }
+            let (n, table) = (view.n, view.table);
+            self.n = n;
+            self.table = table;
+            self.loaded = Some(address);
+        }
+        self.page_no = page;
+        self.index = index;
+        self.load()
+    }
+
+    async fn next_leaf_async<F: BlockFile>(
+        &mut self,
+        branch: &Branch,
+        store: &mut Store<F>,
+    ) -> Result<(), Error> {
+        match self.next_leaf_page(branch)? {
+            Some(page) => self.land_async(branch, store, page, 0).await,
+            None => {
+                self.valid = false;
+                Ok(())
+            }
+        }
+    }
+
     /// Reads leaf `page` unless it is the one held, and loads entry `index`.
     fn land<F: BlockFile>(
         &mut self,
@@ -1968,3 +2200,6 @@ impl RunCursor {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod hash_paced_tests;

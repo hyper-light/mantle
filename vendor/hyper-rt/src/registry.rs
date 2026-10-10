@@ -19,8 +19,10 @@
 #![allow(unsafe_code)]
 
 use std::cell::Cell;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::thread::Thread;
 
 use crate::mem::Encoded;
 
@@ -66,6 +68,11 @@ pub struct Entry {
     pub stop: AtomicBool,
     /// Admission is closed during owned cancellation and after shutdown begins.
     pub(crate) accepting: AtomicBool,
+    /// Published only by the owner after its native wait returned with driver loss.
+    pub(crate) cleanup_mode: AtomicBool,
+    /// The actual owning thread, bound once when its shard is built. Its one park
+    /// permit wakes driverless cleanup; the bitmap remains the actual task payload.
+    cleanup_thread: OnceLock<Thread>,
     /// The generational kick that wakes this registration's driver.
     pub kick: Kick,
     /// The kick descriptor, closed after the owning contexts and foreign borrows end (Unix).
@@ -104,6 +111,20 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// Called inside the existing parking fence protocol, after payload publication.
+    fn kick_parked(&self) {
+        self.parking.kick_if_parked(|| {
+            if self.cleanup_mode.load(Ordering::Acquire) {
+                // An unpark retains one permit even before its owner enters park.
+                if let Some(owner) = self.cleanup_thread.get() {
+                    owner.unpark();
+                }
+            } else {
+                self.kick.kick();
+            }
+        });
+    }
+
     /// Marks the wait in `slot` at `generation` abandoned and asks the shard to sweep, as a control message
     /// would: the mark, then the flag, then the control mark and a kick. False only for a slot past the
     /// marks, which no ticket of this shard names.
@@ -126,7 +147,7 @@ impl Entry {
         summary.fetch_or(1u64 << bit, Ordering::AcqRel);
         self.abandons_marked.store(true, Ordering::Release);
         self.control_pending.publish();
-        self.parking.kick_if_parked(|| self.kick.kick());
+        self.kick_parked();
         true
     }
 }
@@ -391,6 +412,16 @@ pub(crate) fn register_slot(
     waits: usize,
     kick: RegisterKick,
 ) -> Result<(SlotHolder, Receiver<Control>), RtError> {
+    register_runtime_slot(wake_slots, control_bound, waits, kick)
+}
+
+/// Registers the cold resources; the shard binds its cleanup thread at its build.
+pub(crate) fn register_runtime_slot(
+    wake_slots: usize,
+    control_bound: usize,
+    waits: usize,
+    kick: RegisterKick,
+) -> Result<(SlotHolder, Receiver<Control>), RtError> {
     let max = u16::try_from(MAX_SHARDS).unwrap_or(u16::MAX);
     for (index, slot) in SLOTS.iter().enumerate() {
         let free = slot.generation.load(Ordering::Acquire);
@@ -429,6 +460,8 @@ pub(crate) fn register_slot(
             control_pending: crate::parking::ControlFlag::new(),
             stop: AtomicBool::new(false),
             accepting: AtomicBool::new(true),
+            cleanup_mode: AtomicBool::new(false),
+            cleanup_thread: OnceLock::new(),
             kick: Kick::None,
             #[cfg(unix)]
             kick_fd: None,
@@ -465,6 +498,22 @@ pub(crate) fn register_slot(
         return Ok((holder, receiver));
     }
     Err(RtError::TooManyShards { max })
+}
+
+/// Binds driverless parking to the thread that actually builds this shard. Runtime
+/// seeds are registered on another thread, so registration cannot choose this owner.
+pub(crate) fn bind_cleanup_thread(holder: SlotHolder) -> Result<(), RtError> {
+    with_holder(holder, |entry| {
+        entry
+            .cleanup_thread
+            .set(std::thread::current())
+            .map_err(|_| RtError::BadConfig {
+                what: "a shard cleanup thread already bound",
+            })
+    })
+    .ok_or(RtError::ShardGone {
+        shard: holder.shard,
+    })?
 }
 
 /// What a registration hands the slot for its kick: a ready [`Kick`] (none), the simulation's shared
@@ -688,7 +737,7 @@ pub fn wake(word: Encoded) {
         if entry.exited.load(Ordering::Acquire) || !entry.wakes.set(word.slot()) {
             return false;
         }
-        entry.parking.kick_if_parked(|| entry.kick.kick());
+        entry.kick_parked();
         true
     });
     if landed != Some(true) {
@@ -719,7 +768,7 @@ pub(crate) fn request_stop(target: u16) -> Result<(), RtError> {
         // The flag before the mark: the drain that takes the mark (AcqRel) then sees the flag.
         entry.stop.store(true, Ordering::Release);
         entry.control_pending.publish();
-        entry.parking.kick_if_parked(|| entry.kick.kick());
+        entry.kick_parked();
     })
     .ok_or(RtError::ShardGone { shard: target })
 }
@@ -735,7 +784,7 @@ fn send_control_to(entry: &Entry, target: u16, message: Control) -> Result<(), R
     match entry.control.try_send(message) {
         Ok(()) => {
             entry.control_pending.publish();
-            entry.parking.kick_if_parked(|| entry.kick.kick());
+            entry.kick_parked();
             Ok(())
         }
         Err(TrySendError::Full(_)) => Err(RtError::ControlFull { shard: target }),

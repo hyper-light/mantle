@@ -8,6 +8,10 @@
     clippy::disallowed_macros
 )]
 
+#[path = "support/into_file.rs"]
+mod file_outcome;
+use file_outcome::finished_file;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -118,7 +122,7 @@ fn a_failed_write_refuses_fitting_puts_and_deletes_before_further_io() {
     assert!(matches!(db.delete(b"known"), Err(Error::Io { .. })));
     assert_eq!(fault.writes.load(Ordering::SeqCst), writes);
     assert!(matches!(db.checkpoint(2), Err(Error::Io { .. })));
-    let (file, landed) = db.into_file();
+    let (file, landed) = finished_file(db.into_file());
     assert!(landed.is_err());
     fault.reject.store(false, Ordering::SeqCst);
     let (mut recovered, applied) = ShardDb::open(file, STORE, STORE.page_size, TRUNK).unwrap();

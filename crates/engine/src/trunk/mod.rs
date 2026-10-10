@@ -26,11 +26,13 @@
 //! one) and holds the one reference its extents were allocated with; the node that drops it
 //! releases them, so an extent is freed exactly when no node names it.
 
+use std::mem::size_of;
+
 use crate::branch::merge::Compaction;
 use crate::branch::{Branch, Op};
 use crate::error::{Error, Malformed};
 use crate::remix::{Build, Rebuild, View};
-use crate::store::Store;
+use crate::store::{Run, Store};
 use hyper_block::block::BlockFile;
 use pool::{Output, Owner, Pool, Task, Work};
 
@@ -291,6 +293,7 @@ pub struct Trunk {
     config: TrunkConfig,
     /// The extents of the last saved image, released when the next one is saved.
     saved: Vec<u64>,
+    saving: Saving,
     stats: TrunkStats,
     /// Packed memtables not yet in the tree, oldest first: read before it, and taken into the
     /// root together when the next cascade starts.
@@ -349,6 +352,83 @@ pub struct Trunk {
     workers_waiting: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SavePhase {
+    #[default]
+    Idle,
+    Views,
+    ViewPages,
+    ViewRun,
+    Encoding,
+    ImagePages,
+    ImageRun,
+    Drain,
+    Publish,
+    Abort,
+}
+
+#[derive(Debug)]
+struct SavedView {
+    node: usize,
+    pivot: usize,
+    extents: Vec<u64>,
+}
+
+/// The checkpoint owns one run and unpublished references until its owner writes retire.
+/// Bytes and list capacities stay here for the next checkpoint; no view payload is copied
+/// into a second framing buffer.
+#[derive(Debug, Default)]
+struct Saving {
+    phase: SavePhase,
+    node: usize,
+    pivot: usize,
+    page: usize,
+    extent_count: usize,
+    image_limit: usize,
+    bytes: Vec<u8>,
+    header: Vec<u8>,
+    fresh: Vec<u64>,
+    views: Vec<SavedView>,
+    named: Vec<u64>,
+    run: Option<Run>,
+    head: Option<u64>,
+    error: Option<Error>,
+}
+
+/// Image magic, serialized byte count and extent count, before the extent addresses.
+fn image_header_bytes() -> Result<usize, Error> {
+    size_of::<[u64; 2]>()
+        .checked_add(size_of::<u32>())
+        .ok_or(corrupt())
+}
+
+fn save_reserve<T>(out: &mut Vec<T>, additional: usize) -> Result<(), Error> {
+    out.try_reserve(additional)
+        .map_err(|_| Error::LimitExceeded {
+            what: "a trunk checkpoint's serialized workspace",
+            limit: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+        })
+}
+
+fn save32(out: &mut Vec<u8>, n: usize) -> Result<(), Error> {
+    out.extend_from_slice(&u32::try_from(n).map_err(|_| corrupt())?.to_le_bytes());
+    Ok(())
+}
+
+impl Saving {
+    fn address<F: BlockFile>(&self, store: &Store<F>, page: usize) -> Result<u64, Error> {
+        let per = usize::try_from(store.extent_pages()).map_err(|_| corrupt())?;
+        let extent = *self
+            .fresh
+            .get(page.checked_div(per).ok_or(corrupt())?)
+            .ok_or(corrupt())?;
+        store.address(
+            extent,
+            u32::try_from(page.checked_rem(per).ok_or(corrupt())?).map_err(|_| corrupt())?,
+        )
+    }
+}
+
 /// How long a step waits on the maintenance workers: not at all (a put's share, a runtime's
 /// slice), for one message (an idle step, which has nothing else to do), or until the cascade
 /// in progress is done (a stall, a drain).
@@ -400,10 +480,21 @@ struct MapletJob {
     pivot: usize,
     roots: Vec<u64>,
     heads: Vec<(crate::branch::HashCursor, Option<u32>)>,
+    /// Initial heads opened, and the winner already added while its successor is read.
+    opening: usize,
+    advancing: Option<usize>,
     builder: crate::maplet::Builder,
     pages: Vec<Vec<u8>>,
     /// Once merged, the maplet being measured against the bundle's filters.
     trial: Option<Trial>,
+}
+
+impl MapletJob {
+    fn give_back<F: BlockFile>(mut self, store: &mut Store<F>) {
+        for (cursor, _) in self.heads.drain(..) {
+            cursor.give_back(store);
+        }
+    }
 }
 
 /// A built maplet timed against its bundle's filters on as many random hashes as it holds keys,
@@ -596,6 +687,8 @@ enum Phase {
     /// A node's compactions out on the maintenance workers: every pivot's with live in-flight
     /// bundles at once, or the leaf's whole (`settle`). The node changes once every one is back.
     Out { jobs: Vec<Remote>, settle: bool },
+    /// A worker failed: retain its peers and their grants until every submitted job ends.
+    Abandon { jobs: Vec<Remote>, error: Error },
 }
 
 /// A compaction out on a worker: its pivot (a settle's, 0) and the in-flight bundles its
@@ -752,6 +845,7 @@ impl Trunk {
             root: 0,
             config,
             saved: Vec::new(),
+            saving: Saving::default(),
             stats: TrunkStats::default(),
             pending: Vec::new(),
             cascade: Vec::new(),
@@ -830,6 +924,91 @@ impl Trunk {
         let found = self.find(store, key, hash, value, &mut tally);
         self.routes = self.routes.add(tally);
         found
+    }
+
+    /// The same newest-first search through an attached owner's demand reads. The exclusive
+    /// borrow retains candidate references and freezes topology until the lookup ends.
+    pub(crate) async fn get_hashed_async<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        key: &[u8],
+        hash: u64,
+        value: &mut Vec<u8>,
+    ) -> Result<Option<Op>, Error> {
+        self.gets = self.gets.saturating_add(1);
+        for b in self.pending.iter_mut().rev() {
+            b.probes = b.probes.saturating_add(1);
+            if let Some(op) = b.get_hashed_async(store, key, hash, value).await? {
+                return Ok(Some(op));
+            }
+        }
+        let mut at = self.root;
+        // Every level down is a node's child: at most the trunk's node count of steps.
+        for _ in 0..self.nodes.len() {
+            let node = self.nodes.get_mut(at).ok_or(corrupt())?;
+            let p = Self::pivot_of(node, key);
+            let Node {
+                pivots, inflight, ..
+            } = node;
+            let pivot = pivots.get_mut(p).ok_or(corrupt())?;
+            for bundle in inflight
+                .get_mut(pivot.start..)
+                .unwrap_or_default()
+                .iter_mut()
+                .rev()
+            {
+                for b in bundle.iter_mut() {
+                    b.probes = b.probes.saturating_add(1);
+                    if let Some(op) = b.get_hashed_async(store, key, hash, value).await? {
+                        return Ok(Some(op));
+                    }
+                }
+            }
+            let Bundle {
+                branches, maplet, ..
+            } = &mut pivot.bundle;
+            match maplet {
+                Some(m) => {
+                    let mask = m.route(hash)?;
+                    let n = branches.len();
+                    for (i, b) in branches.iter().enumerate() {
+                        let age = n.saturating_sub(1).saturating_sub(i);
+                        let named = u32::try_from(age)
+                            .ok()
+                            .and_then(|a| 1u64.checked_shl(a))
+                            .is_some_and(|bit| mask & bit != 0);
+                        if named && let Some(op) = b.get_routed_async(store, key, value).await? {
+                            return Ok(Some(op));
+                        }
+                    }
+                }
+                None => {
+                    let several = branches.len() >= 2;
+                    if several {
+                        self.routes.branches = self
+                            .routes
+                            .branches
+                            .saturating_add(u64::try_from(branches.len()).unwrap_or(u64::MAX));
+                    }
+                    for b in branches.iter_mut() {
+                        // Commit each started probe before its wait, so cancellation does not
+                        // discard work already priced for maplet eligibility.
+                        if several {
+                            self.routes.probes = self.routes.probes.saturating_add(1);
+                        }
+                        b.probes = b.probes.saturating_add(1);
+                        if let Some(op) = b.get_hashed_async(store, key, hash, value).await? {
+                            return Ok(Some(op));
+                        }
+                    }
+                }
+            }
+            match pivot.child {
+                Some(child) => at = child,
+                None => return Ok(None),
+            }
+        }
+        Err(corrupt())
     }
 
     /// [`Self::get_hashed`], tallying the filters it probes in bundles of several branches and
@@ -1374,6 +1553,11 @@ impl Trunk {
         budget: u64,
         wait: Wait,
     ) -> Result<u64, Error> {
+        if self.saving() {
+            return Err(Error::InvalidArgument {
+                what: "a trunk changed while its checkpoint is being saved",
+            });
+        }
         self.views_unchecked = self.nodes.len();
         self.maplets_unchecked = self.nodes.len();
         self.wait = wait;
@@ -1402,6 +1586,14 @@ impl Trunk {
         self.pool.as_ref().is_some_and(|p| p.out_for(Owner::Trunk))
     }
 
+    /// Ready compactions cannot take a seat until packing progresses. A packing can still
+    /// need its owner to feed it, so the owner must not wait for its Done inside the trunk.
+    pub(crate) fn packing_blocks_dispatch(&self) -> bool {
+        self.pool.as_ref().is_some_and(|pool| {
+            !pool.can_take(true) && !pool.out_for(Owner::Trunk) && pool.out_for(Owner::Pack)
+        })
+    }
+
     /// Hands the trunk maintenance workers: from the next compaction planned on, compactions
     /// run on them. A cascade in progress keeps the compactions it has.
     pub fn set_pool(&mut self, pool: Pool) {
@@ -1427,9 +1619,33 @@ impl Trunk {
         used
     }
 
+    /// Every admitted worker has acknowledged its device setup.
+    pub(crate) fn workers_prepared(&self) -> bool {
+        self.pool.as_ref().is_some_and(Pool::prepared)
+    }
+
+    pub(crate) fn validate_worker_preparation(&self) -> Result<(), Error> {
+        if self.cascade.iter().any(|frame| {
+            matches!(
+                &frame.phase,
+                Phase::Pivots { job: Some(_), .. } | Phase::Settle { job: Some(_) }
+            )
+        }) {
+            return Err(Error::InvalidArgument {
+                what: "an inline compaction before runtime worker preparation",
+            });
+        }
+        self.pool.as_ref().ok_or(no_pool())?.can_prepare()
+    }
+
     /// Whether the trunk has maintenance workers.
     pub fn has_pool(&self) -> bool {
         self.pool.is_some()
+    }
+
+    /// The worker capacity admitted by the shard's memory reservation.
+    pub(crate) fn pool_capacity(&self) -> usize {
+        self.pool.as_ref().map_or(0, Pool::capacity)
     }
 
     /// Stops the workers, each job still out run to its end and dropped.
@@ -1437,7 +1653,7 @@ impl Trunk {
         self.pool = None;
     }
 
-    /// The workers held and wanted, for diagnosis.
+    /// Warm worker seats held and active workers wanted, for diagnosis.
     pub fn pool_workers(&self) -> Option<(usize, usize)> {
         self.pool.as_ref().map(|p| (p.workers(), p.want()))
     }
@@ -1453,19 +1669,43 @@ impl Trunk {
         budget: u64,
     ) -> Result<u64, Error> {
         self.yield_io = true;
-        let used = self.step(store, budget);
+        let used = self.step_with(store, budget, Wait::No);
         self.yield_io = false;
         used
     }
 
     /// The last paced step stopped for a required input page that had not landed.
     pub(crate) fn waiting_for_io(&self) -> bool {
-        self.io_waiting
+        self.io_waiting || self.workers_waiting
     }
 
     /// A new idle slice reports only a wait encountered by that slice's trunk step.
     pub(crate) fn clear_io_wait(&mut self) {
         self.io_waiting = false;
+        self.workers_waiting = false;
+        if let Some(pool) = self.pool.as_mut() {
+            pool.clear_wait();
+        }
+    }
+
+    pub(crate) fn waiting_for_worker(&self) -> bool {
+        self.pool.as_ref().is_some_and(Pool::waiting)
+    }
+
+    /// Finishes only the current cascade, leaving its pending inputs for the next one, as
+    /// finish_cascade does, but a runtime task waits through the completion receivers.
+    pub(crate) fn finish_cascade_paced<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        budget: u64,
+    ) -> Result<bool, Error> {
+        self.views_unchecked = self.nodes.len();
+        self.maplets_unchecked = self.nodes.len();
+        self.wait = Wait::No;
+        self.yield_io = true;
+        let result = self.run(store, budget, false);
+        self.yield_io = false;
+        result.map(|_| !self.cascading())
     }
 
     /// Runs the cascade in progress to its end, starting none: the pending branches then enter
@@ -1499,128 +1739,27 @@ impl Trunk {
         store: &mut Store<F>,
         budget: u64,
     ) -> Result<u64, Error> {
-        if let Some(mut job) = self.maplet_job.take() {
-            let same = self
-                .bundle_of(job.node, job.pivot)
-                .is_some_and(|bs| bs.iter().map(|b| b.root).eq(job.roots.iter().copied()));
-            if !same {
-                self.stats.maplets_dropped = self.stats.maplets_dropped.saturating_add(1);
-                return Ok(1);
-            }
-            let branches = self.bundle_of(job.node, job.pivot).ok_or(corrupt())?;
-            if let Some(mut trial) = job.trial.take() {
-                let entries = trial.maplet.shape.entries.max(1);
-                let chunk = budget.max(1).min(entries.saturating_sub(trial.done));
-                trial.hashes.clear();
-                for _ in 0..chunk {
-                    trial.x ^= trial.x << 13;
-                    trial.x ^= trial.x >> 7;
-                    trial.x ^= trial.x << 17;
-                    trial.hashes.push(trial.x);
-                }
-                let mut sink = 0u64;
-                let t = std::time::Instant::now();
-                for &h in &trial.hashes {
-                    sink ^= trial.maplet.route(h)?;
-                }
-                let routed = t.elapsed();
-                let t = std::time::Instant::now();
-                for &h in &trial.hashes {
-                    for b in branches {
-                        sink ^= u64::from(b.filter.may_contain(h));
-                    }
-                }
-                let probed = t.elapsed();
-                std::hint::black_box(sink);
-                let ns = |d: std::time::Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
-                trial.maplet_ns = trial.maplet_ns.saturating_add(ns(routed));
-                trial.filter_ns = trial.filter_ns.saturating_add(ns(probed));
-                trial.done = trial.done.saturating_add(chunk);
-                if trial.done < entries {
-                    job.trial = Some(trial);
-                    self.maplet_job = Some(job);
-                    return Ok(chunk.max(1));
-                }
-                // Kept when a route through it costs less than the filters' expected share: per
-                // route, maplet_ns / n against (filter_ns / (n k)) · k · probes / branches, the
-                // tally's share of a bundle's filters a get probes; with no tally yet, every
-                // filter (an absent key's route).
-                let routes = if self.routes.branches == 0 {
-                    Tally {
-                        branches: 1,
-                        probes: 1,
-                    }
-                } else {
-                    self.routes
-                };
-                let keep = u128::from(trial.maplet_ns).saturating_mul(u128::from(routes.branches))
-                    < u128::from(trial.filter_ns).saturating_mul(u128::from(routes.probes));
-                if let Some(p) = self
-                    .nodes
-                    .get_mut(job.node)
-                    .and_then(|nd| nd.pivots.get_mut(job.pivot))
-                {
-                    if keep {
-                        p.bundle.maplet = Some(trial.maplet);
-                        self.stats.maplets_built = self.stats.maplets_built.saturating_add(1);
-                    } else {
-                        p.bundle.declined = true;
-                        self.stats.maplets_declined = self.stats.maplets_declined.saturating_add(1);
-                    }
-                }
-                return Ok(chunk.max(1));
-            }
-            let n = branches.len();
-            let mut work = 0u64;
-            let MapletJob {
-                heads,
-                builder,
-                pages,
-                ..
-            } = &mut job;
-            let mut emit = |p: &[u8]| {
-                pages.push(p.to_vec());
-                Ok(())
-            };
-            // Each round adds a hash: at most the budget.
-            while work < budget.max(1) {
-                // The least next hash among the branches' (a bundle has at most its fanout and one).
-                let next = heads
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, (_, h))| h.map(|h| (h, i)))
-                    .min();
-                let Some((h, i)) = next else { break };
-                let age = n.saturating_sub(1).saturating_sub(i);
-                builder.add(h, u8::try_from(age).map_err(|_| corrupt())?, &mut emit)?;
-                if let (Some((cursor, head)), Some(b)) = (heads.get_mut(i), branches.get(i)) {
-                    *head = cursor.next(store, b)?;
-                }
-                work = work.saturating_add(1);
-            }
-            if heads.iter().any(|(_, h)| h.is_some()) {
-                self.maplet_job = Some(job);
-                return Ok(work.max(1));
-            }
-            let builder = std::mem::replace(
-                &mut job.builder,
-                crate::maplet::Builder::new(crate::maplet::BUCKETS.trailing_zeros(), 0, 1)?,
-            );
-            let mut pages = std::mem::take(&mut job.pages);
-            let shape = builder.close(&mut |p: &[u8]| {
-                pages.push(p.to_vec());
-                Ok(())
-            })?;
-            job.trial = Some(Trial {
-                maplet: crate::maplet::Maplet { shape, pages },
-                done: 0,
-                maplet_ns: 0,
-                filter_ns: 0,
-                x: job.roots.first().copied().unwrap_or(1) | 1,
-                hashes: Vec::new(),
+        if self.saving() {
+            return Err(Error::InvalidArgument {
+                what: "a trunk changed while its checkpoint is being saved",
             });
-            self.maplet_job = Some(job);
-            return Ok(work.max(1));
+        }
+        if let Some(mut job) = self.maplet_job.take() {
+            let advanced = self.advance_maplet(store, &mut job, budget);
+            match advanced {
+                Ok((work, true)) => {
+                    self.maplet_job = Some(job);
+                    return Ok(work);
+                }
+                Ok((work, false)) => {
+                    job.give_back(store);
+                    return Ok(work);
+                }
+                Err(error) => {
+                    job.give_back(store);
+                    return Err(error);
+                }
+            }
         }
         let mut checked = 0u64;
         while self.maplets_unchecked > 0 && checked < budget.max(1) {
@@ -1649,15 +1788,16 @@ impl Trunk {
             )?;
             let mut heads = Vec::with_capacity(branches.len());
             for b in branches {
-                let mut cursor = b.hashes(store)?;
-                let head = cursor.next(store, b)?;
-                heads.push((cursor, head));
+                // Each cursor is owned before its first read; opening is budgeted below.
+                heads.push((b.hashes(store)?, None));
             }
             self.maplet_job = Some(MapletJob {
                 node: n,
                 pivot: i,
                 roots: branches.iter().map(|b| b.root).collect(),
                 heads,
+                opening: 0,
+                advancing: None,
                 builder,
                 pages: Vec::new(),
                 trial: None,
@@ -1668,6 +1808,213 @@ impl Trunk {
             break;
         }
         Ok(checked.max(1))
+    }
+
+    /// A paced idle maplet retains its hash cursor and unfinished opening/advance until
+    /// the real device receipt; normal standalone maintenance keeps its synchronous API.
+    pub(crate) fn maplet_step_paced<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        budget: u64,
+    ) -> Result<u64, Error> {
+        self.yield_io = true;
+        let used = self.maplet_step(store, budget);
+        self.yield_io = false;
+        used
+    }
+
+    /// Drops optional hash work before checkpoint/terminal retirement or a structural
+    /// turn can replace its branch identity. Any read remains owned by Store to retire.
+    pub(crate) fn abandon_maplet<F: BlockFile>(&mut self, store: &mut Store<F>) {
+        if let Some(job) = self.maplet_job.take() {
+            job.give_back(store);
+            self.stats.maplets_dropped = self.stats.maplets_dropped.saturating_add(1);
+            self.maplets_unchecked = self.maplets_unchecked.max(self.nodes.len());
+        }
+    }
+
+    /// Optional views retain cursors by root address. Return them before structural or
+    /// durable turnover can reuse that identity; the same bundle remains eligible later.
+    pub(crate) fn abandon_view<F: BlockFile>(&mut self, store: &mut Store<F>) {
+        if let Some(job) = self.view_job.take() {
+            job.build.abandon(store);
+            self.stats.views_dropped = self.stats.views_dropped.saturating_add(1);
+            self.views_unchecked = self.views_unchecked.max(self.nodes.len());
+        }
+    }
+
+    fn advance_maplet<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        job: &mut MapletJob,
+        budget: u64,
+    ) -> Result<(u64, bool), Error> {
+        let same = self
+            .bundle_of(job.node, job.pivot)
+            .is_some_and(|bs| bs.iter().map(|b| b.root).eq(job.roots.iter().copied()));
+        if !same {
+            self.stats.maplets_dropped = self.stats.maplets_dropped.saturating_add(1);
+            return Ok((1, false));
+        }
+        let branches = self.bundle_of(job.node, job.pivot).ok_or(corrupt())?;
+        if let Some(mut trial) = job.trial.take() {
+            let entries = trial.maplet.shape.entries.max(1);
+            let chunk = budget.max(1).min(entries.saturating_sub(trial.done));
+            trial.hashes.clear();
+            for _ in 0..chunk {
+                trial.x ^= trial.x << 13;
+                trial.x ^= trial.x >> 7;
+                trial.x ^= trial.x << 17;
+                trial.hashes.push(trial.x);
+            }
+            let mut sink = 0u64;
+            let t = std::time::Instant::now();
+            for &h in &trial.hashes {
+                sink ^= trial.maplet.route(h)?;
+            }
+            let routed = t.elapsed();
+            let t = std::time::Instant::now();
+            for &h in &trial.hashes {
+                for b in branches {
+                    sink ^= u64::from(b.filter.may_contain(h));
+                }
+            }
+            let probed = t.elapsed();
+            std::hint::black_box(sink);
+            let ns = |d: std::time::Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+            trial.maplet_ns = trial.maplet_ns.saturating_add(ns(routed));
+            trial.filter_ns = trial.filter_ns.saturating_add(ns(probed));
+            trial.done = trial.done.saturating_add(chunk);
+            if trial.done < entries {
+                job.trial = Some(trial);
+                return Ok((chunk.max(1), true));
+            }
+            // Kept when a route through it costs less than the filters' expected share: per
+            // route, maplet_ns / n against (filter_ns / (n k)) · k · probes / branches, the
+            // tally's share of a bundle's filters a get probes; with no tally yet, every
+            // filter (an absent key's route).
+            let routes = if self.routes.branches == 0 {
+                Tally {
+                    branches: 1,
+                    probes: 1,
+                }
+            } else {
+                self.routes
+            };
+            let keep = u128::from(trial.maplet_ns).saturating_mul(u128::from(routes.branches))
+                < u128::from(trial.filter_ns).saturating_mul(u128::from(routes.probes));
+            if let Some(p) = self
+                .nodes
+                .get_mut(job.node)
+                .and_then(|nd| nd.pivots.get_mut(job.pivot))
+            {
+                if keep {
+                    p.bundle.maplet = Some(trial.maplet);
+                    self.stats.maplets_built = self.stats.maplets_built.saturating_add(1);
+                } else {
+                    p.bundle.declined = true;
+                    self.stats.maplets_declined = self.stats.maplets_declined.saturating_add(1);
+                }
+            }
+            return Ok((chunk.max(1), false));
+        }
+        let branches = self.bundle_of(job.node, job.pivot).ok_or(corrupt())?;
+        let n = branches.len();
+        let mut work = 0u64;
+        // Opening and adding each hash cost one unit; successor completion is retained
+        // continuation of its already-paid add, so a Waiting step may do zero work.
+        while job.opening < n && work < budget.max(1) {
+            let i = job.opening;
+            let (cursor, head) = job.heads.get_mut(i).ok_or(corrupt())?;
+            let branch = branches.get(i).ok_or(corrupt())?;
+            let next = if self.yield_io {
+                cursor.next_paced(store, branch)?
+            } else {
+                crate::branch::HashStep::Done(cursor.next(store, branch)?)
+            };
+            match next {
+                crate::branch::HashStep::Waiting => {
+                    self.io_waiting = true;
+                    return Ok((work, true));
+                }
+                crate::branch::HashStep::Done(next) => {
+                    *head = next;
+                    job.opening = job.opening.checked_add(1).ok_or(corrupt())?;
+                    work = work.saturating_add(1);
+                }
+            }
+        }
+        if job.opening < n {
+            return Ok((work, true));
+        }
+        while work < budget.max(1) {
+            if let Some(i) = job.advancing {
+                let (cursor, head) = job.heads.get_mut(i).ok_or(corrupt())?;
+                let branch = branches.get(i).ok_or(corrupt())?;
+                let next = if self.yield_io {
+                    cursor.next_paced(store, branch)?
+                } else {
+                    crate::branch::HashStep::Done(cursor.next(store, branch)?)
+                };
+                match next {
+                    crate::branch::HashStep::Waiting => {
+                        self.io_waiting = true;
+                        return Ok((work, true));
+                    }
+                    crate::branch::HashStep::Done(next) => {
+                        *head = next;
+                        job.advancing = None;
+                    }
+                }
+            }
+            let next = job
+                .heads
+                .iter()
+                .enumerate()
+                .filter_map(|(i, (_, h))| h.map(|h| (h, i)))
+                .min();
+            let Some((hash, i)) = next else { break };
+            let age = n.saturating_sub(1).saturating_sub(i);
+            let pages = &mut job.pages;
+            job.builder.add(
+                hash,
+                u8::try_from(age).map_err(|_| corrupt())?,
+                &mut |page| {
+                    pages.push(page.to_vec());
+                    Ok(())
+                },
+            )?;
+            *job.heads
+                .get_mut(i)
+                .map(|(_, head)| head)
+                .ok_or(corrupt())? = None;
+            job.advancing = Some(i);
+            work = work.saturating_add(1);
+        }
+        if job.advancing.is_some() || job.heads.iter().any(|(_, head)| head.is_some()) {
+            return Ok((work, true));
+        }
+        let builder = std::mem::replace(
+            &mut job.builder,
+            crate::maplet::Builder::new(crate::maplet::BUCKETS.trailing_zeros(), 0, 1)?,
+        );
+        let mut pages = std::mem::take(&mut job.pages);
+        let shape = builder.close(&mut |p: &[u8]| {
+            pages.push(p.to_vec());
+            Ok(())
+        })?;
+        for (cursor, _) in job.heads.drain(..) {
+            cursor.give_back(store);
+        }
+        job.trial = Some(Trial {
+            maplet: crate::maplet::Maplet { shape, pages },
+            done: 0,
+            maplet_ns: 0,
+            filter_ns: 0,
+            x: job.roots.first().copied().unwrap_or(1) | 1,
+            hashes: Vec::new(),
+        });
+        Ok((work.max(1), true))
     }
 
     /// Whether a pivot bundle may want a view: one being built, or nodes not checked since the
@@ -1686,6 +2033,11 @@ impl Trunk {
         store: &mut Store<F>,
         budget: u64,
     ) -> Result<u64, Error> {
+        if self.saving() {
+            return Err(Error::InvalidArgument {
+                what: "a trunk changed while its checkpoint is being saved",
+            });
+        }
         let yield_io = self.yield_io;
         if let Some(job) = self.view_job.take() {
             let done = {
@@ -1698,7 +2050,13 @@ impl Trunk {
                     Some(runs) if resumable && job.build.reads(runs) => {
                         let mut job = job;
                         let t = std::time::Instant::now();
-                        let (taken, done) = job.build.step(store, runs, budget, yield_io)?;
+                        let (taken, done) = match job.build.step(store, runs, budget, yield_io) {
+                            Ok(done) => done,
+                            Err(error) => {
+                                job.build.abandon(store);
+                                return Err(error);
+                            }
+                        };
                         self.io_waiting |= job.build.waiting();
                         job.ns = job.ns.saturating_add(
                             u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX),
@@ -1863,6 +2221,15 @@ impl Trunk {
         budget: u64,
         start: bool,
     ) -> Result<u64, Error> {
+        if self.saving() {
+            return Err(Error::InvalidArgument {
+                what: "a trunk changed while its checkpoint is being saved",
+            });
+        }
+        // The cascade may replace branch identities before a later maplet step runs.
+        // A deferred hash read cannot publish a route against reused extent addresses.
+        self.abandon_maplet(store);
+        self.abandon_view(store);
         let mut used = 0u64;
         self.io_waiting = false;
         self.workers_waiting = false;
@@ -2074,18 +2441,43 @@ impl Trunk {
                 (self.flush_from(n, i)?, 0)
             }
             Phase::Out { mut jobs, settle } => {
-                if !self.tend(store, &mut jobs)? {
-                    self.workers_waiting = true;
-                    self.cascade.push(Frame {
-                        n,
-                        phase: Phase::Out { jobs, settle },
-                    });
-                    return Ok(0);
+                match self.tend(store, &mut jobs) {
+                    Ok(false) => {
+                        self.workers_waiting = true;
+                        self.cascade.push(Frame {
+                            n,
+                            phase: Phase::Out { jobs, settle },
+                        });
+                        return Ok(0);
+                    }
+                    Err(error) => {
+                        if !self.abandon(store, &mut jobs)? {
+                            self.workers_waiting = true;
+                            self.cascade.push(Frame {
+                                n,
+                                phase: Phase::Abandon { jobs, error },
+                            });
+                            return Ok(0);
+                        }
+                        return Err(error);
+                    }
+                    Ok(true) => {}
                 }
                 let t = self.timed.then(std::time::Instant::now);
                 let phase = self.apply_out(store, n, jobs, settle)?;
                 self.stats.finish_ns = self.stats.finish_ns.saturating_add(ns_since(t));
                 (phase, 0)
+            }
+            Phase::Abandon { mut jobs, error } => {
+                if !self.abandon(store, &mut jobs)? {
+                    self.workers_waiting = true;
+                    self.cascade.push(Frame {
+                        n,
+                        phase: Phase::Abandon { jobs, error },
+                    });
+                    return Ok(0);
+                }
+                return Err(error);
             }
         };
         if let Some(phase) = phase {
@@ -2100,11 +2492,18 @@ impl Trunk {
     /// the checkpoint naming this one is durable (the store's deferred free). Every node's
     /// in-flight list is empty between incorporations, which the image relies on.
     pub fn save<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<u64, Error> {
+        if self.saving() {
+            return Err(Error::InvalidArgument {
+                what: "a synchronous save during a paced checkpoint",
+            });
+        }
         if !self.is_idle() {
             return Err(Error::InvalidArgument {
                 what: "a trunk saved with maintenance pending",
             });
         }
+        self.abandon_maplet(store);
+        self.abandon_view(store);
         // Views not yet written go to fresh extents of their own, which the image then names.
         for node in &mut self.nodes {
             for p in &mut node.pivots {
@@ -2221,6 +2620,477 @@ impl Trunk {
         }
         self.view_extents = named;
         Ok(head)
+    }
+
+    /// A checkpoint's immutable image is still owned by the trunk. Its caller must not
+    /// incorporate new branches or change allocator structure until save or abort completes.
+    pub(crate) fn saving(&self) -> bool {
+        self.saving.phase != SavePhase::Idle
+    }
+
+    /// Saves one retained image in budgeted node/page steps. Unfinished pages remain owned;
+    /// no view or old image reference changes before every owner write has retired.
+    pub(crate) fn save_paced<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        budget: u64,
+    ) -> Result<Option<u64>, Error> {
+        if !self.saving() {
+            if !self.is_idle() {
+                return Err(Error::InvalidArgument {
+                    what: "a trunk saved with maintenance pending",
+                });
+            }
+            self.abandon_maplet(store);
+            self.abandon_view(store);
+            let capacity = store.page_capacity();
+            let per = usize::try_from(store.extent_pages()).map_err(|_| corrupt())?;
+            if capacity == 0 || per == 0 {
+                return Err(corrupt());
+            }
+            let room = capacity
+                .saturating_sub(image_header_bytes()?)
+                .checked_div(size_of::<u64>())
+                .ok_or(corrupt())?;
+            // The image header names these extents; one page is the header itself.
+            self.saving.image_limit = room
+                .checked_mul(per)
+                .and_then(|n| n.checked_sub(1))
+                .and_then(|n| n.checked_mul(capacity))
+                .ok_or(Error::LimitExceeded {
+                    what: "extents a trunk image's header names",
+                    limit: u64::try_from(room).unwrap_or(u64::MAX),
+                })?;
+            self.saving.run = Some(store.run()?);
+            self.saving.phase = SavePhase::Views;
+            self.saving.node = 0;
+            self.saving.pivot = 0;
+        }
+        // Each pass encodes one node, allocates one extent, or accepts one page/run. A
+        // completion wait leaves the cursor unchanged and consumes none of the next page.
+        for _ in 0..budget {
+            match self.save_step(store) {
+                Ok((false, None)) => return Ok(None),
+                Ok((_, Some(head))) => return Ok(Some(head)),
+                Ok((true, None)) => {}
+                Err(error) => {
+                    if !self.saving() {
+                        return Err(error);
+                    }
+                    self.saving.error.get_or_insert(error);
+                    self.saving.phase = SavePhase::Abort;
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn save_step<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+    ) -> Result<(bool, Option<u64>), Error> {
+        let capacity = store.page_capacity();
+        let per = usize::try_from(store.extent_pages()).map_err(|_| corrupt())?;
+        if capacity == 0 || per == 0 {
+            return Err(corrupt());
+        }
+        match self.saving.phase {
+            SavePhase::Idle => return Err(corrupt()),
+            SavePhase::Views => {
+                let save = &mut self.saving;
+                let Some(node) = self.nodes.get(save.node) else {
+                    save.bytes.clear();
+                    // Format, root, fanout, leaf entries and node count.
+                    let bytes = size_of::<u8>()
+                        .checked_add(size_of::<[u32; 3]>())
+                        .and_then(|n| n.checked_add(size_of::<u64>()))
+                        .ok_or(corrupt())?;
+                    if bytes > save.image_limit {
+                        return Err(Error::LimitExceeded {
+                            what: "a trunk image's serialized bytes",
+                            limit: u64::try_from(save.image_limit).unwrap_or(u64::MAX),
+                        });
+                    }
+                    save_reserve(&mut save.bytes, bytes)?;
+                    save.bytes.push(IMAGE_FORMAT);
+                    save32(&mut save.bytes, self.root)?;
+                    save32(&mut save.bytes, self.config.fanout)?;
+                    save.bytes
+                        .extend_from_slice(&self.config.leaf_entries.to_le_bytes());
+                    save32(&mut save.bytes, self.nodes.len())?;
+                    save.node = 0;
+                    save.phase = SavePhase::Encoding;
+                    return Ok((true, None));
+                };
+                let Some(pivot) = node.pivots.get(save.pivot) else {
+                    save.node = save.node.checked_add(1).ok_or(corrupt())?;
+                    save.pivot = 0;
+                    return Ok((true, None));
+                };
+                let Some(view) = pivot
+                    .bundle
+                    .view
+                    .as_ref()
+                    .filter(|_| pivot.bundle.stored.is_none())
+                else {
+                    save.pivot = save.pivot.checked_add(1).ok_or(corrupt())?;
+                    return Ok((true, None));
+                };
+                let runs = pivot.bundle.branches().len();
+                if !view
+                    .roots()
+                    .iter()
+                    .copied()
+                    .eq(pivot.bundle.branches().iter().map(|b| b.root))
+                {
+                    return Err(corrupt());
+                }
+                // View::bytes counts 6 bytes/offset and 3 bytes/segment; its encoding uses
+                // 10 and 8, plus six u32 lengths and one u64 root per run.
+                let extra = view
+                    .segments()
+                    .checked_mul(
+                        runs.checked_mul(4)
+                            .and_then(|n| n.checked_add(5))
+                            .ok_or(corrupt())?,
+                    )
+                    .and_then(|n| n.checked_add(runs.checked_mul(size_of::<u64>())?))
+                    .and_then(|n| n.checked_add(size_of::<[u32; 6]>()))
+                    .and_then(|n| n.checked_add(size_of::<u64>()))
+                    .ok_or(corrupt())?;
+                let bytes = view.bytes().checked_add(extra).ok_or(corrupt())?;
+                save.bytes.clear();
+                save_reserve(&mut save.bytes, bytes)?;
+                save.bytes.extend_from_slice(&0u64.to_le_bytes());
+                view.encode(&mut save.bytes)?;
+                let len = save
+                    .bytes
+                    .len()
+                    .checked_sub(size_of::<u64>())
+                    .ok_or(corrupt())?;
+                save.bytes
+                    .get_mut(..size_of::<u64>())
+                    .ok_or(corrupt())?
+                    .copy_from_slice(&u64::try_from(len).map_err(|_| corrupt())?.to_le_bytes());
+                save.extent_count = save.bytes.len().div_ceil(capacity).div_ceil(per);
+                u32::try_from(save.extent_count).map_err(|_| corrupt())?;
+                save_reserve(&mut save.fresh, save.extent_count)?;
+                save.page = 0;
+                save.phase = SavePhase::ViewPages;
+            }
+            SavePhase::ViewPages | SavePhase::ImagePages => {
+                let save = &mut self.saving;
+                if save.fresh.len() < save.extent_count {
+                    save.fresh.push(store.allocate_extent()?);
+                    return Ok((true, None));
+                }
+                let image = save.phase == SavePhase::ImagePages;
+                if image && save.head.is_none() {
+                    let header = image_header_bytes()?;
+                    let len = save
+                        .fresh
+                        .len()
+                        .checked_mul(size_of::<u64>())
+                        .and_then(|n| n.checked_add(header))
+                        .ok_or(corrupt())?;
+                    save.header.clear();
+                    save_reserve(&mut save.header, len)?;
+                    save.header.extend_from_slice(&IMAGE_MAGIC.to_le_bytes());
+                    save.header.extend_from_slice(
+                        &u64::try_from(save.bytes.len())
+                            .map_err(|_| corrupt())?
+                            .to_le_bytes(),
+                    );
+                    save32(&mut save.header, save.fresh.len())?;
+                    for extent in &save.fresh {
+                        save.header.extend_from_slice(&extent.to_le_bytes());
+                    }
+                    save.head = Some(save.address(store, 0)?);
+                }
+                let pages = save
+                    .bytes
+                    .len()
+                    .div_ceil(capacity)
+                    .checked_add(usize::from(image))
+                    .ok_or(corrupt())?;
+                if save.page == pages {
+                    save.phase = if image {
+                        SavePhase::ImageRun
+                    } else {
+                        SavePhase::ViewRun
+                    };
+                    return Ok((true, None));
+                }
+                let address = save.address(store, save.page)?;
+                let payload = if image && save.page == 0 {
+                    save.header.as_slice()
+                } else {
+                    let page = save.page.checked_sub(usize::from(image)).ok_or(corrupt())?;
+                    let start = page.checked_mul(capacity).ok_or(corrupt())?;
+                    let end = start
+                        .checked_add(capacity)
+                        .ok_or(corrupt())?
+                        .min(save.bytes.len());
+                    save.bytes.get(start..end).ok_or(corrupt())?
+                };
+                let run = save.run.as_mut().ok_or(corrupt())?;
+                if !store.queue_page_paced(run, address, payload)? {
+                    return Ok((false, None));
+                }
+                save.page = save.page.checked_add(1).ok_or(corrupt())?;
+            }
+            SavePhase::ViewRun => {
+                let save = &mut self.saving;
+                if !store.write_run_paced(save.run.as_mut().ok_or(corrupt())?)? {
+                    return Ok((false, None));
+                }
+                save_reserve(&mut save.views, 1)?;
+                save.views.push(SavedView {
+                    node: save.node,
+                    pivot: save.pivot,
+                    extents: std::mem::take(&mut save.fresh),
+                });
+                save.pivot = save.pivot.checked_add(1).ok_or(corrupt())?;
+                save.phase = SavePhase::Views;
+            }
+            SavePhase::Encoding => {
+                if self.saving.node == self.nodes.len() {
+                    let save = &mut self.saving;
+                    let pages = save
+                        .bytes
+                        .len()
+                        .div_ceil(capacity)
+                        .checked_add(1)
+                        .ok_or(corrupt())?;
+                    save.extent_count = pages.div_ceil(per);
+                    let room = capacity
+                        .saturating_sub(image_header_bytes()?)
+                        .checked_div(size_of::<u64>())
+                        .ok_or(corrupt())?;
+                    if save.extent_count > room {
+                        return Err(Error::LimitExceeded {
+                            what: "extents a trunk image's header names",
+                            limit: u64::try_from(room).unwrap_or(u64::MAX),
+                        });
+                    }
+                    save_reserve(&mut save.fresh, save.extent_count)?;
+                    save.named.sort_unstable();
+                    save.page = 0;
+                    save.phase = SavePhase::ImagePages;
+                    return Ok((true, None));
+                }
+                self.encode_saved_node()?;
+                self.saving.node = self.saving.node.checked_add(1).ok_or(corrupt())?;
+            }
+            SavePhase::ImageRun => {
+                if !store.write_run_paced(self.saving.run.as_mut().ok_or(corrupt())?)? {
+                    return Ok((false, None));
+                }
+                if let Some(run) = self.saving.run.take() {
+                    store.give_run(run);
+                }
+                self.saving.phase = SavePhase::Drain;
+            }
+            SavePhase::Drain => {
+                if !store.drain_paced()? {
+                    return Ok((false, None));
+                }
+                self.saving.phase = SavePhase::Publish;
+            }
+            SavePhase::Publish => {
+                // Validate all staged destinations before either old references or metadata
+                // changes. Structural steps are refused throughout this retained save.
+                for view in &self.saving.views {
+                    let pivot = self
+                        .nodes
+                        .get(view.node)
+                        .and_then(|n| n.pivots.get(view.pivot))
+                        .ok_or(corrupt())?;
+                    if pivot.bundle.stored.is_some() || pivot.bundle.view.is_none() {
+                        return Err(corrupt());
+                    }
+                }
+                for &extent in &self.saved {
+                    store.release(extent)?;
+                }
+                for &extent in &self.view_extents {
+                    if self.saving.named.binary_search(&extent).is_err() {
+                        store.release(extent)?;
+                    }
+                }
+                for view in self.saving.views.drain(..) {
+                    let pivot = self
+                        .nodes
+                        .get_mut(view.node)
+                        .and_then(|n| n.pivots.get_mut(view.pivot))
+                        .ok_or(corrupt())?;
+                    pivot.bundle.stored = Some(view.extents);
+                }
+                std::mem::swap(&mut self.saved, &mut self.saving.fresh);
+                std::mem::swap(&mut self.view_extents, &mut self.saving.named);
+                let head = self.saving.head.take().ok_or(corrupt())?;
+                self.reset_save();
+                return Ok((true, Some(head)));
+            }
+            SavePhase::Abort => {
+                if matches!(store.drain_paced(), Ok(false)) {
+                    return Ok((false, None));
+                }
+                let error = self.saving.error.take().ok_or(corrupt())?;
+                // The original save error is retained even if reference cleanup also fails.
+                let _ = self.discard_save(store);
+                return Err(error);
+            }
+        }
+        Ok((true, None))
+    }
+
+    fn encode_saved_node(&mut self) -> Result<(), Error> {
+        let save = &mut self.saving;
+        let node = self.nodes.get(save.node).ok_or(corrupt())?;
+        if !node.inflight.is_empty() {
+            return Err(corrupt());
+        }
+        // Reserve this node's exact descriptor shape before encoders append to the scratch.
+        let mut bytes = size_of::<u8>()
+            .checked_add(size_of::<[u32; 2]>())
+            .ok_or(corrupt())?;
+        bytes = bytes
+            .checked_add(node.end.as_ref().map_or(0, Vec::len))
+            .ok_or(corrupt())?;
+        for (i, pivot) in node.pivots.iter().enumerate() {
+            let extents = save
+                .views
+                .binary_search_by_key(&(save.node, i), |v| (v.node, v.pivot))
+                .ok()
+                .and_then(|n| save.views.get(n))
+                .map_or(pivot.bundle.stored.as_deref().unwrap_or(&[]), |v| {
+                    v.extents.as_slice()
+                });
+            bytes = bytes
+                .checked_add(size_of::<[u32; 4]>())
+                .and_then(|n| n.checked_add(pivot.key.len()))
+                .ok_or(corrupt())?;
+            for branch in pivot.bundle.branches() {
+                // Branch::encode has seven u64 fields, two u32 fields and its u8 height.
+                let fixed = size_of::<[u64; 7]>()
+                    .checked_add(size_of::<[u32; 2]>())
+                    .and_then(|n| n.checked_add(size_of::<u8>()))
+                    .ok_or(corrupt())?;
+                bytes = bytes
+                    .checked_add(fixed)
+                    .and_then(|n| {
+                        n.checked_add(branch.extents.len().checked_mul(size_of::<u64>())?)
+                    })
+                    .ok_or(corrupt())?;
+            }
+            bytes = bytes
+                .checked_add(
+                    extents
+                        .len()
+                        .checked_mul(size_of::<u64>())
+                        .ok_or(corrupt())?,
+                )
+                .ok_or(corrupt())?;
+        }
+        let total = save.bytes.len().checked_add(bytes).ok_or(corrupt())?;
+        if total > save.image_limit {
+            return Err(Error::LimitExceeded {
+                what: "a trunk image's serialized bytes",
+                limit: u64::try_from(save.image_limit).unwrap_or(u64::MAX),
+            });
+        }
+        save_reserve(&mut save.bytes, bytes)?;
+        save.bytes.push(u8::from(node.leaf));
+        match &node.end {
+            Some(end) => {
+                save32(&mut save.bytes, end.len())?;
+                save.bytes.extend_from_slice(end);
+            }
+            None => save.bytes.extend_from_slice(&ABSENT.to_le_bytes()),
+        }
+        save32(&mut save.bytes, node.pivots.len())?;
+        for (i, pivot) in node.pivots.iter().enumerate() {
+            save32(&mut save.bytes, pivot.key.len())?;
+            save.bytes.extend_from_slice(&pivot.key);
+            match pivot.child {
+                Some(child) => save32(&mut save.bytes, child)?,
+                None => save.bytes.extend_from_slice(&ABSENT.to_le_bytes()),
+            }
+            save32(&mut save.bytes, pivot.bundle.branches().len())?;
+            for branch in pivot.bundle.branches() {
+                branch.encode(&mut save.bytes)?;
+            }
+            let extents = save
+                .views
+                .binary_search_by_key(&(save.node, i), |v| (v.node, v.pivot))
+                .ok()
+                .and_then(|n| save.views.get(n))
+                .map_or(pivot.bundle.stored.as_deref().unwrap_or(&[]), |v| {
+                    v.extents.as_slice()
+                });
+            save_reserve(&mut save.named, extents.len())?;
+            save.named.extend_from_slice(extents);
+            save32(&mut save.bytes, extents.len())?;
+            for extent in extents {
+                save.bytes.extend_from_slice(&extent.to_le_bytes());
+            }
+        }
+        Ok(())
+    }
+
+    fn reset_save(&mut self) {
+        self.saving.phase = SavePhase::Idle;
+        self.saving.bytes.clear();
+        self.saving.header.clear();
+        self.saving.fresh.clear();
+        self.saving.views.clear();
+        self.saving.named.clear();
+        self.saving.head = None;
+        self.saving.error = None;
+    }
+
+    fn discard_save<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
+        if let Some(run) = self.saving.run.take() {
+            store.give_run(run);
+        }
+        let mut first = None;
+        for extent in self.saving.fresh.drain(..).chain(
+            self.saving
+                .views
+                .iter_mut()
+                .flat_map(|v| v.extents.drain(..)),
+        ) {
+            if let Err(error) = store.release(extent) {
+                first.get_or_insert(error);
+            }
+        }
+        self.reset_save();
+        first.map_or(Ok(()), Err)
+    }
+
+    /// Cancels an unfinished image only after its physical owner writes retired. No active
+    /// memtable is flushed, and neither old image nor old view metadata is published/released.
+    pub(crate) fn abort_save<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
+        if !self.saving() {
+            return Ok(());
+        }
+        let mut first = self.saving.error.clone();
+        match store.drain_paced() {
+            Ok(false) => {
+                return Err(Error::InvalidArgument {
+                    what: "a paced save aborted before owner write retirement",
+                });
+            }
+            Err(error) => {
+                first.get_or_insert(error);
+            }
+            Ok(true) => {}
+        }
+        if let Err(error) = self.discard_save(store) {
+            first.get_or_insert(error);
+        }
+        first.map_or(Ok(()), Err)
     }
 
     /// The trunk a checkpoint's image at `head` holds, its branches' filters read back.
@@ -2382,6 +3252,7 @@ impl Trunk {
                 leaf_entries,
             },
             saved,
+            saving: Saving::default(),
             stats: TrunkStats::default(),
             pending: Vec::new(),
             cascade: Vec::new(),
@@ -2534,8 +3405,19 @@ impl Trunk {
             let pool = self.pool.as_mut().ok_or(no_pool())?;
             let Some(back) = pool.take(store, Owner::Trunk, wait)? else {
                 if wait && !pool.out_for(Owner::Trunk) {
-                    // A wait with nothing out: no worker would take a job, which a pool that
-                    // wants at least one never refuses.
+                    if pool.can_take(true)
+                        && jobs.iter().any(|r| matches!(r.state, State::Ready(_)))
+                    {
+                        // Taking another owner's Done can free a seat after dispatch checked
+                        // it. The next dispatch sends a ready job into that seat.
+                        continue;
+                    }
+                    if pool.out_for(Owner::Pack) {
+                        // Its input may still need feeding: return to the owning shard rather
+                        // than wait here for a result that depends on that same shard.
+                        pool.want_message();
+                        return Ok(false);
+                    }
                     return Err(Error::InvalidArgument {
                         what: "a maintenance job no worker would take",
                     });
@@ -2559,7 +3441,6 @@ impl Trunk {
                         r.grant.extend_from_slice(&back.topped);
                         r.state = State::Dropped;
                     }
-                    self.abandon(store, jobs)?;
                     return Err(match result {
                         Err(error) => error,
                         Ok(_) => Error::InvalidArgument {
@@ -2627,15 +3508,29 @@ impl Trunk {
                 generation: store.generation(),
             });
             let pool = self.pool.as_mut().ok_or(no_pool())?;
-            match pool.send(job, Owner::Trunk, wait)? {
-                Ok(worker) => r.state = State::Out(worker),
-                Err(job) => {
-                    store.grant_back(&job.grant)?;
-                    r.grant.clear();
+            let sent = match pool.send(job, Owner::Trunk, wait) {
+                Ok(sent) => sent,
+                Err((error, job)) => {
                     let Work::Compact(task) = job.work else {
                         return Err(corrupt());
                     };
                     r.state = State::Ready(Box::new(task));
+                    // Restoration precedes cleanup: a refused grant return keeps both
+                    // the task and its owned extent list available to terminal handling.
+                    store.grant_back(&job.grant)?;
+                    r.grant.clear();
+                    return Err(error);
+                }
+            };
+            match sent {
+                Ok(worker) => r.state = State::Out(worker),
+                Err(job) => {
+                    let Work::Compact(task) = job.work else {
+                        return Err(corrupt());
+                    };
+                    r.state = State::Ready(Box::new(task));
+                    store.grant_back(&job.grant)?;
+                    r.grant.clear();
                     return Ok(());
                 }
             }
@@ -2650,11 +3545,11 @@ impl Trunk {
         &mut self,
         store: &mut Store<F>,
         jobs: &mut [Remote],
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
         let pool = self.pool.as_mut().ok_or(no_pool())?;
         while jobs.iter().any(|r| matches!(r.state, State::Out(_))) {
-            let Some(back) = pool.take(store, Owner::Trunk, true)? else {
-                break;
+            let Some(back) = pool.take(store, Owner::Trunk, self.wait != Wait::No)? else {
+                return Ok(false);
             };
             for r in jobs.iter_mut() {
                 if matches!(r.state, State::Out(w) if w == back.worker) {
@@ -2668,7 +3563,7 @@ impl Trunk {
                 store.release(e)?;
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Every job of a node's frame is back: each output's unused extents go back to the store
@@ -3094,6 +3989,9 @@ impl<'a> Reader<'a> {
         Ok(s)
     }
 }
+
+#[cfg(test)]
+mod optional_jobs_native;
 
 #[cfg(test)]
 mod view_cost_tests {

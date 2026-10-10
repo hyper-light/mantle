@@ -14,6 +14,10 @@
     clippy::disallowed_macros
 )]
 
+#[path = "support/into_file.rs"]
+mod file_outcome;
+use file_outcome::finished_file;
+
 use hyper_block::block::BlockFile;
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
@@ -177,7 +181,7 @@ fn run(issuer: bool, idle: bool) {
     }
     check_scan(&mut db, &oracle, 64);
     db.check_references().unwrap();
-    let (file, landed) = db.into_file();
+    let (file, landed) = finished_file(db.into_file());
     landed.unwrap();
     drop(file);
     let (mut db, applied) = ShardDb::open(open(&path, false), STORE, MEM, TRUNK).unwrap();

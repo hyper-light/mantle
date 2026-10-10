@@ -12,6 +12,10 @@
     clippy::cast_possible_truncation
 )]
 
+#[path = "support/into_file.rs"]
+mod file_outcome;
+use file_outcome::finished_file;
+
 use std::collections::BTreeMap;
 
 use hyper_block::buf::Alignment;
@@ -303,7 +307,7 @@ fn a_cursor_refuses_a_page_flipped_on_the_medium() {
     let page = u64::from(b.leaf_of(&250u32.to_be_bytes()).unwrap());
     let address = b.page_address(&s, page).unwrap();
     s.checkpoint(None, 1).unwrap();
-    let (file, finished) = s.into_file();
+    let (file, finished) = finished_file(s.into_file());
     finished.unwrap();
     file.inject(Fault::BitFlip {
         offset: address * CONFIG.page_size as u64 + 100,

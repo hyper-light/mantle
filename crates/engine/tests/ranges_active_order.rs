@@ -8,6 +8,10 @@
     clippy::disallowed_macros
 )]
 
+#[path = "support/into_file.rs"]
+mod file_outcome;
+use file_outcome::finished_file;
+
 use std::collections::BTreeMap;
 
 use hyper_block::buf::Alignment;
@@ -91,16 +95,30 @@ fn run(mem: usize, depth: usize) {
     let path = dir.path().join("active.store");
     let align = Alignment::new(4096).unwrap();
     let file = DeviceFile::open(&path, true, CachingRequest::Buffered, align).unwrap();
-    let issuer = (depth > 0).then(|| Issuer::start_for(&path, depth, depth).unwrap());
+    let issuer = Issuer::start_for(
+        &path,
+        depth,
+        mantle_engine::shard_db::issuer_batches(depth, depth),
+    )
+    .unwrap();
     let mut db = ShardDb::create(file, STORE, mem, TRUNK).unwrap();
     db.set_cache(usize::try_from(STORE.extent_pages).unwrap());
-    if let Some(issuer) = &issuer {
-        db.attach(issuer, depth).unwrap();
-        db.set_write_budget(depth * usize::try_from(STORE.extent_pages).unwrap() * STORE.page_size);
-    }
-    let runtime = runtime();
+    db.attach(&issuer, depth).unwrap();
+    db.set_write_budget(depth * usize::try_from(STORE.extent_pages).unwrap() * STORE.page_size)
+        .unwrap();
+    let worker_path = path.clone();
+    db.set_workers(move || {
+        DeviceFile::open(&worker_path, false, CachingRequest::Buffered, align).map_err(|error| {
+            Error::Io {
+                op: "open an active-order worker",
+                detail: error.to_string(),
+            }
+        })
+    })
+    .unwrap();
+    let mut runtime = runtime();
     let ranges = Ranges::start(
-        &runtime,
+        &mut runtime,
         vec![(Vec::new(), db)],
         RangesConfig {
             clients: 1,
@@ -206,7 +224,7 @@ fn run(mem: usize, depth: usize) {
     });
     db.checkpoint(OPS + 3).unwrap();
     db.check_references().unwrap();
-    let (file, landed) = db.into_file();
+    let (file, landed) = finished_file(db.into_file());
     landed.unwrap();
     drop(file);
     let file = DeviceFile::open(&path, false, CachingRequest::Buffered, align).unwrap();
@@ -220,7 +238,7 @@ fn run(mem: usize, depth: usize) {
 
 #[test]
 fn unflushed_active_table_idle_and_scans_keep_newest_versions() {
-    run(1 << 20, 0);
+    run(1 << 20, 1);
 }
 
 #[test]

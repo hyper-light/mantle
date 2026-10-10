@@ -79,7 +79,7 @@ fn run<'a>(
     count
 }
 
-fn main() {
+fn main() -> Result<(), mantle_engine::Error> {
     let args: Vec<_> = std::env::args()
         .skip(1)
         .filter(|arg| arg != "--bench")
@@ -170,8 +170,12 @@ fn main() {
             after_io.span_cache_hits - before_io.span_cache_hits
         );
     }
-    let (file, landed) = store.into_file();
+    let (file, landed) = match store.into_file() {
+        mantle_engine::store::IntoFile::Finished { file, result } => (file, result),
+        mantle_engine::store::IntoFile::Refused { error, .. } => return Err(error),
+    };
     landed.unwrap();
     drop(file);
     // Retain the immutable image so the runner can compare dataset hashes after the timings.
+    Ok(())
 }

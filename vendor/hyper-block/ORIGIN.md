@@ -93,6 +93,40 @@ caller hands in the alignment, queue and measured depth it found.
    an attach after the issuer stopped is refused, and the duplicates it made are dropped with the
    refusal.
 
+10. **Reusable asynchronous device completion and terminal retirement** (`issuer.rs`,
+    local development repair): each actual attachment owns a submission lane and reusable
+    numbered answer channel bounded by its declared batches. Output credit includes queued,
+    in-flight and unanswered batches; in-credit submission does not block on a shared data
+    inbox. Retirement follows out0 on the same empty lane. A capacity-one dirty doorbell
+    coalesces submissions/retirements, and publication wakes the existing dispatcher thread.
+    There is no workers+batches cap on cold attachments. A canceled borrowed completion or
+    retirement wait keeps its number and owner; foreign context refuses before publication.
+    Completion closure follows all native worker duplicate Drops/joins even during concurrent
+    issuer Stop. Pre-Stop accepted batches are answered with numbered refusal; owning Drop
+    retains its blocking plain-thread contract.
+    Current development issuer source SHA256: 981096ba8935533bb82c01ec362cedd7ad035b0061908564f80c406f5d333f32.
+    The standalone warm allocation oracle and its hyper-measure dev-dependency are retained.
+    This local delta has no accepted shared producer commit; producer/all-consumer gates and
+    exact-source native CI remain required before re-vendoring an accepted upstream snapshot.
+
+11. **Terminal ownership and typed lifecycle failures** (`issuer.rs`, development):
+    each completion channel holds its declared B numbered results plus one physical
+    terminal role; batch/data admission remains B. The slot/ticket and array layouts
+    are checked before channel construction or file duplication, and cold batch storage
+    is fallibly reserved. Retirement publication reserves its worker news and receipt
+    storage before transferring Client ownership. Any entered-shard owning Drop closes
+    its sole lane and notifies without a success acknowledgement; the broker retains
+    accepted batches and completion senders through actual duplicate retirement and
+    abnormal native joins. Guarded duplicate Drop and worker/broker lifecycle failures
+    become terminal errors, never successful Detached. `is_retired` follows actual
+    Detached or post-join completion closure, including error; context/admission and
+    numbered I/O errors are not terminal facts. `retire_async` checks the actual task
+    waker before each receive poll; canceled borrowed waits retain the same receipt.
+    Cold `retire_blocking` shares that terminal state and returns lifecycle failures,
+    while refusing any entered shard before mutation. Raw Drop remains unacknowledged
+    cleanup. Exact issuer source SHA256: `981096ba8935533bb82c01ec362cedd7ad035b0061908564f80c406f5d333f32`. This is an uncommitted development
+    identity, not an accepted producer revision or measured throughput claim.
+
 ## Planned
 
 - The log's frame writes and flushes through the device's issuer, and the issuer's own reads (mantle

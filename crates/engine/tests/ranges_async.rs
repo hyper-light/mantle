@@ -11,15 +11,16 @@
 
 use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use hyper_block::DiskError;
 use hyper_block::block::BlockFile;
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
-use hyper_rt::{Runtime, RuntimeConfig, TaskId};
+use hyper_block::issuer::Issuer;
+use hyper_rt::{Runtime, RuntimeConfig};
 use mantle_engine::Error;
 use mantle_engine::ranges::{Client, Ranges, RangesConfig};
 use mantle_engine::rows::Rows;
@@ -67,7 +68,7 @@ fn ranges_config() -> RangesConfig {
     }
 }
 
-fn native(path: &std::path::Path) -> ShardDb<DeviceFile> {
+fn native(path: &std::path::Path, issuer: &Issuer) -> ShardDb<DeviceFile> {
     let file = DeviceFile::open(
         path,
         true,
@@ -75,7 +76,35 @@ fn native(path: &std::path::Path) -> ShardDb<DeviceFile> {
         Alignment::new(STORE.page_size).unwrap(),
     )
     .unwrap();
-    ShardDb::create(file, STORE, STORE.page_size, TRUNK).unwrap()
+    let mut db = ShardDb::create(file, STORE, STORE.page_size, TRUNK).unwrap();
+    db.attach(issuer, 1).unwrap();
+    let path = path.to_path_buf();
+    db.set_workers(move || {
+        DeviceFile::open(
+            &path,
+            false,
+            CachingRequest::Buffered,
+            Alignment::new(STORE.page_size).map_err(|error| Error::Io {
+                op: "align a native range worker",
+                detail: error.to_string(),
+            })?,
+        )
+        .map_err(|error| Error::Io {
+            op: "open a native range worker",
+            detail: error.to_string(),
+        })
+    })
+    .unwrap();
+    db
+}
+
+fn issuer(path: &std::path::Path, ranges: usize) -> Issuer {
+    Issuer::start_for(
+        path,
+        1,
+        mantle_engine::shard_db::issuer_batches(1, 1) * ranges,
+    )
+    .unwrap()
 }
 
 async fn canceled(future: impl Future<Output = Result<(), Error>>) {
@@ -130,13 +159,14 @@ async fn scan(
 fn same_shard_async_clients_preserve_versions_pages_and_durable_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let paths = [dir.path().join("first"), dir.path().join("second")];
-    let runtime = runtime(paths.len() + 1);
+    let issuer = issuer(dir.path(), paths.len());
+    let mut runtime = runtime(paths.len() + 1);
     let shard = runtime.shard_ids()[0];
     let ranges = Ranges::start(
-        &runtime,
+        &mut runtime,
         vec![
-            (Vec::new(), native(&paths[0])),
-            (b"m".to_vec(), native(&paths[1])),
+            (Vec::new(), native(&paths[0], &issuer)),
+            (b"m".to_vec(), native(&paths[1], &issuer)),
         ],
         ranges_config(),
     )
@@ -227,9 +257,14 @@ fn same_shard_async_clients_preserve_versions_pages_and_durable_reopen() {
 fn canceled_mutation_returns_its_error_before_new_work_and_retains_orphan_admission() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("store");
-    let runtime = runtime(2);
-    let ranges =
-        Ranges::start(&runtime, vec![(Vec::new(), native(&path))], ranges_config()).unwrap();
+    let issuer = issuer(dir.path(), 1);
+    let mut runtime = runtime(2);
+    let ranges = Ranges::start(
+        &mut runtime,
+        vec![(Vec::new(), native(&path, &issuer))],
+        ranges_config(),
+    )
+    .unwrap();
     let (done, result) = std::sync::mpsc::sync_channel(1);
     runtime
         .spawn_on(runtime.shard_ids()[0], async move {
@@ -291,7 +326,6 @@ fn canceled_mutation_returns_its_error_before_new_work_and_retains_orphan_admiss
 struct SyncFacts {
     calls: AtomicUsize,
     reject: AtomicBool,
-    owner: Mutex<Option<TaskId>>,
 }
 
 struct File {
@@ -322,9 +356,6 @@ impl BlockFile for File {
     }
     fn sync_data(&self) -> Result<(), DiskError> {
         self.facts.calls.fetch_add(1, Ordering::SeqCst);
-        if let Some(task) = hyper_rt::futures::current_task() {
-            *self.facts.owner.lock().unwrap() = Some(task);
-        }
         if self.facts.reject.load(Ordering::SeqCst) {
             return Err(DiskError::Io {
                 op: "test durability refusal",
@@ -356,9 +387,33 @@ fn tracked(path: &std::path::Path, facts: Arc<SyncFacts>) -> ShardDb<File> {
     ShardDb::create(file, STORE, STORE.page_size, TRUNK).unwrap()
 }
 
+fn tracked_backend(
+    db: &mut ShardDb<File>,
+    issuer: &Issuer,
+    path: &std::path::Path,
+    facts: Arc<SyncFacts>,
+) {
+    db.attach(issuer, 1).unwrap();
+    let path = path.to_path_buf();
+    db.set_workers(move || {
+        Ok(File {
+            file: DeviceFile::open(
+                &path,
+                false,
+                CachingRequest::Buffered,
+                Alignment::new(STORE.page_size).unwrap(),
+            )
+            .unwrap(),
+            facts: Arc::clone(&facts),
+        })
+    })
+    .unwrap();
+}
+
 async fn foreign_repoll(
     future: impl Future<Output = Result<(), Error>>,
     ready: bool,
+    observer: Option<&mut Client<'_>>,
     facts: &SyncFacts,
 ) {
     let before = facts.calls.load(Ordering::SeqCst);
@@ -369,9 +424,14 @@ async fn foreign_repoll(
     })
     .await;
     if ready {
-        // The colocated Range executes its synchronous checkpoint and sends the reply
-        // before returning to this task; observed durability I/O establishes that fact.
-        hyper_rt::futures::yield_now().await;
+        // This ordered barrier cannot reply before the first checkpoint's reply is queued.
+        // Device sync observations alone precede owner completion routing and are insufficient.
+        let observed = observer.unwrap().flush_async().await;
+        if facts.reject.load(Ordering::SeqCst) {
+            assert!(matches!(observed, Err(Error::Io { .. })));
+        } else {
+            observed.unwrap();
+        }
         assert!(facts.calls.load(Ordering::SeqCst) > before);
     }
     let mut foreign = Context::from_waker(Waker::noop());
@@ -386,21 +446,30 @@ fn checkpoint_repoll(ready: bool) {
     let paths = [dir.path().join("first"), dir.path().join("second")];
     let facts = Arc::new(SyncFacts::default());
     let mut first = tracked(&paths[0], Arc::clone(&facts));
-    let mut second = tracked(&paths[1], Arc::default());
+    let second_facts = Arc::new(SyncFacts::default());
+    let mut second = tracked(&paths[1], Arc::clone(&second_facts));
     first.put(b"a", b"first").unwrap();
     second.put(b"z", b"second").unwrap();
-    let runtime = runtime(paths.len() + 1);
+    let issuer = issuer(dir.path(), paths.len());
+    tracked_backend(&mut first, &issuer, &paths[0], Arc::clone(&facts));
+    tracked_backend(&mut second, &issuer, &paths[1], second_facts);
+    let mut runtime = runtime(paths.len() + 1);
     let ranges = Ranges::start(
-        &runtime,
+        &mut runtime,
         vec![(Vec::new(), first), (b"m".to_vec(), second)],
-        ranges_config(),
+        RangesConfig {
+            clients: if ready { 2 } else { 1 },
+            ..ranges_config()
+        },
     )
     .unwrap();
     let (done, result) = std::sync::mpsc::sync_channel(1);
     runtime
         .spawn_on(runtime.shard_ids()[0], async move {
             let mut client = ranges.client().unwrap();
-            foreign_repoll(client.checkpoint_async(7), ready, &facts).await;
+            let mut observer = ready.then(|| ranges.client().unwrap());
+            foreign_repoll(client.checkpoint_async(7), ready, observer.as_mut(), &facts).await;
+            drop(observer);
             let mut value = Vec::new();
             // Reclaims the first answer and finishes the second checkpoint before this get.
             assert!(client.get_async(b"z", &mut value).await.unwrap());
@@ -460,14 +529,32 @@ fn a_foreign_ready_poll_cannot_consume_an_error_or_publish_replacement_work() {
     db.put(b"known", b"durable").unwrap();
     db.checkpoint(1).unwrap();
     db.put(b"uncheckpointed", b"tail").unwrap();
-    let runtime = runtime(2);
-    let ranges = Ranges::start(&runtime, vec![(Vec::new(), db)], ranges_config()).unwrap();
+    let issuer = issuer(dir.path(), 1);
+    tracked_backend(&mut db, &issuer, &path, Arc::clone(&facts));
+    let mut runtime = runtime(2);
+    let ranges = Ranges::start(
+        &mut runtime,
+        vec![(Vec::new(), db)],
+        RangesConfig {
+            clients: 2,
+            ..ranges_config()
+        },
+    )
+    .unwrap();
     let (done, result) = std::sync::mpsc::sync_channel(1);
     runtime
         .spawn_on(runtime.shard_ids()[0], async move {
             let mut client = ranges.client().unwrap();
             facts.reject.store(true, Ordering::SeqCst);
-            foreign_repoll(client.checkpoint_async(2), true, &facts).await;
+            let mut observer = ranges.client().unwrap();
+            foreign_repoll(
+                client.checkpoint_async(2),
+                true,
+                Some(&mut observer),
+                &facts,
+            )
+            .await;
+            drop(observer);
             let mut value = b"untouched".to_vec();
             assert!(matches!(
                 client.get_async(b"known", &mut value).await,
@@ -508,17 +595,20 @@ fn a_foreign_ready_poll_cannot_consume_an_error_or_publish_replacement_work() {
 fn terminal_clients_keep_admission_until_their_owner_and_request_retire() {
     let dir = tempfile::tempdir().unwrap();
     let facts = Arc::new(SyncFacts::default());
-    let db = tracked(&dir.path().join("store"), Arc::clone(&facts));
-    let runtime = runtime(2);
-    let ranges = Ranges::start(&runtime, vec![(Vec::new(), db)], ranges_config()).unwrap();
+    let path = dir.path().join("store");
+    let mut db = tracked(&path, Arc::clone(&facts));
+    let issuer = issuer(dir.path(), 1);
+    tracked_backend(&mut db, &issuer, &path, Arc::clone(&facts));
+    let mut runtime = runtime(2);
+    let ranges = Ranges::start(&mut runtime, vec![(Vec::new(), db)], ranges_config()).unwrap();
     let (done, result) = std::sync::mpsc::sync_channel(1);
     runtime
         .spawn_on(runtime.shard_ids()[0], async move {
             let mut client = ranges.client().unwrap();
             client.put_async(b"known", b"value").await.unwrap();
             client.checkpoint_async(1).await.unwrap();
-            // BlockFile observes its actual owner TaskId through the supported public task API.
-            let owner = facts.owner.lock().unwrap().unwrap();
+            // Cancel the actual admitted actor through its public generational identity.
+            let owner = ranges.task_ids().first().copied().unwrap();
             canceled(client.put_async(b"unanswered", b"v")).await;
             hyper_rt::futures::cancel(owner).unwrap();
             hyper_rt::futures::yield_now().await;
@@ -549,10 +639,11 @@ fn terminal_clients_keep_admission_until_their_owner_and_request_retire() {
 #[test]
 fn an_off_runtime_async_call_is_refused_before_publication_and_reuses_its_buffers() {
     let dir = tempfile::tempdir().unwrap();
-    let runtime = runtime(1);
+    let issuer = issuer(dir.path(), 1);
+    let mut runtime = runtime(1);
     let ranges = Ranges::start(
-        &runtime,
-        vec![(Vec::new(), native(&dir.path().join("store")))],
+        &mut runtime,
+        vec![(Vec::new(), native(&dir.path().join("store"), &issuer))],
         ranges_config(),
     )
     .unwrap();

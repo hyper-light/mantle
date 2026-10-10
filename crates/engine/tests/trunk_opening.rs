@@ -10,6 +10,10 @@
     clippy::cast_possible_truncation
 )]
 
+#[path = "support/into_file.rs"]
+mod file_outcome;
+use file_outcome::finished_file;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -282,7 +286,7 @@ fn checkpoint_and_reopen(mut store: Store<Gated>, mut trunk: Trunk, oracle: &Ent
     let root = trunk.save(&mut store).unwrap();
     let applied = oracle.len() as u64;
     store.checkpoint(Some(root), applied).unwrap();
-    let (file, drained) = store.into_file();
+    let (file, drained) = finished_file(store.into_file());
     drained.unwrap();
     let (mut store, recovered) = Store::open(file, CONFIG).unwrap();
     assert_eq!(recovered.applied, applied);

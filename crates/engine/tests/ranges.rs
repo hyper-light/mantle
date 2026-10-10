@@ -22,7 +22,8 @@ use hyper_block::block::BlockFile;
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::issuer::Issuer;
-use hyper_block::sim::SimFile;
+#[path = "support/shared_sim.rs"]
+mod shared_sim;
 use hyper_rt::{Runtime, RuntimeConfig};
 use mantle_engine::Error;
 use mantle_engine::ranges::{Client, Ranges, RangesConfig};
@@ -30,6 +31,7 @@ use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::Config;
 use mantle_engine::trunk::TrunkConfig;
+use shared_sim::SharedSim;
 
 const STORE: Config = Config {
     page_size: 4096,
@@ -77,15 +79,18 @@ fn key(k: u64, t: u64) -> Vec<u8> {
     format!("k{k:05}-t{t}").into_bytes()
 }
 
-fn engines(starts: &[&str]) -> Vec<(Vec<u8>, ShardDb<SimFile>)> {
+fn engines(starts: &[&str], issuer: &Issuer) -> Vec<(Vec<u8>, ShardDb<SharedSim>)> {
     starts
         .iter()
         .enumerate()
         .map(|(i, s)| {
             let align = Alignment::new(4096).unwrap();
-            let file = SimFile::new(align, Alignment::new(512).unwrap(), 17 + i as u64).unwrap();
+            let file = SharedSim::new(align, Alignment::new(512).unwrap(), 17 + i as u64).unwrap();
+            let worker = file.clone();
             let mut db = ShardDb::create(file, STORE, MEM, TRUNK).unwrap();
             db.set_cache(16);
+            db.attach(issuer, 1).unwrap();
+            db.set_workers(move || Ok(worker.clone())).unwrap();
             (s.as_bytes().to_vec(), db)
         })
         .collect()
@@ -174,11 +179,18 @@ fn worker(ranges: &Ranges, t: u64) -> BTreeMap<u64, Option<Vec<u8>>> {
 
 #[test]
 fn clients_on_many_threads_read_their_own_writes_across_ranges_and_shards() {
-    let runtime = Runtime::start(&config(2)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let issuer = Issuer::start_for(
+        dir.path(),
+        1,
+        mantle_engine::shard_db::issuer_batches(1, 1) * 4,
+    )
+    .unwrap();
+    let mut runtime = Runtime::start(&config(2)).unwrap();
     let starts = ["", "k00500", "k01000", "k01500"];
     let ranges = Ranges::start(
-        &runtime,
-        engines(&starts),
+        &mut runtime,
+        engines(&starts, &issuer),
         ranges_config(THREADS as usize + 1),
     )
     .unwrap();
@@ -219,8 +231,15 @@ fn clients_on_many_threads_read_their_own_writes_across_ranges_and_shards() {
 
 #[test]
 fn clients_past_the_bound_are_refused_and_admitted_once_one_goes() {
-    let runtime = Runtime::start(&config(1)).unwrap();
-    let ranges = Ranges::start(&runtime, engines(&[""]), ranges_config(2)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let issuer = Issuer::start_for(
+        dir.path(),
+        1,
+        mantle_engine::shard_db::issuer_batches(1, 1) * 2,
+    )
+    .unwrap();
+    let mut runtime = Runtime::start(&config(1)).unwrap();
+    let ranges = Ranges::start(&mut runtime, engines(&[""], &issuer), ranges_config(2)).unwrap();
     let a = ranges.client().unwrap();
     let mut b = ranges.client().unwrap();
     assert!(matches!(
@@ -240,8 +259,16 @@ fn clients_past_the_bound_are_refused_and_admitted_once_one_goes() {
 
 #[test]
 fn a_range_whose_shard_is_gone_is_reported_gone() {
-    let runtime = Runtime::start(&config(1)).unwrap();
-    let ranges = Ranges::start(&runtime, engines(&["", "m"]), ranges_config(1)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let issuer = Issuer::start_for(
+        dir.path(),
+        1,
+        mantle_engine::shard_db::issuer_batches(1, 1) * 2,
+    )
+    .unwrap();
+    let mut runtime = Runtime::start(&config(1)).unwrap();
+    let ranges =
+        Ranges::start(&mut runtime, engines(&["", "m"], &issuer), ranges_config(1)).unwrap();
     let mut client = ranges.client().unwrap();
     client.put(b"a", b"1").unwrap();
     runtime.shutdown().unwrap();
@@ -255,11 +282,20 @@ fn a_range_whose_shard_is_gone_is_reported_gone() {
 
 #[test]
 fn ranges_must_ascend_from_the_empty_key() {
-    let runtime = Runtime::start(&config(1)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let issuer = Issuer::start_for(
+        dir.path(),
+        1,
+        mantle_engine::shard_db::issuer_batches(1, 1) * 2,
+    )
+    .unwrap();
+    let mut runtime = Runtime::start(&config(1)).unwrap();
     for starts in [&["a"][..], &["", "m", "c"], &["", "m", "m"]] {
         assert!(matches!(
-            Ranges::start(&runtime, engines(starts), ranges_config(1)),
-            Err(Error::InvalidArgument { .. })
+            Ranges::start(&mut runtime, engines(starts, &issuer), ranges_config(1)),
+            Err(mantle_engine::ranges::StartError::Failed(
+                Error::InvalidArgument { .. }
+            ))
         ));
     }
     runtime.shutdown().unwrap();
@@ -384,14 +420,58 @@ fn a_held_maintenance_read_leaves_the_shard_available_for_range_requests() {
         first.put(&key, &value).unwrap();
         oracle.insert(key, value);
     }
-    first.land().unwrap();
-    assert!(first.owed());
+    first.flush().unwrap();
+    while first.owed() {
+        assert!(first.maintain(u64::MAX).unwrap() > 0);
+    }
+    first.checkpoint(1).unwrap();
     first.set_cache(0);
-    first.set_write_budget(STORE.page_size * STORE.extent_pages as usize);
-    let issuer = Issuer::start_for(dir.path(), 1, 1).unwrap();
+    first
+        .set_write_budget(STORE.page_size * STORE.extent_pages as usize)
+        .unwrap();
+    let issuer = Issuer::start_for(
+        dir.path(),
+        1,
+        mantle_engine::shard_db::issuer_batches(1, 1)
+            .checked_mul(2)
+            .unwrap(),
+    )
+    .unwrap();
     first.attach(&issuer, 1).unwrap();
-    let second = native_db(&dir.path().join("second"), Arc::default());
-    let runtime = Runtime::start(&config(1)).unwrap();
+    let first_worker_path = first_path.clone();
+    let first_worker_gate = Arc::clone(&gate);
+    first
+        .set_workers(move || {
+            Ok(Gated {
+                file: DeviceFile::open(
+                    &first_worker_path,
+                    false,
+                    CachingRequest::Buffered,
+                    Alignment::new(STORE.page_size).unwrap(),
+                )
+                .unwrap(),
+                gate: Arc::clone(&first_worker_gate),
+            })
+        })
+        .unwrap();
+    let second_path = dir.path().join("second");
+    let mut second = native_db(&second_path, Arc::default());
+    second.attach(&issuer, 1).unwrap();
+    second
+        .set_workers(move || {
+            Ok(Gated {
+                file: DeviceFile::open(
+                    &second_path,
+                    false,
+                    CachingRequest::Buffered,
+                    Alignment::new(STORE.page_size).unwrap(),
+                )
+                .unwrap(),
+                gate: Arc::default(),
+            })
+        })
+        .unwrap();
+    let mut runtime = Runtime::start(&config(1)).unwrap();
     let (thread, on_shard) = std::sync::mpsc::sync_channel(1);
     runtime
         .spawn_on(runtime.shard_ids()[0], async move {
@@ -406,17 +486,29 @@ fn a_held_maintenance_read_leaves_the_shard_available_for_range_requests() {
     *gate.events.lock().unwrap() = Some(report);
     gate.held.store(true, Ordering::SeqCst);
     let ranges = Ranges::start(
-        &runtime,
+        &mut runtime,
         vec![(Vec::new(), first), (b"m".to_vec(), second)],
-        ranges_config(2),
+        ranges_config(3),
     )
     .unwrap();
     std::thread::scope(|scope| {
-        // The terminal witness: a second client waits until the ranges owe nothing (or fault),
-        // sending nothing meanwhile. It answers only once the held read is released, so arriving
-        // before the read is admitted means maintenance ended without the cold read the test needs.
+        let _release = OpenOnDrop(Arc::clone(&gate));
+        // Fresh prepared workers create this maintenance demand after placement. The
+        // watcher begins only after the finite writer ends, so idle admission cannot be
+        // falsely rejected because the initial cold image already owed nothing.
+        let (written, writer_done) = std::sync::mpsc::sync_channel(1);
+        let mut writer = ranges.client().unwrap();
+        let want = oracle.clone();
+        let writes = scope.spawn(move || {
+            for (key, value) in &want {
+                writer.put(key, value).unwrap();
+            }
+            drop(writer);
+            written.send(()).unwrap();
+        });
         let mut watcher = ranges.client().unwrap();
         let witness = scope.spawn(move || {
+            writer_done.recv().unwrap();
             let done = watcher.settled().is_ok();
             drop(settled.try_send(ReadEvent::Settled(done)));
             done
@@ -436,6 +528,7 @@ fn a_held_maintenance_read_leaves_the_shard_available_for_range_requests() {
         assert!(client.get(b"z-unrelated", &mut out).unwrap());
         assert_eq!(out, b"progress while read is held");
         gate.held.store(false, Ordering::SeqCst);
+        writes.join().unwrap();
         client.flush().unwrap();
         client.checkpoint(1).unwrap();
         for (key, expected) in &oracle {

@@ -12,6 +12,10 @@
     clippy::cast_possible_truncation
 )]
 
+#[path = "support/into_file.rs"]
+mod file_outcome;
+use file_outcome::finished_file;
+
 use hyper_block::buf::Alignment;
 use hyper_block::sim::{Fault, SimFile};
 use mantle_engine::error::Error;
@@ -148,7 +152,7 @@ fn a_span_stops_at_the_files_end() {
 #[test]
 fn a_page_flipped_on_the_medium_fails_alone_through_a_span() {
     let (store, addresses) = written();
-    let file = store.into_file().0;
+    let file = finished_file(store.into_file()).0;
     let offset = addresses[1] * CONFIG.page_size as u64 + 100;
     file.inject(Fault::BitFlip {
         offset,

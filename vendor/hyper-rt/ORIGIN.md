@@ -21,3 +21,27 @@ slates' runtime, taken at slates `6b9ce5c` (2026-10-05) and designed onward for 
 against this suite.
 
 | `src/udp/linux.rs`, `src/udp/macos.rs`, `src/udp/batched.rs` | hyper-tokio `src/sys/{linux,macos}.rs`, `src/socket.rs`, `src/clock.rs` | The batched calls and kernel stamps, moved so hyper-tokio and hyper-rt share one layer (docs/runtime.md §5.1, §14). `Batched` awaits hyper-rt's readiness instead of tokio's reactor, so a receive always asks the kernel (no `Through::Reactor`). Stamps land on the shard's clock by their age; macOS reads the age on `mach_absolute_time` (`Clock::now_ticks`). Astray reports are a seam outcome; EIO from a segmented send resends unsegmented instead of dropping. |
+
+## Current development overlay
+
+The consumer currently imports the local `hyper-rt-service-root` candidate; its exact
+Rust source/test censuses are recorded in `vendor/UPSTREAM.md`, not an accepted producer
+commit. The overlay adds cooperative service admission and cancellation ownership,
+nonblocking manual-step/readiness progression, typed driver-loss cleanup, context checks
+before each synchronization receive poll, checked channel slot/ticket layouts before
+construction, and cold Runtime-owned bounded native retirement groups. TCP serving
+metadata is owned from the first shard claim, and accept futures retain guards across
+refused admission and cancellation; partial setup and dropped acceptors release their
+metadata before a same-capacity healthy server retry. Native handles are adopted before
+engines enter a shard; an actor
+awaits the actual join receipt, including native TLS destruction, without joining inline.
+Runtime shutdown retains those retirement owners until all service shard workers finish.
+Original files transfer to the same native reaper before service admission. Their separate
+lease answers only after worker joins, the registered physical attachment fence, and final
+file close. Cancellation retains this ownership and a known physical error precedes later
+join/destructor failures. Actors retain receipts rather than native file owners.
+The cold synchronous APIs remain distinct; their entered-shard calls are refused before
+blocking admission. These source identities do not establish a performance or universal
+foreign-destructor guarantee. The pending generic canceled-grant handoff proposal is not
+part of this imported tree. Producer and consumer gates and all six native targets still
+require exact final-tree acceptance.

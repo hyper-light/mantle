@@ -96,7 +96,9 @@ fn a_workers_compaction_writes_what_the_shards_would_within_its_grant() {
     let count: usize = inputs.iter().map(|b| b.extents.len()).sum();
     let grant = shard.grant(count).unwrap();
     let mut worker = Store::worker(open(&path, false), CONFIG).unwrap();
-    worker.begin_job(&grant, shard.end(), shard.generation());
+    worker
+        .begin_job(&grant, shard.end(), shard.generation())
+        .unwrap();
     let there = compact_split(&mut worker, &inputs, b"", None, true, per).unwrap();
     worker.drain().unwrap();
     let unused = worker.unused_grant();
@@ -152,7 +154,9 @@ fn a_job_past_its_grant_asks_for_more_and_writes_the_same() {
     let grant = vec![spare.pop().unwrap()];
     let (tx, rx) = std::sync::mpsc::channel();
     let mut worker = Store::worker(open(&path, false), CONFIG).unwrap();
-    worker.begin_job(&grant, shard.end(), shard.generation());
+    worker
+        .begin_job(&grant, shard.end(), shard.generation())
+        .unwrap();
     let mut handed = grant.clone();
     let mut pool = spare.clone();
     worker.set_refill(mantle_engine::store::Refill(Box::new(move |n| {

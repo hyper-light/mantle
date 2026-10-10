@@ -14,6 +14,10 @@
     clippy::disallowed_macros
 )]
 
+#[path = "support/into_file.rs"]
+mod file_outcome;
+use file_outcome::finished_file;
+
 use hyper_block::block::BlockFile;
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
@@ -204,7 +208,7 @@ fn runs_submitted_to_the_issuer_read_back_and_reopen_whole() {
     assert!(io.submitted > 0 && io.reads > 0, "{io:?}");
     assert!(io.prefetches > 0, "{io:?}");
     db.checkpoint(OPS).unwrap();
-    let (file, landed) = db.into_file();
+    let (file, landed) = finished_file(db.into_file());
     landed.unwrap();
     drop(file);
     let file = DeviceFile::open(&path, false, CachingRequest::Buffered, align).unwrap();
@@ -292,7 +296,7 @@ fn rewritten_keys_of_different_prefixes_read_back_after_reopen() {
         }
     }
     db.checkpoint(4).unwrap();
-    let (file, landed) = db.into_file();
+    let (file, landed) = finished_file(db.into_file());
     landed.unwrap();
     let (mut db, applied) = ShardDb::open(file, STORE, MEM, TRUNK).unwrap();
     assert_eq!(applied, 4);
@@ -321,7 +325,7 @@ fn memory_moving_between_regions_never_holds_more_than_the_budget() {
     let file = SimFile::new(align, Alignment::new(512).unwrap(), 41).unwrap();
     let mut db = ShardDb::create(file, STORE, MEM, TRUNK).unwrap();
     let budget = 96 * 4096;
-    db.set_memory(budget);
+    db.set_memory(budget).unwrap();
     let value = [5u8; 100];
     let mut out = Vec::new();
     let mut x = 0x9e37_79b9_7f4a_7c15u64;
@@ -684,7 +688,7 @@ fn views_saved_with_a_checkpoint_are_loaded_on_reopen() {
     assert!(views > 0);
     db.checkpoint(OPS).unwrap();
     db.check_references().unwrap();
-    let (file, landed) = db.into_file();
+    let (file, landed) = finished_file(db.into_file());
     landed.unwrap();
     let (mut db, applied) = ShardDb::open(file, STORE, MEM, TRUNK).unwrap();
     assert_eq!(applied, OPS);
@@ -725,7 +729,7 @@ fn the_write_budget_is_the_last_cycles_writes_within_the_owners_cap() {
     let mut db = ShardDb::create(file, STORE, MEM, TRUNK).unwrap();
     let run = STORE.page_size * STORE.extent_pages as usize;
     for cap in [1_000 * run, 3 * run] {
-        db.set_write_budget(cap);
+        db.set_write_budget(cap).unwrap();
         let mut rotations = 0;
         let mut rotated = db.stats().0.rotations;
         let mut cycle_start = db.stats().2.pages_written;

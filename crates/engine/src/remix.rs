@@ -1274,6 +1274,233 @@ impl Walk {
         Ok(())
     }
 
+    /// Opens the walk's owned buffers before any page await. A borrowed scan guard
+    /// owns this walk before positioning, so cancellation returns every placed cursor.
+    pub(crate) fn prepare(view: &View, from: &[u8], bufs: WalkBufs) -> Self {
+        let WalkBufs {
+            mut cursors,
+            mut behind,
+            mut targets,
+        } = bufs;
+        cursors.clear();
+        cursors.resize_with(view.runs, || None);
+        behind.clear();
+        behind.resize(view.runs, 0);
+        targets.clear();
+        targets.resize(view.runs, None);
+        Self {
+            segment: view.segment_of(from),
+            at: 0,
+            run: 0,
+            cursors,
+            behind,
+            targets,
+            valid: view.segments() > 0,
+        }
+    }
+
+    /// Positions a prepared walk, preserving search and occurrence counts in the
+    /// future while its borrowed owner keeps the view and runs immutable.
+    pub(crate) async fn position_async<F: BlockFile>(
+        &mut self,
+        view: &View,
+        store: &mut Store<F>,
+        runs: &[Branch],
+        from: &[u8],
+    ) -> Result<(), Error> {
+        if !self.valid {
+            return Ok(());
+        }
+        let selectors = view.selectors_of(self.segment).ok_or(corrupt())?;
+        self.at = self
+            .search_async(view, store, runs, selectors, from)
+            .await?;
+        for r in 0..view.runs {
+            let k = occurrences(selectors, self.at, r);
+            let slot = self.cursors.get_mut(r).ok_or(corrupt())?;
+            let behind = self.behind.get_mut(r).ok_or(corrupt())?;
+            *behind = k;
+            let Some(c) = slot.as_mut() else { continue };
+            let b = runs.get(r).ok_or(corrupt())?;
+            match b.position_after(view.offset(self.segment, r)?, k)? {
+                Some(at) if at.0 == c.position().0 => {
+                    c.place_async(b, store, at).await?;
+                    *behind = 0;
+                }
+                Some(at) => {
+                    *self.targets.get_mut(r).ok_or(corrupt())? = Some(at);
+                    *behind = 0;
+                }
+                None => {
+                    if let Some(c) = slot.take() {
+                        c.give_back(store);
+                    }
+                }
+            }
+        }
+        self.settle_async(view, store, runs).await
+    }
+
+    async fn search_async<F: BlockFile>(
+        &mut self,
+        view: &View,
+        store: &mut Store<F>,
+        runs: &[Branch],
+        selectors: &[u8],
+        from: &[u8],
+    ) -> Result<usize, Error> {
+        let (mut lo, mut hi) = (0usize, selectors.len());
+        while lo < hi {
+            let mid = group_start(selectors, lo.saturating_add(hi.saturating_sub(lo) / 2))?;
+            if mid < lo {
+                return Err(corrupt());
+            }
+            let r = usize::from(selectors.get(mid).ok_or(corrupt())? & RUN);
+            let b = runs.get(r).ok_or(corrupt())?;
+            let offset = view.offset(self.segment, r)?;
+            let k = occurrences(selectors, mid, r);
+            let at = b.position_after(offset, k)?.ok_or(corrupt())?;
+            let slot = self.cursors.get_mut(r).ok_or(corrupt())?;
+            if slot.is_none() {
+                *slot = Some(RunCursor::new(store)?);
+            }
+            let c = slot.as_mut().ok_or(corrupt())?;
+            c.place_async(b, store, at).await?;
+            // The run's occurrences in the segment: those before `from` are counted on the page.
+            let (_, index) = c.position();
+            let (first_at_least, n) = c.page_lower_bound(from)?;
+            let total = occurrences(selectors, selectors.len(), r);
+            // The occurrence the page's entry `i` is: `k` at the cursor's entry.
+            let occurrence_of = |i: usize| k.checked_add(i)?.checked_sub(index);
+            if first_at_least < n {
+                // The page's first entry at least `from`: the run's entries from it on are at
+                // least `from`; those on the page before it are less (none is known less when
+                // it is the page's first, as entries before the page may be at least `from`).
+                if let Some(before) = occurrence_of(first_at_least) {
+                    if first_at_least > 0
+                        && let Some(p) = before.checked_sub(1).and_then(|o| nth_of(selectors, r, o))
+                    {
+                        lo = lo.max(group_end(selectors, p)?);
+                    }
+                    if before < total
+                        && let Some(p) = nth_of(selectors, r, before)
+                    {
+                        hi = hi.min(group_start(selectors, p)?);
+                    }
+                } else {
+                    // Even the segment's first of the run is at least `from`.
+                    if let Some(p) = nth_of(selectors, r, 0) {
+                        hi = hi.min(group_start(selectors, p)?);
+                    }
+                }
+            } else if let Some(last) = occurrence_of(n.saturating_sub(1)) {
+                // Every entry on the page is less than `from`: so is the run up to its last.
+                if let Some(p) = nth_of(selectors, r, last.min(total.saturating_sub(1))) {
+                    lo = lo.max(group_end(selectors, p)?);
+                }
+            }
+            // Every bound stays at a group boundary, even when a page's bound named an old
+            // version: its head has the same key. A group below `from` is passed whole.
+            if c.key() < from {
+                lo = lo.max(group_end(selectors, mid)?);
+            } else {
+                hi = hi.min(mid);
+            }
+        }
+        Ok(lo)
+    }
+
+    pub(crate) async fn step_async<F: BlockFile>(
+        &mut self,
+        view: &View,
+        store: &mut Store<F>,
+        runs: &[Branch],
+    ) -> Result<(), Error> {
+        if !self.valid {
+            return Ok(());
+        }
+        // The current entry is passed: its run's cursor moves past it when next read.
+        let b = self.behind.get_mut(self.run).ok_or(corrupt())?;
+        *b = b.saturating_add(1);
+        self.at = self.at.saturating_add(1);
+        self.settle_async(view, store, runs).await
+    }
+
+    async fn settle_async<F: BlockFile>(
+        &mut self,
+        view: &View,
+        store: &mut Store<F>,
+        runs: &[Branch],
+    ) -> Result<(), Error> {
+        for _ in 0..=view.entries() {
+            let Some(selectors) = view.selectors_of(self.segment) else {
+                self.valid = false;
+                return Ok(());
+            };
+            let Some(&sel) = selectors.get(self.at) else {
+                // The segment's end: the next one's offsets place the runs not yet read, and
+                // their counts of entries passed start again from it.
+                self.segment = self.segment.saturating_add(1);
+                self.at = 0;
+                for (c, b) in self.cursors.iter().zip(self.behind.iter_mut()) {
+                    if c.is_none() {
+                        *b = 0;
+                    }
+                }
+                continue;
+            };
+            let r = usize::from(sel & RUN);
+            if sel & OLD != 0 {
+                let b = self.behind.get_mut(r).ok_or(corrupt())?;
+                *b = b.saturating_add(1);
+                self.at = self.at.saturating_add(1);
+                continue;
+            }
+            self.run = r;
+            return self.load_async(view, store, runs).await;
+        }
+        Err(corrupt())
+    }
+
+    async fn load_async<F: BlockFile>(
+        &mut self,
+        view: &View,
+        store: &mut Store<F>,
+        runs: &[Branch],
+    ) -> Result<(), Error> {
+        let r = self.run;
+        let b = runs.get(r).ok_or(corrupt())?;
+        let slot = self.cursors.get_mut(r).ok_or(corrupt())?;
+        let behind = self.behind.get_mut(r).ok_or(corrupt())?;
+        let target = self.targets.get_mut(r).ok_or(corrupt())?;
+        match slot.as_mut() {
+            None => {
+                // Opened where it is consumed, from the counts in memory: the segment's offset
+                // moved on by the entries passed, the one page there read.
+                let (page, index) = b
+                    .position_after(view.offset(self.segment, r)?, *behind)?
+                    .ok_or(corrupt())?;
+                *slot = Some(RunCursor::new(store)?);
+                let c = slot.as_mut().ok_or(corrupt())?;
+                c.place_async(b, store, (page, index)).await?;
+            }
+            Some(c) => {
+                let at = *target;
+                match at.map(|at| b.position_after(at, *behind)).transpose()? {
+                    Some(Some(at)) => c.place_async(b, store, at).await?,
+                    Some(None) => return Err(corrupt()),
+                    None => c.advance_async(b, store, *behind).await?,
+                }
+                if !c.valid() {
+                    return Err(corrupt());
+                }
+            }
+        }
+        *target = None;
+        *behind = 0;
+        Ok(())
+    }
+
     /// Gives every placed cursor's page and span back to `store`.
     /// Gives the runs' cursors back to `store`'s pools; the walk's own buffers come back, empty,
     /// for the next [`Self::seek_with`].

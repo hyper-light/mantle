@@ -90,15 +90,15 @@ impl Future for Notified<'_> {
     type Output = Result<(), RtError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let Some(word) = polling_task(cx.waker()) else {
+            return Poll::Ready(Err(RtError::NotOnShardThread));
+        };
         let Some(cell) = self.notify.cell.cell() else {
             return Poll::Ready(Err(RtError::ShardGone { shard: 0 }));
         };
         if cell.state.fetch_and(!PENDING, Ordering::AcqRel) & PENDING != 0 {
             return Poll::Ready(Ok(()));
         }
-        let Some(word) = polling_task(cx.waker()) else {
-            return Poll::Ready(Err(RtError::NotOnShardThread));
-        };
         self.notify.cell.register(word);
         if cell.state.fetch_and(!PENDING, Ordering::AcqRel) & PENDING != 0 {
             return Poll::Ready(Ok(()));
@@ -212,7 +212,10 @@ impl Drop for Queued {
 
 impl<T> OneshotReceiver<T> {
     /// Waits for the value on a plain thread.
-    pub fn blocking_recv(self) -> Result<T, SyncError<()>> {
+    pub fn blocking_recv(&mut self) -> Result<T, SyncError<()>> {
+        if crate::registry::current_shard().is_some() {
+            return Err(SyncError::NotOnShardThread(()));
+        }
         self.value.recv().map_err(|_| SyncError::Closed(()))
     }
 
@@ -236,12 +239,12 @@ impl<T> Future for OneshotReceiver<T> {
     type Output = Result<T, SyncError<()>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Some(ready) = poll_value(&mut self.as_mut().try_recv()) {
-            return Poll::Ready(ready);
-        }
         let Some(word) = polling_task(cx.waker()) else {
             return Poll::Ready(Err(SyncError::NotOnShardThread(())));
         };
+        if let Some(ready) = poll_value(&mut self.as_mut().try_recv()) {
+            return Poll::Ready(ready);
+        }
         self.cell.register(word);
         match poll_value(&mut self.as_mut().try_recv()) {
             Some(ready) => Poll::Ready(ready),
@@ -306,6 +309,8 @@ pub fn channel_with<T>(
             what: "a channel of no capacity, or no room for a waiting sender",
         });
     }
+    channel_capacity::<T>(capacity)?;
+    channel_capacity::<Queued>(waiters)?;
     let cell = claim(2)?;
     let (value, receiver) = sync_channel(capacity);
     let (room, waiting) = sync_channel(waiters);
@@ -321,6 +326,28 @@ pub fn channel_with<T>(
             cell,
         },
     ))
+}
+
+/// Rust 1.98 std/sync/mpmc/array.rs: cap+1 next power of two, a mark and
+/// lap in usize; Slot<T> owns one AtomicUsize and MaybeUninit<T>. Refuse impossible
+/// tickets/layouts before std's infallible constructor or either arena owner exists.
+/// This checks representation, not recoverable allocation failure from std's allocator.
+fn channel_capacity<T>(capacity: usize) -> Result<(), RtError> {
+    let refused = || RtError::BadConfig {
+        what: "channel capacity exceeds its ticket or slot layout",
+    };
+    capacity
+        .checked_add(1)
+        .and_then(usize::checked_next_power_of_two)
+        .and_then(|mark| mark.checked_mul(2))
+        .ok_or_else(refused)?;
+    let (slot, _) = std::alloc::Layout::new::<std::sync::atomic::AtomicUsize>()
+        .extend(std::alloc::Layout::new::<std::mem::MaybeUninit<T>>())
+        .map_err(|_| refused())?;
+    let slot = slot.pad_to_align();
+    let bytes = slot.size().checked_mul(capacity).ok_or_else(refused)?;
+    std::alloc::Layout::from_size_align(bytes, slot.align()).map_err(|_| refused())?;
+    Ok(())
 }
 
 impl<T> Clone for Sender<T> {
@@ -349,6 +376,9 @@ impl<T> Sender<T> {
 
     /// Sends on a plain thread, waiting for room.
     pub fn blocking_send(&self, value: T) -> Result<(), SyncError<T>> {
+        if crate::registry::current_shard().is_some() {
+            return Err(SyncError::NotOnShardThread(value));
+        }
         match self.value.send(value) {
             Ok(()) => {
                 self.cell.0.wake();
@@ -437,6 +467,10 @@ impl<T> Future for Send<'_, T> {
         let Some(value) = self.value.take() else {
             return Poll::Ready(Ok(()));
         };
+        let Some(word) = polling_task(cx.waker()) else {
+            self.leave(false);
+            return Poll::Ready(Err(SyncError::NotOnShardThread(value)));
+        };
         let value = match self.sender.try_send(value) {
             Ok(()) => {
                 self.leave(true);
@@ -447,10 +481,6 @@ impl<T> Future for Send<'_, T> {
                 self.leave(true);
                 return Poll::Ready(Err(refused));
             }
-        };
-        let Some(word) = polling_task(cx.waker()) else {
-            self.leave(false);
-            return Poll::Ready(Err(SyncError::NotOnShardThread(value)));
         };
         // Still waiting with a cell not yet granted: keep the place, with the latest word registered.
         let waiting = self
@@ -505,6 +535,9 @@ impl<T> ChannelReceiver<T> {
 
     /// Takes a value on a plain thread, waiting for one.
     pub fn blocking_recv(&mut self) -> Result<T, SyncError<()>> {
+        if crate::registry::current_shard().is_some() {
+            return Err(SyncError::NotOnShardThread(()));
+        }
         let value = self.value.recv().map_err(|_| SyncError::Closed(()))?;
         self.wake_one_sender();
         Ok(value)
@@ -555,12 +588,12 @@ impl<T> Future for Recv<'_, T> {
     type Output = Result<T, SyncError<()>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Some(ready) = poll_value(&mut self.receiver.try_recv()) {
-            return Poll::Ready(ready);
-        }
         let Some(word) = polling_task(cx.waker()) else {
             return Poll::Ready(Err(SyncError::NotOnShardThread(())));
         };
+        if let Some(ready) = poll_value(&mut self.receiver.try_recv()) {
+            return Poll::Ready(ready);
+        }
         self.receiver.cell.register(word);
         match poll_value(&mut self.receiver.try_recv()) {
             Some(ready) => Poll::Ready(ready),
@@ -864,12 +897,12 @@ impl Future for Changed<'_> {
     type Output = Result<(), SyncError<()>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Some(ready) = self.receiver.check() {
-            return Poll::Ready(ready);
-        }
         let Some(word) = polling_task(cx.waker()) else {
             return Poll::Ready(Err(SyncError::NotOnShardThread(())));
         };
+        if let Some(ready) = self.receiver.check() {
+            return Poll::Ready(ready);
+        }
         self.receiver.own.register(word);
         match self.receiver.check() {
             Some(ready) => Poll::Ready(ready),
@@ -917,6 +950,7 @@ impl Semaphore {
                 what: "a semaphore no acquirer may wait on",
             });
         }
+        channel_capacity::<CellRef>(waiters)?;
         let cell = claim(1)?;
         if let Some(words) = cell.cell() {
             words.state.store(permits, Ordering::Release);
@@ -1007,6 +1041,9 @@ impl<'a> Future for Acquire<'a> {
     type Output = Result<Permit<'a>, SyncError<()>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let Some(word) = polling_task(cx.waker()) else {
+            return Poll::Ready(Err(SyncError::NotOnShardThread(())));
+        };
         let semaphore = self.semaphore;
         if let Some(own) = self.waiting {
             let granted = own
@@ -1017,17 +1054,12 @@ impl<'a> Future for Acquire<'a> {
                 own.release();
                 return Poll::Ready(Ok(Permit { semaphore }));
             }
-            if let Some(word) = polling_task(cx.waker()) {
-                own.register(word);
-            }
+            own.register(word);
             return Poll::Pending;
         }
         if let Some(permit) = semaphore.try_acquire() {
             return Poll::Ready(Ok(permit));
         }
-        let Some(word) = polling_task(cx.waker()) else {
-            return Poll::Ready(Err(SyncError::NotOnShardThread(())));
-        };
         let Ok(own) = claim(2) else {
             return Poll::Ready(Err(SyncError::Full(())));
         };

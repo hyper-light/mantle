@@ -109,9 +109,30 @@ The channel's register-then-recheck receive and publish-then-wake send are the e
 hyper-rt handoff protocol (`vendor/hyper-rt/src/sync/mod.rs`, `handoff.rs`; upstream runtime
 design §8). Canceling a borrowed receive consumes no answer, batch credit or buffer. Store
 accounts the numbered answer through the same path as its synchronous consumer, and a later
-consumer can take an interrupted wait's answer. The synchronous answer path remains available.
+consumer can take an interrupted wait's answer. A runtime range requires its device attachment
+and admitted maintenance workers before it starts. Every runtime I/O wait, including cold queries,
+packing, metadata, both durability flushes and retirement, must yield to the shard. A synchronous
+fallback is an implementation defect and prevents acceptance of the integration.
 Native held-I/O tests cover same-shard request progress, cancellation,
-failed reads and writes, and exact checkpoint recovery (`tests/ranges.rs`, `store_issuer.rs`).
+failed reads and writes, and exact checkpoint recovery (`tests/ranges_async_reads.rs`,
+`ranges_owning_cancel.rs`, `ranges_paced_stall.rs`, `store_issuer.rs`).
+
+The retained checkpoint keeps its applied index through preparation, saved views and image pages,
+allocator map pages, the first numbered flush, the alternating superblock write and the second
+numbered flush. Only the second successful flush publishes durability. Once image saving begins,
+idle maintenance cannot change the snapshot. Canceling a borrowed wait retains its current page,
+cursor, buffers and receipt; it cannot replay a completed write. A cold Get or Scan keeps its cursor
+and page ownership while awaiting the issuer, with resident pages borrowed in place. A range is an
+admitted cooperative service: owning-task cancellation enters closing once, then retains the Db,
+active and queued requests, reply buffers and client leases until worker EOF, owner drain and
+attachment retirement. Closing is never raced against the already-ready cancellation level.
+Before actor admission, the original file moves to the native reaper with the attachment's
+physical-retirement watch. The reaper joins the workers, waits for that watch and closes the
+original file off the shard. The range awaits the original-close receipt before returning or
+dropping its retained requests and leases. The Store retains the first observed
+physical fence error through later drains, so terminal cleanup does not replace it with a generic
+refusal. This private candidate has native fault, cancellation and crash-cut proofs; final shared
+consumer, platform, stress and performance gates remain required before acceptance.
 
 What it is held to: puts and gets per second against RocksDB's `db_bench` at the same thread
 count (`--threads=N`, N shards against N threads), and every operation's p99, p99.9 and p99.99
@@ -374,6 +395,20 @@ ran. The shard now does that work a slice at a time on its own worker
   (`store::Run`). With one buffer in the store, the packing builder and a compaction's builder
   taking turns wrote each other's runs a page at a time: 352,084 write calls a fill against
   15,829.
+- **Write reservations.** `ShardDb::set_write_budget` still caps queued whole runs. The total
+  budget (`set_memory`) first reserves issuer workspace for the owner and every admitted
+  worker: each attached store's batch slots, active replacement and submit handoff, since
+  `Store::submit` takes its replacement before waiting for a full attachment. The owner's
+  depth peak and queued buffers returned to its warm pool stay charged after admission
+  shrinks. Worker capacity is limited by the budget left after these reservations; fixed or
+  retained write memory that cannot fit is refused before changing the configuration.
+  A worker seat stays warm and charged until terminal retirement. The measured `want`
+  limits active jobs, while `workers` counts those retained seats; a reduced need does not
+  detach a Store and reuse its seat before the old Store has finished retirement.
+  `memory_held` reports this reservation alongside the caches, whose existing gradual trim
+  remains visible. This is not RSS: additional Builder working runs, input spans, point/page
+  buffers, memtables, branch metadata, packing feeds, channel metadata and thread stacks are
+  separate. Only the remainder moves by the marginal-gain rule (research/36).
 - **Filters as keys arrive.** A builder adds each key to its filter as it adds the entry, so
   finishing a branch no longer builds a filter over millions of keys in one slice. A
   compaction's count is only bounded, so its filter starts at a power of two of blocks for the

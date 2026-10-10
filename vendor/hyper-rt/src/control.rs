@@ -14,6 +14,9 @@ use crate::task::SpawnRequest;
 pub enum Control {
     /// Take ownership of a spawn request (a boxed future and its placement).
     Spawn(Box<SpawnRequest>),
+    /// Admit a service whose cancellation is completed by its own future. The request must
+    /// carry only cold bootstrap ownership until its admission receipt is answered.
+    SpawnService(Box<SpawnRequest>),
     /// Cancel the task named by the packed word.
     Cancel(Encoded),
     /// Finish every task and exit the loop.

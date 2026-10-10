@@ -9,6 +9,10 @@
     clippy::disallowed_macros
 )]
 
+#[path = "support/into_file.rs"]
+mod file_outcome;
+use file_outcome::finished_file;
+
 use std::collections::BTreeMap;
 
 use hyper_block::buf::Alignment;
@@ -135,7 +139,7 @@ fn a_failed_single_head_step_can_reopen_over_another_run() {
     let page = u64::from(bad_branch.leaf_of(b"a/0100").unwrap());
     let address = bad_branch.page_address(&store, page).unwrap();
     store.checkpoint(None, 1).unwrap();
-    let (file, landed) = store.into_file();
+    let (file, landed) = finished_file(store.into_file());
     landed.unwrap();
     file.inject(Fault::ReadError {
         offset: address * config.page_size as u64,

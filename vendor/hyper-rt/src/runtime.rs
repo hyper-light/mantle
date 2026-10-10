@@ -5,6 +5,11 @@
 use std::future::Future;
 use std::thread::JoinHandle;
 
+mod retirement;
+pub use retirement::{
+    OriginalAdoption, OriginalFence, OriginalLease, OriginalRetirement, RetirementLease,
+};
+
 use crate::control::Control;
 use crate::derived;
 use crate::driver::{DriverSeed, Kick, Prepared, os_driver};
@@ -27,6 +32,17 @@ pub fn submit_to_holder<F: Future<Output = ()> + Send + 'static>(
 ) -> Result<AdmissionReceipt, RtError> {
     let (request, receipt) = SpawnRequest::with_receipt(Box::pin(future), None);
     registry::send_control_to_holder(holder, Control::Spawn(Box::new(request)))?;
+    Ok(receipt)
+}
+
+/// Submits an opt-in service bootstrap to this exact registration. An unadmitted
+/// bootstrap must not own live I/O; transfer that ownership only after `Admitted`.
+pub fn submit_service_to_holder<F: Future<Output = ()> + Send + 'static>(
+    holder: registry::SlotHolder,
+    future: F,
+) -> Result<AdmissionReceipt, RtError> {
+    let (request, receipt) = SpawnRequest::with_receipt(Box::pin(future), None);
+    registry::send_control_to_holder(holder, Control::SpawnService(Box::new(request)))?;
     Ok(receipt)
 }
 
@@ -306,6 +322,17 @@ struct Worker {
     thread: JoinHandle<Result<Counters, RtError>>,
 }
 
+/// The opt-in retirement executor starts only on its runtime's cold owner.
+fn spawn_retirement<F: FnOnce() + Send + 'static>(body: F) -> std::io::Result<JoinHandle<()>> {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the runtime cold owner owns and joins its bounded retirement threads (docs/runtime.md §3)"
+    )]
+    std::thread::Builder::new()
+        .name("hyper-rt-retirement".into())
+        .spawn(body)
+}
+
 /// The OS runtime: one thread per shard. It owns its workers from start to a terminal state (AUD-29-12):
 /// `start` is transactional — every shard's context is built and acknowledged before it returns, and any
 /// failure stops and joins the workers that did start and gives every registry slot back before the typed
@@ -317,6 +344,8 @@ pub struct Runtime {
     workers: Vec<Worker>,
     ids: Vec<ShardId>,
     notes: Vec<String>,
+    retirement: Vec<retirement::Owner>,
+    retirement_capacity: usize,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -332,11 +361,14 @@ impl Drop for Runtime {
     /// slots back, exactly as `shutdown` would; a worker's failure is reported on the error stream, the one
     /// place a drop can put it.
     fn drop(&mut self) {
-        if self.workers.is_empty() {
-            return;
-        }
-        if stop(std::mem::take(&mut self.workers)).is_err() {
+        if !self.workers.is_empty() && stop(std::mem::take(&mut self.workers)).is_err() {
             registry::note_unreported_failure();
+        }
+        // Reapers remain alive through every service-worker join, including driver failure.
+        for owner in &mut self.retirement {
+            if owner.join().is_err() {
+                registry::note_unreported_failure();
+            }
         }
     }
 }
@@ -468,6 +500,12 @@ impl Runtime {
         prepare: &mut dyn FnMut() -> Result<Prepared, RtError>,
     ) -> Result<Runtime, RtError> {
         config.validate_shape()?;
+        let retirement_capacity = config
+            .tasks_per_shard
+            .checked_mul(usize::from(config.shards))
+            .ok_or(RtError::BadConfig {
+                what: "native retirement task capacity overflow",
+            })?;
         let mut notes = Vec::new();
         let seeds = register_seeds(config, prepare, &mut notes)?;
         let ids: Vec<ShardId> = seeds.iter().map(|s| ShardId(s.id)).collect();
@@ -514,7 +552,80 @@ impl Runtime {
             workers,
             ids,
             notes,
+            retirement: Vec::new(),
+            retirement_capacity,
         })
+    }
+
+    /// Prepares exactly these native worker groups on the cold caller. Their handles are
+    /// adopted before an engine enters a service; retirement only signals and awaits.
+    /// Live groups are bounded by the runtime's configured task arena. Completed owners
+    /// are joined here, so repeated cold service setup does not accumulate reaper threads.
+    pub fn prepare_retirement(
+        &mut self,
+        capacities: &[usize],
+    ) -> Result<Vec<RetirementLease>, RtError> {
+        self.retirement_room(capacities)?;
+        let (owner, leases) = retirement::Owner::new(capacities)?;
+        self.retirement.push(owner);
+        Ok(leases)
+    }
+
+    /// Reserves worker retirement and a separately receipted original resource on the
+    /// same native reaper. Cold adoption transfers the resource before service admission;
+    /// original retirement first joins this group's workers, then waits its physical fence.
+    pub fn prepare_retirement_with_original<F: Send + 'static, W: OriginalFence>(
+        &mut self,
+        capacities: &[usize],
+    ) -> Result<Vec<OriginalRetirement<F, W>>, RtError> {
+        self.retirement_room(capacities)?;
+        let (owner, leases) = retirement::Owner::new_with_original(capacities)?;
+        self.retirement.push(owner);
+        Ok(leases)
+    }
+
+    fn retirement_room(&mut self, capacities: &[usize]) -> Result<(), RtError> {
+        if registry::with_current(|_| ()).is_some() {
+            return Err(RtError::NotOnShardThread);
+        }
+        if capacities.is_empty() || capacities.contains(&0) {
+            return Err(RtError::BadConfig {
+                what: "an empty native retirement reservation",
+            });
+        }
+        let held = self
+            .retirement
+            .iter()
+            .filter(|owner| !owner.done())
+            .try_fold(0usize, |held, owner| held.checked_add(owner.groups()))
+            .ok_or(RtError::BadConfig {
+                what: "native retirement groups overflow",
+            })?;
+        if held
+            .checked_add(capacities.len())
+            .is_none_or(|total| total > self.retirement_capacity)
+        {
+            return Err(RtError::Capacity {
+                what: "native retirement groups",
+                bound: self.retirement_capacity,
+            });
+        }
+        let mut at = 0;
+        while at < self.retirement.len() {
+            if self.retirement.get(at).is_some_and(retirement::Owner::done) {
+                let mut owner = self.retirement.swap_remove(at);
+                owner.join()?;
+            } else {
+                at = at.saturating_add(1);
+            }
+        }
+        self.retirement
+            .try_reserve(1)
+            .map_err(|_| RtError::Capacity {
+                what: "native retirement owners",
+                bound: self.retirement_capacity,
+            })?;
+        Ok(())
     }
 
     /// The shard ids, in order.
@@ -554,6 +665,18 @@ impl Runtime {
         Ok(receipt)
     }
 
+    /// Submits an opt-in service bootstrap and returns its real admission receipt.
+    /// Cancellation keeps the admitted future alive until its cleanup returns Ready.
+    pub fn spawn_service_on_with_receipt<F: Future<Output = ()> + Send + 'static>(
+        &self,
+        shard: ShardId,
+        future: F,
+    ) -> Result<AdmissionReceipt, RtError> {
+        let (request, receipt) = SpawnRequest::with_receipt(Box::pin(future), None);
+        registry::send_control(shard.0, Control::SpawnService(Box::new(request)))?;
+        Ok(receipt)
+    }
+
     /// The registration holding `shard`'s slot, for a submitter that must reach this runtime's shard and
     /// never a later holder of its slot ([`submit_to_holder`]); `None` when the shard is gone.
     pub fn holder_of(&self, shard: ShardId) -> Option<registry::SlotHolder> {
@@ -569,7 +692,15 @@ impl Runtime {
     /// counters in shard order, or the first worker's failure (typed; every worker is still joined and every
     /// slot still given back).
     pub fn shutdown(mut self) -> Result<Vec<Counters>, RtError> {
-        stop(std::mem::take(&mut self.workers))
+        let mut result = stop(std::mem::take(&mut self.workers));
+        for owner in &mut self.retirement {
+            if let Err(error) = owner.join()
+                && result.is_ok()
+            {
+                result = Err(error);
+            }
+        }
+        result
     }
 }
 
@@ -694,6 +825,14 @@ impl LocalRuntime {
         self.shard.spawn_local(crate::shard::boxed(future))
     }
 
+    /// Spawns a joinable service whose future completes its cancellation cleanup.
+    pub fn spawn_service<F: Future<Output = ()> + 'static>(
+        &mut self,
+        future: F,
+    ) -> Result<TaskId, RtError> {
+        self.shard.spawn_service_local(crate::shard::boxed(future))
+    }
+
     /// Keeps `value` for the shard's life and hands back its handle.
     pub fn keep<T: 'static>(&mut self, value: T) -> Result<Kept<T>, RtError> {
         self.shard.keep(value)
@@ -734,7 +873,7 @@ impl LocalRuntime {
                 });
             }
             if !outcome.did_work {
-                self.shard.park(outcome.next_deadline_ns);
+                self.shard.park_owned(outcome.next_deadline_ns);
             }
         }
     }

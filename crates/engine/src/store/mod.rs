@@ -26,8 +26,9 @@ use crate::fst::surf::SurfBuilder;
 use crate::fst::trie::TrieBuilder;
 use alloc::Allocator;
 use hyper_block::block::BlockFile;
-use hyper_block::buf::AlignedBuf;
-use hyper_block::issuer::{Answer, Attached, Attacher, Issuer, Transfers};
+use hyper_block::buf::{AlignedBuf, Alignment};
+use hyper_block::issuer::{Answer, Attached, Attacher, Issuer, RetirementWatch, Transfers};
+use hyper_rt::runtime::{OriginalAdoption, OriginalFence, OriginalLease};
 use page::{HEADER, Kind};
 use std::collections::VecDeque;
 use superblock::Superblock;
@@ -144,15 +145,33 @@ pub const RANGE_FILTER_BITS: u32 = 8;
 /// A store over one file, owned by one thread (as every `BlockFile` is).
 #[derive(Debug)]
 pub struct Store<F: BlockFile> {
-    file: F,
+    /// Standalone cold owners retain their file; runtime owners transfer it before admission.
+    file: Option<F>,
+    /// The existing native retirement owner holds the original file through physical close.
+    original: Option<OriginalLease>,
     config: Config,
     alloc: Allocator,
+    /// Accepted worker jobs; nonempty borrowed runs cannot cross this boundary.
+    job_ordinal: u64,
     /// The durable checkpoint.
     durable: Superblock,
     /// One page's aligned buffer, reused by every read and write.
     buf: AlignedBuf,
     /// A write or flush failed: the store takes no more.
     fenced: bool,
+    /// The first cause of the fence survives later drains until the worker starts a new job.
+    fence_error: Option<Error>,
+    /// A paced terminal drain retains its first failure until every issued batch ends.
+    drain_error: Option<Error>,
+    drain_closed: bool,
+    /// Terminal close survives a canceled borrowed wait.
+    closing: Option<Closing>,
+    /// One retained durability barrier; its map freezes allocator changes across waits.
+    checkpoint: Option<Checkpoint>,
+    /// A failed or abandoned barrier is terminal; a worker's ordinary job fence is separate.
+    checkpoint_aborted: bool,
+    checkpoint_payload: Vec<u8>,
+    checkpoint_map: Vec<u64>,
     /// The file's end in bytes: past every page written, the furthest a span reads.
     end: u64,
     io: IoStats,
@@ -166,6 +185,9 @@ pub struct Store<F: BlockFile> {
     /// queued at once since the tuner last asked ([`Store::take_queue_peak`]).
     write_budget_runs: usize,
     queue_peak: usize,
+    /// Queued output buffers ever held, in bytes. Their returned buffers stay warm in pool,
+    /// so reducing admission does not give this reservation back before the store retires.
+    warm_write_bytes: usize,
     /// Extent buffers given back by spans, runs and answered writes, for the next to need one:
     /// a fresh one costs a page fault for each of its pages, milliseconds a compaction's
     /// cursors on a busy machine. It holds no more than were ever out at once.
@@ -174,6 +196,11 @@ pub struct Store<F: BlockFile> {
     /// The buffer a point read's page is read into on a cache miss ([`Store::with_page`]).
     point: Vec<u8>,
     most_lent: usize,
+    /// Empty span read lists, bounded by the most spans borrowed together. Pool slots
+    /// are reserved while acquiring a span, never while canceling one.
+    span_pending: Vec<PendingReads>,
+    spans_lent: usize,
+    spans_most_lent: usize,
     /// Page buffers lent to readers (a cursor's path, a point read), kept when given back: at
     /// most as many as were ever out at once.
     pages: Vec<Vec<u8>>,
@@ -191,6 +218,45 @@ pub struct Store<F: BlockFile> {
     forgetting: VecDeque<u64>,
     /// A worker's way to more extents once its grant is spent ([`Store::set_refill`]).
     refill: Option<Refill>,
+}
+
+/// A file returned after physical retirement, or its unchanged owner on refusal.
+#[derive(Debug)]
+pub enum IntoFile<O, F> {
+    Finished { file: F, result: Result<(), Error> },
+    Refused { owner: O, error: Error },
+}
+
+#[derive(Debug)]
+struct Closing {
+    phase: ClosePhase,
+    error: Option<Error>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClosePhase {
+    Drain,
+    Abort,
+    Retire,
+    Original,
+    Done,
+}
+
+/// The registered physical watch stays native-owned with the original file.
+pub(crate) struct OriginalPhysical(RetirementWatch);
+
+impl OriginalFence for OriginalPhysical {
+    fn wait_blocking(&mut self) -> Result<(), hyper_rt::error::RtError> {
+        self.0
+            .wait_blocking()
+            .map_err(|_| hyper_rt::error::RtError::BadConfig {
+                what: "original file attachment retired abnormally",
+            })
+    }
+
+    fn is_retired(&self) -> bool {
+        self.0.is_retired()
+    }
 }
 
 /// Asks the shard for `n` more extents and waits for them: a worker's, whose job outgrew its
@@ -230,6 +296,40 @@ struct Writer {
     /// handed to a queued run, so a write queue that never empties cannot starve its reads.
     /// Writes keep every other batch, so with two or more the reserve never stops them.
     read_wanted: bool,
+    /// A numbered flush has no buffer loan. Any answer consumer keeps its result here.
+    flush: Option<Flush>,
+}
+
+#[derive(Debug)]
+struct Flush {
+    number: u64,
+    result: Option<Result<(), Error>>,
+}
+
+#[derive(Debug)]
+struct Checkpoint {
+    root: Option<u64>,
+    applied: u64,
+    generation: u64,
+    refs: usize,
+    map: Vec<u64>,
+    payload: Vec<u8>,
+    run: Run,
+    phase: CheckpointPhase,
+    error: Option<Error>,
+}
+
+#[derive(Debug)]
+enum CheckpointPhase {
+    Map(usize),
+    DrainMap,
+    Flush1(Option<u64>),
+    EncodeSuperblock,
+    Superblock,
+    DrainSuperblock,
+    Flush2(Option<u64>),
+    Commit,
+    Failed,
 }
 
 /// A full run waiting for the issuer: its buffer cut to its pages, its offset, its pages and
@@ -253,6 +353,8 @@ pub struct Run {
     buf: AlignedBuf,
     first: u64,
     pages: u32,
+    /// The job that accepted its first page; ignored while this run is empty.
+    job_ordinal: u64,
 }
 
 /// A branch builder's working lists, kept by the store between builders so they grow once: the
@@ -339,6 +441,8 @@ impl Span {
     }
 }
 
+type PendingReads = VecDeque<(u64, u64, u32, bool)>;
+
 /// Pages a scan reads ahead ([`Store::read_page_ahead`]): an extent's buffer, the first page it
 /// holds, and the pages it holds. A scan reads one finished branch's pages, which no write
 /// changes while the branch is held, so the pages a span holds stay the file's.
@@ -359,7 +463,7 @@ pub struct Span {
     /// number, first page, pages and whether its delay has widened the lookahead. Each late
     /// read adds one extent, up to the batches; polling it again is not a new observation of
     /// the device's latency over the time the compaction takes through an extent.
-    pending: VecDeque<(u64, u64, u32, bool)>,
+    pending: PendingReads,
     depth: usize,
     /// The next memory-ready payload, held across a builder's intervening cache admission or
     /// write submission. One pooled page; it does not replace the current leaf's bytes.
@@ -377,6 +481,62 @@ fn corrupt(why: Malformed) -> Error {
     Error::Corruption {
         what: "a store",
         why,
+    }
+}
+
+fn blocking_allowed(what: &'static str) -> Result<(), Error> {
+    if hyper_rt::registry::current_shard().is_some() {
+        Err(Error::InvalidArgument { what })
+    } else {
+        Ok(())
+    }
+}
+
+fn finish_context(cx: &std::task::Context<'_>) -> Result<(), Error> {
+    if hyper_rt::futures::current_task()
+        .is_some_and(|task| hyper_rt::waker::waker_for(task.0).will_wake(cx.waker()))
+    {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgument {
+            what: "an async store finish polled outside its runtime task",
+        })
+    }
+}
+
+fn checkpoint_context(cx: &std::task::Context<'_>) -> Result<(), Error> {
+    if hyper_rt::futures::current_task()
+        .is_some_and(|task| hyper_rt::waker::waker_for(task.0).will_wake(cx.waker()))
+    {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgument {
+            what: "an async checkpoint polled outside its runtime task",
+        })
+    }
+}
+
+fn page_context(cx: &std::task::Context<'_>) -> Result<(), Error> {
+    if hyper_rt::futures::current_task()
+        .is_some_and(|task| hyper_rt::waker::waker_for(task.0).will_wake(cx.waker()))
+    {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgument {
+            what: "an async page read polled outside its runtime task",
+        })
+    }
+}
+
+fn write_context(cx: &std::task::Context<'_>) -> Result<(), Error> {
+    if hyper_rt::futures::current_task()
+        .is_some_and(|task| hyper_rt::waker::waker_for(task.0).will_wake(cx.waker()))
+    {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgument {
+            what: "an async page write polled outside its runtime task",
+        })
     }
 }
 
@@ -418,15 +578,15 @@ impl<F: BlockFile> Store<F> {
         Ok(buf)
     }
 
-    fn run_buf(file: &F, config: Config) -> Result<AlignedBuf, Error> {
+    fn run_buf(alignment: Alignment, config: Config) -> Result<AlignedBuf, Error> {
         let bytes = config
             .page_size
             .checked_mul(
                 usize::try_from(config.extent_pages).map_err(|_| corrupt(Malformed::TooLarge))?,
             )
             .ok_or(corrupt(Malformed::TooLarge))?;
-        let mut run = AlignedBuf::zeroed(bytes, file.alignment())
-            .map_err(|e| io("allocate an extent buffer", e))?;
+        let mut run =
+            AlignedBuf::zeroed(bytes, alignment).map_err(|e| io("allocate an extent buffer", e))?;
         run.extend_zeros(bytes)
             .map_err(|e| io("allocate an extent buffer", e))?;
         Ok(run)
@@ -435,6 +595,7 @@ impl<F: BlockFile> Store<F> {
     /// Creates a store in `file`, which must be empty: generation 1, no root, applied 0, durable
     /// when this returns.
     pub fn create(file: F, config: Config) -> Result<Self, Error> {
+        blocking_allowed("a synchronous store creation in a runtime task")?;
         Self::check(&file, config)?;
         if !file.is_empty().map_err(|e| io("stat a store", e))? {
             return Err(Error::InvalidArgument {
@@ -446,7 +607,8 @@ impl<F: BlockFile> Store<F> {
             what: "a page size past 4 GiB",
         })?;
         let mut store = Self {
-            file,
+            file: Some(file),
+            original: None,
             config,
             alloc: Allocator::new(config.max_extents),
             durable: Superblock {
@@ -460,6 +622,15 @@ impl<F: BlockFile> Store<F> {
             },
             buf,
             fenced: false,
+            fence_error: None,
+            job_ordinal: 0,
+            drain_error: None,
+            drain_closed: false,
+            closing: None,
+            checkpoint: None,
+            checkpoint_aborted: false,
+            checkpoint_payload: Vec::new(),
+            checkpoint_map: Vec::new(),
             end: 0,
             io: IoStats::default(),
             cache: None,
@@ -467,10 +638,14 @@ impl<F: BlockFile> Store<F> {
             writer: None,
             write_budget_runs: 0,
             queue_peak: 0,
+            warm_write_bytes: 0,
             pool: Vec::new(),
             lent: 0,
             point: Vec::new(),
             most_lent: 0,
+            span_pending: Vec::new(),
+            spans_lent: 0,
+            spans_most_lent: 0,
             pages: Vec::new(),
             pages_lent: 0,
             pages_most_lent: 0,
@@ -491,13 +666,15 @@ impl<F: BlockFile> Store<F> {
     /// write landed when it returns; the shard takes the result once every write has. One store
     /// serves a worker's every job, its buffers' pools kept warm.
     pub fn worker(file: F, config: Config) -> Result<Self, Error> {
+        blocking_allowed("a synchronous worker store setup in a runtime task")?;
         Self::check(&file, config)?;
         let buf = Self::page_buf(&file, config)?;
         let page_size = u32::try_from(config.page_size).map_err(|_| Error::InvalidArgument {
             what: "a page size past 4 GiB",
         })?;
         Ok(Self {
-            file,
+            file: Some(file),
+            original: None,
             config,
             alloc: Allocator::granted(),
             durable: Superblock {
@@ -511,6 +688,15 @@ impl<F: BlockFile> Store<F> {
             },
             buf,
             fenced: false,
+            fence_error: None,
+            job_ordinal: 0,
+            drain_error: None,
+            drain_closed: false,
+            closing: None,
+            checkpoint: None,
+            checkpoint_aborted: false,
+            checkpoint_payload: Vec::new(),
+            checkpoint_map: Vec::new(),
             end: 0,
             io: IoStats::default(),
             cache: None,
@@ -518,10 +704,14 @@ impl<F: BlockFile> Store<F> {
             writer: None,
             write_budget_runs: 0,
             queue_peak: 0,
+            warm_write_bytes: 0,
             pool: Vec::new(),
             lent: 0,
             point: Vec::new(),
             most_lent: 0,
+            span_pending: Vec::new(),
+            spans_lent: 0,
+            spans_most_lent: 0,
             pages: Vec::new(),
             pages_lent: 0,
             pages_most_lent: 0,
@@ -537,8 +727,26 @@ impl<F: BlockFile> Store<F> {
     /// A worker's next job: the extents `grant`ed it ([`Allocator::granted`]); reads up to `end`,
     /// the bytes the shard's store knew the file to hold when it granted the job; and its pages
     /// sealed as the shard's would be, for the checkpoint after `generation`.
-    pub fn begin_job(&mut self, grant: &[u64], end: u64, generation: u64) {
+    pub fn begin_job(&mut self, grant: &[u64], end: u64, generation: u64) -> Result<(), Error> {
+        self.allocator_available()?;
+        if self
+            .writer
+            .as_ref()
+            .is_some_and(|writer| writer.attached.out() > 0 || !writer.queued.is_empty())
+        {
+            return Err(Error::InvalidArgument {
+                what: "a worker job started before its earlier transfers drained",
+            });
+        }
+        let job_ordinal = self
+            .job_ordinal
+            .checked_add(1)
+            .ok_or(Error::LimitExceeded {
+                what: "worker jobs of a store",
+                limit: u64::MAX,
+            })?;
         self.alloc.regrant(grant);
+        self.job_ordinal = job_ordinal;
         self.end = end;
         self.durable.generation = generation;
         // A failed write fences a store, since what it holds durable is then unknown. A
@@ -546,6 +754,8 @@ impl<F: BlockFile> Store<F> {
         // by the shard, which keeps its own fence. Each job starts unfenced, so one failure
         // does not fail every later job on the worker.
         self.fenced = false;
+        self.fence_error = None;
+        Ok(())
     }
 
     /// How a worker gets more extents once its grant is spent.
@@ -562,6 +772,7 @@ impl<F: BlockFile> Store<F> {
     /// Opens the store in `file` at its newest durable checkpoint: the newer of the two
     /// superblock copies that verify, its map read back. A file whose copies both fail is corrupt.
     pub fn open(file: F, config: Config) -> Result<(Self, Recovered), Error> {
+        blocking_allowed("a synchronous store recovery in a runtime task")?;
         Self::check(&file, config)?;
         let mut buf = Self::page_buf(&file, config)?;
         let mut best: Option<Superblock> = None;
@@ -591,12 +802,22 @@ impl<F: BlockFile> Store<F> {
         };
         Ok((
             Self {
-                file,
+                file: Some(file),
+                original: None,
                 config,
                 alloc,
                 durable: sb,
                 buf,
                 fenced: false,
+                fence_error: None,
+                job_ordinal: 0,
+                drain_error: None,
+                drain_closed: false,
+                closing: None,
+                checkpoint: None,
+                checkpoint_aborted: false,
+                checkpoint_payload: Vec::new(),
+                checkpoint_map: Vec::new(),
                 end,
                 io: IoStats::default(),
                 cache: None,
@@ -604,10 +825,14 @@ impl<F: BlockFile> Store<F> {
                 writer: None,
                 write_budget_runs: 0,
                 queue_peak: 0,
+                warm_write_bytes: 0,
                 pool: Vec::new(),
                 lent: 0,
                 point: Vec::new(),
                 most_lent: 0,
+                span_pending: Vec::new(),
+                spans_lent: 0,
+                spans_most_lent: 0,
                 pages: Vec::new(),
                 pages_lent: 0,
                 pages_most_lent: 0,
@@ -628,6 +853,7 @@ impl<F: BlockFile> Store<F> {
         buf: &mut AlignedBuf,
         slot: u64,
     ) -> Result<Superblock, Error> {
+        blocking_allowed("a synchronous superblock read in a runtime task")?;
         let offset = slot
             .checked_mul(u64::try_from(config.page_size).map_err(|_| corrupt(Malformed::TooLarge))?)
             .ok_or(corrupt(Malformed::TooLarge))?;
@@ -650,6 +876,7 @@ impl<F: BlockFile> Store<F> {
         buf: &mut AlignedBuf,
         sb: &Superblock,
     ) -> Result<Vec<u32>, Error> {
+        blocking_allowed("a synchronous allocator map read in a runtime task")?;
         let count = usize::try_from(sb.extents).map_err(|_| corrupt(Malformed::TooLarge))?;
         if sb.extents > config.max_extents {
             return Err(corrupt(Malformed::TooLarge));
@@ -822,8 +1049,12 @@ impl<F: BlockFile> Store<F> {
 
     /// An extent for new pages, held once.
     pub fn allocate_extent(&mut self) -> Result<u64, Error> {
+        self.allocator_available()?;
         match self.alloc.allocate() {
             Err(Error::LimitExceeded { .. }) if self.refill.is_some() => {
+                // The failed granted allocation moved no extent. A runtime task must
+                // not enter the native worker's synchronous refill callback.
+                blocking_allowed("a synchronous worker refill inside a runtime task")?;
                 // A worker's grant is spent: as many again as it held, so the asks a job makes
                 // grow geometrically and number at most the logarithm of its need (the doubling
                 // of a dynamic table, Cormen et al., Introduction to Algorithms, 3rd ed., §17.4).
@@ -847,12 +1078,19 @@ impl<F: BlockFile> Store<F> {
     /// is forgotten now rather than in its turn ([`Self::forget_some`] passes over extents held
     /// again, since this store's own writes replace what it cached).
     pub fn grant(&mut self, count: usize) -> Result<Vec<u64>, Error> {
+        self.allocator_available()?;
         let mut out = Vec::new();
         out.try_reserve_exact(count)
             .map_err(|_| Error::LimitExceeded {
                 what: "extents granted a maintenance job",
                 limit: u64::try_from(count).unwrap_or(u64::MAX),
             })?;
+        if let Some(last) = self.alloc.reserve(count)? {
+            let page = u64::from(self.config.extent_pages)
+                .checked_sub(1)
+                .ok_or(corrupt(Malformed::TooLarge))?;
+            Self::address_in(self.config, last, page)?;
+        }
         for _ in 0..count {
             out.push(self.alloc.allocate()?);
         }
@@ -873,6 +1111,10 @@ impl<F: BlockFile> Store<F> {
     /// Takes back extents granted a worker that it never wrote: free again at once, since no
     /// checkpoint ever named them.
     pub fn grant_back(&mut self, extents: &[u64]) -> Result<(), Error> {
+        // Returning an unused grant is cleanup after finish began. The checkpoint's
+        // retained and abandoned barriers, and held-once validation, still apply.
+        self.allocator_idle()?;
+        self.alloc.reserve_back(extents)?;
         for &extent in extents {
             self.alloc.give_back(extent)?;
         }
@@ -891,12 +1133,14 @@ impl<F: BlockFile> Store<F> {
 
     /// One more reference to a held extent (a new node naming an existing branch).
     pub fn retain(&mut self, extent: u64) -> Result<(), Error> {
+        self.allocator_available()?;
         self.alloc.retain(extent)
     }
 
     /// One reference fewer; an extent left with none is reused once a checkpoint that no
     /// longer names it is durable.
     pub fn release(&mut self, extent: u64) -> Result<(), Error> {
+        self.checkpoint_idle()?;
         self.alloc.release(extent)?;
         // An extent no node names any more is read by no one: its pages leave the cache, so
         // the cache holds live pages, not the inputs of compactions done. Forgetting a
@@ -954,8 +1198,13 @@ impl<F: BlockFile> Store<F> {
         self.fenced
     }
 
+    pub(crate) fn has_issuer(&self) -> bool {
+        self.writer.is_some()
+    }
+
     fn fence<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
-        if result.is_err() {
+        if let Err(error) = &result {
+            self.fence_error.get_or_insert_with(|| error.clone());
             self.fenced = true;
             // The cache took pages as they were queued; one whose write failed is not the
             // file's, so reads go to the file until the owner reopens it.
@@ -971,6 +1220,8 @@ impl<F: BlockFile> Store<F> {
         generation: u64,
         payload: &[u8],
     ) -> Result<(), Error> {
+        blocking_allowed("a synchronous store page write in a runtime task")?;
+        self.admission_open()?;
         if self.fenced {
             return Err(io(
                 "write a store page",
@@ -994,6 +1245,8 @@ impl<F: BlockFile> Store<F> {
         let started = self.timed.then(std::time::Instant::now);
         let written = self
             .file
+            .as_ref()
+            .ok_or_else(Self::original_missing)?
             .write_all_at(self.buf.as_slice(), offset)
             .map_err(|e| io("write a store page", e));
         self.io.write_ns = self.io.write_ns.saturating_add(elapsed_ns(started));
@@ -1011,6 +1264,8 @@ impl<F: BlockFile> Store<F> {
     }
 
     fn sync(&mut self) -> Result<(), Error> {
+        blocking_allowed("a synchronous store flush in a runtime task")?;
+        self.admission_open()?;
         // A flush makes durable only the writes completed when it is issued: every run in
         // flight is answered first, and a batch still out here is refused, not flushed past (a
         // batch counts as out until its answer is taken, so the check is exact).
@@ -1022,7 +1277,12 @@ impl<F: BlockFile> Store<F> {
             ));
         }
         self.io.syncs = self.io.syncs.saturating_add(1);
-        let synced = self.file.sync_data().map_err(|e| io("flush a store", e));
+        let synced = self
+            .file
+            .as_ref()
+            .ok_or_else(Self::original_missing)?
+            .sync_data()
+            .map_err(|e| io("flush a store", e));
         self.fence(synced)
     }
 
@@ -1050,7 +1310,7 @@ impl<F: BlockFile> Store<F> {
             Some(b) => b,
             None => {
                 self.io.buffers_fresh = self.io.buffers_fresh.saturating_add(1);
-                Self::run_buf(&self.file, self.config)?
+                Self::run_buf(self.buf.alignment(), self.config)?
             }
         };
         self.io.buffers_taken = self.io.buffers_taken.saturating_add(1);
@@ -1119,7 +1379,17 @@ impl<F: BlockFile> Store<F> {
             buf: self.take_buf()?,
             first: 0,
             pages: 0,
+            job_ordinal: 0,
         })
+    }
+
+    fn current_run_job(&self, run: &Run) -> Result<(), Error> {
+        if run.pages > 0 && run.job_ordinal != self.job_ordinal {
+            return Err(Error::InvalidArgument {
+                what: "a nonempty page run from an earlier worker job",
+            });
+        }
+        Ok(())
     }
 
     /// Takes back a run its writer is done with: its pages written, its buffer for the next.
@@ -1133,10 +1403,234 @@ impl<F: BlockFile> Store<F> {
     /// not continuing the run writes the run out first ([`Self::write_run`]), and a full extent
     /// writes it.
     pub fn queue_page(&mut self, run: &mut Run, address: u64, payload: &[u8]) -> Result<(), Error> {
+        blocking_allowed("a synchronous store page queue in a runtime task")?;
+        self.admission_open()?;
+        self.checkpoint_idle()?;
+        if self.fenced {
+            return Err(io(
+                "queue a store page",
+                "the store was fenced by a failed write or flush",
+            ));
+        }
         let started = self.timed.then(std::time::Instant::now);
         let queued = self.queue_page_timed(run, address, payload);
         self.io.queue_ns = self.io.queue_ns.saturating_add(elapsed_ns(started));
         queued
+    }
+
+    /// Accepts one node page without waiting for output credit. False leaves this page
+    /// unaccepted; a full older run remains owned by its caller across the wait.
+    pub(crate) fn queue_page_paced(
+        &mut self,
+        run: &mut Run,
+        address: u64,
+        payload: &[u8],
+    ) -> Result<bool, Error> {
+        self.checkpoint_idle()?;
+        let generation = self
+            .durable
+            .generation
+            .checked_add(1)
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        self.queue_kind_paced(run, address, Kind::Node, generation, payload)
+    }
+
+    /// Accepts one page into the borrowed run, yielding for an older run's output credit.
+    /// Cancellation before acceptance retains that older run. Once this page is accepted,
+    /// the call returns without another wait; `write_run_async` dispatches the retained run.
+    pub async fn queue_page_async(
+        &mut self,
+        run: &mut Run,
+        address: u64,
+        payload: &[u8],
+    ) -> Result<(), Error> {
+        loop {
+            std::future::poll_fn(|cx| std::task::Poll::Ready(write_context(cx))).await?;
+            if self.queue_page_paced(run, address, payload)? {
+                return Ok(());
+            }
+            self.write_credit().await?;
+        }
+    }
+
+    fn queue_kind_paced(
+        &mut self,
+        run: &mut Run,
+        address: u64,
+        kind: Kind,
+        generation: u64,
+        payload: &[u8],
+    ) -> Result<bool, Error> {
+        self.async_writer()?;
+        let extent = self.extent_of(address);
+        let held = if kind == Kind::Superblock {
+            address == (generation & 1)
+        } else {
+            extent != 0 && self.alloc.is_held(extent)
+        };
+        if !held || payload.len() > self.page_capacity() {
+            return Err(Error::InvalidArgument {
+                what: "a paced page outside its held extent or page capacity",
+            });
+        }
+        self.current_run_job(run)?;
+        let continues = run.pages > 0
+            && run.pages < self.config.extent_pages
+            && run.first.checked_add(u64::from(run.pages)) == Some(address)
+            && self.extent_of(run.first) == extent;
+        if !continues {
+            if !self.write_run_paced(run)? {
+                return Ok(false);
+            }
+            run.first = address;
+        }
+        let at = usize::try_from(run.pages)
+            .ok()
+            .and_then(|n| n.checked_mul(self.config.page_size))
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        let page = run
+            .buf
+            .as_mut_slice()
+            .get_mut(
+                at..at
+                    .checked_add(self.config.page_size)
+                    .ok_or(corrupt(Malformed::TooLarge))?,
+            )
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        let end = HEADER
+            .checked_add(payload.len())
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        page.get_mut(HEADER..end)
+            .ok_or(corrupt(Malformed::TooLarge))?
+            .copy_from_slice(payload);
+        page::seal(page, address, kind, generation, payload.len())?;
+        if let Some(cache) = self.cache.as_mut() {
+            if kind == Kind::Node {
+                cache.insert(address, payload);
+            } else {
+                cache.forget(address);
+            }
+        }
+        if run.pages == 0 {
+            run.job_ordinal = self.job_ordinal;
+        }
+        run.pages = run
+            .pages
+            .checked_add(1)
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        // Dispatch is a separate acceptance boundary: this page already belongs to the
+        // run even when it filled the extent and the attachment has no credit yet.
+        Ok(true)
+    }
+
+    /// Dispatches an attached run without waiting. False preserves both its page count
+    /// and buffer. A successful queue admission uses the existing whole-run budget.
+    pub(crate) fn write_run_paced(&mut self, run: &mut Run) -> Result<bool, Error> {
+        self.async_writer()?;
+        if run.pages == 0 {
+            return Ok(true);
+        }
+        self.current_run_job(run)?;
+        if !self.alloc.is_held(self.extent_of(run.first)) {
+            return Err(Error::InvalidArgument {
+                what: "a page run written outside a held extent",
+            });
+        }
+        self.reap()?;
+        let run_bytes = self.write_reservation_for(None)?;
+        let Some(writer) = self.writer.as_ref() else {
+            return Err(io("dispatch paced pages", "no issuer attached"));
+        };
+        let reserve = usize::from(writer.read_wanted && writer.attached.batches() >= 2);
+        let direct = writer.queued.is_empty()
+            && writer.attached.out().saturating_add(reserve) < writer.attached.batches();
+        if !direct && writer.queued.len() >= writer.queue_most {
+            return Ok(false);
+        }
+        let warm = if direct {
+            0
+        } else {
+            writer
+                .queued
+                .len()
+                .checked_add(1)
+                .and_then(|n| n.checked_mul(run_bytes))
+                .ok_or(corrupt(Malformed::TooLarge))?
+        };
+        let bytes = usize::try_from(run.pages)
+            .ok()
+            .and_then(|n| n.checked_mul(self.config.page_size))
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        let offset = Self::offset_in(self.config, run.first)?;
+        let past = Self::past(offset, bytes)?;
+        let pages = u64::from(run.pages);
+        let fresh = self.take_buf()?;
+        let mut buf = std::mem::replace(&mut run.buf, fresh);
+        if let Err(error) = buf.set_len(bytes) {
+            let spare = std::mem::replace(&mut run.buf, buf);
+            self.give_buf(spare);
+            return Err(io("cut paced pages to their run", error));
+        }
+        let queued = Queued {
+            buf,
+            offset,
+            first: run.first,
+            end: run
+                .first
+                .checked_add(pages)
+                .ok_or(corrupt(Malformed::TooLarge))?,
+            past,
+        };
+        run.pages = 0;
+        self.io.writes = self.io.writes.saturating_add(1);
+        self.io.pages_written = self.io.pages_written.saturating_add(pages);
+        if direct {
+            self.issue(queued)?;
+        } else if let Some(writer) = self.writer.as_mut() {
+            writer.queued.push_back(queued);
+            self.warm_write_bytes = self.warm_write_bytes.max(warm);
+            self.io.runs_queued = self.io.runs_queued.saturating_add(1);
+            let n = writer.queued.len();
+            self.io.runs_queued_most = self
+                .io
+                .runs_queued_most
+                .max(u64::try_from(n).unwrap_or(u64::MAX));
+            self.queue_peak = self.queue_peak.max(n);
+        }
+        Ok(true)
+    }
+
+    /// Dispatches the borrowed run through the issuer, yielding for actual output credit.
+    /// A cancelled wait leaves its unsubmitted pages owned by the same run. Accepted
+    /// transfers remain owned by the Store until completion, independently of this borrow.
+    pub async fn write_run_async(&mut self, run: &mut Run) -> Result<(), Error> {
+        loop {
+            std::future::poll_fn(|cx| std::task::Poll::Ready(write_context(cx))).await?;
+            self.checkpoint_idle()?;
+            if self.write_run_paced(run)? {
+                return Ok(());
+            }
+            self.write_credit().await?;
+        }
+    }
+
+    async fn write_credit(&mut self) -> Result<(), Error> {
+        let answered = {
+            let mut completion = std::pin::pin!(self.wait_completion());
+            std::future::poll_fn(|cx| {
+                if let Err(error) = write_context(cx) {
+                    return std::task::Poll::Ready(Err(error));
+                }
+                std::future::Future::poll(completion.as_mut(), cx)
+            })
+            .await?
+        };
+        if !answered {
+            return Err(Error::InvalidArgument {
+                what: "an async page write without an outstanding completion",
+            });
+        }
+        Ok(())
     }
 
     fn queue_page_timed(
@@ -1156,6 +1650,7 @@ impl<F: BlockFile> Store<F> {
                 what: "a page payload longer than the page",
             });
         }
+        self.current_run_job(run)?;
         let continues = run.pages > 0
             && run.first.checked_add(u64::from(run.pages)) == Some(address)
             && self.extent_of(run.first) == extent;
@@ -1185,6 +1680,9 @@ impl<F: BlockFile> Store<F> {
         if let Some(c) = self.cache.as_mut() {
             c.insert(address, payload);
         }
+        if run.pages == 0 {
+            run.job_ordinal = self.job_ordinal;
+        }
         run.pages = run.pages.saturating_add(1);
         // The run ends with its extent.
         if self
@@ -1203,6 +1701,9 @@ impl<F: BlockFile> Store<F> {
 
     /// Writes `run`'s queued pages out.
     pub fn write_run(&mut self, run: &mut Run) -> Result<(), Error> {
+        blocking_allowed("a synchronous store run write in a runtime task")?;
+        self.admission_open()?;
+        self.checkpoint_idle()?;
         if run.pages == 0 {
             return Ok(());
         }
@@ -1211,6 +1712,12 @@ impl<F: BlockFile> Store<F> {
                 "write a store page",
                 "the store was fenced by a failed write or flush",
             ));
+        }
+        self.current_run_job(run)?;
+        if !self.alloc.is_held(self.extent_of(run.first)) {
+            return Err(Error::InvalidArgument {
+                what: "a page run written outside a held extent",
+            });
         }
         let bytes = usize::try_from(run.pages)
             .ok()
@@ -1233,6 +1740,8 @@ impl<F: BlockFile> Store<F> {
             .ok_or(corrupt(Malformed::TooLarge))
             .and_then(|b| {
                 self.file
+                    .as_ref()
+                    .ok_or_else(Self::original_missing)?
                     .write_all_at(b, offset)
                     .map_err(|e| io("write a store page run", e))
             });
@@ -1257,6 +1766,7 @@ impl<F: BlockFile> Store<F> {
         offset: u64,
         past: u64,
     ) -> Result<(), Error> {
+        let run_bytes = self.write_reservation_for(None)?;
         self.reap()?;
         let fresh = self.take_buf()?;
         let mut buf = std::mem::replace(&mut run.buf, fresh);
@@ -1269,12 +1779,34 @@ impl<F: BlockFile> Store<F> {
             end: first.saturating_add(pages),
             past,
         };
+        let warm = self
+            .writer
+            .as_ref()
+            .filter(|w| w.attached.out() >= w.attached.batches() || !w.queued.is_empty())
+            .map(|w| {
+                w.queued
+                    .len()
+                    .checked_add(1)
+                    .and_then(|n| n.min(w.queue_most).checked_mul(run_bytes))
+            });
+        let warm = match warm {
+            Some(Some(bytes)) => bytes,
+            Some(None) => {
+                self.give_buf(queued.buf);
+                return Err(Error::LimitExceeded {
+                    what: "queued write buffer bytes",
+                    limit: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+                });
+            }
+            None => 0,
+        };
         let Some(w) = self.writer.as_mut() else {
             return Err(io("submit a store page run", "no issuer attached"));
         };
         let full = w.attached.out() >= w.attached.batches();
         if full && w.queued.len() < w.queue_most {
             w.queued.push_back(queued);
+            self.warm_write_bytes = self.warm_write_bytes.max(warm);
             let n = u64::try_from(w.queued.len()).unwrap_or(u64::MAX);
             self.io.runs_queued = self.io.runs_queued.saturating_add(1);
             self.io.runs_queued_most = self.io.runs_queued_most.max(n);
@@ -1286,6 +1818,7 @@ impl<F: BlockFile> Store<F> {
         if full || !w.queued.is_empty() {
             // Runs go out in the order they were written: this one after those queued.
             w.queued.push_back(queued);
+            self.warm_write_bytes = self.warm_write_bytes.max(warm);
             let mut t = None;
             while self
                 .writer
@@ -1364,6 +1897,9 @@ impl<F: BlockFile> Store<F> {
     /// pages in flight, the file's end moves past it, and its buffer is kept for a run. A
     /// failed write fences the store. Returns whether an answer was taken.
     fn answer(&mut self, wait: bool) -> Result<bool, Error> {
+        if wait {
+            blocking_allowed("a synchronous issuer answer in a runtime task")?;
+        }
         let Some(w) = self.writer.as_mut() else {
             return Ok(false);
         };
@@ -1415,15 +1951,40 @@ impl<F: BlockFile> Store<F> {
         &mut self,
         answered: Result<Option<(u64, Answer)>, Error>,
     ) -> Result<bool, Error> {
-        let Some(numbered) = self.fence(answered)? else {
-            return Ok(false);
-        };
-        self.route(numbered)
+        let result = self.fence(answered).and_then(|answer| match answer {
+            Some(numbered) => self.route(numbered),
+            None => Ok(false),
+        });
+        if let Err(error) = &result
+            && let Some(checkpoint) = self.checkpoint.as_mut()
+        {
+            checkpoint.error.get_or_insert(error.clone());
+            checkpoint.phase = CheckpointPhase::Failed;
+        }
+        result
     }
 
     /// Routes one answer: a read's to its span (or its buffers to the pool when the span is
     /// gone), a write's run out of flight and the file's end past it.
     fn route(&mut self, (number, answer): (u64, Answer)) -> Result<bool, Error> {
+        if self
+            .writer
+            .as_ref()
+            .is_some_and(|w| w.flush.as_ref().is_some_and(|f| f.number == number))
+        {
+            let result = match answer {
+                Ok(batch) => {
+                    self.give_transfers(batch);
+                    Ok(())
+                }
+                Err(error) => self.fence(Err(io("flush a store", error))),
+            };
+            if let Some(flush) = self.writer.as_mut().and_then(|w| w.flush.as_mut()) {
+                flush.result = Some(result.clone());
+            }
+            result?;
+            return Ok(true);
+        }
         // A read's answer: kept for its span, or its buffers pooled when the span is gone. A
         // failed read fails only the read that asked for it.
         let read = self.writer.as_mut().and_then(|w| {
@@ -1525,6 +2086,18 @@ impl<F: BlockFile> Store<F> {
     /// Waits until no run in flight writes a page in `[first, end)`: a read of those pages then
     /// reads what was written.
     fn settle(&mut self, first: u64, end: u64) -> Result<(), Error> {
+        if self.writer.as_ref().is_some_and(|writer| {
+            writer
+                .in_flight
+                .iter()
+                .any(|&(_, a, b, _)| a < end && first < b)
+                || writer
+                    .queued
+                    .iter()
+                    .any(|run| run.first < end && first < run.end)
+        }) {
+            blocking_allowed("a synchronous store extent wait in a runtime task")?;
+        }
         self.reap()?;
         // A run queued counts as in flight: its pages are not in the file yet. Each answer
         // frees room the queue's oldest takes, so the loop ends within the queue and the batches.
@@ -1544,7 +2117,14 @@ impl<F: BlockFile> Store<F> {
     /// to the pool. A maintenance worker's job ends here, and the shard may write the job's
     /// extents again once it has the result, so nothing may still be in flight then.
     pub fn drain(&mut self) -> Result<(), Error> {
-        let mut first = None;
+        if self
+            .writer
+            .as_ref()
+            .is_some_and(|writer| !writer.queued.is_empty() || writer.attached.out() > 0)
+        {
+            blocking_allowed("a synchronous store drain in a runtime task")?;
+        }
+        let mut first = self.drain_error.take();
         // Each pass takes one answer or ends: the runs out, and those queued before it, bound it.
         loop {
             if let Err(error) = self.pump() {
@@ -1568,16 +2148,81 @@ impl<F: BlockFile> Store<F> {
                 }
             }
         }
-        if let Some(error) = first {
+        if let Some(error) = self.fence_error.clone().or(first) {
             return Err(error);
         }
-        if self.fenced {
+        if self.fenced && !self.checkpoint_aborted {
             return Err(io(
                 "drain store page runs",
                 "the store was fenced by a failed write or flush",
             ));
         }
         Ok(())
+    }
+
+    /// Advances terminal draining without waiting on a batch. A failed write fences new
+    /// submissions, but every older issued batch is still received before its first failure
+    /// is returned. False retains the remaining work; the caller awaits only when a batch
+    /// is out, otherwise it resumes a bounded slice of queued work.
+    pub(crate) fn drain_paced(&mut self) -> Result<bool, Error> {
+        // Each pass consumes one admitted batch, or stops at the first not yet answered.
+        let bound = self
+            .writer
+            .as_ref()
+            .map_or(0, |w| w.attached.out().saturating_add(w.queued.len()));
+        for _ in 0..=bound {
+            if let Err(error) = self.pump() {
+                self.drain_error.get_or_insert(error);
+            }
+            if self.fenced {
+                while let Some(run) = self.writer.as_mut().and_then(|w| w.queued.pop_front()) {
+                    self.give_buf(run.buf);
+                }
+            }
+            let out = self.writer.as_ref().map_or(0, |w| w.attached.out());
+            if out == 0 || self.drain_closed {
+                break;
+            }
+            match self.answer(false) {
+                Ok(true) => {}
+                Ok(false) => return Ok(false),
+                Err(error) => {
+                    self.drain_error.get_or_insert(error);
+                    // A failed batch consumes its answer. A closed issuer channel does
+                    // not: the issuer's stop has already retired its in-flight transfers.
+                    if self.writer.as_ref().map_or(0, |w| w.attached.out()) == out {
+                        self.drain_closed = true;
+                    }
+                }
+            }
+        }
+        let queued = self.writer.as_ref().is_some_and(|w| !w.queued.is_empty());
+        if queued || (self.io_outstanding() && !self.drain_closed) {
+            return Ok(false);
+        }
+        if let Some(error) = self.fence_error.clone().or(self.drain_error.take()) {
+            return Err(error);
+        }
+        if self.fenced && !self.checkpoint_aborted {
+            return Err(io(
+                "drain store page runs",
+                "the store was fenced by a failed write or flush",
+            ));
+        }
+        Ok(true)
+    }
+
+    /// Retires the owner's device duplicates after terminal draining, yielding even when a
+    /// different attachment's held write delays a worker from dropping this file.
+    pub(crate) async fn retire_async(&mut self) -> Result<(), Error> {
+        let Some(writer) = self.writer.as_mut() else {
+            return Ok(());
+        };
+        writer
+            .attached
+            .retire_async()
+            .await
+            .map_err(|error| io("retire a store attachment", error))
     }
 
     /// Spares the store `bytes` of write memory for runs waiting for the device's issuer
@@ -1596,6 +2241,35 @@ impl<F: BlockFile> Store<F> {
         self.config
             .page_size
             .saturating_mul(usize::try_from(self.config.extent_pages).unwrap_or(usize::MAX))
+    }
+
+    /// Fixed output roles in whole runs: one active run without an issuer; attached batches,
+    /// the active replacement and one submit handoff with an issuer. Submit takes its spare
+    /// before waiting for a full attachment, so the latter two can coexist. Input spans,
+    /// other Builder working runs, point/page buffers, feed buffers and branch/memtable metadata
+    /// are outside this scope, as are attachment/channel metadata and worker stacks.
+    pub(crate) fn write_reservation_for(&self, batches: Option<usize>) -> Result<usize, Error> {
+        let refused = || Error::LimitExceeded {
+            what: "fixed write buffer bytes",
+            limit: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+        };
+        let extents = usize::try_from(self.config.extent_pages).map_err(|_| refused())?;
+        let run = self
+            .config
+            .page_size
+            .checked_mul(extents)
+            .ok_or_else(refused)?;
+        let roles = match batches {
+            Some(n) => n.checked_add(2).ok_or_else(refused)?,
+            None => 1,
+        };
+        run.checked_mul(roles).ok_or_else(refused)
+    }
+
+    /// Output queue buffers retained warm after their run is answered. The fixed roles above
+    /// already include the single transient submit handoff, which is not charged a second time.
+    pub(crate) fn warm_write_bytes(&self) -> usize {
+        self.warm_write_bytes
     }
 
     /// The write memory spared now, in bytes: whole runs.
@@ -1635,9 +2309,27 @@ impl<F: BlockFile> Store<F> {
     where
         F: 'static,
     {
+        blocking_allowed("a synchronous store attachment in a runtime task")?;
+        self.allocator_available()?;
+        if self.spans_lent > 0
+            || self.writer.as_ref().is_some_and(|writer| {
+                !writer.reads.is_empty() || !writer.parked.is_empty() || !writer.orphans.is_empty()
+            })
+        {
+            return Err(Error::InvalidArgument {
+                what: "a store reattached while demand read owners remain",
+            });
+        }
+        let mut orphans = Vec::new();
+        orphans
+            .try_reserve_exact(batches)
+            .map_err(|error| io("reserve canceled read numbers", error))?;
         self.drain()?;
         let attached = attacher
-            .attach_deep(&self.file, batches)
+            .attach_deep(
+                self.file.as_ref().ok_or_else(Self::original_missing)?,
+                batches,
+            )
             .map_err(|e| io("attach a store to its device's issuer", e))?;
         self.writer = Some(Writer {
             attached,
@@ -1646,16 +2338,68 @@ impl<F: BlockFile> Store<F> {
             queue_most: self.write_budget_runs,
             reads: Vec::with_capacity(batches),
             parked: Vec::with_capacity(batches),
-            orphans: Vec::new(),
+            orphans,
             transfers: Vec::with_capacity(batches),
             read_wanted: false,
+            flush: None,
         });
         Ok(())
+    }
+
+    fn original_missing() -> Error {
+        Error::InvalidArgument {
+            what: "original store file owned by native retirement",
+        }
+    }
+
+    pub(crate) fn prepare_original_retirement_watch(&mut self) -> Result<OriginalPhysical, Error> {
+        blocking_allowed("original file retirement setup on a runtime")?;
+        self.allocator_available()?;
+        if self.file.is_none() || self.original.is_some() {
+            return Err(Self::original_missing());
+        }
+        self.writer
+            .as_mut()
+            .ok_or(Error::InvalidArgument {
+                what: "original file retirement without an attachment",
+            })?
+            .attached
+            .prepare_retirement_watch()
+            .map(OriginalPhysical)
+            .map_err(|error| io("prepare original file physical retirement", error))
+    }
+
+    pub(crate) fn adopt_original<W>(
+        &mut self,
+        adoption: &mut OriginalAdoption<F, W>,
+        physical: W,
+    ) -> Result<(), Error>
+    where
+        F: Send + 'static,
+        W: OriginalFence,
+    {
+        blocking_allowed("original file adoption on a runtime")?;
+        self.allocator_available()?;
+        if self.file.is_none() || self.original.is_some() {
+            return Err(Self::original_missing());
+        }
+        match adoption.adopt(&mut self.file, physical) {
+            Ok(original) => {
+                self.original = Some(original);
+                Ok(())
+            }
+            Err((physical, error)) => {
+                // A cold refusal leaves the complete original in self.file.
+                drop(physical);
+                Err(io("adopt a store original file", error))
+            }
+        }
     }
 
     /// Writes a node page at `address`, in a held extent past the superblocks', for the next
     /// checkpoint. It is durable once that checkpoint is.
     pub fn write_page(&mut self, address: u64, payload: &[u8]) -> Result<(), Error> {
+        self.checkpoint_idle()?;
         let extent = self.extent_of(address);
         if extent == 0 || !self.alloc.is_held(extent) {
             return Err(Error::InvalidArgument {
@@ -1686,6 +2430,7 @@ impl<F: BlockFile> Store<F> {
         if self.queued_page(address, out)? {
             return Ok(());
         }
+        blocking_allowed("a synchronous store page miss in a runtime task")?;
         if self.cache.as_ref().is_some_and(|c| c.in_ghost(address)) {
             self.io.ghost_misses = self.io.ghost_misses.saturating_add(1);
         }
@@ -1697,6 +2442,8 @@ impl<F: BlockFile> Store<F> {
         let started = Some(std::time::Instant::now());
         let read = self
             .file
+            .as_ref()
+            .ok_or_else(Self::original_missing)?
             .read_exact_at(self.buf.as_mut_slice(), offset)
             .map_err(|e| io("read a store page", e));
         let ns = elapsed_ns(started);
@@ -1747,6 +2494,42 @@ impl<F: BlockFile> Store<F> {
         })
     }
 
+    /// Lends a resident payload without issuing or waiting for a device read. A miss leaves
+    /// the callback untouched, so an async reader can acquire its demand owners afterward.
+    pub(crate) fn with_resident_page<R>(
+        &mut self,
+        address: u64,
+        read: impl FnOnce(&[u8]) -> Result<R, Error>,
+    ) -> Result<Option<R>, Error> {
+        if self
+            .cache
+            .as_ref()
+            .is_some_and(|cache| cache.contains(address))
+            && let Some(payload) = self.cache.as_mut().and_then(|cache| cache.get_ref(address))
+        {
+            return read(payload).map(Some);
+        }
+        if self.fenced {
+            return Ok(None);
+        }
+        let size = self.config.page_size;
+        let Some(page) = self.writer.as_ref().and_then(|writer| {
+            let run = writer
+                .queued
+                .iter()
+                .find(|run| run.first <= address && address < run.end)?;
+            let at = usize::try_from(address.checked_sub(run.first)?)
+                .ok()?
+                .checked_mul(size)?;
+            run.buf.as_slice().get(at..at.checked_add(size)?)
+        }) else {
+            return Ok(None);
+        };
+        let payload = node_payload_ref(page, address)?;
+        self.io.queued_reads = self.io.queued_reads.saturating_add(1);
+        read(payload).map(Some)
+    }
+
     /// Lends page `address`'s payload to `read`: in place from the cache when it holds the page,
     /// else read as [`Self::read_page`] reads it (and cached), into a buffer the store keeps.
     /// A point read copies only what it takes from the page, not the page.
@@ -1770,29 +2553,57 @@ impl<F: BlockFile> Store<F> {
     /// A span for a scan, which may stop after a page: its first read takes one page, and its
     /// reads double while the scan runs on.
     pub fn span(&mut self) -> Result<Span, Error> {
-        Ok(Span {
-            buf: self.take_buf()?,
-            first: 0,
-            pages: 0,
-            ahead: 1,
-            floor: 1,
-            pending: VecDeque::new(),
-            depth: 1,
-            prepared: None,
-        })
+        self.span_with_floor(1)
     }
 
     /// A span for a compaction, which reads its inputs to their end: every read takes the rest
     /// of its extent.
     pub fn span_sequential(&mut self) -> Result<Span, Error> {
-        let extent = self.config.extent_pages;
+        self.span_with_floor(self.config.extent_pages)
+    }
+
+    fn span_with_floor(&mut self, floor: u32) -> Result<Span, Error> {
+        let lent = self.spans_lent.checked_add(1).ok_or(Error::LimitExceeded {
+            what: "borrowed span metadata",
+            limit: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+        })?;
+        let most = self.spans_most_lent.max(lent);
+        self.span_pending
+            .try_reserve(most.saturating_sub(self.span_pending.len()))
+            .map_err(|error| io("reserve span metadata returns", error))?;
+        let pooled = self.span_pending.pop();
+        let was_pooled = pooled.is_some();
+        let mut pending = pooled.unwrap_or_default();
+        let batches = self
+            .writer
+            .as_ref()
+            .map_or(1, |writer| writer.attached.batches());
+        if pending.capacity() < batches
+            && let Err(error) = pending.try_reserve(batches.saturating_sub(pending.len()))
+        {
+            if was_pooled {
+                self.span_pending.push(pending);
+            }
+            return Err(io("reserve a span's pending reads", error));
+        }
+        let buf = match self.take_buf() {
+            Ok(buf) => buf,
+            Err(error) => {
+                if was_pooled {
+                    self.span_pending.push(pending);
+                }
+                return Err(error);
+            }
+        };
+        self.spans_lent = lent;
+        self.spans_most_lent = most;
         Ok(Span {
-            buf: self.take_buf()?,
+            buf,
             first: 0,
             pages: 0,
-            ahead: extent,
-            floor: extent,
-            pending: VecDeque::new(),
+            ahead: floor,
+            floor,
+            pending,
             depth: 1,
             prepared: None,
         })
@@ -1805,6 +2616,11 @@ impl<F: BlockFile> Store<F> {
         }
         while let Some((number, ..)) = span.pending.pop_front() {
             self.release_read(number);
+        }
+        self.spans_lent = self.spans_lent.saturating_sub(1);
+        if self.span_pending.len() < self.spans_most_lent {
+            // span_with_floor reserved this slot before lending its metadata.
+            self.span_pending.push(span.pending);
         }
         self.give_buf(span.buf);
     }
@@ -1825,6 +2641,200 @@ impl<F: BlockFile> Store<F> {
         }
     }
 
+    /// Reserve the configured attachment's pending-read roles before a batch is published.
+    fn reserve_span_reads(&self, span: &mut Span) -> Result<(), Error> {
+        let batches = self
+            .writer
+            .as_ref()
+            .map_or(1, |writer| writer.attached.batches());
+        if span.pending.capacity() < batches {
+            span.pending
+                .try_reserve(batches.saturating_sub(span.pending.len()))
+                .map_err(|error| io("reserve a span's pending reads", error))?;
+        }
+        Ok(())
+    }
+
+    /// A demand page through the issuer, even for a one-page foreground span. False
+    /// leaves `out` and the current span page unchanged; the owned read resumes after
+    /// its numbered answer. Memory hits and every new device page keep Node validation.
+    pub(crate) fn read_page_paced(
+        &mut self,
+        span: &mut Span,
+        address: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<bool, Error> {
+        self.async_writer()?;
+        self.reserve_span_reads(span)?;
+        self.reap()?;
+        let mut landed = false;
+        if let Some(index) = span.pending_for(address) {
+            let number = span
+                .pending
+                .get(index)
+                .map(|&(number, ..)| number)
+                .ok_or(corrupt(Malformed::Truncated))?;
+            let answered = self.writer.as_mut().and_then(|writer| {
+                let at = writer
+                    .parked
+                    .iter()
+                    .position(|&(ready, _)| ready == number)?;
+                Some(writer.parked.swap_remove(at).1)
+            });
+            let Some(answered) = answered else {
+                return Ok(false);
+            };
+            for _ in 0..index {
+                if let Some((number, ..)) = span.pending.pop_front() {
+                    self.release_read(number);
+                }
+            }
+            let (_, first, pages, _) = span
+                .pending
+                .pop_front()
+                .ok_or(corrupt(Malformed::Truncated))?;
+            let mut batch = answered?;
+            if batch.len() != 1 {
+                self.give_transfers(batch);
+                return Err(corrupt(Malformed::CountMismatch));
+            }
+            let taken = batch.pop();
+            if let Some(writer) = self.writer.as_mut()
+                && writer.transfers.len() < writer.transfers.capacity()
+            {
+                writer.transfers.push(batch);
+            }
+            let (mut buf, _) = taken.ok_or(corrupt(Malformed::Truncated))?;
+            if let Err(error) = buf.set_len(buf.capacity()) {
+                self.give_buf(buf);
+                return Err(io("size a paced demand page", error));
+            }
+            let old = std::mem::replace(&mut span.buf, buf);
+            self.give_buf(old);
+            span.first = first;
+            span.pages = pages;
+            landed = true;
+        }
+        if let Some(index) = address
+            .checked_sub(span.first)
+            .filter(|&index| index < u64::from(span.pages))
+        {
+            let at = usize::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_mul(self.config.page_size))
+                .ok_or(corrupt(Malformed::TooLarge))?;
+            let end = at
+                .checked_add(self.config.page_size)
+                .ok_or(corrupt(Malformed::TooLarge))?;
+            let page = span
+                .buf
+                .as_slice()
+                .get(at..end)
+                .ok_or(corrupt(Malformed::Truncated))?;
+            let payload = node_payload_ref(page, address)?;
+            if landed && let Some(cache) = self.cache.as_mut() {
+                cache.insert(address, payload);
+            }
+            out.extend_from_slice(payload);
+            return Ok(true);
+        }
+        if let Some((prepared, page)) = span.prepared.take() {
+            if prepared == address {
+                out.extend_from_slice(&page);
+                self.give_page(page);
+                return Ok(true);
+            }
+            self.give_page(page);
+        }
+        if self
+            .cache
+            .as_mut()
+            .is_some_and(|cache| cache.get(address, out))
+        {
+            self.io.span_cache_hits = self.io.span_cache_hits.saturating_add(1);
+            return Ok(true);
+        }
+        if self.queued_page(address, out)? {
+            return Ok(true);
+        }
+        while let Some((number, ..)) = span.pending.pop_front() {
+            self.release_read(number);
+        }
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| io("read a paced demand page", "no issuer attached"))?;
+        if writer
+            .in_flight
+            .iter()
+            .any(|&(_, first, end, _)| first <= address && address < end)
+            || writer.attached.out() >= writer.attached.batches()
+        {
+            writer.read_wanted = true;
+            return Ok(false);
+        }
+        let offset = Self::offset_in(self.config, address)?;
+        if Self::past(offset, self.config.page_size)? > self.end {
+            return Err(corrupt(Malformed::Truncated));
+        }
+        let mut buf = self.take_buf()?;
+        if let Err(error) = buf.set_len(self.config.page_size) {
+            self.give_buf(buf);
+            return Err(io("size a paced demand page", error));
+        }
+        let Some(writer) = self.writer.as_mut() else {
+            self.give_buf(buf);
+            return Err(io("read a paced demand page", "no issuer attached"));
+        };
+        let mut batch = writer.transfers.pop().unwrap_or_default();
+        batch.push((buf, offset));
+        let number = match writer.attached.submit_reads(batch) {
+            Ok(number) => number,
+            Err(error) => {
+                self.lent = self.lent.saturating_sub(1);
+                return Err(io("submit a paced demand page", error));
+            }
+        };
+        writer.reads.push(number);
+        writer.read_wanted = false;
+        span.pending.push_back((number, address, 1, false));
+        self.io.reads = self.io.reads.saturating_add(1);
+        self.io.pages_read = self.io.pages_read.saturating_add(1);
+        self.io.device_reads = self.io.device_reads.saturating_add(1);
+        Ok(false)
+    }
+
+    /// Reads a demand page without a blocking fallback. The numbered read and current
+    /// span remain owned across each borrowed completion wait; its caller owns cleanup.
+    pub(crate) async fn read_page_async(
+        &mut self,
+        span: &mut Span,
+        address: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<(), Error> {
+        loop {
+            std::future::poll_fn(|cx| std::task::Poll::Ready(page_context(cx))).await?;
+            if self.read_page_paced(span, address, out)? {
+                return Ok(());
+            }
+            let answered = {
+                let mut completion = std::pin::pin!(self.wait_completion());
+                std::future::poll_fn(|cx| {
+                    if let Err(error) = page_context(cx) {
+                        return std::task::Poll::Ready(Err(error));
+                    }
+                    std::future::Future::poll(completion.as_mut(), cx)
+                })
+                .await?
+            };
+            if !answered {
+                return Err(Error::InvalidArgument {
+                    what: "an async demand page without an outstanding completion",
+                });
+            }
+        }
+    }
+
     /// Hands the read of `address` and the rest of its extent to the device's issuer for a
     /// compaction's `span`, without waiting: the read [`Self::read_page_ahead`] would make
     /// when the compaction reaches it, made while it works through the extent before. Only a
@@ -1832,6 +2842,7 @@ impl<F: BlockFile> Store<F> {
     /// write still out or queued covers, and with no batch free the next one freed is kept for
     /// it.
     pub fn prefetch(&mut self, span: &mut Span, address: u64) -> Result<(), Error> {
+        self.admission_open()?;
         if span.floor <= 1
             || span.pending.len() >= span.depth
             || span.holds(address)
@@ -1851,6 +2862,7 @@ impl<F: BlockFile> Store<F> {
             u64::try_from(self.config.page_size).map_err(|_| corrupt(Malformed::TooLarge))?;
         let last = extent_end.min(self.end.checked_div(size).unwrap_or(0));
         let busy = self.first_queued(address, extent_end).is_some();
+        self.reserve_span_reads(span)?;
         let Some(w) = self.writer.as_mut() else {
             return Ok(());
         };
@@ -1905,6 +2917,34 @@ impl<F: BlockFile> Store<F> {
     /// once it has landed, rather than hold the put that paces it behind the device. A scan's
     /// span, or a store with no issuer, always reads at once.
     pub fn ready(&mut self, span: &mut Span, address: u64) -> Result<bool, Error> {
+        if hyper_rt::futures::current_task().is_some() {
+            self.async_writer()?;
+            self.reap()?;
+            if span.floor <= 1 {
+                let mut page = match span.prepared.take() {
+                    Some((prepared, page)) if prepared == address => {
+                        span.prepared = Some((prepared, page));
+                        return Ok(true);
+                    }
+                    Some((_, mut page)) => {
+                        page.clear();
+                        page
+                    }
+                    None => self.take_page(),
+                };
+                let ready = self.read_page_paced(span, address, &mut page);
+                match ready {
+                    Ok(true) => {
+                        span.prepared = Some((address, page));
+                        return Ok(true);
+                    }
+                    result => {
+                        self.give_page(page);
+                        return result;
+                    }
+                }
+            }
+        }
         if span.floor <= 1 || self.writer.is_none() || span.holds(address) {
             return Ok(true);
         }
@@ -2007,6 +3047,7 @@ impl<F: BlockFile> Store<F> {
             if !w.reads.contains(&number) {
                 return Err(io("claim a store page span read", "no such read is out"));
             }
+            blocking_allowed("an unanswered span claimed synchronously in a runtime task")?;
             self.answer(true)?;
         }
     }
@@ -2059,6 +3100,32 @@ impl<F: BlockFile> Store<F> {
         transfer: bool,
     ) -> Result<Option<std::ops::Range<usize>>, Error> {
         let pending = span.pending_for(address);
+        let memory = span
+            .prepared
+            .as_ref()
+            .is_some_and(|(ready, _)| *ready == address)
+            || span.holds(address)
+            || self
+                .cache
+                .as_ref()
+                .is_some_and(|cache| cache.contains(address))
+            || self
+                .first_queued(address, address.saturating_add(1))
+                .is_some();
+        if pending.is_none() && !memory {
+            blocking_allowed("a cold span read synchronously in a runtime task")?;
+        }
+        if let Some(number) = pending
+            .and_then(|index| span.pending.get(index))
+            .map(|&(number, ..)| number)
+            && !self
+                .writer
+                .as_ref()
+                .is_some_and(|writer| writer.parked.iter().any(|&(ready, _)| ready == number))
+        {
+            // Refuse before removing the pending read or replacing its current page.
+            blocking_allowed("an unanswered span read synchronously in a runtime task")?;
+        }
         if let Some((prepared, mut page)) = span.prepared.take() {
             let copied = prepared == address && pending.is_none() && !self.fenced;
             if copied {
@@ -2160,6 +3227,7 @@ impl<F: BlockFile> Store<F> {
 
     /// Reads `address` and the pages after it in its extent, up to the file's end, into `span`.
     fn fill(&mut self, span: &mut Span, address: u64) -> Result<(), Error> {
+        blocking_allowed("a synchronous store span read in a runtime task")?;
         let extent_pages = u64::from(self.config.extent_pages);
         let extent_end = self
             .extent_of(address)
@@ -2209,6 +3277,8 @@ impl<F: BlockFile> Store<F> {
             .ok_or(corrupt(Malformed::TooLarge))
             .and_then(|b| {
                 self.file
+                    .as_ref()
+                    .ok_or_else(Self::original_missing)?
                     .read_exact_at(b, offset)
                     .map_err(|e| io("read a store page span", e))
             });
@@ -2219,9 +3289,453 @@ impl<F: BlockFile> Store<F> {
         Ok(())
     }
 
+    fn admission_open(&self) -> Result<(), Error> {
+        if self.closing.is_some() {
+            Err(Error::InvalidArgument {
+                what: "new work after store finish began",
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn checkpoint_idle(&self) -> Result<(), Error> {
+        if self.checkpoint.is_some() {
+            Err(Error::InvalidArgument {
+                what: "allocator or writes changed during a retained checkpoint",
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn allocator_available(&self) -> Result<(), Error> {
+        self.admission_open()?;
+        self.allocator_idle()
+    }
+
+    fn allocator_idle(&self) -> Result<(), Error> {
+        self.checkpoint_idle()?;
+        if self.checkpoint_aborted {
+            return Err(Error::InvalidArgument {
+                what: "allocator changed after terminal checkpoint abandonment",
+            });
+        }
+        Ok(())
+    }
+
+    fn async_writer(&self) -> Result<(), Error> {
+        self.admission_open()?;
+        if self.fenced {
+            return Err(io(
+                "write paced store pages",
+                "the store was fenced by a failed write or flush",
+            ));
+        }
+        if self.writer.is_none() {
+            return Err(Error::InvalidArgument {
+                what: "paced store I/O without an attached issuer",
+            });
+        }
+        Ok(())
+    }
+
+    fn prepare_checkpoint(&mut self, root: Option<u64>, applied: u64) -> Result<Checkpoint, Error> {
+        self.async_writer()?;
+        if self.alloc.refs().is_empty() {
+            return Err(Error::InvalidArgument {
+                what: "a checkpoint on a granted worker store",
+            });
+        }
+        let generation = self
+            .durable
+            .generation
+            .checked_add(1)
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        let max_map = superblock::max_map_extents(self.page_capacity());
+        let per_extent = (self.page_capacity() / 4)
+            .checked_mul(
+                usize::try_from(self.config.extent_pages)
+                    .map_err(|_| corrupt(Malformed::TooLarge))?,
+            )
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        max_map
+            .checked_mul(per_extent)
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        // Validate every old reference before changing any. A duplicate would release the
+        // same map extent twice rather than describe a valid allocator snapshot.
+        for (at, &extent) in self.durable.map.iter().enumerate() {
+            if extent == 0
+                || !self.alloc.is_held(extent)
+                || self
+                    .durable
+                    .map
+                    .get(..at)
+                    .is_some_and(|old| old.contains(&extent))
+            {
+                return Err(corrupt(Malformed::OutOfRange));
+            }
+        }
+        let capacity = self.page_capacity();
+        self.checkpoint_payload
+            .try_reserve(capacity.saturating_sub(self.checkpoint_payload.len()))
+            .map_err(|_| Error::LimitExceeded {
+                what: "bytes of a checkpoint page",
+                limit: u64::try_from(capacity).unwrap_or(u64::MAX),
+            })?;
+        self.checkpoint_map.clear();
+        self.checkpoint_map
+            .try_reserve(max_map)
+            .map_err(|_| Error::LimitExceeded {
+                what: "allocator map extents a superblock names",
+                limit: u64::try_from(max_map).unwrap_or(u64::MAX),
+            })?;
+        let run = self.run()?;
+        let mut map = std::mem::take(&mut self.checkpoint_map);
+        while map
+            .len()
+            .checked_mul(per_extent)
+            .ok_or(corrupt(Malformed::TooLarge))?
+            < self.alloc.refs().len()
+        {
+            let allocated = if map.len() >= max_map {
+                Err(Error::LimitExceeded {
+                    what: "allocator map extents a superblock names",
+                    limit: u64::try_from(max_map).unwrap_or(u64::MAX),
+                })
+            } else {
+                self.alloc.allocate()
+            };
+            match allocated {
+                Ok(extent) => map.push(extent),
+                Err(mut error) => {
+                    for &extent in &map {
+                        if let Err(failed) = self.alloc.give_back(extent) {
+                            error = failed;
+                        }
+                    }
+                    self.checkpoint_map = map;
+                    self.give_run(run);
+                    return Err(error);
+                }
+            }
+        }
+        for &extent in &self.durable.map {
+            self.alloc.release(extent)?;
+        }
+        let mut payload = std::mem::take(&mut self.checkpoint_payload);
+        payload.clear();
+        Ok(Checkpoint {
+            root,
+            applied,
+            generation,
+            refs: self.alloc.refs().len(),
+            map,
+            payload,
+            run,
+            phase: CheckpointPhase::Map(0),
+            error: None,
+        })
+    }
+
+    fn checkpoint_flush(&mut self, number: &mut Option<u64>) -> Result<bool, Error> {
+        self.reap()?;
+        let Some(writer) = self.writer.as_mut() else {
+            return Err(io("flush a paced checkpoint", "no issuer attached"));
+        };
+        if let Some(number) = *number {
+            let flush = writer
+                .flush
+                .as_mut()
+                .filter(|flush| flush.number == number)
+                .ok_or(corrupt(Malformed::CountMismatch))?;
+            let Some(result) = flush.result.take() else {
+                return Ok(false);
+            };
+            writer.flush = None;
+            result?;
+            return Ok(true);
+        }
+        if writer.attached.out() != 0 || !writer.queued.is_empty() {
+            return Ok(false);
+        }
+        if writer.flush.is_some() {
+            return Err(corrupt(Malformed::CountMismatch));
+        }
+        let batch = writer.transfers.pop().unwrap_or_default();
+        let submitted = writer
+            .attached
+            .submit(batch, true)
+            .map_err(|error| io("flush a paced checkpoint", error));
+        let issued = self.fence(submitted)?;
+        if let Some(writer) = self.writer.as_mut() {
+            writer.flush = Some(Flush {
+                number: issued,
+                result: None,
+            });
+        }
+        *number = Some(issued);
+        self.io.syncs = self.io.syncs.saturating_add(1);
+        Ok(false)
+    }
+
+    fn checkpoint_step(&mut self, checkpoint: &mut Checkpoint, budget: u64) -> Result<bool, Error> {
+        for _ in 0..budget {
+            match &mut checkpoint.phase {
+                CheckpointPhase::Map(at) => {
+                    if *at >= checkpoint.refs {
+                        if !self.write_run_paced(&mut checkpoint.run)? {
+                            return Ok(false);
+                        }
+                        checkpoint.phase = CheckpointPhase::DrainMap;
+                        continue;
+                    }
+                    let per = self.page_capacity() / 4;
+                    let end = at
+                        .checked_add(per)
+                        .ok_or(corrupt(Malformed::TooLarge))?
+                        .min(checkpoint.refs);
+                    checkpoint.payload.clear();
+                    for count in self
+                        .alloc
+                        .refs()
+                        .get(*at..end)
+                        .ok_or(corrupt(Malformed::Truncated))?
+                    {
+                        checkpoint.payload.extend_from_slice(&count.to_le_bytes());
+                    }
+                    let page = at.checked_div(per).ok_or(corrupt(Malformed::TooLarge))?;
+                    let extent_pages = usize::try_from(self.config.extent_pages)
+                        .map_err(|_| corrupt(Malformed::TooLarge))?;
+                    let extent = *checkpoint
+                        .map
+                        .get(
+                            page.checked_div(extent_pages)
+                                .ok_or(corrupt(Malformed::TooLarge))?,
+                        )
+                        .ok_or(corrupt(Malformed::Truncated))?;
+                    let in_extent = u32::try_from(
+                        page.checked_rem(extent_pages)
+                            .ok_or(corrupt(Malformed::TooLarge))?,
+                    )
+                    .map_err(|_| corrupt(Malformed::TooLarge))?;
+                    let address = self.address(extent, in_extent)?;
+                    if !self.queue_kind_paced(
+                        &mut checkpoint.run,
+                        address,
+                        Kind::Map,
+                        checkpoint.generation,
+                        &checkpoint.payload,
+                    )? {
+                        return Ok(false);
+                    }
+                    *at = end;
+                }
+                CheckpointPhase::DrainMap => {
+                    if !self.drain_paced()? {
+                        return Ok(false);
+                    }
+                    checkpoint.phase = CheckpointPhase::Flush1(None);
+                }
+                CheckpointPhase::Flush1(number) => {
+                    if !self.checkpoint_flush(number)? {
+                        return Ok(false);
+                    }
+                    checkpoint.phase = CheckpointPhase::EncodeSuperblock;
+                }
+                CheckpointPhase::EncodeSuperblock => {
+                    let sb = Superblock {
+                        page_size: self.durable.page_size,
+                        extent_pages: self.config.extent_pages,
+                        generation: checkpoint.generation,
+                        applied: checkpoint.applied,
+                        root: checkpoint.root,
+                        extents: u64::try_from(checkpoint.refs)
+                            .map_err(|_| corrupt(Malformed::TooLarge))?,
+                        map: std::mem::take(&mut checkpoint.map),
+                    };
+                    let len = sb.encoded_len()?;
+                    checkpoint.payload.resize(len, 0);
+                    let encoded = sb.encode(&mut checkpoint.payload);
+                    checkpoint.map = sb.map;
+                    encoded?;
+                    checkpoint.phase = CheckpointPhase::Superblock;
+                }
+                CheckpointPhase::Superblock => {
+                    if !self.queue_kind_paced(
+                        &mut checkpoint.run,
+                        checkpoint.generation & 1,
+                        Kind::Superblock,
+                        checkpoint.generation,
+                        &checkpoint.payload,
+                    )? {
+                        return Ok(false);
+                    }
+                    checkpoint.phase = CheckpointPhase::DrainSuperblock;
+                }
+                CheckpointPhase::DrainSuperblock => {
+                    if !self.write_run_paced(&mut checkpoint.run)? || !self.drain_paced()? {
+                        return Ok(false);
+                    }
+                    checkpoint.phase = CheckpointPhase::Flush2(None);
+                }
+                CheckpointPhase::Flush2(number) => {
+                    if !self.checkpoint_flush(number)? {
+                        return Ok(false);
+                    }
+                    checkpoint.phase = CheckpointPhase::Commit;
+                }
+                CheckpointPhase::Commit => {
+                    let sb = Superblock {
+                        page_size: self.durable.page_size,
+                        extent_pages: self.config.extent_pages,
+                        generation: checkpoint.generation,
+                        applied: checkpoint.applied,
+                        root: checkpoint.root,
+                        extents: u64::try_from(checkpoint.refs)
+                            .map_err(|_| corrupt(Malformed::TooLarge))?,
+                        map: std::mem::take(&mut checkpoint.map),
+                    };
+                    let old = std::mem::replace(&mut self.durable, sb);
+                    self.checkpoint_map = old.map;
+                    self.alloc.durable();
+                    return Ok(true);
+                }
+                CheckpointPhase::Failed => {
+                    match self.drain_paced() {
+                        Ok(false) => return Ok(false),
+                        Ok(true) => {}
+                        Err(error) => {
+                            checkpoint.error.get_or_insert(error);
+                        }
+                    }
+                    return Err(checkpoint
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| io("checkpoint a store", "checkpoint failed")));
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// One counted slice of a retained attached checkpoint. False keeps the same map,
+    /// generation, page cursor and numbered flush across the next completion wait.
+    pub(crate) fn checkpoint_paced(
+        &mut self,
+        root: Option<u64>,
+        applied: u64,
+        budget: u64,
+    ) -> Result<bool, Error> {
+        self.admission_open()?;
+        if self
+            .checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.root != root || checkpoint.applied != applied)
+        {
+            return Err(Error::InvalidArgument {
+                what: "a different checkpoint while a barrier is retained",
+            });
+        }
+        let mut checkpoint = match self.checkpoint.take() {
+            Some(checkpoint) => checkpoint,
+            None => self.prepare_checkpoint(root, applied)?,
+        };
+        let mut result = self.checkpoint_step(&mut checkpoint, budget);
+        if let Err(error) = &result
+            && !matches!(checkpoint.phase, CheckpointPhase::Failed)
+        {
+            self.fence_error.get_or_insert_with(|| error.clone());
+            self.fenced = true;
+            self.cache = None;
+            checkpoint.error.get_or_insert(error.clone());
+            checkpoint.phase = CheckpointPhase::Failed;
+            result = Ok(false);
+        }
+        if matches!(result, Ok(true) | Err(_)) {
+            if let Err(error) = &result {
+                self.checkpoint_aborted = true;
+                self.drain_error.get_or_insert(error.clone());
+            }
+            self.give_run(checkpoint.run);
+            self.checkpoint_payload = checkpoint.payload;
+        } else {
+            self.checkpoint = Some(checkpoint);
+        }
+        result
+    }
+
+    /// Terminal cleanup only: accepted writes end before the unfinished barrier's Run
+    /// is returned. Its extents stay conservatively held or pending; no allocator reuse
+    /// or durable generation is advanced. Reopen recovers only the durable file state.
+    pub(crate) fn abort_checkpoint_paced(&mut self) -> Result<bool, Error> {
+        if self.checkpoint.is_none() {
+            return Ok(true);
+        }
+        let drained = self.drain_paced();
+        if matches!(drained, Ok(false)) {
+            return Ok(false);
+        }
+        let Some(checkpoint) = self.checkpoint.take() else {
+            return Ok(true);
+        };
+        let result = checkpoint.error.map_or(drained, Err);
+        self.give_run(checkpoint.run);
+        self.checkpoint_payload = checkpoint.payload;
+        if let Some(writer) = self.writer.as_mut() {
+            writer.flush = None;
+        }
+        self.checkpoint_aborted = true;
+        if let Err(error) = &result {
+            self.fence_error.get_or_insert_with(|| error.clone());
+            self.drain_error.get_or_insert(error.clone());
+        }
+        self.fenced = true;
+        self.cache = None;
+        result
+    }
+
+    /// Makes an attached checkpoint durable from a runtime task. Cancellation keeps the
+    /// same barrier; a later call with the same root and index resumes it. Allocator and
+    /// ordinary write methods refuse changes until it completes or fails after draining.
+    pub async fn checkpoint_async(&mut self, root: Option<u64>, applied: u64) -> Result<(), Error> {
+        loop {
+            std::future::poll_fn(|cx| std::task::Poll::Ready(checkpoint_context(cx))).await?;
+            if self.checkpoint_paced(root, applied, u64::from(self.config.extent_pages))? {
+                return Ok(());
+            }
+            if self.io_outstanding() {
+                let answered = {
+                    let mut completion = std::pin::pin!(self.wait_completion());
+                    std::future::poll_fn(|cx| {
+                        if let Err(error) = checkpoint_context(cx) {
+                            return std::task::Poll::Ready(Err(error));
+                        }
+                        std::future::Future::poll(completion.as_mut(), cx)
+                    })
+                    .await
+                };
+                if let Err(error) = answered {
+                    if matches!(error, Error::InvalidArgument { .. }) {
+                        return Err(error);
+                    }
+                    if let Some(checkpoint) = self.checkpoint.as_mut() {
+                        checkpoint.error.get_or_insert(error);
+                        checkpoint.phase = CheckpointPhase::Failed;
+                    }
+                }
+            } else {
+                // The remaining work is a counted CPU slice, never a repeated I/O probe.
+                hyper_rt::futures::yield_now().await;
+            }
+        }
+    }
+
     /// Makes a checkpoint naming `root` with state through Raft index `applied`, durable when
     /// this returns, in the order the module describes.
     pub fn checkpoint(&mut self, root: Option<u64>, applied: u64) -> Result<(), Error> {
+        blocking_allowed("a synchronous store checkpoint in a runtime task")?;
+        self.allocator_available()?;
         let generation = self
             .durable
             .generation
@@ -2282,12 +3796,333 @@ impl<F: BlockFile> Store<F> {
         Ok(())
     }
 
-    /// The store's file, its work done, and whether every run handed to the device's issuer
-    /// landed: the file comes back either way, as a crash's recovery reopens it, and a run that
-    /// failed is reported here, not lost (it fenced the store already).
-    pub fn into_file(mut self) -> (F, Result<(), Error>) {
+    /// Finishes accepted work without consuming the store. Cancellation retains its phase,
+    /// first error and every buffer; only actual attachment retirement completes the finish.
+    pub async fn finish_async(&mut self) -> Result<(), Error> {
+        let mut finish = std::pin::pin!(self.finish_inner());
+        std::future::poll_fn(|cx| {
+            if let Err(error) = finish_context(cx) {
+                return std::task::Poll::Ready(Err(error));
+            }
+            std::future::Future::poll(finish.as_mut(), cx)
+        })
+        .await
+    }
+
+    fn close_error(&mut self, error: Error) {
+        if let Some(closing) = self.closing.as_mut() {
+            closing.error.get_or_insert(error);
+        }
+    }
+
+    async fn finish_inner(&mut self) -> Result<(), Error> {
+        if self.closing.is_none() {
+            self.closing = Some(Closing {
+                phase: ClosePhase::Drain,
+                error: self.fence_error.clone(),
+            });
+        }
+        loop {
+            let phase = self.closing.as_ref().map(|closing| closing.phase);
+            match phase {
+                Some(ClosePhase::Drain) | Some(ClosePhase::Abort) => {
+                    let advanced = if phase == Some(ClosePhase::Drain) {
+                        self.drain_paced()
+                    } else {
+                        self.abort_checkpoint_paced()
+                    };
+                    match advanced {
+                        Ok(false) => {
+                            if self.io_outstanding() {
+                                if let Err(error) = self.wait_completion().await {
+                                    self.close_error(error);
+                                }
+                            } else {
+                                // Only a counted queued CPU slice remains; no readiness polling.
+                                hyper_rt::futures::yield_now().await;
+                            }
+                        }
+                        result => {
+                            if let Err(error) = result {
+                                self.close_error(error);
+                            }
+                            if let Some(closing) = self.closing.as_mut() {
+                                closing.phase = if phase == Some(ClosePhase::Drain) {
+                                    ClosePhase::Abort
+                                } else {
+                                    ClosePhase::Retire
+                                };
+                            }
+                        }
+                    }
+                }
+                Some(ClosePhase::Retire) => {
+                    let retired = self.retire_async().await;
+                    if self
+                        .writer
+                        .as_ref()
+                        .is_some_and(|writer| !writer.attached.is_retired())
+                    {
+                        // Refusal retains the owner and phase; no file is exposed on this path.
+                        return retired.and(Err(Error::InvalidArgument {
+                            what: "store attachment retirement not completed",
+                        }));
+                    }
+                    if let Err(error) = retired {
+                        self.close_error(error);
+                    }
+                    self.writer = None;
+                    if let Some(closing) = self.closing.as_mut() {
+                        closing.phase = ClosePhase::Original;
+                    }
+                }
+                Some(ClosePhase::Original) => {
+                    if let Some(original) = self.original.as_mut() {
+                        let closed = original.wait().await;
+                        if !original.is_retired() {
+                            // Context/admission refusal cannot establish physical file close.
+                            return Err(closed.err().map_or_else(
+                                || Error::InvalidArgument {
+                                    what: "original file close not completed",
+                                },
+                                |error| io("retire a store original file", error),
+                            ));
+                        }
+                        if let Err(error) = closed {
+                            self.close_error(io("retire a store original file", error));
+                        }
+                    }
+                    if let Some(closing) = self.closing.as_mut() {
+                        closing.phase = ClosePhase::Done;
+                    }
+                }
+                Some(ClosePhase::Done) => {
+                    return self
+                        .closing
+                        .as_ref()
+                        .and_then(|closing| closing.error.clone())
+                        .map_or(Ok(()), Err);
+                }
+                None => {
+                    return Err(Error::InvalidArgument {
+                        what: "store finish lost its retained phase",
+                    });
+                }
+            }
+        }
+    }
+
+    pub(crate) fn finished(&self) -> bool {
+        self.writer.is_none()
+            && self.original.as_ref().is_none_or(OriginalLease::is_retired)
+            && self
+                .closing
+                .as_ref()
+                .is_some_and(|closing| closing.phase == ClosePhase::Done)
+    }
+
+    /// True only for a runtime owner whose original file was physically closed off-shard.
+    pub(crate) fn original_retired(&self) -> bool {
+        self.file.is_none()
+            && self
+                .original
+                .as_ref()
+                .is_some_and(OriginalLease::is_retired)
+    }
+
+    /// Checked extraction performs no I/O, receipt wait or native join.
+    pub(crate) fn into_file_finished(mut self) -> IntoFile<Self, F> {
+        if !self.finished() {
+            return IntoFile::Refused {
+                owner: self,
+                error: Error::InvalidArgument {
+                    what: "file extraction before store finish",
+                },
+            };
+        }
+        let Some(file) = self.file.take() else {
+            return IntoFile::Refused {
+                owner: self,
+                error: Self::original_missing(),
+            };
+        };
+        let result = self
+            .closing
+            .take()
+            .and_then(|closing| closing.error)
+            .map_or(Ok(()), Err);
+        IntoFile::Finished { file, result }
+    }
+
+    /// A cold caller drains synchronously. An entered runtime receives its unchanged owner
+    /// unless a borrowed async finish already established physical quiescence.
+    pub fn into_file(mut self) -> IntoFile<Self, F> {
+        if self.finished() {
+            return self.into_file_finished();
+        }
+        if self.file.is_none() {
+            return IntoFile::Refused {
+                owner: self,
+                error: Self::original_missing(),
+            };
+        }
+        if hyper_rt::registry::current_shard().is_some() {
+            return IntoFile::Refused {
+                owner: self,
+                error: Error::InvalidArgument {
+                    what: "unfinished store consumed by a runtime",
+                },
+            };
+        }
         let drained = self.drain();
+        let mut first = self
+            .closing
+            .as_ref()
+            .and_then(|closing| closing.error.clone())
+            .or_else(|| drained.err());
+        if let Some(writer) = self.writer.as_mut()
+            && !writer.attached.is_retired()
+            && let Err(error) = writer.attached.retire_blocking()
+        {
+            first.get_or_insert_with(|| io("retire a store attachment", error));
+        }
+        if self
+            .writer
+            .as_ref()
+            .is_some_and(|writer| !writer.attached.is_retired())
+        {
+            let error = first.unwrap_or(Error::InvalidArgument {
+                what: "file extraction before physical attachment retirement",
+            });
+            let closing = self.closing.get_or_insert(Closing {
+                phase: ClosePhase::Retire,
+                error: None,
+            });
+            closing.error.get_or_insert_with(|| error.clone());
+            return IntoFile::Refused { owner: self, error };
+        }
         self.writer = None;
-        (self.file, drained)
+        self.closing = Some(Closing {
+            phase: ClosePhase::Done,
+            error: first,
+        });
+        self.into_file_finished()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn cold_file<O, F>(outcome: IntoFile<O, F>) -> (F, Result<(), Error>) {
+    match outcome {
+        IntoFile::Finished { file, result } => (file, result),
+        IntoFile::Refused { error, .. } => panic!("cold file extraction refused: {error:?}"),
+    }
+}
+
+#[cfg(test)]
+#[path = "../../tests/support/shared_sim.rs"]
+mod checkpoint_sim;
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::checkpoint_sim::SharedSim;
+    use super::*;
+    use hyper_block::buf::Alignment;
+    use hyper_block::sim::{Crash, Fault};
+    use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
+
+    #[test]
+    fn failed_terminal_abort_preserves_error_and_refuses_allocator_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config {
+            page_size: 4096,
+            extent_pages: 4,
+            max_extents: 256,
+        };
+        let file = SharedSim::new(
+            Alignment::new(config.page_size).unwrap(),
+            Alignment::new(512).unwrap(),
+            7,
+        )
+        .unwrap();
+        let observed = file.try_clone().unwrap();
+        let mut store = Store::create(file, config).unwrap();
+        let old = store.allocate_extent().unwrap();
+        let old_root = store.address(old, 0).unwrap();
+        store.write_page(old_root, b"durable before abort").unwrap();
+        store.checkpoint(Some(old_root), 1).unwrap();
+        let fresh = store.allocate_extent().unwrap();
+        let root = store.address(fresh, 0).unwrap();
+        store.write_page(root, b"unfinished checkpoint").unwrap();
+        store.release(old).unwrap();
+        let issuer = Issuer::start_for(directory.path(), 1, 1).unwrap();
+        store.attach(&issuer, 1).unwrap();
+        observed.inject(Fault::WriteError).unwrap();
+        let mut runtime = LocalRuntime::new(&RuntimeConfig {
+            shards: 1,
+            tasks_per_shard: 1,
+            pin: false,
+            cores: Vec::new(),
+            timers_per_shard: 1,
+            interests_per_shard: 2,
+            ring_entries: 1,
+            batch: 1,
+            step_budget_ns: 1_000_000_000,
+            timer_tick_ns: 100_000,
+            spin_ns: 0,
+            page_bytes: config.page_size,
+            wake_tracking: None,
+        })
+        .unwrap();
+        let (store, failed) = runtime
+            .block_on(async move {
+                let failed = loop {
+                    assert!(!store.checkpoint_paced(Some(root), 2, 1).unwrap());
+                    if store.io_outstanding() {
+                        break store.wait_completion().await.unwrap_err();
+                    }
+                    hyper_rt::futures::yield_now().await;
+                };
+                assert!(matches!(failed, Error::Io { .. }));
+                assert_eq!(store.abort_checkpoint_paced(), Err(failed.clone()));
+                let refs = store.refs().to_vec();
+                let generation = store.generation();
+                assert!(matches!(
+                    store.allocate_extent(),
+                    Err(Error::InvalidArgument { .. })
+                ));
+                assert!(matches!(store.grant(1), Err(Error::InvalidArgument { .. })));
+                assert!(matches!(
+                    store.grant_back(&[]),
+                    Err(Error::InvalidArgument { .. })
+                ));
+                assert!(matches!(
+                    store.begin_job(&[], 0, 0),
+                    Err(Error::InvalidArgument { .. })
+                ));
+                assert_eq!(store.refs(), refs);
+                assert_eq!(store.generation(), generation);
+                // Terminal Trunk cleanup may still release an unpublished extent; it never
+                // makes that extent reusable before a durable checkpoint.
+                store.release(fresh).unwrap();
+                (store, failed)
+            })
+            .unwrap();
+        assert_eq!(store.io_stats().buffers_out, 0);
+        let (file, landed) = crate::store::cold_file(store.into_file());
+        assert_eq!(landed, Err(failed));
+        eprintln!(
+            "terminal abort physical operations: {:?}",
+            observed.stats().unwrap()
+        );
+        drop(issuer);
+        file.crash(Crash::LoseAll).unwrap();
+        file.clear_faults().unwrap();
+        let (mut recovered, checkpoint) = Store::open(file, config).unwrap();
+        assert_eq!(checkpoint.applied, 1);
+        let mut value = Vec::new();
+        recovered
+            .read_page(checkpoint.root.unwrap(), &mut value)
+            .unwrap();
+        assert_eq!(value, b"durable before abort");
     }
 }

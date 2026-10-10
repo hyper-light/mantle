@@ -43,8 +43,8 @@
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
-use std::thread::{Builder, JoinHandle};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
+use std::thread::{Builder, JoinHandle, Thread};
 
 use hyper_rt::sync::{self, ChannelReceiver, Sender, SyncError};
 
@@ -74,7 +74,8 @@ pub fn depth(queue: Option<u32>, measured: Option<usize>) -> usize {
 /// A device's issuer: its thread, its workers and the budget they hold. Dropping it lets the
 /// transfers in flight end, refuses what is queued, and joins every thread.
 pub struct Issuer {
-    events: SyncSender<Event>,
+    events: Events,
+    submission_pending: Sender<()>,
     thread: Option<JoinHandle<()>>,
     workers: usize,
     path: PathBuf,
@@ -90,8 +91,87 @@ pub type Answer = Result<Transfers, DiskError>;
 /// An answer with the number of the batch it answers ([`Attached::submit`]).
 type Numbered = (u64, Answer);
 
-/// A file as a worker holds it.
-type Handle = Box<dyn BlockFile>;
+/// The same reusable completion channel carries retirement after every batch was answered.
+#[derive(Debug)]
+enum Completion {
+    Batch(Numbered),
+    Detached(Result<(), DiskError>),
+}
+
+#[derive(Debug)]
+struct Retirement {
+    slot: usize,
+    generation: u64,
+}
+
+/// A lifecycle refusal, retained as a scalar until its terminal error is delivered.
+#[derive(Clone, Copy, Debug)]
+enum LifecycleFailure {
+    FileDrop,
+    FileArena,
+    DispatchArena,
+    Worker,
+    Dispatcher,
+    RetiredDrop,
+}
+
+impl LifecycleFailure {
+    fn error(self, path: &Path) -> DiskError {
+        let why = match self {
+            Self::FileDrop => "a device file's Drop unwound",
+            Self::FileArena => "the device worker's file arena refused its allocation",
+            Self::DispatchArena => {
+                "the device dispatcher's retirement arena refused its allocation"
+            }
+            Self::Worker => "a device worker's lifecycle ended unexpectedly",
+            Self::Dispatcher => "the device dispatcher unwound",
+            Self::RetiredDrop => "a retired value's Drop unwound",
+        };
+        stopped(path, why)
+    }
+}
+
+/// A single owned duplicate. Explicit retirement reports its failure; implicit cleanup
+/// during already-refused setup cannot let a foreign destructor unwind past ownership.
+struct Handle(Option<Box<dyn BlockFile>>);
+
+impl Handle {
+    fn retire(&mut self) -> Option<LifecycleFailure> {
+        let file = self.0.take()?;
+        std::panic::catch_unwind(AssertUnwindSafe(|| drop(file)))
+            .err()
+            .map(|_| LifecycleFailure::FileDrop)
+    }
+
+    fn read_exact_at(&self, bytes: &mut [u8], at: u64) -> Result<(), DiskError> {
+        self.0.as_ref().map_or_else(
+            || Err(stopped(Path::new(""), "a read after duplicate retirement")),
+            |file| file.read_exact_at(bytes, at),
+        )
+    }
+
+    fn write_all_at(&self, bytes: &[u8], at: u64) -> Result<(), DiskError> {
+        self.0.as_ref().map_or_else(
+            || Err(stopped(Path::new(""), "a write after duplicate retirement")),
+            |file| file.write_all_at(bytes, at),
+        )
+    }
+
+    fn sync_data(&self) -> Result<(), DiskError> {
+        self.0.as_ref().map_or_else(
+            || Err(stopped(Path::new(""), "a flush after duplicate retirement")),
+            |file| file.sync_data(),
+        )
+    }
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        // Successful paths explicitly retire and report first. A rejected cold setup
+        // already has its primary error; this protects its secondary cleanup too.
+        let _ = self.retire();
+    }
+}
 
 enum Event {
     Attach {
@@ -99,26 +179,55 @@ enum Event {
         files: Vec<Handle>,
         /// The batches the submitter may have out at once.
         batches: usize,
-        answers: Sender<Numbered>,
-        reply: SyncSender<Result<(usize, u64), DiskError>>,
+        queued: VecDeque<Batch>,
+        answers: Sender<Completion>,
+        submissions: ChannelReceiver<Submission>,
+        reply: SyncSender<AttachReply>,
+    },
+    Watch {
+        slot: usize,
+        generation: u64,
+        done: SyncSender<Result<(), DiskError>>,
+        reply: SyncSender<Result<(), DiskError>>,
     },
     Detach {
         slot: usize,
         generation: u64,
         done: SyncSender<()>,
     },
+    Stop,
+}
+
+/// One attachment's bounded lane. A terminal command follows all consumed batch answers,
+/// so it needs no room beyond the existing batch capacity.
+#[derive(Debug)]
+enum Submission {
     Batch {
-        slot: usize,
-        generation: u64,
         number: u64,
         transfers: Transfers,
         kind: Kind,
     },
-    Done {
-        worker: usize,
-        report: Report,
-    },
-    Stop,
+    Retire,
+}
+
+/// Every cold inbox publication wakes the dispatcher. Batch/retirement submissions and
+/// native reports have separate bounded lanes, and consume no cold inbox room.
+#[derive(Clone, Debug)]
+struct Events {
+    queue: SyncSender<Event>,
+    dispatcher: Thread,
+}
+
+impl Events {
+    fn send(&self, event: Event) -> Result<(), SyncError<()>> {
+        self.queue.send(event).map_err(|_| SyncError::Closed(()))?;
+        self.wake();
+        Ok(())
+    }
+
+    fn wake(&self) {
+        self.dispatcher.unpark();
+    }
 }
 
 /// What a batch's transfers do.
@@ -152,13 +261,47 @@ enum Task {
         slot: usize,
         generation: u64,
         file: Handle,
+        /// The attachment's completion channel, for the reads its submitter hands this worker
+        /// itself ([`Task::Read`]).
+        answers: Sender<Completion>,
     },
     Detach {
         slot: usize,
         generation: u64,
     },
     Transfer(Transfer),
+    /// A one-transfer read its submitter handed this worker directly: answered to the submitter,
+    /// never reported to the broker.
+    Read(Direct),
+    /// The broker's last word: submitters hold this inbox for their direct reads, so it never
+    /// closes by itself, and the worker ends after what it already holds.
+    Stop,
+    /// A taken cold news slot; never assigned to a native worker.
+    Retired,
+    /// Retained in that same slot until all native joins, with no new fault allocation.
+    RetirementPanicked(Box<dyn std::any::Any + Send>),
 }
+
+/// A read its submitter hands a worker itself, a batch of one transfer (`Attached::submit_reads`):
+/// the worker answers on the submitter's completion channel, so no broker stands between them, two
+/// cross-thread handoffs where the broker's path takes four (submitter, broker, worker, broker,
+/// submitter), each a wake of a parked thread on a busy machine.
+struct Direct {
+    slot: usize,
+    generation: u64,
+    number: u64,
+    /// The submitter's own vector, its one buffer and offset, answered back in place: the read
+    /// allocates nothing.
+    transfers: Transfers,
+}
+
+/// A worker's way back to one attachment's submitter: the attachment's generation and its
+/// completion channel.
+type Lane = Option<(u64, Sender<Completion>)>;
+
+/// The answer to an attach, once every worker holds the file: the slot, its generation, and the
+/// workers' inboxes for its direct reads (none when a worker refused the file).
+type AttachReply = Result<(usize, u64, Vec<SyncSender<Task>>), DiskError>;
 
 struct Transfer {
     slot: usize,
@@ -170,9 +313,62 @@ struct Transfer {
 
 /// A worker's report of one task.
 enum Report {
-    /// A file attached, or one detached and dropped: which.
-    News(Option<(usize, u64)>),
+    /// One lifecycle task ended, even if the foreign destructor failed.
+    News {
+        slot: usize,
+        generation: u64,
+        detached: bool,
+        failed: Option<LifecycleFailure>,
+    },
     Finished(Finished),
+}
+
+/// One not-yet-consumed assignment report plus one exit notice per actually started worker.
+/// Taking that report is required before another assignment, so both roles fit without waiting.
+const NATIVE_EXIT_ROLES: usize = 2;
+
+enum NativeExit {
+    Report(Report),
+    Ended(Option<LifecycleFailure>),
+}
+
+/// Lives outside the worker body so an unexpected unwind still publishes its exit.
+/// This notice is before TLS destruction; the broker must join before certification.
+struct WorkerEnded<'a> {
+    publisher: &'a NativePublisher,
+    failed: Option<LifecycleFailure>,
+}
+
+impl Drop for WorkerEnded<'_> {
+    fn drop(&mut self) {
+        self.publisher.publish(NativeExit::Ended(self.failed));
+    }
+}
+
+struct NativePublisher {
+    retired: SyncSender<NativeExit>,
+    pending: SyncSender<()>,
+    dispatcher: Thread,
+}
+
+impl NativePublisher {
+    fn publish(&self, exit: NativeExit) -> bool {
+        // One counted assignment may publish one report before the broker takes it;
+        // its exit is the other role. Thus both try_send calls are bounded and do not wait.
+        let accepted = self.retired.try_send(exit).is_ok();
+        let _ = self.pending.try_send(());
+        self.dispatcher.unpark();
+        accepted
+    }
+}
+
+/// Cold ownership for one actually started native worker and its two exit roles.
+struct NativeWorker<'scope> {
+    handle: Option<std::thread::ScopedJoinHandle<'scope, Option<LifecycleFailure>>>,
+    retirement: Receiver<NativeExit>,
+    panic: Option<Box<dyn std::any::Any + Send>>,
+    report: Option<Report>,
+    ended: bool,
 }
 
 /// A transfer's end: the write's or read's index and buffer, `None` for a flush.
@@ -195,14 +391,15 @@ impl Issuer {
     }
 
     /// [`Self::start`] for submitters that together keep up to `batches` out
-    /// ([`Self::attach_deep`]): the issuer's inbox holds every worker's report and every such
-    /// batch at once, so within that budget a submission is handed over without waiting, even
-    /// while the issuer's thread is not running. Past it, a submission waits for room.
+    /// ([`Self::attach_deep`]). Its declared cold inbox shape is retained; each attachment's
+    /// own batch lane admits its configured credits without waiting on that shared inbox.
+    /// Native completion and exit receipts have their own bounded worker lanes.
     #[allow(
         clippy::disallowed_methods,
         reason = "the issuer's bounded device workers: hyper-block runs its device's I/O (clippy.toml's file rule names it)"
     )]
     pub fn start_for(path: &Path, depth: usize, batches: usize) -> Result<Self, DiskError> {
+        blocking_call_allowed(path, "issuer startup inside a runtime task")?;
         if depth == 0 {
             return Err(invalid(path, "an issuer needs a depth of one at least"));
         }
@@ -218,15 +415,26 @@ impl Issuer {
             });
         }
         let budget = threads::reserve(threads, path)?;
-        // Room for every worker's report and every batch the submitters may have out, so a worker
-        // never waits to report and a submission within the budget is never held behind them.
-        let (events, inbox) = sync_channel(workers.saturating_add(batches));
+        // Preserve the declared cold inbox shape. Batch publication uses each attachment's
+        // lane; native workers now own distinct report/exit lanes and never wait on this inbox.
+        let bound = workers
+            .checked_add(batches)
+            .ok_or_else(|| invalid(path, "the issuer's workers and batch budget exceed usize"))?;
+        channel_capacity::<Event>(path, bound)?;
+        // Attachments own their batch lanes. This coalesced pending-scan signal asks the
+        // dispatcher to inspect them, without taking report or cold-setup inbox room.
+        let (submission_pending, mut pending) =
+            sync::channel(1).map_err(|error| DiskError::Io {
+                op: "make an issuer submission doorbell",
+                path: path.to_path_buf(),
+                source: std::io::Error::other(error),
+            })?;
+        let (events, inbox) = sync_channel(bound);
         let (ready, started) = sync_channel(1);
-        let completions = events.clone();
         let device = path.to_path_buf();
         let thread = Builder::new()
             .name("hyper-issuer".into())
-            .spawn(move || run(&device, &inbox, &completions, workers, &ready))
+            .spawn(move || run(&device, inbox, workers, batches, &ready, &mut pending))
             .map_err(|source| DiskError::Io {
                 op: "start a device issuer",
                 path: path.to_path_buf(),
@@ -241,7 +449,11 @@ impl Issuer {
             return Err(e);
         }
         Ok(Self {
-            events,
+            events: Events {
+                queue: events,
+                dispatcher: thread.thread().clone(),
+            },
+            submission_pending,
             thread: Some(thread),
             workers,
             path: path.to_path_buf(),
@@ -268,7 +480,14 @@ impl Issuer {
         file: &F,
         batches: usize,
     ) -> Result<Attached, DiskError> {
-        attach(&self.events, self.workers, &self.path, file, batches)
+        attach(
+            &self.events,
+            &self.submission_pending,
+            self.workers,
+            &self.path,
+            file,
+            batches,
+        )
     }
 
     /// A way to attach submitters to this issuer that its holder owns and may send to another
@@ -279,6 +498,7 @@ impl Issuer {
     pub fn attacher(&self) -> Attacher {
         Attacher {
             events: self.events.clone(),
+            submission_pending: self.submission_pending.clone(),
             workers: self.workers,
             path: self.path.clone(),
         }
@@ -290,7 +510,8 @@ impl Issuer {
 /// than borrow the issuer.
 #[derive(Clone, Debug)]
 pub struct Attacher {
-    events: SyncSender<Event>,
+    events: Events,
+    submission_pending: Sender<()>,
     workers: usize,
     path: PathBuf,
 }
@@ -303,29 +524,68 @@ impl Attacher {
         file: &F,
         batches: usize,
     ) -> Result<Attached, DiskError> {
-        attach(&self.events, self.workers, &self.path, file, batches)
+        attach(
+            &self.events,
+            &self.submission_pending,
+            self.workers,
+            &self.path,
+            file,
+            batches,
+        )
     }
 }
 
 /// Hands the issuer whose inbox is `events` duplicates of `file`, one for each of its `workers`, for
 /// a submitter that keeps up to `batches` out at once.
 fn attach<F: BlockFile + 'static>(
-    events: &SyncSender<Event>,
+    events: &Events,
+    submission_pending: &Sender<()>,
     workers: usize,
     path: &Path,
     file: &F,
     batches: usize,
 ) -> Result<Attached, DiskError> {
+    blocking_call_allowed(path, "issuer attachment inside a runtime task")?;
     if batches == 0 {
         return Err(invalid(path, "a submitter needs one batch at least"));
     }
-    let mut files: Vec<Handle> = Vec::with_capacity(workers);
+    // Numbered batch results plus exactly one physical terminal result. Batch/data
+    // admission remains batches, including queued, dispatched and untaken answers.
+    let answer_bound = batches
+        .checked_add(1)
+        .ok_or_else(|| invalid(path, "batch answers plus terminal result exceed usize"))?;
+    channel_capacity::<Completion>(path, answer_bound)?;
+    channel_capacity::<Submission>(path, batches)?;
+    // Reserve the same per-client batch storage before cloning or publishing ownership.
+    let mut queued = VecDeque::new();
+    queued
+        .try_reserve_exact(batches)
+        .map_err(|error| DiskError::Io {
+            op: "reserve an attachment's batch arena",
+            path: path.to_path_buf(),
+            source: std::io::Error::other(error),
+        })?;
+    let mut files: Vec<Handle> = Vec::new();
+    files
+        .try_reserve_exact(workers)
+        .map_err(|error| DiskError::Io {
+            op: "reserve an attachment's file duplicates",
+            path: path.to_path_buf(),
+            source: std::io::Error::other(error),
+        })?;
     for _ in 0..workers {
-        files.push(Box::new(file.try_clone()?));
+        files.push(Handle(Some(Box::new(file.try_clone()?))));
     }
-    // Each batch out is answered once: room for every answer the submitter may be owed.
-    let (answers, answered) = sync::channel(batches).map_err(|error| DiskError::Io {
+    // Each admitted batch has one numbered answer, plus one post-quiescence terminal fact.
+    let (answers, answered) = sync::channel(answer_bound).map_err(|error| DiskError::Io {
         op: "attach completion channel",
+        path: path.to_path_buf(),
+        source: std::io::Error::other(error),
+    })?;
+    // Out counts queued, issued and answered-but-untaken batches. With out < batches,
+    // this lane has room; retirement requires out == 0 and therefore an empty lane.
+    let (submit, submissions) = sync::channel(batches).map_err(|error| DiskError::Io {
+        op: "attach submission channel",
         path: path.to_path_buf(),
         source: std::io::Error::other(error),
     })?;
@@ -335,20 +595,41 @@ fn attach<F: BlockFile + 'static>(
         .send(Event::Attach {
             files,
             batches,
+            queued,
             answers,
+            submissions,
             reply,
         })
         .map_err(|_| gone())?;
-    let (slot, generation) = replied.recv().map_err(|_| gone())??;
+    let (slot, generation, direct) = replied.recv().map_err(|_| gone())??;
+    let mut direct_out = Vec::new();
+    let mut direct_numbers = VecDeque::new();
+    if direct_out.try_reserve_exact(direct.len()).is_err()
+        || direct_numbers.try_reserve_exact(batches).is_err()
+    {
+        return Err(DiskError::Io {
+            op: "reserve an attachment's direct read accounts",
+            path: path.to_path_buf(),
+            source: std::io::Error::other("allocation refused"),
+        });
+    }
+    direct_out.resize(direct.len(), 0);
     Ok(Attached {
         slot,
         generation,
+        direct,
+        direct_out,
+        direct_numbers,
         events: events.clone(),
+        submissions: Some(submit),
+        submission_pending: submission_pending.clone(),
         answers: answered,
         path: path.to_path_buf(),
         batches,
         out: 0,
         next: 0,
+        retirement: RetirementState::Live,
+        watch_prepared: false,
     })
 }
 
@@ -363,27 +644,126 @@ impl Drop for Issuer {
     }
 }
 
-/// One submitter's way to its device's issuer: a volume's writer holds one. Dropping it
-/// detaches the file and returns once no worker holds a duplicate of it.
+/// One submitter's way to its device's issuer: a volume's writer holds one. A cold owner
+/// dropping it waits until no worker holds a duplicate. On an entered shard, Drop hands
+/// accepted work and duplicate retirement to the issuer without a success acknowledgement;
+/// await [`Attached::retire_async`] when that acknowledgement is required.
 #[derive(Debug)]
 pub struct Attached {
     slot: usize,
     generation: u64,
-    events: SyncSender<Event>,
-    answers: ChannelReceiver<Numbered>,
+    /// The workers' inboxes, for a one-transfer read handed straight to one of them
+    /// ([`Self::submit_reads`]); none when a worker refused the file.
+    direct: Vec<SyncSender<Task>>,
+    /// This submitter's direct reads out on each worker, and the worker each is out on by its
+    /// batch's number: at most the batches it attached for.
+    direct_out: Vec<usize>,
+    direct_numbers: VecDeque<(u64, usize)>,
+    events: Events,
+    submissions: Option<Sender<Submission>>,
+    submission_pending: Sender<()>,
+    answers: ChannelReceiver<Completion>,
     path: PathBuf,
     /// The batches it may have out at once, those out, and the next batch's number.
     batches: usize,
     out: usize,
     next: u64,
+    retirement: RetirementState,
+    watch_prepared: bool,
+}
+
+/// An independent physical fence for one registered attachment. Its receiver can
+/// be cold-owned by a native retirement worker before the submitter enters a shard.
+/// Dropping the submitter or its batch-answer receiver cannot complete this fence.
+#[derive(Debug)]
+pub struct RetirementWatch {
+    received: Receiver<Result<(), DiskError>>,
+    result: Option<Result<(), DiskError>>,
+    path: PathBuf,
+}
+
+impl RetirementWatch {
+    /// Waits on a cold/native owner until accepted I/O and every native file duplicate
+    /// have physically retired. Every returned native result, including an error, is
+    /// terminal; an entered-shard refusal leaves the receipt and state untouched.
+    pub fn wait_blocking(&mut self) -> Result<(), DiskError> {
+        blocking_call_allowed(&self.path, "a retirement watch inside a runtime shard")?;
+        if self.result.is_none() {
+            self.result =
+                Some(self.received.recv().unwrap_or_else(|_| {
+                    Err(stopped(&self.path, "the device's issuer has stopped"))
+                }));
+        }
+        match self.result.as_ref() {
+            Some(Ok(())) => Ok(()),
+            Some(Err(error)) => Err(copy_disk_error(error)),
+            None => Err(stopped(
+                &self.path,
+                "a retirement watch has no terminal result",
+            )),
+        }
+    }
+
+    /// True only after this independent receipt, or its post-native-join closure,
+    /// was consumed. Context/admission refusal never establishes physical retirement.
+    pub fn is_retired(&self) -> bool {
+        self.result.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetirementState {
+    Live,
+    Waiting,
+    Retired,
 }
 
 impl Attached {
+    /// Registers one independent physical-retirement watch from the cold owner.
+    /// The broker acknowledges ownership before the watch may be adopted elsewhere.
+    /// Refusal leaves this attachment and every batch credit unchanged.
+    pub fn prepare_retirement_watch(&mut self) -> Result<RetirementWatch, DiskError> {
+        blocking_call_allowed(
+            &self.path,
+            "prepare a retirement watch inside a runtime shard",
+        )?;
+        if self.watch_prepared || self.retirement != RetirementState::Live {
+            return Err(invalid(
+                &self.path,
+                "a retirement watch needs one live unregistered attachment",
+            ));
+        }
+        // Exactly one physical terminal result and one cold registration acknowledgement.
+        let (done, received) = sync_channel(1);
+        let (reply, replied) = sync_channel(1);
+        self.events
+            .send(Event::Watch {
+                slot: self.slot,
+                generation: self.generation,
+                done,
+                reply,
+            })
+            .map_err(|_| stopped(&self.path, "the device's issuer has stopped"))?;
+        replied
+            .recv()
+            .map_err(|_| stopped(&self.path, "the device's issuer has stopped"))??;
+        self.watch_prepared = true;
+        Ok(RetirementWatch {
+            received,
+            result: None,
+            path: self.path.clone(),
+        })
+    }
+
     /// Issues every `(buffer, offset)` of `writes` at once, as deep as the device's workers go,
     /// and once all have completed, a flush when `flush` is set and every write succeeded.
     /// Returns `writes` back, every buffer and offset in order, after the last of them; the first
     /// failure otherwise, once none is in flight. Refused while batches submitted are out.
     pub fn write(&mut self, writes: Transfers, flush: bool) -> Answer {
+        blocking_call_allowed(
+            &self.path,
+            "a synchronous device write inside a runtime task",
+        )?;
         if self.out > 0 {
             return Err(invalid(
                 &self.path,
@@ -436,17 +816,74 @@ impl Attached {
                 "a batch past those the submitter attached for; take an answer first",
             ));
         }
-        self.send(reads, Kind::Read)
+        match self.read_directly(reads) {
+            Ok(number) => Ok(number),
+            Err(reads) => self.send(reads, Kind::Read),
+        }
+    }
+
+    /// Hands a one-transfer read straight to the worker with the fewest of this submitter's direct
+    /// reads out, the first of them; the worker answers it on this attachment's channel, no broker
+    /// between them (two cross-thread handoffs, not four). The broker hands its own transfers to the
+    /// last idle worker, so the two fill the pool from opposite ends. The read back, for the
+    /// broker's path, when it is more than one transfer, retirement began, or no worker inbox takes
+    /// it.
+    fn read_directly(&mut self, reads: Transfers) -> Result<u64, Transfers> {
+        if reads.len() != 1 || self.retirement != RetirementState::Live {
+            return Err(reads);
+        }
+        let Some(worker) = self
+            .direct_out
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, out)| **out)
+            .map(|(worker, _)| worker)
+        else {
+            return Err(reads);
+        };
+        let Some(inbox) = self.direct.get(worker) else {
+            return Err(reads);
+        };
+        let number = self.next;
+        let task = Task::Read(Direct {
+            slot: self.slot,
+            generation: self.generation,
+            number,
+            transfers: reads,
+        });
+        if let Err(TrySendError::Full(task) | TrySendError::Disconnected(task)) =
+            inbox.try_send(task)
+        {
+            return Err(match task {
+                Task::Read(direct) => direct.transfers,
+                // Only a read was sent: no other task comes back.
+                _ => Transfers::new(),
+            });
+        }
+        self.next = self.next.wrapping_add(1);
+        self.out = self.out.saturating_add(1);
+        if let Some(out) = self.direct_out.get_mut(worker) {
+            *out = out.saturating_add(1);
+        }
+        // Within the batches reserved at attach: out never exceeds them.
+        self.direct_numbers.push_back((number, worker));
+        Ok(number)
     }
 
     /// Sends a batch the submitter has room for, and counts it out.
     fn send(&mut self, transfers: Transfers, kind: Kind) -> Result<u64, DiskError> {
+        if self.retirement != RetirementState::Live {
+            return Err(invalid(
+                &self.path,
+                "a batch after attachment retirement began",
+            ));
+        }
         let number = self.next;
         let gone = || stopped(&self.path, "the device's issuer has stopped");
-        self.events
-            .send(Event::Batch {
-                slot: self.slot,
-                generation: self.generation,
+        self.submissions
+            .as_ref()
+            .ok_or_else(gone)?
+            .try_send(Submission::Batch {
                 number,
                 transfers,
                 kind,
@@ -454,21 +891,23 @@ impl Attached {
             .map_err(|_| gone())?;
         self.next = self.next.wrapping_add(1);
         self.out = self.out.saturating_add(1);
+        self.notify_submissions();
         Ok(number)
     }
 
     /// The next answer, waiting for it: the batch's number and its answer. Refused with no batch
     /// out.
     pub fn answer(&mut self) -> Result<Numbered, DiskError> {
+        blocking_call_allowed(
+            &self.path,
+            "a synchronous device answer inside a runtime task",
+        )?;
         if self.out == 0 {
             return Err(invalid(&self.path, "an answer with no batch out"));
         }
-        let answered = self
-            .answers
-            .blocking_recv()
-            .map_err(|_| stopped(&self.path, "the device's issuer has stopped"))?;
-        self.out = self.out.saturating_sub(1);
-        Ok(answered)
+        let received = self.answers.blocking_recv();
+        let answered = self.completion_result(received)?;
+        self.batch_answer(answered)
     }
 
     /// The next answer, waiting as a hyper-rt task. Dropping this borrowed wait leaves the
@@ -478,13 +917,8 @@ impl Attached {
         if self.out == 0 {
             return Err(invalid(&self.path, "an answer with no batch out"));
         }
-        let answered = self
-            .answers
-            .recv()
-            .await
-            .map_err(|error| completion_error(&self.path, error))?;
-        self.out = self.out.saturating_sub(1);
-        Ok(answered)
+        let answered = self.receive_completion().await?;
+        self.batch_answer(answered)
     }
 
     /// The next answer if one has come; none otherwise, or with no batch out.
@@ -493,16 +927,173 @@ impl Attached {
             return Ok(None);
         }
         match self.answers.try_recv() {
-            Ok(Some(answered)) => {
-                self.out = self.out.saturating_sub(1);
-                Ok(Some(answered))
-            }
+            Ok(Some(answered)) => self.batch_answer(answered).map(Some),
             Ok(None) => Ok(None),
-            Err(error) => Err(completion_error(&self.path, error)),
+            Err(error) => self.completion_result(Err(error)).map(|_| None),
         }
     }
 
-    /// Batches submitted and not yet answered.
+    fn batch_answer(&mut self, completion: Completion) -> Result<Numbered, DiskError> {
+        match completion {
+            Completion::Batch(answered) => {
+                self.out = self.out.saturating_sub(1);
+                if let Some(at) = self
+                    .direct_numbers
+                    .iter()
+                    .position(|(number, _)| *number == answered.0)
+                    && let Some((_, worker)) = self.direct_numbers.remove(at)
+                    && let Some(out) = self.direct_out.get_mut(worker)
+                {
+                    *out = out.saturating_sub(1);
+                }
+                Ok(answered)
+            }
+            Completion::Detached(result) => {
+                self.retirement = RetirementState::Retired;
+                self.out = 0;
+                match result {
+                    Err(error) => Err(error),
+                    Ok(()) => Err(stopped(
+                        &self.path,
+                        "a detach where a batch answer was required",
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Retires this attachment as a hyper-rt task, after every submitted batch's answer
+    /// was taken. Every worker drops its duplicate before this returns. Another attachment's
+    /// held I/O may delay that fact; this task waits without blocking its shard.
+    ///
+    /// The retirement owns its cold setup control slot and uses this attachment's existing
+    /// completion channel. Canceling the borrowed wait neither repeats retirement nor drops
+    /// a duplicate early; a later wait resumes it. The final Drop then has no work left.
+    pub async fn retire_async(&mut self) -> Result<(), DiskError> {
+        // Refuse before publishing retirement; every later receive poll checks again.
+        std::future::poll_fn(|cx| std::task::Poll::Ready(completion_context(&self.path, cx)))
+            .await?;
+        self.begin_retirement()?;
+        if self.retirement == RetirementState::Retired {
+            return Ok(());
+        }
+        let completion = self.receive_completion().await?;
+        self.retirement_result(completion)
+    }
+
+    /// Retires this attachment from its cold owner, after every submitted batch's answer
+    /// was taken. This waits for the same physical retirement as `retire_async` and reports
+    /// a native duplicate's lifecycle failure instead of discarding it during Drop.
+    /// Any entered runtime shard is refused before publishing or consuming retirement.
+    pub fn retire_blocking(&mut self) -> Result<(), DiskError> {
+        blocking_call_allowed(
+            &self.path,
+            "a synchronous device retirement inside a runtime shard",
+        )?;
+        self.begin_retirement()?;
+        if self.retirement == RetirementState::Retired {
+            return Ok(());
+        }
+        let received = self.answers.blocking_recv();
+        let completion = self.completion_result(received)?;
+        self.retirement_result(completion)
+    }
+
+    fn begin_retirement(&mut self) -> Result<(), DiskError> {
+        if self.out != 0 {
+            return Err(invalid(
+                &self.path,
+                "retirement with batch answers still out",
+            ));
+        }
+        if self.retirement == RetirementState::Live {
+            let submitted = match self.submissions.as_ref() {
+                Some(sender) => sender.try_send(Submission::Retire),
+                None => Err(SyncError::Closed(Submission::Retire)),
+            };
+            match submitted {
+                Ok(()) => {
+                    self.retirement = RetirementState::Waiting;
+                    self.notify_submissions();
+                }
+                Err(SyncError::Closed(_)) => {
+                    // Stop closes admission before joining. Its completion channel stays
+                    // alive until every native duplicate has actually dropped.
+                    self.retirement = RetirementState::Waiting;
+                }
+                Err(error) => {
+                    return Err(DiskError::Io {
+                        op: "retire a device attachment",
+                        path: self.path.clone(),
+                        source: std::io::Error::other(format!("{error:?}")),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn retirement_result(&mut self, completion: Completion) -> Result<(), DiskError> {
+        match completion {
+            Completion::Detached(result) => {
+                self.retirement = RetirementState::Retired;
+                self.out = 0;
+                result
+            }
+            Completion::Batch(_) => Err(stopped(
+                &self.path,
+                "a batch after all its answers were taken",
+            )),
+        }
+    }
+
+    async fn receive_completion(&mut self) -> Result<Completion, DiskError> {
+        let received = {
+            let path = &self.path;
+            let mut receive = std::pin::pin!(self.answers.recv());
+            std::future::poll_fn(|cx| {
+                // Validate before taking a ready value, including every later poll.
+                if let Err(error) = completion_context(path, cx) {
+                    return std::task::Poll::Ready(Err(error));
+                }
+                std::future::Future::poll(receive.as_mut(), cx).map(Ok)
+            })
+            .await?
+        };
+        self.completion_result(received)
+    }
+
+    fn completion_result(
+        &mut self,
+        received: Result<Completion, SyncError<()>>,
+    ) -> Result<Completion, DiskError> {
+        if matches!(&received, Err(SyncError::Closed(()))) {
+            // Completion senders survive every device duplicate's native join. Closed
+            // is physical retirement, unlike context refusal or a numbered I/O error.
+            self.retirement = RetirementState::Retired;
+            self.out = 0;
+        }
+        received.map_err(|error| completion_error(&self.path, error))
+    }
+
+    fn notify_submissions(&self) {
+        // Full already records the same scan. Closed follows native joins, and the
+        // accepted batch/retirement must still be consumed or reported by its completion
+        // channel; notification failure cannot turn accepted ownership into refusal.
+        let _ = self.submission_pending.try_send(());
+        self.events.wake();
+    }
+
+    /// Whether every device duplicate has physically retired. True after Detached or
+    /// actual completion-channel closure following native joins, even when that closure
+    /// reported a stopped-issuer error. Context/admission and numbered I/O errors alone
+    /// do not establish this fact.
+    pub fn is_retired(&self) -> bool {
+        self.retirement == RetirementState::Retired
+    }
+
+    /// Batches submitted and not yet answered. Physical issuer closure retires all stale
+    /// credits with a typed error; it does not acknowledge the missing batches as successful.
     pub fn out(&self) -> usize {
         self.out
     }
@@ -515,6 +1106,26 @@ impl Attached {
 
 impl Drop for Attached {
     fn drop(&mut self) {
+        if self.retirement == RetirementState::Retired {
+            return;
+        }
+        if hyper_rt::registry::current_shard().is_some() {
+            // Closing the sole producer is the terminal command. The issuer drains its
+            // queued lane and keeps accepted batches until their physical reports retire.
+            self.submissions.take();
+            self.notify_submissions();
+            return;
+        }
+        if self.retirement == RetirementState::Waiting {
+            // A canceled borrowed retirement still owns its receipt. Plain Drop retains its
+            // blocking contract; a shard consumer completes retire_async before dropping.
+            while let Ok(completion) = self.answers.blocking_recv() {
+                if matches!(completion, Completion::Detached(_)) {
+                    return;
+                }
+            }
+            return;
+        }
         let (done, detached) = sync_channel(1);
         let detach = Event::Detach {
             slot: self.slot,
@@ -533,97 +1144,422 @@ impl Drop for Attached {
 /// dispatches until stopped.
 fn run(
     path: &Path,
-    inbox: &Receiver<Event>,
-    completions: &SyncSender<Event>,
+    inbox: Receiver<Event>,
     workers: usize,
+    batches: usize,
     ready: &SyncSender<Result<(), DiskError>>,
+    submission_pending: &mut ChannelReceiver<()>,
 ) {
     std::thread::scope(|scope| {
-        let mut slots = Vec::with_capacity(workers);
-        let mut handles = Vec::with_capacity(workers);
-        let mut failed = None;
-        for id in 0..workers {
-            let (tasks, assigned) = sync_channel::<Task>(1);
-            let done = completions.clone();
-            match Builder::new()
-                .name("hyper-io".into())
-                .spawn_scoped(scope, move || work(id, &assigned, &done))
-            {
-                Ok(handle) => {
-                    slots.push(tasks);
-                    handles.push(handle);
-                }
-                Err(source) => {
-                    failed = Some(DiskError::Io {
-                        op: "start a device worker",
-                        path: path.to_path_buf(),
-                        source,
-                    });
-                    break;
-                }
-            }
+        // Coalesced yes/no native-report notification: one pending inspection.
+        let (native_pending, completed) = sync_channel(1);
+        let started = start_workers(scope, path, workers, batches, &native_pending);
+        let mut handles = started.native;
+        let mut dispatch = Dispatch::new(started.assignments, path);
+        // A foreign panic payload can itself panic on Drop. Retain it until every
+        // native join, exactly like native-thread join payloads, before any sender closes.
+        let mut broker_panic = None;
+        if ready.send(started.result).is_ok()
+            && dispatch.workers.len() == workers
+            && let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                dispatch.run(&inbox, submission_pending, &completed, &mut handles);
+            }))
+        {
+            broker_panic = Some(payload);
+            dispatch.failure.get_or_insert(LifecycleFailure::Dispatcher);
         }
-        let started = match failed {
-            Some(e) => Err(e),
-            None => Ok(()),
-        };
-        if ready.send(started).is_ok() && slots.len() == workers {
-            Dispatch::new(slots, path).run(inbox);
-        } else {
-            drop(slots);
+        // Stop admission and assigned-task publication before joins. On an abnormal
+        // broker exit, reports cannot block behind cold Attach traffic in this inbox.
+        // Handle's cleanup boundary protects duplicates in never-admitted Attach events.
+        // Submitters hold the workers' inboxes for their direct reads, so the inboxes do not
+        // close with the broker's senders: each worker is told to end, after what it holds,
+        // which it reaches without waiting on the broker; one that ended refuses the word.
+        for worker in &dispatch.workers {
+            let _ = worker.send(Task::Stop);
         }
-        // Each worker ends once its slot's sender is gone; a worker that unwound is already
-        // ended. Joined here, so the scope has nothing left to report.
-        for handle in handles {
-            let _ = handle.join();
+        dispatch.workers.clear();
+        // Close cold admission before terminal waits. Native reports have their own
+        // bounded lanes; a foreign unadmitted Attach destructor cannot discard them.
+        let mut inbox_panic = std::panic::catch_unwind(AssertUnwindSafe(|| drop(inbox))).err();
+        if inbox_panic.is_some() {
+            dispatch.failure.get_or_insert(LifecycleFailure::FileDrop);
         }
+        dispatch.retire_news();
+        finish_native(&mut handles, &mut dispatch);
+        dispatch.dispose_news(); // Every foreign disposal is guarded after all joins.
+        dispatch.record_disposal(broker_panic.take());
+        dispatch.record_disposal(inbox_panic.take());
+        // No completion sender leaves before all native duplicates and TLS have joined.
+        // The reserved terminal role fits even behind batches untaken numbered answers.
+        dispatch.terminal();
     });
 }
 
-/// A worker: takes each task from its own slot, carries it out on the duplicates it owns, and
-/// reports. An unwind from a file, which production code never raises, is caught here and
-/// reported as an error, so a batch's submitter never waits on a report that cannot come.
-fn work(id: usize, tasks: &Receiver<Task>, done: &SyncSender<Event>) {
-    let mut files: Vec<Option<(u64, Handle)>> = Vec::new();
+struct StartedWorkers<'scope> {
+    assignments: Vec<SyncSender<Task>>,
+    native: Vec<NativeWorker<'scope>>,
+    result: Result<(), DiskError>,
+}
+
+fn start_workers<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    path: &Path,
+    workers: usize,
+    batches: usize,
+    pending: &SyncSender<()>,
+) -> StartedWorkers<'scope> {
+    let mut started = StartedWorkers {
+        assignments: Vec::with_capacity(workers),
+        native: Vec::with_capacity(workers),
+        result: Ok(()),
+    };
+    for _ in 0..workers {
+        match start_worker(scope, batches, pending) {
+            Ok((assignment, worker)) => {
+                started.assignments.push(assignment);
+                started.native.push(worker);
+            }
+            Err(source) => {
+                started.result = Err(DiskError::Io {
+                    op: "start a device worker",
+                    path: path.to_path_buf(),
+                    source,
+                });
+                break;
+            }
+        }
+    }
+    started
+}
+
+fn start_worker<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    batches: usize,
+    pending: &SyncSender<()>,
+) -> Result<(SyncSender<Task>, NativeWorker<'scope>), std::io::Error> {
+    // The broker's one assignment at a time, beside the reads its submitters hand it themselves:
+    // each submitter's at most its batches out, so all of theirs at most the budget the issuer was
+    // started for (`Issuer::start_for`).
+    let (tasks, assigned) = sync_channel(batches.saturating_add(1));
+    let (retired, retirement) = sync_channel(NATIVE_EXIT_ROLES);
+    let publisher = NativePublisher {
+        retired,
+        pending: pending.clone(),
+        dispatcher: std::thread::current(),
+    };
+    let handle = Builder::new()
+        .name("hyper-io".into())
+        .spawn_scoped(scope, move || {
+            let mut ended = WorkerEnded {
+                publisher: &publisher,
+                failed: Some(LifecycleFailure::Worker),
+            };
+            let failed = work(&assigned, &publisher);
+            ended.failed = failed;
+            failed
+        })?;
+    Ok((
+        tasks,
+        NativeWorker {
+            handle: Some(handle),
+            retirement,
+            panic: None,
+            report: None,
+            ended: false,
+        },
+    ))
+}
+
+impl NativeWorker<'_> {
+    fn keep_exit(&mut self, exit: NativeExit) -> Option<LifecycleFailure> {
+        match exit {
+            NativeExit::Report(report) => {
+                self.report = Some(report);
+                None
+            }
+            NativeExit::Ended(failed) => {
+                self.ended = true;
+                failed
+            }
+        }
+    }
+
+    fn drain_exit(&mut self) -> Option<LifecycleFailure> {
+        let mut first = None;
+        for _ in 0..NATIVE_EXIT_ROLES {
+            let Ok(exit) = self.retirement.try_recv() else {
+                break;
+            };
+            first = first.or(self.keep_exit(exit));
+        }
+        first
+    }
+
+    fn wait_exit(&mut self) -> Option<LifecycleFailure> {
+        if self.ended {
+            return self.drain_exit();
+        }
+        for _ in 0..NATIVE_EXIT_ROLES {
+            let Ok(exit) = self.retirement.recv() else {
+                return Some(LifecycleFailure::Worker);
+            };
+            let failed = self.keep_exit(exit);
+            if self.ended {
+                return failed.or(self.drain_exit());
+            }
+        }
+        Some(LifecycleFailure::Worker)
+    }
+
+    fn join(&mut self) -> Option<LifecycleFailure> {
+        match self.handle.take()?.join() {
+            Ok(failed) => failed,
+            Err(payload) => {
+                self.panic = Some(payload);
+                Some(LifecycleFailure::Worker)
+            }
+        }
+    }
+}
+
+fn finish_native(native: &mut [NativeWorker<'_>], dispatch: &mut Dispatch<'_>) {
+    for worker in native.iter_mut() {
+        if let Some(failed) = worker.wait_exit() {
+            dispatch.failure.get_or_insert(failed);
+        }
+    }
+    // Exit notices are before TLS. Every handle is still joined, with foreign panic
+    // payloads retained until the entire native cohort joined.
+    for worker in native.iter_mut() {
+        if let Some(failed) = worker.join() {
+            dispatch.failure.get_or_insert(failed);
+        }
+    }
+    latch_native_reports(native, dispatch);
+    dispose_native(native, dispatch);
+}
+
+fn latch_native_reports(native: &[NativeWorker<'_>], dispatch: &mut Dispatch<'_>) {
+    // The original foreign errors remain owned; latching only borrows them.
+    for worker in native {
+        if let Some(report) = &worker.report {
+            dispatch.terminal_report(report);
+        }
+    }
+}
+
+fn dispose_native(native: &mut [NativeWorker<'_>], dispatch: &mut Dispatch<'_>) {
+    for worker in native {
+        // Eager `or` is deliberate: both owned roles must be disposed, even on failure.
+        let failed = worker
+            .panic
+            .take()
+            .and_then(dispose_foreign)
+            .or(worker.report.take().and_then(dispose_foreign));
+        if let Some(failed) = failed {
+            dispatch.failure.get_or_insert(failed);
+        }
+    }
+}
+
+/// A worker owns its file slots. Replacement/take precedes foreign Drop, so every
+/// lifecycle task reports Done with deterministic remaining ownership on unwind.
+fn work(tasks: &Receiver<Task>, publisher: &NativePublisher) -> Option<LifecycleFailure> {
+    let mut files: Vec<FileSlot> = Vec::new();
+    let mut lanes: Vec<Lane> = Vec::new();
     while let Ok(task) = tasks.recv() {
         let report = match task {
             Task::Attach {
                 slot,
                 generation,
                 file,
+                answers,
             } => {
-                place(&mut files, slot, Some((generation, file)));
-                Report::News(None)
+                let failed = match place(&mut files, slot, Some((generation, file))) {
+                    Ok(old) => retire_file(old),
+                    Err((unplaced, failed)) => {
+                        let _ = retire_file(unplaced);
+                        Some(failed)
+                    }
+                };
+                let failed = failed.or_else(|| open_lane(&mut lanes, slot, generation, answers));
+                Report::News {
+                    slot,
+                    generation,
+                    detached: false,
+                    failed,
+                }
             }
             Task::Detach { slot, generation } => {
-                if files
-                    .get(slot)
-                    .is_some_and(|f| f.as_ref().is_some_and(|(g, _)| *g == generation))
+                if let Some(lane) = lanes.get_mut(slot)
+                    && lane.as_ref().is_some_and(|(g, _)| *g == generation)
                 {
-                    place(&mut files, slot, None);
+                    *lane = None;
                 }
-                Report::News(Some((slot, generation)))
+                let old = files.get_mut(slot).and_then(|held| {
+                    if held.as_ref().is_some_and(|(g, _)| *g == generation) {
+                        held.take()
+                    } else {
+                        None
+                    }
+                });
+                let failed = retire_file(old);
+                Report::News {
+                    slot,
+                    generation,
+                    detached: true,
+                    failed,
+                }
             }
             Task::Transfer(transfer) => Report::Finished(carry_out(&files, transfer)),
+            Task::Read(direct) => {
+                read_directly(&files, &lanes, direct);
+                continue;
+            }
+            Task::Stop => break,
+            Task::Retired | Task::RetirementPanicked(_) => return Some(LifecycleFailure::Worker),
         };
-        if done.send(Event::Done { worker: id, report }).is_err() {
-            return;
+        if !publisher.publish(NativeExit::Report(report)) {
+            break;
+        }
+    }
+    // EOF cannot silently drop native duplicates. Retire each before the joined result;
+    // the first remaining lifecycle failure is retained without another allocation.
+    let mut first = None;
+    while let Some(file) = files.pop() {
+        if let Some(failed) = retire_file(file) {
+            first.get_or_insert(failed);
+        }
+    }
+    first
+}
+
+/// One worker file slot: the attachment generation and its single native duplicate.
+type FileSlot = Option<(u64, Handle)>;
+
+/// Keeps an attachment's completion channel at its slot beside its file: the refusal of the
+/// lane arena's growth, as the file arena's.
+fn open_lane(
+    lanes: &mut Vec<Lane>,
+    slot: usize,
+    generation: u64,
+    answers: Sender<Completion>,
+) -> Option<LifecycleFailure> {
+    if lanes.len() <= slot {
+        let need = slot.checked_add(1)?;
+        if lanes.try_reserve(need.saturating_sub(lanes.len())).is_err() {
+            return Some(LifecycleFailure::FileArena);
+        }
+        lanes.resize_with(need, || None);
+    }
+    match lanes.get_mut(slot) {
+        Some(at) => {
+            *at = Some((generation, answers));
+            None
+        }
+        None => Some(LifecycleFailure::FileArena),
+    }
+}
+
+/// Reads a direct read's one transfer on the worker's duplicate of its file, and answers it on its
+/// attachment's completion channel: the vector back with its buffer filled, or the read's failure,
+/// the vector then dropped, as a batch of one. With no lane for it the attachment has detached,
+/// which it does only once nothing it handed over is out, so no one waits for the answer.
+fn read_directly(files: &[FileSlot], lanes: &[Lane], direct: Direct) {
+    let Direct {
+        slot,
+        generation,
+        number,
+        mut transfers,
+    } = direct;
+    let Some((_, answers)) = lanes
+        .get(slot)
+        .and_then(Option::as_ref)
+        .filter(|(g, _)| *g == generation)
+    else {
+        return;
+    };
+    let Some((kept, at)) = transfers.first_mut() else {
+        let _ = answers.try_send(Completion::Batch((number, Ok(transfers))));
+        return;
+    };
+    let buf = std::mem::replace(kept, AlignedBuf::empty());
+    let finished = carry_out(
+        files,
+        Transfer {
+            slot,
+            generation,
+            number,
+            op: Op::Read {
+                index: 0,
+                buf,
+                at: *at,
+            },
+        },
+    );
+    let answer = match (finished.result, finished.write) {
+        (Ok(()), Some((_, Some(buf)))) => {
+            *kept = buf;
+            Ok(transfers)
+        }
+        (Ok(()), _) => Err(unwound()),
+        (Err(error), _) => Err(error),
+    };
+    // Its room is the batch's own: the submitter counted it out of the batches it attached for.
+    let _ = answers.try_send(Completion::Batch((number, answer)));
+}
+
+/// Puts the new owner in its slot before returning the old one for guarded retirement.
+fn place(
+    files: &mut Vec<FileSlot>,
+    slot: usize,
+    file: FileSlot,
+) -> Result<FileSlot, (FileSlot, LifecycleFailure)> {
+    if files.len() <= slot {
+        let Some(need) = slot.checked_add(1) else {
+            return Err((file, LifecycleFailure::FileArena));
+        };
+        if files.try_reserve(need.saturating_sub(files.len())).is_err() {
+            return Err((file, LifecycleFailure::FileArena));
+        }
+        files.resize_with(need, || None);
+    }
+    match files.get_mut(slot) {
+        Some(at) => Ok(std::mem::replace(at, file)),
+        None => Err((file, LifecycleFailure::FileArena)),
+    }
+}
+
+fn retire_file(file: FileSlot) -> Option<LifecycleFailure> {
+    file.and_then(|(_, mut file)| file.retire())
+}
+
+fn retire_task(task: Task) -> Option<LifecycleFailure> {
+    match task {
+        Task::Attach { mut file, .. } => file.retire(),
+        Task::Detach { .. } | Task::Transfer(_) | Task::Read(_) | Task::Stop | Task::Retired => {
+            None
+        }
+        Task::RetirementPanicked(payload) => {
+            drop(payload);
+            None
         }
     }
 }
 
-/// Puts `file` in slot `slot` of a worker's arena, growing it to hold the slot.
-fn place(files: &mut Vec<Option<(u64, Handle)>>, slot: usize, file: Option<(u64, Handle)>) {
-    if files.len() <= slot {
-        files.resize_with(slot.saturating_add(1), || None);
-    }
-    if let Some(at) = files.get_mut(slot) {
-        *at = file;
+fn retire_news(task: &mut Task) -> Option<LifecycleFailure> {
+    let owned = std::mem::replace(task, Task::Retired);
+    match std::panic::catch_unwind(AssertUnwindSafe(|| retire_task(owned))) {
+        Ok(failed) => failed,
+        Err(payload) => {
+            *task = Task::RetirementPanicked(payload);
+            Some(LifecycleFailure::FileDrop)
+        }
     }
 }
 
 /// Issues one transfer on the worker's duplicate of its file.
-fn carry_out(files: &[Option<(u64, Handle)>], transfer: Transfer) -> Finished {
+fn carry_out(files: &[FileSlot], transfer: Transfer) -> Finished {
     let Transfer {
         slot,
         generation,
@@ -685,7 +1621,20 @@ fn carry_out(files: &[Option<(u64, Handle)>], transfer: Transfer) -> Finished {
 /// number it attached for.
 struct Client {
     generation: u64,
-    answers: Sender<Numbered>,
+    /// The attach's reply until every worker holds the file: the workers still to, and whether
+    /// all that did took it.
+    confirming: Option<(SyncSender<AttachReply>, usize, bool)>,
+    answers: Sender<Completion>,
+    submissions: Option<ChannelReceiver<Submission>>,
+    /// The sole owner closed its drained lane; batches still own pending/in-flight data.
+    closing: bool,
+    failure: Option<LifecycleFailure>,
+    /// Cold Drop's receipt survives any retirement-reservation failure through native joins.
+    detached: Option<SyncSender<()>>,
+    /// Cold-registered independent receipt; it survives loss of the ordinary answers.
+    watch: Option<SyncSender<Result<(), DiskError>>>,
+    /// First actual write/flush or lifecycle error, even after its batch answer was taken.
+    physical_error: Option<DiskError>,
     limit: usize,
     batches: VecDeque<Batch>,
 }
@@ -698,8 +1647,24 @@ struct Batch {
     /// standing in while it is out.
     transfers: Transfers,
     failed: Option<DiskError>,
+    /// Read errors can be repaired; actual write/flush failures fence physical retirement.
+    non_abandonable: bool,
     /// A flush is still to be issued once the writes have completed.
     flush: bool,
+}
+
+impl Client {
+    fn submission(&mut self) -> Option<(u64, Option<Submission>)> {
+        match self.submissions.as_mut()?.try_recv() {
+            Ok(Some(submission)) => Some((self.generation, Some(submission))),
+            Err(SyncError::Closed(())) => {
+                self.submissions = None;
+                self.closing = true;
+                Some((self.generation, None))
+            }
+            Ok(None) | Err(_) => None,
+        }
+    }
 }
 
 /// A file being detached: the workers yet to drop their duplicates, and who waits for them.
@@ -707,7 +1672,28 @@ struct Detaching {
     slot: usize,
     generation: u64,
     remaining: usize,
-    done: SyncSender<()>,
+    failure: Option<LifecycleFailure>,
+    done: DetachAnswer,
+    watch: Option<SyncSender<Result<(), DiskError>>>,
+    physical_error: Option<DiskError>,
+}
+
+enum DetachAnswer {
+    Blocking(SyncSender<()>),
+    Task(Sender<Completion>),
+}
+
+impl DetachAnswer {
+    fn send(self, result: Result<(), DiskError>) {
+        match self {
+            Self::Blocking(done) => {
+                let _ = done.try_send(());
+            }
+            Self::Task(done) => {
+                let _ = done.try_send(Completion::Detached(result));
+            }
+        }
+    }
 }
 
 /// The issuer's state, owned by its thread.
@@ -730,6 +1716,7 @@ struct Dispatch<'a> {
     detaching: Vec<Detaching>,
     generation: u64,
     stopping: bool,
+    failure: Option<LifecycleFailure>,
     path: &'a Path,
 }
 
@@ -746,16 +1733,86 @@ impl<'a> Dispatch<'a> {
             detaching: Vec::new(),
             generation: 0,
             stopping: false,
+            failure: None,
             path,
         }
     }
 
-    fn run(mut self, inbox: &Receiver<Event>) {
-        while let Ok(event) = inbox.recv() {
-            self.event(event);
+    fn run(
+        &mut self,
+        inbox: &Receiver<Event>,
+        submission_pending: &mut ChannelReceiver<()>,
+        exited: &Receiver<()>,
+        native: &mut [NativeWorker<'_>],
+    ) {
+        let mut scan_needed = false;
+        loop {
+            // An early native unwind can leave a counted assignment without Done. Its
+            // distinct exit lane and permit drive typed shutdown, never a forged completion.
+            let exit_notified = matches!(exited.try_recv(), Ok(()));
+            if exit_notified {
+                self.native_exits(native);
+                if self.failure.is_some() {
+                    return;
+                }
+            }
+            let mut progressed = match inbox.try_recv() {
+                Ok(event) => {
+                    self.event(event);
+                    true
+                }
+                Err(TryRecvError::Empty) => false,
+                Err(TryRecvError::Disconnected) => return,
+            };
+            progressed |= self.inspect_submissions(submission_pending, &mut scan_needed);
             self.dispatch();
-            if self.stopping && self.in_flight == 0 {
+            if self.failure.is_some() || (self.stopping && self.in_flight == 0) {
                 return;
+            }
+            if !progressed {
+                // Publication between the empty checks and park leaves a permit; later
+                // publication wakes the parked dispatcher. Spurious wakes just recheck.
+                std::thread::park();
+            }
+        }
+    }
+
+    fn inspect_submissions(&mut self, pending: &mut ChannelReceiver<()>, scan: &mut bool) -> bool {
+        // Take the coalesced signal before scanning; late publication leaves the next permit.
+        if !matches!(pending.try_recv(), Ok(Some(()))) && !*scan {
+            return false;
+        }
+        *scan = false;
+        for slot in 0..self.clients.len() {
+            let submitted = self
+                .clients
+                .get_mut(slot)
+                .and_then(Option::as_mut)
+                .and_then(Client::submission);
+            if let Some((generation, submission)) = submitted {
+                *scan |= self.submission(slot, generation, submission);
+            }
+        }
+        true
+    }
+
+    fn submission(&mut self, slot: usize, generation: u64, submission: Option<Submission>) -> bool {
+        match submission {
+            Some(Submission::Batch {
+                number,
+                transfers,
+                kind,
+            }) => {
+                self.batch(slot, generation, number, transfers, kind);
+                true
+            }
+            Some(Submission::Retire) => {
+                self.retire(Retirement { slot, generation });
+                true
+            }
+            None => {
+                self.retire_if_finished(slot, generation);
+                false
             }
         }
     }
@@ -765,34 +1822,69 @@ impl<'a> Dispatch<'a> {
             Event::Attach {
                 files,
                 batches,
+                queued,
                 answers,
+                submissions,
+                reply,
+            } => match self.attach(files, batches, queued, answers, submissions) {
+                // Answered once every worker holds the file (`Self::confirm`): a direct read
+                // never reaches a worker before its file does.
+                Ok((slot, generation)) => {
+                    let workers = self.workers.len();
+                    if let Some(client) = self.client(slot, generation) {
+                        client.confirming = Some((reply, workers, true));
+                    }
+                }
+                Err(error) => {
+                    let _ = reply.try_send(Err(error));
+                }
+            },
+            Event::Watch {
+                slot,
+                generation,
+                done,
                 reply,
             } => {
-                let attached = self.attach(files, batches, answers);
-                let _ = reply.try_send(attached);
+                let result = self.watch(slot, generation, done);
+                let _ = reply.try_send(result);
             }
             Event::Detach {
                 slot,
                 generation,
                 done,
             } => self.detach(slot, generation, done),
-            Event::Batch {
-                slot,
-                generation,
-                number,
-                transfers,
-                kind,
-            } => self.batch(slot, generation, number, transfers, kind),
-            Event::Done { worker, report } => {
-                self.idle.push(worker);
-                self.in_flight = self.in_flight.saturating_sub(1);
-                match report {
-                    Report::News(dropped) => self.dropped(dropped),
-                    Report::Finished(finished) => self.finished(finished),
-                }
-            }
             Event::Stop => {
                 self.stopping = true;
+                let bound = self.clients.len();
+                for slot in 0..bound {
+                    let lane = self
+                        .clients
+                        .get_mut(slot)
+                        .and_then(Option::as_mut)
+                        .and_then(|client| {
+                            Some((client.generation, client.limit, client.submissions.take()?))
+                        });
+                    if let Some((generation, limit, mut submissions)) = lane {
+                        // All pre-Stop publications are in this FIFO prefix, at most the
+                        // declared out credit. Refuse each with its number before closing
+                        // admission; later racing publications cannot make this unbounded.
+                        for _ in 0..limit {
+                            let Ok(Some(submission)) = submissions.try_recv() else {
+                                break;
+                            };
+                            if let Submission::Batch {
+                                number,
+                                transfers,
+                                kind,
+                            } = submission
+                            {
+                                self.batch(slot, generation, number, transfers, kind);
+                            }
+                        }
+                    }
+                }
+                // Completion senders remain through native joins, including for a
+                // retirement refused after the admission lane closed.
                 for transfer in std::mem::take(&mut self.pending) {
                     self.refused(transfer);
                 }
@@ -800,11 +1892,27 @@ impl<'a> Dispatch<'a> {
         }
     }
 
+    fn done(&mut self, worker: usize, report: Report) {
+        self.idle.push(worker);
+        self.in_flight = self.in_flight.saturating_sub(1);
+        match report {
+            Report::News {
+                slot,
+                generation,
+                detached,
+                failed,
+            } => self.lifecycle(slot, generation, detached, failed),
+            Report::Finished(finished) => self.finished(finished, true),
+        }
+    }
+
     fn attach(
         &mut self,
         files: Vec<Handle>,
         limit: usize,
-        answers: Sender<Numbered>,
+        queued: VecDeque<Batch>,
+        answers: Sender<Completion>,
+        submissions: ChannelReceiver<Submission>,
     ) -> Result<(usize, u64), DiskError> {
         if self.stopping {
             return Err(stopped(self.path, "the device's issuer is stopping"));
@@ -830,13 +1938,21 @@ impl<'a> Dispatch<'a> {
                 slot,
                 generation,
                 file,
+                answers: answers.clone(),
             });
         }
         let client = Some(Client {
             generation,
+            confirming: None,
             answers,
+            submissions: Some(submissions),
+            closing: false,
+            failure: None,
+            detached: None,
+            watch: None,
+            physical_error: None,
             limit,
-            batches: VecDeque::with_capacity(limit),
+            batches: queued,
         });
         match self.clients.get_mut(slot) {
             Some(free) => *free = client,
@@ -845,15 +1961,155 @@ impl<'a> Dispatch<'a> {
         Ok((slot, generation))
     }
 
+    fn watch(
+        &mut self,
+        slot: usize,
+        generation: u64,
+        done: SyncSender<Result<(), DiskError>>,
+    ) -> Result<(), DiskError> {
+        if self.stopping {
+            return Err(stopped(self.path, "the device's issuer is stopping"));
+        }
+        let path = self.path;
+        let client = self
+            .client(slot, generation)
+            .ok_or_else(|| stopped(path, "the watched attachment has retired"))?;
+        if client.watch.is_some() || client.closing {
+            return Err(invalid(
+                path,
+                "a physical retirement watch is already registered or closing",
+            ));
+        }
+        client.watch = Some(done);
+        Ok(())
+    }
+
     fn detach(&mut self, slot: usize, generation: u64, done: SyncSender<()>) {
         if self.client(slot, generation).is_none() {
             let _ = done.try_send(());
             return;
         }
-        // The submitter waits for nothing once it detaches; its batches, if any, have ended.
+        // Keep the cold receipt with the client before any fallible growth or batch routing.
+        if let Some(client) = self.client(slot, generation) {
+            client.detached = Some(done);
+        }
+        if !self.reserve_detach() {
+            return;
+        }
+        // Batch publications precede Drop's Detach. Taking their bounded lane snapshot
+        // preserves that FIFO relation before the client is removed; its owner cannot refill.
+        let bound = self
+            .client(slot, generation)
+            .map_or(0, |client| client.limit);
+        for _ in 0..bound {
+            let submission = self
+                .client(slot, generation)
+                .and_then(|client| client.submissions.as_mut()?.try_recv().ok().flatten());
+            let Some(submission) = submission else {
+                break;
+            };
+            if let Submission::Batch {
+                number,
+                transfers,
+                kind,
+            } = submission
+            {
+                self.batch(slot, generation, number, transfers, kind);
+            }
+        }
+        if let Some(client) = self.client(slot, generation)
+            && client.watch.is_some()
+        {
+            client.submissions = None;
+            client.closing = true;
+            self.retire_if_finished(slot, generation);
+            return;
+        }
+        let Some((done, failure)) = self
+            .client(slot, generation)
+            .and_then(|client| Some((client.detached.as_ref()?.clone(), client.failure)))
+        else {
+            return;
+        };
+        self.detach_with(
+            slot,
+            generation,
+            DetachAnswer::Blocking(done),
+            failure,
+            None,
+            None,
+        );
+        // The published Detaching now owns the receipt; no allocation separates this transfer.
         if let Some(client) = self.clients.get_mut(slot) {
             *client = None;
         }
+    }
+
+    fn retire(&mut self, retirement: Retirement) {
+        if self
+            .client(retirement.slot, retirement.generation)
+            .is_none()
+        {
+            return;
+        }
+        if !self.reserve_detach() {
+            return;
+        }
+        let Some(client) = self.client(retirement.slot, retirement.generation) else {
+            return;
+        };
+        let done = match client.detached.take() {
+            Some(done) => DetachAnswer::Blocking(done),
+            None => DetachAnswer::Task(client.answers.clone()),
+        };
+        let failure = client.failure;
+        let watch = client.watch.take();
+        let physical_error = client.physical_error.take();
+        self.detach_with(
+            retirement.slot,
+            retirement.generation,
+            done,
+            failure,
+            watch,
+            physical_error,
+        );
+        if let Some(client) = self.clients.get_mut(retirement.slot) {
+            *client = None;
+        }
+    }
+
+    fn retire_if_finished(&mut self, slot: usize, generation: u64) {
+        if self
+            .client(slot, generation)
+            .is_some_and(|client| client.closing && client.batches.is_empty())
+        {
+            self.retire(Retirement { slot, generation });
+        }
+    }
+
+    fn reserve_detach(&mut self) -> bool {
+        if self.detaching.try_reserve(1).is_err()
+            || self
+                .news
+                .iter_mut()
+                .any(|news| news.try_reserve(1).is_err())
+        {
+            // Retain every client/receipt until the broker closes worker lanes and joins.
+            self.failure.get_or_insert(LifecycleFailure::DispatchArena);
+            return false;
+        }
+        true
+    }
+
+    fn detach_with(
+        &mut self,
+        slot: usize,
+        generation: u64,
+        done: DetachAnswer,
+        failure: Option<LifecycleFailure>,
+        watch: Option<SyncSender<Result<(), DiskError>>>,
+        physical_error: Option<DiskError>,
+    ) {
         for news in &mut self.news {
             news.push_back(Task::Detach { slot, generation });
         }
@@ -861,12 +2117,15 @@ impl<'a> Dispatch<'a> {
             slot,
             generation,
             remaining: self.workers.len(),
+            failure,
             done,
+            watch,
+            physical_error,
         });
     }
 
     /// A worker dropped its duplicate of a detached file; the last one answers the detach.
-    fn dropped(&mut self, dropped: Option<(usize, u64)>) {
+    fn dropped(&mut self, dropped: Option<(usize, u64)>, failed: Option<LifecycleFailure>) {
         let Some((slot, generation)) = dropped else {
             return;
         };
@@ -878,12 +2137,219 @@ impl<'a> Dispatch<'a> {
             return;
         };
         let finished = self.detaching.get_mut(at).is_some_and(|d| {
+            if let Some(failed) = failed {
+                d.failure.get_or_insert(failed);
+            }
             d.remaining = d.remaining.saturating_sub(1);
             d.remaining == 0
         });
         if finished {
             let d = self.detaching.swap_remove(at);
-            let _ = d.done.try_send(());
+            let result = d
+                .failure
+                .map_or(Ok(()), |failed| Err(failed.error(self.path)));
+            send_watch(
+                d.watch,
+                d.physical_error
+                    .or_else(|| d.failure.map(|failed| failed.error(self.path))),
+            );
+            d.done.send(result);
+        }
+    }
+
+    fn lifecycle(
+        &mut self,
+        slot: usize,
+        generation: u64,
+        detached: bool,
+        failed: Option<LifecycleFailure>,
+    ) {
+        let path = self.path;
+        if !detached {
+            self.confirm(slot, generation, failed.is_none());
+        }
+        if let Some(failed) = failed
+            && let Some(client) = self.client(slot, generation)
+        {
+            client.failure.get_or_insert(failed);
+            for batch in &mut client.batches {
+                // A known earlier transfer failure is never overwritten by teardown.
+                batch.failed.get_or_insert_with(|| failed.error(path));
+            }
+        }
+        if detached {
+            self.dropped(Some((slot, generation)), failed);
+        }
+    }
+
+    /// One worker holds an attachment's file, or refused it. Once every worker has, the attach is
+    /// answered with the workers' inboxes for its direct reads, or none when one refused the file:
+    /// a direct read never goes to a worker without it. The refusal itself is the client's
+    /// failure, as before, and fails its batches.
+    fn confirm(&mut self, slot: usize, generation: u64, held: bool) {
+        let reply = {
+            let Some(client) = self.client(slot, generation) else {
+                return;
+            };
+            let Some((reply, left, all)) = client.confirming.take() else {
+                return;
+            };
+            let all = all && held;
+            match left.checked_sub(1) {
+                Some(left) if left > 0 => {
+                    client.confirming = Some((reply, left, all));
+                    return;
+                }
+                _ => (reply, all),
+            }
+        };
+        let (reply, all) = reply;
+        let mut inboxes = Vec::new();
+        if all && inboxes.try_reserve_exact(self.workers.len()).is_ok() {
+            inboxes.extend(self.workers.iter().cloned());
+        }
+        let _ = reply.try_send(Ok((slot, generation, inboxes)));
+    }
+
+    fn native_exits(&mut self, native: &mut [NativeWorker<'_>]) {
+        for (index, worker) in native.iter_mut().enumerate() {
+            self.native_worker(index, worker);
+            if self.failure.is_some() {
+                return;
+            }
+        }
+    }
+
+    fn native_worker(&mut self, index: usize, worker: &mut NativeWorker<'_>) {
+        for _ in 0..NATIVE_EXIT_ROLES {
+            match worker.retirement.try_recv() {
+                Ok(NativeExit::Report(report)) => self.done(index, report),
+                Ok(NativeExit::Ended(failed)) => {
+                    worker.ended = true;
+                    self.failure
+                        .get_or_insert(failed.unwrap_or(LifecycleFailure::Worker));
+                }
+                Err(TryRecvError::Disconnected) if !worker.ended => {
+                    worker.ended = true;
+                    self.failure.get_or_insert(LifecycleFailure::Worker);
+                }
+                Err(_) => break,
+            }
+            if self.failure.is_some() {
+                return;
+            }
+        }
+    }
+
+    fn terminal_report(&mut self, report: &Report) {
+        match report {
+            Report::Finished(finished) => self.terminal_transfer(finished),
+            Report::News {
+                slot,
+                generation,
+                failed,
+                ..
+            } => self.terminal_news(*slot, *generation, *failed),
+        }
+    }
+
+    fn terminal_transfer(&mut self, finished: &Finished) {
+        if let Err(error) = &finished.result {
+            self.physical_failure(finished.slot, finished.generation, finished.number, error);
+        }
+    }
+
+    fn terminal_news(&mut self, slot: usize, generation: u64, failed: Option<LifecycleFailure>) {
+        let Some(failed) = failed else {
+            return;
+        };
+        if let Some(client) = self.client(slot, generation) {
+            client.failure.get_or_insert(failed);
+        }
+        if let Some(detaching) = self
+            .detaching
+            .iter_mut()
+            .find(|d| d.slot == slot && d.generation == generation)
+        {
+            detaching.failure.get_or_insert(failed);
+        }
+    }
+
+    fn retire_news(&mut self) {
+        for news in &mut self.news {
+            for task in news {
+                if let Some(failed) = retire_news(task) {
+                    self.failure.get_or_insert(failed);
+                }
+            }
+        }
+    }
+
+    fn dispose_news(&mut self) {
+        for news in &mut self.news {
+            for task in news {
+                let owned = std::mem::replace(task, Task::Retired);
+                if let Some(failed) = dispose_foreign(owned) {
+                    self.failure.get_or_insert(failed);
+                }
+            }
+        }
+    }
+
+    fn record_disposal<T>(&mut self, owned: Option<T>) {
+        if let Some(failed) = owned.and_then(dispose_foreign) {
+            self.failure.get_or_insert(failed);
+        }
+    }
+
+    fn terminal_watches(&mut self) {
+        for client in self.clients.iter_mut().flatten() {
+            let watch_error = client.physical_error.take().unwrap_or_else(|| {
+                client.failure.or(self.failure).map_or_else(
+                    || stopped(self.path, "the device's issuer has stopped"),
+                    |failed| failed.error(self.path),
+                )
+            });
+            send_watch(client.watch.take(), Some(watch_error));
+        }
+        for detaching in &mut self.detaching {
+            let watch_error = detaching.physical_error.take().unwrap_or_else(|| {
+                detaching.failure.or(self.failure).map_or_else(
+                    || stopped(self.path, "the device's issuer has stopped"),
+                    |failed| failed.error(self.path),
+                )
+            });
+            send_watch(detaching.watch.take(), Some(watch_error));
+        }
+    }
+
+    fn terminal(&mut self) {
+        self.terminal_watches();
+        for client in &mut self.clients {
+            if let Some(mut client) = client.take() {
+                // Preserve an already-known physical failure before later lifecycle/Stop.
+                let failed = client
+                    .batches
+                    .iter_mut()
+                    .find_map(|batch| batch.failed.take());
+                let result = Err(failed.unwrap_or_else(|| {
+                    client.failure.or(self.failure).map_or_else(
+                        || stopped(self.path, "the device's issuer has stopped"),
+                        |failed| failed.error(self.path),
+                    )
+                }));
+                let _ = client.answers.try_send(Completion::Detached(result));
+                if let Some(done) = client.detached.take() {
+                    let _ = done.try_send(());
+                }
+            }
+        }
+        for detaching in self.detaching.drain(..) {
+            let result = Err(detaching.failure.or(self.failure).map_or_else(
+                || stopped(self.path, "the device's issuer has stopped"),
+                |failed| failed.error(self.path),
+            ));
+            detaching.done.send(result);
         }
     }
 
@@ -902,18 +2368,28 @@ impl<'a> Dispatch<'a> {
             // Not attached: the submitter's answers went with it.
             return;
         };
+        if let Some(failed) = client.failure {
+            let _ = client
+                .answers
+                .try_send(Completion::Batch((number, Err(failed.error(path)))));
+            return;
+        }
         if refused || client.batches.len() >= client.limit {
             let why = if refused {
                 "the device's issuer is stopping"
             } else {
                 "a batch past those its submitter attached for"
             };
-            let _ = client.answers.try_send((number, Err(stopped(path, why))));
+            let _ = client
+                .answers
+                .try_send(Completion::Batch((number, Err(stopped(path, why)))));
             return;
         }
         let count = transfers.len();
         if count == 0 && !flush {
-            let _ = client.answers.try_send((number, Ok(transfers)));
+            let _ = client
+                .answers
+                .try_send(Completion::Batch((number, Ok(transfers))));
             return;
         }
         if count == 0 {
@@ -947,6 +2423,7 @@ impl<'a> Dispatch<'a> {
                 outstanding,
                 transfers,
                 failed: None,
+                non_abandonable: matches!(kind, Kind::Write { .. }),
                 flush: flush && count > 0,
             });
         }
@@ -961,7 +2438,19 @@ impl<'a> Dispatch<'a> {
 
     /// Records a transfer's report, and answers its batch or issues its flush once every write
     /// has completed.
-    fn finished(&mut self, finished: Finished) {
+    fn physical_failure(&mut self, slot: usize, generation: u64, number: u64, error: &DiskError) {
+        if let Some(client) = self.client(slot, generation)
+            && client.physical_error.is_none()
+            && client
+                .batches
+                .iter()
+                .any(|batch| batch.number == number && batch.non_abandonable)
+        {
+            client.physical_error = Some(copy_disk_error(error));
+        }
+    }
+
+    fn finished(&mut self, finished: Finished, physical: bool) {
         let Finished {
             slot,
             generation,
@@ -969,6 +2458,9 @@ impl<'a> Dispatch<'a> {
             write,
             result,
         } = finished;
+        if physical && let Err(error) = &result {
+            self.physical_failure(slot, generation, number, error);
+        }
         let Some(client) = self.client(slot, generation) else {
             return;
         };
@@ -1007,8 +2499,9 @@ impl<'a> Dispatch<'a> {
                 Some(e) => Err(e),
                 None => Ok(batch.transfers),
             };
-            let _ = client.answers.try_send((number, answer));
+            let _ = client.answers.try_send(Completion::Batch((number, answer)));
         }
+        self.retire_if_finished(slot, generation);
     }
 
     /// A transfer never issued: its batch fails.
@@ -1023,13 +2516,16 @@ impl<'a> Dispatch<'a> {
             Op::Flush => None,
         };
         let path = self.path;
-        self.finished(Finished {
-            slot: transfer.slot,
-            generation: transfer.generation,
-            number: transfer.number,
-            write,
-            result: Err(stopped(path, why)),
-        });
+        self.finished(
+            Finished {
+                slot: transfer.slot,
+                generation: transfer.generation,
+                number: transfer.number,
+                write,
+                result: Err(stopped(path, why)),
+            },
+            false,
+        );
     }
 
     /// Hands each idle worker its news first, then queued transfers to the idle workers with
@@ -1043,14 +2539,13 @@ impl<'a> Dispatch<'a> {
             };
             idle.pop();
             let sent = match self.workers.get(worker) {
-                Some(slot) => slot.try_send(Task::Transfer(transfer)),
-                None => Err(TrySendError::Disconnected(Task::Transfer(transfer))),
+                Some(slot) => assign(slot, Task::Transfer(transfer)),
+                None => Err(Task::Transfer(transfer)),
             };
-            // An idle worker's slot is empty; one that is not, or whose worker ended, keeps no
-            // place among the idle, and its transfer fails its batch.
+            // A worker that ended keeps no place among the idle, and its transfer fails its batch.
             match sent {
                 Ok(()) => self.in_flight = self.in_flight.saturating_add(1),
-                Err(TrySendError::Full(task) | TrySendError::Disconnected(task)) => {
+                Err(task) => {
                     if let Task::Transfer(transfer) = task {
                         self.failed(transfer, "a device worker has ended");
                     }
@@ -1065,15 +2560,108 @@ impl<'a> Dispatch<'a> {
         let Some(task) = self.news.get_mut(worker).and_then(VecDeque::pop_front) else {
             return false;
         };
-        let sent = self
-            .workers
-            .get(worker)
-            .is_some_and(|slot| slot.try_send(task).is_ok());
-        if sent {
-            self.in_flight = self.in_flight.saturating_add(1);
+        let sent = match self.workers.get(worker) {
+            Some(slot) => assign(slot, task),
+            None => Err(task),
+        };
+        match sent {
+            Ok(()) => self.in_flight = self.in_flight.saturating_add(1),
+            Err(task) => {
+                self.failure.get_or_insert(LifecycleFailure::Worker);
+                let _ = retire_task(task); // Secondary cleanup cannot replace the first refusal.
+            }
         }
-        // A worker that ended takes no news and no transfer: it leaves the idle.
+        // Any refused assignment drives broker shutdown and real joins, not a fake Done.
         true
+    }
+}
+
+/// Hands an idle worker a task. Its inbox has room for the one assignment beside the direct reads
+/// of its submitters' budget; past that budget, the broker waits for the worker, which never waits
+/// on the broker, rather than take a full inbox for an ended worker. The task back when the worker
+/// has ended.
+fn assign(slot: &SyncSender<Task>, task: Task) -> Result<(), Task> {
+    match slot.try_send(task) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(task)) => slot.send(task).map_err(|refused| refused.0),
+        Err(TrySendError::Disconnected(task)) => Err(task),
+    }
+}
+
+/// Drop only after all native joins and inside a boundary. A normal destructor unwind
+/// and its ordinary panic payload become a typed failure, before terminal publication.
+/// Recursive/process-aborting panic payload destructors are outside recoverable claims.
+fn dispose_foreign<T>(owned: T) -> Option<LifecycleFailure> {
+    let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(|| drop(owned))) else {
+        return None;
+    };
+    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| drop(payload)));
+    Some(LifecycleFailure::RetiredDrop)
+}
+
+/// One reserved terminal credit, never a wait on the submitter or its receiver.
+fn send_watch(done: Option<SyncSender<Result<(), DiskError>>>, error: Option<DiskError>) {
+    if let Some(done) = done {
+        let _ = done.try_send(error.map_or(Ok(()), Err));
+    }
+}
+
+/// Only fault paths duplicate an error: the watch must retain it after the ordinary
+/// numbered answer is consumed. Success adds no error allocation or transfer copy.
+fn copy_disk_error(error: &DiskError) -> DiskError {
+    match error {
+        DiskError::Io { op, path, source } => DiskError::Io {
+            op,
+            path: path.clone(),
+            source: source.raw_os_error().map_or_else(
+                || {
+                    let detail =
+                        match std::panic::catch_unwind(AssertUnwindSafe(|| source.to_string())) {
+                            Ok(detail) => detail,
+                            Err(payload) => {
+                                dispose_foreign(payload);
+                                "a device error's formatter unwound".to_owned()
+                            }
+                        };
+                    std::io::Error::new(source.kind(), detail)
+                },
+                std::io::Error::from_raw_os_error,
+            ),
+        },
+        DiskError::Misaligned { offset, len, align } => DiskError::Misaligned {
+            offset: *offset,
+            len: *len,
+            align: *align,
+        },
+        DiskError::ShortRead {
+            path,
+            offset,
+            missing,
+        } => DiskError::ShortRead {
+            path: path.clone(),
+            offset: *offset,
+            missing: *missing,
+        },
+        DiskError::Buf(error) => DiskError::Buf(error.clone()),
+        DiskError::Threads {
+            path,
+            asked,
+            left,
+            ceiling,
+        } => DiskError::Threads {
+            path: path.clone(),
+            asked: *asked,
+            left: *left,
+            ceiling: *ceiling,
+        },
+        DiskError::Unsupported { path, reason } => DiskError::Unsupported {
+            path: path.clone(),
+            reason,
+        },
+        DiskError::Corrupt { path, what } => DiskError::Corrupt {
+            path: path.clone(),
+            what,
+        },
     }
 }
 
@@ -1082,6 +2670,16 @@ fn stopped(path: &Path, why: &str) -> DiskError {
         op: "issue",
         path: path.to_path_buf(),
         source: std::io::Error::new(std::io::ErrorKind::BrokenPipe, why.to_owned()),
+    }
+}
+
+fn completion_context(path: &Path, cx: &std::task::Context<'_>) -> Result<(), DiskError> {
+    if hyper_rt::futures::current_task()
+        .is_some_and(|task| hyper_rt::waker::waker_for(task.0).will_wake(cx.waker()))
+    {
+        Ok(())
+    } else {
+        Err(completion_error(path, SyncError::NotOnShardThread(())))
     }
 }
 
@@ -1099,6 +2697,43 @@ fn unwound() -> DiskError {
     stopped(Path::new(""), "a device worker unwound")
 }
 
+/// Rust 1.98 std's bounded queue packs an index, mark and lap into usize, and
+/// allocates one AtomicUsize plus message slot per capacity. Refuse overflowing
+/// ticket arithmetic or allocation layout before calling its infallible constructor.
+fn channel_capacity<T>(path: &Path, capacity: usize) -> Result<(), DiskError> {
+    let ticket = capacity
+        .checked_add(1)
+        .and_then(usize::checked_next_power_of_two)
+        .and_then(|mark| mark.checked_mul(2));
+    if capacity == 0 || ticket.is_none() {
+        return Err(invalid(
+            path,
+            "the bounded channel's ticket capacity exceeds usize",
+        ));
+    }
+    let (slot, _) = std::alloc::Layout::new::<std::sync::atomic::AtomicUsize>()
+        .extend(std::alloc::Layout::new::<std::mem::MaybeUninit<T>>())
+        .map_err(|_| invalid(path, "the bounded channel's slot layout exceeds isize"))?;
+    let slot = slot.pad_to_align();
+    let bytes = slot
+        .size()
+        .checked_mul(capacity)
+        .ok_or_else(|| invalid(path, "the bounded channel's array size exceeds usize"))?;
+    std::alloc::Layout::from_size_align(bytes, slot.align())
+        .map_err(|_| invalid(path, "the bounded channel's array layout exceeds isize"))?;
+    Ok(())
+}
+
+/// Blocking APIs stay on the cold owner or native workers. Refuse before hardware
+/// setup, file duplication, accepted submission or consumption of a ready answer.
+fn blocking_call_allowed(path: &Path, why: &'static str) -> Result<(), DiskError> {
+    if hyper_rt::registry::current_shard().is_some() {
+        Err(invalid(path, why))
+    } else {
+        Ok(())
+    }
+}
+
 fn invalid(path: &Path, why: &str) -> DiskError {
     DiskError::Io {
         op: "issue",
@@ -1109,8 +2744,11 @@ fn invalid(path: &Path, why: &str) -> DiskError {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_types)]
+
     use std::future::{Future, poll_fn};
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex};
     use std::task::{Context, Poll, Waker};
 
     use hyper_rt::combine::{Either, race2};
@@ -1272,6 +2910,405 @@ mod tests {
         fn drop(&mut self) {
             self.0.open.store(true, Ordering::SeqCst);
         }
+    }
+
+    #[derive(Default)]
+    struct DropGate {
+        entered: AtomicBool,
+        open: Mutex<bool>,
+        changed: Condvar,
+    }
+
+    impl DropGate {
+        fn entered(&self) {
+            let mut open = self.open.lock().unwrap();
+            while !self.entered.load(Ordering::SeqCst) {
+                open = self.changed.wait(open).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            *self.open.lock().unwrap() = true;
+            self.changed.notify_all();
+        }
+    }
+
+    struct DropProbe {
+        file: Probe,
+        gate: Option<&'static DropGate>,
+        duplicates: &'static DropGate,
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            if let Some(gate) = self.gate {
+                let mut open = gate.open.lock().unwrap();
+                gate.entered.store(true, Ordering::SeqCst);
+                gate.changed.notify_all();
+                while !*open {
+                    open = gate.changed.wait(open).unwrap();
+                }
+            }
+        }
+    }
+
+    impl BlockFile for DropProbe {
+        fn alignment(&self) -> Alignment {
+            self.file.alignment()
+        }
+
+        fn len(&self) -> Result<u64, DiskError> {
+            self.file.len()
+        }
+
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), DiskError> {
+            self.file.read_exact_at(buf, offset)
+        }
+
+        fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError> {
+            self.file.write_all_at(buf, offset)
+        }
+
+        fn sync_data(&self) -> Result<(), DiskError> {
+            self.file.sync_data()
+        }
+
+        fn try_clone(&self) -> Result<Self, DiskError> {
+            Ok(Self {
+                file: self.file.try_clone()?,
+                gate: Some(self.duplicates),
+                duplicates: self.duplicates,
+            })
+        }
+    }
+
+    struct ReleaseDropOnDrop {
+        attached: Attached,
+        gate: &'static DropGate,
+    }
+
+    impl Drop for ReleaseDropOnDrop {
+        fn drop(&mut self) {
+            // Open before the attachment field's Drop can wait for native retirement.
+            self.gate.release();
+        }
+    }
+
+    /// Closed completion means native duplicates are gone, including when Issuer::Drop
+    /// runs concurrently and a worker's actual file Drop is held after its last write.
+    #[test]
+    fn stopped_issuer_retirement_waits_for_worker_file_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate: &'static DropGate = Box::leak(Box::default());
+        let probe = DropProbe {
+            file: Probe::new(dir.path(), true, None),
+            gate: None,
+            duplicates: gate,
+        };
+        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+        let mut attached = issuer.attach(&probe).unwrap();
+        let returned = attached.write(writes(1), false).unwrap();
+        assert_eq!(returned[0].0.as_slice(), &[fill(0); 4096]);
+        assert_eq!(attached.out(), 0);
+        let counts = probe.file.counts;
+        let progressed: &'static AtomicBool = Box::leak(Box::default());
+        let mut rt = runtime();
+        std::thread::scope(|scope| {
+            let mut owned = ReleaseDropOnDrop { attached, gate };
+            let shutdown = scope.spawn(move || drop(issuer));
+            gate.entered();
+            eprintln!("issuer shutdown worker duplicate Drop held after completed write");
+            rt.block_on(async move {
+                assert_eq!(counts.alive.load(Ordering::SeqCst), 2);
+                let mut retirement = std::pin::pin!(owned.attached.retire_async());
+                poll_fn(|cx| {
+                    assert!(retirement.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                hyper_rt::futures::spawn_detached(async move {
+                    assert!(gate.entered.load(Ordering::SeqCst));
+                    assert_eq!(counts.alive.load(Ordering::SeqCst), 2);
+                    progressed.store(true, Ordering::SeqCst);
+                    gate.release();
+                })
+                .unwrap();
+                let result = retirement.await;
+                assert!(matches!(
+                    result,
+                    Err(DiskError::Io { source, .. })
+                        if source.kind() == std::io::ErrorKind::BrokenPipe
+                ));
+                assert!(progressed.load(Ordering::SeqCst));
+                assert_eq!(counts.alive.load(Ordering::SeqCst), 1);
+            })
+            .unwrap();
+            shutdown.join().unwrap();
+        });
+        assert_eq!(probe.file.counts.alive.load(Ordering::SeqCst), 1);
+    }
+
+    struct ReleaseIoOnDrop {
+        attached: Attached,
+        counts: &'static Counts,
+    }
+
+    impl Drop for ReleaseIoOnDrop {
+        fn drop(&mut self) {
+            self.counts.open.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn coalesced_submissions_with_held_io(fail_second: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = Probe::new(dir.path(), false, fail_second.then_some(4096));
+        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+        let mut owned = ReleaseIoOnDrop {
+            attached: issuer.attach_deep(&probe, 2).unwrap(),
+            counts: probe.counts,
+        };
+        let first = owned.attached.submit(writes(1), false).unwrap();
+        probe.entered(1);
+        let progressed: &'static AtomicBool = Box::leak(Box::default());
+        let counts = probe.counts;
+        let mut rt = runtime();
+        let (issuer, probe) = rt
+            .block_on(async move {
+                let mut second_bytes = writes(1);
+                second_bytes[0].1 = 4096;
+                let second = owned.attached.submit(second_bytes, false).unwrap();
+                assert_eq!(owned.attached.out(), 2);
+                assert!(owned.attached.submit(writes(1), false).is_err());
+                assert_eq!(owned.attached.out(), 2);
+                hyper_rt::futures::spawn_detached(async move {
+                    assert_eq!(counts.in_flight.load(Ordering::SeqCst), 1);
+                    progressed.store(true, Ordering::SeqCst);
+                    counts.open.store(true, Ordering::SeqCst);
+                })
+                .unwrap();
+                for expected in [first, second] {
+                    let (number, answer) = owned.attached.answer_async().await.unwrap();
+                    assert_eq!(number, expected);
+                    if expected == second && fail_second {
+                        assert!(answer.is_err());
+                    } else {
+                        assert_eq!(answer.unwrap()[0].0.as_slice(), &[fill(0); 4096]);
+                    }
+                }
+                assert!(progressed.load(Ordering::SeqCst));
+                assert_eq!(owned.attached.out(), 0);
+                counts.fail_at.store(u64::MAX, Ordering::SeqCst);
+                let number = owned.attached.submit(writes(1), true).unwrap();
+                let (answered, bytes) = owned.attached.answer_async().await.unwrap();
+                assert_eq!(answered, number);
+                assert_eq!(bytes.unwrap()[0].0.as_slice(), &[fill(0); 4096]);
+                owned.attached.retire_async().await.unwrap();
+                drop(owned);
+                (issuer, probe)
+            })
+            .unwrap();
+        let mut read = [0; 4096];
+        probe.read_exact_at(&mut read, 0).unwrap();
+        assert_eq!(read, [fill(0); 4096]);
+        drop(issuer);
+        assert_eq!(probe.counts.alive.load(Ordering::SeqCst), 1);
+    }
+
+    /// A held device write cannot block another admitted lane publication or a sibling
+    /// task; a coalesced doorbell continues every admitted batch to its exact answer.
+    #[test]
+    fn coalesced_submissions_keep_progress_and_batch_identity() {
+        coalesced_submissions_with_held_io(false);
+    }
+
+    /// A failed queued write returns its own error, leaves no out credit, and the same
+    /// attachment can write, flush and retire correctly afterward.
+    #[test]
+    fn a_coalesced_failed_submission_keeps_progress_and_reuse() {
+        coalesced_submissions_with_held_io(true);
+    }
+
+    /// Stop preserves every pre-Stop batch number while an actual write is still held.
+    /// A refused queued batch is answered first; terminal closure waits for the held write.
+    #[test]
+    fn stop_refuses_queued_numbers_and_waits_for_held_native_io() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = Probe::new(dir.path(), false, None);
+        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+        let mut owned = ReleaseIoOnDrop {
+            attached: issuer.attach_deep(&probe, 2).unwrap(),
+            counts: probe.counts,
+        };
+        let first = owned.attached.submit(writes(1), false).unwrap();
+        probe.entered(1);
+        let second = owned.attached.submit(writes(1), false).unwrap();
+        let counts = probe.counts;
+        let progressed: &'static AtomicBool = Box::leak(Box::default());
+        let mut rt = runtime();
+        eprintln!("stop case: actual first write Held; both batch numbers accepted");
+        std::thread::scope(|scope| {
+            let shutdown = scope.spawn(move || drop(issuer));
+            rt.block_on(async move {
+                let (refused, result) = owned.attached.answer_async().await.unwrap();
+                assert_eq!(refused, second);
+                assert!(matches!(result, Err(DiskError::Io { .. })));
+                assert_eq!(counts.in_flight.load(Ordering::SeqCst), 1);
+                assert_eq!(owned.attached.out(), 1);
+                let (answered, bytes) = {
+                    let mut answer = std::pin::pin!(owned.attached.answer_async());
+                    poll_fn(|cx| {
+                        assert!(answer.as_mut().poll(cx).is_pending());
+                        Poll::Ready(())
+                    })
+                    .await;
+                    hyper_rt::futures::spawn_detached(async move {
+                        assert_eq!(counts.in_flight.load(Ordering::SeqCst), 1);
+                        progressed.store(true, Ordering::SeqCst);
+                        counts.open.store(true, Ordering::SeqCst);
+                    })
+                    .unwrap();
+                    answer.await.unwrap()
+                };
+                assert_eq!(answered, first);
+                assert_eq!(bytes.unwrap()[0].0.as_slice(), &[fill(0); 4096]);
+                assert!(progressed.load(Ordering::SeqCst));
+                assert_eq!(owned.attached.out(), 0);
+                assert!(owned.attached.retire_async().await.is_err());
+                assert_eq!(counts.alive.load(Ordering::SeqCst), 1);
+                drop(owned);
+            })
+            .unwrap();
+            shutdown.join().unwrap();
+        });
+        let mut read = [0; 4096];
+        probe.read_exact_at(&mut read, 0).unwrap();
+        assert_eq!(read, [fill(0); 4096]);
+    }
+
+    /// Retirement of an idle file waits for a worker busy on another file, without holding
+    /// the task's shard. A canceled borrowed wait keeps the same retirement and duplicates.
+    #[test]
+    fn cancelled_retirement_keeps_duplicates_and_allows_same_shard_progress() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+        let idle = Probe::new(first.path(), true, None);
+        let held = Probe::new(second.path(), false, None);
+        let mut idle_attachment = issuer.attach(&idle).unwrap();
+        let mut held_attachment = issuer.attach(&held).unwrap();
+        let number = held_attachment.submit(writes(1), false).unwrap();
+        held.entered(1);
+        let _open = OpenOnDrop(held.counts);
+        let idle_counts = idle.counts;
+        let held_counts = held.counts;
+        let progressed: &'static AtomicBool = Box::leak(Box::default());
+        let mut rt = runtime();
+        rt.block_on(async move {
+            // A still-out batch is refused without consuming its answer or retiring its file.
+            assert!(held_attachment.retire_async().await.is_err());
+            assert_eq!(held_attachment.out(), 1);
+            {
+                let mut retirement = std::pin::pin!(idle_attachment.retire_async());
+                poll_fn(|cx| {
+                    assert!(retirement.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                let canceled = race2(retirement.as_mut(), async {}).await;
+                assert!(matches!(canceled, Either::Second(())));
+            }
+            assert_eq!(idle_counts.alive.load(Ordering::SeqCst), 2);
+            assert!(idle_attachment.submit(writes(1), false).is_err());
+            hyper_rt::futures::spawn_detached(async move {
+                assert_eq!(held_counts.in_flight.load(Ordering::SeqCst), 1);
+                assert_eq!(idle_counts.alive.load(Ordering::SeqCst), 2);
+                progressed.store(true, Ordering::SeqCst);
+                held_counts.open.store(true, Ordering::SeqCst);
+            })
+            .unwrap();
+            idle_attachment.retire_async().await.unwrap();
+            assert!(progressed.load(Ordering::SeqCst));
+            assert_eq!(idle_counts.alive.load(Ordering::SeqCst), 1);
+            idle_attachment.retire_async().await.unwrap();
+            drop(idle_attachment);
+            let (answered, buffers) = held_attachment.answer_async().await.unwrap();
+            assert_eq!(answered, number);
+            assert_eq!(buffers.unwrap()[0].0.as_slice(), &[fill(0); 4096]);
+            held_attachment.retire_async().await.unwrap();
+            assert_eq!(held_counts.alive.load(Ordering::SeqCst), 1);
+        })
+        .unwrap();
+        drop(issuer);
+        assert_eq!(idle.counts.alive.load(Ordering::SeqCst), 1);
+        assert_eq!(held.counts.alive.load(Ordering::SeqCst), 1);
+    }
+
+    /// Cold attachments remain independent of the issuer's batch inbox budget. Retirement
+    /// releases their duplicates; an issuer that has fully stopped refuses retirement.
+    #[test]
+    fn retirement_preserves_attachment_setup_and_stopped_issuers_refuse_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+        let probe = Probe::new(dir.path(), true, None);
+        let mut first = issuer.attach(&probe).unwrap();
+        let second = issuer.attach(&probe).unwrap();
+        let third = issuer.attach(&probe).unwrap();
+        let mut rt = runtime();
+        let (mut second, mut third) = rt
+            .block_on(async move {
+                first.retire_async().await.unwrap();
+                drop(first);
+                (second, third)
+            })
+            .unwrap();
+        let mut replacement = issuer.attach(&probe).unwrap();
+        rt.block_on(async move {
+            replacement.retire_async().await.unwrap();
+            second.retire_async().await.unwrap();
+            third.retire_async().await.unwrap();
+            drop(second);
+            drop(third);
+        })
+        .unwrap();
+        let mut stopped_attachment = issuer.attach(&probe).unwrap();
+        drop(issuer);
+        assert_eq!(probe.counts.alive.load(Ordering::SeqCst), 1);
+        assert!(
+            rt.block_on(async move {
+                let result = stopped_attachment.retire_async().await;
+                drop(stopped_attachment);
+                result
+            })
+            .unwrap()
+            .is_err()
+        );
+        assert_eq!(probe.counts.alive.load(Ordering::SeqCst), 1);
+    }
+
+    /// A foreign poll is refused before any retirement, leaving the file usable for an
+    /// ordinary write and a later correctly driven task retirement.
+    #[test]
+    fn refused_foreign_retirement_leaves_attachment_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+        let probe = Probe::new(dir.path(), true, None);
+        let mut attached = issuer.attach(&probe).unwrap();
+        {
+            let mut retirement = std::pin::pin!(attached.retire_async());
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(matches!(
+                retirement.as_mut().poll(&mut context),
+                Poll::Ready(Err(_))
+            ));
+        }
+        let buffers = attached.write(writes(1), false).unwrap();
+        assert_eq!(buffers[0].0.as_slice(), &[fill(0); 4096]);
+        let mut rt = runtime();
+        rt.block_on(async move {
+            attached.retire_async().await.unwrap();
+        })
+        .unwrap();
+        assert_eq!(probe.counts.alive.load(Ordering::SeqCst), 1);
     }
 
     /// Cancelling a borrowed wait spends neither a batch credit nor its buffers. A repeated
@@ -1659,6 +3696,82 @@ mod tests {
     }
 
     /// Empty page buffers to read `n` pages into, at offsets `first..first + n` pages.
+    /// A one-transfer read goes straight to a worker and is answered on the attachment's own
+    /// channel: its bytes, its number, beside the broker's batches answered out of order, and a
+    /// read past the file's end failed as a batch of one.
+    #[test]
+    fn one_transfer_reads_are_answered_directly_beside_broker_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 2).unwrap();
+        let probe = Probe::new(dir.path(), true, None);
+        let mut attached = issuer.attach_deep(&probe, 4).unwrap();
+        let written = attached.submit(writes(4), true).unwrap();
+        let (answered, buffers) = attached.answer().unwrap();
+        assert_eq!(answered, written);
+        assert!(buffers.is_ok());
+        let one = attached.submit_reads(reads(2, 1)).unwrap();
+        let batch = attached.submit_reads(reads(0, 2)).unwrap();
+        let past = attached.submit_reads(reads(9, 1)).unwrap();
+        let mut answers = [
+            attached.answer().unwrap(),
+            attached.answer().unwrap(),
+            attached.answer().unwrap(),
+        ];
+        answers.sort_by_key(|(number, _)| *number);
+        let [(n1, a1), (n2, a2), (n3, a3)] = answers;
+        assert_eq!((n1, n2, n3), (one, batch, past));
+        let a1 = a1.unwrap();
+        assert_eq!(a1.len(), 1);
+        assert_eq!(a1[0].1, 2 * 4096);
+        assert!(a1[0].0.as_slice().iter().all(|&b| b == fill(2)));
+        let a2 = a2.unwrap();
+        assert_eq!(a2.len(), 2);
+        for (i, (buf, at)) in a2.iter().enumerate() {
+            assert_eq!(*at, (i * 4096) as u64);
+            assert!(buf.as_slice().iter().all(|&b| b == fill(i)));
+        }
+        assert!(
+            a3.is_err(),
+            "a read past the file's end fails its batch of one"
+        );
+        assert_eq!(attached.out(), 0);
+        // Many direct reads keep within the batches attached for, and all come back.
+        for round in 0..64usize {
+            let page = round % 4;
+            let number = attached.submit_reads(reads(page, 1)).unwrap();
+            let (answered, buffers) = attached.answer().unwrap();
+            assert_eq!(answered, number);
+            assert!(
+                buffers.unwrap()[0]
+                    .0
+                    .as_slice()
+                    .iter()
+                    .all(|&b| b == fill(page))
+            );
+        }
+        attached.retire_blocking().unwrap();
+        assert_eq!(probe.counts.alive.load(Ordering::SeqCst), 1);
+    }
+
+    /// The issuer stops while an attachment still holds the workers' inboxes for its direct reads:
+    /// each worker is told to end, so the stop joins rather than waits on a submitter, and the
+    /// attachment then learns the issuer has stopped.
+    #[test]
+    fn an_issuer_stops_while_an_attachment_holds_the_worker_inboxes() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 2).unwrap();
+        let probe = Probe::new(dir.path(), true, None);
+        let mut attached = issuer.attach_deep(&probe, 2).unwrap();
+        let written = attached.submit(writes(1), true).unwrap();
+        assert_eq!(attached.answer().unwrap().0, written);
+        let read = attached.submit_reads(reads(0, 1)).unwrap();
+        assert_eq!(attached.answer().unwrap().0, read);
+        drop(issuer);
+        assert!(attached.submit_reads(reads(0, 1)).is_err() || attached.answer().is_err());
+        drop(attached);
+        assert_eq!(probe.counts.alive.load(Ordering::SeqCst), 1);
+    }
+
     fn reads(first: usize, n: usize) -> Vec<(AlignedBuf, u64)> {
         (first..first + n)
             .map(|i| {
@@ -1821,5 +3934,837 @@ mod tests {
             "{refused:?}"
         );
         assert_eq!(probe.counts.alive.load(Ordering::SeqCst), 1);
+    }
+    // Insert inside the existing issuer native test module. Reuses its public Probe,
+    // actual native write gate, runtime(), and OpenOnDrop; no production test hook.
+
+    fn invalid_completion_poll<T>(result: &Poll<Result<T, DiskError>>) -> bool {
+        matches!(result, Poll::Ready(Err(DiskError::Io { source, .. }))
+        if source.kind() == std::io::ErrorKind::InvalidInput)
+    }
+
+    #[test]
+    fn a_ready_async_answer_refuses_foreign_poll_before_consuming() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+        let probe = Probe::new(dir.path(), true, None);
+        let mut attached = issuer.attach(&probe).unwrap();
+        let number = attached.submit(Vec::new(), false).unwrap();
+        // Stop refuses or finishes every pre-Stop accepted number before native joins.
+        // Its completed return guarantees a queued numbered answer, not just a clock delay.
+        drop(issuer);
+        let foreign = {
+            let mut answer = std::pin::pin!(attached.answer_async());
+            answer
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+        };
+        let refused = invalid_completion_poll(&foreign);
+        let retained = attached.out() == 1;
+        let answered = match foreign {
+            Poll::Ready(Ok(answered)) => answered,
+            Poll::Ready(Err(_)) => attached.answer().unwrap(),
+            Poll::Pending => panic!("a closed completed issuer cannot leave its answer pending"),
+        };
+        assert_eq!(answered.0, number);
+        assert_eq!(attached.out(), 0);
+        assert_eq!(probe.counts.alive.load(Ordering::SeqCst), 1);
+        drop(attached);
+        // Verdict follows full cleanup, including on the pre-fix consuming path.
+        assert!(
+            refused && retained,
+            "a foreign ready poll consumed its batch credit"
+        );
+    }
+
+    #[test]
+    fn a_pending_async_answer_rechecks_foreign_context_when_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+        let probe = Probe::new(dir.path(), false, None);
+        let mut attached = issuer.attach(&probe).unwrap();
+        let number = attached.submit(writes(1), false).unwrap();
+        probe.entered(1);
+        let counts = probe.counts;
+        let mut rt = runtime();
+        let _open = OpenOnDrop(counts);
+        let (armed, first_pending) = sync_channel(1);
+        let (finished, mut joined) = hyper_rt::sync::channel(1).unwrap();
+        let owned = ReleaseIoOnDrop { attached, counts };
+        let (refused, retained, owned) = std::thread::scope(|scope| {
+            let controller = scope.spawn(move || {
+                first_pending.recv().unwrap();
+                counts.open.store(true, Ordering::SeqCst);
+                drop(issuer); // Queued answer and actual physical joins precede this fact.
+                finished.try_send(()).unwrap();
+            });
+            let returned = rt
+                .block_on(async move {
+                    let mut owned = owned;
+                    let foreign = {
+                        let mut answer = std::pin::pin!(owned.attached.answer_async());
+                        poll_fn(|cx| {
+                            assert!(answer.as_mut().poll(cx).is_pending());
+                            armed.try_send(()).unwrap();
+                            Poll::Ready(())
+                        })
+                        .await;
+                        joined.recv().await.unwrap();
+                        // SAME borrowed future, after genuine Pending. The actual runtime task
+                        // is present, but this noop waker is foreign to it.
+                        answer
+                            .as_mut()
+                            .poll(&mut Context::from_waker(Waker::noop()))
+                    };
+                    let refused = invalid_completion_poll(&foreign);
+                    let retained = owned.attached.out() == 1;
+                    let answered = match foreign {
+                        Poll::Ready(Ok(answered)) => answered,
+                        Poll::Ready(Err(_)) => owned.attached.answer_async().await.unwrap(),
+                        Poll::Pending => {
+                            panic!("a retired held callback must leave a terminal answer")
+                        }
+                    };
+                    assert_eq!(answered.0, number);
+                    assert_eq!(answered.1.unwrap()[0].0.as_slice(), &[fill(0); 4096]);
+                    assert_eq!(owned.attached.out(), 0);
+                    (refused, retained, owned)
+                })
+                .unwrap();
+            controller.join().unwrap();
+            returned
+        });
+        assert_eq!(counts.completed.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.alive.load(Ordering::SeqCst), 1);
+        drop(owned);
+        assert!(
+            refused && retained,
+            "the later foreign poll consumed a completed batch"
+        );
+    }
+
+    #[test]
+    fn a_pending_retirement_rechecks_foreign_context_at_terminal_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+        let probe = Probe::new(dir.path(), false, None);
+        let mut writer = issuer.attach(&probe).unwrap();
+        let idle = issuer.attach(&probe).unwrap();
+        let number = writer.submit(writes(1), false).unwrap();
+        probe.entered(1);
+        let counts = probe.counts;
+        let mut rt = runtime();
+        let _open = OpenOnDrop(counts);
+        let (armed, first_pending) = sync_channel(1);
+        let (finished, mut joined) = hyper_rt::sync::channel(1).unwrap();
+        // Guards are already captured before admission; either attachment opens I/O before
+        // its own field Drop on any assertion/refused-admission path.
+        let writer = ReleaseIoOnDrop {
+            attached: writer,
+            counts,
+        };
+        let idle = ReleaseIoOnDrop {
+            attached: idle,
+            counts,
+        };
+        let (refused, writer, idle) = std::thread::scope(|scope| {
+            let controller = scope.spawn(move || {
+                first_pending.recv().unwrap();
+                counts.open.store(true, Ordering::SeqCst);
+                drop(issuer);
+                finished.try_send(()).unwrap();
+            });
+            let returned = rt
+                .block_on(async move {
+                    let mut writer = writer;
+                    let mut idle = idle;
+                    let foreign = {
+                        let mut retirement = std::pin::pin!(idle.attached.retire_async());
+                        poll_fn(|cx| {
+                            assert!(retirement.as_mut().poll(cx).is_pending());
+                            armed.try_send(()).unwrap();
+                            Poll::Ready(())
+                        })
+                        .await;
+                        joined.recv().await.unwrap();
+                        // Stop may deliver Detached or close after joins. Both are terminal-ready,
+                        // and neither permits a foreign waker to bypass the later context check.
+                        retirement
+                            .as_mut()
+                            .poll(&mut Context::from_waker(Waker::noop()))
+                    };
+                    let refused = invalid_completion_poll(&foreign);
+                    let (answered, bytes) = writer.attached.answer_async().await.unwrap();
+                    assert_eq!(answered, number);
+                    assert_eq!(bytes.unwrap()[0].0.as_slice(), &[fill(0); 4096]);
+                    if !matches!(foreign, Poll::Ready(Ok(()))) {
+                        let result = idle.attached.retire_async().await;
+                        assert!(
+                            result.is_ok()
+                                || matches!(result,
+                    Err(DiskError::Io { source, .. })
+                        if source.kind() == std::io::ErrorKind::BrokenPipe)
+                        );
+                    }
+                    (refused, writer, idle)
+                })
+                .unwrap();
+            controller.join().unwrap();
+            returned
+        });
+        drop(idle);
+        drop(writer);
+        assert_eq!(counts.alive.load(Ordering::SeqCst), 1);
+        assert!(
+            refused,
+            "terminal-ready retirement skipped its later context check"
+        );
+    }
+    // Insert into existing issuer native test module; uses its real BlockFile Probe.
+    // Public calls and exact buffers only. Baseline cleanup precedes the semantic verdict.
+
+    fn cold_call_refused<T>(result: &Result<T, DiskError>) -> bool {
+        matches!(result, Err(DiskError::Io { source, .. })
+        if source.kind() == std::io::ErrorKind::InvalidInput)
+    }
+
+    #[test]
+    fn issuer_start_refuses_on_a_shard_before_hardware_setup() {
+        let made = runtime()
+            .block_on(async { Issuer::start_for(Path::new("dev"), 1, 1) })
+            .unwrap();
+        let refused = cold_call_refused(&made);
+        drop(made); // Baseline's real native issuer is joined by the cold test owner.
+        let healthy = Issuer::start_for(Path::new("dev"), 1, 1).unwrap();
+        drop(healthy);
+        assert!(refused, "a runtime call started the cold device issuer");
+    }
+
+    #[test]
+    fn issuer_attach_refuses_on_a_shard_before_cloning_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+        let probe = Probe::new(dir.path(), true, None);
+        let counts = probe.counts;
+        let (issuer, probe, made, live_at_return) = runtime()
+            .block_on(async move {
+                let made = issuer.attach(&probe);
+                let live = counts.alive.load(Ordering::SeqCst);
+                (issuer, probe, made, live)
+            })
+            .unwrap();
+        let refused = cold_call_refused(&made);
+        let mut attached = match made {
+            Ok(attached) => attached,
+            Err(_) => issuer.attach(&probe).unwrap(),
+        };
+        let buffers = attached.write(writes(1), false).unwrap();
+        assert_eq!(buffers[0].0.as_slice(), &[fill(0); 4096]);
+        drop(attached);
+        drop(issuer);
+        assert_eq!(counts.alive.load(Ordering::SeqCst), 1);
+        assert!(refused, "a runtime call admitted a cold attachment");
+        assert_eq!(live_at_return, 1, "the refusal cloned a native file first");
+    }
+
+    fn runtime_write_refusal(flush: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+        let probe = Probe::new(dir.path(), true, None);
+        let counts = probe.counts;
+        let mut attached = issuer.attach(&probe).unwrap();
+        let (mut attached, result, writes_at_return, flushes_at_return, out_at_return) = runtime()
+            .block_on(async move {
+                let result = if flush {
+                    attached.flush().map(|()| Vec::new())
+                } else {
+                    attached.write(writes(1), false)
+                };
+                let wrote = counts.entered.load(Ordering::SeqCst);
+                let flushed = counts.flushes.load(Ordering::SeqCst);
+                let out = attached.out();
+                (attached, result, wrote, flushed, out)
+            })
+            .unwrap();
+        let refused = cold_call_refused(&result);
+        drop(result);
+        let returned = attached.write(writes(1), true).unwrap();
+        assert_eq!(returned[0].0.as_slice(), &[fill(0); 4096]);
+        let mut bytes = [0; 4096];
+        probe.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(bytes, [fill(0); 4096]);
+        drop(attached);
+        drop(issuer);
+        assert_eq!(counts.alive.load(Ordering::SeqCst), 1);
+        assert!(refused, "a synchronous runtime call submitted native work");
+        assert_eq!(writes_at_return, 0, "the refusal published a write");
+        assert_eq!(flushes_at_return, 0, "the refusal published a flush");
+        assert_eq!(out_at_return, 0, "the refusal spent a batch credit");
+    }
+
+    #[test]
+    fn attached_write_refuses_on_a_shard_before_submission() {
+        runtime_write_refusal(false);
+    }
+
+    #[test]
+    fn attached_flush_refuses_on_a_shard_before_submission() {
+        runtime_write_refusal(true);
+    }
+
+    #[test]
+    fn attached_blocking_answer_refuses_on_a_shard_without_consuming_ready_credit() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+        let probe = Probe::new(dir.path(), true, None);
+        let mut attached = issuer.attach(&probe).unwrap();
+        let number = attached.submit(Vec::new(), false).unwrap();
+        drop(issuer); // Actual terminal completion, not an assumed scheduling delay.
+        let (mut attached, result, out_at_return) = runtime()
+            .block_on(async move {
+                let result = attached.answer();
+                let out = attached.out();
+                (attached, result, out)
+            })
+            .unwrap();
+        let refused = cold_call_refused(&result);
+        let answer = match result {
+            Ok(answer) => answer,
+            Err(_) => attached.answer().unwrap(),
+        };
+        assert_eq!(answer.0, number);
+        assert_eq!(attached.out(), 0);
+        drop(attached);
+        assert_eq!(probe.counts.alive.load(Ordering::SeqCst), 1);
+        assert!(refused, "a runtime blocking call took its queued answer");
+        assert_eq!(out_at_return, 1, "the refused call consumed a batch credit");
+    }
+    // Insert inside existing issuer native test module. First four cases compile on
+    // both the baseline and proposed API; Root's external guard classifies failures
+    // only after positive Held + entered-Drop witnesses. No internal timer or sleep.
+
+    fn drop_runtime() -> hyper_rt::Runtime {
+        let roles = 2; // One owner/destructor and one independently admitted release task.
+        hyper_rt::Runtime::start(&RuntimeConfig {
+            shards: 1,
+            tasks_per_shard: roles,
+            timers_per_shard: roles,
+            interests_per_shard: hyper_rt::runtime::interests_for(roles),
+            ring_entries: roles,
+            step_budget_ns: 1_000_000_000,
+            timer_tick_ns: 100_000,
+            batch: roles,
+            pin: false,
+            cores: Vec::new(),
+            page_bytes: 4096,
+            spin_ns: 0,
+            wake_tracking: None,
+        })
+        .unwrap()
+    }
+
+    struct ShardDropWitness {
+        attached: Option<Attached>,
+        entered: SyncSender<(bool, bool)>,
+    }
+
+    impl Drop for ShardDropWitness {
+        fn drop(&mut self) {
+            let entered = hyper_rt::registry::current_shard().is_some();
+            let no_current_task = hyper_rt::futures::current_task().is_none();
+            let _ = self.entered.try_send((entered, no_current_task));
+            drop(self.attached.take());
+        }
+    }
+
+    #[derive(Debug)]
+    enum PhysicalDone {
+        Write(bool),
+        Flush(bool),
+    }
+
+    struct ObservedProbe {
+        probe: Probe,
+        completed: SyncSender<PhysicalDone>,
+    }
+
+    impl BlockFile for ObservedProbe {
+        fn alignment(&self) -> Alignment {
+            self.probe.alignment()
+        }
+        fn len(&self) -> Result<u64, DiskError> {
+            self.probe.len()
+        }
+        fn read_exact_at(&self, bytes: &mut [u8], at: u64) -> Result<(), DiskError> {
+            self.probe.read_exact_at(bytes, at)
+        }
+        fn write_all_at(&self, bytes: &[u8], at: u64) -> Result<(), DiskError> {
+            let result = self.probe.write_all_at(bytes, at);
+            let _ = self.completed.try_send(PhysicalDone::Write(result.is_ok()));
+            result
+        }
+        fn sync_data(&self) -> Result<(), DiskError> {
+            // Unlike Probe's counting-only sync, this fixture executes the native barrier.
+            let result = self
+                .probe
+                .file
+                .sync_data()
+                .and_then(|()| self.probe.sync_data());
+            let _ = self.completed.try_send(PhysicalDone::Flush(result.is_ok()));
+            result
+        }
+        fn try_clone(&self) -> Result<Self, DiskError> {
+            Ok(Self {
+                probe: self.probe.try_clone()?,
+                completed: self.completed.clone(),
+            })
+        }
+    }
+
+    fn dropped_accepted_batches(cancel_owner: bool, fail_first: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+        assert_eq!(issuer.depth(), 1);
+        let (completed, physically_done) = sync_channel(3); // Two writes + their one required flush.
+        let probe = ObservedProbe {
+            probe: Probe::new(dir.path(), false, fail_first.then_some(0)),
+            completed,
+        };
+        let counts = probe.probe.counts;
+        let _setup_open = OpenOnDrop(counts); // Protect even Runtime startup/admission failure.
+        let mut attached = issuer.attach_deep(&probe, 2).unwrap();
+        attached.submit(writes(1), false).unwrap();
+        probe.probe.entered(1);
+        let mut second = writes(1);
+        second[0].0.as_mut_slice().fill(fill(1));
+        second[0].1 = 4096;
+        attached.submit(second, true).unwrap();
+        assert_eq!(attached.out(), 2);
+        eprintln!("positive held native write; two accepted batches including later flush");
+        let rt = drop_runtime();
+        let _runtime_open = OpenOnDrop(counts); // Open before Runtime joins on assertion failure.
+        let shard = rt.shard_ids()[0];
+        let (entered, dropping) = sync_channel(1);
+        let (admitted, owner) = sync_channel(1);
+        let witness = ShardDropWitness {
+            attached: Some(attached),
+            entered,
+        };
+        rt.spawn_on(shard, async move {
+            if cancel_owner {
+                // Actual actor identity, without private layout or allocation forcing.
+                admitted
+                    .try_send(hyper_rt::futures::current_task().unwrap())
+                    .unwrap();
+                let _owned = witness;
+                std::future::pending::<()>().await;
+            } else {
+                drop(witness); // Current task is present in this business poll.
+            }
+        })
+        .unwrap();
+        if cancel_owner {
+            rt.cancel(owner.recv().unwrap()).unwrap();
+        }
+        let (on_shard, no_current_task) = dropping.recv().unwrap();
+        assert!(on_shard);
+        assert_eq!(no_current_task, cancel_owner);
+        eprintln!("actual entered Attached Drop witness; current_task_absent={no_current_task}");
+        let (progressed, progress) = sync_channel(1);
+        rt.spawn_on(shard, async move {
+            // A setup/controller guard has not opened this native callback.
+            assert!(!counts.open.load(Ordering::SeqCst));
+            assert_eq!(counts.in_flight.load(Ordering::SeqCst), 1);
+            assert_eq!(counts.alive.load(Ordering::SeqCst), 2);
+            progressed.try_send(()).unwrap();
+            counts.open.store(true, Ordering::SeqCst);
+        })
+        .unwrap();
+        progress.recv().unwrap(); // Success requires the real same-shard release task to run.
+        // Do not Stop the issuer before the queued accepted write and flush execute: Stop
+        // is allowed to refuse queued work, so a join alone cannot establish this oracle.
+        for expected in [
+            PhysicalDone::Write(!fail_first),
+            PhysicalDone::Write(true),
+            PhysicalDone::Flush(true),
+        ] {
+            match (physically_done.recv().unwrap(), expected) {
+                (PhysicalDone::Write(got), PhysicalDone::Write(want))
+                | (PhysicalDone::Flush(got), PhysicalDone::Flush(want)) => assert_eq!(got, want),
+                _ => panic!("native write/flush callback order changed"),
+            }
+        }
+        drop(issuer); // Native joins, not elapsed time, close physical write ownership.
+        assert_eq!(counts.completed.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.flushes.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.alive.load(Ordering::SeqCst), 1);
+        let mut second_bytes = [0; 4096];
+        probe.read_exact_at(&mut second_bytes, 4096).unwrap();
+        assert_eq!(second_bytes, [fill(1); 4096]);
+        if !fail_first {
+            let mut first_bytes = [0; 4096];
+            probe.read_exact_at(&mut first_bytes, 0).unwrap();
+            assert_eq!(first_bytes, [fill(0); 4096]);
+        }
+        rt.shutdown().unwrap();
+    }
+
+    #[test]
+    fn shard_drop_yields_while_accepted_batches_and_flush_are_physically_held() {
+        dropped_accepted_batches(false, false);
+    }
+
+    #[test]
+    fn canceled_owner_drop_yields_after_current_task_clears() {
+        dropped_accepted_batches(true, false);
+    }
+
+    #[test]
+    fn shard_drop_keeps_later_accepted_work_after_a_held_write_failure() {
+        dropped_accepted_batches(false, true);
+    }
+
+    #[test]
+    fn a_waiting_borrowed_retirement_can_be_dropped_without_blocking_its_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+        assert_eq!(issuer.depth(), 1);
+        let probe = Probe::new(dir.path(), false, None);
+        let counts = probe.counts;
+        let _setup_open = OpenOnDrop(counts);
+        let mut writer = issuer.attach(&probe).unwrap();
+        let idle = issuer.attach(&probe).unwrap();
+        let number = writer.submit(writes(1), false).unwrap();
+        probe.entered(1);
+        eprintln!("positive held native write on a different attachment");
+        let rt = drop_runtime();
+        let _runtime_open = OpenOnDrop(counts);
+        let shard = rt.shard_ids()[0];
+        let (entered, dropping) = sync_channel(1);
+        let witness = ShardDropWitness {
+            attached: Some(idle),
+            entered,
+        };
+        rt.spawn_on(shard, async move {
+            let mut witness = witness;
+            {
+                let attached = witness.attached.as_mut().unwrap();
+                let mut wait = std::pin::pin!(attached.retire_async());
+                poll_fn(|cx| {
+                    assert!(wait.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+            } // Borrowed wait canceled; the attachment still owns Waiting retirement.
+            drop(witness);
+        })
+        .unwrap();
+        let (on_shard, no_current_task) = dropping.recv().unwrap();
+        assert!(on_shard && !no_current_task);
+        eprintln!("actual entered Waiting-retirement Attached Drop witness");
+        let (progressed, progress) = sync_channel(1);
+        rt.spawn_on(shard, async move {
+            assert!(!counts.open.load(Ordering::SeqCst));
+            assert_eq!(counts.in_flight.load(Ordering::SeqCst), 1);
+            assert_eq!(counts.alive.load(Ordering::SeqCst), 3);
+            progressed.try_send(()).unwrap();
+            counts.open.store(true, Ordering::SeqCst);
+        })
+        .unwrap();
+        progress.recv().unwrap();
+        let (answered, bytes) = writer.answer().unwrap();
+        assert_eq!(answered, number);
+        assert_eq!(bytes.unwrap()[0].0.as_slice(), &[fill(0); 4096]);
+        drop(writer);
+        drop(issuer);
+        assert_eq!(counts.alive.load(Ordering::SeqCst), 1);
+        rt.shutdown().unwrap();
+    }
+    // New API follow-ups, stage after production. They are not baseline-compatible
+    // RED fixtures because is_retired did not previously exist.
+
+    #[test]
+    fn numbered_io_failure_is_not_physical_retirement() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+        let probe = Probe::new(dir.path(), true, Some(0));
+        let mut attached = issuer.attach(&probe).unwrap();
+        let number = attached.submit(writes(1), false).unwrap();
+        let (answered, failed) = attached.answer().unwrap();
+        assert_eq!(answered, number);
+        assert!(failed.is_err());
+        assert_eq!(attached.out(), 0);
+        assert!(!attached.is_retired());
+        assert_eq!(probe.counts.alive.load(Ordering::SeqCst), 2);
+        let attached = runtime()
+            .block_on(async move {
+                attached.retire_async().await.unwrap();
+                assert!(attached.is_retired());
+                attached
+            })
+            .unwrap();
+        assert_eq!(probe.counts.alive.load(Ordering::SeqCst), 1);
+        drop(attached);
+        drop(issuer);
+    }
+
+    #[test]
+    fn stopped_completion_retirement_is_observed_only_after_native_duplicate_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate: &'static DropGate = Box::leak(Box::default());
+        let probe = DropProbe {
+            file: Probe::new(dir.path(), true, None),
+            gate: None,
+            duplicates: gate,
+        };
+        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+        let mut attached = issuer.attach(&probe).unwrap();
+        attached.write(writes(1), false).unwrap();
+        let counts = probe.file.counts;
+        let mut rt = runtime();
+        std::thread::scope(|scope| {
+            let mut owned = ReleaseDropOnDrop { attached, gate };
+            let shutdown = scope.spawn(move || drop(issuer));
+            gate.entered();
+            rt.block_on(async move {
+                {
+                    let mut wait = std::pin::pin!(owned.attached.retire_async());
+                    poll_fn(|cx| {
+                        assert!(wait.as_mut().poll(cx).is_pending());
+                        Poll::Ready(())
+                    })
+                    .await;
+                }
+                assert!(!owned.attached.is_retired());
+                assert_eq!(counts.alive.load(Ordering::SeqCst), 2);
+                hyper_rt::futures::spawn_detached(async move {
+                    gate.release();
+                })
+                .unwrap();
+                let failed = owned.attached.retire_async().await;
+                assert!(matches!(failed, Err(DiskError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::BrokenPipe));
+                assert!(owned.attached.is_retired());
+                assert_eq!(owned.attached.out(), 0);
+                assert_eq!(counts.alive.load(Ordering::SeqCst), 1);
+            })
+            .unwrap();
+            shutdown.join().unwrap();
+        });
+    }
+
+    // Insert in existing issuer native test module. This fixture deliberately injects
+    // a foreign destructor panic; no production panic site or scheduler sleep is added.
+    // Root guard failure is meaningful only after actual completed-write/Drop-attempt facts.
+
+    struct FailingDuplicateDrop {
+        probe: Probe,
+        fail: bool,
+        attempted: SyncSender<()>,
+    }
+
+    impl Drop for FailingDuplicateDrop {
+        fn drop(&mut self) {
+            if self.fail {
+                let _ = self.attempted.try_send(());
+                panic!("native duplicate Drop failure witness");
+            }
+        }
+    }
+
+    impl BlockFile for FailingDuplicateDrop {
+        fn alignment(&self) -> Alignment {
+            self.probe.alignment()
+        }
+        fn len(&self) -> Result<u64, DiskError> {
+            self.probe.len()
+        }
+        fn read_exact_at(&self, bytes: &mut [u8], at: u64) -> Result<(), DiskError> {
+            self.probe.read_exact_at(bytes, at)
+        }
+        fn write_all_at(&self, bytes: &[u8], at: u64) -> Result<(), DiskError> {
+            self.probe.write_all_at(bytes, at)
+        }
+        fn sync_data(&self) -> Result<(), DiskError> {
+            self.probe.file.sync_data()
+        }
+        fn try_clone(&self) -> Result<Self, DiskError> {
+            Ok(Self {
+                probe: self.probe.try_clone()?,
+                fail: true,
+                attempted: self.attempted.clone(),
+            })
+        }
+    }
+
+    #[test]
+    fn a_worker_duplicate_drop_failure_reports_terminal_error_instead_of_losing_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let (attempted, dropping) = sync_channel(1);
+        let file = FailingDuplicateDrop {
+            probe: Probe::new(dir.path(), true, None),
+            fail: false,
+            attempted,
+        };
+        let counts = file.probe.counts;
+        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+        assert_eq!(issuer.depth(), 1);
+        let mut attached = issuer.attach(&file).unwrap();
+        let returned = attached.write(writes(1), false).unwrap();
+        assert_eq!(returned[0].0.as_slice(), &[fill(0); 4096]);
+        assert_eq!(counts.completed.load(Ordering::SeqCst), 1);
+        eprintln!("actual native write completed before duplicate retirement");
+        let rt = drop_runtime();
+        let shard = rt.shard_ids()[0];
+        let (back, received) = sync_channel(1);
+        rt.spawn_on(shard, async move {
+            let result = attached.retire_async().await;
+            // Return the owner to cold cleanup even when the typed terminal result is Err.
+            back.try_send((attached, result)).unwrap();
+        })
+        .unwrap();
+        dropping.recv().unwrap();
+        eprintln!("actual worker duplicate Drop fault entered");
+        let (progressed, progress) = sync_channel(1);
+        rt.spawn_on(shard, async move {
+            progressed.try_send(()).unwrap();
+        })
+        .unwrap();
+        progress.recv().unwrap(); // Runtime is still polling independent tasks.
+        let (attached, result) = received.recv().unwrap();
+        assert!(
+            matches!(result, Err(DiskError::Io { source, .. })
+        if source.to_string().contains("Drop")),
+            "the actual lifecycle failure must survive instead of successful Detached or generic Stop"
+        );
+        drop(attached);
+        drop(issuer);
+        assert_eq!(counts.alive.load(Ordering::SeqCst), 1);
+        rt.shutdown().unwrap();
+    }
+    // Insert in the current issuer native test module. Existing Probe/runtime/
+    // cold_call_refused/FailingDuplicateDrop helpers are the actual baseline wrappers.
+    // No timer or ordering sleep. Parent owns compilation and native execution.
+
+    #[test]
+    fn explicit_cold_retirement_preserves_duplicate_drop_failure_after_physical_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let (attempted, dropping) = sync_channel(1);
+        let file = FailingDuplicateDrop {
+            probe: Probe::new(dir.path(), true, None),
+            fail: false,
+            attempted,
+        };
+        let counts = file.probe.counts;
+        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+        assert_eq!(issuer.depth(), 1);
+        let mut attached = issuer.attach(&file).unwrap();
+        let returned = attached.write(writes(1), false).unwrap();
+        assert_eq!(returned[0].0.as_slice(), &[fill(0); 4096]);
+        assert_eq!(counts.completed.load(Ordering::SeqCst), 1);
+        let mut bytes = [0; 4096];
+        file.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(bytes, [fill(0); 4096]);
+        eprintln!("actual native write completed before explicit cold retirement");
+        let result = attached.retire_blocking();
+        assert_eq!(dropping.try_recv(), Ok(()));
+        assert!(attached.is_retired());
+        assert_eq!(counts.alive.load(Ordering::SeqCst), 1);
+        assert!(
+            matches!(result, Err(DiskError::Io { source, .. })
+            if source.to_string().contains("Drop")),
+            "the explicit cold receipt must preserve the actual duplicate Drop failure"
+        );
+        drop(attached);
+
+        // The dispatcher and its worker remain usable after the typed lifecycle failure.
+        let healthy_dir = tempfile::tempdir().unwrap();
+        let healthy = Probe::new(healthy_dir.path(), true, None);
+        let mut next = issuer.attach(&healthy).unwrap();
+        let returned = next.write(writes(1), true).unwrap();
+        assert_eq!(returned[0].0.as_slice(), &[fill(0); 4096]);
+        let mut bytes = [0; 4096];
+        healthy.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(bytes, [fill(0); 4096]);
+        next.retire_blocking().unwrap();
+        assert!(next.is_retired());
+        assert_eq!(healthy.counts.alive.load(Ordering::SeqCst), 1);
+        drop(next);
+        drop(issuer);
+    }
+
+    #[test]
+    fn explicit_cold_retirement_refuses_on_a_shard_without_publishing_or_consuming() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = Probe::new(dir.path(), true, None);
+        let counts = file.counts;
+        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+        let mut attached = issuer.attach(&file).unwrap();
+        let (mut attached, result, retired_at_return) = runtime()
+            .block_on(async move {
+                let result = attached.retire_blocking();
+                let retired = attached.is_retired();
+                (attached, result, retired)
+            })
+            .unwrap();
+        let refused = cold_call_refused(&result);
+        drop(result);
+        // The identical attachment still accepts and completes a native batch, proving that
+        // the refused call did not publish its terminal command or consume its receipt.
+        let returned = attached.write(writes(1), true).unwrap();
+        assert_eq!(returned[0].0.as_slice(), &[fill(0); 4096]);
+        let mut bytes = [0; 4096];
+        file.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(bytes, [fill(0); 4096]);
+        attached.retire_blocking().unwrap();
+        assert!(attached.is_retired());
+        drop(attached);
+        drop(issuer);
+        assert_eq!(counts.alive.load(Ordering::SeqCst), 1);
+        assert!(refused, "a synchronous runtime call published retirement");
+        assert!(!retired_at_return, "refusal consumed a retirement receipt");
+    }
+    // Insert in the current issuer native test module. The extreme numeric values
+    // are rejected before the first native clone or infallible std queue constructor.
+
+    #[test]
+    fn attachment_extreme_batch_bounds_are_typed_refusals_before_any_file_clone() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = Probe::new(dir.path(), true, None);
+        let counts = file.counts;
+        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+        for batches in [usize::MAX, usize::MAX - 1] {
+            let result = issuer.attach_deep(&file, batches);
+            let refused = cold_call_refused(&result);
+            drop(result);
+            assert!(
+                refused,
+                "an unrepresentable batch shape must be typed-refused"
+            );
+            assert_eq!(counts.alive.load(Ordering::SeqCst), 1);
+        }
+        let mut attached = issuer.attach(&file).unwrap();
+        let returned = attached.write(writes(1), true).unwrap();
+        assert_eq!(returned[0].0.as_slice(), &[fill(0); 4096]);
+        let mut bytes = [0; 4096];
+        file.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(bytes, [fill(0); 4096]);
+        attached.retire_blocking().unwrap();
+        drop(attached);
+        drop(issuer);
+        assert_eq!(counts.alive.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn issuer_extreme_inbox_bound_is_typed_refused_before_thread_start() {
+        let made = Issuer::start_for(Path::new("dev"), 1, usize::MAX - 1);
+        let refused = cold_call_refused(&made);
+        drop(made);
+        let healthy = Issuer::start_for(Path::new("dev"), 1, 1).unwrap();
+        drop(healthy);
+        assert!(
+            refused,
+            "the std queue ticket overflow must be a typed refusal"
+        );
     }
 }

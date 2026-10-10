@@ -46,6 +46,13 @@ impl Head<'_> {
         }
     }
 
+    async fn next_async<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
+        match self {
+            Head::Branch(c, b) => c.next_async(b, store).await,
+            Head::View(w, view, runs) => w.step_async(view, store, runs).await,
+        }
+    }
+
     /// Gives the head's pages back to `store`; a walk's buffers come back for the next.
     fn give_back<F: BlockFile>(self, store: &mut Store<F>) -> Option<WalkBufs> {
         match self {
@@ -140,6 +147,65 @@ impl<'a> ScanMerge<'a> {
         Ok(())
     }
 
+    async fn open_async<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        sources: &[Source<'a>],
+        from: &[u8],
+        end: Option<&[u8]>,
+        filter: bool,
+        timed: bool,
+    ) -> Result<(), Error> {
+        self.close(store);
+        self.end.clear();
+        self.bounded = end.is_some();
+        if let Some(e) = end {
+            self.end.extend_from_slice(e);
+        }
+        self.open_ns.clear();
+        for s in sources {
+            let t = timed.then(std::time::Instant::now);
+            if filter && end.is_some() {
+                let scratch = &mut self.scratch;
+                let held = match *s {
+                    Source::Branch(b) => b.range.may_hold(from, end, scratch),
+                    Source::View(_, runs) => {
+                        runs.iter().any(|b| b.range.may_hold(from, end, scratch))
+                    }
+                };
+                if !held {
+                    self.skipped = self.skipped.saturating_add(1);
+                    self.open_ns.push(0);
+                    continue;
+                }
+            }
+            self.opened = self.opened.saturating_add(1);
+            let head = match *s {
+                Source::Branch(b) => Head::Branch(RunCursor::new(store)?, b),
+                Source::View(view, runs) => {
+                    let bufs = self.walks.pop().unwrap_or_default();
+                    Head::View(Walk::prepare(view, from, bufs), view, runs)
+                }
+            };
+            // The guard owns the head before any await, including the first demand miss.
+            self.heads.push(head);
+            let head = self.heads.last_mut().ok_or(Error::InvalidArgument {
+                what: "a scan head absent after it was opened",
+            })?;
+            match head {
+                Head::Branch(cursor, branch) => cursor.seek_async(branch, store, from).await?,
+                Head::View(walk, view, runs) => {
+                    walk.position_async(view, store, runs, from).await?;
+                }
+            }
+            self.open_ns.push(t.map_or(0, |t| {
+                u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
+            }));
+        }
+        self.pick();
+        Ok(())
+    }
+
     /// The merge, its heads given back to `store` first, with its buffers kept for sources of
     /// another borrow and its counts reset: a shard keeps one merge between scans.
     pub fn recycle<'b, F: BlockFile>(mut self, store: &mut Store<F>) -> ScanMerge<'b> {
@@ -225,5 +291,105 @@ impl<'a> ScanMerge<'a> {
         }
         self.pick();
         Ok(())
+    }
+
+    async fn next_async<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
+        if self.current == Some(0)
+            && let [head] = self.heads.as_mut_slice()
+        {
+            // The only head needs no copied key to decide which sources move.
+            head.next_async(store).await?;
+            self.pick();
+            return Ok(());
+        }
+        let Some(key) = self
+            .current
+            .and_then(|i| self.heads.get(i))
+            .and_then(Head::key)
+        else {
+            return Ok(());
+        };
+        self.past.clear();
+        self.past.extend_from_slice(key);
+        for h in &mut self.heads {
+            if h.key() == Some(self.past.as_slice()) {
+                h.next_async(store).await?;
+            }
+        }
+        self.pick();
+        Ok(())
+    }
+}
+
+/// A scan page's borrowed merge, returning its heads and reusable buffers on every
+/// exit. Source references stay borrowed, so no topology snapshot or replay is needed.
+pub(crate) struct BorrowedScanMerge<'s, 'a, F: BlockFile> {
+    merge: Option<ScanMerge<'a>>,
+    store: &'s mut Store<F>,
+    returned: &'s mut ScanMerge<'static>,
+}
+
+impl<'s, 'a, F: BlockFile> BorrowedScanMerge<'s, 'a, F> {
+    pub(crate) fn new(returned: &'s mut ScanMerge<'static>, store: &'s mut Store<F>) -> Self {
+        let merge = std::mem::take(returned).recycle(store);
+        Self {
+            merge: Some(merge),
+            store,
+            returned,
+        }
+    }
+
+    pub(crate) async fn open(
+        &mut self,
+        sources: &[Source<'a>],
+        from: &[u8],
+        end: Option<&[u8]>,
+        filter: bool,
+        timed: bool,
+    ) -> Result<(), Error> {
+        if !self.store.has_issuer() {
+            return Err(Error::InvalidArgument {
+                what: "an async scan without an attached issuer",
+            });
+        }
+        let merge = self.merge.as_mut().ok_or(Error::InvalidArgument {
+            what: "an async scan after its merge was returned",
+        })?;
+        merge
+            .open_async(self.store, sources, from, end, filter, timed)
+            .await
+    }
+
+    pub(crate) fn entry(&self) -> Option<(&[u8], Op, &[u8])> {
+        self.merge.as_ref().and_then(ScanMerge::entry)
+    }
+
+    pub(crate) fn open_ns(&self) -> &[u64] {
+        self.merge.as_ref().map_or(&[], ScanMerge::open_ns)
+    }
+
+    pub(crate) fn counts(&self) -> (u64, u64) {
+        self.merge.as_ref().map_or((0, 0), ScanMerge::counts)
+    }
+
+    pub(crate) fn close(&mut self) {
+        if let Some(merge) = self.merge.as_mut() {
+            merge.close(self.store);
+        }
+    }
+
+    pub(crate) async fn next(&mut self) -> Result<(), Error> {
+        let merge = self.merge.as_mut().ok_or(Error::InvalidArgument {
+            what: "an async scan after its merge was returned",
+        })?;
+        merge.next_async(self.store).await
+    }
+}
+
+impl<F: BlockFile> Drop for BorrowedScanMerge<'_, '_, F> {
+    fn drop(&mut self) {
+        if let Some(merge) = self.merge.take() {
+            *self.returned = merge.recycle(self.store);
+        }
     }
 }

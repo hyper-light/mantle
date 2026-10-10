@@ -9,6 +9,10 @@
     clippy::cast_possible_truncation
 )]
 
+#[path = "support/into_file.rs"]
+mod file_outcome;
+use file_outcome::finished_file;
+
 use hyper_block::buf::Alignment;
 use hyper_block::sim::{Fault, SimFile};
 use mantle_engine::error::Error;
@@ -64,7 +68,7 @@ fn a_rejected_queue_payload_preserves_the_last_successful_page() {
 /// A fault on the medium remains observable: a failed write/flush cannot hide it in the cache.
 fn failed_write_does_not_serve_cached_bytes(fault: Fault) {
     let (store, address) = written();
-    let file = store.into_file().0;
+    let file = finished_file(store.into_file()).0;
     let write = fault == Fault::WriteError;
     file.inject(fault).unwrap();
     file.inject(Fault::ReadError {

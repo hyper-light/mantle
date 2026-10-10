@@ -26,8 +26,8 @@ use crate::branch::{Builder, Op};
 use crate::error::Error;
 use crate::memtable::hashed::{HashMem, Walk};
 use crate::rows::Rows;
-use crate::scan::ScanMerge;
-use crate::store::{Config, Store};
+use crate::scan::{BorrowedScanMerge, ScanMerge};
+use crate::store::{Config, IntoFile, Store};
 use crate::trunk::pool::{self, Back, FEED_BUFFERS, Job, Owner, Pool, Spawn, Stream, Work};
 use crate::trunk::{Source, Trunk, TrunkConfig};
 use crate::util::reuse;
@@ -172,9 +172,8 @@ struct Feed {
 /// A full memtable handed to its packing worker, its entries fed to it by later puts: still
 /// read until the worker's branch is back and every older memtable's branch has gone to the trunk before it,
 /// since pending branches are read newest first. Its worker, the extents granted the job, the
-/// worker's result once back, when it began packing, and whether it is to be packed here: its
-/// worker failed and the shard's own packing of it failed too, so it waits, still read, for
-/// the next try ([`ShardDb::retire`]).
+/// worker's result once back, when it began packing, and its first failure. A failed input
+/// stays readable and never retires past its older predecessors ([`ShardDb::retire`]).
 #[derive(Debug)]
 struct Frozen {
     mem: HashMem,
@@ -182,7 +181,7 @@ struct Frozen {
     grant: Vec<u64>,
     back: Option<Back>,
     since: std::time::Instant,
-    here: bool,
+    error: Option<Error>,
     /// Its walk and feed while entries are still to send: puts go on feeding it after its
     /// rotation, oldest first, so a rotation never feeds a memtable whole ([`ShardDb::feed`]).
     walk: Option<Walk>,
@@ -191,9 +190,9 @@ struct Frozen {
 }
 
 impl Frozen {
-    /// Whether it can be retired now: its worker's result is in, or it is packed here.
+    /// Whether its worker result or retained failure is ready to report.
     fn ready(&self) -> bool {
-        self.back.is_some() || self.here
+        self.back.is_some() || self.error.is_some()
     }
 }
 
@@ -278,12 +277,43 @@ pub fn issuer_batches(shard_batches: usize, depth: usize) -> usize {
     shard_batches.saturating_add(Pool::cores().saturating_mul(depth))
 }
 
+/// A runtime task's rotation, resumed before its entry is inserted. Its overlap bound is
+/// measured once, not again after waiting for a worker.
+#[derive(Debug)]
+struct Rotation {
+    started: std::time::Instant,
+    finish_packing: bool,
+    most: Option<usize>,
+    stalled: bool,
+}
+
+/// One retained durability operation. Its index and phases survive a canceled borrowed wait.
+#[derive(Debug)]
+struct Checkpoint {
+    applied: u64,
+    phase: CheckpointPhase,
+    error: Option<Error>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CheckpointPhase {
+    Flush,
+    Save,
+    Metadata(u64),
+}
+
 /// A shard's engine over a store.
 #[derive(Debug)]
 pub struct ShardDb<F: BlockFile> {
     store: Store<F>,
     mem: HashMem,
     packing: Option<Packing>,
+    rotation: Option<Rotation>,
+    checkpoint: Option<Checkpoint>,
+    /// Terminal worker cleanup leaves active entries unflushed, as the synchronous Stop did.
+    stopping: bool,
+    terminal_error: Option<Error>,
+    terminal_done: bool,
     /// Memtables fed whole to their packing workers, oldest first ([`Frozen`]); at most
     /// [`Self::frozen_most`].
     frozen: VecDeque<Frozen>,
@@ -330,6 +360,10 @@ pub struct ShardDb<F: BlockFile> {
     /// The write memory the owner spares at most, and the pages written when the last cycle
     /// began ([`ShardDb::set_write_budget`]).
     write_cap: usize,
+    /// Fixed output reservations: the owner's lifetime peak, and owner plus admitted Pool
+    /// capacity. Pool credit is kept until its workers and attachments have retired.
+    owner_write_reserved: usize,
+    write_reserved: usize,
     cycle_pages: u64,
     /// The memory budget for the cache and write memory together, write memory's share of it,
     /// and the store's counters when it was last divided ([`ShardDb::set_memory`]).
@@ -586,10 +620,16 @@ pub const ORDER_BOUND: usize = 2048;
 
 impl<F: BlockFile> ShardDb<F> {
     fn with(store: Store<F>, mem_limit: usize, trunk: Trunk) -> Result<Self, Error> {
+        let write_reserved = store.write_reservation_for(None)?;
         Ok(Self {
             store,
             mem: HashMem::new(mem_limit)?,
             packing: None,
+            rotation: None,
+            checkpoint: None,
+            stopping: false,
+            terminal_error: None,
+            terminal_done: false,
             frozen: VecDeque::new(),
             rotated: None,
             fill_ns: 0,
@@ -610,6 +650,8 @@ impl<F: BlockFile> ShardDb<F> {
             forget_carry: 0,
             flush_stats: FlushStats::default(),
             write_cap: 0,
+            owner_write_reserved: write_reserved,
+            write_reserved,
             cycle_pages: 0,
             memory: None,
             records: None,
@@ -675,9 +717,189 @@ impl<F: BlockFile> ShardDb<F> {
     /// the trunk, the trunk's image written, and a checkpoint naming it, durable when this
     /// returns.
     pub fn checkpoint(&mut self, applied: u64) -> Result<(), Error> {
+        self.no_checkpoint_mutation()?;
         self.flush()?;
         let head = self.trunk.save(&mut self.store)?;
         self.store.checkpoint(Some(head), applied)
+    }
+
+    /// Cold validation precedes every range spawn and any preparation mutation.
+    pub(crate) fn validate_async_setup(&self) -> Result<(), Error> {
+        if hyper_rt::registry::current_shard().is_some() {
+            return Err(Error::InvalidArgument {
+                what: "runtime engine preparation inside a runtime task",
+            });
+        }
+        if !self.store.has_issuer() || self.worker_attach.is_none() {
+            return Err(Error::InvalidArgument {
+                what: "a runtime engine without its device issuer and maintenance workers",
+            });
+        }
+        if self.store.fenced() {
+            return Err(Error::Io {
+                op: "prepare a runtime engine",
+                detail: "the store was fenced by a failed write or flush".into(),
+            });
+        }
+        if self.checkpoint.is_some() || self.packing.as_ref().is_some_and(|p| p.builder.is_some()) {
+            return Err(Error::InvalidArgument {
+                what: "a retained local operation before runtime preparation",
+            });
+        }
+        self.no_worker_failure()?;
+        self.trunk.validate_worker_preparation()
+    }
+
+    pub(crate) fn retirement_capacity(&self) -> usize {
+        self.trunk.pool_capacity()
+    }
+
+    pub(crate) fn adopt_retirement(
+        &mut self,
+        lease: hyper_rt::runtime::RetirementLease,
+    ) -> Result<(), Error> {
+        self.trunk
+            .pool_mut()
+            .ok_or(Error::InvalidArgument {
+                what: "native retirement without maintenance workers",
+            })?
+            .adopt_retirement(lease)
+    }
+
+    pub(crate) fn prepare_original_retirement_watch(
+        &mut self,
+    ) -> Result<crate::store::OriginalPhysical, Error> {
+        self.store.prepare_original_retirement_watch()
+    }
+
+    pub(crate) fn adopt_original<W>(
+        &mut self,
+        adoption: &mut hyper_rt::runtime::OriginalAdoption<F, W>,
+        physical: W,
+    ) -> Result<(), Error>
+    where
+        F: Send + 'static,
+        W: hyper_rt::runtime::OriginalFence,
+    {
+        self.store.adopt_original(adoption, physical)
+    }
+
+    /// All configured output reservations become ready before the engine leaves cold setup.
+    pub(crate) fn prepare_async_backend(&mut self) -> Result<(), Error> {
+        self.validate_async_setup()?;
+        let pool = self.trunk.pool_mut().ok_or(Error::InvalidArgument {
+            what: "runtime preparation without maintenance workers",
+        })?;
+        match pool.prepare() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // No job was admitted. Partial startup is still retired before refusal.
+                self.terminal_error.get_or_insert_with(|| error.clone());
+                if let Err(retirement) = pool.close_blocking(&mut self.store) {
+                    self.terminal_error.get_or_insert(retirement);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn no_worker_failure(&self) -> Result<(), Error> {
+        self.frozen
+            .iter()
+            .find_map(|f| f.error.as_ref())
+            .cloned()
+            .map_or(Ok(()), Err)
+    }
+
+    /// Whether the runtime can perform required I/O through the device and maintenance workers.
+    /// Checked before any range is placed on a shard: a missing backend is a setup refusal.
+    pub(crate) fn require_async_backend(&self) -> Result<(), Error> {
+        if !self.store.has_issuer()
+            || !self.trunk.workers_prepared()
+            || self.worker_attach.is_none()
+        {
+            return Err(Error::InvalidArgument {
+                what: "a runtime engine without its device issuer and maintenance workers",
+            });
+        }
+        Ok(())
+    }
+
+    fn no_checkpoint_mutation(&self) -> Result<(), Error> {
+        if self.stopping {
+            return Err(Error::InvalidArgument {
+                what: "a mutation after shard finish began",
+            });
+        }
+        if self.checkpoint.is_some() {
+            return Err(Error::InvalidArgument {
+                what: "a mutation during a retained checkpoint",
+            });
+        }
+        Ok(())
+    }
+
+    /// A range's checkpoint advances only on its own receipts. The serialized trunk and
+    /// allocator stay unchanged between Save and the second flush's commit.
+    pub(crate) fn checkpoint_paced(&mut self, applied: u64, keys: u64) -> Result<bool, Error> {
+        self.require_async_backend()?;
+        if let Some(checkpoint) = &self.checkpoint {
+            if checkpoint.applied != applied {
+                return Err(Error::InvalidArgument {
+                    what: "a different index while a checkpoint is retained",
+                });
+            }
+            if let Some(error) = &checkpoint.error {
+                return Err(error.clone());
+            }
+        } else {
+            self.checkpoint = Some(Checkpoint {
+                applied,
+                phase: CheckpointPhase::Flush,
+                error: None,
+            });
+        }
+        let result = self.advance_checkpoint(keys);
+        if let Err(error) = &result
+            && let Some(checkpoint) = self.checkpoint.as_mut()
+        {
+            checkpoint.error.get_or_insert_with(|| error.clone());
+        }
+        if matches!(result, Ok(true)) {
+            self.checkpoint = None;
+        }
+        result
+    }
+
+    fn advance_checkpoint(&mut self, keys: u64) -> Result<bool, Error> {
+        let checkpoint = self.checkpoint.as_ref().ok_or(Error::InvalidArgument {
+            what: "a checkpoint continuation without its operation",
+        })?;
+        let (applied, phase) = (checkpoint.applied, checkpoint.phase);
+        let next = match phase {
+            CheckpointPhase::Flush => {
+                if !self.flush_paced(keys)? {
+                    return Ok(false);
+                }
+                CheckpointPhase::Save
+            }
+            CheckpointPhase::Save => {
+                let Some(head) = self.trunk.save_paced(&mut self.store, keys)? else {
+                    return Ok(false);
+                };
+                CheckpointPhase::Metadata(head)
+            }
+            CheckpointPhase::Metadata(head) => {
+                return self.store.checkpoint_paced(Some(head), applied, keys);
+            }
+        };
+        self.checkpoint
+            .as_mut()
+            .ok_or(Error::InvalidArgument {
+                what: "a checkpoint lost while advancing its phase",
+            })?
+            .phase = next;
+        Ok(false)
     }
 
     /// Checks that the store holds exactly the extents the engine names, each once: the
@@ -760,6 +982,37 @@ impl<F: BlockFile> ShardDb<F> {
     where
         F: Send + 'static,
     {
+        if self.trunk.has_pool() {
+            return Err(Error::InvalidArgument {
+                what: "maintenance workers already configured",
+            });
+        }
+        let per_worker = self
+            .store
+            .write_reservation_for(self.worker_attach.as_ref().map(|(_, n)| *n))?;
+        let mut most = Pool::cores();
+        if let Some(memory) = self.memory {
+            let (cache, _, records) = self.memory_held();
+            let used = self
+                .owner_write_reserved
+                .checked_add(self.queue_reservation())
+                .and_then(|n| n.checked_add(cache))
+                .and_then(|n| n.checked_add(records))
+                .ok_or_else(|| Self::write_limit(memory))?;
+            most = memory
+                .checked_sub(used)
+                .and_then(|n| n.checked_div(per_worker))
+                .unwrap_or(0)
+                .min(most);
+            if most == 0 {
+                return Err(Self::write_limit(memory));
+            }
+        }
+        let reserved = per_worker
+            .checked_mul(most)
+            .and_then(|n| n.checked_add(self.owner_write_reserved))
+            .ok_or_else(|| Self::write_limit(usize::MAX))?;
+        self.check_write_reservation(reserved)?;
         let config = self.store.config();
         let spawn: Spawn = Box::new(move |seat| {
             let file = open()?;
@@ -771,15 +1024,17 @@ impl<F: BlockFile> ShardDb<F> {
                     detail: e.to_string(),
                 })
         });
-        let mut pool = Pool::new(spawn, Pool::cores())?;
+        let mut pool = Pool::new(spawn, most)?;
         if let Some((attacher, batches)) = &self.worker_attach {
             pool.set_attach(attacher.clone(), *batches);
         }
         self.trunk.set_pool(pool);
+        self.write_reserved = reserved;
+        self.partition_memory();
         Ok(())
     }
 
-    /// The maintenance workers held and wanted, when the shard has any.
+    /// Warm maintenance seats held and active workers wanted, when the shard has any.
     pub fn workers(&self) -> Option<(usize, usize)> {
         self.trunk.pool_workers()
     }
@@ -811,9 +1066,28 @@ impl<F: BlockFile> ShardDb<F> {
     /// lesser of that and the bytes the last memtable's cycle wrote: paced maintenance pays a
     /// cycle's debt before the next memtable rotates, so a queue longer than a cycle's writes
     /// could not spare a put a wait, only hold memory while the device is short.
-    pub fn set_write_budget(&mut self, bytes: usize) {
+    pub fn set_write_budget(&mut self, bytes: usize) -> Result<(), Error> {
+        let run = self.store.write_reservation_for(None)?;
+        let queued = bytes
+            .checked_div(run)
+            .and_then(|n| n.checked_mul(run))
+            .ok_or_else(|| Self::write_limit(usize::MAX))?;
+        let total = self
+            .write_reserved
+            .checked_add(queued.max(self.store.warm_write_bytes()))
+            .ok_or_else(|| Self::write_limit(usize::MAX))?;
+        if let Some(memory) = self.memory
+            && total > memory
+        {
+            return Err(Self::write_limit(memory));
+        }
         self.write_cap = bytes;
         self.store.set_write_budget(bytes);
+        if self.memory.is_some() {
+            self.write_share = queued.max(self.store.warm_write_bytes());
+            self.partition_memory();
+        }
+        Ok(())
     }
 
     /// The write memory the store has now ([`Self::set_write_budget`]).
@@ -822,30 +1096,108 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     /// Gives the shard `bytes` of memory for its page cache and its write memory together,
-    /// divided between them at each memtable's rotation by their measured marginal gains
-    /// ([`tune`]; Luo & Carey, PVLDB 2021 §5; research/36): all of it the cache's at first.
-    pub fn set_memory(&mut self, bytes: usize) {
+    /// fixed output reservations charged first, then divided between cache, queued writes and
+    /// records by measured marginal gains ([`tune`]; research/36). Refused unchanged when the
+    /// owner, admitted worker capacity and retained output buffers cannot fit. Other Builder
+    /// working runs, input spans, point/page buffers, memtables, branch metadata and packing
+    /// feeds are separate, as are attachment/channel metadata and worker stacks.
+    pub fn set_memory(&mut self, bytes: usize) -> Result<(), Error> {
+        let needed = self
+            .write_reserved
+            .checked_add(self.store.warm_write_bytes())
+            .ok_or_else(|| Self::write_limit(usize::MAX))?;
+        let available = bytes
+            .checked_sub(self.write_reserved)
+            .ok_or_else(|| Self::write_limit(bytes))?;
+        if bytes < needed {
+            return Err(Self::write_limit(bytes));
+        }
+        // Validate before changing any share or cache: held output buffers cannot be reclaimed.
         self.memory = Some(bytes);
-        self.write_share = 0;
-        self.write_cap = bytes;
-        self.store.set_write_budget(0);
-        // The record cache starts at one tuning step, so its ghost gathers the evidence that
-        // prices it; the page cache has the rest.
-        self.records_share = bytes.saturating_mul(TUNE_STEP_PERCENT) / 100;
+        self.write_share = self.store.warm_write_bytes();
+        self.write_cap = available;
+        self.store.set_write_budget(self.write_share);
+        let remaining = available.saturating_sub(self.write_share);
+        self.records_share = (available.saturating_mul(TUNE_STEP_PERCENT) / 100).min(remaining);
         self.records = Some(crate::records::RecordCache::new(
             self.records_share,
             self.store.page_size(),
         ));
-        let cache = bytes.saturating_sub(self.records_share);
-        self.cache_share = cache;
-        self.store
-            .resize_cache(cache.checked_div(self.store.page_size()).unwrap_or(0));
+        self.cache_share = remaining.saturating_sub(self.records_share);
+        self.store.resize_cache(
+            self.cache_share
+                .checked_div(self.store.page_size())
+                .unwrap_or(0),
+        );
         self.tuned = self.store.io_stats();
         (
             self.record_misses,
             self.record_miss_ns,
             self.record_ghost_hits,
         ) = (0, 0, 0);
+        self.partition_memory();
+        Ok(())
+    }
+
+    fn write_limit(bytes: usize) -> Error {
+        Error::LimitExceeded {
+            what: "reserved write buffers within the memory budget",
+            limit: u64::try_from(bytes).unwrap_or(u64::MAX),
+        }
+    }
+
+    fn queue_reservation(&self) -> usize {
+        let queue = if self.memory.is_some() {
+            self.write_share
+        } else {
+            self.store.write_budget()
+        };
+        queue.max(self.store.warm_write_bytes())
+    }
+
+    /// Current physically held cache regions remain charged while a new fixed reservation is
+    /// admitted. Setup does not borrow credit from a cache that has not returned its buffers.
+    fn check_write_reservation(&self, fixed: usize) -> Result<(), Error> {
+        let write = fixed
+            .checked_add(self.queue_reservation())
+            .ok_or_else(|| Self::write_limit(usize::MAX))?;
+        if let Some(memory) = self.memory {
+            let (cache, _, records) = self.memory_held();
+            let total = write
+                .checked_add(cache)
+                .and_then(|n| n.checked_add(records))
+                .ok_or_else(|| Self::write_limit(memory))?;
+            if total > memory {
+                return Err(Self::write_limit(memory));
+            }
+        }
+        Ok(())
+    }
+
+    /// Only the bytes beyond fixed output reservations move between cache, queue and records.
+    fn partition_memory(&mut self) {
+        let Some(memory) = self.memory else {
+            return;
+        };
+        // All reservation changes validated this subtraction before mutating the shard.
+        let available = memory.saturating_sub(self.write_reserved);
+        self.write_share = self.write_share.max(self.store.warm_write_bytes());
+        self.records_share = self
+            .records_share
+            .min(available.saturating_sub(self.write_share));
+        self.cache_share = available
+            .saturating_sub(self.write_share)
+            .saturating_sub(self.records_share);
+        self.grant();
+        let half = usize::try_from(self.cycle_ops / 2)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        self.trim_cache = self.store.cache_over().div_ceil(half);
+        self.trim_records = self
+            .records
+            .as_ref()
+            .map_or(0, crate::records::RecordCache::over)
+            .div_ceil(half);
     }
 
     /// The bytes the memtables hold: the active one, the one packing and the spare kept for
@@ -864,12 +1216,13 @@ impl<F: BlockFile> ShardDb<F> {
             .saturating_add(self.spare.as_ref().map_or(0, HashMem::memory))
     }
 
-    /// The memory the page cache, write memory and record cache have now, in bytes.
+    /// The cache capacity, scoped write reservation and record capacity, in bytes. Writes
+    /// include fixed owner/worker roles and retained queued buffers, not only queue admission.
     pub fn memory_split(&self) -> (usize, usize, usize) {
         let (pages, _) = self.store.cache_pages();
         (
             pages.saturating_mul(self.store.page_size()),
-            self.store.write_budget(),
+            self.write_reserved.saturating_add(self.queue_reservation()),
             self.records
                 .as_ref()
                 .map_or(0, crate::records::RecordCache::bytes),
@@ -877,14 +1230,14 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     /// The memory the page cache and record cache hold now, with the index and ghost bytes
-    /// their shares were last charged, and write memory's share, in bytes: within the budget as
+    /// their shares were last charged, and scoped write reservations, in bytes: within the budget as
     /// memory moves (`grant`). Indexes are charged at each grant, so a cache's data never takes
     /// what its index needs; between grants its index's own size is `index_bytes`.
     pub fn memory_held(&self) -> (usize, usize, usize) {
         let (cache_index, records_index) = self.charged;
         (
             self.store.cache_bytes().saturating_add(cache_index),
-            self.write_share,
+            self.write_reserved.saturating_add(self.queue_reservation()),
             self.records
                 .as_ref()
                 .map_or(0, crate::records::RecordCache::held_bytes)
@@ -957,7 +1310,8 @@ impl<F: BlockFile> ShardDb<F> {
     /// Divides the memory budget again by what each region saved a byte since the last
     /// division (research/36), write memory held within the last write cycle's writes.
     fn retune(&mut self) {
-        let Some(memory) = self.memory else { return };
+        let Some(total) = self.memory else { return };
+        let memory = total.saturating_sub(self.write_reserved);
         let io = self.store.io_stats();
         let page = self.store.page_size();
         let written = self.cycle_written;
@@ -998,7 +1352,8 @@ impl<F: BlockFile> ShardDb<F> {
         };
         // Write memory the cycle did not use goes back at once: a share above the most queued
         // spared no wait, and the queue takes buffers only as runs wait.
-        self.write_share = self.write_share.min(self.store.take_queue_peak());
+        let warm = self.store.warm_write_bytes();
+        self.write_share = self.write_share.min(self.store.take_queue_peak()).max(warm);
         let cache = memory
             .saturating_sub(self.write_share)
             .saturating_sub(self.records_share);
@@ -1009,9 +1364,16 @@ impl<F: BlockFile> ShardDb<F> {
             [read, write, records],
             &mut self.newton,
         );
+        // Warm output buffers remain owned even when admission shrinks: the retained floor
+        // cannot be reassigned to a cache before the store retires.
+        let extra = warm.saturating_sub(write_share);
+        let write_share = write_share.max(warm);
+        let records_share = records_share.saturating_sub(extra.saturating_sub(cache));
+        let cache = cache.saturating_sub(extra);
         // The record cache keeps one step: with none, its ghost would gather no evidence that
         // it should grow.
-        let floor = memory.saturating_mul(TUNE_STEP_PERCENT) / 100;
+        let floor = (memory.saturating_mul(TUNE_STEP_PERCENT) / 100)
+            .min(memory.saturating_sub(write_share));
         let (cache, records_share) = if records_share < floor {
             (
                 cache.saturating_sub(floor.saturating_sub(records_share)),
@@ -1021,7 +1383,7 @@ impl<F: BlockFile> ShardDb<F> {
             (cache, records_share)
         };
         self.write_share = write_share;
-        self.store.set_write_budget(write_share);
+        self.store.set_write_budget(write_share.min(self.write_cap));
         self.cache_share = cache;
         self.records_share = records_share;
         self.grant();
@@ -1107,6 +1469,33 @@ impl<F: BlockFile> ShardDb<F> {
     where
         F: 'static,
     {
+        if self.trunk.pool_workers().is_some_and(|(held, _)| held != 0) {
+            return Err(Error::InvalidArgument {
+                what: "changing device attachment after maintenance workers started",
+            });
+        }
+        let owner = self
+            .owner_write_reserved
+            .max(self.store.write_reservation_for(Some(batches))?);
+        let old_workers = self
+            .write_reserved
+            .checked_sub(self.owner_write_reserved)
+            .ok_or(Error::InvalidArgument {
+                what: "write reservation state",
+            })?;
+        let per = self.store.write_reservation_for(Some(issuer.depth()))?;
+        let workers = self
+            .trunk
+            .pool_mut()
+            .map_or(Ok(0), |pool| {
+                per.checked_mul(pool.capacity())
+                    .ok_or_else(|| Self::write_limit(usize::MAX))
+            })?
+            .max(old_workers);
+        let reserved = owner
+            .checked_add(workers)
+            .ok_or_else(|| Self::write_limit(usize::MAX))?;
+        self.check_write_reservation(reserved)?;
         self.store.attach(issuer, batches)?;
         // The maintenance workers' stores attach too, each on its own thread, with as many
         // batches out as the device serves at once (`Issuer::depth`, from the queue the OS
@@ -1121,6 +1510,9 @@ impl<F: BlockFile> ShardDb<F> {
             pool.set_attach(worker.0.clone(), worker.1);
         }
         self.worker_attach = Some(worker);
+        self.owner_write_reserved = owner;
+        self.write_reserved = reserved;
+        self.partition_memory();
         Ok(())
     }
 
@@ -1129,15 +1521,223 @@ impl<F: BlockFile> ShardDb<F> {
         self.store.drain()
     }
 
-    /// The store's file, the engine's work done, and whether every write handed to the device's
-    /// issuer landed (`Store::into_file`).
-    pub fn into_file(mut self) -> (F, Result<(), Error>) {
-        // The workers stop first: a job still out ends before the file is handed back.
+    /// A terminal path must close every partial worker input before stopping its pool. Both
+    /// synchronous and paced cleanup retain the inputs/grants until physical quiescence.
+    fn close_worker_inputs(&mut self) {
+        if let Err(error) = self.no_worker_failure() {
+            self.terminal_error.get_or_insert(error);
+        }
+        if !self.stopping {
+            self.stopping = true;
+            if let Some(feed) = self.packing.as_mut().and_then(|p| p.feed.as_mut()) {
+                feed.full = None;
+            }
+            for feed in self.frozen.iter_mut().filter_map(|f| f.feed.as_mut()) {
+                feed.full = None;
+            }
+            if let Some(pool) = self.trunk.pool_mut() {
+                for back in self.frozen.iter_mut().filter_map(|f| f.back.as_mut()) {
+                    if let Some(error) = back.physical_error.take() {
+                        pool.note_close_error(error);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ends unfinished worker inputs without publishing partial branches. Grants and input
+    /// buffers stay owned until all worker writes drain and their return channel closes.
+    /// The active memtable is not flushed: stopping retains the last checkpoint's contract.
+    pub(crate) fn stop_workers_paced(&mut self) -> Result<bool, Error> {
+        self.close_worker_inputs();
+        let Some(pool) = self.trunk.pool_mut() else {
+            return Ok(true);
+        };
+        let closed = pool.close_paced(&mut self.store);
+        if matches!(closed, Ok(false)) {
+            return closed;
+        }
+        // EOF ends each Store/attachment, and close_paced then awaited the native
+        // retirement receipt. Every thread and its TLS destructors have ended here.
         self.trunk.stop_workers();
-        self.store.into_file()
+        closed
+    }
+
+    /// A shard's terminal cleanup, driven by its runtime task. A canceled borrowed wait
+    /// keeps the first error and every unfinished owner in the engine for the next wait.
+    /// The result follows worker EOF and native retirement, owner drain and device-attachment retirement.
+    pub async fn finish_async(&mut self) -> Result<(), Error> {
+        let mut finish = std::pin::pin!(self.finish_inner());
+        std::future::poll_fn(|cx| {
+            let current = hyper_rt::futures::current_task()
+                .is_some_and(|task| hyper_rt::waker::waker_for(task.0).will_wake(cx.waker()));
+            if !current {
+                return std::task::Poll::Ready(Err(Error::InvalidArgument {
+                    what: "an async shard finish polled outside its runtime task",
+                }));
+            }
+            std::future::Future::poll(finish.as_mut(), cx)
+        })
+        .await
+    }
+
+    async fn finish_inner(&mut self) -> Result<(), Error> {
+        if self
+            .trunk
+            .pool_mut()
+            .is_some_and(|pool| pool.workers() != 0 && !pool.retirement_owned())
+        {
+            return Err(Error::InvalidArgument {
+                what: "runtime finish without adopted native worker retirement",
+            });
+        }
+        self.trunk.abandon_maplet(&mut self.store);
+        self.trunk.abandon_view(&mut self.store);
+        if let Some(error) = self.checkpoint.as_ref().and_then(|c| c.error.as_ref()) {
+            self.terminal_error.get_or_insert_with(|| error.clone());
+        }
+        while !self.terminal_done {
+            loop {
+                match self.stop_workers_paced() {
+                    Ok(true) => break,
+                    Err(error) => {
+                        // Pool close reports its error only after EOF; it was dropped by
+                        // stop_workers_paced, so no unfinished worker can reuse a grant.
+                        self.terminal_error.get_or_insert(error);
+                        break;
+                    }
+                    Ok(false) => {
+                        if let Err(error) = self.wait_completion().await {
+                            self.terminal_error.get_or_insert(error);
+                        }
+                    }
+                }
+            }
+            loop {
+                match self.store.drain_paced() {
+                    Ok(true) => break,
+                    Err(error) => {
+                        // The Store preserves its first failure until every issued transfer
+                        // has retired; detach must still run before this error is returned.
+                        self.terminal_error.get_or_insert(error);
+                        break;
+                    }
+                    Ok(false) => {
+                        if self.store.io_outstanding() {
+                            if let Err(error) = self.store.wait_completion().await {
+                                self.terminal_error.get_or_insert(error);
+                            }
+                        } else {
+                            hyper_rt::futures::yield_now().await;
+                        }
+                    }
+                }
+            }
+            // An interrupted checkpoint's unsubmitted pages and new metadata remain
+            // owned until the accepted writes above have retired. Abandoning it never
+            // publishes durability or permits a late write to a reused extent.
+            loop {
+                match self.store.abort_checkpoint_paced() {
+                    Ok(true) => break,
+                    Err(error) => {
+                        self.terminal_error.get_or_insert(error);
+                        break;
+                    }
+                    Ok(false) => {
+                        if self.store.io_outstanding() {
+                            if let Err(error) = self.store.wait_completion().await {
+                                self.terminal_error.get_or_insert(error);
+                            }
+                        } else {
+                            hyper_rt::futures::yield_now().await;
+                        }
+                    }
+                }
+            }
+            if let Err(error) = self.trunk.abort_save(&mut self.store) {
+                self.terminal_error.get_or_insert(error);
+            }
+            if let Err(error) = self.store.finish_async().await {
+                if !self.store.finished() {
+                    return Err(error);
+                }
+                self.terminal_error.get_or_insert(error);
+            }
+            self.checkpoint = None;
+            self.terminal_done = true;
+        }
+        self.terminal_error.clone().map_or(Ok(()), Err)
+    }
+
+    /// The actor retains no native file after this terminal check.
+    pub(crate) fn actor_finished(&self) -> bool {
+        self.terminal_done
+            && self.store.finished()
+            && self.store.original_retired()
+            && self.trunk.pool_workers().is_none()
+    }
+
+    /// The store's file after worker retirement, and whether every submitted device write
+    /// landed. Unfinished packing and the active memtable are not flushed; recovery keeps
+    /// the last checkpoint's contract (`Store::into_file`).
+    /// No device operation, receipt wait or native join occurs after this check.
+    pub(crate) fn into_file_finished(mut self) -> IntoFile<Self, F> {
+        if !self.terminal_done || !self.store.finished() || self.trunk.pool_workers().is_some() {
+            return IntoFile::Refused {
+                owner: self,
+                error: Error::InvalidArgument {
+                    what: "file extraction before shard finish",
+                },
+            };
+        }
+        match self.store.into_file_finished() {
+            IntoFile::Finished { file, result } => IntoFile::Finished {
+                file,
+                result: self.terminal_error.take().map_or(result, Err),
+            },
+            IntoFile::Refused { owner, error } => {
+                self.store = owner;
+                IntoFile::Refused { owner: self, error }
+            }
+        }
+    }
+
+    pub fn into_file(mut self) -> IntoFile<Self, F> {
+        if self.terminal_done {
+            return self.into_file_finished();
+        }
+        if hyper_rt::registry::current_shard().is_some() {
+            return IntoFile::Refused {
+                owner: self,
+                error: Error::InvalidArgument {
+                    what: "unfinished shard consumed by a runtime",
+                },
+            };
+        }
+        self.close_worker_inputs();
+        let mut first = self.terminal_error.take();
+        if let Some(pool) = self.trunk.pool_mut()
+            && let Err(error) = pool.close_blocking(&mut self.store)
+        {
+            first.get_or_insert(error);
+        }
+        self.trunk.stop_workers();
+        match self.store.into_file() {
+            IntoFile::Finished { file, result } => IntoFile::Finished {
+                file,
+                result: first.map_or(result, Err),
+            },
+            IntoFile::Refused { owner, error } => {
+                self.store = owner;
+                self.terminal_error = first;
+                IntoFile::Refused { owner: self, error }
+            }
+        }
     }
 
     fn apply(&mut self, key: &[u8], op: Op, value: &[u8]) -> Result<(), Error> {
+        self.no_worker_failure()?;
+        self.no_checkpoint_mutation()?;
         if self.store.fenced() {
             return Err(Error::Io {
                 op: "apply a shard entry",
@@ -1164,7 +1764,51 @@ impl<F: BlockFile> ShardDb<F> {
         }
         let ns = ns_since(t);
         self.flush_stats.insert_ns = self.flush_stats.insert_ns.saturating_add(ns);
-        self.pace(self.mem.bytes().saturating_sub(before))
+        self.pace(self.mem.bytes().saturating_sub(before), false)
+    }
+
+    /// A range's owned request remains unapplied when its rotation stops for work still out.
+    /// HashMem's capacity refusal changes nothing; record invalidation follows insertion so a
+    /// yielded request leaves the previous value and its cache entry reachable.
+    fn apply_paced(&mut self, key: &[u8], op: Op, value: &[u8], keys: u64) -> Result<bool, Error> {
+        self.no_worker_failure()?;
+        self.no_checkpoint_mutation()?;
+        self.require_async_backend()?;
+        if self.store.fenced() {
+            return Err(Error::Io {
+                op: "apply a shard entry",
+                detail: "the store was fenced by a failed write or flush".into(),
+            });
+        }
+        self.trunk.clear_io_wait();
+        if self.rotation.is_some() && !self.rotate_paced(keys)? {
+            return Ok(false);
+        }
+        let mut before = self.mem.bytes();
+        match self.mem.insert(key, op, value) {
+            Err(Error::LimitExceeded { .. }) if !self.mem.is_empty() => {
+                if !self.rotate_paced(keys)? {
+                    return Ok(false);
+                }
+                before = self.mem.bytes();
+                self.mem.insert(key, op, value)?;
+            }
+            other => other?,
+        }
+        self.trim();
+        if let Some(r) = self.records.as_mut() {
+            r.invalidate(key, crate::branch::filter::hash(key));
+        }
+        self.pace(self.mem.bytes().saturating_sub(before), true)?;
+        Ok(true)
+    }
+
+    pub(crate) fn put_paced(&mut self, key: &[u8], value: &[u8], keys: u64) -> Result<bool, Error> {
+        self.apply_paced(key, Op::Put, value, keys)
+    }
+
+    pub(crate) fn delete_paced(&mut self, key: &[u8], keys: u64) -> Result<bool, Error> {
+        self.apply_paced(key, Op::Delete, &[], keys)
     }
 
     /// Records `key` holding `value`.
@@ -1206,6 +1850,55 @@ impl<F: BlockFile> ShardDb<F> {
             // A get the record cache missed is timed: its trunk lookup is what a hit saves.
             let t = self.records.as_ref().map(|_| std::time::Instant::now());
             found = self.trunk.get_hashed(&mut self.store, key, hash, value)?;
+            if let Some(r) = self.records.as_mut() {
+                self.record_misses = self.record_misses.saturating_add(1);
+                self.record_miss_ns = self.record_miss_ns.saturating_add(ns_since(t));
+                if found == Some(Op::Put) {
+                    r.insert(key, hash, value);
+                }
+            }
+        }
+        Ok(found == Some(Op::Put))
+    }
+
+    /// A runtime lookup keeps its source borrows until the owned request is answered.
+    /// Memtable and record hits complete immediately; device demand reads yield.
+    pub(crate) async fn get_async(
+        &mut self,
+        key: &[u8],
+        value: &mut Vec<u8>,
+    ) -> Result<bool, Error> {
+        self.require_async_backend()?;
+        self.count_get();
+        // The key's filter hash, once for the memtables and every branch on its path.
+        let hash = crate::branch::filter::hash(key);
+        let mut found = self.mem.get_hashed(key, hash, value)?;
+        if found.is_none()
+            && let Some(p) = &self.packing
+        {
+            found = p.mem.get_hashed(key, hash, value)?;
+        }
+        // The frozen memtables, newest first.
+        for f in self.frozen.iter().rev() {
+            if found.is_some() {
+                break;
+            }
+            found = f.mem.get_hashed(key, hash, value)?;
+        }
+        if found.is_none()
+            && let Some(cached) = self.records.as_mut().and_then(|r| r.get(key, hash))
+        {
+            value.clear();
+            value.extend_from_slice(cached);
+            return Ok(true);
+        }
+        if found.is_none() {
+            // A get the record cache missed is timed: its trunk lookup is what a hit saves.
+            let t = self.records.as_ref().map(|_| std::time::Instant::now());
+            found = self
+                .trunk
+                .get_hashed_async(&mut self.store, key, hash, value)
+                .await?;
             if let Some(r) = self.records.as_mut() {
                 self.record_misses = self.record_misses.saturating_add(1);
                 self.record_miss_ns = self.record_miss_ns.saturating_add(ns_since(t));
@@ -1429,9 +2122,217 @@ impl<F: BlockFile> ShardDb<F> {
         Ok(more)
     }
 
+    /// A runtime scan owns its complete page while source borrows yield for demand reads.
+    /// The merge guard returns every cursor and its buffers on completion, error or cancel.
+    pub(crate) async fn scan_async(
+        &mut self,
+        from: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+        out: &mut Rows,
+        next: &mut Vec<u8>,
+    ) -> Result<bool, Error> {
+        self.require_async_backend()?;
+        next.clear();
+        if limit == 0 {
+            next.extend_from_slice(from);
+            return Ok(true);
+        }
+        // A walk of a memtable sees its sorted runs: what arrived since the last scan is sorted
+        // into one first, and a packing memtable's sort, if unfinished, is finished.
+        self.mem.seal();
+        if let Some(p) = self.packing.as_mut() {
+            p.mem.seal();
+        }
+        let mut active = std::mem::replace(&mut self.scan_active, MemCursor::empty());
+        // A seek of the runs is timed when they are many: the price of the comparisons they add.
+        let (many, one) = self.mem.seek_comparisons();
+        let step_extra = self.mem.step_comparisons();
+        let t = (many > one).then(std::time::Instant::now);
+        active.seek(&self.mem, from)?;
+        let seek_ns = ns_since(t);
+        let seek_timed = t.is_some() && active.walk.run_work().0 > 0;
+        let mut packing = match &self.packing {
+            Some(p) => {
+                let mut c = std::mem::replace(&mut self.scan_packing, MemCursor::empty());
+                c.seek(&p.mem, from)?;
+                Some(c)
+            }
+            None => None,
+        };
+        // A cursor a frozen memtable, newest first; their order work is paid, so none changes
+        // under the scan.
+        let mut frozen = std::mem::take(&mut self.scan_frozen);
+        frozen.resize_with(self.frozen.len(), MemCursor::empty);
+        for (c, f) in frozen.iter_mut().zip(self.frozen.iter().rev()) {
+            c.seek(&f.mem, from)?;
+        }
+        let trunk = &mut self.trunk;
+        let key = &mut self.scan_key;
+        // The trunk's leaf segments, found one at a time from the seek's key: a segment's
+        // sources (branches, and pivot bundles through their views), and where the next starts.
+        let seg_from = &mut self.scan_from;
+        let seg_end = &mut self.scan_end;
+        seg_from.clear();
+        seg_from.extend_from_slice(from);
+        let mut sources: Vec<Source<'_>> = reuse(std::mem::take(&mut self.scan_sources));
+        let passed = &mut self.scan_passed;
+        let charges = &mut self.scan_charges;
+        charges.clear();
+        let mut trunk_done = false;
+        let mut merge = BorrowedScanMerge::new(&mut self.scan_merge, &mut self.store);
+        let before_end = |k: &[u8]| end.is_none_or(|e| k < e);
+        let mut taken = 0usize;
+        let more = loop {
+            // The trunk's next key: from the segment open, or the next segment's first.
+            while merge.entry().is_none() {
+                if trunk_done || !before_end(seg_from) {
+                    break;
+                }
+                let bounded = trunk.segment_at(seg_from, &mut sources, seg_end, passed)?;
+                // Each segment ends past its start, so the walk moves a leaf a step and ends.
+                if bounded && seg_end.as_slice() <= seg_from.as_slice() {
+                    merge.close();
+                    return Err(Error::Corruption {
+                        what: "a trunk segment's bounds",
+                        why: crate::error::Malformed::OutOfOrder,
+                    });
+                }
+                let hi = match (bounded, end) {
+                    (true, Some(e)) if e < seg_end.as_slice() => Some(e),
+                    (true, _) => Some(seg_end.as_slice()),
+                    (false, e) => e,
+                };
+                // Sources are timed only when a pivot gave more than its one: what earns rent.
+                let spare = passed.iter().any(|p| {
+                    let (_, n) = p.sources();
+                    if p.leaf() { n > 1 } else { n > 0 }
+                });
+                merge
+                    .open(&sources, seg_from, hi, end.is_some(), spare)
+                    .await?;
+                // Each pivot's rent: the measured time its sources took to open, all an index
+                // pivot gave, all but the dearest of a leaf's, which stands for the one branch a
+                // consolidated leaf keeps.
+                let open_ns = merge.open_ns();
+                charges.extend(passed.iter().map(|&p| {
+                    let (first, n) = p.sources();
+                    let own = open_ns.get(first..first.saturating_add(n)).unwrap_or(&[]);
+                    let sum = own.iter().fold(0u64, |a, &b| a.saturating_add(b));
+                    let rent = if p.leaf() {
+                        sum.saturating_sub(own.iter().copied().max().unwrap_or(0))
+                    } else {
+                        sum
+                    };
+                    (p, rent)
+                }));
+                if bounded {
+                    std::mem::swap(seg_from, seg_end);
+                } else {
+                    trunk_done = true;
+                }
+            }
+            // The smallest key any source holds next, copied so the sources can move.
+            let tree = merge.entry().map(|(k, _, _)| k);
+            let mem_a = active.key().filter(|k| before_end(k));
+            let mem_p = packing
+                .as_ref()
+                .and_then(MemCursor::key)
+                .filter(|k| before_end(k));
+            let mem_f = frozen
+                .iter()
+                .filter_map(MemCursor::key)
+                .filter(|k| before_end(k))
+                .min();
+            let Some(least) = [mem_a, mem_p, mem_f, tree].into_iter().flatten().min() else {
+                break false;
+            };
+            key.clear();
+            key.extend_from_slice(least);
+            if taken == limit {
+                next.extend_from_slice(key);
+                break true;
+            }
+            // The newest source holding the key decides; every source holding it moves past it.
+            let mut decided = false;
+            if active.key() == Some(key.as_slice()) {
+                decided = true;
+                if active.op == Op::Put {
+                    out.push(key, &active.value);
+                    taken = taken.saturating_add(1);
+                }
+                active.advance(&self.mem)?;
+            }
+            if let (Some(c), Some(p)) = (packing.as_mut(), self.packing.as_ref())
+                && c.key() == Some(key.as_slice())
+            {
+                if !decided {
+                    decided = true;
+                    if c.op == Op::Put {
+                        out.push(key, &c.value);
+                        taken = taken.saturating_add(1);
+                    }
+                }
+                c.advance(&p.mem)?;
+            }
+            for (c, f) in frozen.iter_mut().zip(self.frozen.iter().rev()) {
+                if c.key() != Some(key.as_slice()) {
+                    continue;
+                }
+                if !decided {
+                    decided = true;
+                    if c.op == Op::Put {
+                        out.push(key, &c.value);
+                        taken = taken.saturating_add(1);
+                    }
+                }
+                c.advance(&f.mem)?;
+            }
+            if let Some((k, op, v)) = merge.entry()
+                && k == key.as_slice()
+            {
+                if !decided && op == Op::Put {
+                    out.push(key, v);
+                    taken = taken.saturating_add(1);
+                }
+                merge.next().await?;
+            }
+        };
+        let (skipped, opened) = merge.counts();
+        drop(merge);
+        self.scan_sources = reuse(sources);
+        self.scan_skipped = self.scan_skipped.saturating_add(skipped);
+        self.scan_opened = self.scan_opened.saturating_add(opened);
+        self.scan_active = active;
+        if let Some(c) = packing {
+            self.scan_packing = c;
+        }
+        self.scan_frozen = frozen;
+        // What the walks merged from the runs stays merged for the next seek of that range.
+        if !self.scan_charges.is_empty() {
+            let io = self.store.io_stats();
+            let pages = crate::trunk::PageCosts {
+                read_ns: io.read_ns.checked_div(io.pages_read).unwrap_or(0),
+                write_ns: io.write_ns.checked_div(io.pages_written).unwrap_or(0),
+                extent_pages: u64::from(self.store.extent_pages()),
+            };
+            self.trunk.charge(&self.scan_charges, pages);
+        }
+        let (run_seeks, run_steps) = self.scan_active.walk.run_work();
+        self.mem.adopt(&mut self.scan_active.walk);
+        if let Some(p) = self.packing.as_mut() {
+            p.mem.adopt(&mut self.scan_packing.walk);
+        }
+        if many > one {
+            let seek_ns = if seek_timed { Some(seek_ns) } else { None };
+            self.charge_runs(seek_ns, many, one, run_seeks, run_steps, step_extra);
+        }
+        Ok(more)
+    }
+
     /// A put that took `bytes` of the memtable does its share of each debt (the module's
     /// pacing).
-    fn pace(&mut self, bytes: usize) -> Result<(), Error> {
+    fn pace(&mut self, bytes: usize, paced: bool) -> Result<(), Error> {
         let room = self.mem.room();
         // The active memtable sorts its own entries as it fills, in chunks of at most
         // `order_bound` entries paid by the puts that write them, so the one it rotates to is
@@ -1480,7 +2381,7 @@ impl<F: BlockFile> ShardDb<F> {
                 // each put waits for its reads and pays its share, so a device that cannot
                 // keep up slows puts in step rather than leave the whole debt to one rotation.
                 let last = self.trunk.pending().saturating_add(1) >= self.trunk.fanout();
-                if last {
+                if last && !paced {
                     self.trunk.step(&mut self.store, w)?;
                     self.flush_stats.waited_steps = self.flush_stats.waited_steps.saturating_add(1);
                 } else {
@@ -1491,7 +2392,11 @@ impl<F: BlockFile> ShardDb<F> {
         } else if self.trunk.cascading() && self.trunk.has_pool() {
             // The cascade's compactions are out on the workers: a step takes whatever results
             // have come and hands out what they let go, waiting for none.
-            self.trunk.step(&mut self.store, 1)?;
+            if paced {
+                self.trunk.step_paced(&mut self.store, 1)?;
+            } else {
+                self.trunk.step(&mut self.store, 1)?;
+            }
         }
         Ok(())
     }
@@ -1617,7 +2522,14 @@ impl<F: BlockFile> ShardDb<F> {
                 file_end: self.store.end(),
                 generation: self.store.generation(),
             });
-            match pool.send(job, Owner::Pack, true)? {
+            let sent = match pool.send(job, Owner::Pack, true) {
+                Ok(sent) => sent,
+                Err((error, job)) => {
+                    self.store.grant_back(&job.grant)?;
+                    return Err(error);
+                }
+            };
+            match sent {
                 Ok(worker) => {
                     let mut spare = std::mem::take(&mut self.feed_buffers);
                     spare.resize_with(FEED_BUFFERS, Vec::new);
@@ -1635,6 +2547,9 @@ impl<F: BlockFile> ShardDb<F> {
         }
         if now || !self.trunk.has_pool() {
             p.builder = Some(Builder::new(&mut self.store, Keys::Exactly(entries))?);
+        } else if let Some(pool) = self.trunk.pool_mut() {
+            // Every worker is occupied: a completion frees the slot this packing needs.
+            pool.want_message();
         }
         Ok(())
     }
@@ -1769,7 +2684,7 @@ impl<F: BlockFile> ShardDb<F> {
             grant,
             back: None,
             since,
-            here: false,
+            error: None,
             walk,
             feed,
             packed,
@@ -1804,7 +2719,7 @@ impl<F: BlockFile> ShardDb<F> {
             && self
                 .frozen
                 .iter()
-                .any(|f| f.feed.is_none() && f.back.is_none() && !f.here);
+                .any(|f| f.feed.is_none() && f.back.is_none() && f.error.is_none());
         loop {
             // Results already in are retired whether or not another comes.
             self.retire_ready()?;
@@ -1812,6 +2727,14 @@ impl<F: BlockFile> ShardDb<F> {
                 return Ok(());
             };
             let Some(back) = pool.take(&mut self.store, Owner::Pack, wait)? else {
+                if pool.out_for(Owner::Pack)
+                    && self
+                        .frozen
+                        .iter()
+                        .any(|f| f.feed.is_none() && f.back.is_none() && f.error.is_none())
+                {
+                    pool.want_message();
+                }
                 return Ok(());
             };
             wait = false;
@@ -1863,50 +2786,84 @@ impl<F: BlockFile> ShardDb<F> {
     /// A frozen memtable's branch goes to the trunk as pending, the memtable is kept cleared for
     /// a later fill, and the packing's latency is measured ([`Self::frozen_most`]).
     ///
-    /// A worker's failure costs no entry the memtable holds: its grant is released and the shard
-    /// packs the memtable itself. Should that fail too, the memtable goes back to the front,
-    /// still read by gets and scans, to be packed here at the next try, and the failure is
-    /// returned; nothing after it retires first, so the trunk's pending order holds.
+    /// A worker failure is reported after its physical drain; the memtable remains readable.
+    /// No shard-owned Builder repeats the failed job, and nothing younger retires past it.
     fn retire(&mut self, mut f: Frozen) -> Result<(), Error> {
-        let branch = match f.back.take() {
-            Some(mut back) => {
-                // The job's own buffers, taken with its result: never another job's on the same
-                // worker.
-                self.feed_buffers.append(&mut back.buffers);
-                self.feed_buffers.truncate(FEED_BUFFERS);
-                match back.result {
-                    Ok(out) => {
-                        self.store.grant_back(&out.unused)?;
-                        self.store.extend_end(out.end);
-                        let (_, branch) =
-                            out.parts.into_iter().next().ok_or(Error::InvalidArgument {
-                                what: "a packing worker's result with no branch",
-                            })?;
-                        Some(branch)
-                    }
-                    Err(_) => {
-                        // Its outputs are dropped unread; the extents return once no
-                        // checkpoint names them.
-                        for e in std::mem::take(&mut f.grant).into_iter().chain(back.topped) {
-                            self.store.release(e)?;
-                        }
-                        self.flush_stats.repacked = self.flush_stats.repacked.saturating_add(1);
-                        None
-                    }
-                }
+        let retired = (|| {
+            if let Some(error) = f.error.clone() {
+                return Err(error);
             }
-            None => None,
-        };
-        let branch = match branch {
-            Some(b) => b,
-            None => match self.pack_here(&f.mem) {
-                Ok(b) => b,
-                Err(error) => {
-                    f.here = true;
-                    self.frozen.push_front(f);
-                    return Err(error);
-                }
-            },
+            let back = f.back.as_mut().ok_or(Error::InvalidArgument {
+                what: "a frozen input with no worker result",
+            })?;
+            self.feed_buffers.append(&mut back.buffers);
+            self.feed_buffers.truncate(FEED_BUFFERS);
+            let failed = back
+                .physical_error
+                .as_ref()
+                .or_else(|| back.result.as_ref().err())
+                .cloned();
+            if let Some(error) = failed {
+                // The first worker/physical error precedes cleanup errors. Failed releases
+                // remain named in their original vectors, but are not attempted again.
+                let terminal = &mut self.terminal_error;
+                terminal.get_or_insert_with(|| error.clone());
+                let store = &mut self.store;
+                f.grant.retain(|extent| match store.release(*extent) {
+                    Ok(()) => false,
+                    Err(cleanup) => {
+                        terminal.get_or_insert(cleanup);
+                        true
+                    }
+                });
+                back.topped.retain(|extent| match store.release(*extent) {
+                    Ok(()) => false,
+                    Err(cleanup) => {
+                        terminal.get_or_insert(cleanup);
+                        true
+                    }
+                });
+                return Err(error);
+            }
+            let out = back.result.as_mut().map_err(|error| error.clone())?;
+            let mut cleanup_error = None;
+            // Mark each unused extent only after its individual return succeeds, so a
+            // partial allocator refusal cannot make an owned extent disappear.
+            out.unused.retain(
+                |extent| match self.store.grant_back(std::slice::from_ref(extent)) {
+                    Ok(()) => {
+                        f.grant.retain(|held| held != extent);
+                        back.topped.retain(|held| held != extent);
+                        false
+                    }
+                    Err(error) => {
+                        cleanup_error.get_or_insert(error);
+                        true
+                    }
+                },
+            );
+            if let Some(error) = cleanup_error {
+                return Err(error);
+            }
+            if out.parts.len() != 1 {
+                return Err(Error::InvalidArgument {
+                    what: "a packing worker's result without exactly one branch",
+                });
+            }
+            let (_, branch) = out.parts.pop().ok_or(Error::InvalidArgument {
+                what: "a packing worker's result with no branch",
+            })?;
+            self.store.extend_end(out.end);
+            Ok(branch)
+        })();
+        let branch = match retired {
+            Ok(branch) => branch,
+            Err(error) => {
+                f.error.get_or_insert_with(|| error.clone());
+                self.terminal_error.get_or_insert_with(|| error.clone());
+                self.frozen.push_front(f);
+                return Err(error);
+            }
         };
         let Frozen { mut mem, since, .. } = f;
         self.trunk.add(branch);
@@ -1932,7 +2889,7 @@ impl<F: BlockFile> ShardDb<F> {
     /// that lasts any part of a fill reaches the rotation that freezes it, so the overlap is
     /// rounded up, `ceil(pack_ns / fill_ns)`: rounded down, a packing a little shorter than its
     /// last measure counted none, and every rotation it outlasted fed it whole and waited for it.
-    /// With no measure yet, none. At most the cores the workers may use, each packing a worker's.
+    /// With no measure yet, none. At most the pool's admitted capacity, each packing a worker's.
     fn frozen_most(&self) -> usize {
         if !self.trunk.has_pool() {
             return 0;
@@ -1940,7 +2897,7 @@ impl<F: BlockFile> ShardDb<F> {
         let overlap = crate::util::div_ceil(self.pack_ns, self.fill_ns).unwrap_or(0);
         usize::try_from(overlap)
             .unwrap_or(usize::MAX)
-            .min(Pool::cores())
+            .min(self.trunk.pool_capacity())
     }
 
     /// Takes every frozen memtable's branch, waiting for each: the front retires once ready, and
@@ -1970,19 +2927,6 @@ impl<F: BlockFile> ShardDb<F> {
             self.feed_from(left, true, false)?;
         }
         self.take_packs(true)
-    }
-
-    /// Packs a frozen memtable on the shard, its order paid: the branch its worker failed to
-    /// make.
-    fn pack_here(&mut self, mem: &HashMem) -> Result<crate::branch::Branch, Error> {
-        let entries = u64::try_from(mem.len()).unwrap_or(u64::MAX);
-        let mut builder = Builder::new(&mut self.store, Keys::Exactly(entries))?;
-        let mut walk = mem.walk_start();
-        let store = &mut self.store;
-        mem.walk_some_hashed(&mut walk, usize::MAX, |k, op, v, h| {
-            builder.add_hashed(store, k, op, v, h)
-        })?;
-        builder.finish(&mut self.store)
     }
 
     /// Charges a scan's `run_seeks` seeks of the runs, each `many` comparisons where one run would
@@ -2050,7 +2994,20 @@ impl<F: BlockFile> ShardDb<F> {
     /// active memtable's larger run for each new partial tail; its runs are merged only once
     /// scans have paid for it ([`Self::tidy_paid`]).
     pub(crate) fn idle_owed(&self) -> bool {
+        if self.checkpoint_frozen() {
+            return false;
+        }
         self.owed_with(true)
+    }
+
+    fn checkpoint_frozen(&self) -> bool {
+        self.checkpoint
+            .as_ref()
+            .is_some_and(|c| !matches!(c.phase, CheckpointPhase::Flush))
+    }
+
+    pub(crate) fn checkpoint_failed(&self) -> bool {
+        self.checkpoint.as_ref().is_some_and(|c| c.error.is_some())
     }
 
     fn owed_with(&self, paced: bool) -> bool {
@@ -2083,19 +3040,41 @@ impl<F: BlockFile> ShardDb<F> {
     /// A runtime task's idle slice: a required trunk read that has not landed leaves its
     /// work owed, so the task can await an attachment completion or another request.
     pub(crate) fn idle_paced_step(&mut self, keys: u64) -> Result<u64, Error> {
+        self.require_async_backend()?;
+        if self.checkpoint_frozen() {
+            return Ok(0);
+        }
         self.trunk.clear_io_wait();
         self.idle_step_with(keys, true)
     }
 
     pub(crate) fn waiting_for_io(&self) -> bool {
-        self.packing.is_none()
-            && self.frozen.is_empty()
-            && self.trunk.waiting_for_io()
-            && self.store.io_outstanding()
+        self.trunk.waiting_for_worker()
+            || ((self.stopping
+                || self.rotation.is_some()
+                || self.checkpoint.is_some()
+                || self.trunk.waiting_for_io())
+                && self.store.io_outstanding())
     }
 
     pub(crate) async fn wait_completion(&mut self) -> Result<bool, Error> {
-        self.store.wait_completion().await
+        let Some(pool) = self.trunk.pool_mut().filter(|p| p.waiting()) else {
+            return self.store.wait_completion().await;
+        };
+        if self.store.io_outstanding() {
+            match hyper_rt::combine::race2(pool.receive(), self.store.wait_completion()).await {
+                hyper_rt::combine::Either::First(message) => match message? {
+                    Some(message) => pool.accept(&mut self.store, message),
+                    None => Ok(true),
+                },
+                hyper_rt::combine::Either::Second(answer) => answer,
+            }
+        } else {
+            match pool.receive().await? {
+                Some(message) => pool.accept(&mut self.store, message),
+                None => Ok(true),
+            }
+        }
     }
 
     fn idle_step_with(&mut self, keys: u64, paced: bool) -> Result<u64, Error> {
@@ -2140,7 +3119,11 @@ impl<F: BlockFile> ShardDb<F> {
             };
         }
         if self.trunk.maplets_owed() {
-            return self.trunk.maplet_step(&mut self.store, keys);
+            return if paced {
+                self.trunk.maplet_step_paced(&mut self.store, keys)
+            } else {
+                self.trunk.maplet_step(&mut self.store, keys)
+            };
         }
         if self.trunk.consolidation_owed() {
             // Seeks paid for consolidating leaves: one cascade, in bulk, flushes and settles
@@ -2288,6 +3271,158 @@ impl<F: BlockFile> ShardDb<F> {
         })
     }
 
+    /// The same rotation as the blocking API, paid in the task's existing slice budget.
+    /// Only old packing and cascade state changes before it returns true; the caller's entry
+    /// remains unapplied, and every old memtable remains reachable by reads.
+    fn rotate_paced(&mut self, keys: u64) -> Result<bool, Error> {
+        self.require_async_backend()?;
+        if self.rotation.is_none() {
+            self.rebudget();
+            self.flush_stats.rotations = self.flush_stats.rotations.saturating_add(1);
+            let now = std::time::Instant::now();
+            if let Some(r) = self.rotated {
+                self.fill_ns =
+                    u64::try_from(now.saturating_duration_since(r).as_nanos()).unwrap_or(u64::MAX);
+            }
+            let finish_packing = self.packing.as_ref().is_some_and(|p| p.feed.is_none());
+            if self.packing.as_ref().is_some_and(|p| p.feed.is_some()) {
+                self.freeze();
+            }
+            self.rotation = Some(Rotation {
+                started: now,
+                finish_packing,
+                most: None,
+                stalled: finish_packing,
+            });
+        }
+        if self.rotation.as_ref().is_some_and(|r| r.finish_packing) {
+            if self.packing.is_some() {
+                self.pack_some(keys.max(1), false)?;
+                if self.packing.is_some() {
+                    return Ok(false);
+                }
+            }
+            let left = self.pack_left();
+            if left > 0 {
+                self.feed_from(left.min(keys.max(1)), false, false)?;
+            }
+            self.take_packs(false)?;
+            if !self.frozen.is_empty() {
+                return Ok(false);
+            }
+            if let Some(r) = self.rotation.as_mut() {
+                r.finish_packing = false;
+            }
+        }
+        let most = match self.rotation.as_ref().and_then(|r| r.most) {
+            Some(most) => most,
+            None => {
+                let most = self.frozen_most();
+                if let Some(r) = self.rotation.as_mut() {
+                    r.most = Some(most);
+                }
+                most
+            }
+        };
+        if self.frozen.len() > most {
+            if let Some(r) = self.rotation.as_mut() {
+                r.stalled = true;
+            }
+            let n = self.frozen.len().saturating_sub(most);
+            let left = self
+                .frozen
+                .iter()
+                .take(n)
+                .filter(|f| f.feed.is_some())
+                .map(|f| u64::try_from(f.mem.len().saturating_sub(f.packed)).unwrap_or(u64::MAX))
+                .fold(0u64, u64::saturating_add);
+            if left > 0 {
+                self.feed_from(left.min(keys.max(1)), false, false)?;
+            }
+            self.take_packs(false)?;
+            if self.frozen.len() > most {
+                return Ok(false);
+            }
+        }
+        if self.trunk.pending() >= self.trunk.fanout() {
+            if let Some(r) = self.rotation.as_mut() {
+                r.stalled = true;
+            }
+            if self.trunk.packing_blocks_dispatch() {
+                // A packing holds every seat and can still need owner-fed input. Pay its
+                // bounded slice before waiting on the cascade's worker capacity.
+                self.pack_some(keys.max(1), false)?;
+                self.take_packs(false)?;
+                if self.trunk.packing_blocks_dispatch() {
+                    return Ok(false);
+                }
+            }
+            if !self
+                .trunk
+                .finish_cascade_paced(&mut self.store, keys.max(1))?
+            {
+                return Ok(false);
+            }
+        }
+        let fresh = match self.spare.take() {
+            Some(m) => m,
+            None => HashMem::new(self.mem_limit)?,
+        };
+        let mut full = std::mem::replace(&mut self.mem, fresh);
+        self.tidy_rent_ns = 0;
+        full.close();
+        self.packing = Some(self.packing_of(full)?);
+        let r = self.rotation.take().ok_or(Error::InvalidArgument {
+            what: "a resumed rotation with no initial state",
+        })?;
+        let ns = if self.timed {
+            u64::try_from(r.started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+        } else {
+            0
+        };
+        self.flush_stats.rotate_ns = self.flush_stats.rotate_ns.saturating_add(ns);
+        if r.stalled {
+            let f = &mut self.flush_stats;
+            f.stalls = f.stalls.saturating_add(1);
+            f.stall_ns = f.stall_ns.saturating_add(ns);
+            f.stall_max_ns = f.stall_max_ns.max(ns);
+        }
+        self.rotated = Some(std::time::Instant::now());
+        Ok(true)
+    }
+
+    /// Packs every memtable and finishes its cascades before a range starts durability.
+    /// A false result owns all unfinished work.
+    pub(crate) fn flush_paced(&mut self, keys: u64) -> Result<bool, Error> {
+        self.trunk.clear_io_wait();
+        self.require_async_backend()?;
+        if self.rotation.is_some() && !self.rotate_paced(keys)? {
+            return Ok(false);
+        }
+        if self.packing.is_some() || !self.frozen.is_empty() {
+            self.pack_some(keys.max(1), false)?;
+            self.take_packs(false)?;
+            return Ok(false);
+        }
+        if !self.mem.is_empty() {
+            let fresh = match self.spare.take() {
+                Some(m) => m,
+                None => HashMem::new(self.mem_limit)?,
+            };
+            let mut full = std::mem::replace(&mut self.mem, fresh);
+            self.tidy_rent_ns = 0;
+            full.close();
+            self.packing = Some(self.packing_of(full)?);
+            return Ok(false);
+        }
+        if !self.trunk.is_idle() {
+            self.trunk.step_paced(&mut self.store, keys.max(1))?;
+            return Ok(false);
+        }
+        self.trunk_carry = 0;
+        Ok(true)
+    }
+
     /// The memtable is full: it becomes the packing one and a cleared one takes the puts. A debt
     /// still owed is paid first, whole, and counted a stall: the packing memtable's, and the
     /// trunk's cascade when `fanout` packed memtables wait on it.
@@ -2319,6 +3454,11 @@ impl<F: BlockFile> ShardDb<F> {
             stalled = true;
         }
         if self.trunk.pending() >= self.trunk.fanout() {
+            if self.trunk.packing_blocks_dispatch() {
+                // A whole cascade cannot admit its first job until a packing seat is free;
+                // feed the oldest packing before any wait that would depend on its owner.
+                self.wait_oldest(1)?;
+            }
             self.trunk.finish_cascade(&mut self.store)?;
             stalled = true;
         }
@@ -2423,6 +3563,7 @@ impl<F: BlockFile> ShardDb<F> {
 
     /// Packs every memtable into the trunk and runs its maintenance to the end.
     pub fn flush(&mut self) -> Result<(), Error> {
+        self.no_checkpoint_mutation()?;
         self.finish_packing()?;
         if !self.mem.is_empty() {
             let fresh = match self.spare.take() {
@@ -2863,7 +4004,7 @@ mod frozen_tests {
         }
         db.checkpoint(i).unwrap();
         check(&mut db, &oracle);
-        let (file, landed) = db.into_file();
+        let (file, landed) = crate::store::cold_file(db.into_file());
         landed.unwrap();
         drop(file);
         let (mut db, applied) = ShardDb::open(plain(&path, false), STORE, MEM, TRUNK).unwrap();
@@ -2879,7 +4020,7 @@ mod frozen_tests {
     static GATES_B: [&AtomicBool; 3] = [&HELD_B, &FAIL_WORKER_B, &FAIL_SHARD_B];
 
     #[test]
-    fn a_failed_packing_is_repacked_here_or_kept_typed_and_read_exact() {
+    fn a_failed_packing_keeps_entries_and_reports_the_worker_failure() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("store");
         let shard = Held {
@@ -2891,6 +4032,11 @@ mod frozen_tests {
         };
         let mut db = ShardDb::create(shard, STORE, MEM, TRUNK).unwrap();
         let _open = Open(&GATES_B);
+        let mut oracle = BTreeMap::new();
+        db.put(b"durable", b"before worker failure").unwrap();
+        oracle.insert(b"durable".to_vec(), b"before worker failure".to_vec());
+        db.checkpoint(1).unwrap();
+        let durable = oracle.clone();
         let p = path.clone();
         db.set_workers(move || {
             let first = OPENS_B.fetch_add(1, Ordering::SeqCst) == 0;
@@ -2903,45 +4049,28 @@ mod frozen_tests {
             })
         })
         .unwrap();
-        let mut oracle = BTreeMap::new();
         let mut i = 0u64;
 
-        // A worker's failure alone is absorbed: the shard packs that memtable itself.
+        // A real worker failure is retained, with no owner-thread repacking.
         HELD_B.store(true, Ordering::SeqCst);
         FAIL_WORKER_B.store(true, Ordering::SeqCst);
         until_reused(&mut db, &mut oracle, &mut i);
         HELD_B.store(false, Ordering::SeqCst);
-        db.drain_frozen().unwrap();
-        assert!(db.frozen.is_empty());
-        assert!(db.stats().0.repacked >= 1);
+        assert!(matches!(db.drain_frozen(), Err(Error::Io { .. })));
+        assert!(matches!(db.drain_frozen(), Err(Error::Io { .. })));
         check(&mut db, &oracle);
-        db.checkpoint(i).unwrap();
-        let at = i;
-        let durable = oracle.clone();
-
-        // Both failing: the oldest held with younger results in behind it, then released into
-        // a failed write on its worker and on the shard. The failure is typed, as often as it
-        // is asked, with no wait; every frozen memtable stays read; nothing retires past it.
-        HELD_B.store(true, Ordering::SeqCst);
-        FAIL_WORKER_B.store(true, Ordering::SeqCst);
-        until_reused(&mut db, &mut oracle, &mut i);
-        let frozen = db.frozen.len();
-        FAIL_SHARD_B.store(true, Ordering::SeqCst);
-        HELD_B.store(false, Ordering::SeqCst);
-        assert!(db.drain_frozen().is_err());
-        assert!(db.drain_frozen().is_err());
-        assert_eq!(db.frozen.len(), frozen);
-        assert!(db.frozen.front().is_some_and(|f| f.here));
+        assert!(matches!(
+            db.put(b"after", b"refused"),
+            Err(Error::Io { .. })
+        ));
+        assert!(matches!(db.delete(b"durable"), Err(Error::Io { .. })));
         check(&mut db, &oracle);
-        // The store is fenced by its failed write: a put is refused, typed.
-        assert!(db.put(b"after", b"the fence").is_err());
-        drop(db);
-
-        // Reopened: the last checkpoint, exactly.
-        FAIL_SHARD_B.store(false, Ordering::SeqCst);
+        let (file, retired) = crate::store::cold_file(db.into_file());
+        assert!(matches!(retired, Err(Error::Io { .. })));
+        drop(file);
         FAIL_WORKER_B.store(false, Ordering::SeqCst);
         let (mut db, applied) = ShardDb::open(plain(&path, false), STORE, MEM, TRUNK).unwrap();
-        assert_eq!(applied, at);
+        assert_eq!(applied, 1);
         check(&mut db, &durable);
         db.check_references().unwrap();
     }
@@ -3057,7 +4186,7 @@ mod frozen_tests {
             assert!(db.get(k, &mut v).unwrap() && &v == want);
         }
         db.checkpoint(i).unwrap();
-        let (file, landed) = db.into_file();
+        let (file, landed) = crate::store::cold_file(db.into_file());
         landed.unwrap();
         drop(file);
         let (mut db, applied) =

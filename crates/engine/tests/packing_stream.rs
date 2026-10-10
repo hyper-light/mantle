@@ -9,6 +9,10 @@
     clippy::cast_possible_truncation
 )]
 
+#[path = "support/into_file.rs"]
+mod file_outcome;
+use file_outcome::finished_file;
+
 use std::collections::BTreeMap;
 
 use hyper_block::buf::Alignment;
@@ -83,7 +87,7 @@ fn native_shared_prefix_entries_cross_pages_and_reopen_with_exact_values() {
     let mut descriptor = Vec::new();
     branch.encode(&mut descriptor).unwrap();
     s.checkpoint(Some(branch.root), 1).unwrap();
-    let (file, landed) = s.into_file();
+    let (file, landed) = finished_file(s.into_file());
     landed.unwrap();
     let (mut s, recovered) = Store::open(file, CONFIG).unwrap();
     assert_eq!(recovered.root, Some(branch.root));

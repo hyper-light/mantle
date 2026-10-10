@@ -12,15 +12,16 @@
 //! the channel full; a client past the bound is refused when it is made. A range's batch is at
 //! most its channel's capacity, and a maintenance slice lasts about the caller's slice budget.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Poll, Waker};
 
 use hyper_block::block::BlockFile;
-use hyper_rt::Runtime;
 use hyper_rt::combine::{Either, race2};
 use hyper_rt::sync::{ChannelReceiver, Sender, SyncError, channel, channel_with};
+use hyper_rt::{Runtime, TaskId};
 
 use crate::error::Error;
 use crate::rows::Rows;
@@ -111,76 +112,135 @@ async fn serve<F: BlockFile>(
     mut db: ShardDb<F>,
     mut requests: ChannelReceiver<Request>,
     batch: usize,
-    slice_ns: u64,
+    mut range: Range,
 ) {
-    let mut range = Range {
-        fault: None,
-        slice: Slice::new(slice_ns),
-        settling: Vec::new(),
-    };
-    loop {
-        // Every request waiting, at most a batch: one wake serves them all.
+    // Cancellation is latched by leaving this loop. The terminal cleanup below is
+    // never raced again against the permanently ready cancellation level.
+    let stop = 'serving: loop {
+        match hyper_rt::futures::cancellation_requested() {
+            Ok(false) => {}
+            Ok(true) => break None,
+            Err(_) => {
+                range.fault.get_or_insert(Error::InvalidArgument {
+                    what: "a range actor outside its admitted service task",
+                });
+                break None;
+            }
+        }
+        if let Some(stop) = range.resume(&mut db) {
+            break Some(stop);
+        }
         let mut served = 0usize;
         while served < batch {
             match requests.try_recv() {
                 Ok(Some(request)) => {
-                    if range.answer(&mut db, request) {
-                        return finish(db, &mut requests);
+                    match range.answer(&mut db, request).await {
+                        Answered::Continue => {}
+                        Answered::Stop => break 'serving range.active.take(),
+                        Answered::Cancelled => break 'serving None,
                     }
                     served = served.saturating_add(1);
                 }
                 Ok(None) => break,
-                Err(_) => return finish(db, &mut requests),
+                Err(_) => break 'serving None,
             }
         }
         if served == batch {
-            // More may wait: the shard's other tasks first, then the next batch.
             hyper_rt::futures::yield_now().await;
             continue;
         }
-        if range.fault.is_none() && db.idle_owed() {
-            range.maintain(&mut db);
+        if range.fault.is_none() && (!range.pending.is_empty() || db.idle_owed()) {
+            if db.idle_owed() {
+                range.maintain(&mut db);
+            }
             if range.fault.is_none() && db.waiting_for_io() {
-                // The same task owns both receivers. A request can interrupt this borrowed
-                // completion wait without consuming its answer or returning its buffer.
-                let ready = race2(requests.recv(), db.wait_completion()).await;
+                // Only borrowed waits are raced. Range retains every active/pending
+                // Request, its buffers, reply and admission lease until physical finish.
+                let ready = race2(
+                    hyper_rt::futures::cancelled(),
+                    race2(requests.recv(), db.wait_completion()),
+                )
+                .await;
                 match ready {
-                    Either::First(Ok(request)) => {
-                        if range.answer(&mut db, request) {
-                            return finish(db, &mut requests);
+                    Either::First(_) => break None,
+                    Either::Second(Either::First(Ok(request))) => {
+                        match range.answer(&mut db, request).await {
+                            Answered::Continue => {}
+                            Answered::Stop => break range.active.take(),
+                            Answered::Cancelled => break None,
                         }
                     }
-                    Either::First(Err(_)) => return finish(db, &mut requests),
-                    Either::Second(Ok(_)) => {}
-                    Either::Second(Err(error)) => range.fault = Some(error),
+                    Either::Second(Either::First(Err(_))) => break None,
+                    Either::Second(Either::Second(Ok(_))) => {}
+                    Either::Second(Either::Second(Err(error))) => range.fault = Some(error),
                 }
             } else {
                 hyper_rt::futures::yield_now().await;
             }
             continue;
         }
-        // Nothing owed, or a fault: whoever waits for that is answered before the task sleeps.
         range.settle(&mut db);
-        match requests.recv().await {
-            Ok(request) => {
-                if range.answer(&mut db, request) {
-                    return finish(db, &mut requests);
-                }
-            }
-            Err(_) => return finish(db, &mut requests),
+        match race2(hyper_rt::futures::cancelled(), requests.recv()).await {
+            Either::First(_) => break None,
+            Either::Second(Ok(request)) => match range.answer(&mut db, request).await {
+                Answered::Continue => {}
+                Answered::Stop => break range.active.take(),
+                Answered::Cancelled => break None,
+            },
+            Either::Second(Err(_)) => break None,
         }
+    };
+    finish(db, requests, stop, range).await;
+}
+
+/// An admitted cold bootstrap owns no Db until the caller observes its actual
+/// admission. Cancellation does not drop the offer receiver: a late accepted Db
+/// must arrive and be retired on this same service task, or the producer closes it.
+async fn bootstrap<F: BlockFile>(
+    mut offered: ChannelReceiver<ShardDb<F>>,
+    requests: ChannelReceiver<Request>,
+    batch: usize,
+    range: Range,
+) {
+    if let Ok(db) = offered.recv().await {
+        serve(db, requests, batch, range).await;
     }
 }
 
-/// The task's end: the engine's writes landed and the engine dropped. Requests still queued
-/// are dropped unanswered, which closes their clients' channels: they are told the range is
-/// gone.
-fn finish<F: BlockFile>(db: ShardDb<F>, requests: &mut ChannelReceiver<Request>) {
-    let (_, landed) = db.into_file();
-    drop(landed);
-    while let Ok(Some(request)) = requests.try_recv() {
-        drop(request);
+/// Once closing, keep all unanswered ownership until worker, owner and file
+/// retirement. Closing the owned receiver after retirement drops its bounded
+/// queued requests in one terminal step, rather than accepting an endless new drain.
+async fn finish<F: BlockFile>(
+    mut db: ShardDb<F>,
+    requests: ChannelReceiver<Request>,
+    stop: Option<Request>,
+    mut range: Range,
+) {
+    let fault = range.fault.take();
+    let finished = db.finish_async().await;
+    if !db.actor_finished() {
+        // Prepared ownership returns to its existing reaper/issuer close protocol.
+        // No file or Stop acknowledgement is exposed before physical quiescence.
+        drop(db);
+        drop(stop);
+        drop(requests);
+        drop(range);
+        return;
     }
+    // The cold reaper already closed the original; the actor holds only scalar receipts.
+    drop(db);
+    drop(requests);
+    drop(range);
+    if let Some(mut request) = stop {
+        request.result = fault.map_or(finished, Err);
+        Range::reply(request);
+    }
+}
+
+enum Answered {
+    Continue,
+    Stop,
+    Cancelled,
 }
 
 /// A range task's state beside its engine.
@@ -192,30 +252,186 @@ struct Range {
     /// Settled requests waiting for the range to owe nothing: at most one a client, each
     /// client having one request out at a time.
     settling: Vec<Request>,
+    /// The unapplied mutation and later mutations/barriers, in arrival order. Each
+    /// client owns at most one request, so this and `settling` together cannot exceed
+    /// the node's existing client bound. Capacity is reserved before the task starts.
+    pending: VecDeque<Request>,
+    clients: usize,
+    /// Outside the borrowed query future: cancellation cannot drop its lease early.
+    active: Option<Request>,
+}
+
+enum Started {
+    Pending(Request),
+    Replied,
+    Stop(Request),
 }
 
 impl Range {
-    /// Applies `request` and sends its answer; true when it was the range's stop. The shard is
+    fn new(clients: usize, slice_ns: u64) -> Result<Self, Error> {
+        let refused = || Error::LimitExceeded {
+            what: "a range's retained requests",
+            limit: u64::try_from(clients).unwrap_or(u64::MAX),
+        };
+        let mut pending = VecDeque::new();
+        pending.try_reserve_exact(clients).map_err(|_| refused())?;
+        let mut settling = Vec::new();
+        settling.try_reserve_exact(clients).map_err(|_| refused())?;
+        Ok(Self {
+            fault: None,
+            slice: Slice::new(slice_ns),
+            settling,
+            pending,
+            clients,
+            active: None,
+        })
+    }
+
+    /// Applies `request` and sends its answer, or retains a stop for terminal cleanup. The shard is
     /// told a client was served, so it spins out its wake window before it parks and the
     /// client's next request costs no kernel wake (hyper-rt `ShardContext::note_activity`).
-    fn answer<F: BlockFile>(&mut self, db: &mut ShardDb<F>, mut request: Request) -> bool {
+    async fn answer<F: BlockFile>(&mut self, db: &mut ShardDb<F>, request: Request) -> Answered {
         hyper_rt::registry::with_current(|ctx| ctx.note_activity());
+        if self.fault.is_none() && matches!(request.ask, Ask::Get | Ask::Scan { .. }) {
+            self.active = Some(request);
+            let ready = {
+                let Some(request) = self.active.as_mut() else {
+                    return Answered::Cancelled;
+                };
+                // Cancellation drops only this borrowed query and its span/page guards.
+                // The Request itself remains in Range through finish_async.
+                race2(hyper_rt::futures::cancelled(), Self::query(db, request)).await
+            };
+            match ready {
+                Either::First(_) => return Answered::Cancelled,
+                Either::Second(result) => {
+                    if let Some(mut request) = self.active.take() {
+                        request.result = result;
+                        Self::reply(request);
+                    }
+                    return Answered::Continue;
+                }
+            }
+        }
+        if !self.pending.is_empty()
+            && !matches!(request.ask, Ask::Get | Ask::Scan { .. } | Ask::Stats)
+        {
+            self.defer(request);
+            return Answered::Continue;
+        }
+        match self.start(db, request) {
+            Started::Pending(request) => {
+                self.defer(request);
+                Answered::Continue
+            }
+            Started::Replied => Answered::Continue,
+            Started::Stop(request) => {
+                self.active = Some(request);
+                Answered::Stop
+            }
+        }
+    }
+
+    async fn query<F: BlockFile>(db: &mut ShardDb<F>, request: &mut Request) -> Result<(), Error> {
+        match &request.ask {
+            Ask::Get => db
+                .get_async(&request.key, &mut request.value)
+                .await
+                .map(|found| request.found = found),
+            Ask::Scan { bounded, limit } => {
+                request.rows.clear();
+                let end = bounded.then(|| request.end.as_slice());
+                db.scan_async(
+                    &request.key,
+                    end,
+                    *limit,
+                    &mut request.rows,
+                    &mut request.next,
+                )
+                .await
+                .map(|more| request.more = more)
+            }
+            _ => Err(Error::InvalidArgument {
+                what: "a nonquery in an owned range query",
+            }),
+        }
+    }
+
+    fn defer(&mut self, mut request: Request) {
+        if self.pending.len() >= self.clients {
+            request.result = Err(Error::LimitExceeded {
+                what: "a range's retained requests",
+                limit: u64::try_from(self.clients).unwrap_or(u64::MAX),
+            });
+            Self::reply(request);
+        } else {
+            self.pending.push_back(request);
+        }
+    }
+
+    /// Retries only the oldest unapplied entry. A completed entry is removed before
+    /// another request runs, so cancellation of a client's receive never replays it.
+    fn resume<F: BlockFile>(&mut self, db: &mut ShardDb<F>) -> Option<Request> {
+        for _ in 0..self.pending.len() {
+            let Some(request) = self.pending.pop_front() else {
+                break;
+            };
+            match self.start(db, request) {
+                Started::Pending(request) => {
+                    self.pending.push_front(request);
+                    break;
+                }
+                Started::Replied => {}
+                Started::Stop(request) => return Some(request),
+            }
+        }
+        None
+    }
+
+    /// An unapplied request keeps its buffers, answer channel and admission lease. A stop
+    /// keeps the same ownership even after a fault, until its writes and workers retire.
+    fn start<F: BlockFile>(&mut self, db: &mut ShardDb<F>, mut request: Request) -> Started {
+        if matches!(request.ask, Ask::Stop) {
+            return Started::Stop(request);
+        }
         if matches!(request.ask, Ask::Settled) && self.fault.is_none() && db.idle_owed() {
             // Answered once nothing is owed ([`Self::settle`]).
-            self.settling.push(request);
-            return false;
+            if self.settling.len() >= self.clients {
+                request.result = Err(Error::LimitExceeded {
+                    what: "a range's settled requests",
+                    limit: u64::try_from(self.clients).unwrap_or(u64::MAX),
+                });
+                Self::reply(request);
+            } else {
+                self.settling.push(request);
+            }
+            return Started::Replied;
         }
-        let stop = matches!(request.ask, Ask::Stop);
-        request.result = match &self.fault {
+        let result = match &self.fault {
             Some(fault) => Err(fault.clone()),
-            None => apply(db, &mut request),
+            None => apply(db, &mut request, self.slice.keys()),
         };
+        if matches!(request.ask, Ask::Checkpoint(_))
+            && db.checkpoint_failed()
+            && let Err(error) = &result
+        {
+            self.fault.get_or_insert_with(|| error.clone());
+        }
+        request.result = match result {
+            Ok(false) => return Started::Pending(request),
+            Ok(true) => Ok(()),
+            Err(error) => Err(error),
+        };
+        Self::reply(request);
+        Started::Replied
+    }
+
+    fn reply(mut request: Request) {
         if let Some(reply) = request.reply.take() {
             request.reply = Some(reply.clone());
             // A client gone has nobody to tell.
             drop(reply.try_send(request));
         }
-        stop
     }
 
     /// Answers every settled request waiting, the range owing nothing or faulted: its fault, or
@@ -224,8 +440,12 @@ impl Range {
         if self.settling.is_empty() || (self.fault.is_none() && db.idle_owed()) {
             return;
         }
-        for request in std::mem::take(&mut self.settling) {
-            self.answer(db, request);
+        for mut request in self.settling.drain(..) {
+            request.result = self
+                .fault
+                .as_ref()
+                .map_or(Ok(()), |fault| Err(fault.clone()));
+            Self::reply(request);
         }
     }
 
@@ -245,32 +465,22 @@ impl Range {
 }
 
 /// Applies a request to the engine, its answer into the request.
-fn apply<F: BlockFile>(db: &mut ShardDb<F>, request: &mut Request) -> Result<(), Error> {
+fn apply<F: BlockFile>(
+    db: &mut ShardDb<F>,
+    request: &mut Request,
+    keys: u64,
+) -> Result<bool, Error> {
     match &request.ask {
-        Ask::Put => db.put(&request.key, &request.value),
-        Ask::Delete => db.delete(&request.key),
-        Ask::Get => {
-            request.found = db.get(&request.key, &mut request.value)?;
-            Ok(())
-        }
-        Ask::Scan { bounded, limit } => {
-            request.rows.clear();
-            let end = if *bounded {
-                Some(request.end.as_slice())
-            } else {
-                None
-            };
-            request.more = db.scan(
-                &request.key,
-                end,
-                *limit,
-                &mut request.rows,
-                &mut request.next,
-            )?;
-            Ok(())
-        }
-        Ask::Checkpoint(applied) => db.checkpoint(*applied),
-        Ask::Flush => db.flush(),
+        Ask::Put => return db.put_paced(&request.key, &request.value, keys),
+        Ask::Delete => return db.delete_paced(&request.key, keys),
+        Ask::Get => Err(Error::InvalidArgument {
+            what: "a runtime point lookup outside its owned async request",
+        }),
+        Ask::Scan { .. } => Err(Error::InvalidArgument {
+            what: "a runtime scan outside its owned async request",
+        }),
+        Ask::Checkpoint(applied) => return db.checkpoint_paced(*applied, keys),
+        Ask::Flush => return db.flush_paced(keys),
         Ask::Stats => {
             request.stats = Some(db.stats());
             Ok(())
@@ -278,6 +488,7 @@ fn apply<F: BlockFile>(db: &mut ShardDb<F>, request: &mut Request) -> Result<(),
         Ask::Settled => Ok(()),
         Ask::Stop => db.land(),
     }
+    .map(|()| true)
 }
 
 /// The keys a maintenance slice is given: the slice budget at the rate slices have run, so a
@@ -332,18 +543,57 @@ pub struct Ranges {
     /// Each range's lowest key, ascending; the first is empty, so every key has a range.
     starts: Vec<Vec<u8>>,
     senders: Vec<Sender<Request>>,
+    tasks: Vec<TaskId>,
     /// Clients live now, at most `clients`.
     live: Arc<AtomicUsize>,
     clients: usize,
     spin_ns: u64,
 }
 
+/// Runtime preflight retains every engine. Later cold startup errors follow cold rollback.
+pub enum StartError<F: BlockFile> {
+    Refused {
+        ranges: Vec<(Vec<u8>, ShardDb<F>)>,
+        error: Error,
+    },
+    Failed(Error),
+}
+
+impl<F: BlockFile> std::fmt::Debug for StartError<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused { ranges, error } => f
+                .debug_struct("Refused")
+                .field("ranges", &ranges.len())
+                .field("error", error)
+                .finish(),
+            Self::Failed(error) => f.debug_tuple("Failed").field(error).finish(),
+        }
+    }
+}
+
 impl Ranges {
     /// Starts each range's engine on a shard of `runtime`, the ranges dealt to its shards in
     /// order. `ranges` gives each range's lowest key, ascending, the first empty.
     pub fn start<F: BlockFile + Send + 'static>(
-        runtime: &Runtime,
+        runtime: &mut Runtime,
         ranges: Vec<(Vec<u8>, ShardDb<F>)>,
+        config: RangesConfig,
+    ) -> Result<Self, StartError<F>> {
+        if hyper_rt::registry::current_shard().is_some() {
+            return Err(StartError::Refused {
+                ranges,
+                error: Error::InvalidArgument {
+                    what: "range cold setup on a runtime",
+                },
+            });
+        }
+        Self::start_cold(runtime, ranges, config).map_err(StartError::Failed)
+    }
+
+    fn start_cold<F: BlockFile + Send + 'static>(
+        runtime: &mut Runtime,
+        mut ranges: Vec<(Vec<u8>, ShardDb<F>)>,
         config: RangesConfig,
     ) -> Result<Self, Error> {
         let RangesConfig {
@@ -361,9 +611,53 @@ impl Ranges {
                 what: "ranges not ascending from the empty key",
             });
         }
+        // Refuse an incomplete setup before any engine can start serving on a shard.
+        for (_, db) in &ranges {
+            db.validate_async_setup()?;
+        }
+        let mut capacities = Vec::new();
+        capacities
+            .try_reserve_exact(ranges.len())
+            .map_err(|_| Error::LimitExceeded {
+                what: "range native retirement groups",
+                limit: u64::try_from(ranges.len()).unwrap_or(u64::MAX),
+            })?;
+        capacities.extend(ranges.iter().map(|(_, db)| db.retirement_capacity()));
+        // Spawn the empty retirement owner first. Native handles remain in their Pools
+        // on every preparation refusal, and all adoptions precede bootstrap/Db transfer.
+        let leases = runtime
+            .prepare_retirement_with_original::<F, crate::store::OriginalPhysical>(&capacities)
+            .map_err(|error| Error::Io {
+                op: "prepare range native retirement",
+                detail: error.to_string(),
+            })?;
+        // File opens, thread startup and attachment handshakes finish in cold setup.
+        // No range is published until every engine's actual startup receipts arrived.
+        for ((_, db), (lease, mut original)) in ranges.iter_mut().zip(leases) {
+            db.prepare_async_backend()?;
+            db.adopt_retirement(lease)?;
+            let physical = db.prepare_original_retirement_watch()?;
+            db.adopt_original(&mut original, physical)?;
+        }
         let shards = runtime.shard_ids();
         let mut starts = Vec::with_capacity(ranges.len());
         let mut senders = Vec::with_capacity(ranges.len());
+        let mut tasks = Vec::new();
+        tasks
+            .try_reserve_exact(ranges.len())
+            .map_err(|_| Error::LimitExceeded {
+                what: "range task identities",
+                limit: u64::try_from(ranges.len()).unwrap_or(u64::MAX),
+            })?;
+        // Every bootstrap is admitted before any Db transfers. A failed admission
+        // closes previous cold offers; their service tasks then have no live I/O to drop.
+        let mut admitted = Vec::new();
+        admitted
+            .try_reserve_exact(ranges.len())
+            .map_err(|_| Error::LimitExceeded {
+                what: "range cold admission handoffs",
+                limit: u64::try_from(ranges.len()).unwrap_or(u64::MAX),
+            })?;
         for (i, (start, db)) in ranges.into_iter().enumerate() {
             let shard = shards
                 .get(i.checked_rem(shards.len()).unwrap_or(0))
@@ -376,21 +670,61 @@ impl Ranges {
                     what: "a range's request channel",
                     limit: u64::try_from(clients).unwrap_or(u64::MAX),
                 })?;
-            runtime
-                .spawn_on(shard, serve(db, receiver, clients, slice_ns))
+            let range = Range::new(clients, slice_ns)?;
+            let (offer, offered) = channel(1).map_err(|_| Error::LimitExceeded {
+                what: "a range's single cold engine handoff",
+                limit: 1,
+            })?;
+            let receipt = runtime
+                .spawn_service_on_with_receipt(shard, bootstrap(offered, receiver, clients, range))
                 .map_err(|_| Error::Gone {
                     what: "the shard a range was placed on",
                 })?;
+            let task = match receipt.wait_blocking() {
+                Ok(hyper_rt::task::Admission::Admitted(task)) => task,
+                Ok(hyper_rt::task::Admission::Refused(hyper_rt::RtError::TooManyTasks {
+                    capacity,
+                })) => {
+                    return Err(Error::LimitExceeded {
+                        what: "a range actor's task admission",
+                        limit: u64::try_from(capacity).unwrap_or(u64::MAX),
+                    });
+                }
+                Ok(hyper_rt::task::Admission::Refused(_))
+                | Ok(hyper_rt::task::Admission::Terminated)
+                | Err(_) => {
+                    return Err(Error::Gone {
+                        what: "the shard a range was placed on",
+                    });
+                }
+            };
+            admitted.push((start, sender, offer, db, task));
+        }
+        for (start, sender, offer, db, task) in admitted {
+            // The empty cap-one lane has one producer and one engine. Refusal
+            // returns/drops Db on this cold caller; it never silently drops on the shard.
+            offer.try_send(db).map_err(|_| Error::Gone {
+                what: "an admitted range's cold handoff",
+            })?;
+            drop(offer);
             starts.push(start);
             senders.push(sender);
+            tasks.push(task);
         }
         Ok(Self {
             starts,
             senders,
+            tasks,
             live: Arc::new(AtomicUsize::new(0)),
             clients,
             spin_ns,
         })
+    }
+
+    /// The admitted actor identities, in range order, for placement inspection and
+    /// cancellation. Each generational handle becomes stale once its actor retires.
+    pub fn task_ids(&self) -> &[TaskId] {
+        &self.tasks
     }
 
     /// A client of the ranges, refused past the bound `start` was given.
@@ -589,6 +923,11 @@ impl Client<'_> {
     }
 
     fn prepare(&mut self) -> Result<(), Error> {
+        if hyper_rt::registry::current_shard().is_some() {
+            return Err(Error::InvalidArgument {
+                what: "a synchronous range client call inside a runtime task",
+            });
+        }
         if self.barrier.is_some() {
             return Err(Error::InvalidArgument {
                 what: "an asynchronous range barrier still to finish",

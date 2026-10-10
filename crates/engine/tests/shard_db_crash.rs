@@ -15,6 +15,10 @@
     clippy::cast_possible_truncation
 )]
 
+#[path = "support/into_file.rs"]
+mod file_outcome;
+use file_outcome::finished_file;
+
 use std::collections::BTreeMap;
 
 use hyper_block::buf::Alignment;
@@ -98,12 +102,12 @@ fn run(
             None => db.delete(&key(k)),
         };
         if done.is_err() {
-            return (acked, Err(db.into_file().0));
+            return (acked, Err(finished_file(db.into_file()).0));
         }
         let applied = i + 1;
         if applied.is_multiple_of(EVERY) {
             if db.checkpoint(applied).is_err() {
-                return (acked, Err(db.into_file().0));
+                return (acked, Err(finished_file(db.into_file()).0));
             }
             acked = applied;
         }
@@ -134,7 +138,7 @@ fn every_crash_point_recovers_a_checkpoint_whose_state_reads_back() {
     let (acked, done) = run(db, 0, 0);
     let db = done.ok().unwrap();
     assert_eq!(acked, OPS - OPS % EVERY);
-    let file = db.into_file().0;
+    let file = finished_file(db.into_file()).0;
     let stats = file.stats().unwrap();
     let ops = stats.writes + stats.syncs;
     let (mut db, applied) = ShardDb::open(file, STORE, MEM, TRUNK).unwrap();
@@ -209,7 +213,7 @@ fn consolidation_baseline(
     db.put(k, v).unwrap();
     db.checkpoint(applied).unwrap();
     db.check_references().unwrap();
-    let (file, landed) = db.into_file();
+    let (file, landed) = finished_file(db.into_file());
     landed.unwrap();
     (file, expected, applied)
 }
@@ -305,7 +309,7 @@ fn consolidation_seeks_paid_for_recovers_the_same_state_at_every_crash_point() {
         let (_, stats, _) = db.stats();
         assert!(stats.consolidations > 0, "{stats:?}");
         assert!(!db.owed());
-        let (file, landed) = db.into_file();
+        let (file, landed) = finished_file(db.into_file());
         landed.unwrap();
         let after = file.stats().unwrap();
         let (mut db, applied) = ShardDb::open(file, STORE, mem, trunk).unwrap();
@@ -330,7 +334,7 @@ fn consolidation_seeks_paid_for_recovers_the_same_state_at_every_crash_point() {
                 let mut acknowledged = false;
                 let result = consolidate_and_checkpoint(&mut db, baseline, &mut acknowledged);
                 assert!(result.is_err(), "{fault:?} {mode:?}: the fault stopped it");
-                let file = db.into_file().0;
+                let file = finished_file(db.into_file()).0;
                 file.crash(mode).unwrap();
                 file.clear_faults().unwrap();
                 let (mut db, applied) = ShardDb::open(file, STORE, mem, trunk).unwrap();
@@ -345,7 +349,7 @@ fn consolidation_seeks_paid_for_recovers_the_same_state_at_every_crash_point() {
                 // The recovered engine finishes the same consolidation and reopens to it.
                 let mut done = false;
                 consolidate_and_checkpoint(&mut db, baseline, &mut done).unwrap();
-                let (file, landed) = db.into_file();
+                let (file, landed) = finished_file(db.into_file());
                 landed.unwrap();
                 let (mut db, applied) = ShardDb::open(file, STORE, mem, trunk).unwrap();
                 assert_eq!(applied, baseline + 1);

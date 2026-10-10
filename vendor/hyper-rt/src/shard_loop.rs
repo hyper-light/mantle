@@ -164,7 +164,7 @@ impl ShardSeed {
         kick: registry::RegisterKick,
     ) -> Result<ShardSeed, RtError> {
         config.validate_shape()?;
-        let (holder, control) = registry::register_slot(
+        let (holder, control) = registry::register_runtime_slot(
             config.tasks_per_shard,
             config.ring_entries,
             config.interests_per_shard,
@@ -246,6 +246,38 @@ impl Drop for Shard {
                 .store(false, std::sync::atomic::Ordering::Release);
         }
         self.close_control();
+        // A caught foreign poll panic leaves this existing marker set and its
+        // already-unwound future absent. Retire that metadata before driving peers.
+        if let Some(slot) = self.desk.current_task.take()
+            && self
+                .task_mut(slot)
+                .is_some_and(|task| task.state == State::Running && task.future.is_none())
+        {
+            self.finish(slot, Outcome::Cancelled);
+        }
+        // An apply/drop unwind can occur after current_task was cleared. Only an
+        // actual unwind permits this exceptional classification; ordinary missing
+        // ownership is never silently treated as completed service cleanup.
+        if std::thread::panicking() {
+            for index in 0..self.core.tasks.len() {
+                let Ok(slot) = u32::try_from(index) else {
+                    continue;
+                };
+                let interrupted = self.task_mut(slot).is_some_and(|task| {
+                    task.future.is_none()
+                        && (task.state == State::Running
+                            || (task.state == State::Finishing && task.outcome.is_none()))
+                });
+                if interrupted {
+                    self.finish(slot, Outcome::Cancelled);
+                }
+            }
+        }
+        self.core.shutting_down = true;
+        self.cancel_all();
+        // A service may still own accepted physical I/O. Its future is never forcibly
+        // dropped because a poll count expired; only its Ready proves retirement.
+        self.finish_cancelled();
         let entered = registry::enter(&self.desk);
         for task in self.core.tasks.iter_mut() {
             drop(task.future.take());
@@ -262,6 +294,7 @@ impl Shard {
         let config = seed.config;
         let mut driver = (seed.driver)(seed.kick)?;
         driver.reserve_handles(config.interests_per_shard)?;
+        registry::bind_cleanup_thread(seed.holder)?;
         let is_sim = driver.kind() == DriverKind::Simulation;
         let generation_base = registry::entry(seed.id).map_or(0, |entry| entry.generation_base);
         let desk = Box::new(ShardContext::new(
@@ -395,7 +428,11 @@ impl Shard {
 
     /// The driver's clock.
     pub fn now_ns(&self) -> u64 {
-        self.core.driver.now_ns()
+        if self.core.driver_lost {
+            self.desk.now_ns.get()
+        } else {
+            self.core.driver.now_ns()
+        }
     }
 
     /// The step quantum now: the online wake estimate while the shard tracks one, else the configured budget.
@@ -415,7 +452,7 @@ impl Shard {
     }
 
     fn publish_clock(&self) {
-        self.desk.now_ns.set(self.core.driver.now_ns());
+        self.desk.now_ns.set(self.now_ns());
     }
 
     // ------------------------------------------------------------------ admission
@@ -423,6 +460,14 @@ impl Shard {
     /// Admits a spawn request (from any thread's message, or the runtime that owns the shard): detached. The
     /// request's receipt, if it carries one, is answered with the outcome.
     pub fn spawn_request(&mut self, request: SpawnRequest) -> Result<TaskId, RtError> {
+        self.spawn_request_with(request, false)
+    }
+
+    fn spawn_request_with(
+        &mut self,
+        request: SpawnRequest,
+        service: bool,
+    ) -> Result<TaskId, RtError> {
         let SpawnRequest {
             future,
             parent,
@@ -444,6 +489,7 @@ impl Shard {
             future,
             parent,
             joinable: false,
+            service,
         });
         if admitted.is_ok() {
             self.apply();
@@ -463,6 +509,18 @@ impl Shard {
             });
         }
         let id = self.desk.spawn_local(future, None)?;
+        self.apply();
+        Ok(id)
+    }
+
+    /// Owner-side service admission, before the future can first be polled.
+    pub(crate) fn spawn_service_local(&mut self, future: BoxedFuture) -> Result<TaskId, RtError> {
+        if self.core.shutting_down || self.core.exited {
+            return Err(RtError::ShardGone {
+                shard: self.desk.id,
+            });
+        }
+        let id = self.desk.spawn_service_local(future, None)?;
         self.apply();
         Ok(id)
     }
@@ -504,12 +562,8 @@ impl Shard {
                 ready,
             });
         }
-        if asks & ask::CANCEL != 0
-            && let Some(task) = self.task_mut(slot)
-            && task.state != State::Done
-        {
-            task.cancel_requested = true;
-            self.desk.wake_local(slot);
+        if asks & ask::CANCEL != 0 {
+            self.request_cancel(slot);
         }
         if asks & ask::DETACH != 0
             && let Some(task) = self.task_mut(slot)
@@ -529,6 +583,7 @@ impl Shard {
             future,
             parent,
             joinable,
+            service: _,
         } = incoming;
         let parent = parent.filter(|p| self.live(*p));
         if let Some(task) = self.task_mut(slot) {
@@ -592,7 +647,7 @@ impl Shard {
             if self.spin_after_activity(outcome.next_deadline_ns) {
                 continue;
             }
-            self.park(outcome.next_deadline_ns);
+            self.park_owned(outcome.next_deadline_ns);
         }
     }
 
@@ -623,7 +678,7 @@ impl Shard {
     /// quantum; idle turns retrieve immediately. Simulation has no elapsed CPU time to cross a quantum,
     /// so a registered deterministic event is retrieved on its next turn without advancing virtual time.
     fn harvest_turn(&mut self) -> bool {
-        if self.core.shutting_down {
+        if self.core.driver_lost || self.core.exited {
             return false;
         }
         let now = self.desk.now_ns.get();
@@ -734,7 +789,8 @@ impl Shard {
     /// shard arms the driver only for its waits, `apply_interest` and `deliver`), so no system call is made:
     /// a kick left behind returns the next park at once, as it would have.
     fn harvest_io(&mut self, now_ns: u64) -> bool {
-        if self.core.shutting_down
+        if self.core.driver_lost
+            || self.core.exited
             || (self.core.waiting.is_empty() && !self.core.driver.has_pending())
         {
             return false;
@@ -768,6 +824,9 @@ impl Shard {
     /// Spins out the rest of the idle window the last client activity opened; true when something arrived or
     /// a timer fell due during the spin.
     fn spin_after_activity(&mut self, deadline_ns: Option<u64>) -> bool {
+        if self.core.driver_lost {
+            return false;
+        }
         let Some(activity) = self.desk.activity_ns.get() else {
             return false;
         };
@@ -829,7 +888,7 @@ impl Shard {
     }
 
     /// Whether anything waits in the shard's inboxes (no system call).
-    fn has_inbound(&self) -> bool {
+    pub(crate) fn has_inbound(&self) -> bool {
         !self.desk.local.is_empty()
             || self
                 .desk
@@ -889,17 +948,15 @@ impl Shard {
         }
         // Running tasks, not occupied slots: a finished task that waits for a joiner holds its slot, and after
         // shutdown nobody joins it, so waiting on it would never end (found by `tcp::serve`'s handlers).
-        let exit = self.core.shutting_down && self.running_tasks() == 0;
-        if exit {
-            self.core.exited = true;
-            self.close_control();
-            registry::note_arena_generation(self.desk.id, self.core.generation_high);
-            registry::note_exited(self.desk.id);
-        }
+        let exit = self.exit_if_drained();
         self.core.attribution.step_ended(did_work);
         StepOutcome {
             did_work,
-            next_deadline_ns: self.core.timers.next_deadline_ns(),
+            next_deadline_ns: if self.core.driver_lost {
+                None
+            } else {
+                self.core.timers.next_deadline_ns()
+            },
             exit,
         }
     }
@@ -907,16 +964,32 @@ impl Shard {
     /// Parks in the driver until a kick, a completion or `deadline_ns`. The parking announcement comes first
     /// and the inbox re-check second (the protocol and its loom model: [`crate::parking`]).
     pub fn park(&mut self, deadline_ns: Option<u64>) {
+        self.park_with_cleanup(deadline_ns, false);
+    }
+
+    /// The owning run/block_on/Drop loop may await terminal channel completions.
+    /// Manual and simulation park must instead return with cooperative work retained.
+    pub(crate) fn park_owned(&mut self, deadline_ns: Option<u64>) {
+        self.park_with_cleanup(deadline_ns, true);
+    }
+
+    fn park_with_cleanup(&mut self, deadline_ns: Option<u64>, block_cleanup: bool) {
         if self.core.exited {
             return;
         }
         if self.core.driver_lost {
-            self.finish_cancelled();
+            self.finish_hard_cancelled();
+            if block_cleanup && !self.core.exited {
+                self.park_cleanup();
+            }
             return;
         }
         self.apply();
         if self.core.driver_lost {
-            self.finish_cancelled();
+            self.finish_hard_cancelled();
+            if block_cleanup && !self.core.exited {
+                self.park_cleanup();
+            }
             return;
         }
         self.core.waited_for_ns = deadline_ns;
@@ -949,7 +1022,57 @@ impl Shard {
         self.wait_ended(retrieved);
         if lost {
             self.fail_all();
+            self.finish_hard_cancelled();
         }
+    }
+
+    /// Driver loss closed admission and marked every live task. A single arena
+    /// pass can retire ordinary cancellation without polling a cooperative future,
+    /// invoking step recursively, or waiting for a receiver. Service ownership and
+    /// any hard parent's live service children remain until their own Ready.
+    fn finish_hard_cancelled(&mut self) {
+        for index in 0..self.core.tasks.len() {
+            let Ok(slot) = u32::try_from(index) else {
+                break;
+            };
+            let ordinary = self.desk.task(slot).is_some_and(|cell| !cell.service.get());
+            let ready = self.task_mut(slot).is_some_and(|task| {
+                task.cancel_requested
+                    && task.future.is_some()
+                    && matches!(task.state, State::Idle | State::Queued)
+            });
+            if ordinary && ready {
+                self.poll_slot(slot);
+            }
+        }
+        self.apply();
+        self.exit_if_drained();
+    }
+
+    fn exit_if_drained(&mut self) -> bool {
+        let exit = self.core.shutting_down && self.running_tasks() == 0;
+        if exit {
+            self.core.exited = true;
+            self.close_control();
+            registry::note_arena_generation(self.desk.id, self.core.generation_high);
+            registry::note_exited(self.desk.id);
+        }
+        exit
+    }
+
+    /// Event-driven terminal park after the owner has observed native driver loss.
+    /// The ordinary wake bitmap is published before this same announce/recheck protocol;
+    /// the thread permit replaces only the unusable kernel kick/wait, never the payload.
+    fn park_cleanup(&self) {
+        let Some(entry) = self.desk.entry else {
+            return;
+        };
+        entry.parking.park_unless_pending(
+            || self.has_inbound(),
+            || {
+                std::thread::park();
+            },
+        );
     }
 
     /// Folds a park's measured wake into the online estimate (slates §4.3).
@@ -1045,13 +1168,10 @@ impl Shard {
         self.core.driver_lost
     }
 
-    /// Cancels every task with a terminal completion and exits: the driver is gone. Bounded by twice the
-    /// tasks live when it began, plus one: each task needs at most a poll to drop and one to complete.
+    /// Driver loss has already marked cancellation. The normal loop keeps owning
+    /// service futures until their event-driven cleanup returns Ready, then exits.
     fn fail_all(&mut self) {
-        self.finish_cancelled();
-        self.core.exited = true;
-        self.close_control();
-        registry::note_exited(self.desk.id);
+        self.cancel_all();
     }
 
     /// Closes admission before cancellation; called outside nested task polling, or marks
@@ -1069,6 +1189,10 @@ impl Shard {
                 .accepting
                 .store(false, std::sync::atomic::Ordering::Release);
             entry.stop.store(true, std::sync::atomic::Ordering::Release);
+            // No native wait can still be parked: loss was observed by this owner.
+            entry
+                .cleanup_mode
+                .store(true, std::sync::atomic::Ordering::Release);
         }
         self.close_control();
         self.cancel_all();
@@ -1082,12 +1206,13 @@ impl Shard {
     }
 
     fn finish_cancelled(&mut self) {
-        let mut bound = self.live_tasks().saturating_mul(2).saturating_add(1);
-        while self.running_tasks() > 0 && bound > 0 {
+        while self.running_tasks() > 0 {
             let outcome = self.step();
-            bound = bound.saturating_sub(1);
             if outcome.exit {
                 break;
+            }
+            if !outcome.did_work {
+                self.park_owned(outcome.next_deadline_ns);
             }
         }
     }
@@ -1194,6 +1319,12 @@ impl Shard {
                         self.core.counters.admission_refused.saturating_add(1);
                 }
             }
+            Control::SpawnService(request) => {
+                if let Err(RtError::TooManyTasks { .. }) = self.spawn_request_with(*request, true) {
+                    self.core.counters.admission_refused =
+                        self.core.counters.admission_refused.saturating_add(1);
+                }
+            }
             Control::Cancel(word) => {
                 let _ = self.desk.cancel(TaskId(word));
             }
@@ -1212,7 +1343,10 @@ impl Shard {
     }
 
     fn expire_timers(&mut self) -> bool {
-        let now = self.core.driver.now_ns();
+        if self.core.driver_lost {
+            return false;
+        }
+        let now = self.now_ns();
         let mut fired = std::mem::take(&mut self.core.fired);
         self.core.timers.advance(now, &mut fired);
         let any = !fired.is_empty();
@@ -1234,6 +1368,15 @@ impl Shard {
     }
 
     fn poll_slot(&mut self, slot: u32) {
+        let service = self.desk.task(slot).is_some_and(|cell| cell.service.get());
+        if service
+            && self
+                .desk
+                .task(slot)
+                .is_some_and(|cell| cell.cancelled.get())
+        {
+            self.cancel_children_once(slot);
+        }
         let Some(generation) = self.desk.task(slot).map(|cell| cell.generation.get()) else {
             return;
         };
@@ -1246,7 +1389,7 @@ impl Shard {
         let Some(mut future) = task.future.take() else {
             return;
         };
-        if task.cancel_requested {
+        if task.cancel_requested && !service {
             task.state = State::Finishing;
             self.drop_entered(future);
             self.finish(slot, Outcome::Cancelled);
@@ -1309,6 +1452,7 @@ impl Shard {
             count_long_poll(&mut self.core.counters, attributed);
         }
         self.core.counters.longest_step_ns = self.core.counters.longest_step_ns.max(elapsed);
+        let service = self.desk.task(slot).is_some_and(|cell| cell.service.get());
         let Some(task) = slot_mut(&mut self.core.tasks, slot) else {
             return;
         };
@@ -1317,14 +1461,15 @@ impl Shard {
             task.long_steps = task.long_steps.saturating_add(1);
         }
         task.longest_step_ns = task.longest_step_ns.max(elapsed);
-        if done || task.cancel_requested {
+        if done || (task.cancel_requested && !service) {
+            let cancelled = task.cancel_requested;
             self.drop_entered(future);
             self.finish(
                 slot,
-                if done {
-                    Outcome::Completed
-                } else {
+                if cancelled && service || !done {
                     Outcome::Cancelled
+                } else {
+                    Outcome::Completed
                 },
             );
             return;
@@ -1365,6 +1510,9 @@ impl Shard {
                 }
                 None => break,
             };
+            if let Some(cell) = self.desk.task(child) {
+                cell.cancelled.set(true);
+            }
             if done {
                 unlink_child(&mut self.core.tasks, slot, child);
                 self.free_slot(child);
@@ -1474,6 +1622,41 @@ impl Shard {
         }
     }
 
+    /// Every cancellation writer publishes the same level before scheduling the task.
+    fn request_cancel(&mut self, slot: u32) {
+        if let Some(task) = self.task_mut(slot)
+            && task.state != State::Done
+        {
+            task.cancel_requested = true;
+            if let Some(cell) = self.desk.task(slot) {
+                cell.cancelled.set(true);
+            }
+            self.desk.wake_local(slot);
+        }
+    }
+
+    /// Direct children are scheduled for cancellation before a service can await them.
+    /// A cancelled service child performs its own direct pass when polled: no recursive
+    /// traversal stack, additional allocation, or unbounded linked-list walk is introduced.
+    fn cancel_children_once(&mut self, slot: u32) {
+        let Some(cell) = self.desk.task(slot) else {
+            return;
+        };
+        if cell.cancel_children.replace(true) {
+            return;
+        }
+        let mut child = self.task_mut(slot).map_or(NO_LINK, |task| task.first_child);
+        let mut budget = self.core.tasks.len();
+        while child != NO_LINK && budget > 0 {
+            budget = budget.saturating_sub(1);
+            let Some(next) = self.task_mut(child).map(|task| task.next_sibling) else {
+                break;
+            };
+            self.request_cancel(child);
+            child = next;
+        }
+    }
+
     fn cancel_all(&mut self) {
         for (slot, task) in self.core.tasks.iter_mut().enumerate() {
             if let Ok(slot) = u32::try_from(slot)
@@ -1484,6 +1667,9 @@ impl Shard {
                 && task.state != State::Done
             {
                 task.cancel_requested = true;
+                if let Some(cell) = self.desk.task(slot) {
+                    cell.cancelled.set(true);
+                }
                 self.desk.wake_local(slot);
             }
         }

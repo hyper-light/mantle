@@ -92,9 +92,9 @@ carries work not yet on hyper-raft's `main`: #12 (the hardened runtime: readines
 manual stepping, driver loss, representation bounds, and the blocking pool refusing a job once
 stopped, `48b7d81`), #13 (`Issuer::attacher`, an owned way for a maintenance worker to attach), #7
 (a batch's vector comes back with its answer) and the issuer's completion bridge
-(`Attached::answer_async`) that this vendor already held. Against the vendor it replaces, the only
-changes are #12's and #13's; the bridge and #7 are byte-identical but for seven test asserts that read
-#7's `(AlignedBuf, u64)` answers. Both crates are re-vendored from `main` once these land, and this
+(`Attached::answer_async`) that this vendor already held. That describes the historical base import. This isolated candidate additionally carries
+uncommitted cooperative-service cleanup and the per-attachment submission/retirement lanes
+recorded below; neither is claimed to exist in the base commit's objects. Both crates are re-vendored from `main` once these land, and this
 note goes with that commit. The rows below state the snapshot each crate held before.
 
 The crates mantle shares with focal and slates come from github.com/hyper-light/hyper-raft:
@@ -121,6 +121,34 @@ The crates mantle shares with focal and slates come from github.com/hyper-light/
   dev-dependency on a crate not vendored here, with a comment naming it: `hyper-timing`'s on
   `hyper-sim`, and `hyper-liveness`'s on `hyper-swim`, `hyper-datagram`, `hyper-tokio` and
   `hyper-sim`, whose tests hyper-raft's CI runs and mantle does not.
+
+The base snapshots came from `8cd36040c1a9cb51d7aed8981b4aa5539b47ef6c`, including
+the hardened-runtime revision `48b7d81213885b26f9572eefb1db279c49f5aa68`. The current
+candidate imports local uncommitted changes on producer HEAD `d9c5cf8e121fd009e82f56e0927ead1c94cc1197`. Its
+62 runtime Rust source files and 69 runtime Rust test files identify the prepared
+`hyper-rt-service-root` source, including cooperative service admission/cancellation,
+per-poll synchronization guards, checked channel slot/ticket layouts, TCP setup and
+accept-future RAII, and cold-owned bounded native retirement. Source census
+SHA256: `0ccee4e528191c94ef986b8ffec440c6e88b8151bd56fad2a7c888855b432b60`; test census SHA256:
+`417707fb8ee898a6bd20cbf82c52d769f835fb2f7cf36ecb5dcc4fb654c269f4`. The two TLS ownership tests use
+`Cell<Option<_>>`. The current overlay also pre-adopts original files into the existing
+native reaper and holds an independent attachment watch through physical retirement. Each census hashes UTF-8 lines
+`<file SHA256>  <relative path>\n` for every `*.rs` beneath that directory, ordered by the UTF-8 relative path. Its issuer source
+SHA256 is `a84ee65def48fedb8412e43b8ab2fe2bd2b2cdd9a7284fa3a8114896fc7eefb9`, including nonblocking
+entered-shard owning Drop, B+1 physical terminal receipts, guarded lifecycle errors,
+cold typed retirement, checked extreme channel/batch layouts, and bounded per-worker
+completion/exit lanes that wake the broker without polling
+(`hyper-block/ORIGIN.md` changes10–11). These are development source identities, not
+accepted producer revisions. They do not include the pending generic canceled-grant
+handoff proposal or establish repaired-C3 throughput. Producer and every consumer's
+exact final-tree gates, native six-platform CI and the measured replacement law remain
+required. After the producer lands, re-vendor from its exact accepted commit objects,
+conform manifests by the recipe above and update SNAPSHOT; the historical rows below
+are not current API identity.
+
+The AWS-LC workspace command above excludes these standalone shared-crate roots. It does
+not run their runtime, device or allocation tests. Their suites must also be run against
+the exact development sources, including `hyper-block/tests/issuer_allocs.rs`.
 
 | Snapshot | Revision | Used by |
 |---|---|---|

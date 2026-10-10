@@ -13,6 +13,10 @@
     clippy::cast_possible_truncation
 )]
 
+#[path = "support/into_file.rs"]
+mod file_outcome;
+use file_outcome::finished_file;
+
 use std::collections::BTreeMap;
 
 use hyper_block::buf::Alignment;
@@ -235,7 +239,7 @@ fn a_short_seek_does_not_read_a_fully_shadowed_run() {
     let old_page = u64::from(branches[1].leaf_of(&from).unwrap());
     let address = branches[1].page_address(&s, old_page).unwrap();
     s.checkpoint(None, 1).unwrap();
-    let (file, finished) = s.into_file();
+    let (file, finished) = finished_file(s.into_file());
     finished.unwrap();
     file.inject(Fault::ReadError {
         offset: address * CONFIG.page_size as u64,
@@ -295,7 +299,7 @@ fn a_reopened_view_pages_from_present_and_absent_keys_with_deletions() {
     let mut encoded_view = Vec::new();
     view.encode(&mut encoded_view).unwrap();
     s.checkpoint(None, 1).unwrap();
-    let (file, finished) = s.into_file();
+    let (file, finished) = finished_file(s.into_file());
     finished.unwrap();
     let (mut s, _) = Store::open(file, CONFIG).unwrap();
     let branches: Vec<_> = descriptors

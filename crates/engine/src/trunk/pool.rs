@@ -15,10 +15,11 @@
 //! puts fill them, and the workers spent `busy` nanoseconds on jobs; the shard itself ran for
 //! `period` nanoseconds of that, its waits on the workers left out, since those measure too few
 //! workers rather than demand. Keeping up takes `busy / period` workers on average, so the pool
-//! keeps the ceiling of that measured ratio, at least one and at most the cores the OS reports
+//! admits the ceiling of that measured ratio as active jobs, at least one and at most the cores the OS reports
 //! less the shard's own (`std::thread::available_parallelism`). A worker is started only when a
 //! job is ready and none is free, so a pool never holds more threads than jobs were ever out at
-//! once, and one above the measured need is stopped once free.
+//! once. Idle seats keep their warm stores and reservations until terminal retirement, so
+//! reducing demand cannot overlap an old store's destruction with a replacement in its seat.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -32,7 +33,7 @@ use crate::branch::filter::Keys;
 use crate::branch::merge::Compaction;
 use crate::branch::{Branch, Builder, Op};
 use crate::error::Error;
-use crate::store::{Config, Refill, Store};
+use crate::store::{Config, IntoFile, Refill, Store};
 use hyper_block::block::BlockFile;
 
 /// A compaction for a worker: `inputs` newest first, the descriptors a merge reads (no filters),
@@ -169,6 +170,8 @@ pub enum Owner {
 pub struct Back {
     pub worker: usize,
     pub result: Result<Output, Error>,
+    /// An issued-write failure or worker unwind remains visible when input was abandoned.
+    pub physical_error: Option<Error>,
     pub topped: Vec<u64>,
     pub buffers: Vec<Vec<u8>>,
 }
@@ -176,7 +179,12 @@ pub struct Back {
 /// What a worker tells the shard: its grant is spent and it waits for `n` more extents, or its
 /// job is done.
 #[derive(Debug)]
-enum Message {
+pub(crate) enum Message {
+    /// Cold preparation acknowledges actual Store creation and issuer attachment.
+    Ready {
+        worker: usize,
+        result: Result<(), Error>,
+    },
     Need {
         worker: usize,
         n: usize,
@@ -188,6 +196,12 @@ enum Message {
     Done {
         worker: usize,
         result: Result<Output, Error>,
+        physical_error: Option<Error>,
+    },
+    /// Terminal native attachment result, after the owner's last Done was consumed.
+    Retired {
+        worker: usize,
+        result: Result<(), Error>,
     },
 }
 
@@ -203,6 +217,8 @@ pub struct Seat {
     /// The device's issuer and the batches the worker may have out on it, when the shard has
     /// one: its store's writes then go to the device while the worker builds on.
     attach: Option<(Attacher, usize)>,
+    /// Only cold preparation reports startup before admitting a job.
+    prepare: bool,
 }
 
 /// Starts a worker's thread on its seat: the shard's way to open its own file again.
@@ -217,6 +233,7 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
         more,
         back,
         attach,
+        prepare,
     } = seat;
     let worker = Store::worker(file, config).and_then(|mut store| {
         if let Some((attacher, batches)) = &attach {
@@ -227,13 +244,32 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
     let mut store = match worker {
         Ok(s) => s,
         Err(error) => {
-            drop(back.blocking_send(Message::Done {
-                worker: id,
-                result: Err(error),
-            }));
+            let message = if prepare {
+                Message::Ready {
+                    worker: id,
+                    result: Err(error),
+                }
+            } else {
+                Message::Done {
+                    worker: id,
+                    result: Err(error),
+                    physical_error: None,
+                }
+            };
+            drop(back.blocking_send(message));
             return;
         }
     };
+    if prepare
+        && back
+            .blocking_send(Message::Ready {
+                worker: id,
+                result: Ok(()),
+            })
+            .is_err()
+    {
+        return;
+    }
     let asks = back.clone();
     store.set_refill(Refill(Box::new(move |n| {
         asks.blocking_send(Message::Need { worker: id, n })
@@ -243,12 +279,21 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
     })));
     while let Ok(job) = jobs.recv() {
         let t = Instant::now();
-        let ran = run(&mut store, &job, &back, id);
+        let (ran, unwound) = run_guarded(&mut store, &job, &back, id);
         // Whatever the job's end, every run it handed the device is answered before its result
         // goes back: the shard releases a failed job's extents once it has the result, and the
         // next job starts the allocator over, so none of this job's writes may land after. The
         // job's own failure is the one reported.
         let drained = store.drain();
+        // An issued failure precedes the unwind. A worker unwind is non-abandonable too,
+        // so terminal cleanup must retain it even when a partial input was canceled.
+        let physical_error = drained.as_ref().err().cloned().or_else(|| {
+            if unwound {
+                ran.as_ref().err().cloned()
+            } else {
+                None
+            }
+        });
         // A job's time less its waits for a packing's entries: the work it did, which the pool
         // sizes itself by, not the shard's pace.
         let result = ran.and_then(|(parts, waited)| {
@@ -262,17 +307,77 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
         // A packing's channels close before the result is sent, so every buffer still held is
         // back on the shard's side when it takes the result.
         drop(job);
-        if back
-            .blocking_send(Message::Done { worker: id, result })
-            .is_err()
-        {
+        let done = Message::Done {
+            worker: id,
+            result,
+            physical_error,
+        };
+        if unwound {
+            // Close admission before Done: its owner can immediately try this same seat.
+            // Cursors/runs that unwound did not return every loan, so never reuse the Store.
+            drop(jobs);
+            drop(back.blocking_send(done));
+            retire(store, &back, id);
             return;
+        }
+        if back.blocking_send(done).is_err() {
+            return;
+        }
+    }
+    retire(store, &back, id);
+}
+
+fn retire<F: BlockFile>(store: Store<F>, back: &Sender<Message>, id: usize) {
+    // Raw Drop is unacknowledged cleanup. Explicit terminal retirement must report
+    // the worker attachment's lifecycle error before its return sender reaches EOF.
+    // Normal close has consumed Done; after unwind a bounded sender waits for its slot.
+    match store.into_file() {
+        IntoFile::Finished { file, result } => {
+            drop(back.blocking_send(Message::Retired { worker: id, result }));
+            // EOF and the native retirement receipt still follow this file's Drop/TLS.
+            drop(file);
+        }
+        IntoFile::Refused { owner, error } => {
+            drop(back.blocking_send(Message::Retired {
+                worker: id,
+                result: Err(error),
+            }));
+            // An exceptional refusal keeps the complete owner for cold cleanup; no early
+            // physical receipt or actor acknowledgement follows this message alone.
+            drop(owner);
         }
     }
 }
 
 /// The branches a job made, each with its first key, in key order.
 type Parts = Vec<(Vec<u8>, Branch)>;
+
+/// A guarded job keeps the Store, job/grants and accepted transfer ledger outside unwind.
+/// Only this job's nested cursor/Builder stack unwinds; its Store is then drained and retired.
+fn run_guarded<F: BlockFile>(
+    store: &mut Store<F>,
+    job: &Job,
+    back: &Sender<Message>,
+    id: usize,
+) -> (Result<(Parts, u64), Error>, bool) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(store, job, back, id))) {
+        Ok(result) => (result, false),
+        Err(payload) => {
+            let reason = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("foreign callback unwound without a string payload");
+            (
+                Err(Error::Io {
+                    op: "run a maintenance worker job",
+                    detail: format!("maintenance worker job unwound: {reason}"),
+                }),
+                true,
+            )
+        }
+    }
+}
 
 /// Runs `job`: the branches made, and the nanoseconds it waited for a packing's entries.
 fn run<F: BlockFile>(
@@ -281,7 +386,7 @@ fn run<F: BlockFile>(
     back: &Sender<Message>,
     id: usize,
 ) -> Result<(Parts, u64), Error> {
-    store.begin_job(&job.grant, job.file_end, job.generation);
+    store.begin_job(&job.grant, job.file_end, job.generation)?;
     let mut waited = 0u64;
     let parts = match &job.work {
         Work::Compact(t) => {
@@ -326,8 +431,8 @@ fn gone(what: &'static str) -> Error {
 /// it, and the extents topped up to that job.
 #[derive(Debug)]
 struct Worker {
-    jobs: SyncSender<Box<Job>>,
-    more: SyncSender<Result<Vec<u64>, Error>>,
+    jobs: Option<SyncSender<Box<Job>>>,
+    more: Option<SyncSender<Result<Vec<u64>, Error>>>,
     thread: Option<JoinHandle<()>>,
     owner: Option<Owner>,
     topped: Vec<u64>,
@@ -358,6 +463,30 @@ pub struct Pool {
     /// The device's issuer for the workers started from now on, and the batches each may have
     /// out ([`Self::set_attach`]).
     attach: Option<(Attacher, usize)>,
+    /// A nonblocking take found work out but no message yet: a task can await the receiver.
+    waiting: bool,
+    /// Terminal jobs are abandoned, their refills refused, before the job channels close.
+    closing: bool,
+    /// Every worker dropped its store and return sender, including its device attachment.
+    closed: bool,
+    close_error: Option<Error>,
+    /// Every charged seat acknowledged startup before any runtime job was admitted.
+    prepared: bool,
+    /// Handles adopted on the cold caller; runtime retirement sends no native owner.
+    retirement: Option<hyper_rt::runtime::RetirementLease>,
+}
+
+/// A borrowed wait's share of the pool's measured period, including a request that interrupts
+/// it. Dropping the future returns the measurement once without consuming any message.
+struct WaitMeasure<'a> {
+    waited: &'a mut u64,
+    since: Instant,
+}
+
+impl Drop for WaitMeasure<'_> {
+    fn drop(&mut self) {
+        *self.waited = self.waited.saturating_add(ns(self.since.elapsed()));
+    }
 }
 
 impl std::fmt::Debug for Pool {
@@ -394,13 +523,274 @@ impl Pool {
             waited_ns: 0,
             since: None,
             attach: None,
+            waiting: false,
+            closing: false,
+            closed: false,
+            close_error: None,
+            prepared: false,
+            retirement: None,
         })
     }
 
     /// Workers started from now on attach their stores to the device's issuer through
     /// `attacher`, each with up to `batches` out (`ShardDb::attach`).
     pub fn set_attach(&mut self, attacher: Attacher, batches: usize) {
+        self.prepared = false;
         self.attach = Some((attacher, batches));
+    }
+
+    /// Preparation is cold: no actor task may open files, spawn threads or wait for startup.
+    pub(crate) fn can_prepare(&self) -> Result<(), Error> {
+        if self.closing || (!self.prepared && (!self.workers.is_empty() || self.attach.is_none())) {
+            return Err(Error::InvalidArgument {
+                what: "existing workers incompatible with runtime preparation",
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepared(&self) -> bool {
+        self.prepared && !self.closing && self.retirement.is_some()
+    }
+
+    /// Starts every seat already charged by capacity, then accepts its actual startup result.
+    /// No job can run yet, so Ready never overlaps the feed/Need/Done channel roles.
+    pub(crate) fn prepare(&mut self) -> Result<(), Error> {
+        if hyper_rt::registry::current_shard().is_some() {
+            return Err(Error::InvalidArgument {
+                what: "maintenance worker preparation inside a runtime task",
+            });
+        }
+        self.can_prepare()?;
+        if self.prepared {
+            return Ok(());
+        }
+        for _ in 0..self.most {
+            let at = self.start(true)?;
+            match self
+                .messages
+                .blocking_recv()
+                .map_err(|_| gone("take worker startup"))?
+            {
+                Message::Ready { worker, result } if worker == at => result?,
+                _ => return Err(gone("worker startup with no matching receipt")),
+            }
+        }
+        self.prepared = true;
+        Ok(())
+    }
+
+    pub(crate) fn adopt_retirement(
+        &mut self,
+        mut lease: hyper_rt::runtime::RetirementLease,
+    ) -> Result<(), Error> {
+        if hyper_rt::registry::with_current(|_| ()).is_some() {
+            return Err(Error::InvalidArgument {
+                what: "native worker adoption inside a runtime task",
+            });
+        }
+        if !self.prepared || self.retirement.is_some() || lease.capacity() != self.most {
+            return Err(Error::InvalidArgument {
+                what: "native worker adoption outside its prepared capacity",
+            });
+        }
+        let mut threads = Vec::new();
+        threads
+            .try_reserve_exact(self.most)
+            .map_err(|_| Error::LimitExceeded {
+                what: "native maintenance retirement handles",
+                limit: u64::try_from(self.most).unwrap_or(u64::MAX),
+            })?;
+        for worker in self.workers.iter_mut().flatten() {
+            if let Some(thread) = worker.thread.take() {
+                threads.push(thread);
+            }
+        }
+        let accepted = lease.adopt(&mut threads);
+        if lease.adopted() {
+            // Even a receipt failure after acceptance keeps the native owner in Runtime.
+            self.retirement = Some(lease);
+        } else {
+            let mut returned = threads.into_iter();
+            for worker in self.workers.iter_mut().flatten() {
+                if worker.thread.is_none() {
+                    worker.thread = returned.next();
+                }
+            }
+        }
+        accepted.map_err(|error| Error::Io {
+            op: "adopt native maintenance threads",
+            detail: error.to_string(),
+        })
+    }
+
+    pub(crate) fn retirement_owned(&self) -> bool {
+        self.retirement.is_some()
+    }
+
+    pub(crate) fn clear_wait(&mut self) {
+        self.waiting = false;
+    }
+
+    pub(crate) fn waiting(&self) -> bool {
+        self.waiting && (self.closing || self.workers.iter().flatten().any(|w| w.owner.is_some()))
+    }
+
+    pub(crate) fn want_message(&mut self) {
+        self.waiting = true;
+    }
+
+    /// Canceling this borrowed receive leaves the message on the channel. The caller routes
+    /// a received message with its store before returning to the task's next request.
+    pub(crate) async fn receive(&mut self) -> Result<Option<Message>, Error> {
+        if self.closed
+            && let Some(retirement) = &mut self.retirement
+        {
+            if let Err(error) = retirement.wait().await {
+                // A matching failed join still proves retirement. Route it through
+                // close_paced so a prior physical failure remains the first error.
+                if matches!(error, hyper_rt::RtError::NotOnShardThread)
+                    || !matches!(retirement.try_result(), Ok(Some(Err(_))))
+                {
+                    return Err(Error::Io {
+                        op: "retire native maintenance threads",
+                        detail: error.to_string(),
+                    });
+                }
+                self.close_error.get_or_insert(Error::Io {
+                    op: "join native maintenance threads",
+                    detail: error.to_string(),
+                });
+            }
+            self.waiting = false;
+            return Ok(None);
+        }
+        let _measure = WaitMeasure {
+            waited: &mut self.waited_ns,
+            since: Instant::now(),
+        };
+        match self.messages.recv().await {
+            Ok(message) => Ok(Some(message)),
+            Err(hyper_rt::sync::SyncError::Closed(())) if self.closing && self.back.is_none() => {
+                self.closed = true;
+                self.waiting = false;
+                Ok(None)
+            }
+            Err(error) => Err(Error::Io {
+                op: "take a worker's message",
+                detail: format!("{error:?}"),
+            }),
+        }
+    }
+
+    /// Closing a partial feed makes its worker finish that input; no new extent grant is
+    /// made after this point. Existing grants stay owned until every job is physically drained.
+    pub(crate) fn begin_close(&mut self) {
+        self.closing = true;
+        for (_, back) in &mut self.undelivered {
+            if let Some(error) = back.physical_error.take() {
+                self.close_error.get_or_insert(error);
+            }
+        }
+    }
+
+    pub(crate) fn note_close_error(&mut self, error: Error) {
+        self.close_error.get_or_insert(error);
+    }
+
+    /// Takes terminal results without applying their unfinished outputs, then closes the
+    /// idle workers' channels. False awaits the same return receiver, including its final EOF.
+    pub(crate) fn close_paced<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+    ) -> Result<bool, Error> {
+        self.begin_close();
+        loop {
+            match self.next(store, false) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) => {
+                    self.close_error.get_or_insert(error);
+                    break;
+                }
+            }
+        }
+        if self.workers.iter().flatten().any(|w| w.owner.is_some()) {
+            self.waiting = true;
+            return Ok(false);
+        }
+        // Done is sent after the worker Store drained every transfer. Closing its job
+        // receiver now ends the loop; EOF follows its Store/attachment destruction.
+        for worker in self.workers.iter_mut().flatten() {
+            worker.jobs = None;
+            worker.more = None;
+        }
+        self.back = None;
+        if !self.closed {
+            match self.next(store, false) {
+                Ok(_) => {}
+                Err(error) => {
+                    self.close_error.get_or_insert(error);
+                }
+            }
+        }
+        if self.closed {
+            if let Some(retirement) = &mut self.retirement {
+                retirement.request().map_err(|error| Error::Io {
+                    op: "signal native maintenance retirement",
+                    detail: error.to_string(),
+                })?;
+                match retirement.try_result().map_err(|error| Error::Io {
+                    op: "take native maintenance retirement",
+                    detail: error.to_string(),
+                })? {
+                    None => {
+                        self.waiting = true;
+                        return Ok(false);
+                    }
+                    Some(Err(error)) => {
+                        self.close_error.get_or_insert(Error::Io {
+                            op: "join native maintenance threads",
+                            detail: error.to_string(),
+                        });
+                    }
+                    Some(Ok(())) => {}
+                }
+            }
+            return self.close_error.take().map_or(Ok(true), Err);
+        }
+        self.waiting = true;
+        Ok(false)
+    }
+
+    /// The same terminal state for a plain thread: each unfinished pass takes one worker
+    /// receipt, waiting for it. An error is reported only after the channel's terminal EOF.
+    pub(crate) fn close_blocking<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+    ) -> Result<(), Error> {
+        if hyper_rt::registry::with_current(|_| ()).is_some() {
+            return Err(Error::InvalidArgument {
+                what: "blocking maintenance retirement inside a runtime task",
+            });
+        }
+        while !self.close_paced(store)? {
+            if self.closed
+                && let Some(retirement) = &mut self.retirement
+            {
+                if let Err(error) = retirement.wait_blocking() {
+                    self.close_error.get_or_insert(Error::Io {
+                        op: "retire native maintenance threads",
+                        detail: error.to_string(),
+                    });
+                }
+                continue;
+            }
+            if let Err(error) = self.next(store, true) {
+                self.close_error.get_or_insert(error);
+            }
+        }
+        Ok(())
     }
 
     /// The cores the OS reports less the shard's own thread, at least one.
@@ -411,12 +801,17 @@ impl Pool {
             .max(1)
     }
 
-    /// The workers it holds now.
+    /// The admitted worker maximum, including workers that may start in a later cascade.
+    pub(crate) fn capacity(&self) -> usize {
+        self.most
+    }
+
+    /// Warm worker seats held, each charged until its terminal Store/attachment retirement.
     pub fn workers(&self) -> usize {
         self.workers.iter().filter(|w| w.is_some()).count()
     }
 
-    /// The workers the measured need asks for.
+    /// The active workers the measured need asks for; idle warm seats may exceed it.
     pub fn want(&self) -> usize {
         self.want
     }
@@ -440,63 +835,94 @@ impl Pool {
         self.since = Some(now);
         self.busy_ns = 0;
         self.waited_ns = 0;
-        // Workers above the need stop once free.
-        let mut keep = 0usize;
-        for slot in &mut self.workers {
-            if let Some(w) = slot {
-                if keep < self.want || w.owner.is_some() {
-                    keep = keep.saturating_add(1);
-                } else {
-                    // Its channels closed, its loop ends; the thread is not joined here, since
-                    // it has no job and exits at once.
-                    *slot = None;
-                }
-            }
-        }
+        // Idle seats stay warm and charged. Dropping one here could leave its Store alive
+        // behind device detach while a replacement reused the same admitted seat.
     }
 
     /// Whether a job handed now would go out: a worker is free, or another may start, within
     /// the measured need or, when `waiting` (the shard would otherwise wait on a job no worker
     /// takes, itself evidence the need is more), within the cores.
     pub fn can_take(&self, waiting: bool) -> bool {
+        if self.closing {
+            return false;
+        }
         let bound = if waiting { self.most } else { self.want };
-        self.workers() < bound || self.workers.iter().flatten().any(|w| w.owner.is_none())
+        self.workers
+            .iter()
+            .flatten()
+            .filter(|w| w.owner.is_some())
+            .count()
+            < bound
     }
 
     /// Hands `job` to a free worker for `owner`, starting one if none is free within the bound
     /// [`Self::can_take`] states for `waiting`: the worker's number, or the job back when every
-    /// worker is busy.
+    /// worker is busy. Every hard refusal returns its owned job too, before any grant is lost.
     pub fn send(
         &mut self,
         job: Box<Job>,
         owner: Owner,
         waiting: bool,
-    ) -> Result<Result<usize, Box<Job>>, Error> {
+    ) -> Result<Result<usize, Box<Job>>, (Error, Box<Job>)> {
+        if hyper_rt::registry::current_shard().is_some() && !self.prepared() {
+            return Err((
+                Error::InvalidArgument {
+                    what: "runtime worker admission before preparation",
+                },
+                job,
+            ));
+        }
+        if self.closing {
+            return Err((gone("hand a closing worker its job"), job));
+        }
+        let bound = if waiting { self.most } else { self.want };
+        if self
+            .workers
+            .iter()
+            .flatten()
+            .filter(|w| w.owner.is_some())
+            .count()
+            >= bound
+        {
+            return Ok(Err(job));
+        }
         let free = self
             .workers
             .iter()
             .position(|w| w.as_ref().is_some_and(|w| w.owner.is_none()));
-        let bound = if waiting { self.most } else { self.want };
         let at = match free {
             Some(at) => at,
-            None if self.workers() < bound => self.start()?,
+            None if self.workers() < self.most => match self.start(false) {
+                Ok(at) => at,
+                Err(error) => return Err((error, job)),
+            },
             None => return Ok(Err(job)),
         };
-        let w = self
-            .workers
-            .get_mut(at)
-            .and_then(Option::as_mut)
-            .ok_or(gone("hand a worker its job"))?;
-        w.jobs
-            .send(job)
-            .map_err(|_| gone("hand a worker its job"))?;
+        let Some(w) = self.workers.get_mut(at).and_then(Option::as_mut) else {
+            return Err((gone("hand a worker its job"), job));
+        };
+        let Some(jobs) = w.jobs.as_ref() else {
+            return Err((gone("hand a closing worker its job"), job));
+        };
+        match jobs.try_send(job) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(job)) => return Ok(Err(job)),
+            Err(std::sync::mpsc::TrySendError::Disconnected(job)) => {
+                return Err((gone("hand a worker its job"), job));
+            }
+        }
         w.owner = Some(owner);
         w.topped.clear();
         w.spent.clear();
         Ok(Ok(at))
     }
 
-    fn start(&mut self) -> Result<usize, Error> {
+    fn start(&mut self, prepare: bool) -> Result<usize, Error> {
+        if hyper_rt::registry::current_shard().is_some() {
+            return Err(Error::InvalidArgument {
+                what: "maintenance worker startup inside a runtime task",
+            });
+        }
         let at = self
             .workers
             .iter()
@@ -512,11 +938,12 @@ impl Pool {
             more: more_rx,
             back,
             attach: self.attach.clone(),
+            prepare,
         };
         let thread = (self.spawn)(seat)?;
         let w = Worker {
-            jobs,
-            more,
+            jobs: Some(jobs),
+            more: Some(more),
             thread: Some(thread),
             owner: None,
             topped: Vec::new(),
@@ -538,6 +965,7 @@ impl Pool {
         owner: Owner,
         wait: bool,
     ) -> Result<Option<Back>, Error> {
+        blocking_wait_allowed(wait)?;
         loop {
             if let Some(at) = self.undelivered.iter().position(|(o, _)| *o == owner)
                 && let Some((_, back)) = self.undelivered.swap_remove_back(at)
@@ -545,6 +973,11 @@ impl Pool {
                 return Ok(Some(back));
             }
             if !self.next(store, wait && self.out_for(owner))? {
+                // Compactions own their inputs. Packing can still need its owner to feed it,
+                // so its caller marks a result wait only once the feed is closed.
+                if owner == Owner::Trunk && self.out_for(owner) {
+                    self.waiting = true;
+                }
                 return Ok(None);
             }
         }
@@ -559,6 +992,7 @@ impl Pool {
         worker: usize,
         wait: bool,
     ) -> Result<Option<Vec<u8>>, Error> {
+        blocking_wait_allowed(wait)?;
         loop {
             let w = self
                 .workers
@@ -570,6 +1004,9 @@ impl Pool {
             }
             let out = w.owner.is_some();
             if !self.next(store, wait && out)? {
+                if out {
+                    self.waiting = true;
+                }
                 return Ok(None);
             }
         }
@@ -583,20 +1020,52 @@ impl Pool {
             Ok(Some(m)) => m,
             Ok(None) if wait => {
                 let t = Instant::now();
-                let m = self
-                    .messages
-                    .blocking_recv()
-                    .map_err(|_| gone("take a worker's message"))?;
+                let m = match self.messages.blocking_recv() {
+                    Ok(message) => message,
+                    Err(_) if self.closing && self.back.is_none() => {
+                        self.closed = true;
+                        self.waiting = false;
+                        return Ok(false);
+                    }
+                    Err(_) => return Err(gone("take a worker's message")),
+                };
                 let waited = ns(Instant::now().saturating_duration_since(t));
                 self.waited_ns = self.waited_ns.saturating_add(waited);
                 m
             }
             Ok(None) => return Ok(false),
+            Err(_) if self.closing && self.back.is_none() => {
+                self.closed = true;
+                self.waiting = false;
+                return Ok(false);
+            }
             Err(_) => return Err(gone("take a worker's message")),
         };
+        self.accept(store, message)
+    }
+
+    pub(crate) fn accept<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        message: Message,
+    ) -> Result<bool, Error> {
+        self.waiting = false;
         match message {
+            Message::Ready { result, .. } => result?,
+            Message::Retired { worker, result } => {
+                if self.workers.get(worker).and_then(Option::as_ref).is_none() {
+                    return Err(gone("take a worker's terminal result"));
+                }
+                if let Err(error) = result {
+                    self.close_error.get_or_insert(error);
+                }
+            }
             Message::Need { worker, n } => {
-                let more = store.grant(n);
+                let more = if self.closing {
+                    Err(gone("give a closing worker extents"))
+                } else {
+                    store.grant(n)
+                };
                 let w = self
                     .workers
                     .get_mut(worker)
@@ -605,9 +1074,24 @@ impl Pool {
                 if let Ok(extents) = &more {
                     w.topped.extend_from_slice(extents);
                 }
-                w.more
-                    .send(more)
-                    .map_err(|_| gone("give a worker extents"))?;
+                // One Need waits for its one reply. A refused reply still belongs to
+                // w.topped until Done proves physical quiescence; never wait in the owner.
+                match w
+                    .more
+                    .as_ref()
+                    .ok_or(gone("give a closing worker extents"))?
+                    .try_send(more)
+                {
+                    Ok(()) => {}
+                    Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                        return Err(Error::InvalidArgument {
+                            what: "a maintenance worker's top-up still pending",
+                        });
+                    }
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                        return Err(gone("give a worker extents"));
+                    }
+                }
             }
             Message::Spent { worker, buf } => {
                 let w = self
@@ -619,7 +1103,16 @@ impl Pool {
                     w.spent.push(buf);
                 }
             }
-            Message::Done { worker, result } => {
+            Message::Done {
+                worker,
+                result,
+                physical_error,
+            } => {
+                // A canceled request can consume Done before closing starts. Physical
+                // failures and worker unwinds stay terminal even after that Back is taken.
+                if let Some(error) = &physical_error {
+                    self.close_error.get_or_insert_with(|| error.clone());
+                }
                 let w = self
                     .workers
                     .get_mut(worker)
@@ -640,6 +1133,7 @@ impl Pool {
                     Back {
                         worker,
                         result,
+                        physical_error,
                         topped,
                         buffers,
                     },
@@ -652,6 +1146,7 @@ impl Pool {
     /// Waits for one message from the workers, answered or kept as [`Self::take`] does: false,
     /// with nothing taken, when no worker has a job out to send one.
     pub fn wait_any<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<bool, Error> {
+        blocking_wait_allowed(true)?;
         if !self.workers.iter().flatten().any(|w| w.owner.is_some()) {
             return Ok(false);
         }
@@ -673,6 +1168,21 @@ impl Drop for Pool {
     /// first and a top-up it waits for is refused, so each worker ends; the messages they send
     /// meanwhile are taken until the last worker's end closes the channel back.
     fn drop(&mut self) {
+        if let Some(retirement) = &mut self.retirement {
+            // Cold adoption removed every handle from these seats. During exceptional
+            // service Drop, closing both producer ends then dropping messages lets any
+            // blocked worker publication fail; the independent owner still joins it.
+            self.workers.clear();
+            self.back = None;
+            if hyper_rt::registry::with_current(|_| ()).is_none() {
+                while self.messages.blocking_recv().is_ok() {}
+                let _ = retirement.wait_blocking();
+            } else {
+                let _ = retirement.request();
+            }
+            return;
+        }
+        // Standalone cold Pools retain their explicit blocking ownership contract.
         let threads: Vec<JoinHandle<()>> = self
             .workers
             .iter_mut()
@@ -686,7 +1196,23 @@ impl Drop for Pool {
     }
 }
 
+/// Borrowed blocking APIs refuse before consuming a ready receipt or buffer. Runtime
+/// callers keep the same job and await its existing receiver through the paced owner.
+fn blocking_wait_allowed(wait: bool) -> Result<(), Error> {
+    if wait && hyper_rt::registry::current_shard().is_some() {
+        Err(Error::InvalidArgument {
+            what: "a synchronous maintenance worker wait inside a runtime task",
+        })
+    } else {
+        Ok(())
+    }
+}
+
 /// A duration's nanoseconds, saturating.
 fn ns(d: std::time::Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
+
+#[cfg(test)]
+#[path = "retirement_first_error_native.rs"]
+mod retirement_first_error_native;

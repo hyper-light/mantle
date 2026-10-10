@@ -10,6 +10,8 @@
 //! postquery flush+checkpoint barriers are timed and charged, including metadata/flushes.
 //! Checkpoint does not finish optional views/maplets. Continuous process counts through
 //! stop/shutdown include maintenance between phase snapshots and discard/cleanup work.
+//! Cold setup and exact fresh reopen/reference verification are separately charged; reopen
+//! occurs only after the query population and all native/physical retirement have ended.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -30,6 +32,9 @@ use std::time::{Duration, Instant};
 #[path = "support/rocks_workload.rs"]
 mod rocks_workload;
 
+#[path = "support/benchmark_recovery.rs"]
+mod benchmark_recovery;
+
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::issuer::Issuer;
@@ -39,7 +44,7 @@ use hyper_rt::{Runtime, RuntimeConfig};
 use mantle_engine::ranges::{RangeStats, Ranges, RangesConfig};
 use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::ShardDb;
-use mantle_engine::store::Config;
+use mantle_engine::store::{Config, IntoFile};
 use mantle_engine::trunk::TrunkConfig;
 
 #[global_allocator]
@@ -534,6 +539,10 @@ fn main() -> Result<(), BenchError> {
     let spin_override: Option<u64> = args.get(8).map(|s| s.parse()).transpose()?;
     let write_budget_mib: usize = args.get(9).map(|s| s.parse()).transpose()?.unwrap_or(64);
     require(
+        issuer_depth > 0,
+        "positive issuer depth required for runtime range I/O",
+    )?;
+    require(
         num > 0 && threads > 0 && threads <= num && seek_nexts > 0,
         "positive num/threads/seek_nexts and threads <= num required",
     )?;
@@ -564,9 +573,11 @@ fn main() -> Result<(), BenchError> {
         .ok_or_else(overflow)?;
     let cache_bytes = cache_mib.checked_mul(1 << 20).ok_or_else(overflow)?;
     let write_bytes = write_budget_mib.checked_mul(1 << 20).ok_or_else(overflow)?;
-    let all_batches = issuer_depth
+    let all_batches = mantle_engine::shard_db::issuer_batches(issuer_depth, issuer_depth)
         .checked_mul(usize::try_from(threads)?)
         .ok_or_else(overflow)?;
+    alloc::begin_process();
+    let before_setup = Mark::now()?;
     std::fs::create_dir_all(&dir)?;
     let mut workload = Workload {
         num,
@@ -620,7 +631,7 @@ fn main() -> Result<(), BenchError> {
         rt.wake_tracking.is_some(),
         rt
     );
-    let runtime = Runtime::start(&rt)?;
+    let mut runtime = Runtime::start(&rt)?;
     let align = Alignment::new(4096)?;
     let config = Config {
         page_size: 4096,
@@ -629,11 +640,7 @@ fn main() -> Result<(), BenchError> {
     };
     let mem = (64usize << 20) / threads as usize;
     let leaf_entries = (mem / (16 + 100 + 3)) as u64;
-    let issuer = if issuer_depth > 0 {
-        Some(Issuer::start_for(&dir, issuer_depth, all_batches)?)
-    } else {
-        None
-    };
+    let issuer = Issuer::start_for(&dir, issuer_depth, all_batches)?;
     println!(
         "workers client_roles {threads} owner_roles {threads} client_placement {} issuer {} device {}",
         if shard_client {
@@ -641,8 +648,8 @@ fn main() -> Result<(), BenchError> {
         } else {
             "external-thread"
         },
-        usize::from(issuer.is_some()),
-        issuer.as_ref().map_or(0, Issuer::depth)
+        1,
+        issuer.depth()
     );
     let mut engines = Vec::new();
     let mut paths = Vec::new();
@@ -660,10 +667,17 @@ fn main() -> Result<(), BenchError> {
             },
         )?;
         db.set_cache(cache_bytes / 4096 / threads as usize);
-        db.set_write_budget(write_bytes / threads as usize);
-        if let Some(issuer) = &issuer {
-            db.attach(issuer, issuer_depth)?;
-        }
+        db.set_write_budget(write_bytes / threads as usize)?;
+        db.attach(&issuer, issuer_depth)?;
+        let worker_path = path.clone();
+        db.set_workers(move || {
+            DeviceFile::open(&worker_path, false, CachingRequest::Buffered, align).map_err(
+                |error| mantle_engine::Error::Io {
+                    op: "open a range benchmark worker",
+                    detail: error.to_string(),
+                },
+            )
+        })?;
         let start = if i == 0 {
             Vec::new()
         } else {
@@ -673,15 +687,22 @@ fn main() -> Result<(), BenchError> {
         paths.push(path);
     }
     let ranges = Ranges::start(
-        &runtime,
+        &mut runtime,
         engines,
         RangesConfig {
             clients: threads as usize + 1,
             slice_ns: rt.step_budget_ns,
             spin_ns: rt.spin_ns,
         },
-    )?;
-    alloc::begin_process();
+    )
+    .map_err(|failure| match failure {
+        mantle_engine::ranges::StartError::Failed(error) => error,
+        mantle_engine::ranges::StartError::Refused { ranges, error } => {
+            // This benchmark creates engines on its plain cold caller.
+            drop(ranges);
+            error
+        }
+    })?;
     let start = Mark::now()?;
     let (
         mut fill,
@@ -694,6 +715,7 @@ fn main() -> Result<(), BenchError> {
         queried,
         query_stats,
         postquery,
+        workload,
     ) = if shard_client {
         let (done, result) = std::sync::mpsc::sync_channel(1);
         let shard = runtime
@@ -743,6 +765,7 @@ fn main() -> Result<(), BenchError> {
                     queried,
                     query_stats,
                     postquery,
+                    workload,
                 ))
             }
             .await;
@@ -785,11 +808,39 @@ fn main() -> Result<(), BenchError> {
             queried,
             query_stats,
             postquery,
+            workload,
         )
     };
     let runtime_stats = runtime.shutdown()?;
     drop(issuer);
     let stopped = Mark::now()?;
+    // Cold reopen is after physical Stop/Runtime/Issuer retirement and never warms queries.
+    for path in &paths {
+        let file = DeviceFile::open(path, false, CachingRequest::Buffered, align)?;
+        let (mut db, applied) = ShardDb::open(
+            file,
+            config,
+            mem,
+            TrunkConfig {
+                fanout: 8,
+                leaf_entries,
+            },
+        )?;
+        require(applied == threads * num, "recovered applied index differs")?;
+        benchmark_recovery::verify(&mut db, &workload.ordered, &VALUE, seek_nexts)?;
+        match db.into_file() {
+            IntoFile::Finished { file, result } => {
+                result?;
+                drop(file);
+            }
+            IntoFile::Refused { owner, error } => {
+                // This is the plain cold benchmark caller; preserve the error, then clean up.
+                drop(owner);
+                return Err(error.into());
+            }
+        }
+    }
+    let recovered = Mark::now()?;
     alloc::end_process();
     fill.report(&start, &filled);
     costs("postfillflush", threads * num, &filled, &postfill);
@@ -805,6 +856,20 @@ fn main() -> Result<(), BenchError> {
     costs("paid_queries", query_ops, &postfill, &postquery);
     costs("stop_shutdown", threads * num, &postquery, &stopped);
     costs("paid_total", total, &start, &stopped);
+    costs("cold_setup", threads * num, &before_setup, &start);
+    costs("recovery_verify", threads * num, &stopped, &recovered);
+    costs("setup_to_close", total, &before_setup, &stopped);
+    costs(
+        "setup_to_verified_recovery",
+        total,
+        &before_setup,
+        &recovered,
+    );
+    println!(
+        "recovery verified_live_keys {} all_values_exact true required_crc_reads true applied {}",
+        workload.ordered.len(),
+        threads * num
+    );
     stats("postfill", &fill_stats);
     stats("postquery", &query_stats);
     for (shard, counters) in runtime_stats.iter().enumerate() {

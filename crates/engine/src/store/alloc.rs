@@ -121,6 +121,69 @@ impl Allocator {
         std::mem::take(&mut self.free)
     }
 
+    /// Preflights `count` allocations and reserves their lists before any extent changes.
+    /// The greatest selected extent lets the store check its page addresses first too.
+    pub fn reserve(&mut self, count: usize) -> Result<Option<u64>, Error> {
+        let what = if self.granted {
+            "extents granted a maintenance worker"
+        } else {
+            "extents of a store"
+        };
+        let limit = self.limit;
+        let refused = || Error::LimitExceeded { what, limit };
+        let grow = count.saturating_sub(self.free.len());
+        let end = self.refs.len().checked_add(grow).ok_or_else(refused)?;
+        if (self.granted && grow > 0)
+            || (!self.granted && u64::try_from(end).map_err(|_| refused())? > self.limit)
+        {
+            return Err(refused());
+        }
+        let mut last = None;
+        for &extent in self.free.iter().rev().take(count) {
+            if !self.granted && (extent == 0 || self.refs.get(index(extent)?).copied() != Some(0)) {
+                return Err(corrupt(Malformed::CountMismatch));
+            }
+            last = Some(last.map_or(extent, |old: u64| old.max(extent)));
+        }
+        if grow > 0 {
+            let extent = u64::try_from(end.saturating_sub(1)).map_err(|_| refused())?;
+            last = Some(last.map_or(extent, |old| old.max(extent)));
+        }
+        if self.granted {
+            self.held.try_reserve(count).map_err(|_| refused())?;
+        } else {
+            self.refs.try_reserve(grow).map_err(|_| refused())?;
+        }
+        Ok(last)
+    }
+
+    /// Checks a complete unused grant and reserves its return space before changing counts.
+    pub fn reserve_back(&mut self, extents: &[u64]) -> Result<(), Error> {
+        let refused = || Error::LimitExceeded {
+            what: "unused extent grant metadata",
+            limit: u64::try_from(extents.len()).unwrap_or(u64::MAX),
+        };
+        let mut sorted = Vec::new();
+        sorted
+            .try_reserve_exact(extents.len())
+            .map_err(|_| refused())?;
+        sorted.extend_from_slice(extents);
+        sorted.sort_unstable();
+        let mut previous = None;
+        for extent in sorted {
+            if extent == 0
+                || previous == Some(extent)
+                || self.refs.get(index(extent)?).copied() != Some(1)
+            {
+                return Err(Error::InvalidArgument {
+                    what: "an unused grant not held once and uniquely",
+                });
+            }
+            previous = Some(extent);
+        }
+        self.free.try_reserve(extents.len()).map_err(|_| refused())
+    }
+
     /// An extent for new pages, its count 1: a free one, else one past the file's end. Refused
     /// once the file holds `limit` extents and none is free.
     pub fn allocate(&mut self) -> Result<u64, Error> {
@@ -212,6 +275,11 @@ impl Allocator {
     /// Takes back an extent allocated and never named by any checkpoint, held once: free again
     /// at once, since no durable checkpoint can name it (a worker's grant it never wrote).
     pub fn give_back(&mut self, extent: u64) -> Result<(), Error> {
+        if extent == 0 {
+            return Err(Error::InvalidArgument {
+                what: "a return of the superblocks' extent",
+            });
+        }
         let count = self
             .refs
             .get_mut(index(extent)?)
@@ -269,6 +337,8 @@ mod tests {
         assert_eq!(a.allocate().unwrap(), 1);
         assert!(matches!(a.allocate(), Err(Error::LimitExceeded { .. })));
         assert!(a.release(0).is_err());
+        assert!(a.give_back(0).is_err());
+        assert!(a.is_held(0));
         assert!(a.release(5).is_err());
         assert!(a.retain(3).is_err());
     }

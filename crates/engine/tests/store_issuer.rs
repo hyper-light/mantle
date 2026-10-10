@@ -12,6 +12,10 @@
     clippy::cast_possible_truncation
 )]
 
+#[path = "support/into_file.rs"]
+mod file_outcome;
+use file_outcome::finished_file;
+
 use std::future::{Future, poll_fn};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::Poll;
@@ -488,7 +492,7 @@ fn a_stopped_issuer_refuses_a_prefetch_and_preserves_the_checkpoint() {
         })
     ));
     store.give_span(span);
-    let (file, _) = store.into_file();
+    let (file, _) = finished_file(store.into_file());
     let (mut recovered, checkpoint) = Store::open(file, CONFIG).unwrap();
     assert_eq!(checkpoint.applied, 1);
     let mut out = Vec::new();
@@ -653,7 +657,7 @@ fn a_submitted_run_is_read_once_it_lands() {
     store.queue_page(&mut run, a, &payload(a)).unwrap();
     store.write_run(&mut run).unwrap();
     store.checkpoint(Some(a), 7).unwrap();
-    let (file, landed) = store.into_file();
+    let (file, landed) = finished_file(store.into_file());
     landed.unwrap();
     let (mut store, recovered) = Store::open(file, CONFIG).unwrap();
     assert_eq!(recovered.applied, 7);
@@ -751,7 +755,7 @@ fn runs_past_the_batches_wait_in_write_memory_and_read_back_whole() {
         s.spawn(|| gate.open.store(true, Ordering::SeqCst));
         store.checkpoint(later.first().copied(), 9).unwrap();
     });
-    let (file, landed) = store.into_file();
+    let (file, landed) = finished_file(store.into_file());
     landed.unwrap();
     let (mut store, recovered) = Store::open(file, CONFIG).unwrap();
     assert_eq!(recovered.applied, 9);
@@ -834,7 +838,7 @@ fn a_request_interrupts_a_completion_wait_without_losing_the_read() {
         })
         .unwrap();
     store.checkpoint(Some(address), 2).unwrap();
-    let (file, landed) = store.into_file();
+    let (file, landed) = finished_file(store.into_file());
     landed.unwrap();
     let (mut recovered, checkpoint) = Store::open(file, CONFIG).unwrap();
     assert_eq!(checkpoint.applied, 2);
@@ -1007,25 +1011,30 @@ fn async_write_completions_advance_a_single_slot_queue_and_zero_budget_writes() 
                 assert_eq!(out, payload(address));
                 store.give_span(span);
             }
-            store.drain().unwrap();
             store.set_write_budget(0);
             let extent = store.allocate_extent().unwrap();
             let address = store.address(extent, 0).unwrap();
             store
-                .queue_page(&mut run, address, &payload(address))
+                .queue_page_async(&mut run, address, &payload(address))
+                .await
                 .unwrap();
-            store.write_run(&mut run).unwrap();
+            store.write_run_async(&mut run).await.unwrap();
             assert!(store.wait_completion().await.unwrap());
             assert!(!store.wait_completion().await.unwrap());
+            let mut span = store.span_sequential().unwrap();
+            while !store.ready(&mut span, address).unwrap() {
+                assert!(store.wait_completion().await.unwrap());
+            }
             out.clear();
-            store.read_page(address, &mut out).unwrap();
+            store.read_page_ahead(&mut span, address, &mut out).unwrap();
             assert_eq!(out, payload(address));
-            store.checkpoint(Some(address), 2).unwrap();
+            store.give_span(span);
+            store.checkpoint_async(Some(address), 2).await.unwrap();
             (store, run)
         })
         .unwrap();
     store.give_run(run);
-    let (file, landed) = store.into_file();
+    let (file, landed) = finished_file(store.into_file());
     landed.unwrap();
     let (mut recovered, checkpoint) = Store::open(file, CONFIG).unwrap();
     assert_eq!(checkpoint.applied, 2);
@@ -1072,30 +1081,52 @@ fn a_failed_async_write_fences_cached_bytes_and_preserves_the_previous_checkpoin
                 })
             ));
             let mut span = store.span_sequential().unwrap();
-            // Fencing discards admission/prepared bytes; durable reads may still succeed.
-            store.ready(&mut span, address).unwrap();
-            let mut out = Vec::new();
-            store.read_page_ahead(&mut span, address, &mut out).unwrap();
-            assert_eq!(out, b"last successful contents");
-            out.clear();
-            store.read_page(address, &mut out).unwrap();
-            assert_eq!(out, b"last successful contents");
+            // A fenced paced demand refuses before serving the failed cached payload.
             assert!(matches!(
-                store.write_page(address, b"another refused write"),
+                store.ready(&mut span, address),
                 Err(mantle_engine::Error::Io { .. })
             ));
             store.give_span(span);
             assert!(matches!(
-                store.checkpoint(Some(address), 2),
+                store
+                    .queue_page_async(&mut run, address, b"refused async queue")
+                    .await,
+                Err(mantle_engine::Error::Io { .. })
+            ));
+            assert!(matches!(
+                store.write_run_async(&mut run).await,
+                Err(mantle_engine::Error::Io { .. })
+            ));
+            assert!(matches!(
+                store.checkpoint_async(Some(address), 2).await,
                 Err(mantle_engine::Error::Io { .. })
             ));
             (store, run)
         })
         .unwrap();
+    // A durable cold read remains permitted after fencing, while every new write is
+    // refused. Reading both ways checks that the failed cache admission was discarded.
+    let mut span = store.span_sequential().unwrap();
+    let mut out = Vec::new();
+    store.read_page_ahead(&mut span, address, &mut out).unwrap();
+    assert_eq!(out, b"last successful contents");
+    store.give_span(span);
+    out.clear();
+    store.read_page(address, &mut out).unwrap();
+    assert_eq!(out, b"last successful contents");
+    assert!(matches!(
+        store.write_page(address, b"another refused write"),
+        Err(mantle_engine::Error::Io { .. })
+    ));
+    let mut run = run;
+    assert!(matches!(
+        store.queue_page(&mut run, address, b"another refused queue"),
+        Err(mantle_engine::Error::Io { .. })
+    ));
     store.give_run(run);
     gate.reject_writes.store(false, Ordering::SeqCst);
-    let (file, landed) = store.into_file();
-    assert!(landed.is_err());
+    let (file, landed) = finished_file(store.into_file());
+    assert!(matches!(landed, Err(mantle_engine::Error::Io { .. })));
     let (mut recovered, checkpoint) = Store::open(file, CONFIG).unwrap();
     assert_eq!(checkpoint.applied, 1);
     let mut out = Vec::new();
@@ -1133,7 +1164,7 @@ fn an_idle_or_stopped_issuer_has_no_completion_to_wait_for() {
         Err(mantle_engine::Error::Io { .. })
     ));
     store.give_run(run);
-    let (file, _) = store.into_file();
+    let (file, _) = finished_file(store.into_file());
     let (mut recovered, checkpoint) = Store::open(file, CONFIG).unwrap();
     assert_eq!(checkpoint.applied, 1);
     let mut out = Vec::new();
@@ -1172,7 +1203,7 @@ fn a_completion_wait_off_the_runtime_refuses_without_fencing_the_store() {
         .write_page(address, b"after the context refusal")
         .unwrap();
     store.checkpoint(Some(address), 2).unwrap();
-    let (file, landed) = store.into_file();
+    let (file, landed) = finished_file(store.into_file());
     landed.unwrap();
     let (mut recovered, checkpoint) = Store::open(file, CONFIG).unwrap();
     assert_eq!(checkpoint.applied, 2);

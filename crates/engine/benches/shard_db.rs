@@ -5,6 +5,9 @@
 //! §2; `--disable_wal=1` on RocksDB's side), buffered reads through the OS page cache on both.
 //! `cargo bench -p mantle-engine --bench shard_db -- DIR [NUM] [FANOUT] [buffered|direct] ...` prints
 //! `workload num ops_per_s micros_per_op`, and the trunk's shape.
+//! `--durable-recovery` selects the separately labeled canonical cold API panel:
+//! full flush/checkpoint, exact point/row oracles, paid physical close and complete reopen.
+//! Reports/sorting follow engine/recovery snapshots; whole-child counters still pay them.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -24,18 +27,23 @@ use std::time::Instant;
 #[path = "support/rocks_workload.rs"]
 mod rocks_workload;
 
+#[path = "support/benchmark_recovery.rs"]
+mod benchmark_recovery;
+
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::issuer::Issuer;
 use hyper_measure::{alloc, faults, usage};
 use mantle_engine::shard_db::ShardDb;
-use mantle_engine::store::Config;
+use mantle_engine::store::{Config, IntoFile};
 use mantle_engine::trunk::TrunkConfig;
 
 #[global_allocator]
 static ALLOCATOR: alloc::Counting = alloc::Counting;
 
 struct Mark {
+    at: Instant,
+    alloc: alloc::Counts,
     faults: faults::Faults,
     usage: Option<usage::Usage>,
 }
@@ -43,8 +51,9 @@ struct Mark {
 /// Starts a phase's allocation, fault and CPU counts for the whole process, the issuer
 /// and device workers included. OS accounts are read only at the phase boundaries.
 fn begin() -> Mark {
-    alloc::begin_process();
     Mark {
+        at: Instant::now(),
+        alloc: alloc::read_process(),
         faults: faults::read().unwrap(),
         usage: usage::this().ok(),
     }
@@ -52,12 +61,20 @@ fn begin() -> Mark {
 
 /// A phase's whole-process costs per operation; CPU includes overlapping device work.
 fn costs(name: &str, ops: u64, from: &Mark) {
-    let process = usage::this()
-        .ok()
-        .zip(from.usage.as_ref())
-        .map(|(now, before)| now.since(before));
-    let a = alloc::end_process();
-    let f = faults::read().unwrap().since(&from.faults);
+    costs_between(name, ops, from, &begin());
+}
+
+fn costs_between(name: &str, ops: u64, from: &Mark, to: &Mark) {
+    let process = to
+        .usage
+        .zip(from.usage)
+        .map(|(now, before)| now.since(&before));
+    let a = to.alloc.less(&from.alloc);
+    let f = to.faults.since(&from.faults);
+    println!(
+        "{name} elapsed {:.6}s",
+        to.at.duration_since(from.at).as_secs_f64()
+    );
     let line = format!(
         "{name} allocs/op {:.3} reallocs/op {:.3} bytes/op {:.1} faults/op {:.4} (allocs {} reallocs {} faults {})",
         a.allocations as f64 / ops as f64,
@@ -114,10 +131,289 @@ fn key(n: u64) -> [u8; 16] {
     rocks_workload::key(n)
 }
 
+/// The canonical durable panel keeps reports outside every measured engine interval.
+struct DurablePhase {
+    name: &'static str,
+    operations: u64,
+    found: u64,
+    rows: u64,
+    latencies: Vec<u64>,
+    began: Mark,
+    ended: Mark,
+}
+
+impl DurablePhase {
+    fn report(&mut self) {
+        if self.operations == 0 {
+            return;
+        }
+        let seconds = self.ended.at.duration_since(self.began.at).as_secs_f64();
+        println!(
+            "{} {} {:.0} {:.3}",
+            self.name,
+            self.operations,
+            self.operations as f64 / seconds,
+            seconds * 1e6 / self.operations as f64
+        );
+        println!("{} found {} rows {}", self.name, self.found, self.rows);
+        report(self.name, &mut self.latencies);
+        costs_between(self.name, self.operations, &self.began, &self.ended);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DurableWork {
+    Fill,
+    Get,
+    Seek(usize),
+}
+
+fn durable_phase(
+    db: &mut ShardDb<DeviceFile>,
+    seed: u64,
+    num: u64,
+    operations: u64,
+    work: DurableWork,
+    oracle: &(Vec<bool>, Vec<u64>),
+) -> Result<DurablePhase, Box<dyn std::error::Error>> {
+    let (name, phase) = match work {
+        DurableWork::Fill => ("fillrandom", 1),
+        DurableWork::Get => ("readrandom", 2),
+        DurableWork::Seek(_) => ("seekrandom", 3),
+    };
+    let began = begin();
+    let mut latencies = Vec::new();
+    latencies.try_reserve_exact(usize::try_from(operations)?)?;
+    let mut rng = Rng::new(Some(seed), phase);
+    let value = [b'v'; 100];
+    let mut out = Vec::new();
+    let mut page = mantle_engine::rows::Rows::new();
+    let mut next = Vec::new();
+    let mut found = 0;
+    let mut rows = 0;
+    for _ in 0..operations {
+        let number = rng.next() % num;
+        let key = key(number);
+        page.clear();
+        next.clear();
+        let call = Instant::now();
+        let hit = match work {
+            DurableWork::Fill => {
+                db.put(&key, &value)?;
+                true
+            }
+            DurableWork::Get => db.get(&key, &mut out)?,
+            DurableWork::Seek(limit) => {
+                db.scan(&key, None, limit, &mut page, &mut next)?;
+                false
+            }
+        };
+        latencies.push(u64::try_from(call.elapsed().as_nanos())?);
+        let hit = match work {
+            DurableWork::Fill => hit,
+            DurableWork::Get => {
+                if hit != oracle.0[number as usize] || (hit && out.as_slice() != value) {
+                    return Err(
+                        std::io::Error::other("point differs from canonical fill oracle").into(),
+                    );
+                }
+                hit
+            }
+            DurableWork::Seek(limit) => {
+                let at = oracle.1.partition_point(|&n| n < number);
+                let expected = &oracle.1[at..at.saturating_add(limit).min(oracle.1.len())];
+                if page.len() != expected.len()
+                    || page
+                        .iter()
+                        .zip(expected)
+                        .any(|((k, v), &n)| k != rocks_workload::key(n) || v != value)
+                {
+                    return Err(
+                        std::io::Error::other("scan differs from canonical fill oracle").into(),
+                    );
+                }
+                let hit = page.get(0).is_some_and(|(k, _)| k == key);
+                if hit != oracle.0[number as usize] {
+                    return Err(
+                        std::io::Error::other("scan membership differs from fill oracle").into(),
+                    );
+                }
+                rows += page.len() as u64; // The setup row bound covers the complete phase.
+                hit
+            }
+        };
+        found += u64::from(hit);
+    }
+    let ended = begin();
+    Ok(DurablePhase {
+        name,
+        operations,
+        found,
+        rows,
+        latencies,
+        began,
+        ended,
+    })
+}
+
+struct DurableConfig {
+    path: PathBuf,
+    caching: CachingRequest,
+    align: Alignment,
+    store: Config,
+    mem: usize,
+    trunk: TrunkConfig,
+    seed: u64,
+    num: u64,
+    reads: u64,
+    seeks: u64,
+    seek_nexts: usize,
+    total: u64,
+    query_ops: u64,
+}
+
+fn durable_benchmark(
+    mut db: ShardDb<DeviceFile>,
+    issuer: Option<Issuer>,
+    config: DurableConfig,
+    oracle: &(Vec<bool>, Vec<u64>),
+    before_setup: &Mark,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let DurableConfig {
+        path,
+        caching,
+        align,
+        store: config,
+        mem,
+        trunk,
+        seed,
+        num,
+        reads,
+        seeks,
+        seek_nexts,
+        total,
+        query_ops,
+    } = config;
+    let started = begin();
+    let mut fill = durable_phase(&mut db, seed, num, num, DurableWork::Fill, oracle)?;
+    let filled = begin();
+    let fill_barrier = begin();
+    db.flush()?;
+    db.checkpoint(num)?;
+    let durable = begin();
+    let fill_stats = db.stats();
+    let mut get = durable_phase(&mut db, seed, num, reads, DurableWork::Get, oracle)?;
+    let mut seek = durable_phase(
+        &mut db,
+        seed,
+        num,
+        seeks,
+        DurableWork::Seek(seek_nexts),
+        oracle,
+    )?;
+    let queried = begin();
+    db.flush()?;
+    db.checkpoint(num)?;
+    let postquery = begin();
+    let shape = db.shape()?;
+    let memory = db.memory();
+    let split = db.memory_split();
+    let (_, work, io) = db.stats();
+    let held = db.memory_held();
+    let workers = db.workers();
+    match db.into_file() {
+        IntoFile::Finished { file, result } => {
+            result?;
+            drop(file);
+        }
+        IntoFile::Refused { owner, error } => {
+            drop(owner);
+            return Err(error.into());
+        }
+    }
+    drop(issuer);
+    let closed = begin();
+    let file = DeviceFile::open(&path, false, caching, align)?;
+    let (mut db, applied) = ShardDb::open(file, config, mem, trunk)?;
+    if applied != num {
+        return Err(std::io::Error::other("recovered applied index differs").into());
+    }
+    benchmark_recovery::verify(&mut db, &oracle.1, &[b'v'; 100], seek_nexts)?;
+    match db.into_file() {
+        IntoFile::Finished { file, result } => {
+            result?;
+            drop(file);
+        }
+        IntoFile::Refused { owner, error } => {
+            drop(owner);
+            return Err(error.into());
+        }
+    }
+    let recovered = begin();
+    alloc::end_process();
+    // Sorting/reporting is outside phase and recovery snapshots; whole-child wait4 pays it.
+    fill.report();
+    get.report();
+    seek.report();
+    costs_between("cold_setup", num, before_setup, &started);
+    costs_between("postfillflush", num, &fill_barrier, &durable);
+    costs_between("postfill_to_barrier", num, &filled, &fill_barrier);
+    costs_between("paid_fill", num, &started, &durable);
+    costs_between("postqueryflush", query_ops.max(1), &queried, &postquery);
+    costs_between("paid_queries", query_ops.max(1), &durable, &postquery);
+    costs_between("physical_close", total, &postquery, &closed);
+    costs_between("post_start_to_close", total, &started, &closed);
+    costs_between("setup_to_close", total, before_setup, &closed);
+    costs_between("recovery_verify", num, &closed, &recovered);
+    costs_between(
+        "setup_to_verified_recovery",
+        total,
+        before_setup,
+        &recovered,
+    );
+    println!(
+        "shape height {} nodes {} leaves {} views built {} dropped {} maplets built {} declined {} entries_written {}",
+        shape.0,
+        shape.1,
+        shape.2,
+        work.views_built,
+        work.views_dropped,
+        work.maplets_built,
+        work.maplets_declined,
+        work.entries_written
+    );
+    println!(
+        "memory split cache {} write {} records {} filters {} indexes {} counts {} ranges {} views {}",
+        split.0,
+        split.1,
+        split.2,
+        memory.filters,
+        memory.indexes,
+        memory.counts,
+        memory.ranges,
+        memory.views
+    );
+    println!(
+        "postfill stats {:?} postquery trunk {:?} workers {:?} memory_held {:?}",
+        fill_stats, work, workers, held
+    );
+    println!(
+        "owner_io reads {} writes {} pages_read {} pages_written {} scope owner-only-workers-separate",
+        io.reads, io.writes, io.pages_read, io.pages_written
+    );
+    println!(
+        "recovery verified_live_keys {} all_values_exact true required_crc_reads true applied {applied}",
+        oracle.1.len()
+    );
+    std::fs::remove_file(&path)?;
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rocks_seed = None;
     let mut drain = true;
     let mut workers = false;
+    let mut durable_recovery = false;
     let mut args = Vec::new();
     for arg in std::env::args().skip(1) {
         if let Some(seed) = arg.strip_prefix("--rocks-seed=") {
@@ -134,6 +430,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .into());
                 }
             };
+        } else if arg == "--durable-recovery" {
+            durable_recovery = true;
         } else if arg == "--workers" {
             // The trunk's compactions on maintenance workers (`ShardDb::set_workers`).
             workers = true;
@@ -185,8 +483,78 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A cache of hot records for point reads, in MiB, as the nineteenth argument, none by default
     // (`ShardDb::set_record_cache`).
     let record_mib: usize = args.get(18).map_or(0, |s| s.parse().unwrap());
+    if durable_recovery
+        && (rocks_seed.is_none()
+            || !drain
+            || attribute
+            || mix != 0
+            || seek_distance != 0
+            || read_exp_range != 0.0
+            || num == 0
+            || seek_nexts == 0)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--durable-recovery requires canonical seeded drain, no attribution/mix/skew/bounded seeks",
+        ).into());
+    }
+    let overflow = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "benchmark count, seed, budget or vector layout exceeds its representation",
+        )
+    };
+    let cache_bytes = cache_mib.checked_mul(1 << 20).ok_or_else(overflow)?;
+    let write_bytes = write_budget_mib.checked_mul(1 << 20).ok_or_else(overflow)?;
+    let memory_bytes = memory_mib.checked_mul(1 << 20).ok_or_else(overflow)?;
+    let record_bytes = record_mib.checked_mul(1 << 20).ok_or_else(overflow)?;
+    let query_ops = reads.checked_add(seeks).ok_or_else(overflow)?;
+    let total = num
+        .checked_add(query_ops)
+        .and_then(|n| n.checked_add(mix))
+        .ok_or_else(overflow)?;
+    let rows_per_seek = num.min(u64::try_from(seek_nexts)?);
+    seeks.checked_mul(rows_per_seek).ok_or_else(overflow)?;
+    if let Some(seed) = rocks_seed {
+        seed.checked_add(3).ok_or_else(overflow)?;
+    }
+    for count in [num, reads, seeks] {
+        let count = usize::try_from(count)?;
+        count
+            .checked_mul(std::mem::size_of::<u64>())
+            .filter(|&bytes| bytes <= isize::MAX as usize)
+            .ok_or_else(overflow)?;
+    }
     let path = dir.join("shard_db.store");
-    let _ = std::fs::remove_file(&path);
+    if path.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "benchmark requires a fresh owned database",
+        )
+        .into());
+    }
+    alloc::begin_process();
+    let before_setup = begin();
+    let oracle = if durable_recovery {
+        let count = usize::try_from(num)?;
+        let mut present = Vec::new();
+        present.try_reserve_exact(count)?;
+        present.resize(count, false);
+        let mut fill = Rng::new(rocks_seed, 1);
+        for _ in 0..num {
+            present[(fill.next() % num) as usize] = true;
+        }
+        let mut ordered = Vec::new();
+        ordered.try_reserve_exact(present.iter().filter(|&&live| live).count())?;
+        for (n, &live) in present.iter().enumerate() {
+            if live {
+                ordered.push(n as u64);
+            }
+        }
+        Some((present, ordered))
+    } else {
+        None
+    };
     let align = Alignment::new(4096).unwrap();
     // `direct` as the fourth argument: transfers bypass the OS page cache (F_NOCACHE on macOS,
     // O_DIRECT on Linux); buffered by default, as db_bench reads.
@@ -213,7 +581,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )
     .unwrap();
-    db.set_cache((cache_mib << 20) / 4096);
+    db.set_cache(cache_bytes / 4096);
     // The engine's own timers only when attributing: a clock read each slice costs every put.
     db.set_timed(attribute);
     let issuer = (issuer_depth > 0).then(|| {
@@ -237,13 +605,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .unwrap();
     }
-    db.set_write_budget(write_budget_mib << 20);
+    db.set_write_budget(write_bytes).unwrap();
     if memory_mib > 0 {
-        db.set_memory(memory_mib << 20);
+        db.set_memory(memory_bytes).unwrap();
     }
     if record_mib > 0 {
-        db.set_record_cache(record_mib << 20);
+        db.set_record_cache(record_bytes);
     }
+    println!(
+        "population {} full_value_oracle {} recovery_verify {}",
+        if durable_recovery {
+            "batch-durable-fullflush"
+        } else {
+            "legacy-maintain-active-tail"
+        },
+        durable_recovery,
+        durable_recovery
+    );
     let value = [b'v'; 100];
     let mut rng = Rng::new(rocks_seed, 1);
     println!(
@@ -262,6 +640,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         issuer.as_ref().map_or(0, Issuer::depth),
         1 + usize::from(issuer.is_some()) + issuer.as_ref().map_or(0, Issuer::depth)
     );
+    if let Some(oracle) = &oracle {
+        let seed = rocks_seed.ok_or_else(overflow)?;
+        return durable_benchmark(
+            db,
+            issuer,
+            DurableConfig {
+                path,
+                caching,
+                align,
+                store: config,
+                mem,
+                trunk: TrunkConfig {
+                    fanout,
+                    leaf_entries,
+                },
+                seed,
+                num,
+                reads,
+                seeks,
+                seek_nexts,
+                total,
+                query_ops,
+            },
+            oracle,
+            &before_setup,
+        );
+    }
     // Each operation timed, into a vector sized before the run: percentiles from the sorted
     // samples. db_bench's histogram instead includes harness work between completions.
     // Touched before the run, a write a page (zeroed memory is mapped only once written), so a
@@ -270,6 +675,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     lat.iter_mut().step_by(512).for_each(|x| *x = 1);
     lat.clear();
     let mut slow: Recorder<Slow> = Recorder::new(if attribute { num } else { 0 });
+    let started = begin();
     let mark = begin();
     let t = Instant::now();
     for _ in 0..num {
@@ -419,7 +825,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut slow_gets: Recorder<(Slow, u64, u64)> =
         Recorder::new(if attribute { reads } else { 0 });
     for _ in 0..reads {
-        let k = key(skewed(rng.next(), num, read_exp_range));
+        let number = skewed(rng.next(), num, read_exp_range);
+        let k = key(number);
         let before = attribute.then(|| {
             (
                 db.stats(),
@@ -428,7 +835,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         });
         let o = Instant::now();
-        if db.get(&k, &mut out).unwrap() {
+        let hit = db.get(&k, &mut out)?;
+        if hit {
             found += 1;
         }
         let ns = o.elapsed().as_nanos() as u64;
@@ -679,8 +1087,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         m.views,
         m.views as f64 / num as f64
     );
-    drop(db);
-    std::fs::remove_file(&path).unwrap();
+    let close_began = begin();
+    match db.into_file() {
+        IntoFile::Finished { file, result } => {
+            result?;
+            drop(file);
+        }
+        IntoFile::Refused { owner, error } => {
+            drop(owner); // This main is a plain cold caller, never a runtime task.
+            return Err(error.into());
+        }
+    }
+    drop(issuer);
+    let closed = begin();
+    costs_between("physical_close", total.max(1), &close_began, &closed);
+    costs_between("post_start_to_close", total.max(1), &started, &closed);
+    costs_between("cold_setup", num, &before_setup, &started);
+    alloc::end_process();
+    std::fs::remove_file(&path)?;
     Ok(())
 }
 

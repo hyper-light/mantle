@@ -147,13 +147,13 @@ conform manifests by the recipe above and update SNAPSHOT; the historical rows b
 are not current API identity.
 
 Mantle-local changes to `hyper-block` on `worker-stream`, made here by the owner's direction and
-owed upstream to hyper-raft: the issuer hands a one-transfer read straight to a worker, which
-answers the submitter itself (`Attached::submit_reads`, two cross-thread handoffs where the broker
-path takes four); and a read the OS holds in memory is made on the submitter's own thread
+owed upstream to hyper-raft: a read the OS holds in memory is made on the submitter's own thread
 (`resident`, `BlockFile::read_resident_at`, `BlockFile::reads_resident`,
 `Attached::read_resident_at`: `RWF_NOWAIT` on Linux, `mincore(2)` over a kept mapping on macOS;
-mantle `docs/research/41-resident-reads.md`). `libc` is a dependency on Apple targets too, for the
-latter; the lock files are unchanged.
+mantle `docs/research/41-resident-reads.md`). `libc` is a dependency on Apple targets too, for it;
+the lock files are unchanged. A lane that handed a one-transfer read straight to a worker was tried
+and removed: it chose a worker without the dispatcher's view of the work each holds, so a read or
+a write could wait behind a long transfer while other workers were idle.
 
 The AWS-LC workspace command above excludes these standalone shared-crate roots. It does
 not run their runtime, device or allocation tests. Their suites must also be run against

@@ -194,7 +194,7 @@ enum Event {
         queued: VecDeque<Batch>,
         answers: Sender<Completion>,
         submissions: ChannelReceiver<Submission>,
-        reply: SyncSender<AttachReply>,
+        reply: SyncSender<Result<(usize, u64), DiskError>>,
     },
     Watch {
         slot: usize,
@@ -273,47 +273,17 @@ enum Task {
         slot: usize,
         generation: u64,
         file: Handle,
-        /// The attachment's completion channel, for the reads its submitter hands this worker
-        /// itself ([`Task::Read`]).
-        answers: Sender<Completion>,
     },
     Detach {
         slot: usize,
         generation: u64,
     },
     Transfer(Transfer),
-    /// A one-transfer read its submitter handed this worker directly: answered to the submitter,
-    /// never reported to the broker.
-    Read(Direct),
-    /// The broker's last word: submitters hold this inbox for their direct reads, so it never
-    /// closes by itself, and the worker ends after what it already holds.
-    Stop,
     /// A taken cold news slot; never assigned to a native worker.
     Retired,
     /// Retained in that same slot until all native joins, with no new fault allocation.
     RetirementPanicked(Box<dyn std::any::Any + Send>),
 }
-
-/// A read its submitter hands a worker itself, a batch of one transfer (`Attached::submit_reads`):
-/// the worker answers on the submitter's completion channel, so no broker stands between them, two
-/// cross-thread handoffs where the broker's path takes four (submitter, broker, worker, broker,
-/// submitter), each a wake of a parked thread on a busy machine.
-struct Direct {
-    slot: usize,
-    generation: u64,
-    number: u64,
-    /// The submitter's own vector, its one buffer and offset, answered back in place: the read
-    /// allocates nothing.
-    transfers: Transfers,
-}
-
-/// A worker's way back to one attachment's submitter: the attachment's generation and its
-/// completion channel.
-type Lane = Option<(u64, Sender<Completion>)>;
-
-/// The answer to an attach, once every worker holds the file: the slot, its generation, and the
-/// workers' inboxes for its direct reads (none when a worker refused the file).
-type AttachReply = Result<(usize, u64, Vec<SyncSender<Task>>), DiskError>;
 
 struct Transfer {
     slot: usize,
@@ -446,7 +416,7 @@ impl Issuer {
         let device = path.to_path_buf();
         let thread = Builder::new()
             .name("hyper-issuer".into())
-            .spawn(move || run(&device, inbox, workers, batches, &ready, &mut pending))
+            .spawn(move || run(&device, inbox, workers, &ready, &mut pending))
             .map_err(|source| DiskError::Io {
                 op: "start a device issuer",
                 path: path.to_path_buf(),
@@ -620,25 +590,10 @@ fn attach<F: BlockFile + 'static>(
             reply,
         })
         .map_err(|_| gone())?;
-    let (slot, generation, direct) = replied.recv().map_err(|_| gone())??;
-    let mut direct_out = Vec::new();
-    let mut direct_numbers = VecDeque::new();
-    if direct_out.try_reserve_exact(direct.len()).is_err()
-        || direct_numbers.try_reserve_exact(batches).is_err()
-    {
-        return Err(DiskError::Io {
-            op: "reserve an attachment's direct read accounts",
-            path: path.to_path_buf(),
-            source: std::io::Error::other("allocation refused"),
-        });
-    }
-    direct_out.resize(direct.len(), 0);
+    let (slot, generation) = replied.recv().map_err(|_| gone())??;
     Ok(Attached {
         slot,
         generation,
-        direct,
-        direct_out,
-        direct_numbers,
         events: events.clone(),
         submissions: Some(submit),
         submission_pending: submission_pending.clone(),
@@ -673,13 +628,6 @@ impl Drop for Issuer {
 pub struct Attached {
     slot: usize,
     generation: u64,
-    /// The workers' inboxes, for a one-transfer read handed straight to one of them
-    /// ([`Self::submit_reads`]); none when a worker refused the file.
-    direct: Vec<SyncSender<Task>>,
-    /// This submitter's direct reads out on each worker, and the worker each is out on by its
-    /// batch's number: at most the batches it attached for.
-    direct_out: Vec<usize>,
-    direct_numbers: VecDeque<(u64, usize)>,
     events: Events,
     submissions: Option<Sender<Submission>>,
     submission_pending: Sender<()>,
@@ -846,58 +794,7 @@ impl Attached {
                 "a batch past those the submitter attached for; take an answer first",
             ));
         }
-        match self.read_directly(reads) {
-            Ok(number) => Ok(number),
-            Err(reads) => self.send(reads, Kind::Read),
-        }
-    }
-
-    /// Hands a one-transfer read straight to the worker with the fewest of this submitter's direct
-    /// reads out, the first of them; the worker answers it on this attachment's channel, no broker
-    /// between them (two cross-thread handoffs, not four). The broker hands its own transfers to the
-    /// last idle worker, so the two fill the pool from opposite ends. The read back, for the
-    /// broker's path, when it is more than one transfer, retirement began, or no worker inbox takes
-    /// it.
-    fn read_directly(&mut self, reads: Transfers) -> Result<u64, Transfers> {
-        if reads.len() != 1 || self.retirement != RetirementState::Live {
-            return Err(reads);
-        }
-        let Some(worker) = self
-            .direct_out
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, out)| **out)
-            .map(|(worker, _)| worker)
-        else {
-            return Err(reads);
-        };
-        let Some(inbox) = self.direct.get(worker) else {
-            return Err(reads);
-        };
-        let number = self.next;
-        let task = Task::Read(Direct {
-            slot: self.slot,
-            generation: self.generation,
-            number,
-            transfers: reads,
-        });
-        if let Err(TrySendError::Full(task) | TrySendError::Disconnected(task)) =
-            inbox.try_send(task)
-        {
-            return Err(match task {
-                Task::Read(direct) => direct.transfers,
-                // Only a read was sent: no other task comes back.
-                _ => Transfers::new(),
-            });
-        }
-        self.next = self.next.wrapping_add(1);
-        self.out = self.out.saturating_add(1);
-        if let Some(out) = self.direct_out.get_mut(worker) {
-            *out = out.saturating_add(1);
-        }
-        // Within the batches reserved at attach: out never exceeds them.
-        self.direct_numbers.push_back((number, worker));
-        Ok(number)
+        self.send(reads, Kind::Read)
     }
 
     /// Sends a batch the submitter has room for, and counts it out.
@@ -967,15 +864,6 @@ impl Attached {
         match completion {
             Completion::Batch(answered) => {
                 self.out = self.out.saturating_sub(1);
-                if let Some(at) = self
-                    .direct_numbers
-                    .iter()
-                    .position(|(number, _)| *number == answered.0)
-                    && let Some((_, worker)) = self.direct_numbers.remove(at)
-                    && let Some(out) = self.direct_out.get_mut(worker)
-                {
-                    *out = out.saturating_sub(1);
-                }
                 Ok(answered)
             }
             Completion::Detached(result) => {
@@ -1205,14 +1093,13 @@ fn run(
     path: &Path,
     inbox: Receiver<Event>,
     workers: usize,
-    batches: usize,
     ready: &SyncSender<Result<(), DiskError>>,
     submission_pending: &mut ChannelReceiver<()>,
 ) {
     std::thread::scope(|scope| {
         // Coalesced yes/no native-report notification: one pending inspection.
         let (native_pending, completed) = sync_channel(1);
-        let started = start_workers(scope, path, workers, batches, &native_pending);
+        let started = start_workers(scope, path, workers, &native_pending);
         let mut handles = started.native;
         let mut dispatch = Dispatch::new(started.assignments, path);
         // A foreign panic payload can itself panic on Drop. Retain it until every
@@ -1230,12 +1117,6 @@ fn run(
         // Stop admission and assigned-task publication before joins. On an abnormal
         // broker exit, reports cannot block behind cold Attach traffic in this inbox.
         // Handle's cleanup boundary protects duplicates in never-admitted Attach events.
-        // Submitters hold the workers' inboxes for their direct reads, so the inboxes do not
-        // close with the broker's senders: each worker is told to end, after what it holds,
-        // which it reaches without waiting on the broker; one that ended refuses the word.
-        for worker in &dispatch.workers {
-            let _ = worker.send(Task::Stop);
-        }
         dispatch.workers.clear();
         // Close cold admission before terminal waits. Native reports have their own
         // bounded lanes; a foreign unadmitted Attach destructor cannot discard them.
@@ -1264,7 +1145,6 @@ fn start_workers<'scope, 'env>(
     scope: &'scope std::thread::Scope<'scope, 'env>,
     path: &Path,
     workers: usize,
-    batches: usize,
     pending: &SyncSender<()>,
 ) -> StartedWorkers<'scope> {
     let mut started = StartedWorkers {
@@ -1273,7 +1153,7 @@ fn start_workers<'scope, 'env>(
         result: Ok(()),
     };
     for _ in 0..workers {
-        match start_worker(scope, batches, pending) {
+        match start_worker(scope, pending) {
             Ok((assignment, worker)) => {
                 started.assignments.push(assignment);
                 started.native.push(worker);
@@ -1293,13 +1173,9 @@ fn start_workers<'scope, 'env>(
 
 fn start_worker<'scope, 'env>(
     scope: &'scope std::thread::Scope<'scope, 'env>,
-    batches: usize,
     pending: &SyncSender<()>,
 ) -> Result<(SyncSender<Task>, NativeWorker<'scope>), std::io::Error> {
-    // The broker's one assignment at a time, beside the reads its submitters hand it themselves:
-    // each submitter's at most its batches out, so all of theirs at most the budget the issuer was
-    // started for (`Issuer::start_for`).
-    let (tasks, assigned) = sync_channel(batches.saturating_add(1));
+    let (tasks, assigned) = sync_channel(1);
     let (retired, retirement) = sync_channel(NATIVE_EXIT_ROLES);
     let publisher = NativePublisher {
         retired,
@@ -1425,14 +1301,12 @@ fn dispose_native(native: &mut [NativeWorker<'_>], dispatch: &mut Dispatch<'_>) 
 /// lifecycle task reports Done with deterministic remaining ownership on unwind.
 fn work(tasks: &Receiver<Task>, publisher: &NativePublisher) -> Option<LifecycleFailure> {
     let mut files: Vec<FileSlot> = Vec::new();
-    let mut lanes: Vec<Lane> = Vec::new();
     while let Ok(task) = tasks.recv() {
         let report = match task {
             Task::Attach {
                 slot,
                 generation,
                 file,
-                answers,
             } => {
                 let failed = match place(&mut files, slot, Some((generation, file))) {
                     Ok(old) => retire_file(old),
@@ -1441,7 +1315,6 @@ fn work(tasks: &Receiver<Task>, publisher: &NativePublisher) -> Option<Lifecycle
                         Some(failed)
                     }
                 };
-                let failed = failed.or_else(|| open_lane(&mut lanes, slot, generation, answers));
                 Report::News {
                     slot,
                     generation,
@@ -1450,11 +1323,6 @@ fn work(tasks: &Receiver<Task>, publisher: &NativePublisher) -> Option<Lifecycle
                 }
             }
             Task::Detach { slot, generation } => {
-                if let Some(lane) = lanes.get_mut(slot)
-                    && lane.as_ref().is_some_and(|(g, _)| *g == generation)
-                {
-                    *lane = None;
-                }
                 let old = files.get_mut(slot).and_then(|held| {
                     if held.as_ref().is_some_and(|(g, _)| *g == generation) {
                         held.take()
@@ -1471,11 +1339,6 @@ fn work(tasks: &Receiver<Task>, publisher: &NativePublisher) -> Option<Lifecycle
                 }
             }
             Task::Transfer(transfer) => Report::Finished(carry_out(&files, transfer)),
-            Task::Read(direct) => {
-                read_directly(&files, &lanes, direct);
-                continue;
-            }
-            Task::Stop => break,
             Task::Retired | Task::RetirementPanicked(_) => return Some(LifecycleFailure::Worker),
         };
         if !publisher.publish(NativeExit::Report(report)) {
@@ -1495,78 +1358,6 @@ fn work(tasks: &Receiver<Task>, publisher: &NativePublisher) -> Option<Lifecycle
 
 /// One worker file slot: the attachment generation and its single native duplicate.
 type FileSlot = Option<(u64, Handle)>;
-
-/// Keeps an attachment's completion channel at its slot beside its file: the refusal of the
-/// lane arena's growth, as the file arena's.
-fn open_lane(
-    lanes: &mut Vec<Lane>,
-    slot: usize,
-    generation: u64,
-    answers: Sender<Completion>,
-) -> Option<LifecycleFailure> {
-    if lanes.len() <= slot {
-        let need = slot.checked_add(1)?;
-        if lanes.try_reserve(need.saturating_sub(lanes.len())).is_err() {
-            return Some(LifecycleFailure::FileArena);
-        }
-        lanes.resize_with(need, || None);
-    }
-    match lanes.get_mut(slot) {
-        Some(at) => {
-            *at = Some((generation, answers));
-            None
-        }
-        None => Some(LifecycleFailure::FileArena),
-    }
-}
-
-/// Reads a direct read's one transfer on the worker's duplicate of its file, and answers it on its
-/// attachment's completion channel: the vector back with its buffer filled, or the read's failure,
-/// the vector then dropped, as a batch of one. With no lane for it the attachment has detached,
-/// which it does only once nothing it handed over is out, so no one waits for the answer.
-fn read_directly(files: &[FileSlot], lanes: &[Lane], direct: Direct) {
-    let Direct {
-        slot,
-        generation,
-        number,
-        mut transfers,
-    } = direct;
-    let Some((_, answers)) = lanes
-        .get(slot)
-        .and_then(Option::as_ref)
-        .filter(|(g, _)| *g == generation)
-    else {
-        return;
-    };
-    let Some((kept, at)) = transfers.first_mut() else {
-        let _ = answers.try_send(Completion::Batch((number, Ok(transfers))));
-        return;
-    };
-    let buf = std::mem::replace(kept, AlignedBuf::empty());
-    let finished = carry_out(
-        files,
-        Transfer {
-            slot,
-            generation,
-            number,
-            op: Op::Read {
-                index: 0,
-                buf,
-                at: *at,
-            },
-        },
-    );
-    let answer = match (finished.result, finished.write) {
-        (Ok(()), Some((_, Some(buf)))) => {
-            *kept = buf;
-            Ok(transfers)
-        }
-        (Ok(()), _) => Err(unwound()),
-        (Err(error), _) => Err(error),
-    };
-    // Its room is the batch's own: the submitter counted it out of the batches it attached for.
-    let _ = answers.try_send(Completion::Batch((number, answer)));
-}
 
 /// Puts the new owner in its slot before returning the old one for guarded retirement.
 fn place(
@@ -1596,9 +1387,7 @@ fn retire_file(file: FileSlot) -> Option<LifecycleFailure> {
 fn retire_task(task: Task) -> Option<LifecycleFailure> {
     match task {
         Task::Attach { mut file, .. } => file.retire(),
-        Task::Detach { .. } | Task::Transfer(_) | Task::Read(_) | Task::Stop | Task::Retired => {
-            None
-        }
+        Task::Detach { .. } | Task::Transfer(_) | Task::Retired => None,
         Task::RetirementPanicked(payload) => {
             drop(payload);
             None
@@ -1680,9 +1469,6 @@ fn carry_out(files: &[FileSlot], transfer: Transfer) -> Finished {
 /// number it attached for.
 struct Client {
     generation: u64,
-    /// The attach's reply until every worker holds the file: the workers still to, and whether
-    /// all that did took it.
-    confirming: Option<(SyncSender<AttachReply>, usize, bool)>,
     answers: Sender<Completion>,
     submissions: Option<ChannelReceiver<Submission>>,
     /// The sole owner closed its drained lane; batches still own pending/in-flight data.
@@ -1885,19 +1671,10 @@ impl<'a> Dispatch<'a> {
                 answers,
                 submissions,
                 reply,
-            } => match self.attach(files, batches, queued, answers, submissions) {
-                // Answered once every worker holds the file (`Self::confirm`): a direct read
-                // never reaches a worker before its file does.
-                Ok((slot, generation)) => {
-                    let workers = self.workers.len();
-                    if let Some(client) = self.client(slot, generation) {
-                        client.confirming = Some((reply, workers, true));
-                    }
-                }
-                Err(error) => {
-                    let _ = reply.try_send(Err(error));
-                }
-            },
+            } => {
+                let attached = self.attach(files, batches, queued, answers, submissions);
+                let _ = reply.try_send(attached);
+            }
             Event::Watch {
                 slot,
                 generation,
@@ -1997,12 +1774,10 @@ impl<'a> Dispatch<'a> {
                 slot,
                 generation,
                 file,
-                answers: answers.clone(),
             });
         }
         let client = Some(Client {
             generation,
-            confirming: None,
             answers,
             submissions: Some(submissions),
             closing: false,
@@ -2224,9 +1999,6 @@ impl<'a> Dispatch<'a> {
         failed: Option<LifecycleFailure>,
     ) {
         let path = self.path;
-        if !detached {
-            self.confirm(slot, generation, failed.is_none());
-        }
         if let Some(failed) = failed
             && let Some(client) = self.client(slot, generation)
         {
@@ -2239,35 +2011,6 @@ impl<'a> Dispatch<'a> {
         if detached {
             self.dropped(Some((slot, generation)), failed);
         }
-    }
-
-    /// One worker holds an attachment's file, or refused it. Once every worker has, the attach is
-    /// answered with the workers' inboxes for its direct reads, or none when one refused the file:
-    /// a direct read never goes to a worker without it. The refusal itself is the client's
-    /// failure, as before, and fails its batches.
-    fn confirm(&mut self, slot: usize, generation: u64, held: bool) {
-        let reply = {
-            let Some(client) = self.client(slot, generation) else {
-                return;
-            };
-            let Some((reply, left, all)) = client.confirming.take() else {
-                return;
-            };
-            let all = all && held;
-            match left.checked_sub(1) {
-                Some(left) if left > 0 => {
-                    client.confirming = Some((reply, left, all));
-                    return;
-                }
-                _ => (reply, all),
-            }
-        };
-        let (reply, all) = reply;
-        let mut inboxes = Vec::new();
-        if all && inboxes.try_reserve_exact(self.workers.len()).is_ok() {
-            inboxes.extend(self.workers.iter().cloned());
-        }
-        let _ = reply.try_send(Ok((slot, generation, inboxes)));
     }
 
     fn native_exits(&mut self, native: &mut [NativeWorker<'_>]) {
@@ -2598,13 +2341,14 @@ impl<'a> Dispatch<'a> {
             };
             idle.pop();
             let sent = match self.workers.get(worker) {
-                Some(slot) => assign(slot, Task::Transfer(transfer)),
-                None => Err(Task::Transfer(transfer)),
+                Some(slot) => slot.try_send(Task::Transfer(transfer)),
+                None => Err(TrySendError::Disconnected(Task::Transfer(transfer))),
             };
-            // A worker that ended keeps no place among the idle, and its transfer fails its batch.
+            // An idle worker's slot is empty; one that is not, or whose worker ended, keeps no
+            // place among the idle, and its transfer fails its batch.
             match sent {
                 Ok(()) => self.in_flight = self.in_flight.saturating_add(1),
-                Err(task) => {
+                Err(TrySendError::Full(task) | TrySendError::Disconnected(task)) => {
                     if let Task::Transfer(transfer) = task {
                         self.failed(transfer, "a device worker has ended");
                     }
@@ -2620,30 +2364,18 @@ impl<'a> Dispatch<'a> {
             return false;
         };
         let sent = match self.workers.get(worker) {
-            Some(slot) => assign(slot, task),
-            None => Err(task),
+            Some(slot) => slot.try_send(task),
+            None => Err(TrySendError::Disconnected(task)),
         };
         match sent {
             Ok(()) => self.in_flight = self.in_flight.saturating_add(1),
-            Err(task) => {
+            Err(TrySendError::Full(task) | TrySendError::Disconnected(task)) => {
                 self.failure.get_or_insert(LifecycleFailure::Worker);
                 let _ = retire_task(task); // Secondary cleanup cannot replace the first refusal.
             }
         }
         // Any refused assignment drives broker shutdown and real joins, not a fake Done.
         true
-    }
-}
-
-/// Hands an idle worker a task. Its inbox has room for the one assignment beside the direct reads
-/// of its submitters' budget; past that budget, the broker waits for the worker, which never waits
-/// on the broker, rather than take a full inbox for an ended worker. The task back when the worker
-/// has ended.
-fn assign(slot: &SyncSender<Task>, task: Task) -> Result<(), Task> {
-    match slot.try_send(task) {
-        Ok(()) => Ok(()),
-        Err(TrySendError::Full(task)) => slot.send(task).map_err(|refused| refused.0),
-        Err(TrySendError::Disconnected(task)) => Err(task),
     }
 }
 
@@ -3769,82 +3501,6 @@ mod tests {
     }
 
     /// Empty page buffers to read `n` pages into, at offsets `first..first + n` pages.
-    /// A one-transfer read goes straight to a worker and is answered on the attachment's own
-    /// channel: its bytes, its number, beside the broker's batches answered out of order, and a
-    /// read past the file's end failed as a batch of one.
-    #[test]
-    fn one_transfer_reads_are_answered_directly_beside_broker_batches() {
-        let dir = tempfile::tempdir().unwrap();
-        let issuer = Issuer::start(Path::new("dev"), 2).unwrap();
-        let probe = Probe::new(dir.path(), true, None);
-        let mut attached = issuer.attach_deep(&probe, 4).unwrap();
-        let written = attached.submit(writes(4), true).unwrap();
-        let (answered, buffers) = attached.answer().unwrap();
-        assert_eq!(answered, written);
-        assert!(buffers.is_ok());
-        let one = attached.submit_reads(reads(2, 1)).unwrap();
-        let batch = attached.submit_reads(reads(0, 2)).unwrap();
-        let past = attached.submit_reads(reads(9, 1)).unwrap();
-        let mut answers = [
-            attached.answer().unwrap(),
-            attached.answer().unwrap(),
-            attached.answer().unwrap(),
-        ];
-        answers.sort_by_key(|(number, _)| *number);
-        let [(n1, a1), (n2, a2), (n3, a3)] = answers;
-        assert_eq!((n1, n2, n3), (one, batch, past));
-        let a1 = a1.unwrap();
-        assert_eq!(a1.len(), 1);
-        assert_eq!(a1[0].1, 2 * 4096);
-        assert!(a1[0].0.as_slice().iter().all(|&b| b == fill(2)));
-        let a2 = a2.unwrap();
-        assert_eq!(a2.len(), 2);
-        for (i, (buf, at)) in a2.iter().enumerate() {
-            assert_eq!(*at, (i * 4096) as u64);
-            assert!(buf.as_slice().iter().all(|&b| b == fill(i)));
-        }
-        assert!(
-            a3.is_err(),
-            "a read past the file's end fails its batch of one"
-        );
-        assert_eq!(attached.out(), 0);
-        // Many direct reads keep within the batches attached for, and all come back.
-        for round in 0..64usize {
-            let page = round % 4;
-            let number = attached.submit_reads(reads(page, 1)).unwrap();
-            let (answered, buffers) = attached.answer().unwrap();
-            assert_eq!(answered, number);
-            assert!(
-                buffers.unwrap()[0]
-                    .0
-                    .as_slice()
-                    .iter()
-                    .all(|&b| b == fill(page))
-            );
-        }
-        attached.retire_blocking().unwrap();
-        assert_eq!(probe.counts.alive.load(Ordering::SeqCst), 1);
-    }
-
-    /// The issuer stops while an attachment still holds the workers' inboxes for its direct reads:
-    /// each worker is told to end, so the stop joins rather than waits on a submitter, and the
-    /// attachment then learns the issuer has stopped.
-    #[test]
-    fn an_issuer_stops_while_an_attachment_holds_the_worker_inboxes() {
-        let dir = tempfile::tempdir().unwrap();
-        let issuer = Issuer::start(Path::new("dev"), 2).unwrap();
-        let probe = Probe::new(dir.path(), true, None);
-        let mut attached = issuer.attach_deep(&probe, 2).unwrap();
-        let written = attached.submit(writes(1), true).unwrap();
-        assert_eq!(attached.answer().unwrap().0, written);
-        let read = attached.submit_reads(reads(0, 1)).unwrap();
-        assert_eq!(attached.answer().unwrap().0, read);
-        drop(issuer);
-        assert!(attached.submit_reads(reads(0, 1)).is_err() || attached.answer().is_err());
-        drop(attached);
-        assert_eq!(probe.counts.alive.load(Ordering::SeqCst), 1);
-    }
-
     /// Do: attach a file that reads from memory, read through the attachment, then retire it
     /// while a cold thread waits on its retirement watch. Expect: the read is made on the
     /// submitter's own duplicate with the file's bytes, none goes to a worker; when the watch is

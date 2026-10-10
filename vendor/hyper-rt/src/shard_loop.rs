@@ -7,8 +7,8 @@
 //! spin out the idle window that client activity opened, and park in the driver until a kick, a completion
 //! or the next deadline. Cancellation guarantees a terminal completion: the future is dropped at the next
 //! poll boundary, the task's children are cancelled and joined, and whoever joins it sees `Cancelled`.
-//! The watchdog counts polls that exceed the step quantum (the expected wake) and attributes each to its
-//! task or to the host ([`crate::attribution`]).
+//! The watchdog times each step that polled, from its start to its polls' end, and attributes a step past
+//! the step quantum to its tasks or to the host ([`crate::attribution`]).
 //!
 //! **Ownership.** [`Shard`] owns everything here by value: its desk (boxed, so the address the thread's
 //! current-shard pointer names is stable) and its loop state. A step lends the desk to the tasks it polls
@@ -55,15 +55,15 @@ pub struct Counters {
     pub steps: u64,
     /// Task polls.
     pub polls: u64,
-    /// Polls past the step quantum that were their task's own: past it on the CPU, or waiting inside a call.
+    /// Steps past the step quantum that were their tasks' own: past it on the CPU, or waiting inside a call.
     pub long_steps: u64,
-    /// Of `long_steps`, the polls that waited inside a call.
+    /// Of `long_steps`, the steps that waited inside a call.
     pub blocked_steps: u64,
-    /// Polls past the quantum by the wall clock that the host held.
+    /// Steps past the quantum by the wall clock that the host held.
     pub preempted_steps: u64,
-    /// Polls past the quantum by the wall clock that could not be attributed.
+    /// Steps past the quantum by the wall clock that could not be attributed.
     pub unattributed_steps: u64,
-    /// The longest poll by the wall clock, in nanoseconds.
+    /// The longest step that polled, by the wall clock from its start to its polls' end, in nanoseconds.
     pub longest_step_ns: u64,
     /// Kicked parks whose kick-to-running latency fed the online wake estimate.
     pub wake_samples: u64,
@@ -104,7 +104,7 @@ pub struct Counters {
     /// registered.
     pub harvests: u64,
     /// Reads of the thread's CPU account (`attribution::thread_account`), each a system call: made only
-    /// while poll attribution is armed, and at a poll past the step quantum.
+    /// while step attribution is armed, and at a step past the step quantum.
     pub thread_accounts: u64,
     /// Reads of the thread's CPU clock to learn what a park costs, each a system call: two for each park
     /// the shard waits in while it learns ([`Counters::park_samples`]), and none otherwise.
@@ -943,9 +943,10 @@ impl Shard {
                 exit: true,
             };
         }
-        // The step's one reading of the clock: the overrun of a wait just ended, the attribution window, the
-        // timers and the harvest's quantum all take it.
+        // The step's first reading of the clock: the overrun of a wait just ended, the attribution window, the
+        // timers, the harvest's quantum and the step's own length all take it.
         self.publish_clock();
+        let started_ns = self.desk.now_ns.get();
         // Only while armed: the account is a system call, and every step paid it before the tracker
         // threw an unarmed read away.
         if self.core.real_time && self.core.attribution.armed() {
@@ -968,7 +969,6 @@ impl Shard {
             self.note_wait_overrun(deadline);
         }
         self.desk.counters.set(self.counters());
-        let harvests = self.core.counters.harvests;
         let mut did_work = self.drain_control();
         did_work |= self.drain_wakes();
         did_work |= self.expire_timers();
@@ -979,22 +979,18 @@ impl Shard {
         // earlier polls. The FIFO keeps already-ready tasks ahead of those wakes;
         // a local request/reply handoff need not repeat the whole loop for each end.
         let batch = self.core.config.batch.max(1);
-        // One clock read a poll: each poll's end is the next one's start, so the bookkeeping between two polls
-        // is counted to the second. The first poll starts from the step's reading when the step's drains,
-        // timers, pollers and driver did nothing since (a few loads); after any of them, from a fresh one.
-        let mut mark =
-            (!did_work && self.core.counters.harvests == harvests).then(|| self.desk.now_ns.get());
+        // No clock reading a poll: the step is timed whole, after its polls.
+        let mut polled = false;
         for _ in 0..batch {
             let Some(slot) = self.desk.local.pop() else {
                 break;
             };
             did_work = true;
-            let start = match mark {
-                Some(start) => start,
-                None => self.now_ns(),
-            };
-            mark = Some(self.poll_slot(slot, start));
+            polled |= self.poll_slot(slot);
             self.apply();
+        }
+        if polled {
+            self.time_step(started_ns);
         }
         // Running tasks, not occupied slots: a finished task that waits for a joiner holds its slot, and after
         // shutdown nobody joins it, so waiting on it would never end (found by `tcp::serve`'s handlers).
@@ -1112,8 +1108,7 @@ impl Shard {
                     && matches!(task.state, State::Idle | State::Queued)
             });
             if ordinary && ready {
-                let start = self.now_ns();
-                self.poll_slot(slot, start);
+                self.poll_slot(slot);
             }
         }
         self.apply();
@@ -1224,11 +1219,30 @@ impl Shard {
         }
     }
 
-    /// Attributes a poll against the step quantum: within it by the wall clock it is within; past it, the
+    /// Times the step that began at `started_ns` and polled, with one reading of the clock after its polls:
+    /// the watchdog judges the step by it, and a client's idle window opens where it ended.
+    fn time_step(&mut self, started_ns: u64) {
+        let ended_ns = self.now_ns();
+        // A request served in this step opens the idle window from where the step ended, not where it began:
+        // the spin covers the moments after the shard goes idle, however long the serving took.
+        if self.desk.activity_noted.replace(false) {
+            self.desk.activity_ns.set(Some(ended_ns));
+        }
+        self.core.counters.longest_step_ns = self
+            .core
+            .counters
+            .longest_step_ns
+            .max(ended_ns.saturating_sub(started_ns));
+        if let Some(attributed) = self.attribute_step(started_ns, ended_ns) {
+            count_long_step(&mut self.core.counters, attributed);
+        }
+    }
+
+    /// Attributes a step against the step quantum: within it by the wall clock it is within; past it, the
     /// attribution windows decide whose it was ([`crate::attribution`]).
-    fn attribute_poll(&mut self, poll_started_ns: u64, ended_ns: u64) -> Option<Attribution> {
+    fn attribute_step(&mut self, started_ns: u64, ended_ns: u64) -> Option<Attribution> {
         let quantum = self.quantum_ns();
-        if ended_ns.saturating_sub(poll_started_ns) <= quantum {
+        if ended_ns.saturating_sub(started_ns) <= quantum {
             return None;
         }
         if !self.core.real_time {
@@ -1239,7 +1253,7 @@ impl Shard {
         Some(
             self.core
                 .attribution
-                .long_poll(poll_started_ns, ended_ns, end, quantum),
+                .long_step(started_ns, ended_ns, end, quantum),
         )
     }
 
@@ -1455,8 +1469,8 @@ impl Shard {
         any
     }
 
-    /// Polls the task in `slot`, timed from `start`; the time the poll ended, or `start` when nothing ran.
-    fn poll_slot(&mut self, slot: u32, start: u64) -> u64 {
+    /// Polls the task in `slot`; whether its future was polled.
+    fn poll_slot(&mut self, slot: u32) -> bool {
         let service = self.desk.task(slot).is_some_and(|cell| cell.service.get());
         if service
             && self
@@ -1467,51 +1481,41 @@ impl Shard {
             self.cancel_children_once(slot);
         }
         let Some(generation) = self.desk.task(slot).map(|cell| cell.generation.get()) else {
-            return start;
+            return false;
         };
         let Some(task) = slot_mut(&mut self.core.tasks, slot) else {
-            return start;
+            return false;
         };
         if matches!(task.state, State::Finishing | State::Done | State::Running) {
-            return start;
+            return false;
         }
         let Some(mut future) = task.future.take() else {
-            return start;
+            return false;
         };
         if task.cancel_requested && !service {
             task.state = State::Finishing;
             self.drop_entered(future);
             self.finish(slot, Outcome::Cancelled);
-            return start;
+            return false;
         }
         task.state = State::Running;
         let word = Encoded::pack(self.desk.id, slot, generation).unwrap_or(Encoded::from_word(0));
         let waker = waker_for(word);
         let mut cx = Context::from_waker(&waker);
         self.desk.current_task.set(Some(slot));
-        self.desk.now_ns.set(start);
         let entered = registry::enter(&self.desk);
         let poll = future.as_mut().poll(&mut cx);
         drop(entered);
-        let ended = self.now_ns();
         self.desk.current_task.set(None);
-        // A request served in this poll opens the idle window from where the poll ended, not where it began:
-        // the spin covers the moments after the shard goes idle, however long the serving took.
-        if self.desk.activity_noted.replace(false) {
-            self.desk.activity_ns.set(Some(ended));
-        }
         // What the poll asked takes effect before its result is recorded: a parent that spawned children and
         // finished in one poll has them installed, linked and so cancelled with it.
         self.apply();
-        let attributed = self.attribute_poll(start, ended);
         self.after_poll(PollDone {
             slot,
             future,
-            elapsed: ended.saturating_sub(start),
             done: matches!(poll, Poll::Ready(())),
-            attributed,
         });
-        ended
+        true
     }
 
     /// Drops a task's future with the desk entered: its destructors may wake or cancel other tasks of this
@@ -1533,28 +1537,13 @@ impl Shard {
 
     /// Records the poll and either stores the future back or finishes the task.
     fn after_poll(&mut self, poll: PollDone) {
-        let PollDone {
-            slot,
-            future,
-            elapsed,
-            done,
-            attributed,
-        } = poll;
-        let long = attributed.is_some_and(Attribution::is_tasks);
+        let PollDone { slot, future, done } = poll;
         self.core.counters.polls = self.core.counters.polls.saturating_add(1);
-        if let Some(attributed) = attributed {
-            count_long_poll(&mut self.core.counters, attributed);
-        }
-        self.core.counters.longest_step_ns = self.core.counters.longest_step_ns.max(elapsed);
         let service = self.desk.task(slot).is_some_and(|cell| cell.service.get());
         let Some(task) = slot_mut(&mut self.core.tasks, slot) else {
             return;
         };
         task.polls = task.polls.saturating_add(1);
-        if long {
-            task.long_steps = task.long_steps.saturating_add(1);
-        }
-        task.longest_step_ns = task.longest_step_ns.max(elapsed);
         if done || (task.cancel_requested && !service) {
             let cancelled = task.cancel_requested;
             self.drop_entered(future);
@@ -1784,9 +1773,7 @@ impl Shard {
 struct PollDone {
     slot: u32,
     future: Pin<Box<dyn std::future::Future<Output = ()> + 'static>>,
-    elapsed: u64,
     done: bool,
-    attributed: Option<Attribution>,
 }
 
 /// The thread's account and the shard clock now: an attribution window's start.
@@ -1794,8 +1781,8 @@ fn account_now(now_ns: u64) -> Option<(attribution::ThreadAccount, u64)> {
     attribution::thread_account().map(|account| (account, now_ns))
 }
 
-/// Counts a poll past the step quantum by the wall clock under whoever held it.
-fn count_long_poll(counters: &mut Counters, attributed: Attribution) {
+/// Counts a step past the step quantum by the wall clock under whoever held it.
+fn count_long_step(counters: &mut Counters, attributed: Attribution) {
     if attributed.is_tasks() {
         counters.long_steps = counters.long_steps.saturating_add(1);
     }

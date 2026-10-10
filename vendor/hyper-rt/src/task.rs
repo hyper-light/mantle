@@ -276,11 +276,6 @@ pub struct TaskSlot {
     pub joinable: bool,
     /// Polls so far.
     pub polls: u64,
-    /// Polls past the step quantum that were this task's own: past it on the CPU, or waiting inside a call
-    /// (the shard's `Counters::long_steps`; a poll the host held off the CPU is not counted).
-    pub long_steps: u32,
-    /// The longest poll by the wall clock, in nanoseconds.
-    pub longest_step_ns: u64,
 }
 
 impl TaskSlot {
@@ -298,8 +293,6 @@ impl TaskSlot {
             cancel_requested: false,
             joinable,
             polls: 0,
-            long_steps: 0,
-            longest_step_ns: 0,
         }
     }
 
@@ -317,8 +310,6 @@ impl TaskSlot {
             cancel_requested: false,
             joinable: false,
             polls: 0,
-            long_steps: 0,
-            longest_step_ns: 0,
         }
     }
 

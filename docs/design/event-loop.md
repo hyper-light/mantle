@@ -56,35 +56,46 @@ an exact mean over the warm-up, then a weighted mean whose window the warm-up's 
 - The idle window's multiple is the configuration's `WakeTracking::idle_ratio`, 1 from
   `from_calibration` (unchanged).
 
-## D3. The shard's clock is the cheap one, read once a poll
+## D3. The shard's clock is the cheap one, read twice a step
 
 **Decision.** The shard's clock (`driver::nanos_since`, every OS driver's epoch) reads
 `machine::clock::shard_clock_ns`: on macOS `mach_continuous_time` scaled by the timebase as a 32-bit
 fixed-point ratio (one multiply and a shift); elsewhere `monotonic_ns`, whose clocks there are already
 the cheap ones (Linux's vDSO `CLOCK_BOOTTIME`, Windows' interrupt time). `monotonic_ns`, the host-wide
-reading other processes compare, is unchanged. Each reading serves every decision that can share it:
+reading other processes compare, is unchanged. A step reads it twice, however many tasks it polls: at its
+start, and once after its polls. The watchdog judges the step, not each poll: a step past the step
+quantum by the wall clock, from its start to its polls' end, is attributed to its tasks or to the host
+(`attribution.rs`), and the longest-step counter is the longest such step.
 
 | Reader | Reads before | Reads now |
 |---|---|---|
 | a step: the overrun of a wait just ended, the attribution window, timer expiry, the harvest's quantum | 2 (the step's publication, then the timers' own) | 1 (the publication, which the others take) |
-| a poll: its length (attribution, the longest-poll counters), the next poll's start, an activity window's origin | 2 (start and end) | 1 (its end; it starts where the previous poll ended) |
-| a step's first poll | its own start | the step's reading when nothing ran since it (no drain, timer, poller or driver call), else one fresh read |
+| a step's polls: their length (the watchdog and its attribution, the longest-step counter), an activity window's origin | one a poll, at its end (each poll's end was the next one's start) | 1, after the last poll |
 | the idle spin, a turn | 2 | 1, and 1 more after a turn that asked the driver |
 | a timed park and its kick (wake learning) | 4 of `CLOCK_MONOTONIC` | 4 of the shard's clock |
 
 A step of `p` polls on macOS read `CLOCK_MONOTONIC` `2 + 2p` times at 16–25 ns; it now reads the shard's
-clock `1 + p` times (`2 + p` when its drains or driver did work) at 5–7 ns. A request/reply step with one
-poll went from four reads to two or three.
+clock twice at 5–7 ns. A request/reply step with one poll went from four reads to two.
 
 **Why.** macOS `CLOCK_MONOTONIC` is the wall clock less the boot time: 16.1 ns a read at 1 µs resolution,
 where `mach_continuous_time`, which also counts through sleep, costs 4.8 ns at 41.67 ns (note 42 §4). The
 two reads a poll were 6 % of the shard's samples on mantle's resident get path, and a poll that yields
-cost 47.5 ns; it costs 15.9 ns now (note 42 §7).
+cost 47.5 ns; it cost 15.9 ns with one read a poll (note 42 §7). That one read was still the largest cost
+of a poll that does little: 1,134 of the 2,915 samples in a detached-spawn shard's step were
+`mach_continuous_time` after a poll (note 42 §9). Without it, on this Mac at load 12–15, detached spawns
+run 25.8 million a second against 22.8 million, yields 66.8 million against 46.9 million, and a two-shard
+ping-pong 1.30 million round trips against 1.07 million; a single client's round trip and an eight-client
+fan-in are unchanged (`benchmark-results/hyper-rt-vs-tokio-20261010/runs/mac-b-step-r1`). Mantle's fill
+through its same-shard client puts 2.96 million keys a second at the median against 2.55 million, with gets
+and seeks unchanged (`benchmark-results/rtloop-async-fill-bisect-20261010/b-step-r1`). Per-poll timing
+bought a per-task long-poll count no consumer read (`TaskSlot::long_steps`, removed); the step's own
+timing is what the watchdog needs, since a step is what holds the shard's other work back.
 
-**Proof.** `machine::clock`'s tests: Apple silicon's 125/3 timebase converts 3 ticks to 125 ns and a
+**Proof.** `tests/step_clock_reads.rs`: one step polls 256 tasks and reads its driver's clock twice (257
+times before). `machine::clock`'s tests: Apple silicon's 125/3 timebase converts 3 ticks to 125 ns and a
 second's 24,000,000 ticks to exactly 10⁹ ns, a one-to-one timebase returns its ticks, and the shard's
-clock never runs backwards. The suite's attribution tests (`tests/wake_estimate.rs`) hold the long-poll
-rules on the new reading points.
+clock never runs backwards. The attribution tests (`tests/wake_estimate.rs`) hold the long-step rules,
+each held poll a step of its own (a batch of one); `attribution.rs`'s unit tests hold the tracker.
 
 **Constants.**
 - `SCALE_BITS` (32): format, the fixed-point scale's fraction, chosen so the 64×64-bit product cannot

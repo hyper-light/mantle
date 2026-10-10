@@ -1,13 +1,14 @@
-//! The shard's online wake estimate and the attribution of its long polls (§4.1, §4.3; A-31;
+//! The shard's online wake estimate and the attribution of its long steps (§4.1, §4.3; A-31;
 //! docs/bugs/2026-09-25-wake-estimate-frozen-at-boot-and-preemptions-counted-as-long-steps.md).
 //!
 //! The boot probe's mean wake converges slowly under a heavy tail, so a shard that tracks one refines it
 //! from the kicked parks it pays: a sender stamps the first kick of a park, and the shard folds the
 //! kick-to-running latency of a park that slept into its estimate, which its step quantum and idle spin
-//! follow. A shard whose configuration carries no measured prior keeps its fixed values. A poll past the
-//! quantum by the wall clock is attributed in a window of the thread's account: the task's when it ran
+//! follow. A shard whose configuration carries no measured prior keeps its fixed values. A step past the
+//! quantum by the wall clock is attributed in a window of the thread's account: its tasks' when it ran
 //! past the quantum on the CPU or blocked in a call, the host's when it was runnable and held off the
-//! CPU, unattributed where the platform cannot tell (the first long poll opens the first window).
+//! CPU, unattributed where the platform cannot tell (the first long step opens the first window). Each
+//! held poll below is a step of its own (a batch of one), so a step's attribution is its poll's.
 
 // Test harness code: a panic here is a failed test (CLAUDE.md §1).
 #![allow(
@@ -282,10 +283,14 @@ impl Future for HoldEachPoll {
     }
 }
 
-/// Runs one busy period of [`LONG_POLLS`] held polls and returns the shard's counters.
+/// Runs one busy period of [`LONG_POLLS`] held polls, one a step, and returns the shard's counters.
 fn one_busy_period(hold: Hold) -> hyper_rt::shard_loop::Counters {
     CPU_PAST_QUANTUM.with(|count| count.set(0));
-    let mut rt = LocalRuntime::new(&config(QUANTUM_NS, None)).unwrap();
+    let mut rt = LocalRuntime::new(&RuntimeConfig {
+        batch: 1,
+        ..config(QUANTUM_NS, None)
+    })
+    .unwrap();
     rt.spawn(HoldEachPoll {
         polls_left: LONG_POLLS,
         hold,
@@ -301,7 +306,7 @@ fn one_busy_period(hold: Hold) -> hyper_rt::shard_loop::Counters {
     counters
 }
 
-/// A shard's long polls as (the task's, of those blocked, the host's, unattributed).
+/// A shard's long steps as (the tasks', of those blocked, the host's, unattributed).
 fn attributed(counters: &hyper_rt::shard_loop::Counters) -> (u64, u64, u64, u64) {
     (
         counters.long_steps,

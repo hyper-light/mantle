@@ -244,6 +244,34 @@ variants of the channel to price its fences: with both removed (`nofence`, no lo
 sequentially consistent operations in their place (`seqcst`): neither moved the CPU a value outside the
 rounds' spread (106–111 ns, 12–14 ns), so the fences, which loom checks, stay.
 
+## 9. A clock read a poll
+
+**MEASURED** (PANELS `spawnd-profile`, `sample` at 1 ms over a shard running a million detached spawns
+at hyper-rt `bd7c0fd` with its fixed configuration): of the 2,915 samples in the shard's step, 1,147 were
+in `poll_slot`, and 1,134 of those were the clock read at the poll's end (`KqueueDriver::now_ns` →
+`shard_clock_ns` → `mach_continuous_time`, 1,091 in the call itself). A poll that spawns nothing and ends
+costs a few tens of nanoseconds, so a read that costs 4.8 ns in a tight loop (§4) is a third of it where
+the poll does little; **INFERENCE**: in the step's own instruction stream the read also waits on the
+`isb` that `mach_continuous_time` issues before it reads the counter, which a loop of reads alone hides.
+The read served the watchdog (each poll's length against the quantum, and its attribution), the next
+poll's start, and an activity window's origin. A step's own two readings serve each of them for the step:
+the watchdog asks whether the shard's other work was held back, which is a step's length, not a poll's.
+
+**MEASURED** with the read removed (PANELS `mac-b-step-r1`, load 12–15, five rounds, arms rotated; base
+`bd7c0fd`, changed the step-timing tree), per second:
+
+| Case | Base | Changed | trantor |
+|---|---|---|---|
+| detached spawns | 22.8 M | 25.8 M | 37.5 M |
+| yields | 46.9 M | 66.8 M | 36.2 M |
+| two-shard ping-pong round trips | 1.07 M | 1.30 M | 0.15 M |
+| one client closed loop, requests | 223 k | 215 k | 168 k |
+| eight clients onto one shard, requests | 388 k | 383 k | 597 k |
+
+**MEASURED** on mantle's fill (`benchmark-results/rtloop-async-fill-bisect-20261010/b-step-r1`, eight
+interleaved rounds each, load 11.2–11.7): 1M random puts through the same-shard client at a median of
+2.96 M a second against 2.55 M (`bd7c0fd`'s runtime), gets 2.15 M against 2.12 M, seeks 536 k against 534 k.
+
 ## What remains unknown
 
 - **The cost of blocking on Windows.** Its per-thread times advance a scheduler tick at a time, and its

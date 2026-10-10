@@ -1,31 +1,30 @@
-//! Who held a long poll (§4.3, the long-step count; A-31). A poll that runs past the step quantum by the
-//! wall clock was held either by its task — it ran past the quantum on the CPU, or it waited inside a
-//! call (blocked in the kernel, such as the base plane's synchronous `pread` on a cold page cache, or
-//! yielding the thread to a full peer ring) — or by the host: the thread was runnable and off the CPU,
-//! preempted by the operating system or its virtual CPU stolen by the hypervisor. The wall clock counts
-//! both the same. The quantum is the expected wake, a few microseconds (§4.1: a mean of 2.0–3.3 µs on
-//! Apple silicon and 10.7–21.7 µs in a Linux container, 2026-09-25), while a time slice handed to another
-//! runnable thread is far longer (Linux's EEVDF base slice is 0.75 ms, `sysctl_sched_base_slice` in
-//! `kernel/sched/fair.c`, from memory). So by the wall clock alone, every preemption of a correct poll
-//! counted as the bounded-work rule's bug signal.
+//! Who held a long step (§4.3, the long-step count; A-31). A step that runs past the step quantum by the
+//! wall clock, from its start to its polls' end, was held either by its tasks — they ran past the quantum on
+//! the CPU, or one waited inside a call (blocked in the kernel, such as the base plane's synchronous `pread`
+//! on a cold page cache, or yielding the thread to a full peer ring) — or by the host: the thread was
+//! runnable and off the CPU, preempted by the operating system or its virtual CPU stolen by the hypervisor.
+//! The wall clock counts both the same, while a time slice handed to another runnable thread is far longer
+//! than a step (Linux's EEVDF base slice is 0.75 ms, `sysctl_sched_base_slice` in `kernel/sched/fair.c`,
+//! from memory). So by the wall clock alone, every preemption of a correct step counted as the
+//! bounded-work rule's bug signal.
 //!
 //! The shard reads the calling thread's account ([`ThreadAccount`]) at the start of a window and at the
-//! end of a long poll: its CPU time (`CLOCK_THREAD_CPUTIME_ID` on Linux and macOS) and, on Linux, its
+//! end of a long step: its CPU time (`CLOCK_THREAD_CPUTIME_ID` on Linux and macOS) and, on Linux, its
 //! voluntary context switches (`getrusage(RUSAGE_THREAD)`'s `ru_nvcsw`: the thread blocked in a call;
 //! Linux counts a preemption and a `sched_yield` as involuntary). hyper-rt's runtime never yields the
 //! thread inside a poll (no wake waits for a full ring: docs/runtime.md §3.2), so slates' report of its own
 //! yields to the window is gone. Measured in a Linux container on this Mac (Docker,
 //! four CPUs, 2026-09-25, best of five rounds of 200,000 calls): the CPU clock 155–161 ns and `getrusage`
-//! 130–134 ns; on Apple silicon the CPU clock 107–129 ns (2026-09-22). That is too dear for every poll,
-//! so the shard reads only at the end of a poll that already ran long, and — while a long poll went
+//! 130–134 ns; on Apple silicon the CPU clock 107–129 ns (2026-09-22). That is too dear for every step,
+//! so the shard reads only at the end of a step that already ran long, and — while a long step went
 //! unattributed for want of a window — at each step's start and each wait's end ([`Tracker`]); a busy
-//! period that runs no long poll stops the readings. macOS counts no per-thread voluntary switches, so a
-//! poll off the CPU there is unattributed. A virtual machine's
-//! guest may count time its virtual CPU was stolen while the thread ran as the thread's CPU; such a poll
-//! then reads as a long run and is the task's by this rule (the macOS CI runner, run 36289513559,
+//! period that runs no long step stops the readings. macOS counts no per-thread voluntary switches, so a
+//! step off the CPU there is unattributed. A virtual machine's
+//! guest may count time its virtual CPU was stolen while the thread ran as the thread's CPU; such a step
+//! then reads as a long run and is its tasks' by this rule (the macOS CI runner, run 36289513559,
 //! 2026-09-27: a poll that slept 3 ms took 23 ms and read past a 1 ms quantum on the thread clock). Windows keeps
 //! per-thread times at the scheduler tick (about 15.6 ms), so no account is read there and every long
-//! poll is unattributed.
+//! step is unattributed.
 //!
 //! [`attribute`] and [`Tracker`] are cfg-free and unit-tested on every host; the readings are paired
 //! `#[cfg]` functions.
@@ -125,23 +124,23 @@ pub(crate) fn thread_cpu_now() -> Option<u64> {
     None
 }
 
-/// What held a poll that ran past the quantum by the wall clock.
+/// What held a step that ran past the quantum by the wall clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Attribution {
-    /// The task: the poll ran past the quantum on the CPU.
+    /// Its tasks: the step ran past the quantum on the CPU.
     Long,
-    /// The task: the poll's CPU stayed within the quantum and the thread waited inside a call during the
+    /// Its tasks: the step's CPU stayed within the quantum and the thread waited inside a call during the
     /// window — blocked in the kernel.
     Blocked,
-    /// The host: the poll's CPU stayed within the quantum and the thread never waited inside a call during
+    /// The host: the step's CPU stayed within the quantum and the thread never waited inside a call during
     /// the window, so it was runnable and off the CPU.
     Preempted,
-    /// Unattributed: the window's CPU does not decide this poll's share (the window holds earlier work). A
+    /// Unattributed: the window's CPU does not decide this step's share (the window holds earlier work). A
     /// fresher window would, so the shard arms.
     Ambiguous,
     /// Unattributed: off the CPU, and the platform cannot tell a block from a preemption (macOS).
     OffCpu,
-    /// Unattributed: no window was open (the first long poll, or the first after a wait while unarmed).
+    /// Unattributed: no window was open (the first long step, or the first after a wait while unarmed).
     NoWindow,
     /// Unattributed: no per-thread clock here.
     NoClock,
@@ -159,25 +158,25 @@ impl Attribution {
     }
 }
 
-/// One window of a long poll: from the start reading to the poll's end.
+/// One window of a long step: from the start reading to the step's end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Window {
-    /// CPU time the thread ran from the window's start to the poll's end.
+    /// CPU time the thread ran from the window's start to the step's end.
     pub(crate) cpu_ns: u64,
-    /// Wall time from the window's start to the poll's start: the most CPU the thread can have run before
-    /// the poll.
-    pub(crate) before_poll_ns: u64,
+    /// Wall time from the window's start to the step's start: the most CPU the thread can have run before
+    /// the step.
+    pub(crate) before_step_ns: u64,
     /// Whether the thread waited inside a call during the window; `None` where no one can tell.
     pub(crate) waited_in_call: Option<bool>,
 }
 
-/// Attributes a poll that ran past `quantum_ns` by the wall clock. Its CPU is at most the window's and at
-/// least the window's less the wall time before the poll (the thread ran at most that much before it):
+/// Attributes a step that ran past `quantum_ns` by the wall clock. Its CPU is at most the window's and at
+/// least the window's less the wall time before the step (the thread ran at most that much before it):
 /// past the quantum at the least, the task ran long; within it at the most, the thread was off the CPU
 /// for the rest, and whether it waited inside a call decides whose that was; between the two, the window
 /// does not decide.
 pub(crate) fn attribute(window: &Window, quantum_ns: u64) -> Attribution {
-    if window.cpu_ns.saturating_sub(window.before_poll_ns) > quantum_ns {
+    if window.cpu_ns.saturating_sub(window.before_step_ns) > quantum_ns {
         return Attribution::Long;
     }
     if window.cpu_ns > quantum_ns {
@@ -190,10 +189,10 @@ pub(crate) fn attribute(window: &Window, quantum_ns: u64) -> Attribution {
     }
 }
 
-/// The shard's windows and when it reads. A window opens at the end reading of every long poll, and —
+/// The shard's windows and when it reads. A window opens at the end reading of every long step, and —
 /// while armed — at each step's start and each wait's end. A wait closes the window, so a park's own
-/// block is never charged to a poll. The shard arms when a long poll found no window, or one that did not
-/// decide it; a busy period (from one wait to the next, having done work) that runs no long poll disarms,
+/// block is never charged to a step. The shard arms when a long step found no window, or one that did not
+/// decide it; a busy period (from one wait to the next, having done work) that runs no long step disarms,
 /// so a healthy shard reads nothing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Tracker {
@@ -203,7 +202,7 @@ pub(crate) struct Tracker {
     armed: bool,
     /// Whether the busy period since the last wait did work.
     period_worked: bool,
-    /// Whether the busy period since the last wait ran a long poll.
+    /// Whether the busy period since the last wait ran a long step.
     period_long: bool,
 }
 
@@ -226,7 +225,7 @@ impl Tracker {
         self.period_worked |= did_work;
     }
 
-    /// A wait (a spin or a park) begins: the window closes, and a busy period that ran no long poll disarms.
+    /// A wait (a spin or a park) begins: the window closes, and a busy period that ran no long step disarms.
     pub(crate) fn wait_began(&mut self) {
         self.window_start = None;
         if self.period_worked {
@@ -245,12 +244,12 @@ impl Tracker {
         }
     }
 
-    /// A poll that began at `poll_started_ns` ran past `quantum_ns` by the wall clock and ended at `now_ns`
+    /// A step that began at `step_started_ns` ran past `quantum_ns` by the wall clock and ended at `now_ns`
     /// with the thread's account `end`: attributes it, arms if the window was missing or undecided, and
     /// opens the next window at `end`.
-    pub(crate) fn long_poll(
+    pub(crate) fn long_step(
         &mut self,
-        poll_started_ns: u64,
+        step_started_ns: u64,
         now_ns: u64,
         end: Option<ThreadAccount>,
         quantum_ns: u64,
@@ -262,7 +261,7 @@ impl Tracker {
             (Some((start, start_ns)), Some(end)) => attribute(
                 &Window {
                     cpu_ns: end.cpu_ns.saturating_sub(start.cpu_ns),
-                    before_poll_ns: poll_started_ns.saturating_sub(start_ns),
+                    before_step_ns: step_started_ns.saturating_sub(start_ns),
                     waited_in_call: self.waited_in_call(start, end),
                 },
                 quantum_ns,
@@ -307,15 +306,15 @@ mod tests {
         reading.map(|account| (account, now_ns))
     }
 
-    /// §4.3, A-31: the poll's CPU lies between the window's CPU less the wall time before the poll and the
+    /// §4.3, A-31: the step's CPU lies between the window's CPU less the wall time before the step and the
     /// window's CPU. Past the quantum at the least it is the task's; within it at the most, a wait inside a
     /// call makes it the task's and none makes it the host's; unknown waits stay unattributed; and a window
-    /// whose earlier work leaves the poll's share open decides nothing.
+    /// whose earlier work leaves the step's share open decides nothing.
     #[test]
-    fn a_window_attributes_a_long_poll_by_the_bounds_on_its_cpu() {
-        let window = |cpu_ns, before_poll_ns, waited_in_call| Window {
+    fn a_window_attributes_a_long_step_by_the_bounds_on_its_cpu() {
+        let window = |cpu_ns, before_step_ns, waited_in_call| Window {
             cpu_ns,
-            before_poll_ns,
+            before_step_ns,
             waited_in_call,
         };
         assert_eq!(
@@ -334,7 +333,7 @@ mod tests {
             attribute(&window(QUANTUM_NS / 2, 0, None), QUANTUM_NS),
             Attribution::OffCpu
         );
-        // Twice the quantum of CPU in the window, but the whole of it might have run before the poll.
+        // Twice the quantum of CPU in the window, but the whole of it might have run before the step.
         assert_eq!(
             attribute(
                 &window(2 * QUANTUM_NS, 2 * QUANTUM_NS, Some(false)),
@@ -344,21 +343,21 @@ mod tests {
         );
     }
 
-    /// §4.3, A-31: the first long poll has no window and arms; the next is judged in the window its
-    /// predecessor's end opened; a busy period with no long poll disarms at the next wait, so a healthy
+    /// §4.3, A-31: the first long step has no window and arms; the next is judged in the window its
+    /// predecessor's end opened; a busy period with no long step disarms at the next wait, so a healthy
     /// shard stops reading; a spin that finds nothing and then parks is one wait, not a busy period.
     #[test]
-    fn the_tracker_arms_on_an_unattributed_poll_and_disarms_after_a_quiet_busy_period() {
+    fn the_tracker_arms_on_an_unattributed_step_and_disarms_after_a_quiet_busy_period() {
         let mut tracker = Tracker::default();
         tracker.step_began(|| panic!("an unarmed shard reads nothing"));
         assert_eq!(
-            tracker.long_poll(0, QUANTUM_NS * 2, account(100, Some(0)), QUANTUM_NS),
+            tracker.long_step(0, QUANTUM_NS * 2, account(100, Some(0)), QUANTUM_NS),
             Attribution::NoWindow
         );
         assert!(tracker.armed());
         // Held off the CPU for three quanta right after, with no voluntary switch: the host's.
         assert_eq!(
-            tracker.long_poll(
+            tracker.long_step(
                 QUANTUM_NS * 2,
                 QUANTUM_NS * 5,
                 account(200, Some(0)),
@@ -367,7 +366,7 @@ mod tests {
             Attribution::Preempted
         );
         tracker.step_ended(true);
-        // A busy period that ran a long poll keeps the arming across its wait.
+        // A busy period that ran a long step keeps the arming across its wait.
         tracker.wait_began();
         tracker.wait_ended(|| at(QUANTUM_NS * 6, account(300, Some(1))));
         assert!(tracker.armed());
@@ -381,13 +380,13 @@ mod tests {
         tracker.step_began(|| panic!("a disarmed shard reads nothing"));
     }
 
-    /// §4.3, A-31: a wait closes the window, so the park's own block is never charged to the poll after it,
-    /// and a window opened by an armed step start judges the next long poll.
+    /// §4.3, A-31: a wait closes the window, so the park's own block is never charged to the step after it,
+    /// and a window opened by an armed step start judges the next long step.
     #[test]
-    fn a_wait_closes_the_window_and_a_fresh_window_judges_the_next_long_poll() {
+    fn a_wait_closes_the_window_and_a_fresh_window_judges_the_next_long_step() {
         let mut tracker = Tracker::default();
         assert_eq!(
-            tracker.long_poll(0, QUANTUM_NS * 2, account(0, None), QUANTUM_NS),
+            tracker.long_step(0, QUANTUM_NS * 2, account(0, None), QUANTUM_NS),
             Attribution::NoWindow
         );
         tracker.step_ended(true);
@@ -395,7 +394,7 @@ mod tests {
         // The park blocked (a voluntary switch) — then the next busy period opens a fresh window after it.
         tracker.wait_ended(|| at(QUANTUM_NS * 100, account(10, Some(5))));
         assert_eq!(
-            tracker.long_poll(
+            tracker.long_step(
                 QUANTUM_NS * 100,
                 QUANTUM_NS * 103,
                 account(20, Some(5)),
@@ -406,7 +405,7 @@ mod tests {
         );
         tracker.step_began(|| at(QUANTUM_NS * 104, account(30, Some(5))));
         assert_eq!(
-            tracker.long_poll(
+            tracker.long_step(
                 QUANTUM_NS * 104,
                 QUANTUM_NS * 107,
                 account(40, Some(6)),
@@ -416,7 +415,7 @@ mod tests {
         );
         // With no switch count, off the CPU is all this platform can say.
         assert_eq!(
-            tracker.long_poll(
+            tracker.long_step(
                 QUANTUM_NS * 107,
                 QUANTUM_NS * 110,
                 account(50, None),
@@ -425,7 +424,7 @@ mod tests {
             Attribution::OffCpu
         );
         assert_eq!(
-            tracker.long_poll(QUANTUM_NS * 110, QUANTUM_NS * 113, None, QUANTUM_NS),
+            tracker.long_step(QUANTUM_NS * 110, QUANTUM_NS * 113, None, QUANTUM_NS),
             Attribution::NoClock
         );
     }

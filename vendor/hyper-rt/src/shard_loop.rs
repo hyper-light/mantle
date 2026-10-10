@@ -96,6 +96,9 @@ pub struct Counters {
     /// Non-blocking driver polls (`harvest_io`): each a system call, made only while a readiness wait is
     /// registered.
     pub harvests: u64,
+    /// Reads of the thread's CPU account (`attribution::thread_account`), each a system call: made only
+    /// while poll attribution is armed, and at a poll past the step quantum.
+    pub thread_accounts: u64,
     /// Driver completions delivered.
     pub completions: u64,
     /// Times the driver was lost.
@@ -843,8 +846,12 @@ impl Shard {
                 exit: true,
             };
         }
-        if self.core.real_time {
+        // Only while armed: the account is a system call, and every step paid it before the tracker
+        // threw an unarmed read away.
+        if self.core.real_time && self.core.attribution.armed() {
             let read = account_now(self.now_ns());
+            self.core.counters.thread_accounts =
+                self.core.counters.thread_accounts.saturating_add(1);
             self.core.attribution.step_began(|| read);
         }
         self.core.counters.steps = self.core.counters.steps.saturating_add(1);
@@ -868,7 +875,10 @@ impl Shard {
         did_work |= self.wake_ready_pollers();
         self.apply();
         did_work |= self.harvest_turn();
-        let batch = self.desk.local.batch(self.core.config.batch.max(1));
+        // The configured poll budget bounds this phase, including wakes produced by
+        // earlier polls. The FIFO keeps already-ready tasks ahead of those wakes;
+        // a local request/reply handoff need not repeat the whole loop for each end.
+        let batch = self.core.config.batch.max(1);
         for _ in 0..batch {
             let Some(slot) = self.desk.local.pop() else {
                 break;
@@ -996,8 +1006,10 @@ impl Shard {
         if retrieved {
             self.core.last_driver_ns = now;
         }
-        if self.core.real_time {
+        if self.core.real_time && self.core.attribution.armed() {
             let read = account_now(now);
+            self.core.counters.thread_accounts =
+                self.core.counters.thread_accounts.saturating_add(1);
             self.core.attribution.wait_ended(|| read);
         }
     }
@@ -1013,6 +1025,7 @@ impl Shard {
             return Some(Attribution::Long);
         }
         let end = attribution::thread_account();
+        self.core.counters.thread_accounts = self.core.counters.thread_accounts.saturating_add(1);
         Some(
             self.core
                 .attribution

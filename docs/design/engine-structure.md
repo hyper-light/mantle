@@ -106,6 +106,24 @@ but its own first part: the work spread over shards, one per core, each owning w
   `tasks_per_shard`); batches out at the issuer; the page cache by bytes. Each is a stated bound
   with a typed refusal.
 
+**Same-shard clients (planned, not built).** Measured per operation over the same engine
+(`benchmark-results/mantle-boxed-request-panel-20261010`, 1M fills, 100K gets and seeks): a put
+costs 2,995 instructions on the direct path and 9,340 through a range on the runtime; a get 4,833
+and 7,600 warm; a seek 14,822 and 21,160. The difference is the request's round trip, which a
+client on the range's own shard does not need: two channel hops, two wakes, three or four polls of
+two tasks (each reading the clock), the serve loop's bookkeeping and a timed maintenance slice. A
+client on the range's shard will run an operation inline when the range is idle and the operation
+completes without waiting, as an event loop runs a call made on its own thread at once (trantor's
+`EventLoop::runInLoop`, drogon's loop):
+- the engine moves into a shard-local slot whenever the range's task awaits, and back out when it
+  runs; a client takes it for one synchronous operation and returns it, so ownership moves and no
+  reference is shared (no Arc, no RefCell);
+- a put that `put_paced` cannot apply now, a get that needs a page the issuer must read, any
+  request while the range has pending mutations (their arrival order is kept), a fault, and
+  closing all take the request path unchanged;
+- an inline client yields when another task on its shard is ready, so a loop of inline
+  operations does not hold the shard (a hyper-rt signal owed for it).
+
 An idle range that reaches a required trunk read yields its work before opening or claiming
 that read. Its task then waits for either a request or an issuer answer through hyper-rt's
 existing bounded channel. The answer channel holds the attachment's admitted batch count,

@@ -48,9 +48,17 @@ RocksDB, reading on its calling thread, served 438 to 763 thousand.
   So the mapping is kept, and remapped twice as long when a read reaches past it [CLRS]. No byte
   is read through it [mmap-db]: a resident range is read with `pread(2)`. A page evicted between the
   probe and the read costs one device read on the shard; a byte read is never wrong.
-- **Windows**. No interface here yet: every read goes to the issuer. The candidate to research is an
-  overlapped `ReadFile` on a cached handle, which the cache manager completes synchronously when it
-  holds the range.
+- **Windows**. No interface here yet: every read goes to the issuer. Windows has no probe that
+  does not issue the read. An overlapped `ReadFile` on a cached handle completes synchronously
+  when the cache manager holds the range (Microsoft KB 156932, "Asynchronous disk I/O appears as
+  synchronous on Windows"; Chen, The Old New Thing, 2010-10-08, "Why does my asynchronous I/O
+  request return TRUE instead of failing with ERROR_IO_PENDING?"), and with
+  `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` set on a handle bound to a completion port such a
+  completion queues no packet (`SetFileCompletionNotificationModes`). A read that goes pending is
+  then in flight with its buffer lent to the kernel, so it cannot be abandoned: the design owed
+  is a completion port the issuer polls, answering the pending read to its submitter with one
+  wake rather than handing it to a worker. It needs Windows CI to run on, so it is a step of its
+  own.
 
 ## 3. Where the handle comes from
 

@@ -237,7 +237,7 @@ fn feed_one<F: BlockFile>(
         if f.filling.is_none() {
             f.filling = match f.spare.pop() {
                 Some(b) => Some(b),
-                None => pool.buffer(store, f.ticket.worker, false)?,
+                None => pool.buffer(store, f.ticket, false)?,
             };
         }
         let Some(buf) = f.filling.as_mut() else {

@@ -225,7 +225,7 @@ fn run(call: Call) {
         file_end: store.end(),
         generation: store.generation(),
     });
-    let worker = pool.send(job, Owner::Pack, true).unwrap().unwrap().worker;
+    let ticket = pool.send(job, Owner::Pack, true).unwrap().unwrap();
     held.recv().unwrap(); // An actual worker write is now held before the runtime call.
     let (attempted, attempt) = mpsc::sync_channel(1);
     let (back, returned) = mpsc::sync_channel(1);
@@ -238,7 +238,7 @@ fn run(call: Call) {
         attempted.try_send(()).unwrap();
         let result = match call {
             Call::Take => ResultOf::Take(owned.pool.take(&mut owned.store, Owner::Pack, true)),
-            Call::Buffer => ResultOf::Buffer(owned.pool.buffer(&mut owned.store, worker, true)),
+            Call::Buffer => ResultOf::Buffer(owned.pool.buffer(&mut owned.store, ticket, true)),
             Call::Any => ResultOf::Any(owned.pool.wait_any(&mut owned.store, std::iter::empty())),
         };
         let still_owned = owned.pool.out_for(Owner::Pack);

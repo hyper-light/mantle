@@ -1024,30 +1024,30 @@ impl Pool {
         }
     }
 
-    /// A packing buffer worker `worker` gave back: waiting for one when `wait` and its job is
-    /// still out. None once its job is back (taken with [`Self::take`]) or, without `wait`,
-    /// when none has come.
+    /// A packing buffer the job `ticket` names gave back: waiting for one when `wait`. None once
+    /// that job is back, its result held or taken, since its worker may then hold another
+    /// job's buffers; or, without `wait`, when none has come.
     pub fn buffer<F: BlockFile>(
         &mut self,
         store: &mut Store<F>,
-        worker: usize,
+        ticket: Ticket,
         wait: bool,
     ) -> Result<Option<Vec<u8>>, Error> {
         blocking_wait_allowed(wait)?;
         loop {
             let w = self
                 .workers
-                .get_mut(worker)
+                .get_mut(ticket.worker)
                 .and_then(Option::as_mut)
                 .ok_or(gone("take a packing buffer"))?;
+            if w.owner.is_none() || w.job != ticket.job {
+                return Ok(None);
+            }
             if let Some(b) = w.spent.pop() {
                 return Ok(Some(b));
             }
-            let out = w.owner.is_some();
-            if !self.next(store, wait && out)? {
-                if out {
-                    self.waiting = true;
-                }
+            if !self.next(store, wait)? {
+                self.waiting = true;
                 return Ok(None);
             }
         }

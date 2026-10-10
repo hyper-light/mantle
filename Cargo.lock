@@ -503,6 +503,7 @@ dependencies = [
  "hyper-measure",
  "hyper-rt",
  "mantle-crc",
+ "mantle-disk",
  "proptest",
  "rustix",
  "tempfile",

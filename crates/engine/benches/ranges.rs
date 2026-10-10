@@ -35,12 +35,18 @@ mod rocks_workload;
 #[path = "support/benchmark_recovery.rs"]
 mod benchmark_recovery;
 
+#[path = "support/present.rs"]
+mod present;
+
+use present::Present;
+
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::issuer::Issuer;
 use hyper_measure::{alloc, faults, usage};
 use hyper_rt::machine::calibration::{Calibration, Policy};
 use hyper_rt::{Runtime, RuntimeConfig};
+use mantle_disk::histogram::Histogram;
 use mantle_engine::ranges::{RangeStats, Ranges, RangesConfig};
 use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::ShardDb;
@@ -122,16 +128,14 @@ struct Phase {
     ops: u64,
     found: u64,
     rows: u64,
-    lat: Vec<u64>,
+    lat: Histogram,
 }
 
 impl Phase {
     fn report(&mut self, from: &Mark, to: &Mark) {
         let seconds = to.at.duration_since(from.at).as_secs_f64();
-        self.lat.sort_unstable();
-        let at = |q: f64| {
-            self.lat[((self.lat.len() as f64 * q) as usize).min(self.lat.len() - 1)] as f64 / 1000.0
-        };
+        // A log-linear histogram's bucket bounds: never below the latency, at most 2^-5 above it.
+        let at = |ppm: u32| self.lat.quantile(ppm) as f64 / 1000.0;
         println!(
             "{} {} {:.0} {:.3}",
             self.name,
@@ -144,11 +148,11 @@ impl Phase {
             self.name,
             self.found,
             self.rows,
-            at(0.50),
-            at(0.99),
-            at(0.999),
-            at(0.9999),
-            at(1.0)
+            at(500_000),
+            at(990_000),
+            at(999_000),
+            at(999_900),
+            self.lat.max() as f64 / 1000.0
         );
         costs(self.name, self.ops, from, to);
     }
@@ -165,8 +169,7 @@ struct Workload {
     num: u64,
     threads: u64,
     seed: u64,
-    present: Vec<bool>,
-    ordered: Vec<u64>,
+    present: Present,
 }
 
 impl Workload {
@@ -190,10 +193,11 @@ impl Workload {
                     scope.spawn(move || {
                         let mut client = ranges.client()?;
                         let mut rng = self.rng(phase, thread);
-                        let mut lat = Vec::with_capacity(n as usize);
+                        let mut lat = Histogram::new();
                         let mut value = Vec::new();
                         let mut page = Rows::new();
                         let mut next = Vec::new();
+                        let mut expected = Vec::new();
                         let mut found = 0;
                         let mut rows = 0;
                         for _ in 0..n {
@@ -213,12 +217,12 @@ impl Workload {
                                     false
                                 }
                             };
-                            lat.push(began.elapsed().as_nanos() as u64);
+                            lat.record(began.elapsed().as_nanos() as u64);
                             let hit = match work {
                                 Work::Fill => hit,
                                 Work::Get => {
                                     require(
-                                        hit == self.present[start as usize],
+                                        hit == self.present.holds(start),
                                         "found flag differs from the fill oracle",
                                     )?;
                                     if hit {
@@ -230,14 +234,12 @@ impl Workload {
                                     hit
                                 }
                                 Work::Seek(limit) => {
-                                    let at = self.ordered.partition_point(|&key| key < start);
-                                    let expected = &self.ordered
-                                        [at..at.saturating_add(limit).min(self.ordered.len())];
+                                    self.present.after(start, limit, &mut expected);
                                     require(
                                         page.len() == expected.len(),
                                         "scan row count differs from the fill oracle",
                                     )?;
-                                    for ((key, value), &number) in page.iter().zip(expected) {
+                                    for ((key, value), &number) in page.iter().zip(&expected) {
                                         require(
                                             key == rocks_workload::key(number),
                                             "scan key differs from the fill oracle",
@@ -250,7 +252,7 @@ impl Workload {
                                     rows += page.len() as u64;
                                     let hit = page.get(0).is_some_and(|(first, _)| first == key);
                                     require(
-                                        hit == self.present[start as usize],
+                                        hit == self.present.holds(start),
                                         "found flag differs from the fill oracle",
                                     )?;
                                     hit
@@ -262,14 +264,14 @@ impl Workload {
                     })
                 })
                 .collect();
-            let mut all = Vec::with_capacity((self.threads * n) as usize);
+            let mut all = Histogram::new();
             let mut found = 0;
             let mut rows = 0;
             for handle in handles {
                 let (lat, hits, scanned) = handle
                     .join()
                     .map_err(|_| io::Error::other("a benchmark client thread panicked"))??;
-                all.extend(lat);
+                all.merge(&lat);
                 found += hits;
                 rows += scanned;
             }
@@ -290,13 +292,16 @@ impl Workload {
             Work::Get => ("readrandom", 2),
             Work::Seek(_) => ("seekrandom", 3),
         };
+        // Its start and end as they happen, so a profiler can sample this phase alone.
+        println!("phase {name} start");
         let thread = 0;
         let mut client = ranges.client()?;
         let mut rng = self.rng(phase, thread);
-        let mut lat = Vec::with_capacity(n as usize);
+        let mut lat = Histogram::new();
         let mut value = Vec::new();
         let mut page = Rows::new();
         let mut next = Vec::new();
+        let mut expected = Vec::new();
         let mut found = 0;
         let mut rows = 0;
         for _ in 0..n {
@@ -318,12 +323,12 @@ impl Workload {
                     false
                 }
             };
-            lat.push(began.elapsed().as_nanos() as u64);
+            lat.record(began.elapsed().as_nanos() as u64);
             let hit = match work {
                 Work::Fill => hit,
                 Work::Get => {
                     require(
-                        hit == self.present[start as usize],
+                        hit == self.present.holds(start),
                         "found flag differs from the fill oracle",
                     )?;
                     if hit {
@@ -335,14 +340,12 @@ impl Workload {
                     hit
                 }
                 Work::Seek(limit) => {
-                    let at = self.ordered.partition_point(|&key| key < start);
-                    let expected =
-                        &self.ordered[at..at.saturating_add(limit).min(self.ordered.len())];
+                    self.present.after(start, limit, &mut expected);
                     require(
                         page.len() == expected.len(),
                         "scan row count differs from the fill oracle",
                     )?;
-                    for ((key, value), &number) in page.iter().zip(expected) {
+                    for ((key, value), &number) in page.iter().zip(&expected) {
                         require(
                             key == rocks_workload::key(number),
                             "scan key differs from the fill oracle",
@@ -352,7 +355,7 @@ impl Workload {
                     rows += page.len() as u64;
                     let hit = page.get(0).is_some_and(|(first, _)| first == key);
                     require(
-                        hit == self.present[start as usize],
+                        hit == self.present.holds(start),
                         "found flag differs from the fill oracle",
                     )?;
                     hit
@@ -360,9 +363,10 @@ impl Workload {
             };
             found += u64::from(hit);
         }
-        // Match the threaded driver's joined latency-vector aggregation and its paid copy.
-        let mut all = Vec::with_capacity(n as usize);
-        all.extend(lat);
+        println!("phase {name} end");
+        // Match the threaded driver's joined histogram aggregation.
+        let mut all = Histogram::new();
+        all.merge(&lat);
         Ok(Phase {
             name,
             ops: n,
@@ -555,7 +559,6 @@ fn main() -> Result<(), BenchError> {
         "positive num/threads/seek_nexts and threads <= num required",
     )?;
     let thread_count = u16::try_from(threads)?;
-    let num_keys = usize::try_from(num)?;
     let overflow = || {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -591,22 +594,15 @@ fn main() -> Result<(), BenchError> {
         num,
         threads,
         seed,
-        present: vec![false; num_keys],
-        ordered: Vec::new(),
+        present: Present::new(num)?,
     };
     // Exact oracle and its storage are setup work, outside measured operations.
     for thread in 0..threads {
         let mut rng = workload.rng(1, thread);
         for _ in 0..num {
-            workload.present[(rng.next() % num) as usize] = true;
+            workload.present.insert(rng.next() % num);
         }
     }
-    workload.ordered = workload
-        .present
-        .iter()
-        .enumerate()
-        .filter_map(|(key, &present)| present.then_some(key as u64))
-        .collect();
     require(
         threads == 1,
         "matched shard-client harness requires one client/range/shard",
@@ -627,7 +623,7 @@ fn main() -> Result<(), BenchError> {
     );
     println!(
         "workload generator rocksdb-mt19937_64 seed {seed} key_padding ascii-0 values repeated-v num {num} client_threads {threads} ranges {threads} shards {threads} reads_per_thread {reads} seeks_per_thread {seeks} seek_nexts {seek_nexts} issuer_depth {issuer_depth} runs_in_flight_per_range {issuer_depth} cache_mib {cache_mib} write_budget_mib {write_budget_mib} oracle_keys {} throughput full-oracle latency api-only barriers flush+durable-checkpoint optional-accelerators-not-fully-drained",
-        workload.ordered.len()
+        workload.present.len()
     );
     println!(
         "runtime shards {} step_budget_ns {} spin_ns {} batch {}",
@@ -836,7 +832,7 @@ fn main() -> Result<(), BenchError> {
             },
         )?;
         require(applied == threads * num, "recovered applied index differs")?;
-        benchmark_recovery::verify(&mut db, &workload.ordered, &VALUE, seek_nexts)?;
+        benchmark_recovery::verify(&mut db, &workload.present, &VALUE, seek_nexts)?;
         match db.into_file() {
             IntoFile::Finished { file, result } => {
                 result?;
@@ -876,7 +872,7 @@ fn main() -> Result<(), BenchError> {
     );
     println!(
         "recovery verified_live_keys {} all_values_exact true required_crc_reads true applied {}",
-        workload.ordered.len(),
+        workload.present.len(),
         threads * num
     );
     stats("postfill", &fill_stats);

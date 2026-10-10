@@ -34,6 +34,8 @@ zstd.workspace = true
 tempfile.workspace = true
 # Allocation and page-fault counts of the benchmarks against RocksDB.
 hyper-measure = { path = "../../vendor/hyper-measure" }
+# The benchmarks' fixed-size latency histograms (bounded at any operation count).
+mantle-disk = { path = "../disk" }
 
 [[bench]]
 name = "memtable"

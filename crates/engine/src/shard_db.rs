@@ -270,6 +270,14 @@ fn feed_one<F: BlockFile>(
     Ok(w.saturating_sub(budget))
 }
 
+/// The batches a device's issuer is started for (`Issuer::start_for`) to hold a shard that
+/// keeps `shard_batches` out and its maintenance workers, each with at most `FEED_BUFFERS` out
+/// (`ShardDb::attach`), up to the cores they may use: within it a submission never waits for
+/// the issuer's inbox.
+pub fn issuer_batches(shard_batches: usize) -> usize {
+    shard_batches.saturating_add(Pool::cores().saturating_mul(FEED_BUFFERS))
+}
+
 /// A shard's engine over a store.
 #[derive(Debug)]
 pub struct ShardDb<F: BlockFile> {
@@ -295,6 +303,9 @@ pub struct ShardDb<F: BlockFile> {
     /// Work owed but not yet whole, in work·bytes over the room: the remainder of each debt's
     /// share.
     pack_carry: u128,
+    /// The device's issuer for the maintenance workers' stores and the batches each may have
+    /// out, once the shard is attached ([`Self::attach`]).
+    worker_attach: Option<(hyper_block::issuer::Attacher, usize)>,
     trunk_carry: u128,
     /// The active memtable's order debt's carry ([`share`]).
     /// Entries the active memtable leaves unsorted at most before it sorts them
@@ -588,6 +599,7 @@ impl<F: BlockFile> ShardDb<F> {
             mem_limit,
             trunk,
             pack_carry: 0,
+            worker_attach: None,
             trunk_carry: 0,
             order_bound: ORDER_BOUND,
             tidy_rent_ns: 0,
@@ -759,7 +771,11 @@ impl<F: BlockFile> ShardDb<F> {
                     detail: e.to_string(),
                 })
         });
-        self.trunk.set_pool(Pool::new(spawn, Pool::cores())?);
+        let mut pool = Pool::new(spawn, Pool::cores())?;
+        if let Some((attacher, batches)) = &self.worker_attach {
+            pool.set_attach(attacher.clone(), *batches);
+        }
+        self.trunk.set_pool(pool);
         Ok(())
     }
 
@@ -1091,7 +1107,17 @@ impl<F: BlockFile> ShardDb<F> {
     where
         F: 'static,
     {
-        self.store.attach(issuer, batches)
+        self.store.attach(issuer, batches)?;
+        // The maintenance workers' stores attach too, each on its own thread: two batches out
+        // each at most, as their feed's buffers are two (`FEED_BUFFERS`), the least that lets a
+        // worker build while its last run is written, and no more than the device's depth.
+        // An issuer's depth is one at least (`Issuer::start_for`), so a worker has a batch.
+        let worker = (issuer.attacher(), issuer.depth().min(FEED_BUFFERS));
+        if let Some(pool) = self.trunk.pool_mut() {
+            pool.set_attach(worker.0.clone(), worker.1);
+        }
+        self.worker_attach = Some(worker);
+        Ok(())
     }
 
     /// Waits for every write handed to the device's issuer to land (`Store::drain`).

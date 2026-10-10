@@ -25,6 +25,7 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+use hyper_block::issuer::Attacher;
 use hyper_rt::sync::{ChannelReceiver, Sender};
 
 use crate::branch::filter::Keys;
@@ -199,6 +200,9 @@ pub struct Seat {
     jobs: Receiver<Box<Job>>,
     more: Receiver<Result<Vec<u64>, Error>>,
     back: Sender<Message>,
+    /// The device's issuer and the batches the worker may have out on it, when the shard has
+    /// one: its store's writes then go to the device while the worker builds on.
+    attach: Option<(Attacher, usize)>,
 }
 
 /// Starts a worker's thread on its seat: the shard's way to open its own file again.
@@ -206,14 +210,21 @@ pub type Spawn = Box<dyn FnMut(Seat) -> Result<JoinHandle<()>, Error> + Send>;
 
 /// A worker's loop: each job run on one store, kept across jobs so its buffers stay warm, until
 /// the shard drops its end of the job channel.
-pub fn serve<F: BlockFile>(file: F, config: Config, seat: Seat) {
+pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
     let Seat {
         id,
         jobs,
         more,
         back,
+        attach,
     } = seat;
-    let mut store = match Store::worker(file, config) {
+    let worker = Store::worker(file, config).and_then(|mut store| {
+        if let Some((attacher, batches)) = &attach {
+            store.attach_through(attacher, *batches)?;
+        }
+        Ok(store)
+    });
+    let mut store = match worker {
         Ok(s) => s,
         Err(error) => {
             drop(back.blocking_send(Message::Done {
@@ -344,6 +355,9 @@ pub struct Pool {
     busy_ns: u64,
     waited_ns: u64,
     since: Option<Instant>,
+    /// The device's issuer for the workers started from now on, and the batches each may have
+    /// out ([`Self::set_attach`]).
+    attach: Option<(Attacher, usize)>,
 }
 
 impl std::fmt::Debug for Pool {
@@ -379,7 +393,14 @@ impl Pool {
             busy_ns: 0,
             waited_ns: 0,
             since: None,
+            attach: None,
         })
+    }
+
+    /// Workers started from now on attach their stores to the device's issuer through
+    /// `attacher`, each with up to `batches` out (`ShardDb::attach`).
+    pub fn set_attach(&mut self, attacher: Attacher, batches: usize) {
+        self.attach = Some((attacher, batches));
     }
 
     /// The cores the OS reports less the shard's own thread, at least one.
@@ -490,6 +511,7 @@ impl Pool {
             jobs: job_rx,
             more: more_rx,
             back,
+            attach: self.attach.clone(),
         };
         let thread = (self.spawn)(seat)?;
         let w = Worker {

@@ -216,8 +216,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     db.set_cache((cache_mib << 20) / 4096);
     // The engine's own timers only when attributing: a clock read each slice costs every put.
     db.set_timed(attribute);
-    let issuer =
-        (issuer_depth > 0).then(|| Issuer::start_for(&dir, issuer_depth, batches.max(1)).unwrap());
+    let issuer = (issuer_depth > 0).then(|| {
+        Issuer::start_for(
+            &dir,
+            issuer_depth,
+            mantle_engine::shard_db::issuer_batches(batches.max(1)),
+        )
+        .unwrap()
+    });
     if let Some(issuer) = &issuer {
         db.attach(issuer, batches.max(1)).unwrap();
     }

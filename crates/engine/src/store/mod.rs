@@ -27,7 +27,7 @@ use crate::fst::trie::TrieBuilder;
 use alloc::Allocator;
 use hyper_block::block::BlockFile;
 use hyper_block::buf::AlignedBuf;
-use hyper_block::issuer::{Answer, Attached, Issuer, Transfers};
+use hyper_block::issuer::{Answer, Attached, Attacher, Issuer, Transfers};
 use page::{HEADER, Kind};
 use std::collections::VecDeque;
 use superblock::Superblock;
@@ -1626,8 +1626,17 @@ impl<F: BlockFile> Store<F> {
     where
         F: 'static,
     {
+        self.attach_through(&issuer.attacher(), batches)
+    }
+
+    /// [`Self::attach`] through an owned way to the issuer: a maintenance worker's store, on
+    /// the worker's own thread, which cannot borrow the issuer its shard was given.
+    pub fn attach_through(&mut self, attacher: &Attacher, batches: usize) -> Result<(), Error>
+    where
+        F: 'static,
+    {
         self.drain()?;
-        let attached = issuer
+        let attached = attacher
             .attach_deep(&self.file, batches)
             .map_err(|e| io("attach a store to its device's issuer", e))?;
         self.writer = Some(Writer {

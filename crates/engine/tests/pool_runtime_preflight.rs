@@ -225,7 +225,7 @@ fn run(call: Call) {
         file_end: store.end(),
         generation: store.generation(),
     });
-    let worker = pool.send(job, Owner::Pack, true).unwrap().unwrap();
+    let worker = pool.send(job, Owner::Pack, true).unwrap().unwrap().worker;
     held.recv().unwrap(); // An actual worker write is now held before the runtime call.
     let (attempted, attempt) = mpsc::sync_channel(1);
     let (back, returned) = mpsc::sync_channel(1);

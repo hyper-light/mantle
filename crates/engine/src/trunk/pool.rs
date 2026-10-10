@@ -4,11 +4,13 @@
 //! (`max_background_jobs`; SILK, Balmau et al., USENIX ATC 2019, schedules them so). A job is a
 //! compaction's inputs and range, or a full memtable's entries to pack; a worker runs it on its
 //! own store over its own handle on the shard's file ([`Store::worker`]), writing into extents the
-//! shard granted it, and hands back the branches made. Nothing is shared between threads: the
-//! shard keeps its memtables and trunk, a job owns its inputs' descriptors, and a packing's
-//! entries reach the worker as buffers moved through a channel and moved back for reuse. The
-//! trunk and the memtables change only on the shard's thread, when a result is taken, so a read
-//! between never sees one half changed.
+//! shard granted it, and hands back the branches made, named by the ticket the job's send
+//! returned ([`Ticket`]): a worker freed while its result waits for its owner can take that
+//! owner's next job, so the worker alone does not say which job a result answers. Nothing is
+//! shared between threads: the shard keeps its memtables and trunk, a job owns its inputs'
+//! descriptors, and a packing's entries reach the worker as buffers moved through a channel and
+//! moved back for reuse. The trunk and the memtables change only on the shard's thread, when a
+//! result is taken, so a read between never sees one half changed.
 //!
 //! How many workers: Little's law, L = λW (Little, Operations Research 9(3), 1961). Between one
 //! cascade's start and the next, the shard's thread offers maintenance its memtables at the pace
@@ -163,12 +165,23 @@ pub enum Owner {
     Pack,
 }
 
-/// A job back from worker `worker`: its result; the extents granted it beyond its job's grant
-/// (its top-ups), which are the owner's to release if it failed; and the packing buffers the
-/// job gave back, the job's own, since the worker sends every one before its result.
+/// A job handed to a worker: the worker, whose buffers a packing's feed takes back, and the
+/// job's number among every job the pool has handed out. A worker freed while its result waits
+/// for its owner can take that owner's next job, so only the number tells two of an owner's jobs
+/// apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ticket {
+    pub worker: usize,
+    pub job: u64,
+}
+
+/// A job back, as the ticket its send returned names it: its result; the extents granted it
+/// beyond its job's grant (its top-ups), which are the owner's to release if it failed; and the
+/// packing buffers the job gave back, the job's own, since the worker sends every one before
+/// its result.
 #[derive(Debug)]
 pub struct Back {
-    pub worker: usize,
+    pub ticket: Ticket,
     pub result: Result<Output, Error>,
     /// An issued-write failure or worker unwind remains visible when input was abandoned.
     pub physical_error: Option<Error>,
@@ -428,13 +441,14 @@ fn gone(what: &'static str) -> Error {
 }
 
 /// A worker as the shard holds it: its channels' sending ends, its thread, whose job is out on
-/// it, and the extents topped up to that job.
+/// it and that job's number, and the extents topped up to that job.
 #[derive(Debug)]
 struct Worker {
     jobs: Option<SyncSender<Box<Job>>>,
     more: Option<SyncSender<Result<Vec<u64>, Error>>>,
     thread: Option<JoinHandle<()>>,
     owner: Option<Owner>,
+    job: u64,
     topped: Vec<u64>,
     /// Packing buffers it gave back, not yet taken: at most [`FEED_BUFFERS`].
     spent: Vec<Vec<u8>>,
@@ -449,8 +463,12 @@ pub struct Pool {
     /// its workers' messages; plain threads send and take on it as on a std channel.
     back: Option<Sender<Message>>,
     messages: ChannelReceiver<Message>,
-    /// Jobs back for an owner other than the one taking: at most a job a worker.
+    /// Jobs back for an owner other than the one taking: at most every job the owners have out
+    /// (one node's compactions, the memtables' packings), since a worker freed here can take its
+    /// next job before its owner takes this one.
     undelivered: VecDeque<(Owner, Back)>,
+    /// Jobs handed to workers since the pool began: the next one's number ([`Ticket`]).
+    handed: u64,
     /// The cores the OS reports less the shard's own: the most workers.
     most: usize,
     /// The workers Little's law measured the need for.
@@ -522,6 +540,7 @@ impl Pool {
             back: Some(back),
             messages,
             undelivered: VecDeque::new(),
+            handed: 0,
             most,
             want: 1,
             busy_ns: 0,
@@ -862,14 +881,15 @@ impl Pool {
     }
 
     /// Hands `job` to a free worker for `owner`, starting one if none is free within the bound
-    /// [`Self::can_take`] states for `waiting`: the worker's number, or the job back when every
-    /// worker is busy. Every hard refusal returns its owned job too, before any grant is lost.
+    /// [`Self::can_take`] states for `waiting`: the job's ticket, which its result carries back,
+    /// or the job back when every worker is busy. Every hard refusal returns its owned job too,
+    /// before any grant is lost.
     pub fn send(
         &mut self,
         job: Box<Job>,
         owner: Owner,
         waiting: bool,
-    ) -> Result<Result<usize, Box<Job>>, (Error, Box<Job>)> {
+    ) -> Result<Result<Ticket, Box<Job>>, (Error, Box<Job>)> {
         if hyper_rt::registry::current_shard().is_some() && !self.prepared() {
             return Err((
                 Error::InvalidArgument {
@@ -881,6 +901,14 @@ impl Pool {
         if self.closing {
             return Err((gone("hand a closing worker its job"), job));
         }
+        let Some(next) = self.handed.checked_add(1) else {
+            return Err((
+                Error::InvalidArgument {
+                    what: "a maintenance job past the pool's job numbers",
+                },
+                job,
+            ));
+        };
         let bound = if waiting { self.most } else { self.want };
         if self
             .workers
@@ -918,9 +946,15 @@ impl Pool {
             }
         }
         w.owner = Some(owner);
+        w.job = self.handed;
         w.topped.clear();
         w.spent.clear();
-        Ok(Ok(at))
+        let ticket = Ticket {
+            worker: at,
+            job: self.handed,
+        };
+        self.handed = next;
+        Ok(Ok(ticket))
     }
 
     fn start(&mut self, prepare: bool) -> Result<usize, Error> {
@@ -952,6 +986,7 @@ impl Pool {
             more: Some(more),
             thread: Some(thread),
             owner: None,
+            job: 0,
             topped: Vec::new(),
             spent: Vec::new(),
         };
@@ -1128,6 +1163,7 @@ impl Pool {
                 let of = w.owner.take().ok_or(Error::InvalidArgument {
                     what: "a maintenance worker's result for no job",
                 })?;
+                let ticket = Ticket { worker, job: w.job };
                 let topped = std::mem::take(&mut w.topped);
                 // The job's buffers, all back before its result on this channel: taken with it
                 // now, before the worker can start another job whose buffers would mix in.
@@ -1138,7 +1174,7 @@ impl Pool {
                 self.undelivered.push_back((
                     of,
                     Back {
-                        worker,
+                        ticket,
                         result,
                         physical_error,
                         topped,

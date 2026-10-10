@@ -28,7 +28,7 @@ use crate::memtable::hashed::{HashMem, Walk};
 use crate::rows::Rows;
 use crate::scan::{BorrowedScanMerge, ScanMerge};
 use crate::store::{Config, IntoFile, Store};
-use crate::trunk::pool::{self, Back, FEED_BUFFERS, Job, Owner, Pool, Spawn, Stream, Work};
+use crate::trunk::pool::{self, Back, FEED_BUFFERS, Job, Owner, Pool, Spawn, Stream, Ticket, Work};
 use crate::trunk::{Source, Trunk, TrunkConfig};
 use crate::util::reuse;
 use hyper_block::block::BlockFile;
@@ -157,12 +157,13 @@ struct Packing {
     since: std::time::Instant,
 }
 
-/// A packing fed to worker `worker`: the channel its full buffers go out on, closed once every
-/// entry is sent; the buffers the shard holds, the one it fills and those spare (the worker
-/// gives the others back through the pool, [`Pool::buffer`]); and the extents granted the job.
+/// A packing fed to the worker its ticket names: the channel its full buffers go out on, closed
+/// once every entry is sent; the buffers the shard holds, the one it fills and those spare (the
+/// worker gives the others back through the pool, [`Pool::buffer`]); and the extents granted
+/// the job.
 #[derive(Debug)]
 struct Feed {
-    worker: usize,
+    ticket: Ticket,
     full: Option<SyncSender<Vec<u8>>>,
     filling: Option<Vec<u8>>,
     spare: Vec<Vec<u8>>,
@@ -171,13 +172,13 @@ struct Feed {
 
 /// A full memtable handed to its packing worker, its entries fed to it by later puts: still
 /// read until the worker's branch is back and every older memtable's branch has gone to the trunk before it,
-/// since pending branches are read newest first. Its worker, the extents granted the job, the
-/// worker's result once back, when it began packing, and its first failure. A failed input
+/// since pending branches are read newest first. Its job's ticket, the extents granted the job,
+/// the worker's result once back, when it began packing, and its first failure. A failed input
 /// stays readable and never retires past its older predecessors ([`ShardDb::retire`]).
 #[derive(Debug)]
 struct Frozen {
     mem: HashMem,
-    worker: usize,
+    ticket: Ticket,
     grant: Vec<u64>,
     back: Option<Back>,
     since: std::time::Instant,
@@ -236,7 +237,7 @@ fn feed_one<F: BlockFile>(
         if f.filling.is_none() {
             f.filling = match f.spare.pop() {
                 Some(b) => Some(b),
-                None => pool.buffer(store, f.worker, false)?,
+                None => pool.buffer(store, f.ticket.worker, false)?,
             };
         }
         let Some(buf) = f.filling.as_mut() else {
@@ -2559,11 +2560,11 @@ impl<F: BlockFile> ShardDb<F> {
                 }
             };
             match sent {
-                Ok(worker) => {
+                Ok(ticket) => {
                     let mut spare = std::mem::take(&mut self.feed_buffers);
                     spare.resize_with(FEED_BUFFERS, Vec::new);
                     p.feed = Some(Feed {
-                        worker,
+                        ticket,
                         full: Some(full),
                         filling: spare.pop(),
                         spare,
@@ -2628,12 +2629,12 @@ impl<F: BlockFile> ShardDb<F> {
                 }
                 let open = frozen
                     .iter()
-                    .filter_map(|f| f.feed.as_ref().map(|feed| feed.worker))
+                    .filter_map(|f| f.feed.as_ref().map(|feed| feed.ticket.worker))
                     .chain(
                         packing
                             .as_ref()
                             .filter(|_| packing_too)
-                            .and_then(|p| p.feed.as_ref().map(|feed| feed.worker)),
+                            .and_then(|p| p.feed.as_ref().map(|feed| feed.ticket.worker)),
                     );
                 if !pool.wait_any(store, open)? {
                     return Ok(fed);
@@ -2724,7 +2725,7 @@ impl<F: BlockFile> ShardDb<F> {
         let Some(mut f) = feed else {
             return;
         };
-        let worker = f.worker;
+        let ticket = f.ticket;
         let grant = std::mem::take(&mut f.grant);
         let (walk, feed) = if f.full.is_none() {
             f.spare.extend(f.filling.take());
@@ -2736,7 +2737,7 @@ impl<F: BlockFile> ShardDb<F> {
         };
         self.frozen.push_back(Frozen {
             mem,
-            worker,
+            ticket,
             grant,
             back: None,
             since,
@@ -2794,11 +2795,7 @@ impl<F: BlockFile> ShardDb<F> {
                 return Ok(());
             };
             wait = false;
-            match self
-                .frozen
-                .iter_mut()
-                .find(|f| f.worker == back.worker && f.back.is_none())
-            {
+            match self.frozen.iter_mut().find(|f| f.ticket == back.ticket) {
                 Some(f) => {
                     // A worker ends before its feed does only by a failure: the feed closes.
                     f.back = Some(back);
@@ -2812,7 +2809,7 @@ impl<F: BlockFile> ShardDb<F> {
                         .packing
                         .as_ref()
                         .and_then(|p| p.feed.as_ref())
-                        .is_some_and(|f| f.worker == back.worker);
+                        .is_some_and(|f| f.ticket == back.ticket);
                     if !feeding {
                         return Err(Error::InvalidArgument {
                             what: "a packed branch for no packing memtable",
@@ -4113,7 +4110,7 @@ mod frozen_tests {
                     FEED_BUFFERS,
                     "a buffer reached the worker before its stall was armed"
                 );
-                break f.worker;
+                break f.ticket.worker;
             }
             assert_eq!(
                 db.flush_stats.rotations, rotations,
@@ -4132,7 +4129,7 @@ mod frozen_tests {
         assert!(
             db.frozen
                 .front()
-                .is_some_and(|f| f.worker == worker && !f.ready()),
+                .is_some_and(|f| f.ticket.worker == worker && !f.ready()),
             "the stalled packing is the oldest frozen"
         );
         worker

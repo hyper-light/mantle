@@ -23,7 +23,7 @@ use mantle_engine::ranges::{Ranges, RangesConfig};
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::{Config, Store};
 use mantle_engine::trunk::TrunkConfig;
-use mantle_engine::trunk::pool::{self, Job, Owner, Pool, Spawn, Stream, Work};
+use mantle_engine::trunk::pool::{self, Job, Owner, Pool, Spawn, Stream, Ticket, Work};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -159,7 +159,7 @@ fn runtime() -> LocalRuntime {
 
 const KEY: &[u8] = b"post-poll-public-owner";
 const VALUE: &[u8] = b"returned input and exact public value";
-type Sent = Result<Result<usize, Box<Job>>, (Error, Box<Job>)>;
+type Sent = Result<Result<Ticket, Box<Job>>, (Error, Box<Job>)>;
 
 struct PoolOnDrop {
     pool: Option<Pool>,

@@ -34,7 +34,7 @@ use crate::error::{Error, Malformed};
 use crate::remix::{Build, Rebuild, View};
 use crate::store::{Run, Store};
 use hyper_block::block::BlockFile;
-use pool::{Output, Owner, Pool, Task, Work};
+use pool::{Output, Owner, Pool, Task, Ticket, Work};
 
 pub mod pool;
 
@@ -707,8 +707,9 @@ struct Remote {
 enum State {
     /// Waiting for its inputs to land and a worker to be free.
     Ready(Box<Task>),
-    /// On worker `0`.
-    Out(usize),
+    /// Out on a worker, as the ticket its send returned names it: a worker freed while its
+    /// result waits for the cascade can take the cascade's next job too.
+    Out(Ticket),
     Done(Output),
     /// Back from a cascade abandoned for a job's failure, its output dropped; or, for a moment,
     /// handed from ready to out.
@@ -3427,7 +3428,7 @@ impl Trunk {
             taken = taken.saturating_add(1);
             let r = jobs
                 .iter_mut()
-                .find(|r| matches!(r.state, State::Out(w) if w == back.worker))
+                .find(|r| matches!(r.state, State::Out(t) if t == back.ticket))
                 .ok_or(Error::InvalidArgument {
                     what: "a maintenance worker's result for no job of its",
                 });
@@ -3523,7 +3524,7 @@ impl Trunk {
                 }
             };
             match sent {
-                Ok(worker) => r.state = State::Out(worker),
+                Ok(ticket) => r.state = State::Out(ticket),
                 Err(job) => {
                     let Work::Compact(task) = job.work else {
                         return Err(corrupt());
@@ -3552,7 +3553,7 @@ impl Trunk {
                 return Ok(false);
             };
             for r in jobs.iter_mut() {
-                if matches!(r.state, State::Out(w) if w == back.worker) {
+                if matches!(r.state, State::Out(t) if t == back.ticket) {
                     r.grant.extend_from_slice(&back.topped);
                     r.state = State::Dropped;
                 }

@@ -210,7 +210,28 @@ fn batches_spanning_many_regions_start_no_threads() {
         assert_eq!(v.read(&key(k), 0, CHUNK as u64).unwrap(), data(k, CHUNK));
     }
     v.close();
-    assert_eq!(hyper_block::threads::count().unwrap(), idle - 2);
+    // close joins the writer and the cleaner, but the OS drops a joined thread from its count
+    // only once it releases it, a moment after the join returns: Linux wakes the join from
+    // exit_mm (mm_release clears the child's tid) and lowers nr_threads in release_task, later
+    // in do_exit. Right after a join, 19% of counts on two busy CPUs still held the joined
+    // thread (benchmark-results/thread-join-count-20261011). So the test waits for the release,
+    // the fact it needs. Close starts nothing and nothing else ends, so the count only falls,
+    // and never below the two.
+    let mut last = idle;
+    loop {
+        let now = hyper_block::threads::count().unwrap();
+        assert!(now <= last, "{now} threads after close, {last} before");
+        assert!(
+            now >= idle - 2,
+            "{now} threads after close, {} once its two are released",
+            idle - 2
+        );
+        if now == idle - 2 {
+            break;
+        }
+        last = now;
+        std::thread::yield_now();
+    }
 }
 
 /// A batch whose third write fails, a region of a batch spanning many: the batch's puts are

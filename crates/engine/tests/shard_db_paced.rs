@@ -25,7 +25,7 @@ use hyper_block::issuer::Issuer;
 use hyper_block::sim::SimFile;
 use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::ShardDb;
-use mantle_engine::store::Config;
+use mantle_engine::store::{Config, MIN_PAGE};
 use mantle_engine::trunk::{Consolidation, TrunkConfig, ViewChoice};
 use std::collections::BTreeMap;
 
@@ -320,11 +320,24 @@ fn memory_moving_between_regions_never_holds_more_than_the_budget() {
     // cache's and record cache's memory with their indexes' charge and write memory's share is
     // within the budget whenever no region is still giving memory back; while one is, it never
     // rises past where it stood when that began; giving back ends within the cycle it was
-    // scheduled for; and the regions really moved.
-    let align = Alignment::new(4096).unwrap();
-    let file = SimFile::new(align, Alignment::new(512).unwrap(), 41).unwrap();
-    let mut db = ShardDb::create(file, STORE, MEM, TRUNK).unwrap();
-    let budget = 96 * 4096;
+    // scheduled for; and the regions really moved. On the host's own file, aligned and paged
+    // as its device asks, so the tuner prices each region by reads it really makes.
+    let dir = tempfile::tempdir().unwrap();
+    let id = mantle_disk::probe::identify(dir.path());
+    let align = [id.logical_block, id.physical_block]
+        .into_iter()
+        .flatten()
+        .filter_map(|b| usize::try_from(b).ok())
+        .filter_map(|b| Alignment::new(b).ok())
+        .fold(Alignment::new(MIN_PAGE).unwrap(), Alignment::max);
+    let store = Config {
+        page_size: align.get(),
+        ..STORE
+    };
+    let path = dir.path().join("store");
+    let file = DeviceFile::open(&path, true, CachingRequest::Buffered, align).unwrap();
+    let mut db = ShardDb::create(file, store, MEM, TRUNK).unwrap();
+    let budget = 96 * store.page_size;
     db.set_memory(budget).unwrap();
     let value = [5u8; 100];
     let mut out = Vec::new();

@@ -13,8 +13,8 @@
 )]
 
 mod common;
+mod live;
 
-use std::path::Path;
 use std::sync::{Condvar, Mutex};
 use std::task::Waker;
 
@@ -23,17 +23,19 @@ use common::{config, data, issuer, key, sim};
 use hyper_block::DiskError;
 use hyper_block::block::BlockFile;
 use hyper_block::buf::Alignment;
+use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::issuer::Issuer;
 use hyper_block::sim::Crash;
 use mantle_chunk::{ChunkError, Config, Limits, Volume};
 
-/// A simulated file that watches its writes: how many are in flight at once, the threads the
-/// process runs while each is, the most written between two flushes, and, when armed, fails
-/// the write that makes `fail_at` since the last flush. While held, every write waits: a test
-/// holds the device while it submits a round, so the writer's batches are made of what was
-/// queued, never of how the scheduler happened to interleave the submissions.
-struct Watch {
-    file: SimDevice,
+/// A file that watches its writes: how many are in flight at once, the threads the process
+/// runs while each is, the most written between two flushes, and, when armed, fails the write
+/// that makes `fail_at` since the last flush. While held, every write waits, as on a device
+/// busy elsewhere: a test holds the device while it submits a round, so the writer's batches
+/// are made of what was queued, never of how the scheduler happened to interleave the
+/// submissions.
+struct Watch<F = SimDevice> {
+    file: F,
     seen: Mutex<Seen>,
     held: Mutex<bool>,
     released: Condvar,
@@ -51,8 +53,8 @@ struct Seen {
     flushed_after_failure: bool,
 }
 
-impl Watch {
-    fn new(file: SimDevice) -> Handle<Self> {
+impl<F> Watch<F> {
+    fn new(file: F) -> Handle<Self> {
         Handle::new(Self {
             file,
             seen: Mutex::new(Seen::default()),
@@ -69,7 +71,7 @@ impl Watch {
     }
 }
 
-impl BlockFile for Watch {
+impl<F: BlockFile> BlockFile for Watch<F> {
     fn alignment(&self) -> Alignment {
         self.file.alignment()
     }
@@ -139,9 +141,9 @@ const SIZE: u64 = 32 << 20;
 /// Submits `n` puts from `first` at once, as many clients would, with the device held until
 /// every one is queued, and waits for every answer; a put refused when submitted answers with
 /// its refusal.
-fn put_together(
-    v: &Volume<Handle<Watch>>,
-    file: &Watch,
+fn put_together<F: BlockFile + Sync + 'static>(
+    v: &Volume<Handle<Watch<F>>>,
+    file: &Watch<F>,
     first: u64,
     n: u64,
 ) -> Vec<Result<(), ChunkError>> {
@@ -156,13 +158,16 @@ fn put_together(
         .collect()
 }
 
-/// Batches spanning many more regions than the issuer's depth run as many threads, as the OS
-/// counts them, as the volume idle: the issuer's workers carry every region, and no more of
-/// them are in flight than its depth. Run in a process of its own, so that no other test's
-/// threads are counted.
+/// A batch handing the issuer more writes than it has workers runs as many threads, as the OS
+/// counts them, as the volume idle: the issuer's workers carry every write, and no more of
+/// them are in flight than its depth. On the host's own device, its issuer as deep as measured
+/// there (`live::Device`), and in a process of its own, so that no other test's threads are
+/// counted.
 #[test]
 fn batches_spanning_many_regions_start_no_threads() {
     const ALONE: &str = "MANTLE_TEST_THREADS_ALONE";
+    let dir = tempfile::tempdir().unwrap();
+    let device = live::Device::of(dir.path());
     if std::env::var_os(ALONE).is_none() {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
@@ -172,20 +177,37 @@ fn batches_spanning_many_regions_start_no_threads() {
                 "--nocapture",
             ])
             .env(ALONE, "1")
+            .env(live::DEVICE_ENV, device.handed())
             .status()
             .unwrap();
         assert!(status.success());
         return;
     }
-    let issuer = Issuer::start(Path::new("test device"), 4).unwrap();
-    let file = Watch::new(sim(1));
-    let v = Volume::format(&issuer, file.clone(), SIZE, small_segments()).unwrap();
+    let issuer = Issuer::start(dir.path(), device.depth).unwrap();
+    // A round is twice as many puts as the issuer has workers, each in a segment of its own
+    // (`small_segments`), queued while the device is held. The writer's first batch is held in
+    // its write while the rest queue, and the second takes all of them, so a round is at most
+    // two batches, the larger of them at least half the round: a batch of `depth` puts and its
+    // frame hands the issuer more writes than it has workers, wherever the split falls, and a
+    // thread a write would start one.
+    let n = 2 * u64::try_from(issuer.depth()).unwrap();
+    let mut cfg = small_segments();
+    cfg.limits.batch_requests = usize::try_from(n).unwrap();
+    cfg.limits.batch_bytes = usize::try_from(n * cfg.segment_size).unwrap();
+    // The space the original volume left beside its data, and a segment for every put.
+    let size = SIZE + 2 * n * cfg.segment_size;
+    let path = dir.path().join("volume");
+    let raw = DeviceFile::open(&path, true, CachingRequest::PreferDirect, device.align).unwrap();
+    raw.preallocate(size).unwrap();
+    let file = Watch::new(raw);
+    let v = Volume::format(&issuer, file.clone(), size, cfg).unwrap();
     let idle = hyper_block::threads::count().unwrap();
     // The harness's thread and this test's, the writer and the cleaner, the issuer and its
     // workers.
     assert!(idle >= 4 + 1 + issuer.depth(), "{idle} threads");
-    for round in 0..3 {
-        for result in put_together(&v, &file, round * 32, 32) {
+    // A second round finds the workers the first used, and starts none either.
+    for round in 0..2 {
+        for result in put_together(&v, &file, round * n, n) {
             result.unwrap();
         }
     }
@@ -199,14 +221,15 @@ fn batches_spanning_many_regions_start_no_threads() {
         issuer.depth()
     );
     assert!(
-        seen.most_since_flush >= 4 * issuer.depth(),
-        "no batch spanned many regions: {} writes",
+        seen.most_since_flush > issuer.depth(),
+        "no batch handed the issuer more writes than its {} workers: {} at most",
+        issuer.depth(),
         seen.most_since_flush
     );
     assert!(seen.most_in_flight <= issuer.depth());
     assert_eq!(seen.most_threads, idle);
     drop(seen);
-    for k in 0..96 {
+    for k in 0..2 * n {
         assert_eq!(v.read(&key(k), 0, CHUNK as u64).unwrap(), data(k, CHUNK));
     }
     v.close();

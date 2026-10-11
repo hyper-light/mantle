@@ -2,11 +2,15 @@
 //! file, persisted with each checkpoint and read back at open, where SplinterDB invalidates its
 //! map at every checkpoint and cannot rebuild it after a crash (research/34 §0).
 //!
-//! An extent freed while the durable checkpoint may still name it must not be written over: a
-//! crash before the next checkpoint is durable recovers that checkpoint, and its pages must be
-//! intact. So an extent whose count falls to zero waits in `pending` and is reused only once a
-//! checkpoint that no longer names it is durable ([`Allocator::durable`]). Extent 0 holds the two
-//! superblock copies and is never freed.
+//! An extent freed while the durable checkpoint names it must not be written over: a crash before
+//! the next checkpoint is durable recovers that checkpoint, and its pages must be intact. So such
+//! an extent waits in `pending` and is reused only once a checkpoint that no longer names it is
+//! durable ([`Allocator::durable`]). An extent the durable checkpoint does not name, allocated
+//! since it was taken, is read by no recovery and is free again as soon as its count falls to
+//! zero: a file is then about its live extents, not everything written since the last checkpoint
+//! (a 100M-key fill checkpointed only at its end held 54-64 GB for 11.6 GB of entries,
+//! benchmark-results/mantle-pacediag-100m-20261011). Extent 0 holds the two superblock copies and
+//! is never freed.
 
 use crate::error::{Error, Malformed};
 
@@ -17,6 +21,8 @@ pub struct Allocator {
     refs: Vec<u32>,
     free: Vec<u64>,
     pending: Vec<u64>,
+    /// The extents the durable checkpoint names, a bit each: those its map counts as held.
+    named: Vec<u64>,
     limit: u64,
     /// A maintenance worker's: it holds its grant alone and never grows the file
     /// ([`Allocator::granted`]).
@@ -33,6 +39,19 @@ fn corrupt(why: Malformed) -> Error {
     }
 }
 
+/// A bit an extent, set for each `refs` counts as held.
+fn named_of(refs: &[u32]) -> Vec<u64> {
+    let mut named = vec![0u64; refs.len().div_ceil(64)];
+    for (extent, &count) in refs.iter().enumerate() {
+        if count > 0
+            && let Some(bits) = named.get_mut(extent / 64)
+        {
+            *bits |= 1u64 << (extent % 64);
+        }
+    }
+    named
+}
+
 fn index(extent: u64) -> Result<usize, Error> {
     usize::try_from(extent).map_err(|_| Error::InvalidArgument {
         what: "an extent past the address space",
@@ -46,6 +65,7 @@ impl Allocator {
             refs: vec![1],
             free: Vec::new(),
             pending: Vec::new(),
+            named: vec![1],
             limit: limit.max(1),
             granted: false,
             held: Vec::new(),
@@ -70,10 +90,13 @@ impl Allocator {
         }
         // Lowest first off the stack, so a file's low extents are reused before it grows.
         free.reverse();
+        // The checkpoint read back names exactly the extents its map holds.
+        let named = named_of(&refs);
         Ok(Self {
             refs,
             free,
             pending: Vec::new(),
+            named,
             limit,
             granted: false,
             held: Vec::new(),
@@ -89,6 +112,7 @@ impl Allocator {
             refs: Vec::new(),
             free: Vec::new(),
             pending: Vec::new(),
+            named: Vec::new(),
             limit: 0,
             granted: true,
             held: Vec::new(),
@@ -239,7 +263,8 @@ impl Allocator {
         Ok(())
     }
 
-    /// One reference fewer; at none, the extent waits for the next durable checkpoint.
+    /// One reference fewer; at none, the extent is free again at once unless the durable
+    /// checkpoint names it, and then it waits for the next durable checkpoint.
     pub fn release(&mut self, extent: u64) -> Result<(), Error> {
         if extent == 0 {
             return Err(Error::InvalidArgument {
@@ -267,9 +292,20 @@ impl Allocator {
             })?;
         *count = count.saturating_sub(1);
         if *count == 0 {
-            self.pending.push(extent);
+            if self.durably_named(extent) {
+                self.pending.push(extent);
+            } else {
+                self.free.push(extent);
+            }
         }
         Ok(())
+    }
+
+    /// Whether the durable checkpoint names `extent`.
+    fn durably_named(&self, extent: u64) -> bool {
+        let word = usize::try_from(extent / 64).ok();
+        word.and_then(|w| self.named.get(w))
+            .is_some_and(|&bits| bits & (1u64 << (extent % 64)) != 0)
     }
 
     /// Takes back an extent allocated and never named by any checkpoint, held once: free again
@@ -293,8 +329,11 @@ impl Allocator {
     }
 
     /// A checkpoint that names none of the pending extents is durable: they are free to reuse.
+    /// It was taken with every count as it is now (the store refuses releases while a checkpoint
+    /// is out), so the extents it names are those held now.
     pub fn durable(&mut self) {
         self.free.append(&mut self.pending);
+        self.named = named_of(&self.refs);
     }
 
     /// Whether `extent` is held.
@@ -319,16 +358,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_freed_extent_is_reused_only_after_a_durable_checkpoint() {
+    fn a_freed_extent_the_durable_checkpoint_names_is_reused_only_after_the_next() {
         let mut a = Allocator::new(8);
         let e = a.allocate().unwrap();
         assert_eq!(e, 1);
+        // A checkpoint taken while `e` is held is durable: it names `e`.
+        a.durable();
         a.release(e).unwrap();
         assert!(!a.is_held(e));
-        // Not yet reusable: the durable checkpoint may name it.
+        // Not yet reusable: a crash recovers that checkpoint, which reads `e`.
         assert_eq!(a.allocate().unwrap(), 2);
+        // The next checkpoint, taken with `e` free, no longer names it.
         a.durable();
         assert_eq!(a.allocate().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_freed_extent_no_durable_checkpoint_names_is_reused_at_once() {
+        let mut a = Allocator::new(8);
+        let e = a.allocate().unwrap();
+        let f = a.allocate().unwrap();
+        assert_eq!((e, f), (1, 2));
+        // Allocated since the durable checkpoint: no recovery reads them.
+        a.release(e).unwrap();
+        assert!(!a.is_held(e));
+        assert_eq!(a.allocate().unwrap(), e);
+        // Held again, then named by a durable checkpoint: its next release waits.
+        a.durable();
+        a.release(e).unwrap();
+        assert_eq!(a.allocate().unwrap(), 3);
+        a.durable();
+        assert_eq!(a.allocate().unwrap(), e);
+        // A map read back names what it holds: those wait, the rest were free from the start.
+        let mut b = Allocator::from_refs(vec![1, 1, 0], 8).unwrap();
+        b.release(1).unwrap();
+        assert_eq!(b.allocate().unwrap(), 2);
+        assert_eq!(b.allocate().unwrap(), 3);
+        b.durable();
+        assert_eq!(b.allocate().unwrap(), 1);
     }
 
     #[test]

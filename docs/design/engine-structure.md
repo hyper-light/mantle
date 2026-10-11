@@ -633,15 +633,19 @@ both sides, and landed before the next:
   file holds and the extents of the allocator map. Open takes the newest copy that verifies and
   whose slot matches its generation.
 - **Allocator** (`store/alloc.rs`): a reference count an extent, persisted copy-on-write with
-  each checkpoint. An extent whose count reaches zero is reused only once a checkpoint that does
-  not name it is durable; the old map is released before the new counts are written, so the
-  counts persisted never hold it.
+  each checkpoint. An extent the durable checkpoint names whose count reaches zero is reused only
+  once a checkpoint that does not name it is durable; one it does not name, allocated since it was
+  taken, is read by no recovery and is free again at once, so a file holds about its live extents
+  rather than everything written since the last checkpoint (a 100M-key fill checkpointed only at
+  its end held 54-64 GB for 11.6 GB of entries). The old map is released before the new counts are
+  written, so the counts persisted never hold it.
 - **Proof** (`tests/store_crash.rs`): power is cut after every write and flush of a workload of
   checkpoints, each crash losing all, none, or a random half of the unflushed sectors. Recovery
   always lands on the last acknowledged checkpoint or the one in flight, every page it names
   reads back exactly, the allocator holds exactly what it names, and the store goes on from it.
-  Removing the deferred free, the flush before the superblock, or the old map's early release
-  each makes the test fail.
+  Each step also writes and releases an extent no checkpoint names and reuses it at once for its
+  data. Removing the deferred free (freeing a named extent at once), the flush before the
+  superblock, or the old map's early release each makes the test fail.
 
 ## 9. RocksDB's format
 

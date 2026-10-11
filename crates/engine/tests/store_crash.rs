@@ -63,24 +63,41 @@ fn root_payload(model: &Model) -> Vec<u8> {
         .collect()
 }
 
-/// One step: a new data extent, every fourth step the oldest released, and a new root.
+/// One step: every fourth step the oldest data extent released, which the durable checkpoint
+/// names, so it must not be reused before the next one is durable; a scratch extent written and
+/// released, which no checkpoint names, so it is free again at once and the new data extent
+/// reuses it; then the new data, a new root and the checkpoint.
 fn step<F: BlockFile>(
     store: &mut Store<F>,
     model: &mut Model,
     step: u64,
 ) -> Result<(), mantle_engine::error::Error> {
-    let extent = store.allocate_extent()?;
-    let pages = 1 + (step % 3) as u32;
-    let mut run = store.run()?;
-    for p in 0..pages {
-        store.queue_page(&mut run, store.address(extent, p)?, &page_payload(step, p))?;
-    }
     let mut next = model.clone();
-    next.data.push((extent, pages, step));
     if step.is_multiple_of(4) {
         let (old, _, _) = next.data.remove(0);
         store.release(old)?;
     }
+    let mut run = store.run()?;
+    let scratch = store.allocate_extent()?;
+    for p in 0..CONFIG.extent_pages {
+        store.queue_page(
+            &mut run,
+            store.address(scratch, p)?,
+            &page_payload(step + STEPS, p),
+        )?;
+    }
+    store.write_run(&mut run)?;
+    store.release(scratch)?;
+    let extent = store.allocate_extent()?;
+    assert_eq!(
+        extent, scratch,
+        "an extent no checkpoint names is free again at once"
+    );
+    let pages = 1 + (step % 3) as u32;
+    for p in 0..pages {
+        store.queue_page(&mut run, store.address(extent, p)?, &page_payload(step, p))?;
+    }
+    next.data.push((extent, pages, step));
     let root_extent = store.allocate_extent()?;
     let root = store.address(root_extent, 0)?;
     store.queue_page(&mut run, root, &root_payload(&next))?;

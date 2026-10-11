@@ -41,12 +41,6 @@ pub fn step_budget_ns() -> Option<u64> {
     registry::with_current(|ctx| ctx.quantum_ns())
 }
 
-/// The current shard's online wake estimate in nanoseconds (0 when it tracks none); what the daemon's own
-/// idle window scales. `None` off a shard thread.
-pub fn wake_cost_ns() -> Option<u64> {
-    registry::with_current(|ctx| ctx.wake_cost_ns())
-}
-
 /// The task being polled on this thread, if any.
 pub fn current_task() -> Option<TaskId> {
     registry::with_current(|ctx| ctx.current_task()).flatten()

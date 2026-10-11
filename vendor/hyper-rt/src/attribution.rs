@@ -71,15 +71,14 @@ fn voluntary_switches() -> Option<u64> {
 }
 
 /// The calling thread's voluntary context switches now, where the OS counts them per thread (Linux): what
-/// tells a park that slept in its wait from one whose wait found a kick already pending (§4.3, the
-/// shard's online wake estimate). `None` elsewhere.
-#[cfg(all(target_os = "linux", not(miri)))]
+/// tells a test's call that blocked from one that did not. `None` elsewhere.
+#[cfg(all(test, target_os = "linux", not(miri)))]
 pub(crate) fn voluntary_switches_now() -> Option<u64> {
     voluntary_switches()
 }
 
-/// No per-thread voluntary switch count here (macOS, Windows), and none under Miri.
-#[cfg(any(miri, not(target_os = "linux")))]
+/// No per-thread voluntary switch count here (macOS), and none under Miri; its one caller is a Unix test.
+#[cfg(all(test, unix, any(miri, not(target_os = "linux"))))]
 pub(crate) fn voluntary_switches_now() -> Option<u64> {
     None
 }

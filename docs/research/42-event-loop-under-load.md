@@ -47,8 +47,11 @@ builds and tests run beside. This is its ordinary state and nothing here waited 
 | PANELS | `benchmark-results/hyper-rt-vs-tokio-20261010/runs/` (the harness `harness/src/main.rs`; each run's raw output and host load). |
 | GETPROF | `benchmark-results/mantle-resident-reads-smoke-20261010/reads3m-sample.txt` (a 5 s `sample` of mantle's resident get path). |
 | PRCTL | Linux man-pages, `prctl(2)`, `PR_SET_TIMERSLACK` (the page as Debian bookworm ships it, manpages.debian.org/bookworm/manpages-dev/prctl.2.en.html, read 2026-10-10). **primary** |
-| JACOBSON88 | V. Jacobson, M. J. Karels, "Congestion Avoidance and Control", revised November 1988 from the SIGCOMM '88 paper (ee.lbl.gov/papers/congavoid.pdf), §1 "Getting to Equilibrium: Slow-start", p. 4. |
+| JACOBSON88 | V. Jacobson, M. J. Karels, "Congestion Avoidance and Control", revised November 1988 from the SIGCOMM '88 paper (ee.lbl.gov/papers/congavoid.pdf), §1 "Getting to Equilibrium: Slow-start", p. 4; §2 "Conservation at equilibrium: round-trip timing", p. 7 (a retransmit's backoff: "only one scheme has any hope of working—exponential backoff"). |
 | TOKIO-YIELD | tokio at `09a57c27`, `tokio/src/task/yield_now.rs:48-55` (`yield_now` hands its waker to `context::defer`). **primary** |
+| LIM-AGARWAL | B.-H. Lim, A. Agarwal, "Waiting Algorithms for Synchronization in Large-Scale Multiprocessors", MIT/LCS/TR-498, which states it appears in ACM Transactions on Computer Systems 11(3), August 1993; read in the report's text (§3 p. 7, §4 pp. 9–10). |
+| BOGUSLAVSKY93 | L. Boguslavsky, K. Harzallah, A. Kreinen, K. Sevcik, A. Vainshtein, "Optimal Strategies for Spinning and Blocking", Technical Report CSRI-278, Computer Systems Research Institute, University of Toronto, January 1993; read in the report's text (§3, pp. 9–15). |
+| PANELS-LINUX | `benchmark-results/hyper-rt-vs-tokio-20261010/runs-linux/` (`linux.sh`, `spin-linux.sh`, `spin-linux2.sh`): the harness in a Linux container on this machine's Docker virtual machine (aarch64, kernel 6.12.76-linuxkit), pinned to the CPUs each panel names, with a memory limit and with or without two busy loops beside it; each run's raw output, its CPU mask and the host load. |
 
 ## 1. What a wake costs: latency and CPU are different quantities
 
@@ -374,6 +377,81 @@ against trantor's 95,659 at 72 µs. The price is a second ring a yield passes th
 turn run 53.9 million polls a second against 77.2 million without it (trantor runs its queued closures at
 28.1 million).
 
+## 14. A spin where its waker may not run, judged by what the spins saved
+
+**primary** [LIM-AGARWAL §3, p. 7]: "A choice of waiting mechanisms has to be made only if there are runnable
+threads to replace a blocked thread. To facilitate discussion, let us say that a program is *matched* if the
+number of concurrently runnable threads assigned to any processor never exceeds the number of hardware
+contexts on that processor; otherwise the program is *unmatched*. Thus, an always-poll algorithm should be
+used for matched programs since there are no other runnable threads to replace a blocked thread." And, of
+waiting by one mechanism alone: "If the program is unmatched, polling admits the possibility of deadlock if
+non-preemptive scheduling is used. Although timeouts and preemptive scheduling can be used to avoid deadlock,
+polling could still suffer from poor performance." Their analysis of two-phase waiting "assumes that we can
+always find a runnable thread to replace a blocked thread" [§4, p. 9], and prices a wait in processor cycles:
+polling up to `αB` and then blocking at cost `B` costs `∫₀^{αB} t f(t) dt + ∫_{αB}^∞ (1 + α)B f(t) dt` for a
+wait-time density `f` [§4.2 eq. (1), p. 10, spinning's `β = 1`]. [BOGUSLAVSKY93 §3.3, pp. 14-15] models three
+threads sharing a lock on two processors; its Fig. 7 maps where immediate blocking, pure spinning, or spinning
+then blocking gives the most throughput, and "If T_c → 0, then immediate blocking is the best choice for all
+other parameters" (`T_c` the time a context switch takes).
+
+**INFERENCE**: a shard waiting for work and the thread that will send it are two runnable threads. Where the
+process can run one thread at a time (one CPU in its affinity mask, or a cgroup quota of one CPU) they are
+unmatched by construction: the sender runs only once the spinning shard is descheduled, so no spin can see its
+work and its whole length is waste. Where the process can run more, whether the sender runs beside the spin
+depends on everything else the host runs; only the spins' outcomes tell. Lim and Agarwal's always-poll for
+matched programs rests on the processor having nothing else to do. On a laptop an idle core saves power, and
+on a busy machine, this note's premise, the core has other work; so the price stays the one their equation (1)
+sets, processor time, evaluated on the waits the shard met: a spin that saw its work after `t` saved `B − t`,
+and one that ran out its length wasted it.
+
+**MEASURED** (PANELS-LINUX `c1-quiet-bd7c0fd`, a container on one CPU, three rounds, load 10): two shards
+bouncing a value with the calibrated spin ran 138,940 round trips a second at 5.27 µs of CPU each, and every
+one of its 3,832 spins missed; the hand-configured loop with no spin (`HYPER_SIMPLE`) ran 366,896 at 1.51 µs;
+trantor 420,243; tokio's current-thread runtime 478,135.
+
+**MEASURED**: no fixed choice is right everywhere. "Always" spins for the park cost on every wait (D2), "never"
+does not spin; ops/s medians, the spins that saw their work under "always".
+
+| Panel (load) | Case | Always | Never | Spins that saw their work |
+|---|---|---|---|---|
+| PANELS `mac-spin-r2` (54–72) | ping-pong | 957,323 | 5,802 | 21,916 of 21,993 |
+| PANELS-LINUX `c2-hogs2-trial` (27) | ping-pong | 71,596 | 151,533 | 2 of 15,482 |
+| PANELS-LINUX `c2-quiet-spin` (40–41) | rtt | 154,111 | 293,956 | 15 of 3,916 |
+| PANELS-LINUX `c2-quiet-trial` (15–17) | rtt | 49,987 | 31,212 | 16,329 of 21,828 |
+
+The last two rows are the same two-CPU container with nothing of this work beside it: what else the virtual
+machine ran made the program matched or not.
+
+**MEASURED** (PANELS `mac-spin-r1`): judging each spin as it came, by a running mean of each spin's saving
+and waste (D2's estimator), spinning on every wait while the mean saving exceeded the mean waste and otherwise
+on one wait in a number that doubled up to 59, the ping-pong fell to 6,443 round trips a second (always
+270,847, never 9,649). **INFERENCE**: two shards bouncing a message see each other's work early only while both
+spin. The first misses, met while the peer still parked, turned both means; after that each shard's lone
+probes met a parked peer, missed, and kept the verdict.
+
+**MEASURED**: judging windows of 59 spins (D9), five rounds a panel; ops/s medians, CPU an operation in
+parentheses (ns):
+
+| Panel (load) | Case | Windows | Always | Never | trantor | tokio current-thread |
+|---|---|---|---|---|---|---|
+| PANELS `mac-spin-r2` (54–98) | ping-pong | 1,859,593 (1,078) | 957,323 (1,184) | 5,802 (9,479) | 9,045 | 10,928 |
+| | fan-in | 37,844 (5,833) | 48,415 (6,263) | 29,869 (5,885) | 49,814 | 30,179 |
+| | rtt | 8,782 (8,315) | 10,043 (11,745) | 8,791 (8,892) | 5,023 | 12,424 |
+| PANELS-LINUX `c2-quiet-trial` (14–18) | ping-pong | 1,000,492 (1,979) | 1,043,059 (1,946) | 30,405 (18,738) | 32,319 | 29,670 |
+| | fan-in | 307,304 (3,349) | 426,417 (4,108) | 221,416 (4,036) | 397,337 | 587,434 |
+| | rtt | 31,447 (16,134) | 49,987 (17,256) | 31,212 (16,966) | 27,843 | 32,550 |
+| PANELS-LINUX `c2-hogs2-trial` (27–31) | ping-pong | 136,550 (3,446) | 71,596 (7,659) | 151,533 (3,675) | 176,242 | 263,498 |
+| | fan-in | 167,040 (4,100) | 127,240 (6,208) | 140,544 (5,390) | 233,730 | 143,558 |
+| | rtt | 198,057 (2,715) | 130,997 (3,894) | 227,066 (2,299) | 197,346 | 286,841 |
+
+**INFERENCE**: peers that wait in step, a ping-pong's two shards taking turns, rest the same number of waits
+and start their next windows on the same round trip, so their spins meet again. Where every spin missed
+(c2-hogs2 rtt, and the 200 µs-gap rtt on all three hosts), the windows tried before the rests reached their
+cap were all the spinning there was, and cost from 0.7% to 18% more CPU an operation than never spinning in
+these runs of a few thousand waits; at the cap the share is one wait in 60. Fan-in stays below trantor on all
+three hosts, and ping-pong beside the busy loops below trantor and tokio, with no spin at all as well: those
+gaps are in the park and wake path, not in the decision to spin.
+
 ## What remains unknown
 
 - **The cost of blocking on Windows.** Its per-thread times advance a scheduler tick at a time, and its
@@ -381,7 +459,9 @@ turn run 53.9 million polls a second against 77.2 million without it (trantor ru
   learns no cost and does not spin.
 - **trantor's loop**, whose source is not on this machine (§3).
 - **Johnson, Stoica, Ailamaki and Mowry**, "Decoupling contention management from scheduling" (ASPLOS
-  2010), and **Lim and Agarwal** (ASPLOS 1994), which bear on spinning under load, were not read: the
-  publisher refused the fetch. KARLIN91 states the regime and the threshold this note relies on.
-- **Linux's numbers.** Every measurement here is macOS on Apple silicon; the decisions measure their
-  quantities on the running machine, so they hold there by construction, but no Linux run is recorded.
+  2010), and **Lim and Agarwal**'s reactive synchronization (ASPLOS 1994), which bear on spinning under
+  load, were not read: the publisher refused the fetch. KARLIN91 states the regime and the threshold this
+  note relies on, and LIM-AGARWAL's earlier report (§14) the matched and unmatched cases.
+- **Linux's numbers on a Linux host.** §1–§13 measure macOS on Apple silicon; §14's Linux panels run in
+  containers on this machine's virtual machine, beside other containers, not on a Linux host of their own.
+  The decisions measure their quantities on the running machine, so they hold there by construction.

@@ -491,12 +491,6 @@ impl ShardContext {
         self.quantum_ns.get()
     }
 
-    /// The online wake estimate, nanoseconds, as of the current step's start; 0 for a shard that does not
-    /// track its wake.
-    pub fn wake_cost_ns(&self) -> u64 {
-        self.counters.get().wake_cost_ns
-    }
-
     /// The measured scheduler overrun, nanoseconds: how late the shard's steps have run after its waits.
     pub fn scheduler_overrun_ns(&self) -> u64 {
         self.scheduler_overrun_ns.get()

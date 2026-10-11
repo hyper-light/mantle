@@ -29,9 +29,8 @@ fn config(learns: bool) -> RuntimeConfig {
         page_bytes: 4096,
         spin_ns: 0,
         wake_tracking: learns.then_some(WakeTracking {
-            prior_ns: 1_000_000,
-            shift: 4,
             idle_ratio: 1,
+            cpus_at_once: 2,
         }),
     }
 }

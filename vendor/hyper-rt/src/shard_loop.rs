@@ -25,15 +25,15 @@ use crate::control::Control;
 use crate::driver::{Completion, Driver, DriverKind, DriverSeed, Kick};
 use crate::error::RtError;
 use crate::interests::{self, Interests, Readiness};
-use crate::machine::wake::WakeEstimate;
 use crate::mem::Encoded;
 use crate::park_cost::ParkCost;
-use crate::parking::{Parked, Woken};
+use crate::parking::Parked;
 use crate::registry::{self, Entry};
 use crate::runtime::RuntimeConfig;
 use crate::shard::{
     DeskShape, Incoming, Kept, Phase, ShardContext, ShardId, TaskId, TimerPhase, ask,
 };
+use crate::spin_policy::SpinPolicy;
 use crate::task::{Admission, BoxedFuture, NO_LINK, Outcome, SpawnRequest, State, TaskSlot};
 use crate::timer::Wheel;
 use crate::waker::waker_for;
@@ -67,14 +67,6 @@ pub struct Counters {
     pub unattributed_steps: u64,
     /// The longest step that polled, by the wall clock from its start to its polls' end, in nanoseconds.
     pub longest_step_ns: u64,
-    /// Kicked parks whose kick-to-running latency fed the online wake estimate.
-    pub wake_samples: u64,
-    /// Kick stamps that predated their park's announcement, dropped.
-    pub wake_stale: u64,
-    /// Kicks that found the shard not yet asleep, so no wake was measured.
-    pub wake_unslept: u64,
-    /// The online wake estimate, nanoseconds (0 for a shard that does not track its wake).
-    pub wake_cost_ns: u64,
     /// The online cost of blocking: the CPU one park/wake cycle costs, the shard's park and its sender's
     /// kick, nanoseconds (`park_cost`); a tracking shard's idle spin lasts this long. 0 before the first
     /// measured park, and where the OS keeps no fine per-thread clock.
@@ -225,10 +217,11 @@ struct Core {
     generation_high: u32,
     /// The absolute deadline the shard last waited for and has not stepped since.
     waited_for_ns: Option<u64>,
-    /// The online wake estimate (§4.1, §4.3), when the configuration carries a measured prior.
-    wake: Option<WakeEstimate>,
+    /// Whether the idle spin pays, from what this shard's spins measured (`crate::spin_policy`); `None` for a
+    /// shard that tracks nothing and spins its configured `spin_ns`.
+    spin: Option<SpinPolicy>,
     /// The CPU a park costs this shard's thread, and a kick its senders' (`crate::park_cost`): a tracking
-    /// shard's idle spin. Learned only while the wake is tracked on a real clock.
+    /// shard's idle spin. Learned only by a shard on a real clock that can spin.
     park_cost: ParkCost,
     kick_cost: ParkCost,
     /// The parking word's kick sums last folded into `kick_cost`.
@@ -330,9 +323,15 @@ impl Shard {
             is_sim,
             driver.clock(),
         ));
-        let times_wakes = config.wake_tracking.is_some() && !is_sim;
-        if times_wakes && let Some(entry) = registry::entry(seed.id) {
-            entry.parking.time_wakes();
+        let spin = config
+            .wake_tracking
+            .map(|tracking| SpinPolicy::new(tracking.cpus_at_once));
+        // Only a shard that can spin needs what blocking costs, so only it has its kicks measured.
+        if !is_sim
+            && spin.is_some_and(|spin| spin.can_spin())
+            && let Some(entry) = registry::entry(seed.id)
+        {
+            entry.parking.measure_kicks();
         }
         let now_ns = driver.now_ns();
         let core = Core {
@@ -351,9 +350,7 @@ impl Shard {
             driver_lost: false,
             generation_high: generation_base,
             waited_for_ns: None,
-            wake: config
-                .wake_tracking
-                .map(|tracking| WakeEstimate::new(tracking.prior_ns, tracking.shift)),
+            spin,
             park_cost: ParkCost::new(),
             kick_cost: ParkCost::new(),
             kicks_seen: (0, 0),
@@ -419,7 +416,6 @@ impl Shard {
             .saturating_add(self.desk.refused_spawns.get());
         c.timer_waits = c.timer_waits.saturating_add(self.desk.timer_waits.get());
         c.scheduler_overrun_ns = self.desk.scheduler_overrun_ns.get();
-        c.wake_cost_ns = self.core.wake.map_or(0, |estimate| estimate.mean_ns());
         c.park_cost_ns = self.blocking_cost_ns().unwrap_or(0);
         c.park_samples = self.core.park_cost.samples();
         c
@@ -473,7 +469,7 @@ impl Shard {
     /// Manasse, Owicki, SOSP'91]; sizing it by the wake's latency instead made it as long as the host's
     /// scheduler queue (`crate::park_cost`).
     fn spin_window_ns(&self) -> u64 {
-        if self.core.wake.is_none() {
+        if self.core.spin.is_none() {
             return self.core.fixed_spin_ns;
         }
         self.blocking_cost_ns()
@@ -868,16 +864,35 @@ impl Shard {
             return false;
         };
         let window_end = activity.saturating_add(self.spin_window_ns());
-        if self.now_ns() >= window_end {
+        let started_ns = self.now_ns();
+        if started_ns >= window_end {
+            return false;
+        }
+        // A tracking shard spins only while its spins pay, and never where no spin can see its work
+        // (`crate::spin_policy`).
+        if self
+            .core
+            .spin
+            .as_mut()
+            .is_some_and(|spin| !spin.should_spin())
+        {
             return false;
         }
         self.core.attribution.wait_began();
         if let Some(entry) = self.desk.entry {
             entry.pulse.record_spinning(true);
         }
-        let found = self.spin_for_work(window_end, deadline_ns);
+        let (found, spun_ns) = self.spin_for_work(started_ns, window_end, deadline_ns);
         if let Some(entry) = self.desk.entry {
             entry.pulse.record_spinning(false);
+        }
+        let blocking_ns = self.blocking_cost_ns().unwrap_or(0);
+        if let Some(spin) = self.core.spin.as_mut() {
+            if found {
+                spin.note_seen(spun_ns, blocking_ns);
+            } else {
+                spin.note_missed(spun_ns);
+            }
         }
         if found {
             // harvest_io already recorded any retrieval; an inbox hit is not one.
@@ -886,12 +901,18 @@ impl Shard {
         found
     }
 
-    /// The spin: true when work arrived or `deadline_ns` fell due before `spin_end`. Each turn asks the
+    /// The spin that began at `started_ns`: whether work arrived or `deadline_ns` fell due before `spin_end`,
+    /// and how long it spun. Each turn asks the
     /// inboxes and the pollers, which cost no system call; the driver (a socket's readiness is work as much
     /// as a wake) is asked at the spin's start and then once a quantum, the calibrated wake's cost, so a
     /// readiness waits no longer than a wake would have while the spin makes no system call a turn. The
     /// preceding step's retrieval and the spin share their quantum, so idle entry does not ask twice.
-    fn spin_for_work(&mut self, spin_end: u64, deadline_ns: Option<u64>) -> bool {
+    fn spin_for_work(
+        &mut self,
+        started_ns: u64,
+        spin_end: u64,
+        deadline_ns: Option<u64>,
+    ) -> (bool, u64) {
         let mut next_harvest_ns = self.core.last_driver_ns.saturating_add(self.quantum_ns());
         loop {
             let now = self.now_ns();
@@ -902,7 +923,7 @@ impl Shard {
                 || (harvest_due && self.harvest_io(now))
             {
                 self.core.counters.spin_hits = self.core.counters.spin_hits.saturating_add(1);
-                return true;
+                return (true, now.saturating_sub(started_ns));
             }
             // Re-read only after the driver was asked (a system call); otherwise this turn's reading stands.
             let now = if harvest_due { self.now_ns() } else { now };
@@ -912,11 +933,11 @@ impl Shard {
                 self.core.counters.spin_deadlines =
                     self.core.counters.spin_deadlines.saturating_add(1);
                 self.core.waited_for_ns = Some(deadline);
-                return true;
+                return (true, now.saturating_sub(started_ns));
             }
             if now >= spin_end {
                 self.core.counters.spin_misses = self.core.counters.spin_misses.saturating_add(1);
-                return false;
+                return (false, now.saturating_sub(started_ns));
             }
             if harvest_due {
                 next_harvest_ns = now.saturating_add(self.quantum_ns());
@@ -1078,11 +1099,10 @@ impl Shard {
     }
 
     /// The registered shard's park: announced, then a wait in the driver unless an inbox already holds work
-    /// (the protocol of [`crate::parking`]), learning from a wait what the wake took and what the park
-    /// cost. Whether it waited, and whether the driver was lost.
+    /// (the protocol of [`crate::parking`]), learning from a wait what the park cost when the shard can spin.
+    /// Whether it waited, and whether the driver was lost.
     fn park_announced(&mut self, entry: &'static Entry, deadline_ns: Option<u64>) -> (bool, bool) {
-        let learns = self.core.real_time && self.core.wake.is_some();
-        let mut switches_before_wait = None;
+        let learns = self.core.real_time && self.core.spin.is_some_and(|spin| spin.can_spin());
         let mut lost = false;
         // The CPU clock is read (a system call) only by a learning shard, only around a wait it makes, and
         // the second time only after a first. A tuple of the two readings read it after every park, learning
@@ -1094,7 +1114,6 @@ impl Shard {
             || pending || entry.wakes.is_pending() || entry.control_pending.is_pending(),
             || {
                 if learns {
-                    switches_before_wait = attribution::voluntary_switches_now();
                     cpu_before = attribution::thread_cpu_now();
                     self.core.counters.park_cost_reads =
                         self.core.counters.park_cost_reads.saturating_add(1);
@@ -1102,11 +1121,8 @@ impl Shard {
                 lost = self.wait_in_driver(deadline_ns);
             },
         );
-        let Parked::Waited(woken) = parked else {
+        if parked == Parked::Pending {
             return (false, lost);
-        };
-        if let Some(woken) = woken {
-            self.note_wake(entry, woken, switches_before_wait);
         }
         if let Some(before) = cpu_before {
             self.core.counters.park_cost_reads =
@@ -1165,39 +1181,6 @@ impl Shard {
                 std::thread::park();
             },
         );
-    }
-
-    /// Folds a park's measured wake into the online estimate (slates §4.3).
-    fn note_wake(&mut self, entry: &Entry, woken: Woken, switches_before_wait: Option<u64>) {
-        let Some(mut estimate) = self.core.wake else {
-            return;
-        };
-        if !self.core.real_time {
-            return;
-        }
-        if woken.stale() {
-            self.core.counters.wake_stale = self.core.counters.wake_stale.saturating_add(1);
-            return;
-        }
-        let Some(latency) = woken.latency_ns() else {
-            if woken.early() {
-                self.core.counters.wake_unslept = self.core.counters.wake_unslept.saturating_add(1);
-            }
-            return;
-        };
-        if let (Some(before), Some(after)) =
-            (switches_before_wait, attribution::voluntary_switches_now())
-            && after == before
-        {
-            self.core.counters.wake_unslept = self.core.counters.wake_unslept.saturating_add(1);
-            return;
-        }
-        estimate.record(latency);
-        self.core.wake = Some(estimate);
-        let mean = estimate.mean_ns();
-        self.core.counters.wake_samples = self.core.counters.wake_samples.saturating_add(1);
-        self.core.counters.wake_cost_ns = mean;
-        entry.pulse.record_wake_cost(mean);
     }
 
     /// Folds one waited park's CPU on this thread into the cost of blocking, and the kicks its senders

@@ -27,13 +27,13 @@ kicks it deadlocks at the first (`benchmark-results/hyper-rt-vs-tokio-20261010/t
 
 ## D2. A tracking shard spins as long as blocking costs it in CPU
 
-**Decision.** While a shard tracks its wake (`RuntimeConfig::wake_tracking`, set by
+**Decision.** While a shard learns its costs (`RuntimeConfig::wake_tracking`, set by
 `RuntimeConfig::from_calibration`), its idle spin lasts the CPU one park/wake cycle costs: its own
 thread's CPU across each park it waits in, and its senders' CPU across the kick they claimed, each read
 on that thread's CPU clock. It spins not at all until its first park has been measured, and not at all
 where the OS keeps no fine per-thread clock (Windows). A request served in a step opens the idle window
 from where that step ended (D3). A shard with no wake tracking keeps its configured `spin_ns`. The step
-quantum and the timer tick no longer follow the wake estimate (D6).
+quantum and the timer tick no longer follow the wake estimate (D6), and whether it spins at all is D9's.
 
 **Why.** Spin-then-block is 2-competitive in processor time when the spin lasts as long as a context
 switch costs [KARLIN91, note 42 §2]. hyper-rt spun for the measured wake latency instead, which on this
@@ -43,9 +43,9 @@ tokio's 5.8 µs with no gain in throughput or tail (note 42 §2). Spinning by th
 spinning pays, a producer that is running, as in two shards bouncing a message (four times the
 throughput, note 42 §7), and bounds a miss to one cycle's CPU.
 
-**Proof.** `tests/spin_by_park_cost.rs`: a shard tracking a one-second wake prior notes a client's
-activity and sleeps on 20 ms timers five times. It parks for every timer and measures every park; with
-the wake-sized spin it spun to nine deadlines and parked once. `park_cost.rs`'s tests hold the estimator:
+**Proof.** `tests/spin_by_park_cost.rs`: a tracking shard that can spin notes a client's activity and
+sleeps on 20 ms timers five times. It parks for every timer and measures every park; with the wake-sized
+spin, from a one-second wake prior, it spun to nine deadlines and parked once (the prior went with D9). `park_cost.rs`'s tests hold the estimator:
 an exact mean over the warm-up, then a weighted mean whose window the warm-up's spread sets.
 
 **Constants.**
@@ -94,8 +94,9 @@ timing is what the watchdog needs, since a step is what holds the shard's other 
 **Proof.** `tests/step_clock_reads.rs`: one step polls 256 tasks and reads its driver's clock twice (257
 times before). `machine::clock`'s tests: Apple silicon's 125/3 timebase converts 3 ticks to 125 ns and a
 second's 24,000,000 ticks to exactly 10⁹ ns, a one-to-one timebase returns its ticks, and the shard's
-clock never runs backwards. The attribution tests (`tests/wake_estimate.rs`) hold the long-step rules,
-each held poll a step of its own (a batch of one); `attribution.rs`'s unit tests hold the tracker.
+clock never runs backwards. The attribution tests (`tests/long_steps.rs`, in `tests/wake_estimate.rs`
+until D9 removed the wake it learned) hold the long-step rules, each held poll a step of its own (a batch
+of one); `attribution.rs`'s unit tests hold the tracker.
 
 **Constants.**
 - `SCALE_BITS` (32): format, the fixed-point scale's fraction, chosen so the 64×64-bit product cannot
@@ -289,3 +290,60 @@ reading and the next step's start) and once elsewhere. RED before: 1,002 reads
 holds the tracker's rule.
 
 **Constants.** None.
+
+## D9. A shard spins only while windows of its spins pay, and never where it runs alone
+
+**Decision.** A shard that learns its costs (`RuntimeConfig::wake_tracking`, set by `from_calibration`) judges
+its idle spin by windows of `machine::bench::MIN_SAMPLES` (59) consecutive spins. Each spin that saw its work
+saved the cost of blocking less the time it took; each that saw nothing wasted its whole length. It spins on
+every wait while the last window's saving exceeded its waste; after a window that did not, it rests 59 waits
+and tries a new window, the rest doubling after each window that fails, up to 59² waits. Where the process can
+run one of its threads at a time (`Facts::cpus_at_once`: the CPUs its affinity mask and its cgroup quota
+allow), the thread that would end a spin cannot run beside it: such a shard never spins and never measures
+what blocking costs, which only a spin's length needs. The spin's length is still the cost of blocking (D2).
+The online wake estimate is gone: since D6 no step, tick or spin read it, and it cost every claimed kick a
+clock read and every park three; `WakeTracking` now carries the idle ratio and the CPU count.
+
+**Why.** Spinning for the cost of blocking is 2-competitive only while the event arrives in its own time
+during the spin [KARLIN91]. Lim and Agarwal's analysis of two-phase waiting assumes a runnable thread can always
+replace a blocked one, and where runnable threads outnumber a processor's contexts "polling could still suffer
+from poor performance"; Boguslavsky et al., three threads on two processors, find blocking at once optimal over
+a region of their parameters (note 42 §14). Measured, no fixed choice is right everywhere: spinning on every
+wait ran a ping-pong at 957 thousand round trips a second on this Mac against 5,802 without, and at 72 thousand
+on a two-CPU Linux container beside two busy loops against 152 thousand without, where two of its 15,482 spins
+saw their work. Judging spins one at a time collapsed: two shards bouncing a message see each other's work
+early only while both spin, and the first misses, met while the peer still parked, stopped both (6,443 round
+trips a second on this Mac). Judging windows, peers waiting in step rest and try again together: 1.86 million
+on this Mac, 1.00 million on the quiet two-CPU container (against 1.04 million spinning always and 30 thousand
+never), 137 thousand beside the busy loops (against 152 thousand never and 72 thousand always).
+
+The judgment is in CPU, the price Lim and Agarwal's equation (1) sets on a wait and the resource a busy machine
+shares (the bar above). They would always poll in a matched program, whose processor has nothing else to do;
+on a laptop an idle core saves power, and on a busy machine the core has other work. Of the three, the windows
+used the least CPU an operation in seven of the twelve panels where shards waited and came within 2% of the
+least in two more; in the other three every spin missed, and the first windows, tried before the rests reach
+their cap, cost up to 18% (note 42 §14). Where spins see their work but late, the rule declines a spin that
+buys latency with CPU: on the quiet two-CPU container a closed-loop client ran 31 thousand round trips a second
+against 50 thousand spinning always, at 16.1 µs of CPU an operation against 17.3, beside trantor's 28 thousand
+and tokio's current-thread runtime's 33 thousand, neither of which spins. On one CPU no spin can see its work,
+so the rule's saving is zero there before anything is measured: the same rule, its premise checked.
+
+**Proof.**
+- `spin_policy`'s tests: a process that runs one thread at a time never spins; spins that pay keep it spinning
+  window after window; a window that misses rests 59 waits, and the rests double up to 59²; a window that pays
+  resets the rest.
+- `tests/spin_one_cpu.rs`: a shard whose process runs one thread at a time, a task noting a client's activity
+  and sleeping eight times, spins never and reads no CPU clock. RED before: eight spins that missed, nine parks
+  measured, eighteen CPU clock reads (`benchmark-results/hyper-rt-vs-tokio-20261010/tests/spin-one-cpu-RED.txt`).
+- `tests/spin_by_park_cost.rs`, `tests/park_cost_reads.rs`: a learning shard with threads beside it parks for
+  each timer and measures each park with two CPU clock reads. `parking`'s loom models, the measured kick
+  among them, hold the protocol (`benchmark-results/hyper-rt-vs-tokio-20261010/tests/loom-spin-policy.txt`).
+- Panels: `benchmark-results/hyper-rt-vs-tokio-20261010/runs/mac-spin-r1`, `runs/mac-spin-r2`,
+  `runs-linux/c2-hogs2-spin`, `runs-linux/c2-quiet-spin`, `runs-linux/c2-hogs2-trial`,
+  `runs-linux/c2-quiet-trial`, `runs-linux/c1-quiet-spin`, `runs-linux/c1-quiet-bd7c0fd`.
+
+**Constants.**
+- The window and the first rest, `machine::bench::MIN_SAMPLES` (59): cited, Wilks 1941 (the crate's stopping
+  rule).
+- The rest's doubling: cited, exponential backoff for a load the shard cannot know [JACOBSON88 §2, p. 7]; its
+  cap, 59²: derived, so a shard whose spins never pay spends at most one wait in 60 spinning.

@@ -1,15 +1,10 @@
-//! The shard's online wake estimate and the attribution of its long steps (§4.1, §4.3; A-31;
-//! docs/bugs/2026-09-25-wake-estimate-frozen-at-boot-and-preemptions-counted-as-long-steps.md).
-//!
-//! The boot probe's mean wake converges slowly under a heavy tail, so a shard that tracks one refines it
-//! from the kicked parks it pays: a sender stamps the first kick of a park, and the shard folds the
-//! kick-to-running latency of a park that slept into its estimate, which it reports
-//! (`Counters::wake_cost_ns`); its step quantum is its step budget whatever the wake. A shard whose
-//! configuration carries no measured prior learns nothing. A step past its bound (the step budget and one
-//! quantum) by the wall clock is attributed in a window of the thread's account: its tasks' when it ran
-//! past the bound on the CPU or blocked in a call, the host's when it was runnable and held off the
-//! CPU, unattributed where the platform cannot tell (the first long step opens the first window). Each
-//! held poll below is a step of its own (a batch of one), so a step's attribution is its poll's.
+//! The attribution of a shard's long steps (§4.3; A-31;
+//! docs/bugs/2026-09-25-wake-estimate-frozen-at-boot-and-preemptions-counted-as-long-steps.md). A step past
+//! its bound (the step budget and one quantum) by the wall clock is attributed in a window of the thread's
+//! account: its tasks' when it ran past the bound on the CPU or blocked in a call, the host's when it was
+//! runnable and held off the CPU, unattributed where the platform cannot tell (the first long step opens the
+//! first window). Each held poll below is a step of its own (a batch of one), so a step's attribution is its
+//! poll's.
 
 // Test harness code: a panic here is a failed test (CLAUDE.md §1).
 #![allow(
@@ -33,20 +28,11 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::mpsc::{Receiver, Sender, channel};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use hyper_rt::registry;
-use hyper_rt::runtime::{LocalRuntime, RuntimeConfig, WakeTracking};
+use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
 
-/// Shape: the prior the tracking shard is seeded with — a second, far above any real wake — so an
-/// estimate that learned from its wakes has unmistakably moved off it.
-const PRIOR_NS: u64 = 1_000_000_000;
-/// Shape: a short weighting window (sixteen wakes), so a handful of kicks moves the estimate far.
-const SHIFT: u32 = 4;
-/// Shape: kicked parks the tracking test drives.
-const KICKS: u64 = 24;
 /// Shape: the fixed quantum of the long-step test — a millisecond, far above a poll's own cost.
 const QUANTUM_NS: u64 = 1_000_000;
 /// Shape: how long a long poll holds its thread, three quanta: past a step's bound (the budget and one
@@ -54,13 +40,8 @@ const QUANTUM_NS: u64 = 1_000_000;
 const HOLD: Duration = Duration::from_millis(3);
 /// Shape: polls each long-step history runs in one busy period.
 const LONG_POLLS: u64 = 3;
-/// Shape: how long a helper thread waits for the shard to announce its park before the test fails.
-const PARK_WAIT: Duration = Duration::from_secs(10);
-/// Shape: how long the kicker holds its kick after the shard announced its park, so the shard is asleep
-/// in its wait when the kick lands (a millisecond: hundreds of wakes).
-const ASLEEP_AFTER: Duration = Duration::from_millis(1);
 
-fn config(step_budget_ns: u64, wake_tracking: Option<WakeTracking>) -> RuntimeConfig {
+fn config(step_budget_ns: u64) -> RuntimeConfig {
     RuntimeConfig {
         shards: 1,
         tasks_per_shard: 64,
@@ -75,129 +56,13 @@ fn config(step_budget_ns: u64, wake_tracking: Option<WakeTracking>) -> RuntimeCo
         page_bytes: 4096,
         // No idle spin: every wait below is a park.
         spin_ns: 0,
-        wake_tracking,
-    }
-}
-
-/// A future that is pending once — handing its waker to the test — and ready when polled again.
-struct PendOnce {
-    wakers: Sender<Waker>,
-    polled: bool,
-}
-
-impl Future for PendOnce {
-    type Output = ();
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.polled {
-            return Poll::Ready(());
-        }
-        self.polled = true;
-        let _ = self.wakers.send(cx.waker().clone());
-        Poll::Pending
+        wake_tracking: None,
     }
 }
 
 /// Steps the shard until it has nothing to do.
 fn step_until_idle(rt: &mut LocalRuntime) {
     while rt.step().did_work {}
-}
-
-/// Parks the shard and wakes it from another thread a millisecond after it announced the park: a real
-/// kick of a sleeping shard, the event the online estimate learns from.
-fn park_and_kick(rt: &mut LocalRuntime, wakers: &Receiver<Waker>) {
-    let waker = wakers.try_recv().expect("the task handed over its waker");
-    let shard = rt.shard_id().0;
-    std::thread::scope(|scope| {
-        scope.spawn(move || {
-            let began = Instant::now();
-            while !registry::with_entry(shard, |entry| entry.parking.parked())
-                .expect("a local shard is registered")
-            {
-                assert!(
-                    began.elapsed() < PARK_WAIT,
-                    "the shard never announced its park"
-                );
-                std::thread::yield_now();
-            }
-            let announced = Instant::now();
-            while announced.elapsed() < ASLEEP_AFTER {
-                std::thread::yield_now();
-            }
-            waker.wake();
-        });
-        rt.park(None);
-    });
-}
-
-/// §4.3, A-31: a tracking shard kicked while asleep learns the kick's wake — each such park is one sample
-/// (the non-vacuity count), and every kicked park is either a sample or counted unslept (a kick that found
-/// it awake) — and its estimate, seeded with a one-second prior, moves down to the wakes it measured; its
-/// step quantum stays its step budget, and the registry pulse mirrors the estimate for another thread. A
-/// shard with no measured prior learns nothing.
-#[test]
-#[cfg_attr(miri, ignore)] // the OS driver opens a kqueue or an eventfd, which Miri does not model
-fn a_tracking_shard_learns_its_wake_from_the_parks_its_kicks_ended() {
-    let tracking = WakeTracking {
-        prior_ns: PRIOR_NS,
-        shift: SHIFT,
-        idle_ratio: 1,
-    };
-    let mut rt = LocalRuntime::new(&config(PRIOR_NS, Some(tracking))).unwrap();
-    let (tx, rx) = channel::<Waker>();
-    rt.spawn(async move {
-        for _ in 0..KICKS {
-            PendOnce {
-                wakers: tx.clone(),
-                polled: false,
-            }
-            .await;
-        }
-    })
-    .unwrap();
-    for _ in 0..KICKS {
-        step_until_idle(&mut rt);
-        park_and_kick(&mut rt, &rx);
-    }
-    step_until_idle(&mut rt);
-    let counters = rt.counters();
-    assert_eq!(
-        counters.wake_samples + counters.wake_unslept,
-        KICKS,
-        "every kicked park was measured or counted unslept: {counters:?}"
-    );
-    assert!(
-        counters.wake_samples >= KICKS / 2,
-        "kicks that landed on a sleeping shard fed the estimate: {counters:?}"
-    );
-    assert!(
-        counters.wake_cost_ns < PRIOR_NS / 2,
-        "the estimate moved off its one-second prior toward the measured wakes: {counters:?}"
-    );
-    assert_eq!(
-        rt.context().quantum_ns(),
-        PRIOR_NS,
-        "the quantum is the step budget, whatever the wake"
-    );
-    let mirrored =
-        registry::with_entry(rt.shard_id().0, |entry| entry.pulse.wake_cost_ns()).unwrap();
-    assert_eq!(mirrored, counters.wake_cost_ns);
-
-    let mut fixed = LocalRuntime::new(&config(QUANTUM_NS, None)).unwrap();
-    let (tx, rx) = channel::<Waker>();
-    fixed
-        .spawn(async move {
-            PendOnce {
-                wakers: tx,
-                polled: false,
-            }
-            .await;
-        })
-        .unwrap();
-    step_until_idle(&mut fixed);
-    park_and_kick(&mut fixed, &rx);
-    step_until_idle(&mut fixed);
-    assert_eq!(fixed.counters().wake_samples, 0);
-    assert_eq!(fixed.context().quantum_ns(), QUANTUM_NS);
 }
 
 /// How a held poll spends its hold.
@@ -294,7 +159,7 @@ fn one_busy_period(hold: Hold) -> hyper_rt::shard_loop::Counters {
     CPU_PAST_QUANTUM.with(|count| count.set(0));
     let mut rt = LocalRuntime::new(&RuntimeConfig {
         batch: 1,
-        ..config(QUANTUM_NS, None)
+        ..config(QUANTUM_NS)
     })
     .unwrap();
     rt.spawn(HoldEachPoll {

@@ -48,9 +48,6 @@ pub struct Policy {
 /// The runtime's constants, each with its formula (docs/runtime.md §10.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Constants {
-    /// How long an idle shard spins before parking: the expected cost of parking, the 2-competitive
-    /// spin-then-park threshold [A: Karlin, Li, Manasse, Owicki, SOSP'91].
-    pub spin_ns: Derived<u64>,
     /// The timing wheel's tick.
     pub tick_ns: Derived<u64>,
     /// The step budget: how long a busy shard's polls run before it looks at its inboxes, timers and driver
@@ -86,7 +83,6 @@ impl Calibration {
 
     /// The constants under the consumer's `policy`, or the lateness the machine cannot keep.
     pub fn constants(&self, policy: &Policy) -> Result<Constants, Unmet> {
-        let wake_mean = self.wake.mean_ns.max(1);
         let wake_p99 = self.wake.p99_ns.max(1);
         let lateness_ns = TIMER_SLACK_NS.saturating_add(wake_p99);
         if let Some(tolerance_ns) = policy.lateness_tolerance_ns
@@ -101,11 +97,6 @@ impl Calibration {
             .latency_objective_ns
             .map_or(TIMER_SLACK_NS, |objective| objective.min(TIMER_SLACK_NS));
         Ok(Constants {
-            spin_ns: derived!(
-                wake_mean,
-                "wake.mean (the expected cost of parking: the 2-competitive spin-then-park threshold)",
-                ["wake.mean_ns"]
-            ),
             tick_ns: derived!(
                 TIMER_SLACK_NS,
                 "the timer slack (the kernel fires the shard's own timed wait no sooner; lateness = tick + wake.p99)",
@@ -154,7 +145,6 @@ mod tests {
         let constants = calibration.constants(&open).unwrap();
         assert_eq!(constants.tick_ns.get(), TIMER_SLACK_NS);
         assert_eq!(constants.step_ns.get(), TIMER_SLACK_NS);
-        assert_eq!(constants.spin_ns.get(), calibration.wake.mean_ns.max(1));
         let tight = Policy {
             lateness_tolerance_ns: Some(1),
             ..open

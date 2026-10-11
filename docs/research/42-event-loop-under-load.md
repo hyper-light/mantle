@@ -51,6 +51,9 @@ builds and tests run beside. This is its ordinary state and nothing here waited 
 | TOKIO-YIELD | tokio at `09a57c27`, `tokio/src/task/yield_now.rs:48-55` (`yield_now` hands its waker to `context::defer`). **primary** |
 | LIM-AGARWAL | B.-H. Lim, A. Agarwal, "Waiting Algorithms for Synchronization in Large-Scale Multiprocessors", MIT/LCS/TR-498, which states it appears in ACM Transactions on Computer Systems 11(3), August 1993; read in the report's text (§3 p. 7, §4 pp. 9–10). |
 | BOGUSLAVSKY93 | L. Boguslavsky, K. Harzallah, A. Kreinen, K. Sevcik, A. Vainshtein, "Optimal Strategies for Spinning and Blocking", Technical Report CSRI-278, Computer Systems Research Institute, University of Toronto, January 1993; read in the report's text (§3, pp. 9–15). |
+| EPOLL-WAIT | Linux man-pages 6.9.1, `epoll_wait(2)` (2024-05-02), as Debian ships it (`manpages-dev`), saved in `benchmark-results/hyper-rt-vs-tokio-20261010/man/epoll_wait.2.txt`. **primary** |
+| TIMERFD | Linux man-pages 6.9.1, `timerfd_create(2)` (2024-06-15), saved beside it as `timerfd_create.2.txt`. **primary** |
+| RUSTIX | rustix 1.1.5 as the crate builds it, `src/timespec.rs`, `src/backend/linux_raw/event/syscalls.rs`. **primary** |
 | PANELS-LINUX | `benchmark-results/hyper-rt-vs-tokio-20261010/runs-linux/` (`linux.sh`, `spin-linux.sh`, `spin-linux2.sh`): the harness in a Linux container on this machine's Docker virtual machine (aarch64, kernel 6.12.76-linuxkit), pinned to the CPUs each panel names, with a memory limit and with or without two busy loops beside it; each run's raw output, its CPU mask and the host load. |
 
 ## 1. What a wake costs: latency and CPU are different quantities
@@ -451,6 +454,55 @@ cap were all the spinning there was, and cost from 0.7% to 18% more CPU an opera
 these runs of a few thousand waits; at the cap the share is one wait in 60. Fan-in stays below trantor on all
 three hosts, and ping-pong beside the busy loops below trantor and tokio, with no spin at all as well: those
 gaps are in the park and wake path, not in the decision to spin.
+
+## 15. A timed wait's own timer: what kqueue, epoll and timerfd promise
+
+**primary** [MAN-KQUEUE]: `EVFILT_TIMER`'s `NOTE_NSECONDS` means "data is in nanoseconds", and `NOTE_CRITICAL`
+means "override default power-saving techniques to more strictly respect the leeway value". [EPOLL-WAIT]:
+"The timeout argument specifies the number of milliseconds that epoll_wait() will block", and "the timeout
+interval will be rounded up to the system clock granularity"; `epoll_pwait2` "takes an argument of type
+timespec to be able to specify nanosecond resolution timeout", from Linux 5.11. [RUSTIX] converts a finer
+timeout to milliseconds "rounding up" (`timespec.rs:193-205`); without its `linux_5_11` feature it calls
+`epoll_pwait` with that count whenever it fits a `c_int`, and with the feature it calls `epoll_pwait2` on every
+kernel (`backend/linux_raw/event/syscalls.rs:285-334`). [TIMERFD]: with `TFD_TIMER_ABSTIME` "the timer will expire when the value of the timer's clock
+reaches the value specified in new_value.it_value"; `CLOCK_BOOTTIME` (Linux 3.15) is monotonic and counts the
+time the system is suspended; and a read returns the expirations "since its settings were last modified using
+timerfd_settime(), or since the last successful read(2)", so setting the timer again empties it.
+
+**MEASURED** (PANELS `mac-timers-r1`, load 8–10; PANELS-LINUX `c1-quiet-timers`, `c2-hogs2-timers`, load
+8–11; five rounds; median lateness, p99 in parentheses, µs):
+
+| Host | Timer | Before | Own timer | tokio current-thread | trantor |
+|---|---|---|---|---|---|
+| Mac | 1 ms | 147.5 (213.0) | 50.2 (104.4) | 1,245.2 (1,310.7) | 131.1 (192.5) |
+| Mac | 250 µs | 49.2 (96.3) | 49.2 (92.2) | 884.7 (2,031.6) | 868.4 (917.5) |
+| Mac | 5 ms | 233.5 (622.6) | 50.2 (108.5) | 1,736.7 (1,802.2) | 639.0 (704.5) |
+| Linux, 1 CPU | 1 ms | 1,966.1 (2,621.4) | 983.0 (1,441.8) | 1,966.1 (2,687.0) | 983.0 (1,441.8) |
+| Linux, 2 CPUs + 2 busy loops | 1 ms | 1,998.8 (1,998.8) | 999.4 (1,015.8) | 1,998.8 (1,998.8) | 983.0 (1,015.8) |
+| Linux, 2 CPUs + 2 busy loops | 250 µs | 1,736.7 (1,802.2) | 737.3 (802.8) | 1,736.7 (1,769.5) | 737.3 (786.4) |
+
+The shard's 50 µs median on the Mac is its timer tick (D6), the wheel's resolution; the OS timer adds little
+to it. The Mac's CPU a timer rose by 2.2 µs at 1 ms (6,498 to 8,744 ns) and 6.0 µs at 5 ms: a timer knote
+added and fired per wait, against the wait's own timeout. **MEASURED** (`os-timer3/run1.txt`): the container's
+kernel (6.12.76-linuxkit) reports a 1 ms resolution for `CLOCK_MONOTONIC` and `CLOCK_BOOTTIME`, and a 250 µs
+`nanosleep` and `timerfd` run 752 and 750 µs late at the median: it runs without high-resolution timers, so
+trantor's and the shard's timers there both meet the kernel's tick.
+
+## 16. What trantor's clients waited with
+
+The harness's plain-thread clients (`rtt`, fan-in, the gap and busy variants) wait for each answer in a
+one-value mailbox. The Rust clients park with std's `park` and are unparked, a futex or `__ulock` wait that
+blocks at once; trbench's C++ clients waited with C++20 `atomic::wait`, which in libc++ polls and then yields
+for microseconds before it blocks. **MEASURED** (one run each, this Mac, `rtt`): trantor with that client ran
+297,392 round trips a second at 0.84 context switches each; with a mailbox that blocks at once in the OS's
+address wait (`futex`, `os_sync_wait_on_address`), as the Rust clients do, 130,358 at 2.04, beside hyper-rt's
+175,481 and, never spinning, 132,934. Every client-thread comparison with trantor before `trbench-mb` (this
+note's §7 and §13, D7, and the panels named there) gave trantor's clients a spin the other arms' did not have;
+the panels from `mac-timers-r1` on use `trbench-mb`. **MEASURED** beside two busy loops (PANELS-LINUX
+`c2-hogs2-trantor-client`, three rounds): trantor's fan-in ran 3,133 a second with the polling client and
+232,500 with the blocking one, so its collapse in `c2-hogs2-c` (3,763) was the client's; its closed-loop round
+trips ran 226,020 and 354,178 (hyper-rt 299,587). Its busy rows stay far below with either client (255 and
+9,310 a second against hyper-rt's 381,193): its loop runs the busy job's slices ahead of the requests.
 
 ## What remains unknown
 

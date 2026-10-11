@@ -171,6 +171,18 @@ pub trait Driver {
     /// bound). Completions are appended to `out`. Returns `DriverLost` when the driver died.
     fn wait(&mut self, timeout_ns: Option<u64>, out: &mut Vec<Completion>) -> Result<(), RtError>;
 
+    /// Blocks until kicked, a completion arrives, or this driver's clock reaches `deadline_ns` (`None` waits
+    /// without bound): [`Driver::wait`] with the time left. A driver whose OS timer takes an absolute deadline
+    /// overrides it, so as to set its timer only when the deadline changes (epoll's timerfd).
+    fn wait_until(
+        &mut self,
+        deadline_ns: Option<u64>,
+        out: &mut Vec<Completion>,
+    ) -> Result<(), RtError> {
+        let timeout_ns = deadline_ns.map(|deadline| deadline.saturating_sub(self.now_ns()));
+        self.wait(timeout_ns, out)
+    }
+
     /// Submits an operation that completes with `user_data` on a following `wait` (the seam's
     /// self-test; every real operation follows the same path).
     fn submit_nop(&mut self, user_data: u64) -> Result<(), RtError>;

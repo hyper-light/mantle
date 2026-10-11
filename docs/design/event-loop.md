@@ -205,7 +205,8 @@ it adds no more lateness than the kernel's coalescing already allows.
 A count of polls bounds a step's time only for polls as cheap as the one it was measured on. A task that
 slices long work by the quantum and yields between slices held its shard for the whole count: with a 50 µs
 slice beside a server, a request from another thread waited 0.8–2.4 ms at the median (`bd7c0fd`, a
-calibrated count of 28; `runs/mac-a1-r1`, `runs/mac-ad-r1`) where trantor and tokio answer in one slice. The allowance follows the polls the step actually
+calibrated count of 28; `runs/mac-a1-r1`, `runs/mac-ad-r1`) where trantor and tokio answer in one slice (trantor's clients
+spun in these runs, note 42 §16). The allowance follows the polls the step actually
 runs (note 42 §11). It opens as slow start opens a window [JACOBSON88]: from one, doubling, so a step the
 clock cannot time (a tick or none) is never trusted past twice the last, and a step that ran long restarts
 it at what fits.
@@ -258,7 +259,8 @@ for the yielder's next slice too: with 50 µs slices, about three slices at the 
 to the scheduler, "which wakes deferred tasks only after it has run out of ready tasks and polled the driver"
 [TOKIO-YIELD, note 42 §13]; trantor runs its one queue in order. Both answer in one slice; so does a yield
 here now: 52 µs at the median, 8,261 requests a second against 5,827; eight clients 92,797 a second at 72 µs
-against 34,362 at 135 µs, where trantor ran 95,659 at 72 µs (`runs/mac-a1-r1`, load 25–60). The price is a
+against 34,362 at 135 µs, where trantor ran 95,659 at 72 µs with clients that spun (`runs/mac-a1-r1`, load 25–60;
+note 42 §16). The price is a
 second ring a yield passes through: sixteen tasks yielding in turn run 53.9 million polls a second against
 77.2 million (trantor runs its queued closures at 28.1 million). The check of the inboxes replaces tokio's
 poll of the driver when the ready tasks run out: a driver poll is a system call, and I/O readiness already
@@ -325,7 +327,7 @@ least in two more; in the other three every spin missed, and the first windows, 
 their cap, cost up to 18% (note 42 §14). Where spins see their work but late, the rule declines a spin that
 buys latency with CPU: on the quiet two-CPU container a closed-loop client ran 31 thousand round trips a second
 against 50 thousand spinning always, at 16.1 µs of CPU an operation against 17.3, beside trantor's 28 thousand
-and tokio's current-thread runtime's 33 thousand, neither of which spins. On one CPU no spin can see its work,
+(its client spinning, note 42 §16) and tokio's current-thread runtime's 33 thousand, neither of which spins. On one CPU no spin can see its work,
 so the rule's saving is zero there before anything is measured: the same rule, its premise checked.
 
 **Proof.**
@@ -347,3 +349,41 @@ so the rule's saving is zero there before anything is measured: the same rule, i
   rule).
 - The rest's doubling: cited, exponential backoff for a load the shard cannot know [JACOBSON88 §2, p. 7]; its
   cap, 59²: derived, so a shard whose spins never pay spends at most one wait in 60 spinning.
+
+## D10. A timed wait is held by an OS timer set to its deadline
+
+**Decision.** A shard that waits for a deadline sets an OS timer of its driver to that deadline and waits with
+no timeout. On macOS the timer is a one-shot `EVFILT_TIMER` in nanoseconds with `NOTE_CRITICAL`, submitted in
+the same `kevent` call as the wait. On Linux it is a `timerfd` on `CLOCK_BOOTTIME`, the shard clock's own, set
+to the absolute deadline and edge-triggered on the epoll instance; it is set only when the deadline changes,
+which the driver learns because the shard now hands it the deadline itself (`Driver::wait_until`, whose
+default converts to the time left for the drivers that take a timeout), so a shard woken before its deadline
+waits again with no system call for the timer. Windows keeps `GetQueuedCompletionStatusEx`'s millisecond
+timeout.
+
+**Why.** A kevent timeout runs later the longer it is (note 42 §12), and `NOTE_CRITICAL` asks macOS to
+"override default power-saving techniques to more strictly respect the leeway value" [MAN-KQUEUE].
+`epoll_wait`'s timeout counts whole milliseconds and rustix rounds a finer one up, so a 1 ms timer fired after
+2 ms [EPOLL-WAIT; RUSTIX `timespec.rs:193-205`]. `epoll_pwait2` takes nanoseconds but only from Linux 5.11,
+and rustix calls it only when built for 5.11 and then on every kernel; a `timerfd` with `TFD_TIMER_ABSTIME`
+works on every kernel the crate supports, and setting it again resets its expiration count, which readies an
+edge-triggered registration for the next deadline [TIMERFD] (note 42 §15). Measured (five rounds each), a 1 ms
+timer's median lateness on this Mac went from 148 µs to 50 µs (p99 213 to 104 µs; trantor 131 µs, tokio's
+current-thread runtime 1,245 µs) and a 5 ms timer's from 234 µs to 50 µs (trantor 639 µs), at 2.2 to 6.0 µs
+more CPU a timer. On Linux in this machine's container a 1 ms timer went from 1,966–1,999 µs late to 983–999
+µs, trantor's 983 µs and the floor of that kernel, which runs without high-resolution timers (its clocks
+report a 1 ms resolution and a 250 µs `nanosleep` runs 752 µs late); tokio stays at 1,999 µs.
+
+**Proof.**
+- `kqueue`'s test: a wait for a deadline registers the critical timer and is ended by it, never before; a wait
+  that a kick ends leaves it registered; a wait with no deadline takes it away.
+- `epoll`'s test (run on Linux, `benchmark-results/hyper-rt-vs-tokio-20261010/tests/suite-linux-timers.txt`):
+  three waits that kicks end before one deadline set the timerfd once; the timer ends the wait at its
+  deadline; a new deadline sets it again and a wait with none clears it.
+- Lateness is timing, which no exact test asserts: the panels are the measurement,
+  `benchmark-results/hyper-rt-vs-tokio-20261010/runs/mac-timers-r1`, `runs-linux/c1-quiet-timers`,
+  `runs-linux/c2-hogs2-timers`; the kernel's resolution, `os-timer3/run1.txt`. The same panels hold the
+  shard's other waits where they were (round trips, ping-pong, gets).
+
+**Constants.** None: the deadline is the shard's, and `NOTE_CRITICAL`, `CLOCK_BOOTTIME` and the timer's
+identifiers are format.

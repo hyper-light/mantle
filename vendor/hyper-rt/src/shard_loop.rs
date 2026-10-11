@@ -836,8 +836,17 @@ impl Shard {
     /// One result policy for busy harvest, spin and idle park. Fatal loss takes precedence
     /// over partial completions, before any task is fired or dead driver rearmed.
     fn receive_completions(&mut self, timeout_ns: Option<u64>) -> bool {
+        self.receive(|driver, out| driver.wait(timeout_ns, out))
+    }
+
+    /// The driver's call `wait` (a wait or a harvest), its completions delivered; true when it retrieved
+    /// any, or the driver was lost.
+    fn receive(
+        &mut self,
+        wait: impl FnOnce(&mut dyn Driver, &mut Vec<Completion>) -> Result<(), RtError>,
+    ) -> bool {
         let mut completions = std::mem::take(&mut self.core.completions);
-        let result = self.core.driver.wait(timeout_ns, &mut completions);
+        let result = wait(&mut *self.core.driver, &mut completions);
         if result == Err(RtError::DriverLost) {
             completions.clear();
             self.core.completions = completions;
@@ -1286,8 +1295,7 @@ impl Shard {
         if let Some(entry) = self.desk.entry {
             entry.pulse.record_waits(self.core.counters.waits);
         }
-        let timeout = deadline_ns.map(|d| d.saturating_sub(self.core.driver.now_ns()));
-        let _ = self.receive_completions(timeout);
+        let _ = self.receive(|driver, out| driver.wait_until(deadline_ns, out));
         self.core.driver_lost
     }
 

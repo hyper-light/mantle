@@ -50,9 +50,9 @@ use hyper_measure::alloc::Counting;
 use hyper_measure::cost::{Costs, measure};
 use hyper_measure::usage;
 use hyper_raft::Mutant;
-use hyper_raft::proto::{Entry, MessageType};
+use hyper_raft::proto::{Entry, Message, MessageType};
 use support::judge::{Core, Driver, Judge, Judged, Seed, drive, route};
-use support::{Cluster, Draws, Lagged, Mix, New, Op, Replica, Seeded, Settings};
+use support::{Cluster, Draws, Lagged, Mix, New, Op, Replica, Seeded, Settings, Step};
 
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
@@ -1064,18 +1064,42 @@ fn tiny() -> Settings {
 }
 
 /// Scenarios a round may play: a leader (3), the partition its election crosses (with each other
-/// member alone or both: 3), the partition its replication crosses (none, either, both: 4), whether
-/// it sends its new term's entries or only older ones (2), and whether it then takes a proposal it
-/// sends to no one (2).
-const SCENARIOS: usize = 3 * 3 * 4 * 2 * 2;
+/// member alone or both: 3), the partition its replication crosses (none, either, both: 4), what
+/// its replication withholds (3): nothing, its new term's entries (sending only older ones), or
+/// every notice that would raise a member's commit; and what else it is asked (3): nothing, a
+/// proposal it then sends to no one, or a read as it is elected, before any entry of its term can
+/// be committed (the thesis's §6.4 step 1), confirmed by what its replication's partition carries.
+const SCENARIOS: usize = 3 * 3 * 4 * 3 * 3;
+
+/// What a round's replication withholds from the members it reaches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Withheld {
+    Nothing,
+    /// An append that would give a member an entry of the leader's term: the old entries reach
+    /// it, the new ones do not (the thesis's Figure 3.7).
+    NewEntries,
+    /// A message that would raise the member's commit: it holds what the leader commits without
+    /// knowing it committed, as a member does whose leader's last notices were lost.
+    Commits,
+}
+
+/// What a round's leader is asked besides leading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Asked {
+    Nothing,
+    /// A proposal, after its replication, sent to no one.
+    Proposal,
+    /// A read, as it is elected.
+    Read,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Scenario {
     leader: u64,
     elected_by: Vec<u64>,
     replicated_to: Vec<u64>,
-    older_only: bool,
-    proposes: bool,
+    withheld: Withheld,
+    asked: Asked,
 }
 
 fn scenario(choice: usize) -> Scenario {
@@ -1101,8 +1125,16 @@ fn scenario(choice: usize) -> Scenario {
         leader,
         elected_by,
         replicated_to,
-        older_only: rest % 2 == 1,
-        proposes: rest / 2 == 1,
+        withheld: match rest % 3 {
+            0 => Withheld::Nothing,
+            1 => Withheld::NewEntries,
+            _ => Withheld::Commits,
+        },
+        asked: match rest / 3 {
+            0 => Asked::Nothing,
+            1 => Asked::Proposal,
+            _ => Asked::Read,
+        },
     }
 }
 
@@ -1112,6 +1144,9 @@ struct Tiny {
     group: Cluster<New>,
     judge: Judge,
     depth: u32,
+    /// The reads asked so far, each read's context its number. Not in the key: a read asked in a
+    /// round is answered in it or dropped with its member's restart, so no future depends on it.
+    reads: u64,
 }
 
 impl Tiny {
@@ -1122,6 +1157,7 @@ impl Tiny {
             group,
             judge: Judge::new(false, false, 1_000),
             depth,
+            reads: 0,
         }
     }
 
@@ -1159,12 +1195,14 @@ impl System for Tiny {
     /// A round: every member restarts on what it holds (so a round's state is its members' disks
     /// and the judge's, which the key holds); the leader campaigns until it leads or a campaign
     /// fails twice over (a vote refused for a term already voted in is answered at the next term),
-    /// its election's messages crossing only its partition; it replicates in rounds of its
+    /// its election's messages crossing only its partition; where the scenario says, it is asked a
+    /// read as soon as it leads, which its replication's rounds confirm; it replicates in rounds of its
     /// heartbeat until no disk changes, its messages crossing only their partition and, where the
     /// scenario says, no append that would give a member an entry of its term (one that follows
     /// what the member holds: an append past a hole is delivered, and refused, as the thesis's
-    /// Figure 3.7 has the old entry reach a member while the new one does not); then it takes a proposal,
-    /// sent to no one.
+    /// Figure 3.7 has the old entry reach a member while the new one does not), or no message
+    /// that would raise a member's commit; then, where the
+    /// scenario says, it takes a proposal, sent to no one.
     fn play(&mut self, choice: usize) -> Result<(), String> {
         let round = scenario(choice);
         for id in 1..=3 {
@@ -1192,6 +1230,11 @@ impl System for Tiny {
             return Ok(());
         }
         let term = self.group.peek(leader).map_or(0, |node| node.view().term);
+        if round.asked == Asked::Read {
+            self.reads += 1;
+            self.act(&Op::Read(leader, self.reads.to_le_bytes().to_vec()));
+            self.fault()?;
+        }
         // Each round of the heartbeat moves some disk or ends the replication; a disk takes at
         // most an entry a round and a probe a round for it, and the scope's logs hold at most an
         // entry and a proposal a round over its rounds: twice that many rounds, and one to see
@@ -1203,21 +1246,32 @@ impl System for Tiny {
                 self.act(&Op::Tick(leader));
             }
             let to = round.replicated_to.clone();
-            let older = round.older_only;
+            let withheld = round.withheld;
             route(&mut self.group, &mut self.judge, |group, m| {
+                let held = group.disk(m.to);
                 to.contains(&m.from)
                     && to.contains(&m.to)
-                    && !(older
-                        && m.msg_type == MessageType::MsgAppend
-                        && m.entries.iter().any(|e| e.term == term)
-                        && m.index <= group.disk(m.to).last_index())
+                    && match withheld {
+                        Withheld::Nothing => true,
+                        Withheld::NewEntries => {
+                            !(m.msg_type == MessageType::MsgAppend
+                                && m.entries.iter().any(|e| e.term == term)
+                                && m.index <= held.last_index())
+                        }
+                        Withheld::Commits => {
+                            !(matches!(
+                                m.msg_type,
+                                MessageType::MsgAppend | MessageType::MsgHeartbeat
+                            ) && m.commit > held.hard_state.commit)
+                        }
+                    }
             });
             self.fault()?;
             if self.disks() == before {
                 break;
             }
         }
-        if round.proposes {
+        if round.asked == Asked::Proposal {
             self.act(&Op::Propose(leader, b"v".to_vec()));
             route(&mut self.group, &mut self.judge, |_, _| false);
         }
@@ -1242,6 +1296,249 @@ impl System for Tiny {
             self.judge.same,
         ))
     }
+}
+
+/// Three members driven ahead of their persistence (`Lagged`, `docs/durable.md` §2.1), on
+/// [`tiny`]'s rules with two writes out at most, as the pipelined schedules run them.
+fn tiny_lagged() -> Settings {
+    Settings {
+        depth: 2,
+        in_place: true,
+        ..tiny()
+    }
+}
+
+/// Scenarios a round of lagged members may play: a leader (3), the partition its election crosses
+/// (3, as [`Scenario`]'s), and which member, if any, stops once it has taken what the election
+/// gave it to write and before any of it is durable (4): the crash point between a write's issue and
+/// its durability, where a vote or a term that left early is lost.
+const LAGGED_SCENARIOS: usize = 3 * 3 * 4;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LaggedScenario {
+    leader: u64,
+    elected_by: Vec<u64>,
+    stopped: Option<u64>,
+}
+
+fn lagged_scenario(choice: usize) -> LaggedScenario {
+    let leader = (choice % 3) as u64 + 1;
+    let rest = choice / 3;
+    let others: Vec<u64> = (1..=3).filter(|m| *m != leader).collect();
+    let mut elected_by = vec![leader];
+    match rest % 3 {
+        0 => elected_by.push(others[0]),
+        1 => elected_by.push(others[1]),
+        _ => elected_by.extend(&others),
+    }
+    let stopped = match rest / 3 {
+        0 => None,
+        member => Some(member as u64),
+    };
+    LaggedScenario {
+        leader,
+        elected_by,
+        stopped,
+    }
+}
+
+/// The passes a lagged election takes at most before nothing moves. A pass delivers what is in
+/// flight and then steps every member's persistence once, which releases what waited for its
+/// write: a message takes a pass to be released and is delivered in the next. A campaign sends a
+/// request to each of two voters and each answers: four messages, two passes each, and one more
+/// pass sees nothing move.
+const ELECTION_PASSES: u32 = 4 * 2 + 1;
+
+/// The passes a lagged replication takes at most before nothing moves: one entry an append, so a
+/// follower is sent each entry it lacks and answers it, two messages of two passes each; a log
+/// holds at most one entry a round played (each leader's first), so `rounds` of them; then the
+/// commit's notice and its answer, two more messages; and one pass to see nothing move.
+fn replication_passes(rounds: u32) -> u32 {
+    2 * 2 * (rounds + 1) + 1
+}
+
+/// Three lagged members and their judge, a round at a time.
+#[derive(Clone)]
+struct TinyLagged {
+    group: Cluster<Lagged>,
+    judge: Judge,
+    depth: u32,
+}
+
+impl TinyLagged {
+    fn new(mutant: Option<Mutant>, depth: u32) -> Self {
+        let mut group: Cluster<Lagged> = Cluster::new(3, &[1, 2, 3], tiny_lagged(), 0);
+        group.plant(mutant);
+        Self {
+            group,
+            judge: Judge::new(false, true, 1_000),
+            depth,
+        }
+    }
+
+    fn act(&mut self, op: &Op) {
+        self.group.act_observed(&mut self.judge, op);
+    }
+
+    fn fault(&self) -> Result<(), String> {
+        self.judge
+            .violation
+            .as_ref()
+            .map_or(Ok(()), |v| Err(v.to_string()))
+    }
+
+    fn disks(&self) -> u128 {
+        fingerprint(&format!(
+            "{:?}",
+            self.group
+                .ids()
+                .iter()
+                .map(|id| self.group.disk(*id))
+                .collect::<Vec<_>>()
+        ))
+    }
+
+    /// Passes until nothing moves: what `allow` lets through is delivered, then every member's
+    /// persistence is stepped once, `stopping` only taking what it is given to write and making
+    /// none of it durable.
+    fn settle(
+        &mut self,
+        passes: u32,
+        stopping: Option<u64>,
+        allow: impl Fn(&Cluster<Lagged>, &Message) -> bool + Copy,
+    ) -> Result<(), String> {
+        for _ in 0..passes {
+            let (before, flight) = (self.disks(), self.group.net.len());
+            route(&mut self.group, &mut self.judge, allow);
+            for id in 1..=3 {
+                let step = if Some(id) == stopping {
+                    Step::Take
+                } else {
+                    Step::Flush
+                };
+                self.act(&Op::Persist(id, step));
+            }
+            self.fault()?;
+            if self.group.net.is_empty() && flight == 0 && self.disks() == before {
+                return Ok(());
+            }
+        }
+        // A harness failure, reported as the search reports a fault, with its path.
+        Err(format!(
+            "a lagged round did not settle within {passes} passes"
+        ))
+    }
+}
+
+impl System for TinyLagged {
+    type Fault = String;
+
+    fn choices(&self) -> usize {
+        LAGGED_SCENARIOS
+    }
+
+    /// A round: every member restarts on what its disk holds; the leader campaigns (twice at most,
+    /// as [`Tiny`]'s), its election's messages crossing only its partition, every member's writes
+    /// made durable as the passes go but the stopped member's, which takes what it is given and
+    /// then stops with none of it durable; then the leader, if elected, replicates to its
+    /// partition, every member's writes made durable, until nothing moves.
+    fn play(&mut self, choice: usize) -> Result<(), String> {
+        let round = lagged_scenario(choice);
+        for id in 1..=3 {
+            self.act(&Op::Restart(id));
+        }
+        self.fault()?;
+        let (leader, among) = (round.leader, round.elected_by.clone());
+        for _ in 0..2 {
+            self.act(&Op::Campaign(leader));
+            let voters = &among;
+            self.settle(ELECTION_PASSES, round.stopped, move |_, m| {
+                voters.contains(&m.from)
+                    && voters.contains(&m.to)
+                    && matches!(
+                        m.msg_type,
+                        MessageType::MsgRequestVote | MessageType::MsgRequestVoteResponse
+                    )
+            })?;
+            if self.group.leaders_now().contains(&leader) {
+                break;
+            }
+        }
+        if let Some(stopped) = round.stopped {
+            self.act(&Op::Restart(stopped));
+            self.fault()?;
+        }
+        if !self.group.leaders_now().contains(&leader) {
+            return Ok(());
+        }
+        for _ in 0..self.group.settings.heartbeat_tick {
+            self.act(&Op::Tick(leader));
+        }
+        let to = &among;
+        let passes = replication_passes(self.depth);
+        self.settle(passes, None, move |_, m| {
+            to.contains(&m.from) && to.contains(&m.to)
+        })
+    }
+
+    /// The members' disks and the oracles a round's futures depend on, as [`Tiny::key`]'s: every
+    /// member restarts at the next round, so nothing else carries over; the durability oracle keeps
+    /// no table.
+    fn key(&self) -> u128 {
+        fingerprint(&format!(
+            "{:?} {:?} {:?} {:?} {:?} {:?}",
+            self.group
+                .ids()
+                .iter()
+                .map(|id| self.group.disk(*id))
+                .collect::<Vec<_>>(),
+            self.judge.election,
+            self.judge.matching,
+            self.judge.machine,
+            self.judge.complete,
+            self.judge.same,
+        ))
+    }
+}
+
+/// Every sequence of three rounds of three lagged members, a member stopping between a write's
+/// issue and its durability in any round, played on the real core: no oracle breaks.
+#[test]
+fn every_three_lagged_rounds_keep_every_oracle() {
+    let played = rounds(&TinyLagged::new(None, 3), 3, Budget::default());
+    let Played::Exhausted(done) = played else {
+        panic!("{played:?}");
+    };
+    println!("three lagged rounds: {done:?}");
+    assert!(done.pruned > 0);
+}
+
+/// A vote that leaves before it is durable (`Mutant::VoteBeforeDurable`) is caught by the round
+/// search of lagged members in its first round: the durability oracle refuses the vote as it
+/// leaves (I1).
+#[test]
+fn a_lagged_round_catches_a_vote_sent_before_it_is_durable() {
+    let played = rounds(
+        &TinyLagged::new(Some(Mutant::VoteBeforeDurable), 1),
+        1,
+        Budget::default(),
+    );
+    let Played::Fault {
+        rounds,
+        path,
+        fault,
+    } = played
+    else {
+        panic!("one lagged round did not catch a vote sent before it was durable: {played:?}");
+    };
+    println!(
+        "vote before durable caught after {} rounds played: {fault}\n  {:?}",
+        rounds.played,
+        path.iter()
+            .map(|choice| lagged_scenario(*choice))
+            .collect::<Vec<_>>()
+    );
+    assert!(fault.starts_with("Durability"), "{fault}");
 }
 
 /// Every sequence of two rounds of three members, played on the real core: no oracle breaks.
@@ -1291,6 +1588,37 @@ fn four_rounds_of_three_members_catch_the_older_term_commit() {
             .map(|choice| scenario(*choice))
             .collect::<Vec<_>>()
     );
+}
+
+/// A read answered before the term's first commit (`Mutant::ReadBeforeFirstCommit`) is caught by
+/// the exhaustive search of two rounds: a leader commits an entry the next leader holds but does
+/// not know committed, and that leader, asked a read as it is elected, answers below the commit
+/// the read was asked at. Without the defect every two rounds keep every oracle
+/// (`every_two_rounds_of_three_members_keep_every_oracle`).
+#[test]
+fn two_rounds_of_three_members_catch_the_read_before_the_first_commit() {
+    let played = rounds(
+        &Tiny::new(Some(Mutant::ReadBeforeFirstCommit), 2),
+        2,
+        Budget::default(),
+    );
+    let Played::Fault {
+        rounds,
+        path,
+        fault,
+    } = played
+    else {
+        panic!("two rounds did not catch the read before the first commit: {played:?}");
+    };
+    println!(
+        "read before the first commit caught after {} rounds played: {fault}\n  {:#?}",
+        rounds.played,
+        path.iter()
+            .map(|choice| scenario(*choice))
+            .collect::<Vec<_>>()
+    );
+    assert!(fault.starts_with("Read safety"), "{fault}");
+    assert_eq!(path.len(), 2);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1470,29 +1798,29 @@ fn figure_three_seven_is_a_path_of_four_rounds() {
             leader: 1,
             elected_by: vec![1, 2, 3],
             replicated_to: vec![1, 2, 3],
-            older_only: false,
-            proposes: true,
+            withheld: Withheld::Nothing,
+            asked: Asked::Proposal,
         },
         Scenario {
             leader: 3,
             elected_by: vec![3, 2],
             replicated_to: vec![3],
-            older_only: false,
-            proposes: true,
+            withheld: Withheld::Nothing,
+            asked: Asked::Proposal,
         },
         Scenario {
             leader: 1,
             elected_by: vec![1, 2],
             replicated_to: vec![1, 2],
-            older_only: true,
-            proposes: false,
+            withheld: Withheld::NewEntries,
+            asked: Asked::Nothing,
         },
         Scenario {
             leader: 3,
             elected_by: vec![3, 2],
             replicated_to: vec![3, 2],
-            older_only: false,
-            proposes: false,
+            withheld: Withheld::Nothing,
+            asked: Asked::Nothing,
         },
     ];
     for mutant in [None, Some(Mutant::OlderTermCommit)] {

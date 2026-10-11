@@ -3936,6 +3936,50 @@ fn a_blocking_writer_flushes_its_own_frame() {
     assert!(threads.iter().all(|t| *t != me), "{threads:?}");
 }
 
+/// Every blocking writer does its own frame's I/O, whichever handle it writes through and from
+/// whichever thread: a log's write and waiting write, an opener's and a group's handle's, each
+/// frame flushed and confirmed on its writer's thread. A thread writing to logs of two kinds of
+/// file keeps a job slot for each.
+#[test]
+fn every_blocking_writer_flushes_its_own_frame() {
+    let (flushed, flushes) = std::sync::mpsc::sync_channel(1 << 10);
+    let file = Flushing {
+        file: sim(51),
+        flushed,
+    };
+    let log = Log::create(file, config(16, 8), ID).unwrap();
+    let other = Log::create(sim(52), config(16, 8), ID).unwrap();
+    while flushes.try_recv().is_ok() {}
+    let opener = log.opener();
+    let mut handle = log.group(3).unwrap();
+    let small = |term| Update {
+        hard_state: Some(hard(term, 0)),
+        ..Update::default()
+    };
+    let me = std::thread::current().id();
+    for term in 1..=3 {
+        log.write(1, small(term)).unwrap();
+        other.write(1, small(term)).unwrap();
+        log.write_waiting(1, small(term)).unwrap();
+        opener.write_waiting(2, small(term)).unwrap();
+        other.write_waiting(2, small(term)).unwrap();
+        handle.write(small(term)).unwrap();
+        let threads: Vec<_> = flushes.try_iter().collect();
+        // Four writes to the log, each a frame's flush and its confirmation's.
+        assert_eq!(threads, [me; 8], "round {term}");
+    }
+    std::thread::scope(|s| {
+        let writer = s.spawn(|| {
+            log.write(1, small(4)).unwrap();
+            std::thread::current().id()
+        });
+        let writer = writer.join().unwrap();
+        assert_ne!(writer, me);
+        let threads: Vec<_> = flushes.try_iter().collect();
+        assert_eq!(threads, [writer; 2]);
+    });
+}
+
 /// A frame that confirms itself comes back to the owner waking no one. A submission the log took
 /// while that confirmation was written waits on the frame to come back, and the owner, having
 /// asked the I/O thread to wake it then, writes and answers it.

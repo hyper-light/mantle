@@ -1,6 +1,9 @@
 //! A writer process killed at a random point, on a real file system through the real
 //! direct-I/O file layer: every write the child reported as acknowledged must be there after
-//! reopening, and the one write in flight may or may not be.
+//! reopening, and the one write in flight may or may not be. Its frame may have reached the
+//! file without its record, since a batch's writes are issued together (chunk-store.md §4):
+//! recovery then keeps the record and reports it damaged (§6, step 3), as the crash test
+//! expects of a write a power cut tore.
 //!
 //! The test binary re-launches itself as the child (`kill_child_entry` with
 //! `MANTLE_KILL_CHILD` set), which formats a volume in a directory the parent names and
@@ -27,7 +30,7 @@ use std::process::{Command, Stdio};
 use common::{SIZE, config, data, issuer, key};
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
-use mantle_chunk::{ChunkKey, Volume};
+use mantle_chunk::{ChunkError, ChunkKey, Volume};
 
 const KEYS: u64 = 8;
 
@@ -198,15 +201,46 @@ fn run(seed: u64, kill_after: u64) {
     }
     let (uncertain_key, uncertain_op) = op(seed, acked, &state);
 
-    let (v, _) = Volume::open(
+    let (v, report) = Volume::open(
         issuer(),
         open_file(&dir.path().join("volume"), false),
         config(),
     )
     .unwrap_or_else(|e| panic!("seed {seed}: reopening after kill failed: {e}"));
+    // Recovery reports only records of the last batch: the write in flight, if any.
+    assert!(
+        report.damaged.iter().all(|k| *k == uncertain_key),
+        "seed {seed}, killed after {acked} acks: {:?} reported damaged, only {uncertain_key} \
+         was in flight",
+        report.damaged
+    );
     for n in 0..KEYS {
         let k = key(n);
         let acked_state = state.get(&k).cloned().flatten();
+        if report.damaged.contains(&k) {
+            // The write in flight is indexed without its record whole: the chunk stands as the
+            // write leaves it, a read of it answers that its bytes do not verify, and the bytes
+            // acknowledged before it still read back.
+            let after = apply(&acked_state, &uncertain_op).unwrap();
+            let s = v.stat(&k).unwrap().unwrap();
+            assert_eq!(
+                (s.len, s.sealed),
+                (after.bytes.len() as u64, after.sealed),
+                "seed {seed}, killed after {acked} acks: damaged chunk {k}"
+            );
+            assert!(
+                matches!(v.read(&k, 0, s.len), Err(ChunkError::Corrupt { .. })),
+                "seed {seed}, killed after {acked} acks: damaged chunk {k} read back"
+            );
+            if let Some(a) = acked_state.filter(|a| !a.bytes.is_empty()) {
+                assert_eq!(
+                    v.read(&k, 0, a.bytes.len() as u64).unwrap(),
+                    a.bytes,
+                    "seed {seed}, killed after {acked} acks: chunk {k}'s acknowledged bytes"
+                );
+            }
+            continue;
+        }
         let got = v.stat(&k).unwrap().map(|s| State {
             bytes: v
                 .read(&k, 0, s.len)

@@ -13,7 +13,8 @@
 //! result is taken, so a read between never sees one half changed.
 //!
 //! How many workers: Little's law, L = λW (Little, Operations Research 9(3), 1961). Between one
-//! cascade's start and the next, the shard's thread offers maintenance its memtables at the pace
+//! period's start and the next (the trunk starts one when its root takes pending branches or a
+//! consolidation starts), the shard's thread offers maintenance its memtables at the pace
 //! puts fill them, and the workers spent `busy` nanoseconds on jobs; the shard itself ran for
 //! `period` nanoseconds of that, its waits on the workers left out, since those measure too few
 //! workers rather than demand. Keeping up takes `busy / period` workers on average, so the pool
@@ -158,7 +159,7 @@ pub struct Output {
     pub ns: u64,
 }
 
-/// Who a job's result goes back to: the trunk's cascade, or the shard's packing.
+/// Who a job's result goes back to: the trunk's maintenance, or the shard's packing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Owner {
     Trunk,
@@ -473,7 +474,7 @@ pub struct Pool {
     most: usize,
     /// The workers Little's law measured the need for.
     want: usize,
-    /// Workers' nanoseconds on jobs, and the shard's own waits on them, since the cascade
+    /// Workers' nanoseconds on jobs, and the shard's own waits on them, since the period
     /// started at `since`.
     busy_ns: u64,
     waited_ns: u64,
@@ -826,7 +827,7 @@ impl Pool {
             .max(1)
     }
 
-    /// The admitted worker maximum, including workers that may start in a later cascade.
+    /// The admitted worker maximum, including workers that may start in a later period.
     pub(crate) fn capacity(&self) -> usize {
         self.most
     }
@@ -841,9 +842,9 @@ impl Pool {
         self.want
     }
 
-    /// A cascade starts: the last one's measure sets the workers wanted (the module's rule).
-    /// With no shard time between two cascades (a drain), every core is wanted.
-    pub fn cascade_started(&mut self) {
+    /// A period starts: the last one's measure sets the workers wanted (the module's rule).
+    /// With no shard time between two periods (a drain), every core is wanted.
+    pub fn period_started(&mut self) {
         let now = Instant::now();
         if let Some(since) = self.since {
             let wall = ns(now.saturating_duration_since(since));

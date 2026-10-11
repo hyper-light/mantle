@@ -1,8 +1,8 @@
 //! The shard's paced maintenance (docs/design/engine-structure.md §6) against a `BTreeMap`: with
 //! memtables of a few KiB and a fanout of 3, puts rotate memtables, pack them a slice at a time,
-//! queue packed branches and run the trunk's cascades a slice at a time, all interleaved. Every
+//! queue packed branches and run the trunk's maintenance a slice at a time, all interleaved. Every
 //! key reads its newest value between any two operations, wherever it then lives: the memtable,
-//! the one being packed, a pending branch, or a tree whose cascade is part done. Checkpoints
+//! the one being packed, a pending branch, or a tree whose maintenance is part done. Checkpoints
 //! along the way free extents for reuse. Flushed at the end, the store holds exactly the extents
 //! the engine names.
 #![allow(
@@ -513,7 +513,7 @@ fn run_trunk<F: BlockFile + 'static>(
     );
     let (flush, trunk, _) = db.stats();
     eprintln!("{flush:?}\n{trunk:?}\nscan sources skipped {skipped} opened {opened}");
-    // The workload did what it is for: many memtables packed in slices, cascades with leaf
+    // The workload did what it is for: many memtables packed in slices, maintenance with leaf
     // compactions and splits.
     assert!(flush.flushes > 100, "{}", flush.flushes);
     assert!(trunk.leaf_compactions > 0 && trunk.splits > 0, "{trunk:?}");

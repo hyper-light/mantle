@@ -1,6 +1,6 @@
 //! The shard's trunk compactions on maintenance workers (`ShardDb::set_workers`), against a
-//! `BTreeMap`: with memtables of a few KiB and a fanout of 3, cascades start every few hundred
-//! puts and their compactions run on other threads, over their own handles on the file, while
+//! `BTreeMap`: with memtables of a few KiB and a fanout of 3, the root takes branches every few
+//! hundred puts and the trunk's compactions run on other threads, over their own handles on the file, while
 //! puts and reads go on. Every key reads its newest value between any two operations, wherever
 //! it then lives, and every scan reads exactly the live keys. Checkpoints along the way free
 //! extents the workers' outputs replaced; the store reopened reads every key the last
@@ -161,7 +161,7 @@ fn run(issuer: bool, idle: bool) {
     workers(&mut db, &path);
     let oracle = workload(&mut db, idle, 0x2545_f491_4f6c_dd1d);
     let (flush, trunk, _) = db.stats();
-    // The workload did what it is for: many cascades, their pivot and leaf compactions and
+    // The workload did what it is for: much maintenance, its pivot and leaf compactions and
     // splits all on the workers.
     assert!(flush.flushes > 100, "{}", flush.flushes);
     // Most memtables packed on workers; one finds none free only when every worker is busy.
@@ -213,8 +213,8 @@ fn idle_slices_take_the_workers_results_and_keep_every_read_exact() {
 }
 
 /// The same workload, inline and on workers, leaves the same rows: the workers' compactions
-/// write what the shard's own would. (Their cascades differ: workers finish one sooner, so the
-/// next takes fewer pending branches.)
+/// write what the shard's own would. (Their maintenance differs: workers finish a task sooner, so
+/// the root takes its pending branches in other batches.)
 #[test]
 fn workers_and_inline_compactions_hold_the_same_data() {
     let dir = tempfile::tempdir().unwrap();

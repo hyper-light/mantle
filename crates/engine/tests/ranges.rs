@@ -413,7 +413,7 @@ fn a_held_maintenance_read_leaves_the_shard_available_for_range_requests() {
     let first_path = dir.path().join("first");
     let mut first = native_db(&first_path, Arc::clone(&gate));
     let mut oracle = BTreeMap::new();
-    // Values span separate leaves. Several full memtables leave a cascade owed after puts,
+    // Values span separate leaves. Several full memtables leave maintenance owed after puts,
     // so idle preparation needs cold input pages rather than merely tidying the memtable.
     for i in 0..TRUNK.leaf_entries {
         let key = format!("a{i:04}").into_bytes();
@@ -515,7 +515,7 @@ fn a_held_maintenance_read_leaves_the_shard_available_for_range_requests() {
             done
         });
         let mut client = ranges.client().unwrap();
-        // No request is sent while the cascade's first cold read is awaited: the range is idle, so
+        // No request is sent while maintenance's first cold read is awaited: the range is idle, so
         // it runs its owed maintenance until that read is admitted off its thread, the fact this
         // waits on; a read attempted on the shard's thread, or the range settling or faulting
         // first, fails at once.

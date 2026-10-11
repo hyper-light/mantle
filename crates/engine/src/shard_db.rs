@@ -13,7 +13,7 @@
 //!   for each further one that may wait).
 //!
 //! A put of `b` bytes does `debt · b / room` of a debt: paid at that rate, it is paid when the
-//! room runs out. A cascade's compactions are owed only once planned, so a debt can still be
+//! room runs out. Maintenance's compactions are owed only once planned, so a debt can still be
 //! owed when a memtable fills; that put pays it whole, a stall the engine counts.
 //!
 //! Durability is the Raft log's (§2): the engine applies committed entries and makes its state
@@ -974,7 +974,7 @@ impl<F: BlockFile> ShardDb<F> {
     /// shard's file that `open` gives (the file opened again as the shard's was): as many as
     /// the measured need asks, up to the cores the OS reports less this thread (`trunk::pool`).
     /// Puts then pay only for taking the workers' results, and wait on them only when a
-    /// rotation finds the trunk's cascade still out. Refused when the workers' channel back
+    /// rotation finds the trunk's root without room. Refused when the workers' channel back
     /// cannot be made (`Pool::new`).
     pub fn set_workers(
         &mut self,
@@ -2419,8 +2419,8 @@ impl<F: BlockFile> ShardDb<F> {
                 }
                 self.note_trunk(ns_since(t));
             }
-        } else if self.trunk.cascading() && self.trunk.has_pool() {
-            // The cascade's compactions are out on the workers: a step takes whatever results
+        } else if self.trunk.maintaining() && self.trunk.has_pool() {
+            // Maintenance's compactions are out on the workers: a step takes whatever results
             // have come and hands out what they let go, waiting for none.
             if paced {
                 self.trunk.step_paced(&mut self.store, 1)?;
@@ -3179,7 +3179,7 @@ impl<F: BlockFile> ShardDb<F> {
             };
         }
         if self.trunk.consolidation_owed() {
-            // Seeks paid for consolidating leaves: one cascade, in bulk, flushes and settles
+            // Seeks paid for consolidating leaves: one consolidation, in bulk, flushes and settles
             // them. After views and maplets, which make a bundle one source without rewriting
             // it: seeks pay rent only for the sources left with those built.
             let t = Some(std::time::Instant::now());
@@ -3325,7 +3325,7 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     /// The same rotation as the blocking API, paid in the task's existing slice budget.
-    /// Only old packing and cascade state changes before it returns true; the caller's entry
+    /// Only old packing and maintenance state changes before it returns true; the caller's entry
     /// remains unapplied, and every old memtable remains reachable by reads.
     fn rotate_paced(&mut self, keys: u64) -> Result<bool, Error> {
         self.require_async_backend()?;
@@ -3397,23 +3397,20 @@ impl<F: BlockFile> ShardDb<F> {
                 return Ok(false);
             }
         }
-        if self.trunk.pending() >= self.trunk.fanout() {
+        if !self.trunk.has_room() {
             if let Some(r) = self.rotation.as_mut() {
                 r.stalled = true;
             }
             if self.trunk.packing_blocks_dispatch() {
                 // A packing holds every seat and can still need owner-fed input. Pay its
-                // bounded slice before waiting on the cascade's worker capacity.
+                // bounded slice before waiting on maintenance's worker capacity.
                 self.pack_some(keys.max(1), false)?;
                 self.take_packs(false)?;
                 if self.trunk.packing_blocks_dispatch() {
                     return Ok(false);
                 }
             }
-            if !self
-                .trunk
-                .finish_cascade_paced(&mut self.store, keys.max(1))?
-            {
+            if !self.trunk.make_room_paced(&mut self.store, keys.max(1))? {
                 return Ok(false);
             }
         }
@@ -3444,7 +3441,7 @@ impl<F: BlockFile> ShardDb<F> {
         Ok(true)
     }
 
-    /// Packs every memtable and finishes its cascades before a range starts durability.
+    /// Packs every memtable and finishes its maintenance before a range starts durability.
     /// A false result owns all unfinished work.
     pub(crate) fn flush_paced(&mut self, keys: u64) -> Result<bool, Error> {
         self.trunk.clear_io_wait();
@@ -3478,7 +3475,7 @@ impl<F: BlockFile> ShardDb<F> {
 
     /// The memtable is full: it becomes the packing one and a cleared one takes the puts. A debt
     /// still owed is paid first, whole, and counted a stall: the packing memtable's, and the
-    /// trunk's cascade when `fanout` packed memtables wait on it.
+    /// trunk's maintenance when its root has no room for more branches.
     fn rotate(&mut self) -> Result<(), Error> {
         self.rebudget();
         self.flush_stats.rotations = self.flush_stats.rotations.saturating_add(1);
@@ -3506,13 +3503,13 @@ impl<F: BlockFile> ShardDb<F> {
             self.wait_oldest(self.frozen.len().saturating_sub(most))?;
             stalled = true;
         }
-        if self.trunk.pending() >= self.trunk.fanout() {
+        if !self.trunk.has_room() {
             if self.trunk.packing_blocks_dispatch() {
-                // A whole cascade cannot admit its first job until a packing seat is free;
-                // feed the oldest packing before any wait that would depend on its owner.
+                // The root's compactions cannot admit a job until a packing seat is free; feed
+                // the oldest packing before any wait that would depend on its owner.
                 self.wait_oldest(1)?;
             }
-            self.trunk.finish_cascade(&mut self.store)?;
+            self.trunk.make_room(&mut self.store)?;
             stalled = true;
         }
         if stalled {
@@ -3572,7 +3569,7 @@ impl<F: BlockFile> ShardDb<F> {
         // mantle-bounded-consolidation-experiment-20261008). Then the views and maplets of the
         // bundles it changed.
         self.trunk.consolidate_all();
-        while used < budget && (self.trunk.consolidation_owed() || self.trunk.cascading()) {
+        while used < budget && (self.trunk.consolidation_owed() || self.trunk.maintaining()) {
             // A drain's whole budget stays whole, so each step waits for the workers'
             // compactions rather than return to be called again.
             let left = if budget == u64::MAX {
@@ -4180,10 +4177,10 @@ mod frozen_tests {
         assert!(db.frozen.is_empty());
         assert!(GATES_A.waited());
         check(&mut db, &oracle);
-        // Puts on, through a cascade, at the overlap the shard measures.
+        // Puts on, through `fanout` rotations, at the overlap the shard measures.
         let rotations = db.flush_stats.rotations;
-        let cascade = u64::try_from(TRUNK.fanout).unwrap();
-        while db.flush_stats.rotations < rotations + cascade {
+        let more = u64::try_from(TRUNK.fanout).unwrap();
+        while db.flush_stats.rotations < rotations + more {
             put_or_delete(&mut db, &mut oracle, i);
             i += 1;
         }

@@ -9,18 +9,18 @@
 //! Documentation/ABI/stable/sysfs-block. File system types are the statfs(2) `f_type` magic
 //! numbers of include/uapi/linux/magic.h.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use rustix::fs::FileType;
 
 use crate::identity::{
-    FileSystem, FileSystemKind, Identity, Interconnect, Medium, WriteCache, Zoned,
+    FileSystem, FileSystemKind, Identity, Interconnect, Medium, Member, Note, WriteCache, Zoned,
 };
 
-/// Composite devices nest (dm-crypt over LVM over md, three deep); the walk, which recurses,
-/// stops past this depth and leaves the composite's medium unknown rather than guess it, so
-/// the device is measured and treated as rule 5 of CLAUDE.md treats an undescribed one.
+/// Composite devices nest (dm-crypt over LVM over md, three deep); the walk stops past this
+/// depth and leaves the composite's medium unknown rather than guess it, so the device is
+/// measured and treated as rule 5 of CLAUDE.md treats an undescribed one.
 const MAX_DEPTH: usize = 8;
 
 pub fn identify(path: &Path) -> Identity {
@@ -99,19 +99,26 @@ fn describe_number(number: rustix::fs::Dev, identity: &mut Identity) -> Option<P
         }
     };
     if !dir.join("partition").exists() {
-        describe(&dir, identity, 0, &mut HashSet::new());
+        describe(&dir, identity);
         return None;
     }
     let disk = dir.parent().map_or_else(|| dir.clone(), Path::to_path_buf);
-    describe(&disk, identity, 0, &mut HashSet::new());
+    describe(&disk, identity);
     Some(dir)
 }
 
-/// Fills `identity` from the sysfs directory of a whole block device. `seen` holds the devices
-/// the walk has described, each once, so the walk does no more work than the system has
-/// block devices, however they share members.
-fn describe(disk: &Path, identity: &mut Identity, depth: usize, seen: &mut HashSet<PathBuf>) {
-    seen.insert(disk.to_path_buf());
+/// Fills `identity` from the sysfs directory of a whole block device, and a composite's members
+/// as one flat list ([`stack`]).
+fn describe(disk: &Path, identity: &mut Identity) {
+    let mut seen = HashSet::from([disk.to_path_buf()]);
+    describe_one(disk, identity);
+    if identity.interconnect == Interconnect::Composite {
+        stack(disk, identity, &mut seen);
+    }
+}
+
+/// Fills `identity` from the sysfs directory of a whole block device, its members aside.
+fn describe_one(disk: &Path, identity: &mut Identity) {
     let name = disk
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -152,10 +159,6 @@ fn describe(disk: &Path, identity: &mut Identity, depth: usize, seen: &mut HashS
         _ => Medium::Unknown,
     };
     identity.model = read_str(&disk.join("device"), "model", identity);
-
-    if identity.interconnect == Interconnect::Composite {
-        members(disk, identity, depth, seen);
-    }
 }
 
 fn interconnect(name: &str, canonical: &str, disk: &Path, identity: &mut Identity) -> Interconnect {
@@ -194,24 +197,128 @@ fn interconnect(name: &str, canonical: &str, disk: &Path, identity: &mut Identit
     Interconnect::Unknown
 }
 
-fn members(disk: &Path, identity: &mut Identity, depth: usize, seen: &mut HashSet<PathBuf>) {
+/// A composite's members, from each composite's `slaves/`: one walk over a queue of devices still
+/// to describe, each with the member it sits under and its depth. A device is marked seen when
+/// queued, so each is described once, however the stack shares it, and the queue holds at most
+/// the system's block devices; a composite deeper than `MAX_DEPTH` is noted and not followed.
+/// Then each composite is as slow as its slowest member: a member is listed after the member it
+/// sits under, so a pass from the last member to the first meets children before parents.
+fn stack(disk: &Path, identity: &mut Identity, seen: &mut HashSet<PathBuf>) {
+    // Per composite (the top one first, then members by index): it shares a member described
+    // under another, or nests too deep to follow.
+    let mut queue = VecDeque::new();
+    let found = slaves(disk, 0, seen, &mut queue, None);
+    identity.notes.extend(found.notes);
+    let (mut shared, mut deep) = (vec![found.shared], vec![found.deep]);
+    while let Some((whole, under, depth)) = queue.pop_front() {
+        let mut described = Identity::unknown(identity.file_system.clone());
+        describe_one(&whole, &mut described);
+        let index = identity.members.len();
+        let mut notes = described.notes;
+        let (mut is_shared, mut is_deep) = (false, false);
+        if described.interconnect == Interconnect::Composite {
+            let found = slaves(&whole, depth, seen, &mut queue, Some(index));
+            notes.extend(found.notes);
+            (is_shared, is_deep) = (found.shared, found.deep);
+        }
+        identity.members.push(Member {
+            under,
+            device: described.device,
+            model: described.model,
+            medium: described.medium,
+            interconnect: described.interconnect,
+            size_bytes: described.size_bytes,
+            notes,
+        });
+        shared.push(is_shared);
+        deep.push(is_deep);
+    }
+    // Children before parents: each member settles its own medium, then a rotational one makes
+    // its composite rotational.
+    for at in (0..identity.members.len()).rev() {
+        let flag = at.saturating_add(1);
+        let Some(member) = identity.members.get_mut(at) else {
+            continue;
+        };
+        settle(
+            &mut member.medium,
+            shared.get(flag).copied().unwrap_or(false),
+            deep.get(flag).copied().unwrap_or(false),
+        );
+        if member.medium != Medium::Rotational {
+            continue;
+        }
+        match member.under {
+            Some(parent) => {
+                if let Some(p) = identity.members.get_mut(parent) {
+                    p.medium = Medium::Rotational;
+                }
+            }
+            None => identity.medium = Medium::Rotational,
+        }
+    }
+    settle(
+        &mut identity.medium,
+        shared.first().copied().unwrap_or(false),
+        deep.first().copied().unwrap_or(false),
+    );
+}
+
+/// A composite's medium once its members' are in: rotational stays (as slow as its slowest
+/// member); otherwise a member described under another, or a stack too deep to follow, leaves it
+/// unknown rather than guessed.
+fn settle(medium: &mut Medium, shared: bool, deep: bool) {
+    if *medium != Medium::Rotational && (shared || deep) {
+        *medium = Medium::Unknown;
+    }
+}
+
+/// What a composite's `slaves/` gave: its notes, and whether a member was described under
+/// another or the composite nests past `MAX_DEPTH`.
+struct Found {
+    notes: Vec<Note>,
+    shared: bool,
+    deep: bool,
+}
+
+/// Queues the whole devices under composite `disk`, at `depth`, under member `under`, each not
+/// yet seen; marks them seen.
+fn slaves(
+    disk: &Path,
+    depth: usize,
+    seen: &mut HashSet<PathBuf>,
+    queue: &mut VecDeque<(PathBuf, Option<usize>, usize)>,
+    under: Option<usize>,
+) -> Found {
+    let mut found = Found {
+        notes: Vec::new(),
+        shared: false,
+        deep: false,
+    };
+    let note = |found: &mut Found, query: String, outcome: String| {
+        found.notes.push(Note { query, outcome });
+    };
     if depth >= MAX_DEPTH {
-        identity.note(
-            "slaves",
+        note(
+            &mut found,
+            "slaves".to_owned(),
             format!("nesting deeper than {MAX_DEPTH}; not followed"),
         );
-        identity.medium = Medium::Unknown;
-        return;
+        found.deep = true;
+        return found;
     }
     let slaves = disk.join("slaves");
     let entries = match std::fs::read_dir(&slaves) {
         Ok(entries) => entries,
         Err(e) => {
-            identity.note(format!("read_dir {}", slaves.display()), e.to_string());
-            return;
+            note(
+                &mut found,
+                format!("read_dir {}", slaves.display()),
+                e.to_string(),
+            );
+            return found;
         }
     };
-    let mut shared = false;
     for entry in entries.flatten() {
         let Ok(dir) = std::fs::canonicalize(entry.path()) else {
             continue;
@@ -223,28 +330,18 @@ fn members(disk: &Path, identity: &mut Identity, depth: usize, seen: &mut HashSe
         };
         // A device under two members of the stack is described once; the composite's medium
         // then rests on a member not described here, and is left unknown.
-        if seen.contains(&whole) {
-            identity.note(
+        if !seen.insert(whole.clone()) {
+            note(
+                &mut found,
                 format!("slave {}", whole.display()),
                 "described under another member".to_owned(),
             );
-            shared = true;
+            found.shared = true;
             continue;
         }
-        let mut member = Identity::unknown(identity.file_system.clone());
-        describe(&whole, &mut member, depth.saturating_add(1), seen);
-        identity.members.push(member);
+        queue.push_back((whole, under, depth.saturating_add(1)));
     }
-    // A composite device is as slow as its slowest member: rotational if any member is.
-    if identity
-        .members
-        .iter()
-        .any(|m| m.medium == Medium::Rotational)
-    {
-        identity.medium = Medium::Rotational;
-    } else if shared {
-        identity.medium = Medium::Unknown;
-    }
+    found
 }
 
 fn file_system(path: &Path) -> FileSystem {
@@ -358,6 +455,117 @@ mod tests {
         assert!(size > 0);
         assert_eq!(id.size_bytes, Some(size), "{id:#?}");
         assert_ne!(id.medium, Medium::Memory, "{id:#?}");
+    }
+
+    /// A sysfs-shaped block device under `root`: its queue's rotational flag, and its members as
+    /// `slaves/` links to their directories.
+    fn device(root: &Path, name: &str, rotational: u8, slaves: &[&str]) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(dir.join("queue")).unwrap();
+        std::fs::write(dir.join("queue/rotational"), format!("{rotational}\n")).unwrap();
+        std::fs::create_dir_all(dir.join("slaves")).unwrap();
+        for slave in slaves {
+            let target = root.join(slave);
+            let link = dir.join("slaves").join(target.file_name().unwrap());
+            std::os::unix::fs::symlink(&target, link).unwrap();
+        }
+        dir
+    }
+
+    fn member<'a>(id: &'a Identity, name: &str) -> (usize, &'a Member) {
+        let found: Vec<_> = id
+            .members
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.device.as_deref() == Some(name))
+            .collect();
+        assert_eq!(found.len(), 1, "{name} once among {:#?}", id.members);
+        found[0]
+    }
+
+    /// Do: describe dm-0 over md0 (over a rotational sda and a solid-state sdb) and a partition
+    /// of sdc.
+    /// Expect: four members in one flat list, md0 and sdc under the composite itself, sda and sdb
+    /// under md0, sdc found through its partition; md0 and dm-0 as slow as sda.
+    #[test]
+    fn a_stack_of_composites_is_one_flat_list_as_slow_as_its_slowest_member() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        device(&root, "sda", 1, &[]);
+        device(&root, "sdb", 0, &[]);
+        let sdc = device(&root, "sdc", 0, &[]);
+        std::fs::create_dir_all(sdc.join("sdc1")).unwrap();
+        std::fs::write(sdc.join("sdc1/partition"), "1\n").unwrap();
+        device(&root, "md0", 0, &["sda", "sdb"]);
+        let dm = device(&root, "dm-0", 0, &["md0", "sdc/sdc1"]);
+        let mut id = Identity::unknown(device_fs());
+        describe(&dm, &mut id);
+        assert_eq!(id.members.len(), 4, "{:#?}", id.members);
+        let (md, md0) = member(&id, "md0");
+        assert_eq!(md0.under, None);
+        assert_eq!(member(&id, "sdc").1.under, None);
+        assert_eq!(member(&id, "sda").1.under, Some(md));
+        assert_eq!(member(&id, "sdb").1.under, Some(md));
+        assert_eq!(member(&id, "sda").1.medium, Medium::Rotational);
+        assert_eq!(member(&id, "sdc").1.medium, Medium::SolidState);
+        assert_eq!(md0.medium, Medium::Rotational);
+        assert_eq!(id.medium, Medium::Rotational);
+        for (at, m) in id.members.iter().enumerate() {
+            assert!(
+                m.under.is_none_or(|p| p < at),
+                "a member follows its parent"
+            );
+        }
+    }
+
+    /// Do: describe dm-1 over sdb and md1, md1 over the same sdb; then a chain of composites
+    /// deeper than `MAX_DEPTH`.
+    /// Expect: sdb described once, md1 noting it and its medium unknown rather than guessed; the
+    /// chain followed to `MAX_DEPTH` members, the deepest noted and unknown.
+    #[test]
+    fn a_shared_member_and_a_stack_too_deep_leave_their_composite_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        device(&root, "sdb", 0, &[]);
+        device(&root, "md1", 0, &["sdb"]);
+        let dm = device(&root, "dm-1", 0, &["sdb", "md1"]);
+        let mut id = Identity::unknown(device_fs());
+        describe(&dm, &mut id);
+        assert_eq!(id.members.len(), 2, "{:#?}", id.members);
+        let md1 = member(&id, "md1").1;
+        assert_eq!(md1.medium, Medium::Unknown);
+        assert!(
+            md1.notes
+                .iter()
+                .any(|n| n.outcome == "described under another member"),
+            "{md1:#?}"
+        );
+        assert_eq!(id.medium, Medium::SolidState);
+
+        let deep = tempfile::tempdir().unwrap();
+        let deep = std::fs::canonicalize(deep.path()).unwrap();
+        let names: Vec<String> = (0..=MAX_DEPTH.saturating_add(1))
+            .map(|d| format!("dm-{d}"))
+            .collect();
+        for (d, name) in names.iter().enumerate().rev() {
+            let below: Vec<&str> = names.get(d + 1).map(String::as_str).into_iter().collect();
+            device(&deep, name, 0, &below);
+        }
+        let mut id = Identity::unknown(device_fs());
+        describe(&deep.join("dm-0"), &mut id);
+        assert_eq!(id.members.len(), MAX_DEPTH, "{:#?}", id.members);
+        let last = member(&id, &format!("dm-{MAX_DEPTH}")).1;
+        assert_eq!(last.medium, Medium::Unknown);
+        assert!(
+            last.notes
+                .iter()
+                .any(|n| n.outcome.contains("not followed")),
+            "{last:#?}"
+        );
+    }
+
+    fn device_fs() -> FileSystem {
+        super::device()
     }
 
     #[test]

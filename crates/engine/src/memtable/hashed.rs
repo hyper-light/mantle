@@ -349,8 +349,35 @@ fn hot_lo<'a>(arena: &'a [u8], pool: &[Keyed], hot: &[Hot], id: u32) -> &'a [u8]
         .map_or(&[], |k| key(arena, k.entry))
 }
 
+/// Where the next node a treap walk picks hangs: a new root, or a node's left or right link.
+#[derive(Clone, Copy)]
+enum Slot {
+    Root,
+    Left(u32),
+    Right(u32),
+}
+
+/// Hangs `x` at `slot`; a root slot is `root`.
+fn hang(hot: &mut [Hot], root: &mut u32, slot: Slot, x: u32) {
+    match slot {
+        Slot::Root => *root = x,
+        Slot::Left(n) => {
+            if let Some(h) = hot.get_mut(ix(n)) {
+                h.left = x;
+            }
+        }
+        Slot::Right(n) => {
+            if let Some(h) = hot.get_mut(ix(n)) {
+                h.right = x;
+            }
+        }
+    }
+}
+
 /// Splits treap `t` into the ranges whose first key is below `k` (or not above it, with
-/// `or_equal`) and the rest.
+/// `or_equal`) and the rest: one walk down from `t`, each node hung on the side it goes to and
+/// the walk going on into the side it leaves open, a step a node. `None` when the walk passes
+/// the slab's size, which no treap allows.
 fn split(
     arena: &[u8],
     pool: &[Keyed],
@@ -358,53 +385,60 @@ fn split(
     t: u32,
     k: &[u8],
     or_equal: bool,
-) -> (u32, u32) {
-    if t == NIL {
-        return (NIL, NIL);
-    }
-    let lo = hot_lo(arena, pool, hot, t);
-    let goes_left = lo < k || (or_equal && lo == k);
-    let Some(node) = hot.get(ix(t)) else {
-        return (NIL, NIL);
-    };
-    if goes_left {
-        let (a, b) = split(arena, pool, hot, node.right, k, or_equal);
-        if let Some(node) = hot.get_mut(ix(t)) {
-            node.right = a;
+) -> Option<(u32, u32)> {
+    let (mut below, mut rest) = (NIL, NIL);
+    let (mut low, mut high) = (Slot::Root, Slot::Root);
+    let mut t = t;
+    for _ in 0..=hot.len() {
+        if t == NIL {
+            hang(hot, &mut below, low, NIL);
+            hang(hot, &mut rest, high, NIL);
+            return Some((below, rest));
         }
-        (t, b)
-    } else {
-        let (a, b) = split(arena, pool, hot, node.left, k, or_equal);
-        if let Some(node) = hot.get_mut(ix(t)) {
-            node.left = b;
+        let lo = hot_lo(arena, pool, hot, t);
+        let goes_left = lo < k || (or_equal && lo == k);
+        let node = hot.get(ix(t))?;
+        let (left, right) = (node.left, node.right);
+        if goes_left {
+            hang(hot, &mut below, low, t);
+            low = Slot::Right(t);
+            t = right;
+        } else {
+            hang(hot, &mut rest, high, t);
+            high = Slot::Left(t);
+            t = left;
         }
-        (a, t)
     }
+    None
 }
 
-/// Joins treaps `a` and `b`, every first key of `a` below every one of `b`.
-fn join(hot: &mut [Hot], a: u32, b: u32) -> u32 {
-    if a == NIL {
-        return b;
-    }
-    if b == NIL {
-        return a;
-    }
-    if priority(a) > priority(b) {
-        let r = hot.get(ix(a)).map_or(NIL, |n| n.right);
-        let joined = join(hot, r, b);
-        if let Some(n) = hot.get_mut(ix(a)) {
-            n.right = joined;
+/// Joins treaps `a` and `b`, every first key of `a` below every one of `b`: one walk down `a`'s
+/// right spine and `b`'s left spine, the higher priority hung first, a step a node. `None` when
+/// the walk passes the slab's size, which no treap allows.
+fn join(hot: &mut [Hot], a: u32, b: u32) -> Option<u32> {
+    let mut root = NIL;
+    let mut slot = Slot::Root;
+    let (mut a, mut b) = (a, b);
+    for _ in 0..=hot.len() {
+        if a == NIL {
+            hang(hot, &mut root, slot, b);
+            return Some(root);
         }
-        a
-    } else {
-        let l = hot.get(ix(b)).map_or(NIL, |n| n.left);
-        let joined = join(hot, a, l);
-        if let Some(n) = hot.get_mut(ix(b)) {
-            n.left = joined;
+        if b == NIL {
+            hang(hot, &mut root, slot, a);
+            return Some(root);
         }
-        b
+        if priority(a) > priority(b) {
+            hang(hot, &mut root, slot, a);
+            slot = Slot::Right(a);
+            a = hot.get(ix(a))?.right;
+        } else {
+            hang(hot, &mut root, slot, b);
+            slot = Slot::Left(b);
+            b = hot.get(ix(b))?.left;
+        }
     }
+    None
 }
 
 impl HashMem {
@@ -1386,16 +1420,28 @@ impl HashMem {
     /// Takes segment `i` out of the treap and the append order, its node to the free list.
     fn hot_remove(&mut self, i: u32) {
         let k = hot_lo(&self.arena, &self.hot_pool, &self.hot, i);
-        let (below, rest) = split(
+        // A walk past the slab's size is no treap: the cache goes whole, the runs being the data.
+        let Some((below, rest)) = split(
             &self.arena,
             &self.hot_pool,
             &mut self.hot,
             self.hot_root,
             k,
             false,
-        );
-        let (_, above) = split(&self.arena, &self.hot_pool, &mut self.hot, rest, k, true);
-        self.hot_root = join(&mut self.hot, below, above);
+        ) else {
+            self.drop_hot();
+            return;
+        };
+        let Some((_, above)) = split(&self.arena, &self.hot_pool, &mut self.hot, rest, k, true)
+        else {
+            self.drop_hot();
+            return;
+        };
+        let Some(root) = join(&mut self.hot, below, above) else {
+            self.drop_hot();
+            return;
+        };
+        self.hot_root = root;
         let (older, newer, len) = self
             .hot
             .get(ix(i))
@@ -1487,16 +1533,24 @@ impl HashMem {
         }
         self.hot_newest = id;
         let k = hot_lo(&self.arena, &self.hot_pool, &self.hot, id);
-        let (below, above) = split(
+        // A walk past the slab's size is no treap: the cache goes whole, adding nothing.
+        let Some((below, above)) = split(
             &self.arena,
             &self.hot_pool,
             &mut self.hot,
             self.hot_root,
             k,
             false,
-        );
-        let left = join(&mut self.hot, below, id);
-        self.hot_root = join(&mut self.hot, left, above);
+        ) else {
+            self.drop_hot();
+            return None;
+        };
+        let Some(root) = join(&mut self.hot, below, id).and_then(|l| join(&mut self.hot, l, above))
+        else {
+            self.drop_hot();
+            return None;
+        };
+        self.hot_root = root;
         Some(id)
     }
 

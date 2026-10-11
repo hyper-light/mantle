@@ -87,7 +87,7 @@ fn a_wait_for_a_worker_whose_buffers_are_back_is_refused() {
         file_end: store.end(),
         generation: store.generation(),
     });
-    let worker = pool.send(job, Owner::Pack, true).unwrap().unwrap();
+    let worker = pool.send(job, Owner::Pack, true).unwrap().unwrap().worker;
     for number in 1..=entries {
         full.send(buffer(number)).unwrap();
     }

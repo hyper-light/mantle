@@ -15,10 +15,12 @@
 //! on its own. Then, for each chunk size and worker count, the workers put chunks for the
 //! step's duration or until they have written a third of the volume, read the same chunks
 //! back in random order for the step's duration, and delete them, so every point starts from
-//! the same state. Right after each read point, the same number of workers read the same
-//! number of bytes from random places in the volume's segments directly through the file
-//! layer. Background work of the file system and the drive stalls reads at times; running
-//! the two back to back shows what mantle adds, apart from the environment. For chunks
+//! the same state. Each client's first operation of a round goes out whatever the step, so a
+//! round measures at least that much on a host too slow to finish one within it. Right after
+//! each read point, the same number of workers read the same number of bytes from random
+//! places in the volume's segments directly through the file layer. Background work of the
+//! file system and the drive stalls reads at times; running the two back to back shows what
+//! mantle adds, apart from the environment. For chunks
 //! larger than the smallest size, the same readers then read ranges of the smallest size at
 //! random places within the same chunks, which a range GET does: the store reads a range's
 //! checksum blocks, not the chunk (docs/design/chunk-store.md §7).
@@ -399,7 +401,7 @@ fn run(
         step: Duration::MAX,
         point: 0,
     };
-    let (filled, keys) = puts(&v, path, fill_size, fill, u64::MAX)?;
+    let (filled, keys) = puts(&v, path, fill_size, fill, volume)?;
     writeln!(
         out,
         "  first pass     {} writing {} chunks into blocks never written before",
@@ -615,13 +617,13 @@ struct Putter {
     out: Option<(mantle_chunk::Answer, ChunkKey)>,
 }
 
-/// What every put driver of one point reads.
+/// What every put driver of one point reads: each driver's payload among them, made before the
+/// step starts so that making it takes none of the step.
 struct Puts<'a> {
     v: &'a Volume<DeviceFile>,
-    size: usize,
     load: Load,
     drivers: usize,
-    deadline: Option<Instant>,
+    payloads: &'a [Vec<u8>],
     budget: u64,
     written: &'a AtomicU64,
     full: &'a AtomicBool,
@@ -630,9 +632,9 @@ struct Puts<'a> {
 }
 
 impl Puts<'_> {
-    fn going(&self) -> bool {
-        self.deadline.is_some_and(|d| Instant::now() < d)
-            && self.written.load(Ordering::Relaxed) < self.budget
+    /// Whether puts may go on: the budget not reached, the volume not full, none failed.
+    fn open(&self) -> bool {
+        self.written.load(Ordering::Relaxed) < self.budget
             && !self.full.load(Ordering::Relaxed)
             && self.failed.lock().is_ok_and(|f| f.is_none())
     }
@@ -644,8 +646,14 @@ impl Puts<'_> {
     }
 
     /// One driver: the clients `driver`, `driver + drivers`, ... of the point's, each putting
-    /// its next chunk when its operation is meant to start and its last is answered.
-    fn run(&self, driver: usize) -> (Histogram, Vec<ChunkKey>, drive::Generator) {
+    /// its next chunk when its operation is meant to start and its last is answered, until
+    /// `deadline` (none: until the budget or a full volume). Each client's first put goes out
+    /// whatever the deadline, so a round measures at least that much however slow the host.
+    fn run(
+        &self,
+        driver: usize,
+        deadline: Option<Instant>,
+    ) -> (Histogram, Vec<ChunkKey>, drive::Generator) {
         let cpu = drive::cpu();
         let Load {
             clients,
@@ -653,9 +661,11 @@ impl Puts<'_> {
             point,
             ..
         } = self.load;
-        let size64 = u64::try_from(self.size).unwrap_or(u64::MAX);
-        let mut payload = vec![0u8; self.size];
-        SplitMix64::new(point ^ u64::try_from(driver).unwrap_or(0)).fill(&mut payload);
+        let timely = || deadline.is_none_or(|d| Instant::now() < d);
+        let Some(payload) = self.payloads.get(driver) else {
+            return (Histogram::new(), Vec::new(), drive::Generator::default());
+        };
+        let size64 = u64::try_from(payload.len()).unwrap_or(u64::MAX);
         let now = Instant::now();
         let mut putters: Vec<Putter> = (driver..clients)
             .step_by(self.drivers.max(1))
@@ -687,10 +697,13 @@ impl Puts<'_> {
         let (mut latency, mut keys) = (Histogram::new(), Vec::new());
         let mut generator = drive::Generator::default();
         let (mut out, mut sampled) = (0usize, false);
+        // The clients whose first put has not gone out.
+        let mut first = putters.len();
         loop {
-            // Every client whose put is due goes out, until the store says it is busy.
+            // Every client whose put is due goes out, until the store says it is busy; past the
+            // deadline only a first put does, and a client with one out leaves the round.
             let mut busy = false;
-            while self.going() {
+            while self.open() {
                 let now = Instant::now();
                 let Some(&Reverse((at, i))) = idle.peek().filter(|r| r.0.0 <= now) else {
                     break;
@@ -698,10 +711,17 @@ impl Puts<'_> {
                 let (Some(p), Some(waker)) = (putters.get_mut(i), wakers.get(i)) else {
                     break;
                 };
+                if p.n > 0 && !timely() {
+                    idle.pop();
+                    continue;
+                }
                 let k = key(point, p.worker, p.n);
-                match self.v.put_waking(k, &payload, waker.clone()) {
+                match self.v.put_waking(k, payload, waker.clone()) {
                     Ok(answer) => {
                         idle.pop();
+                        if p.n == 0 {
+                            first = first.saturating_sub(1);
+                        }
                         p.n = p.n.saturating_add(1);
                         p.out = Some((answer, k));
                         out = out.saturating_add(1);
@@ -726,7 +746,7 @@ impl Puts<'_> {
                     .fetch_max(drive::thread_count(), Ordering::Relaxed);
                 sampled = true;
             }
-            let going = self.going();
+            let going = self.open() && (first > 0 || timely());
             if out == 0 {
                 if !going {
                     break;
@@ -794,30 +814,37 @@ fn puts(
     load: Load,
     budget: u64,
 ) -> Result<(Outcome, Vec<ChunkKey>), Error> {
-    let started = Instant::now();
-    let deadline = started.checked_add(load.step);
     let written = AtomicU64::new(0);
     let full = AtomicBool::new(false);
     let failed: Mutex<Option<ChunkError>> = Mutex::new(None);
     let peak = AtomicUsize::new(0);
     let size64 = u64::try_from(size).unwrap_or(u64::MAX);
     let drivers = drive::drivers(load.clients);
+    let payloads: Vec<Vec<u8>> = (0..drivers)
+        .map(|driver| {
+            let mut payload = vec![0u8; size];
+            SplitMix64::new(load.point ^ u64::try_from(driver).unwrap_or(0)).fill(&mut payload);
+            payload
+        })
+        .collect();
     let shared = Puts {
         v,
-        size,
         load,
         drivers,
-        deadline,
+        payloads: &payloads,
         budget,
         written: &written,
         full: &full,
         failed: &failed,
         peak: &peak,
     };
+    let started = Instant::now();
+    // A step too long to add to now has no deadline: the fill's, which ends at its budget.
+    let deadline = started.checked_add(load.step);
     let results = std::thread::scope(|scope| {
         drive::start(scope, path, drivers, |driver| {
             let shared = &shared;
-            move || shared.run(driver)
+            move || shared.run(driver, deadline)
         })
         .map(drive::Started::join)
     })?;
@@ -886,7 +913,10 @@ fn readers<S, E: Send>(
                 let now = Instant::now();
                 let (mut intended, mut free) = (schedule.next(now, now), now);
                 peak.fetch_max(drive::thread_count(), Ordering::Relaxed);
-                while deadline.is_some_and(|d| Instant::now() < d)
+                // The first read goes out whatever the deadline, so a round measures at least
+                // that much however slow the host.
+                let mut read_once = false;
+                while (!read_once || deadline.is_some_and(|d| Instant::now() < d))
                     && failed.lock().is_ok_and(|f| f.is_none())
                 {
                     let now = Instant::now();
@@ -898,6 +928,7 @@ fn readers<S, E: Send>(
                     generator
                         .lateness
                         .record(nanos(now.saturating_duration_since(intended.max(free))));
+                    read_once = true;
                     match read(&mut buf, &mut rng) {
                         Ok(()) => {
                             free = Instant::now();
@@ -1158,6 +1189,63 @@ mod tests {
             "reopened",
         ] {
             assert!(text.contains(name), "{name} missing from:\n{text}");
+        }
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "scratch volume left behind"
+        );
+    }
+
+    /// Do: the small benchmark with a step of zero, on a volume of a few small segments.
+    /// Expect: the first pass writes, every put and get row is there and measures something,
+    /// and the scratch volume is gone: a round measures each client's first operation however
+    /// short its step, as on a host too slow to finish any operation within one.
+    #[test]
+    fn a_step_shorter_than_any_operation_still_measures_each_clients_first() {
+        let dir = tempfile::tempdir().unwrap();
+        // The log takes its least, 64 MiB; three segments follow.
+        let plan = Plan {
+            volume: 128 << 20,
+            sizes: vec![4 << 10, 1 << 20],
+            workers: vec![1, 4],
+            rate: None,
+            step: Duration::ZERO,
+            rounds: Policy {
+                min: 2,
+                max: 2,
+                precision: 0.05,
+            },
+            segment_size: Some(16 << 20),
+        };
+        let mut out = Vec::new();
+        run(
+            &mut out,
+            dir.path(),
+            Alignment::new(4096).unwrap(),
+            &plan,
+            false,
+            Reads::measured(4, 4 << 20, 0),
+            4,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        for name in [
+            "first pass",
+            "put 4 KiB",
+            "get 4 KiB",
+            "put 1 MiB",
+            "get 1 MiB",
+        ] {
+            assert!(text.contains(name), "{name} missing from:\n{text}");
+        }
+        for line in text.lines().filter(|l| {
+            l.starts_with("  first pass") || l.starts_with("  put ") || l.starts_with("  get ")
+        }) {
+            assert!(
+                !line.contains(" 0 B/s"),
+                "a row measured nothing: {line}\n{text}"
+            );
         }
         assert_eq!(
             std::fs::read_dir(dir.path()).unwrap().count(),

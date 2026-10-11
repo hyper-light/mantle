@@ -410,6 +410,15 @@ impl HashOrder {
 
 /// A sealed builder's fixed root and height, and its filter's pages: the first, the bytes in
 /// all, the bytes written, and the pages written.
+/// A written page's entry for the level above: its first key, its address and subtree count as
+/// the entry's head, and that count.
+#[derive(Debug)]
+struct Separator {
+    first: Vec<u8>,
+    head: [u8; 16],
+    total: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Sealed {
     root: u64,
@@ -594,7 +603,11 @@ impl Builder {
         Ok(())
     }
 
-    /// Adds an entry to level `level`, writing the page out first if it would not fit.
+    /// Adds an entry to level `level`. A level whose page the entry would overflow writes the
+    /// page first, and the written page's entry goes to the level above the same way: one pass up
+    /// the levels, each full page written before its own entry lands, so pages are issued
+    /// bottom-up as they fill. A written page leaves its level empty, so the pass ends at the
+    /// first level with room, at most one above the levels there are.
     fn insert<F: BlockFile>(
         &mut self,
         store: &mut Store<F>,
@@ -604,32 +617,75 @@ impl Builder {
         tail: &[u8],
         under: u64,
     ) -> Result<(), Error> {
-        let page = self.levels.get(level).ok_or(corrupt(Malformed::TooLarge))?;
-        let mut prefix = if page.len() == 0 {
-            key.len()
-        } else {
-            page.prefix.min(shared(page.key(0), key))
-        };
-        let rest = head
-            .len()
-            .checked_add(tail.len())
-            .ok_or(corrupt(Malformed::TooLarge))?;
-        let size = page
-            .size_with(prefix, key.len(), rest)
-            .ok_or(corrupt(Malformed::TooLarge))?;
-        if size > self.capacity && page.len() > 0 {
-            self.write(store, level)?;
-            prefix = key.len();
+        let mut level = level;
+        // The entry for the level in hand: the caller's, then each written page's.
+        let mut up: Option<Separator> = None;
+        for _ in 0..=self.levels.len() {
+            let (key, head, tail, under) = match &up {
+                None => (key, head, tail, under),
+                Some(s) => (s.first.as_slice(), &s.head[..], &[][..], s.total),
+            };
+            let page = self.levels.get(level).ok_or(corrupt(Malformed::TooLarge))?;
+            let mut prefix = if page.len() == 0 {
+                key.len()
+            } else {
+                page.prefix.min(shared(page.key(0), key))
+            };
+            let rest = head
+                .len()
+                .checked_add(tail.len())
+                .ok_or(corrupt(Malformed::TooLarge))?;
+            let size = page
+                .size_with(prefix, key.len(), rest)
+                .ok_or(corrupt(Malformed::TooLarge))?;
+            let written = if size > self.capacity && page.len() > 0 {
+                prefix = key.len();
+                Some(self.write_page(store, level)?)
+            } else {
+                None
+            };
+            self.levels
+                .get_mut(level)
+                .ok_or(corrupt(Malformed::TooLarge))?
+                .push(key, head, tail, under, prefix);
+            // A separator pushed here came from the level below, whose first-key buffer it is.
+            if let Some(s) = up.take() {
+                self.give_first(level.saturating_sub(1), s.first);
+            }
+            match written {
+                Some(s) => {
+                    up = Some(s);
+                    level = level.checked_add(1).ok_or(corrupt(Malformed::TooLarge))?;
+                }
+                None => return Ok(()),
+            }
         }
-        self.levels
-            .get_mut(level)
-            .ok_or(corrupt(Malformed::TooLarge))?
-            .push(key, head, tail, under, prefix);
-        Ok(())
+        Err(corrupt(Malformed::TooLarge))
     }
 
     /// Writes level `level`'s page and adds its entry to the level above.
-    fn write<F: BlockFile>(&mut self, store: &mut Store<F>, level: usize) -> Result<u64, Error> {
+    fn write<F: BlockFile>(&mut self, store: &mut Store<F>, level: usize) -> Result<(), Error> {
+        let s = self.write_page(store, level)?;
+        let above = level.checked_add(1).ok_or(corrupt(Malformed::TooLarge))?;
+        let inserted = self.insert(store, above, &s.first, &s.head, &[], s.total);
+        self.give_first(level, s.first);
+        inserted
+    }
+
+    /// Returns level `level`'s first-key buffer, kept for its next page.
+    fn give_first(&mut self, level: usize, first: Vec<u8>) {
+        if let Some(f) = self.firsts.get_mut(level) {
+            *f = first;
+        }
+    }
+
+    /// Writes level `level`'s page, leaving the level empty, and returns its entry for the level
+    /// above.
+    fn write_page<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        level: usize,
+    ) -> Result<Separator, Error> {
         let kind = if level == 0 { LEAF } else { INDEX };
         let mut payload = std::mem::take(&mut self.payload);
         let page = self.levels.get(level).ok_or(corrupt(Malformed::TooLarge))?;
@@ -702,12 +758,7 @@ impl Builder {
         let (child, under) = head.split_at_mut(8);
         child.copy_from_slice(&address.to_le_bytes());
         under.copy_from_slice(&total.to_le_bytes());
-        let inserted = self.insert(store, above, &first, &head, &[], total);
-        if let Some(f) = self.firsts.get_mut(level) {
-            *f = first;
-        }
-        inserted?;
-        Ok(address)
+        Ok(Separator { first, head, total })
     }
 
     /// Writes every page left and returns the branch; a builder given no entry is refused.

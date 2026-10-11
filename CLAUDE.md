@@ -71,6 +71,17 @@ that measured it.
 Code states what the system does now: no speculative abstraction, no dead or commented-out
 code. Comments explain why.
 
+## 10. No runtime recursion
+
+No function calls itself, directly or through others, and no algorithm walks a structure
+depth-first with a parent's work waiting on its children's, on the call stack or on an explicit
+stack of frames. Recursion makes work a chain that grows with the structure, so its latency and
+stack are unbounded by construction (§1–2). Work is flat: loops with counted budgets and bounded
+queues of independent tasks, each with a stated trigger. A tree is kept as SplinterDB keeps its
+trunk (research/34): a flush moves references only, and compaction, settle and split are
+per-node tasks applied when done and discarded if their node changed meanwhile. Call-graph
+cycles are found with a tool on the built code, not by reading.
+
 ## Gates
 
 Every commit passes these on its final tree (`bash scripts/gates.sh` runs them in order and

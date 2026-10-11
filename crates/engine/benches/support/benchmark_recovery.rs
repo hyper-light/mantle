@@ -6,7 +6,7 @@ use mantle_engine::shard_db::ShardDb;
 
 pub fn verify<F: BlockFile>(
     db: &mut ShardDb<F>,
-    ordered: &[u64],
+    present: &super::present::Present,
     value: &[u8],
     limit: usize,
 ) -> Result<(), Error> {
@@ -20,20 +20,21 @@ pub fn verify<F: BlockFile>(
     let mut from = Vec::new();
     let mut rows = Rows::new();
     let mut next = Vec::new();
+    let mut keys = present.iter();
     let mut at = 0;
     // Even one-row pages finish in at most the expected cardinality plus one terminal page.
-    for _ in 0..=ordered.len() {
+    for _ in 0..=present.len() {
         rows.clear();
         let more = db.scan(&from, None, limit, &mut rows, &mut next)?;
         for (actual_key, actual_value) in rows.iter() {
-            let number = ordered.get(at).ok_or_else(bad)?;
-            if actual_key != super::rocks_workload::key(*number) || actual_value != value {
+            let number = keys.next().ok_or_else(bad)?;
+            if actual_key != super::rocks_workload::key(number) || actual_value != value {
                 return Err(bad());
             }
             at += 1;
         }
         if !more {
-            if at != ordered.len() {
+            if at != present.len() {
                 return Err(bad());
             }
             return db.check_references();

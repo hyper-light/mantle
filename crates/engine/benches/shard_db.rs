@@ -30,6 +30,11 @@ mod rocks_workload;
 #[path = "support/benchmark_recovery.rs"]
 mod benchmark_recovery;
 
+#[path = "support/present.rs"]
+mod present;
+
+use present::Present;
+
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::issuer::Issuer;
@@ -174,7 +179,7 @@ fn durable_phase(
     num: u64,
     operations: u64,
     work: DurableWork,
-    oracle: &(Vec<bool>, Vec<u64>),
+    oracle: &Present,
 ) -> Result<DurablePhase, Box<dyn std::error::Error>> {
     let (name, phase) = match work {
         DurableWork::Fill => ("fillrandom", 1),
@@ -189,6 +194,7 @@ fn durable_phase(
     let mut out = Vec::new();
     let mut page = mantle_engine::rows::Rows::new();
     let mut next = Vec::new();
+    let mut expected = Vec::new();
     let mut found = 0;
     let mut rows = 0;
     for _ in 0..operations {
@@ -212,7 +218,7 @@ fn durable_phase(
         let hit = match work {
             DurableWork::Fill => hit,
             DurableWork::Get => {
-                if hit != oracle.0[number as usize] || (hit && out.as_slice() != value) {
+                if hit != oracle.holds(number) || (hit && out.as_slice() != value) {
                     return Err(
                         std::io::Error::other("point differs from canonical fill oracle").into(),
                     );
@@ -220,12 +226,11 @@ fn durable_phase(
                 hit
             }
             DurableWork::Seek(limit) => {
-                let at = oracle.1.partition_point(|&n| n < number);
-                let expected = &oracle.1[at..at.saturating_add(limit).min(oracle.1.len())];
+                oracle.after(number, limit, &mut expected);
                 if page.len() != expected.len()
                     || page
                         .iter()
-                        .zip(expected)
+                        .zip(&expected)
                         .any(|((k, v), &n)| k != rocks_workload::key(n) || v != value)
                 {
                     return Err(
@@ -233,7 +238,7 @@ fn durable_phase(
                     );
                 }
                 let hit = page.get(0).is_some_and(|(k, _)| k == key);
-                if hit != oracle.0[number as usize] {
+                if hit != oracle.holds(number) {
                     return Err(
                         std::io::Error::other("scan membership differs from fill oracle").into(),
                     );
@@ -276,7 +281,7 @@ fn durable_benchmark(
     mut db: ShardDb<DeviceFile>,
     issuer: Option<Issuer>,
     config: DurableConfig,
-    oracle: &(Vec<bool>, Vec<u64>),
+    oracle: &Present,
     before_setup: &Mark,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let DurableConfig {
@@ -338,7 +343,7 @@ fn durable_benchmark(
     if applied != num {
         return Err(std::io::Error::other("recovered applied index differs").into());
     }
-    benchmark_recovery::verify(&mut db, &oracle.1, &[b'v'; 100], seek_nexts)?;
+    benchmark_recovery::verify(&mut db, oracle, &[b'v'; 100], seek_nexts)?;
     match db.into_file() {
         IntoFile::Finished { file, result } => {
             result?;
@@ -403,7 +408,7 @@ fn durable_benchmark(
     );
     println!(
         "recovery verified_live_keys {} all_values_exact true required_crc_reads true applied {applied}",
-        oracle.1.len()
+        oracle.len()
     );
     std::fs::remove_file(&path)?;
     Ok(())
@@ -536,22 +541,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     alloc::begin_process();
     let before_setup = begin();
     let oracle = if durable_recovery {
-        let count = usize::try_from(num)?;
-        let mut present = Vec::new();
-        present.try_reserve_exact(count)?;
-        present.resize(count, false);
+        let mut present = Present::new(num)?;
         let mut fill = Rng::new(rocks_seed, 1);
         for _ in 0..num {
-            present[(fill.next() % num) as usize] = true;
+            present.insert(fill.next() % num);
         }
-        let mut ordered = Vec::new();
-        ordered.try_reserve_exact(present.iter().filter(|&&live| live).count())?;
-        for (n, &live) in present.iter().enumerate() {
-            if live {
-                ordered.push(n as u64);
-            }
-        }
-        Some((present, ordered))
+        Some(present)
     } else {
         None
     };

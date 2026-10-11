@@ -115,16 +115,7 @@ pub fn log(out: &mut impl Write, path: &Path, options: &Options) -> Result<(), E
             let scratch = Scratch::create(path, ".mantle-bench-log").map_err(Error::Disk)?;
             let file = DeviceFile::open(scratch.path(), false, CachingRequest::PreferDirect, align)
                 .map_err(Error::Disk)?;
-            let config = Config {
-                segment_bytes: 16 << 20,
-                max_segments: 64,
-                max_groups: most,
-                group_entries: 1 << 20,
-                group_bytes: 1 << 30,
-                group_cache: 1 << 16,
-                queue_submissions: most.saturating_mul(2),
-                waits: Waits::Measured,
-            };
+            let config = config(most);
             let idle = drive::thread_count();
             let log = Log::create(file, config, u128::from(point)).map_err(log_error)?;
             let outcome = appends(&log, scratch.path(), size, count, options.step)?;
@@ -166,6 +157,20 @@ pub fn log(out: &mut impl Write, path: &Path, options: &Options) -> Result<(), E
         }
     }
     Ok(())
+}
+
+/// The log every point runs on, for up to `most` replicas' groups.
+fn config(most: usize) -> Config {
+    Config {
+        segment_bytes: 16 << 20,
+        max_segments: 64,
+        max_groups: most,
+        group_entries: 1 << 20,
+        group_bytes: 1 << 30,
+        group_cache: 1 << 16,
+        queue_submissions: most.saturating_mul(2),
+        waits: Waits::Measured,
+    }
 }
 
 fn log_error(e: LogError) -> Error {
@@ -312,9 +317,8 @@ impl Drivers<'_> {
                 f.get_or_insert(e.to_string());
             }
         };
-        let going = || {
-            deadline.is_some_and(|d| Instant::now() < d) && failed.lock().is_ok_and(|f| f.is_none())
-        };
+        let healthy = || failed.lock().is_ok_and(|f| f.is_none());
+        let going = || deadline.is_some_and(|d| Instant::now() < d) && healthy();
         let submit = |replica: &mut Replica, waker: &std::task::Waker| -> Result<(), LogError> {
             let next = replica.last.checked_add(1).ok_or(LogError::Busy)?;
             let mut update = Update {
@@ -344,8 +348,10 @@ impl Drivers<'_> {
         };
         let mut latency = Histogram::new();
         let mut out = 0usize;
+        // Each replica's first append goes out whatever the deadline, so a round measures at
+        // least that much however slow the host.
         for (replica, waker) in replicas.iter_mut().zip(&wakers) {
-            if !going() {
+            if !healthy() {
                 break;
             }
             match submit(replica, waker) {
@@ -413,5 +419,24 @@ mod tests {
         )
         .unwrap();
         assert!(!out.is_empty());
+    }
+
+    /// Do: four replicas append for a step of zero.
+    /// Expect: each replica's first append is measured and none after it: a round measures at
+    /// least each replica's first append, however slow the host.
+    #[test]
+    fn a_step_of_zero_measures_each_replicas_first_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = Scratch::create(dir.path(), ".mantle-bench-log").unwrap();
+        let file = DeviceFile::open(
+            scratch.path(),
+            false,
+            CachingRequest::PreferDirect,
+            Alignment::new(4096).unwrap(),
+        )
+        .unwrap();
+        let log = Log::create(file, config(4), 1).unwrap();
+        let outcome = appends(&log, scratch.path(), 128, 4, Duration::ZERO).unwrap();
+        assert_eq!(outcome.appends, 4);
     }
 }

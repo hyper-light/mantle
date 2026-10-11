@@ -448,10 +448,20 @@ impl Reply {
 
 impl Drop for Reply {
     /// Wakes the submitter once: after its answer is sent, or when the request is dropped
-    /// unanswered, which its receiver then reads as closed.
+    /// unanswered, which its receiver then reads as closed. The waker is the caller's code, run
+    /// on the writer's thread: one that panics is contained here, its payload dropped behind the
+    /// same boundary, so the writer goes on answering every other request (CLAUDE.md §1). The
+    /// caller's answer is already sent or its request dropped, which its receiver reads.
     fn drop(&mut self) {
-        if let Some(waker) = self.waker.take() {
-            waker.wake();
+        if let Some(waker) = self.waker.take()
+            && let Err(payload) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| waker.wake()))
+            && let Err(again) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
+        {
+            // A payload whose own drop panicked left another, the caller's too: it is let go
+            // without running its drop, one allocation for a request whose waker does both.
+            let _unrun = std::mem::ManuallyDrop::new(again);
         }
     }
 }

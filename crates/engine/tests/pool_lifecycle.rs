@@ -33,7 +33,7 @@ const CONFIG: Config = Config {
     extent_pages: 4,
     max_extents: 256,
 };
-// Two jobs can coexist, and one initial measured-demand seat remains after the first cascade.
+// Two jobs can coexist, and one initial measured-demand seat remains after the first period.
 const WORKERS: usize = 2;
 const DEPTH: usize = 1;
 // Existing native worker fixtures' failure guard. A passing run never waits for this deadline.
@@ -265,9 +265,9 @@ fn less_demand_does_not_overlap_replaced_worker_file_lifetimes() {
     assert_eq!(files.live.load(Ordering::SeqCst), WORKERS);
     let release = OpenOnDrop::new(Arc::clone(&files));
     files.drops_open.store(false, Ordering::SeqCst);
-    // No prior cascade period exists: the fresh pool's existing one-seat need is unchanged,
-    // without sleeping or fabricating a measured duration.
-    pool.cascade_started();
+    // No prior period exists: the fresh pool's existing one-seat need is unchanged, without
+    // sleeping or fabricating a measured duration.
+    pool.period_started();
     assert_eq!(pool.want(), 1);
     for number in 3..=4 {
         assert!(

@@ -13,7 +13,7 @@
 //!   for each further one that may wait).
 //!
 //! A put of `b` bytes does `debt · b / room` of a debt: paid at that rate, it is paid when the
-//! room runs out. A cascade's compactions are owed only once planned, so a debt can still be
+//! room runs out. Maintenance's compactions are owed only once planned, so a debt can still be
 //! owed when a memtable fills; that put pays it whole, a stall the engine counts.
 //!
 //! Durability is the Raft log's (§2): the engine applies committed entries and makes its state
@@ -28,7 +28,7 @@ use crate::memtable::hashed::{HashMem, Walk};
 use crate::rows::Rows;
 use crate::scan::{BorrowedScanMerge, ScanMerge};
 use crate::store::{Config, IntoFile, Store};
-use crate::trunk::pool::{self, Back, FEED_BUFFERS, Job, Owner, Pool, Spawn, Stream, Work};
+use crate::trunk::pool::{self, Back, FEED_BUFFERS, Job, Owner, Pool, Spawn, Stream, Ticket, Work};
 use crate::trunk::{Source, Trunk, TrunkConfig};
 use crate::util::reuse;
 use hyper_block::block::BlockFile;
@@ -157,12 +157,13 @@ struct Packing {
     since: std::time::Instant,
 }
 
-/// A packing fed to worker `worker`: the channel its full buffers go out on, closed once every
-/// entry is sent; the buffers the shard holds, the one it fills and those spare (the worker
-/// gives the others back through the pool, [`Pool::buffer`]); and the extents granted the job.
+/// A packing fed to the worker its ticket names: the channel its full buffers go out on, closed
+/// once every entry is sent; the buffers the shard holds, the one it fills and those spare (the
+/// worker gives the others back through the pool, [`Pool::buffer`]); and the extents granted
+/// the job.
 #[derive(Debug)]
 struct Feed {
-    worker: usize,
+    ticket: Ticket,
     full: Option<SyncSender<Vec<u8>>>,
     filling: Option<Vec<u8>>,
     spare: Vec<Vec<u8>>,
@@ -171,13 +172,13 @@ struct Feed {
 
 /// A full memtable handed to its packing worker, its entries fed to it by later puts: still
 /// read until the worker's branch is back and every older memtable's branch has gone to the trunk before it,
-/// since pending branches are read newest first. Its worker, the extents granted the job, the
-/// worker's result once back, when it began packing, and its first failure. A failed input
+/// since pending branches are read newest first. Its job's ticket, the extents granted the job,
+/// the worker's result once back, when it began packing, and its first failure. A failed input
 /// stays readable and never retires past its older predecessors ([`ShardDb::retire`]).
 #[derive(Debug)]
 struct Frozen {
     mem: HashMem,
-    worker: usize,
+    ticket: Ticket,
     grant: Vec<u64>,
     back: Option<Back>,
     since: std::time::Instant,
@@ -236,7 +237,7 @@ fn feed_one<F: BlockFile>(
         if f.filling.is_none() {
             f.filling = match f.spare.pop() {
                 Some(b) => Some(b),
-                None => pool.buffer(store, f.worker, false)?,
+                None => pool.buffer(store, f.ticket, false)?,
             };
         }
         let Some(buf) = f.filling.as_mut() else {
@@ -973,7 +974,7 @@ impl<F: BlockFile> ShardDb<F> {
     /// shard's file that `open` gives (the file opened again as the shard's was): as many as
     /// the measured need asks, up to the cores the OS reports less this thread (`trunk::pool`).
     /// Puts then pay only for taking the workers' results, and wait on them only when a
-    /// rotation finds the trunk's cascade still out. Refused when the workers' channel back
+    /// rotation finds the trunk's root without room. Refused when the workers' channel back
     /// cannot be made (`Pool::new`).
     pub fn set_workers(
         &mut self,
@@ -1401,33 +1402,24 @@ impl<F: BlockFile> ShardDb<F> {
         );
     }
 
-    /// Sets the page cache's and the record cache's limits to their shares, each less the index
-    /// and ghost bytes it pays for, at the ratio of index to data measured now. A region whose
-    /// limit fell is brought down to it by `trim`, a few pages an operation, which outpaces a
-    /// growing region's filling (a page or a record a miss): memory moving between them never
-    /// holds more than it did when the step began.
+    /// Sets the page cache's and the record cache's data limits to their shares, each less the
+    /// index and ghost bytes it takes now, the charge `memory_held` counts until the next grant:
+    /// a cache's data at its limit and that charge are within its share whatever either holds.
+    /// A region whose limit fell is brought down to it by `trim`, a few pages an operation,
+    /// which outpaces a growing region's filling (a page or a record a miss): memory moving
+    /// between them never holds more than it did when the step began.
     fn grant(&mut self) {
         if self.memory.is_none() {
             return;
         }
         let page = self.store.page_size().max(1);
-        let net = |share: usize, data: usize, index: usize| -> usize {
-            let total = u128::try_from(data.saturating_add(index)).unwrap_or(u128::MAX);
-            if data == 0 || total == 0 {
-                return share.saturating_sub(index);
-            }
-            let share = u128::try_from(share).unwrap_or(u128::MAX);
-            let data = u128::try_from(data).unwrap_or(u128::MAX);
-            usize::try_from(share.saturating_mul(data).checked_div(total).unwrap_or(0))
-                .unwrap_or(usize::MAX)
-        };
         let (cache_index, records_index) = self.index_bytes();
         self.charged = (cache_index, records_index);
-        let cache = net(self.cache_share, self.store.cache_bytes(), cache_index);
+        let cache = self.cache_share.saturating_sub(cache_index);
         self.store
             .resize_cache(cache.checked_div(page).unwrap_or(0));
         if let Some(r) = self.records.as_mut() {
-            let records = net(self.records_share, r.held_bytes(), records_index);
+            let records = self.records_share.saturating_sub(records_index);
             r.resize(records);
         }
     }
@@ -2418,8 +2410,8 @@ impl<F: BlockFile> ShardDb<F> {
                 }
                 self.note_trunk(ns_since(t));
             }
-        } else if self.trunk.cascading() && self.trunk.has_pool() {
-            // The cascade's compactions are out on the workers: a step takes whatever results
+        } else if self.trunk.maintaining() && self.trunk.has_pool() {
+            // Maintenance's compactions are out on the workers: a step takes whatever results
             // have come and hands out what they let go, waiting for none.
             if paced {
                 self.trunk.step_paced(&mut self.store, 1)?;
@@ -2559,11 +2551,11 @@ impl<F: BlockFile> ShardDb<F> {
                 }
             };
             match sent {
-                Ok(worker) => {
+                Ok(ticket) => {
                     let mut spare = std::mem::take(&mut self.feed_buffers);
                     spare.resize_with(FEED_BUFFERS, Vec::new);
                     p.feed = Some(Feed {
-                        worker,
+                        ticket,
                         full: Some(full),
                         filling: spare.pop(),
                         spare,
@@ -2628,12 +2620,12 @@ impl<F: BlockFile> ShardDb<F> {
                 }
                 let open = frozen
                     .iter()
-                    .filter_map(|f| f.feed.as_ref().map(|feed| feed.worker))
+                    .filter_map(|f| f.feed.as_ref().map(|feed| feed.ticket.worker))
                     .chain(
                         packing
                             .as_ref()
                             .filter(|_| packing_too)
-                            .and_then(|p| p.feed.as_ref().map(|feed| feed.worker)),
+                            .and_then(|p| p.feed.as_ref().map(|feed| feed.ticket.worker)),
                     );
                 if !pool.wait_any(store, open)? {
                     return Ok(fed);
@@ -2724,7 +2716,7 @@ impl<F: BlockFile> ShardDb<F> {
         let Some(mut f) = feed else {
             return;
         };
-        let worker = f.worker;
+        let ticket = f.ticket;
         let grant = std::mem::take(&mut f.grant);
         let (walk, feed) = if f.full.is_none() {
             f.spare.extend(f.filling.take());
@@ -2736,7 +2728,7 @@ impl<F: BlockFile> ShardDb<F> {
         };
         self.frozen.push_back(Frozen {
             mem,
-            worker,
+            ticket,
             grant,
             back: None,
             since,
@@ -2794,11 +2786,7 @@ impl<F: BlockFile> ShardDb<F> {
                 return Ok(());
             };
             wait = false;
-            match self
-                .frozen
-                .iter_mut()
-                .find(|f| f.worker == back.worker && f.back.is_none())
-            {
+            match self.frozen.iter_mut().find(|f| f.ticket == back.ticket) {
                 Some(f) => {
                     // A worker ends before its feed does only by a failure: the feed closes.
                     f.back = Some(back);
@@ -2812,7 +2800,7 @@ impl<F: BlockFile> ShardDb<F> {
                         .packing
                         .as_ref()
                         .and_then(|p| p.feed.as_ref())
-                        .is_some_and(|f| f.worker == back.worker);
+                        .is_some_and(|f| f.ticket == back.ticket);
                     if !feeding {
                         return Err(Error::InvalidArgument {
                             what: "a packed branch for no packing memtable",
@@ -3182,7 +3170,7 @@ impl<F: BlockFile> ShardDb<F> {
             };
         }
         if self.trunk.consolidation_owed() {
-            // Seeks paid for consolidating leaves: one cascade, in bulk, flushes and settles
+            // Seeks paid for consolidating leaves: one consolidation, in bulk, flushes and settles
             // them. After views and maplets, which make a bundle one source without rewriting
             // it: seeks pay rent only for the sources left with those built.
             let t = Some(std::time::Instant::now());
@@ -3349,7 +3337,7 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     /// The same rotation as the blocking API, paid in the task's existing slice budget.
-    /// Only old packing and cascade state changes before it returns true; the caller's entry
+    /// Only old packing and maintenance state changes before it returns true; the caller's entry
     /// remains unapplied, and every old memtable remains reachable by reads.
     fn rotate_paced(&mut self, keys: u64) -> Result<bool, Error> {
         self.require_async_backend()?;
@@ -3422,23 +3410,20 @@ impl<F: BlockFile> ShardDb<F> {
                 return Ok(false);
             }
         }
-        if self.trunk.pending() >= self.trunk.fanout() {
+        if !self.trunk.has_room() {
             if let Some(r) = self.rotation.as_mut() {
                 r.stalled = true;
             }
             if self.trunk.packing_blocks_dispatch() {
                 // A packing holds every seat and can still need owner-fed input. Pay its
-                // bounded slice before waiting on the cascade's worker capacity.
+                // bounded slice before waiting on maintenance's worker capacity.
                 self.pack_some(keys.max(1), false)?;
                 self.take_packs(false)?;
                 if self.trunk.packing_blocks_dispatch() {
                     return Ok(false);
                 }
             }
-            if !self
-                .trunk
-                .finish_cascade_paced(&mut self.store, keys.max(1))?
-            {
+            if !self.trunk.make_room_paced(&mut self.store, keys.max(1))? {
                 return Ok(false);
             }
         }
@@ -3469,7 +3454,7 @@ impl<F: BlockFile> ShardDb<F> {
         Ok(true)
     }
 
-    /// Packs every memtable and finishes its cascades before a range starts durability.
+    /// Packs every memtable and finishes its maintenance before a range starts durability.
     /// A false result owns all unfinished work.
     pub(crate) fn flush_paced(&mut self, keys: u64) -> Result<bool, Error> {
         self.trunk.clear_io_wait();
@@ -3503,7 +3488,7 @@ impl<F: BlockFile> ShardDb<F> {
 
     /// The memtable is full: it becomes the packing one and a cleared one takes the puts. A debt
     /// still owed is paid first, whole, and counted a stall: the packing memtable's, and the
-    /// trunk's cascade when `fanout` packed memtables wait on it.
+    /// trunk's maintenance when its root has no room for more branches.
     fn rotate(&mut self) -> Result<(), Error> {
         self.rebudget();
         self.flush_stats.rotations = self.flush_stats.rotations.saturating_add(1);
@@ -3533,13 +3518,13 @@ impl<F: BlockFile> ShardDb<F> {
             self.wait_oldest(self.frozen.len().saturating_sub(most))?;
             stalled = true;
         }
-        if self.trunk.pending() >= self.trunk.fanout() {
+        if !self.trunk.has_room() {
             if self.trunk.packing_blocks_dispatch() {
-                // A whole cascade cannot admit its first job until a packing seat is free;
-                // feed the oldest packing before any wait that would depend on its owner.
+                // The root's compactions cannot admit a job until a packing seat is free; feed
+                // the oldest packing before any wait that would depend on its owner.
                 self.wait_oldest(1)?;
             }
-            self.trunk.finish_cascade(&mut self.store)?;
+            self.trunk.make_room(&mut self.store)?;
             stalled = true;
         }
         if stalled {
@@ -3599,7 +3584,7 @@ impl<F: BlockFile> ShardDb<F> {
         // mantle-bounded-consolidation-experiment-20261008). Then the views and maplets of the
         // bundles it changed.
         self.trunk.consolidate_all();
-        while used < budget && (self.trunk.consolidation_owed() || self.trunk.cascading()) {
+        while used < budget && (self.trunk.consolidation_owed() || self.trunk.maintaining()) {
             // A drain's whole budget stays whole, so each step waits for the workers'
             // compactions rather than return to be called again.
             let left = if budget == u64::MAX {
@@ -4137,7 +4122,7 @@ mod frozen_tests {
                     FEED_BUFFERS,
                     "a buffer reached the worker before its stall was armed"
                 );
-                break f.worker;
+                break f.ticket.worker;
             }
             assert_eq!(
                 db.flush_stats.rotations, rotations,
@@ -4156,7 +4141,7 @@ mod frozen_tests {
         assert!(
             db.frozen
                 .front()
-                .is_some_and(|f| f.worker == worker && !f.ready()),
+                .is_some_and(|f| f.ticket.worker == worker && !f.ready()),
             "the stalled packing is the oldest frozen"
         );
         worker
@@ -4207,10 +4192,10 @@ mod frozen_tests {
         assert!(db.frozen.is_empty());
         assert!(GATES_A.waited());
         check(&mut db, &oracle);
-        // Puts on, through a cascade, at the overlap the shard measures.
+        // Puts on, through `fanout` rotations, at the overlap the shard measures.
         let rotations = db.flush_stats.rotations;
-        let cascade = u64::try_from(TRUNK.fanout).unwrap();
-        while db.flush_stats.rotations < rotations + cascade {
+        let more = u64::try_from(TRUNK.fanout).unwrap();
+        while db.flush_stats.rotations < rotations + more {
             put_or_delete(&mut db, &mut oracle, i);
             i += 1;
         }

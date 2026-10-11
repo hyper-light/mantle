@@ -48,7 +48,7 @@ const TRUNK: TrunkConfig = TrunkConfig {
     fanout: 3,
     leaf_entries: 96,
 };
-/// Memtables of a few KiB: a cascade every few hundred operations, so a kill finds jobs out.
+/// Memtables of a few KiB: maintenance every few hundred operations, so a kill finds jobs out.
 const MEM: usize = 4 * 1024;
 const KEYS: u64 = 1500;
 /// A checkpoint every this many operations.
@@ -242,7 +242,7 @@ fn run(kill_after: u64) {
 }
 
 /// Kill points at every checkpoint's boundary and between them, across the run: a kill in each
-/// stretch of a checkpoint interval, so it lands before, during and after cascades and packings
+/// stretch of a checkpoint interval, so it lands before, during and after compactions and packings
 /// out on the workers. `MANTLE_SHARD_KILL_POINTS` sets how many (default: one an interval of
 /// the first ten, and the boundaries).
 #[test]

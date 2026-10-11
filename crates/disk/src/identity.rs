@@ -134,9 +134,23 @@ pub struct Identity {
     pub removable: Option<bool>,
     pub size_bytes: Option<u64>,
     pub file_system: FileSystem,
-    /// For a composite device, the devices it is built from.
-    pub members: Vec<Identity>,
+    /// For a composite device, the devices it is built from, as one flat list.
+    pub members: Vec<Member>,
     /// Queries that failed or were unavailable, with the reason.
+    pub notes: Vec<Note>,
+}
+
+/// A device a composite device is built from, as its own description gives it, and the member it
+/// sits under (`None`: the composite itself). Members are one flat list, each naming its parent
+/// by index and listed after it, so a description never holds another (CLAUDE.md §10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Member {
+    pub under: Option<usize>,
+    pub device: Option<String>,
+    pub model: Option<String>,
+    pub medium: Medium,
+    pub interconnect: Interconnect,
+    pub size_bytes: Option<u64>,
     pub notes: Vec<Note>,
 }
 

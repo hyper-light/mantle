@@ -1283,10 +1283,10 @@ pub fn agreed(seed: u64, events: &[HistoryEvent], totals: &mut Totals) {
 
 /// `group`'s messages delivered in order, those `allow` refuses lost, until none is left; each
 /// operation judged.
-pub fn route(
-    group: &mut Cluster<New>,
+pub fn route<R: Core>(
+    group: &mut Cluster<R>,
     judge: &mut Judge,
-    allow: impl Fn(&Cluster<New>, &Message) -> bool,
+    allow: impl Fn(&Cluster<R>, &Message) -> bool,
 ) {
     for _ in 0..10_000 {
         let Some(message) = group.net.first() else {

@@ -125,7 +125,7 @@ proptest! {
     #![proptest_config(ProptestConfig { cases: 24, ..ProptestConfig::default() })]
 
     /// Maintenance a slice at a time: each batch is added as pending, then a few steps of a
-    /// small budget run, a cascade left part done between them, and every key reads its newest
+    /// small budget run, maintenance left part done between them, and every key reads its newest
     /// entry after every step. Drained at the end, the trunk holds exactly its branches'
     /// extents.
     #[test]

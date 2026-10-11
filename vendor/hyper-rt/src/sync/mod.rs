@@ -25,14 +25,14 @@ mod room;
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering, fence};
 use std::task::{Context, Poll};
 
 use crate::error::RtError;
 use crate::waker::polling_task;
 
 use cell::{CellRef, claim};
-use ring::{Ring, Shared};
+use ring::{Refused, Ring, Shared};
 use room::Room;
 
 /// Why a primitive's call ended without a value.
@@ -179,7 +179,11 @@ impl<T> OneshotSender<T> {
             set_state(cell, SENDERS_GONE);
             return Err(SyncError::Closed(value));
         }
-        let sent = shared.get().value.push(value).map_err(SyncError::Closed);
+        let sent = shared
+            .get()
+            .value
+            .push(value)
+            .map_err(|refused| SyncError::Closed(refused.into_value()));
         // The one value went (or could not): the receiver may stop waiting either way.
         set_state(cell, SENDERS_GONE);
         cell.wake();
@@ -340,19 +344,27 @@ impl<T> Drop for Sender<T> {
 }
 
 impl<T> Sender<T> {
-    /// Sends without waiting: `Full` when the channel is at its capacity, `Closed` when the receiver is gone.
+    /// Sends without waiting: `Full` when the channel is at its capacity, `Closed` when the receiver is gone
+    /// (its drop closed the ring, which the push's own claim reads).
     pub fn try_send(&self, value: T) -> Result<(), SyncError<T>> {
         let cell = self.shared.cell();
+        // A receiver already gone is refused before the ring is touched. The read also brings in the cell that
+        // the wake below reads after its fence, which otherwise waits for it (event-loop.md D4).
         if state_has(cell, RECEIVER_GONE) {
             return Err(SyncError::Closed(value));
         }
-        match self.shared.get().values.push(value) {
+        let values = &self.shared.get().values;
+        match values.push(value) {
             Ok(()) => {
+                // The wake fences (`SeqCst`, `crate::handoff::take`) before it reads the waiter, and the read of
+                // the close below follows that fence: a receiver that dropped while this value was being
+                // published either drained it or is seen here, and the value goes with what it left.
                 cell.wake();
+                values.drain_if_closed();
                 Ok(())
             }
-            Err(value) if state_has(cell, RECEIVER_GONE) => Err(SyncError::Closed(value)),
-            Err(value) => Err(SyncError::Full(value)),
+            Err(Refused::Closed(value)) => Err(SyncError::Closed(value)),
+            Err(Refused::Full(value)) => Err(SyncError::Full(value)),
         }
     }
 
@@ -529,11 +541,16 @@ impl<T> ChannelReceiver<T> {
 
 impl<T> Drop for ChannelReceiver<T> {
     fn drop(&mut self) {
-        // Senders refuse from now on; the values sent drop now, and every sender waiting for room is woken to
-        // find the channel closed.
+        // Senders refuse from now on: the ring's close is in the word their pushes claim positions in, so no
+        // send gets in after it, nor into the room the drain below makes. The values sent drop now, a sender
+        // still publishing one drops it itself (`Sender::try_send`, after its own fence), and every sender
+        // waiting for room is woken to find the channel closed.
+        let state = self.shared.get();
+        state.values.close();
         set_state(self.shared.cell(), RECEIVER_GONE);
-        while self.shared.get().values.pop().is_some() {}
-        self.shared.get().room.wake_all();
+        fence(Ordering::SeqCst);
+        state.values.drain();
+        state.room.wake_all();
     }
 }
 

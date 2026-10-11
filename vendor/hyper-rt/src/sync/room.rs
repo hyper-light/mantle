@@ -292,7 +292,7 @@ mod tests {
 mod loom_tests {
     use super::*;
     use crate::mem::loom_bounds;
-    use crate::sync::ring::Ring;
+    use crate::sync::ring::{Refused, Ring};
     use loom::cell::UnsafeCell;
 
     /// A sender waits for room on a full channel of one value while the receiver takes the value and grants,
@@ -348,13 +348,13 @@ mod loom_tests {
         stack
             .handle
             .with_mut(|handle| unsafe { *handle = Some(loom::thread::current()) });
-        if let Err(value) = values.push(value) {
+        if let Err(value) = values.push(value).map_err(Refused::into_value) {
             let place = room.hold().unwrap();
             let word = handoff::thread_word(stack);
             room.send_waiting(
                 place,
                 value,
-                |value| values.push(value),
+                |value| values.push(value).map_err(Refused::into_value),
                 |waiter, granted| {
                     handoff::wait_registered(
                         waiter,

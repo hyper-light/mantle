@@ -247,6 +247,34 @@ variants of the channel to price its fences: with both removed (`nofence`, no lo
 sequentially consistent operations in their place (`seqcst`): neither moved the CPU a value outside the
 rounds' spread (106–111 ns, 12–14 ns), so the fences, which loom checks, stay.
 
+**The receiver's close.** mantle's suite caught a send that succeeded into a channel whose receiver had gone
+(`tests/sync.rs`, round 2,380 of 3,000, `tests/suite-spin-policy.txt`). The receiver's drop set a flag,
+drained the ring and woke the waiting senders; a sender that had read the flag clear and found the ring full
+could push into the room the drain made. std puts its disconnect in the tail: `disconnect_receivers` sets a
+mark bit with one `fetch_or`, `start_send` refuses a marked tail before it claims, and a claim's
+compare-and-swap fails on a tail the mark has changed, so a send and the disconnect are ordered by one word
+[STDMPMC `array.rs:129–134`, `470–481`]; `discard_all_messages` then waits, spinning and then yielding, for
+each position claimed before the mark to be published [STDMPMC `array.rs:495–539`]. **primary** hyper-rt's
+ring takes the mark and not the wait: a sender whose push succeeded reads the mark after the `SeqCst` fence
+its wake already makes (`handoff::take`) and drops what the ring holds if it is set, and the receiver fences
+between its close and its drain, so whichever fence comes first, the later side sees the other's write (§3's
+argument): the drain sees the value published, or the sender sees the mark. loom checks the protocol
+(`tests/loom-ring-close.txt`), and the three mutations that must fail it do
+(`tests/loom-ring-close-mutations.txt`).
+
+**MEASURED** (PANELS `chan-ringclose-spsc-r3`, load 10, nine rounds, one producer): the send without its
+read of the receiver's flag before the push cost 13.2 ns of CPU a value against 11.1 before the close, and
+with the read kept 11.3: the read brings in the cell that the wake reads after its fence, which otherwise
+waits for those loads. With the post-push check of the mark removed and the read not kept, 15.7 against
+13.3 (`chan-ringclose-spsc-r2`, load 14): the check was not the cost.
+
+**MEASURED** (PANELS `chan-ringclose-r4`, load 10–12, seven rounds, arms interleaved; median CPU a value or
+round trip, before the close and with it): one producer 13.4 and 11.5 ns, four producers on capacity 64
+514 and 528 ns, four on capacity 1 4,897 and 4,912 ns, the two-thread ping-pong 4,749 and 4,803 ns, each pair
+inside the other's rounds. Sixteen producers on capacity 64 split between streaming and parking from round
+to round in both (53 ns to 7.5 µs a value before, 99 ns to 6.9 µs with the close), so its medians say
+nothing either way.
+
 ## 9. A clock read a poll
 
 **MEASURED** (PANELS `spawnd-profile`, `sample` at 1 ms over a shard running a million detached spawns

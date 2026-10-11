@@ -130,10 +130,30 @@ model fails under the mutations recorded there (a value read before its stamp, e
 removed, a grant kept that the sender did not see, a granted sender that does not wait again).
 `tests/channel_threads.rs` runs real threads through the blocking calls.
 
+**The receiver's close.** The receiver's drop set a flag and then drained the ring, and a sender that had
+read the flag clear could push into the room the drain made: its send succeeded into a channel no one would
+read, where it had to be `Closed` (`tests/sync.rs` caught it at round 2,380 of 3,000,
+`benchmark-results/hyper-rt-vs-tokio-20261010/tests/suite-spin-policy.txt`). The close now marks the
+ring's tail, between the index and the lap, as std's array channel marks a disconnect: the compare-and-swap
+that claims a position fails on the mark, so a push and the close are ordered by that one word (note 42
+§8). A push that claimed its position before the mark may publish after the drain has looked; std's drain
+spins until it does, and here the sender drops what the drain left, reading the mark after its wake's
+`SeqCst` fence while the receiver fences between its close and its drain. Proof: loom
+(`tests/loom-ring-close.txt`): a push against a close and drain never gets in with the one slot full (50
+interleavings), and with it empty its value is dropped exactly once (50); with the close a flag the push does
+not read, the push gets in (interleaving 8), and without the sender's drain, or the receiver's fence, the
+value is stranded (interleavings 9 and 1; `tests/loom-ring-close-mutations.txt`). `sync::ring`'s unit test:
+a closed ring refuses every push at capacities 1 to 7 across laps, and its drains drop what it held. The send
+keeps its read of the receiver's flag before the push, now only to refuse a gone receiver early: that read
+brings in the cell the wake reads after its fence, and without it one producer moved 13.2 ns of CPU a value
+against 11.1 (PANELS `chan-ringclose-spsc-r3`).
+
 **Constants.**
 - `Padded`'s alignment (128 bytes): shape, the largest cache line targeted (Apple silicon), keeping the
   ring's head and tail on separate lines.
 - The slot and word states (`FREE`, `WAITING`, `GRANTED`; `NO_WAITER`, `CLAIMED`, `THREAD`): format.
+- The ring's mark: format, the capacity plus one rounded up to a power of two (std's `mark_bit`), with a
+  lap twice that.
 
 
 ## D5. A shard's control channel holds its admission limit

@@ -154,7 +154,8 @@ impl Trunk {
     }
 
     /// Runs maintenance, waiting on the workers, until the root has room for more branches.
-    /// Refused when a pass changes nothing with nothing out: no task could free it.
+    /// Refused when a pass leaves it without room, changes nothing, and leaves no task out and
+    /// no node to look at: no task could free it.
     pub fn make_room<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
         self.views_unchecked = self.nodes.len();
         self.maplets_unchecked = self.nodes.len();
@@ -163,7 +164,7 @@ impl Trunk {
         while !self.has_room() {
             self.run(store, u64::MAX)?;
             let now = self.progress();
-            if now == mark && self.tasks.is_empty() {
+            if !self.has_room() && now == mark && self.tasks.is_empty() && self.looking.is_empty() {
                 return Err(Error::InvalidArgument {
                     what: "a trunk whose root no task can make room in",
                 });
@@ -174,13 +175,14 @@ impl Trunk {
     }
 
     /// Runs all maintenance to the end, each step waiting on the workers. Refused when a step
-    /// changes nothing with nothing out: what is left, no task can do.
+    /// leaves work, changes nothing, and leaves no task out and no node to look at: what is
+    /// left, no task can do.
     pub fn drain<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
         let mut mark = self.progress();
         while !self.is_idle() {
             self.step(store, u64::MAX)?;
             let now = self.progress();
-            if now == mark && self.tasks.is_empty() && self.looking.is_empty() {
+            if !self.is_idle() && now == mark && self.tasks.is_empty() && self.looking.is_empty() {
                 return Err(Error::InvalidArgument {
                     what: "a trunk whose maintenance no task can finish",
                 });
@@ -348,11 +350,10 @@ impl Trunk {
         }
     }
 
-    /// Looks at the queued nodes, each once: a node looked at may queue those it changed, and a
-    /// pass ends after twice as many looks as there are nodes, the rest left for the next.
+    /// Looks at the nodes queued when it begins, each once: a node looked at may queue those it
+    /// changed, and they wait for the next look ([`Self::run`] looks again once tasks apply).
     fn look<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
-        let most = self.nodes.len().saturating_mul(2).saturating_add(1);
-        for _ in 0..most {
+        for _ in 0..self.looking.len() {
             let Some(n) = self.looking.pop_front() else {
                 break;
             };
@@ -1041,8 +1042,9 @@ impl Trunk {
     /// at all, one, or every job out. A failed job starts the abandonment of every other.
     fn tend_tasks<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
         let mut taken = 0usize;
-        // Each loop takes a result or returns: the jobs out bound it.
-        for _ in 0..=self.tasks.len().saturating_mul(2).saturating_add(1) {
+        // Each loop takes a result or returns, and a task gives one result at most, since none is
+        // planned or applied here: the tasks bound it, and a last loop finds none out.
+        for _ in 0..=self.tasks.len() {
             self.dispatch_tasks(store)?;
             if !self.tasks.iter().any(|t| t.run.out()) {
                 return Ok(());

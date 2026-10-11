@@ -721,6 +721,9 @@ impl Trunk {
         budget: u64,
     ) -> Result<u64, Error> {
         let mut used = 0u64;
+        // The merging timed where it runs, a clock read a task's step, so a step with no inline
+        // task reads none: a compacted key's measured cost ([`Trunk::note_merge`]).
+        let mut merge_ns = 0u64;
         let root = self.root;
         // Two passes, the root's tasks first: they free room for pending branches.
         'passes: for roots in [true, false] {
@@ -741,6 +744,7 @@ impl Trunk {
                 let node = self.nodes.get(task.node).ok_or(corrupt())?;
                 c.set_yield(yield_io);
                 let left = budget.saturating_sub(used);
+                let merging = std::time::Instant::now();
                 let step = match &task.what {
                     What::Compact { start, covered, .. } => {
                         let live = node.inflight.get(*start..*covered).ok_or(corrupt())?;
@@ -751,6 +755,7 @@ impl Trunk {
                         c.step(store, bundle, left)
                     }
                 };
+                merge_ns = merge_ns.saturating_add(ns_since(Some(merging)));
                 let spent = match step {
                     Ok(spent) => spent,
                     Err(error) => {
@@ -777,15 +782,20 @@ impl Trunk {
                     else {
                         return Err(corrupt());
                     };
-                    let t = self.timed.then(std::time::Instant::now);
+                    let finishing = std::time::Instant::now();
                     let parts = (*c).finish(store)?;
-                    self.stats.finish_ns = self.stats.finish_ns.saturating_add(ns_since(t));
+                    let ns = ns_since(Some(finishing));
+                    merge_ns = merge_ns.saturating_add(ns);
+                    if self.timed {
+                        self.stats.finish_ns = self.stats.finish_ns.saturating_add(ns);
+                    }
                     if let Some(task) = self.tasks.get_mut(at) {
                         task.run = Running::Finished(parts);
                     }
                 }
             }
         }
+        self.note_merge(merge_ns, used);
         Ok(used)
     }
 
@@ -821,6 +831,9 @@ impl Trunk {
             } => {
                 store.grant_back(&out.unused)?;
                 store.extend_end(out.end);
+                // The worker timed its merge: a compacted key's cost, which consolidations are
+                // priced at, measured wherever compactions run.
+                self.note_merge(out.ns, out.units);
                 out.parts
             }
             _ => return Err(corrupt()),

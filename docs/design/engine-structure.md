@@ -505,6 +505,13 @@ counted budget; no task waits on another node's:
 - **Compaction**, one task per pivot with live in-flight bundles: it merges them, clipped to the
   pivot's range, into one branch, on a worker or inline a budget at a time, and its apply puts
   the branch at the front of the pivot bundle and moves the pivot's start to `covered`.
+- **Timed where it runs.** A compaction's merging is timed where it runs, an inline task's steps on
+  the shard or a worker's job on the worker, and its merged units are counted, so a compacted key's
+  measured cost, which seek-paid consolidations are priced at, covers every compaction. Timing the
+  shard's idle slices instead measured nothing once the compactions were on workers: the cost stayed
+  unmeasured and no consolidation was ever priced. 1M seeks over 10M keys on the async path spent
+  53% of the phase, 7.9 s, on rent, opening 3.07 sources a seek, and bought none
+  (benchmark-results/mantle-async10m-diag-20261011, run `rent`).
 - **Flush**, one task per pivot whose bundle passes `fanout`: its branches move to the child's
   in-flight list by reference, no entry rewritten, which makes the child's pivots compaction
   tasks. A pivot bundle has one owner, so a branch is still named by one node at a time.

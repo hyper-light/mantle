@@ -198,6 +198,41 @@ fn every_key_reads_its_newest_value_with_compactions_on_workers() {
     run(false, false);
 }
 
+/// A consolidation is priced at a compacted key's measured cost, so that cost is measured wherever
+/// compactions run: with the trunk's compactions on workers, every one of them is timed and its
+/// merged keys counted, and seeks that pay for a leaf's consolidation get it in idle time, with
+/// no drain asking for it.
+#[test]
+fn seeks_buy_consolidations_priced_by_the_workers_compactions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let mut db = ShardDb::create(open(&path, true), STORE, MEM, TRUNK).unwrap();
+    workers(&mut db, &path);
+    let oracle = workload(&mut db, false, 0x9e37_79b9_7f4a_7c15);
+    while db.owed() {
+        db.idle_step(64).unwrap();
+    }
+    let (_, trunk, _) = db.stats();
+    // A merge reads every entry it writes: every compacted entry was priced.
+    assert!(
+        trunk.merge_units >= trunk.entries_written && trunk.merge_ns > 0,
+        "{trunk:?}"
+    );
+    // Seeks pay rent for the sources a consolidation would spare them, and idle time
+    // consolidates the leaves they paid for.
+    while db.stats().1.consolidations == 0 {
+        check_scan(&mut db, &oracle, 7);
+        while db.owed() {
+            db.idle_step(64).unwrap();
+        }
+    }
+    for k in 0..KEYS {
+        check(&mut db, &oracle, k);
+    }
+    check_scan(&mut db, &oracle, 64);
+    db.check_references().unwrap();
+}
+
 /// The same with the shard's runs on a two-worker issuer: a job waits for its inputs' runs to
 /// land before a worker reads them.
 #[test]

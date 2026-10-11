@@ -150,13 +150,17 @@ pub struct Job {
 }
 
 /// A job's result: the branches made, each with its first key, in key order; the granted
-/// extents it never wrote; the file's end past its writes; and the nanoseconds it ran.
+/// extents it never wrote; the file's end past its writes; the nanoseconds it ran; and, for a
+/// compaction, the work units it merged in them, counted as a step on the shard counts its own
+/// (keys merged, leaves opened and filter pages at their worth in keys), so the trunk prices a
+/// compacted key from every compaction wherever it ran ([`super::Trunk::note_merge`]).
 #[derive(Debug)]
 pub struct Output {
     pub parts: Vec<(Vec<u8>, Branch)>,
     pub unused: Vec<u64>,
     pub end: u64,
     pub ns: u64,
+    pub units: u64,
 }
 
 /// Who a job's result goes back to: the trunk's maintenance, or the shard's packing.
@@ -310,12 +314,13 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
         });
         // A job's time less its waits for a packing's entries: the work it did, which the pool
         // sizes itself by, not the shard's pace.
-        let result = ran.and_then(|(parts, waited)| {
+        let result = ran.and_then(|(parts, waited, units)| {
             drained.map(|()| Output {
                 parts,
                 unused: store.unused_grant(),
                 end: store.end(),
                 ns: ns(Instant::now().saturating_duration_since(t)).saturating_sub(waited),
+                units,
             })
         });
         // A packing's channels close before the result is sent, so every buffer still held is
@@ -373,7 +378,7 @@ fn run_guarded<F: BlockFile>(
     job: &Job,
     back: &Sender<Message>,
     id: usize,
-) -> (Result<(Parts, u64), Error>, bool) {
+) -> (Result<(Parts, u64, u64), Error>, bool) {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(store, job, back, id))) {
         Ok(result) => (result, false),
         Err(payload) => {
@@ -393,15 +398,17 @@ fn run_guarded<F: BlockFile>(
     }
 }
 
-/// Runs `job`: the branches made, and the nanoseconds it waited for a packing's entries.
+/// Runs `job`: the branches made, the nanoseconds it waited for a packing's entries, and the
+/// work units a compaction merged (none for a packing).
 fn run<F: BlockFile>(
     store: &mut Store<F>,
     job: &Job,
     back: &Sender<Message>,
     id: usize,
-) -> Result<(Parts, u64), Error> {
+) -> Result<(Parts, u64, u64), Error> {
     store.begin_job(&job.grant, job.file_end, job.generation)?;
     let mut waited = 0u64;
+    let mut units = 0u64;
     let parts = match &job.work {
         Work::Compact(t) => {
             let mut c = Compaction::new(
@@ -412,7 +419,7 @@ fn run<F: BlockFile>(
                 t.drop_tombstones,
                 t.per,
             )?;
-            c.step(store, &t.inputs, u64::MAX)?;
+            units = c.step(store, &t.inputs, u64::MAX)?;
             c.finish(store)?
         }
         Work::Pack(s) => {
@@ -431,7 +438,7 @@ fn run<F: BlockFile>(
             vec![(Vec::new(), b.finish(store)?)]
         }
     };
-    Ok((parts, waited))
+    Ok((parts, waited, units))
 }
 
 fn gone(what: &'static str) -> Error {

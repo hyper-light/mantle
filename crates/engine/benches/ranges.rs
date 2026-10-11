@@ -380,7 +380,7 @@ impl Workload {
 fn stats(name: &str, counters: &[RangeStats]) {
     for (range, (f, t, io)) in counters.iter().enumerate() {
         println!(
-            "{name} range {range} flushes {} stalls {} waited_steps {} pivot_compactions {} leaf_compactions {} splits {} entries_written {} views_built {} views_dropped {} maplets_built {} maplets_declined {} maplets_dropped {} io reads {} pages_read {} submitted {} pages_written {} syncs {} queued {} queued_most {} write_waits {} prefetches {} prefetch_waits {} cache_hits {} span_cache_hits {} device_reads {} resident_reads {} device_read_ns {}",
+            "{name} range {range} flushes {} stalls {} waited_steps {} pivot_compactions {} leaf_compactions {} splits {} entries_written {} views_built {} views_dropped {} maplets_built {} maplets_declined {} maplets_dropped {} consolidations {} merge_units {} merge_ns {} io reads {} pages_read {} submitted {} pages_written {} syncs {} queued {} queued_most {} write_waits {} prefetches {} prefetch_waits {} cache_hits {} span_cache_hits {} device_reads {} resident_reads {} device_read_ns {}",
             f.flushes,
             f.stalls,
             f.waited_steps,
@@ -393,6 +393,9 @@ fn stats(name: &str, counters: &[RangeStats]) {
             t.maplets_built,
             t.maplets_declined,
             t.maplets_dropped,
+            t.consolidations,
+            t.merge_units,
+            t.merge_ns,
             io.reads,
             io.pages_read,
             io.submitted,

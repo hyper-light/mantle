@@ -283,6 +283,11 @@ pub struct TrunkStats {
     pub maplets_declined: u64,
     /// Leaves settled to one branch because seeks paid for it ([`Consolidation`]).
     pub consolidations: u64,
+    /// Work units merged by timed maintenance, inline or on workers, and the nanoseconds they
+    /// took: a compacted key's measured cost, which consolidations are priced at
+    /// ([`Trunk::note_merge`]).
+    pub merge_units: u64,
+    pub merge_ns: u64,
 }
 
 /// Nanoseconds since `t`, none when timing is off (`Trunk::set_timed`).
@@ -1333,10 +1338,10 @@ impl Trunk {
         )
     }
 
-    /// Counts an idle or drain slice of maintenance that took `ns` and merged `keys`: the measured
-    /// cost of a compacted key a consolidation is priced at. Timed by the shard's idle paths, a
-    /// clock read a slice, never by a put's share.
-    pub fn note_merge(&mut self, ns: u64, keys: u64) {
+    /// Counts merging that took `ns` and merged `keys`: the measured cost of a compacted key a
+    /// consolidation is priced at. Timed where the merging ran, never the waits around it: an
+    /// inline compaction's steps on the shard, and a maintenance worker's compaction job.
+    fn note_merge(&mut self, ns: u64, keys: u64) {
         if keys > 0 {
             self.merge_ns = self.merge_ns.saturating_add(ns);
             self.merge_keys = self.merge_keys.saturating_add(keys);
@@ -3177,7 +3182,11 @@ impl Trunk {
 
     /// What the trunk's maintenance has done.
     pub fn stats(&self) -> TrunkStats {
-        self.stats
+        TrunkStats {
+            merge_units: self.merge_keys,
+            merge_ns: self.merge_ns,
+            ..self.stats
+        }
     }
 
     /// The extents of the trunk's saved image.

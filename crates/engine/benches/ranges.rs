@@ -56,7 +56,14 @@ use mantle_engine::trunk::TrunkConfig;
 #[global_allocator]
 static ALLOCATOR: alloc::Counting = alloc::Counting;
 
-const VALUE: [u8; 100] = [b'v'; 100];
+/// The value every put writes: `--value-bytes=N` bytes of `v` (100 unless given), set once
+/// before any workload runs. A 1B-key run takes a smaller value where 100 bytes a key would not
+/// fit the disk (owner, 2026-10-11).
+static VALUE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+fn fill_value() -> &'static [u8] {
+    VALUE.get().map_or(&[], Vec::as_slice)
+}
 type BenchError = Box<dyn std::error::Error + Send + Sync>;
 
 fn require(holds: bool, what: &'static str) -> Result<(), BenchError> {
@@ -208,7 +215,7 @@ impl Workload {
                             let began = Instant::now();
                             let hit = match work {
                                 Work::Fill => {
-                                    client.put(&key, &VALUE)?;
+                                    client.put(&key, fill_value())?;
                                     true
                                 }
                                 Work::Get => client.get(&key, &mut value)?,
@@ -227,7 +234,7 @@ impl Workload {
                                     )?;
                                     if hit {
                                         require(
-                                            value.as_slice() == VALUE,
+                                            value.as_slice() == fill_value(),
                                             "get value differs from the fill oracle",
                                         )?;
                                     }
@@ -245,7 +252,7 @@ impl Workload {
                                             "scan key differs from the fill oracle",
                                         )?;
                                         require(
-                                            value == VALUE,
+                                            value == fill_value(),
                                             "scan value differs from the fill oracle",
                                         )?;
                                     }
@@ -312,7 +319,7 @@ impl Workload {
             let began = Instant::now();
             let hit = match work {
                 Work::Fill => {
-                    client.put_async(&key, &VALUE).await?;
+                    client.put_async(&key, fill_value()).await?;
                     true
                 }
                 Work::Get => client.get_async(&key, &mut value).await?,
@@ -333,7 +340,7 @@ impl Workload {
                     )?;
                     if hit {
                         require(
-                            value.as_slice() == VALUE,
+                            value.as_slice() == fill_value(),
                             "get value differs from the fill oracle",
                         )?;
                     }
@@ -350,7 +357,10 @@ impl Workload {
                             key == rocks_workload::key(number),
                             "scan key differs from the fill oracle",
                         )?;
-                        require(value == VALUE, "scan value differs from the fill oracle")?;
+                        require(
+                            value == fill_value(),
+                            "scan value differs from the fill oracle",
+                        )?;
                     }
                     rows += page.len() as u64;
                     let hit = page.get(0).is_some_and(|(first, _)| first == key);
@@ -522,6 +532,7 @@ fn main() -> Result<(), BenchError> {
     let mut no_inline = false;
     let mut seed = 301u64;
     let mut runtime_record = None;
+    let mut value_bytes = 100usize;
     let mut args = Vec::new();
     for arg in std::env::args().skip(1) {
         if arg == "--shard-client" {
@@ -532,10 +543,15 @@ fn main() -> Result<(), BenchError> {
             seed = value.parse()?;
         } else if let Some(path) = arg.strip_prefix("--runtime-record=") {
             runtime_record = Some(PathBuf::from(path));
+        } else if let Some(n) = arg.strip_prefix("--value-bytes=") {
+            value_bytes = n.parse()?;
         } else if arg != "--bench" {
             args.push(arg);
         }
     }
+    VALUE
+        .set(vec![b'v'; value_bytes])
+        .map_err(|_| io::Error::other("the value was set twice"))?;
     let dir = PathBuf::from(
         args.first()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "DIR required"))?,
@@ -625,7 +641,8 @@ fn main() -> Result<(), BenchError> {
         rt.tasks_per_shard
     );
     println!(
-        "workload generator rocksdb-mt19937_64 seed {seed} key_padding ascii-0 values repeated-v num {num} client_threads {threads} ranges {threads} shards {threads} reads_per_thread {reads} seeks_per_thread {seeks} seek_nexts {seek_nexts} issuer_depth {issuer_depth} runs_in_flight_per_range {issuer_depth} cache_mib {cache_mib} write_budget_mib {write_budget_mib} oracle_keys {} throughput full-oracle latency api-only barriers flush+durable-checkpoint optional-accelerators-not-fully-drained",
+        "workload generator rocksdb-mt19937_64 seed {seed} key_padding ascii-0 values repeated-v value_bytes {} num {num} client_threads {threads} ranges {threads} shards {threads} reads_per_thread {reads} seeks_per_thread {seeks} seek_nexts {seek_nexts} issuer_depth {issuer_depth} runs_in_flight_per_range {issuer_depth} cache_mib {cache_mib} write_budget_mib {write_budget_mib} oracle_keys {} throughput full-oracle latency api-only barriers flush+durable-checkpoint optional-accelerators-not-fully-drained",
+        fill_value().len(),
         workload.present.len()
     );
     println!(
@@ -835,7 +852,7 @@ fn main() -> Result<(), BenchError> {
             },
         )?;
         require(applied == threads * num, "recovered applied index differs")?;
-        benchmark_recovery::verify(&mut db, &workload.present, &VALUE, seek_nexts)?;
+        benchmark_recovery::verify(&mut db, &workload.present, fill_value(), seek_nexts)?;
         match db.into_file() {
             IntoFile::Finished { file, result } => {
                 result?;

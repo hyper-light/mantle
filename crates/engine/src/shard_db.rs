@@ -1402,33 +1402,24 @@ impl<F: BlockFile> ShardDb<F> {
         );
     }
 
-    /// Sets the page cache's and the record cache's limits to their shares, each less the index
-    /// and ghost bytes it pays for, at the ratio of index to data measured now. A region whose
-    /// limit fell is brought down to it by `trim`, a few pages an operation, which outpaces a
-    /// growing region's filling (a page or a record a miss): memory moving between them never
-    /// holds more than it did when the step began.
+    /// Sets the page cache's and the record cache's data limits to their shares, each less the
+    /// index and ghost bytes it takes now, the charge `memory_held` counts until the next grant:
+    /// a cache's data at its limit and that charge are within its share whatever either holds.
+    /// A region whose limit fell is brought down to it by `trim`, a few pages an operation,
+    /// which outpaces a growing region's filling (a page or a record a miss): memory moving
+    /// between them never holds more than it did when the step began.
     fn grant(&mut self) {
         if self.memory.is_none() {
             return;
         }
         let page = self.store.page_size().max(1);
-        let net = |share: usize, data: usize, index: usize| -> usize {
-            let total = u128::try_from(data.saturating_add(index)).unwrap_or(u128::MAX);
-            if data == 0 || total == 0 {
-                return share.saturating_sub(index);
-            }
-            let share = u128::try_from(share).unwrap_or(u128::MAX);
-            let data = u128::try_from(data).unwrap_or(u128::MAX);
-            usize::try_from(share.saturating_mul(data).checked_div(total).unwrap_or(0))
-                .unwrap_or(usize::MAX)
-        };
         let (cache_index, records_index) = self.index_bytes();
         self.charged = (cache_index, records_index);
-        let cache = net(self.cache_share, self.store.cache_bytes(), cache_index);
+        let cache = self.cache_share.saturating_sub(cache_index);
         self.store
             .resize_cache(cache.checked_div(page).unwrap_or(0));
         if let Some(r) = self.records.as_mut() {
-            let records = net(self.records_share, r.held_bytes(), records_index);
+            let records = self.records_share.saturating_sub(records_index);
             r.resize(records);
         }
     }

@@ -475,6 +475,54 @@ reads a put still issues synchronously, one call in about 600 puts. Submitting t
 device's issuer and going on, once hyper-block's issuer takes submissions without waiting, is the
 next part of E7.
 
+### Flat maintenance (CLAUDE.md §10), as designed
+
+The cascade above is recursion on an explicit stack: a node's frame flushes one pivot, then waits
+for that child's whole frame (its compactions, its flushes, its children's) before the next
+pivot, and incorporation waits for the whole of it once `fanout` branches are pending. At 100 M
+puts (`benches/ranges.rs`, seed 301, this Mac, 2026-10-10) one cascade in each run was a split
+wave: 26 pivot compactions, 12 leaf compactions, 93–107 splits and about 100 M entries written in
+15–17.7 s, while rotations filled `fanout` pending slots behind it, so a put waited 11.7–14.4 s.
+Its single-job leaf compactions ran one after another, 9.6–11.8 s of each run, and the async
+path admitted each node's jobs at the pool's measured need, one in 44 of the 58 slowest nodes,
+beside 17 idle warm workers (benchmark-results/mantle-stall-trace-100m-20261010,
+mantle-stall-urgent-ab-20261010). Admitting a stalled cascade's jobs within the cores changed
+neither the stall nor the fill: the work was a chain, not a queue.
+
+SplinterDB keeps no such chain (research/34 §2, trunk.c): a flush copies references only, so the
+recursive flush ends before any compaction, and each changed pivot's bundle compaction is a task
+the workers run in parallel and apply later, discarded if a flush or split changed the pivot.
+SILK (research/34 §5) gives the work that blocks clients first claim: flush and L0→L1 are never
+paused. The trunk becomes a set of per-node tasks, each with a trigger, run by one loop with a
+counted budget; no task waits on another node's:
+- **Incorporation** moves pending branches into the root's in-flight list whenever the root takes
+  no structural change. A compaction plans over the in-flight bundles up to `covered`, so later
+  ones land past it. Puts wait only when the root holds more than `fanout` uncompacted in-flight
+  bundles, the bound pending has now, so a read probes no more sources than today; this is the
+  one stall left. Root compactions free it, so they are first among ready tasks, and while a put
+  or a pending branch waits, every ready task is admitted within the cores (`Pool::can_take`'s
+  rule for a wait).
+- **Compaction**, one task per pivot with live in-flight bundles: it merges them, clipped to the
+  pivot's range, into one branch, on a worker or inline a budget at a time, and its apply puts
+  the branch at the front of the pivot bundle and moves the pivot's start to `covered`.
+- **Flush**, one task per pivot whose bundle passes `fanout`: its branches move to the child's
+  in-flight list by reference, no entry rewritten, which makes the child's pivots compaction
+  tasks. A pivot bundle has one owner, so a branch is still named by one node at a time.
+- **Settle and split**, one structural task per node: a leaf past `fanout` branches or
+  `leaf_entries` entries is compacted whole and split by entries; an index node past `fanout`
+  pivots splits. The apply splices the parts into the parent, which may make the parent a split
+  task in turn: a trigger per level, never a frame waiting on a frame.
+- **Exclusivity, not discard.** A node with a structural task out takes no flush and plans no
+  compaction until it applies, so no work is thrown away and no branch is shared; every other
+  node proceeds.
+- **Bounds.** At most one compaction and one flush per pivot and one structural task per node:
+  the queue is bounded by the trunk's size, and a step ends on its budget. The debt is the known
+  sum of the queued tasks, so pacing no longer meets work planned only once a chain reaches it.
+
+Reads are unchanged: every apply runs on the shard's thread between steps, so a read sees each
+node either before or after a task, never half of one. A checkpoint saves the nodes as they are;
+an output not yet applied is named by no saved node and is freed at recovery, as a job out is now.
+
 ### Writes handed to the device's issuer (E7's second part)
 
 The tail left after pacing was the extent write a put issued synchronously: attributed by

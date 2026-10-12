@@ -2415,29 +2415,34 @@ impl<F: BlockFile> ShardDb<F> {
     /// Packs `w` keys' worth of the packing memtable: its order, then entries, then its filter
     /// pages at their worth in keys; the branch goes to the trunk once whole. With workers, the
     /// entries are fed to one and its branch taken once it comes back, waited for when `wait`.
-    fn pack_some(&mut self, w: u64, wait: bool) -> Result<(), Error> {
+    /// Returns the work done in those units, a branch taken counting one: none when every feed's
+    /// buffers are out with its worker and nothing else is left to the shard.
+    fn pack_some(&mut self, w: u64, wait: bool) -> Result<u64, Error> {
         if w == 0 {
             // No share this put: a worker's branch is taken if it is back, nothing else.
             return self.take_packs(false);
         }
         // The frozen memtables still feeding come first, oldest first.
         let mut w = w;
+        let mut done = 0u64;
         if self.frozen.iter().any(|f| f.feed.is_some()) {
             let used = self.feed_from(w, wait, false)?;
             w = w.saturating_sub(used);
-            self.take_packs(false)?;
+            done = used.saturating_add(self.take_packs(false)?);
         }
         let Some(p) = &mut self.packing else {
-            return Ok(());
+            return Ok(done);
         };
         if w == 0 {
-            return Ok(());
+            return Ok(done);
         }
         let t = self.timed.then(std::time::Instant::now);
         // The memtable's order first: its sort and merges, a slice of the budget.
         if p.mem.debt() > 0 {
-            let paid = p.mem.pay(usize::try_from(w).unwrap_or(usize::MAX));
-            w = w.saturating_sub(u64::try_from(paid).unwrap_or(u64::MAX));
+            let paid = u64::try_from(p.mem.pay(usize::try_from(w).unwrap_or(usize::MAX)))
+                .unwrap_or(u64::MAX);
+            w = w.saturating_sub(paid);
+            done = done.saturating_add(paid);
         }
         if p.mem.debt() == 0 && p.walk.is_none() {
             p.walk = Some(p.mem.walk_start());
@@ -2447,7 +2452,7 @@ impl<F: BlockFile> ShardDb<F> {
         }
         let fed = self.packing.as_ref().is_some_and(|p| p.feed.is_some());
         if fed {
-            self.feed(w, wait)?;
+            done = done.saturating_add(self.feed(w, wait)?);
             let whole = self
                 .packing
                 .as_ref()
@@ -2457,13 +2462,14 @@ impl<F: BlockFile> ShardDb<F> {
                 self.freeze();
             }
             self.note_pack(ns_since(t));
-            return self.take_packs(wait && !self.frozen.is_empty());
+            let taken = self.take_packs(wait && !self.frozen.is_empty())?;
+            return Ok(done.saturating_add(taken));
         }
         if w == 0 {
-            return Ok(());
+            return Ok(done);
         }
         let Some(p) = &mut self.packing else {
-            return Ok(());
+            return Ok(done);
         };
         let Packing {
             mem,
@@ -2473,7 +2479,7 @@ impl<F: BlockFile> ShardDb<F> {
             ..
         } = p;
         let Some(builder) = builder.as_mut() else {
-            return Ok(());
+            return Ok(done);
         };
         let store = &mut self.store;
         let entries = u64::try_from(mem.len().saturating_sub(*packed)).unwrap_or(u64::MAX);
@@ -2486,6 +2492,7 @@ impl<F: BlockFile> ShardDb<F> {
                 builder.add_hashed(store, k, op, v, h)
             })?;
             *packed = packed.saturating_add(visited);
+            done = done.saturating_add(u64::try_from(visited).unwrap_or(u64::MAX));
         }
         let mut whole = false;
         let over = if walk.is_some() {
@@ -2496,13 +2503,17 @@ impl<F: BlockFile> ShardDb<F> {
         if *packed >= mem.len() && over > 0 {
             builder.seal(store)?;
             let pages = over.checked_div(builder.page_keys()).unwrap_or(1).max(1);
+            let left = builder.filter_pages_left();
             whole = builder.write_filter(store, pages)?;
+            // The filter's pages written, at their worth in keys as the budget took them.
+            let wrote = left.saturating_sub(builder.filter_pages_left());
+            done = done.saturating_add(wrote.saturating_mul(builder.page_keys()));
         }
         self.note_pack(ns_since(t));
         if whole {
             self.finish_packing()?;
         }
-        Ok(())
+        Ok(done)
     }
 
     /// The packing memtable's order is paid: its branch goes to a worker, the walked entries fed
@@ -2749,8 +2760,8 @@ impl<F: BlockFile> ShardDb<F> {
 
     /// Takes the packing workers' branches that are back, waiting for one when `wait` and a
     /// memtable is frozen: each goes to its memtable, and those whose older memtables' are all
-    /// in go to the trunk as pending, oldest first ([`Self::retire`]).
-    fn take_packs(&mut self, wait: bool) -> Result<(), Error> {
+    /// in go to the trunk as pending, oldest first ([`Self::retire`]). Returns the branches taken.
+    fn take_packs(&mut self, wait: bool) -> Result<u64, Error> {
         // A wait needs a result on its way: a frozen memtable fed whole whose worker is still
         // building. One still feeding waits on the shard, not the shard on it.
         let mut wait = wait
@@ -2758,11 +2769,12 @@ impl<F: BlockFile> ShardDb<F> {
                 .frozen
                 .iter()
                 .any(|f| f.feed.is_none() && f.back.is_none() && f.error.is_none());
+        let mut taken = 0u64;
         loop {
             // Results already in are retired whether or not another comes.
             self.retire_ready()?;
             let Some(pool) = self.trunk.pool_mut() else {
-                return Ok(());
+                return Ok(taken);
             };
             let Some(back) = pool.take(&mut self.store, Owner::Pack, wait)? else {
                 if pool.out_for(Owner::Pack)
@@ -2773,9 +2785,10 @@ impl<F: BlockFile> ShardDb<F> {
                 {
                     pool.want_message();
                 }
-                return Ok(());
+                return Ok(taken);
             };
             wait = false;
+            taken = taken.saturating_add(1);
             match self.frozen.iter_mut().find(|f| f.ticket == back.ticket) {
                 Some(f) => {
                     // A worker ends before its feed does only by a failure: the feed closes.
@@ -2960,7 +2973,8 @@ impl<F: BlockFile> ShardDb<F> {
         if left > 0 {
             self.feed_from(left, true, false)?;
         }
-        self.take_packs(true)
+        self.take_packs(true)?;
+        Ok(())
     }
 
     /// Charges a scan's `run_seeks` seeks of the runs, each `many` comparisons where one run would
@@ -3108,23 +3122,30 @@ impl<F: BlockFile> ShardDb<F> {
         }
     }
 
+    /// The work an idle slice did. A blocking one waits for what it is owed, so it always
+    /// made progress, counted at least one; a paced one counts what it did, none when everything
+    /// owed waits on the device or the workers: a range sizes its slices by the work they do
+    /// ([`crate::ranges`]), which a budget counted as done whether worked or not inflated past
+    /// any slice's bound (benchmark-results/mantle-slices-20261012).
     fn idle_step_with(&mut self, keys: u64, paced: bool) -> Result<u64, Error> {
+        let counted = |n: u64| if paced { n } else { n.max(1) };
         let left = self.pack_left();
         if left > 0 || self.packing.is_some() {
             // At least one: a memtable packed whole with no filter page left still has its
             // branch to finish.
             let w = keys.min(left).max(1);
-            self.pack_some(w, !paced)?;
-            return Ok(w);
+            let did = self.pack_some(w, !paced)?;
+            return Ok(counted(did));
         }
         if !self.frozen.is_empty() {
             // Only workers' branches owed: an idle shard that may wait waits for the oldest.
-            if paced {
-                self.take_packs(false)?;
+            let did = if paced {
+                self.take_packs(false)?
             } else {
                 self.wait_oldest(1)?;
-            }
-            return Ok(1);
+                1
+            };
+            return Ok(counted(did));
         }
         if self.trunk.debt() > 0 || !self.trunk.is_idle() {
             let t = self.timed.then(std::time::Instant::now);
@@ -3136,7 +3157,7 @@ impl<F: BlockFile> ShardDb<F> {
             if self.timed {
                 self.note_trunk(ns_since(t));
             }
-            return Ok(used.max(1));
+            return Ok(counted(used));
         }
         if self.trunk.consolidation_owed() {
             // Seeks paid for consolidating leaves: one consolidation, in bulk, flushes and settles
@@ -3146,7 +3167,7 @@ impl<F: BlockFile> ShardDb<F> {
             if self.timed {
                 self.note_trunk(ns_since(t));
             }
-            return Ok(used.max(1));
+            return Ok(counted(used));
         }
         let ordering = if paced {
             self.mem.debt() > 0
@@ -4215,6 +4236,82 @@ mod frozen_tests {
         db.fill_ns = 0;
         db.pack_ns = 5_000;
         assert_eq!(db.frozen_most(), 0, "no fill measured, none");
+    }
+
+    /// The shard state an idle step can change: the packing's and each frozen memtable's order
+    /// owed, entries fed and branch back, the active memtable's order owed, the trunk's debt, merged
+    /// units and idleness, and the cache's forgetting and its slots left to reserve.
+    #[derive(Debug, PartialEq, Eq)]
+    struct IdleState {
+        packing: Option<(usize, usize, bool, bool)>,
+        frozen: Vec<(usize, usize, bool, bool)>,
+        mem: usize,
+        trunk: (u64, u64, bool),
+        cache: (u64, usize),
+    }
+
+    fn idle_state(db: &ShardDb<Held>) -> IdleState {
+        IdleState {
+            packing: db
+                .packing
+                .as_ref()
+                .map(|p| (p.mem.debt(), p.packed, p.walk.is_some(), p.feed.is_some())),
+            frozen: db
+                .frozen
+                .iter()
+                .map(|f| (f.mem.debt(), f.packed, f.feed.is_some(), f.back.is_some()))
+                .collect(),
+            mem: db.mem.debt(),
+            trunk: (
+                db.trunk.debt(),
+                db.trunk.stats().merge_units,
+                db.trunk.is_idle(),
+            ),
+            cache: (db.store.forget_debt(), db.store.cache_unreserved()),
+        }
+    }
+
+    static GATES_D: Gates = Gates::new();
+
+    /// A paced idle step reports the work it did, so a range's slices are sized by work: one
+    /// that changed nothing, with the oldest packing's worker held and its feed's buffers out
+    /// with it, reports none, where it reported its whole budget or one; one that changed the
+    /// shard reports some.
+    #[test]
+    fn an_idle_step_that_changes_nothing_reports_no_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let mut db = ShardDb::create(plain(&path, true), STORE, MEM, TRUNK).unwrap();
+        let _open = Open(&GATES_D);
+        db.set_workers(gated(&path, &GATES_D)).unwrap();
+        let mut oracle = BTreeMap::new();
+        let mut i = 0u64;
+        warm(&mut db, &mut oracle, &mut i, put_or_delete);
+        stall_oldest(&mut db, &mut oracle, &mut i, put_or_delete, &GATES_D, false);
+        // Every step changes the shard and says so until none can: the work left is finite while
+        // the oldest packing's worker is held, each changing step doing at least one unit of it.
+        loop {
+            let before = idle_state(&db);
+            let done = db.idle_step_with(u64::MAX, true).unwrap();
+            let after = idle_state(&db);
+            if before == after {
+                assert_eq!(
+                    done, 0,
+                    "a step that changed nothing reported {done}: {after:?}"
+                );
+                break;
+            }
+            assert!(
+                done > 0,
+                "a step that changed the shard reported nothing: {after:?}"
+            );
+        }
+        assert!(db.frozen.front().is_some_and(|f| !f.ready()));
+        check(&mut db, &oracle);
+        GATES_D.release();
+        db.drain_frozen().unwrap();
+        db.maintain(u64::MAX).unwrap();
+        check(&mut db, &oracle);
     }
 
     static GATES_C: Gates = Gates::new();

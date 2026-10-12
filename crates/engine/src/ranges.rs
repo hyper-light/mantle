@@ -698,13 +698,17 @@ impl Range {
 
     /// One slice of maintenance; a failure is kept as the range's fault. A slice that stopped
     /// for a read still in flight leaves [`ShardDb::waiting_for_io`] set for the task to await.
+    /// Only a slice that did work sizes the next: one that found everything owed out with the
+    /// device or the workers measured its own clock reads, not the work's cost.
     fn maintain<F: BlockFile>(&mut self, db: &mut ShardDb<F>) {
         let t = std::time::Instant::now();
         let keys = self.slice.keys();
         match db.idle_paced_step(keys) {
             Ok(done) => {
-                let ns = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                self.slice.record(done, ns);
+                if done > 0 {
+                    let ns = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    self.slice.record(done, ns);
+                }
             }
             Err(e) => self.fault = Some(e),
         }

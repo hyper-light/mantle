@@ -132,6 +132,17 @@ caller hands in the alignment, queue and measured depth it found.
     cleanup. Exact issuer source SHA256: `981096ba8935533bb82c01ec362cedd7ad035b0061908564f80c406f5d333f32`. This is an uncommitted development
     identity, not an accepted producer revision or measured throughput claim.
 
+13. **Foreground thread class** (`threads/`, `issuer.rs`, development): `threads::set_foreground`
+    puts the calling thread in the OS's class for work a caller waits on: macOS QoS
+    USER_INITIATED (pthread_set_qos_class_self_np(3)), whose scheduler bucket XNU runs within
+    37.5 ms against DEFAULT's 75 ms at the same I/O tier; Linux the fair scheduler's shortest
+    slice, 0.1 ms, through sched_getattr(2) and sched_setattr(2) with the thread's policy and nice
+    value kept (EEVDF, Linux 6.12); Windows above-normal priority (SetThreadPriority); false
+    elsewhere. The issuer's dispatcher takes it before it reports ready, and each worker before
+    its first task, reporting the result over a lane of one that the dispatcher reads; a refusal
+    fails the issuer's start (mantle docs/research/44 §2). Exact issuer source SHA256:
+    `73d0320a2df2d3664ed41bc14fbc786286d8361c56d9bbfeb2865fa58a2b09bd`.
+
 ## Planned
 
 - The log's frame writes and flushes through the device's issuer, and the issuer's own reads (mantle

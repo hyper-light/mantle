@@ -388,6 +388,14 @@ Each shard schedules its replicas' flushes and compactions against foreground I/
 - The device's bandwidth `T` is measured (CLAUDE.md §5).
 - SILK's unstated constants (`ε`, the flush minimum, the pause granularity) are measured, not
   chosen.
+- **Thread classes.** A range's shard thread and the device issuer's threads answer requests a
+  caller waits on, so the OS is told so (`hyper_block::threads::set_foreground`): macOS QoS
+  USER_INITIATED, whose scheduler bucket XNU runs within 37.5 ms where DEFAULT's waits 75 ms, at
+  the same I/O tier; Linux the fair scheduler's shortest slice (0.1 ms), with which a waking
+  thread may preempt; Windows above-normal priority (research/44 §2.1-2.3, C2). Maintenance
+  workers keep the default class: a lower one would starve under a saturated CPU without a
+  controller raising it as their backlog grows (research/44 A3), and UTILITY's I/O tier would
+  throttle them behind every foreground read.
 
 ### Paced maintenance, as built (step E7's first part)
 

@@ -60,6 +60,10 @@ mod platform {
     pub fn thread_cpu() -> io::Result<Duration> {
         Err(unsupported())
     }
+
+    pub fn set_foreground() -> io::Result<bool> {
+        Ok(false)
+    }
 }
 
 /// Pool threads drawn from the budget and not yet given back. A draw adds its threads and takes
@@ -89,6 +93,17 @@ pub fn ceiling() -> Result<usize, DiskError> {
 /// than the system it drives, was the bottleneck (docs/design/measurement.md §10).
 pub fn thread_cpu() -> Result<Duration, DiskError> {
     platform::thread_cpu().map_err(|e| os("read the thread's CPU time", e))
+}
+
+/// Tells the OS that the calling thread answers requests a caller waits on (a shard's, the
+/// device issuer's), so that a host whose CPUs other work saturates still runs it in time
+/// (mantle docs/research/44 §2): on macOS the USER_INITIATED QoS class, whose scheduler bucket
+/// XNU runs within 37.5 ms of becoming runnable and lets warp ahead by 4 ms, against DEFAULT's
+/// 75 ms and 2 ms, at the same I/O tier; on Linux the shortest time slice the fair scheduler
+/// takes, with which a waking thread may preempt one whose slice is longer (EEVDF, Linux 6.12);
+/// on Windows above-normal priority. False where the OS offers no such class.
+pub fn set_foreground() -> Result<bool, DiskError> {
+    platform::set_foreground().map_err(|e| os("mark the thread as foreground", e))
 }
 
 /// Pool threads the budget has left.
@@ -162,6 +177,22 @@ mod tests {
         });
         assert!(ceiling().unwrap() >= 1);
         thread_cpu().unwrap();
+    }
+
+    /// A thread marked foreground runs in the class the OS gives request work, where it has one.
+    #[test]
+    fn a_thread_marked_foreground_takes_the_os_foreground_class() {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let marked = set_foreground().unwrap();
+                assert_eq!(
+                    marked,
+                    cfg!(any(target_os = "linux", target_os = "macos", windows))
+                );
+                #[cfg(target_os = "macos")]
+                assert!(platform::is_foreground().unwrap());
+            });
+        });
     }
 
     /// A draw past what is left is refused and draws nothing; a reservation dropped gives its

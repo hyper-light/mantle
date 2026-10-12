@@ -292,6 +292,15 @@ async fn serve<F: BlockFile + 'static>(
     // Boxed once, so a lend moves a pointer.
     let mut db = Box::new(db);
     let task = hyper_rt::futures::current_task();
+    // The range answers requests its clients wait on: its shard's thread is the OS's foreground
+    // class, so a host whose CPUs other work saturates still runs it in time (research/44 §2).
+    // A refusal is the range's fault, which every request is answered with.
+    if let Err(error) = hyper_block::threads::set_foreground() {
+        range.fault.get_or_insert(Error::Io {
+            op: "mark a range's shard thread as foreground",
+            detail: error.to_string(),
+        });
+    }
     // Cancellation is latched by leaving this loop. The terminal cleanup below is
     // never raced again against the permanently ready cancellation level.
     let stop = 'serving: loop {

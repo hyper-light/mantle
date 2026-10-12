@@ -13,7 +13,8 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcessId, GetCurrentThread, GetThreadTimes,
+    GetCurrentProcessId, GetCurrentThread, GetThreadTimes, SetThreadPriority,
+    THREAD_PRIORITY_ABOVE_NORMAL,
 };
 
 /// "By default, each thread pool has a maximum of 500 worker threads" (Microsoft, "Thread
@@ -91,4 +92,16 @@ pub(super) fn thread_cpu() -> io::Result<Duration> {
         .and_then(|u| u.checked_mul(FILETIME_NANOS))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "a CPU time past u64"))?;
     Ok(Duration::from_nanos(nanos))
+}
+
+/// The calling thread at above-normal priority (SetThreadPriority).
+pub(super) fn set_foreground() -> io::Result<bool> {
+    // SAFETY: GetCurrentThread returns the calling thread's pseudo-handle, which needs no closing,
+    // and SetThreadPriority changes only that thread's priority.
+    let set = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
+    if set == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(true)
+    }
 }

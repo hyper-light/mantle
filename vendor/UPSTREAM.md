@@ -129,8 +129,8 @@ SHA-256 `79ab27562281a9585cc4430d2390358283da30c83d9b46b3bdda6249162f0166` and i
 `<file SHA256>  <relative path>\n` for every `*.rs` beneath that directory, ordered by the UTF-8
 relative path. Mantle-local changes to `hyper-block`'s issuer, owed upstream: each attachment's
 numbered submission and completion lanes and the issuer's terminal ownership and retirement
-(`hyper-block/ORIGIN.md` changes 11–12); `src/issuer.rs` SHA-256
-`e818d3eddd339a5678575e11fb975dc5bb59cf21f6c9793b7826063c981d6496`.
+(`hyper-block/ORIGIN.md` changes 11–12), and its threads at the OS's foreground class (change 13);
+`src/issuer.rs` SHA-256 `73d0320a2df2d3664ed41bc14fbc786286d8361c56d9bbfeb2865fa58a2b09bd`.
 
 Mantle-local changes to `hyper-block` on `worker-stream`, made here by the owner's direction and
 owed upstream to hyper-raft: a read the OS holds in memory is made on the submitter's own thread
@@ -140,6 +140,13 @@ mantle `docs/research/41-resident-reads.md`). `libc` is a dependency on Apple ta
 the lock files are unchanged. A lane that handed a one-transfer read straight to a worker was tried
 and removed: it chose a worker without the dispatcher's view of the work each holds, so a read or
 a write could wait behind a long transfer while other workers were idle.
+
+Also owed upstream, made here by the owner's direction (mantle `docs/research/44`): a thread that
+answers requests a caller waits on is put in the OS's foreground class (`threads::set_foreground`:
+macOS QoS USER_INITIATED, Linux the fair scheduler's shortest slice with the thread's policy and
+nice value kept, Windows above-normal priority), which the issuer's dispatcher and workers take at
+start (`hyper-block/ORIGIN.md` change 13). `libc` serves it on Linux and Apple targets, already
+dependencies there; the lock files are unchanged.
 
 The AWS-LC workspace command above excludes these standalone shared-crate roots. It does
 not run their runtime, device or allocation tests. Their suites must also be run against

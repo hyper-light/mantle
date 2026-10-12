@@ -111,3 +111,33 @@ pub(super) fn thread_cpu() -> io::Result<Duration> {
         u32::try_from(t.tv_nsec).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
     Ok(Duration::new(secs, nanos))
 }
+
+/// The calling thread at QoS USER_INITIATED (pthread_set_qos_class_self_np(3)).
+pub(super) fn set_foreground() -> io::Result<bool> {
+    // SAFETY: pthread_set_qos_class_self_np changes only the calling thread's QoS class; the class
+    // is an enumerator and the relative priority 0, both passed by value.
+    let rc = unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0)
+    };
+    if rc == 0 {
+        Ok(true)
+    } else {
+        Err(io::Error::from_raw_os_error(rc))
+    }
+}
+
+/// Whether the calling thread's QoS class is USER_INITIATED (pthread_get_qos_class_np(3)).
+#[cfg(test)]
+pub(super) fn is_foreground() -> io::Result<bool> {
+    let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+    let mut relative: c_int = 0;
+    // SAFETY: pthread_get_qos_class_np writes the calling thread's class and relative priority to
+    // the two locals passed by pointer, which outlive the call.
+    let rc =
+        unsafe { libc::pthread_get_qos_class_np(libc::pthread_self(), &mut class, &mut relative) };
+    if rc == 0 {
+        Ok(matches!(class, libc::qos_class_t::QOS_CLASS_USER_INITIATED))
+    } else {
+        Err(io::Error::from_raw_os_error(rc))
+    }
+}

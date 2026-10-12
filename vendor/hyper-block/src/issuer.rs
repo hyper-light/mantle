@@ -1099,7 +1099,14 @@ fn run(
     std::thread::scope(|scope| {
         // Coalesced yes/no native-report notification: one pending inspection.
         let (native_pending, completed) = sync_channel(1);
-        let started = start_workers(scope, path, workers, &native_pending);
+        let mut started = start_workers(scope, path, workers, &native_pending);
+        // The dispatcher answers the submitters' requests, as each worker does: its thread is
+        // the OS's foreground class (`threads::set_foreground`).
+        if started.result.is_ok()
+            && let Err(e) = crate::threads::set_foreground()
+        {
+            started.result = Err(e);
+        }
         let mut handles = started.native;
         let mut dispatch = Dispatch::new(started.assignments, path);
         // A foreign panic payload can itself panic on Drop. Retain it until every
@@ -1152,11 +1159,13 @@ fn start_workers<'scope, 'env>(
         native: Vec::with_capacity(workers),
         result: Ok(()),
     };
+    let mut classes = Vec::with_capacity(workers);
     for _ in 0..workers {
         match start_worker(scope, pending) {
-            Ok((assignment, worker)) => {
+            Ok((assignment, worker, class)) => {
                 started.assignments.push(assignment);
                 started.native.push(worker);
+                classes.push(class);
             }
             Err(source) => {
                 started.result = Err(DiskError::Io {
@@ -1168,14 +1177,39 @@ fn start_workers<'scope, 'env>(
             }
         }
     }
+    // Each worker reports its thread's foreground class before it takes a task; one that ended
+    // before it could is a worker that did not start.
+    for class in classes {
+        let reported = class.recv().unwrap_or_else(|_| {
+            Err(DiskError::Io {
+                op: "start a device worker",
+                path: path.to_path_buf(),
+                source: std::io::Error::other("the worker ended before it reported its class"),
+            })
+        });
+        if started.result.is_ok()
+            && let Err(e) = reported
+        {
+            started.result = Err(e);
+        }
+    }
     started
 }
+
+/// A started worker: its task lane, its thread, and where it reports its thread's foreground
+/// class (`threads::set_foreground`) before it takes a task.
+type StartedWorker<'scope> = (
+    SyncSender<Task>,
+    NativeWorker<'scope>,
+    Receiver<Result<bool, DiskError>>,
+);
 
 fn start_worker<'scope, 'env>(
     scope: &'scope std::thread::Scope<'scope, 'env>,
     pending: &SyncSender<()>,
-) -> Result<(SyncSender<Task>, NativeWorker<'scope>), std::io::Error> {
+) -> Result<StartedWorker<'scope>, std::io::Error> {
     let (tasks, assigned) = sync_channel(1);
+    let (class, classed) = sync_channel(1);
     let (retired, retirement) = sync_channel(NATIVE_EXIT_ROLES);
     let publisher = NativePublisher {
         retired,
@@ -1189,6 +1223,9 @@ fn start_worker<'scope, 'env>(
                 publisher: &publisher,
                 failed: Some(LifecycleFailure::Worker),
             };
+            // A full lane is impossible (one report into a lane of one); a gone dispatcher has
+            // stopped starting this issuer, and the worker's tasks lane ends it in turn.
+            let _ = class.send(crate::threads::set_foreground());
             let failed = work(&assigned, &publisher);
             ended.failed = failed;
             failed
@@ -1202,6 +1239,7 @@ fn start_worker<'scope, 'env>(
             report: None,
             ended: false,
         },
+        classed,
     ))
 }
 

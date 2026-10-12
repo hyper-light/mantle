@@ -59,6 +59,10 @@ use mantle_engine::trunk::TrunkConfig;
 /// A range's store file: one file growing by its writes, or (`--segments`) segment files each
 /// written whole before use (hyper-block's `SegmentedFile`, docs/research/48).
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one file a range, made once: the size between the variants costs nothing"
+)]
 enum BenchFile {
     One(DeviceFile),
     Segments(SegmentedFile),

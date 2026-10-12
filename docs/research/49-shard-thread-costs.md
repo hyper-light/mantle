@@ -65,3 +65,14 @@ memtable, `merge_step` ~10%), and the heap over the runs left when the memtable 
 
 (a) keeps the memory budget and the worker protocol; (b) takes more off the shard for 64 MiB more a
 packing in flight. Both are built as variants and measured against this tree and RocksDB.
+
+## 5. Later is not less
+
+The ceiling on (a) was measured first, with a build never kept: the same tree with `ORDER_BOUND`
+unbounded, so the memtable is put in order only once it closes, in one sort of every entry
+(`benchmark-results/mantle-orderbound-20261012`, 10M keys, five rounds interleaved). It filled at
+2.34–2.60 M puts/s against 2.50–2.69 M, the whole process's instructions a put 12.4–13.0 K against
+12.6–12.9 K. Deferred, the order work is the same work: one radix sort of 550 K entries, 8.8 MB a
+pass, is no cheaper than chunks of 2,048 sorted and merged while they are in cache. Neither
+deferring nor merging less takes it off the shard; only moving it does, so (a) is dropped and (b)
+is built.

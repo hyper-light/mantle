@@ -3588,6 +3588,12 @@ impl<F: BlockFile> ShardDb<F> {
         (self.flush_stats, self.trunk.stats(), self.store.io_stats())
     }
 
+    /// Shadow mode for the store's resident reads' kept answers, for measurement
+    /// ([`Store::set_residency_shadow`]).
+    pub fn set_residency_shadow(&mut self, on: bool) {
+        self.store.set_residency_shadow(on);
+    }
+
     /// The bytes the trunk's branches hold in memory.
     pub fn memory(&self) -> crate::trunk::Memory {
         self.trunk.memory()

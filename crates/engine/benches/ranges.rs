@@ -390,7 +390,7 @@ impl Workload {
 fn stats(name: &str, counters: &[RangeStats]) {
     for (range, (f, t, io)) in counters.iter().enumerate() {
         println!(
-            "{name} range {range} flushes {} stalls {} waited_steps {} pivot_compactions {} leaf_compactions {} splits {} entries_written {} consolidations {} merge_units {} merge_ns {} io reads {} pages_read {} submitted {} pages_written {} syncs {} queued {} queued_most {} write_waits {} prefetches {} prefetch_waits {} cache_hits {} span_cache_hits {} device_reads {} resident_reads {} device_read_ns {}",
+            "{name} range {range} flushes {} stalls {} waited_steps {} pivot_compactions {} leaf_compactions {} splits {} entries_written {} consolidations {} merge_units {} merge_ns {} io reads {} pages_read {} submitted {} pages_written {} syncs {} queued {} queued_most {} write_waits {} prefetches {} prefetch_waits {} cache_hits {} span_cache_hits {} device_reads {} resident_reads {} device_read_ns {} resident_probes {} resident_skips {} residency_epochs {} residency_changes {} residency_wrong {}",
             f.flushes,
             f.stalls,
             f.waited_steps,
@@ -415,7 +415,12 @@ fn stats(name: &str, counters: &[RangeStats]) {
             io.span_cache_hits,
             io.device_reads,
             io.resident_reads,
-            io.device_read_ns
+            io.device_read_ns,
+            io.residency.probes,
+            io.residency.skips,
+            io.residency.epochs,
+            io.residency.changes,
+            io.residency.wrong
         );
     }
 }
@@ -528,12 +533,17 @@ fn main() -> Result<(), BenchError> {
     let mut seed = 301u64;
     let mut runtime_record = None;
     let mut value_bytes = 100usize;
+    // `--shadow-probe`: every resident read made on a kept answer probes anyway, and the answers
+    // the probe finds wrong are counted (docs/research/46-reclaim-epochs.md): for measurement.
+    let mut shadow_probe = false;
     let mut args = Vec::new();
     for arg in std::env::args().skip(1) {
         if arg == "--shard-client" {
             shard_client = true;
         } else if arg == "--no-inline" {
             no_inline = true;
+        } else if arg == "--shadow-probe" {
+            shadow_probe = true;
         } else if let Some(value) = arg.strip_prefix("--rocks-seed=") {
             seed = value.parse()?;
         } else if let Some(path) = arg.strip_prefix("--runtime-record=") {
@@ -688,6 +698,7 @@ fn main() -> Result<(), BenchError> {
         db.set_cache(cache_bytes / 4096 / threads as usize);
         db.set_write_budget(write_bytes / threads as usize)?;
         db.attach(&issuer, issuer_depth)?;
+        db.set_residency_shadow(shadow_probe);
         let worker_path = path.clone();
         db.set_workers(move || {
             DeviceFile::open(&worker_path, false, CachingRequest::Buffered, align).map_err(

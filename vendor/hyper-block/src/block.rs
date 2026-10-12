@@ -58,6 +58,14 @@ pub trait BlockFile: Send {
         false
     }
 
+    /// What [`BlockFile::read_resident_at`] did. Nothing counted by default.
+    fn residency(&self) -> crate::Residency {
+        crate::Residency::default()
+    }
+
+    /// Shadow mode for [`BlockFile::read_resident_at`]'s kept answers. Nothing by default.
+    fn set_residency_shadow(&mut self, _on: bool) {}
+
     /// Writes all of `buf` at `offset`, extending the file if it ends past the end.
     fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError>;
 
@@ -121,6 +129,14 @@ impl BlockFile for DeviceFile {
 
     fn reads_resident(&self) -> bool {
         DeviceFile::reads_resident(self)
+    }
+
+    fn residency(&self) -> crate::Residency {
+        DeviceFile::residency(self)
+    }
+
+    fn set_residency_shadow(&mut self, on: bool) {
+        DeviceFile::set_residency_shadow(self, on);
     }
 
     fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError> {

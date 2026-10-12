@@ -129,14 +129,15 @@ SHA-256 `79ab27562281a9585cc4430d2390358283da30c83d9b46b3bdda6249162f0166` and i
 `<file SHA256>  <relative path>\n` for every `*.rs` beneath that directory, ordered by the UTF-8
 relative path. Mantle-local changes to `hyper-block`'s issuer, owed upstream: each attachment's
 numbered submission and completion lanes and the issuer's terminal ownership and retirement
-(`hyper-block/ORIGIN.md` changes 11–12); `src/issuer.rs` SHA-256
-`e818d3eddd339a5678575e11fb975dc5bb59cf21f6c9793b7826063c981d6496`.
+(`hyper-block/ORIGIN.md` changes 11–13); `src/issuer.rs` SHA-256
+`3e8f4241704891c74bf0ddc4d3328ea5170c9ec706b2071f9fe313c1ead36195`.
 
 Mantle-local changes to `hyper-block` on `worker-stream`, made here by the owner's direction and
 owed upstream to hyper-raft: a read the OS holds in memory is made on the submitter's own thread
 (`resident`, `BlockFile::read_resident_at`, `BlockFile::reads_resident`,
 `Attached::read_resident_at`: `RWF_NOWAIT` on Linux, `mincore(2)` over a kept mapping on macOS;
-mantle `docs/research/41-resident-reads.md`). `libc` is a dependency on Apple targets too, for it;
+mantle `docs/research/41-resident-reads.md`), and on macOS a probe's answer kept while the kernel
+reclaims no file-backed page (ORIGIN.md change 13; mantle `docs/research/46-reclaim-epochs.md`). `libc` is a dependency on Apple targets too, for it;
 the lock files are unchanged. A lane that handed a one-transfer read straight to a worker was tried
 and removed: it chose a worker without the dispatcher's view of the work each holds, so a read or
 a write could wait behind a long transfer while other workers were idle.

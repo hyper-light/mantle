@@ -131,6 +131,10 @@ pub struct IoStats {
     /// device's issuer ([`hyper_block::block::BlockFile::read_resident_at`]): counted among
     /// `device_reads` too, and timed there, since a larger cache would have saved them.
     pub resident_reads: u64,
+    /// What those reads asked the OS: probes made, reads made on a probe's kept answer instead,
+    /// epochs read and changed, and in shadow mode the kept answers found wrong (hyper-block
+    /// `resident`; docs/research/46-reclaim-epochs.md).
+    pub residency: hyper_block::Residency,
 }
 
 /// Nanoseconds since `since`, none when timing is off (`Store::set_timed`).
@@ -941,6 +945,7 @@ impl<F: BlockFile> Store<F> {
                 .as_ref()
                 .map_or(0, cache::Cache::evict_steps_most),
             buffers_out: u64::try_from(self.lent).unwrap_or(u64::MAX),
+            residency: self.residency(),
             ..self.io
         }
     }
@@ -2729,6 +2734,27 @@ impl<F: BlockFile> Store<F> {
         self.would_wait = true;
         Error::Gone {
             what: "a page only the device can supply now",
+        }
+    }
+
+    /// What the resident reads asked the OS, through the handle they read with.
+    fn residency(&self) -> hyper_block::Residency {
+        if let Some(writer) = self.writer.as_ref() {
+            writer.attached.residency()
+        } else {
+            self.file
+                .as_ref()
+                .map_or_else(hyper_block::Residency::default, BlockFile::residency)
+        }
+    }
+
+    /// Shadow mode for the resident reads' kept answers, for measurement: each read made on one
+    /// probes anyway and counts the answer wrong when the probe disagrees.
+    pub fn set_residency_shadow(&mut self, on: bool) {
+        if let Some(writer) = self.writer.as_mut() {
+            writer.attached.set_residency_shadow(on);
+        } else if let Some(file) = self.file.as_mut() {
+            file.set_residency_shadow(on);
         }
     }
 

@@ -156,6 +156,18 @@ impl Handle {
             .map_or(Ok(false), |file| file.read_resident_at(bytes, at))
     }
 
+    fn residency(&self) -> crate::Residency {
+        self.0
+            .as_ref()
+            .map_or_else(crate::Residency::default, |file| file.residency())
+    }
+
+    fn set_residency_shadow(&mut self, on: bool) {
+        if let Some(file) = self.0.as_mut() {
+            file.set_residency_shadow(on);
+        }
+    }
+
     fn write_all_at(&self, bytes: &[u8], at: u64) -> Result<(), DiskError> {
         self.0.as_ref().map_or_else(
             || Err(stopped(Path::new(""), "a write after duplicate retirement")),
@@ -1037,6 +1049,20 @@ impl Attached {
         self.reader
             .as_mut()
             .map_or(Ok(false), |reader| reader.read_resident_at(buf, offset))
+    }
+
+    /// What [`Self::read_resident_at`] did through this submitter's duplicate.
+    pub fn residency(&self) -> crate::Residency {
+        self.reader
+            .as_ref()
+            .map_or_else(crate::Residency::default, Handle::residency)
+    }
+
+    /// Shadow mode for [`Self::read_resident_at`]'s kept answers, for measurement.
+    pub fn set_residency_shadow(&mut self, on: bool) {
+        if let Some(reader) = self.reader.as_mut() {
+            reader.set_residency_shadow(on);
+        }
     }
 
     /// Closes the submitter's own duplicate, before retirement is signalled (see `reader`).

@@ -220,6 +220,17 @@ impl DeviceFile {
         }
     }
 
+    /// What [`Self::read_resident_at`] did: probes, reads on kept answers, epochs.
+    pub fn residency(&self) -> crate::Residency {
+        self.resident.residency()
+    }
+
+    /// Shadow mode, for measurement: a read made on a kept answer probes anyway and counts the
+    /// answer wrong when the probe disagrees.
+    pub fn set_residency_shadow(&mut self, on: bool) {
+        self.resident.set_shadow(on);
+    }
+
     /// Whether [`Self::read_resident_at`] can read anything: a buffered file, where the platform
     /// can tell what the OS holds (`crate::resident`).
     pub fn reads_resident(&self) -> bool {
@@ -868,6 +879,54 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    /// Do: write pages through the cache; read one from memory twice with the kernel's epoch
+    /// held; again in shadow mode; then once after the epoch moves. Expect: the first read probes,
+    /// the second is made on its kept answer, the shadow read probes anyway and finds the answer
+    /// right, and after the move the read probes again; every read returns the page's bytes.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_page_found_in_memory_is_read_again_without_asking_until_the_epoch_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = DeviceFile::open(
+            &dir.path().join("answers"),
+            true,
+            CachingRequest::Buffered,
+            align(),
+        )
+        .unwrap();
+        let page = 4096usize;
+        let bytes: Vec<u8> = (0..4 * page).map(|i| (i % 251) as u8).collect();
+        file.write_all_at(&bytes, 0).unwrap();
+        file.resident.hold_epoch();
+        let mut buf = vec![0u8; page];
+        let mut read = |file: &mut DeviceFile| {
+            buf.fill(0);
+            assert!(file.read_resident_at(&mut buf, page as u64).unwrap());
+            assert_eq!(buf, &bytes[page..2 * page]);
+            let r = file.residency();
+            (r.probes, r.skips, r.wrong)
+        };
+        assert_eq!(read(&mut file), (1, 0, 0));
+        assert_eq!(read(&mut file), (1, 1, 0));
+        file.set_residency_shadow(true);
+        assert_eq!(read(&mut file), (2, 2, 0));
+        file.set_residency_shadow(false);
+        file.resident.move_epoch();
+        assert_eq!(read(&mut file), (3, 2, 0));
+        assert_eq!(read(&mut file), (3, 3, 0));
+    }
+
+    /// Do: refresh a reader against the kernel's reclamation counters, then again with its epoch
+    /// held one off them. Expect: the second refresh counts a change and starts a new generation,
+    /// and each sets when the epoch is next read.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_refresh_that_finds_the_epoch_moved_forgets_every_answer() {
+        let mut resident = crate::resident::Resident::new();
+        let (before, after) = resident.refresh_from_off_epoch();
+        assert_eq!(after, before + 1);
     }
 
     /// Do: write pages through the cache, then read them only from memory: one the write left

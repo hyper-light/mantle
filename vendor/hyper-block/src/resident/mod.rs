@@ -26,6 +26,19 @@ mod macos;
 #[cfg(target_vendor = "apple")]
 pub(crate) use macos::Resident;
 
+/// What a handle's reads from memory did ([`crate::block::BlockFile::residency`]): probes made,
+/// reads made on an earlier probe's answer instead (macOS, mantle `docs/research/46-reclaim-epochs.md`),
+/// epochs read and the changes among them that forgot every answer, and, in shadow mode, the
+/// answers a probe made anyway found wrong.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Residency {
+    pub probes: u64,
+    pub skips: u64,
+    pub epochs: u64,
+    pub changes: u64,
+    pub wrong: u64,
+}
+
 /// A handle's state for reads made only from memory: whether the kernel refused `RWF_NOWAIT`.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
@@ -76,6 +89,14 @@ impl Resident {
     pub(crate) fn refused(&self) -> bool {
         self.refused
     }
+
+    /// Nothing is counted here: `RWF_NOWAIT` asks and reads in one call, so no answer is kept.
+    pub(crate) fn residency(&self) -> Residency {
+        Residency::default()
+    }
+
+    /// No answers to check.
+    pub(crate) fn set_shadow(&mut self, _on: bool) {}
 }
 
 /// No platform interface: no read is made from memory.
@@ -93,6 +114,12 @@ impl Resident {
     pub(crate) fn read(&mut self, _file: &File, _buf: &mut [u8], _offset: u64) -> io::Result<bool> {
         Ok(false)
     }
+
+    pub(crate) fn residency(&self) -> Residency {
+        Residency::default()
+    }
+
+    pub(crate) fn set_shadow(&mut self, _on: bool) {}
 
     #[cfg(test)]
     pub(crate) fn refused(&self) -> bool {

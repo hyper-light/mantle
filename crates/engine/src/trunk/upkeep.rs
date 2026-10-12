@@ -326,19 +326,12 @@ impl Trunk {
             return;
         }
         let fanout = self.config.fanout;
-        let leaf_entries = self.config.leaf_entries;
         for at in 0..self.nodes.len() {
             let due = self.nodes.get(at).is_some_and(|n| {
                 !n.inflight.is_empty()
                     || n.wants.is_some()
                     || n.pivots.len() > fanout
                     || n.pivots.iter().any(|p| p.bundle.branches().len() > fanout)
-                    || (n.leaf
-                        && n.pivots
-                            .first()
-                            .map(|p| entries(p.bundle.branches()))
-                            .unwrap_or(0)
-                            > leaf_entries)
             });
             if due {
                 self.queue(at);
@@ -428,11 +421,17 @@ impl Trunk {
         if wants.is_some_and(|c| c.started) {
             return Ok(false);
         }
+        let held = pivot.bundle.branches().len();
+        // The last flush before the child splits comes first, a consolidation's too: the split
+        // waits for this bundle to empty and this pivot's compaction waits for the split
+        // ([`Self::held`]), so waiting for that compaction here would hold all three.
+        if held > 0 && wants.is_some_and(Change::splits) {
+            return Ok(true);
+        }
         if self.consolidating && (pivot.seek.paid || pivot.seek.below) {
             return Ok(node.inflight.len() <= pivot.start && !self.compacting(n, &pivot.key));
         }
-        let held = pivot.bundle.branches().len();
-        Ok(held > self.config.fanout || (held > 0 && wants.is_some_and(Change::splits)))
+        Ok(held > self.config.fanout)
     }
 
     /// Plans pivot `i` of node `n`'s compaction of its live in-flight bundles: inline without
@@ -518,9 +517,13 @@ impl Trunk {
         Ok(())
     }
 
-    /// Notes the change node `n` wants, if any: a leaf past `fanout` branches or `leaf_entries`
-    /// entries, or one seeks paid to consolidate, settles; an index node past `fanout` pivots
-    /// splits. A change that splits queues the parent, whose pivot flushes down to it.
+    /// Notes the change node `n` wants, if any: a leaf past `fanout` branches, or one seeks paid
+    /// to consolidate, settles, into as many leaves as its entries fill at `leaf_entries` each;
+    /// an index node past `fanout` pivots splits. A change that splits queues the parent, whose
+    /// pivot flushes down to it. A leaf's entries alone never settle it: the settle rewrites
+    /// every entry, which a split needs no more than SplinterDB's does (its leaf split hands the
+    /// new leaves the old one's bundles by reference; trunk.c `leaf_split`), so a leaf splits
+    /// within the compaction its branches force.
     fn want_change(&mut self, n: usize) -> Result<(), Error> {
         let fanout = self.config.fanout;
         let consolidating = self.consolidating;
@@ -535,8 +538,7 @@ impl Trunk {
             let count = entries(pivot.bundle.branches());
             let was_paid = consolidating && pivot.seek.paid;
             let paid = was_paid && pivot.bundle.branches().len() > 1;
-            if !paid && pivot.bundle.branches().len() <= fanout && count <= self.config.leaf_entries
-            {
+            if !paid && pivot.bundle.branches().len() <= fanout {
                 // Paid with one branch: nothing to rewrite once the leaf's own compactions are
                 // in (a consolidation's flush may still be on its way down), then the rent is
                 // spent; the apply of a compaction due or out looks at the leaf again.
@@ -637,10 +639,7 @@ impl Trunk {
         // A leaf seeks paid to consolidate settles to one branch, within the ordinary bounds.
         let was_paid = self.consolidating && pivot.seek.paid;
         let paid = was_paid && pivot.bundle.branches().len() > 1;
-        if !paid
-            && pivot.bundle.branches().len() <= self.config.fanout
-            && count <= self.config.leaf_entries
-        {
+        if !paid && pivot.bundle.branches().len() <= self.config.fanout {
             if was_paid {
                 self.spend(n, 0)?;
             }

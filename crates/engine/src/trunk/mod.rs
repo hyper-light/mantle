@@ -58,7 +58,8 @@ pub struct Memory {
 pub struct TrunkConfig {
     /// Pivots a node holds, and branches a pivot bundle holds, before a split or a flush.
     pub fanout: usize,
-    /// Entries a leaf holds before it splits.
+    /// Entries each leaf a settle makes holds at most: a leaf settles once past `fanout`
+    /// branches, into `ceil(entries / leaf_entries)` leaves. Its entries alone never rewrite it.
     pub leaf_entries: u64,
 }
 

@@ -254,3 +254,47 @@ fn a_growing_trunk_splits_deepens_and_reads_after_every_batch() {
     // size-tiered Bε-tree), so many keys sit above the leaves; the leaves still split.
     assert!(leaves >= 10, "leaves {leaves}");
 }
+
+/// A leaf whose in-flight branch takes it past its bounds settles that branch with the rest
+/// directly: compacted into the leaf's bundle first, each of its entries would be written twice,
+/// once by the leaf's compaction and again by the settle (measured: every entry a leaf's
+/// compaction wrote in a fill was rewritten by a settle in that fill).
+#[test]
+fn a_leaf_settles_the_branch_that_takes_it_past_its_bounds_without_compacting_it_first() {
+    let align = Alignment::new(4096).unwrap();
+    let file = SimFile::new(align, Alignment::new(512).unwrap(), 5).unwrap();
+    let mut store = Store::create(file, CONFIG).unwrap();
+    let mut trunk = Trunk::new(TrunkConfig {
+        fanout: 4,
+        leaf_entries: 100,
+    })
+    .unwrap();
+    let mut oracle: BTreeMap<Vec<u8>, (Op, Vec<u8>)> = BTreeMap::new();
+    for keys in [0u32..60, 60..150] {
+        let mem: BTreeMap<Vec<u8>, (Op, Vec<u8>)> = keys
+            .map(|k| (key(k), (Op::Put, format!("v{k}").into_bytes())))
+            .collect();
+        let mut b = Builder::new(&mut store, Keys::Exactly(mem.len() as u64)).unwrap();
+        for (k, (op, v)) in &mem {
+            b.add(&mut store, k, *op, v).unwrap();
+        }
+        trunk.add(b.finish(&mut store).unwrap());
+        oracle.extend(mem);
+        trunk.drain(&mut store).unwrap();
+        check_reads(&mut store, &mut trunk, &oracle).unwrap();
+    }
+    let s = trunk.stats();
+    // The first branch compacted into the leaf (60 written); the second, which takes the leaf to
+    // 150 entries, settled with it into two leaves (150 written), never compacted on its own.
+    assert_eq!(
+        (
+            s.pivot_compactions,
+            s.leaf_compactions,
+            s.splits,
+            s.entries_written
+        ),
+        (1, 1, 1, 210),
+        "{s:?}"
+    );
+    check_refs(&store, &trunk);
+}

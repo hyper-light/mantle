@@ -497,7 +497,12 @@ counted budget; no task waits on another node's:
 - **Settle and split**, one structural task per node: a leaf past `fanout` branches or
   `leaf_entries` entries is compacted whole and split by entries; an index node past `fanout`
   pivots splits. The apply splices the parts into the parent, which may make the parent a split
-  task in turn: a trigger per level, never a frame waiting on a frame.
+  task in turn: a trigger per level, never a frame waiting on a frame. A leaf counts its live
+  in-flight bundles as their compaction would leave it, and one they take past its bounds settles
+  them with the rest, as its newest inputs, instead of compacting them into its bundle first:
+  measured on the ranges path, every entry a leaf's compaction wrote was written again by a settle
+  in the same fill, 5.9–6.2 M entries of a 10M fill (28% of its compaction writes) and 40 M of a
+  100M fill (13%) (benchmark-results/mantle-writevol-20261012).
 - **Exclusivity, not discard.** A node with a structural task out takes no flush and plans no
   compaction until it applies, so no work is thrown away and no branch is shared; every other
   node proceeds.

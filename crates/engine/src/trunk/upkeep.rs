@@ -410,7 +410,8 @@ impl Trunk {
     }
 
     /// Whether pivot `i` of node `n` flushes its bundle to its child now: past the fanout, the
-    /// last flush before its child splits, or a consolidation's through a paid or marked pivot.
+    /// last flush before its child splits, a consolidation's through a paid or marked pivot, or,
+    /// above a leaf, once the bundle holds a fanout'th of the leaf's entries.
     /// A consolidation carries the pivot's data down, so it waits for the pivot's live in-flight
     /// bundles to be compacted into the bundle, and flushes even an empty one, so the rent is
     /// spent and a paid pivot's payment goes down to the child's pivots. Never into a child whose
@@ -432,6 +433,23 @@ impl Trunk {
             return Ok(node.inflight.len() <= pivot.start && !self.compacting(n, &pivot.key));
         }
         let held = pivot.bundle.branches().len();
+        // Above a leaf the buffer is sized by the leaf it flushes into, as a leveled tree sizes
+        // each level by the next (Dostoevsky, SIGMOD 2018, §3, §4.1; research/44 B2): at most a
+        // fanout'th of the leaf, so the leaves, which hold one run each, hold all but about a
+        // fanout'th of the data, and the versions the buffers above them keep are bounded so.
+        let child_node = self.node(child)?;
+        if held > 0 && child_node.leaf {
+            let buffered = entries(pivot.bundle.branches());
+            let below = child_node
+                .pivots
+                .iter()
+                .map(|p| entries(p.bundle.branches()))
+                .fold(0u64, u64::saturating_add);
+            let fanout = u64::try_from(self.config.fanout).unwrap_or(u64::MAX);
+            if buffered.saturating_mul(fanout) >= below {
+                return Ok(true);
+            }
+        }
         Ok(held > self.config.fanout || (held > 0 && wants.is_some_and(Change::splits)))
     }
 
@@ -518,9 +536,10 @@ impl Trunk {
         Ok(())
     }
 
-    /// Notes the change node `n` wants, if any: a leaf past `fanout` branches or `leaf_entries`
-    /// entries, or one seeks paid to consolidate, settles; an index node past `fanout` pivots
-    /// splits. A change that splits queues the parent, whose pivot flushes down to it.
+    /// Notes the change node `n` wants, if any: a leaf past one branch or `leaf_entries` entries,
+    /// or one seeks paid to consolidate, settles, so each leaf is one run; an index node past
+    /// `fanout` pivots splits. A change that splits queues the parent, whose pivot flushes down
+    /// to it.
     fn want_change(&mut self, n: usize) -> Result<(), Error> {
         let fanout = self.config.fanout;
         let consolidating = self.consolidating;
@@ -535,8 +554,8 @@ impl Trunk {
             let count = entries(pivot.bundle.branches());
             let was_paid = consolidating && pivot.seek.paid;
             let paid = was_paid && pivot.bundle.branches().len() > 1;
-            if !paid && pivot.bundle.branches().len() <= fanout && count <= self.config.leaf_entries
-            {
+            // One run a leaf, the last level leveled (research/44 B2): every flush into it settles.
+            if !paid && pivot.bundle.branches().len() <= 1 && count <= self.config.leaf_entries {
                 // Paid with one branch: nothing to rewrite once the leaf's own compactions are
                 // in (a consolidation's flush may still be on its way down), then the rent is
                 // spent; the apply of a compaction due or out looks at the leaf again.
@@ -590,16 +609,22 @@ impl Trunk {
         match change.kind {
             ChangeKind::Settle { parts } => {
                 // The parts as the bundle stands now: a settle that has come to split holds its
-                // parent's pivot first, then waits for it to empty.
+                // parent's pivot first, then waits for it to empty. A pivot already empty, with no
+                // compaction into it out, has no flush or compaction to come that would look at
+                // this leaf again: the settle goes ahead now, as one that wanted to split from the
+                // start does.
                 let now = self.settle_parts(n)?;
                 if now > 1 && parts <= 1 && n != self.root {
                     self.node_mut(n)?.wants = Some(Change {
                         kind: ChangeKind::Settle { parts: now },
                         started: false,
                     });
-                    let (parent, _) = self.parent_of(n)?;
-                    self.queue(parent);
-                    return Ok(());
+                    let (parent, i) = self.parent_of(n)?;
+                    let pivot = self.node(parent)?.pivots.get(i).ok_or(corrupt())?;
+                    if !pivot.bundle.branches().is_empty() || self.compacting(parent, &pivot.key) {
+                        self.queue(parent);
+                        return Ok(());
+                    }
                 }
                 self.plan_settle(n)
             }

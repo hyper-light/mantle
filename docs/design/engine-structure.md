@@ -220,6 +220,14 @@ What mantle changes, and why:
   running hardware and against mantle's key counts. SplinterDB chose 8 and 24 MiB without a
   measurement (research/34 §1).
 - **Checksums everywhere** (§3), where SplinterDB has none on data pages.
+- **Leaves leveled, the buffer above each sized by it.** A leaf holds one run: every flush into it
+  settles. A pivot above a leaf flushes once its bundle holds a fanout'th of the leaf's entries, as
+  a leveled tree sizes each level by the next (Dostoevsky, SIGMOD 2018, §3-4; research/44 B2), so
+  the buffers above the leaves, and the versions they keep of keys the leaves hold, are bounded to
+  about a fanout'th of the data. Before, a pivot buffered up to `fanout` branches whatever their
+  size: at 100M the level above the leaves held 36M entries against the leaves' 39M, and the trunk
+  82.5M entries for 63.2M keys (`benchmark-results/mantle-seek-1b-20261012/levels-100m`). Its
+  cost is the leaf's rewrite at each flush, which the measurement weighs against space and seeks.
 
 **Maplets were built, measured and removed** (2026-10-11; research/43 §3–4). Two designs, A/B'd
 in interleaved rounds against per-branch filters with no maplets:

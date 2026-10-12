@@ -184,6 +184,10 @@ pages, each page-aligned and ended by a null, through a handle opened past the c
 overlapped I/O (Microsoft, "WriteFileGather function"); every element may name a page of the same
 buffer. So on Windows a file past the cache takes gather writes of a 128 KiB fill's copies, as
 many a call as an element list no larger than the fill names (64 MiB), hyper-block's `gather`.
+On the runners again (CI run 38313980358, `mantle-wholefill-20261012/gather`), `write_copies_at`
+then took 1,555 / 1,548 ms on Windows aarch64, where a write a copy took 5,122 / 12,505, and 649 /
+707 on Windows x86_64 against 653 / 1,154: the large writes' plateau, from one 128 KiB buffer.
+On Linux and macOS it was again the fastest way or within a tenth of it.
 
 The third (`mantle-segments3-20261012`, e44d9e5) still read less than the merge tree wherever the
 host reclaimed file pages during a run, and segments runs saw reclaim far more often: 8 of 11

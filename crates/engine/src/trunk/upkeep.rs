@@ -428,11 +428,17 @@ impl Trunk {
         if wants.is_some_and(|c| c.started) {
             return Ok(false);
         }
+        let held = pivot.bundle.branches().len();
+        // The last flush before the child splits comes first, a consolidation's too: the split
+        // waits for this bundle to empty and this pivot's compaction waits for the split
+        // ([`Self::held`]), so waiting for that compaction here would hold all three.
+        if held > 0 && wants.is_some_and(Change::splits) {
+            return Ok(true);
+        }
         if self.consolidating && (pivot.seek.paid || pivot.seek.below) {
             return Ok(node.inflight.len() <= pivot.start && !self.compacting(n, &pivot.key));
         }
-        let held = pivot.bundle.branches().len();
-        Ok(held > self.config.fanout || (held > 0 && wants.is_some_and(Change::splits)))
+        Ok(held > self.config.fanout)
     }
 
     /// Plans pivot `i` of node `n`'s compaction of its live in-flight bundles: inline without

@@ -72,6 +72,8 @@ pub struct ScanMerge<'a> {
     /// The nanoseconds each source of the last open took to open, in the sources' order, none
     /// for one passed over: what a seek's extra sources cost it, measured.
     open_ns: Vec<u64>,
+    /// For each head of an async open, its source's place in `open_ns`.
+    slots: Vec<usize>,
 }
 
 impl<'a> ScanMerge<'a> {
@@ -143,6 +145,10 @@ impl<'a> ScanMerge<'a> {
             self.end.extend_from_slice(e);
         }
         self.open_ns.clear();
+        self.slots.clear();
+        // Every source's leaf read started first, none awaited: those the OS holds are read at
+        // once and the rest go to the device together, so a seek waits about one device read
+        // where it waited one a source in turn (research/43 §5).
         for s in sources {
             let t = timed.then(std::time::Instant::now);
             if filter && end.is_some() {
@@ -160,17 +166,30 @@ impl<'a> ScanMerge<'a> {
             let head = match *s {
                 Source::Branch(b) => Head::Branch(RunCursor::new(store)?, b),
             };
-            // The guard owns the head before any await, including the first demand miss.
+            // The guard owns the head before any read starts, the first demand miss included.
             self.heads.push(head);
             let head = self.heads.last_mut().ok_or(Error::InvalidArgument {
                 what: "a scan head absent after it was opened",
             })?;
             match head {
-                Head::Branch(cursor, branch) => cursor.seek_async(branch, store, from).await?,
+                Head::Branch(cursor, branch) => cursor.start_seek(branch, store, from)?,
             }
+            self.slots.push(self.open_ns.len());
             self.open_ns.push(t.map_or(0, |t| {
                 u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
             }));
+        }
+        // Then each seek finished in order, waiting only for a read still out.
+        for (head, &slot) in self.heads.iter_mut().zip(self.slots.iter()) {
+            let t = timed.then(std::time::Instant::now);
+            match head {
+                Head::Branch(cursor, branch) => cursor.seek_async(branch, store, from).await?,
+            }
+            if let Some(ns) = self.open_ns.get_mut(slot) {
+                *ns = ns.saturating_add(t.map_or(0, |t| {
+                    u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
+                }));
+            }
         }
         self.pick();
         Ok(())
@@ -190,6 +209,7 @@ impl<'a> ScanMerge<'a> {
             skipped: 0,
             opened: 0,
             open_ns: self.open_ns,
+            slots: self.slots,
         }
     }
 

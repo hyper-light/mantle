@@ -1527,6 +1527,46 @@ impl RunCursor {
 
     /// Positions an attached scan cursor through demand completion, keeping the selected
     /// leaf in this future across a wait. Its owner returns the cursor on cancellation.
+    /// [`Self::seek_async`]'s first read, made without waiting: the leaf `from` falls in, read
+    /// now when the OS holds it, otherwise handed to the issuer and left in flight in the cursor's
+    /// span (or, with every issuer slot taken, left for the seek to hand over). A scan starts
+    /// every source's seek before it finishes any, so the reads the device serves overlap rather
+    /// than follow one another; [`Self::seek_async`] then takes the page read here, or waits for
+    /// the read in flight.
+    pub(crate) fn start_seek<F: BlockFile>(
+        &mut self,
+        branch: &Branch,
+        store: &mut Store<F>,
+        from: &[u8],
+    ) -> Result<(), Error> {
+        let address = branch.page_address(store, u64::from(branch.leaf_of(from)?))?;
+        if self.loaded == Some(address) {
+            return Ok(());
+        }
+        self.loaded = None;
+        self.valid = false;
+        self.span_page = None;
+        self.page.clear();
+        if store.read_page_paced(&mut self.span, address, &mut self.page)? {
+            self.take_leaf(address)?;
+        }
+        Ok(())
+    }
+
+    /// The page just read into the cursor, from `address`, checked to be a leaf: its entry count
+    /// and table taken, and it is the page held.
+    fn take_leaf(&mut self, address: u64) -> Result<(), Error> {
+        let view = View::new(self.page_data()?)?;
+        if view.kind != LEAF {
+            return Err(corrupt(Malformed::CountMismatch));
+        }
+        let (n, table) = (view.n, view.table);
+        self.n = n;
+        self.table = table;
+        self.loaded = Some(address);
+        Ok(())
+    }
+
     pub(crate) async fn seek_async<F: BlockFile>(
         &mut self,
         branch: &Branch,
@@ -1575,14 +1615,7 @@ impl RunCursor {
             store
                 .read_page_async(&mut self.span, address, &mut self.page)
                 .await?;
-            let view = View::new(self.page_data()?)?;
-            if view.kind != LEAF {
-                return Err(corrupt(Malformed::CountMismatch));
-            }
-            let (n, table) = (view.n, view.table);
-            self.n = n;
-            self.table = table;
-            self.loaded = Some(address);
+            self.take_leaf(address)?;
         }
         self.page_no = page;
         self.index = index;

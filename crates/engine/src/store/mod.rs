@@ -131,6 +131,10 @@ pub struct IoStats {
     /// device's issuer ([`hyper_block::block::BlockFile::read_resident_at`]): counted among
     /// `device_reads` too, and timed there, since a larger cache would have saved them.
     pub resident_reads: u64,
+    /// The most reads handed to the device's issuer and not yet taken by the span that asked for
+    /// them, at once, in flight or landed: the overlap reads reach. A scan that starts every
+    /// source's read before it waits for any holds one for each source the device serves.
+    pub reads_held_most: u64,
 }
 
 /// Nanoseconds since `since`, none when timing is off (`Store::set_timed`).
@@ -2950,6 +2954,11 @@ impl<F: BlockFile> Store<F> {
         };
         writer.reads.push(number);
         writer.read_wanted = false;
+        let held = writer.reads.len().saturating_add(writer.parked.len());
+        self.io.reads_held_most = self
+            .io
+            .reads_held_most
+            .max(u64::try_from(held).unwrap_or(u64::MAX));
         span.pending.push_back((number, address, 1, false));
         self.io.reads = self.io.reads.saturating_add(1);
         self.io.pages_read = self.io.pages_read.saturating_add(1);
@@ -3056,6 +3065,11 @@ impl<F: BlockFile> Store<F> {
         };
         w.reads.push(number);
         w.read_wanted = false;
+        let held = w.reads.len().saturating_add(w.parked.len());
+        self.io.reads_held_most = self
+            .io
+            .reads_held_most
+            .max(u64::try_from(held).unwrap_or(u64::MAX));
         span.pending.push_back((number, address, pages, false));
         self.io.prefetches = self.io.prefetches.saturating_add(1);
         self.io.reads = self.io.reads.saturating_add(1);

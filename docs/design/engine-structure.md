@@ -248,8 +248,10 @@ when it binds, and is measured then.
    read. With the filters and branch interiors in memory, a cold get costs about one device read
    (research/34 §1).
 4. **Seeks and listings.** A scan merges a cursor per branch on its path; a SuRF-style range
-   filter answers "nothing in this prefix" without reading (research/33 row 8). REMIX views were
-   built and measured, and removed (below).
+   filter answers "nothing in this prefix" without reading (research/33 row 8). A seek starts
+   every source's leaf read before it waits for any, so the reads the device serves overlap
+   instead of following one another (research/43 §5). REMIX views were built and measured, and
+   removed (below).
 
 ### Seeks and listings (step E6), as designed
 

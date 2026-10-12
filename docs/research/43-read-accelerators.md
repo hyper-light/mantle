@@ -173,3 +173,24 @@ fix cannot fit on the disk (5× space amplification at 100M) and was not run.
   trunk work in r4), while RocksDB's queries start after `waitforcompaction`. Mantle's database
   was 146–154 GB against RocksDB's 102 GB, which this machine's 128 GB mostly caches. Where
   maintenance lands, space amplification and the page access path (§1) are the next targets.
+
+## 5. Where a 1B seek's time goes [mantle]
+
+The final layout (no views, maplets or hash lists) at 1B, checkpointed as the bench runs it, with
+temporary counters and a 30-second `sample` of the seek phase
+(`benchmark-results/mantle-seek-1b-20261012`, `seekdiag.patch`, `run-measured`):
+
+| 1B seek phase | |
+|---|---|
+| seeks | 3.72K/s; p50 205 µs, p99.9 4.3 ms |
+| sources a seek opens | 10.0 (most 8-10 or 14-15) |
+| page reads a seek | 10.1: 8.5 the OS held (`mincore` and `pread` on the shard), 1.5 from the device, 0.5 from mantle's cache |
+| the shard thread, sampled | 78% parked in `kevent` for a device read's completion, ~20% running (most of it `mincore` and `pread`) |
+| maintenance during the reads / seeks | none / 79.5M entries rewritten by 13 seek-paid consolidations |
+
+A seek positioned its sources one at a time (`ScanMerge::open_async`): each source's leaf read,
+when the device served it, was awaited before the next source's started, so a seek waited one
+device read for every source the OS did not hold, in turn. Started together, the reads overlap: a
+seek waits about as long as its slowest one. The issuer's attachment bounds how many are out at
+once; past it, a read is handed over as an earlier one lands.
+

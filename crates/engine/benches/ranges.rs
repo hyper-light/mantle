@@ -390,7 +390,7 @@ impl Workload {
 fn stats(name: &str, counters: &[RangeStats]) {
     for (range, (f, t, io)) in counters.iter().enumerate() {
         println!(
-            "{name} range {range} flushes {} stalls {} waited_steps {} pivot_compactions {} leaf_compactions {} splits {} entries_written {} consolidations {} merge_units {} merge_ns {} io reads {} pages_read {} submitted {} pages_written {} syncs {} queued {} queued_most {} write_waits {} prefetches {} prefetch_waits {} cache_hits {} span_cache_hits {} device_reads {} resident_reads {} device_read_ns {}",
+            "{name} range {range} flushes {} stalls {} waited_steps {} pivot_compactions {} leaf_compactions {} splits {} entries_written {} consolidations {} merge_units {} merge_ns {} io reads {} pages_read {} submitted {} pages_written {} syncs {} queued {} queued_most {} write_waits {} prefetches {} prefetch_waits {} cache_hits {} span_cache_hits {} device_reads {} resident_reads {} device_read_ns {} reads_held_most {}",
             f.flushes,
             f.stalls,
             f.waited_steps,
@@ -415,7 +415,8 @@ fn stats(name: &str, counters: &[RangeStats]) {
             io.span_cache_hits,
             io.device_reads,
             io.resident_reads,
-            io.device_read_ns
+            io.device_read_ns,
+            io.reads_held_most
         );
     }
 }

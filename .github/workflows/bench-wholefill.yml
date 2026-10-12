@@ -1,0 +1,64 @@
+name: wholefill-bench
+# How fast a new file is written whole with zeros on every target's runner, as a store grows a
+# segment (docs/research/48 §6): crates/disk/benches/wholefill.rs, each way (past the cache 128 KiB,
+# 1, 8 or 64 MiB a write; DeviceFile::write_copies_at from one 128 KiB buffer; through the cache
+# 128 KiB a write) three rounds, the ways' order rotated, beside nothing and beside a writer making
+# the platform's full flushes. Every line is kept as an artifact.
+on:
+  push:
+    branches: ["iobench/**"]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  wholefill:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
+          - { name: linux-aarch64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { name: macos-aarch64, runner: macos-15, target: aarch64-apple-darwin }
+          # Built on Apple silicon and run under Rosetta 2.
+          - { name: macos-x86_64, runner: macos-15, target: x86_64-apple-darwin }
+          - { name: windows-x86_64, runner: windows-2025, target: x86_64-pc-windows-msvc }
+          - { name: windows-aarch64, runner: windows-11-arm, target: aarch64-pc-windows-msvc }
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned Rust
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup target add --toolchain 1.98.0 ${{ matrix.target }}
+      - name: Install NASM
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Build
+        run: |
+          mkdir -p wf
+          cargo +1.98.0 bench -p mantle-disk --bench wholefill --no-run --locked --target ${{ matrix.target }} \
+            --message-format=json | python3 -c '
+          import json, sys
+          for line in sys.stdin:
+              m = json.loads(line)
+              if m.get("reason") == "compiler-artifact" and m.get("executable") and m["target"]["name"] == "wholefill":
+                  print(m["executable"])' > wf/exe.txt
+          cat wf/exe.txt
+      - name: Runs
+        run: |
+          exe=$(cat wf/exe.txt)
+          scratch="$RUNNER_TEMP/wholefill"; mkdir -p "$scratch"
+          { uname -a; df -h "$scratch"; } > wf/host.txt 2>&1 || true
+          for load in none flush; do
+            "$exe" "$load" "$scratch" 268435456 3 2>&1 | tee -a wf/results.txt
+          done
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: wholefill-${{ matrix.name }}
+          path: wf/

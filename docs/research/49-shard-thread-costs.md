@@ -76,3 +76,24 @@ unbounded, so the memtable is put in order only once it closes, in one sort of e
 pass, is no cheaper than chunks of 2,048 sorted and merged while they are in cache. Neither
 deferring nor merging less takes it off the shard; only moving it does, so (a) is dropped and (b)
 is built.
+
+## 6. Elsewhere, measured
+
+(b) built (branch `packoff`, not merged): a closed memtable goes to a free worker at once as a copy
+of its arena (`Work::PackArena`), which sorts it whole (`walk_arena`) and builds its branch; the
+shard keeps it frozen for reads, scans seal its leftover chunk, and it feeds nothing. Against
+segments 38ea487 at 10M, five rounds interleaved (`benchmark-results/mantle-packarena-20261012`):
+
+| arm | fill/s | put p99.99 µs | slowest put ms | reads/s | seeks/s | instructions a put |
+|---|---|---|---|---|---|---|
+| segments | 2.49–2.63 M | 19.5–21.5 | 0.29–0.63 | 762–800 K | 206–211 K | 12.8–12.9 K |
+| (b) | 2.70–2.80 M | 15.6–16.1 | 3.76–4.36 | 747–797 K | 199–205 K | 13.9–14.0 K |
+
+The feed left the shard: its profile under (b) has no `feed_one`, `sift` or `encode`. But the time
+it freed went to waiting, not to puts: a third of the shard's samples were then the runtime's
+clock reads and `kevent` while idle. The bench's one client puts one key at a time and awaits
+each, so with the shard no longer full the fill is the client's round trip, and (b) gains 6%. It
+costs 9% more instructions a put across the process (the worker's sort of every entry, the copy)
+and a 64 MiB copy each rotation, allocated afresh on the shard: its first touch is the 4 ms
+slowest put. Not merged. What would make it pay: work enough in flight to fill the shard the
+feed frees, and the copy's buffer kept and given back by the worker, as the feed's buffers are.

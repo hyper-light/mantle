@@ -231,6 +231,79 @@ fn digit(prefix: u64, byte: usize) -> usize {
     usize::from(prefix.to_be_bytes().get(byte).copied().unwrap_or(0))
 }
 
+/// The newest entry of each key in `arena`, a copy of a closed memtable's whose keys share their
+/// first `skip` bytes ([`HashMem::copy_arena`], [`HashMem::skip`]), in key order:
+/// `each(key, op, value, hash32)`. A packing worker's own order of its copy, one radix sort of
+/// every entry as a chunk's is sorted (`sort_step`), so the memtable's shard keeps only the order
+/// its own scans need (docs/research/49 §4).
+pub(crate) fn walk_arena(
+    arena: &[u8],
+    skip: usize,
+    mut each: impl FnMut(&[u8], Op, &[u8], u32) -> Result<(), Error>,
+) -> Result<(), Error> {
+    let oom = || Error::LimitExceeded {
+        what: "entries of a packing's sort",
+        limit: u64::try_from(arena.len()).unwrap_or(u64::MAX),
+    };
+    // Every entry as the memtable keys its own, read from the start in the order written.
+    let mut src: Vec<Keyed> = Vec::new();
+    let mut at = 0usize;
+    while at < arena.len() {
+        let entry = u32::try_from(at).map_err(|_| corrupt())?;
+        let (_, klen, vlen, start) = parse(arena, entry).ok_or(corrupt())?;
+        let mid = start.checked_add(klen).ok_or(corrupt())?;
+        let key = arena.get(start..mid).ok_or(corrupt())?;
+        src.try_reserve(1).map_err(|_| oom())?;
+        src.push(Keyed {
+            prefix: prefix(key, skip),
+            entry,
+            hash32: crate::branch::filter::hash32(crate::branch::filter::hash(key)),
+        });
+        at = mid.checked_add(vlen).ok_or(corrupt())?;
+    }
+    let n = src.len();
+    let mut dst = Vec::new();
+    dst.try_reserve_exact(n).map_err(|_| oom())?;
+    dst.resize(n, Keyed::default());
+    let mut s = Sort {
+        src,
+        dst,
+        skip,
+        stage: Stage::Rekey,
+        at: 0,
+        stale: 0,
+        counts: Box::new([[0; 256]; 8]),
+        passes: [0; 8],
+        npass: 0,
+        pass: 0,
+        next: [0; 256],
+        lo: 0,
+        group: None,
+        kept: 0,
+        rate: 0,
+    };
+    // Each step moves an entry or ends a stage, and a sort's moves are at most its reads, so
+    // the steps end within them.
+    let mut steps = sort_reads(n).saturating_add(16);
+    while !sort_step(arena, &mut s, usize::MAX).0 {
+        steps = steps.checked_sub(1).ok_or(corrupt())?;
+    }
+    for e in &s.src {
+        let (op, klen, vlen, start) = parse(arena, e.entry).ok_or(corrupt())?;
+        let op = match op {
+            1 => Op::Put,
+            2 => Op::Delete,
+            _ => return Err(corrupt()),
+        };
+        let mid = start.checked_add(klen).ok_or(corrupt())?;
+        let end = mid.checked_add(vlen).ok_or(corrupt())?;
+        let key = arena.get(start..mid).ok_or(corrupt())?;
+        let value = arena.get(mid..end).ok_or(corrupt())?;
+        each(key, op, value, e.hash32)?;
+    }
+    Ok(())
+}
+
 /// A memtable: the arena, its bound, the index of newest entries, the collisions the index
 /// cannot hold, the sorted runs and the unsorted tail, and the work in progress on them.
 #[derive(Debug)]
@@ -627,6 +700,24 @@ impl HashMem {
 
     fn key(&self, entry: u32) -> &[u8] {
         key(&self.arena, entry)
+    }
+
+    /// A copy of the entries written, for a packing worker to order and pack on its own
+    /// ([`walk_arena`]): the memtable stays the shard's, read until its branch is in.
+    pub fn copy_arena(&self) -> Result<Vec<u8>, Error> {
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(self.arena.len())
+            .map_err(|_| Error::LimitExceeded {
+                what: "bytes of a memtable's copy",
+                limit: u64::try_from(self.arena.len()).unwrap_or(u64::MAX),
+            })?;
+        copy.extend_from_slice(&self.arena);
+        Ok(copy)
+    }
+
+    /// The bytes every key written shares with the first: where prefixes are taken from.
+    pub fn skip(&self) -> usize {
+        self.skip
     }
 
     /// An entry's key, operation and value.

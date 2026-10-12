@@ -56,7 +56,19 @@ pub struct Task {
 pub enum Work {
     Compact(Task),
     Pack(Stream),
+    PackArena(Arena),
     Grow(Growth),
+}
+
+/// A closed memtable's entries as a copy of its arena, for the worker to order and pack on its own
+/// (`memtable::hashed::walk_arena`): `entries` keys in all, their prefixes from `skip`. The shard
+/// keeps its memtable, and the order its own scans need, until the branch is in
+/// (docs/research/49 §4).
+#[derive(Debug)]
+pub struct Arena {
+    pub arena: Vec<u8>,
+    pub skip: usize,
+    pub entries: u64,
 }
 
 /// A segment of the shard's file to add, when `add`, and write whole, so its extents may be
@@ -447,6 +459,13 @@ fn run<F: BlockFile>(
                 back.blocking_send(Message::Spent { worker: id, buf })
                     .map_err(|_| gone("give the shard a packing buffer back"))?;
             }
+            vec![(Vec::new(), b.finish(store)?)]
+        }
+        Work::PackArena(a) => {
+            let mut b = Builder::new(store, Keys::Exactly(a.entries))?;
+            crate::memtable::hashed::walk_arena(&a.arena, a.skip, |k, op, v, h| {
+                b.add_hashed(store, k, op, v, h)
+            })?;
             vec![(Vec::new(), b.finish(store)?)]
         }
         Work::Grow(g) => {

@@ -29,13 +29,13 @@ use crate::rows::Rows;
 use crate::scan::{BorrowedScanMerge, ScanMerge};
 use crate::store::{Config, IntoFile, Store};
 use crate::trunk::pool::{
-    self, Back, FEED_BUFFERS, Growth, Job, Owner, Pool, Spawn, Stream, Ticket, Work,
+    self, Arena, Back, FEED_BUFFERS, Growth, Job, Owner, Pool, Spawn, Ticket, Work,
 };
 use crate::trunk::{Source, Trunk, TrunkConfig};
 use crate::util::reuse;
 use hyper_block::block::BlockFile;
 use std::collections::VecDeque;
-use std::sync::mpsc::{SyncSender, sync_channel};
+use std::sync::mpsc::SyncSender;
 
 /// The time maintenance took on the put path: packing memtables into branches, the trunk's
 /// steps, and the stalls, a put paying a debt whole because its room ran out; in total and at the
@@ -1981,6 +1981,11 @@ impl<F: BlockFile> ShardDb<F> {
         if let Some(p) = self.packing.as_mut() {
             p.mem.seal();
         }
+        // A frozen memtable a worker packs from its own copy keeps the order work its rotation
+        // left, a chunk and its merges at most: sealed here, so none changes under the scan.
+        for f in &mut self.frozen {
+            f.mem.seal();
+        }
         let mut active = std::mem::replace(&mut self.scan_active, MemCursor::empty());
         // A seek of the runs is timed when they are many: the price of the comparisons they add.
         let (many, one) = self.mem.seek_comparisons();
@@ -2187,6 +2192,11 @@ impl<F: BlockFile> ShardDb<F> {
         self.mem.seal();
         if let Some(p) = self.packing.as_mut() {
             p.mem.seal();
+        }
+        // A frozen memtable a worker packs from its own copy keeps the order work its rotation
+        // left, a chunk and its merges at most: sealed here, so none changes under the scan.
+        for f in &mut self.frozen {
+            f.mem.seal();
         }
         let mut active = std::mem::replace(&mut self.scan_active, MemCursor::empty());
         // A seek of the runs is timed when they are many: the price of the comparisons they add.
@@ -2615,12 +2625,25 @@ impl<F: BlockFile> ShardDb<F> {
             w = w.saturating_sub(used);
             self.take_packs(false)?;
         }
+        if w == 0 || self.packing.is_none() {
+            return Ok(());
+        }
+        // A worker free takes the memtable whole at once and orders its own copy
+        // ([`Self::start_packing`]): the shard pays none of its order.
+        if self
+            .packing
+            .as_ref()
+            .is_some_and(|p| p.builder.is_none() && p.feed.is_none())
+            && self
+                .trunk
+                .pool_mut()
+                .is_some_and(|pool| pool.can_take(true))
+        {
+            self.start_packing(false)?;
+        }
         let Some(p) = &mut self.packing else {
             return Ok(());
         };
-        if w == 0 {
-            return Ok(());
-        }
         let t = self.timed.then(std::time::Instant::now);
         // The memtable's order first: its sort and merges, a slice of the budget.
         if p.mem.debt() > 0 {
@@ -2719,11 +2742,21 @@ impl<F: BlockFile> ShardDb<F> {
         }
         if !short && let Some(pool) = self.trunk.pool_mut().filter(|pool| pool.can_take(true)) {
             let grant = self.store.grant(extents)?;
-            let (full, full_rx) = sync_channel(FEED_BUFFERS);
+            // The worker orders and packs a copy of the memtable on its own: the shard keeps the
+            // memtable, read until the branch is in, and only the order its own scans need
+            // (docs/research/49 §4).
+            let arena = match p.mem.copy_arena() {
+                Ok(arena) => arena,
+                Err(error) => {
+                    self.store.grant_back(&grant)?;
+                    return Err(error);
+                }
+            };
             let job = Box::new(Job {
-                work: Work::Pack(Stream {
+                work: Work::PackArena(Arena {
+                    arena,
+                    skip: p.mem.skip(),
                     entries,
-                    full: full_rx,
                 }),
                 grant: grant.clone(),
                 file_end: self.store.end(),
@@ -2738,15 +2771,7 @@ impl<F: BlockFile> ShardDb<F> {
             };
             match sent {
                 Ok(ticket) => {
-                    let mut spare = std::mem::take(&mut self.feed_buffers);
-                    spare.resize_with(FEED_BUFFERS, Vec::new);
-                    p.feed = Some(Feed {
-                        ticket,
-                        full: Some(full),
-                        filling: spare.pop(),
-                        spare,
-                        grant,
-                    });
+                    self.frozen_whole(ticket, grant);
                     return Ok(());
                 }
                 Err(job) => self.store.grant_back(&job.grant)?,
@@ -2926,6 +2951,29 @@ impl<F: BlockFile> ShardDb<F> {
             error: None,
             walk,
             feed,
+            packed,
+        });
+        let held = u64::try_from(self.frozen.len()).unwrap_or(u64::MAX);
+        self.flush_stats.frozen_most = self.flush_stats.frozen_most.max(held);
+        self.pack_carry = 0;
+    }
+
+    /// The packing memtable out whole on the worker `ticket` names, its copy the worker's: frozen
+    /// at once, read until its branch is back and retired in turn, with nothing left to feed.
+    fn frozen_whole(&mut self, ticket: Ticket, grant: Vec<u64>) {
+        let Some(Packing { mem, since, .. }) = self.packing.take() else {
+            return;
+        };
+        let packed = mem.len();
+        self.frozen.push_back(Frozen {
+            mem,
+            ticket,
+            grant,
+            back: None,
+            since,
+            error: None,
+            walk: None,
+            feed: None,
             packed,
         });
         let held = u64::try_from(self.frozen.len()).unwrap_or(u64::MAX);

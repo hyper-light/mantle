@@ -22,7 +22,7 @@ use mantle_engine::branch::{Branch, Builder, Op};
 use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::{Config, Store};
-use mantle_engine::trunk::{Consolidation, TrunkConfig, ViewChoice};
+use mantle_engine::trunk::{Consolidation, TrunkConfig};
 
 #[global_allocator]
 static ALLOCATOR: alloc::Counting = alloc::Counting;
@@ -245,10 +245,7 @@ fn a_shard_scans_without_allocating_once_its_buffers_have_grown() {
         },
     )
     .unwrap();
-    // Views built whenever they can be, not as measured costs choose: the test does not depend
-    // on timing.
-    db.set_view_choice(ViewChoice::Rebuild);
-    // Its bundles kept for their views: seeks consolidate none (`Consolidation`).
+    // Its bundles kept as they are: seeks consolidate none (`Consolidation`).
     db.set_consolidation(Consolidation::Never);
     // Random keys over many memtables: the trunk has pivot bundles and in-flight branches, and
     // a memtable is packing, so a scan merges both memtables and several trunk sources.
@@ -285,17 +282,11 @@ fn a_shard_scans_without_allocating_once_its_buffers_have_grown() {
         (0, 0),
         "{counts:?}"
     );
-    // The debts paid in idle slices, which build the bundles' REMIX views: scans then walk views,
-    // and allocate nothing either once their walks' buffers have grown.
+    // The debts paid in idle slices: the trunk settles, and scans over it allocate nothing either
+    // once their buffers have grown.
     while db.owed() {
         db.idle_step(64).unwrap();
     }
-    let (_, t, _) = db.stats();
-    assert!(
-        db.views() > 0,
-        "no view built: {t:?} shape {:?}",
-        db.shape()
-    );
     scans(&mut db, &mut rows, &mut next);
     alloc::begin();
     scans(&mut db, &mut rows, &mut next);
@@ -303,7 +294,7 @@ fn a_shard_scans_without_allocating_once_its_buffers_have_grown() {
     assert_eq!(
         (counts.allocations, counts.reallocations),
         (0, 0),
-        "through views: {counts:?}"
+        "once settled: {counts:?}"
     );
 }
 

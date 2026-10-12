@@ -106,10 +106,9 @@ pub struct Branch {
     pub filter_start: u64,
     pub filter_pages: u32,
     pub filter_bytes: u64,
-    /// The entries in each of its tree pages, in page order, 0 for an index page: a run
-    /// cursor moves by entries with them, reading only the page it lands on (REMIX's runs,
-    /// as RemixDB's metadata block; docs/design/engine-structure.md §5, E6). Written after the
-    /// filter in its pages.
+    /// The entries in each of its tree pages, in page order, 0 for an index page: a walk in
+    /// page order passes over the index pages between leaves by them, reading none. Written
+    /// after the filter in its pages.
     pub counts: Vec<u16>,
     /// Its leaves' separators in a succinct trie, each to its leaf's page number: the leaf a key
     /// falls in by one `floor` (docs/design/engine-structure.md §5; research/35). Written after
@@ -1319,18 +1318,6 @@ impl Branch {
         point.read(key, value).await
     }
 
-    /// A maplet already routed this candidate, so its Bloom filter is not asked again.
-    pub(crate) async fn get_routed_async<F: BlockFile>(
-        &self,
-        store: &mut Store<F>,
-        key: &[u8],
-        value: &mut Vec<u8>,
-    ) -> Result<Option<Op>, Error> {
-        let read = self.prepare_get_routed(store, key)?;
-        let mut point = point::BorrowedPoint::new(read, store);
-        point.read(key, value).await
-    }
-
     /// Starts one candidate branch's lookup. A rejected filter has no device work or cursor;
     /// the caller retains its candidate/probe position rather than restarting the lookup.
     pub(crate) fn prepare_get<F: BlockFile>(
@@ -1575,16 +1562,6 @@ impl HashCursor {
         }
     }
 
-    /// Takes one hash through the attached demand path. A wait leaves its partial bytes,
-    /// page offset and remaining hash count unchanged until the same read resumes.
-    pub(crate) fn next_paced<F: BlockFile>(
-        &mut self,
-        store: &mut Store<F>,
-        branch: &Branch,
-    ) -> Result<HashStep, Error> {
-        self.next_with(store, branch, true)
-    }
-
     fn next_with<F: BlockFile>(
         &mut self,
         store: &mut Store<F>,
@@ -1655,22 +1632,11 @@ impl HashCursor {
         self.assembled = 0;
         Ok(HashStep::Done(Some(u32::from_le_bytes(self.hash))))
     }
-
-    /// Returns a paced cursor's owners, including an unfinished numbered demand read.
-    pub(crate) fn give_back(mut self, store: &mut Store<impl BlockFile>) {
-        if let Some(span) = self.span.take() {
-            store.give_span(span);
-        }
-        if self.pooled {
-            store.give_page(std::mem::take(&mut self.buf));
-        }
-    }
 }
 
-/// A cursor over a branch's entries that walks its leaves in page order: a run of a REMIX view
-/// (docs/design/engine-structure.md §5, E6). Placed at a page number and an entry, as a view's
-/// offsets name them, it needs no path from the root: a branch's tree pages precede its filter's
-/// in its extents, and each page names its kind, so the next leaf is the next leaf page.
+/// A cursor over a branch's entries that walks its leaves in page order. Placed at a page number
+/// and an entry, it needs no path from the root: a branch's tree pages precede its filter's in its
+/// extents, and each page names its kind, so the next leaf is the next leaf page.
 #[derive(Debug)]
 pub struct RunCursor {
     /// The leaf's page number in the branch's pages, and the entry in it.
@@ -1729,37 +1695,6 @@ impl Branch {
             .ok_or(corrupt(Malformed::OutOfRange))
     }
 
-    /// The position `k` entries past `(page_no, index)` in key order, by the tree pages' entry
-    /// counts alone, with no page read; none past the branch's last entry. Index pages, whose
-    /// count is 0, are passed over.
-    pub fn position_after(
-        &self,
-        (page_no, index): (u64, usize),
-        k: usize,
-    ) -> Result<Option<(u64, usize)>, Error> {
-        let (mut page, mut at, mut left) = (page_no, index, k);
-        // Each turn moves a page on: at most the tree's pages.
-        for _ in 0..=self.counts.len() {
-            let n = self.count_of(page)?;
-            if at.checked_add(left).is_some_and(|i| i < n) {
-                return Ok(Some((page, at.saturating_add(left))));
-            }
-            left = left.saturating_sub(n.saturating_sub(at));
-            at = 0;
-            // The next leaf: the next page with entries.
-            loop {
-                page = page.saturating_add(1);
-                if page >= self.filter_start {
-                    return Ok(None);
-                }
-                if self.count_of(page)? > 0 {
-                    break;
-                }
-            }
-        }
-        Err(corrupt(Malformed::CountMismatch))
-    }
-
     /// A cursor at the first entry at or past `from`, for a scan, which may stop after a page:
     /// its leaf by the index from memory, then the leaves in page order, read a page and then
     /// more while the scan runs on.
@@ -1780,15 +1715,6 @@ impl Branch {
     ) -> Result<RunCursor, Error> {
         let c = RunCursor::new_sequential(store)?;
         self.place_at(store, c, from)
-    }
-
-    /// The run cursor a REMIX view's build starts each run with: [`Self::seek`].
-    pub fn run_at<F: BlockFile>(
-        &self,
-        store: &mut Store<F>,
-        from: &[u8],
-    ) -> Result<RunCursor, Error> {
-        self.seek(store, from)
     }
 
     /// Places `c` at the first entry at or past `from`.
@@ -1817,30 +1743,6 @@ impl Branch {
                 Err(e)
             }
         }
-    }
-
-    /// A run cursor at entry `index` of the leaf at page `page_no`: a view's offset.
-    pub fn run_from<F: BlockFile>(
-        &self,
-        store: &mut Store<F>,
-        page_no: u64,
-        index: usize,
-    ) -> Result<RunCursor, Error> {
-        let mut c = RunCursor::new(store)?;
-        c.page_no = page_no;
-        let address = self.page_address(store, page_no)?;
-        c.span_page = store.read_page_ahead_ref(&mut c.span, address, &mut c.page)?;
-        c.loaded = Some(address);
-        let view = View::new(c.page_data()?)?;
-        if view.kind != LEAF || index >= view.n {
-            return Err(corrupt(Malformed::OutOfRange));
-        }
-        let (n, table) = (view.n, view.table);
-        c.n = n;
-        c.table = table;
-        c.index = index;
-        c.load()?;
-        Ok(c)
     }
 }
 
@@ -1917,11 +1819,6 @@ impl RunCursor {
         Ok((view.lower_bound(key)?, view.n))
     }
 
-    /// Where the cursor is: the leaf's page number and the entry's index in it.
-    pub fn position(&self) -> (u64, usize) {
-        (self.page_no, self.index)
-    }
-
     /// Moves to the next entry of `branch`, the one the cursor walks.
     pub fn next<F: BlockFile>(
         &mut self,
@@ -1980,37 +1877,6 @@ impl RunCursor {
         }
     }
 
-    /// Moves `k` entries on in `branch`, by its pages' entry counts: only the page the cursor
-    /// lands on is read, none it passes. Past the last entry the cursor is invalid.
-    pub fn advance<F: BlockFile>(
-        &mut self,
-        branch: &Branch,
-        store: &mut Store<F>,
-        k: usize,
-    ) -> Result<(), Error> {
-        if !self.valid || k == 0 {
-            return Ok(());
-        }
-        match branch.position_after((self.page_no, self.index), k)? {
-            Some((page, index)) => self.land(branch, store, page, index),
-            None => {
-                self.valid = false;
-                Ok(())
-            }
-        }
-    }
-
-    /// Places the cursor at `position` (a leaf's page number and an entry in it), forward or
-    /// back: the leaf is read unless it is the one held.
-    pub fn place<F: BlockFile>(
-        &mut self,
-        branch: &Branch,
-        store: &mut Store<F>,
-        (page, index): (u64, usize),
-    ) -> Result<(), Error> {
-        self.land(branch, store, page, index)
-    }
-
     /// Positions an attached scan cursor through demand completion, keeping the selected
     /// leaf in this future across a wait. Its owner returns the cursor on cancellation.
     pub(crate) async fn seek_async<F: BlockFile>(
@@ -2043,33 +1909,6 @@ impl RunCursor {
             return self.load();
         }
         self.next_leaf_async(branch, store).await
-    }
-
-    pub(crate) async fn advance_async<F: BlockFile>(
-        &mut self,
-        branch: &Branch,
-        store: &mut Store<F>,
-        k: usize,
-    ) -> Result<(), Error> {
-        if !self.valid || k == 0 {
-            return Ok(());
-        }
-        match branch.position_after((self.page_no, self.index), k)? {
-            Some((page, index)) => self.land_async(branch, store, page, index).await,
-            None => {
-                self.valid = false;
-                Ok(())
-            }
-        }
-    }
-
-    pub(crate) async fn place_async<F: BlockFile>(
-        &mut self,
-        branch: &Branch,
-        store: &mut Store<F>,
-        (page, index): (u64, usize),
-    ) -> Result<(), Error> {
-        self.land_async(branch, store, page, index).await
     }
 
     async fn land_async<F: BlockFile>(
@@ -2251,6 +2090,3 @@ impl RunCursor {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod hash_paced_tests;

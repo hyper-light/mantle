@@ -93,7 +93,7 @@ fn native_shared_prefix_entries_cross_pages_and_reopen_with_exact_values() {
     assert_eq!(recovered.root, Some(branch.root));
     let (branch, used) = Branch::decode(&mut s, &descriptor).unwrap();
     assert_eq!(used, descriptor.len());
-    let mut cursor = branch.run_at(&mut s, b"").unwrap();
+    let mut cursor = branch.seek(&mut s, b"").unwrap();
     for (key, (op, value)) in &entries {
         assert!(cursor.valid());
         assert_eq!(cursor.key(), key);

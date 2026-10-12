@@ -23,7 +23,7 @@ use mantle_engine::ranges::{Client, Ranges, RangesConfig};
 use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::{ShardDb, issuer_batches};
 use mantle_engine::store::Config;
-use mantle_engine::trunk::TrunkConfig;
+use mantle_engine::trunk::{Consolidation, TrunkConfig};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::Path;
@@ -289,6 +289,10 @@ fn case(mode: Mode) {
     let mem = if disk { STORE.page_size } else { ACTIVE_BYTES };
     let mut db =
         ShardDb::create(native(&path, true, Arc::clone(&reads)), STORE, mem, TRUNK).unwrap();
+    // Its bundles kept as they are: the warm passes' scans would otherwise pay for
+    // consolidations that reshape the trunk before the counted ones, which then merge sources
+    // the warm passes never did (`Consolidation`).
+    db.set_consolidation(Consolidation::Never);
     for op in &data.input {
         match &op.value {
             Some(value) => db.put(&op.key, value).unwrap(),

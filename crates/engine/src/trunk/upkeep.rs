@@ -157,8 +157,6 @@ impl Trunk {
     /// Refused when a pass leaves it without room, changes nothing, and leaves no task out and
     /// no node to look at: no task could free it.
     pub fn make_room<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
-        self.views_unchecked = self.nodes.len();
-        self.maplets_unchecked = self.nodes.len();
         self.wait = Wait::All;
         let mut mark = self.progress();
         while !self.has_room() {
@@ -199,8 +197,6 @@ impl Trunk {
         store: &mut Store<F>,
         budget: u64,
     ) -> Result<bool, Error> {
-        self.views_unchecked = self.nodes.len();
-        self.maplets_unchecked = self.nodes.len();
         self.wait = Wait::No;
         self.yield_io = true;
         let result = self.run(store, budget);
@@ -380,7 +376,7 @@ impl Trunk {
         }
         for i in 0..pivots {
             if self.flush_due(n, i)? {
-                self.flush_pivot(store, n, i)?;
+                self.flush_pivot(n, i)?;
             }
         }
         self.want_change(n)?;
@@ -491,12 +487,7 @@ impl Trunk {
 
     /// Flushes pivot `i` of node `n`: its branches go to the child's in-flight list by
     /// reference, oldest first, and the child is looked at.
-    fn flush_pivot<F: BlockFile>(
-        &mut self,
-        store: &mut Store<F>,
-        n: usize,
-        i: usize,
-    ) -> Result<(), Error> {
+    fn flush_pivot(&mut self, n: usize, i: usize) -> Result<(), Error> {
         let consolidating = self.consolidating;
         let pivot = self.node_mut(n)?.pivots.get_mut(i).ok_or(corrupt())?;
         let child = pivot.child.ok_or(corrupt())?;
@@ -523,7 +514,6 @@ impl Trunk {
         for b in bundle.into_iter().rev() {
             self.node_mut(child)?.inflight.push(vec![b]);
         }
-        self.touched(store, n);
         self.queue(child);
         Ok(())
     }
@@ -619,7 +609,7 @@ impl Trunk {
                 self.drop_dead(store, n)?;
                 let parts = self.split_node(n)?;
                 self.node_mut(n)?.wants = None;
-                self.splice(store, n, parts)
+                self.splice(n, parts)
             }
         }
     }
@@ -853,7 +843,6 @@ impl Trunk {
                 let merged = parts.into_iter().next().map(|(_, b)| b);
                 self.apply_pivot(n, i, merged, covered)?;
                 self.drop_dead(store, n)?;
-                self.touched(store, n);
                 self.queue(n);
                 // A child waiting for this pivot to be empty may take its change now.
                 if let Some(c) = self.node(n)?.pivots.get(i).and_then(|p| p.child) {
@@ -863,7 +852,7 @@ impl Trunk {
             What::Settle { extents } => {
                 let leaves = self.apply_settle(store, n, parts, &extents)?;
                 self.node_mut(n)?.wants = None;
-                self.splice(store, n, leaves)?;
+                self.splice(n, leaves)?;
             }
         }
         self.stats.finish_ns = self.stats.finish_ns.saturating_add(ns_since(t));
@@ -873,19 +862,12 @@ impl Trunk {
     /// Node `n`'s change applied: the nodes now covering its range, each with its first key,
     /// replace its parent's pivot for it, which was held empty for them (reading the parent's
     /// in-flight bundles from the pivot's start, as it did), or become a new root's children.
-    fn splice<F: BlockFile>(
-        &mut self,
-        store: &mut Store<F>,
-        n: usize,
-        parts: Vec<(Vec<u8>, usize)>,
-    ) -> Result<(), Error> {
+    fn splice(&mut self, n: usize, parts: Vec<(Vec<u8>, usize)>) -> Result<(), Error> {
         for &(_, p) in &parts {
             self.queue(p);
         }
         if n == self.root {
             if parts.len() > 1 {
-                self.abandon_view(store);
-                self.abandon_maplet(store);
                 self.grow_root(parts);
                 self.queue(self.root);
             }
@@ -893,8 +875,6 @@ impl Trunk {
         }
         let (parent, i) = self.parent_of(n)?;
         if parts.len() > 1 {
-            self.abandon_view(store);
-            self.abandon_maplet(store);
             // The pivot the parts replace takes its rent with it.
             self.spend(parent, i)?;
             let node = self.node_mut(parent)?;
@@ -917,8 +897,6 @@ impl Trunk {
                 p.key = first;
             }
             node.pivots.splice(i..=i, replacement);
-            self.views_unchecked = self.nodes.len();
-            self.maplets_unchecked = self.nodes.len();
         }
         self.queue(parent);
         Ok(())
@@ -936,17 +914,6 @@ impl Trunk {
                     .map(|i| (p, i))
             })
             .ok_or(corrupt())
-    }
-
-    /// A pivot bundle of node `n` changed: a view or maplet being built over one of its bundles
-    /// would describe branches no longer there.
-    fn touched<F: BlockFile>(&mut self, store: &mut Store<F>, n: usize) {
-        if self.view_job.as_ref().is_some_and(|j| j.node == n) {
-            self.abandon_view(store);
-        }
-        if self.maplet_job.as_ref().is_some_and(|j| j.node == n) {
-            self.abandon_maplet(store);
-        }
     }
 
     /// Whether a job's tasks may take the cores: when a pending branch or a full root waits on

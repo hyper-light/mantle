@@ -1,66 +1,55 @@
 //! The merge a scan reads a leaf segment's trunk sources through (docs/design/engine-structure.md
-//! §5, E6): a cursor for each lone branch and a walk for each pivot bundle with a REMIX view, given
-//! newest first as `Trunk::segment_at` lists them. Each key reads from the newest source holding
-//! it, a deletion too, and every source holding it moves past it.
+//! §5): a cursor for each branch, given newest first as `Trunk::segment_at` lists them. Each key
+//! reads from the newest source holding it, a deletion too, and every source holding it moves
+//! past it.
 
 use crate::branch::{Branch, Op, RunCursor};
 use crate::error::Error;
-use crate::remix::{View, Walk, WalkBufs};
 use crate::store::Store;
 use crate::trunk::Source;
 use hyper_block::block::BlockFile;
 
-/// One source's head: a branch's cursor, or a bundle's walk through its view.
+/// One source's head: a branch's cursor.
 #[derive(Debug)]
 enum Head<'a> {
     Branch(RunCursor, &'a Branch),
-    View(Walk, &'a View, &'a [Branch]),
 }
 
 impl Head<'_> {
     fn key(&self) -> Option<&[u8]> {
         match self {
             Head::Branch(c, _) => c.valid().then(|| c.key()),
-            Head::View(w, ..) => w.valid().then(|| w.key()),
         }
     }
 
     fn op(&self) -> Op {
         match self {
             Head::Branch(c, _) => c.op(),
-            Head::View(w, ..) => w.op(),
         }
     }
 
     fn value(&self) -> &[u8] {
         match self {
             Head::Branch(c, _) => c.value(),
-            Head::View(w, ..) => w.value(),
         }
     }
 
     fn next<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
         match self {
             Head::Branch(c, b) => c.next(b, store),
-            Head::View(w, view, runs) => w.step(view, store, runs),
         }
     }
 
     async fn next_async<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
         match self {
             Head::Branch(c, b) => c.next_async(b, store).await,
-            Head::View(w, view, runs) => w.step_async(view, store, runs).await,
         }
     }
 
-    /// Gives the head's pages back to `store`; a walk's buffers come back for the next.
-    fn give_back<F: BlockFile>(self, store: &mut Store<F>) -> Option<WalkBufs> {
+    /// Gives the head's pages back to `store`.
+    fn give_back<F: BlockFile>(self, store: &mut Store<F>) {
         match self {
-            Head::Branch(c, _) => {
-                c.give_back(store);
-                None
-            }
-            Head::View(w, ..) => Some(w.give_back(store)),
+            Head::Branch(c, _) => c.give_back(store),
         }
     }
 }
@@ -77,8 +66,6 @@ pub struct ScanMerge<'a> {
     past: Vec<u8>,
     /// A range filter check's buffer.
     scratch: Vec<u8>,
-    /// Walks' buffers given back, for the next views' walks.
-    walks: Vec<WalkBufs>,
     /// Sources passed over at open by their range filters, and sources opened.
     skipped: u64,
     opened: u64,
@@ -94,8 +81,8 @@ impl<'a> ScanMerge<'a> {
     }
 
     /// Opens `sources` (newest first) over `[from, end)`, the heads of a merge open before given
-    /// back first. With `filter`, a source whose range filters rule `[from, end)` out is passed
-    /// over unread: a branch by its own, a view when every run's does. A scan the caller bounds
+    /// back first. With `filter`, a source whose range filter rules `[from, end)` out is passed
+    /// over unread. A scan the caller bounds
     /// asks for it; a leaf's end alone almost never rules a branch above it out, so an open scan
     /// does not pay the checks.
     pub fn open<F: BlockFile>(
@@ -120,9 +107,6 @@ impl<'a> ScanMerge<'a> {
                 let scratch = &mut self.scratch;
                 let held = match *s {
                     Source::Branch(b) => b.range.may_hold(from, end, scratch),
-                    Source::View(_, runs) => {
-                        runs.iter().any(|b| b.range.may_hold(from, end, scratch))
-                    }
                 };
                 if !held {
                     self.skipped = self.skipped.saturating_add(1);
@@ -133,10 +117,6 @@ impl<'a> ScanMerge<'a> {
             self.opened = self.opened.saturating_add(1);
             let head = match *s {
                 Source::Branch(b) => Head::Branch(b.seek(store, from)?, b),
-                Source::View(view, runs) => {
-                    let bufs = self.walks.pop().unwrap_or_default();
-                    Head::View(Walk::seek_with(view, store, runs, from, bufs)?, view, runs)
-                }
             };
             self.heads.push(head);
             self.open_ns.push(t.map_or(0, |t| {
@@ -169,9 +149,6 @@ impl<'a> ScanMerge<'a> {
                 let scratch = &mut self.scratch;
                 let held = match *s {
                     Source::Branch(b) => b.range.may_hold(from, end, scratch),
-                    Source::View(_, runs) => {
-                        runs.iter().any(|b| b.range.may_hold(from, end, scratch))
-                    }
                 };
                 if !held {
                     self.skipped = self.skipped.saturating_add(1);
@@ -182,10 +159,6 @@ impl<'a> ScanMerge<'a> {
             self.opened = self.opened.saturating_add(1);
             let head = match *s {
                 Source::Branch(b) => Head::Branch(RunCursor::new(store)?, b),
-                Source::View(view, runs) => {
-                    let bufs = self.walks.pop().unwrap_or_default();
-                    Head::View(Walk::prepare(view, from, bufs), view, runs)
-                }
             };
             // The guard owns the head before any await, including the first demand miss.
             self.heads.push(head);
@@ -194,9 +167,6 @@ impl<'a> ScanMerge<'a> {
             })?;
             match head {
                 Head::Branch(cursor, branch) => cursor.seek_async(branch, store, from).await?,
-                Head::View(walk, view, runs) => {
-                    walk.position_async(view, store, runs, from).await?;
-                }
             }
             self.open_ns.push(t.map_or(0, |t| {
                 u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
@@ -217,7 +187,6 @@ impl<'a> ScanMerge<'a> {
             current: None,
             past: self.past,
             scratch: self.scratch,
-            walks: self.walks,
             skipped: 0,
             opened: 0,
             open_ns: self.open_ns,
@@ -237,9 +206,7 @@ impl<'a> ScanMerge<'a> {
     /// Gives every head's pages and span back to `store`.
     pub fn close<F: BlockFile>(&mut self, store: &mut Store<F>) {
         for h in self.heads.drain(..) {
-            if let Some(bufs) = h.give_back(store) {
-                self.walks.push(bufs);
-            }
+            h.give_back(store);
         }
         self.current = None;
     }

@@ -192,7 +192,6 @@ fn check_refs(store: &Store<Gated>, trunk: &Trunk) {
     expected.extend(branches);
     expected.extend(store.map_extents());
     expected.extend(trunk.image_extents());
-    expected.extend(trunk.view_extents());
     let held: BTreeSet<_> = store
         .refs()
         .iter()
@@ -424,10 +423,12 @@ fn a_pivot_lower_bound_in_a_leaf_gap_keeps_the_next_leaf_and_end_fence() {
     store.drain().unwrap();
     // These public seeks establish that m0 routes to a leaf ending before it, and must cross
     // to another leaf. The crossed leaf lies beyond the middle pivot's exclusive z0 fence.
-    let before = u64::from(branch.leaf_of(b"m0").unwrap());
-    let cursor = branch.run_at(&mut store, b"m0").unwrap();
+    let cursor = branch.seek(&mut store, b"m0").unwrap();
     assert_eq!(cursor.key(), b"z0");
-    assert_ne!(cursor.position().0, before);
+    assert_ne!(
+        branch.leaf_of(b"z0").unwrap(),
+        branch.leaf_of(b"m0").unwrap()
+    );
     cursor.give_back(&mut store);
     trunk.add(branch);
     store.set_cache(0);

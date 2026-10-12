@@ -26,7 +26,7 @@ use hyper_block::sim::SimFile;
 use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::{Config, MIN_PAGE};
-use mantle_engine::trunk::{Consolidation, TrunkConfig, ViewChoice};
+use mantle_engine::trunk::{Consolidation, TrunkConfig};
 use std::collections::BTreeMap;
 
 const STORE: Config = Config {
@@ -467,12 +467,7 @@ fn run_trunk<F: BlockFile + 'static>(
     db.set_record_cache(records);
     // Consolidation chosen, not measured, so the trunk's shape does not depend on timing.
     db.set_consolidation(consolidation);
-    let views = consolidation == Consolidation::Never;
-    // The idle variant asserts views are rebuilt: rebuilt whenever they can be, not as measured
-    // costs choose, so the test does not depend on timing.
-    if idle {
-        db.set_view_choice(ViewChoice::Rebuild);
-    }
+    let consolidating = consolidation != Consolidation::Never;
     if let Some(issuer) = issuer {
         db.attach(issuer, 2).unwrap();
     }
@@ -542,26 +537,16 @@ fn run_trunk<F: BlockFile + 'static>(
         for k in 0..KEYS {
             check(&mut db, &oracle, k);
         }
-        // The bundles' REMIX views are built in idle time with the rest, and scans read
-        // bundles through them exactly; so are their maplets, kept where they measured cheaper
-        // than their filters, and the gets above read every key exactly either way.
         let (_, trunk, _) = db.stats();
-        if views {
-            assert!(trunk.views_built > 0, "{trunk:?}");
-            // Each bundle's maplet kept or declined by measured cost, never both nor neither.
-            assert!(
-                trunk.maplets_built + trunk.maplets_declined > 0,
-                "{trunk:?}"
-            );
-        } else {
+        if consolidating {
             // The seeks' consolidations ran, and left no pivot paid.
             assert!(trunk.consolidations > 0, "{trunk:?}");
         }
         for (a, b, limit) in [(0, KEYS - 1, 1), (3, KEYS / 2, 7), (KEYS / 3, KEYS - 1, 64)] {
             check_scan(&mut db, &oracle, a, b, limit);
         }
-        // More writes with every view built: flushes add runs to bundles that have views, and
-        // idle slices rebuild those views from the older ones; every read and scan stays exact.
+        // More writes, idle time paying everything owed now and then: every read and scan stays
+        // exact.
         let mut y = 0x6a09_e667_f3bc_c908u64;
         for i in 0..OPS / 2 {
             y ^= y << 13;
@@ -577,8 +562,6 @@ fn run_trunk<F: BlockFile + 'static>(
                 oracle.insert(k, Some(v));
             }
             check(&mut db, &oracle, k);
-            // Idle time now and then pays everything owed, views too: the next flush into a
-            // bundle with a view then has it rebuilt.
             if i % 50 == 0 {
                 db.maintain(u64::MAX).unwrap();
             }
@@ -599,10 +582,6 @@ fn run_trunk<F: BlockFile + 'static>(
             steps += 1;
             assert!(steps < 1_000_000, "idle slices never paid the debts");
         }
-        let (_, trunk, _) = db.stats();
-        if views {
-            assert!(trunk.views_rebuilt > 0, "{trunk:?}");
-        }
         for k in 0..KEYS {
             check(&mut db, &oracle, k);
         }
@@ -611,8 +590,7 @@ fn run_trunk<F: BlockFile + 'static>(
         }
     }
     db.flush().unwrap();
-    // One unbounded idle call pays everything left, the views of every bundle of two runs or
-    // more among it.
+    // One unbounded idle call pays everything left.
     db.maintain(u64::MAX).unwrap();
     assert!(!db.owed());
     for k in 0..KEYS {
@@ -631,108 +609,6 @@ fn run_trunk<F: BlockFile + 'static>(
         io.buffers_taken
     );
     (db, oracle)
-}
-
-/// A wider trunk (fanout 6), maintenance paid in idle time every so many writes: flushes add
-/// several runs to a bundle with a view before the next idle time, so its rebuild merges them in a
-/// run at a time, each into the view of the last. Every read and scan stays exact.
-#[test]
-fn views_rebuilt_over_several_added_runs_read_exactly() {
-    let align = Alignment::new(4096).unwrap();
-    let file = SimFile::new(align, Alignment::new(512).unwrap(), 23).unwrap();
-    let trunk = TrunkConfig {
-        fanout: 6,
-        leaf_entries: 400,
-    };
-    let mut db = ShardDb::create(file, STORE, MEM, trunk).unwrap();
-    db.set_view_choice(ViewChoice::Rebuild);
-    // Its bundles kept for their views: seeks consolidate none (`Consolidation`).
-    db.set_consolidation(Consolidation::Never);
-    let mut oracle: BTreeMap<u64, Option<Vec<u8>>> = BTreeMap::new();
-    let mut x = 0x510e_527f_ade6_82d1u64;
-    for i in 0..OPS {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        let k = x % KEYS;
-        if x.is_multiple_of(9) {
-            db.delete(&key(k)).unwrap();
-            oracle.insert(k, None);
-        } else {
-            let v = format!("c{i}-{}", "z".repeat((x % 35) as usize)).into_bytes();
-            db.put(&key(k), &v).unwrap();
-            oracle.insert(k, Some(v));
-        }
-        check(&mut db, &oracle, k);
-        if i % 400 == 0 {
-            db.maintain(u64::MAX).unwrap();
-        }
-        if i % 113 == 0 {
-            let (a, b) = ((x >> 8) % KEYS, (x >> 32) % KEYS);
-            check_scan(
-                &mut db,
-                &oracle,
-                a.min(b),
-                a.max(b) + 1,
-                1 + (x % 17) as usize,
-            );
-        }
-    }
-    db.maintain(u64::MAX).unwrap();
-    let (_, trunk, _) = db.stats();
-    assert!(trunk.views_rebuilt > 0, "{trunk:?}");
-    assert!(trunk.views_merged > trunk.views_rebuilt, "{trunk:?}");
-    for k in 0..KEYS {
-        check(&mut db, &oracle, k);
-    }
-    check_scan(&mut db, &oracle, 0, KEYS - 1, 11);
-}
-
-/// Views written with a checkpoint are read back with the store: the reopened shard holds as many,
-/// loaded, not rebuilt, and every read and scan through them is exact; the store holds exactly the
-/// extents the engine names, the views' among them.
-#[test]
-fn views_saved_with_a_checkpoint_are_loaded_on_reopen() {
-    let align = Alignment::new(4096).unwrap();
-    let file = SimFile::new(align, Alignment::new(512).unwrap(), 29).unwrap();
-    let (mut db, oracle) = run_on(file, 16, None, true);
-    db.maintain(u64::MAX).unwrap();
-    let views = db.views();
-    assert!(views > 0);
-    db.checkpoint(OPS).unwrap();
-    db.check_references().unwrap();
-    let (file, landed) = finished_file(db.into_file());
-    landed.unwrap();
-    let (mut db, applied) = ShardDb::open(file, STORE, MEM, TRUNK).unwrap();
-    assert_eq!(applied, OPS);
-    assert_eq!(db.views(), views);
-    let (_, trunk, _) = db.stats();
-    assert_eq!(trunk.views_built, 0, "{trunk:?}");
-    db.check_references().unwrap();
-    for k in 0..KEYS {
-        check(&mut db, &oracle, k);
-    }
-    for (a, b, limit) in [(0, KEYS - 1, 1), (5, KEYS / 2, 9), (KEYS / 4, KEYS - 1, 50)] {
-        check_scan(&mut db, &oracle, a, b, limit);
-    }
-    // Written again with another checkpoint, the store still holds exactly what is named.
-    db.checkpoint(OPS + 1).unwrap();
-    db.check_references().unwrap();
-    // Writes that change the bundles drop their saved views; the next checkpoint releases the
-    // extents only the last image named, so the store again holds exactly what is named.
-    let mut oracle = oracle;
-    for i in 0..OPS / 2 {
-        let k = (i * 7919) % KEYS;
-        let v = format!("r{i}").into_bytes();
-        db.put(&key(k), &v).unwrap();
-        oracle.insert(k, Some(v));
-    }
-    db.maintain(u64::MAX).unwrap();
-    db.checkpoint(OPS + 2).unwrap();
-    db.check_references().unwrap();
-    for k in 0..KEYS {
-        check(&mut db, &oracle, k);
-    }
 }
 
 #[test]

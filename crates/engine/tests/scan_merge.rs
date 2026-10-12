@@ -20,7 +20,6 @@ use hyper_block::sim::{Fault, SimFile};
 use mantle_engine::Error;
 use mantle_engine::branch::filter::Keys;
 use mantle_engine::branch::{Branch, Builder, Op};
-use mantle_engine::remix::View;
 use mantle_engine::scan::ScanMerge;
 use mantle_engine::store::{Config, Store};
 use mantle_engine::trunk::Source;
@@ -69,7 +68,6 @@ fn reused_single_and_multiple_heads_keep_bounds_versions_and_deletions() {
             })
             .collect();
         let branches = [build(&mut store, &newest), build(&mut store, &older)];
-        let view = View::build(&mut store, &branches, b"", None).unwrap();
         let mut all = older.clone();
         all.extend(newest.clone());
         let mut merge = ScanMerge::new();
@@ -79,7 +77,6 @@ fn reused_single_and_multiple_heads_keep_bounds_versions_and_deletions() {
                 vec![Source::Branch(&branches[0]), Source::Branch(&branches[1])],
                 &all,
             ),
-            (vec![Source::View(&view, &branches)], &all),
             (vec![Source::Branch(&branches[1])], &older),
         ] {
             for from in [

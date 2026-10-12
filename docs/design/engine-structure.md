@@ -157,7 +157,7 @@ Native held-I/O tests cover same-shard request progress, cancellation,
 failed reads and writes, and exact checkpoint recovery (`tests/ranges_async_reads.rs`,
 `ranges_owning_cancel.rs`, `ranges_paced_stall.rs`, `store_issuer.rs`).
 
-The retained checkpoint keeps its applied index through preparation, saved views and image pages,
+The retained checkpoint keeps its applied index through preparation and image pages,
 allocator map pages, the first numbered flush, the alternating superblock write and the second
 numbered flush. Only the second successful flush publishes durability. Once image saving begins,
 idle maintenance cannot change the snapshot. Canceling a borrowed wait retains its current page,
@@ -232,10 +232,9 @@ What mantle changes, and why:
 3. **The tree.** Root to leaf; at each node the maplet names the branches to probe. With the
    filters and branch interiors in memory, a cold get costs about one device read (research/34
    §1).
-4. **Seeks and listings.** A REMIX view per leaf gives seeks `log2(H·N)` comparisons and `next`
-   no comparisons at all (research/34 §4). It is built when a leaf's branches change, by merging
-   the old view with the new branch. A SuRF-style range filter answers "nothing in this prefix"
-   without reading (research/33 row 8).
+4. **Seeks and listings.** A scan merges a cursor per branch on its path; a SuRF-style range
+   filter answers "nothing in this prefix" without reading (research/33 row 8). REMIX views were
+   built and measured, and removed (below).
 
 ### Seeks and listings (step E6), as designed
 
@@ -248,60 +247,25 @@ throughput at 3 M keys (benches/shard_db.rs, 2026-10-07: 151–165 k seeks a sec
 against 84–94 k at p50 9.5–11.2 µs). What remains is the merge: a seek descends every branch of
 the leaf's bundle, and every `next` compares the heads of all of them.
 
-**A REMIX view per pivot bundle** (Zhong et al., FAST 2021; research/34 §4) removes both. The
-paper keeps a view per partition because RemixDB's runs pile up in its leaf partitions. Ours do
-not: a leaf compacts or splits as soon as its bundle passes the fanout or a leaf's entries, so a
-leaf holds one branch, and the runs a seek merges sit in the pivot bundles on its path (traced on
-the paced test's trunk, 2026-10-07: every leaf one branch, every interior pivot three, its
-fanout). So a view is kept for each pivot bundle of two runs or more, at any level, its runs that
-bundle's branches, newest first: a bundle changes only when a flush or a compaction reaches it.
-A seek merges one source a level, each a view or a lone branch, with the pending branches and the
-in-flight bundles, newest first. A view above the leaf has older levels below it, so its walk
-yields a key's newest version even when it is a deletion; the scan's merge decides.
-
-- **Segments.** The bundle's entries in key order, every version, newest first within a key,
-  cut into segments of exactly `D` selectors. Each segment holds its anchor (its first key), one
-  offset per run (the run's first entry at or past the anchor, as the page number in the
-  branch's pages and the entry's index in the page), and `D` selector bytes: the run's number
-  (at most 63 runs), 0x80 for a version a newer run shadows, 0x40 for a deletion, and 0x3f a
-  placeholder. A key's versions never split: where they would, the segment is closed with
-  placeholders and they open the next (the paper's §4.1). `D = 32` as the paper evaluates it:
-  2.9 B a key for 48-byte keys and 8 runs, 3.16% of the data (research/34 §4); `D` is at least
-  the runs.
-- **Entry counts a page.** RemixDB keeps an entry count for each 4 KB block of a table in memory
-  (§4.1, the metadata block), so a run's cursor moves by any number of entries with arithmetic and
-  reads only the page it lands on. Each branch here keeps the same: one 16-bit count for each of
-  its tree pages, 0 for an index page, written after its filter in the same page stream and held
-  in memory with the filter (2 bytes a 4 KiB page, 0.05%).
-- **Pages.** A view's segments are written to its own extents as pages, sealed and verified as
-  every page, read through the page cache; the anchors form an index of pages as a branch's keys
-  do. The trunk image names each pivot's view with its bundle.
-- **Seek.** Binary search of the anchors (no I/O while they are in memory), then a binary search
-  of the segment's key groups (§3.2), probing each group's newest version. Page bounds round to
-  group boundaries, while cursor offsets still count every version. The selector at position
-  `j` names a run and its offset advances by that run's occurrences before `j`, so each probe
-  reads one key; `log2(H·N)` comparisons where the merge takes `H·log2 N`. The cursors are left at
-  the counts of their runs' selectors before the found entry. A run's page is read only when a
-  selector names it.
-- **Next.** The next selector names the run whose cursor moves: no comparison. Shadowed versions
-  and placeholders are passed by their bits; a run's cursor catches up by its counts, reading only
-  the page it lands on. A deletion hides its key without reading a value, and since the bundle is
-  the oldest source in its leaf, a key whose newest version is a deletion is passed over.
-- **Rebuilt, not rebuilt from scratch** (§4.3). A flush that reaches a leaf adds one run, the
-  newest, to its bundle. The old view is one sorted run; the new view is its merge with the new
-  run by generalized binary merging (Hwang and Lin): for each next key of the new run, its merge
-  point in the old view is found by the anchors and a binary search in one segment (at most
-  `log2 D` key reads); the old selectors between merge points are copied with their run numbers
-  moved up one, versions of a key the new run holds are marked shadowed, and the old runs'
-  offsets at each new segment follow from the old offsets and the entry counts, without I/O. A
-  new segment's anchor is its first key: one key read a new segment. A leaf compaction leaves one
-  run, which needs no view; a split's new bundles are built by merging their runs.
-- **Built as maintenance.** A rebuild is SILK-scheduled work of the leaf's shard, a slice at a time
-  like a compaction (§6). A bundle that changes while its view is being built drops the build.
-  Until a view is built, a scan merges the bundle's cursors as before, so correctness never waits
-  on it.
-- **Gets** keep the filters (and later the maplets): a REMIX get is a seek, which a filter that
-  rules a branch out beats.
+**REMIX views were built, measured and removed** (2026-10-11; research/43). A view per pivot
+bundle of two runs or more (Zhong et al., FAST 2021; research/34 §4) was built in the shard's idle
+time and, on the async path, from every run each time its bundle gained one (a rebuild's
+merge-point reads could not be readied ahead): a root pivot's view was rebuilt after every
+memtable rotation, quadratic in its runs. Measured on the async ranges path:
+- **Cost.** Views took 18-63 s of a 100M-key fill (22-62% with maplets), while nothing reads them
+  during a fill.
+- **Gain.** A view seek still positions a cursor in each run, so it reads as many pages as the
+  merge; it saves comparisons, and a 100M seek spends ~62% of its time on page access (research/43
+  §1). Microbenchmarked, a view seek gains nothing at 2-4 runs and 1.8× at 8.
+- **A/B** (three rounds, 1M-100M, against RocksDB; research/43 §3): with no views and no maplets,
+  100M fills ran 2.10M a second, reads 438K and seeks 63K, against 1.19M, 285K and 43K with them
+  built speculatively, and against views bought by seeks' measured rent (2.04M, 430K, 53K) or by
+  one account choosing a view or a consolidation (2.25M, 449K, 47K): building a view in the phase
+  that wants it costs that phase more than the view saves it.
+RemixDB and SplinterDB build their structures eagerly because there they are mandatory (REMIX
+§4.1: tables carry no index or filter); here every bundle keeps its branches' indexes and filters,
+so nothing requires a view, and none is built. Seeks are measured against the page-access cost
+they pay instead.
 
 **SuRF range filters** (Zhang et al., SIGMOD 2018; research/33 row 8, research/35 §2) let a
 bounded seek pass over a source with nothing in its range without reading it (closed seeks up to
@@ -324,9 +288,9 @@ bounded seek pass over a source with nothing in its range without reading it (cl
   sequence as the paper does. A level's nodes are the branches going on above it, so rank and
   select run within the level. Finishing copies words, not labels: 0.17 ms for 500 k keys
   against 3.3 ms assembled, which was the put latency maximum once a flush.
-- **Consulted on bounded scans.** At a segment's open, a lone branch is passed over when its
-  filter rules out `[from, min(end, segment end))`, and a view when all its runs' filters do. An
-  open scan does not check, since a leaf's end alone almost never rules out a branch above it.
+- **Consulted on bounded scans.** At a segment's open, a branch is passed over when its filter
+  rules out `[from, min(end, segment end))`. An open scan does not check, since a leaf's end alone
+  almost never rules out a branch above it.
 - **Measured** (benches/surf.rs, 1 M keys): 16-byte random-number keys at 18.8 bits a key let
   0.03% of empty ranges through, checked in 84–167 ns. 42-byte object names at 21.9 bits let
   3.6–4.4% through, checked in about 0.63 µs. That descent goes through about 25 sparse levels and
@@ -600,7 +564,7 @@ The structure is research/33 §5's seven parts, each a step below with the evide
 2. a log with several group commits in flight (SpanDB), and the log as level 0 (TRIAD);
 3. SplinterDB's size-tiered Bε-tree with maplets, compacted by its shard, the compaction's
    granularity aligned to the last level (Spooky);
-4. a REMIX view and SuRF range filters for listings;
+4. SuRF range filters for listings (REMIX views measured and removed, research/43);
 5. an F2-style in-place hot region and read cache, S3-FIFO for the caches;
 6. SILK-style scheduling of flush and compaction;
 7. FDP or ZNS lifetime hints where the device has them.
@@ -616,7 +580,7 @@ both sides, and landed before the next:
 | E3 | Memtable (concurrent B-tree) and branch packing | 3 | flush cost |
 | E4 | Trunk, flush-then-compact, bundle compaction on the shard's tasks, granularity aligned to the last level | 3 | inserts 6–10×, write amplification 2× lower (SplinterDB); total write amplification with the device's GC about 2.5× lower (Spooky) |
 | E5 | Per-branch blocked Bloom filters (landed first: a read probes only branches that may hold its key), then maplets routing a key to its pivot's branches with one lookup in less space | 3 | queries up to 1.8×, space overhead 15–61% (maplets, abstract-level evidence); measured with filters: reads 1.2–1.7× RocksDB at 10 M (benches/shard_db.rs) |
-| E6 | REMIX views and SuRF range filters for listings | 4 | seeks 1.4–9×, closed seeks up to 5× |
+| E6 | SuRF range filters for listings (REMIX views built, measured and removed: research/43) | 4 | closed seeks up to 5× |
 | E7 | SILK scheduling: paced maintenance on the shard's worker (landed, §6 as built), then I/O submitted without waiting | 6 | p99 10–100× under compaction; measured so far: the longest put at 10 M from 2.9 s to 5.1–49.5 ms |
 | E8 | Hot region and S3-FIFO caches | 5 | hot gets up to about 10× |
 | E9 | The log as level 0, if the Raft log's ownership of entries allows it (§10) | 2 | throughput up to 2.9×, write amplification up to 4× lower (TRIAD) |

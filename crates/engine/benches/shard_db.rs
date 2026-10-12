@@ -377,26 +377,12 @@ fn durable_benchmark(
         &recovered,
     );
     println!(
-        "shape height {} nodes {} leaves {} views built {} dropped {} maplets built {} declined {} entries_written {}",
-        shape.0,
-        shape.1,
-        shape.2,
-        work.views_built,
-        work.views_dropped,
-        work.maplets_built,
-        work.maplets_declined,
-        work.entries_written
+        "shape height {} nodes {} leaves {} entries_written {}",
+        shape.0, shape.1, shape.2, work.entries_written
     );
     println!(
-        "memory split cache {} write {} records {} filters {} indexes {} counts {} ranges {} views {}",
-        split.0,
-        split.1,
-        split.2,
-        memory.filters,
-        memory.indexes,
-        memory.counts,
-        memory.ranges,
-        memory.views
+        "memory split cache {} write {} records {} filters {} indexes {} counts {} ranges {}",
+        split.0, split.1, split.2, memory.filters, memory.indexes, memory.counts, memory.ranges
     );
     println!(
         "postfill stats {:?} postquery trunk {:?} workers {:?} memory_held {:?}",
@@ -790,15 +776,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("maintain {seconds:.6}s");
         let (_, t, _) = db.stats();
         println!(
-            "maintain trunk pivot_compactions {} leaf_compactions {} flushes {} splits {} consolidations {} views built {} maplets built {} declined {} entries_written {}",
+            "maintain trunk pivot_compactions {} leaf_compactions {} flushes {} splits {} consolidations {} entries_written {}",
             t.pivot_compactions,
             t.leaf_compactions,
             t.flushes,
             t.splits,
             t.consolidations,
-            t.views_built,
-            t.maplets_built,
-            t.maplets_declined,
             t.entries_written
         );
         if let Some((held, want)) = db.workers() {
@@ -891,7 +874,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         mib(u.as_ref().and_then(|u| u.footprint)),
         mib(u.as_ref().and_then(|u| u.peak_footprint)),
     );
-    let (_, t2, io2) = db.stats();
+    let (_, _, io2) = db.stats();
     let plan = db.filter_plan();
     println!(
         "filters: {} branches, {:.2} bits a key in all, false positives a get now {:.5}, with rates by entries over visits {:.5} ({:.1}x fewer), or today's rate in {:.2} bits a key ({:.0}% of today's), over {} gets",
@@ -903,10 +886,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         plan.bits_for_now / num as f64,
         100.0 * plan.bits_for_now / plan.bits.max(1.0),
         plan.gets
-    );
-    println!(
-        "maplets built {} declined {} dropped {}",
-        t2.maplets_built, t2.maplets_declined, t2.maplets_dropped
     );
     println!(
         "read io reads {} ({:.2}s) cache hits {} misses {}",
@@ -1022,13 +1001,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (skipped, opened) = db.scan_filtered();
         let n_seeks = seeks_done.len().max(1) as f64;
         println!(
-            "mixgraph puts {} gets {} seeks {} distance {seek_distance} sources/seek skipped {:.2} opened {:.2} views {}",
+            "mixgraph puts {} gets {} seeks {} distance {seek_distance} sources/seek skipped {:.2} opened {:.2}",
             puts.len(),
             gets.len(),
             seeks_done.len(),
             (skipped - skipped_before) as f64 / n_seeks,
-            (opened - opened_before) as f64 / n_seeks,
-            db.views()
+            (opened - opened_before) as f64 / n_seeks
         );
         if attribute {
             println!("mixgraph puts' tail:");
@@ -1059,11 +1037,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         record_bytes as f64 / (1 << 20) as f64
     );
     let (h, n, l) = db.shape().unwrap();
-    let (_, trunk, _) = db.stats();
-    println!(
-        "shape height {h} nodes {n} leaves {l} views built {} dropped {}",
-        trunk.views_built, trunk.views_dropped
-    );
+    println!("shape height {h} nodes {n} leaves {l}");
     let m = db.memory();
     println!(
         "filter budget {} bytes {:.2} bits/input-key (input keys {num}; includes filters across branches)",
@@ -1071,16 +1045,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         m.filters as f64 * 8.0 / num as f64
     );
     println!(
-        "memory filters {} B ({:.2} B/key) indexes {} B ({:.3} B/key) counts {} B ranges {} B ({:.2} B/key) views {} B ({:.2} B/key)",
+        "memory filters {} B ({:.2} B/key) indexes {} B ({:.3} B/key) counts {} B ranges {} B ({:.2} B/key)",
         m.filters,
         m.filters as f64 / num as f64,
         m.indexes,
         m.indexes as f64 / num as f64,
         m.counts,
         m.ranges,
-        m.ranges as f64 / num as f64,
-        m.views,
-        m.views as f64 / num as f64
+        m.ranges as f64 / num as f64
     );
     let close_began = begin();
     match db.into_file() {

@@ -31,7 +31,6 @@ pub mod memtable;
 pub mod port;
 pub mod ranges;
 pub mod records;
-pub mod remix;
 pub mod rows;
 pub mod scan;
 pub mod shard_db;

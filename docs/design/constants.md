@@ -123,14 +123,9 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/engine/src/records.rs` `READ` | format | 2: a cached record's flag, set when it is read after being appended; it is carried to the tail once when its page is evicted (F2's second chance, Kanellis et al. PVLDB 2025 §7; research/37). |
 | `crates/engine/src/records.rs` `RECORD_HEAD` | format | 15: a cached record's fixed bytes, key length (2), value length (4), flags (1), key hash (8). |
 | `crates/engine/src/records.rs` `SKIP` | format | `u16::MAX`: a key length no record has, marking a page empty from it to its end. |
-| `crates/engine/src/remix.rs` `OLD` | format | 0x80, a selector's bit for a version a newer run shadows (Zhong et al., REMIX, FAST 2021 §4.1; research/34 §4). |
-| `crates/engine/src/remix.rs` `RUN` | format | 0x3f, a selector's run bits: runs 0 to 62, 0x3f the paper's placeholder (REMIX §4.1). |
-| `crates/engine/src/remix.rs` `SEGMENT` | cited | 32 entries a segment as the paper evaluates it: 2.9 B a key for 48-byte keys and 8 runs, 3.16% of the data (REMIX Table 1; research/34 §4); wider for more runs, so a key's versions fit one. |
-| `crates/engine/src/remix.rs` `TOMBSTONE` | format | 0x40, a selector's bit for a deletion (REMIX §4.1). |
 | `crates/engine/src/shard_db.rs` `TUNE_SAMPLES` | cited | 3: the Newton step fits the slope of the gains' difference to the last three allocations between a pair of regions (Luo & Carey, PVLDB 2021 §5.4, K = 3; research/36 §1). |
 | `crates/engine/src/table/format.rs` `CONTEXT_CHECKSUM_FORMAT_VERSION` | format | The first block-based table format_version whose block and footer checksums carry the context modifier [R table/format.h:218-220] (docs/research/24 §1.2). |
 | `crates/engine/src/table/format.rs` `LAST_BYTE_PRIME` | format | `kRandomPrime` 0x6b9083d9 of `ModifyChecksumForLastByte`, folding a block's compression-type byte into its XXH3 checksum [R table/format.cc:606-612] (docs/research/24 §1.2). |
-| `crates/engine/src/trunk/mod.rs` `MAX_VIEW_RUNS` | format | 63: the runs a view names, a selector's six run bits less the placeholder (REMIX §4.1). |
 | `crates/engine/src/util/coding.rs` `CONTINUATION` | format | 0x80, the LEB128 varint's continuation bit [R util/coding.cc:27] (docs/research/24 §1.1). |
 | `crates/engine/src/util/coding.rs` `MAX_VARINT32_LENGTH` | format | 5 bytes, the longest varint32: 32 bits at 7 per byte [R util/coding.h:156] (docs/research/24 §1.1). |
 | `crates/engine/src/util/coding.rs` `MAX_VARINT64_LENGTH` | format | 10 bytes, `kMaxVarint64Length` [R util/coding.h:36] (docs/research/24 §1.1). |
@@ -419,7 +414,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/engine/src/store/cache.rs` `PROMOTE` | cited | 2: reads in the small queue that move a page to main (libCacheSim `S3FIFO.c` default `move-to-main-threshold=2`). |
 | `crates/engine/src/store/cache.rs` `MAX_FREQ` | cited | 3: a cached page's read count's cap, the two-bit counter of S3-FIFO (libCacheSim `S3FIFO.c`, `MIN(freq, 3)`). |
 | `crates/engine/src/trunk/mod.rs` `ABSENT` | format | `u32::MAX`, a trunk image's marker for no child and no end key: above every node index and key length the image holds. |
-| `crates/engine/src/trunk/mod.rs` `IMAGE_FORMAT` | format | 3, the trunk image format this engine writes and reads: 2 named each pivot's view, 3 each branch's range filter (docs/design/engine-structure.md §8, E4c). |
+| `crates/engine/src/trunk/mod.rs` `IMAGE_FORMAT` | format | 5, the trunk image format this engine writes and reads: 2 named each pivot's view, 3 each branch's range filter, 4 each branch's maplet hashes, 5 no views (docs/design/engine-structure.md §8, E4c; views removed, research/43). |
 | `crates/engine/src/trunk/mod.rs` `IMAGE_MAGIC` | format | "mantleTK" in ASCII, little-endian: the trunk image header's magic number. |
 | `crates/gateway/src/layout.rs` `CHUNK` | cited | Tectonic's "typically 8 MiB" chunk (docs/research/01 §1.14). docs/design/gateway.md says measured transfer sizing will replace it, and audit §12.6/§16.2 requires per-upload sizing. |
 | `crates/gateway/src/layout.rs` `SEALED` | derived | `seal::SEGMENT + seal::TAG`: a 64 KiB plaintext segment plus its 16-byte AEAD tag (docs/design/gateway.md §1). |

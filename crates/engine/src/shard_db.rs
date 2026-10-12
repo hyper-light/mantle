@@ -926,9 +926,6 @@ impl<F: BlockFile> ShardDb<F> {
         for &e in self.trunk.image_extents() {
             once(e)?;
         }
-        for &e in self.trunk.view_extents() {
-            once(e)?;
-        }
         for b in self.trunk.branches() {
             for &e in &b.extents {
                 once(e)?;
@@ -1049,11 +1046,6 @@ impl<F: BlockFile> ShardDb<F> {
     /// When seeks consolidate the trunk's pivots (`Trunk::set_consolidation`).
     pub fn set_consolidation(&mut self, choice: crate::trunk::Consolidation) {
         self.trunk.set_consolidation(choice);
-    }
-
-    /// How the trunk makes a bundle's view when it can rebuild it (`Trunk::set_view_choice`).
-    pub fn set_view_choice(&mut self, choice: crate::trunk::ViewChoice) {
-        self.trunk.set_view_choice(choice);
     }
 
     /// Has branches built from here keep `suffix_bits` a key in their range filters
@@ -1583,8 +1575,6 @@ impl<F: BlockFile> ShardDb<F> {
                 what: "runtime finish without adopted native worker retirement",
             });
         }
-        self.trunk.abandon_maplet(&mut self.store);
-        self.trunk.abandon_view(&mut self.store);
         if let Some(error) = self.checkpoint.as_ref().and_then(|c| c.error.as_ref()) {
             self.terminal_error.get_or_insert_with(|| error.clone());
         }
@@ -3027,9 +3017,9 @@ impl<F: BlockFile> ShardDb<F> {
             >= moves.saturating_mul(u128::from(ns))
     }
 
-    /// Whether maintenance is owed: a memtable packing, the trunk's work or a consolidation, a
-    /// leaf's REMIX view to build, the active memtable's runs to merge, or freed pages the cache
-    /// has yet to forget.
+    /// Whether maintenance is owed: a memtable packing, the trunk's work or a consolidation, the
+    /// active memtable's runs to merge, freed pages the cache has yet to forget, or cache slots
+    /// to reserve.
     pub fn owed(&self) -> bool {
         self.owed_with(false)
     }
@@ -3060,8 +3050,6 @@ impl<F: BlockFile> ShardDb<F> {
             || self.trunk.debt() > 0
             || !self.trunk.is_idle()
             || self.trunk.consolidation_owed()
-            || self.trunk.views_owed()
-            || self.trunk.maplets_owed()
             || (if paced {
                 self.mem.debt() > 0
             } else {
@@ -3073,10 +3061,9 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     /// Pays up to `keys` work units of maintenance owed, for the shard's idle time (SILK: the
-    /// flush first, since a full memtable stops puts; then the trunk's work; then the cache's
-    /// views of leaves' bundles; then the consolidations seeks paid for; then the active
-    /// memtable's order; then the cache's forgetting). Returns the work done, 0 once nothing is
-    /// owed.
+    /// flush first, since a full memtable stops puts; then the trunk's work; then the
+    /// consolidations seeks paid for; then the active memtable's order; then the cache's
+    /// forgetting and its slots). Returns the work done, 0 once nothing is owed.
     pub fn idle_step(&mut self, keys: u64) -> Result<u64, Error> {
         self.idle_step_with(keys, false)
     }
@@ -3151,24 +3138,9 @@ impl<F: BlockFile> ShardDb<F> {
             }
             return Ok(used.max(1));
         }
-        if self.trunk.views_owed() {
-            return if paced {
-                self.trunk.view_step_paced(&mut self.store, keys)
-            } else {
-                self.trunk.view_step(&mut self.store, keys)
-            };
-        }
-        if self.trunk.maplets_owed() {
-            return if paced {
-                self.trunk.maplet_step_paced(&mut self.store, keys)
-            } else {
-                self.trunk.maplet_step(&mut self.store, keys)
-            };
-        }
         if self.trunk.consolidation_owed() {
             // Seeks paid for consolidating leaves: one consolidation, in bulk, flushes and settles
-            // them. After views and maplets, which make a bundle one source without rewriting
-            // it: seeks pay rent only for the sources left with those built.
+            // them.
             let t = self.timed.then(std::time::Instant::now);
             let used = self.trunk.consolidate_step(&mut self.store, keys, paced)?;
             if self.timed {
@@ -3544,7 +3516,7 @@ impl<F: BlockFile> ShardDb<F> {
 
     /// Pays maintenance owed, for the shard's idle time: the packing memtable's whole, then up
     /// to `budget` work units of the trunk's (initial leaf moves, merged keys and filter pages),
-    /// then REMIX views of its bundles and the cache's freed pages with the budget left.
+    /// then the cache's freed pages with the budget left.
     /// Returns the work done, less than `budget` only once nothing is owed.
     pub fn maintain(&mut self, budget: u64) -> Result<u64, Error> {
         self.finish_packing()?;
@@ -3553,26 +3525,10 @@ impl<F: BlockFile> ShardDb<F> {
         if self.timed {
             self.note_trunk(ns_since(t));
         }
-        // Each view step does at least one unit of work while views are owed: the budget left
-        // bounds the steps.
-        while used < budget && self.trunk.views_owed() {
-            let done = self
-                .trunk
-                .view_step(&mut self.store, budget.saturating_sub(used))?;
-            used = used.saturating_add(done.max(1));
-        }
-        // Then bundles' maplets, each step at least one unit while owed.
-        while used < budget && self.trunk.maplets_owed() {
-            let done = self
-                .trunk
-                .maplet_step(&mut self.store, budget.saturating_sub(used))?;
-            used = used.saturating_add(done.max(1));
-        }
         // Then a consolidation of every pivot of several sources, each step at least one unit
         // while owed: a drain settles the layout so each seek opens one source, as bulk
         // preparation measured 3.6x the seeks of the layout it replaces (Codex's
-        // mantle-bounded-consolidation-experiment-20261008). Then the views and maplets of the
-        // bundles it changed.
+        // mantle-bounded-consolidation-experiment-20261008).
         self.trunk.consolidate_all();
         while used < budget && (self.trunk.consolidation_owed() || self.trunk.maintaining()) {
             // A drain's whole budget stays whole, so each step waits for the workers'
@@ -3584,18 +3540,6 @@ impl<F: BlockFile> ShardDb<F> {
             };
             let done = self.trunk.consolidate_step(&mut self.store, left, false)?;
             used = used.saturating_add(done.max(1));
-            while used < budget && self.trunk.views_owed() {
-                let done = self
-                    .trunk
-                    .view_step(&mut self.store, budget.saturating_sub(used))?;
-                used = used.saturating_add(done.max(1));
-            }
-            while used < budget && self.trunk.maplets_owed() {
-                let done = self
-                    .trunk
-                    .maplet_step(&mut self.store, budget.saturating_sub(used))?;
-                used = used.saturating_add(done.max(1));
-            }
         }
         // Then the active memtable's runs merged to one, each step at least one unit while owed.
         while used < budget && self.mem.untidy() {
@@ -3652,11 +3596,6 @@ impl<F: BlockFile> ShardDb<F> {
     /// Trunk sources scans have passed over by their range filters, and those they opened.
     pub fn scan_filtered(&self) -> (u64, u64) {
         (self.scan_skipped, self.scan_opened)
-    }
-
-    /// The trunk's bundles that have a REMIX view now.
-    pub fn views(&self) -> usize {
-        self.trunk.views()
     }
 
     /// The trunk's shape: height, nodes, leaves.

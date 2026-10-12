@@ -1,7 +1,6 @@
-//! A branch's run cursor (`Branch::run_at`, `Branch::run_from`), the walk a REMIX view's runs
-//! take (docs/design/engine-structure.md §5, E6): through the leaves in page order, over the index
-//! pages between them, it reads every entry the root-to-leaf cursor reads, in the same order, from
-//! any start key; and placed again at any position it recorded, it reads the same rest.
+//! A branch's run cursor (`Branch::seek`), the walk scans and compactions take: through the leaves
+//! in page order, over the index pages between them, it reads every entry the tree holds at or past
+//! any start key, in key order, and refuses a corrupt page.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -33,8 +32,7 @@ const CONFIG: Config = Config {
 };
 
 type Entries = BTreeMap<Vec<u8>, (Op, Vec<u8>)>;
-/// An entry read, and the position the cursor read it at.
-type Read = ((Vec<u8>, Op, Vec<u8>), (u64, usize));
+type Read = (Vec<u8>, Op, Vec<u8>);
 
 fn store(seed: u64) -> Store<SimFile> {
     let align = Alignment::new(4096).unwrap();
@@ -53,12 +51,12 @@ fn build(s: &mut Store<SimFile>, entries: &Entries) -> Branch {
     b.finish(s).unwrap()
 }
 
-/// Every entry from `from` on, as the run cursor reads them, with each one's position.
+/// Every entry from `from` on, as the run cursor reads them.
 fn walk(s: &mut Store<SimFile>, b: &Branch, from: &[u8]) -> Vec<Read> {
-    let mut c = b.run_at(s, from).unwrap();
+    let mut c = b.seek(s, from).unwrap();
     let mut out = Vec::new();
     while c.valid() {
-        out.push(((c.key().to_vec(), c.op(), c.value().to_vec()), c.position()));
+        out.push((c.key().to_vec(), c.op(), c.value().to_vec()));
         c.next(b, s).unwrap();
         assert!(
             out.len() <= b.count as usize,
@@ -89,70 +87,35 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(24))]
 
     #[test]
-    fn the_run_cursor_reads_what_the_tree_holds_from_any_key_and_any_position(
+    fn the_run_cursor_reads_what_the_tree_holds_from_any_key(
         e in entries(),
         from in prop::collection::vec(any::<u8>(), 0..40),
         pick in any::<prop::sample::Index>(),
-        k in 0usize..600,
     ) {
         let mut s = store(3);
         let b = build(&mut s, &e);
-        let want: Vec<(Vec<u8>, Op, Vec<u8>)> = e
+        let want: Vec<Read> = e
             .range(from.clone()..)
             .map(|(k, (op, v))| (k.clone(), *op, v.clone()))
             .collect();
-        let got = walk(&mut s, &b, &from);
-        let read: Vec<_> = got.iter().map(|(entry, _)| entry.clone()).collect();
-        prop_assert_eq!(&read, &want);
-        // The leaf index routes every key to the leaf holding it, and a query to the leaf whose
-        // keys before it are all less and after it all greater (a seek's first key at or past
-        // it is there or in the next leaf's start); so does the index read back from the
-        // branch's pages.
-        let all = walk(&mut s, &b, b"");
+        prop_assert_eq!(&walk(&mut s, &b, &from), &want);
+        // The leaf index read back from the branch's pages is the one built, and it routes a
+        // seek of every key to that key, and a seek between two keys to the second.
         let mut descriptor = Vec::new();
         b.encode(&mut descriptor).unwrap();
         let (back, _) = Branch::decode(&mut s, &descriptor).unwrap();
         prop_assert_eq!(&back.index, &b.index);
-        for ((k, _, _), (page, _)) in &all {
-            prop_assert_eq!(b.leaf_of(k).unwrap(), *page as u32);
-        }
-        let leaf = u64::from(b.leaf_of(&from).unwrap());
-        prop_assert!(all.iter().any(|(_, (p, _))| *p == leaf), "a leaf the branch has");
-        for ((k, _, _), (p, _)) in &all {
-            if *p < leaf {
-                prop_assert!(k.as_slice() < from.as_slice(), "a key before the leaf at or past the query");
-            }
-            if *p > leaf {
-                prop_assert!(k.as_slice() > from.as_slice(), "a key after the leaf at or before the query");
-            }
-        }
-        // Placed at a recorded position, the cursor reads the same rest.
-        if !got.is_empty() {
-            let at = pick.index(got.len());
-            let (page_no, index) = got[at].1;
-            let mut c = b.run_from(&mut s, page_no, index).unwrap();
-            let mut rest = Vec::new();
-            while c.valid() {
-                rest.push((c.key().to_vec(), c.op(), c.value().to_vec()));
-                c.next(&b, &mut s).unwrap();
-            }
-            c.give_back(&mut s);
-            prop_assert_eq!(&rest[..], &read[at..]);
-            // `k` entries on, by the counts alone and by a cursor's one move: where `k` steps land.
-            let want = got.get(at + k).map(|(_, p)| *p);
-            prop_assert_eq!(b.position_after((page_no, index), k).unwrap(), want);
-            let mut c = b.run_from(&mut s, page_no, index).unwrap();
-            c.advance(&b, &mut s, k).unwrap();
-            match got.get(at + k) {
-                Some((entry, p)) => {
-                    prop_assert!(c.valid());
-                    prop_assert_eq!(c.position(), *p);
-                    prop_assert_eq!(&(c.key().to_vec(), c.op(), c.value().to_vec()), entry);
-                }
-                None => prop_assert!(!c.valid()),
-            }
+        let all = walk(&mut s, &b, b"");
+        for (k, op, v) in &all {
+            let c = b.seek(&mut s, k).unwrap();
+            prop_assert!(c.valid());
+            prop_assert_eq!((c.key(), c.op(), c.value()), (k.as_slice(), *op, v.as_slice()));
             c.give_back(&mut s);
         }
+        let at = pick.index(all.len());
+        let mut past = all[at].0.clone();
+        past.push(0);
+        prop_assert_eq!(&walk(&mut s, &b, &past)[..], &all[at + 1..]);
     }
 }
 
@@ -168,39 +131,13 @@ fn a_branch_of_many_leaves_has_index_pages_between_them() {
     assert!(b.height >= 3, "height {}", b.height);
     let got = walk(&mut s, &b, b"");
     assert_eq!(got.len(), e.len());
-    assert!(got.iter().zip(e.keys()).all(|((g, _), k)| &g.0 == k));
+    assert!(got.iter().zip(e.keys()).all(|(g, k)| &g.0 == k));
 }
 
 #[test]
-fn position_arithmetic_lands_where_steps_do_from_every_position_by_every_count() {
-    // Every position of a branch of many leaves and index pages, every count up to past several
-    // leaves: each page's end is landed on exactly, from every entry before it.
-    let mut s = store(5);
-    let e: Entries = (0u32..20_000)
-        .map(|n| {
-            (
-                n.to_be_bytes().to_vec(),
-                (Op::Put, vec![9u8; 60 + (n % 50) as usize]),
-            )
-        })
-        .collect();
-    let b = build(&mut s, &e);
-    assert!(b.height >= 3, "height {}", b.height);
-    let positions: Vec<(u64, usize)> = walk(&mut s, &b, b"").into_iter().map(|(_, p)| p).collect();
-    assert_eq!(positions.len(), e.len());
-    for (j, &p) in positions.iter().enumerate() {
-        for k in 0..300 {
-            assert_eq!(
-                b.position_after(p, k).unwrap(),
-                positions.get(j + k).copied(),
-                "from {p:?} by {k}"
-            );
-        }
-    }
-}
-
-#[test]
-fn placing_a_cursor_again_reads_each_leafs_prefix_and_entry_ranges() {
+fn seeks_alternating_between_branches_read_each_leafs_prefix_and_entry_ranges() {
+    // Two branches whose keys share prefixes of different lengths, read through a cache of a
+    // few pages: each seek's leaf is read again, its prefix and ranges its own.
     let mut s = store(13);
     s.set_cache(8);
     let entries = |prefix: &[u8]| -> Entries {
@@ -222,47 +159,45 @@ fn placing_a_cursor_again_reads_each_leafs_prefix_and_entry_ranges() {
     let second = build(&mut s, &entries(b"a-longer-common-prefix/"));
     let first_read = walk(&mut s, &first, b"");
     let second_read = walk(&mut s, &second, b"");
-    let mut c = first.run_from(&mut s, first_read[0].1.0, 0).unwrap();
     for (branch, read) in [
         (&first, &first_read),
         (&second, &second_read),
         (&first, &first_read),
     ] {
         for at in [read.len() / 2, 0, read.len() - 1, 1] {
-            c.place(branch, &mut s, read[at].1).unwrap();
-            assert_eq!((c.key().to_vec(), c.op(), c.value().to_vec()), read[at].0);
+            let mut c = branch.seek(&mut s, &read[at].0).unwrap();
+            assert_eq!((c.key().to_vec(), c.op(), c.value().to_vec()), read[at]);
             c.next(branch, &mut s).unwrap();
             match read.get(at + 1) {
-                Some((entry, _)) => {
+                Some(entry) => {
                     assert!(c.valid());
                     assert_eq!(&(c.key().to_vec(), c.op(), c.value().to_vec()), entry);
                 }
                 None => assert!(!c.valid()),
             }
+            c.give_back(&mut s);
         }
     }
-    c.give_back(&mut s);
 }
 
 #[test]
-fn a_cursor_refuses_a_corrupt_leaf_and_can_be_placed_on_a_valid_one_again() {
+fn a_seek_refuses_a_corrupt_leaf_and_a_valid_branch_still_reads() {
     let mut s = store(17);
     let entries: Entries = [(b"key".to_vec(), (Op::Put, b"value".to_vec()))]
         .into_iter()
         .collect();
     let good = build(&mut s, &entries);
     let broken = build(&mut s, &entries);
-    let mut c = good.run_at(&mut s, b"").unwrap();
-    let position = c.position();
-    let address = broken.page_address(&s, position.0).unwrap();
+    let page = u64::from(broken.leaf_of(b"key").unwrap());
+    let address = broken.page_address(&s, page).unwrap();
     // A valid store-page checksum around an empty branch payload: corruption must also be
     // refused by the branch's reader, before any entry can be read through the cursor.
     s.write_page(address, b"").unwrap();
     assert!(matches!(
-        c.place(&broken, &mut s, position),
+        broken.seek(&mut s, b""),
         Err(Error::Corruption { .. })
     ));
-    c.place(&good, &mut s, position).unwrap();
+    let c = good.seek(&mut s, b"").unwrap();
     assert!(c.valid());
     assert_eq!(c.key(), b"key");
     assert_eq!(c.value(), b"value");
@@ -290,7 +225,7 @@ fn stepping_a_cursor_refuses_a_truncated_entry_in_a_valid_leaf_header() {
         b.seek(&mut s, b"z"),
         Err(Error::Corruption { .. })
     ));
-    let mut c = b.run_from(&mut s, page, 0).unwrap();
+    let mut c = b.seek(&mut s, b"a").unwrap();
     assert_eq!(c.key(), b"a");
     assert_eq!(c.value(), b"first");
     assert!(matches!(c.next(&b, &mut s), Err(Error::Corruption { .. })));
@@ -316,10 +251,6 @@ fn a_cursor_refuses_a_page_flipped_on_the_medium() {
     })
     .unwrap();
     let (mut s, _) = Store::open(file, CONFIG).unwrap();
-    assert!(matches!(
-        b.run_from(&mut s, page, 0),
-        Err(Error::Corruption { .. })
-    ));
     assert!(matches!(
         b.seek(&mut s, &250u32.to_be_bytes()),
         Err(Error::Corruption { .. })

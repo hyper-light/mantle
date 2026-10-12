@@ -420,13 +420,17 @@ pub struct ShardDb<F: BlockFile> {
     /// Whether maintenance is timed ([`ShardDb::set_timed`]).
     timed: bool,
     /// A file kept as segments: the growth out on a worker, its segment's first extent and
-    /// extents; the extents a segment adds, the reserve kept ahead of the allocations; the most
-    /// a packing's grant wanted that the admitted extents could not give; and the most any grant
-    /// wanted that they could not give since the last segment was booked.
+    /// extents; the extents a segment adds, the largest grant asked and at least a packing's; the
+    /// most a packing's grant wanted that the admitted extents could not give; the most any grant
+    /// wanted that they could not give since the last segment was booked; the extents left when
+    /// the growth now due first came due; and the most the allocations took while one was due,
+    /// which the next segment is booked ahead of.
     growth: Option<(Ticket, u64, u64)>,
     segment_extents: u64,
     packing_wanted: u64,
     growth_waited: u64,
+    growth_due_at: Option<u64>,
+    growth_lead: u64,
 }
 
 /// Cited (Luo & Carey, PVLDB 2021 §5.4): a tuning step moves 5% of the memory budget toward
@@ -697,6 +701,8 @@ impl<F: BlockFile> ShardDb<F> {
             segment_extents: 0,
             packing_wanted: 0,
             growth_waited: 0,
+            growth_due_at: None,
+            growth_lead: 0,
         })
     }
 
@@ -2381,8 +2387,8 @@ impl<F: BlockFile> ShardDb<F> {
 
     /// A file kept as segments, cold (created, opened, no workers yet): a segment recovered past
     /// the admitted extents written whole again, and one segment's reserve admitted ahead, here
-    /// and now. A segment is a packing's grant at first, the unit a fill grows by
-    /// ([`Self::grow`] doubles it when the allocations outrun it).
+    /// and now. A segment is a packing's grant at first, the unit a fill grows by, and grows to
+    /// the largest grant asked ([`Self::grow`]).
     fn grow_cold(&mut self) -> Result<(), Error> {
         let Some(seg) = self.store.segments() else {
             return Ok(());
@@ -2398,12 +2404,15 @@ impl<F: BlockFile> ShardDb<F> {
         Ok(())
     }
 
-    /// Grows a file kept as segments ahead of its allocations (docs/research/48): takes a growth
-    /// back from its worker, waiting for it when `wait`, admits its segment and answers the asks
-    /// for extents that waited for it; then, with fewer extents left than a segment's reserve or
-    /// than any grant waiting wants, books the next segment and hands it to a worker to add and
-    /// write whole. A segment doubles, once a booking, when a grant waited for one. Without
-    /// workers it grows in place, where the shard may wait. Returns whether it did anything.
+    /// Grows a file kept as segments ahead of its allocations (docs/research/48 §5): takes a
+    /// growth back from its worker, waiting for it when `wait`, admits its segment and answers the
+    /// asks for extents that waited for it; then, with fewer extents left than a segment and the
+    /// lead, or than any grant waiting wants, books the next segment and hands it to a worker to
+    /// add and write whole. A segment is as large as the largest grant asked; the lead is the most
+    /// the allocations took from the time a growth came due to its segment's admission, the wait
+    /// for a free worker and any grant that waited included, so the next growth starts that far
+    /// ahead. A larger segment would not help: it takes the longer to write. Without workers it
+    /// grows in place, where the shard may wait. Returns whether it did anything.
     fn grow(&mut self, wait: bool) -> Result<bool, Error> {
         if self.store.segments().is_none() {
             return Ok(false);
@@ -2425,6 +2434,7 @@ impl<F: BlockFile> ShardDb<F> {
                 back.result?;
                 self.growth = None;
                 self.store.growth_added();
+                self.note_lead();
                 self.store.admit(start, extents)?;
                 did = true;
             }
@@ -2440,27 +2450,17 @@ impl<F: BlockFile> ShardDb<F> {
         if wanted > self.store.capacity() {
             self.growth_waited = self.growth_waited.max(wanted);
         }
-        if self.growth.is_some()
-            || self.store.capacity() >= self.segment_extents.max(self.growth_waited)
-        {
+        if self.growth.is_some() || (!self.growth_due() && self.growth_waited == 0) {
             return Ok(did);
         }
+        // Due from now, if it was not already: the lead counts from the first look that found it.
+        self.growth_due_at.get_or_insert(self.store.capacity());
         let waited = std::mem::take(&mut self.growth_waited);
-        if waited > 0 {
-            // A grant outran the reserve since the last segment was booked: this segment and
-            // those after twice as large, once for each segment booked however long the grant
-            // waited, and never past what the file holds already, so it at most doubles (the
-            // dynamic table's growth, Cormen et al., Introduction to Algorithms, 3rd ed., §17.4);
-            // and at least what waited.
-            let admitted = self.store.segments().map_or(0, |s| s.admitted);
-            self.segment_extents = self
-                .segment_extents
-                .saturating_mul(2)
-                .min(admitted.max(self.segment_extents))
-                .max(waited);
+        if waited > self.segment_extents {
+            self.segment_extents = waited;
             self.store.set_growth_extents(self.segment_extents);
         }
-        let Some(p) = self.store.begin_growth(self.segment_extents.max(waited))? else {
+        let Some(p) = self.store.begin_growth(self.segment_extents)? else {
             return Ok(did);
         };
         // Where the shard may wait it grows here, so no growth is out on a worker while its own
@@ -2468,6 +2468,7 @@ impl<F: BlockFile> ShardDb<F> {
         if self.store.grows_in_place() {
             self.store.grow_segment(p.start, p.extents, !p.added)?;
             self.store.growth_added();
+            self.note_lead();
             self.store.admit(p.start, p.extents)?;
             return Ok(true);
         }
@@ -2496,6 +2497,7 @@ impl<F: BlockFile> ShardDb<F> {
                     // Every worker is occupied and the shard may wait: grown here.
                     self.store.grow_segment(p.start, p.extents, !p.added)?;
                     self.store.growth_added();
+                    self.note_lead();
                     self.store.admit(p.start, p.extents)?;
                     return Ok(true);
                 }
@@ -3309,12 +3311,24 @@ impl<F: BlockFile> ShardDb<F> {
         }
     }
 
-    /// Whether a file kept as segments has fewer extents left than a segment's reserve, and no
+    /// Whether a file kept as segments has fewer extents left than a segment and the lead, and no
     /// growth out.
     fn growth_due(&self) -> bool {
         self.growth.is_none()
             && self.store.segments().is_some()
-            && self.store.capacity() < self.segment_extents
+            && self.store.capacity() < self.segment_extents.saturating_add(self.growth_lead)
+    }
+
+    /// A growth's segment is about to be admitted: what the allocations took since it came due,
+    /// and the most any grant asked of the extents left while it was out, is the lead the next
+    /// is booked ahead of, if it is the most yet.
+    fn note_lead(&mut self) {
+        if let Some(due_at) = self.growth_due_at.take() {
+            let took = due_at
+                .saturating_sub(self.store.capacity())
+                .saturating_add(self.growth_waited);
+            self.growth_lead = self.growth_lead.max(took);
+        }
     }
 
     fn idle_step_with(&mut self, keys: u64, paced: bool) -> Result<u64, Error> {

@@ -116,8 +116,10 @@ no other transfer uses it,
 and only then are its extents handed out, so every transfer to a segment in use is an overwrite
 (the zeros as PostgreSQL's WAL segments take them [pg], and as NTFS's valid data length needs
 [ntfs]). The allocator stops at the extents admitted; the shard books the next segment when fewer
-are left than a segment, which starts at a packing's grant and doubles whenever a grant had to wait
-for one; a packing, a compaction or a worker's ask that does not fit waits for the growth. Opened,
+are left than a segment and a lead: a segment is as large as the largest grant asked, at least a
+packing's, and the lead is the most the allocations took between a growth coming due and its
+segment's admission, the wait for a free worker included (§6); a packing, a compaction or a
+worker's ask that does not fit waits for the growth. Opened,
 the segments holding an extent ever handed out are admitted, and a segment past them, which a crash
 may have left unwritten, is written again before use.
 

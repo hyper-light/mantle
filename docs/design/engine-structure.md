@@ -201,8 +201,8 @@ under load, at moderate load and saturated.
   each created whole at its final length and written whole with zeros by a maintenance worker,
   past the OS's cache, before any of its extents is handed out, so every transfer to a segment in
   use is an overwrite. The allocator stops at the extents admitted; the shard books the next
-  segment when fewer are left than a segment, which starts at a packing's grant and doubles, at
-  most once a booking and never past the file's size, when a grant waited for one. Reads made
+  segment when fewer are left than a segment, as large as the largest grant asked, and a lead,
+  the most the allocations took while a growth was due (research/48 §6). Reads made
   from memory keep one reclaim epoch for the whole file (research/46). Opened, the segments
   holding an extent ever handed out are admitted, and a segment past them, which a crash may have
   left unwritten, is written whole again before use.

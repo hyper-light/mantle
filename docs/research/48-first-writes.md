@@ -137,7 +137,8 @@ need:
   often. They now go through a handle past the cache.
 - A segment doubled at every look while a grant waited, not once a growth: beside F_FULLFSYNC every
   10M fill, and one 100M fill, asked APFS for a segment past the free space (ENOSPC). A segment now
-  doubles at most once a booking, and never past the file's size.
+  doubled at most once a booking after that, and never past the file's size, until the lead
+  below replaced the doubling.
 
 The second (`mantle-segments2-20261012`, 8dcf196) found the writing itself too slow under load:
 one 128 KiB write at a time, each waiting for the device. Beside F_FULLFSYNC its fills ran at 652 K
@@ -200,3 +201,29 @@ over the handles a file takes, made again by every worker that opened one. A 10M
 touched 4.9 GB (313,692 page faults and 520 bytes a put, against 344 and 7.4 for one file). Slots
 now sit in chunks of 1, 2, 4 and on, each made when a segment reaches it (Dechev, Pirkelbauer and
 Stroustrup's bucket layout, OPODIS 2006): the same setup touches 473 pages.
+
+Doubling once a booking still grew segments without bound under contention: a larger segment takes
+the longer to write whole, so every growth waited again. At 100M beside a load average of 26 the
+segments ran to 5 GB, 22.7 GB of them for a store a calm run held in 14.4 GB, and a put waited 6.2 s;
+at 1B they ran to 42 GB, 224 GB on disk for about 120 GB of store, and a put waited 11.3 s
+(`mantle-segments4-20261012`, `mantle-gate1b-20261012`). So a segment is now as large as the
+largest grant asked, and the next is booked once fewer extents are left than a segment and a lead:
+the most the allocations took from a growth coming due to its segment's admission, the wait for a
+free worker included. The same A/B with it (`mantle-segments6-20261012`; rounds 3, 5, 3, 5, 3):
+
+| keys | load | arm | fill/s | reads/s | seeks/s | put p99.99 µs | slowest put ms | stalls |
+|---|---|---|---|---|---|---|---|---|
+| 10M | none added | merge tree | 2,160,167 | 549,370 | 147,991 | 73.7 | 1.4 | 0/1/0/0/0 |
+| 10M | none added | segments | 2,056,681 | 562,829 | 140,818 | 59.4 | 2.2 | 0/0/0/0/0 |
+| 10M | `F_FULLFSYNC` | merge tree | 1,255,796 | 517,065 | 142,691 | 475.1 | 86.9 | 1/0/0 |
+| 10M | `F_FULLFSYNC` | segments | 1,885,418 | 389,868 | 142,163 | 64.5 | 24.0 | 0/0/0 |
+| 10M | memory hog | merge tree | 1,806,711 | 484,625 | 124,594 | 102.4 | 19.2 | 0/0/0/0/0 |
+| 10M | memory hog | segments | 1,843,102 | 447,817 | 121,697 | 51.2 | 2.2 | 0/0/0/0/0 |
+| 100M | none added | merge tree | 1,443,344 | 331,332 | 59,015 | 108.5 | 3,262.5 | 13/1/0 |
+| 100M | none added | segments | 1,848,464 | 349,375 | 59,288 | 58.4 | 7.7 | 0/0/0 |
+
+RocksDB in the same rounds: 791 K, 693 K, 698 K and 779 K puts a second. The 100M segments came to
+14.6–15.1 GB, the largest 316–410 MiB. Where segments read less, beside the flushes, their fill had
+left the tree less consolidated: its queries made 1.91 M device reads to the merge tree's 1.31 M,
+and bought 24 more pivot compactions while they ran (the post-fill flush steps every owed
+compaction first, as RocksDB's `waitforcompaction` does, so these are the queries' own).

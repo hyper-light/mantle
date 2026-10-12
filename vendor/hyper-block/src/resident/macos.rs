@@ -44,11 +44,24 @@ pub(crate) struct Resident {
     /// The window could not be mapped, or a probe refused: the handle probes no more, and its
     /// reads all go to the thread that may wait.
     refused: bool,
-    /// For each 64 OS pages of the file, the pages a probe found resident, and the generation it
-    /// found them in: a word of another generation answers nothing.
+    /// For each 64 OS pages of the file, the pages a probe found resident, and the generation of
+    /// the [`Epoch`] it found them in: a word of another generation answers nothing.
     bits: Vec<u64>,
-    gens: Vec<u32>,
-    generation: u32,
+    gens: Vec<u64>,
+    shadow: bool,
+    /// Probes, reads made on answers, and answers found wrong; the epoch counts its own.
+    counts: super::Residency,
+}
+
+/// The epoch kept answers hold in: the kernel's count of file-backed pages reclaimed, which is
+/// one for the whole machine, so the files a handle reads through share one (a file kept as
+/// segments, `crate::segmented`) and a read refreshes it once however many files it spans.
+#[derive(Debug)]
+pub(crate) struct Epoch {
+    /// Moves on each time a refresh finds the epoch changed, so every answer kept before is
+    /// forgotten. One a refresh at most, and a refresh is at least one system call, so its
+    /// 2^64 values outlast any process: no word kept can meet a generation come round again.
+    generation: u64,
     /// The kernel's count of file-backed pages reclaimed at the last refresh, which the
     /// generation stands for; none before the first, or when it cannot be read, and then every
     /// read probes.
@@ -60,8 +73,9 @@ pub(crate) struct Resident {
     /// The counters' and the free count's resolved names, and the free target in bytes, found
     /// at the first refresh; none when one cannot be, and then no answer is kept.
     mibs: Option<Mibs>,
-    shadow: bool,
-    counts: super::Residency,
+    /// Refreshes made, and the changes among them that forgot every answer.
+    epochs: u64,
+    changes: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -191,23 +205,28 @@ impl Drop for Window {
     }
 }
 
-impl Resident {
-    /// A handle with no mapping yet: it maps one on its first read.
+impl Epoch {
+    /// An epoch not read yet: the first read through it reads it.
     pub(crate) fn new() -> Self {
         Self {
-            window: None,
-            pages: Vec::new(),
-            refused: false,
-            bits: Vec::new(),
-            gens: Vec::new(),
             generation: 0,
             epoch: None,
             due: None,
             unanswerable: false,
             mibs: None,
-            shadow: false,
-            counts: super::Residency::default(),
+            epochs: 0,
+            changes: 0,
         }
+    }
+
+    /// The generation answers are kept in now, the epoch read again first when it is due: none
+    /// when the epoch is unknown, and then no answer is kept or used.
+    fn current(&mut self) -> Option<u64> {
+        let now = std::time::Instant::now();
+        if !self.unanswerable && self.due.is_none_or(|due| now >= due) {
+            self.refresh(now);
+        }
+        self.epoch.map(|_| self.generation)
     }
 
     /// The names resolved and the free target read, once; none when any cannot be.
@@ -243,7 +262,7 @@ impl Resident {
             .try_fold(0u64, |sum, mib| mib.read().map(|v| sum.wrapping_add(v)));
         let page = u64::try_from(rustix::param::page_size()).unwrap_or(u64::MAX);
         let free = mibs.free.read_int().map(|f| f.saturating_mul(page));
-        self.counts.epochs = self.counts.epochs.saturating_add(1);
+        self.epochs = self.epochs.saturating_add(1);
         // The time free memory needs to reach the target at the fastest fill, or to spend the
         // target's own bytes once it is there.
         let room = free.map_or(0, |f| {
@@ -257,14 +276,34 @@ impl Resident {
             return;
         }
         if self.epoch.is_some() {
-            self.counts.changes = self.counts.changes.saturating_add(1);
+            self.changes = self.changes.saturating_add(1);
         }
         self.generation = self.generation.wrapping_add(1);
-        if self.generation == 0 {
-            // A wrapped generation could match a word left from four billion epochs ago.
-            self.bits.iter_mut().for_each(|b| *b = 0);
-        }
         self.epoch = read;
+    }
+
+    /// Its refreshes and the changes they found.
+    pub(crate) fn residency(&self) -> super::Residency {
+        super::Residency {
+            epochs: self.epochs,
+            changes: self.changes,
+            ..super::Residency::default()
+        }
+    }
+}
+
+impl Resident {
+    /// A handle with no mapping yet: it maps one on its first read.
+    pub(crate) fn new() -> Self {
+        Self {
+            window: None,
+            pages: Vec::new(),
+            refused: false,
+            bits: Vec::new(),
+            gens: Vec::new(),
+            shadow: false,
+            counts: super::Residency::default(),
+        }
     }
 
     /// What its reads from memory did.
@@ -278,18 +317,18 @@ impl Resident {
         self.shadow = on;
     }
 
-    /// Whether every OS page in [`first`, `end`) was found resident in this epoch.
-    fn answered(&self, first: usize, end: usize) -> bool {
+    /// Whether every OS page in [`first`, `end`) was found resident in `generation`.
+    fn answered(&self, first: usize, end: usize, generation: u64) -> bool {
         (first..end).all(|p| {
             let (w, b) = (p / 64, p % 64);
-            self.gens.get(w) == Some(&self.generation)
+            self.gens.get(w) == Some(&generation)
                 && self.bits.get(w).is_some_and(|bits| bits & (1u64 << b) != 0)
         })
     }
 
-    /// Keeps the answer that every OS page in [`first`, `end`) is resident; none when the words
-    /// cannot grow, which only costs those pages a probe again.
-    fn answer(&mut self, first: usize, end: usize) {
+    /// Keeps the answer that every OS page in [`first`, `end`) is resident in `generation`; none
+    /// when the words cannot grow, which only costs those pages a probe again.
+    fn answer(&mut self, first: usize, end: usize, generation: u64) {
         let words = end.div_ceil(64);
         if words > self.bits.len() {
             let more = words.saturating_sub(self.bits.len());
@@ -301,9 +340,9 @@ impl Resident {
         }
         for p in first..end {
             let (w, b) = (p / 64, p % 64);
-            if let (Some(bits), Some(generation)) = (self.bits.get_mut(w), self.gens.get_mut(w)) {
-                if *generation != self.generation {
-                    *generation = self.generation;
+            if let (Some(bits), Some(found_in)) = (self.bits.get_mut(w), self.gens.get_mut(w)) {
+                if *found_in != generation {
+                    *found_in = generation;
                     *bits = 0;
                 }
                 *bits |= 1u64 << b;
@@ -312,8 +351,15 @@ impl Resident {
     }
 
     /// Fills `buf` from `offset` if every page of it is in the unified buffer cache now: true when
-    /// it did; false when a page is not, the file ends first, or the handle cannot probe.
-    pub(crate) fn read(&mut self, file: &File, buf: &mut [u8], offset: u64) -> io::Result<bool> {
+    /// it did; false when a page is not, the file ends first, or the handle cannot probe. Answers
+    /// are kept, and used, in `epoch`.
+    pub(crate) fn read(
+        &mut self,
+        file: &File,
+        buf: &mut [u8],
+        offset: u64,
+        epoch: &mut Epoch,
+    ) -> io::Result<bool> {
         if self.refused || buf.is_empty() {
             return Ok(false);
         }
@@ -329,11 +375,8 @@ impl Resident {
             return Ok(false);
         };
         let (p0, p1) = (first / page, end / page);
-        let now = std::time::Instant::now();
-        if !self.unanswerable && self.due.is_none_or(|due| now >= due) {
-            self.refresh(now);
-        }
-        if self.epoch.is_some() && self.answered(p0, p1) {
+        let generation = epoch.current();
+        if generation.is_some_and(|g| self.answered(p0, p1, g)) {
             if self.shadow && self.probe(file, first, end)? != Some(true) {
                 self.counts.wrong = self.counts.wrong.saturating_add(1);
             }
@@ -342,8 +385,8 @@ impl Resident {
         }
         match self.probe(file, first, end)? {
             Some(true) => {
-                if self.epoch.is_some() {
-                    self.answer(p0, p1);
+                if let Some(g) = generation {
+                    self.answer(p0, p1, g);
                 }
                 Self::read_now(file, buf, offset)
             }
@@ -421,30 +464,33 @@ impl Resident {
     pub(crate) fn refused(&self) -> bool {
         self.refused
     }
+}
 
+#[cfg(test)]
+impl Epoch {
     /// Holds the epoch where it is for a test, whatever the host's kernel reclaims meanwhile:
     /// answers are kept, and no refresh comes due.
-    #[cfg(test)]
-    pub(crate) fn hold_epoch(&mut self) {
+    pub(crate) fn hold(&mut self) {
         let now = std::time::Instant::now();
         self.mibs = Self::resolve();
-        self.epoch = Some(self.epoch.unwrap_or(0));
+        if self.epoch.is_none() {
+            self.epoch = Some(0);
+            self.generation = self.generation.wrapping_add(1);
+        }
         self.due = now.checked_add(std::time::Duration::from_secs(u64::from(u32::MAX)));
     }
 
     /// What a refresh does when the epoch moved: every answer forgotten.
-    #[cfg(test)]
-    pub(crate) fn move_epoch(&mut self) {
+    pub(crate) fn move_on(&mut self) {
         self.epoch = self.epoch.map(|e| e.wrapping_add(1));
         self.generation = self.generation.wrapping_add(1);
     }
 
     /// A refresh against the kernel's counters as they are, with the epoch held one off them.
-    #[cfg(test)]
-    pub(crate) fn refresh_from_off_epoch(&mut self) -> (u64, u64) {
+    pub(crate) fn refresh_from_off(&mut self) -> (u64, u64) {
         let now = std::time::Instant::now();
         self.refresh(now);
-        let (before, generation) = (self.counts.changes, self.generation);
+        let (before, generation) = (self.changes, self.generation);
         self.epoch = self.epoch.map(|e| e.wrapping_sub(1));
         self.refresh(now);
         assert_ne!(
@@ -452,6 +498,6 @@ impl Resident {
             "a changed epoch is a new generation"
         );
         assert!(self.due.is_some_and(|due| due >= now));
-        (before, self.counts.changes)
+        (before, self.changes)
     }
 }

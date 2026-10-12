@@ -24,7 +24,7 @@ use std::io;
 mod macos;
 
 #[cfg(target_vendor = "apple")]
-pub(crate) use macos::Resident;
+pub(crate) use macos::{Epoch, Resident};
 
 /// What a handle's reads from memory did ([`crate::block::BlockFile::residency`]): probes made,
 /// reads made on an earlier probe's answer instead (macOS, mantle `docs/research/46-reclaim-epochs.md`),
@@ -53,6 +53,22 @@ impl Residency {
     }
 }
 
+/// No answer is kept off macOS, so there is no epoch for one to hold in.
+#[cfg(not(target_vendor = "apple"))]
+#[derive(Debug)]
+pub(crate) struct Epoch;
+
+#[cfg(not(target_vendor = "apple"))]
+impl Epoch {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+
+    pub(crate) fn residency(&self) -> Residency {
+        Residency::default()
+    }
+}
+
 /// A handle's state for reads made only from memory: whether the kernel refused `RWF_NOWAIT`.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
@@ -71,7 +87,13 @@ impl Resident {
 
     /// Fills `buf` from `offset` if every byte of it is in memory now: true when it did; false
     /// when the read would wait, the file ends first, or the kernel takes no `RWF_NOWAIT`.
-    pub(crate) fn read(&mut self, file: &File, buf: &mut [u8], offset: u64) -> io::Result<bool> {
+    pub(crate) fn read(
+        &mut self,
+        file: &File,
+        buf: &mut [u8],
+        offset: u64,
+        _epoch: &mut Epoch,
+    ) -> io::Result<bool> {
         use rustix::io::{Errno, ReadWriteFlags, preadv2};
         if self.refused {
             return Ok(false);
@@ -125,7 +147,13 @@ impl Resident {
     }
 
     /// Never reads: every read goes to the thread that may wait.
-    pub(crate) fn read(&mut self, _file: &File, _buf: &mut [u8], _offset: u64) -> io::Result<bool> {
+    pub(crate) fn read(
+        &mut self,
+        _file: &File,
+        _buf: &mut [u8],
+        _offset: u64,
+        _epoch: &mut Epoch,
+    ) -> io::Result<bool> {
         Ok(false)
     }
 

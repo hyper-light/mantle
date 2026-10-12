@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::DiskError;
 use crate::block::{BlockFile, Durable};
-use crate::buf::Alignment;
+use crate::buf::{AlignedBuf, Alignment};
 use crate::file::{CachingRequest, DeviceFile, sync_dir};
 
 #[derive(Debug)]
@@ -45,6 +45,10 @@ pub struct SegmentedFile {
     /// Shadow mode for resident reads, given to each segment as it is found
     /// ([`BlockFile::set_residency_shadow`]).
     shadow: bool,
+    /// The epoch every segment's kept answers hold in (`crate::resident`): the kernel's count it
+    /// stands for is the machine's, so one serves them all, read once however many segments a
+    /// file's reads reach.
+    epoch: crate::resident::Epoch,
 }
 
 /// The path of segment `index`: the base file for 0, `<base>.<index>` after.
@@ -61,6 +65,21 @@ fn beyond(path: &Path, reason: &'static str) -> DiskError {
     DiskError::Unsupported {
         path: path.to_path_buf(),
         reason,
+    }
+}
+
+/// The alignment a write past the OS's cache needs of its buffer: on macOS the cluster layer
+/// writes past the cache only from a buffer and at a file offset aligned to the VM page, and
+/// copies through the cache otherwise (XNU `bsd/vfs/vfs_cluster.c`, `cluster_write_direct`; and
+/// only a write of 16 KiB or more, `MIN_DIRECT_WRITE_SIZE`); elsewhere the file's own.
+fn whole_align(align: Alignment) -> Result<Alignment, DiskError> {
+    #[cfg(target_vendor = "apple")]
+    {
+        Ok(Alignment::new(rustix::param::page_size().max(align.get()))?)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        Ok(align)
     }
 }
 
@@ -120,6 +139,7 @@ impl SegmentedFile {
             align,
             segments,
             shadow: false,
+            epoch: crate::resident::Epoch::new(),
         };
         file.place(0, 0, len, first)?;
         // Every segment that exists now, so `len` is the whole file's.
@@ -184,9 +204,9 @@ impl SegmentedFile {
         }
     }
 
-    /// The segment holding `[offset, offset + len)`, finding segments added since this handle
-    /// last looked; a transfer across two segments, or past the last, is refused.
-    fn segment(&self, offset: u64, len: usize) -> Result<&Segment, DiskError> {
+    /// The segment holding `[offset, offset + len)` and its index, finding segments added since
+    /// this handle last looked; a transfer across two segments, or past the last, is refused.
+    fn segment(&self, offset: u64, len: usize) -> Result<(usize, &Segment), DiskError> {
         let end = offset
             .checked_add(u64::try_from(len).map_err(|_| beyond(&self.base, "a transfer past u64"))?)
             .ok_or_else(|| beyond(&self.base, "a transfer past u64"))?;
@@ -195,12 +215,13 @@ impl SegmentedFile {
                 .segments
                 .iter()
                 .map_while(OnceLock::get)
-                .find(|s| offset >= s.start && offset < s.start.saturating_add(s.len));
-            if let Some(s) = at {
+                .enumerate()
+                .find(|(_, s)| offset >= s.start && offset < s.start.saturating_add(s.len));
+            if let Some((index, s)) = at {
                 if end > s.start.saturating_add(s.len) {
                     return Err(beyond(&self.base, "a transfer across two segments"));
                 }
-                return Ok(s);
+                return Ok((index, s));
             }
             if offset < self.known_end() || self.find_next()?.is_none() {
                 return Err(beyond(
@@ -272,24 +293,19 @@ impl BlockFile for SegmentedFile {
     }
 
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), DiskError> {
-        let s = self.segment(offset, buf.len())?;
+        let (_, s) = self.segment(offset, buf.len())?;
         s.file.read_exact_at(buf, offset.saturating_sub(s.start))
     }
 
     fn read_resident_at(&mut self, buf: &mut [u8], offset: u64) -> Result<bool, DiskError> {
-        let start = self.segment(offset, buf.len())?.start;
-        let index = self
-            .segments
-            .iter()
-            .map_while(OnceLock::get)
-            .position(|s| s.start == start)
-            .ok_or_else(|| beyond(&self.base, "a segment lost from its slot"))?;
+        let (index, start) = self.segment(offset, buf.len()).map(|(i, s)| (i, s.start))?;
         let s = self
             .segments
             .get_mut(index)
             .and_then(OnceLock::get_mut)
             .ok_or_else(|| beyond(&self.base, "a segment lost from its slot"))?;
-        s.file.read_resident_at(buf, offset.saturating_sub(start))
+        s.file
+            .read_resident_with(buf, offset.saturating_sub(start), &mut self.epoch)
     }
 
     fn reads_resident(&self) -> bool {
@@ -301,7 +317,7 @@ impl BlockFile for SegmentedFile {
             .iter()
             .map_while(OnceLock::get)
             .map(|s| s.file.residency())
-            .fold(crate::Residency::default(), crate::Residency::plus)
+            .fold(self.epoch.residency(), crate::Residency::plus)
     }
 
     fn set_residency_shadow(&mut self, on: bool) {
@@ -312,9 +328,41 @@ impl BlockFile for SegmentedFile {
     }
 
     fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError> {
-        let s = self.segment(offset, buf.len())?;
+        let (_, s) = self.segment(offset, buf.len())?;
         s.dirty.store(true, Ordering::Release);
         s.file.write_all_at(buf, offset.saturating_sub(s.start))
+    }
+
+    /// Writes the copies through a handle of each segment they reach opened past the OS's cache
+    /// where the platform has a way ([`CachingRequest::PreferDirect`]): the bytes only make the
+    /// blocks written, and no read wants them held in memory, where they would take the place of
+    /// pages reads do want. The segment's flush makes them durable.
+    fn write_whole(&self, offset: u64, copies: u64, fill: &[u8]) -> Result<(), DiskError> {
+        let piece = u64::try_from(fill.len()).map_err(|_| beyond(&self.base, "a fill past u64"))?;
+        let mut aligned = AlignedBuf::zeroed(fill.len(), whole_align(self.align)?)?;
+        aligned.extend_from_slice(fill)?;
+        let fill = aligned.as_slice();
+        let mut at = offset;
+        let mut left = copies;
+        while left > 0 {
+            let (index, s) = self.segment(at, fill.len())?;
+            let direct = DeviceFile::open(
+                &segment_path(&self.base, index),
+                false,
+                CachingRequest::PreferDirect,
+                self.align,
+            )?;
+            s.dirty.store(true, Ordering::Release);
+            let end = s.start.saturating_add(s.len);
+            while left > 0 && at < end {
+                direct.write_all_at(fill, at.saturating_sub(s.start))?;
+                at = at
+                    .checked_add(piece)
+                    .ok_or_else(|| beyond(&self.base, "a transfer past u64"))?;
+                left = left.saturating_sub(1);
+            }
+        }
+        Ok(())
     }
 
     /// Flushes every segment written since its last flush: the base's flush alone would leave
@@ -351,7 +399,7 @@ impl BlockFile for SegmentedFile {
     }
 
     fn write_durable_at(&self, buf: &[u8], offset: u64) -> Result<Durable, DiskError> {
-        let s = self.segment(offset, buf.len())?;
+        let (_, s) = self.segment(offset, buf.len())?;
         s.file.write_durable_at(buf, offset.saturating_sub(s.start))
     }
 
@@ -364,6 +412,7 @@ impl BlockFile for SegmentedFile {
             align: self.align,
             segments,
             shadow: self.shadow,
+            epoch: crate::resident::Epoch::new(),
         };
         for (i, s) in self.segments.iter().map_while(OnceLock::get).enumerate() {
             copy.place(i, s.start, s.len, s.file.try_clone()?)?;
@@ -479,5 +528,93 @@ mod tests {
         assert_eq!(dirty(&file), vec![false, true, false, true]);
         file.sync_data().unwrap();
         assert_eq!(dirty(&file), vec![false, false, false, false]);
+    }
+
+    /// Do: write two segments whole with copies of a 16 KiB piece (a VM page on every target),
+    /// then overwrite one piece through the file. Expect: every piece holds the fill, each
+    /// segment reached is flushed with the file's next flush, and where the OS granted a handle
+    /// past its cache the pieces written whole are not in memory, while the piece overwritten
+    /// through the file is where it reads from memory.
+    #[test]
+    fn a_segment_written_whole_holds_its_fill_and_takes_no_memory() {
+        const PIECE: usize = 16384;
+        let piece = |fill: u8| {
+            let mut b = AlignedBuf::zeroed(PIECE, Alignment::new(PIECE).unwrap()).unwrap();
+            b.extend_from_slice(&[fill; PIECE]).unwrap();
+            b
+        };
+        let at = |i: u64| i * PIECE as u64;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("store");
+        let align = Alignment::new(ALIGN).unwrap();
+        let file = SegmentedFile::create(&base, CachingRequest::Buffered, align, 4).unwrap();
+        file.add(at(1)).unwrap();
+        file.add(at(2)).unwrap();
+        file.write_whole(0, 3, piece(7).as_slice()).unwrap();
+        assert!(file.write_whole(0, 4, piece(7).as_slice()).is_err());
+        let dirty: Vec<bool> = file
+            .segments
+            .iter()
+            .map_while(OnceLock::get)
+            .map(|s| s.dirty.load(Ordering::Acquire))
+            .collect();
+        assert_eq!(dirty, vec![false, true, true]);
+        // Whether this host's file system granted a handle past its cache, read before any read
+        // of the pieces could bring them into memory.
+        let direct = DeviceFile::open(
+            &segment_path(&base, 2),
+            false,
+            CachingRequest::PreferDirect,
+            align,
+        )
+        .unwrap()
+        .caching()
+            == crate::file::Caching::Direct;
+        let mut fresh = open(&base, 4);
+        let mut b = piece(0);
+        if direct {
+            for i in 0..3 {
+                assert!(!fresh.read_resident_at(b.as_mut_slice(), at(i)).unwrap());
+            }
+        }
+        fresh.write_all_at(piece(8).as_slice(), at(1)).unwrap();
+        assert_eq!(
+            fresh.read_resident_at(b.as_mut_slice(), at(1)).unwrap(),
+            fresh.reads_resident()
+        );
+        assert_eq!(
+            (read(&file, 0), read(&file, at(1)), read(&file, at(2))),
+            (7, 8, 7)
+        );
+        file.sync_data().unwrap();
+    }
+
+    /// Do: write a page into each of two segments through the cache, hold the file's epoch, read
+    /// each from memory twice, then move the epoch and read both again. Expect: each segment's
+    /// first read probes and its second is made on the kept answer; one move of the file's epoch
+    /// forgets both segments' answers; no read refreshes the held epoch.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn one_epoch_holds_every_segments_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("store");
+        let mut file = create(&base, 4);
+        file.add(4096).unwrap();
+        file.write_all_at(page(1).as_slice(), 0).unwrap();
+        file.write_all_at(page(2).as_slice(), 4096).unwrap();
+        file.epoch.hold();
+        let mut b = page(0);
+        let mut both = |file: &mut SegmentedFile| {
+            for (offset, fill) in [(0, 1), (4096, 2)] {
+                assert!(file.read_resident_at(b.as_mut_slice(), offset).unwrap());
+                assert_eq!(b.as_slice()[0], fill);
+            }
+            let r = file.residency();
+            (r.probes, r.skips, r.epochs)
+        };
+        assert_eq!(both(&mut file), (2, 0, 0));
+        assert_eq!(both(&mut file), (2, 2, 0));
+        file.epoch.move_on();
+        assert_eq!(both(&mut file), (4, 2, 0));
     }
 }

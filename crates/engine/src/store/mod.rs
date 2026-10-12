@@ -1330,14 +1330,8 @@ impl<F: BlockFile> Store<F> {
             }
         }
         let zeros = Self::run_buf(file.alignment(), self.config)?;
-        for i in 0..extents {
-            let offset = start
-                .checked_add(i)
-                .and_then(|e| e.checked_mul(bytes))
-                .ok_or(corrupt(Malformed::TooLarge))?;
-            file.write_all_at(zeros.as_slice(), offset)
-                .map_err(|e| io("write a store segment whole", e))?;
-        }
+        file.write_whole(at, extents, zeros.as_slice())
+            .map_err(|e| io("write a store segment whole", e))?;
         self.io.pages_written = self
             .io
             .pages_written

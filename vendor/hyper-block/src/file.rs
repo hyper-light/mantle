@@ -52,6 +52,9 @@ pub struct DeviceFile {
     node: bool,
     /// What this handle needs to read from memory alone ([`DeviceFile::read_resident_at`]).
     resident: crate::resident::Resident,
+    /// The epoch its kept answers hold in, unless a caller reading through several files
+    /// passes its own ([`DeviceFile::read_resident_with`]).
+    epoch: crate::resident::Epoch,
 }
 
 impl DeviceFile {
@@ -100,6 +103,7 @@ impl DeviceFile {
             layout,
             node,
             resident: crate::resident::Resident::new(),
+            epoch: crate::resident::Epoch::new(),
         })
     }
 
@@ -126,6 +130,7 @@ impl DeviceFile {
             node: self.node,
             // A duplicate maps its own window when it first reads from memory.
             resident: crate::resident::Resident::new(),
+            epoch: crate::resident::Epoch::new(),
         })
     }
 
@@ -210,11 +215,35 @@ impl DeviceFile {
     /// may wait ([`crate::issuer`]). A direct file has no OS cache to read from, so it never reads
     /// here.
     pub fn read_resident_at(&mut self, buf: &mut [u8], offset: u64) -> Result<bool, DiskError> {
+        self.read_resident(buf, offset, None)
+    }
+
+    /// [`Self::read_resident_at`], its answers kept in `epoch` rather than this handle's own: one
+    /// epoch for the files a caller reads as one (`crate::segmented`).
+    pub(crate) fn read_resident_with(
+        &mut self,
+        buf: &mut [u8],
+        offset: u64,
+        epoch: &mut crate::resident::Epoch,
+    ) -> Result<bool, DiskError> {
+        self.read_resident(buf, offset, Some(epoch))
+    }
+
+    fn read_resident(
+        &mut self,
+        buf: &mut [u8],
+        offset: u64,
+        shared: Option<&mut crate::resident::Epoch>,
+    ) -> Result<bool, DiskError> {
         if self.caching == Caching::Direct {
             return Ok(false);
         }
         self.check_alignment(offset, buf.len())?;
-        match self.resident.read(&self.file, buf, offset) {
+        let epoch = match shared {
+            Some(epoch) => epoch,
+            None => &mut self.epoch,
+        };
+        match self.resident.read(&self.file, buf, offset, epoch) {
             Ok(read) => Ok(read),
             Err(e) => Err(self.io_error("read from memory", e)),
         }
@@ -222,7 +251,7 @@ impl DeviceFile {
 
     /// What [`Self::read_resident_at`] did: probes, reads on kept answers, epochs.
     pub fn residency(&self) -> crate::Residency {
-        self.resident.residency()
+        self.resident.residency().plus(self.epoch.residency())
     }
 
     /// Shadow mode, for measurement: a read made on a kept answer probes anyway and counts the
@@ -899,7 +928,7 @@ mod tests {
         let page = 4096usize;
         let bytes: Vec<u8> = (0..4 * page).map(|i| (i % 251) as u8).collect();
         file.write_all_at(&bytes, 0).unwrap();
-        file.resident.hold_epoch();
+        file.epoch.hold();
         let mut buf = vec![0u8; page];
         let mut read = |file: &mut DeviceFile| {
             buf.fill(0);
@@ -913,7 +942,7 @@ mod tests {
         file.set_residency_shadow(true);
         assert_eq!(read(&mut file), (2, 2, 0));
         file.set_residency_shadow(false);
-        file.resident.move_epoch();
+        file.epoch.move_on();
         assert_eq!(read(&mut file), (3, 2, 0));
         assert_eq!(read(&mut file), (3, 3, 0));
     }
@@ -924,8 +953,8 @@ mod tests {
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_refresh_that_finds_the_epoch_moved_forgets_every_answer() {
-        let mut resident = crate::resident::Resident::new();
-        let (before, after) = resident.refresh_from_off_epoch();
+        let mut epoch = crate::resident::Epoch::new();
+        let (before, after) = epoch.refresh_from_off();
         assert_eq!(after, before + 1);
     }
 

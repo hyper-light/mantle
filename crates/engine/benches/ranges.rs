@@ -59,10 +59,6 @@ use mantle_engine::trunk::TrunkConfig;
 /// A range's store file: one file growing by its writes, or (`--segments`) segment files each
 /// written whole before use (hyper-block's `SegmentedFile`, docs/research/48).
 #[derive(Debug)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "one file a range, made once: the size between the variants costs nothing"
-)]
 enum BenchFile {
     One(DeviceFile),
     Segments(SegmentedFile),
@@ -104,6 +100,9 @@ impl BlockFile for BenchFile {
     }
     fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError> {
         each!(self, f => BlockFile::write_all_at(f, buf, offset))
+    }
+    fn write_whole(&self, offset: u64, copies: u64, fill: &[u8]) -> Result<(), DiskError> {
+        each!(self, f => BlockFile::write_whole(f, offset, copies, fill))
     }
     fn sync_data(&self) -> Result<(), DiskError> {
         each!(self, f => BlockFile::sync_data(f))
@@ -1053,6 +1052,7 @@ fn main() -> Result<(), BenchError> {
     }
     for path in paths {
         // A store kept as segments has `<path>.1` and on beside its base.
+        let mut lengths = Vec::new();
         for k in 1usize.. {
             let mut name = path.as_os_str().to_owned();
             name.push(format!(".{k}"));
@@ -1060,8 +1060,15 @@ fn main() -> Result<(), BenchError> {
             if !segment.exists() {
                 break;
             }
+            lengths.push(std::fs::metadata(&segment)?.len());
             std::fs::remove_file(segment)?;
         }
+        println!(
+            "store_file bytes {} segments {} segment_bytes {} lengths {lengths:?}",
+            std::fs::metadata(&path)?.len(),
+            lengths.len(),
+            lengths.iter().sum::<u64>()
+        );
         std::fs::remove_file(path)?;
     }
     Ok(())

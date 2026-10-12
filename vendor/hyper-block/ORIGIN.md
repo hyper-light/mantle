@@ -148,8 +148,13 @@ caller hands in the alignment, queue and measured depth it found.
     transfer lies within one segment; a flush covers the segments written since the last; the
     segments are at most a bound given at open. `BlockFile::grows_by_segments` and
     `BlockFile::grow` let a store add one (a plain file grows by its writes, as before), and
-    `Residency::plus` sums segments' counts. A file's own first writes hold up its other reads and
-    writes, another file's do not: mantle `docs/research/48-first-writes.md`.
+    `BlockFile::write_whole` writes a new segment's blocks once, through a handle past the OS's
+    cache (from a buffer aligned to the VM page, which macOS's cluster layer needs to write past
+    its cache), so its zeros take no memory a read wants. Reads made from memory keep one reclaim
+    epoch for the whole file (`resident::Epoch`, split from `Resident`, its generation 64 bits so
+    it never comes round again), and `Residency::plus` sums segments' counts. A file's own first
+    writes hold up its other reads and writes, another file's do not: mantle
+    `docs/research/48-first-writes.md`.
 
 ## Planned
 

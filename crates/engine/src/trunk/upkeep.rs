@@ -373,10 +373,16 @@ impl Trunk {
         if self.node(n)?.wants.is_some_and(|c| c.started) {
             return Ok(());
         }
-        // A leaf its in-flight bundles take past its bounds settles them with the rest: compacted
-        // into its bundle first, every entry they hold would be written again by the settle.
-        if self.node(n)?.leaf {
-            self.want_change(n)?;
+        // A leaf its in-flight bundles take past its bounds settles them with the rest when it can
+        // at once: compacted into its bundle first, every entry they hold would be written again
+        // by the settle.
+        if self.settles_now(n)? {
+            let parts = self.settle_parts(n)?;
+            self.node_mut(n)?.wants = Some(Change {
+                kind: ChangeKind::Settle { parts },
+                started: false,
+            });
+            return self.plan_settle(n);
         }
         let pivots = self.node(n)?.pivots.len();
         for i in 0..pivots {
@@ -394,14 +400,41 @@ impl Trunk {
     }
 
     /// Whether pivot `i` of node `n` has live in-flight bundles and no compaction yet, and is
-    /// not held for a child that will split, nor a leaf's whose settle takes them.
+    /// not held for a child that will split.
     fn compaction_due(&self, n: usize, i: usize) -> Result<bool, Error> {
         let node = self.node(n)?;
         let pivot = node.pivots.get(i).ok_or(corrupt())?;
         Ok(node.inflight.len() > pivot.start
-            && !(node.leaf && node.wants.is_some())
             && !self.compacting(n, &pivot.key)
             && !self.held(pivot)?)
+    }
+
+    /// Whether leaf `n` settles its live in-flight bundles with the rest now rather than
+    /// compacting them into its bundle first: they take it past its bounds, nothing is in
+    /// progress on it, and the settle need not wait, making one leaf or finding its parent's
+    /// pivot empty with no compaction out. A settle that would wait leaves them to be compacted
+    /// as they come, so the sources a read opens stay bounded meanwhile (a 10M fill that held
+    /// them for a waiting split ended with one split where seven were due and its queries read
+    /// 2.2 times the pages; benchmark-results/mantle-settleflight-20261012).
+    fn settles_now(&self, n: usize) -> Result<bool, Error> {
+        let node = self.node(n)?;
+        if !node.leaf || node.wants.is_some() || self.tasks.iter().any(|t| t.node == n) {
+            return Ok(false);
+        }
+        let pivot = node.pivots.first().ok_or(corrupt())?;
+        if node.inflight.len() <= pivot.start {
+            return Ok(false);
+        }
+        let (count, branches) = self.leaf_load(n)?;
+        if branches <= self.config.fanout && count <= self.config.leaf_entries {
+            return Ok(false);
+        }
+        if self.settle_parts(n)? <= 1 || n == self.root {
+            return Ok(true);
+        }
+        let (parent, i) = self.parent_of(n)?;
+        let p = self.node(parent)?.pivots.get(i).ok_or(corrupt())?;
+        Ok(p.bundle.branches().is_empty() && !self.compacting(parent, &p.key))
     }
 
     /// Whether a compaction of node `n`'s pivot keyed `key` is planned or out.
@@ -536,9 +569,8 @@ impl Trunk {
     }
 
     /// Notes the change node `n` wants, if any: a leaf past `fanout` branches or `leaf_entries`
-    /// entries with its live in-flight bundles ([`Self::leaf_load`]), or one seeks paid to
-    /// consolidate, settles; an index node past `fanout` pivots splits. A change that splits
-    /// queues the parent, whose pivot flushes down to it.
+    /// entries, or one seeks paid to consolidate, settles; an index node past `fanout` pivots
+    /// splits. A change that splits queues the parent, whose pivot flushes down to it.
     fn want_change(&mut self, n: usize) -> Result<(), Error> {
         let fanout = self.config.fanout;
         let consolidating = self.consolidating;
@@ -550,10 +582,11 @@ impl Trunk {
         let live = node.pivots.iter().any(|p| node.inflight.len() > p.start);
         let kind = if node.leaf {
             let pivot = node.pivots.first().ok_or(corrupt())?;
+            let count = entries(pivot.bundle.branches());
             let was_paid = consolidating && pivot.seek.paid;
-            let (count, branches) = self.leaf_load(n)?;
-            let paid = was_paid && branches > 1;
-            if !paid && branches <= fanout && count <= self.config.leaf_entries {
+            let paid = was_paid && pivot.bundle.branches().len() > 1;
+            if !paid && pivot.bundle.branches().len() <= fanout && count <= self.config.leaf_entries
+            {
                 // Paid with one branch: nothing to rewrite once the leaf's own compactions are
                 // in (a consolidation's flush may still be on its way down), then the rent is
                 // spent; the apply of a compaction due or out looks at the leaf again.

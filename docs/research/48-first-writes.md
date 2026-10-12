@@ -111,7 +111,8 @@ disks saturating, every mode alike, and decide nothing here.
 ## 5. The store grows by segments
 
 So the store's file grows by segments (hyper-block `SegmentedFile`): a segment is created whole at
-its final length, written whole with zeros by a maintenance worker while no other transfer uses it,
+its final length, written whole with zeros by a maintenance worker, past the OS's cache (§6), while
+no other transfer uses it,
 and only then are its extents handed out, so every transfer to a segment in use is an overwrite
 (the zeros as PostgreSQL's WAL segments take them [pg], and as NTFS's valid data length needs
 [ntfs]). The allocator stops at the extents admitted; the shard books the next segment when fewer
@@ -119,3 +120,77 @@ are left than a segment, which starts at a packing's grant and doubles whenever 
 for one; a packing, a compaction or a worker's ask that does not fit waits for the growth. Opened,
 the segments holding an extent ever handed out are admitted, and a segment past them, which a crash
 may have left unwritten, is written again before use.
+
+## 6. Writing a segment whole
+
+The first A/B of segments (`benchmark-results/mantle-segments-20261012`: segments 0906dfe against
+the merge tree 5317963 and RocksDB, interleaved) found three costs, each work the design did not
+need:
+
+- Every segment kept its own reclaim epoch (research/46), so a read refreshed the epoch of the
+  segment it reached: 473–637 K refreshes during a 10M run's queries against 3.7–62 K for one file,
+  and reads 0.74 times the merge tree's. One epoch now serves all of a file's segments (39 K).
+- The zeros went through the page cache, memory no read wants: those runs had 126–298 K file pages
+  reclaimed each, against 0–148 K beside the merge tree, and reads probed residency 6–8 times as
+  often. They now go through a handle past the cache.
+- A segment doubled at every look while a grant waited, not once a growth: beside F_FULLFSYNC every
+  10M fill, and one 100M fill, asked APFS for a segment past the free space (ENOSPC). A segment now
+  doubles at most once a booking, and never past the file's size.
+
+The second (`mantle-segments2-20261012`, 8dcf196) found the writing itself too slow under load:
+one 128 KiB write at a time, each waiting for the device. Beside F_FULLFSYNC its fills ran at 652 K
+puts/s, 0.76 times RocksDB, with 3–4 stalls each and a slowest put of 6.4 s, where the merge tree's
+stalled 2–3 times each, its slowest 1.84 s. A 256 MiB segment written whole
+(`benchmark-results/mantle-zfill-20261012`, `zfill.c`; 3 to 6 rounds each, interleaved, the host
+as it was):
+
+| written | beside F_FULLFSYNC | beside nothing added |
+|---|---|---|
+| 128 KiB a write, past the cache | 7.5–9.9 s | 1.3–2.1 s |
+| 128 KiB a write through the cache, then one flush | 4.1–4.5 s | 0.42–0.85 s |
+| 1 MiB a write, past the cache | 1.0–1.4 s | 0.23–0.58 s |
+| 8 MiB a write, past the cache | 0.12–0.33 s | 0.03–0.15 s |
+| 64 MiB a write, past the cache | 0.06–0.20 s | 0.04–0.07 s |
+| pwritev(2), 1,024 vectors all one 128 KiB buffer, past the cache | 61–66 ms | 33–50 ms |
+
+The device has in flight what a call hands it at once: XNU's cluster layer issues a direct write's
+pieces asynchronously and goes on to a vectored write's next vector without waiting
+(`bsd/vfs/vfs_cluster.c`, `cluster_write_direct`, `next_dwrite`). So a segment's copies go in
+pwritev(2) calls of as many vectors as `IOV_MAX`, every one the same buffer
+(`DeviceFile::write_copies_at`, Linux and macOS): as fast as one 64 MiB write, from 1/512 of its
+memory. Beside the same flushes a 10M fill then ran at 2.52 M puts/s with no stall, its slowest put
+572 µs (`benchmark-results/mantle-segments3-20261012/probe`).
+
+On every target's runner (`benchmark-results/mantle-wholefill-20261012`, CI run 38310978631,
+`crates/disk/benches/wholefill.rs` on branch `iobench/wholefill`; median ms of three rounds, the
+same 256 MiB, beside nothing added / beside a writer making the platform's full flushes):
+
+| target | 128 KiB a write | 1 MiB | 8 MiB | 64 MiB | `write_copies_at` |
+|---|---|---|---|---|---|
+| Linux x86_64 | 645 / 744 | 641 / 648 | 648 / 648 | 649 / 648 | 695 / 648 |
+| Linux aarch64 | 854 / 944 | 764 / 783 | 792 / 646 | 646 / 645 | 803 / 795 |
+| macOS aarch64 | 245 / 427 | 78 / 96 | 73 / 52 | 40 / 31 | 31 / 26 |
+| macOS x86_64 (Rosetta 2) | 90 / 63 | 55 / 50 | 76 / 51 | 64 / 51 | 52 / 45 |
+| Windows x86_64 | 963 / 1,677 | 962 / 1,066 | 960 / 981 | 955 / 967 | 963 / 1,686 |
+| Windows aarch64 | 3,779 / 7,141 | 1,526 / 1,531 | 1,534 / 1,547 | 1,541 / 1,526 | 3,840 / 7,295 |
+
+The Linux runners' disks write about 0.4 GB/s whatever the way, so every way there is the disk;
+pwritev(2) keeps up with the largest writes on Linux and leads on macOS. On Windows, where
+`write_copies_at` still wrote a copy at a time, one 128 KiB write at a time took 1.7–4.7 times as
+long as writes of 1 MiB or more. NTFS's own gather write, `WriteFileGather`, writes from a list of
+pages, each page-aligned and ended by a null, through a handle opened past the cache for
+overlapped I/O (Microsoft, "WriteFileGather function"); every element may name a page of the same
+buffer. So on Windows a file past the cache takes gather writes of a 128 KiB fill's copies, as
+many a call as an element list no larger than the fill names (64 MiB), hyper-block's `gather`.
+
+The third (`mantle-segments3-20261012`, e44d9e5) still read less than the merge tree wherever the
+host reclaimed file pages during a run, and segments runs saw reclaim far more often: 8 of 11
+against 2 of 11. The cause was the handles, not the writes. Vectored writes past the cache leave
+none of a 256 MiB segment's 16,384 pages in memory (`mantle-zfill-20261012/zres.c`), and both
+arms' stores held the same pages at the end of their fills and their queries (1,444–1,474 MiB and
+1,791–1,816 MiB, `mantle-reclaim-20261012`). But every handle made a slot for each segment its
+bound allowed: about 30 K slots of some 500 bytes, the bench's bound being the open-file limit
+over the handles a file takes, made again by every worker that opened one. A 10M fill's setup
+touched 4.9 GB (313,692 page faults and 520 bytes a put, against 344 and 7.4 for one file). Slots
+now sit in chunks of 1, 2, 4 and on, each made when a segment reaches it (Dechev, Pirkelbauer and
+Stroustrup's bucket layout, OPODIS 2006): the same setup touches 473 pages.

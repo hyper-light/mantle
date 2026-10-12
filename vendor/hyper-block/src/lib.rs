@@ -26,6 +26,8 @@ pub mod block;
 pub mod buf;
 pub mod commit;
 pub mod file;
+#[cfg(windows)]
+mod gather;
 #[cfg(all(target_vendor = "apple", any(test, feature = "sim")))]
 pub mod image;
 pub mod issuer;

@@ -4274,6 +4274,23 @@ mod frozen_tests {
         }
     }
 
+    /// Waits for a message from a worker out on a job, which frees it ([`Pool::wait_any`]), the
+    /// frozen memtables' feeds given their buffers first, since a worker waiting for its feed
+    /// sends nothing.
+    fn until_a_worker_is_free(db: &mut ShardDb<Held>) {
+        db.feed_from(u64::MAX, false, false).unwrap();
+        let open: Vec<usize> = db
+            .frozen
+            .iter()
+            .filter_map(|f| f.feed.as_ref().map(|feed| feed.ticket.worker))
+            .collect();
+        let ShardDb { trunk, store, .. } = db;
+        assert!(
+            trunk.pool_mut().unwrap().wait_any(store, open).unwrap(),
+            "every worker is out, and none has a job to answer"
+        );
+    }
+
     /// Puts until the packing memtable is out on a worker that has none of its entries yet (its
     /// feed's buffers all still in hand), then stalls that worker's writes, failing the first
     /// after the stall when `fail`; puts through the rotation that freezes it, feeds it what its
@@ -4295,6 +4312,18 @@ mod frozen_tests {
                     "a buffer reached the worker before its stall was armed"
                 );
                 break f.ticket.worker;
+            }
+            // Its order paid and every worker out on another job, as on a host of few cores
+            // while the trunk compacts: a put would only fill the next memtable, so the shard
+            // waits, putting nothing, for a worker's message, which frees that worker for it.
+            if db
+                .packing
+                .as_ref()
+                .is_some_and(|p| p.walk.is_some() && p.feed.is_none() && p.builder.is_none())
+                && !db.trunk.pool_mut().unwrap().can_take(true)
+            {
+                until_a_worker_is_free(db);
+                continue;
             }
             assert_eq!(
                 db.flush_stats.rotations, rotations,

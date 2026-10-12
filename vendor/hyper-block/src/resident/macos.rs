@@ -338,14 +338,24 @@ impl Resident {
                 self.counts.wrong = self.counts.wrong.saturating_add(1);
             }
             self.counts.skips = self.counts.skips.saturating_add(1);
-            return Self::read_now(file, buf, offset);
+            let t = std::time::Instant::now();
+            let read = Self::read_now(file, buf, offset);
+            let ns = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            self.counts.skip_ns = self.counts.skip_ns.saturating_add(ns);
+            self.counts.skip_max_ns = self.counts.skip_max_ns.max(ns);
+            return read;
         }
         match self.probe(file, first, end)? {
             Some(true) => {
                 if self.epoch.is_some() {
                     self.answer(p0, p1);
                 }
-                Self::read_now(file, buf, offset)
+                let t = std::time::Instant::now();
+                let read = Self::read_now(file, buf, offset);
+                let ns = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                self.counts.probed_ns = self.counts.probed_ns.saturating_add(ns);
+                self.counts.probed_max_ns = self.counts.probed_max_ns.max(ns);
+                read
             }
             _ => Ok(false),
         }

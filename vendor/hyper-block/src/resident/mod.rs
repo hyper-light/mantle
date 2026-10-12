@@ -29,7 +29,9 @@ pub(crate) use macos::Resident;
 /// What a handle's reads from memory did ([`crate::block::BlockFile::residency`]): probes made,
 /// reads made on an earlier probe's answer instead (macOS, mantle `docs/research/46-reclaim-epochs.md`),
 /// epochs read and the changes among them that forgot every answer, and, in shadow mode, the
-/// answers a probe made anyway found wrong.
+/// answers a probe made anyway found wrong. The reads' own time, in all and at the most, apart
+/// for reads made on answers and reads made after a probe found the pages resident: an answer gone
+/// stale makes its read wait for the device, which only these times show without shadow mode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Residency {
     pub probes: u64,
@@ -37,6 +39,10 @@ pub struct Residency {
     pub epochs: u64,
     pub changes: u64,
     pub wrong: u64,
+    pub skip_ns: u64,
+    pub skip_max_ns: u64,
+    pub probed_ns: u64,
+    pub probed_max_ns: u64,
 }
 
 /// A handle's state for reads made only from memory: whether the kernel refused `RWF_NOWAIT`.

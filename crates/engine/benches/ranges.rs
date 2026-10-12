@@ -390,9 +390,14 @@ impl Workload {
 fn stats(name: &str, counters: &[RangeStats]) {
     for (range, (f, t, io)) in counters.iter().enumerate() {
         println!(
-            "{name} range {range} flushes {} stalls {} waited_steps {} pivot_compactions {} leaf_compactions {} splits {} entries_written {} consolidations {} merge_units {} merge_ns {} io reads {} pages_read {} submitted {} pages_written {} syncs {} queued {} queued_most {} write_waits {} prefetches {} prefetch_waits {} cache_hits {} span_cache_hits {} device_reads {} resident_reads {} device_read_ns {} resident_probes {} resident_skips {} residency_epochs {} residency_changes {} residency_wrong {}",
+            "{name} range {range} flushes {} stalls {} stalls_packing {} stalls_frozen {} stalls_room {} feed_waits {} stall_max_ns {} waited_steps {} pivot_compactions {} leaf_compactions {} splits {} entries_written {} consolidations {} merge_units {} merge_ns {} io reads {} pages_read {} submitted {} pages_written {} syncs {} queued {} queued_most {} write_waits {} prefetches {} prefetch_waits {} cache_hits {} span_cache_hits {} device_reads {} resident_reads {} device_read_ns {} resident_probes {} resident_skips {} residency_epochs {} residency_changes {} residency_wrong {} skip_ns {} skip_max_ns {} probed_ns {} probed_max_ns {}",
             f.flushes,
             f.stalls,
+            f.stalls_packing,
+            f.stalls_frozen,
+            f.stalls_room,
+            f.feed_waits,
+            f.stall_max_ns,
             f.waited_steps,
             t.pivot_compactions,
             t.leaf_compactions,
@@ -420,7 +425,11 @@ fn stats(name: &str, counters: &[RangeStats]) {
             io.residency.skips,
             io.residency.epochs,
             io.residency.changes,
-            io.residency.wrong
+            io.residency.wrong,
+            io.residency.skip_ns,
+            io.residency.skip_max_ns,
+            io.residency.probed_ns,
+            io.residency.probed_max_ns
         );
     }
 }

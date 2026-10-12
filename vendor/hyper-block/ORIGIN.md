@@ -136,8 +136,9 @@ caller hands in the alignment, queue and measured depth it found.
     that `mincore(2)` found its pages resident, and reads them again without probing while the
     pageout scan's file-backed reclamation counts (`vm.pageout_freed_*`) stay unchanged; they are
     read again before free memory could reach the kernel's free target at the fastest fill a Mac
-    has. `Residency` counts probes, reads on kept answers, epochs and changes, and in shadow mode
-    the kept answers a probe found wrong (`BlockFile::residency`,
+    has. `Residency` counts probes, reads on kept answers, epochs and changes, in shadow mode the
+    kept answers a probe found wrong, and the time of reads made on kept answers apart from reads
+    made after a probe, in all and at the most (`BlockFile::residency`,
     `BlockFile::set_residency_shadow`, `Attached::residency`, `Attached::set_residency_shadow`).
     Mantle `docs/research/46-reclaim-epochs.md`.
 

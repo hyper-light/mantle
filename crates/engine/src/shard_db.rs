@@ -63,6 +63,15 @@ pub struct FlushStats {
     pub stalls: u64,
     pub stall_ns: u64,
     pub stall_max_ns: u64,
+    /// Stalls by what the rotation waited for: a packing no worker took, more packings out than
+    /// the measured overlap, the root without room for another branch.
+    pub stalls_packing: u64,
+    pub stalls_frozen: u64,
+    pub stalls_room: u64,
+    /// Times a put yielded, or waited, for a packing worker to give a feed buffer back, the
+    /// share owed unfed: the fill held to the workers' pace a buffer at a time
+    /// ([`ShardDb::pay_due`]).
+    pub feed_waits: u64,
     /// Nanoseconds in memtable inserts, in rotations (a full memtable handed to packing, its
     /// stall included), and in forgetting freed pages: in all, timed only as the rest are.
     /// Memtables rotated: filled, and handed to packing.
@@ -286,6 +295,9 @@ struct Rotation {
     finish_packing: bool,
     most: Option<usize>,
     stalled: bool,
+    /// What it stalled for, each counted once: a packing no worker took, packings past the
+    /// overlap, the root without room.
+    causes: [bool; 3],
 }
 
 /// One retained durability operation. Its index and phases survive a canceled borrowed wait.
@@ -1726,6 +1738,10 @@ impl<F: BlockFile> ShardDb<F> {
                 detail: "the store was fenced by a failed write or flush".into(),
             });
         }
+        if self.feed_due() > 0 && !self.pay_due(false)? {
+            self.flush_stats.feed_waits = self.flush_stats.feed_waits.saturating_add(1);
+            self.pay_due(true)?;
+        }
         self.trim();
         // A write makes the key's cached record stale: it goes before the write is answered.
         if let Some(r) = self.records.as_mut() {
@@ -1763,6 +1779,10 @@ impl<F: BlockFile> ShardDb<F> {
             });
         }
         self.trunk.clear_io_wait();
+        if self.feed_due() > 0 && !self.pay_due(false)? {
+            self.flush_stats.feed_waits = self.flush_stats.feed_waits.saturating_add(1);
+            return Ok(false);
+        }
         if self.rotation.is_some() && !self.rotate_paced(keys)? {
             return Ok(false);
         }
@@ -2356,7 +2376,9 @@ impl<F: BlockFile> ShardDb<F> {
         let left = self.pack_left();
         if left > 0 {
             // The memtable rotates when a put no longer fits, before its room reaches nothing:
-            // packing is paced over the room a put of this size leaves, so it ends first.
+            // packing is paced over the room a put of this size leaves, so it ends first. A feed
+            // whose worker holds both its buffers takes nothing; what the next rotation would
+            // wait for is then paid down before the room runs out ([`Self::feed_due`]).
             let room = room.saturating_sub(bytes);
             let w = share(left, bytes, room, &mut self.pack_carry);
             self.flush_stats.pack_share_most = self.flush_stats.pack_share_most.max(w);
@@ -2730,6 +2752,58 @@ impl<F: BlockFile> ShardDb<F> {
         let held = u64::try_from(self.frozen.len()).unwrap_or(u64::MAX);
         self.flush_stats.frozen_most = self.flush_stats.frozen_most.max(held);
         self.pack_carry = 0;
+    }
+
+    /// The unfed entries the next rotation would wait for, past what the active memtable's room
+    /// can still hold at their mean entry: none while they fit. The rotation leaves the measured
+    /// overlap's packings out ([`Self::frozen_most`]) and waits for the older ones whole, so those
+    /// are paid down while puts still come, at the workers' pace a buffer at a time, rather than
+    /// all at the rotation (bLSM's gear: Sears and Ramakrishnan, SIGMOD 2012). Packings inside the
+    /// overlap are never waited for here, however starved: room absorbs them, as before.
+    fn feed_due(&self) -> u64 {
+        let feeding = usize::from(self.packing.as_ref().is_some_and(|p| p.feed.is_some()));
+        let waited = self
+            .frozen
+            .len()
+            .saturating_add(feeding)
+            .saturating_sub(self.frozen_most());
+        if waited == 0 {
+            return 0;
+        }
+        let (unfed, bytes, entries) = self
+            .frozen
+            .iter()
+            .take(waited)
+            .filter(|f| f.feed.is_some())
+            .fold((0u64, 0usize, 0usize), |(u, b, e), f| {
+                (
+                    u.saturating_add(
+                        u64::try_from(f.mem.len().saturating_sub(f.packed)).unwrap_or(u64::MAX),
+                    ),
+                    b.saturating_add(f.mem.bytes()),
+                    e.saturating_add(f.mem.len()),
+                )
+            });
+        let mean = bytes.checked_div(entries).unwrap_or(1).max(1);
+        let room = self.mem.room().checked_div(mean).unwrap_or(0);
+        unfed.saturating_sub(u64::try_from(room).unwrap_or(u64::MAX))
+    }
+
+    /// Feeds the due entries past the room ([`Self::feed_due`]): true once none are. The shares'
+    /// own work goes first, which may start or feed a younger packing; with `wait`, it then waits
+    /// for the oldest feeds' buffers, never for a whole packing's result.
+    fn pay_due(&mut self, wait: bool) -> Result<bool, Error> {
+        let due = self.feed_due();
+        if due == 0 {
+            return Ok(true);
+        }
+        self.pack_some(due, false)?;
+        let due = self.feed_due();
+        if due > 0 && wait {
+            self.feed_from(due, true, false)?;
+            self.take_packs(false)?;
+        }
+        Ok(self.feed_due() == 0)
     }
 
     /// The entries still to feed: the frozen memtables' and the packing one's, with its order
@@ -3324,6 +3398,7 @@ impl<F: BlockFile> ShardDb<F> {
                 finish_packing,
                 most: None,
                 stalled: finish_packing,
+                causes: [finish_packing, false, false],
             });
         }
         if self.rotation.as_ref().is_some_and(|r| r.finish_packing) {
@@ -3359,6 +3434,7 @@ impl<F: BlockFile> ShardDb<F> {
         if self.frozen.len() > most {
             if let Some(r) = self.rotation.as_mut() {
                 r.stalled = true;
+                r.causes[1] = true;
             }
             let n = self.frozen.len().saturating_sub(most);
             let left = self
@@ -3379,6 +3455,7 @@ impl<F: BlockFile> ShardDb<F> {
         if !self.trunk.has_room() {
             if let Some(r) = self.rotation.as_mut() {
                 r.stalled = true;
+                r.causes[2] = true;
             }
             if self.trunk.packing_blocks_dispatch() {
                 // A packing holds every seat and can still need owner-fed input. Pay its
@@ -3411,13 +3488,22 @@ impl<F: BlockFile> ShardDb<F> {
         };
         self.flush_stats.rotate_ns = self.flush_stats.rotate_ns.saturating_add(ns);
         if r.stalled {
-            let f = &mut self.flush_stats;
-            f.stalls = f.stalls.saturating_add(1);
-            f.stall_ns = f.stall_ns.saturating_add(ns);
-            f.stall_max_ns = f.stall_max_ns.max(ns);
+            self.count_stall(ns, r.causes);
         }
         self.rotated = Some(std::time::Instant::now());
         Ok(true)
+    }
+
+    /// A stall of `ns` and what it waited for.
+    fn count_stall(&mut self, ns: u64, causes: [bool; 3]) {
+        let f = &mut self.flush_stats;
+        f.stalls = f.stalls.saturating_add(1);
+        f.stall_ns = f.stall_ns.saturating_add(ns);
+        f.stall_max_ns = f.stall_max_ns.max(ns);
+        let [packing, frozen, room] = causes;
+        f.stalls_packing = f.stalls_packing.saturating_add(u64::from(packing));
+        f.stalls_frozen = f.stalls_frozen.saturating_add(u64::from(frozen));
+        f.stalls_room = f.stalls_room.saturating_add(u64::from(room));
     }
 
     /// Packs every memtable and finishes its maintenance before a range starts durability.
@@ -3467,10 +3553,12 @@ impl<F: BlockFile> ShardDb<F> {
         }
         let t = if self.timed { Some(now) } else { None };
         let mut stalled = false;
+        let mut causes = [false; 3];
         if self.packing.as_ref().is_some_and(|p| p.feed.is_none()) && !self.hand_off_packing()? {
             // Every worker busy: the shard builds it, its branch after the older ones'.
             self.finish_packing()?;
             stalled = true;
+            causes[0] = true;
         }
         if self.packing.as_ref().is_some_and(|p| p.feed.is_some()) {
             // Handed to a worker: frozen as it is, later puts feeding what is left, while the
@@ -3483,6 +3571,7 @@ impl<F: BlockFile> ShardDb<F> {
         while self.frozen.len() > most {
             self.wait_oldest(self.frozen.len().saturating_sub(most))?;
             stalled = true;
+            causes[1] = true;
         }
         if !self.trunk.has_room() {
             if self.trunk.packing_blocks_dispatch() {
@@ -3492,13 +3581,10 @@ impl<F: BlockFile> ShardDb<F> {
             }
             self.trunk.make_room(&mut self.store)?;
             stalled = true;
+            causes[2] = true;
         }
         if stalled {
-            let ns = ns_since(t);
-            let f = &mut self.flush_stats;
-            f.stalls = f.stalls.saturating_add(1);
-            f.stall_ns = f.stall_ns.saturating_add(ns);
-            f.stall_max_ns = f.stall_max_ns.max(ns);
+            self.count_stall(ns_since(t), causes);
         }
         let fresh = match self.spare.take() {
             Some(m) => m,

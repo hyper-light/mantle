@@ -209,7 +209,7 @@ fn run(call: Call) {
         KEY,
         Op::Put,
         VALUE,
-        mantle_engine::maplet::hash32(filter::hash(KEY)),
+        filter::hash32(filter::hash(KEY)),
     )
     .unwrap();
     full.try_send(bytes).unwrap();

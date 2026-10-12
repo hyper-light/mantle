@@ -143,7 +143,7 @@ fn a_physical_job_failure_stays_first_after_native_worker_join_failure() {
         key,
         crate::branch::Op::Put,
         b"value",
-        crate::maplet::hash32(crate::branch::filter::hash(key)),
+        crate::branch::filter::hash32(crate::branch::filter::hash(key)),
     )
     .unwrap();
     full.try_send(bytes).unwrap();

@@ -186,7 +186,7 @@ under load, at moderate load and saturated.
 - **Checksums.** Every page carries a header checksum (CRC-32C, as the chunk store's frames)
   over its contents and its own address, so a page read from the wrong place fails like a
   corrupt one.
-- **Immutability.** Pages of branches, maplets and trunk nodes are immutable once written:
+- **Immutability.** Pages of branches and trunk nodes are immutable once written:
   copy-on-write, reference-counted per extent.
 - **Superblock.** Two alternating copies at fixed places, each with a generation and a
   checksum, written only after the data it names is durable; open takes the newest valid copy
@@ -196,7 +196,7 @@ under load, at moderate load and saturated.
   persists the map with each checkpoint, behind the superblock's generation, and can also rebuild
   it by walking from the root. A test compares the two after every simulated crash.
 
-## 4. The tree: SplinterDB's size-tiered Bε-tree with maplets
+## 4. The tree: SplinterDB's size-tiered Bε-tree
 
 The structure is research/34 §1–§2.
 - **Branches** are immutable B-trees of 4 KiB pages, built by packing sorted data. Their index
@@ -204,8 +204,9 @@ The structure is research/34 §1–§2.
 - **Trunk nodes** carry pivots, a pivot bundle each and inflight bundles shared by the pivots.
 - **Flush-then-compact.** A memtable becomes a branch, and a flush hands bundles down by
   reference. Compaction folds one pivot's inflight bundles into a single branch.
-- **Maplets.** One per pivot maps keys to the branches that may hold them, merged sequentially
-  as branches arrive.
+- **Filters.** SplinterDB keeps one maplet per pivot (its routing filter), merged as branches
+  arrive, instead of per-branch filters. Mantle keeps a blocked Bloom filter per branch: maplets
+  were built two ways, A/B'd against it to 1B keys, and removed (below).
 
 What mantle changes, and why:
 - **Who compacts.** Bundle compaction runs as tasks of the replica's own shard, scheduled by §6.
@@ -215,12 +216,26 @@ What mantle changes, and why:
   - the task queue;
   - the branches a range iterator collects (SplinterDB's cap is 256; mantle derives it from `F`
     and the height).
-- **Parameters by measurement.** The fanout `F`, the memtable size `m` and the maplet hash width
-  are measured on the running hardware and against mantle's key counts. SplinterDB chose 8,
-  24 MiB and 26 bits without a measurement (research/34 §1). The false-positive rate per query
-  follows from the width and the count (`n·2^−h`), so `h` is derived from the leaf size `F·m`
-  and a target rate the owner signs off.
+- **Parameters by measurement.** The fanout `F` and the memtable size `m` are measured on the
+  running hardware and against mantle's key counts. SplinterDB chose 8 and 24 MiB without a
+  measurement (research/34 §1).
 - **Checksums everywhere** (§3), where SplinterDB has none on data pages.
+
+**Maplets were built, measured and removed** (2026-10-11; research/43 §3–4). Two designs, A/B'd
+in interleaved rounds against per-branch filters with no maplets:
+- bought by gets' measured rent: the read phase carries the builds it buys (reads 198K at 100M
+  against 438K);
+- SplinterDB's paged routing filters: no Bloom filters, each branch's own maplet in its pages,
+  bundle maplets merged on workers at every bundle change and read through the cache. A get
+  reads its maplet's page where a filter answers from memory: fill 1.90M, reads 354K, seeks 59K
+  at 100M against 2.10M, 438K, 63K. At 1B it fills 29% slower even with its block indexes in
+  memory (the trunk image cannot name the extents they take; SplinterDB keeps them in pages, a
+  page read more a probe). Its 1B seeks were twice none's, from the trunk its slower fill left
+  (seeks read no maplet; research/43 §4).
+Each branch also kept its keys' sorted 32-bit hashes, 4 bytes a key, for maplets to merge from:
+gone with them. The filters' resident memory (10 bits a key) is what paged filters would save; a
+filter kept in pages and read through the cache, as RocksDB's partitioned filters are, bounds it
+when it binds, and is measured then.
 
 ## 5. Reads
 
@@ -229,9 +244,9 @@ What mantle changes, and why:
    that takes half the gets, in memory with in-place updates. Its size and admission are
    measured, and S3-FIFO governs the cache (row 14). It never holds a value the tree does not
    also have durably by checkpoint or Raft log.
-3. **The tree.** Root to leaf; at each node the maplet names the branches to probe. With the
-   filters and branch interiors in memory, a cold get costs about one device read (research/34
-   §1).
+3. **The tree.** Root to leaf; at each node each branch's filter is asked before its leaf is
+   read. With the filters and branch interiors in memory, a cold get costs about one device read
+   (research/34 §1).
 4. **Seeks and listings.** A scan merges a cursor per branch on its path; a SuRF-style range
    filter answers "nothing in this prefix" without reading (research/33 row 8). REMIX views were
    built and measured, and removed (below).
@@ -562,7 +577,7 @@ Mac under load, 2026-10-07; benches/shard_db.rs `attribute`):
 The structure is research/33 §5's seven parts, each a step below with the evidence it is held to:
 1. shared-nothing key-range shards, a worker each, requests batched per shard (p²KVS);
 2. a log with several group commits in flight (SpanDB), and the log as level 0 (TRIAD);
-3. SplinterDB's size-tiered Bε-tree with maplets, compacted by its shard, the compaction's
+3. SplinterDB's size-tiered Bε-tree, compacted by its shard, the compaction's
    granularity aligned to the last level (Spooky);
 4. SuRF range filters for listings (REMIX views measured and removed, research/43);
 5. an F2-style in-place hot region and read cache, S3-FIFO for the caches;
@@ -579,7 +594,7 @@ both sides, and landed before the next:
 | E2 | Shards: a range replica's engine on one hyper-rt shard, its requests batched, no state shared across shards | 1 | writes up to 4.6×, reads up to 5.4× (p²KVS, asynchronous log there; measured here with the durable one) |
 | E3 | Memtable (concurrent B-tree) and branch packing | 3 | flush cost |
 | E4 | Trunk, flush-then-compact, bundle compaction on the shard's tasks, granularity aligned to the last level | 3 | inserts 6–10×, write amplification 2× lower (SplinterDB); total write amplification with the device's GC about 2.5× lower (Spooky) |
-| E5 | Per-branch blocked Bloom filters (landed first: a read probes only branches that may hold its key), then maplets routing a key to its pivot's branches with one lookup in less space | 3 | queries up to 1.8×, space overhead 15–61% (maplets, abstract-level evidence); measured with filters: reads 1.2–1.7× RocksDB at 10 M (benches/shard_db.rs) |
+| E5 | Per-branch blocked Bloom filters: a read probes only branches that may hold its key. Maplets routing a key to its pivot's branches were built, measured and removed (research/43) | 3 | queries up to 1.8×, space overhead 15–61% (maplets, abstract-level evidence); measured with filters: reads 1.2–1.7× RocksDB at 10 M (benches/shard_db.rs), 1.6× at 1B (research/43 §4) |
 | E6 | SuRF range filters for listings (REMIX views built, measured and removed: research/43) | 4 | closed seeks up to 5× |
 | E7 | SILK scheduling: paced maintenance on the shard's worker (landed, §6 as built), then I/O submitted without waiting | 6 | p99 10–100× under compaction; measured so far: the longest put at 10 M from 2.9 s to 5.1–49.5 ms |
 | E8 | Hot region and S3-FIFO caches | 5 | hot gets up to about 10× |
@@ -624,7 +639,7 @@ longer read them, and that was the owner's trade.
 
 ## 10. Open, to be decided by measurement
 
-- `F`, `m`, the maplet width, the page and extent sizes.
+- `F`, `m`, the page and extent sizes.
 - The hot region's size and admission rule.
 - Whether the log serves as level 0 (TRIAD, research/33 row 6), given the Raft log's ownership of
   entries: step E9 decides it.

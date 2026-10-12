@@ -67,7 +67,7 @@ fn entry(number: u8) -> Vec<u8> {
         &key,
         Op::Put,
         &[number; 100],
-        mantle_engine::maplet::hash32(filter::hash(&key)),
+        filter::hash32(filter::hash(&key)),
     )
     .unwrap();
     bytes

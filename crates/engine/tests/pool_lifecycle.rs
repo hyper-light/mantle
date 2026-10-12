@@ -186,7 +186,7 @@ fn job(store: &mut Store<File>, number: u8) -> Box<Job> {
         &key,
         Op::Put,
         &[number; 100],
-        mantle_engine::maplet::hash32(filter::hash(&key)),
+        filter::hash32(filter::hash(&key)),
     )
     .unwrap();
     full.send(bytes).unwrap();

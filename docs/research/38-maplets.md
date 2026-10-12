@@ -1,5 +1,8 @@
 # 38. Maplets, measured against mantle's filters
 
+**Outcome (2026-10-11):** maplets were built two ways, A/B'd against per-branch filters to 1B keys,
+and removed; research/43 §3–4 holds the measurements.
+
 Sources, marked as cited:
 - **[arXiv]** Bender, Conway, Farach-Colton, Johnson, Pandey, *Time To Replace Your Filter: How
   Maplets Simplify System Design*, arXiv 2510.05518v1 (October 2025), §2–§4. Read in full.

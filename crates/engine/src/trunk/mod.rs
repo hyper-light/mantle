@@ -19,8 +19,8 @@
 //! - A **leaf** whose bundle passes `fanout` branches is compacted whole, tombstones dropped (no
 //!   older entry lies below it), and split by entries once past `leaf_entries`.
 //! - A **point read** goes root to leaf: each node's pivot for the key, its live in-flight
-//!   bundles newest first, then its pivot bundle. Every branch is probed until maplets (step E5)
-//!   name the branches a key may be in.
+//!   bundles newest first, then its pivot bundle; each branch's filter is asked before its leaf
+//!   is read.
 //!
 //! References: a branch is named by one node at a time (a flush moves a bundle, it never copies
 //! one) and holds the one reference its extents were allocated with; the node that drops it
@@ -40,7 +40,7 @@ pub mod pool;
 mod upkeep;
 use upkeep::{Change, NodeTask};
 
-/// The bytes a trunk's branches and views hold in memory ([`Trunk::memory`]).
+/// The bytes a trunk's branches hold in memory ([`Trunk::memory`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Memory {
     /// Point filters.
@@ -382,8 +382,10 @@ enum State {
 
 /// The saved image's format version.
 /// Format 2: each pivot names its view's extents after its branches. Format 3: each branch's
-/// descriptor names its range filter's bytes after its leaf index's. Format 5: no view's.
-const IMAGE_FORMAT: u8 = 5;
+/// descriptor names its range filter's bytes after its leaf index's. Format 4: its maplet
+/// hashes' bytes after those. Format 5: no pivot names a view. Format 6: no descriptor names
+/// maplet hashes.
+const IMAGE_FORMAT: u8 = 6;
 /// The saved image header's magic: "mantleTK" in ASCII, little-endian.
 const IMAGE_MAGIC: u64 = u64::from_le_bytes(*b"mantleTK");
 /// None, in a child or an end key's place.

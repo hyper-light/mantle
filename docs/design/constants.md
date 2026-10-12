@@ -96,8 +96,6 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/ec/src/durability.rs` `YEAR` | derived | Unit conversion: 365.25 days × 24 h = 8766 hours. |
 | `crates/engine/src/branch/mod.rs` `KEY_HEAD` | format | 4: the bytes of a page entry's head, its suffix's first 4 bytes, which a search compares before reading the entry. |
 | `crates/engine/src/branch/mod.rs` `SLOT` | format | 6: a page entry's table bytes, its offset (2) and its head (4). |
-| `crates/engine/src/fst/bits.rs` `MSBS_STEP_8` | cited | `0x8080…80`: every byte's high bit, broadword select's comparison flags (Vigna, WEA 2008; sux). |
-| `crates/engine/src/fst/bits.rs` `ONES_STEP_8` | cited | `0x0101…01`: one in every byte, broadword select's step (Vigna, WEA 2008; sux `support/common.hpp`). |
 | `crates/engine/src/fst/bits.rs` `SELECT_SAMPLE` | cited | 64: select samples every 64th set bit, 9–17% of a dense bit vector and 1–2% of the trie (Zhang et al., SuRF, SIGMOD 2018 §2.6; research/35 §1). |
 | `crates/engine/src/fst/packed.rs` `MAX_WIDTH` | format | 32: a trie value is a `u32` (a leaf's page number, a range filter's suffix bits). |
 | `crates/engine/src/fst/surf.rs` `SUFFIX_BYTES` | format | 4: the bytes a suffix of at most 32 bits (`MAX_WIDTH`) spans. |
@@ -114,11 +112,6 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/engine/src/shard_db.rs` `ORDER_BOUND` | measured | 2048 entries, a default `ShardDb::set_order_bound` replaces: the active memtable leaves unsorted at most (`ShardDb::set_order_bound`): a scan after a burst of puts sorts at most two such chunks. The radix sort measured 20-30 ns an entry and seeks' p99.9 41-165 us on the Apple M-series dev machine (benches/shard_db.rs), so the inherited sort, about 50 us, stays within seeks' own tail; the first seek after a 10M-put burst measured 107 us (5 reads) against 3.15 ms unbounded (research/40). |
 | `crates/engine/src/trunk/pool.rs` `ENTRY_FIXED` | format | 13: an entry's fixed bytes in a packing buffer, its key's length (4), its value's length (4), its operation (1) and its key's 32-bit hash (4). |
 | `crates/engine/src/trunk/pool.rs` `FEED_BUFFERS` | derived | 2: the buffers a packing's entries reach its worker in, each a run's bytes: double buffering, the least that overlaps a producer (the shard filling one) with its consumer (the worker building from the other). |
-| `crates/engine/src/maplet.rs` `BUCKETS` | derived | 32: buckets a block holds; its headers (buckets and slots in bits) fit one 128-bit word for up to 96 slots, which 32 buckets at a load of at most one key a bucket next to never exceed (research/38 §6). |
-| `crates/engine/src/maplet.rs` `HEADER_BITS` | format | 4: a block's header bytes less one, at most 16. |
-| `crates/engine/src/maplet.rs` `MOST_SLOTS` | derived | `128 − BUCKETS`: the most slots a block holds, its headers within a 128-bit word. |
-| `crates/engine/src/maplet.rs` `OFFSET_BITS` | format | 12: a block's offset in its page, a page being at most 4 KiB. |
-| `crates/engine/src/maplet.rs` `PAGE_SHIFT` | derived | `OFFSET_BITS + HEADER_BITS`: where a block's page starts in its index word. |
 | `crates/engine/src/records.rs` `LIVE` | format | 1: a cached record's flag, set while it is the key's current replica. |
 | `crates/engine/src/records.rs` `READ` | format | 2: a cached record's flag, set when it is read after being appended; it is carried to the tail once when its page is evicted (F2's second chance, Kanellis et al. PVLDB 2025 §7; research/37). |
 | `crates/engine/src/records.rs` `RECORD_HEAD` | format | 15: a cached record's fixed bytes, key length (2), value length (4), flags (1), key hash (8). |
@@ -414,7 +407,7 @@ every one of their constants its derivation or citation where it is defined.
 | `crates/engine/src/store/cache.rs` `PROMOTE` | cited | 2: reads in the small queue that move a page to main (libCacheSim `S3FIFO.c` default `move-to-main-threshold=2`). |
 | `crates/engine/src/store/cache.rs` `MAX_FREQ` | cited | 3: a cached page's read count's cap, the two-bit counter of S3-FIFO (libCacheSim `S3FIFO.c`, `MIN(freq, 3)`). |
 | `crates/engine/src/trunk/mod.rs` `ABSENT` | format | `u32::MAX`, a trunk image's marker for no child and no end key: above every node index and key length the image holds. |
-| `crates/engine/src/trunk/mod.rs` `IMAGE_FORMAT` | format | 5, the trunk image format this engine writes and reads: 2 named each pivot's view, 3 each branch's range filter, 4 each branch's maplet hashes, 5 no views (docs/design/engine-structure.md §8, E4c; views removed, research/43). |
+| `crates/engine/src/trunk/mod.rs` `IMAGE_FORMAT` | format | 6, the trunk image format this engine writes and reads: 2 named each pivot's view, 3 each branch's range filter, 4 each branch's maplet hashes, 5 no views, 6 no maplet hashes (docs/design/engine-structure.md §8, E4c; views and maplets removed, research/43). |
 | `crates/engine/src/trunk/mod.rs` `IMAGE_MAGIC` | format | "mantleTK" in ASCII, little-endian: the trunk image header's magic number. |
 | `crates/gateway/src/layout.rs` `CHUNK` | cited | Tectonic's "typically 8 MiB" chunk (docs/research/01 §1.14). docs/design/gateway.md says measured transfer sizing will replace it, and audit §12.6/§16.2 requires per-upload sizing. |
 | `crates/gateway/src/layout.rs` `SEALED` | derived | `seal::SEGMENT + seal::TAG`: a 64 KiB plaintext segment plus its 16-byte AEAD tag (docs/design/gateway.md §1). |

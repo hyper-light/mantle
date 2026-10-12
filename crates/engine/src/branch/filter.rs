@@ -3,10 +3,10 @@
 //! branch that cannot hold its key without reading a page. Every probe of a key falls in one
 //! 512-bit block, one cache line, so a check costs one cache miss.
 //!
-//! Step E5's maplets (docs/design/engine-structure.md §4) route a key to its pivot's branches
-//! with one lookup in less space; this filter is the step before them, measured against RocksDB
-//! (benches/shard_db.rs).
+//! Maplets routing a key to its pivot's branches in one lookup were built, measured and removed
+//! (docs/research/43-read-accelerators.md): a point read asks each branch's filter.
 
+use crate::error::Error;
 use crate::util::xxhash::xxh3_64bits;
 
 /// Cited: bits a key. A Bloom filter of `b` bits a key and `k = b·ln 2` probes has a
@@ -22,6 +22,12 @@ const BLOCK_WORDS: usize = 8;
 /// A key's filter hash: computed once a lookup, checked against every branch on its path.
 pub fn hash(key: &[u8]) -> u64 {
     xxh3_64bits(key)
+}
+
+/// The high 32 bits of a key's filter hash, all a filter's block and probes use: what a memtable
+/// keeps of each key so a branch built from it hashes no key again.
+pub fn hash32(hash: u64) -> u32 {
+    u32::try_from(hash >> 32).unwrap_or(0)
 }
 
 /// The filter: its blocks.
@@ -47,6 +53,15 @@ fn blocks_for(keys: u64) -> usize {
         .max(1)
 }
 
+/// Blocks for `keys`: an upper bound gets an even count, so the filter can halve to fit
+/// ([`Filter::fit`]).
+fn blocks_of(keys: Keys) -> usize {
+    match keys {
+        Keys::Exactly(n) => blocks_for(n),
+        Keys::AtMost(n) => blocks_for(n).saturating_add(blocks_for(n) % 2),
+    }
+}
+
 /// The block for a hash: its high 32 bits scaled into the block count (Lemire, "Fast random
 /// integer generation in an interval", ACM TOMACS 29(1), 2019).
 fn block_of(h: u64, blocks: usize) -> usize {
@@ -56,8 +71,8 @@ fn block_of(h: u64, blocks: usize) -> usize {
 
 /// The probes' bit positions within a block, from the hash's high 32 bits remixed by the golden
 /// ratio each probe, its top 9 bits a position (RocksDB's FastLocalBloom derives its probes so,
-/// from the low 32). The high 32 are what a branch keeps of each key ([`crate::maplet::hash32`]),
-/// so a filter can be rebuilt at any size from them without reading the keys (research/39 §3).
+/// from the low 32). The high 32 are what a memtable keeps of each key ([`hash32`]), so a filter
+/// can be rebuilt at any size from them without reading the keys (research/39 §3).
 fn probes(h: u64) -> impl Iterator<Item = (usize, u64)> {
     let mut x = u32::try_from(h >> 32).unwrap_or(0);
     (0..PROBES).map(move |_| {
@@ -78,23 +93,32 @@ impl Filter {
     /// the bound, an even count of blocks, which [`Self::fit`] halves once the count is known if
     /// half still holds it.
     pub fn new(keys: Keys) -> Self {
-        let count = match keys {
-            Keys::Exactly(n) => blocks_for(n),
-            Keys::AtMost(n) => blocks_for(n).saturating_add(blocks_for(n) % 2),
-        };
         Self {
-            blocks: vec![[0u64; BLOCK_WORDS]; count],
+            blocks: vec![[0u64; BLOCK_WORDS]; blocks_of(keys)],
         }
+    }
+
+    /// [`Self::new`] for keys a caller names: a count the allocator refuses is refused, not a
+    /// panic.
+    pub fn try_new(keys: Keys) -> Result<Self, Error> {
+        let count = blocks_of(keys);
+        let mut blocks = Vec::new();
+        blocks
+            .try_reserve_exact(count)
+            .map_err(|_| Error::LimitExceeded {
+                what: "a branch filter's blocks (the allocator refused them)",
+                limit: match keys {
+                    Keys::Exactly(n) | Keys::AtMost(n) => n,
+                },
+            })?;
+        blocks.resize(count, [0u64; BLOCK_WORDS]);
+        Ok(Self { blocks })
     }
 
     /// Empties the filter for `keys`, as [`Self::new`] sizes it, keeping its allocation.
     pub fn reset(&mut self, keys: Keys) {
-        let count = match keys {
-            Keys::Exactly(n) => blocks_for(n),
-            Keys::AtMost(n) => blocks_for(n).saturating_add(blocks_for(n) % 2),
-        };
         self.blocks.clear();
-        self.blocks.resize(count, [0u64; BLOCK_WORDS]);
+        self.blocks.resize(blocks_of(keys), [0u64; BLOCK_WORDS]);
     }
 
     /// Adds a key of hash `h`.
@@ -271,15 +295,12 @@ mod tests {
 
     #[test]
     fn a_filter_rebuilt_from_the_keys_32_bit_hashes_is_the_one_built_from_the_keys() {
-        // What a branch keeps of each key (crate::maplet::hash32) rebuilds its filter exactly,
-        // at this size or any other, without the keys (research/39 §3).
+        // What a memtable keeps of each key (hash32) rebuilds its filter exactly, at this size
+        // or any other, without the keys (research/39 §3).
         let hashes: Vec<u64> = (0..50_000u32)
             .map(|i| hash(format!("k{i}").as_bytes()))
             .collect();
-        let kept: Vec<u64> = hashes
-            .iter()
-            .map(|&h| u64::from(crate::maplet::hash32(h)) << 32)
-            .collect();
+        let kept: Vec<u64> = hashes.iter().map(|&h| u64::from(hash32(h)) << 32).collect();
         assert_eq!(Filter::build(&hashes), Filter::build(&kept));
     }
 

@@ -76,7 +76,7 @@ fn job(store: &mut Store<DeviceFile>) -> Box<Job> {
         b"returned-job",
         Op::Put,
         b"input still owned",
-        mantle_engine::maplet::hash32(filter::hash(b"returned-job")),
+        filter::hash32(filter::hash(b"returned-job")),
     )
     .unwrap();
     send.send(buf).unwrap();

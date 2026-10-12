@@ -206,7 +206,7 @@ fn post_poll_pool_startup_refuses_and_returns_the_exact_job() {
         KEY,
         Op::Put,
         VALUE,
-        mantle_engine::maplet::hash32(filter::hash(KEY)),
+        filter::hash32(filter::hash(KEY)),
     )
     .unwrap();
     full.try_send(bytes).unwrap();

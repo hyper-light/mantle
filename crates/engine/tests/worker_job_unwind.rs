@@ -195,7 +195,7 @@ fn packed(store: &mut Store<File>, key: &[u8], value: &[u8]) -> Box<Job> {
         key,
         Op::Put,
         value,
-        mantle_engine::maplet::hash32(filter::hash(key)),
+        filter::hash32(filter::hash(key)),
     )
     .unwrap();
     send.try_send(bytes).unwrap();

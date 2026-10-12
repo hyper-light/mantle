@@ -751,7 +751,7 @@ impl HashMem {
         self.tail.push(Keyed {
             prefix: prefix(key, self.skip),
             entry,
-            hash32: crate::maplet::hash32(h),
+            hash32: crate::branch::filter::hash32(h),
         });
         Ok(())
     }

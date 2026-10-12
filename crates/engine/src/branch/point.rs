@@ -322,7 +322,7 @@ mod tests {
         store.attach(&issuer, 1).unwrap();
         let chosen = ROWS / 2;
         let query = key(chosen);
-        let mut cursor = branch.prepare_get_routed(&mut store, &query).unwrap();
+        let mut cursor = branch.prepare_leaf(&mut store, &query).unwrap();
         // Two actual roles: the root read and the independent callback-gate opener.
         let config = RuntimeConfig {
             shards: 1,
@@ -393,7 +393,7 @@ mod tests {
                 if fail {
                     assert!(matches!(result, Err(Error::Io { .. })));
                     assert_eq!(value, [99]);
-                    let mut repaired = branch.prepare_get_routed(store, &query).unwrap();
+                    let mut repaired = branch.prepare_leaf(store, &query).unwrap();
                     loop {
                         match repaired.step(store, &query, &mut value).unwrap() {
                             PointStep::Done(op) => {

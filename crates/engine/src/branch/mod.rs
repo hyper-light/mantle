@@ -120,10 +120,6 @@ pub struct Branch {
     /// Written after its leaf index in its pages.
     pub range: Surf,
     pub range_bytes: u64,
-    /// Its keys' 32-bit maplet hashes, ascending, written after its range filter in its pages
-    /// and never held in memory: what a bundle's maplet is merged from without reading the
-    /// branch's entries (research/38 §5).
-    pub hashes_bytes: u64,
     /// Gets that asked its filter since it was built or loaded: its visits, which with its
     /// entries set the false-positive rate its filter's memory is worth (research/39 §2).
     /// Not part of its descriptor.
@@ -317,11 +313,6 @@ pub struct Builder {
     keys: SurfBuilder,
     range: Vec<u8>,
     range_filter: Option<Surf>,
-    /// Each key's maplet hash, sorted after the seal and written after the range filter.
-    hashes: Vec<u32>,
-    hash_scratch: Vec<u32>,
-    /// The hashes' sort: how many hold each value of each byte, counted as keys are added.
-    hash_order: HashOrder,
     /// The last key of the last leaf written.
     prev_last: Vec<u8>,
     count: u64,
@@ -337,74 +328,6 @@ pub struct Builder {
     entry_bytes: u64,
     /// The tree written, once [`Self::seal`] has run: what is left is its filter's pages.
     sealed: Option<Sealed>,
-}
-
-/// A least-significant-byte radix sort of a builder's hashes, a byte with one value across them
-/// skipped: the bytes left to scatter by, the pass at `pass`, its position `at` and where each
-/// value goes next; the moves each filter page written before the hashes pays, so the sort ends
-/// as the first hash page is due ([`Builder::write_filter`]).
-#[derive(Debug)]
-struct HashOrder {
-    counts: [[u32; 256]; 4],
-    passes: [usize; 4],
-    npass: usize,
-    pass: usize,
-    at: usize,
-    next: [u32; 256],
-    per_page: usize,
-}
-
-impl Default for HashOrder {
-    fn default() -> Self {
-        Self {
-            counts: [[0; 256]; 4],
-            passes: [0; 4],
-            npass: 0,
-            pass: 0,
-            at: 0,
-            next: [0; 256],
-            per_page: 0,
-        }
-    }
-}
-
-impl HashOrder {
-    fn count(&mut self, h: u32) {
-        for (counts, &b) in self.counts.iter_mut().zip(h.to_le_bytes().iter()) {
-            if let Some(c) = counts.get_mut(usize::from(b)) {
-                *c = c.saturating_add(1);
-            }
-        }
-    }
-
-    /// Readies pass `pass`: each value of its byte starts after the hashes of smaller values.
-    fn start_pass(&mut self) {
-        let Some(counts) = self
-            .passes
-            .get(self.pass)
-            .filter(|_| self.pass < self.npass)
-            .and_then(|&byte| self.counts.get(byte))
-        else {
-            return;
-        };
-        let mut sum = 0u32;
-        for (next, &count) in self.next.iter_mut().zip(counts.iter()) {
-            *next = sum;
-            sum = sum.saturating_add(count);
-        }
-    }
-
-    fn done(&self) -> bool {
-        self.pass >= self.npass
-    }
-
-    /// Moves left: the passes left over every hash.
-    fn left(&self, n: usize) -> usize {
-        self.npass
-            .saturating_sub(self.pass)
-            .saturating_mul(n)
-            .saturating_sub(self.at)
-    }
 }
 
 /// A sealed builder's fixed root and height, and its filter's pages: the first, the bytes in
@@ -438,35 +361,14 @@ impl Builder {
                 what: "a branch page past 64 KiB",
             });
         }
-        let (filter::Keys::Exactly(n) | filter::Keys::AtMost(n)) = keys;
-        let refused = || Error::LimitExceeded {
-            what: "a branch's hash buffers (the allocator refused them)",
-            limit: n,
-        };
-        let n = usize::try_from(n).map_err(|_| refused())?;
-        let mut lists = store.take_lists();
-        // The hashes grow to the keys the builder is made for at once, not by doublings; a
-        // recycled list that held as many already holds them.
-        // The scratch keeps its old entries (none is read before it is written), so it is
-        // reserved to `n` in all, not `n` past them.
-        if lists
-            .hashes
-            .try_reserve(n.saturating_sub(lists.hashes.len()))
-            .is_err()
-            || lists
-                .hash_scratch
-                .try_reserve(n.saturating_sub(lists.hash_scratch.len()))
-                .is_err()
-        {
-            store.give_lists(lists);
-            return Err(refused());
-        }
+        // The filter first, sized by the keys the caller names: a count the allocator refuses is
+        // refused before the store's lists are taken, so they stay pooled for the next builder.
+        let filter = filter::Filter::try_new(keys)?;
+        let lists = store.take_lists();
         let mut separators = lists.separators;
         separators.reset(Width::Fit)?;
         let mut keys_filter = lists.keys;
         keys_filter.reset(store.range_filter_bits())?;
-        let hashes = lists.hashes;
-        let hash_scratch = lists.hash_scratch;
         let mut spare_pages = lists.pages;
         let mut levels = lists.levels;
         levels.push(
@@ -490,14 +392,11 @@ impl Builder {
             keys: keys_filter,
             range: lists.range,
             range_filter: None,
-            hashes,
-            hash_scratch,
-            hash_order: HashOrder::default(),
             prev_last: lists.prev_last,
             count: 0,
             payload,
             capacity,
-            filter: filter::Filter::new(keys),
+            filter,
             run: store.run()?,
             issued: 0,
             entry_bytes: 0,
@@ -585,16 +484,9 @@ impl Builder {
         self.last.clear();
         self.last.extend_from_slice(key);
         self.count = self.count.saturating_add(1);
-        let h32 = hash32.unwrap_or_else(|| crate::maplet::hash32(filter::hash(key)));
-        // The Bloom filter's block and probes, and the maplet hash, use these high bits alone.
+        let h32 = hash32.unwrap_or_else(|| filter::hash32(filter::hash(key)));
+        // The filter's block and probes use these high bits alone.
         self.filter.insert(u64::from(h32) << u32::BITS);
-        self.hashes.push(h32);
-        // Scatter scratch is initialized as keys arrive, one entry a key. A recycled
-        // buffer's old entries need no clearing, and the seal initializes none.
-        if self.hash_scratch.len() < self.hashes.len() {
-            self.hash_scratch.push(0);
-        }
-        self.hash_order.count(h32);
         self.keys.add(key)?;
         self.entry_bytes = self.entry_bytes.saturating_add(
             u64::try_from(key.len().saturating_add(value.len())).unwrap_or(u64::MAX),
@@ -811,12 +703,10 @@ impl Builder {
                         .bytes()
                         .saturating_add(self.counts.len().saturating_mul(2))
                         .saturating_add(self.index.len())
-                        .saturating_add(self.range.len())
-                        .saturating_add(self.hashes.len().saturating_mul(4)),
+                        .saturating_add(self.range.len()),
                     at: 0,
                     pages: 0,
                 });
-                self.start_hash_sort();
                 return Ok(());
             }
             if self.levels.get(level).is_some_and(|p| p.len() > 0) {
@@ -834,13 +724,12 @@ impl Builder {
         u64::try_from(total.saturating_sub(at).div_ceil(self.capacity.max(1))).unwrap_or(u64::MAX)
     }
 
-    /// What follows the tree before the seal, as far as known: the filter's bytes, each page's
-    /// count and each key's hash. The leaf index and range filter are sized only when built.
+    /// What follows the tree before the seal, as far as known: the filter's bytes and each
+    /// page's count. The leaf index and range filter are sized only when built.
     fn unsealed_bytes(&self) -> usize {
         self.filter
             .bytes()
             .saturating_add(self.counts.len().saturating_mul(2))
-            .saturating_add(self.hashes.len().saturating_mul(4))
     }
 
     /// The keys a filter page is worth in a compaction's budget: as many bytes as a page, at
@@ -852,65 +741,6 @@ impl Builder {
             .checked_div(self.entry_bytes.max(1))
             .unwrap_or(1)
             .max(1)
-    }
-
-    /// Starts the hashes' sort at the seal: the bytes to scatter by, and the moves each page
-    /// written before the hashes pays so that it ends as the first hash page is due.
-    fn start_hash_sort(&mut self) {
-        let n = self.hashes.len();
-        let o = &mut self.hash_order;
-        let all = u32::try_from(n).unwrap_or(u32::MAX);
-        o.npass = 0;
-        for byte in 0..4 {
-            let varies = o
-                .counts
-                .get(byte)
-                .is_some_and(|c| c.iter().all(|&m| m != all));
-            if varies && let Some(p) = o.passes.get_mut(o.npass) {
-                *p = byte;
-                o.npass = o.npass.saturating_add(1);
-            }
-        }
-        o.pass = 0;
-        o.at = 0;
-        o.start_pass();
-        let before = self.sealed.map_or(0, |s| {
-            s.total
-                .saturating_sub(n.saturating_mul(4))
-                .div_ceil(self.capacity.max(1))
-        });
-        o.per_page = o.left(n).div_ceil(before.max(1));
-        self.hash_scratch.truncate(n);
-    }
-
-    /// Up to `budget` moves of the hashes' sort.
-    fn hash_sort_step(&mut self, budget: usize) {
-        let mut moved = 0usize;
-        while moved < budget && !self.hash_order.done() {
-            let o = &mut self.hash_order;
-            let Some(&byte) = o.passes.get(o.pass) else {
-                return;
-            };
-            let Some(&h) = self.hashes.get(o.at) else {
-                std::mem::swap(&mut self.hashes, &mut self.hash_scratch);
-                o.pass = o.pass.saturating_add(1);
-                o.at = 0;
-                o.start_pass();
-                continue;
-            };
-            let b = usize::from(h.to_le_bytes().get(byte).copied().unwrap_or(0));
-            if let Some(next) = o.next.get_mut(b) {
-                if let Some(d) = usize::try_from(*next)
-                    .ok()
-                    .and_then(|i| self.hash_scratch.get_mut(i))
-                {
-                    *d = h;
-                }
-                *next = next.saturating_add(1);
-            }
-            o.at = o.at.saturating_add(1);
-            moved = moved.saturating_add(1);
-        }
     }
 
     /// Writes up to `pages` of the sealed filter's pages, each copied from its blocks; true once
@@ -925,17 +755,9 @@ impl Builder {
         })?;
         let mut chunk = std::mem::take(&mut self.payload);
         let mut written = 0u64;
-        let hashes_at = s.total.saturating_sub(self.hashes.len().saturating_mul(4));
         while written < pages && s.at < s.total {
             chunk.clear();
             let end = s.at.saturating_add(self.capacity).min(s.total);
-            // Each page pays its share of the hashes' sort; a page holding hashes needs it done.
-            let share = if end > hashes_at {
-                usize::MAX
-            } else {
-                self.hash_order.per_page
-            };
-            self.hash_sort_step(share);
             self.stream_bytes(s.at..end, &mut chunk);
             let address = self.page(store)?;
             store.queue_page(&mut self.run, address, &chunk)?;
@@ -952,11 +774,8 @@ impl Builder {
         Ok(true)
     }
 
-    /// The branch, its tree and filter written; refused before. The run's buffer goes back to
-    /// the store's pool for the next writer.
     /// Bytes `range` of what follows the tree in the branch's pages: the filter's bytes, each
-    /// tree page's entry count (two bytes each), the leaf index, the range filter, then the
-    /// keys' maplet hashes (four bytes each, little-endian).
+    /// tree page's entry count (two bytes each), the leaf index, then the range filter.
     fn stream_bytes(&self, range: std::ops::Range<usize>, out: &mut Vec<u8>) {
         let fb = self.filter.bytes();
         let cb = self.counts.len().saturating_mul(2);
@@ -982,13 +801,6 @@ impl Builder {
         let to = range.end.saturating_sub(base).min(rb);
         if from < to {
             out.extend_from_slice(self.range.get(from..to).unwrap_or(&[]));
-        }
-        let base = base.saturating_add(rb);
-        let from = range.start.max(base).saturating_sub(base);
-        let to = range.end.saturating_sub(base);
-        for at in from..to {
-            let h = self.hashes.get(at / 4).copied().unwrap_or(0).to_le_bytes();
-            out.push(h.get(at % 4).copied().unwrap_or(0));
         }
     }
 
@@ -1033,8 +845,6 @@ impl Builder {
             range_bytes: u64::try_from(self.range.len())
                 .map_err(|_| corrupt(Malformed::TooLarge))?,
             range: self.range_filter.ok_or(corrupt(Malformed::CountMismatch))?,
-            hashes_bytes: u64::try_from(self.hashes.len().saturating_mul(4))
-                .map_err(|_| corrupt(Malformed::TooLarge))?,
             probes: 0,
         });
         // Every level's page back among the spares, for the next builder's levels.
@@ -1048,8 +858,6 @@ impl Builder {
             keys: self.keys,
             range: self.range,
             index: self.index,
-            hashes: self.hashes,
-            hash_scratch: self.hash_scratch,
             levels,
             pages,
             firsts: self.firsts,
@@ -1255,7 +1063,6 @@ impl Branch {
             index_bytes: self.index_bytes,
             range: Surf::default(),
             range_bytes: self.range_bytes,
-            hashes_bytes: self.hashes_bytes,
             probes: 0,
         }
     }
@@ -1285,16 +1092,6 @@ impl Branch {
         if !self.filter.may_contain(hash) {
             return Ok(None);
         }
-        self.get_routed(store, key, value)
-    }
-
-    /// [`Self::get`] for a key its bundle's maplet routed here: its filter not asked again.
-    pub fn get_routed<F: BlockFile>(
-        &self,
-        store: &mut Store<F>,
-        key: &[u8],
-        value: &mut Vec<u8>,
-    ) -> Result<Option<Op>, Error> {
         // The leaf by the index, from memory: the one page read, parsed where the store holds
         // it, only the value copied out.
         let page_no = self.leaf_of(key)?;
@@ -1329,11 +1126,12 @@ impl Branch {
         if !self.filter.may_contain(hash) {
             return Ok(None);
         }
-        self.prepare_get_routed(store, key).map(Some)
+        self.prepare_leaf(store, key).map(Some)
     }
 
-    /// A maplet already routed this candidate, so its Bloom filter is not asked again.
-    pub(crate) fn prepare_get_routed<F: BlockFile>(
+    /// The read of the leaf `key` falls in, its filter not asked: [`Self::prepare_get`] once
+    /// the filter passes it.
+    pub(crate) fn prepare_leaf<F: BlockFile>(
         &self,
         store: &mut Store<F>,
         key: &[u8],
@@ -1356,7 +1154,6 @@ impl Branch {
         out.extend_from_slice(&self.filter_bytes.to_le_bytes());
         out.extend_from_slice(&self.index_bytes.to_le_bytes());
         out.extend_from_slice(&self.range_bytes.to_le_bytes());
-        out.extend_from_slice(&self.hashes_bytes.to_le_bytes());
         let n = u32::try_from(self.extents.len()).map_err(|_| corrupt(Malformed::TooLarge))?;
         out.extend_from_slice(&n.to_le_bytes());
         for e in &self.extents {
@@ -1396,14 +1193,13 @@ impl Branch {
         let filter_bytes = u64_of(take(8)?)?;
         let index_bytes = u64_of(take(8)?)?;
         let range_bytes = u64_of(take(8)?)?;
-        let hashes_bytes = u64_of(take(8)?)?;
         let n = usize::try_from(u32_of(take(4)?)?).map_err(|_| corrupt(Malformed::TooLarge))?;
         let mut extents = Vec::with_capacity(n.min(bytes.len() / 8));
         for _ in 0..n {
             extents.push(u64_of(take(8)?)?);
         }
-        // The filter's pages: its place in the branch's pages, counted in extent order; the
-        // pages up to the range filter's end, the maplet hashes after it left on the device.
+        // The filter's pages: its place in the branch's pages, counted in extent order, up to
+        // the range filter's end.
         let per = u64::from(store.extent_pages());
         let held = filter_bytes
             .checked_add(
@@ -1440,12 +1236,11 @@ impl Branch {
         let ib = usize::try_from(index_bytes).map_err(|_| corrupt(Malformed::TooLarge))?;
         let rb = usize::try_from(range_bytes).map_err(|_| corrupt(Malformed::TooLarge))?;
         let cb = tree.checked_mul(2).ok_or(corrupt(Malformed::TooLarge))?;
-        // The last page read may run on into the hashes: what follows the range filter is cut.
+        // The pages hold exactly the stream: nothing follows the range filter.
         let want = usize::try_from(held).map_err(|_| corrupt(Malformed::TooLarge))?;
-        if filter.len() < want {
+        if filter.len() != want {
             return Err(corrupt(Malformed::CountMismatch));
         }
-        filter.truncate(want);
         let (filter_part, rest) = filter.split_at(fb);
         let (count_part, rest) = rest.split_at(cb);
         let (index_part, range_part) = rest.split_at(ib);
@@ -1480,157 +1275,10 @@ impl Branch {
                 index_bytes,
                 range,
                 range_bytes,
-                hashes_bytes,
                 probes: 0,
             },
             at,
         ))
-    }
-}
-
-/// A branch's keys' maplet hashes in ascending order, read from its pages a page at a time: what
-/// a bundle's maplet is merged from without reading the branch's entries (research/38 §5).
-#[derive(Debug)]
-pub struct HashCursor {
-    /// The next page to read, in the branch's pages; the page read; where in it the next hash's
-    /// bytes start; the hashes left.
-    page_no: u64,
-    buf: Vec<u8>,
-    pos: usize,
-    left: u64,
-    /// A format u32 can cross a page; bytes taken before a wait remain owned here.
-    hash: [u8; size_of::<u32>()],
-    assembled: usize,
-    span: Option<Span>,
-    pooled: bool,
-}
-
-pub(crate) enum HashStep {
-    Waiting,
-    Done(Option<u32>),
-}
-
-impl Branch {
-    /// A cursor over the branch's maplet hashes.
-    pub fn hashes<F: BlockFile>(&self, store: &Store<F>) -> Result<HashCursor, Error> {
-        let held = self
-            .filter_bytes
-            .checked_add(
-                self.filter_start
-                    .checked_mul(2)
-                    .ok_or(corrupt(Malformed::TooLarge))?,
-            )
-            .and_then(|n| n.checked_add(self.index_bytes))
-            .and_then(|n| n.checked_add(self.range_bytes))
-            .ok_or(corrupt(Malformed::TooLarge))?;
-        let capacity = u64::try_from(store.page_capacity())
-            .unwrap_or(u64::MAX)
-            .max(1);
-        Ok(HashCursor {
-            page_no: self
-                .filter_start
-                .checked_add(held.checked_div(capacity).unwrap_or(0))
-                .ok_or(corrupt(Malformed::TooLarge))?,
-            buf: Vec::new(),
-            pos: usize::try_from(held.checked_rem(capacity).unwrap_or(0)).unwrap_or(0),
-            left: self
-                .hashes_bytes
-                .checked_div(
-                    u64::try_from(size_of::<u32>()).map_err(|_| corrupt(Malformed::TooLarge))?,
-                )
-                .ok_or(corrupt(Malformed::TooLarge))?,
-            hash: [0; size_of::<u32>()],
-            assembled: 0,
-            span: None,
-            pooled: false,
-        })
-    }
-}
-
-impl HashCursor {
-    /// The next hash, reading the branch's next page when its bytes run out; none after the last.
-    pub fn next<F: BlockFile>(
-        &mut self,
-        store: &mut Store<F>,
-        branch: &Branch,
-    ) -> Result<Option<u32>, Error> {
-        match self.next_with(store, branch, false)? {
-            HashStep::Done(hash) => Ok(hash),
-            HashStep::Waiting => Err(Error::InvalidArgument {
-                what: "a synchronous hash cursor left waiting for a page",
-            }),
-        }
-    }
-
-    fn next_with<F: BlockFile>(
-        &mut self,
-        store: &mut Store<F>,
-        branch: &Branch,
-        paced: bool,
-    ) -> Result<HashStep, Error> {
-        if self.left == 0 {
-            return Ok(HashStep::Done(None));
-        }
-        if paced && self.span.is_none() {
-            self.span = Some(store.span()?);
-            if !self.pooled {
-                let mut page = store.take_page();
-                page.extend_from_slice(&self.buf);
-                self.buf = page;
-                self.pooled = true;
-            }
-        }
-        // One format u32, so at most its four bytes are taken before completion or wait.
-        while self.assembled < self.hash.len() {
-            if self.pos >= self.buf.len() {
-                let skip = if self.buf.is_empty() { self.pos } else { 0 };
-                // Save this page's offset before clearing the old bytes: a retry after a
-                // wait must not use the exhausted old page's length as its new offset.
-                self.pos = skip;
-                self.buf.clear();
-                let address = branch.page_address(store, self.page_no)?;
-                if paced {
-                    let span = self.span.as_mut().ok_or(corrupt(Malformed::Truncated))?;
-                    if !store.read_page_paced(span, address, &mut self.buf)? {
-                        return Ok(HashStep::Waiting);
-                    }
-                } else if let Some(span) = self.span.as_mut() {
-                    store.read_page_ahead(span, address, &mut self.buf)?;
-                } else {
-                    store.read_page(address, &mut self.buf)?;
-                }
-                self.page_no = self
-                    .page_no
-                    .checked_add(1)
-                    .ok_or(corrupt(Malformed::TooLarge))?;
-                if self.pos >= self.buf.len() {
-                    return Err(corrupt(Malformed::Truncated));
-                }
-            }
-            let byte = self
-                .buf
-                .get(self.pos)
-                .copied()
-                .ok_or(corrupt(Malformed::Truncated))?;
-            *self
-                .hash
-                .get_mut(self.assembled)
-                .ok_or(corrupt(Malformed::Truncated))? = byte;
-            self.assembled = self
-                .assembled
-                .checked_add(1)
-                .ok_or(corrupt(Malformed::TooLarge))?;
-            self.pos = self
-                .pos
-                .checked_add(1)
-                .ok_or(corrupt(Malformed::TooLarge))?;
-        }
-        self.left = self
-            .left
-            .checked_sub(1)
-            .ok_or(corrupt(Malformed::CountMismatch))?;
-        self.assembled = 0;
-        Ok(HashStep::Done(Some(u32::from_le_bytes(self.hash))))
     }
 }
 

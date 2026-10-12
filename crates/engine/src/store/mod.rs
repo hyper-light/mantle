@@ -380,10 +380,6 @@ pub struct Lists {
     pub keys: SurfBuilder,
     pub range: Vec<u8>,
     pub index: Vec<u8>,
-    /// Each key's 32-bit maplet hash, sorted after the seal ([`crate::maplet`]), and the sort's
-    /// scratch.
-    pub hashes: Vec<u32>,
-    pub hash_scratch: Vec<u32>,
     /// The builder's levels (empty between builders) and its spare pages; each level's first-key
     /// buffer; the last key and the last leaf's last key; and the payload a page
     /// is encoded into.
@@ -401,7 +397,6 @@ impl Lists {
         self.counts.clear();
         self.index.clear();
         self.range.clear();
-        self.hashes.clear();
         for p in &mut self.pages {
             p.clear();
         }

@@ -8,7 +8,7 @@
 //! This compares identical Range controls, not direct RocksDB timings: throughput/work
 //! include exact membership/value/row checks; latency is the API call alone. Postfill and
 //! postquery flush+checkpoint barriers are timed and charged, including metadata/flushes.
-//! Checkpoint does not finish optional views/maplets. Continuous process counts through
+//! Continuous process counts through
 //! stop/shutdown include maintenance between phase snapshots and discard/cleanup work.
 //! Cold setup and exact fresh reopen/reference verification are separately charged; reopen
 //! occurs only after the query population and all native/physical retirement have ended.
@@ -636,7 +636,7 @@ fn main() -> Result<(), BenchError> {
         rt.tasks_per_shard
     );
     println!(
-        "workload generator rocksdb-mt19937_64 seed {seed} key_padding ascii-0 values repeated-v value_bytes {} num {num} client_threads {threads} ranges {threads} shards {threads} reads_per_thread {reads} seeks_per_thread {seeks} seek_nexts {seek_nexts} issuer_depth {issuer_depth} runs_in_flight_per_range {issuer_depth} cache_mib {cache_mib} write_budget_mib {write_budget_mib} oracle_keys {} throughput full-oracle latency api-only barriers flush+durable-checkpoint optional-accelerators-not-fully-drained",
+        "workload generator rocksdb-mt19937_64 seed {seed} key_padding ascii-0 values repeated-v value_bytes {} num {num} client_threads {threads} ranges {threads} shards {threads} reads_per_thread {reads} seeks_per_thread {seeks} seek_nexts {seek_nexts} issuer_depth {issuer_depth} runs_in_flight_per_range {issuer_depth} cache_mib {cache_mib} write_budget_mib {write_budget_mib} oracle_keys {} throughput full-oracle latency api-only barriers flush+durable-checkpoint",
         fill_value().len(),
         workload.present.len()
     );

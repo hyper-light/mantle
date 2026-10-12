@@ -1975,7 +1975,7 @@ impl<F: BlockFile> ShardDb<F> {
         let store = &mut self.store;
         let key = &mut self.scan_key;
         // The trunk's leaf segments, found one at a time from the seek's key: a segment's
-        // sources (branches, and pivot bundles through their views), and where the next starts.
+        // sources (a branch each), and where the next starts.
         let seg_from = &mut self.scan_from;
         let seg_end = &mut self.scan_end;
         seg_from.clear();
@@ -2181,7 +2181,7 @@ impl<F: BlockFile> ShardDb<F> {
         let trunk = &mut self.trunk;
         let key = &mut self.scan_key;
         // The trunk's leaf segments, found one at a time from the seek's key: a segment's
-        // sources (branches, and pivot bundles through their views), and where the next starts.
+        // sources (a branch each), and where the next starts.
         let seg_from = &mut self.scan_from;
         let seg_end = &mut self.scan_end;
         seg_from.clear();
@@ -3588,7 +3588,7 @@ impl<F: BlockFile> ShardDb<F> {
         (self.flush_stats, self.trunk.stats(), self.store.io_stats())
     }
 
-    /// The bytes the trunk's branches and views hold in memory.
+    /// The bytes the trunk's branches hold in memory.
     pub fn memory(&self) -> crate::trunk::Memory {
         self.trunk.memory()
     }

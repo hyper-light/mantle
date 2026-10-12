@@ -140,8 +140,36 @@ fix cannot fit on the disk (5× space amplification at 100M) and was not run.
   order"). Its maplet task read a bundle's branches on a worker while a flush and the child's
   compactions dropped them; with extent reuse their extents were rewritten under it
   (`msplinter-1b-diag`). 100M never hit the race. Fixed in the arm as SplinterDB's tasks do,
-  each holding a reference to what it reads (acc-msplinter C6); its 1B result is measured beside
-  a second none run (`n1000000000-r2-*`).
-- Seeks are mantle's gap at 1B (0.46× RocksDB), with or without views: 172 µs of CPU a seek,
-  1.9M instructions and 14 context switches, 66% of page reads served from the OS cache. The page
-  access path (§1) is the next target, not an accelerator.
+  each holding a reference to what it reads (acc-msplinter C6).
+- Fixed, it filled 1B keys and then could not checkpoint: each maplet's block index rides in its
+  branch's descriptor, and the trunk image outgrew the 66 MB its header page can name. SplinterDB
+  keeps its filter's index in pages, a page read more a probe. Rather than build that to rank the
+  arm, it ran with checkpoints skipped (`--no-checkpoint`, both arms, `n1000000000-r4-*`): its
+  indexes in memory, an upper bound on the paged design.
+
+| 1B, no checkpoints | none | SplinterDB filters, indexes in memory |
+|---|---|---|
+| fill | 1.58M | 1.12M |
+| read | 35.6K | 34.9K |
+| read p99 µs | 135 | 184 |
+| seek | 3.77K | 7.84K |
+| seek p50 µs | 188 | 123 |
+| seek p99.9 µs | 3,015 | 2,490 |
+| peak bytes | 146 GB | 123 GB |
+| entries rewritten during the queries | 559M | 133M |
+
+- The SplinterDB arm loses fill at every size (−18% at 10M, −10% at 100M, −29% at 1B) and reads
+  at every size below 1B (−15%, −19%), even at its bound.
+- Its 1B seeks are twice none's, but a seek reads no maplet (scan.rs merges a cursor a branch; a
+  bundle's maplet routes only gets). What differs is the trunk the queries ran on: none's query
+  phase rewrote 559M entries alongside the seeks, the SplinterDB arm's slower fill had done most
+  of its rewriting before them (133M during). That rewriting's cost lands on seeks: 182 µs of
+  process CPU a seek against 55, 12.7 context switches against 3.7, 82% of page reads served
+  from the OS cache against 91%. It is fixed in none directly, not by maplets.
+- **Verdict:** none, on balance at every size. Views, maplets and the branches' hash lists are
+  removed.
+- Seeks are mantle's gap at 1B (0.46–0.51× RocksDB). The phase is not seeks alone: maintenance
+  rewrote 546–559M entries during each none query phase (seek-paid consolidations in r1, other
+  trunk work in r4), while RocksDB's queries start after `waitforcompaction`. Mantle's database
+  was 146–154 GB against RocksDB's 102 GB, which this machine's 128 GB mostly caches. Where
+  maintenance lands, space amplification and the page access path (§1) are the next targets.

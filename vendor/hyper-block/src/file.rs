@@ -214,7 +214,8 @@ impl DeviceFile {
     /// `IOV_MAX`, every one the same buffer), so a direct file's device has them all in flight
     /// rather than one at a time: a 256 MiB file written whole with 128 KiB copies beside another
     /// process's `F_FULLFSYNC` writes took 61-66 ms so, and 7.5-9.9 s a copy at a time (mantle
-    /// `docs/research/48-first-writes.md` §6). Elsewhere, a write a copy.
+    /// `docs/research/48-first-writes.md` §6). On Windows a file past the cache takes gather writes
+    /// of the same kind (`crate::gather`); a buffered one there, a write a copy.
     pub fn write_copies_at(&self, fill: &[u8], offset: u64, copies: u64) -> Result<(), DiskError> {
         self.check_alignment(offset, fill.len())?;
         self.check_address(fill.as_ptr().addr(), offset, fill.len())?;
@@ -227,6 +228,11 @@ impl DeviceFile {
         {
             sys::write_copies_at(&self.file, fill, offset, copies)
                 .map_err(|e| self.io_error("write copies", e))
+        }
+        #[cfg(windows)]
+        if self.caching == Caching::Direct && !self.node {
+            return crate::gather::write_copies(&self.path, fill, offset, copies)
+                .map_err(|e| self.io_error("write copies", e));
         }
         #[cfg(not(unix))]
         {

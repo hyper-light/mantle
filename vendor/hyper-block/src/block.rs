@@ -82,6 +82,20 @@ pub trait BlockFile: Send {
         false
     }
 
+    /// Whether the file grows by segments ([`BlockFile::grow`], `crate::segmented`) rather than
+    /// by writes past its end. False by default.
+    fn grows_by_segments(&self) -> bool {
+        false
+    }
+
+    /// Adds a segment of `len` bytes after the file's end, allocated whole and its name durable,
+    /// when the file grows by segments: the offset its first byte is at. Its blocks are written by
+    /// the caller before any other transfer uses them, so the segments in use take no first
+    /// write (`crate::segmented`). None for a file that grows by writes past its end.
+    fn grow(&self, _len: u64) -> Result<Option<u64>, DiskError> {
+        Ok(None)
+    }
+
     /// Writes all of `buf` at `offset` and makes that write durable before it returns: at least
     /// that write, and of the others not yet flushed none it promises. By default a write and a
     /// flush of the file. A failure leaves the write's durability unknown, as a flush's does.

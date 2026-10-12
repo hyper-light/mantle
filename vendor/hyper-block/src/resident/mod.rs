@@ -39,6 +39,20 @@ pub struct Residency {
     pub wrong: u64,
 }
 
+impl Residency {
+    /// Both handles' counts summed: one file kept as several (`crate::segmented`).
+    #[must_use]
+    pub fn plus(self, other: Self) -> Self {
+        Self {
+            probes: self.probes.saturating_add(other.probes),
+            skips: self.skips.saturating_add(other.skips),
+            epochs: self.epochs.saturating_add(other.epochs),
+            changes: self.changes.saturating_add(other.changes),
+            wrong: self.wrong.saturating_add(other.wrong),
+        }
+    }
+}
+
 /// A handle's state for reads made only from memory: whether the kernel refused `RWF_NOWAIT`.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]

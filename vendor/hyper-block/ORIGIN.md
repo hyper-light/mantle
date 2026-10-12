@@ -140,6 +140,16 @@ caller hands in the alignment, queue and measured depth it found.
     the kept answers a probe found wrong (`BlockFile::residency`,
     `BlockFile::set_residency_shadow`, `Attached::residency`, `Attached::set_residency_shadow`).
     Mantle `docs/research/46-reclaim-epochs.md`.
+14. **A file kept as segments** (`segmented.rs`, `block.rs`, `resident`, mantle): a base file and
+    `<base>.1`, `<base>.2` and on, read and written at offsets into their concatenation
+    (`SegmentedFile`). A segment is created whole at its final length, allocated and its name made
+    durable, and never changes length, so every handle finds the layout from names and lengths
+    alone; a duplicate made before a segment was added opens it when a transfer first reaches it. A
+    transfer lies within one segment; a flush covers the segments written since the last; the
+    segments are at most a bound given at open. `BlockFile::grows_by_segments` and
+    `BlockFile::grow` let a store add one (a plain file grows by its writes, as before), and
+    `Residency::plus` sums segments' counts. A file's own first writes hold up its other reads and
+    writes, another file's do not: mantle `docs/research/48-first-writes.md`.
 
 ## Planned
 

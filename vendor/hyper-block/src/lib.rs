@@ -34,6 +34,7 @@ pub mod record;
 mod resident;
 pub use resident::Residency;
 pub mod scratch;
+pub mod segmented;
 #[cfg(any(test, feature = "sim"))]
 pub mod sim;
 pub mod threads;

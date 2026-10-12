@@ -17,7 +17,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::DiskError;
 use crate::block::{BlockFile, Durable};
@@ -48,6 +48,11 @@ const CHUNKS: usize = usize::BITS as usize;
 #[derive(Debug)]
 struct Slots {
     chunks: [OnceLock<Box<[OnceLock<Segment>]>>; CHUNKS],
+    /// The slots filled, a prefix: a read finds its segment by a binary search over them, which
+    /// touches a logarithm of the segments where a scan touched each (about 250 instructions a
+    /// get more than one file's at 10M keys and 20 segments, mantle
+    /// `docs/research/48-first-writes.md` §6).
+    filled: AtomicUsize,
     bound: usize,
 }
 
@@ -55,8 +60,42 @@ impl Slots {
     fn new(bound: usize) -> Self {
         Self {
             chunks: std::array::from_fn(|_| OnceLock::new()),
+            filled: AtomicUsize::new(0),
             bound,
         }
+    }
+
+    /// Fills slot `index`, its chunk made if no segment reached it before: false when another
+    /// thread filled it first; none past the bound, or when the chunk cannot be allocated. The
+    /// count reaches past the slot either way, so a reader that found it filled by another thread
+    /// makes the progress that thread has yet to record.
+    fn fill(&self, index: usize, segment: Segment) -> Option<bool> {
+        let set = self.make(index)?.set(segment).is_ok();
+        self.filled
+            .fetch_max(index.checked_add(1)?, Ordering::AcqRel);
+        Some(set)
+    }
+
+    /// The slots filled.
+    fn len(&self) -> usize {
+        self.filled.load(Ordering::Acquire)
+    }
+
+    /// The segment holding `offset`, and its index.
+    fn find(&self, offset: u64) -> Option<(usize, &Segment)> {
+        let (mut lo, mut hi) = (0usize, self.filled.load(Ordering::Acquire));
+        while lo < hi {
+            let mid = lo.checked_add(hi.checked_sub(lo)?.checked_div(2)?)?;
+            let s = self.get(mid)?.get()?;
+            if offset < s.start {
+                hi = mid;
+            } else if offset >= s.start.saturating_add(s.len) {
+                lo = mid.checked_add(1)?;
+            } else {
+                return Some((mid, s));
+            }
+        }
+        None
     }
 
     /// The chunk slot `index` is in, and its place there.
@@ -231,29 +270,37 @@ impl SegmentedFile {
     }
 
     fn place(&self, index: usize, start: u64, len: u64, file: DeviceFile) -> Result<(), DiskError> {
-        let slot = self
+        let filled = self
             .slots
-            .make(index)
+            .fill(
+                index,
+                Segment {
+                    start,
+                    len,
+                    file,
+                    dirty: AtomicBool::new(false),
+                },
+            )
             .ok_or_else(|| beyond(&self.base, "segments past the file's bound"))?;
-        slot.set(Segment {
-            start,
-            len,
-            file,
-            dirty: AtomicBool::new(false),
-        })
-        .map_err(|_| beyond(&self.base, "a segment slot filled twice"))
+        if filled {
+            Ok(())
+        } else {
+            Err(beyond(&self.base, "a segment slot filled twice"))
+        }
     }
 
     /// The segments this handle knows.
     fn known(&self) -> usize {
-        self.slots.iter().count()
+        self.slots.len()
     }
 
     /// The end of the segments this handle knows.
     fn known_end(&self) -> u64 {
         self.slots
-            .iter()
-            .last()
+            .len()
+            .checked_sub(1)
+            .and_then(|last| self.slots.get(last))
+            .and_then(OnceLock::get)
             .map_or(0, |s| s.start.saturating_add(s.len))
     }
 
@@ -283,17 +330,14 @@ impl SegmentedFile {
 
     /// The segment holding `[offset, offset + len)` and its index, finding segments added since
     /// this handle last looked; a transfer across two segments, or past the last, is refused.
+    /// Each pass finds the segment, refuses, or counts one more segment filled, so the passes are
+    /// at most the bound.
     fn segment(&self, offset: u64, len: usize) -> Result<(usize, &Segment), DiskError> {
         let end = offset
             .checked_add(u64::try_from(len).map_err(|_| beyond(&self.base, "a transfer past u64"))?)
             .ok_or_else(|| beyond(&self.base, "a transfer past u64"))?;
         loop {
-            let at = self
-                .slots
-                .iter()
-                .enumerate()
-                .find(|(_, s)| offset >= s.start && offset < s.start.saturating_add(s.len));
-            if let Some((index, s)) = at {
+            if let Some((index, s)) = self.slots.find(offset) {
                 if end > s.start.saturating_add(s.len) {
                     return Err(beyond(&self.base, "a transfer across two segments"));
                 }

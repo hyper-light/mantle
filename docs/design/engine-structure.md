@@ -102,6 +102,16 @@ but its own first part: the work spread over shards, one per core, each owning w
   partial tail and merge it with a larger run: that repeats the larger run's rebuild as writes
   continue. Scans still seal their tail, and explicit maintenance, tidying and packing retain
   their full ordering rules. With no admitted job, a partial tail does not keep the range awake.
+- **Slices sized by work done.** A range sizes each idle slice at the runtime's step budget from
+  the work its slices did over the time they took (`ranges::Slice`). Each idle path reports the
+  units it did (order paid, entries fed or walked, filter pages at their worth in keys, branches
+  taken, merged units), none when everything owed waits on the device or the workers, and only
+  slices that did work enter the rate. Counted as its whole budget whether worked or not, a
+  packing slice with its feed's buffers out with the worker reported up to the packing's remaining
+  entries: 99% of a 10M fill's 9 M slices did nothing, and the inflated rate gave about 2,000 slices
+  a fill budgets that ran 131 µs–16 ms against a 4.5 µs slice; reported as done, a 10M fill's put
+  p99.99 fell from 172 µs to 36 µs and its worst put from 25 ms to 0.6 ms
+  (benchmark-results/mantle-slices-20261012, mantle-twosteps-20261012).
 - **Bounds.** Requests a channel holds; ranges a shard owns (its tasks bound,
   `tasks_per_shard`); batches out at the issuer; the page cache by bytes. Each is a stated bound
   with a typed refusal.

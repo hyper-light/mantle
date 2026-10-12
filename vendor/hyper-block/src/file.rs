@@ -209,6 +209,36 @@ impl DeviceFile {
         Ok(())
     }
 
+    /// Writes `copies` copies of `fill` back to back from `offset`. On Linux and macOS each call
+    /// hands the kernel as many copies as it takes at once (pwritev(2), as many vectors as
+    /// `IOV_MAX`, every one the same buffer), so a direct file's device has them all in flight
+    /// rather than one at a time: a 256 MiB file written whole with 128 KiB copies beside another
+    /// process's `F_FULLFSYNC` writes took 61-66 ms so, and 7.5-9.9 s a copy at a time (mantle
+    /// `docs/research/48-first-writes.md` §6). Elsewhere, a write a copy.
+    pub fn write_copies_at(&self, fill: &[u8], offset: u64, copies: u64) -> Result<(), DiskError> {
+        self.check_alignment(offset, fill.len())?;
+        self.check_address(fill.as_ptr().addr(), offset, fill.len())?;
+        let piece = u64::try_from(fill.len()).map_err(|_| self.overflow(offset))?;
+        piece
+            .checked_mul(copies)
+            .and_then(|total| offset.checked_add(total))
+            .ok_or_else(|| self.overflow(offset))?;
+        #[cfg(unix)]
+        {
+            sys::write_copies_at(&self.file, fill, offset, copies)
+                .map_err(|e| self.io_error("write copies", e))
+        }
+        #[cfg(not(unix))]
+        {
+            let mut at = offset;
+            for _ in 0..copies {
+                self.write_all_at(fill, at)?;
+                at = at.checked_add(piece).ok_or_else(|| self.overflow(offset))?;
+            }
+            Ok(())
+        }
+    }
+
     /// Fills `buf` from `offset` only if the OS holds every byte of it in memory now, without
     /// waiting for the device (`crate::resident`): true when it read, false when the read would
     /// wait, the file ends first, or the platform cannot tell, leaving the read to a thread that
@@ -571,6 +601,56 @@ mod sys {
 
     pub(super) fn write_at(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
         file.write_at(buf, offset)
+    }
+
+    /// `copies` copies of `fill` from `offset` (the caller checked the span fits a file offset),
+    /// by pwritev(2) with a vector a copy, all the one buffer: rustix passes at most `IOV_MAX` of
+    /// them a call. A call that ends inside a copy has the rest of that copy written alone.
+    pub(super) fn write_copies_at(
+        file: &File,
+        fill: &[u8],
+        offset: u64,
+        copies: u64,
+    ) -> io::Result<()> {
+        let invalid = || io::Error::from(io::ErrorKind::InvalidInput);
+        let piece = u64::try_from(fill.len()).map_err(|_| invalid())?;
+        let count = usize::try_from(copies).map_err(|_| invalid())?;
+        if fill.is_empty() {
+            return Ok(());
+        }
+        let mut vectors: Vec<io::IoSlice<'_>> = Vec::new();
+        vectors
+            .try_reserve_exact(count)
+            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        vectors.extend((0..count).map(|_| io::IoSlice::new(fill)));
+        let at = |copy: usize| {
+            u64::try_from(copy)
+                .ok()
+                .and_then(|c| c.checked_mul(piece))
+                .and_then(|b| offset.checked_add(b))
+                .ok_or_else(invalid)
+        };
+        let mut next = 0usize;
+        while let Some(rest) = vectors.get(next..).filter(|r| !r.is_empty()) {
+            let wrote = match rustix::io::pwritev(file, rest, at(next)?) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => n,
+                Err(e) if e == rustix::io::Errno::INTR => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let whole = wrote.checked_div(fill.len()).ok_or_else(invalid)?;
+            let part = wrote.checked_rem(fill.len()).ok_or_else(invalid)?;
+            next = next.checked_add(whole).ok_or_else(invalid)?;
+            if part > 0 {
+                let tail = fill.get(part..).ok_or_else(invalid)?;
+                let start = at(next)?
+                    .checked_add(u64::try_from(part).map_err(|_| invalid())?)
+                    .ok_or_else(invalid)?;
+                file.write_all_at(tail, start)?;
+                next = next.checked_add(1).ok_or_else(invalid)?;
+            }
+        }
+        Ok(())
     }
 
     /// All of `buf` at `offset` with `RWF_DSYNC`: each part durable before the call returns.
@@ -1004,6 +1084,35 @@ mod tests {
         );
         if !twin.resident.refused() {
             assert_eq!(buf, &bytes[..page]);
+        }
+    }
+
+    /// Do: write more copies of a page than one vectored call takes (1024 is `IOV_MAX` on Linux
+    /// and macOS) from past a hole, through a buffered handle and one past the cache. Expect:
+    /// every copy lands back to back, and the file ends with the last.
+    #[test]
+    fn copies_of_a_page_land_back_to_back_past_a_calls_vectors() {
+        for caching in [CachingRequest::Buffered, CachingRequest::PreferDirect] {
+            let dir = tempfile::tempdir().unwrap();
+            let file =
+                DeviceFile::open(&dir.path().join("copies"), true, caching, align()).unwrap();
+            let mut fill = AlignedBuf::zeroed(4096, align()).unwrap();
+            fill.extend_from_slice(&[0xa5; 4096]).unwrap();
+            let copies = 1500u64;
+            file.write_copies_at(fill.as_slice(), 4096, copies).unwrap();
+            assert_eq!(file.len().unwrap(), 4096 * (copies + 1));
+            let mut back = AlignedBuf::zeroed(4096, align()).unwrap();
+            back.extend_from_slice(&[0; 4096]).unwrap();
+            for k in 1..=copies {
+                back.as_mut_slice().fill(0);
+                file.read_exact_at(back.as_mut_slice(), 4096 * k).unwrap();
+                assert_eq!(back.as_slice(), fill.as_slice(), "copy {k}");
+            }
+            // A direct handle refuses copies at an offset off its alignment.
+            assert!(
+                file.write_copies_at(fill.as_slice(), 1, 1).is_err()
+                    || file.caching() == Caching::Buffered
+            );
         }
     }
 

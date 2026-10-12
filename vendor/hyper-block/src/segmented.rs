@@ -336,9 +336,13 @@ impl BlockFile for SegmentedFile {
     /// Writes the copies through a handle of each segment they reach opened past the OS's cache
     /// where the platform has a way ([`CachingRequest::PreferDirect`]): the bytes only make the
     /// blocks written, and no read wants them held in memory, where they would take the place of
-    /// pages reads do want. The segment's flush makes them durable.
+    /// pages reads do want. All of a segment's copies go in as few calls as the kernel takes
+    /// ([`DeviceFile::write_copies_at`]). The segment's flush makes them durable.
     fn write_whole(&self, offset: u64, copies: u64, fill: &[u8]) -> Result<(), DiskError> {
         let piece = u64::try_from(fill.len()).map_err(|_| beyond(&self.base, "a fill past u64"))?;
+        if piece == 0 {
+            return Ok(());
+        }
         let mut aligned = AlignedBuf::zeroed(fill.len(), whole_align(self.align)?)?;
         aligned.extend_from_slice(fill)?;
         let fill = aligned.as_slice();
@@ -353,14 +357,23 @@ impl BlockFile for SegmentedFile {
                 self.align,
             )?;
             s.dirty.store(true, Ordering::Release);
-            let end = s.start.saturating_add(s.len);
-            while left > 0 && at < end {
-                direct.write_all_at(fill, at.saturating_sub(s.start))?;
-                at = at
-                    .checked_add(piece)
-                    .ok_or_else(|| beyond(&self.base, "a transfer past u64"))?;
-                left = left.saturating_sub(1);
+            // The copies this segment holds from `at` on.
+            let here = s
+                .start
+                .saturating_add(s.len)
+                .saturating_sub(at)
+                .checked_div(piece)
+                .unwrap_or(0)
+                .min(left);
+            if here == 0 {
+                return Err(beyond(&self.base, "a copy across two segments"));
             }
+            direct.write_copies_at(fill, at.saturating_sub(s.start), here)?;
+            at = piece
+                .checked_mul(here)
+                .and_then(|b| at.checked_add(b))
+                .ok_or_else(|| beyond(&self.base, "a transfer past u64"))?;
+            left = left.saturating_sub(here);
         }
         Ok(())
     }

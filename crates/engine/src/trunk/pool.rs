@@ -29,6 +29,8 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+use hyper_block::issuer::Urgency;
+
 use hyper_block::issuer::Attacher;
 use hyper_rt::sync::{ChannelReceiver, Sender};
 
@@ -49,6 +51,9 @@ pub struct Task {
     pub end: Option<Vec<u8>>,
     pub drop_tombstones: bool,
     pub per: u64,
+    /// The root's: what frees room for the next memtable's branch, so its I/O goes before
+    /// deeper compactions' ([`Urgency::Soon`]).
+    pub soon: bool,
 }
 
 /// A worker's work: a compaction, or a full memtable's entries to pack into one branch.
@@ -407,6 +412,13 @@ fn run<F: BlockFile>(
     id: usize,
 ) -> Result<(Parts, u64, u64), Error> {
     store.begin_job(&job.grant, job.file_end, job.generation)?;
+    // A packing is what the next rotation waits for, the root's compactions what frees its room,
+    // the rest waited for by no one yet: the device's issuer serves them in that order (SILK).
+    store.set_urgency(match &job.work {
+        Work::Pack(_) => Urgency::Now,
+        Work::Compact(t) if t.soon => Urgency::Soon,
+        Work::Compact(_) => Urgency::Later,
+    });
     let mut waited = 0u64;
     let mut units = 0u64;
     let parts = match &job.work {

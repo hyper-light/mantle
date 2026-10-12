@@ -230,8 +230,36 @@ enum Submission {
         number: u64,
         transfers: Transfers,
         kind: Kind,
+        urgency: Urgency,
     },
     Retire,
+}
+
+/// How soon a submitter wants its batches' transfers, as the dispatcher orders them: every queued
+/// transfer of a sooner class goes to a worker before any of a later one, and within a class in
+/// the order they arrived. SILK orders a log-structured store's I/O the same way: its flushes
+/// first, then the compactions that free their room, then the rest (Balmau et al., "SILK:
+/// Preventing Latency Spikes in Log-Structured Merge Key-Value Stores", USENIX ATC 2019, §4).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Urgency {
+    /// Waited on now: a submitter's reads, a store's flush.
+    #[default]
+    Now,
+    /// Waited on soon: the work that frees room for the next flush.
+    Soon,
+    /// Waited on by no one yet.
+    Later,
+}
+
+impl Urgency {
+    /// The dispatcher's queue for it.
+    fn queue(self) -> usize {
+        match self {
+            Self::Now => 0,
+            Self::Soon => 1,
+            Self::Later => 2,
+        }
+    }
 }
 
 /// Every cold inbox publication wakes the dispatcher. Batch/retirement submissions and
@@ -618,6 +646,7 @@ fn attach<F: BlockFile + 'static>(
         watch_prepared: false,
         reader,
         reader_failure: None,
+        urgency: Urgency::Now,
     })
 }
 
@@ -660,6 +689,8 @@ pub struct Attached {
     reader: Option<Handle>,
     /// That duplicate's Drop unwound: retirement reports it.
     reader_failure: Option<LifecycleFailure>,
+    /// How soon its batches are wanted ([`Self::set_urgency`]).
+    urgency: Urgency,
 }
 
 /// An independent physical fence for one registered attachment. Its receiver can
@@ -826,6 +857,7 @@ impl Attached {
                 number,
                 transfers,
                 kind,
+                urgency: self.urgency,
             })
             .map_err(|_| gone())?;
         self.next = self.next.wrapping_add(1);
@@ -1063,6 +1095,12 @@ impl Attached {
         if let Some(reader) = self.reader.as_mut() {
             reader.set_residency_shadow(on);
         }
+    }
+
+    /// How soon the batches it sends from now on are wanted: the dispatcher hands a sooner
+    /// class's queued transfers to the device before a later one's ([`Urgency`]).
+    pub fn set_urgency(&mut self, urgency: Urgency) {
+        self.urgency = urgency;
     }
 
     /// Closes the submitter's own duplicate, before retirement is signalled (see `reader`).
@@ -1522,6 +1560,8 @@ struct Batch {
     non_abandonable: bool,
     /// A flush is still to be issued once the writes have completed.
     flush: bool,
+    /// Its submitter's urgency when it was sent: its flush is queued with it.
+    urgency: Urgency,
 }
 
 impl Client {
@@ -1578,10 +1618,10 @@ struct Dispatch<'a> {
     news: Vec<VecDeque<Task>>,
     /// Tasks handed to workers and not yet reported.
     in_flight: usize,
-    /// Transfers waiting for a worker, in the order they arrived. Each attached submitter has
-    /// at most the batches it attached for out, so these are at most those batches' transfers,
-    /// whose buffers their submitters already gave.
-    pending: VecDeque<Transfer>,
+    /// Transfers waiting for a worker, a queue for each [`Urgency`], sooner first, each in the
+    /// order they arrived. Each attached submitter has at most the batches it attached for out,
+    /// so these are at most those batches' transfers, whose buffers their submitters already gave.
+    pending: [VecDeque<Transfer>; 3],
     /// Indexed by slot. A slot is reused once every worker has dropped the file it held.
     clients: Vec<Option<Client>>,
     detaching: Vec<Detaching>,
@@ -1599,7 +1639,7 @@ impl<'a> Dispatch<'a> {
             news: (0..count).map(|_| VecDeque::new()).collect(),
             workers,
             in_flight: 0,
-            pending: VecDeque::new(),
+            pending: std::array::from_fn(|_| VecDeque::new()),
             clients: Vec::new(),
             detaching: Vec::new(),
             generation: 0,
@@ -1673,8 +1713,9 @@ impl<'a> Dispatch<'a> {
                 number,
                 transfers,
                 kind,
+                urgency,
             }) => {
-                self.batch(slot, generation, number, transfers, kind);
+                self.batch(slot, generation, number, transfers, kind, urgency);
                 true
             }
             Some(Submission::Retire) => {
@@ -1738,17 +1779,20 @@ impl<'a> Dispatch<'a> {
                                 number,
                                 transfers,
                                 kind,
+                                urgency,
                             } = submission
                             {
-                                self.batch(slot, generation, number, transfers, kind);
+                                self.batch(slot, generation, number, transfers, kind, urgency);
                             }
                         }
                     }
                 }
                 // Completion senders remain through native joins, including for a
                 // retirement refused after the admission lane closed.
-                for transfer in std::mem::take(&mut self.pending) {
-                    self.refused(transfer);
+                for queue in std::mem::take(&mut self.pending) {
+                    for transfer in queue {
+                        self.refused(transfer);
+                    }
                 }
             }
         }
@@ -1872,9 +1916,10 @@ impl<'a> Dispatch<'a> {
                 number,
                 transfers,
                 kind,
+                urgency,
             } = submission
             {
-                self.batch(slot, generation, number, transfers, kind);
+                self.batch(slot, generation, number, transfers, kind, urgency);
             }
         }
         if let Some(client) = self.client(slot, generation)
@@ -2188,6 +2233,7 @@ impl<'a> Dispatch<'a> {
         number: u64,
         mut transfers: Transfers,
         kind: Kind,
+        urgency: Urgency,
     ) {
         let flush = kind == Kind::Write { flush: true };
         let refused = self.stopping;
@@ -2221,12 +2267,15 @@ impl<'a> Dispatch<'a> {
             return;
         }
         if count == 0 {
-            self.pending.push_back(Transfer {
-                slot,
-                generation,
-                number,
-                op: Op::Flush,
-            });
+            self.queue(
+                urgency,
+                Transfer {
+                    slot,
+                    generation,
+                    number,
+                    op: Op::Flush,
+                },
+            );
         }
         // Each buffer goes to its transfer; its slot keeps the offset and an empty buffer until
         // the transfer reports.
@@ -2237,12 +2286,15 @@ impl<'a> Dispatch<'a> {
                 Kind::Write { .. } => Op::Write { index, buf, at },
                 Kind::Read => Op::Read { index, buf, at },
             };
-            self.pending.push_back(Transfer {
-                slot,
-                generation,
-                number,
-                op,
-            });
+            self.queue(
+                urgency,
+                Transfer {
+                    slot,
+                    generation,
+                    number,
+                    op,
+                },
+            );
         }
         let outstanding = if count == 0 { 1 } else { count };
         if let Some(client) = self.client(slot, generation) {
@@ -2253,7 +2305,15 @@ impl<'a> Dispatch<'a> {
                 failed: None,
                 non_abandonable: matches!(kind, Kind::Write { .. }),
                 flush: flush && count > 0,
+                urgency,
             });
+        }
+    }
+
+    /// Queues `transfer` behind the others of its urgency.
+    fn queue(&mut self, urgency: Urgency, transfer: Transfer) {
+        if let Some(queue) = self.pending.get_mut(urgency.queue()) {
+            queue.push_back(transfer);
         }
     }
 
@@ -2314,12 +2374,16 @@ impl<'a> Dispatch<'a> {
         if batch.flush && batch.failed.is_none() {
             batch.flush = false;
             batch.outstanding = 1;
-            self.pending.push_back(Transfer {
-                slot,
-                generation,
-                number,
-                op: Op::Flush,
-            });
+            let urgency = batch.urgency;
+            self.queue(
+                urgency,
+                Transfer {
+                    slot,
+                    generation,
+                    number,
+                    op: Op::Flush,
+                },
+            );
             return;
         }
         if let Some(batch) = client.batches.remove(at) {
@@ -2357,12 +2421,12 @@ impl<'a> Dispatch<'a> {
     }
 
     /// Hands each idle worker its news first, then queued transfers to the idle workers with
-    /// no news waiting, in the order they arrived.
+    /// no news waiting, the soonest urgency first and each in the order they arrived.
     fn dispatch(&mut self) {
         let mut idle = std::mem::take(&mut self.idle);
         idle.retain(|&worker| !self.tell(worker));
         while let Some(&worker) = idle.last() {
-            let Some(transfer) = self.pending.pop_front() else {
+            let Some(transfer) = self.pending.iter_mut().find_map(VecDeque::pop_front) else {
                 break;
             };
             idle.pop();
@@ -2594,6 +2658,8 @@ mod tests {
         /// reads it made there.
         resident: AtomicBool,
         resident_reads: AtomicUsize,
+        /// The offsets of the writes, in the order they entered.
+        order: Mutex<Vec<u64>>,
     }
 
     /// A file on disk that counts the transfers in flight, holds every write until the test
@@ -2668,6 +2734,7 @@ mod tests {
             let now = c.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             c.most.fetch_max(now, Ordering::SeqCst);
             c.entered.fetch_add(1, Ordering::SeqCst);
+            c.order.lock().unwrap().push(offset);
             while !c.open.load(Ordering::SeqCst) {
                 std::thread::yield_now();
             }
@@ -3454,6 +3521,46 @@ mod tests {
         attached.flush().unwrap();
         assert_eq!(c.flushes.load(Ordering::SeqCst), 1);
         assert_eq!(c.completed_at_flush.load(Ordering::SeqCst), 5);
+    }
+
+    /// A sooner class's queued transfers go to the device before a later class's that queued
+    /// first: with the device's only worker held, a later batch, a soon one and a now one wait,
+    /// and once the worker is free the device sees the now write, the soon one, then the later
+    /// ones in the order they were given.
+    #[test]
+    fn a_sooner_batch_goes_to_the_device_before_a_later_one_queued_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+        let probe = Probe::new(dir.path(), false, None);
+        let mut holder = issuer.attach(&probe).unwrap();
+        let mut later = issuer.attach(&probe).unwrap();
+        let mut soon = issuer.attach(&probe).unwrap();
+        let mut now = issuer.attach(&probe).unwrap();
+        later.set_urgency(Urgency::Later);
+        soon.set_urgency(Urgency::Soon);
+        now.set_urgency(Urgency::Now);
+        let mut given = writes(5).into_iter();
+        holder
+            .submit(given.by_ref().take(1).collect(), false)
+            .unwrap();
+        probe.entered(1);
+        later
+            .submit(given.by_ref().take(2).collect(), false)
+            .unwrap();
+        soon.submit(given.by_ref().take(1).collect(), false)
+            .unwrap();
+        now.submit(given.collect(), false).unwrap();
+        probe.open();
+        for a in [&mut holder, &mut later, &mut soon, &mut now] {
+            let (number, answer) = a.answer().unwrap();
+            assert_eq!(number, 0);
+            answer.unwrap();
+        }
+        let page = 4096;
+        assert_eq!(
+            *probe.counts.order.lock().unwrap(),
+            [0, 4 * page, 3 * page, page, 2 * page]
+        );
     }
 
     /// Several submitters on one device share its workers: the device never has more than the

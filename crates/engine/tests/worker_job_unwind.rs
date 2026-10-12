@@ -279,6 +279,7 @@ fn an_active_job_read_panic_returns_after_retirement_and_preserves_retry_and_che
             end: None,
             drop_tombstones: false,
             per: input.count,
+            soon: false,
         }),
         grant,
         file_end: store.end(),

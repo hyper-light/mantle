@@ -2748,6 +2748,14 @@ impl<F: BlockFile> Store<F> {
         }
     }
 
+    /// How soon the batches this store sends to its device's issuer from now on are wanted
+    /// ([`hyper_block::issuer::Urgency`]); a store with no issuer attached has no queue to order.
+    pub fn set_urgency(&mut self, urgency: hyper_block::issuer::Urgency) {
+        if let Some(writer) = self.writer.as_mut() {
+            writer.attached.set_urgency(urgency);
+        }
+    }
+
     /// Shadow mode for the resident reads' kept answers, for measurement: each read made on one
     /// probes anyway and counts the answer wrong when the probe disagrees.
     pub fn set_residency_shadow(&mut self, on: bool) {

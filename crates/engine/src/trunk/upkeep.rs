@@ -445,6 +445,7 @@ impl Trunk {
     /// workers, else a job for them.
     fn plan_compact(&mut self, n: usize, i: usize) -> Result<(), Error> {
         let t = self.timed.then(std::time::Instant::now);
+        let soon = n == self.root;
         let node = self.node(n)?;
         let pivot = node.pivots.get(i).ok_or(corrupt())?;
         let (start, covered) = (pivot.start, node.inflight.len());
@@ -465,6 +466,7 @@ impl Trunk {
                     end,
                     drop_tombstones: false,
                     per: u64::MAX,
+                    soon,
                 })),
             }
         } else {
@@ -637,6 +639,7 @@ impl Trunk {
     /// branches in place and splits one over its size into even parts; trunk.c, research/34).
     fn plan_settle(&mut self, n: usize) -> Result<(), Error> {
         let t = self.timed.then(std::time::Instant::now);
+        let soon = n == self.root;
         let node = self.node(n)?;
         let pivot = node.pivots.first().ok_or(corrupt())?;
         let count = entries(pivot.bundle.branches());
@@ -679,6 +682,7 @@ impl Trunk {
                     end,
                     drop_tombstones: true,
                     per,
+                    soon,
                 })),
             }
         } else {

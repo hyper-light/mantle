@@ -96,6 +96,12 @@ pub trait BlockFile: Send {
         Ok(None)
     }
 
+    /// The end of the segment holding `offset`, when the file grows by segments and one does.
+    /// None otherwise.
+    fn segment_end(&self, _offset: u64) -> Result<Option<u64>, DiskError> {
+        Ok(None)
+    }
+
     /// Writes all of `buf` at `offset` and makes that write durable before it returns: at least
     /// that write, and of the others not yet flushed none it promises. By default a write and a
     /// flush of the file. A failure leaves the write's durability unknown, as a flush's does.

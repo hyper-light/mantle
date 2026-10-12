@@ -150,6 +150,10 @@ fn elapsed_ns(since: Option<std::time::Instant>) -> u64 {
 /// (38-44% at none, 0.2-0.6% at 16).
 pub const RANGE_FILTER_BITS: u32 = 8;
 
+/// A new store's first segment, when its file grows by segments: the superblocks' extent and the
+/// first checkpoint's map, whose one count takes one page of one extent.
+const FIRST_SEGMENT_EXTENTS: u64 = 2;
+
 /// A store over one file, owned by one thread (as every `BlockFile` is).
 #[derive(Debug)]
 pub struct Store<F: BlockFile> {
@@ -231,6 +235,34 @@ pub struct Store<F: BlockFile> {
     forgetting: VecDeque<u64>,
     /// A worker's way to more extents once its grant is spent ([`Store::set_refill`]).
     refill: Option<Refill>,
+    /// A file grown by segments ([`BlockFile::grow`]): what the allocator may hand out. None for
+    /// a file that grows by its writes, and for a worker's.
+    segments: Option<Segments>,
+    /// A booked segment is being added and written ([`Self::begin_growth`]).
+    growth_out: bool,
+    /// The extents a segment adds when this store grows its file in place for its own
+    /// allocations ([`Self::set_growth_extents`]).
+    growth_extents: u64,
+}
+
+/// The extents of a file grown by segments that the store may use: each segment is written
+/// whole before any of its extents is handed out, so every transfer the store makes in it is an
+/// overwrite, and none waits behind a first write (docs/research/48).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Segments {
+    /// Extents admitted, from 0: written whole.
+    pub admitted: u64,
+    /// A segment booked past them and not yet written whole.
+    pub pending: Option<Pending>,
+}
+
+/// A segment booked past the admitted extents ([`Store::begin_growth`]): its first extent, its
+/// extents, and whether its file exists yet (recovered, or added by a growth that ran).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pending {
+    pub start: u64,
+    pub extents: u64,
+    pub added: bool,
 }
 
 /// A file returned after physical retirement, or its unchanged owner on refusal.
@@ -492,7 +524,7 @@ fn corrupt(why: Malformed) -> Error {
     }
 }
 
-fn blocking_allowed(what: &'static str) -> Result<(), Error> {
+pub(crate) fn blocking_allowed(what: &'static str) -> Result<(), Error> {
     if hyper_rt::registry::current_shard().is_some() {
         Err(Error::InvalidArgument { what })
     } else {
@@ -665,7 +697,20 @@ impl<F: BlockFile> Store<F> {
             forgetting: VecDeque::new(),
             timed: false,
             refill: None,
+            segments: None,
+            growth_out: false,
+            growth_extents: FIRST_SEGMENT_EXTENTS,
         };
+        if store
+            .file
+            .as_ref()
+            .is_some_and(BlockFile::grows_by_segments)
+        {
+            // A new store's first segment holds the superblocks' extent and the first map's,
+            // written whole before the first checkpoint uses them.
+            store.segments = Some(Segments::default());
+            store.grow_now(FIRST_SEGMENT_EXTENTS)?;
+        }
         store.checkpoint(None, 0)?;
         Ok(store)
     }
@@ -733,6 +778,9 @@ impl<F: BlockFile> Store<F> {
             forgetting: VecDeque::new(),
             timed: false,
             refill: None,
+            segments: None,
+            growth_out: false,
+            growth_extents: FIRST_SEGMENT_EXTENTS,
         })
     }
 
@@ -805,8 +853,9 @@ impl<F: BlockFile> Store<F> {
             });
         }
         let refs = Self::read_map(&file, config, &mut buf, &sb)?;
-        let alloc = Allocator::from_refs(refs, config.max_extents)?;
+        let mut alloc = Allocator::from_refs(refs, config.max_extents)?;
         let end = file.len().map_err(|e| io("stat a store", e))?;
+        let segments = Self::recovered_segments(&file, config, &mut alloc, end)?;
         let recovered = Recovered {
             generation: sb.generation,
             applied: sb.applied,
@@ -856,6 +905,9 @@ impl<F: BlockFile> Store<F> {
                 forgetting: VecDeque::new(),
                 timed: false,
                 refill: None,
+                segments,
+                growth_out: false,
+                growth_extents: FIRST_SEGMENT_EXTENTS,
             },
             recovered,
         ))
@@ -1062,9 +1114,20 @@ impl<F: BlockFile> Store<F> {
         self.durable.generation
     }
 
-    /// An extent for new pages, held once.
+    /// The extents a segment adds when this store grows its file in place for its own
+    /// allocations: the shard's segment size ([`crate::shard_db`]).
+    pub fn set_growth_extents(&mut self, extents: u64) {
+        self.growth_extents = extents.max(1);
+    }
+
+    /// An extent for new pages, held once. A file kept as segments with no admitted extent left
+    /// grows here first by a segment, where the store may wait ([`Self::grows_in_place`]); where
+    /// it may not, its owner grows it ahead.
     pub fn allocate_extent(&mut self) -> Result<u64, Error> {
         self.allocator_available()?;
+        if self.refill.is_none() && self.alloc.capacity() == 0 && self.grows_in_place() {
+            self.grow_now(self.growth_extents)?;
+        }
         match self.alloc.allocate() {
             Err(Error::LimitExceeded { .. }) if self.refill.is_some() => {
                 // The failed granted allocation moved no extent. A runtime task must
@@ -1139,6 +1202,209 @@ impl<F: BlockFile> Store<F> {
     /// The bytes the file is known to hold: what a read may reach.
     pub fn end(&self) -> u64 {
         self.end
+    }
+
+    fn extent_bytes(config: Config) -> Result<u64, Error> {
+        u64::try_from(config.page_size)
+            .ok()
+            .and_then(|p| p.checked_mul(u64::from(config.extent_pages)))
+            .ok_or(corrupt(Malformed::TooLarge))
+    }
+
+    /// A file grown by segments, opened: each segment holding an extent the allocator handed out
+    /// was written whole before it was, so those are admitted; the file past them may hold a
+    /// segment added and not written whole before a crash, which is written again before any of
+    /// it is used.
+    fn recovered_segments(
+        file: &F,
+        config: Config,
+        alloc: &mut Allocator,
+        end: u64,
+    ) -> Result<Option<Segments>, Error> {
+        if !file.grows_by_segments() {
+            return Ok(None);
+        }
+        let bytes = Self::extent_bytes(config)?;
+        let last = alloc
+            .high_water()
+            .checked_sub(1)
+            .and_then(|e| e.checked_mul(bytes))
+            .ok_or(corrupt(Malformed::CountMismatch))?;
+        let held_end = file
+            .segment_end(last)
+            .map_err(|e| io("find a store's segments", e))?
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        if !held_end.is_multiple_of(bytes) || !end.is_multiple_of(bytes) || end < held_end {
+            return Err(corrupt(Malformed::CountMismatch));
+        }
+        let admitted = held_end
+            .checked_div(bytes)
+            .ok_or(corrupt(Malformed::CountMismatch))?;
+        alloc.set_limit(admitted.min(config.max_extents))?;
+        let past = end
+            .checked_sub(held_end)
+            .and_then(|b| b.checked_div(bytes))
+            .ok_or(corrupt(Malformed::CountMismatch))?;
+        let pending = if past > 0 {
+            Some(Pending {
+                start: admitted,
+                extents: past,
+                added: true,
+            })
+        } else {
+            None
+        };
+        Ok(Some(Segments { admitted, pending }))
+    }
+
+    /// The extents a file grown by segments may use, and a segment being written whole past
+    /// them; None for a file that grows by its writes.
+    pub fn segments(&self) -> Option<Segments> {
+        self.segments
+    }
+
+    /// Extents the allocator may still hand out before the file grows.
+    pub fn capacity(&self) -> u64 {
+        self.alloc.capacity()
+    }
+
+    /// Books a segment of `extents` past those admitted, to be added and written whole
+    /// ([`Self::grow_segment`]) and then admitted ([`Self::admit`]); a segment booked already
+    /// and not out (recovered past the admitted extents, or whose growth no worker took) is booked
+    /// again as it stands. None when the file grows by its writes, or a growth is out.
+    pub fn begin_growth(&mut self, extents: u64) -> Result<Option<Pending>, Error> {
+        let max = self.config.max_extents;
+        if self.growth_out {
+            return Ok(None);
+        }
+        let Some(seg) = self.segments.as_mut() else {
+            return Ok(None);
+        };
+        let booked = match seg.pending {
+            Some(p) => p,
+            None => {
+                let n = extents.min(max.saturating_sub(seg.admitted));
+                if n == 0 {
+                    return Err(Error::LimitExceeded {
+                        what: "extents of a store",
+                        limit: max,
+                    });
+                }
+                let p = Pending {
+                    start: seg.admitted,
+                    extents: n,
+                    added: false,
+                };
+                seg.pending = Some(p);
+                p
+            }
+        };
+        self.growth_out = true;
+        Ok(Some(booked))
+    }
+
+    /// Adds the segment booked at `start` of `extents` when `add` (else it exists), through this
+    /// store's own file, and writes it whole with zeros: a worker's growth job, or the shard's
+    /// own while it is cold (creation, recovery).
+    pub fn grow_segment(&mut self, start: u64, extents: u64, add: bool) -> Result<(), Error> {
+        blocking_allowed("a synchronous segment write in a runtime task")?;
+        let bytes = Self::extent_bytes(self.config)?;
+        let file = self.file.as_ref().ok_or_else(Self::original_missing)?;
+        let len = extents
+            .checked_mul(bytes)
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        let at = start
+            .checked_mul(bytes)
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        if add {
+            let placed = file
+                .grow(len)
+                .map_err(|e| io("add a store segment", e))?
+                .ok_or(Error::InvalidArgument {
+                    what: "a segment added to a file that grows by its writes",
+                })?;
+            if placed != at {
+                return Err(Error::InvalidArgument {
+                    what: "a segment added somewhere other than past the admitted extents",
+                });
+            }
+        }
+        let zeros = Self::run_buf(file.alignment(), self.config)?;
+        for i in 0..extents {
+            let offset = start
+                .checked_add(i)
+                .and_then(|e| e.checked_mul(bytes))
+                .ok_or(corrupt(Malformed::TooLarge))?;
+            file.write_all_at(zeros.as_slice(), offset)
+                .map_err(|e| io("write a store segment whole", e))?;
+        }
+        self.io.pages_written = self
+            .io
+            .pages_written
+            .saturating_add(extents.saturating_mul(u64::from(self.config.extent_pages)));
+        Ok(())
+    }
+
+    /// The segment booked at `start` of `extents` is written whole: the allocator may hand its
+    /// extents out.
+    pub fn admit(&mut self, start: u64, extents: u64) -> Result<(), Error> {
+        let bytes = Self::extent_bytes(self.config)?;
+        let max = self.config.max_extents;
+        let seg = self.segments.as_mut().ok_or(Error::InvalidArgument {
+            what: "a segment admitted by a file that grows by its writes",
+        })?;
+        if seg
+            .pending
+            .is_none_or(|p| (p.start, p.extents) != (start, extents))
+        {
+            return Err(Error::InvalidArgument {
+                what: "a segment admitted that was not the one booked",
+            });
+        }
+        let admitted = start
+            .checked_add(extents)
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        seg.admitted = admitted;
+        seg.pending = None;
+        self.growth_out = false;
+        self.alloc.set_limit(admitted.min(max))?;
+        self.end = self.end.max(
+            admitted
+                .checked_mul(bytes)
+                .ok_or(corrupt(Malformed::TooLarge))?,
+        );
+        Ok(())
+    }
+
+    /// Whether the file grows by segments and this store may grow it here and now: it holds its
+    /// own file, on a thread that may wait ([`Self::grow_now`]).
+    pub fn grows_in_place(&self) -> bool {
+        self.segments.is_some()
+            && self.file.is_some()
+            && blocking_allowed("a synchronous segment growth in a runtime task").is_ok()
+    }
+
+    /// A booked segment's growth no worker took: booked again as it stands.
+    pub fn growth_abandoned(&mut self) {
+        self.growth_out = false;
+    }
+
+    /// A booked segment's file was added by a growth that ran: booked again, it is only written.
+    pub fn growth_added(&mut self) {
+        if let Some(p) = self.segments.as_mut().and_then(|s| s.pending.as_mut()) {
+            p.added = true;
+        }
+    }
+
+    /// Grows by a segment of `extents` here and now, written whole and admitted: a cold store's
+    /// own (creation, recovery, a store with no workers).
+    pub fn grow_now(&mut self, extents: u64) -> Result<(), Error> {
+        if let Some(p) = self.begin_growth(extents)? {
+            self.grow_segment(p.start, p.extents, !p.added)?;
+            self.growth_added();
+            self.admit(p.start, p.extents)?;
+        }
+        Ok(())
     }
 
     /// The file holds at least `end` bytes: a worker's writes, landed, reached it.

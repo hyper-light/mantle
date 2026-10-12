@@ -28,7 +28,9 @@ use crate::memtable::hashed::{HashMem, Walk};
 use crate::rows::Rows;
 use crate::scan::{BorrowedScanMerge, ScanMerge};
 use crate::store::{Config, IntoFile, Store};
-use crate::trunk::pool::{self, Back, FEED_BUFFERS, Job, Owner, Pool, Spawn, Stream, Ticket, Work};
+use crate::trunk::pool::{
+    self, Back, FEED_BUFFERS, Growth, Job, Owner, Pool, Spawn, Stream, Ticket, Work,
+};
 use crate::trunk::{Source, Trunk, TrunkConfig};
 use crate::util::reuse;
 use hyper_block::block::BlockFile;
@@ -417,6 +419,12 @@ pub struct ShardDb<F: BlockFile> {
     scan_end: Vec<u8>,
     /// Whether maintenance is timed ([`ShardDb::set_timed`]).
     timed: bool,
+    /// A file kept as segments: the growth out on a worker, its segment's first extent and
+    /// extents; the extents a segment adds, the reserve kept ahead of the allocations; and the
+    /// most a packing's grant wanted that the admitted extents could not give.
+    growth: Option<(Ticket, u64, u64)>,
+    segment_extents: u64,
+    packing_wanted: u64,
 }
 
 /// Cited (Luo & Carey, PVLDB 2021 §5.4): a tuning step moves 5% of the memory budget toward
@@ -683,6 +691,9 @@ impl<F: BlockFile> ShardDb<F> {
             scan_opened: 0,
             scan_end: Vec::new(),
             timed: false,
+            growth: None,
+            segment_extents: 0,
+            packing_wanted: 0,
         })
     }
 
@@ -694,7 +705,9 @@ impl<F: BlockFile> ShardDb<F> {
         mem_limit: usize,
         trunk: TrunkConfig,
     ) -> Result<Self, Error> {
-        Self::with(Store::create(file, store)?, mem_limit, Trunk::new(trunk)?)
+        let mut db = Self::with(Store::create(file, store)?, mem_limit, Trunk::new(trunk)?)?;
+        db.grow_cold()?;
+        Ok(db)
     }
 
     /// The engine in `file` at its newest checkpoint, and the last Raft index that checkpoint
@@ -711,7 +724,9 @@ impl<F: BlockFile> ShardDb<F> {
             Some(head) => Trunk::load(&mut store, head)?,
             None => Trunk::new(trunk)?,
         };
-        Ok((Self::with(store, mem_limit, trunk)?, recovered.applied))
+        let mut db = Self::with(store, mem_limit, trunk)?;
+        db.grow_cold()?;
+        Ok((db, recovered.applied))
     }
 
     /// Makes the engine's state through Raft index `applied` durable: the memtable packed into
@@ -844,6 +859,9 @@ impl<F: BlockFile> ShardDb<F> {
     /// allocator stay unchanged between Save and the second flush's commit.
     pub(crate) fn checkpoint_paced(&mut self, applied: u64, keys: u64) -> Result<bool, Error> {
         self.require_async_backend()?;
+        // The checkpoint's flush and its map's extents need the file's admitted extents, which
+        // only this drives while the checkpoint steps.
+        self.grow(false)?;
         if let Some(checkpoint) = &self.checkpoint {
             if checkpoint.applied != applied {
                 return Err(Error::InvalidArgument {
@@ -1081,6 +1099,12 @@ impl<F: BlockFile> ShardDb<F> {
             self.partition_memory();
         }
         Ok(())
+    }
+
+    /// The extents a store whose file grows by segments may use, and a segment being written
+    /// whole past them ([`Store::segments`]); None for a file that grows by its writes.
+    pub fn segments(&self) -> Option<crate::store::Segments> {
+        self.store.segments()
     }
 
     /// The write memory the store has now ([`Self::set_write_budget`]).
@@ -2343,7 +2367,152 @@ impl<F: BlockFile> ShardDb<F> {
 
     /// A put that took `bytes` of the memtable does its share of each debt (the module's
     /// pacing).
+    /// A packing's grant: the memtable's bytes in extents, and one for the last partial one.
+    fn packing_extents(&self) -> u64 {
+        let run = self.store.run_bytes().max(1);
+        let n = crate::util::div_ceil_usize(self.mem_limit, run)
+            .unwrap_or(0)
+            .saturating_add(1);
+        u64::try_from(n).unwrap_or(u64::MAX)
+    }
+
+    /// A file kept as segments, cold (created, opened, no workers yet): a segment recovered past
+    /// the admitted extents written whole again, and one segment's reserve admitted ahead, here
+    /// and now. A segment is a packing's grant at first, the unit a fill grows by
+    /// ([`Self::grow`] doubles it when the allocations outrun it).
+    fn grow_cold(&mut self) -> Result<(), Error> {
+        let Some(seg) = self.store.segments() else {
+            return Ok(());
+        };
+        self.segment_extents = self.packing_extents();
+        self.store.set_growth_extents(self.segment_extents);
+        if seg.pending.is_some() {
+            self.store.grow_now(self.segment_extents)?;
+        }
+        if self.store.capacity() < self.segment_extents {
+            self.store.grow_now(self.segment_extents)?;
+        }
+        Ok(())
+    }
+
+    /// Grows a file kept as segments ahead of its allocations (docs/research/48): takes a growth
+    /// back from its worker, waiting for it when `wait`, admits its segment and answers the asks
+    /// for extents that waited for it; then, with fewer extents left than a segment's reserve or
+    /// than any grant waiting wants, books the next segment and hands it to a worker to add and
+    /// write whole. A segment doubles when a grant waited for one. Without workers it grows in
+    /// place, where the shard may wait. Returns whether it did anything.
+    fn grow(&mut self, wait: bool) -> Result<bool, Error> {
+        if self.store.segments().is_none() {
+            return Ok(false);
+        }
+        let mut did = false;
+        if let Some((ticket, start, extents)) = self.growth {
+            let pool = self.trunk.pool_mut().ok_or(Error::InvalidArgument {
+                what: "a growth out with no workers",
+            })?;
+            if let Some(back) = pool.take(&mut self.store, Owner::Grow, wait)? {
+                if back.ticket != ticket {
+                    return Err(Error::InvalidArgument {
+                        what: "a growth result for another growth",
+                    });
+                }
+                if let Some(error) = back.physical_error {
+                    return Err(error);
+                }
+                back.result?;
+                self.growth = None;
+                self.store.growth_added();
+                self.store.admit(start, extents)?;
+                did = true;
+            }
+        }
+        let wanted = self
+            .trunk
+            .take_capacity_wanted()
+            .max(std::mem::take(&mut self.packing_wanted))
+            .max(self.trunk.pool_mut().map_or(0, |p| p.needs_wanted()));
+        if let Some(pool) = self.trunk.pool_mut() {
+            pool.answer_needs(&mut self.store)?;
+        }
+        if wanted > self.store.capacity() {
+            // Grants outran the reserve: segments twice as large from now on, and at least
+            // what is wanted.
+            self.segment_extents = self.segment_extents.saturating_mul(2).max(wanted);
+            self.store.set_growth_extents(self.segment_extents);
+        }
+        if self.growth.is_some() || self.store.capacity() >= self.segment_extents.max(wanted) {
+            return Ok(did);
+        }
+        let Some(p) = self.store.begin_growth(self.segment_extents.max(wanted))? else {
+            return Ok(did);
+        };
+        // Where the shard may wait it grows here, so no growth is out on a worker while its own
+        // allocations need one ([`Store::grows_in_place`]); a runtime's shard hands it to one.
+        if self.store.grows_in_place() {
+            self.store.grow_segment(p.start, p.extents, !p.added)?;
+            self.store.growth_added();
+            self.store.admit(p.start, p.extents)?;
+            return Ok(true);
+        }
+        let Some(pool) = self.trunk.pool_mut() else {
+            self.store.growth_abandoned();
+            return Ok(did);
+        };
+        let job = Box::new(Job {
+            work: Work::Grow(Growth {
+                start: p.start,
+                extents: p.extents,
+                add: !p.added,
+            }),
+            grant: Vec::new(),
+            file_end: self.store.end(),
+            generation: self.store.generation(),
+        });
+        match pool.send(job, Owner::Grow, true) {
+            Ok(Ok(ticket)) => {
+                self.growth = Some((ticket, p.start, p.extents));
+                Ok(true)
+            }
+            Ok(Err(_)) => {
+                pool.want_message();
+                if self.store.grows_in_place() {
+                    // Every worker is occupied and the shard may wait: grown here.
+                    self.store.grow_segment(p.start, p.extents, !p.added)?;
+                    self.store.growth_added();
+                    self.store.admit(p.start, p.extents)?;
+                    return Ok(true);
+                }
+                // The next look books it again.
+                self.store.growth_abandoned();
+                Ok(did)
+            }
+            Err((error, _)) => {
+                self.store.growth_abandoned();
+                Err(error)
+            }
+        }
+    }
+
+    /// Grows a file kept as segments until `extents` can be handed out, waiting for each growth:
+    /// for the shard's own allocations where it may wait.
+    fn grow_for(&mut self, extents: u64) -> Result<(), Error> {
+        if self.store.segments().is_none() {
+            return Ok(());
+        }
+        while self.store.capacity() < extents {
+            self.packing_wanted = self.packing_wanted.max(extents);
+            if !self.grow(true)? && self.growth.is_none() {
+                return Err(Error::LimitExceeded {
+                    what: "extents a store's file could be grown by",
+                    limit: extents,
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn pace(&mut self, bytes: usize, paced: bool) -> Result<(), Error> {
+        self.grow(false)?;
         let room = self.mem.room();
         // The active memtable sorts its own entries as it fills, in chunks of at most
         // `order_bound` entries paid by the puts that write them, so the one it rotates to is
@@ -2515,13 +2684,21 @@ impl<F: BlockFile> ShardDb<F> {
             return Ok(());
         };
         let entries = u64::try_from(p.mem.len()).unwrap_or(u64::MAX);
-        if let Some(pool) = self.trunk.pool_mut().filter(|pool| pool.can_take(true)) {
-            // The grant: the memtable's bytes in extents, and one for the last partial one; a
-            // branch that needs more asks for it.
-            let run = self.store.run_bytes().max(1);
-            let extents = crate::util::div_ceil_usize(p.mem.bytes(), run)
-                .unwrap_or(0)
-                .saturating_add(1);
+        // The grant: the memtable's bytes in extents, and one for the last partial one; a branch
+        // that needs more asks for it.
+        let run = self.store.run_bytes().max(1);
+        let extents = crate::util::div_ceil_usize(p.mem.bytes(), run)
+            .unwrap_or(0)
+            .saturating_add(1);
+        let asked = u64::try_from(extents).unwrap_or(u64::MAX);
+        // A file kept as segments whose admitted extents cannot hold it yet: the packing starts
+        // once the file has grown ([`Self::grow`]), as one no worker took does; one that must
+        // end now is built here, the file grown first.
+        let short = self.store.segments().is_some() && self.store.capacity() < asked;
+        if short {
+            self.packing_wanted = self.packing_wanted.max(asked);
+        }
+        if !short && let Some(pool) = self.trunk.pool_mut().filter(|pool| pool.can_take(true)) {
             let grant = self.store.grant(extents)?;
             let (full, full_rx) = sync_channel(FEED_BUFFERS);
             let job = Box::new(Job {
@@ -2557,9 +2734,14 @@ impl<F: BlockFile> ShardDb<F> {
             }
         }
         if now || !self.trunk.has_pool() {
+            self.grow_for(asked)?;
+            let Some(p) = &mut self.packing else {
+                return Ok(());
+            };
             p.builder = Some(Builder::new(&mut self.store, Keys::Exactly(entries))?);
         } else if let Some(pool) = self.trunk.pool_mut() {
-            // Every worker is occupied: a completion frees the slot this packing needs.
+            // Every worker is occupied, or the file has yet to grow: a completion, or the
+            // growth's, frees what this packing needs.
             pool.want_message();
         }
         Ok(())
@@ -3045,7 +3227,9 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     fn owed_with(&self, paced: bool) -> bool {
-        self.packing.is_some()
+        self.growth.is_some()
+            || self.growth_due()
+            || self.packing.is_some()
             || !self.frozen.is_empty()
             || self.trunk.debt() > 0
             || !self.trunk.is_idle()
@@ -3108,7 +3292,19 @@ impl<F: BlockFile> ShardDb<F> {
         }
     }
 
+    /// Whether a file kept as segments has fewer extents left than a segment's reserve, and no
+    /// growth out.
+    fn growth_due(&self) -> bool {
+        self.growth.is_none()
+            && self.store.segments().is_some()
+            && self.store.capacity() < self.segment_extents
+    }
+
     fn idle_step_with(&mut self, keys: u64, paced: bool) -> Result<u64, Error> {
+        // A file kept as segments grows first: the room every allocation after needs.
+        if (self.growth.is_some() || self.growth_due()) && self.grow(!paced)? {
+            return Ok(1);
+        }
         let left = self.pack_left();
         if left > 0 || self.packing.is_some() {
             // At least one: a memtable packed whole with no filter page left still has its
@@ -3249,14 +3445,21 @@ impl<F: BlockFile> ShardDb<F> {
         }
         // Built here: after every older memtable's branch, pending in age order.
         self.drain_frozen()?;
-        let Some(Packing {
-            mut mem,
-            walk,
-            builder: Some(mut builder),
-            ..
-        }) = self.packing.take()
-        else {
-            return Ok(());
+        let (mut mem, walk, mut builder) = match self.packing.take() {
+            Some(Packing {
+                mem,
+                walk,
+                builder: Some(builder),
+                ..
+            }) => (mem, walk, builder),
+            Some(other) => {
+                // Neither handed to a worker nor built: kept, never dropped with its entries.
+                self.packing = Some(other);
+                return Err(Error::InvalidArgument {
+                    what: "a packing finished that was neither handed to a worker nor built",
+                });
+            }
+            None => return Ok(()),
         };
         let mut walk = match walk {
             Some(w) => w,
@@ -3425,6 +3628,9 @@ impl<F: BlockFile> ShardDb<F> {
     pub(crate) fn flush_paced(&mut self, keys: u64) -> Result<bool, Error> {
         self.trunk.clear_io_wait();
         self.require_async_backend()?;
+        // A job the file's admitted extents cannot hold waits for growth, which only this
+        // drives while the flush steps the trunk.
+        self.grow(false)?;
         if self.rotation.is_some() && !self.rotate_paced(keys)? {
             return Ok(false);
         }

@@ -981,7 +981,21 @@ impl Trunk {
                     .unwrap_or(entries)
                     .saturating_add(1);
                 let parts = usize::try_from(parts).unwrap_or(usize::MAX);
-                let given = store.grant(extents.saturating_add(parts))?;
+                let needed = extents.saturating_add(parts);
+                let asked = u64::try_from(needed).unwrap_or(u64::MAX);
+                if store.segments().is_some() && store.capacity() < asked {
+                    if store.grows_in_place() {
+                        // Where the shard may wait, its file grows by the grant here.
+                        store.grow_now(asked)?;
+                    }
+                    if store.capacity() < asked {
+                        // The file's admitted extents cannot hold it yet: the shard grows the
+                        // file by at least this much, and the job goes out once they can.
+                        self.capacity_wanted = self.capacity_wanted.max(asked);
+                        continue;
+                    }
+                }
+                let given = store.grant(needed)?;
                 let State::Ready(task) = std::mem::replace(state, State::Dropped) else {
                     continue;
                 };

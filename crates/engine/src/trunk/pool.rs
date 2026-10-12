@@ -56,6 +56,16 @@ pub struct Task {
 pub enum Work {
     Compact(Task),
     Pack(Stream),
+    Grow(Growth),
+}
+
+/// A segment of the shard's file to add, when `add`, and write whole, so its extents may be
+/// handed out (`Store::grow_segment`, `Store::admit`): its first extent and its extents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Growth {
+    pub start: u64,
+    pub extents: u64,
+    pub add: bool,
 }
 
 /// A packing's entries as the worker takes them: `entries` in all, in key order, in buffers
@@ -163,11 +173,13 @@ pub struct Output {
     pub units: u64,
 }
 
-/// Who a job's result goes back to: the trunk's maintenance, or the shard's packing.
+/// Who a job's result goes back to: the trunk's maintenance, the shard's packing, or the shard's
+/// file's growth.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Owner {
     Trunk,
     Pack,
+    Grow,
 }
 
 /// A job handed to a worker: the worker, whose buffers a packing's feed takes back, and the
@@ -437,6 +449,10 @@ fn run<F: BlockFile>(
             }
             vec![(Vec::new(), b.finish(store)?)]
         }
+        Work::Grow(g) => {
+            store.grow_segment(g.start, g.extents, g.add)?;
+            Vec::new()
+        }
     };
     Ok((parts, waited, units))
 }
@@ -475,6 +491,9 @@ pub struct Pool {
     /// (one node's compactions, the memtables' packings), since a worker freed here can take its
     /// next job before its owner takes this one.
     undelivered: VecDeque<(Owner, Back)>,
+    /// Workers' asks for more extents the shard's admitted extents could not give yet, oldest
+    /// first: at most one a worker, each waiting for its one reply.
+    needs: VecDeque<(usize, usize)>,
     /// Jobs handed to workers since the pool began: the next one's number ([`Ticket`]).
     handed: u64,
     /// The cores the OS reports less the shard's own: the most workers.
@@ -548,6 +567,7 @@ impl Pool {
             back: Some(back),
             messages,
             undelivered: VecDeque::new(),
+            needs: VecDeque::new(),
             handed: 0,
             most,
             want: 1,
@@ -723,6 +743,19 @@ impl Pool {
         for (_, back) in &mut self.undelivered {
             if let Some(error) = back.physical_error.take() {
                 self.close_error.get_or_insert(error);
+            }
+        }
+        // An ask that waited for growth is refused now, so its worker ends its job.
+        while let Some((worker, _)) = self.needs.pop_front() {
+            let refused = self
+                .workers
+                .get(worker)
+                .and_then(Option::as_ref)
+                .and_then(|w| w.more.as_ref())
+                .map(|more| more.try_send(Err(gone("give a closing worker extents"))));
+            if let Some(Err(std::sync::mpsc::TrySendError::Disconnected(_))) = refused {
+                self.close_error
+                    .get_or_insert(gone("give a closing worker extents"));
             }
         }
     }
@@ -1111,6 +1144,19 @@ impl Pool {
                 }
             }
             Message::Need { worker, n } => {
+                // A file grown by segments may not have admitted the extents yet: the ask waits,
+                // one a worker, until growth does ([`Self::answer_needs`]).
+                let asked = u64::try_from(n).unwrap_or(u64::MAX);
+                if !self.closing && store.segments().is_some() && store.capacity() < asked {
+                    if store.grows_in_place() {
+                        // Where the shard may wait, its file grows by the ask here.
+                        store.grow_now(asked)?;
+                    }
+                    if store.capacity() < asked {
+                        self.needs.push_back((worker, n));
+                        return Ok(true);
+                    }
+                }
                 let more = if self.closing {
                     Err(gone("give a closing worker extents"))
                 } else {
@@ -1235,6 +1281,52 @@ impl Pool {
     }
 
     /// Whether a job of `owner`'s is out, or back and not yet taken.
+    /// Answers the asks for extents that waited, oldest first, while the store's admitted
+    /// extents give them: after the file grows, or extents are freed.
+    pub fn answer_needs<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
+        while let Some(&(worker, n)) = self.needs.front() {
+            let asked = u64::try_from(n).unwrap_or(u64::MAX);
+            if store.capacity() < asked {
+                return Ok(());
+            }
+            self.needs.pop_front();
+            let more = store.grant(n);
+            let w = self
+                .workers
+                .get_mut(worker)
+                .and_then(Option::as_mut)
+                .ok_or(gone("give a worker extents"))?;
+            if let Ok(extents) = &more {
+                w.topped.extend_from_slice(extents);
+            }
+            match w
+                .more
+                .as_ref()
+                .ok_or(gone("give a closing worker extents"))?
+                .try_send(more)
+            {
+                Ok(()) => {}
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    return Err(Error::InvalidArgument {
+                        what: "a maintenance worker's top-up still pending",
+                    });
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    return Err(gone("give a worker extents"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The extents the waiting asks want in all: what the shard's file grows by at least.
+    pub fn needs_wanted(&self) -> u64 {
+        self.needs
+            .iter()
+            .map(|&(_, n)| u64::try_from(n).unwrap_or(u64::MAX))
+            .fold(0u64, u64::saturating_add)
+    }
+
     pub fn out_for(&self, owner: Owner) -> bool {
         self.workers
             .iter()

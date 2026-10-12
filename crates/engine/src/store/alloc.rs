@@ -140,6 +140,34 @@ impl Allocator {
         self.limit
     }
 
+    /// A file grown by segments admits extents as each segment is written whole: the shard's
+    /// allocator may hand out `limit` extents, never fewer than it holds. A worker's limit is its
+    /// grant's, and refused here.
+    pub fn set_limit(&mut self, limit: u64) -> Result<(), Error> {
+        let held = u64::try_from(self.refs.len()).map_err(|_| corrupt(Malformed::TooLarge))?;
+        if self.granted || limit < held {
+            return Err(Error::InvalidArgument {
+                what: "an extent limit below the extents held, or a worker's",
+            });
+        }
+        self.limit = limit;
+        Ok(())
+    }
+
+    /// Extents the shard's allocator may still hand out: the free ones, and those past its
+    /// high-water within its limit.
+    pub fn capacity(&self) -> u64 {
+        let held = u64::try_from(self.refs.len()).unwrap_or(u64::MAX);
+        self.limit
+            .saturating_sub(held)
+            .saturating_add(u64::try_from(self.free.len()).unwrap_or(u64::MAX))
+    }
+
+    /// The extents the shard's allocator has handed out at least once: its high-water.
+    pub fn high_water(&self) -> u64 {
+        u64::try_from(self.refs.len()).unwrap_or(u64::MAX)
+    }
+
     /// A worker's granted extents it never wrote, or released again: given back to the shard.
     pub fn unused(&mut self) -> Vec<u64> {
         std::mem::take(&mut self.free)

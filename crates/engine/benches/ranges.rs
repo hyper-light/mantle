@@ -40,9 +40,12 @@ mod present;
 
 use present::Present;
 
+use hyper_block::DiskError;
+use hyper_block::block::{BlockFile, Durable};
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_block::issuer::Issuer;
+use hyper_block::segmented::SegmentedFile;
 use hyper_measure::{alloc, faults, usage};
 use hyper_rt::machine::calibration::{Calibration, Policy};
 use hyper_rt::{Runtime, RuntimeConfig};
@@ -52,6 +55,96 @@ use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::{Config, IntoFile};
 use mantle_engine::trunk::TrunkConfig;
+
+/// A range's store file: one file growing by its writes, or (`--segments`) segment files each
+/// written whole before use (hyper-block's `SegmentedFile`, docs/research/48).
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one file a range, made once: the size between the variants costs nothing"
+)]
+enum BenchFile {
+    One(DeviceFile),
+    Segments(SegmentedFile),
+}
+
+macro_rules! each {
+    ($self:expr, $f:ident => $e:expr) => {
+        match $self {
+            BenchFile::One($f) => $e,
+            BenchFile::Segments($f) => $e,
+        }
+    };
+}
+
+impl BlockFile for BenchFile {
+    fn alignment(&self) -> Alignment {
+        each!(self, f => f.alignment())
+    }
+    fn layout_block(&self) -> Alignment {
+        each!(self, f => BlockFile::layout_block(f))
+    }
+    fn len(&self) -> Result<u64, DiskError> {
+        each!(self, f => BlockFile::len(f))
+    }
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), DiskError> {
+        each!(self, f => BlockFile::read_exact_at(f, buf, offset))
+    }
+    fn read_resident_at(&mut self, buf: &mut [u8], offset: u64) -> Result<bool, DiskError> {
+        each!(self, f => BlockFile::read_resident_at(f, buf, offset))
+    }
+    fn reads_resident(&self) -> bool {
+        each!(self, f => BlockFile::reads_resident(f))
+    }
+    fn residency(&self) -> hyper_block::Residency {
+        each!(self, f => BlockFile::residency(f))
+    }
+    fn set_residency_shadow(&mut self, on: bool) {
+        each!(self, f => BlockFile::set_residency_shadow(f, on))
+    }
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError> {
+        each!(self, f => BlockFile::write_all_at(f, buf, offset))
+    }
+    fn sync_data(&self) -> Result<(), DiskError> {
+        each!(self, f => BlockFile::sync_data(f))
+    }
+    fn fills_new_space(&self) -> bool {
+        each!(self, f => BlockFile::fills_new_space(f))
+    }
+    fn grows_by_segments(&self) -> bool {
+        each!(self, f => BlockFile::grows_by_segments(f))
+    }
+    fn grow(&self, len: u64) -> Result<Option<u64>, DiskError> {
+        each!(self, f => BlockFile::grow(f, len))
+    }
+    fn segment_end(&self, offset: u64) -> Result<Option<u64>, DiskError> {
+        each!(self, f => BlockFile::segment_end(f, offset))
+    }
+    fn write_durable_at(&self, buf: &[u8], offset: u64) -> Result<Durable, DiskError> {
+        each!(self, f => BlockFile::write_durable_at(f, buf, offset))
+    }
+    fn try_clone(&self) -> Result<Self, DiskError> {
+        Ok(match self {
+            BenchFile::One(f) => BenchFile::One(BlockFile::try_clone(f)?),
+            BenchFile::Segments(f) => BenchFile::Segments(BlockFile::try_clone(f)?),
+        })
+    }
+}
+
+/// The segments a range's file may have: the process's open-file limit over the handles each
+/// segment takes, the shard's own, one for each of the issuer's workers and one for each
+/// maintenance worker the host's cores allow.
+fn segment_bound(issuer_depth: usize) -> usize {
+    #[cfg(unix)]
+    let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile)
+        .current
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(usize::MAX);
+    #[cfg(not(unix))]
+    let limit = usize::MAX;
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    (limit / (1 + issuer_depth + cores)).max(2)
+}
 
 #[global_allocator]
 static ALLOCATOR: alloc::Counting = alloc::Counting;
@@ -536,6 +629,9 @@ fn main() -> Result<(), BenchError> {
     // `--shadow-probe`: every resident read made on a kept answer probes anyway, and the answers
     // the probe finds wrong are counted (docs/research/46-reclaim-epochs.md): for measurement.
     let mut shadow_probe = false;
+    // `--segments`: each range's store kept as segment files, every segment written whole before
+    // any of it is used (docs/research/48), for an A/B against one file growing by its writes.
+    let mut segments = false;
     let mut args = Vec::new();
     for arg in std::env::args().skip(1) {
         if arg == "--shard-client" {
@@ -544,6 +640,8 @@ fn main() -> Result<(), BenchError> {
             no_inline = true;
         } else if arg == "--shadow-probe" {
             shadow_probe = true;
+        } else if arg == "--segments" {
+            segments = true;
         } else if let Some(value) = arg.strip_prefix("--rocks-seed=") {
             seed = value.parse()?;
         } else if let Some(path) = arg.strip_prefix("--runtime-record=") {
@@ -685,7 +783,22 @@ fn main() -> Result<(), BenchError> {
     for i in 0..threads {
         let path = dir.join(format!("range-{i}.store"));
         require(!path.exists(), "benchmark requires a fresh directory")?;
-        let file = DeviceFile::open(&path, true, CachingRequest::Buffered, align)?;
+        let bound = segment_bound(issuer_depth);
+        let file = if segments {
+            BenchFile::Segments(SegmentedFile::create(
+                &path,
+                CachingRequest::Buffered,
+                align,
+                bound,
+            )?)
+        } else {
+            BenchFile::One(DeviceFile::open(
+                &path,
+                true,
+                CachingRequest::Buffered,
+                align,
+            )?)
+        };
         let mut db = ShardDb::create(
             file,
             config,
@@ -701,12 +814,17 @@ fn main() -> Result<(), BenchError> {
         db.set_residency_shadow(shadow_probe);
         let worker_path = path.clone();
         db.set_workers(move || {
-            DeviceFile::open(&worker_path, false, CachingRequest::Buffered, align).map_err(
-                |error| mantle_engine::Error::Io {
-                    op: "open a range benchmark worker",
-                    detail: error.to_string(),
-                },
-            )
+            let file = if segments {
+                SegmentedFile::open(&worker_path, CachingRequest::Buffered, align, bound)
+                    .map(BenchFile::Segments)
+            } else {
+                DeviceFile::open(&worker_path, false, CachingRequest::Buffered, align)
+                    .map(BenchFile::One)
+            };
+            file.map_err(|error| mantle_engine::Error::Io {
+                op: "open a range benchmark worker",
+                detail: error.to_string(),
+            })
         })?;
         let start = if i == 0 {
             Vec::new()
@@ -847,7 +965,21 @@ fn main() -> Result<(), BenchError> {
     let stopped = Mark::now()?;
     // Cold reopen is after physical Stop/Runtime/Issuer retirement and never warms queries.
     for path in &paths {
-        let file = DeviceFile::open(path, false, CachingRequest::Buffered, align)?;
+        let file = if segments {
+            BenchFile::Segments(SegmentedFile::open(
+                path,
+                CachingRequest::Buffered,
+                align,
+                segment_bound(issuer_depth),
+            )?)
+        } else {
+            BenchFile::One(DeviceFile::open(
+                path,
+                false,
+                CachingRequest::Buffered,
+                align,
+            )?)
+        };
         let (mut db, applied) = ShardDb::open(
             file,
             config,
@@ -920,6 +1052,16 @@ fn main() -> Result<(), BenchError> {
         );
     }
     for path in paths {
+        // A store kept as segments has `<path>.1` and on beside its base.
+        for k in 1usize.. {
+            let mut name = path.as_os_str().to_owned();
+            name.push(format!(".{k}"));
+            let segment = PathBuf::from(name);
+            if !segment.exists() {
+                break;
+            }
+            std::fs::remove_file(segment)?;
+        }
         std::fs::remove_file(path)?;
     }
     Ok(())

@@ -340,6 +340,16 @@ impl BlockFile for SegmentedFile {
         self.add(len).map(|(_, start)| Some(start))
     }
 
+    fn segment_end(&self, offset: u64) -> Result<Option<u64>, DiskError> {
+        while self.find_next()?.is_some() {}
+        Ok(self
+            .segments
+            .iter()
+            .map_while(OnceLock::get)
+            .find(|s| offset >= s.start && offset < s.start.saturating_add(s.len))
+            .map(|s| s.start.saturating_add(s.len)))
+    }
+
     fn write_durable_at(&self, buf: &[u8], offset: u64) -> Result<Durable, DiskError> {
         let s = self.segment(offset, buf.len())?;
         s.file.write_durable_at(buf, offset.saturating_sub(s.start))

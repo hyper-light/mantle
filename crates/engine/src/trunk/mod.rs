@@ -182,6 +182,27 @@ struct Node {
     queued: bool,
 }
 
+/// One depth of the trunk ([`Trunk::levels`]): its nodes and pivots, the branches the pivots'
+/// bundles hold and the most one holds, the branches in its nodes' in-flight lists, and the
+/// entries of both.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LevelShape {
+    pub leaf: bool,
+    pub nodes: u64,
+    pub pivots: u64,
+    pub branches: u64,
+    pub most: u64,
+    pub inflight: u64,
+    pub entries: u64,
+}
+
+fn entries_of(branches: &[Branch]) -> u64 {
+    branches
+        .iter()
+        .map(|b| b.count)
+        .fold(0u64, u64::saturating_add)
+}
+
 /// What the trunk's maintenance has done since it was made or loaded.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TrunkStats {
@@ -206,7 +227,37 @@ pub struct TrunkStats {
     /// ([`Trunk::note_merge`]).
     pub merge_units: u64,
     pub merge_ns: u64,
+    /// Scans made through the trunk, the leaf segments they visited, the sources those segments
+    /// listed, and of them those passed over by their range filters and those opened: what a
+    /// seek reads its way through (filled in by the shard, `ShardDb::stats`).
+    pub scans: u64,
+    pub scan_segments: u64,
+    pub scan_sources: u64,
+    pub scan_skipped: u64,
+    pub scan_opened: u64,
+    /// Entries written by pivots' compactions, and by leaves' settles by what asked for them:
+    /// seeks' rent, more than `fanout` branches, more than `leaf_entries` entries.
+    pub pivot_entries: u64,
+    pub settle_entries_seeks: u64,
+    pub settle_entries_branches: u64,
+    pub settle_entries_size: u64,
+    /// Sources seeks were given by leaves' pivots and by index pivots ([`Trunk::charge`]); the
+    /// pivots seeks' rent paid for, leaves' and index pivots' apart; the pivots a paid flush
+    /// marked paid below it; and the consolidations started: where a consolidation's work
+    /// comes from.
+    pub charged_leaf_sources: u64,
+    pub charged_index_sources: u64,
+    pub paid_leaves: u64,
+    pub paid_index: u64,
+    pub paid_below: u64,
+    pub consolidations_started: u64,
+    /// The trunk's shape when these were taken ([`Trunk::levels`]), a depth an element from the
+    /// root, depths past the last summed into it.
+    pub shape: [LevelShape; SHAPE_DEPTHS],
 }
+
+/// The depths [`TrunkStats::shape`] keeps apart.
+pub const SHAPE_DEPTHS: usize = 8;
 
 /// Nanoseconds since `t`, none when timing is off (`Trunk::set_timed`).
 fn ns_since(t: Option<std::time::Instant>) -> u64 {
@@ -783,6 +834,15 @@ impl Trunk {
     /// write one. Idle time then runs the consolidations paid for, in bulk
     /// ([`Self::consolidate_step`]); a seek does none itself, so its latency carries none.
     pub fn charge(&mut self, path: &[(Passed, u64)], pages: PageCosts) {
+        for (step, _) in path {
+            let sources = u64::try_from(step.sources).unwrap_or(u64::MAX);
+            let counted = if step.leaf {
+                &mut self.stats.charged_leaf_sources
+            } else {
+                &mut self.stats.charged_index_sources
+            };
+            *counted = counted.saturating_add(sources);
+        }
         let key_ns = match self.consolidation {
             Consolidation::Never => return,
             Consolidation::Always => 0,
@@ -842,6 +902,12 @@ impl Trunk {
             if !pivot.seek.paid && pivot.seek.ns >= price {
                 pivot.seek.paid = true;
                 self.paid = self.paid.saturating_add(1);
+                let counted = if step.leaf {
+                    &mut self.stats.paid_leaves
+                } else {
+                    &mut self.stats.paid_index
+                };
+                *counted = counted.saturating_add(1);
             }
         }
     }
@@ -1800,6 +1866,7 @@ impl Trunk {
         self.stats.pivot_compactions = self.stats.pivot_compactions.saturating_add(1);
         if let Some(b) = &merged {
             self.stats.entries_written = self.stats.entries_written.saturating_add(b.count);
+            self.stats.pivot_entries = self.stats.pivot_entries.saturating_add(b.count);
         }
         let pivot = self.node_mut(n)?.pivots.get_mut(i).ok_or(corrupt())?;
         pivot.start = covered;
@@ -1839,6 +1906,7 @@ impl Trunk {
         n: usize,
         parts: Vec<(Vec<u8>, Branch)>,
         extents: &[u64],
+        cause: upkeep::Cause,
     ) -> Result<Vec<(Vec<u8>, usize)>, Error> {
         let node = self.node(n)?;
         let pivot = node.pivots.first().ok_or(corrupt())?;
@@ -1850,6 +1918,12 @@ impl Trunk {
             .saturating_add(u64::try_from(parts.len().saturating_sub(1)).unwrap_or(0));
         for (_, b) in &parts {
             self.stats.entries_written = self.stats.entries_written.saturating_add(b.count);
+            let by_cause = match cause {
+                upkeep::Cause::Seeks => &mut self.stats.settle_entries_seeks,
+                upkeep::Cause::Branches => &mut self.stats.settle_entries_branches,
+                upkeep::Cause::Size => &mut self.stats.settle_entries_size,
+            };
+            *by_cause = by_cause.saturating_add(b.count);
         }
         for &e in extents {
             store.release(e)?;
@@ -1999,11 +2073,71 @@ impl Trunk {
     }
 
     pub fn stats(&self) -> TrunkStats {
+        let mut shape = [LevelShape::default(); SHAPE_DEPTHS];
+        for (depth, level) in self.levels().into_iter().enumerate() {
+            let Some(at) = shape.get_mut(depth.min(SHAPE_DEPTHS.saturating_sub(1))) else {
+                continue;
+            };
+            at.leaf |= level.leaf;
+            at.nodes = at.nodes.saturating_add(level.nodes);
+            at.pivots = at.pivots.saturating_add(level.pivots);
+            at.branches = at.branches.saturating_add(level.branches);
+            at.most = at.most.max(level.most);
+            at.inflight = at.inflight.saturating_add(level.inflight);
+            at.entries = at.entries.saturating_add(level.entries);
+        }
         TrunkStats {
             merge_units: self.merge_keys,
             merge_ns: self.merge_ns,
+            shape,
             ..self.stats
         }
+    }
+
+    /// The trunk's shape by depth from the root: nodes, pivots, the branches their bundles and
+    /// in-flight lists hold, and those branches' entries; what a seek's sources come from.
+    /// Breadth first from the root, each node once.
+    pub fn levels(&self) -> Vec<LevelShape> {
+        let mut levels: Vec<LevelShape> = Vec::new();
+        let mut queue = std::collections::VecDeque::with_capacity(self.nodes.len());
+        queue.push_back((self.root, 0usize));
+        for _ in 0..self.nodes.len() {
+            let Some((n, depth)) = queue.pop_front() else {
+                break;
+            };
+            let Some(node) = self.nodes.get(n) else {
+                continue;
+            };
+            if levels.len() <= depth {
+                levels.resize(depth.saturating_add(1), LevelShape::default());
+            }
+            let Some(level) = levels.get_mut(depth) else {
+                continue;
+            };
+            level.nodes = level.nodes.saturating_add(1);
+            level.leaf |= node.leaf;
+            for p in &node.pivots {
+                level.pivots = level.pivots.saturating_add(1);
+                let held = p.bundle.branches();
+                level.branches = level
+                    .branches
+                    .saturating_add(u64::try_from(held.len()).unwrap_or(u64::MAX));
+                level.most = level
+                    .most
+                    .max(u64::try_from(held.len()).unwrap_or(u64::MAX));
+                level.entries = level.entries.saturating_add(entries_of(held));
+                if let Some(c) = p.child {
+                    queue.push_back((c, depth.saturating_add(1)));
+                }
+            }
+            for bundle in &node.inflight {
+                level.inflight = level
+                    .inflight
+                    .saturating_add(u64::try_from(bundle.len()).unwrap_or(u64::MAX));
+                level.entries = level.entries.saturating_add(entries_of(bundle));
+            }
+        }
+        levels
     }
 
     /// The extents of the trunk's saved image.

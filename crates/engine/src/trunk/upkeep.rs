@@ -53,8 +53,19 @@ enum What {
         start: usize,
         covered: usize,
     },
-    /// The leaf's whole compaction; `extents` its inputs hold, released once it replaces them.
-    Settle { extents: Vec<u64> },
+    /// The leaf's whole compaction; `extents` its inputs hold, released once it replaces them,
+    /// and what asked for it.
+    Settle { extents: Vec<u64>, cause: Cause },
+}
+
+/// What asked a leaf to settle: seeks' rent ([`Trunk::charge`]), more than `fanout` branches, or
+/// more than `leaf_entries` entries (SplinterDB splits such a leaf by reference instead;
+/// research/34 §1), counted apart so each cause's writes are measured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Cause {
+    Seeks,
+    Branches,
+    Size,
 }
 
 #[derive(Debug)]
@@ -297,6 +308,7 @@ impl Trunk {
         }
         self.mark_paid_paths()?;
         self.consolidating = true;
+        self.stats.consolidations_started = self.stats.consolidations_started.saturating_add(1);
         if let Some(p) = self.pool.as_mut() {
             p.period_started();
         }
@@ -515,6 +527,10 @@ impl Trunk {
                 }
             }
             self.paid = self.paid.saturating_add(newly);
+            self.stats.paid_below = self
+                .stats
+                .paid_below
+                .saturating_add(u64::try_from(newly).unwrap_or(u64::MAX));
         }
         // Oldest first into the child's in-flight list: the bundle is newest first.
         for b in bundle.into_iter().rev() {
@@ -640,6 +656,7 @@ impl Trunk {
         let node = self.node(n)?;
         let pivot = node.pivots.first().ok_or(corrupt())?;
         let count = entries(pivot.bundle.branches());
+        let pivot_branches = pivot.bundle.branches().len();
         // A leaf seeks paid to consolidate settles to one branch, within the ordinary bounds.
         let was_paid = self.consolidating && pivot.seek.paid;
         let paid = was_paid && pivot.bundle.branches().len() > 1;
@@ -696,9 +713,16 @@ impl Trunk {
         if paid {
             self.stats.consolidations = self.stats.consolidations.saturating_add(1);
         }
+        let cause = if paid {
+            Cause::Seeks
+        } else if pivot_branches > self.config.fanout {
+            Cause::Branches
+        } else {
+            Cause::Size
+        };
         self.tasks.push(NodeTask {
             node: n,
-            what: What::Settle { extents },
+            what: What::Settle { extents, cause },
             run,
             units: count,
         });
@@ -855,8 +879,8 @@ impl Trunk {
                     self.queue(c);
                 }
             }
-            What::Settle { extents } => {
-                let leaves = self.apply_settle(store, n, parts, &extents)?;
+            What::Settle { extents, cause } => {
+                let leaves = self.apply_settle(store, n, parts, &extents, cause)?;
                 self.node_mut(n)?.wants = None;
                 self.splice(n, leaves)?;
             }

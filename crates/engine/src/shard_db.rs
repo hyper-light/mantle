@@ -416,6 +416,10 @@ pub struct ShardDb<F: BlockFile> {
     /// Trunk sources scans passed over by their range filters, and sources they opened.
     scan_skipped: u64,
     scan_opened: u64,
+    /// Scans made, the trunk's leaf segments they visited and the sources those listed.
+    scans: u64,
+    scan_segments: u64,
+    scan_listed: u64,
     scan_end: Vec<u8>,
     /// Whether maintenance is timed ([`ShardDb::set_timed`]).
     timed: bool,
@@ -695,6 +699,9 @@ impl<F: BlockFile> ShardDb<F> {
             scan_merge: ScanMerge::new(),
             scan_skipped: 0,
             scan_opened: 0,
+            scans: 0,
+            scan_segments: 0,
+            scan_listed: 0,
             scan_end: Vec::new(),
             timed: false,
             growth: None,
@@ -2004,9 +2011,12 @@ impl<F: BlockFile> ShardDb<F> {
         for (c, f) in frozen.iter_mut().zip(self.frozen.iter().rev()) {
             c.seek(&f.mem, from)?;
         }
+        self.scans = self.scans.saturating_add(1);
         let trunk = &self.trunk;
         let store = &mut self.store;
         let key = &mut self.scan_key;
+        let scan_segments = &mut self.scan_segments;
+        let scan_listed = &mut self.scan_listed;
         // The trunk's leaf segments, found one at a time from the seek's key: a segment's
         // sources (a branch each), and where the next starts.
         let seg_from = &mut self.scan_from;
@@ -2028,6 +2038,9 @@ impl<F: BlockFile> ShardDb<F> {
                     break;
                 }
                 let bounded = trunk.segment_at(seg_from, &mut sources, seg_end, passed)?;
+                *scan_segments = scan_segments.saturating_add(1);
+                *scan_listed =
+                    scan_listed.saturating_add(u64::try_from(sources.len()).unwrap_or(u64::MAX));
                 // Each segment ends past its start, so the walk moves a leaf a step and ends.
                 if bounded && seg_end.as_slice() <= seg_from.as_slice() {
                     merge.close(store);
@@ -2211,8 +2224,11 @@ impl<F: BlockFile> ShardDb<F> {
         for (c, f) in frozen.iter_mut().zip(self.frozen.iter().rev()) {
             c.seek(&f.mem, from)?;
         }
+        self.scans = self.scans.saturating_add(1);
         let trunk = &mut self.trunk;
         let key = &mut self.scan_key;
+        let scan_segments = &mut self.scan_segments;
+        let scan_listed = &mut self.scan_listed;
         // The trunk's leaf segments, found one at a time from the seek's key: a segment's
         // sources (a branch each), and where the next starts.
         let seg_from = &mut self.scan_from;
@@ -2234,6 +2250,9 @@ impl<F: BlockFile> ShardDb<F> {
                     break;
                 }
                 let bounded = trunk.segment_at(seg_from, &mut sources, seg_end, passed)?;
+                *scan_segments = scan_segments.saturating_add(1);
+                *scan_listed =
+                    scan_listed.saturating_add(u64::try_from(sources.len()).unwrap_or(u64::MAX));
                 // Each segment ends past its start, so the walk moves a leaf a step and ends.
                 if bounded && seg_end.as_slice() <= seg_from.as_slice() {
                     merge.close();
@@ -3822,7 +3841,13 @@ impl<F: BlockFile> ShardDb<F> {
 
     /// The flushes' time, the trunk's maintenance, and the store's I/O since the engine started.
     pub fn stats(&self) -> (FlushStats, crate::trunk::TrunkStats, crate::store::IoStats) {
-        (self.flush_stats, self.trunk.stats(), self.store.io_stats())
+        let mut trunk = self.trunk.stats();
+        trunk.scans = self.scans;
+        trunk.scan_segments = self.scan_segments;
+        trunk.scan_sources = self.scan_listed;
+        trunk.scan_skipped = self.scan_skipped;
+        trunk.scan_opened = self.scan_opened;
+        (self.flush_stats, trunk, self.store.io_stats())
     }
 
     /// Shadow mode for the store's resident reads' kept answers, for measurement

@@ -486,7 +486,7 @@ impl Workload {
 fn stats(name: &str, counters: &[RangeStats]) {
     for (range, (f, t, io)) in counters.iter().enumerate() {
         println!(
-            "{name} range {range} flushes {} stalls {} waited_steps {} pivot_compactions {} leaf_compactions {} splits {} entries_written {} consolidations {} merge_units {} merge_ns {} io reads {} pages_read {} submitted {} pages_written {} syncs {} queued {} queued_most {} write_waits {} prefetches {} prefetch_waits {} cache_hits {} span_cache_hits {} device_reads {} resident_reads {} device_read_ns {} resident_probes {} resident_skips {} residency_epochs {} residency_changes {} residency_wrong {}",
+            "{name} range {range} flushes {} stalls {} waited_steps {} pivot_compactions {} leaf_compactions {} splits {} entries_written {} consolidations {} merge_units {} merge_ns {} io reads {} pages_read {} submitted {} pages_written {} syncs {} queued {} queued_most {} write_waits {} prefetches {} prefetch_waits {} cache_hits {} span_cache_hits {} device_reads {} resident_reads {} device_read_ns {} resident_probes {} resident_skips {} residency_epochs {} residency_changes {} residency_wrong {} scans {} scan_segments {} scan_sources {} scan_skipped {} scan_opened {} pivot_entries {} settle_entries_seeks {} settle_entries_branches {} settle_entries_size {} charged_leaf_sources {} charged_index_sources {} paid_leaves {} paid_index {} paid_below {} consolidations_started {}",
             f.flushes,
             f.stalls,
             f.waited_steps,
@@ -516,8 +516,31 @@ fn stats(name: &str, counters: &[RangeStats]) {
             io.residency.skips,
             io.residency.epochs,
             io.residency.changes,
-            io.residency.wrong
+            io.residency.wrong,
+            t.scans,
+            t.scan_segments,
+            t.scan_sources,
+            t.scan_skipped,
+            t.scan_opened,
+            t.pivot_entries,
+            t.settle_entries_seeks,
+            t.settle_entries_branches,
+            t.settle_entries_size,
+            t.charged_leaf_sources,
+            t.charged_index_sources,
+            t.paid_leaves,
+            t.paid_index,
+            t.paid_below,
+            t.consolidations_started
         );
+        let mut shape = String::new();
+        for (depth, l) in t.shape.iter().enumerate().filter(|(_, l)| l.nodes > 0) {
+            shape.push_str(&format!(
+                " | depth {depth} leaf {} nodes {} pivots {} branches {} most {} inflight {} entries {}",
+                l.leaf, l.nodes, l.pivots, l.branches, l.most, l.inflight, l.entries
+            ));
+        }
+        println!("{name}_shape range {range}{shape}");
     }
 }
 
@@ -635,6 +658,9 @@ fn main() -> Result<(), BenchError> {
     // `--segments`: each range's store kept as segment files, every segment written whole before
     // any of it is used (docs/research/48), for an A/B against one file growing by its writes.
     let mut segments = false;
+    // `--consolidation=never|measured|always`: when seeks' rent buys a pivot's consolidation
+    // (`Trunk::set_consolidation`; measured by default), for arms that isolate what it costs.
+    let mut consolidation = mantle_engine::trunk::Consolidation::Measured;
     let mut args = Vec::new();
     for arg in std::env::args().skip(1) {
         if arg == "--shard-client" {
@@ -645,6 +671,18 @@ fn main() -> Result<(), BenchError> {
             shadow_probe = true;
         } else if arg == "--segments" {
             segments = true;
+        } else if let Some(value) = arg.strip_prefix("--consolidation=") {
+            consolidation = match value {
+                "never" => mantle_engine::trunk::Consolidation::Never,
+                "always" => mantle_engine::trunk::Consolidation::Always,
+                "measured" => mantle_engine::trunk::Consolidation::Measured,
+                _ => {
+                    return Err(io::Error::other(
+                        "--consolidation= takes never, measured or always",
+                    )
+                    .into());
+                }
+            };
         } else if let Some(value) = arg.strip_prefix("--rocks-seed=") {
             seed = value.parse()?;
         } else if let Some(path) = arg.strip_prefix("--runtime-record=") {
@@ -815,6 +853,7 @@ fn main() -> Result<(), BenchError> {
         db.set_write_budget(write_bytes / threads as usize)?;
         db.attach(&issuer, issuer_depth)?;
         db.set_residency_shadow(shadow_probe);
+        db.set_consolidation(consolidation);
         let worker_path = path.clone();
         db.set_workers(move || {
             let file = if segments {
@@ -863,6 +902,7 @@ fn main() -> Result<(), BenchError> {
         postfill,
         mut get,
         read,
+        read_stats,
         mut seek,
         queried,
         query_stats,
@@ -890,6 +930,7 @@ fn main() -> Result<(), BenchError> {
                     None
                 };
                 let read = Mark::now()?;
+                let read_stats = client.stats_async().await?;
                 let seek = if seeks > 0 {
                     Some(
                         workload
@@ -913,6 +954,7 @@ fn main() -> Result<(), BenchError> {
                     postfill,
                     get,
                     read,
+                    read_stats,
                     seek,
                     queried,
                     query_stats,
@@ -938,6 +980,7 @@ fn main() -> Result<(), BenchError> {
             .then(|| workload.phase(&ranges, reads, Work::Get))
             .transpose()?;
         let read = Mark::now()?;
+        let read_stats = client.stats()?;
         let seek = (seeks > 0)
             .then(|| workload.phase(&ranges, seeks, Work::Seek(seek_nexts)))
             .transpose()?;
@@ -956,6 +999,7 @@ fn main() -> Result<(), BenchError> {
             postfill,
             get,
             read,
+            read_stats,
             seek,
             queried,
             query_stats,
@@ -1037,6 +1081,7 @@ fn main() -> Result<(), BenchError> {
         threads * num
     );
     stats("postfill", &fill_stats);
+    stats("postread", &read_stats);
     stats("postquery", &query_stats);
     for (shard, counters) in runtime_stats.iter().enumerate() {
         println!(

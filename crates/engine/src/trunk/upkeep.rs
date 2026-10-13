@@ -999,9 +999,11 @@ impl Trunk {
     }
 
     /// Whether a job's tasks may take the cores: when a pending branch or a full root waits on
-    /// them, or a step waits for them anyway; otherwise the pool's measured need.
+    /// them, a step waits for them anyway, or a consolidation seeks paid for is in progress
+    /// (every seek pays rent until it is done, and it runs beside them on the cores the shard
+    /// leaves); otherwise the pool's measured need.
     fn admit(&self) -> bool {
-        self.wait != Wait::No || !self.pending.is_empty() || !self.has_room()
+        self.wait != Wait::No || !self.pending.is_empty() || !self.has_room() || self.consolidating
     }
 
     /// Hands out each ready job whose inputs have landed (waited for when the step waits),

@@ -1,10 +1,13 @@
 //! Memtables sorted where they are packed (research/40 §4): with maintenance workers, a full
 //! memtable's copy of its arena goes to a worker that sorts and packs it, and the shard orders a
 //! memtable only for the scans that read it. Against a `BTreeMap`, a fill with no scan moves no
-//! entry of order work on the shard and every memtable it fills is packed by a worker; a scan
-//! has the memtable it reads ordered from then on, and the next one, while scans may still
-//! come; a memtable filled with no scan since the last rotation is not ordered again. Every key
-//! and every scan reads exactly what was written throughout, frozen memtables included.
+//! entry of order work on the shard, and its memtables are packed by workers, the shard packing
+//! one only when its place is needed and no worker has taken it: a rotation's stall, or the
+//! flush. Which, the live host decides: workers that keep up take every memtable, and on one CPU
+//! a worker runs only when the shard waits. A scan has the memtable it reads ordered from then
+//! on, and the next one, while scans may still come; a memtable filled with no scan since the
+//! last rotation is not ordered again. Every key and every scan reads exactly what was written
+//! throughout, frozen memtables included.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -152,8 +155,17 @@ fn memtables_are_sorted_on_workers_and_ordered_on_the_shard_only_for_scans() {
     db.flush().unwrap();
     let flushed = db.stats().0;
     assert!(
-        flushed.fed >= start.fed + 12,
-        "memtables not packed by workers: {start:?} {flushed:?}"
+        flushed.fed > start.fed,
+        "no memtable packed by a worker: {start:?} {flushed:?}"
+    );
+    // The shard packed the rest, each at a rotation that stalled for its place, or at the flush:
+    // the packing memtable and the active one.
+    let by_shard = (flushed.flushes - start.flushes)
+        - (flushed.fed - start.fed)
+        - (flushed.repacked - start.repacked);
+    assert!(
+        by_shard <= flushed.stalls - start.stalls + 2,
+        "the shard packed memtables a worker could take: {start:?} {flushed:?}"
     );
     check_all(&mut db, &oracle);
     check_scan(&mut db, &oracle);

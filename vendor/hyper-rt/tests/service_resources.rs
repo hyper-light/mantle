@@ -17,7 +17,6 @@ use std::future::{Future, pending, poll_fn};
 use std::hint::black_box;
 use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{SyncSender, sync_channel};
 use std::task::Poll;
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
@@ -85,6 +84,7 @@ struct Costs {
     wall_ns: u128,
 }
 
+#[derive(Debug)]
 struct Mark {
     counts: alloc::Counts,
     faults: faults::Faults,
@@ -151,7 +151,7 @@ async fn first_pending<F: Future>(mut future: Pin<&mut F>, fact: &sync::Sender<(
     .await
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Wake {
     Parked {
         shard: u16,
@@ -171,8 +171,17 @@ fn waits(shard: u16) -> u64 {
 
 /// This plain thread only observes actual public parked state. It publishes an
 /// exact channel completion once that state is reached; no sleep or timer can pass.
-fn observer(receiver: std::sync::mpsc::Receiver<Wake>, release: sync::Sender<u64>) {
-    while let Ok(command) = receiver.recv() {
+// The harness's own channels are hyper-rt's: a std channel boxes its lock at its first lock on macOS and
+// grows its waiter list as a receiver blocks, which the process-wide count took for the runtime's.
+fn observer(mut receiver: ChannelReceiver<Wake>, release: sync::Sender<u64>) {
+    // The loop below yields only when the shard has not parked yet, which a round may or may not
+    // meet; its first yield ran the system's yield for the first time in the process, and Windows
+    // counts the first run of a code page as a page fault: kernel32!SwitchToThread, one fault in a
+    // random measured round of 8 runs in 40 on windows-2025 (diag runs 38299575184, 38300845540, the
+    // working-set watch naming the page). One yield here, before this thread's first command and so
+    // before any measured window: 0 runs in 80 (diag run 38301030044).
+    thread::yield_now();
+    while let Ok(command) = receiver.blocking_recv() {
         let (shard, waits_before, value) = match command {
             Wake::Stop => break,
             Wake::Parked {
@@ -204,7 +213,7 @@ fn observer(receiver: std::sync::mpsc::Receiver<Wake>, release: sync::Sender<u64
 }
 
 struct Observer {
-    commands: SyncSender<Wake>,
+    commands: sync::Sender<Wake>,
     thread: Option<JoinHandle<()>>,
 }
 impl Drop for Observer {
@@ -217,9 +226,9 @@ impl Drop for Observer {
     }
 }
 
-fn start_observer(release: sync::Sender<u64>) -> (Observer, SyncSender<Wake>) {
+fn start_observer(release: sync::Sender<u64>) -> (Observer, sync::Sender<Wake>) {
     STOP_OBSERVER.store(false, Ordering::Release);
-    let (commands, receiver) = sync_channel(1);
+    let (commands, receiver) = sync::channel(1).unwrap();
     let thread = thread::spawn(move || observer(receiver, release));
     (
         Observer {
@@ -386,60 +395,74 @@ impl Driver for Loss {
     }
 }
 
-fn one_loss(ordinal: u64) -> Row {
+/// One driver-loss lifecycle on a runtime of its own. The observer and its release channel serve every
+/// round, as in the reuse rounds: a thread started per round began inside the hot window it was started
+/// for (a busy host gives a new thread its core late), so its first stack pages counted as the runtime's
+/// faults. The warmup round warms the observer once. The service hands the channel's receiver back with
+/// its observation, as the reuse rounds' service does.
+fn one_loss(
+    ordinal: u64,
+    receiver: ChannelReceiver<u64>,
+    commands: &sync::Sender<Wake>,
+) -> (Row, ChannelReceiver<u64>) {
     let setup = mark();
     let cfg = config(LOSS_ROLES);
     let seed: DriverSeed = Box::new(|_| Ok(Box::new(Loss { lost: false })));
     let mut rt = LocalRuntime::with_driver(&cfg, seed, Kick::None).unwrap();
     let shard = rt.shard_id().0;
-    let (release, mut retirement) = sync::channel(1).unwrap();
     let (pending_fact, mut first) = sync::channel(1).unwrap();
     let (go, mut start_loss) = sync::channel(1).unwrap();
     // One cold result slot; hot Mark/costs are moved values, not new allocations.
-    let (started, timing) = sync_channel(1);
-    let (observed, observation) = sync_channel(1);
+    let (started, mut timing) = sync::channel(1).unwrap();
+    let (observed, mut observation) = sync::channel(1).unwrap();
     let before_returned = RETURNED.load(Ordering::SeqCst);
-    let (guard, commands) = start_observer(release);
+    let commands = commands.clone();
     let service = rt
         .spawn_service(async move {
             let _capture = Returned;
+            let mut retirement = receiver;
             let mut cancel = pin!(futures::cancelled());
             let cancelled = first_pending(cancel.as_mut(), &pending_fact).await;
             let ready = hyper_rt::readiness::readable(HANDLE).await;
             let timer = futures::sleep(config(LOSS_ROLES).timer_tick_ns).await;
-            let mut receive = pin!(retirement.recv());
-            let mut sent = false;
-            let value = poll_fn(|cx| match receive.as_mut().poll(cx) {
-                Poll::Ready(value) => Poll::Ready(value),
-                Poll::Pending => {
-                    if !sent {
-                        // This same owning poll cannot still be announcing a park.
-                        // std command publication follows this false fact, so a later
-                        // true observation is fresh; Pulse counts only native waits.
-                        assert_eq!(
-                            registry::with_entry(shard, |entry| entry.parking.parked()),
-                            Some(false)
-                        );
-                        commands
-                            .try_send(Wake::CleanupParked {
-                                shard,
-                                value: ordinal,
-                            })
-                            .unwrap();
-                        sent = true;
+            let value = {
+                let mut receive = pin!(retirement.recv());
+                let mut sent = false;
+                poll_fn(|cx| match receive.as_mut().poll(cx) {
+                    Poll::Ready(value) => Poll::Ready(value),
+                    Poll::Pending => {
+                        if !sent {
+                            // This same owning poll cannot still be announcing a park.
+                            // std command publication follows this false fact, so a later
+                            // true observation is fresh; Pulse counts only native waits.
+                            assert_eq!(
+                                registry::with_entry(shard, |entry| entry.parking.parked()),
+                                Some(false)
+                            );
+                            commands
+                                .try_send(Wake::CleanupParked {
+                                    shard,
+                                    value: ordinal,
+                                })
+                                .unwrap();
+                            sent = true;
+                        }
+                        Poll::Pending
                     }
-                    Poll::Pending
-                }
-            })
-            .await;
+                })
+                .await
+            };
             // ABORT wakes cannot pass an exact completion. The capture is returned even
             // during failure cleanup, before any eventual verdict is considered.
-            let _ = observed.try_send(LossObservation {
-                cancelled,
-                ready,
-                timer,
-                value,
-            });
+            let _ = observed.try_send((
+                LossObservation {
+                    cancelled,
+                    ready,
+                    timer,
+                    value,
+                },
+                retirement,
+            ));
         })
         .unwrap();
     rt.context().detach(service).unwrap();
@@ -460,6 +483,7 @@ fn one_loss(ordinal: u64) -> Row {
     });
     let (setup, hot) = timing
         .try_recv()
+        .expect("the timing channel holds its sender's value")
         .expect("fault was triggered after actual Pending");
     let hot = close(hot);
     assert_eq!(outcome, Err(RtError::ShardGone { shard }));
@@ -467,20 +491,20 @@ fn one_loss(ordinal: u64) -> Row {
     assert_eq!(rt.live_tasks(), 0);
     assert_eq!(RETURNED.load(Ordering::SeqCst), before_returned + 1);
     let retirement = mark();
-    drop(guard);
     drop(rt);
     let retirement = close(retirement);
-    let observed = observation.try_recv().unwrap();
+    let (observed, receiver) = observation.try_recv().unwrap().unwrap();
     assert_eq!(observed.cancelled, Ok(()));
     assert_eq!(observed.ready, Err(RtError::DriverLost));
     assert_eq!(observed.timer, Err(RtError::DriverLost));
     assert_eq!(observed.value, Ok(ordinal));
     assert_eq!(AFTER_LOSS_CALLS.load(Ordering::Relaxed), 0);
-    Row {
+    let row = Row {
         setup,
         hot,
         retirement,
-    }
+    };
+    (row, receiver)
 }
 
 fn summary(label: &str, phase: &str, rows: &[Row], select: impl Fn(&Row) -> Costs) {
@@ -537,12 +561,17 @@ fn warm_cancellation_channel_wake_reuse_and_driver_loss_have_measured_resources(
     let (boot, reuse, reuse_retirement) = reusable_native_services();
     let mut loss = vec![Row::default(); LOSS_ROUNDS];
     black_box(&mut loss);
+    let (release, mut receiver) = sync::channel(1).unwrap();
+    let (observer, commands) = start_observer(release);
     for ordinal in 0..(LOSS_WARMUP + LOSS_ROUNDS) {
-        let row = one_loss(u64::try_from(ordinal).unwrap());
+        let (row, back) = one_loss(u64::try_from(ordinal).unwrap(), receiver, &commands);
+        receiver = back;
         if ordinal >= LOSS_WARMUP {
             loss[ordinal - LOSS_WARMUP] = row;
         }
     }
+    drop(observer);
+    drop(receiver);
     let whole = close(whole);
     let total = alloc::end_process();
     eprintln!(

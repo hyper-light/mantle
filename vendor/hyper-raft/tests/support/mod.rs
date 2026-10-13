@@ -1678,6 +1678,7 @@ pub mod backlog;
 pub mod cluster;
 pub mod judge;
 pub mod lagged;
+pub mod swarm;
 pub mod timed;
 #[allow(unused_imports)]
 pub use cluster::{Cluster, Mix, Op, Report};

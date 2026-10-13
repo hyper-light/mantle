@@ -109,10 +109,8 @@ caller hands in the alignment, queue and measured depth it found.
     Completion closure follows all native worker duplicate Drops/joins even during concurrent
     issuer Stop. Pre-Stop accepted batches are answered with numbered refusal; owning Drop
     retains its blocking plain-thread contract.
-    Current development issuer source SHA256: 981096ba8935533bb82c01ec362cedd7ad035b0061908564f80c406f5d333f32.
-    The standalone warm allocation oracle and its hyper-measure dev-dependency are retained.
-    This local delta has no accepted shared producer commit; producer/all-consumer gates and
-    exact-source native CI remain required before re-vendoring an accepted upstream snapshot.
+    The warm allocation oracle (`tests/issuer_allocs.rs`) and its hyper-measure dev-dependency
+    came with it. Made in mantle's copy (`6f05bd8`) and taken here (2026-10-12).
 
 12. **Terminal ownership and typed lifecycle failures** (`issuer.rs`, development):
     each completion channel holds its declared B numbered results plus one physical
@@ -129,32 +127,66 @@ caller hands in the alignment, queue and measured depth it found.
     waker before each receive poll; canceled borrowed waits retain the same receipt.
     Cold `retire_blocking` shares that terminal state and returns lifecycle failures,
     while refusing any entered shard before mutation. Raw Drop remains unacknowledged
-    cleanup. Exact issuer source SHA256: `981096ba8935533bb82c01ec362cedd7ad035b0061908564f80c406f5d333f32`. This is an uncommitted development
-    identity, not an accepted producer revision or measured throughput claim.
+    cleanup. Made in mantle's copy (`6f05bd8`) and taken here (2026-10-12); in the merge with
+    `main`, an unwound payload the issuer does not keep for a later disposal is dropped inside a
+    boundary of its own (`unwind::contained`): a duplicate's drop that unwinds with a payload
+    that unwinds again costs that drop alone, and the worker lives on
+    (`tests/attachment_watch_native.rs`).
+
 13. **A probe's answer kept while the kernel reclaims nothing** (`resident`, `file.rs`,
-    `block.rs`, `issuer.rs`, mantle): on macOS a read from memory keeps, one bit an OS page,
-    that `mincore(2)` found its pages resident, and reads them again without probing while the
-    pageout scan's file-backed reclamation counts (`vm.pageout_freed_*`) stay unchanged; they are
-    read again before free memory could reach the kernel's free target at the fastest fill a Mac
-    has. `Residency` counts probes, reads on kept answers, epochs and changes, and in shadow mode
-    the kept answers a probe found wrong (`BlockFile::residency`,
-    `BlockFile::set_residency_shadow`, `Attached::residency`, `Attached::set_residency_shadow`).
-    Mantle `docs/research/46-reclaim-epochs.md`.
-14. **A file kept as segments** (`segmented.rs`, `block.rs`, `resident`, mantle): a base file and
-    `<base>.1`, `<base>.2` and on, read and written at offsets into their concatenation
-    (`SegmentedFile`). A segment is created whole at its final length, allocated and its name made
-    durable, and never changes length, so every handle finds the layout from names and lengths
-    alone; a duplicate made before a segment was added opens it when a transfer first reaches it. A
-    transfer lies within one segment; a flush covers the segments written since the last; the
-    segments are at most a bound given at open. `BlockFile::grows_by_segments` and
-    `BlockFile::grow` let a store add one (a plain file grows by its writes, as before), and
+    `block.rs`, `issuer.rs`): on macOS a read from memory keeps, one bit an OS page, that
+    `mincore(2)` found its pages resident, and reads them again without probing while the pageout
+    scan's file-backed reclamation counts (`vm.pageout_freed_*`) stay unchanged; they are read
+    again before free memory could reach the kernel's free target at the fastest fill a Mac has.
+    `Residency` counts probes, reads on kept answers, epochs and changes, and in shadow mode the
+    kept answers a probe found wrong (`BlockFile::residency`, `BlockFile::set_residency_shadow`,
+    `Attached::residency`, `Attached::set_residency_shadow`). Mantle
+    `docs/research/46-reclaim-epochs.md`. Made in mantle's copy (`a5f5cf3`) and taken here
+    (2026-10-12).
+
+14. **A file kept as segments** (`segmented.rs`, `gather.rs`, `block.rs`, `file.rs`, `resident`): a
+    base file and `<base>.1`, `<base>.2` and on, read and written at offsets into their
+    concatenation (`SegmentedFile`). A segment is created whole at its final length, allocated and
+    its name made durable, and never changes length, so every handle finds the layout from names
+    and lengths alone; a duplicate made before a segment was added opens it when a transfer first
+    reaches it, and a handle holds slots for the segments it has, found by a binary search over the
+    filled ones, not for its bound. A transfer lies within one segment; a flush covers the segments
+    written since the last; the segments are at most a bound given at open.
+    `BlockFile::grows_by_segments`, `BlockFile::grow` and `BlockFile::segment_end` let a store add
+    one and find where one ends (a plain file grows by its writes, as before), and
     `BlockFile::write_whole` writes a new segment's blocks once, through a handle past the OS's
-    cache (from a buffer aligned to the VM page, which macOS's cluster layer needs to write past
-    its cache), so its zeros take no memory a read wants. Reads made from memory keep one reclaim
-    epoch for the whole file (`resident::Epoch`, split from `Resident`, its generation 64 bits so
-    it never comes round again), and `Residency::plus` sums segments' counts. A file's own first
-    writes hold up its other reads and writes, another file's do not: mantle
-    `docs/research/48-first-writes.md`.
+    cache (from a buffer aligned to the VM page, which macOS's cluster layer needs to write past its
+    cache), so its zeros take no memory a read wants: in as few calls as the kernel takes, by
+    vectored writes of one buffer (`DeviceFile::write_copies_at`, pwritev(2) on Linux and macOS) and
+    by gather writes on Windows (`WriteFileGather`, `gather.rs`). Reads made from memory keep one
+    reclaim epoch for the whole file (`resident::Epoch`, split from `Resident`, its generation 64
+    bits so it never comes round again), and `Residency::plus` sums segments' counts. A file's own
+    first writes hold up its other reads and writes, another file's do not: mantle
+    `docs/research/48-first-writes.md`. Made in mantle's copy (`0d9dfb4`, `0906dfe`, `8dcf196`,
+    `e44d9e5`, `f2f6a57`, `abe99c8`, `8384354`; mantle's `ORIGIN.md` change 14) and taken here
+    (2026-10-12), with `gather.rs` listed among the files whose `unsafe` binds an OS interface
+    (`scripts/check-contracts.py`).
+15. **What a segment written whole leaves in memory, asked of the page cache** (`resident/linux.rs`,
+    new, tests only; `segmented.rs`'s `a_segment_written_whole_holds_its_fill_and_takes_no_memory`).
+    On Linux a resident read is no probe: `preadv2(2)` with `RWF_NOWAIT` on a page not in memory
+    starts read-ahead of it and of the window after it before it answers, and reads what that
+    brought in by the time it looks (Linux 6.8 `mm/filemap.c`, `filemap_get_pages` and
+    `filemap_update_page`). The test read each piece of the segments it had written past the cache
+    that way, so a piece's own read-ahead, or the one before it in the same segment, could leave it
+    resident: once on ubuntu-24.04-arm (CI run 38348043505), and in Docker's Linux 6.12 under busy
+    loops in 1 run of 300, where `mincore(2)` before and after each read showed both (a piece not in
+    memory read by its own probe; the next piece in memory before its probe). On Linux the test now
+    asks `mincore(2)` over a mapping of each piece, which starts no I/O; elsewhere the resident read
+    stays its probe (`mincore(2)` on macOS; no read off Linux and macOS).
+    `DeviceFile::read_resident_at` states what a true answer means on Linux: read without waiting,
+    not in memory before.
+
+16. **The simulated file's model in hyper-sim** (`sim.rs`, `sim/shared.rs`; `docs/sim.md` §16, step
+    S-3): the device itself, its images, faults, generator and counts, is `hyper_sim::storage::Device`,
+    and `SimFile` and `SimDevice` are adapters over it that add a direct-I/O file's refusals and map
+    its refusals onto `DiskError`. `Fault`, `Crash` and `SimStats` are hyper-sim's (`Stats`), with
+    its new faults: a lost write, a misdirected write, a block read as zeros or junk. Every seed's bytes
+    are unchanged (hyper-log's equivalence hashes, identical); the `sim` feature takes hyper-sim.
 
 ## Planned
 

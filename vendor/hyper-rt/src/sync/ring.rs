@@ -11,10 +11,18 @@
 //! slot carries a stamp, the position it is free for (`position`) or full at (`position + 1`); a producer
 //! claims a position by compare-and-swap on the tail and publishes by storing the stamp, a consumer claims by
 //! compare-and-swap on the head and releases the slot for the next lap by storing `position + lap`. A
-//! position is a lap above an index (`lap | index`), one lap the capacity rounded up to a power of two and at
-//! least two, as Rust's std encodes its array channel (`sync/mpmc/array.rs`), so the capacity is exact and
-//! "full at this lap" never reads as "free for the next" (slates' word ring refused a capacity of one for
-//! exactly that collision, AUD-29-33).
+//! position is a lap above a mark above an index (`lap | index`), the mark the capacity rounded up to a power
+//! of two and one lap twice it, as Rust's std encodes its array channel (`sync/mpmc/array.rs`, `mark_bit`), so
+//! the capacity is exact and "full at this lap" never reads as "free for the next" (slates' word ring refused
+//! a capacity of one for exactly that collision, AUD-29-33).
+//!
+//! **Closing** sets the mark in the tail (std's disconnect, the same bit): a producer claims a position only
+//! by a compare-and-swap from a tail without it, so a push either claimed its place before the close, in the
+//! tail's one order of changes, or is refused `Closed` with its value. A check of a primitive's state before
+//! the push could not order the two: a receiver's drop that freed a full ring's room between a sender's check
+//! and its push let the push in after the close (`tests/sync.rs`, a task waiting for room; 2 of 3 runs with
+//! 200 µs between the check and the push). A push that claimed its place before the close and published
+//! after the closer drained finds the mark after a fence and drops what is left ([`Ring::drain`]).
 //!
 //! **No spin.** A slot the consumer has claimed but not yet released reads as full, and a position a
 //! producer has claimed but not yet published reads as empty: the call returns at once and the waiter
@@ -37,9 +45,9 @@ use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 
 #[cfg(loom)]
-use loom::sync::atomic::{AtomicUsize, Ordering};
+use loom::sync::atomic::{AtomicUsize, Ordering, fence};
 #[cfg(not(loom))]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering, fence};
 
 use super::cell::CellRef;
 use crate::error::RtError;
@@ -71,7 +79,7 @@ impl<T> UnsafeCell<T> {
 /// silicon's 128 bytes): producers write the tail, the consumer the head.
 #[repr(align(128))]
 #[derive(Debug)]
-struct Padded<T>(T);
+pub(super) struct Padded<T>(pub(super) T);
 
 /// One slot: the position it is free for or full at, and its value while full.
 #[derive(Debug)]
@@ -85,9 +93,21 @@ struct Slot<T> {
 pub(crate) struct Ring<T> {
     head: Padded<AtomicUsize>,
     tail: Padded<AtomicUsize>,
-    /// One lap of positions: the capacity rounded up to a power of two, at least two.
+    /// The bit of the tail that marks the ring closed: the capacity rounded up to a power of two, above
+    /// every index.
+    mark: usize,
+    /// One lap of positions: twice the mark, so no position carries it.
     one_lap: usize,
     slots: Box<[Slot<T>]>,
+}
+
+/// A push refused, its value handed back.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Refused<T> {
+    /// Every place holds a value, or one is still being taken from a lap ago.
+    Full(T),
+    /// The ring was closed before this push claimed a place.
+    Closed(T),
 }
 
 // SAFETY: a value moves into a slot on one thread and out of it on another, exactly once each, ordered by the
@@ -108,9 +128,12 @@ impl<T> Ring<T> {
         if capacity == 0 {
             return Err(refused);
         }
-        let one_lap = capacity
+        let mark = capacity
             .checked_add(1)
             .and_then(usize::checked_next_power_of_two)
+            .ok_or(refused.clone())?;
+        let one_lap = mark
+            .checked_mul(2)
             .filter(|lap| lap.checked_mul(2).is_some())
             .ok_or(refused.clone())?;
         // The slots' allocation must be a valid layout, or collecting them would abort on the overflow.
@@ -124,14 +147,20 @@ impl<T> Ring<T> {
         Ok(Self {
             head: Padded(AtomicUsize::new(0)),
             tail: Padded(AtomicUsize::new(0)),
+            mark,
             one_lap,
             slots,
         })
     }
 
+    /// The most values the ring holds at once.
+    pub(crate) fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+
     /// The position after `position`: the next index of its lap, or the first of the next lap.
     fn next(&self, position: usize) -> usize {
-        let index = position & self.one_lap.wrapping_sub(1);
+        let index = position & self.mark.wrapping_sub(1);
         if index.saturating_add(1) < self.slots.len() {
             position.wrapping_add(1)
         } else {
@@ -141,17 +170,21 @@ impl<T> Ring<T> {
 
     /// The slot of `position`.
     fn slot(&self, position: usize) -> Option<&Slot<T>> {
-        self.slots.get(position & self.one_lap.wrapping_sub(1))
+        self.slots.get(position & self.mark.wrapping_sub(1))
     }
 
     /// Adds `value` at the tail; hands it back when the ring is full, including while the slot the tail
-    /// reaches is still being taken from a lap ago.
-    pub(crate) fn push(&self, value: T) -> Result<(), T> {
+    /// reaches is still being taken from a lap ago, and when the ring is closed.
+    pub(crate) fn push(&self, value: T) -> Result<(), Refused<T>> {
         let mut tail = self.tail.0.load(Ordering::Relaxed);
         let mut reread = false;
         loop {
+            // A closed tail carries the mark, so no claim below can succeed past a close.
+            if tail & self.mark != 0 {
+                return Err(Refused::Closed(value));
+            }
             let Some(slot) = self.slot(tail) else {
-                return Err(value);
+                return Err(Refused::Full(value));
             };
             let stamp = slot.stamp.load(Ordering::Acquire);
             if stamp == tail {
@@ -162,11 +195,12 @@ impl<T> Ring<T> {
                     Ordering::Relaxed,
                 ) {
                     Ok(_) => {
-                        // SAFETY: the claim of `tail` is this call's alone (the compare-and-swap), and the stamp
-                        // it read (Acquire) says the last lap's value was taken and released, so no one reads or
-                        // writes this slot until the stamp below publishes it.
-                        slot.value
-                            .with_mut(|cell| unsafe { cell.write(MaybeUninit::new(value)) });
+                        slot.value.with_mut(|cell| {
+                            // SAFETY: the claim of `tail` is this call's alone (the compare-and-swap), and the
+                            // stamp it read (Acquire) says the last lap's value was taken and released, so no one
+                            // reads or writes this slot until the stamp below publishes it.
+                            unsafe { cell.write(MaybeUninit::new(value)) }
+                        });
                         slot.stamp.store(tail.wrapping_add(1), Ordering::Release);
                         return Ok(());
                     }
@@ -177,7 +211,7 @@ impl<T> Ring<T> {
             {
                 // The slot still holds the last lap's position, claimed and not yet published or published and
                 // not yet taken: the ring is full.
-                return Err(value);
+                return Err(Refused::Full(value));
             } else if stamp == tail.wrapping_add(1) {
                 // Another producer claimed and published `tail`: the tail is past it.
                 tail = self.next(tail);
@@ -191,7 +225,7 @@ impl<T> Ring<T> {
                 // Still a lap apart with the latest tail: the slot's stamp read is the old one. Reported full
                 // rather than read again until it changes, which nothing bounds; a sender that must wait fences
                 // before it looks again (`sync::room`), and no stamp that old survives the fence.
-                return Err(value);
+                return Err(Refused::Full(value));
             }
         }
     }
@@ -235,6 +269,33 @@ impl<T> Ring<T> {
                 // The slot's stamp read is the old one: reported empty (as for a push); a receiver that must
                 // wait fences before it looks again (`crate::handoff`).
                 return None;
+            }
+        }
+    }
+}
+
+impl<T> Ring<T> {
+    /// Refuses every push that has not claimed its place yet; one that has still lands. The mark, then a
+    /// fence, so this thread's next look at the slots and a producer's look at the mark after its own fence
+    /// cannot both miss the other's write (the store-buffering outcome both fences forbid).
+    pub(crate) fn close(&self) {
+        self.tail.0.fetch_or(self.mark, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+    }
+
+    /// Whether the ring is closed, as this thread sees the tail: a producer asks after a fence that
+    /// follows its push.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.tail.0.load(Ordering::Relaxed) & self.mark != 0
+    }
+
+    /// Drops the values in the ring, at most its capacity of them: what a closed ring holds that no one
+    /// will take. Every value published before this thread's last fence is among the first that many; one
+    /// published after it was published by a producer that then finds the mark and drains for itself.
+    pub(crate) fn drain(&self) {
+        for _ in 0..self.capacity() {
+            if self.pop().is_none() {
+                break;
             }
         }
     }
@@ -321,7 +382,7 @@ mod tests {
                 }
                 assert_eq!(
                     ring.push((lap, capacity)),
-                    Err((lap, capacity)),
+                    Err(Refused::Full((lap, capacity))),
                     "full at {capacity}"
                 );
                 for value in 0..capacity {
@@ -332,6 +393,29 @@ mod tests {
         }
         assert!(Ring::<u8>::new(0).is_err());
         assert!(Ring::<u8>::new(usize::MAX).is_err());
+    }
+
+    /// A closed ring refuses every push with its value, the room a take frees after the close as well, and
+    /// still gives what it held.
+    #[test]
+    fn a_closed_ring_refuses_pushes_and_still_gives_what_it_held() {
+        for capacity in [1usize, 2, 3] {
+            let ring = Ring::new(capacity).unwrap();
+            ring.push(1u32).unwrap();
+            assert!(!ring.is_closed());
+            ring.close();
+            assert!(ring.is_closed());
+            assert_eq!(ring.push(2), Err(Refused::Closed(2)));
+            assert_eq!(ring.pop(), Some(1));
+            assert_eq!(
+                ring.push(3),
+                Err(Refused::Closed(3)),
+                "room freed after the close"
+            );
+            assert_eq!(ring.pop(), None);
+            ring.close();
+            assert!(ring.is_closed(), "a second close changes nothing");
+        }
     }
 
     /// Drops counted in a test's own static, so a dropped value's count is exact.
@@ -375,7 +459,7 @@ mod tests {
                 scope.spawn(move || {
                     for sequence in 0..EACH {
                         let mut value = (producer, sequence);
-                        while let Err(back) = ring.push(value) {
+                        while let Err(Refused::Full(back)) = ring.push(value) {
                             value = back;
                             std::hint::spin_loop();
                         }
@@ -433,6 +517,60 @@ mod loom_tests {
             out.sort_unstable();
             assert_eq!(out, accepted, "out {out:?}, accepted {accepted:?}");
             assert!(!accepted.is_empty(), "an empty slot refused both pushes");
+        });
+    }
+
+    /// A producer pushes once into a full ring of one place while a closer closes it and drains it, each a
+    /// thread of its own: the push is refused, full or closed, never let into the room the drain frees after
+    /// the close. A check of a closed flag before the push let it in (`tests/sync.rs`).
+    #[test]
+    fn a_full_ring_closed_and_drained_takes_no_push() {
+        loom_bounds::explore("ring: a push against the close of a full ring", || {
+            let ring: &'static Ring<u32> = Box::leak(Box::new(Ring::new(1).unwrap()));
+            ring.push(0).unwrap();
+            let producer = loom::thread::spawn(move || ring.push(8));
+            let closer = loom::thread::spawn(move || {
+                ring.close();
+                ring.drain();
+            });
+            let pushed = producer.join().unwrap();
+            closer.join().unwrap();
+            assert!(
+                matches!(pushed, Err(Refused::Full(8) | Refused::Closed(8))),
+                "{pushed:?}"
+            );
+            assert!(ring.pop().is_none(), "a value was left in the closed ring");
+        });
+    }
+
+    /// A producer pushes once into an empty ring while a closer closes it and drains it; a producer whose
+    /// push lands looks at the mark after a fence and drains if it is set, as the primitives' senders do.
+    /// Once both have joined the ring holds nothing, and a push refused kept its value.
+    #[test]
+    fn a_push_racing_a_close_is_refused_taken_or_dropped_never_left() {
+        loom_bounds::explore("ring: a push against a close", || {
+            let ring: &'static Ring<u32> = Box::leak(Box::new(Ring::new(1).unwrap()));
+            let producer = loom::thread::spawn(move || {
+                let pushed = ring.push(7);
+                if pushed.is_ok() {
+                    fence(Ordering::SeqCst);
+                    if ring.is_closed() {
+                        ring.drain();
+                    }
+                }
+                pushed
+            });
+            let closer = loom::thread::spawn(move || {
+                ring.close();
+                ring.drain();
+            });
+            let pushed = producer.join().unwrap();
+            closer.join().unwrap();
+            assert!(ring.pop().is_none(), "a value was left in the closed ring");
+            assert!(
+                matches!(pushed, Ok(()) | Err(Refused::Closed(7))),
+                "{pushed:?}"
+            );
         });
     }
 }

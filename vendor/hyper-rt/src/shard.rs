@@ -324,6 +324,8 @@ pub struct ShardContext {
     pub(crate) quantum_ns: Cell<u64>,
     /// The measured scheduler overrun, published by the loop.
     pub(crate) scheduler_overrun_ns: Cell<u64>,
+    /// The timer wheel's tick: a deadline is kept on the tick after it.
+    timer_tick_ns: u64,
     /// Spawns refused because no slot was free (folded into the loop's counters).
     pub(crate) refused_spawns: Cell<u64>,
     /// Sleeps that found every timer taken and waited for one (folded into the loop's counters).
@@ -332,12 +334,24 @@ pub struct ShardContext {
     pub(crate) is_sim: bool,
     /// The driver's clock, read live.
     pub(crate) clock: crate::driver::Clock,
+    /// The loop's last reading of the driver's clock with the counter's ticks then, which a live reading
+    /// carries forward (`machine::clock::Carried`); `None` where the shard reads no counter, and the driver's
+    /// clock takes every reading.
+    pub(crate) carried: Cell<Option<crate::machine::clock::Carried>>,
+    /// The latest live reading handed out, so none is earlier than one before it: each step reads the
+    /// driver's clock afresh, and a scale off by a fraction could carry a reading past the next step's.
+    latest_ns: Cell<u64>,
     pub(crate) entry: Option<&'static Entry>,
     pub(crate) incarnation: Option<SlotHolder>,
     pub(crate) kept: KeptValues,
     /// The output of a [`crate::runtime::LocalRuntime::block_on`] root, moved here by the root as it finishes
     /// and taken by the runtime: written once, taken once.
     pub(crate) root_output: Cell<Option<Box<dyn std::any::Any>>>,
+    /// The task a running `block_on` waits on, so the shard can tell it that task's poll unwound.
+    pub(crate) root: Cell<Option<TaskId>>,
+    /// Set by the shard when the root's poll unwound and its task ended `Outcome::Unwound`: no output will
+    /// come, and `block_on` is refused rather than wait for one.
+    pub(crate) root_unwound: Cell<bool>,
     /// The loop's counters as of the start of the current step, published for tasks that report them.
     pub(crate) counters: Cell<crate::shard_loop::Counters>,
     /// A simulated shard's sockets (docs/runtime.md §11); `None` on an OS driver.
@@ -358,6 +372,7 @@ pub(crate) struct DeskShape {
     pub(crate) timers: usize,
     pub(crate) interests: usize,
     pub(crate) generation_base: u32,
+    pub(crate) timer_tick_ns: u64,
 }
 
 impl ShardContext {
@@ -429,14 +444,19 @@ impl ShardContext {
             activity_noted: Cell::new(false),
             quantum_ns: Cell::new(1),
             scheduler_overrun_ns: Cell::new(0),
+            timer_tick_ns: shape.timer_tick_ns,
             refused_spawns: Cell::new(0),
             timer_waits: Cell::new(0),
             is_sim,
             clock,
+            carried: Cell::new(None),
+            latest_ns: Cell::new(0),
             entry: registry::entry(id),
             incarnation: registry::entry(id).map(Entry::holder),
             kept: KeptValues::default(),
             root_output: Cell::new(None),
+            root: Cell::new(None),
+            root_unwound: Cell::new(false),
             counters: Cell::new(crate::shard_loop::Counters::default()),
             sim: None,
         }
@@ -450,6 +470,30 @@ impl ShardContext {
     /// Takes a `block_on` root's output, once it finished.
     pub(crate) fn take_root_output(&self) -> Option<Box<dyn std::any::Any>> {
         self.root_output.take()
+    }
+
+    /// `task` is the root a `block_on` waits on, until [`ShardContext::end_root`].
+    pub(crate) fn begin_root(&self, task: TaskId) {
+        self.root.set(Some(task));
+        self.root_unwound.set(false);
+    }
+
+    /// The `block_on` waiting on its root returns.
+    pub(crate) fn end_root(&self) {
+        self.root.set(None);
+        self.root_unwound.set(false);
+    }
+
+    /// Task `task`'s poll unwound and it ended `Outcome::Unwound`: if it is the root, its `block_on` is told.
+    pub(crate) fn note_unwound(&self, task: TaskId) {
+        if self.root.get() == Some(task) {
+            self.root_unwound.set(true);
+        }
+    }
+
+    /// Whether the root's poll unwound.
+    pub(crate) fn root_unwound(&self) -> bool {
+        self.root_unwound.get()
     }
 
     /// Keeps `value` for the shard's life and hands back its [`Kept`] handle: for an owner between steps
@@ -468,14 +512,24 @@ impl ShardContext {
 
     // ------------------------------------------------------------------ what tasks read
 
-    /// The shard's clock in nanoseconds, read live from its driver's clock (the time the loop last published
-    /// where the driver has none).
+    /// The shard's clock in nanoseconds, read live: from the counter carrying the loop's last reading of
+    /// its driver's clock forward where the shard reads one (`machine::clock::counter_ticks`), else from the
+    /// driver's clock (the time the loop last published where the driver has none). Never earlier than a
+    /// reading before it.
     pub fn now_ns(&self) -> u64 {
-        match self.clock {
-            crate::driver::Clock::Since(epoch) => crate::driver::nanos_since(epoch),
-            crate::driver::Clock::Sim(shared) => shared.now_ns(),
-            crate::driver::Clock::Published => self.now_ns.get(),
-        }
+        let now = match self.clock {
+            crate::driver::Clock::Since(epoch) => {
+                match (self.carried.get(), crate::machine::clock::counter_ticks()) {
+                    (Some(carried), Some(ticks)) => carried.now_ns(ticks),
+                    _ => crate::driver::nanos_since(epoch),
+                }
+            }
+            crate::driver::Clock::Sim(shared) => return shared.now_ns(),
+            crate::driver::Clock::Published => return self.now_ns.get(),
+        };
+        let now = now.max(self.latest_ns.get());
+        self.latest_ns.set(now);
+        now
     }
 
     /// The task being polled on this shard right now.
@@ -499,6 +553,12 @@ impl ShardContext {
     /// The measured scheduler overrun, nanoseconds: how late the shard's steps have run after its waits.
     pub fn scheduler_overrun_ns(&self) -> u64 {
         self.scheduler_overrun_ns.get()
+    }
+
+    /// The timer wheel's tick, nanoseconds: a sleep ends on the tick after its deadline, so up to a tick
+    /// later than due by design (and later still by the scheduler's overrun).
+    pub fn timer_tick_ns(&self) -> u64 {
+        self.timer_tick_ns
     }
 
     /// The shard's counters as of the start of the current step.

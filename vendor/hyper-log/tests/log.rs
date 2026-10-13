@@ -816,6 +816,174 @@ fn damage_to_an_acknowledged_frame_is_reported() {
     ));
 }
 
+/// Four acknowledged frames of group 1, entries 1 to 4 of term 1, with `fault` armed on the file
+/// once the first `before` are acknowledged; then the machine restarted, its device's cache gone,
+/// and the log reopened.
+fn four_frames_with(
+    seed: u64,
+    before: u64,
+    fault: Fault,
+) -> Result<(Log<SimFile>, hyper_log::Recovery), LogError> {
+    let cfg = config(16, 8);
+    let log = Log::create(sim(seed), cfg, ID).unwrap();
+    for i in 1..=4u64 {
+        if i == before + 1 {
+            let fault = fault.clone();
+            log.with_file(move |f| f.inject(fault).unwrap()).unwrap();
+        }
+        log.write(
+            1,
+            Update {
+                entries: Some(entries(i, &[1])),
+                ..Update::default()
+            },
+        )
+        .unwrap();
+    }
+    let file = closed(log);
+    // The machine restarts: the device's cache goes, what reached its medium stays.
+    file.crash(Crash::KeepAll).unwrap();
+    Log::open(file, cfg, ID)
+}
+
+/// What [`acknowledged_or_reported`] says of a reopening that lost nothing.
+const HELD: &str = "every acknowledged entry held";
+
+/// What a device fault the log has acknowledged past leaves at its reopening (`docs/sim.md` §9,
+/// S-3's gate): every acknowledged entry read back as written, or the loss reported, the open
+/// refused as damaged, the group named damaged, or its entries from the first missing marked as
+/// possibly lacking. Never an acknowledged entry missing unreported, nor one read back changed.
+fn acknowledged_or_reported(
+    opened: Result<(Log<SimFile>, hyper_log::Recovery), LogError>,
+    what: &str,
+) -> &'static str {
+    let (log, recovery) = match opened {
+        Err(error) => {
+            assert!(
+                matches!(error, LogError::Damaged(_)),
+                "{what}: refused other than as damaged: {error:?}"
+            );
+            return "refused as damaged";
+        }
+        Ok(opened) => opened,
+    };
+    if recovery.damaged.contains(&1) {
+        drop(closed(log));
+        return "the group named damaged";
+    }
+    let view = log.view(1).unwrap().unwrap();
+    for (i, got) in (1..=view.last).zip(log.entries(1, 1, view.last + 1, u64::MAX).unwrap()) {
+        assert_eq!(
+            got,
+            entry(1, &format!("e{i}t1")),
+            "{what}: entry {i} read back changed"
+        );
+    }
+    let held = if view.last >= 4 {
+        HELD
+    } else {
+        assert!(
+            view.uncertain.is_some_and(|mark| mark.index > view.last),
+            "{what}: entries {} to 4 missing unreported: {view:?}",
+            view.last + 1
+        );
+        "the missing entries marked"
+    };
+    drop(closed(log));
+    held
+}
+
+/// A block read as zeros, an acknowledged frame's at rest: the log's checks report it, as they do
+/// a flipped bit (`damage_to_an_acknowledged_frame_is_reported`), wherever it falls on the frames.
+#[test]
+fn a_frame_read_as_zeros_or_junk_is_reported_by_the_logs_checks() {
+    for frame in 1..=5u64 {
+        for (name, fault) in [
+            (
+                "zeros",
+                Fault::ReadZeros {
+                    offset: AREA + frame * BLOCK as u64,
+                    len: BLOCK as u64,
+                },
+            ),
+            (
+                "junk",
+                Fault::ReadJunk {
+                    offset: AREA + frame * BLOCK as u64,
+                    len: BLOCK as u64,
+                },
+            ),
+        ] {
+            let file = {
+                let log = Log::create(sim(90 + frame), config(16, 8), ID).unwrap();
+                for i in 1..=4u64 {
+                    log.write(
+                        1,
+                        Update {
+                            entries: Some(entries(i, &[1])),
+                            ..Update::default()
+                        },
+                    )
+                    .unwrap();
+                }
+                closed(log)
+            };
+            file.inject(fault).unwrap();
+            let how = acknowledged_or_reported(
+                Log::open(file, config(16, 8), ID),
+                &format!("{name} over block {frame}"),
+            );
+            // Every block here holds a frame the log acknowledged: none reads wrong unreported.
+            assert_ne!(how, HELD, "{name} over block {frame} went unseen");
+        }
+    }
+}
+
+/// A write acknowledged and never written to the medium (a lost write, Ganesan et al. Table 1),
+/// the next one the log makes after each of its first four frames: once the machine restarts and
+/// the device's cache is gone, the open reports the loss, refused as damaged or the lost frame's
+/// entries marked.
+#[test]
+fn a_lost_frame_write_is_reported_once_the_machine_restarts() {
+    for before in 0..4u64 {
+        let how = acknowledged_or_reported(
+            four_frames_with(120 + before, before, Fault::LostWrite),
+            &format!("a lost write after {before} frames"),
+        );
+        // The lost write was the next frame's: acknowledged, and gone once the machine restarted.
+        assert_ne!(how, HELD, "a lost write after {before} frames went unseen");
+    }
+}
+
+/// A write that lands at another block of the log, its own left as it was (a misdirected write,
+/// Ganesan et al. Table 1): the log's checks see the frame out of its place, or the one it
+/// overwrote, and report it.
+#[test]
+fn a_misdirected_frame_write_is_reported() {
+    for before in 0..4u64 {
+        for to in 1..=5u64 {
+            let how = acknowledged_or_reported(
+                four_frames_with(
+                    140 + before * 8 + to,
+                    before,
+                    Fault::Misdirected {
+                        to: AREA + to * BLOCK as u64,
+                    },
+                ),
+                &format!("a write after {before} frames misdirected to block {to}"),
+            );
+            // The next frame's own block follows the empty first frame and the frames before it: a
+            // write sent there is no misdirection at all.
+            let own = before + 2;
+            if to == own {
+                assert_eq!(how, HELD, "a write sent to its own block {to}");
+            } else {
+                assert_ne!(how, HELD, "a write misdirected to block {to} went unseen");
+            }
+        }
+    }
+}
+
 /// The last frame, flushed and acknowledged, then damaged at rest, whatever part of it no
 /// longer reads: nothing after it proves it was flushed, but its persist record does. Its
 /// group's term and vote come back as the frame left them, never older; the entries it wrote

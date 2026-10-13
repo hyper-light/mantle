@@ -820,6 +820,58 @@ fn a_leader_probes_a_member_that_started_again() {
     assert_eq!(after.next_index, after.matched + 1);
 }
 
+/// A member cut off while its group commits is sent a window of what the cut loses. Trusted again,
+/// it is taken for unreachable while it was suspected, as a transport's report that it was is
+/// (raft's `MsgUnreachable`): the leader gives the window up and asks where it is at once, not
+/// once a beat has passed with the window unanswered, and it catches up.
+#[test]
+fn a_member_cut_off_while_its_group_commits_is_asked_where_it_is_once_trusted() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 13);
+    sim.found(1);
+    sim.cut.push(3);
+    sim.suspect(1, 3);
+    sim.suspect(2, 3);
+    let window = sim.peek(1).raw.raft.config().max_inflight_msgs;
+    for k in 0..window {
+        sim.node(1)
+            .propose(format!("committed while 3 was cut off: {k}").into_bytes());
+        sim.settle(1);
+        assert!(sim.run(), "1 and 2 commit");
+    }
+    let full = sim.peek(1).raw.raft.tracker().get(3).cloned().unwrap();
+    assert!(
+        full.inflights.full(),
+        "the window to 3 holds what the cut lost: {full:?}"
+    );
+    sim.cut.clear();
+    sim.trust(2, 3);
+    let from = sim.sent.len();
+    sim.trust(1, 3);
+    let asked = sim.peek(1).raw.raft.tracker().get(3).cloned().unwrap();
+    assert_eq!(asked.state, hyper_raft::progress::ProgressState::Probe);
+    assert_eq!(asked.inflights.count(), 0);
+    assert_eq!(asked.next_index, asked.matched + 1);
+    assert_eq!(
+        sim.sent[from..]
+            .iter()
+            .filter(|m| m.to == 3 && m.msg_type == MessageType::MsgHeartbeat)
+            .count(),
+        1,
+        "the leader asks 3 where it is"
+    );
+    assert!(sim.run());
+    let leader = sim.peek(1).view();
+    for id in 2..=3 {
+        let view = sim.peek(id).view();
+        assert_eq!(
+            (view.last_index, view.commit),
+            (leader.last_index, leader.commit),
+            "member {id}"
+        );
+    }
+}
+
 /// A follower whose detectors see its leader's node start again forgets it, and campaigns.
 #[test]
 fn a_follower_forgets_a_leader_that_started_again() {

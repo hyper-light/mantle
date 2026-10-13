@@ -25,10 +25,14 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use hyper_rt::RtError;
+use hyper_rt::driver::{Clock, Completion, Driver, DriverKind, Kick};
+use hyper_rt::interests::Readiness;
 use hyper_rt::runtime::{Runtime, RuntimeConfig};
 
 /// The tests of this binary read process-global state (which registry slots are free), so they run one at
@@ -218,26 +222,130 @@ impl Future for Panics {
     type Output = ();
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
         let _ = self.0.send(());
-        panic!("the test's injected worker failure");
+        panic!("the test's injected task failure");
     }
 }
 
-/// AUD-29-12. Do: make one shard's worker panic, then shut the runtime down. Expect: `WorkerFailed`
-/// naming that shard — never default counters — and every slot given back all the same.
+/// Do: make a task on one shard panic in its poll, then run another task there and shut the runtime
+/// down. Expect: the task unwound inside its shard's boundary, so the shard ran the next task, and
+/// the shutdown reports every shard's counters, the unwind counted on that shard's alone, and gives
+/// every slot back.
+#[test]
+fn a_task_that_panics_ends_unwound_and_its_shard_goes_on() {
+    let _serial = serial();
+    let baseline = baseline_slots();
+    let runtime = Runtime::start(&config()).unwrap();
+    let shard = runtime.shard_ids()[1];
+    let (polled, told) = channel();
+    runtime.spawn_on(shard, Panics(polled)).unwrap();
+    told.recv_timeout(STOP_WAIT)
+        .expect("the panicking task was polled");
+    let (ran, heard) = channel();
+    runtime
+        .spawn_on(shard, async move {
+            let _ = ran.send(());
+        })
+        .unwrap();
+    heard
+        .recv_timeout(STOP_WAIT)
+        .expect("the shard ran a task after the one that panicked");
+    let counters = runtime.shutdown().unwrap();
+    let unwound: Vec<u64> = counters.iter().map(|shard| shard.unwound).collect();
+    assert_eq!(unwound, [0, 1, 0], "{counters:?}");
+    let after = Runtime::start(&config()).unwrap();
+    assert_eq!(
+        after.shard_ids(),
+        &baseline[..],
+        "every slot was given back"
+    );
+    after.shutdown().unwrap();
+}
+
+/// Whether [`PanicsOnWait`] panics at its next wait.
+static ARMED: AtomicBool = AtomicBool::new(false);
+
+/// A shard's OS driver whose wait panics once [`ARMED`] is set, telling the test first: a worker
+/// that fails outside its tasks, in a caller's driver.
+struct PanicsOnWait {
+    driver: Box<dyn Driver>,
+    failing: Sender<()>,
+}
+
+impl Driver for PanicsOnWait {
+    fn kind(&self) -> DriverKind {
+        self.driver.kind()
+    }
+    fn kick_handle(&self) -> Kick {
+        self.driver.kick_handle()
+    }
+    fn now_ns(&self) -> u64 {
+        self.driver.now_ns()
+    }
+    fn wait(&mut self, timeout_ns: Option<u64>, out: &mut Vec<Completion>) -> Result<(), RtError> {
+        if ARMED.load(Ordering::SeqCst) {
+            let _ = self.failing.send(());
+            panic!("the test's injected worker failure");
+        }
+        self.driver.wait(timeout_ns, out)
+    }
+    fn submit_nop(&mut self, user_data: u64) -> Result<(), RtError> {
+        self.driver.submit_nop(user_data)
+    }
+    fn arm(&mut self, raw: i32, want: Readiness, tag: u64) -> Result<(), RtError> {
+        self.driver.arm(raw, want, tag)
+    }
+    fn disarm(&mut self, raw: i32) {
+        self.driver.disarm(raw);
+    }
+    fn reserve_handles(&mut self, handles: usize) -> Result<(), RtError> {
+        self.driver.reserve_handles(handles)
+    }
+    fn has_pending(&self) -> bool {
+        self.driver.has_pending()
+    }
+    fn clock(&self) -> Clock {
+        self.driver.clock()
+    }
+    fn is_sim(&self) -> bool {
+        self.driver.is_sim()
+    }
+}
+
+/// AUD-29-12. Do: make one shard's worker panic outside its tasks (its driver's wait panics), then
+/// shut the runtime down. Expect: `WorkerFailed` naming that shard — never default counters — and
+/// every slot given back all the same.
 #[test]
 fn a_worker_that_panics_is_reported_typed_and_its_slot_is_given_back() {
     let _serial = serial();
     let baseline = baseline_slots();
-    let runtime = Runtime::start(&config()).unwrap();
+    let entries = u32::try_from(config().ring_entries).unwrap();
+    let (failing_told, failed) = channel();
+    let mut prepared = 0;
+    let mut prepare = || {
+        prepared += 1;
+        let mut driver = hyper_rt::driver::os_driver(entries)?;
+        if prepared == 2 {
+            let seed = driver.seed;
+            let failing = failing_told.clone();
+            driver.seed = Box::new(move |kick| {
+                seed(kick)
+                    .map(|driver| Box::new(PanicsOnWait { driver, failing }) as Box<dyn Driver>)
+            });
+        }
+        Ok(driver)
+    };
+    let runtime = Runtime::start_with(&config(), &mut prepare).unwrap();
     let failing = runtime.shard_ids()[1];
-    let (polled, told) = channel();
-    runtime.spawn_on(failing, Panics(polled)).unwrap();
-    // The shutdown must not reach the shard before the task is polled, or it is cancelled unpanicked.
-    told.recv_timeout(STOP_WAIT)
-        .expect("the panicking task was polled");
+    ARMED.store(true, Ordering::SeqCst);
+    // A task wakes the shard from its wait, and its next wait panics.
+    runtime.spawn_on(failing, async {}).unwrap();
+    failed
+        .recv_timeout(STOP_WAIT)
+        .expect("the shard's driver panicked");
+    ARMED.store(false, Ordering::SeqCst);
     assert_eq!(
         runtime.shutdown(),
-        Err(hyper_rt::error::RtError::WorkerFailed { shard: failing.0 })
+        Err(RtError::WorkerFailed { shard: failing.0 })
     );
     let after = Runtime::start(&config()).unwrap();
     assert_eq!(

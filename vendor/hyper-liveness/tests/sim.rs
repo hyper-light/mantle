@@ -1553,9 +1553,9 @@ fn heartbeats_without_their_proof_are_refused() {
 
 /// Problem 1 and item 10 of `docs/timing.md` (§2.9, §3): every link configures, or a crash on it
 /// is suspected within the bound its suspicion states. On the measured hosts, macOS (whose freezes
-/// make heartbeats at a short floor late together, too correlated for a window to measure,
-/// `LinkEstimator::independent_interval`), macOS with its groups keeping its log busy, and Linux
-/// in its VM:
+/// make heartbeats at a short floor late together, too correlated for a short window to measure, so
+/// the link waits for a longer one), macOS with its groups keeping its log busy, and Linux in its
+/// VM:
 /// - before any kill, every pair configures, none taking more heartbeats unconfigured than any
 ///   window holds (`Sim::unresolved`);
 /// - one node is killed after a share of the heartbeats it sent before every pair had configured

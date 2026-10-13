@@ -37,4 +37,4 @@ if [ "$hogs" != "0" ]; then
   [ -n "$cpus" ] || { echo "HOGS needs CPUS: the busy loops share the CPUs the tests run on" >&2; exit 2; }
   load="for _ in \$(seq $hogs); do taskset -c $cpus sh -c 'while :; do :; done' & done"
 fi
-docker "${args[@]}" rust:1.98.0 bash -c "rustup component add clippy rustfmt >/dev/null 2>&1; set -e; $build; $load; $run"
+docker "${args[@]}" rust:1.98.1 bash -c "rustup component add clippy rustfmt >/dev/null 2>&1; set -e; $build; $load; $run"

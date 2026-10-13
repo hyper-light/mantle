@@ -37,10 +37,11 @@
 //! unavailability is one or more promises nothing and is not made.
 //!
 //! **Every link judged** (`docs/timing.md` §2.8–§2.9, §3 item 10). A link whose heartbeats are too
-//! correlated at its interval for its estimator to measure its evidence asks the interval its Allan
-//! levels say they would be independent at (`LinkEstimator::independent_interval`), and a sender
-//! follows its floor up, not down, so the receiver's evidence is not started again at each move of
-//! a mean. Until a link configures, it is judged by the margin what its node measured of its links
+//! correlated at its interval for its estimator to measure its evidence waits there for a longer
+//! Allan level, asking no longer interval, and a sender
+//! follows its floor up at once and down once the flushes it is the mean of have doubled, so the
+//! receiver's evidence is not started again at each move of a mean, nor held at a new log's first
+//! flushes. Until a link configures, it is judged by the margin what its node measured of its links
 //! configures for it: the wider of its pool's measure and the widest of its configured links', and
 //! of what the link's own latenesses show; a peer from which nothing has come is judged from the
 //! attach. A receiver expects

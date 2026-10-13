@@ -333,3 +333,204 @@ fn a_holding_the_same_write_reaches_by_an_append_is_kept() {
         "the holding is kept beside the entry that reached it"
     );
 }
+
+fn store_waker() -> (Waker, Receiver<usize>) {
+    let (tell, woken) = sync_channel(1024);
+    let (waker, _) = hyper_measure::wake::waker(0, tell);
+    (waker, woken)
+}
+
+fn entries_of(first: u64, last: u64, term: u64) -> Vec<hyper_raft::proto::Entry> {
+    (first..=last)
+        .map(|index| hyper_raft::proto::Entry {
+            index,
+            term,
+            data: vec![index as u8; 96],
+            ..hyper_raft::proto::Entry::default()
+        })
+        .collect()
+}
+
+fn write_of(first: u64, entries: &[hyper_raft::proto::Entry]) -> hyper_durable::Write<'_> {
+    hyper_durable::Write {
+        start: None,
+        entries: Some(hyper_durable::Entries { first, entries }),
+        hard_state: None,
+        proposals: &[],
+        released: None,
+    }
+}
+
+/// The oldest write's answer, waited for.
+fn answer_of(store: &mut GroupStore<SimFile>, woken: &Receiver<usize>) {
+    loop {
+        if let Some(answer) = store.poll() {
+            answer.unwrap();
+            return;
+        }
+        woken.recv().unwrap();
+    }
+}
+
+/// What a replica has yet to apply is read back from its store's handle, never through the log: the
+/// log closed, and the group's share of its cache too small for an entry, the entries after the
+/// replica's mark still read, and those it applied no longer do. What is kept is counted exactly from
+/// the write's answer, and let go as the replica applies it.
+#[test]
+fn entries_the_replica_has_yet_to_apply_are_read_back_from_its_store_until_applied() {
+    let log = Log::create(
+        sim_file(31),
+        Config {
+            group_cache: 1,
+            ..config(16, 1 << 12)
+        },
+        1,
+    )
+    .unwrap();
+    let mut store = GroupStore::claim(&log, 1).unwrap();
+    let (waker, woken) = store_waker();
+    // As a replica opens with nothing applied.
+    store.keep_after(0);
+    let written = entries_of(1, 8, 1);
+    let bytes = |entries: &[hyper_raft::proto::Entry]| -> u64 {
+        entries
+            .iter()
+            .map(|entry| hyper_durable::encode_entry(entry).unwrap().len() as u64)
+            .sum()
+    };
+    store.submit(&write_of(1, &written), &waker).unwrap();
+    assert_eq!(
+        store.kept_bytes(),
+        0,
+        "nothing is kept before the log has the write"
+    );
+    answer_of(&mut store, &woken);
+    assert_eq!(
+        store.kept_bytes(),
+        bytes(&written),
+        "each entry kept from the answer"
+    );
+    let mut read = Vec::new();
+    store.entries(3, 7, u64::MAX, &mut read).unwrap();
+    assert_eq!(read, written[2..6]);
+    store.keep_after(4);
+    assert_eq!(
+        store.kept_bytes(),
+        bytes(&written[4..]),
+        "what was applied is let go"
+    );
+    drop(log);
+    let mut kept = Vec::new();
+    store.entries(5, 9, u64::MAX, &mut kept).unwrap();
+    assert_eq!(
+        kept,
+        written[4..8],
+        "read from what was kept, the log closed"
+    );
+    let mut visited = Vec::new();
+    store
+        .visit(5, 9, 1, &mut |entry| {
+            visited.push(entry.index);
+            false
+        })
+        .unwrap();
+    assert_eq!(visited, vec![5, 6, 7, 8]);
+    let mut gone = Vec::new();
+    assert!(
+        store.entries(2, 4, u64::MAX, &mut gone).is_err(),
+        "a range applied is the log's, and the log is closed"
+    );
+    // A lower mark changes nothing.
+    store.keep_after(2);
+    assert_eq!(store.kept_bytes(), bytes(&written[4..]));
+    store.keep_after(8);
+    assert_eq!(store.kept_bytes(), 0);
+}
+
+/// A write that replaces a suffix shows nothing of it before it is answered: until then the
+/// indices it carries read the entries the answered writes left, after it the new ones.
+#[test]
+fn a_replaced_suffix_is_read_as_the_answered_writes_left_it() {
+    let log = Log::create(sim_file(32), config(16, 1 << 12), 1).unwrap();
+    let mut store = GroupStore::claim(&log, 1).unwrap();
+    let (waker, woken) = store_waker();
+    let first = entries_of(1, 6, 1);
+    store.submit(&write_of(1, &first), &waker).unwrap();
+    answer_of(&mut store, &woken);
+    let replacing = entries_of(4, 6, 2);
+    store.submit(&write_of(4, &replacing), &waker).unwrap();
+    let mut before = Vec::new();
+    store.entries(1, 7, u64::MAX, &mut before).unwrap();
+    assert_eq!(before, first, "the replacing write is not answered yet");
+    answer_of(&mut store, &woken);
+    let mut after = Vec::new();
+    store.entries(4, 7, u64::MAX, &mut after).unwrap();
+    assert_eq!(after, replacing);
+    let mut whole = Vec::new();
+    store.entries(1, 7, u64::MAX, &mut whole).unwrap();
+    assert_eq!(&whole[..3], &first[..3]);
+    assert_eq!(&whole[3..], &replacing[..]);
+}
+
+/// A read asks for as many entries as its bytes admit and one at least, from what was kept as
+/// from the log.
+#[test]
+fn a_read_from_what_was_kept_takes_what_its_bytes_admit_and_one_at_least() {
+    let log = Log::create(sim_file(33), config(16, 1 << 12), 1).unwrap();
+    let mut store = GroupStore::claim(&log, 1).unwrap();
+    let (waker, woken) = store_waker();
+    let written = entries_of(1, 6, 1);
+    store.submit(&write_of(1, &written), &waker).unwrap();
+    answer_of(&mut store, &woken);
+    let one = hyper_durable::encode_entry(&written[0]).unwrap().len() as u64;
+    let mut two = Vec::new();
+    store.entries(1, 7, one * 2, &mut two).unwrap();
+    assert_eq!(two, written[..2]);
+    let mut least = Vec::new();
+    store.entries(1, 7, 1, &mut least).unwrap();
+    assert_eq!(least, written[..1]);
+}
+
+/// A group stopped with a write out and opened again at once in the same process opens on the
+/// group as the log holds it, every write the log took included (focal, 2026-10-12: a shell group
+/// reopened in-process failed `Compacted` at `Replica::open`). The member compacts and is dropped
+/// before the compaction's answer comes; its store's handle goes with it, and a claim made then was
+/// given the group without the compaction, so the open read entries the compaction had let go.
+/// Each seed's log takes the compaction at its own point in the drop, as a device answers when it
+/// does.
+#[test]
+fn a_group_stopped_with_its_compaction_out_opens_again_at_once() {
+    for seed in 0..16 {
+        let log = Log::create(sim_file(40 + seed), config(16, 1 << 12), 1).unwrap();
+        let (mut r, waker, woken) = sole(&log);
+        settle(&mut r, &waker, &woken);
+        for i in 0..8u8 {
+            r.propose(Vec::new(), vec![i; 64]).unwrap();
+        }
+        settle(&mut r, &waker, &woken);
+        let applied = r.applied().index;
+        assert!(
+            r.compact(1, now(), &waker).unwrap(),
+            "seed {seed}: a compaction is due"
+        );
+        assert!(r.in_flight() > 0, "seed {seed}: the compaction is out");
+        // The machine persisted what the compaction keeps behind (`Replica::compact`): it opens
+        // again on that.
+        let kv = r.machine().crashed();
+        drop(r);
+        let store = GroupStore::claim(&log, 1).unwrap();
+        let again = Replica::open(&settings(1, 3), store, kv, Unbounded)
+            .unwrap_or_else(|e| panic!("seed {seed}: the group opens again: {e:?}"));
+        let ours = again.core().store().log().handle().view().unwrap().unwrap();
+        let theirs = log.view(1).unwrap().unwrap();
+        assert_eq!(
+            ours, theirs,
+            "seed {seed}: the store holds the group as the log does"
+        );
+        assert_eq!(
+            theirs.start.index,
+            applied - 1,
+            "seed {seed}: the compaction is the log's"
+        );
+    }
+}

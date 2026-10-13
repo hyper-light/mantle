@@ -13,6 +13,7 @@ exclude = [
   "hyper-raft",
   "hyper-rt",
   "hyper-seal",
+  "hyper-sim",
   "hyper-timing",
 ]
 resolver = "2"

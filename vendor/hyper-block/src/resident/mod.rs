@@ -9,7 +9,9 @@
 //! made where it is asked for, and only a read that would wait is handed over.
 //!
 //! - Linux: `preadv2(2)` with `RWF_NOWAIT` (since 4.14) returns `EAGAIN`, or only the part in
-//!   memory, rather than wait for the device or a lock.
+//!   memory, rather than wait for the device or a lock. A page not in memory has its read-ahead
+//!   started before the call answers, and is read if that I/O finished first (`linux`, through
+//!   which tests ask the page cache itself).
 //! - macOS: no such flag. `mincore(2)` over a read-only shared mapping of the file reports each
 //!   page's residency in the unified buffer cache (`macos`), and a read every page of which is
 //!   resident is made with `pread(2)`.
@@ -26,16 +28,27 @@ mod macos;
 #[cfg(target_vendor = "apple")]
 pub(crate) use macos::{Epoch, Resident};
 
+#[cfg(all(test, target_os = "linux"))]
+mod linux;
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use linux::cached;
+
 /// What a handle's reads from memory did ([`crate::block::BlockFile::residency`]): probes made,
 /// reads made on an earlier probe's answer instead (macOS, mantle `docs/research/46-reclaim-epochs.md`),
 /// epochs read and the changes among them that forgot every answer, and, in shadow mode, the
 /// answers a probe made anyway found wrong.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Residency {
+    /// Reads that asked the kernel which of their pages it holds (`mincore(2)`).
     pub probes: u64,
+    /// Reads made on an earlier probe's answer, kept while the kernel reclaimed nothing.
     pub skips: u64,
+    /// Times the kernel's reclaim counters were read.
     pub epochs: u64,
+    /// Readings of them that had moved, each forgetting every kept answer.
     pub changes: u64,
+    /// In shadow mode, kept answers a probe made anyway found wrong.
     pub wrong: u64,
 }
 

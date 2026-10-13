@@ -404,8 +404,14 @@ fn an_entered_owner_drop_keeps_the_watch_and_original_alive_until_held_io_retire
     assert_eq!(&bytes[PAGE..], &[0x4a; PAGE]);
 }
 
+/// A duplicate whose drop unwinds with a payload that unwinds as it drops costs only that drop: the
+/// issuer drops the payload inside a boundary of its own and leaves the second unfreed (hyper-block's
+/// `unwind::contained`), so its worker lives on, the retirement is refused, typed, and the watch keeps
+/// the earlier write's own cause. The worker's thread then ends at the issuer's shutdown, its native
+/// thread-local held until released, with the first write durable. Before the rule the second unwind
+/// left the worker and ended its thread, the exit this test once produced to observe the watch.
 #[test]
-fn an_unexpected_worker_exit_preserves_prior_write_cause_through_held_native_tls() {
+fn a_duplicate_whose_drop_unwinds_twice_costs_only_its_drop_and_keeps_the_prior_write_cause() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("watch");
     let (probe, held) = setup(&path, true);
@@ -421,31 +427,28 @@ fn an_unexpected_worker_exit_preserves_prior_write_cause_through_held_native_tls
     write_reason(result.map(|_| ()));
     let mut watch = attached.prepare_retirement_watch().unwrap();
     let _cleanup = OpenOnDrop(status);
-    status.hold_tls.store(true, Ordering::SeqCst);
     status.panic_duplicate_drop.store(true, Ordering::SeqCst);
+    let retired = attached.retire_blocking();
+    assert!(
+        matches!(&retired, Err(DiskError::Io { op: "issue", source, .. })
+            if source.kind() == std::io::ErrorKind::BrokenPipe
+                && source.to_string() == "a device file's Drop unwound"),
+        "{retired:?}"
+    );
+    write_reason(watch.wait_blocking()); // The earlier write's own cause, not the drop's.
+    assert!(watch.is_retired());
+    status.hold_tls.store(true, Ordering::SeqCst);
     std::thread::scope(|scope| {
         let _release = OpenOnDrop(status);
-        let waiting = scope.spawn(move || {
-            let result = watch.wait_blocking();
-            let retired = watch.is_retired();
-            drop(probe);
-            (result, retired)
-        });
-        let retiring = scope.spawn(move || attached.retire_blocking());
+        let stopping = scope.spawn(move || drop(issuer));
         assert_eq!(held.recv().unwrap(), Notice::TlsHeld);
-        eprintln!("[WATCH_TLS_HELD] unexpected worker exit after completed and failed writes");
         assert!(!status.tls_ended.load(Ordering::SeqCst));
         assert!(!status.original_dropped.load(Ordering::SeqCst));
-        assert!(!waiting.is_finished());
-        assert!(!retiring.is_finished());
         release(status);
-        assert!(retiring.join().unwrap().is_err());
-        let (result, retired) = waiting.join().unwrap();
-        write_reason(result); // Earlier actual write, rather than generic lifecycle/Stop.
-        assert!(retired);
+        stopping.join().unwrap();
         assert!(status.tls_ended.load(Ordering::SeqCst));
     });
-    drop(issuer);
+    drop(probe);
     assert_eq!(status.alive.load(Ordering::SeqCst), 0);
     let file = DeviceFile::open(
         &path,

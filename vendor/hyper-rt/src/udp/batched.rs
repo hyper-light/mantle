@@ -53,6 +53,30 @@ pub struct Io {
     pub batch: usize,
 }
 
+impl Io {
+    /// The most a real socket batched by this `Io` holds while it lives, bytes, and so what its owner
+    /// charges for it: its receive buffers ([`RECEIVE_BYTES`] each, `batch` of them on Linux and one
+    /// elsewhere), its outbox (`batch` slots, each a datagram or a segmented send of at most
+    /// [`RECEIVE_BYTES`], [`IoStats::oversize`] past it) and, on Linux, the message headers of a send and a
+    /// receive. A socket holds as much once it has sent its largest datagrams and received a full batch.
+    pub fn held_bound(&self) -> usize {
+        let receive = if cfg!(target_os = "linux") {
+            self.batch
+        } else {
+            1
+        };
+        let slot = RECEIVE_BYTES.saturating_add(size_of::<Slot>());
+        #[cfg(target_os = "linux")]
+        let headers = linux::message_bytes().saturating_mul(self.batch);
+        #[cfg(not(target_os = "linux"))]
+        let headers = 0;
+        receive
+            .saturating_mul(RECEIVE_BYTES)
+            .saturating_add(self.batch.saturating_mul(slot))
+            .saturating_add(headers)
+    }
+}
+
 /// What a socket has done.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IoStats {
@@ -78,6 +102,9 @@ pub struct IoStats {
     /// Whether the kernel stamps each datagram received (Linux's `SO_TIMESTAMPNS`, macOS's
     /// `SO_TIMESTAMP_MONOTONIC`); otherwise a datagram is stamped when it is read.
     pub kernel_stamps: bool,
+    /// Datagrams dropped because they were larger than a slot holds ([`RECEIVE_BYTES`]): no UDP payload
+    /// or segmented send is, so one is a caller's fault, and the slot never grows past its bound for it.
+    pub oversize: u64,
 }
 
 /// Where and when a datagram arrived.
@@ -118,6 +145,10 @@ enum SendStep {
     NotNow,
     /// The kernel refused the message carrying this many slots; they are dropped.
     Refused(usize),
+    /// The call returned an astray report and sent the message carrying this many slots nothing: an
+    /// earlier datagram's report, consumed by the call, or the message's own when it has no route —
+    /// which a second send of it tells apart.
+    Astray(usize),
     /// Segmented sends were just switched off (the device cannot segment); send again unsegmented.
     #[cfg(target_os = "linux")]
     Unsegmented,
@@ -144,6 +175,8 @@ pub struct Batched {
     /// Slots filled, and of those, the ones sent.
     queued: usize,
     sent: usize,
+    /// The slot whose send returned an astray report once: a second report for it is its own.
+    astray_at: Option<usize>,
     buffers: Vec<Vec<u8>>,
     stats: IoStats,
     /// The latest arrival handed over: none after it arrived before it.
@@ -309,6 +342,7 @@ impl Batched {
             slots,
             queued: 0,
             sent: 0,
+            astray_at: None,
             buffers,
             stats,
             latest_ns: 0,
@@ -358,18 +392,49 @@ impl Batched {
         if self.sent == self.queued {
             self.sent = 0;
             self.queued = 0;
+            self.astray_at = None;
         }
         self.slots.get_mut(self.queued)
     }
 
-    /// Queues the slot [`Batched::slot`] gave.
+    /// Queues the slot [`Batched::slot`] gave; one filled past [`RECEIVE_BYTES`] is dropped and counted
+    /// ([`IoStats::oversize`]) and gives back what it grew past its bound.
     pub fn commit(&mut self) {
+        if let Some(slot) = self.slots.get_mut(self.queued)
+            && slot.bytes.len() > RECEIVE_BYTES
+        {
+            slot.bytes.clear();
+            slot.bytes.shrink_to(RECEIVE_BYTES);
+            self.stats.oversize = self.stats.oversize.saturating_add(1);
+            return;
+        }
         self.queued = self.queued.saturating_add(1).min(self.batch);
+    }
+
+    /// What the socket holds now, bytes: its receive buffers, its outbox's slots and what each slot holds,
+    /// and on Linux its message headers. Never more than [`Io::held_bound`] of its `Io`.
+    pub fn held_bytes(&self) -> usize {
+        let buffers = self.buffers.iter().fold(0usize, |held, buffer| {
+            held.saturating_add(buffer.capacity())
+        });
+        let slots = self.slots.iter().fold(0usize, |held, slot| {
+            held.saturating_add(size_of::<Slot>())
+                .saturating_add(slot.bytes.capacity())
+        });
+        #[cfg(target_os = "linux")]
+        let headers = linux::message_bytes().saturating_mul(self.batch);
+        #[cfg(not(target_os = "linux"))]
+        let headers = 0;
+        buffers.saturating_add(slots).saturating_add(headers)
     }
 
     /// Queues a copy of `bytes` for `to`; with the outbox full it is dropped and counted, and `false`
     /// returned.
     pub fn queue(&mut self, to: SocketAddr, bytes: &[u8]) -> bool {
+        if bytes.len() > RECEIVE_BYTES {
+            self.stats.oversize = self.stats.oversize.saturating_add(1);
+            return false;
+        }
         let Some(slot) = self.slot() else {
             self.stats.outbox_full = self.stats.outbox_full.saturating_add(1);
             return false;
@@ -382,8 +447,12 @@ impl Batched {
     }
 
     /// Sends what is queued, as far as the socket takes it now. A datagram the kernel refuses is dropped
-    /// and counted: the protocols above recover a lost one. Every pass of the loop moves at least one
-    /// slot, or returns, or switches segmentation off (once), so it ends within the queue's length.
+    /// and counted: the protocols above recover a lost one. An astray report is an earlier datagram's
+    /// once — the call consumed it, and the datagram is sent again at once — and the datagram's own the
+    /// second time (a destination the kernel has no route for, which macOS reports as unreachable): it
+    /// is refused like any other, and never holds the queue behind it. Every pass of the loop moves at
+    /// least one slot, or returns, or marks the slot it tried astray (once a slot), or switches
+    /// segmentation off (once), so it ends within twice the queue's length and one.
     pub fn send(&mut self) -> Sent {
         while self.sent < self.queued {
             match self.send_some() {
@@ -392,19 +461,29 @@ impl Batched {
                     self.sent = self.sent.saturating_add(count).min(self.queued);
                     self.stats.sent = self.stats.sent.saturating_add(as_u64(count));
                     self.stats.send_calls = self.stats.send_calls.saturating_add(1);
+                    self.astray_at = None;
                 }
                 SendStep::NotNow => return Sent::Blocked,
                 SendStep::Refused(slots) => {
                     let slots = slots.max(1);
                     self.sent = self.sent.saturating_add(slots).min(self.queued);
                     self.stats.send_errors = self.stats.send_errors.saturating_add(as_u64(slots));
+                    self.astray_at = None;
                 }
+                SendStep::Astray(slots) if self.astray_at == Some(self.sent) => {
+                    let slots = slots.max(1);
+                    self.sent = self.sent.saturating_add(slots).min(self.queued);
+                    self.stats.send_errors = self.stats.send_errors.saturating_add(as_u64(slots));
+                    self.astray_at = None;
+                }
+                SendStep::Astray(_) => self.astray_at = Some(self.sent),
                 #[cfg(target_os = "linux")]
                 SendStep::Unsegmented => {}
             }
         }
         self.sent = 0;
         self.queued = 0;
+        self.astray_at = None;
         Sent::Drained
     }
 
@@ -423,9 +502,10 @@ impl Batched {
                 Some(
                     libc::ECONNREFUSED | libc::ECONNRESET | libc::EHOSTUNREACH | libc::ENETUNREACH,
                 ) => {
-                    // The report is consumed and the datagram was not sent: the next send carries it.
+                    // The report is consumed and the datagram was not sent: the next send carries it,
+                    // unless the report was its own (`Batched::send`).
                     self.stats.astray = self.stats.astray.saturating_add(1);
-                    SendStep::NotNow
+                    SendStep::Astray(failed.slots)
                 }
                 // EIO from a segmented send: the device cannot segment (its checksum offload is off,
                 // udp(7)); later sends go one datagram a message, this one among them.
@@ -448,8 +528,13 @@ impl Batched {
         let Some(slot) = self.slots.get(self.sent) else {
             return SendStep::Took(1);
         };
+        let astray_before = self.udp.astray_reports();
         match self.udp.send_once(&slot.bytes, slot.to) {
             Ok(Outcome::Done(_)) => SendStep::Took(1),
+            // The socket counted the report itself.
+            Ok(Outcome::NotNow) if self.udp.astray_reports() != astray_before => {
+                SendStep::Astray(1)
+            }
             Ok(Outcome::NotNow) => SendStep::NotNow,
             Err(_) => SendStep::Refused(1),
         }

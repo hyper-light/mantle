@@ -20,19 +20,19 @@
 //! receivers each have their own cell, which the sender wakes one by one, at most the configured receivers.
 
 pub mod cell;
-mod ring;
+pub(crate) mod ring;
 mod room;
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
 use std::task::{Context, Poll};
 
 use crate::error::RtError;
 use crate::waker::polling_task;
 
 use cell::{CellRef, claim};
-use ring::{Ring, Shared};
+use ring::{Padded, Refused, Ring, Shared};
 use room::Room;
 
 /// Why a primitive's call ended without a value.
@@ -169,6 +169,14 @@ pub fn oneshot<T>() -> Result<(OneshotSender<T>, OneshotReceiver<T>), RtError> {
 }
 
 impl<T> OneshotSender<T> {
+    /// Whether the receiver has gone, so a value sent now would be refused: what an owner holding replies
+    /// for its callers sweeps by, before their deadlines, once a caller stopped waiting.
+    pub fn is_closed(&self) -> bool {
+        self.shared
+            .as_ref()
+            .is_none_or(|shared| state_has(shared.cell(), RECEIVER_GONE))
+    }
+
     /// Sends the value; `Closed` when the receiver is gone.
     pub fn send(mut self, value: T) -> Result<(), SyncError<T>> {
         let Some(shared) = self.shared.take() else {
@@ -179,7 +187,20 @@ impl<T> OneshotSender<T> {
             set_state(cell, SENDERS_GONE);
             return Err(SyncError::Closed(value));
         }
-        let sent = shared.get().value.push(value).map_err(SyncError::Closed);
+        let ring = &shared.get().value;
+        // The one place is the one send's, so a refusal is the receiver's close (`ring`'s mark).
+        let sent = match ring.push(value) {
+            Ok(()) => {
+                // A receiver that closed after this push claimed its place may have drained before it
+                // landed: the value is dropped here, as a close drops what was sent.
+                fence(Ordering::SeqCst);
+                if ring.is_closed() {
+                    ring.drain();
+                }
+                Ok(())
+            }
+            Err(Refused::Full(value) | Refused::Closed(value)) => Err(SyncError::Closed(value)),
+        };
         // The one value went (or could not): the receiver may stop waiting either way.
         set_state(cell, SENDERS_GONE);
         cell.wake();
@@ -226,8 +247,12 @@ impl<T> OneshotReceiver<T> {
 
 impl<T> Drop for OneshotReceiver<T> {
     fn drop(&mut self) {
+        // The sender refuses from now on: a send that has not claimed the place is refused with its value,
+        // and one that has is dropped here or by its sender (`ring`'s close).
         set_state(self.shared.cell(), RECEIVER_GONE);
-        drop(self.shared.get().value.pop());
+        let ring = &self.shared.get().value;
+        ring.close();
+        ring.drain();
     }
 }
 
@@ -260,13 +285,20 @@ fn poll_value<T>(tried: &mut Result<Option<T>, SyncError<()>>) -> Option<Result<
 
 // ------------------------------------------------------------------------------------------ channel
 
-/// What a channel's ends share: its values, the senders waiting for room, and how many senders live.
+/// What a channel's ends share: its values, the senders waiting for room, how many senders live, and
+/// whether every one is gone.
 #[derive(Debug)]
 struct ChannelState<T> {
     values: Ring<T>,
     room: Room,
     /// The live senders; the last to go closes the channel for the receiver.
     senders: AtomicUsize,
+    /// Whether every sender is gone, on a line of its own that only the last sender's drop writes. The
+    /// receiver reads it each time it finds the ring empty, and it used to read the cell's state word for
+    /// it, in the process-wide table where a cell is 32 bytes, four to an Apple silicon line, beside other
+    /// primitives' words that their own ends write: an empty `try_recv` cost 1.8 ns alone and 2.1–2.7 ns
+    /// while two threads churned one-shots (`benchmark-results/hyper-rt-recv-20261013`).
+    senders_gone: Padded<AtomicBool>,
 }
 
 /// The sending half of a bounded channel; clone it for more senders.
@@ -309,6 +341,7 @@ pub fn channel_with<T>(
             values,
             room,
             senders: AtomicUsize::new(1),
+            senders_gone: Padded(AtomicBool::new(false)),
         },
         cell,
     );
@@ -332,8 +365,9 @@ impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         // The last sender closes the channel for the receiver, then wakes it to see so: its values, and every
         // earlier sender's (each released by its own count above), are visible to a receiver that reads the bit.
-        if self.shared.get().senders.fetch_sub(1, Ordering::AcqRel) == 1 {
-            set_state(self.shared.cell(), SENDERS_GONE);
+        let state = self.shared.get();
+        if state.senders.fetch_sub(1, Ordering::AcqRel) == 1 {
+            state.senders_gone.0.store(true, Ordering::Release);
             self.shared.cell().wake();
         }
     }
@@ -346,13 +380,23 @@ impl<T> Sender<T> {
         if state_has(cell, RECEIVER_GONE) {
             return Err(SyncError::Closed(value));
         }
-        match self.shared.get().values.push(value) {
+        let values = &self.shared.get().values;
+        match values.push(value) {
             Ok(()) => {
+                // A receiver that closed after this push claimed its place may have drained before it
+                // landed: what is left is dropped here, as the receiver's drop drops what was sent.
+                fence(Ordering::SeqCst);
+                if values.is_closed() {
+                    values.drain();
+                }
                 cell.wake();
                 Ok(())
             }
-            Err(value) if state_has(cell, RECEIVER_GONE) => Err(SyncError::Closed(value)),
-            Err(value) => Err(SyncError::Full(value)),
+            Err(Refused::Closed(value)) => Err(SyncError::Closed(value)),
+            Err(Refused::Full(value)) if state_has(cell, RECEIVER_GONE) => {
+                Err(SyncError::Closed(value))
+            }
+            Err(Refused::Full(value)) => Err(SyncError::Full(value)),
         }
     }
 
@@ -498,10 +542,10 @@ impl<T> ChannelReceiver<T> {
             state.room.grant_one();
             return Ok(Some(value));
         }
-        if !state_has(self.shared.cell(), SENDERS_GONE) {
+        if !state.senders_gone.0.load(Ordering::Acquire) {
             return Ok(None);
         }
-        // Every sender is gone; what they sent before going is visible now (the last set the bit after).
+        // Every sender is gone; what they sent before going is visible now (the last set the flag after).
         match state.values.pop() {
             Some(value) => {
                 state.room.grant_one();
@@ -529,10 +573,13 @@ impl<T> ChannelReceiver<T> {
 
 impl<T> Drop for ChannelReceiver<T> {
     fn drop(&mut self) {
-        // Senders refuse from now on; the values sent drop now, and every sender waiting for room is woken to
-        // find the channel closed.
+        // Senders refuse from now on (`ring`'s close: a push that has not claimed its place is refused with
+        // its value, so none lands in the room this drain frees); the values sent drop now, a sender whose
+        // claim came first drops its own, and every sender waiting for room is woken to find the channel closed.
         set_state(self.shared.cell(), RECEIVER_GONE);
-        while self.shared.get().values.pop().is_some() {}
+        let values = &self.shared.get().values;
+        values.close();
+        values.drain();
         self.shared.get().room.wake_all();
     }
 }

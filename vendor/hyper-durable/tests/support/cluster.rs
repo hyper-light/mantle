@@ -1,48 +1,73 @@
-//! A group of replicas on [`SimStore`]s, driven one step at a time by a seeded schedule, and the
-//! oracle every step is held to.
+//! A group of replicas on [`SimStore`]s in hyper-sim's world (`docs/sim.md` S-6), driven one step
+//! at a time by a schedule drawn from the world's streams, and held at every step to hyper-check's
+//! oracles.
 //!
 //! Every step is one of: a word of a member's failure detectors about another (suspected, or
-//! trusted again), a delivery or loss of a message, a drive of a member, a write of a member made
-//! durable (or refused, or failed), a proposal, a change of configuration, a read, a compaction, a
-//! crash. Members elect by suspicion (timing step L-2) and take no ticks: the clock moves a
-//! millisecond a step, and a drive wakes the member at it. A crash loses every write not durable
-//! and the state machine's applied state past its durable point; the member reopens on what is
-//! left, and the others' detectors see its new incarnation.
+//! trusted again), the world's next event as its strategy picks it (a message arriving, or a
+//! member's device completing its oldest write), a drive of a member, a proposal, a change of
+//! configuration, a read, a compaction, a crash, a refusal or failure armed on a member's device.
+//! Messages travel on the world's network (`hyper_sim::net`), whose path loses what the schedule
+//! says; a member's device is hyper-sim's typed write queue, whose completion is an event of the
+//! world while a write is out, or, in directed tests, a test's word ([`Devices`]). Members elect by
+//! suspicion (timing step L-2) and take no ticks: the clock moves a millisecond a step, and a drive
+//! wakes the member at it. A crash loses every write not durable and the state machine's applied
+//! state past its durable point; the member reopens on what is left, its device's pending
+//! completion with it, and the others' detectors see its new incarnation.
 //!
-//! The oracle, against each member's durable state `D` (its store's disk) when an output leaves
-//! or the step ends (`docs/durable.md` §3):
-//! - **I1**: a message carries no term `D` does not hold; a vote request or a vote leaves only
-//!   with `D` holding that vote.
-//! - **I2**: an acknowledgement of index `i` leaves only with `D` holding the entry at `i` with
-//!   the term the member's log has there.
-//! - **I3**: a commit a leader sends is durable on a majority of each half of its configuration.
-//! - **I4**: every member applies the same entry at an index.
-//! - **I5**: a change of configuration, and an entry acted on at start, is applied only with the
-//!   durable commit (the log's stated commit, or the state machine's durable index) covering it;
-//!   and across a crash, every entry acted on at start is applied again from what the member
-//!   reopens with, before it hears from anyone.
-//! - **I7**: once a write is durable, the commit `D` states is an entry `D` holds.
-//! - **I8**: `D` never starts past the state machine's durable index.
+//! The oracles (`hyper_check::oracle`), against each member's durable state `D` (its store's disk,
+//! the state machine's durable point beside it) as an output leaves or a write lands
+//! (`docs/durable.md` §3):
+//! - **Durability**: I1 and I2 and R-6 on every message a member releases, I3 on every commit a
+//!   leader counts new to the group, I4 on every entry applied, I5 on every change and every entry
+//!   acted on at start, I7 on every write made durable, I8 on every member after every step.
+//! - **State Machine Safety**: every member applies the same entry at an index.
+//! - **Election Safety**: at most one leader a term, ever.
+//! - **Log Matching**: two logs holding an entry of one term at an index agree on it and on the
+//!   term before it, fed from every write made durable.
+//! - **Leader Completeness**: a leader holds every entry committed in an earlier term.
+//!
+//! Beside them, the harness's own: across a crash, every entry acted on at start is applied again
+//! from what the member reopens with, before it hears from anyone (I5), and the compaction rule's
+//! count of a member's log is what a walk of it counts (R22).
 //!
 //! Crashing after a drive rather than inside it is the harder case for every event inside it:
-//! nothing durable changes within a drive (writes become durable only at the schedule's steps),
-//! and what the drive released has left, for the others to act on.
-use std::collections::{BTreeMap, VecDeque};
+//! nothing durable changes within a drive (writes become durable only at the world's or a test's
+//! word), and what the drive released has left, for the others to act on.
+use std::collections::BTreeMap;
 use std::task::Waker;
 use std::time::Duration;
 
+use hyper_check::oracle::{
+    Durability, DurableView, ElectionSafety, LeaderCompleteness, LogMatching, LogView, Released,
+    Says, StateMachineSafety, Terms, Violation,
+};
 use hyper_durable::{
     Cause, EntryRef, Fault, Output, Point, Replica, ReplicaError, Settings, Unbounded,
 };
 use hyper_raft::proto::{
-    ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState, Message,
-    MessageType,
+    ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState, Entry,
+    EntryType, Message, MessageType,
 };
+use hyper_raft::wire::Record as _;
 use hyper_raft::{Config, Configuration, StateRole};
+use hyper_sim::net::{Net, NetLimits, NetStats, Path, Ticket};
+use hyper_sim::{
+    Clock, Discipline, Fifo, Limits, NodeId, Random, Record, Source, Step, Strategy, StreamId,
+    Twice, World, twice,
+};
 
-use super::{ACTS, Disk, Kv, Seeded, SimStore};
+use super::{ACTS, DeviceWrites, Disk, Kv, SimStore};
 
 pub type Member = Replica<SimStore, Kv, Unbounded>;
+
+/// What an entry states, as the oracles compare it: its term, its kind and its data. The term is
+/// part of it, as the schedule this harness replaced compared a commit by its index and term: no
+/// fast track restamps an entry here.
+pub type Value = (u64, u8, Vec<u8>);
+
+fn value(term: u64, entry_type: EntryType, data: &[u8]) -> Value {
+    (term, entry_type as u8, data.to_vec())
+}
 
 /// How the group runs.
 #[derive(Clone, Copy, Debug)]
@@ -57,16 +82,40 @@ pub struct Shape {
     pub ahead: bool,
 }
 
+/// How members' writes become durable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Devices {
+    /// When a test says ([`Op::Durable`]): directed tests that fix their schedule.
+    Directed,
+    /// As the world's events, a device's next completion pending while a write is out
+    /// (`hyper_sim::storage::Writes::arm`), picked by the world's strategy like any other event.
+    World,
+}
+
+/// What a crash left of a member: its disk, its state machine at its durable point, and its
+/// device's queue, a completion pending in the world with it.
+#[derive(Clone)]
+pub struct Down {
+    pub disk: Disk,
+    pub kv: Kv,
+    writes: DeviceWrites,
+}
+
 /// One member: its replica while up, and what a crash left while down.
+#[derive(Clone)]
 pub struct Node {
     pub id: u64,
     pub replica: Option<Member>,
-    /// While down: the disk and the state machine a restart opens on.
-    pub down: Option<(Disk, Kv)>,
+    /// While down: what a restart opens on.
+    pub down: Option<Down>,
     /// Every entry acted on at start before the last crash, to hold against what it reopens with.
     pub acted_before_crash: Vec<u64>,
     /// Whether a crash left it to reopen alone first.
     pub reopened: bool,
+    /// The core's seed, drawn from the world once: an incarnation opens on the same draws.
+    seed: u64,
+    /// The highest index of its state machine held to the oracles since it opened.
+    checked: u64,
 }
 
 /// A step of the schedule.
@@ -76,9 +125,12 @@ pub enum Op {
     Suspect(u64, u64),
     /// The first member's detectors trust the second again.
     Trust(u64, u64),
-    Deliver(usize),
-    Lose(usize),
+    /// The world's next event, as its strategy picks it.
+    World,
+    /// The world's next event, as its strategy picks it, a message it delivers lost.
+    Lose,
     Drive(u64),
+    /// The member's device completes its oldest write, at a test's word.
     Durable(u64),
     Propose(u64),
     Fence(u64),
@@ -89,6 +141,15 @@ pub enum Op {
     Refuse(u64),
     Fail(u64),
     Resume(u64),
+}
+
+/// An event of the group's world.
+#[derive(Clone, Copy, Debug)]
+pub enum Event {
+    /// A message arrives.
+    Arrival(Ticket),
+    /// The member's device completes its oldest write out.
+    Device(u64),
 }
 
 /// What the group reached, so a test proves it ran what it claims.
@@ -107,32 +168,110 @@ pub struct Reached {
     pub events: u64,
     /// Drives after which a leader had applied past what its disk holds (§4.2).
     pub ahead: u64,
+    /// Messages the schedule lost ([`Op::Lose`]).
+    pub lost: u64,
+    /// Messages lost to the network's capacity: fewer than those the schedule lost, or the bound
+    /// is too small for the schedule (`docs/sim.md` §7).
+    pub overflowed: u64,
+    /// The most messages in flight at once.
+    pub most_in_flight: u64,
 }
 
+impl Reached {
+    /// Adds `other`'s counts.
+    pub fn add(&mut self, other: &Self) {
+        self.committed += other.committed;
+        self.crashes += other.crashes;
+        self.refused += other.refused;
+        self.stalls += other.stalls;
+        self.fenced += other.fenced;
+        self.behind_fence += other.behind_fence;
+        self.deep += other.deep;
+        self.changes += other.changes;
+        self.acted += other.acted;
+        self.compactions += other.compactions;
+        self.events += other.events;
+        self.ahead += other.ahead;
+        self.lost += other.lost;
+        self.overflowed += other.overflowed;
+        self.most_in_flight = self.most_in_flight.max(other.most_in_flight);
+    }
+}
+
+/// hyper-check's oracles over one run.
+#[derive(Clone)]
+struct Judge {
+    durable: Durability,
+    machine: StateMachineSafety<Value>,
+    election: ElectionSafety,
+    matching: LogMatching<Value>,
+    complete: LeaderCompleteness,
+}
+
+/// The drive's output buffers: scratch, so a fork's copy starts empty.
+struct Scratch(Output<(u64, Vec<u8>)>);
+
+impl Clone for Scratch {
+    fn clone(&self) -> Self {
+        Self(Output::default())
+    }
+}
+
+#[derive(Clone)]
 pub struct Cluster {
     pub shape: Shape,
     pub nodes: Vec<Node>,
-    pub net: VecDeque<Message>,
-    /// The entry every member applied at each index: term and data.
-    pub chosen: BTreeMap<u64, (u64, Vec<u8>)>,
-    /// The schedule's clock, nanoseconds: a step is a millisecond.
-    pub now: u64,
+    world: World<Event>,
+    net: Net<Message>,
+    /// The schedule's draws.
+    ops: StreamId,
+    /// The slow leader's draws: whether its device completes when the world picks it.
+    slow: StreamId,
+    devices: Devices,
     pub reached: Reached,
     pub seq: u64,
-    out: Output<(u64, Vec<u8>)>,
-    seed: u64,
+    judge: Judge,
+    out: Scratch,
     /// The greatest commit any leader has counted: a commit is held to I3 when it is new to the
     /// group, since one already counted was held to it when it was.
     sent_commit: u64,
+    /// The member the world's last event was for.
+    last_event: Option<u64>,
+    /// Whether the liveness phase runs: the network whole and every disk as fast as another's.
+    settling: bool,
+    /// The value an applied entry is judged by, refilled for each.
+    scratch: Value,
 }
 
 /// The most messages the network holds; past it the oldest is lost, as a network may lose any.
 const NET: usize = 4096;
 
+/// The schedule's clock: a step is a millisecond.
+const STEP_NS: u64 = 1_000_000;
+
 /// Of a thousand words about a member that is down, how many are right; and of a thousand about
 /// one that is up, how many are wrong: a detector errs both ways now and then, and the schedule is
 /// safe whatever it says.
 const ACCURATE: u64 = 900;
+
+/// The steps a run takes at most: a schedule's own, and the liveness phase's rounds, each a drive,
+/// the writes made durable and a drive for every member, and what the network holds delivered.
+pub fn steps_bound(steps: u64, rounds: u64) -> u64 {
+    steps + rounds * (4 * MEMBERS as u64 + NET as u64)
+}
+
+/// The trace a run keeps at most, in words: what a schedule's step draws, at most
+/// [`WORDS_A_STEP`] a step, and each core's seed, two words a member. The liveness phase draws
+/// nothing: its strategy is [`Fifo`], and it loses no message and slows no disk.
+pub fn trace_bound(steps: u64, members: usize) -> usize {
+    (steps * WORDS_A_STEP) as usize + 2 * members
+}
+
+/// The most words a schedule's step draws: the member and the roll, and two more at most: a
+/// detector's word its peer and whether it is right; a change its target and its kind; the world's
+/// next event the pick among two or more pending, and a slow leader's device whether it completes.
+/// Nothing else a step does draws: the network neither delays, loses nor repeats on its own.
+pub const WORDS_A_STEP: u64 = 4;
 
 /// The timing the schedule's members elect by: a round and a span of half a second each, five
 /// hundred of the schedule's millisecond steps, as the ticks before it waited ten ticks of fifty
@@ -191,45 +330,286 @@ fn waker() -> &'static Waker {
     Waker::noop()
 }
 
+/// The world's node of member `id`.
+fn node_of(id: u64) -> NodeId {
+    NodeId(u32::try_from(id - 1).expect("a member of these groups"))
+}
+
+/// A member's durable state as the oracles read it: its disk, and the index its state machine
+/// holds durably, which states a commit as the log does (`docs/durable.md` §4.1: `C_d` is the
+/// greater); an entry lost at rest after it was acknowledged held by its mark. Where an entry's
+/// effect is what is judged (I4: applied only once durable here), the state machine holds what it
+/// holds durably as well (`machine_holds`): an image it installed is durable in it before the
+/// log's start moves past it.
+struct View<'a> {
+    disk: &'a Disk,
+    machine: u64,
+    machine_holds: bool,
+    mark: Option<Point>,
+}
+
+impl DurableView<Value> for View<'_> {
+    fn term(&self) -> u64 {
+        self.disk.hard.term
+    }
+    fn vote(&self) -> u64 {
+        self.disk.hard.vote
+    }
+    fn commit(&self) -> u64 {
+        self.disk.hard.commit.max(self.machine)
+    }
+    fn start(&self) -> u64 {
+        self.disk.start.index
+    }
+    fn last(&self) -> u64 {
+        self.disk.last()
+    }
+    fn term_at(&self, index: u64) -> Option<u64> {
+        self.disk.term(index)
+    }
+    fn holds(&self, index: u64, held: &Value) -> bool {
+        let same = |entry: &Entry| {
+            entry.term == held.0 && entry.entry_type as u8 == held.1 && entry.data == held.2
+        };
+        index <= self.disk.start.index
+            || self.disk.entry(index).is_some_and(same)
+            || self
+                .disk
+                .proposals
+                .iter()
+                .any(|entry| entry.index == index && same(entry))
+            || self.mark.is_some_and(|mark| mark.index >= index)
+            || (self.machine_holds && index <= self.machine)
+    }
+}
+
+/// Member `id`'s durable state as the oracles read it, up or down.
+fn view_of(nodes: &[Node], id: u64) -> View<'_> {
+    let node = nodes.iter().find(|n| n.id == id).expect("a member");
+    match (&node.replica, &node.down) {
+        (Some(r), _) => View {
+            disk: &r.core().store().log().disk,
+            machine: r.machine().durable.applied.index,
+            machine_holds: false,
+            mark: r.core().store().log().mark,
+        },
+        (None, Some(down)) => View {
+            disk: &down.disk,
+            machine: down.kv.durable.applied.index,
+            machine_holds: false,
+            mark: None,
+        },
+        (None, None) => unreachable!("a member neither up nor down"),
+    }
+}
+
+/// A leader's log, as Leader Completeness reads it.
+struct LogOf {
+    start: u64,
+    entries: BTreeMap<u64, (u64, Value)>,
+}
+
+impl LogView<Value> for LogOf {
+    fn start(&self) -> u64 {
+        self.start
+    }
+    fn entry(&self, index: u64) -> Option<(u64, &Value)> {
+        self.entries.get(&index).map(|(term, value)| (*term, value))
+    }
+}
+
+/// `message` as it leaves its sender.
+fn released(message: &Message) -> Released<'static, Value> {
+    let kind = message.msg_type;
+    let pre_vote = matches!(
+        kind,
+        MessageType::MsgRequestPreVote | MessageType::MsgRequestPreVoteResponse
+    );
+    let says = match kind {
+        MessageType::MsgRequestVote => Says::VoteRequest {
+            last_index: message.index,
+            last_term: message.log_term,
+        },
+        MessageType::MsgRequestVoteResponse => Says::Vote {
+            granted: !message.reject,
+        },
+        MessageType::MsgAppendResponse if !message.reject => Says::Acknowledges {
+            index: message.index,
+        },
+        _ => Says::Nothing,
+    };
+    let commit = matches!(
+        kind,
+        MessageType::MsgAppendResponse | MessageType::MsgHeartbeatResponse
+    )
+    .then_some(message.commit);
+    Released {
+        from: message.from,
+        to: message.to,
+        term: (!pre_vote).then_some(message.term),
+        says,
+        commit,
+    }
+}
+
+/// A run's oracle found a violation: the run fails, naming it as `at` says. Named only then: a
+/// check that holds formats nothing.
+fn judged(result: Result<(), Violation>, at: impl FnOnce() -> String) {
+    if let Err(violation) = result {
+        panic!("{}: {violation:?}", at());
+    }
+}
+
 impl Cluster {
+    /// A group drawing from `seed`, its devices completing at a test's word, for directed tests.
     pub fn new(shape: Shape, seed: u64) -> Self {
+        Self::from_source(shape, Source::Seed(seed), Devices::Directed, 0, 0)
+    }
+
+    /// A group drawing from `source`, its devices completing as `devices` says, within the bounds
+    /// of a schedule of `steps` and a liveness phase of `rounds`.
+    pub fn from_source(
+        shape: Shape,
+        source: Source,
+        devices: Devices,
+        steps: u64,
+        rounds: u64,
+    ) -> Self {
+        // A directed test states no schedule: its bounds are the gate's largest.
+        let (steps, rounds) = if steps == 0 {
+            (5_000, 4_000)
+        } else {
+            (steps, rounds)
+        };
+        let members = usize::try_from(shape.members).expect("a group of these tests");
+        let mut world = World::new(
+            source,
+            Discipline::Free,
+            Limits {
+                // What the network holds, and as many arrivals of messages it lost to its bound
+                // since, and each device's completion.
+                events: 2 * NET + members,
+                nodes: members,
+                // The schedule's two, each node's lateness and its core's seed, and each directed
+                // pair's delay, loss and duplication.
+                streams: 2 + 2 * members + 3 * members * members,
+                steps: steps_bound(steps, rounds),
+                trace_words: trace_bound(steps, members),
+            },
+        )
+        .expect("the world's bounds");
+        let ops = world.stream("schedule.ops", &[]).expect("a stream");
+        let slow = world.stream("schedule.slow", &[]).expect("a stream");
+        let mut net = Net::new(NetLimits {
+            flows: members * members,
+            links: 0,
+            nats: 0,
+            link_messages: 0,
+            messages: NET,
+            bytes: NET * ((64 << 10) + hyper_raft::wire::MESSAGE_RECORD_FIXED_BYTES),
+        });
+        net.set_path(Path::NONE);
         let configuration = ConfState {
             voters: (1..=shape.voters).collect(),
             ..ConfState::default()
         };
-        let nodes = (1..=shape.members)
-            .map(|id| {
-                let mut kv = Kv::new(configuration.clone(), shape.volatile);
-                kv.control = shape.control;
-                let mut replica = Replica::open(
-                    &shaped(id, seed, &shape),
-                    SimStore::new(shape.depth),
-                    kv,
-                    Unbounded,
-                )
-                .expect("a member opens");
-                replica.set_timing(timing()).expect("timing");
-                Node {
-                    id,
-                    replica: Some(replica),
-                    down: None,
-                    acted_before_crash: Vec::new(),
-                    reopened: false,
-                }
-            })
-            .collect();
+        let mut nodes = Vec::new();
+        for id in 1..=shape.members {
+            world.node(Clock::default()).expect("a node");
+            let core = world.stream("node.seed", &[id]).expect("a stream");
+            let seed = world.below(core, u64::MAX).expect("a draw");
+            let mut kv = Kv::new(configuration.clone(), shape.volatile);
+            kv.control = shape.control;
+            let mut replica = Replica::open(
+                &shaped(id, seed, &shape),
+                SimStore::new(shape.depth),
+                kv,
+                Unbounded,
+            )
+            .expect("a member opens");
+            replica.set_timing(timing()).expect("timing");
+            nodes.push(Node {
+                id,
+                replica: Some(replica),
+                down: None,
+                acted_before_crash: Vec::new(),
+                reopened: false,
+                seed,
+                checked: 0,
+            });
+        }
+        // Every table holds at most an entry a step's words, and what the network holds.
+        let bound = trace_bound(steps, members) + NET;
         Self {
             shape,
             nodes,
-            net: VecDeque::new(),
-            chosen: BTreeMap::new(),
-            now: 0,
+            world,
+            net,
+            ops,
+            slow,
+            devices,
             reached: Reached::default(),
             seq: 0,
-            out: Output::default(),
-            seed,
+            judge: Judge {
+                durable: Durability::default(),
+                machine: StateMachineSafety::new(Terms::Compared, bound),
+                election: ElectionSafety::new(bound),
+                matching: LogMatching::new(Terms::Compared, bound),
+                complete: LeaderCompleteness::new(bound),
+            },
+            out: Scratch(Output::default()),
             sent_commit: 0,
+            last_event: None,
+            settling: false,
+            scratch: (0, 0, Vec::new()),
         }
+    }
+
+    /// A random schedule's group from `source`, its devices completing as the world's events,
+    /// bounded for `steps` and a liveness phase of `rounds`.
+    pub fn scheduled(shape: Shape, source: Source, steps: u64, rounds: u64) -> Self {
+        Self::from_source(shape, source, Devices::World, steps, rounds)
+    }
+
+    /// One step of the schedule: whether it did something a crash after it would cut into, and
+    /// the member whose event it was.
+    pub fn step(&mut self) -> (bool, u64) {
+        let op = self.choose(true);
+        let did = self.act(op);
+        (did, self.member_of(op, self.last_event))
+    }
+
+    /// The world's present: the schedule's clock.
+    pub fn now(&self) -> u64 {
+        self.world.now()
+    }
+
+    /// The clock moves on by `by` nanoseconds with nothing delivered.
+    pub fn pass(&mut self, by: u64) {
+        let to = self.world.now() + by;
+        self.world
+            .advance(to)
+            .expect("the free discipline skips nothing");
+    }
+
+    /// Events pending in the world: messages in flight and devices' completions.
+    pub fn pending(&self) -> usize {
+        self.world.pending()
+    }
+
+    /// What the network did.
+    pub fn net_stats(&self) -> NetStats {
+        self.net.stats()
+    }
+
+    /// The trace's words so far.
+    pub fn decisions(&self) -> usize {
+        self.world.decisions()
+    }
+
+    /// The run's record: its digest, its trace and its steps.
+    pub fn finish(self) -> Record {
+        self.world.finish()
     }
 
     pub fn node(&mut self, id: u64) -> &mut Node {
@@ -248,7 +628,7 @@ impl Cluster {
         let node = self.nodes.iter().find(|n| n.id == id).expect("a member");
         match (&node.replica, &node.down) {
             (Some(r), _) => &r.core().store().log().disk,
-            (None, Some((disk, _))) => disk,
+            (None, Some(down)) => &down.disk,
             (None, None) => unreachable!("a member neither up nor down"),
         }
     }
@@ -262,44 +642,41 @@ impl Cluster {
             .map(|r| r.id())
     }
 
-    /// One random step.
-    pub fn choose(&mut self, rng: &mut Seeded, faults: bool) -> Op {
+    fn draw(&mut self, bound: u64) -> u64 {
+        self.world.below(self.ops, bound).expect("a draw")
+    }
+
+    /// One random step, drawn from the world's schedule stream.
+    pub fn choose(&mut self, faults: bool) -> Op {
         let n = self.shape.members;
-        let member = 1 + rng.below(n);
-        let roll = rng.below(1000);
+        let member = 1 + self.draw(n);
+        let roll = self.draw(1000);
         let leader = self.leader().unwrap_or(member);
         match roll {
             0..100 => {
-                let peer = 1 + rng.below(n);
+                let peer = 1 + self.draw(n);
                 let down = self
                     .nodes
                     .iter()
                     .any(|n| n.id == peer && n.replica.is_none());
-                let right = rng.below(1000) < ACCURATE;
+                let right = self.draw(1000) < ACCURATE;
                 if down == right {
                     Op::Suspect(member, peer)
                 } else {
                     Op::Trust(member, peer)
                 }
             }
-            100..400 if !self.net.is_empty() => {
-                Op::Deliver(rng.below(self.net.len() as u64) as usize)
-            }
-            400..420 if !self.net.is_empty() && faults => {
-                Op::Lose(rng.below(self.net.len() as u64) as usize)
-            }
-            420..670 => Op::Drive(member),
-            // Where a leader applies ahead, its disk is the slowest of the group: its writes are
-            // made durable a quarter as often as another member's.
-            670..870 if self.shape.ahead && member == leader && rng.below(4) != 0 => {
-                Op::Durable(1 + (member + rng.below(n - 1)) % n)
-            }
-            670..870 => Op::Durable(member),
+            // What the schedule this one replaced spent delivering and making writes durable:
+            // the world picks among the messages in flight and the devices' completions.
+            100..600 if self.world.pending() > 0 => Op::World,
+            // What it spent losing a message in flight.
+            600..620 if self.world.pending() > 0 && faults => Op::Lose,
+            620..870 => Op::Drive(member),
             870..930 => Op::Propose(leader),
             930..940 => Op::Fence(leader),
             940..950 => {
-                let target = 1 + rng.below(n);
-                let kind = match rng.below(3) {
+                let target = 1 + self.draw(n);
+                let kind = match self.draw(3) {
                     0 => ConfChangeType::AddNode,
                     1 => ConfChangeType::AddLearnerNode,
                     _ => ConfChangeType::RemoveNode,
@@ -318,14 +695,22 @@ impl Cluster {
 
     /// Takes `op`; true when it did something a crash after it would cut into.
     pub fn act(&mut self, op: Op) -> bool {
-        self.now += 1_000_000;
+        self.pass(STEP_NS);
         let did = match op {
             Op::Suspect(id, peer) => self.with(id, |r| r.suspect(peer)),
             Op::Trust(id, peer) => self.with(id, |r| r.trust(peer)),
-            Op::Deliver(at) => self.deliver(at),
-            Op::Lose(at) => self.net.remove(at).is_some(),
+            Op::World => self.step_world(&mut Random, &mut |_: &Message| true),
+            Op::Lose => {
+                let mut lost = 0u64;
+                let did = self.step_world(&mut Random, &mut |_: &Message| {
+                    lost += 1;
+                    false
+                });
+                self.reached.lost += lost;
+                did || lost > 0
+            }
             Op::Drive(id) => self.drive(id),
-            Op::Durable(id) => self.durable(id),
+            Op::Durable(id) => self.durable(id, false),
             Op::Propose(id) => {
                 self.seq += 1;
                 let data = format!("p:{}", self.seq).into_bytes();
@@ -345,8 +730,8 @@ impl Cluster {
             }
             Op::Compact(id) => self.compact(id),
             Op::Crash(id) => self.crash(id),
-            Op::Refuse(id) => self.arm(id, Fault::Room("the group's retained bound")),
-            Op::Fail(id) => self.arm(id, Fault::Failed("the device failed")),
+            Op::Refuse(id) => self.arm_fault(id, Fault::Room("the group's retained bound")),
+            Op::Fail(id) => self.arm_fault(id, Fault::Failed("the device failed")),
             Op::Resume(id) => {
                 let stalled = self.replica(id).is_some_and(|r| r.is_stalled());
                 if let Some(r) = self.replica(id) {
@@ -357,7 +742,63 @@ impl Cluster {
         };
         self.check_start();
         self.check_compactable();
+        let (in_flight, _) = self.net.in_flight();
+        self.reached.most_in_flight = self.reached.most_in_flight.max(in_flight as u64);
         did
+    }
+
+    /// The member an event of `op` was of: the one a crash right after it crashes.
+    pub fn member_of(&self, op: Op, event: Option<u64>) -> u64 {
+        match op {
+            Op::Suspect(id, _)
+            | Op::Trust(id, _)
+            | Op::Drive(id)
+            | Op::Durable(id)
+            | Op::Propose(id)
+            | Op::Fence(id)
+            | Op::Change(id, ..)
+            | Op::Read(id)
+            | Op::Compact(id)
+            | Op::Crash(id)
+            | Op::Refuse(id)
+            | Op::Fail(id)
+            | Op::Resume(id) => id,
+            Op::World | Op::Lose => event.unwrap_or(1),
+        }
+    }
+
+    /// The world's next event as `strategy` picks it: an arrival is delivered unless `keep` refuses
+    /// the message, which is then lost; a device's completion completes its oldest write.
+    fn step_world(
+        &mut self,
+        strategy: &mut impl Strategy,
+        keep: &mut impl FnMut(&Message) -> bool,
+    ) -> bool {
+        match self.world.next(strategy).expect("the world steps") {
+            Step::Event {
+                event: Event::Arrival(ticket),
+                node,
+            } => {
+                self.last_event = Some(u64::from(node.0) + 1);
+                let delivery = self
+                    .net
+                    .deliver(&mut self.world, ticket, Event::Arrival)
+                    .expect("the network delivers");
+                match delivery {
+                    Some(delivery) if keep(&delivery.payload) => self.deliver(delivery.payload),
+                    _ => false,
+                }
+            }
+            Step::Event {
+                event: Event::Device(id),
+                ..
+            } => {
+                self.last_event = Some(id);
+                self.fire(id)
+            }
+            Step::Wake { .. } | Step::Idle => false,
+            Step::Spent => panic!("the run's step budget is spent: its bound is too small"),
+        }
     }
 
     /// Calls `call` on a live member; a refusal changed nothing; a fence is the oracle's to see
@@ -405,14 +846,9 @@ impl Cluster {
         done
     }
 
-    fn deliver(&mut self, at: usize) -> bool {
-        let Some(message) = self.net.remove(at) else {
-            return false;
-        };
+    /// `message` arrives at its member, if it is up.
+    fn deliver(&mut self, message: Message) -> bool {
         let to = message.to;
-        if !self.nodes.iter().any(|n| n.id == to) {
-            return false;
-        }
         let before = self
             .replica(to)
             .map(|r| (r.core().raft.configuration().clone(), r.is_leader()));
@@ -423,8 +859,27 @@ impl Cluster {
         stepped
     }
 
+    /// Sends what `from` released on the world's network.
+    fn send(&mut self, from: u64, message: Message) {
+        let to = message.to;
+        // A configuration may name a member this group never had: no node, no delivery.
+        if to == 0 || to > self.shape.members {
+            return;
+        }
+        let bytes = message.encoded_len();
+        self.net
+            .send(
+                &mut self.world,
+                (node_of(from), node_of(to)),
+                message,
+                bytes,
+                Event::Arrival,
+            )
+            .expect("the network takes the message");
+    }
+
     /// I3, as a leader's commit moves: the entry it now counts committed is durable on a
-    /// majority of each half of the configuration it decided by, the one before the step or one
+    /// majority of each half of the configuration it decided it by, the one before the step or one
     /// a change applied in it. A commit already counted by some leader was held to it then.
     fn check_leader_commit(&mut self, id: u64, before: &Configuration, led: bool) {
         let Some(r) = self
@@ -447,7 +902,8 @@ impl Cluster {
         self.check_commit(id, commit, before);
     }
 
-    fn arm(&mut self, id: u64, fault: Fault) -> bool {
+    /// Arms `fault` on the next write `id`'s device completes, while one is out.
+    fn arm_fault(&mut self, id: u64, fault: Fault) -> bool {
         let Some(r) = self.replica(id) else {
             return false;
         };
@@ -461,35 +917,115 @@ impl Cluster {
         true
     }
 
-    fn durable(&mut self, id: u64) -> bool {
+    /// `id`'s device completes its oldest write: at a test's word, or as the world's event
+    /// (`fired`). I7 and Log Matching on what it left.
+    fn durable(&mut self, id: u64, fired: bool) -> bool {
         let Some(r) = self.replica(id) else {
             return false;
         };
         let store = store_of(r);
         let before = store.events.refused;
-        let made = store.make_durable();
+        let last = store.disk.last();
+        let made = if fired {
+            store.fire()
+        } else {
+            store.make_durable()
+        };
         if store.events.refused > before {
             self.reached.refused += 1;
         }
         if made {
-            // I7: what the disk states committed, it holds.
-            let disk = self.disk(id).clone();
-            assert!(
-                disk.hard.commit <= disk.last(),
-                "member {id}: a durable write stated commit {} past the log's last {}",
-                disk.hard.commit,
-                disk.last()
-            );
+            // I7 is of the log's own statement: the state machine's durable point is not in it.
+            let view = View {
+                machine: 0,
+                ..view_of(&self.nodes, id)
+            };
+            judged(self.judge.durable.written(id, &view), || {
+                format!("member {id}'s write")
+            });
+            self.match_log(id, last);
         }
         made
     }
 
+    /// Log Matching on `id`'s disk past what it held through `from` before a write: the entries
+    /// the write holds, each with the term before it.
+    fn match_log(&mut self, id: u64, from: u64) {
+        let disk = view_of(&self.nodes, id).disk;
+        let first = from.min(disk.last()).max(disk.start.index) + 1;
+        let written: Vec<(u64, u64, Value, u64)> = (first..=disk.last())
+            .filter_map(|index| {
+                let entry = disk.entry(index)?;
+                let before = disk.term(index - 1).unwrap_or(0);
+                Some((
+                    index,
+                    entry.term,
+                    value(entry.term, entry.entry_type, &entry.data),
+                    before,
+                ))
+            })
+            .collect();
+        for (index, term, held, before) in written {
+            judged(
+                self.judge.matching.holds(id, index, term, &held, before),
+                || format!("member {id}'s log"),
+            );
+        }
+    }
+
+    /// The world took `id`'s device's completion. A leader applying ahead has the slowest disk of
+    /// its group: its device completes a quarter as often as another's, the world's pick drawn
+    /// again three times in four.
+    fn fire(&mut self, id: u64) -> bool {
+        if self.shape.ahead && !self.settling && self.leader() == Some(id) {
+            let slow = self.world.below(self.slow, 4).expect("a draw");
+            if slow != 0 {
+                let now = self.world.now();
+                self.world
+                    .schedule(now, node_of(id), Event::Device(id))
+                    .expect("the device's completion goes back");
+                return false;
+            }
+        }
+        let node = self.node(id);
+        if node.replica.is_none() {
+            // Its process is gone; the device's queue lost what was out, and the completion
+            // finds nothing.
+            if let Some(down) = node.down.as_mut() {
+                down.writes
+                    .fire(|_| unreachable!("a crashed device holds no write out"));
+            }
+            return false;
+        }
+        let made = self.durable(id, true);
+        self.arm(id);
+        made
+    }
+
+    /// Gives the world `id`'s device's next completion, where devices complete as the world's
+    /// events and a write is out.
+    fn arm(&mut self, id: u64) {
+        if self.devices != Devices::World {
+            return;
+        }
+        let Self { world, nodes, .. } = self;
+        if let Some(r) = nodes
+            .iter_mut()
+            .find(|n| n.id == id)
+            .and_then(|n| n.replica.as_mut())
+        {
+            store_of(r)
+                .arm(world, node_of(id), || Event::Device(id))
+                .expect("the world holds the device's completion");
+        }
+    }
+
     fn compact(&mut self, id: u64) -> bool {
-        let now = self.now;
+        let now = self.world.now();
         let Some(r) = self.replica(id) else {
             return false;
         };
-        match r.compact(2, now, waker()) {
+        let compacted = match r.compact(2, now, waker()) {
             Ok(true) => {
                 self.reached.compactions += 1;
                 true
@@ -497,20 +1033,28 @@ impl Cluster {
             Ok(false) => false,
             Err(ReplicaError::Fenced(Cause::Write(_))) => true,
             Err(e) => panic!("member {id}: compact: {e}"),
-        }
+        };
+        self.arm(id);
+        compacted
     }
 
     /// Loses power: the writes not durable, and what the state machine applied past its durable
     /// point.
     pub fn crash(&mut self, id: u64) -> bool {
         let node = self.node(id);
-        let Some(replica) = node.replica.take() else {
+        let Some(mut replica) = node.replica.take() else {
             return false;
         };
-        let disk = replica.core().store().log().disk.clone();
+        let store = store_of(&mut replica);
+        let disk = store.disk.clone();
+        let writes = store.crash();
         let kv = replica.machine().clone();
         node.acted_before_crash.extend(kv.acted.iter().copied());
-        node.down = Some((disk, kv.crashed()));
+        node.down = Some(Down {
+            disk,
+            kv: kv.crashed(),
+            writes,
+        });
         self.reached.crashes += 1;
         true
     }
@@ -522,18 +1066,18 @@ impl Cluster {
     pub fn rot(&mut self, id: u64, lose: u64) -> Option<Point> {
         self.crash(id);
         let node = self.node(id);
-        let (mut disk, kv) = node.down.take()?;
+        let down = node.down.as_mut()?;
+        let disk = &mut down.disk;
         let last = disk.last();
         let mark = Point {
             index: last,
             term: disk.term(last).unwrap_or(0),
         };
-        let floor = kv.durable.applied.index.max(disk.start.index);
+        let floor = down.kv.durable.applied.index.max(disk.start.index);
         let cut = lose.min(last.saturating_sub(floor)) as usize;
         let keep = disk.entries.len() - cut;
         disk.entries.truncate(keep);
         disk.hard.commit = disk.hard.commit.min(disk.last());
-        node.down = Some((disk, kv));
         let marked = (cut > 0).then_some(mark);
         self.reopen(id, marked);
         marked
@@ -548,17 +1092,19 @@ impl Cluster {
 
     /// [`Cluster::restart`], its store reporting `mark`.
     fn reopen(&mut self, id: u64, mark: Option<Point>) {
-        let seed = self.seed;
         let depth = self.shape.depth;
         let shape = self.shape;
-        let now = self.now;
+        let now = self.world.now();
         let node = self.node(id);
-        let Some((disk, kv)) = node.down.take() else {
+        let Some(Down { disk, kv, writes }) = node.down.take() else {
             return;
         };
-        let mut store = SimStore::from_disk(disk, depth);
+        // What its state machine holds durably it applied before the crash, and was held to the
+        // oracles then; what it applies again from its log is held to them again.
+        node.checked = kv.now.applied.index;
+        let mut store = SimStore::on_device(disk, depth, writes);
         store.mark = mark;
-        let mut replica = Replica::open(&shaped(id, seed, &shape), store, kv, Unbounded)
+        let mut replica = Replica::open(&shaped(id, node.seed, &shape), store, kv, Unbounded)
             .unwrap_or_else(|e| panic!("member {id} does not reopen: {e}"));
         replica.set_timing(timing()).expect("timing");
         let mut out = Output::default();
@@ -588,6 +1134,8 @@ impl Cluster {
         }
         node.replica = Some(replica);
         node.reopened = true;
+        self.check_applied(id, None);
+        self.arm(id);
         // The others' detectors see its new incarnation.
         let others: Vec<u64> = self
             .nodes
@@ -600,18 +1148,19 @@ impl Cluster {
         }
     }
 
-    /// Drives `id` once and holds what it gave out to the oracle.
+    /// Drives `id` once and holds what it gave out to the oracles.
     pub fn drive(&mut self, id: u64) -> bool {
-        let now = self.now;
-        let mut out = std::mem::take(&mut self.out);
+        let now = self.world.now();
+        let mut out = std::mem::take(&mut self.out.0);
         out.clear();
         let Some(r) = self.replica(id) else {
-            self.out = out;
+            self.out.0 = out;
             return false;
         };
         let events = store_of(r).events;
         let configuration = r.core().raft.configuration().clone();
         let led = r.is_leader();
+        let term = r.term();
         let driven = r.drive(now, waker(), &mut out);
         let after = store_of(r).events;
         let behind = r.behind_fence().is_some();
@@ -622,7 +1171,7 @@ impl Cluster {
             Err(ReplicaError::Fenced(Cause::Write(_))) => {
                 // A failed write: the owner reopens the member from what is durable.
                 self.reached.fenced += 1;
-                self.out = out;
+                self.out.0 = out;
                 self.crash(id);
                 self.restart(id);
                 return true;
@@ -633,22 +1182,21 @@ impl Cluster {
         self.reached.deep += u64::from(deep);
         self.reached.stalls += u64::from(stalled);
         self.check_output(id, &out, &configuration, led);
-        self.check_applied(id);
+        self.check_applied(id, led.then_some(term));
+        self.check_leadership(id);
         let did = after != events || !out.messages.is_empty() || !out.answers.is_empty();
         for m in out.messages.drain(..) {
-            if self.net.len() >= NET {
-                self.net.pop_front();
-            }
-            self.net.push_back(m);
+            self.send(id, m);
         }
+        self.arm(id);
         self.reached.events += u64::from(did);
-        self.out = out;
+        self.out.0 = out;
         did
     }
 
-    /// I1, I2, I3 on what `id` released, against the disks as they are now. A commit is held to
-    /// the configuration the leader decided it by: the one before the drive, or one a change
-    /// applied in it.
+    /// I1, I2 and R-6 on what `id` released, against its durable state as it is now; I3 on a
+    /// commit it counted. A commit is held to the configuration the leader decided it by: the one
+    /// before the drive, or one a change applied in it.
     fn check_output(
         &mut self,
         id: u64,
@@ -656,24 +1204,18 @@ impl Cluster {
         before: &Configuration,
         led: bool,
     ) {
-        let disk = self.disk(id);
-        let replica = self
-            .nodes
-            .iter()
-            .find(|n| n.id == id)
-            .and_then(|n| n.replica.as_ref())
-            .expect("up");
         for m in &out.messages {
-            check_promises(id, disk, m);
-            check_acknowledgement(id, disk, replica, m);
-            check_stated_commit(id, disk, replica, m);
+            let view = view_of(&self.nodes, id);
+            judged(self.judge.durable.released(&view, &released(m)), || {
+                format!("member {id}'s {:?}", m.msg_type)
+            });
         }
         self.check_leader_commit(id, before, led);
     }
 
     /// I3: the entry at `commit` is durable on a majority of each half of the configuration the
     /// leader decided it by.
-    fn check_commit(&self, id: u64, commit: u64, before: &Configuration) {
+    fn check_commit(&mut self, id: u64, commit: u64, before: &Configuration) {
         let leader = self
             .nodes
             .iter()
@@ -682,21 +1224,13 @@ impl Cluster {
             .expect("up");
         let log = leader.core().raft.log();
         // Through a step that left it no leader, its commit is still the one it decided.
-        let Ok(term) = log.term(commit) else {
+        let Ok(entries) = log.slice(commit, commit + 1, u64::MAX) else {
             return;
         };
-        let held_by = |configuration: &Configuration| {
-            [configuration.voters(), configuration.outgoing()]
-                .iter()
-                .filter(|half| !half.is_empty())
-                .all(|half| {
-                    let held = half
-                        .iter()
-                        .filter(|v| self.disk(**v).holds(commit, term))
-                        .count();
-                    held * 2 > half.len()
-                })
+        let Some(entry) = entries.first() else {
+            return;
         };
+        let held = value(entry.term, entry.entry_type, &entry.data);
         let after = leader.core().raft.configuration();
         // The leader counts by the newest configuration its log states, from the entry on
         // (`docs/raft.md` §3.4): it decided `commit` by the one its log stated through its last
@@ -704,16 +1238,16 @@ impl Cluster {
         // along the entries it has not applied (a leader's log is never cut short).
         let raft = &leader.core().raft;
         let mut stated = raft.applied_configuration().clone();
-        let mut decided_by = Vec::new();
+        let mut decided_by = vec![before.clone(), after.clone()];
         let applied = log.applied();
         let last = log.last_index().expect("the leader's last entry");
         if applied >= commit {
             decided_by.push(stated.clone());
         }
-        let entries = log
+        let unapplied = log
             .slice(applied + 1, last + 1, u64::MAX)
             .expect("the leader's entries past its applied index");
-        for entry in &entries {
+        for entry in &unapplied {
             if let Some(plan) =
                 hyper_raft::proto::Plan::of_entry(entry).expect("a change that decodes")
                 && let Ok(changed) = plan.apply(&stated)
@@ -724,58 +1258,151 @@ impl Cluster {
                 decided_by.push(stated.clone());
             }
         }
-        let disks: Vec<String> = before
-            .voters()
+        let halves: Vec<[&[u64]; 2]> = decided_by
             .iter()
-            .map(|v| {
-                let d = self.disk(*v);
-                format!(
-                    "{v}: start {:?} last {} term at {commit} {:?} hard {:?}",
-                    d.start,
-                    d.last(),
-                    d.term(commit),
-                    d.hard
-                )
-            })
+            .map(|c| [c.voters(), c.outgoing()])
             .collect();
-        assert!(
-            held_by(before) || held_by(after) || decided_by.iter().any(held_by),
-            "leader {id}: sent commit {commit} of term {term} not durable on a majority of {:?} or {:?} (I3): {disks:?}",
-            before.voters(),
-            after.voters()
-        );
+        let configurations: Vec<&[&[u64]]> = halves.iter().map(|h| &h[..]).collect();
+        let views: Vec<(u64, View<'_>)> = self
+            .nodes
+            .iter()
+            .map(|n| (n.id, view_of(&self.nodes, n.id)))
+            .collect();
+        let found = |voter: u64| {
+            views
+                .iter()
+                .find(|(v, _)| *v == voter)
+                .map(|(_, view)| view)
+        };
+        let result = self
+            .judge
+            .durable
+            .committed(id, commit, &held, &configurations, found);
+        judged(result, || format!("leader {id}'s commit {commit}"));
     }
 
-    /// I4 and I5 on what `id` applied since the last look.
-    fn check_applied(&mut self, id: u64) {
-        let disk = self.disk(id).clone();
-        let Some(r) = self.replica(id) else {
+    /// I4, I5 and State Machine Safety on what `id` applied since it was last held to them; `led`
+    /// the term it led as the drive that applied them began, if it led: a leader applying ahead
+    /// may apply its own entries, of that term or of the one it leads now, before its write of them
+    /// is durable.
+    fn check_applied(&mut self, id: u64, led: Option<u64>) {
+        let Some(r) = self
+            .nodes
+            .iter_mut()
+            .find(|n| n.id == id)
+            .and_then(|n| n.replica.as_mut())
+        else {
             return;
         };
-        let durable_commit = disk.hard.commit.max(r.machine().durable.applied.index);
-        let ahead = r.is_leader() && r.machine().now.applied.index > disk.last();
-        let fenced: Vec<u64> = std::mem::take(&mut store_machine(r).fenced_applied);
-        for index in fenced {
-            assert!(
-                index <= durable_commit,
-                "member {id}: applied {index}, a change or an entry acted on at start, with the \
-                 durable commit at {durable_commit} (I5)"
+        // Its room kept: the machine's list is given back emptied.
+        let mut fenced = std::mem::take(&mut store_machine(r).fenced_applied);
+        let Self {
+            nodes,
+            judge,
+            world,
+            reached,
+            shape,
+            scratch,
+            ..
+        } = self;
+        let view = View {
+            machine_holds: true,
+            ..view_of(nodes, id)
+        };
+        for &index in &fenced {
+            judged(judge.durable.fenced(id, &view, index, view.machine), || {
+                format!("member {id} applied {index}")
+            });
+        }
+        let node = nodes.iter().find(|n| n.id == id).expect("a member");
+        let r = node.replica.as_ref().expect("up");
+        let machine = r.machine();
+        let committed = r.core().raft.log().committed();
+        let leads = r.is_leader().then(|| r.term());
+        let ahead = leads.is_some() && machine.now.applied.index > view.disk.last();
+        for (index, term, data) in machine
+            .now
+            .entries
+            .iter()
+            .filter(|(i, ..)| *i > node.checked)
+        {
+            // One value refilled for every entry: what the oracles keep, they copy.
+            scratch.0 = *term;
+            scratch.1 = EntryType::EntryNormal as u8;
+            scratch.2.clear();
+            scratch.2.extend_from_slice(data);
+            let own_ahead = shape.ahead && (led == Some(*term) || leads == Some(*term));
+            judged(
+                judge
+                    .durable
+                    .applied(id, &view, *index, scratch, committed, own_ahead),
+                || format!("member {id} applied {index}"),
             );
-        }
-        let entries: Vec<(u64, u64, Vec<u8>)> = r.machine().now.entries.clone();
-        self.reached.ahead += u64::from(ahead);
-        for (index, term, data) in entries {
-            match self.chosen.get(&index) {
-                Some((t, d)) => assert!(
-                    *t == term && *d == data,
-                    "member {id} applied another entry at {index} (I4)"
-                ),
-                None => {
-                    self.chosen.insert(index, (term, data));
-                    self.reached.committed += 1;
-                }
+            if judge.machine.at(*index).is_none() {
+                reached.committed += 1;
+                world.observe(*index);
+                world.observe(*term);
             }
+            judged(judge.machine.committed(id, *index, *term, scratch), || {
+                format!("member {id} applied {index}")
+            });
         }
+        reached.ahead += u64::from(ahead);
+        let applied = machine.now.applied.index;
+        fenced.clear();
+        let node = nodes.iter_mut().find(|n| n.id == id).expect("a member");
+        node.checked = node.checked.max(applied);
+        if let Some(r) = node.replica.as_mut() {
+            store_machine(r).fenced_applied = fenced;
+        }
+    }
+
+    /// Election Safety on `id` if it leads, and the first time it leads a term, Leader
+    /// Completeness on its log.
+    fn check_leadership(&mut self, id: u64) {
+        let Some(r) = self
+            .nodes
+            .iter()
+            .find(|n| n.id == id)
+            .and_then(|n| n.replica.as_ref())
+        else {
+            return;
+        };
+        if r.core().raft.state() != StateRole::Leader {
+            return;
+        }
+        let term = r.term();
+        let raft = &r.core().raft;
+        let log = raft.log();
+        let committed = log.committed();
+        // Its log is held to what was committed before only the first time it is seen leading the
+        // term: Election Safety knows whether it has been.
+        let seen = self.judge.election.leader_of(term) == Some(id);
+        judged(self.judge.election.leader(id, term), || {
+            format!("member {id} led term {term}")
+        });
+        judged(self.judge.complete.committed_in(committed, term), || {
+            format!("member {id} committed in term {term}")
+        });
+        if seen {
+            return;
+        }
+        let first = log.first_index().expect("the leader's first index");
+        let last = log.last_index().expect("the leader's last index");
+        let held = LogOf {
+            start: first - 1,
+            entries: log
+                .slice(first, last + 1, u64::MAX)
+                .expect("the leader's log")
+                .iter()
+                .map(|e| (e.index, (e.term, value(e.term, e.entry_type, &e.data))))
+                .collect(),
+        };
+        let result = self
+            .judge
+            .complete
+            .leader(id, term, &held, &self.judge.machine);
+        judged(result, || format!("member {id} leading term {term}"));
     }
 
     /// The compaction rule's count for every live member with no start out (R22,
@@ -818,29 +1445,23 @@ impl Cluster {
     }
 
     /// I8 for every member, up or down.
-    fn check_start(&self) {
-        for node in &self.nodes {
-            let (disk, machine) = match (&node.replica, &node.down) {
-                (Some(r), _) => (
-                    &r.core().store().log().disk,
-                    r.machine().durable.applied.index,
-                ),
-                (None, Some((disk, kv))) => (disk, kv.durable.applied.index),
-                _ => continue,
-            };
-            assert!(
-                disk.start.index <= machine,
-                "member {}: the log starts at {} past the state machine's {} (I8)",
-                node.id,
-                disk.start.index,
-                machine
-            );
+    fn check_start(&mut self) {
+        for at in 0..self.nodes.len() {
+            let id = self.nodes[at].id;
+            let view = view_of(&self.nodes, id);
+            let machine = view.machine;
+            judged(self.judge.durable.start(id, &view, machine), || {
+                format!("member {id}'s log")
+            });
         }
     }
 
-    /// Brings every member up and the network whole, then runs until a leader commits an entry
-    /// every member of its configuration applies: false when it never does within `rounds`.
+    /// Brings every member up, the network whole and every disk as fast as another's, for the rest
+    /// of the run, then runs until a leader commits an entry every member of its configuration
+    /// applies: false when it never does within `rounds`.
     pub fn settles(&mut self, rounds: usize) -> bool {
+        self.net.set_path(Path::NONE);
+        self.settling = true;
         let ids: Vec<u64> = self.nodes.iter().map(|n| n.id).collect();
         for &id in &ids {
             if self.node(id).replica.is_none() {
@@ -892,15 +1513,24 @@ impl Cluster {
     }
 
     /// A round with no faults: every member drives, makes its writes durable and drives again,
-    /// and every message is delivered.
+    /// and every event pending in the world is taken in the order it came.
     pub fn round(&mut self, ids: &[u64]) {
         for &id in ids {
             self.act(Op::Drive(id));
-            while self.durable(id) {}
+            while self.durable(id, false) {}
             self.act(Op::Drive(id));
         }
-        while !self.net.is_empty() {
-            self.act(Op::Deliver(0));
+        self.deliver_all(|_| true);
+    }
+
+    /// Takes every event pending in the world, in the order it came, a millisecond each: each
+    /// message delivered unless `keep` refuses it, then lost, and each device's completion made.
+    pub fn deliver_all(&mut self, mut keep: impl FnMut(&Message) -> bool) {
+        while self.world.pending() > 0 {
+            self.pass(STEP_NS);
+            self.step_world(&mut Fifo, &mut keep);
+            self.check_start();
+            self.check_compactable();
         }
     }
 
@@ -931,78 +1561,15 @@ impl Cluster {
             .map(|r| r.machine().acted.len() as u64)
             .sum()
     }
-}
 
-/// I1: no message carries a term the sender's disk does not hold; a vote request or a vote
-/// leaves only with the disk holding the vote. A pre-vote takes no term.
-fn check_promises(id: u64, disk: &Disk, m: &Message) {
-    if matches!(
-        m.msg_type,
-        MessageType::MsgRequestPreVote | MessageType::MsgRequestPreVoteResponse
-    ) {
-        return;
+    /// What the run reached, the network's losses with it.
+    pub fn reached(&self) -> Reached {
+        let net = self.net.stats();
+        Reached {
+            overflowed: net.dropped_capacity,
+            ..self.reached
+        }
     }
-    assert!(
-        disk.hard.term >= m.term,
-        "member {id}: {:?} of term {} left with term {} durable (I1)",
-        m.msg_type,
-        m.term,
-        disk.hard.term
-    );
-    if disk.hard.term != m.term {
-        return;
-    }
-    match m.msg_type {
-        MessageType::MsgRequestVote => assert_eq!(
-            disk.hard.vote, id,
-            "member {id}: asked for votes before its own vote was durable (I1)"
-        ),
-        MessageType::MsgRequestVoteResponse if !m.reject => assert_eq!(
-            disk.hard.vote, m.to,
-            "member {id}: voted before its vote was durable (I1)"
-        ),
-        _ => {}
-    }
-}
-
-/// I2: an acknowledgement of `i` in term `t` leaves only with the disk holding an entry at `i`
-/// (or a start past it) of a term no later than `t`: what the leader of `t` sent it. The member's
-/// log may since hold another entry there, from a later leader whose term is not durable yet.
-fn check_acknowledgement(id: u64, disk: &Disk, _replica: &Member, m: &Message) {
-    if m.msg_type != MessageType::MsgAppendResponse || m.reject || m.term != disk.hard.term {
-        return;
-    }
-    let held = m.index <= disk.start.index || disk.term(m.index).is_some_and(|t| t <= m.term);
-    assert!(
-        held,
-        "member {id}: acknowledged {} in term {} with its disk through {} (I2)",
-        m.index,
-        m.term,
-        disk.last()
-    );
-}
-
-/// An answer states no commit beyond what the member holds durable (`RawNode::durable_commit`):
-/// what its log's hard state states, or what its state machine holds durably. A leader takes a
-/// follower's stated commit as that follower's durable commit (`configuration_known`), so a commit
-/// stated ahead of every durable write would let it count a change as known that a restart forgets.
-fn check_stated_commit(id: u64, disk: &Disk, replica: &Member, m: &Message) {
-    if !matches!(
-        m.msg_type,
-        MessageType::MsgAppendResponse | MessageType::MsgHeartbeatResponse
-    ) {
-        return;
-    }
-    let durable = disk
-        .hard
-        .commit
-        .max(replica.machine().durable.applied.index);
-    assert!(
-        m.commit <= durable,
-        "member {id}: {:?} said commit {} with {durable} durable",
-        m.msg_type,
-        m.commit
-    );
 }
 
 /// The store a replica writes through, for the harness to make its writes durable, as a
@@ -1018,4 +1585,28 @@ fn store_machine(replica: &mut Member) -> &mut Kv {
 /// Whether `id` leads.
 pub fn leads(r: &Member) -> bool {
     r.core().raft.state() == StateRole::Leader
+}
+
+/// `steps` of the schedule from `source` and its liveness phase, as the world records them: what
+/// the run-twice check compares.
+fn recorded(shape: Shape, source: Source, steps: u64, rounds: usize) -> Result<Record, String> {
+    let mut group = Cluster::scheduled(shape, source, steps, rounds as u64);
+    for _ in 0..steps {
+        group.step();
+    }
+    if !group.settles(rounds) {
+        return Err(format!("the group did not settle: {:?}", group.reached()));
+    }
+    Ok(group.finish())
+}
+
+/// The schedule from `seed` run twice from its seed and once from its first run's trace, to one
+/// digest (`docs/sim.md` §3.9): the first run's record.
+pub fn runs_the_same(
+    shape: Shape,
+    seed: u64,
+    steps: u64,
+    rounds: usize,
+) -> Result<Record, Twice<String>> {
+    twice(seed, |source| recorded(shape, source, steps, rounds))
 }

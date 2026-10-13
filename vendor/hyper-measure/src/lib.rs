@@ -12,6 +12,10 @@
 //! [`wake`]. A real-socket test or an E2E member waits for a datagram with
 //! [`wait::arrives`].
 //!
+//! A latency benchmark schedules its requests with [`open_loop`] and states
+//! each quantile it reports with its interval from [`quantile`]
+//! (`docs/tails.md` §3, step T-1).
+//!
 //! The `unsafe` this crate needs is in five files that
 //! `scripts/check-contracts.py` lists: `src/alloc.rs` (the allocator forwards
 //! to the system's), `src/faults.rs` (the OS calls that read the faults),
@@ -34,6 +38,8 @@
 pub mod alloc;
 pub mod cost;
 pub mod faults;
+pub mod open_loop;
+pub mod quantile;
 pub mod stats;
 pub mod usage;
 pub mod wait;

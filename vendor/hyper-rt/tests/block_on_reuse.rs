@@ -1,15 +1,18 @@
-//! Completed block_on calls release their roots and the children they leave pending.
+//! Completed block_on calls release their roots and the children they leave pending; a root that unwinds
+//! ends its call refused, typed, and the runtime runs the next.
 
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::disallowed_macros,
     clippy::disallowed_methods,
-    clippy::missing_panics_doc
+    clippy::missing_panics_doc,
+    clippy::panic
 )]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use hyper_rt::RtError;
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
 
 fn config() -> RuntimeConfig {
@@ -80,4 +83,45 @@ fn each_call_cleans_its_pending_child_and_leaves_room_for_the_next_root() {
         runtime.block_on(async { "still serving" }),
         Ok("still serving")
     );
+}
+
+/// A root future that unwinds ends `block_on` refused, `RootUnwound`: the shard's boundary ends the root's
+/// task with no output, and the call waited for one for good before (found on windows-11-arm, where a test's
+/// assertion failing inside its root left the test binary waiting, diag run 38275004157). The child the root
+/// left pending is cancelled with it, and the runtime runs the next root.
+#[test]
+#[cfg_attr(miri, ignore)] // LocalRuntime opens the native platform driver.
+fn a_root_that_unwinds_ends_its_call_refused_and_the_next_runs() {
+    UNWOUND_CHILDREN_DROPPED.store(0, Ordering::SeqCst);
+    let mut runtime = LocalRuntime::new(&config()).unwrap();
+    let out = runtime.block_on(async move {
+        let child = UnwoundChild;
+        hyper_rt::futures::spawn_detached(async move {
+            let _child = child;
+            std::future::pending::<()>().await;
+        })
+        .unwrap();
+        if std::hint::black_box(true) {
+            panic!("the root's own failure");
+        }
+        1u8
+    });
+    assert!(matches!(out, Err(RtError::RootUnwound { .. })), "{out:?}");
+    assert_eq!(
+        UNWOUND_CHILDREN_DROPPED.load(Ordering::SeqCst),
+        1,
+        "the pending child was cancelled with the root"
+    );
+    assert_eq!(runtime.block_on(async { 7u8 }), Ok(7));
+}
+
+/// The children an unwound root left pending that were dropped.
+static UNWOUND_CHILDREN_DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+struct UnwoundChild;
+
+impl Drop for UnwoundChild {
+    fn drop(&mut self) {
+        UNWOUND_CHILDREN_DROPPED.fetch_add(1, Ordering::SeqCst);
+    }
 }

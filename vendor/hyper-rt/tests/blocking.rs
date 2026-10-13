@@ -56,20 +56,10 @@ fn config() -> RuntimeConfig {
 fn the_pool_runs_refuses_survives_and_resolves() {
     blocking::start(Config {
         workers: 2,
-        queue: 8,
         shares: vec![
-            Share {
-                name: "work",
-                limit: 2,
-            },
-            Share {
-                name: dns::SHARE,
-                limit: 1,
-            },
-            Share {
-                name: "order",
-                limit: 1,
-            },
+            Share::new("work", 2),
+            Share::new(dns::SHARE, 1),
+            Share::new("order", 1),
         ],
     })
     .unwrap();
@@ -77,11 +67,7 @@ fn the_pool_runs_refuses_survives_and_resolves() {
         matches!(
             blocking::start(Config {
                 workers: 1,
-                queue: 1,
-                shares: vec![Share {
-                    name: "x",
-                    limit: 1
-                }],
+                shares: vec![Share::new("x", 1)],
             }),
             Err(RtError::BadConfig { .. })
         ),
@@ -93,7 +79,8 @@ fn the_pool_runs_refuses_survives_and_resolves() {
         let value = blocking::run("work", || 6 * 7).unwrap().await.unwrap();
         assert_eq!(value, 42);
 
-        // Two jobs held open fill the share; a third is refused before any thread is asked.
+        // Two jobs held open fill a share that keeps no line; a third is refused before any thread is
+        // asked.
         let (release_a, hold_a) = sync_channel::<()>(1);
         let (release_b, hold_b) = sync_channel::<()>(1);
         let a = blocking::run("work", move || hold_a.recv().is_ok()).unwrap();

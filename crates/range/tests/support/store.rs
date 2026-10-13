@@ -128,4 +128,13 @@ impl<F: BlockFile + 'static> LogStore for Synchronous<F> {
     fn write_now(&mut self, write: &Write<'_>) -> Result<(), Fault> {
         self.inner.write_now(write)
     }
+
+    /// The log's store keeps what the replica will read back: passed on.
+    fn keep_after(&mut self, index: u64) {
+        self.inner.keep_after(index);
+    }
+
+    fn kept_bytes(&self) -> u64 {
+        self.inner.kept_bytes()
+    }
 }

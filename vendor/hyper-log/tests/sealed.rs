@@ -154,6 +154,43 @@ fn a_sealed_log_reads_back_what_it_was_given_and_holds_none_of_it_in_the_clear()
     log.close().unwrap();
 }
 
+/// A sealed log writes a group's release of its proposals and reads it back after a reopen. The
+/// seal's walk of a frame did not know the release's kind: the frame failed to seal and the log
+/// fenced (focal's three-member session fenced at its first release).
+#[test]
+fn a_sealed_log_writes_and_reopens_a_release() {
+    let log = Log::create_sealed(sim(9), config(16, 8), ID, keys(1, 2)).unwrap();
+    log.write(
+        1,
+        Update {
+            entries: Some(entries(1, &[1, 1])),
+            proposals: vec![Proposal {
+                index: 3,
+                term: 1,
+                bytes: [MARK, b"-proposal"].concat(),
+            }],
+            ..Update::default()
+        },
+    )
+    .unwrap();
+    log.write(
+        1,
+        Update {
+            released: Some(3),
+            ..Update::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(log.view(1).unwrap().unwrap().released, 3);
+    let file = log.close().unwrap();
+    let (log, recovery) = Log::open_sealed(file, config(16, 8), ID, keys(1, 2)).unwrap();
+    assert!(recovery.damaged.is_empty());
+    let view = log.view(1).unwrap().unwrap();
+    assert_eq!(view.released, 3);
+    assert!(view.proposals.is_empty());
+    log.close().unwrap();
+}
+
 #[test]
 fn a_sealed_log_opens_only_with_its_own_keys() {
     let log = Log::create_sealed(sim(2), config(16, 8), ID, keys(1, 2)).unwrap();

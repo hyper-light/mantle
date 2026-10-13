@@ -1,10 +1,11 @@
 //! The shard's online wake estimate and the attribution of its long polls (§4.1, §4.3; A-31;
 //! docs/bugs/2026-09-25-wake-estimate-frozen-at-boot-and-preemptions-counted-as-long-steps.md).
 //!
-//! The boot probe's mean wake converges slowly under a heavy tail, so a shard that tracks one refines it
-//! from the kicked parks it pays: a sender stamps the first kick of a park, and the shard folds the
-//! kick-to-running latency of a park that slept into its estimate, which its step quantum and idle spin
-//! follow. A shard whose configuration carries no measured prior keeps its fixed values. A poll past the
+//! The boot probe's mean wake converges slowly under a heavy tail and samples the host for a few tens of
+//! milliseconds, so a shard that tracks one refines it from the kicked parks it pays: a sender stamps the
+//! first kick of a park, and the shard folds the kick-to-running latency of a park that slept into its
+//! estimate (the median of its last five blocks' means, `hyper_rt::machine::wake::WakeTrack`), which its
+//! step quantum follows. A shard whose configuration carries no measured prior keeps its fixed values. A poll past the
 //! quantum by the wall clock is attributed in a window of the thread's account: the task's when it ran
 //! past the quantum on the CPU or blocked in a call, the host's when it was runnable and held off the
 //! CPU, unattributed where the platform cannot tell (the first long poll opens the first window).
@@ -41,7 +42,7 @@ use hyper_rt::runtime::{LocalRuntime, RuntimeConfig, WakeTracking};
 /// Shape: the prior the tracking shard is seeded with — a second, far above any real wake — so an
 /// estimate that learned from its wakes has unmistakably moved off it.
 const PRIOR_NS: u64 = 1_000_000_000;
-/// Shape: a short weighting window (sixteen wakes), so a handful of kicks moves the estimate far.
+/// Shape: a short window (sixteen wakes, so blocks of four), so a dozen kicked parks outvote the prior.
 const SHIFT: u32 = 4;
 /// Shape: kicked parks the tracking test drives.
 const KICKS: u64 = 24;
@@ -128,8 +129,9 @@ fn park_and_kick(rt: &mut LocalRuntime, wakers: &Receiver<Waker>) {
 
 /// §4.3, A-31: a tracking shard kicked while asleep learns the kick's wake — each such park is one sample
 /// (the non-vacuity count), and every kicked park is either a sample or counted unslept (a kick that found
-/// it awake) — and its estimate, seeded with a one-second prior, moves down to the wakes it measured; its
-/// step quantum is the estimate, and the registry pulse mirrors it for another thread. A shard with no
+/// it awake) — and its estimate, seeded with a one-second prior, leaves it for the wakes it measured once
+/// they fill a majority of its blocks (twelve, three blocks of four); its step quantum is the estimate,
+/// and the registry pulse mirrors it for another thread. A shard with no
 /// measured prior learns nothing and keeps its fixed quantum.
 #[test]
 #[cfg_attr(miri, ignore)] // the OS driver opens a kqueue or an eventfd, which Miri does not model

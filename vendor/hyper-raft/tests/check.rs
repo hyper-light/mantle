@@ -1,8 +1,9 @@
-//! This core's schedules judged by hyper-check (`docs/sim.md` §4, step S-4): the same seeds the
-//! schedule tests run (`tests/group.rs`, `tests/fast.rs`, `tests/pipeline.rs`), with every oracle of
-//! §4.1 fed after every operation over the whole history, the clients' history recorded and judged
-//! by both linearizability checkers, which must agree, and the paths the runs claim held to their
-//! floors (§4.4). Then the planted defects of §4.6 (`src/mutant.rs`), each run with the harness's
+//! This core's schedules judged by hyper-check (`docs/sim.md` §4, step S-4): the harnesses of the
+//! schedule tests (`tests/group.rs`, `tests/fast.rs`, `tests/pipeline.rs`), which run their fixed
+//! mixes under their own checks, here with each seed under its own swarm configuration within the
+//! harness's ranges (§3.8, step S-6), with every oracle of §4.1 fed after every operation over the
+//! whole history, the clients' history recorded and judged by both linearizability checkers, which
+//! must agree, and the paths the runs claim held to their floors (§4.4). Then the planted defects of §4.6 (`src/mutant.rs`), each run with the harness's
 //! own checks set aside (`Settings::judged`), and caught by the oracle that names it.
 //!
 //! The clients' history. A proposal a leader takes is a write of a register (one of two, by its
@@ -41,9 +42,10 @@ use hyper_measure::alloc::Counting;
 use hyper_raft::Mutant;
 
 use support::judge::{
-    Core, Judge, PATHS, Totals, agreed, between, elect, judged, replicate, route,
+    Core, Judge, PATHS, Seed, Totals, agreed, between, elect, judged, replicate, route,
 };
-use support::{Cluster, Lagged, Mix, New, Op, Settings};
+use support::swarm::{Configuration, Harness, run};
+use support::{Cluster, Lagged, Mix, New, Op, Seeded, Settings};
 
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
@@ -84,67 +86,70 @@ fn campaign_floor(path: &'static str, count: u64, seeds: u64) -> Floor {
     }
 }
 
-/// `tests/group.rs`'s schedules of this core, judged.
-#[test]
-fn the_group_schedules_keep_every_oracle_and_their_histories_are_linearizable() {
-    let seeds = count("HYPER_RAFT_SEEDS", 96);
-    let steps = count("HYPER_RAFT_STEPS", 4_000);
+/// A harness's schedules of `seeds`, each seed under its own swarm configuration within the
+/// harness's ranges (`docs/sim.md` §3.8, `support::swarm`): every oracle held after every operation,
+/// the group settled within its liveness bound, both checkers agreeing on its history, and the
+/// paths it claims held to their floors.
+fn swarm_schedules(name: &str, harness: Harness, seeds: u64, floors_of: &[Floor]) {
     let first = count("HYPER_RAFT_SEED", 0);
-    let mix = Mix {
-        leader_leaves: true,
-        bursts: true,
-        windows: true,
-        ..Mix::everything()
-    };
     let mut counters = Counters::new(PATHS);
     let mut totals = Totals::default();
     for seed in first..first + seeds {
-        let mut group: Cluster<New> = Cluster::new(5, &[1, 2, 3], Settings::focal(), seed);
-        group.stop_who_left = true;
-        let run = judged(group, seed, steps, &mix, None);
+        let configuration = Configuration::swarm(harness, seed);
+        let run = run(harness, &configuration, seed, None, &mut Seed(Seeded(seed)));
         assert!(
             run.violation.is_none(),
-            "seed {seed}: {}",
+            "{name}, seed {seed}, {configuration:?}: {}",
             run.violation.unwrap()
         );
-        assert!(run.settled, "seed {seed}: the group did not settle");
+        assert!(
+            run.settled,
+            "{name}, seed {seed}, {configuration:?}: the group did not settle"
+        );
         assert!(
             run.hot.is_none(),
-            "seed {seed}: {}",
+            "{name}, seed {seed}: {}",
             run.hot.unwrap_or_default()
         );
         agreed(seed, &run.events, &mut totals);
         counters.merge(&run.counters);
     }
     println!(
-        "{} histories of {} events agreed, {} configurations searched; {}",
+        "{name}: {} histories of {} events agreed, {} configurations searched; {}",
         totals.histories,
         totals.operations,
         totals.configurations,
         totals.tails()
     );
-    floors("group", &counters, seeds, &group_floors());
+    floors(name, &counters, seeds, floors_of);
 }
 
-/// The floors of the group schedules, each set from its count over the default 96 seeds of 4,000
-/// steps (2026-10-05, this test at its commit): more than one a seed where the count was, at least
-/// one a campaign where it was rarer.
+/// `tests/group.rs`'s schedules of this core, each seed under its swarm configuration, judged.
+#[test]
+fn the_group_schedules_keep_every_oracle_and_their_histories_are_linearizable() {
+    let seeds = count("HYPER_RAFT_SEEDS", 96);
+    swarm_schedules("group", Harness::Group, seeds, &group_floors());
+}
+
+/// The floors of the group schedules under their swarm configurations, each set from its count over
+/// the default 96 seeds (2026-10-13, this test at its commit, `docs/sim.md` §18): more than one a seed
+/// where the count was, at least one a campaign where it was rarer.
 fn group_floors() -> Vec<Floor> {
     vec![
-        seed_floor("terms led", 911, 96),
-        seed_floor("entries committed", 91775, 96),
-        seed_floor("log entries held", 63578, 96),
-        seed_floor("leaderships held to the committed entries", 911, 96),
-        seed_floor("messages held to their senders' devices", 170297, 96),
-        seed_floor("reads asked", 23507, 96),
-        seed_floor("reads recorded", 4664, 96),
-        seed_floor("read indexes answered", 9643, 96),
-        seed_floor("reads served", 3069, 96),
-        seed_floor("writes published", 4350, 96),
-        seed_floor("writes answered committed", 4350, 96),
-        seed_floor("writes failed, another entry at their index", 188, 96),
-        campaign_floor("writes failed, their term ended past the commit", 20, 96),
-        seed_floor("operations left unknown by a restart", 2826, 96),
+        seed_floor("terms led", 582, 96),
+        seed_floor("entries committed", 35762, 96),
+        seed_floor("log entries held", 28192, 96),
+        seed_floor("leaderships held to the committed entries", 582, 96),
+        seed_floor("messages held to their senders' devices", 176397, 96),
+        seed_floor("reads asked", 14989, 96),
+        seed_floor("reads recorded", 1140, 96),
+        seed_floor("read indexes answered", 3836, 96),
+        seed_floor("reads served", 568, 96),
+        seed_floor("writes published", 1063, 96),
+        seed_floor("writes answered committed", 1063, 96),
+        seed_floor("writes failed, another entry at their index", 249, 96),
+        campaign_floor("writes failed, their term ended past the commit", 38, 96),
+        seed_floor("operations left unknown by a restart", 1212, 96),
     ]
 }
 
@@ -194,143 +199,65 @@ fn the_group_schedules_on_hostile_networks_keep_every_oracle_and_their_histories
     }
 }
 
-/// `tests/fast.rs`'s schedules of the fast track, judged.
+/// `tests/fast.rs`'s schedules of the fast track, each seed under its swarm configuration, judged.
 #[test]
 fn the_fast_schedules_keep_every_oracle_and_their_histories_are_linearizable() {
     let seeds = count("HYPER_RAFT_SEEDS", 96);
-    let steps = count("HYPER_RAFT_STEPS", 4_000);
-    let first = count("HYPER_RAFT_SEED", 0);
-    let mix = Mix {
-        leader_leaves: true,
-        fast: 60,
-        ..Mix::everything()
-    };
-    let mut counters = Counters::new(PATHS);
-    let mut totals = Totals::default();
-    for seed in first..first + seeds {
-        let group: Cluster<New> = Cluster::new(5, &[1, 2, 3, 4, 5], Settings::fast(), seed);
-        let run = judged(group, seed, steps, &mix, None);
-        assert!(
-            run.violation.is_none(),
-            "seed {seed}: {}",
-            run.violation.unwrap()
-        );
-        assert!(run.settled, "seed {seed}: the group did not settle");
-        assert!(
-            run.hot.is_none(),
-            "seed {seed}: {}",
-            run.hot.unwrap_or_default()
-        );
-        agreed(seed, &run.events, &mut totals);
-        counters.merge(&run.counters);
-    }
-    println!(
-        "{} histories of {} events agreed, {} configurations searched; {}",
-        totals.histories,
-        totals.operations,
-        totals.configurations,
-        totals.tails()
-    );
-    floors("fast", &counters, seeds, &fast_floors());
+    swarm_schedules("fast", Harness::Fast, seeds, &fast_floors());
 }
 
-/// The floors of the fast schedules, from their counts over the default 96 seeds of 4,000 steps
-/// (2026-10-05, this test at its commit).
+/// The floors of the fast schedules under their swarm configurations, from their counts over the
+/// default 96 seeds (2026-10-13, this test at its commit, `docs/sim.md` §18).
 fn fast_floors() -> Vec<Floor> {
     vec![
-        seed_floor("terms led", 446, 96),
-        seed_floor("entries committed", 31804, 96),
-        seed_floor("log entries held", 30450, 96),
-        seed_floor("leaderships held to the committed entries", 446, 96),
-        seed_floor("messages held to their senders' devices", 238721, 96),
-        seed_floor("reads asked", 7718, 96),
-        seed_floor("reads recorded", 638, 96),
-        seed_floor("read indexes answered", 1083, 96),
-        seed_floor("reads served", 281, 96),
-        seed_floor("writes published", 686, 96),
-        seed_floor("writes answered committed", 686, 96),
-        seed_floor("writes failed, another entry at their index", 763, 96),
-        seed_floor("operations left unknown by a restart", 1282, 96),
-        seed_floor("fast votes cast", 79004, 96),
-        seed_floor("indexes a fast quorum chose", 681, 96),
+        seed_floor("terms led", 427, 96),
+        seed_floor("entries committed", 26071, 96),
+        seed_floor("log entries held", 23096, 96),
+        seed_floor("leaderships held to the committed entries", 427, 96),
+        seed_floor("messages held to their senders' devices", 199122, 96),
+        seed_floor("reads asked", 15105, 96),
+        seed_floor("reads recorded", 599, 96),
+        seed_floor("read indexes answered", 3276, 96),
+        seed_floor("reads served", 270, 96),
+        seed_floor("writes published", 536, 96),
+        seed_floor("writes answered committed", 535, 96),
+        seed_floor("writes failed, another entry at their index", 467, 96),
+        campaign_floor("writes failed, their term ended past the commit", 7, 96),
+        seed_floor("operations left unknown by a restart", 745, 96),
+        seed_floor("fast votes cast", 28331, 96),
+        seed_floor("indexes a fast quorum chose", 229, 96),
     ]
 }
 
-/// `tests/pipeline.rs`'s schedules of members driven ahead of their persistence, judged: the
-/// durability oracle holds every message to its sender's disk as the schedule leaves it.
+/// `tests/pipeline.rs`'s schedules of members driven ahead of their persistence, each seed under
+/// its swarm configuration, judged: the durability oracle holds every message to its sender's disk
+/// as the schedule leaves it.
 #[test]
 fn the_pipelined_schedules_keep_every_oracle_and_their_histories_are_linearizable() {
-    let seeds = count("HYPER_RAFT_SEEDS", 24);
-    let steps = count("HYPER_RAFT_STEPS", 2_000);
-    let first = count("HYPER_RAFT_SEED", 0);
-    let mut counters = Counters::new(PATHS);
-    let mut totals = Totals::default();
-    for (depth, apply_unpersisted) in [(2, false), (3, true)] {
-        let settings = Settings {
-            depth,
-            in_place: true,
-            apply_unpersisted,
-            ..Settings::focal()
-        };
-        let mix = Mix {
-            leader_leaves: true,
-            bursts: true,
-            windows: true,
-            lag: 35,
-            leader_durable: if apply_unpersisted { 10 } else { 100 },
-            ..Mix::everything()
-        };
-        for seed in first..first + seeds {
-            let mut group: Cluster<Lagged> = Cluster::new(5, &[1, 2, 3], settings, seed);
-            group.stop_who_left = true;
-            let run = judged(group, seed, steps, &mix, None);
-            assert!(
-                run.violation.is_none(),
-                "seed {seed}: {}",
-                run.violation.unwrap()
-            );
-            assert!(run.settled, "seed {seed}: the group did not settle");
-            assert!(
-                run.hot.is_none(),
-                "seed {seed}: {}",
-                run.hot.unwrap_or_default()
-            );
-            agreed(seed, &run.events, &mut totals);
-            counters.merge(&run.counters);
-        }
-    }
-    println!(
-        "{} histories of {} events agreed, {} configurations searched; {}",
-        totals.histories,
-        totals.operations,
-        totals.configurations,
-        totals.tails()
-    );
-    floors("pipelined", &counters, 2 * seeds, &pipelined_floors());
+    let seeds = count("HYPER_RAFT_SEEDS", 48);
+    swarm_schedules("pipelined", Harness::Pipelined, seeds, &pipelined_floors());
 }
 
-/// The floors of the pipelined schedules, from their counts over the default 2 × 24 seeds of 2,000
-/// steps (2026-10-05, this test at its commit, the core counting by the newest configuration in its
-/// log: `docs/raft.md` §3.4). A write another entry displaced is now reached once a seed on
-/// average, so it is held to being reached, not to its rate.
+/// The floors of the pipelined schedules under their swarm configurations, from their counts over
+/// the default 48 seeds (2026-10-13, this test at its commit, `docs/sim.md` §18).
 fn pipelined_floors() -> Vec<Floor> {
     vec![
-        seed_floor("terms led", 142, 48),
-        seed_floor("entries committed", 4581, 48),
-        seed_floor("log entries held", 4433, 48),
-        seed_floor("leaderships held to the committed entries", 142, 48),
-        seed_floor("messages held to their senders' devices", 15113, 48),
-        seed_floor("leaders' commits held to their voters' devices", 333, 48),
-        seed_floor("entries applied held to their members' devices", 4581, 48),
-        seed_floor("reads asked", 3844, 48),
-        seed_floor("reads recorded", 392, 48),
-        seed_floor("read indexes answered", 693, 48),
-        seed_floor("reads served", 170, 48),
-        seed_floor("writes published", 291, 48),
-        seed_floor("writes answered committed", 291, 48),
-        campaign_floor("writes failed, another entry at their index", 53, 48),
-        campaign_floor("writes failed, their term ended past the commit", 27, 48),
-        seed_floor("operations left unknown by a restart", 403, 48),
+        seed_floor("terms led", 96, 48),
+        seed_floor("entries committed", 2178, 48),
+        seed_floor("log entries held", 2219, 48),
+        seed_floor("leaderships held to the committed entries", 96, 48),
+        seed_floor("messages held to their senders' devices", 14629, 48),
+        seed_floor("leaders' commits held to their voters' devices", 328, 48),
+        seed_floor("entries applied held to their members' devices", 2178, 48),
+        seed_floor("reads asked", 2447, 48),
+        seed_floor("reads recorded", 100, 48),
+        seed_floor("read indexes answered", 216, 48),
+        campaign_floor("reads served", 46, 48),
+        seed_floor("writes published", 180, 48),
+        seed_floor("writes answered committed", 180, 48),
+        campaign_floor("writes failed, another entry at their index", 35, 48),
+        campaign_floor("writes failed, their term ended past the commit", 10, 48),
+        seed_floor("operations left unknown by a restart", 141, 48),
     ]
 }
 

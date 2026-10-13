@@ -75,8 +75,8 @@ pub struct Parking {
     timed: AtomicBool,
 }
 
-/// A shard's control-pending flag: the sender's publication marker for its control channel, so the shard
-/// learns a control message waits without polling the channel every step, and so a parking shard's re-check
+/// A shard's control-pending flag: the sender's publication marker for its control queue, so the shard
+/// learns a control message waits without polling the queue every step, and so a parking shard's re-check
 /// sees one ([`Parking::park_unless_pending`]). A sender publishes after pushing its message; the shard takes
 /// the mark before draining, and re-arms it when a batch-limited drain may have left messages behind.
 #[derive(Debug, Default)]
@@ -92,7 +92,7 @@ impl ControlFlag {
         }
     }
 
-    /// The sender's half, after its message is pushed: marks the channel pending — a read-modify-write, not a
+    /// The sender's half, after its message is pushed: marks the queue pending — a read-modify-write, not a
     /// store. Consecutive RMWs form one release sequence, so the shard's acquiring [`take`](Self::take) of the
     /// latest mark synchronizes with **every** sender whose mark it absorbs, and the drain that follows sees
     /// each of their messages. A plain store from a second sender would end the first sender's release
@@ -109,7 +109,7 @@ impl ControlFlag {
     /// which the drain that follows then finds) or that publication lands after it and stays set for the next
     /// step. Until 2026-09-28 this was a load and then a store of `false`: the load could read an earlier
     /// sender's mark, the store then overwrote a later sender's, and the drain could miss that sender's
-    /// message — a `Shutdown` stranded in the channel while the shard parked for good, since the later
+    /// message — a `Shutdown` stranded in the queue while the shard parked for good, since the later
     /// sender's kick had coalesced into the wake the shard already took (loom: the first interleaving
     /// explored; `docs/bugs/2026-09-28-a-cleared-control-flag-stranded-a-shutdown.md`).
     pub fn take(&self) -> bool {
@@ -450,7 +450,7 @@ mod loom_tests {
 
     /// AC-0.7 (the control path of `registry::send_control_to` and `shard::drain_control`): two senders each
     /// push one control message into the shard's channel, publish the [`ControlFlag`], and kick the shard if
-    /// it announced parking; the shard takes the flag and drains the channel, and parks unless the flag is
+    /// it announced parking; the shard takes the flag and drains the queue, and parks unless the flag is
     /// pending. In every interleaving both messages are drained: a message whose publication the shard's
     /// take cleared is either drained by that same drain or re-marked. A lost message leaves the shard parked
     /// with nothing left to run, which loom reports as a deadlock. Some interleaving made the shard wait.

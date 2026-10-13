@@ -14,8 +14,9 @@
 //!   physical footprint the system charges it, now and at its highest.
 //! - Linux: `/proc/<pid>/stat`'s `utime` and `stime` (proc(5)), in ticks of
 //!   `sysconf(_SC_CLK_TCK)`; `/proc/<pid>/status`'s `VmRSS` and `VmHWM`; `/proc/<pid>/io`'s
-//!   `write_bytes`. Instructions and cycles (`perf_event_open`) and energy (powercap, per package,
-//!   not per process) are not read: `None`.
+//!   `write_bytes`, each read into a buffer on the stack, so the probe allocates nothing beside the
+//!   allocation counts it is read with. Instructions and cycles (`perf_event_open`) and energy
+//!   (powercap, per package, not per process) are not read: `None`.
 //! - Other Unix: this process only, by `getrusage(RUSAGE_SELF)`: user and system times and
 //!   `ru_maxrss`, the most resident memory, in KiB on the BSDs (getrusage(2)).
 //! - Windows: `GetProcessTimes` (100 ns units), `QueryProcessCycleTime`, and
@@ -282,10 +283,55 @@ mod os {
 
 #[cfg(target_os = "linux")]
 mod os {
+    use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
+
     use super::{Usage, UsageError};
 
-    fn read(pid: u32, what: &str) -> Result<String, UsageError> {
-        std::fs::read_to_string(format!("/proc/{pid}/{what}")).map_err(|_| UsageError::Unreadable)
+    /// Shape: room for one of the three `/proc` files this reads, each a few hundred bytes to a couple of
+    /// KiB (proc(5): `stat` is one line, `status` some fifty short lines, `io` seven); a file past it is
+    /// refused rather than read in part.
+    const FILE_BYTES: usize = 8192;
+    /// Shape: room for `/proc/<pid>/status`, the longest path read: a `u32` in decimal is ten digits.
+    const PATH_BYTES: usize = 32;
+
+    /// `/proc/<pid>/<what>`, read into `buffer` without an allocation: a probe read beside the allocator's
+    /// counts must not be counted in them (a read through `read_to_string` and `format!` was 7
+    /// allocations and 18 reallocations a call, which `tests/service_driverless_receipts.rs` counted as
+    /// the runtime's on Linux). The path is formatted on the stack, and std opens a path that short from
+    /// a stack copy (`run_path_with_cstr`).
+    fn read<'b>(
+        pid: u32,
+        what: &str,
+        buffer: &'b mut [u8; FILE_BYTES],
+    ) -> Result<&'b str, UsageError> {
+        let mut path = [0u8; PATH_BYTES];
+        let mut free: &mut [u8] = &mut path;
+        std::io::Write::write_fmt(&mut free, format_args!("/proc/{pid}/{what}"))
+            .map_err(|_| UsageError::Unreadable)?;
+        let written = PATH_BYTES.saturating_sub(free.len());
+        let path = path.get(..written).ok_or(UsageError::Unreadable)?;
+        let mut file = std::fs::File::open(std::path::Path::new(std::ffi::OsStr::from_bytes(path)))
+            .map_err(|_| UsageError::Unreadable)?;
+        let mut filled = 0usize;
+        // Each read fills at least a byte or ends the file; an interrupted one is asked again, at most
+        // once a byte of the room.
+        for _ in 0..FILE_BYTES {
+            let room = buffer.get_mut(filled..).ok_or(UsageError::Unreadable)?;
+            if room.is_empty() {
+                return Err(UsageError::Unreadable);
+            }
+            match file.read(room) {
+                Ok(0) => {
+                    let bytes = buffer.get(..filled).ok_or(UsageError::Unreadable)?;
+                    return std::str::from_utf8(bytes).map_err(|_| UsageError::Unreadable);
+                }
+                Ok(read) => filled = filled.saturating_add(read),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return Err(UsageError::Unreadable),
+            }
+        }
+        Err(UsageError::Unreadable)
     }
 
     /// The value of `key` in a `/proc` file of `key: value` lines, its first word.
@@ -303,40 +349,41 @@ mod os {
             .ok()
             .filter(|ticks| *ticks > 0)
             .ok_or(UsageError::Unreadable)?;
-        let stat = read(pid, "stat")?;
-        // The command is in parentheses and may hold spaces: the fields follow its last ')'.
-        let after = stat
-            .rsplit_once(')')
-            .map(|(_, rest)| rest)
-            .ok_or(UsageError::Unreadable)?;
-        let fields: Vec<&str> = after.split_whitespace().collect();
-        // utime and stime are the stat's 14th and 15th fields; after the command, the 12th and
-        // 13th words (proc(5)).
-        let time = |at: usize| -> Result<u64, UsageError> {
-            let value: u64 = fields
-                .get(at)
-                .and_then(|word| word.parse().ok())
-                .ok_or(UsageError::Unreadable)?;
+        let nanos = |value: &str| -> Result<u64, UsageError> {
+            let value: u64 = value.parse().map_err(|_| UsageError::Unreadable)?;
             value
                 .checked_mul(1_000_000_000)
                 .and_then(|scaled| scaled.checked_div(ticks))
                 .ok_or(UsageError::Unreadable)
         };
-        let status = read(pid, "status")?;
-        let kib = |key: &str| field(&status, key).and_then(|kib| kib.checked_mul(1024));
-        let written = read(pid, "io")
+        let mut buffer = [0u8; FILE_BYTES];
+        let stat = read(pid, "stat", &mut buffer)?;
+        // The command is in parentheses and may hold spaces: the fields follow its last ')'. utime and
+        // stime are the stat's 14th and 15th fields; after the command, the 12th and 13th words
+        // (proc(5)).
+        let mut words = stat
+            .rsplit_once(')')
+            .map(|(_, rest)| rest)
+            .ok_or(UsageError::Unreadable)?
+            .split_whitespace();
+        let user_ns = nanos(words.nth(11).ok_or(UsageError::Unreadable)?)?;
+        let system_ns = nanos(words.next().ok_or(UsageError::Unreadable)?)?;
+        let status = read(pid, "status", &mut buffer)?;
+        let kib = |key: &str| field(status, key).and_then(|kib| kib.checked_mul(1024));
+        let (footprint, peak_footprint) = (kib("VmRSS"), kib("VmHWM"));
+        let written = read(pid, "io", &mut buffer)
             .ok()
-            .and_then(|io| field(&io, "write_bytes"));
+            .and_then(|io| field(io, "write_bytes"));
         Ok(Usage {
-            user_ns: time(11)?,
-            system_ns: time(12)?,
+            user_ns,
+            system_ns,
             instructions: None,
             cycles: None,
             energy_nj: None,
             wakeups: None,
             disk_written: written,
-            footprint: kib("VmRSS"),
-            peak_footprint: kib("VmHWM"),
+            footprint,
+            peak_footprint,
         })
     }
 }

@@ -25,7 +25,7 @@ use crate::task::{AdmissionReceipt, SpawnRequest};
 /// Submits a detached task to the shard `holder` names, from any thread and without a runtime handle
 /// (a submitter that may outlive the runtime — an observation still pending while its daemon stops),
 /// and returns the receipt of its admission; refused `ShardGone` when the slot is free or held by a
-/// later registration, `ControlFull` when the holder's control channel is full.
+/// later registration, `ControlFull` when the holder's control queue is full.
 pub fn submit_to_holder<F: Future<Output = ()> + Send + 'static>(
     holder: registry::SlotHolder,
     future: F,
@@ -47,7 +47,7 @@ pub fn submit_service_to_holder<F: Future<Output = ()> + Send + 'static>(
 }
 
 /// Requests a task's cancellation from any thread without a runtime handle (the message
-/// [`Runtime::cancel`] sends); refused when the task's shard is gone or its control channel is full.
+/// [`Runtime::cancel`] sends); refused when the task's shard is gone or its control queue is full.
 /// A task that already ended is a stale word the shard ignores.
 pub fn cancel_task(task: TaskId) -> Result<(), RtError> {
     registry::send_control(task.0.shard(), Control::Cancel(task.0))
@@ -94,13 +94,15 @@ pub struct RuntimeConfig {
 
 /// What a shard needs to refine its wake estimate after boot (§4.1: the boot probe's mean converges
 /// slowly under a heavy tail — a virtual machine's needs 38,000–75,000 wakes where the probe's budget buys
-/// a few thousand — so the estimate a shard sizes its spin and its quantum by keeps learning from the
-/// wakes it actually pays).
+/// a few thousand — and is one sample of a few tens of milliseconds of a host whose load moves, so the
+/// estimate a shard sizes its quantum by keeps learning from the wakes it actually pays,
+/// [`crate::machine::wake::WakeTrack`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WakeTracking {
-    /// The boot probe's mean wake, nanoseconds: the estimate's seed.
+    /// The boot probe's mean wake (the median of its rounds' means), nanoseconds: the estimate's seed.
     pub prior_ns: u64,
-    /// The estimate's weighting shift, about `2^shift` wakes ([`crate::machine::wake::WakeLatency::estimate_shift`]).
+    /// The estimate's window, `2^shift` wakes: what its blocks hold between them once grown
+    /// ([`crate::machine::wake::WakeLatency::estimate_shift`]).
     pub shift: u32,
     /// The idle spin window as a multiple of the estimate (1 for the runtime's own spin-then-park; the
     /// daemon's idle window sets its ratio).
@@ -411,13 +413,13 @@ fn run_worker(
     }
 }
 
-/// Stops every worker (a shutdown message, retried while the shard's control channel is full), joins them
+/// Stops every worker (a shutdown message, retried while the shard's control queue is full), joins them
 /// all, and then gives every slot back — after every join, never before, since a shard's pair rings are lent
 /// to its peers. The counters in shard order, or the first worker's failure (every worker is still joined
 /// and every slot still given back).
 fn stop(workers: Vec<Worker>) -> Result<Vec<Counters>, RtError> {
     for worker in &workers {
-        // The stop takes no slot of the bounded control channel, so a full channel cannot hold it back and
+        // The stop takes no slot of the bounded control queue, so a full queue cannot hold it back and
         // nothing here waits (§15 item 9: the send used to be retried with `yield_now`, unbounded). Before
         // 2026-09-17 a refused Shutdown was dropped and the join waited for good (`tests/admission.rs`).
         // `ShardGone`: the shard's slot is already free, and the join below reports how its thread ended.
@@ -433,7 +435,10 @@ fn stop(workers: Vec<Worker>) -> Result<Vec<Counters>, RtError> {
             Ok(Err(error)) => {
                 failure.get_or_insert(error);
             }
-            Err(_) => {
+            Err(payload) => {
+                // The payload is the unwound code's own (a caller's driver; a task's poll and drop
+                // unwind inside the shard's boundary), so it is dropped inside a boundary too.
+                let _ = crate::unwind::contained(move || drop(payload));
                 failure.get_or_insert(RtError::WorkerFailed { shard: id });
             }
         }
@@ -640,7 +645,7 @@ impl Runtime {
 
     /// Spawns a detached task on a shard from any thread; refused when the shard's control
     /// channel is full (its admission limit) or the shard is gone. `Ok` is a **submission**: the request
-    /// is in the shard's control channel, and whether the shard admits it is answered only to a receipt
+    /// is in the shard's control queue, and whether the shard admits it is answered only to a receipt
     /// ([`Self::spawn_on_with_receipt`]).
     pub fn spawn_on<F: Future<Output = ()> + Send + 'static>(
         &self,
@@ -652,7 +657,7 @@ impl Runtime {
     }
 
     /// Spawns a detached task on a shard from any thread and returns the receipt of its admission
-    /// ([`AdmissionReceipt`]): refused here when the shard's control channel is full or the shard is gone;
+    /// ([`AdmissionReceipt`]): refused here when the shard's control queue is full or the shard is gone;
     /// otherwise the receipt reports, once the shard drains the request, whether the task was admitted
     /// (and as which task), refused (the arena full), or terminated unadmitted (the shard shutting down).
     pub fn spawn_on_with_receipt<F: Future<Output = ()> + Send + 'static>(
@@ -845,8 +850,9 @@ impl LocalRuntime {
 
     /// Runs `future` to completion on this thread as the shard's root task and returns its output. Whatever
     /// the root spawned and left running is cancelled and joined before this returns: nothing outlives the
-    /// call. Refused when the root cannot be admitted, and `ShardGone` when the shard's driver is lost
-    /// before the root finishes.
+    /// call. Refused when the root cannot be admitted, `ShardGone` when the shard's driver is lost before
+    /// the root finishes, and `RootUnwound` when the root's future unwinds: the shard's boundary ends that
+    /// task with no output to wait for.
     pub fn block_on<T: 'static>(
         &mut self,
         future: impl Future<Output = T> + 'static,
@@ -855,9 +861,23 @@ impl LocalRuntime {
             let output = future.await;
             let _ = registry::with_current(|desk| desk.put_root_output(Box::new(output)));
         }))?;
-        self.shard.context().detach(root)?;
+        self.shard.context().begin_root(root);
+        if let Err(refused) = self.shard.context().detach(root) {
+            self.shard.context().end_root();
+            return Err(refused);
+        }
         loop {
+            if self.shard.context().root_unwound() {
+                // The root's poll unwound inside the shard's boundary and its task ended `Unwound`: no output
+                // will come. What it left running is cancelled and joined as on a return.
+                self.shard.context().end_root();
+                self.shard.cancel_everything();
+                return Err(RtError::RootUnwound {
+                    shard: self.slot.0.shard(),
+                });
+            }
             if let Some(output) = self.shard.context().take_root_output() {
+                self.shard.context().end_root();
                 self.shard.cancel_everything();
                 return output.downcast::<T>().map(|output| *output).map_err(|_| {
                     RtError::BadConfig {
@@ -867,6 +887,7 @@ impl LocalRuntime {
             }
             let outcome = self.shard.step();
             if outcome.exit {
+                self.shard.context().end_root();
                 self.shard.discard_root_output();
                 return Err(RtError::ShardGone {
                     shard: self.slot.0.shard(),

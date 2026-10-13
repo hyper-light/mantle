@@ -45,7 +45,7 @@ Each change below preserves behaviour. "Proof" at the end says how that was show
   `prost-codec`. raft-rs is a dev-dependency only: the differential's oracle.
 - `Cargo.lock` was seeded from focal's at `a8e95f7` and pruned to this workspace, so every package
   resolves to the version focal tested.
-- This workspace declares `rust-version = "1.98"`. focal pins 1.94.1.
+- This workspace declares `rust-version = "1.98.1"` ("Rust 1.98.1" below). focal pins 1.94.1.
 
 ### The lint wall
 
@@ -717,6 +717,37 @@ and a follower that queued more than four answers while its writes were out grew
   about 18 growths a group of three more than mantle's shell makes, 0.01–0.02 an entry over those
   3,000; they are done by 3,000 entries, after which the counts are mantle's.
 
+## Trusted again, what was sent while suspected is taken for lost
+
+Not a port: found by hyper-durable's repair bench (`crates/hyper-durable/benches/repair.rs`,
+`docs/durable.md` §14 item 5, 2026-10-13), which cuts a member of three off while the others commit,
+its detectors and theirs suspecting each other, and heals it, their detectors trusting again. At 100
+entries committed during the cut the member was never repaired.
+
+- **The defect.** A leader trusting a member again sent it a heartbeat (`Raft::trust`), so a member
+  cut off while its group was idle learns who leads and answers where its log ends. One cut off while
+  its group committed had been sent appends until its window was full, every one lost to the cut,
+  and the leader kept it in `Replicate` with the full window. The heartbeat's answer frees nothing
+  from a full window until a beat has passed with it unanswered (`Progress::heard_heartbeat`,
+  `stalled >= beat`), and a leader beats only on the round its owner's timing gives: the member was
+  repaired a round tail after the heal, and by a leader whose owner had given it no timing yet (as
+  the bench's owner gives none), never.
+- **The rule** (`src/raft.rs`: `Raft::trust`, `Raft::unreachable`): a leader trusting a member
+  again first takes what it sent it while suspecting it for lost, as raft takes a transport's report
+  that a member is unreachable (`MsgUnreachable`, whose handling is now the same function): a member
+  in `Replicate` is probed again from what it is known to hold, its window given up; a probe out is
+  sent again; a snapshot on its way waits for its report. Then the heartbeat. Whatever was in fact
+  delivered is answered as an append's answer always is, so a wrong suspicion costs at most the
+  window sent again; a member trusted with nothing out probes before it streams again, one round
+  trip once, as after an unreachable report.
+- **The test.** `tests/suspicion.rs`,
+  `a_member_cut_off_while_its_group_commits_is_asked_where_it_is_once_trusted`: a window's worth of
+  entries committed by two of three while the third is cut off and suspected; trusted, the leader's
+  progress for it is `Probe` with an empty window and a heartbeat to it queued, and the group
+  converges. It fails before the rule (the progress stays `Replicate`).
+- **Where it shows.** Only by suspicion: on ticks the detectors' words are refused, so the raft-rs
+  differential and every suite on ticks compare unchanged.
+
 ## R-3: slates' enhancements
 
 Core step R-3 (`docs/raft.md` §3; mantle note 32 §2.13's ledger, R4–R7, R13, R16, R17, R20–R22).
@@ -1031,3 +1062,18 @@ each now ends where it began, and what the core does is unchanged.
   pruned; two rounds of three members, 45,036, 139, 186; the read before the first commit caught
   after 13,917 rounds, the vote before durable after 11), the differential against raft-rs, and the
   gates.
+
+### Rust 1.98.1
+
+Rust 1.98.0 miscompiles some trait-object vtables: a slot that must hold a function pointer is
+left null, so a call through it jumps to address 0, in safe code. focal met it moving from 1.94.1
+to 1.98.0 (its core's tests died calling `Box<dyn Iterator>::next`) and reduced it to a 56-line
+std-only program of nested `impl Iterator + use<'a>` chains boxed as `dyn Iterator`.
+
+- **Reproduced** here (aarch64-apple-darwin, 2026-10-10): the program exits by SIGSEGV built by
+  1.98.0 at opt-level 0 and at 3, and prints its 1,200 evaluations built by 1.94.1, 1.98.1 and
+  1.99.0, each at both levels.
+- **The pin** is 1.98.1 (`rust-toolchain.toml`), and the workspace's `rust-version` is 1.98.1, so
+  cargo refuses to build these crates with 1.98.0, here and in each consumer that vendors them.
+- **The test** `tests/toolchain.rs` is the program as a test: it dies of SIGSEGV built by 1.98.0
+  (`cargo +1.98.0 test -p hyper-raft --test toolchain --ignore-rust-version`) and passes by 1.98.1.

@@ -197,6 +197,40 @@ fn a_oneshot_carries_its_value_or_closes_when_its_sender_goes() {
     assert_eq!(dropped, Err(SyncError::Closed(())));
 }
 
+/// An owner that holds replies for its callers sweeps the ones whose caller stopped waiting: the sender sees
+/// the receiver go, whether it was dropped before it waited, while it waited on a task, or on another
+/// thread, and not while it waits.
+#[test]
+fn a_oneshot_sender_sees_its_receiver_go() {
+    let (tx, rx) = sync::oneshot::<u8>().unwrap();
+    assert!(!tx.is_closed());
+    drop(rx);
+    assert!(tx.is_closed());
+    assert_eq!(tx.send(1), Err(SyncError::Closed(1)));
+
+    let (tx, rx) = sync::oneshot::<u8>().unwrap();
+    std::thread::spawn(move || drop(rx)).join().unwrap();
+    assert!(tx.is_closed());
+
+    let mut rt = LocalRuntime::new(&config(1)).unwrap();
+    let (waiting, abandoned) = rt
+        .block_on(async {
+            let (tx, rx) = sync::oneshot::<u8>().unwrap();
+            let waiter = hyper_rt::futures::spawn(async move {
+                let _ = rx.await;
+            })
+            .unwrap();
+            hyper_rt::futures::yield_now().await;
+            let waiting = tx.is_closed();
+            hyper_rt::futures::cancel(waiter).unwrap();
+            let _ = hyper_rt::futures::join(waiter).await;
+            (waiting, tx.is_closed())
+        })
+        .unwrap();
+    assert!(!waiting);
+    assert!(abandoned);
+}
+
 #[test]
 fn every_watch_receiver_sees_the_latest_version_and_the_senders_end() {
     let mut rt = LocalRuntime::new(&config(1)).unwrap();

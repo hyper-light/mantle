@@ -146,8 +146,20 @@ fn a_wait_dropped_on_another_shard_ends_on_its_own() {
         assert_eq!(waits_held(), 1, "armed on A");
         let _ = moved.send(armed);
         let _ = done.await;
-        yield_now().await;
-        let _ = from_a.send(("A's slots held", waits_held()));
+        // B marked A's entry before it finished, so A's next control drain sweeps the mark. A yield need
+        // not reach that drain: a step polls a task that yields again within its batch (a step's poll
+        // budget covers the wakes its own polls make), and the step this poll is in may have drained
+        // before the mark. Within a batch of yields and one more, a later step polls this task, its
+        // drain before the poll; a slot still held then was never given back.
+        let mut held = waits_held();
+        for _ in 0..=config().batch {
+            if held == 0 {
+                break;
+            }
+            yield_now().await;
+            held = waits_held();
+        }
+        let _ = from_a.send(("A's slots held", held));
     })
     .unwrap();
     rt.spawn_on(b, async move {

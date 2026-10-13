@@ -23,7 +23,7 @@ use hyper_rt::driver::Kick;
 use hyper_rt::registry::{RegisterKick, Registration, register, with_entry};
 
 fn registration() -> Registration {
-    register(4, 2, RegisterKick::Kick(Kick::none())).unwrap().0
+    register(4, 2, RegisterKick::Kick(Kick::none())).unwrap()
 }
 
 /// Do: a reader stays inside its call on another thread while the registration drops, and only then

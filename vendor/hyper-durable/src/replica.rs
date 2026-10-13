@@ -38,6 +38,7 @@ use std::task::Waker;
 use std::time::Duration;
 
 use hyper_liveness::{Liveness, PeerId};
+use hyper_raft::progress::ProgressState;
 use hyper_raft::proto::{
     self, ConfChange, ConfChangeV2, ConfState, Entry, EntryType, HardState, Message, Snapshot,
     SnapshotMetadata,
@@ -216,7 +217,7 @@ pub struct Writes {
 }
 
 /// A write the replica made, oldest first, with what waits for it.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Out {
     kind: Kind,
     state: State,
@@ -255,7 +256,7 @@ enum State {
 }
 
 /// Writes refused for room, waiting to be made again.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Stall {
     fault: Fault,
     /// Writes that were out behind the refused one when its refusal was taken: each is refused
@@ -284,7 +285,10 @@ enum Stop {
     Failed(Cause),
 }
 
-/// One member of one group (module docs).
+/// One member of one group (module docs). A copy is a second member in the same state, for a
+/// simulation that forks its world (`docs/sim.md` §3.7); its log, machine and budget must be values
+/// to copy, so no owner of a device's handle has one.
+#[derive(Clone)]
 pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> {
     node: RawNode<Held<L>>,
     machine: M,
@@ -382,6 +386,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     pub fn open(settings: &Settings, mut log: L, machine: M, budget: B) -> Result<Self, OpenError> {
         let durable = machine.durable();
         let view = repair_at_open(&mut log, durable)?;
+        // What the member has yet to apply it reads back from its store, which may keep it.
+        log.keep_after(durable.index);
         let depth = log.depth();
         let mut config = settings.core.clone();
         config.applied = durable.index;
@@ -619,7 +625,14 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         }
         match catch_unwind(AssertUnwindSafe(|| call(&mut *self))) {
             Ok(outcome) => outcome,
-            Err(_) => Err(self.fence(Cause::Unwound)),
+            Err(payload) => {
+                // The payload is the unwound code's own, so it is dropped inside a boundary too:
+                // one whose drop unwinds again is left unfreed, one allocation, rather than unwind.
+                if let Err(again) = catch_unwind(AssertUnwindSafe(move || drop(payload))) {
+                    let _ = Box::leak(again);
+                }
+                Err(self.fence(Cause::Unwound))
+            }
         }
     }
 
@@ -709,13 +722,16 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             sum.saturating_add(context.capacity())
                 .saturating_add(std::mem::size_of::<(u64, Vec<u8>)>())
         });
+        // What the store keeps for this replica's reads is this replica's to bound.
+        let kept = usize::try_from(self.node.store().log.kept_bytes()).unwrap_or(usize::MAX);
         bytes(
             self.node
                 .raft
                 .resident_bytes()
                 .saturating_add(writes)
                 .saturating_add(stalled)
-                .saturating_add(reads),
+                .saturating_add(reads)
+                .saturating_add(kept),
         )
     }
 
@@ -843,10 +859,19 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         Ok(Some(span))
     }
 
-    /// When the owner is to drive the replica though nothing arrives (`Driven::wake`); none when
-    /// nothing is timed.
+    /// When the owner is to drive the replica though nothing arrives (`Driven::wake`): the core's
+    /// next timer, or the end of the quiet period at which a commit no write has stated is written
+    /// (§4.1, `quiet_commit`), while the log has room for it; none when nothing is timed. Without
+    /// the second, a group that went quiet with its applied index past its durable commit was
+    /// driven by nothing again, and stayed there.
     pub fn deadline(&self) -> Option<u64> {
-        self.node.deadline()
+        let quiet = self.quiet_since.filter(|_| self.has_slot()).map(|since| {
+            since.saturating_add(u64::try_from(self.quiet.as_nanos()).unwrap_or(u64::MAX))
+        });
+        match (self.node.deadline(), quiet) {
+            (Some(core), Some(quiet)) => Some(core.min(quiet)),
+            (core, quiet) => core.or(quiet),
+        }
     }
 
     /// Wakes the core at the owner's clock (timing step L-2): what it armed since the last
@@ -1133,6 +1158,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 r.quiet_commit(now, waker)?;
             }
             r.release_reads(out);
+            r.keep();
             r.settle();
             Ok(r.driven())
         })
@@ -1875,8 +1901,39 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             let told = self.node.advance_apply_to(self.applied.index);
             self.must(told)?;
             self.told_applied = self.applied.index;
+            // What the store kept for this replica to read back before applying it may go.
+            self.keep();
         }
         Ok(())
+    }
+
+    /// Tells the store the index after which it keeps what this replica will read back
+    /// ([`LogStore::keep_after`]): what it has yet to apply, and on a leader what a replicating
+    /// member has yet to acknowledge of what was sent to it up to the apply point, which a resend
+    /// reads (focal, 2026-10-12). A member in `Replicate` whose next index is past the apply point
+    /// has all of that in flight, within the window the leader sends it ahead (`set_inflight_bytes`),
+    /// so it holds no more than its window; one whose next index is not past it, or that probes or
+    /// takes a snapshot, holds nothing, so a stalled member pins nothing past its window. A mark
+    /// below one already given changes nothing, so a member that falls behind and catches up holds
+    /// the mark again only from where it then stands.
+    fn keep(&mut self) {
+        let applied = self.applied.index;
+        let from = if self.is_leader() {
+            let id = self.id();
+            self.node
+                .raft
+                .tracker()
+                .iter()
+                .filter(|&(member, progress)| {
+                    member != id
+                        && progress.state == ProgressState::Replicate
+                        && progress.next_index > applied
+                })
+                .fold(applied, |from, (_, progress)| from.min(progress.matched))
+        } else {
+            applied
+        };
+        self.node.store_mut().log.keep_after(from);
     }
 
     /// Gives out `messages`. The emptied vector goes back to the core as its next queue

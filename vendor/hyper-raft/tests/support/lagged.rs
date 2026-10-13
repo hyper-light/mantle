@@ -23,9 +23,8 @@
 //! disk's as a lazy shell's does; a change of configuration applies only
 //! once the disk states a commit covering it, held until then with every
 //! entry after it while the core is asked for no more (R-6's apply pause).
-use std::collections::VecDeque;
-
 use hyper_raft::proto::{Entry, HardState, Message, MessageType, Snapshot};
+use hyper_sim::storage::Writes;
 
 use super::{
     App, Disk, Led, New, Output, Replica, Settings, Step, Store, View, apply_to, canonical,
@@ -104,10 +103,10 @@ struct Write {
 pub struct Lagged {
     pub node: New,
     depth: usize,
-    /// Writes issued and not yet durable, oldest first.
-    out: VecDeque<Write>,
-    /// Writes durable whose owner has not heard of them yet.
-    durable: VecDeque<Write>,
+    /// The member's device, hyper-sim's typed write queue (`docs/sim.md` §3.5): writes issued and
+    /// not yet durable, oldest first, then those durable whose owner has not heard of them yet. Each
+    /// is made durable, and heard of, at the schedule's step.
+    writes: Writes<Write, ()>,
     output: Output,
     coverage: Coverage,
     /// Committed entries given to apply and held behind the commit fence: a
@@ -283,7 +282,9 @@ impl Lagged {
             .raw
             .advance_apply_to(self.node.app.index)
             .expect("applied");
-        self.out.push_back(write);
+        self.writes
+            .submit(write)
+            .expect("a member takes no ready past its depth");
         self.coverage.taken += 1;
         self.coverage.behind += u64::from(behind);
         true
@@ -357,7 +358,7 @@ impl Lagged {
     /// behind it would be durable after it. The core is told the commit it
     /// states.
     fn state_commit(&mut self, index: u64) -> bool {
-        if !self.out.is_empty() {
+        if self.writes.out() > 0 {
             return false;
         }
         let raw = &mut self.node.raw;
@@ -375,65 +376,75 @@ impl Lagged {
     }
 
     fn make_durable(&mut self) -> bool {
-        let Some(write) = self.out.pop_front() else {
-            return false;
-        };
-        let id = self.node.raw.raft.id();
-        let disk = &mut self.node.raw.store_mut().0;
-        if let Some(snapshot) = &write.snapshot {
-            disk.install(snapshot);
-        }
-        disk.append(&write.entries);
-        disk.hold(&write.proposals, write.released);
-        if let Some(hard) = write.hard_state {
-            // The commit a store records never goes back: a compaction since
-            // the `Ready` was taken recorded a later one (`Disk::compact`).
-            disk.hard_state = HardState {
-                commit: hard.commit.max(disk.hard_state.commit),
-                ..hard
-            };
-        }
-        // I7: the disk holds what the member held when it took the `Ready`.
-        assert_eq!(
-            (disk.hard_state.term, disk.hard_state.vote),
-            write.vote,
-            "member {id}: write {} left another term or vote durable",
-            write.number
-        );
-        let last = write.from + write.terms.len() as u64 - 1;
-        assert_eq!(
-            disk.last_index().max(disk.snapshot_index()),
-            last,
-            "member {id}: write {} left another log durable",
-            write.number
-        );
-        for (at, term) in write.terms.iter().enumerate() {
-            let index = write.from + at as u64;
-            if index >= disk.snapshot_index() {
-                assert_eq!(
-                    disk.term(index),
-                    Some(*term),
-                    "member {id}: write {} left another entry durable at {index}",
-                    write.number
-                );
+        let Self {
+            node,
+            writes,
+            coverage,
+            judged,
+            ..
+        } = self;
+        let id = node.raw.raft.id();
+        let made = writes.complete(|write| {
+            let disk = &mut node.raw.store_mut().0;
+            if let Some(snapshot) = &write.snapshot {
+                disk.install(snapshot);
             }
+            disk.append(&write.entries);
+            disk.hold(&write.proposals, write.released);
+            if let Some(hard) = write.hard_state {
+                // The commit a store records never goes back: a compaction since
+                // the `Ready` was taken recorded a later one (`Disk::compact`).
+                disk.hard_state = HardState {
+                    commit: hard.commit.max(disk.hard_state.commit),
+                    ..hard
+                };
+            }
+            // I7: the disk holds what the member held when it took the `Ready`.
+            assert_eq!(
+                (disk.hard_state.term, disk.hard_state.vote),
+                write.vote,
+                "member {id}: write {} left another term or vote durable",
+                write.number
+            );
+            let last = write.from + write.terms.len() as u64 - 1;
+            assert_eq!(
+                disk.last_index().max(disk.snapshot_index()),
+                last,
+                "member {id}: write {} left another log durable",
+                write.number
+            );
+            for (at, term) in write.terms.iter().enumerate() {
+                let index = write.from + at as u64;
+                if index >= disk.snapshot_index() {
+                    assert_eq!(
+                        disk.term(index),
+                        Some(*term),
+                        "member {id}: write {} left another entry durable at {index}",
+                        write.number
+                    );
+                }
+            }
+            for message in write.messages.iter().filter(|_| !*judged) {
+                coverage.answers += u64::from(check_message(disk, message, id));
+            }
+        });
+        if made {
+            coverage.durable += 1;
         }
-        for message in write.messages.iter().filter(|_| !self.judged) {
-            self.coverage.answers += u64::from(check_message(disk, message, id));
-        }
-        self.durable.push_back(write);
-        self.coverage.durable += 1;
-        true
+        made
     }
 
     fn notify(&mut self) -> bool {
-        let Some(number) = self.durable.back().map(|write| write.number) else {
+        let heard = self.writes.unanswered();
+        if heard == 0 {
             return false;
-        };
-        if self.durable.len() > 1 {
+        }
+        if heard > 1 {
             self.coverage.several += 1;
         }
-        for write in self.durable.drain(..) {
+        let mut number = 0;
+        while let Some((write, ())) = self.writes.take() {
+            number = write.number;
             self.output.messages.extend(write.messages);
             if let Some(snapshot) = write.snapshot {
                 let metadata = snapshot.metadata.clone().unwrap_or_default();
@@ -514,8 +525,7 @@ impl Replica for Lagged {
         Self {
             node: New::open(id, store, settings, seed, members),
             depth: settings.depth,
-            out: VecDeque::new(),
-            durable: VecDeque::new(),
+            writes: Writes::new(settings.depth),
             output: Output::default(),
             coverage: Coverage::default(),
             held: Vec::new(),
@@ -628,14 +638,11 @@ impl Replica for Lagged {
         }
     }
     fn busy(&self) -> bool {
-        self.node.raw.has_ready()
-            || !self.out.is_empty()
-            || !self.durable.is_empty()
-            || !self.held.is_empty()
+        self.node.raw.has_ready() || self.writes.held() > 0 || !self.held.is_empty()
     }
     fn coverage(&self) -> Coverage {
         Coverage {
-            lost: self.out.len() as u64,
+            lost: self.writes.out() as u64,
             ..self.coverage
         }
     }

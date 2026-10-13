@@ -5,7 +5,7 @@
 //! member knows of the others; all of it is equal, or the run fails naming
 //! its seed and its step.
 //!
-//! The two differ by decision in four places a schedule reaches. A change
+//! The two differ by decision in five places a schedule reaches. A change
 //! of the configuration counts here from the moment a log holds its entry,
 //! and there from the moment its owner applies it (`docs/raft.md` §3.4:
 //! raft-rs's rule elects two leaders of a term, `docs/models/Reconfig.tla`):
@@ -20,7 +20,11 @@
 //! schedule loses that message for both too. An answer to a read round sent
 //! before the read it names was asked again under the same context confirms
 //! nothing here and the read and every one before it there: the schedule
-//! loses that message for both as well.
+//! loses that message for both as well. An append behind its member's commit
+//! that runs past it, naming the committed entry at the commit, is taken past
+//! the commit here (Raft §5.3: a receiver appends any new entries not already
+//! in its log) and answered with the commit and dropped there: the schedule
+//! loses that message for both too.
 #![allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -66,6 +70,8 @@ struct Reached {
     held_reads: u64,
     /// Answers to a round sent before the read they name was asked again, lost for both.
     older_rounds: u64,
+    /// Appends behind their member's commit that run past it, lost for both.
+    past_commits: u64,
     terms: u64,
     committed: u64,
     changes: u64,
@@ -192,6 +198,38 @@ fn answers_an_older_round(group: &Cluster<New>, op: &Op) -> bool {
         leader.raw.raft.state() == StateRole::Leader
             && leader.raw.raft.term() == message.term
             && leader.raw.raft.round_confirms(context, round) == Some(false)
+    })
+}
+
+/// Whether `op` delivers an append behind its member's commit that runs past it, naming the
+/// committed entry at the commit: this core takes what the append carries past the commit (Raft
+/// §5.3), raft-rs answers with the commit and drops the append whole, and the comparison loses it
+/// for both (`docs/raft.md` §3.3).
+fn runs_past_the_commit(group: &Cluster<New>, op: &Op) -> bool {
+    let Op::Deliver {
+        at, lose: false, ..
+    } = op
+    else {
+        return false;
+    };
+    let Some(message) = group.net.get(*at) else {
+        return false;
+    };
+    if message.msg_type != MessageType::MsgAppend {
+        return false;
+    }
+    group.peek(message.to).is_some_and(|member| {
+        let log = member.raw.raft.log();
+        let committed = log.committed();
+        message.term >= member.view().term
+            && message.index < committed
+            && message
+                .entries
+                .last()
+                .is_some_and(|entry| entry.index > committed)
+            && message.entries.iter().any(|entry| {
+                entry.index == committed && log.term(committed).is_ok_and(|held| held == entry.term)
+            })
     })
 }
 
@@ -414,6 +452,14 @@ fn run(seed: u64, steps: u64, settings: Settings, mix: Mix, reached: &mut Reache
             }
             Op::Deliver { at, keep, .. } if answers_an_older_round(&new, &op) => {
                 reached.older_rounds += 1;
+                Op::Deliver {
+                    at,
+                    keep,
+                    lose: true,
+                }
+            }
+            Op::Deliver { at, keep, .. } if runs_past_the_commit(&new, &op) => {
+                reached.past_commits += 1;
                 Op::Deliver {
                     at,
                     keep,
@@ -697,6 +743,9 @@ fn the_cores_agree_as_the_shell_sets_them() {
         "{reached:?}"
     );
     assert!(reached.restarts > 0, "{reached:?}");
+    // Appends behind their member's commit that run past it: the schedule
+    // reaches them, and loses them for both.
+    assert!(reached.past_commits > 0, "{reached:?}");
 }
 
 #[test]

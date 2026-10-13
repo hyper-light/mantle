@@ -29,8 +29,8 @@ use std::sync::mpsc::channel;
 use std::task::{Context, Poll, Waker};
 
 use hyper_rt::error::RtError;
-use hyper_rt::futures::{cancel, now_ns, sleep, spawn, within};
-use hyper_rt::runtime::RuntimeConfig;
+use hyper_rt::futures::{cancel, now_ns, sleep, spawn, timer_tick_ns, within};
+use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
 use hyper_rt::sim::SimRuntime;
 
 /// Shape: the span every waiting sleep asks for, in the audit's words.
@@ -212,4 +212,15 @@ fn within_tells_the_work_the_deadline_and_a_refusal_apart() {
         std::future::Future::poll(off_shard.as_mut(), &mut foreign_context()),
         Poll::Ready(Err(RtError::NotOnShardThread))
     );
+}
+
+/// A shard tells its timer tick, how much later than due a sleep may end by design (a deadline is kept
+/// on the tick after it): what a wait that must end before another's sets aside for itself. Zero off a
+/// shard, where no sleep is kept.
+#[test]
+fn a_shard_tells_its_timer_tick() {
+    assert_eq!(timer_tick_ns(), 0);
+    let mut rt = LocalRuntime::new(&one_timer()).unwrap();
+    let tick = rt.block_on(async { timer_tick_ns() }).unwrap();
+    assert_eq!(tick, one_timer().timer_tick_ns);
 }

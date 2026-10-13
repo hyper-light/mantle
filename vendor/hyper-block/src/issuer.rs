@@ -138,9 +138,10 @@ struct Handle(Option<Box<dyn BlockFile>>);
 impl Handle {
     fn retire(&mut self) -> Option<LifecycleFailure> {
         let file = self.0.take()?;
-        std::panic::catch_unwind(AssertUnwindSafe(|| drop(file)))
-            .err()
-            .map(|_| LifecycleFailure::FileDrop)
+        // The payload of a drop that unwound is dropped inside a boundary too (`unwind::contained`).
+        crate::unwind::contained(|| drop(file))
+            .is_none()
+            .then_some(LifecycleFailure::FileDrop)
     }
 
     fn read_exact_at(&self, bytes: &mut [u8], at: u64) -> Result<(), DiskError> {
@@ -1452,34 +1453,33 @@ fn carry_out(files: &[FileSlot], transfer: Transfer) -> Finished {
     };
     let (write, result) = match op {
         Op::Write { index, buf, at } => {
-            let issued = std::panic::catch_unwind(AssertUnwindSafe(move || {
+            let issued = crate::unwind::contained(move || {
                 let result =
                     file.map_or_else(|| Err(missing()), |f| f.write_all_at(buf.as_slice(), at));
                 (buf, result)
-            }));
+            });
             match issued {
-                Ok((buf, result)) => (Some((index, Some(buf))), result),
-                Err(_) => (Some((index, None)), Err(unwound())),
+                Some((buf, result)) => (Some((index, Some(buf))), result),
+                None => (Some((index, None)), Err(unwound())),
             }
         }
         Op::Read { index, mut buf, at } => {
-            let issued = std::panic::catch_unwind(AssertUnwindSafe(move || {
+            let issued = crate::unwind::contained(move || {
                 let result = file.map_or_else(
                     || Err(missing()),
                     |f| f.read_exact_at(buf.as_mut_slice(), at),
                 );
                 (buf, result)
-            }));
+            });
             match issued {
-                Ok((buf, result)) => (Some((index, Some(buf))), result),
-                Err(_) => (Some((index, None)), Err(unwound())),
+                Some((buf, result)) => (Some((index, Some(buf))), result),
+                None => (Some((index, None)), Err(unwound())),
             }
         }
         Op::Flush => {
-            let issued = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                file.map_or_else(|| Err(missing()), |f| f.sync_data())
-            }));
-            (None, issued.unwrap_or_else(|_| Err(unwound())))
+            let issued =
+                crate::unwind::contained(|| file.map_or_else(|| Err(missing()), |f| f.sync_data()));
+            (None, issued.unwrap_or_else(|| Err(unwound())))
         }
     };
     Finished {
@@ -2409,11 +2409,11 @@ impl<'a> Dispatch<'a> {
 /// and its ordinary panic payload become a typed failure, before terminal publication.
 /// Recursive/process-aborting panic payload destructors are outside recoverable claims.
 fn dispose_foreign<T>(owned: T) -> Option<LifecycleFailure> {
-    let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(|| drop(owned))) else {
-        return None;
-    };
-    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| drop(payload)));
-    Some(LifecycleFailure::RetiredDrop)
+    // The unwind's payload is dropped inside a boundary of its own, and one whose drop unwinds again is
+    // left unfreed (`unwind::contained`).
+    crate::unwind::contained(|| drop(owned))
+        .is_none()
+        .then_some(LifecycleFailure::RetiredDrop)
 }
 
 /// One reserved terminal credit, never a wait on the submitter or its receiver.
@@ -2432,14 +2432,8 @@ fn copy_disk_error(error: &DiskError) -> DiskError {
             path: path.clone(),
             source: source.raw_os_error().map_or_else(
                 || {
-                    let detail =
-                        match std::panic::catch_unwind(AssertUnwindSafe(|| source.to_string())) {
-                            Ok(detail) => detail,
-                            Err(payload) => {
-                                dispose_foreign(payload);
-                                "a device error's formatter unwound".to_owned()
-                            }
-                        };
+                    let detail = crate::unwind::contained(|| source.to_string())
+                        .unwrap_or_else(|| "a device error's formatter unwound".to_owned());
                     std::io::Error::new(source.kind(), detail)
                 },
                 std::io::Error::from_raw_os_error,
@@ -2584,6 +2578,10 @@ mod tests {
         open: AtomicBool,
         /// The offset whose write fails, `u64::MAX` for none.
         fail_at: AtomicU64,
+        /// The offset whose write unwinds, `u64::MAX` for none.
+        unwind_at: AtomicU64,
+        /// Whether that write's unwind carries a payload whose drop unwinds too.
+        bomb: AtomicBool,
         flushes: AtomicUsize,
         /// Writes completed when the last flush was issued.
         completed_at_flush: AtomicUsize,
@@ -2611,6 +2609,7 @@ mod tests {
             counts
                 .fail_at
                 .store(fail_at.unwrap_or(u64::MAX), Ordering::SeqCst);
+            counts.unwind_at.store(u64::MAX, Ordering::SeqCst);
             counts.alive.store(1, Ordering::SeqCst);
             let file = DeviceFile::open(
                 &dir.join("probe"),
@@ -2671,6 +2670,12 @@ mod tests {
             while !c.open.load(Ordering::SeqCst) {
                 std::thread::yield_now();
             }
+            if c.unwind_at.load(Ordering::SeqCst) == offset {
+                if c.bomb.load(Ordering::SeqCst) {
+                    std::panic::panic_any(Bomb);
+                }
+                panic!("a write that unwinds");
+            }
             let fail = c.fail_at.load(Ordering::SeqCst) == offset;
             if !fail {
                 self.file.write_all_at(buf, offset)?;
@@ -2697,6 +2702,15 @@ mod tests {
                 file: self.file.try_clone()?,
                 counts: self.counts,
             })
+        }
+    }
+
+    /// A panic payload whose drop unwinds too.
+    struct Bomb;
+
+    impl Drop for Bomb {
+        fn drop(&mut self) {
+            panic!("a payload that unwinds as it drops");
         }
     }
 
@@ -3454,6 +3468,32 @@ mod tests {
         attached.flush().unwrap();
         assert_eq!(c.flushes.load(Ordering::SeqCst), 1);
         assert_eq!(c.completed_at_flush.load(Ordering::SeqCst), 5);
+    }
+
+    /// A write that unwinds, its payload unwinding again as it drops or not, fails its batch,
+    /// typed, and costs the device's one worker nothing: the next batch and a flush are served.
+    #[test]
+    fn a_write_that_unwinds_fails_its_batch_and_the_worker_goes_on() {
+        for bomb in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+            let probe = Probe::new(dir.path(), true, None);
+            probe.counts.unwind_at.store(4096, Ordering::SeqCst);
+            probe.counts.bomb.store(bomb, Ordering::SeqCst);
+            let mut attached = issuer.attach(&probe).unwrap();
+            let failed = attached.write(writes(3), true).unwrap_err();
+            assert!(
+                failed.to_string().contains("a device worker unwound"),
+                "bomb {bomb}: {failed}"
+            );
+            probe.counts.unwind_at.store(u64::MAX, Ordering::SeqCst);
+            assert_eq!(
+                attached.write(writes(3), true).unwrap().len(),
+                3,
+                "bomb {bomb}"
+            );
+            attached.flush().unwrap();
+        }
     }
 
     /// Several submitters on one device share its workers: the device never has more than the

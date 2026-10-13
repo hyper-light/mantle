@@ -157,6 +157,47 @@ fn a_refused_slot_is_the_bound_reached_never_a_fence() {
     drop(log.close().unwrap());
 }
 
+/// An admission that unwinds (the owner's code, run on the log's owner thread) is called no more
+/// and reads as a refusal from then on: the frame that needed a slot is answered `Full`, never
+/// `Fenced` or `Closed`; the refusal is counted; and the log goes on serving what it holds.
+#[test]
+fn an_admission_that_unwinds_reads_as_a_refusal_never_a_fence() {
+    // The persist area and first slot at creation and the two slots kept ahead are admitted; the
+    // next admission unwinds.
+    let with = With {
+        growth: Some(Box::new(UnwindsAfter { admits: 3 })),
+        ..With::default()
+    };
+    let log = Log::create_with(sim(9), config(), ID, with).unwrap();
+    let mut next = 1;
+    assert!(matches!(fill(&log, &mut next), LogError::Full));
+    assert!(log.stats(None).unwrap().growth_refused > 0);
+    assert!(!log.is_fenced());
+    assert_eq!(
+        log.entries(1, 1, 2, u64::MAX).unwrap()[0].bytes.len(),
+        ENTRY
+    );
+    drop(log.close().unwrap());
+}
+
+/// An admission that admits `admits` times, then unwinds.
+struct UnwindsAfter {
+    admits: u64,
+}
+
+impl Growth for UnwindsAfter {
+    fn held(&mut self, _bytes: u64) {}
+    fn admit(&mut self, _bytes: u64) -> bool {
+        if self.admits == 0 {
+            panic!("an admission that unwinds");
+        }
+        self.admits -= 1;
+        true
+    }
+    fn commit(&mut self, _bytes: u64) {}
+    fn release(&mut self, _bytes: u64) {}
+}
+
 /// Fills `log` to its bound, lets go of all but the last entry, and counts the appends that fit
 /// in the slots the compaction freed before the bound is met again.
 fn resumed_after_compaction(log: &Log<SimFile>) -> u64 {

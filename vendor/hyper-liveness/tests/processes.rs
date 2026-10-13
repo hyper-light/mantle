@@ -1386,8 +1386,8 @@ impl Supervisor {
     }
 
     /// A pair that has taken more heartbeats unconfigured than any window holds
-    /// (`hyper_timing::WINDOW_LIMIT`): a link whose correlation no window of it resolves, which
-    /// the crate's moves to the interval its evidence needs exist to prevent.
+    /// (`hyper_timing::WINDOW_LIMIT`): a link whose correlation no window of it resolves, which a
+    /// link waiting at its interval for a longer level must not be.
     fn unresolved(&self) -> Option<(u64, u64, u64)> {
         self.latest.iter().find_map(|(member, stated)| {
             stated.peers.iter().find_map(|(peer, seen)| {

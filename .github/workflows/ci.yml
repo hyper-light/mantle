@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Install pinned Rust
-        run: rustup toolchain install 1.98.0 --profile minimal
+        run: rustup toolchain install 1.98.1 --profile minimal
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked
       - name: Audit dependencies
@@ -38,8 +38,8 @@ jobs:
       - name: Install pinned Rust
         shell: bash
         run: |
-          rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
-          rustup target add --toolchain 1.98.0 ${{ matrix.target }}
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
+          rustup target add --toolchain 1.98.1 ${{ matrix.target }}
       # AWS-LC's x86_64 Windows assembly is NASM source, built rather than taken prebuilt
       # (vendor/UPSTREAM.md).
       - name: Install NASM
@@ -84,7 +84,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Install pinned Rust
-        run: rustup toolchain install 1.98.0 --profile minimal
+        run: rustup toolchain install 1.98.1 --profile minimal
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.name }}

@@ -221,6 +221,10 @@ impl Epoch {
 
     /// The generation answers are kept in now, the epoch read again first when it is due: none
     /// when the epoch is unknown, and then no answer is kept or used.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the epoch is the kernel's, due on the host's clock: its reclaim counters are read again before free memory could reach the kernel's free target at the fastest fill (mantle docs/research/46-reclaim-epochs.md); hyper-block owns its device files"
+    )]
     fn current(&mut self) -> Option<u64> {
         let now = std::time::Instant::now();
         if !self.unanswerable && self.due.is_none_or(|due| now >= due) {
@@ -374,7 +378,9 @@ impl Resident {
         }) else {
             return Ok(false);
         };
-        let (p0, p1) = (first / page, end / page);
+        let (Some(p0), Some(p1)) = (first.checked_div(page), end.checked_div(page)) else {
+            return Ok(false);
+        };
         let generation = epoch.current();
         if generation.is_some_and(|g| self.answered(p0, p1, g)) {
             if self.shadow && self.probe(file, first, end)? != Some(true) {
@@ -467,6 +473,10 @@ impl Resident {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test sets and reads the epoch's due on the host's clock, as the epoch does"
+)]
 impl Epoch {
     /// Holds the epoch where it is for a test, whatever the host's kernel reclaims meanwhile:
     /// answers are kept, and no refresh comes due.

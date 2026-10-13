@@ -27,7 +27,7 @@ pub const NO_LINK: u32 = u32::MAX;
 /// A spawn request that may cross threads: the future is `Send` because it may be created on any
 /// thread and run on the shard's. It may carry the answering half of an admission receipt
 /// ([`SpawnRequest::with_receipt`]): the shard answers it when it drains the request, and a request
-/// dropped undrained (queued in a control channel the shard exited behind) answers it `Terminated`
+/// dropped undrained (queued in a control queue the shard exited behind) answers it `Terminated`
 /// itself, so a submitter that holds a receipt always learns what became of its task — a submission
 /// is never mistaken for an admission (§4.3 "admission").
 pub struct SpawnRequest {
@@ -79,7 +79,7 @@ impl std::fmt::Debug for SpawnRequest {
 }
 
 /// What became of a spawn request after its submission (§4.3 "admission"): the three ends a request
-/// can meet once it is in a shard's control channel, so a submitter that must know whether its task
+/// can meet once it is in a shard's control queue, so a submitter that must know whether its task
 /// exists reads one of these and never infers it from a submission that merely landed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Admission {
@@ -250,6 +250,10 @@ pub enum Outcome {
     /// The future was dropped before returning (cancelled by request, by its parent, or by
     /// shutdown).
     Cancelled,
+    /// The future unwound while it was polled: the task's code panicked. The poll runs inside an
+    /// unwind boundary of the shard's own, so the task ends there, its future dropped inside a
+    /// boundary too, and the shard and its other tasks go on (CLAUDE.md §1).
+    Unwound,
 }
 
 /// One task slot.

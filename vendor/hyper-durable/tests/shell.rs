@@ -254,6 +254,83 @@ fn a_change_waits_behind_the_fence_and_what_waits_is_bounded() {
     assert!(r.durable_commit() >= r.applied().index);
 }
 
+/// A member whose applied index ran past its durable commit asks its owner to drive it when its
+/// quiet period ends (`Replica::deadline`, `Driven::wake`), and that drive writes the commit
+/// (`docs/durable.md` §4.1). A follower's commit moves alone, with no write of its own, and electing
+/// by suspicion it has no timer of the core's: before, nothing drove it again, and a group that went
+/// quiet stayed past what its logs state (found by `benches/quiet.rs`).
+#[test]
+fn a_follower_past_its_durable_commit_asks_to_be_driven_when_its_quiet_period_ends() {
+    let s = settings(1, 7);
+    let quiet = u64::try_from(s.quiet.as_nanos()).unwrap();
+    let mut r: Sim = Replica::open(
+        &s,
+        SimStore::new(3),
+        Kv::new(voters(&[1, 2, 3]), false),
+        Unbounded,
+    )
+    .unwrap();
+    // Member 2 leads term 1.
+    r.step(Message {
+        msg_type: MessageType::MsgHeartbeat,
+        from: 2,
+        to: 1,
+        term: 1,
+        ..Message::default()
+    })
+    .unwrap();
+    pump(&mut r);
+    let last = r.core().raft.log().last_index().unwrap();
+    let log_term = r.core().raft.log().term(last).unwrap();
+    // An entry, then its commit alone.
+    r.step(Message {
+        msg_type: MessageType::MsgAppend,
+        from: 2,
+        to: 1,
+        term: 1,
+        index: last,
+        log_term,
+        commit: last,
+        entries: vec![Entry {
+            index: last + 1,
+            term: 1,
+            data: b"entry".to_vec(),
+            ..Entry::default()
+        }],
+        ..Message::default()
+    })
+    .unwrap();
+    pump(&mut r);
+    r.step(Message {
+        msg_type: MessageType::MsgHeartbeat,
+        from: 2,
+        to: 1,
+        term: 1,
+        commit: last + 1,
+        ..Message::default()
+    })
+    .unwrap();
+    pump(&mut r);
+    assert_eq!(r.applied().index, last + 1);
+    assert!(
+        r.durable_commit() < last + 1,
+        "the commit moved alone: no write states it"
+    );
+    let due = r
+        .deadline()
+        .expect("a deadline while a commit is applied and unwritten");
+    let at = now();
+    assert!(due > at && due <= at + quiet, "due {due} at {at}");
+    let mut out = Output::default();
+    r.drive(due, waker(), &mut out).unwrap();
+    while r.log_mut().make_durable() {}
+    out.clear();
+    r.drive(due + 1, waker(), &mut out).unwrap();
+    assert!(r.durable_commit() >= r.applied().index);
+    assert_eq!(r.writes().quiet, 1);
+    assert_eq!(r.deadline(), None, "nothing left to drive it for");
+}
+
 /// A write refused for room stalls the replica: inputs are refused `Stalled`, its campaigns held
 /// whatever its detectors say, snapshot reports kept (one a member, members only), and the
 /// refused writes are made again, in order, once the log has room; nothing was lost.
@@ -469,6 +546,9 @@ impl StateMachine for Boom {
         if entry.data == b"boom" {
             panic!("the application unwound");
         }
+        if entry.data == b"bomb" {
+            std::panic::panic_any(Bomb);
+        }
         self.0.apply(entry, answers)
     }
     fn apply_change(
@@ -502,9 +582,25 @@ impl StateMachine for Boom {
     }
 }
 
-/// An unwind of the state machine fences the replica and is reported, never propagated.
+/// A panic payload whose drop unwinds too.
+struct Bomb;
+
+impl Drop for Bomb {
+    fn drop(&mut self) {
+        panic!("a payload that unwinds as it drops");
+    }
+}
+
+/// An unwind of the state machine fences the replica and is reported, never propagated, its
+/// payload dropped inside a boundary too: one whose drop unwinds again fences it all the same.
 #[test]
 fn an_unwind_inside_a_call_fences_the_replica() {
+    for data in [b"boom", b"bomb"] {
+        an_unwind_of(data);
+    }
+}
+
+fn an_unwind_of(data: &[u8]) {
     let mut r = Replica::open(
         &settings(1, 3),
         RamStore::new(),
@@ -517,7 +613,7 @@ fn an_unwind_inside_a_call_fences_the_replica() {
     for _ in 0..8 {
         r.drive(now(), waker(), &mut out).unwrap();
     }
-    r.propose(Vec::new(), b"boom".to_vec()).unwrap();
+    r.propose(Vec::new(), data.to_vec()).unwrap();
     let mut fenced = None;
     for _ in 0..8 {
         if let Err(e) = r.drive(now(), waker(), &mut out) {
@@ -1110,6 +1206,14 @@ impl LogStore for Holding {
 
     fn write_now(&mut self, write: &Write<'_>) -> Result<(), Fault> {
         self.inner.write_now(write)
+    }
+
+    fn keep_after(&mut self, index: u64) {
+        self.inner.keep_after(index);
+    }
+
+    fn kept_bytes(&self) -> u64 {
+        self.inner.kept_bytes()
     }
 }
 

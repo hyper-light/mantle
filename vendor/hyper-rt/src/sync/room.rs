@@ -289,10 +289,13 @@ mod tests {
 
 #[cfg(test)]
 #[cfg(loom)]
+// The model keeps each sender's thread handle in loom's cell, whose accesses are `unsafe` by signature; the
+// module's own code has none.
+#[allow(unsafe_code)]
 mod loom_tests {
     use super::*;
     use crate::mem::loom_bounds;
-    use crate::sync::ring::Ring;
+    use crate::sync::ring::{Refused, Ring};
     use loom::cell::UnsafeCell;
 
     /// A sender waits for room on a full channel of one value while the receiver takes the value and grants,
@@ -343,18 +346,23 @@ mod loom_tests {
     /// A model sender: sends `value` as `Sender::blocking_send` does, through the same `Room::send_waiting`,
     /// parking as a loom thread whose handle is the model's.
     fn send_blocking(values: &Ring<u32>, room: &Room, stacks: &[Stack], stack: &Stack, value: u32) {
-        // SAFETY: the model's stand-in for the sender's handle on its own stack, written before the sender
-        // registers it (the registration orders it for a reader).
-        stack
-            .handle
-            .with_mut(|handle| unsafe { *handle = Some(loom::thread::current()) });
-        if let Err(value) = values.push(value) {
+        stack.handle.with_mut(|handle| {
+            // SAFETY: the model's stand-in for the sender's handle on its own stack, written before the
+            // sender registers it (the registration orders it for a reader).
+            unsafe { *handle = Some(loom::thread::current()) }
+        });
+        // The model's ring is never closed: a refusal is a full ring.
+        if let Err(Refused::Full(value) | Refused::Closed(value)) = values.push(value) {
             let place = room.hold().unwrap();
             let word = handoff::thread_word(stack);
             room.send_waiting(
                 place,
                 value,
-                |value| values.push(value),
+                |value| {
+                    values
+                        .push(value)
+                        .map_err(|(Refused::Full(value) | Refused::Closed(value))| value)
+                },
                 |waiter, granted| {
                     handoff::wait_registered(
                         waiter,
@@ -385,11 +393,11 @@ mod loom_tests {
                 .find(|stack| handoff::thread_word(*stack) == word)
                 .unwrap();
             assert_eq!(stack.alive.load(Ordering::Relaxed), 1, "read after leaving");
-            // SAFETY: the model's stand-in for the handle on the waiting sender's stack; loom reports a read
-            // that overlaps the sender's writes of it.
-            stack
-                .handle
-                .with(|handle| unsafe { (*handle).clone() }.unwrap())
+            stack.handle.with(|handle| {
+                // SAFETY: the model's stand-in for the handle on the waiting sender's stack; loom reports a
+                // read that overlaps the sender's writes of it.
+                unsafe { (*handle).clone() }.unwrap()
+            })
         });
         if let handoff::Taken::Thread(thread) = taken {
             thread.unpark();

@@ -341,7 +341,7 @@ mod tests {
         // Exercise the real registration and retirement protocol, including the foreign kick.
         // The registration outlives its driver and retires even when an assertion unwinds (its drop):
         // otherwise the parallel registry stress test can fill its abandoned ring and wait forever.
-        let (registration, _control) =
+        let registration =
             crate::registry::register(2, 1, crate::runtime::register_kick(prepared.kick_fd))
                 .unwrap();
         let shard = registration.shard();
@@ -434,7 +434,7 @@ mod tests {
         let prepared = os_driver(64).unwrap();
         // The registration outlives its driver and retires even when an assertion unwinds (its drop):
         // otherwise the parallel registry stress test can fill its abandoned ring and wait forever.
-        let (registration, _control) =
+        let registration =
             crate::registry::register(2, 1, crate::runtime::register_kick(prepared.kick_fd))
                 .unwrap();
         let shard = registration.shard();

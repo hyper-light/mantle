@@ -1,7 +1,7 @@
 //! The shard's loop: one thread, one task table, one run queue, one timing wheel, one driver, and the
 //! loop that ties them (slates §4.3, "Loop"; docs/runtime.md §3.4).
 //!
-//! Each step: drain the control channel and the wake bitmap (spawns, cancels, shutdown, wakes from other
+//! Each step: drain the control queue and the wake bitmap (spawns, cancels, shutdown, wakes from other
 //! threads) and the driver's completions into the run queue; expire timers; poll ready tasks, at most a
 //! batch of them, applying what each poll asked of the desk before the next; then, if nothing is ready,
 //! spin out the idle window that client activity opened, and park in the driver until a kick, a completion
@@ -16,7 +16,6 @@
 //! no `RefCell` and nothing a nested call could find borrowed.
 
 use std::pin::Pin;
-use std::sync::mpsc::Receiver;
 use std::task::{Context, Poll};
 
 use crate::attribution::{self, Attribution, Tracker};
@@ -24,7 +23,7 @@ use crate::control::Control;
 use crate::driver::{Completion, Driver, DriverKind, DriverSeed, Kick};
 use crate::error::RtError;
 use crate::interests::{self, Interests, Readiness};
-use crate::machine::wake::WakeEstimate;
+use crate::machine::wake::WakeTrack;
 use crate::mem::Encoded;
 use crate::park_cost::ParkCost;
 use crate::parking::{Parked, Woken};
@@ -85,6 +84,9 @@ pub struct Counters {
     pub completed: u64,
     /// Tasks whose future was dropped.
     pub cancelled: u64,
+    /// Tasks whose poll unwound ([`Outcome::Unwound`]), and futures whose drop unwound: each caught by
+    /// the shard's boundary around the task's code.
+    pub unwound: u64,
     /// Wakes that arrived from other threads (the wake bitmap).
     pub wakes_foreign: u64,
     /// Of those, wakes for a slot with no task when drained: the task ended after the wake was sent. Not
@@ -154,8 +156,6 @@ pub struct ShardSeed {
     pub driver: DriverSeed,
     /// The kick the driver answers to.
     pub kick: Kick,
-    /// The control channel's receiving end.
-    pub control: Receiver<Control>,
     /// The configuration.
     pub config: RuntimeConfig,
 }
@@ -174,7 +174,7 @@ impl ShardSeed {
         kick: registry::RegisterKick,
     ) -> Result<ShardSeed, RtError> {
         config.validate_shape()?;
-        let (holder, control) = registry::register_runtime_slot(
+        let holder = registry::register_runtime_slot(
             config.tasks_per_shard,
             config.ring_entries,
             config.interests_per_shard,
@@ -187,7 +187,6 @@ impl ShardSeed {
             holder,
             driver,
             kick,
-            control,
             config: config.clone(),
         })
     }
@@ -205,7 +204,6 @@ struct Core {
     tasks: Box<[TaskSlot]>,
     timers: Wheel,
     driver: Box<dyn Driver>,
-    control: Option<Receiver<Control>>,
     config: RuntimeConfig,
     counters: Counters,
     shutting_down: bool,
@@ -221,7 +219,7 @@ struct Core {
     /// The absolute deadline the shard last waited for and has not stepped since.
     waited_for_ns: Option<u64>,
     /// The online wake estimate (§4.1, §4.3), when the configuration carries a measured prior.
-    wake: Option<WakeEstimate>,
+    wake: Option<WakeTrack>,
     /// The CPU a park costs this shard's thread, and a kick its senders' (`crate::park_cost`): a tracking
     /// shard's idle spin. Learned only while the wake is tracked on a real clock.
     park_cost: ParkCost,
@@ -231,11 +229,26 @@ struct Core {
     idle_ratio: u64,
     fixed_quantum_ns: u64,
     fixed_spin_ns: u64,
+    /// The counter's scale where the shard reads a counter on real time (`machine::clock::counter_scale`):
+    /// each step's reading of the driver's clock is carried forward by it (`ShardContext::carried`).
+    counter_scale: Option<u64>,
     /// The published time of the last driver retrieval: busy native turns share one quantum.
     last_driver_ns: u64,
     /// Whether the driver's clock is real time (the simulation's is not).
     real_time: bool,
     attribution: Tracker,
+    /// The step's long polls left for one reading at its end ([`Tracker::defers`]): at most the step's poll
+    /// budget, reserved at build, so judging by step allocates nothing.
+    deferred: Vec<Deferred>,
+}
+
+/// A long poll left for the step's end: the task, as its slot and generation, so a slot reused since
+/// is not charged, and how far the poll ran past the quantum by the wall clock.
+#[derive(Clone, Copy, Debug)]
+struct Deferred {
+    slot: u32,
+    generation: u32,
+    overrun_ns: u64,
 }
 
 /// A shard: its desk and its loop, owned together by whoever runs it (a worker thread, a
@@ -296,7 +309,10 @@ impl Drop for Shard {
         self.finish_cancelled();
         let entered = registry::enter(&self.desk);
         for task in self.core.tasks.iter_mut() {
-            drop(task.future.take());
+            if let Some(future) = task.future.take() {
+                // A future's drop is its task's code: inside an unwind boundary of the shard's own.
+                let _ = crate::unwind::contained(move || drop(future));
+            }
         }
         drop(entered);
         registry::note_arena_generation(self.desk.id, self.core.generation_high);
@@ -320,6 +336,8 @@ impl Shard {
                 timers: config.timers_per_shard,
                 interests: config.interests_per_shard,
                 generation_base,
+                // The wheel's own tick (`Wheel::new` takes at least a nanosecond).
+                timer_tick_ns: config.timer_tick_ns.max(1),
             },
             is_sim,
             driver.clock(),
@@ -334,7 +352,6 @@ impl Shard {
                 .map(|_| TaskSlot::empty())
                 .collect(),
             timers: Wheel::new(config.timer_tick_ns, config.timers_per_shard, now_ns),
-            control: Some(seed.control),
             fired: Vec::with_capacity(config.timers_per_shard),
             completions: Vec::with_capacity(config.ring_entries),
             waiting: Interests::new(config.interests_per_shard)?,
@@ -345,9 +362,12 @@ impl Shard {
             driver_lost: false,
             generation_high: generation_base,
             waited_for_ns: None,
-            wake: config
-                .wake_tracking
-                .map(|tracking| WakeEstimate::new(tracking.prior_ns, tracking.shift)),
+            wake: config.wake_tracking.map(|tracking| {
+                WakeTrack::new(
+                    tracking.prior_ns,
+                    1u64.checked_shl(tracking.shift).unwrap_or(u64::MAX),
+                )
+            }),
             park_cost: ParkCost::new(),
             kick_cost: ParkCost::new(),
             kicks_seen: (0, 0),
@@ -356,9 +376,15 @@ impl Shard {
                 .map_or(1, |tracking| tracking.idle_ratio),
             fixed_quantum_ns: config.step_budget_ns,
             fixed_spin_ns: config.spin_ns,
+            // Only the OS's clock is carried: a simulated or published clock is the driver's to keep.
+            counter_scale: match desk.clock {
+                crate::driver::Clock::Since(_) => crate::machine::clock::counter_scale(),
+                crate::driver::Clock::Sim(_) | crate::driver::Clock::Published => None,
+            },
             last_driver_ns: now_ns,
             real_time: !is_sim,
             attribution: Tracker::default(),
+            deferred: Vec::with_capacity(config.batch.max(1)),
             config,
             driver,
         };
@@ -460,7 +486,8 @@ impl Shard {
     pub fn quantum_ns(&self) -> u64 {
         self.core
             .wake
-            .map_or(self.core.fixed_quantum_ns, |estimate| estimate.mean_ns())
+            .as_ref()
+            .map_or(self.core.fixed_quantum_ns, WakeTrack::mean_ns)
             .max(1)
     }
 
@@ -487,6 +514,32 @@ impl Shard {
 
     fn publish_clock(&self) {
         self.desk.now_ns.set(self.now_ns());
+    }
+
+    /// The step's reading of the driver's clock, published, and the counter's ticks beside it, which carry it
+    /// forward to the step's later readings (docs/runtime.md §3.9, "a poll's end from the counter"); none
+    /// once the driver is lost, or where the shard reads no counter.
+    fn publish_and_carry_clock(&self) {
+        self.publish_clock();
+        let carried = match (self.core.counter_scale, self.core.driver_lost) {
+            (Some(scale), false) => crate::machine::clock::counter_ticks().map(|ticks| {
+                crate::machine::clock::Carried::new(self.desk.now_ns.get(), ticks, scale)
+            }),
+            _ => None,
+        };
+        self.desk.carried.set(carried);
+    }
+
+    /// The driver's clock now within a step: its step's reading carried forward by the counter where the
+    /// shard reads one, else read again.
+    fn carried_now_ns(&self) -> u64 {
+        match (
+            self.desk.carried.get(),
+            crate::machine::clock::counter_ticks(),
+        ) {
+            (Some(carried), Some(ticks)) => carried.now_ns(ticks),
+            _ => self.now_ns(),
+        }
     }
 
     // ------------------------------------------------------------------ admission
@@ -941,11 +994,11 @@ impl Shard {
             };
         }
         // The step's one reading of the clock: the overrun of a wait just ended, the attribution window, the
-        // timers and the harvest's quantum all take it.
-        self.publish_clock();
-        // Only while armed: the account is a system call, and every step paid it before the tracker
-        // threw an unarmed read away.
-        if self.core.real_time && self.core.attribution.armed() {
+        // timers and the harvest's quantum all take it, and the counter carries it to the step's polls.
+        self.publish_and_carry_clock();
+        // Only where the step's start opens a window: the account is a system call, and every step paid it
+        // before the tracker threw an unarmed read away; judging by step, the last step's reading is open.
+        if self.core.real_time && self.core.attribution.reads_at_step_start() {
             let read = account_now(self.desk.now_ns.get());
             self.core.counters.thread_accounts =
                 self.core.counters.thread_accounts.saturating_add(1);
@@ -988,11 +1041,12 @@ impl Shard {
             did_work = true;
             let start = match mark {
                 Some(start) => start,
-                None => self.now_ns(),
+                None => self.carried_now_ns(),
             };
             mark = Some(self.poll_slot(slot, start));
             self.apply();
         }
+        self.judge_deferred();
         // Running tasks, not occupied slots: a finished task that waits for a joiner holds its slot, and after
         // shutdown nobody joins it, so waiting on it would never end (found by `tcp::serve`'s handlers).
         let exit = self.exit_if_drained();
@@ -1024,6 +1078,8 @@ impl Shard {
         if self.core.exited {
             return;
         }
+        // A wait closes the window, so nothing left for a step's end may wait past it.
+        self.judge_deferred();
         if self.core.driver_lost {
             self.finish_hard_cancelled();
             if block_cleanup && !self.core.exited {
@@ -1113,6 +1169,7 @@ impl Shard {
                 self.poll_slot(slot, start);
             }
         }
+        self.judge_deferred();
         self.apply();
         self.exit_if_drained();
     }
@@ -1145,10 +1202,7 @@ impl Shard {
 
     /// Folds a park's measured wake into the online estimate (slates §4.3).
     fn note_wake(&mut self, entry: &Entry, woken: Woken, switches_before_wait: Option<u64>) {
-        let Some(mut estimate) = self.core.wake else {
-            return;
-        };
-        if !self.core.real_time {
+        if self.core.wake.is_none() || !self.core.real_time {
             return;
         }
         if woken.stale() {
@@ -1168,8 +1222,10 @@ impl Shard {
             self.core.counters.wake_unslept = self.core.counters.wake_unslept.saturating_add(1);
             return;
         }
+        let Some(estimate) = self.core.wake.as_mut() else {
+            return;
+        };
         estimate.record(latency);
-        self.core.wake = Some(estimate);
         let mean = estimate.mean_ns();
         self.core.counters.wake_samples = self.core.counters.wake_samples.saturating_add(1);
         self.core.counters.wake_cost_ns = mean;
@@ -1222,14 +1278,33 @@ impl Shard {
     }
 
     /// Attributes a poll against the step quantum: within it by the wall clock it is within; past it, the
-    /// attribution windows decide whose it was ([`crate::attribution`]).
-    fn attribute_poll(&mut self, poll_started_ns: u64, ended_ns: u64) -> Option<Attribution> {
+    /// attribution windows decide whose it was ([`crate::attribution`]), at once or, judging by step, at the
+    /// step's end ([`Shard::judge_deferred`]), for which it returns `None` now.
+    fn attribute_poll(
+        &mut self,
+        slot: u32,
+        generation: u32,
+        poll_started_ns: u64,
+        ended_ns: u64,
+    ) -> Option<Attribution> {
         let quantum = self.quantum_ns();
-        if ended_ns.saturating_sub(poll_started_ns) <= quantum {
+        let wall_ns = ended_ns.saturating_sub(poll_started_ns);
+        if wall_ns <= quantum {
             return None;
         }
         if !self.core.real_time {
             return Some(Attribution::Long);
+        }
+        if self.core.attribution.defers()
+            && self.core.deferred.len() < self.core.deferred.capacity()
+        {
+            self.core.deferred.push(Deferred {
+                slot,
+                generation,
+                overrun_ns: wall_ns.saturating_sub(quantum),
+            });
+            self.core.attribution.long_poll_deferred();
+            return None;
         }
         let end = attribution::thread_account();
         self.core.counters.thread_accounts = self.core.counters.thread_accounts.saturating_add(1);
@@ -1238,6 +1313,44 @@ impl Shard {
                 .attribution
                 .long_poll(poll_started_ns, ended_ns, end, quantum),
         )
+    }
+
+    /// The long polls left for the step's end, judged at one reading of the thread's account
+    /// ([`Tracker::close_step`], [`attribution::judge_in_window`]) and counted as the polls' own attribution
+    /// would have been; a task's own count only while its slot still holds it.
+    fn judge_deferred(&mut self) {
+        if self.core.deferred.is_empty() {
+            return;
+        }
+        let now = self.now_ns();
+        let end = attribution::thread_account();
+        self.core.counters.thread_accounts = self.core.counters.thread_accounts.saturating_add(1);
+        let off_cpu_ns = self.core.attribution.close_step(now, end);
+        let mut undecided = false;
+        for deferred in self.core.deferred.drain(..) {
+            let attributed = match (off_cpu_ns, end) {
+                (_, None) => Attribution::NoClock,
+                (None, Some(_)) => Attribution::NoWindow,
+                (Some(off_cpu_ns), Some(_)) => {
+                    attribution::judge_in_window(deferred.overrun_ns, off_cpu_ns)
+                }
+            };
+            undecided |= matches!(attributed, Attribution::NoWindow | Attribution::Ambiguous);
+            count_long_poll(&mut self.core.counters, attributed);
+            let still_held = self
+                .desk
+                .task(deferred.slot)
+                .is_some_and(|cell| cell.generation.get() == deferred.generation);
+            if attributed.is_tasks()
+                && still_held
+                && let Some(task) = slot_mut(&mut self.core.tasks, deferred.slot)
+            {
+                task.long_steps = task.long_steps.saturating_add(1);
+            }
+        }
+        if undecided {
+            self.core.attribution.undecided();
+        }
     }
 
     /// The driver's blocking wait until a kick, a completion or `deadline_ns`, its completions queued; true
@@ -1282,10 +1395,13 @@ impl Shard {
         self.cancel_all();
     }
 
+    /// Closes the control queue: what is queued is dropped with the desk entered, as a task's future is.
     fn close_control(&mut self) {
-        let control = self.core.control.take();
+        let Some(entry) = self.desk.entry else {
+            return;
+        };
         let entered = registry::enter(&self.desk);
-        drop(control);
+        entry.close_control();
         drop(entered);
     }
 
@@ -1313,12 +1429,7 @@ impl Shard {
         let batch = self.core.config.batch.max(1);
         let mut drained: usize = 0;
         while drained < batch {
-            let Some(message) = self
-                .core
-                .control
-                .as_ref()
-                .and_then(|control| control.try_recv().ok())
-            else {
+            let Some(message) = entry.take_control() else {
                 break;
             };
             drained = drained.saturating_add(1);
@@ -1488,9 +1599,11 @@ impl Shard {
         self.desk.current_task.set(Some(slot));
         self.desk.now_ns.set(start);
         let entered = registry::enter(&self.desk);
-        let poll = future.as_mut().poll(&mut cx);
+        // The poll is the task's code: inside an unwind boundary of the shard's own, so a task that
+        // panics ends there, typed, and costs the shard and its other tasks nothing (CLAUDE.md §1).
+        let poll = crate::unwind::contained(|| future.as_mut().poll(&mut cx));
         drop(entered);
-        let ended = self.now_ns();
+        let ended = self.carried_now_ns().max(start);
         self.desk.current_task.set(None);
         // A request served in this poll opens the idle window from where the poll ended, not where it began:
         // the spin covers the moments after the shard goes idle, however long the serving took.
@@ -1500,7 +1613,17 @@ impl Shard {
         // What the poll asked takes effect before its result is recorded: a parent that spawned children and
         // finished in one poll has them installed, linked and so cancelled with it.
         self.apply();
-        let attributed = self.attribute_poll(start, ended);
+        let attributed = self.attribute_poll(slot, generation, start, ended);
+        let Some(poll) = poll else {
+            // A future that unwound is in no state to poll again: it is dropped, and the task ends.
+            if let Some(task) = slot_mut(&mut self.core.tasks, slot) {
+                task.state = State::Finishing;
+            }
+            self.drop_entered(future);
+            self.finish(slot, Outcome::Unwound);
+            self.desk.note_unwound(TaskId(word));
+            return ended;
+        };
         self.after_poll(PollDone {
             slot,
             future,
@@ -1512,11 +1635,15 @@ impl Shard {
     }
 
     /// Drops a task's future with the desk entered: its destructors may wake or cancel other tasks of this
-    /// shard, or let their timers go.
-    fn drop_entered(&self, future: BoxedFuture) {
+    /// shard, or let their timers go. The drop is the task's code, inside an unwind boundary of the shard's
+    /// own; one that unwinds is counted.
+    fn drop_entered(&mut self, future: BoxedFuture) {
         let entered = registry::enter(&self.desk);
-        drop(future);
+        let dropped = crate::unwind::contained(move || drop(future));
         drop(entered);
+        if dropped.is_none() {
+            self.core.counters.unwound = self.core.counters.unwound.saturating_add(1);
+        }
     }
 
     /// Wakes the task `word` names: on this shard directly, elsewhere through the registry.
@@ -1586,6 +1713,9 @@ impl Shard {
             }
             Outcome::Cancelled => {
                 self.core.counters.cancelled = self.core.counters.cancelled.saturating_add(1);
+            }
+            Outcome::Unwound => {
+                self.core.counters.unwound = self.core.counters.unwound.saturating_add(1);
             }
         }
         let mut child = first_child;

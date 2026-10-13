@@ -22,7 +22,6 @@
 pub mod cluster;
 pub mod device;
 
-use std::collections::VecDeque;
 use std::task::Waker;
 
 use hyper_durable::{
@@ -30,6 +29,8 @@ use hyper_durable::{
 };
 use hyper_raft::StorageError;
 use hyper_raft::proto::{ConfChangeV2, ConfState, Entry, HardState};
+use hyper_sim::storage::Writes;
+use hyper_sim::{NodeId, SimError, World};
 
 /// A seeded generator: SplitMix64, so a schedule replays exactly from its seed.
 #[derive(Clone, Debug)]
@@ -117,7 +118,7 @@ impl Disk {
 
 /// A write as the store keeps it until it is durable.
 #[derive(Clone, Debug, Default)]
-struct Owned {
+pub struct Owned {
     start: Option<Point>,
     entries: Option<(u64, Vec<Entry>)>,
     hard: Option<HardState>,
@@ -146,18 +147,22 @@ pub struct Events {
     pub refused: u64,
 }
 
-/// A store whose writes are durable only when the schedule says ([`SimStore::make_durable`]),
-/// in the order submitted, and whose answers the replica takes later still. It reads as its
-/// answered writes left it, as hyper-log's handle does. A refusal is whole and refuses every
-/// write behind it, as hyper-log's `Behind` rule does.
-#[derive(Debug)]
+/// A device's writes as the store keeps them: each with the epoch it was submitted in, answered
+/// as the log answers it.
+pub type DeviceWrites = Writes<(u64, Owned), Result<(), Fault>>;
+
+/// A store whose writes are durable only when the schedule says, in the order submitted, and
+/// whose answers the replica takes later still: hyper-sim's typed write queue (`docs/sim.md`
+/// §3.5), completed by a test directly ([`SimStore::make_durable`]) or by the world's event
+/// ([`SimStore::fire`]). It reads as its answered writes left it, as hyper-log's handle does. A
+/// refusal is whole and refuses every write behind it, as hyper-log's `Behind` rule does.
+#[derive(Clone, Debug)]
 pub struct SimStore {
     /// What a crash keeps.
     pub disk: Disk,
     /// What the answered writes left: what the replica reads.
     answered: Disk,
-    pending: VecDeque<(u64, Owned)>,
-    done: VecDeque<(Owned, Result<(), Fault>)>,
+    writes: DeviceWrites,
     depth: usize,
     /// The next write made durable is refused or fails with this.
     pub refuse: Option<Fault>,
@@ -171,6 +176,9 @@ pub struct SimStore {
     refused_epoch: Option<u64>,
     /// The log holds no room for another write until the owner frees some.
     pub full: bool,
+    /// The highest mark the replica gave ([`LogStore::keep_after`]), for a test to hold against the
+    /// core's state: every entry is in `answered`, so the store keeps nothing apart for it.
+    pub kept_after: Option<u64>,
 }
 
 impl SimStore {
@@ -178,11 +186,16 @@ impl SimStore {
         Self::from_disk(Disk::default(), depth)
     }
     pub fn from_disk(disk: Disk, depth: usize) -> Self {
+        // The replica keeps one write past its depth out (`LogStore::room`).
+        Self::on_device(disk, depth, Writes::new(depth + 1))
+    }
+    /// A store opened on what a crash left of a device, `writes` the device's queue across the
+    /// crash: its completion pending in the world serves the store that reopens.
+    pub fn on_device(disk: Disk, depth: usize, writes: DeviceWrites) -> Self {
         Self {
             answered: disk.clone(),
             disk,
-            pending: VecDeque::new(),
-            done: VecDeque::new(),
+            writes,
             depth,
             refuse: None,
             events: Events::default(),
@@ -190,15 +203,16 @@ impl SimStore {
             epoch: 0,
             refused_epoch: None,
             full: false,
+            kept_after: None,
         }
     }
     /// Writes submitted and not yet durable.
     pub fn pending(&self) -> usize {
-        self.pending.len()
+        self.writes.out()
     }
     /// Writes durable whose answers were not taken.
     pub fn unanswered(&self) -> usize {
-        self.done.len()
+        self.writes.unanswered()
     }
     /// What the answered writes left: what the replica reads.
     pub fn answered(&self) -> &Disk {
@@ -206,50 +220,83 @@ impl SimStore {
     }
     /// Whether a write that moves the log's start is out: submitted, or durable and unanswered.
     pub fn start_out(&self) -> bool {
-        let pending = self.pending.iter().map(|(_, write)| write);
-        let done = self.done.iter().map(|(write, _)| write);
-        pending.chain(done).any(|write| write.start.is_some())
+        self.writes.iter().any(|(_, write)| write.start.is_some())
     }
     /// Makes the oldest pending write durable, or refuses it and every one behind it; false
     /// when none is pending.
     pub fn make_durable(&mut self) -> bool {
-        let Some((epoch, write)) = self.pending.pop_front() else {
-            return false;
+        self.complete(false)
+    }
+    /// The world took the device's completion ([`Writes::fire`]): as [`SimStore::make_durable`].
+    pub fn fire(&mut self) -> bool {
+        self.complete(true)
+    }
+    /// Gives the world the device's next completion, while a write is out and none is pending.
+    pub fn arm<E>(
+        &mut self,
+        world: &mut World<E>,
+        node: NodeId,
+        event: impl FnOnce() -> E,
+    ) -> Result<bool, SimError> {
+        self.writes.arm(world, node, event)
+    }
+    /// The device's queue, its process gone: what was out and unanswered is lost, and the
+    /// completion it has pending in the world stays with the device.
+    pub fn crash(&mut self) -> DeviceWrites {
+        let mut writes = std::mem::replace(&mut self.writes, Writes::new(self.depth + 1));
+        writes.crash();
+        writes
+    }
+    fn complete(&mut self, fired: bool) -> bool {
+        let Self {
+            writes,
+            disk,
+            refuse,
+            refused_epoch,
+            events,
+            ..
+        } = self;
+        let mut cascade = None;
+        let answer = |(epoch, write): &(u64, Owned)| {
+            match *refused_epoch {
+                Some(refused) if *epoch <= refused => return Err(Fault::Behind),
+                Some(_) => *refused_epoch = None,
+                None => {}
+            }
+            match refuse.take() {
+                Some(fault) => {
+                    events.refused += 1;
+                    let behind = fault.changed_nothing();
+                    if behind {
+                        *refused_epoch = Some(*epoch);
+                    }
+                    cascade = Some(behind);
+                    Err(fault)
+                }
+                None => {
+                    disk.apply(write).expect("a write the store cannot take");
+                    events.durables += 1;
+                    Ok(())
+                }
+            }
         };
-        match self.refused_epoch {
-            Some(refused) if epoch <= refused => {
-                self.done.push_back((write, Err(Fault::Behind)));
-                return true;
-            }
-            Some(_) => self.refused_epoch = None,
-            None => {}
-        }
-        match self.refuse.take() {
-            Some(fault) => {
-                self.events.refused += 1;
-                let behind = fault.changed_nothing();
+        let completed = if fired {
+            writes.fire(answer)
+        } else {
+            writes.complete(answer)
+        };
+        // A refusal refuses every write behind it: one behind a refusal for room is behind it,
+        // and one behind a failure is fenced with it.
+        if let Some(behind) = cascade {
+            writes.complete_all(|_| {
                 if behind {
-                    self.refused_epoch = Some(epoch);
+                    Err(Fault::Behind)
+                } else {
+                    Err(Fault::Failed("the log is fenced"))
                 }
-                self.done.push_back((write, Err(fault)));
-                while let Some((_, later)) = self.pending.pop_front() {
-                    let answer = if behind {
-                        Err(Fault::Behind)
-                    } else {
-                        Err(Fault::Failed("the log is fenced"))
-                    };
-                    self.done.push_back((later, answer));
-                }
-            }
-            None => {
-                self.disk
-                    .apply(&write)
-                    .expect("a write the store cannot take");
-                self.events.durables += 1;
-                self.done.push_back((write, Ok(())));
-            }
+            });
         }
-        true
+        completed
     }
 }
 
@@ -343,16 +390,18 @@ impl LogStore for SimStore {
         Ok(self.answered.released)
     }
     fn room(&self) -> bool {
-        !self.full && self.pending.len() + self.done.len() < self.depth + 1
+        !self.full && self.writes.held() < self.depth + 1
     }
     fn submit(&mut self, write: &Write<'_>, _waker: &Waker) -> Result<(), Fault> {
         assert!(self.room(), "a write submitted past the store's room");
         self.events.submits += 1;
-        self.pending.push_back((self.epoch, Owned::of(write)));
+        self.writes
+            .submit((self.epoch, Owned::of(write)))
+            .expect("the store's room is the device's bound");
         Ok(())
     }
     fn poll(&mut self) -> Option<Result<(), Fault>> {
-        let (write, answer) = self.done.pop_front()?;
+        let ((_, write), answer) = self.writes.take()?;
         if answer.as_ref().is_err_and(Fault::changed_nothing) {
             self.epoch += 1;
         }
@@ -367,6 +416,14 @@ impl LogStore for SimStore {
         self.disk.apply(&owned).map_err(Fault::Failed)?;
         self.answered.apply(&owned).map_err(Fault::Failed)?;
         Ok(())
+    }
+
+    fn keep_after(&mut self, index: u64) {
+        self.kept_after = Some(self.kept_after.map_or(index, |kept| kept.max(index)));
+    }
+
+    fn kept_bytes(&self) -> u64 {
+        0
     }
 }
 

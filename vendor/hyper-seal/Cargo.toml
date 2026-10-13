@@ -6,7 +6,7 @@ edition = "2024"
 license = "MIT"
 repository = "https://github.com/hyper-light/hyper-raft"
 publish = false
-rust-version = "1.98"
+rust-version = "1.98.1"
 
 [dependencies]
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }

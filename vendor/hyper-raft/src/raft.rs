@@ -2293,15 +2293,38 @@ impl<S: Storage> Raft<S> {
     /// The owner's detectors trust `member`'s node again. A follower that
     /// knows it for its leader no longer campaigns for it; a leader tells
     /// it who leads, so a member cut off while the group was idle catches
-    /// up.
+    /// up. What the leader sent it while it was suspected is taken for lost,
+    /// as a report that it was unreachable takes it ([`Raft::unreachable`]):
+    /// a member cut off while its group committed was sent a window of what
+    /// the cut lost, and would be asked where it is only once a beat passed
+    /// with that window unanswered, or, by a leader the owner has given no
+    /// timing yet, never.
     pub fn trust(&mut self, member: NodeId) -> Result<()> {
         if !self.watch_mut()?.trust(member) {
             return Ok(());
         }
         if self.state == StateRole::Leader && member != self.id {
+            self.unreachable(member);
             self.probe(member)?;
         }
         Ok(())
+    }
+    /// What was sent `member` ahead of its answers is likely lost: the
+    /// window is given up and the member probed again from what it is known
+    /// to hold, and a probe that was out is sent again (raft's
+    /// `MsgUnreachable`). A snapshot on its way waits for its report.
+    fn unreachable(&mut self, member: NodeId) {
+        let position = self.config.heartbeat_answers == HeartbeatAnswers::Position;
+        if let Some(progress) = self.tracker.get_mut(member) {
+            match progress.state {
+                ProgressState::Replicate => progress.become_probe(),
+                ProgressState::Probe if position => {
+                    progress.paused = false;
+                    progress.stalled = 0;
+                }
+                ProgressState::Probe | ProgressState::Snapshot => {}
+            }
+        }
     }
     /// What the owner's measurements give this group's elections
     /// ([`Timing`]). A member that has none draws no delay and beats on no
@@ -3043,20 +3066,7 @@ impl<S: Storage> Raft<S> {
                 Ok(())
             }
             MessageType::MsgUnreachable => {
-                // What was sent ahead is likely lost; a probe that was, is
-                // sent again.
-                if let Some(progress) = self.tracker.get_mut(message.from) {
-                    match progress.state {
-                        ProgressState::Replicate => progress.become_probe(),
-                        ProgressState::Probe
-                            if self.config.heartbeat_answers == HeartbeatAnswers::Position =>
-                        {
-                            progress.paused = false;
-                            progress.stalled = 0;
-                        }
-                        ProgressState::Probe | ProgressState::Snapshot => {}
-                    }
-                }
+                self.unreachable(message.from);
                 Ok(())
             }
             MessageType::MsgTransferLeader => self.handle_transfer_leader(&message),
@@ -3647,10 +3657,46 @@ impl<S: Storage> Raft<S> {
             return self.send_request_snapshot();
         }
         let mut answer = proto::message(message.from, MessageType::MsgAppendResponse);
-        if message.index < self.log.committed() {
-            answer.index = self.log.committed();
-            answer.commit = self.log.committed();
-            return self.send(answer);
+        let committed = self.log.committed();
+        if message.index < committed {
+            // The entries an append behind the commit carries at or below it
+            // are committed: the leader's log holds every committed entry
+            // (Leader Completeness, Raft §5.4). Where the one it carries at
+            // the commit is the one held there, what it carries after are
+            // entries this log may lack, taken after the committed one (§5.3:
+            // a receiver appends any new entries not already in its log).
+            // Answered with the commit and dropped whole, an append that a
+            // path held back past its leader's patience lost its new entries
+            // with it, and every append the leader had sent behind it was
+            // refused for the hole (focal's fleet: one append of 33 entries
+            // held 700 ms, 27 refused behind it). One that adds nothing past
+            // the commit, or that names another entry there, is answered with
+            // the commit as before.
+            let held = self.log.term(committed)?;
+            let past = committed
+                .checked_sub(message.index)
+                .and_then(|skip| skip.checked_sub(1))
+                .and_then(|at| usize::try_from(at).ok())
+                .filter(|at| {
+                    message
+                        .entries
+                        .get(*at)
+                        .is_some_and(|entry| entry.index == committed && entry.term == held)
+                        && at
+                            .checked_add(1)
+                            .is_some_and(|next| next < message.entries.len())
+                });
+            let Some(at) = past else {
+                answer.index = committed;
+                answer.commit = committed;
+                return self.send(answer);
+            };
+            let after = at
+                .checked_add(1)
+                .ok_or(Error::Invariant("an entry past the commit"))?;
+            message.entries = message.entries.split_off(after);
+            message.index = committed;
+            message.log_term = held;
         }
         // A leader on another core bounds its messages by their bytes
         // alone. What is more than this member may hold is left for the

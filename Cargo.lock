@@ -322,6 +322,7 @@ dependencies = [
  "crc32c",
  "getrandom 0.4.3",
  "hyper-rt",
+ "hyper-sim",
  "libc",
  "rustix",
  "thiserror",
@@ -382,6 +383,7 @@ version = "0.1.0"
 dependencies = [
  "crc32c",
  "libc",
+ "pin-project-lite",
  "rustix",
  "windows-sys",
 ]
@@ -396,6 +398,10 @@ dependencies = [
  "thiserror",
  "windows-sys",
 ]
+
+[[package]]
+name = "hyper-sim"
+version = "0.1.0"
 
 [[package]]
 name = "hyper-timing"
@@ -599,6 +605,12 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
+name = "pin-project-lite"
+version = "0.2.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pkg-config"

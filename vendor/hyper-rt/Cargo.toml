@@ -3,7 +3,7 @@ name = "hyper-rt"
 description = "The shared thread-per-core runtime: shards with arena tasks and Copy wakers, a hierarchical timing wheel, readiness drivers per OS behind one seam, sockets, signals, stdio, synchronization without shared ownership, and a deterministic simulation driver (docs/runtime.md)"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.98.1"
 license = "MIT"
 repository = "https://github.com/hyper-light/hyper-raft"
 publish = false
@@ -11,6 +11,8 @@ publish = false
 [dependencies]
 # The calibration record's checksum (docs/runtime.md §10.2), the workspace's CRC-32C.
 crc32c = "0.6"
+# The combinators and `within` are named futures that hold what they are given in place (docs/runtime.md §3.8).
+pin-project-lite = "0.2.17"
 
 [target.'cfg(unix)'.dependencies]
 # sysctl, mach and the per-thread CPU clocks that rustix does not cover (the OS-interface files of

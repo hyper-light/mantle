@@ -16,6 +16,7 @@ use std::sync::mpsc::{SyncSender, sync_channel};
 use std::task::Poll;
 use std::thread;
 
+use hyper_rt::RtError;
 use hyper_rt::control::Control;
 use hyper_rt::futures;
 use hyper_rt::registry;
@@ -90,35 +91,29 @@ fn caught_foreign_poll_panic_does_not_strand_a_retained_peer_service() {
     rt.run_until_idle();
     assert_eq!(pending.try_recv(), Ok("service pending"));
     let ordinary = Returned(returned, "panicked root");
-    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        rt.block_on::<()>(async move {
+    thread::scope(|scope| {
+        // The root's poll unwinds inside the shard's boundary: its task ends `Outcome::Unwound`, and the
+        // call cancels and joins what it leaves running, as a call whose root returned does, before it is
+        // refused, typed. The peer service, cancelled, reaches its closing stage holding its resource and
+        // is released from here, so the call's join can end; were the unwind to drop it, its closing
+        // fact would never come and its resource would come back unreleased.
+        let releasing = scope.spawn(move || {
+            closing.recv().unwrap();
+            release.blocking_send(42).unwrap();
+        });
+        let out = rt.block_on::<()>(async move {
             let _ordinary = ordinary;
             panic!("deliberate public foreign-future poll unwind");
-        })
-    }));
-    assert!(panic.is_err());
-    assert_eq!(heard.try_recv(), Ok("panicked root"));
-    assert!(
-        heard.try_recv().is_err(),
-        "the peer service still owns its resource"
-    );
-    thread::scope(|scope| {
-        let complete = scope.spawn(move || {
-            closing.recv().unwrap();
-            assert!(
-                heard.try_recv().is_err(),
-                "unwind dropped a live peer service"
-            );
-            release.blocking_send(42).unwrap();
-            let returned = heard.recv().unwrap();
-            assert!(heard.try_recv().is_err());
-            returned
         });
-        // The retained LocalRuntime is dropped after the catch, so thread::panicking
-        // is false. The real interrupted-poll marker must close the missing root slot.
-        drop(rt);
-        assert_eq!(complete.join().unwrap(), "service");
+        assert!(matches!(out, Err(RtError::RootUnwound { .. })), "{out:?}");
+        releasing.join().unwrap();
     });
+    // The root's resource came back first, as its future was dropped, then the service's, after its
+    // release.
+    assert_eq!(heard.try_recv(), Ok("panicked root"));
+    assert_eq!(heard.try_recv(), Ok("service"));
+    assert!(heard.try_recv().is_err());
+    drop(rt);
 }
 
 #[test]

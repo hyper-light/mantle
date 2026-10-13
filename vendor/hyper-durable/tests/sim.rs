@@ -1,13 +1,16 @@
-//! The shell under deterministic simulation (`docs/durable.md` §12): groups driven by seeded
-//! schedules of detectors' words, deliveries, losses, drives, writes made durable at the
-//! schedule's choice,
-//! refusals for room, failed writes, proposals, entries acted on at start, changes of
-//! configuration, reads, compactions and crashes, with readies ahead of their persistence up to
-//! the store's depth; every output held to the oracle of `support::cluster` against the
-//! sender's durable state, and every group settling once whole.
+//! The shell under deterministic simulation (`docs/durable.md` §12), in hyper-sim's world
+//! (`docs/sim.md` S-6): groups driven by schedules drawn from the world's streams — detectors'
+//! words, the world's events (a message arriving, or a member's device completing its oldest
+//! write, as its strategy picks), drives, refusals for room, failed writes, proposals, entries acted
+//! on at start, changes of configuration, reads, compactions and crashes — with readies ahead of
+//! their persistence up to the store's depth, messages lost as the schedule draws; every output held
+//! to hyper-check's oracles against the sender's durable state, and every group settling once
+//! whole. A schedule runs the same twice from its seed and once from its trace.
 //!
-//! Then the durability windows, enumerated: a schedule's events are counted, and the schedule
-//! is run again once for each, crashing the member whose event it was right after it.
+//! Then the durability windows, enumerated by fork (`hyper_check::strategy::fork`, `docs/sim.md`
+//! §3.7): a schedule runs once, and after each step that did something its world is copied, the
+//! member whose event it was crashed in the copy, and the copy run through the rest of the schedule
+//! and settled; the copy is dropped before the schedule goes on.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -22,46 +25,25 @@
 
 mod support;
 
-use support::Seeded;
-use support::cluster::{Cluster, Op, Reached, Shape};
+use hyper_check::strategy::fork::each_point;
+use hyper_sim::Source;
+use support::cluster::{Cluster, Op, Reached, Shape, runs_the_same};
 
-/// One schedule of `steps` from `seed`; `crash` crashes the member of the `crash`-th step that
-/// did something, right after it. The group, and how many steps did something.
-fn schedule(shape: Shape, seed: u64, steps: u64, crash: Option<u64>) -> (Cluster, u64) {
-    let mut group = Cluster::new(shape, seed);
-    let mut rng = Seeded(seed);
-    let mut events = 0u64;
+/// The liveness phase's rounds: a group that has not settled in them is reported, not waited on.
+const ROUNDS: usize = 4_000;
+
+/// `steps` of the schedule from `seed`, then the liveness phase.
+fn schedule(shape: Shape, seed: u64, steps: u64) -> Cluster {
+    let mut group = Cluster::scheduled(shape, Source::Seed(seed), steps, ROUNDS as u64);
     for _ in 0..steps {
-        let op = group.choose(&mut rng, true);
-        if group.act(op) {
-            if crash == Some(events) {
-                let member = match op {
-                    Op::Suspect(id, _)
-                    | Op::Trust(id, _)
-                    | Op::Drive(id)
-                    | Op::Durable(id)
-                    | Op::Propose(id)
-                    | Op::Fence(id)
-                    | Op::Change(id, ..)
-                    | Op::Read(id)
-                    | Op::Compact(id)
-                    | Op::Crash(id)
-                    | Op::Refuse(id)
-                    | Op::Fail(id)
-                    | Op::Resume(id) => id,
-                    Op::Deliver(_) | Op::Lose(_) => 1,
-                };
-                group.crash(member);
-            }
-            events += 1;
-        }
+        group.step();
     }
     assert!(
-        group.settles(4_000),
-        "seed {seed}, crash {crash:?}: the group did not settle: {:?}",
-        group.reached
+        group.settles(ROUNDS),
+        "seed {seed}: the group did not settle: {:?}",
+        group.reached()
     );
-    (group, events)
+    group
 }
 
 const SHAPES: [(&str, Shape); 5] = [
@@ -130,18 +112,8 @@ fn random_schedules_keep_every_invariant_and_settle() {
     for (name, shape) in SHAPES {
         let mut reached = Reached::default();
         for seed in first..first + seeds {
-            let (group, _) = schedule(shape, seed, steps, None);
-            let r = group.reached;
-            reached.committed += r.committed;
-            reached.crashes += r.crashes;
-            reached.refused += r.refused;
-            reached.stalls += r.stalls;
-            reached.fenced += r.fenced;
-            reached.behind_fence += r.behind_fence;
-            reached.deep += r.deep;
-            reached.changes += r.changes;
-            reached.compactions += r.compactions;
-            reached.ahead += r.ahead;
+            let group = schedule(shape, seed, steps);
+            reached.add(&group.reached());
             reached.acted += group.acted();
         }
         println!("{name}: {seeds} schedules of {steps} steps: {reached:?}");
@@ -161,10 +133,33 @@ fn random_schedules_keep_every_invariant_and_settle() {
         if shape.depth > 1 {
             assert!(reached.deep > 0, "{name}: {reached:?}");
         }
+        // A leader applying ahead was seen ahead of its disk: what the shape is for.
+        if shape.ahead {
+            assert!(reached.ahead > 0, "{name}: {reached:?}");
+        }
+        // The network's bound loses fewer than the schedule does, or it, not the schedule, decides
+        // what is lost (`docs/sim.md` §7).
+        assert!(
+            reached.lost > 0 && reached.overflowed < reached.lost,
+            "{name}: {reached:?}"
+        );
     }
 }
 
-/// A crash right after every step of a schedule that did something, in turn.
+/// Each shape's first schedule twice from its seed and once from its trace: the same decisions and
+/// the same observations, so a failing seed replays (`docs/sim.md` §3.9).
+#[test]
+fn a_schedule_runs_the_same_twice_and_from_its_trace() {
+    let steps = support::count("HYPER_DURABLE_STEPS", 5_000);
+    for (name, shape) in SHAPES {
+        let record =
+            runs_the_same(shape, 0, steps, ROUNDS).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(record.steps > 0 && !record.trace.is_empty(), "{name}");
+    }
+}
+
+/// A crash right after every step of a schedule that did something, each in a fork of the
+/// schedule's world at that step.
 #[test]
 fn a_crash_after_every_durability_event_loses_nothing_durable() {
     let seeds = support::count("HYPER_DURABLE_CRASH_SEEDS", 4);
@@ -172,11 +167,34 @@ fn a_crash_after_every_durability_event_loses_nothing_durable() {
     let mut crashes = 0u64;
     for (name, shape) in [SHAPES[0], SHAPES[2]] {
         for seed in 0..seeds {
-            let (_, events) = schedule(shape, seed, steps, None);
-            for at in 0..events {
-                schedule(shape, seed, steps, Some(at));
-                crashes += 1;
-            }
+            let mut trunk = Cluster::scheduled(shape, Source::Seed(seed), steps, ROUNDS as u64);
+            let mut taken = 0u64;
+            let forked = each_point(
+                &mut trunk,
+                steps,
+                |group| {
+                    taken += 1;
+                    let (did, member) = group.step();
+                    Some(did.then_some((member, taken)))
+                },
+                |mut branch, (member, at)| {
+                    branch.crash(member);
+                    for _ in at..steps {
+                        branch.step();
+                    }
+                    assert!(
+                        branch.settles(ROUNDS),
+                        "{name}, seed {seed}, crash after step {at}: the group did not settle: {:?}",
+                        branch.reached()
+                    );
+                },
+            );
+            assert!(
+                trunk.settles(ROUNDS),
+                "{name}, seed {seed}: the group did not settle"
+            );
+            let events = forked.branches.len() as u64;
+            crashes += events;
             println!("{name}, seed {seed}: crashed after each of {events} events");
         }
     }
@@ -220,26 +238,23 @@ fn a_member_whose_last_writes_were_lost_at_rest_is_repaired_by_entries() {
         if group.replica(member).unwrap().mark().is_none() {
             break;
         }
-        group.now += 1_000_000;
         for &id in &ids {
             group.act(Op::Drive(id));
             while group.act(Op::Durable(id)) {}
             group.act(Op::Drive(id));
         }
-        for message in group
-            .net
-            .iter()
-            .filter(|m| m.to == member && m.from == leader)
-        {
-            match message.msg_type {
-                MessageType::MsgSnapshot => snapshots += 1,
-                MessageType::MsgAppend => resent.extend(message.entries.iter().map(|e| e.index)),
-                _ => {}
+        group.deliver_all(|message| {
+            if message.to == member && message.from == leader {
+                match message.msg_type {
+                    MessageType::MsgSnapshot => snapshots += 1,
+                    MessageType::MsgAppend => {
+                        resent.extend(message.entries.iter().map(|e| e.index));
+                    }
+                    _ => {}
+                }
             }
-        }
-        while !group.net.is_empty() {
-            group.act(Op::Deliver(0));
-        }
+            true
+        });
     }
     assert_eq!(
         group.replica(member).unwrap().mark(),

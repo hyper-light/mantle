@@ -71,8 +71,7 @@ fn registrations_wakes_and_unregistrations_interleave_without_a_fault() {
         .map(|_| {
             std::thread::spawn(move || {
                 for _ in 0..CYCLES {
-                    let (registration, receiver) =
-                        register(4, 2, RegisterKick::Kick(Kick::none())).unwrap();
+                    let registration = register(4, 2, RegisterKick::Kick(Kick::none())).unwrap();
                     let id = registration.shard();
                     let held = holder_of(id).unwrap();
                     // A foreign wake to our own slot lands in its bitmap at once, drained by the "shard" (this
@@ -84,7 +83,6 @@ fn registrations_wakes_and_unregistrations_interleave_without_a_fault() {
                     let neighbour =
                         id.wrapping_add(1) % u16::try_from(MAX_SHARDS).unwrap_or(u16::MAX);
                     wake(Encoded::pack(neighbour, OWN_SLOT, 0).unwrap());
-                    let _ = receiver.try_recv();
                     drop(registration);
                     // The slot was given back: its generation moved past the even value this thread held
                     // (another test in this binary, or another thread here, may already hold it again, so

@@ -28,7 +28,7 @@ jobs:
         with:
           fetch-depth: 2
       - name: Install pinned Rust
-        run: rustup toolchain install 1.98.0 --profile minimal
+        run: rustup toolchain install 1.98.1 --profile minimal
       - name: Build both arms' benches
         run: |
           mkdir -p ab/bin

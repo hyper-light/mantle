@@ -2790,6 +2790,50 @@ impl<F: BlockFile> Store<F> {
         Some(i)
     }
 
+    /// The cache slot holding page `address` for a scan's cursor to read in place, as the paced
+    /// path reads a cached leaf (`RunCursor::land_async`), so the page is not copied into the
+    /// cursor: none when `span` holds, reads or has prepared the page, when it is a compaction's
+    /// span (its pages pass through it ahead of the merge), or when the cache does not hold the
+    /// page. A seek's page is a demand read, counted and promoted; a page a scan runs on to is
+    /// only looked at, as [`Self::read_page_ahead_ref`] treats them, so a long scan promotes
+    /// nothing it passes.
+    pub(crate) fn cache_slot_ahead(&mut self, span: &Span, address: u64) -> Option<usize> {
+        if span.floor != 1
+            || span.holds(address)
+            || span.pending_for(address).is_some()
+            || span
+                .prepared
+                .as_ref()
+                .is_some_and(|(ready, _)| *ready == address)
+        {
+            return None;
+        }
+        let c = self.cache.as_mut()?;
+        // A miss is counted where the page is then read, never here.
+        let slot = if span.runs_on(address) {
+            c.slot_peek(address)?
+        } else {
+            if !c.contains(address) {
+                return None;
+            }
+            c.lookup(address)?
+        };
+        self.io.span_cache_hits = self.io.span_cache_hits.saturating_add(1);
+        Some(slot)
+    }
+
+    /// What a page read and a page write took on average since the store opened, the costs a
+    /// scan's rent is charged at, without the rest of [`Self::io_stats`].
+    pub fn page_costs(&self) -> (u64, u64) {
+        (
+            self.io.read_ns.checked_div(self.io.pages_read).unwrap_or(0),
+            self.io
+                .write_ns
+                .checked_div(self.io.pages_written)
+                .unwrap_or(0),
+        )
+    }
+
     /// The payload in cache slot `slot` if it still holds page `address`.
     pub(crate) fn cache_page(&self, slot: usize, address: u64) -> Option<&[u8]> {
         self.cache.as_ref()?.page_at(slot, address)

@@ -384,6 +384,12 @@ impl Cache {
         }
     }
 
+    /// The slot holding `address`, for a reader that reads it in place ([`Self::page_at`]),
+    /// without counting or promoting the look: a scan's look at a page it runs on to.
+    pub fn slot_peek(&self, address: u64) -> Option<usize> {
+        self.slot_of(address).filter(|&i| self.payload(i).is_some())
+    }
+
     /// Whether the page can be read from memory, without counting or promoting the look.
     pub fn contains(&self, address: u64) -> bool {
         self.slot_of(address)

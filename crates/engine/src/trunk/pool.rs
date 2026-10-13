@@ -60,6 +60,19 @@ pub enum Work {
     Compact(Task),
     Sort(SortPack),
     Grow(Growth),
+    Index(Box<IndexJob>),
+}
+
+/// The index over the memtables a shard keeps for gets (`crate::kept`, research/51 §7), out on a
+/// worker to take the key lists of the memtables kept since it last covered one, oldest first,
+/// after dropping, with `sweep`, the entries of memtables older than `oldest`, given back. It
+/// comes back whole with its lists, which the other index takes next.
+#[derive(Debug, Default)]
+pub struct IndexJob {
+    pub index: crate::kept::KeptIndex,
+    pub lists: Vec<(u32, crate::kept::KeyList)>,
+    pub oldest: u32,
+    pub sweep: bool,
 }
 
 /// A full memtable packed by a worker that sorts it (research/40 §4): the copy of its arena it
@@ -72,12 +85,18 @@ pub struct SortPack {
     pub skip: usize,
     pub arena: Vec<u8>,
     pub sorter: Sorter,
+    /// Each kept key's filter hash and arena offset, written as the branch is built, for the
+    /// index over the memtables the shard keeps for gets (`crate::kept`, research/51 §7).
+    pub keys: crate::kept::KeyList,
 }
 
 impl SortPack {
     /// The bytes its buffers hold, at their capacities.
     pub fn memory(&self) -> usize {
-        self.arena.capacity().saturating_add(self.sorter.memory())
+        self.arena
+            .capacity()
+            .saturating_add(self.sorter.memory())
+            .saturating_add(self.keys.bytes())
     }
 }
 
@@ -126,6 +145,7 @@ pub enum Owner {
     Trunk,
     Pack,
     Grow,
+    Index,
 }
 
 /// A job handed to a worker: the worker, and the job's number among every job the pool has
@@ -153,6 +173,8 @@ pub struct Back {
     pub topped: Vec<u64>,
     /// A sorted packing's buffers, back for the next.
     pub sorted: Option<SortPack>,
+    /// An index job's index and lists, back.
+    pub indexed: Option<Box<IndexJob>>,
 }
 
 /// What a worker tells the shard: its grant is spent and it waits for `n` more extents, or its
@@ -173,7 +195,8 @@ pub(crate) enum Message {
         result: Result<Output, Error>,
         physical_error: Option<Error>,
         kept: Option<Box<Kept>>,
-        sorted: Option<SortPack>,
+        sorted: Option<Box<SortPack>>,
+        indexed: Option<Box<IndexJob>>,
     },
     /// Terminal native attachment result, after the owner's last Done was consumed.
     Retired {
@@ -241,6 +264,7 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
                     physical_error: None,
                     kept: None,
                     sorted: None,
+                    indexed: None,
                 }
             };
             drop(back.blocking_send(message));
@@ -295,10 +319,11 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
                 kept: None,
             })
         });
-        // A sorted packing's buffers go back with its result.
-        let sorted = match job.work {
-            Work::Sort(pack) => Some(pack),
-            _ => None,
+        // A sorted packing's buffers, and an index job's index, go back with its result.
+        let (sorted, indexed) = match job.work {
+            Work::Sort(pack) => (Some(Box::new(pack)), None),
+            Work::Index(index) => (None, Some(index)),
+            _ => (None, None),
         };
         let done = Message::Done {
             worker: id,
@@ -306,6 +331,7 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
             physical_error,
             kept,
             sorted,
+            indexed,
         };
         if unwound {
             // Close admission before Done: its owner can immediately try this same seat.
@@ -395,6 +421,7 @@ fn run<F: BlockFile>(store: &mut Store<F>, job: &mut Job) -> Result<(Parts, u64)
                 skip,
                 arena,
                 sorter,
+                keys,
             } = pack;
             let kept = sorter.sort(arena, *skip)?;
             // The memtable counted each key once as it took it: the sort keeps as many.
@@ -405,11 +432,39 @@ fn run<F: BlockFile>(store: &mut Store<F>, job: &mut Job) -> Result<(Parts, u64)
                 });
             }
             let mut b = Builder::new(store, Keys::Exactly(*entries))?;
-            sorter.each(arena, |k, op, v, h| b.add_hashed(store, k, op, v, h))?;
+            // The walk's keys, each its newest entry, with their offsets in the copy, the
+            // arena's own: the index over kept memtables is built from them.
+            keys.clear();
+            keys.hashes
+                .try_reserve(usize::try_from(*entries).unwrap_or(usize::MAX))
+                .map_err(|_| Error::LimitExceeded {
+                    what: "a memtable's key list",
+                    limit: *entries,
+                })?;
+            keys.offsets
+                .try_reserve(usize::try_from(*entries).unwrap_or(usize::MAX))
+                .map_err(|_| Error::LimitExceeded {
+                    what: "a memtable's key list",
+                    limit: *entries,
+                })?;
+            sorter.each_at(arena, |k, op, v, h, at| {
+                keys.push(crate::branch::filter::hash(k), at);
+                b.add_hashed(store, k, op, v, h)
+            })?;
             vec![(Vec::new(), b.finish(store)?)]
         }
         Work::Grow(g) => {
             store.grow_segment(g.start, g.extents, g.add)?;
+            Vec::new()
+        }
+        Work::Index(job) => {
+            let IndexJob {
+                index,
+                lists,
+                oldest,
+                sweep,
+            } = job.as_mut();
+            index.extend(lists, *oldest, *sweep);
             Vec::new()
         }
     };
@@ -1020,9 +1075,10 @@ impl Pool {
                 return Ok(Some(back));
             }
             if !self.next(store, wait && self.out_for(owner))? {
-                // Compactions own their inputs. Packing can still need its owner to feed it,
-                // so its caller marks a result wait only once the feed is closed.
-                if owner == Owner::Trunk && self.out_for(owner) {
+                // Compactions and index jobs own their inputs: their owner waits for the result,
+                // the range's task on the pool's channel rather than polling. Packing's caller
+                // marks its own wait.
+                if matches!(owner, Owner::Trunk | Owner::Index) && self.out_for(owner) {
                     self.waiting = true;
                 }
                 return Ok(None);
@@ -1130,6 +1186,7 @@ impl Pool {
                 physical_error,
                 kept,
                 sorted,
+                indexed,
             } => {
                 // A canceled request can consume Done before closing starts. Physical
                 // failures and worker unwinds stay terminal even after that Back is taken.
@@ -1157,7 +1214,8 @@ impl Pool {
                         kept,
                         physical_error,
                         topped,
-                        sorted,
+                        sorted: sorted.map(|pack| *pack),
+                        indexed,
                     },
                 ));
             }

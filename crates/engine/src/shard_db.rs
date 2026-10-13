@@ -94,9 +94,21 @@ pub struct FlushStats {
     pub kept: u64,
     pub kept_bytes: u64,
     pub kept_hits: u64,
+    /// Of the kept memtables, those the index a get probes covers (research/51 §7).
+    pub kept_covered: u64,
     /// Puts whose trunk share waited for its input reads: the last memtable before a rotation
     /// would stall ([`ShardDb::put`]'s pacing).
     pub waited_steps: u64,
+}
+
+/// A memtable kept readable for gets: the memtable, its number among the kept ones (`crate::kept`
+/// numbers them by a counter that wraps), and the entries its key list held, which giving it
+/// back leaves in the indexes until a sweep.
+#[derive(Debug)]
+struct KeptMem {
+    mem: HashMem,
+    number: u32,
+    keys: u64,
 }
 
 /// A memtable read in key order from a seek, its next entry held in buffers it reuses: one
@@ -279,8 +291,9 @@ pub struct ShardDb<F: BlockFile> {
     /// active, so the first version a get finds newest first is the newest, and a key none of
     /// them holds is read from the trunk. They hold memory the budget leaves idle and give it
     /// back oldest first ([`Self::fit_kept`]), as F2's hot log evicts at its head.
-    kept: std::collections::VecDeque<HashMem>,
-    /// The bytes the kept memtables hold ([`HashMem::memory`]).
+    kept: std::collections::VecDeque<KeptMem>,
+    /// The bytes the kept memtables and the key lists home hold ([`HashMem::memory`],
+    /// `KeyList::bytes`).
     kept_bytes: usize,
     /// Gets a kept memtable answered.
     kept_hits: u64,
@@ -290,11 +303,29 @@ pub struct ShardDb<F: BlockFile> {
     /// The most a get grows the caches by, a page cache chunk and a record cache page, taken at
     /// the last full look ([`Self::fit_kept`]): room kept memtables leave them.
     kept_step: usize,
-    /// What the page cache and the record cache held at the last look: more since, and the kept
-    /// memtables look again ([`Self::kept_crowded`]).
+    /// What the budget's regions held at the last look, and the kept memtables with their lists
+    /// and indexes: more since, and they look again ([`Self::kept_crowded`]).
     kept_seen: usize,
+    kept_seen_held: usize,
     /// The entry buffers the last kept memtable shed, for the next memtable a fill starts new.
     kept_shed: Option<crate::memtable::hashed::Bufs>,
+    /// The key lists of kept memtables not yet taken by both indexes, oldest first.
+    kept_lists: std::collections::VecDeque<(u32, crate::kept::KeyList)>,
+    /// The index over kept memtables a get probes (research/51 §7), and the other, home while
+    /// not out on a worker taking the memtables kept since it last went (`kept_out`); the two
+    /// take turns, so a get never waits for an index and the shard never lends the one it reads.
+    kept_index: Option<crate::kept::KeptIndex>,
+    kept_spare: Option<crate::kept::KeptIndex>,
+    kept_out: bool,
+    /// The bytes the index out on a worker held when it went.
+    kept_out_bytes: usize,
+    /// The next kept memtable's number.
+    kept_next: u32,
+    /// Entries of the key lists of every memtable given back: an index swept when this much has
+    /// gone stale since its last sweep is more than half of what it holds.
+    kept_gone: u64,
+    /// Key list buffers no index needs, for the next packings and lists.
+    kept_free: Vec<crate::kept::KeyList>,
     /// Sorted packings back from their workers, their buffers for the next memtables' mirrors
     /// and sorts: no more than were ever out at once with the active memtable's, and at most a
     /// worker's packing each beside it ([`Self::keep_sort_pack`]).
@@ -633,7 +664,16 @@ impl<F: BlockFile> ShardDb<F> {
             kept_refused: 0,
             kept_step: 0,
             kept_seen: 0,
+            kept_seen_held: 0,
             kept_shed: None,
+            kept_lists: std::collections::VecDeque::new(),
+            kept_index: None,
+            kept_spare: None,
+            kept_out: false,
+            kept_out_bytes: 0,
+            kept_next: 0,
+            kept_gone: 0,
+            kept_free: Vec::new(),
             sort_spares: Vec::new(),
             order_paced: false,
             scans_at_rotation: 0,
@@ -1603,6 +1643,11 @@ impl<F: BlockFile> ShardDb<F> {
                     }
                 }
             }
+            // A stopping shard keeps no memtable for gets: an index out on a worker comes back
+            // with the pool's close and is dropped with it.
+            self.give_back_kept();
+            self.kept_out = false;
+            self.kept_out_bytes = 0;
         }
     }
 
@@ -1958,7 +2003,8 @@ impl<F: BlockFile> ShardDb<F> {
         }
         // Then the kept memtables, packed but readable, newest first.
         if found.is_none() && !self.kept.is_empty() {
-            found = Self::kept_get(&self.kept, key, hash, value)?;
+            self.tend_kept()?;
+            found = self.kept_get(key, hash, value)?;
             if found.is_some() {
                 self.kept_hits = self.kept_hits.saturating_add(1);
             }
@@ -1989,6 +2035,10 @@ impl<F: BlockFile> ShardDb<F> {
                 }
             }
         }
+        // The get may have grown the caches: the kept memtables give way before it returns.
+        if self.kept_crowded() {
+            self.fit_kept(false);
+        }
         Ok(found == Some(Op::Put))
     }
 
@@ -2018,7 +2068,8 @@ impl<F: BlockFile> ShardDb<F> {
         }
         // Then the kept memtables, packed but readable, newest first.
         if found.is_none() && !self.kept.is_empty() {
-            found = Self::kept_get(&self.kept, key, hash, value)?;
+            self.tend_kept()?;
+            found = self.kept_get(key, hash, value)?;
             if found.is_some() {
                 self.kept_hits = self.kept_hits.saturating_add(1);
             }
@@ -2052,6 +2103,10 @@ impl<F: BlockFile> ShardDb<F> {
                 }
             }
         }
+        // The get may have grown the caches: the kept memtables give way before it returns.
+        if self.kept_crowded() {
+            self.fit_kept(false);
+        }
         Ok(found == Some(Op::Put))
     }
 
@@ -2064,6 +2119,23 @@ impl<F: BlockFile> ShardDb<F> {
     /// (`Trunk::segments`); a deletion hides the key. A row costs no allocation once `out`,
     /// `next` and the shard's own scan buffer have grown.
     pub fn scan(
+        &mut self,
+        from: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+        out: &mut Rows,
+        next: &mut Vec<u8>,
+    ) -> Result<bool, Error> {
+        let more = self.scan_inner(from, end, limit, out, next);
+        // A scan may have read pages into the cache: the kept memtables give way before it
+        // returns.
+        if self.kept_crowded() {
+            self.fit_kept(false);
+        }
+        more
+    }
+
+    fn scan_inner(
         &mut self,
         from: &[u8],
         end: Option<&[u8]>,
@@ -2302,6 +2374,23 @@ impl<F: BlockFile> ShardDb<F> {
     /// A runtime scan owns its complete page while source borrows yield for demand reads.
     /// The merge guard returns every cursor and its buffers on completion, error or cancel.
     pub(crate) async fn scan_async(
+        &mut self,
+        from: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+        out: &mut Rows,
+        next: &mut Vec<u8>,
+    ) -> Result<bool, Error> {
+        let more = self.scan_async_inner(from, end, limit, out, next).await;
+        // A scan may have read pages into the cache: the kept memtables give way before it
+        // returns.
+        if self.kept_crowded() {
+            self.fit_kept(false);
+        }
+        more
+    }
+
+    async fn scan_async_inner(
         &mut self,
         from: &[u8],
         end: Option<&[u8]>,
@@ -2746,10 +2835,22 @@ impl<F: BlockFile> ShardDb<F> {
                 self.trunk.step(&mut self.store, 1)?;
             }
         }
-        // A trunk step may have kept a compaction's pages in the cache: the kept memtables give
-        // way at once.
+        self.tend_kept()?;
+        // A trunk step may have kept a compaction's pages in the cache, and an index come home
+        // larger: the kept memtables give way at once.
         if self.kept_crowded() {
             self.fit_kept(false);
+        }
+        Ok(())
+    }
+
+    /// The index over kept memtables, tended between operations: taken back if its worker is
+    /// done, sent out if it lacks a list and a worker is free; a flag's look when neither.
+    fn tend_kept(&mut self) -> Result<(), Error> {
+        if self.kept_out {
+            self.take_kept()?;
+        } else if !self.kept_lists.is_empty() {
+            self.extend_kept();
         }
         Ok(())
     }
@@ -2901,6 +3002,7 @@ impl<F: BlockFile> ShardDb<F> {
     /// A worker failure is reported after its physical drain; the memtable remains readable.
     /// No shard-owned Builder repeats the failed job, and nothing younger retires past it.
     fn retire(&mut self, mut f: Frozen) -> Result<(), Error> {
+        let mut keys = None;
         let retired = (|| {
             if let Some(error) = f.error.clone() {
                 return Err(error);
@@ -2908,8 +3010,9 @@ impl<F: BlockFile> ShardDb<F> {
             let back = f.back.as_mut().ok_or(Error::InvalidArgument {
                 what: "a frozen input with no worker result",
             })?;
-            if let Some(pack) = back.sorted.take() {
+            if let Some(mut pack) = back.sorted.take() {
                 f.sorting = 0;
+                keys = Some(std::mem::take(&mut pack.keys));
                 self.keep_sort_pack(pack);
             }
             let failed = back
@@ -2989,23 +3092,243 @@ impl<F: BlockFile> ShardDb<F> {
         .unwrap_or(u64::MAX);
         self.flush_stats.fed = self.flush_stats.fed.saturating_add(1);
         let t = self.timed.then(std::time::Instant::now);
-        self.keep(mem);
+        self.keep(mem, keys);
         let ns = ns_since(t);
         self.flush_stats.retire_ns = self.flush_stats.retire_ns.saturating_add(ns);
         self.flush_stats.flushes = self.flush_stats.flushes.saturating_add(1);
         Ok(())
     }
 
-    /// A packed memtable, its branch in the trunk: kept readable for gets, newest last, the
-    /// oldest given back while they hold more than [`Self::fit_kept`] allows. It is read through
-    /// its index alone, so its entry buffers go to the next memtable a fill starts new.
-    fn keep(&mut self, mut mem: HashMem) {
-        if self.memory.is_some() {
-            self.kept_shed = Some(mem.shed());
+    /// A packed memtable, its branch in the trunk, with its key list when a worker packed it:
+    /// kept readable for gets, newest last, the oldest given back while they hold more than
+    /// [`Self::fit_kept`] allows, and its keys sent to the indexes over kept memtables. It is read
+    /// through its index alone, so its entry buffers go to the next memtable a fill starts new.
+    /// Without a memory budget, or without workers to build the indexes, none is kept, and none
+    /// older stays: a get's probes would grow with the memtables kept (research/51 §7).
+    fn keep(&mut self, mut mem: HashMem, keys: Option<crate::kept::KeyList>) {
+        if self.memory.is_none() || !self.trunk.has_pool() {
+            self.give_back_kept();
+            if let Some(list) = keys {
+                self.free_list(list);
+            }
+            self.recycle(mem);
+            return;
         }
-        self.kept_bytes = self.kept_bytes.saturating_add(mem.memory());
-        self.kept.push_back(mem);
+        let list = match keys {
+            Some(list) => list,
+            None => {
+                // Packed on the shard: its list made here, from its index.
+                let mut list = self.kept_free.pop().unwrap_or_default();
+                if mem.key_list(&mut list).is_err() {
+                    // An entry it cannot read is not kept: nor is any older.
+                    self.give_back_kept();
+                    self.free_list(list);
+                    self.recycle(mem);
+                    return;
+                }
+                list
+            }
+        };
+        self.kept_shed = Some(mem.shed());
+        let number = self.kept_next;
+        self.kept_next = number.wrapping_add(1);
+        self.kept_bytes = self
+            .kept_bytes
+            .saturating_add(mem.memory())
+            .saturating_add(list.bytes());
+        let keys = u64::try_from(list.len()).unwrap_or(u64::MAX);
+        self.kept.push_back(KeptMem { mem, number, keys });
+        self.kept_lists.push_back((number, list));
         self.fit_kept(true);
+        self.extend_kept();
+    }
+
+    /// Gives every kept memtable back, and the indexes over them.
+    fn give_back_kept(&mut self) {
+        while let Some(k) = self.kept.pop_front() {
+            self.kept_gone = self.kept_gone.saturating_add(k.keys);
+            self.recycle(k.mem);
+        }
+        self.kept_bytes = 0;
+        while let Some((_, list)) = self.kept_lists.pop_front() {
+            self.free_list(list);
+        }
+        self.kept_index = None;
+        self.kept_spare = None;
+    }
+
+    /// A key list no index needs: kept for the next packing's or list's, at most one a worker
+    /// and the shard's own.
+    fn free_list(&mut self, mut list: crate::kept::KeyList) {
+        let most = self
+            .trunk
+            .pool_workers()
+            .map_or(0, |(held, _)| held)
+            .saturating_add(1);
+        if self.kept_free.len() < most && list.bytes() > 0 {
+            list.clear();
+            self.kept_free.push(list);
+        }
+    }
+
+    /// Sends the index that is home out to a free worker to take the key lists it lacks, oldest
+    /// first: the spare, or a new one while there are fewer than two. One is out at a time.
+    fn extend_kept(&mut self) {
+        if self.kept_out || self.kept_lists.is_empty() || self.kept.is_empty() {
+            return;
+        }
+        let newest = self.kept_lists.back().map(|(n, _)| *n);
+        let lacks = |i: &crate::kept::KeptIndex| {
+            newest.is_some_and(|n| i.covers().is_none_or(|c| crate::kept::older(c, n)))
+        };
+        // The spare when it lacks a list; with fewer than two indexes, a new one, which takes
+        // every list home (none is freed before both indexes have it).
+        let index = match self.kept_spare.take() {
+            Some(spare) if lacks(&spare) => spare,
+            Some(spare) => {
+                self.kept_spare = Some(spare);
+                return;
+            }
+            None => crate::kept::KeptIndex::new(),
+        };
+        // Within the pool's bound, as a packing is: the index is owed maintenance a get waits
+        // on, not work the measured need for compactions sizes.
+        let Some(pool) = self.trunk.pool_mut().filter(|pool| pool.can_take(true)) else {
+            self.kept_spare = Some(index);
+            return;
+        };
+        let oldest = self.kept.front().map_or(self.kept_next, |k| k.number);
+        // Swept when the entries given back since its last sweep are more than half it holds.
+        let stale = self.kept_gone.saturating_sub(index.swept_at());
+        let sweep = stale.saturating_mul(2) > u64::try_from(index.len()).unwrap_or(u64::MAX);
+        let bytes = index.bytes();
+        let mut job = Box::new(crate::trunk::pool::IndexJob {
+            index,
+            lists: self.kept_lists.drain(..).collect(),
+            oldest,
+            sweep,
+        });
+        if sweep {
+            job.index.set_swept_at(self.kept_gone);
+        }
+        let lists_bytes = job
+            .lists
+            .iter()
+            .map(|(_, l)| l.bytes())
+            .fold(0, usize::saturating_add);
+        let job = Box::new(Job {
+            work: Work::Index(job),
+            grant: Vec::new(),
+            file_end: self.store.end(),
+            generation: self.store.generation(),
+            keep: None,
+        });
+        match pool.send(job, Owner::Index, true) {
+            Ok(Ok(_)) => {
+                self.kept_out = true;
+                self.kept_out_bytes = bytes.saturating_add(lists_bytes);
+                self.kept_bytes = self.kept_bytes.saturating_sub(lists_bytes);
+            }
+            Ok(Err(job)) | Err((_, job)) => {
+                // Not taken: everything back where it was.
+                if let Work::Index(job) = job.work {
+                    let crate::trunk::pool::IndexJob { index, lists, .. } = *job;
+                    self.kept_lists = lists.into();
+                    self.kept_spare = Some(index);
+                }
+            }
+        }
+    }
+
+    /// Takes the index back from its worker, if it is back: it serves gets when it covers newer
+    /// memtables than the one serving, which becomes the spare; lists both have taken are freed,
+    /// and the spare goes out again when lists remain that it lacks.
+    fn take_kept(&mut self) -> Result<(), Error> {
+        self.take_kept_waiting(false)
+    }
+
+    /// [`Self::take_kept`], waiting for the index when `wait` (where the shard may wait).
+    fn take_kept_waiting(&mut self, wait: bool) -> Result<(), Error> {
+        if !self.kept_out {
+            return Ok(());
+        }
+        let Some(pool) = self.trunk.pool_mut() else {
+            return Ok(());
+        };
+        let Some(back) = pool.take(&mut self.store, Owner::Index, wait)? else {
+            return Ok(());
+        };
+        self.kept_out = false;
+        self.kept_out_bytes = 0;
+        back.result?;
+        let Some(job) = back.indexed else {
+            return Err(Error::InvalidArgument {
+                what: "an index job's result with no index",
+            });
+        };
+        let crate::trunk::pool::IndexJob { index, lists, .. } = *job;
+        // The lists out with the index come before those kept since.
+        let mut all: std::collections::VecDeque<_> = lists.into();
+        all.extend(self.kept_lists.drain(..));
+        let returned = all
+            .iter()
+            .map(|(_, l)| l.bytes())
+            .fold(0, usize::saturating_add);
+        self.kept_bytes = self.kept_bytes.saturating_add(returned);
+        self.kept_lists = all;
+        if self.kept.is_empty() {
+            // Every memtable it covers was given back while it was out.
+            self.give_back_kept();
+            return Ok(());
+        }
+        let newer =
+            |a: &crate::kept::KeptIndex, b: &crate::kept::KeptIndex| match (a.covers(), b.covers())
+            {
+                (Some(x), Some(y)) => crate::kept::older(y, x),
+                (Some(_), None) => true,
+                _ => false,
+            };
+        match self.kept_index.take() {
+            Some(serving) if newer(&index, &serving) => {
+                self.kept_index = Some(index);
+                self.kept_spare = Some(serving);
+            }
+            Some(serving) => {
+                self.kept_index = Some(serving);
+                self.kept_spare = Some(index);
+            }
+            None => self.kept_index = Some(index),
+        }
+        self.prune_lists();
+        self.extend_kept();
+        Ok(())
+    }
+
+    /// Frees the key lists both indexes have taken, and those of memtables given back.
+    fn prune_lists(&mut self) {
+        let oldest = self.kept.front().map(|k| k.number);
+        let both = match (
+            self.kept_index
+                .as_ref()
+                .and_then(crate::kept::KeptIndex::covers),
+            self.kept_spare
+                .as_ref()
+                .and_then(crate::kept::KeptIndex::covers),
+        ) {
+            (Some(a), Some(b)) => Some(if crate::kept::older(a, b) { a } else { b }),
+            _ => None,
+        };
+        while let Some(&(n, _)) = self.kept_lists.front() {
+            let taken = both.is_some_and(|b| !crate::kept::older(b, n));
+            let gone = oldest.is_none_or(|o| crate::kept::older(n, o));
+            if !(taken || gone) {
+                break;
+            }
+            if let Some((_, list)) = self.kept_lists.pop_front() {
+                self.kept_bytes = self.kept_bytes.saturating_sub(list.bytes());
+                self.free_list(list);
+            }
+        }
     }
 
     /// Gives kept memtables back, oldest first: while they hold more than the budget's idle
@@ -3027,36 +3350,61 @@ impl<F: BlockFile> ShardDb<F> {
         let mut short = refused > self.kept_refused;
         self.kept_refused = refused;
         let limit = self.kept_limit();
+        let mut gave = false;
         while !self.kept.is_empty() {
-            let over = self.kept_bytes > limit;
+            let over = self.kept_held() > limit;
             let machine_short = machine && self.spare.is_none() && !self.machine_spares();
             if !(over || short || machine_short) {
                 break;
             }
             short = false;
-            if let Some(mem) = self.kept.pop_front() {
-                self.kept_bytes = self.kept_bytes.saturating_sub(mem.memory());
-                self.recycle(mem);
+            if let Some(k) = self.kept.pop_front() {
+                self.kept_bytes = self.kept_bytes.saturating_sub(k.mem.memory());
+                self.kept_gone = self.kept_gone.saturating_add(k.keys);
+                self.recycle(k.mem);
+                gave = true;
             }
         }
-        self.kept_seen = self.caches_held();
+        if self.kept.is_empty() && !self.kept_out {
+            self.give_back_kept();
+        } else if gave {
+            self.prune_lists();
+        }
+        self.kept_seen = self.regions_held();
+        self.kept_seen_held = self.kept_held();
     }
 
-    /// What the page cache and the record cache hold: the regions a put's trunk step or a get
-    /// grows between rotations.
-    fn caches_held(&self) -> usize {
-        self.store.cache_bytes().saturating_add(
-            self.records
-                .as_ref()
-                .map_or(0, crate::records::RecordCache::held_bytes),
-        )
+    /// What kept memtables, their key lists and their indexes hold, the index out on a worker
+    /// counted as it went.
+    fn kept_held(&self) -> usize {
+        self.kept_bytes
+            .saturating_add(
+                self.kept_index
+                    .as_ref()
+                    .map_or(0, crate::kept::KeptIndex::bytes),
+            )
+            .saturating_add(
+                self.kept_spare
+                    .as_ref()
+                    .map_or(0, crate::kept::KeptIndex::bytes),
+            )
+            .saturating_add(self.kept_out_bytes)
     }
 
-    /// Whether memtables are kept and, since their last look, a cache took memory or the page
-    /// cache was refused the machine's: a few loads, made each put and get.
+    /// What the budget's regions hold together ([`Self::memory_held`]): a put's trunk step, a
+    /// get and a tuning step grow them between rotations.
+    fn regions_held(&self) -> usize {
+        let (cache, write, records) = self.memory_held();
+        cache.saturating_add(write).saturating_add(records)
+    }
+
+    /// Whether memtables are kept and, since their last look, a region or the kept memtables'
+    /// indexes and lists took memory, or the page cache was refused the machine's: a few loads,
+    /// made after each put, get and scan.
     fn kept_crowded(&self) -> bool {
         !self.kept.is_empty()
-            && (self.caches_held() > self.kept_seen
+            && (self.regions_held() > self.kept_seen
+                || self.kept_held() > self.kept_seen_held
                 || self.store.cache_refused() > self.kept_refused)
     }
 
@@ -3095,25 +3443,39 @@ impl<F: BlockFile> ShardDb<F> {
         }
     }
 
-    /// The newest entry of `key` among the kept memtables: each one's first index group read
-    /// first, their misses overlapped, then each probed newest first.
-    fn kept_get(
-        kept: &std::collections::VecDeque<HashMem>,
-        key: &[u8],
-        hash: u64,
-        value: &mut Vec<u8>,
-    ) -> Result<Option<Op>, Error> {
-        let mut touched = 0u64;
-        for m in kept {
-            touched ^= m.touch(hash);
+    /// The newest entry of `key` among the kept memtables: those the index a get probes does not
+    /// cover, newest first, each through its own index, then the index, whose entry is checked:
+    /// its memtable still kept, its key the one asked. Every probe's first group is read before
+    /// any is probed, their misses overlapped.
+    fn kept_get(&self, key: &[u8], hash: u64, value: &mut Vec<u8>) -> Result<Option<Op>, Error> {
+        let index = self.kept_index.as_ref();
+        let covered = index.and_then(crate::kept::KeptIndex::covers);
+        let uncovered = |k: &&KeptMem| covered.is_none_or(|c| crate::kept::older(c, k.number));
+        let mut touched = index.map_or(0, |i| i.touch(hash));
+        for k in self.kept.iter().rev().take_while(uncovered) {
+            touched ^= k.mem.touch(hash);
         }
         std::hint::black_box(touched);
-        for m in kept.iter().rev() {
-            if let Some(op) = m.get_hashed(key, hash, value)? {
+        for k in self.kept.iter().rev().take_while(uncovered) {
+            if let Some(op) = k.mem.get_hashed(key, hash, value)? {
                 return Ok(Some(op));
             }
         }
-        Ok(None)
+        let (Some(index), Some(oldest)) = (index, self.kept.front()) else {
+            return Ok(None);
+        };
+        let Some((number, offset)) = index.get(hash) else {
+            return Ok(None);
+        };
+        if crate::kept::older(number, oldest.number) {
+            // Its memtable was given back: the trunk holds the record.
+            return Ok(None);
+        }
+        let at = usize::try_from(number.wrapping_sub(oldest.number)).unwrap_or(usize::MAX);
+        match self.kept.get(at) {
+            Some(k) if k.number == number => k.mem.get_at(offset, key, value),
+            _ => Ok(None),
+        }
     }
 
     /// The frozen memtables a rotation may leave in flight: the packings whose lifetimes reach
@@ -3243,6 +3605,8 @@ impl<F: BlockFile> ShardDb<F> {
             || self.tidy_paid()
             || self.store.forget_debt() > 0
             || self.store.cache_unreserved() > 0
+            || self.kept_out
+            || !self.kept_lists.is_empty()
     }
 
     /// Pays up to `keys` work units of maintenance owed, for the shard's idle time (SILK: the
@@ -3318,6 +3682,16 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     fn idle_step_with(&mut self, keys: u64, paced: bool) -> Result<u64, Error> {
+        let done = self.idle_step_inner(keys, paced)?;
+        // Idle work may have kept a compaction's pages or a page read: the kept memtables give
+        // way before the step returns.
+        if self.kept_crowded() {
+            self.fit_kept(false);
+        }
+        Ok(done)
+    }
+
+    fn idle_step_inner(&mut self, keys: u64, paced: bool) -> Result<u64, Error> {
         // A file kept as segments grows first: the room every allocation after needs.
         if (self.growth.is_some() || self.growth_due()) && self.grow(!paced)? {
             return Ok(1);
@@ -3346,6 +3720,23 @@ impl<F: BlockFile> ShardDb<F> {
                 self.note_trunk(ns_since(t));
             }
             return Ok(used.max(1));
+        }
+        if self.kept_out || !self.kept_lists.is_empty() {
+            // The index over kept memtables: back from its worker, waited for where the shard may
+            // wait, or sent out with the lists it lacks. With no worker free, the work below
+            // goes on, its results freeing one.
+            if self.kept_out {
+                let out = self.kept_out;
+                self.take_kept_waiting(!paced)?;
+                if out != self.kept_out {
+                    return Ok(1);
+                }
+            } else {
+                self.extend_kept();
+                if self.kept_out {
+                    return Ok(1);
+                }
+            }
         }
         if self.trunk.consolidation_owed() {
             // Seeks paid for consolidating leaves: one consolidation, in bulk, flushes and settles
@@ -3473,7 +3864,7 @@ impl<F: BlockFile> ShardDb<F> {
         self.flush_stats.pack_finish_ns = self.flush_stats.pack_finish_ns.saturating_add(ns);
         self.trunk.add(branch);
         let t = self.timed.then(std::time::Instant::now);
-        self.keep(mem);
+        self.keep(mem, None);
         let ns = ns_since(t);
         self.flush_stats.retire_ns = self.flush_stats.retire_ns.saturating_add(ns);
         self.pack_carry = 0;
@@ -3935,8 +4326,18 @@ impl<F: BlockFile> ShardDb<F> {
             flush.record_bytes = as_u64(r.bytes());
         }
         flush.kept = as_u64(self.kept.len());
-        flush.kept_bytes = as_u64(self.kept_bytes);
+        flush.kept_bytes = as_u64(self.kept_held());
         flush.kept_hits = self.kept_hits;
+        let covered = self
+            .kept_index
+            .as_ref()
+            .and_then(crate::kept::KeptIndex::covers);
+        flush.kept_covered = as_u64(
+            self.kept
+                .iter()
+                .filter(|k| covered.is_some_and(|c| !crate::kept::older(c, k.number)))
+                .count(),
+        );
         let mut trunk = self.trunk.stats();
         trunk.scans = self.scans;
         trunk.scan_segments = self.scan_segments;

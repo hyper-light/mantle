@@ -75,6 +75,7 @@ fn packing(store: &mut Store<DeviceFile>, number: u8, corrupt: bool) -> Box<Job>
             skip: mem.skip(),
             arena,
             sorter: Sorter::default(),
+            keys: Default::default(),
         }),
         grant: store
             .grant(usize::try_from(CONFIG.extent_pages).unwrap())

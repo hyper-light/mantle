@@ -169,6 +169,18 @@ impl KeyIndex {
         first(&self.table) ^ self.old.as_ref().map_or(0, first)
     }
 
+    /// Each key's newest entry, in no order: every entry the index holds, in either table while a
+    /// migration runs.
+    pub fn each_entry(&self, mut each: impl FnMut(u32)) {
+        for t in std::iter::once(&self.table).chain(self.old.as_ref()) {
+            for (i, &e) in t.slots.iter().enumerate() {
+                if t.is_full(i) {
+                    each(e);
+                }
+            }
+        }
+    }
+
     /// Empties the index, keeping its table: refilled to the size it last held, it neither grows
     /// nor migrates again.
     pub fn clear(&mut self) {

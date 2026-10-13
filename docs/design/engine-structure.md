@@ -267,9 +267,17 @@ when it binds, and is measured then.
    measured, and S3-FIFO governs the cache (row 14). It never holds a value the tree does not
    also have durably by checkpoint or Raft log.
    - **Kept memtables** (research/51), built: a packed memtable whose branch is in the trunk
-     stays readable through its own index, newest last, and a get probes them after the frozen
-     memtables, newest first, each one's first index group read before any is probed so their
-     misses overlap. Every memtable packed after a kept one is kept, frozen, packing or active,
+     stays readable, newest last, and one index over them answers a get in one probe: each
+     key's newest entry among the kept memtables, by its 64-bit filter hash, as (memtable,
+     offset) (`kept::KeptIndex`). The packing worker emits each memtable's (hash, offset) pairs
+     from the walk it builds the branch with (the shard makes them from the memtable's own index
+     for one it packed itself); a worker adds them to an index the shard hands it, the newer
+     memtable's entry replacing an older one's, and hands it back. Two indexes take turns, one
+     serving gets while the other is out taking the memtables kept since, so the shard never
+     lends the one it reads and a get never waits for one. A get probes, after the frozen
+     memtables, the few kept memtables the serving index does not yet cover, through their own
+     indexes, then the index, whose entry is checked: its memtable still kept, its key the one
+     asked. Every memtable packed after a kept one is kept, frozen, packing or active,
      so the first version found is the newest, and a key none holds is read from the tree. They
      hold the memory budget's idle memory: the budget less what the page cache, write memory
      and the record cache hold and the most a get grows the caches by (a cache chunk and a
@@ -279,7 +287,9 @@ when it binds, and is measured then.
      when the page cache is refused the machine's memory, and before a rotation would take a new
      memtable while the machine has not twice its bytes free (the cache's rule). A fresh
      memtable's index is sized for the entries the one before it held, so it neither grows nor
-     migrates as it fills. Without a memory budget none is kept; reopened, none is.
+     migrates as it fills. Without a memory budget, or without workers to build the index (a get's
+     probes would grow with the memtables kept), none is kept; reopened, none is. An index drops
+     the entries of memtables given back when they are more than half of what it holds.
 3. **The tree.** Root to leaf; at each node each branch's filter is asked before its leaf is
    read. With the filters and branch interiors in memory, a cold get costs about one device read
    (research/34 §1).

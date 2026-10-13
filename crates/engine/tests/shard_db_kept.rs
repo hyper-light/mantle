@@ -1,11 +1,13 @@
-//! Packed memtables kept readable for gets (research/51). With a memory budget, a memtable whose
-//! branch is in the trunk stays readable from its own index, newest last, in the memory the
-//! budget leaves idle. Against a `BTreeMap`, every key reads exactly what was written throughout:
-//! puts, deletions and overwrites across many memtables, the kept memtables answering gets with
-//! the newest version, a deletion in a newer one hiding an older one's value. A smaller budget
-//! has them give their memory back; without a budget none is kept; reopened, the engine keeps
-//! none and reads the trunk. With maintenance workers and without, so memtables packed on
-//! workers and on the shard are both kept.
+//! Packed memtables kept readable for gets (research/51). With a memory budget and maintenance
+//! workers, a memtable whose branch is in the trunk stays readable, newest last, in the memory
+//! the budget leaves idle, and one index over them, built on the workers, answers a get in one
+//! probe. Against a `BTreeMap`, every key reads exactly what was written throughout: puts,
+//! deletions and overwrites across many memtables, the kept memtables answering gets with the
+//! newest version, a deletion in a newer one hiding an older one's value, before and after the
+//! index covers them. Once maintenance is done the index covers every kept memtable. A smaller
+//! budget has them give their memory back, the index's entries for them then missing; without a
+//! budget or without workers none is kept; reopened, the engine keeps none and reads the
+//! trunk.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -38,6 +40,9 @@ const TRUNK: TrunkConfig = TrunkConfig {
     leaf_entries: 128,
 };
 const KEYS: u64 = 2000;
+/// Keys the random fill never writes: written in the first memtables alone, so an index that
+/// took two of those memtables' lists in the wrong order would answer the older value.
+const STICKY: std::ops::Range<u64> = KEYS..KEYS + 64;
 /// Room for every memtable the tests fill, kept, beside the page cache and write memory.
 const BUDGET: usize = 256 << 20;
 
@@ -76,7 +81,7 @@ type Oracle = BTreeMap<u64, Option<Vec<u8>>>;
 
 fn check_all(db: &mut ShardDb<DeviceFile>, oracle: &Oracle) {
     let mut value = Vec::new();
-    for k in 0..KEYS {
+    for k in (0..KEYS).chain(STICKY) {
         let found = db.get(&key(k), &mut value).unwrap();
         match oracle.get(&k) {
             Some(Some(v)) => {
@@ -112,19 +117,43 @@ fn fill(db: &mut ShardDb<DeviceFile>, oracle: &mut Oracle, mut x: u64, rotations
     x
 }
 
-fn run(with_workers: bool) {
+/// Maintenance to its end: every index job back.
+fn settle(db: &mut ShardDb<DeviceFile>) {
+    while db.owed() {
+        db.idle_step(64).unwrap();
+    }
+}
+
+#[test]
+fn kept_memtables_answer_gets_through_one_index_and_every_read_is_exact() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("store");
     let mut db = ShardDb::create(open(&path, true), STORE, MEM, TRUNK).unwrap();
     db.set_memory(BUDGET).unwrap();
-    if with_workers {
-        workers(&mut db, &path);
-    }
+    workers(&mut db, &path);
     let mut oracle = Oracle::new();
-    let mut x = fill(&mut db, &mut oracle, 0x9e37_79b9_7f4a_7c15, 24);
+    // The sticky keys, written in the first memtable and again in the second, never after.
+    let mut x = 0x9e37_79b9_7f4a_7c15;
+    for round in 0..2u8 {
+        for k in STICKY {
+            let v = vec![b's', round, (k % 251) as u8];
+            db.put(&key(k), &v).unwrap();
+            oracle.insert(k, Some(v));
+        }
+        x = fill(&mut db, &mut oracle, x, 1);
+    }
+    // Read while memtables are kept and their index is still out: exact.
+    x = fill(&mut db, &mut oracle, x, 12);
+    check_all(&mut db, &oracle);
+    x = fill(&mut db, &mut oracle, x, 12);
     db.flush().unwrap();
+    settle(&mut db);
     let kept = db.stats().0;
-    assert!(kept.kept >= 1, "no memtable kept: {kept:?}");
+    assert!(kept.kept >= 12, "too few memtables kept: {kept:?}");
+    assert_eq!(
+        kept.kept_covered, kept.kept,
+        "the index does not cover every kept memtable: {kept:?}"
+    );
     check_all(&mut db, &oracle);
     let read = db.stats().0;
     assert!(
@@ -148,6 +177,8 @@ fn run(with_workers: bool) {
     x = fill(&mut db, &mut oracle, x, 2);
     db.flush().unwrap();
     check_all(&mut db, &oracle);
+    settle(&mut db);
+    check_all(&mut db, &oracle);
 
     // The least budget the engine takes: the kept memtables give their memory back, and every
     // key still reads exactly, now from the trunk.
@@ -165,6 +196,8 @@ fn run(with_workers: bool) {
     check_all(&mut db, &oracle);
     let _ = fill(&mut db, &mut oracle, x, 3);
     check_all(&mut db, &oracle);
+    settle(&mut db);
+    check_all(&mut db, &oracle);
 
     // Reopened: nothing kept, every key read from the trunk.
     db.flush().unwrap();
@@ -179,14 +212,64 @@ fn run(with_workers: bool) {
     db.check_references().unwrap();
 }
 
+/// Under a budget of a few hundred pages, with workers, the kept memtables, their key lists and
+/// their indexes hold only what the page cache, write memory and the record cache leave: after
+/// every operation the regions and the kept memtables together hold no more than the budget,
+/// while no region is still giving memory back; memtables are kept, and every read is exact.
 #[test]
-fn memtables_packed_on_workers_are_kept_and_every_read_is_exact() {
-    run(true);
+fn kept_memtables_hold_only_the_budget_s_idle_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let mut db = ShardDb::create(open(&path, true), STORE, MEM, TRUNK).unwrap();
+    let budget = 512 * STORE.page_size;
+    db.set_memory(budget).unwrap();
+    workers(&mut db, &path);
+    let mut oracle = Oracle::new();
+    let mut value = Vec::new();
+    let mut kept_most = 0u64;
+    let mut x = 0x5851_f42d_4c95_7f2du64;
+    for step in 0..30_000u64 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let k = x % KEYS;
+        if step % 3 == 0 {
+            let v = format!("v{step}").into_bytes();
+            db.put(&key(k), &v).unwrap();
+            oracle.insert(k, Some(v));
+        } else {
+            let found = db.get(&key(k), &mut value).unwrap();
+            match oracle.get(&k) {
+                Some(Some(v)) => assert!(found && &value == v, "key {k} at step {step}"),
+                _ => assert!(!found, "key {k} at step {step}"),
+            }
+        }
+        let (cache, write, records) = db.memory_held();
+        let kept = db.stats().0.kept_bytes;
+        kept_most = kept_most.max(db.stats().0.kept);
+        assert!(
+            db.trimming() || cache + write + records + usize::try_from(kept).unwrap() <= budget,
+            "step {step}: kept {kept} beside cache {cache} write {write} records {records}"
+        );
+    }
+    assert!(kept_most > 0, "no memtable was kept");
+    settle(&mut db);
+    check_all(&mut db, &oracle);
 }
 
+/// Without maintenance workers no index over kept memtables can be built, and a get's probes
+/// would grow with them: none is kept.
 #[test]
-fn memtables_packed_on_the_shard_are_kept_and_every_read_is_exact() {
-    run(false);
+fn without_workers_no_memtable_is_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let mut db = ShardDb::create(open(&path, true), STORE, MEM, TRUNK).unwrap();
+    db.set_memory(BUDGET).unwrap();
+    let mut oracle = Oracle::new();
+    let _ = fill(&mut db, &mut oracle, 0x2545_f491_4f6c_dd1d, 12);
+    db.flush().unwrap();
+    assert_eq!(db.stats().0.kept, 0);
+    check_all(&mut db, &oracle);
 }
 
 /// Without a memory budget there is no idle memory to keep a memtable in: none is kept.

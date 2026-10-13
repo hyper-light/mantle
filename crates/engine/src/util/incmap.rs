@@ -232,6 +232,12 @@ impl IncMap {
             .saturating_add(self.old.as_ref().map_or(0, |o| o.full))
     }
 
+    /// Buckets in its table, the old one's while a migration runs not counted: a sweep of that
+    /// many looks at every entry once.
+    pub fn buckets(&self) -> usize {
+        self.table.buckets()
+    }
+
     /// The bytes its tables take, the old one's while a migration runs included.
     pub fn bytes(&self) -> usize {
         let of = |t: &Table| t.buckets().saturating_mul(17);
@@ -247,6 +253,20 @@ impl IncMap {
         self.table
             .get(key)
             .or_else(|| self.old.as_ref().and_then(|o| o.get(key)))
+    }
+
+    /// Reads `key`'s first group in each table, its control word and its first bucket, so a
+    /// lookup made after finds them cached: several maps' misses overlapped rather than one after
+    /// another (the shard's kept memtables' index, research/51 §7).
+    #[inline]
+    pub fn touch(&self, key: u64) -> u64 {
+        let first = |t: &Table| {
+            let (_, g) = t.hash(key);
+            let w = t.ctrl.get(g).copied().unwrap_or(0);
+            let e = t.slots.get(g.wrapping_mul(GROUP)).map_or(0, |e| e[1]);
+            w ^ e
+        };
+        first(&self.table) ^ self.old.as_ref().map_or(0, first)
     }
 
     pub fn contains_key(&self, key: u64) -> bool {

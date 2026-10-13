@@ -147,5 +147,17 @@ offset), the newest memtable's entry replacing an older one's, and the table goe
 get probes the few kept memtables the table does not yet cover, then the table, one group's miss
 and the record's. Two tables take turns: one serves while the other is out being extended with the
 memtables kept since, so the shard never lends what it reads and each entry is inserted twice. An
-entry whose memtable was given back is a miss (the trunk holds its record); the table drops such
-entries when it next grows or holds more of them than of live ones.
+entry whose memtable was given back is a miss (the trunk holds its record); a table is swept of
+such entries when they are more than half of what it holds.
+
+Built (`kept::KeptIndex`, an `IncMap` of 16-byte slots, a key's hash beside its (memtable, offset);
+`ShardDb::keep`, `extend_kept`, `take_kept`, `kept_get`):
+- The packing worker hashes each key it walks again (xxh3, a few nanoseconds a key on the worker)
+  rather than widen the sort's 16-byte entries for the low 32 bits.
+- A memtable the shard packed itself (no worker free when its place was needed) has its list made
+  from its own index's slots, which name each key's newest entry.
+- Without workers none is kept: no index could be built, and a get's probes would grow.
+- A key list stays home until both indexes have taken it; a trip carries every list home, and an
+  index passes over those it covers.
+- Two keys of one 64-bit hash share an entry, the newer memtable's; a get of the other finds a
+  key that is not its own and reads the trunk.

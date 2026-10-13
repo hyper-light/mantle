@@ -336,6 +336,19 @@ impl Sorter {
         Ok(self.keyed.len())
     }
 
+    /// [`Self::each`] with each entry's arena offset: `each(key, op, value, hash, offset)`.
+    pub fn each_at(
+        &self,
+        arena: &[u8],
+        mut each: impl FnMut(&[u8], Op, &[u8], u32, u32) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        for k in &self.keyed {
+            let (key, op, value) = read(arena, k.entry)?;
+            each(key, op, value, k.hash32, k.entry)?;
+        }
+        Ok(())
+    }
+
     /// Each entry the last sort kept, in key order: `each(key, op, value, hash)`, the hash the
     /// key's 32-bit filter hash.
     pub fn each(
@@ -908,6 +921,39 @@ impl HashMem {
     fn newest(&self, key: &[u8], hash: u64) -> Option<u32> {
         let arena = &self.arena;
         self.index.get(hash, |e| self::key(arena, e) == key)
+    }
+
+    /// The entry at arena offset `offset` if its key is `key`: its operation and value into
+    /// `value`. None for another key's: the index over kept memtables names an entry by its
+    /// key's hash alone (`crate::kept`).
+    pub fn get_at(
+        &self,
+        offset: u32,
+        key: &[u8],
+        value: &mut Vec<u8>,
+    ) -> Result<Option<Op>, Error> {
+        let (k, op, v) = self.read(offset)?;
+        if k != key {
+            return Ok(None);
+        }
+        value.clear();
+        value.extend_from_slice(v);
+        Ok(Some(op))
+    }
+
+    /// Each key's newest entry, its filter hash and arena offset, into `list`: what a packing
+    /// worker's walk gives for a memtable it sorted, made here from the index for one the shard
+    /// packed itself.
+    pub fn key_list(&self, list: &mut crate::kept::KeyList) -> Result<(), Error> {
+        list.clear();
+        let mut failed = None;
+        self.index.each_entry(|e| match self.read(e) {
+            Ok((k, _, _)) => list.push(hash(k), e),
+            Err(error) => {
+                failed.get_or_insert(error);
+            }
+        });
+        failed.map_or(Ok(()), Err)
     }
 
     /// The newest entry for `key`, of filter hash `hash` ([`crate::branch::filter::hash`]): its

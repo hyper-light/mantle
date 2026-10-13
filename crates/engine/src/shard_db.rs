@@ -89,6 +89,11 @@ pub struct FlushStats {
     pub record_ghost_hits: u64,
     pub record_held: u64,
     pub record_bytes: u64,
+    /// The packed memtables kept readable for gets, the bytes they hold, and the gets they
+    /// answered ([`ShardDb`]'s kept memtables, research/51).
+    pub kept: u64,
+    pub kept_bytes: u64,
+    pub kept_hits: u64,
     /// Puts whose trunk share waited for its input reads: the last memtable before a rotation
     /// would stall ([`ShardDb::put`]'s pacing).
     pub waited_steps: u64,
@@ -269,6 +274,25 @@ pub struct ShardDb<F: BlockFile> {
     pack_ns: u64,
     /// A cleared memtable for the next fill, its arena kept.
     spare: Option<HashMem>,
+    /// Packed memtables kept readable for gets, oldest first (research/51). Each one's branch is
+    /// in the trunk, and every memtable packed after a kept one is kept, frozen, packing or
+    /// active, so the first version a get finds newest first is the newest, and a key none of
+    /// them holds is read from the trunk. They hold memory the budget leaves idle and give it
+    /// back oldest first ([`Self::fit_kept`]), as F2's hot log evicts at its head.
+    kept: std::collections::VecDeque<HashMem>,
+    /// The bytes the kept memtables hold ([`HashMem::memory`]).
+    kept_bytes: usize,
+    /// Gets a kept memtable answered.
+    kept_hits: u64,
+    /// The page cache's refusals for want of the machine's memory at the last look: one since
+    /// gives a kept memtable back.
+    kept_refused: u64,
+    /// The most a get grows the caches by, a page cache chunk and a record cache page, taken at
+    /// the last full look ([`Self::fit_kept`]): room kept memtables leave them.
+    kept_step: usize,
+    /// What the page cache and the record cache held at the last look: more since, and the kept
+    /// memtables look again ([`Self::kept_crowded`]).
+    kept_seen: usize,
     /// Sorted packings back from their workers, their buffers for the next memtables' mirrors
     /// and sorts: no more than were ever out at once with the active memtable's, and at most a
     /// worker's packing each beside it ([`Self::keep_sort_pack`]).
@@ -601,6 +625,12 @@ impl<F: BlockFile> ShardDb<F> {
             fill_ns: 0,
             pack_ns: 0,
             spare: None,
+            kept: std::collections::VecDeque::new(),
+            kept_bytes: 0,
+            kept_hits: 0,
+            kept_refused: 0,
+            kept_step: 0,
+            kept_seen: 0,
             sort_spares: Vec::new(),
             order_paced: false,
             scans_at_rotation: 0,
@@ -1138,6 +1168,8 @@ impl<F: BlockFile> ShardDb<F> {
         self.tuned = self.store.io_stats();
         self.record_ghost_ns = 0;
         self.partition_memory();
+        // A budget smaller than the kept memtables hold has them give memory back now.
+        self.fit_kept(true);
         Ok(())
     }
 
@@ -1301,6 +1333,7 @@ impl<F: BlockFile> ShardDb<F> {
             return;
         }
         self.retune();
+        self.fit_kept(true);
     }
 
     /// Counts a get toward the tuning cycle, and divides the memory again at its end.
@@ -1309,6 +1342,11 @@ impl<F: BlockFile> ShardDb<F> {
             return;
         }
         self.trim();
+        // The page cache and the record cache grow as gets miss: the kept memtables give way at
+        // once.
+        if self.kept_crowded() {
+            self.fit_kept(false);
+        }
         self.ops_since = self.ops_since.saturating_add(1);
         if self.ops_since >= self.cycle_ops {
             self.ops_since = 0;
@@ -1915,6 +1953,13 @@ impl<F: BlockFile> ShardDb<F> {
             }
             found = f.mem.get_hashed(key, hash, value)?;
         }
+        // Then the kept memtables, packed but readable, newest first.
+        if found.is_none() && !self.kept.is_empty() {
+            found = Self::kept_get(&self.kept, key, hash, value)?;
+            if found.is_some() {
+                self.kept_hits = self.kept_hits.saturating_add(1);
+            }
+        }
         let mut ghost = false;
         if found.is_none()
             && let Some(r) = self.records.as_mut()
@@ -1967,6 +2012,13 @@ impl<F: BlockFile> ShardDb<F> {
                 break;
             }
             found = f.mem.get_hashed(key, hash, value)?;
+        }
+        // Then the kept memtables, packed but readable, newest first.
+        if found.is_none() && !self.kept.is_empty() {
+            found = Self::kept_get(&self.kept, key, hash, value)?;
+            if found.is_some() {
+                self.kept_hits = self.kept_hits.saturating_add(1);
+            }
         }
         let mut ghost = false;
         if found.is_none()
@@ -2691,6 +2743,11 @@ impl<F: BlockFile> ShardDb<F> {
                 self.trunk.step(&mut self.store, 1)?;
             }
         }
+        // A trunk step may have kept a compaction's pages in the cache: the kept memtables give
+        // way at once.
+        if self.kept_crowded() {
+            self.fit_kept(false);
+        }
         Ok(())
     }
 
@@ -2919,7 +2976,7 @@ impl<F: BlockFile> ShardDb<F> {
                 return Err(error);
             }
         };
-        let Frozen { mut mem, since, .. } = f;
+        let Frozen { mem, since, .. } = f;
         self.trunk.add(branch);
         self.pack_ns = u64::try_from(
             std::time::Instant::now()
@@ -2929,12 +2986,127 @@ impl<F: BlockFile> ShardDb<F> {
         .unwrap_or(u64::MAX);
         self.flush_stats.fed = self.flush_stats.fed.saturating_add(1);
         let t = self.timed.then(std::time::Instant::now);
-        mem.clear();
+        self.keep(mem);
         let ns = ns_since(t);
         self.flush_stats.retire_ns = self.flush_stats.retire_ns.saturating_add(ns);
-        self.spare = Some(mem);
         self.flush_stats.flushes = self.flush_stats.flushes.saturating_add(1);
         Ok(())
+    }
+
+    /// A packed memtable, its branch in the trunk: kept readable for gets, newest last, the
+    /// oldest given back while they hold more than [`Self::fit_kept`] allows.
+    fn keep(&mut self, mem: HashMem) {
+        self.kept_bytes = self.kept_bytes.saturating_add(mem.memory());
+        self.kept.push_back(mem);
+        self.fit_kept(true);
+    }
+
+    /// Gives kept memtables back, oldest first: while they hold more than the budget's idle
+    /// memory ([`Self::kept_limit`]); one when the page cache was refused the machine's memory
+    /// since the last look; and, with `machine` (a reading of the machine, made at rotations, not
+    /// gets), while the next fill would take a new memtable and the machine has not twice its
+    /// bytes free, the rule the page cache takes memory by (`Cache::machine_spares`). Without a
+    /// memory budget none is kept.
+    fn fit_kept(&mut self, machine: bool) {
+        if machine {
+            // Between two looks a get grows the page cache by at most a chunk and the record
+            // cache by at most a page; a put's growth is looked at as its pacing ends.
+            self.kept_step = self
+                .store
+                .cache_next_chunk_bytes()
+                .saturating_add(self.store.page_size());
+        }
+        let refused = self.store.cache_refused();
+        let mut short = refused > self.kept_refused;
+        self.kept_refused = refused;
+        let limit = self.kept_limit();
+        while !self.kept.is_empty() {
+            let over = self.kept_bytes > limit;
+            let machine_short = machine && self.spare.is_none() && !self.machine_spares();
+            if !(over || short || machine_short) {
+                break;
+            }
+            short = false;
+            if let Some(mem) = self.kept.pop_front() {
+                self.kept_bytes = self.kept_bytes.saturating_sub(mem.memory());
+                self.recycle(mem);
+            }
+        }
+        self.kept_seen = self.caches_held();
+    }
+
+    /// What the page cache and the record cache hold: the regions a put's trunk step or a get
+    /// grows between rotations.
+    fn caches_held(&self) -> usize {
+        self.store.cache_bytes().saturating_add(
+            self.records
+                .as_ref()
+                .map_or(0, crate::records::RecordCache::held_bytes),
+        )
+    }
+
+    /// Whether memtables are kept and, since their last look, a cache took memory or the page
+    /// cache was refused the machine's: a few loads, made each put and get.
+    fn kept_crowded(&self) -> bool {
+        !self.kept.is_empty()
+            && (self.caches_held() > self.kept_seen
+                || self.store.cache_refused() > self.kept_refused)
+    }
+
+    /// The memory kept memtables may hold: the budget less what its regions hold and the most a
+    /// get grows the caches by ([`Self::kept_step`]), so after any operation the regions and the
+    /// kept memtables together hold no more than the budget; none without a budget.
+    fn kept_limit(&self) -> usize {
+        let Some(budget) = self.memory else {
+            return 0;
+        };
+        let (cache, write, records) = self.memory_held();
+        budget
+            .saturating_sub(cache)
+            .saturating_sub(write)
+            .saturating_sub(records)
+            .saturating_sub(self.kept_step)
+    }
+
+    /// Whether the machine has twice a memtable's bytes free, a new memtable's arena: true
+    /// without a reading.
+    fn machine_spares(&self) -> bool {
+        self.store.machine_free().is_none_or(|free| {
+            u64::try_from(self.mem_limit)
+                .ok()
+                .and_then(|b| b.checked_mul(2))
+                .is_some_and(|need| free >= need)
+        })
+    }
+
+    /// A memtable no longer read: cleared for the next fill when none is spare, else dropped,
+    /// its memory back to the machine.
+    fn recycle(&mut self, mut mem: HashMem) {
+        if self.spare.is_none() {
+            mem.clear();
+            self.spare = Some(mem);
+        }
+    }
+
+    /// The newest entry of `key` among the kept memtables: each one's first index group read
+    /// first, their misses overlapped, then each probed newest first.
+    fn kept_get(
+        kept: &std::collections::VecDeque<HashMem>,
+        key: &[u8],
+        hash: u64,
+        value: &mut Vec<u8>,
+    ) -> Result<Option<Op>, Error> {
+        let mut touched = 0u64;
+        for m in kept {
+            touched ^= m.touch(hash);
+        }
+        std::hint::black_box(touched);
+        for m in kept.iter().rev() {
+            if let Some(op) = m.get_hashed(key, hash, value)? {
+                return Ok(Some(op));
+            }
+        }
+        Ok(None)
     }
 
     /// The frozen memtables a rotation may leave in flight: the packings whose lifetimes reach
@@ -3264,7 +3436,7 @@ impl<F: BlockFile> ShardDb<F> {
         }
         // Built here: after every older memtable's branch, pending in age order.
         self.drain_frozen()?;
-        let (mut mem, walk, mut builder) = match self.packing.take() {
+        let (mem, walk, mut builder) = match self.packing.take() {
             Some(Packing {
                 mem,
                 walk,
@@ -3294,10 +3466,9 @@ impl<F: BlockFile> ShardDb<F> {
         self.flush_stats.pack_finish_ns = self.flush_stats.pack_finish_ns.saturating_add(ns);
         self.trunk.add(branch);
         let t = self.timed.then(std::time::Instant::now);
-        mem.clear();
+        self.keep(mem);
         let ns = ns_since(t);
         self.flush_stats.retire_ns = self.flush_stats.retire_ns.saturating_add(ns);
-        self.spare = Some(mem);
         self.pack_carry = 0;
         self.flush_stats.flushes = self.flush_stats.flushes.saturating_add(1);
         Ok(())
@@ -3308,7 +3479,9 @@ impl<F: BlockFile> ShardDb<F> {
     fn fresh_mem(&mut self) -> Result<HashMem, Error> {
         let mut fresh = match self.spare.take() {
             Some(m) => m,
-            None => HashMem::new(self.mem_limit)?,
+            // Sized for the entries the memtable it follows holds: it fills without its index
+            // growing or migrating, as a cleared spare refills.
+            None => HashMem::new_for(self.mem_limit, self.mem.len())?,
         };
         self.give_mirror(&mut fresh);
         Ok(fresh)
@@ -3740,13 +3913,16 @@ impl<F: BlockFile> ShardDb<F> {
     /// The flushes' time, the trunk's maintenance, and the store's I/O since the engine started.
     pub fn stats(&self) -> (FlushStats, crate::trunk::TrunkStats, crate::store::IoStats) {
         let mut flush = self.flush_stats;
+        let as_u64 = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
         if let Some(r) = self.records.as_ref() {
-            let as_u64 = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
             (flush.record_hits, flush.record_misses) = r.stats();
             flush.record_ghost_hits = r.ghost_hits();
             flush.record_held = as_u64(r.held_bytes());
             flush.record_bytes = as_u64(r.bytes());
         }
+        flush.kept = as_u64(self.kept.len());
+        flush.kept_bytes = as_u64(self.kept_bytes);
+        flush.kept_hits = self.kept_hits;
         let mut trunk = self.trunk.stats();
         trunk.scans = self.scans;
         trunk.scan_segments = self.scan_segments;

@@ -135,6 +135,40 @@ pub struct KeyIndex {
 }
 
 impl KeyIndex {
+    /// An index whose table holds `entries` at most half full, the size a migration starts
+    /// (`rebuild`): a memtable that fills to as many entries as the one before it neither grows
+    /// nor migrates, as a cleared one refilled does not.
+    pub fn for_entries(entries: usize) -> Self {
+        if entries == 0 {
+            return Self::default();
+        }
+        let want = entries.saturating_mul(2).max(GROUP);
+        let buckets = want.checked_next_power_of_two().unwrap_or(want);
+        Self {
+            table: Table::new(buckets),
+            old: None,
+            moved: 0,
+        }
+    }
+
+    /// Reads `hash`'s first group in each table, its control word and its first bucket's entry,
+    /// so a probe made after finds them cached: several indexes' misses overlapped rather than
+    /// one after another (the shard's kept memtables, research/51).
+    #[inline]
+    pub fn touch(&self, hash: u64) -> u64 {
+        let first = |t: &Table| {
+            let (_, g) = t.place(hash);
+            let w = t.ctrl.get(g).copied().unwrap_or(0);
+            let e = t
+                .slots
+                .get(g.wrapping_mul(GROUP))
+                .copied()
+                .map_or(0, u64::from);
+            w ^ e
+        };
+        first(&self.table) ^ self.old.as_ref().map_or(0, first)
+    }
+
     /// Empties the index, keeping its table: refilled to the size it last held, it neither grows
     /// nor migrates again.
     pub fn clear(&mut self) {

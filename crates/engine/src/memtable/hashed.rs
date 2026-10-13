@@ -620,6 +620,21 @@ impl HashMem {
         })
     }
 
+    /// [`Self::new`], its index sized for `entries`, as many as the memtable before it held: it
+    /// fills without the index growing or migrating, as a cleared spare refills
+    /// ([`KeyIndex::for_entries`]).
+    pub fn new_for(limit: usize, entries: usize) -> Result<Self, Error> {
+        let mut mem = Self::new(limit)?;
+        mem.index = KeyIndex::for_entries(entries);
+        Ok(mem)
+    }
+
+    /// Reads `hash`'s first index group ([`KeyIndex::touch`]).
+    #[inline]
+    pub fn touch(&self, hash: u64) -> u64 {
+        self.index.touch(hash)
+    }
+
     /// Empties the memtable for its next fill, keeping its arena and every entry buffer, the
     /// tail given room for as long as it has grown.
     pub fn clear(&mut self) {

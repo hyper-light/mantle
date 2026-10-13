@@ -1108,6 +1108,24 @@ impl<F: BlockFile> Store<F> {
         self.cache.as_ref().map_or(0, cache::Cache::bytes)
     }
 
+    /// The most the page cache grows by at once: its next chunk's bytes (`Cache::next_chunk_bytes`).
+    pub fn cache_next_chunk_bytes(&self) -> usize {
+        self.cache
+            .as_ref()
+            .map_or(0, cache::Cache::next_chunk_bytes)
+    }
+
+    /// Chunks the page cache was refused for want of the machine's free memory, since it was made.
+    pub fn cache_refused(&self) -> u64 {
+        self.cache.as_ref().map_or(0, cache::Cache::refused)
+    }
+
+    /// The memory the machine has free now, when the store follows the machine
+    /// ([`Self::follow_machine`]); none without a reading.
+    pub fn machine_free(&self) -> Option<u64> {
+        self.machine_free.and_then(|read| read())
+    }
+
     /// The bytes the page cache's index and ghost take.
     pub fn cache_index_bytes(&self) -> usize {
         self.cache.as_ref().map_or(0, cache::Cache::index_bytes)

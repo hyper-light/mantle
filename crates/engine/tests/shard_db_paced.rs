@@ -348,6 +348,7 @@ fn memory_moving_between_regions_never_holds_more_than_the_budget() {
     let mut out = Vec::new();
     let mut x = 0x9e37_79b9_7f4a_7c15u64;
     let (mut records_most, mut records_least) = (0, usize::MAX);
+    let mut kept_most = 0usize;
     // While giving back: the total when it began, the ops it has taken, and the cycle then.
     let mut giving: Option<(usize, u64, u64)> = None;
     // The last steps as seen, for a failure's message.
@@ -393,6 +394,13 @@ fn memory_moving_between_regions_never_holds_more_than_the_budget() {
             db.memory_split(),
             db.index_bytes()
         );
+        // Packed memtables kept for gets hold only what the regions leave idle (research/51).
+        let kept = usize::try_from(db.stats().0.kept_bytes).unwrap();
+        kept_most = kept_most.max(kept);
+        assert!(
+            db.trimming() || total + kept <= budget,
+            "step {step}: kept {kept} beside cache {cache} write {write} records {records}"
+        );
         let (_, _, records) = db.memory_split();
         records_most = records_most.max(records);
         records_least = records_least.min(records);
@@ -401,6 +409,7 @@ fn memory_moving_between_regions_never_holds_more_than_the_budget() {
         records_most > records_least,
         "the record cache never moved: {records_least}..{records_most}"
     );
+    assert!(kept_most > 0, "no memtable was kept");
 }
 
 #[test]

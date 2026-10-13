@@ -777,13 +777,25 @@ impl Cache {
         }
     }
 
+    /// The pages the next chunk takes by the module's rule: as many as the chunks before it hold,
+    /// a tuning step at most, within the limit.
+    fn next_chunk_pages(&self) -> usize {
+        let room = self.room();
+        let step = (self.limit.saturating_mul(TUNE_STEP_PERCENT) / 100).max(1);
+        room.max(1).min(step).min(self.limit.saturating_sub(room))
+    }
+
+    /// The bytes the cache's next chunk takes ([`Self::next_chunk_pages`]): the most it grows by
+    /// at once.
+    pub fn next_chunk_bytes(&self) -> usize {
+        self.next_chunk_pages().saturating_mul(self.page)
+    }
+
     /// Takes a new chunk by the module's rule, with room in the slot and free lists for its
     /// pages, so making them reallocates nothing. False when the limit has no room left or the
     /// memory refuses it.
     fn new_chunk(&mut self) -> bool {
-        let room = self.room();
-        let step = (self.limit.saturating_mul(TUNE_STEP_PERCENT) / 100).max(1);
-        let pages = room.max(1).min(step).min(self.limit.saturating_sub(room));
+        let pages = self.next_chunk_pages();
         if pages == 0 {
             return false;
         }

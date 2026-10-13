@@ -1365,10 +1365,14 @@ impl<F: BlockFile> ShardDb<F> {
         self.trunk.filter_plan()
     }
 
-    /// Whether a region is still being brought down to a smaller share (`trim`): until it is,
-    /// the regions may hold more than the budget by what it has left to give back.
+    /// Whether a region is still being brought down to a smaller share (`trim`), or the kept
+    /// memtables hold more than the budget leaves them while an index of theirs is out on a
+    /// worker, which gives its memory back only when it returns: until then the regions and the
+    /// kept memtables may hold more than the budget by what is left to give back.
     pub fn trimming(&self) -> bool {
-        self.trim_cache > 0 || self.trim_records > 0
+        self.trim_cache > 0
+            || self.trim_records > 0
+            || (self.kept_out && self.kept_held() > self.kept_limit())
     }
 
     /// The bytes the page cache's and record cache's indexes and ghosts take.
@@ -1410,15 +1414,15 @@ impl<F: BlockFile> ShardDb<F> {
             return;
         }
         self.trim();
-        // The page cache and the record cache grow as gets miss: the kept memtables give way at
-        // once.
-        if self.kept_crowded() {
-            self.fit_kept(false);
-        }
         self.ops_since = self.ops_since.saturating_add(1);
         if self.ops_since >= self.cycle_ops {
             self.ops_since = 0;
             self.retune();
+        }
+        // A tuning step may have moved shares, write memory's among them: the kept memtables give
+        // way at once.
+        if self.kept_crowded() {
+            self.fit_kept(false);
         }
     }
 
@@ -2038,6 +2042,9 @@ impl<F: BlockFile> ShardDb<F> {
                 KeptAnswer::Absent if self.kept_whole => {
                     self.kept_absent = self.kept_absent.saturating_add(1);
                     value.clear();
+                    if self.kept_crowded() {
+                        self.fit_kept(false);
+                    }
                     return Ok(false);
                 }
                 KeptAnswer::Absent | KeptAnswer::Unknown => {}
@@ -2112,6 +2119,9 @@ impl<F: BlockFile> ShardDb<F> {
                 KeptAnswer::Absent if self.kept_whole => {
                     self.kept_absent = self.kept_absent.saturating_add(1);
                     value.clear();
+                    if self.kept_crowded() {
+                        self.fit_kept(false);
+                    }
                     return Ok(false);
                 }
                 KeptAnswer::Absent | KeptAnswer::Unknown => {}
@@ -2878,9 +2888,9 @@ impl<F: BlockFile> ShardDb<F> {
                 self.trunk.step(&mut self.store, 1)?;
             }
         }
-        self.tend_kept()?;
-        // A trunk step may have kept a compaction's pages in the cache, and an index come home
-        // larger: the kept memtables give way at once.
+        // A trunk step may have kept a compaction's pages in the cache: the kept memtables give
+        // way at once. The index out on a worker is taken back at the next rotation, get or idle
+        // step, not polled for by every put.
         if self.kept_crowded() {
             self.fit_kept(false);
         }
@@ -2892,6 +2902,11 @@ impl<F: BlockFile> ShardDb<F> {
     fn tend_kept(&mut self) -> Result<(), Error> {
         if self.kept_out {
             self.take_kept()?;
+            // The index home may hold more than it did when it went: the kept memtables look
+            // again at once.
+            if self.kept_crowded() {
+                self.fit_kept(false);
+            }
         } else if !self.kept_lists.is_empty() {
             self.extend_kept();
         }
@@ -3135,7 +3150,7 @@ impl<F: BlockFile> ShardDb<F> {
         .unwrap_or(u64::MAX);
         self.flush_stats.fed = self.flush_stats.fed.saturating_add(1);
         let t = self.timed.then(std::time::Instant::now);
-        self.keep(mem, keys);
+        self.keep(mem, keys)?;
         let ns = ns_since(t);
         self.flush_stats.retire_ns = self.flush_stats.retire_ns.saturating_add(ns);
         self.flush_stats.flushes = self.flush_stats.flushes.saturating_add(1);
@@ -3148,7 +3163,7 @@ impl<F: BlockFile> ShardDb<F> {
     /// through its index alone, so its entry buffers go to the next memtable a fill starts new.
     /// Without a memory budget, or without workers to build the indexes, none is kept, and none
     /// older stays: a get's probes would grow with the memtables kept (research/51 §7).
-    fn keep(&mut self, mut mem: HashMem, keys: Option<crate::kept::KeyList>) {
+    fn keep(&mut self, mut mem: HashMem, keys: Option<crate::kept::KeyList>) -> Result<(), Error> {
         if self.memory.is_none() || !self.trunk.has_pool() {
             // A packed memtable not kept: the trunk holds records no kept one does.
             self.kept_whole = false;
@@ -3157,7 +3172,7 @@ impl<F: BlockFile> ShardDb<F> {
                 self.free_list(list);
             }
             self.recycle(mem);
-            return;
+            return Ok(());
         }
         let list = match keys {
             Some(list) => list,
@@ -3170,7 +3185,7 @@ impl<F: BlockFile> ShardDb<F> {
                     self.give_back_kept();
                     self.free_list(list);
                     self.recycle(mem);
-                    return;
+                    return Ok(());
                 }
                 list
             }
@@ -3186,7 +3201,8 @@ impl<F: BlockFile> ShardDb<F> {
         self.kept.push_back(KeptMem { mem, number, keys });
         self.kept_lists.push_back((number, list));
         self.fit_kept(true);
-        self.extend_kept();
+        // The index out on a worker comes back here, a rotation's look, before the next goes.
+        self.tend_kept()
     }
 
     /// Gives every kept memtable back, and the indexes over them: the trunk then holds records
@@ -3414,7 +3430,9 @@ impl<F: BlockFile> ShardDb<F> {
                 gave = true;
             }
         }
-        if self.kept.is_empty() && !self.kept_out {
+        if self.kept.is_empty() {
+            // Nothing kept: the indexes home and the lists go too; one out on a worker is dropped
+            // when it comes back.
             self.give_back_kept();
         } else if gave {
             self.prune_lists();
@@ -3918,7 +3936,7 @@ impl<F: BlockFile> ShardDb<F> {
         self.flush_stats.pack_finish_ns = self.flush_stats.pack_finish_ns.saturating_add(ns);
         self.trunk.add(branch);
         let t = self.timed.then(std::time::Instant::now);
-        self.keep(mem, None);
+        self.keep(mem, None)?;
         let ns = ns_since(t);
         self.flush_stats.retire_ns = self.flush_stats.retire_ns.saturating_add(ns);
         self.pack_carry = 0;

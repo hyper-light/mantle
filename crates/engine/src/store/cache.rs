@@ -1142,6 +1142,10 @@ impl Cache {
         let mut made = 0usize;
         while made < n && self.unreserved() > 0 {
             if !self.make_slot() {
+                // No slot can be made now (the limit's room held by chunks, loans' among them,
+                // or the machine's memory refused): what is wanted is no longer owed, until the
+                // next insert wants again. Owed, idle time asked for it forever.
+                self.wanted = 0;
                 break;
             }
             made = made.saturating_add(1);
@@ -1409,6 +1413,19 @@ mod tests {
             assert!(c.get(a, &mut out));
             assert_eq!(out, page(a));
         }
+    }
+
+    /// Idle reservation that can make no slot stops owing them: the machine refusing the cache
+    /// a chunk ends `reserve` with nothing left owed, rather than leaving slots wanted that
+    /// idle time asks for again and again.
+    #[test]
+    fn slots_none_can_be_made_for_are_not_owed() {
+        let mut c = Cache::new(8, 16);
+        c.set_available(|| Some(0));
+        c.wanted = 8;
+        assert!(c.unreserved() > 0);
+        assert_eq!(c.reserve(8), 0);
+        assert_eq!(c.unreserved(), 0, "slots owed that none can be made for");
     }
 
     #[test]

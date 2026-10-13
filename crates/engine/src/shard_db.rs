@@ -3283,6 +3283,7 @@ impl<F: BlockFile> ShardDb<F> {
             || self.trunk.debt() > 0
             || !self.trunk.is_idle()
             || self.trunk.consolidation_owed()
+            || self.trunk.balance_owed()
             || (if paced {
                 self.mem.debt() > 0
             } else {
@@ -3400,6 +3401,15 @@ impl<F: BlockFile> ShardDb<F> {
             // them.
             let t = self.timed.then(std::time::Instant::now);
             let used = self.trunk.consolidate_step(&mut self.store, keys, paced)?;
+            if self.timed {
+                self.note_trunk(ns_since(t));
+            }
+            return Ok(used.max(1));
+        }
+        if self.trunk.balance_owed() {
+            // Nothing else owed: index pivots past a memtable's entries flush toward the leaves.
+            let t = self.timed.then(std::time::Instant::now);
+            let used = self.trunk.balance_step(&mut self.store, keys, paced)?;
             if self.timed {
                 self.note_trunk(ns_since(t));
             }
@@ -3806,6 +3816,16 @@ impl<F: BlockFile> ShardDb<F> {
                 budget.saturating_sub(used)
             };
             let done = self.trunk.consolidate_step(&mut self.store, left, false)?;
+            used = used.saturating_add(done.max(1));
+        }
+        // Then index pivots past a memtable's entries flushed toward the leaves, the same way.
+        while used < budget && (self.trunk.balance_owed() || self.trunk.maintaining()) {
+            let left = if budget == u64::MAX {
+                u64::MAX
+            } else {
+                budget.saturating_sub(used)
+            };
+            let done = self.trunk.balance_step(&mut self.store, left, false)?;
             used = used.saturating_add(done.max(1));
         }
         // Then the active memtable's runs merged to one, each step at least one unit while owed.

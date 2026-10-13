@@ -254,3 +254,74 @@ fn a_growing_trunk_splits_deepens_and_reads_after_every_batch() {
     // size-tiered Bε-tree), so many keys sit above the leaves; the leaves still split.
     assert!(leaves >= 10, "leaves {leaves}");
 }
+
+/// A fill's steps flush an index pivot only past `fanout` runs, so its buffer grows past a
+/// memtable's entries; idle time's balancing flushes each such pivot until none holds more,
+/// and every key reads as before.
+#[test]
+fn idle_balancing_leaves_no_index_pivot_past_a_memtables_entries() {
+    let align = Alignment::new(4096).unwrap();
+    let file = SimFile::new(align, Alignment::new(512).unwrap(), 9).unwrap();
+    let mut store = Store::create(file, CONFIG).unwrap();
+    let leaf_entries = 128;
+    let mut trunk = Trunk::new(TrunkConfig {
+        fanout: 4,
+        leaf_entries,
+    })
+    .unwrap();
+    let mut oracle: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let mut x = 0x9e37_79b9_7f4a_7c15u64;
+    for batch in 0..120u32 {
+        let mut mem: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        for _ in 0..200 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let k = (x % 20_000) as u32;
+            mem.insert(key(k), format!("v{batch}-{k}").into_bytes());
+        }
+        let mut b = Builder::new(&mut store, Keys::Exactly(mem.len() as u64)).unwrap();
+        for (k, v) in &mem {
+            b.add(&mut store, k, Op::Put, v).unwrap();
+        }
+        let branch = b.finish(&mut store).unwrap();
+        trunk.incorporate(&mut store, branch).unwrap();
+        oracle.extend(mem);
+    }
+    assert!(trunk.balance_owed(), "{:?}", trunk.levels());
+    // Each balancing step flushes at least one pivot of more than `leaf_entries` entries one
+    // level down, and no entry is ever farther from the leaves than the height.
+    let above: u64 = trunk
+        .levels()
+        .iter()
+        .filter(|l| !l.leaf)
+        .map(|l| l.entries)
+        .sum();
+    let height = trunk.levels().len() as u64;
+    let most = above * height / leaf_entries + 1;
+    let mut steps = 0;
+    while trunk.balance_owed() {
+        assert!(
+            steps < most,
+            "{steps} balancing steps: {:?}",
+            trunk.levels()
+        );
+        trunk.balance_step(&mut store, u64::MAX, false).unwrap();
+        trunk.drain(&mut store).unwrap();
+        steps += 1;
+    }
+    assert!(trunk.is_idle());
+    for level in trunk.levels().iter().filter(|l| !l.leaf) {
+        assert!(
+            level.entries <= level.pivots * leaf_entries,
+            "{:?}",
+            trunk.levels()
+        );
+    }
+    check_refs(&store, &trunk);
+    let mut value = Vec::new();
+    for (k, v) in &oracle {
+        assert_eq!(trunk.get(&mut store, k, &mut value).unwrap(), Some(Op::Put));
+        assert_eq!(&value, v);
+    }
+}

@@ -238,6 +238,11 @@ pub struct TrunkStats {
     /// Entries written by pivots' compactions, and by leaves' settles by what asked for them:
     /// seeks' rent, more than `fanout` branches, more than `leaf_entries` entries.
     pub pivot_entries: u64,
+    /// Entries of index pivots' compactions planned with `fanout` branches in the bundle: the
+    /// branch each writes makes the bundle full, so the flush that follows carries it down
+    /// whole, to be merged again below; what a flush taking live in-flight branches down
+    /// uncompacted would not write (research/50 §11).
+    pub passthrough_entries: u64,
     pub settle_entries_seeks: u64,
     pub settle_entries_branches: u64,
     pub settle_entries_size: u64,
@@ -324,6 +329,13 @@ pub struct Trunk {
     consolidate: bool,
     consolidating: bool,
     consolidation: Consolidation,
+    /// Whether the run in progress is idle time's balancing ([`Self::balance_step`]), the only
+    /// kind that flushes an index pivot for its size alone.
+    balance: bool,
+    /// Index pivots holding more than a memtable's entries, which balancing flushes: counted
+    /// where a bundle grows or empties, so asking whether balancing is owed, as every operation
+    /// does, costs no walk over the nodes.
+    oversized: usize,
     /// The pivots above paid ones, found before a consolidation marks them; kept for the next.
     marks: Vec<(usize, usize)>,
     /// The maintenance workers compactions run on, when the shard has any ([`Self::set_pool`]).
@@ -534,6 +546,8 @@ impl Trunk {
             consolidate: false,
             consolidating: false,
             consolidation: Consolidation::Measured,
+            balance: false,
+            oversized: 0,
             marks: Vec::new(),
             pool: None,
             wait: Wait::No,
@@ -1057,6 +1071,33 @@ impl Trunk {
             self.step(store, budget)
         };
         self.consolidate = false;
+        used
+    }
+
+    /// Whether an index pivot holds more than a memtable's entries with nothing else in
+    /// progress: idle time's balancing would flush it ([`Self::balance_step`]).
+    pub fn balance_owed(&self) -> bool {
+        self.oversized > 0 && self.pending.is_empty() && !self.maintaining()
+    }
+
+    /// [`Self::step`] for idle time, when nothing else is owed: index pivots past a memtable's
+    /// entries flush, so a key range's data lives in the leaf below it (research/50 §11). Only
+    /// here: flushes for size alone set compactions going, which a fill's maintenance must
+    /// never wait behind (measured at 100M: done on every look they cost the fill 18% and one
+    /// put 1.5 s).
+    pub fn balance_step<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        budget: u64,
+        paced: bool,
+    ) -> Result<u64, Error> {
+        self.balance = true;
+        let used = if paced {
+            self.step_paced(store, budget)
+        } else {
+            self.step(store, budget)
+        };
+        self.balance = false;
         used
     }
 
@@ -1822,6 +1863,12 @@ impl Trunk {
         if root >= nodes.len() {
             return Err(corrupt());
         }
+        let oversized = nodes
+            .iter()
+            .filter(|n| !n.leaf)
+            .flat_map(|n| &n.pivots)
+            .filter(|p| entries_of(p.bundle.branches()) > leaf_entries)
+            .count();
         Ok(Self {
             nodes,
             root,
@@ -1849,6 +1896,8 @@ impl Trunk {
             consolidate: false,
             consolidating: false,
             consolidation: Consolidation::Measured,
+            balance: false,
+            oversized,
             marks: Vec::new(),
             pool: None,
             wait: Wait::No,
@@ -1870,10 +1919,18 @@ impl Trunk {
             self.stats.entries_written = self.stats.entries_written.saturating_add(b.count);
             self.stats.pivot_entries = self.stats.pivot_entries.saturating_add(b.count);
         }
-        let pivot = self.node_mut(n)?.pivots.get_mut(i).ok_or(corrupt())?;
+        let limit = self.config.leaf_entries;
+        let node = self.node_mut(n)?;
+        let leaf = node.leaf;
+        let pivot = node.pivots.get_mut(i).ok_or(corrupt())?;
         pivot.start = covered;
-        if let Some(b) = merged {
-            pivot.bundle.push_newest(b);
+        let Some(b) = merged else {
+            return Ok(());
+        };
+        let was = entries_of(pivot.bundle.branches()) > limit;
+        pivot.bundle.push_newest(b);
+        if !leaf && !was && entries_of(pivot.bundle.branches()) > limit {
+            self.oversized = self.oversized.saturating_add(1);
         }
         Ok(())
     }

@@ -345,7 +345,8 @@ impl Trunk {
                     || n.wants.is_some()
                     || n.pivots.len() > fanout
                     || n.pivots.iter().any(|p| p.bundle.branches().len() > fanout)
-                    || (!n.leaf
+                    || (self.balance
+                        && !n.leaf
                         && n.pivots
                             .iter()
                             .any(|p| entries(p.bundle.branches()) > self.config.leaf_entries))
@@ -458,10 +459,8 @@ impl Trunk {
         // against the leaves below it, as a Bε-tree's buffers do, so the data lives in the leaves
         // and a key range lies in one run there (research/50 §11; SplinterDB's fullest-child
         // flush past one incorporation's bytes, trunk.c restore_balance_index).
-        Ok(
-            held > self.config.fanout
-                || entries(pivot.bundle.branches()) > self.config.leaf_entries,
-        )
+        Ok(held > self.config.fanout
+            || (self.balance && entries(pivot.bundle.branches()) > self.config.leaf_entries))
     }
 
     /// Plans pivot `i` of node `n`'s compaction of its live in-flight bundles: inline without
@@ -478,6 +477,7 @@ impl Trunk {
             .flatten()
             .map(|b| b.count)
             .fold(0u64, u64::saturating_add);
+        let passes = !node.leaf && pivot.bundle.branches().len() == self.config.fanout;
         // Newest first, the order a merge takes.
         let run = if self.pool.is_some() {
             Running::Remote {
@@ -500,6 +500,9 @@ impl Trunk {
             )))
         };
         let key = pivot.key.clone();
+        if passes {
+            self.stats.passthrough_entries = self.stats.passthrough_entries.saturating_add(units);
+        }
         self.tasks.push(NodeTask {
             node: n,
             what: What::Compact {
@@ -518,10 +521,15 @@ impl Trunk {
     /// reference, oldest first, and the child is looked at.
     fn flush_pivot(&mut self, n: usize, i: usize) -> Result<(), Error> {
         let cascades = self.consolidating && self.full;
+        let limit = self.config.leaf_entries;
         let pivot = self.node_mut(n)?.pivots.get_mut(i).ok_or(corrupt())?;
         let child = pivot.child.ok_or(corrupt())?;
         let paid = cascades && pivot.seek.paid;
+        let was = entries(pivot.bundle.branches()) > limit;
         let bundle = pivot.bundle.take();
+        if was {
+            self.oversized = self.oversized.saturating_sub(1);
+        }
         self.spend(n, i)?;
         if !bundle.is_empty() {
             self.stats.flushes = self.stats.flushes.saturating_add(1);

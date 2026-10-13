@@ -291,6 +291,7 @@ impl Trunk {
         for b in std::mem::take(&mut self.pending) {
             self.node_mut(root)?.inflight.push(vec![b]);
         }
+        self.node_mut(root)?.received = true;
         self.queue(root);
         Ok(())
     }
@@ -338,7 +339,7 @@ impl Trunk {
             return;
         }
         let fanout = self.config.fanout;
-        let leaf_entries = self.config.leaf_entries;
+        let leaf_entries = self.leaf_limit();
         for at in 0..self.nodes.len() {
             let due = self.nodes.get(at).is_some_and(|n| {
                 !n.inflight.is_empty()
@@ -391,6 +392,7 @@ impl Trunk {
                 self.flush_pivot(n, i)?;
             }
         }
+        self.flush_fullest(n)?;
         self.want_change(n)?;
         self.take_change(store, n)
     }
@@ -451,6 +453,41 @@ impl Trunk {
             return Ok(node.inflight.len() <= pivot.start && !self.compacting(n, &pivot.key));
         }
         Ok(held > self.config.fanout)
+    }
+
+    /// SplinterDB's pass through an index node that received data (`restore_balance_index`,
+    /// trunk.c; research/50 §4): once what it received is compacted into its pivots, its fullest
+    /// pivot flushes if it holds more than a memtable's entries, so index pivots hold about that
+    /// much and the data lives in the leaves. Once a receipt; never into a child whose change has
+    /// started.
+    fn flush_fullest(&mut self, n: usize) -> Result<(), Error> {
+        let node = self.node(n)?;
+        if node.leaf || !node.received || node.pivots.iter().any(|p| node.inflight.len() > p.start)
+        {
+            return Ok(());
+        }
+        let mut fullest: Option<(usize, u64)> = None;
+        for (i, p) in node.pivots.iter().enumerate() {
+            let held = entries(p.bundle.branches());
+            if held > self.config.leaf_entries && fullest.is_none_or(|(_, most)| held > most) {
+                fullest = Some((i, held));
+            }
+        }
+        self.node_mut(n)?.received = false;
+        let Some((i, _)) = fullest else {
+            return Ok(());
+        };
+        let child = self
+            .node(n)?
+            .pivots
+            .get(i)
+            .and_then(|p| p.child)
+            .ok_or(corrupt())?;
+        if self.node(child)?.wants.is_some_and(|c| c.started) {
+            return Ok(());
+        }
+        self.stats.fullest_flushes = self.stats.fullest_flushes.saturating_add(1);
+        self.flush_pivot(n, i)
     }
 
     /// Plans pivot `i` of node `n`'s compaction of its live in-flight bundles: inline without
@@ -533,8 +570,12 @@ impl Trunk {
                 .saturating_add(u64::try_from(newly).unwrap_or(u64::MAX));
         }
         // Oldest first into the child's in-flight list: the bundle is newest first.
+        let received = !bundle.is_empty();
         for b in bundle.into_iter().rev() {
             self.node_mut(child)?.inflight.push(vec![b]);
+        }
+        if received {
+            self.node_mut(child)?.received = true;
         }
         self.queue(child);
         Ok(())
@@ -557,8 +598,7 @@ impl Trunk {
             let count = entries(pivot.bundle.branches());
             let was_paid = consolidating && pivot.seek.paid;
             let paid = was_paid && pivot.bundle.branches().len() > 1;
-            if !paid && pivot.bundle.branches().len() <= fanout && count <= self.config.leaf_entries
-            {
+            if !paid && pivot.bundle.branches().len() <= fanout && count <= self.leaf_limit() {
                 // Paid with one branch: nothing to rewrite once the leaf's own compactions are
                 // in (a consolidation's flush may still be on its way down), then the rent is
                 // spent; the apply of a compaction due or out looks at the leaf again.
@@ -567,9 +607,8 @@ impl Trunk {
                 }
                 return Ok(());
             }
-            let target = self.config.leaf_entries.max(1);
             ChangeKind::Settle {
-                parts: crate::util::div_ceil(count, target).unwrap_or(1).max(1),
+                parts: self.leaf_parts(count),
             }
         } else if node.pivots.len() > fanout {
             ChangeKind::Split
@@ -636,16 +675,31 @@ impl Trunk {
         }
     }
 
-    /// The leaves leaf `n`'s settle would make, as its bundle stands: `ceil(entries /
-    /// leaf_entries)`, at least one.
+    /// The leaves leaf `n`'s settle would make, as its bundle stands ([`Self::leaf_parts`]).
     fn settle_parts(&self, n: usize) -> Result<u64, Error> {
         let pivot = self.node(n)?.pivots.first().ok_or(corrupt())?;
+        Ok(self.leaf_parts(entries(pivot.bundle.branches())))
+    }
+
+    /// The entries a leaf holds before it splits: `fanout` memtables' (SplinterDB's
+    /// `leaf_might_need_to_split`, `incorporation_size_kv_bytes * target_fanout`).
+    pub(super) fn leaf_limit(&self) -> u64 {
+        let fanout = u64::try_from(self.config.fanout).unwrap_or(u64::MAX);
+        self.config.leaf_entries.saturating_mul(fanout)
+    }
+
+    /// The leaves a settle of `count` entries makes: one within [`Self::leaf_limit`], else
+    /// `round(count / leaf_entries)` (SplinterDB's `leaf_split_target_num_leaves`).
+    fn leaf_parts(&self, count: u64) -> u64 {
+        if count <= self.leaf_limit() {
+            return 1;
+        }
         let target = self.config.leaf_entries.max(1);
-        Ok(
-            crate::util::div_ceil(entries(pivot.bundle.branches()), target)
-                .unwrap_or(1)
-                .max(1),
-        )
+        count
+            .saturating_add(target / 2)
+            .checked_div(target)
+            .unwrap_or(1)
+            .max(1)
     }
 
     /// Plans leaf `n`'s whole compaction, tombstones dropped, into `ceil(entries /
@@ -662,7 +716,7 @@ impl Trunk {
         let paid = was_paid && pivot.bundle.branches().len() > 1;
         if !paid
             && pivot.bundle.branches().len() <= self.config.fanout
-            && count <= self.config.leaf_entries
+            && count <= self.leaf_limit()
         {
             if was_paid {
                 self.spend(n, 0)?;
@@ -677,10 +731,8 @@ impl Trunk {
             .iter()
             .flat_map(|b| b.extents.iter().copied())
             .collect();
-        // Its entries counted over every branch, an upper bound on its keys: the parts it asks
-        // for are at least as full as their target allows.
-        let target = self.config.leaf_entries.max(1);
-        let parts = crate::util::div_ceil(count, target).unwrap_or(1).max(1);
+        // Its entries counted over every branch, an upper bound on its keys.
+        let parts = self.leaf_parts(count);
         let per = crate::util::div_ceil(count, parts).unwrap_or(count).max(1);
         let run = if self.pool.is_some() {
             Running::Remote {

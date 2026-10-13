@@ -180,6 +180,9 @@ struct Node {
     wants: Option<Change>,
     /// Queued to be looked at ([`Trunk::queue`]).
     queued: bool,
+    /// Data reached it (the root's pending branches, a parent's flush) since its fullest pivot
+    /// was last considered for a flush ([`Trunk::flush_fullest`]).
+    received: bool,
 }
 
 /// One depth of the trunk ([`Trunk::levels`]): its nodes and pivots, the branches the pivots'
@@ -251,6 +254,8 @@ pub struct TrunkStats {
     pub paid_index: u64,
     pub paid_below: u64,
     pub consolidations_started: u64,
+    /// Fullest pivots flushed past a memtable's entries ([`Trunk::flush_fullest`]).
+    pub fullest_flushes: u64,
     /// The trunk's shape when these were taken ([`Trunk::levels`]), a depth an element from the
     /// root, depths past the last summed into it.
     pub shape: [LevelShape; SHAPE_DEPTHS],
@@ -501,6 +506,7 @@ impl Trunk {
                 end: None,
                 wants: None,
                 queued: false,
+                received: false,
             }],
             root: 0,
             config,
@@ -1262,6 +1268,7 @@ impl Trunk {
             end: None,
             wants: None,
             queued: false,
+            received: false,
         });
         self.root = self.nodes.len().saturating_sub(1);
     }
@@ -1815,6 +1822,7 @@ impl Trunk {
                 end,
                 wants: None,
                 queued: false,
+                received: false,
             });
         }
         if root >= nodes.len() {
@@ -1962,6 +1970,7 @@ impl Trunk {
                     end: None,
                     wants: None,
                     queued: false,
+                    received: false,
                 });
                 out.push((key, self.nodes.len().saturating_sub(1)));
             }
@@ -2012,6 +2021,7 @@ impl Trunk {
                 end: None,
                 wants: None,
                 queued: false,
+                received: false,
             });
             out.push((key, self.nodes.len().saturating_sub(1)));
             rest = tail;

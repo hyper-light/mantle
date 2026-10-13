@@ -96,9 +96,21 @@ pub struct FlushStats {
     pub kept_hits: u64,
     /// Of the kept memtables, those the index a get probes covers (research/51 §7).
     pub kept_covered: u64,
+    /// Gets of keys no kept memtable held, answered without the trunk while they held every
+    /// record it does (research/51 §8).
+    pub kept_absent: u64,
     /// Puts whose trunk share waited for its input reads: the last memtable before a rotation
     /// would stall ([`ShardDb::put`]'s pacing).
     pub waited_steps: u64,
+}
+
+/// What the kept memtables say of a key: its newest entry's operation; that none holds it; or,
+/// when the index named another key of its hash, nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeptAnswer {
+    Found(Op),
+    Absent,
+    Unknown,
 }
 
 /// A memtable kept readable for gets: the memtable, its number among the kept ones (`crate::kept`
@@ -295,8 +307,10 @@ pub struct ShardDb<F: BlockFile> {
     /// The bytes the kept memtables and the key lists home hold ([`HashMem::memory`],
     /// `KeyList::bytes`).
     kept_bytes: usize,
-    /// Gets a kept memtable answered.
+    /// Gets a kept memtable answered, and gets of keys none held answered so while they hold
+    /// every record the trunk does.
     kept_hits: u64,
+    kept_absent: u64,
     /// The page cache's refusals for want of the machine's memory at the last look: one since
     /// gives a kept memtable back.
     kept_refused: u64,
@@ -321,6 +335,10 @@ pub struct ShardDb<F: BlockFile> {
     kept_out_bytes: usize,
     /// The next kept memtable's number.
     kept_next: u32,
+    /// Whether the kept memtables hold every record the trunk does: from a shard made empty, while
+    /// every memtable packed has been kept and none given back. A key no memtable holds and no
+    /// kept one holds is then held by none, and its get reads no further (research/51 §8).
+    kept_whole: bool,
     /// Entries of the key lists of every memtable given back: an index swept when this much has
     /// gone stale since its last sweep is more than half of what it holds.
     kept_gone: u64,
@@ -661,6 +679,7 @@ impl<F: BlockFile> ShardDb<F> {
             kept: std::collections::VecDeque::new(),
             kept_bytes: 0,
             kept_hits: 0,
+            kept_absent: 0,
             kept_refused: 0,
             kept_step: 0,
             kept_seen: 0,
@@ -672,6 +691,7 @@ impl<F: BlockFile> ShardDb<F> {
             kept_out: false,
             kept_out_bytes: 0,
             kept_next: 0,
+            kept_whole: false,
             kept_gone: 0,
             kept_free: Vec::new(),
             sort_spares: Vec::new(),
@@ -743,6 +763,8 @@ impl<F: BlockFile> ShardDb<F> {
     ) -> Result<Self, Error> {
         let mut db = Self::with(Store::create(file, store)?, mem_limit, Trunk::new(trunk)?)?;
         db.grow_cold()?;
+        // An empty trunk: every record it will hold comes from a packed memtable.
+        db.kept_whole = true;
         Ok(db)
     }
 
@@ -756,12 +778,15 @@ impl<F: BlockFile> ShardDb<F> {
         trunk: TrunkConfig,
     ) -> Result<(Self, u64), Error> {
         let (mut store, recovered) = Store::open(file, store)?;
+        let empty = recovered.root.is_none();
         let trunk = match recovered.root {
             Some(head) => Trunk::load(&mut store, head)?,
             None => Trunk::new(trunk)?,
         };
         let mut db = Self::with(store, mem_limit, trunk)?;
         db.grow_cold()?;
+        // A trunk loaded holds records no kept memtable does.
+        db.kept_whole = empty;
         Ok((db, recovered.applied))
     }
 
@@ -2001,12 +2026,21 @@ impl<F: BlockFile> ShardDb<F> {
             }
             found = f.mem.get_hashed(key, hash, value)?;
         }
-        // Then the kept memtables, packed but readable, newest first.
+        // Then the kept memtables, packed but readable, newest first. When they hold every record
+        // the trunk does, a key none holds is held by none.
         if found.is_none() && !self.kept.is_empty() {
             self.tend_kept()?;
-            found = self.kept_get(key, hash, value)?;
-            if found.is_some() {
-                self.kept_hits = self.kept_hits.saturating_add(1);
+            match self.kept_get(key, hash, value)? {
+                KeptAnswer::Found(op) => {
+                    found = Some(op);
+                    self.kept_hits = self.kept_hits.saturating_add(1);
+                }
+                KeptAnswer::Absent if self.kept_whole => {
+                    self.kept_absent = self.kept_absent.saturating_add(1);
+                    value.clear();
+                    return Ok(false);
+                }
+                KeptAnswer::Absent | KeptAnswer::Unknown => {}
             }
         }
         let mut ghost = false;
@@ -2066,12 +2100,21 @@ impl<F: BlockFile> ShardDb<F> {
             }
             found = f.mem.get_hashed(key, hash, value)?;
         }
-        // Then the kept memtables, packed but readable, newest first.
+        // Then the kept memtables, packed but readable, newest first. When they hold every record
+        // the trunk does, a key none holds is held by none.
         if found.is_none() && !self.kept.is_empty() {
             self.tend_kept()?;
-            found = self.kept_get(key, hash, value)?;
-            if found.is_some() {
-                self.kept_hits = self.kept_hits.saturating_add(1);
+            match self.kept_get(key, hash, value)? {
+                KeptAnswer::Found(op) => {
+                    found = Some(op);
+                    self.kept_hits = self.kept_hits.saturating_add(1);
+                }
+                KeptAnswer::Absent if self.kept_whole => {
+                    self.kept_absent = self.kept_absent.saturating_add(1);
+                    value.clear();
+                    return Ok(false);
+                }
+                KeptAnswer::Absent | KeptAnswer::Unknown => {}
             }
         }
         let mut ghost = false;
@@ -3107,6 +3150,8 @@ impl<F: BlockFile> ShardDb<F> {
     /// older stays: a get's probes would grow with the memtables kept (research/51 §7).
     fn keep(&mut self, mut mem: HashMem, keys: Option<crate::kept::KeyList>) {
         if self.memory.is_none() || !self.trunk.has_pool() {
+            // A packed memtable not kept: the trunk holds records no kept one does.
+            self.kept_whole = false;
             self.give_back_kept();
             if let Some(list) = keys {
                 self.free_list(list);
@@ -3121,6 +3166,7 @@ impl<F: BlockFile> ShardDb<F> {
                 let mut list = self.kept_free.pop().unwrap_or_default();
                 if mem.key_list(&mut list).is_err() {
                     // An entry it cannot read is not kept: nor is any older.
+                    self.kept_whole = false;
                     self.give_back_kept();
                     self.free_list(list);
                     self.recycle(mem);
@@ -3143,10 +3189,12 @@ impl<F: BlockFile> ShardDb<F> {
         self.extend_kept();
     }
 
-    /// Gives every kept memtable back, and the indexes over them.
+    /// Gives every kept memtable back, and the indexes over them: the trunk then holds records
+    /// none does, if one was given back.
     fn give_back_kept(&mut self) {
         while let Some(k) = self.kept.pop_front() {
             self.kept_gone = self.kept_gone.saturating_add(k.keys);
+            self.kept_whole = false;
             self.recycle(k.mem);
         }
         self.kept_bytes = 0;
@@ -3362,6 +3410,7 @@ impl<F: BlockFile> ShardDb<F> {
                 self.kept_bytes = self.kept_bytes.saturating_sub(k.mem.memory());
                 self.kept_gone = self.kept_gone.saturating_add(k.keys);
                 self.recycle(k.mem);
+                self.kept_whole = false;
                 gave = true;
             }
         }
@@ -3447,7 +3496,7 @@ impl<F: BlockFile> ShardDb<F> {
     /// cover, newest first, each through its own index, then the index, whose entry is checked:
     /// its memtable still kept, its key the one asked. Every probe's first group is read before
     /// any is probed, their misses overlapped.
-    fn kept_get(&self, key: &[u8], hash: u64, value: &mut Vec<u8>) -> Result<Option<Op>, Error> {
+    fn kept_get(&self, key: &[u8], hash: u64, value: &mut Vec<u8>) -> Result<KeptAnswer, Error> {
         let index = self.kept_index.as_ref();
         let covered = index.and_then(crate::kept::KeptIndex::covers);
         let uncovered = |k: &&KeptMem| covered.is_none_or(|c| crate::kept::older(c, k.number));
@@ -3458,23 +3507,28 @@ impl<F: BlockFile> ShardDb<F> {
         std::hint::black_box(touched);
         for k in self.kept.iter().rev().take_while(uncovered) {
             if let Some(op) = k.mem.get_hashed(key, hash, value)? {
-                return Ok(Some(op));
+                return Ok(KeptAnswer::Found(op));
             }
         }
         let (Some(index), Some(oldest)) = (index, self.kept.front()) else {
-            return Ok(None);
+            // No index: every kept memtable was probed above.
+            return Ok(KeptAnswer::Absent);
         };
         let Some((number, offset)) = index.get(hash) else {
-            return Ok(None);
+            return Ok(KeptAnswer::Absent);
         };
         if crate::kept::older(number, oldest.number) {
             // Its memtable was given back: the trunk holds the record.
-            return Ok(None);
+            return Ok(KeptAnswer::Unknown);
         }
         let at = usize::try_from(number.wrapping_sub(oldest.number)).unwrap_or(usize::MAX);
         match self.kept.get(at) {
-            Some(k) if k.number == number => k.mem.get_at(offset, key, value),
-            _ => Ok(None),
+            Some(k) if k.number == number => Ok(k
+                .mem
+                .get_at(offset, key, value)?
+                // Another key of its hash: the trunk answers.
+                .map_or(KeptAnswer::Unknown, KeptAnswer::Found)),
+            _ => Ok(KeptAnswer::Unknown),
         }
     }
 
@@ -4328,6 +4382,7 @@ impl<F: BlockFile> ShardDb<F> {
         flush.kept = as_u64(self.kept.len());
         flush.kept_bytes = as_u64(self.kept_held());
         flush.kept_hits = self.kept_hits;
+        flush.kept_absent = self.kept_absent;
         let covered = self
             .kept_index
             .as_ref()

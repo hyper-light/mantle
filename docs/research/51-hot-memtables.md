@@ -161,3 +161,16 @@ Built (`kept::KeptIndex`, an `IncMap` of 16-byte slots, a key's hash beside its 
   index passes over those it covers.
 - Two keys of one 64-bit hash share an entry, the newer memtable's; a get of the other finds a
   key that is not its own and reads the trunk.
+
+## 8. Absent keys: when the kept memtables hold every record
+
+37% of the benchmark's gets ask for a key never written. The kept memtables answer those only
+when they hold every record the trunk does: a shard made empty (or opened with no trunk) whose
+packed memtables were all kept and none given back. The trunk takes branches from two places,
+both a packed memtable's (`ShardDb::retire`, `finish_packing`), and each such memtable goes to
+`keep`; so while none is given back and none is packed without being kept, a key no memtable,
+frozen memtable or kept memtable holds is held by none, and the get answers absent without the
+record cache or the trunk (`KeptAnswer::Absent`, `kept_whole`). The index's miss must be clean:
+an entry for the key's hash naming another key (two keys of one 64-bit hash share an entry) says
+nothing, and the trunk answers. Giving one back, a memtable packed while none can be kept, and a
+loaded trunk each end it for the shard's life.

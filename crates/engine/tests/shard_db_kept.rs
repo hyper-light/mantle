@@ -4,8 +4,10 @@
 //! probe. Against a `BTreeMap`, every key reads exactly what was written throughout: puts,
 //! deletions and overwrites across many memtables, the kept memtables answering gets with the
 //! newest version, a deletion in a newer one hiding an older one's value, before and after the
-//! index covers them. Once maintenance is done the index covers every kept memtable. A smaller
-//! budget has them give their memory back, the index's entries for them then missing; without a
+//! index covers them. Once maintenance is done the index covers every kept memtable, and while a
+//! shard made empty has given none back they hold every record the trunk does, so a key none
+//! holds is answered absent without the trunk. A smaller budget has them give their memory back,
+//! the index's entries for them then missing and absent keys read from the trunk; without a
 //! budget or without workers none is kept; reopened, the engine keeps none and reads the
 //! trunk.
 #![allow(
@@ -160,6 +162,12 @@ fn kept_memtables_answer_gets_through_one_index_and_every_read_is_exact() {
         read.kept_hits > kept.kept_hits,
         "no get answered by a kept memtable: {read:?}"
     );
+    // A shard made empty that gave none back: its kept memtables hold every record the trunk
+    // does, and a key none holds was read as absent without the trunk.
+    assert!(
+        read.kept_absent > kept.kept_absent,
+        "no absent key answered by the kept memtables: {read:?}"
+    );
 
     // A key written, deleted and written again, each in its own memtable: kept newest last, so
     // the deletion hides the first value and the second write shows.
@@ -193,7 +201,10 @@ fn kept_memtables_answer_gets_through_one_index_and_every_read_is_exact() {
         after.kept_bytes < before.kept_bytes,
         "a smaller budget kept as much: {before:?} {after:?}"
     );
+    // Memtables given back: the trunk holds records no kept one does, and an absent key is read
+    // from it.
     check_all(&mut db, &oracle);
+    assert_eq!(db.stats().0.kept_absent, after.kept_absent);
     let _ = fill(&mut db, &mut oracle, x, 3);
     check_all(&mut db, &oracle);
     settle(&mut db);

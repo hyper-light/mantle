@@ -68,11 +68,15 @@ memory its owner spares between its memtables, its page cache and its write runs
   growing region's filling (a page or a record a miss), so memory moving between regions never
   holds more than when the step began (tests/shard_db_paced.rs). The page cache's resize had
   taken 0.5 to 3.3 ms on the read path at each step.
-- Only the misses a region's ghost names are timed. The record cache timed every miss to price
-  its share, two clock reads a get that missed it: 14.1% of the shard's time in 10M gets
-  (`perf` cpu-clock, Linux VM, 2026-10-13, `benchmark-results/mantle-splinterdb-20261013/prof`),
-  where the ghost named none of the 970K misses. A miss now says whether the ghost named its key
-  (`records::Lookup::Miss`), and the gain is the time of those gets alone, the paper's `saved`.
+- Only the misses a region's ghost names are timed: the gain is the time of those gets alone,
+  the paper's `saved`. The record cache had timed every miss, two clock reads a get that missed
+  it; a miss now says whether the ghost named its key (`records::Lookup::Miss`). The profile
+  had put 14.1% of the shard's time in 10M gets on those reads (`perf` cpu-clock, Linux VM,
+  2026-10-13, `benchmark-results/mantle-splinterdb-20261013/prof`), where the ghost named none
+  of the 970K misses; without them the same gets ran at the same rate, 734,760 and 735,456 a
+  second (`base-get10m`, `mrec-get10m`), the share moving to the lookup's own loads. On aarch64
+  the clock read's `isb` waits for the loads before it, so a profile charges their misses to it:
+  the reads were not the cost.
 - A region's share pays for its index and ghost: each step charges them at the ratio of index
   to data measured then (`ShardDb::grant`). A 64 MiB record cache's index and ghost had been 51
   MiB outside any budget; with SwissTable groups (util/incmap.rs) 34 MiB, now inside it.

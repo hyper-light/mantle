@@ -332,6 +332,7 @@ async fn serve<F: BlockFile + 'static>(
                 break None;
             }
         }
+        range.take_results(&mut db);
         if let Some(stop) = range.resume(&mut db) {
             break Some(stop);
         }
@@ -744,6 +745,17 @@ impl Range {
     /// applied (their order is kept), no request in hand.
     fn lends(&self) -> bool {
         self.inline && self.fault.is_none() && self.pending.is_empty() && self.active.is_none()
+    }
+
+    /// Takes what the engine's workers sent back since the task's last turn
+    /// ([`ShardDb::take_results`]): each turn, between a batch of requests or a lent engine's
+    /// client turn and the next; a failure is kept as the range's fault.
+    fn take_results<F: BlockFile>(&mut self, db: &mut ShardDb<F>) {
+        if self.fault.is_none()
+            && let Err(e) = db.take_results()
+        {
+            self.fault = Some(e);
+        }
     }
 
     /// One slice of maintenance; a failure is kept as the range's fault. A slice that stopped

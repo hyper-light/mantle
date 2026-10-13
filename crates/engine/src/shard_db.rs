@@ -636,6 +636,22 @@ fn ns_since(t: Option<std::time::Instant>) -> u64 {
 /// A put's share of `debt`: `debt · bytes / room`, the remainder carried to the next put; the
 /// whole debt when no room is left.
 fn share(debt: u64, bytes: usize, room: usize, carry: &mut u128) -> u64 {
+    if room == 0 {
+        *carry = 0;
+        return debt;
+    }
+    // In 64 bits while `debt · bytes` and the carry fit, as they do below 1.6·10^17 units of
+    // debt for a 116-byte put: a 128-bit division is a call into the compiler's runtime, 1.8% of
+    // a fill's shard thread (research/52).
+    if let (Ok(b), Ok(r), Ok(c)) = (
+        u64::try_from(bytes),
+        u64::try_from(room),
+        u64::try_from(*carry),
+    ) && let Some(owed) = debt.checked_mul(b).and_then(|o| o.checked_add(c))
+    {
+        *carry = u128::from(owed.checked_rem(r).unwrap_or(0));
+        return owed.checked_div(r).unwrap_or(0).min(debt);
+    }
     let (bytes, room) = (
         u128::try_from(bytes).unwrap_or(u128::MAX),
         u128::try_from(room).unwrap_or(u128::MAX),
@@ -643,10 +659,6 @@ fn share(debt: u64, bytes: usize, room: usize, carry: &mut u128) -> u64 {
     let owed = u128::from(debt)
         .saturating_mul(bytes)
         .saturating_add(*carry);
-    if room == 0 {
-        *carry = 0;
-        return debt;
-    }
     *carry = owed.checked_rem(room).unwrap_or(0);
     u64::try_from(owed.checked_div(room).unwrap_or(0))
         .unwrap_or(u64::MAX)
@@ -1878,20 +1890,22 @@ impl<F: BlockFile> ShardDb<F> {
             });
         }
         self.trim();
+        // One hash of the key serves the record cache and the memtable.
+        let h = crate::branch::filter::hash(key);
         // A write makes the key's cached record stale: it goes before the write is answered.
         if let Some(r) = self.records.as_mut() {
-            r.invalidate(key, crate::branch::filter::hash(key));
+            r.invalidate(key, h);
         }
         let mut before = self.mem.bytes();
         let t = self.timed.then(std::time::Instant::now);
-        match self.mem.insert(key, op, value) {
+        match self.mem.insert_hashed(key, h, op, value) {
             Err(Error::LimitExceeded { .. }) if !self.mem.is_empty() => {
                 let r = self.timed.then(std::time::Instant::now);
                 self.rotate()?;
                 let ns = ns_since(r);
                 self.flush_stats.rotate_ns = self.flush_stats.rotate_ns.saturating_add(ns);
                 before = self.mem.bytes();
-                self.mem.insert(key, op, value)?;
+                self.mem.insert_hashed(key, h, op, value)?;
             }
             other => other?,
         }
@@ -1917,20 +1931,21 @@ impl<F: BlockFile> ShardDb<F> {
         if self.rotation.is_some() && !self.rotate_paced(keys)? {
             return Ok(false);
         }
+        let h = crate::branch::filter::hash(key);
         let mut before = self.mem.bytes();
-        match self.mem.insert(key, op, value) {
+        match self.mem.insert_hashed(key, h, op, value) {
             Err(Error::LimitExceeded { .. }) if !self.mem.is_empty() => {
                 if !self.rotate_paced(keys)? {
                     return Ok(false);
                 }
                 before = self.mem.bytes();
-                self.mem.insert(key, op, value)?;
+                self.mem.insert_hashed(key, h, op, value)?;
             }
             other => other?,
         }
         self.trim();
         if let Some(r) = self.records.as_mut() {
-            r.invalidate(key, crate::branch::filter::hash(key));
+            r.invalidate(key, h);
         }
         self.pace(self.mem.bytes().saturating_sub(before), true)?;
         Ok(true)
@@ -2816,7 +2831,11 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     fn pace(&mut self, bytes: usize, paced: bool) -> Result<(), Error> {
-        self.grow(false)?;
+        // A range's task takes the workers' results and answers their needs at each of its turns
+        // ([`Self::take_results`]); a put paced by it pays only its shares of the work.
+        if !paced {
+            self.grow(false)?;
+        }
         let room = self.mem.room();
         // A memtable a worker will sort orders itself only for scans (research/40 §4); one the
         // shard packs sorts its own entries as it fills, in chunks of at most `order_bound`
@@ -2839,8 +2858,10 @@ impl<F: BlockFile> ShardDb<F> {
             let room = room.saturating_sub(bytes);
             let w = share(left, bytes, room, &mut self.pack_carry);
             self.flush_stats.pack_share_most = self.flush_stats.pack_share_most.max(w);
-            self.pack_some(w, false)?;
-        } else if !self.frozen.is_empty() {
+            if w > 0 || !paced {
+                self.pack_some(w, false)?;
+            }
+        } else if !paced && !self.frozen.is_empty() {
             self.take_packs(false)?;
         }
         let waiting = self.trunk.fanout().saturating_sub(self.trunk.pending());
@@ -3687,6 +3708,26 @@ impl<F: BlockFile> ShardDb<F> {
     /// forgetting and its slots). Returns the work done, 0 once nothing is owed.
     pub fn idle_step(&mut self, keys: u64) -> Result<u64, Error> {
         self.idle_step_with(keys, false)
+    }
+
+    /// A range task's turn: what the workers sent back since its last turn is taken, a growth
+    /// back or booked once due and packed branches retired, and their needs answered, once a
+    /// turn rather than at every put its pacing runs (research/52). Nothing while a checkpoint
+    /// holds the trunk still.
+    pub(crate) fn take_results(&mut self) -> Result<(), Error> {
+        self.require_async_backend()?;
+        if self.checkpoint_frozen() {
+            return Ok(());
+        }
+        self.grow(false)?;
+        if !self.frozen.is_empty() {
+            self.take_packs(false)?;
+        }
+        // A retired branch's pages may have gone to the cache: the kept memtables give way.
+        if self.kept_crowded() {
+            self.fit_kept(false);
+        }
+        Ok(())
     }
 
     /// A runtime task's idle slice: a required trunk read that has not landed leaves its

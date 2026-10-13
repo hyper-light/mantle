@@ -43,7 +43,34 @@ A turn of the range's task comes between the client's turns, every shard quantum
 about nine puts): `serve` reclaims the lent engine and steps maintenance there
 (`ShardDb::idle_paced_step`), and with requests rather than inline puts it yields after each batch
 of them. A branch taken at the task's turn rather than at the next put delays its retirement by
-one turn of the task (2.3 µs here, one client on the shard), of a packing that takes about 100 ms. The polls' 16.2% and the second hash need not be
-paid per put; the `u128` division need not be paid below its overflow. Together with the clocks
-fixed upstream they are 25.6% of the shard's time, about the 17% 10M needs and short of 100M's 29%:
-the trunk's per-call costs come next.
+one turn of the task (2.3 µs here, one client on the shard), of a packing that takes about 100 ms.
+The polls' 16.2% and the second hash need not be paid per put; the `u128` division need not be paid
+below its overflow.
+
+## 4. The trunk's pass, a put at a time [sample]
+
+A put whose share of the trunk's debt is a unit or more runs one pass of the trunk's maintenance
+(`Trunk::run`), as does every put while compactions are out on the workers: 11.9% of the shard.
+The pass at 10M did no compaction work on the shard; its time was the pass's own:
+
+| `Trunk::run`'s callees | samples of 1,215 |
+|---|---|
+| taking the workers' results (`tend_tasks`, `Pool::take`) | 57 |
+| handing out jobs (`dispatch_tasks`) | 32 |
+| walking the inline tasks, none running (`step_inline`) | 16 |
+| applying finished tasks (`apply_done`) | 13 |
+| moving pending branches to the root, looking at queued nodes, sweeping | 15 |
+
+The compactions run on the workers; a pass takes their results and hands out what they free,
+which a pass at each turn of the range's task does as well as one at each put. A put's share of
+the debt, inline compactions' work when there are any, is paid as before, summed over the turn:
+each share is the debt by the turn's bytes over the room left, as the puts' shares summed are.
+
+The kept memtables' look (`kept_crowded`, 1.8%) follows the steps that may have grown a region, all
+at the turn now. `trim` (1.4%) asked `trimming`, whose kept-memtable part computes the kept
+memtables' bytes and limit while their index is out: that part is the index's to give back, not
+`trim`'s, which brings down the page cache and the record cache.
+
+All told, 16.2% of polls, 11.9% of the trunk's pass, the 1.8% look, the 1.4% `trim` check, the
+`u128` division's 1.8% and the second hash's 0.9% are 34% of the shard's time per put, about the
+29% 100M needs, and hyper-rt's clocks fixed upstream are 6.8% more.

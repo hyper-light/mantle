@@ -358,6 +358,9 @@ pub struct ShardDb<F: BlockFile> {
     /// Work owed but not yet whole, in work·bytes over the room: the remainder of each debt's
     /// share.
     pack_carry: u128,
+    /// The bytes paced puts wrote since their range's task last paid their shares
+    /// ([`Self::take_results`]).
+    turn_bytes: usize,
     /// The device's issuer for the maintenance workers' stores and the batches each may have
     /// out, once the shard is attached ([`Self::attach`]).
     worker_attach: Option<(hyper_block::issuer::Attacher, usize)>,
@@ -712,6 +715,7 @@ impl<F: BlockFile> ShardDb<F> {
             mem_limit,
             trunk,
             pack_carry: 0,
+            turn_bytes: 0,
             worker_attach: None,
             trunk_carry: 0,
             order_bound: ORDER_BOUND,
@@ -1578,7 +1582,9 @@ impl<F: BlockFile> ShardDb<F> {
     /// An operation's share of bringing shrunk regions down to their size; what they gave back
     /// the growing regions may take ([`Self::grant`]).
     fn trim(&mut self) {
-        if !self.trimming() {
+        // Its regions only: the kept memtables' part of `trimming` is given back by their index's
+        // return, not here.
+        if self.trim_cache == 0 && self.trim_records == 0 {
             return;
         }
         if self.trim_cache > 0 && !self.store.trim_cache(self.trim_cache) {
@@ -2831,8 +2837,6 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     fn pace(&mut self, bytes: usize, paced: bool) -> Result<(), Error> {
-        // A range's task takes the workers' results and answers their needs at each of its turns
-        // ([`Self::take_results`]); a put paced by it pays only its shares of the work.
         if !paced {
             self.grow(false)?;
         }
@@ -2851,17 +2855,29 @@ impl<F: BlockFile> ShardDb<F> {
                 .order_moves
                 .saturating_add(u64::try_from(moved).unwrap_or(u64::MAX));
         }
+        if paced {
+            // A range's task pays its turn's puts' shares at the turn, with the workers' results
+            // ([`Self::take_results`]): one pass of the trunk's maintenance a turn, not a put
+            // (research/52).
+            self.turn_bytes = self.turn_bytes.saturating_add(bytes);
+            return Ok(());
+        }
+        self.pay_shares(bytes, room, false)
+    }
+
+    /// Pays `bytes` of puts' shares of the work owed, `room` left in the memtable after them: the
+    /// packing memtable's (or the workers' branches taken), the cache's forgetting and the
+    /// trunk's maintenance, each a share of its debt by `bytes` over the room it is paced over.
+    fn pay_shares(&mut self, bytes: usize, room: usize, paced: bool) -> Result<(), Error> {
         let left = self.pack_left();
         if left > 0 {
             // The memtable rotates when a put no longer fits, before its room reaches nothing:
-            // packing is paced over the room a put of this size leaves, so it ends first.
+            // packing is paced over the room as many bytes again leave, so it ends first.
             let room = room.saturating_sub(bytes);
             let w = share(left, bytes, room, &mut self.pack_carry);
             self.flush_stats.pack_share_most = self.flush_stats.pack_share_most.max(w);
-            if w > 0 || !paced {
-                self.pack_some(w, false)?;
-            }
-        } else if !paced && !self.frozen.is_empty() {
+            self.pack_some(w, false)?;
+        } else if !self.frozen.is_empty() {
             self.take_packs(false)?;
         }
         let waiting = self.trunk.fanout().saturating_sub(self.trunk.pending());
@@ -3711,15 +3727,20 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     /// A range task's turn: what the workers sent back since its last turn is taken, a growth
-    /// back or booked once due and packed branches retired, and their needs answered, once a
-    /// turn rather than at every put its pacing runs (research/52). Nothing while a checkpoint
-    /// holds the trunk still.
+    /// back or booked once due and packed branches retired, their needs answered, and the shares
+    /// of the work owed that the turn's puts wrote paid, once a turn rather than at every put
+    /// (research/52). Nothing while a checkpoint holds the trunk still.
     pub(crate) fn take_results(&mut self) -> Result<(), Error> {
         self.require_async_backend()?;
         if self.checkpoint_frozen() {
             return Ok(());
         }
         self.grow(false)?;
+        let bytes = std::mem::take(&mut self.turn_bytes);
+        if bytes > 0 {
+            let room = self.mem.room();
+            return self.pay_shares(bytes, room, true);
+        }
         if !self.frozen.is_empty() {
             self.take_packs(false)?;
         }

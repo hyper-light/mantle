@@ -25,7 +25,7 @@ use hyper_block::issuer::Issuer;
 use mantle_engine::rows::Rows;
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::Config;
-use mantle_engine::trunk::TrunkConfig;
+use mantle_engine::trunk::{Consolidation, TrunkConfig};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -230,6 +230,61 @@ fn seeks_buy_consolidations_priced_by_the_workers_compactions() {
         check(&mut db, &oracle, k);
     }
     check_scan(&mut db, &oracle, 64);
+    db.check_references().unwrap();
+}
+
+/// Seeks buy consolidations until no descent holds more than the one source a consolidated path
+/// keeps, whatever shape the fill left, an index pivot of one branch over a leaf of one included
+/// (research/50 §14): with consolidation at the first seek with a source to spare, passes of
+/// scanning every key and draining end when one pays for nothing, and then a scan opens at most one
+/// trunk source a segment, every read exact throughout.
+#[test]
+fn seeks_consolidate_every_descent_to_one_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let mut db = ShardDb::create(open(&path, true), STORE, MEM, TRUNK).unwrap();
+    db.set_consolidation(Consolidation::Always);
+    workers(&mut db, &path);
+    let oracle = workload(&mut db, false, 0x2545_f491_4f6c_dd1d);
+    db.flush().unwrap();
+    while db.owed() {
+        db.idle_step(64).unwrap();
+    }
+    let paid = |db: &ShardDb<DeviceFile>| {
+        let (_, t, _) = db.stats();
+        t.paid_index + t.paid_leaves
+    };
+    // A pass that pays consolidates what it paid for: an index pivot's flush moves its branches
+    // into its child, whose settle the next pass pays for and which merges them into one. Every
+    // two passes that pay merge at least two branches into one, and the trunk holds no more
+    // branches than the entries written, so the passes are bounded by twice those.
+    let bound = 2 * (OPS + 1);
+    let mut passes = 0u64;
+    loop {
+        let before = paid(&db);
+        check_scan(&mut db, &oracle, 7);
+        while db.owed() {
+            db.idle_step(64).unwrap();
+        }
+        if paid(&db) == before {
+            break;
+        }
+        passes += 1;
+        assert!(passes <= bound, "seeks kept paying after {passes} passes");
+    }
+    let (_, t0, _) = db.stats();
+    check_scan(&mut db, &oracle, 7);
+    let (_, t1, _) = db.stats();
+    let sources = (t1.charged_leaf_sources + t1.charged_index_sources)
+        - (t0.charged_leaf_sources + t0.charged_index_sources);
+    let segments = t1.scan_segments - t0.scan_segments;
+    assert!(
+        segments > 0 && sources <= segments,
+        "{sources} trunk sources over {segments} segments after {passes} passes"
+    );
+    for k in 0..KEYS {
+        check(&mut db, &oracle, k);
+    }
     db.check_references().unwrap();
 }
 

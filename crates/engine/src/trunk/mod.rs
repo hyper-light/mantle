@@ -117,6 +117,43 @@ impl Passed {
     }
 }
 
+/// Whether a seek's descent holds more sources than the one a consolidated path keeps: only then
+/// do they earn rent, and only then are their opens timed.
+pub fn earns_rent(path: &[Passed]) -> bool {
+    path.iter()
+        .map(|p| p.sources)
+        .fold(0usize, usize::saturating_add)
+        > 1
+}
+
+/// Each pivot's rent for one seek, appended to `out`, from the nanoseconds each of the segment's
+/// sources took to open (`open_ns`, in the segment's order): all an index pivot gave, which its
+/// consolidation flushes into its child, and all but the dearest of the deepest pivot that gave
+/// any (a leaf's, when it holds a branch), which stands for the one source the consolidated path
+/// keeps ([`Trunk::charge`]). A descent of one branch a pivot, the root's and the leaf's, so pays
+/// for its root pivot's flush, after which the leaf it reached earns its own settle. A pivot with a
+/// source to spare is charged at least a nanosecond, however fast the clock read its opens: it
+/// owes rent, and [`Consolidation::Always`] pays at the first such seek whatever the timings.
+pub fn rents(path: &[Passed], open_ns: &[u64], out: &mut Vec<(Passed, u64)>) {
+    let deepest = path.iter().rposition(|p| p.sources > 0);
+    out.extend(path.iter().enumerate().map(|(i, &p)| {
+        let own = open_ns
+            .get(p.first..p.first.saturating_add(p.sources))
+            .unwrap_or(&[]);
+        let sum = own.iter().fold(0u64, |a, &b| a.saturating_add(b));
+        let (kept, spare) = if Some(i) == deepest {
+            (
+                own.iter().copied().max().unwrap_or(0),
+                p.sources.saturating_sub(1),
+            )
+        } else {
+            (0, p.sources)
+        };
+        let rent = sum.saturating_sub(kept);
+        (p, if spare > 0 { rent.max(1) } else { rent })
+    }));
+}
+
 /// What a consolidation's pages cost on this device, measured by the store: nanoseconds a page
 /// read and a page written, and the pages an extent holds.
 #[derive(Clone, Copy, Debug, Default)]
@@ -868,9 +905,9 @@ impl Trunk {
     }
 
     /// Charges the pivots seeks passed (`path`, from [`Self::segment_at`], each with the
-    /// nanoseconds its extra sources took that seek to open, measured) as rent for those sources:
-    /// all an index pivot gave, all but one of a leaf's. A pivot whose rent since its sources
-    /// took their present shape covers its consolidation is paid. The price is what the
+    /// nanoseconds its extra sources took that seek to open, measured, [`rents`]) as rent for
+    /// those sources: all an index pivot gave, all but one of a leaf's. A pivot whose rent since
+    /// its sources took their present shape covers its consolidation is paid. The price is what the
     /// consolidation rewrites, the bundles above it on the descent included: its entries at the
     /// measured cost of a compacted key, and its pages at `pages`' measured cost to read and
     /// write one. Idle time then runs the consolidations paid for, in bulk
@@ -2190,7 +2227,71 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::wall_price;
+    use super::{Passed, earns_rent, rents, wall_price};
+
+    /// A descent's pivot giving `sources` sources from `first` in the segment's list.
+    fn step(first: usize, sources: usize, leaf: bool) -> Passed {
+        Passed {
+            node: 0,
+            pivot: 0,
+            first,
+            sources,
+            newest: 0,
+            leaf,
+        }
+    }
+
+    fn rent_of(path: &[Passed], open_ns: &[u64]) -> Vec<u64> {
+        let mut out = Vec::new();
+        rents(path, open_ns, &mut out);
+        out.iter().map(|&(_, rent)| rent).collect()
+    }
+
+    #[test]
+    fn a_descent_of_one_branch_a_pivot_pays_its_index_pivots_for_every_branch() {
+        // The root's branch and the leaf's: two sources a seek, one after consolidation. The
+        // root pivot earns its branch's open, which its flush into the leaf removes; the leaf
+        // keeps its one.
+        let path = [step(0, 1, false), step(1, 1, true)];
+        assert!(earns_rent(&path));
+        assert_eq!(rent_of(&path, &[5, 7]), vec![5, 0]);
+        // Three levels, the middle one empty.
+        let path = [step(0, 1, false), step(1, 0, false), step(1, 1, true)];
+        assert_eq!(rent_of(&path, &[4, 9]), vec![4, 0, 0]);
+        // An index pivot of two over a leaf of one: both its branches.
+        let path = [step(0, 2, false), step(2, 1, true)];
+        assert_eq!(rent_of(&path, &[2, 6, 5]), vec![8, 0]);
+    }
+
+    #[test]
+    fn the_deepest_pivot_that_gave_a_source_keeps_its_dearest() {
+        // A leaf of three: all but its dearest.
+        let path = [step(0, 0, false), step(0, 3, true)];
+        assert!(earns_rent(&path));
+        assert_eq!(rent_of(&path, &[3, 9, 4]), vec![0, 7]);
+        // An empty leaf below an index pivot of two: the index pivot is the deepest that gave
+        // any, and keeps its dearest, the one branch its flush leaves in the leaf.
+        let path = [step(0, 2, false), step(2, 0, true)];
+        assert_eq!(rent_of(&path, &[3, 8]), vec![3, 0]);
+    }
+
+    #[test]
+    fn a_source_to_spare_owes_rent_however_fast_its_open_measured() {
+        let path = [step(0, 1, false), step(1, 2, true)];
+        assert_eq!(rent_of(&path, &[0, 0, 0]), vec![1, 1]);
+    }
+
+    #[test]
+    fn a_descent_of_one_source_earns_no_rent() {
+        for path in [
+            vec![step(0, 1, false), step(1, 0, true)],
+            vec![step(0, 0, false), step(0, 1, true)],
+            vec![step(0, 0, false), step(0, 0, true)],
+        ] {
+            assert!(!earns_rent(&path));
+            assert!(rent_of(&path, &[6]).iter().all(|&r| r == 0));
+        }
+    }
 
     #[test]
     fn a_consolidation_costs_seeks_its_merging_over_the_idle_workers() {

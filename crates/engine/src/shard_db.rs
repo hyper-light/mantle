@@ -2306,26 +2306,16 @@ impl<F: BlockFile> ShardDb<F> {
                     (true, _) => Some(seg_end.as_slice()),
                     (false, e) => e,
                 };
-                // Sources are timed only when a pivot gave more than its one: what earns rent.
-                let spare = passed.iter().any(|p| {
-                    let (_, n) = p.sources();
-                    n > 1
-                });
+                // Sources are timed only when the descent gave more than the one a consolidated
+                // path keeps: what earns rent.
+                let spare = crate::trunk::earns_rent(passed);
                 if let Err(error) = merge.open(store, &sources, seg_from, hi, end.is_some(), spare)
                 {
                     break 'walk Err(error);
                 }
-                // Each pivot's rent: the measured time its sources took to open, all but the
-                // dearest, which stands for the one branch a consolidated leaf keeps and a
-                // flushed index pivot's bundle becomes in its child.
-                let open_ns = merge.open_ns();
-                charges.extend(passed.iter().map(|&p| {
-                    let (first, n) = p.sources();
-                    let own = open_ns.get(first..first.saturating_add(n)).unwrap_or(&[]);
-                    let sum = own.iter().fold(0u64, |a, &b| a.saturating_add(b));
-                    let rent = sum.saturating_sub(own.iter().copied().max().unwrap_or(0));
-                    (p, rent)
-                }));
+                // Each pivot's rent: the measured time its sources took to open, all an index
+                // pivot gave, all but the dearest of the deepest that gave any (research/50 §14).
+                crate::trunk::rents(passed, merge.open_ns(), charges);
                 if bounded {
                     std::mem::swap(seg_from, seg_end);
                 } else {
@@ -2556,25 +2546,15 @@ impl<F: BlockFile> ShardDb<F> {
                     (true, _) => Some(seg_end.as_slice()),
                     (false, e) => e,
                 };
-                // Sources are timed only when a pivot gave more than its one: what earns rent.
-                let spare = passed.iter().any(|p| {
-                    let (_, n) = p.sources();
-                    n > 1
-                });
+                // Sources are timed only when the descent gave more than the one a consolidated
+                // path keeps: what earns rent.
+                let spare = crate::trunk::earns_rent(passed);
                 merge
                     .open(&sources, seg_from, hi, end.is_some(), spare)
                     .await?;
-                // Each pivot's rent: the measured time its sources took to open, all but the
-                // dearest, which stands for the one branch a consolidated leaf keeps and a
-                // flushed index pivot's bundle becomes in its child.
-                let open_ns = merge.open_ns();
-                charges.extend(passed.iter().map(|&p| {
-                    let (first, n) = p.sources();
-                    let own = open_ns.get(first..first.saturating_add(n)).unwrap_or(&[]);
-                    let sum = own.iter().fold(0u64, |a, &b| a.saturating_add(b));
-                    let rent = sum.saturating_sub(own.iter().copied().max().unwrap_or(0));
-                    (p, rent)
-                }));
+                // Each pivot's rent: the measured time its sources took to open, all an index
+                // pivot gave, all but the dearest of the deepest that gave any (research/50 §14).
+                crate::trunk::rents(passed, merge.open_ns(), charges);
                 if bounded {
                     std::mem::swap(seg_from, seg_end);
                 } else {

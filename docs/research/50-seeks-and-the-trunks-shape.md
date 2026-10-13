@@ -321,3 +321,34 @@ its share, and the regions held 1,536 bytes past the budget (`shard_db_paced`'s
 `memory_moving_between_regions_never_holds_more_than_the_budget`, 7 of 40 runs). A region now grows
 past what it holds only into the budget's room, and each trim step grants again what it freed:
 0 of 60 runs.
+
+## 14. A descent of one branch a pivot
+
+Sources. macOS, 10M keys, the ranges path, 1M seeks after the fill, four rounds interleaved
+(`mac-ab2.sh`): 1d5caa9, 3c1675a (scan leaves read in place), 3e6378f (kept memtables), 9e53a6c
+(both) and a3a840c (9e53a6c, puts paced at the range task's turn, research/52).
+
+Seeks' rent paid each pivot for its sources all but its dearest (`ShardDb::scan`), the rule
+`Trunk::charge` states for a leaf, and timed a seek's sources only when a pivot gave more than
+one. A fill that ends with one branch in each root pivot and one in each leaf, which a fill whose
+maintenance keeps up ends in, gives every seek two sources, and no pivot earns rent for either:
+nothing is consolidated, and every seek merges both for as long as no put changes the shape.
+
+| build | rounds that ended a pivot's branch per level | seeks/s, those rounds | seeks/s, the others |
+|---|---|---|---|
+| 1d5caa9, 3c1675a, 3e6378f | 0 of 12 | | 411–491K |
+| 9e53a6c | 2 of 4 | 287K, 345K | 407K, 475K |
+| a3a840c | 4 of 4 | 298–346K | |
+
+In 9e53a6c's second round the seeks were charged 1,000,011 index and 1,000,011 leaf sources and
+paid for no pivot (`charged_*`, `paid_*`), two sources a seek throughout; in 3c1675a's and
+3e6378f's second rounds they paid for 7 index pivots and 8 leaves, and the consolidations left 1.2
+sources a seek.
+
+`Trunk::charge` states the rule the scans did not apply: an index pivot owes rent for every source
+it gave, since its consolidation flushes them into its child, and only the deepest pivot that gave
+any keeps one, the source the consolidated descent keeps (`trunk::rents`, `trunk::earns_rent`).
+The root pivot's branch then pays for its flush; the leaf it lands in holds two and pays for its
+settle. A pivot with a source to spare is charged at least a nanosecond, so
+`Consolidation::Always` pays at the first such seek whatever the clock read
+(`shard_db_workers`' `seeks_consolidate_every_descent_to_one_source`).

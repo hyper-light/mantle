@@ -10,11 +10,20 @@
 //! reference implementation's (libCacheSim `S3FIFO.c`: small queue 10% of the cache, ghost 90%,
 //! promotion at two reads, a page's count capped at 3).
 //!
-//! Each slot owns its page's buffer, so a slot never moves: resizing sets the page limit, and a
-//! cache above it is brought down a few pages an operation (`trim`) by the rule above, freed
-//! buffers dropped, with no page copied (a tuning step resizes the cache while reads run,
-//! research/36). A freed slot's buffer is the next page's, so a warm cache allocates nothing. The
-//! index and the ghost grow a few buckets a write (`util::incmap`), so no read rehashes them.
+//! Pages lie in chunks of memory. A new chunk has room for as many pages as all before it together
+//! (a table that doubles, CLRS §17.4), so a cache that grows to `n` pages allocates O(log n)
+//! times; it holds at most one tuning step of the limit (`TUNE_STEP_PERCENT`, Luo and Carey, PVLDB
+//! 2021 §5.4), so a step that lowers the limit gives back whole chunks, and at most what the limit
+//! has left. A chunk's pages become slots in idle time (`reserve`), each written once as it is
+//! made, and only as many as the reads since the last such time asked for: a read never
+//! allocates or touches memory for the first time, and the cache takes the memory its reads use,
+//! not its limit (measured: reserving the whole limit ahead took 38.7 GB, 7.9 M allocations, for a
+//! 10M-key store of 2.3 GB, and halved its gets; research/50 §9). A read that finds no slot made
+//! leaves its page out, as an insert past its eviction bound does. Resizing sets the page limit;
+//! a cache above it is brought down a few pages an operation (`trim`) by the rule above, and the
+//! chunks above it are given back the last first, its pages dropped. A freed slot is the next
+//! page's, so a warm cache allocates nothing. The index and the ghost grow a few buckets a write
+//! (`util::incmap`), so no read rehashes them.
 //!
 //! The ghost names the addresses evicted within the last `ghost_cap` evictions. A ghost hit
 //! leaves a hole rather than keeping an older address longer, as libCacheSim's ghost FIFO does,
@@ -26,6 +35,7 @@
 
 use std::num::NonZeroUsize;
 
+use crate::shard_db::TUNE_STEP_PERCENT;
 use crate::util::incmap::{IncMap, SWEEP};
 
 /// Cited: the small queue's share of the cache, in tenths (libCacheSim `S3FIFO.c`
@@ -80,6 +90,10 @@ struct Slot {
     live: bool,
     newer: Option<NonZeroUsize>,
     older: Option<NonZeroUsize>,
+    /// Its page's place: the chunk, the byte it starts at there, and its payload's length.
+    chunk: usize,
+    at: usize,
+    len: usize,
 }
 
 /// A page cache of at most `limit` pages.
@@ -87,9 +101,10 @@ struct Slot {
 pub struct Cache {
     page: usize,
     limit: usize,
-    /// Each slot's buffer, parallel to `slots`: a page's capacity while the slot holds a page or
-    /// waits in `free`, none in `empty`.
-    bufs: Vec<Vec<u8>>,
+    /// The pages' memory (the module's rule), each chunk's first slot, and its pages.
+    chunks: Vec<Vec<u8>>,
+    starts: Vec<usize>,
+    sizes: Vec<usize>,
     slots: Vec<Slot>,
     map: IncMap,
     small: Fifo,
@@ -101,9 +116,18 @@ pub struct Cache {
     /// the last `ghost_cap` evictions.
     ghosts: IncMap,
     ghost_seq: u64,
-    /// Slots without a page, with a buffer and without one.
+    /// Slots made that hold no page.
     free: Vec<usize>,
-    empty: Vec<usize>,
+    /// Pages inserted since `reserve` last caught up: the free slots it keeps ready.
+    wanted: usize,
+    /// Slots a read made itself because idle time had not made one.
+    grown: u64,
+    /// While the chunks have room for more pages than the limit: the last chunk's first slot,
+    /// whose pages `trim` drops before the chunk is given back, and the next of its slots to
+    /// look at. Its free slots are set aside meanwhile, kept in case the limit grows back first.
+    retiring: Option<usize>,
+    retire_at: usize,
+    retired: Vec<usize>,
     hits: u64,
     misses: u64,
     /// The most queue steps one eviction took.
@@ -113,15 +137,16 @@ pub struct Cache {
 }
 
 impl Cache {
-    /// A cache of `pages` pages of `page` bytes, at least one. Slots and their buffers are
-    /// made as pages arrive.
+    /// A cache of `pages` pages of `page` bytes, at least one. Its memory is taken as reads
+    /// want it ([`Self::reserve`]).
     pub fn new(pages: usize, page: usize) -> Self {
-        let pages = pages.max(1);
         Self {
             page,
-            limit: pages,
-            bufs: Vec::with_capacity(pages),
-            slots: Vec::with_capacity(pages),
+            limit: pages.max(1),
+            chunks: Vec::new(),
+            starts: Vec::new(),
+            sizes: Vec::new(),
+            slots: Vec::new(),
             map: IncMap::new(),
             small: Fifo::default(),
             main: Fifo::default(),
@@ -129,8 +154,12 @@ impl Cache {
             main_live: 0,
             ghosts: IncMap::new(),
             ghost_seq: 0,
-            free: Vec::with_capacity(pages),
-            empty: Vec::new(),
+            free: Vec::new(),
+            wanted: 0,
+            grown: 0,
+            retiring: None,
+            retire_at: 0,
+            retired: Vec::new(),
             hits: 0,
             misses: 0,
             evict_steps_most: 0,
@@ -157,12 +186,20 @@ impl Cache {
             return false;
         };
         slot.freq = slot.freq.saturating_add(1).min(MAX_FREQ);
-        let Some(payload) = self.bufs.get(i) else {
+        let Some(payload) = self.payload(i) else {
             return false;
         };
         out.extend_from_slice(payload);
         self.hits = self.hits.saturating_add(1);
         true
+    }
+
+    /// The payload slot `i` holds.
+    fn payload(&self, i: usize) -> Option<&[u8]> {
+        let s = self.slots.get(i)?;
+        self.chunks
+            .get(s.chunk)?
+            .get(s.at..s.at.checked_add(s.len)?)
     }
 
     /// The payload cached for `address`, lent in place and counted as a read; none when it is
@@ -177,7 +214,7 @@ impl Cache {
         let slot = self.slots.get_mut(i)?;
         slot.freq = slot.freq.saturating_add(1).min(MAX_FREQ);
         self.hits = self.hits.saturating_add(1);
-        self.bufs.get(i).map(Vec::as_slice)
+        self.payload(i)
     }
 
     /// The payload cached for `address`, appended to `out`, without counting a read: a scan's
@@ -186,7 +223,7 @@ impl Cache {
         let Some(i) = self.slot_of(address) else {
             return false;
         };
-        match self.bufs.get(i) {
+        match self.payload(i) {
             Some(payload) => {
                 out.extend_from_slice(payload);
                 true
@@ -198,7 +235,7 @@ impl Cache {
     /// Whether the page can be read from memory, without counting or promoting the look.
     pub fn contains(&self, address: u64) -> bool {
         self.slot_of(address)
-            .and_then(|i| self.bufs.get(i))
+            .and_then(|i| self.payload(i))
             .is_some()
     }
 
@@ -213,21 +250,29 @@ impl Cache {
         // eviction may cost a step for each page the queues cycle, so it is bounded at the
         // policy's own amortized cost, and an insert whose bound frees no slot leaves the page
         // out; the queues keep their place, so the next insert goes on from there.
+        self.wanted = self.wanted.saturating_add(1);
         if self.held() >= self.limit && !self.evict(EVICT_STEPS) {
             self.skipped = self.skipped.saturating_add(1);
             return;
         }
-        let Some(i) = self.slot() else {
+        // A slot made in idle time, else one made now: its page touched here, and at most
+        // O(log n) times over the cache's growth a chunk taken (the module's rule). Idle time
+        // makes the slots the reads since asked for, so a read seldom does.
+        let Some(i) = self.take_free().or_else(|| self.make_now()) else {
+            self.skipped = self.skipped.saturating_add(1);
             return;
         };
-        let Some(buf) = self.bufs.get_mut(i) else {
+        let Some(&Slot { chunk, at, .. }) = self.slots.get(i) else {
             return;
         };
-        if buf.capacity() == 0 {
-            buf.reserve_exact(self.page);
-        }
-        buf.clear();
-        buf.extend_from_slice(payload);
+        let Some(room) = at
+            .checked_add(payload.len())
+            .and_then(|end| self.chunks.get_mut(chunk)?.get_mut(at..end))
+        else {
+            self.free.push(i);
+            return;
+        };
+        room.copy_from_slice(payload);
         let to_main = self.forget_ghost(address);
         let queue = if to_main { Queue::Main } else { Queue::Small };
         if let Some(slot) = self.slots.get_mut(i) {
@@ -238,6 +283,9 @@ impl Cache {
                 live: true,
                 newer: None,
                 older: None,
+                chunk,
+                at,
+                len: payload.len(),
             };
         }
         self.push(queue, i);
@@ -250,13 +298,60 @@ impl Cache {
         self.small_live.saturating_add(self.main_live)
     }
 
-    /// A slot for a new page: a freed one with its buffer, else one whose buffer was dropped,
-    /// else a new one. Pages held stay within the limit, so slots stay within the most pages the
-    /// cache was ever given.
-    fn slot(&mut self) -> Option<usize> {
-        if let Some(i) = self.free.pop().or_else(|| self.empty.pop()) {
+    /// A made slot holding no page, none in a retiring chunk: those met are set aside.
+    fn take_free(&mut self) -> Option<usize> {
+        while let Some(i) = self.free.pop() {
+            if self.retiring.is_some_and(|first| i >= first) {
+                // Room was taken for the chunk's slots when it began to retire.
+                self.retired.push(i);
+                continue;
+            }
             return Some(i);
         }
+        None
+    }
+
+    /// A slot made for a read when idle time has not made one: none at the limit or while a
+    /// chunk retires.
+    fn make_now(&mut self) -> Option<usize> {
+        if self.retiring.is_some() || self.slots.len() >= self.limit {
+            return None;
+        }
+        self.grown = self.grown.saturating_add(1);
+        if self.make_slot() {
+            self.take_free()
+        } else {
+            None
+        }
+    }
+
+    /// Pages the chunks have room for, made into slots or not.
+    fn room(&self) -> usize {
+        self.sizes.iter().fold(0usize, |a, &p| a.saturating_add(p))
+    }
+
+    /// One more slot, its page written once so the OS maps it now: the last chunk's next page,
+    /// or a new chunk's first. False when the limit or the memory refuses one.
+    fn make_slot(&mut self) -> bool {
+        let full = match (self.chunks.last(), self.sizes.last()) {
+            (Some(c), Some(&pages)) => c.len() >= pages.saturating_mul(self.page),
+            _ => true,
+        };
+        if full && !self.new_chunk() {
+            return false;
+        }
+        let Some(chunk) = self.chunks.len().checked_sub(1) else {
+            return false;
+        };
+        let Some(c) = self.chunks.get_mut(chunk) else {
+            return false;
+        };
+        let at = c.len();
+        let Some(end) = at.checked_add(self.page) else {
+            return false;
+        };
+        // Within the room taken for the chunk: no reallocation, the page written once.
+        c.resize(end, 0);
         let i = self.slots.len();
         self.slots.push(Slot {
             address: 0,
@@ -265,9 +360,41 @@ impl Cache {
             live: false,
             newer: None,
             older: None,
+            chunk,
+            at,
+            len: 0,
         });
-        self.bufs.push(Vec::new());
-        Some(i)
+        self.free.push(i);
+        true
+    }
+
+    /// Takes a new chunk by the module's rule, with room in the slot and free lists for its
+    /// pages, so making them reallocates nothing. False when the limit has no room left or the
+    /// memory refuses it.
+    fn new_chunk(&mut self) -> bool {
+        let room = self.room();
+        let step = (self.limit.saturating_mul(TUNE_STEP_PERCENT) / 100).max(1);
+        let pages = room.max(1).min(step).min(self.limit.saturating_sub(room));
+        if pages == 0 {
+            return false;
+        }
+        let Some(bytes) = pages.checked_mul(self.page) else {
+            return false;
+        };
+        let mut chunk = Vec::new();
+        if chunk.try_reserve_exact(bytes).is_err()
+            || self.slots.try_reserve_exact(pages).is_err()
+            || self.free.try_reserve_exact(pages).is_err()
+            || self.chunks.try_reserve(1).is_err()
+            || self.starts.try_reserve(1).is_err()
+            || self.sizes.try_reserve(1).is_err()
+        {
+            return false;
+        }
+        self.starts.push(self.slots.len());
+        self.sizes.push(pages);
+        self.chunks.push(chunk);
+        true
     }
 
     fn push(&mut self, queue: Queue, i: usize) {
@@ -487,56 +614,78 @@ impl Cache {
             }
             self.step();
         }
-        for _ in 0..n {
-            if self.held().saturating_add(self.free.len()) <= self.limit {
+        self.settle_retirement();
+        // Then the chunks above the limit, the last first: its slots looked at `n` a call, the
+        // pages they hold dropped, and the chunk given back once none is left.
+        let mut looked = 0usize;
+        while self.room() > self.limit && looked < n {
+            let (Some(&first), Some(&pages)) = (self.starts.last(), self.sizes.last()) else {
+                break;
+            };
+            if self.retiring.is_none() {
+                if self.retired.try_reserve_exact(pages).is_err() {
+                    break;
+                }
+                self.retiring = Some(first);
+                self.retire_at = self.slots.len();
+            }
+            while looked < n && self.retire_at > first {
+                self.retire_at = self.retire_at.saturating_sub(1);
+                looked = looked.saturating_add(1);
+                let i = self.retire_at;
+                if let Some(address) = self.slots.get(i).filter(|s| s.live).map(|s| s.address) {
+                    self.map.remove(address);
+                    self.release(i);
+                }
+            }
+            if self.retire_at > first {
                 break;
             }
-            let Some(i) = self.free.pop() else { break };
-            if let Some(b) = self.bufs.get_mut(i) {
-                *b = Vec::new();
-            }
-            self.empty.push(i);
+            // Every page of the chunk dropped: its slots leave the free list and it is given back.
+            self.free.retain(|&i| i < first);
+            self.retired.clear();
+            self.slots.truncate(first);
+            self.chunks.pop();
+            self.starts.pop();
+            self.sizes.pop();
+            self.retiring = None;
         }
         self.over() > 0
     }
 
-    /// Slots the limit allows that have no buffer yet: what [`Self::reserve`] has left to make.
-    pub fn unreserved(&self) -> usize {
-        self.limit
-            .saturating_sub(self.held())
-            .saturating_sub(self.free.len())
+    /// A retirement the limit no longer asks for ends: the slots it set aside are free again.
+    fn settle_retirement(&mut self) {
+        if self.retiring.is_some() && self.room() <= self.limit {
+            self.retiring = None;
+            self.free.append(&mut self.retired);
+        }
     }
 
-    /// Makes up to `n` of the slots the limit allows, each with its page's buffer allocated and
-    /// written once, so the OS maps its memory now: a read that misses later takes a ready
-    /// buffer, with no allocation and no first-touch page fault on its path. Run in idle time;
-    /// the pages made.
+    /// Slots wanted and not made: the pages inserted since [`Self::reserve`] last caught up that
+    /// the free slots do not cover, within the limit; none while chunks retire.
+    pub fn unreserved(&self) -> usize {
+        if self.retiring.is_some() {
+            return 0;
+        }
+        self.wanted
+            .saturating_sub(self.free.len())
+            .min(self.limit.saturating_sub(self.slots.len()))
+    }
+
+    /// Makes up to `n` of the slots wanted, each its page written once so the OS maps it now: a
+    /// read that misses later takes a made slot, with no allocation and no first-touch page
+    /// fault on its path. Run in idle time; the slots made.
     pub fn reserve(&mut self, n: usize) -> usize {
+        self.settle_retirement();
         let mut made = 0usize;
         while made < n && self.unreserved() > 0 {
-            let i = match self.empty.pop() {
-                Some(i) => i,
-                None => {
-                    let i = self.slots.len();
-                    self.slots.push(Slot {
-                        address: 0,
-                        freq: 0,
-                        queue: Queue::Small,
-                        live: false,
-                        newer: None,
-                        older: None,
-                    });
-                    self.bufs.push(Vec::new());
-                    i
-                }
-            };
-            if let Some(buf) = self.bufs.get_mut(i) {
-                // Written whole, then emptied: the capacity stays, mapped.
-                buf.resize(self.page, 0);
-                buf.clear();
+            if !self.make_slot() {
+                break;
             }
-            self.free.push(i);
             made = made.saturating_add(1);
+        }
+        if self.unreserved() == 0 {
+            self.wanted = 0;
         }
         made
     }
@@ -546,11 +695,10 @@ impl Cache {
         self.map.bytes().saturating_add(self.ghosts.bytes())
     }
 
-    /// Pages and freed buffers above the limit: what `trim` has left to do.
+    /// Pages held, or pages the chunks have room for, above the limit: what `trim` has left
+    /// to do.
     pub fn over(&self) -> usize {
-        self.held()
-            .saturating_add(self.free.len())
-            .saturating_sub(self.limit)
+        self.held().max(self.room()).saturating_sub(self.limit)
     }
 
     /// Whether `address` was evicted recently enough that the ghost still names it: a miss on
@@ -582,16 +730,19 @@ impl Cache {
         self.evict_steps_most
     }
 
-    /// Inserts left out because their bounded eviction freed no slot.
+    /// Inserts left out because their bounded eviction freed no slot, or no slot was made.
     pub fn skipped(&self) -> u64 {
         self.skipped
     }
 
-    /// The cache's bytes in memory: its pages' buffers, held or freed.
+    /// Slots reads made themselves, in a chunk's room, when idle time had not made one.
+    pub fn grown(&self) -> u64 {
+        self.grown
+    }
+
+    /// The cache's bytes in memory: its slots' pages, holding a page or not.
     pub fn bytes(&self) -> usize {
-        self.held()
-            .saturating_add(self.free.len())
-            .saturating_mul(self.page)
+        self.slots.len().saturating_mul(self.page)
     }
 }
 
@@ -605,9 +756,80 @@ mod tests {
         format!("page {a}").into_bytes()
     }
 
+    /// A cache whose slots are all made, as idle time leaves one its reads have filled.
+    fn warm(pages: usize, page: usize) -> Cache {
+        let mut c = Cache::new(pages, page);
+        c.wanted = pages;
+        c.reserve(usize::MAX);
+        c
+    }
+
+    #[test]
+    fn a_cache_takes_memory_only_as_reads_want_it_in_chunks_and_never_on_a_read() {
+        // A cache of a million pages takes memory as its reads come, not its limit: the first
+        // read makes its own slot, and idle time then makes as many as the reads since wanted.
+        let mut c = Cache::new(1 << 20, 64);
+        assert_eq!(c.unreserved(), 0);
+        c.insert(1, &page(1));
+        assert!(c.contains(1));
+        assert_eq!(c.slots.len(), 1);
+        assert_eq!(c.reserve(usize::MAX), 1);
+        assert_eq!(c.unreserved(), 0);
+        // The next read takes the slot idle time made; the one after makes its own. Each chunk
+        // has room for as many pages as those before it.
+        for a in 2..4u64 {
+            c.insert(a, &page(a));
+        }
+        assert!(c.contains(2) && c.contains(3));
+        assert_eq!(c.grown(), 2);
+        assert_eq!(c.sizes, vec![1, 1, 2]);
+        assert_eq!(c.bytes(), c.slots.len() * 64);
+        assert_eq!(c.slots.len(), 3);
+        // Chunks double up to a tuning step of the limit, so a cache filled to its limit took
+        // O(log n) of them plus the steps.
+        let mut c = Cache::new(4096, 64);
+        c.wanted = 4096;
+        c.reserve(usize::MAX);
+        assert_eq!(c.slots.len(), 4096);
+        let step = 4096 * TUNE_STEP_PERCENT / 100;
+        assert!(c.sizes.iter().all(|&p| p <= step), "{:?}", c.sizes);
+        assert!(c.chunks.len() <= 13 + 4096 / step + 1, "{}", c.chunks.len());
+    }
+
+    #[test]
+    fn a_lowered_limit_gives_back_whole_chunks_the_last_first() {
+        let mut c = warm(1000, 64);
+        for a in 0..1000u64 {
+            c.insert(a, &page(a));
+        }
+        let before = c.chunks.len();
+        c.resize(500);
+        while c.trim(64) {}
+        assert!(c.room() <= 500, "{}", c.room());
+        assert!(c.chunks.len() < before);
+        // What it holds reads back exactly; what it dropped misses.
+        for a in 0..1000u64 {
+            let mut out = Vec::new();
+            if c.get(a, &mut out) {
+                assert_eq!(out, page(a));
+            }
+        }
+        assert!(c.held() <= 500);
+        // Grown back, it makes slots again as reads want them.
+        c.resize(1000);
+        for a in 1000..1100u64 {
+            c.insert(a, &page(a));
+        }
+        c.reserve(usize::MAX);
+        for a in 1000..1100u64 {
+            c.insert(a, &page(a));
+        }
+        assert!(c.contains(1099));
+    }
+
     #[test]
     fn a_cached_page_reads_back_and_a_forgotten_one_misses() {
-        let mut c = Cache::new(10, 64);
+        let mut c = warm(10, 64);
         c.insert(7, &page(7));
         let mut out = Vec::new();
         assert!(c.get(7, &mut out));
@@ -624,7 +846,7 @@ mod tests {
 
     #[test]
     fn repeated_rewrites_and_invalidations_keep_serving_current_pages() {
-        let mut c = Cache::new(64, 64);
+        let mut c = warm(64, 64);
         for a in 0..64u64 {
             c.insert(a, &page(a));
         }
@@ -676,7 +898,7 @@ mod tests {
         // main, which no one insert pays. Each takes at most the bound, the pages it does not
         // admit are only left out, and the hand goes on, so new pages are admitted again.
         let n = 2048u64;
-        let mut c = Cache::new(usize::try_from(n).unwrap(), 64);
+        let mut c = warm(usize::try_from(n).unwrap(), 64);
         for a in 0..n {
             c.insert(a, &page(a));
         }
@@ -715,7 +937,7 @@ mod tests {
     fn a_scan_does_not_flush_pages_read_again() {
         // Ten slots: pages 0..3 read three times each move to main; a scan of 1,000 pages read
         // once passes through the small queue and leaves them.
-        let mut c = Cache::new(10, 64);
+        let mut c = warm(10, 64);
         for a in 0..3u64 {
             c.insert(a, &page(a));
         }
@@ -739,7 +961,7 @@ mod tests {
 
     #[test]
     fn a_page_read_again_after_its_eviction_enters_main() {
-        let mut c = Cache::new(10, 64);
+        let mut c = warm(10, 64);
         // Fifteen pages into ten slots: the five oldest, 0 among them, leave the small queue
         // unread for the ghost, which holds nine.
         for a in 0..15u64 {
@@ -756,7 +978,7 @@ mod tests {
 
     #[test]
     fn the_ghost_names_what_an_eager_window_of_evictions_does_and_stays_bounded() {
-        let mut c = Cache::new(40, 64);
+        let mut c = warm(40, 64);
         let cap = Cache::ghost_cap(40);
         // The eager window: the last `cap` evictions, newest at the front, a forgotten address
         // leaving a hole where it stands.
@@ -791,7 +1013,7 @@ mod tests {
 
     #[test]
     fn a_resized_cache_serves_only_what_it_was_given_and_keeps_its_bounds() {
-        let mut c = Cache::new(64, 32);
+        let mut c = warm(64, 32);
         let mut most = 64;
         let mut latest: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
         let mut x = 0x2545_f491_4f6c_dd1du64;
@@ -820,9 +1042,12 @@ mod tests {
                         );
                     }
                 }
-                9 => {
+                9 if x & (1 << 41) == 0 => {
                     c.forget(address);
                     latest.remove(&address);
+                }
+                9 => {
+                    c.reserve(1 + usize::try_from((x >> 20) % 16).unwrap());
                 }
                 _ if x & (1 << 40) == 0 => {
                     let pages = 1 + usize::try_from((x >> 20) % 128).unwrap();
@@ -843,24 +1068,28 @@ mod tests {
                 c.slots[i].live && c.slots[i].address == a
             }));
             assert_eq!(
-                c.free.len() + c.empty.len() + live,
+                c.free.len() + c.retired.len() + live,
                 c.slots.len(),
                 "step {step}"
             );
+            assert!(c.free.iter().all(|&i| i < c.slots.len()), "step {step}");
             assert_eq!(c.small_live + c.main_live, live, "step {step}");
             // Never above the limit by more than it was, nor growing while above it.
             assert!(live <= c.limit.max(held), "step {step}");
             held = live;
             if c.over() == 0 {
-                assert!(live + c.free.len() <= c.limit, "step {step}");
+                assert!(c.slots.len() <= c.limit, "step {step}");
             }
             assert!(c.slots.len() <= most, "step {step}");
-            assert!(c.empty.iter().all(|&i| c.bufs[i].capacity() == 0));
             assert!(
                 c.ghosts.len() <= 4 * Cache::ghost_cap(most).max(16),
                 "step {step}"
             );
-            assert_eq!(c.bytes(), (live + c.free.len()) * 32, "step {step}");
+            assert_eq!(
+                c.bytes(),
+                (live + c.free.len() + c.retired.len()) * 32,
+                "step {step}"
+            );
         }
     }
 }

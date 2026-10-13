@@ -440,7 +440,7 @@ pub struct ShardDb<F: BlockFile> {
 /// Cited (Luo & Carey, PVLDB 2021 §5.4): a tuning step moves 5% of the memory budget toward
 /// the region whose memory saves more, and takes at most 10% of the region giving it up, since
 /// both regions' returns diminish.
-const TUNE_STEP_PERCENT: usize = 5;
+pub(crate) const TUNE_STEP_PERCENT: usize = 5;
 const TUNE_DONOR_PERCENT: usize = 10;
 
 /// Cited (Luo & Carey, PVLDB 2021 §5.4): the Newton step fits the cost's slope to the last

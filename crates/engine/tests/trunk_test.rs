@@ -230,7 +230,11 @@ fn full_pivots_carry_in_flight_branches_down_uncompacted() {
             x ^= x >> 7;
             x ^= x << 17;
             let k = (x % 600) as u32;
-            let op = if x % 5 == 0 { Op::Delete } else { Op::Put };
+            let op = if x.is_multiple_of(5) {
+                Op::Delete
+            } else {
+                Op::Put
+            };
             mem.insert(key(k), (op, format!("v{batch}-{k}").into_bytes()));
         }
         let mut b = Builder::new(&mut store, Keys::Exactly(mem.len() as u64)).unwrap();

@@ -1527,6 +1527,26 @@ impl RunCursor {
 
     /// Positions an attached scan cursor through demand completion, keeping the selected
     /// leaf in this future across a wait. Its owner returns the cursor on cancellation.
+    /// Asks for the leaf `from` falls in without waiting: a page in memory lands in the span at
+    /// once, one on the device goes to the issuer, and [`Self::seek_async`] takes it from there.
+    /// A seek's sources ask together, so their device reads overlap.
+    pub(crate) fn ask<F: BlockFile>(
+        &mut self,
+        branch: &Branch,
+        store: &mut Store<F>,
+        from: &[u8],
+    ) -> Result<(), Error> {
+        let page = u64::from(branch.leaf_of(from)?);
+        let address = branch.page_address(store, page)?;
+        self.loaded = None;
+        self.valid = false;
+        self.span_page = None;
+        self.page.clear();
+        store.read_page_paced(&mut self.span, address, &mut self.page)?;
+        self.page.clear();
+        Ok(())
+    }
+
     pub(crate) async fn seek_async<F: BlockFile>(
         &mut self,
         branch: &Branch,

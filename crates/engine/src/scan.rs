@@ -72,6 +72,8 @@ pub struct ScanMerge<'a> {
     /// The nanoseconds each source of the last open took to open, in the sources' order, none
     /// for one passed over: what a seek's extra sources cost it, measured.
     open_ns: Vec<u64>,
+    /// Where each head opened asynchronously has its time in `open_ns`.
+    asked: Vec<usize>,
 }
 
 impl<'a> ScanMerge<'a> {
@@ -143,6 +145,10 @@ impl<'a> ScanMerge<'a> {
             self.end.extend_from_slice(e);
         }
         self.open_ns.clear();
+        self.asked.clear();
+        // First every source's leaf is asked for, those on the device together; then each is
+        // placed, waiting only for what has not landed. The guard owns each head before any
+        // await, including the first demand miss.
         for s in sources {
             let t = timed.then(std::time::Instant::now);
             if filter && end.is_some() {
@@ -160,17 +166,31 @@ impl<'a> ScanMerge<'a> {
             let head = match *s {
                 Source::Branch(b) => Head::Branch(RunCursor::new(store)?, b),
             };
-            // The guard owns the head before any await, including the first demand miss.
             self.heads.push(head);
             let head = self.heads.last_mut().ok_or(Error::InvalidArgument {
                 what: "a scan head absent after it was opened",
             })?;
             match head {
-                Head::Branch(cursor, branch) => cursor.seek_async(branch, store, from).await?,
+                Head::Branch(cursor, branch) => cursor.ask(branch, store, from)?,
             }
+            self.asked.push(self.open_ns.len());
             self.open_ns.push(t.map_or(0, |t| {
                 u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
             }));
+        }
+        for (h, &i) in self.asked.iter().enumerate() {
+            let t = timed.then(std::time::Instant::now);
+            let head = self.heads.get_mut(h).ok_or(Error::InvalidArgument {
+                what: "a scan head absent after it was asked for",
+            })?;
+            match head {
+                Head::Branch(cursor, branch) => cursor.seek_async(branch, store, from).await?,
+            }
+            if let Some(spent) = self.open_ns.get_mut(i) {
+                *spent = spent.saturating_add(t.map_or(0, |t| {
+                    u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
+                }));
+            }
         }
         self.pick();
         Ok(())
@@ -190,6 +210,7 @@ impl<'a> ScanMerge<'a> {
             skipped: 0,
             opened: 0,
             open_ns: self.open_ns,
+            asked: self.asked,
         }
     }
 

@@ -291,7 +291,6 @@ impl Trunk {
         for b in std::mem::take(&mut self.pending) {
             self.node_mut(root)?.inflight.push(vec![b]);
         }
-        self.node_mut(root)?.received = true;
         self.queue(root);
         Ok(())
     }
@@ -346,6 +345,10 @@ impl Trunk {
                     || n.wants.is_some()
                     || n.pivots.len() > fanout
                     || n.pivots.iter().any(|p| p.bundle.branches().len() > fanout)
+                    || (!n.leaf
+                        && n.pivots
+                            .iter()
+                            .any(|p| entries(p.bundle.branches()) > self.config.leaf_entries))
                     || (n.leaf
                         && n.pivots
                             .first()
@@ -392,7 +395,6 @@ impl Trunk {
                 self.flush_pivot(n, i)?;
             }
         }
-        self.flush_fullest(n)?;
         self.want_change(n)?;
         self.take_change(store, n)
     }
@@ -452,42 +454,14 @@ impl Trunk {
         if self.consolidating && (pivot.seek.paid || (self.full && pivot.seek.below)) {
             return Ok(node.inflight.len() <= pivot.start && !self.compacting(n, &pivot.key));
         }
-        Ok(held > self.config.fanout)
-    }
-
-    /// SplinterDB's pass through an index node that received data (`restore_balance_index`,
-    /// trunk.c; research/50 §4): once what it received is compacted into its pivots, its fullest
-    /// pivot flushes if it holds more than a memtable's entries, so index pivots hold about that
-    /// much and the data lives in the leaves. Once a receipt; never into a child whose change has
-    /// started.
-    fn flush_fullest(&mut self, n: usize) -> Result<(), Error> {
-        let node = self.node(n)?;
-        if node.leaf || !node.received || node.pivots.iter().any(|p| node.inflight.len() > p.start)
-        {
-            return Ok(());
-        }
-        let mut fullest: Option<(usize, u64)> = None;
-        for (i, p) in node.pivots.iter().enumerate() {
-            let held = entries(p.bundle.branches());
-            if held > self.config.leaf_entries && fullest.is_none_or(|(_, most)| held > most) {
-                fullest = Some((i, held));
-            }
-        }
-        self.node_mut(n)?.received = false;
-        let Some((i, _)) = fullest else {
-            return Ok(());
-        };
-        let child = self
-            .node(n)?
-            .pivots
-            .get(i)
-            .and_then(|p| p.child)
-            .ok_or(corrupt())?;
-        if self.node(child)?.wants.is_some_and(|c| c.started) {
-            return Ok(());
-        }
-        self.stats.fullest_flushes = self.stats.fullest_flushes.saturating_add(1);
-        self.flush_pivot(n, i)
+        // Past `fanout` runs, or past a memtable's entries: an index pivot's buffer stays small
+        // against the leaves below it, as a Bε-tree's buffers do, so the data lives in the leaves
+        // and a key range lies in one run there (research/50 §11; SplinterDB's fullest-child
+        // flush past one incorporation's bytes, trunk.c restore_balance_index).
+        Ok(
+            held > self.config.fanout
+                || entries(pivot.bundle.branches()) > self.config.leaf_entries,
+        )
     }
 
     /// Plans pivot `i` of node `n`'s compaction of its live in-flight bundles: inline without
@@ -570,12 +544,8 @@ impl Trunk {
                 .saturating_add(u64::try_from(newly).unwrap_or(u64::MAX));
         }
         // Oldest first into the child's in-flight list: the bundle is newest first.
-        let received = !bundle.is_empty();
         for b in bundle.into_iter().rev() {
             self.node_mut(child)?.inflight.push(vec![b]);
-        }
-        if received {
-            self.node_mut(child)?.received = true;
         }
         self.queue(child);
         Ok(())

@@ -1348,6 +1348,45 @@ impl Branch {
             .ok_or(corrupt(Malformed::CountMismatch))
     }
 
+    /// The pages a merge of `[from, end)` writes from this branch, at most: the tree's pages from
+    /// the leaf `from` falls in to the one `end` does (the last without an end), index pages
+    /// between them included, since keys kept in order pack into no more leaves than held them
+    /// (a page's entries fit again once any are dropped, so filling each page in turn is
+    /// optimal); a part-filled index page at each level above the leaves, which an output however
+    /// small has of its own; and the trailer's pages (filter, entry counts, leaf index, range
+    /// filter) in the share of the keys or of the pages the range holds, whichever is larger,
+    /// since its filters grow with keys and its index with leaves, rounded up, and one more for
+    /// where the trailer's sections fall.
+    pub fn pages_between(&self, from: &[u8], end: Option<&[u8]>) -> usize {
+        let total = self.counts.len();
+        let page = |p: Result<u32, Error>| p.ok().and_then(|p| usize::try_from(p).ok());
+        let first = page(self.leaf_of(from)).unwrap_or(0);
+        let last = end
+            .and_then(|e| page(self.leaf_of(e)))
+            .unwrap_or(total.saturating_sub(1))
+            .min(total.saturating_sub(1));
+        let tree = last.saturating_sub(first).saturating_add(1).min(total);
+        let keys = self
+            .counts
+            .get(first..=last)
+            .map_or(0u64, |c| c.iter().map(|&n| u64::from(n)).sum());
+        let trailer = u64::from(self.filter_pages);
+        let share = |part: u64, whole: u64| {
+            trailer
+                .saturating_mul(part)
+                .saturating_add(whole.saturating_sub(1))
+                .checked_div(whole)
+                .unwrap_or(trailer)
+        };
+        let trailer = share(keys, self.count).max(share(
+            u64::try_from(tree).unwrap_or(u64::MAX),
+            u64::try_from(total).unwrap_or(u64::MAX),
+        ));
+        tree.saturating_add(usize::from(self.height).saturating_sub(1))
+            .saturating_add(usize::try_from(trailer).unwrap_or(usize::MAX))
+            .saturating_add(1)
+    }
+
     /// The address of page `page_no`, counted through the branch's extents in order.
     pub fn page_address<F: BlockFile>(&self, store: &Store<F>, page_no: u64) -> Result<u64, Error> {
         let per = u64::from(store.extent_pages());

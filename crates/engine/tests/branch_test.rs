@@ -346,6 +346,79 @@ mod cursor_and_merge {
     }
 }
 
+/// The pages a branch holds in a key range bound what a compaction of that range writes from
+/// it: a loan of the cache's memory sized by them holds every page the job writes.
+#[test]
+fn a_compaction_of_a_range_writes_no_more_pages_than_its_input_holds_there() {
+    let mut s = store(17);
+    let entries: BTreeMap<Vec<u8>, (Op, Vec<u8>)> = (0..5_000u32)
+        .map(|k| {
+            (
+                format!("key-{k:08}").into_bytes(),
+                (Op::Put, vec![b'v'; (k % 120) as usize]),
+            )
+        })
+        .collect();
+    let branch = build(&mut s, &entries);
+    assert!(branch.counts.len() > 50, "{}", branch.counts.len());
+    let whole = branch.pages_between(b"", None);
+    assert_eq!(
+        whole,
+        branch.counts.len() + usize::from(branch.height) - 1 + branch.filter_pages as usize + 1
+    );
+    let mut x = 0x9e37_79b9_7f4a_7c15u64;
+    for _ in 0..40 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let a = x % 5_000;
+        let b = a + 1 + (x >> 32) % (5_000 - a);
+        let from = format!("key-{a:08}").into_bytes();
+        let end = format!("key-{b:08}").into_bytes();
+        let bound = branch.pages_between(&from, Some(&end));
+        let inputs = [branch.clone()];
+        let mut c = mantle_engine::branch::merge::Compaction::new(
+            &mut s,
+            &inputs,
+            &from,
+            Some(&end),
+            false,
+            u64::MAX,
+        )
+        .unwrap();
+        c.step(&mut s, &inputs, u64::MAX).unwrap();
+        let parts = c.finish(&mut s).unwrap();
+        let written: usize = parts
+            .iter()
+            .map(|(_, b)| b.counts.len() + b.filter_pages as usize)
+            .sum();
+        let shape: Vec<(usize, u32, u8, usize)> = parts
+            .iter()
+            .map(|(_, b)| {
+                (
+                    b.counts.iter().filter(|&&n| n > 0).count(),
+                    b.filter_pages,
+                    b.height,
+                    b.counts.iter().filter(|&&n| n == 0).count(),
+                )
+            })
+            .collect();
+        let first = branch.leaf_of(&from).unwrap();
+        let last = branch.leaf_of(&end).unwrap();
+        assert!(
+            written <= bound,
+            "[{a}, {b}): wrote {written} of a bound {bound}: parts (leaves, trailer, height, index) {shape:?}; input pages {first}..={last}, height {}, trailer {}, total {}",
+            branch.height,
+            branch.filter_pages,
+            branch.counts.len()
+        );
+        assert!(
+            bound < whole || b - a > 4_000,
+            "[{a}, {b}): {bound} of {whole}"
+        );
+    }
+}
+
 #[test]
 fn binary_entries_cross_index_levels_and_reopen_with_their_exact_values() {
     let mut s = store(37);

@@ -77,5 +77,9 @@ name = "compaction"
 harness = false
 
 [[bench]]
+name = "point_read"
+harness = false
+
+[[bench]]
 name = "active_order"
 harness = false

@@ -1135,16 +1135,13 @@ impl Trunk {
                     continue;
                 };
                 grant.clone_from(&given);
-                // The cache's room for what it writes: at most its inputs' pages, as a merge
-                // writes no more entries than it reads.
+                // The cache's room for what it writes: at most the pages its inputs hold in its
+                // range, as a merge writes no more entries than it reads; a pivot's compaction
+                // reads its slice of inputs that span the node.
                 let pages = task
                     .inputs
                     .iter()
-                    .map(|b| {
-                        b.counts
-                            .len()
-                            .saturating_add(usize::try_from(b.filter_pages).unwrap_or(usize::MAX))
-                    })
+                    .map(|b| b.pages_between(&task.from, task.end.as_deref()))
                     .fold(0usize, usize::saturating_add);
                 let job = Box::new(pool::Job {
                     work: Work::Compact(*task),

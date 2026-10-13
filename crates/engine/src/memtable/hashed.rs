@@ -650,6 +650,18 @@ impl HashMem {
         Ok(mem)
     }
 
+    /// [`Self::new_for`] with every page of its arena and index written once: the puts that fill
+    /// it take no first-touch fault. Made on a maintenance worker for the shard's next fill
+    /// (research/52 §6).
+    pub fn ready(limit: usize, entries: usize) -> Result<Self, Error> {
+        let mut mem = Self::new_for(limit, entries)?;
+        // Within the room reserved: no reallocation, each page written once and kept mapped.
+        mem.arena.resize(limit, 0);
+        mem.arena.clear();
+        mem.index.prefault();
+        Ok(mem)
+    }
+
     /// Reads `hash`'s first index group ([`KeyIndex::touch`]).
     #[inline]
     pub fn touch(&self, hash: u64) -> u64 {
@@ -2787,6 +2799,30 @@ mod tests {
     /// A memtable read through its index alone sheds its entry buffers to a new one: that one's
     /// tail holds as many entries as the first's did without growing, its walk reads every
     /// entry in key order, and the first still answers every get.
+    #[test]
+    fn a_ready_memtable_fills_as_a_new_one_without_its_arena_or_index_growing() {
+        // Made for 2,000 entries with its pages written: empty, its whole room left, and filled
+        // with them, neither its arena's buffer nor its index's table changes.
+        let keys: Vec<Vec<u8>> = (0..2_000u32)
+            .map(|n| n.wrapping_mul(2_654_435_761).to_be_bytes().to_vec())
+            .collect();
+        let mut mem = HashMem::ready(1 << 20, keys.len()).unwrap();
+        assert!(mem.is_empty());
+        assert_eq!(mem.room(), 1 << 20);
+        let arena = mem.arena.as_ptr();
+        let index = mem.index.bytes();
+        for k in &keys {
+            mem.insert(k, Op::Put, k).unwrap();
+        }
+        assert_eq!(mem.arena.as_ptr(), arena, "the arena moved");
+        assert_eq!(mem.index.bytes(), index, "the index grew");
+        let mut value = Vec::new();
+        for k in &keys {
+            assert_eq!(mem.get(k, &mut value).unwrap(), Some(Op::Put));
+            assert_eq!(&value, k);
+        }
+    }
+
     #[test]
     fn a_memtable_sheds_its_buffers_to_a_new_one_and_still_answers_gets() {
         let mut a = HashMem::new(1 << 20).unwrap();

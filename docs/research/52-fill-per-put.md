@@ -88,3 +88,30 @@ and its first-touch faults 10.5%, the copy for the packing worker 3.9%, the head
 1.9%); the bench's clock read after each put 33%, which on aarch64 waits at its `isb` for the
 loads before it, the insert's misses among them (research/36 §2), and its key generator 7%. The
 head is written in one append now (`put_varint32s`, its operation's byte a varint of its own).
+
+## 6. A new memtable's first touch, at 100M [sample100]
+
+[sample100]: macOS `sample` of a 100M fill of a3a840c, 5 s from 12 s into it, 3,102 samples of
+the shard thread; the fill ran 4.36M puts a second, kept all 178 memtables (19.7 GB).
+
+A put copies its entry twice: into the memtable's arena and into the copy kept for the packing
+worker (research/40 §4). The bytes are the same; the arena is new each fill, since the memtable
+before it is kept for gets (research/51), while the copy's buffer comes back from the worker that
+packed with it. The arena's copy took 437 samples (14.1%), the copy's 55 (1.8%): the difference,
+12.3% of the shard, is the arena's first touch, a page fault for each of its pages (4,096 of 16 KiB
+a 64 MiB arena) taken on the shard as puts reach them. At 10M it was 124 samples against 33 (7.7%
+of the shard).
+
+1. **Does the fill need it?** It needs the arena's pages mapped before its puts write them, not
+   mapped by the shard: whichever thread writes a page first takes its fault.
+2. **How much?** A memtable's arena and index, once a fill: 64 MiB and its index's tables,
+   178 times in a 100M fill.
+3. **Elsewhere:** a maintenance worker makes the next memtable while the current one fills, its
+   arena and index written once (`HashMem::ready`, `Work::Memtable`), and the next rotation takes
+   it: a runtime's shard if it is back, a shard that may wait waiting for it, since its job is
+   already running and the shard would pay the same first touches making its own
+   (`ShardDb::order_spare`, `take_spare`). A fill takes about 150 ms here; a 64 MiB first touch, a
+   few milliseconds of a worker.
+4. **Fewer resources:** none beyond the spare memtable the shard kept before kept memtables took
+   its place: one memtable's arena and index, made only while the machine has twice a memtable
+   free, as a new fill requires.

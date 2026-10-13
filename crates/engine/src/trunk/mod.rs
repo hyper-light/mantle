@@ -259,6 +259,16 @@ pub struct TrunkStats {
 /// The depths [`TrunkStats::shape`] keeps apart.
 pub const SHAPE_DEPTHS: usize = 8;
 
+/// A consolidation's price in the unit seeks pay rent in, the seeks' wall time: its merging,
+/// `work` nanoseconds of one core, runs on the maintenance workers idle when it is bought, beside
+/// the seeks (a consolidation in progress takes the cores, `Trunk::admit`), so it costs the
+/// seeks the work spread over them. Priced at the work itself, as one core's, the rule compared
+/// wall time with CPU time and bought nothing while the workers stood idle.
+pub(crate) fn wall_price(work: u64, idle: usize) -> u64 {
+    work.checked_div(u64::try_from(idle.max(1)).unwrap_or(u64::MAX))
+        .unwrap_or(work)
+}
+
 /// Nanoseconds since `t`, none when timing is off (`Trunk::set_timed`).
 fn ns_since(t: Option<std::time::Instant>) -> u64 {
     t.map_or(0, |t| {
@@ -882,11 +892,15 @@ impl Trunk {
         } else {
             pages.read_ns.saturating_add(pages.write_ns)
         };
+        let idle = self.pool.as_ref().map_or(1, Pool::idle);
         for &(ref step, rent) in path {
             let (entries, pages_own) = self.bundle_size(step, pages.extent_pages);
-            let price = entries
-                .saturating_mul(key_ns)
-                .saturating_add(pages_own.saturating_mul(page_ns));
+            let price = wall_price(
+                entries
+                    .saturating_mul(key_ns)
+                    .saturating_add(pages_own.saturating_mul(page_ns)),
+                idle,
+            );
             let Some(pivot) = self
                 .nodes
                 .get_mut(step.node)
@@ -2161,5 +2175,20 @@ impl<'a> Reader<'a> {
         let s = self.bytes.get(self.at..end).ok_or(corrupt())?;
         self.at = end;
         Ok(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wall_price;
+
+    #[test]
+    fn a_consolidation_costs_seeks_its_merging_over_the_idle_workers() {
+        // One core's 16 ms of merging over 16 idle workers is 1 ms of the seeks' wall time;
+        // with one worker, or none counted, the whole of it.
+        assert_eq!(wall_price(16_000_000, 16), 1_000_000);
+        assert_eq!(wall_price(16_000_000, 1), 16_000_000);
+        assert_eq!(wall_price(16_000_000, 0), 16_000_000);
+        assert_eq!(wall_price(u64::MAX, 2), u64::MAX / 2);
     }
 }

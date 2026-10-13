@@ -877,6 +877,18 @@ impl Pool {
         self.workers.iter().filter(|w| w.is_some()).count()
     }
 
+    /// Workers a job handed now could have beside those busy: the cores the pool may use less
+    /// the jobs out, at least one (the job's own).
+    pub fn idle(&self) -> usize {
+        let busy = self
+            .workers
+            .iter()
+            .flatten()
+            .filter(|w| w.owner.is_some())
+            .count();
+        self.most.saturating_sub(busy).max(1)
+    }
+
     /// The active workers the measured need asks for; idle warm seats may exceed it.
     pub fn want(&self) -> usize {
         self.want

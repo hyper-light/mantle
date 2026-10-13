@@ -956,7 +956,7 @@ impl Trunk {
             } => {
                 // The pages the job wrote, cached where they were written, with its branches.
                 if let Some(kept) = out.kept.take() {
-                    store.adopt_pages(kept);
+                    store.adopt_pages(*kept);
                 }
                 store.grant_back(&out.unused)?;
                 store.extend_end(out.end);
@@ -1159,7 +1159,7 @@ impl Trunk {
                     Err((error, job)) => {
                         let job = *job;
                         if let Some(kept) = job.keep {
-                            store.unlend_pages(kept);
+                            store.unlend_pages(*kept);
                         }
                         let Work::Compact(task) = job.work else {
                             return Err(corrupt());
@@ -1177,7 +1177,7 @@ impl Trunk {
                     Err(job) => {
                         let job = *job;
                         if let Some(kept) = job.keep {
-                            store.unlend_pages(kept);
+                            store.unlend_pages(*kept);
                         }
                         let Work::Compact(task) = job.work else {
                             return Err(corrupt());
@@ -1237,7 +1237,7 @@ impl Trunk {
                 }
                 (task, result) => {
                     if let Some(kept) = back.kept {
-                        store.unlend_pages(kept);
+                        store.unlend_pages(*kept);
                     }
                     if let Some(NodeTask {
                         run: Running::Remote { grant, state },
@@ -1278,7 +1278,7 @@ impl Trunk {
                 return Ok(());
             };
             if let Some(kept) = back.kept {
-                store.unlend_pages(kept);
+                store.unlend_pages(*kept);
             }
             for t in &mut self.tasks {
                 if let Running::Remote { grant, state } = &mut t.run
@@ -1300,7 +1300,7 @@ impl Trunk {
                     if let State::Done(out) = state
                         && let Some(kept) = out.kept
                     {
-                        store.unlend_pages(kept);
+                        store.unlend_pages(*kept);
                     }
                     for e in grant {
                         store.release(e)?;

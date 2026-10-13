@@ -205,7 +205,7 @@ pub struct Store<F: BlockFile> {
     cache: Option<cache::Cache>,
     /// A worker's job's loan of the shard's cache memory, its written pages kept in it
     /// ([`Store::keep_pages`]).
-    keep: Option<cache::Kept>,
+    keep: Option<Box<cache::Kept>>,
     /// What the machine has free, asked before the cache takes more memory
     /// ([`Store::follow_machine`]).
     machine_free: Option<fn() -> Option<u64>>,
@@ -1716,8 +1716,8 @@ impl<F: BlockFile> Store<F> {
 
     /// Room in the cache for up to `pages` pages a worker's job will write, lent with the job
     /// ([`cache::Cache::lend`]); none without a cache.
-    pub(crate) fn lend_pages(&mut self, pages: usize) -> Option<cache::Kept> {
-        self.cache.as_mut()?.lend(pages)
+    pub(crate) fn lend_pages(&mut self, pages: usize) -> Option<Box<cache::Kept>> {
+        self.cache.as_mut()?.lend(pages).map(Box::new)
     }
 
     /// A loan back with the pages a job wrote, which the cache takes as its own
@@ -1737,12 +1737,12 @@ impl<F: BlockFile> Store<F> {
 
     /// A worker's store keeps the node pages its job writes in `kept`, the shard's cache's memory
     /// lent for them; none keeps none.
-    pub(crate) fn keep_pages(&mut self, kept: Option<cache::Kept>) {
+    pub(crate) fn keep_pages(&mut self, kept: Option<Box<cache::Kept>>) {
         self.keep = kept;
     }
 
     /// The loan the job's pages were kept in, taken back at the job's end.
-    pub(crate) fn take_kept(&mut self) -> Option<cache::Kept> {
+    pub(crate) fn take_kept(&mut self) -> Option<Box<cache::Kept>> {
         self.keep.take()
     }
 

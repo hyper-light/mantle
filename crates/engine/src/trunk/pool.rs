@@ -159,7 +159,7 @@ pub struct Job {
     pub grant: Vec<u64>,
     pub file_end: u64,
     pub generation: u64,
-    pub keep: Option<Kept>,
+    pub keep: Option<Box<Kept>>,
 }
 
 /// A job's result: the branches made, each with its first key, in key order; the granted
@@ -176,7 +176,7 @@ pub struct Output {
     pub units: u64,
     /// The pages kept in the cache's loan, held with the result until its branches are applied:
     /// set by the owner from the job's [`Back`].
-    pub kept: Option<Kept>,
+    pub kept: Option<Box<Kept>>,
 }
 
 /// Who a job's result goes back to: the trunk's maintenance, the shard's packing, or the shard's
@@ -208,7 +208,7 @@ pub struct Back {
     pub result: Result<Output, Error>,
     /// The cache's memory the job was lent, its written pages in it: the owner's to adopt with
     /// the result, or to give back unread.
-    pub kept: Option<Kept>,
+    pub kept: Option<Box<Kept>>,
     /// An issued-write failure or worker unwind remains visible when input was abandoned.
     pub physical_error: Option<Error>,
     pub topped: Vec<u64>,
@@ -236,7 +236,7 @@ pub(crate) enum Message {
         worker: usize,
         result: Result<Output, Error>,
         physical_error: Option<Error>,
-        kept: Option<Kept>,
+        kept: Option<Box<Kept>>,
     },
     /// Terminal native attachment result, after the owner's last Done was consumed.
     Retired {

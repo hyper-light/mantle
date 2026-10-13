@@ -61,17 +61,6 @@ pub enum Work {
     Sort(SortPack),
     Grow(Growth),
     Index(Box<IndexJob>),
-    Memtable(Box<MemJob>),
-}
-
-/// The shard's next memtable, made on a worker with its arena and index written once, so the
-/// puts that fill it take no first-touch page fault on the shard (research/52 §6): an arena of
-/// `limit` bytes and an index sized for `entries`. It comes back holding the memtable.
-#[derive(Debug, Default)]
-pub struct MemJob {
-    pub limit: usize,
-    pub entries: usize,
-    pub mem: Option<crate::memtable::hashed::HashMem>,
 }
 
 /// The index over the memtables a shard keeps for gets (`crate::kept`, research/51 §7), out on a
@@ -149,15 +138,14 @@ pub struct Output {
     pub kept: Option<Box<Kept>>,
 }
 
-/// Who a job's result goes back to: the trunk's maintenance, the shard's packing, the shard's
-/// file's growth, the index over its kept memtables, or its next memtable.
+/// Who a job's result goes back to: the trunk's maintenance, the shard's packing, or the shard's
+/// file's growth.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Owner {
     Trunk,
     Pack,
     Grow,
     Index,
-    Spare,
 }
 
 /// A job handed to a worker: the worker, and the job's number among every job the pool has
@@ -187,8 +175,6 @@ pub struct Back {
     pub sorted: Option<SortPack>,
     /// An index job's index and lists, back.
     pub indexed: Option<Box<IndexJob>>,
-    /// A memtable job's memtable, back.
-    pub made: Option<Box<MemJob>>,
 }
 
 /// What a worker tells the shard: its grant is spent and it waits for `n` more extents, or its
@@ -211,7 +197,6 @@ pub(crate) enum Message {
         kept: Option<Box<Kept>>,
         sorted: Option<Box<SortPack>>,
         indexed: Option<Box<IndexJob>>,
-        made: Option<Box<MemJob>>,
     },
     /// Terminal native attachment result, after the owner's last Done was consumed.
     Retired {
@@ -280,7 +265,6 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
                     kept: None,
                     sorted: None,
                     indexed: None,
-                    made: None,
                 }
             };
             drop(back.blocking_send(message));
@@ -335,13 +319,11 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
                 kept: None,
             })
         });
-        // A sorted packing's buffers, an index job's index and a memtable job's memtable go
-        // back with its result.
-        let (sorted, indexed, made) = match job.work {
-            Work::Sort(pack) => (Some(Box::new(pack)), None, None),
-            Work::Index(index) => (None, Some(index), None),
-            Work::Memtable(mem) => (None, None, Some(mem)),
-            _ => (None, None, None),
+        // A sorted packing's buffers, and an index job's index, go back with its result.
+        let (sorted, indexed) = match job.work {
+            Work::Sort(pack) => (Some(Box::new(pack)), None),
+            Work::Index(index) => (None, Some(index)),
+            _ => (None, None),
         };
         let done = Message::Done {
             worker: id,
@@ -350,7 +332,6 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
             kept,
             sorted,
             indexed,
-            made,
         };
         if unwound {
             // Close admission before Done: its owner can immediately try this same seat.
@@ -484,13 +465,6 @@ fn run<F: BlockFile>(store: &mut Store<F>, job: &mut Job) -> Result<(Parts, u64)
                 sweep,
             } = job.as_mut();
             index.extend(lists, *oldest, *sweep);
-            Vec::new()
-        }
-        Work::Memtable(job) => {
-            job.mem = Some(crate::memtable::hashed::HashMem::ready(
-                job.limit,
-                job.entries,
-            )?);
             Vec::new()
         }
     };
@@ -1213,7 +1187,6 @@ impl Pool {
                 kept,
                 sorted,
                 indexed,
-                made,
             } => {
                 // A canceled request can consume Done before closing starts. Physical
                 // failures and worker unwinds stay terminal even after that Back is taken.
@@ -1243,7 +1216,6 @@ impl Pool {
                         topped,
                         sorted: sorted.map(|pack| *pack),
                         indexed,
-                        made,
                     },
                 ));
             }

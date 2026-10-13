@@ -493,7 +493,7 @@ impl Workload {
 fn stats(name: &str, counters: &[RangeStats]) {
     for (range, (f, _, _)) in counters.iter().enumerate() {
         println!(
-            "{name}_shard range {range} rotations {} fed {} frozen_most {} order_moves {} idle_slices {} idle_units {} record_hits {} record_misses {} record_ghost_hits {} record_held {} record_bytes {} kept {} kept_bytes {} kept_hits {} spares_made {}",
+            "{name}_shard range {range} rotations {} fed {} frozen_most {} order_moves {} idle_slices {} idle_units {} record_hits {} record_misses {} record_ghost_hits {} record_held {} record_bytes {} kept {} kept_bytes {} kept_hits {}",
             f.rotations,
             f.fed,
             f.frozen_most,
@@ -507,8 +507,7 @@ fn stats(name: &str, counters: &[RangeStats]) {
             f.record_bytes,
             f.kept,
             f.kept_bytes,
-            f.kept_hits,
-            f.spares_made
+            f.kept_hits
         );
     }
     for (range, (f, t, io)) in counters.iter().enumerate() {

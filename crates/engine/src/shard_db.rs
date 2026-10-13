@@ -99,8 +99,6 @@ pub struct FlushStats {
     /// Gets of keys no kept memtable held, answered without the trunk while they held every
     /// record it does (research/51 §8).
     pub kept_absent: u64,
-    /// Memtables a worker made for a fill, their pages written once (research/52 §6).
-    pub spares_made: u64,
     /// Puts whose trunk share waited for its input reads: the last memtable before a rotation
     /// would stall ([`ShardDb::put`]'s pacing).
     pub waited_steps: u64,
@@ -298,11 +296,8 @@ pub struct ShardDb<F: BlockFile> {
     rotated: Option<std::time::Instant>,
     fill_ns: u64,
     pack_ns: u64,
-    /// A memtable for the next fill: one cleared, its arena kept, or one a worker made
-    /// ([`Self::order_spare`]).
+    /// A cleared memtable for the next fill, its arena kept.
     spare: Option<HashMem>,
-    /// Whether a worker is making the next fill's memtable.
-    spare_out: bool,
     /// Packed memtables kept readable for gets, oldest first (research/51). Each one's branch is
     /// in the trunk, and every memtable packed after a kept one is kept, frozen, packing or
     /// active, so the first version a get finds newest first is the newest, and a key none of
@@ -696,7 +691,6 @@ impl<F: BlockFile> ShardDb<F> {
             fill_ns: 0,
             pack_ns: 0,
             spare: None,
-            spare_out: false,
             kept: std::collections::VecDeque::new(),
             kept_bytes: 0,
             kept_hits: 0,
@@ -1697,11 +1691,10 @@ impl<F: BlockFile> ShardDb<F> {
                 }
             }
             // A stopping shard keeps no memtable for gets: an index out on a worker comes back
-            // with the pool's close and is dropped with it, as does a memtable a worker makes.
+            // with the pool's close and is dropped with it.
             self.give_back_kept();
             self.kept_out = false;
             self.kept_out_bytes = 0;
-            self.spare_out = false;
         }
     }
 
@@ -3995,81 +3988,22 @@ impl<F: BlockFile> ShardDb<F> {
 
     /// The memtable the next fill takes: the spare one, else a new one, given a mirror when
     /// workers will pack it ([`Self::give_mirror`]).
-    fn fresh_mem(&mut self, wait: bool) -> Result<HashMem, Error> {
-        // Where the shard may wait, a memtable a worker is making is waited for: its job is
-        // already running, and the shard would pay the same first touches making its own.
-        self.take_spare(wait)?;
-        let entries = self.mem.len();
-        // Sized for the entries the memtable it follows holds, with the entry buffers a kept
-        // memtable shed: it fills without its index or buffers growing, as a cleared spare
-        // refills.
+    fn fresh_mem(&mut self) -> Result<HashMem, Error> {
         let mut fresh = match self.spare.take() {
             Some(m) => m,
-            None => HashMem::new_for(self.mem_limit, entries)?,
+            // Sized for the entries the memtable it follows holds, with the entry buffers a kept
+            // memtable shed: it fills without its index or buffers growing, as a cleared spare
+            // refills.
+            None => {
+                let mut fresh = HashMem::new_for(self.mem_limit, self.mem.len())?;
+                if let Some(bufs) = self.kept_shed.take() {
+                    fresh.take_shed(bufs);
+                }
+                fresh
+            }
         };
-        if let Some(bufs) = self.kept_shed.take() {
-            fresh.take_shed(bufs);
-        }
         self.give_mirror(&mut fresh);
-        // The fill after it gets its memtable from a worker while this one fills.
-        self.order_spare(entries);
         Ok(fresh)
-    }
-
-    /// Asks a worker for the next fill's memtable, sized for `entries`, its arena and index
-    /// written once so its puts take no first-touch fault on the shard (research/52 §6): when
-    /// none is spare and packed memtables are kept rather than cleared for the next fill, while
-    /// the machine has twice a memtable free, as a new fill requires.
-    fn order_spare(&mut self, entries: usize) {
-        if self.spare.is_some() || self.spare_out || self.memory.is_none() || !self.machine_spares()
-        {
-            return;
-        }
-        let Some(pool) = self.trunk.pool_mut().filter(|pool| pool.can_take(true)) else {
-            return;
-        };
-        let job = Box::new(Job {
-            work: Work::Memtable(Box::new(crate::trunk::pool::MemJob {
-                limit: self.mem_limit,
-                entries,
-                mem: None,
-            })),
-            grant: Vec::new(),
-            file_end: self.store.end(),
-            generation: self.store.generation(),
-            keep: None,
-        });
-        if let Ok(Ok(_)) = pool.send(job, Owner::Spare, true) {
-            self.spare_out = true;
-        }
-    }
-
-    /// Takes the next fill's memtable from its worker if it is back, or waits for it when `wait`:
-    /// the spare, unless a kept memtable given back and cleared took that place first, when it is
-    /// dropped.
-    fn take_spare(&mut self, wait: bool) -> Result<(), Error> {
-        if !self.spare_out {
-            return Ok(());
-        }
-        let Some(pool) = self.trunk.pool_mut() else {
-            return Ok(());
-        };
-        let Some(back) = pool.take(&mut self.store, Owner::Spare, wait)? else {
-            return Ok(());
-        };
-        self.spare_out = false;
-        back.result?;
-        let mem = back
-            .made
-            .and_then(|job| job.mem)
-            .ok_or(Error::InvalidArgument {
-                what: "a memtable job's result with no memtable",
-            })?;
-        if self.spare.is_none() {
-            self.spare = Some(mem);
-            self.flush_stats.spares_made = self.flush_stats.spares_made.saturating_add(1);
-        }
-        Ok(())
     }
 
     /// Gives an empty memtable a copy of its arena to keep for the worker that will sort and
@@ -4329,7 +4263,7 @@ impl<F: BlockFile> ShardDb<F> {
                 return Ok(false);
             }
         }
-        let fresh = self.fresh_mem(false)?;
+        let fresh = self.fresh_mem()?;
         let full = std::mem::replace(&mut self.mem, fresh);
         self.pack_full(full)?;
         let r = self.rotation.take().ok_or(Error::InvalidArgument {
@@ -4368,7 +4302,7 @@ impl<F: BlockFile> ShardDb<F> {
             return Ok(false);
         }
         if !self.mem.is_empty() {
-            let fresh = self.fresh_mem(false)?;
+            let fresh = self.fresh_mem()?;
             let full = std::mem::replace(&mut self.mem, fresh);
             self.pack_full(full)?;
             return Ok(false);
@@ -4425,7 +4359,7 @@ impl<F: BlockFile> ShardDb<F> {
             f.stall_ns = f.stall_ns.saturating_add(ns);
             f.stall_max_ns = f.stall_max_ns.max(ns);
         }
-        let fresh = self.fresh_mem(true)?;
+        let fresh = self.fresh_mem()?;
         let full = std::mem::replace(&mut self.mem, fresh);
         self.pack_full(full)?;
         self.rotated = Some(std::time::Instant::now());
@@ -4483,7 +4417,7 @@ impl<F: BlockFile> ShardDb<F> {
         self.no_checkpoint_mutation()?;
         self.finish_packing()?;
         if !self.mem.is_empty() {
-            let fresh = self.fresh_mem(true)?;
+            let fresh = self.fresh_mem()?;
             let full = std::mem::replace(&mut self.mem, fresh);
             self.pack_full(full)?;
             self.finish_packing()?;
@@ -5144,62 +5078,5 @@ mod frozen_tests {
         db.fill_ns = 0;
         db.pack_ns = 5_000;
         assert_eq!(db.frozen_most(), 0, "no fill measured, none");
-    }
-}
-
-#[cfg(test)]
-mod spare_tests {
-    //! The next fill's memtable made on a worker, its arena and index written once (research/52
-    //! §6).
-    use super::*;
-    use crate::store::Config;
-    use crate::trunk::TrunkConfig;
-    use hyper_block::buf::Alignment;
-    use hyper_block::file::{CachingRequest, DeviceFile};
-
-    const STORE: Config = Config {
-        page_size: 4096,
-        extent_pages: 8,
-        max_extents: 1 << 16,
-    };
-    const TRUNK: TrunkConfig = TrunkConfig {
-        fanout: 3,
-        leaf_entries: 96,
-    };
-    const MEM: usize = 4 * 1024;
-    const BUDGET: usize = 256 << 20;
-
-    fn open(path: &std::path::Path, create: bool) -> DeviceFile {
-        DeviceFile::open(
-            path,
-            create,
-            CachingRequest::Buffered,
-            Alignment::new(4096).unwrap(),
-        )
-        .unwrap()
-    }
-
-    /// With a budget and workers, a fresh memtable with none spare orders the next from a
-    /// worker while the machine has room for it (any pool takes a job with none out); a fill
-    /// that may wait takes it, empty and whole, counts it made and orders the next. Without
-    /// workers none is ordered.
-    #[test]
-    fn a_fill_takes_the_memtable_a_worker_made() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("store");
-        let mut db = ShardDb::create(open(&path, true), STORE, MEM, TRUNK).unwrap();
-        db.set_memory(BUDGET).unwrap();
-        let _ = db.fresh_mem(true).unwrap();
-        assert!(!db.spare_out, "no worker to make one");
-        let p = path.clone();
-        db.set_workers(move || Ok(open(&p, false))).unwrap();
-        let room = db.machine_spares();
-        let _ = db.fresh_mem(true).unwrap();
-        assert_eq!(db.spare_out, room);
-        let made = db.fresh_mem(true).unwrap();
-        assert_eq!(db.flush_stats.spares_made, u64::from(room));
-        assert!(made.is_empty());
-        assert_eq!(made.room(), MEM);
-        assert_eq!(db.spare_out, room, "the next one ordered");
     }
 }

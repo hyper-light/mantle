@@ -181,15 +181,6 @@ impl KeyIndex {
         }
     }
 
-    /// Writes each bucket's slot once, so the OS maps the table's pages now rather than at the
-    /// inserts that first reach them; its control words were written when it was made.
-    pub fn prefault(&mut self) {
-        // An opaque zero: the slots were allocated zeroed, and a store of a known zero over them
-        // could be dropped as one that changes nothing.
-        let zero = std::hint::black_box(0);
-        self.table.slots.fill(zero);
-    }
-
     /// Empties the index, keeping its table: refilled to the size it last held, it neither grows
     /// nor migrates again.
     pub fn clear(&mut self) {

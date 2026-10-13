@@ -83,6 +83,14 @@ shares paid at the turn (a3a840c) at 1.43× (1.27–2.21), 6.38M puts a second a
 puts' p99.9 1.9–2.4 µs against 2.3–3.7. Instructions a put across the process fell from 8,110 to
 5,715.
 
+In the comparison's container (`runs/n*-r141..145-*`, each build compiled from a fresh copy of its
+tree), paired with 9e53a6c: the polls at the turn filled at 1.17× at 10M (0.99–1.41, five rounds)
+and 1.27× at 100M (two), the turn's shares at the turn 1.25× and 1.10×, and with the seeks' rent
+fixed (a388aa8, research/50 §14) 1.30× (1.10–1.58) and 1.28× (1.25–1.32), against SplinterDB with a
+32 GiB cache 3.83× at 10M and 4.01× at 100M. The shard was on CPU for 88% of a 10M fill there
+(`threads_sched.sh`: 2.60 s of 2.94 s, no run-queue wait), about 260 ns a put against about 150 on
+macOS.
+
 The shard thread after them [sample, a3a840c, 1,181 samples]: the insert 33% (the arena's copy
 and its first-touch faults 10.5%, the copy for the packing worker 3.9%, the head's two varints
 1.9%); the bench's clock read after each put 33%, which on aarch64 waits at its `isb` for the
@@ -106,12 +114,15 @@ of the shard).
    mapped by the shard: whichever thread writes a page first takes its fault.
 2. **How much?** A memtable's arena and index, once a fill: 64 MiB and its index's tables,
    178 times in a 100M fill.
-3. **Elsewhere:** a maintenance worker makes the next memtable while the current one fills, its
-   arena and index written once (`HashMem::ready`, `Work::Memtable`), and the next rotation takes
-   it: a runtime's shard if it is back, a shard that may wait waiting for it, since its job is
-   already running and the shard would pay the same first touches making its own
-   (`ShardDb::order_spare`, `take_spare`). A fill takes about 150 ms here; a 64 MiB first touch, a
-   few milliseconds of a worker.
+3. **Elsewhere:** a maintenance worker made the next memtable while the current one filled, its
+   arena and index written once (`HashMem::ready`, `Work::Memtable`), and the next rotation took
+   it (8ba0336).
 4. **Fewer resources:** none beyond the spare memtable the shard kept before kept memtables took
-   its place: one memtable's arena and index, made only while the machine has twice a memtable
-   free, as a new fill requires.
+   its place, made only while the machine had twice a memtable free.
+
+Measured against a388aa8, interleaved: in the comparison's container (`runs/n*-r141..145-*`) the
+fill ran 0.97× at 10M (0.77–1.12, five rounds) and 0.99× at 100M (0.97–1.00, two), gets 0.93× and
+0.82×; on macOS at 100M, 0.97× and gets 0.88× (two rounds). The VM backs the arena with
+transparent huge pages, 32 faults a 64 MiB arena; on macOS the first touches the profile charged
+to the arena's copy were not what bounded the fill. Not kept: reverted, the cost measured and
+named here.

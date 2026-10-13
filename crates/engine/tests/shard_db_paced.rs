@@ -189,10 +189,11 @@ fn runs_submitted_to_the_issuer_read_back_and_reopen_whole() {
     // Leaves of more entries than an extent's pages hold: compactions read branches across
     // extents, the next read ahead through the issuer, and puts step them without waiting on
     // the device. Every key read exactly between operations regardless.
-    // 1,024 entries a leaf, more than an extent's pages hold (about 640 here) and fewer than
-    // the 1,500 keys, so leaves both span extents and split.
+    // A leaf splits past `fanout` times `leaf_entries` entries (SplinterDB's rule): 448 a part
+    // makes leaves of up to 1,344 entries, more than an extent's pages hold (about 640 here)
+    // and fewer than the 1,500 keys, so leaves both span extents and split.
     let trunk = TrunkConfig {
-        leaf_entries: 1_024,
+        leaf_entries: 448,
         ..TRUNK
     };
     let (mut db, oracle) = run_trunk(

@@ -651,16 +651,21 @@ impl Trunk {
         match change.kind {
             ChangeKind::Settle { parts } => {
                 // The parts as the bundle stands now: a settle that has come to split holds its
-                // parent's pivot first, then waits for it to empty.
+                // parent's pivot first, then waits for it to empty. A pivot already empty with no
+                // compaction out has no flush left to come, and a flush is what would look at
+                // this leaf again, so the split settle is planned now.
                 let now = self.settle_parts(n)?;
                 if now > 1 && parts <= 1 && n != self.root {
                     self.node_mut(n)?.wants = Some(Change {
                         kind: ChangeKind::Settle { parts: now },
                         started: false,
                     });
-                    let (parent, _) = self.parent_of(n)?;
-                    self.queue(parent);
-                    return Ok(());
+                    let (parent, i) = self.parent_of(n)?;
+                    let pivot = self.node(parent)?.pivots.get(i).ok_or(corrupt())?;
+                    if !pivot.bundle.branches().is_empty() || self.compacting(parent, &pivot.key) {
+                        self.queue(parent);
+                        return Ok(());
+                    }
                 }
                 self.plan_settle(n)
             }
@@ -807,6 +812,54 @@ impl Trunk {
                     break 'passes;
                 }
                 let yield_io = self.yield_io;
+                let Some(task) = self.tasks.get_mut(at) else {
+                    break 'passes;
+                };
+                let Running::Inline(c) = &mut task.run else {
+                    continue;
+                };
+                let node = self.nodes.get(task.node).ok_or(corrupt())?;
+                // A task about to write takes its output's room first, as a worker's job takes
+                // its grant (`dispatch_tasks`): the inputs' extents and one more a part, the
+                // file grown in place where the shard may, else asked of the shard's growth and
+                // the task stepped once it has grown.
+                if c.opening() && store.segments().is_some() {
+                    let inputs: Vec<&Branch> = match &task.what {
+                        What::Compact { start, covered, .. } => node
+                            .inflight
+                            .get(*start..*covered)
+                            .ok_or(corrupt())?
+                            .iter()
+                            .flatten()
+                            .collect(),
+                        What::Settle { .. } => node
+                            .pivots
+                            .first()
+                            .ok_or(corrupt())?
+                            .bundle
+                            .branches()
+                            .iter()
+                            .collect(),
+                    };
+                    let extents = inputs
+                        .iter()
+                        .map(|b| u64::try_from(b.extents.len()).unwrap_or(u64::MAX))
+                        .fold(0u64, u64::saturating_add);
+                    let parts = match &task.what {
+                        What::Compact { .. } => 1,
+                        What::Settle { .. } => self.leaf_parts(entries_of_refs(&inputs)),
+                    };
+                    let asked = extents.saturating_add(parts).saturating_add(1);
+                    if store.capacity() < asked {
+                        if store.grows_in_place() {
+                            store.grow_now(asked)?;
+                        }
+                        if store.capacity() < asked {
+                            self.capacity_wanted = self.capacity_wanted.max(asked);
+                            continue;
+                        }
+                    }
+                }
                 let Some(task) = self.tasks.get_mut(at) else {
                     break 'passes;
                 };
@@ -1255,6 +1308,13 @@ impl Trunk {
 }
 
 /// The entries of `branches`, an upper bound on their keys.
+fn entries_of_refs(branches: &[&Branch]) -> u64 {
+    branches
+        .iter()
+        .map(|b| b.count)
+        .fold(0u64, u64::saturating_add)
+}
+
 fn entries(branches: &[Branch]) -> u64 {
     branches
         .iter()

@@ -541,6 +541,10 @@ fn stats(name: &str, counters: &[RangeStats]) {
             ));
         }
         println!("{name}_shape range {range}{shape}");
+        println!(
+            "{name}_waits range {range} demand_waits {} demand_wait_ns {}",
+            io.demand_waits, io.demand_wait_ns
+        );
     }
 }
 

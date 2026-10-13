@@ -131,6 +131,10 @@ pub struct IoStats {
     /// device's issuer ([`hyper_block::block::BlockFile::read_resident_at`]): counted among
     /// `device_reads` too, and timed there, since a larger cache would have saved them.
     pub resident_reads: u64,
+    /// Demand pages a task awaited the device's issuer for, and the nanoseconds from its first
+    /// wait to the page landing: what a page from the device costs the reader that asked.
+    pub demand_waits: u64,
+    pub demand_wait_ns: u64,
     /// What those reads asked the OS: probes made, reads made on a probe's kept answer instead,
     /// epochs read and changed, and in shadow mode the kept answers found wrong (hyper-block
     /// `resident`; docs/research/46-reclaim-epochs.md).
@@ -3251,10 +3255,19 @@ impl<F: BlockFile> Store<F> {
         address: u64,
         out: &mut Vec<u8>,
     ) -> Result<(), Error> {
+        let mut waited: Option<std::time::Instant> = None;
         loop {
             std::future::poll_fn(|cx| std::task::Poll::Ready(page_context(cx))).await?;
             if self.read_page_paced(span, address, out)? {
+                if waited.is_some() {
+                    self.io.demand_waits = self.io.demand_waits.saturating_add(1);
+                    self.io.demand_wait_ns =
+                        self.io.demand_wait_ns.saturating_add(elapsed_ns(waited));
+                }
                 return Ok(());
+            }
+            if waited.is_none() {
+                waited = Some(std::time::Instant::now());
             }
             let answered = {
                 let mut completion = std::pin::pin!(self.wait_completion());
